@@ -3,6 +3,7 @@ defmodule Ferricstore.MetricsTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Metrics
+  alias Ferricstore.QuorumMetrics
 
   # ---------------------------------------------------------------------------
   # scrape/0 — Prometheus text format validity
@@ -171,6 +172,72 @@ defmodule Ferricstore.MetricsTest do
 
       # 11 base metrics, plus namespace and prefix metrics when data exists
       assert help_count >= 11
+    end
+
+    test "includes quorum write-path telemetry counters" do
+      QuorumMetrics.reset()
+
+      on_exit(fn ->
+        QuorumMetrics.reset()
+      end)
+
+      :telemetry.execute(
+        [:ferricstore, :batcher, :slot_flush],
+        %{batch_size: 3, caller_count: 2, queue_wait_us: 17},
+        %{shard_index: 2, durability: :quorum}
+      )
+
+      :telemetry.execute(
+        [:ferricstore, :batcher, :quorum_submit],
+        %{duration_us: 5, batch_size: 3, caller_count: 2, command_bytes: 80},
+        %{shard_index: 2, kind: :batch, status: :ok}
+      )
+
+      :telemetry.execute(
+        [:ferricstore, :raft, :apply],
+        %{duration_us: 11},
+        %{shard_index: 2, result: :ok, disk: :ok}
+      )
+
+      :telemetry.execute(
+        [:ferricstore, :bitcask, :append],
+        %{duration_us: 7, batch_size: 3, batch_bytes: 42},
+        %{shard_index: 2, status: :ok}
+      )
+
+      text = Metrics.handle("FERRICSTORE.METRICS", [])
+
+      assert String.contains?(text, "# TYPE ferricstore_quorum_submit_total counter")
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_quorum_slot_flush_total{shard_index="2",durability="quorum"} 1)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_quorum_slot_flush_queue_wait_us_total{shard_index="2",durability="quorum"} 17)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_quorum_submit_total{shard_index="2",kind="batch",status="ok"} 1)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_quorum_submit_command_bytes_total{shard_index="2",kind="batch",status="ok"} 80)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_quorum_apply_total{shard_index="2",result="ok",disk="ok"} 1)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_quorum_bitcask_append_batch_bytes_total{shard_index="2",status="ok"} 42)
+             )
     end
   end
 

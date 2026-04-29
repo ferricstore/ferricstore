@@ -1007,6 +1007,7 @@ defmodule Ferricstore.Raft.Batcher do
         froms = Enum.reverse(slot.froms)
 
         {_prefix, durability} = slot_key
+        emit_slot_flush_telemetry(state, slot, durability, batch, froms)
 
         new_state =
           case durability do
@@ -1041,16 +1042,42 @@ defmodule Ferricstore.Raft.Batcher do
   @spec pipeline_submit(%__MODULE__{}, [command()], [GenServer.from()]) :: %__MODULE__{}
   defp pipeline_submit(state, [single_cmd], froms) do
     corr = make_ref()
-    serialized = {:ttb, :erlang.term_to_binary(single_cmd)}
-    :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
+    started_at = System.monotonic_time()
+    bin = :erlang.term_to_binary(single_cmd)
+    serialized = {:ttb, bin}
+    submit_result = :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
+
+    emit_quorum_submit_telemetry(
+      state,
+      started_at,
+      :single,
+      1,
+      length(froms),
+      byte_size(bin),
+      submit_result
+    )
+
     mono = System.monotonic_time()
     %{state | pending: Map.put(state.pending, corr, {froms, :single, mono})}
   end
 
   defp pipeline_submit(state, batch, froms) do
     corr = make_ref()
-    serialized = {:ttb, :erlang.term_to_binary({:batch, batch})}
-    :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
+    started_at = System.monotonic_time()
+    bin = :erlang.term_to_binary({:batch, batch})
+    serialized = {:ttb, bin}
+    submit_result = :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
+
+    emit_quorum_submit_telemetry(
+      state,
+      started_at,
+      :batch,
+      length(batch),
+      length(froms),
+      byte_size(bin),
+      submit_result
+    )
+
     mono = System.monotonic_time()
     %{state | pending: Map.put(state.pending, corr, {froms, :batch, mono})}
   end
@@ -1299,7 +1326,58 @@ defmodule Ferricstore.Raft.Batcher do
 
   @spec new_slot(pos_integer()) :: slot()
   defp new_slot(window_ms) do
-    %{cmds: [], froms: [], timer_ref: nil, window_ms: window_ms, count: 0}
+    %{
+      cmds: [],
+      froms: [],
+      timer_ref: nil,
+      window_ms: window_ms,
+      count: 0,
+      created_mono: System.monotonic_time()
+    }
+  end
+
+  defp emit_slot_flush_telemetry(state, slot, durability, batch, froms) do
+    :telemetry.execute(
+      [:ferricstore, :batcher, :slot_flush],
+      %{
+        batch_size: length(batch),
+        caller_count: length(froms),
+        queue_wait_us: duration_us(Map.get(slot, :created_mono, System.monotonic_time()))
+      },
+      %{shard_index: state.shard_index, durability: durability}
+    )
+  end
+
+  defp emit_quorum_submit_telemetry(
+         state,
+         started_at,
+         kind,
+         batch_size,
+         caller_count,
+         command_bytes,
+         submit_result
+       ) do
+    :telemetry.execute(
+      [:ferricstore, :batcher, :quorum_submit],
+      %{
+        duration_us: duration_us(started_at),
+        batch_size: batch_size,
+        caller_count: caller_count,
+        command_bytes: command_bytes
+      },
+      %{shard_index: state.shard_index, kind: kind, status: pipeline_submit_status(submit_result)}
+    )
+  end
+
+  defp pipeline_submit_status(:ok), do: :ok
+  defp pipeline_submit_status({:ok, _}), do: :ok
+  defp pipeline_submit_status({:error, _}), do: :error
+  defp pipeline_submit_status(_), do: :unknown
+
+  defp duration_us(started_at) do
+    System.monotonic_time()
+    |> Kernel.-(started_at)
+    |> System.convert_time_unit(:native, :microsecond)
   end
 
   defp cancel_timer(nil), do: :ok

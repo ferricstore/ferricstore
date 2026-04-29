@@ -97,7 +97,9 @@ fn thread_loop_inner(
 
         match msg {
             ThreadMsg::Close => {
-                drain_to_kernel(&mut file, &buffer, &file_size);
+                if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
+                    eprintln!("[ferricstore_wal_nif] WAL write failed during close: {e}");
+                }
                 let _ = file.sync_data();
                 return;
             }
@@ -109,7 +111,10 @@ fn thread_loop_inner(
         // =====================================================================
         // Phase 2: Drain buffer to kernel immediately (before sync decision)
         // =====================================================================
-        drain_to_kernel(&mut file, &buffer, &file_size);
+        if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
+            notify_callers_error(&mut callers, &e);
+            return;
+        }
 
         // =====================================================================
         // Phase 3: Commit delay — collect more Flush requests, keep draining
@@ -124,20 +129,29 @@ fn thread_loop_inner(
                 match rx.recv_timeout(remaining) {
                     Ok(ThreadMsg::Flush(c)) => callers.push(c),
                     Ok(ThreadMsg::Close) => {
-                        drain_to_kernel(&mut file, &buffer, &file_size);
+                        if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
+                            notify_callers_error(&mut callers, &e);
+                            return;
+                        }
                         let _ = file.sync_data();
                         notify_callers_success(&mut callers);
                         return;
                     }
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => {
-                        drain_to_kernel(&mut file, &buffer, &file_size);
+                        if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
+                            notify_callers_error(&mut callers, &e);
+                            return;
+                        }
                         let _ = file.sync_data();
                         notify_callers_success(&mut callers);
                         return;
                     }
                 }
-                drain_to_kernel(&mut file, &buffer, &file_size);
+                if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
+                    notify_callers_error(&mut callers, &e);
+                    return;
+                }
             }
         }
 
@@ -146,7 +160,10 @@ fn thread_loop_inner(
         // =====================================================================
         loop {
             // Drain any remaining buffer to kernel
-            drain_to_kernel(&mut file, &buffer, &file_size);
+            if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
+                notify_callers_error(&mut callers, &e);
+                return;
+            }
 
             // Sync + notify if we have callers
             if !callers.is_empty() {
@@ -166,7 +183,10 @@ fn thread_loop_inner(
                 match rx.try_recv() {
                     Ok(ThreadMsg::Flush(c)) => callers.push(c),
                     Ok(ThreadMsg::Close) => {
-                        drain_to_kernel(&mut file, &buffer, &file_size);
+                        if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
+                            notify_callers_error(&mut callers, &e);
+                            return;
+                        }
                         let _ = file.sync_data();
                         notify_callers_success(&mut callers);
                         return;
@@ -197,26 +217,36 @@ fn thread_loop_inner(
 
 /// Drain shared buffer to kernel page cache. No fdatasync.
 /// Returns true if data was written.
-fn drain_to_kernel(file: &mut File, buffer: &Mutex<AlignedBuffer>, file_size: &AtomicU64) -> bool {
+fn drain_to_kernel(
+    file: &mut File,
+    buffer: &Mutex<AlignedBuffer>,
+    file_size: &AtomicU64,
+) -> io::Result<bool> {
+    drain_to_kernel_writer(file, buffer, file_size)
+}
+
+fn drain_to_kernel_writer<W: Write>(
+    writer: &mut W,
+    buffer: &Mutex<AlignedBuffer>,
+    file_size: &AtomicU64,
+) -> io::Result<bool> {
     let taken = {
         let mut buf = buffer.lock().expect("buffer mutex poisoned");
         buf.take()
     };
 
     if taken.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     let bytes = taken.logical_len as u64;
-    // write_all_retry only fails on persistent I/O errors — panic is appropriate
-    // since the WAL is unrecoverable at that point.
-    write_all_retry(file, taken.as_padded_slice()).expect("WAL write failed");
+    write_all_retry(writer, taken.as_padded_slice())?;
     file_size.fetch_add(bytes, Ordering::Release);
-    true
+    Ok(true)
 }
 
 /// Write with retry on EINTR.
-fn write_all_retry(file: &mut File, data: &[u8]) -> io::Result<()> {
+fn write_all_retry<W: Write>(file: &mut W, data: &[u8]) -> io::Result<()> {
     let mut written = 0;
     while written < data.len() {
         match file.write(&data[written..]) {
@@ -347,6 +377,35 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::Other, "forced write failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn drain_to_kernel_returns_write_error_instead_of_panicking() {
+        let buffer = Mutex::new(AlignedBuffer::new());
+        {
+            let mut guard = buffer.lock().unwrap();
+            guard.extend(b"entry");
+        }
+
+        let file_size = AtomicU64::new(WAL_HEADER_SIZE);
+        let mut writer = FailingWriter;
+
+        let result = drain_to_kernel_writer(&mut writer, &buffer, &file_size);
+
+        assert!(result.is_err());
+        assert_eq!(file_size.load(Ordering::Acquire), WAL_HEADER_SIZE);
+    }
+
     /// Helper: create a thread config for testing (no BEAM notifications).
     #[allow(dead_code)]
     fn test_config(commit_delay_us: u64) -> (ThreadConfig, crossbeam_channel::Sender<ThreadMsg>) {
@@ -458,7 +517,7 @@ mod tests {
             buf.extend(b"test data 12345");
         }
 
-        assert!(drain_to_kernel(&mut file, &buffer, &file_size));
+        assert!(drain_to_kernel(&mut file, &buffer, &file_size).unwrap());
         assert_eq!(file_size.load(Ordering::Acquire), 15);
 
         let contents = std::fs::read(&path).unwrap();
@@ -481,7 +540,7 @@ mod tests {
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
 
-        assert!(!drain_to_kernel(&mut file, &buffer, &file_size));
+        assert!(!drain_to_kernel(&mut file, &buffer, &file_size).unwrap());
         assert_eq!(file_size.load(Ordering::Acquire), 0);
     }
 
@@ -504,14 +563,14 @@ mod tests {
             let mut buf = buffer.lock().unwrap();
             buf.extend(b"first ");
         }
-        assert!(drain_to_kernel(&mut file, &buffer, &file_size));
+        assert!(drain_to_kernel(&mut file, &buffer, &file_size).unwrap());
         assert_eq!(file_size.load(Ordering::Acquire), 6);
 
         {
             let mut buf = buffer.lock().unwrap();
             buf.extend(b"second");
         }
-        assert!(drain_to_kernel(&mut file, &buffer, &file_size));
+        assert!(drain_to_kernel(&mut file, &buffer, &file_size).unwrap());
         assert_eq!(file_size.load(Ordering::Acquire), 12);
     }
 
@@ -535,7 +594,7 @@ mod tests {
             buf.extend(b"final data");
         }
 
-        drain_to_kernel(&mut file, &buffer, &file_size);
+        drain_to_kernel(&mut file, &buffer, &file_size).unwrap();
         file.sync_data().unwrap();
         assert_eq!(file_size.load(Ordering::Acquire), 10);
     }
@@ -716,7 +775,7 @@ mod tests {
             buf.extend(&data);
         }
 
-        drain_to_kernel(&mut file, &buffer, &file_size);
+        drain_to_kernel(&mut file, &buffer, &file_size).unwrap();
         file.sync_data().unwrap();
 
         assert_eq!(file_size.load(Ordering::Acquire), 10 * 1024 * 1024);

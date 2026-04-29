@@ -108,7 +108,11 @@ defmodule Ferricstore.Raft.StateMachine do
   def init(config) do
     interval =
       Map.get_lazy(config, :release_cursor_interval, fn ->
-        Application.get_env(:ferricstore, :release_cursor_interval, @default_release_cursor_interval)
+        Application.get_env(
+          :ferricstore,
+          :release_cursor_interval,
+          @default_release_cursor_interval
+        )
       end)
 
     %{
@@ -254,6 +258,23 @@ defmodule Ferricstore.Raft.StateMachine do
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
+  def apply(meta, {:set, key, value, expire_at_ms, opts}, state) do
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+    result =
+      case check_key_lock(state, redis_key, nil) do
+        :ok ->
+          with_pending_writes(state, fn -> do_set(state, key, value, expire_at_ms, opts) end)
+
+        {:error, :key_locked} ->
+          {:error, :key_locked}
+      end
+
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
   def apply(meta, {:delete, key}, state) do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
@@ -276,7 +297,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     # All commands in a batch share one pending-writes buffer so they
     # are flushed in a single v2_append_batch_nosync NIF call.
-    {results, new_count} =
+    write_result =
       with_pending_writes(state, fn ->
         Enum.map_reduce(commands, old_count, fn cmd, count ->
           result = apply_single(state, cmd)
@@ -284,8 +305,15 @@ defmodule Ferricstore.Raft.StateMachine do
         end)
       end)
 
-    new_state = %{state | applied_count: new_count}
-    maybe_release_cursor(meta, old_count, new_state, {:ok, results})
+    case write_result do
+      {:error, _reason} = error ->
+        new_state = %{state | applied_count: old_count + length(commands)}
+        maybe_release_cursor(meta, old_count, new_state, error)
+
+      {results, new_count} ->
+        new_state = %{state | applied_count: new_count}
+        maybe_release_cursor(meta, old_count, new_state, {:ok, results})
+    end
   end
 
   def apply(meta, {:cross_shard_tx, shard_batches}, state) do
@@ -329,12 +357,14 @@ defmodule Ferricstore.Raft.StateMachine do
   # replay of entries written before the compound-key migration.
   def apply(meta, {:list_op, key, operation}, state) do
     store = build_compound_store(state)
-    type_store = Map.put(store, :exists?, fn k ->
-      case :ets.lookup(state.ets, k) do
-        [{^k, _, _, _, _, _, _}] -> true
-        _ -> false
-      end
-    end)
+
+    type_store =
+      Map.put(store, :exists?, fn k ->
+        case :ets.lookup(state.ets, k) do
+          [{^k, _, _, _, _, _, _}] -> true
+          _ -> false
+        end
+      end)
 
     result =
       case Ferricstore.Store.TypeRegistry.check_type(key, :list, type_store) do
@@ -349,9 +379,12 @@ defmodule Ferricstore.Raft.StateMachine do
 
   def apply(meta, {:list_op_lmove, src_key, dst_key, from_dir, to_dir}, state) do
     store = build_compound_store(state)
-    result = with_pending_writes(state, fn ->
-      Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
-    end)
+
+    result =
+      with_pending_writes(state, fn ->
+        Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
+      end)
+
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
@@ -594,7 +627,11 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   def apply(meta, {:ratelimit_add, key, window_ms, max, count}, state) do
-    result = with_pending_writes(state, fn -> do_ratelimit_add(state, key, window_ms, max, count, nil) end)
+    result =
+      with_pending_writes(state, fn ->
+        do_ratelimit_add(state, key, window_ms, max, count, nil)
+      end)
+
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
@@ -602,7 +639,11 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # 6-tuple variant: shard pre-computes now_ms for deterministic replay.
   def apply(meta, {:ratelimit_add, key, window_ms, max, count, now_ms}, state) do
-    result = with_pending_writes(state, fn -> do_ratelimit_add(state, key, window_ms, max, count, now_ms) end)
+    result =
+      with_pending_writes(state, fn ->
+        do_ratelimit_add(state, key, window_ms, max, count, now_ms)
+      end)
+
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
@@ -727,148 +768,176 @@ defmodule Ferricstore.Raft.StateMachine do
   # -- Bloom --
 
   def apply(meta, {:bloom_create, key, num_bits, num_hashes, prob_meta}, state) do
-    result = do_prob_command(state, fn ->
-      path = prob_path(state, key, "bloom")
-      ensure_prob_dir(state)
-      NIF.bloom_file_create(path, num_bits, num_hashes)
-      prob_fsync_dir(state)
-      do_put(state, key, :erlang.term_to_binary(prob_meta), 0)
-      :ok
-    end)
+    result =
+      do_prob_command(state, fn ->
+        path = prob_path(state, key, "bloom")
+        ensure_prob_dir(state)
+        NIF.bloom_file_create(path, num_bits, num_hashes)
+        prob_fsync_dir(state)
+        do_put(state, key, :erlang.term_to_binary(prob_meta), 0)
+        :ok
+      end)
+
     bump_applied(meta, state, result)
   end
 
   def apply(meta, {:bloom_add, key, element, auto_create_params}, state) do
-    result = do_prob_command(state, fn ->
-      path = prob_path(state, key, "bloom")
-      ensure_prob_dir(state)
-      auto_create_bloom_if_needed(state, path, key, auto_create_params)
-      NIF.bloom_file_add(path, element)
-    end)
+    result =
+      do_prob_command(state, fn ->
+        path = prob_path(state, key, "bloom")
+        ensure_prob_dir(state)
+        auto_create_bloom_if_needed(state, path, key, auto_create_params)
+        NIF.bloom_file_add(path, element)
+      end)
+
     bump_applied(meta, state, result)
   end
 
   def apply(meta, {:bloom_madd, key, elements, auto_create_params}, state) do
-    result = do_prob_command(state, fn ->
-      path = prob_path(state, key, "bloom")
-      ensure_prob_dir(state)
-      auto_create_bloom_if_needed(state, path, key, auto_create_params)
-      NIF.bloom_file_madd(path, elements)
-    end)
+    result =
+      do_prob_command(state, fn ->
+        path = prob_path(state, key, "bloom")
+        ensure_prob_dir(state)
+        auto_create_bloom_if_needed(state, path, key, auto_create_params)
+        NIF.bloom_file_madd(path, elements)
+      end)
+
     bump_applied(meta, state, result)
   end
 
   # -- CMS --
 
   def apply(meta, {:cms_create, key, width, depth}, state) do
-    result = do_prob_command(state, fn ->
-      path = prob_path(state, key, "cms")
-      ensure_prob_dir(state)
-      NIF.cms_file_create(path, width, depth)
-      prob_fsync_dir(state)
-      meta_val = {:cms_meta, %{width: width, depth: depth}}
-      do_put(state, key, :erlang.term_to_binary(meta_val), 0)
-      :ok
-    end)
+    result =
+      do_prob_command(state, fn ->
+        path = prob_path(state, key, "cms")
+        ensure_prob_dir(state)
+        NIF.cms_file_create(path, width, depth)
+        prob_fsync_dir(state)
+        meta_val = {:cms_meta, %{width: width, depth: depth}}
+        do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+        :ok
+      end)
+
     bump_applied(meta, state, result)
   end
 
   def apply(meta, {:cms_incrby, key, items}, state) do
-    result = do_prob_command(state, fn ->
-      path = prob_path(state, key, "cms")
-      NIF.cms_file_incrby(path, items)
-    end)
+    result =
+      do_prob_command(state, fn ->
+        path = prob_path(state, key, "cms")
+        NIF.cms_file_incrby(path, items)
+      end)
+
     bump_applied(meta, state, result)
   end
 
   # src_paths are pre-resolved absolute paths (sources may be on different shards)
   def apply(meta, {:cms_merge, dst_key, src_paths, weights, create_params}, state) do
-    result = do_prob_command(state, fn ->
-      dst_path = prob_path(state, dst_key, "cms")
-      ensure_prob_dir(state)
-      unless Ferricstore.FS.exists?(dst_path) do
-        %{width: w, depth: d} = create_params
-        NIF.cms_file_create(dst_path, w, d)
-        prob_fsync_dir(state)
-        meta_val = {:cms_meta, %{width: w, depth: d}}
-        do_put(state, dst_key, :erlang.term_to_binary(meta_val), 0)
-      end
-      NIF.cms_file_merge(dst_path, src_paths, weights)
-    end)
+    result =
+      do_prob_command(state, fn ->
+        dst_path = prob_path(state, dst_key, "cms")
+        ensure_prob_dir(state)
+
+        unless Ferricstore.FS.exists?(dst_path) do
+          %{width: w, depth: d} = create_params
+          NIF.cms_file_create(dst_path, w, d)
+          prob_fsync_dir(state)
+          meta_val = {:cms_meta, %{width: w, depth: d}}
+          do_put(state, dst_key, :erlang.term_to_binary(meta_val), 0)
+        end
+
+        NIF.cms_file_merge(dst_path, src_paths, weights)
+      end)
+
     bump_applied(meta, state, result)
   end
 
   # -- Cuckoo --
 
   def apply(meta, {:cuckoo_create, key, capacity, bucket_size}, state) do
-    result = do_prob_command(state, fn ->
-      path = prob_path(state, key, "cuckoo")
-      ensure_prob_dir(state)
-      NIF.cuckoo_file_create(path, capacity, bucket_size)
-      prob_fsync_dir(state)
-      meta_val = {:cuckoo_meta, %{capacity: capacity}}
-      do_put(state, key, :erlang.term_to_binary(meta_val), 0)
-      :ok
-    end)
+    result =
+      do_prob_command(state, fn ->
+        path = prob_path(state, key, "cuckoo")
+        ensure_prob_dir(state)
+        NIF.cuckoo_file_create(path, capacity, bucket_size)
+        prob_fsync_dir(state)
+        meta_val = {:cuckoo_meta, %{capacity: capacity}}
+        do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+        :ok
+      end)
+
     bump_applied(meta, state, result)
   end
 
   def apply(meta, {:cuckoo_add, key, element, auto_create_params}, state) do
-    result = do_prob_command(state, fn ->
-      path = prob_path(state, key, "cuckoo")
-      ensure_prob_dir(state)
-      auto_create_cuckoo_if_needed(state, path, key, auto_create_params)
-      NIF.cuckoo_file_add(path, element)
-    end)
+    result =
+      do_prob_command(state, fn ->
+        path = prob_path(state, key, "cuckoo")
+        ensure_prob_dir(state)
+        auto_create_cuckoo_if_needed(state, path, key, auto_create_params)
+        NIF.cuckoo_file_add(path, element)
+      end)
+
     bump_applied(meta, state, result)
   end
 
   def apply(meta, {:cuckoo_addnx, key, element, auto_create_params}, state) do
-    result = do_prob_command(state, fn ->
-      path = prob_path(state, key, "cuckoo")
-      ensure_prob_dir(state)
-      auto_create_cuckoo_if_needed(state, path, key, auto_create_params)
-      NIF.cuckoo_file_addnx(path, element)
-    end)
+    result =
+      do_prob_command(state, fn ->
+        path = prob_path(state, key, "cuckoo")
+        ensure_prob_dir(state)
+        auto_create_cuckoo_if_needed(state, path, key, auto_create_params)
+        NIF.cuckoo_file_addnx(path, element)
+      end)
+
     bump_applied(meta, state, result)
   end
 
   def apply(meta, {:cuckoo_del, key, element}, state) do
-    result = do_prob_command(state, fn ->
-      path = prob_path(state, key, "cuckoo")
-      NIF.cuckoo_file_del(path, element)
-    end)
+    result =
+      do_prob_command(state, fn ->
+        path = prob_path(state, key, "cuckoo")
+        NIF.cuckoo_file_del(path, element)
+      end)
+
     bump_applied(meta, state, result)
   end
 
   # -- TopK --
 
   def apply(meta, {:topk_create, key, k, width, depth, decay}, state) do
-    result = do_prob_command(state, fn ->
-      path = prob_path(state, key, "topk")
-      ensure_prob_dir(state)
-      NIF.topk_file_create_v2(path, k, width, depth, decay)
-      prob_fsync_dir(state)
-      meta_val = {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
-      do_put(state, key, :erlang.term_to_binary(meta_val), 0)
-      :ok
-    end)
+    result =
+      do_prob_command(state, fn ->
+        path = prob_path(state, key, "topk")
+        ensure_prob_dir(state)
+        NIF.topk_file_create_v2(path, k, width, depth, decay)
+        prob_fsync_dir(state)
+        meta_val = {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
+        do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+        :ok
+      end)
+
     bump_applied(meta, state, result)
   end
 
   def apply(meta, {:topk_add, key, elements}, state) do
-    result = do_prob_command(state, fn ->
-      path = prob_path(state, key, "topk")
-      NIF.topk_file_add_v2(path, elements)
-    end)
+    result =
+      do_prob_command(state, fn ->
+        path = prob_path(state, key, "topk")
+        NIF.topk_file_add_v2(path, elements)
+      end)
+
     bump_applied(meta, state, result)
   end
 
   def apply(meta, {:topk_incrby, key, pairs}, state) do
-    result = do_prob_command(state, fn ->
-      path = prob_path(state, key, "topk")
-      NIF.topk_file_incrby_v2(path, pairs)
-    end)
+    result =
+      do_prob_command(state, fn ->
+        path = prob_path(state, key, "topk")
+        NIF.topk_file_incrby_v2(path, pairs)
+      end)
+
     bump_applied(meta, state, result)
   end
 
@@ -886,7 +955,9 @@ defmodule Ferricstore.Raft.StateMachine do
   def apply(meta, {:server_command, command}, state) do
     hook =
       case state.instance_ctx do
-        %{raft_apply_hook: fun} when is_function(fun) -> fun
+        %{raft_apply_hook: fun} when is_function(fun) ->
+          fun
+
         _ ->
           try do
             FerricStore.Instance.get(:default).raft_apply_hook
@@ -1111,20 +1182,27 @@ defmodule Ferricstore.Raft.StateMachine do
     local_put = fn key, value, expire_at_ms ->
       value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
       disk_val = to_disk_binary(value)
+
       if tx_binary_ref do
         new_bytes = binary_byte_size(key) + binary_byte_size(value_for)
-        old_bytes = case :ets.lookup(ctx.keydir, key) do
-          [{^key, old_val, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(old_val)
-          _ -> 0
-        end
+
+        old_bytes =
+          case :ets.lookup(ctx.keydir, key) do
+            [{^key, old_val, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(old_val)
+            _ -> 0
+          end
+
         delta = new_bytes - old_bytes
         if delta != 0, do: :atomics.add(tx_binary_ref, ctx.index + 1, delta)
       end
+
       :ets.insert(ctx.keydir, {key, value_for, expire_at_ms, LFU.initial(), 0, 0, 0})
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
       if MapSet.member?(deleted, key) do
         Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
       end
+
       BitcaskWriter.write(
         ctx.index,
         ctx.active_file_path,
@@ -1134,17 +1212,21 @@ defmodule Ferricstore.Raft.StateMachine do
         disk_val,
         expire_at_ms
       )
+
       :ok
     end
 
     local_delete = fn key ->
       if tx_binary_ref do
-        bytes = case :ets.lookup(ctx.keydir, key) do
-          [{^key, val, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(val)
-          _ -> 0
-        end
+        bytes =
+          case :ets.lookup(ctx.keydir, key) do
+            [{^key, val, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(val)
+            _ -> 0
+          end
+
         if bytes > 0, do: :atomics.sub(tx_binary_ref, ctx.index + 1, bytes)
       end
+
       :ets.delete(ctx.keydir, key)
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
       Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
@@ -1155,6 +1237,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     local_get = fn key ->
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
       if MapSet.member?(deleted, key) do
         nil
       else
@@ -1164,6 +1247,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     local_get_meta = fn key ->
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
       if MapSet.member?(deleted, key) do
         nil
       else
@@ -1173,6 +1257,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     local_exists = fn key ->
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
       if MapSet.member?(deleted, key) do
         false
       else
@@ -1182,16 +1267,19 @@ defmodule Ferricstore.Raft.StateMachine do
 
     local_incr = fn key, delta ->
       current = local_get.(key)
+
       case current do
         nil ->
           local_put.(key, delta, 0)
           {:ok, delta}
+
         value ->
           case coerce_integer(value) do
             {:ok, int_val} ->
               new_val = int_val + delta
               local_put.(key, new_val, 0)
               {:ok, new_val}
+
             :error ->
               {:error, "ERR value is not an integer or out of range"}
           end
@@ -1200,17 +1288,20 @@ defmodule Ferricstore.Raft.StateMachine do
 
     local_incr_float = fn key, delta ->
       current = local_get.(key)
+
       case current do
         nil ->
           new_val = delta * 1.0
           local_put.(key, new_val, 0)
           {:ok, new_val}
+
         value ->
           case coerce_float(value) do
             {:ok, float_val} ->
               new_val = float_val + delta
               local_put.(key, new_val, 0)
               {:ok, new_val}
+
             :error ->
               {:error, "ERR value is not a valid float"}
           end
@@ -1218,12 +1309,14 @@ defmodule Ferricstore.Raft.StateMachine do
     end
 
     local_append = fn key, suffix ->
-      current = case local_get.(key) do
-        nil -> ""
-        v when is_integer(v) -> Integer.to_string(v)
-        v when is_float(v) -> Float.to_string(v)
-        v -> v
-      end
+      current =
+        case local_get.(key) do
+          nil -> ""
+          v when is_integer(v) -> Integer.to_string(v)
+          v when is_float(v) -> Float.to_string(v)
+          v -> v
+        end
+
       new_val = current <> suffix
       local_put.(key, new_val, 0)
       {:ok, byte_size(new_val)}
@@ -1248,12 +1341,14 @@ defmodule Ferricstore.Raft.StateMachine do
     end
 
     local_setrange = fn key, offset, value ->
-      old = case local_get.(key) do
-        nil -> ""
-        v when is_integer(v) -> Integer.to_string(v)
-        v when is_float(v) -> Float.to_string(v)
-        v -> v
-      end
+      old =
+        case local_get.(key) do
+          nil -> ""
+          v when is_integer(v) -> Integer.to_string(v)
+          v when is_float(v) -> Float.to_string(v)
+          v -> v
+        end
+
       new_val = sm_apply_setrange(old, offset, value)
       local_put.(key, new_val, 0)
       {:ok, byte_size(new_val)}
@@ -1285,11 +1380,15 @@ defmodule Ferricstore.Raft.StateMachine do
       getdel: local_getdel,
       getex: local_getex,
       setrange: local_setrange,
-      cas: fn key, expected, new_value, ttl_ms -> Router.cas(instance_ctx, key, expected, new_value, ttl_ms) end,
+      cas: fn key, expected, new_value, ttl_ms ->
+        Router.cas(instance_ctx, key, expected, new_value, ttl_ms)
+      end,
       lock: fn key, owner, ttl_ms -> Router.lock(instance_ctx, key, owner, ttl_ms) end,
       unlock: fn key, owner -> Router.unlock(instance_ctx, key, owner) end,
       extend: fn key, owner, ttl_ms -> Router.extend(instance_ctx, key, owner, ttl_ms) end,
-      ratelimit_add: fn key, window_ms, max, count -> Router.ratelimit_add(instance_ctx, key, window_ms, max, count) end,
+      ratelimit_add: fn key, window_ms, max, count ->
+        Router.ratelimit_add(instance_ctx, key, window_ms, max, count)
+      end,
       list_op: fn key, op -> Router.list_op(instance_ctx, key, op) end,
       compound_get: fn _redis_key, compound_key ->
         cross_shard_ets_read(ctx, compound_key)
@@ -1333,24 +1432,32 @@ defmodule Ferricstore.Raft.StateMachine do
   # Reads a value from a shard's keydir ETS table with cold-read fallback.
   defp cross_shard_ets_read(ctx, key) do
     now = HLC.now_ms()
+
     try do
       case :ets.lookup(ctx.keydir, key) do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
           value
+
         [{^key, nil, 0, _lfu, fid, off, _vsize}] when is_integer(fid) and fid > 0 ->
           path = sm_file_path_from_ctx(ctx, fid)
+
           case NIF.v2_pread_at(path, off) do
             {:ok, v} -> v
             _ -> nil
           end
+
         [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
           value
-        [{^key, nil, exp, _lfu, fid, off, _vsize}] when exp > now and is_integer(fid) and fid > 0 ->
+
+        [{^key, nil, exp, _lfu, fid, off, _vsize}]
+        when exp > now and is_integer(fid) and fid > 0 ->
           path = sm_file_path_from_ctx(ctx, fid)
+
           case NIF.v2_pread_at(path, off) do
             {:ok, v} -> v
             _ -> nil
           end
+
         _ ->
           nil
       end
@@ -1362,24 +1469,32 @@ defmodule Ferricstore.Raft.StateMachine do
   # Reads value + expire_at_ms from a shard's keydir ETS table.
   defp cross_shard_ets_read_meta(ctx, key) do
     now = HLC.now_ms()
+
     try do
       case :ets.lookup(ctx.keydir, key) do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
           {value, 0}
+
         [{^key, nil, 0, _lfu, fid, off, _vsize}] when is_integer(fid) and fid > 0 ->
           path = sm_file_path_from_ctx(ctx, fid)
+
           case NIF.v2_pread_at(path, off) do
             {:ok, v} -> {v, 0}
             _ -> nil
           end
+
         [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
           {value, exp}
-        [{^key, nil, exp, _lfu, fid, off, _vsize}] when exp > now and is_integer(fid) and fid > 0 ->
+
+        [{^key, nil, exp, _lfu, fid, off, _vsize}]
+        when exp > now and is_integer(fid) and fid > 0 ->
           path = sm_file_path_from_ctx(ctx, fid)
+
           case NIF.v2_pread_at(path, off) do
             {:ok, v} -> {v, exp}
             _ -> nil
           end
+
         _ ->
           nil
       end
@@ -1391,11 +1506,16 @@ defmodule Ferricstore.Raft.StateMachine do
   defp cross_shard_prefix_scan(ctx, prefix) do
     now = HLC.now_ms()
     prefix_len = byte_size(prefix)
-    ms = [{{:"$1", :"$2", :"$3", :_, :"$4", :"$5", :"$6"},
-           [{:andalso, {:is_binary, :"$1"},
-             {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}],
-           [{{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"}}]}]
+
+    ms = [
+      {{:"$1", :"$2", :"$3", :_, :"$4", :"$5", :"$6"},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+       ], [{{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"}}]}
+    ]
+
     try do
       :ets.select(ctx.keydir, ms)
       |> Enum.reduce([], fn {key, value, exp, fid, off, _vsize}, acc ->
@@ -1403,6 +1523,7 @@ defmodule Ferricstore.Raft.StateMachine do
           actual_value =
             if value == nil do
               path = sm_file_path_from_ctx(ctx, fid)
+
               case NIF.v2_pread_at(path, off) do
                 {:ok, v} -> v
                 _ -> nil
@@ -1410,11 +1531,14 @@ defmodule Ferricstore.Raft.StateMachine do
             else
               value
             end
+
           if actual_value != nil do
-            field = case :binary.split(key, <<0>>) do
-              [_pre, sub] -> sub
-              _ -> key
-            end
+            field =
+              case :binary.split(key, <<0>>) do
+                [_pre, sub] -> sub
+                _ -> key
+              end
+
             [{field, actual_value} | acc]
           else
             acc
@@ -1432,11 +1556,16 @@ defmodule Ferricstore.Raft.StateMachine do
   defp cross_shard_prefix_count(keydir, prefix) do
     prefix_len = byte_size(prefix)
     now = HLC.now_ms()
-    ms = [{{:"$1", :_, :"$2", :_, :_, :_, :_},
-           [{:andalso, {:is_binary, :"$1"},
-             {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}],
-           [:"$2"]}]
+
+    ms = [
+      {{:"$1", :_, :"$2", :_, :_, :_, :_},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+       ], [:"$2"]}
+    ]
+
     try do
       :ets.select(keydir, ms)
       |> Enum.count(fn exp -> exp == 0 or exp > now end)
@@ -1447,22 +1576,31 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp cross_shard_delete_prefix(ctx, prefix, delete_fn) do
     prefix_len = byte_size(prefix)
-    ms = [{{:"$1", :_, :_, :_, :_, :_, :_},
-           [{:andalso, {:is_binary, :"$1"},
-             {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}],
-           [:"$1"]}]
+
+    ms = [
+      {{:"$1", :_, :_, :_, :_, :_, :_},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+       ], [:"$1"]}
+    ]
+
     try do
       keys = :ets.select(ctx.keydir, ms)
       Enum.each(keys, fn key -> delete_fn.(key) end)
     rescue
       ArgumentError -> :ok
     end
+
     :ok
   end
 
   defp sm_file_path_from_ctx(ctx, file_id) do
-    Path.join(ctx.shard_data_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+    Path.join(
+      ctx.shard_data_path,
+      "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
+    )
   end
 
   # ---------------------------------------------------------------------------
@@ -1638,6 +1776,15 @@ defmodule Ferricstore.Raft.StateMachine do
 
     case check_key_lock(state, redis_key, nil) do
       :ok -> do_put(state, key, value, expire_at_ms)
+      {:error, :key_locked} -> {:error, :key_locked}
+    end
+  end
+
+  defp apply_single(state, {:set, key, value, expire_at_ms, opts}) do
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+    case check_key_lock(state, redis_key, nil) do
+      :ok -> do_set(state, key, value, expire_at_ms, opts)
       {:error, :key_locked} -> {:error, :key_locked}
     end
   end
@@ -1836,6 +1983,7 @@ defmodule Ferricstore.Raft.StateMachine do
     do_prob_command(state, fn ->
       dst_path = prob_path(state, dst_key, "cms")
       ensure_prob_dir(state)
+
       unless Ferricstore.FS.exists?(dst_path) do
         %{width: w, depth: d} = create_params
         NIF.cms_file_create(dst_path, w, d)
@@ -1843,6 +1991,7 @@ defmodule Ferricstore.Raft.StateMachine do
         meta_val = {:cms_meta, %{width: w, depth: d}}
         do_put(state, dst_key, :erlang.term_to_binary(meta_val), 0)
       end
+
       NIF.cms_file_merge(dst_path, src_paths, weights)
     end)
   end
@@ -1913,14 +2062,27 @@ defmodule Ferricstore.Raft.StateMachine do
   # Wraps a block of state machine operations with batched disk writes.
   # Initializes the pending-writes buffer, runs the block, then flushes
   # all accumulated writes in a single v2_append_batch_nosync NIF call.
-  # For quorum durability, follows with a single fsync so all writes in
-  # the batch are durable on disk before the caller gets :ok.
-  # Guarantees: no :pending entries in ETS after this returns.
+  # If the append fails, restores any ETS entries that were replaced with
+  # :pending locations and returns the disk error instead of acknowledging
+  # success to the caller.
   defp with_pending_writes(state, fun) do
     Process.put(:sm_pending_writes, [])
-    result = fun.()
-    flush_pending_writes(state)
-    result
+    Process.put(:sm_pending_originals, %{})
+    started_at = System.monotonic_time()
+
+    try do
+      result = fun.()
+      flush_result = flush_pending_writes(state)
+      emit_raft_apply_telemetry(state, started_at, result, flush_result)
+
+      case flush_result do
+        :ok -> result
+        {:error, _reason} = error -> error
+      end
+    after
+      Process.delete(:sm_pending_writes)
+      Process.delete(:sm_pending_originals)
+    end
   end
 
   defp do_put(state, key, value, expire_at_ms) do
@@ -1930,6 +2092,7 @@ defmodule Ferricstore.Raft.StateMachine do
     # Track binary memory: subtract old entry's bytes, add new entry's bytes.
     # This gives MemoryGuard accurate off-heap binary accounting.
     track_keydir_binary_delta(state, key, ets_val)
+    record_pending_original(state, key)
 
     # Insert into ETS immediately so subsequent read-modify-write commands
     # (INCR, APPEND, etc.) in the same batch see the correct value.
@@ -1948,6 +2111,43 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
+  defp do_set(state, key, value, expire_at_ms, opts) do
+    current = do_get_meta(state, key)
+    exists? = current != nil
+
+    {old_value, old_expire_at_ms} =
+      case current do
+        nil -> {nil, expire_at_ms}
+        {old_value, old_expire_at_ms} -> {old_value, old_expire_at_ms}
+      end
+
+    skip? =
+      cond do
+        Map.get(opts, :nx, false) and exists? -> true
+        Map.get(opts, :xx, false) and not exists? -> true
+        true -> false
+      end
+
+    cond do
+      skip? and Map.get(opts, :get, false) ->
+        old_value
+
+      skip? ->
+        nil
+
+      true ->
+        effective_expire_at_ms =
+          if Map.get(opts, :keepttl, false) and exists? do
+            old_expire_at_ms
+          else
+            expire_at_ms
+          end
+
+        do_put(state, key, value, effective_expire_at_ms)
+        if Map.get(opts, :get, false), do: old_value, else: :ok
+    end
+  end
+
   # Flushes all accumulated disk writes in a single NIF call, then updates
   # ETS entries with real file_id/offset. Called at the end of every apply/3
   # — no :pending entries remain after this returns.
@@ -1958,13 +2158,33 @@ defmodule Ferricstore.Raft.StateMachine do
 
       pending when is_list(pending) ->
         batch = Enum.reverse(pending)
+        batch_bytes = bitcask_batch_bytes(batch)
 
         case resolve_active_file(state) do
           :stale ->
+            emit_bitcask_append_telemetry(
+              state,
+              System.monotonic_time(),
+              length(batch),
+              batch_bytes,
+              :stale
+            )
+
             :ok
 
           {file_path, file_id} ->
-            case NIF.v2_append_batch_nosync(file_path, batch) do
+            started_at = System.monotonic_time()
+            append_result = NIF.v2_append_batch_nosync(file_path, batch)
+
+            emit_bitcask_append_telemetry(
+              state,
+              started_at,
+              length(batch),
+              batch_bytes,
+              append_result
+            )
+
+            case append_result do
               {:ok, locations} ->
                 if state.instance_ctx do
                   :atomics.put(state.instance_ctx.checkpoint_flags, state.shard_index + 1, 1)
@@ -1986,17 +2206,118 @@ defmodule Ferricstore.Raft.StateMachine do
                   end
                 end)
 
-              {:error, _reason} ->
+              {:error, reason} ->
                 if state.instance_ctx do
                   Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.shard_index)
                 else
                   Ferricstore.Store.DiskPressure.set(state.shard_index)
                 end
+
+                rollback_pending_writes(state)
+                {:error, {:bitcask_append_failed, reason}}
             end
         end
 
       _ ->
         :ok
+    end
+  end
+
+  defp bitcask_batch_bytes(batch) do
+    Enum.reduce(batch, 0, fn {key, value, _expire_at_ms}, acc ->
+      acc + byte_size(key) + byte_size(value)
+    end)
+  end
+
+  defp emit_raft_apply_telemetry(state, started_at, result, flush_result) do
+    :telemetry.execute(
+      [:ferricstore, :raft, :apply],
+      %{duration_us: duration_us(started_at)},
+      %{
+        shard_index: state.shard_index,
+        result: result_class(result),
+        disk: flush_result_class(flush_result)
+      }
+    )
+  end
+
+  defp emit_bitcask_append_telemetry(state, started_at, batch_size, batch_bytes, append_result) do
+    :telemetry.execute(
+      [:ferricstore, :bitcask, :append],
+      %{
+        duration_us: duration_us(started_at),
+        batch_size: batch_size,
+        batch_bytes: batch_bytes
+      },
+      %{shard_index: state.shard_index, status: append_result_class(append_result)}
+    )
+  end
+
+  defp result_class({:error, _}), do: :error
+  defp result_class(_), do: :ok
+
+  defp flush_result_class(:ok), do: :ok
+  defp flush_result_class({:error, _}), do: :error
+  defp flush_result_class(_), do: :unknown
+
+  defp append_result_class({:ok, _}), do: :ok
+  defp append_result_class({:error, _}), do: :error
+  defp append_result_class(:stale), do: :stale
+  defp append_result_class(_), do: :unknown
+
+  defp duration_us(started_at) do
+    System.monotonic_time()
+    |> Kernel.-(started_at)
+    |> System.convert_time_unit(:native, :microsecond)
+  end
+
+  defp record_pending_original(state, key) do
+    originals = Process.get(:sm_pending_originals, %{})
+
+    if Map.has_key?(originals, key) do
+      :ok
+    else
+      original =
+        case :ets.lookup(state.ets, key) do
+          [entry] -> {:entry, entry}
+          [] -> :missing
+        end
+
+      Process.put(:sm_pending_originals, Map.put(originals, key, original))
+    end
+  end
+
+  defp rollback_pending_writes(state) do
+    Process.get(:sm_pending_originals, %{})
+    |> Enum.each(fn
+      {key, {:entry, entry}} ->
+        track_keydir_binary_restore(state, key, entry)
+        :ets.insert(state.ets, entry)
+
+      {key, :missing} ->
+        track_keydir_binary_restore(state, key, nil)
+        :ets.delete(state.ets, key)
+    end)
+  end
+
+  defp track_keydir_binary_restore(state, key, original_entry) do
+    ref = keydir_binary_ref(state)
+
+    if ref do
+      current_bytes =
+        case :ets.lookup(state.ets, key) do
+          [{^key, value, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(value)
+          _ -> 0
+        end
+
+      original_bytes =
+        case original_entry do
+          {^key, value, _, _, _, _, _} -> binary_byte_size(key) + binary_byte_size(value)
+          _ -> 0
+        end
+
+      delta = original_bytes - current_bytes
+      if delta != 0, do: :atomics.add(ref, state.shard_index + 1, delta)
     end
   end
 
@@ -2011,6 +2332,7 @@ defmodule Ferricstore.Raft.StateMachine do
       try do
         {file_id, file_path, _data_path} =
           Ferricstore.Store.ActiveFile.get(state.shard_index)
+
         if File.exists?(file_path) do
           {file_path, file_id}
         else
@@ -2077,6 +2399,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp value_for_ets(nil, _threshold), do: nil
   defp value_for_ets(value, _threshold) when is_integer(value), do: Integer.to_string(value)
   defp value_for_ets(value, _threshold) when is_float(value), do: Float.to_string(value)
+
   defp value_for_ets(value, threshold) when is_binary(value) do
     if byte_size(value) > threshold do
       nil
@@ -2084,6 +2407,7 @@ defmodule Ferricstore.Raft.StateMachine do
       value
     end
   end
+
   # Catch-all for non-primitive values (e.g. tuples like {:topk_path, path}
   # stored via Ops.put). Serialize to binary for ETS storage.
   defp value_for_ets(value, _threshold), do: :erlang.term_to_binary(value)
@@ -2122,6 +2446,7 @@ defmodule Ferricstore.Raft.StateMachine do
         case coerce_integer(value) do
           {:ok, int_val} ->
             new_val = int_val + delta
+
             if new_val > @int64_max or new_val < @int64_min do
               {:error, "ERR increment or decrement would overflow"}
             else
@@ -2260,11 +2585,11 @@ defmodule Ferricstore.Raft.StateMachine do
       end
 
     old_byte = :binary.at(extended, byte_index)
-    old_bit = (old_byte >>> bit_position) &&& 1
+    old_bit = old_byte >>> bit_position &&& 1
 
     new_byte =
       case bit_val do
-        1 -> old_byte ||| (1 <<< bit_position)
+        1 -> old_byte ||| 1 <<< bit_position
         0 -> old_byte &&& bnot(1 <<< bit_position)
       end
 
@@ -2387,11 +2712,11 @@ defmodule Ferricstore.Raft.StateMachine do
           # that don't thread instance_ctx through to state machine config.
           ctx =
             state.instance_ctx ||
-              (try do
-                 FerricStore.Instance.get(:default)
-               rescue
-                 ArgumentError -> nil
-               end)
+              try do
+                FerricStore.Instance.get(:default)
+              rescue
+                ArgumentError -> nil
+              end
 
           case ctx do
             nil -> nil
@@ -2484,8 +2809,7 @@ defmodule Ferricstore.Raft.StateMachine do
       nil ->
         # No type metadata yet. Reject if the key already exists as a plain string.
         if ets_has?(state.ets, redis_key) do
-          {:error,
-           "WRONGTYPE Operation against a key holding the wrong kind of value"}
+          {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
         else
           do_put(state, type_key, expected_type, 0)
           :ok
@@ -2495,8 +2819,7 @@ defmodule Ferricstore.Raft.StateMachine do
         :ok
 
       _other ->
-        {:error,
-         "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
     end
   end
 
@@ -2847,7 +3170,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Returns the full file path for a log file within this shard's data dir.
   defp sm_file_path(state, file_id) do
-    Path.join(state.shard_data_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+    Path.join(
+      state.shard_data_path,
+      "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
+    )
   end
 
   # ---------------------------------------------------------------------------
@@ -2879,7 +3205,9 @@ defmodule Ferricstore.Raft.StateMachine do
       end,
       compound_scan: fn _redis_key, prefix ->
         Ferricstore.Store.Shard.ETS.prefix_scan_entries(
-          state.ets, prefix, state.shard_data_path
+          state.ets,
+          prefix,
+          state.shard_data_path
         )
         |> Enum.sort_by(fn {field, _} -> field end)
       end,
@@ -2910,10 +3238,11 @@ defmodule Ferricstore.Raft.StateMachine do
 
     match_spec = [
       {{:"$1", :_, :_, :_, :_, :_, :_},
-       [{:andalso, {:is_binary, :"$1"},
-         {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}],
-       [:"$1"]}
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+       ], [:"$1"]}
     ]
 
     keys_to_delete = :ets.select(state.ets, match_spec)
@@ -2977,13 +3306,19 @@ defmodule Ferricstore.Raft.StateMachine do
   # Computes delta: new_bytes - old_bytes (if key existed before).
   defp track_keydir_binary_delta(state, key, new_ets_val) do
     ref = keydir_binary_ref(state)
+
     if ref do
       new_bytes = binary_byte_size(key) + binary_byte_size(new_ets_val)
-      old_bytes = case :ets.lookup(state.ets, key) do
-        [{^key, old_val, _, _, _, _, _}] ->
-          binary_byte_size(key) + binary_byte_size(old_val)
-        _ -> 0
-      end
+
+      old_bytes =
+        case :ets.lookup(state.ets, key) do
+          [{^key, old_val, _, _, _, _, _}] ->
+            binary_byte_size(key) + binary_byte_size(old_val)
+
+          _ ->
+            0
+        end
+
       delta = new_bytes - old_bytes
       if delta != 0, do: :atomics.add(ref, state.shard_index + 1, delta)
     end
@@ -2992,12 +3327,17 @@ defmodule Ferricstore.Raft.StateMachine do
   # Tracks off-heap binary bytes when deleting a key from ETS.
   defp track_keydir_binary_remove(state, key) do
     ref = keydir_binary_ref(state)
+
     if ref do
-      bytes = case :ets.lookup(state.ets, key) do
-        [{^key, val, _, _, _, _, _}] ->
-          binary_byte_size(key) + binary_byte_size(val)
-        _ -> 0
-      end
+      bytes =
+        case :ets.lookup(state.ets, key) do
+          [{^key, val, _, _, _, _, _}] ->
+            binary_byte_size(key) + binary_byte_size(val)
+
+          _ ->
+            0
+        end
+
       if bytes > 0, do: :atomics.sub(ref, state.shard_index + 1, bytes)
     end
   end
@@ -3005,6 +3345,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # Tracks off-heap binary bytes when deleting a key whose value is already known.
   defp track_keydir_binary_remove_known(state, key, value) do
     ref = keydir_binary_ref(state)
+
     if ref do
       bytes = binary_byte_size(key) + binary_byte_size(value)
       if bytes > 0, do: :atomics.sub(ref, state.shard_index + 1, bytes)
@@ -3014,6 +3355,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # Tracks off-heap binary bytes when warming a cold key (nil -> value).
   defp track_keydir_binary_warm(state, new_ets_val) do
     ref = keydir_binary_ref(state)
+
     if ref do
       new_bytes = binary_byte_size(new_ets_val)
       if new_bytes > 0, do: :atomics.add(ref, state.shard_index + 1, new_bytes)
@@ -3021,6 +3363,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp keydir_binary_ref(%{instance_ctx: %{keydir_binary_bytes: ref}}) when ref != nil, do: ref
+
   defp keydir_binary_ref(_) do
     try do
       ctx = FerricStore.Instance.get(:default)

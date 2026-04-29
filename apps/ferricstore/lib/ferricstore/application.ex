@@ -196,7 +196,8 @@ defmodule Ferricstore.Application do
         Ferricstore.AuditLog,
         Ferricstore.Config,
         Ferricstore.NamespaceConfig,
-        Ferricstore.HLC
+        Ferricstore.HLC,
+        Ferricstore.QuorumMetrics
       ] ++
         batcher_children ++
         bitcask_writer_children ++

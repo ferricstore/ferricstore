@@ -26,6 +26,7 @@ defmodule Ferricstore.Metrics do
   | `ferricstore_slowlog_entries`            | gauge   | `SlowLog.len/0`              |
   | `ferricstore_namespace_window_ms`        | gauge   | `NamespaceConfig.get_all/0`   |
   | `ferricstore_namespace_durability`       | gauge   | `NamespaceConfig.get_all/0`   |
+  | `ferricstore_quorum_*`                   | counter | `QuorumMetrics` telemetry     |
 
   ## Usage
 
@@ -86,8 +87,9 @@ defmodule Ferricstore.Metrics do
 
     ns = namespace_metrics_text()
     prefix = prefix_metrics_text()
+    quorum = Ferricstore.QuorumMetrics.prometheus_text()
 
-    [base, ns, prefix]
+    [base, ns, prefix, quorum]
     |> Enum.reject(&(&1 == ""))
     |> Enum.join("\n")
     |> Kernel.<>("\n")

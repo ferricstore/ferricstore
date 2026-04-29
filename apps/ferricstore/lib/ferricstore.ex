@@ -274,34 +274,22 @@ defmodule FerricStore do
         true -> {0, false}
       end
 
-    # Read old metadata when GET or KEEPTTL is needed
-    {old_value, effective_expire} =
-      if get? or from_keepttl? do
-        case Router.get_meta(ctx, key) do
-          nil ->
-            {nil, expire_at_ms}
+    if nx? or xx? or get? or from_keepttl? do
+      opts = %{
+        expire_at_ms: expire_at_ms,
+        nx: nx?,
+        xx: xx?,
+        get: get?,
+        keepttl: from_keepttl?
+      }
 
-          {old_val, old_exp} ->
-            eff_exp = if from_keepttl?, do: old_exp, else: expire_at_ms
-            {old_val, eff_exp}
-        end
-      else
-        {nil, expire_at_ms}
+      case Router.set(ctx, key, value, opts) do
+        {:error, _} = err -> err
+        result when get? -> {:ok, result}
+        result -> result
       end
-
-    # Condition check
-    skip? =
-      cond do
-        nx? and Router.exists?(ctx, key) -> true
-        xx? and not Router.exists?(ctx, key) -> true
-        true -> false
-      end
-
-    if skip? do
-      if get?, do: {:ok, old_value}, else: nil
     else
-      Router.put(ctx, key, value, effective_expire)
-      if get?, do: {:ok, old_value}, else: :ok
+      Router.put(ctx, key, value, expire_at_ms)
     end
   end
 

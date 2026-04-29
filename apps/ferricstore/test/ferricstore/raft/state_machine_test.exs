@@ -64,7 +64,14 @@ defmodule Ferricstore.Raft.StateMachineTest do
       File.rm_rf!(dir)
     end)
 
-    %{state: state, ets: keydir_name, store: nil, dir: dir, active_file_path: active_file_path, shard_index: shard_index}
+    %{
+      state: state,
+      ets: keydir_name,
+      store: nil,
+      dir: dir,
+      active_file_path: active_file_path,
+      shard_index: shard_index
+    }
   end
 
   # ---------------------------------------------------------------------------
@@ -86,6 +93,63 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "apply/3 with {:put, key, value, expire_at_ms}" do
+    test "Bitcask append errors fail quorum apply and roll back pending ETS", %{
+      state: state,
+      ets: ets
+    } do
+      file_id = 9_000_000 + :erlang.unique_integer([:positive])
+      bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+      File.mkdir_p!(bad_active_path)
+
+      bad_state = %{state | active_file_id: file_id, active_file_path: bad_active_path}
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:put, "append_error_key", "value", 0}, bad_state)
+
+      assert {:error, {:bitcask_append_failed, _reason}} = result
+      assert [] == :ets.lookup(ets, "append_error_key")
+    end
+
+    test "emits bounded apply and Bitcask append telemetry", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      handler_id = {:state_machine_quorum_telemetry, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach_many(
+          handler_id,
+          [
+            [:ferricstore, :raft, :apply],
+            [:ferricstore, :bitcask, :append]
+          ],
+          fn event, measurements, metadata, test_pid ->
+            send(test_pid, {:quorum_telemetry, event, measurements, metadata})
+          end,
+          self()
+        )
+
+      try do
+        {_new_state, :ok} = StateMachine.apply(%{}, {:put, "telemetry_key", "value", 0}, state)
+
+        assert_receive {:quorum_telemetry, [:ferricstore, :bitcask, :append], append_meas,
+                        %{shard_index: ^shard_index, status: :ok}},
+                       500
+
+        assert append_meas.batch_size == 1
+        assert append_meas.batch_bytes > 0
+        assert is_integer(append_meas.duration_us)
+
+        assert_receive {:quorum_telemetry, [:ferricstore, :raft, :apply], apply_meas,
+                        %{shard_index: ^shard_index, result: :ok, disk: :ok}},
+                       500
+
+        assert is_integer(apply_meas.duration_us)
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
     test "writes value to disk and ETS", %{state: state, ets: ets, shard_index: shard_index} do
       {new_state, result} =
         StateMachine.apply(%{}, {:put, "key1", "value1", 0}, state)
@@ -102,7 +166,13 @@ defmodule Ferricstore.Raft.StateMachineTest do
       # Verify disk via pread
       [{_, _, _, _, fid, off, _}] = :ets.lookup(ets, "key1")
       assert is_integer(fid)
-      log_path = Path.join(state.shard_data_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+
+      log_path =
+        Path.join(
+          state.shard_data_path,
+          "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
+        )
+
       assert {:ok, "value1"} = NIF.v2_pread_at(log_path, off)
     end
 
@@ -113,7 +183,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
         StateMachine.apply(%{}, {:put, "expiring", "val", future}, state)
 
       assert result == :ok
-      assert [{"expiring", "val", ^future, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets, "expiring")
+
+      assert [{"expiring", "val", ^future, _lfu, _fid, _off, _vsize}] =
+               :ets.lookup(ets, "expiring")
     end
 
     test "put overwrites previous value", %{state: state, ets: ets} do
@@ -301,7 +373,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "overview/1" do
-    test "returns shard_index, keydir_size, and applied_count", %{state: state, shard_index: shard_index} do
+    test "returns shard_index, keydir_size, and applied_count", %{
+      state: state,
+      shard_index: shard_index
+    } do
       {state2, :ok} = StateMachine.apply(%{}, {:put, "ov_k", "ov_v", 0}, state)
 
       overview = StateMachine.overview(state2)
@@ -325,7 +400,15 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
   describe "release_cursor log compaction" do
     test "init/1 stores release_cursor_interval from config", %{store: _store, ets: ets} do
-      state = StateMachine.init(%{shard_index: 0, shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"), ets: ets})
+      state =
+        StateMachine.init(%{
+          shard_index: 0,
+          shard_data_path: System.tmp_dir!(),
+          active_file_id: 0,
+          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
+          ets: ets
+        })
+
       assert is_integer(state.release_cursor_interval)
       assert state.release_cursor_interval > 0
     end
@@ -334,7 +417,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
+          shard_data_path: System.tmp_dir!(),
+          active_file_id: 0,
+          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: 500
         })
@@ -346,7 +431,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
+          shard_data_path: System.tmp_dir!(),
+          active_file_id: 0,
+          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: 5
         })
@@ -355,6 +442,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       result =
         Enum.reduce(1..4, state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
+
           {new_state, {:applied_at, _, :ok}, effects} =
             StateMachine.apply(meta, {:put, "rc_key_#{i}", "v#{i}", 0}, acc)
 
@@ -374,7 +462,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
+          shard_data_path: System.tmp_dir!(),
+          active_file_id: 0,
+          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: interval
         })
@@ -383,7 +473,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state_before =
         Enum.reduce(1..(interval - 1), state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
-          {new_state, {:applied_at, _, :ok}, _effects} = StateMachine.apply(meta, {:put, "rc_#{i}", "v#{i}", 0}, acc)
+
+          {new_state, {:applied_at, _, :ok}, _effects} =
+            StateMachine.apply(meta, {:put, "rc_#{i}", "v#{i}", 0}, acc)
+
           new_state
         end)
 
@@ -411,7 +504,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
+          shard_data_path: System.tmp_dir!(),
+          active_file_id: 0,
+          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: interval
         })
@@ -420,13 +515,15 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {_final_state, cursor_indices} =
         Enum.reduce(1..9, {state, []}, fn i, {acc, cursors} ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
+
           {new_state, {:applied_at, _, :ok}, effects} =
             StateMachine.apply(meta, {:put, "mc_#{i}", "v#{i}", 0}, acc)
 
-          cursor_idx = Enum.find_value(effects, fn
-            {:release_cursor, idx, _snap} -> idx
-            _ -> nil
-          end)
+          cursor_idx =
+            Enum.find_value(effects, fn
+              {:release_cursor, idx, _snap} -> idx
+              _ -> nil
+            end)
 
           if cursor_idx, do: {new_state, cursors ++ [cursor_idx]}, else: {new_state, cursors}
         end)
@@ -440,17 +537,23 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
+          shard_data_path: System.tmp_dir!(),
+          active_file_id: 0,
+          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: interval
         })
 
       # Put two keys (applied_count = 2), then delete at the 3rd apply
       meta1 = %{index: 10, term: 1, system_time: System.os_time(:millisecond)}
-      {s1, {:applied_at, _, :ok}, _e1} = StateMachine.apply(meta1, {:put, "del_rc_a", "va", 0}, state)
+
+      {s1, {:applied_at, _, :ok}, _e1} =
+        StateMachine.apply(meta1, {:put, "del_rc_a", "va", 0}, state)
 
       meta2 = %{index: 11, term: 1, system_time: System.os_time(:millisecond)}
-      {s2, {:applied_at, _, :ok}, _e2} = StateMachine.apply(meta2, {:put, "del_rc_b", "vb", 0}, s1)
+
+      {s2, {:applied_at, _, :ok}, _e2} =
+        StateMachine.apply(meta2, {:put, "del_rc_b", "vb", 0}, s1)
 
       # 3rd command is a delete -- should trigger release_cursor
       meta3 = %{index: 12, term: 1, system_time: System.os_time(:millisecond)}
@@ -469,7 +572,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
+          shard_data_path: System.tmp_dir!(),
+          active_file_id: 0,
+          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: interval
         })
@@ -478,7 +583,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state_before =
         Enum.reduce(1..3, state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
-          {new_state, {:applied_at, _, :ok}, _e} = StateMachine.apply(meta, {:put, "pre_#{i}", "v#{i}", 0}, acc)
+
+          {new_state, {:applied_at, _, :ok}, _e} =
+            StateMachine.apply(meta, {:put, "pre_#{i}", "v#{i}", 0}, acc)
+
           new_state
         end)
 
@@ -528,7 +636,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 2,
-          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
+          shard_data_path: System.tmp_dir!(),
+          active_file_id: 0,
+          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: interval
         })
@@ -537,11 +647,15 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state_after =
         Enum.reduce(1..2, state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
-          {new_state, {:applied_at, _, :ok}, _e} = StateMachine.apply(meta, {:put, "snap_#{i}", "v#{i}", 0}, acc)
+
+          {new_state, {:applied_at, _, :ok}, _e} =
+            StateMachine.apply(meta, {:put, "snap_#{i}", "v#{i}", 0}, acc)
+
           new_state
         end)
 
       meta = %{index: 3, term: 1, system_time: System.os_time(:millisecond)}
+
       {_new_state, {:applied_at, _, :ok}, effects} =
         StateMachine.apply(meta, {:put, "snap_3", "v3", 0}, state_after)
 

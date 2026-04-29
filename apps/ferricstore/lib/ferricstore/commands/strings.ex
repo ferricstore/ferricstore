@@ -282,11 +282,12 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
 
   def handle("SETNX", [key, value], store) do
-    if Ops.exists?(store, key) do
-      0
-    else
-      Ops.put(store, key, value, 0)
-      1
+    opts = %{expire_at_ms: 0, nx: true, xx: false, get: false, keepttl: false}
+
+    case Ops.set(store, key, value, opts) do
+      :ok -> 1
+      nil -> 0
+      {:error, _} = err -> err
     end
   end
 
@@ -539,40 +540,10 @@ defmodule Ferricstore.Commands.Strings do
 
   defp do_set(key, value, opts, store) do
     with {:ok, parsed} <- parse_set_opts(opts) do
-      %{expire_at_ms: expire_at_ms, nx: nx?, xx: xx?, get: get?, keepttl: keepttl?} = parsed
-
-      # Read old value/meta when GET or KEEPTTL is requested.
-      # We need old_meta for KEEPTTL (to preserve the existing expire_at_ms)
-      # and the old value for GET (to return it).
-      {old_value, effective_expire} =
-        if get? or keepttl? do
-          case Ops.get_meta(store, key) do
-            nil ->
-              {nil, expire_at_ms}
-
-            {old_val, old_exp} ->
-              # KEEPTTL: use the old expiry when no explicit expiry was set
-              eff_exp = if keepttl?, do: old_exp, else: expire_at_ms
-              {old_val, eff_exp}
-          end
-        else
-          {nil, expire_at_ms}
-        end
-
-      # Condition check: NX (only if not exists) / XX (only if exists)
-      skip? =
-        cond do
-          nx? and Ops.exists?(store, key) -> true
-          xx? and not Ops.exists?(store, key) -> true
-          true -> false
-        end
-
-      if skip? do
-        # When GET is set, return old value even if NX/XX prevented the write
-        if get?, do: old_value, else: nil
+      if parsed.nx or parsed.xx or parsed.get or parsed.keepttl do
+        Ops.set(store, key, value, parsed)
       else
-        Ops.put(store, key, value, effective_expire)
-        if get?, do: old_value, else: :ok
+        Ops.put(store, key, value, parsed.expire_at_ms)
       end
     end
   end

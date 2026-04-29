@@ -216,6 +216,7 @@ defmodule Ferricstore.Store.Router do
   # namespace is configured `:async`. Adding a new coordination primitive?
   # Add it here.
   @doc false
+  def always_quorum?({:set, _, _, _, _}), do: true
   def always_quorum?({:cas, _, _, _, _}), do: true
   def always_quorum?({:lock, _, _, _}), do: true
   def always_quorum?({:unlock, _, _}), do: true
@@ -1443,6 +1444,33 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @doc """
+  Atomically applies Redis SET options in Raft order.
+
+  Unlike `put/4`, this keeps NX/XX/GET/KEEPTTL checks inside the state
+  machine so concurrent conditional SETs serialize correctly.
+  """
+  @spec set(FerricStore.Instance.t(), binary(), binary(), map()) :: term()
+  def set(ctx, key, value, opts) do
+    cond do
+      byte_size(key) > @max_key_size ->
+        {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+
+      is_binary(value) and byte_size(value) >= @max_value_size ->
+        {:error, "ERR value too large (max #{@max_value_size} bytes)"}
+
+      true ->
+        case check_keydir_full_for_set(ctx, key, opts) do
+          :ok ->
+            idx = shard_for(ctx, key)
+            raft_write(ctx, idx, key, {:set, key, value, opts.expire_at_ms, opts})
+
+          {:error, _} = err ->
+            err
+        end
+    end
+  end
+
   # Checks if the keydir is full. If so, only allows writes to existing keys.
   # Checks both `keydir_full?` (ETS-level memory guard) and `reject_writes?`
   # (noeviction policy with reject-level pressure). The Shard GenServer has its
@@ -1462,6 +1490,29 @@ defmodule Ferricstore.Store.Router do
         # Without this, the next eviction cycle is up to 100ms away.
         Ferricstore.MemoryGuard.nudge()
         {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp check_keydir_full_for_set(ctx, key, opts) do
+    keydir_full = :atomics.get(ctx.pressure_flags, 1) == 1
+    reject_writes = :atomics.get(ctx.pressure_flags, 2) == 1
+
+    if keydir_full or reject_writes do
+      existing? = exists_fast?(ctx, key)
+
+      cond do
+        existing? ->
+          :ok
+
+        opts.xx ->
+          :ok
+
+        true ->
+          Ferricstore.MemoryGuard.nudge()
+          {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}
       end
     else
       :ok

@@ -50,6 +50,49 @@ defmodule Ferricstore.WritePathSetOptionsTest do
   # =========================================================================
 
   describe "SET EXAT/PXAT/GET/KEEPTTL" do
+    test "quorum SET emits bounded batcher telemetry" do
+      store = real_store()
+      key = ukey("telemetry_setnx")
+      handler_id = {:set_options_quorum_telemetry, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach_many(
+          handler_id,
+          [
+            [:ferricstore, :batcher, :slot_flush],
+            [:ferricstore, :batcher, :quorum_submit]
+          ],
+          fn event, measurements, metadata, test_pid ->
+            send(test_pid, {:quorum_telemetry, event, measurements, metadata})
+          end,
+          self()
+        )
+
+      try do
+        assert :ok = Ferricstore.Commands.Strings.handle("SET", [key, "v", "NX"], store)
+
+        assert_receive {:quorum_telemetry, [:ferricstore, :batcher, :slot_flush], flush_meas,
+                        %{durability: :quorum}},
+                       1_000
+
+        assert flush_meas.batch_size >= 1
+        assert flush_meas.caller_count >= 1
+        assert is_integer(flush_meas.queue_wait_us)
+
+        assert_receive {:quorum_telemetry, [:ferricstore, :batcher, :quorum_submit], submit_meas,
+                        %{kind: kind, status: status}},
+                       1_000
+
+        assert kind in [:single, :batch]
+        assert status in [:ok, :unknown]
+        assert submit_meas.batch_size >= 1
+        assert submit_meas.command_bytes > 0
+        assert is_integer(submit_meas.duration_us)
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
     test "SET EXAT with future timestamp sets correct expiry" do
       store = real_store()
       future_ts = div(System.os_time(:millisecond), 1000) + 60
@@ -178,6 +221,42 @@ defmodule Ferricstore.WritePathSetOptionsTest do
       assert result2 == nil
 
       assert "first" == store.get.(key)
+    end
+
+    test "concurrent SET NX serializes the existence check with the write" do
+      ctx = FerricStore.Instance.get(:default)
+      key = ukey("setnx_race")
+
+      results =
+        1..20
+        |> Enum.map(fn value ->
+          Task.async(fn ->
+            Ferricstore.Commands.Strings.handle("SET", [key, "value_#{value}", "NX"], ctx)
+          end)
+        end)
+        |> Enum.map(&Task.await(&1, 10_000))
+
+      assert Enum.count(results, &(&1 == :ok)) == 1
+      assert Enum.count(results, &is_nil/1) == 19
+      assert Router.get(ctx, key) in Enum.map(1..20, &"value_#{&1}")
+    end
+
+    test "concurrent SETNX serializes the existence check with the write" do
+      ctx = FerricStore.Instance.get(:default)
+      key = ukey("setnx_cmd_race")
+
+      results =
+        1..20
+        |> Enum.map(fn value ->
+          Task.async(fn ->
+            Ferricstore.Commands.Strings.handle("SETNX", [key, "value_#{value}"], ctx)
+          end)
+        end)
+        |> Enum.map(&Task.await(&1, 10_000))
+
+      assert Enum.count(results, &(&1 == 1)) == 1
+      assert Enum.count(results, &(&1 == 0)) == 19
+      assert Router.get(ctx, key) in Enum.map(1..20, &"value_#{&1}")
     end
 
     test "SET XX only sets if key exists" do

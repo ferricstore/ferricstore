@@ -63,6 +63,27 @@ defmodule Ferricstore.Store.Ops do
 
   def put(store, key, value, exp) when is_map(store), do: store.put.(key, value, exp)
 
+  @spec set(store(), binary(), binary(), map()) :: term()
+  def set(%FerricStore.Instance{} = ctx, key, value, opts), do: Router.set(ctx, key, value, opts)
+
+  def set(%LocalTxStore{} = tx, key, value, opts) do
+    if local?(tx, key) do
+      local_set(tx, key, value, opts)
+    else
+      Router.set(tx.instance_ctx, key, value, opts)
+    end
+  end
+
+  def set(store, key, value, opts) when is_map(store) do
+    case store do
+      %{set: set_fun} when is_function(set_fun, 3) ->
+        set_fun.(key, value, opts)
+
+      _ ->
+        fallback_set(store, key, value, opts)
+    end
+  end
+
   @spec delete(store(), binary()) :: :ok
   def delete(%FerricStore.Instance{} = ctx, key), do: Router.delete(ctx, key)
 
@@ -549,6 +570,66 @@ defmodule Ferricstore.Store.Ops do
             {value, 0}
           _error -> nil
         end
+    end
+  end
+
+  defp local_set(tx, key, value, opts) do
+    {old_value, effective_expire} =
+      if opts.get or opts.keepttl do
+        case local_read_meta(tx, key) do
+          nil ->
+            {nil, opts.expire_at_ms}
+
+          {old_val, old_exp} ->
+            {old_val, if(opts.keepttl, do: old_exp, else: opts.expire_at_ms)}
+        end
+      else
+        {nil, opts.expire_at_ms}
+      end
+
+    skip? =
+      cond do
+        opts.nx and local_read_meta(tx, key) != nil -> true
+        opts.xx and local_read_meta(tx, key) == nil -> true
+        true -> false
+      end
+
+    if skip? do
+      if opts.get, do: old_value, else: nil
+    else
+      ShardETS.ets_insert(tx.shard_state, key, value, effective_expire)
+      tx_undelete(key)
+      send(self(), {:tx_pending_write, key, value, effective_expire})
+      if opts.get, do: old_value, else: :ok
+    end
+  end
+
+  defp fallback_set(store, key, value, opts) do
+    {old_value, effective_expire} =
+      if opts.get or opts.keepttl do
+        case get_meta(store, key) do
+          nil ->
+            {nil, opts.expire_at_ms}
+
+          {old_val, old_exp} ->
+            {old_val, if(opts.keepttl, do: old_exp, else: opts.expire_at_ms)}
+        end
+      else
+        {nil, opts.expire_at_ms}
+      end
+
+    skip? =
+      cond do
+        opts.nx and exists?(store, key) -> true
+        opts.xx and not exists?(store, key) -> true
+        true -> false
+      end
+
+    if skip? do
+      if opts.get, do: old_value, else: nil
+    else
+      put(store, key, value, effective_expire)
+      if opts.get, do: old_value, else: :ok
     end
   end
 
