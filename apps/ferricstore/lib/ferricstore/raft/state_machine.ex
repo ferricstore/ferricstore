@@ -2170,7 +2170,9 @@ defmodule Ferricstore.Raft.StateMachine do
               :stale
             )
 
-            :ok
+            set_disk_pressure(state)
+            rollback_pending_writes(state)
+            {:error, :active_file_unavailable}
 
           {file_path, file_id} ->
             started_at = System.monotonic_time()
@@ -2186,12 +2188,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
             case append_result do
               {:ok, locations} ->
-                if state.instance_ctx do
-                  :atomics.put(state.instance_ctx.checkpoint_flags, state.shard_index + 1, 1)
-                  Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.shard_index)
-                else
-                  Ferricstore.Store.DiskPressure.clear(state.shard_index)
-                end
+                clear_disk_pressure(state)
 
                 Enum.zip(batch, locations)
                 |> Enum.each(fn {{key, _val, _exp}, {offset, value_size}} ->
@@ -2207,12 +2204,7 @@ defmodule Ferricstore.Raft.StateMachine do
                 end)
 
               {:error, reason} ->
-                if state.instance_ctx do
-                  Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.shard_index)
-                else
-                  Ferricstore.Store.DiskPressure.set(state.shard_index)
-                end
-
+                set_disk_pressure(state)
                 rollback_pending_writes(state)
                 {:error, {:bitcask_append_failed, reason}}
             end
@@ -2264,6 +2256,23 @@ defmodule Ferricstore.Raft.StateMachine do
   defp append_result_class({:error, _}), do: :error
   defp append_result_class(:stale), do: :stale
   defp append_result_class(_), do: :unknown
+
+  defp set_disk_pressure(state) do
+    if state.instance_ctx do
+      Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.shard_index)
+    else
+      Ferricstore.Store.DiskPressure.set(state.shard_index)
+    end
+  end
+
+  defp clear_disk_pressure(state) do
+    if state.instance_ctx do
+      :atomics.put(state.instance_ctx.checkpoint_flags, state.shard_index + 1, 1)
+      Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.shard_index)
+    else
+      Ferricstore.Store.DiskPressure.clear(state.shard_index)
+    end
+  end
 
   defp duration_us(started_at) do
     System.monotonic_time()
@@ -2351,18 +2360,17 @@ defmodule Ferricstore.Raft.StateMachine do
     # resurrect the key on recovery (Bitcask last-record-wins semantics).
     flush_pending_for_key(state, key)
 
-    # If this key holds prob metadata, delete the associated prob file.
-    # Must happen before the ETS entry is removed so we can read the value.
-    maybe_delete_prob_file(state, key)
-
     case resolve_active_file(state) do
       :stale ->
-        :ets.delete(state.ets, key)
-        :ok
+        set_disk_pressure(state)
+        {:error, :active_file_unavailable}
 
       {file_path, _file_id} ->
         case NIF.v2_append_tombstone(file_path, key) do
           {:ok, _} ->
+            # Keep prob sidecar files until the tombstone is durable enough
+            # for this apply to succeed; otherwise the metadata would remain.
+            maybe_delete_prob_file(state, key)
             track_keydir_binary_remove(state, key)
             :ets.delete(state.ets, key)
             :ok

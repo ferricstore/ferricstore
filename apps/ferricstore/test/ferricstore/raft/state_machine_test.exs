@@ -93,6 +93,59 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "apply/3 with {:put, key, value, expire_at_ms}" do
+    test "missing active file fails put and rolls back new key", %{
+      state: state,
+      ets: ets
+    } do
+      missing_state = state_with_missing_active_file(state)
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:put, "missing_active_new", "value", 0}, missing_state)
+
+      assert {:error, :active_file_unavailable} = result
+      assert [] == :ets.lookup(ets, "missing_active_new")
+    end
+
+    test "missing active file fails overwrite and restores old ETS entry", %{
+      state: state,
+      ets: ets
+    } do
+      {state2, :ok} = StateMachine.apply(%{}, {:put, "missing_active_existing", "old", 0}, state)
+      old_entry = :ets.lookup(ets, "missing_active_existing")
+      missing_state = state_with_missing_active_file(state2)
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:put, "missing_active_existing", "new", 0}, missing_state)
+
+      assert {:error, :active_file_unavailable} = result
+      assert old_entry == :ets.lookup(ets, "missing_active_existing")
+    end
+
+    test "missing state active file falls back to live ActiveFile registry", %{
+      state: state,
+      ets: ets,
+      dir: dir,
+      shard_index: shard_index
+    } do
+      file_id = 8_000_000 + :erlang.unique_integer([:positive])
+      live_path = Path.join(dir, "#{file_id}.log")
+      File.touch!(live_path)
+      Ferricstore.Store.ActiveFile.publish(shard_index, file_id, live_path, dir)
+
+      missing_state = state_with_missing_active_file(state, shard_index: shard_index)
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:put, "missing_active_fallback", "value", 0}, missing_state)
+
+      assert :ok = result
+
+      assert [{"missing_active_fallback", "value", 0, _, ^file_id, offset, value_size}] =
+               :ets.lookup(ets, "missing_active_fallback")
+
+      assert is_integer(offset)
+      assert value_size > 0
+    end
+
     test "Bitcask append errors fail quorum apply and roll back pending ETS", %{
       state: state,
       ets: ets
@@ -227,6 +280,41 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {s1, :ok} = StateMachine.apply(%{}, {:put, "k", "v", 0}, state)
       {s2, :ok} = StateMachine.apply(%{}, {:delete, "k"}, s1)
       {_s3, :ok} = StateMachine.apply(%{}, {:delete, "k"}, s2)
+    end
+
+    test "missing active file fails delete and keeps ETS entry", %{state: state, ets: ets} do
+      {state2, :ok} = StateMachine.apply(%{}, {:put, "missing_active_delete", "val", 0}, state)
+      old_entry = :ets.lookup(ets, "missing_active_delete")
+      missing_state = state_with_missing_active_file(state2)
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:delete, "missing_active_delete"}, missing_state)
+
+      assert {:error, :active_file_unavailable} = result
+      assert old_entry == :ets.lookup(ets, "missing_active_delete")
+    end
+
+    test "missing active file does not remove prob file during failed delete", %{
+      state: state,
+      ets: ets,
+      dir: dir
+    } do
+      key = "missing_active_prob_delete"
+      prob_dir = Path.join(dir, "prob")
+      File.mkdir_p!(prob_dir)
+      prob_path = Path.join(prob_dir, "#{Base.url_encode64(key, padding: false)}.cms")
+      File.write!(prob_path, "cms")
+
+      meta = :erlang.term_to_binary({:cms_meta, %{width: 1, depth: 1}})
+      {state2, :ok} = StateMachine.apply(%{}, {:put, key, meta, 0}, state)
+      old_entry = :ets.lookup(ets, key)
+      missing_state = state_with_missing_active_file(state2)
+
+      {_new_state, result} = StateMachine.apply(%{}, {:delete, key}, missing_state)
+
+      assert {:error, :active_file_unavailable} = result
+      assert old_entry == :ets.lookup(ets, key)
+      assert File.exists?(prob_path)
     end
   end
 
@@ -675,5 +763,17 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert Map.has_key?(overview, :release_cursor_interval)
       assert is_integer(overview.release_cursor_interval)
     end
+  end
+
+  defp state_with_missing_active_file(state, opts \\ []) do
+    file_id = 9_000_000 + :erlang.unique_integer([:positive])
+    shard_index = Keyword.get(opts, :shard_index, 100_000 + :erlang.unique_integer([:positive]))
+
+    %{
+      state
+      | shard_index: shard_index,
+        active_file_id: file_id,
+        active_file_path: Path.join(state.shard_data_path, "#{file_id}.log")
+    }
   end
 end
