@@ -3,6 +3,7 @@ defmodule Ferricstore.MetricsTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Metrics
+  alias Ferricstore.PrefixMetricsCache
   alias Ferricstore.QuorumMetrics
 
   # ---------------------------------------------------------------------------
@@ -237,6 +238,46 @@ defmodule Ferricstore.MetricsTest do
       assert String.contains?(
                text,
                ~s(ferricstore_quorum_bitcask_append_batch_bytes_total{shard_index="2",status="ok"} 42)
+             )
+    end
+
+    test "serves prefix metrics from cache instead of rescanning on every scrape" do
+      PrefixMetricsCache.reset()
+
+      prefix = "metrics_cache_#{System.unique_integer([:positive])}"
+      key = "#{prefix}:key"
+
+      :ets.insert(:keydir_0, {key, "value", 0, 0, 0, 0, byte_size("value")})
+
+      on_exit(fn ->
+        :ets.delete(:keydir_0, key)
+        PrefixMetricsCache.reset()
+      end)
+
+      assert :ok = PrefixMetricsCache.refresh_now()
+
+      text = Metrics.handle("FERRICSTORE.METRICS", [])
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_prefix_key_count{prefix="#{prefix}"} 1)
+             )
+
+      :ets.delete(:keydir_0, key)
+
+      cached_text = Metrics.handle("FERRICSTORE.METRICS", [])
+
+      assert String.contains?(
+               cached_text,
+               ~s(ferricstore_prefix_key_count{prefix="#{prefix}"} 1)
+             )
+
+      assert :ok = PrefixMetricsCache.refresh_now()
+      refreshed_text = Metrics.handle("FERRICSTORE.METRICS", [])
+
+      refute String.contains?(
+               refreshed_text,
+               ~s(ferricstore_prefix_key_count{prefix="#{prefix}"} 1)
              )
     end
   end

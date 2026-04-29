@@ -26,6 +26,7 @@ defmodule Ferricstore.Metrics do
   | `ferricstore_slowlog_entries`            | gauge   | `SlowLog.len/0`              |
   | `ferricstore_namespace_window_ms`        | gauge   | `NamespaceConfig.get_all/0`   |
   | `ferricstore_namespace_durability`       | gauge   | `NamespaceConfig.get_all/0`   |
+  | `ferricstore_prefix_*`                   | mixed   | `PrefixMetricsCache`          |
   | `ferricstore_quorum_*`                   | counter | `QuorumMetrics` telemetry     |
 
   ## Usage
@@ -209,90 +210,7 @@ defmodule Ferricstore.Metrics do
 
   @spec prefix_metrics_text() :: binary()
   defp prefix_metrics_text do
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
-
-    # Aggregate key counts and keydir bytes per prefix across all shards
-    now = System.os_time(:millisecond)
-
-    prefix_data =
-      Enum.reduce(0..(shard_count - 1), %{}, fn i, acc ->
-        table = :"keydir_#{i}"
-        try do
-          :ets.foldl(fn {key, _value, exp, _lfu, _fid, _off, _vsize}, inner_acc ->
-            # Skip expired keys (exp > 0 means has TTL, skip if past)
-            if exp > 0 and exp <= now do
-              inner_acc
-            else
-              prefix = Stats.extract_prefix(key)
-              key_bytes = byte_size(key) + 8 + 8 + 64
-              {count, bytes} = Map.get(inner_acc, prefix, {0, 0})
-              Map.put(inner_acc, prefix, {count + 1, bytes + key_bytes})
-            end
-          end, acc, table)
-        rescue _ -> acc
-        catch _, _ -> acc
-        end
-      end)
-
-    # Get hotness data per prefix
-    hotness_data =
-      try do
-        :ets.tab2list(:ferricstore_hotness)
-        |> Map.new(fn {prefix, hot, cold} -> {prefix, {hot, cold}} end)
-      rescue _ -> %{}
-      catch _, _ -> %{}
-      end
-
-    if prefix_data == %{} and hotness_data == %{} do
-      ""
-    else
-      all_prefixes =
-        MapSet.union(
-          MapSet.new(Map.keys(prefix_data)),
-          MapSet.new(Map.keys(hotness_data))
-        )
-        |> Enum.sort()
-
-      key_count_samples =
-        Enum.map_join(all_prefixes, "\n", fn prefix ->
-          {count, _bytes} = Map.get(prefix_data, prefix, {0, 0})
-          "ferricstore_prefix_key_count{prefix=\"#{escape_label(prefix)}\"} #{count}"
-        end)
-
-      keydir_bytes_samples =
-        Enum.map_join(all_prefixes, "\n", fn prefix ->
-          {_count, bytes} = Map.get(prefix_data, prefix, {0, 0})
-          "ferricstore_prefix_keydir_bytes{prefix=\"#{escape_label(prefix)}\"} #{bytes}"
-        end)
-
-      hot_reads_samples =
-        Enum.map_join(all_prefixes, "\n", fn prefix ->
-          {hot, _cold} = Map.get(hotness_data, prefix, {0, 0})
-          "ferricstore_prefix_hot_reads{prefix=\"#{escape_label(prefix)}\"} #{hot}"
-        end)
-
-      cold_reads_samples =
-        Enum.map_join(all_prefixes, "\n", fn prefix ->
-          {_hot, cold} = Map.get(hotness_data, prefix, {0, 0})
-          "ferricstore_prefix_cold_reads{prefix=\"#{escape_label(prefix)}\"} #{cold}"
-        end)
-
-      "# HELP ferricstore_prefix_key_count Number of live keys per prefix\n" <>
-        "# TYPE ferricstore_prefix_key_count gauge\n" <>
-        key_count_samples <>
-        "\n" <>
-        "# HELP ferricstore_prefix_keydir_bytes Estimated keydir ETS bytes per prefix\n" <>
-        "# TYPE ferricstore_prefix_keydir_bytes gauge\n" <>
-        keydir_bytes_samples <>
-        "\n" <>
-        "# HELP ferricstore_prefix_hot_reads Hot reads (ETS cache hits) per prefix\n" <>
-        "# TYPE ferricstore_prefix_hot_reads counter\n" <>
-        hot_reads_samples <>
-        "\n" <>
-        "# HELP ferricstore_prefix_cold_reads Cold reads (Bitcask fallbacks) per prefix\n" <>
-        "# TYPE ferricstore_prefix_cold_reads counter\n" <>
-        cold_reads_samples
-    end
+    Ferricstore.PrefixMetricsCache.text()
   end
 
   # ---------------------------------------------------------------------------
