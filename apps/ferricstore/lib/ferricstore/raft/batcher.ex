@@ -462,6 +462,12 @@ defmodule Ferricstore.Raft.Batcher do
     {:reply, :ok, %{state | pending: Map.put(state.pending, corr, entry)}}
   end
 
+  def handle_call({:__inject_quorum_pending__, corr, froms, kind, mono}, _from, state)
+      when kind in [:single, :batch] do
+    entry = {froms, kind, mono}
+    {:reply, :ok, %{state | pending: Map.put(state.pending, corr, entry)}}
+  end
+
   def handle_call(:__latest_async_corr__, _from, state) do
     latest =
       Enum.reduce(state.pending, {nil, 0}, fn
@@ -1431,6 +1437,21 @@ defmodule Ferricstore.Raft.Batcher do
     GenServer.call(
       batcher_name(shard_index),
       {:__inject_async_pending__, corr, batch, retry_count, submitted_mono}
+    )
+  end
+
+  @doc false
+  @spec __inject_quorum_pending_at__(
+          non_neg_integer(),
+          reference(),
+          [GenServer.from()],
+          :single | :batch,
+          integer()
+        ) :: :ok
+  def __inject_quorum_pending_at__(shard_index, corr, froms, kind, submitted_mono) do
+    GenServer.call(
+      batcher_name(shard_index),
+      {:__inject_quorum_pending__, corr, froms, kind, submitted_mono}
     )
   end
 

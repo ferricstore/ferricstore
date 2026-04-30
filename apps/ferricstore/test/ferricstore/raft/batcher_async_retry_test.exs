@@ -209,4 +209,70 @@ defmodule Ferricstore.Raft.BatcherAsyncRetryTest do
       end
     end
   end
+
+  describe "quorum TTL sweep" do
+    test "stale single pending entry replies unknown outcome and is removed" do
+      attach_events({:retry_test, :quorum_single_ttl}, [
+        [:ferricstore, :batcher, :quorum_timeout]
+      ], self())
+
+      try do
+        idx = 0
+        corr = make_ref()
+        reply_ref = make_ref()
+        froms = [{self(), reply_ref}]
+
+        old_mono =
+          System.monotonic_time() -
+            System.convert_time_unit(60_000, :millisecond, :native)
+
+        Batcher.__inject_quorum_pending_at__(idx, corr, froms, :single, old_mono)
+        assert Batcher.__has_pending__(idx, corr)
+
+        Batcher.__sweep_pending_now__(idx)
+
+        assert_receive {^reply_ref, {:error, {:timeout, :unknown_outcome}}}, 1_000
+
+        assert_receive {:telemetry, [:ferricstore, :batcher, :quorum_timeout],
+                        %{caller_count: 1, kind: :single}, %{reason: :ttl}},
+                       1_000
+
+        refute Batcher.__has_pending__(idx, corr)
+      after
+        :telemetry.detach({:retry_test, :quorum_single_ttl})
+      end
+    end
+
+    test "stale batch pending entry replies unknown outcome and is removed" do
+      attach_events({:retry_test, :quorum_batch_ttl}, [
+        [:ferricstore, :batcher, :quorum_timeout]
+      ], self())
+
+      try do
+        idx = 0
+        corr = make_ref()
+        reply_ref = make_ref()
+        froms = [{self(), reply_ref}]
+
+        old_mono =
+          System.monotonic_time() -
+            System.convert_time_unit(60_000, :millisecond, :native)
+
+        Batcher.__inject_quorum_pending_at__(idx, corr, froms, :batch, old_mono)
+        assert Batcher.__has_pending__(idx, corr)
+
+        Batcher.__sweep_pending_now__(idx)
+
+        assert_receive {^reply_ref, {:error, {:timeout, :unknown_outcome}}}, 1_000
+
+        assert_receive {:telemetry, [:ferricstore, :batcher, :quorum_timeout],
+                        %{caller_count: 1, kind: :batch}, %{reason: :ttl}},
+                       1_000
+
+        refute Batcher.__has_pending__(idx, corr)
+      after
+        :telemetry.detach({:retry_test, :quorum_batch_ttl})
+      end
+    end
+  end
 end
