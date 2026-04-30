@@ -1087,6 +1087,11 @@ defmodule Ferricstore.Raft.StateMachine do
     }
   end
 
+  @doc false
+  def __validate_pending_locations__(batch, locations) do
+    validate_pending_locations(batch, locations)
+  end
+
   # ---------------------------------------------------------------------------
   # Private: release_cursor compaction
   # ---------------------------------------------------------------------------
@@ -2176,6 +2181,7 @@ defmodule Ferricstore.Raft.StateMachine do
           {file_path, file_id} ->
             started_at = System.monotonic_time()
             append_result = append_pending_batch(file_path, batch)
+            validated_append_result = validate_append_result(batch, append_result)
 
             emit_bitcask_append_telemetry(
               state,
@@ -2183,10 +2189,10 @@ defmodule Ferricstore.Raft.StateMachine do
               length(batch),
               batch_bytes,
               delete_count,
-              append_result
+              validated_append_result
             )
 
-            case append_result do
+            case validated_append_result do
               {:ok, locations} ->
                 clear_disk_pressure(state)
                 apply_pending_locations(state, file_id, batch, locations)
@@ -2243,6 +2249,44 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp validate_append_result(batch, {:ok, locations}) do
+    case validate_pending_locations(batch, locations) do
+      :ok -> {:ok, locations}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_append_result(_batch, append_result), do: append_result
+
+  defp validate_pending_locations(batch, locations) when length(batch) != length(locations) do
+    {:error,
+     {:bitcask_append_result_mismatch, {:length_mismatch, length(batch), length(locations)}}}
+  end
+
+  defp validate_pending_locations(batch, locations) do
+    batch
+    |> Enum.zip(locations)
+    |> Enum.with_index()
+    |> Enum.reduce_while(:ok, fn {{entry, location}, index}, :ok ->
+      expected = pending_entry_op(entry)
+      actual = pending_location_op(location)
+
+      if expected == actual do
+        {:cont, :ok}
+      else
+        {:halt,
+         {:error, {:bitcask_append_result_mismatch, {:op_mismatch, index, expected, actual}}}}
+      end
+    end)
+  end
+
+  defp pending_entry_op({:put, _key, _value, _expire_at_ms}), do: :put
+  defp pending_entry_op({:delete, _key, _prob_path}), do: :delete
+
+  defp pending_location_op({:put, _offset, _value_size}), do: :put
+  defp pending_location_op({:delete, _offset, _record_size}), do: :delete
+  defp pending_location_op(_location), do: :unknown
+
   defp apply_pending_locations(state, file_id, batch, locations) do
     Enum.zip(batch, locations)
     |> Enum.each(fn
@@ -2262,9 +2306,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
       {{:delete, _key, prob_path}, {:delete, _offset, _record_size}} ->
         maybe_delete_prob_file_path(state, prob_path)
-
-      {_entry, _location} ->
-        :ok
     end)
   end
 

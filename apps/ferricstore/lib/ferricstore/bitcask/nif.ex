@@ -28,7 +28,8 @@ defmodule Ferricstore.Bitcask.NIF do
           {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, term()}
   def v2_append_record(_path, _key, _value, _expire_at_ms), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec v2_append_tombstone(binary(), binary()) :: {:ok, non_neg_integer()} | {:error, term()}
+  @spec v2_append_tombstone(binary(), binary()) ::
+          {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, term()}
   def v2_append_tombstone(_path, _key), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec v2_append_batch(binary(), [{binary(), binary(), non_neg_integer()}]) ::

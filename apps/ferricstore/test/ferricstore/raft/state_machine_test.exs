@@ -316,6 +316,33 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert old_entry == :ets.lookup(ets, key)
       assert File.exists?(prob_path)
     end
+
+    test "append failure rolls back deleted entry in a mixed batch", %{state: state, ets: ets} do
+      {state2, :ok} =
+        StateMachine.apply(%{}, {:put, "delete_append_failure_keep", "old", 0}, state)
+
+      old_entry = :ets.lookup(ets, "delete_append_failure_keep")
+      file_id = 9_100_000 + :erlang.unique_integer([:positive])
+      bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+      File.mkdir_p!(bad_active_path)
+
+      bad_state = %{state2 | active_file_id: file_id, active_file_path: bad_active_path}
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:batch,
+           [
+             {:put, "delete_append_failure_new", "new", 0},
+             {:delete, "delete_append_failure_keep"}
+           ]},
+          bad_state
+        )
+
+      assert {:error, {:bitcask_append_failed, _reason}} = result
+      assert old_entry == :ets.lookup(ets, "delete_append_failure_keep")
+      assert [] == :ets.lookup(ets, "delete_append_failure_new")
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -413,6 +440,47 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert length(results) == 100
       assert Enum.all?(results, &(&1 == :ok))
       assert new_state.applied_count == 100
+    end
+  end
+
+  describe "pending batch location validation" do
+    test "rejects a result count that does not match the batch" do
+      batch = [
+        {:put, "k1", "v1", 0},
+        {:delete, "k2", nil}
+      ]
+
+      assert {:error, {:bitcask_append_result_mismatch, {:length_mismatch, 2, 1}}} =
+               StateMachine.__validate_pending_locations__(batch, [{:put, 0, 2}])
+    end
+
+    test "rejects out-of-order operation tags" do
+      batch = [
+        {:put, "k1", "v1", 0},
+        {:delete, "k2", nil}
+      ]
+
+      locations = [
+        {:delete, 0, 28},
+        {:put, 28, 2}
+      ]
+
+      assert {:error, {:bitcask_append_result_mismatch, {:op_mismatch, 0, :put, :delete}}} =
+               StateMachine.__validate_pending_locations__(batch, locations)
+    end
+
+    test "accepts matching put and delete result tags in order" do
+      batch = [
+        {:put, "k1", "v1", 0},
+        {:delete, "k2", nil}
+      ]
+
+      locations = [
+        {:put, 0, 2},
+        {:delete, 30, 28}
+      ]
+
+      assert :ok = StateMachine.__validate_pending_locations__(batch, locations)
     end
   end
 
