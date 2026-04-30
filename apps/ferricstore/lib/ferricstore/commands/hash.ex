@@ -25,7 +25,7 @@ defmodule Ferricstore.Commands.Hash do
   WRONGTYPE error is returned.
   """
 
-  alias Ferricstore.HLC
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.TypeRegistry
@@ -292,7 +292,7 @@ defmodule Ferricstore.Commands.Hash do
          {:ok, count} <- parse_positive_integer(count_str, "count"),
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
-        expire_at_ms = HLC.now_ms() + seconds * 1000
+        expire_at_ms = CommandTime.now_ms() + seconds * 1000
 
         Enum.map(fields, fn field ->
           compound_key = CompoundKey.hash_field(key, field)
@@ -324,7 +324,7 @@ defmodule Ferricstore.Commands.Hash do
     with {:ok, count} <- parse_positive_integer(count_str, "count"),
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
-        now = HLC.now_ms()
+        now = CommandTime.now_ms()
 
         Enum.map(fields, fn field ->
           compound_key = CompoundKey.hash_field(key, field)
@@ -393,7 +393,7 @@ defmodule Ferricstore.Commands.Hash do
          {:ok, count} <- parse_positive_integer(count_str, "count"),
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
-        expire_at_ms = HLC.now_ms() + ms
+        expire_at_ms = CommandTime.now_ms() + ms
 
         Enum.map(fields, fn field ->
           compound_key = CompoundKey.hash_field(key, field)
@@ -425,7 +425,7 @@ defmodule Ferricstore.Commands.Hash do
     with {:ok, count} <- parse_positive_integer(count_str, "count"),
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
-        now = HLC.now_ms()
+        now = CommandTime.now_ms()
 
         Enum.map(fields, fn field ->
           compound_key = CompoundKey.hash_field(key, field)
@@ -587,7 +587,7 @@ defmodule Ferricstore.Commands.Hash do
     with {:ok, seconds} <- parse_positive_integer(seconds_str, "seconds") do
       if even_length?(field_value_pairs) do
         with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
-          expire_at_ms = HLC.now_ms() + seconds * 1000
+          expire_at_ms = CommandTime.now_ms() + seconds * 1000
           hset_pairs_with_ttl(field_value_pairs, key, store, expire_at_ms, 0)
         end
       else
@@ -636,7 +636,9 @@ defmodule Ferricstore.Commands.Hash do
             pairs
 
           pattern ->
-            Enum.filter(pairs, fn {field, _value} -> Ferricstore.GlobMatcher.match?(field, pattern) end)
+            Enum.filter(pairs, fn {field, _value} ->
+              Ferricstore.GlobMatcher.match?(field, pattern)
+            end)
         end
 
       {next_cursor, batch} = paginate(filtered, cursor, count)
@@ -663,7 +665,9 @@ defmodule Ferricstore.Commands.Hash do
       pairs = Ops.compound_scan(store, key, prefix)
 
       case pairs do
-        [] -> nil
+        [] ->
+          nil
+
         _ ->
           {field, _value} = Enum.random(pairs)
           field
@@ -803,7 +807,8 @@ defmodule Ferricstore.Commands.Hash do
   defp parse_expiry_mode("EX", value_str) do
     case Integer.parse(value_str) do
       {seconds, ""} when seconds > 0 ->
-        {:ok, HLC.now_ms() + seconds * 1000}
+        {:ok, CommandTime.now_ms() + seconds * 1000}
+
       _ ->
         {:error, "ERR value is not an integer or out of range"}
     end
@@ -812,7 +817,8 @@ defmodule Ferricstore.Commands.Hash do
   defp parse_expiry_mode("PX", value_str) do
     case Integer.parse(value_str) do
       {ms, ""} when ms > 0 ->
-        {:ok, HLC.now_ms() + ms}
+        {:ok, CommandTime.now_ms() + ms}
+
       _ ->
         {:error, "ERR value is not an integer or out of range"}
     end
@@ -822,6 +828,7 @@ defmodule Ferricstore.Commands.Hash do
     case Integer.parse(value_str) do
       {ts, ""} when ts > 0 ->
         {:ok, ts * 1000}
+
       _ ->
         {:error, "ERR value is not an integer or out of range"}
     end
@@ -831,6 +838,7 @@ defmodule Ferricstore.Commands.Hash do
     case Integer.parse(value_str) do
       {ts_ms, ""} when ts_ms > 0 ->
         {:ok, ts_ms}
+
       _ ->
         {:error, "ERR value is not an integer or out of range"}
     end
@@ -838,7 +846,9 @@ defmodule Ferricstore.Commands.Hash do
 
   defp validate_field_count(0, []), do: :ok
   defp validate_field_count(n, [_ | rest]) when n > 0, do: validate_field_count(n - 1, rest)
-  defp validate_field_count(_, _), do: {:error, "ERR number of fields does not match the count argument"}
+
+  defp validate_field_count(_, _),
+    do: {:error, "ERR number of fields does not match the count argument"}
 
   # ---------------------------------------------------------------------------
   # HSCAN helpers

@@ -65,6 +65,7 @@ defmodule Ferricstore.Raft.StateMachine do
   import Bitwise
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.CommandTime
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.HLC
   alias Ferricstore.Store.{BitcaskWriter, LFU, ListOps, Router, ValueCodec}
@@ -841,9 +842,10 @@ defmodule Ferricstore.Raft.StateMachine do
   # ---------------------------------------------------------------------------
   # HLC-wrapped commands (spec 2G.6)
   #
-  # NOT WIRED UP — nothing sends wrapped commands today. Heartbeat sync
-  # (~150ms drift) is sufficient. See `Ferricstore.HLC` module doc for
-  # full rationale, when to enable, and how to wire it up.
+  # Raft submit paths stamp commands before they enter the log. During apply,
+  # the stamped physical HLC time is installed through `CommandTime`, so command
+  # modules compute relative expiries and other time-derived values from the
+  # same log-entry timestamp on every replica.
   # ---------------------------------------------------------------------------
 
   # Generic server command hook — allows server apps to replicate their own
@@ -1041,27 +1043,14 @@ defmodule Ferricstore.Raft.StateMachine do
     {state, result}
   end
 
-  @apply_now_key :ferricstore_raft_apply_now_ms
-  @apply_now_unset :__ferricstore_raft_apply_now_unset__
-
   defp with_apply_time(%{system_time: now_ms}, fun) when is_integer(now_ms) do
-    previous = Process.get(@apply_now_key, @apply_now_unset)
-    Process.put(@apply_now_key, now_ms)
-
-    try do
-      fun.()
-    after
-      case previous do
-        @apply_now_unset -> Process.delete(@apply_now_key)
-        value -> Process.put(@apply_now_key, value)
-      end
-    end
+    CommandTime.with_now_ms(now_ms, fun)
   end
 
   defp with_apply_time(_meta, fun), do: fun.()
 
   defp apply_now_ms do
-    Process.get(@apply_now_key) || HLC.now_ms()
+    CommandTime.now_ms()
   end
 
   defp apply_pending_with_time(meta, state, fun) do

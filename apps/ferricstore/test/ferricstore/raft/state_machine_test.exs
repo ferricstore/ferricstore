@@ -146,6 +146,109 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert [{"hlc_time_locked", "value", 0, _, _, _, _}] = :ets.lookup(ets, "hlc_time_locked")
     end
 
+    test "cross-shard dispatched SETEX uses stamped HLC time for relative expiry", %{
+      state: state,
+      ets: ets,
+      shard_index: shard_index
+    } do
+      local_now = Ferricstore.HLC.now_ms()
+      stamped_now = local_now - 30_000
+
+      {_new_state, %{^shard_index => [:ok]}} =
+        StateMachine.apply(
+          %{system_time: local_now},
+          {{:cross_shard_tx, [{shard_index, [{"SETEX", ["stamped_setex", "5", "value"]}], nil}]},
+           %{hlc_ts: {stamped_now, 0}}},
+          state
+        )
+
+      expected_expire_at_ms = stamped_now + 5_000
+
+      assert [{"stamped_setex", "value", ^expected_expire_at_ms, _, _, _, _}] =
+               :ets.lookup(ets, "stamped_setex")
+    end
+
+    test "cross-shard dispatched PEXPIRE uses stamped HLC time for relative expiry", %{
+      state: state,
+      ets: ets,
+      shard_index: shard_index
+    } do
+      local_now = Ferricstore.HLC.now_ms()
+      stamped_now = local_now - 30_000
+
+      :ets.insert(
+        ets,
+        {"stamped_pexpire", "value", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("value")}
+      )
+
+      {_new_state, %{^shard_index => [1]}} =
+        StateMachine.apply(
+          %{system_time: local_now},
+          {{:cross_shard_tx, [{shard_index, [{"PEXPIRE", ["stamped_pexpire", "5000"]}], nil}]},
+           %{hlc_ts: {stamped_now, 0}}},
+          state
+        )
+
+      expected_expire_at_ms = stamped_now + 5_000
+
+      assert [{"stamped_pexpire", "value", ^expected_expire_at_ms, _, _, _, _}] =
+               :ets.lookup(ets, "stamped_pexpire")
+    end
+
+    test "cross-shard dispatched PEXPIREAT compares absolute expiry to stamped HLC time", %{
+      state: state,
+      ets: ets,
+      shard_index: shard_index
+    } do
+      local_now = Ferricstore.HLC.now_ms()
+      stamped_now = local_now - 30_000
+      expire_at_ms = stamped_now + 5_000
+
+      :ets.insert(
+        ets,
+        {"stamped_pexpireat", "value", 0, Ferricstore.Store.LFU.initial(), 0, 0,
+         byte_size("value")}
+      )
+
+      {_new_state, %{^shard_index => [1]}} =
+        StateMachine.apply(
+          %{system_time: local_now},
+          {{:cross_shard_tx,
+            [
+              {shard_index,
+               [{"PEXPIREAT", ["stamped_pexpireat", Integer.to_string(expire_at_ms)]}], nil}
+            ]}, %{hlc_ts: {stamped_now, 0}}},
+          state
+        )
+
+      assert [{"stamped_pexpireat", "value", ^expire_at_ms, _, _, _, _}] =
+               :ets.lookup(ets, "stamped_pexpireat")
+    end
+
+    test "cross-shard dispatched PTTL reports remaining time from stamped HLC time", %{
+      state: state,
+      ets: ets,
+      shard_index: shard_index
+    } do
+      local_now = Ferricstore.HLC.now_ms()
+      stamped_now = local_now - 30_000
+      expire_at_ms = stamped_now + 5_000
+
+      :ets.insert(
+        ets,
+        {"stamped_pttl", "value", expire_at_ms, Ferricstore.Store.LFU.initial(), 0, 0,
+         byte_size("value")}
+      )
+
+      {_new_state, %{^shard_index => [5_000]}} =
+        StateMachine.apply(
+          %{system_time: local_now},
+          {{:cross_shard_tx, [{shard_index, [{"PTTL", ["stamped_pttl"]}], nil}]},
+           %{hlc_ts: {stamped_now, 0}}},
+          state
+        )
+    end
+
     test "uses raft meta system_time when acquiring cross-shard locks", %{state: state} do
       local_now = Ferricstore.HLC.now_ms()
       apply_now = local_now - 20_000

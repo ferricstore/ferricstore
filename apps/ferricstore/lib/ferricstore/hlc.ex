@@ -55,6 +55,10 @@ defmodule Ferricstore.HLC do
       {physical_ms, logical} = Ferricstore.HLC.now()
       ms = Ferricstore.HLC.now_ms()
 
+  Command handlers that can run inside Raft apply should use
+  `Ferricstore.CommandTime.now_ms/0` instead. It falls back to HLC outside
+  Raft and returns the stamped log-entry time during state-machine apply.
+
   When receiving a Raft heartbeat with a piggybacked timestamp:
 
       :ok = Ferricstore.HLC.update(remote_timestamp)

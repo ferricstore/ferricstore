@@ -13,7 +13,7 @@ defmodule Ferricstore.Commands.Native do
     * `KEY_INFO key` -- returns diagnostic metadata about a key
   """
 
-  alias Ferricstore.HLC
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.Router
 
   @spec handle(binary(), [binary()], map()) :: term()
@@ -23,57 +23,99 @@ defmodule Ferricstore.Commands.Native do
     ctx = FerricStore.Instance.get(:default)
     Router.cas(ctx, key, expected, new_value, nil)
   end
+
   def handle("CAS", [key, expected, new_value, "EX", secs_str], _store) do
     ctx = FerricStore.Instance.get(:default)
+
     case Integer.parse(secs_str) do
       {secs, ""} when secs > 0 -> Router.cas(ctx, key, expected, new_value, secs * 1_000)
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
-  def handle("CAS", _args, _store), do: {:error, "ERR wrong number of arguments for 'cas' command"}
+
+  def handle("CAS", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'cas' command"}
+
   def handle("LOCK", [key, owner, ttl_ms_str], _store) do
     ctx = FerricStore.Instance.get(:default)
+
     case Integer.parse(ttl_ms_str) do
       {ttl_ms, ""} when ttl_ms > 0 -> Router.lock(ctx, key, owner, ttl_ms)
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
-  def handle("LOCK", _args, _store), do: {:error, "ERR wrong number of arguments for 'lock' command"}
+
+  def handle("LOCK", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'lock' command"}
+
   def handle("UNLOCK", [key, owner], _store) do
     ctx = FerricStore.Instance.get(:default)
     Router.unlock(ctx, key, owner)
   end
-  def handle("UNLOCK", _args, _store), do: {:error, "ERR wrong number of arguments for 'unlock' command"}
+
+  def handle("UNLOCK", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'unlock' command"}
+
   def handle("EXTEND", [key, owner, ttl_ms_str], _store) do
     ctx = FerricStore.Instance.get(:default)
+
     case Integer.parse(ttl_ms_str) do
       {ttl_ms, ""} when ttl_ms > 0 -> Router.extend(ctx, key, owner, ttl_ms)
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
-  def handle("EXTEND", _args, _store), do: {:error, "ERR wrong number of arguments for 'extend' command"}
-  def handle("RATELIMIT.ADD", [key, wms, max_str], _store), do: do_ratelimit_add(key, wms, max_str, "1")
-  def handle("RATELIMIT.ADD", [key, wms, max_str, cnt], _store), do: do_ratelimit_add(key, wms, max_str, cnt)
-  def handle("RATELIMIT.ADD", _args, _store), do: {:error, "ERR wrong number of arguments for 'ratelimit.add' command"}
+
+  def handle("EXTEND", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'extend' command"}
+
+  def handle("RATELIMIT.ADD", [key, wms, max_str], _store),
+    do: do_ratelimit_add(key, wms, max_str, "1")
+
+  def handle("RATELIMIT.ADD", [key, wms, max_str, cnt], _store),
+    do: do_ratelimit_add(key, wms, max_str, cnt)
+
+  def handle("RATELIMIT.ADD", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'ratelimit.add' command"}
+
   def handle("KEY_INFO", [key], _store), do: do_key_info(key)
-  def handle("KEY_INFO", _args, _store), do: {:error, "ERR wrong number of arguments for 'key_info' command"}
+
+  def handle("KEY_INFO", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'key_info' command"}
+
   def handle("FETCH_OR_COMPUTE", [key, ttl], _store), do: do_fetch_or_compute(key, ttl, "")
-  def handle("FETCH_OR_COMPUTE", [key, ttl, hint], _store), do: do_fetch_or_compute(key, ttl, hint)
-  def handle("FETCH_OR_COMPUTE", _args, _store), do: {:error, "ERR wrong number of arguments for 'fetch_or_compute' command"}
+
+  def handle("FETCH_OR_COMPUTE", [key, ttl, hint], _store),
+    do: do_fetch_or_compute(key, ttl, hint)
+
+  def handle("FETCH_OR_COMPUTE", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'fetch_or_compute' command"}
+
   def handle("FETCH_OR_COMPUTE_RESULT", [key, value, ttl_ms_str], _store) do
     case Integer.parse(ttl_ms_str) do
-      {ttl_ms, ""} when ttl_ms >= 0 -> Ferricstore.FetchOrCompute.fetch_or_compute_result(key, value, ttl_ms)
-      _ -> {:error, "ERR value is not an integer or out of range"}
+      {ttl_ms, ""} when ttl_ms >= 0 ->
+        Ferricstore.FetchOrCompute.fetch_or_compute_result(key, value, ttl_ms)
+
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
-  def handle("FETCH_OR_COMPUTE_RESULT", _args, _store), do: {:error, "ERR wrong number of arguments for 'fetch_or_compute_result' command"}
-  def handle("FETCH_OR_COMPUTE_ERROR", [key, msg], _store), do: Ferricstore.FetchOrCompute.fetch_or_compute_error(key, msg)
-  def handle("FETCH_OR_COMPUTE_ERROR", _args, _store), do: {:error, "ERR wrong number of arguments for 'fetch_or_compute_error' command"}
+
+  def handle("FETCH_OR_COMPUTE_RESULT", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'fetch_or_compute_result' command"}
+
+  def handle("FETCH_OR_COMPUTE_ERROR", [key, msg], _store),
+    do: Ferricstore.FetchOrCompute.fetch_or_compute_error(key, msg)
+
+  def handle("FETCH_OR_COMPUTE_ERROR", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'fetch_or_compute_error' command"}
 
   defp do_ratelimit_add(key, wms, max_str, cnt) do
-    with {w, ""} <- Integer.parse(wms), true <- w > 0,
-         {m, ""} <- Integer.parse(max_str), true <- m > 0,
-         {c, ""} <- Integer.parse(cnt), true <- c > 0 do
+    with {w, ""} <- Integer.parse(wms),
+         true <- w > 0,
+         {m, ""} <- Integer.parse(max_str),
+         true <- m > 0,
+         {c, ""} <- Integer.parse(cnt),
+         true <- c > 0 do
       ctx = FerricStore.Instance.get(:default)
       Router.ratelimit_add(ctx, key, w, m, c)
     else
@@ -85,7 +127,7 @@ defmodule Ferricstore.Commands.Native do
     ctx = FerricStore.Instance.get(:default)
     idx = Router.shard_for(ctx, key)
     keydir = Router.resolve_keydir(ctx, idx)
-    now = HLC.now_ms()
+    now = CommandTime.now_ms()
     shard = Router.shard_name(ctx, idx)
 
     store = %{
@@ -103,11 +145,16 @@ defmodule Ferricstore.Commands.Native do
     ttl_ms = compute_ttl_ms(alive?, expire_at_ms, now)
 
     [
-      "type", type,
-      "value_size", Integer.to_string(value_size),
-      "ttl_ms", Integer.to_string(ttl_ms),
-      "hot_cache_status", hot_status,
-      "last_write_shard", Integer.to_string(idx)
+      "type",
+      type,
+      "value_size",
+      Integer.to_string(value_size),
+      "ttl_ms",
+      Integer.to_string(ttl_ms),
+      "hot_cache_status",
+      hot_status,
+      "last_write_shard",
+      Integer.to_string(idx)
     ]
   end
 
@@ -136,14 +183,19 @@ defmodule Ferricstore.Commands.Native do
       case :ets.lookup(keydir, key) do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
           {value, 0, "hot"}
+
         [{^key, nil, 0, _lfu, _fid, _off, _vsize}] ->
           {nil, 0, "cold"}
+
         [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
           {value, exp, "hot"}
+
         [{^key, nil, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
           {nil, exp, "cold"}
+
         [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
           {nil, 0, "cold"}
+
         [] ->
           {nil, 0, "cold"}
       end
@@ -161,7 +213,9 @@ defmodule Ferricstore.Commands.Native do
           {:ok, v} -> ["hit", v]
           {:error, reason} -> {:error, "ERR compute failed: " <> reason}
         end
-      _ -> {:error, "ERR value is not an integer or out of range"}
+
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
 end

@@ -23,11 +23,10 @@ defmodule Ferricstore.Commands.Stream do
 
   Stream IDs follow the Redis format `{milliseconds}-{sequence}`. When the
   client sends `*`, the server auto-generates a monotonically increasing ID
-  using `Ferricstore.HLC.now_ms/0` (Hybrid Logical Clock, spec 2G.6) as the
-  milliseconds component and an incrementing sequence number when multiple
-  entries arrive in the same millisecond. The HLC ensures monotonicity even
-  when the wall clock jumps backward and, in multi-node mode, tracks the
-  cluster-wide max physical time via Raft heartbeat piggyback.
+  using `Ferricstore.CommandTime.now_ms/0` as the milliseconds component and an
+  incrementing sequence number when multiple entries arrive in the same
+  millisecond. Outside Raft this reads the Hybrid Logical Clock; inside Raft it
+  reads the stamped log-entry time so replicas generate the same IDs.
 
   Explicit IDs must be strictly greater than the last entry's ID.
   """
@@ -36,6 +35,7 @@ defmodule Ferricstore.Commands.Stream do
   # Types
   # ---------------------------------------------------------------------------
 
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.Ops
 
   @typedoc "A parsed stream ID as `{milliseconds, sequence}`."
@@ -609,7 +609,6 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   defp do_apply_trim_minid(key, prefix, min_id, store) do
-
     all_ids =
       store
       |> stream_keys_for(prefix)
@@ -767,9 +766,10 @@ defmodule Ferricstore.Commands.Stream do
 
     cond do
       not stream_exists? and not mkstream ->
-        {:error, "ERR The XGROUP subcommand requires the key to exist. " <>
-                 "Note that for CREATE you may want to use the MKSTREAM option to create " <>
-                 "an empty stream automatically."}
+        {:error,
+         "ERR The XGROUP subcommand requires the key to exist. " <>
+           "Note that for CREATE you may want to use the MKSTREAM option to create " <>
+           "an empty stream automatically."}
 
       not stream_exists? and mkstream ->
         # Create an empty stream.
@@ -816,8 +816,7 @@ defmodule Ferricstore.Commands.Stream do
       Enum.map(stream_ids, fn {key, id_str} ->
         case :ets.lookup(@groups_table, {key, group}) do
           [] ->
-            {:error,
-             "NOGROUP No such consumer group '#{group}' for key name '#{key}'"}
+            {:error, "NOGROUP No such consumer group '#{group}' for key name '#{key}'"}
 
           [{{^key, ^group}, last_delivered, consumers, pending}] ->
             case id_str do
@@ -838,10 +837,10 @@ defmodule Ferricstore.Commands.Stream do
 
                       new_pending =
                         Enum.reduce(entries, pending, fn [id | _], acc ->
-                          Map.put(acc, id, {consumer, Ferricstore.HLC.now_ms()})
+                          Map.put(acc, id, {consumer, CommandTime.now_ms()})
                         end)
 
-                      new_consumers = Map.put(consumers, consumer, Ferricstore.HLC.now_ms())
+                      new_consumers = Map.put(consumers, consumer, CommandTime.now_ms())
 
                       :ets.insert(
                         @groups_table,
@@ -933,11 +932,9 @@ defmodule Ferricstore.Commands.Stream do
   # ---------------------------------------------------------------------------
 
   defp resolve_id(:auto, last_ms, last_seq) do
-    # Use the Hybrid Logical Clock for the millisecond component (spec 2G.6).
-    # HLC guarantees monotonicity even when the wall clock jumps backward,
-    # and in multi-node mode the physical component tracks the cluster-wide
-    # max via Raft heartbeat piggyback.
-    now = Ferricstore.HLC.now_ms()
+    # CommandTime uses HLC outside Raft and stamped log-entry time inside Raft,
+    # keeping stream ID generation deterministic during state-machine replay.
+    now = CommandTime.now_ms()
 
     cond do
       now > last_ms -> {:ok, {now, 0}}
@@ -962,8 +959,12 @@ defmodule Ferricstore.Commands.Stream do
   defp resolve_id({:partial, ms}, last_ms, last_seq) do
     # Partial ID: only ms given, seq auto-assigned.
     cond do
-      ms > last_ms -> {:ok, {ms, 0}}
-      ms == last_ms -> {:ok, {ms, last_seq + 1}}
+      ms > last_ms ->
+        {:ok, {ms, 0}}
+
+      ms == last_ms ->
+        {:ok, {ms, last_seq + 1}}
+
       true ->
         {:error,
          "ERR The ID specified in XADD is equal or smaller than the " <>
@@ -1152,12 +1153,14 @@ defmodule Ferricstore.Commands.Stream do
   defp consume_approx(rest), do: {false, rest}
 
   defp parse_count_opt([]), do: {:ok, :infinity}
+
   defp parse_count_opt(["COUNT", n_str | _rest]) do
     case Integer.parse(n_str) do
       {n, ""} when n >= 0 -> {:ok, n}
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
+
   defp parse_count_opt(_), do: {:error, "ERR syntax error"}
 
   defp parse_xread_args(args) do
@@ -1181,7 +1184,8 @@ defmodule Ferricstore.Commands.Stream do
         {:ok, count, block, stream_ids}
 
       {:ok, _, _} ->
-        {:error, "ERR Unbalanced XREAD list of streams: for each stream key an ID must be specified"}
+        {:error,
+         "ERR Unbalanced XREAD list of streams: for each stream key an ID must be specified"}
 
       :not_found ->
         {:error, "ERR syntax error"}

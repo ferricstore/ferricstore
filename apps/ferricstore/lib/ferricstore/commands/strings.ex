@@ -1,7 +1,9 @@
 # Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Strings do
-  alias Ferricstore.Store.Ops
+  alias Ferricstore.CommandTime
   alias Ferricstore.CrossShardOp
+  alias Ferricstore.Store.Ops
+
   @moduledoc """
   Handles Redis string commands.
 
@@ -77,6 +79,7 @@ defmodule Ferricstore.Commands.Strings do
         # Plain key is nil. Check if this is a data structure key (compound keys).
         if Ops.has_compound?(store) do
           type_key = Ferricstore.Store.CompoundKey.type_key(key)
+
           case Ops.compound_get(store, key, type_key) do
             nil -> nil
             _type_str -> @wrongtype_error
@@ -84,8 +87,12 @@ defmodule Ferricstore.Commands.Strings do
         else
           nil
         end
-      value when is_binary(value) -> maybe_check_type(value)
-      other -> other
+
+      value when is_binary(value) ->
+        maybe_check_type(value)
+
+      other ->
+        other
     end
   end
 
@@ -94,7 +101,10 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   def handle("SET", ["", _value | _opts], _store), do: {:error, "ERR empty key"}
-  def handle("SET", [key, _value | _opts], _store) when byte_size(key) > 65_535, do: {:error, "ERR key too large"}
+
+  def handle("SET", [key, _value | _opts], _store) when byte_size(key) > 65_535,
+    do: {:error, "ERR key too large"}
+
   def handle("SET", [key, value | opts], store), do: do_set(key, value, opts, store)
 
   def handle("SET", _args, _store) do
@@ -120,8 +130,11 @@ defmodule Ferricstore.Commands.Strings do
       exists = Ops.exists?(store, key)
       # Also check TypeRegistry for compound-key-based data structures
       # (lists, hashes, sets, zsets) that don't use the plain key store.
-      exists = exists or (Ops.has_compound?(store) and
-        Ops.compound_get(store, key, Ferricstore.Store.CompoundKey.type_key(key)) != nil)
+      exists =
+        exists or
+          (Ops.has_compound?(store) and
+             Ops.compound_get(store, key, Ferricstore.Store.CompoundKey.type_key(key)) != nil)
+
       if exists, do: acc + 1, else: acc
     end)
   end
@@ -157,10 +170,14 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
 
   def handle("INCR", [key], store), do: Ops.incr(store, key, 1)
-  def handle("INCR", _args, _store), do: {:error, "ERR wrong number of arguments for 'incr' command"}
+
+  def handle("INCR", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'incr' command"}
 
   def handle("DECR", [key], store), do: Ops.incr(store, key, -1)
-  def handle("DECR", _args, _store), do: {:error, "ERR wrong number of arguments for 'decr' command"}
+
+  def handle("DECR", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'decr' command"}
 
   # Redis range: [-2^63, 2^63-1] for integer operations.
   @max_int64 9_223_372_036_854_775_807
@@ -208,8 +225,12 @@ defmodule Ferricstore.Commands.Strings do
         case Ops.incr_float(store, key, delta) do
           {:ok, new_val} when is_float(new_val) ->
             Ferricstore.Store.ValueCodec.format_float(new_val)
-          {:ok, new_str} when is_binary(new_str) -> new_str
-          {:error, _} = err -> err
+
+          {:ok, new_str} when is_binary(new_str) ->
+            new_str
+
+          {:error, _} = err ->
+            err
         end
 
       :error ->
@@ -301,7 +322,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("SETEX", [key, secs_str, value], store) do
     case Integer.parse(secs_str) do
       {secs, ""} when secs > 0 ->
-        expire_at_ms = Ferricstore.HLC.now_ms() + secs * 1_000
+        expire_at_ms = CommandTime.now_ms() + secs * 1_000
         Ops.put(store, key, value, expire_at_ms)
 
       {_secs, ""} ->
@@ -322,7 +343,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("PSETEX", [key, ms_str, value], store) do
     case Integer.parse(ms_str) do
       {ms, ""} when ms > 0 ->
-        expire_at_ms = Ferricstore.HLC.now_ms() + ms
+        expire_at_ms = CommandTime.now_ms() + ms
         Ops.put(store, key, value, expire_at_ms)
 
       {_ms, ""} ->
@@ -432,7 +453,7 @@ defmodule Ferricstore.Commands.Strings do
   defp parse_getex_opts(["EX", secs_str]) do
     case Integer.parse(secs_str) do
       {secs, ""} when secs > 0 ->
-        {:ok, Ferricstore.HLC.now_ms() + secs * 1_000}
+        {:ok, CommandTime.now_ms() + secs * 1_000}
 
       {_secs, ""} ->
         {:error, "ERR invalid expire time in 'getex' command"}
@@ -445,7 +466,7 @@ defmodule Ferricstore.Commands.Strings do
   defp parse_getex_opts(["PX", ms_str]) do
     case Integer.parse(ms_str) do
       {ms, ""} when ms > 0 ->
-        {:ok, Ferricstore.HLC.now_ms() + ms}
+        {:ok, CommandTime.now_ms() + ms}
 
       {_ms, ""} ->
         {:error, "ERR invalid expire time in 'getex' command"}
@@ -549,7 +570,14 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   # Accumulator map for SET option parsing. All fields start at their defaults.
-  @set_opts_default %{expire_at_ms: 0, nx: false, xx: false, get: false, keepttl: false, has_expiry: false}
+  @set_opts_default %{
+    expire_at_ms: 0,
+    nx: false,
+    xx: false,
+    get: false,
+    keepttl: false,
+    has_expiry: false
+  }
 
   defp parse_set_opts(opts), do: parse_set_opts(opts, @set_opts_default)
 
@@ -587,7 +615,11 @@ defmodule Ferricstore.Commands.Strings do
     else
       with {secs, ""} <- Integer.parse(secs_str),
            true <- secs > 0 do
-        parse_set_opts(rest, %{acc | expire_at_ms: Ferricstore.HLC.now_ms() + secs * 1000, has_expiry: true})
+        parse_set_opts(rest, %{
+          acc
+          | expire_at_ms: CommandTime.now_ms() + secs * 1000,
+            has_expiry: true
+        })
       else
         false -> {:error, "ERR invalid expire time in 'set' command"}
         _ -> {:error, "ERR value is not an integer or out of range"}
@@ -601,7 +633,7 @@ defmodule Ferricstore.Commands.Strings do
     else
       with {ms, ""} <- Integer.parse(ms_str),
            true <- ms > 0 do
-        parse_set_opts(rest, %{acc | expire_at_ms: Ferricstore.HLC.now_ms() + ms, has_expiry: true})
+        parse_set_opts(rest, %{acc | expire_at_ms: CommandTime.now_ms() + ms, has_expiry: true})
       else
         false -> {:error, "ERR invalid expire time in 'set' command"}
         _ -> {:error, "ERR value is not an integer or out of range"}
@@ -773,10 +805,12 @@ defmodule Ferricstore.Commands.Strings do
             end
 
           Ops.compound_delete_prefix(store, key, prefix)
+
           if type_str == "list" do
             meta_key = CompoundKey.list_meta_key(key)
             Ops.compound_delete(store, key, meta_key)
           end
+
           TypeRegistry.delete_type(key, store)
           true
       end

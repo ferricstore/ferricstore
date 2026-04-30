@@ -1,5 +1,7 @@
 defmodule Ferricstore.Commands.Expiry do
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.Ops
+
   @moduledoc """
   Handles Redis expiry commands: EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST.
 
@@ -34,41 +36,55 @@ defmodule Ferricstore.Commands.Expiry do
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
 
-  def handle("EXPIRE", [key, secs_str], store), do: set_expiry_seconds(key, secs_str, :none, store)
+  def handle("EXPIRE", [key, secs_str], store),
+    do: set_expiry_seconds(key, secs_str, :none, store)
+
   def handle("EXPIRE", [key, secs_str, flag], store) do
     case parse_flag(flag) do
       {:ok, f} -> set_expiry_seconds(key, secs_str, f, store)
       :error -> {:error, "ERR Unsupported option #{flag}"}
     end
   end
-  def handle("EXPIRE", _args, _store), do: {:error, "ERR wrong number of arguments for 'expire' command"}
+
+  def handle("EXPIRE", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'expire' command"}
 
   def handle("PEXPIRE", [key, ms_str], store), do: set_expiry_ms(key, ms_str, :none, store)
+
   def handle("PEXPIRE", [key, ms_str, flag], store) do
     case parse_flag(flag) do
       {:ok, f} -> set_expiry_ms(key, ms_str, f, store)
       :error -> {:error, "ERR Unsupported option #{flag}"}
     end
   end
-  def handle("PEXPIRE", _args, _store), do: {:error, "ERR wrong number of arguments for 'pexpire' command"}
 
-  def handle("EXPIREAT", [key, ts_str], store), do: set_expiry_at_seconds(key, ts_str, :none, store)
+  def handle("PEXPIRE", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'pexpire' command"}
+
+  def handle("EXPIREAT", [key, ts_str], store),
+    do: set_expiry_at_seconds(key, ts_str, :none, store)
+
   def handle("EXPIREAT", [key, ts_str, flag], store) do
     case parse_flag(flag) do
       {:ok, f} -> set_expiry_at_seconds(key, ts_str, f, store)
       :error -> {:error, "ERR Unsupported option #{flag}"}
     end
   end
-  def handle("EXPIREAT", _args, _store), do: {:error, "ERR wrong number of arguments for 'expireat' command"}
+
+  def handle("EXPIREAT", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'expireat' command"}
 
   def handle("PEXPIREAT", [key, ts_str], store), do: set_expiry_at_ms(key, ts_str, :none, store)
+
   def handle("PEXPIREAT", [key, ts_str, flag], store) do
     case parse_flag(flag) do
       {:ok, f} -> set_expiry_at_ms(key, ts_str, f, store)
       :error -> {:error, "ERR Unsupported option #{flag}"}
     end
   end
-  def handle("PEXPIREAT", _args, _store), do: {:error, "ERR wrong number of arguments for 'pexpireat' command"}
+
+  def handle("PEXPIREAT", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'pexpireat' command"}
 
   def handle("TTL", [key], store), do: get_ttl_seconds(key, store)
 
@@ -98,7 +114,7 @@ defmodule Ferricstore.Commands.Expiry do
         delete_if_exists(key, store)
 
       {secs, ""} ->
-        apply_expiry(key, Ferricstore.HLC.now_ms() + secs * 1_000, flag, store)
+        apply_expiry(key, CommandTime.now_ms() + secs * 1_000, flag, store)
 
       _ ->
         {:error, "ERR value is not an integer or out of range"}
@@ -111,7 +127,7 @@ defmodule Ferricstore.Commands.Expiry do
         delete_if_exists(key, store)
 
       {ms, ""} ->
-        apply_expiry(key, Ferricstore.HLC.now_ms() + ms, flag, store)
+        apply_expiry(key, CommandTime.now_ms() + ms, flag, store)
 
       _ ->
         {:error, "ERR value is not an integer or out of range"}
@@ -126,26 +142,29 @@ defmodule Ferricstore.Commands.Expiry do
     case Integer.parse(ts_str) do
       {ts, ""} ->
         expire_at_ms = ts * 1_000
-        if expire_at_ms <= Ferricstore.HLC.now_ms() do
+
+        if expire_at_ms <= CommandTime.now_ms() do
           delete_if_exists(key, store)
         else
           apply_expiry(key, expire_at_ms, flag, store)
         end
 
-      _ -> {:error, "ERR value is not an integer or out of range"}
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
 
   defp set_expiry_at_ms(key, ts_str, flag, store) do
     case Integer.parse(ts_str) do
       {ts, ""} ->
-        if ts <= Ferricstore.HLC.now_ms() do
+        if ts <= CommandTime.now_ms() do
           delete_if_exists(key, store)
         else
           apply_expiry(key, ts, flag, store)
         end
 
-      _ -> {:error, "ERR value is not an integer or out of range"}
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
 
@@ -155,7 +174,9 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp delete_if_exists(key, store) do
     case Ops.get_meta(store, key) do
-      nil -> 0
+      nil ->
+        0
+
       _ ->
         Ops.delete(store, key)
         1
@@ -207,7 +228,7 @@ defmodule Ferricstore.Commands.Expiry do
     case Ops.get_meta(store, key) do
       nil -> -2
       {_, 0} -> -1
-      {_, exp} -> max(0, div(exp - Ferricstore.HLC.now_ms(), 1_000))
+      {_, exp} -> max(0, div(exp - CommandTime.now_ms(), 1_000))
     end
   end
 
@@ -215,7 +236,7 @@ defmodule Ferricstore.Commands.Expiry do
     case Ops.get_meta(store, key) do
       nil -> -2
       {_, 0} -> -1
-      {_, exp} -> max(0, exp - Ferricstore.HLC.now_ms())
+      {_, exp} -> max(0, exp - CommandTime.now_ms())
     end
   end
 
@@ -225,8 +246,12 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp do_persist(key, store) do
     case Ops.get_meta(store, key) do
-      nil -> 0
-      {_, 0} -> 0
+      nil ->
+        0
+
+      {_, 0} ->
+        0
+
       {value, _exp} ->
         Ops.put(store, key, value, 0)
         1
