@@ -2651,36 +2651,38 @@ defmodule Ferricstore.Raft.StateMachine do
   # needed, flip the single bit, write back. Preserves expire_at_ms.
   # Returns the OLD bit at that offset (Redis semantics).
   defp do_setbit(state, key, offset, bit_val) do
-    {old_val, expire_at_ms} =
-      case do_get_meta(state, key) do
-        nil -> {<<>>, 0}
-        {v, exp} -> {to_disk_binary(v), exp}
-      end
+    with :ok <- ensure_string_key(state, key) do
+      {old_val, expire_at_ms} =
+        case do_get_meta(state, key) do
+          nil -> {<<>>, 0}
+          {v, exp} -> {to_disk_binary(v), exp}
+        end
 
-    byte_index = div(offset, 8)
-    bit_position = 7 - rem(offset, 8)
+      byte_index = div(offset, 8)
+      bit_position = 7 - rem(offset, 8)
 
-    extended =
-      if byte_size(old_val) >= byte_index + 1 do
-        old_val
-      else
-        old_val <> :binary.copy(<<0>>, byte_index + 1 - byte_size(old_val))
-      end
+      extended =
+        if byte_size(old_val) >= byte_index + 1 do
+          old_val
+        else
+          old_val <> :binary.copy(<<0>>, byte_index + 1 - byte_size(old_val))
+        end
 
-    old_byte = :binary.at(extended, byte_index)
-    old_bit = old_byte >>> bit_position &&& 1
+      old_byte = :binary.at(extended, byte_index)
+      old_bit = old_byte >>> bit_position &&& 1
 
-    new_byte =
-      case bit_val do
-        1 -> old_byte ||| 1 <<< bit_position
-        0 -> old_byte &&& bnot(1 <<< bit_position)
-      end
+      new_byte =
+        case bit_val do
+          1 -> old_byte ||| 1 <<< bit_position
+          0 -> old_byte &&& bnot(1 <<< bit_position)
+        end
 
-    <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
-    new_value = <<prefix::binary, new_byte::8, suffix::binary>>
+      <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
+      new_value = <<prefix::binary, new_byte::8, suffix::binary>>
 
-    do_put(state, key, new_value, expire_at_ms)
-    old_bit
+      do_put(state, key, new_value, expire_at_ms)
+      old_bit
+    end
   end
 
   # Atomic HINCRBY: read compound key (H:<redis_key>\0<field>), parse integer,
@@ -2842,7 +2844,26 @@ defmodule Ferricstore.Raft.StateMachine do
       end,
       # Compound ops: redis_key and compound_key live on the same shard by
       # design, so treat them identically to plain get/put/delete.
-      compound_get: fn _rk, ck -> do_get(state, ck) end,
+      compound_get: fn rk, ck ->
+        case do_get(state, ck) do
+          nil ->
+            ctx =
+              state.instance_ctx ||
+                try do
+                  FerricStore.Instance.get(:default)
+                rescue
+                  ArgumentError -> nil
+                end
+
+            case ctx do
+              nil -> nil
+              ctx -> Router.compound_get(ctx, rk, ck)
+            end
+
+          value ->
+            value
+        end
+      end,
       compound_get_meta: fn _rk, ck ->
         case do_get_meta(state, ck) do
           nil -> nil

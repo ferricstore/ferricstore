@@ -257,6 +257,14 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
       assert {:ok, 1} = FerricStore.setbit("bit:prev", 7, 0)
       assert {:ok, 0} = FerricStore.getbit("bit:prev", 7)
     end
+
+    test "setbit and getbit return WRONGTYPE for hash key" do
+      assert :ok = FerricStore.hset("bit:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.setbit("bit:hash", 7, 1)
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.getbit("bit:hash", 7)
+      assert {:ok, "hash"} = FerricStore.type("bit:hash")
+      assert {:ok, "old"} = FerricStore.hget("bit:hash", "field")
+    end
   end
 
   describe "bitcount/1" do
@@ -275,6 +283,12 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
       FerricStore.set("bc:range", "foobar")
       assert {:ok, count} = FerricStore.bitcount("bc:range", start: 0, stop: 0)
       assert is_integer(count) and count > 0
+    end
+
+    test "returns WRONGTYPE for hash key" do
+      assert :ok = FerricStore.hset("bc:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.bitcount("bc:hash")
+      assert {:ok, "hash"} = FerricStore.type("bc:hash")
     end
   end
 
@@ -299,6 +313,14 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
       assert {:ok, 1} = FerricStore.bitop(:not, "bo:not_dst", ["bo:not_src"])
       assert {:ok, <<0xF0>>} = FerricStore.get("bo:not_dst")
     end
+
+    test "returns WRONGTYPE for hash source and does not write destination" do
+      assert :ok = FerricStore.hset("bo:hash_src", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.bitop(:or, "bo:hash_dst", ["bo:hash_src"])
+      assert {:ok, nil} = FerricStore.get("bo:hash_dst")
+      assert {:ok, "hash"} = FerricStore.type("bo:hash_src")
+      assert {:ok, "old"} = FerricStore.hget("bo:hash_src", "field")
+    end
   end
 
   describe "bitpos/2" do
@@ -319,6 +341,12 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
       assert {:ok, pos} = FerricStore.bitpos("bp:ones", 0, start: 0, stop: 0)
       # With byte-level range, all bits are 1 in byte 0 => -1
       assert pos == -1
+    end
+
+    test "returns WRONGTYPE for hash key" do
+      assert :ok = FerricStore.hset("bp:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.bitpos("bp:hash", 1)
+      assert {:ok, "hash"} = FerricStore.type("bp:hash")
     end
   end
 
@@ -376,10 +404,13 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
     test "exhausting the limit eventually blocks" do
       key = "rl:exhaust"
       max = 3
-      results = for _ <- 1..5 do
-        {:ok, r} = FerricStore.ratelimit_add(key, 60_000, max)
-        r
-      end
+
+      results =
+        for _ <- 1..5 do
+          {:ok, r} = FerricStore.ratelimit_add(key, 60_000, max)
+          r
+        end
+
       # At least some responses should exist
       assert length(results) == 5
     end
@@ -393,7 +424,8 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
     test "returns :compute on cache miss, then :hit after storing" do
       case FerricStore.fetch_or_compute("foc:key", ttl: 60_000) do
         {:ok, {:compute, _hint}} ->
-          assert :ok = FerricStore.fetch_or_compute_result("foc:key", "computed_value", ttl: 60_000)
+          assert :ok =
+                   FerricStore.fetch_or_compute_result("foc:key", "computed_value", ttl: 60_000)
 
           case FerricStore.fetch_or_compute("foc:key", ttl: 60_000) do
             {:ok, {:hit, value}} ->
@@ -444,5 +476,4 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
       assert {:ok, nil} = FerricStore.get("fa:b")
     end
   end
-
 end

@@ -1,5 +1,7 @@
 defmodule Ferricstore.Commands.Bitmap do
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+
   @moduledoc """
   Handles Redis bitmap commands: SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP.
 
@@ -28,6 +30,7 @@ defmodule Ferricstore.Commands.Bitmap do
 
   # Redis limits bit offset to 2^32 - 1 (512MB value max)
   @max_bit_offset 4_294_967_295
+  @wrongtype_error {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
 
   @doc """
   Handles a bitmap command.
@@ -50,7 +53,8 @@ defmodule Ferricstore.Commands.Bitmap do
   # ---------------------------------------------------------------------------
 
   def handle("SETBIT", [key, offset_str, bit_str], store) do
-    with {:ok, offset} <- parse_non_negative_integer(offset_str, "bit offset"),
+    with :ok <- ensure_string_key(key, store),
+         {:ok, offset} <- parse_non_negative_integer(offset_str, "bit offset"),
          :ok <- check_bit_offset(offset),
          {:ok, bit_val} <- parse_bit_value(bit_str) do
       current = Ops.get(store, key) || <<>>
@@ -61,12 +65,12 @@ defmodule Ferricstore.Commands.Bitmap do
       # Read the old bit
       old_byte = :binary.at(extended, byte_index)
       bit_position = 7 - rem(offset, 8)
-      old_bit = (old_byte >>> bit_position) &&& 1
+      old_bit = old_byte >>> bit_position &&& 1
 
       # Set the new bit
       new_byte =
         case bit_val do
-          1 -> old_byte ||| (1 <<< bit_position)
+          1 -> old_byte ||| 1 <<< bit_position
           0 -> old_byte &&& Bitwise.bnot(1 <<< bit_position)
         end
 
@@ -88,7 +92,8 @@ defmodule Ferricstore.Commands.Bitmap do
   # ---------------------------------------------------------------------------
 
   def handle("GETBIT", [key, offset_str], store) do
-    with {:ok, offset} <- parse_non_negative_integer(offset_str, "bit offset"),
+    with :ok <- ensure_string_key(key, store),
+         {:ok, offset} <- parse_non_negative_integer(offset_str, "bit offset"),
          :ok <- check_bit_offset(offset) do
       current = Ops.get(store, key) || <<>>
       byte_index = div(offset, 8)
@@ -98,7 +103,7 @@ defmodule Ferricstore.Commands.Bitmap do
       else
         byte = :binary.at(current, byte_index)
         bit_position = 7 - rem(offset, 8)
-        (byte >>> bit_position) &&& 1
+        byte >>> bit_position &&& 1
       end
     end
   end
@@ -112,14 +117,17 @@ defmodule Ferricstore.Commands.Bitmap do
   # ---------------------------------------------------------------------------
 
   def handle("BITCOUNT", [key], store) do
-    current = Ops.get(store, key) || <<>>
-    popcount(current)
+    with :ok <- ensure_string_key(key, store) do
+      current = Ops.get(store, key) || <<>>
+      popcount(current)
+    end
   end
 
   def handle("BITCOUNT", [key, start_str, end_str | rest], store) do
     mode = parse_bitcount_mode(rest)
 
-    with {:ok, mode} <- mode,
+    with :ok <- ensure_string_key(key, store),
+         {:ok, mode} <- mode,
          {:ok, start_idx} <- parse_integer(start_str),
          {:ok, end_idx} <- parse_integer(end_str) do
       current = Ops.get(store, key) || <<>>
@@ -144,14 +152,16 @@ defmodule Ferricstore.Commands.Bitmap do
   # ---------------------------------------------------------------------------
 
   def handle("BITPOS", [key, bit_str], store) do
-    with {:ok, bit_val} <- parse_bit_value(bit_str) do
+    with :ok <- ensure_string_key(key, store),
+         {:ok, bit_val} <- parse_bit_value(bit_str) do
       current = Ops.get(store, key) || <<>>
       bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
     end
   end
 
   def handle("BITPOS", [key, bit_str, start_str], store) do
-    with {:ok, bit_val} <- parse_bit_value(bit_str),
+    with :ok <- ensure_string_key(key, store),
+         {:ok, bit_val} <- parse_bit_value(bit_str),
          {:ok, start_idx} <- parse_integer(start_str) do
       current = Ops.get(store, key) || <<>>
       len = byte_size(current)
@@ -163,7 +173,8 @@ defmodule Ferricstore.Commands.Bitmap do
   def handle("BITPOS", [key, bit_str, start_str, end_str | rest], store) do
     mode = parse_bitcount_mode(rest)
 
-    with {:ok, mode} <- mode,
+    with :ok <- ensure_string_key(key, store),
+         {:ok, mode} <- mode,
          {:ok, bit_val} <- parse_bit_value(bit_str),
          {:ok, start_idx} <- parse_integer(start_str),
          {:ok, end_idx} <- parse_integer(end_str) do
@@ -222,7 +233,8 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp check_bit_offset(_offset), do: :ok
 
-  @spec parse_non_negative_integer(binary(), binary()) :: {:ok, non_neg_integer()} | {:error, binary()}
+  @spec parse_non_negative_integer(binary(), binary()) ::
+          {:ok, non_neg_integer()} | {:error, binary()}
   defp parse_non_negative_integer(str, label) do
     case Integer.parse(str) do
       {n, ""} when n >= 0 -> {:ok, n}
@@ -259,6 +271,18 @@ defmodule Ferricstore.Commands.Bitmap do
   end
 
   defp parse_bitcount_mode(_), do: {:error, "ERR syntax error"}
+
+  # --- Type guards ----------------------------------------------------------
+
+  defp ensure_string_key(key, store) do
+    if compound_data_structure_key?(key, store), do: @wrongtype_error, else: :ok
+  end
+
+  defp compound_data_structure_key?(key, store) do
+    Ops.has_compound?(store) and
+      (Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
+         Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil)
+  end
 
   # --- Binary manipulation --------------------------------------------------
 
@@ -298,7 +322,7 @@ defmodule Ferricstore.Commands.Bitmap do
   defp do_byte_popcount(0, count), do: count
 
   defp do_byte_popcount(byte, count) do
-    do_byte_popcount(byte &&& (byte - 1), count + 1)
+    do_byte_popcount(byte &&& byte - 1, count + 1)
   end
 
   # --- BITCOUNT with byte range ----------------------------------------------
@@ -343,7 +367,7 @@ defmodule Ferricstore.Commands.Bitmap do
         byte_idx = div(bit_offset, 8)
         bit_pos = 7 - rem(bit_offset, 8)
         byte = :binary.at(bin, byte_idx)
-        ((byte >>> bit_pos) &&& 1) == 1
+        (byte >>> bit_pos &&& 1) == 1
       end)
     end
   end
@@ -400,7 +424,7 @@ defmodule Ferricstore.Commands.Bitmap do
         byte_idx = div(bit_offset, 8)
         bit_pos = 7 - rem(bit_offset, 8)
         byte = :binary.at(bin, byte_idx)
-        ((byte >>> bit_pos) &&& 1) == bit_val
+        (byte >>> bit_pos &&& 1) == bit_val
       end)
     end
   end
@@ -425,7 +449,7 @@ defmodule Ferricstore.Commands.Bitmap do
   @spec first_bit_in_byte(byte(), 0 | 1) :: 0..7
   defp first_bit_in_byte(byte, bit_val) do
     Enum.find(0..7, fn bit_pos ->
-      ((byte >>> (7 - bit_pos)) &&& 1) == bit_val
+      (byte >>> (7 - bit_pos) &&& 1) == bit_val
     end)
   end
 
@@ -433,8 +457,9 @@ defmodule Ferricstore.Commands.Bitmap do
 
   @spec execute_bitop(binary(), [binary()], map()) :: {:ok, binary()} | {:error, binary()}
   defp execute_bitop("NOT", [src_key], store) do
-    src = Ops.get(store, src_key) || <<>>
-    {:ok, bitop_not(src)}
+    with {:ok, src} <- read_source(src_key, store) do
+      {:ok, bitop_not(src)}
+    end
   end
 
   defp execute_bitop("NOT", _keys, _store) do
@@ -442,28 +467,49 @@ defmodule Ferricstore.Commands.Bitmap do
   end
 
   defp execute_bitop(op, source_keys, store) when op in ~w(AND OR XOR) do
-    values = Enum.map(source_keys, fn k -> Ops.get(store, k) || <<>> end)
-    max_len = values |> Enum.map(&byte_size/1) |> Enum.max()
-    padded = Enum.map(values, &pad_binary(&1, max_len))
+    with {:ok, values} <- read_sources(source_keys, store) do
+      max_len = values |> Enum.map(&byte_size/1) |> Enum.max()
+      padded = Enum.map(values, &pad_binary(&1, max_len))
 
-    result =
-      case op do
-        "AND" -> bitop_combine(padded, &Bitwise.band/2)
-        "OR" -> bitop_combine(padded, &Bitwise.bor/2)
-        "XOR" -> bitop_combine(padded, &Bitwise.bxor/2)
-      end
+      result =
+        case op do
+          "AND" -> bitop_combine(padded, &Bitwise.band/2)
+          "OR" -> bitop_combine(padded, &Bitwise.bor/2)
+          "XOR" -> bitop_combine(padded, &Bitwise.bxor/2)
+        end
 
-    {:ok, result}
+      {:ok, result}
+    end
   end
 
   defp execute_bitop(_op, _keys, _store), do: {:error, "ERR syntax error"}
+
+  defp read_sources(source_keys, store) do
+    Enum.reduce_while(source_keys, {:ok, []}, fn key, {:ok, acc} ->
+      case read_source(key, store) do
+        {:ok, value} -> {:cont, {:ok, [value | acc]}}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+    |> case do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp read_source(key, store) do
+    case ensure_string_key(key, store) do
+      :ok -> {:ok, Ops.get(store, key) || <<>>}
+      @wrongtype_error -> @wrongtype_error
+    end
+  end
 
   # --- BITOP helpers ---------------------------------------------------------
 
   @spec bitop_not(binary()) :: binary()
   defp bitop_not(bin) do
     for <<byte::8 <- bin>>, into: <<>> do
-      <<(Bitwise.bnot(byte) &&& 0xFF)::8>>
+      <<Bitwise.bnot(byte) &&& 0xFF::8>>
     end
   end
 
