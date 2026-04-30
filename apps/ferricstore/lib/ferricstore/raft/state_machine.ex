@@ -2436,26 +2436,36 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  # Returns {path, file_id} for the active Bitcask log file. Falls back
-  # to the live ActiveFile registry when the path in ra state is stale
-  # (deleted shard dir during test restarts). Returns :stale when no
-  # valid path can be found — the caller should skip the disk write.
+  # Returns {path, file_id} for the active Bitcask log file. Prefer the live
+  # ActiveFile registry so state-machine writes follow shard rotations even
+  # when the init-time path still exists. Falls back to ra state for isolated
+  # tests/recovery where the registry has not been published yet.
   defp resolve_active_file(state) do
-    if File.exists?(state.active_file_path) do
-      {state.active_file_path, state.active_file_id}
-    else
-      try do
-        {file_id, file_path, _data_path} =
-          Ferricstore.Store.ActiveFile.get(state.shard_index)
+    case live_active_file(state.shard_index) do
+      {file_path, file_id} ->
+        {file_path, file_id}
 
-        if File.exists?(file_path) do
-          {file_path, file_id}
+      :stale ->
+        if File.exists?(state.active_file_path) do
+          {state.active_file_path, state.active_file_id}
         else
           :stale
         end
-      rescue
-        _ -> :stale
+    end
+  end
+
+  defp live_active_file(shard_index) do
+    try do
+      {file_id, file_path, _data_path} =
+        Ferricstore.Store.ActiveFile.get(shard_index)
+
+      if File.exists?(file_path) do
+        {file_path, file_id}
+      else
+        :stale
       end
+    rescue
+      _ -> :stale
     end
   end
 

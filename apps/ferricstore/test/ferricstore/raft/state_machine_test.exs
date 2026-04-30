@@ -146,6 +146,30 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert value_size > 0
     end
 
+    test "uses live ActiveFile registry when state active file is stale but still exists", %{
+      state: state,
+      ets: ets,
+      dir: dir,
+      shard_index: shard_index
+    } do
+      live_file_id = 8_100_000 + :erlang.unique_integer([:positive])
+      live_path = Path.join(dir, "#{live_file_id}.log")
+      File.touch!(live_path)
+      Ferricstore.Store.ActiveFile.publish(shard_index, live_file_id, live_path, dir)
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:put, "stale_active_registry", "value", 0}, state)
+
+      assert :ok = result
+
+      assert [{"stale_active_registry", "value", 0, _, ^live_file_id, offset, value_size}] =
+               :ets.lookup(ets, "stale_active_registry")
+
+      assert is_integer(offset)
+      assert value_size > 0
+      assert {:ok, "value"} = NIF.v2_pread_at(live_path, offset)
+    end
+
     test "Bitcask append errors fail quorum apply and roll back pending ETS", %{
       state: state,
       ets: ets
