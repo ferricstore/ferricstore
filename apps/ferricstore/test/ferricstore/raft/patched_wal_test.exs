@@ -22,6 +22,39 @@ defmodule Ferricstore.Raft.PatchedWalTest do
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
+  defmodule AlwaysFailWalIo do
+    def write(table, _data) do
+      :ets.update_counter(table, :attempts, {2, 1}, {:attempts, 0})
+      {:error, :forced_failure}
+    end
+  end
+
+  defmodule RaisingWalIo do
+    def write(table, _data) do
+      :ets.update_counter(table, :attempts, {2, 1}, {:attempts, 0})
+      :erlang.error(:forced_exception)
+    end
+  end
+
+  defmodule FlakyWalIo do
+    def write(table, _data) do
+      attempts = :ets.update_counter(table, :attempts, {2, 1}, {:attempts, 0})
+
+      if attempts < 3 do
+        {:error, :transient_failure}
+      else
+        :ok
+      end
+    end
+  end
+
+  defmodule UnexpectedWalIo do
+    def write(table, _data) do
+      :ets.update_counter(table, :attempts, {2, 1}, {:attempts, 0})
+      :busy
+    end
+  end
+
   setup_all do
     ShardHelpers.wait_shards_alive()
     :ok
@@ -45,6 +78,10 @@ defmodule Ferricstore.Raft.PatchedWalTest do
 
   defp wal_pid do
     Process.whereis(wal_name())
+  end
+
+  defp attempt_table do
+    :ets.new(:wal_write_attempts, [:set, :public])
   end
 
   # ---------------------------------------------------------------------------
@@ -178,6 +215,47 @@ defmodule Ferricstore.Raft.PatchedWalTest do
       assert File.read!(path) == "closed"
 
       File.rm!(path)
+    end
+  end
+
+  describe "WAL write retry error propagation" do
+    test "test write helper is exported" do
+      exports = :ra_log_wal.module_info(:exports)
+      assert {:__wal_write_for_test__, 3} in exports
+    end
+
+    test "permanent write errors are not reported as ok after retries" do
+      table = attempt_table()
+
+      assert {:error, {:retries_exhausted, :forced_failure}} =
+               :ra_log_wal.__wal_write_for_test__(AlwaysFailWalIo, table, "payload")
+
+      assert [{:attempts, 50}] = :ets.lookup(table, :attempts)
+    end
+
+    test "write exceptions are not reported as ok after retries" do
+      table = attempt_table()
+
+      assert {:error, {:retries_exhausted, {:error, :forced_exception}}} =
+               :ra_log_wal.__wal_write_for_test__(RaisingWalIo, table, "payload")
+
+      assert [{:attempts, 50}] = :ets.lookup(table, :attempts)
+    end
+
+    test "transient write errors still retry to success" do
+      table = attempt_table()
+
+      assert :ok = :ra_log_wal.__wal_write_for_test__(FlakyWalIo, table, "payload")
+      assert [{:attempts, 3}] = :ets.lookup(table, :attempts)
+    end
+
+    test "unexpected write results fail closed" do
+      table = attempt_table()
+
+      assert {:error, {:unexpected_result, :busy}} =
+               :ra_log_wal.__wal_write_for_test__(UnexpectedWalIo, table, "payload")
+
+      assert [{:attempts, 1}] = :ets.lookup(table, :attempts)
     end
   end
 

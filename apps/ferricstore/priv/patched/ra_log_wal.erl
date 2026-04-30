@@ -49,7 +49,8 @@
          fill_ratio/1]).
 
 -export([wal2list/1]).
--export(['__close_file_for_test__'/1]).
+-export(['__close_file_for_test__'/1,
+         '__wal_write_for_test__'/3]).
 
 -compile([inline_list_funcs]).
 -compile(inline).
@@ -948,28 +949,38 @@ start_batch(#state{conf = #conf{counter = CRef}} = State) ->
 flush_pending(#state{wal = #wal{fd = Fd},
                      batch = #batch{pending = Pend},
                      conf = #conf{wal_io_module = IoMod}} = State0) ->
-    ok = wal_write(IoMod, Fd, Pend),
-    %% NO sync here — it's done asynchronously
-    State0#state{batch = undefined}.
+    case wal_write(IoMod, Fd, Pend) of
+        ok ->
+            %% NO sync here — it's done asynchronously
+            State0#state{batch = undefined};
+        {error, Reason} ->
+            throw({stop, {wal_write_failed, Reason}});
+        Other ->
+            throw({stop, {wal_write_failed, Other}})
+    end.
+
+'__wal_write_for_test__'(IoMod, Handle, Data) ->
+    wal_write(IoMod, Handle, Data).
 
 wal_write(undefined, Fd, Data) ->
     file:write(Fd, Data);
 wal_write(IoMod, Handle, Data) ->
-    wal_write_retry(IoMod, Handle, Data, 50).
+    wal_write_retry(IoMod, Handle, Data, 50, undefined).
 
-wal_write_retry(_IoMod, _Handle, _Data, 0) ->
-    ok;
-wal_write_retry(IoMod, Handle, Data, Retries) ->
+wal_write_retry(_IoMod, _Handle, _Data, 0, LastError) ->
+    {error, {retries_exhausted, LastError}};
+wal_write_retry(IoMod, Handle, Data, Retries, _LastError) ->
     try IoMod:write(Handle, Data) of
         ok -> ok;
-        {error, _} ->
+        {error, Reason} ->
             timer:sleep(1),
-            wal_write_retry(IoMod, Handle, Data, Retries - 1);
-        Other -> Other
+            wal_write_retry(IoMod, Handle, Data, Retries - 1, Reason);
+        Other ->
+            {error, {unexpected_result, Other}}
     catch
-        _:_ ->
+        Class:Reason ->
             timer:sleep(1),
-            wal_write_retry(IoMod, Handle, Data, Retries - 1)
+            wal_write_retry(IoMod, Handle, Data, Retries - 1, {Class, Reason})
     end.
 
 sync(_Fd, none) ->
