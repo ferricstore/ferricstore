@@ -2034,6 +2034,8 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_put(state, key, value, expire_at_ms) do
+    maybe_clear_compound_data_structure_for_string_put(state, key)
+
     ets_val = value_for_ets(value, hot_cache_threshold(state))
     disk_val = to_disk_binary(value)
 
@@ -3316,6 +3318,46 @@ defmodule Ferricstore.Raft.StateMachine do
 
     :ok
   end
+
+  defp maybe_clear_compound_data_structure_for_string_put(state, key) do
+    unless Ferricstore.Store.CompoundKey.internal_key?(key) do
+      type_key = Ferricstore.Store.CompoundKey.type_key(key)
+
+      case do_get(state, type_key) do
+        nil ->
+          clear_legacy_list_metadata_for_string_put(state, key)
+
+        type ->
+          clear_compound_prefix_for_string_put(state, key, type)
+          do_delete(state, type_key)
+      end
+    end
+
+    :ok
+  end
+
+  defp clear_legacy_list_metadata_for_string_put(state, key) do
+    list_meta_key = Ferricstore.Store.CompoundKey.list_meta_key(key)
+
+    if do_get(state, list_meta_key) != nil do
+      clear_compound_prefix_for_string_put(state, key, "list")
+      do_delete(state, list_meta_key)
+    end
+  end
+
+  defp clear_compound_prefix_for_string_put(state, key, "hash"),
+    do: do_delete_prefix(state, Ferricstore.Store.CompoundKey.hash_prefix(key))
+
+  defp clear_compound_prefix_for_string_put(state, key, "list"),
+    do: do_delete_prefix(state, Ferricstore.Store.CompoundKey.list_prefix(key))
+
+  defp clear_compound_prefix_for_string_put(state, key, "set"),
+    do: do_delete_prefix(state, Ferricstore.Store.CompoundKey.set_prefix(key))
+
+  defp clear_compound_prefix_for_string_put(state, key, "zset"),
+    do: do_delete_prefix(state, Ferricstore.Store.CompoundKey.zset_prefix(key))
+
+  defp clear_compound_prefix_for_string_put(_state, _key, _type), do: :ok
 
   # ---------------------------------------------------------------------------
   # Private: read from ETS with Bitcask fallback

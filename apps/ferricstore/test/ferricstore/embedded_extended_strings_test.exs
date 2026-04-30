@@ -120,6 +120,38 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       FerricStore.mset(%{"ms:ow" => "new"})
       assert {:ok, "new"} = FerricStore.get("ms:ow")
     end
+
+    test "replaces hash key with string and clears stale hash metadata" do
+      assert :ok = FerricStore.hset("ms:hash", %{"field" => "old"})
+      assert :ok = FerricStore.mset(%{"ms:hash" => "string"})
+      assert {:ok, "string"} = FerricStore.get("ms:hash")
+      assert {:ok, "string"} = FerricStore.type("ms:hash")
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.hget("ms:hash", "field")
+    end
+  end
+
+  describe "set replacement across data structure keys" do
+    test "set replaces hash key with string and clears stale hash metadata" do
+      assert :ok = FerricStore.hset("set:hash", %{"field" => "old"})
+      assert :ok = FerricStore.set("set:hash", "string")
+      assert {:ok, "string"} = FerricStore.get("set:hash")
+      assert {:ok, "string"} = FerricStore.type("set:hash")
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.hget("set:hash", "field")
+    end
+
+    test "setex and psetex replace hash key with string and clear stale hash metadata" do
+      assert :ok = FerricStore.hset("setex:hash", %{"field" => "old"})
+      assert :ok = FerricStore.setex("setex:hash", 10, "string")
+      assert {:ok, "string"} = FerricStore.get("setex:hash")
+      assert {:ok, "string"} = FerricStore.type("setex:hash")
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.hget("setex:hash", "field")
+
+      assert :ok = FerricStore.hset("psetex:hash", %{"field" => "old"})
+      assert :ok = FerricStore.psetex("psetex:hash", 10_000, "string")
+      assert {:ok, "string"} = FerricStore.get("psetex:hash")
+      assert {:ok, "string"} = FerricStore.type("psetex:hash")
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.hget("psetex:hash", "field")
+    end
   end
 
   # ===========================================================================

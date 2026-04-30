@@ -6,6 +6,7 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.{Strings, Hash, Set, SortedSet}
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
   # ===========================================================================
@@ -147,6 +148,47 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
 
       result = Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = result
+    end
+  end
+
+  describe "string SET replacement clears old compound data" do
+    setup do
+      store = MockStore.make()
+      store.compound_put.("mykey", CompoundKey.type_key("mykey"), "hash", 0)
+      store.compound_put.("mykey", CompoundKey.hash_field("mykey", "field"), "old", 0)
+      {:ok, store: store}
+    end
+
+    test "SET replaces hash key with string and clears stale hash metadata", %{store: store} do
+      assert :ok = Strings.handle("SET", ["mykey", "string"], store)
+      assert store.get.("mykey") == "string"
+      assert store.compound_get.("mykey", CompoundKey.type_key("mykey")) == nil
+      assert store.compound_get.("mykey", CompoundKey.hash_field("mykey", "field")) == nil
+      assert {:simple, "string"} = Strings.handle("TYPE", ["mykey"], store)
+    end
+
+    test "MSET replaces hash key with string and clears stale hash metadata", %{store: store} do
+      assert :ok = Strings.handle("MSET", ["mykey", "string", "other", "value"], store)
+      assert store.get.("mykey") == "string"
+      assert store.get.("other") == "value"
+      assert store.compound_get.("mykey", CompoundKey.type_key("mykey")) == nil
+      assert store.compound_get.("mykey", CompoundKey.hash_field("mykey", "field")) == nil
+    end
+
+    test "SETEX and PSETEX replace hash key with string and clear stale hash metadata", %{
+      store: store
+    } do
+      assert :ok = Strings.handle("SETEX", ["mykey", "10", "string"], store)
+      assert store.get.("mykey") == "string"
+      assert store.compound_get.("mykey", CompoundKey.type_key("mykey")) == nil
+      assert store.compound_get.("mykey", CompoundKey.hash_field("mykey", "field")) == nil
+
+      store.compound_put.("mykey", CompoundKey.type_key("mykey"), "hash", 0)
+      store.compound_put.("mykey", CompoundKey.hash_field("mykey", "field"), "old", 0)
+      assert :ok = Strings.handle("PSETEX", ["mykey", "10", "string2"], store)
+      assert store.get.("mykey") == "string2"
+      assert store.compound_get.("mykey", CompoundKey.type_key("mykey")) == nil
+      assert store.compound_get.("mykey", CompoundKey.hash_field("mykey", "field")) == nil
     end
   end
 

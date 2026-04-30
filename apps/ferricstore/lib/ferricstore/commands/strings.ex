@@ -340,7 +340,7 @@ defmodule Ferricstore.Commands.Strings do
     case Integer.parse(secs_str) do
       {secs, ""} when secs > 0 ->
         expire_at_ms = CommandTime.now_ms() + secs * 1_000
-        Ops.put(store, key, value, expire_at_ms)
+        replace_string_key(key, value, expire_at_ms, store)
 
       {_secs, ""} ->
         {:error, "ERR invalid expire time in 'setex' command"}
@@ -361,7 +361,7 @@ defmodule Ferricstore.Commands.Strings do
     case Integer.parse(ms_str) do
       {ms, ""} when ms > 0 ->
         expire_at_ms = CommandTime.now_ms() + ms
-        Ops.put(store, key, value, expire_at_ms)
+        replace_string_key(key, value, expire_at_ms, store)
 
       {_ms, ""} ->
         {:error, "ERR invalid expire time in 'psetex' command"}
@@ -595,10 +595,21 @@ defmodule Ferricstore.Commands.Strings do
 
   defp do_set(key, value, opts, store) do
     with {:ok, parsed} <- parse_set_opts(opts) do
-      if parsed.nx or parsed.xx or parsed.get or parsed.keepttl do
-        Ops.set(store, key, value, parsed)
-      else
-        Ops.put(store, key, value, parsed.expire_at_ms)
+      cond do
+        parsed.get and compound_data_structure_key?(key, store) ->
+          @wrongtype_error
+
+        parsed.nx and compound_data_structure_key?(key, store) ->
+          nil
+
+        compound_data_structure_key?(key, store) ->
+          replace_string_key(key, value, parsed.expire_at_ms, store)
+
+        parsed.nx or parsed.xx or parsed.get or parsed.keepttl ->
+          Ops.set(store, key, value, parsed)
+
+        true ->
+          replace_string_key(key, value, parsed.expire_at_ms, store)
       end
     end
   end
@@ -727,7 +738,7 @@ defmodule Ferricstore.Commands.Strings do
   defp mset_exec([], _store), do: :ok
 
   defp mset_exec([k, v | rest], store) do
-    Ops.put(store, k, v, 0)
+    replace_string_key(k, v, 0, store)
     mset_exec(rest, store)
   end
 
@@ -780,11 +791,58 @@ defmodule Ferricstore.Commands.Strings do
   defp string_value_size(value) when is_float(value), do: byte_size(Float.to_string(value))
   defp string_value_size(value), do: byte_size(value)
 
+  defp replace_string_key(key, value, expire_at_ms, store) do
+    clear_compound_data_structure(key, store)
+    Ops.put(store, key, value, expire_at_ms)
+  end
+
   defp compound_data_structure_key?(key, store) do
     Ops.has_compound?(store) and
       (Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
          Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil)
   end
+
+  defp clear_compound_data_structure(key, store) do
+    if Ops.has_compound?(store) do
+      type_key = CompoundKey.type_key(key)
+
+      case Ops.compound_get(store, key, type_key) do
+        nil ->
+          clear_legacy_list_metadata(key, store)
+
+        type ->
+          clear_compound_prefix(key, type, store)
+          Ops.compound_delete(store, key, type_key)
+      end
+    end
+
+    :ok
+  end
+
+  defp clear_legacy_list_metadata(key, store) do
+    list_meta_key = CompoundKey.list_meta_key(key)
+
+    if Ops.compound_get(store, key, list_meta_key) != nil do
+      clear_compound_prefix(key, "list", store)
+      Ops.compound_delete(store, key, list_meta_key)
+    end
+  end
+
+  defp clear_compound_prefix(key, "hash", store),
+    do: Ops.compound_delete_prefix(store, key, CompoundKey.hash_prefix(key))
+
+  defp clear_compound_prefix(key, "list", store) do
+    Ops.compound_delete_prefix(store, key, CompoundKey.list_prefix(key))
+    Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))
+  end
+
+  defp clear_compound_prefix(key, "set", store),
+    do: Ops.compound_delete_prefix(store, key, CompoundKey.set_prefix(key))
+
+  defp clear_compound_prefix(key, "zset", store),
+    do: Ops.compound_delete_prefix(store, key, CompoundKey.zset_prefix(key))
+
+  defp clear_compound_prefix(_key, _type, _store), do: :ok
 
   # Detects if a stored binary is actually a serialized non-string type
   # (list, hash, set, zset). If so, returns WRONGTYPE error instead of the
