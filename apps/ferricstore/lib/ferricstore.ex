@@ -5509,7 +5509,7 @@ defmodule FerricStore.Pipe do
       :all_gets ->
         keys = Enum.map(ordered, fn {:get, k} -> k end)
         values = Ferricstore.Store.Router.batch_get(ctx, keys)
-        Enum.map(values, fn v -> {:ok, v} end)
+        pipeline_get_results(ctx, keys, values)
 
       :all_sets ->
         kv_pairs = Enum.map(ordered, fn {:set, k, v, _opts} -> {k, v} end)
@@ -5680,10 +5680,11 @@ defmodule FerricStore.Pipe do
       if get_ops != [] do
         keys = Enum.map(get_ops, &elem(&1, 1))
         values = Ferricstore.Store.Router.batch_get(ctx, keys)
+        results = pipeline_get_results(ctx, keys, values)
 
         get_ops
-        |> Enum.zip(values)
-        |> Map.new(fn {{i, _}, v} -> {i, {:ok, v}} end)
+        |> Enum.zip(results)
+        |> Map.new(fn {{i, _}, result} -> {i, result} end)
       else
         %{}
       end
@@ -5706,6 +5707,30 @@ defmodule FerricStore.Pipe do
     (async_ops ++ quorum_ops)
     |> Enum.sort_by(fn {i, _, _} -> i end)
     |> Enum.map(fn {i, _, _} -> Map.fetch!(combined, i) end)
+  end
+
+  defp pipeline_get_results(ctx, keys, values) do
+    keys
+    |> Enum.zip(values)
+    |> Enum.map(fn {key, value} -> pipeline_get_result(ctx, key, value) end)
+  end
+
+  defp pipeline_get_result(_ctx, _key, value) when value != nil, do: {:ok, value}
+
+  defp pipeline_get_result(ctx, key, nil) do
+    if pipeline_compound_data_structure_key?(ctx, key) do
+      {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp pipeline_compound_data_structure_key?(ctx, key) do
+    type_key = Ferricstore.Store.CompoundKey.type_key(key)
+    list_meta_key = Ferricstore.Store.CompoundKey.list_meta_key(key)
+
+    Ferricstore.Store.Router.compound_get(ctx, key, type_key) != nil or
+      Ferricstore.Store.Router.compound_get(ctx, key, list_meta_key) != nil
   end
 
   # The Coordinator returns raw Dispatcher results (RESP-level values).

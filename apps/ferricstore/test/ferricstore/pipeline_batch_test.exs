@@ -195,6 +195,32 @@ defmodule Ferricstore.PipelineBatchTest do
       assert {:ok, "value"} = FerricStore.get("pb:ttl")
     end
 
+    test "all-get fast path returns WRONGTYPE for compound keys" do
+      assert :ok = FerricStore.hset("pb:get:hash", %{"field" => "value"})
+      assert :ok = FerricStore.set("pb:get:string", "value")
+
+      assert {:ok, [{:error, "WRONGTYPE" <> _}, {:ok, "value"}]} =
+               FerricStore.pipeline(fn pipe ->
+                 pipe
+                 |> FerricStore.Pipe.get("pb:get:hash")
+                 |> FerricStore.Pipe.get("pb:get:string")
+               end)
+    end
+
+    test "all-set fast path replaces compound key with string" do
+      assert :ok = FerricStore.hset("pb:set:hash", %{"field" => "old"})
+
+      assert {:ok, [:ok]} =
+               FerricStore.pipeline(fn pipe ->
+                 pipe
+                 |> FerricStore.Pipe.set("pb:set:hash", "string")
+               end)
+
+      assert {:ok, "string"} = FerricStore.get("pb:set:hash")
+      assert {:ok, "string"} = FerricStore.type("pb:set:hash")
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.hget("pb:set:hash", "field")
+    end
+
     test "pipeline commands execute in order" do
       assert {:ok, results} =
                FerricStore.pipeline(fn pipe ->
