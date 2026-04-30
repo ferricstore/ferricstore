@@ -2,7 +2,8 @@ defmodule Ferricstore.Commands.StringsTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.Strings
+  alias Ferricstore.Commands.{Stream, Strings}
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -150,6 +151,27 @@ defmodule Ferricstore.Commands.StringsTest do
     test "DEL no args returns error" do
       assert {:error, _} = Strings.handle("DEL", [], MockStore.make())
     end
+
+    test "DEL handles stream type metadata without crashing" do
+      store = MockStore.make()
+      store.compound_put.("s", CompoundKey.type_key("s"), "stream", 0)
+
+      assert 1 == Strings.handle("DEL", ["s"], store)
+      assert nil == store.compound_get.("s", CompoundKey.type_key("s"))
+    end
+
+    test "DEL removes stream entries and metadata" do
+      Stream.ensure_meta_table()
+      store = MockStore.make()
+
+      id = Stream.handle("XADD", ["s", "*", "f", "v"], store)
+      assert is_binary(id)
+      assert 1 == Stream.handle("XLEN", ["s"], store)
+
+      assert 1 == Strings.handle("DEL", ["s"], store)
+      assert 0 == Stream.handle("XLEN", ["s"], store)
+      assert [] == store.compound_scan.("s", "X:s" <> <<0>>)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -249,10 +271,12 @@ defmodule Ferricstore.Commands.StringsTest do
     test "SET with both NX and XX returns error (mutually exclusive flags)" do
       # Redis rejects NX+XX regardless of key state
       store_empty = MockStore.make()
+
       assert {:error, "ERR XX and NX options at the same time are not compatible"} =
                Strings.handle("SET", ["key", "val", "NX", "XX"], store_empty)
 
       store_present = MockStore.make(%{"key" => {"old", 0}})
+
       assert {:error, "ERR XX and NX options at the same time are not compatible"} =
                Strings.handle("SET", ["key", "val", "NX", "XX"], store_present)
     end

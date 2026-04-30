@@ -913,12 +913,17 @@ defmodule Ferricstore.Commands.Strings do
 
       case Ops.compound_get(store, key, type_key) do
         nil ->
-          # No type metadata -- plain string key
-          if Ops.exists?(store, key) do
-            Ops.delete(store, key)
+          # No type metadata -- plain string key, or a stream that only has
+          # X:<key>\0 compound entries plus local ETS metadata.
+          if maybe_delete_stream_key(key, store) do
             true
           else
-            false
+            if Ops.exists?(store, key) do
+              Ops.delete(store, key)
+              true
+            else
+              false
+            end
           end
 
         type_str ->
@@ -931,13 +936,21 @@ defmodule Ferricstore.Commands.Strings do
               "list" -> CompoundKey.list_prefix(key)
               "set" -> CompoundKey.set_prefix(key)
               "zset" -> CompoundKey.zset_prefix(key)
+              "stream" -> stream_prefix(key)
+              _unknown -> nil
             end
 
-          Ops.compound_delete_prefix(store, key, prefix)
+          if prefix != nil do
+            Ops.compound_delete_prefix(store, key, prefix)
+          end
 
           if type_str == "list" do
             meta_key = CompoundKey.list_meta_key(key)
             Ops.compound_delete(store, key, meta_key)
+          end
+
+          if type_str == "stream" do
+            cleanup_stream_metadata(key)
           end
 
           TypeRegistry.delete_type(key, store)
@@ -951,5 +964,44 @@ defmodule Ferricstore.Commands.Strings do
         false
       end
     end
+  end
+
+  defp maybe_delete_stream_key(key, store) do
+    prefix = stream_prefix(key)
+
+    if Ops.compound_scan(store, key, prefix) != [] or stream_metadata_exists?(key) do
+      Ops.compound_delete_prefix(store, key, prefix)
+      cleanup_stream_metadata(key)
+      true
+    else
+      false
+    end
+  end
+
+  defp stream_prefix(key), do: "X:" <> key <> <<0>>
+
+  defp stream_metadata_exists?(key) do
+    table = Ferricstore.Stream.Meta
+    :ets.whereis(table) != :undefined and :ets.lookup(table, key) != []
+  end
+
+  defp cleanup_stream_metadata(key) do
+    meta_table = Ferricstore.Stream.Meta
+    groups_table = Ferricstore.Stream.Groups
+    waiters_table = :ferricstore_stream_waiters
+
+    if :ets.whereis(meta_table) != :undefined do
+      :ets.delete(meta_table, key)
+    end
+
+    if :ets.whereis(groups_table) != :undefined do
+      :ets.match_delete(groups_table, {{key, :_}, :_, :_, :_})
+    end
+
+    if :ets.whereis(waiters_table) != :undefined do
+      :ets.match_delete(waiters_table, {key, :_, :_, :_})
+    end
+
+    :ok
   end
 end
