@@ -77,7 +77,15 @@ mod atoms {
         error,
         nil,
         tokio_complete,
+        put,
+        delete,
     }
+}
+
+#[derive(rustler::NifTaggedEnum)]
+enum NifBatchWrite<'a> {
+    Put(Binary<'a>, Binary<'a>, u64),
+    Delete(Binary<'a>),
 }
 
 #[allow(non_local_definitions)]
@@ -879,6 +887,58 @@ fn v2_append_batch_nosync<'a>(
             match writer.write_batch_nosync(&entries) {
                 Ok(results) => {
                     let tuples: Vec<(u64, usize)> = results;
+                    Ok((atoms::ok(), tuples).encode(env))
+                }
+                Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+            }
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Append a mixed batch of put and delete records **without** fsync.
+/// Returns `{:ok, [{:put, offset, value_size} | {:delete, offset, record_size}, ...]}`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_append_ops_batch_nosync<'a>(
+    env: Env<'a>,
+    path: String,
+    records: Vec<NifBatchWrite<'a>>,
+) -> NifResult<Term<'a>> {
+    let p = std::path::Path::new(&path);
+    let file_id = parse_file_id(p);
+
+    match log::LogWriter::open(p, file_id) {
+        Ok(mut writer) => {
+            let entries: Vec<log::BatchWrite<'_>> = records
+                .iter()
+                .map(|record| match record {
+                    NifBatchWrite::Put(key, value, expire_at_ms) => log::BatchWrite::Put {
+                        key: key.as_slice(),
+                        value: value.as_slice(),
+                        expire_at_ms: *expire_at_ms,
+                    },
+                    NifBatchWrite::Delete(key) => log::BatchWrite::Delete {
+                        key: key.as_slice(),
+                    },
+                })
+                .collect();
+
+            match writer.write_ops_batch_nosync(&entries) {
+                Ok(results) => {
+                    let tuples: Vec<Term<'a>> = results
+                        .into_iter()
+                        .map(|result| match result {
+                            log::BatchWriteResult::Put { offset, value_len } => {
+                                (atoms::put(), offset, value_len).encode(env)
+                            }
+                            log::BatchWriteResult::Delete {
+                                offset,
+                                record_size,
+                            } => (atoms::delete(), offset, record_size).encode(env),
+                        })
+                        .collect();
+
                     Ok((atoms::ok(), tuples).encode(env))
                 }
                 Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),

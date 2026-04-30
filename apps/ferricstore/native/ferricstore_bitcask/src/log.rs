@@ -73,6 +73,24 @@ pub struct LogWriter {
     pub file_id: u64,
 }
 
+/// A record to append in a mixed Bitcask batch.
+pub enum BatchWrite<'a> {
+    Put {
+        key: &'a [u8],
+        value: &'a [u8],
+        expire_at_ms: u64,
+    },
+    Delete {
+        key: &'a [u8],
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchWriteResult {
+    Put { offset: u64, value_len: usize },
+    Delete { offset: u64, record_size: usize },
+}
+
 impl LogWriter {
     /// Open (or create) a data file for appending.
     ///
@@ -270,6 +288,78 @@ impl LogWriter {
             .zip(entries.iter())
             .map(|(off, (_, value, _))| (off, value.len()))
             .collect())
+    }
+
+    /// Write mixed put and delete records in a single batch **without** fsync.
+    ///
+    /// Preserves input order and combines all encoded records into one append.
+    /// The caller is responsible for a later fsync/checkpoint.
+    pub fn write_ops_batch_nosync(
+        &mut self,
+        entries: &[BatchWrite<'_>],
+    ) -> Result<Vec<BatchWriteResult>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        for entry in entries {
+            match entry {
+                BatchWrite::Put { key, value, .. } => {
+                    validate_kv_sizes(key, value).map_err(LogError)?;
+                }
+                BatchWrite::Delete { key } => {
+                    validate_kv_sizes(key, &[]).map_err(LogError)?;
+                }
+            }
+        }
+
+        let encoded: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|entry| match entry {
+                BatchWrite::Put {
+                    key,
+                    value,
+                    expire_at_ms,
+                } => encode_record(key, value, *expire_at_ms),
+                BatchWrite::Delete { key } => encode_tombstone(key),
+            })
+            .collect();
+
+        let total_len: usize = encoded.iter().map(Vec::len).sum();
+        let mut combined = Vec::with_capacity(total_len);
+        let mut results = Vec::with_capacity(encoded.len());
+        let mut running = self.backend.offset();
+
+        for (entry, buf) in entries.iter().zip(&encoded) {
+            match entry {
+                BatchWrite::Put { value, .. } => {
+                    results.push(BatchWriteResult::Put {
+                        offset: running,
+                        value_len: value.len(),
+                    });
+                }
+                BatchWrite::Delete { key } => {
+                    results.push(BatchWriteResult::Delete {
+                        offset: running,
+                        record_size: HEADER_SIZE + key.len(),
+                    });
+                }
+            }
+
+            combined.extend_from_slice(buf);
+            running += buf.len() as u64;
+        }
+
+        self.backend
+            .append(&combined)
+            .map_err(|e| LogError(e.to_string()))?;
+
+        self.backend
+            .flush_no_sync()
+            .map_err(|e| LogError(e.to_string()))?;
+        self.offset = self.backend.offset();
+
+        Ok(results)
     }
 
     /// Write pre-encoded record buffers and fsync. Returns the file offset
@@ -1335,6 +1425,489 @@ mod tests {
         assert_eq!(records[0].key, b"dk1");
         assert_eq!(records[1].key, b"dk2");
         let _ = results;
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_supports_tombstones_in_order() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let entries = vec![
+            BatchWrite::Put {
+                key: b"k1",
+                value: b"v1",
+                expire_at_ms: 0,
+            },
+            BatchWrite::Delete { key: b"k1" },
+            BatchWrite::Put {
+                key: b"empty",
+                value: b"",
+                expire_at_ms: 0,
+            },
+        ];
+
+        let results = w.write_ops_batch_nosync(&entries).unwrap();
+        assert_eq!(results.len(), 3);
+
+        let off1 = match results[0] {
+            BatchWriteResult::Put { offset, value_len } => {
+                assert_eq!(value_len, 2);
+                offset
+            }
+            BatchWriteResult::Delete { .. } => panic!("first op must be put"),
+        };
+
+        let off2 = match results[1] {
+            BatchWriteResult::Delete {
+                offset,
+                record_size,
+            } => {
+                assert_eq!(record_size, HEADER_SIZE + 2);
+                offset
+            }
+            BatchWriteResult::Put { .. } => panic!("second op must be delete"),
+        };
+
+        let off3 = match results[2] {
+            BatchWriteResult::Put { offset, value_len } => {
+                assert_eq!(value_len, 0);
+                offset
+            }
+            BatchWriteResult::Delete { .. } => panic!("third op must be put"),
+        };
+
+        assert_eq!(off1, 0);
+        assert!(off2 > off1);
+        assert!(off3 > off2);
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_start().unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].key, b"k1");
+        assert_eq!(records[0].value, Some(b"v1".to_vec()));
+        assert_eq!(records[1].key, b"k1");
+        assert_eq!(records[1].value, None);
+        assert_eq!(records[2].key, b"empty");
+        assert_eq!(records[2].value, Some(Vec::new()));
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_empty_preserves_offset() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+
+        let results = w.write_ops_batch_nosync(&[]).unwrap();
+
+        assert!(results.is_empty());
+        assert_eq!(w.offset, 0);
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_single_tombstone_is_readable_as_none() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let entries = vec![BatchWrite::Delete { key: b"gone" }];
+
+        let results = w.write_ops_batch_nosync(&entries).unwrap();
+
+        assert_eq!(
+            results,
+            vec![BatchWriteResult::Delete {
+                offset: 0,
+                record_size: HEADER_SIZE + 4,
+            }]
+        );
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let record = reader.read_at(0).unwrap().unwrap();
+        assert_eq!(record.key, b"gone");
+        assert_eq!(record.value, None);
+        assert_eq!(record.expire_at_ms, 0);
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_appends_after_existing_records() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let first_offset = w.write(b"seed", b"value", 0).unwrap();
+        assert_eq!(first_offset, 0);
+        let expected_next = (HEADER_SIZE + b"seed".len() + b"value".len()) as u64;
+
+        let entries = vec![
+            BatchWrite::Delete { key: b"seed" },
+            BatchWrite::Put {
+                key: b"next",
+                value: b"v",
+                expire_at_ms: 123,
+            },
+        ];
+
+        let results = w.write_ops_batch_nosync(&entries).unwrap();
+
+        assert_eq!(
+            results[0],
+            BatchWriteResult::Delete {
+                offset: expected_next,
+                record_size: HEADER_SIZE + 4,
+            }
+        );
+
+        let second_offset = match results[1] {
+            BatchWriteResult::Put { offset, value_len } => {
+                assert_eq!(value_len, 1);
+                offset
+            }
+            BatchWriteResult::Delete { .. } => panic!("second op must be put"),
+        };
+
+        assert!(second_offset > expected_next);
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_start().unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].key, b"seed");
+        assert_eq!(records[0].value, Some(b"value".to_vec()));
+        assert_eq!(records[1].key, b"seed");
+        assert_eq!(records[1].value, None);
+        assert_eq!(records[2].key, b"next");
+        assert_eq!(records[2].value, Some(b"v".to_vec()));
+        assert_eq!(records[2].expire_at_ms, 123);
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_repeated_key_preserves_last_record_order() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let entries = vec![
+            BatchWrite::Put {
+                key: b"k",
+                value: b"v1",
+                expire_at_ms: 0,
+            },
+            BatchWrite::Delete { key: b"k" },
+            BatchWrite::Put {
+                key: b"k",
+                value: b"v2",
+                expire_at_ms: 0,
+            },
+            BatchWrite::Delete { key: b"k" },
+        ];
+
+        let results = w.write_ops_batch_nosync(&entries).unwrap();
+        assert_eq!(results.len(), 4);
+
+        let mut offsets = Vec::new();
+        for result in results {
+            offsets.push(match result {
+                BatchWriteResult::Put { offset, .. } | BatchWriteResult::Delete { offset, .. } => {
+                    offset
+                }
+            });
+        }
+
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_start().unwrap();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].value, Some(b"v1".to_vec()));
+        assert_eq!(records[1].value, None);
+        assert_eq!(records[2].value, Some(b"v2".to_vec()));
+        assert_eq!(records[3].value, None);
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_empty_value_is_not_tombstone() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let entries = vec![
+            BatchWrite::Put {
+                key: b"empty",
+                value: b"",
+                expire_at_ms: 0,
+            },
+            BatchWrite::Delete { key: b"deleted" },
+        ];
+
+        let results = w.write_ops_batch_nosync(&entries).unwrap();
+
+        assert_eq!(
+            results[0],
+            BatchWriteResult::Put {
+                offset: 0,
+                value_len: 0,
+            }
+        );
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_start().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].key, b"empty");
+        assert_eq!(records[0].value, Some(Vec::new()));
+        assert_eq!(records[1].key, b"deleted");
+        assert_eq!(records[1].value, None);
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_offsets_match_encoded_lengths_and_file_size() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let entries = vec![
+            BatchWrite::Put {
+                key: b"aa",
+                value: b"111",
+                expire_at_ms: 10,
+            },
+            BatchWrite::Delete { key: b"bbb" },
+            BatchWrite::Put {
+                key: b"c",
+                value: b"2222",
+                expire_at_ms: 20,
+            },
+        ];
+
+        let results = w.write_ops_batch_nosync(&entries).unwrap();
+
+        let first_len = (HEADER_SIZE + 2 + 3) as u64;
+        let second_len = (HEADER_SIZE + 3) as u64;
+        let third_len = (HEADER_SIZE + 1 + 4) as u64;
+        assert_eq!(
+            results,
+            vec![
+                BatchWriteResult::Put {
+                    offset: 0,
+                    value_len: 3,
+                },
+                BatchWriteResult::Delete {
+                    offset: first_len,
+                    record_size: HEADER_SIZE + 3,
+                },
+                BatchWriteResult::Put {
+                    offset: first_len + second_len,
+                    value_len: 4,
+                },
+            ]
+        );
+        assert_eq!(w.offset, first_len + second_len + third_len);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            first_len + second_len + third_len
+        );
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_preserves_empty_binary_keys() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let entries = vec![
+            BatchWrite::Put {
+                key: b"",
+                value: b"present",
+                expire_at_ms: 0,
+            },
+            BatchWrite::Delete { key: b"" },
+        ];
+
+        let results = w.write_ops_batch_nosync(&entries).unwrap();
+
+        assert_eq!(
+            results,
+            vec![
+                BatchWriteResult::Put {
+                    offset: 0,
+                    value_len: 7,
+                },
+                BatchWriteResult::Delete {
+                    offset: (HEADER_SIZE + 7) as u64,
+                    record_size: HEADER_SIZE,
+                },
+            ]
+        );
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_start().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records[0].key.is_empty());
+        assert_eq!(records[0].value, Some(b"present".to_vec()));
+        assert!(records[1].key.is_empty());
+        assert_eq!(records[1].value, None);
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_pure_delete_batch_returns_all_tombstones() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let entries = vec![
+            BatchWrite::Delete { key: b"a" },
+            BatchWrite::Delete { key: b"bb" },
+            BatchWrite::Delete { key: b"ccc" },
+        ];
+
+        let results = w.write_ops_batch_nosync(&entries).unwrap();
+
+        assert_eq!(
+            results,
+            vec![
+                BatchWriteResult::Delete {
+                    offset: 0,
+                    record_size: HEADER_SIZE + 1,
+                },
+                BatchWriteResult::Delete {
+                    offset: (HEADER_SIZE + 1) as u64,
+                    record_size: HEADER_SIZE + 2,
+                },
+                BatchWriteResult::Delete {
+                    offset: (HEADER_SIZE + 1 + HEADER_SIZE + 2) as u64,
+                    record_size: HEADER_SIZE + 3,
+                },
+            ]
+        );
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_start().unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|record| record.value.is_none()));
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_retains_put_expiry_around_deletes() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let entries = vec![
+            BatchWrite::Put {
+                key: b"ttl-max",
+                value: b"v1",
+                expire_at_ms: u64::MAX,
+            },
+            BatchWrite::Delete { key: b"ttl-max" },
+            BatchWrite::Put {
+                key: b"ttl-later",
+                value: b"v2",
+                expire_at_ms: 1_700_000_000_000,
+            },
+        ];
+
+        let results = w.write_ops_batch_nosync(&entries).unwrap();
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = results
+            .iter()
+            .map(|result| match result {
+                BatchWriteResult::Put { offset, .. } | BatchWriteResult::Delete { offset, .. } => {
+                    reader.read_at(*offset).unwrap().unwrap()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(records[0].expire_at_ms, u64::MAX);
+        assert_eq!(records[1].expire_at_ms, 0);
+        assert_eq!(records[1].value, None);
+        assert_eq!(records[2].expire_at_ms, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_empty_after_existing_record_preserves_offset() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        w.write(b"seed", b"value", 0).unwrap();
+        w.sync().unwrap();
+        let offset_before = w.offset;
+
+        let results = w.write_ops_batch_nosync(&[]).unwrap();
+
+        assert!(results.is_empty());
+        assert_eq!(w.offset, offset_before);
+        assert_eq!(fs::metadata(&path).unwrap().len(), offset_before);
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_accepts_max_key_for_put_and_delete() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let key = vec![0x42; usize::from(u16::MAX)];
+        let entries = vec![
+            BatchWrite::Put {
+                key: &key,
+                value: b"v",
+                expire_at_ms: 0,
+            },
+            BatchWrite::Delete { key: &key },
+        ];
+
+        let results = w.write_ops_batch_nosync(&entries).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[1],
+            BatchWriteResult::Delete {
+                offset: (HEADER_SIZE + key.len() + 1) as u64,
+                record_size: HEADER_SIZE + key.len(),
+            }
+        );
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_start().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].key, key);
+        assert_eq!(records[0].value, Some(b"v".to_vec()));
+        assert_eq!(records[1].key, records[0].key);
+        assert_eq!(records[1].value, None);
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_rejects_oversized_put_key_without_writing() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let too_large_key = vec![0x42; usize::from(u16::MAX) + 1];
+        let entries = vec![
+            BatchWrite::Delete { key: b"valid" },
+            BatchWrite::Put {
+                key: &too_large_key,
+                value: b"v",
+                expire_at_ms: 0,
+            },
+        ];
+
+        let err = w.write_ops_batch_nosync(&entries).unwrap_err();
+
+        assert!(err.to_string().contains("key too large"));
+        assert_eq!(w.offset, 0);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn write_ops_batch_nosync_rejects_oversized_delete_key_without_writing() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let too_large_key = vec![0x42; usize::from(u16::MAX) + 1];
+        let entries = vec![
+            BatchWrite::Put {
+                key: b"valid",
+                value: b"v",
+                expire_at_ms: 0,
+            },
+            BatchWrite::Delete {
+                key: &too_large_key,
+            },
+        ];
+
+        let err = w.write_ops_batch_nosync(&entries).unwrap_err();
+
+        assert!(err.to_string().contains("key too large"));
+        assert_eq!(w.offset, 0);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
     }
 
     // ------------------------------------------------------------------

@@ -29,14 +29,25 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
     flush_ms = Keyword.get(opts, :flush_interval_ms, 1)
 
     name = :"async_io_test_#{:erlang.unique_integer([:positive])}"
-    ctx = FerricStore.Instance.build(name, [
-      data_dir: dir,
-      shard_count: 1,
-      raft_enabled: false
-    ])
+
+    ctx =
+      FerricStore.Instance.build(name,
+        data_dir: dir,
+        shard_count: 1,
+        raft_enabled: false
+      )
+
     Ferricstore.DataDir.ensure_layout!(dir, 1)
 
-    {:ok, pid} = Shard.start_link(index: 0, data_dir: dir, flush_interval_ms: flush_ms, instance_ctx: ctx, raft_enabled: false)
+    {:ok, pid} =
+      Shard.start_link(
+        index: 0,
+        data_dir: dir,
+        flush_interval_ms: flush_ms,
+        instance_ctx: ctx,
+        raft_enabled: false
+      )
+
     {pid, 0, dir, ctx}
   end
 
@@ -77,8 +88,10 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       [{off1, vsize1}, {off2, vsize2}] = locations
       assert off1 == 0
       assert off2 > off1
-      assert vsize1 == 4  # byte_size("val1")
-      assert vsize2 == 4  # byte_size("val2")
+      # byte_size("val1")
+      assert vsize1 == 4
+      # byte_size("val2")
+      assert vsize2 == 4
 
       # Data should be readable via v2_pread_at (flushed to page cache)
       assert {:ok, "val1"} = NIF.v2_pread_at(path, off1)
@@ -94,6 +107,43 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       on_exit(fn -> File.rm_rf(dir) end)
 
       assert {:ok, []} = NIF.v2_append_batch_nosync(path, [])
+    end
+  end
+
+  describe "v2_append_ops_batch_nosync NIF" do
+    test "writes mixed put and tombstone records without fsync" do
+      dir = Path.join(System.tmp_dir!(), "nosync_ops_nif_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "00000.log")
+      File.touch!(path)
+
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      ops = [
+        {:put, "key1", "val1", 0},
+        {:delete, "key1"},
+        {:put, "empty", "", 0}
+      ]
+
+      assert {:ok, [{:put, off1, 4}, {:delete, off2, tomb_size}, {:put, off3, 0}]} =
+               NIF.v2_append_ops_batch_nosync(path, ops)
+
+      assert off1 == 0
+      assert off2 > off1
+      assert off3 > off2
+      assert tomb_size == 26 + byte_size("key1")
+
+      assert {:ok, "val1"} = NIF.v2_pread_at(path, off1)
+      assert {:ok, nil} = NIF.v2_pread_at(path, off2)
+      assert {:ok, ""} = NIF.v2_pread_at(path, off3)
+
+      assert {:ok, records} = NIF.v2_scan_file(path)
+
+      assert [
+               {"key1", ^off1, 4, 0, false},
+               {"key1", ^off2, 0, 0, true},
+               {"empty", ^off3, 0, 0, false}
+             ] = records
     end
   end
 
@@ -328,8 +378,10 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       [{off1, vsize1}, {off2, vsize2}] = locations
       assert off1 == 0
       assert off2 > off1
-      assert vsize1 == 3  # byte_size("av1")
-      assert vsize2 == 3  # byte_size("av2")
+      # byte_size("av1")
+      assert vsize1 == 3
+      # byte_size("av2")
+      assert vsize2 == 3
 
       # Data should be readable
       assert {:ok, "av1"} = NIF.v2_pread_at(path, off1)

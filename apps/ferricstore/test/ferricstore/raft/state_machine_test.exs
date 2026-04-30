@@ -362,6 +362,40 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert [{"mix_c", "vc", 0, _, _, _, _}] = :ets.lookup(ets, "mix_c")
     end
 
+    test "mixed put and delete batch emits one Bitcask append for all ops", %{
+      state: state
+    } do
+      {state2, :ok} = StateMachine.apply(%{}, {:put, "batched_delete_seed", "old", 0}, state)
+      handler_id = {:state_machine_mixed_delete_batch_telemetry, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :bitcask, :append],
+          fn _event, measurements, metadata, test_pid ->
+            send(test_pid, {:bitcask_append, measurements, metadata})
+          end,
+          self()
+        )
+
+      try do
+        commands = [
+          {:put, "batched_delete_put_a", "a", 0},
+          {:delete, "batched_delete_seed"},
+          {:put, "batched_delete_put_b", "b", 0}
+        ]
+
+        {_new_state, {:ok, [:ok, :ok, :ok]}} =
+          StateMachine.apply(%{}, {:batch, commands}, state2)
+
+        assert_receive {:bitcask_append, measurements, %{status: :ok}}, 500
+        assert measurements.batch_size == 3
+        assert measurements.delete_count == 1
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
     test "empty batch returns empty results", %{state: state} do
       {new_state, {:ok, results}} =
         StateMachine.apply(%{}, {:batch, []}, state)

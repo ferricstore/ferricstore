@@ -1715,8 +1715,7 @@ defmodule Ferricstore.Raft.StateMachine do
     case :ets.lookup(state.ets, key) do
       [{^key, _v, _e, _lfu, :pending, 0, _vs}] ->
         disk_val = to_disk_binary(value)
-        pending = Process.get(:sm_pending_writes, [])
-        Process.put(:sm_pending_writes, [{key, disk_val, expire_at_ms} | pending])
+        queue_pending_put(key, disk_val, expire_at_ms)
 
       _ ->
         :ok
@@ -1750,8 +1749,7 @@ defmodule Ferricstore.Raft.StateMachine do
       case :ets.lookup(state.ets, key) do
         [{^key, _v, _e, _lfu, :pending, 0, _vs}] ->
           disk_val = to_disk_binary(value)
-          pending = Process.get(:sm_pending_writes, [])
-          Process.put(:sm_pending_writes, [{key, disk_val, expire_at_ms} | pending])
+          queue_pending_put(key, disk_val, expire_at_ms)
 
         _ ->
           :ok
@@ -2061,7 +2059,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Wraps a block of state machine operations with batched disk writes.
   # Initializes the pending-writes buffer, runs the block, then flushes
-  # all accumulated writes in a single v2_append_batch_nosync NIF call.
+  # all accumulated writes in one no-sync NIF call.
   # If the append fails, restores any ETS entries that were replaced with
   # :pending locations and returns the disk error instead of acknowledging
   # success to the caller.
@@ -2105,8 +2103,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     # Accumulate for batch disk write — flushed by flush_pending_writes
     # at the end of apply/3 before returning to ra.
-    pending = Process.get(:sm_pending_writes, [])
-    Process.put(:sm_pending_writes, [{key, disk_val, expire_at_ms} | pending])
+    queue_pending_put(key, disk_val, expire_at_ms)
 
     :ok
   end
@@ -2159,6 +2156,7 @@ defmodule Ferricstore.Raft.StateMachine do
       pending when is_list(pending) ->
         batch = Enum.reverse(pending)
         batch_bytes = bitcask_batch_bytes(batch)
+        delete_count = Enum.count(batch, &match?({:delete, _, _}, &1))
 
         case resolve_active_file(state) do
           :stale ->
@@ -2167,6 +2165,7 @@ defmodule Ferricstore.Raft.StateMachine do
               System.monotonic_time(),
               length(batch),
               batch_bytes,
+              delete_count,
               :stale
             )
 
@@ -2176,32 +2175,21 @@ defmodule Ferricstore.Raft.StateMachine do
 
           {file_path, file_id} ->
             started_at = System.monotonic_time()
-            append_result = NIF.v2_append_batch_nosync(file_path, batch)
+            append_result = append_pending_batch(file_path, batch)
 
             emit_bitcask_append_telemetry(
               state,
               started_at,
               length(batch),
               batch_bytes,
+              delete_count,
               append_result
             )
 
             case append_result do
               {:ok, locations} ->
                 clear_disk_pressure(state)
-
-                Enum.zip(batch, locations)
-                |> Enum.each(fn {{key, _val, _exp}, {offset, value_size}} ->
-                  try do
-                    :ets.update_element(state.ets, key, [
-                      {5, file_id},
-                      {6, offset},
-                      {7, value_size}
-                    ])
-                  rescue
-                    ArgumentError -> :ok
-                  end
-                end)
+                apply_pending_locations(state, file_id, batch, locations)
 
               {:error, reason} ->
                 set_disk_pressure(state)
@@ -2216,9 +2204,78 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp bitcask_batch_bytes(batch) do
-    Enum.reduce(batch, 0, fn {key, value, _expire_at_ms}, acc ->
-      acc + byte_size(key) + byte_size(value)
+    Enum.reduce(batch, 0, fn
+      {:put, key, value, _expire_at_ms}, acc ->
+        acc + byte_size(key) + byte_size(value)
+
+      {:delete, key, _prob_path}, acc ->
+        acc + byte_size(key)
     end)
+  end
+
+  defp append_pending_batch(file_path, batch) do
+    if Enum.any?(batch, &match?({:delete, _, _}, &1)) do
+      ops =
+        Enum.map(batch, fn
+          {:put, key, value, expire_at_ms} -> {:put, key, value, expire_at_ms}
+          {:delete, key, _prob_path} -> {:delete, key}
+        end)
+
+      NIF.v2_append_ops_batch_nosync(file_path, ops)
+    else
+      puts =
+        Enum.map(batch, fn {:put, key, value, expire_at_ms} ->
+          {key, value, expire_at_ms}
+        end)
+
+      case NIF.v2_append_batch_nosync(file_path, puts) do
+        {:ok, locations} ->
+          tagged_locations =
+            Enum.map(locations, fn {offset, value_size} ->
+              {:put, offset, value_size}
+            end)
+
+          {:ok, tagged_locations}
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+  end
+
+  defp apply_pending_locations(state, file_id, batch, locations) do
+    Enum.zip(batch, locations)
+    |> Enum.each(fn
+      {{:put, key, _val, _exp}, {:put, offset, value_size}} ->
+        try do
+          :ets.update_element(state.ets, key, [
+            {5, file_id},
+            {6, offset},
+            {7, value_size}
+          ])
+        rescue
+          ArgumentError -> :ok
+        end
+
+      {{:delete, _key, nil}, {:delete, _offset, _record_size}} ->
+        :ok
+
+      {{:delete, _key, prob_path}, {:delete, _offset, _record_size}} ->
+        maybe_delete_prob_file_path(state, prob_path)
+
+      {_entry, _location} ->
+        :ok
+    end)
+  end
+
+  defp queue_pending_put(key, value, expire_at_ms) do
+    pending = Process.get(:sm_pending_writes, [])
+    Process.put(:sm_pending_writes, [{:put, key, value, expire_at_ms} | pending])
+  end
+
+  defp queue_pending_delete(key, prob_path) do
+    pending = Process.get(:sm_pending_writes, [])
+    Process.put(:sm_pending_writes, [{:delete, key, prob_path} | pending])
   end
 
   defp emit_raft_apply_telemetry(state, started_at, result, flush_result) do
@@ -2233,13 +2290,21 @@ defmodule Ferricstore.Raft.StateMachine do
     )
   end
 
-  defp emit_bitcask_append_telemetry(state, started_at, batch_size, batch_bytes, append_result) do
+  defp emit_bitcask_append_telemetry(
+         state,
+         started_at,
+         batch_size,
+         batch_bytes,
+         delete_count,
+         append_result
+       ) do
     :telemetry.execute(
       [:ferricstore, :bitcask, :append],
       %{
         duration_us: duration_us(started_at),
         batch_size: batch_size,
-        batch_bytes: batch_bytes
+        batch_bytes: batch_bytes,
+        delete_count: delete_count
       },
       %{shard_index: state.shard_index, status: append_result_class(append_result)}
     )
@@ -2359,25 +2424,19 @@ defmodule Ferricstore.Raft.StateMachine do
     # Without this, a background PUT arriving after the tombstone would
     # resurrect the key on recovery (Bitcask last-record-wins semantics).
     flush_pending_for_key(state, key)
+    prob_path = prob_file_path_for_delete(state, key)
 
     case resolve_active_file(state) do
       :stale ->
         set_disk_pressure(state)
         {:error, :active_file_unavailable}
 
-      {file_path, _file_id} ->
-        case NIF.v2_append_tombstone(file_path, key) do
-          {:ok, _} ->
-            # Keep prob sidecar files until the tombstone is durable enough
-            # for this apply to succeed; otherwise the metadata would remain.
-            maybe_delete_prob_file(state, key)
-            track_keydir_binary_remove(state, key)
-            :ets.delete(state.ets, key)
-            :ok
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+      {_file_path, _file_id} ->
+        record_pending_original(state, key)
+        track_keydir_binary_remove(state, key)
+        :ets.delete(state.ets, key)
+        queue_pending_delete(key, prob_path)
+        :ok
     end
   end
 
@@ -3469,29 +3528,36 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Enhanced do_delete that cleans up prob files.
   # When a key's value is a prob metadata marker, delete the associated file.
-  defp maybe_delete_prob_file(state, key) do
+  defp prob_file_path_for_delete(state, key) do
     case do_get(state, key) do
       nil ->
-        :ok
+        nil
 
       value when is_binary(value) ->
         try do
-          deleted? =
-            case :erlang.binary_to_term(value) do
-              {:bloom_meta, %{path: path}} -> Ferricstore.FS.rm(path) == :ok
-              {:cms_meta, _} -> Ferricstore.FS.rm(prob_path(state, key, "cms")) == :ok
-              {:cuckoo_meta, _} -> Ferricstore.FS.rm(prob_path(state, key, "cuckoo")) == :ok
-              {:topk_meta, %{path: path}} -> Ferricstore.FS.rm(path) == :ok
-              _ -> false
-            end
-
-          if deleted?, do: prob_fsync_dir(state), else: :ok
+          case :erlang.binary_to_term(value) do
+            {:bloom_meta, %{path: path}} -> path
+            {:cms_meta, _} -> prob_path(state, key, "cms")
+            {:cuckoo_meta, _} -> prob_path(state, key, "cuckoo")
+            {:topk_meta, %{path: path}} -> path
+            _ -> nil
+          end
         rescue
-          _ -> :ok
+          _ -> nil
         end
 
       _ ->
-        :ok
+        nil
+    end
+  end
+
+  defp maybe_delete_prob_file_path(_state, nil), do: :ok
+
+  defp maybe_delete_prob_file_path(state, path) do
+    try do
+      if Ferricstore.FS.rm(path) == :ok, do: prob_fsync_dir(state), else: :ok
+    rescue
+      _ -> :ok
     end
   end
 end
