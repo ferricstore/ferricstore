@@ -34,10 +34,18 @@ defmodule Ferricstore.Commands.TopKTest do
                TopK.handle("TOPK.INFO", ["hot_keys"], store)
     end
 
-    test "returns error when key already exists" do
-      store = MockStore.make(%{"hot_keys" => {{"existing", 0}, 0}})
+    test "returns error when TopK key already exists" do
+      store = MockStore.make()
+      :ok = TopK.handle("TOPK.RESERVE", ["hot_keys", "10"], store)
+
       assert {:error, msg} = TopK.handle("TOPK.RESERVE", ["hot_keys", "10"], store)
       assert msg =~ "already exists"
+    end
+
+    test "returns WRONGTYPE when key holds a string" do
+      store = MockStore.make(%{"hot_keys" => {{"existing", 0}, 0}})
+      assert {:error, msg} = TopK.handle("TOPK.RESERVE", ["hot_keys", "10"], store)
+      assert msg =~ "WRONGTYPE"
     end
 
     test "returns error with zero k" do
@@ -173,12 +181,10 @@ defmodule Ferricstore.Commands.TopKTest do
       assert msg =~ "does not exist"
     end
 
-    test "returns error when key holds wrong type" do
-      # With stateless NIFs, type isolation is by file extension.
-      # A string key has no .topk file, so the NIF returns enoent.
+    test "returns WRONGTYPE when key holds wrong type" do
       store = MockStore.make(%{"str_key" => {"a string", 0}})
       assert {:error, msg} = TopK.handle("TOPK.ADD", ["str_key", "elem"], store)
-      assert msg =~ "does not exist"
+      assert msg =~ "WRONGTYPE"
     end
 
     test "returns error with no element arguments" do
@@ -299,10 +305,10 @@ defmodule Ferricstore.Commands.TopKTest do
       assert msg =~ "does not exist"
     end
 
-    test "returns error when key holds wrong type" do
+    test "returns WRONGTYPE when key holds wrong type" do
       store = MockStore.make(%{"str_key" => {"a string", 0}})
       assert {:error, msg} = TopK.handle("TOPK.QUERY", ["str_key", "a"], store)
-      assert msg =~ "does not exist"
+      assert msg =~ "WRONGTYPE"
     end
 
     test "returns error with no element arguments" do
@@ -361,10 +367,10 @@ defmodule Ferricstore.Commands.TopKTest do
       assert msg =~ "does not exist"
     end
 
-    test "returns error when key holds wrong type" do
+    test "returns WRONGTYPE when key holds wrong type" do
       store = MockStore.make(%{"str_key" => {"a string", 0}})
       assert {:error, msg} = TopK.handle("TOPK.LIST", ["str_key"], store)
-      assert msg =~ "does not exist"
+      assert msg =~ "WRONGTYPE"
     end
 
     test "returns error with no arguments" do
@@ -397,10 +403,10 @@ defmodule Ferricstore.Commands.TopKTest do
       assert msg =~ "does not exist"
     end
 
-    test "returns error when key holds wrong type" do
+    test "returns WRONGTYPE when key holds wrong type" do
       store = MockStore.make(%{"str_key" => {"a string", 0}})
       assert {:error, msg} = TopK.handle("TOPK.INFO", ["str_key"], store)
-      assert msg =~ "does not exist"
+      assert msg =~ "WRONGTYPE"
     end
 
     test "returns error with wrong number of arguments" do

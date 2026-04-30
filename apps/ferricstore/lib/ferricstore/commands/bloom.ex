@@ -20,6 +20,7 @@ defmodule Ferricstore.Commands.Bloom do
   """
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Commands.ProbType
   @default_error_rate 0.01
   @default_capacity 100
 
@@ -43,7 +44,7 @@ defmodule Ferricstore.Commands.Bloom do
     end
   end
 
-    def handle("BF.RESERVE", _args, _store) do
+  def handle("BF.RESERVE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'bf.reserve' command"}
   end
 
@@ -52,9 +53,11 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   def handle("BF.ADD", [key, element], store) do
-    auto_params = default_auto_create_params()
-    result = do_prob_write(store, {:bloom_add, key, element, auto_params})
-    normalize_add_result(result)
+    with :ok <- ProbType.check_expected(key, :bloom, store) do
+      auto_params = default_auto_create_params()
+      result = do_prob_write(store, {:bloom_add, key, element, auto_params})
+      normalize_add_result(result)
+    end
   end
 
   def handle("BF.ADD", _args, _store) do
@@ -66,9 +69,11 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   def handle("BF.MADD", [key | elements], store) when elements != [] do
-    auto_params = default_auto_create_params()
-    result = do_prob_write(store, {:bloom_madd, key, elements, auto_params})
-    normalize_add_result(result)
+    with :ok <- ProbType.check_expected(key, :bloom, store) do
+      auto_params = default_auto_create_params()
+      result = do_prob_write(store, {:bloom_madd, key, elements, auto_params})
+      normalize_add_result(result)
+    end
   end
 
   def handle("BF.MADD", _args, _store) do
@@ -80,16 +85,23 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   def handle("BF.EXISTS", [key, element], store) do
-    path = prob_path(store, key, "bloom")
-    corr_id = System.unique_integer([:positive, :monotonic])
-    :ok = NIF.bloom_file_exists_async(self(), corr_id, path, element)
+    with :ok <- ProbType.check_expected(key, :bloom, store) do
+      path = prob_path(store, key, "bloom")
+      corr_id = System.unique_integer([:positive, :monotonic])
+      :ok = NIF.bloom_file_exists_async(self(), corr_id, path, element)
 
-    receive do
-      {:tokio_complete, ^corr_id, :ok, result} -> result
-      {:tokio_complete, ^corr_id, :error, "enoent"} -> 0
-      {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR bloom exists failed: #{reason}"}
-    after
-      5000 -> {:error, "ERR timeout"}
+      receive do
+        {:tokio_complete, ^corr_id, :ok, result} ->
+          result
+
+        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+          0
+
+        {:tokio_complete, ^corr_id, :error, reason} ->
+          {:error, "ERR bloom exists failed: #{reason}"}
+      after
+        5000 -> {:error, "ERR timeout"}
+      end
     end
   end
 
@@ -102,16 +114,23 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   def handle("BF.MEXISTS", [key | elements], store) when elements != [] do
-    path = prob_path(store, key, "bloom")
-    corr_id = System.unique_integer([:positive, :monotonic])
-    :ok = NIF.bloom_file_mexists_async(self(), corr_id, path, elements)
+    with :ok <- ProbType.check_expected(key, :bloom, store) do
+      path = prob_path(store, key, "bloom")
+      corr_id = System.unique_integer([:positive, :monotonic])
+      :ok = NIF.bloom_file_mexists_async(self(), corr_id, path, elements)
 
-    receive do
-      {:tokio_complete, ^corr_id, :ok, results} -> results
-      {:tokio_complete, ^corr_id, :error, "enoent"} -> List.duplicate(0, length(elements))
-      {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR bloom mexists failed: #{reason}"}
-    after
-      5000 -> {:error, "ERR timeout"}
+      receive do
+        {:tokio_complete, ^corr_id, :ok, results} ->
+          results
+
+        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+          List.duplicate(0, length(elements))
+
+        {:tokio_complete, ^corr_id, :error, reason} ->
+          {:error, "ERR bloom mexists failed: #{reason}"}
+      after
+        5000 -> {:error, "ERR timeout"}
+      end
     end
   end
 
@@ -124,16 +143,23 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   def handle("BF.CARD", [key], store) do
-    path = prob_path(store, key, "bloom")
-    corr_id = System.unique_integer([:positive, :monotonic])
-    :ok = NIF.bloom_file_card_async(self(), corr_id, path)
+    with :ok <- ProbType.check_expected(key, :bloom, store) do
+      path = prob_path(store, key, "bloom")
+      corr_id = System.unique_integer([:positive, :monotonic])
+      :ok = NIF.bloom_file_card_async(self(), corr_id, path)
 
-    receive do
-      {:tokio_complete, ^corr_id, :ok, count} -> count
-      {:tokio_complete, ^corr_id, :error, "enoent"} -> 0
-      {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR bloom card failed: #{reason}"}
-    after
-      5000 -> {:error, "ERR timeout"}
+      receive do
+        {:tokio_complete, ^corr_id, :ok, count} ->
+          count
+
+        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+          0
+
+        {:tokio_complete, ^corr_id, :error, reason} ->
+          {:error, "ERR bloom card failed: #{reason}"}
+      after
+        5000 -> {:error, "ERR timeout"}
+      end
     end
   end
 
@@ -146,33 +172,43 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   def handle("BF.INFO", [key], store) do
-    path = prob_path(store, key, "bloom")
-    corr_id = System.unique_integer([:positive, :monotonic])
-    :ok = NIF.bloom_file_info_async(self(), corr_id, path)
+    with :ok <- ProbType.check_expected(key, :bloom, store) do
+      path = prob_path(store, key, "bloom")
+      corr_id = System.unique_integer([:positive, :monotonic])
+      :ok = NIF.bloom_file_info_async(self(), corr_id, path)
 
-    receive do
-      {:tokio_complete, ^corr_id, :ok, {num_bits, count, num_hashes}} ->
-        # Try to get capacity/error_rate from stored metadata
-        {capacity, error_rate} = recover_bloom_meta(key, store, num_bits, num_hashes)
+      receive do
+        {:tokio_complete, ^corr_id, :ok, {num_bits, count, num_hashes}} ->
+          # Try to get capacity/error_rate from stored metadata
+          {capacity, error_rate} = recover_bloom_meta(key, store, num_bits, num_hashes)
 
-        [
-          "Capacity", capacity,
-          "Size", count,
-          "Number of filters", 1,
-          "Number of items inserted", count,
-          "Expansion rate", 0,
-          "Error rate", error_rate,
-          "Number of hash functions", num_hashes,
-          "Number of bits", num_bits
-        ]
+          [
+            "Capacity",
+            capacity,
+            "Size",
+            count,
+            "Number of filters",
+            1,
+            "Number of items inserted",
+            count,
+            "Expansion rate",
+            0,
+            "Error rate",
+            error_rate,
+            "Number of hash functions",
+            num_hashes,
+            "Number of bits",
+            num_bits
+          ]
 
-      {:tokio_complete, ^corr_id, :error, "enoent"} ->
-        {:error, "ERR not found"}
+        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+          {:error, "ERR not found"}
 
-      {:tokio_complete, ^corr_id, :error, reason} ->
-        {:error, "ERR bloom info failed: #{reason}"}
-    after
-      5000 -> {:error, "ERR timeout"}
+        {:tokio_complete, ^corr_id, :error, reason} ->
+          {:error, "ERR bloom info failed: #{reason}"}
+      after
+        5000 -> {:error, "ERR timeout"}
+      end
     end
   end
 
@@ -214,15 +250,28 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   defp check_bloom_not_exists(key, store) do
-    if bloom_file_exists?(key, store), do: {:error, "ERR item exists"}, else: :ok
+    case ProbType.check_create(key, :bloom, store) do
+      :ok -> if bloom_file_exists?(key, store), do: {:error, "ERR item exists"}, else: :ok
+      {:error, :exists} -> {:error, "ERR item exists"}
+      {:error, _} = error -> error
+    end
   end
 
   defp do_bloom_reserve(key, capacity, error_rate, store) do
     {num_bits, num_hashes} = compute_params(capacity, error_rate)
-    meta = {:bloom_meta, %{path: prob_path(store, key, "bloom"),
-                            num_bits: num_bits, num_hashes: num_hashes,
-                            capacity: capacity, error_rate: error_rate}}
+
+    meta =
+      {:bloom_meta,
+       %{
+         path: prob_path(store, key, "bloom"),
+         num_bits: num_bits,
+         num_hashes: num_hashes,
+         capacity: capacity,
+         error_rate: error_rate
+       }}
+
     result = do_prob_write(store, {:bloom_create, key, num_bits, num_hashes, meta})
+
     case result do
       {:ok, _} -> :ok
       :ok -> :ok
@@ -238,8 +287,13 @@ defmodule Ferricstore.Commands.Bloom do
 
   defp default_auto_create_params do
     {num_bits, num_hashes} = compute_params(@default_capacity, @default_error_rate)
-    %{num_bits: num_bits, num_hashes: num_hashes,
-      capacity: @default_capacity, error_rate: @default_error_rate}
+
+    %{
+      num_bits: num_bits,
+      num_hashes: num_hashes,
+      capacity: @default_capacity,
+      error_rate: @default_error_rate
+    }
   end
 
   defp prob_path(store, key, ext) do
@@ -248,9 +302,12 @@ defmodule Ferricstore.Commands.Bloom do
     Path.join(prob_dir, "#{safe}.#{ext}")
   end
 
-  defp resolve_prob_dir(%{prob_dir: prob_dir_fn}, _key) when is_function(prob_dir_fn), do: prob_dir_fn.()
+  defp resolve_prob_dir(%{prob_dir: prob_dir_fn}, _key) when is_function(prob_dir_fn),
+    do: prob_dir_fn.()
+
   defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
   defp resolve_prob_dir(%{bloom_registry: %{dir: dir}}, _key), do: dir
+
   defp resolve_prob_dir(_store, key) do
     ctx = FerricStore.Instance.get(:default)
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
@@ -271,7 +328,10 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   defp normalize_add_result({:ok, result}), do: result
-  defp normalize_add_result({:error, reason}), do: {:error, "ERR bloom add failed: #{inspect(reason)}"}
+
+  defp normalize_add_result({:error, reason}),
+    do: {:error, "ERR bloom add failed: #{inspect(reason)}"}
+
   defp normalize_add_result(:ok), do: :ok
   defp normalize_add_result(other), do: other
 
@@ -289,11 +349,12 @@ defmodule Ferricstore.Commands.Bloom do
   # Direct NIF application for test stores without Raft. Every path that
   # creates a prob file fsyncs the containing dir so the filename entry
   # is durable — matches the Raft state-machine path.
-  defp apply_prob_locally(store, {:bloom_create, key, num_bits, num_hashes, _meta}) do
+  defp apply_prob_locally(store, {:bloom_create, key, num_bits, num_hashes, meta}) do
     path = prob_path(store, key, "bloom")
     ensure_prob_dir(Path.dirname(path))
     result = NIF.bloom_file_create(path, num_bits, num_hashes)
     _ = NIF.v2_fsync_dir(Path.dirname(path))
+    register_bloom_meta(result, store, key, meta)
     result
   end
 
@@ -301,13 +362,17 @@ defmodule Ferricstore.Commands.Bloom do
     path = prob_path(store, key, "bloom")
     dir = Path.dirname(path)
     ensure_prob_dir(dir)
-    unless Ferricstore.FS.exists?(path) do
+    created? = not Ferricstore.FS.exists?(path)
+
+    if created? do
       if auto_params do
         %{num_bits: nb, num_hashes: nh} = auto_params
-        NIF.bloom_file_create(path, nb, nh)
+        result = NIF.bloom_file_create(path, nb, nh)
         _ = NIF.v2_fsync_dir(dir)
+        register_bloom_meta(result, store, key, {:bloom_meta, Map.put(auto_params, :path, path)})
       end
     end
+
     NIF.bloom_file_add(path, element)
   end
 
@@ -315,15 +380,23 @@ defmodule Ferricstore.Commands.Bloom do
     path = prob_path(store, key, "bloom")
     dir = Path.dirname(path)
     ensure_prob_dir(dir)
-    unless Ferricstore.FS.exists?(path) do
+    created? = not Ferricstore.FS.exists?(path)
+
+    if created? do
       if auto_params do
         %{num_bits: nb, num_hashes: nh} = auto_params
-        NIF.bloom_file_create(path, nb, nh)
+        result = NIF.bloom_file_create(path, nb, nh)
         _ = NIF.v2_fsync_dir(dir)
+        register_bloom_meta(result, store, key, {:bloom_meta, Map.put(auto_params, :path, path)})
       end
     end
+
     NIF.bloom_file_madd(path, elements)
   end
+
+  defp register_bloom_meta({:error, _}, _store, _key, _meta), do: :ok
+
+  defp register_bloom_meta(_result, store, key, meta), do: ProbType.register(store, key, meta)
 
   # Creates the prob dir if missing and fsyncs its parent so the new
   # directory entry is durable. No-op if the dir already exists.
@@ -351,6 +424,7 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   defp parse_stored_meta(nil), do: nil
+
   defp parse_stored_meta(value) when is_binary(value) do
     try do
       case :erlang.binary_to_term(value) do
@@ -361,6 +435,7 @@ defmodule Ferricstore.Commands.Bloom do
       _ -> nil
     end
   end
+
   defp parse_stored_meta(_), do: nil
 
   defp derive_bloom_params(num_bits, num_hashes) do
@@ -384,8 +459,12 @@ defmodule Ferricstore.Commands.Bloom do
   @spec parse_float(binary(), binary()) :: {:ok, float()} | {:error, binary()}
   defp parse_float(str, name) do
     case Float.parse(str) do
-      {val, ""} -> {:ok, val}
-      {val, ".0"} -> {:ok, val}
+      {val, ""} ->
+        {:ok, val}
+
+      {val, ".0"} ->
+        {:ok, val}
+
       _ ->
         case Integer.parse(str) do
           {int_val, ""} -> {:ok, int_val / 1}

@@ -8,6 +8,7 @@ defmodule Ferricstore.Commands.CMS do
   """
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Commands.ProbType
 
   # -------------------------------------------------------------------
   # Public command handler
@@ -21,6 +22,7 @@ defmodule Ferricstore.Commands.CMS do
          {:ok, depth} <- parse_pos_integer(depth_str, "depth"),
          :ok <- check_not_exists(key, store) do
       result = do_prob_write(store, {:cms_create, key, width, depth})
+
       case result do
         {:ok, _} -> :ok
         :ok -> :ok
@@ -39,6 +41,7 @@ defmodule Ferricstore.Commands.CMS do
       width = ceil(:math.exp(1) / error)
       depth = ceil(:math.log(1.0 / prob))
       result = do_prob_write(store, {:cms_create, key, width, depth})
+
       case result do
         {:ok, _} -> :ok
         :ok -> :ok
@@ -51,7 +54,8 @@ defmodule Ferricstore.Commands.CMS do
     do: {:error, "ERR wrong number of arguments for 'cms.initbyprob' command"}
 
   def handle("CMS.INCRBY", [key | rest], store) when rest != [] do
-    with {:ok, pairs} <- parse_element_count_pairs(rest) do
+    with :ok <- ProbType.check_expected(key, :cms, store),
+         {:ok, pairs} <- parse_element_count_pairs(rest) do
       result = do_prob_write(store, {:cms_incrby, key, pairs})
       normalize_result(result)
     end
@@ -62,16 +66,18 @@ defmodule Ferricstore.Commands.CMS do
 
   # CMS.QUERY — local stateless pread (async)
   def handle("CMS.QUERY", [key | elements], store) when elements != [] do
-    path = prob_path(store, key, "cms")
-    corr_id = System.unique_integer([:positive, :monotonic])
-    :ok = NIF.cms_file_query_async(self(), corr_id, path, elements)
+    with :ok <- ProbType.check_expected(key, :cms, store) do
+      path = prob_path(store, key, "cms")
+      corr_id = System.unique_integer([:positive, :monotonic])
+      :ok = NIF.cms_file_query_async(self(), corr_id, path, elements)
 
-    receive do
-      {:tokio_complete, ^corr_id, :ok, counts} -> counts
-      {:tokio_complete, ^corr_id, :error, "enoent"} -> {:error, "ERR CMS: key does not exist"}
-      {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR CMS query failed: #{reason}"}
-    after
-      5000 -> {:error, "ERR timeout"}
+      receive do
+        {:tokio_complete, ^corr_id, :ok, counts} -> counts
+        {:tokio_complete, ^corr_id, :error, "enoent"} -> {:error, "ERR CMS: key does not exist"}
+        {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR CMS query failed: #{reason}"}
+      after
+        5000 -> {:error, "ERR timeout"}
+      end
     end
   end
 
@@ -81,6 +87,8 @@ defmodule Ferricstore.Commands.CMS do
   def handle("CMS.MERGE", [dst, numkeys_str | rest], store) do
     with {:ok, numkeys} <- parse_pos_integer(numkeys_str, "numkeys"),
          {:ok, src_keys, weights} <- parse_merge_args(rest, numkeys),
+         :ok <- ProbType.check_expected(dst, :cms, store),
+         :ok <- check_source_types(src_keys, store),
          {:ok, first_w, first_d} <- get_first_sketch_dims(store, src_keys),
          :ok <- validate_sketch_dims(store, src_keys, first_w, first_d) do
       create_params = %{width: first_w, depth: first_d}
@@ -95,21 +103,23 @@ defmodule Ferricstore.Commands.CMS do
 
   # CMS.INFO — local stateless pread (async)
   def handle("CMS.INFO", [key], store) do
-    path = prob_path(store, key, "cms")
-    corr_id = System.unique_integer([:positive, :monotonic])
-    :ok = NIF.cms_file_info_async(self(), corr_id, path)
+    with :ok <- ProbType.check_expected(key, :cms, store) do
+      path = prob_path(store, key, "cms")
+      corr_id = System.unique_integer([:positive, :monotonic])
+      :ok = NIF.cms_file_info_async(self(), corr_id, path)
 
-    receive do
-      {:tokio_complete, ^corr_id, :ok, {width, depth, count}} ->
-        ["width", width, "depth", depth, "count", count]
+      receive do
+        {:tokio_complete, ^corr_id, :ok, {width, depth, count}} ->
+          ["width", width, "depth", depth, "count", count]
 
-      {:tokio_complete, ^corr_id, :error, "enoent"} ->
-        {:error, "ERR CMS: key does not exist"}
+        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+          {:error, "ERR CMS: key does not exist"}
 
-      {:tokio_complete, ^corr_id, :error, reason} ->
-        {:error, "ERR CMS info failed: #{reason}"}
-    after
-      5000 -> {:error, "ERR timeout"}
+        {:tokio_complete, ^corr_id, :error, reason} ->
+          {:error, "ERR CMS info failed: #{reason}"}
+      after
+        5000 -> {:error, "ERR timeout"}
+      end
     end
   end
 
@@ -137,9 +147,12 @@ defmodule Ferricstore.Commands.CMS do
     Path.join(prob_dir, "#{safe}.#{ext}")
   end
 
-  defp resolve_prob_dir(%{prob_dir: prob_dir_fn}, _key) when is_function(prob_dir_fn), do: prob_dir_fn.()
+  defp resolve_prob_dir(%{prob_dir: prob_dir_fn}, _key) when is_function(prob_dir_fn),
+    do: prob_dir_fn.()
+
   defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
   defp resolve_prob_dir(%{cms_registry: %{dir: dir}}, _key), do: dir
+
   defp resolve_prob_dir(_store, key) do
     ctx = FerricStore.Instance.get(:default)
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
@@ -165,6 +178,7 @@ defmodule Ferricstore.Commands.CMS do
     ensure_prob_dir(dir)
     result = NIF.cms_file_create(path, width, depth)
     _ = NIF.v2_fsync_dir(dir)
+    register_cms_meta(result, store, key, width, depth)
     result
   end
 
@@ -178,11 +192,14 @@ defmodule Ferricstore.Commands.CMS do
     dst_path = prob_path(store, dst_key, "cms")
     dir = Path.dirname(dst_path)
     ensure_prob_dir(dir)
+
     unless Ferricstore.FS.exists?(dst_path) do
       %{width: w, depth: d} = create_params
-      NIF.cms_file_create(dst_path, w, d)
+      result = NIF.cms_file_create(dst_path, w, d)
       _ = NIF.v2_fsync_dir(dir)
+      register_cms_meta(result, store, dst_key, w, d)
     end
+
     NIF.cms_file_merge(dst_path, src_paths, weights)
   end
 
@@ -198,13 +215,18 @@ defmodule Ferricstore.Commands.CMS do
   end
 
   defp check_not_exists(key, store) do
-    exists =
-      case Map.get(store, :exists?) do
-        nil -> Ferricstore.FS.exists?(prob_path(store, key, "cms"))
-        exists_fn -> exists_fn.(key)
-      end
+    case ProbType.check_create(key, :cms, store) do
+      :ok -> if cms_file_exists?(key, store), do: {:error, "ERR item already exists"}, else: :ok
+      {:error, :exists} -> {:error, "ERR item already exists"}
+      {:error, _} = error -> error
+    end
+  end
 
-    if exists, do: {:error, "ERR item already exists"}, else: :ok
+  defp cms_file_exists?(key, store) do
+    case Map.get(store, :exists?) do
+      nil -> Ferricstore.FS.exists?(prob_path(store, key, "cms"))
+      exists_fn -> exists_fn.(key)
+    end
   end
 
   defp cms_file_info_for_key(store, key) do
@@ -250,6 +272,21 @@ defmodule Ferricstore.Commands.CMS do
       end)
 
     if all_valid, do: :ok, else: {:error, "ERR CMS: width/depth of src sketches must be equal"}
+  end
+
+  defp check_source_types(src_keys, store) do
+    Enum.reduce_while(src_keys, :ok, fn key, :ok ->
+      case ProbType.check_expected(key, :cms, store) do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp register_cms_meta({:error, _}, _store, _key, _width, _depth), do: :ok
+
+  defp register_cms_meta(_result, store, key, width, depth) do
+    ProbType.register(store, key, {:cms_meta, %{width: width, depth: depth}})
   end
 
   defp parse_prob_float(str, label) do

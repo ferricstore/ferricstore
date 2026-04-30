@@ -713,75 +713,52 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
   end
 
   # ===========================================================================
-  # Wrong-type key access (BUG: Bloom/Cuckoo crash instead of WRONGTYPE)
+  # Wrong-type key access
   # ===========================================================================
 
   describe "wrong-type key access" do
-    @tag :bug
-    test "BUG: BF.EXISTS on CMS key raises CaseClauseError (should return WRONGTYPE)" do
-      # Fixed: Bloom's load_filter/2 now has a catch-all clause for non-binary
-      # values, so it returns nil (treating it as no filter) instead of crashing.
+    test "BF.EXISTS on CMS key returns WRONGTYPE" do
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYDIM", ["mykey", "100", "5"], store)
 
-      # After fix: no crash, returns 0 (not found)
-      result = Bloom.handle("BF.EXISTS", ["mykey", "elem"], store)
-      assert result == 0
+      assert {:error, "WRONGTYPE" <> _} = Bloom.handle("BF.EXISTS", ["mykey", "elem"], store)
     end
 
-    @tag :bug
-    test "BUG: CF.EXISTS on CMS key raises CaseClauseError (should return WRONGTYPE)" do
-      # Fixed: Cuckoo's load_filter/2 now has a catch-all clause.
+    test "CF.EXISTS on CMS key returns WRONGTYPE" do
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYDIM", ["mykey", "100", "5"], store)
 
-      # After fix: no crash, returns 0 (not found)
-      result = Cuckoo.handle("CF.EXISTS", ["mykey", "elem"], store)
-      assert result == 0
+      assert {:error, "WRONGTYPE" <> _} = Cuckoo.handle("CF.EXISTS", ["mykey", "elem"], store)
     end
 
-    @tag :bug
-    test "BUG: BF.ADD on TopK key raises CaseClauseError (should return WRONGTYPE)" do
-      # Fixed: Bloom's load_or_create_filter calls load_filter which now
-      # returns nil for non-binary values, so it creates a new default filter
-      # instead of crashing.
+    test "BF.ADD on TopK key returns WRONGTYPE and does not create Bloom file" do
       store = MockStore.make()
       :ok = TopK.handle("TOPK.RESERVE", ["mykey", "5"], store)
 
-      # After fix: no crash, creates a new bloom filter and adds the element
-      result = Bloom.handle("BF.ADD", ["mykey", "elem"], store)
-      assert result == 1
+      assert {:error, "WRONGTYPE" <> _} = Bloom.handle("BF.ADD", ["mykey", "elem"], store)
+      assert {:error, "WRONGTYPE" <> _} = Bloom.handle("BF.INFO", ["mykey"], store)
     end
 
-    @tag :bug
-    test "BUG: CF.ADD on TopK key raises CaseClauseError (should return WRONGTYPE)" do
-      # Fixed: Cuckoo's load_or_create_filter now handles non-binary values.
+    test "CF.ADD on TopK key returns WRONGTYPE and does not create Cuckoo file" do
       store = MockStore.make()
       :ok = TopK.handle("TOPK.RESERVE", ["mykey", "5"], store)
 
-      # After fix: no crash, creates a new cuckoo filter and adds the element
-      result = Cuckoo.handle("CF.ADD", ["mykey", "elem"], store)
-      assert result == 1
+      assert {:error, "WRONGTYPE" <> _} = Cuckoo.handle("CF.ADD", ["mykey", "elem"], store)
+      assert {:error, "WRONGTYPE" <> _} = Cuckoo.handle("CF.INFO", ["mykey"], store)
     end
 
-    # CMS and TopK don't distinguish between missing key and wrong-type key;
-    # they return "does not exist" for both. This is a known limitation.
-    test "CMS.QUERY on a TopK key returns error" do
+    test "CMS.QUERY on a TopK key returns WRONGTYPE" do
       store = MockStore.make()
       :ok = TopK.handle("TOPK.RESERVE", ["mykey", "5"], store)
 
-      assert {:error, msg} = CMS.handle("CMS.QUERY", ["mykey", "elem"], store)
-      assert msg =~ "does not exist" or msg =~ "WRONGTYPE"
+      assert {:error, "WRONGTYPE" <> _} = CMS.handle("CMS.QUERY", ["mykey", "elem"], store)
     end
 
-    test "TOPK.ADD on a CMS key returns error or auto-creates" do
+    test "TOPK.ADD on a CMS key returns WRONGTYPE" do
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYDIM", ["mykey", "100", "5"], store)
 
-      # TopK and CMS use different file extensions (.topk vs .cms), so TopK.ADD
-      # may auto-create a new TopK file instead of detecting the CMS type conflict.
-      result = TopK.handle("TOPK.ADD", ["mykey", "elem"], store)
-      assert is_list(result) or match?({:error, _}, result)
+      assert {:error, "WRONGTYPE" <> _} = TopK.handle("TOPK.ADD", ["mykey", "elem"], store)
     end
   end
 

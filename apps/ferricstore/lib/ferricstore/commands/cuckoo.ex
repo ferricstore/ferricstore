@@ -8,6 +8,7 @@ defmodule Ferricstore.Commands.Cuckoo do
   """
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Commands.ProbType
 
   @default_capacity 1024
   @bucket_size 4
@@ -40,15 +41,17 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   def handle("CF.ADD", [key, element], store) do
-    auto_params = %{capacity: @default_capacity, bucket_size: @bucket_size}
-    result = do_prob_write(store, {:cuckoo_add, key, element, auto_params})
+    with :ok <- ProbType.check_expected(key, :cuckoo, store) do
+      auto_params = %{capacity: @default_capacity, bucket_size: @bucket_size}
+      result = do_prob_write(store, {:cuckoo_add, key, element, auto_params})
 
-    case result do
-      {:ok, 1} -> 1
-      {:ok, _} -> 1
-      :ok -> 1
-      {:error, _} -> {:error, "ERR filter is full"}
-      other -> other
+      case result do
+        {:ok, 1} -> 1
+        {:ok, _} -> 1
+        :ok -> 1
+        {:error, _} -> {:error, "ERR filter is full"}
+        other -> other
+      end
     end
   end
 
@@ -60,13 +63,15 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   def handle("CF.ADDNX", [key, element], store) do
-    auto_params = %{capacity: @default_capacity, bucket_size: @bucket_size}
-    result = do_prob_write(store, {:cuckoo_addnx, key, element, auto_params})
+    with :ok <- ProbType.check_expected(key, :cuckoo, store) do
+      auto_params = %{capacity: @default_capacity, bucket_size: @bucket_size}
+      result = do_prob_write(store, {:cuckoo_addnx, key, element, auto_params})
 
-    case result do
-      {:ok, n} when n in [0, 1] -> n
-      {:error, _} -> {:error, "ERR filter is full"}
-      other -> other
+      case result do
+        {:ok, n} when n in [0, 1] -> n
+        {:error, _} -> {:error, "ERR filter is full"}
+        other -> other
+      end
     end
   end
 
@@ -78,18 +83,20 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   def handle("CF.DEL", [key, element], store) do
-    path = prob_path(store, key, "cuckoo")
+    with :ok <- ProbType.check_expected(key, :cuckoo, store) do
+      path = prob_path(store, key, "cuckoo")
 
-    if Ferricstore.FS.exists?(path) do
-      result = do_prob_write(store, {:cuckoo_del, key, element})
+      if Ferricstore.FS.exists?(path) do
+        result = do_prob_write(store, {:cuckoo_del, key, element})
 
-      case result do
-        {:ok, n} -> n
-        {:error, reason} -> {:error, "ERR cuckoo del failed: #{inspect(reason)}"}
-        other -> other
+        case result do
+          {:ok, n} -> n
+          {:error, reason} -> {:error, "ERR cuckoo del failed: #{inspect(reason)}"}
+          other -> other
+        end
+      else
+        0
       end
-    else
-      0
     end
   end
 
@@ -101,16 +108,23 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   def handle("CF.EXISTS", [key, element], store) do
-    path = prob_path(store, key, "cuckoo")
-    corr_id = System.unique_integer([:positive, :monotonic])
-    :ok = NIF.cuckoo_file_exists_async(self(), corr_id, path, element)
+    with :ok <- ProbType.check_expected(key, :cuckoo, store) do
+      path = prob_path(store, key, "cuckoo")
+      corr_id = System.unique_integer([:positive, :monotonic])
+      :ok = NIF.cuckoo_file_exists_async(self(), corr_id, path, element)
 
-    receive do
-      {:tokio_complete, ^corr_id, :ok, result} -> result
-      {:tokio_complete, ^corr_id, :error, "enoent"} -> 0
-      {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR cuckoo exists failed: #{reason}"}
-    after
-      5000 -> {:error, "ERR timeout"}
+      receive do
+        {:tokio_complete, ^corr_id, :ok, result} ->
+          result
+
+        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+          0
+
+        {:tokio_complete, ^corr_id, :error, reason} ->
+          {:error, "ERR cuckoo exists failed: #{reason}"}
+      after
+        5000 -> {:error, "ERR timeout"}
+      end
     end
   end
 
@@ -122,24 +136,26 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   def handle("CF.MEXISTS", [key | elements], store) when elements != [] do
-    path = prob_path(store, key, "cuckoo")
+    with :ok <- ProbType.check_expected(key, :cuckoo, store) do
+      path = prob_path(store, key, "cuckoo")
 
-    case Ferricstore.FS.exists?(path) do
-      false ->
-        List.duplicate(0, length(elements))
+      case Ferricstore.FS.exists?(path) do
+        false ->
+          List.duplicate(0, length(elements))
 
-      true ->
-        Enum.map(elements, fn element ->
-          corr_id = System.unique_integer([:positive, :monotonic])
-          :ok = NIF.cuckoo_file_exists_async(self(), corr_id, path, element)
+        true ->
+          Enum.map(elements, fn element ->
+            corr_id = System.unique_integer([:positive, :monotonic])
+            :ok = NIF.cuckoo_file_exists_async(self(), corr_id, path, element)
 
-          receive do
-            {:tokio_complete, ^corr_id, :ok, result} -> result
-            {:tokio_complete, ^corr_id, :error, _reason} -> 0
-          after
-            5000 -> 0
-          end
-        end)
+            receive do
+              {:tokio_complete, ^corr_id, :ok, result} -> result
+              {:tokio_complete, ^corr_id, :error, _reason} -> 0
+            after
+              5000 -> 0
+            end
+          end)
+      end
     end
   end
 
@@ -151,16 +167,23 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   def handle("CF.COUNT", [key, element], store) do
-    path = prob_path(store, key, "cuckoo")
-    corr_id = System.unique_integer([:positive, :monotonic])
-    :ok = NIF.cuckoo_file_count_async(self(), corr_id, path, element)
+    with :ok <- ProbType.check_expected(key, :cuckoo, store) do
+      path = prob_path(store, key, "cuckoo")
+      corr_id = System.unique_integer([:positive, :monotonic])
+      :ok = NIF.cuckoo_file_count_async(self(), corr_id, path, element)
 
-    receive do
-      {:tokio_complete, ^corr_id, :ok, count} -> count
-      {:tokio_complete, ^corr_id, :error, "enoent"} -> 0
-      {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR cuckoo count failed: #{reason}"}
-    after
-      5000 -> {:error, "ERR timeout"}
+      receive do
+        {:tokio_complete, ^corr_id, :ok, count} ->
+          count
+
+        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+          0
+
+        {:tokio_complete, ^corr_id, :error, reason} ->
+          {:error, "ERR cuckoo count failed: #{reason}"}
+      after
+        5000 -> {:error, "ERR timeout"}
+      end
     end
   end
 
@@ -172,26 +195,44 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   def handle("CF.INFO", [key], store) do
-    path = prob_path(store, key, "cuckoo")
-    corr_id = System.unique_integer([:positive, :monotonic])
-    :ok = NIF.cuckoo_file_info_async(self(), corr_id, path)
+    with :ok <- ProbType.check_expected(key, :cuckoo, store) do
+      path = prob_path(store, key, "cuckoo")
+      corr_id = System.unique_integer([:positive, :monotonic])
+      :ok = NIF.cuckoo_file_info_async(self(), corr_id, path)
 
-    receive do
-      {:tokio_complete, ^corr_id, :ok, {num_buckets, bucket_size, fingerprint_size,
-             num_items, num_deletes, total_slots, max_kicks}} ->
-        ["Size", total_slots, "Number of buckets", num_buckets,
-         "Number of filters", 1, "Number of items inserted", num_items,
-         "Number of items deleted", num_deletes, "Bucket size", bucket_size,
-         "Fingerprint size", fingerprint_size, "Max iterations", max_kicks,
-         "Expansion rate", 0]
+      receive do
+        {:tokio_complete, ^corr_id, :ok,
+         {num_buckets, bucket_size, fingerprint_size, num_items, num_deletes, total_slots,
+          max_kicks}} ->
+          [
+            "Size",
+            total_slots,
+            "Number of buckets",
+            num_buckets,
+            "Number of filters",
+            1,
+            "Number of items inserted",
+            num_items,
+            "Number of items deleted",
+            num_deletes,
+            "Bucket size",
+            bucket_size,
+            "Fingerprint size",
+            fingerprint_size,
+            "Max iterations",
+            max_kicks,
+            "Expansion rate",
+            0
+          ]
 
-      {:tokio_complete, ^corr_id, :error, "enoent"} ->
-        {:error, "ERR not found"}
+        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+          {:error, "ERR not found"}
 
-      {:tokio_complete, ^corr_id, :error, reason} ->
-        {:error, "ERR cuckoo info failed: #{reason}"}
-    after
-      5000 -> {:error, "ERR timeout"}
+        {:tokio_complete, ^corr_id, :error, reason} ->
+          {:error, "ERR cuckoo info failed: #{reason}"}
+      after
+        5000 -> {:error, "ERR timeout"}
+      end
     end
   end
 
@@ -219,9 +260,12 @@ defmodule Ferricstore.Commands.Cuckoo do
     Path.join(prob_dir, "#{safe}.#{ext}")
   end
 
-  defp resolve_prob_dir(%{prob_dir: prob_dir_fn}, _key) when is_function(prob_dir_fn), do: prob_dir_fn.()
+  defp resolve_prob_dir(%{prob_dir: prob_dir_fn}, _key) when is_function(prob_dir_fn),
+    do: prob_dir_fn.()
+
   defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
   defp resolve_prob_dir(%{cuckoo_registry: %{dir: dir}}, _key), do: dir
+
   defp resolve_prob_dir(_store, key) do
     ctx = FerricStore.Instance.get(:default)
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
@@ -247,6 +291,7 @@ defmodule Ferricstore.Commands.Cuckoo do
     ensure_prob_dir(dir)
     result = NIF.cuckoo_file_create(path, capacity, bucket_size)
     _ = NIF.v2_fsync_dir(dir)
+    register_cuckoo_meta(result, store, key, capacity)
     result
   end
 
@@ -254,13 +299,16 @@ defmodule Ferricstore.Commands.Cuckoo do
     path = prob_path(store, key, "cuckoo")
     dir = Path.dirname(path)
     ensure_prob_dir(dir)
+
     unless Ferricstore.FS.exists?(path) do
       if auto_params do
         %{capacity: cap, bucket_size: bs} = auto_params
-        NIF.cuckoo_file_create(path, cap, bs)
+        result = NIF.cuckoo_file_create(path, cap, bs)
         _ = NIF.v2_fsync_dir(dir)
+        register_cuckoo_meta(result, store, key, cap)
       end
     end
+
     NIF.cuckoo_file_add(path, element)
   end
 
@@ -268,13 +316,16 @@ defmodule Ferricstore.Commands.Cuckoo do
     path = prob_path(store, key, "cuckoo")
     dir = Path.dirname(path)
     ensure_prob_dir(dir)
+
     unless Ferricstore.FS.exists?(path) do
       if auto_params do
         %{capacity: cap, bucket_size: bs} = auto_params
-        NIF.cuckoo_file_create(path, cap, bs)
+        result = NIF.cuckoo_file_create(path, cap, bs)
         _ = NIF.v2_fsync_dir(dir)
+        register_cuckoo_meta(result, store, key, cap)
       end
     end
+
     NIF.cuckoo_file_addnx(path, element)
   end
 
@@ -308,7 +359,17 @@ defmodule Ferricstore.Commands.Cuckoo do
   end
 
   defp check_cuckoo_not_exists(key, store) do
-    if cuckoo_file_exists?(key, store), do: {:error, "ERR item exists"}, else: :ok
+    case ProbType.check_create(key, :cuckoo, store) do
+      :ok -> if cuckoo_file_exists?(key, store), do: {:error, "ERR item exists"}, else: :ok
+      {:error, :exists} -> {:error, "ERR item exists"}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp register_cuckoo_meta({:error, _}, _store, _key, _capacity), do: :ok
+
+  defp register_cuckoo_meta(_result, store, key, capacity) do
+    ProbType.register(store, key, {:cuckoo_meta, %{capacity: capacity}})
   end
 
   defp normalize_create_result({:ok, _}), do: :ok
