@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.GenericTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.Generic
+  alias Ferricstore.Commands.{Generic, Hash}
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -463,6 +463,20 @@ defmodule Ferricstore.Commands.GenericTest do
     test "OBJECT encoding is case-insensitive" do
       store = MockStore.make(%{"k" => {"v", 0}})
       assert "embstr" == Generic.handle("OBJECT", ["encoding", "k"], store)
+    end
+
+    test "OBJECT ENCODING detects hash keys stored only as compound entries" do
+      store = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["hash", "field", "value"], store)
+
+      assert "hashtable" == Generic.handle("OBJECT", ["ENCODING", "hash"], store)
+    end
+
+    test "OBJECT REFCOUNT detects hash keys stored only as compound entries" do
+      store = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["hash", "field", "value"], store)
+
+      assert 1 == Generic.handle("OBJECT", ["REFCOUNT", "hash"], store)
     end
   end
 

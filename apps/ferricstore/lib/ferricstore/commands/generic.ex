@@ -274,32 +274,31 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   defp do_object("ENCODING", [key], store) do
-    if Ops.exists?(store, key) do
-      case Ferricstore.Store.TypeRegistry.get_type(key, store) do
-        "hash" ->
-          "hashtable"
+    case Ferricstore.Store.TypeRegistry.get_type(key, store) do
+      "none" ->
+        {:error, "ERR no such key"}
 
-        "list" ->
-          "quicklist"
+      "hash" ->
+        "hashtable"
 
-        "set" ->
-          "hashtable"
+      "list" ->
+        "quicklist"
 
-        "zset" ->
-          "skiplist"
+      "set" ->
+        "hashtable"
 
-        "stream" ->
-          "stream"
+      "zset" ->
+        "skiplist"
 
-        "string" ->
-          value = Ops.get(store, key)
-          if value != nil and byte_size(value) <= 44, do: "embstr", else: "raw"
+      "stream" ->
+        "stream"
 
-        _other ->
-          "raw"
-      end
-    else
-      {:error, "ERR no such key"}
+      "string" ->
+        value = Ops.get(store, key)
+        if value != nil and byte_size(value) <= 44, do: "embstr", else: "raw"
+
+      _other ->
+        "raw"
     end
   end
 
@@ -320,7 +319,7 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_object("FREQ", [key], store) do
-    if Ops.exists?(store, key) do
+    if object_exists?(store, key) do
       ctx = FerricStore.Instance.get(:default)
       idx = Ferricstore.Store.Router.shard_for(ctx, key)
       keydir = Ferricstore.Store.Router.resolve_keydir(ctx, idx)
@@ -338,7 +337,7 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_object("IDLETIME", [key], store) do
-    if Ops.exists?(store, key) do
+    if object_exists?(store, key) do
       ctx = FerricStore.Instance.get(:default)
       idx = Ferricstore.Store.Router.shard_for(ctx, key)
       keydir = Ferricstore.Store.Router.resolve_keydir(ctx, idx)
@@ -359,7 +358,7 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_object("REFCOUNT", [key], store) do
-    if Ops.exists?(store, key) do
+    if object_exists?(store, key) do
       1
     else
       {:error, "ERR no such key"}
@@ -369,6 +368,10 @@ defmodule Ferricstore.Commands.Generic do
   defp do_object(subcmd, _rest, _store) do
     {:error,
      "ERR unknown subcommand or wrong number of arguments for '#{String.downcase(subcmd)}' command"}
+  end
+
+  defp object_exists?(store, key) do
+    Ferricstore.Store.TypeRegistry.get_type(key, store) != "none"
   end
 
   # ---------------------------------------------------------------------------
