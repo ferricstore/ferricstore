@@ -395,6 +395,13 @@ defmodule Ferricstore.CrossShardOp do
           :exit, _ -> nil
         end
       end,
+      compound_get_meta: fn redis_key, compound_key ->
+        try do
+          GenServer.call(shard, {:compound_get_meta, redis_key, compound_key}, 5_000)
+        catch
+          :exit, _ -> nil
+        end
+      end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
       end,
@@ -448,6 +455,9 @@ defmodule Ferricstore.CrossShardOp do
         Enum.flat_map(per_shard_stores, fn {_idx, store} -> store.keys.() end)
       end,
       compound_get: fn redis_key, ck -> route.(redis_key).compound_get.(redis_key, ck) end,
+      compound_get_meta: fn redis_key, ck ->
+        route.(redis_key).compound_get_meta.(redis_key, ck)
+      end,
       compound_put: fn redis_key, ck, v, exp ->
         route.(redis_key).compound_put.(redis_key, ck, v, exp)
       end,
@@ -487,6 +497,9 @@ defmodule Ferricstore.CrossShardOp do
         Enum.flat_map(per_shard_stores, fn {_idx, store} -> store.keys.() end)
       end,
       compound_get: fn redis_key, ck -> route.(redis_key).compound_get.(redis_key, ck) end,
+      compound_get_meta: fn redis_key, ck ->
+        route.(redis_key).compound_get_meta.(redis_key, ck)
+      end,
       compound_scan: fn redis_key, prefix ->
         route.(redis_key).compound_scan.(redis_key, prefix)
       end,

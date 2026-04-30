@@ -84,17 +84,12 @@ defmodule Ferricstore.Commands.Generic do
     CrossShardOp.execute(
       [{key, :read_write}, {newkey, :write}],
       fn unified_store ->
-        case Ops.get_meta(unified_store, key) do
+        case key_entry(unified_store, key) do
           nil ->
             {:error, "ERR no such key"}
 
-          {value, expire_at_ms} ->
-            Ops.put(unified_store, newkey, value, expire_at_ms)
-
-            if key != newkey do
-              Ops.delete(unified_store, key)
-            end
-
+          entry ->
+            rename_entry(key, newkey, entry, unified_store)
             :ok
         end
       end,
@@ -115,20 +110,19 @@ defmodule Ferricstore.Commands.Generic do
     CrossShardOp.execute(
       [{key, :read_write}, {newkey, :write}],
       fn unified_store ->
-        case Ops.get_meta(unified_store, key) do
+        case key_entry(unified_store, key) do
           nil ->
             {:error, "ERR no such key"}
 
-          {_value, _expire_at_ms} when key == newkey ->
+          _entry when key == newkey ->
             # Same key -- always 0 since destination "exists"
             0
 
-          {value, expire_at_ms} ->
-            if Ops.exists?(unified_store, newkey) do
+          entry ->
+            if key_exists?(unified_store, newkey) do
               0
             else
-              Ops.put(unified_store, newkey, value, expire_at_ms)
-              Ops.delete(unified_store, key)
+              rename_entry(key, newkey, entry, unified_store)
               1
             end
         end
@@ -396,19 +390,155 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_copy(source, destination, replace?, store) do
-    case Ops.get_meta(store, source) do
+    case key_entry(store, source) do
       nil ->
         {:error, "ERR no such key"}
 
-      {value, expire_at_ms} ->
-        if not replace? and Ops.exists?(store, destination) do
+      entry ->
+        if not replace? and key_exists?(store, destination) do
           {:error, "ERR target key already exists"}
         else
-          Ops.put(store, destination, value, expire_at_ms)
+          if source != destination do
+            delete_key(destination, store)
+          end
+
+          copy_entry(source, destination, entry, store)
           1
         end
     end
   end
+
+  defp key_exists?(store, key), do: key_entry(store, key) != nil
+
+  defp key_entry(store, key) do
+    case Ops.get_meta(store, key) do
+      nil -> compound_entry(store, key)
+      {value, expire_at_ms} -> {:plain, value, expire_at_ms}
+    end
+  end
+
+  defp compound_entry(store, key) do
+    if Ops.has_compound?(store) do
+      type_key = CompoundKey.type_key(key)
+
+      case Ops.compound_get_meta(store, key, type_key) do
+        nil ->
+          list_meta_key = CompoundKey.list_meta_key(key)
+
+          case Ops.compound_get_meta(store, key, list_meta_key) do
+            nil -> nil
+            {_meta, expire_at_ms} -> {:compound, "list", expire_at_ms}
+          end
+
+        {type, expire_at_ms} ->
+          {:compound, type, expire_at_ms}
+      end
+    end
+  end
+
+  defp rename_entry(source, destination, _entry, _store) when source == destination, do: :ok
+
+  defp rename_entry(source, destination, entry, store) do
+    delete_key(destination, store)
+    copy_entry(source, destination, entry, store)
+    delete_key(source, store)
+  end
+
+  defp copy_entry(_source, destination, {:plain, value, expire_at_ms}, store) do
+    Ops.put(store, destination, value, expire_at_ms)
+  end
+
+  defp copy_entry(source, destination, {:compound, type, _expire_at_ms}, store) do
+    copy_compound_meta(source, destination, type, store)
+    copy_compound_entries(source, destination, type, store)
+  end
+
+  defp delete_key(key, store) do
+    case key_entry(store, key) do
+      nil ->
+        0
+
+      {:plain, _value, _expire_at_ms} ->
+        Ops.delete(store, key)
+        1
+
+      {:compound, type, _expire_at_ms} ->
+        delete_compound_key(key, type, store)
+        1
+    end
+  end
+
+  defp delete_compound_key(key, type, store) do
+    Ops.compound_delete_prefix(store, key, compound_prefix(type, key))
+
+    if type == "list" do
+      Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))
+    end
+
+    Ops.compound_delete(store, key, CompoundKey.type_key(key))
+  end
+
+  defp copy_compound_meta(source, destination, type, store) do
+    copy_compound_key(
+      source,
+      destination,
+      CompoundKey.type_key(source),
+      CompoundKey.type_key(destination),
+      store,
+      type
+    )
+
+    if type == "list" do
+      copy_compound_key(
+        source,
+        destination,
+        CompoundKey.list_meta_key(source),
+        CompoundKey.list_meta_key(destination),
+        store
+      )
+    end
+  end
+
+  defp copy_compound_entries(source, destination, type, store) do
+    source_prefix = compound_prefix(type, source)
+    destination_prefix = compound_prefix(type, destination)
+
+    store
+    |> Ops.compound_scan(source, source_prefix)
+    |> Enum.each(fn {sub_key, _value} ->
+      source_key = scanned_compound_key(source_prefix, sub_key)
+      destination_key = scanned_compound_key(destination_prefix, sub_key)
+      copy_compound_key(source, destination, source_key, destination_key, store)
+    end)
+  end
+
+  defp copy_compound_key(
+         source,
+         destination,
+         source_key,
+         destination_key,
+         store,
+         fallback_value \\ nil
+       ) do
+    case Ops.compound_get_meta(store, source, source_key) do
+      nil ->
+        if fallback_value != nil do
+          Ops.compound_put(store, destination, destination_key, fallback_value, 0)
+        end
+
+      {value, expire_at_ms} ->
+        Ops.compound_put(store, destination, destination_key, value, expire_at_ms)
+    end
+  end
+
+  defp scanned_compound_key(prefix, key) do
+    if String.starts_with?(key, prefix), do: key, else: prefix <> key
+  end
+
+  defp compound_prefix("hash", key), do: CompoundKey.hash_prefix(key)
+  defp compound_prefix("list", key), do: CompoundKey.list_prefix(key)
+  defp compound_prefix("set", key), do: CompoundKey.set_prefix(key)
+  defp compound_prefix("zset", key), do: CompoundKey.zset_prefix(key)
 
   # ---------------------------------------------------------------------------
   # Private -- SCAN option parsing and execution

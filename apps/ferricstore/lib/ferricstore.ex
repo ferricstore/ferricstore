@@ -1821,20 +1821,12 @@ defmodule FerricStore do
   """
   @spec copy(key(), key(), keyword()) :: {:ok, true} | {:error, binary()}
   def copy(source, destination, opts \\ []) do
-    ctx = default_ctx()
     replace = Keyword.get(opts, :replace, false)
+    args = [source, destination] ++ if replace, do: ["REPLACE"], else: []
 
-    case Router.get_meta(ctx, source) do
-      nil ->
-        {:error, "ERR no such key"}
-
-      {value, expire_at_ms} ->
-        if Router.exists?(ctx, destination) and not replace do
-          {:error, "ERR target key already exists"}
-        else
-          Router.put(ctx, destination, value, expire_at_ms)
-          {:ok, true}
-        end
+    case Ferricstore.Commands.Generic.handle("COPY", args, build_compound_store(source)) do
+      1 -> {:ok, true}
+      {:error, _} = err -> err
     end
   end
 
@@ -1861,17 +1853,11 @@ defmodule FerricStore do
   """
   @spec rename(key(), key()) :: :ok | {:error, binary()}
   def rename(source, destination) do
-    ctx = default_ctx()
-
-    case Router.get_meta(ctx, source) do
-      nil ->
-        {:error, "ERR no such key"}
-
-      {value, expire_at_ms} ->
-        Router.put(ctx, destination, value, expire_at_ms)
-        Router.delete(ctx, source)
-        :ok
-    end
+    Ferricstore.Commands.Generic.handle(
+      "RENAME",
+      [source, destination],
+      build_compound_store(source)
+    )
   end
 
   @doc """
@@ -1900,20 +1886,14 @@ defmodule FerricStore do
   """
   @spec renamenx(key(), key()) :: {:ok, boolean()} | {:error, binary()}
   def renamenx(source, destination) do
-    ctx = default_ctx()
-
-    case Router.get_meta(ctx, source) do
-      nil ->
-        {:error, "ERR no such key"}
-
-      {value, expire_at_ms} ->
-        if Router.exists?(ctx, destination) do
-          {:ok, false}
-        else
-          Router.put(ctx, destination, value, expire_at_ms)
-          Router.delete(ctx, source)
-          {:ok, true}
-        end
+    case Ferricstore.Commands.Generic.handle(
+           "RENAMENX",
+           [source, destination],
+           build_compound_store(source)
+         ) do
+      1 -> {:ok, true}
+      0 -> {:ok, false}
+      {:error, _} = err -> err
     end
   end
 

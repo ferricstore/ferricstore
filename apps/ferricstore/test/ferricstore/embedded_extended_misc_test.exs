@@ -44,6 +44,30 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
       assert {:ok, true} = FerricStore.copy("cp:s3", "cp:d3", replace: true)
       assert {:ok, "src_val"} = FerricStore.get("cp:d3")
     end
+
+    test "copies hash fields and TTL" do
+      assert :ok = FerricStore.hset("cp:hash:src", %{"f1" => "v1", "f2" => "v2"})
+      assert {:ok, true} = FerricStore.expire("cp:hash:src", 60_000)
+
+      assert {:ok, true} = FerricStore.copy("cp:hash:src", "cp:hash:dst")
+
+      assert {:ok, "v1"} = FerricStore.hget("cp:hash:dst", "f1")
+      assert {:ok, "v2"} = FerricStore.hget("cp:hash:dst", "f2")
+      assert {:ok, ms} = FerricStore.ttl("cp:hash:dst")
+      assert is_integer(ms) and ms > 0
+      assert {:ok, "v1"} = FerricStore.hget("cp:hash:src", "f1")
+    end
+
+    test "replaces existing compound destination" do
+      assert :ok = FerricStore.hset("cp:hash:replace:src", %{"new" => "value"})
+      assert :ok = FerricStore.hset("cp:hash:replace:dst", %{"old" => "value"})
+
+      assert {:ok, true} =
+               FerricStore.copy("cp:hash:replace:src", "cp:hash:replace:dst", replace: true)
+
+      assert {:ok, "value"} = FerricStore.hget("cp:hash:replace:dst", "new")
+      assert {:ok, nil} = FerricStore.hget("cp:hash:replace:dst", "old")
+    end
   end
 
   describe "rename/2" do
@@ -56,6 +80,26 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
 
     test "returns error for nonexistent key" do
       assert {:error, _} = FerricStore.rename("rn:missing", "rn:dst")
+    end
+
+    test "renames list data and removes old name" do
+      assert {:ok, 2} = FerricStore.rpush("rn:list:old", ["a", "b"])
+
+      assert :ok = FerricStore.rename("rn:list:old", "rn:list:new")
+
+      assert {:ok, 0} = FerricStore.llen("rn:list:old")
+      assert {:ok, ["a", "b"]} = FerricStore.lrange("rn:list:new", 0, -1)
+    end
+
+    test "overwrites existing compound destination" do
+      assert :ok = FerricStore.hset("rn:hash:src", %{"new" => "value"})
+      assert :ok = FerricStore.hset("rn:hash:dst", %{"old" => "value"})
+
+      assert :ok = FerricStore.rename("rn:hash:src", "rn:hash:dst")
+
+      assert {:ok, "value"} = FerricStore.hget("rn:hash:dst", "new")
+      assert {:ok, nil} = FerricStore.hget("rn:hash:dst", "old")
+      assert {:ok, nil} = FerricStore.hget("rn:hash:src", "new")
     end
   end
 
@@ -71,6 +115,17 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
       FerricStore.set("rnx:dst", "dst_val")
       assert {:ok, false} = FerricStore.renamenx("rnx:src", "rnx:dst")
       assert {:ok, "dst_val"} = FerricStore.get("rnx:dst")
+    end
+
+    test "does not rename when compound destination exists" do
+      assert :ok = FerricStore.hset("rnx:hash:src", %{"src" => "value"})
+      assert :ok = FerricStore.hset("rnx:hash:dst", %{"dst" => "value"})
+
+      assert {:ok, false} = FerricStore.renamenx("rnx:hash:src", "rnx:hash:dst")
+
+      assert {:ok, "value"} = FerricStore.hget("rnx:hash:src", "src")
+      assert {:ok, "value"} = FerricStore.hget("rnx:hash:dst", "dst")
+      assert {:ok, nil} = FerricStore.hget("rnx:hash:dst", "src")
     end
   end
 
