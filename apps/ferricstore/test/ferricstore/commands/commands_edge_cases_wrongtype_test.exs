@@ -61,6 +61,22 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
       result = Strings.handle("GET", ["other"], store)
       assert result == other_val
     end
+
+    test "GETEX on hash key returns WRONGTYPE and does not create a string", %{store: store} do
+      assert {:error, "WRONGTYPE" <> _} = Strings.handle("GETEX", ["mykey"], store)
+      assert {:error, "WRONGTYPE" <> _} = Strings.handle("GETEX", ["mykey", "PX", "1000"], store)
+      assert store.get.("mykey") == nil
+    end
+
+    test "SETNX on hash key treats compound type metadata as existing", %{store: store} do
+      assert 0 = Strings.handle("SETNX", ["mykey", "overwrite"], store)
+      assert store.get.("mykey") == nil
+    end
+
+    test "APPEND on hash key returns WRONGTYPE and does not create a string", %{store: store} do
+      assert {:error, "WRONGTYPE" <> _} = Strings.handle("APPEND", ["mykey", "suffix"], store)
+      assert store.get.("mykey") == nil
+    end
   end
 
   describe "WRONGTYPE enforcement: HSET on string key" do
@@ -209,5 +225,4 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
       assert {:error, "WRONGTYPE" <> _} = result
     end
   end
-
 end

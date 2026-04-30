@@ -2,6 +2,7 @@
 defmodule Ferricstore.Commands.Strings do
   alias Ferricstore.CommandTime
   alias Ferricstore.CrossShardOp
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
 
   @moduledoc """
@@ -74,25 +75,10 @@ defmodule Ferricstore.Commands.Strings do
   def handle("GET", [key], _store) when byte_size(key) > 65_535, do: {:error, "ERR key too large"}
 
   def handle("GET", [key], store) do
-    case Ops.get(store, key) do
-      nil ->
-        # Plain key is nil. Check if this is a data structure key (compound keys).
-        if Ops.has_compound?(store) do
-          type_key = Ferricstore.Store.CompoundKey.type_key(key)
-
-          case Ops.compound_get(store, key, type_key) do
-            nil -> nil
-            _type_str -> @wrongtype_error
-          end
-        else
-          nil
-        end
-
-      value when is_binary(value) ->
-        maybe_check_type(value)
-
-      other ->
-        other
+    case read_string_value(key, store) do
+      {:value, value} -> value
+      :missing -> nil
+      @wrongtype_error -> @wrongtype_error
     end
   end
 
@@ -246,8 +232,14 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
 
   def handle("APPEND", [key, value], store) do
-    {:ok, new_len} = Ops.append(store, key, value)
-    new_len
+    case ensure_string_key(key, store) do
+      :ok ->
+        {:ok, new_len} = Ops.append(store, key, value)
+        new_len
+
+      @wrongtype_error ->
+        @wrongtype_error
+    end
   end
 
   def handle("APPEND", _args, _store),
@@ -291,7 +283,13 @@ defmodule Ferricstore.Commands.Strings do
   # GETEX
   # ---------------------------------------------------------------------------
 
-  def handle("GETEX", [key], store), do: Ops.get(store, key)
+  def handle("GETEX", [key], store) do
+    case read_string_value(key, store) do
+      {:value, value} -> value
+      :missing -> nil
+      @wrongtype_error -> @wrongtype_error
+    end
+  end
 
   def handle("GETEX", [key | opts], store), do: do_getex(key, opts, store)
 
@@ -305,10 +303,14 @@ defmodule Ferricstore.Commands.Strings do
   def handle("SETNX", [key, value], store) do
     opts = %{expire_at_ms: 0, nx: true, xx: false, get: false, keepttl: false}
 
-    case Ops.set(store, key, value, opts) do
-      :ok -> 1
-      nil -> 0
-      {:error, _} = err -> err
+    if compound_data_structure_key?(key, store) do
+      0
+    else
+      case Ops.set(store, key, value, opts) do
+        :ok -> 1
+        nil -> 0
+        {:error, _} = err -> err
+      end
     end
   end
 
@@ -441,7 +443,10 @@ defmodule Ferricstore.Commands.Strings do
   defp do_getex(key, opts, store) do
     case parse_getex_opts(opts) do
       {:ok, expire_at_ms} ->
-        Ops.getex(store, key, expire_at_ms)
+        case ensure_string_key(key, store) do
+          :ok -> Ops.getex(store, key, expire_at_ms)
+          @wrongtype_error -> @wrongtype_error
+        end
 
       {:error, _} = err ->
         err
@@ -716,6 +721,35 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
   # Private — type checking for GET
   # ---------------------------------------------------------------------------
+
+  defp read_string_value(key, store) do
+    case Ops.get(store, key) do
+      nil ->
+        if compound_data_structure_key?(key, store), do: @wrongtype_error, else: :missing
+
+      value when is_binary(value) ->
+        case maybe_check_type(value) do
+          @wrongtype_error -> @wrongtype_error
+          checked -> {:value, checked}
+        end
+
+      other ->
+        {:value, other}
+    end
+  end
+
+  defp ensure_string_key(key, store) do
+    case read_string_value(key, store) do
+      @wrongtype_error -> @wrongtype_error
+      _ -> :ok
+    end
+  end
+
+  defp compound_data_structure_key?(key, store) do
+    Ops.has_compound?(store) and
+      (Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
+         Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil)
+  end
 
   # Detects if a stored binary is actually a serialized non-string type
   # (list, hash, set, zset). If so, returns WRONGTYPE error instead of the
