@@ -346,6 +346,15 @@ defmodule Ferricstore.Commands.TopKTest do
       assert result == ["b", 50, "a", 10]
     end
 
+    test "LIST WITHCOUNT option is case-insensitive" do
+      store = MockStore.make()
+      :ok = TopK.handle("TOPK.RESERVE", ["hot_keys", "5"], store)
+      TopK.handle("TOPK.INCRBY", ["hot_keys", "a", "10", "b", "50"], store)
+
+      assert ["b", 50, "a", 10] = TopK.handle("TOPK.LIST", ["hot_keys", "withcount"], store)
+      assert ["b", 50, "a", 10] = TopK.handle("TOPK.LIST", ["hot_keys", "WiThCoUnT"], store)
+    end
+
     test "returns error when key does not exist" do
       store = MockStore.make()
       assert {:error, msg} = TopK.handle("TOPK.LIST", ["missing"], store)
