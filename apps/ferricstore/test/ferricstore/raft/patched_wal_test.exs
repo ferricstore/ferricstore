@@ -158,6 +158,29 @@ defmodule Ferricstore.Raft.PatchedWalTest do
     end
   end
 
+  describe "WAL close error propagation" do
+    test "test close helper is exported" do
+      exports = :ra_log_wal.module_info(:exports)
+      assert {:__close_file_for_test__, 1} in exports
+    end
+
+    test "invalid close target is not swallowed as ok" do
+      assert catch_exit(:ra_log_wal.__close_file_for_test__(:not_a_wal_fd)) ==
+               {:could_not_close, :badarg}
+    end
+
+    test "raw file descriptor fallback still closes successfully" do
+      path = Path.join(System.tmp_dir!(), "wal_close_fallback_#{:rand.uniform(999_999)}.wal")
+      {:ok, fd} = :file.open(to_charlist(path), [:raw, :write, :binary])
+
+      :ok = :file.write(fd, "closed")
+      assert :ok = :ra_log_wal.__close_file_for_test__(fd)
+      assert File.read!(path) == "closed"
+
+      File.rm!(path)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # 3. forget_writer/2 — new ra 3.x export
   # ---------------------------------------------------------------------------

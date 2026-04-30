@@ -16,7 +16,7 @@ mod wal_handle;
 #[cfg(test)]
 mod tests;
 
-use rustler::{Atom, Binary, Env, LocalPid, NifResult, OwnedBinary, ResourceArc, Term};
+use rustler::{Atom, Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, ResourceArc, Term};
 use wal_handle::WalHandle;
 
 // WalHandle is registered as a NIF resource via `rustler::resource!` in
@@ -95,10 +95,10 @@ fn sync(
 /// Close the WAL file. Blocks until background thread drains, syncs, and exits.
 /// Timeout: 30 seconds.
 #[rustler::nif]
-fn close(handle: ResourceArc<WalHandle>) -> NifResult<Atom> {
+fn close<'a>(env: Env<'a>, handle: ResourceArc<WalHandle>) -> NifResult<Term<'a>> {
     match handle.close() {
-        Ok(()) => Ok(atoms::ok()),
-        Err(e) => Err(rustler::Error::Term(Box::new(format!("{e}")))),
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
     }
 }
 

@@ -49,6 +49,7 @@
          fill_ratio/1]).
 
 -export([wal2list/1]).
+-export(['__close_file_for_test__'/1]).
 
 -compile([inline_list_funcs]).
 -compile(inline).
@@ -544,8 +545,8 @@ cleanup(#state{wal = #wal{fd = undefined}}) ->
 cleanup(#state{wal = #wal{fd = Fd},
                conf = #conf{wal_io_module = IoMod,
                             sync_method = SyncMeth}}) ->
-    _ = try wal_sync_blocking(IoMod, Fd, SyncMeth) catch _:_ -> ok end,
-    _ = close_file(Fd),
+    ok = wal_sync_blocking(IoMod, Fd, SyncMeth),
+    ok = close_file(Fd),
     ok.
 
 serialize_header(UId, Trunc, {Next, Cache} = WriterCache) ->
@@ -749,7 +750,7 @@ wait_for_sync_complete() ->
         {wal_async_sync_complete} -> ok;
         {wal_sync_complete, _Ref} -> ok;
         {wal_sync_error, _Ref, Reason} -> throw({stop, {wal_sync_failed, Reason}})
-    after 30000 -> ok
+    after 30000 -> throw({stop, wal_sync_timeout})
     end.
 
 wal_sync_blocking(undefined, Fd, SyncMeth) ->
@@ -900,18 +901,43 @@ maybe_pre_allocate(Conf, _Fd, _Max0) ->
 close_file(undefined) ->
     ok;
 close_file(Fd) when is_pid(Fd) ->
-    file:close(Fd);
+    close_file_result(file:close(Fd));
 close_file(Handle) ->
     try ferricstore_wal_nif:close(Handle) of
-        _ -> ok
-    catch _:_ ->
-        %% Not a NIF handle — try standard file:close
-        try file:close(Handle) of
-            _ -> ok
-        catch _:_ ->
-            ok
-        end
+        ok ->
+            ok;
+        {error, Reason} ->
+            exit({could_not_close, Reason});
+        Other ->
+            exit({could_not_close, Other})
+    catch
+        error:badarg ->
+            %% Not a NIF handle — try standard file:close
+            close_file_fallback(Handle);
+        Class:Reason ->
+            exit({could_not_close, {Class, Reason}})
     end.
+
+'__close_file_for_test__'(Handle) ->
+    close_file(Handle).
+
+close_file_fallback(Handle) ->
+    try file:close(Handle) of
+        Result ->
+            close_file_result(Result)
+    catch
+        error:badarg ->
+            exit({could_not_close, badarg});
+        Class:Reason ->
+            exit({could_not_close, {Class, Reason}})
+    end.
+
+close_file_result(ok) ->
+    ok;
+close_file_result({error, Reason}) ->
+    exit({could_not_close, Reason});
+close_file_result(Other) ->
+    exit({could_not_close, Other}).
 
 start_batch(#state{conf = #conf{counter = CRef}} = State) ->
     ok = counters:add(CRef, ?C_BATCHES, 1),

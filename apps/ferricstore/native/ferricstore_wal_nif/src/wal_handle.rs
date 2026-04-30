@@ -129,29 +129,60 @@ impl WalHandle {
 
     /// Close the WAL. Blocks until background thread exits (max 30s).
     pub fn close(&self) -> io::Result<()> {
-        // Send close signal
-        let _ = self.flush_tx.send(ThreadMsg::Close);
+        let handle = {
+            let mut guard = self
+                .thread_handle
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "thread_handle poisoned"))?;
 
-        // Wait for thread to exit
-        if let Ok(mut guard) = self.thread_handle.lock() {
-            if let Some(handle) = guard.take() {
-                // Wait with timeout
-                let start = std::time::Instant::now();
-                loop {
-                    if handle.is_finished() {
-                        let _ = handle.join();
-                        break;
-                    }
-                    if start.elapsed() > Duration::from_secs(30) {
-                        return Err(io::Error::new(io::ErrorKind::TimedOut, "wal close timeout"));
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
+            match guard.take() {
+                Some(handle) => handle,
+                None => {
+                    self.alive.store(false, Ordering::Release);
+                    return Ok(());
                 }
             }
+        };
+
+        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+
+        if self
+            .flush_tx
+            .send(ThreadMsg::Close(Some(result_tx)))
+            .is_err()
+        {
+            self.alive.store(false, Ordering::Release);
+            let _ = handle.join();
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "wal thread dead"));
+        }
+
+        let close_result = match result_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => Err(io::Error::new(io::ErrorKind::Other, reason)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "wal close timeout"))
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "wal thread closed without reporting close result",
+            )),
+        };
+
+        // Wait for thread to exit.
+        let start = std::time::Instant::now();
+        loop {
+            if handle.is_finished() {
+                let _ = handle.join();
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(30) {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "wal close timeout"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
 
         self.alive.store(false, Ordering::Release);
-        Ok(())
+        close_result
     }
 
     /// Current logical file size (no syscall).
@@ -175,7 +206,7 @@ impl Drop for WalHandle {
     fn drop(&mut self) {
         // Non-blocking: signal thread to exit, don't wait.
         self.alive.store(false, Ordering::Release);
-        let _ = self.flush_tx.try_send(ThreadMsg::Close);
+        let _ = self.flush_tx.try_send(ThreadMsg::Close(None));
         // Thread will notice channel disconnect or Close signal and exit.
         // fd closed by OS when thread's File is dropped.
     }
@@ -290,6 +321,26 @@ mod tests {
         handle.close().unwrap();
 
         // Thread is dead after close
+        assert!(handle.check_alive().is_err());
+    }
+
+    #[test]
+    fn test_close_returns_error_when_final_drain_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal").to_str().unwrap().to_string();
+
+        let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
+        handle.buffer_write(b"must report drain failure").unwrap();
+
+        let buffer = handle.buffer.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = buffer.lock().unwrap();
+            panic!("poison buffer mutex before close");
+        });
+
+        let err = handle.close().unwrap_err();
+
+        assert!(err.to_string().contains("buffer mutex poisoned"));
         assert!(handle.check_alive().is_err());
     }
 

@@ -9,7 +9,7 @@
 // go through OwnedEnv::send_and_clear.
 
 use crate::aligned_buffer::AlignedBuffer;
-use crossbeam_channel::{Receiver, RecvTimeoutError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rustler::Encoder;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -21,11 +21,13 @@ use std::time::{Duration, Instant};
 use std::os::unix::io::AsRawFd;
 
 /// Messages sent from NIF to background thread (flush signals only, not data).
+pub type ThreadResult = std::result::Result<(), String>;
+
 pub enum ThreadMsg {
     /// Request fdatasync. Caller will be notified on completion.
     Flush(FlushCaller),
     /// Shutdown: drain, sync, close, exit.
-    Close,
+    Close(Option<Sender<ThreadResult>>),
 }
 
 /// Caller information for flush notification.
@@ -47,6 +49,16 @@ pub struct ThreadConfig {
     pub file_size: Arc<AtomicU64>,
     pub commit_delay: Duration,
     pub _use_o_direct: bool,
+}
+
+trait SyncData {
+    fn sync_data(&mut self) -> io::Result<()>;
+}
+
+impl SyncData for File {
+    fn sync_data(&mut self) -> io::Result<()> {
+        File::sync_data(self)
+    }
 }
 
 /// Run the background thread loop.
@@ -92,15 +104,15 @@ fn thread_loop_inner(
         // =====================================================================
         let msg = match rx.recv() {
             Ok(msg) => msg,
-            Err(_) => return,
+            Err(_) => {
+                finish_disconnect(&mut file, &buffer, &file_size, &mut callers);
+                return;
+            }
         };
 
         match msg {
-            ThreadMsg::Close => {
-                if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
-                    eprintln!("[ferricstore_wal_nif] WAL write failed during close: {e}");
-                }
-                let _ = file.sync_data();
+            ThreadMsg::Close(response) => {
+                finish_close(&mut file, &buffer, &file_size, &mut callers, response);
                 return;
             }
             ThreadMsg::Flush(caller) => {
@@ -128,23 +140,13 @@ fn thread_loop_inner(
                 }
                 match rx.recv_timeout(remaining) {
                     Ok(ThreadMsg::Flush(c)) => callers.push(c),
-                    Ok(ThreadMsg::Close) => {
-                        if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
-                            notify_callers_error(&mut callers, &e);
-                            return;
-                        }
-                        let _ = file.sync_data();
-                        notify_callers_success(&mut callers);
+                    Ok(ThreadMsg::Close(response)) => {
+                        finish_close(&mut file, &buffer, &file_size, &mut callers, response);
                         return;
                     }
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => {
-                        if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
-                            notify_callers_error(&mut callers, &e);
-                            return;
-                        }
-                        let _ = file.sync_data();
-                        notify_callers_success(&mut callers);
+                        finish_disconnect(&mut file, &buffer, &file_size, &mut callers);
                         return;
                     }
                 }
@@ -182,13 +184,8 @@ fn thread_loop_inner(
             loop {
                 match rx.try_recv() {
                     Ok(ThreadMsg::Flush(c)) => callers.push(c),
-                    Ok(ThreadMsg::Close) => {
-                        if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
-                            notify_callers_error(&mut callers, &e);
-                            return;
-                        }
-                        let _ = file.sync_data();
-                        notify_callers_success(&mut callers);
+                    Ok(ThreadMsg::Close(response)) => {
+                        finish_close(&mut file, &buffer, &file_size, &mut callers, response);
                         return;
                     }
                     Err(_) => break,
@@ -201,9 +198,13 @@ fn thread_loop_inner(
             }
 
             // Buffer has data? Drain it to kernel (writes flow continuously).
-            let has_data = {
-                let buf = buffer.lock().expect("buffer mutex poisoned");
-                !buf.is_empty()
+            let has_data = match buffer.lock() {
+                Ok(buf) => !buf.is_empty(),
+                Err(_) => {
+                    let err = io::Error::new(io::ErrorKind::Other, "buffer mutex poisoned");
+                    notify_callers_error(&mut callers, &err);
+                    return;
+                }
             };
             if has_data {
                 continue;
@@ -213,6 +214,57 @@ fn thread_loop_inner(
             break;
         }
     }
+}
+
+fn finish_close(
+    file: &mut File,
+    buffer: &Mutex<AlignedBuffer>,
+    file_size: &AtomicU64,
+    callers: &mut Vec<FlushCaller>,
+    response: Option<Sender<ThreadResult>>,
+) {
+    let result = close_drain_and_sync(file, buffer, file_size);
+    notify_callers_for_close(callers, &result);
+    send_close_result(response, &result);
+}
+
+fn finish_disconnect(
+    file: &mut File,
+    buffer: &Mutex<AlignedBuffer>,
+    file_size: &AtomicU64,
+    callers: &mut Vec<FlushCaller>,
+) {
+    let result = close_drain_and_sync(file, buffer, file_size);
+    notify_callers_for_close(callers, &result);
+
+    if let Err(e) = result {
+        eprintln!("[ferricstore_wal_nif] WAL drain/sync failed during disconnect: {e}");
+    }
+}
+
+fn notify_callers_for_close(callers: &mut Vec<FlushCaller>, result: &io::Result<()>) {
+    match result {
+        Ok(()) => notify_callers_success(callers),
+        Err(e) => notify_callers_error(callers, e),
+    }
+}
+
+fn send_close_result(response: Option<Sender<ThreadResult>>, result: &io::Result<()>) {
+    if let Some(response) = response {
+        let _ = response.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+    }
+}
+
+fn close_drain_and_sync<W>(
+    writer: &mut W,
+    buffer: &Mutex<AlignedBuffer>,
+    file_size: &AtomicU64,
+) -> io::Result<()>
+where
+    W: Write + SyncData,
+{
+    drain_to_kernel_writer(writer, buffer, file_size)?;
+    writer.sync_data()
 }
 
 /// Drain shared buffer to kernel page cache. No fdatasync.
@@ -231,7 +283,9 @@ fn drain_to_kernel_writer<W: Write>(
     file_size: &AtomicU64,
 ) -> io::Result<bool> {
     let taken = {
-        let mut buf = buffer.lock().expect("buffer mutex poisoned");
+        let mut buf = buffer
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "buffer mutex poisoned"))?;
         buf.take()
     };
 
@@ -389,6 +443,27 @@ mod tests {
         }
     }
 
+    struct FailingSyncWriter {
+        writes: Vec<u8>,
+    }
+
+    impl Write for FailingSyncWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SyncData for FailingSyncWriter {
+        fn sync_data(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::Other, "forced sync failure"))
+        }
+    }
+
     #[test]
     fn drain_to_kernel_returns_write_error_instead_of_panicking() {
         let buffer = Mutex::new(AlignedBuffer::new());
@@ -404,6 +479,24 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(file_size.load(Ordering::Acquire), WAL_HEADER_SIZE);
+    }
+
+    #[test]
+    fn close_drain_and_sync_returns_sync_error() {
+        let buffer = Mutex::new(AlignedBuffer::new());
+        {
+            let mut guard = buffer.lock().unwrap();
+            guard.extend(b"entry");
+        }
+
+        let file_size = AtomicU64::new(WAL_HEADER_SIZE);
+        let mut writer = FailingSyncWriter { writes: Vec::new() };
+
+        let err = close_drain_and_sync(&mut writer, &buffer, &file_size).unwrap_err();
+
+        assert!(err.to_string().contains("forced sync failure"));
+        assert_eq!(file_size.load(Ordering::Acquire), WAL_HEADER_SIZE + 5);
+        assert!(!writer.writes.is_empty());
     }
 
     /// Helper: create a thread config for testing (no BEAM notifications).
@@ -642,7 +735,12 @@ mod tests {
         }
 
         // Send close — thread should flush before exiting
-        tx.send(ThreadMsg::Close).unwrap();
+        let (close_tx, close_rx) = crossbeam_channel::bounded(1);
+        tx.send(ThreadMsg::Close(Some(close_tx))).unwrap();
+        assert_eq!(
+            close_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Ok(())
+        );
         handle.join().unwrap();
 
         // Thread should be marked dead
@@ -691,12 +789,24 @@ mod tests {
             })
             .unwrap();
 
+        // Write data without sending an explicit close message. Disconnect
+        // must still drain and sync the buffer before the thread exits.
+        {
+            let mut buf = buffer.lock().unwrap();
+            buf.extend(b"disconnect data");
+        }
+
         // Drop the sender — channel disconnects
         drop(tx);
 
         // Thread should exit cleanly
         handle.join().unwrap();
         assert!(!alive.load(Ordering::Acquire));
+
+        let contents = std::fs::read(&path).unwrap();
+        assert!(contents.len() >= 15);
+        assert_eq!(&contents[..15], b"disconnect data");
+        assert_eq!(file_size.load(Ordering::Acquire), 15);
     }
 
     #[test]
@@ -745,7 +855,12 @@ mod tests {
 
         // Send multiple flush requests rapidly (no BEAM callers in this test)
         // We can't send FlushCaller without BEAM, so just test Close behavior
-        tx.send(ThreadMsg::Close).unwrap();
+        let (close_tx, close_rx) = crossbeam_channel::bounded(1);
+        tx.send(ThreadMsg::Close(Some(close_tx))).unwrap();
+        assert_eq!(
+            close_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Ok(())
+        );
         handle.join().unwrap();
 
         let contents = std::fs::read(&path).unwrap();
