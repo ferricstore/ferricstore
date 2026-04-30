@@ -455,6 +455,27 @@ defmodule Ferricstore.Commands.GenericTest do
       assert "embstr" == Generic.handle("OBJECT", ["ENCODING", "k"], store)
     end
 
+    test "OBJECT ENCODING returns 'int' for canonical integer strings" do
+      store =
+        MockStore.make(%{
+          "positive" => {"42", 0},
+          "negative" => {"-7", 0},
+          "max" => {"9223372036854775807", 0},
+          "min" => {"-9223372036854775808", 0}
+        })
+
+      assert "int" == Generic.handle("OBJECT", ["ENCODING", "positive"], store)
+      assert "int" == Generic.handle("OBJECT", ["ENCODING", "negative"], store)
+      assert "int" == Generic.handle("OBJECT", ["ENCODING", "max"], store)
+      assert "int" == Generic.handle("OBJECT", ["ENCODING", "min"], store)
+    end
+
+    test "OBJECT ENCODING does not return 'int' for out-of-range integer strings" do
+      store = MockStore.make(%{"too_big" => {"9223372036854775808", 0}})
+
+      assert "embstr" == Generic.handle("OBJECT", ["ENCODING", "too_big"], store)
+    end
+
     test "OBJECT ENCODING returns error for missing key" do
       store = MockStore.make()
       assert {:error, "ERR no such key"} = Generic.handle("OBJECT", ["ENCODING", "missing"], store)

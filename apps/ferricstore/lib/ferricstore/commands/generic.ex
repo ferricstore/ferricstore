@@ -2,6 +2,9 @@ defmodule Ferricstore.Commands.Generic do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
 
+  @max_int64 9_223_372_036_854_775_807
+  @min_int64 -9_223_372_036_854_775_808
+
   @moduledoc """
   Handles Redis generic key commands: TYPE, UNLINK, RENAME, RENAMENX, COPY,
   RANDOMKEY, SCAN, EXPIRETIME, PEXPIRETIME, OBJECT, WAIT.
@@ -295,7 +298,12 @@ defmodule Ferricstore.Commands.Generic do
 
       "string" ->
         value = Ops.get(store, key)
-        if value != nil and byte_size(value) <= 44, do: "embstr", else: "raw"
+
+        cond do
+          int_encoded_string?(value) -> "int"
+          value != nil and byte_size(value) <= 44 -> "embstr"
+          true -> "raw"
+        end
 
       _other ->
         "raw"
@@ -373,6 +381,18 @@ defmodule Ferricstore.Commands.Generic do
   defp object_exists?(store, key) do
     Ferricstore.Store.TypeRegistry.get_type(key, store) != "none"
   end
+
+  defp int_encoded_string?(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} ->
+        int >= @min_int64 and int <= @max_int64 and Integer.to_string(int) == value
+
+      _ ->
+        false
+    end
+  end
+
+  defp int_encoded_string?(_value), do: false
 
   # ---------------------------------------------------------------------------
   # Private -- COPY helpers
