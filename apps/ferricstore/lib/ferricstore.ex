@@ -173,6 +173,7 @@ defmodule FerricStore do
 
   @type key :: binary()
   @type value :: binary()
+  @type write_error :: {:error, binary() | {:timeout, :unknown_outcome}}
   @type set_opts :: [
           ttl: non_neg_integer(),
           exat: pos_integer(),
@@ -242,7 +243,7 @@ defmodule FerricStore do
   Returns `{:error, reason}` if the value exceeds the configured
   `max_value_size`.
   """
-  @spec set(key(), value(), set_opts()) :: :ok | {:ok, value() | nil} | nil | {:error, binary()}
+  @spec set(key(), value(), set_opts()) :: :ok | {:ok, value() | nil} | nil | write_error()
   def set(key, value, opts \\ []) do
     max_value_size =
       Application.get_env(:ferricstore, :max_value_size, 1_048_576)
@@ -337,7 +338,7 @@ defmodule FerricStore do
       {:ok, 2}
 
   """
-  @spec del(key() | [key()]) :: {:ok, non_neg_integer()} | {:error, binary()}
+  @spec del(key() | [key()]) :: {:ok, non_neg_integer()} | write_error()
   def del(key) when is_binary(key), do: del([key])
 
   def del(keys) when is_list(keys) do
@@ -370,7 +371,7 @@ defmodule FerricStore do
       {:error, "ERR value is not an integer or out of range"}
 
   """
-  @spec incr(key()) :: {:ok, integer()} | {:error, binary()}
+  @spec incr(key()) :: {:ok, integer()} | write_error()
   def incr(key) do
     incr_by(key, 1)
   end
@@ -393,7 +394,7 @@ defmodule FerricStore do
       {:ok, 9}
 
   """
-  @spec decr(key()) :: {:ok, integer()} | {:error, binary()}
+  @spec decr(key()) :: {:ok, integer()} | write_error()
   def decr(key) do
     incr_by(key, -1)
   end
@@ -415,7 +416,7 @@ defmodule FerricStore do
       {:ok, -5}
 
   """
-  @spec decr_by(key(), integer()) :: {:ok, integer()} | {:error, binary()}
+  @spec decr_by(key(), integer()) :: {:ok, integer()} | write_error()
   def decr_by(key, amount) when is_integer(amount) do
     incr_by(key, -amount)
   end
@@ -440,7 +441,7 @@ defmodule FerricStore do
       {:error, "ERR value is not an integer or out of range"}
 
   """
-  @spec incr_by(key(), integer()) :: {:ok, integer()} | {:error, binary()}
+  @spec incr_by(key(), integer()) :: {:ok, integer()} | write_error()
   @int64_max 9_223_372_036_854_775_807
   @int64_min -9_223_372_036_854_775_808
 
@@ -483,7 +484,7 @@ defmodule FerricStore do
       {:ok, "80.25"}
 
   """
-  @spec incr_by_float(key(), float()) :: {:ok, binary()} | {:error, binary()}
+  @spec incr_by_float(key(), float()) :: {:ok, binary()} | write_error()
   def incr_by_float(key, amount) when is_number(amount) do
     ctx = default_ctx()
 
@@ -5070,7 +5071,7 @@ defmodule FerricStore do
   Routes through `Router.batch_quorum_put` or `batch_async_put` based on
   namespace durability. Designed for erpc callers.
   """
-  @spec batch_set([{binary(), binary()}]) :: [:ok | {:error, binary()}]
+  @spec batch_set([{binary(), binary()}]) :: [:ok | write_error()]
   def batch_set(kv_pairs) when is_list(kv_pairs) do
     ctx = FerricStore.Instance.get(:default)
 
@@ -5463,7 +5464,7 @@ defmodule FerricStore.Pipe do
 
   Results are returned in the original command order.
   """
-  @spec execute(t()) :: [term()]
+  @spec execute(t()) :: [term()] | FerricStore.write_error()
   def execute(%__MODULE__{commands: []}), do: []
 
   def execute(%__MODULE__{commands: commands}) do
@@ -5848,7 +5849,7 @@ defmodule FerricStore.Tx do
   as a batch to the shard GenServer (atomic, no interleaving). If commands
   span multiple shards, returns a CROSSSLOT error.
   """
-  @spec execute(t()) :: [term()] | {:error, binary()}
+  @spec execute(t()) :: [term()] | FerricStore.write_error()
   def execute(%__MODULE__{commands: []}), do: []
 
   def execute(%__MODULE__{commands: commands}) do
