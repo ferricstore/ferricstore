@@ -46,6 +46,11 @@ defmodule FerricstoreServer.Resp.EncoderTest do
       assert to_binary(Encoder.encode({:error, "ERR unknown"})) == "-ERR unknown\r\n"
     end
 
+    test "encodes unknown outcome write timeout as Redis error text" do
+      assert to_binary(Encoder.encode({:error, {:timeout, :unknown_outcome}})) ==
+               "-ERR write timeout; outcome unknown\r\n"
+    end
+
     test "encodes an empty error" do
       assert to_binary(Encoder.encode({:error, ""})) == "-\r\n"
     end
@@ -63,7 +68,8 @@ defmodule FerricstoreServer.Resp.EncoderTest do
 
   describe "encode blob error" do
     test "encodes a blob error" do
-      assert to_binary(Encoder.encode({:blob_error, "ERR something"})) == "!13\r\nERR something\r\n"
+      assert to_binary(Encoder.encode({:blob_error, "ERR something"})) ==
+               "!13\r\nERR something\r\n"
     end
 
     test "encodes an empty blob error" do

@@ -968,6 +968,7 @@ wal_write(IoMod, Handle, Data) ->
     wal_write_retry(IoMod, Handle, Data, 50, undefined).
 
 wal_write_retry(_IoMod, _Handle, _Data, 0, LastError) ->
+    ?WARN("WAL write failed after retries: ~p", [LastError]),
     {error, {retries_exhausted, LastError}};
 wal_write_retry(IoMod, Handle, Data, Retries, _LastError) ->
     try IoMod:write(Handle, Data) of

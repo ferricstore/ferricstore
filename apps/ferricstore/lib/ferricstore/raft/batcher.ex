@@ -97,6 +97,7 @@ defmodule Ferricstore.Raft.Batcher do
 
   require Logger
 
+  alias Ferricstore.ErrorReasons
   alias Ferricstore.NamespaceConfig
 
   @default_max_batch_size 50_000
@@ -136,7 +137,8 @@ defmodule Ferricstore.Raft.Batcher do
           | {:unlock, binary(), binary()}
           | {:extend, binary(), binary(), non_neg_integer()}
           | {:ratelimit_add, binary(), pos_integer(), pos_integer(), pos_integer()}
-          | {:ratelimit_add, binary(), pos_integer(), pos_integer(), pos_integer(), non_neg_integer()}
+          | {:ratelimit_add, binary(), pos_integer(), pos_integer(), pos_integer(),
+             non_neg_integer()}
           | {:list_op, binary(), term()}
 
   @typedoc """
@@ -678,7 +680,8 @@ defmodule Ferricstore.Raft.Batcher do
     GenServer.reply(from, result)
   end
 
-  defp maybe_wrap_remote({pid, _ref}, result, ra_index) when node(pid) != node() and ra_index > 0 do
+  defp maybe_wrap_remote({pid, _ref}, result, ra_index)
+       when node(pid) != node() and ra_index > 0 do
     {:remote_applied_at, ra_index, result}
   end
 
@@ -719,6 +722,7 @@ defmodule Ferricstore.Raft.Batcher do
               %{retry_count: retry_count + 1, batch_size: length(batch)},
               %{shard_index: state.shard_index, target: inspect(target)}
             )
+
             submit_async_with_retry(state_without, batch, target, retry_count + 1)
           else
             :telemetry.execute(
@@ -726,9 +730,11 @@ defmodule Ferricstore.Raft.Batcher do
               %{batch_size: length(batch)},
               %{shard_index: state.shard_index, reason: :max_retries}
             )
+
             Logger.warning(
               "Batcher shard=#{state.shard_index}: async batch of #{length(batch)} commands dropped after #{@max_async_retries} retries"
             )
+
             state_without
           end
 
@@ -804,7 +810,9 @@ defmodule Ferricstore.Raft.Batcher do
     # entries (retry-aware 5-tuple or legacy 3-tuple) have no froms to
     # reply to — Router already got :ok.
     Enum.each(state.pending, fn
-      {_corr, {_froms, :async_no_reply, _batch, _retry, _mono}} -> :ok
+      {_corr, {_froms, :async_no_reply, _batch, _retry, _mono}} ->
+        :ok
+
       {_corr, {froms, _kind, _mono}} ->
         Enum.each(froms, fn from ->
           safe_reply(from, {:error, :batcher_terminated})
@@ -820,10 +828,11 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   defp reply_batch(froms, {:ok, results}) when is_list(results) do
-    expected = Enum.reduce(froms, 0, fn
-      {:batch_from, _, count}, acc -> acc + count
-      _, acc -> acc + 1
-    end)
+    expected =
+      Enum.reduce(froms, 0, fn
+        {:batch_from, _, count}, acc -> acc + count
+        _, acc -> acc + 1
+      end)
 
     if length(results) == expected do
       dispatch_batch_results(froms, results)
@@ -842,11 +851,13 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   defp dispatch_batch_results([], []), do: :ok
+
   defp dispatch_batch_results([{:batch_from, from, count} | rest_froms], results) do
     {slice, rest_results} = Enum.split(results, count)
     GenServer.reply(from, {:ok, slice})
     dispatch_batch_results(rest_froms, rest_results)
   end
+
   defp dispatch_batch_results([from | rest_froms], [result | rest_results]) do
     GenServer.reply(from, result)
     dispatch_batch_results(rest_froms, rest_results)
@@ -860,6 +871,7 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   defp safe_reply({:batch_from, from, _count}, msg), do: safe_reply(from, msg)
+
   defp safe_reply(from, msg) do
     try do
       GenServer.reply(from, msg)
@@ -1245,8 +1257,8 @@ defmodule Ferricstore.Raft.Batcher do
   #     got `:ok` when the command was enqueued. Emits
   #     `[:ferricstore, :batcher, :async_dropped]` telemetry.
   #
-  #   * `:single` / `:batch` (quorum callers) — reply `{:error, :timeout}`
-  #     to every blocked `from` so they unblock, then drop. Emits
+  #   * `:single` / `:batch` (quorum callers) — reply with an unknown-outcome
+  #     timeout error to every blocked `from` so they unblock, then drop. Emits
   #     `[:ferricstore, :batcher, :quorum_timeout]` telemetry. This is
   #     the production safety net for lost ra_events after a leader
   #     crash: without it, a caller blocked on `GenServer.call(..., :flush)`
@@ -1281,7 +1293,7 @@ defmodule Ferricstore.Raft.Batcher do
         )
 
       {_corr, {froms, kind, _mono}} when kind in [:single, :batch] ->
-        reply_all_froms(froms, {:error, :timeout})
+        reply_all_froms(froms, ErrorReasons.write_timeout_unknown())
 
         :telemetry.execute(
           [:ferricstore, :batcher, :quorum_timeout],
@@ -1398,7 +1410,8 @@ defmodule Ferricstore.Raft.Batcher do
   # ---------------------------------------------------------------------------
 
   @doc false
-  @spec __inject_async_pending__(non_neg_integer(), reference(), [tuple()], non_neg_integer()) :: :ok
+  @spec __inject_async_pending__(non_neg_integer(), reference(), [tuple()], non_neg_integer()) ::
+          :ok
   def __inject_async_pending__(shard_index, corr, batch, retry_count) do
     GenServer.call(
       batcher_name(shard_index),
@@ -1407,7 +1420,13 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc false
-  @spec __inject_async_pending_at__(non_neg_integer(), reference(), [tuple()], non_neg_integer(), integer()) :: :ok
+  @spec __inject_async_pending_at__(
+          non_neg_integer(),
+          reference(),
+          [tuple()],
+          non_neg_integer(),
+          integer()
+        ) :: :ok
   def __inject_async_pending_at__(shard_index, corr, batch, retry_count, submitted_mono) do
     GenServer.call(
       batcher_name(shard_index),

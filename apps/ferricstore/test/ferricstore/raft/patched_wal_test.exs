@@ -18,6 +18,8 @@ defmodule Ferricstore.Raft.PatchedWalTest do
   use ExUnit.Case, async: false
   @moduletag :shard_kill
 
+  import ExUnit.CaptureLog
+
   alias Ferricstore.Raft.Cluster
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
@@ -230,6 +232,20 @@ defmodule Ferricstore.Raft.PatchedWalTest do
       assert {:error, {:retries_exhausted, :forced_failure}} =
                :ra_log_wal.__wal_write_for_test__(AlwaysFailWalIo, table, "payload")
 
+      assert [{:attempts, 50}] = :ets.lookup(table, :attempts)
+    end
+
+    test "permanent write errors log before surfacing retry exhaustion" do
+      table = attempt_table()
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:retries_exhausted, :forced_failure}} =
+                   :ra_log_wal.__wal_write_for_test__(AlwaysFailWalIo, table, "payload")
+        end)
+
+      assert log =~ "WAL write failed after retries"
+      assert log =~ "forced_failure"
       assert [{:attempts, 50}] = :ets.lookup(table, :attempts)
     end
 

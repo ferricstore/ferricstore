@@ -103,6 +103,10 @@ defmodule FerricstoreServer.Resp.Encoder do
     ["-", msg, @crlf]
   end
 
+  def encode({:error, {:timeout, :unknown_outcome}}) do
+    ["-ERR write timeout; outcome unknown", @crlf]
+  end
+
   # Handle non-binary error reasons (e.g. atoms like :noproc from GenServer exits)
   def encode({:error, reason}) when is_atom(reason) do
     msg = "ERR #{Atom.to_string(reason)}"
