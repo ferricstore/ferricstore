@@ -58,4 +58,29 @@ defmodule Ferricstore.Store.RouterTest do
       assert Router.shard_name(FerricStore.Instance.get(:default), 3) == :"Ferricstore.Store.Shard.3"
     end
   end
+
+  describe "batch quorum forward failure classification" do
+    test "remote RPC timeout is an unknown-outcome write timeout" do
+      assert [
+               {:error, {:timeout, :unknown_outcome}},
+               {:error, {:timeout, :unknown_outcome}}
+             ] == Router.__forward_batch_failure_results__({:erpc, :timeout}, 2)
+    end
+
+    test "timeout variants are treated as unknown outcome" do
+      assert [{:error, {:timeout, :unknown_outcome}}] ==
+               Router.__forward_batch_failure_results__(:timeout, 1)
+
+      assert [{:error, {:timeout, :unknown_outcome}}] ==
+               Router.__forward_batch_failure_results__({:timeout, :call}, 1)
+    end
+
+    test "non-timeout forward failures stay leader unavailable" do
+      assert [
+               {:error, "ERR leader unavailable"},
+               {:error, "ERR leader unavailable"},
+               {:error, "ERR leader unavailable"}
+             ] == Router.__forward_batch_failure_results__({:erpc, :noconnection}, 3)
+    end
+  end
 end

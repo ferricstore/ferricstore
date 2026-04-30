@@ -117,11 +117,15 @@ defmodule Ferricstore.Store.Router do
           other
       end
     catch
-      _, _ ->
-        try do
-          GenServer.call(elem(ctx.shard_names, idx), command, 10_000)
-        catch
-          _, _ -> {:error, "ERR leader unavailable"}
+      _, reason ->
+        if forward_timeout?(reason) do
+          ErrorReasons.write_timeout_unknown()
+        else
+          try do
+            GenServer.call(elem(ctx.shard_names, idx), command, 10_000)
+          catch
+            _, _ -> {:error, "ERR leader unavailable"}
+          end
         end
     end
   end
@@ -131,9 +135,31 @@ defmodule Ferricstore.Store.Router do
       remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
       :erpc.call(leader_node, __MODULE__, :run_bypass_locally, [remote_ctx, command], 10_000)
     catch
-      _, _ -> {:error, "ERR leader unavailable"}
+      _, reason -> forward_failure_result(reason)
     end
   end
+
+  @doc false
+  @spec __forward_batch_failure_results__(term(), non_neg_integer()) :: [
+          {:error, binary() | {:timeout, :unknown_outcome}}
+        ]
+  def __forward_batch_failure_results__(reason, count) when is_integer(count) and count >= 0 do
+    List.duplicate(forward_failure_result(reason), count)
+  end
+
+  @spec forward_failure_result(term()) :: {:error, binary() | {:timeout, :unknown_outcome}}
+  defp forward_failure_result(reason) do
+    if forward_timeout?(reason) do
+      ErrorReasons.write_timeout_unknown()
+    else
+      {:error, "ERR leader unavailable"}
+    end
+  end
+
+  defp forward_timeout?({:erpc, :timeout}), do: true
+  defp forward_timeout?(:timeout), do: true
+  defp forward_timeout?({:timeout, _}), do: true
+  defp forward_timeout?(_reason), do: false
 
   @doc false
   # Public-but-undocumented entry point invoked via erpc from peer nodes
@@ -1378,7 +1404,7 @@ defmodule Ferricstore.Store.Router do
   mailbox.
   """
   @spec batch_quorum_put(FerricStore.Instance.t(), [{binary(), binary()}]) :: [
-          :ok | {:error, binary()}
+          :ok | {:error, binary() | {:timeout, :unknown_outcome}}
         ]
   def batch_quorum_put(ctx, kv_pairs) do
     wv_size = :counters.info(ctx.write_version).size
@@ -1503,7 +1529,7 @@ defmodule Ferricstore.Store.Router do
       _, reason ->
         require Logger
         Logger.warning("batch forward to #{inspect(leader_node)} failed: #{inspect(reason)}")
-        Enum.map(kv_pairs, fn _ -> {:error, "ERR leader unavailable"} end)
+        __forward_batch_failure_results__(reason, length(kv_pairs))
     end
   end
 
