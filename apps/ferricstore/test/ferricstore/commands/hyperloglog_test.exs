@@ -57,15 +57,32 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
       assert msg =~ "wrong number of arguments"
     end
 
-    test "PFADD wrong number of args — error (key but no elements)" do
-      assert {:error, msg} = HLLCmd.handle("PFADD", ["mykey"], MockStore.make())
-      assert msg =~ "wrong number of arguments"
+    test "PFADD with key but no elements creates an empty sketch" do
+      store = MockStore.make()
+
+      assert 1 == HLLCmd.handle("PFADD", ["mykey"], store)
+      assert HLL.valid_sketch?(store.get.("mykey"))
+      assert 0 == HLLCmd.handle("PFCOUNT", ["mykey"], store)
+    end
+
+    test "PFADD with key but no elements returns 0 when sketch already exists" do
+      store = MockStore.make()
+      assert 1 == HLLCmd.handle("PFADD", ["mykey"], store)
+
+      assert 0 == HLLCmd.handle("PFADD", ["mykey"], store)
     end
 
     test "PFADD to key holding non-HLL value returns WRONGTYPE error" do
       store = MockStore.make(%{"mykey" => {"not-a-sketch", 0}})
 
       assert {:error, msg} = HLLCmd.handle("PFADD", ["mykey", "elem"], store)
+      assert msg =~ "WRONGTYPE"
+    end
+
+    test "PFADD with no elements on non-HLL value returns WRONGTYPE error" do
+      store = MockStore.make(%{"mykey" => {"not-a-sketch", 0}})
+
+      assert {:error, msg} = HLLCmd.handle("PFADD", ["mykey"], store)
       assert msg =~ "WRONGTYPE"
     end
   end

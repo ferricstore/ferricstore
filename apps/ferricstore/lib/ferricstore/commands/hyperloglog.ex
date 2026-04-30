@@ -48,6 +48,20 @@ defmodule Ferricstore.Commands.HyperLogLog do
   # PFADD key element [element ...]
   # ---------------------------------------------------------------------------
 
+  def handle("PFADD", [key], store) do
+    case Ops.get(store, key) do
+      nil ->
+        Ops.put(store, key, HLL.new(), 0)
+        1
+
+      sketch ->
+        case validate_sketch(sketch) do
+          :ok -> 0
+          {:error, _} = err -> err
+        end
+    end
+  end
+
   def handle("PFADD", [key | elements], store) when elements != [] do
     sketch = get_or_new(key, store)
 
