@@ -313,8 +313,10 @@ defmodule FerricStore do
   """
   @spec get(key(), get_opts()) :: {:ok, value() | nil}
   def get(key, _opts \\ []) do
-    ctx = default_ctx()
-    {:ok, Router.get(ctx, key)}
+    case Ferricstore.Commands.Strings.handle("GET", [key], build_string_store(key)) do
+      {:error, _} = err -> err
+      value -> {:ok, value}
+    end
   end
 
   @doc """
@@ -1596,8 +1598,7 @@ defmodule FerricStore do
   """
   @spec exists(key()) :: boolean()
   def exists(key) do
-    ctx = default_ctx()
-    Router.exists?(ctx, key)
+    Ferricstore.Commands.Strings.handle("EXISTS", [key], build_compound_store(key)) == 1
   end
 
   @doc """
@@ -5196,7 +5197,7 @@ defmodule FerricStore do
   # Private — string store builder for bitmap/json/hyperloglog operations
   # ---------------------------------------------------------------------------
 
-  defp build_string_store(key) do
+  defp build_string_store(_key) do
     ctx = default_ctx()
 
     %{
@@ -5377,7 +5378,7 @@ defmodule FerricStore do
   # The store maps compound key operations to the correct shard GenServer
   # using the Redis key for routing (all sub-keys for one Redis key live
   # on the same shard).
-  defp build_compound_store(key) do
+  defp build_compound_store(_key) do
     ctx = default_ctx()
 
     %{

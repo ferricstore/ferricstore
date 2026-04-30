@@ -14,6 +14,26 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
   end
 
   # ===========================================================================
+  # GET
+  # ===========================================================================
+
+  describe "get/1" do
+    test "returns WRONGTYPE for hash key" do
+      assert :ok = FerricStore.hset("get:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.get("get:hash")
+      assert {:ok, "hash"} = FerricStore.type("get:hash")
+      assert {:ok, "old"} = FerricStore.hget("get:hash", "field")
+    end
+
+    test "returns WRONGTYPE for list key" do
+      assert {:ok, 1} = FerricStore.rpush("get:list", ["old"])
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.get("get:list")
+      assert {:ok, "list"} = FerricStore.type("get:list")
+      assert {:ok, ["old"]} = FerricStore.lrange("get:list", 0, -1)
+    end
+  end
+
+  # ===========================================================================
   # DECR / DECR_BY
   # ===========================================================================
 

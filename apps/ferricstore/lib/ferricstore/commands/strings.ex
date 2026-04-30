@@ -119,7 +119,9 @@ defmodule Ferricstore.Commands.Strings do
       exists =
         exists or
           (Ops.has_compound?(store) and
-             Ops.compound_get(store, key, Ferricstore.Store.CompoundKey.type_key(key)) != nil)
+             (Ops.compound_get(store, key, Ferricstore.Store.CompoundKey.type_key(key)) != nil or
+                Ops.compound_get(store, key, Ferricstore.Store.CompoundKey.list_meta_key(key)) !=
+                  nil))
 
       if exists, do: acc + 1, else: acc
     end)

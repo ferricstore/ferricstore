@@ -78,6 +78,20 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
   # TYPE / RANDOMKEY
   # ===========================================================================
 
+  describe "exists/1" do
+    test "returns true for compound data structure keys" do
+      assert :ok = FerricStore.hset("ex:hash", %{"f" => "v"})
+      assert {:ok, 1} = FerricStore.rpush("ex:list", ["v"])
+      assert {:ok, 1} = FerricStore.sadd("ex:set", ["v"])
+      assert {:ok, 1} = FerricStore.zadd("ex:zset", [{1.0, "v"}])
+
+      assert FerricStore.exists("ex:hash")
+      assert FerricStore.exists("ex:list")
+      assert FerricStore.exists("ex:set")
+      assert FerricStore.exists("ex:zset")
+    end
+  end
+
   describe "type/1" do
     test "returns 'string' for string key" do
       FerricStore.set("tp:str", "value")
