@@ -2062,7 +2062,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp do_set(state, key, value, expire_at_ms, opts) do
     current = do_get_meta(state, key)
-    exists? = current != nil
+    compound_data_structure? = compound_data_structure_key?(state, key)
+    exists? = current != nil or compound_data_structure?
 
     {old_value, old_expire_at_ms} =
       case current do
@@ -2078,6 +2079,9 @@ defmodule Ferricstore.Raft.StateMachine do
       end
 
     cond do
+      compound_data_structure? and Map.get(opts, :get, false) ->
+        {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+
       skip? and Map.get(opts, :get, false) ->
         old_value
 
@@ -3334,6 +3338,12 @@ defmodule Ferricstore.Raft.StateMachine do
     end
 
     :ok
+  end
+
+  defp compound_data_structure_key?(state, key) do
+    not Ferricstore.Store.CompoundKey.internal_key?(key) and
+      (do_get(state, Ferricstore.Store.CompoundKey.type_key(key)) != nil or
+         do_get(state, Ferricstore.Store.CompoundKey.list_meta_key(key)) != nil)
   end
 
   defp clear_legacy_list_metadata_for_string_put(state, key) do

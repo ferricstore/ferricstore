@@ -152,6 +152,28 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert {:ok, "string"} = FerricStore.type("psetex:hash")
       assert {:error, "WRONGTYPE" <> _} = FerricStore.hget("psetex:hash", "field")
     end
+
+    test "set nx treats hash key as existing and leaves it unchanged" do
+      assert :ok = FerricStore.hset("setnx:hash", %{"field" => "old"})
+      assert nil == FerricStore.set("setnx:hash", "string", nx: true)
+      assert {:ok, "hash"} = FerricStore.type("setnx:hash")
+      assert {:ok, "old"} = FerricStore.hget("setnx:hash", "field")
+    end
+
+    test "set xx treats hash key as existing and replaces it with string" do
+      assert :ok = FerricStore.hset("setxx:hash", %{"field" => "old"})
+      assert :ok = FerricStore.set("setxx:hash", "string", xx: true)
+      assert {:ok, "string"} = FerricStore.get("setxx:hash")
+      assert {:ok, "string"} = FerricStore.type("setxx:hash")
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.hget("setxx:hash", "field")
+    end
+
+    test "set get on hash key returns WRONGTYPE and leaves hash unchanged" do
+      assert :ok = FerricStore.hset("setget:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.set("setget:hash", "string", get: true)
+      assert {:ok, "hash"} = FerricStore.type("setget:hash")
+      assert {:ok, "old"} = FerricStore.hget("setget:hash", "field")
+    end
   end
 
   # ===========================================================================
