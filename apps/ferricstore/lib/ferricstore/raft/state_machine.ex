@@ -2502,30 +2502,32 @@ defmodule Ferricstore.Raft.StateMachine do
   @int64_min -9_223_372_036_854_775_808
 
   defp do_incr(state, key, delta) do
-    case do_get_meta(state, key) do
-      nil ->
-        if delta > @int64_max or delta < @int64_min do
-          {:error, "ERR increment or decrement would overflow"}
-        else
-          do_put(state, key, delta, 0)
-          {:ok, delta}
-        end
+    with :ok <- ensure_string_key(state, key) do
+      case do_get_meta(state, key) do
+        nil ->
+          if delta > @int64_max or delta < @int64_min do
+            {:error, "ERR increment or decrement would overflow"}
+          else
+            do_put(state, key, delta, 0)
+            {:ok, delta}
+          end
 
-      {value, expire_at_ms} ->
-        case coerce_integer(value) do
-          {:ok, int_val} ->
-            new_val = int_val + delta
+        {value, expire_at_ms} ->
+          case coerce_integer(value) do
+            {:ok, int_val} ->
+              new_val = int_val + delta
 
-            if new_val > @int64_max or new_val < @int64_min do
-              {:error, "ERR increment or decrement would overflow"}
-            else
-              do_put(state, key, new_val, expire_at_ms)
-              {:ok, new_val}
-            end
+              if new_val > @int64_max or new_val < @int64_min do
+                {:error, "ERR increment or decrement would overflow"}
+              else
+                do_put(state, key, new_val, expire_at_ms)
+                {:ok, new_val}
+              end
 
-          :error ->
-            {:error, "ERR value is not an integer or out of range"}
-        end
+            :error ->
+              {:error, "ERR value is not an integer or out of range"}
+          end
+      end
     end
   end
 
@@ -2550,22 +2552,24 @@ defmodule Ferricstore.Raft.StateMachine do
   # Atomic INCRBYFLOAT: reads current value, parses as float, adds delta,
   # formats result, writes back. Preserves existing expire_at_ms.
   defp do_incr_float(state, key, delta) do
-    case do_get_meta(state, key) do
-      nil ->
-        new_val = delta * 1.0
-        do_put(state, key, new_val, 0)
-        {:ok, new_val}
+    with :ok <- ensure_string_key(state, key) do
+      case do_get_meta(state, key) do
+        nil ->
+          new_val = delta * 1.0
+          do_put(state, key, new_val, 0)
+          {:ok, new_val}
 
-      {value, expire_at_ms} ->
-        case coerce_float(value) do
-          {:ok, float_val} ->
-            new_val = float_val + delta
-            do_put(state, key, new_val, expire_at_ms)
-            {:ok, new_val}
+        {value, expire_at_ms} ->
+          case coerce_float(value) do
+            {:ok, float_val} ->
+              new_val = float_val + delta
+              do_put(state, key, new_val, expire_at_ms)
+              {:ok, new_val}
 
-          :error ->
-            {:error, "ERR value is not a valid float"}
-        end
+            :error ->
+              {:error, "ERR value is not a valid float"}
+          end
+      end
     end
   end
 
@@ -2575,62 +2579,72 @@ defmodule Ferricstore.Raft.StateMachine do
   # Atomic APPEND: reads current value (or ""), concatenates suffix, writes
   # back. Preserves the existing expire_at_ms on the key.
   defp do_append(state, key, suffix) do
-    {old_val, expire_at_ms} =
-      case do_get_meta(state, key) do
-        nil -> {"", 0}
-        {v, exp} -> {to_disk_binary(v), exp}
-      end
+    with :ok <- ensure_string_key(state, key) do
+      {old_val, expire_at_ms} =
+        case do_get_meta(state, key) do
+          nil -> {"", 0}
+          {v, exp} -> {to_disk_binary(v), exp}
+        end
 
-    new_val = old_val <> suffix
-    do_put(state, key, new_val, expire_at_ms)
-    {:ok, byte_size(new_val)}
+      new_val = old_val <> suffix
+      do_put(state, key, new_val, expire_at_ms)
+      {:ok, byte_size(new_val)}
+    end
   end
 
   # Atomic GETSET: reads old value, writes new value with no expiry, returns
   # old value directly (not wrapped in {:ok, ...}).
   defp do_getset(state, key, new_value) do
-    old = do_get(state, key)
-    do_put(state, key, new_value, 0)
-    old
+    with :ok <- ensure_string_key(state, key) do
+      old = do_get(state, key)
+      do_put(state, key, new_value, 0)
+      old
+    end
   end
 
   # Atomic GETDEL: reads value, deletes key, returns value directly (not
   # wrapped in {:ok, ...}). Returns nil if key does not exist.
   defp do_getdel(state, key) do
-    old = do_get(state, key)
+    with :ok <- ensure_string_key(state, key) do
+      old = do_get(state, key)
 
-    if old != nil do
-      do_delete(state, key)
+      if old != nil do
+        do_delete(state, key)
+      end
+
+      old
     end
-
-    old
   end
 
   # Atomic GETEX: reads value, re-writes with new expire_at_ms, returns value
   # directly (not wrapped). Returns nil if key does not exist or is expired.
   defp do_getex(state, key, expire_at_ms) do
-    case do_get_meta(state, key) do
-      nil ->
-        nil
+    with :ok <- ensure_string_key(state, key) do
+      case do_get_meta(state, key) do
+        nil ->
+          nil
 
-      {value, _old_exp} ->
-        do_put(state, key, value, expire_at_ms)
-        value
+        {value, _old_exp} ->
+          do_put(state, key, value, expire_at_ms)
+          value
+      end
     end
   end
 
   # Atomic SETRANGE: reads current value, pads with zero bytes if needed,
   # replaces bytes at offset, writes back. Preserves expire_at_ms.
   defp do_setrange(state, key, offset, value) do
-    {old_val, expire_at_ms} =
-      case do_get_meta(state, key) do
-        nil -> {"", 0}
-        {v, exp} -> {to_disk_binary(v), exp}
-      end
+    with :ok <- ensure_string_key(state, key) do
+      {old_val, expire_at_ms} =
+        case do_get_meta(state, key) do
+          nil -> {"", 0}
+          {v, exp} -> {to_disk_binary(v), exp}
+        end
 
-    new_val = sm_apply_setrange(old_val, offset, value)
-    do_put(state, key, new_val, expire_at_ms)
-    {:ok, byte_size(new_val)}
+      new_val = sm_apply_setrange(old_val, offset, value)
+      do_put(state, key, new_val, expire_at_ms)
+      {:ok, byte_size(new_val)}
+    end
   end
 
   # Atomic SETBIT: read bitmap, extend with zeros to include byte_index if
@@ -3344,6 +3358,12 @@ defmodule Ferricstore.Raft.StateMachine do
     not Ferricstore.Store.CompoundKey.internal_key?(key) and
       (do_get(state, Ferricstore.Store.CompoundKey.type_key(key)) != nil or
          do_get(state, Ferricstore.Store.CompoundKey.list_meta_key(key)) != nil)
+  end
+
+  defp ensure_string_key(state, key) do
+    if compound_data_structure_key?(state, key),
+      do: {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
+      else: :ok
   end
 
   defp clear_legacy_list_metadata_for_string_put(state, key) do

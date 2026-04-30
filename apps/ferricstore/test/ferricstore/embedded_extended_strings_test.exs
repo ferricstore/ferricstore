@@ -37,6 +37,13 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       FerricStore.set("decr:bad", "abc")
       assert {:error, _} = FerricStore.decr("decr:bad")
     end
+
+    test "decr on hash key returns WRONGTYPE and leaves hash unchanged" do
+      assert :ok = FerricStore.hset("decr:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.decr("decr:hash")
+      assert {:ok, "hash"} = FerricStore.type("decr:hash")
+      assert {:ok, "old"} = FerricStore.hget("decr:hash", "field")
+    end
   end
 
   describe "decr_by/2" do
@@ -80,6 +87,13 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       FerricStore.set("ibf:neg", "10")
       assert {:ok, result} = FerricStore.incr_by_float("ibf:neg", -2.5)
       assert_in_delta result, 7.5, 0.001
+    end
+
+    test "incr_by_float on hash key returns WRONGTYPE and leaves hash unchanged" do
+      assert :ok = FerricStore.hset("ibf:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.incr_by_float("ibf:hash", 1.5)
+      assert {:ok, "hash"} = FerricStore.type("ibf:hash")
+      assert {:ok, "old"} = FerricStore.hget("ibf:hash", "field")
     end
   end
 
@@ -196,6 +210,13 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       FerricStore.set("ap:empty", "data")
       assert {:ok, 4} = FerricStore.append("ap:empty", "")
     end
+
+    test "append on hash key returns WRONGTYPE and leaves hash unchanged" do
+      assert :ok = FerricStore.hset("ap:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.append("ap:hash", "suffix")
+      assert {:ok, "hash"} = FerricStore.type("ap:hash")
+      assert {:ok, "old"} = FerricStore.hget("ap:hash", "field")
+    end
   end
 
   describe "strlen/1" do
@@ -211,6 +232,12 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
     test "returns correct length for binary data" do
       FerricStore.set("sl:bin", <<1, 2, 3, 4, 5>>)
       assert {:ok, 5} = FerricStore.strlen("sl:bin")
+    end
+
+    test "strlen on hash key returns WRONGTYPE" do
+      assert :ok = FerricStore.hset("sl:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.strlen("sl:hash")
+      assert {:ok, "hash"} = FerricStore.type("sl:hash")
     end
   end
 
@@ -229,6 +256,13 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert {:ok, "old"} = FerricStore.getset("gs:key", "new")
       assert {:ok, "new"} = FerricStore.get("gs:key")
     end
+
+    test "getset on hash key returns WRONGTYPE and leaves hash unchanged" do
+      assert :ok = FerricStore.hset("gs:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.getset("gs:hash", "new")
+      assert {:ok, "hash"} = FerricStore.type("gs:hash")
+      assert {:ok, "old"} = FerricStore.hget("gs:hash", "field")
+    end
   end
 
   describe "getdel/1" do
@@ -240,6 +274,13 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
 
     test "returns nil for nonexistent key" do
       assert {:ok, nil} = FerricStore.getdel("gd:missing")
+    end
+
+    test "getdel on hash key returns WRONGTYPE and leaves hash unchanged" do
+      assert :ok = FerricStore.hset("gd:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.getdel("gd:hash")
+      assert {:ok, "hash"} = FerricStore.type("gd:hash")
+      assert {:ok, "old"} = FerricStore.hget("gd:hash", "field")
     end
   end
 
@@ -260,6 +301,19 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
     test "returns nil for nonexistent key" do
       assert {:ok, nil} = FerricStore.getex("gex:missing", ttl: 60_000)
     end
+
+    test "getex on hash key returns WRONGTYPE and leaves hash unchanged" do
+      assert :ok = FerricStore.hset("gex:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.getex("gex:hash", ttl: 60_000)
+      assert {:ok, "hash"} = FerricStore.type("gex:hash")
+      assert {:ok, "old"} = FerricStore.hget("gex:hash", "field")
+    end
+
+    test "getex without TTL on hash key returns WRONGTYPE" do
+      assert :ok = FerricStore.hset("gex:no_opts_hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.getex("gex:no_opts_hash")
+      assert {:ok, "hash"} = FerricStore.type("gex:no_opts_hash")
+    end
   end
 
   # ===========================================================================
@@ -276,6 +330,13 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       FerricStore.set("snx:exists", "original")
       assert {:ok, false} = FerricStore.setnx("snx:exists", "other")
       assert {:ok, "original"} = FerricStore.get("snx:exists")
+    end
+
+    test "treats hash key as existing and leaves it unchanged" do
+      assert :ok = FerricStore.hset("snx:hash", %{"field" => "old"})
+      assert {:ok, false} = FerricStore.setnx("snx:hash", "string")
+      assert {:ok, "hash"} = FerricStore.type("snx:hash")
+      assert {:ok, "old"} = FerricStore.hget("snx:hash", "field")
     end
   end
 
@@ -315,6 +376,12 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
     test "returns empty string for nonexistent key" do
       assert {:ok, ""} = FerricStore.getrange("gr:missing", 0, 10)
     end
+
+    test "returns WRONGTYPE for hash key" do
+      assert :ok = FerricStore.hset("gr:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.getrange("gr:hash", 0, 10)
+      assert {:ok, "hash"} = FerricStore.type("gr:hash")
+    end
   end
 
   describe "setrange/3" do
@@ -329,6 +396,13 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert len == 7
       {:ok, val} = FerricStore.get("sr:pad")
       assert byte_size(val) == 7
+    end
+
+    test "returns WRONGTYPE for hash key and leaves it unchanged" do
+      assert :ok = FerricStore.hset("sr:hash", %{"field" => "old"})
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.setrange("sr:hash", 0, "new")
+      assert {:ok, "hash"} = FerricStore.type("sr:hash")
+      assert {:ok, "old"} = FerricStore.hget("sr:hash", "field")
     end
   end
 
