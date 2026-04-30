@@ -81,7 +81,8 @@ defmodule Ferricstore.Bitcask.NIF do
           | {:error, term()}
   def v2_read_hint_file(_path), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec v2_copy_records(binary(), binary(), [non_neg_integer()]) :: :ok | {:error, term()}
+  @spec v2_copy_records(binary(), binary(), [non_neg_integer()]) ::
+          {:ok, [{non_neg_integer(), non_neg_integer()}]} | {:error, term()}
   def v2_copy_records(_source_path, _dest_path, _offsets), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec v2_append_batch_nosync(binary(), [{binary(), binary(), non_neg_integer()}]) ::

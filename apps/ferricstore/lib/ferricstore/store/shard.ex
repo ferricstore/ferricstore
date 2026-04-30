@@ -571,16 +571,18 @@ defmodule Ferricstore.Store.Shard do
       Enum.reduce(file_ids, {0, 0, 0}, fn fid, {written, dropped, reclaimed} ->
         source = file_path(sp, fid)
 
-        offsets =
+        live_entries =
           :ets.foldl(
-            fn {_key, _value, _exp, _lfu, f, off, _vsize}, acc ->
-              if f == fid, do: [off | acc], else: acc
+            fn {key, _value, _exp, _lfu, f, off, _vsize}, acc ->
+              if f == fid, do: [{key, off} | acc], else: acc
             end,
             [],
             state.keydir
           )
 
-        if offsets != [] do
+        if live_entries != [] do
+          offsets = Enum.map(live_entries, fn {_key, off} -> off end)
+
           old_size =
             case File.stat(source) do
               {:ok, %{size: s}} -> s
@@ -590,8 +592,9 @@ defmodule Ferricstore.Store.Shard do
           dest = Path.join(sp, "compact_#{fid}.log")
 
           case NIF.v2_copy_records(source, dest, offsets) do
-            {:ok, _results} ->
+            {:ok, results} when length(results) == length(live_entries) ->
               Ferricstore.FS.rename!(dest, source)
+              update_compacted_ets_locations(state.keydir, fid, live_entries, results)
 
               new_size =
                 case File.stat(source) do
@@ -599,10 +602,21 @@ defmodule Ferricstore.Store.Shard do
                   _ -> 0
                 end
 
-              {written + length(offsets), dropped, reclaimed + max(old_size - new_size, 0)}
+              {written + length(live_entries), dropped, reclaimed + max(old_size - new_size, 0)}
+
+            {:ok, results} ->
+              Logger.error(
+                "Shard #{state.index}: compaction copy_records result mismatch for #{source}: expected #{length(live_entries)}, got #{length(results)}"
+              )
+
+              _ = Ferricstore.FS.rm(dest)
+              {written, dropped, reclaimed}
 
             {:error, reason} ->
-              Logger.error("Shard #{state.index}: compaction copy_records failed for #{source}: #{inspect(reason)}")
+              Logger.error(
+                "Shard #{state.index}: compaction copy_records failed for #{source}: #{inspect(reason)}"
+              )
+
               _ = Ferricstore.FS.rm(dest)
               {written, dropped, reclaimed}
           end
@@ -709,6 +723,19 @@ defmodule Ferricstore.Store.Shard do
         {_new_state, result, _effects} -> {:reply, result, state}
       end
     end
+  end
+
+  defp update_compacted_ets_locations(keydir, fid, live_entries, results) do
+    Enum.zip(live_entries, results)
+    |> Enum.each(fn {{key, old_offset}, {new_offset, _new_size}} ->
+      case :ets.lookup(keydir, key) do
+        [{^key, _value, _exp, _lfu, ^fid, ^old_offset, _vsize}] ->
+          :ets.update_element(keydir, key, {6, new_offset})
+
+        _ ->
+          :ok
+      end
+    end)
   end
 
   # -------------------------------------------------------------------
