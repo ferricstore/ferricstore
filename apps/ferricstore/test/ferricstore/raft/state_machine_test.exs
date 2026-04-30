@@ -163,6 +163,36 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert [] == :ets.lookup(ets, "append_error_key")
     end
 
+    test "batch Bitcask append errors restore deleted ETS entries and remove new puts", %{
+      state: state,
+      ets: ets
+    } do
+      {state2, :ok} =
+        StateMachine.apply(%{}, {:put, "delete_failure_existing", "old_value", 0}, state)
+
+      old_entry = :ets.lookup(ets, "delete_failure_existing")
+
+      file_id = 9_100_000 + :erlang.unique_integer([:positive])
+      bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+      File.mkdir_p!(bad_active_path)
+      bad_state = %{state2 | active_file_id: file_id, active_file_path: bad_active_path}
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:batch,
+           [
+             {:delete, "delete_failure_existing"},
+             {:put, "delete_failure_new", "new_value", 0}
+           ]},
+          bad_state
+        )
+
+      assert {:error, {:bitcask_append_failed, _reason}} = result
+      assert old_entry == :ets.lookup(ets, "delete_failure_existing")
+      assert [] == :ets.lookup(ets, "delete_failure_new")
+    end
+
     test "emits bounded apply and Bitcask append telemetry", %{
       state: state,
       shard_index: shard_index
