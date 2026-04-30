@@ -223,10 +223,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # origin-skip via the embedded origin node tag.
   @impl true
   def apply(meta, {:async, _origin, _inner_cmd} = cmd, state) do
-    result = with_pending_writes(state, fn -> apply_single(state, cmd) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> apply_single(state, cmd) end)
   end
 
   # Backward-compat for 2-tuple async commands written by older binaries.
@@ -234,121 +231,128 @@ defmodule Ferricstore.Raft.StateMachine do
   # may over-count repeated RMW on the same key (acceptable for one-time WAL
   # recovery; new writes use the 3-tuple form below).
   def apply(meta, {:async, _inner_cmd} = cmd, state) do
-    result = with_pending_writes(state, fn -> apply_single(state, cmd) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> apply_single(state, cmd) end)
   end
 
   @impl true
   def apply(meta, {:put, key, value, expire_at_ms}, state) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+    with_apply_time(meta, fn ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
-    result =
-      case check_key_lock(state, redis_key, nil) do
-        :ok ->
-          with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
+      result =
+        case check_key_lock(state, redis_key, nil) do
+          :ok ->
+            with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
 
-        {:error, :key_locked} ->
-          {:error, :key_locked}
-      end
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
 
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
   end
 
   def apply(meta, {:set, key, value, expire_at_ms, opts}, state) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+    with_apply_time(meta, fn ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
-    result =
-      case check_key_lock(state, redis_key, nil) do
-        :ok ->
-          with_pending_writes(state, fn -> do_set(state, key, value, expire_at_ms, opts) end)
+      result =
+        case check_key_lock(state, redis_key, nil) do
+          :ok ->
+            with_pending_writes(state, fn -> do_set(state, key, value, expire_at_ms, opts) end)
 
-        {:error, :key_locked} ->
-          {:error, :key_locked}
-      end
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
 
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
   end
 
   def apply(meta, {:delete, key}, state) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+    with_apply_time(meta, fn ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
-    result =
-      case check_key_lock(state, redis_key, nil) do
-        :ok ->
-          with_pending_writes(state, fn -> do_delete(state, key) end)
+      result =
+        case check_key_lock(state, redis_key, nil) do
+          :ok ->
+            with_pending_writes(state, fn -> do_delete(state, key) end)
 
-        {:error, :key_locked} ->
-          {:error, :key_locked}
-      end
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
 
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
   end
 
   def apply(meta, {:batch, commands}, state) do
-    old_count = state.applied_count
+    with_apply_time(meta, fn ->
+      old_count = state.applied_count
 
-    # All commands in a batch share one pending-writes buffer so they
-    # are flushed in a single v2_append_batch_nosync NIF call.
-    write_result =
-      with_pending_writes(state, fn ->
-        Enum.map_reduce(commands, old_count, fn cmd, count ->
-          result = apply_single(state, cmd)
-          {result, count + 1}
+      # All commands in a batch share one pending-writes buffer so they
+      # are flushed in a single v2_append_batch_nosync NIF call.
+      write_result =
+        with_pending_writes(state, fn ->
+          Enum.map_reduce(commands, old_count, fn cmd, count ->
+            result = apply_single(state, cmd)
+            {result, count + 1}
+          end)
         end)
-      end)
 
-    case write_result do
-      {:error, _reason} = error ->
-        new_state = %{state | applied_count: old_count + length(commands)}
-        maybe_release_cursor(meta, old_count, new_state, error)
+      case write_result do
+        {:error, _reason} = error ->
+          new_state = %{state | applied_count: old_count + length(commands)}
+          maybe_release_cursor(meta, old_count, new_state, error)
 
-      {results, new_count} ->
-        new_state = %{state | applied_count: new_count}
-        maybe_release_cursor(meta, old_count, new_state, {:ok, results})
-    end
+        {results, new_count} ->
+          new_state = %{state | applied_count: new_count}
+          maybe_release_cursor(meta, old_count, new_state, {:ok, results})
+      end
+    end)
   end
 
   def apply(meta, {:cross_shard_tx, shard_batches}, state) do
-    old_count = state.applied_count
+    with_apply_time(meta, fn ->
+      old_count = state.applied_count
 
-    shard_results =
-      Enum.reduce(shard_batches, %{}, fn {shard_idx, queue, sandbox_namespace}, acc ->
-        store = build_cross_shard_store(shard_idx, state)
+      shard_results =
+        Enum.reduce(shard_batches, %{}, fn {shard_idx, queue, sandbox_namespace}, acc ->
+          store = build_cross_shard_store(shard_idx, state)
 
-        Process.put(:tx_deleted_keys, MapSet.new())
+          Process.put(:tx_deleted_keys, MapSet.new())
 
-        results =
-          try do
-            Enum.map(queue, fn {cmd, args} ->
-              namespaced_args = namespace_args(args, sandbox_namespace)
+          results =
+            try do
+              Enum.map(queue, fn {cmd, args} ->
+                namespaced_args = namespace_args(args, sandbox_namespace)
 
-              try do
-                Dispatcher.dispatch(cmd, namespaced_args, store)
-              catch
-                :exit, {:noproc, _} ->
-                  {:error, "ERR server not ready, shard process unavailable"}
+                try do
+                  Dispatcher.dispatch(cmd, namespaced_args, store)
+                catch
+                  :exit, {:noproc, _} ->
+                    {:error, "ERR server not ready, shard process unavailable"}
 
-                :exit, {reason, _} ->
-                  {:error, "ERR internal error: #{inspect(reason)}"}
-              end
-            end)
-          after
-            Process.delete(:tx_deleted_keys)
-          end
+                  :exit, {reason, _} ->
+                    {:error, "ERR internal error: #{inspect(reason)}"}
+                end
+              end)
+            after
+              Process.delete(:tx_deleted_keys)
+            end
 
-        Map.put(acc, shard_idx, results)
-      end)
+          Map.put(acc, shard_idx, results)
+        end)
 
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, shard_results)
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, shard_results)
+    end)
   end
 
   # Legacy: list operations used to be sent as a single {:list_op} Raft entry
@@ -356,174 +360,144 @@ defmodule Ferricstore.Raft.StateMachine do
   # and individual {:put}/{:delete} entries. This handler remains for WAL
   # replay of entries written before the compound-key migration.
   def apply(meta, {:list_op, key, operation}, state) do
-    store = build_compound_store(state)
+    with_apply_time(meta, fn ->
+      store = build_compound_store(state)
 
-    type_store =
-      Map.put(store, :exists?, fn k ->
-        case :ets.lookup(state.ets, k) do
-          [{^k, _, _, _, _, _, _}] -> true
-          _ -> false
+      type_store =
+        Map.put(store, :exists?, fn k ->
+          case :ets.lookup(state.ets, k) do
+            [{^k, _, _, _, _, _, _}] -> true
+            _ -> false
+          end
+        end)
+
+      result =
+        case Ferricstore.Store.TypeRegistry.check_type(key, :list, type_store) do
+          :ok -> with_pending_writes(state, fn -> do_list_op(state, key, operation) end)
+          {:error, _} = err -> err
         end
-      end)
 
-    result =
-      case Ferricstore.Store.TypeRegistry.check_type(key, :list, type_store) do
-        :ok -> with_pending_writes(state, fn -> do_list_op(state, key, operation) end)
-        {:error, _} = err -> err
-      end
-
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
   end
 
   def apply(meta, {:list_op_lmove, src_key, dst_key, from_dir, to_dir}, state) do
-    store = build_compound_store(state)
+    apply_pending_with_time(meta, state, fn ->
+      store = build_compound_store(state)
 
-    result =
-      with_pending_writes(state, fn ->
-        Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
-      end)
-
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+      Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
+    end)
   end
 
   def apply(meta, {:compound_put, compound_key, value, expire_at_ms}, state) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
+    with_apply_time(meta, fn ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
 
-    result =
-      case check_key_lock(state, redis_key, nil) do
-        :ok ->
-          with_pending_writes(state, fn -> do_put(state, compound_key, value, expire_at_ms) end)
+      result =
+        case check_key_lock(state, redis_key, nil) do
+          :ok ->
+            with_pending_writes(state, fn -> do_put(state, compound_key, value, expire_at_ms) end)
 
-        {:error, :key_locked} ->
-          {:error, :key_locked}
-      end
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
 
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
   end
 
   def apply(meta, {:compound_delete, compound_key}, state) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
+    with_apply_time(meta, fn ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
 
-    result =
-      case check_key_lock(state, redis_key, nil) do
-        :ok ->
-          with_pending_writes(state, fn -> do_delete(state, compound_key) end)
+      result =
+        case check_key_lock(state, redis_key, nil) do
+          :ok ->
+            with_pending_writes(state, fn -> do_delete(state, compound_key) end)
 
-        {:error, :key_locked} ->
-          {:error, :key_locked}
-      end
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
 
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
   end
 
   def apply(meta, {:compound_delete_prefix, prefix}, state) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
+    with_apply_time(meta, fn ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
 
-    result =
-      case check_key_lock(state, redis_key, nil) do
-        :ok ->
-          with_pending_writes(state, fn -> do_delete_prefix(state, prefix) end)
+      result =
+        case check_key_lock(state, redis_key, nil) do
+          :ok ->
+            with_pending_writes(state, fn -> do_delete_prefix(state, prefix) end)
 
-        {:error, :key_locked} ->
-          {:error, :key_locked}
-      end
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
 
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
   end
 
   def apply(meta, {:incr, key, delta}, state) do
-    result = with_pending_writes(state, fn -> do_incr(state, key, delta) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_incr(state, key, delta) end)
   end
 
   def apply(meta, {:incr_float, key, delta}, state) do
-    result = with_pending_writes(state, fn -> do_incr_float(state, key, delta) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_incr_float(state, key, delta) end)
   end
 
   def apply(meta, {:append, key, suffix}, state) do
-    result = with_pending_writes(state, fn -> do_append(state, key, suffix) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_append(state, key, suffix) end)
   end
 
   def apply(meta, {:getset, key, new_value}, state) do
-    result = with_pending_writes(state, fn -> do_getset(state, key, new_value) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_getset(state, key, new_value) end)
   end
 
   def apply(meta, {:getdel, key}, state) do
-    result = with_pending_writes(state, fn -> do_getdel(state, key) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_getdel(state, key) end)
   end
 
   def apply(meta, {:getex, key, expire_at_ms}, state) do
-    result = with_pending_writes(state, fn -> do_getex(state, key, expire_at_ms) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_getex(state, key, expire_at_ms) end)
   end
 
   def apply(meta, {:setrange, key, offset, value}, state) do
-    result = with_pending_writes(state, fn -> do_setrange(state, key, offset, value) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_setrange(state, key, offset, value) end)
   end
 
   # Atomic SETBIT — read bitmap blob, mutate one bit, write back. Previously
   # the read+compute+write ran in the caller process (FerricStore.setbit/3),
   # losing updates under concurrent writes on the same key.
   def apply(meta, {:setbit, key, offset, bit_val}, state) do
-    result = with_pending_writes(state, fn -> do_setbit(state, key, offset, bit_val) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_setbit(state, key, offset, bit_val) end)
   end
 
   # Atomic HINCRBY / HINCRBYFLOAT — read compound field, add delta, write back.
   # Previously ran in caller process and lost updates under concurrent hincrby
   # on the same field.
   def apply(meta, {:hincrby, key, field, delta}, state) do
-    result = with_pending_writes(state, fn -> do_hincrby(state, key, field, delta) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_hincrby(state, key, field, delta) end)
   end
 
   def apply(meta, {:hincrbyfloat, key, field, delta}, state) do
-    result = with_pending_writes(state, fn -> do_hincrbyfloat(state, key, field, delta) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_hincrbyfloat(state, key, field, delta) end)
   end
 
   # Atomic ZINCRBY — read zset member's score, add increment, write back.
   # Also sets the type metadata atomically if absent (first write to the key).
   def apply(meta, {:zincrby, key, increment, member}, state) do
-    result = with_pending_writes(state, fn -> do_zincrby(state, key, increment, member) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_zincrby(state, key, increment, member) end)
   end
 
   # Generic JSON RMW — dispatches to Ferricstore.Commands.Json.handle with
@@ -533,120 +507,73 @@ defmodule Ferricstore.Raft.StateMachine do
   # ops (JSON.GET, JSON.TYPE, etc.) still run in the caller; only RMW
   # goes through Raft.
   def apply(meta, {:json_op, cmd, args}, state) do
-    result =
-      with_pending_writes(state, fn ->
-        Ferricstore.Commands.Json.handle(cmd, args, build_sm_store(state))
-      end)
-
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn ->
+      Ferricstore.Commands.Json.handle(cmd, args, build_sm_store(state))
+    end)
   end
 
   # Atomic HyperLogLog RMW — PFADD reads HLL blob, merges hashed elements,
   # writes back. PFMERGE reads N sources + destination, writes merged blob.
   def apply(meta, {:hll_op, cmd, args}, state) do
-    result =
-      with_pending_writes(state, fn ->
-        Ferricstore.Commands.HyperLogLog.handle(cmd, args, build_sm_store(state))
-      end)
-
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn ->
+      Ferricstore.Commands.HyperLogLog.handle(cmd, args, build_sm_store(state))
+    end)
   end
 
   # Generic bitmap RMW — covers BITOP (merge N sources into destination) and
   # BITFIELD (multi-subcommand RMW on one bitmap). SETBIT has its own apply
   # clause above for the hot-path single-bit case.
   def apply(meta, {:bitmap_op, cmd, args}, state) do
-    result =
-      with_pending_writes(state, fn ->
-        Ferricstore.Commands.Bitmap.handle(cmd, args, build_sm_store(state))
-      end)
-
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn ->
+      Ferricstore.Commands.Bitmap.handle(cmd, args, build_sm_store(state))
+    end)
   end
 
   # Geo RMW — GEOADD merges members into the zset blob; GEOSEARCHSTORE
   # writes a filtered subset to destination. Read-only ops (GEOPOS / GEODIST
   # / GEOHASH / GEOSEARCH) don't go through this path.
   def apply(meta, {:geo_op, cmd, args}, state) do
-    result =
-      with_pending_writes(state, fn ->
-        Ferricstore.Commands.Geo.handle(cmd, args, build_sm_store(state))
-      end)
-
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn ->
+      Ferricstore.Commands.Geo.handle(cmd, args, build_sm_store(state))
+    end)
   end
 
   # TDigest RMW — TDIGEST.ADD/RESET/MERGE/CREATE. The old latch-based
   # serialization (with_tdigest_latch in ferricstore.ex) had subtle races
   # with orphan cleanup; state-machine dispatch removes the latch entirely.
   def apply(meta, {:tdigest_op, cmd, args}, state) do
-    result =
-      with_pending_writes(state, fn ->
-        Ferricstore.Commands.TDigest.handle(cmd, args, build_sm_store(state))
-      end)
-
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn ->
+      Ferricstore.Commands.TDigest.handle(cmd, args, build_sm_store(state))
+    end)
   end
 
   def apply(meta, {:cas, key, expected, new_value, ttl_ms}, state) do
-    result = with_pending_writes(state, fn -> do_cas(state, key, expected, new_value, ttl_ms) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_cas(state, key, expected, new_value, ttl_ms) end)
   end
 
   def apply(meta, {:lock, key, owner, ttl_ms}, state) do
-    result = with_pending_writes(state, fn -> do_lock(state, key, owner, ttl_ms) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_lock(state, key, owner, ttl_ms) end)
   end
 
   def apply(meta, {:unlock, key, owner}, state) do
-    result = with_pending_writes(state, fn -> do_unlock(state, key, owner) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_unlock(state, key, owner) end)
   end
 
   def apply(meta, {:extend, key, owner, ttl_ms}, state) do
-    result = with_pending_writes(state, fn -> do_extend(state, key, owner, ttl_ms) end)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn -> do_extend(state, key, owner, ttl_ms) end)
   end
 
   def apply(meta, {:ratelimit_add, key, window_ms, max, count}, state) do
-    result =
-      with_pending_writes(state, fn ->
-        do_ratelimit_add(state, key, window_ms, max, count, nil)
-      end)
-
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn ->
+      do_ratelimit_add(state, key, window_ms, max, count, nil)
+    end)
   end
 
   # 6-tuple variant: shard pre-computes now_ms for deterministic replay.
   def apply(meta, {:ratelimit_add, key, window_ms, max, count, now_ms}, state) do
-    result =
-      with_pending_writes(state, fn ->
-        do_ratelimit_add(state, key, window_ms, max, count, now_ms)
-      end)
-
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_pending_with_time(meta, state, fn ->
+      do_ratelimit_add(state, key, window_ms, max, count, now_ms)
+    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -657,10 +584,12 @@ defmodule Ferricstore.Raft.StateMachine do
   # ---------------------------------------------------------------------------
 
   def apply(meta, {:lock_keys, keys, owner_ref, expire_at_ms}, state) do
-    {new_state, result} = do_lock_keys(state, keys, owner_ref, expire_at_ms)
-    old_count = state.applied_count
-    new_state = %{new_state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    with_apply_time(meta, fn ->
+      {new_state, result} = do_lock_keys(state, keys, owner_ref, expire_at_ms)
+      old_count = state.applied_count
+      new_state = %{new_state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
   end
 
   def apply(meta, {:unlock_keys, keys, owner_ref}, state) do
@@ -706,54 +635,60 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   def apply(meta, {:locked_put, key, value, expire_at_ms, owner_ref}, state) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+    with_apply_time(meta, fn ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
-    result =
-      case check_key_lock(state, redis_key, owner_ref) do
-        :ok ->
-          with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
+      result =
+        case check_key_lock(state, redis_key, owner_ref) do
+          :ok ->
+            with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
 
-        {:error, _} = err ->
-          err
-      end
+          {:error, _} = err ->
+            err
+        end
 
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
   end
 
   def apply(meta, {:locked_delete, key, owner_ref}, state) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+    with_apply_time(meta, fn ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
-    result =
-      case check_key_lock(state, redis_key, owner_ref) do
-        :ok ->
-          with_pending_writes(state, fn -> do_delete(state, key) end)
+      result =
+        case check_key_lock(state, redis_key, owner_ref) do
+          :ok ->
+            with_pending_writes(state, fn -> do_delete(state, key) end)
 
-        {:error, _} = err ->
-          err
-      end
+          {:error, _} = err ->
+            err
+        end
 
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
   end
 
   def apply(meta, {:locked_delete_prefix, prefix, owner_ref}, state) do
-    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
+    with_apply_time(meta, fn ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
 
-    result =
-      case check_key_lock(state, redis_key, owner_ref) do
-        :ok ->
-          with_pending_writes(state, fn -> do_delete_prefix(state, prefix) end)
+      result =
+        case check_key_lock(state, redis_key, owner_ref) do
+          :ok ->
+            with_pending_writes(state, fn -> do_delete_prefix(state, prefix) end)
 
-        {:error, _} = err ->
-          err
-      end
+          {:error, _} = err ->
+            err
+        end
 
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -768,177 +703,138 @@ defmodule Ferricstore.Raft.StateMachine do
   # -- Bloom --
 
   def apply(meta, {:bloom_create, key, num_bits, num_hashes, prob_meta}, state) do
-    result =
-      do_prob_command(state, fn ->
-        path = prob_path(state, key, "bloom")
-        ensure_prob_dir(state)
-        NIF.bloom_file_create(path, num_bits, num_hashes)
-        prob_fsync_dir(state)
-        do_put(state, key, :erlang.term_to_binary(prob_meta), 0)
-        :ok
-      end)
-
-    bump_applied(meta, state, result)
+    apply_prob_with_time(meta, state, fn ->
+      path = prob_path(state, key, "bloom")
+      ensure_prob_dir(state)
+      NIF.bloom_file_create(path, num_bits, num_hashes)
+      prob_fsync_dir(state)
+      do_put(state, key, :erlang.term_to_binary(prob_meta), 0)
+      :ok
+    end)
   end
 
   def apply(meta, {:bloom_add, key, element, auto_create_params}, state) do
-    result =
-      do_prob_command(state, fn ->
-        path = prob_path(state, key, "bloom")
-        ensure_prob_dir(state)
-        auto_create_bloom_if_needed(state, path, key, auto_create_params)
-        NIF.bloom_file_add(path, element)
-      end)
-
-    bump_applied(meta, state, result)
+    apply_prob_with_time(meta, state, fn ->
+      path = prob_path(state, key, "bloom")
+      ensure_prob_dir(state)
+      auto_create_bloom_if_needed(state, path, key, auto_create_params)
+      NIF.bloom_file_add(path, element)
+    end)
   end
 
   def apply(meta, {:bloom_madd, key, elements, auto_create_params}, state) do
-    result =
-      do_prob_command(state, fn ->
-        path = prob_path(state, key, "bloom")
-        ensure_prob_dir(state)
-        auto_create_bloom_if_needed(state, path, key, auto_create_params)
-        NIF.bloom_file_madd(path, elements)
-      end)
-
-    bump_applied(meta, state, result)
+    apply_prob_with_time(meta, state, fn ->
+      path = prob_path(state, key, "bloom")
+      ensure_prob_dir(state)
+      auto_create_bloom_if_needed(state, path, key, auto_create_params)
+      NIF.bloom_file_madd(path, elements)
+    end)
   end
 
   # -- CMS --
 
   def apply(meta, {:cms_create, key, width, depth}, state) do
-    result =
-      do_prob_command(state, fn ->
-        path = prob_path(state, key, "cms")
-        ensure_prob_dir(state)
-        NIF.cms_file_create(path, width, depth)
-        prob_fsync_dir(state)
-        meta_val = {:cms_meta, %{width: width, depth: depth}}
-        do_put(state, key, :erlang.term_to_binary(meta_val), 0)
-        :ok
-      end)
-
-    bump_applied(meta, state, result)
+    apply_prob_with_time(meta, state, fn ->
+      path = prob_path(state, key, "cms")
+      ensure_prob_dir(state)
+      NIF.cms_file_create(path, width, depth)
+      prob_fsync_dir(state)
+      meta_val = {:cms_meta, %{width: width, depth: depth}}
+      do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+      :ok
+    end)
   end
 
   def apply(meta, {:cms_incrby, key, items}, state) do
-    result =
-      do_prob_command(state, fn ->
-        path = prob_path(state, key, "cms")
-        NIF.cms_file_incrby(path, items)
-      end)
-
-    bump_applied(meta, state, result)
+    apply_prob_with_time(meta, state, fn ->
+      path = prob_path(state, key, "cms")
+      NIF.cms_file_incrby(path, items)
+    end)
   end
 
   # src_paths are pre-resolved absolute paths (sources may be on different shards)
   def apply(meta, {:cms_merge, dst_key, src_paths, weights, create_params}, state) do
-    result =
-      do_prob_command(state, fn ->
-        dst_path = prob_path(state, dst_key, "cms")
-        ensure_prob_dir(state)
+    apply_prob_with_time(meta, state, fn ->
+      dst_path = prob_path(state, dst_key, "cms")
+      ensure_prob_dir(state)
 
-        unless Ferricstore.FS.exists?(dst_path) do
-          %{width: w, depth: d} = create_params
-          NIF.cms_file_create(dst_path, w, d)
-          prob_fsync_dir(state)
-          meta_val = {:cms_meta, %{width: w, depth: d}}
-          do_put(state, dst_key, :erlang.term_to_binary(meta_val), 0)
-        end
+      unless Ferricstore.FS.exists?(dst_path) do
+        %{width: w, depth: d} = create_params
+        NIF.cms_file_create(dst_path, w, d)
+        prob_fsync_dir(state)
+        meta_val = {:cms_meta, %{width: w, depth: d}}
+        do_put(state, dst_key, :erlang.term_to_binary(meta_val), 0)
+      end
 
-        NIF.cms_file_merge(dst_path, src_paths, weights)
-      end)
-
-    bump_applied(meta, state, result)
+      NIF.cms_file_merge(dst_path, src_paths, weights)
+    end)
   end
 
   # -- Cuckoo --
 
   def apply(meta, {:cuckoo_create, key, capacity, bucket_size}, state) do
-    result =
-      do_prob_command(state, fn ->
-        path = prob_path(state, key, "cuckoo")
-        ensure_prob_dir(state)
-        NIF.cuckoo_file_create(path, capacity, bucket_size)
-        prob_fsync_dir(state)
-        meta_val = {:cuckoo_meta, %{capacity: capacity}}
-        do_put(state, key, :erlang.term_to_binary(meta_val), 0)
-        :ok
-      end)
-
-    bump_applied(meta, state, result)
+    apply_prob_with_time(meta, state, fn ->
+      path = prob_path(state, key, "cuckoo")
+      ensure_prob_dir(state)
+      NIF.cuckoo_file_create(path, capacity, bucket_size)
+      prob_fsync_dir(state)
+      meta_val = {:cuckoo_meta, %{capacity: capacity}}
+      do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+      :ok
+    end)
   end
 
   def apply(meta, {:cuckoo_add, key, element, auto_create_params}, state) do
-    result =
-      do_prob_command(state, fn ->
-        path = prob_path(state, key, "cuckoo")
-        ensure_prob_dir(state)
-        auto_create_cuckoo_if_needed(state, path, key, auto_create_params)
-        NIF.cuckoo_file_add(path, element)
-      end)
-
-    bump_applied(meta, state, result)
+    apply_prob_with_time(meta, state, fn ->
+      path = prob_path(state, key, "cuckoo")
+      ensure_prob_dir(state)
+      auto_create_cuckoo_if_needed(state, path, key, auto_create_params)
+      NIF.cuckoo_file_add(path, element)
+    end)
   end
 
   def apply(meta, {:cuckoo_addnx, key, element, auto_create_params}, state) do
-    result =
-      do_prob_command(state, fn ->
-        path = prob_path(state, key, "cuckoo")
-        ensure_prob_dir(state)
-        auto_create_cuckoo_if_needed(state, path, key, auto_create_params)
-        NIF.cuckoo_file_addnx(path, element)
-      end)
-
-    bump_applied(meta, state, result)
+    apply_prob_with_time(meta, state, fn ->
+      path = prob_path(state, key, "cuckoo")
+      ensure_prob_dir(state)
+      auto_create_cuckoo_if_needed(state, path, key, auto_create_params)
+      NIF.cuckoo_file_addnx(path, element)
+    end)
   end
 
   def apply(meta, {:cuckoo_del, key, element}, state) do
-    result =
-      do_prob_command(state, fn ->
-        path = prob_path(state, key, "cuckoo")
-        NIF.cuckoo_file_del(path, element)
-      end)
-
-    bump_applied(meta, state, result)
+    apply_prob_with_time(meta, state, fn ->
+      path = prob_path(state, key, "cuckoo")
+      NIF.cuckoo_file_del(path, element)
+    end)
   end
 
   # -- TopK --
 
   def apply(meta, {:topk_create, key, k, width, depth, decay}, state) do
-    result =
-      do_prob_command(state, fn ->
-        path = prob_path(state, key, "topk")
-        ensure_prob_dir(state)
-        NIF.topk_file_create_v2(path, k, width, depth, decay)
-        prob_fsync_dir(state)
-        meta_val = {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
-        do_put(state, key, :erlang.term_to_binary(meta_val), 0)
-        :ok
-      end)
-
-    bump_applied(meta, state, result)
+    apply_prob_with_time(meta, state, fn ->
+      path = prob_path(state, key, "topk")
+      ensure_prob_dir(state)
+      NIF.topk_file_create_v2(path, k, width, depth, decay)
+      prob_fsync_dir(state)
+      meta_val = {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
+      do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+      :ok
+    end)
   end
 
   def apply(meta, {:topk_add, key, elements}, state) do
-    result =
-      do_prob_command(state, fn ->
-        path = prob_path(state, key, "topk")
-        NIF.topk_file_add_v2(path, elements)
-      end)
-
-    bump_applied(meta, state, result)
+    apply_prob_with_time(meta, state, fn ->
+      path = prob_path(state, key, "topk")
+      NIF.topk_file_add_v2(path, elements)
+    end)
   end
 
   def apply(meta, {:topk_incrby, key, pairs}, state) do
-    result =
-      do_prob_command(state, fn ->
-        path = prob_path(state, key, "topk")
-        NIF.topk_file_incrby_v2(path, pairs)
-      end)
-
-    bump_applied(meta, state, result)
+    apply_prob_with_time(meta, state, fn ->
+      path = prob_path(state, key, "topk")
+      NIF.topk_file_incrby_v2(path, pairs)
+    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -1141,6 +1037,43 @@ defmodule Ferricstore.Raft.StateMachine do
   defp maybe_release_cursor(_meta, _old_count, state, result) do
     # No meta (e.g. cross-shard sub-apply) — pass through untouched.
     {state, result}
+  end
+
+  @apply_now_key :ferricstore_raft_apply_now_ms
+  @apply_now_unset :__ferricstore_raft_apply_now_unset__
+
+  defp with_apply_time(%{system_time: now_ms}, fun) when is_integer(now_ms) do
+    previous = Process.get(@apply_now_key, @apply_now_unset)
+    Process.put(@apply_now_key, now_ms)
+
+    try do
+      fun.()
+    after
+      case previous do
+        @apply_now_unset -> Process.delete(@apply_now_key)
+        value -> Process.put(@apply_now_key, value)
+      end
+    end
+  end
+
+  defp with_apply_time(_meta, fun), do: fun.()
+
+  defp apply_now_ms do
+    Process.get(@apply_now_key) || HLC.now_ms()
+  end
+
+  defp apply_pending_with_time(meta, state, fun) do
+    with_apply_time(meta, fn ->
+      result = with_pending_writes(state, fun)
+      bump_applied(meta, state, result)
+    end)
+  end
+
+  defp apply_prob_with_time(meta, state, fun) do
+    with_apply_time(meta, fn ->
+      result = do_prob_command(state, fun)
+      bump_applied(meta, state, result)
+    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -1436,7 +1369,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Reads a value from a shard's keydir ETS table with cold-read fallback.
   defp cross_shard_ets_read(ctx, key) do
-    now = HLC.now_ms()
+    now = apply_now_ms()
 
     try do
       case :ets.lookup(ctx.keydir, key) do
@@ -1473,7 +1406,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Reads value + expire_at_ms from a shard's keydir ETS table.
   defp cross_shard_ets_read_meta(ctx, key) do
-    now = HLC.now_ms()
+    now = apply_now_ms()
 
     try do
       case :ets.lookup(ctx.keydir, key) do
@@ -1509,7 +1442,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp cross_shard_prefix_scan(ctx, prefix) do
-    now = HLC.now_ms()
+    now = apply_now_ms()
     prefix_len = byte_size(prefix)
 
     ms = [
@@ -1560,7 +1493,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp cross_shard_prefix_count(keydir, prefix) do
     prefix_len = byte_size(prefix)
-    now = HLC.now_ms()
+    now = apply_now_ms()
 
     ms = [
       {{:"$1", :_, :"$2", :_, :_, :_, :_},
@@ -3079,7 +3012,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # Returns {new_state, result} — locks are persisted in Raft state.
   defp do_lock_keys(state, keys, owner_ref, expire_at_ms) do
     locks = Map.get(state, :cross_shard_locks, %{})
-    now = HLC.now_ms()
+    now = apply_now_ms()
 
     conflict =
       Enum.find(keys, fn key ->
@@ -3124,7 +3057,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # Checks whether a key is locked by someone other than owner_ref.
   defp check_key_lock(state, key, owner_ref) do
     locks = Map.get(state, :cross_shard_locks, %{})
-    now = HLC.now_ms()
+    now = apply_now_ms()
 
     case Map.get(locks, key) do
       nil -> :ok
@@ -3162,7 +3095,7 @@ defmodule Ferricstore.Raft.StateMachine do
   #
   # Replicates the exact shard.ex handle_ratelimit_add_direct logic.
   defp do_ratelimit_add(state, key, window_ms, max, count, precomputed_now_ms) do
-    now = precomputed_now_ms || HLC.now_ms()
+    now = precomputed_now_ms || apply_now_ms()
 
     {cur_count, cur_start, prv_count} =
       case ets_lookup(state, key) do
@@ -3213,7 +3146,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # Mirrors the shard's `ets_lookup/2` logic with Bitcask fallback for
   # keys that may not yet be warmed into ETS.
   defp ets_lookup(state, key) do
-    now = HLC.now_ms()
+    now = apply_now_ms()
 
     case :ets.lookup(state.ets, key) do
       [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->

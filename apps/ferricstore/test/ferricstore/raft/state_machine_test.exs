@@ -93,6 +93,83 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "apply/3 with {:put, key, value, expire_at_ms}" do
+    test "uses raft meta system_time when checking cross-shard lock expiry", %{
+      state: state,
+      ets: ets
+    } do
+      local_now = Ferricstore.HLC.now_ms()
+      apply_now = local_now - 20_000
+      lock_expires_after_apply_time = apply_now + 10_000
+
+      locked_state = %{
+        state
+        | cross_shard_locks: %{
+            "meta_time_locked" => {make_ref(), lock_expires_after_apply_time}
+          }
+      }
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{system_time: apply_now},
+          {:put, "meta_time_locked", "value", 0},
+          locked_state
+        )
+
+      assert {:error, :key_locked} = result
+      assert [] == :ets.lookup(ets, "meta_time_locked")
+    end
+
+    test "uses raft meta system_time when acquiring cross-shard locks", %{state: state} do
+      local_now = Ferricstore.HLC.now_ms()
+      apply_now = local_now - 20_000
+      existing_lock_expiry = apply_now + 10_000
+      existing_owner = make_ref()
+
+      locked_state = %{
+        state
+        | cross_shard_locks: %{
+            "meta_time_lock_conflict" => {existing_owner, existing_lock_expiry}
+          }
+      }
+
+      {new_state, result} =
+        StateMachine.apply(
+          %{system_time: apply_now},
+          {:lock_keys, ["meta_time_lock_conflict"], make_ref(), apply_now + 30_000},
+          locked_state
+        )
+
+      assert {:error, :keys_locked} = result
+
+      assert %{"meta_time_lock_conflict" => {^existing_owner, ^existing_lock_expiry}} =
+               new_state.cross_shard_locks
+    end
+
+    test "uses raft meta system_time for standalone read-modify-write TTL checks", %{
+      state: state,
+      ets: ets
+    } do
+      local_now = Ferricstore.HLC.now_ms()
+      apply_now = local_now - 20_000
+      expires_after_apply_time = apply_now + 10_000
+
+      :ets.insert(
+        ets,
+        {"meta_time_incr", "5", expires_after_apply_time, Ferricstore.Store.LFU.initial(), 0, 0,
+         byte_size("5")}
+      )
+
+      {_new_state, {:ok, 6}} =
+        StateMachine.apply(
+          %{system_time: apply_now},
+          {:incr, "meta_time_incr", 1},
+          state
+        )
+
+      assert [{"meta_time_incr", "6", ^expires_after_apply_time, _, _, _, _}] =
+               :ets.lookup(ets, "meta_time_incr")
+    end
+
     test "missing active file fails put and rolls back new key", %{
       state: state,
       ets: ets
@@ -404,6 +481,31 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "apply/3 with {:batch, commands}" do
+    test "uses raft meta system_time for TTL checks inside batch read-modify-write", %{
+      state: state,
+      ets: ets
+    } do
+      local_now = Ferricstore.HLC.now_ms()
+      apply_now = local_now - 20_000
+      expires_after_apply_time = apply_now + 10_000
+
+      :ets.insert(
+        ets,
+        {"batch_meta_time_incr", "5", expires_after_apply_time, Ferricstore.Store.LFU.initial(),
+         0, 0, byte_size("5")}
+      )
+
+      {_new_state, {:ok, [{:ok, 6}]}} =
+        StateMachine.apply(
+          %{system_time: apply_now},
+          {:batch, [{:incr, "batch_meta_time_incr", 1}]},
+          state
+        )
+
+      assert [{"batch_meta_time_incr", "6", ^expires_after_apply_time, _, _, _, _}] =
+               :ets.lookup(ets, "batch_meta_time_incr")
+    end
+
     test "processes all commands and returns results list", %{state: state, ets: ets} do
       commands = [
         {:put, "batch_a", "val_a", 0},
