@@ -7,7 +7,7 @@ defmodule Ferricstore.Commands.GeoTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.Geo
+  alias Ferricstore.Commands.{Geo, SortedSet}
   alias Ferricstore.Test.MockStore
 
   # ===========================================================================
@@ -100,15 +100,19 @@ defmodule Ferricstore.Commands.GeoTest do
       store = MockStore.make()
 
       result =
-        Geo.handle("GEOADD", [
-          "mygeo",
-          "13.361389",
-          "38.115556",
-          "Palermo",
-          "15.087269",
-          "37.502669",
-          "Catania"
-        ], store)
+        Geo.handle(
+          "GEOADD",
+          [
+            "mygeo",
+            "13.361389",
+            "38.115556",
+            "Palermo",
+            "15.087269",
+            "37.502669",
+            "Catania"
+          ],
+          store
+        )
 
       assert result == 2
     end
@@ -116,6 +120,15 @@ defmodule Ferricstore.Commands.GeoTest do
     test "adds a single member" do
       store = MockStore.make()
       assert 1 == Geo.handle("GEOADD", ["mygeo", "13.361389", "38.115556", "Palermo"], store)
+    end
+
+    test "stores members in sorted-set format for ZSCORE compatibility" do
+      store = MockStore.make()
+
+      assert 1 == Geo.handle("GEOADD", ["mygeo", "13.361389", "38.115556", "Palermo"], store)
+
+      assert score = SortedSet.handle("ZSCORE", ["mygeo", "Palermo"], store)
+      assert {_, ""} = Float.parse(score)
     end
 
     test "updating existing member returns 0 (not added)" do
@@ -136,15 +149,19 @@ defmodule Ferricstore.Commands.GeoTest do
         ])
 
       result =
-        Geo.handle("GEOADD", [
-          "mygeo",
-          "13.5",
-          "38.2",
-          "Palermo",
-          "15.087269",
-          "37.502669",
-          "Catania"
-        ], store)
+        Geo.handle(
+          "GEOADD",
+          [
+            "mygeo",
+            "13.5",
+            "38.2",
+            "Palermo",
+            "15.087269",
+            "37.502669",
+            "Catania"
+          ],
+          store
+        )
 
       assert result == 1
     end
@@ -156,7 +173,11 @@ defmodule Ferricstore.Commands.GeoTest do
         ])
 
       result =
-        Geo.handle("GEOADD", ["mygeo", "NX", "0.0", "0.0", "Palermo", "15.0", "37.5", "Catania"], store)
+        Geo.handle(
+          "GEOADD",
+          ["mygeo", "NX", "0.0", "0.0", "Palermo", "15.0", "37.5", "Catania"],
+          store
+        )
 
       assert result == 1
 
@@ -173,7 +194,11 @@ defmodule Ferricstore.Commands.GeoTest do
         ])
 
       result =
-        Geo.handle("GEOADD", ["mygeo", "XX", "13.5", "38.2", "Palermo", "15.0", "37.5", "Catania"], store)
+        Geo.handle(
+          "GEOADD",
+          ["mygeo", "XX", "13.5", "38.2", "Palermo", "15.0", "37.5", "Catania"],
+          store
+        )
 
       assert result == 0
 
@@ -188,16 +213,20 @@ defmodule Ferricstore.Commands.GeoTest do
         ])
 
       result =
-        Geo.handle("GEOADD", [
-          "mygeo",
-          "CH",
-          "13.5",
-          "38.2",
-          "Palermo",
-          "15.0",
-          "37.5",
-          "Catania"
-        ], store)
+        Geo.handle(
+          "GEOADD",
+          [
+            "mygeo",
+            "CH",
+            "13.5",
+            "38.2",
+            "Palermo",
+            "15.0",
+            "37.5",
+            "Catania"
+          ],
+          store
+        )
 
       # 1 added (Catania) + 1 changed (Palermo)
       assert result == 2
@@ -710,6 +739,33 @@ defmodule Ferricstore.Commands.GeoTest do
       members = Enum.map(entries, fn {_score, m} -> m end)
       assert "Palermo" in members
       assert "Catania" in members
+    end
+
+    test "stores destination in sorted-set format for ZSCORE compatibility" do
+      store =
+        store_with_geo("src", [
+          {@palermo_lng, @palermo_lat, "Palermo"},
+          {@catania_lng, @catania_lat, "Catania"}
+        ])
+
+      assert 2 ==
+               Geo.handle(
+                 "GEOSEARCHSTORE",
+                 [
+                   "dst",
+                   "src",
+                   "FROMLONLAT",
+                   "13.361389",
+                   "38.115556",
+                   "BYRADIUS",
+                   "200",
+                   "KM"
+                 ],
+                 store
+               )
+
+      assert score = SortedSet.handle("ZSCORE", ["dst", "Palermo"], store)
+      assert {_, ""} = Float.parse(score)
     end
 
     test "returns 0 and deletes destination when no matches" do

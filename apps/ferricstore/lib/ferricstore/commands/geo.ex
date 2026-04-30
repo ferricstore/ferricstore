@@ -24,7 +24,7 @@ defmodule Ferricstore.Commands.Geo do
     * `GEOSEARCHSTORE destination source [same GEOSEARCH options]`
   """
 
-  alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.{CompoundKey, Ops, TypeRegistry}
 
   # Earth radius in meters (WGS-84 mean radius)
   @earth_radius_m 6_371_000.0
@@ -44,6 +44,8 @@ defmodule Ferricstore.Commands.Geo do
     "FT" => 0.3048,
     "MI" => 1609.344
   }
+
+  @wrongtype_msg "WRONGTYPE Operation against a key holding the wrong kind of value"
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -198,7 +200,7 @@ defmodule Ferricstore.Commands.Geo do
       limited = apply_count(sorted, opts)
 
       if limited == [] do
-        Ops.delete(store, destination)
+        delete_key_data(store, destination)
         0
       else
         new_zset =
@@ -206,8 +208,10 @@ defmodule Ferricstore.Commands.Geo do
           |> Enum.map(fn {score, member, _dist} -> {score, member} end)
           |> Enum.sort()
 
-        Ops.put(store, destination, :erlang.term_to_binary({:zset, new_zset}), 0)
-        length(limited)
+        case replace_zset(store, destination, new_zset) do
+          :ok -> length(limited)
+          {:error, _} = err -> err
+        end
       end
     end
   end
@@ -300,6 +304,53 @@ defmodule Ferricstore.Commands.Geo do
   @doc false
   @spec read_zset(map(), binary()) :: {:ok, [{float(), binary()}]} | {:error, binary()}
   def read_zset(store, key) do
+    case read_compound_zset(store, key) do
+      {:ok, zset} -> {:ok, zset}
+      :missing -> read_legacy_zset(store, key)
+      {:error, _} = err -> err
+    end
+  end
+
+  defp read_compound_zset(store, key) do
+    type_key = CompoundKey.type_key(key)
+    prefix = CompoundKey.zset_prefix(key)
+
+    case Ops.compound_get(store, key, type_key) do
+      "zset" ->
+        {:ok, load_compound_zset(store, key, prefix)}
+
+      nil ->
+        case Ops.compound_scan(store, key, prefix) do
+          [] -> :missing
+          entries -> {:ok, parse_compound_zset(entries)}
+        end
+
+      _other ->
+        {:error, @wrongtype_msg}
+    end
+  end
+
+  defp load_compound_zset(store, key, prefix) do
+    store
+    |> Ops.compound_scan(key, prefix)
+    |> parse_compound_zset()
+  end
+
+  defp parse_compound_zset(entries) do
+    entries
+    |> Enum.map(fn {member, score_str} ->
+      score =
+        case Float.parse(score_str) do
+          {score, ""} -> score
+          _ -> 0.0
+        end
+
+      {score, member}
+    end)
+    |> Enum.sort()
+  end
+
+  defp read_legacy_zset(store, key) do
     case Ops.get(store, key) do
       nil -> {:ok, []}
       value when is_binary(value) -> decode_zset(value)
@@ -309,7 +360,7 @@ defmodule Ferricstore.Commands.Geo do
   defp decode_zset(value) do
     case safe_decode(value) do
       {:zset, list} -> {:ok, list}
-      _ -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+      _ -> {:error, @wrongtype_msg}
     end
   end
 
@@ -320,7 +371,69 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp write_zset(store, key, zset) do
-    Ops.put(store, key, :erlang.term_to_binary({:zset, zset}), 0)
+    with :ok <- ensure_zset_type(store, key) do
+      prefix = CompoundKey.zset_prefix(key)
+      new_members = MapSet.new(Enum.map(zset, fn {_score, member} -> member end))
+
+      store
+      |> Ops.compound_scan(key, prefix)
+      |> Enum.each(fn {member, _score} ->
+        unless MapSet.member?(new_members, member) do
+          Ops.compound_delete(store, key, CompoundKey.zset_member(key, member))
+        end
+      end)
+
+      Enum.each(zset, fn {score, member} ->
+        Ops.compound_put(
+          store,
+          key,
+          CompoundKey.zset_member(key, member),
+          Float.to_string(score),
+          0
+        )
+      end)
+
+      Ops.put(store, key, :erlang.term_to_binary({:zset, zset}), 0)
+    end
+  end
+
+  defp replace_zset(store, key, zset) do
+    delete_key_data(store, key)
+    write_zset(store, key, zset)
+  end
+
+  defp delete_key_data(store, key) do
+    Ops.delete(store, key)
+    TypeRegistry.delete_type(key, store)
+    Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))
+
+    for prefix <- [
+          CompoundKey.hash_prefix(key),
+          CompoundKey.list_prefix(key),
+          CompoundKey.set_prefix(key),
+          CompoundKey.zset_prefix(key)
+        ] do
+      Ops.compound_delete_prefix(store, key, prefix)
+    end
+
+    :ok
+  end
+
+  defp ensure_zset_type(store, key) do
+    case TypeRegistry.check_or_set(key, :zset, store) do
+      :ok ->
+        :ok
+
+      {:error, _} = err ->
+        case read_legacy_zset(store, key) do
+          {:ok, _zset} ->
+            Ops.delete(store, key)
+            TypeRegistry.check_or_set(key, :zset, store)
+
+          _ ->
+            err
+        end
+    end
   end
 
   defp zset_to_member_map(zset) do
@@ -361,9 +474,10 @@ defmodule Ferricstore.Commands.Geo do
       |> Enum.map(fn {member, score} -> {score, member} end)
       |> Enum.sort()
 
-    write_zset(store, key, new_zset)
-
-    if :ch in flags, do: added + changed, else: added
+    case write_zset(store, key, new_zset) do
+      :ok -> if :ch in flags, do: added + changed, else: added
+      {:error, _} = err -> err
+    end
   end
 
   # ===========================================================================
@@ -650,7 +764,7 @@ defmodule Ferricstore.Commands.Geo do
     # Then compare member coordinates directly against the degree-based box.
     # This matches Redis behavior and avoids the haversine center-latitude bug.
     lat_half_deg = height_m / 2.0 / 111_320.0
-    cos_lat = :math.cos(center_lat * :math.pi / 180.0)
+    cos_lat = :math.cos(center_lat * :math.pi() / 180.0)
     lon_half_deg = if cos_lat > 0, do: width_m / 2.0 / (111_320.0 * cos_lat), else: 180.0
 
     abs(lat - center_lat) <= lat_half_deg and abs(lng - center_lng) <= lon_half_deg
