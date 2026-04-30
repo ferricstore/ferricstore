@@ -1,5 +1,7 @@
 defmodule Ferricstore.Commands.Generic do
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+
   @moduledoc """
   Handles Redis generic key commands: TYPE, UNLINK, RENAME, RENAMENX, COPY,
   RANDOMKEY, SCAN, EXPIRETIME, PEXPIRETIME, OBJECT, WAIT.
@@ -199,10 +201,10 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   def handle("EXPIRETIME", [key], store) do
-    case Ops.get_meta(store, key) do
+    case key_meta(store, key) do
       nil -> -2
-      {_value, 0} -> -1
-      {_value, expire_at_ms} -> div(expire_at_ms, 1_000)
+      0 -> -1
+      expire_at_ms -> div(expire_at_ms, 1_000)
     end
   end
 
@@ -215,10 +217,10 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   def handle("PEXPIRETIME", [key], store) do
-    case Ops.get_meta(store, key) do
+    case key_meta(store, key) do
       nil -> -2
-      {_value, 0} -> -1
-      {_value, expire_at_ms} -> expire_at_ms
+      0 -> -1
+      expire_at_ms -> expire_at_ms
     end
   end
 
@@ -251,6 +253,28 @@ defmodule Ferricstore.Commands.Generic do
     {:error, "ERR wrong number of arguments for 'wait' command"}
   end
 
+  defp key_meta(store, key) do
+    case Ops.get_meta(store, key) do
+      nil -> compound_expire_at_ms(store, key)
+      {_value, expire_at_ms} -> expire_at_ms
+    end
+  end
+
+  defp compound_expire_at_ms(store, key) do
+    if Ops.has_compound?(store) do
+      case Ops.compound_get_meta(store, key, CompoundKey.type_key(key)) do
+        nil ->
+          case Ops.compound_get_meta(store, key, CompoundKey.list_meta_key(key)) do
+            nil -> nil
+            {_meta, expire_at_ms} -> expire_at_ms
+          end
+
+        {_type, expire_at_ms} ->
+          expire_at_ms
+      end
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Private -- OBJECT subcommands
   # ---------------------------------------------------------------------------
@@ -258,15 +282,27 @@ defmodule Ferricstore.Commands.Generic do
   defp do_object("ENCODING", [key], store) do
     if Ops.exists?(store, key) do
       case Ferricstore.Store.TypeRegistry.get_type(key, store) do
-        "hash" -> "hashtable"
-        "list" -> "quicklist"
-        "set" -> "hashtable"
-        "zset" -> "skiplist"
-        "stream" -> "stream"
+        "hash" ->
+          "hashtable"
+
+        "list" ->
+          "quicklist"
+
+        "set" ->
+          "hashtable"
+
+        "zset" ->
+          "skiplist"
+
+        "stream" ->
+          "stream"
+
         "string" ->
           value = Ops.get(store, key)
           if value != nil and byte_size(value) <= 44, do: "embstr", else: "raw"
-        _other -> "raw"
+
+        _other ->
+          "raw"
       end
     else
       {:error, "ERR no such key"}
@@ -337,7 +373,8 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_object(subcmd, _rest, _store) do
-    {:error, "ERR unknown subcommand or wrong number of arguments for '#{String.downcase(subcmd)}' command"}
+    {:error,
+     "ERR unknown subcommand or wrong number of arguments for '#{String.downcase(subcmd)}' command"}
   end
 
   # ---------------------------------------------------------------------------

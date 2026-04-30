@@ -1746,16 +1746,14 @@ defmodule FerricStore do
   """
   @spec expire(key(), non_neg_integer()) :: {:ok, boolean()}
   def expire(key, ttl_ms) when is_integer(ttl_ms) and ttl_ms > 0 do
-    ctx = default_ctx()
-
-    case Router.get_meta(ctx, key) do
-      nil ->
-        {:ok, false}
-
-      {value, _old_exp} ->
-        expire_at_ms = HLC.now_ms() + ttl_ms
-        Router.put(ctx, key, value, expire_at_ms)
-        {:ok, true}
+    case Ferricstore.Commands.Expiry.handle(
+           "PEXPIRE",
+           [key, to_string(ttl_ms)],
+           build_compound_store(key)
+         ) do
+      1 -> {:ok, true}
+      0 -> {:ok, false}
+      {:error, _} = err -> err
     end
   end
 
@@ -1784,12 +1782,9 @@ defmodule FerricStore do
   """
   @spec ttl(key()) :: {:ok, non_neg_integer() | nil}
   def ttl(key) do
-    ctx = default_ctx()
-
-    case Router.get_meta(ctx, key) do
-      nil -> {:ok, nil}
-      {_value, 0} -> {:ok, nil}
-      {_value, exp} -> {:ok, max(0, exp - HLC.now_ms())}
+    case Ferricstore.Commands.Expiry.handle("PTTL", [key], build_compound_store(key)) do
+      ttl_ms when ttl_ms < 0 -> {:ok, nil}
+      ttl_ms -> {:ok, ttl_ms}
     end
   end
 
@@ -2046,18 +2041,10 @@ defmodule FerricStore do
   """
   @spec persist(key()) :: {:ok, boolean()}
   def persist(key) do
-    ctx = default_ctx()
-
-    case Router.get_meta(ctx, key) do
-      nil ->
-        {:ok, false}
-
-      {_value, 0} ->
-        {:ok, false}
-
-      {value, _exp} ->
-        Router.put(ctx, key, value, 0)
-        {:ok, true}
+    case Ferricstore.Commands.Expiry.handle("PERSIST", [key], build_compound_store(key)) do
+      1 -> {:ok, true}
+      0 -> {:ok, false}
+      {:error, _} = err -> err
     end
   end
 
@@ -2099,16 +2086,14 @@ defmodule FerricStore do
   """
   @spec expireat(key(), non_neg_integer()) :: {:ok, boolean()}
   def expireat(key, unix_ts_seconds) do
-    ctx = default_ctx()
-
-    case Router.get_meta(ctx, key) do
-      nil ->
-        {:ok, false}
-
-      {value, _old_exp} ->
-        expire_at_ms = unix_ts_seconds * 1_000
-        Router.put(ctx, key, value, expire_at_ms)
-        {:ok, true}
+    case Ferricstore.Commands.Expiry.handle(
+           "EXPIREAT",
+           [key, to_string(unix_ts_seconds)],
+           build_compound_store(key)
+         ) do
+      1 -> {:ok, true}
+      0 -> {:ok, false}
+      {:error, _} = err -> err
     end
   end
 
@@ -2131,15 +2116,14 @@ defmodule FerricStore do
   """
   @spec pexpireat(key(), non_neg_integer()) :: {:ok, boolean()}
   def pexpireat(key, unix_ts_ms) do
-    ctx = default_ctx()
-
-    case Router.get_meta(ctx, key) do
-      nil ->
-        {:ok, false}
-
-      {value, _old_exp} ->
-        Router.put(ctx, key, value, unix_ts_ms)
-        {:ok, true}
+    case Ferricstore.Commands.Expiry.handle(
+           "PEXPIREAT",
+           [key, to_string(unix_ts_ms)],
+           build_compound_store(key)
+         ) do
+      1 -> {:ok, true}
+      0 -> {:ok, false}
+      {:error, _} = err -> err
     end
   end
 
@@ -2168,13 +2152,7 @@ defmodule FerricStore do
   """
   @spec expiretime(key()) :: {:ok, integer()}
   def expiretime(key) do
-    ctx = default_ctx()
-
-    case Router.get_meta(ctx, key) do
-      nil -> {:ok, -2}
-      {_value, 0} -> {:ok, -1}
-      {_value, exp} -> {:ok, div(exp, 1_000)}
-    end
+    {:ok, Ferricstore.Commands.Generic.handle("EXPIRETIME", [key], build_compound_store(key))}
   end
 
   @doc """
@@ -2202,13 +2180,7 @@ defmodule FerricStore do
   """
   @spec pexpiretime(key()) :: {:ok, integer()}
   def pexpiretime(key) do
-    ctx = default_ctx()
-
-    case Router.get_meta(ctx, key) do
-      nil -> {:ok, -2}
-      {_value, 0} -> {:ok, -1}
-      {_value, exp} -> {:ok, exp}
-    end
+    {:ok, Ferricstore.Commands.Generic.handle("PEXPIRETIME", [key], build_compound_store(key))}
   end
 
   @doc """
@@ -5217,6 +5189,9 @@ defmodule FerricStore do
       compound_get: fn redis_key, compound_key ->
         Router.compound_get(ctx, redis_key, compound_key)
       end,
+      compound_get_meta: fn redis_key, compound_key ->
+        Router.compound_get_meta(ctx, redis_key, compound_key)
+      end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
       end,
@@ -5394,6 +5369,9 @@ defmodule FerricStore do
       # local node isn't the leader for this key's shard.
       compound_get: fn redis_key, compound_key ->
         Router.compound_get(ctx, redis_key, compound_key)
+      end,
+      compound_get_meta: fn redis_key, compound_key ->
+        Router.compound_get_meta(ctx, redis_key, compound_key)
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)

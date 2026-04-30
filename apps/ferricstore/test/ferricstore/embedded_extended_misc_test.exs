@@ -158,6 +158,16 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
     test "returns false for nonexistent key" do
       assert {:ok, false} = FerricStore.persist("per:missing")
     end
+
+    test "removes TTL from hash key" do
+      assert :ok = FerricStore.hset("per:hash", %{"f" => "v"})
+      assert {:ok, true} = FerricStore.expire("per:hash", 60_000)
+      assert {:ok, ms} = FerricStore.ttl("per:hash")
+      assert is_integer(ms) and ms > 0
+      assert {:ok, true} = FerricStore.persist("per:hash")
+      assert {:ok, nil} = FerricStore.ttl("per:hash")
+      assert {:ok, "v"} = FerricStore.hget("per:hash", "f")
+    end
   end
 
   describe "pexpire/2" do
@@ -166,6 +176,16 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
       assert {:ok, true} = FerricStore.pexpire("pex:key", 30_000)
       assert {:ok, ms} = FerricStore.ttl("pex:key")
       assert is_integer(ms) and ms > 0 and ms <= 30_000
+    end
+
+    test "sets TTL on list key and expiry removes the list" do
+      assert {:ok, 1} = FerricStore.rpush("pex:list", ["v"])
+      assert {:ok, true} = FerricStore.pexpire("pex:list", 200)
+      assert {:ok, ms} = FerricStore.ttl("pex:list")
+      assert is_integer(ms) and ms > 0 and ms <= 200
+      Process.sleep(250)
+      assert {:ok, "none"} = FerricStore.type("pex:list")
+      assert {:ok, 0} = FerricStore.llen("pex:list")
     end
   end
 
@@ -214,6 +234,13 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
     test "returns -2 for nonexistent key" do
       assert {:ok, -2} = FerricStore.expiretime("etime:missing")
     end
+
+    test "returns Unix timestamp for hash key with TTL" do
+      assert :ok = FerricStore.hset("etime:hash", %{"f" => "v"})
+      assert {:ok, true} = FerricStore.expire("etime:hash", 60_000)
+      assert {:ok, ts} = FerricStore.expiretime("etime:hash")
+      assert is_integer(ts) and ts > div(System.os_time(:millisecond), 1_000)
+    end
   end
 
   describe "pexpiretime/1" do
@@ -232,6 +259,13 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
 
     test "returns -2 for nonexistent key" do
       assert {:ok, -2} = FerricStore.pexpiretime("petime:missing")
+    end
+
+    test "returns Unix timestamp in milliseconds for hash key with TTL" do
+      assert :ok = FerricStore.hset("petime:hash", %{"f" => "v"})
+      assert {:ok, true} = FerricStore.expire("petime:hash", 60_000)
+      assert {:ok, ts_ms} = FerricStore.pexpiretime("petime:hash")
+      assert is_integer(ts_ms) and ts_ms > System.os_time(:millisecond)
     end
   end
 

@@ -1,5 +1,6 @@
 defmodule Ferricstore.Commands.Expiry do
   alias Ferricstore.CommandTime
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
 
   @moduledoc """
@@ -173,24 +174,35 @@ defmodule Ferricstore.Commands.Expiry do
   # ---------------------------------------------------------------------------
 
   defp delete_if_exists(key, store) do
-    case Ops.get_meta(store, key) do
+    case key_meta(key, store) do
       nil ->
         0
 
-      _ ->
+      {:plain, _value, _expire_at_ms} ->
         Ops.delete(store, key)
         1
+
+      {:compound, _type, _expire_at_ms} ->
+        Ferricstore.Commands.Strings.handle("DEL", [key], store)
     end
   end
 
   defp apply_expiry(key, expire_at_ms, flag, store) do
-    case Ops.get_meta(store, key) do
+    case key_meta(key, store) do
       nil ->
         0
 
-      {value, old_exp} ->
+      {:plain, value, old_exp} ->
         if flag_allows?(flag, old_exp, expire_at_ms) do
           Ops.put(store, key, value, expire_at_ms)
+          1
+        else
+          0
+        end
+
+      {:compound, type, old_exp} ->
+        if flag_allows?(flag, old_exp, expire_at_ms) do
+          expire_compound_key(key, type, expire_at_ms, store)
           1
         else
           0
@@ -225,18 +237,18 @@ defmodule Ferricstore.Commands.Expiry do
   # ---------------------------------------------------------------------------
 
   defp get_ttl_seconds(key, store) do
-    case Ops.get_meta(store, key) do
+    case key_meta(key, store) do
       nil -> -2
-      {_, 0} -> -1
-      {_, exp} -> max(0, div(exp - CommandTime.now_ms(), 1_000))
+      {_kind, _value_or_type, 0} -> -1
+      {_kind, _value_or_type, exp} -> max(0, div(exp - CommandTime.now_ms(), 1_000))
     end
   end
 
   defp get_ttl_ms(key, store) do
-    case Ops.get_meta(store, key) do
+    case key_meta(key, store) do
       nil -> -2
-      {_, 0} -> -1
-      {_, exp} -> max(0, exp - CommandTime.now_ms())
+      {_kind, _value_or_type, 0} -> -1
+      {_kind, _value_or_type, exp} -> max(0, exp - CommandTime.now_ms())
     end
   end
 
@@ -245,16 +257,80 @@ defmodule Ferricstore.Commands.Expiry do
   # ---------------------------------------------------------------------------
 
   defp do_persist(key, store) do
-    case Ops.get_meta(store, key) do
+    case key_meta(key, store) do
       nil ->
         0
 
-      {_, 0} ->
+      {_kind, _value_or_type, 0} ->
         0
 
-      {value, _exp} ->
+      {:plain, value, _exp} ->
         Ops.put(store, key, value, 0)
         1
+
+      {:compound, type, _exp} ->
+        expire_compound_key(key, type, 0, store)
+        1
     end
+  end
+
+  defp key_meta(key, store) do
+    case Ops.get_meta(store, key) do
+      nil -> compound_meta(key, store)
+      {value, expire_at_ms} -> {:plain, value, expire_at_ms}
+    end
+  end
+
+  defp compound_meta(key, store) do
+    if Ops.has_compound?(store) do
+      type_key = CompoundKey.type_key(key)
+
+      case Ops.compound_get_meta(store, key, type_key) do
+        nil ->
+          list_meta_key = CompoundKey.list_meta_key(key)
+
+          case Ops.compound_get_meta(store, key, list_meta_key) do
+            nil -> nil
+            {_meta, expire_at_ms} -> {:compound, "list", expire_at_ms}
+          end
+
+        {type, expire_at_ms} ->
+          {:compound, type, expire_at_ms}
+      end
+    end
+  end
+
+  defp expire_compound_key(key, type, expire_at_ms, store) do
+    type_key = CompoundKey.type_key(key)
+    Ops.compound_put(store, key, type_key, type, expire_at_ms)
+
+    if type == "list" do
+      list_meta_key = CompoundKey.list_meta_key(key)
+
+      case Ops.compound_get(store, key, list_meta_key) do
+        nil -> :ok
+        meta -> Ops.compound_put(store, key, list_meta_key, meta, expire_at_ms)
+      end
+    end
+
+    type
+    |> compound_prefix(key)
+    |> expire_compound_entries(key, expire_at_ms, store)
+  end
+
+  defp compound_prefix("hash", key), do: CompoundKey.hash_prefix(key)
+  defp compound_prefix("list", key), do: CompoundKey.list_prefix(key)
+  defp compound_prefix("set", key), do: CompoundKey.set_prefix(key)
+  defp compound_prefix("zset", key), do: CompoundKey.zset_prefix(key)
+
+  defp expire_compound_entries(prefix, key, expire_at_ms, store) do
+    store
+    |> Ops.compound_scan(key, prefix)
+    |> Enum.each(fn {sub_key, value} ->
+      compound_key =
+        if String.starts_with?(sub_key, prefix), do: sub_key, else: prefix <> sub_key
+
+      Ops.compound_put(store, key, compound_key, value, expire_at_ms)
+    end)
   end
 end
