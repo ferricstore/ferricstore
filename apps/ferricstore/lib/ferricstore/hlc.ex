@@ -82,34 +82,34 @@ defmodule Ferricstore.HLC do
     * **TTL expiry**: second-granularity TTLs are unaffected by 150ms drift.
     * **Cross-shard WATCH**: uses value hashing, not timestamps.
 
-  ### Per-command HLC stamping (not wired up)
+  ### Per-command HLC stamping
 
-  The state machine can handle commands wrapped as
-  `{inner_command, %{hlc_ts: {physical_ms, logical}}}`. When `apply/3`
+  Raft write paths stamp commands before submission via
+  `Ferricstore.Raft.CommandClock`. The state machine handles commands wrapped
+  as `{inner_command, %{hlc_ts: {physical_ms, logical}}}`. When `apply/3`
   processes a wrapped command, it calls `update/1` to merge the leader's
-  clock into the follower's HLC. This gives per-command causal sync (~0ms
-  drift) instead of heartbeat-level sync (~150ms drift).
+  clock into the follower's HLC and uses the stamped physical millisecond
+  for TTL and lock expiry decisions. This gives deterministic per-command
+  causal time instead of follower-local apply time.
 
-  **Nothing sends wrapped commands today.** Enable if any of these arise:
+  This is important for:
 
     1. **Sub-second TTLs with cross-node reads** — a key with `PX 100`
        (100ms TTL) could appear alive on one node and expired on another
-       within the 150ms drift window.
+       if followers used local apply time.
     2. **Cross-node causal ordering** — if a feature needs "write A
        happened-before write B" guarantees across nodes beyond Raft log
        ordering (e.g., conflict resolution in multi-leader setups).
     3. **Observed drift exceeding 500ms** — if heartbeat intervals increase
        due to network issues or overloaded nodes.
 
-  To enable, stamp commands in `Router.raft_write/4` before submitting:
+  Submit commands through `Ferricstore.Raft.CommandClock`:
 
-      stamped = {command, %{hlc_ts: HLC.now()}}
-      :ra.process_command(shard_id, stamped, opts)
+      Ferricstore.Raft.CommandClock.process_command(shard_id, command)
+      Ferricstore.Raft.CommandClock.pipeline_command(shard_id, command, corr, :normal)
 
-  Cost: ~50ns per write (`now/0` on leader) + one `update/1` GenServer
-  call per follower during `apply/3`. CockroachDB and YugabyteDB stamp
-  every RPC and consider the cost negligible. Redis and Kvrocks do not
-  have cross-node transactions or HLC.
+  Cost: one lock-free HLC stamp on submit plus one `update/1` merge per
+  follower during `apply/3`.
 
   ## Graceful fallback
 

@@ -99,6 +99,7 @@ defmodule Ferricstore.Raft.Batcher do
 
   alias Ferricstore.ErrorReasons
   alias Ferricstore.NamespaceConfig
+  alias Ferricstore.Raft.CommandClock
 
   @default_max_batch_size 50_000
 
@@ -1061,8 +1062,7 @@ defmodule Ferricstore.Raft.Batcher do
   defp pipeline_submit(state, [single_cmd], froms) do
     corr = make_ref()
     started_at = System.monotonic_time()
-    bin = :erlang.term_to_binary(single_cmd)
-    serialized = {:ttb, bin}
+    {:ttb, bin} = serialized = CommandClock.to_ttb(single_cmd)
     submit_result = :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
 
     emit_quorum_submit_telemetry(
@@ -1082,8 +1082,7 @@ defmodule Ferricstore.Raft.Batcher do
   defp pipeline_submit(state, batch, froms) do
     corr = make_ref()
     started_at = System.monotonic_time()
-    bin = :erlang.term_to_binary({:batch, batch})
-    serialized = {:ttb, bin}
+    {:ttb, bin} = serialized = CommandClock.to_ttb({:batch, batch})
     submit_result = :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
 
     emit_quorum_submit_telemetry(
@@ -1155,7 +1154,7 @@ defmodule Ferricstore.Raft.Batcher do
   # at 0 for the first submission.
   defp submit_async_with_retry(state, wrapped_batch, target, retry_count) do
     corr = make_ref()
-    serialized = {:ttb, :erlang.term_to_binary({:batch, wrapped_batch})}
+    serialized = CommandClock.to_ttb({:batch, wrapped_batch})
     :ra.pipeline_command(target, serialized, corr, :normal)
 
     entry = {[], :async_no_reply, wrapped_batch, retry_count, System.monotonic_time()}

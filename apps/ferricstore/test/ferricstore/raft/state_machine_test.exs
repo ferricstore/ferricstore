@@ -119,6 +119,33 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert [] == :ets.lookup(ets, "meta_time_locked")
     end
 
+    test "prefers stamped command HLC over raft meta system_time", %{
+      state: state,
+      ets: ets
+    } do
+      local_now = Ferricstore.HLC.now_ms()
+      meta_now = local_now - 30_000
+      hlc_now = meta_now + 20_000
+      lock_expires_between_meta_and_hlc = meta_now + 10_000
+
+      locked_state = %{
+        state
+        | cross_shard_locks: %{
+            "hlc_time_locked" => {make_ref(), lock_expires_between_meta_and_hlc}
+          }
+      }
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{system_time: meta_now},
+          {{:put, "hlc_time_locked", "value", 0}, %{hlc_ts: {hlc_now, 0}}},
+          locked_state
+        )
+
+      assert :ok = result
+      assert [{"hlc_time_locked", "value", 0, _, _, _, _}] = :ets.lookup(ets, "hlc_time_locked")
+    end
+
     test "uses raft meta system_time when acquiring cross-shard locks", %{state: state} do
       local_now = Ferricstore.HLC.now_ms()
       apply_now = local_now - 20_000

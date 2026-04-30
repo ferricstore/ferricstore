@@ -29,15 +29,16 @@ defmodule Ferricstore.Raft.StateMachine do
 
   ## HLC piggybacking (spec 2G.6)
 
-  HLC timestamps are piggybacked on Raft commands. The `Batcher` stamps each
-  command with the leader's current HLC timestamp before submitting it to ra.
+  HLC timestamps are piggybacked on Raft commands. Raft submit paths stamp each
+  log entry with the leader's current HLC timestamp before submitting it to ra.
   When `apply/3` processes a command carrying an `hlc_ts` metadata map, it
-  calls `HLC.update/1` to merge the leader's clock into the local node's HLC.
+  calls `HLC.update/1` to merge the leader's clock into the local node's HLC
+  and uses the stamped physical millisecond for TTL and lock expiry decisions.
 
   In single-node mode this merge is a no-op (the node merges its own
   timestamp). In multi-node clusters, followers use this to stay
-  causally synchronized with the leader's clock, bounding inter-node TTL
-  precision to Raft heartbeat RTT (~10 ms).
+  causally synchronized with the leader's clock while applying the same
+  command timestamp as every other replica.
 
   Commands may arrive in two forms:
 
@@ -866,9 +867,10 @@ defmodule Ferricstore.Raft.StateMachine do
     bump_applied(meta, state, result)
   end
 
-  def apply(meta, {inner_command, %{hlc_ts: remote_ts}}, state) when is_tuple(inner_command) do
+  def apply(meta, {inner_command, %{hlc_ts: {physical_ms, _logical} = remote_ts}}, state)
+      when is_tuple(inner_command) and is_integer(physical_ms) do
     merge_hlc(remote_ts)
-    __MODULE__.apply(meta, inner_command, state)
+    __MODULE__.apply(Map.put(meta, :system_time, physical_ms), inner_command, state)
   end
 
   # Catch-all: unknown commands should not crash the ra state machine.

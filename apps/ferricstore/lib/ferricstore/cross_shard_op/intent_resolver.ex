@@ -18,6 +18,7 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
 
   alias Ferricstore.HLC
   alias Ferricstore.Raft.Cluster
+  alias Ferricstore.Raft.CommandClock
   alias Ferricstore.Store.Router
 
   @stale_threshold_ms 10_000
@@ -48,7 +49,7 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
   def resolve_shard_intents(shard_idx) do
     shard_id = Cluster.shard_server_id(shard_idx)
 
-    case :ra.process_command(shard_id, {:get_intents}) do
+    case CommandClock.process_command(shard_id, {:get_intents}) do
       {:ok, {:applied_at, _idx, intents}, _} when is_map(intents) and map_size(intents) > 0 ->
         Enum.each(intents, fn {owner_ref, intent} ->
           resolve_single_intent(shard_idx, owner_ref, intent)
@@ -86,7 +87,7 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
 
       if should_cleanup do
         shard_id = Cluster.shard_server_id(shard_idx)
-        :ra.process_command(shard_id, {:delete_intent, owner_ref})
+        CommandClock.process_command(shard_id, {:delete_intent, owner_ref})
 
         # Also unlock any keys associated with this intent on their respective shards
         unlock_intent_keys(keys_map, owner_ref)
@@ -127,7 +128,7 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
       ctx = FerricStore.Instance.get(:default)
       shard_idx = Router.shard_for(ctx, key)
       shard_id = Cluster.shard_server_id(shard_idx)
-      :ra.process_command(shard_id, {:unlock_keys, [key], owner_ref})
+      CommandClock.process_command(shard_id, {:unlock_keys, [key], owner_ref})
     end)
   end
 

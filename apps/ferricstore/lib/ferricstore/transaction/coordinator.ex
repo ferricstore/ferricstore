@@ -19,6 +19,7 @@ defmodule Ferricstore.Transaction.Coordinator do
   caused by unrelated writes to the same shard (the old shard-version approach).
   """
 
+  alias Ferricstore.Raft.CommandClock
   alias Ferricstore.Store.Router
 
   @spec execute([{binary(), [binary()]}], %{binary() => non_neg_integer()}, binary() | nil) ::
@@ -73,7 +74,7 @@ defmodule Ferricstore.Transaction.Coordinator do
     corr = make_ref()
 
     try do
-      case :ra.pipeline_command(shard_id, command, corr, :normal) do
+      case CommandClock.pipeline_command(shard_id, command, corr, :normal) do
         :ok ->
           case wait_for_ra_result(corr, shard_id, anchor_idx, command) do
             {:ok, shard_results} ->
@@ -145,7 +146,7 @@ defmodule Ferricstore.Transaction.Coordinator do
 
         retry_corr = make_ref()
 
-        case :ra.pipeline_command(leader, command, retry_corr, :normal) do
+        case CommandClock.pipeline_command(leader, command, retry_corr, :normal) do
           :ok ->
             wait_for_ra_result(retry_corr, leader, idx, command)
 
@@ -271,6 +272,7 @@ defmodule Ferricstore.Transaction.Coordinator do
 
   defp watches_clean?(watched) do
     ctx = FerricStore.Instance.get(:default)
+
     Enum.all?(watched, fn {key, saved_hash} ->
       try do
         :erlang.phash2(Router.get(ctx, key)) == saved_hash
@@ -279,5 +281,4 @@ defmodule Ferricstore.Transaction.Coordinator do
       end
     end)
   end
-
 end
