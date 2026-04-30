@@ -42,6 +42,7 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
   alias Ferricstore.Commands.Bloom
   alias Ferricstore.Commands.Cuckoo
   alias Ferricstore.Commands.CMS
+  alias Ferricstore.Commands.Strings
   alias Ferricstore.Commands.TopK
   alias Ferricstore.Test.MockStore
 
@@ -759,6 +760,44 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
       :ok = CMS.handle("CMS.INITBYDIM", ["mykey", "100", "5"], store)
 
       assert {:error, "WRONGTYPE" <> _} = TopK.handle("TOPK.ADD", ["mykey", "elem"], store)
+    end
+  end
+
+  describe "DEL removes probabilistic files" do
+    test "DEL removes a Bloom key so reads no longer see the old NIF file" do
+      store = MockStore.make()
+      assert 1 = Bloom.handle("BF.ADD", ["mykey", "elem"], store)
+
+      assert 1 = Strings.handle("DEL", ["mykey"], store)
+      assert 0 = Bloom.handle("BF.EXISTS", ["mykey", "elem"], store)
+    end
+
+    test "DEL removes a Cuckoo key so reads no longer see the old NIF file" do
+      store = MockStore.make()
+      assert 1 = Cuckoo.handle("CF.ADD", ["mykey", "elem"], store)
+
+      assert 1 = Strings.handle("DEL", ["mykey"], store)
+      assert 0 = Cuckoo.handle("CF.EXISTS", ["mykey", "elem"], store)
+    end
+
+    test "DEL removes a CMS key so queries no longer see the old NIF file" do
+      store = MockStore.make()
+      assert :ok = CMS.handle("CMS.INITBYDIM", ["mykey", "100", "5"], store)
+      assert [3] = CMS.handle("CMS.INCRBY", ["mykey", "elem", "3"], store)
+
+      assert 1 = Strings.handle("DEL", ["mykey"], store)
+      assert {:error, msg} = CMS.handle("CMS.QUERY", ["mykey", "elem"], store)
+      assert msg =~ "does not exist"
+    end
+
+    test "DEL removes a TopK key so reads no longer see the old NIF file" do
+      store = MockStore.make()
+      assert :ok = TopK.handle("TOPK.RESERVE", ["mykey", "5"], store)
+      assert [nil] = TopK.handle("TOPK.ADD", ["mykey", "elem"], store)
+
+      assert 1 = Strings.handle("DEL", ["mykey"], store)
+      assert {:error, msg} = TopK.handle("TOPK.INFO", ["mykey"], store)
+      assert msg =~ "does not exist"
     end
   end
 

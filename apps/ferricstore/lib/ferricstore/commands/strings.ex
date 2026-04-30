@@ -1,6 +1,7 @@
 # Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Strings do
   alias Ferricstore.CommandTime
+  alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TopK}
   alias Ferricstore.CrossShardOp
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
@@ -919,6 +920,7 @@ defmodule Ferricstore.Commands.Strings do
             true
           else
             if Ops.exists?(store, key) do
+              maybe_delete_prob_file(key, store)
               Ops.delete(store, key)
               true
             else
@@ -965,6 +967,47 @@ defmodule Ferricstore.Commands.Strings do
       end
     end
   end
+
+  defp maybe_delete_prob_file(_key, %FerricStore.Instance{}), do: :ok
+  defp maybe_delete_prob_file(_key, %Ferricstore.Store.LocalTxStore{}), do: :ok
+  defp maybe_delete_prob_file(_key, %{prob_write: write_fn}) when is_function(write_fn), do: :ok
+
+  defp maybe_delete_prob_file(key, store) when is_map(store) do
+    case prob_type(key, store) do
+      :bloom -> Bloom.nif_delete(key, store)
+      :cms -> CMS.nif_delete(key, store)
+      :cuckoo -> Cuckoo.nif_delete(key, store)
+      :topk -> TopK.nif_delete(key, store)
+      nil -> :ok
+    end
+  end
+
+  defp maybe_delete_prob_file(_key, _store), do: :ok
+
+  defp prob_type(key, store) do
+    store
+    |> Ops.get(key)
+    |> decode_prob_meta()
+  rescue
+    _ -> nil
+  end
+
+  defp decode_prob_meta(value) when is_binary(value) do
+    try do
+      value
+      |> :erlang.binary_to_term()
+      |> decode_prob_meta()
+    rescue
+      _ -> nil
+    end
+  end
+
+  defp decode_prob_meta({:bloom_meta, _}), do: :bloom
+  defp decode_prob_meta({:cms_meta, _}), do: :cms
+  defp decode_prob_meta({:cuckoo_meta, _}), do: :cuckoo
+  defp decode_prob_meta({:topk_meta, _}), do: :topk
+  defp decode_prob_meta({:topk_path, _}), do: :topk
+  defp decode_prob_meta(_), do: nil
 
   defp maybe_delete_stream_key(key, store) do
     prefix = stream_prefix(key)
