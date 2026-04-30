@@ -30,6 +30,10 @@ defmodule Ferricstore.Commands.Hash do
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.TypeRegistry
 
+  @max_int64 9_223_372_036_854_775_807
+  @min_int64 -9_223_372_036_854_775_808
+  @overflow_error "ERR increment or decrement would overflow"
+
   @doc """
   Handles a hash command.
 
@@ -721,9 +725,14 @@ defmodule Ferricstore.Commands.Hash do
 
     case parse_integer_value(current) do
       {:ok, current_int} ->
-        new_val = current_int + increment
-        Ops.compound_put(store, key, compound_key, Integer.to_string(new_val), 0)
-        new_val
+        case checked_integer_add(current_int, increment) do
+          {:ok, new_val} ->
+            Ops.compound_put(store, key, compound_key, Integer.to_string(new_val), 0)
+            new_val
+
+          :overflow ->
+            {:error, @overflow_error}
+        end
 
       :error ->
         {:error, "ERR hash value is not an integer"}
@@ -774,6 +783,16 @@ defmodule Ferricstore.Commands.Hash do
     case Integer.parse(str) do
       {int, ""} -> {:ok, int}
       _ -> :error
+    end
+  end
+
+  defp checked_integer_add(value, increment) do
+    result = value + increment
+
+    if result > @max_int64 or result < @min_int64 do
+      :overflow
+    else
+      {:ok, result}
     end
   end
 

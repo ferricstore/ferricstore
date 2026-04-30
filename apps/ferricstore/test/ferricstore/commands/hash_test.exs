@@ -282,10 +282,51 @@ defmodule Ferricstore.Commands.HashTest do
       assert "5" == Hash.handle("HGET", ["hash", "counter"], store)
     end
 
+    test "HINCRBY allows exact int64 boundaries for missing fields" do
+      store = MockStore.make()
+
+      assert 9_223_372_036_854_775_807 ==
+               Hash.handle("HINCRBY", ["hash", "max", "9223372036854775807"], store)
+
+      assert -9_223_372_036_854_775_808 ==
+               Hash.handle("HINCRBY", ["hash", "min", "-9223372036854775808"], store)
+    end
+
+    test "HINCRBY errors when increment exceeds int64 bounds and leaves field missing" do
+      store = MockStore.make()
+
+      assert {:error, "ERR increment or decrement would overflow"} =
+               Hash.handle("HINCRBY", ["hash", "counter", "9223372036854775808"], store)
+
+      assert nil == Hash.handle("HGET", ["hash", "counter"], store)
+    end
+
     test "HINCRBY with negative increment decrements" do
       store = MockStore.make()
       Hash.handle("HSET", ["hash", "counter", "10"], store)
       assert 7 == Hash.handle("HINCRBY", ["hash", "counter", "-3"], store)
+    end
+
+    test "HINCRBY errors when result exceeds max int64 and leaves field unchanged" do
+      store = MockStore.make()
+      max_minus_one = "9223372036854775806"
+      Hash.handle("HSET", ["hash", "counter", max_minus_one], store)
+
+      assert {:error, "ERR increment or decrement would overflow"} =
+               Hash.handle("HINCRBY", ["hash", "counter", "2"], store)
+
+      assert max_minus_one == Hash.handle("HGET", ["hash", "counter"], store)
+    end
+
+    test "HINCRBY errors when result is below min int64 and leaves field unchanged" do
+      store = MockStore.make()
+      min_plus_one = "-9223372036854775807"
+      Hash.handle("HSET", ["hash", "counter", min_plus_one], store)
+
+      assert {:error, "ERR increment or decrement would overflow"} =
+               Hash.handle("HINCRBY", ["hash", "counter", "-2"], store)
+
+      assert min_plus_one == Hash.handle("HGET", ["hash", "counter"], store)
     end
 
     test "HINCRBY on non-integer field returns error" do
