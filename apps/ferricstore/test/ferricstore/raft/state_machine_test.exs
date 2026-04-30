@@ -249,6 +249,80 @@ defmodule Ferricstore.Raft.StateMachineTest do
         )
     end
 
+    test "stamped ratelimit ignores legacy embedded now_ms", %{
+      state: state,
+      ets: ets
+    } do
+      local_now = Ferricstore.HLC.now_ms()
+      stamped_now = local_now - 30_000
+      embedded_now = local_now + 30_000
+      window_ms = 10_000
+
+      {_new_state, ["allowed", 1, 9, ^window_ms]} =
+        StateMachine.apply(
+          %{system_time: local_now},
+          {{:ratelimit_add, "stamped_ratelimit", window_ms, 10, 1, embedded_now},
+           %{hlc_ts: {stamped_now, 0}}},
+          state
+        )
+
+      expected_expire_at_ms = stamped_now + window_ms * 2
+
+      assert [{"stamped_ratelimit", encoded, ^expected_expire_at_ms, _, _, _, _}] =
+               :ets.lookup(ets, "stamped_ratelimit")
+
+      assert {1, ^stamped_now, 0} = Ferricstore.Store.ValueCodec.decode_ratelimit(encoded)
+    end
+
+    test "stamped batch ratelimit ignores legacy embedded now_ms", %{
+      state: state,
+      ets: ets
+    } do
+      local_now = Ferricstore.HLC.now_ms()
+      stamped_now = local_now - 30_000
+      embedded_now = local_now + 30_000
+      window_ms = 10_000
+
+      {_new_state, {:ok, [["allowed", 1, 9, ^window_ms]]}} =
+        StateMachine.apply(
+          %{system_time: local_now},
+          {{:batch,
+            [{:ratelimit_add, "batch_stamped_ratelimit", window_ms, 10, 1, embedded_now}]},
+           %{hlc_ts: {stamped_now, 0}}},
+          state
+        )
+
+      expected_expire_at_ms = stamped_now + window_ms * 2
+
+      assert [{"batch_stamped_ratelimit", encoded, ^expected_expire_at_ms, _, _, _, _}] =
+               :ets.lookup(ets, "batch_stamped_ratelimit")
+
+      assert {1, ^stamped_now, 0} = Ferricstore.Store.ValueCodec.decode_ratelimit(encoded)
+    end
+
+    test "legacy unwrapped ratelimit keeps embedded now_ms for replay compatibility", %{
+      state: state,
+      ets: ets
+    } do
+      local_now = Ferricstore.HLC.now_ms()
+      embedded_now = local_now - 30_000
+      window_ms = 10_000
+
+      {_new_state, ["allowed", 1, 9, ^window_ms]} =
+        StateMachine.apply(
+          %{},
+          {:ratelimit_add, "legacy_ratelimit", window_ms, 10, 1, embedded_now},
+          state
+        )
+
+      expected_expire_at_ms = embedded_now + window_ms * 2
+
+      assert [{"legacy_ratelimit", encoded, ^expected_expire_at_ms, _, _, _, _}] =
+               :ets.lookup(ets, "legacy_ratelimit")
+
+      assert {1, ^embedded_now, 0} = Ferricstore.Store.ValueCodec.decode_ratelimit(encoded)
+    end
+
     test "uses raft meta system_time when acquiring cross-shard locks", %{state: state} do
       local_now = Ferricstore.HLC.now_ms()
       apply_now = local_now - 20_000

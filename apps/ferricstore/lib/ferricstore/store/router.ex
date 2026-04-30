@@ -258,6 +258,7 @@ defmodule Ferricstore.Store.Router do
   def always_quorum?({:lock, _, _, _}), do: true
   def always_quorum?({:unlock, _, _}), do: true
   def always_quorum?({:extend, _, _, _}), do: true
+  def always_quorum?({:ratelimit_add, _, _, _, _}), do: true
   def always_quorum?({:ratelimit_add, _, _, _, _, _}), do: true
 
   # Probabilistic structures: results (e.g., Bloom "was it new?", TopK
@@ -2023,13 +2024,11 @@ defmodule Ferricstore.Store.Router do
           pos_integer()
         ) :: [term()]
   def ratelimit_add(ctx, key, window_ms, max, count) do
-    now_ms = HLC.now_ms()
-
     raft_write(
       ctx,
       shard_for(ctx, key),
       key,
-      {:ratelimit_add, key, window_ms, max, count, now_ms}
+      {:ratelimit_add, key, window_ms, max, count}
     )
   end
 

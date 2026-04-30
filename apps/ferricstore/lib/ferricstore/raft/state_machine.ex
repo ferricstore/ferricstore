@@ -571,7 +571,9 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
-  # 6-tuple variant: shard pre-computes now_ms for deterministic replay.
+  # Legacy 6-tuple variant: older submitters embedded now_ms before commands
+  # were HLC-stamped at the Raft boundary. Stamped wrappers normalize this back
+  # to the 5-tuple so the single log-entry timestamp wins.
   def apply(meta, {:ratelimit_add, key, window_ms, max, count, now_ms}, state) do
     apply_pending_with_time(meta, state, fn ->
       do_ratelimit_add(state, key, window_ms, max, count, now_ms)
@@ -872,7 +874,12 @@ defmodule Ferricstore.Raft.StateMachine do
   def apply(meta, {inner_command, %{hlc_ts: {physical_ms, _logical} = remote_ts}}, state)
       when is_tuple(inner_command) and is_integer(physical_ms) do
     merge_hlc(remote_ts)
-    __MODULE__.apply(Map.put(meta, :system_time, physical_ms), inner_command, state)
+
+    __MODULE__.apply(
+      Map.put(meta, :system_time, physical_ms),
+      normalize_stamped_command(inner_command),
+      state
+    )
   end
 
   # Catch-all: unknown commands should not crash the ra state machine.
@@ -1985,6 +1992,20 @@ defmodule Ferricstore.Raft.StateMachine do
       NIF.topk_file_incrby_v2(path, pairs)
     end)
   end
+
+  defp normalize_stamped_command({:ratelimit_add, key, window_ms, max, count, _legacy_now_ms}) do
+    {:ratelimit_add, key, window_ms, max, count}
+  end
+
+  defp normalize_stamped_command({:batch, commands}) when is_list(commands) do
+    {:batch, Enum.map(commands, &normalize_stamped_command/1)}
+  end
+
+  defp normalize_stamped_command({:async, command}) do
+    {:async, normalize_stamped_command(command)}
+  end
+
+  defp normalize_stamped_command(command), do: command
 
   # Wraps a block of state machine operations with batched disk writes.
   # Initializes the pending-writes buffer, runs the block, then flushes
