@@ -1083,8 +1083,10 @@ defmodule Ferricstore.Commands.Stream do
             if rem(length(field_values), 2) != 0 do
               {:error, "ERR wrong number of arguments for 'xadd' command"}
             else
-              id_spec = parse_id_spec(id_spec_str)
-              {:ok, key, id_spec, field_values, trim_opts, nomkstream}
+              case parse_id_spec(id_spec_str) do
+                {:error, _} = err -> err
+                id_spec -> {:ok, key, id_spec, field_values, trim_opts, nomkstream}
+              end
             end
 
           _ ->
@@ -1098,10 +1100,22 @@ defmodule Ferricstore.Commands.Stream do
   defp parse_id_spec(id_str) do
     case String.split(id_str, "-", parts: 2) do
       [ms_str, seq_str] ->
-        {:explicit, String.to_integer(ms_str), String.to_integer(seq_str)}
+        with {:ok, ms} <- parse_id_component(ms_str),
+             {:ok, seq} <- parse_id_component(seq_str) do
+          {:explicit, ms, seq}
+        end
 
       [ms_str] ->
-        {:partial, String.to_integer(ms_str)}
+        with {:ok, ms} <- parse_id_component(ms_str) do
+          {:partial, ms}
+        end
+    end
+  end
+
+  defp parse_id_component(value) do
+    case Integer.parse(value) do
+      {int, ""} when int >= 0 -> {:ok, int}
+      _ -> {:error, "ERR Invalid stream ID specified as stream command argument"}
     end
   end
 

@@ -71,6 +71,16 @@ defmodule Ferricstore.Commands.StreamTest do
       assert id == "100-0"
     end
 
+    test "XADD with malformed explicit ID returns error" do
+      store = MockStore.make()
+      key = ustream()
+
+      for bad_id <- ["abc-def", "abc", "123-abc", "1-2-3"] do
+        assert {:error, msg} = Stream.handle("XADD", [key, bad_id, "f", "v"], store)
+        assert msg =~ "Invalid stream ID"
+      end
+    end
+
     test "XADD with explicit ID must be greater than last" do
       store = MockStore.make()
       key = ustream()
