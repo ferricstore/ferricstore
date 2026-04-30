@@ -57,7 +57,12 @@ defmodule Ferricstore.Commands.Bitmap do
          {:ok, offset} <- parse_non_negative_integer(offset_str, "bit offset"),
          :ok <- check_bit_offset(offset),
          {:ok, bit_val} <- parse_bit_value(bit_str) do
-      current = Ops.get(store, key) || <<>>
+      {current, expire_at_ms} =
+        case Ops.get_meta(store, key) do
+          nil -> {<<>>, 0}
+          {value, exp} -> {value, exp}
+        end
+
       byte_index = div(offset, 8)
       # Extend the binary with zero bytes if needed
       extended = extend_binary(current, byte_index + 1)
@@ -78,7 +83,7 @@ defmodule Ferricstore.Commands.Bitmap do
       <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
       new_value = <<prefix::binary, new_byte::8, suffix::binary>>
 
-      Ops.put(store, key, new_value, 0)
+      Ops.put(store, key, new_value, expire_at_ms)
       old_bit
     end
   end

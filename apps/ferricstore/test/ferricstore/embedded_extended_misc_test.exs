@@ -361,6 +361,17 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
       assert {:ok, 0} = FerricStore.getbit("bit:prev", 7)
     end
 
+    test "setbit preserves existing TTL" do
+      assert :ok = FerricStore.set("bit:ttl", <<0>>, ttl: 60_000)
+      assert {:ok, before_ms} = FerricStore.ttl("bit:ttl")
+      assert is_integer(before_ms) and before_ms > 0
+
+      assert {:ok, 0} = FerricStore.setbit("bit:ttl", 0, 1)
+
+      assert {:ok, after_ms} = FerricStore.ttl("bit:ttl")
+      assert is_integer(after_ms) and after_ms > 0 and after_ms <= before_ms
+    end
+
     test "setbit and getbit return WRONGTYPE for hash key" do
       assert :ok = FerricStore.hset("bit:hash", %{"field" => "old"})
       assert {:error, "WRONGTYPE" <> _} = FerricStore.setbit("bit:hash", 7, 1)

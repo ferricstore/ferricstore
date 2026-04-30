@@ -25,6 +25,14 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert <<0>> == store.get.("mykey")
     end
 
+    test "preserves existing TTL" do
+      future = System.os_time(:millisecond) + 60_000
+      store = MockStore.make(%{"mykey" => {<<0>>, future}})
+
+      assert 0 == Bitmap.handle("SETBIT", ["mykey", "0", "1"], store)
+      assert {<<128>>, ^future} = store.get_meta.("mykey")
+    end
+
     test "returns 0 when setting a bit that was already 0" do
       store = MockStore.make(%{"mykey" => {<<0>>, 0}})
       assert 0 == Bitmap.handle("SETBIT", ["mykey", "0", "1"], store)
@@ -343,31 +351,34 @@ defmodule Ferricstore.Commands.BitmapTest do
 
   describe "BITOP AND" do
     test "two keys with same length" do
-      store = MockStore.make(%{
-        "a" => {<<0xFF, 0x0F>>, 0},
-        "b" => {<<0x0F, 0xFF>>, 0}
-      })
+      store =
+        MockStore.make(%{
+          "a" => {<<0xFF, 0x0F>>, 0},
+          "b" => {<<0x0F, 0xFF>>, 0}
+        })
 
       assert 2 == Bitmap.handle("BITOP", ["AND", "dest", "a", "b"], store)
       assert <<0x0F, 0x0F>> == store.get.("dest")
     end
 
     test "three keys" do
-      store = MockStore.make(%{
-        "a" => {<<0xFF>>, 0},
-        "b" => {<<0x0F>>, 0},
-        "c" => {<<0x03>>, 0}
-      })
+      store =
+        MockStore.make(%{
+          "a" => {<<0xFF>>, 0},
+          "b" => {<<0x0F>>, 0},
+          "c" => {<<0x03>>, 0}
+        })
 
       assert 1 == Bitmap.handle("BITOP", ["AND", "dest", "a", "b", "c"], store)
       assert <<0x03>> == store.get.("dest")
     end
 
     test "with different-length strings (zero padding)" do
-      store = MockStore.make(%{
-        "a" => {<<0xFF, 0xFF>>, 0},
-        "b" => {<<0xFF>>, 0}
-      })
+      store =
+        MockStore.make(%{
+          "a" => {<<0xFF, 0xFF>>, 0},
+          "b" => {<<0xFF>>, 0}
+        })
 
       # b is padded with 0x00 -> AND with 0xFF gives 0x00 for byte 1
       assert 2 == Bitmap.handle("BITOP", ["AND", "dest", "a", "b"], store)
@@ -377,20 +388,22 @@ defmodule Ferricstore.Commands.BitmapTest do
 
   describe "BITOP OR" do
     test "two keys" do
-      store = MockStore.make(%{
-        "a" => {<<0xF0, 0x00>>, 0},
-        "b" => {<<0x0F, 0x00>>, 0}
-      })
+      store =
+        MockStore.make(%{
+          "a" => {<<0xF0, 0x00>>, 0},
+          "b" => {<<0x0F, 0x00>>, 0}
+        })
 
       assert 2 == Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
       assert <<0xFF, 0x00>> == store.get.("dest")
     end
 
     test "with different-length strings" do
-      store = MockStore.make(%{
-        "a" => {<<0xF0>>, 0},
-        "b" => {<<0x0F, 0xAA>>, 0}
-      })
+      store =
+        MockStore.make(%{
+          "a" => {<<0xF0>>, 0},
+          "b" => {<<0x0F, 0xAA>>, 0}
+        })
 
       # a is padded: <<0xF0, 0x00>>, b: <<0x0F, 0xAA>>
       # OR: <<0xFF, 0xAA>>
@@ -401,19 +414,21 @@ defmodule Ferricstore.Commands.BitmapTest do
 
   describe "BITOP XOR" do
     test "two keys" do
-      store = MockStore.make(%{
-        "a" => {<<0xFF, 0x00>>, 0},
-        "b" => {<<0xFF, 0xFF>>, 0}
-      })
+      store =
+        MockStore.make(%{
+          "a" => {<<0xFF, 0x00>>, 0},
+          "b" => {<<0xFF, 0xFF>>, 0}
+        })
 
       assert 2 == Bitmap.handle("BITOP", ["XOR", "dest", "a", "b"], store)
       assert <<0x00, 0xFF>> == store.get.("dest")
     end
 
     test "XOR with itself produces zeros" do
-      store = MockStore.make(%{
-        "a" => {<<0xAB, 0xCD>>, 0}
-      })
+      store =
+        MockStore.make(%{
+          "a" => {<<0xAB, 0xCD>>, 0}
+        })
 
       assert 2 == Bitmap.handle("BITOP", ["XOR", "dest", "a", "a"], store)
       assert <<0x00, 0x00>> == store.get.("dest")
@@ -434,10 +449,11 @@ defmodule Ferricstore.Commands.BitmapTest do
     end
 
     test "error with multiple source keys" do
-      store = MockStore.make(%{
-        "a" => {<<0xFF>>, 0},
-        "b" => {<<0x00>>, 0}
-      })
+      store =
+        MockStore.make(%{
+          "a" => {<<0xFF>>, 0},
+          "b" => {<<0x00>>, 0}
+        })
 
       assert {:error, msg} = Bitmap.handle("BITOP", ["NOT", "dest", "a", "b"], store)
       assert msg =~ "BITOP NOT requires one and only one key"
@@ -459,19 +475,21 @@ defmodule Ferricstore.Commands.BitmapTest do
     end
 
     test "returns result length" do
-      store = MockStore.make(%{
-        "a" => {<<0xFF, 0xFF, 0xFF>>, 0},
-        "b" => {<<0x00>>, 0}
-      })
+      store =
+        MockStore.make(%{
+          "a" => {<<0xFF, 0xFF, 0xFF>>, 0},
+          "b" => {<<0x00>>, 0}
+        })
 
       assert 3 == Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
     end
 
     test "case insensitive operation name" do
-      store = MockStore.make(%{
-        "a" => {<<0xFF>>, 0},
-        "b" => {<<0x0F>>, 0}
-      })
+      store =
+        MockStore.make(%{
+          "a" => {<<0xFF>>, 0},
+          "b" => {<<0x0F>>, 0}
+        })
 
       assert 1 == Bitmap.handle("BITOP", ["and", "dest", "a", "b"], store)
       assert <<0x0F>> == store.get.("dest")
@@ -608,10 +626,12 @@ defmodule Ferricstore.Commands.BitmapTest do
     end
 
     test "BITOP with lowercase operation" do
-      store = MockStore.make(%{
-        "a" => {<<0xFF>>, 0},
-        "b" => {<<0x0F>>, 0}
-      })
+      store =
+        MockStore.make(%{
+          "a" => {<<0xFF>>, 0},
+          "b" => {<<0x0F>>, 0}
+        })
+
       assert 1 == Bitmap.handle("BITOP", ["xor", "dest", "a", "b"], store)
       assert <<0xF0>> == store.get.("dest")
     end
@@ -661,10 +681,11 @@ defmodule Ferricstore.Commands.BitmapTest do
     end
 
     test "BITOP result can be read with GETBIT" do
-      store = MockStore.make(%{
-        "a" => {<<0xF0>>, 0},
-        "b" => {<<0x0F>>, 0}
-      })
+      store =
+        MockStore.make(%{
+          "a" => {<<0xF0>>, 0},
+          "b" => {<<0x0F>>, 0}
+        })
 
       Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
       # dest should be 0xFF — all bits set
