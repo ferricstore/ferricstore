@@ -155,12 +155,12 @@ defmodule Ferricstore.Commands.Strings do
   # INCR / DECR / INCRBY / DECRBY
   # ---------------------------------------------------------------------------
 
-  def handle("INCR", [key], store), do: Ops.incr(store, key, 1)
+  def handle("INCR", [key], store), do: incr_string_key(key, 1, store)
 
   def handle("INCR", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'incr' command"}
 
-  def handle("DECR", [key], store), do: Ops.incr(store, key, -1)
+  def handle("DECR", [key], store), do: incr_string_key(key, -1, store)
 
   def handle("DECR", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'decr' command"}
@@ -172,7 +172,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("INCRBY", [key, delta_str], store) do
     case Integer.parse(delta_str) do
       {delta, ""} when delta >= @min_int64 and delta <= @max_int64 ->
-        Ops.incr(store, key, delta)
+        incr_string_key(key, delta, store)
 
       {_delta, ""} ->
         {:error, "ERR value is not an integer or out of range"}
@@ -188,7 +188,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("DECRBY", [key, delta_str], store) do
     case Integer.parse(delta_str) do
       {delta, ""} when delta >= @min_int64 and delta <= @max_int64 ->
-        Ops.incr(store, key, -delta)
+        incr_string_key(key, -delta, store)
 
       {_delta, ""} ->
         {:error, "ERR value is not an integer or out of range"}
@@ -208,7 +208,13 @@ defmodule Ferricstore.Commands.Strings do
   def handle("INCRBYFLOAT", [key, delta_str], store) do
     case parse_float_arg(delta_str) do
       {:ok, delta} ->
-        case Ops.incr_float(store, key, delta) do
+        incr_result =
+          case ensure_string_key(key, store) do
+            :ok -> Ops.incr_float(store, key, delta)
+            @wrongtype_error -> @wrongtype_error
+          end
+
+        case incr_result do
           {:ok, new_val} when is_float(new_val) ->
             Ferricstore.Store.ValueCodec.format_float(new_val)
 
@@ -250,11 +256,10 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
 
   def handle("STRLEN", [key], store) do
-    case Ops.get(store, key) do
-      nil -> 0
-      v when is_integer(v) -> byte_size(Integer.to_string(v))
-      v when is_float(v) -> byte_size(Float.to_string(v))
-      v -> byte_size(v)
+    case read_string_value(key, store) do
+      :missing -> 0
+      @wrongtype_error -> @wrongtype_error
+      {:value, v} -> string_value_size(v)
     end
   end
 
@@ -265,7 +270,12 @@ defmodule Ferricstore.Commands.Strings do
   # GETSET (deprecated but supported)
   # ---------------------------------------------------------------------------
 
-  def handle("GETSET", [key, value], store), do: Ops.getset(store, key, value)
+  def handle("GETSET", [key, value], store) do
+    case ensure_string_key(key, store) do
+      :ok -> Ops.getset(store, key, value)
+      @wrongtype_error -> @wrongtype_error
+    end
+  end
 
   def handle("GETSET", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'getset' command"}
@@ -274,7 +284,12 @@ defmodule Ferricstore.Commands.Strings do
   # GETDEL
   # ---------------------------------------------------------------------------
 
-  def handle("GETDEL", [key], store), do: Ops.getdel(store, key)
+  def handle("GETDEL", [key], store) do
+    case ensure_string_key(key, store) do
+      :ok -> Ops.getdel(store, key)
+      @wrongtype_error -> @wrongtype_error
+    end
+  end
 
   def handle("GETDEL", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'getdel' command"}
@@ -366,11 +381,12 @@ defmodule Ferricstore.Commands.Strings do
   def handle("GETRANGE", [key, start_str, end_str], store) do
     with {start_idx, ""} <- Integer.parse(start_str),
          {end_idx, ""} <- Integer.parse(end_str) do
-      case Ops.get(store, key) do
-        nil -> ""
-        v when is_integer(v) -> do_getrange(Integer.to_string(v), start_idx, end_idx)
-        v when is_float(v) -> do_getrange(Float.to_string(v), start_idx, end_idx)
-        value -> do_getrange(value, start_idx, end_idx)
+      case read_string_value(key, store) do
+        :missing -> ""
+        @wrongtype_error -> @wrongtype_error
+        {:value, v} when is_integer(v) -> do_getrange(Integer.to_string(v), start_idx, end_idx)
+        {:value, v} when is_float(v) -> do_getrange(Float.to_string(v), start_idx, end_idx)
+        {:value, value} -> do_getrange(value, start_idx, end_idx)
       end
     else
       _ -> {:error, "ERR value is not an integer or out of range"}
@@ -390,8 +406,14 @@ defmodule Ferricstore.Commands.Strings do
   def handle("SETRANGE", [key, offset_str, value], store) do
     case Integer.parse(offset_str) do
       {offset, ""} when offset >= 0 and offset <= @max_setrange_offset ->
-        {:ok, new_len} = Ops.setrange(store, key, offset, value)
-        new_len
+        case ensure_string_key(key, store) do
+          :ok ->
+            {:ok, new_len} = Ops.setrange(store, key, offset, value)
+            new_len
+
+          @wrongtype_error ->
+            @wrongtype_error
+        end
 
       {offset, ""} when offset > @max_setrange_offset ->
         {:error, "ERR string exceeds maximum allowed size (512MB)"}
@@ -450,6 +472,13 @@ defmodule Ferricstore.Commands.Strings do
 
       {:error, _} = err ->
         err
+    end
+  end
+
+  defp incr_string_key(key, delta, store) do
+    case ensure_string_key(key, store) do
+      :ok -> Ops.incr(store, key, delta)
+      @wrongtype_error -> @wrongtype_error
     end
   end
 
@@ -706,7 +735,9 @@ defmodule Ferricstore.Commands.Strings do
   defp msetnx_any_exists?([], _store), do: false
 
   defp msetnx_any_exists?([k, _v | rest], store) do
-    if Ops.exists?(store, k), do: true, else: msetnx_any_exists?(rest, store)
+    if Ops.exists?(store, k) or compound_data_structure_key?(k, store),
+      do: true,
+      else: msetnx_any_exists?(rest, store)
   end
 
   # Extracts keys from a flat [k, v, k, v, ...] list.
@@ -744,6 +775,10 @@ defmodule Ferricstore.Commands.Strings do
       _ -> :ok
     end
   end
+
+  defp string_value_size(value) when is_integer(value), do: byte_size(Integer.to_string(value))
+  defp string_value_size(value) when is_float(value), do: byte_size(Float.to_string(value))
+  defp string_value_size(value), do: byte_size(value)
 
   defp compound_data_structure_key?(key, store) do
     Ops.has_compound?(store) and

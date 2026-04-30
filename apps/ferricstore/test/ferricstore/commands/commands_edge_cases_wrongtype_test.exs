@@ -77,6 +77,41 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
       assert {:error, "WRONGTYPE" <> _} = Strings.handle("APPEND", ["mykey", "suffix"], store)
       assert store.get.("mykey") == nil
     end
+
+    test "read-only string commands on hash key return WRONGTYPE", %{store: store} do
+      assert {:error, "WRONGTYPE" <> _} = Strings.handle("STRLEN", ["mykey"], store)
+      assert {:error, "WRONGTYPE" <> _} = Strings.handle("GETRANGE", ["mykey", "0", "-1"], store)
+    end
+
+    test "mutating string commands on hash key return WRONGTYPE and do not create a string", %{
+      store: store
+    } do
+      assert {:error, "WRONGTYPE" <> _} = Strings.handle("GETSET", ["mykey", "overwrite"], store)
+      assert {:error, "WRONGTYPE" <> _} = Strings.handle("GETDEL", ["mykey"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               Strings.handle("SETRANGE", ["mykey", "0", "overwrite"], store)
+
+      assert store.get.("mykey") == nil
+      assert store.compound_get.("mykey", "T:mykey") == "hash"
+    end
+
+    test "numeric string commands on hash key return WRONGTYPE and do not create a string", %{
+      store: store
+    } do
+      assert {:error, "WRONGTYPE" <> _} = Strings.handle("INCR", ["mykey"], store)
+      assert {:error, "WRONGTYPE" <> _} = Strings.handle("DECR", ["mykey"], store)
+      assert {:error, "WRONGTYPE" <> _} = Strings.handle("INCRBY", ["mykey", "2"], store)
+      assert {:error, "WRONGTYPE" <> _} = Strings.handle("DECRBY", ["mykey", "2"], store)
+      assert {:error, "WRONGTYPE" <> _} = Strings.handle("INCRBYFLOAT", ["mykey", "1.5"], store)
+      assert store.get.("mykey") == nil
+    end
+
+    test "MSETNX treats compound type metadata as existing", %{store: store} do
+      assert 0 = Strings.handle("MSETNX", ["other", "value", "mykey", "overwrite"], store)
+      assert store.get.("other") == nil
+      assert store.get.("mykey") == nil
+    end
   end
 
   describe "WRONGTYPE enforcement: HSET on string key" do
