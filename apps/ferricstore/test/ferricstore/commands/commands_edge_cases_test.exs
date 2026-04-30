@@ -118,15 +118,14 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
   # ===========================================================================
 
   describe "integer overflow edge cases" do
-    test "INCR on max int64 value continues without overflow in Elixir (bignum)" do
-      # In Redis, INCR on max int64 returns an error. In Elixir, integers are
-      # arbitrary precision, so this will succeed with a value beyond int64.
-      # The MockStore uses Elixir integers, so it does not enforce int64 bounds.
+    test "INCR on max int64 value returns overflow and leaves value unchanged" do
       max_int64 = 9_223_372_036_854_775_807
       store = MockStore.make(%{"k" => {Integer.to_string(max_int64), 0}})
-      result = Strings.handle("INCR", ["k"], store)
-      assert {:ok, value} = result
-      assert value == max_int64 + 1
+
+      assert {:error, "ERR increment or decrement would overflow"} =
+               Strings.handle("INCR", ["k"], store)
+
+      assert Integer.to_string(max_int64) == store.get.("k")
     end
 
     test "DECRBY with large negative amount on zero" do
@@ -137,12 +136,14 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
       assert value == -large_amount
     end
 
-    test "INCRBY with max int64 on max int64 value" do
+    test "INCRBY with max int64 on max int64 value returns overflow and leaves value unchanged" do
       max_int64 = 9_223_372_036_854_775_807
       store = MockStore.make(%{"k" => {Integer.to_string(max_int64), 0}})
-      result = Strings.handle("INCRBY", ["k", Integer.to_string(max_int64)], store)
-      assert {:ok, value} = result
-      assert value == max_int64 * 2
+
+      assert {:error, "ERR increment or decrement would overflow"} =
+               Strings.handle("INCRBY", ["k", Integer.to_string(max_int64)], store)
+
+      assert Integer.to_string(max_int64) == store.get.("k")
     end
 
     test "INCRBYFLOAT precision with very small increment" do
@@ -168,11 +169,14 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
       assert value == min_int64 + 1
     end
 
-    test "DECR on min int64 value decrements past the boundary" do
+    test "DECR on min int64 value returns overflow and leaves value unchanged" do
       min_int64 = -9_223_372_036_854_775_808
       store = MockStore.make(%{"k" => {Integer.to_string(min_int64), 0}})
-      assert {:ok, value} = Strings.handle("DECR", ["k"], store)
-      assert value == min_int64 - 1
+
+      assert {:error, "ERR increment or decrement would overflow"} =
+               Strings.handle("DECR", ["k"], store)
+
+      assert Integer.to_string(min_int64) == store.get.("k")
     end
   end
 

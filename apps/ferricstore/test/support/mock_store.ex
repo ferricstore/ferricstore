@@ -1,6 +1,10 @@
 defmodule Ferricstore.Test.MockStore do
   @moduledoc false
 
+  @max_int64 9_223_372_036_854_775_807
+  @min_int64 -9_223_372_036_854_775_808
+  @overflow_error "ERR increment or decrement would overflow"
+
   @doc """
   Creates an in-process mock store backed by an Agent.
 
@@ -108,21 +112,36 @@ defmodule Ferricstore.Test.MockStore do
         Agent.get_and_update(pid, fn state ->
           case Map.get(state, key) do
             nil ->
-              new_val = delta
-              new_state = Map.put(state, key, {Integer.to_string(new_val), 0})
-              {{:ok, new_val}, new_state}
+              case Ferricstore.Test.MockStore.checked_integer_add(0, delta) do
+                {:ok, new_val} ->
+                  new_state = Map.put(state, key, {Integer.to_string(new_val), 0})
+                  {{:ok, new_val}, new_state}
+
+                :overflow ->
+                  {{:error, @overflow_error}, state}
+              end
 
             {value, exp} ->
               if exp != 0 and not Ferricstore.Test.MockStore.alive?(exp) do
-                new_val = delta
-                new_state = Map.put(state, key, {Integer.to_string(new_val), 0})
-                {{:ok, new_val}, new_state}
+                case Ferricstore.Test.MockStore.checked_integer_add(0, delta) do
+                  {:ok, new_val} ->
+                    new_state = Map.put(state, key, {Integer.to_string(new_val), 0})
+                    {{:ok, new_val}, new_state}
+
+                  :overflow ->
+                    {{:error, @overflow_error}, state}
+                end
               else
                 case Integer.parse(value) do
                   {int_val, ""} ->
-                    new_val = int_val + delta
-                    new_state = Map.put(state, key, {Integer.to_string(new_val), exp})
-                    {{:ok, new_val}, new_state}
+                    case Ferricstore.Test.MockStore.checked_integer_add(int_val, delta) do
+                      {:ok, new_val} ->
+                        new_state = Map.put(state, key, {Integer.to_string(new_val), exp})
+                        {{:ok, new_val}, new_state}
+
+                      :overflow ->
+                        {{:error, @overflow_error}, state}
+                    end
 
                   _ ->
                     {{:error, "ERR value is not an integer or out of range"}, state}
@@ -315,6 +334,17 @@ defmodule Ferricstore.Test.MockStore do
   # Public so anonymous functions passed to Agent can use it.
   @doc false
   def alive?(exp), do: exp > System.os_time(:millisecond)
+
+  @doc false
+  def checked_integer_add(value, delta) do
+    result = value + delta
+
+    if result > @max_int64 or result < @min_int64 do
+      :overflow
+    else
+      {:ok, result}
+    end
+  end
 
   @doc false
   def fmt_float(f) when is_float(f),

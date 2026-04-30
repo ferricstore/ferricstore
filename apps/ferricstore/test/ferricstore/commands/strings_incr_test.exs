@@ -188,6 +188,15 @@ defmodule Ferricstore.Commands.StringsIncrTest do
       store = MockStore.make()
       assert {:ok, 1_000_000} = Strings.handle("INCRBY", ["k", "1000000"], store)
     end
+
+    test "INCRBY errors when result exceeds max int64 and leaves value unchanged" do
+      store = MockStore.make(%{"k" => {"9223372036854775806", 0}})
+
+      assert {:error, "ERR increment or decrement would overflow"} =
+               Strings.handle("INCRBY", ["k", "2"], store)
+
+      assert "9223372036854775806" == store.get.("k")
+    end
   end
 
   # ===========================================================================
@@ -224,6 +233,24 @@ defmodule Ferricstore.Commands.StringsIncrTest do
       store = MockStore.make()
       assert {:error, _} = Strings.handle("DECRBY", [], store)
       assert {:error, _} = Strings.handle("DECRBY", ["k"], store)
+    end
+
+    test "DECRBY errors when result is below min int64 and leaves value unchanged" do
+      store = MockStore.make(%{"k" => {"-9223372036854775807", 0}})
+
+      assert {:error, "ERR increment or decrement would overflow"} =
+               Strings.handle("DECRBY", ["k", "2"], store)
+
+      assert "-9223372036854775807" == store.get.("k")
+    end
+
+    test "DECRBY errors when negating min int64 delta would overflow" do
+      store = MockStore.make(%{"k" => {"0", 0}})
+
+      assert {:error, "ERR increment or decrement would overflow"} =
+               Strings.handle("DECRBY", ["k", "-9223372036854775808"], store)
+
+      assert "0" == store.get.("k")
     end
   end
 

@@ -18,6 +18,9 @@ defmodule Ferricstore.Store.Ops do
   alias Ferricstore.Store.Shard.Writes, as: ShardWrites
 
   @typep store :: FerricStore.Instance.t() | LocalTxStore.t() | map()
+  @max_int64 9_223_372_036_854_775_807
+  @min_int64 -9_223_372_036_854_775_808
+  @overflow_error "ERR increment or decrement would overflow"
 
   # --- Basic key operations ---
 
@@ -147,17 +150,28 @@ defmodule Ferricstore.Store.Ops do
 
       case current do
         nil ->
-          ShardETS.ets_insert(tx.shard_state, key, delta, 0)
-          send(self(), {:tx_pending_write, key, delta, 0})
-          {:ok, delta}
+          case checked_integer_add(0, delta) do
+            {:ok, new_val} ->
+              ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
+              send(self(), {:tx_pending_write, key, new_val, 0})
+              {:ok, new_val}
+
+            :overflow ->
+              {:error, @overflow_error}
+          end
 
         value ->
           case ShardETS.coerce_integer(value) do
             {:ok, int_val} ->
-              new_val = int_val + delta
-              ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
-              send(self(), {:tx_pending_write, key, new_val, 0})
-              {:ok, new_val}
+              case checked_integer_add(int_val, delta) do
+                {:ok, new_val} ->
+                  ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
+                  send(self(), {:tx_pending_write, key, new_val, 0})
+                  {:ok, new_val}
+
+                :overflow ->
+                  {:error, @overflow_error}
+              end
 
             :error ->
               {:error, "ERR value is not an integer or out of range"}
@@ -169,6 +183,16 @@ defmodule Ferricstore.Store.Ops do
   end
 
   def incr(store, key, delta) when is_map(store), do: store.incr.(key, delta)
+
+  defp checked_integer_add(value, delta) do
+    result = value + delta
+
+    if result > @max_int64 or result < @min_int64 do
+      :overflow
+    else
+      {:ok, result}
+    end
+  end
 
   @spec incr_float(store(), binary(), float()) :: {:ok, binary()} | {:error, binary()}
   def incr_float(%FerricStore.Instance{} = ctx, key, delta), do: Router.incr_float(ctx, key, delta)
