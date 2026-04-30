@@ -34,7 +34,7 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
     test "does not overwrite existing destination without replace" do
       FerricStore.set("cp:s2", "src_val")
       FerricStore.set("cp:d2", "dst_val")
-      assert {:error, _} = FerricStore.copy("cp:s2", "cp:d2")
+      assert {:ok, false} = FerricStore.copy("cp:s2", "cp:d2")
       assert {:ok, "dst_val"} = FerricStore.get("cp:d2")
     end
 

@@ -1810,7 +1810,7 @@ defmodule FerricStore do
       {:ok, true}
 
       iex> FerricStore.copy("user:42:name", "user:42:name:backup")
-      {:error, "ERR target key already exists"}
+      {:ok, false}
 
       iex> FerricStore.copy("user:42:name", "user:42:name:backup", replace: true)
       {:ok, true}
@@ -1819,13 +1819,14 @@ defmodule FerricStore do
       {:error, "ERR no such key"}
 
   """
-  @spec copy(key(), key(), keyword()) :: {:ok, true} | {:error, binary()}
+  @spec copy(key(), key(), keyword()) :: {:ok, boolean()} | {:error, binary()}
   def copy(source, destination, opts \\ []) do
     replace = Keyword.get(opts, :replace, false)
     args = [source, destination] ++ if replace, do: ["REPLACE"], else: []
 
     case Ferricstore.Commands.Generic.handle("COPY", args, build_compound_store(source)) do
       1 -> {:ok, true}
+      0 -> {:ok, false}
       {:error, _} = err -> err
     end
   end

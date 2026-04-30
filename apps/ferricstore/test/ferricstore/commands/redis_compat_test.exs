@@ -193,13 +193,14 @@ defmodule Ferricstore.Commands.RedisCompatTest do
       assert "hello" = Strings.handle("GET", ["src"], store)
     end
 
-    test "COPY without REPLACE on existing destination returns error" do
+    test "COPY without REPLACE on existing destination returns 0" do
       store = MockStore.make()
       Strings.handle("SET", ["src", "hello"], store)
       Strings.handle("SET", ["dst", "world"], store)
 
       result = Generic.handle("COPY", ["src", "dst"], store)
-      assert {:error, _} = result
+      assert 0 = result
+      assert "world" = Strings.handle("GET", ["dst"], store)
     end
 
     test "COPY with REPLACE overwrites destination" do

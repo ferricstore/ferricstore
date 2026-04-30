@@ -419,7 +419,7 @@ defmodule Ferricstore.Commands.Generic do
 
       entry ->
         if not replace? and key_exists?(store, destination) do
-          {:error, "ERR target key already exists"}
+          0
         else
           if source != destination do
             delete_key(destination, store)

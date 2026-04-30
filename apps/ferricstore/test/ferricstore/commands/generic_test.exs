@@ -192,9 +192,9 @@ defmodule Ferricstore.Commands.GenericTest do
       assert src_exp == dst_exp
     end
 
-    test "COPY without REPLACE errors if destination exists" do
+    test "COPY without REPLACE returns 0 if destination exists" do
       store = MockStore.make(%{"src" => {"v1", 0}, "dst" => {"v2", 0}})
-      assert {:error, _} = Generic.handle("COPY", ["src", "dst"], store)
+      assert 0 == Generic.handle("COPY", ["src", "dst"], store)
       assert "v2" == store.get.("dst")
     end
 
@@ -215,9 +215,10 @@ defmodule Ferricstore.Commands.GenericTest do
       assert {:error, "ERR no such key"} = Generic.handle("COPY", ["missing", "dst"], store)
     end
 
-    test "COPY source to itself creates identical key (source preserved)" do
+    test "COPY source to itself without REPLACE returns 0" do
       store = MockStore.make(%{"k" => {"v", 0}})
-      assert {:error, _} = Generic.handle("COPY", ["k", "k"], store)
+      assert 0 == Generic.handle("COPY", ["k", "k"], store)
+      assert "v" == store.get.("k")
     end
 
     test "COPY source to itself with REPLACE succeeds" do
