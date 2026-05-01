@@ -359,6 +359,25 @@ mod integration {
     }
 
     #[test]
+    fn test_backpressure_allows_single_oversized_write_on_empty_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("bp_single_oversized.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let handle = WalHandle::open(path, 0, 0, 100).unwrap();
+        let data = vec![0u8; 101];
+
+        handle.buffer_write(&data).unwrap();
+        assert!(handle.buffer_write(b"x").is_err());
+
+        handle.close().unwrap();
+    }
+
+    #[test]
     fn test_backpressure_zero_byte_write_at_limit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bp_zero.wal").to_str().unwrap().to_string();

@@ -101,7 +101,13 @@ impl WalHandle {
             .lock()
             .map_err(|_| rustler::Error::Term(Box::new("buffer_mutex_poisoned")))?;
 
-        if buf.len() as u64 + data.len() as u64 > self.max_buffer_bytes {
+        let buffered = buf.len() as u64;
+        let incoming = data.len() as u64;
+
+        // A single write larger than the configured limit can never become
+        // acceptable by retrying. Treat the limit as soft only while the buffer
+        // is empty, then apply normal backpressure until the WAL thread drains.
+        if buffered > 0 && buffered + incoming > self.max_buffer_bytes {
             return Err(rustler::Error::Term(Box::new("backpressure")));
         }
 
