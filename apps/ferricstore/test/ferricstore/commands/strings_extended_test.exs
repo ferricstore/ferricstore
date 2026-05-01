@@ -15,6 +15,24 @@ defmodule Ferricstore.Commands.StringsExtendedTest do
   # ===========================================================================
 
   describe "APPEND" do
+    test "native string RMW commands do not pre-read the value for type checks" do
+      store = %{
+        get: fn _key -> flunk("RMW string commands should not pre-read the value") end,
+        compound_get: fn _redis_key, _compound_key -> nil end,
+        append: fn "cold_large", "x" -> {:ok, 10_001} end,
+        getset: fn "cold_large", "new" -> "old" end,
+        getdel: fn "cold_large" -> "old" end,
+        getex: fn "cold_large", 123 -> "old" end,
+        setrange: fn "cold_large", 2, "x" -> {:ok, 10_000} end
+      }
+
+      assert 10_001 == Strings.handle("APPEND", ["cold_large", "x"], store)
+      assert "old" == Strings.handle("GETSET", ["cold_large", "new"], store)
+      assert "old" == Strings.handle("GETDEL", ["cold_large"], store)
+      assert "old" == Strings.handle("GETEX", ["cold_large", "PXAT", "123"], store)
+      assert 10_000 == Strings.handle("SETRANGE", ["cold_large", "2", "x"], store)
+    end
+
     test "APPEND to non-existent key creates it with value" do
       store = MockStore.make()
       assert 5 = Strings.handle("APPEND", ["k", "hello"], store)

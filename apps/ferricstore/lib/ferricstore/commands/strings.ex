@@ -820,10 +820,7 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   defp ensure_string_key(key, store) do
-    case read_string_value(key, store) do
-      @wrongtype_error -> @wrongtype_error
-      _ -> :ok
-    end
+    if compound_data_structure_key?(key, store), do: @wrongtype_error, else: :ok
   end
 
   defp read_string_size(key, store) do
