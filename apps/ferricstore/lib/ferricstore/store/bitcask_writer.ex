@@ -409,6 +409,8 @@ defmodule Ferricstore.Store.BitcaskWriter do
 
     case NIF.v2_append_batch_nosync(path, batch) do
       {:ok, locations} ->
+        mark_checkpoint_dirty(write_entries, shard_index)
+
         # Update ETS entries with real file_id and offset.
         Enum.zip(write_entries, locations)
         |> Enum.each(fn {entry, {offset, _record_size}} ->
@@ -442,21 +444,26 @@ defmodule Ferricstore.Store.BitcaskWriter do
   end
 
   defp flush_tombstone_batch(path, tombstone_entries, shard_index) do
-    Enum.each(tombstone_entries, fn entry ->
-      {instance_ctx, key} = normalize_tombstone_entry(entry)
+    dirty_contexts =
+      Enum.reduce(tombstone_entries, [], fn entry, acc ->
+        {instance_ctx, key} = normalize_tombstone_entry(entry)
 
-      case NIF.v2_append_tombstone(path, key) do
-        {:ok, _} ->
-          :ok
+        case NIF.v2_append_tombstone(path, key) do
+          {:ok, _} ->
+            [instance_ctx | acc]
 
-        {:error, reason} ->
-          set_disk_pressure(instance_ctx, shard_index)
+          {:error, reason} ->
+            set_disk_pressure(instance_ctx, shard_index)
 
-          Logger.error(
-            "BitcaskWriter shard_#{shard_index}: tombstone failed for #{path} key=#{inspect(key)}: #{inspect(reason)}"
-          )
-      end
-    end)
+            Logger.error(
+              "BitcaskWriter shard_#{shard_index}: tombstone failed for #{path} key=#{inspect(key)}: #{inspect(reason)}"
+            )
+
+            acc
+        end
+      end)
+
+    mark_checkpoint_dirty_contexts(dirty_contexts, shard_index)
   end
 
   defp normalize_write_entry({:write, ctx, path, fid, ets, key, value, exp}),
@@ -485,6 +492,31 @@ defmodule Ferricstore.Store.BitcaskWriter do
 
   defp set_disk_pressure(ctx, shard_index),
     do: Ferricstore.Store.DiskPressure.set(ctx, shard_index)
+
+  defp mark_checkpoint_dirty(entries, shard_index) do
+    entries
+    |> Enum.map(fn entry ->
+      {_tag, ctx, _path, _fid, _ets, _key, _value, _exp} = normalize_write_entry(entry)
+      ctx
+    end)
+    |> mark_checkpoint_dirty_contexts(shard_index)
+  end
+
+  defp mark_checkpoint_dirty_contexts(contexts, shard_index) do
+    contexts
+    |> Enum.uniq()
+    |> Enum.each(&mark_checkpoint_dirty_context(&1, shard_index))
+  end
+
+  defp mark_checkpoint_dirty_context(nil, _shard_index), do: :ok
+
+  defp mark_checkpoint_dirty_context(%{checkpoint_flags: flags}, shard_index) do
+    :atomics.put(flags, shard_index + 1, 1)
+  rescue
+    _ -> :ok
+  end
+
+  defp mark_checkpoint_dirty_context(_ctx, _shard_index), do: :ok
 
   defp to_binary(v) when is_binary(v), do: v
   defp to_binary(v) when is_integer(v), do: Integer.to_string(v)

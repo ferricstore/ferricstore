@@ -265,6 +265,68 @@ defmodule Ferricstore.WritePathNosyncTest do
       assert {:ok, ^value} = Ferricstore.Bitcask.NIF.v2_pread_at(path, off)
     end
 
+    test "flush marks the supplied instance shard dirty for the Bitcask checkpointer" do
+      shard_index = 20
+      dir = Path.join(System.tmp_dir!(), "bitcask_writer_checkpoint_#{shard_index}")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "00000.log")
+      File.touch!(path)
+
+      keydir = :ets.new(:"bitcask_writer_checkpoint_#{shard_index}", [:set, :public])
+      ctx = %{checkpoint_flags: :atomics.new(shard_index + 1, signed: false)}
+      key = "writer:checkpoint"
+      value = "checkpoint-me"
+
+      {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
+
+      on_exit(fn ->
+        if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+
+        try do
+          :ets.delete(keydir)
+        rescue
+          ArgumentError -> :ok
+        end
+
+        File.rm_rf(dir)
+      end)
+
+      :ets.insert(keydir, {key, value, 0, Ferricstore.Store.LFU.initial(), :pending, 0, 0})
+      :atomics.put(ctx.checkpoint_flags, shard_index + 1, 0)
+
+      assert :ok = BitcaskWriter.write(ctx, shard_index, path, 0, keydir, key, value, 0)
+      assert :ok = BitcaskWriter.flush(shard_index)
+
+      assert :atomics.get(ctx.checkpoint_flags, shard_index + 1) == 1,
+             "BitcaskWriter nosync append must wake the BitcaskCheckpointer"
+    end
+
+    test "tombstone flush marks the supplied instance shard dirty for the Bitcask checkpointer" do
+      shard_index = 21
+      dir = Path.join(System.tmp_dir!(), "bitcask_writer_tombstone_checkpoint_#{shard_index}")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "00000.log")
+      File.touch!(path)
+
+      ctx = %{checkpoint_flags: :atomics.new(shard_index + 1, signed: false)}
+      key = "writer:tombstone-checkpoint"
+
+      {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
+
+      on_exit(fn ->
+        if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        File.rm_rf(dir)
+      end)
+
+      :atomics.put(ctx.checkpoint_flags, shard_index + 1, 0)
+
+      assert :ok = BitcaskWriter.delete(ctx, shard_index, path, key)
+      assert :ok = BitcaskWriter.flush(shard_index)
+
+      assert :atomics.get(ctx.checkpoint_flags, shard_index + 1) == 1,
+             "BitcaskWriter tombstone append must wake the BitcaskCheckpointer"
+    end
+
     test "failed flush marks the supplied instance under disk pressure" do
       ctx = Ferricstore.Test.IsolatedInstance.checkout()
 
