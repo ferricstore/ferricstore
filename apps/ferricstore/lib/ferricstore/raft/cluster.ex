@@ -154,41 +154,7 @@ defmodule Ferricstore.Raft.Cluster do
         :ok
 
       {:error, reason} ->
-        case start_error_recovery_action(reason) do
-          :same_uid_restart ->
-            :ok
-
-          :fresh_uid_recovery when reason == :not_new ->
-            Logger.info(
-              "Shard #{shard_index}: existing ra state found, deleting and re-joining cluster"
-            )
-
-            _ = :ra.force_delete_server(ra_sys, server_id)
-            Process.sleep(50)
-
-            case :ra.start_server(ra_sys, server_config) do
-              :ok ->
-                Logger.info(
-                  "Shard #{shard_index}: joined cluster with #{length(initial_members)} members"
-                )
-
-                :ok
-
-              {:error, retry_reason} ->
-                case start_error_recovery_action(retry_reason) do
-                  :same_uid_restart ->
-                    :ok
-
-                  :fresh_uid_recovery ->
-                    Logger.error("Shard #{shard_index}: re-join failed: #{inspect(retry_reason)}")
-                    {:error, retry_reason}
-                end
-            end
-
-          :fresh_uid_recovery ->
-            Logger.error("Shard #{shard_index}: failed to join cluster: #{inspect(reason)}")
-            {:error, reason}
-        end
+        handle_join_start_error_action(ra_sys, server_id, shard_index, reason)
     end
   end
 
@@ -377,18 +343,13 @@ defmodule Ferricstore.Raft.Cluster do
         trigger_and_wait(server_id)
 
       {:error, reason} ->
-        case start_error_recovery_action(reason) do
-          :same_uid_restart ->
-            handle_already_started(ra_sys, server_id, server_config, shard_index)
-
-          :fresh_uid_recovery ->
-            handle_start_error(ra_sys, server_id, server_config, shard_index, reason)
-        end
+        handle_start_server_error(ra_sys, server_id, server_config, shard_index, reason)
     end
   end
 
   @doc false
-  @spec start_error_recovery_action(term()) :: :same_uid_restart | :fresh_uid_recovery
+  @spec start_error_recovery_action(term()) ::
+          :same_uid_restart | :existing_state_restart | :fail_closed
   def start_error_recovery_action({:already_started, _pid}) do
     :same_uid_restart
   end
@@ -402,8 +363,12 @@ defmodule Ferricstore.Raft.Cluster do
     :same_uid_restart
   end
 
+  def start_error_recovery_action(:not_new) do
+    :existing_state_restart
+  end
+
   def start_error_recovery_action(_reason) do
-    :fresh_uid_recovery
+    :fail_closed
   end
 
   defp trigger_and_wait(server_id) do
@@ -449,29 +414,53 @@ defmodule Ferricstore.Raft.Cluster do
     end
   end
 
-  defp handle_start_error(ra_sys, server_id, server_config, shard_index, reason) do
-    Logger.warning(
-      "ra server for shard #{shard_index} failed with #{inspect(reason)}, " <>
-        "attempting fresh start with unique UID"
-    )
+  defp handle_start_server_error(ra_sys, server_id, server_config, shard_index, reason) do
+    case start_error_recovery_action(reason) do
+      :same_uid_restart ->
+        handle_already_started(ra_sys, server_id, server_config, shard_index)
 
-    _ = :ra.stop_server(ra_sys, server_id)
-    _ = :ra.force_delete_server(ra_sys, server_id)
+      :existing_state_restart ->
+        restart_existing_server(ra_sys, server_id, shard_index)
 
-    restart_uid = shard_uid(shard_index) <> "_#{System.unique_integer([:positive])}"
-    restart_config = %{server_config | uid: restart_uid, log_init_args: %{uid: restart_uid}}
-
-    case :ra.start_server(ra_sys, restart_config) do
-      :ok ->
-        trigger_and_wait(server_id)
-
-      {:error, retry_reason} = err ->
-        Logger.error(
-          "Failed to start ra server (recovery) for shard #{shard_index}: #{inspect(retry_reason)}"
-        )
-
-        err
+      :fail_closed ->
+        Logger.error("Failed to start ra server for shard #{shard_index}: #{inspect(reason)}")
+        {:error, reason}
     end
+  end
+
+  defp handle_join_start_error_action(ra_sys, server_id, shard_index, reason) do
+    handle_join_start_error_action(
+      ra_sys,
+      server_id,
+      shard_index,
+      reason,
+      start_error_recovery_action(reason)
+    )
+  end
+
+  defp handle_join_start_error_action(
+         _ra_sys,
+         _server_id,
+         _shard_index,
+         _reason,
+         :same_uid_restart
+       ) do
+    :ok
+  end
+
+  defp handle_join_start_error_action(
+         ra_sys,
+         server_id,
+         shard_index,
+         _reason,
+         :existing_state_restart
+       ) do
+    restart_existing_server(ra_sys, server_id, shard_index)
+  end
+
+  defp handle_join_start_error_action(_ra_sys, _server_id, shard_index, reason, :fail_closed) do
+    Logger.error("Shard #{shard_index}: failed to join cluster: #{inspect(reason)}")
+    {:error, reason}
   end
 
   @doc """

@@ -11,6 +11,12 @@ defmodule Ferricstore.Store.ShardLifecycleGuardTest do
     assert tab2list_calls(@lifecycle_path) == []
   end
 
+  test "raft startup errors are not downgraded to direct-write shards" do
+    # If a Batcher exists, the shard is expected to run with Raft. Swallowing a
+    # Ra start error and returning false would silently enable local direct writes.
+    refute File.read!(@lifecycle_path) =~ "_, _ -> false"
+  end
+
   defp tab2list_calls(path) do
     {:ok, ast} =
       path

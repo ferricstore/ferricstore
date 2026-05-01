@@ -137,7 +137,7 @@ defmodule Ferricstore.Application do
     maybe_start_distribution()
 
     # Start the ra system before shards so that Shard.init can start ra servers.
-    Ferricstore.Raft.Cluster.start_system(data_dir)
+    :ok = Ferricstore.Raft.Cluster.start_system(data_dir)
 
     # Build the default instance context. This creates the Instance struct
     # with all refs (atomics, counters, ETS tables) and caches it in

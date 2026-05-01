@@ -389,17 +389,25 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
     if Process.whereis(batcher_name) != nil do
       try do
-        Ferricstore.Raft.Cluster.start_shard_server(
-          index,
-          shard_data_path,
-          active_file_id,
-          active_file_path,
-          ets
-        )
+        case Ferricstore.Raft.Cluster.start_shard_server(
+               index,
+               shard_data_path,
+               active_file_id,
+               active_file_path,
+               ets
+             ) do
+          :ok ->
+            true
 
-        true
+          {:error, reason} ->
+            exit({:raft_start_failed, reason})
+        end
       catch
-        _, _ -> false
+        :exit, {:raft_start_failed, _reason} = start_failure ->
+          exit(start_failure)
+
+        kind, reason ->
+          exit({:raft_start_failed, {kind, reason}})
       end
     else
       false
