@@ -133,7 +133,7 @@ defmodule Ferricstore.Commands.List do
       CrossShardOp.execute(
         [{source, :read_write}, {destination, :write}],
         fn unified_store ->
-          ListOps.execute_lmove(source, destination, unified_store, from_dir, to_dir)
+          checked_lmove(source, destination, unified_store, from_dir, to_dir)
         end,
         store: store,
         intent: %{command: :lmove, keys: %{source: source, dest: destination}}
@@ -198,6 +198,23 @@ defmodule Ferricstore.Commands.List do
       "LEFT" -> {:ok, :left}
       "RIGHT" -> {:ok, :right}
       _ -> :error
+    end
+  end
+
+  defp checked_lmove(source, destination, store, from_dir, to_dir) do
+    with :ok <- TypeRegistry.check_type(source, :list, store) do
+      case ListOps.read_meta(source, store) do
+        nil ->
+          nil
+
+        {0, _, _} ->
+          nil
+
+        _meta ->
+          with :ok <- TypeRegistry.check_or_set(destination, :list, store) do
+            ListOps.execute_lmove(source, destination, store, from_dir, to_dir)
+          end
+      end
     end
   end
 end

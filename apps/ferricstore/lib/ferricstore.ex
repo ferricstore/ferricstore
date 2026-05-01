@@ -2784,9 +2784,11 @@ defmodule FerricStore do
   @spec lmove(key(), key(), :left | :right, :left | :right) :: {:ok, binary() | nil}
   def lmove(source, destination, from_dir, to_dir)
       when from_dir in [:left, :right] and to_dir in [:left, :right] do
-    ctx = default_ctx()
-    result = Router.list_op(ctx, source, {:lmove, destination, from_dir, to_dir})
-    {:ok, result}
+    from = from_dir |> Atom.to_string() |> String.upcase()
+    to = to_dir |> Atom.to_string() |> String.upcase()
+
+    Ferricstore.Commands.List.handle("LMOVE", [source, destination, from, to], %{})
+    |> wrap_result()
   end
 
   @doc """
