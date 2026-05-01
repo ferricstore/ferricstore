@@ -321,7 +321,7 @@ defmodule Ferricstore.Store.Promotion do
             track_binary_delete(keydir, shard_index, key)
             :ets.delete(keydir, key)
 
-          {key, {:live, fid, file_path, offset, _value_size, expire_at_ms}} ->
+          {key, {:live, fid, file_path, offset, value_size, expire_at_ms}} ->
             value =
               case NIF.v2_pread_at(file_path, offset) do
                 {:ok, v} when v != nil -> v
@@ -329,7 +329,11 @@ defmodule Ferricstore.Store.Promotion do
               end
 
             track_binary_insert(keydir, shard_index, key, value)
-            :ets.insert(keydir, {key, value, expire_at_ms, LFU.initial(), fid, offset, 0})
+
+            :ets.insert(
+              keydir,
+              {key, value, expire_at_ms, LFU.initial(), fid, offset, value_size}
+            )
         end)
       else
         # Fallback path: marker exists, dedicated empty. Compound keys

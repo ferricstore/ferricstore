@@ -171,6 +171,31 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
                "after restart, compound #{ckey} vanished"
       end
     end
+
+    test "recovered promoted entries keep value sizes for compaction accounting", ctx do
+      {redis_key, entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
+
+      {:ok, _dedicated_path} =
+        Promotion.promote_collection!(
+          :hash,
+          redis_key,
+          ctx.shard_data_path,
+          ctx.keydir,
+          ctx.data_dir,
+          ctx.shard_index
+        )
+
+      promoted = simulate_restart(ctx)
+
+      for {ckey, value} <- entries do
+        assert [{^ckey, ^value, 0, _lfu, _fid, _off, vsize}] = :ets.lookup(ctx.keydir, ckey)
+        assert vsize == byte_size(value)
+      end
+
+      info = Map.fetch!(promoted, redis_key)
+      assert info.total_bytes > 0
+      assert info.dead_bytes == 0
+    end
   end
 
   describe "dedicated batch failure" do
