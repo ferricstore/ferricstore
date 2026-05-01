@@ -1824,7 +1824,7 @@ defmodule FerricStore do
     replace = Keyword.get(opts, :replace, false)
     args = [source, destination] ++ if replace, do: ["REPLACE"], else: []
 
-    case Ferricstore.Commands.Generic.handle("COPY", args, build_compound_store(source)) do
+    case Ferricstore.Commands.Generic.handle("COPY", args, %{}) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -1857,7 +1857,7 @@ defmodule FerricStore do
     Ferricstore.Commands.Generic.handle(
       "RENAME",
       [source, destination],
-      build_compound_store(source)
+      %{}
     )
   end
 
@@ -1890,7 +1890,7 @@ defmodule FerricStore do
     case Ferricstore.Commands.Generic.handle(
            "RENAMENX",
            [source, destination],
-           build_compound_store(source)
+           %{}
          ) do
       1 -> {:ok, true}
       0 -> {:ok, false}
@@ -3035,8 +3035,7 @@ defmodule FerricStore do
   """
   @spec sdiffstore(key(), [key()]) :: {:ok, non_neg_integer()}
   def sdiffstore(destination, keys) when is_list(keys) do
-    store = build_compound_store(destination)
-    result = Ferricstore.Commands.Set.handle("SDIFFSTORE", [destination | keys], store)
+    result = Ferricstore.Commands.Set.handle("SDIFFSTORE", [destination | keys], %{})
     wrap_result(result)
   end
 
@@ -3056,8 +3055,7 @@ defmodule FerricStore do
   """
   @spec sinterstore(key(), [key()]) :: {:ok, non_neg_integer()}
   def sinterstore(destination, keys) when is_list(keys) do
-    store = build_compound_store(destination)
-    result = Ferricstore.Commands.Set.handle("SINTERSTORE", [destination | keys], store)
+    result = Ferricstore.Commands.Set.handle("SINTERSTORE", [destination | keys], %{})
     wrap_result(result)
   end
 
@@ -3077,8 +3075,7 @@ defmodule FerricStore do
   """
   @spec sunionstore(key(), [key()]) :: {:ok, non_neg_integer()}
   def sunionstore(destination, keys) when is_list(keys) do
-    store = build_compound_store(destination)
-    result = Ferricstore.Commands.Set.handle("SUNIONSTORE", [destination | keys], store)
+    result = Ferricstore.Commands.Set.handle("SUNIONSTORE", [destination | keys], %{})
     wrap_result(result)
   end
 
