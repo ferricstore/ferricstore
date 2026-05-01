@@ -3,6 +3,8 @@ defmodule Ferricstore.Commands.BitmapTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.Bitmap
+  alias Ferricstore.Commands.Set
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -409,6 +411,22 @@ defmodule Ferricstore.Commands.BitmapTest do
       # OR: <<0xFF, 0xAA>>
       assert 2 == Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
       assert <<0xFF, 0xAA>> == store.get.("dest")
+    end
+
+    test "overwrites compound metadata on the destination" do
+      store =
+        MockStore.make(%{
+          "a" => {<<0xF0>>, 0},
+          "b" => {<<0x0F>>, 0}
+        })
+
+      Set.handle("SADD", ["dest", "old-member"], store)
+
+      assert 1 == Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
+      assert <<0xFF>> == store.get.("dest")
+      assert store.compound_get.("dest", CompoundKey.type_key("dest")) == nil
+      assert {:error, message} = Set.handle("SMEMBERS", ["dest"], store)
+      assert message =~ "WRONGTYPE"
     end
   end
 

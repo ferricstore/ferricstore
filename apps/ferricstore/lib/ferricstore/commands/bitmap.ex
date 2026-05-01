@@ -217,6 +217,7 @@ defmodule Ferricstore.Commands.Bitmap do
     op = String.upcase(op_str)
 
     with {:ok, result} <- execute_bitop(op, source_keys, store) do
+      clear_compound_data_structure(destkey, store)
       Ops.put(store, destkey, result, 0)
       byte_size(result)
     end
@@ -287,6 +288,24 @@ defmodule Ferricstore.Commands.Bitmap do
     Ops.has_compound?(store) and
       (Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
          Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil)
+  end
+
+  defp clear_compound_data_structure(key, store) do
+    if Ops.has_compound?(store) do
+      Ops.compound_delete(store, key, CompoundKey.type_key(key))
+      Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))
+
+      for prefix <- [
+            CompoundKey.hash_prefix(key),
+            CompoundKey.list_prefix(key),
+            CompoundKey.set_prefix(key),
+            CompoundKey.zset_prefix(key)
+          ] do
+        Ops.compound_delete_prefix(store, key, prefix)
+      end
+    end
+
+    :ok
   end
 
   # --- Binary manipulation --------------------------------------------------
