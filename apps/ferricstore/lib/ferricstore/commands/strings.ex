@@ -142,7 +142,6 @@ defmodule Ferricstore.Commands.Strings do
       case mset_validate(args) do
         :ok ->
           mset_exec(args, store)
-          :ok
 
         {:error, _} = err ->
           err
@@ -451,8 +450,10 @@ defmodule Ferricstore.Commands.Strings do
           if msetnx_any_exists?(args, unified_store) do
             0
           else
-            mset_exec(args, unified_store)
-            1
+            case mset_exec(args, unified_store) do
+              :ok -> 1
+              {:error, _} = err -> err
+            end
           end
         end,
         intent: %{command: :msetnx, keys: %{targets: keys}},
@@ -773,8 +774,10 @@ defmodule Ferricstore.Commands.Strings do
   defp mset_exec([], _store), do: :ok
 
   defp mset_exec([k, v | rest], store) do
-    replace_string_key(k, v, 0, store)
-    mset_exec(rest, store)
+    case replace_string_key(k, v, 0, store) do
+      :ok -> mset_exec(rest, store)
+      {:error, _} = err -> err
+    end
   end
 
   # Checks if any key in a flat [k, v, k, v, ...] list already exists.

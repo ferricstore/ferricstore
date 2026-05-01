@@ -277,6 +277,15 @@ defmodule Ferricstore.Commands.StringsTest do
       assert {:error, _} = Strings.handle("MSET", [], MockStore.make())
     end
 
+    test "MSET returns put error instead of discarding it" do
+      store =
+        MockStore.make()
+        |> Map.put(:put, fn _key, _value, _expire_at_ms -> {:error, "ERR disk write failed"} end)
+
+      assert {:error, "ERR disk write failed"} =
+               Strings.handle("MSET", ["k1", "v1", "k2", "v2"], store)
+    end
+
     test "MSET with single pair stores the pair" do
       store = MockStore.make()
       assert :ok = Strings.handle("MSET", ["k", "v"], store)
