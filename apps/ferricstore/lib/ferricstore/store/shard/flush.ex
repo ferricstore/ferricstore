@@ -45,7 +45,7 @@ defmodule Ferricstore.Store.Shard.Flush do
           :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 1)
         end
 
-        written = total_written(locations)
+        written = total_record_bytes(batch)
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)
 
@@ -108,7 +108,7 @@ defmodule Ferricstore.Store.Shard.Flush do
           :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 0)
         end
 
-        written = total_written(locations)
+        written = total_record_bytes(batch)
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)
 
@@ -251,10 +251,12 @@ defmodule Ferricstore.Store.Shard.Flush do
   # Byte tracking / fragmentation
   # -------------------------------------------------------------------
 
-  @spec total_written([{non_neg_integer(), non_neg_integer()}]) :: non_neg_integer()
+  @spec total_record_bytes([{binary(), binary(), non_neg_integer()}]) :: non_neg_integer()
   @doc false
-  def total_written(locations) do
-    Enum.reduce(locations, 0, fn {_offset, size}, acc -> acc + size end)
+  def total_record_bytes(batch) do
+    Enum.reduce(batch, 0, fn {key, value, _expire_at_ms}, acc ->
+      acc + @record_header_size + byte_size(key) + byte_size(value)
+    end)
   end
 
   # Increment total_bytes for the active file after a flush.
@@ -442,7 +444,9 @@ defmodule Ferricstore.Store.Shard.Flush do
         %{shard_index: state.index, kind: :new_dir, path: sp}
       )
 
-      Ferricstore.Store.ActiveFile.publish(state.instance_ctx, state.index, new_id, new_path, sp)
+      if ctx = Map.get(state, :instance_ctx) do
+        Ferricstore.Store.ActiveFile.publish(ctx, state.index, new_id, new_path, sp)
+      end
 
       # Initialize file_stats for the new file
       new_file_stats = Map.put(state.file_stats, new_id, {0, 0})

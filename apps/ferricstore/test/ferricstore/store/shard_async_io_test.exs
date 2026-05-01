@@ -863,4 +863,25 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       end
     end
   end
+
+  describe "file size accounting" do
+    test "active_file_size tracks full record bytes after batch flush" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      key = "size_accounting_#{:erlang.unique_integer([:positive])}"
+      value = "value"
+
+      try do
+        assert :ok == GenServer.call(pid, {:put, key, value, 0})
+        assert :ok == GenServer.call(pid, :flush)
+
+        {_fid, active_path} = GenServer.call(pid, :get_active_file)
+        state = :sys.get_state(pid)
+
+        assert state.active_file_size == File.stat!(active_path).size
+        assert state.active_file_size == 26 + byte_size(key) + byte_size(value)
+      after
+        cleanup_shard(pid, ctx, dir)
+      end
+    end
+  end
 end
