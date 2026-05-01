@@ -1,27 +1,32 @@
 defmodule Ferricstore.Store.ShardETSTest do
+  @moduledoc false
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
-  describe "pending_cold?/2" do
-    test "releases tracked key bytes when deleting an expired pending-cold entry" do
-      keydir = :ets.new(:"shard_ets_test_#{System.unique_integer([:positive])}", [:set, :public])
-      ref = :atomics.new(1, [])
-      key = :binary.copy("k", 128)
-      expired_at = Ferricstore.HLC.now_ms() - 1
+  test "stale async cold-read completion does not warm over a pending large write" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "ets:pending:stale-read"
 
-      state = %{keydir: keydir, index: 0, instance_ctx: %{keydir_binary_bytes: ref}}
+    state = %{
+      keydir: keydir,
+      instance_ctx: %{hot_cache_max_value_size: 5}
+    }
 
-      try do
-        :ets.insert(keydir, {key, nil, expired_at, 0, :pending, 0, 0})
-        :atomics.add(ref, 1, byte_size(key))
+    try do
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 7, 12, 3})
 
-        refute ShardETS.pending_cold?(state, key)
-        assert :ets.lookup(keydir, key) == []
-        assert :atomics.get(ref, 1) == 0
-      after
-        :ets.delete(keydir)
-      end
+      ShardETS.ets_insert(state, key, "new-large-value", 0)
+      assert [{^key, nil, 0, _lfu, :pending, 7, 3}] = :ets.lookup(keydir, key)
+
+      assert :ok == ShardETS.cold_read_warm_ets(state, key, "old")
+
+      assert [{^key, nil, 0, _lfu, :pending, 7, 3}] = :ets.lookup(keydir, key)
+      assert :miss == ShardETS.ets_lookup(state, key)
+      assert ShardETS.pending_cold?(state, key)
+    after
+      :ets.delete(keydir)
     end
   end
 end

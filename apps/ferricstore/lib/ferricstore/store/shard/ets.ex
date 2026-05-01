@@ -243,7 +243,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @doc false
   def cold_read_warm_ets(state, key, value) do
     case :ets.lookup(state.keydir, key) do
-      [{^key, nil, exp, _lfu, fid, off, vsize}] ->
+      [{^key, nil, exp, _lfu, fid, off, vsize}] when is_integer(fid) and fid >= 0 ->
         cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
 
       _ ->
