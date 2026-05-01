@@ -42,6 +42,13 @@ defmodule Ferricstore.EmbeddedExtendedSetTest do
     test "returns nil for nonexistent set" do
       assert {:ok, nil} = FerricStore.srandmember("srm:missing")
     end
+
+    test "returns WRONGTYPE directly for string keys" do
+      assert :ok = FerricStore.set("srm:string", "plain")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.srandmember("srm:string")
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.srandmember("srm:string", 2)
+    end
   end
 
   describe "spop/2" do
@@ -61,6 +68,13 @@ defmodule Ferricstore.EmbeddedExtendedSetTest do
 
     test "returns nil for nonexistent set" do
       assert {:ok, nil} = FerricStore.spop("sp:missing")
+    end
+
+    test "returns WRONGTYPE directly for string keys" do
+      assert :ok = FerricStore.set("sp:string", "plain")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.spop("sp:string")
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.spop("sp:string", 2)
     end
   end
 

@@ -2886,19 +2886,15 @@ defmodule FerricStore do
       {:ok, nil}
 
   """
-  @spec srandmember(key(), integer() | nil) :: {:ok, binary() | [binary()] | nil}
+  @spec srandmember(key(), integer() | nil) :: {:ok, binary() | [binary()] | nil} | write_error()
   def srandmember(key, count \\ nil) do
     store = build_compound_store(key)
 
-    case count do
-      nil ->
-        result = Ferricstore.Commands.Set.handle("SRANDMEMBER", [key], store)
-        {:ok, result}
+    args = if is_nil(count), do: [key], else: [key, to_string(count)]
 
-      n ->
-        result = Ferricstore.Commands.Set.handle("SRANDMEMBER", [key, to_string(n)], store)
-        {:ok, result}
-    end
+    "SRANDMEMBER"
+    |> Ferricstore.Commands.Set.handle(args, store)
+    |> wrap_result()
   end
 
   @doc """
@@ -2922,19 +2918,15 @@ defmodule FerricStore do
       {:ok, nil}
 
   """
-  @spec spop(key(), non_neg_integer() | nil) :: {:ok, binary() | [binary()] | nil}
+  @spec spop(key(), non_neg_integer() | nil) :: {:ok, binary() | [binary()] | nil} | write_error()
   def spop(key, count \\ nil) do
     store = build_compound_store(key)
 
-    case count do
-      nil ->
-        result = Ferricstore.Commands.Set.handle("SPOP", [key], store)
-        {:ok, result}
+    args = if is_nil(count), do: [key], else: [key, to_string(count)]
 
-      n ->
-        result = Ferricstore.Commands.Set.handle("SPOP", [key, to_string(n)], store)
-        {:ok, result}
-    end
+    "SPOP"
+    |> Ferricstore.Commands.Set.handle(args, store)
+    |> wrap_result()
   end
 
   @doc """
