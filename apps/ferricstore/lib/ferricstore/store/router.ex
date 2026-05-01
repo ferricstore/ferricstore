@@ -1855,6 +1855,18 @@ defmodule Ferricstore.Store.Router do
   PFCOUNT is read-only and should not go through this path.
   """
   @spec hll_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
+  def hll_op(ctx, "PFMERGE", [destkey | source_keys] = args) when source_keys != [] do
+    keys_with_roles = [{destkey, :write} | Enum.map(source_keys, &{&1, :read})]
+
+    Ferricstore.CrossShardOp.execute(
+      keys_with_roles,
+      fn _store ->
+        raft_write(ctx, shard_for(ctx, destkey), destkey, {:hll_op, "PFMERGE", args})
+      end,
+      intent: %{command: :pfmerge, keys: %{targets: [destkey | source_keys]}}
+    )
+  end
+
   def hll_op(ctx, cmd, [key | _] = args) do
     raft_write(ctx, shard_for(ctx, key), key, {:hll_op, cmd, args})
   end
@@ -1895,6 +1907,18 @@ defmodule Ferricstore.Store.Router do
   Read-only ops (GEOPOS, GEODIST, GEOHASH, GEOSEARCH) don't go through here.
   """
   @spec geo_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
+  def geo_op(ctx, "GEOSEARCHSTORE", [dest, source | _] = args) do
+    keys_with_roles = [{dest, :write}, {source, :read}]
+
+    Ferricstore.CrossShardOp.execute(
+      keys_with_roles,
+      fn _store ->
+        raft_write(ctx, shard_for(ctx, dest), dest, {:geo_op, "GEOSEARCHSTORE", args})
+      end,
+      intent: %{command: :geosearchstore, keys: %{dest: dest, source: source}}
+    )
+  end
+
   def geo_op(ctx, "GEOSEARCHSTORE", [dest | _] = args) do
     raft_write(ctx, shard_for(ctx, dest), dest, {:geo_op, "GEOSEARCHSTORE", args})
   end
