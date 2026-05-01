@@ -24,6 +24,10 @@ defmodule Ferricstore.Store.Ops do
   @min_int64 -9_223_372_036_854_775_808
   @overflow_error "ERR increment or decrement would overflow"
 
+  defguardp valid_cold_location(file_id, offset, value_size)
+            when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+                   is_integer(value_size) and value_size >= 0
+
   # --- Basic key operations ---
 
   @spec get(store(), binary()) :: binary() | nil
@@ -1022,11 +1026,12 @@ defmodule Ferricstore.Store.Ops do
       [{^compound_key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
         {value, exp}
 
-      [{^compound_key, nil, 0, _lfu, fid, off, vsize}] when is_integer(fid) and fid >= 0 ->
+      [{^compound_key, nil, 0, _lfu, fid, off, vsize}]
+      when valid_cold_location(fid, off, vsize) ->
         read_promoted_cold_value(tx, compound_key, dedicated_path, fid, off, vsize, 0)
 
       [{^compound_key, nil, exp, _lfu, fid, off, vsize}]
-      when exp > now and is_integer(fid) and fid >= 0 ->
+      when exp > now and valid_cold_location(fid, off, vsize) ->
         read_promoted_cold_value(tx, compound_key, dedicated_path, fid, off, vsize, exp)
 
       [{^compound_key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
