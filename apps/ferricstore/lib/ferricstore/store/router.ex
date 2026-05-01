@@ -352,17 +352,22 @@ defmodule Ferricstore.Store.Router do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
       with_async_key_latch(ctx, idx, key, fn ->
-        keydir = elem(ctx.keydir_refs, idx)
-        track_keydir_binary_delete(ctx, idx, keydir, key)
-        :ets.delete(keydir, key)
+        case async_submit_to_raft(idx, {:delete, key}) do
+          :ok ->
+            keydir = elem(ctx.keydir_refs, idx)
+            track_keydir_binary_delete(ctx, idx, keydir, key)
+            :ets.delete(keydir, key)
 
-        {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
-        Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
+            {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+            Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
 
-        wv_size = :counters.info(ctx.write_version).size
-        if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
-        async_submit_to_raft(idx, {:delete, key})
-        :ok
+            wv_size = :counters.info(ctx.write_version).size
+            if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+            :ok
+
+          {:error, _} = error ->
+            error
+        end
       end)
     end
   end
@@ -2872,47 +2877,59 @@ defmodule Ferricstore.Store.Router do
   (contended path). The latch guarantees exclusive access to the list's
   compound keys.
 
-  Uses `ListOps.execute/3` with an origin-local compound store that
-  writes ETS + casts BitcaskWriter for each mutation. Then submits the
-  original `{:list_op, key, op}` command to Raft via
-  `Batcher.async_submit` so replicas re-execute against their own state
-  in Raft log order (deterministic convergence).
+  Reserves Batcher capacity before touching origin-local compound state.
+  That prevents overloaded async replication from exposing a local-only
+  list mutation as successful.
   """
   @spec execute_list_op_inline(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
   def execute_list_op_inline(ctx, idx, {:list_op, key, operation} = cmd) do
     :telemetry.execute([:ferricstore, :rmw, :worker_list_op], %{}, %{shard_index: idx})
-    store = build_origin_compound_store(ctx, idx)
 
-    case ensure_list_type_for_operation(key, operation, store) do
-      :ok ->
-        # Resolve the module at runtime to avoid the compile-time cycle
-        # ListOps → Ops → Router → ListOps. `list_ops_mod/0` returns an atom
-        # that xref cannot trace through.
-        result = :erlang.apply(list_ops_mod(), :execute, [key, store, operation])
+    with :ok <- maybe_async_submit_list_op(idx, cmd, operation) do
+      store = build_origin_compound_store(ctx, idx)
 
-        wv_size = :counters.info(ctx.write_version).size
-        if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+      case ensure_list_type_for_operation(key, operation, store) do
+        :ok ->
+          # Resolve the module at runtime to avoid the compile-time cycle
+          # ListOps → Ops → Router → ListOps. `list_ops_mod/0` returns an atom
+          # that xref cannot trace through.
+          result = :erlang.apply(list_ops_mod(), :execute, [key, store, operation])
 
-        async_submit_to_raft(idx, cmd)
-        result
+          if list_operation_mutating?(operation) do
+            wv_size = :counters.info(ctx.write_version).size
+            if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+          end
 
-      {:error, _} = err ->
-        err
+          result
+
+        {:error, _} = err ->
+          err
+      end
     end
   end
 
   def execute_list_op_inline(ctx, idx, {:list_op_lmove, src_key, dst_key, from_dir, to_dir} = cmd) do
-    store = build_origin_compound_store(ctx, idx)
+    with :ok <- async_submit_to_raft(idx, cmd) do
+      store = build_origin_compound_store(ctx, idx)
 
-    result =
-      :erlang.apply(list_ops_mod(), :execute_lmove, [src_key, dst_key, store, from_dir, to_dir])
+      result =
+        :erlang.apply(list_ops_mod(), :execute_lmove, [src_key, dst_key, store, from_dir, to_dir])
 
-    wv_size = :counters.info(ctx.write_version).size
-    if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
-
-    async_submit_to_raft(idx, cmd)
-    result
+      wv_size = :counters.info(ctx.write_version).size
+      if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+      result
+    end
   end
+
+  defp maybe_async_submit_list_op(idx, cmd, operation) do
+    if list_operation_mutating?(operation), do: async_submit_to_raft(idx, cmd), else: :ok
+  end
+
+  defp list_operation_mutating?({:lrange, _, _}), do: false
+  defp list_operation_mutating?(:llen), do: false
+  defp list_operation_mutating?({:lindex, _}), do: false
+  defp list_operation_mutating?({:lpos, _, _, _, _}), do: false
+  defp list_operation_mutating?(_), do: true
 
   defp ensure_list_type_for_operation(key, operation, store)
 

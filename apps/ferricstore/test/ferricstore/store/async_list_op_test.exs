@@ -25,6 +25,7 @@ defmodule Ferricstore.Store.AsyncListOpTest do
   """
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.ShardHelpers
@@ -52,6 +53,28 @@ defmodule Ferricstore.Store.AsyncListOpTest do
   # ---------------------------------------------------------------------------
 
   describe "uncontended LPUSH / RPUSH" do
+    test "RPUSH does not become locally visible when Batcher is overloaded" do
+      key = ukey("rpush_overloaded")
+      idx = Router.shard_for(ctx(), key)
+
+      on_exit(fn -> Batcher.reset_pending(idx) end)
+
+      for _ <- 1..64 do
+        Batcher.__inject_async_pending__(
+          idx,
+          make_ref(),
+          [{:async, node(), {:list_op, key, {:rpush, ["a"]}}}],
+          0
+        )
+      end
+
+      assert {:error, "ERR async replication overloaded"} =
+               Router.list_op(ctx(), key, {:rpush, ["a"]})
+
+      Batcher.reset_pending(idx)
+      assert [] == Router.list_op(ctx(), key, {:lrange, 0, -1})
+    end
+
     test "LPUSH single element creates list with one member" do
       key = ukey("lpush_new")
 

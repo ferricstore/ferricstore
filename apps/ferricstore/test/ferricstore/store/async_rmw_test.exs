@@ -133,6 +133,27 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       assert Router.get(ctx(), k) == nil
     end
 
+    test "DELETE does not remove the local value when Batcher is overloaded" do
+      k = ukey("delete_overloaded")
+      idx = Router.shard_for(ctx(), k)
+
+      :ok = Router.put(ctx(), k, "keep", 0)
+
+      on_exit(fn -> Batcher.reset_pending(idx) end)
+
+      for _ <- 1..64 do
+        Batcher.__inject_async_pending__(
+          idx,
+          make_ref(),
+          [{:async, node(), {:delete, k}}],
+          0
+        )
+      end
+
+      assert {:error, "ERR async replication overloaded"} = Router.delete(ctx(), k)
+      assert Router.get(ctx(), k) == "keep"
+    end
+
     test "APPEND on nonexistent key creates it, returns byte size" do
       k = ukey("append_nokey")
       assert {:ok, 5} = Router.append(ctx(), k, "hello")
