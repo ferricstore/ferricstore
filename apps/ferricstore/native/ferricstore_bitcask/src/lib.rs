@@ -420,6 +420,67 @@ fn v2_scan_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
     }
 }
 
+/// Scan records in a data file from an exact byte offset. Returns a list of record metadata.
+/// `{:ok, [{key, offset, value_size, expire_at_ms, is_tombstone}, ...]}`.
+///
+/// Used by hint recovery to replay only active-file records appended after the
+/// hint boundary.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_scan_file_from_offset<'a>(
+    env: Env<'a>,
+    path: String,
+    start_offset: u64,
+) -> NifResult<Term<'a>> {
+    let p = std::path::Path::new(&path);
+
+    match log::LogReader::open(p) {
+        Ok(mut reader) => {
+            let records = reader
+                .iter_from_offset_tolerant(start_offset)
+                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+
+            let mut results: Vec<Term<'a>> = Vec::with_capacity(records.len());
+            let mut offset: u64 = start_offset;
+
+            for record in &records {
+                let key_bin = match OwnedBinary::new(record.key.len()) {
+                    Some(mut ob) => {
+                        ob.as_mut_slice().copy_from_slice(&record.key);
+                        ob.release(env)
+                    }
+                    None => {
+                        return Ok(
+                            (atoms::error(), "out of memory allocating key binary").encode(env)
+                        );
+                    }
+                };
+
+                let value_size = record.value.as_ref().map_or(0u32, |v| v.len() as u32);
+                let is_tombstone = record.value.is_none();
+
+                let tuple = (
+                    key_bin,
+                    offset,
+                    value_size,
+                    record.expire_at_ms,
+                    is_tombstone,
+                )
+                    .encode(env);
+
+                results.push(tuple);
+
+                offset += (log::HEADER_SIZE
+                    + record.key.len()
+                    + record.value.as_ref().map_or(0, Vec::len)) as u64;
+            }
+
+            Ok((atoms::ok(), results).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
 /// Batch pread: read values at multiple offsets from the same file.
 /// Returns `{:ok, [value_binary | nil, ...]}`.
 ///

@@ -474,6 +474,19 @@ impl LogReader {
         }
         Ok(records)
     }
+
+    /// Iterate records from an exact byte offset, tolerating a truncated tail.
+    ///
+    /// Used after hint recovery to replay only records appended after the hint
+    /// boundary, instead of rescanning the whole hinted active file.
+    pub fn iter_from_offset_tolerant(&mut self, offset: u64) -> Result<Vec<Record>> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut records = Vec::new();
+        while let Ok(Some(record)) = read_next_record(&mut self.file) {
+            records.push(record);
+        }
+        Ok(records)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,6 +1327,32 @@ mod tests {
             10,
             "tolerant iter must return all 10 valid records"
         );
+    }
+
+    #[test]
+    fn tolerant_iter_from_offset_returns_only_tail_records() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let off1 = w.write(b"k1", b"v1", 0).unwrap();
+        let off2 = w.write(b"k2", b"v2", 0).unwrap();
+        let off3 = w.write(b"k3", b"v3", 0).unwrap();
+        w.sync().unwrap();
+
+        assert_eq!(off1, 0);
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_offset_tolerant(off2).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].key, b"k2");
+        assert_eq!(records[0].value.as_deref(), Some(&b"v2"[..]));
+        assert_eq!(records[1].key, b"k3");
+        assert_eq!(records[1].value.as_deref(), Some(&b"v3"[..]));
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_offset_tolerant(off3).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, b"k3");
     }
 
     // ------------------------------------------------------------------

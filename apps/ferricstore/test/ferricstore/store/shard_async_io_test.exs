@@ -18,6 +18,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.BitcaskWriter
   alias Ferricstore.Store.LFU
+  alias Ferricstore.Store.Router
   alias Ferricstore.Store.Shard
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
@@ -52,6 +53,19 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       )
 
     {pid, 0, dir, ctx}
+  end
+
+  defp restart_shard(dir, ctx, flush_ms) do
+    {:ok, pid} =
+      Shard.start_link(
+        index: 0,
+        data_dir: dir,
+        flush_interval_ms: flush_ms,
+        instance_ctx: ctx,
+        raft_enabled: false
+      )
+
+    pid
   end
 
   defp cleanup_shard(pid, ctx, dir) do
@@ -732,6 +746,121 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       :ok = NIF.v2_fsync_async(caller, corr_id, path)
 
       assert_receive {:tokio_complete, ^corr_id, :ok, :ok}, 5000
+    end
+  end
+
+  describe "hint recovery" do
+    test "replays log tail after stale active-file hint" do
+      previous_trap_exit = Process.flag(:trap_exit, true)
+      {pid1, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      key = "hint_tail_#{:erlang.unique_integer([:positive])}"
+
+      try do
+        assert :ok == GenServer.call(pid1, {:put, key, "v1", 0})
+        assert :ok == GenServer.call(pid1, :flush)
+        {hint_fid, _active_path} = GenServer.call(pid1, :get_active_file)
+        :ok = GenServer.stop(pid1, :normal, 5_000)
+        hint_name = "#{String.pad_leading(Integer.to_string(hint_fid), 5, "0")}.hint"
+        hint_path = Path.join([dir, "data", "shard_0", hint_name])
+        assert File.exists?(hint_path)
+
+        pid2 = restart_shard(dir, ctx, 5000)
+        assert "v1" == GenServer.call(pid2, {:get, key})
+
+        assert :ok == GenServer.call(pid2, {:put, key, "v2", 0})
+        assert :ok == GenServer.call(pid2, :flush)
+
+        ref = Process.monitor(pid2)
+        Process.exit(pid2, :kill)
+
+        assert_receive {:DOWN, ^ref, :process, ^pid2, :killed}, 2_000
+        assert File.exists?(hint_path)
+
+        pid3 = restart_shard(dir, ctx, 5000)
+        assert "v2" == GenServer.call(pid3, {:get, key})
+      after
+        case Process.whereis(Router.shard_name(ctx, 0)) do
+          pid when is_pid(pid) ->
+            cleanup_shard(pid, ctx, dir)
+
+          _ ->
+            FerricStore.Instance.cleanup(ctx.name)
+            File.rm_rf(dir)
+        end
+
+        Process.flag(:trap_exit, previous_trap_exit)
+      end
+    end
+
+    test "replays stale active-file hint tombstone tail" do
+      previous_trap_exit = Process.flag(:trap_exit, true)
+      {pid1, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      key = "hint_tail_delete_#{:erlang.unique_integer([:positive])}"
+
+      try do
+        assert :ok == GenServer.call(pid1, {:put, key, "v1", 0})
+        assert :ok == GenServer.call(pid1, :flush)
+        {hint_fid, _active_path} = GenServer.call(pid1, :get_active_file)
+        :ok = GenServer.stop(pid1, :normal, 5_000)
+        hint_name = "#{String.pad_leading(Integer.to_string(hint_fid), 5, "0")}.hint"
+        hint_path = Path.join([dir, "data", "shard_0", hint_name])
+        assert File.exists?(hint_path)
+
+        pid2 = restart_shard(dir, ctx, 5000)
+        assert "v1" == GenServer.call(pid2, {:get, key})
+
+        assert :ok == GenServer.call(pid2, {:delete, key})
+        assert :ok == GenServer.call(pid2, :flush)
+
+        ref = Process.monitor(pid2)
+        Process.exit(pid2, :kill)
+
+        assert_receive {:DOWN, ^ref, :process, ^pid2, :killed}, 2_000
+        assert File.exists?(hint_path)
+
+        pid3 = restart_shard(dir, ctx, 5000)
+        assert nil == GenServer.call(pid3, {:get, key})
+      after
+        case Process.whereis(Router.shard_name(ctx, 0)) do
+          pid when is_pid(pid) ->
+            cleanup_shard(pid, ctx, dir)
+
+          _ ->
+            FerricStore.Instance.cleanup(ctx.name)
+            File.rm_rf(dir)
+        end
+
+        Process.flag(:trap_exit, previous_trap_exit)
+      end
+    end
+
+    test "falls back to log replay when active hint is corrupt" do
+      {pid1, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      key = "hint_corrupt_#{:erlang.unique_integer([:positive])}"
+
+      try do
+        assert :ok == GenServer.call(pid1, {:put, key, "v1", 0})
+        assert :ok == GenServer.call(pid1, :flush)
+        {hint_fid, _active_path} = GenServer.call(pid1, :get_active_file)
+        :ok = GenServer.stop(pid1, :normal, 5_000)
+
+        hint_name = "#{String.pad_leading(Integer.to_string(hint_fid), 5, "0")}.hint"
+        hint_path = Path.join([dir, "data", "shard_0", hint_name])
+        assert File.exists?(hint_path)
+        File.write!(hint_path, "not a valid hint")
+
+        pid2 = restart_shard(dir, ctx, 5000)
+        assert "v1" == GenServer.call(pid2, {:get, key})
+      after
+        case Process.whereis(Router.shard_name(ctx, 0)) do
+          pid when is_pid(pid) ->
+            cleanup_shard(pid, ctx, dir)
+
+          _ ->
+            FerricStore.Instance.cleanup(ctx.name)
+            File.rm_rf(dir)
+        end
+      end
     end
   end
 end

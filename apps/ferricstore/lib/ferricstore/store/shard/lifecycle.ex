@@ -18,6 +18,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   @default_sweep_interval_ms 5_000
   @default_max_keys_per_sweep 100
   @default_frag_check_interval_ms 60_000
+  @log_header_size 26
 
   # Number of consecutive ceiling-hit sweeps before emitting the
   # :expiry_struggling telemetry event.
@@ -103,6 +104,21 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
     # v2_scan_file returns {:ok, [{key, offset, value_size, expire_at_ms, is_tombstone}, ...]}
     case NIF.v2_scan_file(log_path) do
+      {:ok, records} ->
+        Enum.each(records, fn record ->
+          recover_record(keydir, shard_index, fid, record)
+        end)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp recover_from_log_from_offset(shard_path, log_name, keydir, shard_index, offset) do
+    log_path = Path.join(shard_path, log_name)
+    fid = log_file_id(log_name)
+
+    case NIF.v2_scan_file_from_offset(log_path, offset) do
       {:ok, records} ->
         Enum.each(records, fn record ->
           recover_record(keydir, shard_index, fid, record)
@@ -391,15 +407,21 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   end
 
   defp recover_from_hints_or_logs(shard_path, keydir, shard_index, log_files, hint_files) do
-    Enum.each(hint_files, fn hint_name ->
-      recover_from_hint(shard_path, hint_name, keydir, shard_index)
-    end)
+    hint_offsets =
+      Enum.reduce(hint_files, %{}, fn hint_name, acc ->
+        case recover_from_hint(shard_path, hint_name, keydir, shard_index) do
+          {:ok, fid, end_offset} -> Map.put(acc, fid, end_offset)
+          {:error, _fid} -> acc
+        end
+      end)
 
-    unhinted_logs = unhinted_log_files(log_files, hint_files)
+    recovery_logs = unhinted_log_files(log_files, Map.keys(hint_offsets))
 
-    Enum.each(unhinted_logs, fn log_name ->
+    Enum.each(recovery_logs, fn log_name ->
       recover_from_log(shard_path, log_name, keydir, shard_index)
     end)
+
+    replay_hinted_active_tail(shard_path, keydir, shard_index, log_files, hint_offsets)
   end
 
   defp recover_from_hint(shard_path, hint_name, keydir, shard_index) do
@@ -414,22 +436,46 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
         end)
 
+        {:ok, fid, hint_end_offset(entries)}
+
+      _ ->
+        {:error, fid}
+    end
+  end
+
+  defp unhinted_log_files(log_files, hinted_ids) do
+    hinted_ids = MapSet.new(hinted_ids)
+
+    Enum.reject(log_files, fn name ->
+      MapSet.member?(hinted_ids, log_file_id(name))
+    end)
+  end
+
+  defp replay_hinted_active_tail(_shard_path, _keydir, _shard_index, [], _hint_offsets), do: :ok
+
+  defp replay_hinted_active_tail(shard_path, keydir, shard_index, log_files, hint_offsets) do
+    active_log_name = List.last(log_files)
+    active_fid = log_file_id(active_log_name)
+
+    case hint_offsets do
+      %{^active_fid => end_offset} ->
+        # The active file can receive appends after its hint was written. Replay
+        # only the tail so old hinted files stay fast and startup preserves
+        # last-write-wins correctness for the still-mutable active log.
+        recover_from_log_from_offset(shard_path, active_log_name, keydir, shard_index, end_offset)
+
       _ ->
         :ok
     end
   end
 
-  defp unhinted_log_files(log_files, hint_files) do
-    hinted_ids =
-      MapSet.new(hint_files, fn name ->
-        name |> String.trim_trailing(".hint") |> String.to_integer()
-      end)
-
-    Enum.reject(log_files, fn name ->
-      fid = name |> String.trim_trailing(".log") |> String.to_integer()
-      MapSet.member?(hinted_ids, fid)
+  defp hint_end_offset(entries) do
+    Enum.reduce(entries, 0, fn {key, _file_id, offset, value_size, _expire_at_ms}, acc ->
+      max(acc, offset + @log_header_size + byte_size(key) + value_size)
     end)
   end
+
+  defp log_file_id(name), do: name |> String.trim_trailing(".log") |> String.to_integer()
 
   defp recover_record(keydir, shard_index, _fid, {key, _offset, _value_size, _expire_at_ms, true}) do
     track_binary_remove(keydir, shard_index, key)
