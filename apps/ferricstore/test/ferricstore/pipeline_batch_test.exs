@@ -233,6 +233,19 @@ defmodule Ferricstore.PipelineBatchTest do
 
       assert [:ok, {:ok, "first"}, :ok, {:ok, "second"}] = results
     end
+
+    test "mixed fast path preserves GET before SET order on same key" do
+      assert :ok = FerricStore.set("pb:get_before_set", "old")
+
+      assert {:ok, [{:ok, "old"}, :ok]} =
+               FerricStore.pipeline(fn pipe ->
+                 pipe
+                 |> FerricStore.Pipe.get("pb:get_before_set")
+                 |> FerricStore.Pipe.set("pb:get_before_set", "new")
+               end)
+
+      assert {:ok, "new"} = FerricStore.get("pb:get_before_set")
+    end
   end
 
   describe "performance" do

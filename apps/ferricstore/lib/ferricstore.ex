@@ -5533,12 +5533,12 @@ defmodule FerricStore.Pipe do
   end
 
   defp classify_batch(commands) do
-    classify_batch(commands, nil, MapSet.new())
+    classify_batch(commands, nil, MapSet.new(), MapSet.new())
   end
 
-  defp classify_batch([], kind, _written), do: kind || :complex
+  defp classify_batch([], kind, _written, _read), do: kind || :complex
 
-  defp classify_batch([{:get, key} | rest], kind, written) do
+  defp classify_batch([{:get, key} | rest], kind, written, read) do
     if MapSet.member?(written, key) do
       :complex
     else
@@ -5551,12 +5551,14 @@ defmodule FerricStore.Pipe do
           _ -> :complex
         end
 
-      if new_kind == :complex, do: :complex, else: classify_batch(rest, new_kind, written)
+      if new_kind == :complex,
+        do: :complex,
+        else: classify_batch(rest, new_kind, written, MapSet.put(read, key))
     end
   end
 
-  defp classify_batch([{:set, key, _v, opts} | rest], kind, written) do
-    if opts != [] do
+  defp classify_batch([{:set, key, _v, opts} | rest], kind, written, read) do
+    if opts != [] or MapSet.member?(read, key) do
       :complex
     else
       new_kind =
@@ -5570,11 +5572,11 @@ defmodule FerricStore.Pipe do
 
       if new_kind == :complex,
         do: :complex,
-        else: classify_batch(rest, new_kind, MapSet.put(written, key))
+        else: classify_batch(rest, new_kind, MapSet.put(written, key), read)
     end
   end
 
-  defp classify_batch(_, _, _), do: :complex
+  defp classify_batch(_, _, _, _), do: :complex
 
   defp batch_async_put_result_list(ctx, kv_pairs) do
     case Ferricstore.Store.Router.batch_async_put(ctx, kv_pairs) do
