@@ -277,6 +277,38 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         )
       end
     end
+
+    test "async disk pressure rejects only pressured async batch_set keys" do
+      default_ctx = FerricStore.Instance.get(:default)
+      pressured_key = "#{@ns_async}:bs_pressure_#{System.unique_integer([:positive])}"
+      ok_key = different_shard_key(default_ctx, pressured_key, "#{@ns_async}:bs_pressure_ok")
+      idx = Router.shard_for(default_ctx, pressured_key)
+
+      Ferricstore.Store.DiskPressure.set(default_ctx, idx)
+
+      try do
+        assert [
+                 {:error, "ERR disk pressure on shard " <> _},
+                 :ok
+               ] = FerricStore.batch_set([{pressured_key, "blocked"}, {ok_key, "allowed"}])
+
+        assert {:ok, nil} == FerricStore.get(pressured_key)
+        assert {:ok, "allowed"} == FerricStore.get(ok_key)
+      after
+        Ferricstore.Store.DiskPressure.clear(default_ctx, idx)
+      end
+    end
+
+    test "async batch_set rejects overlarge keys before writing" do
+      default_ctx = FerricStore.Instance.get(:default)
+      key = "#{@ns_async}:" <> String.duplicate("k", 65_536)
+      keydir = elem(default_ctx.keydir_refs, Router.shard_for(default_ctx, key))
+
+      assert [{:error, "ERR key too large (max 65535 bytes)"}] =
+               FerricStore.batch_set([{key, "too-large"}])
+
+      assert :ets.lookup(keydir, key) == []
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -522,6 +554,15 @@ defmodule Ferricstore.Store.BatchOperationsTest do
           if Router.shard_for(ctx, left) == Router.shard_for(ctx, right), do: {left, right}
       end)
     end)
+  end
+
+  defp different_shard_key(ctx, key, base) do
+    shard_idx = Router.shard_for(ctx, key)
+    prefix = "#{base}:#{System.unique_integer([:positive])}"
+
+    1..500
+    |> Stream.map(fn i -> "#{prefix}:#{i}" end)
+    |> Enum.find(fn candidate -> Router.shard_for(ctx, candidate) != shard_idx end)
   end
 
   defp key_for_shard(ctx, base, shard_idx) do

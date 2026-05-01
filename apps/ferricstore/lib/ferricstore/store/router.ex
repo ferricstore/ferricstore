@@ -1650,6 +1650,10 @@ defmodule Ferricstore.Store.Router do
   @max_key_size 65_535
   @max_value_size 512 * 1024 * 1024
 
+  @spec max_key_size() :: pos_integer()
+  @doc "Returns the maximum allowed key size in bytes."
+  def max_key_size, do: @max_key_size
+
   @spec max_value_size() :: pos_integer()
   @doc "Returns the maximum allowed value size in bytes."
   def max_value_size, do: @max_value_size

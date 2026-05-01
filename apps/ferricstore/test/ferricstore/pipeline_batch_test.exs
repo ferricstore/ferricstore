@@ -103,6 +103,33 @@ defmodule Ferricstore.PipelineBatchTest do
       assert {:ok, "b"} = FerricStore.get("pb:cross_beta")
       assert {:ok, "c"} = FerricStore.get("pb:cross_gamma")
     end
+
+    test "async all-set pipeline rejects only pressured shard writes" do
+      ns = "pb_async"
+      Ferricstore.NamespaceConfig.set(ns, "durability", "async")
+      on_exit(fn -> Ferricstore.NamespaceConfig.set(ns, "durability", "quorum") end)
+
+      ctx = FerricStore.Instance.get(:default)
+      pressured_key = "#{ns}:pressure_#{System.unique_integer([:positive])}"
+      ok_key = different_shard_key(ctx, pressured_key, "#{ns}:pressure_ok")
+      idx = Ferricstore.Store.Router.shard_for(ctx, pressured_key)
+
+      Ferricstore.Store.DiskPressure.set(ctx, idx)
+
+      try do
+        assert {:ok, [{:error, "ERR disk pressure on shard " <> _}, :ok]} =
+                 FerricStore.pipeline(fn pipe ->
+                   pipe
+                   |> FerricStore.Pipe.set(pressured_key, "blocked")
+                   |> FerricStore.Pipe.set(ok_key, "allowed")
+                 end)
+
+        assert {:ok, nil} = FerricStore.get(pressured_key)
+        assert {:ok, "allowed"} = FerricStore.get(ok_key)
+      after
+        Ferricstore.Store.DiskPressure.clear(ctx, idx)
+      end
+    end
   end
 
   describe "edge cases" do
@@ -291,5 +318,16 @@ defmodule Ferricstore.PipelineBatchTest do
         assert {:ok, ^expected} = FerricStore.get("pb:pipe:#{i}")
       end
     end
+  end
+
+  defp different_shard_key(ctx, key, base) do
+    shard_idx = Ferricstore.Store.Router.shard_for(ctx, key)
+    prefix = "#{base}:#{System.unique_integer([:positive])}"
+
+    1..500
+    |> Stream.map(fn i -> "#{prefix}:#{i}" end)
+    |> Enum.find(fn candidate ->
+      Ferricstore.Store.Router.shard_for(ctx, candidate) != shard_idx
+    end)
   end
 end
