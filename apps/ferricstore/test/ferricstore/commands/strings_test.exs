@@ -538,6 +538,17 @@ defmodule Ferricstore.Commands.StringsTest do
       assert "" = Strings.handle("GETRANGE", ["k", "0", "-1"], store)
     end
 
+    test "GETRANGE returns empty out-of-range slice without loading cold value" do
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 10_000 end,
+        get: fn _key -> flunk("GETRANGE should not load a cold value for an empty range") end
+      }
+
+      assert "" == Strings.handle("GETRANGE", ["cold", "10000", "10010"], store)
+      assert "" == Strings.handle("GETRANGE", ["cold", "-1", "-2"], store)
+    end
+
     test "GETRANGE with extra args returns arity error" do
       store = MockStore.make()
       assert {:error, msg} = Strings.handle("GETRANGE", ["k", "0", "5", "extra"], store)

@@ -382,12 +382,16 @@ defmodule Ferricstore.Commands.Strings do
   def handle("GETRANGE", [key, start_str, end_str], store) do
     with {start_idx, ""} <- Integer.parse(start_str),
          {end_idx, ""} <- Integer.parse(end_str) do
-      case read_string_value(key, store) do
-        :missing -> ""
-        @wrongtype_error -> @wrongtype_error
-        {:value, v} when is_integer(v) -> do_getrange(Integer.to_string(v), start_idx, end_idx)
-        {:value, v} when is_float(v) -> do_getrange(Float.to_string(v), start_idx, end_idx)
-        {:value, value} -> do_getrange(value, start_idx, end_idx)
+      case metadata_value_size(store, key) do
+        size when is_integer(size) ->
+          if getrange_empty_for_size?(size, start_idx, end_idx) do
+            if compound_data_structure_key?(key, store), do: @wrongtype_error, else: ""
+          else
+            read_getrange_value(key, start_idx, end_idx, store)
+          end
+
+        _unknown_or_missing ->
+          read_getrange_value(key, start_idx, end_idx, store)
       end
     else
       _ -> {:error, "ERR value is not an integer or out of range"}
@@ -544,6 +548,36 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
   # Private — GETRANGE substring extraction
   # ---------------------------------------------------------------------------
+
+  defp metadata_value_size(%FerricStore.Instance{} = store, key), do: Ops.value_size(store, key)
+
+  defp metadata_value_size(%Ferricstore.Store.LocalTxStore{} = store, key),
+    do: Ops.value_size(store, key)
+
+  defp metadata_value_size(%{value_size: value_size}, key) when is_function(value_size, 1),
+    do: value_size.(key)
+
+  defp metadata_value_size(_store, _key), do: :unknown
+
+  defp read_getrange_value(key, start_idx, end_idx, store) do
+    case read_string_value(key, store) do
+      :missing -> ""
+      @wrongtype_error -> @wrongtype_error
+      {:value, v} when is_integer(v) -> do_getrange(Integer.to_string(v), start_idx, end_idx)
+      {:value, v} when is_float(v) -> do_getrange(Float.to_string(v), start_idx, end_idx)
+      {:value, value} -> do_getrange(value, start_idx, end_idx)
+    end
+  end
+
+  defp getrange_empty_for_size?(size, start_idx, end_idx) do
+    start_norm = if start_idx < 0, do: max(size + start_idx, 0), else: start_idx
+    end_norm = if end_idx < 0, do: size + end_idx, else: end_idx
+
+    start_clamped = min(start_norm, size)
+    end_clamped = min(end_norm, size - 1)
+
+    start_clamped > end_clamped
+  end
 
   defp do_getrange(value, start_idx, end_idx) do
     len = byte_size(value)
