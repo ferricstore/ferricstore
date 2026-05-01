@@ -3,6 +3,7 @@ defmodule Ferricstore.Commands.SetTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.{Hash, List, Set, SortedSet}
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -115,6 +116,48 @@ defmodule Ferricstore.Commands.SetTest do
 
     test "SISMEMBER with wrong arity returns error" do
       assert {:error, _} = Set.handle("SISMEMBER", ["key"], MockStore.make())
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # SMISMEMBER
+  # ---------------------------------------------------------------------------
+
+  describe "SMISMEMBER" do
+    test "SMISMEMBER returns one result per requested member" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a", "b"], store)
+
+      assert [1, 0, 1] == Set.handle("SMISMEMBER", ["myset", "a", "missing", "b"], store)
+    end
+
+    test "SMISMEMBER uses compound_batch_get when the store provides it" do
+      type_key = CompoundKey.type_key("myset")
+
+      member_keys = [
+        CompoundKey.set_member("myset", "a"),
+        CompoundKey.set_member("myset", "missing"),
+        CompoundKey.set_member("myset", "b")
+      ]
+
+      store = %{
+        compound_get: fn
+          "myset", ^type_key ->
+            nil
+
+          "myset", compound_key ->
+            flunk(
+              "SMISMEMBER should use compound_batch_get, got per-member lookup #{inspect(compound_key)}"
+            )
+        end,
+        compound_batch_get: fn "myset", ^member_keys -> ["1", nil, "1"] end
+      }
+
+      assert [1, 0, 1] == Set.handle("SMISMEMBER", ["myset", "a", "missing", "b"], store)
+    end
+
+    test "SMISMEMBER with no members returns error" do
+      assert {:error, _} = Set.handle("SMISMEMBER", ["myset"], MockStore.make())
     end
   end
 
@@ -240,7 +283,11 @@ defmodule Ferricstore.Commands.SetTest do
       store = MockStore.make()
 
       for i <- 1..20 do
-        Set.handle("SADD", ["myset", "member#{String.pad_leading(Integer.to_string(i), 2, "0")}"], store)
+        Set.handle(
+          "SADD",
+          ["myset", "member#{String.pad_leading(Integer.to_string(i), 2, "0")}"],
+          store
+        )
       end
 
       [cursor, elements] = Set.handle("SSCAN", ["myset", "0", "COUNT", "5"], store)
@@ -694,7 +741,9 @@ defmodule Ferricstore.Commands.SetTest do
 
     test "SSCAN with unknown option returns error" do
       store = MockStore.make()
-      assert {:error, "ERR syntax error"} = Set.handle("SSCAN", ["myset", "0", "BOGUS", "val"], store)
+
+      assert {:error, "ERR syntax error"} =
+               Set.handle("SSCAN", ["myset", "0", "BOGUS", "val"], store)
     end
 
     test "SSCAN with odd trailing option returns error" do
@@ -734,7 +783,9 @@ defmodule Ferricstore.Commands.SetTest do
   end
 
   defp collect_sscan_members(store, key, cursor, count, acc) do
-    [next_cursor, elements] = Set.handle("SSCAN", [key, cursor, "COUNT", Integer.to_string(count)], store)
+    [next_cursor, elements] =
+      Set.handle("SSCAN", [key, cursor, "COUNT", Integer.to_string(count)], store)
+
     new_acc = acc ++ elements
 
     if next_cursor == "0" do

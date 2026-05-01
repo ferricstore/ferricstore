@@ -128,9 +128,13 @@ defmodule Ferricstore.Commands.Set do
 
   def handle("SMISMEMBER", [key | members], store) when members != [] do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
-      Enum.map(members, fn member ->
-        compound_key = CompoundKey.set_member(key, member)
-        if Ops.compound_get(store, key, compound_key) != nil, do: 1, else: 0
+      compound_keys = Enum.map(members, &CompoundKey.set_member(key, &1))
+
+      store
+      |> Ops.compound_batch_get(key, compound_keys)
+      |> Enum.map(fn
+        nil -> 0
+        _value -> 1
       end)
     end
   end
