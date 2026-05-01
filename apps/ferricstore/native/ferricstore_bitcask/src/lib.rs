@@ -225,7 +225,7 @@ fn parse_file_id(path: &std::path::Path) -> u64 {
 ///
 /// Pure I/O — no keydir, no Mutex for reads.
 /// The caller (Elixir Shard GenServer) serialises writes.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_record<'a>(
     env: Env<'a>,
@@ -263,7 +263,7 @@ fn v2_append_record<'a>(
 
 /// Append a tombstone record (logical delete) to a data file.
 /// Returns `{:ok, {offset, record_size}}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_tombstone<'a>(env: Env<'a>, path: String, key: Binary) -> NifResult<Term<'a>> {
     let p = std::path::Path::new(&path);
@@ -287,7 +287,7 @@ fn v2_append_tombstone<'a>(env: Env<'a>, path: String, key: Binary) -> NifResult
 
 /// Append a batch of records with a single fsync. Returns
 /// `{:ok, [{offset, value_size}, ...]}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_batch<'a>(
     env: Env<'a>,
@@ -623,7 +623,7 @@ fn v2_pread_batch<'a>(env: Env<'a>, path: String, locations: Vec<u64>) -> NifRes
 /// L-REMAIN-1 fix: open with write permission so `sync_data()` (fdatasync)
 /// actually flushes dirty pages written by other fds. `File::open()` opens
 /// read-only, and `fdatasync()` on a read-only fd is a no-op per POSIX.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_fsync(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     let p = std::path::Path::new(&path);
@@ -641,7 +641,7 @@ fn v2_fsync(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 /// operations inside it are durable. See `fsync_dir` doc for details.
 ///
 /// Returns `:ok` or `{:error, reason}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_fsync_dir(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     match fsync_dir(&path) {
@@ -653,7 +653,7 @@ fn v2_fsync_dir(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 /// Write a hint file from a list of entries.
 /// Each entry is `{key, file_id, offset, value_size, expire_at_ms}`.
 /// Returns `:ok` or `{:error, reason}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_write_hint_file<'a>(
     env: Env<'a>,
@@ -731,7 +731,7 @@ fn v2_read_hint_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
 /// Returns `{:ok, [{new_offset, new_size}, ...]}`.
 ///
 /// Used by compaction to copy only live records to a new file.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_copy_records(
     env: Env<'_>,
@@ -787,7 +787,7 @@ fn v2_copy_records(
 /// Returns `{:ok, [{new_offset, new_size}, ...]}` for live offsets only, in
 /// the same order as `live_offsets`. Tombstones are copied in source-offset
 /// order so replay still suppresses older values after compaction.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_copy_records_preserve_tombstones(
     env: Env<'_>,
