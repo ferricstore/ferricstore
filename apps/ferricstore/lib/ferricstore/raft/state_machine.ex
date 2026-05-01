@@ -4041,7 +4041,11 @@ defmodule Ferricstore.Raft.StateMachine do
   # Prob commands don't write to Bitcask log (they write to their own files),
   # so they use with_pending_writes to ensure any metadata puts are batched.
   defp do_prob_command(state, fun) do
-    with_pending_writes(state, fun)
+    if Process.get(:sm_pending_writes, :undefined) == :undefined do
+      with_pending_writes(state, fun)
+    else
+      fun.()
+    end
   end
 
   # Returns the file path for a probabilistic data structure file.

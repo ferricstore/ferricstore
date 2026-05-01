@@ -1019,6 +1019,29 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert [{"batch_c", "val_c", 0, _, _, _, _}] = :ets.lookup(ets, "batch_c")
     end
 
+    test "probabilistic command in batch does not drop earlier pending puts", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      commands = [
+        {:put, "batch_before_prob", "keep-me", 0},
+        {:cms_create, "batch_cms", 20, 4}
+      ]
+
+      {_new_state, {:ok, [:ok, :ok]}} =
+        StateMachine.apply(%{}, {:batch, commands}, state)
+
+      value_size = byte_size("keep-me")
+
+      assert [{"batch_before_prob", "keep-me", 0, _, 0, _offset, ^value_size}] =
+               :ets.lookup(ets, "batch_before_prob")
+
+      assert {:ok, records} = NIF.v2_scan_file(active_file_path)
+      assert Enum.any?(records, &match?({"batch_before_prob", _off, ^value_size, 0, false}, &1))
+      assert Enum.any?(records, &match?({"batch_cms", _off, _size, 0, false}, &1))
+    end
+
     test "mixed put and delete batch", %{state: state, ets: ets} do
       {state2, :ok} = StateMachine.apply(%{}, {:put, "mix_a", "va", 0}, state)
 
