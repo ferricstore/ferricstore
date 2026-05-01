@@ -124,6 +124,24 @@ defmodule Ferricstore.Store.AsyncListOpTest do
       assert ["fresh"] == Router.list_op(ctx(), key, {:lrange, 0, -1})
     end
 
+    test "LRANGE treats an unswept fully expired hash as a missing list" do
+      key = ukey("expired_hash_to_list_read")
+      expired_at = Ferricstore.HLC.now_ms() - 1_000
+
+      assert :ok = Router.compound_put(ctx(), key, CompoundKey.type_key(key), "hash", 0)
+
+      assert :ok =
+               Router.compound_put(
+                 ctx(),
+                 key,
+                 CompoundKey.hash_field(key, "field"),
+                 "value",
+                 expired_at
+               )
+
+      assert [] == Router.list_op(ctx(), key, {:lrange, 0, -1})
+    end
+
     test "LPUSH on a live plain value returns WRONGTYPE and leaves the value intact" do
       key = ukey("plain_to_list")
 
