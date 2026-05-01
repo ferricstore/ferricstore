@@ -95,17 +95,28 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     end
 
     ets_size = :ets.info(keydir, :size)
-    # Log recovered keys for debugging (only first 10 to avoid log spam)
-    sample_keys =
-      :ets.tab2list(keydir)
-      |> Enum.take(10)
-      |> Enum.map(fn {k, _v, _e, _l, fid, off, vs} ->
-        "#{k}(fid=#{inspect(fid)},off=#{off},vs=#{vs})"
-      end)
+    sample_keys = sample_keydir_entries(keydir, 10)
 
     Logger.debug(
       "Shard #{shard_index}: recover_keydir done, ETS size: #{ets_size}, keys: #{inspect(sample_keys)}"
     )
+  end
+
+  defp sample_keydir_entries(keydir, limit) do
+    match_spec = [
+      {{:"$1", :_, :_, :_, :"$2", :"$3", :"$4"}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}
+    ]
+
+    case :ets.select(keydir, match_spec, limit) do
+      {entries, _continuation} -> format_keydir_sample(entries)
+      :"$end_of_table" -> []
+    end
+  end
+
+  defp format_keydir_sample(entries) do
+    Enum.map(entries, fn {k, fid, off, vs} ->
+      "#{k}(fid=#{inspect(fid)},off=#{off},vs=#{vs})"
+    end)
   end
 
   @spec recover_from_log(binary(), binary(), :ets.tid(), non_neg_integer()) :: :ok
