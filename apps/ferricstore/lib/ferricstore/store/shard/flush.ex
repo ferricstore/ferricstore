@@ -82,8 +82,18 @@ defmodule Ferricstore.Store.Shard.Flush do
 
     if state.instance_ctx &&
          :atomics.get(state.instance_ctx.checkpoint_flags, idx + 1) == 1 do
-      :atomics.put(state.instance_ctx.checkpoint_flags, idx + 1, 0)
-      NIF.v2_fsync(state.active_file_path)
+      case NIF.v2_fsync(state.active_file_path) do
+        :ok ->
+          :atomics.put(state.instance_ctx.checkpoint_flags, idx + 1, 0)
+          Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
+
+        {:error, reason} ->
+          Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.index)
+
+          Logger.error(
+            "Shard #{state.index}: flush_pending_sync fsync failed: #{inspect(reason)} — keeping checkpoint dirty"
+          )
+      end
     end
 
     state
