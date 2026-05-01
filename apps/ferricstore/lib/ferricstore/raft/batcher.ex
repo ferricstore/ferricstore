@@ -345,6 +345,17 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc """
+  Enqueues multiple async-durability writes and waits until the Batcher has
+  accepted the whole batch into local slots.
+  """
+  @spec async_submit_batch_ordered(non_neg_integer(), [command()]) :: :ok | {:error, :overloaded}
+  def async_submit_batch_ordered(_shard_index, []), do: :ok
+
+  def async_submit_batch_ordered(shard_index, commands) do
+    GenServer.call(batcher_name(shard_index), {:async_submit_batch_ordered, commands}, 5_000)
+  end
+
+  @doc """
   Submits a list of async commands to the batcher in a single cast.
 
   Same semantics as calling `async_submit/2` for each command, but sends
@@ -488,6 +499,20 @@ defmodule Ferricstore.Raft.Batcher do
       {:reply, {:error, :overloaded}, state}
     else
       {:noreply, new_state} = enqueue_async_submit_under_capacity(command, state)
+      {:reply, :ok, new_state}
+    end
+  end
+
+  def handle_call({:async_submit_batch_ordered, commands}, _from, state) do
+    if pending_full?(state) do
+      emit_async_submit_overloaded(state)
+      {:reply, {:error, :overloaded}, state}
+    else
+      {:noreply, new_state} =
+        Enum.reduce(commands, {:noreply, state}, fn cmd, {:noreply, st} ->
+          enqueue_async_submit_under_capacity(cmd, st)
+        end)
+
       {:reply, :ok, new_state}
     end
   end

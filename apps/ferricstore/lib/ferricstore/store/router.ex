@@ -1157,6 +1157,16 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  defp async_submit_batch_to_raft(_idx, []), do: :ok
+
+  defp async_submit_batch_to_raft(idx, commands) do
+    case Ferricstore.Raft.Batcher.async_submit_batch_ordered(idx, commands) do
+      :ok -> :ok
+      {:error, :overloaded} -> {:error, "ERR async replication overloaded"}
+      {:error, reason} -> {:error, "ERR async replication failed: #{inspect(reason)}"}
+    end
+  end
+
   # -------------------------------------------------------------------
   # Routing helpers
   # -------------------------------------------------------------------
@@ -1844,6 +1854,11 @@ defmodule Ferricstore.Store.Router do
       Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, raft_cmds, _large_disk_batch} ->
         shard_locations = Map.get(disk_locations, idx, %{})
 
+        case async_submit_batch_to_raft(idx, raft_cmds) do
+          :ok -> :ok
+          {:error, reason} -> throw({:async_error, reason})
+        end
+
         ets_tuples =
           Enum.map(entries, fn {key, value, value_for_ets} ->
             clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
@@ -1860,8 +1875,6 @@ defmodule Ferricstore.Store.Router do
 
         :ets.insert(keydir, ets_tuples)
 
-        Ferricstore.Raft.Batcher.async_submit_batch(idx, raft_cmds)
-
         if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, length(shard_kvs))
       end)
     after
@@ -1872,6 +1885,9 @@ defmodule Ferricstore.Store.Router do
   catch
     :throw, {:disk_error, reason} ->
       {:error, "ERR disk write failed: #{inspect(reason)}"}
+
+    :throw, {:async_error, reason} ->
+      {:error, reason}
   end
 
   defp dedupe_last_kvs(kv_pairs) do

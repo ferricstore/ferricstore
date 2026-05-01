@@ -98,6 +98,27 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
       assert {:error, "ERR async replication overloaded"} = Router.put(ctx(), key, "value", 0)
       assert Router.get(ctx(), key) == nil
     end
+
+    test "batch async PUT does not become locally visible when Batcher is overloaded" do
+      key = "#{@ns}:overloaded_batch_put_#{:erlang.unique_integer([:positive])}"
+      idx = Router.shard_for(ctx(), key)
+
+      on_exit(fn -> Batcher.reset_pending(idx) end)
+
+      for _ <- 1..64 do
+        Batcher.__inject_async_pending__(
+          idx,
+          make_ref(),
+          [{:async, node(), {:put, key, "old", 0}}],
+          0
+        )
+      end
+
+      assert {:error, "ERR async replication overloaded"} =
+               Router.batch_async_put(ctx(), [{key, "value"}])
+
+      assert Router.get(ctx(), key) == nil
+    end
   end
 
   # ---------------------------------------------------------------------------
