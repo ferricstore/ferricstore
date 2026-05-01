@@ -256,9 +256,19 @@ defmodule Ferricstore.Commands.BlockingTest do
 
   describe "blocking pop behavior" do
     test "BLPOP returns immediately when list has data" do
-      # Simulate: list with data, pop should return immediately
-      # This tests the argument parsing and the concept, not the TCP connection
-      assert {:ok, ["mylist"], 5000} = Blocking.parse_blpop_args(["mylist", "5"])
+      store = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a", "b"], store)
+
+      assert ["mylist", "a"] == Blocking.handle("BLPOP", ["mylist", "5"], store)
+      assert ["b"] == List.handle("LRANGE", ["mylist", "0", "-1"], store)
+    end
+
+    test "BRPOP returns immediately from the right side when list has data" do
+      store = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a", "b"], store)
+
+      assert ["mylist", "b"] == Blocking.handle("BRPOP", ["mylist", "5"], store)
+      assert ["a"] == List.handle("LRANGE", ["mylist", "0", "-1"], store)
     end
 
     test "waiter notification triggers pop" do

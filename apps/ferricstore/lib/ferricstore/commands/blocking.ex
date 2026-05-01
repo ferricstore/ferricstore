@@ -141,7 +141,8 @@ defmodule Ferricstore.Commands.Blocking do
     - `{:ok, source, destination, timeout_ms}` -- parsed arguments
     - `{:error, reason}` -- parse error
   """
-  @spec parse_brpoplpush_args([binary()]) :: {:ok, binary(), binary(), non_neg_integer()} | {:error, binary()}
+  @spec parse_brpoplpush_args([binary()]) ::
+          {:ok, binary(), binary(), non_neg_integer()} | {:error, binary()}
   def parse_brpoplpush_args([source, destination, timeout_str]) do
     case parse_timeout(timeout_str) do
       {:ok, timeout_ms} ->
@@ -200,31 +201,17 @@ defmodule Ferricstore.Commands.Blocking do
 
   defp parse_blmpop_count(_), do: {:error, "ERR syntax error"}
 
-  alias Ferricstore.Store.Ops
+  alias Ferricstore.Commands.List
 
   # Simple non-blocking handle/3 for commands dispatched from connection.ex.
   # Returns the result immediately without blocking (timeout=0 behavior).
   @spec handle(binary(), [binary()], map()) :: term()
-  def handle("BLPOP", args, store) do
-    case parse_blpop_args(args) do
-      {:ok, keys, _timeout_ms} ->
-        result = Enum.find_value(keys, fn key ->
-          case Ops.get(store, key) do
-            nil -> nil
-            _val -> {key, Ops.get(store, key)}
-          end
-        end)
-        if result, do: Tuple.to_list(result), else: nil
-      {:error, _} = err -> err
-    end
-  end
-
-  def handle("BRPOP", args, store), do: handle("BLPOP", args, store)
+  def handle("BLPOP", args, store), do: do_blocking_pop(args, store, "LPOP")
+  def handle("BRPOP", args, store), do: do_blocking_pop(args, store, "RPOP")
 
   def handle("BRPOPLPUSH", args, store) do
     case parse_brpoplpush_args(args) do
       {:ok, source, destination, _timeout_ms} ->
-        alias Ferricstore.Commands.List
         List.handle("LMOVE", [source, destination, "RIGHT", "LEFT"], store)
 
       {:error, _} = err ->
@@ -235,7 +222,6 @@ defmodule Ferricstore.Commands.Blocking do
   def handle("BLMOVE", args, store) do
     case parse_blmove_args(args) do
       {:ok, source, destination, from_dir, to_dir, _timeout_ms} ->
-        alias Ferricstore.Commands.List
         List.handle("LMOVE", [source, destination, to_string(from_dir), to_string(to_dir)], store)
 
       {:error, _} = err ->
@@ -246,19 +232,39 @@ defmodule Ferricstore.Commands.Blocking do
   def handle("BLMPOP", args, store) do
     case parse_blmpop_args(args) do
       {:ok, keys, direction, count, _timeout_ms} ->
-        alias Ferricstore.Commands.List
         pop_cmd = if direction == :left, do: "LPOP", else: "RPOP"
+
         pop_args_fn = fn key ->
           if count == 1, do: [key], else: [key, to_string(count)]
         end
 
         Enum.find_value(keys, fn key ->
           case List.handle(pop_cmd, pop_args_fn.(key), store) do
-            nil -> nil
-            {:error, _} -> nil
+            nil ->
+              nil
+
+            {:error, _} ->
+              nil
+
             value ->
               elements = if is_list(value), do: value, else: [value]
               [key, elements]
+          end
+        end)
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp do_blocking_pop(args, store, pop_cmd) do
+    case parse_blpop_args(args) do
+      {:ok, keys, _timeout_ms} ->
+        Enum.reduce_while(keys, nil, fn key, _acc ->
+          case List.handle(pop_cmd, [key], store) do
+            nil -> {:cont, nil}
+            {:error, _} = err -> {:halt, err}
+            value -> {:halt, [key, value]}
           end
         end)
 
