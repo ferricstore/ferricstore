@@ -881,6 +881,27 @@ defmodule Ferricstore.Commands.JsonTest do
       assert result == ["1", nil]
     end
 
+    test "uses batch_get when the store provides it" do
+      raw1 = :erlang.term_to_binary({:json, Jason.encode!(%{"name" => "Ada"})})
+      raw2 = :erlang.term_to_binary({:json, Jason.encode!(%{"name" => "Linus"})})
+
+      store = %{
+        batch_get: fn keys ->
+          Enum.map(keys, fn
+            "user:1" -> raw1
+            "user:2" -> raw2
+            _ -> nil
+          end)
+        end,
+        get: fn key ->
+          flunk("JSON.MGET should use batch_get, got per-key GET for #{inspect(key)}")
+        end
+      }
+
+      assert [~s("Ada"), ~s("Linus"), nil] ==
+               Json.handle("JSON.MGET", ["user:1", "user:2", "missing", "$.name"], store)
+    end
+
     test "wrong number of arguments returns error" do
       assert {:error, _} = Json.handle("JSON.MGET", [], MockStore.make())
       assert {:error, _} = Json.handle("JSON.MGET", ["key"], MockStore.make())

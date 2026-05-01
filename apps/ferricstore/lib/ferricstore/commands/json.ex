@@ -299,7 +299,7 @@ defmodule Ferricstore.Commands.Json do
 
     case parse_path(path) do
       :error -> {:error, "ERR invalid JSONPath syntax"}
-      segments -> Enum.map(keys, &mget_one(&1, segments, store))
+      segments -> mget_many(keys, segments, store)
     end
   end
 
@@ -464,11 +464,18 @@ defmodule Ferricstore.Commands.Json do
     end
   end
 
-  # Gets a value at path from a single key for MGET.
-  defp mget_one(key, segments, store) do
-    case read_json(key, store) do
+  defp mget_many(keys, segments, store) do
+    store
+    |> Ops.batch_get(keys)
+    |> Enum.map(&mget_one_raw(&1, segments))
+  end
+
+  defp mget_one_raw(nil, _segments), do: nil
+
+  defp mget_one_raw(raw, segments) do
+    case decode_raw_json(raw) do
       {:ok, root} -> mget_encode(root, segments)
-      _ -> nil
+      {:error, _} -> nil
     end
   end
 
