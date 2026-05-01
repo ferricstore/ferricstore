@@ -335,6 +335,16 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc """
+  Enqueues an async-durability write and waits until the Batcher has accepted
+  it into its local slot. The Raft submission is still asynchronous/batched,
+  but callers can distinguish accepted writes from local Batcher backpressure.
+  """
+  @spec async_submit_ordered(non_neg_integer(), command()) :: :ok | {:error, :overloaded}
+  def async_submit_ordered(shard_index, inner_command) do
+    GenServer.call(batcher_name(shard_index), {:async_submit_ordered, inner_command}, 5_000)
+  end
+
+  @doc """
   Submits a list of async commands to the batcher in a single cast.
 
   Same semantics as calling `async_submit/2` for each command, but sends
@@ -470,6 +480,16 @@ defmodule Ferricstore.Raft.Batcher do
 
   def handle_call({:write_forwarded, command, origin_node}, from, state) do
     enqueue_write(command, remote_origin_from(origin_node, from), state)
+  end
+
+  def handle_call({:async_submit_ordered, command}, _from, state) do
+    if pending_full?(state) do
+      emit_async_submit_overloaded(state)
+      {:reply, {:error, :overloaded}, state}
+    else
+      {:noreply, new_state} = enqueue_async_submit_under_capacity(command, state)
+      {:reply, :ok, new_state}
+    end
   end
 
   def handle_call(:flush, from, state) do
@@ -1327,20 +1347,23 @@ defmodule Ferricstore.Raft.Batcher do
   # track — Router already returned :ok to its caller.
   defp enqueue_async_submit(command, state) do
     if pending_full?(state) do
-      :telemetry.execute(
-        [:ferricstore, :batcher, :async_dropped],
-        %{batch_size: 1},
-        %{shard_index: state.shard_index, reason: :overloaded}
-      )
-
-      Logger.warning(
-        "Batcher shard=#{state.shard_index}: async command not enqueued because pending is full"
-      )
-
+      emit_async_submit_overloaded(state)
       {:noreply, state}
     else
       enqueue_async_submit_under_capacity(command, state)
     end
+  end
+
+  defp emit_async_submit_overloaded(state) do
+    :telemetry.execute(
+      [:ferricstore, :batcher, :async_dropped],
+      %{batch_size: 1},
+      %{shard_index: state.shard_index, reason: :overloaded}
+    )
+
+    Logger.warning(
+      "Batcher shard=#{state.shard_index}: async command not enqueued because pending is full"
+    )
   end
 
   defp enqueue_async_submit_under_capacity(command, state) do

@@ -888,6 +888,7 @@ defmodule Ferricstore.Store.Router do
 
   defp do_async_write_put(ctx, idx, key, value, expire_at_ms) do
     keydir = elem(ctx.keydir_refs, idx)
+    raft_cmd = {:put, key, value, expire_at_ms}
 
     value_for_ets =
       case value do
@@ -919,8 +920,18 @@ defmodule Ferricstore.Store.Router do
 
           size = :counters.info(ctx.write_version).size
           if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
-          async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
-          :ok
+
+          case async_submit_to_raft(idx, raft_cmd) do
+            :ok ->
+              :ok
+
+            {:error, _} = err ->
+              track_keydir_binary_delete(ctx, idx, keydir, key)
+              :ets.delete(keydir, key)
+              {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+              Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
+              err
+          end
 
         {:error, reason} ->
           {:error, "ERR disk write failed: #{inspect(reason)}"}
@@ -928,13 +939,14 @@ defmodule Ferricstore.Store.Router do
     else
       # Small value: ETS insert only. Bitcask write deferred to state machine
       # apply (flush_pending_writes) — avoids per-key NIF overhead in Router.
-      clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
-      track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
-      :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
-      size = :counters.info(ctx.write_version).size
-      if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
-      async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
-      :ok
+      with :ok <- async_submit_to_raft(idx, raft_cmd) do
+        clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
+        track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
+        :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
+        size = :counters.info(ctx.write_version).size
+        if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
+        :ok
+      end
     end
   end
 
@@ -1133,13 +1145,16 @@ defmodule Ferricstore.Store.Router do
   defp stored_value_size(value) when is_float(value), do: byte_size(Float.to_string(value))
   defp stored_value_size(value), do: value |> to_string() |> byte_size()
 
-  # Submit an async write to the shard's Batcher, which batches many async
-  # commands into a single `ra.pipeline_command({:batch, [{:async, cmd}, ...]})`
-  # call. Router has already persisted locally (ETS + Bitcask for big values)
-  # by the time this is called — the Raft submission is for replication only.
-  # Fire-and-forget: Router has already returned :ok to the caller.
+  # Enqueue an async write in the shard's Batcher. The Batcher still batches
+  # many async commands into one Raft pipeline submission, but Router waits
+  # until the local Batcher accepts this command so backpressure is returned
+  # instead of exposing a local-only write as successful.
   defp async_submit_to_raft(idx, command) do
-    Ferricstore.Raft.Batcher.async_submit(idx, command)
+    case Ferricstore.Raft.Batcher.async_submit_ordered(idx, command) do
+      :ok -> :ok
+      {:error, :overloaded} -> {:error, "ERR async replication overloaded"}
+      {:error, reason} -> {:error, "ERR async replication failed: #{inspect(reason)}"}
+    end
   end
 
   # -------------------------------------------------------------------

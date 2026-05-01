@@ -16,6 +16,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.BitcaskWriter
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
@@ -77,6 +78,25 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
       after
         :telemetry.detach(handler_id)
       end
+    end
+
+    test "async PUT does not become locally visible when Batcher is overloaded" do
+      key = "#{@ns}:overloaded_put_#{:erlang.unique_integer([:positive])}"
+      idx = Router.shard_for(ctx(), key)
+
+      on_exit(fn -> Batcher.reset_pending(idx) end)
+
+      for _ <- 1..64 do
+        Batcher.__inject_async_pending__(
+          idx,
+          make_ref(),
+          [{:async, node(), {:put, key, "old", 0}}],
+          0
+        )
+      end
+
+      assert {:error, "ERR async replication overloaded"} = Router.put(ctx(), key, "value", 0)
+      assert Router.get(ctx(), key) == nil
     end
   end
 
