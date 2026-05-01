@@ -94,7 +94,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     test "mixed batch rolls back same-shard small keys when large disk write fails" do
       {small_key, large_key} = same_shard_keys(ctx(), "bap_disk_fail")
       idx = Router.shard_for(ctx(), small_key)
-      original = Ferricstore.Store.ActiveFile.get(idx)
+      original = Ferricstore.Store.ActiveFile.get(ctx(), idx)
 
       missing_dir =
         Path.join(
@@ -103,7 +103,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         )
 
       missing_path = Path.join(missing_dir, "00000.log")
-      Ferricstore.Store.ActiveFile.publish(idx, 99_999, missing_path, missing_dir)
+      Ferricstore.Store.ActiveFile.publish(ctx(), idx, 99_999, missing_path, missing_dir)
 
       try do
         large = :binary.copy("X", 100 * 1024)
@@ -115,7 +115,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         assert nil == Router.get(ctx(), large_key)
       after
         {file_id, file_path, shard_data_path} = original
-        Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_data_path)
+        Ferricstore.Store.ActiveFile.publish(ctx(), idx, file_id, file_path, shard_data_path)
       end
     end
 
@@ -123,7 +123,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       {small_key, large_key} = same_shard_keys(ctx(), "bap_disk_fail_existing")
       idx = Router.shard_for(ctx(), small_key)
       :ok = Router.put(ctx(), small_key, "before", 0)
-      original = Ferricstore.Store.ActiveFile.get(idx)
+      original = Ferricstore.Store.ActiveFile.get(ctx(), idx)
 
       missing_dir =
         Path.join(
@@ -132,7 +132,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         )
 
       missing_path = Path.join(missing_dir, "00000.log")
-      Ferricstore.Store.ActiveFile.publish(idx, 99_998, missing_path, missing_dir)
+      Ferricstore.Store.ActiveFile.publish(ctx(), idx, 99_998, missing_path, missing_dir)
 
       try do
         large = :binary.copy("Y", 100 * 1024)
@@ -144,14 +144,14 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         assert nil == Router.get(ctx(), large_key)
       after
         {file_id, file_path, shard_data_path} = original
-        Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_data_path)
+        Ferricstore.Store.ActiveFile.publish(ctx(), idx, file_id, file_path, shard_data_path)
       end
     end
 
     test "cross-shard failure does not leave earlier shard writes visible" do
       small_key = key_for_shard(ctx(), "bap_cross_fail_small", 0)
       large_key = key_for_shard(ctx(), "bap_cross_fail_large", 1)
-      original = Ferricstore.Store.ActiveFile.get(1)
+      original = Ferricstore.Store.ActiveFile.get(ctx(), 1)
 
       missing_dir =
         Path.join(
@@ -160,7 +160,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         )
 
       missing_path = Path.join(missing_dir, "00000.log")
-      Ferricstore.Store.ActiveFile.publish(1, 99_997, missing_path, missing_dir)
+      Ferricstore.Store.ActiveFile.publish(ctx(), 1, 99_997, missing_path, missing_dir)
 
       try do
         large = :binary.copy("Q", 100 * 1024)
@@ -172,7 +172,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         assert nil == Router.get(ctx(), large_key)
       after
         {file_id, file_path, shard_data_path} = original
-        Ferricstore.Store.ActiveFile.publish(1, file_id, file_path, shard_data_path)
+        Ferricstore.Store.ActiveFile.publish(ctx(), 1, file_id, file_path, shard_data_path)
       end
     end
   end
@@ -228,7 +228,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       default_ctx = FerricStore.Instance.get(:default)
       {small_key, large_key} = same_shard_keys(default_ctx, "bs_disk_fail")
       idx = Router.shard_for(default_ctx, small_key)
-      original = Ferricstore.Store.ActiveFile.get(idx)
+      original = Ferricstore.Store.ActiveFile.get(default_ctx, idx)
 
       missing_dir =
         Path.join(
@@ -237,7 +237,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         )
 
       missing_path = Path.join(missing_dir, "00000.log")
-      Ferricstore.Store.ActiveFile.publish(idx, 98_998, missing_path, missing_dir)
+      Ferricstore.Store.ActiveFile.publish(default_ctx, idx, 98_998, missing_path, missing_dir)
 
       try do
         large = :binary.copy("Z", 100 * 1024)
@@ -251,7 +251,14 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         assert {:ok, nil} == FerricStore.get(large_key)
       after
         {file_id, file_path, shard_data_path} = original
-        Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_data_path)
+
+        Ferricstore.Store.ActiveFile.publish(
+          default_ctx,
+          idx,
+          file_id,
+          file_path,
+          shard_data_path
+        )
       end
     end
   end
