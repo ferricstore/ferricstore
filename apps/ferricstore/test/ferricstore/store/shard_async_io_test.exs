@@ -188,6 +188,62 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert "dv" == GenServer.call(pid, {:get, "dk"})
     end
 
+    test "EXISTS miss does not force read-side fsync" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
+
+      :atomics.put(ctx.checkpoint_flags, 1, 0)
+      :ok = GenServer.call(pid, {:put, "dirty_exists_source", "value", 0})
+      Process.sleep(10)
+
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1
+      assert false == GenServer.call(pid, {:exists, "missing_exists_key"})
+
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1,
+             "a pure EXISTS miss must not fsync unrelated dirty Bitcask data"
+    end
+
+    test "compound_get miss does not force read-side fsync" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
+
+      :atomics.put(ctx.checkpoint_flags, 1, 0)
+      :ok = GenServer.call(pid, {:put, "dirty_compound_source", "value", 0})
+      Process.sleep(10)
+
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1
+
+      assert nil ==
+               GenServer.call(
+                 pid,
+                 {:compound_get, "missing_hash", "missing_hash" <> <<0>> <> "field"}
+               )
+
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1,
+             "a pure compound_get miss must not fsync unrelated dirty Bitcask data"
+    end
+
+    test "compound_get_meta miss does not force read-side fsync" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
+
+      :atomics.put(ctx.checkpoint_flags, 1, 0)
+      :ok = GenServer.call(pid, {:put, "dirty_compound_meta_source", "value", 0})
+      Process.sleep(10)
+
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1
+
+      assert nil ==
+               GenServer.call(
+                 pid,
+                 {:compound_get_meta, "missing_hash_meta",
+                  "missing_hash_meta" <> <<0>> <> "field"}
+               )
+
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1,
+             "a pure compound_get_meta miss must not fsync unrelated dirty Bitcask data"
+    end
+
     test "multiple puts before flush are all readable" do
       {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
       on_exit(fn -> cleanup_shard(pid, ctx, dir) end)

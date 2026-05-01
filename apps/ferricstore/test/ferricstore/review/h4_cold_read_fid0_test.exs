@@ -125,6 +125,42 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
       assert offset > 0
       assert size == byte_size(large)
     end
+
+    test "compound_get waits for a truly pending large value", %{shard: shard, keydir: keydir} do
+      redis_key = "pending_hash_get"
+      field_key = "H:" <> redis_key <> <<0>> <> "field"
+      large = String.duplicate("G", @threshold + 100)
+
+      :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
+      :ok = GenServer.call(shard, {:compound_put, redis_key, field_key, large, 0})
+
+      assert [{^field_key, nil, _exp, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, field_key)
+
+      send(shard, {:tokio_complete, 999_999, :ok, :ok})
+
+      assert large == GenServer.call(shard, {:compound_get, redis_key, field_key})
+    end
+
+    test "compound_get_meta waits for a truly pending large value", %{
+      shard: shard,
+      keydir: keydir
+    } do
+      redis_key = "pending_hash_meta"
+      field_key = "H:" <> redis_key <> <<0>> <> "field"
+      large = String.duplicate("E", @threshold + 100)
+      expire_at_ms = Ferricstore.HLC.now_ms() + 60_000
+
+      :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
+      :ok = GenServer.call(shard, {:compound_put, redis_key, field_key, large, expire_at_ms})
+
+      assert [{^field_key, nil, ^expire_at_ms, _lfu, :pending, 0, 0}] =
+               :ets.lookup(keydir, field_key)
+
+      send(shard, {:tokio_complete, 999_999, :ok, :ok})
+
+      assert {^large, ^expire_at_ms} =
+               GenServer.call(shard, {:compound_get_meta, redis_key, field_key})
+    end
   end
 
   describe "prefix scan on unflushed large value" do

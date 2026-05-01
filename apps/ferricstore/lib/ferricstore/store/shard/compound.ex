@@ -34,9 +34,12 @@ defmodule Ferricstore.Store.Shard.Compound do
             {:reply, nil, state}
 
           :miss ->
-            state = ShardFlush.await_in_flight(state)
-            state = ShardFlush.flush_pending_sync(state)
-            {:reply, ShardETS.warm_from_store(state, compound_key), state}
+            if ShardETS.pending_cold?(state, compound_key) do
+              state = ShardFlush.flush_pending_for_read(state)
+              {:reply, ShardETS.warm_from_store(state, compound_key), state}
+            else
+              {:reply, nil, state}
+            end
         end
 
       dedicated_path ->
@@ -80,9 +83,12 @@ defmodule Ferricstore.Store.Shard.Compound do
             {:reply, nil, state}
 
           :miss ->
-            state = ShardFlush.await_in_flight(state)
-            state = ShardFlush.flush_pending_sync(state)
-            {:reply, ShardETS.warm_meta_from_store(state, compound_key), state}
+            if ShardETS.pending_cold?(state, compound_key) do
+              state = ShardFlush.flush_pending_for_read(state)
+              {:reply, ShardETS.warm_meta_from_store(state, compound_key), state}
+            else
+              {:reply, nil, state}
+            end
         end
 
       dedicated_path ->

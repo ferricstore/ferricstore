@@ -121,7 +121,6 @@ defmodule Ferricstore.Store.Shard.Reads do
   @spec handle_exists(binary(), map()) :: {:reply, boolean(), map()}
   @doc false
   def handle_exists(key, state) do
-    # For ETS misses we need Bitcask to be up to date — flush first.
     case ShardETS.ets_lookup(state, key) do
       {:hit, _value, _expire_at_ms} ->
         {:reply, true, state}
@@ -137,9 +136,7 @@ defmodule Ferricstore.Store.Shard.Reads do
         if ShardETS.pending_cold?(state, key) do
           {:reply, true, state}
         else
-          state = ShardFlush.await_in_flight(state)
-          state = ShardFlush.flush_pending_sync(state)
-          {:reply, do_get(state, key) != nil, state}
+          {:reply, false, state}
         end
     end
   end
