@@ -1344,6 +1344,7 @@ defmodule Ferricstore.Store.Router do
     |> Enum.group_by(fn {key, _value} -> shard_for(ctx, key) end)
     |> Enum.each(fn {idx, shard_kvs} ->
       keydir = elem(ctx.keydir_refs, idx)
+      original_rows = Enum.map(shard_kvs, fn {key, _value} -> {key, :ets.lookup(keydir, key)} end)
 
       {ets_tuples, raft_cmds, large_disk_batch} =
         Enum.reduce(shard_kvs, {[], [], []}, fn {key, value}, {ets_acc, raft_acc, disk_acc} ->
@@ -1376,7 +1377,7 @@ defmodule Ferricstore.Store.Router do
             end)
 
           {:error, reason} ->
-            Enum.each(large_disk_batch, fn {key, _, _} -> :ets.delete(keydir, key) end)
+            rollback_batch_async_put(ctx, idx, keydir, original_rows)
             throw({:disk_error, reason})
         end
       end
@@ -1390,6 +1391,23 @@ defmodule Ferricstore.Store.Router do
   catch
     :throw, {:disk_error, reason} ->
       {:error, "ERR disk write failed: #{inspect(reason)}"}
+  end
+
+  defp rollback_batch_async_put(ctx, idx, keydir, original_rows) do
+    Enum.each(original_rows, fn {key, rows} ->
+      track_keydir_binary_delete(ctx, idx, keydir, key)
+      :ets.delete(keydir, key)
+
+      case rows do
+        [row] ->
+          {_key, value, _exp, _lfu, _fid, _off, _vsize} = row
+          track_keydir_binary_insert(ctx, idx, keydir, key, value)
+          :ets.insert(keydir, row)
+
+        [] ->
+          :ok
+      end
+    end)
   end
 
   @doc """

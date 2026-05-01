@@ -82,6 +82,63 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       :ok = Router.batch_async_put(ctx(), [{key, "updated"}])
       assert Router.get(ctx(), key) == "updated"
     end
+
+    test "mixed batch rolls back same-shard small keys when large disk write fails" do
+      {small_key, large_key} = same_shard_keys(ctx(), "bap_disk_fail")
+      idx = Router.shard_for(ctx(), small_key)
+      original = Ferricstore.Store.ActiveFile.get(idx)
+
+      missing_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_missing_active_#{System.unique_integer([:positive])}"
+        )
+
+      missing_path = Path.join(missing_dir, "00000.log")
+      Ferricstore.Store.ActiveFile.publish(idx, 99_999, missing_path, missing_dir)
+
+      try do
+        large = :binary.copy("X", 100 * 1024)
+
+        assert {:error, "ERR disk write failed" <> _} =
+                 Router.batch_async_put(ctx(), [{small_key, "small"}, {large_key, large}])
+
+        assert nil == Router.get(ctx(), small_key)
+        assert nil == Router.get(ctx(), large_key)
+      after
+        {file_id, file_path, shard_data_path} = original
+        Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_data_path)
+      end
+    end
+
+    test "failed mixed batch restores overwritten same-shard keys" do
+      {small_key, large_key} = same_shard_keys(ctx(), "bap_disk_fail_existing")
+      idx = Router.shard_for(ctx(), small_key)
+      :ok = Router.put(ctx(), small_key, "before", 0)
+      original = Ferricstore.Store.ActiveFile.get(idx)
+
+      missing_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_missing_active_#{System.unique_integer([:positive])}"
+        )
+
+      missing_path = Path.join(missing_dir, "00000.log")
+      Ferricstore.Store.ActiveFile.publish(idx, 99_998, missing_path, missing_dir)
+
+      try do
+        large = :binary.copy("Y", 100 * 1024)
+
+        assert {:error, "ERR disk write failed" <> _} =
+                 Router.batch_async_put(ctx(), [{small_key, "after"}, {large_key, large}])
+
+        assert "before" == Router.get(ctx(), small_key)
+        assert nil == Router.get(ctx(), large_key)
+      after
+        {file_id, file_path, shard_data_path} = original
+        Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_data_path)
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -238,6 +295,21 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
+  defp same_shard_keys(ctx, base) do
+    prefix = "#{@ns_async}:#{base}:#{System.unique_integer([:positive])}"
+    keys = for i <- 1..200, do: "#{prefix}:#{i}"
+
+    Enum.find_value(keys, fn left ->
+      Enum.find_value(keys, fn
+        ^left ->
+          nil
+
+        right ->
+          if Router.shard_for(ctx, left) == Router.shard_for(ctx, right), do: {left, right}
+      end)
+    end)
+  end
+
   defp pack_keys(keys) do
     count = length(keys)
     body = for k <- keys, into: <<>>, do: <<byte_size(k)::16, k::binary>>
@@ -246,5 +318,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
   defp unpack_values(<<>>, 0), do: []
   defp unpack_values(<<0xFFFFFFFF::32, rest::binary>>, n), do: [nil | unpack_values(rest, n - 1)]
-  defp unpack_values(<<len::32, val::binary-size(len), rest::binary>>, n), do: [val | unpack_values(rest, n - 1)]
+
+  defp unpack_values(<<len::32, val::binary-size(len), rest::binary>>, n),
+    do: [val | unpack_values(rest, n - 1)]
 end
