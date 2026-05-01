@@ -218,6 +218,21 @@ defmodule Ferricstore.Commands.StringsTest do
       assert ["1"] == Strings.handle("MGET", ["a"], store)
     end
 
+    test "MGET uses batch_get when the store provides it" do
+      store = %{
+        batch_get: fn keys ->
+          Enum.map(keys, fn
+            "a" -> "1"
+            "b" -> "2"
+            _ -> nil
+          end)
+        end,
+        get: fn key -> flunk("MGET should use batch_get, got per-key GET for #{inspect(key)}") end
+      }
+
+      assert ["1", "2", nil] == Strings.handle("MGET", ["a", "b", "c"], store)
+    end
+
     test "MGET no args returns error" do
       assert {:error, _} = Strings.handle("MGET", [], MockStore.make())
     end

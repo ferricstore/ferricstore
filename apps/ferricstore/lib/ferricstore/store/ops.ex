@@ -39,6 +39,21 @@ defmodule Ferricstore.Store.Ops do
 
   def get(store, key) when is_map(store), do: store.get.(key)
 
+  @spec batch_get(store(), [binary()]) :: [binary() | nil]
+  def batch_get(%FerricStore.Instance{} = ctx, keys), do: Router.batch_get(ctx, keys)
+
+  def batch_get(%LocalTxStore{} = tx, keys), do: Enum.map(keys, &get(tx, &1))
+
+  def batch_get(store, keys) when is_map(store) do
+    case store do
+      %{batch_get: batch_get_fun} when is_function(batch_get_fun, 1) ->
+        batch_get_fun.(keys)
+
+      _ ->
+        Enum.map(keys, &get(store, &1))
+    end
+  end
+
   @spec get_meta(store(), binary()) :: {binary(), non_neg_integer()} | nil
   def get_meta(%FerricStore.Instance{} = ctx, key), do: Router.get_meta(ctx, key)
 
