@@ -26,8 +26,6 @@ defmodule Ferricstore.Store.Shard.Reads do
       {:cold, fid, off, _vsize, exp} ->
         # Cold key — value evicted from ETS but disk location known.
         # Use synchronous pread (v2_pread_at_async NIF not yet available).
-        state = ShardFlush.await_in_flight(state)
-        state = ShardFlush.flush_pending_sync(state)
         p = ShardETS.file_path(state.shard_data_path, fid)
 
         case NIF.v2_pread_at(p, off) do
@@ -95,8 +93,6 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       {:cold, fid, off, _vsize, exp} ->
         # Cold key — use synchronous pread (v2_pread_at_async NIF not yet available).
-        state = ShardFlush.await_in_flight(state)
-        state = ShardFlush.flush_pending_sync(state)
         p = ShardETS.file_path(state.shard_data_path, fid)
 
         case NIF.v2_pread_at(p, off) do

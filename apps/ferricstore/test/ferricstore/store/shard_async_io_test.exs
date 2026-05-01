@@ -244,6 +244,47 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
              "a pure compound_get_meta miss must not fsync unrelated dirty Bitcask data"
     end
 
+    test "GET of a known cold key does not force read-side fsync" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
+
+      large = :binary.copy("C", ctx.hot_cache_max_value_size + 1024)
+
+      :ok = GenServer.call(pid, {:put, "cold_read_key", large, 0})
+      :ok = GenServer.call(pid, :flush)
+
+      :atomics.put(ctx.checkpoint_flags, 1, 0)
+      :ok = GenServer.call(pid, {:put, "dirty_after_cold", "value", 0})
+      Process.sleep(10)
+
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1
+      assert large == GenServer.call(pid, {:get, "cold_read_key"})
+
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1,
+             "a known-location cold GET must not fsync unrelated dirty Bitcask data"
+    end
+
+    test "GET_META of a known cold key does not force read-side fsync" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
+
+      large = :binary.copy("M", ctx.hot_cache_max_value_size + 1024)
+      expire_at_ms = Ferricstore.HLC.now_ms() + 60_000
+
+      :ok = GenServer.call(pid, {:put, "cold_meta_key", large, expire_at_ms})
+      :ok = GenServer.call(pid, :flush)
+
+      :atomics.put(ctx.checkpoint_flags, 1, 0)
+      :ok = GenServer.call(pid, {:put, "dirty_after_cold_meta", "value", 0})
+      Process.sleep(10)
+
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1
+      assert {^large, ^expire_at_ms} = GenServer.call(pid, {:get_meta, "cold_meta_key"})
+
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1,
+             "a known-location cold GET_META must not fsync unrelated dirty Bitcask data"
+    end
+
     test "multiple puts before flush are all readable" do
       {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
       on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
