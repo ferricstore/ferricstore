@@ -4,7 +4,8 @@ defmodule Ferricstore.Store.PromotionTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Commands.{Hash, List, Set, SortedSet, Strings}
-  alias Ferricstore.Store.Router
+  alias Ferricstore.HLC
+  alias Ferricstore.Store.{CompoundKey, Router}
   alias Ferricstore.Test.ShardHelpers
 
   # Use a very low threshold so we can trigger promotion in tests
@@ -223,6 +224,29 @@ defmodule Ferricstore.Store.PromotionTest do
       assert promoted?(key)
 
       assert nil == Hash.handle("HGET", [key, "nonexistent"], store)
+    end
+
+    test "HGET does not resurrect expired promoted field after ETS miss" do
+      store = real_store()
+      key = ukey("hget_expired_promoted")
+      field = "expired_field"
+      compound_key = CompoundKey.hash_field(key, field)
+
+      populate_hash(store, key, @test_threshold + 1)
+      assert promoted?(key)
+
+      past = HLC.now_ms() - 1_000
+      :ok = store.compound_put.(key, compound_key, "expired_value", past)
+
+      ctx = FerricStore.Instance.get(:default)
+      idx = Router.shard_for(ctx, key)
+      keydir = elem(ctx.keydir_refs, idx)
+
+      # Force the promoted-read disk fallback. The fallback must still honor
+      # the field TTL stored in the dedicated Bitcask record.
+      :ets.delete(keydir, compound_key)
+
+      assert nil == Hash.handle("HGET", [key, field], store)
     end
   end
 

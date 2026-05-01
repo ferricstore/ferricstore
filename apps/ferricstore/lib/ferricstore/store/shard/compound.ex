@@ -440,15 +440,21 @@ defmodule Ferricstore.Store.Shard.Compound do
           {:ok, binary() | nil} | {:ok, binary(), non_neg_integer()} | {:error, term()}
   @doc false
   def promoted_read(dedicated_path, compound_key, keydir) do
+    now = HLC.now_ms()
+
     case :ets.lookup(keydir, compound_key) do
       [{^compound_key, _value, exp, _lfu, fid, offset, _vsize}]
-      when is_integer(fid) and offset > 0 ->
+      when (exp == 0 or exp > now) and is_integer(fid) and offset > 0 ->
         file_path = dedicated_file_path(dedicated_path, fid)
 
         case NIF.v2_pread_at(file_path, offset) do
           {:ok, value} -> {:ok, value, exp}
           other -> other
         end
+
+      [{^compound_key, _value, _exp, _lfu, _fid, _offset, _vsize}] ->
+        :ets.delete(keydir, compound_key)
+        {:ok, nil}
 
       _ ->
         active = Promotion.find_active(dedicated_path)
@@ -468,9 +474,13 @@ defmodule Ferricstore.Store.Shard.Compound do
                 {:ok, nil}
 
               {_key, offset, _vsize, exp, false} ->
-                case NIF.v2_pread_at(active, offset) do
-                  {:ok, value} -> {:ok, value, exp}
-                  other -> other
+                if exp == 0 or exp > now do
+                  case NIF.v2_pread_at(active, offset) do
+                    {:ok, value} -> {:ok, value, exp}
+                    other -> other
+                  end
+                else
+                  {:ok, nil}
                 end
             end
 
