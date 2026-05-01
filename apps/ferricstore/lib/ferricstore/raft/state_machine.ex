@@ -72,6 +72,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   @default_release_cursor_interval 20_000
 
+  defguardp valid_cold_location(file_id, offset, value_size)
+            when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+                   is_integer(value_size) and value_size >= 0
+
   @type shard_state :: %{
           shard_index: non_neg_integer(),
           shard_data_path: binary(),
@@ -1530,7 +1534,7 @@ defmodule Ferricstore.Raft.StateMachine do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
           value
 
-        [{^key, nil, 0, _lfu, fid, off, _vsize}] when is_integer(fid) and fid >= 0 ->
+        [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
           case NIF.v2_pread_at(path, off) do
@@ -1541,14 +1545,18 @@ defmodule Ferricstore.Raft.StateMachine do
         [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
           value
 
-        [{^key, nil, exp, _lfu, fid, off, _vsize}]
-        when exp > now and is_integer(fid) and fid >= 0 ->
+        [{^key, nil, exp, _lfu, fid, off, vsize}]
+        when exp > now and valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
           case NIF.v2_pread_at(path, off) do
             {:ok, v} -> v
             _ -> nil
           end
+
+        [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
+          cross_shard_delete_keydir_entry(ctx, key, nil)
+          nil
 
         _ ->
           nil
@@ -1571,7 +1579,7 @@ defmodule Ferricstore.Raft.StateMachine do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
           {value, 0}
 
-        [{^key, nil, 0, _lfu, fid, off, _vsize}] when is_integer(fid) and fid >= 0 ->
+        [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
           case NIF.v2_pread_at(path, off) do
@@ -1582,14 +1590,18 @@ defmodule Ferricstore.Raft.StateMachine do
         [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
           {value, exp}
 
-        [{^key, nil, exp, _lfu, fid, off, _vsize}]
-        when exp > now and is_integer(fid) and fid >= 0 ->
+        [{^key, nil, exp, _lfu, fid, off, vsize}]
+        when exp > now and valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
           case NIF.v2_pread_at(path, off) do
             {:ok, v} -> {v, exp}
             _ -> nil
           end
+
+        [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
+          cross_shard_delete_keydir_entry(ctx, key, nil)
+          nil
 
         _ ->
           nil
@@ -1618,33 +1630,39 @@ defmodule Ferricstore.Raft.StateMachine do
 
     try do
       :ets.select(ctx.keydir, ms)
-      |> Enum.reduce([], fn {key, value, exp, fid, off, _vsize}, acc ->
-        if exp == 0 or exp > now do
-          actual_value =
-            if value == nil and is_integer(fid) and fid >= 0 do
-              path = sm_file_path_from_path(data_path, fid)
-
-              case NIF.v2_pread_at(path, off) do
-                {:ok, v} -> v
-                _ -> nil
-              end
-            else
-              value
-            end
-
-          if actual_value != nil do
-            field =
-              case :binary.split(key, <<0>>) do
-                [_pre, sub] -> sub
-                _ -> key
-              end
-
-            [{field, actual_value} | acc]
-          else
+      |> Enum.reduce([], fn {key, value, exp, fid, off, vsize}, acc ->
+        cond do
+          exp != 0 and exp <= now ->
             acc
-          end
-        else
-          acc
+
+          value == nil and not valid_cold_location_value?(fid, off, vsize) ->
+            cross_shard_delete_keydir_entry(ctx, key, nil)
+            acc
+
+          true ->
+            actual_value =
+              if value == nil do
+                path = sm_file_path_from_path(data_path, fid)
+
+                case NIF.v2_pread_at(path, off) do
+                  {:ok, v} -> v
+                  _ -> nil
+                end
+              else
+                value
+              end
+
+            if actual_value != nil do
+              field =
+                case :binary.split(key, <<0>>) do
+                  [_pre, sub] -> sub
+                  _ -> key
+                end
+
+              [{field, actual_value} | acc]
+            else
+              acc
+            end
         end
       end)
       |> Enum.sort_by(fn {field, _} -> field end)
@@ -1766,6 +1784,22 @@ defmodule Ferricstore.Raft.StateMachine do
       data_path,
       "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
     )
+  end
+
+  defp valid_cold_location_value?(file_id, offset, value_size) do
+    is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+      is_integer(value_size) and value_size >= 0
+  end
+
+  defp cross_shard_delete_keydir_entry(ctx, key, value) do
+    ref = keydir_binary_ref(ctx)
+
+    if ref do
+      bytes = binary_byte_size(key) + binary_byte_size(value)
+      if bytes > 0, do: :atomics.sub(ref, ctx.index + 1, bytes)
+    end
+
+    :ets.delete(ctx.keydir, key)
   end
 
   defp parse_fid_from_path(path) do
@@ -3495,8 +3529,13 @@ defmodule Ferricstore.Raft.StateMachine do
   # ETS at all after recover_keydir), returns :miss.
   defp warm_from_bitcask(state, key) do
     case :ets.lookup(state.ets, key) do
-      [{^key, nil, _exp, _lfu, fid, off, _vsize}] when is_integer(fid) and fid >= 0 ->
+      [{^key, nil, _exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         warm_from_disk(state, key, 0, fid, off)
+
+      [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
+        track_keydir_binary_remove_known(state, key, nil)
+        :ets.delete(state.ets, key)
+        :miss
 
       _ ->
         # :pending fid or truly missing -- cannot warm from disk.
@@ -3506,8 +3545,13 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp warm_from_bitcask_with_exp(state, key, exp) do
     case :ets.lookup(state.ets, key) do
-      [{^key, nil, _exp, _lfu, fid, off, _vsize}] when is_integer(fid) and fid >= 0 ->
+      [{^key, nil, _exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         warm_from_disk(state, key, exp, fid, off)
+
+      [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
+        track_keydir_binary_remove_known(state, key, nil)
+        :ets.delete(state.ets, key)
+        :miss
 
       _ ->
         # :pending fid or truly missing -- cannot warm from disk.

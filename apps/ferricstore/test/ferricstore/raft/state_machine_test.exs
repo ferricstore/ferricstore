@@ -377,6 +377,47 @@ defmodule Ferricstore.Raft.StateMachineTest do
         )
     end
 
+    test "cross-shard GET purges malformed cold location instead of retrying exception path", %{
+      state: state,
+      ets: ets,
+      shard_index: shard_index
+    } do
+      :ets.insert(
+        ets,
+        {"cross_bad_offset", nil, 0, Ferricstore.Store.LFU.initial(), 0, :pending_offset, 5}
+      )
+
+      {_new_state, %{^shard_index => [nil]}} =
+        StateMachine.apply(
+          %{system_time: Ferricstore.HLC.now_ms()},
+          {:cross_shard_tx, [{shard_index, [{"GET", ["cross_bad_offset"]}], nil}]},
+          state
+        )
+
+      assert [] == :ets.lookup(ets, "cross_bad_offset")
+    end
+
+    test "cross-shard PTTL purges malformed cold location instead of retrying exception path", %{
+      state: state,
+      ets: ets,
+      shard_index: shard_index
+    } do
+      :ets.insert(
+        ets,
+        {"cross_bad_meta_offset", nil, Ferricstore.HLC.now_ms() + 5_000,
+         Ferricstore.Store.LFU.initial(), 0, :pending_offset, 5}
+      )
+
+      {_new_state, %{^shard_index => [-2]}} =
+        StateMachine.apply(
+          %{system_time: Ferricstore.HLC.now_ms()},
+          {:cross_shard_tx, [{shard_index, [{"PTTL", ["cross_bad_meta_offset"]}], nil}]},
+          state
+        )
+
+      assert [] == :ets.lookup(ets, "cross_bad_meta_offset")
+    end
+
     test "stamped ratelimit ignores legacy embedded now_ms", %{
       state: state,
       ets: ets
