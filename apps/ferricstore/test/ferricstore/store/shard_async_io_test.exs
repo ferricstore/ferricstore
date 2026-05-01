@@ -973,6 +973,19 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   end
 
   describe "shared log compaction" do
+    test "drains deferred BitcaskWriter writes before selecting compacted records" do
+      source =
+        Path.expand("../../../lib/ferricstore/store/shard.ex", __DIR__)
+        |> File.read!()
+
+      flush_pos = :binary.match(source, "BitcaskWriter.flush(state.index)")
+      reduce_pos = :binary.match(source, "Enum.reduce(file_ids")
+
+      assert {flush_offset, _} = flush_pos
+      assert {reduce_offset, _} = reduce_pos
+      assert flush_offset < reduce_offset
+    end
+
     test "removes stale hint when compacting a rewritten shared log file" do
       {pid1, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
       a = "compact_hint_a_#{:erlang.unique_integer([:positive])}"

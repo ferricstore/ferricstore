@@ -623,6 +623,10 @@ defmodule Ferricstore.Store.Shard do
   def handle_call({:run_compaction, file_ids}, _from, state) do
     state = await_in_flight(state)
     state = flush_pending_sync(state)
+    # Router async/RMW paths can leave small values queued in BitcaskWriter with
+    # ETS file_id=:pending. Drain those writes before compaction snapshots ETS,
+    # otherwise a source file can be removed while the writer still targets it.
+    Ferricstore.Store.BitcaskWriter.flush(state.index)
     sp = state.shard_data_path
 
     # v2 compaction: for each file_id, collect live key offsets from ETS,
