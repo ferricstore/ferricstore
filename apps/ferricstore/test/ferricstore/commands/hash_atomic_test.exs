@@ -615,6 +615,44 @@ defmodule Ferricstore.Commands.HashAtomicTest do
       assert et_f2 == -1
     end
 
+    test "batches field meta reads and preserves duplicate field results" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+      expire_at_ms = Ferricstore.CommandTime.now_ms() + 60_000
+
+      field_keys = [
+        CompoundKey.hash_field("hash", "expiring"),
+        CompoundKey.hash_field("hash", "persistent"),
+        CompoundKey.hash_field("hash", "missing")
+      ]
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key ->
+            "hash"
+
+          "hash", compound_key ->
+            flunk("HEXPIRETIME should only use compound_get for type, got #{inspect(compound_key)}")
+        end,
+        compound_get_meta: fn "hash", compound_key ->
+          flunk("HEXPIRETIME should use compound_batch_get_meta, got #{inspect(compound_key)}")
+        end,
+        compound_batch_get_meta: fn "hash", ^field_keys ->
+          send(parent, {:compound_batch_get_meta, field_keys})
+          [{"v1", expire_at_ms}, {"v2", 0}, nil]
+        end
+      }
+
+      assert [div(expire_at_ms, 1000), div(expire_at_ms, 1000), -1, -2] ==
+               Hash.handle(
+                 "HEXPIRETIME",
+                 ["hash", "FIELDS", "4", "expiring", "expiring", "persistent", "missing"],
+                 store
+               )
+
+      assert_received {:compound_batch_get_meta, ^field_keys}
+    end
+
     test "with wrong number of arguments returns error" do
       store = MockStore.make()
       assert {:error, _} = Hash.handle("HEXPIRETIME", ["hash"], store)
