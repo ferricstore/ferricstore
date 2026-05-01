@@ -91,17 +91,23 @@ defmodule Ferricstore.Commands.Hash do
 
   def handle("HDEL", [key | fields], store) when fields != [] do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      deleted =
-        Enum.reduce(fields, 0, fn field, acc ->
-          compound_key = CompoundKey.hash_field(key, field)
+      compound_keys =
+        fields
+        |> Enum.uniq()
+        |> Enum.map(&CompoundKey.hash_field(key, &1))
 
-          if Ops.compound_get(store, key, compound_key) != nil do
-            Ops.compound_delete(store, key, compound_key)
-            acc + 1
-          else
-            acc
-          end
+      deleted_keys =
+        store
+        |> Ops.compound_batch_get(key, compound_keys)
+        |> Enum.zip(compound_keys)
+        |> Enum.flat_map(fn
+          {nil, _compound_key} -> []
+          {_value, compound_key} -> [compound_key]
         end)
+
+      Enum.each(deleted_keys, &Ops.compound_delete(store, key, &1))
+
+      deleted = length(deleted_keys)
 
       maybe_cleanup_empty_hash(key, deleted, store)
       deleted

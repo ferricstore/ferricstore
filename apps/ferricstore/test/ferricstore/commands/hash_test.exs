@@ -107,6 +107,43 @@ defmodule Ferricstore.Commands.HashTest do
       assert 2 == Hash.handle("HDEL", ["hash", "f1", "f3", "f4"], store)
     end
 
+    test "HDEL batches field existence reads and removes duplicates once" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+
+      field_keys = [
+        CompoundKey.hash_field("hash", "f1"),
+        CompoundKey.hash_field("hash", "f2"),
+        CompoundKey.hash_field("hash", "missing")
+      ]
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key ->
+            nil
+
+          "hash", compound_key ->
+            flunk("HDEL should use compound_batch_get, got per-field lookup #{inspect(compound_key)}")
+        end,
+        compound_batch_get: fn "hash", ^field_keys ->
+          send(parent, {:compound_batch_get, field_keys})
+          ["v1", "v2", nil]
+        end,
+        compound_delete: fn "hash", compound_key ->
+          send(parent, {:compound_delete, compound_key})
+          :ok
+        end,
+        compound_count: fn "hash", _prefix -> 1 end
+      }
+
+      assert 2 == Hash.handle("HDEL", ["hash", "f1", "f1", "f2", "missing"], store)
+      assert_received {:compound_batch_get, ^field_keys}
+      assert_received {:compound_delete, deleted_f1}
+      assert_received {:compound_delete, deleted_f2}
+      assert Enum.sort([deleted_f1, deleted_f2]) == Enum.sort(Enum.take(field_keys, 2))
+      refute_received {:compound_delete, _}
+    end
+
     test "HDEL with no fields returns error" do
       assert {:error, _} = Hash.handle("HDEL", ["hash"], MockStore.make())
     end
