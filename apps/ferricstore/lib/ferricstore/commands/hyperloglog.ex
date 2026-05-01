@@ -105,17 +105,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
   # ---------------------------------------------------------------------------
 
   def handle("PFCOUNT", keys, store) when keys != [] do
-    sketches =
-      Enum.reduce_while(keys, {:ok, []}, fn key, {:ok, acc} ->
-        sketch = get_or_new(key, store)
-
-        case validate_sketch(sketch) do
-          :ok -> {:cont, {:ok, [sketch | acc]}}
-          {:error, _} = err -> {:halt, err}
-        end
-      end)
-
-    case sketches do
+    case read_sketches(keys, store) do
       {:ok, [single]} ->
         HLL.count(single)
 
@@ -138,30 +128,9 @@ defmodule Ferricstore.Commands.HyperLogLog do
   # ---------------------------------------------------------------------------
 
   def handle("PFMERGE", [destkey | source_keys], store) when source_keys != [] do
-    # Start with the destination's existing sketch (or empty if absent)
-    dest_sketch = get_or_new(destkey, store)
-
-    result =
-      Enum.reduce_while(
-        [dest_sketch | Enum.map(source_keys, &get_or_new(&1, store))],
-        {:ok, nil},
-        fn
-          sketch, {:ok, nil} ->
-            case validate_sketch(sketch) do
-              :ok -> {:cont, {:ok, sketch}}
-              {:error, _} = err -> {:halt, err}
-            end
-
-          sketch, {:ok, acc} ->
-            case validate_sketch(sketch) do
-              :ok -> {:cont, {:ok, HLL.merge(acc, sketch)}}
-              {:error, _} = err -> {:halt, err}
-            end
-        end
-      )
-
-    case result do
-      {:ok, merged} ->
+    case read_sketches([destkey | source_keys], store) do
+      {:ok, sketches} ->
+        merged = Enum.reduce(sketches, &HLL.merge/2)
         Ops.put(store, destkey, merged, 0)
         :ok
 
@@ -194,6 +163,27 @@ defmodule Ferricstore.Commands.HyperLogLog do
     end
   end
 
+  defp read_sketches(keys, store) do
+    with :ok <- ensure_not_compound_keys(keys, store) do
+      store
+      |> Ops.batch_get(keys)
+      |> Enum.map(fn
+        nil -> HLL.new()
+        value -> value
+      end)
+      |> validate_sketches()
+    end
+  end
+
+  defp ensure_not_compound_keys(keys, store) do
+    Enum.reduce_while(keys, :ok, fn key, :ok ->
+      case ensure_not_compound_key(key, store) do
+        :ok -> {:cont, :ok}
+        @wrongtype_error -> {:halt, @wrongtype_error}
+      end
+    end)
+  end
+
   defp ensure_not_compound_key(key, store) do
     if compound_data_structure_key?(key, store) do
       @wrongtype_error
@@ -222,6 +212,19 @@ defmodule Ferricstore.Commands.HyperLogLog do
       :ok
     else
       @wrongtype_error
+    end
+  end
+
+  defp validate_sketches(sketches) do
+    Enum.reduce_while(sketches, {:ok, []}, fn sketch, {:ok, acc} ->
+      case validate_sketch(sketch) do
+        :ok -> {:cont, {:ok, [sketch | acc]}}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+    |> case do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      {:error, _} = err -> err
     end
   end
 end

@@ -180,6 +180,29 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
       assert_in_delta count, 2, 2
     end
 
+    test "PFCOUNT multiple keys uses batch_get when the store provides it" do
+      parent = self()
+      sketch = HLL.new()
+
+      store = %{
+        batch_get: fn keys ->
+          send(parent, {:batch_get, keys})
+
+          Enum.map(keys, fn
+            "key1" -> sketch
+            "key2" -> nil
+          end)
+        end,
+        get: fn key ->
+          flunk("PFCOUNT should use batch_get, got per-key GET for #{inspect(key)}")
+        end,
+        compound_get: fn _redis_key, _compound_key -> nil end
+      }
+
+      assert 0 == HLLCmd.handle("PFCOUNT", ["key1", "key2"], store)
+      assert_received {:batch_get, ["key1", "key2"]}
+    end
+
     test "PFCOUNT wrong number of args — error" do
       assert {:error, msg} = HLLCmd.handle("PFCOUNT", [], MockStore.make())
       assert msg =~ "wrong number of arguments"
@@ -253,6 +276,30 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
 
       count = HLLCmd.handle("PFCOUNT", ["dest"], store)
       assert count == 0
+    end
+
+    test "PFMERGE reads destination and sources with batch_get when the store provides it" do
+      parent = self()
+      {:ok, pid} = Agent.start_link(fn -> %{"src1" => HLL.new(), "src2" => HLL.new()} end)
+
+      store = %{
+        batch_get: fn keys ->
+          send(parent, {:batch_get, keys})
+          Agent.get(pid, fn state -> Enum.map(keys, &Map.get(state, &1)) end)
+        end,
+        get: fn key ->
+          flunk("PFMERGE should use batch_get, got per-key GET for #{inspect(key)}")
+        end,
+        put: fn key, value, _expire_at_ms ->
+          Agent.update(pid, &Map.put(&1, key, value))
+          :ok
+        end,
+        compound_get: fn _redis_key, _compound_key -> nil end
+      }
+
+      assert :ok = HLLCmd.handle("PFMERGE", ["dest", "src1", "src2"], store)
+      assert_received {:batch_get, ["dest", "src1", "src2"]}
+      assert HLL.valid_sketch?(Agent.get(pid, &Map.fetch!(&1, "dest")))
     end
 
     test "PFMERGE wrong number of args — error (no args)" do
