@@ -2381,10 +2381,17 @@ defmodule Ferricstore.Raft.StateMachine do
     now = apply_now_ms()
 
     case :ets.lookup(state.ets, key) do
-      [{^key, _value, 0, _lfu, _fid, _off, _vsize}] ->
+      [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
         0
 
-      [{^key, _value, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
+      [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+        0
+
+      [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+        exp
+
+      [{^key, nil, exp, _lfu, fid, off, vsize}]
+      when exp > now and valid_cold_location(fid, off, vsize) ->
         exp
 
       [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->

@@ -808,6 +808,25 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert result == :ok
       assert [{^key, "new", ^expire_at_ms, _lfu, _fid, _off, 3}] = :ets.lookup(ets, key)
     end
+
+    test "SET KEEPTTL does not preserve TTL from malformed cold rows", %{
+      state: state,
+      ets: ets
+    } do
+      key = "set_keepttl_bad_cold_ref"
+      expire_at_ms = System.os_time(:millisecond) + 60_000
+
+      :ets.insert(
+        ets,
+        {key, nil, expire_at_ms, Ferricstore.Store.LFU.initial(), 0, :pending_offset, 3}
+      )
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:set, key, "new", 0, set_opts(%{keepttl: true})}, state)
+
+      assert result == :ok
+      assert [{^key, "new", 0, _lfu, _fid, _off, 3}] = :ets.lookup(ets, key)
+    end
   end
 
   # ---------------------------------------------------------------------------
