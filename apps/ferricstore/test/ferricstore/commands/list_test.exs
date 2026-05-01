@@ -14,6 +14,23 @@ defmodule Ferricstore.Commands.ListTest do
   alias Ferricstore.Commands.{Dispatcher, Hash, List, Strings}
   alias Ferricstore.Test.MockStore
 
+  describe "storage path guards" do
+    test "list operations expose only the compound-key store API" do
+      source = File.read!(app_path("lib/ferricstore/store/list_ops.ex"))
+
+      # The closure-based API wrote whole lists as serialized plain values.
+      # New list code must stay on the compound-key path so async/read flows
+      # see one canonical representation.
+      refute source =~ "def execute(get_fn"
+      refute source =~ "legacy_execute_blob"
+      refute source =~ "legacy_execute_lmove"
+      refute source =~ "decode_stored"
+      refute source =~ "encode_list"
+    end
+  end
+
+  defp app_path(path), do: Path.expand("../../../#{path}", __DIR__)
+
   # ===========================================================================
   # LPUSH
   # ===========================================================================
@@ -722,14 +739,45 @@ defmodule Ferricstore.Commands.ListTest do
       # Just verify they don't return "ERR unknown command"
       Dispatcher.dispatch("rpush", ["mylist", "a", "b", "c"], store)
 
-      refute match?({:error, "ERR unknown command" <> _}, Dispatcher.dispatch("lindex", ["mylist", "0"], store))
-      refute match?({:error, "ERR unknown command" <> _}, Dispatcher.dispatch("lset", ["mylist", "0", "x"], store))
-      refute match?({:error, "ERR unknown command" <> _}, Dispatcher.dispatch("lrem", ["mylist", "0", "a"], store))
-      refute match?({:error, "ERR unknown command" <> _}, Dispatcher.dispatch("ltrim", ["mylist", "0", "-1"], store))
-      refute match?({:error, "ERR unknown command" <> _}, Dispatcher.dispatch("lpos", ["mylist", "a"], store))
-      refute match?({:error, "ERR unknown command" <> _}, Dispatcher.dispatch("linsert", ["mylist", "BEFORE", "a", "z"], store))
-      refute match?({:error, "ERR unknown command" <> _}, Dispatcher.dispatch("lpushx", ["mylist", "x"], store))
-      refute match?({:error, "ERR unknown command" <> _}, Dispatcher.dispatch("rpushx", ["mylist", "x"], store))
+      refute match?(
+               {:error, "ERR unknown command" <> _},
+               Dispatcher.dispatch("lindex", ["mylist", "0"], store)
+             )
+
+      refute match?(
+               {:error, "ERR unknown command" <> _},
+               Dispatcher.dispatch("lset", ["mylist", "0", "x"], store)
+             )
+
+      refute match?(
+               {:error, "ERR unknown command" <> _},
+               Dispatcher.dispatch("lrem", ["mylist", "0", "a"], store)
+             )
+
+      refute match?(
+               {:error, "ERR unknown command" <> _},
+               Dispatcher.dispatch("ltrim", ["mylist", "0", "-1"], store)
+             )
+
+      refute match?(
+               {:error, "ERR unknown command" <> _},
+               Dispatcher.dispatch("lpos", ["mylist", "a"], store)
+             )
+
+      refute match?(
+               {:error, "ERR unknown command" <> _},
+               Dispatcher.dispatch("linsert", ["mylist", "BEFORE", "a", "z"], store)
+             )
+
+      refute match?(
+               {:error, "ERR unknown command" <> _},
+               Dispatcher.dispatch("lpushx", ["mylist", "x"], store)
+             )
+
+      refute match?(
+               {:error, "ERR unknown command" <> _},
+               Dispatcher.dispatch("rpushx", ["mylist", "x"], store)
+             )
     end
   end
 
