@@ -117,6 +117,9 @@ defmodule Ferricstore.CrossShardOp do
           length(keys) > @max_cross_shard_keys ->
             {:error, @too_many_keys_error}
 
+          not ctx.raft_enabled ->
+            execute_direct_cross_shard(ctx, shard_map, execute_fn)
+
           true ->
             execute_cross_shard(ctx, keys_with_roles, shard_map, execute_fn, opts)
         end
@@ -144,6 +147,18 @@ defmodule Ferricstore.CrossShardOp do
   # ---------------------------------------------------------------------------
   # Cross-shard quorum path: lock -> intent -> execute -> unlock
   # ---------------------------------------------------------------------------
+
+  defp execute_direct_cross_shard(ctx, shard_map, execute_fn) do
+    # Non-Raft instances have no lock or intent machinery. Preserve their
+    # direct-shard semantics while still routing each key through the caller
+    # instance instead of falling into the default Raft cluster.
+    per_shard_stores =
+      shard_map
+      |> Map.keys()
+      |> Map.new(fn idx -> {idx, build_store_for_shard(ctx, idx)} end)
+
+    execute_fn.(build_routing_store(ctx, per_shard_stores))
+  end
 
   defp execute_cross_shard(ctx, keys_with_roles, shard_map, execute_fn, opts) do
     owner_ref = make_ref()
