@@ -220,6 +220,33 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       end
     end
 
+    test "shard flush completion handles numeric pending values" do
+      keydir =
+        :ets.new(:"shard_flush_numeric_#{System.unique_integer([:positive])}", [
+          :set,
+          :public
+        ])
+
+      key = "flush:numeric-location"
+
+      state = %{
+        keydir: keydir,
+        active_file_id: 7,
+        file_stats: %{},
+        instance_ctx: %{hot_cache_max_value_size: 64}
+      }
+
+      try do
+        :ets.insert(keydir, {key, "42", 0, LFU.initial(), :pending, 0, 0})
+
+        ShardFlush.update_ets_locations(state, [{key, 42, 0}], [{42, 2}])
+
+        assert [{^key, "42", 0, _lfu, 7, 42, 2}] = :ets.lookup(keydir, key)
+      after
+        :ets.delete(keydir)
+      end
+    end
+
     test "put is readable immediately via ETS (before fsync)" do
       {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 100)
       on_exit(fn -> cleanup_shard(pid, ctx, dir) end)

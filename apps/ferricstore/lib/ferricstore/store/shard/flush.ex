@@ -201,7 +201,7 @@ defmodule Ferricstore.Store.Shard.Flush do
 
     case :ets.lookup(keydir, key) do
       [{^key, ^expected_value, ^exp, _lfu, :pending, old_fid, old_vsize}] ->
-        vsize = byte_size(value)
+        vsize = persisted_value_size(value)
 
         replaced =
           :ets.select_replace(keydir, [
@@ -226,6 +226,10 @@ defmodule Ferricstore.Store.Shard.Flush do
         fs
     end
   end
+
+  defp persisted_value_size(value) when is_binary(value), do: byte_size(value)
+  defp persisted_value_size(value) when is_integer(value), do: byte_size(Integer.to_string(value))
+  defp persisted_value_size(value) when is_float(value), do: byte_size(Float.to_string(value))
 
   defp overwrite_dead_ref(:pending, old_fid, old_vsize)
        when is_integer(old_fid) and old_fid >= 0 and is_integer(old_vsize) and old_vsize >= 0 do
