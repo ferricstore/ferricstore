@@ -518,16 +518,26 @@ defmodule Ferricstore.Commands.Bitmap do
   defp execute_bitop(_op, _keys, _store), do: {:error, "ERR syntax error"}
 
   defp read_sources(source_keys, store) do
-    Enum.reduce_while(source_keys, {:ok, []}, fn key, {:ok, acc} ->
-      case read_source(key, store) do
-        {:ok, value} -> {:cont, {:ok, [value | acc]}}
-        {:error, _} = err -> {:halt, err}
+    with :ok <- ensure_string_keys(source_keys, store) do
+      values =
+        store
+        |> Ops.batch_get(source_keys)
+        |> Enum.map(fn
+          nil -> <<>>
+          value -> value
+        end)
+
+      {:ok, values}
+    end
+  end
+
+  defp ensure_string_keys(keys, store) do
+    Enum.reduce_while(keys, :ok, fn key, :ok ->
+      case ensure_string_key(key, store) do
+        :ok -> {:cont, :ok}
+        @wrongtype_error -> {:halt, @wrongtype_error}
       end
     end)
-    |> case do
-      {:ok, values} -> {:ok, Enum.reverse(values)}
-      {:error, _} = err -> err
-    end
   end
 
   defp read_source(key, store) do

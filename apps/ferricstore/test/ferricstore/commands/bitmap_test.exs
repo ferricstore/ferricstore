@@ -701,6 +701,32 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert 1 == Bitmap.handle("BITOP", ["OR", "dest", "a"], store)
       assert <<0xAB>> == store.get.("dest")
     end
+
+    test "BITOP multi-source operations use batch_get when the store provides it" do
+      parent = self()
+      {:ok, pid} = Agent.start_link(fn -> %{"a" => <<0xF0>>, "b" => <<0x0F>>} end)
+
+      store = %{
+        batch_get: fn keys ->
+          send(parent, {:batch_get, keys})
+          Agent.get(pid, fn state -> Enum.map(keys, &Map.get(state, &1)) end)
+        end,
+        get: fn key ->
+          flunk("BITOP should use batch_get, got per-key GET for #{inspect(key)}")
+        end,
+        put: fn key, value, _expire_at_ms ->
+          Agent.update(pid, &Map.put(&1, key, value))
+          :ok
+        end,
+        compound_get: fn _redis_key, _compound_key -> nil end,
+        compound_delete: fn _redis_key, _compound_key -> :ok end,
+        compound_delete_prefix: fn _redis_key, _prefix -> :ok end
+      }
+
+      assert 1 == Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
+      assert_received {:batch_get, ["a", "b"]}
+      assert <<0xFF>> == Agent.get(pid, &Map.fetch!(&1, "dest"))
+    end
   end
 
   describe "cross-command integration" do
