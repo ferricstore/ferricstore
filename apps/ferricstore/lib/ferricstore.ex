@@ -2945,19 +2945,11 @@ defmodule FerricStore do
 
   """
   @spec sdiff([key()]) :: {:ok, [binary()]}
+  def sdiff([]), do: {:ok, []}
+
   def sdiff(keys) when is_list(keys) do
-    sets = Enum.map(keys, &gather_set_members/1)
-
-    result =
-      case sets do
-        [first | rest] ->
-          Enum.reduce(rest, first, fn s, acc -> MapSet.difference(acc, s) end)
-
-        [] ->
-          MapSet.new()
-      end
-
-    {:ok, MapSet.to_list(result)}
+    result = Ferricstore.Commands.Set.handle("SDIFF", keys, build_compound_store(hd(keys)))
+    wrap_result(result)
   end
 
   @doc """
@@ -2975,19 +2967,11 @@ defmodule FerricStore do
 
   """
   @spec sinter([key()]) :: {:ok, [binary()]}
+  def sinter([]), do: {:ok, []}
+
   def sinter(keys) when is_list(keys) do
-    sets = Enum.map(keys, &gather_set_members/1)
-
-    result =
-      case sets do
-        [first | rest] ->
-          Enum.reduce(rest, first, fn s, acc -> MapSet.intersection(acc, s) end)
-
-        [] ->
-          MapSet.new()
-      end
-
-    {:ok, MapSet.to_list(result)}
+    result = Ferricstore.Commands.Set.handle("SINTER", keys, build_compound_store(hd(keys)))
+    wrap_result(result)
   end
 
   @doc """
@@ -3005,10 +2989,11 @@ defmodule FerricStore do
 
   """
   @spec sunion([key()]) :: {:ok, [binary()]}
+  def sunion([]), do: {:ok, []}
+
   def sunion(keys) when is_list(keys) do
-    sets = Enum.map(keys, &gather_set_members/1)
-    result = Enum.reduce(sets, MapSet.new(), fn s, acc -> MapSet.union(acc, s) end)
-    {:ok, MapSet.to_list(result)}
+    result = Ferricstore.Commands.Set.handle("SUNION", keys, build_compound_store(hd(keys)))
+    wrap_result(result)
   end
 
   @doc """
@@ -3110,15 +3095,6 @@ defmodule FerricStore do
 
     result = Ferricstore.Commands.Set.handle("SINTERCARD", args, store)
     wrap_result(result)
-  end
-
-  # Gathers all set members for a resolved key, routing to the correct shard.
-  defp gather_set_members(key) do
-    ctx = default_ctx()
-    shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-    prefix = Ferricstore.Store.CompoundKey.set_prefix(key)
-    pairs = GenServer.call(shard, {:scan_prefix, prefix})
-    MapSet.new(pairs, fn {member, _} -> member end)
   end
 
   # ---------------------------------------------------------------------------

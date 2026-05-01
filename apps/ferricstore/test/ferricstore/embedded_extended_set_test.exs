@@ -91,6 +91,14 @@ defmodule Ferricstore.EmbeddedExtendedSetTest do
       assert {:ok, diff} = FerricStore.sdiff(["sd:only"])
       assert Enum.sort(diff) == ["a", "b"]
     end
+
+    test "returns WRONGTYPE when any input key is a string" do
+      assert {:ok, 2} = FerricStore.sadd("sd:set", ["a", "b"])
+      assert :ok = FerricStore.set("sd:string", "plain")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.sdiff(["sd:string", "sd:set"])
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.sdiff(["sd:set", "sd:string"])
+    end
   end
 
   describe "sinter/1" do
@@ -106,6 +114,13 @@ defmodule Ferricstore.EmbeddedExtendedSetTest do
       assert {:ok, inter} = FerricStore.sinter(["si:only"])
       assert Enum.sort(inter) == ["a", "b"]
     end
+
+    test "returns WRONGTYPE when any input key is a string" do
+      assert {:ok, 2} = FerricStore.sadd("si:set", ["a", "b"])
+      assert :ok = FerricStore.set("si:string", "plain")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.sinter(["si:set", "si:string"])
+    end
   end
 
   describe "sunion/1" do
@@ -120,6 +135,13 @@ defmodule Ferricstore.EmbeddedExtendedSetTest do
       FerricStore.sadd("su:only", ["a", "b"])
       assert {:ok, union} = FerricStore.sunion(["su:only"])
       assert Enum.sort(union) == ["a", "b"]
+    end
+
+    test "returns WRONGTYPE when any input key is a string" do
+      assert {:ok, 2} = FerricStore.sadd("su:set", ["a", "b"])
+      assert :ok = FerricStore.set("su:string", "plain")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.sunion(["su:set", "su:string"])
     end
   end
 end
