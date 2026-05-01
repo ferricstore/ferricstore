@@ -423,6 +423,10 @@ defmodule Ferricstore.Store.Shard do
     ShardCompound.handle_compound_get(redis_key, compound_key, state)
   end
 
+  def handle_call({:compound_batch_get, redis_key, compound_keys}, _from, state) do
+    ShardCompound.handle_compound_batch_get(redis_key, compound_keys, state)
+  end
+
   def handle_call({:compound_get_meta, redis_key, compound_key}, _from, state) do
     ShardCompound.handle_compound_get_meta(redis_key, compound_key, state)
   end

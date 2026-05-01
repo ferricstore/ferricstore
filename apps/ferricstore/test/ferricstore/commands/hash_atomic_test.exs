@@ -3,7 +3,24 @@ defmodule Ferricstore.Commands.HashAtomicTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.Hash
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
+
+  defp put_live_compound_key(store, key, "set") do
+    store.compound_put.(key, CompoundKey.type_key(key), "set", 0)
+    store.compound_put.(key, CompoundKey.set_member(key, "member"), "1", 0)
+  end
+
+  defp put_live_compound_key(store, key, "list") do
+    store.compound_put.(key, CompoundKey.type_key(key), "list", 0)
+    store.compound_put.(key, CompoundKey.list_meta_key(key), :erlang.term_to_binary({0, 1}), 0)
+    store.compound_put.(key, CompoundKey.list_element(key, 0), "member", 0)
+  end
+
+  defp put_live_compound_key(store, key, "zset") do
+    store.compound_put.(key, CompoundKey.type_key(key), "zset", 0)
+    store.compound_put.(key, CompoundKey.zset_member(key, "member"), "1", 0)
+  end
 
   # ---------------------------------------------------------------------------
   # HGETDEL key field [field ...]
@@ -63,7 +80,7 @@ defmodule Ferricstore.Commands.HashAtomicTest do
 
     test "on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      put_live_compound_key(store, "mykey", "set")
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HGETDEL", ["mykey", "FIELDS", "1", "f1"], store)
     end
   end
@@ -159,7 +176,7 @@ defmodule Ferricstore.Commands.HashAtomicTest do
 
     test "on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      put_live_compound_key(store, "mykey", "set")
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HGETEX", ["mykey", "EX", "60", "FIELDS", "1", "f1"], store)
     end
 
@@ -238,7 +255,7 @@ defmodule Ferricstore.Commands.HashAtomicTest do
 
     test "on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      put_live_compound_key(store, "mykey", "set")
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HSETEX", ["mykey", "60", "f1", "v1"], store)
     end
   end
@@ -312,7 +329,7 @@ defmodule Ferricstore.Commands.HashAtomicTest do
 
     test "on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      put_live_compound_key(store, "mykey", "set")
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HPEXPIRE", ["mykey", "60000", "FIELDS", "1", "f1"], store)
     end
   end
@@ -371,7 +388,7 @@ defmodule Ferricstore.Commands.HashAtomicTest do
 
     test "on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      put_live_compound_key(store, "mykey", "set")
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HPTTL", ["mykey", "FIELDS", "1", "f1"], store)
     end
   end
@@ -434,7 +451,7 @@ defmodule Ferricstore.Commands.HashAtomicTest do
 
     test "on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      put_live_compound_key(store, "mykey", "set")
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HEXPIRETIME", ["mykey", "FIELDS", "1", "f1"], store)
     end
   end
@@ -498,7 +515,7 @@ defmodule Ferricstore.Commands.HashAtomicTest do
     test "HGETEX on non-hash key returns WRONGTYPE" do
       store = MockStore.make()
       # Create a set-type key
-      store.compound_put.("mykey", "T:mykey", "list", 0)
+      put_live_compound_key(store, "mykey", "list")
 
       assert {:error, "WRONGTYPE" <> _} =
                Hash.handle("HGETEX", ["mykey", "EX", "60", "FIELDS", "1", "f1"], store)
@@ -506,7 +523,7 @@ defmodule Ferricstore.Commands.HashAtomicTest do
 
     test "HSETEX on non-hash key returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "zset", 0)
+      put_live_compound_key(store, "mykey", "zset")
 
       assert {:error, "WRONGTYPE" <> _} =
                Hash.handle("HSETEX", ["mykey", "60", "f1", "v1"], store)

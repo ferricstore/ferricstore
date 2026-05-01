@@ -444,6 +444,35 @@ defmodule Ferricstore.Store.Ops do
   def compound_get(store, redis_key, compound_key) when is_map(store),
     do: store.compound_get.(redis_key, compound_key)
 
+  @spec compound_batch_get(store(), binary(), [binary()]) :: [binary() | nil]
+  def compound_batch_get(%FerricStore.Instance{} = ctx, redis_key, compound_keys),
+    do: Router.compound_batch_get(ctx, redis_key, compound_keys)
+
+  def compound_batch_get(%LocalTxStore{} = tx, redis_key, compound_keys) do
+    if local?(tx, redis_key) do
+      case promoted_path(tx, redis_key) do
+        nil ->
+          Enum.map(compound_keys, &local_read_value(tx, &1))
+
+        dedicated_path ->
+          Enum.map(compound_keys, &local_promoted_read_value(tx, &1, dedicated_path))
+      end
+    else
+      shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
+      GenServer.call(shard, {:compound_batch_get, redis_key, compound_keys})
+    end
+  end
+
+  def compound_batch_get(store, redis_key, compound_keys) when is_map(store) do
+    case store do
+      %{compound_batch_get: compound_batch_get_fun} when is_function(compound_batch_get_fun, 2) ->
+        compound_batch_get_fun.(redis_key, compound_keys)
+
+      _ ->
+        Enum.map(compound_keys, &compound_get(store, redis_key, &1))
+    end
+  end
+
   @spec compound_get_meta(store(), binary(), binary()) :: {binary(), non_neg_integer()} | nil
   def compound_get_meta(%FerricStore.Instance{} = ctx, redis_key, compound_key),
     do: Router.compound_get_meta(ctx, redis_key, compound_key)

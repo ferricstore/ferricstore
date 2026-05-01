@@ -63,6 +63,18 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       assert "alice" = Router.compound_get(ctx(), redis_key, ck)
     end
 
+    test "compound_batch_get preserves input order and missing entries" do
+      redis_key = ukey("hash_batch")
+      f1 = hash_field(redis_key, "first")
+      missing = hash_field(redis_key, "missing")
+      f2 = hash_field(redis_key, "second")
+
+      :ok = Router.compound_put(ctx(), redis_key, f1, "one", 0)
+      :ok = Router.compound_put(ctx(), redis_key, f2, "two", 0)
+
+      assert ["one", nil, "two"] == Router.compound_batch_get(ctx(), redis_key, [f1, missing, f2])
+    end
+
     test "compound_delete removes the field" do
       redis_key = ukey("hash_del")
       ck = hash_field(redis_key, "name")
@@ -98,6 +110,23 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
           result = Router.compound_get(ctx(), redis_key, ck)
           assert result != nil, "compound_get returned nil for large value"
           assert big == result
+        end,
+        15_000
+      )
+    end
+
+    test "compound_batch_get reads large values" do
+      redis_key = ukey("hash_batch_big")
+      small_key = hash_field(redis_key, "small")
+      big_key = hash_field(redis_key, "big")
+      big = :binary.copy("x", 100 * 1024)
+
+      :ok = Router.compound_put(ctx(), redis_key, small_key, "small", 0)
+      :ok = Router.compound_put(ctx(), redis_key, big_key, big, 0)
+
+      Ferricstore.Test.Utils.eventually(
+        fn ->
+          assert ["small", big] == Router.compound_batch_get(ctx(), redis_key, [small_key, big_key])
         end,
         15_000
       )

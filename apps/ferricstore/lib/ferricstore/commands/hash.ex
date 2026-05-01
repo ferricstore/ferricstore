@@ -118,10 +118,8 @@ defmodule Ferricstore.Commands.Hash do
 
   def handle("HMGET", [key | fields], store) when fields != [] do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      Enum.map(fields, fn field ->
-        compound_key = CompoundKey.hash_field(key, field)
-        Ops.compound_get(store, key, compound_key)
-      end)
+      compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
+      Ops.compound_batch_get(store, key, compound_keys)
     end
   end
 

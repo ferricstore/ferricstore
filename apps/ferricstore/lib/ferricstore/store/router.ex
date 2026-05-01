@@ -2382,6 +2382,43 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @spec compound_batch_get(FerricStore.Instance.t(), binary(), [binary()]) :: [binary() | nil]
+  def compound_batch_get(ctx, redis_key, compound_keys) do
+    idx = shard_for(ctx, redis_key)
+    keydir = resolve_keydir(ctx, idx)
+    now = HLC.now_ms()
+
+    {results, fallback_keys} =
+      Enum.map_reduce(compound_keys, [], fn compound_key, fallback_keys ->
+        case ets_get_full(ctx, idx, keydir, compound_key, now) do
+          {:hit, value, lfu} ->
+            sampled_read_bookkeeping_fast(ctx, keydir, compound_key, lfu)
+            {{:value, value}, fallback_keys}
+
+          _ ->
+            {:fallback, [compound_key | fallback_keys]}
+        end
+      end)
+
+    fallback_values =
+      case fallback_keys do
+        [] ->
+          []
+
+        keys ->
+          shard = elem(ctx.shard_names, idx)
+          GenServer.call(shard, {:compound_batch_get, redis_key, Enum.reverse(keys)})
+      end
+
+    {values, []} =
+      Enum.map_reduce(results, fallback_values, fn
+        {:value, value}, remaining -> {value, remaining}
+        :fallback, [value | remaining] -> {value, remaining}
+      end)
+
+    values
+  end
+
   @spec compound_get_meta(FerricStore.Instance.t(), binary(), binary()) ::
           {binary(), non_neg_integer()} | nil
   def compound_get_meta(ctx, redis_key, compound_key) do

@@ -8,6 +8,7 @@ defmodule Ferricstore.Commands.HashTest do
   alias Ferricstore.Commands.Set
   alias Ferricstore.Commands.SortedSet
   alias Ferricstore.Commands.Strings
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -139,6 +140,30 @@ defmodule Ferricstore.Commands.HashTest do
     test "HMGET on nonexistent key returns all nils" do
       store = MockStore.make()
       assert [nil, nil] == Hash.handle("HMGET", ["nonexistent", "f1", "f2"], store)
+    end
+
+    test "HMGET uses compound_batch_get when the store provides it" do
+      type_key = CompoundKey.type_key("hash")
+
+      field_keys = [
+        CompoundKey.hash_field("hash", "f1"),
+        CompoundKey.hash_field("hash", "missing")
+      ]
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key ->
+            nil
+
+          "hash", compound_key ->
+            flunk(
+              "HMGET should use compound_batch_get, got per-field lookup #{inspect(compound_key)}"
+            )
+        end,
+        compound_batch_get: fn "hash", ^field_keys -> ["v1", nil] end
+      }
+
+      assert ["v1", nil] == Hash.handle("HMGET", ["hash", "f1", "missing"], store)
     end
 
     test "HMGET with no fields returns error" do

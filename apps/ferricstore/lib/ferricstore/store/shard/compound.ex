@@ -24,47 +24,63 @@ defmodule Ferricstore.Store.Shard.Compound do
   @spec handle_compound_get(binary(), binary(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_compound_get(redis_key, compound_key, state) do
+    {value, state} = compound_get_value(redis_key, compound_key, state)
+    {:reply, value, state}
+  end
+
+  @spec handle_compound_batch_get(binary(), [binary()], map()) :: {:reply, [term()], map()}
+  @doc false
+  def handle_compound_batch_get(redis_key, compound_keys, state) do
+    {values, state} =
+      Enum.map_reduce(compound_keys, state, fn compound_key, state ->
+        compound_get_value(redis_key, compound_key, state)
+      end)
+
+    {:reply, values, state}
+  end
+
+  defp compound_get_value(redis_key, compound_key, state) do
     case promoted_store(state, redis_key) do
       nil ->
         case ShardETS.ets_lookup_warm(state, compound_key) do
           {:hit, value, _exp} ->
-            {:reply, value, state}
+            {value, state}
 
           :expired ->
-            {:reply, nil, state}
+            {nil, state}
 
           :miss ->
             if ShardETS.pending_cold?(state, compound_key) do
               state = ShardFlush.flush_pending_for_read(state)
-              {:reply, ShardETS.warm_from_store(state, compound_key), state}
+              {ShardETS.warm_from_store(state, compound_key), state}
             else
-              {:reply, nil, state}
+              {nil, state}
             end
         end
 
       dedicated_path ->
         case ShardETS.ets_lookup(state, compound_key) do
           {:hit, value, _exp} ->
-            {:reply, value, state}
+            {value, state}
 
           :expired ->
-            {:reply, nil, state}
+            {nil, state}
 
           _cold_or_miss ->
             case promoted_read(dedicated_path, compound_key, state.keydir) do
               {:ok, nil} ->
-                {:reply, nil, state}
+                {nil, state}
 
               {:ok, value, exp} ->
                 ShardETS.ets_insert(state, compound_key, value, exp)
-                {:reply, value, state}
+                {value, state}
 
               {:ok, value} ->
                 ShardETS.ets_insert(state, compound_key, value, 0)
-                {:reply, value, state}
+                {value, state}
 
               _error ->
-                {:reply, nil, state}
+                {nil, state}
             end
         end
     end
