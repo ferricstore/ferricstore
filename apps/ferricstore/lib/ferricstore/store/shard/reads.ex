@@ -8,6 +8,10 @@ defmodule Ferricstore.Store.Shard.Reads do
 
   @bitcask_header_size 26
 
+  defguardp valid_cold_location(file_id, offset, value_size)
+            when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+                   is_integer(value_size) and value_size >= 0
+
   # -------------------------------------------------------------------
   # Read-path handlers (return {:reply, result, state})
   # -------------------------------------------------------------------
@@ -253,10 +257,19 @@ defmodule Ferricstore.Store.Shard.Reads do
     {live_keys, expired_keys} =
       :ets.foldl(
         fn
-          {key, _value, 0, _lfu, _fid, _off, _vsize}, {live, expired} ->
+          {key, value, 0, _lfu, _fid, _off, _vsize}, {live, expired} when value != nil ->
             {[key | live], expired}
 
-          {key, _value, exp, _lfu, _fid, _off, _vsize}, {live, expired} when exp > now ->
+          {key, nil, 0, _lfu, fid, off, vsize}, {live, expired}
+          when valid_cold_location(fid, off, vsize) ->
+            {[key | live], expired}
+
+          {key, value, exp, _lfu, _fid, _off, _vsize}, {live, expired}
+          when exp > now and value != nil ->
+            {[key | live], expired}
+
+          {key, nil, exp, _lfu, fid, off, vsize}, {live, expired}
+          when exp > now and valid_cold_location(fid, off, vsize) ->
             {[key | live], expired}
 
           {key, _value, _exp, _lfu, _fid, _off, _vsize}, {live, expired} ->

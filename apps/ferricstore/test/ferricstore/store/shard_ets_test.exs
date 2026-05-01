@@ -171,4 +171,26 @@ defmodule Ferricstore.Store.ShardETSTest do
       :ets.delete(keydir)
     end
   end
+
+  test "live keys skip malformed cold locations" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    good = "ets:keys:good"
+    bad = "ets:keys:bad-offset"
+
+    state = %{
+      keydir: keydir,
+      shard_data_path: System.tmp_dir!(),
+      instance_ctx: %{hot_cache_max_value_size: 64}
+    }
+
+    try do
+      :ets.insert(keydir, {good, "value", 0, LFU.initial(), :pending, 0, 0})
+      :ets.insert(keydir, {bad, nil, 0, LFU.initial(), 0, :pending_offset, 3})
+
+      assert [^good] = ShardReads.live_keys(state)
+      assert [] == :ets.lookup(keydir, bad)
+    after
+      :ets.delete(keydir)
+    end
+  end
 end
