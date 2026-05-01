@@ -672,19 +672,19 @@ defmodule Ferricstore.Store.Router do
         nil
 
       {:hit, v, _exp} ->
-        # Delete locally + submit delta for replicas.
-        keydir = elem(ctx.keydir_refs, idx)
-        track_keydir_binary_delete(ctx, idx, keydir, key)
-        :ets.delete(keydir, key)
+        with :ok <- async_submit_to_raft(idx, {:getdel, key}) do
+          keydir = elem(ctx.keydir_refs, idx)
+          track_keydir_binary_delete(ctx, idx, keydir, key)
+          :ets.delete(keydir, key)
 
-        {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
-        Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
+          {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+          Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
 
-        wv_size = :counters.info(ctx.write_version).size
-        if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+          wv_size = :counters.info(ctx.write_version).size
+          if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
 
-        async_submit_to_raft(idx, {:getdel, key})
-        v
+          v
+        end
     end
   end
 
@@ -727,13 +727,9 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp install_rmw_and_submit(ctx, idx, key, value, expire_at_ms, raft_cmd, success) do
-    case install_rmw_value(ctx, idx, key, value, expire_at_ms) do
-      :ok ->
-        async_submit_to_raft(idx, raft_cmd)
-        success
-
-      {:error, _} = err ->
-        err
+    with :ok <- async_submit_to_raft(idx, raft_cmd),
+         :ok <- install_rmw_value(ctx, idx, key, value, expire_at_ms) do
+      success
     end
   end
 
@@ -3008,13 +3004,9 @@ defmodule Ferricstore.Store.Router do
     if under_pressure do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
-      case install_rmw_value(ctx, idx, compound_key, value, expire_at_ms) do
-        :ok ->
-          async_submit_to_raft(idx, {:put, compound_key, value, expire_at_ms})
-          :ok
-
-        {:error, _} = err ->
-          err
+      with :ok <- async_submit_to_raft(idx, {:put, compound_key, value, expire_at_ms}),
+           :ok <- install_rmw_value(ctx, idx, compound_key, value, expire_at_ms) do
+        :ok
       end
     end
   end
@@ -3026,18 +3018,19 @@ defmodule Ferricstore.Store.Router do
     if under_pressure do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
-      keydir = elem(ctx.keydir_refs, idx)
-      track_keydir_binary_delete(ctx, idx, keydir, compound_key)
-      :ets.delete(keydir, compound_key)
+      with :ok <- async_submit_to_raft(idx, {:delete, compound_key}) do
+        keydir = elem(ctx.keydir_refs, idx)
+        track_keydir_binary_delete(ctx, idx, keydir, compound_key)
+        :ets.delete(keydir, compound_key)
 
-      {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
-      Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, compound_key)
+        {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+        Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, compound_key)
 
-      wv_size = :counters.info(ctx.write_version).size
-      if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+        wv_size = :counters.info(ctx.write_version).size
+        if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
 
-      async_submit_to_raft(idx, {:delete, compound_key})
-      :ok
+        :ok
+      end
     end
   end
 

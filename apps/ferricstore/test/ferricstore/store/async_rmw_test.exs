@@ -20,6 +20,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   """
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.RmwCoordinator
   alias Ferricstore.Test.ShardHelpers
@@ -111,6 +112,25 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       :ok = Router.put(ctx(), k, "hello", 0)
       assert {:error, _msg} = Router.incr(ctx(), k, 1)
       assert Router.get(ctx(), k) == "hello"
+    end
+
+    test "INCR does not become locally visible when Batcher is overloaded" do
+      k = ukey("incr_overloaded")
+      idx = Router.shard_for(ctx(), k)
+
+      on_exit(fn -> Batcher.reset_pending(idx) end)
+
+      for _ <- 1..64 do
+        Batcher.__inject_async_pending__(
+          idx,
+          make_ref(),
+          [{:async, node(), {:incr, k, 1}}],
+          0
+        )
+      end
+
+      assert {:error, "ERR async replication overloaded"} = Router.incr(ctx(), k, 1)
+      assert Router.get(ctx(), k) == nil
     end
 
     test "APPEND on nonexistent key creates it, returns byte size" do
