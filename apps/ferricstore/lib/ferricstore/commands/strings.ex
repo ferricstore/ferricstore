@@ -799,8 +799,15 @@ defmodule Ferricstore.Commands.Strings do
 
   defp compound_data_structure_key?(key, store) do
     Ops.has_compound?(store) and
-      (Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
-         Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil)
+      compound_type_marker?(key, store) and
+      TypeRegistry.get_type(key, store) != "none"
+  end
+
+  defp compound_type_marker?(key, store) do
+    # Raw type markers can outlive all fields when the last field expires.
+    # Keep the cheap no-marker fast path, then let TypeRegistry clean stale markers.
+    Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
+      Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil
   end
 
   defp clear_compound_data_structure(key, store) do

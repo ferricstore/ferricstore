@@ -621,6 +621,17 @@ defmodule Ferricstore.Commands.HashTest do
       assert 0 == Strings.handle("EXISTS", ["hash"], store)
     end
 
+    test "fully expired hash does not block string reads and writes before TYPE cleanup" do
+      store = MockStore.make()
+      Hash.handle("HSET", ["hash", "f1", "v1"], store)
+      compound_key = <<"H:hash", 0, "f1">>
+      store.compound_put.("hash", compound_key, "v1", System.os_time(:millisecond) - 1)
+
+      assert nil == Strings.handle("GET", ["hash"], store)
+      assert 1 == Strings.handle("SETNX", ["hash", "fresh"], store)
+      assert "fresh" == Strings.handle("GET", ["hash"], store)
+    end
+
     test "HEXPIRE then HEXPIRE overwrites the TTL" do
       store = MockStore.make()
       Hash.handle("HSET", ["hash", "f1", "v1"], store)

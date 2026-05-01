@@ -16,10 +16,7 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
   describe "WRONGTYPE enforcement: string commands on hash keys" do
     setup do
       store = MockStore.make()
-      # Simulate a hash key by registering it as type "hash" in compound storage
-      # The type registry stores T:key -> "hash"
-      type_key = "T:mykey"
-      store.compound_put.("mykey", type_key, "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       {:ok, store: store}
     end
 
@@ -108,7 +105,7 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
       assert store.get.("mykey") == nil
     end
 
-    test "MSETNX treats compound type metadata as existing", %{store: store} do
+    test "MSETNX treats live compound data as existing", %{store: store} do
       assert 0 = Strings.handle("MSETNX", ["other", "value", "mykey", "overwrite"], store)
       assert store.get.("other") == nil
       assert store.get.("mykey") == nil
