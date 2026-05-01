@@ -74,6 +74,20 @@ defmodule Ferricstore.Commands.ExpiryTest do
       assert -1 == Expiry.handle("TTL", ["k"], store)
     end
 
+    test "TTL reads expiry without loading the value" do
+      future = System.os_time(:millisecond) + 10_000
+
+      store = %{
+        expire_at_ms: fn "cold_ttl" -> future end,
+        get_meta: fn _key -> flunk("TTL should not load the value") end,
+        compound_get_meta: fn _redis_key, _compound_key -> nil end
+      }
+
+      ttl = Expiry.handle("TTL", ["cold_ttl"], store)
+      assert ttl > 0
+      assert ttl <= 10
+    end
+
     test "TTL missing key returns -2" do
       assert -2 == Expiry.handle("TTL", ["missing"], MockStore.make())
     end
@@ -99,6 +113,20 @@ defmodule Ferricstore.Commands.ExpiryTest do
     test "PTTL key with no expiry returns -1" do
       store = MockStore.make(%{"k" => {"v", 0}})
       assert -1 == Expiry.handle("PTTL", ["k"], store)
+    end
+
+    test "PTTL reads expiry without loading the value" do
+      future = System.os_time(:millisecond) + 10_000
+
+      store = %{
+        expire_at_ms: fn "cold_ttl" -> future end,
+        get_meta: fn _key -> flunk("PTTL should not load the value") end,
+        compound_get_meta: fn _redis_key, _compound_key -> nil end
+      }
+
+      pttl = Expiry.handle("PTTL", ["cold_ttl"], store)
+      assert pttl > 0
+      assert pttl <= 10_000
     end
 
     test "PTTL missing key returns -2" do

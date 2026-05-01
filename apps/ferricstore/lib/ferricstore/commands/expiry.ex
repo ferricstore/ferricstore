@@ -237,18 +237,18 @@ defmodule Ferricstore.Commands.Expiry do
   # ---------------------------------------------------------------------------
 
   defp get_ttl_seconds(key, store) do
-    case key_meta(key, store) do
+    case ttl_expire_at_ms(key, store) do
       nil -> -2
-      {_kind, _value_or_type, 0} -> -1
-      {_kind, _value_or_type, exp} -> max(0, div(exp - CommandTime.now_ms(), 1_000))
+      0 -> -1
+      exp -> max(0, div(exp - CommandTime.now_ms(), 1_000))
     end
   end
 
   defp get_ttl_ms(key, store) do
-    case key_meta(key, store) do
+    case ttl_expire_at_ms(key, store) do
       nil -> -2
-      {_kind, _value_or_type, 0} -> -1
-      {_kind, _value_or_type, exp} -> max(0, exp - CommandTime.now_ms())
+      0 -> -1
+      exp -> max(0, exp - CommandTime.now_ms())
     end
   end
 
@@ -278,6 +278,19 @@ defmodule Ferricstore.Commands.Expiry do
     case Ops.get_meta(store, key) do
       nil -> compound_meta(key, store)
       {value, expire_at_ms} -> {:plain, value, expire_at_ms}
+    end
+  end
+
+  defp ttl_expire_at_ms(key, store) do
+    case Ops.expire_at_ms(store, key) do
+      nil ->
+        case compound_meta(key, store) do
+          nil -> nil
+          {:compound, _type, expire_at_ms} -> expire_at_ms
+        end
+
+      expire_at_ms ->
+        expire_at_ms
     end
   end
 
