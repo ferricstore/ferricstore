@@ -304,13 +304,7 @@ defmodule Ferricstore.Commands.Generic do
         "stream"
 
       "string" ->
-        value = Ops.get(store, key)
-
-        cond do
-          int_encoded_string?(value) -> "int"
-          value != nil and byte_size(value) <= 44 -> "embstr"
-          true -> "raw"
-        end
+        string_encoding(store, key)
 
       _other ->
         "raw"
@@ -383,6 +377,22 @@ defmodule Ferricstore.Commands.Generic do
   defp do_object(subcmd, _rest, _store) do
     {:error,
      "ERR unknown subcommand or wrong number of arguments for '#{String.downcase(subcmd)}' command"}
+  end
+
+  defp string_encoding(store, key) do
+    case Ops.value_size(store, key) do
+      size when is_integer(size) and size > 44 ->
+        "raw"
+
+      _small_or_unknown ->
+        value = Ops.get(store, key)
+
+        cond do
+          int_encoded_string?(value) -> "int"
+          value != nil and byte_size(value) <= 44 -> "embstr"
+          true -> "raw"
+        end
+    end
   end
 
   defp object_exists?(store, key) do

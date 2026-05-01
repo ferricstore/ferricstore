@@ -44,6 +44,15 @@ defmodule Ferricstore.Commands.MemoryTest do
       assert result > 0
     end
 
+    test "uses stored value size without loading cold value" do
+      store = %{
+        value_size: fn "cold" -> 10_000 end,
+        get: fn _key -> flunk("MEMORY USAGE should not load a cold string value") end
+      }
+
+      assert 96 + byte_size("cold") + 10_000 == Memory.handle("USAGE", ["cold"], store)
+    end
+
     test "with no args returns error" do
       store = MockStore.make()
       assert {:error, _} = Memory.handle("USAGE", [], store)

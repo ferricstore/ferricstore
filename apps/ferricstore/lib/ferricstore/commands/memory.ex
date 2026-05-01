@@ -1,5 +1,6 @@
 defmodule Ferricstore.Commands.Memory do
   alias Ferricstore.Store.Ops
+
   @moduledoc """
   Handles Redis MEMORY subcommands.
 
@@ -40,9 +41,9 @@ defmodule Ferricstore.Commands.Memory do
   # ---------------------------------------------------------------------------
 
   def handle("USAGE", [key | _opts], store) do
-    case Ops.get(store, key) do
+    case Ops.value_size(store, key) do
       nil -> nil
-      value -> @key_overhead_bytes + byte_size(key) + byte_size(value)
+      value_size -> @key_overhead_bytes + byte_size(key) + value_size
     end
   end
 

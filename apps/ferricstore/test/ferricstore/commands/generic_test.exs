@@ -583,6 +583,17 @@ defmodule Ferricstore.Commands.GenericTest do
       assert "embstr" == Generic.handle("OBJECT", ["ENCODING", "too_big"], store)
     end
 
+    test "OBJECT ENCODING classifies large strings from metadata without loading value" do
+      store = %{
+        exists?: fn "cold_large" -> true end,
+        compound_get: fn "cold_large", _compound_key -> nil end,
+        value_size: fn "cold_large" -> 10_000 end,
+        get: fn _key -> flunk("OBJECT ENCODING should not load a large cold string value") end
+      }
+
+      assert "raw" == Generic.handle("OBJECT", ["ENCODING", "cold_large"], store)
+    end
+
     test "OBJECT ENCODING returns error for missing key" do
       store = MockStore.make()
 
