@@ -403,7 +403,9 @@ defmodule Ferricstore.Raft.StateMachine do
       result =
         case check_key_lock(state, redis_key, nil) do
           :ok ->
-            with_pending_writes(state, fn -> do_put(state, compound_key, value, expire_at_ms) end)
+            with_pending_writes(state, fn ->
+              do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
+            end)
 
           {:error, :key_locked} ->
             {:error, :key_locked}
@@ -422,7 +424,9 @@ defmodule Ferricstore.Raft.StateMachine do
       result =
         case check_key_lock(state, redis_key, nil) do
           :ok ->
-            with_pending_writes(state, fn -> do_delete(state, compound_key) end)
+            with_pending_writes(state, fn ->
+              do_compound_delete(state, redis_key, compound_key)
+            end)
 
           {:error, :key_locked} ->
             {:error, :key_locked}
@@ -441,7 +445,9 @@ defmodule Ferricstore.Raft.StateMachine do
       result =
         case check_key_lock(state, redis_key, nil) do
           :ok ->
-            with_pending_writes(state, fn -> do_delete_prefix(state, prefix) end)
+            with_pending_writes(state, fn ->
+              do_compound_delete_prefix(state, redis_key, prefix)
+            end)
 
           {:error, :key_locked} ->
             {:error, :key_locked}
@@ -1730,10 +1736,13 @@ defmodule Ferricstore.Raft.StateMachine do
         nil
 
       type ->
-        path = Promotion.dedicated_path(promoted_data_dir(ctx), ctx.index, type, redis_key)
+        path = Promotion.dedicated_path(promoted_data_dir(ctx), ctx_index(ctx), type, redis_key)
         if Ferricstore.FS.dir?(path), do: path, else: nil
     end
   end
+
+  defp ctx_index(%{index: index}), do: index
+  defp ctx_index(%{shard_index: index}), do: index
 
   defp promoted_data_dir(%{data_dir: data_dir}) do
     cond do
@@ -2035,7 +2044,7 @@ defmodule Ferricstore.Raft.StateMachine do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
 
     case check_key_lock(state, redis_key, nil) do
-      :ok -> do_put(state, compound_key, value, expire_at_ms)
+      :ok -> do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
       {:error, :key_locked} -> {:error, :key_locked}
     end
   end
@@ -2044,7 +2053,7 @@ defmodule Ferricstore.Raft.StateMachine do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
 
     case check_key_lock(state, redis_key, nil) do
-      :ok -> do_delete(state, compound_key)
+      :ok -> do_compound_delete(state, redis_key, compound_key)
       {:error, :key_locked} -> {:error, :key_locked}
     end
   end
@@ -2053,7 +2062,7 @@ defmodule Ferricstore.Raft.StateMachine do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
 
     case check_key_lock(state, redis_key, nil) do
-      :ok -> do_delete_prefix(state, prefix)
+      :ok -> do_compound_delete_prefix(state, redis_key, prefix)
       {:error, :key_locked} -> {:error, :key_locked}
     end
   end
@@ -3916,6 +3925,112 @@ defmodule Ferricstore.Raft.StateMachine do
 
     Enum.each(keys_to_delete, fn key ->
       do_delete(state, key)
+    end)
+
+    :ok
+  end
+
+  defp do_compound_put(state, redis_key, compound_key, value, expire_at_ms) do
+    case promoted_compound_path(state, redis_key, compound_key) do
+      nil ->
+        do_put(state, compound_key, value, expire_at_ms)
+
+      dedicated_path ->
+        do_promoted_compound_put(state, compound_key, value, expire_at_ms, dedicated_path)
+    end
+  end
+
+  defp do_compound_delete(state, redis_key, compound_key) do
+    case promoted_compound_path(state, redis_key, compound_key) do
+      nil -> do_delete(state, compound_key)
+      dedicated_path -> do_promoted_compound_delete(state, compound_key, dedicated_path)
+    end
+  end
+
+  defp do_compound_delete_prefix(state, redis_key, prefix) do
+    case promoted_compound_path(state, redis_key, prefix) do
+      nil ->
+        do_delete_prefix(state, prefix)
+
+      _dedicated_path ->
+        delete_compound_prefix_from_ets(state, prefix)
+
+        Promotion.cleanup_promoted!(
+          redis_key,
+          state.shard_data_path,
+          state.ets,
+          state.data_dir,
+          state.shard_index
+        )
+    end
+  end
+
+  defp do_promoted_compound_put(state, compound_key, value, expire_at_ms, dedicated_path) do
+    value_for = value_for_ets(value, hot_cache_threshold(state))
+    disk_val = to_disk_binary(value)
+    active = Promotion.find_active(dedicated_path)
+    fid = parse_fid_from_path(active)
+
+    case NIF.v2_append_record(active, compound_key, disk_val, expire_at_ms) do
+      {:ok, {offset, record_size}} ->
+        track_keydir_binary_delta(state, compound_key, value_for)
+
+        :ets.insert(
+          state.ets,
+          {compound_key, value_for, expire_at_ms, LFU.initial(), fid, offset, record_size}
+        )
+
+        sm_tx_put_pending(compound_key, value, expire_at_ms)
+        deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+        if MapSet.member?(deleted, compound_key) do
+          Process.put(:tx_deleted_keys, MapSet.delete(deleted, compound_key))
+        end
+
+        :ok
+
+      {:error, _reason} = err ->
+        err
+    end
+  end
+
+  defp do_promoted_compound_delete(state, compound_key, dedicated_path) do
+    track_keydir_binary_remove(state, compound_key)
+    active = Promotion.find_active(dedicated_path)
+
+    case NIF.v2_append_tombstone(active, compound_key) do
+      {:ok, _offset} ->
+        :ets.delete(state.ets, compound_key)
+        sm_tx_drop_pending(compound_key)
+        deleted = Process.get(:tx_deleted_keys, MapSet.new())
+        Process.put(:tx_deleted_keys, MapSet.put(deleted, compound_key))
+        :ok
+
+      {:error, _reason} = err ->
+        err
+    end
+  end
+
+  defp delete_compound_prefix_from_ets(state, prefix) do
+    prefix_len = byte_size(prefix)
+
+    match_spec = [
+      {{:"$1", :_, :_, :_, :_, :_, :_},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+       ], [:"$1"]}
+    ]
+
+    state.ets
+    |> :ets.select(match_spec)
+    |> Enum.each(fn key ->
+      track_keydir_binary_remove(state, key)
+      :ets.delete(state.ets, key)
+      sm_tx_drop_pending(key)
+      deleted = Process.get(:tx_deleted_keys, MapSet.new())
+      Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
     end)
 
     :ok

@@ -31,7 +31,12 @@ defmodule Ferricstore.Raft.WritePathTest do
   defp keydir_for(key), do: :"keydir_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
 
   defp shard_pid_for(key) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
+    name =
+      Router.shard_name(
+        FerricStore.Instance.get(:default),
+        Router.shard_for(FerricStore.Instance.get(:default), key)
+      )
+
     Process.whereis(name)
   end
 
@@ -268,7 +273,13 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       # v2: verify the value is on disk via the ETS 7-tuple location
       [{^k, _value, _exp, _lfu, fid, off, _vsize}] = :ets.lookup(state.keydir, k)
-      log_path = Path.join(state.data_dir |> Ferricstore.DataDir.shard_data_path(state.index), "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+
+      log_path =
+        Path.join(
+          state.data_dir |> Ferricstore.DataDir.shard_data_path(state.index),
+          "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
+        )
+
       assert {:ok, "durable_value"} = NIF.v2_pread_at(log_path, off)
     end
 
@@ -295,9 +306,12 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "multiple rapid writes to the same shard are batched" do
       # Generate keys that all map to the same shard
       shard_idx = 0
+
       keys =
         Stream.repeatedly(fn -> ukey("batch_#{:rand.uniform(999_999)}") end)
-        |> Stream.filter(fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) == shard_idx end)
+        |> Stream.filter(fn k ->
+          Router.shard_for(FerricStore.Instance.get(:default), k) == shard_idx
+        end)
         |> Enum.take(5)
 
       # Send all writes nearly simultaneously -- they should be batched
@@ -419,7 +433,9 @@ defmodule Ferricstore.Raft.WritePathTest do
       # Write several keys to the same shard
       keys =
         Stream.repeatedly(fn -> ukey("wc_#{:rand.uniform(999_999)}") end)
-        |> Stream.filter(fn kk -> Router.shard_for(FerricStore.Instance.get(:default), kk) == shard_idx end)
+        |> Stream.filter(fn kk ->
+          Router.shard_for(FerricStore.Instance.get(:default), kk) == shard_idx
+        end)
         |> Enum.take(5)
 
       for kk <- keys do
@@ -462,6 +478,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       Ferricstore.Raft.StateMachine.init(%{
         shard_index: 0,
         shard_data_path: dir,
+        data_dir: dir,
         active_file_id: 0,
         active_file_path: active_file_path,
         ets: keydir_name
@@ -481,7 +498,6 @@ defmodule Ferricstore.Raft.WritePathTest do
   end
 
   alias Ferricstore.Raft.StateMachine, as: SM
-  alias Ferricstore.Store.ListOps
 
   # ---------------------------------------------------------------------------
   # 12. list_op — LPUSH through Raft adds element
@@ -714,6 +730,31 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       cleanup_sm(ctx)
     end
+
+    test "compound_put writes promoted hash fields to the dedicated Bitcask" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      key = "promoted_hash"
+      compound_key = Ferricstore.Store.CompoundKey.hash_field(key, "field1")
+
+      {:ok, dedicated_path} =
+        Ferricstore.Store.Promotion.open_dedicated(state.data_dir, 0, :hash, key)
+
+      dedicated_log = Ferricstore.Store.Promotion.find_active(dedicated_path)
+
+      assert File.stat!(dedicated_log).size == 0
+
+      {new_state, :ok} = SM.apply(%{}, {:compound_put, compound_key, "value1", 0}, state)
+
+      assert new_state.applied_count == 1
+      assert [{^compound_key, "value1", 0, _lfu, 0, off, _vsize}] = :ets.lookup(ets, compound_key)
+      assert off >= 0
+      assert {:ok, "value1"} = NIF.v2_pread_at(dedicated_log, off)
+      assert File.stat!(dedicated_log).size > 0
+
+      cleanup_sm(ctx)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -748,6 +789,31 @@ defmodule Ferricstore.Raft.WritePathTest do
         SM.apply(%{}, {:compound_delete, "nonexistent\x00field"}, state)
 
       assert result == :ok
+
+      cleanup_sm(ctx)
+    end
+
+    test "compound_delete tombstones promoted hash fields in the dedicated Bitcask" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      key = "promoted_hash_delete"
+      compound_key = Ferricstore.Store.CompoundKey.hash_field(key, "field1")
+
+      {:ok, dedicated_path} =
+        Ferricstore.Store.Promotion.open_dedicated(state.data_dir, 0, :hash, key)
+
+      dedicated_log = Ferricstore.Store.Promotion.find_active(dedicated_path)
+
+      {state2, :ok} = SM.apply(%{}, {:compound_put, compound_key, "value1", 0}, state)
+      size_after_put = File.stat!(dedicated_log).size
+      assert size_after_put > 0
+
+      {state3, :ok} = SM.apply(%{}, {:compound_delete, compound_key}, state2)
+
+      assert state3.applied_count == 2
+      assert [] == :ets.lookup(ets, compound_key)
+      assert File.stat!(dedicated_log).size > size_after_put
 
       cleanup_sm(ctx)
     end
@@ -930,6 +996,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       # Verify list via LRANGE
       {_state2, elements} =
         SM.apply(%{}, {:list_op, "mylist", {:lrange, 0, -1}}, new_state)
+
       assert elements == ["a", "b"]
 
       # Verify hash field
@@ -1038,6 +1105,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("lock_conflict")
 
       assert :ok = Router.lock(FerricStore.Instance.get(:default), k, "owner1", 30_000)
+
       assert {:error, "DISTLOCK lock is held by another owner"} =
                Router.lock(FerricStore.Instance.get(:default), k, "owner2", 30_000)
     end
@@ -1072,8 +1140,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("unlock_wrong_owner")
 
       :ok = Router.lock(FerricStore.Instance.get(:default), k, "owner1", 30_000)
+
       assert {:error, "DISTLOCK caller is not the lock owner"} =
                Router.unlock(FerricStore.Instance.get(:default), k, "owner2")
+
       # Lock should still be held
       assert "owner1" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1107,6 +1177,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("extend_wrong_owner")
 
       :ok = Router.lock(FerricStore.Instance.get(:default), k, "owner1", 30_000)
+
       assert {:error, "DISTLOCK caller is not the lock owner"} =
                Router.extend(FerricStore.Instance.get(:default), k, "owner2", 60_000)
     end
@@ -1123,6 +1194,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       past = System.os_time(:millisecond) - 1_000
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "owner1", past)
+
       assert {:error, "DISTLOCK lock does not exist or has expired"} =
                Router.extend(FerricStore.Instance.get(:default), k, "owner1", 60_000)
     end
@@ -1151,9 +1223,14 @@ defmodule Ferricstore.Raft.WritePathTest do
       window_ms = 10_000
       max_requests = 10
 
-      [_, c1, _, _] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
-      [_, c2, _, _] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
-      [_, c3, _, _] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
+      [_, c1, _, _] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
+
+      [_, c2, _, _] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
+
+      [_, c3, _, _] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
 
       assert c1 == 1
       assert c2 == 2
@@ -1166,7 +1243,8 @@ defmodule Ferricstore.Raft.WritePathTest do
       max_requests = 3
 
       # Use up the limit
-      ["allowed", _, _, _] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 3)
+      ["allowed", _, _, _] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 3)
 
       # Next request should be denied
       [status, count, remaining, _ttl] =
@@ -1182,7 +1260,9 @@ defmodule Ferricstore.Raft.WritePathTest do
       window_ms = 10_000
       max_requests = 100
 
-      [_, _, _, ttl] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
+      [_, _, _, ttl] =
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
+
       assert is_integer(ttl)
       assert ttl >= 0
       assert ttl <= window_ms
@@ -1238,7 +1318,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("incrbyfloat_err")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "not_a_number", 0)
-      assert {:error, "ERR value is not a valid float"} = Router.incr_float(FerricStore.Instance.get(:default), k, 1.0)
+
+      assert {:error, "ERR value is not a valid float"} =
+               Router.incr_float(FerricStore.Instance.get(:default), k, 1.0)
+
       # Original value should be unchanged
       assert "not_a_number" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1388,7 +1471,9 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "returns nil when key does not exist" do
       k = ukey("getex_missing")
 
-      value = Router.getex(FerricStore.Instance.get(:default), k, System.os_time(:millisecond) + 60_000)
+      value =
+        Router.getex(FerricStore.Instance.get(:default), k, System.os_time(:millisecond) + 60_000)
+
       assert value == nil
     end
 
@@ -1488,7 +1573,9 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       # The NX guard prevents the write; the original value remains.
       result =
-        if Router.exists?(FerricStore.Instance.get(:default), k), do: nil, else: Router.put(FerricStore.Instance.get(:default), k, "should_not_appear", 0)
+        if Router.exists?(FerricStore.Instance.get(:default), k),
+          do: nil,
+          else: Router.put(FerricStore.Instance.get(:default), k, "should_not_appear", 0)
 
       assert result == nil
       assert "original" == Router.get(FerricStore.Instance.get(:default), k)
@@ -1501,7 +1588,9 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert Router.exists?(FerricStore.Instance.get(:default), k) == false
 
       result =
-        if Router.exists?(FerricStore.Instance.get(:default), k), do: Router.put(FerricStore.Instance.get(:default), k, "should_not_appear", 0), else: nil
+        if Router.exists?(FerricStore.Instance.get(:default), k),
+          do: Router.put(FerricStore.Instance.get(:default), k, "should_not_appear", 0),
+          else: nil
 
       assert result == nil
       assert nil == Router.get(FerricStore.Instance.get(:default), k)
@@ -1530,7 +1619,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("incr_nan")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "not_a_number", 0)
-      assert {:error, "ERR value is not an integer or out of range"} = Router.incr(FerricStore.Instance.get(:default), k, 1)
+
+      assert {:error, "ERR value is not an integer or out of range"} =
+               Router.incr(FerricStore.Instance.get(:default), k, 1)
+
       # Original value should be unchanged
       assert "not_a_number" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1540,8 +1632,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       max_int64 = 9_223_372_036_854_775_807
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, Integer.to_string(max_int64), 0)
+
       assert {:error, "ERR increment or decrement would overflow"} =
                Router.incr(FerricStore.Instance.get(:default), k, 1)
+
       # Value should remain unchanged
       assert Integer.to_string(max_int64) == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1599,7 +1693,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("incrbyfloat_nan")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "not_a_number", 0)
-      assert {:error, "ERR value is not a valid float"} = Router.incr_float(FerricStore.Instance.get(:default), k, 1.0)
+
+      assert {:error, "ERR value is not a valid float"} =
+               Router.incr_float(FerricStore.Instance.get(:default), k, 1.0)
+
       # Original value should be unchanged
       assert "not_a_number" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1705,7 +1802,9 @@ defmodule Ferricstore.Raft.WritePathTest do
       :ok = Router.put(FerricStore.Instance.get(:default), k, "expired_val", past)
 
       # Key is expired; GETEX should return nil
-      result = Router.getex(FerricStore.Instance.get(:default), k, System.os_time(:millisecond) + 60_000)
+      result =
+        Router.getex(FerricStore.Instance.get(:default), k, System.os_time(:millisecond) + 60_000)
+
       assert result == nil
     end
   end

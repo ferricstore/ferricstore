@@ -220,44 +220,28 @@ defmodule Ferricstore.Store.Shard.Compound do
   # -------------------------------------------------------------------
 
   defp handle_compound_put_raft(redis_key, compound_key, value, expire_at_ms, state) do
-    case promoted_store(state, redis_key) do
-      nil ->
-        result =
-          Ferricstore.Raft.Batcher.write(state.index, {:put, compound_key, value, expire_at_ms})
+    result =
+      Ferricstore.Raft.Batcher.write(
+        state.index,
+        {:compound_put, compound_key, value, expire_at_ms}
+      )
 
-        new_version = state.write_version + 1
+    new_version = state.write_version + 1
 
-        case result do
-          :ok ->
-            new_state = %{state | write_version: new_version}
-            new_state = maybe_promote(new_state, redis_key, compound_key)
-            {:reply, :ok, new_state}
+    case result do
+      :ok ->
+        new_state = %{state | write_version: new_version}
 
-          {:error, _} = err ->
-            {:reply, err, state}
-        end
+        new_state =
+          case promoted_store(new_state, redis_key) do
+            nil -> maybe_promote(new_state, redis_key, compound_key)
+            _dedicated_path -> bump_promoted_writes(new_state, redis_key)
+          end
 
-      dedicated_path ->
-        case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
-          {:ok, {fid, offset, record_size}} ->
-            state = track_promoted_dead_bytes(state, redis_key, compound_key, record_size)
+        {:reply, :ok, new_state}
 
-            ShardETS.ets_insert_with_location(
-              state,
-              compound_key,
-              value,
-              expire_at_ms,
-              fid,
-              offset,
-              record_size
-            )
-
-            {:reply, :ok, bump_promoted_writes(state, redis_key)}
-
-          {:error, reason} ->
-            Logger.error("Shard #{state.index}: promoted write failed: #{inspect(reason)}")
-            {:reply, {:error, reason}, state}
-        end
+      {:error, _} = err ->
+        {:reply, err, state}
     end
   end
 
@@ -303,28 +287,29 @@ defmodule Ferricstore.Store.Shard.Compound do
   end
 
   defp handle_compound_delete_raft(redis_key, compound_key, state) do
-    case promoted_store(state, redis_key) do
-      nil ->
-        result = Ferricstore.Raft.Batcher.write(state.index, {:delete, compound_key})
-        new_version = state.write_version + 1
+    tracked_state =
+      if promoted_store(state, redis_key) do
+        track_promoted_delete_bytes(state, redis_key, compound_key)
+      else
+        state
+      end
 
-        case result do
-          :ok -> {:reply, :ok, %{state | write_version: new_version}}
-          {:error, _} = err -> {:reply, err, state}
-        end
+    result = Ferricstore.Raft.Batcher.write(tracked_state.index, {:compound_delete, compound_key})
+    new_version = tracked_state.write_version + 1
 
-      dedicated_path ->
-        state = track_promoted_delete_bytes(state, redis_key, compound_key)
+    case result do
+      :ok ->
+        new_state =
+          if promoted_store(tracked_state, redis_key) do
+            bump_promoted_writes(tracked_state, redis_key)
+          else
+            tracked_state
+          end
 
-        case promoted_tombstone(dedicated_path, compound_key) do
-          {:ok, _} ->
-            ShardETS.ets_delete_key(state, compound_key)
-            {:reply, :ok, bump_promoted_writes(state, redis_key)}
+        {:reply, :ok, %{new_state | write_version: new_version}}
 
-          {:error, reason} ->
-            Logger.error("Shard #{state.index}: promoted tombstone failed: #{inspect(reason)}")
-            {:reply, {:error, reason}, state}
-        end
+      {:error, _} = err ->
+        {:reply, err, state}
     end
   end
 
@@ -372,32 +357,16 @@ defmodule Ferricstore.Store.Shard.Compound do
   end
 
   defp handle_compound_delete_prefix_raft(redis_key, prefix, state) do
-    case promoted_store(state, redis_key) do
-      nil ->
-        keys_to_delete = ShardETS.prefix_collect_keys(state.keydir, prefix)
+    result = Ferricstore.Raft.Batcher.write(state.index, {:compound_delete_prefix, prefix})
+    new_version = state.write_version + 1
 
-        Enum.each(keys_to_delete, fn key ->
-          Ferricstore.Raft.Batcher.write(state.index, {:delete, key})
-        end)
-
-        new_version = state.write_version + 1
-        {:reply, :ok, %{state | write_version: new_version}}
-
-      _dedicated ->
-        keys_to_delete = ShardETS.prefix_collect_keys(state.keydir, prefix)
-
-        Enum.each(keys_to_delete, fn key -> ShardETS.ets_delete_key(state, key) end)
-
-        Promotion.cleanup_promoted!(
-          redis_key,
-          state.shard_data_path,
-          state.keydir,
-          state.data_dir,
-          state.index
-        )
-
+    case result do
+      :ok ->
         new_promoted = Map.delete(state.promoted_instances, redis_key)
-        {:reply, :ok, %{state | promoted_instances: new_promoted}}
+        {:reply, :ok, %{state | promoted_instances: new_promoted, write_version: new_version}}
+
+      {:error, _} = err ->
+        {:reply, err, state}
     end
   end
 

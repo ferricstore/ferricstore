@@ -141,6 +141,9 @@ defmodule Ferricstore.Raft.Batcher do
           | {:ratelimit_add, binary(), pos_integer(), pos_integer(), pos_integer(),
              non_neg_integer()}
           | {:list_op, binary(), term()}
+          | {:compound_put, binary(), binary(), non_neg_integer()}
+          | {:compound_delete, binary()}
+          | {:compound_delete_prefix, binary()}
 
   @typedoc """
   A slot key identifies a unique batching bucket by namespace prefix and
