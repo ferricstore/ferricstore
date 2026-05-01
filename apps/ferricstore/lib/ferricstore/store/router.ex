@@ -1197,9 +1197,35 @@ defmodule Ferricstore.Store.Router do
               nil
           end
 
-        _ ->
+        {:cold, _file_id, _offset, _value_size} ->
+          result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
+
+          if result != nil do
+            Stats.record_cold_read(ctx, key)
+          else
+            Stats.incr_keyspace_misses(ctx)
+          end
+
+          result
+
+        :expired ->
           Stats.incr_keyspace_misses(ctx)
           nil
+
+        :miss ->
+          Stats.incr_keyspace_misses(ctx)
+          nil
+
+        :no_table ->
+          result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
+
+          if result != nil do
+            Stats.record_cold_read(ctx, key)
+          else
+            Stats.incr_keyspace_misses(ctx)
+          end
+
+          result
       end
     end)
   end

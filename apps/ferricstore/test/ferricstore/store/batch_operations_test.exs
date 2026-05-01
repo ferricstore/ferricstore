@@ -219,6 +219,21 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert FerricStore.batch_get(["bg_single"]) == ["solo"]
     end
 
+    test "falls back to shard read when direct keydir ref is unavailable" do
+      key = "bg_stale_keydir_#{System.unique_integer([:positive])}"
+      :ok = Router.put(ctx(), key, "from_shard", 0)
+
+      idx = Router.shard_for(ctx(), key)
+
+      stale_ctx = %{
+        ctx()
+        | keydir_refs: put_elem(ctx().keydir_refs, idx, :missing_keydir_for_test)
+      }
+
+      assert Router.get(stale_ctx, key) == "from_shard"
+      assert Router.batch_get(stale_ctx, [key, "bg_stale_missing"]) == ["from_shard", nil]
+    end
+
     @tag timeout: 120_000
     test "large batch (1000 keys) returns correct results" do
       kvs = for i <- 1..1000, do: {"bg_large_#{i}", "v#{i}"}
