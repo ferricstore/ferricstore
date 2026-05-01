@@ -112,6 +112,26 @@ defmodule Ferricstore.Store.AsyncListOpTest do
       assert 1 == Router.list_op(ctx(), key, {:lpush, ["fresh"]})
       assert ["fresh"] == Router.list_op(ctx(), key, {:lrange, 0, -1})
     end
+
+    test "LPUSH treats an unswept expired plain value as missing" do
+      key = ukey("unswept_expired_plain_to_list")
+      expired_at = Ferricstore.HLC.now_ms() - 1_000
+
+      assert :ok = Router.put(ctx(), key, "old-string", expired_at)
+
+      assert 1 == Router.list_op(ctx(), key, {:lpush, ["fresh"]})
+      assert ["fresh"] == Router.list_op(ctx(), key, {:lrange, 0, -1})
+    end
+
+    test "LPUSH on a live plain value returns WRONGTYPE and leaves the value intact" do
+      key = ukey("plain_to_list")
+
+      assert :ok = Router.put(ctx(), key, "plain-string")
+
+      assert {:error, "WRONGTYPE" <> _} = Router.list_op(ctx(), key, {:lpush, ["fresh"]})
+      assert "plain-string" == Router.get(ctx(), key)
+      assert {:error, "WRONGTYPE" <> _} = Router.list_op(ctx(), key, {:lrange, 0, -1})
+    end
   end
 
   # ---------------------------------------------------------------------------

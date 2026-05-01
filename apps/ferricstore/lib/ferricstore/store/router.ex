@@ -2289,16 +2289,23 @@ defmodule Ferricstore.Store.Router do
   def execute_list_op_inline(ctx, idx, {:list_op, key, operation} = cmd) do
     :telemetry.execute([:ferricstore, :rmw, :worker_list_op], %{}, %{shard_index: idx})
     store = build_origin_compound_store(ctx, idx)
-    # Resolve the module at runtime to avoid the compile-time cycle
-    # ListOps → Ops → Router → ListOps. `list_ops_mod/0` returns an atom
-    # that xref cannot trace through.
-    result = :erlang.apply(list_ops_mod(), :execute, [key, store, operation])
 
-    wv_size = :counters.info(ctx.write_version).size
-    if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+    case TypeRegistry.check_type(key, :list, store) do
+      :ok ->
+        # Resolve the module at runtime to avoid the compile-time cycle
+        # ListOps → Ops → Router → ListOps. `list_ops_mod/0` returns an atom
+        # that xref cannot trace through.
+        result = :erlang.apply(list_ops_mod(), :execute, [key, store, operation])
 
-    async_submit_to_raft(idx, cmd)
-    result
+        wv_size = :counters.info(ctx.write_version).size
+        if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+
+        async_submit_to_raft(idx, cmd)
+        result
+
+      {:error, _} = err ->
+        err
+    end
   end
 
   def execute_list_op_inline(ctx, idx, {:list_op_lmove, src_key, dst_key, from_dir, to_dir} = cmd) do
@@ -2331,16 +2338,7 @@ defmodule Ferricstore.Store.Router do
 
     %{
       compound_get: fn _redis_key, compound_key ->
-        now = Ferricstore.HLC.now_ms()
-
-        case :ets.lookup(keydir, compound_key) do
-          [{_, value, exp, _, _, _, _}]
-          when value != nil and (exp == 0 or exp > now) ->
-            value
-
-          _ ->
-            nil
-        end
+        origin_compound_get(ctx, idx, keydir, compound_key)
       end,
       compound_put: fn _redis_key, compound_key, value, exp ->
         disk_value = to_disk_binary(value)
@@ -2376,12 +2374,53 @@ defmodule Ferricstore.Store.Router do
         Ferricstore.Store.Shard.ETS.prefix_count_entries(keydir, prefix)
       end,
       exists?: fn k ->
-        case :ets.lookup(keydir, k) do
-          [_] -> true
-          [] -> false
-        end
+        origin_key_exists?(ctx, idx, keydir, k)
       end
     }
+  end
+
+  defp origin_compound_get(ctx, idx, keydir, compound_key) do
+    now = HLC.now_ms()
+
+    case ets_get_full(ctx, idx, keydir, compound_key, now) do
+      {:hit, value, _lfu} ->
+        value
+
+      {:cold, file_id, offset, value_size}
+      when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
+        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+
+        path =
+          Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+
+        case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
+          {:ok, value} ->
+            warm_ets_after_cold_read(ctx, keydir, compound_key, value, file_id, offset)
+            value
+
+          _ ->
+            nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp origin_key_exists?(ctx, idx, keydir, key) do
+    now = HLC.now_ms()
+
+    case ets_get_full(ctx, idx, keydir, key, now) do
+      {:hit, _value, _lfu} ->
+        true
+
+      {:cold, file_id, _offset, value_size}
+      when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
+        true
+
+      _ ->
+        false
+    end
   end
 
   defp async_compound_put(ctx, idx, _redis_key, compound_key, value, expire_at_ms) do
