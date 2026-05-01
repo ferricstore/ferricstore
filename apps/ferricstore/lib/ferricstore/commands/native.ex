@@ -132,16 +132,22 @@ defmodule Ferricstore.Commands.Native do
 
     store = %{
       get: fn k -> Router.get(ctx, k) end,
+      exists?: fn k -> Router.exists?(ctx, k) end,
       compound_get: fn redis_key, compound_key ->
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
+      end,
+      compound_count: fn redis_key, prefix ->
+        GenServer.call(shard, {:compound_count, redis_key, prefix})
+      end,
+      compound_delete: fn redis_key, compound_key ->
+        GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end
     }
 
     type = Ferricstore.Store.TypeRegistry.get_type(key, store)
     alive? = type != "none"
 
-    {value, expire_at_ms, hot_status} = resolve_key_value(alive?, ctx, keydir, key, now)
-    value_size = if alive? and is_binary(value), do: byte_size(value), else: 0
+    {value_size, expire_at_ms, hot_status} = resolve_key_info(alive?, keydir, key, now)
     ttl_ms = compute_ttl_ms(alive?, expire_at_ms, now)
 
     [
@@ -158,20 +164,8 @@ defmodule Ferricstore.Commands.Native do
     ]
   end
 
-  defp resolve_key_value(false, _ctx, _keydir, _key, _now), do: {nil, 0, "cold"}
-
-  defp resolve_key_value(true, ctx, keydir, key, now) do
-    {val, exp, hot} = ets_key_info(keydir, key, now)
-
-    if val != nil do
-      {val, exp, hot}
-    else
-      case Router.get_meta(ctx, key) do
-        nil -> {nil, 0, "cold"}
-        {v, e} -> {v, e, "cold"}
-      end
-    end
-  end
+  defp resolve_key_info(false, _keydir, _key, _now), do: {0, 0, "cold"}
+  defp resolve_key_info(true, keydir, key, now), do: ets_key_info(keydir, key, now)
 
   defp compute_ttl_ms(false, _expire_at_ms, _now), do: -2
   defp compute_ttl_ms(true, 0, _now), do: -1
@@ -182,25 +176,25 @@ defmodule Ferricstore.Commands.Native do
     try do
       case :ets.lookup(keydir, key) do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-          {value, 0, "hot"}
+          {byte_size(value), 0, "hot"}
 
-        [{^key, nil, 0, _lfu, _fid, _off, _vsize}] ->
-          {nil, 0, "cold"}
+        [{^key, nil, 0, _lfu, _fid, _off, vsize}] ->
+          {vsize, 0, "cold"}
 
         [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-          {value, exp, "hot"}
+          {byte_size(value), exp, "hot"}
 
-        [{^key, nil, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
-          {nil, exp, "cold"}
+        [{^key, nil, exp, _lfu, _fid, _off, vsize}] when exp > now ->
+          {vsize, exp, "cold"}
 
         [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
-          {nil, 0, "cold"}
+          {0, 0, "cold"}
 
         [] ->
-          {nil, 0, "cold"}
+          {0, 0, "cold"}
       end
     rescue
-      ArgumentError -> {nil, 0, "cold"}
+      ArgumentError -> {0, 0, "cold"}
     end
   end
 
