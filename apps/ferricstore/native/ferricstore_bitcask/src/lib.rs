@@ -481,6 +481,82 @@ fn v2_scan_file_from_offset<'a>(
     }
 }
 
+/// Scan only tombstone metadata from a data file.
+/// `{:ok, [{key, offset, record_size, expire_at_ms}, ...]}`.
+///
+/// Used during hint recovery. Hint files contain only live entries, so startup
+/// must still apply tombstones from hinted logs. This scanner skips live value
+/// payloads instead of materializing them, preserving fast cold-value recovery.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_scan_tombstones<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let p = std::path::Path::new(&path);
+
+    match std::fs::File::open(p) {
+        Ok(file) => {
+            let mut reader = std::io::BufReader::new(file);
+            let mut results: Vec<Term<'a>> = Vec::new();
+            let mut offset: u64 = 0;
+
+            loop {
+                let mut header = [0u8; log::HEADER_SIZE];
+
+                match reader.read_exact(&mut header) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                }
+
+                let stored_crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
+                let expire_at_ms = u64::from_le_bytes(header[12..20].try_into().unwrap());
+                let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
+                let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
+
+                if value_size_raw == log::TOMBSTONE {
+                    let mut key = vec![0u8; key_size];
+                    if reader.read_exact(&mut key).is_err() {
+                        break;
+                    }
+
+                    let mut hasher = crc32fast::Hasher::new();
+                    hasher.update(&header[4..]);
+                    hasher.update(&key);
+
+                    if hasher.finalize() != stored_crc {
+                        break;
+                    }
+
+                    let key_bin = match OwnedBinary::new(key.len()) {
+                        Some(mut ob) => {
+                            ob.as_mut_slice().copy_from_slice(&key);
+                            ob.release(env)
+                        }
+                        None => {
+                            return Ok((atoms::error(), "out of memory allocating key binary")
+                                .encode(env));
+                        }
+                    };
+
+                    let record_size = (log::HEADER_SIZE + key.len()) as u64;
+                    results.push((key_bin, offset, record_size, expire_at_ms).encode(env));
+                    offset += record_size;
+                } else {
+                    let skip = u64::from(key_size as u16) + u64::from(value_size_raw);
+                    if reader.seek(SeekFrom::Current(skip as i64)).is_err() {
+                        break;
+                    }
+                    offset += log::HEADER_SIZE as u64 + skip;
+                }
+            }
+
+            Ok((atoms::ok(), results).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
 /// Batch pread: read values at multiple offsets from the same file.
 /// Returns `{:ok, [value_binary | nil, ...]}`.
 ///

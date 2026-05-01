@@ -76,7 +76,9 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           |> Enum.filter(&String.ends_with?(&1, ".log"))
           |> Enum.sort()
 
-        Logger.debug("Shard #{shard_index}: recover_keydir scanning #{length(log_files)} log file(s) at #{shard_path}")
+        Logger.debug(
+          "Shard #{shard_index}: recover_keydir scanning #{length(log_files)} log file(s) at #{shard_path}"
+        )
 
         # Try hint files first for faster recovery
         hint_files =
@@ -87,13 +89,23 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         recover_from_hints_or_logs(shard_path, keydir, shard_index, log_files, hint_files)
 
       {:error, reason} ->
-        Logger.warning("Shard #{shard_index}: recover_keydir failed to list #{shard_path}: #{inspect(reason)}")
+        Logger.warning(
+          "Shard #{shard_index}: recover_keydir failed to list #{shard_path}: #{inspect(reason)}"
+        )
     end
 
     ets_size = :ets.info(keydir, :size)
     # Log recovered keys for debugging (only first 10 to avoid log spam)
-    sample_keys = :ets.tab2list(keydir) |> Enum.take(10) |> Enum.map(fn {k, _v, _e, _l, fid, off, vs} -> "#{k}(fid=#{inspect(fid)},off=#{off},vs=#{vs})" end)
-    Logger.debug("Shard #{shard_index}: recover_keydir done, ETS size: #{ets_size}, keys: #{inspect(sample_keys)}")
+    sample_keys =
+      :ets.tab2list(keydir)
+      |> Enum.take(10)
+      |> Enum.map(fn {k, _v, _e, _l, fid, off, vs} ->
+        "#{k}(fid=#{inspect(fid)},off=#{off},vs=#{vs})"
+      end)
+
+    Logger.debug(
+      "Shard #{shard_index}: recover_keydir done, ETS size: #{ets_size}, keys: #{inspect(sample_keys)}"
+    )
   end
 
   @spec recover_from_log(binary(), binary(), :ets.tid(), non_neg_integer()) :: :ok
@@ -141,7 +153,10 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   @doc false
   def do_expiry_sweep(state) do
     now = HLC.now_ms()
-    max_keys = Application.get_env(:ferricstore, :expiry_max_keys_per_sweep, @default_max_keys_per_sweep)
+
+    max_keys =
+      Application.get_env(:ferricstore, :expiry_max_keys_per_sweep, @default_max_keys_per_sweep)
+
     expired_keys = scan_expired(state.keydir, now, max_keys)
 
     count = length(expired_keys)
@@ -164,8 +179,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
     # Match entries where expire_at_ms > 0 and expire_at_ms <= now
     match_spec = [
-      {{:"$1", :_, :"$2", :_, :_, :_, :_},
-       [{:andalso, {:>, :"$2", 0}, {:"=<", :"$2", now}}],
+      {{:"$1", :_, :"$2", :_, :_, :_, :_}, [{:andalso, {:>, :"$2", 0}, {:"=<", :"$2", now}}],
        [:"$1"]}
     ]
 
@@ -178,14 +192,18 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   @spec schedule_expiry_sweep() :: reference()
   @doc false
   def schedule_expiry_sweep do
-    interval = Application.get_env(:ferricstore, :expiry_sweep_interval_ms, @default_sweep_interval_ms)
+    interval =
+      Application.get_env(:ferricstore, :expiry_sweep_interval_ms, @default_sweep_interval_ms)
+
     Process.send_after(self(), :expiry_sweep, interval)
   end
 
   @spec schedule_frag_check() :: reference()
   @doc false
   def schedule_frag_check do
-    interval = Application.get_env(:ferricstore, :frag_check_interval_ms, @default_frag_check_interval_ms)
+    interval =
+      Application.get_env(:ferricstore, :frag_check_interval_ms, @default_frag_check_interval_ms)
+
     Process.send_after(self(), :frag_check, interval)
   end
 
@@ -214,7 +232,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     end
   end
 
-  @spec migrate_prob_file(binary(), binary(), :ets.tid(), non_neg_integer(), non_neg_integer()) :: non_neg_integer()
+  @spec migrate_prob_file(binary(), binary(), :ets.tid(), non_neg_integer(), non_neg_integer()) ::
+          non_neg_integer()
   @doc false
   def migrate_prob_file(prob_dir, filename, keydir, shard_index, count) do
     path = Path.join(prob_dir, filename)
@@ -245,7 +264,14 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # The key in the filename may be Base64-encoded (new) or sanitized (old).
   # We try to decode as Base64 first; if that fails, treat the filename
   # stem as the literal key.
-  @spec migrate_if_missing(:ets.tid(), non_neg_integer(), binary(), binary(), atom(), non_neg_integer()) :: non_neg_integer()
+  @spec migrate_if_missing(
+          :ets.tid(),
+          non_neg_integer(),
+          binary(),
+          binary(),
+          atom(),
+          non_neg_integer()
+        ) :: non_neg_integer()
   @doc false
   def migrate_if_missing(keydir, shard_index, filename_key, path, type, count) do
     key =
@@ -287,8 +313,14 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
             do: :math.exp(-num_bits * :math.pow(:math.log(2), 2) / capacity),
             else: 0.01
 
-        {:bloom_meta, %{path: path, num_bits: num_bits, num_hashes: num_hashes,
-                         capacity: capacity, error_rate: error_rate}}
+        {:bloom_meta,
+         %{
+           path: path,
+           num_bits: num_bits,
+           num_hashes: num_hashes,
+           capacity: capacity,
+           error_rate: error_rate
+         }}
 
       _ ->
         {:bloom_meta, %{path: path}}
@@ -333,14 +365,27 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # Application.start for shards 0..N-1). If so, also starts the ra server
   # for this shard. Isolated test shards with ad-hoc indices won't have a
   # Batcher and fall back to the direct write path.
-  @spec start_raft_if_available(non_neg_integer(), binary(), non_neg_integer(), binary(), :ets.tid()) :: boolean()
+  @spec start_raft_if_available(
+          non_neg_integer(),
+          binary(),
+          non_neg_integer(),
+          binary(),
+          :ets.tid()
+        ) :: boolean()
   @doc false
   def start_raft_if_available(index, shard_data_path, active_file_id, active_file_path, ets) do
     batcher_name = Ferricstore.Raft.Batcher.batcher_name(index)
 
     if Process.whereis(batcher_name) != nil do
       try do
-        Ferricstore.Raft.Cluster.start_shard_server(index, shard_data_path, active_file_id, active_file_path, ets)
+        Ferricstore.Raft.Cluster.start_shard_server(
+          index,
+          shard_data_path,
+          active_file_id,
+          active_file_path,
+          ets
+        )
+
         true
       catch
         _, _ -> false
@@ -391,6 +436,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
     :ok
   end
+
   defp cleanup_compact_temps(shard_path, files) do
     Enum.each(files, fn name ->
       if String.starts_with?(name, "compact_") and String.ends_with?(name, ".log") do
@@ -407,19 +453,36 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   end
 
   defp recover_from_hints_or_logs(shard_path, keydir, shard_index, log_files, hint_files) do
-    hint_offsets =
-      Enum.reduce(hint_files, %{}, fn hint_name, acc ->
-        case recover_from_hint(shard_path, hint_name, keydir, shard_index) do
-          {:ok, fid, end_offset} -> Map.put(acc, fid, end_offset)
-          {:error, _fid} -> acc
-        end
+    hint_by_fid =
+      Map.new(hint_files, fn hint_name ->
+        fid = hint_name |> String.trim_trailing(".hint") |> String.to_integer()
+        {fid, hint_name}
       end)
 
-    recovery_logs = unhinted_log_files(log_files, Map.keys(hint_offsets))
+    hint_offsets =
+      Enum.reduce(log_files, %{}, fn log_name, acc ->
+        fid = log_file_id(log_name)
 
-    Enum.each(recovery_logs, fn log_name ->
-      recover_from_log(shard_path, log_name, keydir, shard_index)
-    end)
+        case Map.fetch(hint_by_fid, fid) do
+          {:ok, hint_name} ->
+            case recover_from_hint(shard_path, hint_name, keydir, shard_index) do
+              {:ok, ^fid, end_offset} ->
+                # Hint files contain live entries only. Scan tombstone metadata
+                # from the paired log so deletes still override older hints
+                # without reloading full values during startup.
+                recover_tombstones_from_log(shard_path, log_name, keydir, shard_index)
+                Map.put(acc, fid, end_offset)
+
+              {:error, _fid} ->
+                recover_from_log(shard_path, log_name, keydir, shard_index)
+                acc
+            end
+
+          :error ->
+            recover_from_log(shard_path, log_name, keydir, shard_index)
+            acc
+        end
+      end)
 
     replay_hinted_active_tail(shard_path, keydir, shard_index, log_files, hint_offsets)
   end
@@ -441,14 +504,6 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
       _ ->
         {:error, fid}
     end
-  end
-
-  defp unhinted_log_files(log_files, hinted_ids) do
-    hinted_ids = MapSet.new(hinted_ids)
-
-    Enum.reject(log_files, fn name ->
-      MapSet.member?(hinted_ids, log_file_id(name))
-    end)
   end
 
   defp replay_hinted_active_tail(_shard_path, _keydir, _shard_index, [], _hint_offsets), do: :ok
@@ -476,6 +531,42 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   end
 
   defp log_file_id(name), do: name |> String.trim_trailing(".log") |> String.to_integer()
+
+  defp recover_tombstones_from_log(shard_path, log_name, keydir, shard_index) do
+    log_path = Path.join(shard_path, log_name)
+    fid = log_file_id(log_name)
+
+    case NIF.v2_scan_tombstones(log_path) do
+      {:ok, records} ->
+        Enum.each(records, fn record ->
+          recover_hint_tombstone(keydir, shard_index, fid, record)
+        end)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp recover_hint_tombstone(
+         keydir,
+         shard_index,
+         fid,
+         {key, offset, _record_size, _expire_at_ms}
+       ) do
+    case :ets.lookup(keydir, key) do
+      [{^key, _value, _exp, _lfu, entry_fid, entry_off, _vsize}]
+      when is_integer(entry_fid) and
+             (entry_fid < fid or
+                (entry_fid == fid and is_integer(entry_off) and entry_off < offset)) ->
+        track_binary_remove(keydir, shard_index, key)
+        :ets.delete(keydir, key)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp recover_hint_tombstone(_keydir, _shard_index, _fid, _record), do: :ok
 
   defp recover_record(keydir, shard_index, _fid, {key, _offset, _value_size, _expire_at_ms, true}) do
     track_binary_remove(keydir, shard_index, key)
@@ -516,7 +607,11 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     if new_count >= @struggling_threshold and not state.sweep_struggling do
       :telemetry.execute(
         [:ferricstore, :expiry, :struggling],
-        %{shard_index: state.index, consecutive_ceiling_sweeps: new_count, max_keys_per_sweep: max_keys},
+        %{
+          shard_index: state.index,
+          consecutive_ceiling_sweeps: new_count,
+          max_keys_per_sweep: max_keys
+        },
         %{}
       )
 
@@ -552,6 +647,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # Tracks bytes added for a fresh insert (no existing entry expected, or replaces).
   defp track_binary_add(shard_index, key, value) do
     ref = keydir_binary_ref()
+
     if ref do
       bytes = offheap_size(key) + offheap_size(value)
       if bytes > 0, do: :atomics.add(ref, shard_index + 1, bytes)
@@ -561,11 +657,14 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # Tracks bytes removed for a delete (lookup existing entry first).
   defp track_binary_remove(keydir, shard_index, key) do
     ref = keydir_binary_ref()
+
     if ref do
-      bytes = case :ets.lookup(keydir, key) do
-        [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
-        _ -> 0
-      end
+      bytes =
+        case :ets.lookup(keydir, key) do
+          [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
+          _ -> 0
+        end
+
       if bytes > 0, do: :atomics.sub(ref, shard_index + 1, bytes)
     end
   end

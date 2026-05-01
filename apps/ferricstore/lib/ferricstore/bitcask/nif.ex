@@ -49,6 +49,11 @@ defmodule Ferricstore.Bitcask.NIF do
           | {:error, term()}
   def v2_scan_file_from_offset(_path, _start_offset), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec v2_scan_tombstones(binary()) ::
+          {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()}]}
+          | {:error, term()}
+  def v2_scan_tombstones(_path), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec v2_pread_batch(binary(), [{non_neg_integer(), non_neg_integer()}]) ::
           {:ok, [binary()]} | {:error, term()}
   def v2_pread_batch(_path, _locations), do: :erlang.nif_error(:nif_not_loaded)

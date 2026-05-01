@@ -162,6 +162,34 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
                {"empty", ^off3, 0, 0, false}
              ] = records
     end
+
+    test "scans tombstone metadata without returning live records" do
+      dir = Path.join(System.tmp_dir!(), "tombstone_scan_nif_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "00000.log")
+      File.touch!(path)
+
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      large_value = :binary.copy("x", 1024 * 1024)
+
+      assert {:ok,
+              [
+                {:put, put_offset, _put_size},
+                {:delete, delete_offset, delete_size},
+                {:put, put2_offset, _put2_size}
+              ]} =
+               NIF.v2_append_ops_batch_nosync(path, [
+                 {:put, "live_before", large_value, 0},
+                 {:delete, "deleted"},
+                 {:put, "live_after", large_value, 0}
+               ])
+
+      assert put_offset == 0
+      assert put2_offset > delete_offset
+
+      assert {:ok, [{"deleted", ^delete_offset, ^delete_size, 0}]} = NIF.v2_scan_tombstones(path)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -750,6 +778,32 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   end
 
   describe "hint recovery" do
+    test "replays tombstones that appear before the last live hinted record" do
+      dir = Path.join(System.tmp_dir!(), "hint_tombstone_order_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      log0 = Path.join(dir, "00000.log")
+      hint0 = Path.join(dir, "00000.hint")
+      log1 = Path.join(dir, "00001.log")
+      hint1 = Path.join(dir, "00001.hint")
+
+      {:ok, [{a_offset, a_size}]} = NIF.v2_append_batch(log0, [{"a", "old", 0}])
+      :ok = NIF.v2_write_hint_file(hint0, [{"a", 0, a_offset, a_size, 0}])
+
+      {:ok, _delete_offset} = NIF.v2_append_tombstone(log1, "a")
+      {:ok, [{b_offset, b_size}]} = NIF.v2_append_batch(log1, [{"b", "live", 0}])
+      :ok = NIF.v2_write_hint_file(hint1, [{"b", 1, b_offset, b_size, 0}])
+
+      keydir = :ets.new(:hint_tombstone_order_keydir, [:set, :public])
+
+      Ferricstore.Store.Shard.Lifecycle.recover_keydir(dir, keydir, 0)
+
+      assert [] == :ets.lookup(keydir, "a")
+      assert [{"b", nil, 0, _lfu, 1, ^b_offset, ^b_size}] = :ets.lookup(keydir, "b")
+    end
+
     test "replays log tail after stale active-file hint" do
       previous_trap_exit = Process.flag(:trap_exit, true)
       {pid1, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
