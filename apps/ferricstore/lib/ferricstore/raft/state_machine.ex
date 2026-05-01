@@ -2293,8 +2293,9 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_set(state, key, value, expire_at_ms, opts) do
-    current = do_get_meta(state, key)
     compound_data_structure? = compound_data_structure_key?(state, key)
+    get? = Map.get(opts, :get, false)
+    current = set_current_meta(state, key, get?)
     exists? = current != nil or compound_data_structure?
 
     {old_value, old_expire_at_ms} =
@@ -2311,10 +2312,10 @@ defmodule Ferricstore.Raft.StateMachine do
       end
 
     cond do
-      compound_data_structure? and Map.get(opts, :get, false) ->
+      compound_data_structure? and get? ->
         {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
 
-      skip? and Map.get(opts, :get, false) ->
+      skip? and get? ->
         old_value
 
       skip? ->
@@ -2329,7 +2330,36 @@ defmodule Ferricstore.Raft.StateMachine do
           end
 
         do_put(state, key, value, effective_expire_at_ms)
-        if Map.get(opts, :get, false), do: old_value, else: :ok
+        if get?, do: old_value, else: :ok
+    end
+  end
+
+  defp set_current_meta(state, key, true), do: do_get_meta(state, key)
+
+  defp set_current_meta(state, key, false) do
+    case plain_expire_at_ms(state, key) do
+      nil -> nil
+      expire_at_ms -> {nil, expire_at_ms}
+    end
+  end
+
+  defp plain_expire_at_ms(state, key) do
+    now = apply_now_ms()
+
+    case :ets.lookup(state.ets, key) do
+      [{^key, _value, 0, _lfu, _fid, _off, _vsize}] ->
+        0
+
+      [{^key, _value, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
+        exp
+
+      [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
+        track_keydir_binary_remove_known(state, key, value)
+        :ets.delete(state.ets, key)
+        nil
+
+      [] ->
+        nil
     end
   end
 

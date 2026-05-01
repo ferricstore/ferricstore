@@ -721,6 +721,54 @@ defmodule Ferricstore.Raft.StateMachineTest do
     end
   end
 
+  describe "apply/3 with {:set, key, value, expire_at_ms, opts}" do
+    test "SET NX treats a cold keydir entry as existing without warming it", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      key = "set_nx_cold_existing"
+      {:ok, {offset, _record_size}} = NIF.v2_append_record(active_file_path, key, "old", 0)
+      value_size = byte_size("old")
+      :ets.insert(ets, {key, nil, 0, Ferricstore.Store.LFU.initial(), 0, offset, value_size})
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:set, key, "new", 0, set_opts(%{nx: true})}, state)
+
+      assert result == nil
+      assert [{^key, nil, 0, _lfu, 0, ^offset, ^value_size}] = :ets.lookup(ets, key)
+    end
+
+    test "SET XX updates a cold key even when the old value is unreadable", %{
+      state: state,
+      ets: ets
+    } do
+      key = "set_xx_cold_unreadable"
+      :ets.insert(ets, {key, nil, 0, Ferricstore.Store.LFU.initial(), 99, 123, 3})
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:set, key, "new", 0, set_opts(%{xx: true})}, state)
+
+      assert result == :ok
+      assert [{^key, "new", 0, _lfu, _fid, _off, 3}] = :ets.lookup(ets, key)
+    end
+
+    test "SET KEEPTTL preserves cold key TTL without reading the old value", %{
+      state: state,
+      ets: ets
+    } do
+      key = "set_keepttl_cold_unreadable"
+      expire_at_ms = System.os_time(:millisecond) + 60_000
+      :ets.insert(ets, {key, nil, expire_at_ms, Ferricstore.Store.LFU.initial(), 99, 123, 3})
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:set, key, "new", 0, set_opts(%{keepttl: true})}, state)
+
+      assert result == :ok
+      assert [{^key, "new", ^expire_at_ms, _lfu, _fid, _off, 3}] = :ets.lookup(ets, key)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # apply/3 with :delete
   # ---------------------------------------------------------------------------
@@ -1365,5 +1413,12 @@ defmodule Ferricstore.Raft.StateMachineTest do
         active_file_id: file_id,
         active_file_path: Path.join(state.shard_data_path, "#{file_id}.log")
     }
+  end
+
+  defp set_opts(overrides) do
+    Map.merge(
+      %{expire_at_ms: 0, nx: false, xx: false, get: false, keepttl: false, has_expiry: false},
+      overrides
+    )
   end
 end
