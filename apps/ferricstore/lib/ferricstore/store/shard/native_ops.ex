@@ -375,7 +375,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     case ensure_list_type_for_operation(key, operation, type_store) do
       :ok ->
         result = Ferricstore.Store.ListOps.execute(key, store, operation)
-        {:reply, result, state}
+        {:reply, result, refresh_direct_file_accounting(state)}
 
       {:error, _} = err ->
         {:reply, err, state}
@@ -430,7 +430,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     state = ShardFlush.flush_pending_sync(state)
     store = build_list_compound_store_direct(src_key, state)
     result = Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
-    {:reply, result, state}
+    {:reply, result, refresh_direct_file_accounting(state)}
   end
 
   @spec build_list_compound_store_raft(binary(), map()) :: map()
@@ -596,4 +596,25 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   # Alias for compound key reads — same logic as do_get since compound keys
   # are stored as regular ETS/Bitcask entries.
   defp do_compound_get(state, compound_key), do: ShardReads.do_get(state, compound_key)
+
+  defp refresh_direct_file_accounting(state) do
+    case File.stat(state.active_file_path) do
+      {:ok, %{size: current_size}} ->
+        written = max(current_size - state.active_file_size, 0)
+
+        {total, dead} =
+          Map.get(state.file_stats, state.active_file_id, {state.active_file_size, 0})
+
+        state
+        |> Map.put(:active_file_size, current_size)
+        |> Map.put(
+          :file_stats,
+          Map.put(state.file_stats, state.active_file_id, {total + written, dead})
+        )
+        |> ShardFlush.maybe_rotate_file()
+
+      {:error, _} ->
+        state
+    end
+  end
 end
