@@ -556,18 +556,7 @@ defmodule Ferricstore.Commands.Hash do
              {:ok, count} <- parse_positive_integer(count_str, "count"),
              :ok <- validate_field_count(count, fields) do
           with :ok <- TypeRegistry.check_type(key, :hash, store) do
-            Enum.map(fields, fn field ->
-              compound_key = CompoundKey.hash_field(key, field)
-
-              case Ops.compound_get_meta(store, key, compound_key) do
-                nil ->
-                  nil
-
-                {value, _old_expire} ->
-                  Ops.compound_put(store, key, compound_key, value, expire_at_ms)
-                  value
-              end
-            end)
+            hgetex_fields(fields, key, store, expire_at_ms)
           end
         end
 
@@ -580,18 +569,7 @@ defmodule Ferricstore.Commands.Hash do
     with {:ok, count} <- parse_positive_integer(count_str, "count"),
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
-        Enum.map(fields, fn field ->
-          compound_key = CompoundKey.hash_field(key, field)
-
-          case Ops.compound_get_meta(store, key, compound_key) do
-            nil ->
-              nil
-
-            {value, _old_expire} ->
-              Ops.compound_put(store, key, compound_key, value, 0)
-              value
-          end
-        end)
+        hgetex_fields(fields, key, store, 0)
       end
     end
   end
@@ -801,6 +779,36 @@ defmodule Ferricstore.Commands.Hash do
       end
 
     collapse_field_values(rest, next_fields_rev, Map.put(values_by_field, field, value))
+  end
+
+  defp hgetex_fields(fields, key, store, expire_at_ms) do
+    unique_fields = Enum.uniq(fields)
+    compound_keys = Enum.map(unique_fields, &CompoundKey.hash_field(key, &1))
+
+    metas_by_field =
+      store
+      |> Ops.compound_batch_get_meta(key, compound_keys)
+      |> then(&Enum.zip(unique_fields, &1))
+      |> Map.new()
+
+    unique_fields
+    |> Enum.zip(compound_keys)
+    |> Enum.each(fn {field, compound_key} ->
+      case Map.fetch!(metas_by_field, field) do
+        nil ->
+          :ok
+
+        {value, _old_expire} ->
+          Ops.compound_put(store, key, compound_key, value, expire_at_ms)
+      end
+    end)
+
+    Enum.map(fields, fn field ->
+      case Map.fetch!(metas_by_field, field) do
+        nil -> nil
+        {value, _old_expire} -> value
+      end
+    end)
   end
 
   # Same as hset_pairs but with per-field TTL.

@@ -2426,6 +2426,13 @@ defmodule Ferricstore.Store.Router do
     GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
   end
 
+  @spec compound_batch_get_meta(FerricStore.Instance.t(), binary(), [binary()]) ::
+          [{binary(), non_neg_integer()} | nil]
+  def compound_batch_get_meta(ctx, redis_key, compound_keys) do
+    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
+    GenServer.call(shard, {:compound_batch_get_meta, redis_key, compound_keys})
+  end
+
   @spec compound_put(FerricStore.Instance.t(), binary(), binary(), binary(), non_neg_integer()) ::
           :ok | {:error, term()}
   def compound_put(ctx, redis_key, compound_key, value, expire_at_ms) do

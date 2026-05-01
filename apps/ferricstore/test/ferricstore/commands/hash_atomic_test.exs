@@ -232,6 +232,53 @@ defmodule Ferricstore.Commands.HashAtomicTest do
       Hash.handle("HSET", ["hash", "f1", "v1"], store)
       assert {:error, _} = Hash.handle("HGETEX", ["hash", "EX", "abc", "FIELDS", "1", "f1"], store)
     end
+
+    test "batches field meta reads and writes each existing duplicate field once" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+
+      field_keys = [
+        CompoundKey.hash_field("hash", "f1"),
+        CompoundKey.hash_field("hash", "missing"),
+        CompoundKey.hash_field("hash", "f2")
+      ]
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key ->
+            "hash"
+
+          "hash", compound_key ->
+            flunk("HGETEX should only use compound_get for type, got #{inspect(compound_key)}")
+        end,
+        compound_get_meta: fn "hash", compound_key ->
+          flunk("HGETEX should use compound_batch_get_meta, got #{inspect(compound_key)}")
+        end,
+        compound_batch_get_meta: fn "hash", ^field_keys ->
+          send(parent, {:compound_batch_get_meta, field_keys})
+          [{"v1", 0}, nil, {"v2", 123}]
+        end,
+        compound_put: fn "hash", compound_key, value, expire_at_ms ->
+          send(parent, {:compound_put, compound_key, value, expire_at_ms})
+          :ok
+        end
+      }
+
+      assert ["v1", "v1", nil, "v2"] ==
+               Hash.handle(
+                 "HGETEX",
+                 ["hash", "EX", "60", "FIELDS", "4", "f1", "f1", "missing", "f2"],
+                 store
+               )
+
+      assert_received {:compound_batch_get_meta, ^field_keys}
+      assert_received {:compound_put, f1_key, "v1", f1_expire_at_ms}
+      assert_received {:compound_put, f2_key, "v2", f2_expire_at_ms}
+      assert Enum.sort([f1_key, f2_key]) == Enum.sort([hd(field_keys), List.last(field_keys)])
+      assert f1_expire_at_ms > 0
+      assert f2_expire_at_ms == f1_expire_at_ms
+      refute_received {:compound_put, _, _, _}
+    end
   end
 
   # ---------------------------------------------------------------------------
