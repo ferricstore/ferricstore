@@ -1,6 +1,7 @@
 defmodule Ferricstore.Commands.Generic do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.TypeRegistry
 
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
@@ -58,7 +59,7 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   def handle("TYPE", [key], store) do
-    {:simple, Ferricstore.Store.TypeRegistry.get_type(key, store)}
+    {:simple, TypeRegistry.get_type(key, store)}
   end
 
   def handle("TYPE", _args, _store) do
@@ -263,12 +264,18 @@ defmodule Ferricstore.Commands.Generic do
         nil ->
           case Ops.compound_get_meta(store, key, CompoundKey.list_meta_key(key)) do
             nil -> nil
-            {_meta, expire_at_ms} -> expire_at_ms
+            {_meta, expire_at_ms} -> live_compound_expire_at_ms(store, key, "list", expire_at_ms)
           end
 
-        {_type, expire_at_ms} ->
-          expire_at_ms
+        {type, expire_at_ms} ->
+          live_compound_expire_at_ms(store, key, type, expire_at_ms)
       end
+    end
+  end
+
+  defp live_compound_expire_at_ms(store, key, expected_type, expire_at_ms) do
+    if TypeRegistry.get_type(key, store) == expected_type do
+      expire_at_ms
     end
   end
 
@@ -277,7 +284,7 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   defp do_object("ENCODING", [key], store) do
-    case Ferricstore.Store.TypeRegistry.get_type(key, store) do
+    case TypeRegistry.get_type(key, store) do
       "none" ->
         {:error, "ERR no such key"}
 
@@ -379,7 +386,7 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp object_exists?(store, key) do
-    Ferricstore.Store.TypeRegistry.get_type(key, store) != "none"
+    TypeRegistry.get_type(key, store) != "none"
   end
 
   defp int_encoded_string?(value) when is_binary(value) do
@@ -450,12 +457,18 @@ defmodule Ferricstore.Commands.Generic do
 
           case Ops.compound_get_meta(store, key, list_meta_key) do
             nil -> nil
-            {_meta, expire_at_ms} -> {:compound, "list", expire_at_ms}
+            {_meta, expire_at_ms} -> live_compound_entry(store, key, "list", expire_at_ms)
           end
 
         {type, expire_at_ms} ->
-          {:compound, type, expire_at_ms}
+          live_compound_entry(store, key, type, expire_at_ms)
       end
+    end
+  end
+
+  defp live_compound_entry(store, key, expected_type, expire_at_ms) do
+    if TypeRegistry.get_type(key, store) == expected_type do
+      {:compound, expected_type, expire_at_ms}
     end
   end
 
@@ -631,8 +644,6 @@ defmodule Ferricstore.Commands.Generic do
   defp filter_by_type(keys, nil, _store), do: keys
 
   defp filter_by_type(keys, type_filter, store) do
-    alias Ferricstore.Store.TypeRegistry
-
     Enum.filter(keys, fn key ->
       TypeRegistry.get_type(key, store) == type_filter
     end)

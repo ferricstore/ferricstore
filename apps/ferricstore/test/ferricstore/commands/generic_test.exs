@@ -3,6 +3,7 @@ defmodule Ferricstore.Commands.GenericTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.{Generic, Hash}
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -97,6 +98,13 @@ defmodule Ferricstore.Commands.GenericTest do
       assert {:error, "ERR no such key"} = Generic.handle("RENAME", ["missing", "new"], store)
     end
 
+    test "RENAME treats a fully expired compound source as missing before TYPE cleanup" do
+      store = stale_hash_store("hash")
+
+      assert {:error, "ERR no such key"} = Generic.handle("RENAME", ["hash", "dst"], store)
+      assert nil == store.compound_get.("dst", CompoundKey.type_key("dst"))
+    end
+
     test "RENAME overwrites existing destination" do
       store = MockStore.make(%{"src" => {"new_val", 0}, "dst" => {"old_val", 0}})
       assert :ok = Generic.handle("RENAME", ["src", "dst"], store)
@@ -141,6 +149,14 @@ defmodule Ferricstore.Commands.GenericTest do
       # Source should still exist, destination unchanged
       assert "v1" == store.get.("old")
       assert "v2" == store.get.("new")
+    end
+
+    test "RENAMENX treats a fully expired compound destination as missing before TYPE cleanup" do
+      store = stale_hash_store("dst", %{"src" => {"v", 0}})
+
+      assert 1 == Generic.handle("RENAMENX", ["src", "dst"], store)
+      assert nil == store.get.("src")
+      assert "v" == store.get.("dst")
     end
 
     test "RENAMENX preserves TTL when renamed" do
@@ -213,6 +229,13 @@ defmodule Ferricstore.Commands.GenericTest do
     test "COPY errors when source doesn't exist" do
       store = MockStore.make()
       assert {:error, "ERR no such key"} = Generic.handle("COPY", ["missing", "dst"], store)
+    end
+
+    test "COPY treats a fully expired compound source as missing before TYPE cleanup" do
+      store = stale_hash_store("hash")
+
+      assert {:error, "ERR no such key"} = Generic.handle("COPY", ["hash", "dst"], store)
+      assert nil == store.compound_get.("dst", CompoundKey.type_key("dst"))
     end
 
     test "COPY source to itself without REPLACE returns 0" do
@@ -407,6 +430,12 @@ defmodule Ferricstore.Commands.GenericTest do
       store = MockStore.make(%{"k" => {"v", past}})
       assert -2 == Generic.handle("EXPIRETIME", ["k"], store)
     end
+
+    test "EXPIRETIME returns -2 for a fully expired compound key before TYPE cleanup" do
+      store = stale_hash_store("hash")
+
+      assert -2 == Generic.handle("EXPIRETIME", ["hash"], store)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -443,6 +472,12 @@ defmodule Ferricstore.Commands.GenericTest do
       past = System.os_time(:millisecond) - 1000
       store = MockStore.make(%{"k" => {"v", past}})
       assert -2 == Generic.handle("PEXPIRETIME", ["k"], store)
+    end
+
+    test "PEXPIRETIME returns -2 for a fully expired compound key before TYPE cleanup" do
+      store = stale_hash_store("hash")
+
+      assert -2 == Generic.handle("PEXPIRETIME", ["hash"], store)
     end
   end
 
@@ -761,4 +796,13 @@ defmodule Ferricstore.Commands.GenericTest do
       iterate_scan(store, next_cursor, all_keys, count_opt, count_val)
     end
   end
+
+  defp stale_hash_store(key, initial \\ %{}) do
+    store = MockStore.make(initial)
+    Hash.handle("HSET", [key, "field", "value"], store)
+    store.compound_put.(key, CompoundKey.hash_field(key, "field"), "value", expired_at_ms())
+    store
+  end
+
+  defp expired_at_ms, do: System.os_time(:millisecond) - 1
 end
