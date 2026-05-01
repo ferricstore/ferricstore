@@ -230,6 +230,35 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
     end
   end
 
+  describe "cleanup failure" do
+    test "marker tombstone failure preserves marker and dedicated directory", ctx do
+      redis_key = "user:cleanup"
+      mk = Promotion.marker_key(redis_key)
+      type_str = CompoundKey.encode_type(:hash)
+
+      :ets.insert(ctx.keydir, {mk, type_str, 0, LFU.initial(), 0, 0, byte_size(type_str)})
+
+      {:ok, dedicated_path} =
+        Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+
+      File.rm!(ctx.active_path)
+      File.mkdir!(ctx.active_path)
+
+      assert_raise RuntimeError, ~r/promotion cleanup marker tombstone failed/, fn ->
+        Promotion.cleanup_promoted!(
+          redis_key,
+          ctx.shard_data_path,
+          ctx.keydir,
+          ctx.data_dir,
+          ctx.shard_index
+        )
+      end
+
+      assert [{^mk, ^type_str, 0, _lfu, 0, 0, _vsize}] = :ets.lookup(ctx.keydir, mk)
+      assert File.dir?(dedicated_path)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Crash during marker-first promotion — every intermediate state recovers
   # ---------------------------------------------------------------------------

@@ -401,9 +401,11 @@ defmodule Ferricstore.Store.Promotion do
         :ok
 
       {:error, reason} ->
-        Logger.warning(
+        Logger.error(
           "Promotion cleanup: tombstone write failed for marker #{inspect(mk)}: #{inspect(reason)}"
         )
+
+        raise "promotion cleanup marker tombstone failed: #{inspect(reason)}"
     end
 
     track_binary_delete(keydir, shard_index, mk)
