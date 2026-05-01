@@ -2409,32 +2409,14 @@ defmodule Ferricstore.Store.Router do
   # carries the raw command, replicas apply against their own active file.
   defp build_origin_compound_store(ctx, idx) do
     keydir = elem(ctx.keydir_refs, idx)
-    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+    {_file_id, file_path, shard_data_path} = Ferricstore.Store.ActiveFile.get(ctx, idx)
 
     %{
       compound_get: fn _redis_key, compound_key ->
         origin_compound_get(ctx, idx, keydir, compound_key)
       end,
       compound_put: fn _redis_key, compound_key, value, exp ->
-        disk_value = to_disk_binary(value)
-
-        :ets.insert(
-          keydir,
-          {compound_key, value, exp, LFU.initial(), :pending, 0, byte_size(disk_value)}
-        )
-
-        Ferricstore.Store.BitcaskWriter.write(
-          ctx,
-          idx,
-          file_path,
-          file_id,
-          keydir,
-          compound_key,
-          disk_value,
-          exp
-        )
-
-        :ok
+        install_rmw_value(ctx, idx, compound_key, value, exp)
       end,
       compound_delete: fn _redis_key, compound_key ->
         :ets.delete(keydir, compound_key)
@@ -2442,7 +2424,7 @@ defmodule Ferricstore.Store.Router do
         :ok
       end,
       compound_scan: fn _redis_key, prefix ->
-        Ferricstore.Store.Shard.ETS.prefix_scan_entries(keydir, prefix, file_path)
+        Ferricstore.Store.Shard.ETS.prefix_scan_entries(keydir, prefix, shard_data_path)
         |> Enum.sort_by(fn {field, _} -> field end)
       end,
       compound_count: fn _redis_key, prefix ->

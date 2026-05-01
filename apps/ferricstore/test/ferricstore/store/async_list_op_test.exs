@@ -26,6 +26,7 @@ defmodule Ferricstore.Store.AsyncListOpTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.ShardHelpers
 
   @ns "list_async"
@@ -131,6 +132,30 @@ defmodule Ferricstore.Store.AsyncListOpTest do
       assert {:error, "WRONGTYPE" <> _} = Router.list_op(ctx(), key, {:lpush, ["fresh"]})
       assert "plain-string" == Router.get(ctx(), key)
       assert {:error, "WRONGTYPE" <> _} = Router.list_op(ctx(), key, {:lrange, 0, -1})
+    end
+
+    test "RPUSH large element stores cold location instead of full value in ETS" do
+      ctx = ctx()
+      key = ukey("large_element")
+      large = :binary.copy("x", ctx.hot_cache_max_value_size + 1024)
+
+      assert 1 = Router.list_op(ctx, key, {:rpush, [large]})
+      assert [^large] = Router.list_op(ctx, key, {:lrange, 0, -1})
+
+      keydir = elem(ctx.keydir_refs, Router.shard_for(ctx, key))
+      prefix = CompoundKey.list_prefix(key)
+
+      entries =
+        keydir
+        |> :ets.tab2list()
+        |> Enum.filter(fn {compound_key, _value, _exp, _lfu, _fid, _off, _vsize} ->
+          String.starts_with?(compound_key, prefix)
+        end)
+
+      assert [{_compound_key, nil, _exp, _lfu, fid, off, value_size}] = entries
+      assert is_integer(fid) and fid >= 0
+      assert is_integer(off) and off >= 0
+      assert value_size == byte_size(large)
     end
   end
 
