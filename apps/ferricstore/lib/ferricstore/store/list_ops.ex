@@ -117,6 +117,7 @@ defmodule Ferricstore.Store.ListOps do
 
   defp delete_meta(key, store) do
     Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))
+    |> write_result()
   end
 
   defp sorted_elements(key, store) do
@@ -226,19 +227,14 @@ defmodule Ferricstore.Store.ListOps do
       actual_count = min(count, length(sorted))
       {to_pop, remaining} = Enum.split(sorted, actual_count)
 
-      Enum.each(to_pop, fn {pos, _} ->
-        Ops.compound_delete(store, key, CompoundKey.list_element(key, pos))
-      end)
-
-      if remaining == [],
-        do: delete_meta(key, store),
-        else: update_meta_from_remaining(key, store, len - actual_count, remaining)
-
       popped_values = Enum.map(to_pop, fn {_, val} -> val end)
 
-      case count do
-        1 -> List.first(popped_values)
-        _ -> popped_values
+      with :ok <- delete_elements(key, store, to_pop),
+           :ok <- update_or_delete_meta(key, store, len - actual_count, remaining) do
+        case count do
+          1 -> List.first(popped_values)
+          _ -> popped_values
+        end
       end
     end
   end
@@ -257,19 +253,14 @@ defmodule Ferricstore.Store.ListOps do
       actual_count = min(count, total)
       {remaining, to_pop} = Enum.split(sorted, total - actual_count)
 
-      Enum.each(to_pop, fn {pos, _} ->
-        Ops.compound_delete(store, key, CompoundKey.list_element(key, pos))
-      end)
-
-      if remaining == [],
-        do: delete_meta(key, store),
-        else: update_meta_from_remaining(key, store, len - actual_count, remaining)
-
       popped_values = to_pop |> Enum.map(fn {_, val} -> val end) |> Enum.reverse()
 
-      case count do
-        1 -> List.first(popped_values)
-        _ -> popped_values
+      with :ok <- delete_elements(key, store, to_pop),
+           :ok <- update_or_delete_meta(key, store, len - actual_count, remaining) do
+        case count do
+          1 -> List.first(popped_values)
+          _ -> popped_values
+        end
       end
     end
   end
@@ -331,20 +322,16 @@ defmodule Ferricstore.Store.ListOps do
         0
 
       remaining == [] ->
-        Enum.each(to_remove, fn {pos, _} ->
-          Ops.compound_delete(store, key, CompoundKey.list_element(key, pos))
-        end)
-
-        delete_meta(key, store)
-        removed_count
+        with :ok <- delete_elements(key, store, to_remove),
+             :ok <- delete_meta(key, store) do
+          removed_count
+        end
 
       true ->
-        Enum.each(to_remove, fn {pos, _} ->
-          Ops.compound_delete(store, key, CompoundKey.list_element(key, pos))
-        end)
-
-        update_meta_from_remaining(key, store, len - removed_count, remaining)
-        removed_count
+        with :ok <- delete_elements(key, store, to_remove),
+             :ok <- update_meta_from_remaining(key, store, len - removed_count, remaining) do
+          removed_count
+        end
     end
   end
 
@@ -370,19 +357,15 @@ defmodule Ferricstore.Store.ListOps do
           {kept, Enum.reject(sorted, fn {p, _} -> MapSet.member?(ks, p) end)}
       end
 
-    Enum.each(to_delete, fn {pos, _} ->
-      Ops.compound_delete(store, key, CompoundKey.list_element(key, pos))
-    end)
-
-    if to_keep == [] do
-      delete_meta(key, store)
-    else
-      {mp, _} = hd(to_keep)
-      {xp, _} = List.last(to_keep)
-      write_meta(key, store, {length(to_keep), mp - @position_step, xp + @position_step})
+    with :ok <- delete_elements(key, store, to_delete) do
+      if to_keep == [] do
+        delete_meta(key, store)
+      else
+        {mp, _} = hd(to_keep)
+        {xp, _} = List.last(to_keep)
+        write_meta(key, store, {length(to_keep), mp - @position_step, xp + @position_step})
+      end
     end
-
-    :ok
   end
 
   # LPOS
@@ -475,14 +458,12 @@ defmodule Ferricstore.Store.ListOps do
           :right -> List.last(sorted)
         end
 
-      Ops.compound_delete(store, key, CompoundKey.list_element(key, pos))
       remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
 
-      if remaining == [],
-        do: delete_meta(key, store),
-        else: update_meta_from_remaining(key, store, len - 1, remaining)
-
-      element
+      with :ok <- delete_elements(key, store, [{pos, element}]),
+           :ok <- update_or_delete_meta(key, store, len - 1, remaining) do
+        element
+      end
     end
   end
 
@@ -555,6 +536,25 @@ defmodule Ferricstore.Store.ListOps do
       end
     end)
   end
+
+  defp delete_elements(key, store, elements) do
+    Enum.reduce_while(elements, :ok, fn {pos, _value}, :ok ->
+      result =
+        store
+        |> Ops.compound_delete(key, CompoundKey.list_element(key, pos))
+        |> write_result()
+
+      case result do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp update_or_delete_meta(key, store, _new_len, []), do: delete_meta(key, store)
+
+  defp update_or_delete_meta(key, store, new_len, remaining),
+    do: update_meta_from_remaining(key, store, new_len, remaining)
 
   defp write_result(:ok), do: :ok
   defp write_result(true), do: :ok
