@@ -90,8 +90,8 @@ defmodule Ferricstore.Store.Promotion do
 
     active_file = Path.join(path, "00000.log")
 
+    # credo:disable-for-next-line Credo.Check.Refactor.UnlessWithElse
     created_file? =
-      # credo:disable-for-next-line Credo.Check.Refactor.UnlessWithElse
       unless Ferricstore.FS.exists?(active_file) do
         Ferricstore.FS.touch!(active_file)
         true
@@ -165,7 +165,10 @@ defmodule Ferricstore.Store.Promotion do
         :ets.insert(keydir, {mk, type_str, 0, LFU.initial(), 0, moffset, mvsize})
 
       {:error, reason} ->
-        Logger.error("Promotion: marker write failed for #{inspect(redis_key)}: #{inspect(reason)}")
+        Logger.error(
+          "Promotion: marker write failed for #{inspect(redis_key)}: #{inspect(reason)}"
+        )
+
         raise "promotion marker write failed: #{inspect(reason)}"
     end
 
@@ -175,7 +178,9 @@ defmodule Ferricstore.Store.Promotion do
     if entries != [] do
       batch = Enum.map(entries, fn {k, v, exp} -> {k, v, exp} end)
       dedicated_active = find_active(dedicated_path)
-      dedicated_fid = dedicated_active |> Path.basename() |> String.trim_trailing(".log") |> String.to_integer()
+
+      dedicated_fid =
+        dedicated_active |> Path.basename() |> String.trim_trailing(".log") |> String.to_integer()
 
       case NIF.v2_append_batch(dedicated_active, batch) do
         {:ok, locations} ->
@@ -185,16 +190,24 @@ defmodule Ferricstore.Store.Promotion do
           end)
 
         {:error, reason} ->
-          Logger.error("Promotion: v2_append_batch failed for #{inspect(redis_key)}: #{inspect(reason)}")
+          Logger.error(
+            "Promotion: v2_append_batch failed for #{inspect(redis_key)}: #{inspect(reason)}"
+          )
+
+          raise "promotion dedicated write failed: #{inspect(reason)}"
       end
     end
 
     # Step 3: tombstone compound keys in shared log (LAST step)
     Enum.each(entries, fn {key, _value, _exp} ->
       case NIF.v2_append_tombstone(active_path, key) do
-        {:ok, _} -> :ok
+        {:ok, _} ->
+          :ok
+
         {:error, reason} ->
-          Logger.warning("Promotion: tombstone write failed for #{inspect(key)}: #{inspect(reason)}")
+          Logger.warning(
+            "Promotion: tombstone write failed for #{inspect(key)}: #{inspect(reason)}"
+          )
       end
     end)
 
@@ -218,12 +231,11 @@ defmodule Ferricstore.Store.Promotion do
     # After recover_keydir, PM: entries may be cold (value=nil, offset>0).
     match_spec = [
       {{:"$1", :"$2", :_, :_, :"$3", :"$4", :_},
-       [{:andalso,
-         {:is_binary, :"$1"},
-         {:andalso,
-           {:>=, {:byte_size, :"$1"}, pm_len},
-           {:==, {:binary_part, :"$1", 0, pm_len}, pm_prefix}}}],
-       [{{:"$1", :"$2", :"$3", :"$4"}}]}
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, pm_len},
+           {:==, {:binary_part, :"$1", 0, pm_len}, pm_prefix}}}
+       ], [{{:"$1", :"$2", :"$3", :"$4"}}]}
     ]
 
     all_markers =
@@ -236,7 +248,12 @@ defmodule Ferricstore.Store.Promotion do
           if is_binary(value) do
             value
           else
-            file_path = Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+            file_path =
+              Path.join(
+                shard_data_path,
+                "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
+              )
+
             case NIF.v2_pread_at(file_path, offset) do
               {:ok, v} when is_binary(v) -> v
               _ -> nil
@@ -259,11 +276,16 @@ defmodule Ferricstore.Store.Promotion do
         Enum.reduce(log_files, %{}, fn {fid, file_path}, acc ->
           case NIF.v2_scan_file(file_path) do
             {:ok, records} ->
-              Enum.reduce(records, acc, fn {key, offset, value_size, expire_at_ms, is_tombstone}, inner_acc ->
+              Enum.reduce(records, acc, fn {key, offset, value_size, expire_at_ms, is_tombstone},
+                                           inner_acc ->
                 if is_tombstone do
                   Map.put(inner_acc, key, :tombstone)
                 else
-                  Map.put(inner_acc, key, {:live, fid, file_path, offset, value_size, expire_at_ms})
+                  Map.put(
+                    inner_acc,
+                    key,
+                    {:live, fid, file_path, offset, value_size, expire_at_ms}
+                  )
                 end
               end)
 
@@ -371,9 +393,13 @@ defmodule Ferricstore.Store.Promotion do
     active_path = find_active(shard_data_path)
 
     case NIF.v2_append_tombstone(active_path, mk) do
-      {:ok, _} -> :ok
+      {:ok, _} ->
+        :ok
+
       {:error, reason} ->
-        Logger.warning("Promotion cleanup: tombstone write failed for marker #{inspect(mk)}: #{inspect(reason)}")
+        Logger.warning(
+          "Promotion cleanup: tombstone write failed for marker #{inspect(mk)}: #{inspect(reason)}"
+        )
     end
 
     track_binary_delete(keydir, shard_index, mk)
@@ -387,9 +413,7 @@ defmodule Ferricstore.Store.Promotion do
       _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(parent)
     end
 
-    Logger.debug(
-      "Cleaned up promoted #{type_label} #{inspect(redis_key)} (shard #{shard_index})"
-    )
+    Logger.debug("Cleaned up promoted #{type_label} #{inspect(redis_key)} (shard #{shard_index})")
 
     :ok
   end
@@ -488,12 +512,16 @@ defmodule Ferricstore.Store.Promotion do
 
   defp track_binary_insert(keydir, shard_index, key, new_val) do
     ref = keydir_binary_ref()
+
     if ref do
       new_bytes = offheap_size(key) + offheap_size(new_val)
-      old_bytes = case :ets.lookup(keydir, key) do
-        [{^key, old_val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(old_val)
-        _ -> 0
-      end
+
+      old_bytes =
+        case :ets.lookup(keydir, key) do
+          [{^key, old_val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(old_val)
+          _ -> 0
+        end
+
       delta = new_bytes - old_bytes
       if delta != 0, do: :atomics.add(ref, shard_index + 1, delta)
     end
@@ -501,11 +529,14 @@ defmodule Ferricstore.Store.Promotion do
 
   defp track_binary_delete(keydir, shard_index, key) do
     ref = keydir_binary_ref()
+
     if ref do
-      bytes = case :ets.lookup(keydir, key) do
-        [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
-        _ -> 0
-      end
+      bytes =
+        case :ets.lookup(keydir, key) do
+          [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
+          _ -> 0
+        end
+
       if bytes > 0, do: :atomics.sub(ref, shard_index + 1, bytes)
     end
   end

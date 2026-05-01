@@ -60,12 +60,19 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       rescue
         _ -> :ok
       end
+
       File.rm_rf!(tmp)
     end
 
-    %{tmp: tmp, data_dir: data_dir, shard_data_path: shard_data_path,
-      active_path: active_path, keydir: keydir, shard_index: shard_index,
-      cleanup: cleanup}
+    %{
+      tmp: tmp,
+      data_dir: data_dir,
+      shard_data_path: shard_data_path,
+      active_path: active_path,
+      keydir: keydir,
+      shard_index: shard_index,
+      cleanup: cleanup
+    }
   end
 
   defp seed_hash_entries(active_path, keydir) do
@@ -90,6 +97,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
     :ets.delete_all_objects(ctx.keydir)
 
     ShardLifecycle.recover_keydir(ctx.shard_data_path, ctx.keydir, ctx.shard_index)
+
     Promotion.recover_promoted(
       ctx.shard_data_path,
       ctx.keydir,
@@ -107,7 +115,11 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
 
       [{^ckey, nil, _exp, _lfu, fid, off, _vs}] when fid >= 0 ->
         # Cold entry — read from dedicated dir or shared shard dir.
-        for_shared = Path.join(ctx.shard_data_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+        for_shared =
+          Path.join(
+            ctx.shard_data_path,
+            "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
+          )
 
         case NIF.v2_pread_at(for_shared, off) do
           {:ok, v} when is_binary(v) -> {:cold_shared, v}
@@ -134,8 +146,14 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       {redis_key, entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
 
       {:ok, _dedicated_path} =
-        Promotion.promote_collection!(:hash, redis_key, ctx.shard_data_path,
-                                       ctx.keydir, ctx.data_dir, ctx.shard_index)
+        Promotion.promote_collection!(
+          :hash,
+          redis_key,
+          ctx.shard_data_path,
+          ctx.keydir,
+          ctx.data_dir,
+          ctx.shard_index
+        )
 
       # Before restart, keydir already sees dedicated.
       for {ckey, _v} <- entries do
@@ -147,9 +165,42 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
 
       # After restart, keydir must STILL have all compound keys.
       simulate_restart(ctx)
+
       for {ckey, _value} <- entries do
         assert read_ckey(ctx, ckey) != :missing,
                "after restart, compound #{ckey} vanished"
+      end
+    end
+  end
+
+  describe "dedicated batch failure" do
+    test "promotion aborts without tombstoning shared entries when dedicated batch fails", ctx do
+      {redis_key, entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
+
+      dedicated_path = Promotion.dedicated_path(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+      File.mkdir_p!(dedicated_path)
+      File.mkdir!(Path.join(dedicated_path, "00000.log"))
+
+      assert_raise RuntimeError, ~r/promotion dedicated write failed/, fn ->
+        Promotion.promote_collection!(
+          :hash,
+          redis_key,
+          ctx.shard_data_path,
+          ctx.keydir,
+          ctx.data_dir,
+          ctx.shard_index
+        )
+      end
+
+      assert {:ok, records} = NIF.v2_scan_file(ctx.active_path)
+
+      for {ckey, _value} <- entries do
+        matching =
+          Enum.filter(records, fn {key, _off, _size, _exp, _tombstone?} -> key == ckey end)
+
+        assert matching != []
+        refute match?({_key, _off, _size, _exp, true}, List.last(matching))
+        assert read_ckey(ctx, ckey) != :missing
       end
     end
   end
@@ -198,6 +249,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       # Step 2: dedicated batch
       {:ok, dedicated_path} =
         Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+
       dedicated_active = Promotion.find_active(dedicated_path)
       batch = Enum.map(entries, fn {k, v} -> {k, v, 0} end)
       {:ok, _locs} = NIF.v2_append_batch(dedicated_active, batch)
@@ -216,8 +268,15 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       # symmetry with the other crash points.
       {redis_key, entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
 
-      {:ok, _dp} = Promotion.promote_collection!(:hash, redis_key, ctx.shard_data_path,
-                                                  ctx.keydir, ctx.data_dir, ctx.shard_index)
+      {:ok, _dp} =
+        Promotion.promote_collection!(
+          :hash,
+          redis_key,
+          ctx.shard_data_path,
+          ctx.keydir,
+          ctx.data_dir,
+          ctx.shard_index
+        )
 
       simulate_restart(ctx)
 
@@ -243,6 +302,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       # OLD step 1 — dedicated batch
       {:ok, dedicated_path} =
         Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+
       dedicated_active = Promotion.find_active(dedicated_path)
       batch = Enum.map(entries, fn {k, v} -> {k, v, 0} end)
       {:ok, _locs} = NIF.v2_append_batch(dedicated_active, batch)
@@ -266,7 +326,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
 
       assert all_missing,
              "if this assertion starts FAILING, the recovery path has been " <>
-             "extended — update or remove this regression guard."
+               "extended — update or remove this regression guard."
     end
   end
 end
