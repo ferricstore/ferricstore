@@ -333,11 +333,10 @@ defmodule Ferricstore.Commands.Hash do
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
         now = CommandTime.now_ms()
+        {_unique_fields, _compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
 
         Enum.map(fields, fn field ->
-          compound_key = CompoundKey.hash_field(key, field)
-
-          case Ops.compound_get_meta(store, key, compound_key) do
+          case Map.fetch!(metas_by_field, field) do
             nil ->
               -2
 
@@ -782,14 +781,7 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   defp hgetex_fields(fields, key, store, expire_at_ms) do
-    unique_fields = Enum.uniq(fields)
-    compound_keys = Enum.map(unique_fields, &CompoundKey.hash_field(key, &1))
-
-    metas_by_field =
-      store
-      |> Ops.compound_batch_get_meta(key, compound_keys)
-      |> then(&Enum.zip(unique_fields, &1))
-      |> Map.new()
+    {unique_fields, compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
 
     unique_fields
     |> Enum.zip(compound_keys)
@@ -809,6 +801,19 @@ defmodule Ferricstore.Commands.Hash do
         {value, _old_expire} -> value
       end
     end)
+  end
+
+  defp batch_hash_field_metas(fields, key, store) do
+    unique_fields = Enum.uniq(fields)
+    compound_keys = Enum.map(unique_fields, &CompoundKey.hash_field(key, &1))
+
+    metas_by_field =
+      store
+      |> Ops.compound_batch_get_meta(key, compound_keys)
+      |> then(&Enum.zip(unique_fields, &1))
+      |> Map.new()
+
+    {unique_fields, compound_keys, metas_by_field}
   end
 
   # Same as hset_pairs but with per-field TTL.

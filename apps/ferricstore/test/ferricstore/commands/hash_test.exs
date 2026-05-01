@@ -594,6 +594,43 @@ defmodule Ferricstore.Commands.HashTest do
       assert ttl_f2 == -1
     end
 
+    test "HTTL batches field meta reads and preserves duplicate field results" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+
+      field_keys = [
+        CompoundKey.hash_field("hash", "expiring"),
+        CompoundKey.hash_field("hash", "persistent"),
+        CompoundKey.hash_field("hash", "missing")
+      ]
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key ->
+            "hash"
+
+          "hash", compound_key ->
+            flunk("HTTL should only use compound_get for type, got #{inspect(compound_key)}")
+        end,
+        compound_get_meta: fn "hash", compound_key ->
+          flunk("HTTL should use compound_batch_get_meta, got #{inspect(compound_key)}")
+        end,
+        compound_batch_get_meta: fn "hash", ^field_keys ->
+          send(parent, {:compound_batch_get_meta, field_keys})
+          [{"v1", Ferricstore.CommandTime.now_ms() + 60_000}, {"v2", 0}, nil]
+        end
+      }
+
+      [ttl1, ttl2, persistent_ttl, missing_ttl] =
+        Hash.handle("HTTL", ["hash", "FIELDS", "4", "expiring", "expiring", "persistent", "missing"], store)
+
+      assert_received {:compound_batch_get_meta, ^field_keys}
+      assert ttl1 >= 58 and ttl1 <= 60
+      assert ttl2 == ttl1
+      assert persistent_ttl == -1
+      assert missing_ttl == -2
+    end
+
     test "HTTL with wrong number of arguments returns error" do
       store = MockStore.make()
       assert {:error, _} = Hash.handle("HTTL", ["hash"], store)
