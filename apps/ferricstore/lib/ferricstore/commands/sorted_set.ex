@@ -46,23 +46,37 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle("ZADD", [key | rest], store) when rest != [] do
     with {:ok, opts, score_member_pairs} <- parse_zadd_opts(rest),
          :ok <- TypeRegistry.check_or_set(key, :zset, store) do
-      {added, changed} =
-        Enum.reduce(score_member_pairs, {0, 0}, fn {score, member}, {add_acc, ch_acc} ->
-          compound_key = CompoundKey.zset_member(key, member)
-          existing = Ops.compound_get(store, key, compound_key)
+      unique_members =
+        score_member_pairs |> Enum.map(fn {_score, member} -> member end) |> Enum.uniq()
+
+      compound_keys = Enum.map(unique_members, &CompoundKey.zset_member(key, &1))
+
+      current_by_member =
+        store
+        |> Ops.compound_batch_get(key, compound_keys)
+        |> then(&Enum.zip(unique_members, &1))
+        |> Map.new()
+
+      {added, changed, _current_by_member, writes_by_member} =
+        Enum.reduce(score_member_pairs, {0, 0, current_by_member, %{}}, fn {score, member},
+                                                                           {add_acc, ch_acc,
+                                                                            current_acc,
+                                                                            writes_acc} ->
+          existing = Map.get(current_acc, member)
+          score_str = Float.to_string(score)
 
           cond do
             # NX: only add new elements, don't update existing
             opts.nx and existing != nil ->
-              {add_acc, ch_acc}
+              {add_acc, ch_acc, current_acc, writes_acc}
 
             # XX: only update existing elements, don't add new
             opts.xx and existing == nil ->
-              {add_acc, ch_acc}
+              {add_acc, ch_acc, current_acc, writes_acc}
 
             existing == nil ->
-              Ops.compound_put(store, key, compound_key, Float.to_string(score), 0)
-              {add_acc + 1, ch_acc}
+              {add_acc + 1, ch_acc, Map.put(current_acc, member, score_str),
+               Map.put(writes_acc, member, score_str)}
 
             true ->
               existing_score =
@@ -79,13 +93,20 @@ defmodule Ferricstore.Commands.SortedSet do
                 end
 
               if should_update and score != existing_score do
-                Ops.compound_put(store, key, compound_key, Float.to_string(score), 0)
-                {add_acc, ch_acc + 1}
+                {add_acc, ch_acc + 1, Map.put(current_acc, member, score_str),
+                 Map.put(writes_acc, member, score_str)}
               else
-                {add_acc, ch_acc}
+                {add_acc, ch_acc, current_acc, writes_acc}
               end
           end
         end)
+
+      Enum.each(Enum.zip(unique_members, compound_keys), fn {member, compound_key} ->
+        case Map.fetch(writes_by_member, member) do
+          {:ok, score_str} -> Ops.compound_put(store, key, compound_key, score_str, 0)
+          :error -> :ok
+        end
+      end)
 
       if opts.ch, do: added + changed, else: added
     end
@@ -452,7 +473,9 @@ defmodule Ferricstore.Commands.SortedSet do
             pairs
 
           pattern ->
-            Enum.filter(pairs, fn {member, _score} -> Ferricstore.GlobMatcher.match?(member, pattern) end)
+            Enum.filter(pairs, fn {member, _score} ->
+              Ferricstore.GlobMatcher.match?(member, pattern)
+            end)
         end
 
       {next_cursor, batch} = paginate(filtered, cursor, count)
@@ -479,7 +502,9 @@ defmodule Ferricstore.Commands.SortedSet do
       pairs = Ops.compound_scan(store, key, prefix)
 
       case pairs do
-        [] -> nil
+        [] ->
+          nil
+
         _ ->
           {member, _score} = Enum.random(pairs)
           member

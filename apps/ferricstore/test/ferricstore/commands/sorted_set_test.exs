@@ -75,6 +75,55 @@ defmodule Ferricstore.Commands.SortedSetTest do
     test "ZADD with no args returns error" do
       assert {:error, _} = SortedSet.handle("ZADD", [], MockStore.make())
     end
+
+    test "ZADD batches member reads and collapses duplicate final writes" do
+      parent = self()
+      type_key = CompoundKey.type_key("zs")
+
+      member_keys = [
+        CompoundKey.zset_member("zs", "a"),
+        CompoundKey.zset_member("zs", "b"),
+        CompoundKey.zset_member("zs", "c")
+      ]
+
+      store = %{
+        compound_get: fn
+          "zs", ^type_key ->
+            nil
+
+          "zs", compound_key ->
+            flunk(
+              "ZADD should use compound_batch_get, got per-member lookup #{inspect(compound_key)}"
+            )
+        end,
+        compound_batch_get: fn "zs", ^member_keys ->
+          send(parent, {:compound_batch_get, member_keys})
+          ["1.0", nil, nil]
+        end,
+        compound_put: fn
+          "zs", ^type_key, "zset", 0 ->
+            :ok
+
+          "zs", compound_key, score, 0 ->
+            send(parent, {:compound_put, compound_key, score})
+            :ok
+        end
+      }
+
+      assert 2 ==
+               SortedSet.handle(
+                 "ZADD",
+                 ["zs", "2.0", "a", "3.0", "b", "4.0", "b", "5.0", "c"],
+                 store
+               )
+
+      assert_received {:compound_batch_get, ^member_keys}
+      assert_received {:compound_put, a_key, "2.0"}
+      assert_received {:compound_put, b_key, "4.0"}
+      assert_received {:compound_put, c_key, "5.0"}
+      assert Enum.sort([a_key, b_key, c_key]) == Enum.sort(member_keys)
+      refute_received {:compound_put, _, _}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -392,7 +441,11 @@ defmodule Ferricstore.Commands.SortedSetTest do
       store = MockStore.make()
 
       for i <- 1..20 do
-        SortedSet.handle("ZADD", ["zs", "#{i}.0", "member#{String.pad_leading(Integer.to_string(i), 2, "0")}"], store)
+        SortedSet.handle(
+          "ZADD",
+          ["zs", "#{i}.0", "member#{String.pad_leading(Integer.to_string(i), 2, "0")}"],
+          store
+        )
       end
 
       [cursor, elements] = SortedSet.handle("ZSCAN", ["zs", "0", "COUNT", "5"], store)
@@ -403,7 +456,11 @@ defmodule Ferricstore.Commands.SortedSetTest do
 
     test "ZSCAN full iteration collects all members exactly once" do
       store = MockStore.make()
-      expected = for i <- 1..12, into: %{}, do: {"m#{String.pad_leading(Integer.to_string(i), 2, "0")}", "#{i}.0"}
+
+      expected =
+        for i <- 1..12,
+            into: %{},
+            do: {"m#{String.pad_leading(Integer.to_string(i), 2, "0")}", "#{i}.0"}
 
       for {m, s} <- expected do
         SortedSet.handle("ZADD", ["zs", s, m], store)
@@ -589,7 +646,8 @@ defmodule Ferricstore.Commands.SortedSetTest do
         compound_batch_get: fn "zs", ^member_keys -> ["1.0", nil, "3.0"] end
       }
 
-      assert ["1.0", nil, "3.0"] == SortedSet.handle("ZMSCORE", ["zs", "a", "missing", "c"], store)
+      assert ["1.0", nil, "3.0"] ==
+               SortedSet.handle("ZMSCORE", ["zs", "a", "missing", "c"], store)
     end
 
     test "ZMSCORE on nonexistent key returns all nils" do
@@ -752,13 +810,17 @@ defmodule Ferricstore.Commands.SortedSetTest do
     test "ZINCRBY on wrong type returns WRONGTYPE" do
       store = MockStore.make()
       Set.handle("SADD", ["mykey", "member"], store)
-      assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZINCRBY", ["mykey", "1.0", "m"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               SortedSet.handle("ZINCRBY", ["mykey", "1.0", "m"], store)
     end
 
     test "ZCOUNT on wrong type returns WRONGTYPE" do
       store = MockStore.make()
       Hash.handle("HSET", ["mykey", "field", "value"], store)
-      assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZCOUNT", ["mykey", "-inf", "+inf"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               SortedSet.handle("ZCOUNT", ["mykey", "-inf", "+inf"], store)
     end
 
     test "ZPOPMIN on wrong type returns WRONGTYPE" do
@@ -782,7 +844,9 @@ defmodule Ferricstore.Commands.SortedSetTest do
     test "ZREVRANGE on wrong type returns WRONGTYPE" do
       store = MockStore.make()
       Set.handle("SADD", ["mykey", "member"], store)
-      assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZREVRANGE", ["mykey", "0", "-1"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               SortedSet.handle("ZREVRANGE", ["mykey", "0", "-1"], store)
     end
   end
 
@@ -872,7 +936,9 @@ defmodule Ferricstore.Commands.SortedSetTest do
 
     test "ZSCAN with unknown option returns error" do
       store = MockStore.make()
-      assert {:error, "ERR syntax error"} = SortedSet.handle("ZSCAN", ["zs", "0", "BOGUS", "val"], store)
+
+      assert {:error, "ERR syntax error"} =
+               SortedSet.handle("ZSCAN", ["zs", "0", "BOGUS", "val"], store)
     end
   end
 
@@ -920,7 +986,9 @@ defmodule Ferricstore.Commands.SortedSetTest do
     test "ZRANDMEMBER with invalid WITHSCORES arg returns syntax error" do
       store = MockStore.make()
       SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
-      assert {:error, "ERR syntax error"} = SortedSet.handle("ZRANDMEMBER", ["zs", "1", "BOGUS"], store)
+
+      assert {:error, "ERR syntax error"} =
+               SortedSet.handle("ZRANDMEMBER", ["zs", "1", "BOGUS"], store)
     end
 
     test "ZRANDMEMBER with negative count on empty set returns empty list" do
@@ -935,7 +1003,9 @@ defmodule Ferricstore.Commands.SortedSetTest do
   end
 
   defp collect_zscan_members(store, key, cursor, count, acc) do
-    [next_cursor, elements] = SortedSet.handle("ZSCAN", [key, cursor, "COUNT", Integer.to_string(count)], store)
+    [next_cursor, elements] =
+      SortedSet.handle("ZSCAN", [key, cursor, "COUNT", Integer.to_string(count)], store)
+
     pairs = elements |> Enum.chunk_every(2) |> Enum.map(fn [m, s] -> {m, s} end)
     new_acc = acc ++ pairs
 
