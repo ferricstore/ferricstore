@@ -19,6 +19,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.BitcaskWriter
   alias Ferricstore.Store.Router
+  alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
   alias Ferricstore.Test.ShardHelpers
 
   @ns "rdesign_async"
@@ -97,6 +98,51 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
 
       assert {:error, "ERR async replication overloaded"} = Router.put(ctx(), key, "value", 0)
       assert Router.get(ctx(), key) == nil
+    end
+
+    test "large async PUT restores previous value when Batcher is overloaded" do
+      key = "#{@ns}:overloaded_large_put_#{:erlang.unique_integer([:positive])}"
+      idx = Router.shard_for(ctx(), key)
+      large = :binary.copy("x", ctx().hot_cache_max_value_size + 1024)
+
+      :ok = Router.put(ctx(), key, "old", 0)
+      assert Router.get(ctx(), key) == "old"
+
+      on_exit(fn -> Batcher.reset_pending(idx) end)
+
+      for _ <- 1..64 do
+        Batcher.__inject_async_pending__(
+          idx,
+          make_ref(),
+          [{:async, node(), {:put, key, "pending", 0}}],
+          0
+        )
+      end
+
+      assert {:error, "ERR async replication overloaded"} = Router.put(ctx(), key, large, 0)
+      assert Router.get(ctx(), key) == "old"
+      assert recovered_value_from_bitcask(ctx(), key) == "old"
+    end
+
+    test "large async PUT does not recover unaccepted value when Batcher is overloaded" do
+      key = "#{@ns}:overloaded_large_missing_put_#{:erlang.unique_integer([:positive])}"
+      idx = Router.shard_for(ctx(), key)
+      large = :binary.copy("x", ctx().hot_cache_max_value_size + 1024)
+
+      on_exit(fn -> Batcher.reset_pending(idx) end)
+
+      for _ <- 1..64 do
+        Batcher.__inject_async_pending__(
+          idx,
+          make_ref(),
+          [{:async, node(), {:put, key, "pending", 0}}],
+          0
+        )
+      end
+
+      assert {:error, "ERR async replication overloaded"} = Router.put(ctx(), key, large, 0)
+      assert Router.get(ctx(), key) == nil
+      assert recovered_value_from_bitcask(ctx(), key) == nil
     end
 
     test "batch async PUT does not become locally visible when Batcher is overloaded" do
@@ -281,6 +327,33 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
     case :ets.lookup(keydir, key) do
       [entry] -> entry
       [] -> nil
+    end
+  end
+
+  defp recovered_value_from_bitcask(ctx, key) do
+    idx = Router.shard_for(ctx, key)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+    keydir = :ets.new(:async_write_redesign_recovery, [:set, :public])
+
+    try do
+      ShardLifecycle.recover_keydir(shard_path, keydir, idx)
+
+      case :ets.lookup(keydir, key) do
+        [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil ->
+          value
+
+        [{^key, nil, _exp, _lfu, fid, off, _vsize}] when is_integer(fid) ->
+          path =
+            Path.join(shard_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+
+          {:ok, value} = NIF.v2_pread_at(path, off)
+          value
+
+        [] ->
+          nil
+      end
+    after
+      :ets.delete(keydir)
     end
   end
 end

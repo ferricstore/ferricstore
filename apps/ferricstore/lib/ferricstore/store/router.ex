@@ -906,31 +906,30 @@ defmodule Ferricstore.Store.Router do
     disk_value = to_disk_binary(value)
 
     if value_for_ets == nil do
+      previous = snapshot_live_value(ctx, idx, key)
+
       # Large value: sync NIF write to get offset, then ETS with real location.
       # Cannot use async BitcaskWriter because ETS value is nil (too large for
       # hot cache) and readers would see nil until the async write completes.
       case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
         {:ok, file_id, [{offset, _record_size}]} ->
-          clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
-          track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
-
-          :ets.insert(
-            keydir,
-            {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
-          )
-
-          size = :counters.info(ctx.write_version).size
-          if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
-
           case async_submit_to_raft(idx, raft_cmd) do
             :ok ->
+              clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
+              track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
+
+              :ets.insert(
+                keydir,
+                {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
+              )
+
+              size = :counters.info(ctx.write_version).size
+              if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
+
               :ok
 
             {:error, _} = err ->
-              track_keydir_binary_delete(ctx, idx, keydir, key)
-              :ets.delete(keydir, key)
-              {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
-              Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
+              rollback_unaccepted_large_put(ctx, idx, key, previous)
               err
           end
 
@@ -949,6 +948,25 @@ defmodule Ferricstore.Store.Router do
         :ok
       end
     end
+  end
+
+  defp snapshot_live_value(ctx, idx, key) do
+    case read_live(ctx, idx, key) do
+      {:hit, value, expire_at_ms} -> {:value, value, expire_at_ms}
+      :missing -> :missing
+    end
+  end
+
+  defp rollback_unaccepted_large_put(ctx, idx, key, {:value, previous_value, expire_at_ms}) do
+    disk_value = to_disk_binary(previous_value)
+    _ = nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}])
+    :ok
+  end
+
+  defp rollback_unaccepted_large_put(ctx, idx, key, :missing) do
+    {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+    _ = Ferricstore.Bitcask.NIF.v2_append_ops_batch_nosync(file_path, [{:delete, key}])
+    :ok
   end
 
   defp with_async_key_latch(ctx, idx, key, fun) do
