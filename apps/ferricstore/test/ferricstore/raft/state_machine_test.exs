@@ -70,7 +70,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
       store: nil,
       dir: dir,
       active_file_path: active_file_path,
-      shard_index: shard_index
+      shard_index: shard_index,
+      writer_pid: writer_pid
     }
   end
 
@@ -246,6 +247,59 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert [{"stamped_setex", "value", ^expected_expire_at_ms, _, _, _, _}] =
                :ets.lookup(ets, "stamped_setex")
+    end
+
+    test "cross-shard dispatched SET is appended before acknowledgement", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path,
+      shard_index: shard_index,
+      writer_pid: writer_pid
+    } do
+      GenServer.stop(writer_pid, :normal, 5_000)
+
+      {_new_state, %{^shard_index => [:ok]}} =
+        StateMachine.apply(
+          %{system_time: Ferricstore.HLC.now_ms()},
+          {:cross_shard_tx, [{shard_index, [{"SET", ["cross_durable", "durable-value"]}], nil}]},
+          state
+        )
+
+      value_size = byte_size("durable-value")
+
+      assert {:ok, [{"cross_durable", _off, ^value_size, 0, false}]} =
+               NIF.v2_scan_file(active_file_path)
+
+      assert [{"cross_durable", "durable-value", 0, _, 0, _off, ^value_size}] =
+               :ets.lookup(ets, "cross_durable")
+    end
+
+    test "cross-shard dispatched large SET has a cold location before acknowledgement", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path,
+      shard_index: shard_index,
+      writer_pid: writer_pid
+    } do
+      GenServer.stop(writer_pid, :normal, 5_000)
+      large_value = String.duplicate("x", 70_000)
+
+      {_new_state, %{^shard_index => [:ok]}} =
+        StateMachine.apply(
+          %{system_time: Ferricstore.HLC.now_ms()},
+          {:cross_shard_tx, [{shard_index, [{"SET", ["cross_large", large_value]}], nil}]},
+          state
+        )
+
+      value_size = byte_size(large_value)
+
+      assert {:ok, [{"cross_large", offset, ^value_size, 0, false}]} =
+               NIF.v2_scan_file(active_file_path)
+
+      assert [{"cross_large", nil, 0, _, 0, ^offset, ^value_size}] =
+               :ets.lookup(ets, "cross_large")
+
+      assert {:ok, ^large_value} = NIF.v2_pread_at(active_file_path, offset)
     end
 
     test "cross-shard dispatched PEXPIRE uses stamped HLC time for relative expiry", %{

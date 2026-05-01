@@ -333,38 +333,44 @@ defmodule Ferricstore.Raft.StateMachine do
     with_apply_time(meta, fn ->
       old_count = state.applied_count
 
-      shard_results =
-        Enum.reduce(shard_batches, %{}, fn {shard_idx, queue, sandbox_namespace}, acc ->
-          store = build_cross_shard_store(shard_idx, state)
+      write_result =
+        with_cross_shard_pending_writes(state, fn ->
+          Enum.reduce(shard_batches, %{}, fn {shard_idx, queue, sandbox_namespace}, acc ->
+            store = build_cross_shard_store(shard_idx, state)
 
-          Process.put(:tx_deleted_keys, MapSet.new())
-          Process.put(:tx_pending_values, %{})
+            Process.put(:tx_deleted_keys, MapSet.new())
+            Process.put(:tx_pending_values, %{})
 
-          results =
-            try do
-              Enum.map(queue, fn {cmd, args} ->
-                namespaced_args = namespace_args(args, sandbox_namespace)
+            results =
+              try do
+                Enum.map(queue, fn {cmd, args} ->
+                  namespaced_args = namespace_args(args, sandbox_namespace)
 
-                try do
-                  Dispatcher.dispatch(cmd, namespaced_args, store)
-                catch
-                  :exit, {:noproc, _} ->
-                    {:error, "ERR server not ready, shard process unavailable"}
+                  try do
+                    Dispatcher.dispatch(cmd, namespaced_args, store)
+                  catch
+                    :exit, {:noproc, _} ->
+                      {:error, "ERR server not ready, shard process unavailable"}
 
-                  :exit, {reason, _} ->
-                    {:error, "ERR internal error: #{inspect(reason)}"}
-                end
-              end)
-            after
-              Process.delete(:tx_deleted_keys)
-              Process.delete(:tx_pending_values)
-            end
+                    :exit, {reason, _} ->
+                      {:error, "ERR internal error: #{inspect(reason)}"}
+                  end
+                end)
+              after
+                Process.delete(:tx_deleted_keys)
+                Process.delete(:tx_pending_values)
+              end
 
-          Map.put(acc, shard_idx, results)
+            Map.put(acc, shard_idx, results)
+          end)
         end)
 
       new_state = %{state | applied_count: old_count + 1}
-      maybe_release_cursor(meta, old_count, new_state, shard_results)
+
+      case write_result do
+        {:error, _reason} = error -> maybe_release_cursor(meta, old_count, new_state, error)
+        shard_results -> maybe_release_cursor(meta, old_count, new_state, shard_results)
+      end
     end)
   end
 
@@ -1127,6 +1133,8 @@ defmodule Ferricstore.Raft.StateMachine do
       value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
       disk_val = to_disk_binary(value)
 
+      record_cross_shard_pending_original(ctx, key)
+
       if tx_binary_ref do
         new_bytes = binary_byte_size(key) + binary_byte_size(value_for)
 
@@ -1140,7 +1148,11 @@ defmodule Ferricstore.Raft.StateMachine do
         if delta != 0, do: :atomics.add(tx_binary_ref, ctx.index + 1, delta)
       end
 
-      :ets.insert(ctx.keydir, {key, value_for, expire_at_ms, LFU.initial(), 0, 0, 0})
+      :ets.insert(
+        ctx.keydir,
+        {key, value_for, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
+      )
+
       sm_tx_put_pending(key, value, expire_at_ms)
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
@@ -1148,21 +1160,14 @@ defmodule Ferricstore.Raft.StateMachine do
         Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
       end
 
-      BitcaskWriter.write(
-        ctx.instance_ctx,
-        ctx.index,
-        ctx.active_file_path,
-        ctx.active_file_id,
-        ctx.keydir,
-        key,
-        disk_val,
-        expire_at_ms
-      )
+      queue_cross_shard_pending_put(ctx, key, disk_val, expire_at_ms, value_for)
 
       :ok
     end
 
     local_delete = fn key ->
+      record_cross_shard_pending_original(ctx, key)
+
       if tx_binary_ref do
         bytes =
           case :ets.lookup(ctx.keydir, key) do
@@ -1177,8 +1182,7 @@ defmodule Ferricstore.Raft.StateMachine do
       sm_tx_drop_pending(key)
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
       Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
-      # Write tombstone via BitcaskWriter to ensure ordering
-      BitcaskWriter.delete(ctx.instance_ctx, ctx.index, ctx.active_file_path, key)
+      queue_cross_shard_pending_delete(ctx, key)
       :ok
     end
 
@@ -2272,6 +2276,161 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp normalize_stamped_command(command), do: command
+
+  defp with_cross_shard_pending_writes(state, fun) do
+    Process.put(:sm_cross_shard_pending_writes, [])
+    Process.put(:sm_cross_shard_pending_originals, %{})
+
+    try do
+      result = fun.()
+
+      case flush_cross_shard_pending_writes() do
+        :ok ->
+          result
+
+        {:error, _reason} = error ->
+          rollback_cross_shard_pending_writes(state)
+          error
+      end
+    after
+      Process.delete(:sm_cross_shard_pending_writes)
+      Process.delete(:sm_cross_shard_pending_originals)
+    end
+  end
+
+  defp flush_cross_shard_pending_writes do
+    pending =
+      :sm_cross_shard_pending_writes
+      |> Process.put([])
+      |> Enum.reverse()
+
+    pending
+    |> Enum.group_by(&cross_shard_pending_target/1)
+    |> Enum.reduce_while(:ok, fn {{file_path, file_id, keydir}, entries}, :ok ->
+      batch = Enum.map(entries, &cross_shard_pending_to_batch_entry/1)
+      append_result = append_pending_batch(file_path, batch)
+      validated_append_result = validate_append_result(batch, append_result)
+
+      case validated_append_result do
+        {:ok, locations} ->
+          apply_cross_shard_pending_locations(keydir, file_id, entries, locations)
+          {:cont, :ok}
+
+        {:error, reason} ->
+          {:halt, {:error, {:bitcask_append_failed, reason}}}
+      end
+    end)
+  end
+
+  defp cross_shard_pending_target(
+         {:put, _idx, keydir, file_path, file_id, _key, _ets, _disk, _exp}
+       ),
+       do: {file_path, file_id, keydir}
+
+  defp cross_shard_pending_target({:delete, _idx, keydir, file_path, file_id, _key}),
+    do: {file_path, file_id, keydir}
+
+  defp cross_shard_pending_to_batch_entry(
+         {:put, _idx, _keydir, _file_path, _file_id, key, _ets_value, disk_value, expire_at_ms}
+       ),
+       do: {:put, key, disk_value, expire_at_ms}
+
+  defp cross_shard_pending_to_batch_entry({:delete, _idx, _keydir, _file_path, _file_id, key}),
+    do: {:delete, key, nil}
+
+  defp apply_cross_shard_pending_locations(keydir, file_id, entries, locations) do
+    Enum.zip(entries, locations)
+    |> Enum.each(fn
+      {{:put, _idx, ^keydir, _file_path, ^file_id, key, ets_value, _disk_value, exp},
+       {:put, offset, value_size}} ->
+        try do
+          :ets.select_replace(keydir, [
+            {
+              {key, ets_value, exp, :"$1", :pending, :_, :_},
+              [],
+              [{{key, ets_value, exp, :"$1", file_id, offset, value_size}}]
+            }
+          ])
+        rescue
+          ArgumentError -> :ok
+        end
+
+      {{:delete, _idx, ^keydir, _file_path, ^file_id, _key}, {:delete, _offset, _record_size}} ->
+        :ok
+    end)
+  end
+
+  defp record_cross_shard_pending_original(ctx, key) do
+    originals = Process.get(:sm_cross_shard_pending_originals, %{})
+    original_key = {ctx.keydir, key}
+
+    if Map.has_key?(originals, original_key) do
+      :ok
+    else
+      original =
+        case :ets.lookup(ctx.keydir, key) do
+          [entry] -> {:entry, entry}
+          [] -> :missing
+        end
+
+      Process.put(
+        :sm_cross_shard_pending_originals,
+        Map.put(originals, original_key, {ctx.index, original})
+      )
+    end
+  end
+
+  defp queue_cross_shard_pending_put(ctx, key, disk_value, expire_at_ms, ets_value) do
+    pending = Process.get(:sm_cross_shard_pending_writes, [])
+
+    Process.put(:sm_cross_shard_pending_writes, [
+      {:put, ctx.index, ctx.keydir, ctx.active_file_path, ctx.active_file_id, key, ets_value,
+       disk_value, expire_at_ms}
+      | pending
+    ])
+  end
+
+  defp queue_cross_shard_pending_delete(ctx, key) do
+    pending = Process.get(:sm_cross_shard_pending_writes, [])
+
+    Process.put(:sm_cross_shard_pending_writes, [
+      {:delete, ctx.index, ctx.keydir, ctx.active_file_path, ctx.active_file_id, key} | pending
+    ])
+  end
+
+  defp rollback_cross_shard_pending_writes(state) do
+    ref = keydir_binary_ref(state)
+
+    Process.get(:sm_cross_shard_pending_originals, %{})
+    |> Enum.each(fn
+      {{keydir, key}, {shard_index, {:entry, entry}}} ->
+        track_cross_shard_keydir_binary_restore(ref, keydir, shard_index, key, entry)
+        :ets.insert(keydir, entry)
+
+      {{keydir, key}, {shard_index, :missing}} ->
+        track_cross_shard_keydir_binary_restore(ref, keydir, shard_index, key, nil)
+        :ets.delete(keydir, key)
+    end)
+  end
+
+  defp track_cross_shard_keydir_binary_restore(nil, _keydir, _shard_index, _key, _entry), do: :ok
+
+  defp track_cross_shard_keydir_binary_restore(ref, keydir, shard_index, key, original_entry) do
+    current_bytes =
+      case :ets.lookup(keydir, key) do
+        [{^key, value, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(value)
+        _ -> 0
+      end
+
+    original_bytes =
+      case original_entry do
+        {^key, value, _, _, _, _, _} -> binary_byte_size(key) + binary_byte_size(value)
+        _ -> 0
+      end
+
+    delta = original_bytes - current_bytes
+    if delta != 0, do: :atomics.add(ref, shard_index + 1, delta)
+  end
 
   # Wraps a block of state machine operations with batched disk writes.
   # Initializes the pending-writes buffer, runs the block, then flushes
