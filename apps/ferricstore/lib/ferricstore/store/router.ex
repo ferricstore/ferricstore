@@ -21,7 +21,7 @@ defmodule Ferricstore.Store.Router do
   alias Ferricstore.HLC
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Stats
-  alias Ferricstore.Store.LFU
+  alias Ferricstore.Store.{LFU, ListOps, TypeRegistry}
 
   import Bitwise, only: [band: 2]
 
@@ -2352,34 +2352,35 @@ defmodule Ferricstore.Store.Router do
   # -------------------------------------------------------------------
 
   @spec list_op(FerricStore.Instance.t(), binary(), term()) :: term()
-  def list_op(ctx, key, {:lmove, destination, from_dir, to_dir}) do
-    src_idx = shard_for(ctx, key)
-    dst_idx = shard_for(ctx, destination)
-
-    if src_idx == dst_idx do
-      raft_write(ctx, src_idx, key, {:list_op_lmove, key, destination, from_dir, to_dir})
-    else
-      # Cross-shard: pop from source, push to destination
-      case raft_write(ctx, src_idx, key, {:list_op, key, {:pop_for_move, from_dir}}) do
-        nil ->
-          nil
-
-        {:error, _} = err ->
-          err
-
-        element ->
-          push_op = if to_dir == :left, do: {:lpush, [element]}, else: {:rpush, [element]}
-
-          case raft_write(ctx, dst_idx, destination, {:list_op, destination, push_op}) do
-            {:error, _} = err -> err
-            _length -> element
-          end
-      end
-    end
+  def list_op(_ctx, key, {:lmove, destination, from_dir, to_dir}) do
+    Ferricstore.CrossShardOp.execute(
+      [{key, :read_write}, {destination, :write}],
+      fn unified_store ->
+        checked_lmove(key, destination, unified_store, from_dir, to_dir)
+      end,
+      intent: %{command: :lmove, keys: %{source: key, dest: destination}}
+    )
   end
 
   def list_op(ctx, key, operation) do
     idx = shard_for(ctx, key)
     raft_write(ctx, idx, key, {:list_op, key, operation})
+  end
+
+  defp checked_lmove(source, destination, store, from_dir, to_dir) do
+    with :ok <- TypeRegistry.check_type(source, :list, store) do
+      case ListOps.read_meta(source, store) do
+        nil ->
+          nil
+
+        {0, _, _} ->
+          nil
+
+        _meta ->
+          with :ok <- TypeRegistry.check_or_set(destination, :list, store) do
+            ListOps.execute_lmove(source, destination, store, from_dir, to_dir)
+          end
+      end
+    end
   end
 end

@@ -42,6 +42,38 @@ defmodule Ferricstore.Commands.ListCrossShardTest do
       assert {:ok, "not-a-list"} = FerricStore.get(destination)
     end
 
+    test "direct Router.list_op LMOVE wrong-type destination does not pop source" do
+      [source, destination] = ShardHelpers.keys_on_different_shards(2)
+      ctx = FerricStore.Instance.get(:default)
+
+      assert Router.shard_for(ctx, source) != Router.shard_for(ctx, destination)
+
+      assert {:ok, 2} = FerricStore.rpush(source, ["first", "second"])
+      assert :ok = FerricStore.set(destination, "not-a-list")
+
+      assert {:error, message} = Router.list_op(ctx, source, {:lmove, destination, :left, :right})
+      assert message =~ "WRONGTYPE"
+
+      assert {:ok, ["first", "second"]} = FerricStore.lrange(source, 0, -1)
+      assert {:ok, "not-a-list"} = FerricStore.get(destination)
+    end
+
+    test "direct Router.list_op same-shard LMOVE wrong-type destination does not pop source" do
+      {source, destination} = ShardHelpers.keys_on_same_shard()
+      ctx = FerricStore.Instance.get(:default)
+
+      assert Router.shard_for(ctx, source) == Router.shard_for(ctx, destination)
+
+      assert {:ok, 2} = FerricStore.rpush(source, ["first", "second"])
+      assert :ok = FerricStore.set(destination, "not-a-list")
+
+      assert {:error, message} = Router.list_op(ctx, source, {:lmove, destination, :left, :right})
+      assert message =~ "WRONGTYPE"
+
+      assert {:ok, ["first", "second"]} = FerricStore.lrange(source, 0, -1)
+      assert {:ok, "not-a-list"} = FerricStore.get(destination)
+    end
+
     test "missing source returns nil without touching a wrong-type destination" do
       [source, destination] = ShardHelpers.keys_on_different_shards(2)
       ctx = FerricStore.Instance.get(:default)
