@@ -285,6 +285,50 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
              "a known-location cold GET_META must not fsync unrelated dirty Bitcask data"
     end
 
+    test "direct delete_prefix persists tombstones for deleted keys" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
+
+      :ok = GenServer.call(pid, {:put, "plain:one", "1", 0})
+      :ok = GenServer.call(pid, {:put, "plain:two", "2", 0})
+      :ok = GenServer.call(pid, {:put, "other", "3", 0})
+      :ok = GenServer.call(pid, :flush)
+
+      :ok = GenServer.call(pid, {:delete_prefix, "plain:"})
+
+      log_path = Path.join(Ferricstore.DataDir.shard_data_path(dir, 0), "00000.log")
+      assert {:ok, records} = NIF.v2_scan_file(log_path)
+
+      assert Enum.any?(records, &match?({"plain:one", _off, 0, 0, true}, &1))
+      assert Enum.any?(records, &match?({"plain:two", _off, 0, 0, true}, &1))
+      refute Enum.any?(records, &match?({"other", _off, 0, 0, true}, &1))
+    end
+
+    test "direct compound_delete_prefix persists tombstones for deleted fields" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
+
+      redis_key = "hash_prefix_delete"
+      prefix = "H:" <> redis_key <> <<0>>
+      field_one = prefix <> "one"
+      field_two = prefix <> "two"
+      other_field = "H:other_hash" <> <<0>> <> "field"
+
+      :ok = GenServer.call(pid, {:compound_put, redis_key, field_one, "1", 0})
+      :ok = GenServer.call(pid, {:compound_put, redis_key, field_two, "2", 0})
+      :ok = GenServer.call(pid, {:compound_put, "other_hash", other_field, "3", 0})
+      :ok = GenServer.call(pid, :flush)
+
+      :ok = GenServer.call(pid, {:compound_delete_prefix, redis_key, prefix})
+
+      log_path = Path.join(Ferricstore.DataDir.shard_data_path(dir, 0), "00000.log")
+      assert {:ok, records} = NIF.v2_scan_file(log_path)
+
+      assert Enum.any?(records, &match?({^field_one, _off, 0, 0, true}, &1))
+      assert Enum.any?(records, &match?({^field_two, _off, 0, 0, true}, &1))
+      refute Enum.any?(records, &match?({^other_field, _off, 0, 0, true}, &1))
+    end
+
     test "multiple puts before flush are all readable" do
       {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
       on_exit(fn -> cleanup_shard(pid, ctx, dir) end)

@@ -549,14 +549,38 @@ defmodule Ferricstore.Store.Shard.Writes do
       new_version = state.write_version + 1
       {:reply, :ok, %{state | write_version: new_version}}
     else
-      Enum.each(keys_to_delete, fn key -> ShardETS.ets_delete_key(state, key) end)
-      {:reply, :ok, state}
+      state = ShardFlush.await_in_flight(state)
+      state = ShardFlush.flush_pending_sync(state)
+
+      case tombstone_and_delete_keys(state, keys_to_delete) do
+        {:ok, new_state} ->
+          {:reply, :ok, %{new_state | write_version: new_state.write_version + 1}}
+
+        {{:error, reason}, new_state} ->
+          Logger.error("Shard #{state.index}: delete_prefix tombstone failed: #{inspect(reason)}")
+          {:reply, {:error, reason}, new_state}
+      end
     end
   end
 
   # -------------------------------------------------------------------
   # Helpers
   # -------------------------------------------------------------------
+
+  defp tombstone_and_delete_keys(state, keys) do
+    Enum.reduce_while(keys, {:ok, state}, fn key, {:ok, acc_state} ->
+      next_state = ShardFlush.track_delete_dead_bytes(acc_state, key)
+
+      case NIF.v2_append_tombstone(next_state.active_file_path, key) do
+        {:ok, _} ->
+          ShardETS.ets_delete_key(next_state, key)
+          {:cont, {:ok, next_state}}
+
+        {:error, reason} ->
+          {:halt, {{:error, reason}, next_state}}
+      end
+    end)
+  end
 
   @spec apply_setrange(binary(), non_neg_integer(), binary()) :: binary()
   @doc false
