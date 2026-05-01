@@ -804,14 +804,22 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   # Same as hset_pairs but with per-field TTL.
-  defp hset_pairs_with_ttl([], _key, _store, _expire_at_ms, acc), do: acc
+  defp hset_pairs_with_ttl(field_value_pairs, key, store, expire_at_ms, _acc) do
+    {fields, values_by_field} = collapse_field_values(field_value_pairs, [], %{})
+    compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
 
-  defp hset_pairs_with_ttl([field, value | rest], key, store, expire_at_ms, acc) do
-    compound_key = CompoundKey.hash_field(key, field)
-    existing = Ops.compound_get(store, key, compound_key)
-    Ops.compound_put(store, key, compound_key, value, expire_at_ms)
-    new_acc = if existing == nil, do: acc + 1, else: acc
-    hset_pairs_with_ttl(rest, key, store, expire_at_ms, new_acc)
+    added =
+      store
+      |> Ops.compound_batch_get(key, compound_keys)
+      |> Enum.count(&is_nil/1)
+
+    fields
+    |> Enum.zip(compound_keys)
+    |> Enum.each(fn {field, compound_key} ->
+      Ops.compound_put(store, key, compound_key, Map.fetch!(values_by_field, field), expire_at_ms)
+    end)
+
+    added
   end
 
   # O(n/2) parity check without computing full length.
