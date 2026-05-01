@@ -325,17 +325,19 @@ defmodule Ferricstore.Store.Router do
     if under_pressure do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
-      keydir = elem(ctx.keydir_refs, idx)
-      track_keydir_binary_delete(ctx, idx, keydir, key)
-      :ets.delete(keydir, key)
+      with_async_key_latch(ctx, idx, key, fn ->
+        keydir = elem(ctx.keydir_refs, idx)
+        track_keydir_binary_delete(ctx, idx, keydir, key)
+        :ets.delete(keydir, key)
 
-      {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
-      Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
+        {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+        Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
 
-      wv_size = :counters.info(ctx.write_version).size
-      if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
-      async_submit_to_raft(idx, {:delete, key})
-      :ok
+        wv_size = :counters.info(ctx.write_version).size
+        if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+        async_submit_to_raft(idx, {:delete, key})
+        :ok
+      end)
     end
   end
 
@@ -847,6 +849,12 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_write_put(ctx, idx, key, value, expire_at_ms) do
+    with_async_key_latch(ctx, idx, key, fn ->
+      do_async_write_put(ctx, idx, key, value, expire_at_ms)
+    end)
+  end
+
+  defp do_async_write_put(ctx, idx, key, value, expire_at_ms) do
     keydir = elem(ctx.keydir_refs, idx)
 
     value_for_ets =
@@ -895,6 +903,56 @@ defmodule Ferricstore.Store.Router do
       if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
       async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
       :ok
+    end
+  end
+
+  defp with_async_key_latch(ctx, idx, key, fun) do
+    [{latch_tab, ^key}] = acquire_async_key_latches(ctx, [{idx, key}])
+
+    try do
+      fun.()
+    after
+      release_async_key_latches([{latch_tab, key}])
+    end
+  end
+
+  defp acquire_async_key_latches(ctx, locks) do
+    locks
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.map(fn {idx, key} ->
+      latch_tab = elem(ctx.latch_refs, idx)
+      wait_for_async_key_latch(latch_tab, key)
+      {latch_tab, key}
+    end)
+  end
+
+  defp release_async_key_latches(held_latches) do
+    Enum.each(held_latches, fn {latch_tab, key} ->
+      :ets.select_delete(latch_tab, [{{key, self()}, [], [true]}])
+    end)
+  end
+
+  defp wait_for_async_key_latch(latch_tab, key) do
+    case :ets.insert_new(latch_tab, {key, self()}) do
+      true ->
+        :ok
+
+      false ->
+        case :ets.lookup(latch_tab, key) do
+          [{^key, holder}] when is_pid(holder) ->
+            if Process.alive?(holder) do
+              :erlang.yield()
+              wait_for_async_key_latch(latch_tab, key)
+            else
+              :ets.select_delete(latch_tab, [{{key, holder}, [], [true]}])
+              wait_for_async_key_latch(latch_tab, key)
+            end
+
+          _ ->
+            :erlang.yield()
+            wait_for_async_key_latch(latch_tab, key)
+        end
     end
   end
 
@@ -1702,54 +1760,66 @@ defmodule Ferricstore.Store.Router do
         {idx, keydir, shard_kvs, Enum.reverse(entries), Enum.reverse(raft_cmds), large_disk_batch}
       end)
 
-    disk_locations =
-      Enum.reduce(shard_batches, %{}, fn {idx, _keydir, _shard_kvs, _entries, _raft_cmds,
-                                          large_disk_batch},
-                                         acc ->
-        if large_disk_batch == [] do
-          acc
-        else
-          reversed = Enum.reverse(large_disk_batch)
+    locks =
+      for {idx, _keydir, _shard_kvs, entries, _raft_cmds, _large_disk_batch} <- shard_batches,
+          {key, _value, _value_for_ets} <- entries do
+        {idx, key}
+      end
 
-          case nif_append_batch_with_file(ctx, idx, reversed) do
-            {:ok, file_id, locations} ->
-              shard_locations =
-                Enum.zip(reversed, locations)
-                |> Map.new(fn {{key, value, _exp}, {offset, _rec_size}} ->
-                  {key, {file_id, offset, byte_size(value)}}
-                end)
+    held_latches = acquire_async_key_latches(ctx, locks)
 
-              Map.put(acc, idx, shard_locations)
+    try do
+      disk_locations =
+        Enum.reduce(shard_batches, %{}, fn {idx, _keydir, _shard_kvs, _entries, _raft_cmds,
+                                            large_disk_batch},
+                                           acc ->
+          if large_disk_batch == [] do
+            acc
+          else
+            reversed = Enum.reverse(large_disk_batch)
 
-            {:error, reason} ->
-              throw({:disk_error, reason})
-          end
-        end
-      end)
+            case nif_append_batch_with_file(ctx, idx, reversed) do
+              {:ok, file_id, locations} ->
+                shard_locations =
+                  Enum.zip(reversed, locations)
+                  |> Map.new(fn {{key, value, _exp}, {offset, _rec_size}} ->
+                    {key, {file_id, offset, byte_size(value)}}
+                  end)
 
-    Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, raft_cmds, _large_disk_batch} ->
-      shard_locations = Map.get(disk_locations, idx, %{})
+                Map.put(acc, idx, shard_locations)
 
-      ets_tuples =
-        Enum.map(entries, fn {key, value, value_for_ets} ->
-          clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
-          track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
-
-          case Map.get(shard_locations, key) do
-            {file_id, offset, value_size} ->
-              {key, value_for_ets, 0, lfu_val, file_id, offset, value_size}
-
-            nil ->
-              {key, value_for_ets, 0, lfu_val, :pending, 0, byte_size(value)}
+              {:error, reason} ->
+                throw({:disk_error, reason})
+            end
           end
         end)
 
-      :ets.insert(keydir, ets_tuples)
+      Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, raft_cmds, _large_disk_batch} ->
+        shard_locations = Map.get(disk_locations, idx, %{})
 
-      Ferricstore.Raft.Batcher.async_submit_batch(idx, raft_cmds)
+        ets_tuples =
+          Enum.map(entries, fn {key, value, value_for_ets} ->
+            clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
+            track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
 
-      if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, length(shard_kvs))
-    end)
+            case Map.get(shard_locations, key) do
+              {file_id, offset, value_size} ->
+                {key, value_for_ets, 0, lfu_val, file_id, offset, value_size}
+
+              nil ->
+                {key, value_for_ets, 0, lfu_val, :pending, 0, byte_size(value)}
+            end
+          end)
+
+        :ets.insert(keydir, ets_tuples)
+
+        Ferricstore.Raft.Batcher.async_submit_batch(idx, raft_cmds)
+
+        if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, length(shard_kvs))
+      end)
+    after
+      release_async_key_latches(held_latches)
+    end
 
     :ok
   catch

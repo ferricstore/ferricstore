@@ -393,6 +393,67 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   # ---------------------------------------------------------------------------
 
   describe "mixed SET + INCR" do
+    test "async SET waits behind an existing same-key RMW latch" do
+      key = ukey("set_latch")
+      idx = Router.shard_for(ctx(), key)
+      latch_tab = elem(ctx().latch_refs, idx)
+
+      assert :ets.insert_new(latch_tab, {key, self()})
+      task = Task.async(fn -> Router.put(ctx(), key, "1", 0) end)
+
+      try do
+        assert Task.yield(task, 50) == nil
+        assert Router.get(ctx(), key) == nil
+      after
+        :ets.take(latch_tab, key)
+      end
+
+      assert :ok = Task.await(task, 1_000)
+      assert Router.get(ctx(), key) == "1"
+    end
+
+    test "async batch SET waits behind existing same-key RMW latches before publishing" do
+      key = ukey("batch_set_latch")
+      other_key = ukey("batch_set_latch_other")
+      idx = Router.shard_for(ctx(), key)
+      latch_tab = elem(ctx().latch_refs, idx)
+
+      assert :ets.insert_new(latch_tab, {key, self()})
+      task = Task.async(fn -> Router.batch_async_put(ctx(), [{key, "1"}, {other_key, "2"}]) end)
+
+      try do
+        assert Task.yield(task, 50) == nil
+        assert Router.get(ctx(), key) == nil
+        assert Router.get(ctx(), other_key) == nil
+      after
+        :ets.take(latch_tab, key)
+      end
+
+      assert :ok = Task.await(task, 1_000)
+      assert Router.get(ctx(), key) == "1"
+      assert Router.get(ctx(), other_key) == "2"
+    end
+
+    test "async DELETE waits behind an existing same-key RMW latch" do
+      key = ukey("delete_latch")
+      :ok = Router.put(ctx(), key, "1", 0)
+      idx = Router.shard_for(ctx(), key)
+      latch_tab = elem(ctx().latch_refs, idx)
+
+      assert :ets.insert_new(latch_tab, {key, self()})
+      task = Task.async(fn -> Router.delete(ctx(), key) end)
+
+      try do
+        assert Task.yield(task, 50) == nil
+        assert Router.get(ctx(), key) == "1"
+      after
+        :ets.take(latch_tab, key)
+      end
+
+      assert :ok = Task.await(task, 1_000)
+      assert Router.get(ctx(), key) == nil
+    end
+
     test "concurrent SETs and INCRs on same key never crash; final value is valid" do
       key = ukey("mixed")
       :ok = Router.put(ctx(), key, "0", 0)
