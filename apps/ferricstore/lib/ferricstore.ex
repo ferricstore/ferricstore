@@ -2944,7 +2944,7 @@ defmodule FerricStore do
       ["react", "tailwind"]
 
   """
-  @spec sdiff([key()]) :: {:ok, [binary()]}
+  @spec sdiff([key()]) :: {:ok, [binary()]} | {:error, binary()}
   def sdiff([]), do: {:ok, []}
 
   def sdiff(keys) when is_list(keys) do
@@ -2966,7 +2966,7 @@ defmodule FerricStore do
       {:ok, ["elixir"]}
 
   """
-  @spec sinter([key()]) :: {:ok, [binary()]}
+  @spec sinter([key()]) :: {:ok, [binary()]} | {:error, binary()}
   def sinter([]), do: {:ok, []}
 
   def sinter(keys) when is_list(keys) do
@@ -2988,7 +2988,7 @@ defmodule FerricStore do
       ["elixir", "postgres", "react"]
 
   """
-  @spec sunion([key()]) :: {:ok, [binary()]}
+  @spec sunion([key()]) :: {:ok, [binary()]} | {:error, binary()}
   def sunion([]), do: {:ok, []}
 
   def sunion(keys) when is_list(keys) do
