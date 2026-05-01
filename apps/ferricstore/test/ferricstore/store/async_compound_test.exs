@@ -232,6 +232,21 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       assert nil == Router.compound_get(ctx(), key, hash_field(key, "field"))
     end
 
+    test "SET over an existing list clears list metadata and elements via type marker" do
+      key = ukey("set_over_list")
+
+      assert {:ok, 2} = FerricStore.rpush(key, ["one", "two"])
+      assert {:ok, ["one", "two"]} = FerricStore.lrange(key, 0, -1)
+      assert "list" == Router.compound_get(ctx(), key, CompoundKey.type_key(key))
+
+      assert :ok = FerricStore.set(key, "plain_val")
+
+      assert {:ok, "plain_val"} = FerricStore.get(key)
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.lrange(key, 0, -1)
+      assert nil == Router.compound_get(ctx(), key, CompoundKey.type_key(key))
+      assert nil == Router.compound_get(ctx(), key, CompoundKey.list_meta_key(key))
+    end
+
     test "plain SET without compound markers does not fetch active file" do
       key = ukey("plain_no_marker")
       assert Router.durability_for_key_public(ctx(), key) == :async
@@ -243,12 +258,68 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       refute Process.get(cache_key)
       assert Router.get(ctx(), key) == "plain_val"
     end
+
+    test "SET paths do not use list metadata as a fallback type marker" do
+      # Modern list writes always create T:key. LM:key is list payload metadata,
+      # so probing it on every plain SET is wasted hot-path work.
+      forbidden = [
+        :legacy_list,
+        :legacy_list_marker_for_string_put,
+        :clear_legacy_list_metadata,
+        :clear_legacy_list_metadata_for_string_put
+      ]
+
+      findings =
+        [
+          "lib/ferricstore/store/router.ex",
+          "lib/ferricstore/commands/strings.ex",
+          "lib/ferricstore/raft/state_machine.ex"
+        ]
+        |> Enum.flat_map(fn path ->
+          path
+          |> app_path()
+          |> forbidden_identifiers(forbidden)
+          |> Enum.map(fn {identifier, line} -> "#{path}:#{line}: #{identifier}" end)
+        end)
+
+      assert findings == [],
+             "SET paths must rely on T:key only, found legacy LM fallback markers:\n" <>
+               Enum.join(findings, "\n")
+    end
   end
 
   defp active_file_cache_key(ctx, key) do
     idx = Router.shard_for(ctx, key)
     table_key = if ctx.name == :default, do: idx, else: {ctx.name, idx}
     {:active_file_cache, table_key}
+  end
+
+  defp app_path(path), do: Path.expand("../../../#{path}", __DIR__)
+
+  defp forbidden_identifiers(path, forbidden) do
+    {:ok, ast} = path |> File.read!() |> Code.string_to_quoted()
+
+    {_ast, findings} =
+      Macro.prewalk(ast, [], fn
+        {name, meta, _args} = node, acc when is_atom(name) ->
+          if name in forbidden do
+            {node, [{name, meta[:line]} | acc]}
+          else
+            {node, acc}
+          end
+
+        node, acc when is_atom(node) ->
+          if node in forbidden do
+            {node, [{node, :unknown}]}
+          else
+            {node, acc}
+          end
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    Enum.reverse(findings)
   end
 
   # ---------------------------------------------------------------------------

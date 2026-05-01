@@ -370,18 +370,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # replay of entries written before the compound-key migration.
   def apply(meta, {:list_op, key, operation}, state) do
     with_apply_time(meta, fn ->
-      store = build_compound_store(state)
-
-      type_store =
-        Map.put(store, :exists?, fn k ->
-          live_key?(state, k)
-        end)
-
-      result =
-        case Ferricstore.Store.TypeRegistry.check_type(key, :list, type_store) do
-          :ok -> with_pending_writes(state, fn -> do_list_op(state, key, operation) end)
-          {:error, _} = err -> err
-        end
+      result = with_pending_writes(state, fn -> do_checked_list_op(state, key, operation) end)
 
       old_count = state.applied_count
       new_state = %{state | applied_count: old_count + 1}
@@ -1854,15 +1843,14 @@ defmodule Ferricstore.Raft.StateMachine do
     ets_has?(state.ets, key)
   end
 
-  # List ops check the list metadata key (LM:<key>) which is always written
-  # by the origin before it submits the list_op for replication. On replicas
-  # the LM entry hasn't been created yet, so they apply the inner op.
+  # List ops check the canonical type marker written by the origin before
+  # submit. On replicas the marker is absent, so they apply the inner op.
   defp async_key_present?(state, {:list_op, key, _op}) do
-    ets_has?(state.ets, Ferricstore.Store.CompoundKey.list_meta_key(key))
+    ets_has?(state.ets, Ferricstore.Store.CompoundKey.type_key(key))
   end
 
   defp async_key_present?(state, {:list_op_lmove, src_key, _dst, _from, _to}) do
-    ets_has?(state.ets, Ferricstore.Store.CompoundKey.list_meta_key(src_key))
+    ets_has?(state.ets, Ferricstore.Store.CompoundKey.type_key(src_key))
   end
 
   # Unknown inner command shape — conservative fallback: apply it (treat as replica).
@@ -1964,7 +1952,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp apply_single(state, {:list_op, key, operation}) do
-    do_list_op(state, key, operation)
+    do_checked_list_op(state, key, operation)
   end
 
   # When a `:list_op_lmove` arrives on a replica wrapped as `{:async, origin, cmd}`,
@@ -3532,10 +3520,30 @@ defmodule Ferricstore.Raft.StateMachine do
   # Raft apply. The get/put/delete closures operate directly on ETS and Bitcask
   # (the same stores available to the state machine) so the entire operation is
   # atomic from the Raft log's perspective.
-  defp do_list_op(state, key, operation) do
+  defp do_checked_list_op(state, key, operation) do
     store = build_compound_store(state)
-    ListOps.execute(key, store, operation)
+
+    type_store =
+      Map.put(store, :exists?, fn k ->
+        live_key?(state, k)
+      end)
+
+    case ensure_list_type_for_operation(key, operation, type_store) do
+      :ok -> ListOps.execute(key, store, operation)
+      {:error, _} = err -> err
+    end
   end
+
+  defp ensure_list_type_for_operation(key, operation, store)
+
+  defp ensure_list_type_for_operation(key, {:lpush, _elements}, store),
+    do: Ferricstore.Store.TypeRegistry.check_or_set(key, :list, store)
+
+  defp ensure_list_type_for_operation(key, {:rpush, _elements}, store),
+    do: Ferricstore.Store.TypeRegistry.check_or_set(key, :list, store)
+
+  defp ensure_list_type_for_operation(key, _operation, store),
+    do: Ferricstore.Store.TypeRegistry.check_type(key, :list, store)
 
   # Builds a compound store for list/hash/set operations inside the state
   # machine. Uses do_put/do_delete/do_get directly (already inside apply context,
@@ -3614,7 +3622,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
       case do_get(state, type_key) do
         nil ->
-          clear_legacy_list_metadata_for_string_put(state, key)
+          :ok
 
         type ->
           clear_compound_prefix_for_string_put(state, key, type)
@@ -3627,8 +3635,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp compound_data_structure_key?(state, key) do
     not Ferricstore.Store.CompoundKey.internal_key?(key) and
-      (do_get(state, Ferricstore.Store.CompoundKey.type_key(key)) != nil or
-         do_get(state, Ferricstore.Store.CompoundKey.list_meta_key(key)) != nil)
+      do_get(state, Ferricstore.Store.CompoundKey.type_key(key)) != nil
   end
 
   defp ensure_string_key(state, key) do
@@ -3637,20 +3644,13 @@ defmodule Ferricstore.Raft.StateMachine do
       else: :ok
   end
 
-  defp clear_legacy_list_metadata_for_string_put(state, key) do
-    list_meta_key = Ferricstore.Store.CompoundKey.list_meta_key(key)
-
-    if do_get(state, list_meta_key) != nil do
-      clear_compound_prefix_for_string_put(state, key, "list")
-      do_delete(state, list_meta_key)
-    end
-  end
-
   defp clear_compound_prefix_for_string_put(state, key, "hash"),
     do: do_delete_prefix(state, Ferricstore.Store.CompoundKey.hash_prefix(key))
 
-  defp clear_compound_prefix_for_string_put(state, key, "list"),
-    do: do_delete_prefix(state, Ferricstore.Store.CompoundKey.list_prefix(key))
+  defp clear_compound_prefix_for_string_put(state, key, "list") do
+    do_delete_prefix(state, Ferricstore.Store.CompoundKey.list_prefix(key))
+    do_delete(state, Ferricstore.Store.CompoundKey.list_meta_key(key))
+  end
 
   defp clear_compound_prefix_for_string_put(state, key, "set"),
     do: do_delete_prefix(state, Ferricstore.Store.CompoundKey.set_prefix(key))

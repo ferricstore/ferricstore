@@ -509,8 +509,7 @@ defmodule Ferricstore.Store.Router do
   defp compound_marker_present?(ctx, idx, key) do
     keydir = elem(ctx.keydir_refs, idx)
 
-    :ets.lookup(keydir, CompoundKey.type_key(key)) != [] or
-      :ets.lookup(keydir, CompoundKey.list_meta_key(key)) != []
+    :ets.lookup(keydir, CompoundKey.type_key(key)) != []
   end
 
   # Per-command RMW implementations. Mirror state_machine.ex do_incr et al.,
@@ -908,11 +907,6 @@ defmodule Ferricstore.Store.Router do
           {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
           clear_compound_prefix_for_string_put(ctx, idx, keydir, file_path, key, type)
           delete_local_key(ctx, idx, keydir, file_path, type_key)
-
-        {:legacy_list, list_meta_key} ->
-          {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
-          clear_compound_prefix_for_string_put(ctx, idx, keydir, file_path, key, "list")
-          delete_local_key(ctx, idx, keydir, file_path, list_meta_key)
       end
     end
   end
@@ -925,16 +919,7 @@ defmodule Ferricstore.Store.Router do
         {:type, type_key, type}
 
       :none ->
-        legacy_list_marker_for_string_put(ctx, idx, keydir, key)
-    end
-  end
-
-  defp legacy_list_marker_for_string_put(ctx, idx, keydir, key) do
-    list_meta_key = CompoundKey.list_meta_key(key)
-
-    case live_compound_marker(ctx, idx, keydir, list_meta_key) do
-      {:ok, _meta} -> {:legacy_list, list_meta_key}
-      :none -> :none
+        :none
     end
   end
 
@@ -2495,7 +2480,7 @@ defmodule Ferricstore.Store.Router do
     :telemetry.execute([:ferricstore, :rmw, :worker_list_op], %{}, %{shard_index: idx})
     store = build_origin_compound_store(ctx, idx)
 
-    case TypeRegistry.check_type(key, :list, store) do
+    case ensure_list_type_for_operation(key, operation, store) do
       :ok ->
         # Resolve the module at runtime to avoid the compile-time cycle
         # ListOps → Ops → Router → ListOps. `list_ops_mod/0` returns an atom
@@ -2525,6 +2510,17 @@ defmodule Ferricstore.Store.Router do
     async_submit_to_raft(idx, cmd)
     result
   end
+
+  defp ensure_list_type_for_operation(key, operation, store)
+
+  defp ensure_list_type_for_operation(key, {:lpush, _elements}, store),
+    do: TypeRegistry.check_or_set(key, :list, store)
+
+  defp ensure_list_type_for_operation(key, {:rpush, _elements}, store),
+    do: TypeRegistry.check_or_set(key, :list, store)
+
+  defp ensure_list_type_for_operation(key, _operation, store),
+    do: TypeRegistry.check_type(key, :list, store)
 
   # The module atom is constructed at runtime from a string so it doesn't
   # appear as a BEAM atom-literal reference to the target module. This

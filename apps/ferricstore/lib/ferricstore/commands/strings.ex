@@ -822,8 +822,7 @@ defmodule Ferricstore.Commands.Strings do
   defp compound_type_marker?(key, store) do
     # Raw type markers can outlive all fields when the last field expires.
     # Keep the cheap no-marker fast path, then let TypeRegistry clean stale markers.
-    Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
-      Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil
+    Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil
   end
 
   defp clear_compound_data_structure(key, store) do
@@ -832,7 +831,7 @@ defmodule Ferricstore.Commands.Strings do
 
       case Ops.compound_get(store, key, type_key) do
         nil ->
-          clear_legacy_list_metadata(key, store)
+          :ok
 
         type ->
           clear_compound_prefix(key, type, store)
@@ -841,15 +840,6 @@ defmodule Ferricstore.Commands.Strings do
     end
 
     :ok
-  end
-
-  defp clear_legacy_list_metadata(key, store) do
-    list_meta_key = CompoundKey.list_meta_key(key)
-
-    if Ops.compound_get(store, key, list_meta_key) != nil do
-      clear_compound_prefix(key, "list", store)
-      Ops.compound_delete(store, key, list_meta_key)
-    end
   end
 
   defp clear_compound_prefix(key, "hash", store),
