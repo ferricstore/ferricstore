@@ -312,7 +312,21 @@ defmodule FerricStore do
 
   """
   @spec get(key(), get_opts()) :: {:ok, value() | nil}
-  def get(key, _opts \\ []) do
+  def get(key, opts \\ [])
+
+  def get("", _opts) do
+    store = build_string_store("")
+
+    case Ferricstore.Store.TypeRegistry.get_type("", store) do
+      type when type in ["list", "hash", "set", "zset"] ->
+        {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+
+      _ ->
+        {:ok, Router.get(default_ctx(), "")}
+    end
+  end
+
+  def get(key, _opts) do
     case Ferricstore.Commands.Strings.handle("GET", [key], build_string_store(key)) do
       {:error, _} = err -> err
       value -> {:ok, value}
