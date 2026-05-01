@@ -8,6 +8,8 @@ defmodule Ferricstore.Commands.BitmapTest do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
+  defp app_path(path), do: Path.expand("../../../#{path}", __DIR__)
+
   # ---------------------------------------------------------------------------
   # SETBIT
   # ---------------------------------------------------------------------------
@@ -576,11 +578,11 @@ defmodule Ferricstore.Commands.BitmapTest do
   end
 
   describe "GETBIT edge cases" do
-    test "GETBIT returns WRONGTYPE for legacy encoded non-string values" do
+    test "GETBIT treats ETF-looking plain binaries as strings without type marker" do
       encoded = :erlang.term_to_binary({:list, ["a", "b"]})
-      store = MockStore.make(%{"legacy" => {encoded, 0}})
+      store = MockStore.make(%{"plain" => {encoded, 0}})
 
-      assert {:error, "WRONGTYPE" <> _} = Bitmap.handle("GETBIT", ["legacy", "0"], store)
+      assert 1 == Bitmap.handle("GETBIT", ["plain", "0"], store)
     end
 
     test "GETBIT with non-integer offset returns error" do
@@ -635,11 +637,11 @@ defmodule Ferricstore.Commands.BitmapTest do
   end
 
   describe "BITCOUNT edge cases" do
-    test "BITCOUNT returns WRONGTYPE for legacy encoded non-string values" do
+    test "BITCOUNT treats ETF-looking plain binaries as strings without type marker" do
       encoded = :erlang.term_to_binary({:hash, %{"f" => "v"}})
-      store = MockStore.make(%{"legacy" => {encoded, 0}})
+      store = MockStore.make(%{"plain" => {encoded, 0}})
 
-      assert {:error, "WRONGTYPE" <> _} = Bitmap.handle("BITCOUNT", ["legacy"], store)
+      assert is_integer(Bitmap.handle("BITCOUNT", ["plain"], store))
     end
 
     test "BITCOUNT with invalid mode returns error" do
@@ -662,12 +664,19 @@ defmodule Ferricstore.Commands.BitmapTest do
   end
 
   describe "BITOP error message edge cases" do
-    test "BITOP source returns WRONGTYPE for legacy encoded non-string values" do
+    test "BITOP source treats ETF-looking plain binaries as strings without type marker" do
       encoded = :erlang.term_to_binary({:set, MapSet.new(["a"])})
-      store = MockStore.make(%{"legacy" => {encoded, 0}})
+      store = MockStore.make(%{"plain" => {encoded, 0}})
 
-      assert {:error, "WRONGTYPE" <> _} = Bitmap.handle("BITOP", ["NOT", "dest", "legacy"], store)
-      assert store.get.("dest") == nil
+      assert byte_size(encoded) == Bitmap.handle("BITOP", ["NOT", "dest", "plain"], store)
+      assert byte_size(store.get.("dest")) == byte_size(encoded)
+    end
+
+    test "bitmap read path does not infer type from ETF-looking string payloads" do
+      source = File.read!(app_path("lib/ferricstore/commands/bitmap.ex"))
+
+      refute source =~ "encoded_non_string_type?"
+      refute source =~ "extract_etf_atom_name"
     end
 
     test "BITOP NOT with no source key returns error" do

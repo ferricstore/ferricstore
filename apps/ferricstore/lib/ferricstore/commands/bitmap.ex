@@ -282,33 +282,12 @@ defmodule Ferricstore.Commands.Bitmap do
   # --- Type guards ----------------------------------------------------------
 
   defp ensure_string_key(key, store) do
-    cond do
-      compound_data_structure_key?(key, store) ->
-        @wrongtype_error
-
-      encoded_non_string_type?(Ops.get(store, key)) ->
-        @wrongtype_error
-
-      true ->
-        :ok
+    if compound_data_structure_key?(key, store) do
+      @wrongtype_error
+    else
+      :ok
     end
   end
-
-  defp encoded_non_string_type?(<<131, 104, 2, rest::binary>>) do
-    extract_etf_atom_name(rest) in ["list", "hash", "set", "zset"]
-  end
-
-  defp encoded_non_string_type?(<<131, 105, 0, 0, 0, 2, rest::binary>>) do
-    extract_etf_atom_name(rest) in ["list", "hash", "set", "zset"]
-  end
-
-  defp encoded_non_string_type?(_value), do: false
-
-  defp extract_etf_atom_name(<<100, len::16, name::binary-size(len), _::binary>>), do: name
-  defp extract_etf_atom_name(<<119, len::8, name::binary-size(len), _::binary>>), do: name
-  defp extract_etf_atom_name(<<118, len::16, name::binary-size(len), _::binary>>), do: name
-  defp extract_etf_atom_name(<<115, len::8, name::binary-size(len), _::binary>>), do: name
-  defp extract_etf_atom_name(_), do: nil
 
   defp compound_data_structure_key?(key, store) do
     Ops.has_compound?(store) and
