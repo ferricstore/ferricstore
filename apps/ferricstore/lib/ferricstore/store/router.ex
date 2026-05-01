@@ -1953,7 +1953,29 @@ defmodule Ferricstore.Store.Router do
   """
   @spec exists?(FerricStore.Instance.t(), binary()) :: boolean()
   def exists?(ctx, key) do
-    exists_fast?(ctx, key)
+    idx = shard_for(ctx, key)
+    keydir = resolve_keydir(ctx, idx)
+    now = HLC.now_ms()
+
+    try do
+      case :ets.lookup(keydir, key) do
+        [{^key, _val, 0, _lfu, _fid, _off, _vsize}] ->
+          true
+
+        [{^key, _val, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
+          true
+
+        [{^key, _val, _exp, _lfu, _fid, _off, _vsize}] ->
+          track_keydir_binary_delete(ctx, idx, keydir, key)
+          :ets.delete(keydir, key)
+          false
+
+        [] ->
+          false
+      end
+    rescue
+      ArgumentError -> false
+    end
   end
 
   @doc """
