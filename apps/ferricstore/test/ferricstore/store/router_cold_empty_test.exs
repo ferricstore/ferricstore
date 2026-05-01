@@ -78,4 +78,12 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
 
     assert :miss == Router.get_keydir_file_ref(ctx, key)
   end
+
+  test "value_size rejects cold rows with invalid offsets", %{ctx: ctx, keydir: keydir} do
+    key = "cold_invalid_value_size:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
+
+    assert nil == Router.value_size(ctx, key)
+    assert [] == :ets.lookup(keydir, key)
+  end
 end

@@ -1571,14 +1571,14 @@ defmodule Ferricstore.Store.Router do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
           stored_value_size(value)
 
-        [{^key, nil, 0, _lfu, fid, _off, vsize}] when is_integer(fid) and fid >= 0 ->
+        [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           vsize
 
         [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
           stored_value_size(value)
 
-        [{^key, nil, exp, _lfu, fid, _off, vsize}]
-        when exp > now and is_integer(fid) and fid >= 0 ->
+        [{^key, nil, exp, _lfu, fid, off, vsize}]
+        when exp > now and valid_cold_location(fid, off, vsize) ->
           vsize
 
         [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
