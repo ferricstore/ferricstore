@@ -73,12 +73,44 @@ defmodule Ferricstore.Store.BitcaskWriter do
     - `value` -- the value to persist (always a binary, always < 64KB)
     - `expire_at_ms` -- expiry timestamp in milliseconds (0 = no expiry)
   """
-  @spec write(non_neg_integer(), binary(), non_neg_integer(), atom(), binary(), binary(), non_neg_integer()) :: :ok
-  def write(shard_index, active_file_path, active_file_id, ets_table, key, value, expire_at_ms) do
+  @spec write(
+          FerricStore.Instance.t() | nil,
+          non_neg_integer(),
+          binary(),
+          non_neg_integer(),
+          atom(),
+          binary(),
+          binary(),
+          non_neg_integer()
+        ) :: :ok
+  def write(
+        instance_ctx,
+        shard_index,
+        active_file_path,
+        active_file_id,
+        ets_table,
+        key,
+        value,
+        expire_at_ms
+      ) do
     GenServer.cast(
       writer_name(shard_index),
-      {:write, active_file_path, active_file_id, ets_table, key, value, expire_at_ms}
+      {:write, instance_ctx, active_file_path, active_file_id, ets_table, key, value,
+       expire_at_ms}
     )
+  end
+
+  @spec write(
+          non_neg_integer(),
+          binary(),
+          non_neg_integer(),
+          atom(),
+          binary(),
+          binary(),
+          non_neg_integer()
+        ) :: :ok
+  def write(shard_index, active_file_path, active_file_id, ets_table, key, value, expire_at_ms) do
+    write(nil, shard_index, active_file_path, active_file_id, ets_table, key, value, expire_at_ms)
   end
 
   @doc """
@@ -88,7 +120,9 @@ defmodule Ferricstore.Store.BitcaskWriter do
   GenServer cast instead of N. Each entry is a tuple:
   `{active_file_path, active_file_id, ets_table, key, value, expire_at_ms}`.
   """
-  @spec write_batch(non_neg_integer(), [{binary(), non_neg_integer(), atom(), binary(), binary(), non_neg_integer()}]) :: :ok
+  @spec write_batch(non_neg_integer(), [
+          {binary(), non_neg_integer(), atom(), binary(), binary(), non_neg_integer()}
+        ]) :: :ok
   def write_batch(shard_index, entries) do
     GenServer.cast(
       writer_name(shard_index),
@@ -106,9 +140,14 @@ defmodule Ferricstore.Store.BitcaskWriter do
   """
   @spec delete(non_neg_integer(), binary(), binary()) :: :ok
   def delete(shard_index, active_file_path, key) do
+    delete(nil, shard_index, active_file_path, key)
+  end
+
+  @spec delete(FerricStore.Instance.t() | nil, non_neg_integer(), binary(), binary()) :: :ok
+  def delete(instance_ctx, shard_index, active_file_path, key) do
     GenServer.cast(
       writer_name(shard_index),
-      {:tombstone, active_file_path, key}
+      {:tombstone, instance_ctx, active_file_path, key}
     )
   end
 
@@ -166,20 +205,32 @@ defmodule Ferricstore.Store.BitcaskWriter do
   end
 
   @impl true
+  def handle_cast({:write, instance_ctx, path, file_id, ets, key, value, expire_at_ms}, state) do
+    entry = {:write, instance_ctx, path, file_id, ets, key, value, expire_at_ms}
+    handle_entry(entry, state)
+  end
+
   def handle_cast({:write, path, file_id, ets, key, value, expire_at_ms}, state) do
-    entry = {:write, path, file_id, ets, key, value, expire_at_ms}
+    entry = {:write, nil, path, file_id, ets, key, value, expire_at_ms}
+    handle_entry(entry, state)
+  end
+
+  def handle_cast({:tombstone, instance_ctx, path, key}, state) do
+    entry = {:tombstone, instance_ctx, path, key}
     handle_entry(entry, state)
   end
 
   def handle_cast({:tombstone, path, key}, state) do
-    entry = {:tombstone, path, key}
+    entry = {:tombstone, nil, path, key}
     handle_entry(entry, state)
   end
 
   def handle_cast({:write_batch, entries}, state) do
-    new_pending = Enum.reduce(entries, state.pending, fn {path, fid, ets, key, value, exp}, acc ->
-      [{:write, path, fid, ets, key, value, exp} | acc]
-    end)
+    new_pending =
+      Enum.reduce(entries, state.pending, fn {path, fid, ets, key, value, exp}, acc ->
+        [{:write, path, fid, ets, key, value, exp} | acc]
+      end)
+
     new_count = state.pending_count + length(entries)
 
     if new_count >= @batch_size_threshold do
@@ -221,7 +272,8 @@ defmodule Ferricstore.Store.BitcaskWriter do
           state.flush_timer
         end
 
-      {:noreply, %{state | pending: drained_pending, pending_count: drained_count, flush_timer: timer}}
+      {:noreply,
+       %{state | pending: drained_pending, pending_count: drained_count, flush_timer: timer}}
     end
   end
 
@@ -231,13 +283,19 @@ defmodule Ferricstore.Store.BitcaskWriter do
   # dispatch).
   defp drain_mailbox(pending, count) do
     receive do
-      {:"$gen_cast", {:write, _, _, _, _, _, _} = tag} ->
-        {_, path, fid, ets, key, value, exp} = tag
-        entry = {:write, path, fid, ets, key, value, exp}
+      {:"$gen_cast", {:write, instance_ctx, path, fid, ets, key, value, exp}} ->
+        entry = {:write, instance_ctx, path, fid, ets, key, value, exp}
         drain_mailbox([entry | pending], count + 1)
 
+      {:"$gen_cast", {:write, path, fid, ets, key, value, exp}} ->
+        entry = {:write, nil, path, fid, ets, key, value, exp}
+        drain_mailbox([entry | pending], count + 1)
+
+      {:"$gen_cast", {:tombstone, instance_ctx, path, key}} ->
+        drain_mailbox([{:tombstone, instance_ctx, path, key} | pending], count + 1)
+
       {:"$gen_cast", {:tombstone, path, key}} ->
-        drain_mailbox([{:tombstone, path, key} | pending], count + 1)
+        drain_mailbox([{:tombstone, nil, path, key} | pending], count + 1)
     after
       0 -> {pending, count}
     end
@@ -284,10 +342,12 @@ defmodule Ferricstore.Store.BitcaskWriter do
     end)
   end
 
-  defp entry_path({:write, path, _fid, _ets, _key, _value, _exp}), do: path
-  defp entry_path({:tombstone, path, _key}), do: path
+  defp entry_path({:write, _ctx, path, _fid, _ets, _key, _value, _exp}), do: path
+  defp entry_path({:tombstone, _ctx, path, _key}), do: path
   # Legacy format (6-tuple without tag) for backward compatibility with
   # any in-flight casts that used the old format.
+  defp entry_path({:write, path, _fid, _ets, _key, _value, _exp}), do: path
+  defp entry_path({:tombstone, path, _key}), do: path
   defp entry_path({path, _fid, _ets, _key, _value, _exp}), do: path
 
   # Processes a group of entries for a single file path. Consecutive writes
@@ -313,6 +373,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
       nil,
       fn entry, acc ->
         type = entry_type(entry)
+
         case acc do
           nil -> {:cont, {type, [entry]}}
           {^type, items} -> {:cont, {type, [entry | items]}}
@@ -332,22 +393,26 @@ defmodule Ferricstore.Store.BitcaskWriter do
     end)
   end
 
+  defp entry_type({:write, _, _, _, _, _, _, _}), do: :write
   defp entry_type({:write, _, _, _, _, _, _}), do: :write
+  defp entry_type({:tombstone, _, _, _}), do: :tombstone
   defp entry_type({:tombstone, _, _}), do: :tombstone
   defp entry_type({_, _, _, _, _, _}), do: :write
 
   defp flush_write_batch(path, write_entries, shard_index) do
-    batch = Enum.map(write_entries, fn
-      {:write, _path, _fid, _ets, key, value, exp} -> {key, to_binary(value), exp}
-      {_path, _fid, _ets, key, value, exp} -> {key, to_binary(value), exp}
-    end)
+    batch =
+      Enum.map(write_entries, fn
+        {:write, _ctx, _path, _fid, _ets, key, value, exp} -> {key, to_binary(value), exp}
+        {:write, _path, _fid, _ets, key, value, exp} -> {key, to_binary(value), exp}
+        {_path, _fid, _ets, key, value, exp} -> {key, to_binary(value), exp}
+      end)
 
     case NIF.v2_append_batch_nosync(path, batch) do
       {:ok, locations} ->
         # Update ETS entries with real file_id and offset.
         Enum.zip(write_entries, locations)
         |> Enum.each(fn {entry, {offset, _record_size}} ->
-          {_tag, _path, file_id, ets, key, value, _exp} = normalize_write_entry(entry)
+          {_tag, _ctx, _path, file_id, ets, key, value, _exp} = normalize_write_entry(entry)
           bin_value = to_binary(value)
           vsize = byte_size(bin_value)
 
@@ -369,7 +434,8 @@ defmodule Ferricstore.Store.BitcaskWriter do
         end)
 
       {:error, reason} ->
-        Ferricstore.Store.DiskPressure.set(shard_index)
+        mark_disk_pressure(write_entries, shard_index)
+
         Logger.error(
           "BitcaskWriter shard_#{shard_index}: flush failed for #{path}: #{inspect(reason)} — #{length(batch)} entries lost"
         )
@@ -377,11 +443,16 @@ defmodule Ferricstore.Store.BitcaskWriter do
   end
 
   defp flush_tombstone_batch(path, tombstone_entries, shard_index) do
-    Enum.each(tombstone_entries, fn {:tombstone, _path, key} ->
+    Enum.each(tombstone_entries, fn entry ->
+      {instance_ctx, key} = normalize_tombstone_entry(entry)
+
       case NIF.v2_append_tombstone(path, key) do
-        {:ok, _} -> :ok
+        {:ok, _} ->
+          :ok
+
         {:error, reason} ->
-          Ferricstore.Store.DiskPressure.set(shard_index)
+          set_disk_pressure(instance_ctx, shard_index)
+
           Logger.error(
             "BitcaskWriter shard_#{shard_index}: tombstone failed for #{path} key=#{inspect(key)}: #{inspect(reason)}"
           )
@@ -389,10 +460,32 @@ defmodule Ferricstore.Store.BitcaskWriter do
     end)
   end
 
+  defp normalize_write_entry({:write, ctx, path, fid, ets, key, value, exp}),
+    do: {:write, ctx, path, fid, ets, key, value, exp}
+
   defp normalize_write_entry({:write, path, fid, ets, key, value, exp}),
-    do: {:write, path, fid, ets, key, value, exp}
+    do: {:write, nil, path, fid, ets, key, value, exp}
+
   defp normalize_write_entry({path, fid, ets, key, value, exp}),
-    do: {:write, path, fid, ets, key, value, exp}
+    do: {:write, nil, path, fid, ets, key, value, exp}
+
+  defp normalize_tombstone_entry({:tombstone, ctx, _path, key}), do: {ctx, key}
+  defp normalize_tombstone_entry({:tombstone, _path, key}), do: {nil, key}
+
+  defp mark_disk_pressure(entries, shard_index) do
+    entries
+    |> Enum.map(fn entry ->
+      {_tag, ctx, _path, _fid, _ets, _key, _value, _exp} = normalize_write_entry(entry)
+      ctx
+    end)
+    |> Enum.uniq()
+    |> Enum.each(&set_disk_pressure(&1, shard_index))
+  end
+
+  defp set_disk_pressure(nil, shard_index), do: Ferricstore.Store.DiskPressure.set(shard_index)
+
+  defp set_disk_pressure(ctx, shard_index),
+    do: Ferricstore.Store.DiskPressure.set(ctx, shard_index)
 
   defp to_binary(v) when is_binary(v), do: v
   defp to_binary(v) when is_integer(v), do: Integer.to_string(v)

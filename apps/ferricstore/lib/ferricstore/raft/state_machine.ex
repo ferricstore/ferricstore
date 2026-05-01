@@ -1087,6 +1087,7 @@ defmodule Ferricstore.Raft.StateMachine do
     ctx =
       if shard_idx == anchor_state.shard_index do
         %{
+          instance_ctx: instance_ctx,
           keydir: anchor_state.ets,
           index: shard_idx,
           shard_data_path: anchor_state.shard_data_path,
@@ -1105,6 +1106,7 @@ defmodule Ferricstore.Raft.StateMachine do
           end
 
         %{
+          instance_ctx: instance_ctx,
           keydir: keydir,
           index: shard_idx,
           shard_data_path: shard_data_path,
@@ -1140,6 +1142,7 @@ defmodule Ferricstore.Raft.StateMachine do
       end
 
       BitcaskWriter.write(
+        ctx.instance_ctx,
         ctx.index,
         ctx.active_file_path,
         ctx.active_file_id,
@@ -1167,7 +1170,7 @@ defmodule Ferricstore.Raft.StateMachine do
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
       Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
       # Write tombstone via BitcaskWriter to ensure ordering
-      BitcaskWriter.delete(ctx.index, ctx.active_file_path, key)
+      BitcaskWriter.delete(ctx.instance_ctx, ctx.index, ctx.active_file_path, key)
       :ok
     end
 

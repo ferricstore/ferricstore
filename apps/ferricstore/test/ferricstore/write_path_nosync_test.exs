@@ -244,6 +244,53 @@ defmodule Ferricstore.WritePathNosyncTest do
       end
     end
 
+    test "flush updates small-value keydir entries with usable disk locations" do
+      ctx = FerricStore.Instance.get(:default)
+      key = ukey("writer_location")
+      value = "disk-loc"
+
+      assert :ok = Router.put(ctx, key, value, 0)
+      BitcaskWriter.flush_all()
+
+      idx = Router.shard_for(ctx, key)
+      keydir = :"keydir_#{idx}"
+      [{^key, ^value, 0, _lfu, fid, off, vsize}] = :ets.lookup(keydir, key)
+
+      assert is_integer(fid)
+      assert vsize == byte_size(value)
+
+      shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+      path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+
+      assert {:ok, ^value} = Ferricstore.Bitcask.NIF.v2_pread_at(path, off)
+    end
+
+    test "failed flush marks the supplied instance under disk pressure" do
+      ctx = Ferricstore.Test.IsolatedInstance.checkout()
+
+      on_exit(fn ->
+        Ferricstore.Store.DiskPressure.clear(ctx, 0)
+        Ferricstore.Store.DiskPressure.clear(0)
+        Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      end)
+
+      keydir = elem(ctx.keydir_refs, 0)
+      key = "writer_pressure:#{System.unique_integer([:positive])}"
+
+      missing_dir =
+        Path.join(System.tmp_dir!(), "missing_writer_dir_#{System.unique_integer([:positive])}")
+
+      missing_path = Path.join(missing_dir, "00000.log")
+
+      Ferricstore.Store.DiskPressure.clear(ctx, 0)
+      Ferricstore.Store.DiskPressure.clear(0)
+
+      BitcaskWriter.write(ctx, 0, missing_path, 0, keydir, key, "value", 0)
+      BitcaskWriter.flush(0)
+
+      assert Ferricstore.Store.DiskPressure.under_pressure?(ctx, 0)
+    end
+
     test "BitcaskWriter writer_name returns correct atom" do
       assert BitcaskWriter.writer_name(0) == :"Ferricstore.Store.BitcaskWriter.0"
       assert BitcaskWriter.writer_name(3) == :"Ferricstore.Store.BitcaskWriter.3"

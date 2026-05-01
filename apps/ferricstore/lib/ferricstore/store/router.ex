@@ -323,7 +323,7 @@ defmodule Ferricstore.Store.Router do
       :ets.delete(keydir, key)
 
       {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
-      Ferricstore.Store.BitcaskWriter.delete(idx, file_path, key)
+      Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
 
       wv_size = :counters.info(ctx.write_version).size
       if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
@@ -569,7 +569,7 @@ defmodule Ferricstore.Store.Router do
         :ets.delete(keydir, key)
 
         {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
-        Ferricstore.Store.BitcaskWriter.delete(idx, file_path, key)
+        Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
 
         wv_size = :counters.info(ctx.write_version).size
         if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
@@ -660,6 +660,7 @@ defmodule Ferricstore.Store.Router do
       :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
 
       Ferricstore.Store.BitcaskWriter.write(
+        ctx,
         idx,
         file_path,
         file_id,
@@ -2350,6 +2351,7 @@ defmodule Ferricstore.Store.Router do
         )
 
         Ferricstore.Store.BitcaskWriter.write(
+          ctx,
           idx,
           file_path,
           file_id,
@@ -2363,7 +2365,7 @@ defmodule Ferricstore.Store.Router do
       end,
       compound_delete: fn _redis_key, compound_key ->
         :ets.delete(keydir, compound_key)
-        Ferricstore.Store.BitcaskWriter.delete(idx, file_path, compound_key)
+        Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, compound_key)
         :ok
       end,
       compound_scan: fn _redis_key, prefix ->
@@ -2407,7 +2409,7 @@ defmodule Ferricstore.Store.Router do
       :ets.delete(keydir, compound_key)
 
       {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
-      Ferricstore.Store.BitcaskWriter.delete(idx, file_path, compound_key)
+      Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, compound_key)
 
       wv_size = :counters.info(ctx.write_version).size
       if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
