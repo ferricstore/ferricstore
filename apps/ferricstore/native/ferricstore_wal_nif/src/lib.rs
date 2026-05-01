@@ -1,7 +1,8 @@
 // ferricstore_wal_nif — Rust NIF WAL I/O layer for ra_log_wal
 //
-// All NIF functions run on normal BEAM schedulers (<1μs each).
+// Hot write/sync NIF functions run on normal BEAM schedulers (<1μs each).
 // Blocking I/O (write + fdatasync) runs on a dedicated background thread.
+// Startup/recovery/shutdown calls that can block use DirtyIo schedulers.
 //
 // Architecture:
 //   NIF calls → Mutex<AlignedBuffer> (shared) → FlushRequest channel → Background thread
@@ -44,7 +45,7 @@ mod atoms {
 /// commit_delay_us: microseconds to wait before fdatasync (default 200)
 /// pre_allocate_bytes: fallocate size (default 256MB)
 /// max_buffer_bytes: backpressure limit (default 64MB)
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn open(
     path: String,
     commit_delay_us: u64,
@@ -60,7 +61,7 @@ fn open(
 /// Write pre-formatted iodata to the WAL buffer.
 /// Copies bytes into the shared aligned buffer. Does NOT write to disk.
 /// Returns :ok | {:error, :wal_thread_dead} | {:error, :backpressure}
-#[rustler::nif]
+#[rustler::nif(schedule = "Normal")]
 fn write(handle: ResourceArc<WalHandle>, iodata: Term) -> NifResult<Atom> {
     handle.check_alive()?;
 
@@ -74,7 +75,7 @@ fn write(handle: ResourceArc<WalHandle>, iodata: Term) -> NifResult<Atom> {
 /// Request async fdatasync. Background thread will flush buffer to disk,
 /// fdatasync, and send {wal_sync_complete, Ref} to CallerPid.
 /// Returns :ok immediately.
-#[rustler::nif]
+#[rustler::nif(schedule = "Normal")]
 #[allow(unused_variables)]
 fn sync(
     env: Env,
@@ -94,7 +95,7 @@ fn sync(
 
 /// Close the WAL file. Blocks until background thread drains, syncs, and exits.
 /// Timeout: 30 seconds.
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn close<'a>(env: Env<'a>, handle: ResourceArc<WalHandle>) -> NifResult<Term<'a>> {
     match handle.close() {
         Ok(()) => Ok(atoms::ok().encode(env)),
@@ -103,13 +104,13 @@ fn close<'a>(env: Env<'a>, handle: ResourceArc<WalHandle>) -> NifResult<Term<'a>
 }
 
 /// Returns current logical file size in bytes. No syscall — reads atomic.
-#[rustler::nif]
+#[rustler::nif(schedule = "Normal")]
 fn position(handle: ResourceArc<WalHandle>) -> NifResult<(Atom, u64)> {
     Ok((atoms::ok(), handle.file_size()))
 }
 
 /// Read bytes from WAL at offset. Used during recovery.
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn pread<'a>(
     env: Env<'a>,
     handle: ResourceArc<WalHandle>,
