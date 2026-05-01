@@ -152,6 +152,23 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert {:ok, "old"} = NIF.v2_pread_at(active_file_path, 0)
     end
 
+    test "replays origin PUT when recovery has no local pending row", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      # If the origin crashes after Ra accepts the async command but before the
+      # local pending write reaches Bitcask, recovery must apply the Ra log entry
+      # instead of skipping it as an already-local write.
+      {_state2, :ok} =
+        StateMachine.apply(%{}, {:async, node(), {:put, "missing_origin_put", "v", 0}}, state)
+
+      assert [{"missing_origin_put", "v", 0, _lfu, 0, 0, 1}] =
+               :ets.lookup(ets, "missing_origin_put")
+
+      assert {:ok, [{"missing_origin_put", 0, 1, 0, false}]} = NIF.v2_scan_file(active_file_path)
+    end
+
     test "does not persist a stale origin PUT after local RMW changed the pending ETS value", %{
       state: state,
       ets: ets,
@@ -166,6 +183,21 @@ defmodule Ferricstore.Raft.StateMachineTest do
         StateMachine.apply(%{}, {:async, node(), {:put, "stale_origin_put", "old", 0}}, state)
 
       assert {:ok, []} = NIF.v2_scan_file(active_file_path)
+    end
+
+    test "replays origin RMW when recovery has no local value", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      {_state2, {:ok, 1}} =
+        StateMachine.apply(%{}, {:async, node(), {:incr, "missing_origin_incr", 1}}, state)
+
+      assert [{"missing_origin_incr", "1", 0, _lfu, 0, 0, 1}] =
+               :ets.lookup(ets, "missing_origin_incr")
+
+      assert {:ok, [{"missing_origin_incr", 0, 1, 0, false}]} =
+               NIF.v2_scan_file(active_file_path)
     end
 
     test "replays origin async DELETE when recovery still has an older value", %{

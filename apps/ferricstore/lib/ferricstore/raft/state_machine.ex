@@ -1943,8 +1943,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # and offset from Router's synchronous NIF write — skip disk too.
   defp apply_single(state, {:async, origin, {:put, key, value, expire_at_ms} = _inner})
        when origin == node() do
-    maybe_queue_origin_pending_put(state, key, value, expire_at_ms)
-    :ok
+    apply_origin_async_put(state, key, value, expire_at_ms)
   end
 
   # Async PUT, replica: apply normally (both ETS + disk).
@@ -1964,9 +1963,11 @@ defmodule Ferricstore.Raft.StateMachine do
     if ets_has?(state.ets, key), do: apply_single(state, {:getdel, key}), else: nil
   end
 
-  # Other async commands, origin: skip — Router already applied locally.
-  defp apply_single(_state, {:async, origin, _inner_cmd}) when origin == node() do
-    :ok
+  # Other async commands, origin: skip when Router already applied locally.
+  # If recovery has no local marker/value, apply the accepted Ra entry so an
+  # origin crash after Ra acceptance cannot lose the command.
+  defp apply_single(state, {:async, origin, inner_cmd}) when origin == node() do
+    if async_key_present?(state, inner_cmd), do: :ok, else: apply_single(state, inner_cmd)
   end
 
   # Other async commands, replica: apply.
@@ -2294,6 +2295,27 @@ defmodule Ferricstore.Raft.StateMachine do
 
       _ ->
         :ok
+    end
+  end
+
+  defp apply_origin_async_put(state, key, value, expire_at_ms) do
+    expected_value = value_for_ets(value, hot_cache_threshold(state))
+
+    case :ets.lookup(state.ets, key) do
+      [{^key, ^expected_value, ^expire_at_ms, _lfu, :pending, 0, _vs}]
+      when expected_value != nil ->
+        queue_pending_put(key, to_disk_binary(value), expire_at_ms)
+        :ok
+
+      [{^key, ^expected_value, ^expire_at_ms, _lfu, fid, off, vs}]
+      when fid != :pending and valid_cold_location(fid, off, vs) ->
+        :ok
+
+      [{^key, _other_value, _other_exp, _lfu, :pending, _off, _vs}] ->
+        :ok
+
+      _ ->
+        apply_single(state, {:put, key, value, expire_at_ms})
     end
   end
 
