@@ -366,18 +366,29 @@ defmodule Ferricstore.Commands.Hash do
     with {:ok, count} <- parse_positive_integer(count_str, "count"),
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
-        Enum.map(fields, fn field ->
-          compound_key = CompoundKey.hash_field(key, field)
+        {unique_fields, compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
 
-          case Ops.compound_get_meta(store, key, compound_key) do
+        unique_fields
+        |> Enum.zip(compound_keys)
+        |> Enum.each(fn {field, compound_key} ->
+          case Map.fetch!(metas_by_field, field) do
+            {value, expire_at_ms} when expire_at_ms != 0 ->
+              Ops.compound_put(store, key, compound_key, value, 0)
+
+            _nil_or_persistent ->
+              :ok
+          end
+        end)
+
+        Enum.map(fields, fn field ->
+          case Map.fetch!(metas_by_field, field) do
             nil ->
               -2
 
             {_value, 0} ->
               -1
 
-            {value, _expire_at_ms} ->
-              Ops.compound_put(store, key, compound_key, value, 0)
+            {_value, _expire_at_ms} ->
               1
           end
         end)

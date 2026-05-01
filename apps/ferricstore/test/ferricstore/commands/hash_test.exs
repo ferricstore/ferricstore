@@ -689,6 +689,50 @@ defmodule Ferricstore.Commands.HashTest do
                Hash.handle("HPERSIST", ["hash", "FIELDS", "3", "f1", "f2", "f3"], store)
     end
 
+    test "HPERSIST batches field meta reads and writes each expiring duplicate field once" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+
+      field_keys = [
+        CompoundKey.hash_field("hash", "expiring"),
+        CompoundKey.hash_field("hash", "persistent"),
+        CompoundKey.hash_field("hash", "missing")
+      ]
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key ->
+            "hash"
+
+          "hash", compound_key ->
+            flunk("HPERSIST should only use compound_get for type, got #{inspect(compound_key)}")
+        end,
+        compound_get_meta: fn "hash", compound_key ->
+          flunk("HPERSIST should use compound_batch_get_meta, got #{inspect(compound_key)}")
+        end,
+        compound_batch_get_meta: fn "hash", ^field_keys ->
+          send(parent, {:compound_batch_get_meta, field_keys})
+          [{"v1", Ferricstore.CommandTime.now_ms() + 60_000}, {"v2", 0}, nil]
+        end,
+        compound_put: fn "hash", compound_key, value, 0 ->
+          send(parent, {:compound_put, compound_key, value})
+          :ok
+        end
+      }
+
+      assert [1, 1, -1, -2] ==
+               Hash.handle(
+                 "HPERSIST",
+                 ["hash", "FIELDS", "4", "expiring", "expiring", "persistent", "missing"],
+                 store
+               )
+
+      assert_received {:compound_batch_get_meta, ^field_keys}
+      assert_received {:compound_put, expiring_key, "v1"}
+      assert expiring_key == hd(field_keys)
+      refute_received {:compound_put, _, _}
+    end
+
     test "HPERSIST after removing expiry, HTTL returns -1" do
       store = MockStore.make()
       Hash.handle("HSET", ["hash", "f1", "v1"], store)
