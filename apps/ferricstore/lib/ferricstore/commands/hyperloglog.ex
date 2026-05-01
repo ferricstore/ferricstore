@@ -1,5 +1,7 @@
 defmodule Ferricstore.Commands.HyperLogLog do
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+
   @moduledoc """
   Handles Redis HyperLogLog commands: PFADD, PFCOUNT, PFMERGE.
 
@@ -28,6 +30,8 @@ defmodule Ferricstore.Commands.HyperLogLog do
 
   alias Ferricstore.HyperLogLog, as: HLL
 
+  @wrongtype_error {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+
   @doc """
   Handles a HyperLogLog command.
 
@@ -49,16 +53,22 @@ defmodule Ferricstore.Commands.HyperLogLog do
   # ---------------------------------------------------------------------------
 
   def handle("PFADD", [key], store) do
-    case Ops.get(store, key) do
-      nil ->
-        Ops.put(store, key, HLL.new(), 0)
-        1
+    case ensure_not_compound_key(key, store) do
+      :ok ->
+        case Ops.get(store, key) do
+          nil ->
+            Ops.put(store, key, HLL.new(), 0)
+            1
 
-      sketch ->
-        case validate_sketch(sketch) do
-          :ok -> 0
-          {:error, _} = err -> err
+          sketch ->
+            case validate_sketch(sketch) do
+              :ok -> 0
+              {:error, _} = err -> err
+            end
         end
+
+      @wrongtype_error ->
+        @wrongtype_error
     end
   end
 
@@ -131,19 +141,23 @@ defmodule Ferricstore.Commands.HyperLogLog do
     dest_sketch = get_or_new(destkey, store)
 
     result =
-      Enum.reduce_while([dest_sketch | Enum.map(source_keys, &get_or_new(&1, store))], {:ok, nil}, fn
-        sketch, {:ok, nil} ->
-          case validate_sketch(sketch) do
-            :ok -> {:cont, {:ok, sketch}}
-            {:error, _} = err -> {:halt, err}
-          end
+      Enum.reduce_while(
+        [dest_sketch | Enum.map(source_keys, &get_or_new(&1, store))],
+        {:ok, nil},
+        fn
+          sketch, {:ok, nil} ->
+            case validate_sketch(sketch) do
+              :ok -> {:cont, {:ok, sketch}}
+              {:error, _} = err -> {:halt, err}
+            end
 
-        sketch, {:ok, acc} ->
-          case validate_sketch(sketch) do
-            :ok -> {:cont, {:ok, HLL.merge(acc, sketch)}}
-            {:error, _} = err -> {:halt, err}
-          end
-      end)
+          sketch, {:ok, acc} ->
+            case validate_sketch(sketch) do
+              :ok -> {:cont, {:ok, HLL.merge(acc, sketch)}}
+              {:error, _} = err -> {:halt, err}
+            end
+        end
+      )
 
     case result do
       {:ok, merged} ->
@@ -167,20 +181,38 @@ defmodule Ferricstore.Commands.HyperLogLog do
   # does not exist.
   @spec get_or_new(binary(), map()) :: binary()
   defp get_or_new(key, store) do
-    case Ops.get(store, key) do
-      nil -> HLL.new()
-      value -> value
+    case ensure_not_compound_key(key, store) do
+      :ok ->
+        case Ops.get(store, key) do
+          nil -> HLL.new()
+          value -> value
+        end
+
+      @wrongtype_error ->
+        @wrongtype_error
+    end
+  end
+
+  defp ensure_not_compound_key(key, store) do
+    if Ops.has_compound?(store) and
+         (Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
+            Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil) do
+      @wrongtype_error
+    else
+      :ok
     end
   end
 
   # Validates that a binary is the right size for an HLL sketch.
   # Protects against corrupted or non-HLL values being used with HLL commands.
-  @spec validate_sketch(binary()) :: :ok | {:error, binary()}
+  @spec validate_sketch(binary() | {:error, binary()}) :: :ok | {:error, binary()}
+  defp validate_sketch({:error, _} = err), do: err
+
   defp validate_sketch(sketch) do
     if HLL.valid_sketch?(sketch) do
       :ok
     else
-      {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+      @wrongtype_error
     end
   end
 end

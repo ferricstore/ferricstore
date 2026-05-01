@@ -2,6 +2,7 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Commands.Set
   alias Ferricstore.Commands.HyperLogLog, as: HLLCmd
   alias Ferricstore.HyperLogLog, as: HLL
   alias Ferricstore.Test.MockStore
@@ -84,6 +85,16 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
 
       assert {:error, msg} = HLLCmd.handle("PFADD", ["mykey"], store)
       assert msg =~ "WRONGTYPE"
+    end
+
+    test "PFADD to a compound key returns WRONGTYPE and preserves it" do
+      store = MockStore.make()
+      Set.handle("SADD", ["mykey", "member"], store)
+
+      assert {:error, msg} = HLLCmd.handle("PFADD", ["mykey", "elem"], store)
+      assert msg =~ "WRONGTYPE"
+      assert store.get.("mykey") == nil
+      assert Set.handle("SMEMBERS", ["mykey"], store) == ["member"]
     end
   end
 
@@ -168,6 +179,14 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
       assert {:error, msg} = HLLCmd.handle("PFCOUNT", ["mykey"], store)
       assert msg =~ "WRONGTYPE"
     end
+
+    test "PFCOUNT on a compound key returns WRONGTYPE" do
+      store = MockStore.make()
+      Set.handle("SADD", ["mykey", "member"], store)
+
+      assert {:error, msg} = HLLCmd.handle("PFCOUNT", ["mykey"], store)
+      assert msg =~ "WRONGTYPE"
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -248,6 +267,17 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
 
       assert {:error, msg} = HLLCmd.handle("PFMERGE", ["dest", "src"], store)
       assert msg =~ "WRONGTYPE"
+    end
+
+    test "PFMERGE with compound destination returns WRONGTYPE and preserves destination" do
+      store = MockStore.make()
+      Set.handle("SADD", ["dest", "old-member"], store)
+      HLLCmd.handle("PFADD", ["src", "a"], store)
+
+      assert {:error, msg} = HLLCmd.handle("PFMERGE", ["dest", "src"], store)
+      assert msg =~ "WRONGTYPE"
+      assert store.get.("dest") == nil
+      assert Set.handle("SMEMBERS", ["dest"], store) == ["old-member"]
     end
   end
 
