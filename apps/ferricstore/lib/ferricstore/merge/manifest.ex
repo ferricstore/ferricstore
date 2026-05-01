@@ -16,15 +16,16 @@ defmodule Ferricstore.Merge.Manifest do
 
   On shard startup, if a manifest exists:
 
-  1. Delete any partial output files (the new merged log/hint file).
+  1. Delete any partial compaction temp files.
   2. Leave the original input files intact (they are still valid).
   3. Delete the manifest file.
   4. The shard opens normally — the next merge cycle will retry.
 
-  This is safe because the Rust `compact()` function writes to a NEW file and
-  the old files are only deleted AFTER the compaction succeeds and the keydir
-  is updated. If we crash before the old files are deleted, the old files are
-  still valid and the keydir is rebuilt from them on the next open.
+  This is safe because the shard compaction path writes to `compact_*.log`
+  temporary files and only renames them over existing non-active inputs after
+  the copy succeeds. Recovery must not delete ordinary numbered log files that
+  are newer than the manifest inputs, because those can be the shard's active
+  file after a crash between manifest write and compaction start.
   """
 
   require Logger
@@ -127,8 +128,11 @@ defmodule Ferricstore.Merge.Manifest do
         _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(data_dir)
         :ok
 
-      {:error, {:not_found, _}} -> :ok
-      {:error, reason} -> {:error, reason}
+      {:error, {:not_found, _}} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -166,23 +170,19 @@ defmodule Ferricstore.Merge.Manifest do
             "Cleaning up partial output and re-opening normally."
         )
 
-        # Remove any output files that were created by the incomplete merge.
-        # The compact() function creates files with IDs greater than the max
-        # input ID, so scan for any such files.
-        cleanup_partial_output(data_dir, plan[:input_file_ids] || [])
+        # Remove only temp files created by the current shard compaction path.
+        # Numbered log files greater than the input set may be legitimate active
+        # files when the crash happens after manifest write but before copy.
+        cleanup_partial_output(data_dir)
         delete(data_dir)
 
       {:error, :corrupt_manifest} ->
-        Logger.warning(
-          "Shard #{shard_index}: found corrupt merge manifest. Deleting it."
-        )
+        Logger.warning("Shard #{shard_index}: found corrupt merge manifest. Deleting it.")
 
         delete(data_dir)
 
       {:error, reason} ->
-        Logger.error(
-          "Shard #{shard_index}: failed to read merge manifest: #{inspect(reason)}"
-        )
+        Logger.error("Shard #{shard_index}: failed to read merge manifest: #{inspect(reason)}")
 
         {:error, reason}
     end
@@ -204,20 +204,15 @@ defmodule Ferricstore.Merge.Manifest do
     Path.join(data_dir, @manifest_filename)
   end
 
-  # Remove log/hint files whose file_id is greater than the max input file_id.
-  # These are the partial output files from the interrupted compaction.
-  defp cleanup_partial_output(data_dir, input_file_ids) do
-    max_input_id =
-      case input_file_ids do
-        [] -> 0
-        ids -> Enum.max(ids)
-      end
-
+  # Remove only compaction temp files created by Shard.handle_call({:run_compaction, ...}).
+  # The active file is often newer than the selected merge inputs, so deleting
+  # all numbered files above max(input_file_ids) would drop valid writes.
+  defp cleanup_partial_output(data_dir) do
     case Ferricstore.FS.ls(data_dir) do
       {:ok, files} ->
         files
-        |> Enum.filter(&log_or_hint_file?/1)
-        |> Enum.each(&maybe_remove_partial(&1, data_dir, max_input_id))
+        |> Enum.filter(&partial_output_file?/1)
+        |> Enum.each(&remove_partial(&1, data_dir))
 
         # One dir fsync after the whole sweep so the removals are
         # durable. Without this a double-crash can resurrect stale
@@ -230,24 +225,13 @@ defmodule Ferricstore.Merge.Manifest do
     end
   end
 
-  defp log_or_hint_file?(name) do
-    String.ends_with?(name, ".log") or String.ends_with?(name, ".hint")
+  defp partial_output_file?(name) do
+    String.starts_with?(name, "compact_") and String.ends_with?(name, ".log")
   end
 
-  defp maybe_remove_partial(name, data_dir, max_input_id) do
-    stem =
-      name
-      |> String.replace_suffix(".log", "")
-      |> String.replace_suffix(".hint", "")
-
-    case Integer.parse(stem) do
-      {file_id, ""} when file_id > max_input_id ->
-        Logger.info("Removing partial merge output: #{name}")
-        _ = Ferricstore.FS.rm(Path.join(data_dir, name))
-        :ok
-
-      _ ->
-        :ok
-    end
+  defp remove_partial(name, data_dir) do
+    Logger.info("Removing partial merge output: #{name}")
+    _ = Ferricstore.FS.rm(Path.join(data_dir, name))
+    :ok
   end
 end

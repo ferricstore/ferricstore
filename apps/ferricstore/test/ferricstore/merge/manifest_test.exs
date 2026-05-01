@@ -93,14 +93,13 @@ defmodule Ferricstore.Merge.ManifestTest do
       assert :ok = Manifest.recover_if_needed(dir, 0)
     end
 
-    test "cleans up manifest and partial output files", %{dir: dir} do
+    test "cleans up manifest and partial temp files", %{dir: dir} do
       # Simulate input files.
       File.write!(Path.join(dir, "00000000000000000001.log"), "input1")
       File.write!(Path.join(dir, "00000000000000000002.log"), "input2")
 
-      # Simulate partial output from a crashed merge (file_id > max input).
-      File.write!(Path.join(dir, "00000000000000000003.log"), "partial_output")
-      File.write!(Path.join(dir, "00000000000000000003.hint"), "partial_hint")
+      # Simulate partial output from a crashed merge.
+      File.write!(Path.join(dir, "compact_1.log"), "partial_output")
 
       # Write manifest indicating files 1 and 2 were being merged.
       plan = %{shard_index: 0, input_file_ids: [1, 2]}
@@ -116,9 +115,8 @@ defmodule Ferricstore.Merge.ManifestTest do
       assert File.exists?(Path.join(dir, "00000000000000000001.log"))
       assert File.exists?(Path.join(dir, "00000000000000000002.log"))
 
-      # Partial output files should be cleaned up.
-      refute File.exists?(Path.join(dir, "00000000000000000003.log"))
-      refute File.exists?(Path.join(dir, "00000000000000000003.hint"))
+      # Partial output file should be cleaned up.
+      refute File.exists?(Path.join(dir, "compact_1.log"))
     end
 
     test "handles corrupt manifest gracefully", %{dir: dir} do
@@ -145,6 +143,22 @@ defmodule Ferricstore.Merge.ManifestTest do
       assert File.exists?(Path.join(dir, "00000000000000000005.log"))
       assert File.exists?(Path.join(dir, "00000000000000000003.log"))
     end
+
+    test "preserves active log files newer than merge inputs", %{dir: dir} do
+      # The merge scheduler writes the manifest before compaction starts.
+      # If the node crashes in that window, the active file is newer than
+      # the selected non-active input files and must survive recovery.
+      File.write!(Path.join(dir, "00000000000000000001.log"), "input")
+      File.write!(Path.join(dir, "00000000000000000002.log"), "active_data")
+
+      assert :ok = Manifest.write(dir, %{shard_index: 0, input_file_ids: [1]})
+
+      assert :ok = Manifest.recover_if_needed(dir, 0)
+
+      assert File.exists?(Path.join(dir, "00000000000000000001.log"))
+      assert File.read!(Path.join(dir, "00000000000000000002.log")) == "active_data"
+      refute Manifest.exists?(dir)
+    end
   end
 
   # -------------------------------------------------------------------
@@ -153,7 +167,8 @@ defmodule Ferricstore.Merge.ManifestTest do
 
   describe "manifest with canonical data/shard_N/ paths" do
     test "manifest writes to correct shard data directory under data/" do
-      root = Path.join(System.tmp_dir!(), "manifest_layout_#{:erlang.unique_integer([:positive])}")
+      root =
+        Path.join(System.tmp_dir!(), "manifest_layout_#{:erlang.unique_integer([:positive])}")
 
       on_exit(fn -> File.rm_rf(root) end)
 
@@ -175,7 +190,8 @@ defmodule Ferricstore.Merge.ManifestTest do
     end
 
     test "manifest does not leak to other shard directories" do
-      root = Path.join(System.tmp_dir!(), "manifest_isolation_#{:erlang.unique_integer([:positive])}")
+      root =
+        Path.join(System.tmp_dir!(), "manifest_isolation_#{:erlang.unique_integer([:positive])}")
 
       on_exit(fn -> File.rm_rf(root) end)
 
@@ -193,7 +209,8 @@ defmodule Ferricstore.Merge.ManifestTest do
     end
 
     test "manifest cleanup works with canonical paths" do
-      root = Path.join(System.tmp_dir!(), "manifest_cleanup_#{:erlang.unique_integer([:positive])}")
+      root =
+        Path.join(System.tmp_dir!(), "manifest_cleanup_#{:erlang.unique_integer([:positive])}")
 
       on_exit(fn -> File.rm_rf(root) end)
 
@@ -210,7 +227,8 @@ defmodule Ferricstore.Merge.ManifestTest do
     end
 
     test "interrupted merge recovery finds manifest in canonical path" do
-      root = Path.join(System.tmp_dir!(), "manifest_recovery_#{:erlang.unique_integer([:positive])}")
+      root =
+        Path.join(System.tmp_dir!(), "manifest_recovery_#{:erlang.unique_integer([:positive])}")
 
       on_exit(fn -> File.rm_rf(root) end)
 
@@ -218,10 +236,9 @@ defmodule Ferricstore.Merge.ManifestTest do
 
       shard_dir = Ferricstore.DataDir.shard_data_path(root, 3)
 
-      # Simulate an interrupted merge: write manifest + partial output.
+      # Simulate an interrupted merge: write manifest + partial temp output.
       File.write!(Path.join(shard_dir, "00000000000000000001.log"), "input_data")
-      File.write!(Path.join(shard_dir, "00000000000000000002.log"), "partial_output")
-      File.write!(Path.join(shard_dir, "00000000000000000002.hint"), "partial_hint")
+      File.write!(Path.join(shard_dir, "compact_1.log"), "partial_output")
 
       plan = %{shard_index: 3, input_file_ids: [1]}
       assert :ok = Manifest.write(shard_dir, plan)
@@ -232,13 +249,13 @@ defmodule Ferricstore.Merge.ManifestTest do
       refute Manifest.exists?(shard_dir)
       # Input file preserved.
       assert File.exists?(Path.join(shard_dir, "00000000000000000001.log"))
-      # Partial output removed (id=2 > max input id=1).
-      refute File.exists?(Path.join(shard_dir, "00000000000000000002.log"))
-      refute File.exists?(Path.join(shard_dir, "00000000000000000002.hint"))
+      # Partial output removed.
+      refute File.exists?(Path.join(shard_dir, "compact_1.log"))
     end
 
     test "manifest write and read with legacy shard path" do
-      root = Path.join(System.tmp_dir!(), "manifest_legacy_#{:erlang.unique_integer([:positive])}")
+      root =
+        Path.join(System.tmp_dir!(), "manifest_legacy_#{:erlang.unique_integer([:positive])}")
 
       on_exit(fn -> File.rm_rf(root) end)
 
@@ -280,14 +297,13 @@ defmodule Ferricstore.Merge.ManifestTest do
       assert :ok = Manifest.delete(dir)
     end
 
-    test "recover_if_needed removes partial-output files and fsyncs the dir", %{dir: dir} do
+    test "recover_if_needed removes partial-output temp files and fsyncs the dir", %{dir: dir} do
       # Simulate an interrupted merge: manifest exists listing inputs
-      # [1, 2], plus a stale output file with id > 2 left from the
-      # prior crashed merge attempt.
+      # [1, 2], plus a stale temp file left from the prior crashed merge attempt.
       :ok = Manifest.write(dir, %{shard_index: 0, input_file_ids: [1, 2]})
       File.touch!(Path.join(dir, "00001.log"))
       File.touch!(Path.join(dir, "00002.log"))
-      stale = Path.join(dir, "00003.log")
+      stale = Path.join(dir, "compact_1.log")
       File.touch!(stale)
 
       Manifest.recover_if_needed(dir, 0)
