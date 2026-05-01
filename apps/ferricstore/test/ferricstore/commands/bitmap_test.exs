@@ -576,6 +576,13 @@ defmodule Ferricstore.Commands.BitmapTest do
   end
 
   describe "GETBIT edge cases" do
+    test "GETBIT returns WRONGTYPE for legacy encoded non-string values" do
+      encoded = :erlang.term_to_binary({:list, ["a", "b"]})
+      store = MockStore.make(%{"legacy" => {encoded, 0}})
+
+      assert {:error, "WRONGTYPE" <> _} = Bitmap.handle("GETBIT", ["legacy", "0"], store)
+    end
+
     test "GETBIT with non-integer offset returns error" do
       store = MockStore.make()
       assert {:error, msg} = Bitmap.handle("GETBIT", ["k", "abc"], store)
@@ -628,6 +635,13 @@ defmodule Ferricstore.Commands.BitmapTest do
   end
 
   describe "BITCOUNT edge cases" do
+    test "BITCOUNT returns WRONGTYPE for legacy encoded non-string values" do
+      encoded = :erlang.term_to_binary({:hash, %{"f" => "v"}})
+      store = MockStore.make(%{"legacy" => {encoded, 0}})
+
+      assert {:error, "WRONGTYPE" <> _} = Bitmap.handle("BITCOUNT", ["legacy"], store)
+    end
+
     test "BITCOUNT with invalid mode returns error" do
       store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
       assert {:error, msg} = Bitmap.handle("BITCOUNT", ["k", "0", "0", "BOGUS"], store)
@@ -648,6 +662,14 @@ defmodule Ferricstore.Commands.BitmapTest do
   end
 
   describe "BITOP error message edge cases" do
+    test "BITOP source returns WRONGTYPE for legacy encoded non-string values" do
+      encoded = :erlang.term_to_binary({:set, MapSet.new(["a"])})
+      store = MockStore.make(%{"legacy" => {encoded, 0}})
+
+      assert {:error, "WRONGTYPE" <> _} = Bitmap.handle("BITOP", ["NOT", "dest", "legacy"], store)
+      assert store.get.("dest") == nil
+    end
+
     test "BITOP NOT with no source key returns error" do
       store = MockStore.make()
       assert {:error, msg} = Bitmap.handle("BITOP", ["NOT", "dest"], store)
