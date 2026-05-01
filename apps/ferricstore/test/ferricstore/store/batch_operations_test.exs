@@ -187,6 +187,37 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     test "empty list returns empty list" do
       assert FerricStore.batch_set([]) == []
     end
+
+    test "async disk failure is returned to every async batch_set key" do
+      default_ctx = FerricStore.Instance.get(:default)
+      {small_key, large_key} = same_shard_keys(default_ctx, "bs_disk_fail")
+      idx = Router.shard_for(default_ctx, small_key)
+      original = Ferricstore.Store.ActiveFile.get(idx)
+
+      missing_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_missing_active_#{System.unique_integer([:positive])}"
+        )
+
+      missing_path = Path.join(missing_dir, "00000.log")
+      Ferricstore.Store.ActiveFile.publish(idx, 98_998, missing_path, missing_dir)
+
+      try do
+        large = :binary.copy("Z", 100 * 1024)
+
+        assert [
+                 {:error, "ERR disk write failed" <> _},
+                 {:error, "ERR disk write failed" <> _}
+               ] = FerricStore.batch_set([{small_key, "small"}, {large_key, large}])
+
+        assert {:ok, nil} == FerricStore.get(small_key)
+        assert {:ok, nil} == FerricStore.get(large_key)
+      after
+        {file_id, file_path, shard_data_path} = original
+        Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_data_path)
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------

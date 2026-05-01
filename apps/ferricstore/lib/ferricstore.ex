@@ -5093,8 +5093,7 @@ defmodule FerricStore do
 
     case ctx.durability_mode do
       :all_async ->
-        Ferricstore.Store.Router.batch_async_put(ctx, kv_pairs)
-        List.duplicate(:ok, length(kv_pairs))
+        batch_async_put_result_list(ctx, kv_pairs)
 
       :all_quorum ->
         Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
@@ -5109,12 +5108,10 @@ defmodule FerricStore do
 
         async_results =
           if async_kvs != [] do
-            Ferricstore.Store.Router.batch_async_put(
-              ctx,
-              Enum.map(async_kvs, fn {{k, v}, _} -> {k, v} end)
-            )
+            async_values =
+              batch_async_put_result_list(ctx, Enum.map(async_kvs, fn {{k, v}, _} -> {k, v} end))
 
-            Enum.map(async_kvs, fn {_, i} -> {i, :ok} end)
+            Enum.zip(Enum.map(async_kvs, fn {_, i} -> i end), async_values)
           else
             []
           end
@@ -5144,6 +5141,13 @@ defmodule FerricStore do
 
   defp wrap_result({:error, _} = err), do: err
   defp wrap_result(result), do: {:ok, result}
+
+  defp batch_async_put_result_list(ctx, kv_pairs) do
+    case Ferricstore.Store.Router.batch_async_put(ctx, kv_pairs) do
+      :ok -> List.duplicate(:ok, length(kv_pairs))
+      {:error, _reason} = error -> List.duplicate(error, length(kv_pairs))
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Private — string store builder for bitmap/json/hyperloglog operations
@@ -5572,11 +5576,17 @@ defmodule FerricStore.Pipe do
 
   defp classify_batch(_, _, _), do: :complex
 
-  defp execute_batch_sets(ctx, ordered, kv_pairs) do
+  defp batch_async_put_result_list(ctx, kv_pairs) do
+    case Ferricstore.Store.Router.batch_async_put(ctx, kv_pairs) do
+      :ok -> List.duplicate(:ok, length(kv_pairs))
+      {:error, _reason} = error -> List.duplicate(error, length(kv_pairs))
+    end
+  end
+
+  defp execute_batch_sets(ctx, _ordered, kv_pairs) do
     case ctx.durability_mode do
       :all_async ->
-        Ferricstore.Store.Router.batch_async_put(ctx, kv_pairs)
-        Enum.map(ordered, fn _ -> :ok end)
+        batch_async_put_result_list(ctx, kv_pairs)
 
       :all_quorum ->
         Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
@@ -5591,12 +5601,10 @@ defmodule FerricStore.Pipe do
 
         async_results =
           if async_kvs != [] do
-            Ferricstore.Store.Router.batch_async_put(
-              ctx,
-              Enum.map(async_kvs, fn {{k, v}, _} -> {k, v} end)
-            )
+            async_values =
+              batch_async_put_result_list(ctx, Enum.map(async_kvs, fn {{k, v}, _} -> {k, v} end))
 
-            Enum.map(async_kvs, fn {_, i} -> {i, :ok} end)
+            Enum.zip(Enum.map(async_kvs, fn {_, i} -> i end), async_values)
           else
             []
           end
@@ -5632,8 +5640,7 @@ defmodule FerricStore.Pipe do
         results =
           case ctx.durability_mode do
             :all_async ->
-              Ferricstore.Store.Router.batch_async_put(ctx, kv_pairs)
-              List.duplicate(:ok, length(kv_pairs))
+              batch_async_put_result_list(ctx, kv_pairs)
 
             :all_quorum ->
               Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
@@ -5646,12 +5653,10 @@ defmodule FerricStore.Pipe do
 
               async_r =
                 if async_ops != [] do
-                  Ferricstore.Store.Router.batch_async_put(
+                  batch_async_put_result_list(
                     ctx,
                     Enum.map(async_ops, fn {_, k, v} -> {k, v} end)
                   )
-
-                  List.duplicate(:ok, length(async_ops))
                 else
                   []
                 end
