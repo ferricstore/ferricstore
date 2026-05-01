@@ -678,15 +678,22 @@ defmodule Ferricstore.Store.Shard do
               {written, dropped, reclaimed}
           end
         else
-          # All entries in this file are dead — delete the file entirely
+          # Tombstones are not represented in ETS, but they can still be
+          # semantically live because they suppress older values in lower file
+          # ids. Per-file compaction cannot prove those older values are gone,
+          # so keep tombstone-only files for correctness.
           old_size =
             case File.stat(source) do
               {:ok, %{size: s}} -> s
               _ -> 0
             end
 
-          _ = Ferricstore.FS.rm(source)
-          {written, dropped, reclaimed + old_size}
+          if tombstone_file?(source) do
+            {written, dropped, reclaimed}
+          else
+            _ = Ferricstore.FS.rm(source)
+            {written, dropped, reclaimed + old_size}
+          end
         end
       end)
 
@@ -883,6 +890,13 @@ defmodule Ferricstore.Store.Shard do
 
   defp handle_forwarded_quorum(command, from, state) when is_tuple(command) do
     handle_call(command, from, state)
+  end
+
+  defp tombstone_file?(path) do
+    case NIF.v2_scan_tombstones(path) do
+      {:ok, [_ | _]} -> true
+      _ -> false
+    end
   end
 
   defp update_compacted_ets_locations(keydir, fid, live_entries, results) do
