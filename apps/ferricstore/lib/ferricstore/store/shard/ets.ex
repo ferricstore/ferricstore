@@ -89,7 +89,7 @@ defmodule Ferricstore.Store.Shard.ETS do
 
   @spec pending_cold?(map(), binary()) :: boolean()
   @doc false
-  def pending_cold?(%{keydir: keydir}, key) do
+  def pending_cold?(%{keydir: keydir} = state, key) do
     now = HLC.now_ms()
 
     case :ets.lookup(keydir, key) do
@@ -100,6 +100,7 @@ defmodule Ferricstore.Store.Shard.ETS do
         true
 
       [{^key, nil, _exp, _lfu, :pending, _off, _vsize}] ->
+        track_binary_delete(state, key)
         :ets.delete(keydir, key)
         false
 
