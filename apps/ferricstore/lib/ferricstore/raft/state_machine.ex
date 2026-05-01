@@ -2441,6 +2441,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp with_pending_writes(state, fun) do
     Process.put(:sm_pending_writes, [])
     Process.put(:sm_pending_originals, %{})
+    Process.put(:sm_pending_values, %{})
     started_at = System.monotonic_time()
 
     try do
@@ -2455,6 +2456,7 @@ defmodule Ferricstore.Raft.StateMachine do
     after
       Process.delete(:sm_pending_writes)
       Process.delete(:sm_pending_originals)
+      Process.delete(:sm_pending_values)
     end
   end
 
@@ -2725,11 +2727,15 @@ defmodule Ferricstore.Raft.StateMachine do
   defp queue_pending_put(key, value, expire_at_ms) do
     pending = Process.get(:sm_pending_writes, [])
     Process.put(:sm_pending_writes, [{:put, key, value, expire_at_ms} | pending])
+    pending_values = Process.get(:sm_pending_values, %{})
+    Process.put(:sm_pending_values, Map.put(pending_values, key, {value, expire_at_ms}))
   end
 
   defp queue_pending_delete(key, prob_path) do
     pending = Process.get(:sm_pending_writes, [])
     Process.put(:sm_pending_writes, [{:delete, key, prob_path} | pending])
+    pending_values = Process.get(:sm_pending_values, %{})
+    Process.put(:sm_pending_values, Map.delete(pending_values, key))
   end
 
   defp emit_raft_apply_telemetry(state, started_at, result, flush_result) do
@@ -3661,6 +3667,36 @@ defmodule Ferricstore.Raft.StateMachine do
   # Mirrors the shard's `ets_lookup/2` logic with Bitcask fallback for
   # keys that may not yet be warmed into ETS.
   defp ets_lookup(state, key) do
+    case sm_pending_value_meta(key) do
+      {:hit, value, exp} ->
+        {:hit, value, exp}
+
+      :miss ->
+        ets_lookup_committed(state, key)
+    end
+  end
+
+  defp sm_pending_value_meta(key) do
+    pending = Process.get(:sm_pending_values)
+
+    case pending && Map.get(pending, key) do
+      {value, 0} ->
+        {:hit, value, 0}
+
+      {value, exp} ->
+        if exp > apply_now_ms() do
+          {:hit, value, exp}
+        else
+          Process.put(:sm_pending_values, Map.delete(pending, key))
+          :miss
+        end
+
+      _ ->
+        :miss
+    end
+  end
+
+  defp ets_lookup_committed(state, key) do
     now = apply_now_ms()
 
     case :ets.lookup(state.ets, key) do

@@ -1019,6 +1019,26 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert [{"batch_c", "val_c", 0, _, _, _, _}] = :ets.lookup(ets, "batch_c")
     end
 
+    test "RMW command in same batch reads prior pending large put", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      key = "batch_large_then_append"
+      large = String.duplicate("L", 70_000)
+      expected = large <> "!"
+
+      {new_state, {:ok, results}} =
+        StateMachine.apply(%{}, {:batch, [{:put, key, large, 0}, {:append, key, "!"}]}, state)
+
+      assert results == [:ok, {:ok, byte_size(expected)}]
+      assert new_state.applied_count == 2
+
+      assert [{^key, nil, 0, _, 0, offset, value_size}] = :ets.lookup(ets, key)
+      assert value_size == byte_size(expected)
+      assert {:ok, ^expected} = NIF.v2_pread_at(active_file_path, offset)
+    end
+
     test "probabilistic command in batch does not drop earlier pending puts", %{
       state: state,
       ets: ets,
