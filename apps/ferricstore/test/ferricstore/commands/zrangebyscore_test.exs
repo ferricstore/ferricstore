@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.ZrangebyscoreTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.SortedSet
+  alias Ferricstore.Commands.{Hash, Set, SortedSet}
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -184,7 +184,9 @@ defmodule Ferricstore.Commands.ZrangebyscoreTest do
       store = MockStore.make()
       seed(store, "zs", [{1.0, "a"}, {2.0, "b"}, {3.0, "c"}])
 
-      result = SortedSet.handle("ZRANGEBYSCORE", ["zs", "-inf", "+inf", "LIMIT", "1", "100"], store)
+      result =
+        SortedSet.handle("ZRANGEBYSCORE", ["zs", "-inf", "+inf", "LIMIT", "1", "100"], store)
+
       assert result == ["b", "c"]
     end
 
@@ -192,7 +194,9 @@ defmodule Ferricstore.Commands.ZrangebyscoreTest do
       store = MockStore.make()
       seed(store, "zs", [{1.0, "a"}, {2.0, "b"}])
 
-      result = SortedSet.handle("ZRANGEBYSCORE", ["zs", "-inf", "+inf", "LIMIT", "10", "5"], store)
+      result =
+        SortedSet.handle("ZRANGEBYSCORE", ["zs", "-inf", "+inf", "LIMIT", "10", "5"], store)
+
       assert result == []
     end
 
@@ -200,7 +204,13 @@ defmodule Ferricstore.Commands.ZrangebyscoreTest do
       store = MockStore.make()
       seed(store, "zs", [{1.0, "a"}, {2.0, "b"}, {3.0, "c"}, {4.0, "d"}])
 
-      result = SortedSet.handle("ZRANGEBYSCORE", ["zs", "-inf", "+inf", "WITHSCORES", "LIMIT", "1", "2"], store)
+      result =
+        SortedSet.handle(
+          "ZRANGEBYSCORE",
+          ["zs", "-inf", "+inf", "WITHSCORES", "LIMIT", "1", "2"],
+          store
+        )
+
       assert length(result) == 4
       pairs = Enum.chunk_every(result, 2)
       members = Enum.map(pairs, fn [m, _s] -> m end)
@@ -211,7 +221,9 @@ defmodule Ferricstore.Commands.ZrangebyscoreTest do
       store = MockStore.make()
       seed(store, "zs", [{1.0, "a"}, {2.0, "b"}, {3.0, "c"}, {4.0, "d"}])
 
-      result = SortedSet.handle("ZRANGEBYSCORE", ["zs", "-inf", "+inf", "LIMIT", "2", "-1"], store)
+      result =
+        SortedSet.handle("ZRANGEBYSCORE", ["zs", "-inf", "+inf", "LIMIT", "2", "-1"], store)
+
       assert result == ["c", "d"]
     end
   end
@@ -275,8 +287,10 @@ defmodule Ferricstore.Commands.ZrangebyscoreTest do
 
     test "WRONGTYPE on non-zset key returns error" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
-      assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZRANGEBYSCORE", ["mykey", "-inf", "+inf"], store)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               SortedSet.handle("ZRANGEBYSCORE", ["mykey", "-inf", "+inf"], store)
     end
 
     test "negative scores work correctly" do
@@ -341,7 +355,9 @@ defmodule Ferricstore.Commands.ZrangebyscoreTest do
       store = MockStore.make()
       seed(store, "zs", [{1.0, "a"}, {2.0, "b"}, {3.0, "c"}, {4.0, "d"}, {5.0, "e"}])
 
-      result = SortedSet.handle("ZREVRANGEBYSCORE", ["zs", "+inf", "-inf", "LIMIT", "1", "2"], store)
+      result =
+        SortedSet.handle("ZREVRANGEBYSCORE", ["zs", "+inf", "-inf", "LIMIT", "1", "2"], store)
+
       assert result == ["d", "c"]
     end
 
@@ -349,7 +365,13 @@ defmodule Ferricstore.Commands.ZrangebyscoreTest do
       store = MockStore.make()
       seed(store, "zs", [{1.0, "a"}, {2.0, "b"}, {3.0, "c"}, {4.0, "d"}])
 
-      result = SortedSet.handle("ZREVRANGEBYSCORE", ["zs", "+inf", "-inf", "WITHSCORES", "LIMIT", "0", "2"], store)
+      result =
+        SortedSet.handle(
+          "ZREVRANGEBYSCORE",
+          ["zs", "+inf", "-inf", "WITHSCORES", "LIMIT", "0", "2"],
+          store
+        )
+
       assert length(result) == 4
       pairs = Enum.chunk_every(result, 2)
       members = Enum.map(pairs, fn [m, _s] -> m end)
@@ -383,8 +405,10 @@ defmodule Ferricstore.Commands.ZrangebyscoreTest do
 
     test "WRONGTYPE on non-zset key returns error" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
-      assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZREVRANGEBYSCORE", ["mykey", "+inf", "-inf"], store)
+      Set.handle("SADD", ["mykey", "member"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               SortedSet.handle("ZREVRANGEBYSCORE", ["mykey", "+inf", "-inf"], store)
     end
   end
 
