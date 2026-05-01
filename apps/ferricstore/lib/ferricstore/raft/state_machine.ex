@@ -1965,6 +1965,27 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(
          state,
+         {:async, origin,
+          {:origin_checked, key, inner_cmd, before_value, before_expire_at_ms, expected_value,
+           expire_at_ms}}
+       )
+       when origin == node() do
+    case origin_replay_decision(
+           state,
+           key,
+           before_value,
+           before_expire_at_ms,
+           expected_value,
+           expire_at_ms
+         ) do
+      :already_applied -> :ok
+      :apply -> apply_single(state, inner_cmd)
+      :newer_local_value -> :ok
+    end
+  end
+
+  defp apply_single(
+         state,
          {:async, origin, {:origin_checked, key, inner_cmd, expected_value, expire_at_ms}}
        )
        when origin == node() do
@@ -1980,6 +2001,14 @@ defmodule Ferricstore.Raft.StateMachine do
   # origin crash after Ra acceptance cannot lose the command.
   defp apply_single(state, {:async, origin, inner_cmd}) when origin == node() do
     if async_key_present?(state, inner_cmd), do: :ok, else: apply_single(state, inner_cmd)
+  end
+
+  defp apply_single(
+         state,
+         {:async, _origin,
+          {:origin_checked, _key, inner_cmd, _before_value, _before_exp, _value, _exp}}
+       ) do
+    apply_single(state, inner_cmd)
   end
 
   defp apply_single(state, {:async, _origin, {:origin_checked, _key, inner_cmd, _value, _exp}}) do
@@ -2350,6 +2379,29 @@ defmodule Ferricstore.Raft.StateMachine do
 
       _ ->
         false
+    end
+  end
+
+  defp origin_replay_decision(
+         state,
+         key,
+         before_value,
+         before_expire_at_ms,
+         expected_value,
+         expire_at_ms
+       ) do
+    case do_get_meta(state, key) do
+      {^expected_value, ^expire_at_ms} when expected_value != nil ->
+        :already_applied
+
+      {^before_value, ^before_expire_at_ms} when before_value != nil ->
+        :apply
+
+      nil when before_value == nil ->
+        :apply
+
+      _other ->
+        :newer_local_value
     end
   end
 

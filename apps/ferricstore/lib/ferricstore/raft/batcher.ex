@@ -145,6 +145,8 @@ defmodule Ferricstore.Raft.Batcher do
           | {:compound_delete, binary()}
           | {:compound_delete_prefix, binary()}
           | {:origin_checked, binary(), command(), binary() | nil, non_neg_integer()}
+          | {:origin_checked, binary(), command(), binary() | nil, non_neg_integer(),
+             binary() | nil, non_neg_integer()}
 
   @typedoc """
   A slot key identifies a unique batching bucket by namespace prefix and
@@ -452,8 +454,14 @@ defmodule Ferricstore.Raft.Batcher do
   def extract_prefix(command) when is_tuple(command) do
     key =
       case command do
-        {:origin_checked, key, _inner, _expected_value, _expire_at_ms} -> key
-        _ -> elem(command, 1)
+        {:origin_checked, key, _inner, _before_value, _before_exp, _expected_value, _expire_at_ms} ->
+          key
+
+        {:origin_checked, key, _inner, _expected_value, _expire_at_ms} ->
+          key
+
+        _ ->
+          elem(command, 1)
       end
 
     if is_binary(key) do

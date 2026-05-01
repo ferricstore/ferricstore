@@ -222,6 +222,79 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert {"old_origin_incr", _offset, 1, 0, false} = List.last(records)
     end
 
+    test "replays origin GETSET when recovery has the pre-command value", %{
+      state: state,
+      ets: ets
+    } do
+      :ets.insert(ets, {"old_origin_getset", "old", 0, 1, 0, 0, 3})
+
+      {_state2, "old"} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "old_origin_getset", {:getset, "old_origin_getset", "new"}, "old", 0,
+            "new", 0}},
+          state
+        )
+
+      assert [{"old_origin_getset", "new", 0, _lfu, 0, _off, 3}] =
+               :ets.lookup(ets, "old_origin_getset")
+    end
+
+    test "does not replay origin GETSET over a newer local value", %{state: state, ets: ets} do
+      :ets.insert(ets, {"future_origin_getset", "future", 0, 1, :pending, 0, 0})
+
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "future_origin_getset", {:getset, "future_origin_getset", "new"},
+            "old", 0, "new", 0}},
+          state
+        )
+
+      assert [{"future_origin_getset", "future", 0, _lfu, :pending, 0, 0}] =
+               :ets.lookup(ets, "future_origin_getset")
+    end
+
+    test "replays origin GETEX when recovery has the old expiry", %{state: state, ets: ets} do
+      old_expire_at_ms = Ferricstore.HLC.now_ms() + 10_000
+      new_expire_at_ms = old_expire_at_ms + 10_000
+
+      :ets.insert(ets, {"old_origin_getex", "value", old_expire_at_ms, 1, 0, 0, 5})
+
+      {_state2, "value"} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "old_origin_getex", {:getex, "old_origin_getex", new_expire_at_ms},
+            "value", old_expire_at_ms, "value", new_expire_at_ms}},
+          state
+        )
+
+      assert [{"old_origin_getex", "value", ^new_expire_at_ms, _lfu, 0, _off, 5}] =
+               :ets.lookup(ets, "old_origin_getex")
+    end
+
+    test "replays origin SETRANGE when recovery has the pre-command value", %{
+      state: state,
+      ets: ets
+    } do
+      :ets.insert(ets, {"old_origin_setrange", "hello", 0, 1, 0, 0, 5})
+
+      {_state2, {:ok, 5}} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "old_origin_setrange", {:setrange, "old_origin_setrange", 2, "X"},
+            "hello", 0, "heXlo", 0}},
+          state
+        )
+
+      assert [{"old_origin_setrange", "heXlo", 0, _lfu, 0, _off, 5}] =
+               :ets.lookup(ets, "old_origin_setrange")
+    end
+
     test "replays origin async DELETE when recovery still has an older value", %{
       state: state,
       ets: ets,

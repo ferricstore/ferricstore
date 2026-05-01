@@ -577,7 +577,17 @@ defmodule Ferricstore.Store.Router do
         if delta > 9_223_372_036_854_775_807 or delta < -9_223_372_036_854_775_808 do
           {:error, "ERR increment or decrement would overflow"}
         else
-          install_rmw_and_submit(ctx, idx, key, delta, 0, {:incr, key, delta}, {:ok, delta})
+          install_rmw_and_submit(
+            ctx,
+            idx,
+            key,
+            delta,
+            0,
+            {:incr, key, delta},
+            nil,
+            0,
+            {:ok, delta}
+          )
         end
 
       {:hit, value, expire_at_ms} ->
@@ -595,6 +605,8 @@ defmodule Ferricstore.Store.Router do
                 new_val,
                 expire_at_ms,
                 {:incr, key, delta},
+                value,
+                expire_at_ms,
                 {:ok, new_val}
               )
             end
@@ -617,6 +629,8 @@ defmodule Ferricstore.Store.Router do
           new_val,
           0,
           {:incr_float, key, delta},
+          nil,
+          0,
           {:ok, new_val}
         )
 
@@ -632,6 +646,8 @@ defmodule Ferricstore.Store.Router do
               new_val,
               expire_at_ms,
               {:incr_float, key, delta},
+              value,
+              expire_at_ms,
               {:ok, new_val}
             )
 
@@ -642,10 +658,10 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp do_rmw_inline(ctx, idx, {:append, key, suffix}) do
-    {old_val, expire_at_ms} =
+    {old_val, before_value, expire_at_ms} =
       case read_live(ctx, idx, key) do
-        :missing -> {"", 0}
-        {:hit, v, exp} -> {to_disk_binary(v), exp}
+        :missing -> {"", nil, 0}
+        {:hit, v, exp} -> {to_disk_binary(v), v, exp}
       end
 
     new_val = old_val <> suffix
@@ -657,18 +673,30 @@ defmodule Ferricstore.Store.Router do
       new_val,
       expire_at_ms,
       {:append, key, suffix},
+      before_value,
+      expire_at_ms,
       {:ok, byte_size(new_val)}
     )
   end
 
   defp do_rmw_inline(ctx, idx, {:getset, key, new_value}) do
-    old =
+    {old, old_expire_at_ms} =
       case read_live(ctx, idx, key) do
-        :missing -> nil
-        {:hit, v, _exp} -> v
+        :missing -> {nil, 0}
+        {:hit, v, exp} -> {v, exp}
       end
 
-    install_rmw_and_submit(ctx, idx, key, new_value, 0, {:getset, key, new_value}, old)
+    install_rmw_and_submit(
+      ctx,
+      idx,
+      key,
+      new_value,
+      0,
+      {:getset, key, new_value},
+      old,
+      old_expire_at_ms,
+      old
+    )
   end
 
   defp do_rmw_inline(ctx, idx, {:getdel, key}) do
@@ -698,7 +726,7 @@ defmodule Ferricstore.Store.Router do
       :missing ->
         nil
 
-      {:hit, v, _old_exp} ->
+      {:hit, v, old_expire_at_ms} ->
         install_rmw_and_submit(
           ctx,
           idx,
@@ -706,16 +734,18 @@ defmodule Ferricstore.Store.Router do
           v,
           new_expire_at_ms,
           {:getex, key, new_expire_at_ms},
+          v,
+          old_expire_at_ms,
           v
         )
     end
   end
 
   defp do_rmw_inline(ctx, idx, {:setrange, key, offset, value}) do
-    {old_val, expire_at_ms} =
+    {old_val, before_value, expire_at_ms} =
       case read_live(ctx, idx, key) do
-        :missing -> {"", 0}
-        {:hit, v, exp} -> {to_disk_binary(v), exp}
+        :missing -> {"", nil, 0}
+        {:hit, v, exp} -> {to_disk_binary(v), v, exp}
       end
 
     new_val = apply_setrange(old_val, offset, value)
@@ -727,15 +757,29 @@ defmodule Ferricstore.Store.Router do
       new_val,
       expire_at_ms,
       {:setrange, key, offset, value},
+      before_value,
+      expire_at_ms,
       {:ok, byte_size(new_val)}
     )
   end
 
-  defp install_rmw_and_submit(ctx, idx, key, value, expire_at_ms, raft_cmd, success) do
+  defp install_rmw_and_submit(
+         ctx,
+         idx,
+         key,
+         value,
+         expire_at_ms,
+         raft_cmd,
+         before_value,
+         before_expire_at_ms,
+         success
+       ) do
     if large_value_for_hot_cache?(ctx, value) do
       install_large_rmw_and_submit(ctx, idx, key, value, expire_at_ms, raft_cmd, success)
     else
-      checked_cmd = {:origin_checked, key, raft_cmd, origin_check_value(value), expire_at_ms}
+      checked_cmd =
+        {:origin_checked, key, raft_cmd, origin_check_value(before_value), before_expire_at_ms,
+         origin_check_value(value), expire_at_ms}
 
       with :ok <- async_submit_to_raft(idx, checked_cmd),
            :ok <- install_rmw_value(ctx, idx, key, value, expire_at_ms) do
