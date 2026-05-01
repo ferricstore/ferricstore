@@ -101,9 +101,34 @@ defmodule Ferricstore.Store.TypeRegistry do
         end
 
       type_str ->
-        type_str
+        live_type_or_none(redis_key, type_str, store)
     end
   end
+
+  defp live_type_or_none(redis_key, type_str, store) do
+    if live_compound_type?(redis_key, type_str, store) or Ops.exists?(store, redis_key) do
+      type_str
+    else
+      delete_type(redis_key, store)
+      "none"
+    end
+  end
+
+  defp live_compound_type?(redis_key, "hash", store),
+    do: Ops.compound_count(store, redis_key, CompoundKey.hash_prefix(redis_key)) > 0
+
+  defp live_compound_type?(redis_key, "list", store) do
+    Ops.compound_get(store, redis_key, CompoundKey.list_meta_key(redis_key)) != nil and
+      Ops.compound_count(store, redis_key, CompoundKey.list_prefix(redis_key)) > 0
+  end
+
+  defp live_compound_type?(redis_key, "set", store),
+    do: Ops.compound_count(store, redis_key, CompoundKey.set_prefix(redis_key)) > 0
+
+  defp live_compound_type?(redis_key, "zset", store),
+    do: Ops.compound_count(store, redis_key, CompoundKey.zset_prefix(redis_key)) > 0
+
+  defp live_compound_type?(_redis_key, _type_str, _store), do: true
 
   defp detect_serialized_type(value) do
     try do
@@ -157,8 +182,11 @@ defmodule Ferricstore.Store.TypeRegistry do
           :ok
         end
 
-      ^expected -> :ok
-      _other_type -> {:error, @wrongtype_msg}
+      ^expected ->
+        :ok
+
+      _other_type ->
+        {:error, @wrongtype_msg}
     end
   end
 

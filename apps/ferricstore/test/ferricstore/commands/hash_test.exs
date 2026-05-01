@@ -2,7 +2,9 @@ defmodule Ferricstore.Commands.HashTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Commands.Generic
   alias Ferricstore.Commands.Hash
+  alias Ferricstore.Commands.Strings
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -387,7 +389,9 @@ defmodule Ferricstore.Commands.HashTest do
     test "HEXPIRE returns -2 for non-existent fields" do
       store = MockStore.make()
       Hash.handle("HSET", ["hash", "f1", "v1"], store)
-      assert [1, -2] == Hash.handle("HEXPIRE", ["hash", "10", "FIELDS", "2", "f1", "missing"], store)
+
+      assert [1, -2] ==
+               Hash.handle("HEXPIRE", ["hash", "10", "FIELDS", "2", "f1", "missing"], store)
     end
 
     test "HEXPIRE returns all -2 for non-existent key" do
@@ -440,7 +444,9 @@ defmodule Ferricstore.Commands.HashTest do
     test "HEXPIRE on wrong type returns WRONGTYPE" do
       store = MockStore.make()
       store.compound_put.("mykey", "T:mykey", "set", 0)
-      assert {:error, "WRONGTYPE" <> _} = Hash.handle("HEXPIRE", ["mykey", "10", "FIELDS", "1", "f1"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               Hash.handle("HEXPIRE", ["mykey", "10", "FIELDS", "1", "f1"], store)
     end
   end
 
@@ -498,7 +504,9 @@ defmodule Ferricstore.Commands.HashTest do
     test "HTTL on wrong type returns WRONGTYPE" do
       store = MockStore.make()
       store.compound_put.("mykey", "T:mykey", "set", 0)
-      assert {:error, "WRONGTYPE" <> _} = Hash.handle("HTTL", ["mykey", "FIELDS", "1", "f1"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               Hash.handle("HTTL", ["mykey", "FIELDS", "1", "f1"], store)
     end
   end
 
@@ -535,7 +543,9 @@ defmodule Ferricstore.Commands.HashTest do
       store = MockStore.make()
       Hash.handle("HSET", ["hash", "f1", "v1", "f2", "v2", "f3", "v3"], store)
       Hash.handle("HEXPIRE", ["hash", "60", "FIELDS", "2", "f1", "f2"], store)
-      assert [1, 1, -1] == Hash.handle("HPERSIST", ["hash", "FIELDS", "3", "f1", "f2", "f3"], store)
+
+      assert [1, 1, -1] ==
+               Hash.handle("HPERSIST", ["hash", "FIELDS", "3", "f1", "f2", "f3"], store)
     end
 
     test "HPERSIST after removing expiry, HTTL returns -1" do
@@ -568,7 +578,9 @@ defmodule Ferricstore.Commands.HashTest do
     test "HPERSIST on wrong type returns WRONGTYPE" do
       store = MockStore.make()
       store.compound_put.("mykey", "T:mykey", "set", 0)
-      assert {:error, "WRONGTYPE" <> _} = Hash.handle("HPERSIST", ["mykey", "FIELDS", "1", "f1"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               Hash.handle("HPERSIST", ["mykey", "FIELDS", "1", "f1"], store)
     end
   end
 
@@ -595,6 +607,18 @@ defmodule Ferricstore.Commands.HashTest do
       compound_key = <<"H:hash", 0, "f1">>
       store.compound_put.("hash", compound_key, "v1", System.os_time(:millisecond) - 1)
       assert [-2] == Hash.handle("HTTL", ["hash", "FIELDS", "1", "f1"], store)
+    end
+
+    test "fully expired hash is no longer visible to TYPE or EXISTS" do
+      store = MockStore.make()
+      Hash.handle("HSET", ["hash", "f1", "v1"], store)
+      compound_key = <<"H:hash", 0, "f1">>
+      store.compound_put.("hash", compound_key, "v1", System.os_time(:millisecond) - 1)
+
+      assert nil == Hash.handle("HGET", ["hash", "f1"], store)
+      assert 0 == Hash.handle("HLEN", ["hash"], store)
+      assert {:simple, "none"} == Generic.handle("TYPE", ["hash"], store)
+      assert 0 == Strings.handle("EXISTS", ["hash"], store)
     end
 
     test "HEXPIRE then HEXPIRE overwrites the TTL" do
@@ -655,7 +679,11 @@ defmodule Ferricstore.Commands.HashTest do
       store = MockStore.make()
 
       for i <- 1..20 do
-        Hash.handle("HSET", ["hash", "field#{String.pad_leading(Integer.to_string(i), 2, "0")}", "val#{i}"], store)
+        Hash.handle(
+          "HSET",
+          ["hash", "field#{String.pad_leading(Integer.to_string(i), 2, "0")}", "val#{i}"],
+          store
+        )
       end
 
       [cursor, elements] = Hash.handle("HSCAN", ["hash", "0", "COUNT", "5"], store)
@@ -668,7 +696,11 @@ defmodule Ferricstore.Commands.HashTest do
       store = MockStore.make()
 
       for i <- 1..10 do
-        Hash.handle("HSET", ["hash", "f#{String.pad_leading(Integer.to_string(i), 2, "0")}", "v#{i}"], store)
+        Hash.handle(
+          "HSET",
+          ["hash", "f#{String.pad_leading(Integer.to_string(i), 2, "0")}", "v#{i}"],
+          store
+        )
       end
 
       # First batch: 3 elements
@@ -700,7 +732,9 @@ defmodule Ferricstore.Commands.HashTest do
         Hash.handle("HSET", ["hash", "beta_#{i}", "b#{i}"], store)
       end
 
-      [_cursor, elements] = Hash.handle("HSCAN", ["hash", "0", "MATCH", "alpha_*", "COUNT", "5"], store)
+      [_cursor, elements] =
+        Hash.handle("HSCAN", ["hash", "0", "MATCH", "alpha_*", "COUNT", "5"], store)
+
       # All matched fields should be alpha_*
       fields = elements |> Enum.chunk_every(2) |> Enum.map(fn [k, _v] -> k end)
       assert Enum.all?(fields, &String.starts_with?(&1, "alpha_"))
@@ -738,7 +772,11 @@ defmodule Ferricstore.Commands.HashTest do
 
     test "HSCAN full iteration collects all fields exactly once" do
       store = MockStore.make()
-      expected = for i <- 1..15, into: %{}, do: {"key#{String.pad_leading(Integer.to_string(i), 2, "0")}", "val#{i}"}
+
+      expected =
+        for i <- 1..15,
+            into: %{},
+            do: {"key#{String.pad_leading(Integer.to_string(i), 2, "0")}", "val#{i}"}
 
       for {k, v} <- expected do
         Hash.handle("HSET", ["hash", k, v], store)
@@ -1020,7 +1058,9 @@ defmodule Ferricstore.Commands.HashTest do
     test "HINCRBYFLOAT on a key used as zset returns WRONGTYPE" do
       store = MockStore.make()
       store.compound_put.("mykey", "T:mykey", "zset", 0)
-      assert {:error, "WRONGTYPE" <> _} = Hash.handle("HINCRBYFLOAT", ["mykey", "f", "1.0"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               Hash.handle("HINCRBYFLOAT", ["mykey", "f", "1.0"], store)
     end
   end
 
@@ -1061,7 +1101,9 @@ defmodule Ferricstore.Commands.HashTest do
 
     test "HSCAN with unknown option returns error" do
       store = MockStore.make()
-      assert {:error, "ERR syntax error"} = Hash.handle("HSCAN", ["hash", "0", "BOGUS", "val"], store)
+
+      assert {:error, "ERR syntax error"} =
+               Hash.handle("HSCAN", ["hash", "0", "BOGUS", "val"], store)
     end
   end
 
@@ -1069,7 +1111,9 @@ defmodule Ferricstore.Commands.HashTest do
     test "HRANDFIELD with invalid WITHVALUES string returns syntax error" do
       store = MockStore.make()
       Hash.handle("HSET", ["hash", "a", "1"], store)
-      assert {:error, "ERR syntax error"} = Hash.handle("HRANDFIELD", ["hash", "1", "BOGUS"], store)
+
+      assert {:error, "ERR syntax error"} =
+               Hash.handle("HRANDFIELD", ["hash", "1", "BOGUS"], store)
     end
 
     test "HRANDFIELD with negative count on empty hash returns empty list" do
@@ -1084,7 +1128,9 @@ defmodule Ferricstore.Commands.HashTest do
   end
 
   defp collect_hscan_fields(store, key, cursor, count, acc) do
-    [next_cursor, elements] = Hash.handle("HSCAN", [key, cursor, "COUNT", Integer.to_string(count)], store)
+    [next_cursor, elements] =
+      Hash.handle("HSCAN", [key, cursor, "COUNT", Integer.to_string(count)], store)
+
     pairs = elements |> Enum.chunk_every(2) |> Enum.map(fn [k, v] -> {k, v} end)
     new_acc = acc ++ pairs
 

@@ -5,6 +5,7 @@ defmodule Ferricstore.Commands.Strings do
   alias Ferricstore.CrossShardOp
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.TypeRegistry
 
   @moduledoc """
   Handles Redis string commands.
@@ -119,10 +120,7 @@ defmodule Ferricstore.Commands.Strings do
       # (lists, hashes, sets, zsets) that don't use the plain key store.
       exists =
         exists or
-          (Ops.has_compound?(store) and
-             (Ops.compound_get(store, key, Ferricstore.Store.CompoundKey.type_key(key)) != nil or
-                Ops.compound_get(store, key, Ferricstore.Store.CompoundKey.list_meta_key(key)) !=
-                  nil))
+          (Ops.has_compound?(store) and TypeRegistry.get_type(key, store) != "none")
 
       if exists, do: acc + 1, else: acc
     end)
