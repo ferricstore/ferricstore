@@ -1096,7 +1096,7 @@ defmodule Ferricstore.Raft.StateMachine do
         }
       else
         {file_id, file_path, shard_data_path} =
-          Ferricstore.Store.ActiveFile.get(shard_idx)
+          Ferricstore.Store.ActiveFile.get(instance_ctx, shard_idx)
 
         keydir =
           if instance_ctx do
@@ -2395,7 +2395,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # when the init-time path still exists. Falls back to ra state for isolated
   # tests/recovery where the registry has not been published yet.
   defp resolve_active_file(state) do
-    case live_active_file(state.shard_index) do
+    case live_active_file(state) do
       {file_path, file_id} ->
         {file_path, file_id}
 
@@ -2408,10 +2408,10 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp live_active_file(shard_index) do
+  defp live_active_file(state) do
     try do
       {file_id, file_path, _data_path} =
-        Ferricstore.Store.ActiveFile.get(shard_index)
+        Ferricstore.Store.ActiveFile.get(state.instance_ctx, state.shard_index)
 
       if File.exists?(file_path) do
         {file_path, file_id}

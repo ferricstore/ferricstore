@@ -28,9 +28,11 @@ defmodule Ferricstore.Store.Shard.Flush do
 
   def flush_pending(%{pending: pending} = state) do
     raw_batch = Enum.reverse(pending)
-    batch = Enum.map(raw_batch, fn {key, value, exp} ->
-      {key, ShardETS.to_disk_binary(value), exp}
-    end)
+
+    batch =
+      Enum.map(raw_batch, fn {key, value, exp} ->
+        {key, ShardETS.to_disk_binary(value), exp}
+      end)
 
     state = maybe_rotate_file(state)
 
@@ -42,16 +44,27 @@ defmodule Ferricstore.Store.Shard.Flush do
         if state.instance_ctx do
           :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 1)
         end
+
         written = total_written(locations)
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)
-        state = %{state | pending: [], pending_count: 0,
-          active_file_size: state.active_file_size + written}
+
+        state = %{
+          state
+          | pending: [],
+            pending_count: 0,
+            active_file_size: state.active_file_size + written
+        }
+
         maybe_notify_fragmentation(state)
 
       {:error, reason} ->
         Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.index)
-        Logger.error("Shard #{state.index}: flush_pending (nosync) failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries")
+
+        Logger.error(
+          "Shard #{state.index}: flush_pending (nosync) failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries"
+        )
+
         state
     end
   end
@@ -78,9 +91,11 @@ defmodule Ferricstore.Store.Shard.Flush do
 
   def flush_pending_sync(%{pending: pending} = state) do
     raw_batch = Enum.reverse(pending)
-    batch = Enum.map(raw_batch, fn {key, value, exp} ->
-      {key, ShardETS.to_disk_binary(value), exp}
-    end)
+
+    batch =
+      Enum.map(raw_batch, fn {key, value, exp} ->
+        {key, ShardETS.to_disk_binary(value), exp}
+      end)
 
     state = maybe_rotate_file(state)
 
@@ -92,16 +107,27 @@ defmodule Ferricstore.Store.Shard.Flush do
         if state.instance_ctx do
           :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 0)
         end
+
         written = total_written(locations)
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)
-        state = %{state | pending: [], pending_count: 0,
-          active_file_size: state.active_file_size + written}
+
+        state = %{
+          state
+          | pending: [],
+            pending_count: 0,
+            active_file_size: state.active_file_size + written
+        }
+
         maybe_notify_fragmentation(state)
 
       {:error, reason} ->
         Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.index)
-        Logger.error("Shard #{state.index}: flush_pending_sync failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries")
+
+        Logger.error(
+          "Shard #{state.index}: flush_pending_sync failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries"
+        )
+
         state
     end
   end
@@ -153,7 +179,9 @@ defmodule Ferricstore.Store.Shard.Flush do
   # ETS location updates after flush
   # -------------------------------------------------------------------
 
-  @spec update_ets_locations(map(), [{binary(), binary(), non_neg_integer()}], [{non_neg_integer(), non_neg_integer()}]) :: map()
+  @spec update_ets_locations(map(), [{binary(), binary(), non_neg_integer()}], [
+          {non_neg_integer(), non_neg_integer()}
+        ]) :: map()
   @doc false
   def update_ets_locations(state, batch, locations) do
     fid = state.active_file_id
@@ -216,7 +244,11 @@ defmodule Ferricstore.Store.Shard.Flush do
       [{^key, _v, _exp, _lfu, old_fid, _off, old_vsize}] when old_fid != 0 and old_vsize > 0 ->
         dead_increment = old_vsize + @record_header_size + byte_size(key)
         {old_total, old_dead} = Map.get(state.file_stats, old_fid, {0, 0})
-        %{state | file_stats: Map.put(state.file_stats, old_fid, {old_total, old_dead + dead_increment})}
+
+        %{
+          state
+          | file_stats: Map.put(state.file_stats, old_fid, {old_total, old_dead + dead_increment})
+        }
 
       _ ->
         state
@@ -267,7 +299,9 @@ defmodule Ferricstore.Store.Shard.Flush do
 
   # Compute per-file dead bytes stats from disk file sizes + ETS live data.
   # Called once during init after recover_keydir. O(file_count + key_count).
-  @spec compute_file_stats(binary(), :ets.tid()) :: %{non_neg_integer() => {non_neg_integer(), non_neg_integer()}}
+  @spec compute_file_stats(binary(), :ets.tid()) :: %{
+          non_neg_integer() => {non_neg_integer(), non_neg_integer()}
+        }
   @doc false
   def compute_file_stats(shard_path, keydir) do
     case Ferricstore.FS.ls(shard_path) do
@@ -332,10 +366,15 @@ defmodule Ferricstore.Store.Shard.Flush do
       #    next tick would target the NEW file and the OLD file's
       #    tail could be lost on kernel panic.
       case Ferricstore.Bitcask.NIF.v2_fsync(state.active_file_path) do
-        :ok -> :ok
+        :ok ->
+          :ok
+
         {:error, reason} ->
           require Logger
-          Logger.warning("Shard #{state.index}: rotation fsync of old active file failed: #{inspect(reason)}")
+
+          Logger.warning(
+            "Shard #{state.index}: rotation fsync of old active file failed: #{inspect(reason)}"
+          )
       end
 
       :telemetry.execute(
@@ -356,7 +395,9 @@ defmodule Ferricstore.Store.Shard.Flush do
       #    absent on reboot — the next append would create a fresh
       #    one but we'd lose any bytes already buffered in page cache.
       case Ferricstore.Bitcask.NIF.v2_fsync_dir(sp) do
-        :ok -> :ok
+        :ok ->
+          :ok
+
         {:error, reason} ->
           require Logger
           Logger.warning("Shard #{state.index}: rotation fsync_dir failed: #{inspect(reason)}")
@@ -368,7 +409,7 @@ defmodule Ferricstore.Store.Shard.Flush do
         %{shard_index: state.index, kind: :new_dir, path: sp}
       )
 
-      Ferricstore.Store.ActiveFile.publish(state.index, new_id, new_path, sp)
+      Ferricstore.Store.ActiveFile.publish(state.instance_ctx, state.index, new_id, new_path, sp)
 
       # Initialize file_stats for the new file
       new_file_stats = Map.put(state.file_stats, new_id, {0, 0})
@@ -385,8 +426,13 @@ defmodule Ferricstore.Store.Shard.Flush do
         :exit, _ -> :ok
       end
 
-      %{state | active_file_id: new_id, active_file_path: new_path, active_file_size: 0,
-        file_stats: new_file_stats}
+      %{
+        state
+        | active_file_id: new_id,
+          active_file_path: new_path,
+          active_file_size: 0,
+          file_stats: new_file_stats
+      }
     else
       state
     end

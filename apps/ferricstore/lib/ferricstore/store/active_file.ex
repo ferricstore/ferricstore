@@ -10,10 +10,10 @@ defmodule Ferricstore.Store.ActiveFile do
   ## Usage
 
       # In Shard init and rotation:
-      ActiveFile.publish(shard_index, file_id, file_path, shard_data_path)
+      ActiveFile.publish(instance_ctx, shard_index, file_id, file_path, shard_data_path)
 
       # In Router's async write path (hot path):
-      {file_id, file_path, shard_data_path} = ActiveFile.get(shard_index)
+      {file_id, file_path, shard_data_path} = ActiveFile.get(instance_ctx, shard_index)
   """
 
   @table :ferricstore_active_files
@@ -43,7 +43,20 @@ defmodule Ferricstore.Store.ActiveFile do
   """
   @spec publish(non_neg_integer(), non_neg_integer(), binary(), binary()) :: :ok
   def publish(shard_index, file_id, file_path, shard_data_path) do
-    :ets.insert(@table, {shard_index, file_id, file_path, shard_data_path})
+    publish(nil, shard_index, file_id, file_path, shard_data_path)
+  end
+
+  @doc """
+  Publishes active file metadata for a shard in a specific instance.
+
+  The default instance keeps the historical shard-index key for backward
+  compatibility. Custom instances use `{instance_name, shard_index}` so
+  isolated tests and embedded instances cannot overwrite each other.
+  """
+  @spec publish(map() | nil, non_neg_integer(), non_neg_integer(), binary(), binary()) :: :ok
+  def publish(ctx, shard_index, file_id, file_path, shard_data_path) do
+    table_key = table_key(ctx, shard_index)
+    :ets.insert(@table, {table_key, file_id, file_path, shard_data_path})
     ref = :persistent_term.get(@atomics_key)
     :atomics.add(ref, 1, 1)
     :ok
@@ -57,19 +70,38 @@ defmodule Ferricstore.Store.ActiveFile do
   """
   @spec get(non_neg_integer()) :: {non_neg_integer(), binary(), binary()}
   def get(shard_index) do
+    get(nil, shard_index)
+  end
+
+  @doc """
+  Returns active file metadata for a shard in a specific instance.
+
+  Prefer this in production paths that already have an Instance context.
+  """
+  @spec get(map() | nil, non_neg_integer()) :: {non_neg_integer(), binary(), binary()}
+  def get(ctx, shard_index) do
     ref = :persistent_term.get(@atomics_key)
     current_gen = :atomics.get(ref, 1)
+    table_key = table_key(ctx, shard_index)
 
-    case Process.get({:active_file_cache, shard_index}) do
+    case Process.get({:active_file_cache, table_key}) do
       {^current_gen, file_id, file_path, shard_data_path} ->
         {file_id, file_path, shard_data_path}
 
       _ ->
-        [{^shard_index, file_id, file_path, shard_data_path}] =
-          :ets.lookup(@table, shard_index)
+        [{^table_key, file_id, file_path, shard_data_path}] =
+          :ets.lookup(@table, table_key)
 
-        Process.put({:active_file_cache, shard_index}, {current_gen, file_id, file_path, shard_data_path})
+        Process.put(
+          {:active_file_cache, table_key},
+          {current_gen, file_id, file_path, shard_data_path}
+        )
+
         {file_id, file_path, shard_data_path}
     end
   end
+
+  defp table_key(nil, shard_index), do: shard_index
+  defp table_key(%{name: :default}, shard_index), do: shard_index
+  defp table_key(%{name: name}, shard_index), do: {name, shard_index}
 end

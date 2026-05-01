@@ -232,7 +232,7 @@ defmodule Ferricstore.Store.Shard do
     ShardLifecycle.migrate_prob_files(path, keydir, index)
 
     # Publish active file metadata to ActiveFile registry
-    Ferricstore.Store.ActiveFile.publish(index, active_file_id, active_file_path, path)
+    Ferricstore.Store.ActiveFile.publish(ctx, index, active_file_id, active_file_path, path)
 
     # Compute per-file dead bytes stats from disk sizes + ETS live data.
     file_stats = compute_file_stats(path, keydir)

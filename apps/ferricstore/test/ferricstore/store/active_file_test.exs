@@ -44,7 +44,9 @@ defmodule Ferricstore.Store.ActiveFileTest do
       end
     end
 
-    test "publish/4 updates the value returned by get/1", %{orig_af: {_orig_fid, _, orig_data_path}} do
+    test "publish/4 updates the value returned by get/1", %{
+      orig_af: {_orig_fid, _, orig_data_path}
+    } do
       new_path = Path.join(orig_data_path, "99_999.log")
       ActiveFile.publish(0, 99_999, new_path, orig_data_path)
 
@@ -78,6 +80,34 @@ defmodule Ferricstore.Store.ActiveFileTest do
 
       assert fid == 77_777
       assert path == new_path
+    end
+
+    test "custom instance active file does not overwrite default shard entry",
+         %{orig_af: orig_af} do
+      dir =
+        Path.join(System.tmp_dir!(), "active_file_scope_#{System.unique_integer([:positive])}")
+
+      data_path = Path.join(dir, "data/shard_0")
+      file_path = Path.join(data_path, "00000.log")
+      File.mkdir_p!(data_path)
+      File.touch!(file_path)
+
+      ctx =
+        FerricStore.Instance.build(:active_file_scope_test,
+          data_dir: dir,
+          shard_count: 1,
+          raft_enabled: false
+        )
+
+      on_exit(fn ->
+        FerricStore.Instance.cleanup(ctx.name)
+        File.rm_rf(dir)
+      end)
+
+      ActiveFile.publish(ctx, 0, 123, file_path, data_path)
+
+      assert ActiveFile.get(0) == orig_af
+      assert ActiveFile.get(ctx, 0) == {123, file_path, data_path}
     end
   end
 

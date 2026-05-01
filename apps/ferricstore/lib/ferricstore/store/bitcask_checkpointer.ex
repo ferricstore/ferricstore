@@ -79,9 +79,10 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   def init(opts) do
     index = Keyword.fetch!(opts, :index)
     ctx = Keyword.get(opts, :instance_ctx)
+
     interval_ms =
-      Keyword.get(opts, :checkpoint_interval_ms)
-      || Application.get_env(:ferricstore, :checkpoint_interval_ms, @default_interval_ms)
+      Keyword.get(opts, :checkpoint_interval_ms) ||
+        Application.get_env(:ferricstore, :checkpoint_interval_ms, @default_interval_ms)
 
     # Trap exits so `terminate/2` runs on graceful shutdown and we can
     # synchronously fsync the active file before the supervisor returns.
@@ -113,7 +114,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
 
     result =
       if dirty? do
-        case ActiveFile.get(state.index) do
+        case ActiveFile.get(ctx, state.index) do
           {_fid, active_path, _sp} ->
             r = NIF.v2_fsync(active_path)
             if r == :ok, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 0)
@@ -190,9 +191,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
         %{status: :error, reason: reason}
       )
 
-      Logger.error(
-        "BitcaskCheckpointer shard=#{state.index}: fsync failed: #{inspect(reason)}"
-      )
+      Logger.error("BitcaskCheckpointer shard=#{state.index}: fsync failed: #{inspect(reason)}")
     end
 
     {:noreply, %{state | in_flight?: false, current_corr_id: nil}}
@@ -217,7 +216,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
     flag_idx = state.index + 1
 
     reply =
-      case ActiveFile.get(state.index) do
+      case ActiveFile.get(ctx, state.index) do
         {_fid, active_path, _sp} ->
           if ctx, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 0)
 
@@ -227,7 +226,11 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
 
             {:error, reason} = err ->
               if ctx, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 1)
-              Logger.error("BitcaskCheckpointer shard=#{state.index}: sync_now failed: #{inspect(reason)}")
+
+              Logger.error(
+                "BitcaskCheckpointer shard=#{state.index}: sync_now failed: #{inspect(reason)}"
+              )
+
               err
           end
       end
@@ -253,7 +256,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
     if :atomics.get(state.instance_ctx.checkpoint_flags, flag_idx) == 1 do
       :atomics.put(state.instance_ctx.checkpoint_flags, flag_idx, 0)
 
-      case ActiveFile.get(state.index) do
+      case ActiveFile.get(state.instance_ctx, state.index) do
         {_fid, active_path, _sp} ->
           corr_id = state.next_corr_id
           NIF.v2_fsync_async(self(), corr_id, active_path)

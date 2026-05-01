@@ -322,7 +322,7 @@ defmodule Ferricstore.Store.Router do
       track_keydir_binary_delete(ctx, idx, keydir, key)
       :ets.delete(keydir, key)
 
-      {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+      {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
       Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
 
       wv_size = :counters.info(ctx.write_version).size
@@ -558,6 +558,7 @@ defmodule Ferricstore.Store.Router do
       end
 
     new_val = old_val <> suffix
+
     install_rmw_and_submit(
       ctx,
       idx,
@@ -590,7 +591,7 @@ defmodule Ferricstore.Store.Router do
         track_keydir_binary_delete(ctx, idx, keydir, key)
         :ets.delete(keydir, key)
 
-        {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+        {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
         Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
 
         wv_size = :counters.info(ctx.write_version).size
@@ -627,6 +628,7 @@ defmodule Ferricstore.Store.Router do
       end
 
     new_val = apply_setrange(old_val, offset, value)
+
     install_rmw_and_submit(
       ctx,
       idx,
@@ -710,7 +712,7 @@ defmodule Ferricstore.Store.Router do
     result =
       if value_for_ets == nil do
         # Large — sync NIF write then ETS with real offset.
-        case nif_append_batch_with_file(idx, [{key, disk_value, expire_at_ms}]) do
+        case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
           {:ok, file_id, [{offset, _record_size}]} ->
             :ets.insert(
               keydir,
@@ -723,7 +725,7 @@ defmodule Ferricstore.Store.Router do
             {:error, "ERR disk write failed: #{inspect(reason)}"}
         end
       else
-        {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+        {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
         :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
 
         Ferricstore.Store.BitcaskWriter.write(
@@ -824,7 +826,7 @@ defmodule Ferricstore.Store.Router do
       # Large value: sync NIF write to get offset, then ETS with real location.
       # Cannot use async BitcaskWriter because ETS value is nil (too large for
       # hot cache) and readers would see nil until the async write completes.
-      case nif_append_batch_with_file(idx, [{key, disk_value, expire_at_ms}]) do
+      case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
         {:ok, file_id, [{offset, _record_size}]} ->
           :ets.insert(
             keydir,
@@ -856,8 +858,8 @@ defmodule Ferricstore.Store.Router do
 
   # NIF batch write with retry on stale active file (ENOENT after rotation).
   # Returns {:ok, file_id, locations} or {:error, reason}.
-  defp nif_append_batch_with_file(idx, batch) do
-    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+  defp nif_append_batch_with_file(ctx, idx, batch) do
+    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
 
     case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, batch) do
       {:ok, locations} ->
@@ -865,7 +867,7 @@ defmodule Ferricstore.Store.Router do
 
       {:error, reason} when is_binary(reason) ->
         if String.contains?(reason, "No such file") do
-          {fresh_id, fresh_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+          {fresh_id, fresh_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
 
           case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(fresh_path, batch) do
             {:ok, locations} -> {:ok, fresh_id, locations}
@@ -1482,7 +1484,7 @@ defmodule Ferricstore.Store.Router do
         else
           reversed = Enum.reverse(large_disk_batch)
 
-          case nif_append_batch_with_file(idx, reversed) do
+          case nif_append_batch_with_file(ctx, idx, reversed) do
             {:ok, file_id, locations} ->
               shard_locations =
                 Enum.zip(reversed, locations)
@@ -2407,7 +2409,7 @@ defmodule Ferricstore.Store.Router do
   # carries the raw command, replicas apply against their own active file.
   defp build_origin_compound_store(ctx, idx) do
     keydir = elem(ctx.keydir_refs, idx)
-    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
 
     %{
       compound_get: fn _redis_key, compound_key ->
@@ -2525,7 +2527,7 @@ defmodule Ferricstore.Store.Router do
       track_keydir_binary_delete(ctx, idx, keydir, compound_key)
       :ets.delete(keydir, compound_key)
 
-      {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+      {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
       Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, compound_key)
 
       wv_size = :counters.info(ctx.write_version).size
