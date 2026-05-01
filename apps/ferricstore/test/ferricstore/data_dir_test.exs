@@ -19,4 +19,14 @@ defmodule Ferricstore.DataDirTest do
       File.rm_rf!(root)
     end
   end
+
+  test "root_from_shard_path accepts only canonical data shard paths" do
+    root = Path.join(System.tmp_dir!(), "data_dir_root_#{System.unique_integer([:positive])}")
+
+    assert DataDir.root_from_shard_path(Path.join([root, "data", "shard_2"])) == root
+
+    assert_raise ArgumentError, ~r/canonical/, fn ->
+      DataDir.root_from_shard_path(Path.join(root, "shard_2"))
+    end
+  end
 end
