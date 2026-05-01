@@ -174,17 +174,7 @@ defmodule Ferricstore.Commands.Expiry do
   # ---------------------------------------------------------------------------
 
   defp delete_if_exists(key, store) do
-    case key_meta(key, store) do
-      nil ->
-        0
-
-      {:plain, _value, _expire_at_ms} ->
-        Ops.delete(store, key)
-        1
-
-      {:compound, _type, _expire_at_ms} ->
-        Ferricstore.Commands.Strings.handle("DEL", [key], store)
-    end
+    Ferricstore.Commands.Strings.handle("DEL", [key], store)
   end
 
   defp apply_expiry(key, expire_at_ms, flag, store) do

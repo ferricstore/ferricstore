@@ -25,6 +25,13 @@ defmodule Ferricstore.Commands.ExpiryTest do
       assert store.get.("k") == nil
     end
 
+    test "EXPIRE immediate delete does not load a cold plain value" do
+      store = metadata_delete_store("cold_plain")
+
+      assert 1 == Expiry.handle("EXPIRE", ["cold_plain", "0"], store)
+      assert metadata_delete_seen?(store)
+    end
+
     test "EXPIRE with non-integer returns error" do
       store = MockStore.make(%{"k" => {"v", 0}})
       assert {:error, _} = Expiry.handle("EXPIRE", ["k", "abc"], store)
@@ -49,6 +56,13 @@ defmodule Ferricstore.Commands.ExpiryTest do
       store = MockStore.make(%{"k" => {"v", 0}})
       assert 1 == Expiry.handle("PEXPIRE", ["k", "-1"], store)
       assert store.get.("k") == nil
+    end
+
+    test "PEXPIRE immediate delete does not load a cold plain value" do
+      store = metadata_delete_store("cold_plain")
+
+      assert 1 == Expiry.handle("PEXPIRE", ["cold_plain", "-1"], store)
+      assert metadata_delete_seen?(store)
     end
 
     test "PEXPIRE missing key returns 0" do
@@ -286,9 +300,45 @@ defmodule Ferricstore.Commands.ExpiryTest do
       assert -2 == Expiry.handle("TTL", ["k"], store)
     end
 
+    test "EXPIREAT immediate delete does not load a cold plain value" do
+      store = metadata_delete_store("cold_plain")
+
+      assert 1 == Expiry.handle("EXPIREAT", ["cold_plain", "1"], store)
+      assert metadata_delete_seen?(store)
+    end
+
     test "EXPIREAT with non-integer returns error" do
       store = MockStore.make(%{"k" => {"v", 0}})
       assert {:error, _} = Expiry.handle("EXPIREAT", ["k", "abc"], store)
     end
   end
+
+  describe "PEXPIREAT edge cases" do
+    test "PEXPIREAT immediate delete does not load a cold plain value" do
+      store = metadata_delete_store("cold_plain")
+
+      assert 1 == Expiry.handle("PEXPIREAT", ["cold_plain", "1"], store)
+      assert metadata_delete_seen?(store)
+    end
+  end
+
+  defp metadata_delete_store(key) do
+    {:ok, pid} = Agent.start_link(fn -> false end)
+
+    %{
+      pid: pid,
+      get: fn _key -> flunk("immediate expiry delete should not load the value") end,
+      get_meta: fn _key -> flunk("immediate expiry delete should not load value metadata") end,
+      exists?: fn ^key -> true end,
+      delete: fn ^key ->
+        Agent.update(pid, fn _ -> true end)
+        :ok
+      end,
+      compound_get: fn _redis_key, _compound_key -> nil end,
+      compound_scan: fn _redis_key, _prefix -> [] end,
+      prob_write: fn _command -> :ok end
+    }
+  end
+
+  defp metadata_delete_seen?(%{pid: pid}), do: Agent.get(pid, & &1)
 end
