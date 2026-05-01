@@ -112,6 +112,7 @@ defmodule Ferricstore.Store.ListOps do
 
   defp write_meta(key, store, {_len, _left, _right} = meta) do
     Ops.compound_put(store, key, CompoundKey.list_meta_key(key), :erlang.term_to_binary(meta), 0)
+    |> write_result()
   end
 
   defp delete_meta(key, store) do
@@ -177,16 +178,19 @@ defmodule Ferricstore.Store.ListOps do
     count = length(reversed)
 
     # reversed=[c,b,a]. Assign: c at left_pos-(count-1)*step, b at left_pos-(count-2)*step, a at left_pos
-    Enum.with_index(reversed)
-    |> Enum.each(fn {elem, idx} ->
-      pos = left_pos - (count - 1 - idx) * @position_step
-      Ops.compound_put(store, key, CompoundKey.list_element(key, pos), elem, 0)
-    end)
-
     new_left = left_pos - (count - 1) * @position_step - @position_step
     new_len = len + length(new_elements)
-    write_meta(key, store, {new_len, new_left, right_pos})
-    new_len
+
+    writes =
+      Enum.map(Enum.with_index(reversed), fn {elem, idx} ->
+        pos = left_pos - (count - 1 - idx) * @position_step
+        {pos, elem}
+      end)
+
+    with :ok <- put_elements(key, store, writes),
+         :ok <- write_meta(key, store, {new_len, new_left, right_pos}) do
+      new_len
+    end
   end
 
   # RPUSH
@@ -194,15 +198,19 @@ defmodule Ferricstore.Store.ListOps do
     do: do_rpush_new(key, store, new_elements)
 
   defp do_execute(key, store, {len, left_pos, right_pos}, {:rpush, new_elements}) do
-    {new_right, _} =
-      Enum.reduce(new_elements, {right_pos, 0}, fn elem, {pos, idx} ->
-        Ops.compound_put(store, key, CompoundKey.list_element(key, pos), elem, 0)
-        {pos + @position_step, idx + 1}
+    writes =
+      Enum.map(Enum.with_index(new_elements), fn {elem, idx} ->
+        {right_pos + idx * @position_step, elem}
       end)
 
+    new_right = right_pos + length(new_elements) * @position_step
+
     new_len = len + length(new_elements)
-    write_meta(key, store, {new_len, left_pos, new_right})
-    new_len
+
+    with :ok <- put_elements(key, store, writes),
+         :ok <- write_meta(key, store, {new_len, left_pos, new_right}) do
+      new_len
+    end
   end
 
   # LPOP
@@ -494,35 +502,63 @@ defmodule Ferricstore.Store.ListOps do
     count = length(reversed)
     # reversed=[c,b,a] for LPUSH key a b c. c should be leftmost (smallest pos).
     # Assign: c at -(count-1)*step, b at -(count-2)*step, ..., a at 0.0
-    Enum.with_index(reversed)
-    |> Enum.each(fn {elem, idx} ->
-      pos = @initial_position - (count - 1 - idx) * @position_step
-      Ops.compound_put(store, key, CompoundKey.list_element(key, pos), elem, 0)
-    end)
+    writes =
+      Enum.map(Enum.with_index(reversed), fn {elem, idx} ->
+        pos = @initial_position - (count - 1 - idx) * @position_step
+        {pos, elem}
+      end)
 
     min_a = @initial_position - (count - 1) * @position_step
-    write_meta(key, store, {count, min_a - @position_step, @initial_position + @position_step})
-    count
+
+    with :ok <- put_elements(key, store, writes),
+         :ok <-
+           write_meta(
+             key,
+             store,
+             {count, min_a - @position_step, @initial_position + @position_step}
+           ) do
+      count
+    end
   end
 
   defp do_rpush_new(key, store, elements) do
     count = length(elements)
 
-    Enum.with_index(elements)
-    |> Enum.each(fn {elem, idx} ->
-      Ops.compound_put(
-        store,
-        key,
-        CompoundKey.list_element(key, @initial_position + idx * @position_step),
-        elem,
-        0
-      )
-    end)
+    writes =
+      Enum.map(Enum.with_index(elements), fn {elem, idx} ->
+        {@initial_position + idx * @position_step, elem}
+      end)
 
     max_a = @initial_position + (count - 1) * @position_step
-    write_meta(key, store, {count, @initial_position - @position_step, max_a + @position_step})
-    count
+
+    with :ok <- put_elements(key, store, writes),
+         :ok <-
+           write_meta(
+             key,
+             store,
+             {count, @initial_position - @position_step, max_a + @position_step}
+           ) do
+      count
+    end
   end
+
+  defp put_elements(key, store, writes) do
+    Enum.reduce_while(writes, :ok, fn {pos, elem}, :ok ->
+      result =
+        store
+        |> Ops.compound_put(key, CompoundKey.list_element(key, pos), elem, 0)
+        |> write_result()
+
+      case result do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp write_result(:ok), do: :ok
+  defp write_result(true), do: :ok
+  defp write_result({:error, _} = error), do: error
 
   defp normalize_index(index, len) when index < 0, do: max(0, len + index)
   defp normalize_index(index, _len), do: index

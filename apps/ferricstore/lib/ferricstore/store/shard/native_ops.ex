@@ -528,11 +528,15 @@ defmodule Ferricstore.Store.Shard.NativeOps do
               byte_size(value)
             )
 
-          _ ->
-            ShardETS.ets_insert(state, compound_key, value, expire_at_ms)
-        end
+            :ok
 
-        :ok
+          {:error, reason} ->
+            Logger.error(
+              "Shard #{state.index}: append failed for list compound_put: #{inspect(reason)}"
+            )
+
+            {:error, reason}
+        end
       end,
       compound_delete: fn _redis_key, compound_key ->
         case NIF.v2_append_tombstone(state.active_file_path, compound_key) do
