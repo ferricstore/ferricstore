@@ -58,6 +58,7 @@ defmodule Ferricstore.Store.Ops do
   def put(%LocalTxStore{} = tx, key, value, exp) do
     if local?(tx, key) do
       ShardETS.ets_insert(tx.shard_state, key, value, exp)
+      tx_put_pending(key, value, exp)
       tx_undelete(key)
       send(self(), {:tx_pending_write, key, value, exp})
       :ok
@@ -95,6 +96,7 @@ defmodule Ferricstore.Store.Ops do
   def delete(%LocalTxStore{} = tx, key) do
     if local?(tx, key) do
       ShardETS.ets_delete_key(tx.shard_state, key)
+      tx_drop_pending(key)
       tx_mark_deleted(key)
       send(self(), {:tx_pending_delete, key})
       :ok
@@ -159,6 +161,7 @@ defmodule Ferricstore.Store.Ops do
           case checked_integer_add(0, delta) do
             {:ok, new_val} ->
               ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
+              tx_put_pending(key, new_val, 0)
               send(self(), {:tx_pending_write, key, new_val, 0})
               {:ok, new_val}
 
@@ -172,6 +175,7 @@ defmodule Ferricstore.Store.Ops do
               case checked_integer_add(int_val, delta) do
                 {:ok, new_val} ->
                   ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
+                  tx_put_pending(key, new_val, 0)
                   send(self(), {:tx_pending_write, key, new_val, 0})
                   {:ok, new_val}
 
@@ -212,6 +216,7 @@ defmodule Ferricstore.Store.Ops do
         nil ->
           new_val = delta * 1.0
           ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
+          tx_put_pending(key, new_val, 0)
           send(self(), {:tx_pending_write, key, new_val, 0})
           {:ok, new_val}
 
@@ -220,6 +225,7 @@ defmodule Ferricstore.Store.Ops do
             {:ok, float_val} ->
               new_val = float_val + delta
               ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
+              tx_put_pending(key, new_val, 0)
               send(self(), {:tx_pending_write, key, new_val, 0})
               {:ok, new_val}
 
@@ -242,23 +248,14 @@ defmodule Ferricstore.Store.Ops do
   def append(%LocalTxStore{} = tx, key, suffix) do
     if local?(tx, key) do
       current =
-        case ShardETS.ets_lookup_warm(tx.shard_state, key) do
-          {:hit, value, _exp} ->
-            ShardETS.to_disk_binary(value)
-
-          :expired ->
-            ""
-
-          :miss ->
-            case ShardReads.v2_local_read(tx.shard_state, key) do
-              {:ok, nil} -> ""
-              {:ok, v} -> v
-              _ -> ""
-            end
+        case local_read_value_for_rmw(tx, key) do
+          nil -> ""
+          value -> ShardETS.to_disk_binary(value)
         end
 
       new_val = current <> suffix
       ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
+      tx_put_pending(key, new_val, 0)
       send(self(), {:tx_pending_write, key, new_val, 0})
       {:ok, byte_size(new_val)}
     else
@@ -275,6 +272,7 @@ defmodule Ferricstore.Store.Ops do
     if local?(tx, key) do
       old = local_read_value_for_rmw(tx, key)
       ShardETS.ets_insert(tx.shard_state, key, new_value, 0)
+      tx_put_pending(key, new_value, 0)
       send(self(), {:tx_pending_write, key, new_value, 0})
       old
     else
@@ -293,6 +291,8 @@ defmodule Ferricstore.Store.Ops do
 
       if old do
         ShardETS.ets_delete_key(tx.shard_state, key)
+        tx_drop_pending(key)
+        tx_mark_deleted(key)
         send(self(), {:tx_pending_delete, key})
       end
 
@@ -313,6 +313,7 @@ defmodule Ferricstore.Store.Ops do
 
       if value do
         ShardETS.ets_insert(tx.shard_state, key, value, expire_at_ms)
+        tx_put_pending(key, value, expire_at_ms)
         send(self(), {:tx_pending_write, key, value, expire_at_ms})
       end
 
@@ -331,23 +332,14 @@ defmodule Ferricstore.Store.Ops do
   def setrange(%LocalTxStore{} = tx, key, offset, value) do
     if local?(tx, key) do
       old =
-        case ShardETS.ets_lookup_warm(tx.shard_state, key) do
-          {:hit, v, _exp} ->
-            ShardETS.to_disk_binary(v)
-
-          :expired ->
-            ""
-
-          :miss ->
-            case ShardReads.v2_local_read(tx.shard_state, key) do
-              {:ok, nil} -> ""
-              {:ok, v} -> v
-              _ -> ""
-            end
+        case local_read_value_for_rmw(tx, key) do
+          nil -> ""
+          v -> ShardETS.to_disk_binary(v)
         end
 
       new_val = ShardWrites.apply_setrange(old, offset, value)
       ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
+      tx_put_pending(key, new_val, 0)
       send(self(), {:tx_pending_write, key, new_val, 0})
       {:ok, byte_size(new_val)}
     else
@@ -463,6 +455,8 @@ defmodule Ferricstore.Store.Ops do
   def compound_put(%LocalTxStore{} = tx, redis_key, compound_key, value, expire_at_ms) do
     if local?(tx, redis_key) do
       ShardETS.ets_insert(tx.shard_state, compound_key, value, expire_at_ms)
+      tx_put_pending(compound_key, value, expire_at_ms)
+      tx_undelete(compound_key)
       send(self(), {:tx_pending_write, compound_key, value, expire_at_ms})
       :ok
     else
@@ -481,6 +475,8 @@ defmodule Ferricstore.Store.Ops do
   def compound_delete(%LocalTxStore{} = tx, redis_key, compound_key) do
     if local?(tx, redis_key) do
       ShardETS.ets_delete_key(tx.shard_state, compound_key)
+      tx_drop_pending(compound_key)
+      tx_mark_deleted(compound_key)
       send(self(), {:tx_pending_delete, compound_key})
       :ok
     else
@@ -500,7 +496,10 @@ defmodule Ferricstore.Store.Ops do
     if local?(tx, redis_key) do
       shard_data_path = promoted_path(tx, redis_key) || tx.shard_state.shard_data_path
       results = ShardETS.prefix_scan_entries(tx.shard_state.keydir, prefix, shard_data_path)
-      Enum.sort_by(results, fn {field, _} -> field end)
+
+      results
+      |> merge_tx_pending_prefix(prefix)
+      |> Enum.sort_by(fn {field, _} -> field end)
     else
       shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
       GenServer.call(shard, {:compound_scan, redis_key, prefix})
@@ -536,6 +535,8 @@ defmodule Ferricstore.Store.Ops do
 
       Enum.each(keys_to_delete, fn key ->
         ShardETS.ets_delete_key(tx.shard_state, key)
+        tx_drop_pending(key)
+        tx_mark_deleted(key)
         send(self(), {:tx_pending_delete, key})
       end)
 
@@ -610,6 +611,37 @@ defmodule Ferricstore.Store.Ops do
     MapSet.member?(deleted, key)
   end
 
+  defp tx_pending_meta(key) do
+    pending = Process.get(:tx_pending_values, %{})
+
+    case Map.get(pending, key) do
+      {value, 0} ->
+        {value, 0}
+
+      {value, exp} ->
+        if exp > HLC.now_ms() do
+          {value, exp}
+        else
+          tx_drop_pending(key)
+          nil
+        end
+
+      nil ->
+        nil
+    end
+  end
+
+  defp tx_put_pending(key, value, expire_at_ms) do
+    pending = Process.get(:tx_pending_values, %{})
+    Process.put(:tx_pending_values, Map.put(pending, key, {value, expire_at_ms}))
+    tx_undelete(key)
+  end
+
+  defp tx_drop_pending(key) do
+    pending = Process.get(:tx_pending_values, %{})
+    Process.put(:tx_pending_values, Map.delete(pending, key))
+  end
+
   defp tx_mark_deleted(key) do
     deleted = Process.get(:tx_deleted_keys, MapSet.new())
     Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
@@ -625,6 +657,13 @@ defmodule Ferricstore.Store.Ops do
 
   # Read value from local ETS, cold-read fallback. Returns value or nil.
   defp local_read_value(tx, key) do
+    case tx_pending_meta(key) do
+      {value, _exp} -> value
+      nil -> local_read_value_from_ets(tx, key)
+    end
+  end
+
+  defp local_read_value_from_ets(tx, key) do
     case ShardETS.ets_lookup_warm(tx.shard_state, key) do
       {:hit, value, _exp} ->
         value
@@ -649,6 +688,13 @@ defmodule Ferricstore.Store.Ops do
 
   # Read {value, expire_at_ms} from local ETS, cold-read fallback. Returns {value, exp} or nil.
   defp local_read_meta(tx, key) do
+    case tx_pending_meta(key) do
+      {value, exp} -> {value, exp}
+      nil -> local_read_meta_from_ets(tx, key)
+    end
+  end
+
+  defp local_read_meta_from_ets(tx, key) do
     case ShardETS.ets_lookup_warm(tx.shard_state, key) do
       {:hit, value, exp} ->
         {value, exp}
@@ -696,6 +742,7 @@ defmodule Ferricstore.Store.Ops do
       if opts.get, do: old_value, else: nil
     else
       ShardETS.ets_insert(tx.shard_state, key, value, effective_expire)
+      tx_put_pending(key, value, effective_expire)
       tx_undelete(key)
       send(self(), {:tx_pending_write, key, value, effective_expire})
       if opts.get, do: old_value, else: :ok
@@ -734,6 +781,13 @@ defmodule Ferricstore.Store.Ops do
   # Read value for read-modify-write ops (incr, getset, getdel, getex).
   # Same as local_read_value but without warming ETS on cold read (matching original closures).
   defp local_read_value_for_rmw(tx, key) do
+    case tx_pending_meta(key) do
+      {value, _exp} -> value
+      nil -> local_read_value_for_rmw_from_ets(tx, key)
+    end
+  end
+
+  defp local_read_value_for_rmw_from_ets(tx, key) do
     case ShardETS.ets_lookup_warm(tx.shard_state, key) do
       {:hit, value, _exp} ->
         value
@@ -758,13 +812,21 @@ defmodule Ferricstore.Store.Ops do
   end
 
   defp local_promoted_read_value(tx, compound_key, dedicated_path) do
-    case local_promoted_read_meta(tx, compound_key, dedicated_path) do
+    case tx_pending_meta(compound_key) ||
+           local_promoted_read_meta(tx, compound_key, dedicated_path) do
       {value, _exp} -> value
       nil -> nil
     end
   end
 
   defp local_promoted_read_meta(tx, compound_key, dedicated_path) do
+    case tx_pending_meta(compound_key) do
+      nil -> local_promoted_read_meta_from_ets(tx, compound_key, dedicated_path)
+      meta -> meta
+    end
+  end
+
+  defp local_promoted_read_meta_from_ets(tx, compound_key, dedicated_path) do
     now = HLC.now_ms()
     keydir = tx.shard_state.keydir
 
@@ -789,6 +851,37 @@ defmodule Ferricstore.Store.Ops do
       _ ->
         nil
     end
+  end
+
+  defp merge_tx_pending_prefix(results, prefix) do
+    deleted = Process.get(:tx_deleted_keys, MapSet.new())
+    prefix_len = byte_size(prefix)
+
+    base =
+      results
+      |> Enum.reject(fn {field, _value} -> MapSet.member?(deleted, prefix <> field) end)
+      |> Map.new()
+
+    Process.get(:tx_pending_values, %{})
+    |> Enum.reduce(base, fn
+      {key, {value, exp}}, acc when is_binary(key) and byte_size(key) >= prefix_len ->
+        if String.starts_with?(key, prefix) and not MapSet.member?(deleted, key) and
+             (exp == 0 or exp > HLC.now_ms()) do
+          field =
+            case :binary.split(key, <<0>>) do
+              [_pre, sub] -> sub
+              _ -> key
+            end
+
+          Map.put(acc, field, value)
+        else
+          acc
+        end
+
+      _other, acc ->
+        acc
+    end)
+    |> Map.to_list()
   end
 
   defp read_promoted_cold_value(tx, compound_key, dedicated_path, fid, off, vsize, exp) do

@@ -7,10 +7,12 @@ defmodule Ferricstore.Store.Shard.Transaction do
   # Transaction execution handler
   # -------------------------------------------------------------------
 
-  @spec handle_tx_execute([{binary(), [term()]}], binary() | nil, map()) :: {:reply, [term()], map()}
+  @spec handle_tx_execute([{binary(), [term()]}], binary() | nil, map()) ::
+          {:reply, [term()], map()}
   @doc false
   def handle_tx_execute(queue, sandbox_namespace, state) do
     Process.put(:tx_deleted_keys, MapSet.new())
+    Process.put(:tx_pending_values, %{})
     store = LocalTxStore.new(state)
 
     results =
@@ -30,6 +32,7 @@ defmodule Ferricstore.Store.Shard.Transaction do
         end)
       after
         Process.delete(:tx_deleted_keys)
+        Process.delete(:tx_pending_values)
       end
 
     {:reply, results, state}

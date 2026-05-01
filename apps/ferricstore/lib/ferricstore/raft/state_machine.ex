@@ -334,6 +334,7 @@ defmodule Ferricstore.Raft.StateMachine do
           store = build_cross_shard_store(shard_idx, state)
 
           Process.put(:tx_deleted_keys, MapSet.new())
+          Process.put(:tx_pending_values, %{})
 
           results =
             try do
@@ -352,6 +353,7 @@ defmodule Ferricstore.Raft.StateMachine do
               end)
             after
               Process.delete(:tx_deleted_keys)
+              Process.delete(:tx_pending_values)
             end
 
           Map.put(acc, shard_idx, results)
@@ -1149,6 +1151,7 @@ defmodule Ferricstore.Raft.StateMachine do
       end
 
       :ets.insert(ctx.keydir, {key, value_for, expire_at_ms, LFU.initial(), 0, 0, 0})
+      sm_tx_put_pending(key, value, expire_at_ms)
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
       if MapSet.member?(deleted, key) do
@@ -1181,6 +1184,7 @@ defmodule Ferricstore.Raft.StateMachine do
       end
 
       :ets.delete(ctx.keydir, key)
+      sm_tx_drop_pending(key)
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
       Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
       # Write tombstone via BitcaskWriter to ensure ordering
@@ -1194,7 +1198,10 @@ defmodule Ferricstore.Raft.StateMachine do
       if MapSet.member?(deleted, key) do
         nil
       else
-        cross_shard_ets_read(ctx, key)
+        case sm_tx_pending_meta(key) do
+          {value, _exp} -> value
+          nil -> cross_shard_ets_read(ctx, key)
+        end
       end
     end
 
@@ -1204,7 +1211,10 @@ defmodule Ferricstore.Raft.StateMachine do
       if MapSet.member?(deleted, key) do
         nil
       else
-        cross_shard_ets_read_meta(ctx, key)
+        case sm_tx_pending_meta(key) do
+          nil -> cross_shard_ets_read_meta(ctx, key)
+          meta -> meta
+        end
       end
     end
 
@@ -1214,7 +1224,7 @@ defmodule Ferricstore.Raft.StateMachine do
       if MapSet.member?(deleted, key) do
         false
       else
-        cross_shard_ets_read(ctx, key) != nil
+        sm_tx_pending_meta(key) != nil or cross_shard_ets_read(ctx, key) != nil
       end
     end
 
@@ -1336,6 +1346,7 @@ defmodule Ferricstore.Raft.StateMachine do
             {compound_key, value_for, expire_at_ms, LFU.initial(), fid, offset, record_size}
           )
 
+          sm_tx_put_pending(compound_key, value, expire_at_ms)
           deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
           if MapSet.member?(deleted, compound_key) do
@@ -1368,6 +1379,7 @@ defmodule Ferricstore.Raft.StateMachine do
       case NIF.v2_append_tombstone(active, compound_key) do
         {:ok, _offset} ->
           :ets.delete(ctx.keydir, compound_key)
+          sm_tx_drop_pending(compound_key)
           deleted = Process.get(:tx_deleted_keys, MapSet.new())
           Process.put(:tx_deleted_keys, MapSet.put(deleted, compound_key))
           :ok
@@ -1450,6 +1462,74 @@ defmodule Ferricstore.Raft.StateMachine do
   defp namespace_args([], _ns), do: []
   defp namespace_args([key | rest], ns) when is_binary(key), do: [ns <> key | rest]
   defp namespace_args(args, _ns), do: args
+
+  defp sm_tx_pending_meta(key) do
+    pending = Process.get(:tx_pending_values, %{})
+
+    case Map.get(pending, key) do
+      {value, 0} ->
+        {value, 0}
+
+      {value, exp} ->
+        if exp > apply_now_ms() do
+          {value, exp}
+        else
+          sm_tx_drop_pending(key)
+          nil
+        end
+
+      nil ->
+        nil
+    end
+  end
+
+  defp sm_tx_put_pending(key, value, expire_at_ms) do
+    pending = Process.get(:tx_pending_values, %{})
+    Process.put(:tx_pending_values, Map.put(pending, key, {value, expire_at_ms}))
+
+    deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+    if MapSet.member?(deleted, key) do
+      Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
+    end
+  end
+
+  defp sm_tx_drop_pending(key) do
+    pending = Process.get(:tx_pending_values, %{})
+    Process.put(:tx_pending_values, Map.delete(pending, key))
+  end
+
+  defp sm_merge_tx_pending_prefix(results, prefix) do
+    deleted = Process.get(:tx_deleted_keys, MapSet.new())
+    prefix_len = byte_size(prefix)
+
+    base =
+      results
+      |> Enum.reject(fn {field, _value} -> MapSet.member?(deleted, prefix <> field) end)
+      |> Map.new()
+
+    Process.get(:tx_pending_values, %{})
+    |> Enum.reduce(base, fn
+      {key, {value, exp}}, acc when is_binary(key) and byte_size(key) >= prefix_len ->
+        if String.starts_with?(key, prefix) and not MapSet.member?(deleted, key) and
+             (exp == 0 or exp > apply_now_ms()) do
+          field =
+            case :binary.split(key, <<0>>) do
+              [_pre, sub] -> sub
+              _ -> key
+            end
+
+          Map.put(acc, field, value)
+        else
+          acc
+        end
+
+      _other, acc ->
+        acc
+    end)
+    |> Map.to_list()
+    |> Enum.sort_by(fn {field, _value} -> field end)
+  end
 
   # Reads a value from a shard's keydir ETS table with cold-read fallback.
   defp cross_shard_ets_read(ctx, key) do
@@ -1588,24 +1668,39 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp cross_shard_compound_read(ctx, redis_key, compound_key) do
-    case promoted_compound_path(ctx, redis_key, compound_key) do
-      nil -> cross_shard_ets_read(ctx, compound_key)
-      dedicated_path -> cross_shard_ets_read_from_path(ctx, compound_key, dedicated_path)
+    case sm_tx_pending_meta(compound_key) do
+      {value, _exp} ->
+        value
+
+      nil ->
+        case promoted_compound_path(ctx, redis_key, compound_key) do
+          nil -> cross_shard_ets_read(ctx, compound_key)
+          dedicated_path -> cross_shard_ets_read_from_path(ctx, compound_key, dedicated_path)
+        end
     end
   end
 
   defp cross_shard_compound_read_meta(ctx, redis_key, compound_key) do
-    case promoted_compound_path(ctx, redis_key, compound_key) do
-      nil -> cross_shard_ets_read_meta(ctx, compound_key)
-      dedicated_path -> cross_shard_ets_read_meta_from_path(ctx, compound_key, dedicated_path)
+    case sm_tx_pending_meta(compound_key) do
+      nil ->
+        case promoted_compound_path(ctx, redis_key, compound_key) do
+          nil -> cross_shard_ets_read_meta(ctx, compound_key)
+          dedicated_path -> cross_shard_ets_read_meta_from_path(ctx, compound_key, dedicated_path)
+        end
+
+      meta ->
+        meta
     end
   end
 
   defp cross_shard_compound_scan(ctx, redis_key, prefix) do
-    case promoted_compound_path(ctx, redis_key, prefix) do
-      nil -> cross_shard_prefix_scan(ctx, prefix)
-      dedicated_path -> cross_shard_prefix_scan_from_path(ctx, prefix, dedicated_path)
-    end
+    results =
+      case promoted_compound_path(ctx, redis_key, prefix) do
+        nil -> cross_shard_prefix_scan(ctx, prefix)
+        dedicated_path -> cross_shard_prefix_scan_from_path(ctx, prefix, dedicated_path)
+      end
+
+    sm_merge_tx_pending_prefix(results, prefix)
   end
 
   defp promoted_compound_path(ctx, redis_key, compound_key_or_prefix) do

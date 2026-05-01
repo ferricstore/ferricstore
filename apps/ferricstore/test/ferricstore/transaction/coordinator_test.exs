@@ -35,12 +35,16 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
   # Verify key-to-shard mapping assumptions used throughout these tests.
   describe "test infrastructure" do
     test "keys route to different shards", %{cross_keys: keys} do
-      shards = Enum.map(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end) |> Enum.uniq()
+      shards =
+        Enum.map(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
+        |> Enum.uniq()
+
       assert length(shards) == length(keys)
     end
 
     test "same-shard keys route to same shard", %{same1: same1, same2: same2} do
-      assert Router.shard_for(FerricStore.Instance.get(:default), same1) == Router.shard_for(FerricStore.Instance.get(:default), same2)
+      assert Router.shard_for(FerricStore.Instance.get(:default), same1) ==
+               Router.shard_for(FerricStore.Instance.get(:default), same2)
     end
   end
 
@@ -103,6 +107,29 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
 
       assert result == ["existing", :ok, "updated"]
     end
+
+    test "large SET is visible to later GET in same transaction", %{same1: s1} do
+      ctx = FerricStore.Instance.get(:default)
+      large = :binary.copy("x", ctx.hot_cache_max_value_size + 1024)
+
+      result = Coordinator.execute([{"SET", [s1, large]}, {"GET", [s1]}], %{}, nil)
+
+      assert result == [:ok, large]
+    end
+
+    test "large HSET is visible to later HGET and HGETALL in same transaction", %{same1: s1} do
+      ctx = FerricStore.Instance.get(:default)
+      large = :binary.copy("h", ctx.hot_cache_max_value_size + 1024)
+
+      result =
+        Coordinator.execute(
+          [{"HSET", [s1, "field", large]}, {"HGET", [s1, "field"]}, {"HGETALL", [s1]}],
+          %{},
+          nil
+        )
+
+      assert result == [1, large, ["field", large]]
+    end
   end
 
   describe "cross-shard succeeds atomically" do
@@ -145,6 +172,42 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
 
       assert result == ["existing_k0", :ok]
       assert Router.get(FerricStore.Instance.get(:default), k1) == "new_k1"
+    end
+
+    test "large SET is visible to later GET in same cross-shard transaction", %{
+      k0: k0,
+      k1: k1
+    } do
+      ctx = FerricStore.Instance.get(:default)
+      large = :binary.copy("y", ctx.hot_cache_max_value_size + 1024)
+
+      queue = [
+        {"SET", [k0, large]},
+        {"GET", [k0]},
+        {"SET", [k1, "other"]}
+      ]
+
+      result = Coordinator.execute(queue, %{}, nil)
+
+      assert result == [:ok, large, :ok]
+    end
+
+    test "large HSET is visible to later HGETALL in same cross-shard transaction", %{
+      k0: k0,
+      k1: k1
+    } do
+      ctx = FerricStore.Instance.get(:default)
+      large = :binary.copy("c", ctx.hot_cache_max_value_size + 1024)
+
+      queue = [
+        {"HSET", [k0, "field", large]},
+        {"HGETALL", [k0]},
+        {"SET", [k1, "other"]}
+      ]
+
+      result = Coordinator.execute(queue, %{}, nil)
+
+      assert result == [1, ["field", large], :ok]
     end
 
     test "INCR across shards succeeds", %{k0: k0, k1: k1} do
