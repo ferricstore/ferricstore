@@ -247,6 +247,38 @@ defmodule Ferricstore.Commands.GenericTest do
       assert "v1" == store.get.("dst")
     end
 
+    test "COPY with REPLACE deletes destination without loading destination value" do
+      {:ok, deleted} = Agent.start_link(fn -> false end)
+      {:ok, put_value} = Agent.start_link(fn -> nil end)
+
+      store = %{
+        get: fn _key -> flunk("COPY should not load destination through get") end,
+        get_meta: fn
+          "src" -> {"value", 0}
+          "dst" -> flunk("COPY REPLACE should not read destination value before delete")
+        end,
+        put: fn "dst", "value", 0 ->
+          Agent.update(put_value, fn _ -> "value" end)
+          :ok
+        end,
+        delete: fn "dst" ->
+          Agent.update(deleted, fn _ -> true end)
+          :ok
+        end,
+        exists?: fn
+          "dst" -> true
+          _key -> false
+        end,
+        compound_get: fn _redis_key, _compound_key -> nil end,
+        compound_scan: fn _redis_key, _prefix -> [] end,
+        prob_write: fn _command -> :ok end
+      }
+
+      assert 1 == Generic.handle("COPY", ["src", "dst", "REPLACE"], store)
+      assert Agent.get(deleted, & &1)
+      assert "value" == Agent.get(put_value, & &1)
+    end
+
     test "COPY with lowercase replace option works" do
       store = MockStore.make(%{"src" => {"v1", 0}, "dst" => {"v2", 0}})
       assert 1 == Generic.handle("COPY", ["src", "dst", "replace"], store)

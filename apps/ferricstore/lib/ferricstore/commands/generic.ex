@@ -490,28 +490,7 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp delete_key(key, store) do
-    case key_entry(store, key) do
-      nil ->
-        0
-
-      {:plain, _value, _expire_at_ms} ->
-        Ops.delete(store, key)
-        1
-
-      {:compound, type, _expire_at_ms} ->
-        delete_compound_key(key, type, store)
-        1
-    end
-  end
-
-  defp delete_compound_key(key, type, store) do
-    Ops.compound_delete_prefix(store, key, compound_prefix(type, key))
-
-    if type == "list" do
-      Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))
-    end
-
-    Ops.compound_delete(store, key, CompoundKey.type_key(key))
+    Ferricstore.Commands.Strings.handle("DEL", [key], store)
   end
 
   defp copy_compound_meta(source, destination, type, store) do
