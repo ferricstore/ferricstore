@@ -1634,6 +1634,7 @@ defmodule Ferricstore.Store.Router do
 
       ets_tuples =
         Enum.map(entries, fn {key, value, value_for_ets} ->
+          clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
           track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
 
           case Map.get(shard_locations, key) do

@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.BatchOperationsTest do
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Store.Router
+  alias Ferricstore.Store.{CompoundKey, Router}
 
   @ns_async "batch_test_async"
   @ns_quorum "batch_test_quorum"
@@ -81,6 +81,22 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
       :ok = Router.batch_async_put(ctx(), [{key, "updated"}])
       assert Router.get(ctx(), key) == "updated"
+    end
+
+    test "overwriting a compound key clears compound metadata and fields" do
+      key = "#{@ns_async}:bap_overwrite_hash"
+      field_key = CompoundKey.hash_field(key, "field")
+
+      :ok = Router.compound_put(ctx(), key, CompoundKey.type_key(key), "hash", 0)
+      :ok = Router.compound_put(ctx(), key, field_key, "hash_val", 0)
+      assert "hash" == Router.compound_get(ctx(), key, CompoundKey.type_key(key))
+      assert "hash_val" == Router.compound_get(ctx(), key, field_key)
+
+      :ok = Router.batch_async_put(ctx(), [{key, "string_val"}])
+
+      assert "string_val" == Router.get(ctx(), key)
+      assert nil == Router.compound_get(ctx(), key, CompoundKey.type_key(key))
+      assert nil == Router.compound_get(ctx(), key, field_key)
     end
 
     test "duplicate keys in one async batch use the last value" do
