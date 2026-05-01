@@ -10,6 +10,7 @@ defmodule Ferricstore.ApplicationTest do
   """
 
   use ExUnit.Case, async: false
+  import ExUnit.CaptureLog
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.BitcaskWriter
@@ -61,6 +62,31 @@ defmodule Ferricstore.ApplicationTest do
   end
 
   describe "graceful shutdown" do
+    test "wal rollover reports unconsumed WAL files instead of silently succeeding" do
+      log =
+        capture_log(fn ->
+          assert {:error, {:wal_files_unconsumed, ["0000000000000001.wal"]}} =
+                   Ferricstore.Application.wal_rollover_for_shutdown("ignored",
+                     force_rollover: fn _wal_name -> :ok end,
+                     list_wal_files: fn _ra_dir -> ["0000000000000001.wal"] end,
+                     max_attempts: 1,
+                     poll_interval_ms: 0
+                   )
+        end)
+
+      assert log =~ "segment writer still processing WAL files"
+    end
+
+    test "wal rollover reports force_roll_over failures" do
+      assert {:error, {:force_rollover_failed, :closed}} =
+               Ferricstore.Application.wal_rollover_for_shutdown("ignored",
+                 force_rollover: fn _wal_name -> {:error, :closed} end,
+                 list_wal_files: fn _ra_dir -> ["0000000000000001.wal"] end,
+                 max_attempts: 1,
+                 poll_interval_ms: 0
+               )
+    end
+
     test "prep_stop uses runtime shard count when config shard_count is auto" do
       original_shard_count = Application.get_env(:ferricstore, :shard_count)
       original_ready = Ferricstore.Health.ready?()
