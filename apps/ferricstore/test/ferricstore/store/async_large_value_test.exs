@@ -74,10 +74,50 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
         expected_size = 100_000 + i
         key = "alv_test:multi_#{i}"
 
-        eventually(fn ->
-          val = Router.get(FerricStore.Instance.get(:default), key)
-          val != nil and byte_size(val) == expected_size
-        end, "Key #{key} should have size #{expected_size}")
+        eventually(
+          fn ->
+            val = Router.get(FerricStore.Instance.get(:default), key)
+            val != nil and byte_size(val) == expected_size
+          end,
+          "Key #{key} should have size #{expected_size}"
+        )
+      end
+    end
+
+    test "get_with_file_ref returns value offset for cold sendfile reads" do
+      key = "alv_test:file_ref"
+      value = :binary.copy("F", 100_000)
+      ctx = FerricStore.Instance.get(:default)
+      idx = Router.shard_for(ctx, key)
+      original = Ferricstore.Store.ActiveFile.get(idx)
+      {_file_id, _file_path, shard_data_path} = original
+      file_id = 1
+      file_path = Path.join(shard_data_path, "00001.log")
+
+      Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_data_path)
+
+      try do
+        :ok = Router.batch_async_put(ctx, [{key, value}])
+
+        assert {:cold_ref, path, offset, size} = Router.get_with_file_ref(ctx, key)
+
+        assert size == byte_size(value)
+        assert {:ok, file} = :file.open(String.to_charlist(path), [:read, :binary])
+
+        try do
+          assert {:ok, ^value} = :file.pread(file, offset, size)
+        after
+          :file.close(file)
+        end
+      after
+        {original_file_id, original_file_path, original_shard_data_path} = original
+
+        Ferricstore.Store.ActiveFile.publish(
+          idx,
+          original_file_id,
+          original_file_path,
+          original_shard_data_path
+        )
       end
     end
   end

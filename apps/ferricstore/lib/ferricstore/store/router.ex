@@ -26,6 +26,7 @@ defmodule Ferricstore.Store.Router do
   import Bitwise, only: [band: 2]
 
   @slot_mask 1023
+  @bitcask_header_size 26
 
   # ---------------------------------------------------------------------------
   # Shard resolution helpers
@@ -969,7 +970,7 @@ defmodule Ferricstore.Store.Router do
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
         # Adjust offset to skip header and key bytes (sendfile needs value offset).
-        value_offset = offset + 26 + byte_size(key)
+        value_offset = offset + @bitcask_header_size + byte_size(key)
         {path, value_offset, value_size}
 
       {:cold, _file_id, _offset, _value_size} ->
@@ -1021,8 +1022,9 @@ defmodule Ferricstore.Store.Router do
         path =
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
+        value_offset = offset + @bitcask_header_size + byte_size(key)
         Stats.record_cold_read(ctx, key)
-        {:cold_ref, path, offset, value_size}
+        {:cold_ref, path, value_offset, value_size}
 
       {:cold, _file_id, _offset, _value_size} ->
         # Cold entry but no valid file ref — ask GenServer
