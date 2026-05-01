@@ -1373,9 +1373,11 @@ defmodule Ferricstore.Store.Router do
       |> Enum.group_by(fn {key, _value} -> shard_for(ctx, key) end)
       |> Enum.map(fn {idx, shard_kvs} ->
         keydir = elem(ctx.keydir_refs, idx)
+        effective_kvs = dedupe_last_kvs(shard_kvs)
 
         {entries, raft_cmds, large_disk_batch} =
-          Enum.reduce(shard_kvs, {[], [], []}, fn {key, value}, {entry_acc, raft_acc, disk_acc} ->
+          Enum.reduce(effective_kvs, {[], [], []}, fn {key, value},
+                                                      {entry_acc, raft_acc, disk_acc} ->
             value_for_ets = if byte_size(value) > hot_max, do: nil, else: value
             raft_cmd = {:put, key, value, 0}
 
@@ -1389,7 +1391,7 @@ defmodule Ferricstore.Store.Router do
             {[{key, value, value_for_ets} | entry_acc], [raft_cmd | raft_acc], disk_acc}
           end)
 
-        {idx, keydir, shard_kvs, entries, raft_cmds, large_disk_batch}
+        {idx, keydir, shard_kvs, Enum.reverse(entries), Enum.reverse(raft_cmds), large_disk_batch}
       end)
 
     disk_locations =
@@ -1444,6 +1446,18 @@ defmodule Ferricstore.Store.Router do
   catch
     :throw, {:disk_error, reason} ->
       {:error, "ERR disk write failed: #{inspect(reason)}"}
+  end
+
+  defp dedupe_last_kvs(kv_pairs) do
+    last_index_by_key =
+      kv_pairs
+      |> Enum.with_index()
+      |> Map.new(fn {{key, _value}, index} -> {key, index} end)
+
+    kv_pairs
+    |> Enum.with_index()
+    |> Enum.filter(fn {{key, _value}, index} -> Map.fetch!(last_index_by_key, key) == index end)
+    |> Enum.map(fn {kv, _index} -> kv end)
   end
 
   @doc """

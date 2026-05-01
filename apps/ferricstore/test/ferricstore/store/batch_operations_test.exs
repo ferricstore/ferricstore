@@ -83,6 +83,14 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert Router.get(ctx(), key) == "updated"
     end
 
+    test "duplicate keys in one async batch use the last value" do
+      key = "#{@ns_async}:bap_duplicate"
+
+      :ok = Router.batch_async_put(ctx(), [{key, "first"}, {key, "second"}])
+
+      assert Router.get(ctx(), key) == "second"
+    end
+
     test "mixed batch rolls back same-shard small keys when large disk write fails" do
       {small_key, large_key} = same_shard_keys(ctx(), "bap_disk_fail")
       idx = Router.shard_for(ctx(), small_key)
