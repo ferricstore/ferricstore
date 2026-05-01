@@ -994,14 +994,12 @@ defmodule FerricStore do
       {:ok, 3}
 
   """
-  @spec lpush(key(), [binary()]) :: {:ok, non_neg_integer()}
+  @spec lpush(key(), [binary()]) :: {:ok, non_neg_integer()} | {:error, binary()}
   def lpush(key, elements) when is_list(elements) do
     ctx = default_ctx()
 
-    result =
-      Router.list_op(ctx, key, {:lpush, elements})
-
-    {:ok, result}
+    Router.list_op(ctx, key, {:lpush, elements})
+    |> wrap_result()
   end
 
   @doc """
@@ -1018,14 +1016,12 @@ defmodule FerricStore do
       {:ok, 3}
 
   """
-  @spec rpush(key(), [binary()]) :: {:ok, non_neg_integer()}
+  @spec rpush(key(), [binary()]) :: {:ok, non_neg_integer()} | {:error, binary()}
   def rpush(key, elements) when is_list(elements) do
     ctx = default_ctx()
 
-    result =
-      Router.list_op(ctx, key, {:rpush, elements})
-
-    {:ok, result}
+    Router.list_op(ctx, key, {:rpush, elements})
+    |> wrap_result()
   end
 
   @doc """
@@ -1048,14 +1044,12 @@ defmodule FerricStore do
       {:ok, nil}
 
   """
-  @spec lpop(key(), pos_integer()) :: {:ok, binary() | [binary()] | nil}
+  @spec lpop(key(), pos_integer()) :: {:ok, binary() | [binary()] | nil} | {:error, binary()}
   def lpop(key, count \\ 1) when is_integer(count) and count >= 1 do
     ctx = default_ctx()
 
-    result =
-      Router.list_op(ctx, key, {:lpop, count})
-
-    {:ok, result}
+    Router.list_op(ctx, key, {:lpop, count})
+    |> wrap_result()
   end
 
   @doc """
@@ -1078,14 +1072,12 @@ defmodule FerricStore do
       {:ok, nil}
 
   """
-  @spec rpop(key(), pos_integer()) :: {:ok, binary() | [binary()] | nil}
+  @spec rpop(key(), pos_integer()) :: {:ok, binary() | [binary()] | nil} | {:error, binary()}
   def rpop(key, count \\ 1) when is_integer(count) and count >= 1 do
     ctx = default_ctx()
 
-    result =
-      Router.list_op(ctx, key, {:rpop, count})
-
-    {:ok, result}
+    Router.list_op(ctx, key, {:rpop, count})
+    |> wrap_result()
   end
 
   @doc """
@@ -1107,14 +1099,12 @@ defmodule FerricStore do
       {:ok, []}
 
   """
-  @spec lrange(key(), integer(), integer()) :: {:ok, [binary()]}
+  @spec lrange(key(), integer(), integer()) :: {:ok, [binary()]} | {:error, binary()}
   def lrange(key, start, stop) do
     ctx = default_ctx()
 
-    result =
-      Router.list_op(ctx, key, {:lrange, start, stop})
-
-    {:ok, result}
+    Router.list_op(ctx, key, {:lrange, start, stop})
+    |> wrap_result()
   end
 
   @doc """
@@ -1132,14 +1122,12 @@ defmodule FerricStore do
       {:ok, 0}
 
   """
-  @spec llen(key()) :: {:ok, non_neg_integer()}
+  @spec llen(key()) :: {:ok, non_neg_integer()} | {:error, binary()}
   def llen(key) do
     ctx = default_ctx()
 
-    result =
-      Router.list_op(ctx, key, :llen)
-
-    {:ok, result}
+    Router.list_op(ctx, key, :llen)
+    |> wrap_result()
   end
 
   # ---------------------------------------------------------------------------
@@ -2667,14 +2655,12 @@ defmodule FerricStore do
       {:ok, nil}
 
   """
-  @spec lindex(key(), integer()) :: {:ok, binary() | nil}
+  @spec lindex(key(), integer()) :: {:ok, binary() | nil} | {:error, binary()}
   def lindex(key, index) do
     ctx = default_ctx()
 
-    result =
-      Router.list_op(ctx, key, {:lindex, index})
-
-    {:ok, result}
+    Router.list_op(ctx, key, {:lindex, index})
+    |> wrap_result()
   end
 
   @doc """

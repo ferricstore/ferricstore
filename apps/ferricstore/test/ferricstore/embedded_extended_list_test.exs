@@ -15,6 +15,16 @@ defmodule Ferricstore.EmbeddedExtendedListTest do
   # LIST extended: lindex, lset, lrem, linsert, lmove, lpos
   # ===========================================================================
 
+  describe "WRONGTYPE propagation" do
+    test "embedded list commands return WRONGTYPE directly for string keys" do
+      assert :ok = FerricStore.set("list:wrongtype:string", "plain")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.lpush("list:wrongtype:string", ["x"])
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.lrange("list:wrongtype:string", 0, -1)
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.llen("list:wrongtype:string")
+    end
+  end
+
   describe "lindex/2" do
     test "returns element at index" do
       FerricStore.rpush("li:key", ["a", "b", "c"])
