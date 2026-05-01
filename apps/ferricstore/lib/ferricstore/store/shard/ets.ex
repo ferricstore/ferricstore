@@ -274,10 +274,28 @@ defmodule Ferricstore.Store.Shard.ETS do
       # Under pressure — don't re-cache, keep cold
       :ok
     else
-      # Cold -> warm: previous ETS value was nil, so only add new bytes
-      track_binary_cold_to_warm(state, key, v)
-      :ets.insert(state.keydir, {key, v, exp, LFU.initial(), fid, off, vsize})
+      case warm_matching_cold_entry(state.keydir, key, v, exp, fid, off, vsize) do
+        1 ->
+          # Cold -> warm: previous ETS value was nil, so only add new bytes.
+          track_binary_cold_to_warm(state, key, v)
+          true
+
+        _ ->
+          :ok
+      end
     end
+  end
+
+  defp warm_matching_cold_entry(keydir, key, value, exp, fid, off, vsize) do
+    :ets.select_replace(keydir, [
+      {
+        {key, nil, exp, :"$1", fid, off, vsize},
+        [],
+        [{{key, value, exp, :"$1", fid, off, vsize}}]
+      }
+    ])
+  rescue
+    ArgumentError -> 0
   end
 
   # -------------------------------------------------------------------
