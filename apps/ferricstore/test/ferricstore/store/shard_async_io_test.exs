@@ -19,6 +19,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   alias Ferricstore.Store.BitcaskWriter
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard
+  alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
   setup do
     :ok
@@ -190,6 +191,33 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
       assert :ok == BitcaskWriter.flush(shard_index)
       assert [{^key, "new", 456, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, key)
+    end
+
+    test "shard flush completion does not attach stale location to newer pending value" do
+      keydir =
+        :ets.new(:"shard_flush_stale_#{System.unique_integer([:positive])}", [
+          :set,
+          :public
+        ])
+
+      key = "flush:stale-location"
+
+      state = %{
+        keydir: keydir,
+        active_file_id: 7,
+        file_stats: %{},
+        instance_ctx: %{hot_cache_max_value_size: 64}
+      }
+
+      try do
+        :ets.insert(keydir, {key, "new", 456, LFU.initial(), :pending, 0, 0})
+
+        ShardFlush.update_ets_locations(state, [{key, "old", 123}], [{42, 3}])
+
+        assert [{^key, "new", 456, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, key)
+      after
+        :ets.delete(keydir)
+      end
     end
 
     test "put is readable immediately via ETS (before fsync)" do

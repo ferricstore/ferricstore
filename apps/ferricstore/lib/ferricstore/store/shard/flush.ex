@@ -188,22 +188,41 @@ defmodule Ferricstore.Store.Shard.Flush do
 
     new_file_stats =
       Enum.zip(batch, locations)
-      |> Enum.reduce(state.file_stats, fn {{key, value, _exp}, {offset, _record_size}}, fs ->
-        update_single_ets_location(state.keydir, key, value, fid, offset, fs)
+      |> Enum.reduce(state.file_stats, fn {{key, value, exp}, {offset, _record_size}}, fs ->
+        update_single_ets_location(state, key, value, exp, fid, offset, fs)
       end)
 
     %{state | file_stats: new_file_stats}
   end
 
-  defp update_single_ets_location(keydir, key, value, fid, offset, fs) do
+  defp update_single_ets_location(state, key, value, exp, fid, offset, fs) do
+    keydir = state.keydir
+    expected_value = ShardETS.value_for_ets(value, ShardETS.hot_cache_threshold(state))
+
     case :ets.lookup(keydir, key) do
-      [{^key, _ets_value, _exp, _lfu, old_fid, old_off, old_vsize}] ->
+      [{^key, ^expected_value, ^exp, _lfu, :pending, old_fid, old_vsize}] ->
         vsize = byte_size(value)
-        :ets.update_element(keydir, key, [{5, fid}, {6, offset}, {7, vsize}])
-        {dead_fid, dead_vsize} = overwrite_dead_ref(old_fid, old_off, old_vsize)
-        track_overwrite_dead_bytes(fs, key, dead_fid, dead_vsize)
+
+        replaced =
+          :ets.select_replace(keydir, [
+            {
+              {key, expected_value, exp, :"$1", :pending, old_fid, old_vsize},
+              [],
+              [{{key, expected_value, exp, :"$1", fid, offset, vsize}}]
+            }
+          ])
+
+        if replaced == 1 do
+          {dead_fid, dead_vsize} = overwrite_dead_ref(:pending, old_fid, old_vsize)
+          track_overwrite_dead_bytes(fs, key, dead_fid, dead_vsize)
+        else
+          fs
+        end
 
       [] ->
+        fs
+
+      _ ->
         fs
     end
   end
