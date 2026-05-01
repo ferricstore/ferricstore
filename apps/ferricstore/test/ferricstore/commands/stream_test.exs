@@ -248,6 +248,35 @@ defmodule Ferricstore.Commands.StreamTest do
       assert Enum.map(entries, &hd/1) == ["1-0", "2-0", "3-0"]
     end
 
+    test "XRANGE uses batch_get when the store provides it" do
+      parent = self()
+      {:ok, pid} = Agent.start_link(fn -> %{} end)
+      key = ustream()
+
+      store = %{
+        put: fn entry_key, value, _expire_at_ms ->
+          Agent.update(pid, &Map.put(&1, entry_key, value))
+          :ok
+        end,
+        keys: fn -> Agent.get(pid, &Map.keys/1) end,
+        batch_get: fn keys ->
+          send(parent, {:batch_get, keys})
+          Agent.get(pid, fn state -> Enum.map(keys, &Map.get(state, &1)) end)
+        end,
+        get: fn entry_key ->
+          flunk("XRANGE should use batch_get, got per-entry GET for #{inspect(entry_key)}")
+        end
+      }
+
+      assert "1-0" == Stream.handle("XADD", [key, "1-0", "f", "v1"], store)
+      assert "2-0" == Stream.handle("XADD", [key, "2-0", "f", "v2"], store)
+
+      assert [["1-0", "f", "v1"], ["2-0", "f", "v2"]] ==
+               Stream.handle("XRANGE", [key, "-", "+"], store)
+
+      assert_received {:batch_get, [_first, _second]}
+    end
+
     test "XRANGE on nonexistent stream returns empty list" do
       store = MockStore.make()
       assert [] == Stream.handle("XRANGE", ["nonexistent", "-", "+"], store)

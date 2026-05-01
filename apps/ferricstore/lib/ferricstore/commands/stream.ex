@@ -477,7 +477,7 @@ defmodule Ferricstore.Commands.Stream do
         # all keys with the stream prefix and filter.
         prefix = "X:#{key}" <> @sep
 
-        all_entries =
+        selected_entries =
           store
           |> stream_keys_for(prefix)
           |> Enum.map(fn compound_key ->
@@ -489,14 +489,19 @@ defmodule Ferricstore.Commands.Stream do
           end)
           |> Enum.sort_by(fn {_id_str, id} -> id end)
           |> maybe_take(count)
-          |> Enum.map(fn {id_str, _id} ->
-            compound_key = prefix <> id_str
-            raw = Ops.get(store, compound_key)
 
-            if raw do
+        entry_keys = Enum.map(selected_entries, fn {id_str, _id} -> prefix <> id_str end)
+
+        all_entries =
+          selected_entries
+          |> Enum.zip(Ops.batch_get(store, entry_keys))
+          |> Enum.map(fn
+            {{id_str, _id}, raw} when is_binary(raw) ->
               fields = :erlang.binary_to_term(raw)
               [id_str | fields]
-            end
+
+            {_entry, _missing} ->
+              nil
           end)
           |> Enum.reject(&is_nil/1)
 
