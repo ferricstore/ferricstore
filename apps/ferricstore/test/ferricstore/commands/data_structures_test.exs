@@ -5,7 +5,8 @@ defmodule Ferricstore.Commands.DataStructuresTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Dispatcher, Hash, List, Set, SortedSet, Strings}
+  alias Ferricstore.Commands.{Bitmap, Dispatcher, Hash, Json, List, Set, SortedSet, Strings}
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -51,7 +52,60 @@ defmodule Ferricstore.Commands.DataStructuresTest do
     test "TYPE with wrong arity returns error" do
       assert {:error, _} = Strings.handle("TYPE", [], MockStore.make())
     end
+
+    test "TYPE ignores orphan list metadata without a type marker" do
+      store = MockStore.make()
+
+      :ok =
+        store.compound_put.(
+          "orphan",
+          CompoundKey.list_meta_key("orphan"),
+          :erlang.term_to_binary({1, 0, 1}),
+          0
+        )
+
+      :ok = store.compound_put.("orphan", CompoundKey.list_element("orphan", 0), "value", 0)
+
+      assert {:simple, "none"} == Strings.handle("TYPE", ["orphan"], store)
+      assert nil == Json.handle("JSON.GET", ["orphan"], store)
+      assert 0 == Bitmap.handle("GETBIT", ["orphan", "0"], store)
+    end
+
+    test "read paths do not use list metadata as a fallback type marker" do
+      # LM:key is list payload metadata. Only T:key is a type marker, so read
+      # commands must not probe LM:key as a shortcut for WRONGTYPE detection.
+      checks = [
+        {"lib/ferricstore/store/type_registry.ex", ~r/def get_type.*?case Ops\.get/s},
+        {"lib/ferricstore/commands/json.ex", ~r/defp compound_type_marker\?.*?end/s},
+        {"lib/ferricstore/commands/bitmap.ex", ~r/defp compound_type_marker\?.*?end/s},
+        {"lib/ferricstore/commands/hyperloglog.ex", ~r/defp compound_type_marker\?.*?end/s}
+      ]
+
+      findings =
+        checks
+        |> Enum.flat_map(fn {path, pattern} ->
+          source = File.read!(app_path(path))
+
+          case Regex.run(pattern, source) do
+            [body] ->
+              if body =~ "list_meta_key" do
+                [path]
+              else
+                []
+              end
+
+            nil ->
+              [path <> " missing expected function body"]
+          end
+        end)
+
+      assert findings == [],
+             "read paths must rely on T:key only, found LM fallback probes in:\n" <>
+               Enum.join(findings, "\n")
+    end
   end
+
+  defp app_path(path), do: Path.expand("../../../#{path}", __DIR__)
 
   # ---------------------------------------------------------------------------
   # DEL with data structures

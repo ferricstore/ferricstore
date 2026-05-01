@@ -91,20 +91,10 @@ defmodule Ferricstore.Store.TypeRegistry do
 
     case Ops.compound_get(store, redis_key, type_key) do
       nil ->
-        # No explicit type marker — check for list metadata (compound key lists)
-        list_meta_key = CompoundKey.list_meta_key(redis_key)
-
-        case Ops.compound_get(store, redis_key, list_meta_key) do
-          nil ->
-            # Check if plain string or legacy serialized list
-            case Ops.get(store, redis_key) do
-              nil -> "none"
-              value when is_binary(value) -> detect_serialized_type(value)
-              _ -> "string"
-            end
-
-          _meta ->
-            "list"
+        case Ops.get(store, redis_key) do
+          nil -> "none"
+          value when is_binary(value) -> detect_serialized_type(value)
+          _ -> "string"
         end
 
       type_str ->

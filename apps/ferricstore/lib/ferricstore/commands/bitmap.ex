@@ -317,8 +317,7 @@ defmodule Ferricstore.Commands.Bitmap do
   end
 
   defp compound_type_marker?(key, store) do
-    Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
-      Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil
+    Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil
   end
 
   defp clear_compound_data_structure(key, store) do

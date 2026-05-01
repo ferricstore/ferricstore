@@ -618,8 +618,7 @@ defmodule Ferricstore.Commands.Json do
 
   defp compound_type_marker?(key, store) do
     Ops.has_compound?(store) and
-      (Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
-         Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil)
+      Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil
   end
 
   defp decode_raw_json(raw) do
