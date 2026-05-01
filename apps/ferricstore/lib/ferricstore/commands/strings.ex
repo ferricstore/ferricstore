@@ -771,10 +771,7 @@ defmodule Ferricstore.Commands.Strings do
         if compound_data_structure_key?(key, store), do: @wrongtype_error, else: :missing
 
       value when is_binary(value) ->
-        case maybe_check_type(value) do
-          @wrongtype_error -> @wrongtype_error
-          checked -> {:value, checked}
-        end
+        {:value, value}
 
       other ->
         {:value, other}
@@ -787,10 +784,7 @@ defmodule Ferricstore.Commands.Strings do
         nil
 
       value when is_binary(value) ->
-        case maybe_check_type(value) do
-          @wrongtype_error -> nil
-          checked -> checked
-        end
+        value
 
       other ->
         other
@@ -857,52 +851,6 @@ defmodule Ferricstore.Commands.Strings do
     do: Ops.compound_delete_prefix(store, key, CompoundKey.zset_prefix(key))
 
   defp clear_compound_prefix(_key, _type, _store), do: :ok
-
-  # Detects if a stored binary is actually a serialized non-string type
-  # (list, hash, set, zset). If so, returns WRONGTYPE error instead of the
-  # raw binary. This matches Redis behaviour where GET on a non-string key
-  # returns a WRONGTYPE error.
-  #
-  # Peeks at the ETF header bytes to identify tuple tags without deserializing
-  # the entire payload. This avoids multi-MB heap spikes for large data
-  # structures (e.g., a hash with 10K fields stored as ETF).
-  #
-  # ETF format for a 2-tuple like {:list, payload}:
-  #   131 = ETF version tag
-  #   104 = SMALL_TUPLE_EXT (arity < 256)
-  #   2   = arity (2-tuple)
-  #   100 = ATOM_EXT (followed by 2-byte length + atom bytes)
-  #         or 119 = SMALL_ATOM_UTF8_EXT (1-byte length + atom bytes)
-  #         or 118 = ATOM_UTF8_EXT (2-byte length + atom bytes)
-  #         or 115 = SMALL_ATOM_EXT (1-byte length + atom bytes)
-  defp maybe_check_type(<<131, 104, 2, rest::binary>> = value) do
-    case extract_etf_atom_name(rest) do
-      name when name in ["list", "hash", "set", "zset"] -> @wrongtype_error
-      _ -> value
-    end
-  end
-
-  # LARGE_TUPLE_EXT (arity 2) - same check for large tuples
-  defp maybe_check_type(<<131, 105, 0, 0, 0, 2, rest::binary>> = value) do
-    case extract_etf_atom_name(rest) do
-      name when name in ["list", "hash", "set", "zset"] -> @wrongtype_error
-      _ -> value
-    end
-  end
-
-  defp maybe_check_type(value), do: value
-
-  # Extracts the atom name from the beginning of an ETF-encoded atom.
-  # Returns the atom name as a string, or nil if unrecognized format.
-  # ATOM_EXT (tag 100): 2-byte big-endian length + atom bytes (Latin1)
-  defp extract_etf_atom_name(<<100, len::16, name::binary-size(len), _::binary>>), do: name
-  # SMALL_ATOM_UTF8_EXT (tag 119): 1-byte length + atom bytes (UTF8)
-  defp extract_etf_atom_name(<<119, len::8, name::binary-size(len), _::binary>>), do: name
-  # ATOM_UTF8_EXT (tag 118): 2-byte length + atom bytes (UTF8)
-  defp extract_etf_atom_name(<<118, len::16, name::binary-size(len), _::binary>>), do: name
-  # SMALL_ATOM_EXT (tag 115): 1-byte length + atom bytes (Latin1)
-  defp extract_etf_atom_name(<<115, len::8, name::binary-size(len), _::binary>>), do: name
-  defp extract_etf_atom_name(_), do: nil
 
   # ---------------------------------------------------------------------------
   # Private — DEL key deletion (plain + compound)

@@ -9,6 +9,8 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
+  defp app_path(path), do: Path.expand("../../../#{path}", __DIR__)
+
   # ===========================================================================
   # WRONGTYPE enforcement — string commands on data structure keys
   # ===========================================================================
@@ -20,42 +22,40 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
       {:ok, store: store}
     end
 
-    test "GET on hash key returns WRONGTYPE", %{store: _store} do
-      # GET internally checks the serialized value. When the stored value is
-      # an Erlang-encoded {:hash, _} tuple, GET detects this and returns
-      # WRONGTYPE. Test at the Strings handler level.
+    test "GET treats ETF-looking hash payload as a string without type marker", %{store: _store} do
       hash_val = :erlang.term_to_binary({:hash, %{"f" => "v"}})
       store_with_hash = MockStore.make(%{"mykey" => {hash_val, 0}})
       result = Strings.handle("GET", ["mykey"], store_with_hash)
-      assert {:error, "WRONGTYPE" <> _} = result
+      assert result == hash_val
     end
 
-    test "GET on list key returns WRONGTYPE" do
+    test "GET treats ETF-looking list payload as a string without type marker" do
       list_val = :erlang.term_to_binary({:list, ["a", "b"]})
       store = MockStore.make(%{"mylist" => {list_val, 0}})
       result = Strings.handle("GET", ["mylist"], store)
-      assert {:error, "WRONGTYPE" <> _} = result
+      assert result == list_val
     end
 
-    test "MGET returns nil instead of leaking encoded non-string values" do
+    test "MGET returns ETF-looking plain binaries as string values" do
       list_val = :erlang.term_to_binary({:list, ["a", "b"]})
       store = MockStore.make(%{"mylist" => {list_val, 0}, "string" => {"value", 0}})
 
-      assert [nil, "value", nil] == Strings.handle("MGET", ["mylist", "string", "missing"], store)
+      assert [list_val, "value", nil] ==
+               Strings.handle("MGET", ["mylist", "string", "missing"], store)
     end
 
-    test "GET on set key returns WRONGTYPE" do
+    test "GET treats ETF-looking set payload as a string without type marker" do
       set_val = :erlang.term_to_binary({:set, MapSet.new(["a"])})
       store = MockStore.make(%{"myset" => {set_val, 0}})
       result = Strings.handle("GET", ["myset"], store)
-      assert {:error, "WRONGTYPE" <> _} = result
+      assert result == set_val
     end
 
-    test "GET on zset key returns WRONGTYPE" do
+    test "GET treats ETF-looking zset payload as a string without type marker" do
       zset_val = :erlang.term_to_binary({:zset, %{"a" => 1.0}})
       store = MockStore.make(%{"myzset" => {zset_val, 0}})
       result = Strings.handle("GET", ["myzset"], store)
-      assert {:error, "WRONGTYPE" <> _} = result
+      assert result == zset_val
     end
 
     test "GET on key with Erlang-encoded but non-struct binary returns value as-is" do
@@ -65,6 +65,13 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
       store = MockStore.make(%{"other" => {other_val, 0}})
       result = Strings.handle("GET", ["other"], store)
       assert result == other_val
+    end
+
+    test "string read path does not infer type from ETF-looking payloads" do
+      source = File.read!(app_path("lib/ferricstore/commands/strings.ex"))
+
+      refute source =~ "maybe_check_type"
+      refute source =~ "extract_etf_atom_name"
     end
 
     test "GETEX on hash key returns WRONGTYPE and does not create a string", %{store: store} do
