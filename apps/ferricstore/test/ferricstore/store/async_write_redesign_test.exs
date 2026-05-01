@@ -20,12 +20,12 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
   @ns "rdesign_async"
 
   setup do
-    ctx = Ferricstore.Test.IsolatedInstance.checkout()
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
     Ferricstore.NamespaceConfig.set(@ns, "durability", "async")
+    ctx = FerricStore.Instance.get(:default)
 
     on_exit(fn ->
-      Ferricstore.NamespaceConfig.set(@ns, "durability", "quorum")
-      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      Ferricstore.Test.ShardHelpers.flush_all_keys()
     end)
 
     Process.put(:test_ctx, ctx)
@@ -39,6 +39,13 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
   # ---------------------------------------------------------------------------
 
   describe "async routing" do
+    test "suite context exercises the Raft async path" do
+      key = "#{@ns}:ctx_probe"
+
+      assert ctx().raft_enabled
+      assert Router.durability_for_key_public(ctx(), key) == :async
+    end
+
     test "async writes produce batched ra.pipeline_command submissions" do
       # This test requires the Raft-backed default instance (Batcher submits to Raft).
       default_ctx = FerricStore.Instance.get(:default)
@@ -183,6 +190,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
         end
 
       avg_us = div(Enum.sum(samples), length(samples))
+
       assert avg_us < 5_000,
              "async small-value SET avg latency #{avg_us}μs exceeded 5000μs; " <>
                "suggests call is blocking on Raft or the Batcher"
@@ -196,6 +204,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
   defp read_ets_entry(ctx, key) do
     idx = Router.shard_for(ctx, key)
     keydir = elem(ctx.keydir_refs, idx)
+
     case :ets.lookup(keydir, key) do
       [entry] -> entry
       [] -> nil
