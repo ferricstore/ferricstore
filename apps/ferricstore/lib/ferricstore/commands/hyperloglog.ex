@@ -1,6 +1,7 @@
 defmodule Ferricstore.Commands.HyperLogLog do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.TypeRegistry
 
   @moduledoc """
   Handles Redis HyperLogLog commands: PFADD, PFCOUNT, PFMERGE.
@@ -194,13 +195,22 @@ defmodule Ferricstore.Commands.HyperLogLog do
   end
 
   defp ensure_not_compound_key(key, store) do
-    if Ops.has_compound?(store) and
-         (Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
-            Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil) do
+    if compound_data_structure_key?(key, store) do
       @wrongtype_error
     else
       :ok
     end
+  end
+
+  defp compound_data_structure_key?(key, store) do
+    Ops.has_compound?(store) and
+      compound_type_marker?(key, store) and
+      TypeRegistry.get_type(key, store) != "none"
+  end
+
+  defp compound_type_marker?(key, store) do
+    Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
+      Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil
   end
 
   # Validates that a binary is the right size for an HLL sketch.

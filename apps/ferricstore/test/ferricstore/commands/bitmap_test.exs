@@ -3,6 +3,7 @@ defmodule Ferricstore.Commands.BitmapTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.Bitmap
+  alias Ferricstore.Commands.Hash
   alias Ferricstore.Commands.Set
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
@@ -17,6 +18,16 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert 0 == Bitmap.handle("SETBIT", ["mykey", "7", "1"], store)
       # Bit 7 is the LSB of byte 0 => byte value should be 1
       assert <<1>> == store.get.("mykey")
+    end
+
+    test "treats a fully expired hash as a missing bitmap key before TYPE cleanup" do
+      store = MockStore.make()
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
+      field_key = CompoundKey.hash_field("mykey", "field")
+      store.compound_put.("mykey", field_key, "value", System.os_time(:millisecond) - 1)
+
+      assert 0 == Bitmap.handle("SETBIT", ["mykey", "0", "1"], store)
+      assert <<128>> == store.get.("mykey")
     end
 
     test "returns old bit value when overwriting" do

@@ -2,9 +2,11 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Commands.Hash
   alias Ferricstore.Commands.Set
   alias Ferricstore.Commands.HyperLogLog, as: HLLCmd
   alias Ferricstore.HyperLogLog, as: HLL
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -19,6 +21,16 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
       # The key now holds a valid HLL sketch
       sketch = store.get.("mykey")
       assert HLL.valid_sketch?(sketch)
+    end
+
+    test "PFADD treats a fully expired hash as a missing HLL key before TYPE cleanup" do
+      store = MockStore.make()
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
+      field_key = CompoundKey.hash_field("mykey", "field")
+      store.compound_put.("mykey", field_key, "value", System.os_time(:millisecond) - 1)
+
+      assert 1 == HLLCmd.handle("PFADD", ["mykey", "hello"], store)
+      assert HLL.valid_sketch?(store.get.("mykey"))
     end
 
     test "PFADD same element twice — second returns 0" do

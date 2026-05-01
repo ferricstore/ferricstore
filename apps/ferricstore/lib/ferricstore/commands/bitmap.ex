@@ -1,6 +1,7 @@
 defmodule Ferricstore.Commands.Bitmap do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.TypeRegistry
 
   @moduledoc """
   Handles Redis bitmap commands: SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP.
@@ -286,8 +287,13 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp compound_data_structure_key?(key, store) do
     Ops.has_compound?(store) and
-      (Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
-         Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil)
+      compound_type_marker?(key, store) and
+      TypeRegistry.get_type(key, store) != "none"
+  end
+
+  defp compound_type_marker?(key, store) do
+    Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
+      Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil
   end
 
   defp clear_compound_data_structure(key, store) do
