@@ -138,10 +138,27 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp forward_bypass_to_leader(leader_node, _idx, command) do
+  defp forward_bypass_to_leader(leader_node, idx, command) do
     try do
       remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
-      :erpc.call(leader_node, __MODULE__, :run_bypass_locally, [remote_ctx, command], 10_000)
+
+      result =
+        :erpc.call(
+          leader_node,
+          __MODULE__,
+          :run_bypass_locally,
+          [remote_ctx, command, node()],
+          10_000
+        )
+
+      case result do
+        {:remote_applied_at, ra_index, real_result} ->
+          _ = Ferricstore.Raft.Batcher.await_local_applied(idx, ra_index, 5_000)
+          real_result
+
+        other ->
+          other
+      end
     catch
       _, reason -> forward_failure_result(reason)
     end
@@ -174,7 +191,10 @@ defmodule Ferricstore.Store.Router do
   # when a bypass_shard? command is forwarded to its shard's leader.
   # Re-runs the command on the local (leader) node, going through the
   # normal raft_write path which now recognizes us as the leader.
-  def run_bypass_locally(ctx, command) do
+  def run_bypass_locally(ctx, command), do: run_bypass_locally(ctx, command, node())
+
+  @doc false
+  def run_bypass_locally(ctx, command, origin_node) do
     key =
       case command do
         {:json_op, _, [k | _]} -> k
@@ -187,7 +207,13 @@ defmodule Ferricstore.Store.Router do
         {:tdigest_op, _, [k | _]} -> k
       end
 
-    raft_write(ctx, shard_for(ctx, key), key, command)
+    idx = shard_for(ctx, key)
+
+    if origin_node == node() do
+      raft_write(ctx, idx, key, command)
+    else
+      forced_quorum_write(ctx, idx, command, origin_node)
+    end
   end
 
   @doc "Public wrapper for durability_for_key, used by batch SET fast path."
@@ -387,10 +413,18 @@ defmodule Ferricstore.Store.Router do
   # (`write_async_quorum`) which ignores namespace durability and puts
   # the command in the quorum slot regardless.
   defp async_write(ctx, idx, command) do
+    forced_quorum_write(ctx, idx, command, node())
+  end
+
+  defp forced_quorum_write(ctx, idx, command, origin_node) do
     ref = make_ref()
     from = {self(), ref}
 
-    Ferricstore.Raft.Batcher.write_async_quorum(idx, command, from)
+    if origin_node == node() do
+      Ferricstore.Raft.Batcher.write_async_quorum(idx, command, from)
+    else
+      Ferricstore.Raft.Batcher.write_async_quorum_forwarded(idx, command, from, origin_node)
+    end
 
     result =
       receive do
@@ -413,11 +447,18 @@ defmodule Ferricstore.Store.Router do
         result
 
       _ ->
-        size = :counters.info(ctx.write_version).size
-        if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
+        bump_write_version(ctx, idx)
         result
     end
   end
+
+  defp bump_write_version(%{write_version: write_version}, idx) do
+    size = :counters.info(write_version).size
+    if idx < size, do: :counters.add(write_version, idx + 1, 1)
+    :ok
+  end
+
+  defp bump_write_version(_ctx, _idx), do: :ok
 
   # ---------------------------------------------------------------------------
   # Async RMW: latch-first, worker fallback
