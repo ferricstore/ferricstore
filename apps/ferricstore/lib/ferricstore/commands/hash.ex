@@ -770,16 +770,37 @@ defmodule Ferricstore.Commands.Hash do
     end
   end
 
-  # Walk flat [field, value, field, value, ...] list directly without
-  # Enum.chunk_every intermediate allocation.
-  defp hset_pairs([], _key, _store, acc), do: acc
+  defp hset_pairs(field_value_pairs, key, store, _acc) do
+    {fields, values_by_field} = collapse_field_values(field_value_pairs, [], %{})
+    compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
 
-  defp hset_pairs([field, value | rest], key, store, acc) do
-    compound_key = CompoundKey.hash_field(key, field)
-    existing = Ops.compound_get(store, key, compound_key)
-    Ops.compound_put(store, key, compound_key, value, 0)
-    new_acc = if existing == nil, do: acc + 1, else: acc
-    hset_pairs(rest, key, store, new_acc)
+    added =
+      store
+      |> Ops.compound_batch_get(key, compound_keys)
+      |> Enum.count(&is_nil/1)
+
+    fields
+    |> Enum.zip(compound_keys)
+    |> Enum.each(fn {field, compound_key} ->
+      Ops.compound_put(store, key, compound_key, Map.fetch!(values_by_field, field), 0)
+    end)
+
+    added
+  end
+
+  defp collapse_field_values([], fields_rev, values_by_field) do
+    {Enum.reverse(fields_rev), values_by_field}
+  end
+
+  defp collapse_field_values([field, value | rest], fields_rev, values_by_field) do
+    next_fields_rev =
+      if Map.has_key?(values_by_field, field) do
+        fields_rev
+      else
+        [field | fields_rev]
+      end
+
+    collapse_field_values(rest, next_fields_rev, Map.put(values_by_field, field, value))
   end
 
   # Same as hset_pairs but with per-field TTL.

@@ -53,6 +53,45 @@ defmodule Ferricstore.Commands.HashTest do
       Hash.handle("HSET", ["hash", "existing", "old"], store)
       assert 1 == Hash.handle("HSET", ["hash", "existing", "updated", "new", "val"], store)
     end
+
+    test "HSET batches field existence reads and writes final duplicate value once" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+
+      field_keys = [
+        CompoundKey.hash_field("hash", "f1"),
+        CompoundKey.hash_field("hash", "existing"),
+        CompoundKey.hash_field("hash", "f2")
+      ]
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key ->
+            "hash"
+
+          "hash", compound_key ->
+            flunk("HSET should use compound_batch_get, got per-field lookup #{inspect(compound_key)}")
+        end,
+        compound_batch_get: fn "hash", ^field_keys ->
+          send(parent, {:compound_batch_get, field_keys})
+          [nil, "old", nil]
+        end,
+        compound_put: fn "hash", compound_key, value, 0 ->
+          send(parent, {:compound_put, compound_key, value})
+          :ok
+        end
+      }
+
+      assert 2 ==
+               Hash.handle("HSET", ["hash", "f1", "v1", "existing", "new", "f1", "v2", "f2", "v3"], store)
+
+      assert_received {:compound_batch_get, ^field_keys}
+      assert_received {:compound_put, f1_key, "v2"}
+      assert_received {:compound_put, existing_key, "new"}
+      assert_received {:compound_put, f2_key, "v3"}
+      assert Enum.sort([f1_key, existing_key, f2_key]) == Enum.sort(field_keys)
+      refute_received {:compound_put, _, _}
+    end
   end
 
   # ---------------------------------------------------------------------------
