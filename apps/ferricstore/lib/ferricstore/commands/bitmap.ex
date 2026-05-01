@@ -101,15 +101,20 @@ defmodule Ferricstore.Commands.Bitmap do
     with :ok <- ensure_string_key(key, store),
          {:ok, offset} <- parse_non_negative_integer(offset_str, "bit offset"),
          :ok <- check_bit_offset(offset) do
-      current = Ops.get(store, key) || <<>>
       byte_index = div(offset, 8)
 
-      if byte_index >= byte_size(current) do
+      if byte_index_outside_value?(store, key, byte_index) do
         0
       else
-        byte = :binary.at(current, byte_index)
-        bit_position = 7 - rem(offset, 8)
-        byte >>> bit_position &&& 1
+        current = Ops.get(store, key) || <<>>
+
+        if byte_index >= byte_size(current) do
+          0
+        else
+          byte = :binary.at(current, byte_index)
+          bit_position = 7 - rem(offset, 8)
+          byte >>> bit_position &&& 1
+        end
       end
     end
   end
@@ -136,11 +141,15 @@ defmodule Ferricstore.Commands.Bitmap do
          {:ok, mode} <- mode,
          {:ok, start_idx} <- parse_integer(start_str),
          {:ok, end_idx} <- parse_integer(end_str) do
-      current = Ops.get(store, key) || <<>>
+      if bitcount_range_empty_without_value?(store, key, mode, start_idx, end_idx) do
+        0
+      else
+        current = Ops.get(store, key) || <<>>
 
-      case mode do
-        :byte -> bitcount_byte_range(current, start_idx, end_idx)
-        :bit -> bitcount_bit_range(current, start_idx, end_idx)
+        case mode do
+          :byte -> bitcount_byte_range(current, start_idx, end_idx)
+          :bit -> bitcount_bit_range(current, start_idx, end_idx)
+        end
       end
     end
   end
@@ -231,6 +240,35 @@ defmodule Ferricstore.Commands.Bitmap do
   # ===========================================================================
   # Private helpers
   # ===========================================================================
+
+  defp byte_index_outside_value?(store, key, byte_index) do
+    case Ops.value_size(store, key) do
+      size when is_integer(size) -> byte_index >= size
+      _ -> false
+    end
+  end
+
+  defp bitcount_range_empty_without_value?(_store, _key, _mode, start_idx, end_idx)
+       when start_idx >= 0 and end_idx >= 0 and start_idx > end_idx,
+       do: true
+
+  defp bitcount_range_empty_without_value?(store, key, :byte, start_idx, _end_idx)
+       when start_idx >= 0 do
+    case Ops.value_size(store, key) do
+      size when is_integer(size) -> start_idx >= size
+      _ -> false
+    end
+  end
+
+  defp bitcount_range_empty_without_value?(store, key, :bit, start_idx, _end_idx)
+       when start_idx >= 0 do
+    case Ops.value_size(store, key) do
+      size when is_integer(size) -> start_idx >= size * 8
+      _ -> false
+    end
+  end
+
+  defp bitcount_range_empty_without_value?(_store, _key, _mode, _start_idx, _end_idx), do: false
 
   # --- Parsing helpers -------------------------------------------------------
 

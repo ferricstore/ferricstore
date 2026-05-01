@@ -142,6 +142,16 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert 0 == Bitmap.handle("GETBIT", ["mykey", "100"], store)
     end
 
+    test "beyond known cold value size returns 0 without loading value" do
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 1 end,
+        get: fn _key -> flunk("GETBIT should not load a cold value for out-of-range offset") end
+      }
+
+      assert 0 == Bitmap.handle("GETBIT", ["cold", "8"], store)
+    end
+
     test "returns correct bit at offset 0 (MSB)" do
       store = MockStore.make(%{"mykey" => {<<128>>, 0}})
       assert 1 == Bitmap.handle("GETBIT", ["mykey", "0"], store)
@@ -258,6 +268,17 @@ defmodule Ferricstore.Commands.BitmapTest do
     test "out-of-range byte indices return 0" do
       store = MockStore.make(%{"mykey" => {<<0xFF>>, 0}})
       assert 0 == Bitmap.handle("BITCOUNT", ["mykey", "5", "10"], store)
+    end
+
+    test "out-of-range cold value indices return 0 without loading value" do
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 1 end,
+        get: fn _key -> flunk("BITCOUNT should not load a cold value for out-of-range range") end
+      }
+
+      assert 0 == Bitmap.handle("BITCOUNT", ["cold", "1", "10"], store)
+      assert 0 == Bitmap.handle("BITCOUNT", ["cold", "8", "80", "BIT"], store)
     end
 
     test "reversed range (start > end) returns 0" do
