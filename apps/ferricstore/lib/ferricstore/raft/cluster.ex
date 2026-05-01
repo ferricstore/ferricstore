@@ -66,7 +66,7 @@ defmodule Ferricstore.Raft.Cluster do
       wal_data_dir: ra_data_dir,
       segment_max_entries: 32_768,
       wal_max_batch_size: 32_768,
-      wal_compute_checksums: false,
+      wal_compute_checksums: true,
       wal_pre_allocate: true,
       wal_io_module: :ferricstore_wal_nif,
       wal_commit_delay_us: commit_delay_us
