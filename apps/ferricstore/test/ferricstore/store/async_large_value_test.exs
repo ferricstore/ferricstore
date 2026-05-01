@@ -139,6 +139,60 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
       end
     end
 
+    test "large PUT disk error does not inflate keydir byte accounting" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "alv_test:" <> :binary.copy("put_large_disk_error", 8)
+      value = cold_value(?p)
+      idx = Router.shard_for(ctx, key)
+      keydir = elem(ctx.keydir_refs, idx)
+      before_bytes = :atomics.get(ctx.keydir_binary_bytes, idx + 1)
+      {file_id, file_path, shard_path} = Ferricstore.Store.ActiveFile.get(idx)
+
+      missing_path =
+        Path.join([
+          System.tmp_dir!(),
+          "missing_ferricstore_#{System.unique_integer([:positive])}",
+          "00000.log"
+        ])
+
+      Ferricstore.Store.ActiveFile.publish(idx, file_id, missing_path, Path.dirname(missing_path))
+
+      try do
+        assert {:error, "ERR disk write failed" <> _} = Router.put(ctx, key, value, 0)
+        assert :ets.lookup(keydir, key) == []
+        assert :atomics.get(ctx.keydir_binary_bytes, idx + 1) == before_bytes
+      after
+        Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_path)
+      end
+    end
+
+    test "missing-key APPEND disk error does not inflate keydir byte accounting" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "alv_test:" <> :binary.copy("append_missing_disk_error", 8)
+      suffix = cold_value(?m)
+      idx = Router.shard_for(ctx, key)
+      keydir = elem(ctx.keydir_refs, idx)
+      before_bytes = :atomics.get(ctx.keydir_binary_bytes, idx + 1)
+      {file_id, file_path, shard_path} = Ferricstore.Store.ActiveFile.get(idx)
+
+      missing_path =
+        Path.join([
+          System.tmp_dir!(),
+          "missing_ferricstore_#{System.unique_integer([:positive])}",
+          "00000.log"
+        ])
+
+      Ferricstore.Store.ActiveFile.publish(idx, file_id, missing_path, Path.dirname(missing_path))
+
+      try do
+        assert {:error, "ERR disk write failed" <> _} = FerricStore.append(key, suffix)
+        assert :ets.lookup(keydir, key) == []
+        assert :atomics.get(ctx.keydir_binary_bytes, idx + 1) == before_bytes
+      after
+        Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_path)
+      end
+    end
+
     test "GETSET returns and replaces an existing cold large value" do
       key = "alv_test:getset_cold"
       value = cold_value(?g)

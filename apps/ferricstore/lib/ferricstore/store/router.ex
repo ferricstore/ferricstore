@@ -743,13 +743,13 @@ defmodule Ferricstore.Store.Router do
 
     disk_value = to_disk_binary(value)
 
-    track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
-
     result =
       if value_for_ets == nil do
         # Large — sync NIF write then ETS with real offset.
         case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
           {:ok, file_id, [{offset, _record_size}]} ->
+            track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
+
             :ets.insert(
               keydir,
               {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
@@ -762,6 +762,7 @@ defmodule Ferricstore.Store.Router do
         end
       else
         {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+        track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
         :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
 
         Ferricstore.Store.BitcaskWriter.write(
@@ -855,8 +856,6 @@ defmodule Ferricstore.Store.Router do
       end
 
     disk_value = to_disk_binary(value)
-    # Track off-heap binary bytes for MemoryGuard accuracy
-    track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
 
     if value_for_ets == nil do
       # Large value: sync NIF write to get offset, then ETS with real location.
@@ -865,6 +864,7 @@ defmodule Ferricstore.Store.Router do
       case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
         {:ok, file_id, [{offset, _record_size}]} ->
           clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
+          track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
 
           :ets.insert(
             keydir,
@@ -883,6 +883,7 @@ defmodule Ferricstore.Store.Router do
       # Small value: ETS insert only. Bitcask write deferred to state machine
       # apply (flush_pending_writes) — avoids per-key NIF overhead in Router.
       clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
+      track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
       :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
       size = :counters.info(ctx.write_version).size
       if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
