@@ -865,6 +865,8 @@ defmodule Ferricstore.Store.Router do
       # hot cache) and readers would see nil until the async write completes.
       case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
         {:ok, file_id, [{offset, _record_size}]} ->
+          clear_compound_data_structure_for_string_put(ctx, idx, key)
+
           :ets.insert(
             keydir,
             {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
@@ -881,6 +883,7 @@ defmodule Ferricstore.Store.Router do
     else
       # Small value: ETS insert only. Bitcask write deferred to state machine
       # apply (flush_pending_writes) — avoids per-key NIF overhead in Router.
+      clear_compound_data_structure_for_string_put(ctx, idx, key)
       :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
       size = :counters.info(ctx.write_version).size
       if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
@@ -892,6 +895,65 @@ defmodule Ferricstore.Store.Router do
   defp to_disk_binary(v) when is_integer(v), do: Integer.to_string(v)
   defp to_disk_binary(v) when is_float(v), do: Float.to_string(v)
   defp to_disk_binary(v) when is_binary(v), do: v
+
+  defp clear_compound_data_structure_for_string_put(ctx, idx, key) do
+    unless CompoundKey.internal_key?(key) do
+      keydir = elem(ctx.keydir_refs, idx)
+      {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+      type_key = CompoundKey.type_key(key)
+
+      case origin_compound_get(ctx, idx, keydir, type_key) do
+        nil ->
+          clear_legacy_list_metadata_for_string_put(ctx, idx, keydir, file_path, key)
+
+        type ->
+          clear_compound_prefix_for_string_put(ctx, idx, keydir, file_path, key, type)
+          delete_local_key(ctx, idx, keydir, file_path, type_key)
+      end
+    end
+
+    :ok
+  end
+
+  defp clear_legacy_list_metadata_for_string_put(ctx, idx, keydir, file_path, key) do
+    list_meta_key = CompoundKey.list_meta_key(key)
+
+    if origin_compound_get(ctx, idx, keydir, list_meta_key) != nil do
+      clear_compound_prefix_for_string_put(ctx, idx, keydir, file_path, key, "list")
+      delete_local_key(ctx, idx, keydir, file_path, list_meta_key)
+    end
+  end
+
+  defp clear_compound_prefix_for_string_put(ctx, idx, keydir, file_path, key, "hash"),
+    do: delete_local_prefix(ctx, idx, keydir, file_path, CompoundKey.hash_prefix(key))
+
+  defp clear_compound_prefix_for_string_put(ctx, idx, keydir, file_path, key, "list") do
+    delete_local_prefix(ctx, idx, keydir, file_path, CompoundKey.list_prefix(key))
+    delete_local_key(ctx, idx, keydir, file_path, CompoundKey.list_meta_key(key))
+  end
+
+  defp clear_compound_prefix_for_string_put(ctx, idx, keydir, file_path, key, "set"),
+    do: delete_local_prefix(ctx, idx, keydir, file_path, CompoundKey.set_prefix(key))
+
+  defp clear_compound_prefix_for_string_put(ctx, idx, keydir, file_path, key, "zset"),
+    do: delete_local_prefix(ctx, idx, keydir, file_path, CompoundKey.zset_prefix(key))
+
+  defp clear_compound_prefix_for_string_put(_ctx, _idx, _keydir, _file_path, _key, _type),
+    do: :ok
+
+  defp delete_local_prefix(ctx, idx, keydir, file_path, prefix) do
+    keydir
+    |> Ferricstore.Store.Shard.ETS.prefix_collect_keys(prefix)
+    |> Enum.each(fn compound_key ->
+      delete_local_key(ctx, idx, keydir, file_path, compound_key)
+    end)
+  end
+
+  defp delete_local_key(ctx, idx, keydir, file_path, key) do
+    track_keydir_binary_delete(ctx, idx, keydir, key)
+    :ets.delete(keydir, key)
+    Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
+  end
 
   # NIF batch write with retry on stale active file (ENOENT after rotation).
   # Returns {:ok, file_id, locations} or {:error, reason}.

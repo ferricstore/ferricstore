@@ -214,6 +214,20 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       assert Router.get(ctx(), plain_key) == "plain_val"
       assert Router.compound_get(ctx(), redis_key, ck) == "hash_val"
     end
+
+    test "SET over an existing hash clears compound metadata and fields" do
+      key = ukey("set_over_hash")
+
+      assert :ok = FerricStore.hset(key, %{"field" => "hash_val"})
+      assert {:ok, "hash_val"} = FerricStore.hget(key, "field")
+
+      assert :ok = FerricStore.set(key, "plain_val")
+
+      assert {:ok, "plain_val"} = FerricStore.get(key)
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.hget(key, "field")
+      assert nil == Router.compound_get(ctx(), key, CompoundKey.type_key(key))
+      assert nil == Router.compound_get(ctx(), key, hash_field(key, "field"))
+    end
   end
 
   # ---------------------------------------------------------------------------
