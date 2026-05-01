@@ -2327,7 +2327,9 @@ defmodule Ferricstore.Store.Router do
         [{_, _, exp, _, fid, off, vsize}] when exp > now and is_integer(fid) and fid >= 0 ->
           {:ok, {fid, off, vsize}}
 
-        [{_, _, _exp, _, _fid, _off, _vsize}] ->
+        [{^key, _, _exp, _, _fid, _off, _vsize}] ->
+          track_keydir_binary_delete(ctx, idx, keydir, key)
+          :ets.delete(keydir, key)
           :miss
 
         [] ->
