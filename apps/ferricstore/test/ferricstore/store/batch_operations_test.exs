@@ -307,6 +307,21 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Router.dbsize
+  # ---------------------------------------------------------------------------
+
+  describe "Router.dbsize" do
+    test "does not count expired keys before the sweep removes them" do
+      past = System.os_time(:millisecond) - 1_000
+
+      :ok = Router.put(ctx(), "#{@ns_quorum}:dbsize_live", "live", 0)
+      :ok = Router.put(ctx(), "#{@ns_quorum}:dbsize_expired", "expired", past)
+
+      assert Router.dbsize(ctx()) == 1
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # FerricStore.packed_batch_get (binary protocol)
   # ---------------------------------------------------------------------------
 

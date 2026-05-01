@@ -2039,14 +2039,25 @@ defmodule Ferricstore.Store.Router do
   @spec dbsize(FerricStore.Instance.t()) :: non_neg_integer()
   def dbsize(ctx) do
     sc = ctx.shard_count
+    now = HLC.now_ms()
 
     Enum.reduce(0..(sc - 1), 0, fn i, acc ->
-      try do
-        acc + :ets.info(resolve_keydir(ctx, i), :size)
-      rescue
-        ArgumentError -> acc
-      end
+      acc + live_keydir_size(resolve_keydir(ctx, i), now)
     end)
+  end
+
+  defp live_keydir_size(keydir, now) do
+    :ets.foldl(
+      fn
+        {_key, _value, 0, _lfu, _fid, _off, _vsize}, acc -> acc + 1
+        {_key, _value, exp, _lfu, _fid, _off, _vsize}, acc when exp > now -> acc + 1
+        {_key, _value, _exp, _lfu, _fid, _off, _vsize}, acc -> acc
+      end,
+      0,
+      keydir
+    )
+  rescue
+    ArgumentError -> 0
   end
 
   @doc """
