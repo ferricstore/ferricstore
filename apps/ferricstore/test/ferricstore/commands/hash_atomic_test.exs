@@ -511,6 +511,47 @@ defmodule Ferricstore.Commands.HashAtomicTest do
       assert pttl_f2 == -1
     end
 
+    test "batches field meta reads and preserves duplicate field results" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+
+      field_keys = [
+        CompoundKey.hash_field("hash", "expiring"),
+        CompoundKey.hash_field("hash", "persistent"),
+        CompoundKey.hash_field("hash", "missing")
+      ]
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key ->
+            "hash"
+
+          "hash", compound_key ->
+            flunk("HPTTL should only use compound_get for type, got #{inspect(compound_key)}")
+        end,
+        compound_get_meta: fn "hash", compound_key ->
+          flunk("HPTTL should use compound_batch_get_meta, got #{inspect(compound_key)}")
+        end,
+        compound_batch_get_meta: fn "hash", ^field_keys ->
+          send(parent, {:compound_batch_get_meta, field_keys})
+          [{"v1", Ferricstore.CommandTime.now_ms() + 60_000}, {"v2", 0}, nil]
+        end
+      }
+
+      [pttl1, pttl2, persistent_pttl, missing_pttl] =
+        Hash.handle(
+          "HPTTL",
+          ["hash", "FIELDS", "4", "expiring", "expiring", "persistent", "missing"],
+          store
+        )
+
+      assert_received {:compound_batch_get_meta, ^field_keys}
+      assert pttl1 >= 59_000 and pttl1 <= 60_000
+      assert pttl2 == pttl1
+      assert persistent_pttl == -1
+      assert missing_pttl == -2
+    end
+
     test "with wrong number of arguments returns error" do
       store = MockStore.make()
       assert {:error, _} = Hash.handle("HPTTL", ["hash"], store)

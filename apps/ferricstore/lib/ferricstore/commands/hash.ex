@@ -433,11 +433,10 @@ defmodule Ferricstore.Commands.Hash do
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
         now = CommandTime.now_ms()
+        {_unique_fields, _compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
 
         Enum.map(fields, fn field ->
-          compound_key = CompoundKey.hash_field(key, field)
-
-          case Ops.compound_get_meta(store, key, compound_key) do
+          case Map.fetch!(metas_by_field, field) do
             nil ->
               -2
 
