@@ -8,6 +8,28 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
   alias Ferricstore.Commands.{Expiry, Strings}
   alias Ferricstore.Test.MockStore
 
+  describe "string command backend errors" do
+    test "APPEND returns backend errors instead of raising" do
+      store =
+        MockStore.make()
+        |> Map.put(:append, fn _key, _suffix -> {:error, "ERR async replication overloaded"} end)
+
+      assert {:error, "ERR async replication overloaded"} =
+               Strings.handle("APPEND", ["k", "suffix"], store)
+    end
+
+    test "SETRANGE returns backend errors instead of raising" do
+      store =
+        MockStore.make()
+        |> Map.put(:setrange, fn _key, _offset, _value ->
+          {:error, "ERR disk pressure on shard 0, rejecting async write"}
+        end)
+
+      assert {:error, "ERR disk pressure on shard 0, rejecting async write"} =
+               Strings.handle("SETRANGE", ["k", "0", "value"], store)
+    end
+  end
+
   # ===========================================================================
   # TTL edge cases — spec-required behavior
   # ===========================================================================
@@ -549,71 +571,95 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
   describe "SET mutual exclusion errors" do
     test "EXAT + EX returns syntax error" do
       store = MockStore.make()
+
       assert {:error, msg} =
                Strings.handle("SET", ["k", "v", "EXAT", "9999999999", "EX", "10"], store)
+
       assert msg =~ "syntax error"
     end
 
     test "PXAT + PX returns syntax error" do
       store = MockStore.make()
+
       assert {:error, msg} =
                Strings.handle("SET", ["k", "v", "PXAT", "9999999999000", "PX", "10000"], store)
+
       assert msg =~ "syntax error"
     end
 
     test "EXAT + PXAT returns syntax error" do
       store = MockStore.make()
+
       assert {:error, msg} =
-               Strings.handle("SET", ["k", "v", "EXAT", "9999999999", "PXAT", "9999999999000"], store)
+               Strings.handle(
+                 "SET",
+                 ["k", "v", "EXAT", "9999999999", "PXAT", "9999999999000"],
+                 store
+               )
+
       assert msg =~ "syntax error"
     end
 
     test "EX + EXAT returns syntax error" do
       store = MockStore.make()
+
       assert {:error, msg} =
                Strings.handle("SET", ["k", "v", "EX", "10", "EXAT", "9999999999"], store)
+
       assert msg =~ "syntax error"
     end
 
     test "KEEPTTL + EX returns syntax error" do
       store = MockStore.make()
+
       assert {:error, msg} =
                Strings.handle("SET", ["k", "v", "KEEPTTL", "EX", "10"], store)
+
       assert msg =~ "syntax error"
     end
 
     test "KEEPTTL + PX returns syntax error" do
       store = MockStore.make()
+
       assert {:error, msg} =
                Strings.handle("SET", ["k", "v", "KEEPTTL", "PX", "10000"], store)
+
       assert msg =~ "syntax error"
     end
 
     test "EX + KEEPTTL returns syntax error" do
       store = MockStore.make()
+
       assert {:error, msg} =
                Strings.handle("SET", ["k", "v", "EX", "10", "KEEPTTL"], store)
+
       assert msg =~ "syntax error"
     end
 
     test "PX + KEEPTTL returns syntax error" do
       store = MockStore.make()
+
       assert {:error, msg} =
                Strings.handle("SET", ["k", "v", "PX", "10000", "KEEPTTL"], store)
+
       assert msg =~ "syntax error"
     end
 
     test "KEEPTTL + EXAT returns syntax error" do
       store = MockStore.make()
+
       assert {:error, msg} =
                Strings.handle("SET", ["k", "v", "KEEPTTL", "EXAT", "9999999999"], store)
+
       assert msg =~ "syntax error"
     end
 
     test "KEEPTTL + PXAT returns syntax error" do
       store = MockStore.make()
+
       assert {:error, msg} =
                Strings.handle("SET", ["k", "v", "KEEPTTL", "PXAT", "9999999999000"], store)
+
       assert msg =~ "syntax error"
     end
   end

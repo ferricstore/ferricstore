@@ -240,8 +240,10 @@ defmodule Ferricstore.Commands.Strings do
   def handle("APPEND", [key, value], store) do
     case ensure_string_key(key, store) do
       :ok ->
-        {:ok, new_len} = Ops.append(store, key, value)
-        new_len
+        case Ops.append(store, key, value) do
+          {:ok, new_len} -> new_len
+          {:error, _} = err -> err
+        end
 
       @wrongtype_error ->
         @wrongtype_error
@@ -412,8 +414,10 @@ defmodule Ferricstore.Commands.Strings do
       {offset, ""} when offset >= 0 and offset <= @max_setrange_offset ->
         case ensure_string_key(key, store) do
           :ok ->
-            {:ok, new_len} = Ops.setrange(store, key, offset, value)
-            new_len
+            case Ops.setrange(store, key, offset, value) do
+              {:ok, new_len} -> new_len
+              {:error, _} = err -> err
+            end
 
           @wrongtype_error ->
             @wrongtype_error
