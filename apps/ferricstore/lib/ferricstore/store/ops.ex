@@ -67,6 +67,40 @@ defmodule Ferricstore.Store.Ops do
 
   def get_meta(store, key) when is_map(store), do: store.get_meta.(key)
 
+  @spec expire_at_ms(store(), binary()) :: non_neg_integer() | nil
+  def expire_at_ms(%FerricStore.Instance{} = ctx, key), do: Router.expire_at_ms(ctx, key)
+
+  def expire_at_ms(%LocalTxStore{} = tx, key) do
+    if local?(tx, key) do
+      case tx_pending_meta(key) do
+        {_value, exp} ->
+          exp
+
+        nil ->
+          case ShardETS.ets_lookup(tx.shard_state, key) do
+            {:hit, _value, exp} -> exp
+            {:cold, _fid, _off, _vsize, exp} -> exp
+            _ -> nil
+          end
+      end
+    else
+      Router.expire_at_ms(tx.instance_ctx, key)
+    end
+  end
+
+  def expire_at_ms(store, key) when is_map(store) do
+    case store do
+      %{expire_at_ms: expire_at_ms} when is_function(expire_at_ms, 1) ->
+        expire_at_ms.(key)
+
+      _ ->
+        case get_meta(store, key) do
+          nil -> nil
+          {_value, expire_at_ms} -> expire_at_ms
+        end
+    end
+  end
+
   @spec put(store(), binary(), binary(), non_neg_integer()) :: :ok | {:error, binary()}
   def put(%FerricStore.Instance{} = ctx, key, value, exp), do: Router.put(ctx, key, value, exp)
 

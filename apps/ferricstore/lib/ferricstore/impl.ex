@@ -740,6 +740,7 @@ defmodule FerricStore.Impl do
     %{
       get: fn key -> Router.get(ctx, key) end,
       get_meta: fn key -> Router.get_meta(ctx, key) end,
+      expire_at_ms: fn key -> Router.expire_at_ms(ctx, key) end,
       put: fn key, value, exp -> Router.put(ctx, key, value, exp) end,
       delete: fn key -> Router.delete(ctx, key) end,
       exists?: fn key -> Router.exists?(ctx, key) end,
@@ -808,6 +809,7 @@ defmodule FerricStore.Impl do
     %{
       get: fn k -> Router.get(ctx, k) end,
       get_meta: fn k -> Router.get_meta(ctx, k) end,
+      expire_at_ms: fn k -> Router.expire_at_ms(ctx, k) end,
       put: fn k, value, exp -> Router.put(ctx, k, value, exp) end,
       delete: fn k -> Router.delete(ctx, k) end,
       exists?: fn k -> Router.exists?(ctx, k) end,

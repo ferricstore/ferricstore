@@ -1503,6 +1503,39 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @doc """
+  Returns the expiry timestamp for a live plain key without reading its value.
+
+  This is used by expiry-time commands so cold large values do not pay a
+  Bitcask pread just to report TTL metadata.
+  """
+  @spec expire_at_ms(FerricStore.Instance.t(), binary()) :: non_neg_integer() | nil
+  def expire_at_ms(ctx, key) do
+    idx = shard_for(ctx, key)
+    keydir = resolve_keydir(ctx, idx)
+    now = HLC.now_ms()
+
+    try do
+      case :ets.lookup(keydir, key) do
+        [{^key, _value, 0, _lfu, _fid, _off, _vsize}] ->
+          0
+
+        [{^key, _value, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
+          exp
+
+        [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
+          track_keydir_binary_delete(ctx, idx, keydir, key)
+          :ets.delete(keydir, key)
+          nil
+
+        [] ->
+          nil
+      end
+    rescue
+      ArgumentError -> nil
+    end
+  end
+
   # Sampling rate for read-side bookkeeping (LFU touch + hot/cold stats).
   # 1 in N reads performs the ETS writes. Reduces write contention at high
   # concurrency with negligible impact on LFU accuracy (logarithmic counter)

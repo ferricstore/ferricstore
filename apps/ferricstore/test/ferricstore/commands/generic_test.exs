@@ -487,6 +487,18 @@ defmodule Ferricstore.Commands.GenericTest do
       assert result == expire_at_ms
     end
 
+    test "PEXPIRETIME reads expiry without loading the value" do
+      expire_at_ms = System.os_time(:millisecond) + 60_000
+
+      store = %{
+        expire_at_ms: fn "cold_ttl" -> expire_at_ms end,
+        get_meta: fn _key -> flunk("PEXPIRETIME should not load the value") end,
+        compound_get_meta: fn _redis_key, _compound_key -> nil end
+      }
+
+      assert expire_at_ms == Generic.handle("PEXPIRETIME", ["cold_ttl"], store)
+    end
+
     test "PEXPIRETIME with no args returns error" do
       assert {:error, _} = Generic.handle("PEXPIRETIME", [], MockStore.make())
     end

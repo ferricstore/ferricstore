@@ -252,9 +252,9 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp key_meta(store, key) do
-    case Ops.get_meta(store, key) do
+    case Ops.expire_at_ms(store, key) do
       nil -> compound_expire_at_ms(store, key)
-      {_value, expire_at_ms} -> expire_at_ms
+      expire_at_ms -> expire_at_ms
     end
   end
 
