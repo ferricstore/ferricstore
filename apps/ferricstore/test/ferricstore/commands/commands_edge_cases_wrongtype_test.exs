@@ -5,7 +5,7 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Strings, Hash, Set, SortedSet}
+  alias Ferricstore.Commands.{Hash, List, Set, SortedSet, Strings}
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
@@ -114,34 +114,24 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
 
   describe "WRONGTYPE enforcement: HSET on string key" do
     test "HSET on a key already holding a set returns WRONGTYPE" do
-      alias Ferricstore.Commands.Hash
-
       store = MockStore.make()
-      # Register the key as a set
-      type_key = "T:mykey"
-      store.compound_put.("mykey", type_key, "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
 
       result = Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = result
     end
 
     test "HSET on a key already holding a list returns WRONGTYPE" do
-      alias Ferricstore.Commands.Hash
-
       store = MockStore.make()
-      type_key = "T:mykey"
-      store.compound_put.("mykey", type_key, "list", 0)
+      List.handle("LPUSH", ["mykey", "elem"], store)
 
       result = Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = result
     end
 
     test "HSET on a key already holding a zset returns WRONGTYPE" do
-      alias Ferricstore.Commands.Hash
-
       store = MockStore.make()
-      type_key = "T:mykey"
-      store.compound_put.("mykey", type_key, "zset", 0)
+      SortedSet.handle("ZADD", ["mykey", "1.0", "member"], store)
 
       result = Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = result
@@ -223,77 +213,56 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
 
   describe "WRONGTYPE across data structure boundaries" do
     test "LPUSH on hash key returns WRONGTYPE" do
-      alias Ferricstore.Commands.List
-
       store = MockStore.make()
-      type_key = "T:mykey"
-      store.compound_put.("mykey", type_key, "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
 
       result = List.handle("LPUSH", ["mykey", "elem"], store)
       assert {:error, "WRONGTYPE" <> _} = result
     end
 
     test "SADD on hash key returns WRONGTYPE" do
-      alias Ferricstore.Commands.Set
-
       store = MockStore.make()
-      type_key = "T:mykey"
-      store.compound_put.("mykey", type_key, "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
 
       result = Set.handle("SADD", ["mykey", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = result
     end
 
     test "ZADD on hash key returns WRONGTYPE" do
-      alias Ferricstore.Commands.SortedSet
-
       store = MockStore.make()
-      type_key = "T:mykey"
-      store.compound_put.("mykey", type_key, "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
 
       result = SortedSet.handle("ZADD", ["mykey", "1.0", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = result
     end
 
     test "HSET on list key returns WRONGTYPE" do
-      alias Ferricstore.Commands.Hash
-
       store = MockStore.make()
-      type_key = "T:mykey"
-      store.compound_put.("mykey", type_key, "list", 0)
+      List.handle("LPUSH", ["mykey", "elem"], store)
 
       result = Hash.handle("HSET", ["mykey", "f", "v"], store)
       assert {:error, "WRONGTYPE" <> _} = result
     end
 
     test "SADD on zset key returns WRONGTYPE" do
-      alias Ferricstore.Commands.Set
-
       store = MockStore.make()
-      type_key = "T:mykey"
-      store.compound_put.("mykey", type_key, "zset", 0)
+      SortedSet.handle("ZADD", ["mykey", "1.0", "member"], store)
 
       result = Set.handle("SADD", ["mykey", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = result
     end
 
     test "ZADD on set key returns WRONGTYPE" do
-      alias Ferricstore.Commands.SortedSet
-
       store = MockStore.make()
-      type_key = "T:mykey"
-      store.compound_put.("mykey", type_key, "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
 
       result = SortedSet.handle("ZADD", ["mykey", "1.0", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = result
     end
 
     test "LPUSH on set key returns WRONGTYPE" do
-      alias Ferricstore.Commands.List
-
       store = MockStore.make()
-      type_key = "T:mykey"
-      store.compound_put.("mykey", type_key, "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
 
       result = List.handle("LPUSH", ["mykey", "elem"], store)
       assert {:error, "WRONGTYPE" <> _} = result

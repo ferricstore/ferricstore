@@ -11,7 +11,7 @@ defmodule Ferricstore.Commands.ListTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Dispatcher, List, Strings}
+  alias Ferricstore.Commands.{Dispatcher, Hash, List, Strings}
   alias Ferricstore.Test.MockStore
 
   # ===========================================================================
@@ -54,6 +54,16 @@ defmodule Ferricstore.Commands.ListTest do
       Strings.handle("SET", ["mykey", "hello"], store)
       assert {:error, msg} = List.handle("LPUSH", ["mykey", "a"], store)
       assert msg =~ "WRONGTYPE"
+    end
+
+    test "LPUSH can reuse a fully expired hash before TYPE cleanup" do
+      store = MockStore.make()
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
+      compound_key = <<"H:mykey", 0, "field">>
+      store.compound_put.("mykey", compound_key, "value", System.os_time(:millisecond) - 1)
+
+      assert 1 == List.handle("LPUSH", ["mykey", "a"], store)
+      assert ["a"] == List.handle("LRANGE", ["mykey", "0", "-1"], store)
     end
   end
 

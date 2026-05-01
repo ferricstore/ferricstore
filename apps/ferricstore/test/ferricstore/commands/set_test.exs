@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.SetTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.Set
+  alias Ferricstore.Commands.{Hash, Set}
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -542,7 +542,7 @@ defmodule Ferricstore.Commands.SetTest do
   describe "type enforcement" do
     test "SADD on a key used as hash returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SADD", ["mykey", "a"], store)
     end
 

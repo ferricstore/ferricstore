@@ -4,6 +4,9 @@ defmodule Ferricstore.Commands.HashTest do
 
   alias Ferricstore.Commands.Generic
   alias Ferricstore.Commands.Hash
+  alias Ferricstore.Commands.List
+  alias Ferricstore.Commands.Set
+  alias Ferricstore.Commands.SortedSet
   alias Ferricstore.Commands.Strings
   alias Ferricstore.Test.MockStore
 
@@ -649,8 +652,7 @@ defmodule Ferricstore.Commands.HashTest do
   describe "type enforcement" do
     test "HSET on a key used as set returns WRONGTYPE" do
       store = MockStore.make()
-      # Manually set the type to "set"
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HSET", ["mykey", "f", "v"], store)
     end
 
@@ -1056,19 +1058,19 @@ defmodule Ferricstore.Commands.HashTest do
 
     test "HSETNX on a key used as set returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HSETNX", ["mykey", "f", "v"], store)
     end
 
     test "HINCRBY on a key used as list returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "list", 0)
+      List.handle("LPUSH", ["mykey", "elem"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HINCRBY", ["mykey", "f", "1"], store)
     end
 
     test "HINCRBYFLOAT on a key used as zset returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "zset", 0)
+      SortedSet.handle("ZADD", ["mykey", "1.0", "member"], store)
 
       assert {:error, "WRONGTYPE" <> _} =
                Hash.handle("HINCRBYFLOAT", ["mykey", "f", "1.0"], store)

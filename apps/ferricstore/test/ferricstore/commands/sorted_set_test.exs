@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.SortedSetTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.SortedSet
+  alias Ferricstore.Commands.{Hash, Set, SortedSet}
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -560,7 +560,7 @@ defmodule Ferricstore.Commands.SortedSetTest do
   describe "type enforcement" do
     test "ZADD on a key used as hash returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZADD", ["mykey", "1.0", "a"], store)
     end
 
@@ -686,7 +686,7 @@ defmodule Ferricstore.Commands.SortedSetTest do
 
     test "ZINCRBY on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZINCRBY", ["mykey", "1.0", "m"], store)
     end
 
