@@ -101,6 +101,17 @@ defmodule Ferricstore.Store.AsyncListOpTest do
       Router.list_op(ctx(), key, {:rpush, ["a", "b", "c", "d"]})
       assert 4 == Router.list_op(ctx(), key, :llen)
     end
+
+    test "LPUSH treats an expired plain value as missing" do
+      key = ukey("expired_plain_to_list")
+      expired_at = Ferricstore.HLC.now_ms() - 1_000
+
+      assert :ok = Router.put(ctx(), key, "old-string", expired_at)
+      assert nil == Router.get(ctx(), key)
+
+      assert 1 == Router.list_op(ctx(), key, {:lpush, ["fresh"]})
+      assert ["fresh"] == Router.list_op(ctx(), key, {:lrange, 0, -1})
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -179,6 +190,7 @@ defmodule Ferricstore.Store.AsyncListOpTest do
 
       # Pushes added 30, pops removed up to 20 → length in [60, 60].
       final_len = Router.list_op(ctx(), key, :llen)
+
       assert final_len == 50 + 30 - 20,
              "expected list length #{50 + 30 - 20}, got #{final_len}"
     end

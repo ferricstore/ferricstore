@@ -21,6 +21,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
+  alias Ferricstore.Store.RmwCoordinator
   alias Ferricstore.Test.ShardHelpers
 
   @ns "rmw_async"
@@ -39,6 +40,37 @@ defmodule Ferricstore.Store.AsyncRmwTest do
 
   defp ctx, do: FerricStore.Instance.get(:default)
   defp ukey(base), do: "#{@ns}:#{base}_#{:erlang.unique_integer([:positive])}"
+
+  describe "instance context on fallback path" do
+    test "RmwCoordinator accepts the caller instance context" do
+      isolated = minimal_instance_context()
+
+      try do
+        key = ukey("isolated_missing_getdel")
+        idx = Router.shard_for(isolated, key)
+
+        assert {:reply, nil, %{idx: ^idx}} =
+                 RmwCoordinator.handle_call(
+                   {:rmw, isolated, {:getdel, key}},
+                   {self(), make_ref()},
+                   %{idx: idx}
+                 )
+
+        assert [] == :ets.lookup(elem(isolated.latch_refs, idx), key)
+      after
+        cleanup_minimal_instance_context(isolated)
+      end
+    end
+
+    test "Router passes ctx when falling back to the RMW worker" do
+      # The worker is registered globally per shard, so the caller context must
+      # be part of the GenServer message. Otherwise contended async commands
+      # silently rehydrate the default instance inside RmwCoordinator.
+      path = Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__)
+
+      assert rmw_worker_calls_missing_ctx(path) == []
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Uncontended single-caller correctness — one assertion per RMW command
@@ -220,13 +252,17 @@ defmodule Ferricstore.Store.AsyncRmwTest do
 
       Task.await_many(tasks, 90_000)
 
-      Ferricstore.Test.Utils.eventually(fn ->
-        assert Router.get(ctx(), key) == "1000"
-      end, 5000)
+      Ferricstore.Test.Utils.eventually(
+        fn ->
+          assert Router.get(ctx(), key) == "1000"
+        end,
+        5000
+      )
     end
 
     test "concurrent APPENDs produce a string of the correct total length" do
       key = ukey("concurrent_append")
+
       tasks =
         for _ <- 1..20 do
           Task.async(fn -> Router.append(ctx(), key, "x") end)
@@ -276,6 +312,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
         # Distinct keys → near-zero contention → mostly latch.
         assert latch_n >= 40,
                "expected ≥40 latch path hits for 50 distinct keys, got #{latch_n}"
+
         assert worker_n <= 10,
                "expected ≤10 worker path hits for 50 distinct keys, got #{worker_n}"
       after
@@ -461,21 +498,128 @@ defmodule Ferricstore.Store.AsyncRmwTest do
 
   defp incr_with_retry(ctx, key, delta) do
     case Router.incr(ctx, key, delta) do
-      {:ok, _} = ok -> ok
+      {:ok, _} = ok ->
+        ok
+
       {:error, "ERR disk pressure" <> _} ->
         :timer.sleep(5)
         incr_with_retry(ctx, key, delta)
-      other -> other
+
+      other ->
+        other
     end
   end
 
   defp retry_rmw(_fun, 0), do: {:error, :exhausted}
+
   defp retry_rmw(fun, n) do
     case fun.() do
-      {:ok, _} = ok -> ok
+      {:ok, _} = ok ->
+        ok
+
       _ ->
         :timer.sleep(50)
         retry_rmw(fun, n - 1)
     end
+  end
+
+  defp minimal_instance_context do
+    name = :"rmw_context_test_#{System.unique_integer([:positive])}"
+    dir = Path.join(System.tmp_dir!(), Atom.to_string(name))
+
+    ctx =
+      FerricStore.Instance.build(name,
+        data_dir: dir,
+        shard_count: 2,
+        raft_enabled: false,
+        max_memory_bytes: 256 * 1024 * 1024,
+        keydir_max_ram: 64 * 1024 * 1024
+      )
+
+    Enum.each(0..(ctx.shard_count - 1), fn i ->
+      :ets.new(elem(ctx.keydir_refs, i), [
+        :set,
+        :public,
+        :named_table,
+        {:read_concurrency, true},
+        {:write_concurrency, :auto}
+      ])
+    end)
+
+    ctx
+  end
+
+  defp cleanup_minimal_instance_context(ctx) do
+    Enum.each(0..(ctx.shard_count - 1), fn i ->
+      try do
+        :ets.delete(elem(ctx.keydir_refs, i))
+      rescue
+        _ -> :ok
+      end
+
+      try do
+        :ets.delete(elem(ctx.latch_refs, i))
+      rescue
+        _ -> :ok
+      end
+    end)
+
+    try do
+      :ets.delete(ctx.hotness_table)
+    rescue
+      _ -> :ok
+    end
+
+    try do
+      :ets.delete(ctx.config_table)
+    rescue
+      _ -> :ok
+    end
+
+    FerricStore.Instance.cleanup(ctx.name)
+    File.rm_rf!(ctx.data_dir)
+  end
+
+  defp rmw_worker_calls_missing_ctx(path) do
+    source = File.read!(path)
+    lines = String.split(source, "\n")
+    {:ok, ast} = Code.string_to_quoted(source, columns: true)
+
+    {_ast, violations} =
+      Macro.prewalk(ast, [], fn
+        {{:., meta, [{:__aliases__, _, [:GenServer]}, :call]}, _call_meta, args} = node, acc ->
+          case args do
+            [target, {:rmw, _cmd}, _timeout] ->
+              line_no = Keyword.get(meta, :line, 1)
+
+              if rmw_coordinator_target?(target) do
+                {node, [{line_no, line_at(lines, line_no)} | acc]}
+              else
+                {node, acc}
+              end
+
+            _ ->
+              {node, acc}
+          end
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    Enum.reverse(violations)
+  end
+
+  defp rmw_coordinator_target?(
+         {{:., _, [:erlang, :binary_to_atom]}, _,
+          [{:<<>>, _, ["Ferricstore.Store.RmwCoordinator." | _]}, :utf8]}
+       ),
+       do: true
+
+  defp rmw_coordinator_target?(_target), do: false
+
+  defp line_at(lines, line_no) do
+    lines
+    |> Enum.at(line_no - 1, "")
+    |> String.trim()
   end
 end

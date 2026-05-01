@@ -440,7 +440,7 @@ defmodule Ferricstore.Store.Router do
         try do
           GenServer.call(
             :"Ferricstore.Store.RmwCoordinator.#{idx}",
-            {:rmw, cmd},
+            {:rmw, ctx, cmd},
             10_000
           )
         catch
@@ -2177,7 +2177,7 @@ defmodule Ferricstore.Store.Router do
         try do
           GenServer.call(
             :"Ferricstore.Store.RmwCoordinator.#{idx}",
-            {:rmw, cmd},
+            {:rmw, ctx, cmd},
             10_000
           )
         catch

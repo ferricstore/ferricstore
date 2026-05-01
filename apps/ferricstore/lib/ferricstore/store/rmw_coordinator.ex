@@ -9,9 +9,11 @@ defmodule Ferricstore.Store.RmwCoordinator do
     If it wins the latch, it runs the RMW inline in the caller's process
     (~15μs p50). Fast path.
   - If the latch is already held, `async_rmw` falls through here and
-    does `GenServer.call(RmwCoordinator.name(shard), {:rmw, cmd})`. The
-    worker processes RMW commands serially from its mailbox (FIFO). This
-    is the slow path under heavy same-key contention, but it never
+    sends `{:rmw, ctx, cmd}` to the shard worker. The caller context is
+    part of the message because the coordinator name is global per shard;
+    without it the worker would silently operate on the default instance.
+    The worker processes RMW commands serially from its mailbox (FIFO).
+    This is the slow path under heavy same-key contention, but it never
     loses updates and callers sleep on `receive` while queued (zero CPU).
 
   The worker itself also acquires the per-key latch before executing —
@@ -67,6 +69,10 @@ defmodule Ferricstore.Store.RmwCoordinator do
   @spec execute(non_neg_integer(), tuple()) :: term()
   def execute(idx, cmd), do: GenServer.call(name(idx), {:rmw, cmd}, 10_000)
 
+  @spec execute(non_neg_integer(), FerricStore.Instance.t(), tuple()) :: term()
+  def execute(idx, %FerricStore.Instance{} = ctx, cmd),
+    do: GenServer.call(name(idx), {:rmw, ctx, cmd}, 10_000)
+
   @doc """
   Force a sweep of stale latches for this shard. Intended for tests.
   """
@@ -94,18 +100,12 @@ defmodule Ferricstore.Store.RmwCoordinator do
         {:reply, {:error, "ERR instance not initialized"}, state}
 
       _ ->
-        latch_tab = elem(ctx.latch_refs, state.idx)
-        key = key_of(cmd)
-        wait_for_latch(latch_tab, key)
-
-        try do
-          result = dispatch_inline(ctx, state.idx, cmd)
-          :telemetry.execute([:ferricstore, :rmw, :worker], %{}, %{shard_index: state.idx})
-          {:reply, result, state}
-        after
-          :ets.take(latch_tab, key)
-        end
+        execute_with_context(ctx, cmd, state)
     end
+  end
+
+  def handle_call({:rmw, %FerricStore.Instance{} = ctx, cmd}, _from, state) do
+    execute_with_context(ctx, cmd, state)
   end
 
   def handle_call(:sweep_latches_now, _from, state) do
@@ -142,6 +142,20 @@ defmodule Ferricstore.Store.RmwCoordinator do
 
   defp dispatch_inline(ctx, idx, cmd),
     do: Ferricstore.Store.Router.execute_rmw_inline(ctx, idx, cmd)
+
+  defp execute_with_context(ctx, cmd, state) do
+    latch_tab = elem(ctx.latch_refs, state.idx)
+    key = key_of(cmd)
+    wait_for_latch(latch_tab, key)
+
+    try do
+      result = dispatch_inline(ctx, state.idx, cmd)
+      :telemetry.execute([:ferricstore, :rmw, :worker], %{}, %{shard_index: state.idx})
+      {:reply, result, state}
+    after
+      :ets.take(latch_tab, key)
+    end
+  end
 
   # Acquire the per-key latch. Only the worker process ever spins here, so
   # there's no thundering herd.
