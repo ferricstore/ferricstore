@@ -77,6 +77,14 @@ defmodule Ferricstore.CrossShardOp do
   def execute(keys_with_roles, execute_fn, opts \\ []) do
     caller_store = Keyword.get(opts, :store)
 
+    ctx =
+      Keyword.get(opts, :instance) ||
+        if match?(%FerricStore.Instance{}, caller_store) do
+          caller_store
+        else
+          FerricStore.Instance.get(:default)
+        end
+
     # If the caller provided a store that is NOT shard-local (no :shard_idx
     # field) AND has actual store functions (e.g. :get, :put), it can handle
     # all keys directly -- use it as-is. This covers mock stores in tests
@@ -87,12 +95,12 @@ defmodule Ferricstore.CrossShardOp do
       execute_fn.(caller_store)
     else
       keys = Enum.map(keys_with_roles, fn {key, _role} -> key end)
-      shard_map = group_keys_by_shard(keys_with_roles)
+      shard_map = group_keys_by_shard(ctx, keys_with_roles)
 
       if map_size(shard_map) == 1 do
         # Same-shard fast path: zero overhead.
         # Use the caller's shard-local store if provided, otherwise build one.
-        execute_same_shard(shard_map, execute_fn, caller_store)
+        execute_same_shard(ctx, shard_map, execute_fn, caller_store)
       else
         # Cross-shard: check durability mode for ALL involved keys.
         # If any key is in an async namespace, return CROSSSLOT.
@@ -110,7 +118,7 @@ defmodule Ferricstore.CrossShardOp do
             {:error, @too_many_keys_error}
 
           true ->
-            execute_cross_shard(keys_with_roles, shard_map, execute_fn, opts)
+            execute_cross_shard(ctx, keys_with_roles, shard_map, execute_fn, opts)
         end
       end
     end
@@ -120,7 +128,7 @@ defmodule Ferricstore.CrossShardOp do
   # Same-shard fast path
   # ---------------------------------------------------------------------------
 
-  defp execute_same_shard(shard_map, execute_fn, caller_store) do
+  defp execute_same_shard(ctx, shard_map, execute_fn, caller_store) do
     # Use the caller's store if it is a shard-local store (has :shard_idx)
     # or a fully-capable store (has :get). Otherwise build a fresh one.
     if is_map(caller_store) and
@@ -128,7 +136,7 @@ defmodule Ferricstore.CrossShardOp do
       execute_fn.(caller_store)
     else
       [{shard_idx, _keys}] = Map.to_list(shard_map)
-      store = build_store_for_shard(shard_idx)
+      store = build_store_for_shard(ctx, shard_idx)
       execute_fn.(store)
     end
   end
@@ -137,14 +145,14 @@ defmodule Ferricstore.CrossShardOp do
   # Cross-shard quorum path: lock -> intent -> execute -> unlock
   # ---------------------------------------------------------------------------
 
-  defp execute_cross_shard(keys_with_roles, shard_map, execute_fn, opts) do
+  defp execute_cross_shard(ctx, keys_with_roles, shard_map, execute_fn, opts) do
     owner_ref = make_ref()
 
     # Sort shards by index for deadlock prevention
     sorted_shards = shard_map |> Map.keys() |> Enum.sort()
 
     # Determine which keys need locking (only :write and :read_write roles)
-    lock_map = build_lock_map(keys_with_roles)
+    lock_map = build_lock_map(ctx, keys_with_roles)
 
     case lock_phase(sorted_shards, lock_map, owner_ref, 0) do
       :ok ->
@@ -154,9 +162,9 @@ defmodule Ferricstore.CrossShardOp do
 
         # Build read-only stores to compute value hashes before writing intent
         per_shard_stores =
-          Map.new(sorted_shards, fn idx -> {idx, build_store_for_shard(idx)} end)
+          Map.new(sorted_shards, fn idx -> {idx, build_store_for_shard(ctx, idx)} end)
 
-        value_hashes = compute_value_hashes(keys_with_roles, per_shard_stores)
+        value_hashes = compute_value_hashes(ctx, keys_with_roles, per_shard_stores)
         full_intent = Map.put(intent_map, :value_hashes, value_hashes)
 
         write_intent(coordinator_shard, owner_ref, full_intent)
@@ -165,7 +173,7 @@ defmodule Ferricstore.CrossShardOp do
           # Execute phase: build a unified routing store that uses locked
           # write variants with owner_ref, so writes pass through the lock
           # check in the state machine.
-          unified_store = build_locked_routing_store(per_shard_stores, owner_ref)
+          unified_store = build_locked_routing_store(ctx, per_shard_stores, owner_ref)
 
           result = execute_fn.(unified_store)
 
@@ -347,7 +355,12 @@ defmodule Ferricstore.CrossShardOp do
   @doc false
   @spec build_store_for_shard(non_neg_integer()) :: map()
   def build_store_for_shard(shard_idx) do
-    ctx = FerricStore.Instance.get(:default)
+    build_store_for_shard(FerricStore.Instance.get(:default), shard_idx)
+  end
+
+  @doc false
+  @spec build_store_for_shard(FerricStore.Instance.t(), non_neg_integer()) :: map()
+  def build_store_for_shard(ctx, shard_idx) do
     shard = Router.shard_name(ctx, shard_idx)
 
     # Reads can stay local (we read our own ETS — fast). Writes route through
@@ -438,8 +451,12 @@ defmodule Ferricstore.CrossShardOp do
   @doc false
   @spec build_routing_store(map()) :: map()
   def build_routing_store(per_shard_stores) do
-    ctx = FerricStore.Instance.get(:default)
+    build_routing_store(FerricStore.Instance.get(:default), per_shard_stores)
+  end
 
+  @doc false
+  @spec build_routing_store(FerricStore.Instance.t(), map()) :: map()
+  def build_routing_store(ctx, per_shard_stores) do
     route = fn key ->
       idx = Router.shard_for(ctx, key)
       Map.get(per_shard_stores, idx) || Map.get(per_shard_stores, hd(Map.keys(per_shard_stores)))
@@ -481,8 +498,12 @@ defmodule Ferricstore.CrossShardOp do
   @doc false
   @spec build_locked_routing_store(map(), reference()) :: map()
   def build_locked_routing_store(per_shard_stores, owner_ref) do
-    ctx = FerricStore.Instance.get(:default)
+    build_locked_routing_store(FerricStore.Instance.get(:default), per_shard_stores, owner_ref)
+  end
 
+  @doc false
+  @spec build_locked_routing_store(FerricStore.Instance.t(), map(), reference()) :: map()
+  def build_locked_routing_store(ctx, per_shard_stores, owner_ref) do
     route = fn key ->
       idx = Router.shard_for(ctx, key)
       Map.get(per_shard_stores, idx) || Map.get(per_shard_stores, hd(Map.keys(per_shard_stores)))
@@ -578,8 +599,12 @@ defmodule Ferricstore.CrossShardOp do
   @doc false
   @spec compute_value_hashes([key_with_role()], map()) :: map()
   def compute_value_hashes(keys_with_roles, per_shard_stores) do
-    ctx = FerricStore.Instance.get(:default)
+    compute_value_hashes(FerricStore.Instance.get(:default), keys_with_roles, per_shard_stores)
+  end
 
+  @doc false
+  @spec compute_value_hashes(FerricStore.Instance.t(), [key_with_role()], map()) :: map()
+  def compute_value_hashes(ctx, keys_with_roles, per_shard_stores) do
     Map.new(keys_with_roles, fn {key, _role} ->
       idx = Router.shard_for(ctx, key)
       store = Map.get(per_shard_stores, idx)
@@ -600,9 +625,7 @@ defmodule Ferricstore.CrossShardOp do
   # ---------------------------------------------------------------------------
 
   # Groups keys by shard index, preserving roles.
-  defp group_keys_by_shard(keys_with_roles) do
-    ctx = FerricStore.Instance.get(:default)
-
+  defp group_keys_by_shard(ctx, keys_with_roles) do
     Enum.group_by(
       keys_with_roles,
       fn {key, _role} -> Router.shard_for(ctx, key) end,
@@ -612,9 +635,7 @@ defmodule Ferricstore.CrossShardOp do
 
   # Builds a map of shard_index => [keys_to_lock]. Only :write and :read_write
   # roles need locking.
-  defp build_lock_map(keys_with_roles) do
-    ctx = FerricStore.Instance.get(:default)
-
+  defp build_lock_map(ctx, keys_with_roles) do
     keys_with_roles
     |> Enum.filter(fn {_key, role} -> role in [:write, :read_write] end)
     |> Enum.group_by(

@@ -1863,7 +1863,8 @@ defmodule Ferricstore.Store.Router do
       fn _store ->
         raft_write(ctx, shard_for(ctx, destkey), destkey, {:hll_op, "PFMERGE", args})
       end,
-      intent: %{command: :pfmerge, keys: %{targets: [destkey | source_keys]}}
+      intent: %{command: :pfmerge, keys: %{targets: [destkey | source_keys]}},
+      instance: ctx
     )
   end
 
@@ -1893,7 +1894,8 @@ defmodule Ferricstore.Store.Router do
         # is consistent because the lock blocks concurrent writers).
         raft_write(ctx, shard_for(ctx, destkey), destkey, {:bitmap_op, "BITOP", args})
       end,
-      intent: %{command: :bitop, keys: %{targets: [destkey | source_keys]}}
+      intent: %{command: :bitop, keys: %{targets: [destkey | source_keys]}},
+      instance: ctx
     )
   end
 
@@ -1915,7 +1917,8 @@ defmodule Ferricstore.Store.Router do
       fn _store ->
         raft_write(ctx, shard_for(ctx, dest), dest, {:geo_op, "GEOSEARCHSTORE", args})
       end,
-      intent: %{command: :geosearchstore, keys: %{dest: dest, source: source}}
+      intent: %{command: :geosearchstore, keys: %{dest: dest, source: source}},
+      instance: ctx
     )
   end
 
@@ -1946,7 +1949,8 @@ defmodule Ferricstore.Store.Router do
         fn _store ->
           raft_write(ctx, shard_for(ctx, dest), dest, {:tdigest_op, "TDIGEST.MERGE", args})
         end,
-        intent: %{command: :tdigest_merge, keys: %{targets: [dest | source_keys]}}
+        intent: %{command: :tdigest_merge, keys: %{targets: [dest | source_keys]}},
+        instance: ctx
       )
     end
   end
@@ -2352,13 +2356,14 @@ defmodule Ferricstore.Store.Router do
   # -------------------------------------------------------------------
 
   @spec list_op(FerricStore.Instance.t(), binary(), term()) :: term()
-  def list_op(_ctx, key, {:lmove, destination, from_dir, to_dir}) do
+  def list_op(ctx, key, {:lmove, destination, from_dir, to_dir}) do
     Ferricstore.CrossShardOp.execute(
       [{key, :read_write}, {destination, :write}],
       fn unified_store ->
         checked_lmove(key, destination, unified_store, from_dir, to_dir)
       end,
-      intent: %{command: :lmove, keys: %{source: key, dest: destination}}
+      intent: %{command: :lmove, keys: %{source: key, dest: destination}},
+      instance: ctx
     )
   end
 
