@@ -193,6 +193,45 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert [{^key, "new", 456, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, key)
     end
 
+    test "BitcaskWriter attaches location when pending write preserves old cold ref" do
+      shard_index = 10_000 + System.unique_integer([:positive])
+      dir = Path.join(System.tmp_dir!(), "bitcask_writer_old_ref_#{shard_index}")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "00000.log")
+      File.touch!(path)
+
+      keydir = :ets.new(:"bitcask_writer_old_ref_#{shard_index}", [:set, :public])
+      key = "writer:old-ref-location"
+
+      {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
+
+      on_exit(fn ->
+        if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+
+        try do
+          :ets.delete(keydir)
+        rescue
+          ArgumentError -> :ok
+        end
+
+        File.rm_rf(dir)
+      end)
+
+      :ets.insert(keydir, {key, "new", 456, LFU.initial(), :pending, 99, 3})
+
+      :sys.replace_state(writer, fn state ->
+        %{
+          state
+          | pending: [{:write, nil, path, 0, keydir, key, "new", 456}],
+            pending_count: 1
+        }
+      end)
+
+      assert :ok == BitcaskWriter.flush(shard_index)
+      assert [{^key, "new", 456, _lfu, 0, offset, 3}] = :ets.lookup(keydir, key)
+      assert is_integer(offset) and offset >= 0
+    end
+
     test "shard flush completion does not attach stale location to newer pending value" do
       keydir =
         :ets.new(:"shard_flush_stale_#{System.unique_integer([:positive])}", [

@@ -422,7 +422,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
           try do
             :ets.select_replace(ets, [
               {
-                {key, bin_value, exp, :"$1", :pending, 0, :_},
+                {key, bin_value, exp, :"$1", :pending, :_, :_},
                 [],
                 [{{key, bin_value, exp, :"$1", file_id, offset, vsize}}]
               }
