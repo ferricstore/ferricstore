@@ -354,7 +354,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     store = build_list_compound_store_raft(key, state)
     type_store = type_check_store(store, state)
 
-    case Ferricstore.Store.TypeRegistry.check_type(key, :list, type_store) do
+    case ensure_list_type_for_operation(key, operation, type_store) do
       :ok ->
         result = Ferricstore.Store.ListOps.execute(key, store, operation)
         new_version = state.write_version + 1
@@ -372,7 +372,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
     type_store = type_check_store(store, state)
 
-    case Ferricstore.Store.TypeRegistry.check_type(key, :list, type_store) do
+    case ensure_list_type_for_operation(key, operation, type_store) do
       :ok ->
         result = Ferricstore.Store.ListOps.execute(key, store, operation)
         {:reply, result, state}
@@ -396,6 +396,17 @@ defmodule Ferricstore.Store.Shard.NativeOps do
       end
     end)
   end
+
+  defp ensure_list_type_for_operation(key, operation, store)
+
+  defp ensure_list_type_for_operation(key, {:lpush, _elements}, store),
+    do: Ferricstore.Store.TypeRegistry.check_or_set(key, :list, store)
+
+  defp ensure_list_type_for_operation(key, {:rpush, _elements}, store),
+    do: Ferricstore.Store.TypeRegistry.check_or_set(key, :list, store)
+
+  defp ensure_list_type_for_operation(key, _operation, store),
+    do: Ferricstore.Store.TypeRegistry.check_type(key, :list, store)
 
   @spec handle_list_op_lmove(binary(), binary(), atom(), atom(), map()) :: {:reply, term(), map()}
   @doc false

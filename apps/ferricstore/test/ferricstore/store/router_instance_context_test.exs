@@ -30,6 +30,15 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert ["first"] = Router.list_op(ctx, destination, {:lrange, 0, -1})
   end
 
+  test "direct list creation stamps type metadata before later compound commands", %{ctx: ctx} do
+    key = "router:instance:type:list:#{System.unique_integer([:positive])}"
+
+    assert 1 = Router.list_op(ctx, key, {:rpush, ["first"]})
+
+    assert {:error, "WRONGTYPE" <> _} =
+             Ferricstore.Commands.Hash.handle("HSET", [key, "field", "value"], ctx)
+  end
+
   defp same_shard_keys(ctx) do
     base = System.unique_integer([:positive])
     default_ctx = FerricStore.Instance.get(:default)
