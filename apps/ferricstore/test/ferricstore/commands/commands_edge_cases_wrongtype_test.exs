@@ -37,6 +37,13 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
       assert {:error, "WRONGTYPE" <> _} = result
     end
 
+    test "MGET returns nil instead of leaking encoded non-string values" do
+      list_val = :erlang.term_to_binary({:list, ["a", "b"]})
+      store = MockStore.make(%{"mylist" => {list_val, 0}, "string" => {"value", 0}})
+
+      assert [nil, "value", nil] == Strings.handle("MGET", ["mylist", "string", "missing"], store)
+    end
+
     test "GET on set key returns WRONGTYPE" do
       set_val = :erlang.term_to_binary({:set, MapSet.new(["a"])})
       store = MockStore.make(%{"myset" => {set_val, 0}})

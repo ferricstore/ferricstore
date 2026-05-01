@@ -130,7 +130,7 @@ defmodule Ferricstore.Commands.Strings do
     {:error, "ERR wrong number of arguments for 'mget' command"}
   end
 
-  def handle("MGET", keys, store), do: Enum.map(keys, &Ops.get(store, &1))
+  def handle("MGET", keys, store), do: Enum.map(keys, &mget_string_value(&1, store))
 
   def handle("MSET", [], _store) do
     {:error, "ERR wrong number of arguments for 'mset' command"}
@@ -778,6 +778,22 @@ defmodule Ferricstore.Commands.Strings do
 
       other ->
         {:value, other}
+    end
+  end
+
+  defp mget_string_value(key, store) do
+    case Ops.get(store, key) do
+      nil ->
+        nil
+
+      value when is_binary(value) ->
+        case maybe_check_type(value) do
+          @wrongtype_error -> nil
+          checked -> checked
+        end
+
+      other ->
+        other
     end
   end
 
