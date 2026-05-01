@@ -54,6 +54,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     # (data in OS page cache only). Without explicit fsync, data can be lost
     # if a shard is killed before the OS flushes to disk (especially on Linux).
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+
     for i <- 0..(shard_count - 1) do
       try do
         active_path = :persistent_term.get({:ferricstore_active_file_path, i}, nil)
@@ -70,7 +71,9 @@ defmodule Ferricstore.Test.ShardHelpers do
               |> Enum.each(fn f ->
                 Ferricstore.Bitcask.NIF.v2_fsync(Path.join(shard_path, f))
               end)
-            _ -> :ok
+
+            _ ->
+              :ok
           end
         end
       catch
@@ -162,6 +165,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     # Clear cross-shard locks and intents via Raft so tests start clean.
     Enum.each(0..(shard_count - 1), fn i ->
       shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
+
       try do
         :ra.process_command(shard_id, {:clear_locks})
       catch
@@ -187,6 +191,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     # Shard flush, which may not happen between tests — so the async write
     # path rejects new writes with "ERR disk pressure on shard N".
     ctx = FerricStore.Instance.get(:default)
+
     Enum.each(0..(shard_count - 1), fn i ->
       Ferricstore.Store.DiskPressure.clear(ctx, i)
     end)
@@ -368,7 +373,8 @@ defmodule Ferricstore.Test.ShardHelpers do
 
     other =
       Enum.find(0..100_000, fn i ->
-        Router.shard_for(FerricStore.Instance.get(:default), "same_#{i}") == shard and "same_#{i}" != "same_a"
+        Router.shard_for(FerricStore.Instance.get(:default), "same_#{i}") == shard and
+          "same_#{i}" != "same_a"
       end)
 
     {"same_a", "same_#{other}"}
@@ -417,6 +423,7 @@ defmodule Ferricstore.Test.ShardHelpers do
           catch
             _, _ -> :ok
           end
+
           # Wait for leader election
           eventually(
             fn -> {:ok, _, _} = :ra.members(server_id) end,
@@ -454,7 +461,10 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   defp shard_count do
-    :persistent_term.get(:ferricstore_shard_count, Application.get_env(:ferricstore, :shard_count, 4))
+    :persistent_term.get(
+      :ferricstore_shard_count,
+      Application.get_env(:ferricstore, :shard_count, 4)
+    )
   end
 
   # Polls ra.members/1 for each shard until all ra servers report a leader.
@@ -580,7 +590,7 @@ defmodule Ferricstore.Test.ShardHelpers do
       ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), key) == "expected" end,
                               "key should survive shard restart")
   """
-  @spec eventually((() -> boolean()), binary(), pos_integer(), pos_integer()) :: :ok
+  @spec eventually((-> boolean()), binary(), pos_integer(), pos_integer()) :: :ok
   def eventually(fun, msg \\ "condition not met", attempts \\ 100, interval_ms \\ 100) do
     result =
       try do
@@ -621,78 +631,77 @@ defmodule Ferricstore.Test.ShardHelpers do
         end)
       end
   """
-  @spec setup_isolated_data_dir() :: :ok
+  @spec setup_isolated_data_dir() :: map()
   def setup_isolated_data_dir do
-    wait_shards_alive()
+    original_dir = Application.get_env(:ferricstore, :data_dir, "data")
 
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    shard_count = shard_count()
-    ra_sys = Ferricstore.Raft.Cluster.system_name()
+    tmp_dir =
+      Path.join(System.tmp_dir!(), "ferricstore_isolated_#{System.unique_integer([:positive])}")
 
-    # 1. Stop all ra servers and force-delete their persistent state
-    for i <- 0..(shard_count - 1) do
-      server_id = Ferricstore.Raft.Cluster.shard_server_id(i)
-      try do :ra.stop_server(ra_sys, server_id) catch _, _ -> :ok end
-      try do :ra.force_delete_server(ra_sys, server_id) catch _, _ -> :ok end
-    end
+    server_started? = application_started?(:ferricstore_server)
 
-    # 2. Kill all shard processes
-    for i <- 0..(shard_count - 1) do
-      name = Router.shard_name(FerricStore.Instance.get(:default), i)
-      pid = Process.whereis(name)
-      if pid && Process.alive?(pid) do
-        ref = Process.monitor(pid)
-        Process.exit(pid, :kill)
-        receive do {:DOWN, ^ref, _, _, _} -> :ok after 5_000 -> :ok end
-      end
-    end
+    restart_with_data_dir(tmp_dir, server_started?)
 
-    # 3. Wipe shard data dirs
-    for i <- 0..(shard_count - 1) do
-      shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
-      File.rm_rf!(shard_path)
-    end
-
-    # 4. Wait for shard supervisor to restart all shards. Some may have
-    #    been restarted by the supervisor before the wipe completed and
-    #    will have stale ra state — the resolve_active_file fallback in
-    #    StateMachine handles this gracefully.
-    wait_shards_alive(30_000)
-
-    # 5. After shards are alive, verify they have clean data dirs. If a
-    #    shard was restarted with stale ra state during the wipe, kill it
-    #    one more time and force-delete ra so the next restart is clean.
-    for i <- 0..(shard_count - 1) do
-      shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
-      active_path = Path.join(shard_path, "00000.log")
-      unless File.exists?(active_path) do
-        server_id = Ferricstore.Raft.Cluster.shard_server_id(i)
-        try do :ra.stop_server(ra_sys, server_id) catch _, _ -> :ok end
-        try do :ra.force_delete_server(ra_sys, server_id) catch _, _ -> :ok end
-        name = Router.shard_name(FerricStore.Instance.get(:default), i)
-        pid = Process.whereis(name)
-        if pid && Process.alive?(pid) do
-          ref = Process.monitor(pid)
-          Process.exit(pid, :kill)
-          receive do {:DOWN, ^ref, _, _, _} -> :ok after 5_000 -> :ok end
-        end
-        File.rm_rf!(shard_path)
-      end
-    end
-
-    wait_shards_alive(30_000)
-    Ferricstore.Health.set_ready(true)
-    :ok
+    %{original_dir: original_dir, tmp_dir: tmp_dir, server_started?: server_started?}
   end
 
   @doc """
   Tears down the isolated test environment. Ensures shards are alive
   for the next test.
   """
-  @spec teardown_isolated_data_dir(:ok) :: :ok
-  def teardown_isolated_data_dir(:ok) do
-    wait_shards_alive()
+  @spec teardown_isolated_data_dir(map()) :: :ok
+  def teardown_isolated_data_dir(%{
+        original_dir: original_dir,
+        tmp_dir: tmp_dir,
+        server_started?: server_started?
+      }) do
+    restart_with_data_dir(original_dir, server_started?)
+    File.rm_rf!(tmp_dir)
     :ok
   end
 
+  defp restart_with_data_dir(data_dir, server_started?) do
+    # Keep Ra isolation coarse-grained. Force-deleting individual Ra servers
+    # while the Ra system/WAL is live can leave old UID entries in WAL and make
+    # the next shard restart fail with `:gap_between_snapshot_and_log_range`.
+    stop_app_if_started(:ferricstore_server)
+    stop_app_if_started(:ferricstore)
+    stop_ra_system()
+
+    File.rm_rf!(data_dir)
+    Application.put_env(:ferricstore, :data_dir, data_dir)
+
+    {:ok, _} = Application.ensure_all_started(:ferricstore)
+
+    wait_shards_alive(30_000)
+
+    if server_started? do
+      {:ok, _} = Application.ensure_all_started(:ferricstore_server)
+    end
+
+    Ferricstore.Health.set_ready(true)
+    :ok
+  end
+
+  defp application_started?(app) do
+    Enum.any?(Application.started_applications(), fn {started_app, _desc, _vsn} ->
+      started_app == app
+    end)
+  end
+
+  defp stop_app_if_started(app) do
+    if application_started?(app) do
+      _ = Application.stop(app)
+    end
+  end
+
+  defp stop_ra_system do
+    try do
+      :ra_system.stop(Ferricstore.Raft.Cluster.system_name())
+    catch
+      _, _ -> :ok
+    end
+
+    :ok
+  end
 end

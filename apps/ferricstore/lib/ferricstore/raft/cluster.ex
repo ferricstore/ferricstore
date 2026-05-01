@@ -94,9 +94,25 @@ defmodule Ferricstore.Raft.Cluster do
   so ra knows to join the existing group. Used when a new node joins an
   already-running cluster after data sync.
   """
-  @spec join_shard_server(non_neg_integer(), binary(), non_neg_integer(), binary(), atom(), [node()], keyword()) ::
+  @spec join_shard_server(
+          non_neg_integer(),
+          binary(),
+          non_neg_integer(),
+          binary(),
+          atom(),
+          [node()],
+          keyword()
+        ) ::
           :ok | {:error, term()}
-  def join_shard_server(shard_index, shard_data_path, active_file_id, active_file_path, ets, cluster_members, opts \\ []) do
+  def join_shard_server(
+        shard_index,
+        shard_data_path,
+        active_file_id,
+        active_file_path,
+        ets,
+        cluster_members,
+        opts \\ []
+      ) do
     ra_sys = Keyword.get(opts, :ra_system, @ra_system)
     membership = Keyword.get(opts, :membership, :voter)
     skip_below_index = Keyword.get(opts, :skip_below_index, 0)
@@ -131,33 +147,48 @@ defmodule Ferricstore.Raft.Cluster do
 
     case :ra.start_server(ra_sys, server_config) do
       :ok ->
-        Logger.info("Shard #{shard_index}: joined cluster with #{length(initial_members)} members")
+        Logger.info(
+          "Shard #{shard_index}: joined cluster with #{length(initial_members)} members"
+        )
+
         :ok
 
-      {:error, {:already_started, _pid}} ->
-        :ok
-
-      {:error, {:shutdown, {:failed_to_start_child, _, {:already_started, _}}}} ->
-        :ok
-
-      {:error, :not_new} ->
-        Logger.info("Shard #{shard_index}: existing ra state found, deleting and re-joining cluster")
-        _ = :ra.force_delete_server(ra_sys, server_id)
-        Process.sleep(50)
-        case :ra.start_server(ra_sys, server_config) do
-          :ok ->
-            Logger.info("Shard #{shard_index}: joined cluster with #{length(initial_members)} members")
+      {:error, reason} ->
+        case start_error_recovery_action(reason) do
+          :same_uid_restart ->
             :ok
-          {:error, {:already_started, _}} -> :ok
-          {:error, {:shutdown, {:failed_to_start_child, _, {:already_started, _}}}} -> :ok
-          {:error, reason} ->
-            Logger.error("Shard #{shard_index}: re-join failed: #{inspect(reason)}")
+
+          :fresh_uid_recovery when reason == :not_new ->
+            Logger.info(
+              "Shard #{shard_index}: existing ra state found, deleting and re-joining cluster"
+            )
+
+            _ = :ra.force_delete_server(ra_sys, server_id)
+            Process.sleep(50)
+
+            case :ra.start_server(ra_sys, server_config) do
+              :ok ->
+                Logger.info(
+                  "Shard #{shard_index}: joined cluster with #{length(initial_members)} members"
+                )
+
+                :ok
+
+              {:error, retry_reason} ->
+                case start_error_recovery_action(retry_reason) do
+                  :same_uid_restart ->
+                    :ok
+
+                  :fresh_uid_recovery ->
+                    Logger.error("Shard #{shard_index}: re-join failed: #{inspect(retry_reason)}")
+                    {:error, retry_reason}
+                end
+            end
+
+          :fresh_uid_recovery ->
+            Logger.error("Shard #{shard_index}: failed to join cluster: #{inspect(reason)}")
             {:error, reason}
         end
-
-      {:error, reason} = err ->
-        Logger.error("Shard #{shard_index}: failed to join cluster: #{inspect(reason)}")
-        err
     end
   end
 
@@ -198,21 +229,32 @@ defmodule Ferricstore.Raft.Cluster do
     new_member =
       case membership do
         :promotable ->
-          %{id: shard_server_id_on(shard_index, node), membership: membership,
-            uid: shard_uid(shard_index)}
+          %{
+            id: shard_server_id_on(shard_index, node),
+            membership: membership,
+            uid: shard_uid(shard_index)
+          }
 
         _ ->
           %{id: shard_server_id_on(shard_index, node), membership: membership}
       end
 
     case :ra.add_member(leader, new_member) do
-      {_, _, _leader} -> :ok
-      {:error, :already_member} -> :ok
+      {_, _, _leader} ->
+        :ok
+
+      {:error, :already_member} ->
+        :ok
+
       {:error, :cluster_change_not_permitted} ->
         Process.sleep(200)
         add_member_with_retry(shard_index, node, membership, retries - 1)
-      {:error, reason} -> {:error, reason}
-      {:timeout, _} -> {:error, :timeout}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      {:timeout, _} ->
+        {:error, :timeout}
     end
   end
 
@@ -275,9 +317,23 @@ defmodule Ferricstore.Raft.Cluster do
     * `:ok` on success
     * `{:error, reason}` on failure
   """
-  @spec start_shard_server(non_neg_integer(), binary(), non_neg_integer(), binary(), atom(), keyword()) ::
+  @spec start_shard_server(
+          non_neg_integer(),
+          binary(),
+          non_neg_integer(),
+          binary(),
+          atom(),
+          keyword()
+        ) ::
           :ok | {:error, term()}
-  def start_shard_server(shard_index, shard_data_path, active_file_id, active_file_path, ets, opts \\ []) do
+  def start_shard_server(
+        shard_index,
+        shard_data_path,
+        active_file_id,
+        active_file_path,
+        ets,
+        opts \\ []
+      ) do
     ra_sys = Keyword.get(opts, :ra_system, @ra_system)
     membership = Keyword.get(opts, :membership, :voter)
     server_id = shard_server_id(shard_index)
@@ -320,12 +376,34 @@ defmodule Ferricstore.Raft.Cluster do
       :ok ->
         trigger_and_wait(server_id)
 
-      {:error, {:already_started, _pid}} ->
-        handle_already_started(ra_sys, server_id, server_config, shard_index)
-
       {:error, reason} ->
-        handle_start_error(ra_sys, server_id, server_config, shard_index, reason)
+        case start_error_recovery_action(reason) do
+          :same_uid_restart ->
+            handle_already_started(ra_sys, server_id, server_config, shard_index)
+
+          :fresh_uid_recovery ->
+            handle_start_error(ra_sys, server_id, server_config, shard_index, reason)
+        end
     end
+  end
+
+  @doc false
+  @spec start_error_recovery_action(term()) :: :same_uid_restart | :fresh_uid_recovery
+  def start_error_recovery_action({:already_started, _pid}) do
+    :same_uid_restart
+  end
+
+  # `ra.start_server/2` may wrap an existing child pid in a supervisor
+  # shutdown tuple. Treat it exactly like direct `already_started`; deleting
+  # Ra state or switching UID here can orphan WAL entries for the real server.
+  def start_error_recovery_action(
+        {:shutdown, {:failed_to_start_child, _child_id, {:already_started, _pid}}}
+      ) do
+    :same_uid_restart
+  end
+
+  def start_error_recovery_action(_reason) do
+    :fresh_uid_recovery
   end
 
   defp trigger_and_wait(server_id) do
@@ -334,7 +412,10 @@ defmodule Ferricstore.Raft.Cluster do
   end
 
   defp handle_already_started(ra_sys, server_id, server_config, shard_index) do
-    Logger.info("ra server for shard #{shard_index} already running, stopping and restarting with same UID")
+    Logger.info(
+      "ra server for shard #{shard_index} already running, stopping and restarting with same UID"
+    )
+
     _ = :ra.stop_server(ra_sys, server_id)
     Process.sleep(100)
 
@@ -346,7 +427,10 @@ defmodule Ferricstore.Raft.Cluster do
         restart_existing_server(ra_sys, server_id, shard_index)
 
       {:error, retry_reason} = err ->
-        Logger.error("Failed to start ra server (after stop) for shard #{shard_index}: #{inspect(retry_reason)}")
+        Logger.error(
+          "Failed to start ra server (after stop) for shard #{shard_index}: #{inspect(retry_reason)}"
+        )
+
         err
     end
   end
@@ -357,7 +441,10 @@ defmodule Ferricstore.Raft.Cluster do
         trigger_and_wait(server_id)
 
       {:error, restart_reason} = err ->
-        Logger.error("Failed to restart ra server for shard #{shard_index}: #{inspect(restart_reason)}")
+        Logger.error(
+          "Failed to restart ra server for shard #{shard_index}: #{inspect(restart_reason)}"
+        )
+
         err
     end
   end
@@ -367,6 +454,7 @@ defmodule Ferricstore.Raft.Cluster do
       "ra server for shard #{shard_index} failed with #{inspect(reason)}, " <>
         "attempting fresh start with unique UID"
     )
+
     _ = :ra.stop_server(ra_sys, server_id)
     _ = :ra.force_delete_server(ra_sys, server_id)
 
@@ -378,7 +466,10 @@ defmodule Ferricstore.Raft.Cluster do
         trigger_and_wait(server_id)
 
       {:error, retry_reason} = err ->
-        Logger.error("Failed to start ra server (recovery) for shard #{shard_index}: #{inspect(retry_reason)}")
+        Logger.error(
+          "Failed to start ra server (recovery) for shard #{shard_index}: #{inspect(retry_reason)}"
+        )
+
         err
     end
   end
