@@ -3,11 +3,10 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
   alias Ferricstore.Store.Router
 
   setup do
-    Ferricstore.NamespaceConfig.set("alv_test", "durability", "async")
     Ferricstore.Test.ShardHelpers.flush_all_keys()
+    Ferricstore.NamespaceConfig.set("alv_test", "durability", "async")
 
     on_exit(fn ->
-      Ferricstore.NamespaceConfig.set("alv_test", "durability", "quorum")
       Ferricstore.Test.ShardHelpers.flush_all_keys()
     end)
 
@@ -34,6 +33,22 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
         flunk("Timed out: #{msg}")
       end
     end
+  end
+
+  defp cold_value(byte) do
+    ctx = FerricStore.Instance.get(:default)
+    :binary.copy(<<byte>>, ctx.hot_cache_max_value_size + 1024)
+  end
+
+  defp assert_cold_key(key) do
+    ctx = FerricStore.Instance.get(:default)
+    keydir = elem(ctx.keydir_refs, Router.shard_for(ctx, key))
+
+    assert Router.durability_for_key_public(ctx, key) == :async
+    assert [{^key, nil, _exp, _lfu, fid, off, value_size}] = :ets.lookup(keydir, key)
+    assert is_integer(fid) and fid >= 0
+    assert is_integer(off) and off >= 0
+    assert value_size > ctx.hot_cache_max_value_size
   end
 
   describe "async write with large values (>64KB)" do
@@ -82,6 +97,69 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
           "Key #{key} should have size #{expected_size}"
         )
       end
+    end
+
+    test "APPEND preserves an existing cold large value" do
+      key = "alv_test:append_cold"
+      value = cold_value(?a)
+      suffix = "tail"
+
+      :ok = Router.put(FerricStore.Instance.get(:default), key, value, 0)
+      assert_cold_key(key)
+
+      assert {:ok, byte_size(value) + byte_size(suffix)} == FerricStore.append(key, suffix)
+      assert {:ok, value <> suffix} == FerricStore.get(key)
+    end
+
+    test "GETSET returns and replaces an existing cold large value" do
+      key = "alv_test:getset_cold"
+      value = cold_value(?g)
+
+      :ok = Router.put(FerricStore.Instance.get(:default), key, value, 0)
+      assert_cold_key(key)
+
+      assert {:ok, ^value} = FerricStore.getset(key, "replacement")
+      assert {:ok, "replacement"} = FerricStore.get(key)
+    end
+
+    test "GETDEL returns and deletes an existing cold large value" do
+      key = "alv_test:getdel_cold"
+      value = cold_value(?d)
+
+      :ok = Router.put(FerricStore.Instance.get(:default), key, value, 0)
+      assert_cold_key(key)
+
+      assert {:ok, ^value} = FerricStore.getdel(key)
+      assert {:ok, nil} = FerricStore.get(key)
+    end
+
+    test "GETEX returns and updates expiry on an existing cold large value" do
+      key = "alv_test:getex_cold"
+      value = cold_value(?e)
+
+      :ok = Router.put(FerricStore.Instance.get(:default), key, value, 0)
+      assert_cold_key(key)
+
+      assert {:ok, ^value} = FerricStore.getex(key, ttl: 60_000)
+      assert {:ok, ttl} = FerricStore.ttl(key)
+      assert ttl > 0
+    end
+
+    test "SETRANGE overlays an existing cold large value" do
+      key = "alv_test:setrange_cold"
+      prefix = cold_value(?s)
+      suffix = :binary.copy("t", 1024)
+      value = prefix <> suffix
+      expected_size = byte_size(value)
+
+      :ok = Router.put(FerricStore.Instance.get(:default), key, value, 0)
+      assert_cold_key(key)
+
+      assert {:ok, ^expected_size} = FerricStore.setrange(key, byte_size(prefix), "PATCH")
+      assert {:ok, updated} = FerricStore.get(key)
+      assert binary_part(updated, 0, byte_size(prefix)) == prefix
+      assert binary_part(updated, byte_size(prefix), 5) == "PATCH"
+      assert byte_size(updated) == byte_size(value)
     end
 
     test "get_with_file_ref returns value offset for cold sendfile reads" do

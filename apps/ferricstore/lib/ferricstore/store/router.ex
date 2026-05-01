@@ -614,6 +614,28 @@ defmodule Ferricstore.Store.Router do
       when value != nil and (exp == 0 or exp > now) ->
         {:hit, value, exp}
 
+      [{^key, nil, exp, _, file_id, offset, value_size}]
+      when (exp == 0 or exp > now) and is_integer(file_id) and file_id >= 0 and
+             is_integer(offset) and offset >= 0 and value_size > 0 ->
+        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+
+        path =
+          Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+
+        case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
+          {:ok, value} ->
+            warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
+            {:hit, value, exp}
+
+          _ ->
+            :missing
+        end
+
+      [{^key, _value, _exp, _, _, _, _}] ->
+        track_keydir_binary_delete(ctx, idx, keydir, key)
+        :ets.delete(keydir, key)
+        :missing
+
       _ ->
         :missing
     end
