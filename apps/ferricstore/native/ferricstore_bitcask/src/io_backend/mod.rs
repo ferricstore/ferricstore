@@ -463,6 +463,16 @@ mod tests {
         assert_eq!(backend.offset(), 10);
     }
 
+    #[test]
+    fn uring_backend_overrides_flush_no_sync() {
+        let source = std::fs::read_to_string("src/io_backend/uring.rs").unwrap();
+
+        assert!(
+            source.contains("fn flush_no_sync(&mut self) -> io::Result<()>"),
+            "UringBackend must override flush_no_sync; the IoBackend default calls sync()/fdatasync"
+        );
+    }
+
     // ------------------------------------------------------------------
     // H-1: BufWriter uses 256KB buffer instead of default 8KB
     // ------------------------------------------------------------------

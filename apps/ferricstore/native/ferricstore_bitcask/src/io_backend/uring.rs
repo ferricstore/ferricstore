@@ -198,6 +198,13 @@ impl IoBackend for UringBackend {
         self.offset += bytes;
     }
 
+    fn flush_no_sync(&mut self) -> io::Result<()> {
+        // UringBackend has no userspace buffer: append() submits a positioned
+        // write and waits for its CQE before returning. Data is already in the
+        // kernel page cache, so nosync must not issue fdatasync.
+        Ok(())
+    }
+
     /// Optimised batch path: submit ALL write SQEs in one `io_uring_enter`
     /// call, wait for all completions, then issue fsync in a second call.
     ///
