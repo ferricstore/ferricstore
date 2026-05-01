@@ -136,6 +136,7 @@ impl LogWriter {
     ///
     /// Returns a `LogError` if the record cannot be encoded or written to disk.
     pub fn write(&mut self, key: &[u8], value: &[u8], expire_at_ms: u64) -> Result<u64> {
+        validate_kv_sizes(key, value).map_err(LogError)?;
         let record = encode_record(key, value, expire_at_ms);
         let start = self
             .backend
@@ -151,6 +152,7 @@ impl LogWriter {
     ///
     /// Returns a `LogError` if the tombstone record cannot be written to disk.
     pub fn write_tombstone(&mut self, key: &[u8]) -> Result<u64> {
+        validate_kv_sizes(key, &[]).map_err(LogError)?;
         let record = encode_tombstone(key);
         let start = self
             .backend
@@ -211,6 +213,10 @@ impl LogWriter {
     ///
     /// Returns a `LogError` if any write or the final sync fails.
     pub fn write_batch(&mut self, entries: &[(&[u8], &[u8], u64)]) -> Result<Vec<(u64, usize)>> {
+        for (key, value, _) in entries {
+            validate_kv_sizes(key, value).map_err(LogError)?;
+        }
+
         // Encode all records first (owned Vecs, so lifetimes are clear).
         let encoded: Vec<Vec<u8>> = entries
             .iter()
@@ -254,6 +260,10 @@ impl LogWriter {
     ) -> Result<Vec<(u64, usize)>> {
         if entries.is_empty() {
             return Ok(Vec::new());
+        }
+
+        for (key, value, _) in entries {
+            validate_kv_sizes(key, value).map_err(LogError)?;
         }
 
         let encoded: Vec<Vec<u8>> = entries
@@ -1370,6 +1380,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn write_batch_rejects_oversized_key_without_writing() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let too_large_key = vec![0x42; usize::from(u16::MAX) + 1];
+        let entries: Vec<(&[u8], &[u8], u64)> =
+            vec![(b"valid", b"v", 0), (&too_large_key, b"v", 0)];
+
+        let err = w.write_batch(&entries).unwrap_err();
+
+        assert!(err.to_string().contains("key too large"));
+        assert_eq!(w.offset, 0);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    }
+
     // ------------------------------------------------------------------
     // write_batch_nosync
     // ------------------------------------------------------------------
@@ -1425,6 +1451,22 @@ mod tests {
         assert_eq!(records[0].key, b"dk1");
         assert_eq!(records[1].key, b"dk2");
         let _ = results;
+    }
+
+    #[test]
+    fn write_batch_nosync_rejects_oversized_key_without_writing() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let too_large_key = vec![0x42; usize::from(u16::MAX) + 1];
+        let entries: Vec<(&[u8], &[u8], u64)> =
+            vec![(b"valid", b"v", 0), (&too_large_key, b"v", 0)];
+
+        let err = w.write_batch_nosync(&entries).unwrap_err();
+
+        assert!(err.to_string().contains("key too large"));
+        assert_eq!(w.offset, 0);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
     }
 
     #[test]
@@ -1904,6 +1946,20 @@ mod tests {
         ];
 
         let err = w.write_ops_batch_nosync(&entries).unwrap_err();
+
+        assert!(err.to_string().contains("key too large"));
+        assert_eq!(w.offset, 0);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn write_tombstone_rejects_oversized_key_without_writing() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let too_large_key = vec![0x42; usize::from(u16::MAX) + 1];
+
+        let err = w.write_tombstone(&too_large_key).unwrap_err();
 
         assert!(err.to_string().contains("key too large"));
         assert_eq!(w.offset, 0);
