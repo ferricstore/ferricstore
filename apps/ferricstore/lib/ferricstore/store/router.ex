@@ -1366,47 +1366,72 @@ defmodule Ferricstore.Store.Router do
     hot_max = ctx.hot_cache_max_value_size
     wv_size = :counters.info(ctx.write_version).size
 
-    kv_pairs
-    |> Enum.group_by(fn {key, _value} -> shard_for(ctx, key) end)
-    |> Enum.each(fn {idx, shard_kvs} ->
-      keydir = elem(ctx.keydir_refs, idx)
-      original_rows = Enum.map(shard_kvs, fn {key, _value} -> {key, :ets.lookup(keydir, key)} end)
+    shard_batches =
+      kv_pairs
+      |> Enum.group_by(fn {key, _value} -> shard_for(ctx, key) end)
+      |> Enum.map(fn {idx, shard_kvs} ->
+        keydir = elem(ctx.keydir_refs, idx)
 
-      {ets_tuples, raft_cmds, large_disk_batch} =
-        Enum.reduce(shard_kvs, {[], [], []}, fn {key, value}, {ets_acc, raft_acc, disk_acc} ->
-          value_for_ets = if byte_size(value) > hot_max, do: nil, else: value
+        {entries, raft_cmds, large_disk_batch} =
+          Enum.reduce(shard_kvs, {[], [], []}, fn {key, value}, {entry_acc, raft_acc, disk_acc} ->
+            value_for_ets = if byte_size(value) > hot_max, do: nil, else: value
+            raft_cmd = {:put, key, value, 0}
+
+            disk_acc =
+              if value_for_ets == nil do
+                [{key, value, 0} | disk_acc]
+              else
+                disk_acc
+              end
+
+            {[{key, value, value_for_ets} | entry_acc], [raft_cmd | raft_acc], disk_acc}
+          end)
+
+        {idx, keydir, shard_kvs, entries, raft_cmds, large_disk_batch}
+      end)
+
+    disk_locations =
+      Enum.reduce(shard_batches, %{}, fn {idx, _keydir, _shard_kvs, _entries, _raft_cmds,
+                                          large_disk_batch},
+                                         acc ->
+        if large_disk_batch == [] do
+          acc
+        else
+          reversed = Enum.reverse(large_disk_batch)
+
+          case nif_append_batch_with_file(idx, reversed) do
+            {:ok, file_id, locations} ->
+              shard_locations =
+                Enum.zip(reversed, locations)
+                |> Map.new(fn {{key, value, _exp}, {offset, _rec_size}} ->
+                  {key, {file_id, offset, byte_size(value)}}
+                end)
+
+              Map.put(acc, idx, shard_locations)
+
+            {:error, reason} ->
+              throw({:disk_error, reason})
+          end
+        end
+      end)
+
+    Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, raft_cmds, _large_disk_batch} ->
+      shard_locations = Map.get(disk_locations, idx, %{})
+
+      ets_tuples =
+        Enum.map(entries, fn {key, value, value_for_ets} ->
           track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
 
-          ets_tuple = {key, value_for_ets, 0, lfu_val, :pending, 0, 0}
-          raft_cmd = {:put, key, value, 0}
+          case Map.get(shard_locations, key) do
+            {file_id, offset, value_size} ->
+              {key, value_for_ets, 0, lfu_val, file_id, offset, value_size}
 
-          disk_acc =
-            if value_for_ets == nil do
-              [{key, value, 0} | disk_acc]
-            else
-              disk_acc
-            end
-
-          {[ets_tuple | ets_acc], [raft_cmd | raft_acc], disk_acc}
+            nil ->
+              {key, value_for_ets, 0, lfu_val, :pending, 0, byte_size(value)}
+          end
         end)
 
       :ets.insert(keydir, ets_tuples)
-
-      if large_disk_batch != [] do
-        reversed = Enum.reverse(large_disk_batch)
-
-        case nif_append_batch_with_file(idx, reversed) do
-          {:ok, file_id, locations} ->
-            Enum.zip(reversed, locations)
-            |> Enum.each(fn {{key, value, _exp}, {offset, _rec_size}} ->
-              :ets.update_element(keydir, key, [{5, file_id}, {6, offset}, {7, byte_size(value)}])
-            end)
-
-          {:error, reason} ->
-            rollback_batch_async_put(ctx, idx, keydir, original_rows)
-            throw({:disk_error, reason})
-        end
-      end
 
       Ferricstore.Raft.Batcher.async_submit_batch(idx, raft_cmds)
 
@@ -1417,23 +1442,6 @@ defmodule Ferricstore.Store.Router do
   catch
     :throw, {:disk_error, reason} ->
       {:error, "ERR disk write failed: #{inspect(reason)}"}
-  end
-
-  defp rollback_batch_async_put(ctx, idx, keydir, original_rows) do
-    Enum.each(original_rows, fn {key, rows} ->
-      track_keydir_binary_delete(ctx, idx, keydir, key)
-      :ets.delete(keydir, key)
-
-      case rows do
-        [row] ->
-          {_key, value, _exp, _lfu, _fid, _off, _vsize} = row
-          track_keydir_binary_insert(ctx, idx, keydir, key, value)
-          :ets.insert(keydir, row)
-
-        [] ->
-          :ok
-      end
-    end)
   end
 
   @doc """

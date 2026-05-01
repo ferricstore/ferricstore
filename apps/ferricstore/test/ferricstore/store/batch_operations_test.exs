@@ -139,6 +139,34 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_data_path)
       end
     end
+
+    test "cross-shard failure does not leave earlier shard writes visible" do
+      small_key = key_for_shard(ctx(), "bap_cross_fail_small", 0)
+      large_key = key_for_shard(ctx(), "bap_cross_fail_large", 1)
+      original = Ferricstore.Store.ActiveFile.get(1)
+
+      missing_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_missing_active_#{System.unique_integer([:positive])}"
+        )
+
+      missing_path = Path.join(missing_dir, "00000.log")
+      Ferricstore.Store.ActiveFile.publish(1, 99_997, missing_path, missing_dir)
+
+      try do
+        large = :binary.copy("Q", 100 * 1024)
+
+        assert {:error, "ERR disk write failed" <> _} =
+                 Router.batch_async_put(ctx(), [{small_key, "small"}, {large_key, large}])
+
+        assert nil == Router.get(ctx(), small_key)
+        assert nil == Router.get(ctx(), large_key)
+      after
+        {file_id, file_path, shard_data_path} = original
+        Ferricstore.Store.ActiveFile.publish(1, file_id, file_path, shard_data_path)
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -354,6 +382,14 @@ defmodule Ferricstore.Store.BatchOperationsTest do
           if Router.shard_for(ctx, left) == Router.shard_for(ctx, right), do: {left, right}
       end)
     end)
+  end
+
+  defp key_for_shard(ctx, base, shard_idx) do
+    prefix = "#{@ns_async}:#{base}:#{System.unique_integer([:positive])}"
+
+    1..500
+    |> Stream.map(fn i -> "#{prefix}:#{i}" end)
+    |> Enum.find(fn key -> Router.shard_for(ctx, key) == shard_idx end)
   end
 
   defp pack_keys(keys) do
