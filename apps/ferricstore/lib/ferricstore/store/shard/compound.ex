@@ -67,7 +67,7 @@ defmodule Ferricstore.Store.Shard.Compound do
             {nil, state}
 
           _cold_or_miss ->
-            case promoted_read(dedicated_path, compound_key, state.keydir) do
+            case promoted_read(dedicated_path, compound_key, state) do
               {:ok, nil} ->
                 {nil, state}
 
@@ -132,7 +132,7 @@ defmodule Ferricstore.Store.Shard.Compound do
             {nil, state}
 
           _cold_or_miss ->
-            case promoted_read(dedicated_path, compound_key, state.keydir) do
+            case promoted_read(dedicated_path, compound_key, state) do
               {:ok, nil} ->
                 {nil, state}
 
@@ -468,10 +468,10 @@ defmodule Ferricstore.Store.Shard.Compound do
     end)
   end
 
-  @spec promoted_read(binary(), binary(), :ets.tid()) ::
+  @spec promoted_read(binary(), binary(), map()) ::
           {:ok, binary() | nil} | {:ok, binary(), non_neg_integer()} | {:error, term()}
   @doc false
-  def promoted_read(dedicated_path, compound_key, keydir) do
+  def promoted_read(dedicated_path, compound_key, %{keydir: keydir} = state) do
     now = HLC.now_ms()
 
     case :ets.lookup(keydir, compound_key) do
@@ -485,7 +485,7 @@ defmodule Ferricstore.Store.Shard.Compound do
         end
 
       [{^compound_key, _value, _exp, _lfu, _fid, _offset, _vsize}] ->
-        :ets.delete(keydir, compound_key)
+        ShardETS.ets_delete_key(state, compound_key)
         {:ok, nil}
 
       _ ->

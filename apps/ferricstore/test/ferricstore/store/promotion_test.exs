@@ -309,6 +309,29 @@ defmodule Ferricstore.Store.PromotionTest do
                GenServer.call(shard, {:tx_execute, [{"HGET", [key, "field_1"]}], nil})
     end
 
+    test "transaction HGET releases tracked key bytes for expired cold promoted field" do
+      store = real_store()
+      key = ukey("tx_hget_expired_cold_promoted")
+      field = :binary.copy("expired_cold_field", 8)
+      compound_key = CompoundKey.hash_field(key, field)
+      ctx = FerricStore.Instance.get(:default)
+      idx = Router.shard_for(ctx, key)
+      shard = Router.shard_name(ctx, idx)
+      keydir = elem(ctx.keydir_refs, idx)
+
+      populate_hash(store, key, @test_threshold + 1)
+      assert promoted?(key)
+
+      before_bytes = :atomics.get(ctx.keydir_binary_bytes, idx + 1)
+      expired_at = HLC.now_ms() - 1
+      :ets.insert(keydir, {compound_key, nil, expired_at, 0, 0, 0, 0})
+      :atomics.add(ctx.keydir_binary_bytes, idx + 1, byte_size(compound_key))
+
+      assert [nil] == GenServer.call(shard, {:tx_execute, [{"HGET", [key, field]}], nil})
+      assert :ets.lookup(keydir, compound_key) == []
+      assert :atomics.get(ctx.keydir_binary_bytes, idx + 1) == before_bytes
+    end
+
     test "transaction HGETALL scans cold promoted fields from dedicated storage" do
       store = real_store()
       key = ukey("tx_hgetall_cold_promoted")

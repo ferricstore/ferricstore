@@ -920,7 +920,7 @@ defmodule Ferricstore.Store.Ops do
         read_promoted_cold_value(tx, compound_key, dedicated_path, fid, off, vsize, exp)
 
       [{^compound_key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
-        :ets.delete(keydir, compound_key)
+        ShardETS.ets_delete_key(tx.shard_state, compound_key)
         nil
 
       _ ->
