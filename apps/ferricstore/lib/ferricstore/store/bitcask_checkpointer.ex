@@ -162,6 +162,8 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
 
   # Tokio async-fsync completion.
   def handle_info({:tokio_complete, corr_id, :ok, _}, %{current_corr_id: corr_id} = state) do
+    mark_checkpoint_in_flight(state.instance_ctx, state.index, 0)
+
     :telemetry.execute(
       [:ferricstore, :bitcask, :checkpoint],
       %{shard_index: state.index},
@@ -172,6 +174,8 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   end
 
   def handle_info({:tokio_complete, corr_id, :error, reason}, %{current_corr_id: corr_id} = state) do
+    mark_checkpoint_in_flight(state.instance_ctx, state.index, 0)
+
     # "No such file or directory" = the active file was wiped (test
     # cleanup, shard shutdown, rotation race). Don't raise disk pressure
     # — the next tick will see the new ActiveFile entry. Just drop the
@@ -219,19 +223,24 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
       case ActiveFile.get(ctx, state.index) do
         {_fid, active_path, _sp} ->
           if ctx, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 0)
+          mark_checkpoint_in_flight(ctx, state.index, 1)
 
-          case NIF.v2_fsync(active_path) do
-            :ok ->
-              :ok
+          try do
+            case NIF.v2_fsync(active_path) do
+              :ok ->
+                :ok
 
-            {:error, reason} = err ->
-              if ctx, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 1)
+              {:error, reason} = err ->
+                if ctx, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 1)
 
-              Logger.error(
-                "BitcaskCheckpointer shard=#{state.index}: sync_now failed: #{inspect(reason)}"
-              )
+                Logger.error(
+                  "BitcaskCheckpointer shard=#{state.index}: sync_now failed: #{inspect(reason)}"
+                )
 
-              err
+                err
+            end
+          after
+            mark_checkpoint_in_flight(ctx, state.index, 0)
           end
       end
 
@@ -259,6 +268,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
       case ActiveFile.get(state.instance_ctx, state.index) do
         {_fid, active_path, _sp} ->
           corr_id = state.next_corr_id
+          mark_checkpoint_in_flight(state.instance_ctx, state.index, 1)
           NIF.v2_fsync_async(self(), corr_id, active_path)
           %{state | in_flight?: true, next_corr_id: corr_id + 1, current_corr_id: corr_id}
       end
@@ -268,6 +278,16 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   rescue
     _ ->
       :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 1)
+      mark_checkpoint_in_flight(state.instance_ctx, state.index, 0)
       state
+  end
+
+  defp mark_checkpoint_in_flight(nil, _index, _value), do: :ok
+
+  defp mark_checkpoint_in_flight(ctx, index, value) do
+    case Map.get(ctx, :checkpoint_in_flight) do
+      nil -> :ok
+      checkpoint_in_flight -> :atomics.put(checkpoint_in_flight, index + 1, value)
+    end
   end
 end

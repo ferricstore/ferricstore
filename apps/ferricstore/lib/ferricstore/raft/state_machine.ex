@@ -1063,11 +1063,25 @@ defmodule Ferricstore.Raft.StateMachine do
   # A release_cursor lets ra compact log entries. For the Bitcask-backed state
   # machine, the log must not be released past writes that are still only in
   # the OS page cache; the checkpoint flag is cleared only after fsync succeeds.
-  defp checkpoint_clean?(%{
-         instance_ctx: %{checkpoint_flags: checkpoint_flags},
-         shard_index: shard_index
-       }) do
-    :atomics.get(checkpoint_flags, shard_index + 1) == 0
+  defp checkpoint_clean?(%{instance_ctx: nil}), do: true
+
+  defp checkpoint_clean?(%{instance_ctx: instance_ctx, shard_index: shard_index})
+       when is_map(instance_ctx) do
+    flag_idx = shard_index + 1
+
+    checkpoint_flag_clean? =
+      case Map.get(instance_ctx, :checkpoint_flags) do
+        nil -> true
+        checkpoint_flags -> :atomics.get(checkpoint_flags, flag_idx) == 0
+      end
+
+    checkpoint_idle? =
+      case Map.get(instance_ctx, :checkpoint_in_flight) do
+        nil -> true
+        checkpoint_in_flight -> :atomics.get(checkpoint_in_flight, flag_idx) == 0
+      end
+
+    checkpoint_flag_clean? and checkpoint_idle?
   end
 
   defp checkpoint_clean?(_state), do: true

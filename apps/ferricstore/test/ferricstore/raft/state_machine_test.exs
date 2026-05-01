@@ -1579,6 +1579,37 @@ defmodule Ferricstore.Raft.StateMachineTest do
              "Raft cursor must not advance past data that still needs a Bitcask checkpoint"
     end
 
+    test "release_cursor waits while checkpoint fsync is in flight", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      checkpoint_flags = :atomics.new(shard_index + 1, signed: false)
+      checkpoint_in_flight = :atomics.new(shard_index + 1, signed: false)
+
+      # The checkpointer clears checkpoint_flags before async fsync starts.
+      # StateMachine must still see the in-flight marker and keep Ra log
+      # entries until the fsync completion arrives.
+      :atomics.put(checkpoint_flags, shard_index + 1, 0)
+      :atomics.put(checkpoint_in_flight, shard_index + 1, 1)
+
+      state = %{
+        state
+        | release_cursor_interval: 1,
+          instance_ctx: %{
+            checkpoint_flags: checkpoint_flags,
+            checkpoint_in_flight: checkpoint_in_flight
+          }
+      }
+
+      meta = %{index: 1, term: 1, system_time: System.os_time(:millisecond)}
+
+      {_new_state, {:applied_at, 1, nil}, effects} =
+        StateMachine.apply(meta, {:getdel, "missing_during_checkpoint"}, state)
+
+      refute Enum.any?(effects, &match?({:release_cursor, 1, _}, &1)),
+             "Raft cursor must not advance while Bitcask fsync is still in flight"
+    end
+
     test "release_cursor emitted at every interval multiple", %{store: _store, ets: ets} do
       interval = 3
 

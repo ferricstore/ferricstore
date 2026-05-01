@@ -27,6 +27,7 @@ defmodule FerricStore.Instance do
           pressure_flags: reference(),
           disk_pressure: reference(),
           checkpoint_flags: reference(),
+          checkpoint_in_flight: reference(),
           write_version: reference(),
           stats_counter: reference(),
           lfu_decay_time: non_neg_integer(),
@@ -62,6 +63,7 @@ defmodule FerricStore.Instance do
     :pressure_flags,
     :disk_pressure,
     :checkpoint_flags,
+    :checkpoint_in_flight,
     :write_version,
     :stats_counter,
     :lfu_decay_time,
@@ -148,6 +150,19 @@ defmodule FerricStore.Instance do
         :atomics.new(shard_count, signed: false)
       end
 
+    # Per-shard marker for checkpoint fsync calls that are currently in flight.
+    # `checkpoint_flags` is cleared before async fsync starts so writers can
+    # mark new dirty data; Raft release_cursor must also consult this marker
+    # before compacting log entries that protect page-cache-only Bitcask bytes.
+    checkpoint_in_flight =
+      if name == :default do
+        try_get_pt(:ferricstore_checkpoint_in_flight, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
     # Per-shard counter for off-heap binary bytes in ETS keydirs.
     # :ets.info(:memory) doesn't count refc binaries (> 64 bytes).
     # We track insertions/deletions to give MemoryGuard accurate numbers.
@@ -200,6 +215,7 @@ defmodule FerricStore.Instance do
       pressure_flags: pressure_flags,
       disk_pressure: disk_pressure,
       checkpoint_flags: checkpoint_flags,
+      checkpoint_in_flight: checkpoint_in_flight,
       write_version: write_version,
       stats_counter: stats_counter,
       lfu_decay_time: lfu_decay_time,
