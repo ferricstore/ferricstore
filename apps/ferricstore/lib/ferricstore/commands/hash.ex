@@ -500,22 +500,39 @@ defmodule Ferricstore.Commands.Hash do
     with {:ok, count} <- parse_positive_integer(count_str, "count"),
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
-        results =
-          Enum.map(fields, fn field ->
+        compound_keys =
+          fields
+          |> Enum.uniq()
+          |> Enum.map(&CompoundKey.hash_field(key, &1))
+
+        values_by_key =
+          store
+          |> Ops.compound_batch_get(key, compound_keys)
+          |> then(&Enum.zip(compound_keys, &1))
+          |> Map.new()
+
+        {results, deleted_keys} =
+          Enum.reduce(fields, {[], MapSet.new()}, fn field, {acc, deleted} ->
             compound_key = CompoundKey.hash_field(key, field)
 
-            case Ops.compound_get(store, key, compound_key) do
-              nil ->
-                nil
+            cond do
+              MapSet.member?(deleted, compound_key) ->
+                {[nil | acc], deleted}
 
-              value ->
-                Ops.compound_delete(store, key, compound_key)
-                value
+              is_nil(Map.get(values_by_key, compound_key)) ->
+                {[nil | acc], deleted}
+
+              true ->
+                value = Map.fetch!(values_by_key, compound_key)
+                {[value | acc], MapSet.put(deleted, compound_key)}
             end
           end)
 
+        results = Enum.reverse(results)
+        Enum.each(deleted_keys, &Ops.compound_delete(store, key, &1))
+
         # Clean up type metadata if hash is now empty
-        deleted_count = Enum.count(results, &(&1 != nil))
+        deleted_count = MapSet.size(deleted_keys)
         maybe_cleanup_empty_hash(key, deleted_count, store)
 
         results
