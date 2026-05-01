@@ -1535,10 +1535,18 @@ defmodule Ferricstore.Store.Router do
 
     try do
       case :ets.lookup(keydir, key) do
-        [{^key, _value, 0, _lfu, _fid, _off, _vsize}] ->
+        [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
           0
 
-        [{^key, _value, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
+        [{^key, nil, 0, _lfu, fid, off, vsize}]
+        when valid_cold_location(fid, off, vsize) ->
+          0
+
+        [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+          exp
+
+        [{^key, nil, exp, _lfu, fid, off, vsize}]
+        when exp > now and valid_cold_location(fid, off, vsize) ->
           exp
 
         [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
@@ -2059,10 +2067,17 @@ defmodule Ferricstore.Store.Router do
 
     try do
       case :ets.lookup(keydir, key) do
-        [{^key, _val, 0, _lfu, _fid, _off, _vsize}] ->
+        [{^key, val, 0, _lfu, _fid, _off, _vsize}] when val != nil ->
           true
 
-        [{^key, _val, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
+        [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+          true
+
+        [{^key, val, exp, _lfu, _fid, _off, _vsize}] when exp > now and val != nil ->
+          true
+
+        [{^key, nil, exp, _lfu, fid, off, vsize}]
+        when exp > now and valid_cold_location(fid, off, vsize) ->
           true
 
         [{^key, _val, _exp, _lfu, _fid, _off, _vsize}] ->
@@ -2095,9 +2110,26 @@ defmodule Ferricstore.Store.Router do
 
     try do
       case :ets.lookup(keydir, key) do
-        [{^key, _val, 0, _lfu, _fid, _off, _vsize}] -> true
-        [{^key, _val, exp, _lfu, _fid, _off, _vsize}] when exp > now -> true
-        _ -> false
+        [{^key, val, 0, _lfu, _fid, _off, _vsize}] when val != nil ->
+          true
+
+        [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+          true
+
+        [{^key, val, exp, _lfu, _fid, _off, _vsize}] when exp > now and val != nil ->
+          true
+
+        [{^key, nil, exp, _lfu, fid, off, vsize}]
+        when exp > now and valid_cold_location(fid, off, vsize) ->
+          true
+
+        [{^key, _val, _exp, _lfu, _fid, _off, _vsize}] ->
+          track_keydir_binary_delete(ctx, idx, keydir, key)
+          :ets.delete(keydir, key)
+          false
+
+        [] ->
+          false
       end
     rescue
       ArgumentError -> false

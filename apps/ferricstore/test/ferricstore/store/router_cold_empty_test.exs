@@ -86,4 +86,21 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     assert nil == Router.value_size(ctx, key)
     assert [] == :ets.lookup(keydir, key)
   end
+
+  test "exists rejects cold rows with invalid offsets", %{ctx: ctx, keydir: keydir} do
+    key = "cold_invalid_exists:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
+
+    refute Router.exists?(ctx, key)
+    refute Router.exists_fast?(ctx, key)
+    assert [] == :ets.lookup(keydir, key)
+  end
+
+  test "expire_at rejects cold rows with invalid offsets", %{ctx: ctx, keydir: keydir} do
+    key = "cold_invalid_expire_at:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
+
+    assert nil == Router.expire_at_ms(ctx, key)
+    assert [] == :ets.lookup(keydir, key)
+  end
 end
