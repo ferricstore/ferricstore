@@ -412,74 +412,79 @@ defmodule Ferricstore.Store.Shard.Flush do
       #    tail could be lost on kernel panic.
       case Ferricstore.Bitcask.NIF.v2_fsync(state.active_file_path) do
         :ok ->
-          :ok
+          :telemetry.execute(
+            [:ferricstore, :bitcask, :rotation_fsync],
+            %{},
+            %{shard_index: state.index, kind: :old_file, path: state.active_file_path}
+          )
+
+          write_hint_for_file(state, state.active_file_id)
+          new_id = state.active_file_id + 1
+          sp = state.shard_data_path
+          new_path = ShardETS.file_path(sp, new_id)
+          Ferricstore.FS.touch!(new_path)
+
+          # 2. Fsync the shard directory so the new filename entry
+          #    (`new_path`) is durable. Without this, a kernel panic
+          #    between touch! and the first append can leave the file
+          #    absent on reboot — the next append would create a fresh
+          #    one but we'd lose any bytes already buffered in page cache.
+          case Ferricstore.Bitcask.NIF.v2_fsync_dir(sp) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              require Logger
+
+              Logger.warning(
+                "Shard #{state.index}: rotation fsync_dir failed: #{inspect(reason)}"
+              )
+          end
+
+          :telemetry.execute(
+            [:ferricstore, :bitcask, :rotation_fsync],
+            %{},
+            %{shard_index: state.index, kind: :new_dir, path: sp}
+          )
+
+          if ctx = Map.get(state, :instance_ctx) do
+            Ferricstore.Store.ActiveFile.publish(ctx, state.index, new_id, new_path, sp)
+          end
+
+          # Initialize file_stats for the new file
+          new_file_stats = Map.put(state.file_stats, new_id, {0, 0})
+
+          # Notify the merge scheduler that a rotation happened.
+          # file_count = new_id + 1 (files are 0-indexed: 0, 1, ..., new_id).
+          # Direct cast avoids the Merge.Scheduler → ... → Shard.Flush cycle.
+          try do
+            GenServer.cast(
+              :"Ferricstore.Merge.Scheduler.#{state.index}",
+              {:file_rotated, new_id + 1}
+            )
+          catch
+            :exit, _ -> :ok
+          end
+
+          %{
+            state
+            | active_file_id: new_id,
+              active_file_path: new_path,
+              active_file_size: 0,
+              file_stats: new_file_stats
+          }
 
         {:error, reason} ->
-          require Logger
+          if ctx = Map.get(state, :instance_ctx) do
+            Ferricstore.Store.DiskPressure.set(ctx, state.index)
+          end
 
           Logger.warning(
-            "Shard #{state.index}: rotation fsync of old active file failed: #{inspect(reason)}"
+            "Shard #{state.index}: rotation fsync of old active file failed: #{inspect(reason)}; keeping active file"
           )
+
+          state
       end
-
-      :telemetry.execute(
-        [:ferricstore, :bitcask, :rotation_fsync],
-        %{},
-        %{shard_index: state.index, kind: :old_file, path: state.active_file_path}
-      )
-
-      write_hint_for_file(state, state.active_file_id)
-      new_id = state.active_file_id + 1
-      sp = state.shard_data_path
-      new_path = ShardETS.file_path(sp, new_id)
-      Ferricstore.FS.touch!(new_path)
-
-      # 2. Fsync the shard directory so the new filename entry
-      #    (`new_path`) is durable. Without this, a kernel panic
-      #    between touch! and the first append can leave the file
-      #    absent on reboot — the next append would create a fresh
-      #    one but we'd lose any bytes already buffered in page cache.
-      case Ferricstore.Bitcask.NIF.v2_fsync_dir(sp) do
-        :ok ->
-          :ok
-
-        {:error, reason} ->
-          require Logger
-          Logger.warning("Shard #{state.index}: rotation fsync_dir failed: #{inspect(reason)}")
-      end
-
-      :telemetry.execute(
-        [:ferricstore, :bitcask, :rotation_fsync],
-        %{},
-        %{shard_index: state.index, kind: :new_dir, path: sp}
-      )
-
-      if ctx = Map.get(state, :instance_ctx) do
-        Ferricstore.Store.ActiveFile.publish(ctx, state.index, new_id, new_path, sp)
-      end
-
-      # Initialize file_stats for the new file
-      new_file_stats = Map.put(state.file_stats, new_id, {0, 0})
-
-      # Notify the merge scheduler that a rotation happened.
-      # file_count = new_id + 1 (files are 0-indexed: 0, 1, ..., new_id).
-      # Direct cast avoids the Merge.Scheduler → ... → Shard.Flush cycle.
-      try do
-        GenServer.cast(
-          :"Ferricstore.Merge.Scheduler.#{state.index}",
-          {:file_rotated, new_id + 1}
-        )
-      catch
-        :exit, _ -> :ok
-      end
-
-      %{
-        state
-        | active_file_id: new_id,
-          active_file_path: new_path,
-          active_file_size: 0,
-          file_stats: new_file_stats
-      }
     else
       state
     end
