@@ -21,7 +21,7 @@ defmodule Ferricstore.Store.Router do
   alias Ferricstore.HLC
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Stats
-  alias Ferricstore.Store.{LFU, ListOps, TypeRegistry}
+  alias Ferricstore.Store.{CompoundKey, LFU, ListOps, TypeRegistry}
 
   import Bitwise, only: [band: 2]
 
@@ -472,8 +472,45 @@ defmodule Ferricstore.Store.Router do
     if under_pressure do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
-      do_rmw_inline(ctx, idx, cmd)
+      with :ok <- ensure_string_rmw_key(ctx, idx, cmd) do
+        do_rmw_inline(ctx, idx, cmd)
+      end
     end
+  end
+
+  defp ensure_string_rmw_key(ctx, idx, {_op, key, _arg}) when is_binary(key) do
+    ensure_string_rmw_key_name(ctx, idx, key)
+  end
+
+  defp ensure_string_rmw_key(ctx, idx, {_op, key}) when is_binary(key) do
+    ensure_string_rmw_key_name(ctx, idx, key)
+  end
+
+  defp ensure_string_rmw_key(ctx, idx, {_op, key, _arg1, _arg2}) when is_binary(key) do
+    ensure_string_rmw_key_name(ctx, idx, key)
+  end
+
+  defp ensure_string_rmw_key(_ctx, _idx, _cmd), do: :ok
+
+  defp ensure_string_rmw_key_name(ctx, idx, key) do
+    if compound_marker_present?(ctx, idx, key) do
+      case TypeRegistry.get_type(key, ctx) do
+        type when type in ["none", "string"] ->
+          :ok
+
+        _compound_type ->
+          {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp compound_marker_present?(ctx, idx, key) do
+    keydir = elem(ctx.keydir_refs, idx)
+
+    :ets.lookup(keydir, CompoundKey.type_key(key)) != [] or
+      :ets.lookup(keydir, CompoundKey.list_meta_key(key)) != []
   end
 
   # Per-command RMW implementations. Mirror state_machine.ex do_incr et al.,

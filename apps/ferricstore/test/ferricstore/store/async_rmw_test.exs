@@ -41,6 +41,22 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   defp ctx, do: FerricStore.Instance.get(:default)
   defp ukey(base), do: "#{@ns}:#{base}_#{:erlang.unique_integer([:positive])}"
 
+  defp hash_key(base) do
+    key = ukey(base)
+    assert :ok = FerricStore.hset(key, %{"field" => "value"})
+    key
+  end
+
+  defp assert_hash_intact(key) do
+    assert {:ok, "value"} = FerricStore.hget(key, "field")
+    assert_no_plain_key(key)
+  end
+
+  defp assert_no_plain_key(key) do
+    keydir = elem(ctx().keydir_refs, Router.shard_for(ctx(), key))
+    assert [] == :ets.lookup(keydir, key)
+  end
+
   describe "instance context on fallback path" do
     test "RmwCoordinator accepts the caller instance context" do
       isolated = minimal_instance_context()
@@ -133,6 +149,57 @@ defmodule Ferricstore.Store.AsyncRmwTest do
     test "GETDEL on nonexistent returns nil" do
       k = ukey("getdel_new")
       assert nil == Router.getdel(ctx(), k)
+    end
+  end
+
+  describe "compound type protection" do
+    test "INCR rejects hash keys and does not create a plain value" do
+      key = hash_key("incr_hash")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.incr(key)
+      assert_hash_intact(key)
+    end
+
+    test "INCRBYFLOAT rejects hash keys and does not create a plain value" do
+      key = hash_key("incr_float_hash")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.incr_by_float(key, 1.5)
+      assert_hash_intact(key)
+    end
+
+    test "APPEND rejects hash keys and does not create a plain value" do
+      key = hash_key("append_hash")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.append(key, "suffix")
+      assert_hash_intact(key)
+    end
+
+    test "GETSET rejects hash keys and does not create a plain value" do
+      key = hash_key("getset_hash")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.getset(key, "replacement")
+      assert_hash_intact(key)
+    end
+
+    test "GETDEL rejects hash keys and does not remove the hash" do
+      key = hash_key("getdel_hash")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.getdel(key)
+      assert_hash_intact(key)
+    end
+
+    test "GETEX rejects hash keys and does not create a plain value" do
+      key = hash_key("getex_hash")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.getex(key, ttl: 60_000)
+      assert_hash_intact(key)
+    end
+
+    test "SETRANGE rejects hash keys and does not create a plain value" do
+      key = hash_key("setrange_hash")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.setrange(key, 0, "x")
+      assert_hash_intact(key)
     end
   end
 
