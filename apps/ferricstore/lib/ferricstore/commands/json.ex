@@ -36,6 +36,7 @@ defmodule Ferricstore.Commands.Json do
   """
 
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.TypeRegistry
 
   @wrongtype_msg "WRONGTYPE Operation against a key holding the wrong kind of value"
@@ -338,11 +339,16 @@ defmodule Ferricstore.Commands.Json do
 
   # Deletes the entire key if it holds a JSON value.
   defp do_json_del_root(key, store) do
-    if Ops.exists?(store, key) and match?({:ok, _}, read_json(key, store)) do
-      Ops.delete(store, key)
-      1
-    else
-      0
+    case read_json(key, store) do
+      nil ->
+        0
+
+      {:error, _} = err ->
+        err
+
+      {:ok, _root} ->
+        Ops.delete(store, key)
+        1
     end
   end
 
@@ -549,11 +555,7 @@ defmodule Ferricstore.Commands.Json do
   end
 
   defp root_missing_or_compound(key, store) do
-    case TypeRegistry.get_type(key, store) do
-      "none" -> :missing
-      "string" -> :missing
-      _type -> :compound
-    end
+    if live_compound_key?(key, store), do: :compound, else: :missing
   end
 
   defp maybe_write_json(key, new_value, nx?, xx?, exists?, store) do
@@ -601,9 +603,23 @@ defmodule Ferricstore.Commands.Json do
   @spec read_json(binary(), map()) :: {:ok, term()} | nil | {:error, binary()}
   defp read_json(key, store) do
     case Ops.get(store, key) do
-      nil -> nil
+      nil -> missing_or_compound_json(key, store)
       raw -> decode_raw_json(raw)
     end
+  end
+
+  defp missing_or_compound_json(key, store) do
+    if live_compound_key?(key, store), do: {:error, @wrongtype_msg}, else: nil
+  end
+
+  defp live_compound_key?(key, store) do
+    compound_type_marker?(key, store) and TypeRegistry.get_type(key, store) != "none"
+  end
+
+  defp compound_type_marker?(key, store) do
+    Ops.has_compound?(store) and
+      (Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil or
+         Ops.compound_get(store, key, CompoundKey.list_meta_key(key)) != nil)
   end
 
   defp decode_raw_json(raw) do

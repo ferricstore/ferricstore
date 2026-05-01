@@ -175,7 +175,7 @@ defmodule Ferricstore.Commands.JsonTest do
 
       assert {:error, msg} = Json.handle("JSON.SET", ["doc", "$", ~s({"x":1})], store)
       assert msg =~ "WRONGTYPE"
-      assert nil == Json.handle("JSON.GET", ["doc"], store)
+      assert {:error, "WRONGTYPE" <> _} = Json.handle("JSON.GET", ["doc"], store)
       assert "value" == Hash.handle("HGET", ["doc", "field"], store)
     end
 
@@ -263,6 +263,15 @@ defmodule Ferricstore.Commands.JsonTest do
       assert {:error, msg} = Json.handle("JSON.GET", ["doc"], store)
       assert msg =~ "not a JSON value"
     end
+
+    test "returns WRONGTYPE for compound keys" do
+      store = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["doc", "field", "value"], store)
+
+      assert {:error, msg} = Json.handle("JSON.GET", ["doc"], store)
+      assert msg =~ "WRONGTYPE"
+      assert "value" == Hash.handle("HGET", ["doc", "field"], store)
+    end
   end
 
   # ===========================================================================
@@ -315,6 +324,24 @@ defmodule Ferricstore.Commands.JsonTest do
 
     test "wrong number of arguments returns error" do
       assert {:error, _} = Json.handle("JSON.DEL", [], MockStore.make())
+    end
+
+    test "returns error for non-JSON value stored at key" do
+      store = MockStore.make()
+      store.put.("doc", "not a json tagged value", 0)
+
+      assert {:error, msg} = Json.handle("JSON.DEL", ["doc"], store)
+      assert msg =~ "not a JSON value"
+      assert store.get.("doc") == "not a json tagged value"
+    end
+
+    test "returns WRONGTYPE for compound keys" do
+      store = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["doc", "field", "value"], store)
+
+      assert {:error, msg} = Json.handle("JSON.DEL", ["doc"], store)
+      assert msg =~ "WRONGTYPE"
+      assert "value" == Hash.handle("HGET", ["doc", "field"], store)
     end
   end
 
@@ -442,6 +469,15 @@ defmodule Ferricstore.Commands.JsonTest do
 
     test "wrong number of arguments returns error" do
       assert {:error, _} = Json.handle("JSON.TYPE", [], MockStore.make())
+    end
+
+    test "returns WRONGTYPE for compound keys" do
+      store = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["doc", "field", "value"], store)
+
+      assert {:error, msg} = Json.handle("JSON.TYPE", ["doc"], store)
+      assert msg =~ "WRONGTYPE"
+      assert "value" == Hash.handle("HGET", ["doc", "field"], store)
     end
   end
 
