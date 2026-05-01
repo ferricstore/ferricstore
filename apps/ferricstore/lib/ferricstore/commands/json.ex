@@ -36,6 +36,9 @@ defmodule Ferricstore.Commands.Json do
   """
 
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.TypeRegistry
+
+  @wrongtype_msg "WRONGTYPE Operation against a key holding the wrong kind of value"
 
   @doc """
   Handles a JSON command.
@@ -266,8 +269,11 @@ defmodule Ferricstore.Commands.Json do
 
   def handle("JSON.CLEAR", [key, "$"], store) do
     case read_json(key, store) do
-      nil -> 0
-      {:error, _} = err -> err
+      nil ->
+        0
+
+      {:error, _} = err ->
+        err
 
       {:ok, root} ->
         write_json(key, clear_value(root), store)
@@ -289,6 +295,7 @@ defmodule Ferricstore.Commands.Json do
 
   def handle("JSON.MGET", args, store) when length(args) >= 2 do
     {keys, [path]} = Enum.split(args, length(args) - 1)
+
     case parse_path(path) do
       :error -> {:error, "ERR invalid JSONPath syntax"}
       segments -> Enum.map(keys, &mget_one(&1, segments, store))
@@ -376,7 +383,8 @@ defmodule Ferricstore.Commands.Json do
       :not_found ->
         {:error, "ERR path does not exist"}
 
-      {:error, _} = err -> err
+      {:error, _} = err ->
+        err
     end
   end
 
@@ -397,7 +405,8 @@ defmodule Ferricstore.Commands.Json do
       :not_found ->
         {:error, "ERR path does not exist"}
 
-      {:error, _} = err -> err
+      {:error, _} = err ->
+        err
     end
   end
 
@@ -418,7 +427,8 @@ defmodule Ferricstore.Commands.Json do
       :not_found ->
         {:error, "ERR path does not exist"}
 
-      {:error, _} = err -> err
+      {:error, _} = err ->
+        err
     end
   end
 
@@ -443,7 +453,8 @@ defmodule Ferricstore.Commands.Json do
       :not_found ->
         0
 
-      {:error, _} = err -> err
+      {:error, _} = err ->
+        err
     end
   end
 
@@ -467,12 +478,18 @@ defmodule Ferricstore.Commands.Json do
   # ===========================================================================
 
   defp do_json_set(key, "$", new_value, nx?, xx?, store) do
-    key_exists? = Ops.exists?(store, key)
+    case root_json_key_state(key, store) do
+      :missing ->
+        maybe_write_json(key, new_value, nx?, xx?, false, store)
 
-    if blocked_by_flags?(nx?, xx?, key_exists?) do
-      nil
-    else
-      write_json(key, new_value, store)
+      {:json, _root} ->
+        maybe_write_json(key, new_value, nx?, xx?, true, store)
+
+      :not_json ->
+        {:error, "ERR existing key is not a JSON value"}
+
+      :compound ->
+        {:error, @wrongtype_msg}
     end
   end
 
@@ -514,6 +531,36 @@ defmodule Ferricstore.Commands.Json do
     case set_at_path(root, segments, new_value) do
       {:ok, new_root} -> write_json(key, new_root, store)
       :not_found -> {:error, "ERR path does not exist in the JSON value"}
+    end
+  end
+
+  defp root_json_key_state(key, store) do
+    case Ops.get(store, key) do
+      nil -> root_missing_or_compound(key, store)
+      raw -> root_raw_json_state(raw)
+    end
+  end
+
+  defp root_raw_json_state(raw) do
+    case decode_raw_json(raw) do
+      {:ok, root} -> {:json, root}
+      {:error, _} -> :not_json
+    end
+  end
+
+  defp root_missing_or_compound(key, store) do
+    case TypeRegistry.get_type(key, store) do
+      "none" -> :missing
+      "string" -> :missing
+      _type -> :compound
+    end
+  end
+
+  defp maybe_write_json(key, new_value, nx?, xx?, exists?, store) do
+    if blocked_by_flags?(nx?, xx?, exists?) do
+      nil
+    else
+      write_json(key, new_value, store)
     end
   end
 
@@ -771,7 +818,10 @@ defmodule Ferricstore.Commands.Json do
 
   defp delete_at_path(list, [idx]) when is_list(list) and is_integer(idx) do
     actual_idx = normalize_index(idx, length(list))
-    if valid_index?(actual_idx, length(list)), do: {:ok, List.delete_at(list, actual_idx)}, else: :not_found
+
+    if valid_index?(actual_idx, length(list)),
+      do: {:ok, List.delete_at(list, actual_idx)},
+      else: :not_found
   end
 
   defp delete_at_path(map, [key | rest]) when is_map(map) and is_binary(key) do

@@ -3,6 +3,7 @@ defmodule Ferricstore.Commands.JsonTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.Json
+  alias Ferricstore.Commands.Hash
   alias Ferricstore.Test.MockStore
 
   # ===========================================================================
@@ -157,6 +158,25 @@ defmodule Ferricstore.Commands.JsonTest do
     test "unrecognized flag returns error" do
       assert {:error, msg} = Json.handle("JSON.SET", ["k", "$", "1", "BOGUS"], MockStore.make())
       assert msg =~ "syntax error"
+    end
+
+    test "root set rejects an existing plain string key" do
+      store = MockStore.make()
+      store.put.("doc", "plain", 0)
+
+      assert {:error, msg} = Json.handle("JSON.SET", ["doc", "$", ~s({"x":1})], store)
+      assert msg =~ "not a JSON value"
+      assert store.get.("doc") == "plain"
+    end
+
+    test "root set rejects an existing compound key" do
+      store = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["doc", "field", "value"], store)
+
+      assert {:error, msg} = Json.handle("JSON.SET", ["doc", "$", ~s({"x":1})], store)
+      assert msg =~ "WRONGTYPE"
+      assert nil == Json.handle("JSON.GET", ["doc"], store)
+      assert "value" == Hash.handle("HGET", ["doc", "field"], store)
     end
 
     test "creates nested path on non-existing key" do
