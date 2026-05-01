@@ -650,6 +650,7 @@ defmodule Ferricstore.Store.Shard do
 
           case NIF.v2_copy_records(source, dest, offsets) do
             {:ok, results} when length(results) == length(live_entries) ->
+              remove_hint_for_file(sp, fid)
               Ferricstore.FS.rename!(dest, source)
               update_compacted_ets_locations(state.keydir, fid, live_entries, results)
 
@@ -689,8 +690,10 @@ defmodule Ferricstore.Store.Shard do
             end
 
           if tombstone_file?(source) do
+            remove_hint_for_file(sp, fid)
             {written, dropped, reclaimed}
           else
+            remove_hint_for_file(sp, fid)
             _ = Ferricstore.FS.rm(source)
             {written, dropped, reclaimed + old_size}
           end
@@ -897,6 +900,15 @@ defmodule Ferricstore.Store.Shard do
       {:ok, [_ | _]} -> true
       _ -> false
     end
+  end
+
+  defp remove_hint_for_file(shard_path, fid) do
+    # Compaction rewrites or invalidates offsets in the paired log file.
+    # Dropping the hint forces startup to scan the log instead of trusting
+    # stale offsets that can resurrect deleted keys.
+    hint_name = "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.hint"
+    _ = Ferricstore.FS.rm(Path.join(shard_path, hint_name))
+    :ok
   end
 
   defp update_compacted_ets_locations(keydir, fid, live_entries, results) do

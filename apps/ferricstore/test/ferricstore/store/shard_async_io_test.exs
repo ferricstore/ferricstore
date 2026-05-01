@@ -919,6 +919,50 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   end
 
   describe "shared log compaction" do
+    test "removes stale hint when compacting a rewritten shared log file" do
+      {pid1, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      a = "compact_hint_a_#{:erlang.unique_integer([:positive])}"
+      b = "compact_hint_b_#{:erlang.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        case Process.whereis(elem(ctx.shard_names, 0)) do
+          pid when is_pid(pid) ->
+            cleanup_shard(pid, ctx, dir)
+
+          _ ->
+            FerricStore.Instance.cleanup(ctx.name)
+            File.rm_rf(dir)
+        end
+      end)
+
+      :ok = GenServer.call(pid1, {:put, a, "old-a", 0})
+      :ok = GenServer.call(pid1, {:put, b, "live-b", 0})
+      :ok = GenServer.call(pid1, :flush)
+
+      state = :sys.get_state(pid1)
+      assert :ok = ShardFlush.write_hint_for_file(state, 0)
+
+      hint_path = Path.join([dir, "data", "shard_0", "00000.hint"])
+      assert File.exists?(hint_path)
+
+      :ok = GenServer.call(pid1, {:delete, a})
+      :ok = GenServer.call(pid1, :flush)
+      assert nil == GenServer.call(pid1, {:get, a})
+      assert "live-b" == GenServer.call(pid1, {:get, b})
+
+      assert {:ok, {1, 0, _reclaimed}} = GenServer.call(pid1, {:run_compaction, [0]})
+
+      Process.unlink(pid1)
+      ref = Process.monitor(pid1)
+      Process.exit(pid1, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid1, :killed}, 2_000
+
+      pid2 = restart_shard(dir, ctx, 5000)
+
+      assert nil == GenServer.call(pid2, {:get, a})
+      assert "live-b" == GenServer.call(pid2, {:get, b})
+    end
+
     test "does not drop tombstone-only files while older values can resurrect" do
       previous_trap_exit = Process.flag(:trap_exit, true)
       dir = Path.join(System.tmp_dir!(), "tombstone_compaction_#{:rand.uniform(9_999_999)}")
