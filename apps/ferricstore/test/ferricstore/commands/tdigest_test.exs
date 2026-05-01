@@ -1371,13 +1371,13 @@ defmodule Ferricstore.Commands.TDigestTest do
       assert {:error, _msg} = CMS.handle("CMS.QUERY", ["mydigest", "elem"], store)
     end
 
-    test "TDIGEST command on CMS key returns does not exist" do
+    test "TDIGEST command on CMS key returns WRONGTYPE" do
       alias Ferricstore.Commands.CMS
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
 
       assert {:error, msg} = TDigestCmd.handle("TDIGEST.ADD", ["mysketch", "1.0"], store)
-      assert msg =~ "does not exist"
+      assert msg =~ "WRONGTYPE"
     end
   end
 

@@ -1934,12 +1934,38 @@ defmodule Ferricstore.Store.Router do
   """
   @spec tdigest_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
   def tdigest_op(ctx, "TDIGEST.MERGE", [dest | _] = args) do
-    raft_write(ctx, shard_for(ctx, dest), dest, {:tdigest_op, "TDIGEST.MERGE", args})
+    source_keys = tdigest_merge_source_keys(args)
+
+    if source_keys == [] do
+      raft_write(ctx, shard_for(ctx, dest), dest, {:tdigest_op, "TDIGEST.MERGE", args})
+    else
+      keys_with_roles = [{dest, :write} | Enum.map(source_keys, &{&1, :read})]
+
+      Ferricstore.CrossShardOp.execute(
+        keys_with_roles,
+        fn _store ->
+          raft_write(ctx, shard_for(ctx, dest), dest, {:tdigest_op, "TDIGEST.MERGE", args})
+        end,
+        intent: %{command: :tdigest_merge, keys: %{targets: [dest | source_keys]}}
+      )
+    end
   end
 
   def tdigest_op(ctx, cmd, [key | _] = args) do
     raft_write(ctx, shard_for(ctx, key), key, {:tdigest_op, cmd, args})
   end
+
+  defp tdigest_merge_source_keys([_dest, numkeys_str | rest]) do
+    case Integer.parse(to_string(numkeys_str)) do
+      {numkeys, ""} when numkeys > 0 and length(rest) >= numkeys ->
+        Enum.take(rest, numkeys)
+
+      _ ->
+        []
+    end
+  end
+
+  defp tdigest_merge_source_keys(_args), do: []
 
   @doc "Returns all live (non-expired, non-deleted) keys across every shard."
   @spec keys(FerricStore.Instance.t()) :: [binary()]

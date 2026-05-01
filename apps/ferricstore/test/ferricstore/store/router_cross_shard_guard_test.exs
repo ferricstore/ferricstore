@@ -12,5 +12,6 @@ defmodule Ferricstore.Store.RouterCrossShardGuardTest do
     # before dispatching the destination write.
     assert source =~ ~r/def hll_op\(ctx, "PFMERGE".*CrossShardOp\.execute/s
     assert source =~ ~r/def geo_op\(ctx, "GEOSEARCHSTORE".*CrossShardOp\.execute/s
+    assert source =~ ~r/def tdigest_op\(ctx, "TDIGEST\.MERGE".*CrossShardOp\.execute/s
   end
 end
