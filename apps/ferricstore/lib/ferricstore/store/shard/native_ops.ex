@@ -9,6 +9,9 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
   require Logger
 
+  @record_header_size 26
+  @direct_dead_bytes_key {__MODULE__, :direct_dead_bytes}
+
   # -------------------------------------------------------------------
   # CAS / LOCK / UNLOCK / EXTEND / RATELIMIT / LIST handlers
   # -------------------------------------------------------------------
@@ -370,15 +373,22 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     state = ShardFlush.flush_pending_sync(state)
     store = build_list_compound_store_direct(key, state)
 
-    type_store = type_check_store(store, state)
+    reset_direct_dead_bytes()
 
-    case ensure_list_type_for_operation(key, operation, type_store) do
-      :ok ->
-        result = Ferricstore.Store.ListOps.execute(key, store, operation)
-        {:reply, result, refresh_direct_file_accounting(state)}
+    try do
+      type_store = type_check_store(store, state)
 
-      {:error, _} = err ->
-        {:reply, err, state}
+      case ensure_list_type_for_operation(key, operation, type_store) do
+        :ok ->
+          result = Ferricstore.Store.ListOps.execute(key, store, operation)
+          state = state |> apply_direct_dead_bytes() |> refresh_direct_file_accounting()
+          {:reply, result, state}
+
+        {:error, _} = err ->
+          {:reply, err, state}
+      end
+    after
+      reset_direct_dead_bytes()
     end
   end
 
@@ -429,8 +439,16 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     state = ShardFlush.await_in_flight(state)
     state = ShardFlush.flush_pending_sync(state)
     store = build_list_compound_store_direct(src_key, state)
-    result = Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
-    {:reply, result, refresh_direct_file_accounting(state)}
+
+    reset_direct_dead_bytes()
+
+    try do
+      result = Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
+      state = state |> apply_direct_dead_bytes() |> refresh_direct_file_accounting()
+      {:reply, result, state}
+    after
+      reset_direct_dead_bytes()
+    end
   end
 
   @spec build_list_compound_store_raft(binary(), map()) :: map()
@@ -518,6 +536,8 @@ defmodule Ferricstore.Store.Shard.NativeOps do
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
         case NIF.v2_append_batch(state.active_file_path, [{compound_key, value, expire_at_ms}]) do
           {:ok, [{offset, _value_size}]} ->
+            record_direct_dead_bytes(state, compound_key)
+
             ShardETS.ets_insert_with_location(
               state,
               compound_key,
@@ -541,6 +561,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
       compound_delete: fn _redis_key, compound_key ->
         case NIF.v2_append_tombstone(state.active_file_path, compound_key) do
           {:ok, _} ->
+            record_direct_dead_bytes(state, compound_key)
             ShardETS.ets_delete_key(state, compound_key)
             :ok
 
@@ -616,5 +637,32 @@ defmodule Ferricstore.Store.Shard.NativeOps do
       {:error, _} ->
         state
     end
+  end
+
+  defp reset_direct_dead_bytes, do: Process.put(@direct_dead_bytes_key, %{})
+
+  defp record_direct_dead_bytes(state, key) do
+    case :ets.lookup(state.keydir, key) do
+      [{^key, _value, _exp, _lfu, old_fid, _off, old_vsize}]
+      when is_integer(old_fid) and old_fid >= 0 and is_integer(old_vsize) and old_vsize >= 0 ->
+        dead_increment = old_vsize + @record_header_size + byte_size(key)
+
+        @direct_dead_bytes_key
+        |> Process.get(%{})
+        |> Map.update(old_fid, dead_increment, &(&1 + dead_increment))
+        |> then(&Process.put(@direct_dead_bytes_key, &1))
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp apply_direct_dead_bytes(state) do
+    @direct_dead_bytes_key
+    |> Process.get(%{})
+    |> Enum.reduce(state, fn {fid, dead_increment}, acc ->
+      {total, dead} = Map.get(acc.file_stats, fid, {0, 0})
+      %{acc | file_stats: Map.put(acc.file_stats, fid, {total, dead + dead_increment})}
+    end)
   end
 end
