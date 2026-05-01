@@ -366,6 +366,22 @@ defmodule Ferricstore.Store.Shard do
     {:reply, {:error, "ERR shard writes paused for sync"}, state}
   end
 
+  def handle_call({:forwarded_quorum, origin_node, command}, from, state) do
+    forwarded_from = Ferricstore.Raft.Batcher.remote_origin_from(origin_node, from)
+    previous_origin = Process.get(:ferricstore_forward_origin)
+    Process.put(:ferricstore_forward_origin, origin_node)
+
+    try do
+      handle_forwarded_quorum(command, forwarded_from, state)
+    after
+      if previous_origin == nil do
+        Process.delete(:ferricstore_forward_origin)
+      else
+        Process.put(:ferricstore_forward_origin, previous_origin)
+      end
+    end
+  end
+
   def handle_call({:put, key, value, expire_at_ms}, from, state) do
     ShardWrites.handle_put(key, value, expire_at_ms, from, state)
   end
@@ -767,6 +783,106 @@ defmodule Ferricstore.Store.Shard do
         {_new_state, result, _effects} -> {:reply, result, state}
       end
     end
+  end
+
+  defp handle_forwarded_quorum(
+         {:put, _key, _value, _expire_at_ms},
+         _from,
+         %{writes_paused: true} = state
+       ) do
+    {:reply, {:error, "ERR shard writes paused for sync"}, state}
+  end
+
+  defp handle_forwarded_quorum({:put, key, value, expire_at_ms}, from, state) do
+    ShardWrites.handle_put(key, value, expire_at_ms, from, state)
+  end
+
+  defp handle_forwarded_quorum({:delete, key}, from, state) do
+    ShardWrites.handle_delete(key, from, state)
+  end
+
+  defp handle_forwarded_quorum({:incr, key, delta}, from, state) do
+    ShardWrites.handle_incr(key, delta, from, state)
+  end
+
+  defp handle_forwarded_quorum({:incr_float, key, delta}, from, state) do
+    ShardWrites.handle_incr_float(key, delta, from, state)
+  end
+
+  defp handle_forwarded_quorum({:append, key, suffix}, from, state) do
+    ShardWrites.handle_append(key, suffix, from, state)
+  end
+
+  defp handle_forwarded_quorum({:getset, key, new_value}, from, state) do
+    ShardWrites.handle_getset(key, new_value, from, state)
+  end
+
+  defp handle_forwarded_quorum({:getdel, key}, from, state) do
+    ShardWrites.handle_getdel(key, from, state)
+  end
+
+  defp handle_forwarded_quorum({:getex, key, expire_at_ms}, from, state) do
+    ShardWrites.handle_getex(key, expire_at_ms, from, state)
+  end
+
+  defp handle_forwarded_quorum({:setrange, key, offset, value}, from, state) do
+    ShardWrites.handle_setrange(key, offset, value, from, state)
+  end
+
+  defp handle_forwarded_quorum(
+         {:compound_put, redis_key, compound_key, value, expire_at_ms},
+         _from,
+         state
+       ) do
+    ShardCompound.handle_compound_put(redis_key, compound_key, value, expire_at_ms, state)
+  end
+
+  defp handle_forwarded_quorum({:compound_delete, redis_key, compound_key}, _from, state) do
+    ShardCompound.handle_compound_delete(redis_key, compound_key, state)
+  end
+
+  defp handle_forwarded_quorum({:compound_delete_prefix, redis_key, prefix}, _from, state) do
+    ShardCompound.handle_compound_delete_prefix(redis_key, prefix, state)
+  end
+
+  defp handle_forwarded_quorum({:cas, key, expected, new_value, ttl_ms}, _from, state) do
+    ShardNativeOps.handle_cas(key, expected, new_value, ttl_ms, state)
+  end
+
+  defp handle_forwarded_quorum({:lock, key, owner, ttl_ms}, _from, state) do
+    ShardNativeOps.handle_lock(key, owner, ttl_ms, state)
+  end
+
+  defp handle_forwarded_quorum({:unlock, key, owner}, _from, state) do
+    ShardNativeOps.handle_unlock(key, owner, state)
+  end
+
+  defp handle_forwarded_quorum({:extend, key, owner, ttl_ms}, _from, state) do
+    ShardNativeOps.handle_extend(key, owner, ttl_ms, state)
+  end
+
+  defp handle_forwarded_quorum({:ratelimit_add, key, window_ms, max, count}, _from, state) do
+    ShardNativeOps.handle_ratelimit_add(key, window_ms, max, count, state)
+  end
+
+  defp handle_forwarded_quorum(
+         {:ratelimit_add, key, window_ms, max, count, _now_ms},
+         _from,
+         state
+       ) do
+    ShardNativeOps.handle_ratelimit_add(key, window_ms, max, count, state)
+  end
+
+  defp handle_forwarded_quorum({:list_op, key, operation}, _from, state) do
+    ShardNativeOps.handle_list_op(key, operation, state)
+  end
+
+  defp handle_forwarded_quorum({:list_op_lmove, src_key, dst_key, from_dir, to_dir}, _from, state) do
+    ShardNativeOps.handle_list_op_lmove(src_key, dst_key, from_dir, to_dir, state)
+  end
+
+  defp handle_forwarded_quorum(command, from, state) when is_tuple(command) do
+    handle_call(command, from, state)
   end
 
   defp update_compacted_ets_locations(keydir, fid, live_entries, results) do

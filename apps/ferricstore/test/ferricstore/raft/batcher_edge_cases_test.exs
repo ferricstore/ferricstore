@@ -25,6 +25,11 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
   defp ctx, do: FerricStore.Instance.get(:default)
   defp ukey(base), do: "edge_#{base}_#{:rand.uniform(9_999_999)}"
 
+  defp same_shard_key(shard_index, base) do
+    Stream.repeatedly(fn -> ukey(base) end)
+    |> Enum.find(&(Router.shard_for(ctx(), &1) == shard_index))
+  end
+
   # ---------------------------------------------------------------------------
   # extract_prefix edge cases
   # ---------------------------------------------------------------------------
@@ -212,6 +217,52 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
     test "flush on empty batcher returns immediately" do
       assert :ok == Batcher.flush(0)
       assert :ok == Batcher.flush(1)
+    end
+  end
+
+  describe "forwarded quorum replies" do
+    test "single forwarded caller receives applied index wrapper" do
+      k = ukey("forwarded_single")
+      shard_index = Router.shard_for(ctx(), k)
+      origin_node = :follower@nohost
+      ref = make_ref()
+
+      :ok =
+        Batcher.write_async_quorum_forwarded(
+          shard_index,
+          {:put, k, "forwarded", 0},
+          {self(), ref},
+          origin_node
+        )
+
+      assert_receive {^ref, {:remote_applied_at, ra_index, :ok}}, 10_000
+      assert is_integer(ra_index) and ra_index > 0
+    end
+
+    test "batch forwarded caller receives applied index wrappers per result" do
+      k1 = ukey("forwarded_batch_a")
+      shard_index = Router.shard_for(ctx(), k1)
+      k2 = same_shard_key(shard_index, "forwarded_batch_b")
+      origin_node = :follower@nohost
+      ref = make_ref()
+
+      :ok =
+        Batcher.write_batch_forwarded(
+          shard_index,
+          [{:put, k1, "v1", 0}, {:put, k2, "v2", 0}],
+          {self(), ref},
+          origin_node
+        )
+
+      assert_receive {^ref,
+                      {:ok,
+                       [
+                         {:remote_applied_at, ra_index, :ok},
+                         {:remote_applied_at, ra_index, :ok}
+                       ]}},
+                     10_000
+
+      assert is_integer(ra_index) and ra_index > 0
     end
   end
 

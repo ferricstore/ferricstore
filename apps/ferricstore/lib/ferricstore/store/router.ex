@@ -109,7 +109,7 @@ defmodule Ferricstore.Store.Router do
           leader_node,
           GenServer,
           :call,
-          [elem(remote_ctx.shard_names, idx), command, 10_000],
+          [elem(remote_ctx.shard_names, idx), {:forwarded_quorum, node(), command}, 10_000],
           10_000
         )
 
@@ -1855,6 +1855,10 @@ defmodule Ferricstore.Store.Router do
           :ok | {:error, binary() | {:timeout, :unknown_outcome}}
         ]
   def batch_quorum_put(ctx, kv_pairs) do
+    batch_quorum_put(ctx, kv_pairs, nil)
+  end
+
+  defp batch_quorum_put(ctx, kv_pairs, origin_node) do
     wv_size = :counters.info(ctx.write_version).size
     me = self()
 
@@ -1876,7 +1880,14 @@ defmodule Ferricstore.Store.Router do
     shard_refs =
       Enum.map(by_shard, fn {shard_idx, {cmds, indices}} ->
         ref = make_ref()
-        Ferricstore.Raft.Batcher.write_batch(shard_idx, Enum.reverse(cmds), {me, ref})
+        cmds = Enum.reverse(cmds)
+
+        if origin_node == nil do
+          Ferricstore.Raft.Batcher.write_batch(shard_idx, cmds, {me, ref})
+        else
+          Ferricstore.Raft.Batcher.write_batch_forwarded(shard_idx, cmds, {me, ref}, origin_node)
+        end
+
         {ref, shard_idx, Enum.reverse(indices)}
       end)
 
@@ -1969,10 +1980,20 @@ defmodule Ferricstore.Store.Router do
     Enum.map(kv_pairs, fn _ -> {:error, "ERR not leader, election in progress"} end)
   end
 
-  defp forward_batch_to_leader(_ctx, leader_node, _shard_idx, kv_pairs) do
+  defp forward_batch_to_leader(_ctx, leader_node, shard_idx, kv_pairs) do
     try do
       remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
-      :erpc.call(leader_node, __MODULE__, :batch_quorum_put, [remote_ctx, kv_pairs], 10_000)
+
+      leader_results =
+        :erpc.call(
+          leader_node,
+          __MODULE__,
+          :__forwarded_batch_quorum_put__,
+          [remote_ctx, kv_pairs, node()],
+          10_000
+        )
+
+      unwrap_forwarded_batch_results(shard_idx, leader_results)
     catch
       _, reason ->
         require Logger
@@ -1980,6 +2001,24 @@ defmodule Ferricstore.Store.Router do
         __forward_batch_failure_results__(reason, length(kv_pairs))
     end
   end
+
+  @doc false
+  def __forwarded_batch_quorum_put__(ctx, kv_pairs, origin_node) do
+    batch_quorum_put(ctx, kv_pairs, origin_node)
+  end
+
+  defp unwrap_forwarded_batch_results(shard_idx, results) when is_list(results) do
+    Enum.map(results, fn
+      {:remote_applied_at, ra_index, real_result} ->
+        _ = Ferricstore.Raft.Batcher.await_local_applied(shard_idx, ra_index, 5_000)
+        real_result
+
+      other ->
+        other
+    end)
+  end
+
+  defp unwrap_forwarded_batch_results(_shard_idx, other), do: other
 
   @doc """
   Stores `key` with `value`. `expire_at_ms` is an absolute Unix-epoch

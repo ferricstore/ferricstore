@@ -227,7 +227,17 @@ defmodule Ferricstore.Raft.Batcher do
   """
   @spec write(non_neg_integer(), command()) :: :ok | {:error, term()}
   def write(shard_index, command) do
-    GenServer.call(batcher_name(shard_index), {:write, command}, 10_000)
+    case Process.get(:ferricstore_forward_origin) do
+      nil ->
+        GenServer.call(batcher_name(shard_index), {:write, command}, 10_000)
+
+      origin_node ->
+        GenServer.call(
+          batcher_name(shard_index),
+          {:write_forwarded, command, origin_node},
+          10_000
+        )
+    end
   end
 
   @doc """
@@ -262,6 +272,16 @@ defmodule Ferricstore.Raft.Batcher do
     GenServer.cast(batcher_name(shard_index), {:write_quorum, command, reply_to})
   end
 
+  @doc false
+  @spec write_async_quorum_forwarded(non_neg_integer(), command(), GenServer.from(), node()) ::
+          :ok
+  def write_async_quorum_forwarded(shard_index, command, reply_to, origin_node) do
+    GenServer.cast(
+      batcher_name(shard_index),
+      {:write_quorum, command, remote_origin_from(origin_node, reply_to)}
+    )
+  end
+
   @doc """
   Submits multiple quorum write commands in a single message.
 
@@ -274,6 +294,23 @@ defmodule Ferricstore.Raft.Batcher do
   def write_batch(shard_index, cmds, from) do
     GenServer.cast(batcher_name(shard_index), {:write_batch, cmds, length(cmds), from})
   end
+
+  @doc false
+  @spec write_batch_forwarded(non_neg_integer(), [command()], GenServer.from(), node()) :: :ok
+  def write_batch_forwarded(shard_index, cmds, from, origin_node) do
+    GenServer.cast(
+      batcher_name(shard_index),
+      {:write_batch, cmds, length(cmds), remote_origin_from(origin_node, from)}
+    )
+  end
+
+  @doc false
+  @spec remote_origin_from(node(), GenServer.from()) :: {:remote_origin, node(), GenServer.from()}
+  # Forwarded writes arrive at the leader through an erpc server process, so
+  # the plain GenServer.from() looks local to the leader. Carry the real origin
+  # node explicitly so replies include a Ra index and the origin can wait for
+  # its own local state machine before acknowledging the client.
+  def remote_origin_from(origin_node, from), do: {:remote_origin, origin_node, from}
 
   @doc """
   Submits an async-durability write. Fire-and-forget.
@@ -429,6 +466,10 @@ defmodule Ferricstore.Raft.Batcher do
   @impl true
   def handle_call({:write, command}, from, state) do
     enqueue_write(command, from, state)
+  end
+
+  def handle_call({:write_forwarded, command, origin_node}, from, state) do
+    enqueue_write(command, remote_origin_from(origin_node, from), state)
   end
 
   def handle_call(:flush, from, state) do
@@ -657,10 +698,15 @@ defmodule Ferricstore.Raft.Batcher do
   defp all_local_callers?(froms) do
     Enum.all?(froms, fn
       {pid, _ref} when is_pid(pid) -> node(pid) == node()
-      {:batch_from, {pid, _ref}, _count} when is_pid(pid) -> node(pid) == node()
+      {:remote_origin, origin_node, _from} -> origin_node == node()
+      {:batch_from, from, _count} -> local_from?(from)
       _ -> false
     end)
   end
+
+  defp local_from?({pid, _ref}) when is_pid(pid), do: node(pid) == node()
+  defp local_from?({:remote_origin, origin_node, _from}), do: origin_node == node()
+  defp local_from?(_from), do: false
 
   # When the caller is on a different node, it was forwarded by
   # Router.forward_to_leader. Send the result wrapped with the ra_index so
@@ -669,18 +715,18 @@ defmodule Ferricstore.Raft.Batcher do
   defp do_reply(:single, [from], result, ra_index) do
     case from do
       {:batch_from, inner_from, _count} ->
-        GenServer.reply(inner_from, {:ok, [maybe_wrap_remote(inner_from, result, ra_index)]})
+        reply_from(inner_from, {:ok, [maybe_wrap_remote(inner_from, result, ra_index)]})
 
       _ ->
-        GenServer.reply(from, maybe_wrap_remote(from, result, ra_index))
+        reply_from(from, maybe_wrap_remote(from, result, ra_index))
     end
   end
 
-  defp do_reply(:batch, froms, result, _ra_index) do
-    # Batch results aren't wrapped per-entry — each `from` gets its slice of
-    # the batch's results. Forwarders that issue batches don't barrier on
-    # individual indices today; they'd need their own gating if added.
-    reply_batch(froms, result)
+  defp do_reply(:batch, froms, result, ra_index) do
+    # Each `from` gets its slice of the batch results. Forwarded batch callers
+    # get each result tagged with the Ra index so the origin node can barrier
+    # on local apply before returning to the client.
+    reply_batch(froms, result, ra_index)
   end
 
   defp do_reply(:await_caller, [from], result, _ra_index) do
@@ -689,6 +735,11 @@ defmodule Ferricstore.Raft.Batcher do
 
   defp maybe_wrap_remote({pid, _ref}, result, ra_index)
        when node(pid) != node() and ra_index > 0 do
+    {:remote_applied_at, ra_index, result}
+  end
+
+  defp maybe_wrap_remote({:remote_origin, origin_node, _from}, result, ra_index)
+       when origin_node != node() and ra_index > 0 do
     {:remote_applied_at, ra_index, result}
   end
 
@@ -834,7 +885,7 @@ defmodule Ferricstore.Raft.Batcher do
     :ok
   end
 
-  defp reply_batch(froms, {:ok, results}) when is_list(results) do
+  defp reply_batch(froms, {:ok, results}, ra_index) when is_list(results) do
     expected =
       Enum.reduce(froms, 0, fn
         {:batch_from, _, count}, acc -> acc + count
@@ -842,7 +893,7 @@ defmodule Ferricstore.Raft.Batcher do
       end)
 
     if length(results) == expected do
-      dispatch_batch_results(froms, results)
+      dispatch_batch_results(froms, results, ra_index)
     else
       Logger.error(
         "Batcher: batch result count mismatch — " <>
@@ -853,35 +904,40 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
-  defp reply_batch(froms, other) do
+  defp reply_batch(froms, other, _ra_index) do
     reply_batch_error(froms, other)
   end
 
-  defp dispatch_batch_results([], []), do: :ok
+  defp dispatch_batch_results([], [], _ra_index), do: :ok
 
-  defp dispatch_batch_results([{:batch_from, from, count} | rest_froms], results) do
+  defp dispatch_batch_results([{:batch_from, from, count} | rest_froms], results, ra_index) do
     {slice, rest_results} = Enum.split(results, count)
-    GenServer.reply(from, {:ok, slice})
-    dispatch_batch_results(rest_froms, rest_results)
+    reply_from(from, {:ok, wrap_batch_results(from, slice, ra_index)})
+    dispatch_batch_results(rest_froms, rest_results, ra_index)
   end
 
-  defp dispatch_batch_results([from | rest_froms], [result | rest_results]) do
-    GenServer.reply(from, result)
-    dispatch_batch_results(rest_froms, rest_results)
+  defp dispatch_batch_results([from | rest_froms], [result | rest_results], ra_index) do
+    reply_from(from, maybe_wrap_remote(from, result, ra_index))
+    dispatch_batch_results(rest_froms, rest_results, ra_index)
+  end
+
+  defp wrap_batch_results(from, results, ra_index) do
+    Enum.map(results, &maybe_wrap_remote(from, &1, ra_index))
   end
 
   defp reply_batch_error(froms, error) do
     Enum.each(froms, fn
-      {:batch_from, from, _count} -> GenServer.reply(from, error)
-      from -> GenServer.reply(from, error)
+      {:batch_from, from, _count} -> reply_from(from, error)
+      from -> reply_from(from, error)
     end)
   end
 
   defp safe_reply({:batch_from, from, _count}, msg), do: safe_reply(from, msg)
+  defp safe_reply({:remote_origin, _origin_node, from}, msg), do: safe_reply(from, msg)
 
   defp safe_reply(from, msg) do
     try do
-      GenServer.reply(from, msg)
+      reply_from(from, msg)
     catch
       _, _ -> :ok
     end
@@ -889,10 +945,13 @@ defmodule Ferricstore.Raft.Batcher do
 
   defp reply_all_froms(froms, msg) do
     Enum.each(froms, fn
-      {:batch_from, from, _count} -> GenServer.reply(from, msg)
-      from -> GenServer.reply(from, msg)
+      {:batch_from, from, _count} -> reply_from(from, msg)
+      from -> reply_from(from, msg)
     end)
   end
+
+  defp reply_from({:remote_origin, _origin_node, from}, msg), do: GenServer.reply(from, msg)
+  defp reply_from(from, msg), do: GenServer.reply(from, msg)
 
   # ---------------------------------------------------------------------------
   # Private: write enqueue (shared by handle_call and handle_cast)

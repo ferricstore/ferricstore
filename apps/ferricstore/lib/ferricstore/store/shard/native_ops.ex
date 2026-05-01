@@ -13,7 +13,8 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   # CAS / LOCK / UNLOCK / EXTEND / RATELIMIT / LIST handlers
   # -------------------------------------------------------------------
 
-  @spec handle_cas(binary(), term(), binary(), non_neg_integer() | nil, map()) :: {:reply, term(), map()}
+  @spec handle_cas(binary(), term(), binary(), non_neg_integer() | nil, map()) ::
+          {:reply, term(), map()}
   @doc false
   def handle_cas(key, expected, new_value, ttl_ms, state) do
     if state.raft? do
@@ -45,7 +46,13 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   # specific command.
   defp forced_quorum_call(shard_index, command) do
     ref = make_ref()
-    from = {self(), ref}
+
+    from =
+      case Process.get(:ferricstore_forward_origin) do
+        nil -> {self(), ref}
+        origin_node -> Ferricstore.Raft.Batcher.remote_origin_from(origin_node, {self(), ref})
+      end
+
     Ferricstore.Raft.Batcher.write_async_quorum(shard_index, command, from)
 
     receive do
@@ -62,12 +69,22 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         ShardETS.ets_insert(state, key, new_value, expire)
         new_pending = [{key, new_value, expire} | state.pending]
         new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
-        new_state = if state.flush_in_flight == nil, do: ShardFlush.flush_pending(new_state), else: new_state
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: ShardFlush.flush_pending(new_state),
+            else: new_state
+
         {:reply, 1, new_state}
 
-      {{:hit, _other, _exp}, state} -> {:reply, 0, state}
-      {:expired, state} -> {:reply, nil, state}
-      {:missing, state} -> {:reply, nil, state}
+      {{:hit, _other, _exp}, state} ->
+        {:reply, 0, state}
+
+      {:expired, state} ->
+        {:reply, nil, state}
+
+      {:missing, state} ->
+        {:reply, nil, state}
     end
   end
 
@@ -102,7 +119,12 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         ShardETS.ets_insert(state, key, owner, expire)
         new_pending = [{key, owner, expire} | state.pending]
         new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
-        new_state = if state.flush_in_flight == nil, do: ShardFlush.flush_pending(new_state), else: new_state
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: ShardFlush.flush_pending(new_state),
+            else: new_state
+
         {:reply, :ok, new_state}
 
       {{:hit, _other, _exp}, state} ->
@@ -112,7 +134,12 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         ShardETS.ets_insert(state, key, owner, expire)
         new_pending = [{key, owner, expire} | state.pending]
         new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
-        new_state = if state.flush_in_flight == nil, do: ShardFlush.flush_pending(new_state), else: new_state
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: ShardFlush.flush_pending(new_state),
+            else: new_state
+
         {:reply, :ok, new_state}
     end
   end
@@ -152,14 +179,18 @@ defmodule Ferricstore.Store.Shard.NativeOps do
             {:reply, 1, %{state | write_version: state.write_version + 1}}
 
           {:error, reason} ->
-            Logger.error("Shard #{state.index}: tombstone write failed for UNLOCK: #{inspect(reason)}")
+            Logger.error(
+              "Shard #{state.index}: tombstone write failed for UNLOCK: #{inspect(reason)}"
+            )
+
             {:reply, {:error, reason}, state}
         end
 
       {{:hit, _other, _exp}, state} ->
         {:reply, {:error, "DISTLOCK caller is not the lock owner"}, state}
 
-      {_, state} -> {:reply, 1, state}
+      {_, state} ->
+        {:reply, 1, state}
     end
   end
 
@@ -194,7 +225,12 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         ShardETS.ets_insert(state, key, owner, new_expire)
         new_pending = [{key, owner, new_expire} | state.pending]
         new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
-        new_state = if state.flush_in_flight == nil, do: ShardFlush.flush_pending(new_state), else: new_state
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: ShardFlush.flush_pending(new_state),
+            else: new_state
+
         {:reply, 1, new_state}
 
       {{:hit, _other, _exp}, state} ->
@@ -205,7 +241,13 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
-  @spec handle_ratelimit_add(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), map()) :: {:reply, term(), map()}
+  @spec handle_ratelimit_add(
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          map()
+        ) :: {:reply, term(), map()}
   @doc false
   def handle_ratelimit_add(key, window_ms, max, count, state) do
     if state.raft? do
@@ -230,7 +272,13 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
-  @spec handle_ratelimit_add_direct(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), map()) :: {:reply, [term()], map()}
+  @spec handle_ratelimit_add_direct(
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          map()
+        ) :: {:reply, [term()], map()}
   @doc false
   def handle_ratelimit_add_direct(key, window_ms, max, count, state) do
     now = Ferricstore.HLC.now_ms()
@@ -261,7 +309,12 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         ShardETS.ets_insert(state, key, value, expire_at_ms)
         new_pending = [{key, value, expire_at_ms} | state.pending]
         new_state = %{state | pending: new_pending}
-        new_state = if state.flush_in_flight == nil, do: ShardFlush.flush_pending(new_state), else: new_state
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: ShardFlush.flush_pending(new_state),
+            else: new_state
+
         {"denied", effective, max(0, max - effective), new_state}
       else
         new_cur = cur_count + count
@@ -270,7 +323,12 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         ShardETS.ets_insert(state, key, value, expire_at_ms)
         new_pending = [{key, value, expire_at_ms} | state.pending]
         new_state = %{state | pending: new_pending}
-        new_state = if state.flush_in_flight == nil, do: ShardFlush.flush_pending(new_state), else: new_state
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: ShardFlush.flush_pending(new_state),
+            else: new_state
+
         {"allowed", new_eff, max(0, max - new_eff), new_state}
       end
 
@@ -408,7 +466,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
-  defp forward_compound_to_leader(state, leader_node, command) when leader_node == node() do
+  defp forward_compound_to_leader(_state, leader_node, _command) when leader_node == node() do
     {:error, "ERR not leader, election in progress"}
   end
 
@@ -417,7 +475,14 @@ defmodule Ferricstore.Store.Shard.NativeOps do
       remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
       shard = elem(remote_ctx.shard_names, state.index)
 
-      result = :erpc.call(leader_node, GenServer, :call, [shard, command, 10_000], 10_000)
+      result =
+        :erpc.call(
+          leader_node,
+          GenServer,
+          :call,
+          [shard, {:forwarded_quorum, node(), command}, 10_000],
+          10_000
+        )
 
       case result do
         {:remote_applied_at, ra_index, real_result} ->
@@ -442,10 +507,20 @@ defmodule Ferricstore.Store.Shard.NativeOps do
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
         case NIF.v2_append_batch(state.active_file_path, [{compound_key, value, expire_at_ms}]) do
           {:ok, [{offset, _value_size}]} ->
-            ShardETS.ets_insert_with_location(state, compound_key, value, expire_at_ms, state.active_file_id, offset, byte_size(value))
+            ShardETS.ets_insert_with_location(
+              state,
+              compound_key,
+              value,
+              expire_at_ms,
+              state.active_file_id,
+              offset,
+              byte_size(value)
+            )
+
           _ ->
             ShardETS.ets_insert(state, compound_key, value, expire_at_ms)
         end
+
         :ok
       end,
       compound_delete: fn _redis_key, compound_key ->
@@ -453,8 +528,12 @@ defmodule Ferricstore.Store.Shard.NativeOps do
           {:ok, _} ->
             ShardETS.ets_delete_key(state, compound_key)
             :ok
+
           {:error, reason} ->
-            Logger.error("Shard #{state.index}: tombstone write failed for list compound_delete: #{inspect(reason)}")
+            Logger.error(
+              "Shard #{state.index}: tombstone write failed for list compound_delete: #{inspect(reason)}"
+            )
+
             {:error, reason}
         end
       end,
@@ -469,15 +548,21 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   # Helpers
   # -------------------------------------------------------------------
 
-  @spec resolve_for_native(map(), binary()) :: {{:hit, term(), non_neg_integer()}, map()} | {:expired, map()} | {:missing, map()}
+  @spec resolve_for_native(map(), binary()) ::
+          {{:hit, term(), non_neg_integer()}, map()} | {:expired, map()} | {:missing, map()}
   @doc false
   def resolve_for_native(state, key) do
     case ShardETS.ets_lookup_warm(state, key) do
-      {:hit, value, exp} -> {{:hit, value, exp}, state}
-      :expired -> {:expired, state}
+      {:hit, value, exp} ->
+        {{:hit, value, exp}, state}
+
+      :expired ->
+        {:expired, state}
+
       :miss ->
         state = ShardFlush.await_in_flight(state)
         state = ShardFlush.flush_pending_sync(state)
+
         case ShardReads.do_get_meta(state, key) do
           nil -> {:missing, state}
           {value, exp} -> {{:hit, value, exp}, state}
