@@ -40,8 +40,13 @@ defmodule Ferricstore.Store.Shard.Reads do
         end
 
       :miss ->
-        # Key not in ETS at all — it doesn't exist.
-        {:reply, nil, state}
+        if ShardETS.pending_cold?(state, key) do
+          state = ShardFlush.await_in_flight(state)
+          state = ShardFlush.flush_pending_sync(state)
+          {:reply, do_get(state, key), state}
+        else
+          {:reply, nil, state}
+        end
     end
   end
 
@@ -49,7 +54,8 @@ defmodule Ferricstore.Store.Shard.Reads do
   # or nil if the key is not found / expired / only in ETS (hot cache).
   # The offset stored in ETS is the RECORD offset (start of header).
   # For sendfile, we need the VALUE offset = record_offset + 26 (header) + key_len.
-  @spec handle_get_file_ref(binary(), map()) :: {:reply, {binary(), non_neg_integer(), non_neg_integer()} | nil, map()}
+  @spec handle_get_file_ref(binary(), map()) ::
+          {:reply, {binary(), non_neg_integer(), non_neg_integer()} | nil, map()}
   @doc false
   def handle_get_file_ref(key, state) do
     case ShardETS.ets_lookup(state, key) do
@@ -69,7 +75,13 @@ defmodule Ferricstore.Store.Shard.Reads do
         {:reply, {p, value_offset, vsize}, state}
 
       :miss ->
-        {:reply, nil, state}
+        if ShardETS.pending_cold?(state, key) do
+          state = ShardFlush.await_in_flight(state)
+          state = ShardFlush.flush_pending_sync(state)
+          {:reply, file_ref_from_lookup(state, key), state}
+        else
+          {:reply, nil, state}
+        end
     end
   end
 
@@ -99,7 +111,13 @@ defmodule Ferricstore.Store.Shard.Reads do
         end
 
       :miss ->
-        {:reply, nil, state}
+        if ShardETS.pending_cold?(state, key) do
+          state = ShardFlush.await_in_flight(state)
+          state = ShardFlush.flush_pending_sync(state)
+          {:reply, do_get_meta(state, key), state}
+        else
+          {:reply, nil, state}
+        end
     end
   end
 
@@ -119,9 +137,13 @@ defmodule Ferricstore.Store.Shard.Reads do
         {:reply, false, state}
 
       :miss ->
-        state = ShardFlush.await_in_flight(state)
-        state = ShardFlush.flush_pending_sync(state)
-        {:reply, do_get(state, key) != nil, state}
+        if ShardETS.pending_cold?(state, key) do
+          {:reply, true, state}
+        else
+          state = ShardFlush.await_in_flight(state)
+          state = ShardFlush.flush_pending_sync(state)
+          {:reply, do_get(state, key) != nil, state}
+        end
     end
   end
 
@@ -162,6 +184,17 @@ defmodule Ferricstore.Store.Shard.Reads do
         nil
 
       :miss ->
+        nil
+    end
+  end
+
+  defp file_ref_from_lookup(state, key) do
+    case ShardETS.ets_lookup(state, key) do
+      {:cold, fid, off, vsize, _exp} ->
+        p = ShardETS.file_path(state.shard_data_path, fid)
+        {p, off + @bitcask_header_size + byte_size(key), vsize}
+
+      _ ->
         nil
     end
   end

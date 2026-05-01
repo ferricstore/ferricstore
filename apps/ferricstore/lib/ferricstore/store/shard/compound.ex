@@ -27,8 +27,12 @@ defmodule Ferricstore.Store.Shard.Compound do
     case promoted_store(state, redis_key) do
       nil ->
         case ShardETS.ets_lookup_warm(state, compound_key) do
-          {:hit, value, _exp} -> {:reply, value, state}
-          :expired -> {:reply, nil, state}
+          {:hit, value, _exp} ->
+            {:reply, value, state}
+
+          :expired ->
+            {:reply, nil, state}
+
           :miss ->
             state = ShardFlush.await_in_flight(state)
             state = ShardFlush.flush_pending_sync(state)
@@ -37,18 +41,27 @@ defmodule Ferricstore.Store.Shard.Compound do
 
       dedicated_path ->
         case ShardETS.ets_lookup_warm(state, compound_key) do
-          {:hit, value, _exp} -> {:reply, value, state}
-          :expired -> {:reply, nil, state}
+          {:hit, value, _exp} ->
+            {:reply, value, state}
+
+          :expired ->
+            {:reply, nil, state}
+
           :miss ->
             case promoted_read(dedicated_path, compound_key, state.keydir) do
-              {:ok, nil} -> {:reply, nil, state}
+              {:ok, nil} ->
+                {:reply, nil, state}
+
               {:ok, value, exp} ->
                 ShardETS.ets_insert(state, compound_key, value, exp)
                 {:reply, value, state}
+
               {:ok, value} ->
                 ShardETS.ets_insert(state, compound_key, value, 0)
                 {:reply, value, state}
-              _error -> {:reply, nil, state}
+
+              _error ->
+                {:reply, nil, state}
             end
         end
     end
@@ -60,8 +73,12 @@ defmodule Ferricstore.Store.Shard.Compound do
     case promoted_store(state, redis_key) do
       nil ->
         case ShardETS.ets_lookup_warm(state, compound_key) do
-          {:hit, value, expire_at_ms} -> {:reply, {value, expire_at_ms}, state}
-          :expired -> {:reply, nil, state}
+          {:hit, value, expire_at_ms} ->
+            {:reply, {value, expire_at_ms}, state}
+
+          :expired ->
+            {:reply, nil, state}
+
           :miss ->
             state = ShardFlush.await_in_flight(state)
             state = ShardFlush.flush_pending_sync(state)
@@ -70,24 +87,34 @@ defmodule Ferricstore.Store.Shard.Compound do
 
       dedicated_path ->
         case ShardETS.ets_lookup_warm(state, compound_key) do
-          {:hit, value, expire_at_ms} -> {:reply, {value, expire_at_ms}, state}
-          :expired -> {:reply, nil, state}
+          {:hit, value, expire_at_ms} ->
+            {:reply, {value, expire_at_ms}, state}
+
+          :expired ->
+            {:reply, nil, state}
+
           :miss ->
             case promoted_read(dedicated_path, compound_key, state.keydir) do
-              {:ok, nil} -> {:reply, nil, state}
+              {:ok, nil} ->
+                {:reply, nil, state}
+
               {:ok, value, exp} ->
                 ShardETS.ets_insert(state, compound_key, value, exp)
                 {:reply, {value, exp}, state}
+
               {:ok, value} ->
                 ShardETS.ets_insert(state, compound_key, value, 0)
                 {:reply, {value, 0}, state}
-              _error -> {:reply, nil, state}
+
+              _error ->
+                {:reply, nil, state}
             end
         end
     end
   end
 
-  @spec handle_compound_put(binary(), binary(), binary(), non_neg_integer(), map()) :: {:reply, term(), map()}
+  @spec handle_compound_put(binary(), binary(), binary(), non_neg_integer(), map()) ::
+          {:reply, term(), map()}
   @doc false
   def handle_compound_put(redis_key, compound_key, value, expire_at_ms, state) do
     if state.raft? do
@@ -112,6 +139,8 @@ defmodule Ferricstore.Store.Shard.Compound do
   def handle_compound_scan(redis_key, prefix, state) do
     case promoted_store(state, redis_key) do
       nil ->
+        state = ShardFlush.await_in_flight(state)
+        state = ShardFlush.flush_pending_sync(state)
         results = ShardETS.prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
         {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
 
@@ -143,7 +172,6 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
-
   # -------------------------------------------------------------------
   # Raft / direct write helpers
   # -------------------------------------------------------------------
@@ -151,7 +179,9 @@ defmodule Ferricstore.Store.Shard.Compound do
   defp handle_compound_put_raft(redis_key, compound_key, value, expire_at_ms, state) do
     case promoted_store(state, redis_key) do
       nil ->
-        result = Ferricstore.Raft.Batcher.write(state.index, {:put, compound_key, value, expire_at_ms})
+        result =
+          Ferricstore.Raft.Batcher.write(state.index, {:put, compound_key, value, expire_at_ms})
+
         new_version = state.write_version + 1
 
         case result do
@@ -168,8 +198,19 @@ defmodule Ferricstore.Store.Shard.Compound do
         case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
           {:ok, {fid, offset, record_size}} ->
             state = track_promoted_dead_bytes(state, redis_key, compound_key, record_size)
-            ShardETS.ets_insert_with_location(state, compound_key, value, expire_at_ms, fid, offset, record_size)
+
+            ShardETS.ets_insert_with_location(
+              state,
+              compound_key,
+              value,
+              expire_at_ms,
+              fid,
+              offset,
+              record_size
+            )
+
             {:reply, :ok, bump_promoted_writes(state, redis_key)}
+
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted write failed: #{inspect(reason)}")
             {:reply, {:error, reason}, state}
@@ -198,8 +239,19 @@ defmodule Ferricstore.Store.Shard.Compound do
         case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
           {:ok, {fid, offset, record_size}} ->
             state = track_promoted_dead_bytes(state, redis_key, compound_key, record_size)
-            ShardETS.ets_insert_with_location(state, compound_key, value, expire_at_ms, fid, offset, record_size)
+
+            ShardETS.ets_insert_with_location(
+              state,
+              compound_key,
+              value,
+              expire_at_ms,
+              fid,
+              offset,
+              record_size
+            )
+
             {:reply, :ok, bump_promoted_writes(state, redis_key)}
+
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted write failed: #{inspect(reason)}")
             {:reply, {:error, reason}, state}
@@ -243,16 +295,21 @@ defmodule Ferricstore.Store.Shard.Compound do
         case NIF.v2_append_tombstone(state.active_file_path, compound_key) do
           {:ok, _} ->
             ShardETS.ets_delete_key(state, compound_key)
+
             new_pending =
               case state.pending do
                 [] -> []
                 pending -> Enum.reject(pending, fn {k, _, _} -> k == compound_key end)
               end
+
             new_version = state.write_version + 1
             {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
 
           {:error, reason} ->
-            Logger.error("Shard #{state.index}: tombstone write failed for compound_delete: #{inspect(reason)}")
+            Logger.error(
+              "Shard #{state.index}: tombstone write failed for compound_delete: #{inspect(reason)}"
+            )
+
             {:reply, {:error, reason}, state}
         end
 
@@ -341,11 +398,13 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
-  @spec promoted_read(binary(), binary(), :ets.tid()) :: {:ok, binary() | nil} | {:ok, binary(), non_neg_integer()} | {:error, term()}
+  @spec promoted_read(binary(), binary(), :ets.tid()) ::
+          {:ok, binary() | nil} | {:ok, binary(), non_neg_integer()} | {:error, term()}
   @doc false
   def promoted_read(dedicated_path, compound_key, keydir) do
     case :ets.lookup(keydir, compound_key) do
-      [{^compound_key, _value, exp, _lfu, fid, offset, _vsize}] when is_integer(fid) and offset > 0 ->
+      [{^compound_key, _value, exp, _lfu, fid, offset, _vsize}]
+      when is_integer(fid) and offset > 0 ->
         file_path = dedicated_file_path(dedicated_path, fid)
 
         case NIF.v2_pread_at(file_path, offset) do
@@ -364,8 +423,12 @@ defmodule Ferricstore.Store.Shard.Compound do
               |> List.last()
 
             case last_entry do
-              nil -> {:ok, nil}
-              {_key, _offset, _vsize, _exp, true} -> {:ok, nil}
+              nil ->
+                {:ok, nil}
+
+              {_key, _offset, _vsize, _exp, true} ->
+                {:ok, nil}
+
               {_key, offset, _vsize, exp, false} ->
                 case NIF.v2_pread_at(active, offset) do
                   {:ok, value} -> {:ok, value, exp}
@@ -379,7 +442,8 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
-  @spec promoted_write(binary(), binary(), binary(), non_neg_integer()) :: {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | {:error, term()}
+  @spec promoted_write(binary(), binary(), binary(), non_neg_integer()) ::
+          {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | {:error, term()}
   @doc false
   def promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
     active = Promotion.find_active(dedicated_path)
@@ -424,8 +488,14 @@ defmodule Ferricstore.Store.Shard.Compound do
         if frag >= @promoted_frag_threshold and dead >= @promoted_dead_bytes_min and cooldown_ok do
           state = compact_dedicated(state, redis_key, path)
           new_total = promoted_dir_size(path)
-          new_info = %{info | dead_bytes: 0, total_bytes: new_total,
-                       last_compacted_at: System.system_time(:millisecond)}
+
+          new_info = %{
+            info
+            | dead_bytes: 0,
+              total_bytes: new_total,
+              last_compacted_at: System.system_time(:millisecond)
+          }
+
           new_promoted = Map.put(state.promoted_instances, redis_key, new_info)
           %{state | promoted_instances: new_promoted}
         else
@@ -433,8 +503,13 @@ defmodule Ferricstore.Store.Shard.Compound do
         end
 
       %{path: path, writes: _writes} = info ->
-        new_info = Map.merge(info, %{total_bytes: promoted_dir_size(path),
-                                     dead_bytes: 0, last_compacted_at: nil})
+        new_info =
+          Map.merge(info, %{
+            total_bytes: promoted_dir_size(path),
+            dead_bytes: 0,
+            last_compacted_at: nil
+          })
+
         new_promoted = Map.put(state.promoted_instances, redis_key, new_info)
         %{state | promoted_instances: new_promoted}
 
@@ -476,9 +551,10 @@ defmodule Ferricstore.Store.Shard.Compound do
               0
           end
 
-        new_info = %{info |
-          dead_bytes: dead + old_record_size,
-          total_bytes: total + new_record_size
+        new_info = %{
+          info
+          | dead_bytes: dead + old_record_size,
+            total_bytes: total + new_record_size
         }
 
         %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, new_info)}
@@ -518,7 +594,10 @@ defmodule Ferricstore.Store.Shard.Compound do
     prefix = promoted_prefix_for(state, redis_key)
 
     if prefix == nil do
-      Logger.warning("Shard #{state.index}: cannot determine prefix for promoted key #{inspect(redis_key)}, skipping compaction")
+      Logger.warning(
+        "Shard #{state.index}: cannot determine prefix for promoted key #{inspect(redis_key)}, skipping compaction"
+      )
+
       state
     else
       active = Promotion.find_active(dedicated_path)
@@ -568,7 +647,11 @@ defmodule Ferricstore.Store.Shard.Compound do
             |> Enum.each(fn {{key, value, expire_at_ms}, {offset, value_size}} ->
               value_for_ets = ShardETS.value_for_ets(value, ShardETS.hot_cache_threshold(state))
               track_binary_insert(ref, state, key, value_for_ets)
-              :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), new_fid, offset, value_size})
+
+              :ets.insert(
+                state.keydir,
+                {key, value_for_ets, expire_at_ms, LFU.initial(), new_fid, offset, value_size}
+              )
             end)
 
             case Ferricstore.FS.ls(dedicated_path) do
@@ -576,6 +659,7 @@ defmodule Ferricstore.Store.Shard.Compound do
                 Enum.each(files, fn name ->
                   if String.ends_with?(name, ".log") do
                     fid = name |> String.trim_trailing(".log") |> String.to_integer()
+
                     if fid < new_fid do
                       _ = Ferricstore.FS.rm(Path.join(dedicated_path, name))
                     end
@@ -584,7 +668,8 @@ defmodule Ferricstore.Store.Shard.Compound do
 
                 _ = NIF.v2_fsync_dir(dedicated_path)
 
-              _ -> :ok
+              _ ->
+                :ok
             end
 
             Logger.debug(
@@ -601,7 +686,10 @@ defmodule Ferricstore.Store.Shard.Compound do
             state
 
           {:error, reason} ->
-            Logger.error("Shard #{state.index}: dedicated compaction write failed: #{inspect(reason)}")
+            Logger.error(
+              "Shard #{state.index}: dedicated compaction write failed: #{inspect(reason)}"
+            )
+
             # Roll back the `touch!(new_file)` on write error. Fsync
             # so the rollback survives a subsequent crash.
             _ = Ferricstore.FS.rm(new_file)
@@ -655,10 +743,15 @@ defmodule Ferricstore.Store.Shard.Compound do
                    state.index
                  ) do
               {:ok, dedicated_store} ->
-                new_promoted = Map.put(state.promoted_instances, redis_key, %{
-                  path: dedicated_store, writes: 0,
-                  total_bytes: 0, dead_bytes: 0, last_compacted_at: nil
-                })
+                new_promoted =
+                  Map.put(state.promoted_instances, redis_key, %{
+                    path: dedicated_store,
+                    writes: 0,
+                    total_bytes: 0,
+                    dead_bytes: 0,
+                    last_compacted_at: nil
+                  })
+
                 %{state | promoted_instances: new_promoted}
             end
           else
@@ -691,6 +784,7 @@ defmodule Ferricstore.Store.Shard.Compound do
   # -- Off-heap binary byte tracking --
 
   defp keydir_binary_ref(%{instance_ctx: %{keydir_binary_bytes: ref}}) when ref != nil, do: ref
+
   defp keydir_binary_ref(_) do
     try do
       ctx = FerricStore.Instance.get(:default)
@@ -701,12 +795,16 @@ defmodule Ferricstore.Store.Shard.Compound do
   end
 
   defp track_binary_insert(nil, _, _, _), do: :ok
+
   defp track_binary_insert(ref, state, key, new_val) do
     new_bytes = offheap_size(key) + offheap_size(new_val)
-    old_bytes = case :ets.lookup(state.keydir, key) do
-      [{^key, old_val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(old_val)
-      _ -> 0
-    end
+
+    old_bytes =
+      case :ets.lookup(state.keydir, key) do
+        [{^key, old_val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(old_val)
+        _ -> 0
+      end
+
     delta = new_bytes - old_bytes
     if delta != 0, do: :atomics.add(ref, state.index + 1, delta)
   end

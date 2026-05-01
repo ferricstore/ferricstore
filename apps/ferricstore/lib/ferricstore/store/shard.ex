@@ -158,8 +158,8 @@ defmodule Ferricstore.Store.Shard do
     active_file_path = file_path(path, active_file_id)
 
     # Ensure the active file exists (touch it)
+    # credo:disable-for-next-line Credo.Check.Refactor.UnlessWithElse
     file_created? =
-      # credo:disable-for-next-line Credo.Check.Refactor.UnlessWithElse
       unless Ferricstore.FS.exists?(active_file_path) do
         Ferricstore.FS.touch!(active_file_path)
         true
@@ -179,7 +179,14 @@ defmodule Ferricstore.Store.Shard do
     keydir =
       case :ets.whereis(keydir_name) do
         :undefined ->
-          :ets.new(keydir_name, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
+          :ets.new(keydir_name, [
+            :set,
+            :public,
+            :named_table,
+            {:read_concurrency, true},
+            {:write_concurrency, :auto},
+            {:decentralized_counters, true}
+          ])
 
         _ref ->
           :ets.delete_all_objects(keydir_name)
@@ -187,6 +194,7 @@ defmodule Ferricstore.Store.Shard do
           if ctx != nil and ctx.keydir_binary_bytes != nil do
             :atomics.put(ctx.keydir_binary_bytes, index + 1, 0)
           end
+
           keydir_name
       end
 
@@ -234,7 +242,11 @@ defmodule Ferricstore.Store.Shard do
 
     merge_config = %{
       fragmentation_threshold:
-        Map.get(merge_config_overrides, :fragmentation_threshold, @default_fragmentation_threshold),
+        Map.get(
+          merge_config_overrides,
+          :fragmentation_threshold,
+          @default_fragmentation_threshold
+        ),
       dead_bytes_threshold:
         Map.get(merge_config_overrides, :dead_bytes_threshold, @default_dead_bytes_threshold)
     }
@@ -244,20 +256,25 @@ defmodule Ferricstore.Store.Shard do
     ShardLifecycle.schedule_frag_check()
     max_file_size = if ctx, do: ctx.max_active_file_size, else: @default_max_active_file_size
 
-    {:ok, %__MODULE__{ets: keydir, keydir: keydir,
-                       index: index, data_dir: data_dir,
-                       shard_data_path: path,
-                       instance_ctx: ctx,
-                       active_file_id: active_file_id,
-                       active_file_path: active_file_path,
-                       active_file_size: active_file_size,
-                       pending: [], flush_in_flight: nil,
-                       promoted_instances: promoted,
-                       file_stats: file_stats,
-                       merge_config: merge_config,
-                       raft?: raft?,
-                       max_active_file_size: max_file_size},
-     {:continue, {:flush_interval, flush_ms}}}
+    {:ok,
+     %__MODULE__{
+       ets: keydir,
+       keydir: keydir,
+       index: index,
+       data_dir: data_dir,
+       shard_data_path: path,
+       instance_ctx: ctx,
+       active_file_id: active_file_id,
+       active_file_path: active_file_path,
+       active_file_size: active_file_size,
+       pending: [],
+       flush_in_flight: nil,
+       promoted_instances: promoted,
+       file_stats: file_stats,
+       merge_config: merge_config,
+       raft?: raft?,
+       max_active_file_size: max_file_size
+     }, {:continue, {:flush_interval, flush_ms}}}
   end
 
   defp file_path(shard_path, file_id), do: ShardETS.file_path(shard_path, file_id)
@@ -280,7 +297,8 @@ defmodule Ferricstore.Store.Shard do
   @impl true
   def handle_call({:get, key}, _from, state), do: ShardReads.handle_get(key, state)
 
-  def handle_call({:get_file_ref, key}, _from, state), do: ShardReads.handle_get_file_ref(key, state)
+  def handle_call({:get_file_ref, key}, _from, state),
+    do: ShardReads.handle_get_file_ref(key, state)
 
   def handle_call({:get_meta, key}, _from, state), do: ShardReads.handle_get_meta(key, state)
 
@@ -288,6 +306,8 @@ defmodule Ferricstore.Store.Shard do
   # Used by HSCAN, SSCAN, ZSCAN via the compound_scan store callback.
   # Uses :ets.select match spec instead of :ets.foldl full-table scan.
   def handle_call({:scan_prefix, prefix}, _from, state) do
+    state = ShardFlush.await_in_flight(state)
+    state = ShardFlush.flush_pending_sync(state)
     results = prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
     {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
   end
@@ -315,6 +335,7 @@ defmodule Ferricstore.Store.Shard do
   # This ensures WATCH detects mutations regardless of which write path was used.
   def handle_call({:get_version, _key}, _from, state) do
     ctx = state.instance_ctx
+
     shared =
       if ctx do
         size = :counters.info(ctx.write_version).size
@@ -322,6 +343,7 @@ defmodule Ferricstore.Store.Shard do
       else
         Ferricstore.Store.WriteVersion.get(state.index)
       end
+
     {:reply, state.write_version + shared, state}
   end
 
@@ -420,7 +442,6 @@ defmodule Ferricstore.Store.Shard do
     ShardCompound.handle_compound_delete_prefix(redis_key, prefix, state)
   end
 
-
   # -------------------------------------------------------------------
   # handle_call — native commands: CAS, LOCK, UNLOCK, EXTEND, RATELIMIT.ADD
   # -------------------------------------------------------------------
@@ -513,16 +534,20 @@ defmodule Ferricstore.Store.Shard do
         {:ok, files} ->
           log_files = Enum.filter(files, &String.ends_with?(&1, ".log"))
           fc = length(log_files)
-          total = Enum.reduce(log_files, 0, fn name, acc ->
-            case File.stat(Path.join(sp, name)) do
-              {:ok, %{size: s}} -> acc + s
-              _ -> acc
-            end
-          end)
+
+          total =
+            Enum.reduce(log_files, 0, fn name, acc ->
+              case File.stat(Path.join(sp, name)) do
+                {:ok, %{size: s}} -> acc + s
+                _ -> acc
+              end
+            end)
+
           # Estimate: live = total / file_count (single active), dead = total - live
           live = if fc > 0, do: div(total, fc), else: 0
           dead = total - live
           {total, live, dead, fc}
+
         _ ->
           {0, 0, 0, 0}
       end
@@ -544,12 +569,15 @@ defmodule Ferricstore.Store.Shard do
           |> Enum.filter(&String.ends_with?(&1, ".log"))
           |> Enum.flat_map(fn name ->
             fid = name |> String.trim_trailing(".log") |> String.to_integer()
+
             case File.stat(Path.join(sp, name)) do
               {:ok, %{size: size}} -> [{fid, size}]
               {:error, _} -> []
             end
           end)
-        _ -> []
+
+        _ ->
+          []
       end
 
     {:reply, {:ok, sizes}, state}
@@ -661,14 +689,17 @@ defmodule Ferricstore.Store.Shard do
     case System.cmd("df", ["-k", sp], stderr_to_stdout: true) do
       {output, 0} ->
         lines = String.split(output, "\n", trim: true)
+
         case lines do
           [_header, data_line | _] ->
             parts = String.split(data_line, ~r/\s+/)
             available_kb = parts |> Enum.at(3, "0") |> String.to_integer()
             {:reply, {:ok, available_kb * 1024}, state}
+
           _ ->
             {:reply, {:error, "unable to parse df output"}, state}
         end
+
       _ ->
         {:reply, {:error, "df command failed"}, state}
     end
@@ -775,7 +806,10 @@ defmodule Ferricstore.Store.Shard do
           {:noreply, %{state | pending: new_pending, write_version: new_version}}
 
         {:error, reason} ->
-          Logger.error("Shard #{state.index}: tombstone write failed for tx_pending_delete: #{inspect(reason)}")
+          Logger.error(
+            "Shard #{state.index}: tombstone write failed for tx_pending_delete: #{inspect(reason)}"
+          )
+
           {:noreply, state}
       end
     end
@@ -889,6 +923,7 @@ defmodule Ferricstore.Store.Shard do
       Logger.error(
         "Shard #{state.index}: async fsync failed for corr_id #{corr_id}: #{inspect(reason)}"
       )
+
       {:noreply, %{state | flush_in_flight: nil}}
     else
       case Map.pop(state.pending_reads, corr_id) do
@@ -944,7 +979,10 @@ defmodule Ferricstore.Store.Shard do
   defp await_in_flight(state), do: ShardFlush.await_in_flight(state)
   defp track_delete_dead_bytes(state, key), do: ShardFlush.track_delete_dead_bytes(state, key)
   defp maybe_notify_fragmentation(state), do: ShardFlush.maybe_notify_fragmentation(state)
-  defp compute_file_stats(shard_path, keydir), do: ShardFlush.compute_file_stats(shard_path, keydir)
+
+  defp compute_file_stats(shard_path, keydir),
+    do: ShardFlush.compute_file_stats(shard_path, keydir)
+
   defp schedule_drain_pending(ms), do: ShardFlush.schedule_drain_pending(ms)
 
   # -------------------------------------------------------------------

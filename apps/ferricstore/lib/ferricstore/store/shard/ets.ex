@@ -17,7 +17,11 @@ defmodule Ferricstore.Store.Shard.ETS do
   #   {:cold, file_id, offset, value_size, expire_at_ms}  -- value evicted, disk location known
   #   :expired
   #   :miss
-  @spec ets_lookup(map(), binary()) :: {:hit, term(), non_neg_integer()} | {:cold, non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()} | :expired | :miss
+  @spec ets_lookup(map(), binary()) ::
+          {:hit, term(), non_neg_integer()}
+          | {:cold, non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()}
+          | :expired
+          | :miss
   @doc false
   def ets_lookup(%{keydir: keydir} = state, key) do
     now = HLC.now_ms()
@@ -83,6 +87,27 @@ defmodule Ferricstore.Store.Shard.ETS do
     end
   end
 
+  @spec pending_cold?(map(), binary()) :: boolean()
+  @doc false
+  def pending_cold?(%{keydir: keydir}, key) do
+    now = HLC.now_ms()
+
+    case :ets.lookup(keydir, key) do
+      [{^key, nil, 0, _lfu, :pending, _off, _vsize}] ->
+        true
+
+      [{^key, nil, exp, _lfu, :pending, _off, _vsize}] when exp > now ->
+        true
+
+      [{^key, nil, _exp, _lfu, :pending, _off, _vsize}] ->
+        :ets.delete(keydir, key)
+        false
+
+      _ ->
+        false
+    end
+  end
+
   # -------------------------------------------------------------------
   # ETS insert / delete
   # -------------------------------------------------------------------
@@ -97,7 +122,15 @@ defmodule Ferricstore.Store.Shard.ETS do
   end
 
   # Inserts a key/value/expiry into the keydir with known disk location (v2).
-  @spec ets_insert_with_location(map(), binary(), term(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: true
+  @spec ets_insert_with_location(
+          map(),
+          binary(),
+          term(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: true
   @doc false
   def ets_insert_with_location(state, key, value, expire_at_ms, file_id, offset, value_size) do
     threshold = hot_cache_threshold(state)
@@ -175,7 +208,15 @@ defmodule Ferricstore.Store.Shard.ETS do
   # Values exceeding the hot_cache_max_value_size threshold are NOT warmed --
   # they stay cold (nil) in ETS to avoid expensive binary copies on read.
   # Under memory pressure, skip warming to prevent evict/re-promote thrashing.
-  @spec cold_read_warm_ets(map(), binary(), binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: :ok | true
+  @spec cold_read_warm_ets(
+          map(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: :ok | true
   @doc false
   def cold_read_warm_ets(state, key, value, exp, fid, off, vsize) do
     v = value_for_ets(value, hot_cache_threshold(state))
@@ -204,7 +245,7 @@ defmodule Ferricstore.Store.Shard.ETS do
         # Background write not yet completed -- cannot read from disk.
         nil
 
-      [{^key, nil, exp, _lfu, fid, off, vsize}] ->
+      [{^key, nil, exp, _lfu, fid, off, vsize}] when is_integer(fid) ->
         p = file_path(state.shard_data_path, fid)
 
         case NIF.v2_pread_at(p, off) do
@@ -229,7 +270,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @doc false
   def warm_meta_from_store(state, key) do
     case :ets.lookup(state.keydir, key) do
-      [{^key, nil, exp, _lfu, fid, off, vsize}] ->
+      [{^key, nil, exp, _lfu, fid, off, vsize}] when is_integer(fid) ->
         p = file_path(state.shard_data_path, fid)
 
         case NIF.v2_pread_at(p, off) do
@@ -269,31 +310,28 @@ defmodule Ferricstore.Store.Shard.ETS do
     now = HLC.now_ms()
     prefix_len = byte_size(prefix)
     # Select all 7-tuple fields so we can cold-read nil values
-    ms = [{{:"$1", :"$2", :"$3", :_, :"$4", :"$5", :"$6"},
-           [{:andalso, {:is_binary, :"$1"},
-             {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}],
-           [{{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"}}]}]
+    ms = [
+      {{:"$1", :"$2", :"$3", :_, :"$4", :"$5", :"$6"},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+       ], [{{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"}}]}
+    ]
+
     :ets.select(keydir, ms)
     |> Enum.reduce([], fn {key, value, exp, fid, off, _vsize}, acc ->
       if exp == 0 or exp > now do
         # For cold keys (value=nil), do a disk read to get the actual value
-        actual_value =
-          if value == nil and shard_data_path != nil do
-            p = file_path(shard_data_path, fid)
-            case NIF.v2_pread_at(p, off) do
-              {:ok, v} -> v
-              _ -> nil
-            end
-          else
-            value
-          end
+        actual_value = prefix_entry_value(value, shard_data_path, fid, off)
 
         if actual_value != nil do
-          field = case :binary.split(key, <<0>>) do
-            [_pre, sub] -> sub
-            _ -> key
-          end
+          field =
+            case :binary.split(key, <<0>>) do
+              [_pre, sub] -> sub
+              _ -> key
+            end
+
           [{field, actual_value} | acc]
         else
           acc
@@ -304,16 +342,34 @@ defmodule Ferricstore.Store.Shard.ETS do
     end)
   end
 
+  defp prefix_entry_value(nil, shard_data_path, fid, off)
+       when shard_data_path != nil and is_integer(fid) do
+    p = file_path(shard_data_path, fid)
+
+    case NIF.v2_pread_at(p, off) do
+      {:ok, v} -> v
+      _ -> nil
+    end
+  end
+
+  defp prefix_entry_value(nil, _shard_data_path, _fid, _off), do: nil
+  defp prefix_entry_value(value, _shard_data_path, _fid, _off), do: value
+
   @spec prefix_count_entries(:ets.tid(), binary()) :: non_neg_integer()
   @doc false
   def prefix_count_entries(keydir, prefix) do
     now = HLC.now_ms()
     prefix_len = byte_size(prefix)
-    ms = [{{:"$1", :_, :"$3", :_, :_, :_, :_},
-           [{:andalso, {:is_binary, :"$1"},
-             {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}],
-           [:"$3"]}]
+
+    ms = [
+      {{:"$1", :_, :"$3", :_, :_, :_, :_},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+       ], [:"$3"]}
+    ]
+
     :ets.select(keydir, ms)
     |> Enum.count(fn exp -> exp == 0 or exp > now end)
   end
@@ -321,11 +377,16 @@ defmodule Ferricstore.Store.Shard.ETS do
   @doc false
   def prefix_collect_keys(keydir, prefix) do
     prefix_len = byte_size(prefix)
-    ms = [{{:"$1", :_, :_, :_, :_, :_, :_},
-           [{:andalso, {:is_binary, :"$1"},
-             {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}],
-           [:"$1"]}]
+
+    ms = [
+      {{:"$1", :_, :_, :_, :_, :_, :_},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+       ], [:"$1"]}
+    ]
+
     :ets.select(keydir, ms)
   end
 
@@ -360,41 +421,62 @@ defmodule Ferricstore.Store.Shard.ETS do
 
   # Tracks delta for insert (new value replacing possible existing value).
   # Must be called BEFORE :ets.insert so the old value can be read.
-  defp track_binary_insert(%{instance_ctx: %{keydir_binary_bytes: ref}, index: idx} = state, key, new_val) when ref != nil do
+  defp track_binary_insert(
+         %{instance_ctx: %{keydir_binary_bytes: ref}, index: idx} = state,
+         key,
+         new_val
+       )
+       when ref != nil do
     new_bytes = offheap_size(key) + offheap_size(new_val)
-    old_bytes = case :ets.lookup(state.keydir, key) do
-      [{^key, old_val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(old_val)
-      _ -> 0
-    end
+
+    old_bytes =
+      case :ets.lookup(state.keydir, key) do
+        [{^key, old_val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(old_val)
+        _ -> 0
+      end
+
     delta = new_bytes - old_bytes
     if delta != 0, do: :atomics.add(ref, idx + 1, delta)
   end
+
   defp track_binary_insert(_, _, _), do: :ok
 
   # Tracks bytes removed for delete. Must be called BEFORE :ets.delete.
-  defp track_binary_delete(%{instance_ctx: %{keydir_binary_bytes: ref}, index: idx} = state, key) when ref != nil do
-    bytes = case :ets.lookup(state.keydir, key) do
-      [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
-      _ -> 0
-    end
+  defp track_binary_delete(%{instance_ctx: %{keydir_binary_bytes: ref}, index: idx} = state, key)
+       when ref != nil do
+    bytes =
+      case :ets.lookup(state.keydir, key) do
+        [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
+        _ -> 0
+      end
+
     if bytes > 0, do: :atomics.sub(ref, idx + 1, bytes)
   end
+
   defp track_binary_delete(_, _), do: :ok
 
   # Tracks bytes removed for delete when value is already known (avoids extra lookup).
-  defp track_binary_delete(%{instance_ctx: %{keydir_binary_bytes: ref}, index: idx}, key, value) when ref != nil do
+  defp track_binary_delete(%{instance_ctx: %{keydir_binary_bytes: ref}, index: idx}, key, value)
+       when ref != nil do
     bytes = offheap_size(key) + offheap_size(value)
     if bytes > 0, do: :atomics.sub(ref, idx + 1, bytes)
   end
+
   defp track_binary_delete(_, _, _), do: :ok
 
   # Tracks bytes added when warming a cold key (nil -> value).
-  defp track_binary_cold_to_warm(%{instance_ctx: %{keydir_binary_bytes: ref}, index: idx}, _key, new_val) when ref != nil do
+  defp track_binary_cold_to_warm(
+         %{instance_ctx: %{keydir_binary_bytes: ref}, index: idx},
+         _key,
+         new_val
+       )
+       when ref != nil do
     # Key was already in ETS (cold entry with nil value), so key bytes are unchanged.
     # Only the value bytes are new.
     new_bytes = offheap_size(new_val)
     if new_bytes > 0, do: :atomics.add(ref, idx + 1, new_bytes)
   end
+
   defp track_binary_cold_to_warm(_, _, _), do: :ok
 
   defp offheap_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)

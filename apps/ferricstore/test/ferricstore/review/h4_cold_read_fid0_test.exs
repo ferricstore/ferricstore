@@ -10,14 +10,17 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
 
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   @threshold 128
 
   setup do
-    ctx = Ferricstore.Test.IsolatedInstance.checkout(
-      shard_count: 1,
-      hot_cache_max_value_size: @threshold
-    )
+    ctx =
+      Ferricstore.Test.IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: @threshold
+      )
+
     pid = Process.whereis(elem(ctx.shard_names, 0))
     keydir = elem(ctx.keydir_refs, 0)
     on_exit(fn -> Ferricstore.Test.IsolatedInstance.checkin(ctx) end)
@@ -58,6 +61,100 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
       # GET should trigger flush_pending_sync and return the correct value.
       result = GenServer.call(shard, {:get, "big"})
       assert result == large
+    end
+
+    test "read waits for a truly pending large value", %{shard: shard, keydir: keydir} do
+      large = String.duplicate("W", @threshold + 100)
+
+      :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
+      :ok = GenServer.call(shard, {:put, "pending_big", large, 0})
+
+      assert [{"pending_big", nil, _exp, _lfu, :pending, 0, 0}] =
+               :ets.lookup(keydir, "pending_big")
+
+      send(shard, {:tokio_complete, 999_999, :ok, :ok})
+
+      assert large == GenServer.call(shard, {:get, "pending_big"})
+    end
+
+    test "get_meta waits for a truly pending large value", %{shard: shard, keydir: keydir} do
+      large = String.duplicate("M", @threshold + 100)
+      expire_at_ms = Ferricstore.HLC.now_ms() + 60_000
+
+      :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
+      :ok = GenServer.call(shard, {:put, "pending_meta", large, expire_at_ms})
+
+      assert [{"pending_meta", nil, ^expire_at_ms, _lfu, :pending, 0, 0}] =
+               :ets.lookup(keydir, "pending_meta")
+
+      send(shard, {:tokio_complete, 999_999, :ok, :ok})
+
+      assert {^large, ^expire_at_ms} = GenServer.call(shard, {:get_meta, "pending_meta"})
+    end
+
+    test "get_file_ref waits for a truly pending large value", %{shard: shard, keydir: keydir} do
+      large = String.duplicate("F", @threshold + 100)
+
+      :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
+      :ok = GenServer.call(shard, {:put, "pending_file_ref", large, 0})
+
+      assert [{"pending_file_ref", nil, _exp, _lfu, :pending, 0, 0}] =
+               :ets.lookup(keydir, "pending_file_ref")
+
+      send(shard, {:tokio_complete, 999_999, :ok, :ok})
+
+      assert {path, offset, size} = GenServer.call(shard, {:get_file_ref, "pending_file_ref"})
+      assert is_binary(path)
+      assert offset > 0
+      assert size == byte_size(large)
+    end
+  end
+
+  describe "prefix scan on unflushed large value" do
+    test "scan waits for pending large value instead of treating :pending as a file id",
+         %{shard: shard, keydir: keydir} do
+      prefix = "H:scan_pending" <> <<0>>
+      field_key = prefix <> "field"
+      large = String.duplicate("P", @threshold + 100)
+
+      :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
+      :ok = GenServer.call(shard, {:put, field_key, large, 0})
+
+      assert [{^field_key, nil, _exp, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, field_key)
+
+      send(shard, {:tokio_complete, 999_999, :ok, :ok})
+
+      assert [{"field", ^large}] =
+               GenServer.call(shard, {:scan_prefix, prefix})
+    end
+
+    test "compound scan waits for pending large value before HSCAN-style reads",
+         %{shard: shard, keydir: keydir} do
+      redis_key = "scan_hash"
+      prefix = "H:" <> redis_key <> <<0>>
+      field_key = prefix <> "field"
+      large = String.duplicate("C", @threshold + 100)
+
+      :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
+      :ok = GenServer.call(shard, {:compound_put, redis_key, field_key, large, 0})
+
+      assert [{^field_key, nil, _exp, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, field_key)
+
+      send(shard, {:tokio_complete, 999_999, :ok, :ok})
+
+      assert [{"field", ^large}] =
+               GenServer.call(shard, {:compound_scan, redis_key, prefix})
+    end
+
+    test "raw prefix helper skips pending cold entries instead of crashing",
+         %{keydir: keydir, ctx: ctx} do
+      prefix = "H:raw_pending" <> <<0>>
+      field_key = prefix <> "field"
+      shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+
+      :ets.insert(keydir, {field_key, nil, 0, 1, :pending, 0, 0})
+
+      assert [] == ShardETS.prefix_scan_entries(keydir, prefix, shard_path)
     end
   end
 
