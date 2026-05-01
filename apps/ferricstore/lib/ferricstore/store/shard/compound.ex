@@ -43,14 +43,14 @@ defmodule Ferricstore.Store.Shard.Compound do
         end
 
       dedicated_path ->
-        case ShardETS.ets_lookup_warm(state, compound_key) do
+        case ShardETS.ets_lookup(state, compound_key) do
           {:hit, value, _exp} ->
             {:reply, value, state}
 
           :expired ->
             {:reply, nil, state}
 
-          :miss ->
+          _cold_or_miss ->
             case promoted_read(dedicated_path, compound_key, state.keydir) do
               {:ok, nil} ->
                 {:reply, nil, state}
@@ -92,14 +92,14 @@ defmodule Ferricstore.Store.Shard.Compound do
         end
 
       dedicated_path ->
-        case ShardETS.ets_lookup_warm(state, compound_key) do
+        case ShardETS.ets_lookup(state, compound_key) do
           {:hit, value, expire_at_ms} ->
             {:reply, {value, expire_at_ms}, state}
 
           :expired ->
             {:reply, nil, state}
 
-          :miss ->
+          _cold_or_miss ->
             case promoted_read(dedicated_path, compound_key, state.keydir) do
               {:ok, nil} ->
                 {:reply, nil, state}
@@ -444,7 +444,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
     case :ets.lookup(keydir, compound_key) do
       [{^compound_key, _value, exp, _lfu, fid, offset, _vsize}]
-      when (exp == 0 or exp > now) and is_integer(fid) and offset > 0 ->
+      when (exp == 0 or exp > now) and is_integer(fid) and is_integer(offset) and offset >= 0 ->
         file_path = dedicated_file_path(dedicated_path, fid)
 
         case NIF.v2_pread_at(file_path, offset) do

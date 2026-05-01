@@ -160,6 +160,42 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       assert is_list(pairs)
       assert length(pairs) == (@test_threshold + 1) * 2
     end
+
+    test "HGET on promoted hash reads cold offset zero from recorded dedicated fid" do
+      store = real_store()
+      key = ukey("offset_zero_cold")
+      promote_hash(store, key)
+
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      keydir = :"keydir_#{shard_idx}"
+      dir = dedicated_dir(key)
+      compound_key = "H:#{key}\0cold_zero"
+      value = "cold-offset-zero"
+
+      old_file = Path.join(dir, "00099.log")
+      active_file = Path.join(dir, "00100.log")
+
+      shared_file =
+        Ferricstore.DataDir.shard_data_path(
+          FerricStore.Instance.get(:default).data_dir,
+          shard_idx
+        )
+        |> Path.join("00099.log")
+
+      {:ok, {0, record_size}} = NIF.v2_append_record(old_file, compound_key, value, 0)
+
+      {:ok, {0, _shared_record_size}} =
+        NIF.v2_append_record(shared_file, compound_key, "wrong", 0)
+
+      File.touch!(active_file)
+
+      :ets.insert(
+        keydir,
+        {compound_key, nil, 0, Ferricstore.Store.LFU.initial(), 99, 0, record_size}
+      )
+
+      assert value == Hash.handle("HGET", [key, "cold_zero"], store)
+    end
   end
 
   # ---------------------------------------------------------------------------
