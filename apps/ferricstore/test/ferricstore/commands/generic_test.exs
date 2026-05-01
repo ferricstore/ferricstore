@@ -27,6 +27,16 @@ defmodule Ferricstore.Commands.GenericTest do
       assert {:simple, "none"} == Generic.handle("TYPE", ["k"], store)
     end
 
+    test "TYPE uses existence check without loading string value" do
+      store = %{
+        compound_get: fn _redis_key, _compound_key -> nil end,
+        exists?: fn "cold_string" -> true end,
+        get: fn _key -> flunk("TYPE should not read the value to classify a string key") end
+      }
+
+      assert {:simple, "string"} == Generic.handle("TYPE", ["cold_string"], store)
+    end
+
     test "TYPE with no args returns error" do
       assert {:error, _} = Generic.handle("TYPE", [], MockStore.make())
     end
@@ -514,7 +524,9 @@ defmodule Ferricstore.Commands.GenericTest do
 
     test "OBJECT ENCODING returns error for missing key" do
       store = MockStore.make()
-      assert {:error, "ERR no such key"} = Generic.handle("OBJECT", ["ENCODING", "missing"], store)
+
+      assert {:error, "ERR no such key"} =
+               Generic.handle("OBJECT", ["ENCODING", "missing"], store)
     end
 
     test "OBJECT encoding is case-insensitive" do
@@ -593,7 +605,9 @@ defmodule Ferricstore.Commands.GenericTest do
 
     test "OBJECT IDLETIME returns error for missing key" do
       store = MockStore.make()
-      assert {:error, "ERR no such key"} = Generic.handle("OBJECT", ["IDLETIME", "missing"], store)
+
+      assert {:error, "ERR no such key"} =
+               Generic.handle("OBJECT", ["IDLETIME", "missing"], store)
     end
   end
 
@@ -609,7 +623,9 @@ defmodule Ferricstore.Commands.GenericTest do
 
     test "OBJECT REFCOUNT returns error for missing key" do
       store = MockStore.make()
-      assert {:error, "ERR no such key"} = Generic.handle("OBJECT", ["REFCOUNT", "missing"], store)
+
+      assert {:error, "ERR no such key"} =
+               Generic.handle("OBJECT", ["REFCOUNT", "missing"], store)
     end
   end
 
@@ -714,9 +730,13 @@ defmodule Ferricstore.Commands.GenericTest do
 
     test "SCAN with MATCH and COUNT combined works" do
       data = %{
-        "user:1" => {"v", 0}, "user:2" => {"v", 0}, "user:3" => {"v", 0},
-        "order:1" => {"v", 0}, "order:2" => {"v", 0}
+        "user:1" => {"v", 0},
+        "user:2" => {"v", 0},
+        "user:3" => {"v", 0},
+        "order:1" => {"v", 0},
+        "order:2" => {"v", 0}
       }
+
       store = MockStore.make(data)
       [_cursor, keys] = Generic.handle("SCAN", ["0", "MATCH", "order:*", "COUNT", "100"], store)
       assert Enum.sort(keys) == ["order:1", "order:2"]

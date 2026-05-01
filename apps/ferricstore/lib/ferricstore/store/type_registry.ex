@@ -91,14 +91,21 @@ defmodule Ferricstore.Store.TypeRegistry do
 
     case Ops.compound_get(store, redis_key, type_key) do
       nil ->
-        case Ops.get(store, redis_key) do
-          nil -> "none"
-          value when is_binary(value) -> "string"
-          _ -> "string"
-        end
+        plain_string_type(redis_key, store)
 
       type_str ->
         live_type_or_none(redis_key, type_str, store)
+    end
+  end
+
+  defp plain_string_type(redis_key, store) do
+    if has_exists?(store) do
+      if Ops.exists?(store, redis_key), do: "string", else: "none"
+    else
+      case Ops.get(store, redis_key) do
+        nil -> "none"
+        _value -> "string"
+      end
     end
   end
 
