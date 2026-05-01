@@ -299,6 +299,27 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       end
     end
 
+    test "async keydir pressure rejects new batch_set keys but allows updates" do
+      existing_key = "#{@ns_async}:bs_keydir_existing_#{System.unique_integer([:positive])}"
+      new_key = "#{@ns_async}:bs_keydir_new_#{System.unique_integer([:positive])}"
+
+      assert [:ok] = FerricStore.batch_set([{existing_key, "old"}])
+
+      Ferricstore.MemoryGuard.set_keydir_full(true)
+
+      try do
+        assert [
+                 :ok,
+                 {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}
+               ] = FerricStore.batch_set([{existing_key, "updated"}, {new_key, "blocked"}])
+
+        assert {:ok, "updated"} == FerricStore.get(existing_key)
+        assert {:ok, nil} == FerricStore.get(new_key)
+      after
+        Ferricstore.MemoryGuard.set_keydir_full(false)
+      end
+    end
+
     test "async batch_set rejects overlarge keys before writing" do
       default_ctx = FerricStore.Instance.get(:default)
       key = "#{@ns_async}:" <> String.duplicate("k", 65_536)

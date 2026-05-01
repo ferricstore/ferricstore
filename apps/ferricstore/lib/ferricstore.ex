@@ -5120,19 +5120,25 @@ defmodule FerricStore do
   def __async_batch_put_result_list__(ctx, kv_pairs) do
     {valid_indexed, errors} = split_async_batch_by_size(kv_pairs)
     pressure? = async_disk_pressure?(ctx)
+    keydir_pressure? = async_keydir_pressure?(ctx)
 
     cond do
       valid_indexed == [] ->
         ordered_async_batch_results(length(kv_pairs), errors)
 
-      errors == %{} and not pressure? ->
+      errors == %{} and not pressure? and not keydir_pressure? ->
         run_async_batch_put_result_list(ctx, kv_pairs)
 
-      pressure? ->
-        {accepted_indexed, pressure_errors} = split_async_batch_by_pressure(ctx, valid_indexed)
+      pressure? or keydir_pressure? ->
+        {keydir_accepted_indexed, keydir_errors} =
+          split_async_batch_by_keydir_pressure(ctx, valid_indexed, keydir_pressure?)
+
+        {accepted_indexed, pressure_errors} =
+          split_async_batch_by_pressure(ctx, keydir_accepted_indexed, pressure?)
 
         results =
           errors
+          |> Map.merge(keydir_errors)
           |> Map.merge(pressure_errors)
           |> Map.merge(run_async_batch_put(ctx, accepted_indexed))
 
@@ -5176,7 +5182,31 @@ defmodule FerricStore do
     Enum.any?(1..size, fn pos -> :atomics.get(ctx.disk_pressure, pos) == 1 end)
   end
 
-  defp split_async_batch_by_pressure(ctx, indexed_kvs) do
+  defp async_keydir_pressure?(ctx) do
+    :atomics.get(ctx.pressure_flags, 1) == 1 or :atomics.get(ctx.pressure_flags, 2) == 1
+  end
+
+  defp split_async_batch_by_keydir_pressure(_ctx, indexed_kvs, false), do: {indexed_kvs, %{}}
+
+  defp split_async_batch_by_keydir_pressure(ctx, indexed_kvs, true) do
+    {accepted_reversed, errors} =
+      Enum.reduce(indexed_kvs, {[], %{}}, fn {index, {key, _value} = kv}, {accepted, errors} ->
+        if Router.exists?(ctx, key) do
+          {[{index, kv} | accepted], errors}
+        else
+          error = {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}
+          {accepted, Map.put(errors, index, error)}
+        end
+      end)
+
+    if map_size(errors) > 0, do: Ferricstore.MemoryGuard.nudge()
+
+    {Enum.reverse(accepted_reversed), errors}
+  end
+
+  defp split_async_batch_by_pressure(_ctx, indexed_kvs, false), do: {indexed_kvs, %{}}
+
+  defp split_async_batch_by_pressure(ctx, indexed_kvs, true) do
     {accepted_reversed, errors, _pressure_by_shard} =
       Enum.reduce(indexed_kvs, {[], %{}, %{}}, fn {index, {key, _value} = kv},
                                                   {accepted, errors, pressure_by_shard} ->
