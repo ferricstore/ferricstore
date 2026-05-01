@@ -149,11 +149,20 @@ impl TakenBuffer {
 
     /// Get the padded data as a slice for writing.
     /// The slice length is `padded_len` (aligned), but only `logical_len` bytes are real data.
+    #[allow(dead_code)]
     pub fn as_padded_slice(&self) -> &[u8] {
         if self.ptr.is_null() {
             return &[];
         }
         unsafe { std::slice::from_raw_parts(self.ptr, self.padded_len) }
+    }
+
+    /// Get only the bytes that belong to the logical WAL stream.
+    pub fn as_logical_slice(&self) -> &[u8] {
+        if self.ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.logical_len) }
     }
 }
 

@@ -294,7 +294,7 @@ fn drain_to_kernel_writer<W: Write>(
     }
 
     let bytes = taken.logical_len as u64;
-    write_all_retry(writer, taken.as_padded_slice())?;
+    write_all_retry(writer, taken.as_logical_slice())?;
     file_size.fetch_add(bytes, Ordering::Release);
     Ok(true)
 }
@@ -365,42 +365,26 @@ pub fn open_wal_file(path: &str, pre_allocate_bytes: u64) -> io::Result<(File, b
 
 #[cfg(target_os = "linux")]
 fn open_wal_file_linux(path: &str, pre_allocate_bytes: u64) -> io::Result<(File, bool)> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    // Try O_DIRECT first
-    let file = std::fs::OpenOptions::new()
+    // Ra WAL files have a 5-byte header, so the first data write starts at
+    // offset 5. That offset cannot satisfy O_DIRECT alignment requirements.
+    // Keep buffered writes and rely on explicit fdatasync for durability.
+    let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .read(true)
-        .custom_flags(libc::O_DIRECT) // NO O_DSYNC — fdatasync is explicit
-        .open(path);
+        .open(path)?;
 
-    match file {
-        Ok(f) => {
-            if pre_allocate_bytes > 0 {
-                let ret =
-                    unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, pre_allocate_bytes as i64) };
-                if ret != 0 {
-                    // fallocate failed (e.g., ENOSPC) — close and cleanup
-                    drop(f);
-                    let _ = std::fs::remove_file(path);
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            Ok((f, true)) // O_DIRECT enabled
+    if pre_allocate_bytes > 0 {
+        let ret = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, pre_allocate_bytes as i64) };
+        if ret != 0 {
+            drop(f);
+            let _ = std::fs::remove_file(path);
+            return Err(io::Error::last_os_error());
         }
-        Err(_) => {
-            // O_DIRECT not supported on this filesystem — fall back
-            let f = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .read(true)
-                .open(path)?;
-            Ok((f, false))
-        }
-    }
+    };
+
+    Ok((f, false))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -527,11 +511,7 @@ mod tests {
         let (file, o_direct) = open_wal_file(path.to_str().unwrap(), 0).unwrap();
         drop(file);
 
-        #[cfg(not(target_os = "linux"))]
         assert!(!o_direct);
-
-        #[cfg(target_os = "linux")]
-        let _ = o_direct;
 
         // File should exist
         assert!(path.exists());
@@ -665,6 +645,46 @@ mod tests {
         }
         assert!(drain_to_kernel(&mut file, &buffer, &file_size).unwrap());
         assert_eq!(file_size.load(Ordering::Acquire), 12);
+    }
+
+    #[test]
+    fn drain_to_kernel_appends_logical_bytes_without_padding_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+
+        file.write_all(b"RAWA\x01").unwrap();
+        file.seek(SeekFrom::Start(WAL_HEADER_SIZE)).unwrap();
+
+        let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
+        let file_size = Arc::new(AtomicU64::new(WAL_HEADER_SIZE));
+
+        {
+            let mut buf = buffer.lock().unwrap();
+            buf.extend(b"abc");
+        }
+        assert!(drain_to_kernel(&mut file, &buffer, &file_size).unwrap());
+
+        {
+            let mut buf = buffer.lock().unwrap();
+            buf.extend(b"def");
+        }
+        assert!(drain_to_kernel(&mut file, &buffer, &file_size).unwrap());
+        file.sync_data().unwrap();
+
+        assert_eq!(file_size.load(Ordering::Acquire), WAL_HEADER_SIZE + 6);
+
+        let contents = std::fs::read(&path).unwrap();
+        let logical_start = WAL_HEADER_SIZE as usize;
+        let logical_end = logical_start + 6;
+        assert_eq!(&contents[logical_start..logical_end], b"abcdef");
+        assert_eq!(contents.len(), logical_end);
     }
 
     #[test]
