@@ -21,7 +21,7 @@ defmodule Ferricstore.Store.Router do
   alias Ferricstore.HLC
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Stats
-  alias Ferricstore.Store.{CompoundKey, LFU, ListOps, TypeRegistry}
+  alias Ferricstore.Store.{CompoundKey, LFU, ListOps, TypeRegistry, ValueCodec}
 
   import Bitwise, only: [band: 2]
 
@@ -812,16 +812,7 @@ defmodule Ferricstore.Store.Router do
   defp coerce_float(v) when is_integer(v), do: {:ok, v * 1.0}
 
   defp coerce_float(v) when is_binary(v) do
-    case Float.parse(v) do
-      {f, _} ->
-        {:ok, f}
-
-      :error ->
-        case Integer.parse(v) do
-          {i, ""} -> {:ok, i * 1.0}
-          _ -> :error
-        end
-    end
+    ValueCodec.parse_float(v)
   end
 
   # SETRANGE helper: overwrite bytes at offset, zero-padding if needed.

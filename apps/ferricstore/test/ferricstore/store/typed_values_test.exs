@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.TypedValuesTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
+  alias Ferricstore.NamespaceConfig
   alias Ferricstore.Test.ShardHelpers
 
   setup do
@@ -40,13 +41,17 @@ defmodule Ferricstore.Store.TypedValuesTest do
 
     test "INCR on float returns error" do
       Router.put(FerricStore.Instance.get(:default), "typed:incr_on_float", "3.14", 0)
-      assert {:error, _} = Router.incr(FerricStore.Instance.get(:default), "typed:incr_on_float", 1)
+
+      assert {:error, _} =
+               Router.incr(FerricStore.Instance.get(:default), "typed:incr_on_float", 1)
     end
   end
 
   describe "INCRBYFLOAT stores string representation" do
     test "INCRBYFLOAT on nonexistent key creates string in ETS" do
-      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), "typed:float_new", 3.14)
+      assert {:ok, result} =
+               Router.incr_float(FerricStore.Instance.get(:default), "typed:float_new", 3.14)
+
       assert is_float(result)
       assert_in_delta result, 3.14, 0.001
 
@@ -58,7 +63,10 @@ defmodule Ferricstore.Store.TypedValuesTest do
 
     test "INCRBYFLOAT on integer produces string" do
       Router.incr(FerricStore.Instance.get(:default), "typed:float_from_int", 10)
-      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), "typed:float_from_int", 0.5)
+
+      assert {:ok, result} =
+               Router.incr_float(FerricStore.Instance.get(:default), "typed:float_from_int", 0.5)
+
       assert is_float(result)
       assert_in_delta result, 10.5, 0.001
 
@@ -68,9 +76,27 @@ defmodule Ferricstore.Store.TypedValuesTest do
 
     test "INCRBYFLOAT on string parses and stores string" do
       Router.put(FerricStore.Instance.get(:default), "typed:float_str", "10.5", 0)
-      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), "typed:float_str", 2.5)
+
+      assert {:ok, result} =
+               Router.incr_float(FerricStore.Instance.get(:default), "typed:float_str", 2.5)
+
       assert is_float(result)
       assert_in_delta result, 13.0, 0.001
+    end
+
+    test "async INCRBYFLOAT rejects partial numeric strings" do
+      ns = "typed_async_float"
+      key = "#{ns}:bad_#{System.unique_integer([:positive])}"
+
+      on_exit(fn -> NamespaceConfig.reset_all() end)
+
+      assert :ok = NamespaceConfig.set(ns, "durability", "async")
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "10.5abc", 0)
+
+      assert {:error, "ERR value is not a valid float"} =
+               Router.incr_float(FerricStore.Instance.get(:default), key, 1.0)
+
+      assert Router.get(FerricStore.Instance.get(:default), key) == "10.5abc"
     end
   end
 
@@ -131,7 +157,10 @@ defmodule Ferricstore.Store.TypedValuesTest do
     test "GETRANGE on INCR result extracts from string representation" do
       Router.incr(FerricStore.Instance.get(:default), "typed:getrange_int", 12_345)
       store = build_store()
-      result = Ferricstore.Commands.Strings.handle("GETRANGE", ["typed:getrange_int", "0", "2"], store)
+
+      result =
+        Ferricstore.Commands.Strings.handle("GETRANGE", ["typed:getrange_int", "0", "2"], store)
+
       assert result == "123"
     end
   end
@@ -172,7 +201,9 @@ defmodule Ferricstore.Store.TypedValuesTest do
   defp build_store do
     %{
       get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
-      put: fn key, value, exp -> Router.put(FerricStore.Instance.get(:default), key, value, exp) end,
+      put: fn key, value, exp ->
+        Router.put(FerricStore.Instance.get(:default), key, value, exp)
+      end,
       delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
       exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
       incr: fn k, d -> Router.incr(FerricStore.Instance.get(:default), k, d) end,
