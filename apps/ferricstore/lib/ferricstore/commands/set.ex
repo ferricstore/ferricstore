@@ -65,17 +65,23 @@ defmodule Ferricstore.Commands.Set do
 
   def handle("SREM", [key | members], store) when members != [] do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
-      removed =
-        Enum.reduce(members, 0, fn member, acc ->
-          compound_key = CompoundKey.set_member(key, member)
+      compound_keys =
+        members
+        |> Enum.uniq()
+        |> Enum.map(&CompoundKey.set_member(key, &1))
 
-          if Ops.compound_get(store, key, compound_key) != nil do
-            Ops.compound_delete(store, key, compound_key)
-            acc + 1
-          else
-            acc
-          end
+      removed_keys =
+        store
+        |> Ops.compound_batch_get(key, compound_keys)
+        |> Enum.zip(compound_keys)
+        |> Enum.flat_map(fn
+          {nil, _compound_key} -> []
+          {_value, compound_key} -> [compound_key]
         end)
+
+      Enum.each(removed_keys, &Ops.compound_delete(store, key, &1))
+
+      removed = length(removed_keys)
 
       maybe_cleanup_empty_set(key, removed, store)
       removed
