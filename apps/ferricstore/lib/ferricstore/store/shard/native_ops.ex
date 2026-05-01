@@ -329,8 +329,11 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   # needs to detect string keys masquerading as lists.
   defp type_check_store(compound_store, state) do
     Map.put(compound_store, :exists?, fn key ->
-      case :ets.lookup(state.keydir, key) do
-        [{^key, _, _, _, _, _, _}] -> true
+      # Raw ETS presence is not enough: an unswept expired string must not
+      # block a list write with WRONGTYPE.
+      case ShardETS.ets_lookup(state, key) do
+        {:hit, _value, _exp} -> true
+        {:cold, _fid, _off, _vsize, _exp} -> true
         _ -> false
       end
     end)

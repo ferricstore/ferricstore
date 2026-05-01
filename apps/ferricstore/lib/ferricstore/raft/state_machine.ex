@@ -374,10 +374,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
       type_store =
         Map.put(store, :exists?, fn k ->
-          case :ets.lookup(state.ets, k) do
-            [{^k, _, _, _, _, _, _}] -> true
-            _ -> false
-          end
+          live_key?(state, k)
         end)
 
       result =
@@ -3077,7 +3074,7 @@ defmodule Ferricstore.Raft.StateMachine do
         :ok
       end,
       exists?: fn key ->
-        if ets_has?(state.ets, key) do
+        if live_key?(state, key) do
           true
         else
           case state.instance_ctx do
@@ -3566,12 +3563,18 @@ defmodule Ferricstore.Raft.StateMachine do
         Ferricstore.Store.Shard.ETS.prefix_count_entries(state.ets, prefix)
       end,
       exists?: fn key ->
-        case :ets.lookup(state.ets, key) do
-          [{^key, _, _, _, _, _, _}] -> true
-          _ -> false
-        end
+        live_key?(state, key)
       end
     }
+  end
+
+  defp live_key?(state, key) do
+    # Type checks use this for plain-key existence. Raw ETS presence is
+    # incorrect because expired keys can stay unswept until the next read.
+    case ets_lookup(state, key) do
+      {:hit, _value, _expire_at_ms} -> true
+      _ -> false
+    end
   end
 
   # ---------------------------------------------------------------------------
