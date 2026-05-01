@@ -30,6 +30,18 @@ defmodule Ferricstore.Commands.SetStoreCommandsTest do
       assert Set.handle("SMEMBERS", ["dst"], store) == ["a"]
     end
 
+    test "overwrites an existing string destination" do
+      store = MockStore.make()
+      store.put.("dst", "old-string", 0)
+      Set.handle("SADD", ["s1", "a", "b"], store)
+      Set.handle("SADD", ["s2", "b"], store)
+
+      assert 1 == Set.handle("SDIFFSTORE", ["dst", "s1", "s2"], store)
+      assert store.get.("dst") == nil
+      assert Set.handle("SMEMBERS", ["dst"], store) == ["a"]
+      assert store.compound_get.("dst", CompoundKey.type_key("dst")) == "set"
+    end
+
     test "empty difference stores empty set and returns 0" do
       store = MockStore.make()
       Set.handle("SADD", ["s1", "a", "b"], store)
@@ -143,6 +155,18 @@ defmodule Ferricstore.Commands.SetStoreCommandsTest do
       Set.handle("SADD", ["s1", "a", "b"], store)
 
       assert 0 == Set.handle("SINTERSTORE", ["dst", "s1", "nosuch"], store)
+    end
+
+    test "empty result deletes an existing string destination" do
+      store = MockStore.make()
+      store.put.("dst", "old-string", 0)
+      Set.handle("SADD", ["s1", "a"], store)
+      Set.handle("SADD", ["s2", "b"], store)
+
+      assert 0 == Set.handle("SINTERSTORE", ["dst", "s1", "s2"], store)
+      assert store.get.("dst") == nil
+      assert Set.handle("SMEMBERS", ["dst"], store) == []
+      assert store.compound_get.("dst", CompoundKey.type_key("dst")) == nil
     end
 
     test "wrong number of arguments" do

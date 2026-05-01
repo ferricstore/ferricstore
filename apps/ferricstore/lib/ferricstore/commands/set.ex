@@ -368,7 +368,11 @@ defmodule Ferricstore.Commands.Set do
           store_set_at(destination, result, unified_store)
         end
       end,
-      intent: %{command: :sdiffstore, keys: %{dest: destination, sources: keys}, value_hashes: %{}},
+      intent: %{
+        command: :sdiffstore,
+        keys: %{dest: destination, sources: keys},
+        value_hashes: %{}
+      },
       store: store
     )
   end
@@ -400,7 +404,11 @@ defmodule Ferricstore.Commands.Set do
           store_set_at(destination, result, unified_store)
         end
       end,
-      intent: %{command: :sinterstore, keys: %{dest: destination, sources: keys}, value_hashes: %{}},
+      intent: %{
+        command: :sinterstore,
+        keys: %{dest: destination, sources: keys},
+        value_hashes: %{}
+      },
       store: store
     )
   end
@@ -427,7 +435,11 @@ defmodule Ferricstore.Commands.Set do
           store_set_at(destination, result, unified_store)
         end
       end,
-      intent: %{command: :sunionstore, keys: %{dest: destination, sources: keys}, value_hashes: %{}},
+      intent: %{
+        command: :sunionstore,
+        keys: %{dest: destination, sources: keys},
+        value_hashes: %{}
+      },
       store: store
     )
   end
@@ -496,7 +508,10 @@ defmodule Ferricstore.Commands.Set do
   # Clears any existing set at `destination`, writes `members` as a new set,
   # and returns the member count.
   defp store_set_at(destination, members, store) do
-    # Clear existing destination data
+    # STORE commands replace the destination regardless of its previous type.
+    Ops.delete(store, destination)
+
+    # Clear existing destination data structure metadata and members.
     prefix = CompoundKey.set_prefix(destination)
     Ops.compound_delete_prefix(store, destination, prefix)
     TypeRegistry.delete_type(destination, store)
@@ -504,12 +519,12 @@ defmodule Ferricstore.Commands.Set do
     members_list = MapSet.to_list(members)
 
     if members_list != [] do
-      TypeRegistry.check_or_set(destination, :set, store)
-
-      Enum.each(members_list, fn member ->
-        compound_key = CompoundKey.set_member(destination, member)
-        Ops.compound_put(store, destination, compound_key, @presence_marker, 0)
-      end)
+      with :ok <- TypeRegistry.check_or_set(destination, :set, store) do
+        Enum.each(members_list, fn member ->
+          compound_key = CompoundKey.set_member(destination, member)
+          Ops.compound_put(store, destination, compound_key, @presence_marker, 0)
+        end)
+      end
     end
 
     length(members_list)
