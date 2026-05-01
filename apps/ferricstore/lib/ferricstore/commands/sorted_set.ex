@@ -529,13 +529,13 @@ defmodule Ferricstore.Commands.SortedSet do
 
   def handle("ZMSCORE", [key | members], store) when members != [] do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      Enum.map(members, fn member ->
-        compound_key = CompoundKey.zset_member(key, member)
+      compound_keys = Enum.map(members, &CompoundKey.zset_member(key, &1))
 
-        case Ops.compound_get(store, key, compound_key) do
-          nil -> nil
-          score_str -> format_score_str(score_str)
-        end
+      store
+      |> Ops.compound_batch_get(key, compound_keys)
+      |> Enum.map(fn
+        nil -> nil
+        score_str -> format_score_str(score_str)
       end)
     end
   end

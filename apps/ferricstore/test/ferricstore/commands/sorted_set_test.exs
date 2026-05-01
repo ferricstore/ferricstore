@@ -567,6 +567,31 @@ defmodule Ferricstore.Commands.SortedSetTest do
       assert result == ["1.0", nil, "3.0"]
     end
 
+    test "ZMSCORE uses compound_batch_get when the store provides it" do
+      type_key = CompoundKey.type_key("zs")
+
+      member_keys = [
+        CompoundKey.zset_member("zs", "a"),
+        CompoundKey.zset_member("zs", "missing"),
+        CompoundKey.zset_member("zs", "c")
+      ]
+
+      store = %{
+        compound_get: fn
+          "zs", ^type_key ->
+            nil
+
+          "zs", compound_key ->
+            flunk(
+              "ZMSCORE should use compound_batch_get, got per-member lookup #{inspect(compound_key)}"
+            )
+        end,
+        compound_batch_get: fn "zs", ^member_keys -> ["1.0", nil, "3.0"] end
+      }
+
+      assert ["1.0", nil, "3.0"] == SortedSet.handle("ZMSCORE", ["zs", "a", "missing", "c"], store)
+    end
+
     test "ZMSCORE on nonexistent key returns all nils" do
       store = MockStore.make()
       result = SortedSet.handle("ZMSCORE", ["nonexistent", "a", "b"], store)
