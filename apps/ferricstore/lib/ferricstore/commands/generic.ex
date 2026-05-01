@@ -438,7 +438,7 @@ defmodule Ferricstore.Commands.Generic do
     end
   end
 
-  defp key_exists?(store, key), do: key_entry(store, key) != nil
+  defp key_exists?(store, key), do: TypeRegistry.get_type(key, store) != "none"
 
   defp key_entry(store, key) do
     case Ops.get_meta(store, key) do

@@ -224,6 +224,23 @@ defmodule Ferricstore.Commands.GenericTest do
       assert "v2" == store.get.("dst")
     end
 
+    test "COPY destination existence check does not load destination value" do
+      store = %{
+        get: fn _key -> flunk("COPY should not load values through get") end,
+        get_meta: fn
+          "src" -> {"value", 0}
+          "dst" -> flunk("COPY should not read destination value to check existence")
+        end,
+        compound_get: fn _redis_key, _compound_key -> nil end,
+        exists?: fn
+          "dst" -> true
+          _key -> false
+        end
+      }
+
+      assert 0 == Generic.handle("COPY", ["src", "dst"], store)
+    end
+
     test "COPY with REPLACE overwrites destination" do
       store = MockStore.make(%{"src" => {"v1", 0}, "dst" => {"v2", 0}})
       assert 1 == Generic.handle("COPY", ["src", "dst", "REPLACE"], store)
