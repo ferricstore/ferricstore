@@ -446,7 +446,7 @@ defmodule Ferricstore.Commands.HashTest do
 
     test "HEXPIRE on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
 
       assert {:error, "WRONGTYPE" <> _} =
                Hash.handle("HEXPIRE", ["mykey", "10", "FIELDS", "1", "f1"], store)
@@ -506,7 +506,7 @@ defmodule Ferricstore.Commands.HashTest do
 
     test "HTTL on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
 
       assert {:error, "WRONGTYPE" <> _} =
                Hash.handle("HTTL", ["mykey", "FIELDS", "1", "f1"], store)
@@ -580,7 +580,7 @@ defmodule Ferricstore.Commands.HashTest do
 
     test "HPERSIST on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
 
       assert {:error, "WRONGTYPE" <> _} =
                Hash.handle("HPERSIST", ["mykey", "FIELDS", "1", "f1"], store)
@@ -658,13 +658,13 @@ defmodule Ferricstore.Commands.HashTest do
 
     test "HGET on a key used as list returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "list", 0)
+      List.handle("LPUSH", ["mykey", "elem"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HGET", ["mykey", "f"], store)
     end
 
     test "HGETALL on a key used as zset returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "zset", 0)
+      SortedSet.handle("ZADD", ["mykey", "1.0", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HGETALL", ["mykey"], store)
     end
   end
@@ -779,7 +779,7 @@ defmodule Ferricstore.Commands.HashTest do
 
     test "HSCAN on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HSCAN", ["mykey", "0"], store)
     end
 
@@ -896,7 +896,7 @@ defmodule Ferricstore.Commands.HashTest do
 
     test "HRANDFIELD on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HRANDFIELD", ["mykey"], store)
     end
   end
@@ -1022,37 +1022,37 @@ defmodule Ferricstore.Commands.HashTest do
   describe "WRONGTYPE enforcement edge cases" do
     test "HDEL on a key used as list returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "list", 0)
+      List.handle("LPUSH", ["mykey", "elem"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HDEL", ["mykey", "f1"], store)
     end
 
     test "HMGET on a key used as set returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HMGET", ["mykey", "f1"], store)
     end
 
     test "HLEN on a key used as list returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "list", 0)
+      List.handle("LPUSH", ["mykey", "elem"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HLEN", ["mykey"], store)
     end
 
     test "HEXISTS on a key used as set returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HEXISTS", ["mykey", "f"], store)
     end
 
     test "HKEYS on a key used as zset returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "zset", 0)
+      SortedSet.handle("ZADD", ["mykey", "1.0", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HKEYS", ["mykey"], store)
     end
 
     test "HVALS on a key used as list returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "list", 0)
+      List.handle("LPUSH", ["mykey", "elem"], store)
       assert {:error, "WRONGTYPE" <> _} = Hash.handle("HVALS", ["mykey"], store)
     end
 

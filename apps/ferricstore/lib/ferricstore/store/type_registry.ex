@@ -193,7 +193,10 @@ defmodule Ferricstore.Store.TypeRegistry do
         :ok
 
       _other_type ->
-        {:error, @wrongtype_msg}
+        case get_type(redis_key, store) do
+          "none" -> :ok
+          _live_type -> {:error, @wrongtype_msg}
+        end
     end
   end
 

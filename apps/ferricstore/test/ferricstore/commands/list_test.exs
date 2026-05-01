@@ -230,6 +230,15 @@ defmodule Ferricstore.Commands.ListTest do
       assert [] == List.handle("LRANGE", ["nokey", "0", "-1"], store)
     end
 
+    test "treats a fully expired hash as a missing list before TYPE cleanup" do
+      store = MockStore.make()
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
+      compound_key = <<"H:mykey", 0, "field">>
+      store.compound_put.("mykey", compound_key, "value", System.os_time(:millisecond) - 1)
+
+      assert [] == List.handle("LRANGE", ["mykey", "0", "-1"], store)
+    end
+
     test "stop beyond list length clamps to end" do
       store = MockStore.make()
       List.handle("RPUSH", ["mylist", "a", "b"], store)

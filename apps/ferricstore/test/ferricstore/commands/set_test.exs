@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.SetTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Hash, Set}
+  alias Ferricstore.Commands.{Hash, List, Set, SortedSet}
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -288,7 +288,7 @@ defmodule Ferricstore.Commands.SetTest do
 
     test "SSCAN on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SSCAN", ["mykey", "0"], store)
     end
   end
@@ -370,7 +370,7 @@ defmodule Ferricstore.Commands.SetTest do
 
     test "SRANDMEMBER on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SRANDMEMBER", ["mykey"], store)
     end
   end
@@ -452,7 +452,7 @@ defmodule Ferricstore.Commands.SetTest do
 
     test "SPOP on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SPOP", ["mykey"], store)
     end
   end
@@ -523,14 +523,14 @@ defmodule Ferricstore.Commands.SetTest do
 
     test "SMOVE on wrong type source returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SMOVE", ["mykey", "dst", "a"], store)
     end
 
     test "SMOVE on wrong type destination returns WRONGTYPE" do
       store = MockStore.make()
       Set.handle("SADD", ["src", "a"], store)
-      store.compound_put.("dst", "T:dst", "hash", 0)
+      Hash.handle("HSET", ["dst", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SMOVE", ["src", "dst", "a"], store)
     end
   end
@@ -548,7 +548,7 @@ defmodule Ferricstore.Commands.SetTest do
 
     test "SMEMBERS on a key used as list returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "list", 0)
+      List.handle("LPUSH", ["mykey", "elem"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SMEMBERS", ["mykey"], store)
     end
   end
@@ -640,39 +640,39 @@ defmodule Ferricstore.Commands.SetTest do
     test "SINTER with one key being wrong type returns WRONGTYPE" do
       store = MockStore.make()
       Set.handle("SADD", ["s1", "a", "b"], store)
-      store.compound_put.("s2", "T:s2", "hash", 0)
+      Hash.handle("HSET", ["s2", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SINTER", ["s1", "s2"], store)
     end
 
     test "SUNION with one key being wrong type returns WRONGTYPE" do
       store = MockStore.make()
       Set.handle("SADD", ["s1", "a", "b"], store)
-      store.compound_put.("s2", "T:s2", "list", 0)
+      List.handle("LPUSH", ["s2", "elem"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SUNION", ["s1", "s2"], store)
     end
 
     test "SDIFF with one key being wrong type returns WRONGTYPE" do
       store = MockStore.make()
       Set.handle("SADD", ["s1", "a", "b"], store)
-      store.compound_put.("s2", "T:s2", "zset", 0)
+      SortedSet.handle("ZADD", ["s2", "1.0", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SDIFF", ["s1", "s2"], store)
     end
 
     test "SCARD on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SCARD", ["mykey"], store)
     end
 
     test "SISMEMBER on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SISMEMBER", ["mykey", "m"], store)
     end
 
     test "SREM on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = Set.handle("SREM", ["mykey", "m"], store)
     end
   end

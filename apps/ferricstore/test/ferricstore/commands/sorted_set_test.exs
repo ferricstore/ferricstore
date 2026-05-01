@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.SortedSetTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Hash, Set, SortedSet}
+  alias Ferricstore.Commands.{Hash, List, Set, SortedSet}
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -403,7 +403,7 @@ defmodule Ferricstore.Commands.SortedSetTest do
 
     test "ZSCAN on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZSCAN", ["mykey", "0"], store)
     end
   end
@@ -503,7 +503,7 @@ defmodule Ferricstore.Commands.SortedSetTest do
 
     test "ZRANDMEMBER on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZRANDMEMBER", ["mykey"], store)
     end
   end
@@ -548,7 +548,7 @@ defmodule Ferricstore.Commands.SortedSetTest do
 
     test "ZMSCORE on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZMSCORE", ["mykey", "a"], store)
     end
   end
@@ -566,7 +566,7 @@ defmodule Ferricstore.Commands.SortedSetTest do
 
     test "ZRANGE on a key used as set returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZRANGE", ["mykey", "0", "-1"], store)
     end
   end
@@ -668,19 +668,19 @@ defmodule Ferricstore.Commands.SortedSetTest do
   describe "WRONGTYPE enforcement for sorted set commands" do
     test "ZSCORE on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZSCORE", ["mykey", "m"], store)
     end
 
     test "ZRANK on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZRANK", ["mykey", "m"], store)
     end
 
     test "ZCARD on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZCARD", ["mykey"], store)
     end
 
@@ -692,31 +692,31 @@ defmodule Ferricstore.Commands.SortedSetTest do
 
     test "ZCOUNT on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZCOUNT", ["mykey", "-inf", "+inf"], store)
     end
 
     test "ZPOPMIN on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "list", 0)
+      List.handle("LPUSH", ["mykey", "elem"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZPOPMIN", ["mykey"], store)
     end
 
     test "ZPOPMAX on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "list", 0)
+      List.handle("LPUSH", ["mykey", "elem"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZPOPMAX", ["mykey"], store)
     end
 
     test "ZREM on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      Hash.handle("HSET", ["mykey", "field", "value"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZREM", ["mykey", "m"], store)
     end
 
     test "ZREVRANGE on wrong type returns WRONGTYPE" do
       store = MockStore.make()
-      store.compound_put.("mykey", "T:mykey", "set", 0)
+      Set.handle("SADD", ["mykey", "member"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZREVRANGE", ["mykey", "0", "-1"], store)
     end
   end
