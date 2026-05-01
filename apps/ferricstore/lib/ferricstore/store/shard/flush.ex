@@ -197,15 +197,23 @@ defmodule Ferricstore.Store.Shard.Flush do
 
   defp update_single_ets_location(keydir, key, value, fid, offset, fs) do
     case :ets.lookup(keydir, key) do
-      [{^key, _ets_value, _exp, _lfu, old_fid, _old_off, old_vsize}] ->
+      [{^key, _ets_value, _exp, _lfu, old_fid, old_off, old_vsize}] ->
         vsize = byte_size(value)
         :ets.update_element(keydir, key, [{5, fid}, {6, offset}, {7, vsize}])
-        track_overwrite_dead_bytes(fs, key, old_fid, old_vsize)
+        {dead_fid, dead_vsize} = overwrite_dead_ref(old_fid, old_off, old_vsize)
+        track_overwrite_dead_bytes(fs, key, dead_fid, dead_vsize)
 
       [] ->
         fs
     end
   end
+
+  defp overwrite_dead_ref(:pending, old_fid, old_vsize)
+       when is_integer(old_fid) and old_fid >= 0 and is_integer(old_vsize) and old_vsize >= 0 do
+    {old_fid, old_vsize}
+  end
+
+  defp overwrite_dead_ref(old_fid, _old_off, old_vsize), do: {old_fid, old_vsize}
 
   defp track_overwrite_dead_bytes(fs, key, old_fid, old_vsize)
        when is_integer(old_fid) and old_fid >= 0 and is_integer(old_vsize) and old_vsize >= 0 do

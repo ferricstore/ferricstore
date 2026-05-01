@@ -19,10 +19,13 @@ defmodule Ferricstore.Store.Shard.Writes do
   def handle_put(key, value, expire_at_ms, from, state) do
     # Reject new-key writes when the keydir is at capacity (spec 2.4).
     # Updates to existing keys are always allowed regardless of memory pressure.
-    is_new = case :ets.lookup(state.keydir, key) do
-      [] -> true
-      _ -> false
-    end
+    existing = :ets.lookup(state.keydir, key)
+
+    is_new =
+      case existing do
+        [] -> true
+        _ -> false
+      end
 
     if is_new and Ferricstore.MemoryGuard.reject_writes?() do
       Ferricstore.MemoryGuard.nudge()
@@ -33,7 +36,7 @@ defmodule Ferricstore.Store.Shard.Writes do
         new_version = state.write_version + 1
         {:noreply, %{state | write_version: new_version}}
       else
-        ShardETS.ets_insert(state, key, value, expire_at_ms)
+        ShardETS.ets_insert(state, key, value, expire_at_ms, existing)
         new_pending = [{key, value, expire_at_ms} | state.pending]
         new_count = state.pending_count + 1
         new_version = state.write_version + 1

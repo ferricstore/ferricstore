@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.ShardAccountingTest do
 
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
+  alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
   @record_header_size 26
@@ -66,6 +67,70 @@ defmodule Ferricstore.Store.ShardAccountingTest do
 
         assert state.file_stats[0] == {100, 2 + @record_header_size + byte_size(key)}
         assert [{^key, _value, _exp, _lfu, 1, 30, 9}] = :ets.lookup(keydir, key)
+      after
+        :ets.delete(keydir)
+      end
+    end
+
+    test "async SET overwrite flow counts the old disk record" do
+      keydir = new_keydir()
+      key = "accounting:async:set:overwrite"
+      old_fid = 2
+      old_value_size = 9
+
+      try do
+        :ets.insert(keydir, {key, nil, 0, LFU.initial(), old_fid, 8, old_value_size})
+
+        state = %{
+          keydir: keydir,
+          active_file_id: 3,
+          file_stats: %{old_fid => {120, 0}, 3 => {0, 0}}
+        }
+
+        # This mirrors the direct async SET path: write the new pending value
+        # into ETS first, then update ETS locations after the batch append.
+        ShardETS.ets_insert(state, key, "new-value", 0)
+        state = ShardFlush.update_ets_locations(state, [{key, "new-value", 0}], [{30, 35}])
+
+        assert state.file_stats[old_fid] ==
+                 {120, @record_header_size + byte_size(key) + old_value_size}
+      after
+        :ets.delete(keydir)
+      end
+    end
+
+    test "async SET batch with repeated key counts original and superseded pending records" do
+      keydir = new_keydir()
+      key = "accounting:async:set:repeat"
+      old_fid = 2
+      old_value_size = 3
+      first_value = "first"
+      second_value = "second"
+
+      try do
+        :ets.insert(keydir, {key, nil, 0, LFU.initial(), old_fid, 8, old_value_size})
+
+        state = %{
+          keydir: keydir,
+          active_file_id: 3,
+          file_stats: %{old_fid => {120, 0}, 3 => {0, 0}}
+        }
+
+        ShardETS.ets_insert(state, key, first_value, 0)
+        ShardETS.ets_insert(state, key, second_value, 0)
+
+        state =
+          ShardFlush.update_ets_locations(
+            state,
+            [{key, first_value, 0}, {key, second_value, 0}],
+            [{30, 31}, {61, 32}]
+          )
+
+        old_record_size = @record_header_size + byte_size(key) + old_value_size
+        first_record_size = @record_header_size + byte_size(key) + byte_size(first_value)
+
+        assert state.file_stats[old_fid] == {120, old_record_size}
+        assert state.file_stats[3] == {0, first_record_size}
       after
         :ets.delete(keydir)
       end

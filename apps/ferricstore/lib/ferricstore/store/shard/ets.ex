@@ -138,10 +138,36 @@ defmodule Ferricstore.Store.Shard.ETS do
   @spec ets_insert(map(), binary(), term(), non_neg_integer()) :: true
   @doc false
   def ets_insert(state, key, value, expire_at_ms) do
+    ets_insert(state, key, value, expire_at_ms, :ets.lookup(state.keydir, key))
+  end
+
+  @spec ets_insert(map(), binary(), term(), non_neg_integer(), list()) :: true
+  @doc false
+  def ets_insert(state, key, value, expire_at_ms, previous) do
     threshold = hot_cache_threshold(state)
     v = value_for_ets(value, threshold)
+    {original_fid, original_vsize} = pending_original_location(key, previous)
     track_binary_insert(state, key, v)
-    :ets.insert(state.keydir, {key, v, expire_at_ms, LFU.initial(), :pending, 0, 0})
+
+    :ets.insert(
+      state.keydir,
+      {key, v, expire_at_ms, LFU.initial(), :pending, original_fid, original_vsize}
+    )
+  end
+
+  defp pending_original_location(key, previous) do
+    case previous do
+      [{^key, _old_value, _old_exp, _old_lfu, :pending, old_fid, old_vsize}]
+      when is_integer(old_fid) and old_fid >= 0 and is_integer(old_vsize) and old_vsize >= 0 ->
+        {old_fid, old_vsize}
+
+      [{^key, _old_value, _old_exp, _old_lfu, old_fid, _old_off, old_vsize}]
+      when is_integer(old_fid) and old_fid >= 0 and is_integer(old_vsize) and old_vsize >= 0 ->
+        {old_fid, old_vsize}
+
+      _ ->
+        {nil, 0}
+    end
   end
 
   # Inserts a key/value/expiry into the keydir with known disk location (v2).
