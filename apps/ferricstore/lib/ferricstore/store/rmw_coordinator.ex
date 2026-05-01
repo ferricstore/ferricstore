@@ -16,9 +16,9 @@ defmodule Ferricstore.Store.RmwCoordinator do
     This is the slow path under heavy same-key contention, but it never
     loses updates and callers sleep on `receive` while queued (zero CPU).
 
-  The worker itself also acquires the per-key latch before executing —
-  bounded spin, because at most one latch holder exists for any key,
-  and only one process (the worker) ever spins. No thundering herd.
+  The coordinator keeps a FIFO queue per key and starts at most one waiter
+  task per key. That keeps same-key RMW serialized without letting a latch
+  wait for key A block unrelated key B on the same shard.
 
   Periodic latch sweep (every 5s) removes entries whose holder pid is
   dead — recovery path for a caller that crashed between `insert_new`
@@ -88,11 +88,11 @@ defmodule Ferricstore.Store.RmwCoordinator do
     # The instance context may not be populated yet at application start
     # order. Defer lookup until first use, but remember the shard index.
     Process.send_after(self(), :sweep_latches, @sweep_interval_ms)
-    {:ok, %{idx: idx}}
+    {:ok, %{idx: idx, queues: %{}, running: MapSet.new()}}
   end
 
   @impl true
-  def handle_call({:rmw, cmd}, _from, state) do
+  def handle_call({:rmw, cmd}, from, state) do
     ctx = FerricStore.Instance.get(:default)
 
     case ctx do
@@ -100,12 +100,12 @@ defmodule Ferricstore.Store.RmwCoordinator do
         {:reply, {:error, "ERR instance not initialized"}, state}
 
       _ ->
-        execute_with_context(ctx, cmd, state)
+        {:noreply, enqueue_rmw(state, from, ctx, cmd)}
     end
   end
 
-  def handle_call({:rmw, %FerricStore.Instance{} = ctx, cmd}, _from, state) do
-    execute_with_context(ctx, cmd, state)
+  def handle_call({:rmw, %FerricStore.Instance{} = ctx, cmd}, from, state) do
+    {:noreply, enqueue_rmw(state, from, ctx, cmd)}
   end
 
   def handle_call(:sweep_latches_now, _from, state) do
@@ -128,6 +128,16 @@ defmodule Ferricstore.Store.RmwCoordinator do
     {:noreply, state}
   end
 
+  def handle_info({:rmw_finished, key, from, result}, state) do
+    GenServer.reply(from, result)
+
+    state =
+      %{state | running: MapSet.delete(state.running, key)}
+      |> maybe_start_next(key)
+
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # ---------------------------------------------------------------------------
@@ -143,22 +153,70 @@ defmodule Ferricstore.Store.RmwCoordinator do
   defp dispatch_inline(ctx, idx, cmd),
     do: Ferricstore.Store.Router.execute_rmw_inline(ctx, idx, cmd)
 
-  defp execute_with_context(ctx, cmd, state) do
-    latch_tab = elem(ctx.latch_refs, state.idx)
+  defp enqueue_rmw(state, from, ctx, cmd) do
     key = key_of(cmd)
-    wait_for_latch(latch_tab, key)
+    queue = Map.get(state.queues, key, :queue.new())
+    queues = Map.put(state.queues, key, :queue.in({from, ctx, cmd}, queue))
 
-    try do
-      result = dispatch_inline(ctx, state.idx, cmd)
-      :telemetry.execute([:ferricstore, :rmw, :worker], %{}, %{shard_index: state.idx})
-      {:reply, result, state}
-    after
-      :ets.take(latch_tab, key)
+    %{state | queues: queues}
+    |> maybe_start_next(key)
+  end
+
+  defp maybe_start_next(state, key) do
+    if MapSet.member?(state.running, key) do
+      state
+    else
+      case Map.fetch(state.queues, key) do
+        {:ok, queue} ->
+          case :queue.out(queue) do
+            {{:value, {from, ctx, cmd}}, rest} ->
+              queues =
+                if :queue.is_empty(rest),
+                  do: Map.delete(state.queues, key),
+                  else: Map.put(state.queues, key, rest)
+
+              start_key_worker(self(), state.idx, key, from, ctx, cmd)
+              %{state | queues: queues, running: MapSet.put(state.running, key)}
+
+            {:empty, _} ->
+              %{state | queues: Map.delete(state.queues, key)}
+          end
+
+        :error ->
+          state
+      end
     end
   end
 
-  # Acquire the per-key latch. Only the worker process ever spins here, so
-  # there's no thundering herd.
+  defp start_key_worker(parent, idx, key, from, ctx, cmd) do
+    Task.start(fn ->
+      send(parent, {:rmw_finished, key, from, run_rmw(ctx, idx, cmd)})
+    end)
+  end
+
+  defp run_rmw(ctx, idx, cmd) do
+    latch_tab = elem(ctx.latch_refs, idx)
+    key = key_of(cmd)
+
+    try do
+      wait_for_latch(latch_tab, key)
+
+      try do
+        result = dispatch_inline(ctx, idx, cmd)
+        :telemetry.execute([:ferricstore, :rmw, :worker], %{}, %{shard_index: idx})
+        result
+      after
+        :ets.take(latch_tab, key)
+      end
+    catch
+      kind, reason ->
+        Logger.error("RmwCoordinator: worker task failed: #{inspect({kind, reason})}")
+        {:error, "ERR RMW worker crashed"}
+    end
+  end
+
+  # Acquire the per-key latch. The coordinator starts at most one waiter task
+  # per key, so same-key contention has no thundering herd.
   #
   # If the current holder is dead (crashed mid-RMW), take over the latch
   # immediately instead of waiting for the periodic sweeper. This handles

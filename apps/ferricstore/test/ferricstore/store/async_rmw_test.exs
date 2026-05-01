@@ -42,6 +42,14 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   defp ctx, do: FerricStore.Instance.get(:default)
   defp ukey(base), do: "#{@ns}:#{base}_#{:erlang.unique_integer([:positive])}"
 
+  defp same_shard_key(base, shard_idx) do
+    Stream.iterate(1, &(&1 + 1))
+    |> Enum.find_value(fn n ->
+      key = ukey("#{base}_#{n}")
+      if Router.shard_for(ctx(), key) == shard_idx, do: key
+    end)
+  end
+
   defp hash_key(base) do
     key = ukey(base)
     assert :ok = FerricStore.hset(key, %{"field" => "value"})
@@ -66,13 +74,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
         key = ukey("isolated_missing_getdel")
         idx = Router.shard_for(isolated, key)
 
-        assert {:reply, nil, %{idx: ^idx}} =
-                 RmwCoordinator.handle_call(
-                   {:rmw, isolated, {:getdel, key}},
-                   {self(), make_ref()},
-                   %{idx: idx}
-                 )
-
+        assert nil == RmwCoordinator.execute(idx, isolated, {:getdel, key})
         assert [] == :ets.lookup(elem(isolated.latch_refs, idx), key)
       after
         cleanup_minimal_instance_context(isolated)
@@ -426,6 +428,41 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       after
         :telemetry.detach(handler_id)
       end
+    end
+
+    test "blocked worker RMW for one key does not delay another key on the same shard" do
+      key_a = ukey("worker_hol_a")
+      idx = Router.shard_for(ctx(), key_a)
+      key_b = same_shard_key("worker_hol_b", idx)
+      latch_tab = elem(ctx().latch_refs, idx)
+
+      assert :ets.insert_new(latch_tab, {key_a, self()})
+
+      task_a = Task.async(fn -> Router.incr(ctx(), key_a, 1) end)
+
+      try do
+        assert Task.yield(task_a, 50) == nil
+
+        assert :ets.insert_new(latch_tab, {key_b, self()})
+        task_b = Task.async(fn -> Router.incr(ctx(), key_b, 1) end)
+
+        try do
+          assert Task.yield(task_b, 50) == nil
+          :ets.take(latch_tab, key_b)
+          assert {:ok, {:ok, 1}} = Task.yield(task_b, 1_000)
+          assert Router.get(ctx(), key_b) == "1"
+        after
+          :ets.take(latch_tab, key_b)
+
+          if Process.alive?(task_b.pid) do
+            Task.shutdown(task_b, :brutal_kill)
+          end
+        end
+      after
+        :ets.take(latch_tab, key_a)
+      end
+
+      assert {:ok, 1} = Task.await(task_a, 1_000)
     end
   end
 
