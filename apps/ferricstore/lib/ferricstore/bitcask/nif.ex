@@ -95,6 +95,21 @@ defmodule Ferricstore.Bitcask.NIF do
           {:ok, [{non_neg_integer(), non_neg_integer()}]} | {:error, term()}
   def v2_copy_records(_source_path, _dest_path, _offsets), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec v2_copy_records_preserve_tombstones(
+          binary(),
+          binary(),
+          [non_neg_integer()],
+          [non_neg_integer()]
+        ) ::
+          {:ok, [{non_neg_integer(), non_neg_integer()}]} | {:error, term()}
+  def v2_copy_records_preserve_tombstones(
+        _source_path,
+        _dest_path,
+        _live_offsets,
+        _tombstone_offsets
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   @spec v2_append_batch_nosync(binary(), [{binary(), binary(), non_neg_integer()}]) ::
           {:ok, [{non_neg_integer(), non_neg_integer()}]} | {:error, term()}
   def v2_append_batch_nosync(_path, _records), do: :erlang.nif_error(:nif_not_loaded)

@@ -534,8 +534,9 @@ fn v2_scan_tombstones<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
                             ob.release(env)
                         }
                         None => {
-                            return Ok((atoms::error(), "out of memory allocating key binary")
-                                .encode(env));
+                            return Ok(
+                                (atoms::error(), "out of memory allocating key binary").encode(env)
+                            );
                         }
                     };
 
@@ -778,6 +779,125 @@ fn v2_copy_records(
             Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
         },
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Copy live records and tombstones into a replacement log.
+///
+/// Returns `{:ok, [{new_offset, new_size}, ...]}` for live offsets only, in
+/// the same order as `live_offsets`. Tombstones are copied in source-offset
+/// order so replay still suppresses older values after compaction.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_copy_records_preserve_tombstones(
+    env: Env<'_>,
+    source_path: String,
+    dest_path: String,
+    live_offsets: Vec<u64>,
+    tombstone_offsets: Vec<u64>,
+) -> NifResult<Term<'_>> {
+    let src = std::path::Path::new(&source_path);
+    let dst = std::path::Path::new(&dest_path);
+
+    let dest_file_id = parse_file_id(dst);
+
+    match copy_records_preserve_tombstones_impl(
+        src,
+        dst,
+        dest_file_id,
+        &live_offsets,
+        &tombstone_offsets,
+    ) {
+        Ok(results) => Ok((atoms::ok(), results).encode(env)),
+        Err(reason) => Ok((atoms::error(), reason).encode(env)),
+    }
+}
+
+fn copy_records_preserve_tombstones_impl(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    dest_file_id: u64,
+    live_offsets: &[u64],
+    tombstone_offsets: &[u64],
+) -> std::result::Result<Vec<(u64, u64)>, String> {
+    let mut reader = log::LogReader::open(src).map_err(|e| e.to_string())?;
+    let mut writer = log::LogWriter::open(dst, dest_file_id).map_err(|e| e.to_string())?;
+
+    let live_set: std::collections::HashSet<u64> = live_offsets.iter().copied().collect();
+    let mut all_offsets = live_offsets.to_vec();
+    all_offsets.extend(tombstone_offsets);
+    all_offsets.sort_unstable();
+    all_offsets.dedup();
+
+    let mut live_results: std::collections::HashMap<u64, (u64, u64)> =
+        std::collections::HashMap::with_capacity(live_offsets.len());
+
+    for offset in all_offsets {
+        match reader.read_at(offset) {
+            Ok(Some(record)) => {
+                if let Some(ref value) = record.value {
+                    let new_offset = writer
+                        .write(&record.key, value, record.expire_at_ms)
+                        .map_err(|e| e.to_string())?;
+
+                    if live_set.contains(&offset) {
+                        let new_size = (log::HEADER_SIZE + record.key.len() + value.len()) as u64;
+                        live_results.insert(offset, (new_offset, new_size));
+                    }
+                } else {
+                    writer
+                        .write_tombstone(&record.key)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+
+    writer.sync().map_err(|e| e.to_string())?;
+
+    Ok(live_offsets
+        .iter()
+        .filter_map(|offset| live_results.get(offset).copied())
+        .collect())
+}
+
+#[cfg(test)]
+mod copy_records_preserve_tombstones_tests {
+    use super::*;
+
+    #[test]
+    fn copies_live_records_and_tombstones_in_replay_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("00001.log");
+        let dest = dir.path().join("compact_1.log");
+
+        let mut writer = log::LogWriter::open(&source, 1).unwrap();
+        let live_offset = writer.write(b"b", b"live", 0).unwrap();
+        let tombstone_offset = writer.write_tombstone(b"a").unwrap();
+        writer.sync().unwrap();
+
+        let results = copy_records_preserve_tombstones_impl(
+            &source,
+            &dest,
+            1,
+            &[live_offset],
+            &[tombstone_offset],
+        )
+        .unwrap();
+
+        assert_eq!(1, results.len());
+
+        let mut reader = log::LogReader::open(&dest).unwrap();
+        let first = reader.read_at(results[0].0).unwrap().unwrap();
+        assert_eq!(b"b", first.key.as_slice());
+        assert_eq!(Some(b"live".to_vec()), first.value);
+
+        let tombstone_new_offset = (log::HEADER_SIZE + b"b".len() + b"live".len()) as u64;
+        let second = reader.read_at(tombstone_new_offset).unwrap().unwrap();
+        assert_eq!(b"a", second.key.as_slice());
+        assert!(second.value.is_none());
     }
 }
 

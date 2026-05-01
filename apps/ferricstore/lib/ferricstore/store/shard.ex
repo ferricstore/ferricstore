@@ -652,7 +652,21 @@ defmodule Ferricstore.Store.Shard do
 
           dest = Path.join(sp, "compact_#{fid}.log")
 
-          case NIF.v2_copy_records(source, dest, offsets) do
+          tombstone_offsets = tombstone_offsets(source)
+
+          copy_result =
+            if tombstone_offsets == [] do
+              NIF.v2_copy_records(source, dest, offsets)
+            else
+              NIF.v2_copy_records_preserve_tombstones(
+                source,
+                dest,
+                offsets,
+                tombstone_offsets
+              )
+            end
+
+          case copy_result do
             {:ok, results} when length(results) == length(live_entries) ->
               remove_hint_for_file(sp, fid)
               Ferricstore.FS.rename!(dest, source)
@@ -903,6 +917,16 @@ defmodule Ferricstore.Store.Shard do
     case NIF.v2_scan_tombstones(path) do
       {:ok, [_ | _]} -> true
       _ -> false
+    end
+  end
+
+  defp tombstone_offsets(path) do
+    case NIF.v2_scan_tombstones(path) do
+      {:ok, tombstones} ->
+        Enum.map(tombstones, fn {_key, offset, _record_size, _expire_at_ms} -> offset end)
+
+      _ ->
+        []
     end
   end
 
