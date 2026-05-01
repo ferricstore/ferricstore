@@ -332,6 +332,34 @@ defmodule Ferricstore.Store.PromotionTest do
                |> Map.new(fn [field, value] -> {field, value} end)
                |> Map.get("field_1")
     end
+
+    test "cross-shard transaction HGET reads cold promoted field from dedicated storage" do
+      store = real_store()
+      key = ukey("cross_tx_hget_cold_promoted")
+      ctx = FerricStore.Instance.get(:default)
+      idx = Router.shard_for(ctx, key)
+      keydir = elem(ctx.keydir_refs, idx)
+      compound_key = CompoundKey.hash_field(key, "field_1")
+
+      other_key =
+        Enum.find_value(0..100_000, fn i ->
+          candidate = "cross_tx_other_#{System.unique_integer([:positive])}_#{i}"
+          if Router.shard_for(ctx, candidate) != idx, do: candidate
+        end)
+
+      populate_hash(store, key, @test_threshold + 1)
+      assert promoted?(key)
+
+      [{^compound_key, _value, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, compound_key)
+      :ets.insert(keydir, {compound_key, nil, exp, lfu, fid, off, vsize})
+
+      assert {:ok, ["value_1", :ok]} =
+               FerricStore.multi(fn tx ->
+                 tx
+                 |> FerricStore.Tx.hget(key, "field_1")
+                 |> FerricStore.Tx.set(other_key, "touch")
+               end)
+    end
   end
 
   # ---------------------------------------------------------------------------

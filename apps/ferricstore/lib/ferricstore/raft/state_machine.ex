@@ -68,7 +68,7 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.CommandTime
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{BitcaskWriter, LFU, ListOps, Router, ValueCodec}
+  alias Ferricstore.Store.{BitcaskWriter, LFU, ListOps, Promotion, Router, ValueCodec}
 
   @default_release_cursor_interval 20_000
 
@@ -1084,12 +1084,20 @@ defmodule Ferricstore.Raft.StateMachine do
   defp build_cross_shard_store(shard_idx, anchor_state) do
     instance_ctx = anchor_state.instance_ctx
 
+    data_dir =
+      if instance_ctx do
+        instance_ctx.data_dir
+      else
+        anchor_state.data_dir
+      end
+
     ctx =
       if shard_idx == anchor_state.shard_index do
         %{
           instance_ctx: instance_ctx,
           keydir: anchor_state.ets,
           index: shard_idx,
+          data_dir: data_dir,
           shard_data_path: anchor_state.shard_data_path,
           active_file_path: anchor_state.active_file_path,
           active_file_id: anchor_state.active_file_id
@@ -1109,6 +1117,7 @@ defmodule Ferricstore.Raft.StateMachine do
           instance_ctx: instance_ctx,
           keydir: keydir,
           index: shard_idx,
+          data_dir: data_dir,
           shard_data_path: shard_data_path,
           active_file_path: file_path,
           active_file_id: file_id
@@ -1293,13 +1302,6 @@ defmodule Ferricstore.Raft.StateMachine do
       {:ok, byte_size(new_val)}
     end
 
-    data_dir =
-      if instance_ctx do
-        instance_ctx.data_dir
-      else
-        Application.get_env(:ferricstore, :data_dir, "data")
-      end
-
     %{
       get: local_get,
       get_meta: local_get_meta,
@@ -1329,11 +1331,11 @@ defmodule Ferricstore.Raft.StateMachine do
         Router.ratelimit_add(instance_ctx, key, window_ms, max, count)
       end,
       list_op: fn key, op -> Router.list_op(instance_ctx, key, op) end,
-      compound_get: fn _redis_key, compound_key ->
-        cross_shard_ets_read(ctx, compound_key)
+      compound_get: fn redis_key, compound_key ->
+        cross_shard_compound_read(ctx, redis_key, compound_key)
       end,
-      compound_get_meta: fn _redis_key, compound_key ->
-        cross_shard_ets_read_meta(ctx, compound_key)
+      compound_get_meta: fn redis_key, compound_key ->
+        cross_shard_compound_read_meta(ctx, redis_key, compound_key)
       end,
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
         local_put.(compound_key, value, expire_at_ms)
@@ -1341,8 +1343,8 @@ defmodule Ferricstore.Raft.StateMachine do
       compound_delete: fn _redis_key, compound_key ->
         local_delete.(compound_key)
       end,
-      compound_scan: fn _redis_key, prefix ->
-        cross_shard_prefix_scan(ctx, prefix)
+      compound_scan: fn redis_key, prefix ->
+        cross_shard_compound_scan(ctx, redis_key, prefix)
       end,
       compound_count: fn _redis_key, prefix ->
         cross_shard_prefix_count(ctx.keydir, prefix)
@@ -1370,6 +1372,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Reads a value from a shard's keydir ETS table with cold-read fallback.
   defp cross_shard_ets_read(ctx, key) do
+    cross_shard_ets_read_from_path(ctx, key, ctx.shard_data_path)
+  end
+
+  defp cross_shard_ets_read_from_path(ctx, key, data_path) do
     now = apply_now_ms()
 
     try do
@@ -1378,7 +1384,7 @@ defmodule Ferricstore.Raft.StateMachine do
           value
 
         [{^key, nil, 0, _lfu, fid, off, _vsize}] when is_integer(fid) and fid >= 0 ->
-          path = sm_file_path_from_ctx(ctx, fid)
+          path = sm_file_path_from_path(data_path, fid)
 
           case NIF.v2_pread_at(path, off) do
             {:ok, v} -> v
@@ -1390,7 +1396,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
         [{^key, nil, exp, _lfu, fid, off, _vsize}]
         when exp > now and is_integer(fid) and fid >= 0 ->
-          path = sm_file_path_from_ctx(ctx, fid)
+          path = sm_file_path_from_path(data_path, fid)
 
           case NIF.v2_pread_at(path, off) do
             {:ok, v} -> v
@@ -1407,6 +1413,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Reads value + expire_at_ms from a shard's keydir ETS table.
   defp cross_shard_ets_read_meta(ctx, key) do
+    cross_shard_ets_read_meta_from_path(ctx, key, ctx.shard_data_path)
+  end
+
+  defp cross_shard_ets_read_meta_from_path(ctx, key, data_path) do
     now = apply_now_ms()
 
     try do
@@ -1415,7 +1425,7 @@ defmodule Ferricstore.Raft.StateMachine do
           {value, 0}
 
         [{^key, nil, 0, _lfu, fid, off, _vsize}] when is_integer(fid) and fid >= 0 ->
-          path = sm_file_path_from_ctx(ctx, fid)
+          path = sm_file_path_from_path(data_path, fid)
 
           case NIF.v2_pread_at(path, off) do
             {:ok, v} -> {v, 0}
@@ -1427,7 +1437,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
         [{^key, nil, exp, _lfu, fid, off, _vsize}]
         when exp > now and is_integer(fid) and fid >= 0 ->
-          path = sm_file_path_from_ctx(ctx, fid)
+          path = sm_file_path_from_path(data_path, fid)
 
           case NIF.v2_pread_at(path, off) do
             {:ok, v} -> {v, exp}
@@ -1443,6 +1453,10 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp cross_shard_prefix_scan(ctx, prefix) do
+    cross_shard_prefix_scan_from_path(ctx, prefix, ctx.shard_data_path)
+  end
+
+  defp cross_shard_prefix_scan_from_path(ctx, prefix, data_path) do
     now = apply_now_ms()
     prefix_len = byte_size(prefix)
 
@@ -1461,7 +1475,7 @@ defmodule Ferricstore.Raft.StateMachine do
         if exp == 0 or exp > now do
           actual_value =
             if value == nil and is_integer(fid) and fid >= 0 do
-              path = sm_file_path_from_ctx(ctx, fid)
+              path = sm_file_path_from_path(data_path, fid)
 
               case NIF.v2_pread_at(path, off) do
                 {:ok, v} -> v
@@ -1491,6 +1505,56 @@ defmodule Ferricstore.Raft.StateMachine do
       ArgumentError -> []
     end
   end
+
+  defp cross_shard_compound_read(ctx, redis_key, compound_key) do
+    case promoted_compound_path(ctx, redis_key, compound_key) do
+      nil -> cross_shard_ets_read(ctx, compound_key)
+      dedicated_path -> cross_shard_ets_read_from_path(ctx, compound_key, dedicated_path)
+    end
+  end
+
+  defp cross_shard_compound_read_meta(ctx, redis_key, compound_key) do
+    case promoted_compound_path(ctx, redis_key, compound_key) do
+      nil -> cross_shard_ets_read_meta(ctx, compound_key)
+      dedicated_path -> cross_shard_ets_read_meta_from_path(ctx, compound_key, dedicated_path)
+    end
+  end
+
+  defp cross_shard_compound_scan(ctx, redis_key, prefix) do
+    case promoted_compound_path(ctx, redis_key, prefix) do
+      nil -> cross_shard_prefix_scan(ctx, prefix)
+      dedicated_path -> cross_shard_prefix_scan_from_path(ctx, prefix, dedicated_path)
+    end
+  end
+
+  defp promoted_compound_path(ctx, redis_key, compound_key_or_prefix) do
+    case compound_type_from_key(compound_key_or_prefix) do
+      nil ->
+        nil
+
+      type ->
+        path = Promotion.dedicated_path(promoted_data_dir(ctx), ctx.index, type, redis_key)
+        if Ferricstore.FS.dir?(path), do: path, else: nil
+    end
+  end
+
+  defp promoted_data_dir(%{data_dir: data_dir}) do
+    cond do
+      Ferricstore.FS.dir?(Path.join(data_dir, "dedicated")) ->
+        data_dir
+
+      Ferricstore.FS.dir?(Path.join(Path.dirname(data_dir), "dedicated")) ->
+        Path.dirname(data_dir)
+
+      true ->
+        data_dir
+    end
+  end
+
+  defp compound_type_from_key("H:" <> _), do: :hash
+  defp compound_type_from_key("S:" <> _), do: :set
+  defp compound_type_from_key("Z:" <> _), do: :zset
+  defp compound_type_from_key(_), do: nil
 
   defp cross_shard_prefix_count(keydir, prefix) do
     prefix_len = byte_size(prefix)
@@ -1535,9 +1599,9 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
-  defp sm_file_path_from_ctx(ctx, file_id) do
+  defp sm_file_path_from_path(data_path, file_id) do
     Path.join(
-      ctx.shard_data_path,
+      data_path,
       "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
     )
   end
