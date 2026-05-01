@@ -412,22 +412,21 @@ defmodule Ferricstore.Store.BitcaskWriter do
         # Update ETS entries with real file_id and offset.
         Enum.zip(write_entries, locations)
         |> Enum.each(fn {entry, {offset, _record_size}} ->
-          {_tag, _ctx, _path, file_id, ets, key, value, _exp} = normalize_write_entry(entry)
+          {_tag, _ctx, _path, file_id, ets, key, value, exp} = normalize_write_entry(entry)
           bin_value = to_binary(value)
           vsize = byte_size(bin_value)
 
-          # Only update if the key still exists in ETS and still has :pending.
-          # A DELETE may have removed it between the cast and now.
+          # Only update if the key still has the same pending value/expiry
+          # this writer persisted. Newer pending writes for the same key must
+          # not inherit this older disk location.
           try do
-            case :ets.lookup(ets, key) do
-              [{^key, _v, _e, _lfu, :pending, 0, _vs}] ->
-                :ets.update_element(ets, key, [{5, file_id}, {6, offset}, {7, vsize}])
-
-              _ ->
-                # Key was deleted or already updated (e.g., overwritten by a
-                # newer write that completed synchronously). Skip.
-                :ok
-            end
+            :ets.select_replace(ets, [
+              {
+                {key, bin_value, exp, :"$1", :pending, 0, :_},
+                [],
+                [{{key, bin_value, exp, :"$1", file_id, offset, vsize}}]
+              }
+            ])
           rescue
             ArgumentError -> :ok
           end

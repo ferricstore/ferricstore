@@ -16,6 +16,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.BitcaskWriter
+  alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard
 
   setup do
@@ -152,6 +154,44 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   # ---------------------------------------------------------------------------
 
   describe "shard nosync write path" do
+    test "BitcaskWriter does not attach stale write location to newer pending value" do
+      shard_index = 10_000 + System.unique_integer([:positive])
+      dir = Path.join(System.tmp_dir!(), "bitcask_writer_stale_#{shard_index}")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "00000.log")
+      File.touch!(path)
+
+      keydir = :ets.new(:"bitcask_writer_stale_#{shard_index}", [:set, :public])
+      key = "writer:stale-location"
+
+      {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
+
+      on_exit(fn ->
+        if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+
+        try do
+          :ets.delete(keydir)
+        rescue
+          ArgumentError -> :ok
+        end
+
+        File.rm_rf(dir)
+      end)
+
+      :ets.insert(keydir, {key, "new", 456, LFU.initial(), :pending, 0, 0})
+
+      :sys.replace_state(writer, fn state ->
+        %{
+          state
+          | pending: [{:write, nil, path, 0, keydir, key, "old", 123}],
+            pending_count: 1
+        }
+      end)
+
+      assert :ok == BitcaskWriter.flush(shard_index)
+      assert [{^key, "new", 456, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, key)
+    end
+
     test "put is readable immediately via ETS (before fsync)" do
       {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 100)
       on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
