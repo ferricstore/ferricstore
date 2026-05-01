@@ -3,10 +3,9 @@ defmodule Ferricstore.Commands.Geo do
   Handles Redis geo commands: GEOADD, GEOPOS, GEODIST, GEOHASH, GEOSEARCH,
   GEOSEARCHSTORE.
 
-  Geo is implemented on top of Sorted Set. Members are stored with
-  geohash-encoded float64 scores -- the same encoding Redis uses, making
-  scores wire-compatible. No new data structure is needed. The storage format
-  is `{:zset, [{score, member}, ...]}` serialized via `:erlang.term_to_binary/1`.
+  Geo is implemented on top of Sorted Set. Members are stored as compound zset
+  entries with geohash-encoded float64 scores -- the same encoding Redis uses,
+  making scores wire-compatible. No new data structure is needed.
 
   ## Geohash encoding
 
@@ -306,7 +305,7 @@ defmodule Ferricstore.Commands.Geo do
   def read_zset(store, key) do
     case read_compound_zset(store, key) do
       {:ok, zset} -> {:ok, zset}
-      :missing -> read_legacy_zset(store, key)
+      :missing -> {:ok, []}
       {:error, _} = err -> err
     end
   end
@@ -320,10 +319,7 @@ defmodule Ferricstore.Commands.Geo do
         {:ok, load_compound_zset(store, key, prefix)}
 
       nil ->
-        case Ops.compound_scan(store, key, prefix) do
-          [] -> :missing
-          entries -> {:ok, parse_compound_zset(entries)}
-        end
+        if Ops.exists?(store, key), do: {:error, @wrongtype_msg}, else: :missing
 
       _other ->
         {:error, @wrongtype_msg}
@@ -350,26 +346,6 @@ defmodule Ferricstore.Commands.Geo do
     |> Enum.sort()
   end
 
-  defp read_legacy_zset(store, key) do
-    case Ops.get(store, key) do
-      nil -> {:ok, []}
-      value when is_binary(value) -> decode_zset(value)
-    end
-  end
-
-  defp decode_zset(value) do
-    case safe_decode(value) do
-      {:zset, list} -> {:ok, list}
-      _ -> {:error, @wrongtype_msg}
-    end
-  end
-
-  defp safe_decode(binary) do
-    :erlang.binary_to_term(binary)
-  rescue
-    ArgumentError -> :not_a_term
-  end
-
   defp write_zset(store, key, zset) do
     with :ok <- ensure_zset_type(store, key) do
       prefix = CompoundKey.zset_prefix(key)
@@ -393,7 +369,7 @@ defmodule Ferricstore.Commands.Geo do
         )
       end)
 
-      Ops.put(store, key, :erlang.term_to_binary({:zset, zset}), 0)
+      :ok
     end
   end
 
@@ -420,20 +396,7 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp ensure_zset_type(store, key) do
-    case TypeRegistry.check_or_set(key, :zset, store) do
-      :ok ->
-        :ok
-
-      {:error, _} = err ->
-        case read_legacy_zset(store, key) do
-          {:ok, _zset} ->
-            Ops.delete(store, key)
-            TypeRegistry.check_or_set(key, :zset, store)
-
-          _ ->
-            err
-        end
-    end
+    TypeRegistry.check_or_set(key, :zset, store)
   end
 
   defp zset_to_member_map(zset) do

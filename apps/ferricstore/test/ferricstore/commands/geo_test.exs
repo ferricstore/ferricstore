@@ -8,6 +8,7 @@ defmodule Ferricstore.Commands.GeoTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.{Geo, SortedSet}
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
   # ===========================================================================
@@ -15,15 +16,18 @@ defmodule Ferricstore.Commands.GeoTest do
   # ===========================================================================
 
   defp store_with_geo(key, members) do
-    pairs =
-      Enum.map(members, fn {lng, lat, name} ->
-        score = Geo.geohash_encode(lng, lat)
-        {score, name}
-      end)
-      |> Enum.sort()
+    store = MockStore.make()
 
-    value = :erlang.term_to_binary({:zset, pairs})
-    MockStore.make(%{key => {value, 0}})
+    args =
+      Enum.flat_map(members, fn {lng, lat, name} ->
+        [to_string(lng), to_string(lat), name]
+      end)
+
+    if args != [] do
+      Geo.handle("GEOADD", [key | args], store)
+    end
+
+    store
   end
 
   defp store_with_string(key, value) do
@@ -235,7 +239,22 @@ defmodule Ferricstore.Commands.GeoTest do
     test "creates key if non-existent" do
       store = MockStore.make()
       assert 1 == Geo.handle("GEOADD", ["newgeo", "10.0", "20.0", "place"], store)
-      assert store.get.("newgeo") != nil
+      assert store.compound_get.("newgeo", CompoundKey.type_key("newgeo")) == "zset"
+    end
+
+    test "does not treat a plain serialized zset value as geo data" do
+      score = Geo.geohash_encode(@palermo_lng, @palermo_lat)
+      encoded = :erlang.term_to_binary({:zset, [{score, "Palermo"}]})
+      store = MockStore.make(%{"plain" => {encoded, 0}})
+
+      assert {:error, "WRONGTYPE" <> _} = Geo.handle("GEOPOS", ["plain", "Palermo"], store)
+    end
+
+    test "geo read path has no serialized zset fallback" do
+      source = File.read!(app_path("lib/ferricstore/commands/geo.ex"))
+
+      refute source =~ "read_legacy_zset"
+      refute source =~ "binary_to_term"
     end
 
     test "rejects invalid coordinates" do
@@ -274,6 +293,8 @@ defmodule Ferricstore.Commands.GeoTest do
       assert msg =~ "WRONGTYPE"
     end
   end
+
+  defp app_path(path), do: Path.expand("../../../#{path}", __DIR__)
 
   # ===========================================================================
   # GEOPOS
@@ -732,11 +753,9 @@ defmodule Ferricstore.Commands.GeoTest do
 
       assert count == 2
 
-      # Verify the destination has a valid zset
-      raw = store.get.("dst")
-      assert raw != nil
-      {:zset, entries} = :erlang.binary_to_term(raw)
-      members = Enum.map(entries, fn {_score, m} -> m end)
+      # Verify the destination has a valid compound zset.
+      assert store.compound_get.("dst", CompoundKey.type_key("dst")) == "zset"
+      members = SortedSet.handle("ZRANGE", ["dst", "0", "-1"], store)
       assert "Palermo" in members
       assert "Catania" in members
     end
