@@ -335,6 +335,34 @@ defmodule Ferricstore.Store.PromotionTest do
         assert Map.get(pairs, "field_#{i}") == "value_#{i}"
       end
     end
+
+    test "HGETALL includes fields that were cold before promotion" do
+      store = real_store()
+      key = ukey("hgetall_cold_before_promoted")
+      ctx = FerricStore.Instance.get(:default)
+      idx = Router.shard_for(ctx, key)
+      shard = Router.shard_name(ctx, idx)
+      keydir = elem(ctx.keydir_refs, idx)
+
+      populate_hash(store, key, @test_threshold)
+      refute promoted?(key)
+      :ok = GenServer.call(shard, :flush)
+
+      cold_field_key = CompoundKey.hash_field(key, "field_1")
+      [{^cold_field_key, _value, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, cold_field_key)
+      :ets.insert(keydir, {cold_field_key, nil, exp, lfu, fid, off, vsize})
+
+      assert 1 == Hash.handle("HSET", [key, "extra_field", "extra_value"], store)
+      assert promoted?(key)
+
+      result =
+        Hash.handle("HGETALL", [key], store)
+        |> Enum.chunk_every(2)
+        |> Map.new(fn [field, value] -> {field, value} end)
+
+      assert result["field_1"] == "value_1"
+      assert result["extra_field"] == "extra_value"
+    end
   end
 
   # ---------------------------------------------------------------------------

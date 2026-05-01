@@ -122,9 +122,12 @@ defmodule Ferricstore.Store.Promotion do
 
     entries =
       :ets.foldl(
-        fn {key, value, exp, _lfu, _fid, _off, _vsize}, acc ->
-          if is_binary(key) and value != nil and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
-            [{key, value, exp} | acc]
+        fn {key, value, exp, _lfu, fid, off, _vsize}, acc ->
+          if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+            case promotion_entry_value(shard_data_path, value, fid, off) do
+              nil -> acc
+              live_value -> [{key, live_value, exp} | acc]
+            end
           else
             acc
           end
@@ -395,6 +398,21 @@ defmodule Ferricstore.Store.Promotion do
   defp compound_prefix_for(:hash, redis_key), do: CompoundKey.hash_prefix(redis_key)
   defp compound_prefix_for(:set, redis_key), do: CompoundKey.set_prefix(redis_key)
   defp compound_prefix_for(:zset, redis_key), do: CompoundKey.zset_prefix(redis_key)
+
+  defp promotion_entry_value(_shard_data_path, value, _fid, _off) when value != nil, do: value
+
+  defp promotion_entry_value(shard_data_path, nil, fid, off)
+       when is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 do
+    file_path =
+      Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+
+    case NIF.v2_pread_at(file_path, off) do
+      {:ok, value} when value != nil -> value
+      _ -> nil
+    end
+  end
+
+  defp promotion_entry_value(_shard_data_path, _value, _fid, _off), do: nil
 
   @spec type_label(atom()) :: binary()
   defp type_label(:hash), do: "hash"
