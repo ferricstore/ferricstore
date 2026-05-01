@@ -37,6 +37,14 @@ defmodule Ferricstore.InstanceTest do
       assert map == %{"f1" => "v1", "f2" => "v2"}
     end
 
+    test "hash read operations return WRONGTYPE directly" do
+      ctx = FerricStore.Instance.get(:default)
+      assert :ok = FerricStore.Impl.set(ctx, "impl_hash:string", "plain")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.Impl.hget(ctx, "impl_hash:string", "f")
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.Impl.hexists(ctx, "impl_hash:string", "f")
+    end
+
     test "set operations" do
       ctx = FerricStore.Instance.get(:default)
       assert {:ok, 3} = FerricStore.Impl.sadd(ctx, "impl_set", ["a", "b", "c"])
@@ -45,10 +53,24 @@ defmodule Ferricstore.InstanceTest do
       assert {:ok, 3} = FerricStore.Impl.scard(ctx, "impl_set")
     end
 
+    test "set read operations return WRONGTYPE directly" do
+      ctx = FerricStore.Instance.get(:default)
+      assert :ok = FerricStore.Impl.set(ctx, "impl_set:string", "plain")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.Impl.sismember(ctx, "impl_set:string", "a")
+    end
+
     test "list operations" do
       ctx = FerricStore.Instance.get(:default)
       assert {:ok, 3} = FerricStore.Impl.lpush(ctx, "impl_list", ["a", "b", "c"])
       assert {:ok, 3} = FerricStore.Impl.llen(ctx, "impl_list")
+    end
+
+    test "sorted set read operations return WRONGTYPE directly" do
+      ctx = FerricStore.Instance.get(:default)
+      assert :ok = FerricStore.Impl.set(ctx, "impl_zset:string", "plain")
+
+      assert {:error, "WRONGTYPE" <> _} = FerricStore.Impl.zscore(ctx, "impl_zset:string", "a")
     end
 
     test "bloom filter" do

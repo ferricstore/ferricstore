@@ -226,11 +226,12 @@ defmodule FerricStore.Impl do
     wrap_result(result)
   end
 
-  @spec hget(FerricStore.Instance.t(), binary(), binary()) :: {:ok, binary() | nil}
+  @spec hget(FerricStore.Instance.t(), binary(), binary()) ::
+          {:ok, binary() | nil} | {:error, binary()}
   def hget(ctx, key, field) do
     store = build_store(ctx)
     result = Ferricstore.Commands.Hash.handle("HGET", [key, to_string(field)], store)
-    {:ok, result}
+    wrap_result(result)
   end
 
   @spec hgetall(FerricStore.Instance.t(), binary()) :: {:ok, map()} | {:error, binary()}
@@ -254,11 +255,16 @@ defmodule FerricStore.Impl do
     wrap_result(result)
   end
 
-  @spec hexists(FerricStore.Instance.t(), binary(), binary()) :: {:ok, boolean()}
+  @spec hexists(FerricStore.Instance.t(), binary(), binary()) ::
+          {:ok, boolean()} | {:error, binary()}
   def hexists(ctx, key, field) do
     store = build_store(ctx)
     result = Ferricstore.Commands.Hash.handle("HEXISTS", [key, to_string(field)], store)
-    {:ok, result == 1}
+
+    case result do
+      {:error, _} = err -> err
+      value -> {:ok, value == 1}
+    end
   end
 
   @spec hlen(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
@@ -301,11 +307,16 @@ defmodule FerricStore.Impl do
     wrap_result(result)
   end
 
-  @spec sismember(FerricStore.Instance.t(), binary(), binary()) :: {:ok, boolean()}
+  @spec sismember(FerricStore.Instance.t(), binary(), binary()) ::
+          {:ok, boolean()} | {:error, binary()}
   def sismember(ctx, key, member) do
     store = build_store(ctx)
     result = Ferricstore.Commands.Set.handle("SISMEMBER", [key, to_string(member)], store)
-    {:ok, result == 1}
+
+    case result do
+      {:error, _} = err -> err
+      value -> {:ok, value == 1}
+    end
   end
 
   @spec scard(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
@@ -404,11 +415,11 @@ defmodule FerricStore.Impl do
     wrap_result(result)
   end
 
-  @spec zscore(FerricStore.Instance.t(), binary(), binary()) :: {:ok, term()}
+  @spec zscore(FerricStore.Instance.t(), binary(), binary()) :: {:ok, term()} | {:error, binary()}
   def zscore(ctx, key, member) do
     store = build_store(ctx)
     result = Ferricstore.Commands.SortedSet.handle("ZSCORE", [key, to_string(member)], store)
-    {:ok, result}
+    wrap_result(result)
   end
 
   @spec zrange(FerricStore.Instance.t(), binary(), integer(), integer(), keyword()) :: {:ok, term()} | {:error, binary()}
