@@ -14,15 +14,6 @@ defmodule Ferricstore.DataDir do
     hints/                           (hot cache warm-up files)
   ```
 
-  ## Backward compatibility
-
-  Before this layout was introduced, shard data was stored directly under
-  `data_dir/shard_N/`. For backward compatibility, `shard_data_path/2` checks
-  whether the legacy `data_dir/shard_N/` directory already exists. If it does,
-  that path is returned so that existing data is not orphaned. For fresh
-  installs (where no legacy directory exists), the new canonical path
-  `data_dir/data/shard_N/` is used.
-
   ## Usage
 
   Call `ensure_layout!/2` during application startup to create all placeholder
@@ -79,12 +70,7 @@ defmodule Ferricstore.DataDir do
   end
 
   @doc """
-  Returns the Bitcask data path for a given shard index, respecting backward
-  compatibility.
-
-  If the legacy path `data_dir/shard_N/` already exists on disk, it is
-  returned to avoid orphaning existing data. Otherwise the canonical path
-  `data_dir/data/shard_N/` is returned.
+  Returns the canonical Bitcask data path for a given shard index.
 
   ## Parameters
 
@@ -93,24 +79,13 @@ defmodule Ferricstore.DataDir do
 
   ## Examples
 
-      # Legacy directory exists on disk:
-      iex> Ferricstore.DataDir.shard_data_path("/tmp/fs", 0)
-      "/tmp/fs/shard_0"
-
-      # Fresh install (no legacy directory):
       iex> Ferricstore.DataDir.shard_data_path("/tmp/fs_new", 0)
       "/tmp/fs_new/data/shard_0"
 
   """
   @spec shard_data_path(binary(), non_neg_integer()) :: binary()
   def shard_data_path(data_dir, shard_index) do
-    legacy_path = Path.join(data_dir, "shard_#{shard_index}")
-
-    if Ferricstore.FS.dir?(legacy_path) do
-      legacy_path
-    else
-      Path.join([data_dir, "data", "shard_#{shard_index}"])
-    end
+    Path.join([data_dir, "data", "shard_#{shard_index}"])
   end
 
   @doc """

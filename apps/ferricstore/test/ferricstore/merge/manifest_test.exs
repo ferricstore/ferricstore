@@ -253,26 +253,26 @@ defmodule Ferricstore.Merge.ManifestTest do
       refute File.exists?(Path.join(shard_dir, "compact_1.log"))
     end
 
-    test "manifest write and read with legacy shard path" do
+    test "canonical shard path wins even if stale root shard directory exists" do
       root =
-        Path.join(System.tmp_dir!(), "manifest_legacy_#{:erlang.unique_integer([:positive])}")
+        Path.join(System.tmp_dir!(), "manifest_canonical_#{:erlang.unique_integer([:positive])}")
 
       on_exit(fn -> File.rm_rf(root) end)
 
-      # Create a legacy directory before layout.
-      legacy = Path.join(root, "shard_0")
-      File.mkdir_p!(legacy)
+      stale_root_shard = Path.join(root, "shard_0")
+      File.mkdir_p!(stale_root_shard)
 
       :ok = Ferricstore.DataDir.ensure_layout!(root, 4)
 
       shard_dir = Ferricstore.DataDir.shard_data_path(root, 0)
-      assert shard_dir == legacy, "should resolve to legacy path"
+      assert shard_dir == Path.join([root, "data", "shard_0"])
 
       plan = %{shard_index: 0, input_file_ids: [7, 8]}
       assert :ok = Manifest.write(shard_dir, plan)
 
       {:ok, read_plan} = Manifest.read(shard_dir)
       assert read_plan.input_file_ids == [7, 8]
+      refute Manifest.exists?(stale_root_shard)
 
       assert :ok = Manifest.delete(shard_dir)
       refute Manifest.exists?(shard_dir)
