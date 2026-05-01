@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.ShardTest do
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Store.DiskPressure
   alias Ferricstore.Test.IsolatedInstance
 
   setup do
@@ -43,6 +44,22 @@ defmodule Ferricstore.Store.ShardTest do
       future = System.os_time(:millisecond) + 60_000
       :ok = GenServer.call(shard, {:put, "key", "value", future})
       assert "value" == GenServer.call(shard, {:get, "key"})
+    end
+  end
+
+  describe "disk pressure" do
+    test "frag_check does not clear pressure without a successful disk write", %{
+      shard: shard,
+      ctx: ctx
+    } do
+      DiskPressure.set(ctx, 0)
+
+      send(shard, :frag_check)
+      :sys.get_state(shard)
+
+      assert DiskPressure.under_pressure?(ctx, 0)
+    after
+      DiskPressure.clear(ctx, 0)
     end
   end
 
@@ -109,7 +126,8 @@ defmodule Ferricstore.Store.ShardTest do
     test "put immediately populates ETS", %{shard: shard, keydir: keydir} do
       :ok = GenServer.call(shard, {:put, "cached_key", "val", 0})
       # Single-table format: {key, value, expire_at_ms, lfu_counter}
-      assert [{"cached_key", "val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, "cached_key")
+      assert [{"cached_key", "val", 0, _lfu, _fid, _off, _vsize}] =
+               :ets.lookup(keydir, "cached_key")
     end
 
     @tag :shard_kill
@@ -125,7 +143,9 @@ defmodule Ferricstore.Store.ShardTest do
       :ets.insert(keydir, {"warm_key", nil, exp, lfu, fid, off, vsize})
       # Now get — should fetch from Bitcask and warm ETS
       assert "warm_val" == GenServer.call(shard, {:get, "warm_key"})
-      assert [{"warm_key", "warm_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, "warm_key")
+
+      assert [{"warm_key", "warm_val", 0, _lfu, _fid, _off, _vsize}] =
+               :ets.lookup(keydir, "warm_key")
     end
 
     test "delete evicts ETS entry", %{shard: shard, keydir: keydir} do
@@ -139,7 +159,9 @@ defmodule Ferricstore.Store.ShardTest do
       :ok = GenServer.call(shard, {:put, "exp_key", "val", past})
       # Confirm entry is in ETS (put always writes to ETS)
       # Single-table format: {key, value, expire_at_ms, lfu_counter}
-      assert [{"exp_key", "val", ^past, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, "exp_key")
+      assert [{"exp_key", "val", ^past, _lfu, _fid, _off, _vsize}] =
+               :ets.lookup(keydir, "exp_key")
+
       # get should detect expiry and evict
       assert nil == GenServer.call(shard, {:get, "exp_key"})
       assert [] == :ets.lookup(keydir, "exp_key")

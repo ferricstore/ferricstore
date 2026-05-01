@@ -1009,12 +1009,9 @@ defmodule Ferricstore.Store.Shard do
 
   # Periodic fragmentation re-evaluation for idle shards.
   # Catches shards that accumulated dead data then stopped receiving writes.
-  # Also clears disk pressure flag periodically so writes can probe recovery.
+  # Disk pressure is intentionally not cleared here; only a successful append or
+  # fsync proves that the shard can accept async writes again.
   def handle_info(:frag_check, state) do
-    if Ferricstore.Store.DiskPressure.under_pressure?(state.instance_ctx, state.index) do
-      Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
-    end
-
     state = maybe_notify_fragmentation(state)
     ShardLifecycle.schedule_frag_check()
     {:noreply, state}
