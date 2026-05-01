@@ -167,6 +167,48 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert {:ok, []} = NIF.v2_scan_file(active_file_path)
     end
+
+    test "replays origin async DELETE when recovery still has an older value", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      {:ok, [{old_offset, old_size}]} =
+        NIF.v2_append_batch(active_file_path, [{"origin_delete", "old", 0}])
+
+      :ets.insert(ets, {"origin_delete", nil, 0, 1, 0, old_offset, old_size})
+
+      {_state2, :ok} =
+        StateMachine.apply(%{}, {:async, node(), {:delete, "origin_delete"}}, state)
+
+      assert [] == :ets.lookup(ets, "origin_delete")
+      assert {:ok, records} = NIF.v2_scan_file(active_file_path)
+
+      assert Enum.any?(records, fn {"origin_delete", _off, _size, _exp, tombstone?} ->
+               tombstone?
+             end)
+    end
+
+    test "replays origin async GETDEL when recovery still has an older value", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      {:ok, [{old_offset, old_size}]} =
+        NIF.v2_append_batch(active_file_path, [{"origin_getdel", "old", 0}])
+
+      :ets.insert(ets, {"origin_getdel", nil, 0, 1, 0, old_offset, old_size})
+
+      {_state2, "old"} =
+        StateMachine.apply(%{}, {:async, node(), {:getdel, "origin_getdel"}}, state)
+
+      assert [] == :ets.lookup(ets, "origin_getdel")
+      assert {:ok, records} = NIF.v2_scan_file(active_file_path)
+
+      assert Enum.any?(records, fn {"origin_getdel", _off, _size, _exp, tombstone?} ->
+               tombstone?
+             end)
+    end
   end
 
   # ---------------------------------------------------------------------------
