@@ -1,5 +1,6 @@
 defmodule Ferricstore.Store.AsyncLargeValueTest do
   use ExUnit.Case, async: false
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
 
   setup do
@@ -128,13 +129,29 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
 
       :ok = Router.put(ctx, key, value, 0)
       assert_cold_key(key)
+      :ok = Batcher.flush(idx)
+
+      handler_id = {:async_large_value, self(), make_ref()}
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :batcher, :async_flush],
+        fn _event, _measurements, meta, test_pid ->
+          if meta.shard_index == idx and meta.origin do
+            send(test_pid, :unexpected_async_flush)
+          end
+        end,
+        self()
+      )
 
       Ferricstore.Store.ActiveFile.publish(idx, file_id, missing_path, Path.dirname(missing_path))
 
       try do
         assert {:error, "ERR disk write failed" <> _} = FerricStore.append(key, suffix)
         assert {:ok, ^value} = FerricStore.get(key)
+        refute_receive :unexpected_async_flush, 200
       after
+        :telemetry.detach(handler_id)
         Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_path)
       end
     end

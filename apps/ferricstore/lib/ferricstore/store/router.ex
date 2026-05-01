@@ -732,11 +732,50 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp install_rmw_and_submit(ctx, idx, key, value, expire_at_ms, raft_cmd, success) do
-    with :ok <- async_submit_to_raft(idx, raft_cmd),
-         :ok <- install_rmw_value(ctx, idx, key, value, expire_at_ms) do
-      success
+    if large_value_for_hot_cache?(ctx, value) do
+      install_large_rmw_and_submit(ctx, idx, key, value, expire_at_ms, raft_cmd, success)
+    else
+      with :ok <- async_submit_to_raft(idx, raft_cmd),
+           :ok <- install_rmw_value(ctx, idx, key, value, expire_at_ms) do
+        success
+      end
     end
   end
+
+  defp install_large_rmw_and_submit(ctx, idx, key, value, expire_at_ms, raft_cmd, success) do
+    keydir = elem(ctx.keydir_refs, idx)
+    previous = snapshot_live_value(ctx, idx, key)
+    disk_value = to_disk_binary(value)
+
+    case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
+      {:ok, file_id, [{offset, _record_size}]} ->
+        case async_submit_to_raft(idx, raft_cmd) do
+          :ok ->
+            track_keydir_binary_insert(ctx, idx, keydir, key, nil)
+
+            :ets.insert(
+              keydir,
+              {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
+            )
+
+            wv_size = :counters.info(ctx.write_version).size
+            if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+            success
+
+          {:error, _} = err ->
+            rollback_unaccepted_large_put(ctx, idx, key, previous)
+            err
+        end
+
+      {:error, reason} ->
+        {:error, "ERR disk write failed: #{inspect(reason)}"}
+    end
+  end
+
+  defp large_value_for_hot_cache?(ctx, value) when is_binary(value),
+    do: byte_size(value) > ctx.hot_cache_max_value_size
+
+  defp large_value_for_hot_cache?(_ctx, _value), do: false
 
   # Read the live value for a key (treating expired TTL as missing).
   defp read_live(ctx, idx, key) do
