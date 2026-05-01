@@ -3,6 +3,7 @@ defmodule Ferricstore.Commands.SortedSetTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.{Hash, List, Set, SortedSet}
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -206,6 +207,45 @@ defmodule Ferricstore.Commands.SortedSetTest do
       store = MockStore.make()
       SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
       assert 0 == SortedSet.handle("ZREM", ["zs", "missing"], store)
+    end
+
+    test "ZREM batches member existence reads and removes duplicates once" do
+      parent = self()
+      type_key = CompoundKey.type_key("zs")
+
+      member_keys = [
+        CompoundKey.zset_member("zs", "a"),
+        CompoundKey.zset_member("zs", "b"),
+        CompoundKey.zset_member("zs", "missing")
+      ]
+
+      store = %{
+        compound_get: fn
+          "zs", ^type_key ->
+            nil
+
+          "zs", compound_key ->
+            flunk(
+              "ZREM should use compound_batch_get, got per-member lookup #{inspect(compound_key)}"
+            )
+        end,
+        compound_batch_get: fn "zs", ^member_keys ->
+          send(parent, {:compound_batch_get, member_keys})
+          ["1.0", "2.0", nil]
+        end,
+        compound_delete: fn "zs", compound_key ->
+          send(parent, {:compound_delete, compound_key})
+          :ok
+        end,
+        compound_count: fn "zs", _prefix -> 1 end
+      }
+
+      assert 2 == SortedSet.handle("ZREM", ["zs", "a", "a", "b", "missing"], store)
+      assert_received {:compound_batch_get, ^member_keys}
+      assert_received {:compound_delete, deleted_a}
+      assert_received {:compound_delete, deleted_b}
+      assert Enum.sort([deleted_a, deleted_b]) == Enum.sort(Enum.take(member_keys, 2))
+      refute_received {:compound_delete, _}
     end
 
     test "ZREM cleans up type metadata when sorted set becomes empty" do

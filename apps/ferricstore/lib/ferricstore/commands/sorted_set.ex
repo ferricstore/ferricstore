@@ -230,17 +230,23 @@ defmodule Ferricstore.Commands.SortedSet do
 
   def handle("ZREM", [key | members], store) when members != [] do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      removed =
-        Enum.reduce(members, 0, fn member, acc ->
-          compound_key = CompoundKey.zset_member(key, member)
+      compound_keys =
+        members
+        |> Enum.uniq()
+        |> Enum.map(&CompoundKey.zset_member(key, &1))
 
-          if Ops.compound_get(store, key, compound_key) != nil do
-            Ops.compound_delete(store, key, compound_key)
-            acc + 1
-          else
-            acc
-          end
+      removed_keys =
+        store
+        |> Ops.compound_batch_get(key, compound_keys)
+        |> Enum.zip(compound_keys)
+        |> Enum.flat_map(fn
+          {nil, _compound_key} -> []
+          {_value, compound_key} -> [compound_key]
         end)
+
+      Enum.each(removed_keys, &Ops.compound_delete(store, key, &1))
+
+      removed = length(removed_keys)
 
       if removed > 0 do
         prefix = CompoundKey.zset_prefix(key)
