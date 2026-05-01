@@ -698,13 +698,19 @@ defmodule Ferricstore.Store.Shard.Compound do
 
       live_entries =
         :ets.foldl(
-          fn {key, value, exp, _lfu, _fid, _off, _vsize}, acc ->
-            if is_binary(key) and value != nil and String.starts_with?(key, prefix) and
-                 (exp == 0 or exp > now) do
-              [{key, value, exp} | acc]
-            else
+          fn {key, value, exp, _lfu, fid, off, vsize}, acc ->
+            collect_promoted_live_entry(
+              dedicated_path,
+              prefix,
+              now,
+              key,
+              value,
+              exp,
+              fid,
+              off,
+              vsize,
               acc
-            end
+            )
           end,
           [],
           state.keydir
@@ -793,6 +799,46 @@ defmodule Ferricstore.Store.Shard.Compound do
       [{^mk, "zset", _, _, _, _, _}] -> "Z:" <> redis_key <> <<0>>
       _ -> nil
     end
+  end
+
+  defp collect_promoted_live_entry(
+         dedicated_path,
+         prefix,
+         now,
+         key,
+         value,
+         exp,
+         fid,
+         off,
+         vsize,
+         acc
+       ) do
+    cond do
+      not is_binary(key) or not String.starts_with?(key, prefix) ->
+        acc
+
+      exp != 0 and exp <= now ->
+        acc
+
+      value != nil ->
+        [{key, value, exp} | acc]
+
+      valid_promoted_cold_location?(fid, off, vsize) ->
+        file_path = dedicated_file_path(dedicated_path, fid)
+
+        case NIF.v2_pread_at(file_path, off) do
+          {:ok, cold_value} -> [{key, cold_value, exp} | acc]
+          _ -> acc
+        end
+
+      true ->
+        acc
+    end
+  end
+
+  defp valid_promoted_cold_location?(fid, off, vsize) do
+    is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 and is_integer(vsize) and
+      vsize >= 0
   end
 
   @spec maybe_promote(map(), binary(), binary()) :: map()

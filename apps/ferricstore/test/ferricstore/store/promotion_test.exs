@@ -6,6 +6,7 @@ defmodule Ferricstore.Store.PromotionTest do
   alias Ferricstore.Commands.{Hash, List, Set, SortedSet, Strings}
   alias Ferricstore.HLC
   alias Ferricstore.Store.{CompoundKey, Router}
+  alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Test.ShardHelpers
 
   # Use a very low threshold so we can trigger promotion in tests
@@ -243,6 +244,45 @@ defmodule Ferricstore.Store.PromotionTest do
       # Add more fields after promotion
       assert 1 == Hash.handle("HSET", [key, "new_field", "new_value"], store)
       assert "new_value" == Hash.handle("HGET", [key, "new_field"], store)
+    end
+
+    test "dedicated compaction preserves cold large hash fields" do
+      store = real_store()
+      key = ukey("promoted_large_compact")
+      large_value = String.duplicate("x", 70_000)
+
+      populate_hash(store, key, @test_threshold + 1)
+      assert promoted?(key)
+
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      state = :sys.get_state(shard)
+      dedicated_path = state.promoted_instances[key].path
+      compound_key = CompoundKey.hash_field(key, "large_field")
+
+      assert {:ok, {fid, offset, record_size}} =
+               ShardCompound.promoted_write(dedicated_path, compound_key, large_value, 0)
+
+      Ferricstore.Store.Shard.ETS.ets_insert_with_location(
+        state,
+        compound_key,
+        large_value,
+        0,
+        fid,
+        offset,
+        record_size
+      )
+
+      assert [{^compound_key, nil, 0, _, fid, offset, value_size}] =
+               :ets.lookup(state.keydir, compound_key)
+
+      assert is_integer(fid)
+      assert is_integer(offset)
+      assert value_size > 0
+
+      ShardCompound.compact_dedicated(state, key, dedicated_path)
+
+      assert large_value == Hash.handle("HGET", [key, "large_field"], store)
     end
 
     test "HSET updates existing field in promoted hash" do
