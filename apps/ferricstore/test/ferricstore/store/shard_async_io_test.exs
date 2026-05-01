@@ -778,6 +778,60 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   end
 
   describe "hint recovery" do
+    test "supervisor shutdown runs shard terminate and writes active hint" do
+      dir = Path.join(System.tmp_dir!(), "shard_supervised_shutdown_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+
+      name = :"supervised_shutdown_#{:erlang.unique_integer([:positive])}"
+
+      ctx =
+        FerricStore.Instance.build(name,
+          data_dir: dir,
+          shard_count: 1,
+          raft_enabled: false
+        )
+
+      Ferricstore.DataDir.ensure_layout!(dir, 1)
+
+      parent = self()
+      handler_id = {:shard_shutdown_telemetry, self(), make_ref()}
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :shard, :shutdown],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:shard_shutdown, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn ->
+        :telemetry.detach(handler_id)
+        FerricStore.Instance.cleanup(ctx.name)
+        File.rm_rf(dir)
+      end)
+
+      child =
+        {Shard,
+         index: 0, data_dir: dir, flush_interval_ms: 5000, instance_ctx: ctx, raft_enabled: false}
+
+      {:ok, sup} = Supervisor.start_link([child], strategy: :one_for_one)
+      pid = Process.whereis(Router.shard_name(ctx, 0))
+      assert is_pid(pid)
+
+      assert :ok == GenServer.call(pid, {:put, "supervised-hint", "value", 0})
+      assert :ok == GenServer.call(pid, :flush)
+
+      Supervisor.stop(sup)
+
+      assert_receive {:shard_shutdown, [:ferricstore, :shard, :shutdown], measurements,
+                      %{shard_index: 0}},
+                     1_000
+
+      assert measurements.total_duration_us >= 0
+      assert File.exists?(Path.join([dir, "data", "shard_0", "00000.hint"]))
+    end
+
     test "replays tombstones that appear before the last live hinted record" do
       dir = Path.join(System.tmp_dir!(), "hint_tombstone_order_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(dir)

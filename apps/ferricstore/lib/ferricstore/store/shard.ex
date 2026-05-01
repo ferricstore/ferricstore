@@ -140,6 +140,10 @@ defmodule Ferricstore.Store.Shard do
   @impl true
 
   def init(opts) do
+    # Supervised shutdown reaches terminate/2 only when the GenServer traps
+    # exits. That path drains pending writes and writes the active hint file.
+    Process.flag(:trap_exit, true)
+
     index = Keyword.fetch!(opts, :index)
     data_dir = Keyword.fetch!(opts, :data_dir)
     flush_ms = Keyword.get(opts, :flush_interval_ms, @flush_interval_ms)
