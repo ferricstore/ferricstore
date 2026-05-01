@@ -249,6 +249,54 @@ defmodule Ferricstore.Raft.StateMachineTest do
         )
     end
 
+    test "cross-shard GET reads cold value from valid file id zero", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path,
+      shard_index: shard_index
+    } do
+      {:ok, {offset, value_size}} =
+        NIF.v2_append_record(active_file_path, "cross_cold_fid0", "cold-value", 0)
+
+      :ets.insert(
+        ets,
+        {"cross_cold_fid0", nil, 0, Ferricstore.Store.LFU.initial(), 0, offset, value_size}
+      )
+
+      {_new_state, %{^shard_index => ["cold-value"]}} =
+        StateMachine.apply(
+          %{system_time: Ferricstore.HLC.now_ms()},
+          {:cross_shard_tx, [{shard_index, [{"GET", ["cross_cold_fid0"]}], nil}]},
+          state
+        )
+    end
+
+    test "cross-shard PTTL reads cold metadata from valid file id zero", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path,
+      shard_index: shard_index
+    } do
+      now = Ferricstore.HLC.now_ms()
+      expire_at_ms = now + 5_000
+
+      {:ok, {offset, value_size}} =
+        NIF.v2_append_record(active_file_path, "cross_cold_meta_fid0", "cold-meta", expire_at_ms)
+
+      :ets.insert(
+        ets,
+        {"cross_cold_meta_fid0", nil, expire_at_ms, Ferricstore.Store.LFU.initial(), 0, offset,
+         value_size}
+      )
+
+      {_new_state, %{^shard_index => [5_000]}} =
+        StateMachine.apply(
+          %{system_time: now},
+          {:cross_shard_tx, [{shard_index, [{"PTTL", ["cross_cold_meta_fid0"]}], nil}]},
+          state
+        )
+    end
+
     test "stamped ratelimit ignores legacy embedded now_ms", %{
       state: state,
       ets: ets

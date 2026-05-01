@@ -1377,7 +1377,7 @@ defmodule Ferricstore.Raft.StateMachine do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
           value
 
-        [{^key, nil, 0, _lfu, fid, off, _vsize}] when is_integer(fid) and fid > 0 ->
+        [{^key, nil, 0, _lfu, fid, off, _vsize}] when is_integer(fid) and fid >= 0 ->
           path = sm_file_path_from_ctx(ctx, fid)
 
           case NIF.v2_pread_at(path, off) do
@@ -1389,7 +1389,7 @@ defmodule Ferricstore.Raft.StateMachine do
           value
 
         [{^key, nil, exp, _lfu, fid, off, _vsize}]
-        when exp > now and is_integer(fid) and fid > 0 ->
+        when exp > now and is_integer(fid) and fid >= 0 ->
           path = sm_file_path_from_ctx(ctx, fid)
 
           case NIF.v2_pread_at(path, off) do
@@ -1414,7 +1414,7 @@ defmodule Ferricstore.Raft.StateMachine do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
           {value, 0}
 
-        [{^key, nil, 0, _lfu, fid, off, _vsize}] when is_integer(fid) and fid > 0 ->
+        [{^key, nil, 0, _lfu, fid, off, _vsize}] when is_integer(fid) and fid >= 0 ->
           path = sm_file_path_from_ctx(ctx, fid)
 
           case NIF.v2_pread_at(path, off) do
@@ -1426,7 +1426,7 @@ defmodule Ferricstore.Raft.StateMachine do
           {value, exp}
 
         [{^key, nil, exp, _lfu, fid, off, _vsize}]
-        when exp > now and is_integer(fid) and fid > 0 ->
+        when exp > now and is_integer(fid) and fid >= 0 ->
           path = sm_file_path_from_ctx(ctx, fid)
 
           case NIF.v2_pread_at(path, off) do
@@ -1460,7 +1460,7 @@ defmodule Ferricstore.Raft.StateMachine do
       |> Enum.reduce([], fn {key, value, exp, fid, off, _vsize}, acc ->
         if exp == 0 or exp > now do
           actual_value =
-            if value == nil do
+            if value == nil and is_integer(fid) and fid >= 0 do
               path = sm_file_path_from_ctx(ctx, fid)
 
               case NIF.v2_pread_at(path, off) do
