@@ -20,6 +20,7 @@ defmodule Ferricstore.Commands.TDigestTest do
   """
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Commands.Hash
   alias Ferricstore.Commands.TDigest, as: TDigestCmd
   alias Ferricstore.TDigest.Core
   alias Ferricstore.Test.MockStore
@@ -50,6 +51,23 @@ defmodule Ferricstore.Commands.TDigestTest do
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
       assert {:error, msg} = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
       assert msg =~ "already exists"
+    end
+
+    test "returns WRONGTYPE when key holds a string" do
+      store = MockStore.make(%{"mydigest" => {"a string", 0}})
+
+      assert {:error, msg} = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
+      assert msg =~ "WRONGTYPE"
+      assert store.get.("mydigest") == "a string"
+    end
+
+    test "returns WRONGTYPE when key holds a compound value" do
+      store = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["mydigest", "field", "value"], store)
+
+      assert {:error, msg} = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
+      assert msg =~ "WRONGTYPE"
+      assert "value" == Hash.handle("HGET", ["mydigest", "field"], store)
     end
 
     test "returns error with zero compression" do
@@ -110,6 +128,15 @@ defmodule Ferricstore.Commands.TDigestTest do
       store = MockStore.make(%{"str_key" => {"a string", 0}})
       assert {:error, msg} = TDigestCmd.handle("TDIGEST.ADD", ["str_key", "12.5"], store)
       assert msg =~ "WRONGTYPE"
+    end
+
+    test "returns WRONGTYPE for compound keys" do
+      store = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["mydigest", "field", "value"], store)
+
+      assert {:error, msg} = TDigestCmd.handle("TDIGEST.ADD", ["mydigest", "12.5"], store)
+      assert msg =~ "WRONGTYPE"
+      assert "value" == Hash.handle("HGET", ["mydigest", "field"], store)
     end
 
     test "returns error for non-numeric values" do

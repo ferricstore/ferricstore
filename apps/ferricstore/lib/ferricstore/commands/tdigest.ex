@@ -36,7 +36,10 @@ defmodule Ferricstore.Commands.TDigest do
   """
 
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.TypeRegistry
   alias Ferricstore.TDigest.Core
+
+  @wrongtype_msg "WRONGTYPE Operation against a key holding the wrong kind of value"
 
   @doc """
   Handles a TDIGEST command.
@@ -59,24 +62,15 @@ defmodule Ferricstore.Commands.TDigest do
   # ---------------------------------------------------------------------------
 
   def handle("TDIGEST.CREATE", [key], store) do
-    if Ops.exists?(store, key) do
-      {:error, "ERR TDIGEST: key already exists"}
-    else
-      digest = Core.new(100)
-      persist!(key, digest, store)
-      :ok
+    with :ok <- check_create_available(key, store) do
+      create_digest(key, 100, store)
     end
   end
 
   def handle("TDIGEST.CREATE", [key, "COMPRESSION", comp_str], store) do
-    with {:ok, compression} <- parse_pos_integer(comp_str, "compression") do
-      if Ops.exists?(store, key) do
-        {:error, "ERR TDIGEST: key already exists"}
-      else
-        digest = Core.new(compression)
-        persist!(key, digest, store)
-        :ok
-      end
+    with {:ok, compression} <- parse_pos_integer(comp_str, "compression"),
+         :ok <- check_create_available(key, store) do
+      create_digest(key, compression, store)
     end
   end
 
@@ -327,7 +321,7 @@ defmodule Ferricstore.Commands.TDigest do
     case Ops.get(store, key) do
       nil ->
         if key_held_by_other_registry?(key, store) do
-          {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+          {:error, @wrongtype_msg}
         else
           {:error, "ERR TDIGEST: key does not exist"}
         end
@@ -342,19 +336,63 @@ defmodule Ferricstore.Commands.TDigest do
               {:ok, deserialize(centroids, metadata)}
 
             _ ->
-              {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+              {:error, @wrongtype_msg}
           end
         rescue
           ArgumentError ->
-            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+            {:error, @wrongtype_msg}
         end
 
       _ ->
-        {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        {:error, @wrongtype_msg}
     end
   end
 
-  defp key_held_by_other_registry?(_key, _store), do: false
+  defp check_create_available(key, store) do
+    case Ops.get(store, key) do
+      nil ->
+        if key_held_by_other_registry?(key, store), do: {:error, @wrongtype_msg}, else: :ok
+
+      raw ->
+        case decode_raw_digest(raw) do
+          {:ok, _digest} -> {:error, "ERR TDIGEST: key already exists"}
+          {:error, _wrongtype} -> {:error, @wrongtype_msg}
+        end
+    end
+  end
+
+  defp create_digest(key, compression, store) do
+    digest = Core.new(compression)
+    persist!(key, digest, store)
+    :ok
+  end
+
+  defp key_held_by_other_registry?(key, store) do
+    case TypeRegistry.get_type(key, store) do
+      "none" -> false
+      "string" -> false
+      _type -> true
+    end
+  rescue
+    _ -> false
+  end
+
+  defp decode_raw_digest({:tdigest, centroids, metadata}) do
+    {:ok, deserialize(centroids, metadata)}
+  end
+
+  defp decode_raw_digest(bin) when is_binary(bin) do
+    try do
+      case :erlang.binary_to_term(bin) do
+        {:tdigest, centroids, metadata} -> {:ok, deserialize(centroids, metadata)}
+        _ -> {:error, :wrongtype}
+      end
+    rescue
+      ArgumentError -> {:error, :wrongtype}
+    end
+  end
+
+  defp decode_raw_digest(_raw), do: {:error, :wrongtype}
 
   defp persist!(key, %Core{} = digest, store) do
     encoded = serialize(digest)
