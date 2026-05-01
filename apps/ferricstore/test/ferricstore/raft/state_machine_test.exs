@@ -86,6 +86,54 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert is_atom(state.ets)
       assert state.applied_count == 0
     end
+
+    test "derives canonical data_dir root from data/shard_N path" do
+      root = Path.join(System.tmp_dir!(), "sm_data_dir_#{System.unique_integer([:positive])}")
+      shard_path = Path.join([root, "data", "shard_0"])
+      File.mkdir_p!(shard_path)
+
+      ets = :ets.new(:"sm_data_dir_#{System.unique_integer([:positive])}", [:set, :public])
+
+      try do
+        state =
+          StateMachine.init(%{
+            shard_index: 0,
+            shard_data_path: shard_path,
+            active_file_id: 0,
+            active_file_path: Path.join(shard_path, "00000.log"),
+            ets: ets
+          })
+
+        assert state.data_dir == root
+      after
+        :ets.delete(ets)
+        File.rm_rf!(root)
+      end
+    end
+
+    test "derives legacy data_dir root from shard_N path" do
+      root = Path.join(System.tmp_dir!(), "sm_legacy_dir_#{System.unique_integer([:positive])}")
+      shard_path = Path.join(root, "shard_0")
+      File.mkdir_p!(shard_path)
+
+      ets = :ets.new(:"sm_legacy_dir_#{System.unique_integer([:positive])}", [:set, :public])
+
+      try do
+        state =
+          StateMachine.init(%{
+            shard_index: 0,
+            shard_data_path: shard_path,
+            active_file_id: 0,
+            active_file_path: Path.join(shard_path, "00000.log"),
+            ets: ets
+          })
+
+        assert state.data_dir == root
+      after
+        :ets.delete(ets)
+        File.rm_rf!(root)
+      end
+    end
   end
 
   describe "origin async PUT replay" do

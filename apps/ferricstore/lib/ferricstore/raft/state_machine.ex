@@ -123,7 +123,12 @@ defmodule Ferricstore.Raft.StateMachine do
       active_file_id: config.active_file_id,
       active_file_path: config.active_file_path,
       ets: config.ets,
-      data_dir: Map.get(config, :data_dir, Path.dirname(config.shard_data_path)),
+      data_dir:
+        Map.get(
+          config,
+          :data_dir,
+          Ferricstore.DataDir.root_from_shard_path(config.shard_data_path)
+        ),
       instance_ctx: Map.get(config, :instance_ctx),
       applied_count: 0,
       release_cursor_interval: interval,

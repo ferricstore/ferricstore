@@ -108,7 +108,7 @@ defmodule Ferricstore.Raft.Cluster do
       active_file_id: active_file_id,
       active_file_path: active_file_path,
       ets: ets,
-      data_dir: Path.dirname(shard_data_path),
+      data_dir: Ferricstore.DataDir.root_from_shard_path(shard_data_path),
       skip_below_index: skip_below_index
     }
 
@@ -288,7 +288,7 @@ defmodule Ferricstore.Raft.Cluster do
       active_file_id: active_file_id,
       active_file_path: active_file_path,
       ets: ets,
-      data_dir: Path.dirname(shard_data_path)
+      data_dir: Ferricstore.DataDir.root_from_shard_path(shard_data_path)
     }
 
     # In cluster mode, initial_members includes all configured nodes.

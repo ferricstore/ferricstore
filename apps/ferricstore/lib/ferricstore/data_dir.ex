@@ -114,6 +114,25 @@ defmodule Ferricstore.DataDir do
   end
 
   @doc """
+  Returns the FerricStore root data directory for a shard Bitcask path.
+
+  Handles both supported layouts:
+
+    * canonical: `root/data/shard_N` -> `root`
+    * legacy: `root/shard_N` -> `root`
+  """
+  @spec root_from_shard_path(binary()) :: binary()
+  def root_from_shard_path(shard_data_path) do
+    parent = Path.dirname(shard_data_path)
+
+    if Path.basename(parent) == "data" do
+      Path.dirname(parent)
+    else
+      parent
+    end
+  end
+
+  @doc """
   Returns the list of top-level subdirectory names that make up the layout.
 
   Useful for testing and introspection.
