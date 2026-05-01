@@ -93,7 +93,7 @@ defmodule Ferricstore.Store.TypeRegistry do
       nil ->
         case Ops.get(store, redis_key) do
           nil -> "none"
-          value when is_binary(value) -> detect_serialized_type(value)
+          value when is_binary(value) -> "string"
           _ -> "string"
         end
 
@@ -126,17 +126,6 @@ defmodule Ferricstore.Store.TypeRegistry do
     do: Ops.compound_count(store, redis_key, CompoundKey.zset_prefix(redis_key)) > 0
 
   defp live_compound_type?(_redis_key, _type_str, _store), do: true
-
-  defp detect_serialized_type(value) do
-    try do
-      case :erlang.binary_to_term(value) do
-        {:list, _} -> "list"
-        _ -> "string"
-      end
-    rescue
-      ArgumentError -> "string"
-    end
-  end
 
   @doc """
   Removes the type metadata for a Redis key.

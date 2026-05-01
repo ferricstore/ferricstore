@@ -25,6 +25,12 @@ defmodule Ferricstore.Commands.DataStructuresTest do
       assert {:simple, "string"} == Strings.handle("TYPE", ["k"], store)
     end
 
+    test "TYPE treats plain ETF-looking binaries as strings without a type marker" do
+      store = MockStore.make(%{"plain" => {:erlang.term_to_binary({:list, ["value"]}), 0}})
+
+      assert {:simple, "string"} == Strings.handle("TYPE", ["plain"], store)
+    end
+
     test "TYPE returns 'hash' for hash key" do
       store = MockStore.make()
       Hash.handle("HSET", ["h", "f", "v"], store)
@@ -102,6 +108,13 @@ defmodule Ferricstore.Commands.DataStructuresTest do
       assert findings == [],
              "read paths must rely on T:key only, found LM fallback probes in:\n" <>
                Enum.join(findings, "\n")
+    end
+
+    test "TYPE does not deserialize plain values to infer type" do
+      source = File.read!(app_path("lib/ferricstore/store/type_registry.ex"))
+
+      refute source =~ "detect_serialized_type"
+      refute source =~ "binary_to_term"
     end
   end
 
