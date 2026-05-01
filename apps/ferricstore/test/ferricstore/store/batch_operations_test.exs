@@ -322,6 +322,20 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Router.get_keydir_file_ref
+  # ---------------------------------------------------------------------------
+
+  describe "Router.get_keydir_file_ref" do
+    test "does not return pending async locations as disk file refs" do
+      key = "#{@ns_async}:pending_file_ref"
+
+      :ok = Router.batch_async_put(ctx(), [{key, "small"}])
+
+      assert Router.get_keydir_file_ref(ctx(), key) == :miss
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # FerricStore.packed_batch_get (binary protocol)
   # ---------------------------------------------------------------------------
 

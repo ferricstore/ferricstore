@@ -2088,10 +2088,10 @@ defmodule Ferricstore.Store.Router do
 
     try do
       case :ets.lookup(keydir, key) do
-        [{_, _, 0, _, fid, off, vsize}] ->
+        [{_, _, 0, _, fid, off, vsize}] when is_integer(fid) and fid >= 0 ->
           {:ok, {fid, off, vsize}}
 
-        [{_, _, exp, _, fid, off, vsize}] when exp > now ->
+        [{_, _, exp, _, fid, off, vsize}] when exp > now and is_integer(fid) and fid >= 0 ->
           {:ok, {fid, off, vsize}}
 
         [{_, _, _exp, _, _fid, _off, _vsize}] ->
