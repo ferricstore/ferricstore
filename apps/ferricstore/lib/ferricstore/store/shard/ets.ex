@@ -465,20 +465,34 @@ defmodule Ferricstore.Store.Shard.ETS do
     now = HLC.now_ms()
     prefix_len = byte_size(prefix)
 
-    live_ms = [
-      {{:"$1", :_, :"$3", :_, :_, :_, :_},
-       [
-         {:andalso, {:is_binary, :"$1"},
-          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-           {:andalso, {:==, {:binary_part, :"$1", 0, prefix_len}, prefix},
-            {:orelse, {:==, :"$3", 0}, {:>, :"$3", now}}}}}
-       ], [true]}
+    prefix_guard =
+      {:andalso, {:is_binary, :"$1"},
+       {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+        {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+
+    live_exp_guard = {:orelse, {:==, :"$3", 0}, {:>, :"$3", now}}
+
+    valid_cold_guard =
+      {:andalso, {:is_integer, :"$4"},
+       {:andalso, {:>=, :"$4", 0},
+        {:andalso, {:is_integer, :"$5"},
+         {:andalso, {:>=, :"$5", 0}, {:andalso, {:is_integer, :"$6"}, {:>=, :"$6", 0}}}}}}
+
+    live_hot_ms = [
+      {{:"$1", :"$2", :"$3", :_, :_, :_, :_},
+       [{:andalso, prefix_guard, {:andalso, live_exp_guard, {:"/=", :"$2", nil}}}], [true]}
     ]
 
-    count = :ets.select_count(keydir, live_ms)
+    live_cold_ms = [
+      {{:"$1", nil, :"$3", :_, :"$4", :"$5", :"$6"},
+       [{:andalso, prefix_guard, {:andalso, live_exp_guard, valid_cold_guard}}], [true]}
+    ]
+
+    count = :ets.select_count(keydir, live_hot_ms) + :ets.select_count(keydir, live_cold_ms)
 
     if state != nil do
       delete_expired_prefix_entries(state, keydir, prefix, prefix_len, now)
+      delete_invalid_cold_prefix_entries(state, keydir, prefix, prefix_len, now)
     end
 
     count
@@ -498,6 +512,26 @@ defmodule Ferricstore.Store.Shard.ETS do
     keydir
     |> :ets.select(expired_ms)
     |> Enum.each(&delete_prefix_entry(state, keydir, &1))
+  end
+
+  defp delete_invalid_cold_prefix_entries(state, keydir, prefix, prefix_len, now) do
+    cold_ms = [
+      {{:"$1", nil, :"$2", :_, :"$3", :"$4", :"$5"},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:andalso, {:==, {:binary_part, :"$1", 0, prefix_len}, prefix},
+            {:orelse, {:==, :"$2", 0}, {:>, :"$2", now}}}}}
+       ], [{{:"$1", :"$3", :"$4", :"$5"}}]}
+    ]
+
+    keydir
+    |> :ets.select(cold_ms)
+    |> Enum.each(fn {key, fid, off, vsize} ->
+      unless valid_cold_location(fid, off, vsize) do
+        delete_prefix_entry(state, keydir, key)
+      end
+    end)
   end
 
   defp maybe_delete_expired_prefix_entry(nil, _keydir, _key), do: :ok

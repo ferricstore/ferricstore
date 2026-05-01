@@ -133,6 +133,25 @@ defmodule Ferricstore.Store.ShardETSTest do
     end
   end
 
+  test "prefix count skips malformed cold locations" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "H:bad-count" <> <<0>> <> "field"
+
+    state = %{
+      keydir: keydir,
+      instance_ctx: %{hot_cache_max_value_size: 64}
+    }
+
+    try do
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
+
+      assert 0 == ShardETS.prefix_count_entries(state, "H:bad-count")
+      assert [] == :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   test "local transaction read rejects malformed cold location without calling NIF" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
     key = "ets:tx-read:bad-offset"
