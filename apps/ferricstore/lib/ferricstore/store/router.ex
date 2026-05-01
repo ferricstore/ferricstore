@@ -2275,20 +2275,33 @@ defmodule Ferricstore.Store.Router do
     now = HLC.now_ms()
 
     Enum.reduce(0..(sc - 1), 0, fn i, acc ->
-      acc + live_keydir_size(resolve_keydir(ctx, i), now)
+      acc + live_keydir_size(ctx, i, resolve_keydir(ctx, i), now)
     end)
   end
 
-  defp live_keydir_size(keydir, now) do
-    :ets.foldl(
-      fn
-        {_key, _value, 0, _lfu, _fid, _off, _vsize}, acc -> acc + 1
-        {_key, _value, exp, _lfu, _fid, _off, _vsize}, acc when exp > now -> acc + 1
-        {_key, _value, _exp, _lfu, _fid, _off, _vsize}, acc -> acc
-      end,
-      0,
-      keydir
-    )
+  defp live_keydir_size(ctx, idx, keydir, now) do
+    {count, expired_keys} =
+      :ets.foldl(
+        fn
+          {_key, _value, 0, _lfu, _fid, _off, _vsize}, {count, expired_keys} ->
+            {count + 1, expired_keys}
+
+          {_key, _value, exp, _lfu, _fid, _off, _vsize}, {count, expired_keys} when exp > now ->
+            {count + 1, expired_keys}
+
+          {key, _value, _exp, _lfu, _fid, _off, _vsize}, {count, expired_keys} ->
+            {count, [key | expired_keys]}
+        end,
+        {0, []},
+        keydir
+      )
+
+    Enum.each(expired_keys, fn key ->
+      track_keydir_binary_delete(ctx, idx, keydir, key)
+      :ets.delete(keydir, key)
+    end)
+
+    count
   rescue
     ArgumentError -> 0
   end

@@ -350,6 +350,23 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
       assert Router.dbsize(ctx()) == 1
     end
+
+    test "removes expired keys from ETS and byte accounting" do
+      key = "#{@ns_quorum}:dbsize_expired_cleanup:#{String.duplicate("k", 80)}"
+      value = String.duplicate("v", 128)
+      idx = Router.shard_for(ctx(), key)
+      keydir = elem(ctx().keydir_refs, idx)
+      expired_at = Ferricstore.HLC.now_ms() - 1
+
+      before_bytes = :atomics.get(ctx().keydir_binary_bytes, idx + 1)
+      assert :ok = Router.put(ctx(), key, value, expired_at)
+      assert [{^key, ^value, ^expired_at, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, key)
+      assert :atomics.get(ctx().keydir_binary_bytes, idx + 1) > before_bytes
+
+      assert Router.dbsize(ctx()) == 0
+      assert :ets.lookup(keydir, key) == []
+      assert :atomics.get(ctx().keydir_binary_bytes, idx + 1) == before_bytes
+    end
   end
 
   # ---------------------------------------------------------------------------
