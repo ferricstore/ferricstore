@@ -28,6 +28,13 @@ defmodule Ferricstore.Store.Router do
   @slot_mask 1023
   @bitcask_header_size 26
 
+  defguardp valid_cold_file_ref(file_id, value_size)
+            when is_integer(file_id) and file_id >= 0 and is_integer(value_size) and
+                   value_size >= 0
+
+  defguardp valid_cold_location(file_id, offset, value_size)
+            when valid_cold_file_ref(file_id, value_size) and is_integer(offset) and offset >= 0
+
   # ---------------------------------------------------------------------------
   # Shard resolution helpers
   # ---------------------------------------------------------------------------
@@ -698,8 +705,7 @@ defmodule Ferricstore.Store.Router do
         {:hit, value, exp}
 
       [{^key, nil, exp, _, file_id, offset, value_size}]
-      when (exp == 0 or exp > now) and is_integer(file_id) and file_id >= 0 and
-             is_integer(offset) and offset >= 0 and value_size > 0 ->
+      when (exp == 0 or exp > now) and valid_cold_location(file_id, offset, value_size) ->
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
 
         path =
@@ -1159,7 +1165,7 @@ defmodule Ferricstore.Store.Router do
         nil
 
       {:cold, file_id, offset, value_size}
-      when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
+      when valid_cold_file_ref(file_id, value_size) ->
         # Cold key — return file ref directly, no GenServer needed.
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
 
@@ -1212,7 +1218,7 @@ defmodule Ferricstore.Store.Router do
         {:hot, value}
 
       {:cold, file_id, offset, value_size}
-      when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
+      when valid_cold_file_ref(file_id, value_size) ->
         # Value is on disk — return file ref for potential sendfile.
         # Use DataDir directly to avoid GenServer roundtrip.
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
@@ -1313,7 +1319,7 @@ defmodule Ferricstore.Store.Router do
         value
 
       {:cold, file_id, offset, value_size}
-      when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
+      when valid_cold_file_ref(file_id, value_size) ->
         # Cold key — value evicted from ETS but disk location known.
         # Read directly from Bitcask via NIF, bypassing the Shard GenServer.
         # The ETS entry has valid file_id/offset from when the write committed,
@@ -1383,7 +1389,7 @@ defmodule Ferricstore.Store.Router do
           value
 
         {:cold, file_id, offset, value_size}
-        when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
+        when valid_cold_file_ref(file_id, value_size) ->
           shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
 
           path =
@@ -1462,7 +1468,7 @@ defmodule Ferricstore.Store.Router do
         {value, expire_at_ms}
 
       {:cold, file_id, offset, value_size}
-      when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
+      when valid_cold_file_ref(file_id, value_size) ->
         # Cold key — read value from disk directly, return with expire_at_ms.
         expire_at_ms =
           try do
@@ -2734,7 +2740,7 @@ defmodule Ferricstore.Store.Router do
         value
 
       {:cold, file_id, offset, value_size}
-      when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
+      when valid_cold_file_ref(file_id, value_size) ->
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
 
         path =
@@ -2762,7 +2768,7 @@ defmodule Ferricstore.Store.Router do
         true
 
       {:cold, file_id, _offset, value_size}
-      when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
+      when valid_cold_file_ref(file_id, value_size) ->
         true
 
       _ ->
