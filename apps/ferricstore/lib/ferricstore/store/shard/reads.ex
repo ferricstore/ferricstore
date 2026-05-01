@@ -245,16 +245,23 @@ defmodule Ferricstore.Store.Shard.Reads do
   def live_keys(state) do
     now = HLC.now_ms()
 
-    :ets.foldl(
-      fn {key, _value, exp, _lfu, _fid, _off, _vsize}, acc ->
-        if exp == 0 or exp > now do
-          [key | acc]
-        else
-          acc
-        end
-      end,
-      [],
-      state.keydir
-    )
+    {live_keys, expired_keys} =
+      :ets.foldl(
+        fn
+          {key, _value, 0, _lfu, _fid, _off, _vsize}, {live, expired} ->
+            {[key | live], expired}
+
+          {key, _value, exp, _lfu, _fid, _off, _vsize}, {live, expired} when exp > now ->
+            {[key | live], expired}
+
+          {key, _value, _exp, _lfu, _fid, _off, _vsize}, {live, expired} ->
+            {live, [key | expired]}
+        end,
+        {[], []},
+        state.keydir
+      )
+
+    Enum.each(expired_keys, &ShardETS.ets_delete_key(state, &1))
+    live_keys
   end
 end
