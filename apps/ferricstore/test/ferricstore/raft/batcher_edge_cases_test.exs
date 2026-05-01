@@ -30,6 +30,14 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
     |> Enum.find(&(Router.shard_for(ctx(), &1) == shard_index))
   end
 
+  defp fill_pending(idx, count) do
+    for i <- 1..count do
+      corr = make_ref()
+      batch = [{:put, "edge:pending:#{idx}:#{i}", "v", 0}]
+      Batcher.__inject_async_pending__(idx, corr, batch, 0)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # extract_prefix edge cases
   # ---------------------------------------------------------------------------
@@ -263,6 +271,58 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
                      10_000
 
       assert is_integer(ra_index) and ra_index > 0
+    end
+  end
+
+  describe "single-write backpressure" do
+    setup do
+      idx = 0
+      fill_pending(idx, 64)
+
+      on_exit(fn -> Batcher.reset_pending(idx) end)
+
+      {:ok, idx: idx}
+    end
+
+    test "Batcher.write rejects when pending is full", %{idx: idx} do
+      key = same_shard_key(idx, "single_overload")
+
+      assert {:error, :overloaded} = Batcher.write(idx, {:put, key, "v", 0})
+    end
+
+    test "write_async_quorum replies overloaded when pending is full", %{idx: idx} do
+      key = same_shard_key(idx, "forced_overload")
+      ref = make_ref()
+
+      :ok = Batcher.write_async_quorum(idx, {:put, key, "v", 0}, {self(), ref})
+
+      assert_receive {^ref, {:error, :overloaded}}, 1_000
+    end
+
+    test "async_submit emits dropped telemetry when pending is full", %{idx: idx} do
+      handler = {:edge_backpressure, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:ferricstore, :batcher, :async_dropped],
+          fn event, measurements, metadata, pid ->
+            send(pid, {:telemetry, event, measurements, metadata})
+          end,
+          self()
+        )
+
+      try do
+        key = same_shard_key(idx, "async_overload")
+
+        :ok = Batcher.async_submit(idx, {:put, key, "v", 0})
+
+        assert_receive {:telemetry, [:ferricstore, :batcher, :async_dropped], %{batch_size: 1},
+                        %{reason: :overloaded}},
+                       1_000
+      after
+        :telemetry.detach(handler)
+      end
     end
   end
 

@@ -1008,6 +1008,15 @@ defmodule Ferricstore.Raft.Batcher do
   # batch is flushed and committed.
   @spec enqueue_write(command(), GenServer.from(), %__MODULE__{}) :: {:noreply, %__MODULE__{}}
   defp enqueue_write(command, from, state) do
+    if pending_full?(state) do
+      reply_from(from, {:error, :overloaded})
+      {:noreply, state}
+    else
+      enqueue_write_under_capacity(command, from, state)
+    end
+  end
+
+  defp enqueue_write_under_capacity(command, from, state) do
     prefix = extract_prefix(command)
     {{window_ms, ns_durability}, state} = lookup_ns_config(prefix, state)
 
@@ -1273,6 +1282,15 @@ defmodule Ferricstore.Raft.Batcher do
   # needs atomicity). Bypasses namespace-config durability lookup and uses
   # the quorum slot regardless of how the namespace is configured.
   defp enqueue_write_forced_quorum(command, from, state) do
+    if pending_full?(state) do
+      reply_from(from, {:error, :overloaded})
+      {:noreply, state}
+    else
+      enqueue_write_forced_quorum_under_capacity(command, from, state)
+    end
+  end
+
+  defp enqueue_write_forced_quorum_under_capacity(command, from, state) do
     prefix = extract_prefix(command)
     # Still need window_ms from config, but force durability to quorum.
     {{window_ms, _durability}, state} = lookup_ns_config(prefix, state)
@@ -1308,6 +1326,24 @@ defmodule Ferricstore.Raft.Batcher do
   # Enqueue an async_submit cast (from Router.async_write_*). No `from` to
   # track — Router already returned :ok to its caller.
   defp enqueue_async_submit(command, state) do
+    if pending_full?(state) do
+      :telemetry.execute(
+        [:ferricstore, :batcher, :async_dropped],
+        %{batch_size: 1},
+        %{shard_index: state.shard_index, reason: :overloaded}
+      )
+
+      Logger.warning(
+        "Batcher shard=#{state.shard_index}: async command not enqueued because pending is full"
+      )
+
+      {:noreply, state}
+    else
+      enqueue_async_submit_under_capacity(command, state)
+    end
+  end
+
+  defp enqueue_async_submit_under_capacity(command, state) do
     prefix = extract_prefix(command)
     {{window_ms, _durability}, state} = lookup_ns_config(prefix, state)
     # Dedicated slot: commands here will be wrapped as {:async, inner} during
@@ -1346,6 +1382,8 @@ defmodule Ferricstore.Raft.Batcher do
       {:noreply, new_state}
     end
   end
+
+  defp pending_full?(state), do: map_size(state.pending) >= @max_pending
 
   # Reply to flush waiters once everything is drained: in-flight ra commands
   # are all applied AND the local state machine has caught up to all their
