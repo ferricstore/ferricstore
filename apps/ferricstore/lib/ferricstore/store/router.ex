@@ -1165,7 +1165,7 @@ defmodule Ferricstore.Store.Router do
         nil
 
       {:cold, file_id, offset, value_size}
-      when valid_cold_file_ref(file_id, value_size) ->
+      when valid_cold_location(file_id, offset, value_size) ->
         # Cold key — return file ref directly, no GenServer needed.
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
 
@@ -1218,7 +1218,7 @@ defmodule Ferricstore.Store.Router do
         {:hot, value}
 
       {:cold, file_id, offset, value_size}
-      when valid_cold_file_ref(file_id, value_size) ->
+      when valid_cold_location(file_id, offset, value_size) ->
         # Value is on disk — return file ref for potential sendfile.
         # Use DataDir directly to avoid GenServer roundtrip.
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
@@ -1273,14 +1273,21 @@ defmodule Ferricstore.Store.Router do
         [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
           {:hit, value, lfu}
 
-        [{^key, nil, 0, _lfu, fid, off, vsize}] ->
+        [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           {:cold, fid, off, vsize}
+
+        [{^key, nil, 0, _lfu, :pending, off, vsize}] ->
+          {:cold, :pending, off, vsize}
 
         [{^key, value, exp, lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
           {:hit, value, lfu}
 
-        [{^key, nil, exp, _lfu, fid, off, vsize}] when exp > now ->
+        [{^key, nil, exp, _lfu, fid, off, vsize}]
+        when exp > now and valid_cold_location(fid, off, vsize) ->
           {:cold, fid, off, vsize}
+
+        [{^key, nil, exp, _lfu, :pending, off, vsize}] when exp > now ->
+          {:cold, :pending, off, vsize}
 
         [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
           track_keydir_binary_delete_known(ctx, idx, key, value)
@@ -1319,7 +1326,7 @@ defmodule Ferricstore.Store.Router do
         value
 
       {:cold, file_id, offset, value_size}
-      when valid_cold_file_ref(file_id, value_size) ->
+      when valid_cold_location(file_id, offset, value_size) ->
         # Cold key — value evicted from ETS but disk location known.
         # Read directly from Bitcask via NIF, bypassing the Shard GenServer.
         # The ETS entry has valid file_id/offset from when the write committed,
@@ -1389,7 +1396,7 @@ defmodule Ferricstore.Store.Router do
           value
 
         {:cold, file_id, offset, value_size}
-        when valid_cold_file_ref(file_id, value_size) ->
+        when valid_cold_location(file_id, offset, value_size) ->
           shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
 
           path =
@@ -1468,7 +1475,7 @@ defmodule Ferricstore.Store.Router do
         {value, expire_at_ms}
 
       {:cold, file_id, offset, value_size}
-      when valid_cold_file_ref(file_id, value_size) ->
+      when valid_cold_location(file_id, offset, value_size) ->
         # Cold key — read value from disk directly, return with expire_at_ms.
         expire_at_ms =
           try do
@@ -2427,10 +2434,11 @@ defmodule Ferricstore.Store.Router do
 
     try do
       case :ets.lookup(keydir, key) do
-        [{_, _, 0, _, fid, off, vsize}] when is_integer(fid) and fid >= 0 ->
+        [{_, _, 0, _, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           {:ok, {fid, off, vsize}}
 
-        [{_, _, exp, _, fid, off, vsize}] when exp > now and is_integer(fid) and fid >= 0 ->
+        [{_, _, exp, _, fid, off, vsize}]
+        when exp > now and valid_cold_location(fid, off, vsize) ->
           {:ok, {fid, off, vsize}}
 
         [{^key, _, _exp, _, _fid, _off, _vsize}] ->
@@ -2749,7 +2757,7 @@ defmodule Ferricstore.Store.Router do
         value
 
       {:cold, file_id, offset, value_size}
-      when valid_cold_file_ref(file_id, value_size) ->
+      when valid_cold_location(file_id, offset, value_size) ->
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
 
         path =
