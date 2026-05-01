@@ -1475,6 +1475,33 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  defp ets_get_meta_full(ctx, idx, keydir, key, now) do
+    try do
+      case :ets.lookup(keydir, key) do
+        [{^key, value, exp, lfu, _fid, _off, _vsize}]
+        when value != nil and (exp == 0 or exp > now) ->
+          {:hit, value, exp, lfu}
+
+        [{^key, nil, exp, _lfu, fid, off, vsize}]
+        when (exp == 0 or exp > now) and valid_cold_location(fid, off, vsize) ->
+          {:cold, fid, off, vsize, exp}
+
+        [{^key, nil, exp, _lfu, :pending, off, vsize}] when exp == 0 or exp > now ->
+          {:cold, :pending, off, vsize, exp}
+
+        [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
+          track_keydir_binary_delete_known(ctx, idx, key, value)
+          :ets.delete(keydir, key)
+          :expired
+
+        [] ->
+          :miss
+      end
+    rescue
+      ArgumentError -> :no_table
+    end
+  end
+
   @doc """
   Retrieves the value for `key`, or `nil` if the key does not exist or is
   expired.
@@ -1631,35 +1658,14 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
 
-    case ets_get_full(ctx, idx, keydir, key, now) do
-      {:hit, value, lfu} ->
+    case ets_get_meta_full(ctx, idx, keydir, key, now) do
+      {:hit, value, expire_at_ms, lfu} ->
         sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
-        # Recover expire_at_ms from ETS (ets_get_full returns lfu, not exp).
-        expire_at_ms =
-          try do
-            case :ets.lookup(keydir, key) do
-              [{^key, _val, exp, _lfu, _fid, _off, _vsize}] -> exp
-              _ -> 0
-            end
-          rescue
-            ArgumentError -> 0
-          end
-
         {value, expire_at_ms}
 
-      {:cold, file_id, offset, value_size}
+      {:cold, file_id, offset, value_size, expire_at_ms}
       when valid_cold_location(file_id, offset, value_size) ->
         # Cold key — read value from disk directly, return with expire_at_ms.
-        expire_at_ms =
-          try do
-            case :ets.lookup(keydir, key) do
-              [{^key, _val, exp, _lfu, _fid, _off, _vsize}] -> exp
-              _ -> 0
-            end
-          rescue
-            ArgumentError -> 0
-          end
-
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
 
         path =
@@ -1675,7 +1681,7 @@ defmodule Ferricstore.Store.Router do
             nil
         end
 
-      {:cold, _file_id, _offset, _value_size} ->
+      {:cold, _file_id, _offset, _value_size, _expire_at_ms} ->
         # Invalid file ref — ask GenServer.
         Stats.record_cold_read(ctx, key)
         GenServer.call(resolve_shard(ctx, idx), {:get_meta, key})
