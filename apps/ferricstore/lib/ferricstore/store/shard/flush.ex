@@ -208,7 +208,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   end
 
   defp track_overwrite_dead_bytes(fs, key, old_fid, old_vsize)
-       when old_fid != 0 and old_vsize > 0 do
+       when is_integer(old_fid) and old_fid >= 0 and is_integer(old_vsize) and old_vsize >= 0 do
     dead_increment = old_vsize + @record_header_size + byte_size(key)
     {old_total, old_dead} = Map.get(fs, old_fid, {0, 0})
     Map.put(fs, old_fid, {old_total, old_dead + dead_increment})
@@ -241,7 +241,8 @@ defmodule Ferricstore.Store.Shard.Flush do
   @doc false
   def track_delete_dead_bytes(state, key) do
     case :ets.lookup(state.keydir, key) do
-      [{^key, _v, _exp, _lfu, old_fid, _off, old_vsize}] when old_fid != 0 and old_vsize > 0 ->
+      [{^key, _v, _exp, _lfu, old_fid, _off, old_vsize}]
+      when is_integer(old_fid) and old_fid >= 0 and is_integer(old_vsize) and old_vsize >= 0 ->
         dead_increment = old_vsize + @record_header_size + byte_size(key)
         {old_total, old_dead} = Map.get(state.file_stats, old_fid, {0, 0})
 
@@ -339,7 +340,8 @@ defmodule Ferricstore.Store.Shard.Flush do
     end
   end
 
-  defp accumulate_live_bytes(acc, key, fid, vsize) when fid != 0 and is_integer(fid) do
+  defp accumulate_live_bytes(acc, key, fid, vsize)
+       when is_integer(fid) and fid >= 0 and is_integer(vsize) and vsize >= 0 do
     record_bytes = @record_header_size + byte_size(key) + vsize
     Map.update(acc, fid, record_bytes, &(&1 + record_bytes))
   end

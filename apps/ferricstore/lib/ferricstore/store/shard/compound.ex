@@ -624,7 +624,8 @@ defmodule Ferricstore.Store.Shard.Compound do
       %{total_bytes: total, dead_bytes: dead} = info ->
         old_record_size =
           case :ets.lookup(state.keydir, compound_key) do
-            [{^compound_key, _v, _exp, _lfu, _fid, _off, old_vsize}] when old_vsize > 0 ->
+            [{^compound_key, _v, _exp, _lfu, _fid, _off, old_vsize}]
+            when is_integer(old_vsize) and old_vsize >= 0 ->
               @record_header_size + byte_size(compound_key) + old_vsize
 
             _ ->
@@ -651,7 +652,8 @@ defmodule Ferricstore.Store.Shard.Compound do
       %{dead_bytes: dead} = info ->
         old_record_size =
           case :ets.lookup(state.keydir, compound_key) do
-            [{^compound_key, _v, _exp, _lfu, _fid, _off, old_vsize}] when old_vsize > 0 ->
+            [{^compound_key, _v, _exp, _lfu, _fid, _off, old_vsize}]
+            when is_integer(old_vsize) and old_vsize >= 0 ->
               @record_header_size + byte_size(compound_key) + old_vsize
 
             _ ->
