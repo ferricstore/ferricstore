@@ -1608,7 +1608,8 @@ defmodule Ferricstore.Store.Router do
   # After a cold read, promote the value back to ETS (hot) if it fits
   # under the hot cache max value size threshold. ETS is :public with
   # write_concurrency so this is safe from any process.
-  defp warm_ets_after_cold_read(ctx, keydir, key, value, _file_id, _offset) do
+  @doc false
+  def warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset) do
     # Skip promotion when under memory pressure — prevents evict/re-promote
     # thrashing where MemoryGuard evicts values and cold reads immediately
     # re-cache them. skip_promotion? is set at :pressure level (85%+).
@@ -1616,7 +1617,15 @@ defmodule Ferricstore.Store.Router do
 
     if byte_size(value) <= ctx.hot_cache_max_value_size and not skip_promotion do
       try do
-        :ets.update_element(keydir, key, {2, value})
+        :ets.select_replace(keydir, [
+          {
+            {key, nil, :"$1", :"$2", file_id, offset, :"$3"},
+            [],
+            [{{key, value, :"$1", :"$2", file_id, offset, :"$3"}}]
+          }
+        ])
+
+        :ok
       rescue
         ArgumentError -> :ok
       end
