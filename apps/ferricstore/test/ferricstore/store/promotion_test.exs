@@ -360,6 +360,67 @@ defmodule Ferricstore.Store.PromotionTest do
                  |> FerricStore.Tx.set(other_key, "touch")
                end)
     end
+
+    test "cross-shard transaction HSET writes promoted field to dedicated storage" do
+      store = real_store()
+      key = ukey("cross_tx_hset_promoted")
+      field = "cross_field"
+      ctx = FerricStore.Instance.get(:default)
+      idx = Router.shard_for(ctx, key)
+      keydir = elem(ctx.keydir_refs, idx)
+      compound_key = CompoundKey.hash_field(key, field)
+
+      other_key =
+        Enum.find_value(0..100_000, fn i ->
+          candidate = "cross_tx_hset_other_#{System.unique_integer([:positive])}_#{i}"
+          if Router.shard_for(ctx, candidate) != idx, do: candidate
+        end)
+
+      populate_hash(store, key, @test_threshold + 1)
+      assert promoted?(key)
+
+      assert {:ok, [1, :ok]} =
+               FerricStore.multi(fn tx ->
+                 tx
+                 |> FerricStore.Tx.hset(key, %{field => "cross_value"})
+                 |> FerricStore.Tx.set(other_key, "touch")
+               end)
+
+      [{^compound_key, _value, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, compound_key)
+      :ets.insert(keydir, {compound_key, nil, exp, lfu, fid, off, vsize})
+
+      assert "cross_value" == Hash.handle("HGET", [key, field], store)
+    end
+
+    test "cross-shard transaction HDEL tombstones promoted field in dedicated storage" do
+      store = real_store()
+      key = ukey("cross_tx_hdel_promoted")
+      field = "field_1"
+      ctx = FerricStore.Instance.get(:default)
+      idx = Router.shard_for(ctx, key)
+      keydir = elem(ctx.keydir_refs, idx)
+      compound_key = CompoundKey.hash_field(key, field)
+
+      other_key =
+        Enum.find_value(0..100_000, fn i ->
+          candidate = "cross_tx_hdel_other_#{System.unique_integer([:positive])}_#{i}"
+          if Router.shard_for(ctx, candidate) != idx, do: candidate
+        end)
+
+      populate_hash(store, key, @test_threshold + 1)
+      assert promoted?(key)
+
+      assert [1, :ok] ==
+               Ferricstore.Transaction.Coordinator.execute(
+                 [{"HDEL", [key, field]}, {"SET", [other_key, "touch"]}],
+                 %{},
+                 nil
+               )
+
+      :ets.delete(keydir, compound_key)
+
+      assert nil == Hash.handle("HGET", [key, field], store)
+    end
   end
 
   # ---------------------------------------------------------------------------

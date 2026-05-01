@@ -1302,6 +1302,76 @@ defmodule Ferricstore.Raft.StateMachine do
       {:ok, byte_size(new_val)}
     end
 
+    promoted_put = fn compound_key, value, expire_at_ms, dedicated_path ->
+      value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
+      disk_val = to_disk_binary(value)
+      active = Promotion.find_active(dedicated_path)
+      fid = parse_fid_from_path(active)
+
+      case NIF.v2_append_record(active, compound_key, disk_val, expire_at_ms) do
+        {:ok, {offset, record_size}} ->
+          if tx_binary_ref do
+            new_bytes = binary_byte_size(compound_key) + binary_byte_size(value_for)
+
+            old_bytes =
+              case :ets.lookup(ctx.keydir, compound_key) do
+                [{^compound_key, old_val, _, _, _, _, _}] ->
+                  binary_byte_size(compound_key) + binary_byte_size(old_val)
+
+                _ ->
+                  0
+              end
+
+            delta = new_bytes - old_bytes
+            if delta != 0, do: :atomics.add(tx_binary_ref, ctx.index + 1, delta)
+          end
+
+          :ets.insert(
+            ctx.keydir,
+            {compound_key, value_for, expire_at_ms, LFU.initial(), fid, offset, record_size}
+          )
+
+          deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+          if MapSet.member?(deleted, compound_key) do
+            Process.put(:tx_deleted_keys, MapSet.delete(deleted, compound_key))
+          end
+
+          :ok
+
+        {:error, _reason} = err ->
+          err
+      end
+    end
+
+    promoted_delete = fn compound_key, dedicated_path ->
+      if tx_binary_ref do
+        bytes =
+          case :ets.lookup(ctx.keydir, compound_key) do
+            [{^compound_key, val, _, _, _, _, _}] ->
+              binary_byte_size(compound_key) + binary_byte_size(val)
+
+            _ ->
+              0
+          end
+
+        if bytes > 0, do: :atomics.sub(tx_binary_ref, ctx.index + 1, bytes)
+      end
+
+      active = Promotion.find_active(dedicated_path)
+
+      case NIF.v2_append_tombstone(active, compound_key) do
+        {:ok, _offset} ->
+          :ets.delete(ctx.keydir, compound_key)
+          deleted = Process.get(:tx_deleted_keys, MapSet.new())
+          Process.put(:tx_deleted_keys, MapSet.put(deleted, compound_key))
+          :ok
+
+        {:error, _reason} = err ->
+          err
+      end
+    end
+
     %{
       get: local_get,
       get_meta: local_get_meta,
@@ -1337,11 +1407,17 @@ defmodule Ferricstore.Raft.StateMachine do
       compound_get_meta: fn redis_key, compound_key ->
         cross_shard_compound_read_meta(ctx, redis_key, compound_key)
       end,
-      compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
-        local_put.(compound_key, value, expire_at_ms)
+      compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+        case promoted_compound_path(ctx, redis_key, compound_key) do
+          nil -> local_put.(compound_key, value, expire_at_ms)
+          dedicated_path -> promoted_put.(compound_key, value, expire_at_ms, dedicated_path)
+        end
       end,
-      compound_delete: fn _redis_key, compound_key ->
-        local_delete.(compound_key)
+      compound_delete: fn redis_key, compound_key ->
+        case promoted_compound_path(ctx, redis_key, compound_key) do
+          nil -> local_delete.(compound_key)
+          dedicated_path -> promoted_delete.(compound_key, dedicated_path)
+        end
       end,
       compound_scan: fn redis_key, prefix ->
         cross_shard_compound_scan(ctx, redis_key, prefix)
@@ -1604,6 +1680,13 @@ defmodule Ferricstore.Raft.StateMachine do
       data_path,
       "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
     )
+  end
+
+  defp parse_fid_from_path(path) do
+    path
+    |> Path.basename()
+    |> String.trim_trailing(".log")
+    |> String.to_integer()
   end
 
   # ---------------------------------------------------------------------------
