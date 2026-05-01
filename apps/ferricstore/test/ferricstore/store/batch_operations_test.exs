@@ -475,10 +475,15 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   describe "Router.get_keydir_file_ref" do
     test "does not return pending async locations as disk file refs" do
       key = "#{@ns_async}:pending_file_ref"
+      idx = Router.shard_for(ctx(), key)
+      keydir = elem(ctx().keydir_refs, idx)
 
       :ok = Router.batch_async_put(ctx(), [{key, "small"}])
+      assert [{^key, "small", 0, _lfu, :pending, 0, _vsize}] = :ets.lookup(keydir, key)
 
       assert Router.get_keydir_file_ref(ctx(), key) == :miss
+      assert [{^key, "small", 0, _lfu, :pending, 0, _vsize}] = :ets.lookup(keydir, key)
+      assert Router.get(ctx(), key) == "small"
     end
 
     test "removes expired keys from ETS and byte accounting" do

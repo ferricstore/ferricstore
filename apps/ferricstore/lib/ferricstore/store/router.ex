@@ -2641,9 +2641,25 @@ defmodule Ferricstore.Store.Router do
         [{_, _, 0, _, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           {:ok, {fid, off, vsize}}
 
+        [{^key, nil, 0, _, fid, _off, _vsize}] when is_integer(fid) ->
+          track_keydir_binary_delete(ctx, idx, keydir, key)
+          :ets.delete(keydir, key)
+          :miss
+
+        [{_, _, 0, _, _fid, _off, _vsize}] ->
+          :miss
+
         [{_, _, exp, _, fid, off, vsize}]
         when exp > now and valid_cold_location(fid, off, vsize) ->
           {:ok, {fid, off, vsize}}
+
+        [{^key, nil, exp, _, fid, _off, _vsize}] when exp > now and is_integer(fid) ->
+          track_keydir_binary_delete(ctx, idx, keydir, key)
+          :ets.delete(keydir, key)
+          :miss
+
+        [{_, _, exp, _, _fid, _off, _vsize}] when exp > now ->
+          :miss
 
         [{^key, _, _exp, _, _fid, _off, _vsize}] ->
           track_keydir_binary_delete(ctx, idx, keydir, key)

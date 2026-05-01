@@ -77,6 +77,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
 
     assert :miss == Router.get_keydir_file_ref(ctx, key)
+    assert [] == :ets.lookup(keydir, key)
   end
 
   test "value_size rejects cold rows with invalid offsets", %{ctx: ctx, keydir: keydir} do
