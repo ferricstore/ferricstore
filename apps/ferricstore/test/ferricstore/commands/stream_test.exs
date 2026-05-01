@@ -625,6 +625,36 @@ defmodule Ferricstore.Commands.StreamTest do
       assert info["groups"] == 0
     end
 
+    test "XINFO STREAM batches first and last entry reads" do
+      parent = self()
+      {:ok, pid} = Agent.start_link(fn -> %{} end)
+      key = ustream()
+
+      store = %{
+        put: fn entry_key, value, _expire_at_ms ->
+          Agent.update(pid, &Map.put(&1, entry_key, value))
+          :ok
+        end,
+        keys: fn -> Agent.get(pid, &Map.keys/1) end,
+        batch_get: fn keys ->
+          send(parent, {:batch_get, keys})
+          Agent.get(pid, fn state -> Enum.map(keys, &Map.get(state, &1)) end)
+        end,
+        get: fn entry_key ->
+          flunk("XINFO STREAM should use batch_get, got per-entry GET for #{inspect(entry_key)}")
+        end
+      }
+
+      assert "1-0" == Stream.handle("XADD", [key, "1-0", "name", "alice"], store)
+      assert "2-0" == Stream.handle("XADD", [key, "2-0", "name", "bob"], store)
+
+      info = Stream.handle("XINFO", ["STREAM", key], store)
+
+      assert info["first-entry"] == ["1-0", "name", "alice"]
+      assert info["last-entry"] == ["2-0", "name", "bob"]
+      assert_received {:batch_get, [_first, _last]}
+    end
+
     test "XINFO STREAM on nonexistent stream returns error" do
       store = MockStore.make()
       result = Stream.handle("XINFO", ["STREAM", "nonexistent"], store)

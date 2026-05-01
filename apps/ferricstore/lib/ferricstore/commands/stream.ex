@@ -726,24 +726,25 @@ defmodule Ferricstore.Commands.Stream do
       [{^key, len, first, last, _ms, _seq}] ->
         prefix = "X:#{key}" <> @sep
 
-        first_entry =
-          if len > 0 and first != "0-0" do
-            raw = Ops.get(store, prefix <> first)
-
-            if raw do
-              fields = :erlang.binary_to_term(raw)
-              [first | fields]
-            end
-          end
-
-        last_entry =
+        {first_entry, last_entry} =
           if len > 0 do
-            raw = Ops.get(store, prefix <> last)
+            last_key = prefix <> last
 
-            if raw do
-              fields = :erlang.binary_to_term(raw)
-              [last | fields]
-            end
+            {first_raw, last_raw} =
+              if first != "0-0" do
+                [first_raw, last_raw] = Ops.batch_get(store, [prefix <> first, last_key])
+                {first_raw, last_raw}
+              else
+                [last_raw] = Ops.batch_get(store, [last_key])
+                {nil, last_raw}
+              end
+
+            {
+              decode_stream_entry(first, first_raw),
+              decode_stream_entry(last, last_raw)
+            }
+          else
+            {nil, nil}
           end
 
         # Count consumer groups.
@@ -757,6 +758,13 @@ defmodule Ferricstore.Commands.Stream do
           "groups" => groups
         }
     end
+  end
+
+  defp decode_stream_entry(_id, nil), do: nil
+
+  defp decode_stream_entry(id, raw) do
+    fields = :erlang.binary_to_term(raw)
+    [id | fields]
   end
 
   # ---------------------------------------------------------------------------
