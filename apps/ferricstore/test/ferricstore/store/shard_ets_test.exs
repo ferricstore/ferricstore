@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.ShardETSTest do
 
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
+  alias Ferricstore.Store.Shard.Reads, as: ShardReads
 
   test "stale async cold-read completion does not warm over a pending large write" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
@@ -68,6 +69,85 @@ defmodule Ferricstore.Store.ShardETSTest do
       assert true == ShardETS.cold_read_warm_ets(state, key, "old", 0, 7, 12, 3)
 
       assert [{^key, "old", 0, _lfu, 7, 12, 3}] = :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "warm lookup rejects malformed cold location without calling NIF" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "ets:cold:bad-offset"
+
+    state = %{
+      keydir: keydir,
+      shard_data_path: System.tmp_dir!(),
+      instance_ctx: %{hot_cache_max_value_size: 64}
+    }
+
+    try do
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
+
+      assert :expired == ShardETS.ets_lookup_warm(state, key)
+      assert [] == :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "warm_from_store rejects malformed cold location without calling NIF" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "ets:warm-store:bad-offset"
+
+    state = %{
+      keydir: keydir,
+      shard_data_path: System.tmp_dir!(),
+      instance_ctx: %{hot_cache_max_value_size: 64}
+    }
+
+    try do
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
+
+      assert nil == ShardETS.warm_from_store(state, key)
+      assert [] == :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "prefix scan skips malformed cold locations without calling NIF" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "H:bad-scan" <> <<0>> <> "field"
+
+    state = %{
+      keydir: keydir,
+      instance_ctx: %{hot_cache_max_value_size: 64}
+    }
+
+    try do
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
+
+      assert [] == ShardETS.prefix_scan_entries(state, "H:bad-scan", System.tmp_dir!())
+      assert [] == :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "local transaction read rejects malformed cold location without calling NIF" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "ets:tx-read:bad-offset"
+
+    state = %{
+      keydir: keydir,
+      shard_data_path: System.tmp_dir!(),
+      instance_ctx: %{hot_cache_max_value_size: 64}
+    }
+
+    try do
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
+
+      assert {:ok, nil} == ShardReads.v2_local_read(state, key)
+      assert [] == :ets.lookup(keydir, key)
     after
       :ets.delete(keydir)
     end

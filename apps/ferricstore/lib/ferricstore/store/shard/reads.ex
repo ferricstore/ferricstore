@@ -230,10 +230,15 @@ defmodule Ferricstore.Store.Shard.Reads do
         # it means ets_lookup_warm failed to catch the :pending sentinel.
         {:error, "ERR internal: pending entry reached cold read path for #{inspect(key)}"}
 
-      [{^key, nil, _exp, _lfu, fid, off, _vsize}] ->
+      [{^key, nil, _exp, _lfu, fid, off, _vsize}]
+      when is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 ->
         # Cold key -- pread from disk
         p = ShardETS.file_path(state.shard_data_path, fid)
         NIF.v2_pread_at(p, off)
+
+      [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
+        ShardETS.ets_delete_key(state, key)
+        {:ok, nil}
 
       _ ->
         {:ok, nil}

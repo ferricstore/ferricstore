@@ -5,6 +5,10 @@ defmodule Ferricstore.Store.Shard.ETS do
   alias Ferricstore.HLC
   alias Ferricstore.Store.{LFU, ValueCodec}
 
+  defguardp valid_cold_location(file_id, offset, value_size)
+            when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+                   is_integer(value_size) and value_size >= 0
+
   # -------------------------------------------------------------------
   # ETS lookup / classification
   # -------------------------------------------------------------------
@@ -36,7 +40,7 @@ defmodule Ferricstore.Store.Shard.ETS do
         # Cannot read from disk yet. Treat as miss (rare edge case).
         :miss
 
-      [{^key, nil, 0, _lfu, fid, off, vsize}] ->
+      [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         # Cold key (evicted from RAM) with no expiry -- disk location known.
         {:cold, fid, off, vsize, 0}
 
@@ -48,7 +52,8 @@ defmodule Ferricstore.Store.Shard.ETS do
         # Background write pending with TTL, value evicted before disk write.
         :miss
 
-      [{^key, nil, exp, _lfu, fid, off, vsize}] when exp > now ->
+      [{^key, nil, exp, _lfu, fid, off, vsize}]
+      when exp > now and valid_cold_location(fid, off, vsize) ->
         # Cold key with valid TTL -- disk location known.
         {:cold, fid, off, vsize, exp}
 
@@ -243,7 +248,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @doc false
   def cold_read_warm_ets(state, key, value) do
     case :ets.lookup(state.keydir, key) do
-      [{^key, nil, exp, _lfu, fid, off, vsize}] when is_integer(fid) and fid >= 0 ->
+      [{^key, nil, exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
 
       _ ->
@@ -312,7 +317,7 @@ defmodule Ferricstore.Store.Shard.ETS do
         # Background write not yet completed -- cannot read from disk.
         nil
 
-      [{^key, nil, exp, _lfu, fid, off, vsize}] when is_integer(fid) ->
+      [{^key, nil, exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         p = file_path(state.shard_data_path, fid)
 
         case NIF.v2_pread_at(p, off) do
@@ -326,6 +331,11 @@ defmodule Ferricstore.Store.Shard.ETS do
             nil
         end
 
+      [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
+        track_binary_delete(state, key, nil)
+        :ets.delete(state.keydir, key)
+        nil
+
       _ ->
         nil
     end
@@ -337,7 +347,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @doc false
   def warm_meta_from_store(state, key) do
     case :ets.lookup(state.keydir, key) do
-      [{^key, nil, exp, _lfu, fid, off, vsize}] when is_integer(fid) ->
+      [{^key, nil, exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         p = file_path(state.shard_data_path, fid)
 
         case NIF.v2_pread_at(p, off) do
@@ -350,6 +360,11 @@ defmodule Ferricstore.Store.Shard.ETS do
           _ ->
             nil
         end
+
+      [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
+        track_binary_delete(state, key, nil)
+        :ets.delete(state.keydir, key)
+        nil
 
       _ ->
         nil
@@ -395,31 +410,38 @@ defmodule Ferricstore.Store.Shard.ETS do
     ]
 
     :ets.select(keydir, ms)
-    |> Enum.reduce([], fn {key, value, exp, fid, off, _vsize}, acc ->
-      if exp == 0 or exp > now do
-        # For cold keys (value=nil), do a disk read to get the actual value
-        actual_value = prefix_entry_value(value, shard_data_path, fid, off)
-
-        if actual_value != nil do
-          field =
-            case :binary.split(key, <<0>>) do
-              [_pre, sub] -> sub
-              _ -> key
-            end
-
-          [{field, actual_value} | acc]
-        else
+    |> Enum.reduce([], fn {key, value, exp, fid, off, vsize}, acc ->
+      cond do
+        exp != 0 and exp <= now ->
+          maybe_delete_expired_prefix_entry(state, keydir, key)
           acc
-        end
-      else
-        maybe_delete_expired_prefix_entry(state, keydir, key)
-        acc
+
+        value == nil and not valid_cold_location(fid, off, vsize) ->
+          maybe_delete_expired_prefix_entry(state, keydir, key)
+          acc
+
+        true ->
+          # For cold keys (value=nil), do a disk read to get the actual value
+          actual_value = prefix_entry_value(value, shard_data_path, fid, off)
+
+          if actual_value != nil do
+            field =
+              case :binary.split(key, <<0>>) do
+                [_pre, sub] -> sub
+                _ -> key
+              end
+
+            [{field, actual_value} | acc]
+          else
+            acc
+          end
       end
     end)
   end
 
   defp prefix_entry_value(nil, shard_data_path, fid, off)
-       when shard_data_path != nil and is_integer(fid) do
+       when shard_data_path != nil and is_integer(fid) and fid >= 0 and is_integer(off) and
+              off >= 0 do
     p = file_path(shard_data_path, fid)
 
     case NIF.v2_pread_at(p, off) do
