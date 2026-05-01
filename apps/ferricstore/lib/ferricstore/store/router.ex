@@ -2589,6 +2589,7 @@ defmodule Ferricstore.Store.Router do
         install_rmw_value(ctx, idx, compound_key, value, exp)
       end,
       compound_delete: fn _redis_key, compound_key ->
+        track_keydir_binary_delete(ctx, idx, keydir, compound_key)
         :ets.delete(keydir, compound_key)
         Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, compound_key)
         :ok

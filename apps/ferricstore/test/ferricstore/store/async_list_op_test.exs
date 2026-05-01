@@ -45,6 +45,7 @@ defmodule Ferricstore.Store.AsyncListOpTest do
 
   defp ctx, do: FerricStore.Instance.get(:default)
   defp ukey(base), do: "#{@ns}:#{base}_#{:erlang.unique_integer([:positive])}"
+  defp keydir_binary_bytes(ctx, idx), do: :atomics.get(ctx.keydir_binary_bytes, idx + 1)
 
   # ---------------------------------------------------------------------------
   # Single-caller correctness — round trip via list_op + compound_scan
@@ -174,6 +175,23 @@ defmodule Ferricstore.Store.AsyncListOpTest do
       assert is_integer(fid) and fid >= 0
       assert is_integer(off) and off >= 0
       assert value_size == byte_size(large)
+    end
+
+    test "LPOP releases keydir binary memory for hot off-heap elements" do
+      ctx = ctx()
+      key = ukey("binary_accounting")
+      idx = Router.shard_for(ctx, key)
+      value = :binary.copy("v", 1024)
+      before_push = keydir_binary_bytes(ctx, idx)
+
+      assert 1 = Router.list_op(ctx, key, {:rpush, [value]})
+      after_push = keydir_binary_bytes(ctx, idx)
+      assert after_push >= before_push + byte_size(value)
+
+      assert value == Router.list_op(ctx, key, {:lpop, 1})
+      after_pop = keydir_binary_bytes(ctx, idx)
+
+      assert after_pop <= after_push - byte_size(value)
     end
   end
 
