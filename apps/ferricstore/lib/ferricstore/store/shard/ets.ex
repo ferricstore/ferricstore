@@ -327,9 +327,17 @@ defmodule Ferricstore.Store.Shard.ETS do
   # Prefix-based ETS helpers (replaces O(N) :ets.foldl full-table scans)
   # -------------------------------------------------------------------
 
-  @spec prefix_scan_entries(:ets.tid(), binary(), binary() | nil) :: [{binary(), binary()}]
+  @spec prefix_scan_entries(map() | :ets.tid(), binary(), binary() | nil) :: [
+          {binary(), binary()}
+        ]
   @doc false
-  def prefix_scan_entries(keydir, prefix, shard_data_path) do
+  def prefix_scan_entries(%{keydir: keydir} = state, prefix, shard_data_path),
+    do: do_prefix_scan_entries(state, keydir, prefix, shard_data_path)
+
+  def prefix_scan_entries(keydir, prefix, shard_data_path),
+    do: do_prefix_scan_entries(nil, keydir, prefix, shard_data_path)
+
+  defp do_prefix_scan_entries(state, keydir, prefix, shard_data_path) do
     now = HLC.now_ms()
     prefix_len = byte_size(prefix)
     # Select all 7-tuple fields so we can cold-read nil values
@@ -360,6 +368,7 @@ defmodule Ferricstore.Store.Shard.ETS do
           acc
         end
       else
+        maybe_delete_expired_prefix_entry(state, keydir, key)
         acc
       end
     end)
@@ -378,23 +387,61 @@ defmodule Ferricstore.Store.Shard.ETS do
   defp prefix_entry_value(nil, _shard_data_path, _fid, _off), do: nil
   defp prefix_entry_value(value, _shard_data_path, _fid, _off), do: value
 
-  @spec prefix_count_entries(:ets.tid(), binary()) :: non_neg_integer()
+  @spec prefix_count_entries(map() | :ets.tid(), binary()) :: non_neg_integer()
   @doc false
-  def prefix_count_entries(keydir, prefix) do
+  def prefix_count_entries(%{keydir: keydir} = state, prefix),
+    do: do_prefix_count_entries(state, keydir, prefix)
+
+  def prefix_count_entries(keydir, prefix),
+    do: do_prefix_count_entries(nil, keydir, prefix)
+
+  defp do_prefix_count_entries(state, keydir, prefix) do
     now = HLC.now_ms()
     prefix_len = byte_size(prefix)
 
-    ms = [
+    live_ms = [
       {{:"$1", :_, :"$3", :_, :_, :_, :_},
        [
          {:andalso, {:is_binary, :"$1"},
           {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
-       ], [:"$3"]}
+           {:andalso, {:==, {:binary_part, :"$1", 0, prefix_len}, prefix},
+            {:orelse, {:==, :"$3", 0}, {:>, :"$3", now}}}}}
+       ], [true]}
     ]
 
-    :ets.select(keydir, ms)
-    |> Enum.count(fn exp -> exp == 0 or exp > now end)
+    count = :ets.select_count(keydir, live_ms)
+
+    if state != nil do
+      delete_expired_prefix_entries(state, keydir, prefix, prefix_len, now)
+    end
+
+    count
+  end
+
+  defp delete_expired_prefix_entries(state, keydir, prefix, prefix_len, now) do
+    expired_ms = [
+      {{:"$1", :_, :"$3", :_, :_, :_, :_},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:andalso, {:==, {:binary_part, :"$1", 0, prefix_len}, prefix},
+            {:andalso, {:"/=", :"$3", 0}, {:"=<", :"$3", now}}}}}
+       ], [:"$1"]}
+    ]
+
+    keydir
+    |> :ets.select(expired_ms)
+    |> Enum.each(&delete_prefix_entry(state, keydir, &1))
+  end
+
+  defp maybe_delete_expired_prefix_entry(nil, _keydir, _key), do: :ok
+
+  defp maybe_delete_expired_prefix_entry(state, keydir, key),
+    do: delete_prefix_entry(state, keydir, key)
+
+  defp delete_prefix_entry(state, keydir, key) do
+    track_binary_delete(state, key)
+    :ets.delete(keydir, key)
   end
 
   @doc false

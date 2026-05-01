@@ -570,7 +570,7 @@ defmodule Ferricstore.Store.Ops do
   def compound_scan(%LocalTxStore{} = tx, redis_key, prefix) do
     if local?(tx, redis_key) do
       shard_data_path = promoted_path(tx, redis_key) || tx.shard_state.shard_data_path
-      results = ShardETS.prefix_scan_entries(tx.shard_state.keydir, prefix, shard_data_path)
+      results = ShardETS.prefix_scan_entries(tx.shard_state, prefix, shard_data_path)
 
       results
       |> merge_tx_pending_prefix(prefix)
@@ -590,7 +590,7 @@ defmodule Ferricstore.Store.Ops do
 
   def compound_count(%LocalTxStore{} = tx, redis_key, prefix) do
     if local?(tx, redis_key) do
-      ShardETS.prefix_count_entries(tx.shard_state.keydir, prefix)
+      ShardETS.prefix_count_entries(tx.shard_state, prefix)
     else
       shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
       GenServer.call(shard, {:compound_count, redis_key, prefix})

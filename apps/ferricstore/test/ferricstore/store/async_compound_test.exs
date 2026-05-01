@@ -288,6 +288,50 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       assert Router.get(ctx(), key) == "plain_val"
     end
 
+    test "compound_count releases tracked key bytes for expired fields" do
+      key = ukey("count_expired_field")
+      field = :binary.copy("expired_field", 8)
+      compound_key = hash_field(key, field)
+      prefix = CompoundKey.hash_prefix(key)
+      idx = Router.shard_for(ctx(), key)
+      keydir = elem(ctx().keydir_refs, idx)
+      expired_at = Ferricstore.HLC.now_ms() - 1
+
+      before_bytes = :atomics.get(ctx().keydir_binary_bytes, idx + 1)
+      assert :ok = Router.compound_put(ctx(), key, compound_key, "value", expired_at)
+
+      assert [{^compound_key, _value, ^expired_at, _lfu, _fid, _off, _vsize}] =
+               :ets.lookup(keydir, compound_key)
+
+      assert :atomics.get(ctx().keydir_binary_bytes, idx + 1) > before_bytes
+
+      assert 0 == Router.compound_count(ctx(), key, prefix)
+      assert :ets.lookup(keydir, compound_key) == []
+      assert :atomics.get(ctx().keydir_binary_bytes, idx + 1) == before_bytes
+    end
+
+    test "compound_scan releases tracked key bytes for expired fields" do
+      key = ukey("scan_expired_field")
+      field = :binary.copy("expired_field", 8)
+      compound_key = hash_field(key, field)
+      prefix = CompoundKey.hash_prefix(key)
+      idx = Router.shard_for(ctx(), key)
+      keydir = elem(ctx().keydir_refs, idx)
+      expired_at = Ferricstore.HLC.now_ms() - 1
+
+      before_bytes = :atomics.get(ctx().keydir_binary_bytes, idx + 1)
+      assert :ok = Router.compound_put(ctx(), key, compound_key, "value", expired_at)
+
+      assert [{^compound_key, _value, ^expired_at, _lfu, _fid, _off, _vsize}] =
+               :ets.lookup(keydir, compound_key)
+
+      assert :atomics.get(ctx().keydir_binary_bytes, idx + 1) > before_bytes
+
+      assert [] == Router.compound_scan(ctx(), key, prefix)
+      assert :ets.lookup(keydir, compound_key) == []
+      assert :atomics.get(ctx().keydir_binary_bytes, idx + 1) == before_bytes
+    end
+
     test "SET paths do not use list metadata as a fallback type marker" do
       # Modern list writes always create T:key. LM:key is list payload metadata,
       # so probing it on every plain SET is wasted hot-path work.

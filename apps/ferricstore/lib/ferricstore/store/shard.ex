@@ -313,14 +313,14 @@ defmodule Ferricstore.Store.Shard do
         state
       end
 
-    results = prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
+    results = prefix_scan_entries(state, prefix, state.shard_data_path)
     {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
   end
 
   # Count entries matching a compound key prefix.
   # Uses :ets.select match spec instead of :ets.foldl full-table scan.
   def handle_call({:count_prefix, prefix}, _from, state) do
-    {:reply, prefix_count_entries(state.keydir, prefix), state}
+    {:reply, prefix_count_entries(state, prefix), state}
   end
 
   def handle_call({:exists, key}, _from, state), do: ShardReads.handle_exists(key, state)
@@ -1002,10 +1002,11 @@ defmodule Ferricstore.Store.Shard do
   # Private: read helpers (delegates to Shard.Reads / Shard.ETS)
   # -------------------------------------------------------------------
 
-  defp prefix_scan_entries(keydir, prefix, shard_data_path),
-    do: ShardETS.prefix_scan_entries(keydir, prefix, shard_data_path)
+  defp prefix_scan_entries(state_or_keydir, prefix, shard_data_path),
+    do: ShardETS.prefix_scan_entries(state_or_keydir, prefix, shard_data_path)
 
-  defp prefix_count_entries(keydir, prefix), do: ShardETS.prefix_count_entries(keydir, prefix)
+  defp prefix_count_entries(state_or_keydir, prefix),
+    do: ShardETS.prefix_count_entries(state_or_keydir, prefix)
 
   defp cold_read_warm_ets(state, key, value),
     do: ShardETS.cold_read_warm_ets(state, key, value)

@@ -3561,19 +3561,23 @@ defmodule Ferricstore.Raft.StateMachine do
       end,
       compound_scan: fn _redis_key, prefix ->
         Ferricstore.Store.Shard.ETS.prefix_scan_entries(
-          state.ets,
+          shard_ets_state(state),
           prefix,
           state.shard_data_path
         )
         |> Enum.sort_by(fn {field, _} -> field end)
       end,
       compound_count: fn _redis_key, prefix ->
-        Ferricstore.Store.Shard.ETS.prefix_count_entries(state.ets, prefix)
+        Ferricstore.Store.Shard.ETS.prefix_count_entries(shard_ets_state(state), prefix)
       end,
       exists?: fn key ->
         live_key?(state, key)
       end
     }
+  end
+
+  defp shard_ets_state(state) do
+    %{keydir: state.ets, index: state.shard_index, instance_ctx: state.instance_ctx}
   end
 
   defp live_key?(state, key) do

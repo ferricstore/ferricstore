@@ -384,7 +384,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         cluster_safe_compound_write(state, {:delete, compound_key})
       end,
       compound_scan: fn _redis_key, prefix ->
-        results = ShardETS.prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
+        results = ShardETS.prefix_scan_entries(state, prefix, state.shard_data_path)
         Enum.sort_by(results, fn {field, _} -> field end)
       end
     }
@@ -459,7 +459,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         end
       end,
       compound_scan: fn _redis_key, prefix ->
-        results = ShardETS.prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
+        results = ShardETS.prefix_scan_entries(state, prefix, state.shard_data_path)
         Enum.sort_by(results, fn {field, _} -> field end)
       end
     }

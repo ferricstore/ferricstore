@@ -184,11 +184,11 @@ defmodule Ferricstore.Store.Shard.Compound do
             state
           end
 
-        results = ShardETS.prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
+        results = ShardETS.prefix_scan_entries(state, prefix, state.shard_data_path)
         {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
 
       dedicated_path ->
-        results = ShardETS.prefix_scan_entries(state.keydir, prefix, dedicated_path)
+        results = ShardETS.prefix_scan_entries(state, prefix, dedicated_path)
         {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
     end
   end
@@ -198,10 +198,10 @@ defmodule Ferricstore.Store.Shard.Compound do
   def handle_compound_count(redis_key, prefix, state) do
     case promoted_store(state, redis_key) do
       nil ->
-        {:reply, ShardETS.prefix_count_entries(state.keydir, prefix), state}
+        {:reply, ShardETS.prefix_count_entries(state, prefix), state}
 
       _dedicated_path ->
-        {:reply, ShardETS.prefix_count_entries(state.keydir, prefix), state}
+        {:reply, ShardETS.prefix_count_entries(state, prefix), state}
     end
   end
 
@@ -808,7 +808,7 @@ defmodule Ferricstore.Store.Shard.Compound do
           state
 
         {type, prefix} ->
-          count = ShardETS.prefix_count_entries(state.keydir, prefix)
+          count = ShardETS.prefix_count_entries(state, prefix)
 
           if count > threshold do
             state = ShardFlush.await_in_flight(state)

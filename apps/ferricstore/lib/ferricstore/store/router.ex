@@ -2596,11 +2596,14 @@ defmodule Ferricstore.Store.Router do
         :ok
       end,
       compound_scan: fn _redis_key, prefix ->
-        Ferricstore.Store.Shard.ETS.prefix_scan_entries(keydir, prefix, shard_data_path)
+        state = %{keydir: keydir, index: idx, instance_ctx: ctx}
+
+        Ferricstore.Store.Shard.ETS.prefix_scan_entries(state, prefix, shard_data_path)
         |> Enum.sort_by(fn {field, _} -> field end)
       end,
       compound_count: fn _redis_key, prefix ->
-        Ferricstore.Store.Shard.ETS.prefix_count_entries(keydir, prefix)
+        state = %{keydir: keydir, index: idx, instance_ctx: ctx}
+        Ferricstore.Store.Shard.ETS.prefix_count_entries(state, prefix)
       end,
       exists?: fn k ->
         origin_key_exists?(ctx, idx, keydir, k)
