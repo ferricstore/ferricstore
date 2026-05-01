@@ -200,6 +200,28 @@ defmodule Ferricstore.Raft.StateMachineTest do
                NIF.v2_scan_file(active_file_path)
     end
 
+    test "replays origin RMW when recovery has the old pre-command value", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      :ets.insert(ets, {"old_origin_incr", "1", 0, 1, 0, 0, 1})
+
+      {_state2, {:ok, 2}} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "old_origin_incr", {:incr, "old_origin_incr", 1}, "2", 0}},
+          state
+        )
+
+      assert [{"old_origin_incr", "2", 0, _lfu, 0, _off, 1}] =
+               :ets.lookup(ets, "old_origin_incr")
+
+      assert {:ok, records} = NIF.v2_scan_file(active_file_path)
+      assert {"old_origin_incr", _offset, 1, 0, false} = List.last(records)
+    end
+
     test "replays origin async DELETE when recovery still has an older value", %{
       state: state,
       ets: ets,

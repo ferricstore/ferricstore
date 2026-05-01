@@ -735,7 +735,9 @@ defmodule Ferricstore.Store.Router do
     if large_value_for_hot_cache?(ctx, value) do
       install_large_rmw_and_submit(ctx, idx, key, value, expire_at_ms, raft_cmd, success)
     else
-      with :ok <- async_submit_to_raft(idx, raft_cmd),
+      checked_cmd = {:origin_checked, key, raft_cmd, origin_check_value(value), expire_at_ms}
+
+      with :ok <- async_submit_to_raft(idx, checked_cmd),
            :ok <- install_rmw_value(ctx, idx, key, value, expire_at_ms) do
         success
       end
@@ -776,6 +778,10 @@ defmodule Ferricstore.Store.Router do
     do: byte_size(value) > ctx.hot_cache_max_value_size
 
   defp large_value_for_hot_cache?(_ctx, _value), do: false
+
+  defp origin_check_value(value) when is_integer(value), do: Integer.to_string(value)
+  defp origin_check_value(value) when is_float(value), do: Float.to_string(value)
+  defp origin_check_value(value), do: value
 
   # Read the live value for a key (treating expired TTL as missing).
   defp read_live(ctx, idx, key) do

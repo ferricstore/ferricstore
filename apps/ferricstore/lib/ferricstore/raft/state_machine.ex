@@ -1963,11 +1963,27 @@ defmodule Ferricstore.Raft.StateMachine do
     if ets_has?(state.ets, key), do: apply_single(state, {:getdel, key}), else: nil
   end
 
+  defp apply_single(
+         state,
+         {:async, origin, {:origin_checked, key, inner_cmd, expected_value, expire_at_ms}}
+       )
+       when origin == node() do
+    if origin_command_already_applied?(state, key, inner_cmd, expected_value, expire_at_ms) do
+      :ok
+    else
+      apply_single(state, inner_cmd)
+    end
+  end
+
   # Other async commands, origin: skip when Router already applied locally.
   # If recovery has no local marker/value, apply the accepted Ra entry so an
   # origin crash after Ra acceptance cannot lose the command.
   defp apply_single(state, {:async, origin, inner_cmd}) when origin == node() do
     if async_key_present?(state, inner_cmd), do: :ok, else: apply_single(state, inner_cmd)
+  end
+
+  defp apply_single(state, {:async, _origin, {:origin_checked, _key, inner_cmd, _value, _exp}}) do
+    apply_single(state, inner_cmd)
   end
 
   # Other async commands, replica: apply.
@@ -2317,6 +2333,59 @@ defmodule Ferricstore.Raft.StateMachine do
       _ ->
         apply_single(state, {:put, key, value, expire_at_ms})
     end
+  end
+
+  defp origin_command_already_applied?(state, key, inner_cmd, expected_value, expire_at_ms) do
+    case :ets.lookup(state.ets, key) do
+      [{^key, ^expected_value, ^expire_at_ms, _lfu, _fid, _off, _vs}]
+      when expected_value != nil ->
+        true
+
+      [{^key, nil, ^expire_at_ms, _lfu, fid, off, vs}]
+      when expected_value == nil and valid_cold_location(fid, off, vs) ->
+        true
+
+      [{^key, current_value, _current_exp, _lfu, _fid, _off, _vs}] ->
+        origin_command_already_in_current_value?(inner_cmd, current_value, expected_value)
+
+      _ ->
+        false
+    end
+  end
+
+  defp origin_command_already_in_current_value?(
+         {:incr, _key, delta},
+         current_value,
+         expected_value
+       ) do
+    with {:ok, current} <- coerce_integer(current_value),
+         {:ok, expected} <- coerce_integer(expected_value) do
+      if delta >= 0, do: current >= expected, else: current <= expected
+    else
+      _ -> true
+    end
+  end
+
+  defp origin_command_already_in_current_value?(
+         {:incr_float, _key, delta},
+         current_value,
+         expected_value
+       ) do
+    with {:ok, current} <- coerce_float(current_value),
+         {:ok, expected} <- coerce_float(expected_value) do
+      if delta >= 0.0, do: current >= expected, else: current <= expected
+    else
+      _ -> true
+    end
+  end
+
+  defp origin_command_already_in_current_value?({:append, _key, _suffix}, current_value, expected)
+       when is_binary(current_value) and is_binary(expected) do
+    String.starts_with?(current_value, expected)
+  end
+
+  defp origin_command_already_in_current_value?(_inner_cmd, _current_value, _expected_value) do
+    true
   end
 
   defp normalize_stamped_command({:ratelimit_add, key, window_ms, max, count, _legacy_now_ms}) do
