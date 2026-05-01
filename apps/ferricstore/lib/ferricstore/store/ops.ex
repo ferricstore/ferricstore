@@ -11,6 +11,8 @@ defmodule Ferricstore.Store.Ops do
   without changing command handler logic.
   """
 
+  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.HLC
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.LocalTxStore
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -112,8 +114,12 @@ defmodule Ferricstore.Store.Ops do
         false
       else
         case ShardETS.ets_lookup_warm(tx.shard_state, key) do
-          {:hit, _, _} -> true
-          :expired -> false
+          {:hit, _, _} ->
+            true
+
+          :expired ->
+            false
+
           :miss ->
             case ShardReads.v2_local_read(tx.shard_state, key) do
               {:ok, nil} -> false
@@ -195,7 +201,8 @@ defmodule Ferricstore.Store.Ops do
   end
 
   @spec incr_float(store(), binary(), float()) :: {:ok, binary()} | {:error, binary()}
-  def incr_float(%FerricStore.Instance{} = ctx, key, delta), do: Router.incr_float(ctx, key, delta)
+  def incr_float(%FerricStore.Instance{} = ctx, key, delta),
+    do: Router.incr_float(ctx, key, delta)
 
   def incr_float(%LocalTxStore{} = tx, key, delta) do
     if local?(tx, key) do
@@ -236,8 +243,12 @@ defmodule Ferricstore.Store.Ops do
     if local?(tx, key) do
       current =
         case ShardETS.ets_lookup_warm(tx.shard_state, key) do
-          {:hit, value, _exp} -> ShardETS.to_disk_binary(value)
-          :expired -> ""
+          {:hit, value, _exp} ->
+            ShardETS.to_disk_binary(value)
+
+          :expired ->
+            ""
+
           :miss ->
             case ShardReads.v2_local_read(tx.shard_state, key) do
               {:ok, nil} -> ""
@@ -314,14 +325,19 @@ defmodule Ferricstore.Store.Ops do
   def getex(store, key, exp) when is_map(store), do: store.getex.(key, exp)
 
   @spec setrange(store(), binary(), non_neg_integer(), binary()) :: {:ok, non_neg_integer()}
-  def setrange(%FerricStore.Instance{} = ctx, key, offset, value), do: Router.setrange(ctx, key, offset, value)
+  def setrange(%FerricStore.Instance{} = ctx, key, offset, value),
+    do: Router.setrange(ctx, key, offset, value)
 
   def setrange(%LocalTxStore{} = tx, key, offset, value) do
     if local?(tx, key) do
       old =
         case ShardETS.ets_lookup_warm(tx.shard_state, key) do
-          {:hit, v, _exp} -> ShardETS.to_disk_binary(v)
-          :expired -> ""
+          {:hit, v, _exp} ->
+            ShardETS.to_disk_binary(v)
+
+          :expired ->
+            ""
+
           :miss ->
             case ShardReads.v2_local_read(tx.shard_state, key) do
               {:ok, nil} -> ""
@@ -339,18 +355,27 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
-  def setrange(store, key, offset, value) when is_map(store), do: store.setrange.(key, offset, value)
+  def setrange(store, key, offset, value) when is_map(store),
+    do: store.setrange.(key, offset, value)
 
   # --- Native operations ---
 
   @spec cas(store(), binary(), binary(), binary(), non_neg_integer() | nil) :: 1 | 0 | nil
-  def cas(%FerricStore.Instance{} = ctx, key, expected, new_val, ttl), do: Router.cas(ctx, key, expected, new_val, ttl)
-  def cas(%LocalTxStore{} = tx, key, expected, new_val, ttl), do: Router.cas(tx.instance_ctx, key, expected, new_val, ttl)
-  def cas(store, key, expected, new_val, ttl) when is_map(store), do: store.cas.(key, expected, new_val, ttl)
+  def cas(%FerricStore.Instance{} = ctx, key, expected, new_val, ttl),
+    do: Router.cas(ctx, key, expected, new_val, ttl)
+
+  def cas(%LocalTxStore{} = tx, key, expected, new_val, ttl),
+    do: Router.cas(tx.instance_ctx, key, expected, new_val, ttl)
+
+  def cas(store, key, expected, new_val, ttl) when is_map(store),
+    do: store.cas.(key, expected, new_val, ttl)
 
   @spec lock(store(), binary(), binary(), pos_integer()) :: :ok | {:error, binary()}
   def lock(%FerricStore.Instance{} = ctx, key, owner, ttl), do: Router.lock(ctx, key, owner, ttl)
-  def lock(%LocalTxStore{} = tx, key, owner, ttl), do: Router.lock(tx.instance_ctx, key, owner, ttl)
+
+  def lock(%LocalTxStore{} = tx, key, owner, ttl),
+    do: Router.lock(tx.instance_ctx, key, owner, ttl)
+
   def lock(store, key, owner, ttl) when is_map(store), do: store.lock.(key, owner, ttl)
 
   @spec unlock(store(), binary(), binary()) :: 1 | {:error, binary()}
@@ -359,14 +384,23 @@ defmodule Ferricstore.Store.Ops do
   def unlock(store, key, owner) when is_map(store), do: store.unlock.(key, owner)
 
   @spec extend(store(), binary(), binary(), pos_integer()) :: 1 | {:error, binary()}
-  def extend(%FerricStore.Instance{} = ctx, key, owner, ttl), do: Router.extend(ctx, key, owner, ttl)
-  def extend(%LocalTxStore{} = tx, key, owner, ttl), do: Router.extend(tx.instance_ctx, key, owner, ttl)
+  def extend(%FerricStore.Instance{} = ctx, key, owner, ttl),
+    do: Router.extend(ctx, key, owner, ttl)
+
+  def extend(%LocalTxStore{} = tx, key, owner, ttl),
+    do: Router.extend(tx.instance_ctx, key, owner, ttl)
+
   def extend(store, key, owner, ttl) when is_map(store), do: store.extend.(key, owner, ttl)
 
   @spec ratelimit_add(store(), binary(), pos_integer(), pos_integer(), pos_integer()) :: [term()]
-  def ratelimit_add(%FerricStore.Instance{} = ctx, key, window, max, count), do: Router.ratelimit_add(ctx, key, window, max, count)
-  def ratelimit_add(%LocalTxStore{} = tx, key, window, max, count), do: Router.ratelimit_add(tx.instance_ctx, key, window, max, count)
-  def ratelimit_add(store, key, window, max, count) when is_map(store), do: store.ratelimit_add.(key, window, max, count)
+  def ratelimit_add(%FerricStore.Instance{} = ctx, key, window, max, count),
+    do: Router.ratelimit_add(ctx, key, window, max, count)
+
+  def ratelimit_add(%LocalTxStore{} = tx, key, window, max, count),
+    do: Router.ratelimit_add(tx.instance_ctx, key, window, max, count)
+
+  def ratelimit_add(store, key, window, max, count) when is_map(store),
+    do: store.ratelimit_add.(key, window, max, count)
 
   # --- List operations ---
 
@@ -385,35 +419,46 @@ defmodule Ferricstore.Store.Ops do
   # --- Compound key operations ---
 
   @spec compound_get(store(), binary(), binary()) :: binary() | nil
-  def compound_get(%FerricStore.Instance{} = ctx, redis_key, compound_key), do: Router.compound_get(ctx, redis_key, compound_key)
+  def compound_get(%FerricStore.Instance{} = ctx, redis_key, compound_key),
+    do: Router.compound_get(ctx, redis_key, compound_key)
 
   def compound_get(%LocalTxStore{} = tx, redis_key, compound_key) do
     if local?(tx, redis_key) do
-      local_read_value(tx, compound_key)
+      case promoted_path(tx, redis_key) do
+        nil -> local_read_value(tx, compound_key)
+        dedicated_path -> local_promoted_read_value(tx, compound_key, dedicated_path)
+      end
     else
       shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
       GenServer.call(shard, {:compound_get, redis_key, compound_key})
     end
   end
 
-  def compound_get(store, redis_key, compound_key) when is_map(store), do: store.compound_get.(redis_key, compound_key)
+  def compound_get(store, redis_key, compound_key) when is_map(store),
+    do: store.compound_get.(redis_key, compound_key)
 
   @spec compound_get_meta(store(), binary(), binary()) :: {binary(), non_neg_integer()} | nil
-  def compound_get_meta(%FerricStore.Instance{} = ctx, redis_key, compound_key), do: Router.compound_get_meta(ctx, redis_key, compound_key)
+  def compound_get_meta(%FerricStore.Instance{} = ctx, redis_key, compound_key),
+    do: Router.compound_get_meta(ctx, redis_key, compound_key)
 
   def compound_get_meta(%LocalTxStore{} = tx, redis_key, compound_key) do
     if local?(tx, redis_key) do
-      local_read_meta(tx, compound_key)
+      case promoted_path(tx, redis_key) do
+        nil -> local_read_meta(tx, compound_key)
+        dedicated_path -> local_promoted_read_meta(tx, compound_key, dedicated_path)
+      end
     else
       shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
       GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
     end
   end
 
-  def compound_get_meta(store, redis_key, compound_key) when is_map(store), do: store.compound_get_meta.(redis_key, compound_key)
+  def compound_get_meta(store, redis_key, compound_key) when is_map(store),
+    do: store.compound_get_meta.(redis_key, compound_key)
 
   @spec compound_put(store(), binary(), binary(), binary(), non_neg_integer()) :: :ok
-  def compound_put(%FerricStore.Instance{} = ctx, redis_key, compound_key, value, exp), do: Router.compound_put(ctx, redis_key, compound_key, value, exp)
+  def compound_put(%FerricStore.Instance{} = ctx, redis_key, compound_key, value, exp),
+    do: Router.compound_put(ctx, redis_key, compound_key, value, exp)
 
   def compound_put(%LocalTxStore{} = tx, redis_key, compound_key, value, expire_at_ms) do
     if local?(tx, redis_key) do
@@ -426,10 +471,12 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
-  def compound_put(store, redis_key, compound_key, value, exp) when is_map(store), do: store.compound_put.(redis_key, compound_key, value, exp)
+  def compound_put(store, redis_key, compound_key, value, exp) when is_map(store),
+    do: store.compound_put.(redis_key, compound_key, value, exp)
 
   @spec compound_delete(store(), binary(), binary()) :: :ok
-  def compound_delete(%FerricStore.Instance{} = ctx, redis_key, compound_key), do: Router.compound_delete(ctx, redis_key, compound_key)
+  def compound_delete(%FerricStore.Instance{} = ctx, redis_key, compound_key),
+    do: Router.compound_delete(ctx, redis_key, compound_key)
 
   def compound_delete(%LocalTxStore{} = tx, redis_key, compound_key) do
     if local?(tx, redis_key) do
@@ -442,14 +489,17 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
-  def compound_delete(store, redis_key, compound_key) when is_map(store), do: store.compound_delete.(redis_key, compound_key)
+  def compound_delete(store, redis_key, compound_key) when is_map(store),
+    do: store.compound_delete.(redis_key, compound_key)
 
   @spec compound_scan(store(), binary(), binary()) :: [{binary(), binary()}]
-  def compound_scan(%FerricStore.Instance{} = ctx, redis_key, prefix), do: Router.compound_scan(ctx, redis_key, prefix)
+  def compound_scan(%FerricStore.Instance{} = ctx, redis_key, prefix),
+    do: Router.compound_scan(ctx, redis_key, prefix)
 
   def compound_scan(%LocalTxStore{} = tx, redis_key, prefix) do
     if local?(tx, redis_key) do
-      results = ShardETS.prefix_scan_entries(tx.shard_state.keydir, prefix, tx.shard_state.shard_data_path)
+      shard_data_path = promoted_path(tx, redis_key) || tx.shard_state.shard_data_path
+      results = ShardETS.prefix_scan_entries(tx.shard_state.keydir, prefix, shard_data_path)
       Enum.sort_by(results, fn {field, _} -> field end)
     else
       shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
@@ -457,10 +507,12 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
-  def compound_scan(store, redis_key, prefix) when is_map(store), do: store.compound_scan.(redis_key, prefix)
+  def compound_scan(store, redis_key, prefix) when is_map(store),
+    do: store.compound_scan.(redis_key, prefix)
 
   @spec compound_count(store(), binary(), binary()) :: non_neg_integer()
-  def compound_count(%FerricStore.Instance{} = ctx, redis_key, prefix), do: Router.compound_count(ctx, redis_key, prefix)
+  def compound_count(%FerricStore.Instance{} = ctx, redis_key, prefix),
+    do: Router.compound_count(ctx, redis_key, prefix)
 
   def compound_count(%LocalTxStore{} = tx, redis_key, prefix) do
     if local?(tx, redis_key) do
@@ -471,10 +523,12 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
-  def compound_count(store, redis_key, prefix) when is_map(store), do: store.compound_count.(redis_key, prefix)
+  def compound_count(store, redis_key, prefix) when is_map(store),
+    do: store.compound_count.(redis_key, prefix)
 
   @spec compound_delete_prefix(store(), binary(), binary()) :: :ok
-  def compound_delete_prefix(%FerricStore.Instance{} = ctx, redis_key, prefix), do: Router.compound_delete_prefix(ctx, redis_key, prefix)
+  def compound_delete_prefix(%FerricStore.Instance{} = ctx, redis_key, prefix),
+    do: Router.compound_delete_prefix(ctx, redis_key, prefix)
 
   def compound_delete_prefix(%LocalTxStore{} = tx, redis_key, prefix) do
     if local?(tx, redis_key) do
@@ -492,7 +546,8 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
-  def compound_delete_prefix(store, redis_key, prefix) when is_map(store), do: store.compound_delete_prefix.(redis_key, prefix)
+  def compound_delete_prefix(store, redis_key, prefix) when is_map(store),
+    do: store.compound_delete_prefix.(redis_key, prefix)
 
   # --- Prob operations ---
 
@@ -512,8 +567,11 @@ defmodule Ferricstore.Store.Ops do
     Path.join(tx.shard_state.shard_data_path, "prob")
   end
 
-  def prob_dir(store, _key) when is_map(store) and is_map_key(store, :prob_dir), do: store.prob_dir.()
-  def prob_dir(store, key) when is_map(store) and is_map_key(store, :prob_dir_for_key), do: store.prob_dir_for_key.(key)
+  def prob_dir(store, _key) when is_map(store) and is_map_key(store, :prob_dir),
+    do: store.prob_dir.()
+
+  def prob_dir(store, key) when is_map(store) and is_map_key(store, :prob_dir_for_key),
+    do: store.prob_dir_for_key.(key)
 
   # --- Flush ---
 
@@ -568,15 +626,23 @@ defmodule Ferricstore.Store.Ops do
   # Read value from local ETS, cold-read fallback. Returns value or nil.
   defp local_read_value(tx, key) do
     case ShardETS.ets_lookup_warm(tx.shard_state, key) do
-      {:hit, value, _exp} -> value
-      :expired -> nil
+      {:hit, value, _exp} ->
+        value
+
+      :expired ->
+        nil
+
       :miss ->
         case ShardReads.v2_local_read(tx.shard_state, key) do
-          {:ok, nil} -> nil
+          {:ok, nil} ->
+            nil
+
           {:ok, value} ->
             ShardETS.ets_insert(tx.shard_state, key, value, 0)
             value
-          _error -> nil
+
+          _error ->
+            nil
         end
     end
   end
@@ -584,15 +650,23 @@ defmodule Ferricstore.Store.Ops do
   # Read {value, expire_at_ms} from local ETS, cold-read fallback. Returns {value, exp} or nil.
   defp local_read_meta(tx, key) do
     case ShardETS.ets_lookup_warm(tx.shard_state, key) do
-      {:hit, value, exp} -> {value, exp}
-      :expired -> nil
+      {:hit, value, exp} ->
+        {value, exp}
+
+      :expired ->
+        nil
+
       :miss ->
         case ShardReads.v2_local_read(tx.shard_state, key) do
-          {:ok, nil} -> nil
+          {:ok, nil} ->
+            nil
+
           {:ok, value} ->
             ShardETS.ets_insert(tx.shard_state, key, value, 0)
             {value, 0}
-          _error -> nil
+
+          _error ->
+            nil
         end
     end
   end
@@ -661,14 +735,72 @@ defmodule Ferricstore.Store.Ops do
   # Same as local_read_value but without warming ETS on cold read (matching original closures).
   defp local_read_value_for_rmw(tx, key) do
     case ShardETS.ets_lookup_warm(tx.shard_state, key) do
-      {:hit, value, _exp} -> value
-      :expired -> nil
+      {:hit, value, _exp} ->
+        value
+
+      :expired ->
+        nil
+
       :miss ->
         case ShardReads.v2_local_read(tx.shard_state, key) do
           {:ok, nil} -> nil
           {:ok, v} -> v
           _ -> nil
         end
+    end
+  end
+
+  defp promoted_path(%LocalTxStore{} = tx, redis_key) do
+    case tx.shard_state.promoted_instances do
+      %{^redis_key => %{path: path}} -> path
+      _ -> nil
+    end
+  end
+
+  defp local_promoted_read_value(tx, compound_key, dedicated_path) do
+    case local_promoted_read_meta(tx, compound_key, dedicated_path) do
+      {value, _exp} -> value
+      nil -> nil
+    end
+  end
+
+  defp local_promoted_read_meta(tx, compound_key, dedicated_path) do
+    now = HLC.now_ms()
+    keydir = tx.shard_state.keydir
+
+    case :ets.lookup(keydir, compound_key) do
+      [{^compound_key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
+        {value, 0}
+
+      [{^compound_key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+        {value, exp}
+
+      [{^compound_key, nil, 0, _lfu, fid, off, vsize}] when is_integer(fid) and fid >= 0 ->
+        read_promoted_cold_value(tx, compound_key, dedicated_path, fid, off, vsize, 0)
+
+      [{^compound_key, nil, exp, _lfu, fid, off, vsize}]
+      when exp > now and is_integer(fid) and fid >= 0 ->
+        read_promoted_cold_value(tx, compound_key, dedicated_path, fid, off, vsize, exp)
+
+      [{^compound_key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
+        :ets.delete(keydir, compound_key)
+        nil
+
+      _ ->
+        nil
+    end
+  end
+
+  defp read_promoted_cold_value(tx, compound_key, dedicated_path, fid, off, vsize, exp) do
+    path = ShardETS.file_path(dedicated_path, fid)
+
+    case NIF.v2_pread_at(path, off) do
+      {:ok, value} ->
+        ShardETS.cold_read_warm_ets(tx.shard_state, compound_key, value, exp, fid, off, vsize)
+        {value, exp}
+
+      _ ->
+        nil
     end
   end
 end

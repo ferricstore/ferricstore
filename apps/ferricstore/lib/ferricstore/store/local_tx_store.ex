@@ -24,10 +24,12 @@ defmodule Ferricstore.Store.LocalTxStore do
       instance_ctx: state.instance_ctx,
       shard_index: state.index,
       shard_state: %{
+        instance_ctx: state.instance_ctx,
         keydir: state.keydir,
         index: state.index,
         shard_data_path: state.shard_data_path,
-        data_dir: state.data_dir
+        data_dir: state.data_dir,
+        promoted_instances: state.promoted_instances
       }
     }
   end

@@ -20,6 +20,7 @@ defmodule Ferricstore.Store.PromotionTest do
   setup do
     # Store the original threshold (if any) and set a low one for tests.
     original = Application.get_env(:ferricstore, :promotion_threshold)
+
     original_pt =
       try do
         :persistent_term.get(:ferricstore_promotion_threshold)
@@ -62,31 +63,66 @@ defmodule Ferricstore.Store.PromotionTest do
       flush: fn -> :ok end,
       dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_scan, redis_key, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_count, redis_key, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
     }
@@ -107,7 +143,12 @@ defmodule Ferricstore.Store.PromotionTest do
 
   # Returns true if the given redis_key is promoted in its shard.
   defp promoted?(redis_key) do
-    shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+    shard =
+      Router.shard_name(
+        FerricStore.Instance.get(:default),
+        Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+      )
+
     GenServer.call(shard, {:promoted?, redis_key})
   end
 
@@ -125,7 +166,7 @@ defmodule Ferricstore.Store.PromotionTest do
       refute promoted?(key)
 
       # All fields still accessible
-      assert (@test_threshold - 1) == Hash.handle("HLEN", [key], store)
+      assert @test_threshold - 1 == Hash.handle("HLEN", [key], store)
     end
 
     test "hash with exactly threshold fields is not promoted (threshold is exclusive)" do
@@ -247,6 +288,49 @@ defmodule Ferricstore.Store.PromotionTest do
       :ets.delete(keydir, compound_key)
 
       assert nil == Hash.handle("HGET", [key, field], store)
+    end
+
+    test "transaction HGET reads cold promoted field from dedicated storage" do
+      store = real_store()
+      key = ukey("tx_hget_cold_promoted")
+      ctx = FerricStore.Instance.get(:default)
+      idx = Router.shard_for(ctx, key)
+      shard = Router.shard_name(ctx, idx)
+      keydir = elem(ctx.keydir_refs, idx)
+      compound_key = CompoundKey.hash_field(key, "field_1")
+
+      populate_hash(store, key, @test_threshold + 1)
+      assert promoted?(key)
+
+      [{^compound_key, _value, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, compound_key)
+      :ets.insert(keydir, {compound_key, nil, exp, lfu, fid, off, vsize})
+
+      assert ["value_1"] ==
+               GenServer.call(shard, {:tx_execute, [{"HGET", [key, "field_1"]}], nil})
+    end
+
+    test "transaction HGETALL scans cold promoted fields from dedicated storage" do
+      store = real_store()
+      key = ukey("tx_hgetall_cold_promoted")
+      ctx = FerricStore.Instance.get(:default)
+      idx = Router.shard_for(ctx, key)
+      shard = Router.shard_name(ctx, idx)
+      keydir = elem(ctx.keydir_refs, idx)
+      compound_key = CompoundKey.hash_field(key, "field_1")
+
+      populate_hash(store, key, @test_threshold + 1)
+      assert promoted?(key)
+
+      [{^compound_key, _value, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, compound_key)
+      :ets.insert(keydir, {compound_key, nil, exp, lfu, fid, off, vsize})
+
+      [fields_and_values] = GenServer.call(shard, {:tx_execute, [{"HGETALL", [key]}], nil})
+
+      assert "value_1" ==
+               fields_and_values
+               |> Enum.chunk_every(2)
+               |> Map.new(fn [field, value] -> {field, value} end)
+               |> Map.get("field_1")
     end
   end
 
@@ -597,7 +681,7 @@ defmodule Ferricstore.Store.PromotionTest do
       populate_set(store, key, @test_threshold - 1)
 
       refute promoted?(key)
-      assert (@test_threshold - 1) == Set.handle("SCARD", [key], store)
+      assert @test_threshold - 1 == Set.handle("SCARD", [key], store)
     end
 
     test "set with exactly threshold members is not promoted (threshold is exclusive)" do
@@ -868,7 +952,7 @@ defmodule Ferricstore.Store.PromotionTest do
       populate_zset(store, key, @test_threshold - 1)
 
       refute promoted?(key)
-      assert (@test_threshold - 1) == SortedSet.handle("ZCARD", [key], store)
+      assert @test_threshold - 1 == SortedSet.handle("ZCARD", [key], store)
     end
 
     test "zset with exactly threshold members is not promoted (threshold is exclusive)" do
