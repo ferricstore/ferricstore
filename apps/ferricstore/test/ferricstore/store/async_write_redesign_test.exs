@@ -15,7 +15,10 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
   """
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.BitcaskWriter
   alias Ferricstore.Store.Router
+  alias Ferricstore.Test.ShardHelpers
 
   @ns "rdesign_async"
 
@@ -143,6 +146,35 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
       :ok = Router.put(ctx(), key, "first", 0)
       :ok = Router.put(ctx(), key, "second", 0)
       assert Router.get(ctx(), key) == "second"
+    end
+
+    test "bitcask location points at the last repeated small SET" do
+      key = "#{@ns}:ordered_disk_#{:erlang.unique_integer([:positive])}"
+      c = ctx()
+
+      :ok = Router.put(c, key, "first", 0)
+      :ok = Router.put(c, key, "second", 0)
+
+      ShardHelpers.eventually(
+        fn ->
+          BitcaskWriter.flush_all(c.shard_count)
+
+          case read_ets_entry(c, key) do
+            {^key, "second", _exp, _lfu, fid, _off, _vsize} when is_integer(fid) -> true
+            _ -> false
+          end
+        end,
+        "bitcask writer did not publish location for repeated SET",
+        50,
+        20
+      )
+
+      {^key, "second", _exp, _lfu, fid, off, _vsize} = read_ets_entry(c, key)
+      idx = Router.shard_for(c, key)
+      shard_path = Ferricstore.DataDir.shard_data_path(c.data_dir, idx)
+      path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+
+      assert {:ok, "second"} = NIF.v2_pread_at(path, off)
     end
 
     test "concurrent INCRs on same key sum correctly (atomicity)" do
