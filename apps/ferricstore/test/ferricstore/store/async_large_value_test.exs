@@ -111,6 +111,34 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
       assert {:ok, value <> suffix} == FerricStore.get(key)
     end
 
+    test "APPEND returns disk error instead of acknowledging failed large RMW write" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "alv_test:append_large_disk_error"
+      value = cold_value(?e)
+      suffix = cold_value(?s)
+      idx = Router.shard_for(ctx, key)
+      {file_id, file_path, shard_path} = Ferricstore.Store.ActiveFile.get(idx)
+
+      missing_path =
+        Path.join([
+          System.tmp_dir!(),
+          "missing_ferricstore_#{System.unique_integer([:positive])}",
+          "00000.log"
+        ])
+
+      :ok = Router.put(ctx, key, value, 0)
+      assert_cold_key(key)
+
+      Ferricstore.Store.ActiveFile.publish(idx, file_id, missing_path, Path.dirname(missing_path))
+
+      try do
+        assert {:error, "ERR disk write failed" <> _} = FerricStore.append(key, suffix)
+        assert {:ok, ^value} = FerricStore.get(key)
+      after
+        Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_path)
+      end
+    end
+
     test "GETSET returns and replaces an existing cold large value" do
       key = "alv_test:getset_cold"
       value = cold_value(?g)

@@ -486,9 +486,7 @@ defmodule Ferricstore.Store.Router do
         if delta > 9_223_372_036_854_775_807 or delta < -9_223_372_036_854_775_808 do
           {:error, "ERR increment or decrement would overflow"}
         else
-          install_rmw_value(ctx, idx, key, delta, 0)
-          async_submit_to_raft(idx, {:incr, key, delta})
-          {:ok, delta}
+          install_rmw_and_submit(ctx, idx, key, delta, 0, {:incr, key, delta}, {:ok, delta})
         end
 
       {:hit, value, expire_at_ms} ->
@@ -499,9 +497,15 @@ defmodule Ferricstore.Store.Router do
             if new_val > 9_223_372_036_854_775_807 or new_val < -9_223_372_036_854_775_808 do
               {:error, "ERR increment or decrement would overflow"}
             else
-              install_rmw_value(ctx, idx, key, new_val, expire_at_ms)
-              async_submit_to_raft(idx, {:incr, key, delta})
-              {:ok, new_val}
+              install_rmw_and_submit(
+                ctx,
+                idx,
+                key,
+                new_val,
+                expire_at_ms,
+                {:incr, key, delta},
+                {:ok, new_val}
+              )
             end
 
           :error ->
@@ -514,17 +518,31 @@ defmodule Ferricstore.Store.Router do
     case read_live(ctx, idx, key) do
       :missing ->
         new_val = delta * 1.0
-        install_rmw_value(ctx, idx, key, new_val, 0)
-        async_submit_to_raft(idx, {:incr_float, key, delta})
-        {:ok, new_val}
+
+        install_rmw_and_submit(
+          ctx,
+          idx,
+          key,
+          new_val,
+          0,
+          {:incr_float, key, delta},
+          {:ok, new_val}
+        )
 
       {:hit, value, expire_at_ms} ->
         case coerce_float(value) do
           {:ok, float_val} ->
             new_val = float_val + delta
-            install_rmw_value(ctx, idx, key, new_val, expire_at_ms)
-            async_submit_to_raft(idx, {:incr_float, key, delta})
-            {:ok, new_val}
+
+            install_rmw_and_submit(
+              ctx,
+              idx,
+              key,
+              new_val,
+              expire_at_ms,
+              {:incr_float, key, delta},
+              {:ok, new_val}
+            )
 
           :error ->
             {:error, "ERR value is not a valid float"}
@@ -540,9 +558,15 @@ defmodule Ferricstore.Store.Router do
       end
 
     new_val = old_val <> suffix
-    install_rmw_value(ctx, idx, key, new_val, expire_at_ms)
-    async_submit_to_raft(idx, {:append, key, suffix})
-    {:ok, byte_size(new_val)}
+    install_rmw_and_submit(
+      ctx,
+      idx,
+      key,
+      new_val,
+      expire_at_ms,
+      {:append, key, suffix},
+      {:ok, byte_size(new_val)}
+    )
   end
 
   defp do_rmw_inline(ctx, idx, {:getset, key, new_value}) do
@@ -552,9 +576,7 @@ defmodule Ferricstore.Store.Router do
         {:hit, v, _exp} -> v
       end
 
-    install_rmw_value(ctx, idx, key, new_value, 0)
-    async_submit_to_raft(idx, {:getset, key, new_value})
-    old
+    install_rmw_and_submit(ctx, idx, key, new_value, 0, {:getset, key, new_value}, old)
   end
 
   defp do_rmw_inline(ctx, idx, {:getdel, key}) do
@@ -585,9 +607,15 @@ defmodule Ferricstore.Store.Router do
         nil
 
       {:hit, v, _old_exp} ->
-        install_rmw_value(ctx, idx, key, v, new_expire_at_ms)
-        async_submit_to_raft(idx, {:getex, key, new_expire_at_ms})
-        v
+        install_rmw_and_submit(
+          ctx,
+          idx,
+          key,
+          v,
+          new_expire_at_ms,
+          {:getex, key, new_expire_at_ms},
+          v
+        )
     end
   end
 
@@ -599,9 +627,26 @@ defmodule Ferricstore.Store.Router do
       end
 
     new_val = apply_setrange(old_val, offset, value)
-    install_rmw_value(ctx, idx, key, new_val, expire_at_ms)
-    async_submit_to_raft(idx, {:setrange, key, offset, value})
-    {:ok, byte_size(new_val)}
+    install_rmw_and_submit(
+      ctx,
+      idx,
+      key,
+      new_val,
+      expire_at_ms,
+      {:setrange, key, offset, value},
+      {:ok, byte_size(new_val)}
+    )
+  end
+
+  defp install_rmw_and_submit(ctx, idx, key, value, expire_at_ms, raft_cmd, success) do
+    case install_rmw_value(ctx, idx, key, value, expire_at_ms) do
+      :ok ->
+        async_submit_to_raft(idx, raft_cmd)
+        success
+
+      {:error, _} = err ->
+        err
+    end
   end
 
   # Read the live value for a key (treating expired TTL as missing).
@@ -662,40 +707,46 @@ defmodule Ferricstore.Store.Router do
 
     track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
 
-    if value_for_ets == nil do
-      # Large — sync NIF write then ETS with real offset.
-      case nif_append_batch_with_file(idx, [{key, disk_value, expire_at_ms}]) do
-        {:ok, file_id, [{offset, _record_size}]} ->
-          :ets.insert(
-            keydir,
-            {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
-          )
+    result =
+      if value_for_ets == nil do
+        # Large — sync NIF write then ETS with real offset.
+        case nif_append_batch_with_file(idx, [{key, disk_value, expire_at_ms}]) do
+          {:ok, file_id, [{offset, _record_size}]} ->
+            :ets.insert(
+              keydir,
+              {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
+            )
 
-        {:error, _} ->
-          :ets.insert(
-            keydir,
-            {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_value)}
-          )
+            :ok
+
+          {:error, reason} ->
+            {:error, "ERR disk write failed: #{inspect(reason)}"}
+        end
+      else
+        {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+        :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
+
+        Ferricstore.Store.BitcaskWriter.write(
+          ctx,
+          idx,
+          file_path,
+          file_id,
+          keydir,
+          key,
+          disk_value,
+          expire_at_ms
+        )
+
+        :ok
       end
+
+    if result == :ok do
+      wv_size = :counters.info(ctx.write_version).size
+      if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+      :ok
     else
-      {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
-      :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
-
-      Ferricstore.Store.BitcaskWriter.write(
-        ctx,
-        idx,
-        file_path,
-        file_id,
-        keydir,
-        key,
-        disk_value,
-        expire_at_ms
-      )
+      result
     end
-
-    wv_size = :counters.info(ctx.write_version).size
-    if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
-    :ok
   end
 
   # Coerce a stored value (integer, float, binary-digits) to an integer.
@@ -2452,9 +2503,14 @@ defmodule Ferricstore.Store.Router do
     if under_pressure do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
-      install_rmw_value(ctx, idx, compound_key, value, expire_at_ms)
-      async_submit_to_raft(idx, {:put, compound_key, value, expire_at_ms})
-      :ok
+      case install_rmw_value(ctx, idx, compound_key, value, expire_at_ms) do
+        :ok ->
+          async_submit_to_raft(idx, {:put, compound_key, value, expire_at_ms})
+          :ok
+
+        {:error, _} = err ->
+          err
+      end
     end
   end
 
