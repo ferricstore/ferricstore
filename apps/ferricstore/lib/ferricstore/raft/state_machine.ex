@@ -1041,7 +1041,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
     interval = state.release_cursor_interval
 
-    if div(old_count, interval) != div(state.applied_count, interval) do
+    if div(old_count, interval) != div(state.applied_count, interval) and
+         checkpoint_clean?(state) do
       {state, wrapped_result, [notify_effect, {:release_cursor, ra_index, state}]}
     else
       {state, wrapped_result, [notify_effect]}
@@ -1052,6 +1053,18 @@ defmodule Ferricstore.Raft.StateMachine do
     # No meta (e.g. cross-shard sub-apply) — pass through untouched.
     {state, result}
   end
+
+  # A release_cursor lets ra compact log entries. For the Bitcask-backed state
+  # machine, the log must not be released past writes that are still only in
+  # the OS page cache; the checkpoint flag is cleared only after fsync succeeds.
+  defp checkpoint_clean?(%{
+         instance_ctx: %{checkpoint_flags: checkpoint_flags},
+         shard_index: shard_index
+       }) do
+    :atomics.get(checkpoint_flags, shard_index + 1) == 0
+  end
+
+  defp checkpoint_clean?(_state), do: true
 
   defp with_apply_time(%{system_time: now_ms}, fun) when is_integer(now_ms) do
     CommandTime.with_now_ms(now_ms, fun)

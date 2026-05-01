@@ -1381,6 +1381,35 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert cursor_state.applied_count == interval
     end
 
+    test "release_cursor waits while the shard has uncheckpointed bitcask data", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      checkpoint_flags = :atomics.new(shard_index + 1, signed: false)
+      disk_pressure = :atomics.new(shard_index + 1, signed: false)
+
+      state = %{
+        state
+        | release_cursor_interval: 1,
+          instance_ctx: %{
+            checkpoint_flags: checkpoint_flags,
+            disk_pressure: disk_pressure,
+            hot_cache_max_value_size: 64
+          }
+      }
+
+      meta = %{index: 1, term: 1, system_time: System.os_time(:millisecond)}
+
+      {new_state, {:applied_at, 1, :ok}, effects} =
+        StateMachine.apply(meta, {:put, "dirty_rc_key", "dirty_rc_value", 0}, state)
+
+      assert new_state.applied_count == 1
+      assert :atomics.get(checkpoint_flags, shard_index + 1) == 1
+
+      refute Enum.any?(effects, &match?({:release_cursor, 1, _}, &1)),
+             "Raft cursor must not advance past data that still needs a Bitcask checkpoint"
+    end
+
     test "release_cursor emitted at every interval multiple", %{store: _store, ets: ets} do
       interval = 3
 

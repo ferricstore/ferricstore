@@ -53,7 +53,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     # Publish into ActiveFile registry so the checkpointer can find the
     # path. Use shard index 0.
     ActiveFile.init(1)
-    ActiveFile.publish(0, 0, active_path, tmp)
+    ActiveFile.publish(ctx, 0, 0, active_path, tmp)
 
     # Attach a telemetry handler that forwards checkpoint events.
     parent = self()
