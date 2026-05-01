@@ -865,7 +865,7 @@ defmodule Ferricstore.Store.Router do
       # hot cache) and readers would see nil until the async write completes.
       case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
         {:ok, file_id, [{offset, _record_size}]} ->
-          clear_compound_data_structure_for_string_put(ctx, idx, key)
+          clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
 
           :ets.insert(
             keydir,
@@ -883,7 +883,7 @@ defmodule Ferricstore.Store.Router do
     else
       # Small value: ETS insert only. Bitcask write deferred to state machine
       # apply (flush_pending_writes) — avoids per-key NIF overhead in Router.
-      clear_compound_data_structure_for_string_put(ctx, idx, key)
+      clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
       :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
       size = :counters.info(ctx.write_version).size
       if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
@@ -896,31 +896,61 @@ defmodule Ferricstore.Store.Router do
   defp to_disk_binary(v) when is_float(v), do: Float.to_string(v)
   defp to_disk_binary(v) when is_binary(v), do: v
 
-  defp clear_compound_data_structure_for_string_put(ctx, idx, key) do
-    unless CompoundKey.internal_key?(key) do
-      keydir = elem(ctx.keydir_refs, idx)
-      {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
-      type_key = CompoundKey.type_key(key)
+  defp clear_compound_data_structure_for_string_put(ctx, idx, keydir, key) do
+    if CompoundKey.internal_key?(key) do
+      :ok
+    else
+      case compound_marker_for_string_put(ctx, idx, keydir, key) do
+        :none ->
+          :ok
 
-      case origin_compound_get(ctx, idx, keydir, type_key) do
-        nil ->
-          clear_legacy_list_metadata_for_string_put(ctx, idx, keydir, file_path, key)
-
-        type ->
+        {:type, type_key, type} ->
+          {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
           clear_compound_prefix_for_string_put(ctx, idx, keydir, file_path, key, type)
           delete_local_key(ctx, idx, keydir, file_path, type_key)
+
+        {:legacy_list, list_meta_key} ->
+          {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+          clear_compound_prefix_for_string_put(ctx, idx, keydir, file_path, key, "list")
+          delete_local_key(ctx, idx, keydir, file_path, list_meta_key)
       end
     end
-
-    :ok
   end
 
-  defp clear_legacy_list_metadata_for_string_put(ctx, idx, keydir, file_path, key) do
+  defp compound_marker_for_string_put(ctx, idx, keydir, key) do
+    type_key = CompoundKey.type_key(key)
+
+    case live_compound_marker(ctx, idx, keydir, type_key) do
+      {:ok, type} ->
+        {:type, type_key, type}
+
+      :none ->
+        legacy_list_marker_for_string_put(ctx, idx, keydir, key)
+    end
+  end
+
+  defp legacy_list_marker_for_string_put(ctx, idx, keydir, key) do
     list_meta_key = CompoundKey.list_meta_key(key)
 
-    if origin_compound_get(ctx, idx, keydir, list_meta_key) != nil do
-      clear_compound_prefix_for_string_put(ctx, idx, keydir, file_path, key, "list")
-      delete_local_key(ctx, idx, keydir, file_path, list_meta_key)
+    case live_compound_marker(ctx, idx, keydir, list_meta_key) do
+      {:ok, _meta} -> {:legacy_list, list_meta_key}
+      :none -> :none
+    end
+  end
+
+  # Keep ordinary string SET on the cheap path: a missing marker needs only
+  # direct ETS lookup, while a present marker still uses origin_compound_get/4
+  # so stale/expired/cold markers are handled correctly before clearing.
+  defp live_compound_marker(ctx, idx, keydir, marker_key) do
+    case :ets.lookup(keydir, marker_key) do
+      [] ->
+        :none
+
+      _ ->
+        case origin_compound_get(ctx, idx, keydir, marker_key) do
+          nil -> :none
+          marker -> {:ok, marker}
+        end
     end
   end
 

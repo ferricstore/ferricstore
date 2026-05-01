@@ -93,11 +93,14 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       # Known issue: large values in async mode can return nil if the data dir
       # is cleaned while writes are still in flight. Use eventually to wait for
       # the write to fully land.
-      Ferricstore.Test.Utils.eventually(fn ->
-        result = Router.compound_get(ctx(), redis_key, ck)
-        assert result != nil, "compound_get returned nil for large value"
-        assert big == result
-      end, 15_000)
+      Ferricstore.Test.Utils.eventually(
+        fn ->
+          result = Router.compound_get(ctx(), redis_key, ck)
+          assert result != nil, "compound_get returned nil for large value"
+          assert big == result
+        end,
+        15_000
+      )
     end
   end
 
@@ -228,6 +231,24 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       assert nil == Router.compound_get(ctx(), key, CompoundKey.type_key(key))
       assert nil == Router.compound_get(ctx(), key, hash_field(key, "field"))
     end
+
+    test "plain SET without compound markers does not fetch active file" do
+      key = ukey("plain_no_marker")
+      assert Router.durability_for_key_public(ctx(), key) == :async
+      cache_key = active_file_cache_key(ctx(), key)
+      Process.delete(cache_key)
+
+      assert :ok = Router.put(ctx(), key, "plain_val", 0)
+
+      refute Process.get(cache_key)
+      assert Router.get(ctx(), key) == "plain_val"
+    end
+  end
+
+  defp active_file_cache_key(ctx, key) do
+    idx = Router.shard_for(ctx, key)
+    table_key = if ctx.name == :default, do: idx, else: {ctx.name, idx}
+    {:active_file_cache, table_key}
   end
 
   # ---------------------------------------------------------------------------
