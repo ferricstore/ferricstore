@@ -77,6 +77,23 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
       assert large == GenServer.call(shard, {:get, "pending_big"})
     end
 
+    test "read of pending large value does not force a durability fsync",
+         %{shard: shard, keydir: keydir, ctx: ctx} do
+      large = String.duplicate("D", @threshold + 100)
+
+      :atomics.put(ctx.checkpoint_flags, 1, 0)
+      :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
+      :ok = GenServer.call(shard, {:put, "pending_dirty_read", large, 0})
+
+      assert [{"pending_dirty_read", nil, _exp, _lfu, :pending, 0, 0}] =
+               :ets.lookup(keydir, "pending_dirty_read")
+
+      send(shard, {:tokio_complete, 999_999, :ok, :ok})
+
+      assert large == GenServer.call(shard, {:get, "pending_dirty_read"})
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1
+    end
+
     test "get_meta waits for a truly pending large value", %{shard: shard, keydir: keydir} do
       large = String.duplicate("M", @threshold + 100)
       expire_at_ms = Ferricstore.HLC.now_ms() + 60_000
@@ -155,6 +172,16 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
       :ets.insert(keydir, {field_key, nil, 0, 1, :pending, 0, 0})
 
       assert [] == ShardETS.prefix_scan_entries(keydir, prefix, shard_path)
+    end
+
+    test "scan without pending cold entries does not checkpoint dirty data",
+         %{shard: shard, ctx: ctx} do
+      prefix = "H:clean_scan" <> <<0>>
+
+      :atomics.put(ctx.checkpoint_flags, 1, 1)
+
+      assert [] == GenServer.call(shard, {:scan_prefix, prefix})
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1
     end
   end
 

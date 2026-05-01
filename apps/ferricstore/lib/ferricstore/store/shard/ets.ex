@@ -108,6 +108,28 @@ defmodule Ferricstore.Store.Shard.ETS do
     end
   end
 
+  @spec prefix_has_pending_cold?(:ets.tid(), binary()) :: boolean()
+  @doc false
+  def prefix_has_pending_cold?(keydir, prefix) do
+    now = HLC.now_ms()
+    prefix_len = byte_size(prefix)
+
+    ms = [
+      {{:"$1", nil, :"$2", :_, :pending, :_, :_},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:andalso, {:==, {:binary_part, :"$1", 0, prefix_len}, prefix},
+            {:orelse, {:==, :"$2", 0}, {:>, :"$2", now}}}}}
+       ], [true]}
+    ]
+
+    case :ets.select(keydir, ms, 1) do
+      {[_], _cont} -> true
+      :"$end_of_table" -> false
+    end
+  end
+
   # -------------------------------------------------------------------
   # ETS insert / delete
   # -------------------------------------------------------------------

@@ -41,8 +41,7 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       :miss ->
         if ShardETS.pending_cold?(state, key) do
-          state = ShardFlush.await_in_flight(state)
-          state = ShardFlush.flush_pending_sync(state)
+          state = ShardFlush.flush_pending_for_read(state)
           {:reply, do_get(state, key), state}
         else
           {:reply, nil, state}
@@ -76,8 +75,7 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       :miss ->
         if ShardETS.pending_cold?(state, key) do
-          state = ShardFlush.await_in_flight(state)
-          state = ShardFlush.flush_pending_sync(state)
+          state = ShardFlush.flush_pending_for_read(state)
           {:reply, file_ref_from_lookup(state, key), state}
         else
           {:reply, nil, state}
@@ -112,8 +110,7 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       :miss ->
         if ShardETS.pending_cold?(state, key) do
-          state = ShardFlush.await_in_flight(state)
-          state = ShardFlush.flush_pending_sync(state)
+          state = ShardFlush.flush_pending_for_read(state)
           {:reply, do_get_meta(state, key), state}
         else
           {:reply, nil, state}

@@ -139,8 +139,13 @@ defmodule Ferricstore.Store.Shard.Compound do
   def handle_compound_scan(redis_key, prefix, state) do
     case promoted_store(state, redis_key) do
       nil ->
-        state = ShardFlush.await_in_flight(state)
-        state = ShardFlush.flush_pending_sync(state)
+        state =
+          if ShardETS.prefix_has_pending_cold?(state.keydir, prefix) do
+            ShardFlush.flush_pending_for_read(state)
+          else
+            state
+          end
+
         results = ShardETS.prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
         {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
 

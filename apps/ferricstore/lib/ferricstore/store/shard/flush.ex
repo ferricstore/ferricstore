@@ -106,6 +106,14 @@ defmodule Ferricstore.Store.Shard.Flush do
     end
   end
 
+  @spec flush_pending_for_read(map()) :: map()
+  @doc false
+  def flush_pending_for_read(state) do
+    state
+    |> await_in_flight()
+    |> flush_pending()
+  end
+
   # -------------------------------------------------------------------
   # Await in-flight async flush
   # -------------------------------------------------------------------

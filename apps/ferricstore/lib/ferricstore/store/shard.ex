@@ -306,8 +306,13 @@ defmodule Ferricstore.Store.Shard do
   # Used by HSCAN, SSCAN, ZSCAN via the compound_scan store callback.
   # Uses :ets.select match spec instead of :ets.foldl full-table scan.
   def handle_call({:scan_prefix, prefix}, _from, state) do
-    state = ShardFlush.await_in_flight(state)
-    state = ShardFlush.flush_pending_sync(state)
+    state =
+      if ShardETS.prefix_has_pending_cold?(state.keydir, prefix) do
+        ShardFlush.flush_pending_for_read(state)
+      else
+        state
+      end
+
     results = prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
     {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
   end
