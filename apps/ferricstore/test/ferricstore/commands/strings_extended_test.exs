@@ -76,6 +76,16 @@ defmodule Ferricstore.Commands.StringsExtendedTest do
       assert 5 = Strings.handle("STRLEN", ["k"], store)
     end
 
+    test "STRLEN reads value size without loading the value" do
+      store = %{
+        value_size: fn "cold_large" -> 10_000 end,
+        get: fn _key -> flunk("STRLEN should not load the value") end,
+        compound_get: fn _redis_key, _compound_key -> nil end
+      }
+
+      assert 10_000 == Strings.handle("STRLEN", ["cold_large"], store)
+    end
+
     test "STRLEN of non-existent key returns 0" do
       store = MockStore.make()
       assert 0 = Strings.handle("STRLEN", ["missing"], store)

@@ -101,6 +101,45 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
+  @spec value_size(store(), binary()) :: non_neg_integer() | nil
+  def value_size(%FerricStore.Instance{} = ctx, key), do: Router.value_size(ctx, key)
+
+  def value_size(%LocalTxStore{} = tx, key) do
+    cond do
+      not local?(tx, key) ->
+        Router.value_size(tx.instance_ctx, key)
+
+      tx_deleted?(key) ->
+        nil
+
+      true ->
+        case tx_pending_meta(key) do
+          {value, _exp} ->
+            stored_value_size(value)
+
+          nil ->
+            case ShardETS.ets_lookup(tx.shard_state, key) do
+              {:hit, value, _exp} -> stored_value_size(value)
+              {:cold, _fid, _off, vsize, _exp} -> vsize
+              _ -> nil
+            end
+        end
+    end
+  end
+
+  def value_size(store, key) when is_map(store) do
+    case store do
+      %{value_size: value_size} when is_function(value_size, 1) ->
+        value_size.(key)
+
+      _ ->
+        case get(store, key) do
+          nil -> nil
+          value -> stored_value_size(value)
+        end
+    end
+  end
+
   @spec put(store(), binary(), binary(), non_neg_integer()) :: :ok | {:error, binary()}
   def put(%FerricStore.Instance{} = ctx, key, value, exp), do: Router.put(ctx, key, value, exp)
 
@@ -714,6 +753,11 @@ defmodule Ferricstore.Store.Ops do
   # ===================================================================
 
   defp local?(tx, key), do: Router.shard_for(tx.instance_ctx, key) == tx.shard_index
+
+  defp stored_value_size(value) when is_binary(value), do: byte_size(value)
+  defp stored_value_size(value) when is_integer(value), do: byte_size(Integer.to_string(value))
+  defp stored_value_size(value) when is_float(value), do: byte_size(Float.to_string(value))
+  defp stored_value_size(value), do: value |> to_string() |> byte_size()
 
   defp tx_deleted?(key) do
     deleted = Process.get(:tx_deleted_keys, MapSet.new())

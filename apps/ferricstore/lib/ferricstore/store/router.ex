@@ -1032,6 +1032,11 @@ defmodule Ferricstore.Store.Router do
   defp offheap_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)
   defp offheap_size(_), do: 0
 
+  defp stored_value_size(value) when is_binary(value), do: byte_size(value)
+  defp stored_value_size(value) when is_integer(value), do: byte_size(Integer.to_string(value))
+  defp stored_value_size(value) when is_float(value), do: byte_size(Float.to_string(value))
+  defp stored_value_size(value), do: value |> to_string() |> byte_size()
+
   # Submit an async write to the shard's Batcher, which batches many async
   # commands into a single `ra.pipeline_command({:batch, [{:async, cmd}, ...]})`
   # call. Router has already persisted locally (ETS + Bitcask for big values)
@@ -1522,6 +1527,46 @@ defmodule Ferricstore.Store.Router do
 
         [{^key, _value, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
           exp
+
+        [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
+          track_keydir_binary_delete(ctx, idx, keydir, key)
+          :ets.delete(keydir, key)
+          nil
+
+        [] ->
+          nil
+      end
+    rescue
+      ArgumentError -> nil
+    end
+  end
+
+  @doc """
+  Returns the live plain key value size without reading a cold value.
+
+  Hot entries use the in-memory value size; cold entries use the keydir
+  `value_size` field populated by Bitcask append/recovery.
+  """
+  @spec value_size(FerricStore.Instance.t(), binary()) :: non_neg_integer() | nil
+  def value_size(ctx, key) do
+    idx = shard_for(ctx, key)
+    keydir = resolve_keydir(ctx, idx)
+    now = HLC.now_ms()
+
+    try do
+      case :ets.lookup(keydir, key) do
+        [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
+          stored_value_size(value)
+
+        [{^key, nil, 0, _lfu, fid, _off, vsize}] when is_integer(fid) and fid >= 0 ->
+          vsize
+
+        [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+          stored_value_size(value)
+
+        [{^key, nil, exp, _lfu, fid, _off, vsize}]
+        when exp > now and is_integer(fid) and fid >= 0 ->
+          vsize
 
         [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
           track_keydir_binary_delete(ctx, idx, keydir, key)

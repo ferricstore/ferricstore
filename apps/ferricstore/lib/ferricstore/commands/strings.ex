@@ -257,10 +257,10 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
 
   def handle("STRLEN", [key], store) do
-    case read_string_value(key, store) do
+    case read_string_size(key, store) do
       :missing -> 0
       @wrongtype_error -> @wrongtype_error
-      {:value, v} -> string_value_size(v)
+      {:size, size} -> size
     end
   end
 
@@ -785,9 +785,15 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
-  defp string_value_size(value) when is_integer(value), do: byte_size(Integer.to_string(value))
-  defp string_value_size(value) when is_float(value), do: byte_size(Float.to_string(value))
-  defp string_value_size(value), do: byte_size(value)
+  defp read_string_size(key, store) do
+    case Ops.value_size(store, key) do
+      nil ->
+        if compound_data_structure_key?(key, store), do: @wrongtype_error, else: :missing
+
+      size ->
+        {:size, size}
+    end
+  end
 
   defp replace_string_key(key, value, expire_at_ms, store) do
     clear_compound_data_structure(key, store)
