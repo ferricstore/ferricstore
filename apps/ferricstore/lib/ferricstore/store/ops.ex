@@ -871,49 +871,47 @@ defmodule Ferricstore.Store.Ops do
   end
 
   defp local_set(tx, key, value, opts) do
-    {old_value, effective_expire} =
-      if opts.get or opts.keepttl do
-        case local_read_meta(tx, key) do
-          nil ->
-            {nil, opts.expire_at_ms}
+    get? = Map.get(opts, :get, false)
+    current = local_set_current_meta(tx, key, get?)
 
-          {old_val, old_exp} ->
-            {old_val, if(opts.keepttl, do: old_exp, else: opts.expire_at_ms)}
-        end
-      else
-        {nil, opts.expire_at_ms}
+    {old_value, effective_expire} =
+      case current do
+        nil ->
+          {nil, opts.expire_at_ms}
+
+        {old_val, old_exp} ->
+          {old_val, if(opts.keepttl, do: old_exp, else: opts.expire_at_ms)}
       end
 
     skip? =
       cond do
-        opts.nx and local_read_meta(tx, key) != nil -> true
-        opts.xx and local_read_meta(tx, key) == nil -> true
+        opts.nx and current != nil -> true
+        opts.xx and current == nil -> true
         true -> false
       end
 
     if skip? do
-      if opts.get, do: old_value, else: nil
+      if get?, do: old_value, else: nil
     else
       ShardETS.ets_insert(tx.shard_state, key, value, effective_expire)
       tx_put_pending(key, value, effective_expire)
       tx_undelete(key)
       send(self(), {:tx_pending_write, key, value, effective_expire})
-      if opts.get, do: old_value, else: :ok
+      if get?, do: old_value, else: :ok
     end
   end
 
   defp fallback_set(store, key, value, opts) do
-    {old_value, effective_expire} =
-      if opts.get or opts.keepttl do
-        case get_meta(store, key) do
-          nil ->
-            {nil, opts.expire_at_ms}
+    get? = Map.get(opts, :get, false)
+    current = fallback_set_current_meta(store, key, get?, opts.keepttl)
 
-          {old_val, old_exp} ->
-            {old_val, if(opts.keepttl, do: old_exp, else: opts.expire_at_ms)}
-        end
-      else
-        {nil, opts.expire_at_ms}
+    {old_value, effective_expire} =
+      case current do
+        nil ->
+          {nil, opts.expire_at_ms}
+
+        {old_val, old_exp} ->
+          {old_val, if(opts.keepttl, do: old_exp, else: opts.expire_at_ms)}
       end
 
     skip? =
@@ -924,12 +922,46 @@ defmodule Ferricstore.Store.Ops do
       end
 
     if skip? do
-      if opts.get, do: old_value, else: nil
+      if get?, do: old_value, else: nil
     else
       put(store, key, value, effective_expire)
-      if opts.get, do: old_value, else: :ok
+      if get?, do: old_value, else: :ok
     end
   end
+
+  defp local_set_current_meta(tx, key, true), do: local_read_meta(tx, key)
+
+  defp local_set_current_meta(tx, key, false) do
+    if tx_deleted?(key) do
+      nil
+    else
+      case tx_pending_meta(key) do
+        {_value, _exp} = pending -> pending_expire_meta(pending)
+        nil -> ets_expire_meta(tx, key)
+      end
+    end
+  end
+
+  defp pending_expire_meta({_value, exp}), do: {nil, exp}
+
+  defp ets_expire_meta(tx, key) do
+    case ShardETS.ets_lookup(tx.shard_state, key) do
+      {:hit, _value, exp} -> {nil, exp}
+      {:cold, _fid, _off, _vsize, exp} -> {nil, exp}
+      _ -> nil
+    end
+  end
+
+  defp fallback_set_current_meta(store, key, true, _keepttl), do: get_meta(store, key)
+
+  defp fallback_set_current_meta(store, key, false, true) do
+    case expire_at_ms(store, key) do
+      nil -> nil
+      exp -> {nil, exp}
+    end
+  end
+
+  defp fallback_set_current_meta(_store, _key, false, false), do: nil
 
   # Read value for read-modify-write ops (incr, getset, getdel, getex).
   # Same as local_read_value but without warming ETS on cold read (matching original closures).

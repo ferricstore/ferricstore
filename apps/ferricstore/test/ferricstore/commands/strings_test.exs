@@ -98,6 +98,25 @@ defmodule Ferricstore.Commands.StringsTest do
       assert nil == Strings.handle("SET", ["key", "val", "EX", "10", "NX"], store)
       assert "old" == store.get.("key")
     end
+
+    test "SET KEEPTTL without GET reads expiry without loading a cold value" do
+      expire_at_ms = System.os_time(:millisecond) + 60_000
+      {:ok, seen_expire} = Agent.start_link(fn -> nil end)
+
+      store = %{
+        get: fn _key -> flunk("SET KEEPTTL should not load the value") end,
+        get_meta: fn _key -> flunk("SET KEEPTTL should not load value metadata") end,
+        expire_at_ms: fn "cold" -> expire_at_ms end,
+        put: fn "cold", "new", exp ->
+          Agent.update(seen_expire, fn _ -> exp end)
+          :ok
+        end,
+        compound_get: fn _redis_key, _compound_key -> nil end
+      }
+
+      assert :ok == Strings.handle("SET", ["cold", "new", "KEEPTTL"], store)
+      assert expire_at_ms == Agent.get(seen_expire, & &1)
+    end
   end
 
   # ---------------------------------------------------------------------------
