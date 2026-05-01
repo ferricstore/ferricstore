@@ -49,11 +49,13 @@ defmodule Ferricstore.Application do
   @spec start(Application.start_type(), term()) :: {:ok, pid()} | {:error, term()}
   def start(_type, _args) do
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+
     shard_count =
       case Application.get_env(:ferricstore, :shard_count, 0) do
         0 -> System.schedulers_online()
         n when is_integer(n) and n > 0 -> n
       end
+
     Logger.info("FerricStore starting")
 
     # Create the on-disk directory layout (spec 2B.4) before any process
@@ -86,8 +88,10 @@ defmodule Ferricstore.Application do
 
     # Publish max_active_file_size once at startup. Shards read this via
     # persistent_term.get (~5ns) at init. Never written again at runtime.
-    :persistent_term.put(:ferricstore_max_active_file_size,
-      Application.get_env(:ferricstore, :max_active_file_size, 256 * 1024 * 1024))
+    :persistent_term.put(
+      :ferricstore_max_active_file_size,
+      Application.get_env(:ferricstore, :max_active_file_size, 256 * 1024 * 1024)
+    )
 
     # Initialize MemoryGuard pressure flags as atomics (3 slots).
     # Slot 1: keydir_full (reject new key writes at :reject level)
@@ -105,10 +109,16 @@ defmodule Ferricstore.Application do
     # a uniform 1024-slot -> shard mapping and stores it in persistent_term.
     # Also sets :ferricstore_shard_count.
     Ferricstore.Store.SlotMap.init(shard_count)
-    :persistent_term.put(:ferricstore_promotion_threshold,
-      Application.get_env(:ferricstore, :promotion_threshold, 100))
-    :persistent_term.put(:ferricstore_read_sample_rate,
-      Application.get_env(:ferricstore, :read_sample_rate, 100))
+
+    :persistent_term.put(
+      :ferricstore_promotion_threshold,
+      Application.get_env(:ferricstore, :promotion_threshold, 100)
+    )
+
+    :persistent_term.put(
+      :ferricstore_read_sample_rate,
+      Application.get_env(:ferricstore, :read_sample_rate, 100)
+    )
 
     # Initialize waiter registry ETS for blocking commands
     Ferricstore.Waiters.init()
@@ -135,26 +145,28 @@ defmodule Ferricstore.Application do
     # All code that calls FerricStore.Instance.get(:default) will find it.
     # Note: we pass the EXISTING refs (pressure_flags, etc.) rather than
     # creating new ones, since the global init above already created them.
-    default_ctx = FerricStore.Instance.build(:default, [
-      data_dir: data_dir,
-      shard_count: shard_count,
-      max_memory_bytes: Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824),
-      keydir_max_ram: Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024),
-      eviction_policy: Application.get_env(:ferricstore, :eviction_policy, :volatile_lfu),
-      hot_cache_max_value_size: Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536),
-      max_active_file_size: Application.get_env(:ferricstore, :max_active_file_size, 256 * 1024 * 1024),
-      read_sample_rate: Application.get_env(:ferricstore, :read_sample_rate, 100),
-      lfu_decay_time: Application.get_env(:ferricstore, :lfu_decay_time, 1),
-      lfu_log_factor: Application.get_env(:ferricstore, :lfu_log_factor, 10),
-    ])
+    default_ctx =
+      FerricStore.Instance.build(:default,
+        data_dir: data_dir,
+        shard_count: shard_count,
+        max_memory_bytes: Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824),
+        keydir_max_ram: Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024),
+        eviction_policy: Application.get_env(:ferricstore, :eviction_policy, :volatile_lfu),
+        hot_cache_max_value_size:
+          Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536),
+        max_active_file_size:
+          Application.get_env(:ferricstore, :max_active_file_size, 256 * 1024 * 1024),
+        read_sample_rate: Application.get_env(:ferricstore, :read_sample_rate, 100),
+        lfu_decay_time: Application.get_env(:ferricstore, :lfu_decay_time, 1),
+        lfu_log_factor: Application.get_env(:ferricstore, :lfu_log_factor, 10)
+      )
 
     batcher_children =
       Enum.map(0..(shard_count - 1), fn i ->
         shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
 
         Supervisor.child_spec(
-          {Ferricstore.Raft.Batcher,
-           shard_index: i, shard_id: shard_id},
+          {Ferricstore.Raft.Batcher, shard_index: i, shard_id: shard_id},
           id: :"batcher_#{i}"
         )
       end)
@@ -190,22 +202,23 @@ defmodule Ferricstore.Application do
     # Core children: always started regardless of mode.
     children =
       cluster_children ++
-      [
-        Ferricstore.Stats,
-        Ferricstore.SlowLog,
-        Ferricstore.AuditLog,
-        Ferricstore.Config,
-        Ferricstore.NamespaceConfig,
-        Ferricstore.HLC,
-        Ferricstore.QuorumMetrics,
-        Ferricstore.PrefixMetricsCache
-      ] ++
+        [
+          Ferricstore.Stats,
+          Ferricstore.SlowLog,
+          Ferricstore.AuditLog,
+          Ferricstore.Config,
+          Ferricstore.NamespaceConfig,
+          Ferricstore.HLC,
+          Ferricstore.QuorumMetrics,
+          Ferricstore.PrefixMetricsCache
+        ] ++
         batcher_children ++
         bitcask_writer_children ++
         rmw_coordinator_children ++
         [
-        {Ferricstore.Store.ShardSupervisor, data_dir: data_dir, shard_count: shard_count, instance_ctx: default_ctx}
-      ] ++
+          {Ferricstore.Store.ShardSupervisor,
+           data_dir: data_dir, shard_count: shard_count, instance_ctx: default_ctx}
+        ] ++
         [
           {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
           Ferricstore.PubSub,
@@ -215,7 +228,14 @@ defmodule Ferricstore.Application do
         ]
 
     {max_r, max_s} = Application.get_env(:ferricstore, :supervisor_max_restarts, {20, 10})
-    opts = [strategy: :one_for_one, name: Ferricstore.Supervisor, max_restarts: max_r, max_seconds: max_s]
+
+    opts = [
+      strategy: :one_for_one,
+      name: Ferricstore.Supervisor,
+      max_restarts: max_r,
+      max_seconds: max_s
+    ]
+
     result = Supervisor.start_link(children, opts)
 
     case result do
@@ -259,8 +279,7 @@ defmodule Ferricstore.Application do
       %{}
     )
 
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    {shard_count, data_dir} = runtime_shutdown_config()
 
     shutdown_flush_batchers(shard_count)
     shutdown_flush_bitcask_writers(shard_count)
@@ -275,6 +294,26 @@ defmodule Ferricstore.Application do
     state
   end
 
+  defp runtime_shutdown_config do
+    try do
+      ctx = FerricStore.Instance.get(:default)
+      {ctx.shard_count, ctx.data_dir}
+    rescue
+      ArgumentError ->
+        shard_count = :persistent_term.get(:ferricstore_shard_count, configured_shard_count())
+        data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+        {shard_count, data_dir}
+    end
+  end
+
+  defp configured_shard_count do
+    case Application.get_env(:ferricstore, :shard_count, 0) do
+      0 -> System.schedulers_online()
+      n when is_integer(n) and n > 0 -> n
+      _ -> 4
+    end
+  end
+
   defp shutdown_flush_batchers(shard_count) do
     # Step 2: Flush all Raft batchers — drain pending commands to Raft
     for i <- 0..(shard_count - 1) do
@@ -284,6 +323,7 @@ defmodule Ferricstore.Application do
         :exit, _ -> :ok
       end
     end
+
     Logger.info("Shutdown: batchers flushed")
   end
 
@@ -294,6 +334,7 @@ defmodule Ferricstore.Application do
     catch
       :exit, _ -> :ok
     end
+
     Logger.info("Shutdown: BitcaskWriters flushed")
   end
 
@@ -319,13 +360,16 @@ defmodule Ferricstore.Application do
               |> Enum.each(fn f ->
                 Ferricstore.Bitcask.NIF.v2_fsync(Path.join(shard_path, f))
               end)
-            _ -> :ok
+
+            _ ->
+              :ok
           end
         end
       catch
         _, _ -> :ok
       end
     end
+
     Logger.info("Shutdown: Bitcask files fsynced")
   end
 
@@ -335,12 +379,14 @@ defmodule Ferricstore.Application do
     # while the system is still healthy is more reliable)
     for i <- 0..(shard_count - 1) do
       name = :"Ferricstore.Store.Shard.#{i}"
+
       try do
         GenServer.call(name, :flush, 5_000)
       catch
         :exit, _ -> :ok
       end
     end
+
     Logger.info("Shutdown: shards flushed")
   end
 
@@ -364,6 +410,7 @@ defmodule Ferricstore.Application do
     catch
       _, _ -> :ok
     end
+
     Logger.info("Shutdown: WAL rolled over")
   end
 
@@ -398,9 +445,11 @@ defmodule Ferricstore.Application do
   end
 
   defp await_wal_files_consumed(_ra_dir, [], _max, _interval), do: :ok
+
   defp await_wal_files_consumed(_ra_dir, _old_files, 0, _interval) do
     Logger.warning("Shutdown: segment writer still processing WAL files after timeout")
   end
+
   defp await_wal_files_consumed(ra_dir, old_files, attempts, interval) do
     current = list_wal_files(ra_dir)
     remaining = Enum.filter(old_files, fn f -> f in current end)
@@ -470,20 +519,23 @@ defmodule Ferricstore.Application do
 
       try do
         :ets.foldl(
-          fn {key, value, _expire_at_ms, _lfu, _fid, _off, _vsize}, {c, lk, ls} when is_binary(value) ->
-            size = byte_size(value)
+          fn
+            {key, value, _expire_at_ms, _lfu, _fid, _off, _vsize}, {c, lk, ls}
+            when is_binary(value) ->
+              size = byte_size(value)
 
-            if size > threshold do
-              if size > ls do
-                {c + 1, key, size}
+              if size > threshold do
+                if size > ls do
+                  {c + 1, key, size}
+                else
+                  {c + 1, lk, ls}
+                end
               else
-                {c + 1, lk, ls}
+                {c, lk, ls}
               end
-            else
-              {c, lk, ls}
-            end
 
-            {key, nil, _exp, _lfu, _fid, _off, vsize}, {c, lk, ls} when is_integer(vsize) and vsize > 0 ->
+            {key, nil, _exp, _lfu, _fid, _off, vsize}, {c, lk, ls}
+            when is_integer(vsize) and vsize > 0 ->
               # Cold key (value evicted from RAM) -- use vsize from disk location
               if vsize > threshold do
                 if vsize > ls do

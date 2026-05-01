@@ -11,6 +11,9 @@ defmodule Ferricstore.ApplicationTest do
 
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.BitcaskWriter
+  alias Ferricstore.Store.LFU
   alias Ferricstore.Test.ShardHelpers
 
   # Ensure all shards are alive after every test so that the next test
@@ -54,6 +57,75 @@ defmodule Ferricstore.ApplicationTest do
         assert is_pid(pid) and Process.alive?(pid),
                "Child #{inspect(id)} is not alive (pid=#{inspect(pid)})"
       end
+    end
+  end
+
+  describe "graceful shutdown" do
+    test "prep_stop uses runtime shard count when config shard_count is auto" do
+      original_shard_count = Application.get_env(:ferricstore, :shard_count)
+      original_ready = Ferricstore.Health.ready?()
+
+      shard_index = 2
+      writer = Process.whereis(BitcaskWriter.writer_name(shard_index))
+      assert is_pid(writer)
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "prep_stop_runtime_shards_#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "00000.log")
+      File.touch!(path)
+
+      keydir =
+        :ets.new(:"prep_stop_runtime_shards_#{System.unique_integer([:positive])}", [
+          :set,
+          :public
+        ])
+
+      key = "prep-stop-runtime-shard"
+      value = "must-flush-shard-2"
+      ctx = FerricStore.Instance.get(:default)
+
+      on_exit(fn ->
+        BitcaskWriter.flush(shard_index)
+
+        try do
+          :ets.delete(keydir)
+        rescue
+          ArgumentError -> :ok
+        end
+
+        File.rm_rf(dir)
+
+        case original_shard_count do
+          nil -> Application.delete_env(:ferricstore, :shard_count)
+          count -> Application.put_env(:ferricstore, :shard_count, count)
+        end
+
+        Ferricstore.Health.set_ready(original_ready)
+      end)
+
+      :ets.insert(keydir, {key, value, 0, LFU.initial(), :pending, 0, 0})
+
+      :sys.replace_state(writer, fn state ->
+        %{
+          state
+          | pending: [{:write, ctx, path, 0, keydir, key, value, 0} | state.pending],
+            pending_count: state.pending_count + 1
+        }
+      end)
+
+      Application.put_env(:ferricstore, :shard_count, 0)
+
+      Ferricstore.Application.prep_stop(nil)
+
+      assert [{^key, ^value, 0, _lfu, 0, offset, vsize}] = :ets.lookup(keydir, key)
+      assert vsize == byte_size(value)
+
+      assert {:ok, ^value} = NIF.v2_pread_at(path, offset)
     end
   end
 
