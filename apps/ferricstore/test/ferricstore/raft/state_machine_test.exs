@@ -88,6 +88,38 @@ defmodule Ferricstore.Raft.StateMachineTest do
     end
   end
 
+  describe "origin async PUT replay" do
+    test "persists the pending origin value when ETS still matches the command", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      :ets.insert(ets, {"origin_put", "old", 0, 1, :pending, 0, 0})
+
+      {_state2, :ok} =
+        StateMachine.apply(%{}, {:async, node(), {:put, "origin_put", "old", 0}}, state)
+
+      assert {:ok, [{"origin_put", _off, 3, 0, false}]} = NIF.v2_scan_file(active_file_path)
+      assert {:ok, "old"} = NIF.v2_pread_at(active_file_path, 0)
+    end
+
+    test "does not persist a stale origin PUT after local RMW changed the pending ETS value", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      # Router may apply a later async RMW locally before the earlier async PUT
+      # reaches StateMachine.apply/3. The origin replay must not write the old
+      # command value over the newer local value in Bitcask recovery order.
+      :ets.insert(ets, {"stale_origin_put", "new", 0, 1, :pending, 0, 0})
+
+      {_state2, :ok} =
+        StateMachine.apply(%{}, {:async, node(), {:put, "stale_origin_put", "old", 0}}, state)
+
+      assert {:ok, []} = NIF.v2_scan_file(active_file_path)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # apply/3 with :put
   # ---------------------------------------------------------------------------

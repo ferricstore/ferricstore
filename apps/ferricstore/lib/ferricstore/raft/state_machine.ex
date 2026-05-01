@@ -1651,15 +1651,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # and offset from Router's synchronous NIF write — skip disk too.
   defp apply_single(state, {:async, origin, {:put, key, value, expire_at_ms} = _inner})
        when origin == node() do
-    case :ets.lookup(state.ets, key) do
-      [{^key, _v, _e, _lfu, :pending, 0, _vs}] ->
-        disk_val = to_disk_binary(value)
-        queue_pending_put(key, disk_val, expire_at_ms)
-
-      _ ->
-        :ok
-    end
-
+    maybe_queue_origin_pending_put(state, key, value, expire_at_ms)
     :ok
   end
 
@@ -1685,15 +1677,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # case (single put/delete/incr per key per batch).
   defp apply_single(state, {:async, {:put, key, value, expire_at_ms} = _inner}) do
     if async_key_present?(state, {:put, key, value, expire_at_ms}) do
-      case :ets.lookup(state.ets, key) do
-        [{^key, _v, _e, _lfu, :pending, 0, _vs}] ->
-          disk_val = to_disk_binary(value)
-          queue_pending_put(key, disk_val, expire_at_ms)
-
-        _ ->
-          :ok
-      end
-
+      maybe_queue_origin_pending_put(state, key, value, expire_at_ms)
       :ok
     else
       apply_single(state, {:put, key, value, expire_at_ms})
@@ -1994,6 +1978,19 @@ defmodule Ferricstore.Raft.StateMachine do
       path = prob_path(state, key, "topk")
       NIF.topk_file_incrby_v2(path, pairs)
     end)
+  end
+
+  defp maybe_queue_origin_pending_put(state, key, value, expire_at_ms) do
+    expected_value = value_for_ets(value, hot_cache_threshold(state))
+
+    case :ets.lookup(state.ets, key) do
+      [{^key, ^expected_value, ^expire_at_ms, _lfu, :pending, 0, _vs}]
+      when expected_value != nil ->
+        queue_pending_put(key, to_disk_binary(value), expire_at_ms)
+
+      _ ->
+        :ok
+    end
   end
 
   defp normalize_stamped_command({:ratelimit_add, key, window_ms, max, count, _legacy_now_ms}) do
