@@ -10,8 +10,7 @@ defmodule Ferricstore.Raft.CommandClockGuardTest do
       ":ra.pipeline_command(shard_id, stamp(command), corr, priority)"
     ],
     "lib/ferricstore/raft/batcher.ex" => [
-      ":ra.pipeline_command(state.shard_id, serialized, corr, :normal)",
-      ":ra.pipeline_command(target, serialized, corr, :normal)"
+      ":ra.pipeline_command(target, serialized, corr, priority)"
     ]
   }
 
@@ -21,6 +20,10 @@ defmodule Ferricstore.Raft.CommandClockGuardTest do
     # timestamp before commands enter Raft. This guard blocks future direct
     # production submits that would bypass HLC stamping and reintroduce
     # non-deterministic apply behavior across replicas.
+    #
+    # Batcher is the one allowed direct pipeline path because it serializes
+    # commands with CommandClock.to_ttb/1 first; the raw Ra call must stay
+    # behind that single wrapper so target liveness/reply handling is uniform.
     violations =
       production_files()
       |> Enum.flat_map(&direct_ra_calls/1)

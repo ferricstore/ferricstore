@@ -95,6 +95,31 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
         assert Router.get(ctx(), k) == "multi_val"
       end
     end
+
+    test "immediate Ra pipeline failure replies and does not leak pending" do
+      k = ukey("pipeline_fail")
+      shard_index = Router.shard_for(ctx(), k)
+      batcher_name = Batcher.batcher_name(shard_index)
+
+      original_shard_id = :sys.get_state(batcher_name).shard_id
+
+      :sys.replace_state(batcher_name, fn state ->
+        %{state | shard_id: {:missing_ferricstore_ra_server, node()}}
+      end)
+
+      on_exit(fn ->
+        :sys.replace_state(batcher_name, fn state -> %{state | shard_id: original_shard_id} end)
+        Batcher.reset_pending(shard_index)
+      end)
+
+      ref = make_ref()
+      Batcher.write_batch(shard_index, [{:put, k, "lost", 0}], {self(), ref})
+
+      assert_receive {^ref, {:error, _reason}}, 500
+
+      state = :sys.get_state(batcher_name)
+      assert map_size(state.pending) == 0
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -124,7 +149,10 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
 
       results = Task.await_many(tasks, 15_000)
       # credo:disable-for-next-line Credo.Check.Readability.Semicolons
-      assert Enum.all?(results, fn {:ok, _} -> true; _ -> false end)
+      assert Enum.all?(results, fn
+               {:ok, _} -> true
+               _ -> false
+             end)
 
       for k <- same_shard_keys do
         assert Router.get(ctx(), k) == "accum"

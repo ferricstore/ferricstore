@@ -1063,7 +1063,7 @@ defmodule Ferricstore.Raft.Batcher do
     corr = make_ref()
     started_at = System.monotonic_time()
     {:ttb, bin} = serialized = CommandClock.to_ttb(single_cmd)
-    submit_result = :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
+    submit_result = pipeline_command(state.shard_id, serialized, corr, :normal)
 
     emit_quorum_submit_telemetry(
       state,
@@ -1075,15 +1075,14 @@ defmodule Ferricstore.Raft.Batcher do
       submit_result
     )
 
-    mono = System.monotonic_time()
-    %{state | pending: Map.put(state.pending, corr, {froms, :single, mono})}
+    track_or_reject_quorum_submit(state, corr, froms, :single, submit_result)
   end
 
   defp pipeline_submit(state, batch, froms) do
     corr = make_ref()
     started_at = System.monotonic_time()
     {:ttb, bin} = serialized = CommandClock.to_ttb({:batch, batch})
-    submit_result = :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
+    submit_result = pipeline_command(state.shard_id, serialized, corr, :normal)
 
     emit_quorum_submit_telemetry(
       state,
@@ -1095,8 +1094,7 @@ defmodule Ferricstore.Raft.Batcher do
       submit_result
     )
 
-    mono = System.monotonic_time()
-    %{state | pending: Map.put(state.pending, corr, {froms, :batch, mono})}
+    track_or_reject_quorum_submit(state, corr, froms, :batch, submit_result)
   end
 
   # Flush path for commands accumulated via Batcher.async_submit (called by
@@ -1155,11 +1153,62 @@ defmodule Ferricstore.Raft.Batcher do
   defp submit_async_with_retry(state, wrapped_batch, target, retry_count) do
     corr = make_ref()
     serialized = CommandClock.to_ttb({:batch, wrapped_batch})
-    :ra.pipeline_command(target, serialized, corr, :normal)
+    submit_result = pipeline_command(target, serialized, corr, :normal)
 
-    entry = {[], :async_no_reply, wrapped_batch, retry_count, System.monotonic_time()}
-    %{state | pending: Map.put(state.pending, corr, entry)}
+    if pipeline_submit_status(submit_result) == :ok do
+      entry = {[], :async_no_reply, wrapped_batch, retry_count, System.monotonic_time()}
+      %{state | pending: Map.put(state.pending, corr, entry)}
+    else
+      :telemetry.execute(
+        [:ferricstore, :batcher, :async_dropped],
+        %{batch_size: length(wrapped_batch)},
+        %{shard_index: state.shard_index, reason: submit_result}
+      )
+
+      Logger.warning(
+        "Batcher shard=#{state.shard_index}: async batch of #{length(wrapped_batch)} commands not submitted to Raft: #{inspect(submit_result)}"
+      )
+
+      maybe_reply_flush_waiters(state)
+    end
   end
+
+  defp track_or_reject_quorum_submit(state, corr, froms, kind, submit_result) do
+    if pipeline_submit_status(submit_result) == :ok do
+      mono = System.monotonic_time()
+      %{state | pending: Map.put(state.pending, corr, {froms, kind, mono})}
+    else
+      reply_all_froms(froms, normalize_pipeline_error(submit_result))
+
+      Logger.warning(
+        "Batcher shard=#{state.shard_index}: #{kind} command not submitted to Raft: #{inspect(submit_result)}"
+      )
+
+      maybe_reply_flush_waiters(state)
+    end
+  end
+
+  defp pipeline_command(target, serialized, corr, priority) do
+    if local_pipeline_target_alive?(target) do
+      :ra.pipeline_command(target, serialized, corr, priority)
+    else
+      {:error, {:ra_target_down, target}}
+    end
+  end
+
+  defp local_pipeline_target_alive?({name, target_node})
+       when target_node == node() and is_atom(name) do
+    Process.whereis(name) != nil
+  end
+
+  defp local_pipeline_target_alive?(name) when is_atom(name) do
+    Process.whereis(name) != nil
+  end
+
+  defp local_pipeline_target_alive?(_target), do: true
+
+  defp normalize_pipeline_error({:error, _reason} = error), do: error
+  defp normalize_pipeline_error(other), do: {:error, other}
 
   # Enqueue a write that MUST go through quorum (RMW ops where the caller
   # needs atomicity). Bypasses namespace-config durability lookup and uses
