@@ -46,12 +46,22 @@ defmodule Ferricstore.Commands.Set do
 
   def handle("SADD", [key | members], store) when members != [] do
     with :ok <- TypeRegistry.check_or_set(key, :set, store) do
-      Enum.reduce(members, 0, fn member, acc ->
-        compound_key = CompoundKey.set_member(key, member)
-        existing = Ops.compound_get(store, key, compound_key)
-        Ops.compound_put(store, key, compound_key, @presence_marker, 0)
-        if existing == nil, do: acc + 1, else: acc
-      end)
+      compound_keys =
+        members
+        |> Enum.uniq()
+        |> Enum.map(&CompoundKey.set_member(key, &1))
+
+      new_keys =
+        store
+        |> Ops.compound_batch_get(key, compound_keys)
+        |> Enum.zip(compound_keys)
+        |> Enum.flat_map(fn
+          {nil, compound_key} -> [compound_key]
+          {_value, _compound_key} -> []
+        end)
+
+      Enum.each(new_keys, &Ops.compound_put(store, key, &1, @presence_marker, 0))
+      length(new_keys)
     end
   end
 

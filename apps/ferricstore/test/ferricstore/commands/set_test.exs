@@ -22,6 +22,44 @@ defmodule Ferricstore.Commands.SetTest do
       assert 1 == Set.handle("SADD", ["myset", "b", "c"], store)
     end
 
+    test "SADD batches member existence reads and writes new unique members only" do
+      parent = self()
+      type_key = CompoundKey.type_key("myset")
+
+      member_keys = [
+        CompoundKey.set_member("myset", "a"),
+        CompoundKey.set_member("myset", "b"),
+        CompoundKey.set_member("myset", "existing")
+      ]
+
+      store = %{
+        compound_get: fn
+          "myset", ^type_key ->
+            "set"
+
+          "myset", compound_key ->
+            flunk(
+              "SADD should use compound_batch_get, got per-member lookup #{inspect(compound_key)}"
+            )
+        end,
+        compound_batch_get: fn "myset", ^member_keys ->
+          send(parent, {:compound_batch_get, member_keys})
+          [nil, nil, "1"]
+        end,
+        compound_put: fn "myset", compound_key, "1", 0 ->
+          send(parent, {:compound_put, compound_key})
+          :ok
+        end
+      }
+
+      assert 2 == Set.handle("SADD", ["myset", "a", "a", "b", "existing"], store)
+      assert_received {:compound_batch_get, ^member_keys}
+      assert_received {:compound_put, added_a}
+      assert_received {:compound_put, added_b}
+      assert Enum.sort([added_a, added_b]) == Enum.sort(Enum.take(member_keys, 2))
+      refute_received {:compound_put, _}
+    end
+
     test "SADD with all duplicates returns 0" do
       store = MockStore.make()
       Set.handle("SADD", ["myset", "a"], store)
