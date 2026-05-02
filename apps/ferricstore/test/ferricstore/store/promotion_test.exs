@@ -285,6 +285,42 @@ defmodule Ferricstore.Store.PromotionTest do
       assert large_value == Hash.handle("HGET", [key, "large_field"], store)
     end
 
+    test "repeated HGET preserves cold large promoted hash fields after ETS miss" do
+      store = real_store()
+      key = ukey("promoted_large_cold_repeat")
+      field = "large_field"
+      compound_key = CompoundKey.hash_field(key, field)
+      large_value = String.duplicate("x", 70_000)
+
+      populate_hash(store, key, @test_threshold + 1)
+      assert promoted?(key)
+
+      ctx = FerricStore.Instance.get(:default)
+      shard_idx = Router.shard_for(ctx, key)
+      shard = Router.shard_name(ctx, shard_idx)
+      state = :sys.get_state(shard)
+      dedicated_path = state.promoted_instances[key].path
+
+      assert {:ok, {fid, offset, record_size}} =
+               ShardCompound.promoted_write(dedicated_path, compound_key, large_value, 0)
+
+      Ferricstore.Store.Shard.ETS.ets_insert_with_location(
+        state,
+        compound_key,
+        large_value,
+        0,
+        fid,
+        offset,
+        record_size
+      )
+
+      assert [{^compound_key, nil, 0, _, ^fid, ^offset, _value_size}] =
+               :ets.lookup(state.keydir, compound_key)
+
+      assert large_value == Hash.handle("HGET", [key, field], store)
+      assert large_value == Hash.handle("HGET", [key, field], store)
+    end
+
     test "HSET updates existing field in promoted hash" do
       store = real_store()
       key = ukey("hset_update_promoted")

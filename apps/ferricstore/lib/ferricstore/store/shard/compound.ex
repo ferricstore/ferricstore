@@ -168,6 +168,19 @@ defmodule Ferricstore.Store.Shard.Compound do
                 ShardETS.ets_insert(state, compound_key, value, exp)
                 {value, state}
 
+              {:ok, value, exp, fid, off, vsize} ->
+                ShardETS.ets_insert_with_location(
+                  state,
+                  compound_key,
+                  value,
+                  exp,
+                  fid,
+                  off,
+                  vsize
+                )
+
+                {value, state}
+
               {:ok, value} ->
                 ShardETS.ets_insert(state, compound_key, value, 0)
                 {value, state}
@@ -231,6 +244,19 @@ defmodule Ferricstore.Store.Shard.Compound do
 
               {:ok, value, exp} ->
                 ShardETS.ets_insert(state, compound_key, value, exp)
+                {{value, exp}, state}
+
+              {:ok, value, exp, fid, off, vsize} ->
+                ShardETS.ets_insert_with_location(
+                  state,
+                  compound_key,
+                  value,
+                  exp,
+                  fid,
+                  off,
+                  vsize
+                )
+
                 {{value, exp}, state}
 
               {:ok, value} ->
@@ -531,7 +557,11 @@ defmodule Ferricstore.Store.Shard.Compound do
   end
 
   @spec promoted_read(binary(), binary(), map()) ::
-          {:ok, binary() | nil} | {:ok, binary(), non_neg_integer()} | {:error, term()}
+          {:ok, binary() | nil}
+          | {:ok, binary(), non_neg_integer()}
+          | {:ok, binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(),
+             non_neg_integer()}
+          | {:error, term()}
   @doc false
   def promoted_read(dedicated_path, compound_key, %{keydir: keydir} = state) do
     now = HLC.now_ms()
@@ -547,7 +577,7 @@ defmodule Ferricstore.Store.Shard.Compound do
         file_path = dedicated_file_path(dedicated_path, fid)
 
         case read_cold_async(file_path, offset) do
-          {:ok, value} -> {:ok, value, exp}
+          {:ok, value} -> {:ok, value, exp, fid, offset, vsize}
           other -> other
         end
 
