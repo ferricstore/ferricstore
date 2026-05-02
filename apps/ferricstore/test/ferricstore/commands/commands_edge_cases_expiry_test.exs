@@ -101,15 +101,10 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesExpiryTest do
       assert ttl > 0
     end
 
-    @tag :skip
-    # Known limitation: EXPIREAT 0 is treated as a past timestamp (immediate deletion)
-    # rather than the "no TTL" sentinel, because epoch 0 is in the past
-    test "EXPIREAT with 0 timestamp (epoch) sets expire_at_ms to 0 which means no-expiry" do
-      # In this implementation, expire_at_ms=0 is the sentinel for "no TTL".
-      # EXPIREAT 0 stores 0*1000=0, effectively removing any TTL.
+    test "EXPIREAT with 0 timestamp deletes the key" do
       store = MockStore.make(%{"k" => {"v", 0}})
       assert 1 == Expiry.handle("EXPIREAT", ["k", "0"], store)
-      assert -1 == Expiry.handle("TTL", ["k"], store)
+      assert -2 == Expiry.handle("TTL", ["k"], store)
     end
 
     test "EXPIREAT with only key arg returns error" do
@@ -145,15 +140,10 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesExpiryTest do
       assert -2 == Expiry.handle("PTTL", ["k"], store)
     end
 
-    @tag :skip
-    # Known limitation: PEXPIREAT 0 is treated as a past timestamp (immediate deletion)
-    # rather than the "no TTL" sentinel, because epoch 0 is in the past
-    test "PEXPIREAT with 0 timestamp sets expire_at_ms to 0 which means no-expiry" do
-      # In this implementation, expire_at_ms=0 is the sentinel for "no TTL".
-      # PEXPIREAT 0 stores 0, effectively removing any TTL.
+    test "PEXPIREAT with 0 timestamp deletes the key" do
       store = MockStore.make(%{"k" => {"v", 0}})
       assert 1 == Expiry.handle("PEXPIREAT", ["k", "0"], store)
-      assert -1 == Expiry.handle("PTTL", ["k"], store)
+      assert -2 == Expiry.handle("PTTL", ["k"], store)
     end
 
     test "PEXPIREAT with far-future ms timestamp persists key" do
@@ -255,5 +245,4 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesExpiryTest do
       assert 0 == Expiry.handle("PERSIST", ["k"], store)
     end
   end
-
 end

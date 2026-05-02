@@ -41,16 +41,12 @@ defmodule Ferricstore.Commands.RedisCompatExpiryTest do
       assert result == 1 or match?({:error, _}, result)
     end
 
-    @tag :skip
-    # Known limitation: our impl rejects negative EXPIRE values with an error
-    # instead of treating them as immediate deletion (Redis compat)
     test "EXPIRE with negative value deletes the key (Redis compat)" do
       store = MockStore.make()
       Strings.handle("SET", ["mykey", "hello"], store)
 
       result = Expiry.handle("EXPIRE", ["mykey", "-1"], store)
       assert 1 == result
-      # Key should be deleted
       assert nil == store.get.("mykey")
     end
 
