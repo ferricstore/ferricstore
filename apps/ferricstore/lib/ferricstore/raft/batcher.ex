@@ -731,6 +731,106 @@ defmodule Ferricstore.Raft.Batcher do
     {:noreply, new_state}
   end
 
+  # Handle rejected commands (not_leader). For async entries we re-submit
+  # to the hinted leader up to @max_async_retries times before dropping.
+  # For quorum entries we reply :error to the blocked caller so the
+  # application can retry itself.
+  def handle_info({:ra_event, _from_id, {:rejected, {not_leader, maybe_leader, corr}}}, state) do
+    case Map.pop(state.pending, corr) do
+      {nil, _pending} ->
+        {:noreply, state}
+
+      # Retry-aware async entry. Has the original batch + retry_count.
+      {{_froms, :async_no_reply, batch, retry_count, _mono}, new_pending} ->
+        state_without = %{state | pending: new_pending}
+
+        target =
+          case {not_leader, maybe_leader} do
+            {:not_leader, leader} when leader != :undefined and leader != nil -> leader
+            _ -> state.shard_id
+          end
+
+        new_state =
+          if retry_count < @max_async_retries do
+            :telemetry.execute(
+              [:ferricstore, :batcher, :async_retry],
+              %{retry_count: retry_count + 1, batch_size: length(batch)},
+              %{shard_index: state.shard_index, target: inspect(target)}
+            )
+
+            submit_async_with_retry(state_without, batch, target, retry_count + 1)
+          else
+            :telemetry.execute(
+              [:ferricstore, :batcher, :async_dropped],
+              %{batch_size: length(batch)},
+              %{shard_index: state.shard_index, reason: :max_retries}
+            )
+
+            Logger.warning(
+              "Batcher shard=#{state.shard_index}: async batch of #{length(batch)} commands dropped after #{@max_async_retries} retries"
+            )
+
+            state_without
+          end
+
+        {:noreply, maybe_reply_flush_waiters(new_state)}
+
+      # Legacy async shape without retry info — drop silently.
+      {{_froms, :async_no_reply}, new_pending} ->
+        {:noreply, maybe_reply_flush_waiters(%{state | pending: new_pending})}
+
+      # Quorum entry — local server isn't leader. Reply :not_leader so
+      # Router.forward_to_leader takes over (and barriers on local apply
+      # via await_local_applied/2 after the leader replies, fixing
+      # read-your-write across the redirect).
+      {pending_entry, new_pending}
+      when is_tuple(pending_entry) and elem(pending_entry, 1) in [:single, :batch] ->
+        froms = elem(pending_entry, 0)
+        new_state = %{state | pending: new_pending}
+
+        leader =
+          case {not_leader, maybe_leader} do
+            {:not_leader, leader} when leader != :undefined and leader != nil -> leader
+            _ -> state.shard_id
+          end
+
+        reply_all_froms(froms, {:error, {:not_leader, leader}})
+
+        {:noreply, maybe_reply_flush_waiters(new_state)}
+    end
+  end
+
+  # Periodic sweep of pending entries whose :applied or :rejected never
+  # arrived (bounds memory against lost ra_events / pathological cluster
+  # states). Only affects the retry-aware async entries; everything else
+  # is either still in flight or will be resolved when the ra_event arrives.
+  def handle_info(:sweep_async_pending, state) do
+    new_state = sweep_async_pending(state)
+    Process.send_after(self(), :sweep_async_pending, @async_pending_sweep_ms)
+    {:noreply, new_state}
+  end
+
+  # Handle legacy :flush messages (e.g. from cancel_timer race conditions)
+  def handle_info(:flush, state) do
+    {:noreply, state}
+  end
+
+  # Invalidate the namespace config cache when config changes.
+  # Sent by NamespaceConfig after any set/reset operation.
+  def handle_info(:ns_config_changed, state) do
+    # Flush all open slots immediately so queued commands with the old
+    # window_ms are processed. Next commands create fresh slots with
+    # the new config values.
+    new_state = flush_all_slots(state)
+    {:noreply, %{new_state | ns_cache: %{}}}
+  end
+
+  # Catch-all for unexpected messages (e.g. stale Task results, DOWN messages
+  # from previous implementation). Silently discard.
+  def handle_info(_msg, state) do
+    {:noreply, state}
+  end
+
   # If the new-shape wrapped reply is present, unwrap; otherwise pass through
   # for backward compatibility with WAL entries that pre-date this change.
   defp unwrap_applied({:applied_at, ra_index, real_result}), do: {ra_index, real_result}
@@ -833,106 +933,6 @@ defmodule Ferricstore.Raft.Batcher do
     Enum.each(ready, fn {idx, kind, froms, result} -> do_reply(kind, froms, result, idx) end)
 
     %{state | local_apply_waiters: still_waiting}
-  end
-
-  # Handle rejected commands (not_leader). For async entries we re-submit
-  # to the hinted leader up to @max_async_retries times before dropping.
-  # For quorum entries we reply :error to the blocked caller so the
-  # application can retry itself.
-  def handle_info({:ra_event, _from_id, {:rejected, {not_leader, maybe_leader, corr}}}, state) do
-    case Map.pop(state.pending, corr) do
-      {nil, _pending} ->
-        {:noreply, state}
-
-      # Retry-aware async entry. Has the original batch + retry_count.
-      {{_froms, :async_no_reply, batch, retry_count, _mono}, new_pending} ->
-        state_without = %{state | pending: new_pending}
-
-        target =
-          case {not_leader, maybe_leader} do
-            {:not_leader, leader} when leader != :undefined and leader != nil -> leader
-            _ -> state.shard_id
-          end
-
-        new_state =
-          if retry_count < @max_async_retries do
-            :telemetry.execute(
-              [:ferricstore, :batcher, :async_retry],
-              %{retry_count: retry_count + 1, batch_size: length(batch)},
-              %{shard_index: state.shard_index, target: inspect(target)}
-            )
-
-            submit_async_with_retry(state_without, batch, target, retry_count + 1)
-          else
-            :telemetry.execute(
-              [:ferricstore, :batcher, :async_dropped],
-              %{batch_size: length(batch)},
-              %{shard_index: state.shard_index, reason: :max_retries}
-            )
-
-            Logger.warning(
-              "Batcher shard=#{state.shard_index}: async batch of #{length(batch)} commands dropped after #{@max_async_retries} retries"
-            )
-
-            state_without
-          end
-
-        {:noreply, maybe_reply_flush_waiters(new_state)}
-
-      # Legacy async shape without retry info — drop silently.
-      {{_froms, :async_no_reply}, new_pending} ->
-        {:noreply, maybe_reply_flush_waiters(%{state | pending: new_pending})}
-
-      # Quorum entry — local server isn't leader. Reply :not_leader so
-      # Router.forward_to_leader takes over (and barriers on local apply
-      # via await_local_applied/2 after the leader replies, fixing
-      # read-your-write across the redirect).
-      {pending_entry, new_pending}
-      when is_tuple(pending_entry) and elem(pending_entry, 1) in [:single, :batch] ->
-        froms = elem(pending_entry, 0)
-        new_state = %{state | pending: new_pending}
-
-        leader =
-          case {not_leader, maybe_leader} do
-            {:not_leader, leader} when leader != :undefined and leader != nil -> leader
-            _ -> state.shard_id
-          end
-
-        reply_all_froms(froms, {:error, {:not_leader, leader}})
-
-        {:noreply, maybe_reply_flush_waiters(new_state)}
-    end
-  end
-
-  # Periodic sweep of pending entries whose :applied or :rejected never
-  # arrived (bounds memory against lost ra_events / pathological cluster
-  # states). Only affects the retry-aware async entries; everything else
-  # is either still in flight or will be resolved when the ra_event arrives.
-  def handle_info(:sweep_async_pending, state) do
-    new_state = sweep_async_pending(state)
-    Process.send_after(self(), :sweep_async_pending, @async_pending_sweep_ms)
-    {:noreply, new_state}
-  end
-
-  # Handle legacy :flush messages (e.g. from cancel_timer race conditions)
-  def handle_info(:flush, state) do
-    {:noreply, state}
-  end
-
-  # Invalidate the namespace config cache when config changes.
-  # Sent by NamespaceConfig after any set/reset operation.
-  def handle_info(:ns_config_changed, state) do
-    # Flush all open slots immediately so queued commands with the old
-    # window_ms are processed. Next commands create fresh slots with
-    # the new config values.
-    new_state = flush_all_slots(state)
-    {:noreply, %{new_state | ns_cache: %{}}}
-  end
-
-  # Catch-all for unexpected messages (e.g. stale Task results, DOWN messages
-  # from previous implementation). Silently discard.
-  def handle_info(_msg, state) do
-    {:noreply, state}
   end
 
   @impl true
