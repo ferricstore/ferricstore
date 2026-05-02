@@ -1060,6 +1060,45 @@ defmodule Ferricstore.Store.Router do
     :ok
   end
 
+  defp rollback_installed_async_value(ctx, idx, key, {:value, previous_value, expire_at_ms}) do
+    keydir = elem(ctx.keydir_refs, idx)
+    disk_value = to_disk_binary(previous_value)
+
+    case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
+      {:ok, file_id, [{offset, _record_size}]} ->
+        ets_value =
+          case previous_value do
+            v when is_integer(v) ->
+              Integer.to_string(v)
+
+            v when is_float(v) ->
+              Float.to_string(v)
+
+            v when is_binary(v) ->
+              if byte_size(v) > ctx.hot_cache_max_value_size, do: nil, else: v
+          end
+
+        track_keydir_binary_insert(ctx, idx, keydir, key, ets_value)
+
+        :ets.insert(
+          keydir,
+          {key, ets_value, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
+        )
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp rollback_installed_async_value(ctx, idx, key, :missing) do
+    keydir = elem(ctx.keydir_refs, idx)
+    {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+    _ = Ferricstore.Bitcask.NIF.v2_append_ops_batch_nosync(file_path, [{:delete, key}])
+    track_keydir_binary_delete(ctx, idx, keydir, key)
+    :ets.delete(keydir, key)
+    :ok
+  end
+
   defp with_async_key_latch(ctx, idx, key, fun) do
     [{latch_tab, ^key}] = acquire_async_key_latches(ctx, [{idx, key}])
 
@@ -3343,9 +3382,17 @@ defmodule Ferricstore.Store.Router do
     if under_pressure do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
-      with :ok <- async_submit_to_raft(idx, {:put, compound_key, value, expire_at_ms}),
-           :ok <- install_rmw_value(ctx, idx, compound_key, value, expire_at_ms) do
-        :ok
+      previous = snapshot_live_value(ctx, idx, compound_key)
+
+      with :ok <- install_rmw_value(ctx, idx, compound_key, value, expire_at_ms) do
+        case async_submit_to_raft(idx, {:put, compound_key, value, expire_at_ms}) do
+          :ok ->
+            :ok
+
+          {:error, _} = error ->
+            rollback_installed_async_value(ctx, idx, compound_key, previous)
+            error
+        end
       end
     end
   end

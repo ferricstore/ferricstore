@@ -28,6 +28,7 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
   """
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.{CompoundKey, Router}
   alias Ferricstore.Test.ShardHelpers
 
@@ -49,6 +50,14 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
   defp ukey(base), do: "#{@ns}:#{base}_#{:erlang.unique_integer([:positive])}"
 
   defp hash_field(redis_key, field), do: CompoundKey.hash_field(redis_key, field)
+
+  defp pending_async_commands(idx) do
+    Batcher.batcher_name(idx)
+    |> :sys.get_state()
+    |> Map.get(:slots, %{})
+    |> Map.values()
+    |> Enum.flat_map(fn slot -> Enum.reverse(slot.cmds) end)
+  end
 
   # ---------------------------------------------------------------------------
   # Single-caller correctness — HSET + HGET
@@ -126,10 +135,76 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
 
       Ferricstore.Test.Utils.eventually(
         fn ->
-          assert ["small", big] == Router.compound_batch_get(ctx(), redis_key, [small_key, big_key])
+          assert ["small", big] ==
+                   Router.compound_batch_get(ctx(), redis_key, [small_key, big_key])
         end,
         15_000
       )
+    end
+
+    test "large compound_put restores previous value when Batcher is overloaded" do
+      redis_key = ukey("hash_big_overloaded")
+      ck = hash_field(redis_key, "big_field")
+      old = :binary.copy("o", ctx().hot_cache_max_value_size + 1024)
+      new = :binary.copy("n", ctx().hot_cache_max_value_size + 1024)
+      idx = Router.shard_for(ctx(), redis_key)
+
+      :ok = Router.compound_put(ctx(), redis_key, ck, old, 0)
+      assert old == Router.compound_get(ctx(), redis_key, ck)
+
+      on_exit(fn -> Batcher.reset_pending(idx) end)
+
+      for _ <- 1..64 do
+        Batcher.__inject_async_pending__(
+          idx,
+          make_ref(),
+          [{:async, node(), {:put, ck, "pending", 0}}],
+          0
+        )
+      end
+
+      assert {:error, "ERR async replication overloaded"} =
+               Router.compound_put(ctx(), redis_key, ck, new, 0)
+
+      Batcher.reset_pending(idx)
+      assert old == Router.compound_get(ctx(), redis_key, ck)
+    end
+
+    test "large compound_put disk error is not accepted for async replication" do
+      redis_key = ukey("hash_big_disk_error")
+      ck = hash_field(redis_key, "big_field")
+      big = :binary.copy("x", ctx().hot_cache_max_value_size + 1024)
+      idx = Router.shard_for(ctx(), redis_key)
+      {file_id, file_path, shard_path} = Ferricstore.Store.ActiveFile.get(ctx(), idx)
+
+      missing_path =
+        Path.join([
+          System.tmp_dir!(),
+          "missing_ferricstore_#{System.unique_integer([:positive])}",
+          "00000.log"
+        ])
+
+      :ok = Ferricstore.NamespaceConfig.set(@ns, "window_ms", "5000")
+
+      Ferricstore.Store.ActiveFile.publish(
+        ctx(),
+        idx,
+        file_id,
+        missing_path,
+        Path.dirname(missing_path)
+      )
+
+      try do
+        assert {:error, "ERR disk write failed" <> _} =
+                 Router.compound_put(ctx(), redis_key, ck, big, 0)
+
+        assert [] == pending_async_commands(idx)
+        assert nil == Router.compound_get(ctx(), redis_key, ck)
+      after
+        Ferricstore.Store.ActiveFile.publish(ctx(), idx, file_id, file_path, shard_path)
+        Batcher.reset_pending(idx)
+        Ferricstore.NamespaceConfig.set(@ns, "window_ms", "1")
+      end
     end
   end
 
