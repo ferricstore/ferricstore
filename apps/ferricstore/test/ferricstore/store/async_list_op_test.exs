@@ -249,6 +249,29 @@ defmodule Ferricstore.Store.AsyncListOpTest do
                pending_async_commands(idx)
     end
 
+    test "same-shard LMOVE waits behind an existing destination latch" do
+      {source, destination} = same_shard_keys()
+      idx = Router.shard_for(ctx(), source)
+      latch_tab = elem(ctx().latch_refs, idx)
+
+      assert 1 = Router.list_op(ctx(), source, {:rpush, ["a"]})
+      assert :ets.insert_new(latch_tab, {destination, self()})
+
+      task =
+        Task.async(fn ->
+          Router.list_op(ctx(), source, {:lmove, destination, :left, :right})
+        end)
+
+      try do
+        assert Task.yield(task, 50) == nil
+      after
+        :ets.take(latch_tab, destination)
+      end
+
+      assert "a" = Task.await(task, 1_000)
+      assert ["a"] == Router.list_op(ctx(), destination, {:lrange, 0, -1})
+    end
+
     test "RPUSH large element disk error is not accepted for async replication" do
       ctx = ctx()
       key = ukey("large_disk_error")

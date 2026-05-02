@@ -395,11 +395,11 @@ defmodule Ferricstore.Store.Router do
   # that list.
   defp async_write(ctx, idx, {:list_op, key, _op} = cmd), do: async_list_op(ctx, idx, key, cmd)
 
-  defp async_write(ctx, idx, {:list_op_lmove, src_key, _dst, _from, _to} = cmd) do
-    # Single-shard LMOVE goes async on the source's latch. Cross-shard
-    # LMOVE never reaches here (Router.list_op for lmove already splits
+  defp async_write(ctx, idx, {:list_op_lmove, src_key, dst_key, _from, _to} = cmd) do
+    # Single-shard LMOVE goes async under both source and destination latches.
+    # Cross-shard LMOVE never reaches here (Router.list_op for lmove already splits
     # across shards via quorum_write before calling async_write).
-    async_list_op(ctx, idx, src_key, cmd)
+    async_list_lmove(ctx, idx, src_key, dst_key, cmd)
   end
 
   # Any other command in an async namespace — CAS, LOCK, UNLOCK, EXTEND,
@@ -1145,6 +1145,27 @@ defmodule Ferricstore.Store.Router do
       wait_for_async_key_latch(latch_tab, key)
       {latch_tab, key}
     end)
+  end
+
+  defp try_acquire_async_key_latches(ctx, locks) do
+    locks = locks |> Enum.uniq() |> Enum.sort()
+
+    case Enum.reduce_while(locks, [], fn {idx, key}, held ->
+           latch_tab = elem(ctx.latch_refs, idx)
+
+           if :ets.insert_new(latch_tab, {key, self()}) do
+             {:cont, [{latch_tab, key} | held]}
+           else
+             {:halt, {:error, held}}
+           end
+         end) do
+      {:error, held} ->
+        release_async_key_latches(held)
+        :error
+
+      held ->
+        {:ok, Enum.reverse(held)}
+    end
   end
 
   defp release_async_key_latches(held_latches) do
@@ -3146,17 +3167,36 @@ defmodule Ferricstore.Store.Router do
         end
 
       false ->
+        async_list_op_worker_call(ctx, idx, cmd)
+    end
+  end
+
+  defp async_list_lmove(ctx, idx, src_key, dst_key, cmd) do
+    case try_acquire_async_key_latches(ctx, [{idx, src_key}, {idx, dst_key}]) do
+      {:ok, held_latches} ->
         try do
-          GenServer.call(
-            :"Ferricstore.Store.RmwCoordinator.#{idx}",
-            {:rmw, ctx, cmd},
-            10_000
-          )
-        catch
-          :exit, {:timeout, _} -> {:error, "ERR list_op timeout"}
-          :exit, {:noproc, _} -> {:error, "ERR RMW worker unavailable"}
-          :exit, _ -> {:error, "ERR RMW worker crashed"}
+          :telemetry.execute([:ferricstore, :list_op, :latch], %{}, %{shard_index: idx})
+          execute_list_op_inline(ctx, idx, cmd)
+        after
+          release_async_key_latches(held_latches)
         end
+
+      :error ->
+        async_list_op_worker_call(ctx, idx, cmd)
+    end
+  end
+
+  defp async_list_op_worker_call(ctx, idx, cmd) do
+    try do
+      GenServer.call(
+        :"Ferricstore.Store.RmwCoordinator.#{idx}",
+        {:rmw, ctx, cmd},
+        10_000
+      )
+    catch
+      :exit, {:timeout, _} -> {:error, "ERR list_op timeout"}
+      :exit, {:noproc, _} -> {:error, "ERR RMW worker unavailable"}
+      :exit, _ -> {:error, "ERR RMW worker crashed"}
     end
   end
 

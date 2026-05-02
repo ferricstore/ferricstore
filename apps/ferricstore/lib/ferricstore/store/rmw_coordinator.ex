@@ -196,17 +196,17 @@ defmodule Ferricstore.Store.RmwCoordinator do
 
   defp run_rmw(ctx, idx, cmd) do
     latch_tab = elem(ctx.latch_refs, idx)
-    key = key_of(cmd)
+    keys = latch_keys_of(cmd)
 
     try do
-      wait_for_latch(latch_tab, key)
+      Enum.each(keys, fn key -> wait_for_latch(latch_tab, key) end)
 
       try do
         result = dispatch_inline(ctx, idx, cmd)
         :telemetry.execute([:ferricstore, :rmw, :worker], %{}, %{shard_index: idx})
         result
       after
-        :ets.take(latch_tab, key)
+        release_latches(latch_tab, keys)
       end
     catch
       kind, reason ->
@@ -219,6 +219,10 @@ defmodule Ferricstore.Store.RmwCoordinator do
   # global per shard index, but each instance has its own ETS/keydir/latch
   # tables. Serializing by raw user key would make unrelated tenants with
   # the same key block each other under RMW contention.
+  defp queue_key(%FerricStore.Instance{name: name}, {:list_op_lmove, src, dst, _from, _to}) do
+    {name, {:multi_key, sorted_unique_keys([src, dst])}}
+  end
+
   defp queue_key(%FerricStore.Instance{name: name}, cmd), do: {name, key_of(cmd)}
 
   # Acquire the per-key latch. The coordinator starts at most one waiter task
@@ -256,6 +260,12 @@ defmodule Ferricstore.Store.RmwCoordinator do
     end
   end
 
+  defp release_latches(tab, keys) do
+    Enum.each(keys, fn key ->
+      :ets.select_delete(tab, [{{key, self()}, [], [true]}])
+    end)
+  end
+
   # Remove latch entries whose holder pid is dead. Called on a timer and
   # via the `:sweep_latches_now` test hook.
   defp do_sweep(tab) do
@@ -288,4 +298,11 @@ defmodule Ferricstore.Store.RmwCoordinator do
   defp key_of({:setrange, k, _, _}), do: k
   defp key_of({:list_op, k, _}), do: k
   defp key_of({:list_op_lmove, src_k, _dst, _from, _to}), do: src_k
+
+  defp latch_keys_of({:list_op_lmove, src_k, dst_k, _from, _to}),
+    do: sorted_unique_keys([src_k, dst_k])
+
+  defp latch_keys_of(cmd), do: [key_of(cmd)]
+
+  defp sorted_unique_keys(keys), do: keys |> Enum.uniq() |> Enum.sort()
 end
