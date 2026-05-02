@@ -21,6 +21,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.Shard
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
+  alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
 
   setup do
     :ok
@@ -830,6 +831,48 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
       assert measurements.total_duration_us >= 0
       assert File.exists?(Path.join([dir, "data", "shard_0", "00000.hint"]))
+    end
+
+    test "shutdown telemetry reports warning when active file fsync fails" do
+      dir = Path.join(System.tmp_dir!(), "shard_shutdown_fsync_fail_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+      keydir = :ets.new(:shutdown_fsync_fail_keydir, [:set, :public])
+      parent = self()
+      handler_id = {:shard_shutdown_fsync_fail, self(), make_ref()}
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :shard, :shutdown],
+        fn _event, measurements, metadata, _config ->
+          send(parent, {:shutdown_telemetry, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn ->
+        :telemetry.detach(handler_id)
+        File.rm_rf(dir)
+      end)
+
+      state = %{
+        index: 0,
+        pending: [],
+        flush_in_flight: nil,
+        instance_ctx: nil,
+        active_file_path: Path.join(dir, "missing.log"),
+        active_file_id: 0,
+        shard_data_path: dir,
+        keydir: keydir
+      }
+
+      assert :ok = ShardLifecycle.do_terminate(:shutdown, state)
+
+      assert_receive {:shutdown_telemetry, measurements,
+                      %{shard_index: 0, status: :warning, errors: errors}},
+                     1_000
+
+      assert measurements.total_duration_us >= 0
+      assert match?([{:active_fsync, _reason}], errors)
     end
 
     test "replays tombstones that appear before the last live hinted record" do

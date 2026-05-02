@@ -470,8 +470,10 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
     # Step 2: write v2 hint file for the active file so the next startup
     # can rebuild the keydir from hints instead of replaying the full log.
-    ShardFlush.write_hint_for_file(state, state.active_file_id)
-    NIF.v2_fsync(state.active_file_path)
+    hint_result = ShardFlush.write_hint_for_file(state, state.active_file_id)
+    fsync_result = NIF.v2_fsync(state.active_file_path)
+    shutdown_errors = shutdown_errors(hint_result, fsync_result)
+    shutdown_status = if shutdown_errors == [], do: :ok, else: :warning
 
     t_hint = System.monotonic_time(:microsecond)
 
@@ -483,15 +485,37 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         hint_duration_us: t_hint - t_flush,
         total_duration_us: t_hint - t0
       },
-      %{shard_index: state.index}
+      %{shard_index: state.index, status: shutdown_status, errors: shutdown_errors}
     )
 
-    Logger.info(
-      "Shard #{state.index}: shutdown complete " <>
-        "(flush=#{t_flush - t0}us, hint=#{t_hint - t_flush}us)"
-    )
+    log_shutdown_result(state.index, t_flush - t0, t_hint - t_flush, shutdown_errors)
 
     :ok
+  end
+
+  defp shutdown_errors(hint_result, fsync_result) do
+    []
+    |> maybe_shutdown_error(:hint_write, hint_result)
+    |> maybe_shutdown_error(:active_fsync, fsync_result)
+    |> Enum.reverse()
+  end
+
+  defp maybe_shutdown_error(errors, _operation, result) when result in [:ok, nil], do: errors
+  defp maybe_shutdown_error(errors, operation, {:error, reason}), do: [{operation, reason} | errors]
+  defp maybe_shutdown_error(errors, operation, other), do: [{operation, {:unexpected_result, other}} | errors]
+
+  defp log_shutdown_result(index, flush_us, hint_us, []) do
+    Logger.info(
+      "Shard #{index}: shutdown complete " <>
+        "(flush=#{flush_us}us, hint=#{hint_us}us)"
+    )
+  end
+
+  defp log_shutdown_result(index, flush_us, hint_us, errors) do
+    Logger.warning(
+      "Shard #{index}: shutdown complete with warnings " <>
+        "(flush=#{flush_us}us, hint=#{hint_us}us, errors=#{inspect(errors)})"
+    )
   end
 
   defp cleanup_compact_temps(shard_path, files) do
