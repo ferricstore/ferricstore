@@ -193,4 +193,26 @@ defmodule Ferricstore.Store.ShardETSTest do
       :ets.delete(keydir)
     end
   end
+
+  test "handle_keys reads ETS without forcing pending writes to disk" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "ets:keys:pending-hot"
+
+    state = %{
+      index: 0,
+      keydir: keydir,
+      pending: [{key, "value", 0}],
+      pending_count: 1,
+      flush_in_flight: nil,
+      instance_ctx: nil
+    }
+
+    try do
+      :ets.insert(keydir, {key, "value", 0, LFU.initial(), :pending, 0, 5})
+
+      assert {:reply, [^key], ^state} = ShardReads.handle_keys(state)
+    after
+      :ets.delete(keydir)
+    end
+  end
 end

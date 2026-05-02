@@ -193,9 +193,8 @@ defmodule Ferricstore.Store.Shard.Reads do
   @spec handle_keys(map()) :: {:reply, [binary()], map()}
   @doc false
   def handle_keys(state) do
-    # Flush first so NIF.keys() sees all pending writes.
-    state = ShardFlush.await_in_flight(state)
-    state = ShardFlush.flush_pending_sync(state)
+    # ETS is the read model for live keys, including pending writes that have
+    # not reached Bitcask yet. Keep KEYS off the synchronous disk-flush path.
     {:reply, live_keys(state), state}
   end
 
