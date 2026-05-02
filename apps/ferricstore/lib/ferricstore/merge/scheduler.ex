@@ -89,6 +89,7 @@ defmodule Ferricstore.Merge.Scheduler do
     :config,
     :data_dir,
     :semaphore,
+    :instance_ctx,
     merging: false,
     last_merge_at: nil,
     last_merge_completed_at: nil,
@@ -130,6 +131,18 @@ defmodule Ferricstore.Merge.Scheduler do
   """
   @spec scheduler_name(non_neg_integer()) :: atom()
   def scheduler_name(index), do: :"Ferricstore.Merge.Scheduler.#{index}"
+
+  @doc """
+  Returns the scheduler name for an instance-scoped shard.
+
+  The default instance keeps the historic global names; embedded instances use
+  their module name so rotation/fragmentation notifications cannot hit the
+  default instance's scheduler.
+  """
+  @spec scheduler_name(map() | nil, non_neg_integer()) :: atom()
+  def scheduler_name(nil, index), do: scheduler_name(index)
+  def scheduler_name(%{name: :default}, index), do: scheduler_name(index)
+  def scheduler_name(%{name: name}, index), do: :"#{name}.Merge.Scheduler.#{index}"
 
   @doc """
   Called by the Shard when it rotates to a new active file.
@@ -213,6 +226,7 @@ defmodule Ferricstore.Merge.Scheduler do
     data_dir = Keyword.fetch!(opts, :data_dir)
     merge_config = Keyword.get(opts, :merge_config, %{})
     semaphore = Keyword.get(opts, :semaphore, Semaphore)
+    instance_ctx = Keyword.get(opts, :instance_ctx)
 
     config = build_config(merge_config)
     shard_data_dir = Ferricstore.DataDir.shard_data_path(data_dir, index)
@@ -225,6 +239,7 @@ defmodule Ferricstore.Merge.Scheduler do
       config: config,
       data_dir: shard_data_dir,
       semaphore: semaphore,
+      instance_ctx: instance_ctx,
       file_count: count_existing_log_files(shard_data_dir)
     }
 
@@ -363,7 +378,7 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   defp do_merge(state) do
-    ctx = FerricStore.Instance.get(:default)
+    ctx = state.instance_ctx || FerricStore.Instance.get(:default)
     shard_name = Router.shard_name(ctx, state.shard_index)
 
     result =

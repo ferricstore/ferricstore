@@ -35,19 +35,40 @@ defmodule FerricStore.Instance.Supervisor do
     # Ensure data directory layout exists
     Ferricstore.DataDir.ensure_layout!(ctx.data_dir, ctx.shard_count)
 
-    children = [
-      # Stats and MemoryGuard are global application processes today. The
-      # instance context owns isolated counters/flags, but these GenServers are
-      # not instance-scoped yet, so embedded instances must not start duplicates.
-      {Ferricstore.Store.ShardSupervisor,
-       [
-         name: :"#{name}.ShardSupervisor",
-         data_dir: ctx.data_dir,
-         shard_count: ctx.shard_count,
-         instance_ctx: ctx,
-         raft_enabled: ctx.raft_enabled
-       ]}
-    ]
+    merge_children =
+      if name == :default do
+        []
+      else
+        [
+          Supervisor.child_spec(
+            {Ferricstore.Merge.Supervisor,
+             [
+               name: :"#{name}.Merge.Supervisor",
+               data_dir: ctx.data_dir,
+               shard_count: ctx.shard_count,
+               merge_config: Keyword.get(opts, :merge_config, %{}),
+               instance_ctx: ctx
+             ]},
+            id: :"#{name}.MergeSupervisor"
+          )
+        ]
+      end
+
+    children =
+      merge_children ++
+        [
+          # Stats and MemoryGuard are global application processes today. The
+          # instance context owns isolated counters/flags, but these GenServers are
+          # not instance-scoped yet, so embedded instances must not start duplicates.
+          {Ferricstore.Store.ShardSupervisor,
+           [
+             name: :"#{name}.ShardSupervisor",
+             data_dir: ctx.data_dir,
+             shard_count: ctx.shard_count,
+             instance_ctx: ctx,
+             raft_enabled: ctx.raft_enabled
+           ]}
+        ]
 
     Supervisor.init(children, strategy: :one_for_one, max_restarts: 20, max_seconds: 10)
   end

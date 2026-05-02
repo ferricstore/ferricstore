@@ -99,6 +99,67 @@ defmodule Ferricstore.InstanceTest do
       assert :ok = EmbeddedDefaultOptions.set("same-key", "local")
       assert {:ok, "local"} = EmbeddedDefaultOptions.get("same-key")
     end
+
+    test "custom instances start isolated merge schedulers" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_embedded_merge_#{System.unique_integer([:positive])}"
+        )
+
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        EmbeddedDefaultOptions.stop()
+        File.rm_rf(root)
+      end)
+
+      assert {:ok, _pid} = EmbeddedDefaultOptions.start_link(data_dir: root, shard_count: 1)
+
+      custom_scheduler = :"#{EmbeddedDefaultOptions}.Merge.Scheduler.0"
+      custom_semaphore = :"#{EmbeddedDefaultOptions}.Merge.Semaphore"
+
+      assert is_pid(Process.whereis(custom_scheduler))
+      assert is_pid(Process.whereis(custom_semaphore))
+
+      assert Process.whereis(custom_scheduler) !=
+               Process.whereis(Ferricstore.Merge.Scheduler.scheduler_name(0))
+
+      status = Ferricstore.Merge.Scheduler.status(custom_scheduler)
+      assert status.shard_index == 0
+    end
+
+    test "custom shard rotations notify the custom merge scheduler" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_embedded_rotation_#{System.unique_integer([:positive])}"
+        )
+
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        EmbeddedDefaultOptions.stop()
+        File.rm_rf(root)
+      end)
+
+      assert {:ok, _pid} =
+               EmbeddedDefaultOptions.start_link(
+                 data_dir: root,
+                 shard_count: 1,
+                 max_active_file_size: 1,
+                 merge_config: %{min_files_for_merge: 1_000}
+               )
+
+      custom_scheduler = :"#{EmbeddedDefaultOptions}.Merge.Scheduler.0"
+
+      assert :ok = EmbeddedDefaultOptions.set("rotate-a", String.duplicate("a", 128))
+      assert :ok = EmbeddedDefaultOptions.set("rotate-b", String.duplicate("b", 128))
+
+      assert eventually(fn ->
+               Ferricstore.Merge.Scheduler.status(custom_scheduler).file_count >= 2
+             end)
+    end
   end
 
   describe "custom instance cleanup" do
@@ -243,4 +304,17 @@ defmodule Ferricstore.InstanceTest do
       assert {:ok, nil} = FerricStore.Impl.get(ctx, "impl_flush")
     end
   end
+
+  defp eventually(fun, attempts \\ 50)
+
+  defp eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      true
+    else
+      Process.sleep(10)
+      eventually(fun, attempts - 1)
+    end
+  end
+
+  defp eventually(_fun, 0), do: false
 end

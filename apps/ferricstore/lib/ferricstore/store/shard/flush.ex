@@ -345,11 +345,12 @@ defmodule Ferricstore.Store.Shard.Flush do
       # Direct GenServer.cast avoids the compile-time cycle
       # Merge.Scheduler → Store.Router → Store.ListOps → Store.Ops →
       # Store.Shard.Writes → Store.Shard.Reads → Store.Shard.Flush →
-      # Merge.Scheduler. Fire-and-forget; unknown-name catches are handled
-      # by `try/catch :exit` around the cast.
+      # Merge.Scheduler. The name must be instance-scoped; otherwise embedded
+      # instances would publish compaction work to the default scheduler.
+      # Fire-and-forget; unknown-name catches are handled by `try/catch :exit`.
       try do
         GenServer.cast(
-          :"Ferricstore.Merge.Scheduler.#{state.index}",
+          merge_scheduler_name(Map.get(state, :instance_ctx), state.index),
           {:fragmentation, candidates, file_count}
         )
       catch
@@ -421,6 +422,10 @@ defmodule Ferricstore.Store.Shard.Flush do
     end
   end
 
+  defp merge_scheduler_name(%{name: :default}, index), do: :"Ferricstore.Merge.Scheduler.#{index}"
+  defp merge_scheduler_name(%{name: name}, index), do: :"#{name}.Merge.Scheduler.#{index}"
+  defp merge_scheduler_name(_instance_ctx, index), do: :"Ferricstore.Merge.Scheduler.#{index}"
+
   @spec maybe_rotate_file(map()) :: map()
   @doc false
   def maybe_rotate_file(state) do
@@ -482,7 +487,7 @@ defmodule Ferricstore.Store.Shard.Flush do
           # Direct cast avoids the Merge.Scheduler → ... → Shard.Flush cycle.
           try do
             GenServer.cast(
-              :"Ferricstore.Merge.Scheduler.#{state.index}",
+              merge_scheduler_name(Map.get(state, :instance_ctx), state.index),
               {:file_rotated, new_id + 1}
             )
           catch
