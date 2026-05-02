@@ -60,9 +60,6 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
       assert -2 == Expiry.handle("TTL", ["k"], store)
     end
 
-    @tag :skip
-    # Known limitation: our impl rejects negative EXPIRE values with an error
-    # instead of treating them as immediate deletion (Redis compat)
     test "EXPIRE with negative value deletes the key (Redis compat)" do
       store = MockStore.make(%{"k" => {"v", 0}})
       result = Expiry.handle("EXPIRE", ["k", "-1"], store)
@@ -343,18 +340,15 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
       assert ttl > 0 and ttl <= 30
     end
 
-    @tag :skip
-    # Known limitation: our impl rejects NX+XX together with an error instead of nil
-    test "SET with NX and XX both set: XX takes precedence over NX semantics" do
-      # Both NX and XX at the same time: NX requires key not exist, XX requires
-      # key exist. This is contradictory — Redis rejects with syntax error or
-      # the last one wins. In our impl, both flags are set, so XX=true means
-      # key must exist AND NX=true means key must not exist — neither condition
-      # is satisfiable if both are true.
+    test "SET with NX and XX both set returns an incompatibility error" do
+      # NX requires the key to not exist while XX requires it to exist.
+      # Redis rejects the contradictory option pair instead of applying
+      # either conditional write.
       store = MockStore.make(%{"k" => {"old", 0}})
-      # With existing key: NX=true checks "not exists?" which is false -> nil
       result = Strings.handle("SET", ["k", "new", "NX", "XX"], store)
-      assert result == nil
+      assert {:error, msg} = result
+      assert msg =~ "XX and NX"
+      assert "old" == store.get.("k")
     end
 
     test "SET with NX on non-existing key and PX sets millisecond expiry" do
