@@ -125,6 +125,19 @@ defmodule Ferricstore.Merge.SchedulerTest do
     end
   end
 
+  describe "merge file selection" do
+    test "min_files_for_merge counts the active file from rotation notifications" do
+      config = %{
+        min_files_for_merge: 2,
+        max_files_per_merge: 8,
+        small_file_threshold: 0
+      }
+
+      assert {:ok, [0]} =
+               Scheduler.select_mergeable_file_ids([{0, 1024}, {1, 1024}], config, [])
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Mode guards
   # ---------------------------------------------------------------------------

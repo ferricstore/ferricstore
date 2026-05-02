@@ -190,6 +190,15 @@ defmodule Ferricstore.Merge.Scheduler do
     GenServer.call(server, :trigger_check)
   end
 
+  @doc false
+  @spec select_mergeable_file_ids([{non_neg_integer(), non_neg_integer()}], map(), [
+          non_neg_integer()
+        ]) ::
+          {:ok, [non_neg_integer()]} | {:error, atom()}
+  def select_mergeable_file_ids(file_sizes, config, frag_candidates \\ []) do
+    pick_mergeable_files(file_sizes, config, frag_candidates)
+  end
+
   # -------------------------------------------------------------------
   # GenServer callbacks
   # -------------------------------------------------------------------
@@ -448,7 +457,10 @@ defmodule Ferricstore.Merge.Scheduler do
         # Fragmentation-triggered: merge even a single file
         1
       else
-        config.min_files_for_merge
+        # Rotation notifications count total log files, including the active
+        # file. Selection never merges the active file, so require one fewer
+        # non-active file here.
+        max(config.min_files_for_merge - 1, 1)
       end
 
     if length(mergeable) >= min_required do
