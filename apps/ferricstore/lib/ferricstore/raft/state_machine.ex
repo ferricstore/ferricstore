@@ -1666,45 +1666,81 @@ defmodule Ferricstore.Raft.StateMachine do
     ]
 
     try do
-      :ets.select(ctx.keydir, ms)
-      |> Enum.reduce([], fn {key, value, exp, fid, off, vsize}, acc ->
-        cond do
-          exp != 0 and exp <= now ->
-            acc
+      {tokens, cold_entries, _cold_count} =
+        :ets.select(ctx.keydir, ms)
+        |> Enum.reduce({[], [], 0}, fn {key, value, exp, fid, off, vsize},
+                                       {tokens, cold_entries, cold_count} ->
+          cond do
+            exp != 0 and exp <= now ->
+              {tokens, cold_entries, cold_count}
 
-          value == nil and not valid_cold_location_value?(fid, off, vsize) ->
-            cross_shard_delete_keydir_entry(ctx, key, nil)
-            acc
+            value == nil and not valid_cold_location_value?(fid, off, vsize) ->
+              cross_shard_delete_keydir_entry(ctx, key, nil)
+              {tokens, cold_entries, cold_count}
 
-          true ->
-            actual_value =
-              if value == nil do
-                path = sm_file_path_from_path(data_path, fid)
+            value == nil ->
+              field = sm_prefix_field(key)
+              path = sm_file_path_from_path(data_path, fid)
+              entry = {field, path, off}
+              {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
 
-                case read_cold_async(path, off) do
-                  {:ok, v} -> v
-                  _ -> nil
-                end
-              else
-                value
-              end
+            true ->
+              {[{:value, {sm_prefix_field(key), value}} | tokens], cold_entries, cold_count}
+          end
+        end)
 
-            if actual_value != nil do
-              field =
-                case :binary.split(key, <<0>>) do
-                  [_pre, sub] -> sub
-                  _ -> key
-                end
+      cold_values =
+        cold_entries
+        |> Enum.reverse()
+        |> cross_shard_read_cold_batch()
+        |> List.to_tuple()
 
-              [{field, actual_value} | acc]
-            else
-              acc
-            end
-        end
+      tokens
+      |> Enum.flat_map(fn
+        {:value, result} ->
+          [result]
+
+        {:cold, index} ->
+          case elem(cold_values, index) do
+            nil -> []
+            result -> [result]
+          end
       end)
       |> Enum.sort_by(fn {field, _} -> field end)
     rescue
       ArgumentError -> []
+    end
+  end
+
+  defp cross_shard_read_cold_batch([]), do: []
+
+  defp cross_shard_read_cold_batch(entries) do
+    locations = Enum.map(entries, fn {_field, path, off} -> {path, off} end)
+
+    values =
+      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_read_timeout_ms) do
+        {:ok, values} when is_list(values) ->
+          if length(values) == length(entries) do
+            values
+          else
+            List.duplicate(nil, length(entries))
+          end
+
+        {:error, _reason} ->
+          List.duplicate(nil, length(entries))
+      end
+
+    Enum.zip(entries, values)
+    |> Enum.map(fn
+      {{field, _path, _off}, value} when value != nil -> {field, value}
+      {_entry, _value} -> nil
+    end)
+  end
+
+  defp sm_prefix_field(key) do
+    case :binary.split(key, <<0>>) do
+      [_pre, sub] -> sub
+      _ -> key
     end
   end
 
