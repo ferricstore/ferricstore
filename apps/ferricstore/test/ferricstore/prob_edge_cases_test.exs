@@ -820,6 +820,18 @@ defmodule Ferricstore.ProbEdgeCasesTest do
       assert {:ok, [^max_i64]} = NIF.cms_file_query(path, ["hot"])
     end
 
+    test "cms_file_query rejects truncated counter region" do
+      dir = make_prob_dir("nif_cms_truncated_query")
+      path = Path.join(dir, "truncated.cms")
+
+      assert {:ok, :ok} = NIF.cms_file_create(path, 100, 5)
+      <<header::binary-size(32), _::binary>> = File.read!(path)
+      File.write!(path, header)
+
+      assert {:error, reason} = NIF.cms_file_query(path, ["hot"])
+      assert reason =~ "truncated"
+    end
+
     test "cms_file_info returns correct metadata" do
       dir = make_prob_dir("nif_cms_info")
       path = Path.join(dir, "info.cms")

@@ -148,12 +148,25 @@ fn cms_finalize_merge_counter(acc: i128) -> Result<i64, String> {
     }
 }
 
+fn cms_read_exact_at(file: &File, buf: &mut [u8], offset: u64, label: &str) -> Result<(), String> {
+    let mut read = 0;
+    while read < buf.len() {
+        let n = file
+            .read_at(&mut buf[read..], offset + read as u64)
+            .map_err(|e| format!("read {label}: {e}"))?;
+        if n == 0 {
+            return Err(format!("truncated CMS file while reading {label}"));
+        }
+        read += n;
+    }
+    Ok(())
+}
+
 /// Read the CMS file header (width, depth, count) via pread.
 /// Returns `(width, depth, count)` or an error string.
 fn cms_file_read_header(file: &File) -> Result<(u64, u64, u64), String> {
     let mut header = [0u8; MMAP_HEADER_SIZE];
-    file.read_at(&mut header, 0)
-        .map_err(|e| format!("read header: {e}"))?;
+    cms_read_exact_at(file, &mut header, 0, "header")?;
 
     let magic = u64::from_le_bytes(header[0..8].try_into().unwrap());
     if magic != MMAP_MAGIC {
@@ -291,9 +304,9 @@ pub fn cms_file_incrby<'a>(
         for (row, &col) in indices.iter().enumerate() {
             let offset = MMAP_HEADER_SIZE as u64 + (row as u64 * width + col) * 8;
 
-            // pread current counter value
-            file.read_at(&mut buf, offset)
-                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+            if let Err(e) = cms_read_exact_at(&file, &mut buf, offset, "counter") {
+                return Ok((atoms::error(), e).encode(env));
+            }
             let val = i64::from_le_bytes(buf);
 
             let next_val = match val.checked_add(*count) {
@@ -377,8 +390,9 @@ pub fn cms_file_query<'a>(
         for (row, &col) in indices.iter().enumerate() {
             let offset = MMAP_HEADER_SIZE as u64 + (row as u64 * width + col) * 8;
 
-            file.read_at(&mut buf, offset)
-                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+            if let Err(e) = cms_read_exact_at(&file, &mut buf, offset, "counter") {
+                return Ok((atoms::error(), e).encode(env));
+            }
             let val = i64::from_le_bytes(buf);
             min_val = min_val.min(val);
         }
@@ -486,16 +500,16 @@ pub fn cms_file_merge(
         let offset = MMAP_HEADER_SIZE as u64 + i * 8;
 
         // Read dst counter
-        dst_file
-            .read_at(&mut dst_buf, offset)
-            .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+        if let Err(e) = cms_read_exact_at(&dst_file, &mut dst_buf, offset, "destination counter") {
+            return Ok((atoms::error(), e).encode(env));
+        }
         let mut val = i128::from(i64::from_le_bytes(dst_buf));
 
         // Add weighted src counters
         for (j, (src_file, _)) in src_files.iter().enumerate() {
-            src_file
-                .read_at(&mut src_buf, offset)
-                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+            if let Err(e) = cms_read_exact_at(src_file, &mut src_buf, offset, "source counter") {
+                return Ok((atoms::error(), e).encode(env));
+            }
             let src_val = i64::from_le_bytes(src_buf);
             let delta = i128::from(src_val) * i128::from(weights[j]);
             val = match val.checked_add(delta) {
@@ -576,7 +590,7 @@ pub fn cms_file_query_async<'a>(
                 let mut min_val = i64::MAX;
                 for (row, &col) in indices.iter().enumerate() {
                     let offset = MMAP_HEADER_SIZE as u64 + (row as u64 * width + col) * 8;
-                    file.read_at(&mut buf, offset).map_err(|e| e.to_string())?;
+                    cms_read_exact_at(&file, &mut buf, offset, "counter")?;
                     let val = i64::from_le_bytes(buf);
                     min_val = min_val.min(val);
                 }
@@ -811,6 +825,19 @@ mod tests {
         std::fs::write(&path, [0u8; 16]).unwrap();
         let file = File::open(&path).unwrap();
         assert!(cms_file_read_header(&file).is_err());
+    }
+
+    #[test]
+    fn read_exact_at_rejects_short_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short_counter.cms");
+        std::fs::write(&path, [0u8; 4]).unwrap();
+        let file = File::open(&path).unwrap();
+        let mut buf = [0u8; 8];
+
+        let err = cms_read_exact_at(&file, &mut buf, 0, "counter").unwrap_err();
+
+        assert!(err.contains("truncated"));
     }
 
     #[test]
