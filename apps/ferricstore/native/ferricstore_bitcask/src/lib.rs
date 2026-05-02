@@ -1131,10 +1131,10 @@ fn v2_fsync_async(
 ///
 /// ## Scheduler contract
 ///
-/// Runs on a Normal BEAM scheduler. Write-without-fsync is just a memcpy to
-/// the kernel page cache — typically 1-10us for typical batch sizes. This is
-/// fast enough for a Normal scheduler and avoids occupying a DirtyIo thread.
-#[rustler::nif(schedule = "Normal")]
+/// Runs on a DirtyIo scheduler. Even without fsync, this opens a file and
+/// performs synchronous writes/flushes; disk or kernel backpressure must not
+/// block a Normal BEAM scheduler.
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_batch_nosync<'a>(
     env: Env<'a>,
@@ -1165,7 +1165,7 @@ fn v2_append_batch_nosync<'a>(
 
 /// Append a mixed batch of put and delete records **without** fsync.
 /// Returns `{:ok, [{:put, offset, value_size} | {:delete, offset, record_size}, ...]}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_ops_batch_nosync<'a>(
     env: Env<'a>,

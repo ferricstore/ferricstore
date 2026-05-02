@@ -15,6 +15,8 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
           "v2_append_record",
           "v2_append_tombstone",
           "v2_append_batch",
+          "v2_append_batch_nosync",
+          "v2_append_ops_batch_nosync",
           "v2_fsync",
           "v2_fsync_dir",
           "v2_available_disk_space",
