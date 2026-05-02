@@ -8,6 +8,14 @@ defmodule Ferricstore.Bitcask.Async do
   confuse later receives. This helper submits through a short-lived proxy
   process and replies through a process alias, so late replies are dropped after
   timeout instead of leaking into the caller.
+
+  This helper creates one short-lived BEAM process per wait. That cost is
+  acceptable for synchronous cold reads, probabilistic reads, and cleanup
+  operations, but it is not the final shape for a proven read-hot bottleneck.
+  If benchmarking shows regression on hot async-NIF read workloads, replace
+  per-read proxies with a tracked waiter/collector owned by the connection or
+  command process, so correlation IDs are still isolated without spawning a
+  process for every read.
   """
 
   @type submit_fun :: (pid(), pos_integer() -> :ok | {:error, term()})
