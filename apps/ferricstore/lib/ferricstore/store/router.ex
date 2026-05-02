@@ -3082,7 +3082,7 @@ defmodule Ferricstore.Store.Router do
     execute_mutating_list_op_inline(ctx, idx, cmd, fn ->
       store = build_origin_compound_store(ctx, idx)
 
-      :erlang.apply(list_ops_mod(), :execute_lmove, [src_key, dst_key, store, from_dir, to_dir])
+      checked_lmove(src_key, dst_key, store, from_dir, to_dir)
     end)
   end
 
@@ -3375,14 +3375,20 @@ defmodule Ferricstore.Store.Router do
 
   @spec list_op(FerricStore.Instance.t(), binary(), term()) :: term()
   def list_op(ctx, key, {:lmove, destination, from_dir, to_dir}) do
-    Ferricstore.CrossShardOp.execute(
-      [{key, :read_write}, {destination, :write}],
-      fn unified_store ->
-        checked_lmove(key, destination, unified_store, from_dir, to_dir)
-      end,
-      intent: %{command: :lmove, keys: %{source: key, dest: destination}},
-      instance: ctx
-    )
+    source_idx = shard_for(ctx, key)
+
+    if source_idx == shard_for(ctx, destination) do
+      raft_write(ctx, source_idx, key, {:list_op_lmove, key, destination, from_dir, to_dir})
+    else
+      Ferricstore.CrossShardOp.execute(
+        [{key, :read_write}, {destination, :write}],
+        fn unified_store ->
+          checked_lmove(key, destination, unified_store, from_dir, to_dir)
+        end,
+        intent: %{command: :lmove, keys: %{source: key, dest: destination}},
+        instance: ctx
+      )
+    end
   end
 
   def list_op(ctx, key, operation) do

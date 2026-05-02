@@ -430,9 +430,18 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
   defp handle_list_op_lmove_raft(src_key, dst_key, from_dir, to_dir, state) do
     store = build_list_compound_store_raft(src_key, state)
-    result = Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
-    new_version = state.write_version + 1
-    {:reply, result, %{state | write_version: new_version}}
+
+    result =
+      checked_lmove(src_key, dst_key, store, type_check_store(store, state), from_dir, to_dir)
+
+    case result do
+      {:error, _} ->
+        {:reply, result, state}
+
+      _ ->
+        new_version = state.write_version + 1
+        {:reply, result, %{state | write_version: new_version}}
+    end
   end
 
   defp handle_list_op_lmove_direct(src_key, dst_key, from_dir, to_dir, state) do
@@ -443,11 +452,36 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     reset_direct_dead_bytes()
 
     try do
-      result = Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
-      state = state |> apply_direct_dead_bytes() |> refresh_direct_file_accounting()
-      {:reply, result, state}
+      result =
+        checked_lmove(src_key, dst_key, store, type_check_store(store, state), from_dir, to_dir)
+
+      case result do
+        {:error, _} ->
+          {:reply, result, state}
+
+        _ ->
+          state = state |> apply_direct_dead_bytes() |> refresh_direct_file_accounting()
+          {:reply, result, state}
+      end
     after
       reset_direct_dead_bytes()
+    end
+  end
+
+  defp checked_lmove(src_key, dst_key, store, type_store, from_dir, to_dir) do
+    with :ok <- Ferricstore.Store.TypeRegistry.check_type(src_key, :list, type_store) do
+      case Ferricstore.Store.ListOps.read_meta(src_key, store) do
+        nil ->
+          nil
+
+        {0, _, _} ->
+          nil
+
+        _meta ->
+          with :ok <- Ferricstore.Store.TypeRegistry.check_or_set(dst_key, :list, type_store) do
+            Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
+          end
+      end
     end
   end
 

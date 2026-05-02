@@ -394,9 +394,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   def apply(meta, {:list_op_lmove, src_key, dst_key, from_dir, to_dir}, state) do
     apply_pending_with_time(meta, state, fn ->
-      store = build_compound_store(state)
-
-      Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
+      do_checked_lmove(state, src_key, dst_key, from_dir, to_dir)
     end)
   end
 
@@ -2088,13 +2086,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # the 3-tuple async clause unwraps and re-dispatches via apply_single. We need
   # to handle the inner shape here so followers re-execute and converge.
   defp apply_single(state, {:list_op_lmove, src_key, dst_key, from_dir, to_dir}) do
-    store = build_compound_store(state)
-
-    :erlang.apply(
-      Ferricstore.Store.ListOps,
-      :execute_lmove,
-      [src_key, dst_key, store, from_dir, to_dir]
-    )
+    do_checked_lmove(state, src_key, dst_key, from_dir, to_dir)
   end
 
   defp apply_single(state, {:compound_put, compound_key, value, expire_at_ms}) do
@@ -3997,6 +3989,25 @@ defmodule Ferricstore.Raft.StateMachine do
     case ensure_list_type_for_operation(key, operation, type_store) do
       :ok -> ListOps.execute(key, store, operation)
       {:error, _} = err -> err
+    end
+  end
+
+  defp do_checked_lmove(state, source, destination, from_dir, to_dir) do
+    store = build_compound_store(state)
+
+    with :ok <- Ferricstore.Store.TypeRegistry.check_type(source, :list, store) do
+      case ListOps.read_meta(source, store) do
+        nil ->
+          nil
+
+        {0, _, _} ->
+          nil
+
+        _meta ->
+          with :ok <- Ferricstore.Store.TypeRegistry.check_or_set(destination, :list, store) do
+            ListOps.execute_lmove(source, destination, store, from_dir, to_dir)
+          end
+      end
     end
   end
 

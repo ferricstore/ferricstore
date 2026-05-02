@@ -48,6 +48,34 @@ defmodule Ferricstore.Store.AsyncListOpTest do
   defp ukey(base), do: "#{@ns}:#{base}_#{:erlang.unique_integer([:positive])}"
   defp keydir_binary_bytes(ctx, idx), do: :atomics.get(ctx.keydir_binary_bytes, idx + 1)
 
+  defp same_shard_keys do
+    base = :erlang.unique_integer([:positive])
+
+    keys =
+      for i <- 1..200 do
+        ukey("same_shard_lmove_#{base}_#{i}")
+      end
+
+    Enum.find_value(keys, fn source ->
+      Enum.find_value(keys, fn
+        ^source ->
+          nil
+
+        destination ->
+          if Router.shard_for(ctx(), source) == Router.shard_for(ctx(), destination),
+            do: {source, destination}
+      end)
+    end)
+  end
+
+  defp pending_async_commands(idx) do
+    Batcher.batcher_name(idx)
+    |> :sys.get_state()
+    |> Map.get(:slots, %{})
+    |> Map.values()
+    |> Enum.flat_map(fn slot -> Enum.reverse(slot.cmds) end)
+  end
+
   # ---------------------------------------------------------------------------
   # Single-caller correctness — round trip via list_op + compound_scan
   # ---------------------------------------------------------------------------
@@ -198,6 +226,27 @@ defmodule Ferricstore.Store.AsyncListOpTest do
       assert is_integer(fid) and fid >= 0
       assert is_integer(off) and off >= 0
       assert value_size == byte_size(large)
+    end
+
+    test "same-shard LMOVE enqueues one logical async command" do
+      assert :ok = Ferricstore.NamespaceConfig.set(@ns, "window_ms", "5000")
+
+      {source, destination} = same_shard_keys()
+      idx = Router.shard_for(ctx(), source)
+
+      on_exit(fn ->
+        Batcher.flush(idx)
+        Ferricstore.NamespaceConfig.set(@ns, "window_ms", "1")
+      end)
+
+      assert 1 = Router.list_op(ctx(), source, {:rpush, ["a"]})
+      assert :ok = Batcher.flush(idx)
+      assert [] == pending_async_commands(idx)
+
+      assert "a" = Router.list_op(ctx(), source, {:lmove, destination, :left, :right})
+
+      assert [{:list_op_lmove, ^source, ^destination, :left, :right}] =
+               pending_async_commands(idx)
     end
 
     test "RPUSH large element disk error is not accepted for async replication" do
