@@ -5,6 +5,8 @@ defmodule Ferricstore.Store.Shard.ETS do
   alias Ferricstore.HLC
   alias Ferricstore.Store.{LFU, ValueCodec}
 
+  @cold_batch_read_timeout_ms 10_000
+
   defguardp valid_cold_location(file_id, offset, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
                    is_integer(value_size) and value_size >= 0
@@ -409,49 +411,92 @@ defmodule Ferricstore.Store.Shard.ETS do
        ], [{{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"}}]}
     ]
 
-    :ets.select(keydir, ms)
-    |> Enum.reduce([], fn {key, value, exp, fid, off, vsize}, acc ->
-      cond do
-        exp != 0 and exp <= now ->
-          maybe_delete_expired_prefix_entry(state, keydir, key)
-          acc
+    {tokens, {cold_entries, _cold_count}} =
+      :ets.select(keydir, ms)
+      |> Enum.reduce({[], {[], 0}}, fn {key, value, exp, fid, off, vsize},
+                                       {tokens, {cold_entries, cold_count}} ->
+        cond do
+          exp != 0 and exp <= now ->
+            maybe_delete_expired_prefix_entry(state, keydir, key)
+            {tokens, {cold_entries, cold_count}}
 
-        value == nil and not valid_cold_location(fid, off, vsize) ->
-          maybe_delete_expired_prefix_entry(state, keydir, key)
-          acc
+          value == nil and not valid_cold_location(fid, off, vsize) ->
+            maybe_delete_expired_prefix_entry(state, keydir, key)
+            {tokens, {cold_entries, cold_count}}
 
-        true ->
-          # For cold keys (value=nil), do a disk read to get the actual value
-          actual_value = prefix_entry_value(value, shard_data_path, fid, off)
+          value == nil and shard_data_path != nil ->
+            field = prefix_field(key)
+            file_path = file_path(shard_data_path, fid)
+            entry = {field, file_path, off}
+            {[{:cold, cold_count} | tokens], {[entry | cold_entries], cold_count + 1}}
 
-          if actual_value != nil do
-            field =
-              case :binary.split(key, <<0>>) do
-                [_pre, sub] -> sub
-                _ -> key
-              end
+          value != nil ->
+            {[{:value, {prefix_field(key), value}} | tokens], {cold_entries, cold_count}}
 
-            [{field, actual_value} | acc]
-          else
-            acc
-          end
-      end
+          true ->
+            {tokens, {cold_entries, cold_count}}
+        end
+      end)
+
+    cold_values =
+      cold_entries
+      |> Enum.reverse()
+      |> prefix_read_cold_batch_async()
+      |> List.to_tuple()
+
+    Enum.flat_map(tokens, fn
+      {:value, result} ->
+        [result]
+
+      {:cold, index} ->
+        case elem(cold_values, index) do
+          nil -> []
+          result -> [result]
+        end
     end)
   end
 
-  defp prefix_entry_value(nil, shard_data_path, fid, off)
-       when shard_data_path != nil and is_integer(fid) and fid >= 0 and is_integer(off) and
-              off >= 0 do
-    p = file_path(shard_data_path, fid)
-
-    case NIF.v2_pread_at(p, off) do
-      {:ok, v} -> v
-      _ -> nil
+  defp prefix_field(key) do
+    case :binary.split(key, <<0>>) do
+      [_pre, sub] -> sub
+      _ -> key
     end
   end
 
-  defp prefix_entry_value(nil, _shard_data_path, _fid, _off), do: nil
-  defp prefix_entry_value(value, _shard_data_path, _fid, _off), do: value
+  defp prefix_read_cold_batch_async([]), do: []
+
+  defp prefix_read_cold_batch_async(entries) do
+    locations = Enum.map(entries, fn {_field, file_path, off} -> {file_path, off} end)
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    values =
+      case NIF.v2_pread_batch_async(self(), corr_id, locations) do
+        :ok ->
+          receive do
+            {:tokio_complete, ^corr_id, :ok, values} when is_list(values) ->
+              if length(values) == length(entries) do
+                values
+              else
+                List.duplicate(nil, length(entries))
+              end
+
+            {:tokio_complete, ^corr_id, :error, _reason} ->
+              List.duplicate(nil, length(entries))
+          after
+            @cold_batch_read_timeout_ms ->
+              List.duplicate(nil, length(entries))
+          end
+
+        {:error, _reason} ->
+          List.duplicate(nil, length(entries))
+      end
+
+    Enum.zip(entries, values)
+    |> Enum.map(fn
+      {{field, _file_path, _off}, value} when value != nil -> {field, value}
+      {_entry, _value} -> nil
+    end)
+  end
 
   @spec prefix_count_entries(map() | :ets.tid(), binary()) :: non_neg_integer()
   @doc false
