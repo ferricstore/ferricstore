@@ -97,6 +97,20 @@ fn heap_offset(width: usize, depth: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+fn topk_read_exact_at(file: &File, buf: &mut [u8], offset: u64, label: &str) -> Result<(), String> {
+    let mut read = 0;
+    while read < buf.len() {
+        let n = file
+            .read_at(&mut buf[read..], offset + read as u64)
+            .map_err(|e| format!("read {label}: {e}"))?;
+        if n == 0 {
+            return Err(format!("truncated topk file while reading {label}"));
+        }
+        read += n;
+    }
+    Ok(())
+}
+
 // ===========================================================================
 // v2 Stateless file-based TopK NIF functions (pread/pwrite)
 // ===========================================================================
@@ -130,8 +144,7 @@ fn heap_offset(width: usize, depth: usize) -> usize {
 /// (k, width, depth, decay, heap_len) or an error string.
 fn v2_read_header(file: &File) -> Result<(usize, usize, usize, f64, usize), String> {
     let mut hdr = [0u8; TOPK_HEADER_SIZE];
-    file.read_at(&mut hdr, 0)
-        .map_err(|e| format!("read header: {e}"))?;
+    topk_read_exact_at(file, &mut hdr, 0, "header")?;
 
     let magic = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
     if magic != TOPK_MAGIC {
@@ -170,8 +183,7 @@ fn v2_read_cms(file: &File, width: usize, depth: usize) -> Result<Vec<i64>, Stri
     let cms_size = width * depth;
     let byte_len = cms_size * 8;
     let mut buf = vec![0u8; byte_len];
-    file.read_at(&mut buf, TOPK_HEADER_SIZE as u64)
-        .map_err(|e| format!("read cms: {e}"))?;
+    topk_read_exact_at(file, &mut buf, TOPK_HEADER_SIZE as u64, "cms")?;
 
     let mut counters = Vec::with_capacity(cms_size);
     for i in 0..cms_size {
@@ -212,8 +224,7 @@ fn v2_read_heap(
     let byte_len = read_count * HEAP_ENTRY_SIZE;
     let mut buf = vec![0u8; byte_len];
     if byte_len > 0 {
-        file.read_at(&mut buf, heap_base)
-            .map_err(|e| format!("read heap: {e}"))?;
+        topk_read_exact_at(file, &mut buf, heap_base, "heap")?;
     }
 
     let mut entries = Vec::with_capacity(read_count);
@@ -1047,6 +1058,18 @@ mod tests {
         std::fs::write(&path, [0u8; 32]).unwrap();
         let file = File::open(&path).unwrap();
         assert!(v2_read_header(&file).is_err());
+    }
+
+    #[test]
+    fn read_cms_rejects_truncated_counter_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short_cms.topk");
+        std::fs::write(&path, [0u8; TOPK_HEADER_SIZE]).unwrap();
+        let file = File::open(&path).unwrap();
+
+        let err = v2_read_cms(&file, 8, 7).unwrap_err();
+
+        assert!(err.contains("truncated"));
     }
 
     #[test]

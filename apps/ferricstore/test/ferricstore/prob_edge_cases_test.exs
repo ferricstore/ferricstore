@@ -1002,6 +1002,18 @@ defmodule Ferricstore.ProbEdgeCasesTest do
       assert [^max_i64] = NIF.topk_file_count_v2(path, ["hot"])
     end
 
+    test "topk_file_count_v2 rejects truncated CMS region" do
+      dir = make_prob_dir("nif_topk_truncated_count")
+      path = Path.join(dir, "truncated.topk")
+
+      assert {:ok, :ok} = NIF.topk_file_create_v2(path, 5, 8, 7, 0.9)
+      <<header::binary-size(64), _::binary>> = File.read!(path)
+      File.write!(path, header)
+
+      assert {:error, reason} = NIF.topk_file_count_v2(path, ["hot"])
+      assert reason =~ "truncated"
+    end
+
     test "topk_file_list_v2 on empty topk returns empty list" do
       dir = make_prob_dir("nif_topk_empty")
       path = Path.join(dir, "empty.topk")
