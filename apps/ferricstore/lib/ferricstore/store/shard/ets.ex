@@ -70,7 +70,7 @@ defmodule Ferricstore.Store.Shard.ETS do
     end
   end
 
-  # Like ets_lookup/2, but transparently warms cold keys via v2_pread_at.
+  # Like ets_lookup/2, but transparently warms cold keys via async pread.
   # Returns {:hit, value, expire_at_ms}, :expired, or :miss — never {:cold, ...}.
   # Use this for read-modify-write operations that need the value in memory.
   @spec ets_lookup_warm(map(), binary()) :: {:hit, term(), non_neg_integer()} | :expired | :miss
@@ -80,8 +80,8 @@ defmodule Ferricstore.Store.Shard.ETS do
       {:cold, fid, off, _vsize, exp} ->
         p = file_path(state.shard_data_path, fid)
 
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
+        case read_cold_async(p, off) do
+          {:ok, value} when is_binary(value) ->
             cold_read_warm_ets(state, key, value)
             {:hit, value, exp}
 
@@ -309,7 +309,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   # Warm from store (cold read + ETS update)
   # -------------------------------------------------------------------
 
-  # v2: cold read via pread_at using disk location from ETS 7-tuple.
+  # v2: cold read via async pread using disk location from ETS 7-tuple.
   # Applies the hot_cache_max_value_size threshold when re-warming ETS.
   @spec warm_from_store(map(), binary()) :: binary() | nil
   @doc false
@@ -322,8 +322,8 @@ defmodule Ferricstore.Store.Shard.ETS do
       [{^key, nil, exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         p = file_path(state.shard_data_path, fid)
 
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
+        case read_cold_async(p, off) do
+          {:ok, value} when is_binary(value) ->
             v = value_for_ets(value, hot_cache_threshold(state))
             track_binary_cold_to_warm(state, key, v)
             :ets.insert(state.keydir, {key, v, exp, LFU.initial(), fid, off, vsize})
@@ -343,7 +343,7 @@ defmodule Ferricstore.Store.Shard.ETS do
     end
   end
 
-  # v2: cold read meta via pread_at using disk location from ETS 7-tuple.
+  # v2: cold read meta via async pread using disk location from ETS 7-tuple.
   # Applies the hot_cache_max_value_size threshold when re-warming ETS.
   @spec warm_meta_from_store(map(), binary()) :: {binary(), non_neg_integer()} | nil
   @doc false
@@ -352,8 +352,8 @@ defmodule Ferricstore.Store.Shard.ETS do
       [{^key, nil, exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         p = file_path(state.shard_data_path, fid)
 
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
+        case read_cold_async(p, off) do
+          {:ok, value} when is_binary(value) ->
             v = value_for_ets(value, hot_cache_threshold(state))
             track_binary_cold_to_warm(state, key, v)
             :ets.insert(state.keydir, {key, v, exp, LFU.initial(), fid, off, vsize})
@@ -496,6 +496,23 @@ defmodule Ferricstore.Store.Shard.ETS do
       {{field, _file_path, _off}, value} when value != nil -> {field, value}
       {_entry, _value} -> nil
     end)
+  end
+
+  defp read_cold_async(path, offset) do
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    case NIF.v2_pread_at_async(self(), corr_id, path, offset) do
+      :ok ->
+        receive do
+          {:tokio_complete, ^corr_id, :ok, value} -> {:ok, value}
+          {:tokio_complete, ^corr_id, :error, reason} -> {:error, reason}
+        after
+          @cold_batch_read_timeout_ms -> {:error, :timeout}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   @spec prefix_count_entries(map() | :ets.tid(), binary()) :: non_neg_integer()
