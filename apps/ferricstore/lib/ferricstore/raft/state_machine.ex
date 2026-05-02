@@ -3818,7 +3818,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     {cur_count, cur_start, prv_count} =
       case ets_lookup(state, key) do
-        {:hit, value, _exp} -> decode_ratelimit(value)
+        {:hit, value, _exp} -> decode_ratelimit(value, now)
         _ -> {0, now, 0}
       end
 
@@ -3854,7 +3854,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Delegates to the shared ValueCodec to avoid duplication with shard.ex.
   defp encode_ratelimit(cur, start, prev), do: ValueCodec.encode_ratelimit(cur, start, prev)
-  defp decode_ratelimit(value), do: ValueCodec.decode_ratelimit(value)
+
+  defp decode_ratelimit(value, fallback_start_ms),
+    do: ValueCodec.decode_ratelimit(value, fallback_start_ms)
 
   # ---------------------------------------------------------------------------
   # Private: ETS lookup with expiry checking

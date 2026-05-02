@@ -87,16 +87,32 @@ defmodule Ferricstore.Store.ValueCodec do
   Decodes rate limiter state from a 24-byte binary or legacy string format.
   """
   @spec decode_ratelimit(binary()) :: {integer(), integer(), integer()}
-  def decode_ratelimit(<<cur::64, start::64, prev::64>>), do: {cur, start, prev}
+  def decode_ratelimit(value), do: decode_ratelimit(value, HLC.now_ms())
 
-  def decode_ratelimit(value) when is_binary(value) do
+  @doc """
+  Decodes rate limiter state, using `fallback_start_ms` for malformed values.
+
+  Raft apply paths pass their stamped apply time here so corrupted or malformed
+  state is repaired deterministically on every replica.
+  """
+  @spec decode_ratelimit(binary(), integer()) :: {integer(), integer(), integer()}
+  def decode_ratelimit(<<cur::64, start::64, prev::64>>, _fallback_start_ms),
+    do: {cur, start, prev}
+
+  def decode_ratelimit(value, fallback_start_ms) when is_binary(value) do
     # Legacy fallback: decode old string-encoded values ("cur:start:prev").
     case String.split(value, ":") do
       [cur, start, prev] ->
-        {String.to_integer(cur), String.to_integer(start), String.to_integer(prev)}
+        with {:ok, cur} <- parse_integer(cur),
+             {:ok, start} <- parse_integer(start),
+             {:ok, prev} <- parse_integer(prev) do
+          {cur, start, prev}
+        else
+          :error -> {0, fallback_start_ms, 0}
+        end
 
       _ ->
-        {0, HLC.now_ms(), 0}
+        {0, fallback_start_ms, 0}
     end
   end
 end

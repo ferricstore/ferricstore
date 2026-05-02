@@ -777,6 +777,35 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert {1, ^stamped_now, 0} = Ferricstore.Store.ValueCodec.decode_ratelimit(encoded)
     end
 
+    test "stamped ratelimit repairs malformed state with stamped time", %{
+      state: state,
+      ets: ets
+    } do
+      local_now = Ferricstore.HLC.now_ms()
+      stamped_now = local_now - 30_000
+      window_ms = 10_000
+
+      :ets.insert(
+        ets,
+        {"malformed_stamped_ratelimit", "bad-state", 0, Ferricstore.Store.LFU.initial(), 0, 0, 0}
+      )
+
+      {_new_state, ["allowed", 1, 9, ^window_ms]} =
+        StateMachine.apply(
+          %{system_time: local_now},
+          {{:ratelimit_add, "malformed_stamped_ratelimit", window_ms, 10, 1},
+           %{hlc_ts: {stamped_now, 0}}},
+          state
+        )
+
+      expected_expire_at_ms = stamped_now + window_ms * 2
+
+      assert [{"malformed_stamped_ratelimit", encoded, ^expected_expire_at_ms, _, _, _, _}] =
+               :ets.lookup(ets, "malformed_stamped_ratelimit")
+
+      assert {1, ^stamped_now, 0} = Ferricstore.Store.ValueCodec.decode_ratelimit(encoded)
+    end
+
     test "legacy unwrapped ratelimit keeps embedded now_ms for replay compatibility", %{
       state: state,
       ets: ets

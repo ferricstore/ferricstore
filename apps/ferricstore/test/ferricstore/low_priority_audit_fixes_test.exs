@@ -61,14 +61,26 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       assert {10, 2000, 5} = ValueCodec.decode_ratelimit("10:2000:5")
     end
 
+    test "ValueCodec.decode_ratelimit uses explicit fallback for malformed state" do
+      assert {0, 12_345, 0} = ValueCodec.decode_ratelimit("bad-state", 12_345)
+      assert {0, 12_345, 0} = ValueCodec.decode_ratelimit("1:not-an-int:2", 12_345)
+    end
+
     test "INCRBYFLOAT uses shared format_float (no dead then)" do
       Router.put(FerricStore.Instance.get(:default), "incr_float_test", "10.5", 0)
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "incr_float_test") == "10.5"
-      end, "key not readable after put", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "incr_float_test") == "10.5"
+        end,
+        "key not readable after put",
+        20,
+        10
+      )
 
-      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), "incr_float_test", 1.5)
+      assert {:ok, result} =
+               Router.incr_float(FerricStore.Instance.get(:default), "incr_float_test", 1.5)
+
       assert_in_delta result, 12.0, 0.001
     end
   end
@@ -84,31 +96,53 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       # Verify correct behavior through the store.
       Router.put(FerricStore.Instance.get(:default), "setrange_test", "Hello World", 0)
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "setrange_test") == "Hello World"
-      end, "key not readable after put", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "setrange_test") == "Hello World"
+        end,
+        "key not readable after put",
+        20,
+        10
+      )
 
-      assert {:ok, 11} = Router.setrange(FerricStore.Instance.get(:default), "setrange_test", 6, "Redis")
+      assert {:ok, 11} =
+               Router.setrange(FerricStore.Instance.get(:default), "setrange_test", 6, "Redis")
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "setrange_test") == "Hello Redis"
-      end, "setrange result not readable", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "setrange_test") == "Hello Redis"
+        end,
+        "setrange result not readable",
+        20,
+        10
+      )
     end
 
     test "SETRANGE with padding works correctly" do
       Router.put(FerricStore.Instance.get(:default), "setrange_pad", "Hi", 0)
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "setrange_pad") == "Hi"
-      end, "key not readable after put", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "setrange_pad") == "Hi"
+        end,
+        "key not readable after put",
+        20,
+        10
+      )
 
       # Offset beyond current string length should zero-pad
-      assert {:ok, _len} = Router.setrange(FerricStore.Instance.get(:default), "setrange_pad", 5, "X")
+      assert {:ok, _len} =
+               Router.setrange(FerricStore.Instance.get(:default), "setrange_pad", 5, "X")
 
-      ShardHelpers.eventually(fn ->
-        result = Router.get(FerricStore.Instance.get(:default), "setrange_pad")
-        result != nil and byte_size(result) >= 6
-      end, "setrange result not readable", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          result = Router.get(FerricStore.Instance.get(:default), "setrange_pad")
+          result != nil and byte_size(result) >= 6
+        end,
+        "setrange result not readable",
+        20,
+        10
+      )
 
       result = Router.get(FerricStore.Instance.get(:default), "setrange_pad")
       assert binary_part(result, 0, 2) == "Hi"
@@ -118,11 +152,17 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
     end
 
     test "SETRANGE on empty key works" do
-      assert {:ok, 5} = Router.setrange(FerricStore.Instance.get(:default), "setrange_empty", 0, "Hello")
+      assert {:ok, 5} =
+               Router.setrange(FerricStore.Instance.get(:default), "setrange_empty", 0, "Hello")
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "setrange_empty") == "Hello"
-      end, "setrange result not readable", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "setrange_empty") == "Hello"
+        end,
+        "setrange result not readable",
+        20,
+        10
+      )
     end
   end
 
@@ -137,9 +177,14 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       # Commands must still execute in order.
       Router.put(FerricStore.Instance.get(:default), "multi_order", "0", 0)
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "multi_order") == "0"
-      end, "key not readable after put", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "multi_order") == "0"
+        end,
+        "key not readable after put",
+        20,
+        10
+      )
 
       # INCR three times: result should be 3, not some other value
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "multi_order")
@@ -179,10 +224,15 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       # Trigger an expiry sweep and wait for it to complete
       GenServer.call(pid, :expiry_sweep)
 
-      ShardHelpers.eventually(fn ->
-        # After hibernation, the process should still be responsive
-        Process.alive?(pid)
-      end, "shard process not alive after sweep", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          # After hibernation, the process should still be responsive
+          Process.alive?(pid)
+        end,
+        "shard process not alive after sweep",
+        20,
+        10
+      )
 
       # Verify the shard still works
       :ok = GenServer.call(pid, {:put, "hibernate_test", "value", 0})
@@ -245,14 +295,11 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
 
       match_spec = [
         {{:"$1", :"$2", :_, :_, :_, :_, :_},
-         [{:andalso,
-           {:is_binary, :"$1"},
-           {:andalso,
-             {:>=, {:byte_size, :"$1"}, pm_len},
-             {:andalso,
-               {:==, {:binary_part, :"$1", 0, pm_len}, pm_prefix},
-               {:is_binary, :"$2"}}}}],
-         [{{:"$1", :"$2"}}]}
+         [
+           {:andalso, {:is_binary, :"$1"},
+            {:andalso, {:>=, {:byte_size, :"$1"}, pm_len},
+             {:andalso, {:==, {:binary_part, :"$1", 0, pm_len}, pm_prefix}, {:is_binary, :"$2"}}}}
+         ], [{{:"$1", :"$2"}}]}
       ]
 
       results = :ets.select(keydir, match_spec)
@@ -275,14 +322,11 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
 
       match_spec = [
         {{:"$1", :"$2", :_, :_, :_, :_, :_},
-         [{:andalso,
-           {:is_binary, :"$1"},
-           {:andalso,
-             {:>=, {:byte_size, :"$1"}, pm_len},
-             {:andalso,
-               {:==, {:binary_part, :"$1", 0, pm_len}, pm_prefix},
-               {:is_binary, :"$2"}}}}],
-         [{{:"$1", :"$2"}}]}
+         [
+           {:andalso, {:is_binary, :"$1"},
+            {:andalso, {:>=, {:byte_size, :"$1"}, pm_len},
+             {:andalso, {:==, {:binary_part, :"$1", 0, pm_len}, pm_prefix}, {:is_binary, :"$2"}}}}
+         ], [{{:"$1", :"$2"}}]}
       ]
 
       results = :ets.select(keydir, match_spec)
@@ -316,13 +360,21 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
 
       # Build a minimal instance for this isolated shard
       name = :"discover_test_#{:rand.uniform(999_999)}"
-      ctx = FerricStore.Instance.build(name, [
-        data_dir: dir,
-        shard_count: 1,
-        raft_enabled: false
-      ])
 
-      {:ok, pid} = Ferricstore.Store.Shard.start_link(index: 0, data_dir: dir, instance_ctx: ctx, raft_enabled: false)
+      ctx =
+        FerricStore.Instance.build(name,
+          data_dir: dir,
+          shard_count: 1,
+          raft_enabled: false
+        )
+
+      {:ok, pid} =
+        Ferricstore.Store.Shard.start_link(
+          index: 0,
+          data_dir: dir,
+          instance_ctx: ctx,
+          raft_enabled: false
+        )
 
       # The shard should start successfully
       assert Process.alive?(pid)
@@ -359,9 +411,14 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       # Regular GET/PUT should work fine with nil pubsub fields
       Router.put(FerricStore.Instance.get(:default), "nil_pubsub_test", "value", 0)
 
-      ShardHelpers.eventually(fn ->
-        Router.get(FerricStore.Instance.get(:default), "nil_pubsub_test") == "value"
-      end, "key not readable after put", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Router.get(FerricStore.Instance.get(:default), "nil_pubsub_test") == "value"
+        end,
+        "key not readable after put",
+        20,
+        10
+      )
     end
   end
 

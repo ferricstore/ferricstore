@@ -288,7 +288,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
     {cur_count, cur_start, prv_count} =
       case ShardETS.ets_lookup_warm(state, key) do
-        {:hit, value, _exp} -> decode_ratelimit(value)
+        {:hit, value, _exp} -> decode_ratelimit(value, now)
         _ -> {0, now, 0}
       end
 
@@ -644,9 +644,11 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   @doc false
   def encode_ratelimit(cur, start, prev), do: ValueCodec.encode_ratelimit(cur, start, prev)
 
-  @spec decode_ratelimit(binary()) :: {non_neg_integer(), non_neg_integer(), non_neg_integer()}
+  @spec decode_ratelimit(binary(), non_neg_integer()) ::
+          {non_neg_integer(), non_neg_integer(), non_neg_integer()}
   @doc false
-  def decode_ratelimit(value), do: ValueCodec.decode_ratelimit(value)
+  def decode_ratelimit(value, fallback_start_ms),
+    do: ValueCodec.decode_ratelimit(value, fallback_start_ms)
 
   # Alias for compound key reads — same logic as do_get since compound keys
   # are stored as regular ETS/Bitcask entries.
