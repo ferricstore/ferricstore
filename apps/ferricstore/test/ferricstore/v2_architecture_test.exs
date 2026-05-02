@@ -472,6 +472,18 @@ defmodule Ferricstore.V2ArchitectureTest do
       assert Enum.at(values, 1) == "v2"
       assert Enum.at(values, 2) == "v3"
     end
+
+    test "batch read surfaces CRC errors instead of returning nil", %{dir: dir} do
+      path = data_file(dir, 1)
+      {:ok, {offset, _}} = NIF.v2_append_record(path, "crc_batch", "value", 0)
+
+      {:ok, fd} = :file.open(path, [:read, :write, :binary])
+      :ok = :file.pwrite(fd, @header_size, <<0xFF>>)
+      :ok = :file.close(fd)
+
+      assert {:error, reason} = NIF.v2_pread_batch(path, [offset])
+      assert reason =~ "CRC" or reason =~ "mismatch"
+    end
   end
 
   # =========================================================================

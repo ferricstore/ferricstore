@@ -603,7 +603,8 @@ fn v2_pread_batch<'a>(env: Env<'a>, path: String, locations: Vec<u64>) -> NifRes
                             None => nil,
                         }
                     }
-                    _ => nil,
+                    Ok(None) => nil,
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
                 };
                 slot_results[orig_idx] = Some(term);
             }
@@ -1023,32 +1024,36 @@ fn group_pread_locations(
     (count, grouped.into_iter().collect())
 }
 
-fn pread_batch_for_path(path: String, reads: Vec<(usize, u64)>) -> Vec<(usize, Option<Vec<u8>>)> {
+fn pread_batch_for_path(
+    path: String,
+    reads: Vec<(usize, u64)>,
+) -> Result<Vec<(usize, Option<Vec<u8>>)>, String> {
     let file = match std::fs::File::open(std::path::Path::new(&path)) {
         Ok(file) => file,
-        Err(_) => return reads.into_iter().map(|(index, _)| (index, None)).collect(),
+        Err(e) => return Err(e.to_string()),
     };
 
     fadvise_random(&file);
 
-    reads
-        .into_iter()
-        .map(|(index, offset)| {
-            let value = match log::pread_record_from_file(&file, offset) {
-                Ok(Some(record)) => {
-                    let size = (log::HEADER_SIZE
-                        + record.key.len()
-                        + record.value.as_ref().map_or(0, Vec::len))
-                        as i64;
-                    fadvise_dontneed(&file, offset as i64, size);
-                    record.value
-                }
-                _ => None,
-            };
+    let mut results = Vec::with_capacity(reads.len());
 
-            (index, value)
-        })
-        .collect()
+    for (index, offset) in reads {
+        let value = match log::pread_record_from_file(&file, offset) {
+            Ok(Some(record)) => {
+                let size = (log::HEADER_SIZE
+                    + record.key.len()
+                    + record.value.as_ref().map_or(0, Vec::len)) as i64;
+                fadvise_dontneed(&file, offset as i64, size);
+                record.value
+            }
+            Ok(None) => None,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        results.push((index, value));
+    }
+
+    Ok(results)
 }
 
 fn apply_grouped_pread_results(
@@ -1062,15 +1067,16 @@ fn apply_grouped_pread_results(
     }
 }
 
-fn pread_batch_grouped(locations: Vec<(String, u64)>) -> Vec<Option<Vec<u8>>> {
+#[cfg(test)]
+fn pread_batch_grouped(locations: Vec<(String, u64)>) -> Result<Vec<Option<Vec<u8>>>, String> {
     let (count, groups) = group_pread_locations(locations);
     let mut values = vec![None; count];
 
     for (path, reads) in groups {
-        apply_grouped_pread_results(&mut values, pread_batch_for_path(path, reads));
+        apply_grouped_pread_results(&mut values, pread_batch_for_path(path, reads)?);
     }
 
-    values
+    Ok(values)
 }
 
 #[rustler::nif(schedule = "Normal")]
@@ -1091,32 +1097,53 @@ fn v2_pread_batch_async(
             }));
         }
 
-        let mut values: Vec<Option<Vec<u8>>> = vec![None; count];
+        let mut result: Result<Vec<Option<Vec<u8>>>, String> = Ok(vec![None; count]);
         for handle in handles {
-            if let Ok(results) = handle.await {
-                apply_grouped_pread_results(&mut values, results);
+            match handle.await {
+                Ok(Ok(results)) => {
+                    if let Ok(values) = &mut result {
+                        apply_grouped_pread_results(values, results);
+                    }
+                }
+                Ok(Err(reason)) => {
+                    result = Err(reason);
+                    break;
+                }
+                Err(e) => {
+                    result = Err(format!("spawn_blocking: {e}"));
+                    break;
+                }
             }
         }
 
         let mut msg_env = rustler::OwnedEnv::new();
-        let _ = msg_env.send_and_clear(&caller_pid, |env| {
-            let results: Vec<Term> = values
-                .into_iter()
-                .map(|opt| match opt {
-                    Some(value) => {
-                        let resource = ResourceArc::new(ValueBuffer { data: value });
-                        resource.make_binary(env, |vb| &vb.data).encode(env)
-                    }
-                    None => atoms::nil().encode(env),
-                })
-                .collect();
-            (
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(values) => {
+                let results: Vec<Term> = values
+                    .into_iter()
+                    .map(|opt| match opt {
+                        Some(value) => {
+                            let resource = ResourceArc::new(ValueBuffer { data: value });
+                            resource.make_binary(env, |vb| &vb.data).encode(env)
+                        }
+                        None => atoms::nil().encode(env),
+                    })
+                    .collect();
+                (
+                    atoms::tokio_complete(),
+                    correlation_id,
+                    atoms::ok(),
+                    results,
+                )
+                    .encode(env)
+            }
+            Err(reason) => (
                 atoms::tokio_complete(),
                 correlation_id,
-                atoms::ok(),
-                results,
+                atoms::error(),
+                reason.as_str(),
             )
-                .encode(env)
+                .encode(env),
         });
     });
     Ok(atoms::ok().encode(env))
@@ -1556,7 +1583,8 @@ mod audit_fix_tests {
             (path_a.to_string_lossy().into_owned(), a1),
             (path_a.to_string_lossy().into_owned(), 999_999),
             (path_a.to_string_lossy().into_owned(), a0),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(values[0].as_deref(), Some(&b"vb0"[..]));
         assert_eq!(values[1].as_deref(), Some(&b"va1"[..]));

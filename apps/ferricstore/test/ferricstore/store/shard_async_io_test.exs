@@ -23,6 +23,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
 
+  @header_size 26
+
   setup do
     :ok
   end
@@ -810,6 +812,32 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
       corr_ids = Enum.map(received, fn {id, _} -> id end) |> Enum.sort()
       assert corr_ids == [1, 2, 3, 4, 5]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # v2_pread_batch_async NIF (Tokio path)
+  # ---------------------------------------------------------------------------
+
+  describe "v2_pread_batch_async NIF" do
+    test "surfaces CRC errors instead of returning nil" do
+      dir = Path.join(System.tmp_dir!(), "async_pread_batch_crc_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "00000.log")
+
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      {:ok, {offset, _}} = NIF.v2_append_record(path, "crc_batch_async", "value", 0)
+
+      {:ok, fd} = :file.open(path, [:read, :write, :binary])
+      :ok = :file.pwrite(fd, @header_size, <<0xFF>>)
+      :ok = :file.close(fd)
+
+      corr_id = 101
+      :ok = NIF.v2_pread_batch_async(self(), corr_id, [{path, offset}])
+
+      assert_receive {:tokio_complete, ^corr_id, :error, reason}, 5000
+      assert reason =~ "CRC" or reason =~ "mismatch"
     end
   end
 
