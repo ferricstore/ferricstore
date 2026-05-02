@@ -731,7 +731,13 @@ defmodule Ferricstore.Store.Shard do
           else
             if tombstone_file?(source) do
               remove_hint_for_file(sp, fid)
-              {written, dropped, reclaimed, compacted, [fid | skipped], failures}
+
+              if tombstone_file_still_needed?(sp, fid) do
+                {written, dropped, reclaimed, compacted, [fid | skipped], failures}
+              else
+                _ = Ferricstore.FS.rm(source)
+                {written, dropped, reclaimed + old_size, [fid | compacted], skipped, failures}
+              end
             else
               remove_hint_for_file(sp, fid)
               _ = Ferricstore.FS.rm(source)
@@ -935,6 +941,26 @@ defmodule Ferricstore.Store.Shard do
     case NIF.v2_scan_tombstones(path) do
       {:ok, [_ | _]} -> true
       _ -> false
+    end
+  end
+
+  # A tombstone-only file protects deleted keys from older log files. Once no
+  # lower file id remains, there is nothing left for those tombstones to mask.
+  defp tombstone_file_still_needed?(shard_path, fid) do
+    case Ferricstore.FS.ls(shard_path) do
+      {:ok, files} ->
+        Enum.any?(files, fn name ->
+          with true <- String.ends_with?(name, ".log"),
+               false <- String.starts_with?(name, "compact_"),
+               {other_fid, ""} <- Integer.parse(String.trim_trailing(name, ".log")) do
+            other_fid < fid
+          else
+            _ -> false
+          end
+        end)
+
+      _ ->
+        true
     end
   end
 
