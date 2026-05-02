@@ -65,7 +65,7 @@ defmodule Ferricstore.Merge.Scheduler do
   @default_merge_cooldown_ms 60_000
   @default_small_file_threshold 10_485_760
   @default_merge_retry_interval_ms 5_000
-  @default_compaction_call_timeout_ms 300_000
+  @default_compaction_call_timeout_ms :infinity
   @trigger_check_timeout_ms 300_000
 
   @type merge_mode :: :hot | :bulk | :age
@@ -339,9 +339,7 @@ defmodule Ferricstore.Merge.Scheduler do
         do_merge(state)
 
       {:busy, _holder} ->
-        Logger.debug(
-          "Shard #{state.shard_index}: merge semaphore busy, scheduling retry"
-        )
+        Logger.debug("Shard #{state.shard_index}: merge semaphore busy, scheduling retry")
 
         schedule_retry(state)
     end
@@ -402,9 +400,7 @@ defmodule Ferricstore.Merge.Scheduler do
         }
 
       {:error, reason} ->
-        Logger.error(
-          "Shard #{state.shard_index}: merge failed — #{inspect(reason)}"
-        )
+        Logger.error("Shard #{state.shard_index}: merge failed — #{inspect(reason)}")
 
         Manifest.delete(state.data_dir)
         Semaphore.release(state.shard_index, state.semaphore)
@@ -414,7 +410,8 @@ defmodule Ferricstore.Merge.Scheduler do
 
   defp select_files_for_merge(state, _shard_name) do
     with {:ok, file_sizes} <- log_file_sizes(state.data_dir),
-         {:ok, mergeable} <- pick_mergeable_files(file_sizes, state.config, state.fragmentation_candidates) do
+         {:ok, mergeable} <-
+           pick_mergeable_files(file_sizes, state.config, state.fragmentation_candidates) do
       {:ok, mergeable}
     else
       {:error, reason} -> {:error, reason}
@@ -487,7 +484,8 @@ defmodule Ferricstore.Merge.Scheduler do
         |> Enum.filter(fn {fid, _size} -> fid in file_ids end)
         |> Enum.reduce(0, fn {_fid, size}, acc -> acc + size end)
 
-      if available > 0 and input_bytes / max(available, 1) > (1.0 - state.config.min_free_space_ratio) do
+      if available > 0 and
+           input_bytes / max(available, 1) > 1.0 - state.config.min_free_space_ratio do
         Logger.warning(
           "Shard #{state.shard_index}: insufficient disk space for merge " <>
             "(need ~#{format_bytes(input_bytes)}, available #{format_bytes(available)})"
@@ -508,7 +506,11 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   defp run_compaction(state, shard_name, file_ids) do
-    case safe_call(shard_name, {:run_compaction, file_ids}, state.config.compaction_call_timeout_ms) do
+    case safe_call(
+           shard_name,
+           {:run_compaction, file_ids},
+           state.config.compaction_call_timeout_ms
+         ) do
       {:ok, result} -> {:ok, result}
       {:error, reason} -> {:error, {:compaction_failed, reason}}
     end
@@ -572,13 +574,20 @@ defmodule Ferricstore.Merge.Scheduler do
           app_config(:merge_retry_interval_ms, @default_merge_retry_interval_ms)
         ),
       compaction_call_timeout_ms:
-        Map.get(
-          overrides,
-          :compaction_call_timeout_ms,
-          app_config(:compaction_call_timeout_ms, @default_compaction_call_timeout_ms)
+        normalize_compaction_call_timeout(
+          Map.get(
+            overrides,
+            :compaction_call_timeout_ms,
+            app_config(:compaction_call_timeout_ms, @default_compaction_call_timeout_ms)
+          )
         )
     }
   end
+
+  # A timed-out GenServer.call does not cancel work already running inside the
+  # shard. Keeping this infinite preserves the node-level merge semaphore until
+  # compaction actually finishes or the shard process exits.
+  defp normalize_compaction_call_timeout(_timeout), do: :infinity
 
   defp app_config(key, default) do
     merge_config = Application.get_env(:ferricstore, :merge, [])

@@ -26,7 +26,8 @@ defmodule Ferricstore.Merge.SchedulerTest do
     @impl true
     def handle_call(:file_sizes, _from, state), do: {:reply, {:ok, [{0, 1024}, {1, 1024}]}, state}
 
-    def handle_call(:available_disk_space, _from, state), do: {:reply, {:ok, 1_000_000_000}, state}
+    def handle_call(:available_disk_space, _from, state),
+      do: {:reply, {:ok, 1_000_000_000}, state}
 
     def handle_call({:run_compaction, [0]}, _from, state) do
       send(state.parent, :slow_compaction_started)
@@ -50,10 +51,37 @@ defmodule Ferricstore.Merge.SchedulerTest do
       {:reply, {:ok, [{0, 1024}, {1, 1024}]}, state}
     end
 
-    def handle_call(:available_disk_space, _from, state), do: {:reply, {:ok, 1_000_000_000}, state}
+    def handle_call(:available_disk_space, _from, state),
+      do: {:reply, {:ok, 1_000_000_000}, state}
 
     def handle_call({:run_compaction, [0]}, _from, state) do
       send(state.parent, :compaction_called)
+      {:reply, {:ok, {1, 0, 128}}, state}
+    end
+  end
+
+  defmodule BlockingShard do
+    use GenServer
+
+    def start(opts), do: GenServer.start(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
+
+    @impl true
+    def init(opts), do: {:ok, Map.new(opts)}
+
+    @impl true
+    def handle_call(:available_disk_space, _from, state),
+      do: {:reply, {:ok, 1_000_000_000}, state}
+
+    def handle_call({:run_compaction, [0]}, _from, state) do
+      send(state.parent, {:compaction_started, state.shard_index})
+
+      receive do
+        {:finish_compaction, index} when index == state.shard_index -> :ok
+      after
+        state.sleep_ms -> :ok
+      end
+
+      send(state.parent, {:compaction_finished, state.shard_index})
       {:reply, {:ok, {1, 0, 128}}, state}
     end
   end
@@ -92,7 +120,9 @@ defmodule Ferricstore.Merge.SchedulerTest do
     end
 
     test "dedicated scheduler initializes file count from existing shard log files" do
-      data_dir = Path.join(System.tmp_dir!(), "scheduler_restart_#{System.unique_integer([:positive])}")
+      data_dir =
+        Path.join(System.tmp_dir!(), "scheduler_restart_#{System.unique_integer([:positive])}")
+
       shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
       File.mkdir_p!(shard_dir)
 
@@ -125,9 +155,14 @@ defmodule Ferricstore.Merge.SchedulerTest do
     test "notify_rotation updates file count in scheduler state" do
       Scheduler.notify_rotation(0, 5)
 
-      ShardHelpers.eventually(fn ->
-        Scheduler.status(0).file_count == 5
-      end, "file count not updated", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Scheduler.status(0).file_count == 5
+        end,
+        "file count not updated",
+        20,
+        10
+      )
 
       status = Scheduler.status(0)
       assert status.file_count == 5
@@ -137,9 +172,14 @@ defmodule Ferricstore.Merge.SchedulerTest do
       # min_files_for_merge defaults to 2, send count of 1
       Scheduler.notify_rotation(0, 1)
 
-      ShardHelpers.eventually(fn ->
-        Scheduler.status(0).file_count == 1
-      end, "file count not updated", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Scheduler.status(0).file_count == 1
+        end,
+        "file count not updated",
+        20,
+        10
+      )
 
       status = Scheduler.status(0)
       assert status.merging == false
@@ -155,9 +195,14 @@ defmodule Ferricstore.Merge.SchedulerTest do
         Scheduler.notify_rotation(0, i)
       end
 
-      ShardHelpers.eventually(fn ->
-        Scheduler.status(0).file_count == 10
-      end, "file count not updated to 10", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Scheduler.status(0).file_count == 10
+        end,
+        "file count not updated to 10",
+        20,
+        10
+      )
 
       # Scheduler should be alive and have the latest file count
       status = Scheduler.status(0)
@@ -184,9 +229,14 @@ defmodule Ferricstore.Merge.SchedulerTest do
       # Set file count above threshold via notification
       Scheduler.notify_rotation(0, 5)
 
-      ShardHelpers.eventually(fn ->
-        Scheduler.status(0).file_count == 5
-      end, "file count not updated", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Scheduler.status(0).file_count == 5
+        end,
+        "file count not updated",
+        20,
+        10
+      )
 
       # trigger_check should run the merge check
       assert :ok = Scheduler.trigger_check(0)
@@ -195,9 +245,14 @@ defmodule Ferricstore.Merge.SchedulerTest do
     test "trigger_check with insufficient files does not merge" do
       Scheduler.notify_rotation(0, 1)
 
-      ShardHelpers.eventually(fn ->
-        Scheduler.status(0).file_count == 1
-      end, "file count not updated", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Scheduler.status(0).file_count == 1
+        end,
+        "file count not updated",
+        20,
+        10
+      )
 
       assert :ok = Scheduler.trigger_check(0)
       status = Scheduler.status(0)
@@ -208,7 +263,13 @@ defmodule Ferricstore.Merge.SchedulerTest do
       ctx = FerricStore.Instance.get(:default)
       shard_name = Router.shard_name(ctx, 0)
       real_shard = Process.whereis(shard_name)
-      data_dir = Path.join(System.tmp_dir!(), "scheduler_slow_compaction_#{System.unique_integer([:positive])}")
+
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "scheduler_slow_compaction_#{System.unique_integer([:positive])}"
+        )
+
       shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
       File.mkdir_p!(shard_dir)
       File.write!(Path.join(shard_dir, "00000.log"), "old")
@@ -243,7 +304,10 @@ defmodule Ferricstore.Merge.SchedulerTest do
         ref = Process.monitor(fake_shard)
         Process.exit(fake_shard, :kill)
         assert_receive {:DOWN, ^ref, :process, ^fake_shard, :killed}, 1_000
-        if is_pid(real_shard) and Process.alive?(real_shard), do: Process.register(real_shard, shard_name)
+
+        if is_pid(real_shard) and Process.alive?(real_shard),
+          do: Process.register(real_shard, shard_name)
+
         File.rm_rf!(data_dir)
       end
     end
@@ -252,7 +316,13 @@ defmodule Ferricstore.Merge.SchedulerTest do
       ctx = FerricStore.Instance.get(:default)
       shard_name = Router.shard_name(ctx, 0)
       real_shard = Process.whereis(shard_name)
-      data_dir = Path.join(System.tmp_dir!(), "scheduler_local_file_sizes_#{System.unique_integer([:positive])}")
+
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "scheduler_local_file_sizes_#{System.unique_integer([:positive])}"
+        )
+
       shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
       File.mkdir_p!(shard_dir)
       File.write!(Path.join(shard_dir, "00000.log"), "old")
@@ -278,7 +348,108 @@ defmodule Ferricstore.Merge.SchedulerTest do
         ref = Process.monitor(fake_shard)
         Process.exit(fake_shard, :kill)
         assert_receive {:DOWN, ^ref, :process, ^fake_shard, :killed}, 1_000
-        if is_pid(real_shard) and Process.alive?(real_shard), do: Process.register(real_shard, shard_name)
+
+        if is_pid(real_shard) and Process.alive?(real_shard),
+          do: Process.register(real_shard, shard_name)
+
+        File.rm_rf!(data_dir)
+      end
+    end
+
+    test "compaction timeout does not release semaphore while shard is still compacting" do
+      ctx = FerricStore.Instance.get(:default)
+      shard0_name = Router.shard_name(ctx, 0)
+      shard1_name = Router.shard_name(ctx, 1)
+      real_shard0 = Process.whereis(shard0_name)
+      real_shard1 = Process.whereis(shard1_name)
+
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "scheduler_timeout_semaphore_#{System.unique_integer([:positive])}"
+        )
+
+      for index <- [0, 1] do
+        shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, index)
+        File.mkdir_p!(shard_dir)
+        File.write!(Path.join(shard_dir, "00000.log"), "old")
+        File.write!(Path.join(shard_dir, "00001.log"), "active")
+      end
+
+      {:ok, semaphore} = Ferricstore.Merge.Semaphore.start_link(name: :test_timeout_semaphore)
+
+      Process.unregister(shard0_name)
+      Process.unregister(shard1_name)
+
+      {:ok, fake_shard0} =
+        BlockingShard.start(name: shard0_name, parent: self(), shard_index: 0, sleep_ms: 500)
+
+      {:ok, fake_shard1} =
+        BlockingShard.start(name: shard1_name, parent: self(), shard_index: 1, sleep_ms: 10)
+
+      merge_config = %{
+        mode: :hot,
+        min_files_for_merge: 2,
+        merge_cooldown_ms: 0,
+        compaction_call_timeout_ms: 50
+      }
+
+      {:ok, scheduler0} =
+        Scheduler.start_link(
+          shard_index: 0,
+          data_dir: data_dir,
+          merge_config: merge_config,
+          semaphore: semaphore,
+          name: :test_timeout_scheduler_0
+        )
+
+      {:ok, scheduler1} =
+        Scheduler.start_link(
+          shard_index: 1,
+          data_dir: data_dir,
+          merge_config: merge_config,
+          semaphore: semaphore,
+          name: :test_timeout_scheduler_1
+        )
+
+      try do
+        task0 = Task.async(fn -> Scheduler.trigger_check(scheduler0) end)
+        assert_receive {:compaction_started, 0}, 1_000
+
+        Process.sleep(100)
+        assert Ferricstore.Merge.Semaphore.status(semaphore) == {:held, 0}
+
+        task1 = Task.async(fn -> Scheduler.trigger_check(scheduler1) end)
+        refute_receive {:compaction_started, 1}, 150
+        assert Task.await(task1, 1_000) == :ok
+
+        send(fake_shard0, {:finish_compaction, 0})
+        assert_receive {:compaction_finished, 0}, 1_000
+        assert Task.await(task0, 1_000) == :ok
+
+        assert Scheduler.trigger_check(scheduler1) == :ok
+        assert_receive {:compaction_started, 1}, 1_000
+        assert_receive {:compaction_finished, 1}, 1_000
+      after
+        for pid <- [scheduler0, scheduler1],
+            is_pid(pid),
+            Process.alive?(pid),
+            do: GenServer.stop(pid)
+
+        for pid <- [fake_shard0, fake_shard1], is_pid(pid), Process.alive?(pid) do
+          ref = Process.monitor(pid)
+          Process.exit(pid, :kill)
+          assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
+        end
+
+        if Process.alive?(semaphore), do: GenServer.stop(semaphore)
+
+        if is_pid(real_shard0) and Process.alive?(real_shard0),
+          do: Process.register(real_shard0, shard0_name)
+
+        if is_pid(real_shard1) and Process.alive?(real_shard1),
+          do: Process.register(real_shard1, shard1_name)
+
         File.rm_rf!(data_dir)
       end
     end
@@ -314,9 +485,14 @@ defmodule Ferricstore.Merge.SchedulerTest do
       # Send file count below threshold
       GenServer.cast(pid, {:file_rotated, 5})
 
-      ShardHelpers.eventually(fn ->
-        GenServer.call(pid, :status).file_count == 5
-      end, "file count not updated", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          GenServer.call(pid, :status).file_count == 5
+        end,
+        "file count not updated",
+        20,
+        10
+      )
 
       status = GenServer.call(pid, :status)
       assert status.merging == false
@@ -343,9 +519,14 @@ defmodule Ferricstore.Merge.SchedulerTest do
       # Send file count above threshold
       GenServer.cast(pid, {:file_rotated, 10})
 
-      ShardHelpers.eventually(fn ->
-        GenServer.call(pid, :status).file_count == 10
-      end, "file count not updated", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          GenServer.call(pid, :status).file_count == 10
+        end,
+        "file count not updated",
+        20,
+        10
+      )
 
       status = GenServer.call(pid, :status)
       # Should NOT be merging because we're outside the window
@@ -381,9 +562,14 @@ defmodule Ferricstore.Merge.SchedulerTest do
 
       GenServer.cast(pid, {:file_rotated, 10})
 
-      ShardHelpers.eventually(fn ->
-        GenServer.call(pid, :status).file_count == 10
-      end, "file count not updated", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          GenServer.call(pid, :status).file_count == 10
+        end,
+        "file count not updated",
+        20,
+        10
+      )
 
       status = GenServer.call(pid, :status)
       # Should not be merging — semaphore was held by shard 99
@@ -410,9 +596,14 @@ defmodule Ferricstore.Merge.SchedulerTest do
       Scheduler.notify_rotation(0, 5)
       Scheduler.notify_rotation(0, 6)
 
-      ShardHelpers.eventually(fn ->
-        Scheduler.status(0).file_count == 6
-      end, "file count not updated to 6", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Scheduler.status(0).file_count == 6
+        end,
+        "file count not updated to 6",
+        20,
+        10
+      )
 
       # At most one merge should have been triggered
       status_after = Scheduler.status(0)
@@ -438,9 +629,14 @@ defmodule Ferricstore.Merge.SchedulerTest do
       # Manually notify (simulates what the shard does on rotation)
       Scheduler.notify_rotation(0, initial_count + 1)
 
-      ShardHelpers.eventually(fn ->
-        Scheduler.status(0).file_count == initial_count + 1
-      end, "file count not updated", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Scheduler.status(0).file_count == initial_count + 1
+        end,
+        "file count not updated",
+        20,
+        10
+      )
 
       new_status = Scheduler.status(0)
       assert new_status.file_count == initial_count + 1
