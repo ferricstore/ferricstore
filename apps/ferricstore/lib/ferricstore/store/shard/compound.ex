@@ -844,25 +844,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
       now = HLC.now_ms()
 
-      live_entries =
-        :ets.foldl(
-          fn {key, value, exp, _lfu, fid, off, vsize}, acc ->
-            collect_promoted_live_entry(
-              dedicated_path,
-              prefix,
-              now,
-              key,
-              value,
-              exp,
-              fid,
-              off,
-              vsize,
-              acc
-            )
-          end,
-          [],
-          state.keydir
-        )
+      live_entries = collect_promoted_live_entries(state, dedicated_path, prefix, now)
 
       if live_entries == [] do
         # Roll back the `touch!(new_file)` above: remove the empty
@@ -949,39 +931,74 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
-  defp collect_promoted_live_entry(
-         dedicated_path,
-         prefix,
-         now,
-         key,
-         value,
-         exp,
-         fid,
-         off,
-         vsize,
-         acc
-       ) do
-    cond do
-      not is_binary(key) or not String.starts_with?(key, prefix) ->
-        acc
+  defp collect_promoted_live_entries(state, dedicated_path, prefix, now) do
+    {tokens, cold_entries, _cold_count} =
+      :ets.foldl(
+        fn {key, value, exp, _lfu, fid, off, vsize}, {tokens, cold_entries, cold_count} ->
+          cond do
+            not is_binary(key) or not String.starts_with?(key, prefix) ->
+              {tokens, cold_entries, cold_count}
 
-      exp != 0 and exp <= now ->
-        acc
+            exp != 0 and exp <= now ->
+              {tokens, cold_entries, cold_count}
 
-      value != nil ->
-        [{key, value, exp} | acc]
+            value != nil ->
+              {[{:value, {key, value, exp}} | tokens], cold_entries, cold_count}
 
-      valid_promoted_cold_location?(fid, off, vsize) ->
-        file_path = dedicated_file_path(dedicated_path, fid)
+            valid_promoted_cold_location?(fid, off, vsize) ->
+              file_path = dedicated_file_path(dedicated_path, fid)
+              entry = {key, exp, file_path, off}
+              {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
 
-        case read_cold_async(file_path, off) do
-          {:ok, cold_value} -> [{key, cold_value, exp} | acc]
-          _ -> acc
+            true ->
+              {tokens, cold_entries, cold_count}
+          end
+        end,
+        {[], [], 0},
+        state.keydir
+      )
+
+    cold_values =
+      cold_entries
+      |> Enum.reverse()
+      |> read_promoted_cold_batch()
+      |> List.to_tuple()
+
+    Enum.flat_map(tokens, fn
+      {:value, entry} ->
+        [entry]
+
+      {:cold, index} ->
+        case elem(cold_values, index) do
+          nil -> []
+          entry -> [entry]
         end
+    end)
+  end
 
-      true ->
-        acc
-    end
+  defp read_promoted_cold_batch([]), do: []
+
+  defp read_promoted_cold_batch(entries) do
+    locations = Enum.map(entries, fn {_key, _exp, file_path, off} -> {file_path, off} end)
+
+    values =
+      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_batch_read_timeout_ms) do
+        {:ok, values} when is_list(values) ->
+          if length(values) == length(entries) do
+            values
+          else
+            List.duplicate(nil, length(entries))
+          end
+
+        {:error, _reason} ->
+          List.duplicate(nil, length(entries))
+      end
+
+    Enum.zip(entries, values)
+    |> Enum.map(fn
+      {{key, exp, _file_path, _off}, value} when value != nil -> {key, value, exp}
+      {_entry, _value} -> nil
+    end)
   end
 
   defp valid_promoted_cold_location?(fid, off, vsize) do
