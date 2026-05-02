@@ -2,8 +2,8 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
   @moduledoc """
   Unit tests for the Transaction Coordinator.
 
-  Single-shard transactions dispatch atomically via a single GenServer call.
-  Cross-shard transactions execute atomically via anchor-shard Raft entry.
+  Raft-enabled transactions, including single-shard writes, execute atomically
+  via an anchor-shard Raft entry.
 
   All key-to-shard mappings are discovered dynamically via ShardHelpers so
   tests work with any shard count (not just 4).
@@ -48,13 +48,23 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     end
   end
 
-  describe "single-shard fast path" do
-    test "uses fast path when all commands target the same shard", %{same1: s1, same2: s2} do
+  describe "single-shard transactions" do
+    test "executes when all commands target the same shard", %{same1: s1, same2: s2} do
       queue = [{"SET", [s1, "100"]}, {"SET", [s2, "200"]}, {"GET", [s1]}]
 
       result = Coordinator.execute(queue, %{}, nil)
 
       assert result == [:ok, :ok, "100"]
+    end
+
+    test "single-shard write transaction applies through Raft", %{same1: s1} do
+      idx = Router.shard_for(FerricStore.Instance.get(:default), s1)
+      shard_id = Ferricstore.Raft.Cluster.shard_server_id(idx)
+      before_count = raft_applied_count(shard_id)
+
+      assert [:ok] == Coordinator.execute([{"SET", [s1, "via_raft"]}], %{}, nil)
+
+      assert raft_applied_count(shard_id) == before_count + 1
     end
 
     test "returns results in original command order", %{same1: s1, same2: s2} do
@@ -385,5 +395,10 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       result = Coordinator.execute([], %{}, nil)
       assert result == []
     end
+  end
+
+  defp raft_applied_count(shard_id) do
+    {:ok, %{machine: %{applied_count: count}}, _leader} = :ra.member_overview(shard_id)
+    count
   end
 end

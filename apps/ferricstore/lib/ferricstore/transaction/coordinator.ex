@@ -2,13 +2,11 @@ defmodule Ferricstore.Transaction.Coordinator do
   @moduledoc """
   Transaction coordinator for MULTI/EXEC.
 
-  Single-shard transactions are dispatched as a batch to the target shard's
-  GenServer, executing within a single `handle_call` to guarantee atomicity
-  (no other client can interleave on that shard).
-
-  Cross-shard transactions submit a single Raft log entry to an "anchor shard"
-  containing commands for ALL involved shards. The StateMachine's `apply/3`
+  Raft-enabled transactions submit a single Raft log entry to an "anchor shard"
+  containing commands for all involved shards. The StateMachine's `apply/3`
   writes to all shards' ETS tables and Bitcask files in one deterministic pass.
+  This includes single-shard write transactions; otherwise they would bypass
+  the quorum write path and only mutate the local shard process.
 
   ## WATCH conflict detection
 
@@ -30,7 +28,11 @@ defmodule Ferricstore.Transaction.Coordinator do
     if watches_clean?(watched_keys) do
       case classify_shards(queue, sandbox_namespace) do
         {:single_shard, shard_idx} ->
-          execute_single_shard(queue, shard_idx, sandbox_namespace)
+          if raft_enabled?() do
+            execute_single_shard_raft(queue, shard_idx, sandbox_namespace)
+          else
+            execute_single_shard_direct(queue, shard_idx, sandbox_namespace)
+          end
 
         {:multi_shard, shard_groups, index_map} ->
           execute_cross_shard(shard_groups, index_map, length(queue), sandbox_namespace)
@@ -41,10 +43,26 @@ defmodule Ferricstore.Transaction.Coordinator do
   end
 
   # ---------------------------------------------------------------------------
-  # Single-shard path: dispatch all commands as a batch to the shard GenServer
+  # Single-shard path
   # ---------------------------------------------------------------------------
 
-  defp execute_single_shard(queue, shard_idx, sandbox_namespace) do
+  defp execute_single_shard_raft(queue, shard_idx, sandbox_namespace) do
+    shard_groups = %{
+      shard_idx =>
+        queue
+        |> Enum.with_index()
+        |> Enum.map(fn {{cmd, args}, orig_idx} -> {orig_idx, cmd, args} end)
+    }
+
+    execute_cross_shard(
+      shard_groups,
+      build_index_map(shard_groups),
+      length(queue),
+      sandbox_namespace
+    )
+  end
+
+  defp execute_single_shard_direct(queue, shard_idx, sandbox_namespace) do
     ctx = FerricStore.Instance.get(:default)
     shard = Router.resolve_shard(ctx, shard_idx)
 
@@ -89,19 +107,53 @@ defmodule Ferricstore.Transaction.Coordinator do
           end
 
         {:error, :noproc} ->
-          execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
+          maybe_execute_cross_shard_sequential(
+            shard_groups,
+            index_map,
+            total,
+            sandbox_namespace,
+            :noproc
+          )
 
         {:error, _reason} ->
-          execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
+          maybe_execute_cross_shard_sequential(
+            shard_groups,
+            index_map,
+            total,
+            sandbox_namespace,
+            :pipeline_rejected
+          )
       end
     catch
       :exit, {:noproc, _} ->
-        execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
+        maybe_execute_cross_shard_sequential(
+          shard_groups,
+          index_map,
+          total,
+          sandbox_namespace,
+          :noproc
+        )
     end
   end
 
   # Fallback: dispatch to each shard's GenServer sequentially.
   # Used when the ra server is temporarily unavailable (e.g. during restart).
+  # Only allowed for explicit non-Raft instances; raft-enabled transactions must
+  # fail rather than acknowledge a local-only write.
+  defp maybe_execute_cross_shard_sequential(
+         shard_groups,
+         index_map,
+         total,
+         sandbox_namespace,
+         reason
+       ) do
+    if raft_enabled?() do
+      {:error, "ERR transaction raft unavailable: #{inspect(reason)}"}
+    else
+      execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
+    end
+  end
+
   defp execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace) do
     shard_results =
       Enum.reduce(shard_groups, %{}, fn {shard_idx, cmds_with_indices}, acc ->
@@ -258,6 +310,13 @@ defmodule Ferricstore.Transaction.Coordinator do
 
     ctx = FerricStore.Instance.get(:default)
     Router.shard_for(ctx, full_key)
+  end
+
+  defp raft_enabled? do
+    case FerricStore.Instance.get(:default) do
+      %{raft_enabled: enabled} -> enabled
+      _ -> Application.get_env(:ferricstore, :raft_enabled, true)
+    end
   end
 
   @spec extract_key([binary()]) :: binary()
