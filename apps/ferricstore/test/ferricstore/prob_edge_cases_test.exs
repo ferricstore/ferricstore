@@ -794,6 +794,18 @@ defmodule Ferricstore.ProbEdgeCasesTest do
       assert {:error, :enoent} = NIF.bloom_file_exists("/tmp/nonexistent_bloom_xyz.bloom", "x")
     end
 
+    test "bloom_file_exists rejects truncated bitset" do
+      dir = make_prob_dir("nif_bloom_truncated_exists")
+      path = Path.join(dir, "truncated.bloom")
+
+      assert {:ok, :ok} = NIF.bloom_file_create(path, 500, 5)
+      <<header::binary-size(32), _::binary>> = File.read!(path)
+      File.write!(path, header)
+
+      assert {:error, reason} = NIF.bloom_file_exists(path, "hot")
+      assert reason =~ "truncated"
+    end
+
     test "cms_file_create and query roundtrip" do
       dir = make_prob_dir("nif_cms")
       path = Path.join(dir, "test.cms")

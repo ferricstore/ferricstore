@@ -70,11 +70,29 @@ fn bloom_file_size(num_bits: u64) -> Result<u64, String> {
         .ok_or_else(|| "bloom file size overflow".into())
 }
 
+fn bloom_read_exact_at(
+    file: &File,
+    buf: &mut [u8],
+    offset: u64,
+    label: &str,
+) -> Result<(), String> {
+    let mut read = 0;
+    while read < buf.len() {
+        let n = file
+            .read_at(&mut buf[read..], offset + read as u64)
+            .map_err(|e| format!("pread {label}: {e}"))?;
+        if n == 0 {
+            return Err(format!("truncated bloom file while reading {label}"));
+        }
+        read += n;
+    }
+    Ok(())
+}
+
 /// Read the bloom file header via pread. Returns `(num_bits, num_hashes, count)`.
 fn file_read_header(file: &File) -> Result<(u64, u32, u64), String> {
     let mut header = [0u8; HEADER_SIZE];
-    file.read_at(&mut header, 0)
-        .map_err(|e| format!("pread header: {e}"))?;
+    bloom_read_exact_at(file, &mut header, 0, "header")?;
 
     let magic = u64::from_le_bytes(header[0..8].try_into().unwrap());
     if magic != MAGIC {
@@ -209,8 +227,9 @@ pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> Ni
         let file_offset = HEADER_SIZE as u64 + byte_index;
 
         let mut buf = [0u8; 1];
-        file.read_at(&mut buf, file_offset)
-            .map_err(|e| rustler::Error::Term(Box::new(format!("pread bit: {e}"))))?;
+        if let Err(e) = bloom_read_exact_at(&file, &mut buf, file_offset, "bit") {
+            return Ok((atoms::error(), e).encode(env));
+        }
 
         let mask = 1u8 << bit_offset;
         if (buf[0] & mask) == 0 {
@@ -272,8 +291,9 @@ pub fn bloom_file_madd<'a>(
             let file_offset = HEADER_SIZE as u64 + byte_index;
 
             let mut buf = [0u8; 1];
-            file.read_at(&mut buf, file_offset)
-                .map_err(|e| rustler::Error::Term(Box::new(format!("pread bit: {e}"))))?;
+            if let Err(e) = bloom_read_exact_at(&file, &mut buf, file_offset, "bit") {
+                return Ok((atoms::error(), e).encode(env));
+            }
 
             let mask = 1u8 << bit_offset;
             if (buf[0] & mask) == 0 {
@@ -335,8 +355,9 @@ pub fn bloom_file_exists<'a>(
         let file_offset = HEADER_SIZE as u64 + byte_index;
 
         let mut buf = [0u8; 1];
-        file.read_at(&mut buf, file_offset)
-            .map_err(|e| rustler::Error::Term(Box::new(format!("pread bit: {e}"))))?;
+        if let Err(e) = bloom_read_exact_at(&file, &mut buf, file_offset, "bit") {
+            return Ok((atoms::error(), e).encode(env));
+        }
 
         if (buf[0] & (1u8 << bit_offset)) == 0 {
             crate::fadvise_dontneed(&file, 0, 0);
@@ -380,8 +401,9 @@ pub fn bloom_file_mexists<'a>(
             let file_offset = HEADER_SIZE as u64 + byte_index;
 
             let mut buf = [0u8; 1];
-            file.read_at(&mut buf, file_offset)
-                .map_err(|e| rustler::Error::Term(Box::new(format!("pread bit: {e}"))))?;
+            if let Err(e) = bloom_read_exact_at(&file, &mut buf, file_offset, "bit") {
+                return Ok((atoms::error(), e).encode(env));
+            }
 
             if (buf[0] & (1u8 << bit_offset)) == 0 {
                 found = false;
@@ -469,8 +491,7 @@ pub fn bloom_file_exists_async<'a>(
                 let bit_offset = (pos % 8) as u8;
                 let file_offset = HEADER_SIZE as u64 + byte_index;
                 let mut buf = [0u8; 1];
-                file.read_at(&mut buf, file_offset)
-                    .map_err(|e| e.to_string())?;
+                bloom_read_exact_at(&file, &mut buf, file_offset, "bit")?;
                 if (buf[0] & (1u8 << bit_offset)) == 0 {
                     crate::fadvise_dontneed(&file, 0, 0);
                     return Ok(0u32);
@@ -527,8 +548,7 @@ pub fn bloom_file_mexists_async<'a>(
                     let bit_offset = (pos % 8) as u8;
                     let file_offset = HEADER_SIZE as u64 + byte_index;
                     let mut buf = [0u8; 1];
-                    file.read_at(&mut buf, file_offset)
-                        .map_err(|e| e.to_string())?;
+                    bloom_read_exact_at(&file, &mut buf, file_offset, "bit")?;
                     if (buf[0] & (1u8 << bit_offset)) == 0 {
                         found = false;
                         break;
@@ -776,6 +796,19 @@ mod tests {
         std::fs::write(&path, [0u8; 16]).unwrap();
         let file = File::open(&path).unwrap();
         assert!(file_read_header(&file).is_err());
+    }
+
+    #[test]
+    fn read_exact_at_rejects_short_bitset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short_bitset.bloom");
+        std::fs::write(&path, [0u8; 0]).unwrap();
+        let file = File::open(&path).unwrap();
+        let mut buf = [0u8; 1];
+
+        let err = bloom_read_exact_at(&file, &mut buf, 0, "bit").unwrap_err();
+
+        assert!(err.contains("truncated"));
     }
 
     #[test]
