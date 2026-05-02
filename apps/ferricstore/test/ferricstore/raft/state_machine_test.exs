@@ -1488,6 +1488,50 @@ defmodule Ferricstore.Raft.StateMachineTest do
     end
   end
 
+  describe "pending batch location application" do
+    test "does not attach an old append location to a newer pending value", %{
+      state: state,
+      ets: ets
+    } do
+      key = "stale-location-key"
+
+      :ets.insert(
+        ets,
+        {key, "new", 456, Ferricstore.Store.LFU.initial(), :pending, 0, byte_size("new")}
+      )
+
+      StateMachine.__apply_pending_locations_for_test__(
+        state,
+        7,
+        [{:put, key, "old", 123}],
+        [{:put, 42, byte_size("old")}]
+      )
+
+      assert [{^key, "new", 456, _lfu, :pending, 0, 3}] = :ets.lookup(ets, key)
+    end
+
+    test "attaches append location when the pending value still matches", %{
+      state: state,
+      ets: ets
+    } do
+      key = "matching-location-key"
+
+      :ets.insert(
+        ets,
+        {key, "new", 456, Ferricstore.Store.LFU.initial(), :pending, 0, byte_size("new")}
+      )
+
+      StateMachine.__apply_pending_locations_for_test__(
+        state,
+        7,
+        [{:put, key, "new", 456}],
+        [{:put, 42, byte_size("new")}]
+      )
+
+      assert [{^key, "new", 456, _lfu, 7, 42, 3}] = :ets.lookup(ets, key)
+    end
+  end
+
   describe "apply/3 probabilistic native failures" do
     test "create failures do not publish metadata", %{state: state, ets: ets, dir: dir} do
       state = %{state | shard_index: 0}

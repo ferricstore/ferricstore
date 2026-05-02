@@ -982,6 +982,11 @@ defmodule Ferricstore.Raft.StateMachine do
     validate_pending_locations(batch, locations)
   end
 
+  @doc false
+  def __apply_pending_locations_for_test__(state, file_id, batch, locations) do
+    apply_pending_locations(state, file_id, batch, locations)
+  end
+
   # ---------------------------------------------------------------------------
   # Private: release_cursor compaction
   # ---------------------------------------------------------------------------
@@ -2875,16 +2880,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp apply_pending_locations(state, file_id, batch, locations) do
     Enum.zip(batch, locations)
     |> Enum.each(fn
-      {{:put, key, _val, _exp}, {:put, offset, value_size}} ->
-        try do
-          :ets.update_element(state.ets, key, [
-            {5, file_id},
-            {6, offset},
-            {7, value_size}
-          ])
-        rescue
-          ArgumentError -> :ok
-        end
+      {{:put, key, val, exp}, {:put, offset, value_size}} ->
+        apply_put_pending_location(state, key, val, exp, file_id, offset, value_size)
 
       {{:delete, _key, nil}, {:delete, _offset, _record_size}} ->
         :ok
@@ -2892,6 +2889,63 @@ defmodule Ferricstore.Raft.StateMachine do
       {{:delete, _key, prob_path}, {:delete, _offset, _record_size}} ->
         maybe_delete_prob_file_path(state, prob_path)
     end)
+  end
+
+  defp apply_put_pending_location(state, key, value, expire_at_ms, file_id, offset, value_size) do
+    expected_value = value_for_ets(value, hot_cache_threshold(state))
+    expected_staged_size = byte_size(to_disk_binary(value))
+
+    replaced =
+      replace_pending_location(
+        state,
+        key,
+        expected_value,
+        expire_at_ms,
+        expected_staged_size,
+        file_id,
+        offset,
+        value_size
+      )
+
+    if replaced == 0 and expected_staged_size != 0 do
+      # Router-originated async writes stage small values with vsize=0; Ra apply
+      # must still CAS on value/expiry so stale append results cannot publish.
+      replace_pending_location(
+        state,
+        key,
+        expected_value,
+        expire_at_ms,
+        0,
+        file_id,
+        offset,
+        value_size
+      )
+    end
+
+    :ok
+  end
+
+  defp replace_pending_location(
+         state,
+         key,
+         expected_value,
+         expire_at_ms,
+         expected_staged_size,
+         file_id,
+         offset,
+         value_size
+       ) do
+    try do
+      :ets.select_replace(state.ets, [
+        {
+          {key, expected_value, expire_at_ms, :"$1", :pending, 0, expected_staged_size},
+          [],
+          [{{key, expected_value, expire_at_ms, :"$1", file_id, offset, value_size}}]
+        }
+      ])
+    rescue
+      ArgumentError -> 0
+    end
   end
 
   defp queue_pending_put(key, value, expire_at_ms) do
