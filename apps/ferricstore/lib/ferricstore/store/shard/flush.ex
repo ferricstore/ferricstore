@@ -196,10 +196,21 @@ defmodule Ferricstore.Store.Shard.Flush do
   def update_ets_locations(state, batch, locations) do
     fid = state.active_file_id
 
+    last_index_by_key =
+      batch
+      |> Enum.with_index()
+      |> Map.new(fn {{key, _value, _exp}, index} -> {key, index} end)
+
     new_file_stats =
       Enum.zip(batch, locations)
-      |> Enum.reduce(state.file_stats, fn {{key, value, exp}, {offset, _record_size}}, fs ->
-        update_single_ets_location(state, key, value, exp, fid, offset, fs)
+      |> Enum.with_index()
+      |> Enum.reduce(state.file_stats, fn {{{key, value, exp}, {offset, _record_size}}, index},
+                                          fs ->
+        if last_index_by_key[key] == index do
+          update_single_ets_location(state, key, value, exp, fid, offset, fs)
+        else
+          track_overwrite_dead_bytes(fs, key, fid, persisted_value_size(value))
+        end
       end)
 
     %{state | file_stats: new_file_stats}
@@ -231,6 +242,18 @@ defmodule Ferricstore.Store.Shard.Flush do
 
       [] ->
         fs
+
+      [{^key, _old_value, _old_exp, _lfu, old_fid, _old_off, old_vsize}]
+      when old_fid != :pending and is_integer(old_fid) and old_fid >= 0 and
+             is_integer(old_vsize) and old_vsize >= 0 ->
+        vsize = persisted_value_size(value)
+
+        :ets.insert(
+          keydir,
+          {key, expected_value, exp, Ferricstore.Store.LFU.initial(), fid, offset, vsize}
+        )
+
+        track_overwrite_dead_bytes(fs, key, old_fid, old_vsize)
 
       _ ->
         fs
