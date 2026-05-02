@@ -490,7 +490,7 @@ fn v2_scan_file_from_offset<'a>(
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_scan_tombstones<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Read;
 
     let p = std::path::Path::new(&path);
 
@@ -500,7 +500,7 @@ fn v2_scan_tombstones<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
             let mut results: Vec<Term<'a>> = Vec::new();
             let mut offset: u64 = 0;
 
-            loop {
+            'scan: loop {
                 let mut header = [0u8; log::HEADER_SIZE];
 
                 match reader.read_exact(&mut header) {
@@ -514,16 +514,16 @@ fn v2_scan_tombstones<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
                 let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
                 let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
 
+                let mut key = vec![0u8; key_size];
+                if reader.read_exact(&mut key).is_err() {
+                    break;
+                }
+
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&header[4..]);
+                hasher.update(&key);
+
                 if value_size_raw == log::TOMBSTONE {
-                    let mut key = vec![0u8; key_size];
-                    if reader.read_exact(&mut key).is_err() {
-                        break;
-                    }
-
-                    let mut hasher = crc32fast::Hasher::new();
-                    hasher.update(&header[4..]);
-                    hasher.update(&key);
-
                     if hasher.finalize() != stored_crc {
                         break;
                     }
@@ -544,11 +544,26 @@ fn v2_scan_tombstones<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
                     results.push((key_bin, offset, record_size, expire_at_ms).encode(env));
                     offset += record_size;
                 } else {
-                    let skip = u64::from(key_size as u16) + u64::from(value_size_raw);
-                    if reader.seek(SeekFrom::Current(skip as i64)).is_err() {
+                    let mut remaining = value_size_raw as usize;
+                    let mut buf = [0u8; 64 * 1024];
+
+                    while remaining > 0 {
+                        let chunk_len = remaining.min(buf.len());
+                        let chunk = &mut buf[..chunk_len];
+
+                        if reader.read_exact(chunk).is_err() {
+                            break 'scan;
+                        }
+
+                        hasher.update(chunk);
+                        remaining -= chunk_len;
+                    }
+
+                    if hasher.finalize() != stored_crc {
                         break;
                     }
-                    offset += log::HEADER_SIZE as u64 + skip;
+
+                    offset += log::HEADER_SIZE as u64 + key_size as u64 + u64::from(value_size_raw);
                 }
             }
 

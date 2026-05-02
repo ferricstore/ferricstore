@@ -193,6 +193,30 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
       assert {:ok, [{"deleted", ^delete_offset, ^delete_size, 0}]} = NIF.v2_scan_tombstones(path)
     end
+
+    test "tombstone scan stops before tombstones after a corrupt live record" do
+      dir = Path.join(System.tmp_dir!(), "tombstone_scan_corrupt_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "00000.log")
+      File.touch!(path)
+
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      assert {:ok, [{:put, put_offset, _}, {:delete, delete_offset, _}]} =
+               NIF.v2_append_ops_batch_nosync(path, [
+                 {:put, "live_before", "value", 0},
+                 {:delete, "deleted_after_corruption"}
+               ])
+
+      value_offset = put_offset + @header_size + byte_size("live_before")
+
+      {:ok, fd} = :file.open(path, [:read, :write, :binary])
+      :ok = :file.pwrite(fd, value_offset, <<0xFF>>)
+      :ok = :file.close(fd)
+
+      assert {:ok, []} = NIF.v2_scan_tombstones(path)
+      assert {:ok, nil} = NIF.v2_pread_at(path, delete_offset)
+    end
   end
 
   # ---------------------------------------------------------------------------
