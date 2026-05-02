@@ -10,6 +10,14 @@ defmodule Ferricstore.InstanceTest do
     use FerricStore, shard_count: 1, raft_enabled: false
   end
 
+  defmodule EmbeddedRaftRequested do
+    use FerricStore, shard_count: 1, raft_enabled: true
+  end
+
+  defmodule EmbeddedDefaultOptions do
+    use FerricStore, shard_count: 1
+  end
+
   # Use the :default instance (created at app boot)
   # In future: test with a custom isolated instance
 
@@ -19,7 +27,9 @@ defmodule Ferricstore.InstanceTest do
 
   describe "use FerricStore embedded instances" do
     test "start with isolated shard supervisors and data dirs" do
-      root = Path.join(System.tmp_dir!(), "ferricstore_embedded_#{System.unique_integer([:positive])}")
+      root =
+        Path.join(System.tmp_dir!(), "ferricstore_embedded_#{System.unique_integer([:positive])}")
+
       dir_a = Path.join(root, "a")
       dir_b = Path.join(root, "b")
       File.rm_rf!(root)
@@ -30,14 +40,64 @@ defmodule Ferricstore.InstanceTest do
         File.rm_rf(root)
       end)
 
-      assert {:ok, _pid_a} = EmbeddedA.start_link(data_dir: dir_a, shard_count: 1, raft_enabled: false)
-      assert {:ok, _pid_b} = EmbeddedB.start_link(data_dir: dir_b, shard_count: 1, raft_enabled: false)
+      assert {:ok, _pid_a} =
+               EmbeddedA.start_link(data_dir: dir_a, shard_count: 1, raft_enabled: false)
+
+      assert {:ok, _pid_b} =
+               EmbeddedB.start_link(data_dir: dir_b, shard_count: 1, raft_enabled: false)
 
       assert :ok = EmbeddedA.set("same-key", "from-a")
       assert :ok = EmbeddedB.set("same-key", "from-b")
 
       assert {:ok, "from-a"} = EmbeddedA.get("same-key")
       assert {:ok, "from-b"} = EmbeddedB.get("same-key")
+    end
+
+    test "custom instances fail closed when Raft is requested" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_embedded_raft_#{System.unique_integer([:positive])}"
+        )
+
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        EmbeddedRaftRequested.stop()
+        File.rm_rf(root)
+      end)
+
+      assert {:error, {:unsupported_custom_raft_instance, EmbeddedRaftRequested}} =
+               EmbeddedRaftRequested.start_link(
+                 data_dir: root,
+                 shard_count: 1,
+                 raft_enabled: true
+               )
+
+      ctx = FerricStore.Instance.get(:default)
+      key = "embedded-raft-guard:#{System.unique_integer([:positive])}"
+      assert :ok = Ferricstore.Store.Router.put(ctx, key, "default-still-runs", 0)
+      assert "default-still-runs" = Ferricstore.Store.Router.get(ctx, key)
+    end
+
+    test "custom instances default to non-Raft local mode" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_embedded_local_#{System.unique_integer([:positive])}"
+        )
+
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        EmbeddedDefaultOptions.stop()
+        File.rm_rf(root)
+      end)
+
+      assert {:ok, _pid} = EmbeddedDefaultOptions.start_link(data_dir: root, shard_count: 1)
+      assert false == EmbeddedDefaultOptions.__instance__().raft_enabled
+      assert :ok = EmbeddedDefaultOptions.set("same-key", "local")
+      assert {:ok, "local"} = EmbeddedDefaultOptions.get("same-key")
     end
   end
 
