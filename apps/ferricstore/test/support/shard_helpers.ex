@@ -640,7 +640,7 @@ defmodule Ferricstore.Test.ShardHelpers do
 
     server_started? = application_started?(:ferricstore_server)
 
-    restart_with_data_dir(tmp_dir, server_started?)
+    restart_with_data_dir(tmp_dir, server_started?, clean?: true)
 
     %{original_dir: original_dir, tmp_dir: tmp_dir, server_started?: server_started?}
   end
@@ -655,12 +655,12 @@ defmodule Ferricstore.Test.ShardHelpers do
         tmp_dir: tmp_dir,
         server_started?: server_started?
       }) do
-    restart_with_data_dir(original_dir, server_started?)
+    restart_with_data_dir(original_dir, server_started?, clean?: false)
     File.rm_rf!(tmp_dir)
     :ok
   end
 
-  defp restart_with_data_dir(data_dir, server_started?) do
+  defp restart_with_data_dir(data_dir, server_started?, opts) do
     # Keep Ra isolation coarse-grained. Force-deleting individual Ra servers
     # while the Ra system/WAL is live can leave old UID entries in WAL and make
     # the next shard restart fail with `:gap_between_snapshot_and_log_range`.
@@ -668,7 +668,12 @@ defmodule Ferricstore.Test.ShardHelpers do
     stop_app_if_started(:ferricstore)
     stop_ra_system()
 
-    File.rm_rf!(data_dir)
+    # Setup needs a clean temp dir. Teardown must restore the original data dir
+    # without deleting real state that existed before the isolated test.
+    if Keyword.fetch!(opts, :clean?) do
+      File.rm_rf!(data_dir)
+    end
+
     Application.put_env(:ferricstore, :data_dir, data_dir)
 
     {:ok, _} = Application.ensure_all_started(:ferricstore)
