@@ -83,6 +83,14 @@ fn validate_path<'a>(env: Env<'a>, path: &str) -> Result<(), Term<'a>> {
     Ok(())
 }
 
+fn remove_dir_all_idempotent(path: &Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Synchronous metadata NIFs (Normal scheduler)
 // ---------------------------------------------------------------------------
@@ -262,10 +270,7 @@ fn fs_rm_rf_async(
     async_io::runtime().spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             let p = Path::new(&path);
-            if !p.exists() {
-                return Ok(());
-            }
-            std::fs::remove_dir_all(p)
+            remove_dir_all_idempotent(p)
         })
         .await
         .unwrap_or_else(|e| Err(io::Error::other(format!("spawn_blocking failed: {e}"))));
@@ -443,6 +448,19 @@ mod tests {
                 | io::ErrorKind::InvalidInput
                 | io::ErrorKind::NotADirectory
         ));
+    }
+
+    #[test]
+    fn rm_rf_treats_concurrent_not_found_as_success() {
+        let dir = TempDir::new().unwrap();
+        let vanished = dir.path().join("already-gone");
+
+        let result = remove_dir_all_idempotent(&vanished);
+
+        assert!(
+            result.is_ok(),
+            "rm_rf must stay idempotent if another process removes the path first"
+        );
     }
 
     #[test]
