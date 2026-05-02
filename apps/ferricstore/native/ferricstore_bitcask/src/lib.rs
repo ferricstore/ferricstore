@@ -1009,6 +1009,70 @@ fn v2_pread_at_async(
 ///
 /// This is the async counterpart of `v2_pread_batch/2` and is used by the
 /// MGET / GET_BATCH cold path.
+fn group_pread_locations(
+    locations: Vec<(String, u64)>,
+) -> (usize, Vec<(String, Vec<(usize, u64)>)>) {
+    let count = locations.len();
+    let mut grouped: std::collections::HashMap<String, Vec<(usize, u64)>> =
+        std::collections::HashMap::new();
+
+    for (index, (path, offset)) in locations.into_iter().enumerate() {
+        grouped.entry(path).or_default().push((index, offset));
+    }
+
+    (count, grouped.into_iter().collect())
+}
+
+fn pread_batch_for_path(path: String, reads: Vec<(usize, u64)>) -> Vec<(usize, Option<Vec<u8>>)> {
+    let file = match std::fs::File::open(std::path::Path::new(&path)) {
+        Ok(file) => file,
+        Err(_) => return reads.into_iter().map(|(index, _)| (index, None)).collect(),
+    };
+
+    fadvise_random(&file);
+
+    reads
+        .into_iter()
+        .map(|(index, offset)| {
+            let value = match log::pread_record_from_file(&file, offset) {
+                Ok(Some(record)) => {
+                    let size = (log::HEADER_SIZE
+                        + record.key.len()
+                        + record.value.as_ref().map_or(0, Vec::len))
+                        as i64;
+                    fadvise_dontneed(&file, offset as i64, size);
+                    record.value
+                }
+                _ => None,
+            };
+
+            (index, value)
+        })
+        .collect()
+}
+
+fn apply_grouped_pread_results(
+    values: &mut [Option<Vec<u8>>],
+    results: Vec<(usize, Option<Vec<u8>>)>,
+) {
+    for (index, value) in results {
+        if let Some(slot) = values.get_mut(index) {
+            *slot = value;
+        }
+    }
+}
+
+fn pread_batch_grouped(locations: Vec<(String, u64)>) -> Vec<Option<Vec<u8>>> {
+    let (count, groups) = group_pread_locations(locations);
+    let mut values = vec![None; count];
+
+    for (path, reads) in groups {
+        apply_grouped_pread_results(&mut values, pread_batch_for_path(path, reads));
+    }
+
+    values
+}
+
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_batch_async(
@@ -1018,37 +1082,19 @@ fn v2_pread_batch_async(
     locations: Vec<(String, u64)>,
 ) -> NifResult<Term<'_>> {
     async_io::runtime().spawn(async move {
-        // Spawn each pread as a blocking task for concurrency.
-        let mut handles = Vec::with_capacity(locations.len());
-        for (path, offset) in locations {
+        let (count, groups) = group_pread_locations(locations);
+        let mut handles = Vec::with_capacity(groups.len());
+
+        for (path, reads) in groups {
             handles.push(tokio::task::spawn_blocking(move || {
-                let p = std::path::Path::new(&path);
-                match std::fs::File::open(p) {
-                    Ok(file) => {
-                        fadvise_random(&file);
-                        match log::pread_record_from_file(&file, offset) {
-                            Ok(Some(record)) => {
-                                let size = (log::HEADER_SIZE
-                                    + record.key.len()
-                                    + record.value.as_ref().map_or(0, Vec::len))
-                                    as i64;
-                                fadvise_dontneed(&file, offset as i64, size);
-                                record.value
-                            }
-                            _ => None,
-                        }
-                    }
-                    Err(_) => None,
-                }
+                pread_batch_for_path(path, reads)
             }));
         }
 
-        // Collect all results in order.
-        let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(handles.len());
+        let mut values: Vec<Option<Vec<u8>>> = vec![None; count];
         for handle in handles {
-            match handle.await {
-                Ok(val) => values.push(val),
-                Err(_) => values.push(None),
+            if let Ok(results) = handle.await {
+                apply_grouped_pread_results(&mut values, results);
             }
         }
 
@@ -1469,6 +1515,34 @@ mod audit_fix_tests {
             assert_eq!(&record.key, key);
             assert_eq!(record.value.as_ref().unwrap(), value);
         }
+    }
+
+    #[test]
+    fn grouped_batch_pread_preserves_input_order_across_paths_and_missing_offsets() {
+        let dir = tmp();
+        let path_a = dir.path().join("00000000000000000001.log");
+        let path_b = dir.path().join("00000000000000000002.log");
+
+        let mut writer_a = log::LogWriter::open(&path_a, 1).unwrap();
+        let a0 = writer_a.write(b"a0", b"va0", 0).unwrap();
+        let a1 = writer_a.write(b"a1", b"va1", 0).unwrap();
+        writer_a.sync().unwrap();
+
+        let mut writer_b = log::LogWriter::open(&path_b, 2).unwrap();
+        let b0 = writer_b.write(b"b0", b"vb0", 0).unwrap();
+        writer_b.sync().unwrap();
+
+        let values = pread_batch_grouped(vec![
+            (path_b.to_string_lossy().into_owned(), b0),
+            (path_a.to_string_lossy().into_owned(), a1),
+            (path_a.to_string_lossy().into_owned(), 999_999),
+            (path_a.to_string_lossy().into_owned(), a0),
+        ]);
+
+        assert_eq!(values[0].as_deref(), Some(&b"vb0"[..]));
+        assert_eq!(values[1].as_deref(), Some(&b"va1"[..]));
+        assert_eq!(values[2], None);
+        assert_eq!(values[3].as_deref(), Some(&b"va0"[..]));
     }
 
     // ------------------------------------------------------------------
