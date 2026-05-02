@@ -323,8 +323,8 @@ defmodule Ferricstore.Store.PromotionTest do
       idx = Router.shard_for(ctx, key)
       keydir = elem(ctx.keydir_refs, idx)
 
-      # Force the promoted-read disk fallback. The fallback must still honor
-      # the field TTL stored in the dedicated Bitcask record.
+      # Force the promoted-read ETS-miss path. Promoted reads should trust ETS
+      # and avoid scanning the dedicated file on request path.
       :ets.delete(keydir, compound_key)
 
       assert nil == Hash.handle("HGET", [key, field], store)

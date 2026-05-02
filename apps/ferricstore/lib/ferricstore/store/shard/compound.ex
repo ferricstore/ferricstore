@@ -537,8 +537,13 @@ defmodule Ferricstore.Store.Shard.Compound do
     now = HLC.now_ms()
 
     case :ets.lookup(keydir, compound_key) do
-      [{^compound_key, _value, exp, _lfu, fid, offset, _vsize}]
-      when (exp == 0 or exp > now) and is_integer(fid) and is_integer(offset) and offset >= 0 ->
+      [{^compound_key, value, exp, _lfu, _fid, _offset, _vsize}]
+      when value != nil and (exp == 0 or exp > now) ->
+        {:ok, value, exp}
+
+      [{^compound_key, nil, exp, _lfu, fid, offset, vsize}]
+      when (exp == 0 or exp > now) and is_integer(fid) and fid >= 0 and is_integer(offset) and
+             offset >= 0 and is_integer(vsize) and vsize >= 0 ->
         file_path = dedicated_file_path(dedicated_path, fid)
 
         case read_cold_async(file_path, offset) do
@@ -551,36 +556,7 @@ defmodule Ferricstore.Store.Shard.Compound do
         {:ok, nil}
 
       _ ->
-        active = Promotion.find_active(dedicated_path)
-
-        case NIF.v2_scan_file(active) do
-          {:ok, records} ->
-            last_entry =
-              records
-              |> Enum.filter(fn {k, _off, _vsize, _exp, _is_tomb} -> k == compound_key end)
-              |> List.last()
-
-            case last_entry do
-              nil ->
-                {:ok, nil}
-
-              {_key, _offset, _vsize, _exp, true} ->
-                {:ok, nil}
-
-              {_key, offset, _vsize, exp, false} ->
-                if exp == 0 or exp > now do
-                  case read_cold_async(active, offset) do
-                    {:ok, value} -> {:ok, value, exp}
-                    other -> other
-                  end
-                else
-                  {:ok, nil}
-                end
-            end
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        {:ok, nil}
     end
   end
 
