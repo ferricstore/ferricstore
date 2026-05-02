@@ -19,6 +19,13 @@ const TOPK_MAGIC: u64 = 0x544F_504B_4D4D_5031; // "TOPKMMP1"
 const TOPK_HEADER_SIZE: usize = 64;
 const HEAP_ENTRY_SIZE: usize = 264; // 8 (count) + 4 (len) + 252 (element)
 const MAX_ELEMENT_LEN: usize = 252;
+const MAX_TOPK_K: usize = 100_000;
+const MAX_TOPK_CMS_COUNTERS: usize = 1_048_576;
+
+struct TopKLayout {
+    heap_offset: usize,
+    file_size: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Hash function
@@ -52,8 +59,42 @@ mod atoms {
 // Heap offset helper (replaces MmapTopK::heap_offset)
 // ---------------------------------------------------------------------------
 
+fn topk_layout(k: usize, width: usize, depth: usize) -> Result<TopKLayout, String> {
+    let cms_entries = width
+        .checked_mul(depth)
+        .ok_or_else(|| "TopK CMS counter count overflow".to_string())?;
+    if cms_entries > MAX_TOPK_CMS_COUNTERS {
+        return Err(format!(
+            "TopK CMS counter count exceeds {MAX_TOPK_CMS_COUNTERS}"
+        ));
+    }
+    if k > MAX_TOPK_K {
+        return Err(format!("k must be <= {MAX_TOPK_K}"));
+    }
+    let cms_bytes = cms_entries
+        .checked_mul(8)
+        .ok_or_else(|| "TopK CMS byte size overflow".to_string())?;
+    let heap_offset = TOPK_HEADER_SIZE
+        .checked_add(cms_bytes)
+        .ok_or_else(|| "TopK heap offset overflow".to_string())?;
+    let heap_bytes = k
+        .checked_mul(HEAP_ENTRY_SIZE)
+        .ok_or_else(|| "TopK heap byte size overflow".to_string())?;
+    let file_size = heap_offset
+        .checked_add(heap_bytes)
+        .ok_or_else(|| "TopK file size overflow".to_string())?;
+
+    Ok(TopKLayout {
+        heap_offset,
+        file_size: u64::try_from(file_size)
+            .map_err(|_| "TopK file size exceeds u64".to_string())?,
+    })
+}
+
 fn heap_offset(width: usize, depth: usize) -> usize {
-    TOPK_HEADER_SIZE + (width * depth * 8)
+    topk_layout(0, width, depth)
+        .map(|layout| layout.heap_offset)
+        .unwrap_or(usize::MAX)
 }
 
 // ===========================================================================
@@ -102,6 +143,24 @@ fn v2_read_header(file: &File) -> Result<(usize, usize, usize, f64, usize), Stri
     let depth = u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as usize;
     let decay = f64::from_le_bytes(hdr[20..28].try_into().unwrap());
     let heap_len = u32::from_le_bytes(hdr[28..32].try_into().unwrap()) as usize;
+
+    if k == 0 {
+        return Err("k must be > 0".into());
+    }
+    if width == 0 {
+        return Err("width must be > 0".into());
+    }
+    if depth == 0 {
+        return Err("depth must be > 0".into());
+    }
+    if !(0.0..=1.0).contains(&decay) {
+        return Err("decay must be between 0 and 1".into());
+    }
+    if heap_len > k {
+        return Err("heap_len must be <= k".into());
+    }
+
+    let _ = topk_layout(k, width, depth)?;
 
     Ok((k, width, depth, decay, heap_len))
 }
@@ -315,6 +374,10 @@ pub fn topk_file_create_v2(
     if !(0.0..=1.0).contains(&decay) {
         return Ok((atoms::error(), "decay must be between 0 and 1").encode(env));
     }
+    let layout = match topk_layout(k as usize, width as usize, depth as usize) {
+        Ok(layout) => layout,
+        Err(e) => return Ok((atoms::error(), e).encode(env)),
+    };
 
     let p = Path::new(&path);
     if let Some(parent) = p.parent() {
@@ -322,9 +385,6 @@ pub fn topk_file_create_v2(
             return Ok((atoms::error(), format!("mkdir: {e}")).encode(env));
         }
     }
-
-    let file_size =
-        TOPK_HEADER_SIZE + (width as usize * depth as usize * 8) + (k as usize * HEAP_ENTRY_SIZE);
 
     let mut file = match File::create(p) {
         Ok(f) => f,
@@ -343,9 +403,8 @@ pub fn topk_file_create_v2(
         return Ok((atoms::error(), format!("write header: {e}")).encode(env));
     }
 
-    let zeros = vec![0u8; file_size - TOPK_HEADER_SIZE];
-    if let Err(e) = file.write_all(&zeros) {
-        return Ok((atoms::error(), format!("write body: {e}")).encode(env));
+    if let Err(e) = file.set_len(layout.file_size) {
+        return Ok((atoms::error(), format!("set file size: {e}")).encode(env));
     }
     if let Err(e) = file.sync_data() {
         return Ok((atoms::error(), format!("fdatasync: {e}")).encode(env));
@@ -985,6 +1044,32 @@ mod tests {
         let result = v2_read_header(&file);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("magic"));
+    }
+
+    #[test]
+    fn invalid_header_dimensions_return_error() {
+        for (name, k, width, depth, decay) in [
+            ("zero_k.topk", 0u32, 8u32, 3u32, 0.9f64),
+            ("zero_width.topk", 5u32, 0u32, 3u32, 0.9f64),
+            ("zero_depth.topk", 5u32, 8u32, 0u32, 0.9f64),
+            ("oversized_cms.topk", 5u32, u32::MAX, u32::MAX, 0.9f64),
+            ("invalid_decay.topk", 5u32, 8u32, 3u32, f64::NAN),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            let mut data = [0u8; TOPK_HEADER_SIZE];
+            data[0..8].copy_from_slice(&TOPK_MAGIC.to_le_bytes());
+            data[8..12].copy_from_slice(&k.to_le_bytes());
+            data[12..16].copy_from_slice(&width.to_le_bytes());
+            data[16..20].copy_from_slice(&depth.to_le_bytes());
+            data[20..28].copy_from_slice(&decay.to_le_bytes());
+            std::fs::write(&path, data).unwrap();
+            let file = File::open(&path).unwrap();
+
+            let result = v2_read_header(&file);
+
+            assert!(result.is_err(), "{name} should be rejected");
+        }
     }
 
     #[test]

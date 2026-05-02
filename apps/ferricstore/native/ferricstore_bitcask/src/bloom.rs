@@ -34,6 +34,7 @@ const YIELD_CHECK_INTERVAL: usize = 64;
 
 const MAGIC: u64 = 0x424C_4F4F_4D46_5F31; // "BLOOMF_1"
 const HEADER_SIZE: usize = 32;
+const MAX_NUM_HASHES: u32 = 1024;
 
 // ---------------------------------------------------------------------------
 // NIF atoms
@@ -62,6 +63,13 @@ fn file_hash_positions(element: &[u8], num_bits: u64, num_hashes: u32) -> Vec<u6
         .collect()
 }
 
+fn bloom_file_size(num_bits: u64) -> Result<u64, String> {
+    let byte_count = num_bits.div_ceil(8);
+    (HEADER_SIZE as u64)
+        .checked_add(byte_count)
+        .ok_or_else(|| "bloom file size overflow".into())
+}
+
 /// Read the bloom file header via pread. Returns `(num_bits, num_hashes, count)`.
 fn file_read_header(file: &File) -> Result<(u64, u32, u64), String> {
     let mut header = [0u8; HEADER_SIZE];
@@ -76,6 +84,16 @@ fn file_read_header(file: &File) -> Result<(u64, u32, u64), String> {
     let num_bits = u64::from_le_bytes(header[8..16].try_into().unwrap());
     let num_hashes = u32::from_le_bytes(header[16..20].try_into().unwrap());
     let count = u64::from_le_bytes(header[24..32].try_into().unwrap());
+
+    if num_bits == 0 {
+        return Err("num_bits must be > 0".into());
+    }
+    if num_hashes == 0 {
+        return Err("num_hashes must be > 0".into());
+    }
+    if num_hashes > MAX_NUM_HASHES {
+        return Err(format!("num_hashes must be <= {MAX_NUM_HASHES}"));
+    }
 
     Ok((num_bits, num_hashes, count))
 }
@@ -117,6 +135,17 @@ pub fn bloom_file_create(
     if num_hashes == 0 {
         return Ok((atoms::error(), "num_hashes must be > 0").encode(env));
     }
+    if num_hashes > MAX_NUM_HASHES {
+        return Ok((
+            atoms::error(),
+            format!("num_hashes must be <= {MAX_NUM_HASHES}"),
+        )
+            .encode(env));
+    }
+    let file_size = match bloom_file_size(num_bits) {
+        Ok(size) => size,
+        Err(e) => return Ok((atoms::error(), e).encode(env)),
+    };
 
     let p = Path::new(&path);
 
@@ -126,8 +155,6 @@ pub fn bloom_file_create(
             return Ok((atoms::error(), format!("mkdir: {e}")).encode(env));
         }
     }
-
-    let byte_count = num_bits.div_ceil(8) as usize;
 
     // Write the file with header + zeroed bit array.
     let mut file = match File::create(p) {
@@ -146,9 +173,8 @@ pub fn bloom_file_create(
         return Ok((atoms::error(), format!("write header: {e}")).encode(env));
     }
 
-    let zeros = vec![0u8; byte_count];
-    if let Err(e) = file.write_all(&zeros) {
-        return Ok((atoms::error(), format!("write bits: {e}")).encode(env));
+    if let Err(e) = file.set_len(file_size) {
+        return Ok((atoms::error(), format!("set file size: {e}")).encode(env));
     }
 
     if let Err(e) = file.sync_data() {
@@ -764,6 +790,40 @@ mod tests {
         let result = file_read_header(&file);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("magic"));
+    }
+
+    #[test]
+    fn header_with_zero_num_bits_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_bits.bloom");
+        let mut data = [0u8; HEADER_SIZE];
+        data[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+        data[8..16].copy_from_slice(&0u64.to_le_bytes());
+        data[16..20].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, data).unwrap();
+        let file = File::open(&path).unwrap();
+
+        let result = file_read_header(&file);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("num_bits"));
+    }
+
+    #[test]
+    fn header_with_zero_num_hashes_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_hashes.bloom");
+        let mut data = [0u8; HEADER_SIZE + 1];
+        data[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+        data[8..16].copy_from_slice(&8u64.to_le_bytes());
+        data[16..20].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, data).unwrap();
+        let file = File::open(&path).unwrap();
+
+        let result = file_read_header(&file);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("num_hashes"));
     }
 
     #[test]

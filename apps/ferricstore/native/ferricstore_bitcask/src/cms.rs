@@ -32,6 +32,8 @@ const YIELD_CHECK_INTERVAL: usize = 64;
 const MMAP_MAGIC: u64 = 0x434D_535F_4649_4C31; // "CMS_FIL1"
 /// Header size for mmap files (magic + width + depth + count = 4 * 8 = 32).
 const MMAP_HEADER_SIZE: usize = 32;
+const MAX_CMS_DEPTH: u64 = 1024;
+const MAX_CMS_COUNTERS: u64 = 16_777_216;
 
 mod atoms {
     rustler::atoms! {
@@ -87,6 +89,26 @@ fn hash_indices_standalone(element: &[u8], width: u64, depth: u64) -> Vec<u64> {
 // File helpers
 // ---------------------------------------------------------------------------
 
+fn cms_counter_bytes(width: u64, depth: u64) -> Result<u64, String> {
+    let counters = width
+        .checked_mul(depth)
+        .ok_or_else(|| "CMS counter region size overflow".to_string())?;
+    if counters > MAX_CMS_COUNTERS {
+        return Err(format!(
+            "CMS counter region exceeds {MAX_CMS_COUNTERS} counters"
+        ));
+    }
+    counters
+        .checked_mul(8)
+        .ok_or_else(|| "CMS counter region size overflow".into())
+}
+
+fn cms_file_size(width: u64, depth: u64) -> Result<u64, String> {
+    (MMAP_HEADER_SIZE as u64)
+        .checked_add(cms_counter_bytes(width, depth)?)
+        .ok_or_else(|| "CMS file size overflow".into())
+}
+
 /// Read the CMS file header (width, depth, count) via pread.
 /// Returns `(width, depth, count)` or an error string.
 fn cms_file_read_header(file: &File) -> Result<(u64, u64, u64), String> {
@@ -106,6 +128,10 @@ fn cms_file_read_header(file: &File) -> Result<(u64, u64, u64), String> {
     if width == 0 || depth == 0 {
         return Err("width and depth must be > 0".into());
     }
+    if depth > MAX_CMS_DEPTH {
+        return Err(format!("depth must be <= {MAX_CMS_DEPTH}"));
+    }
+    let _ = cms_counter_bytes(width, depth)?;
 
     Ok((width, depth, count))
 }
@@ -150,6 +176,13 @@ pub fn cms_file_create(env: Env, path: String, width: u64, depth: u64) -> NifRes
     if depth == 0 {
         return Ok((atoms::error(), "depth must be > 0").encode(env));
     }
+    if depth > MAX_CMS_DEPTH {
+        return Ok((atoms::error(), format!("depth must be <= {MAX_CMS_DEPTH}")).encode(env));
+    }
+    let file_size = match cms_file_size(width, depth) {
+        Ok(size) => size,
+        Err(e) => return Ok((atoms::error(), e).encode(env)),
+    };
 
     let p = Path::new(&path);
 
@@ -159,8 +192,6 @@ pub fn cms_file_create(env: Env, path: String, width: u64, depth: u64) -> NifRes
             return Ok((atoms::error(), format!("mkdir: {e}")).encode(env));
         }
     }
-
-    let counter_bytes = (width as usize) * (depth as usize) * 8;
 
     let mut file = match File::create(p) {
         Ok(f) => f,
@@ -177,9 +208,8 @@ pub fn cms_file_create(env: Env, path: String, width: u64, depth: u64) -> NifRes
         return Ok((atoms::error(), format!("write header: {e}")).encode(env));
     }
 
-    let zeros = vec![0u8; counter_bytes];
-    if let Err(e) = file.write_all(&zeros) {
-        return Ok((atoms::error(), format!("write counters: {e}")).encode(env));
+    if let Err(e) = file.set_len(file_size) {
+        return Ok((atoms::error(), format!("set file size: {e}")).encode(env));
     }
 
     if let Err(e) = file.sync_data() {
@@ -736,6 +766,23 @@ mod tests {
         let result = cms_file_read_header(&file);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("width and depth must be > 0"));
+    }
+
+    #[test]
+    fn header_with_oversized_counter_region_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.cms");
+        let mut header = [0u8; MMAP_HEADER_SIZE];
+        header[0..8].copy_from_slice(&MMAP_MAGIC.to_le_bytes());
+        header[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        header[16..24].copy_from_slice(&2u64.to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+        let file = File::open(&path).unwrap();
+
+        let result = cms_file_read_header(&file);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("counter"));
     }
 
     #[test]

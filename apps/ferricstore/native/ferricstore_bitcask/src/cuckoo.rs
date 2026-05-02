@@ -57,6 +57,9 @@ mod atoms {
 const FILE_DEFAULT_FINGERPRINT_SIZE: usize = 1;
 /// Default max kicks for stateless file operations.
 const FILE_DEFAULT_MAX_KICKS: u16 = 500;
+/// Fingerprint bytes plus the alternate-bucket hash must fit in xxh3_128 output.
+const MAX_FINGERPRINT_SIZE: u8 = 8;
+const MAX_CUCKOO_BUCKET_BYTES: u64 = 1 << 30;
 
 /// Header offsets for cuckoo file format.
 const OFF_MAGIC: u64 = 0;
@@ -71,6 +74,37 @@ struct CuckooFileHeader {
     max_kicks: u16,
     num_items: u64,
     num_deletes: u64,
+}
+
+fn cuckoo_bucket_bytes(
+    num_buckets: u32,
+    bucket_size: u8,
+    fingerprint_size: u8,
+) -> Result<u64, String> {
+    let bytes = u64::from(num_buckets)
+        .checked_mul(u64::from(bucket_size))
+        .and_then(|slots| slots.checked_mul(u64::from(fingerprint_size)))
+        .ok_or_else(|| "cuckoo bucket region size overflow".to_string())?;
+    if bytes > MAX_CUCKOO_BUCKET_BYTES {
+        return Err(format!(
+            "cuckoo bucket region exceeds {MAX_CUCKOO_BUCKET_BYTES} bytes"
+        ));
+    }
+    Ok(bytes)
+}
+
+fn cuckoo_file_size(
+    num_buckets: u32,
+    bucket_size: u8,
+    fingerprint_size: u8,
+) -> Result<u64, String> {
+    (HEADER_SIZE as u64)
+        .checked_add(cuckoo_bucket_bytes(
+            num_buckets,
+            bucket_size,
+            fingerprint_size,
+        )?)
+        .ok_or_else(|| "cuckoo file size overflow".into())
 }
 
 /// Read and validate the 27-byte header from a file.
@@ -96,6 +130,23 @@ fn cuckoo_read_header(file: &File) -> Result<CuckooFileHeader, String> {
     let num_deletes = u64::from_le_bytes([
         hdr[19], hdr[20], hdr[21], hdr[22], hdr[23], hdr[24], hdr[25], hdr[26],
     ]);
+
+    if num_buckets == 0 {
+        return Err("num_buckets must be > 0".into());
+    }
+    if bucket_size == 0 {
+        return Err("bucket_size must be > 0".into());
+    }
+    if fingerprint_size == 0 || fingerprint_size > MAX_FINGERPRINT_SIZE {
+        return Err(format!(
+            "fingerprint_size must be between 1 and {MAX_FINGERPRINT_SIZE}"
+        ));
+    }
+    if max_kicks == 0 {
+        return Err("max_kicks must be > 0".into());
+    }
+
+    let _ = cuckoo_bucket_bytes(num_buckets, bucket_size, fingerprint_size)?;
 
     Ok(CuckooFileHeader {
         num_buckets,
@@ -333,8 +384,10 @@ pub fn cuckoo_file_create(
 
     let fingerprint_size = FILE_DEFAULT_FINGERPRINT_SIZE as u8;
     let max_kicks = FILE_DEFAULT_MAX_KICKS;
-    let bucket_bytes = (capacity as usize) * (bucket_size as usize) * (fingerprint_size as usize);
-    let file_size = HEADER_SIZE + bucket_bytes;
+    let file_size = match cuckoo_file_size(capacity, bucket_size, fingerprint_size) {
+        Ok(size) => size,
+        Err(e) => return Ok((atoms::error(), e).encode(env)),
+    };
 
     // Ensure parent directory exists.
     let p = Path::new(&path);
@@ -358,12 +411,10 @@ pub fn cuckoo_file_create(
     // num_items = 0 at bytes 11..19 (already zero)
     // num_deletes = 0 at bytes 19..27 (already zero)
 
-    let mut buf = Vec::with_capacity(file_size);
-    buf.extend_from_slice(&header);
-    buf.resize(file_size, 0);
-
-    file.write_all(&buf)
-        .map_err(|e| rustler::Error::Term(Box::new(format!("write: {e}"))))?;
+    file.write_all(&header)
+        .map_err(|e| rustler::Error::Term(Box::new(format!("write header: {e}"))))?;
+    file.set_len(file_size)
+        .map_err(|e| rustler::Error::Term(Box::new(format!("set file size: {e}"))))?;
     file.sync_data()
         .map_err(|e| rustler::Error::Term(Box::new(format!("fdatasync: {e}"))))?;
 
@@ -1265,6 +1316,32 @@ mod tests {
                 "expected version error, got: {msg}"
             ),
             Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn invalid_dimensions_return_error() {
+        for (name, num_buckets, bucket_size, fingerprint_size) in [
+            ("zero_buckets.cuckoo", 0u32, 1u8, 1u8),
+            ("zero_bucket_size.cuckoo", 1u32, 0u8, 1u8),
+            ("zero_fingerprint.cuckoo", 1u32, 1u8, 0u8),
+            ("oversized_fingerprint.cuckoo", 1u32, 1u8, 9u8),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            let mut data = [0u8; HEADER_SIZE + 64];
+            data[0..2].copy_from_slice(&MAGIC);
+            data[2] = VERSION;
+            data[3..7].copy_from_slice(&num_buckets.to_le_bytes());
+            data[7] = bucket_size;
+            data[8] = fingerprint_size;
+            data[9..11].copy_from_slice(&FILE_DEFAULT_MAX_KICKS.to_le_bytes());
+            std::fs::write(&path, data).unwrap();
+            let file = File::open(&path).unwrap();
+
+            let result = cuckoo_read_header(&file);
+
+            assert!(result.is_err(), "{name} should be rejected");
         }
     }
 
