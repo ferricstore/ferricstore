@@ -936,6 +936,20 @@ defmodule Ferricstore.ProbEdgeCasesTest do
       assert length(list_result) == 3
     end
 
+    test "topk_file_incrby_v2 rejects counter overflow without mutating" do
+      dir = make_prob_dir("nif_topk_overflow")
+      path = Path.join(dir, "overflow.topk")
+      max_i64 = 9_223_372_036_854_775_807
+
+      assert {:ok, :ok} = NIF.topk_file_create_v2(path, 5, 8, 7, 0.9)
+      assert [nil] = NIF.topk_file_incrby_v2(path, [{"hot", max_i64}])
+      assert [^max_i64] = NIF.topk_file_count_v2(path, ["hot"])
+
+      assert {:error, reason} = NIF.topk_file_incrby_v2(path, [{"hot", 1}])
+      assert reason =~ "overflow"
+      assert [^max_i64] = NIF.topk_file_count_v2(path, ["hot"])
+    end
+
     test "topk_file_list_v2 on empty topk returns empty list" do
       dir = make_prob_dir("nif_topk_empty")
       path = Path.join(dir, "empty.topk")

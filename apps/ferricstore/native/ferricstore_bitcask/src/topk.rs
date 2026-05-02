@@ -268,18 +268,28 @@ fn v2_cms_increment(
     depth: usize,
     element: &[u8],
     count: i64,
-) -> i64 {
+) -> Result<i64, String> {
     let h1 = fnv1a(element, 0x811c_9dc5);
     let h2 = fnv1a(element, 0x050c_5d1f);
     let mut min_count = i64::MAX;
+    let mut updates = Vec::with_capacity(depth);
+
     for i in 0..depth {
         let h = h1.wrapping_add((i as u64).wrapping_mul(h2));
         let col = (h % width as u64) as usize;
         let idx = i * width + col;
-        counters[idx] += count;
-        min_count = min_count.min(counters[idx]);
+        let next = counters[idx]
+            .checked_add(count)
+            .ok_or_else(|| format!("TopK CMS counter overflow: {} + {}", counters[idx], count))?;
+        updates.push((idx, next));
+        min_count = min_count.min(next);
     }
-    min_count
+
+    for (idx, next) in updates {
+        counters[idx] = next;
+    }
+
+    Ok(min_count)
 }
 
 /// Helper: CMS estimate (read-only) using in-memory counters array.
@@ -452,7 +462,10 @@ pub fn topk_file_add_v2<'a>(
     for elem_bin in &elements {
         let elem_bytes = elem_bin.as_slice();
         let elem_str = String::from_utf8_lossy(elem_bytes);
-        let estimated = v2_cms_increment(&mut counters, width, depth, elem_bytes, 1);
+        let estimated = match v2_cms_increment(&mut counters, width, depth, elem_bytes, 1) {
+            Ok(estimated) => estimated,
+            Err(e) => return Ok((atoms::error(), e).encode(env)),
+        };
         match v2_heap_add(
             &mut heap_entries,
             &mut fingerprints,
@@ -537,7 +550,10 @@ pub fn topk_file_incrby_v2<'a>(
     for (elem_bin, count) in &pairs {
         let elem_bytes = elem_bin.as_slice();
         let elem_str = String::from_utf8_lossy(elem_bytes);
-        let estimated = v2_cms_increment(&mut counters, width, depth, elem_bytes, *count);
+        let estimated = match v2_cms_increment(&mut counters, width, depth, elem_bytes, *count) {
+            Ok(estimated) => estimated,
+            Err(e) => return Ok((atoms::error(), e).encode(env)),
+        };
         match v2_heap_add(
             &mut heap_entries,
             &mut fingerprints,
@@ -1092,11 +1108,11 @@ mod tests {
         let mut counters = vec![0i64; width * depth];
 
         // Increment "apple" by 5
-        let est = v2_cms_increment(&mut counters, width, depth, b"apple", 5);
+        let est = v2_cms_increment(&mut counters, width, depth, b"apple", 5).unwrap();
         assert_eq!(est, 5);
 
         // Increment "apple" by 3 more
-        let est2 = v2_cms_increment(&mut counters, width, depth, b"apple", 3);
+        let est2 = v2_cms_increment(&mut counters, width, depth, b"apple", 3).unwrap();
         assert_eq!(est2, 8);
 
         // Estimate should match
@@ -1106,6 +1122,19 @@ mod tests {
         // Unseen element should be 0
         let est4 = v2_cms_estimate(&counters, width, depth, b"banana");
         assert_eq!(est4, 0);
+    }
+
+    #[test]
+    fn cms_increment_rejects_overflow_without_mutating() {
+        let width = 1;
+        let depth = 3;
+        let mut counters = vec![i64::MAX; width * depth];
+        let before = counters.clone();
+
+        let err = v2_cms_increment(&mut counters, width, depth, b"apple", 1).unwrap_err();
+
+        assert!(err.contains("overflow"));
+        assert_eq!(counters, before);
     }
 
     #[test]
@@ -1227,7 +1256,7 @@ mod tests {
         let (_, width, depth, _, _) = v2_read_header(&file).unwrap();
 
         let mut counters = vec![0i64; width * depth];
-        v2_cms_increment(&mut counters, width, depth, b"test", 42);
+        v2_cms_increment(&mut counters, width, depth, b"test", 42).unwrap();
 
         v2_write_cms(&file, &counters).unwrap();
 
@@ -1285,7 +1314,8 @@ mod tests {
 
         let mut results = Vec::new();
         for &elem in elements {
-            let estimated = v2_cms_increment(&mut counters, width, depth, elem.as_bytes(), 1);
+            let estimated =
+                v2_cms_increment(&mut counters, width, depth, elem.as_bytes(), 1).unwrap();
             let evicted = v2_heap_add(&mut heap_entries, &mut fingerprints, k, elem, estimated);
             results.push(evicted);
         }
@@ -1304,7 +1334,8 @@ mod tests {
         let mut fingerprints: HashSet<String> =
             heap_entries.iter().map(|e| e.element.clone()).collect();
 
-        let estimated = v2_cms_increment(&mut counters, width, depth, element.as_bytes(), count);
+        let estimated =
+            v2_cms_increment(&mut counters, width, depth, element.as_bytes(), count).unwrap();
         let evicted = v2_heap_add(&mut heap_entries, &mut fingerprints, k, element, estimated);
 
         v2_write_cms(&file, &counters).unwrap();
