@@ -101,6 +101,24 @@ defmodule Ferricstore.ProbAsyncEdgeCasesTest do
     Path.join(dir, "#{safe}.#{ext}")
   end
 
+  describe "cuckoo file write edge cases" do
+    test "failed full insert does not mutate existing filter bytes" do
+      dir = make_prob_dir("cuckoo_full")
+      path = prob_file_path(dir, "full_filter", "cuckoo")
+
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      assert {:ok, :ok} = NIF.cuckoo_file_create(path, 1, 2)
+      assert {:ok, 1} = NIF.cuckoo_file_add(path, "seed_1")
+      assert {:ok, 1} = NIF.cuckoo_file_add(path, "seed_2")
+
+      before = File.read!(path)
+
+      assert {:error, "filter is full"} = NIF.cuckoo_file_add(path, "probe")
+      assert File.read!(path) == before
+    end
+  end
+
   # ===========================================================================
   # 1. Memory leak detection
   # ===========================================================================

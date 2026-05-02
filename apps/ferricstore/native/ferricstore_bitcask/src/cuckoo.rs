@@ -14,6 +14,7 @@
 //!
 //! Total header size: 27 bytes.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
@@ -197,6 +198,82 @@ fn cuckoo_file_write_num_deletes(file: &File, num_deletes: u64) -> Result<(), St
     file.write_at(&num_deletes.to_le_bytes(), OFF_NUM_DELETES)
         .map_err(|e| format!("write num_deletes: {e}"))?;
     Ok(())
+}
+
+fn cuckoo_file_read_slot_staged(
+    file: &File,
+    staged: &HashMap<(usize, usize), Vec<u8>>,
+    bucket_idx: usize,
+    slot_idx: usize,
+    bucket_size: u8,
+    fingerprint_size: u8,
+) -> Result<Vec<u8>, String> {
+    staged.get(&(bucket_idx, slot_idx)).cloned().map_or_else(
+        || cuckoo_file_read_slot(file, bucket_idx, slot_idx, bucket_size, fingerprint_size),
+        Ok,
+    )
+}
+
+fn cuckoo_file_try_eviction(
+    file: &File,
+    hdr: &CuckooFileHeader,
+    fp: Vec<u8>,
+    start_bucket: usize,
+) -> Result<bool, String> {
+    let mut staged: HashMap<(usize, usize), Vec<u8>> = HashMap::new();
+    let mut cur_fp = fp;
+    let mut cur_bucket = start_bucket;
+
+    for kicks in 0..(hdr.max_kicks as u32) {
+        let slot_idx = (kicks as usize) % (hdr.bucket_size as usize);
+
+        let evicted = cuckoo_file_read_slot_staged(
+            file,
+            &staged,
+            cur_bucket,
+            slot_idx,
+            hdr.bucket_size,
+            hdr.fingerprint_size,
+        )?;
+
+        staged.insert((cur_bucket, slot_idx), cur_fp);
+
+        let alt = cuckoo_file_alternate_bucket(cur_bucket, &evicted, hdr.num_buckets);
+
+        for slot in 0..hdr.bucket_size {
+            let slot_idx = slot as usize;
+            let s = cuckoo_file_read_slot_staged(
+                file,
+                &staged,
+                alt,
+                slot_idx,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            )?;
+
+            if s.iter().all(|&b| b == 0) {
+                staged.insert((alt, slot_idx), evicted);
+
+                for ((bucket, slot), value) in staged {
+                    cuckoo_file_write_slot(
+                        file,
+                        bucket,
+                        slot,
+                        hdr.bucket_size,
+                        hdr.fingerprint_size,
+                        &value,
+                    )?;
+                }
+
+                return Ok(true);
+            }
+        }
+
+        cur_fp = evicted;
+        cur_bucket = alt;
+    }
+
+    Ok(false)
 }
 
 /// Error type for file open operations distinguishing not-found from other errors.
@@ -390,81 +467,19 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
         }
     }
 
-    // Both full: cuckoo eviction.
-    let mut cur_fp = fp;
-    let mut cur_bucket = b1;
-    for kicks in 0..(hdr.max_kicks as u32) {
-        let slot_idx = (kicks as usize) % (hdr.bucket_size as usize);
-
-        // Read evicted fingerprint.
-        let evicted = match cuckoo_file_read_slot(
-            &file,
-            cur_bucket,
-            slot_idx,
-            hdr.bucket_size,
-            hdr.fingerprint_size,
-        ) {
-            Ok(s) => s,
-            Err(e) => return Ok((atoms::error(), e).encode(env)),
-        };
-
-        // Place our fingerprint in that slot.
-        if let Err(e) = cuckoo_file_write_slot(
-            &file,
-            cur_bucket,
-            slot_idx,
-            hdr.bucket_size,
-            hdr.fingerprint_size,
-            &cur_fp,
-        ) {
-            return Ok((atoms::error(), e).encode(env));
-        }
-
-        // Find alternate bucket for evicted fingerprint.
-        let alt = cuckoo_file_alternate_bucket(cur_bucket, &evicted, hdr.num_buckets);
-
-        // Try to place evicted fingerprint in its alternate bucket.
-        for slot in 0..hdr.bucket_size {
-            let s = match cuckoo_file_read_slot(
-                &file,
-                alt,
-                slot as usize,
-                hdr.bucket_size,
-                hdr.fingerprint_size,
-            ) {
-                Ok(s) => s,
-                Err(e) => return Ok((atoms::error(), e).encode(env)),
-            };
-            if s.iter().all(|&b| b == 0) {
-                if let Err(e) = cuckoo_file_write_slot(
-                    &file,
-                    alt,
-                    slot as usize,
-                    hdr.bucket_size,
-                    hdr.fingerprint_size,
-                    &evicted,
-                ) {
-                    return Ok((atoms::error(), e).encode(env));
-                }
-                if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
-                    return Ok((atoms::error(), e).encode(env));
-                }
-                // Post-eviction placement must be fsynced like the
-                // direct-insert paths above — otherwise a kernel panic
-                // between the slot write and writeback leaves
-                // num_items++ on disk with the fingerprint bytes only
-                // in page cache.
-                if let Err(e) = crate::prob_fsync(&file) {
-                    return Ok((atoms::error(), e).encode(env));
-                }
-                crate::fadvise_dontneed(&file, 0, 0);
-                return Ok((atoms::ok(), 1u64).encode(env));
+    match cuckoo_file_try_eviction(&file, &hdr, fp, b1) {
+        Ok(true) => {
+            if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
+                return Ok((atoms::error(), e).encode(env));
             }
+            if let Err(e) = crate::prob_fsync(&file) {
+                return Ok((atoms::error(), e).encode(env));
+            }
+            crate::fadvise_dontneed(&file, 0, 0);
+            return Ok((atoms::ok(), 1u64).encode(env));
         }
-
-        // Continue kicking from the alternate bucket.
-        cur_fp = evicted;
-        cur_bucket = alt;
+        Ok(false) => {}
+        Err(e) => return Ok((atoms::error(), e).encode(env)),
     }
 
     crate::fadvise_dontneed(&file, 0, 0);
@@ -592,73 +607,19 @@ pub fn cuckoo_file_addnx<'a>(
         }
     }
 
-    // Both full: cuckoo eviction.
-    let mut cur_fp = fp;
-    let mut cur_bucket = b1;
-    for kicks in 0..(hdr.max_kicks as u32) {
-        let slot_idx = (kicks as usize) % (hdr.bucket_size as usize);
-
-        let evicted = match cuckoo_file_read_slot(
-            &file,
-            cur_bucket,
-            slot_idx,
-            hdr.bucket_size,
-            hdr.fingerprint_size,
-        ) {
-            Ok(s) => s,
-            Err(e) => return Ok((atoms::error(), e).encode(env)),
-        };
-
-        if let Err(e) = cuckoo_file_write_slot(
-            &file,
-            cur_bucket,
-            slot_idx,
-            hdr.bucket_size,
-            hdr.fingerprint_size,
-            &cur_fp,
-        ) {
-            return Ok((atoms::error(), e).encode(env));
-        }
-
-        let alt = cuckoo_file_alternate_bucket(cur_bucket, &evicted, hdr.num_buckets);
-
-        for slot in 0..hdr.bucket_size {
-            let s = match cuckoo_file_read_slot(
-                &file,
-                alt,
-                slot as usize,
-                hdr.bucket_size,
-                hdr.fingerprint_size,
-            ) {
-                Ok(s) => s,
-                Err(e) => return Ok((atoms::error(), e).encode(env)),
-            };
-            if s.iter().all(|&b| b == 0) {
-                if let Err(e) = cuckoo_file_write_slot(
-                    &file,
-                    alt,
-                    slot as usize,
-                    hdr.bucket_size,
-                    hdr.fingerprint_size,
-                    &evicted,
-                ) {
-                    return Ok((atoms::error(), e).encode(env));
-                }
-                if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
-                    return Ok((atoms::error(), e).encode(env));
-                }
-                // Post-eviction placement must be fsynced — see the
-                // matching comment in `cuckoo_file_add`.
-                if let Err(e) = crate::prob_fsync(&file) {
-                    return Ok((atoms::error(), e).encode(env));
-                }
-                crate::fadvise_dontneed(&file, 0, 0);
-                return Ok((atoms::ok(), 1u64).encode(env));
+    match cuckoo_file_try_eviction(&file, &hdr, fp, b1) {
+        Ok(true) => {
+            if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
+                return Ok((atoms::error(), e).encode(env));
             }
+            if let Err(e) = crate::prob_fsync(&file) {
+                return Ok((atoms::error(), e).encode(env));
+            }
+            crate::fadvise_dontneed(&file, 0, 0);
+            return Ok((atoms::ok(), 1u64).encode(env));
         }
-
-        cur_fp = evicted;
-        cur_bucket = alt;
+        Ok(false) => {}
+        Err(e) => return Ok((atoms::error(), e).encode(env)),
     }
 
     crate::fadvise_dontneed(&file, 0, 0);
