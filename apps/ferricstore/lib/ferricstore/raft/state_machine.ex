@@ -1451,6 +1451,12 @@ defmodule Ferricstore.Raft.StateMachine do
       compound_get_meta: fn redis_key, compound_key ->
         cross_shard_compound_read_meta(ctx, redis_key, compound_key)
       end,
+      compound_batch_get: fn redis_key, compound_keys ->
+        cross_shard_compound_batch_read(ctx, redis_key, compound_keys)
+      end,
+      compound_batch_get_meta: fn redis_key, compound_keys ->
+        cross_shard_compound_batch_read_meta(ctx, redis_key, compound_keys)
+      end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         case promoted_compound_path(ctx, redis_key, compound_key) do
           nil -> local_put.(compound_key, value, expire_at_ms)
@@ -1768,6 +1774,104 @@ defmodule Ferricstore.Raft.StateMachine do
       meta ->
         meta
     end
+  end
+
+  defp cross_shard_compound_batch_read(ctx, redis_key, compound_keys) do
+    ctx
+    |> cross_shard_compound_batch_read_meta(redis_key, compound_keys)
+    |> Enum.map(fn
+      {value, _exp} -> value
+      nil -> nil
+    end)
+  end
+
+  defp cross_shard_compound_batch_read_meta(_ctx, _redis_key, []), do: []
+
+  defp cross_shard_compound_batch_read_meta(ctx, redis_key, compound_keys) do
+    data_path =
+      case promoted_compound_path(ctx, redis_key, hd(compound_keys)) do
+        nil -> ctx.shard_data_path
+        dedicated_path -> dedicated_path
+      end
+
+    cross_shard_ets_batch_read_meta_from_path(ctx, compound_keys, data_path)
+  end
+
+  defp cross_shard_ets_batch_read_meta_from_path(ctx, keys, data_path) do
+    now = apply_now_ms()
+
+    {warm_results, cold_reads} =
+      keys
+      |> Enum.with_index()
+      |> Enum.reduce({%{}, []}, fn {key, index}, {results, cold} ->
+        case sm_tx_pending_meta(key) do
+          {value, exp} ->
+            {Map.put(results, index, {value, exp}), cold}
+
+          nil ->
+            cross_shard_collect_batch_ets(ctx, key, index, data_path, now, results, cold)
+        end
+      end)
+
+    results = cross_shard_read_cold_meta_batch(warm_results, Enum.reverse(cold_reads))
+
+    keys
+    |> Enum.with_index()
+    |> Enum.map(fn {_key, index} -> Map.get(results, index) end)
+  end
+
+  defp cross_shard_collect_batch_ets(ctx, key, index, data_path, now, results, cold) do
+    case :ets.lookup(ctx.keydir, key) do
+      [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
+        {Map.put(results, index, {value, 0}), cold}
+
+      [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+        path = sm_file_path_from_path(data_path, fid)
+        {results, [{index, path, off, 0} | cold]}
+
+      [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+        {Map.put(results, index, {value, exp}), cold}
+
+      [{^key, nil, exp, _lfu, fid, off, vsize}]
+      when exp > now and valid_cold_location(fid, off, vsize) ->
+        path = sm_file_path_from_path(data_path, fid)
+        {results, [{index, path, off, exp} | cold]}
+
+      [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
+        cross_shard_delete_keydir_entry(ctx, key, nil)
+        {results, cold}
+
+      _ ->
+        {results, cold}
+    end
+  rescue
+    ArgumentError ->
+      {results, cold}
+  end
+
+  defp cross_shard_read_cold_meta_batch(results, []), do: results
+
+  defp cross_shard_read_cold_meta_batch(results, cold_reads) do
+    locations = Enum.map(cold_reads, fn {_index, path, off, _exp} -> {path, off} end)
+
+    values =
+      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_read_timeout_ms) do
+        {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
+          values
+
+        _ ->
+          List.duplicate(nil, length(cold_reads))
+      end
+
+    cold_reads
+    |> Enum.zip(values)
+    |> Enum.reduce(results, fn
+      {{index, _path, _off, exp}, value}, acc when value != nil ->
+        Map.put(acc, index, {value, exp})
+
+      {_read, _value}, acc ->
+        acc
+    end)
   end
 
   defp cross_shard_compound_scan(ctx, redis_key, prefix) do
@@ -3604,6 +3708,12 @@ defmodule Ferricstore.Raft.StateMachine do
           {v, exp} -> {v, exp}
         end
       end,
+      compound_batch_get: fn rk, compound_keys ->
+        sm_store_compound_batch_get(state, rk, compound_keys)
+      end,
+      compound_batch_get_meta: fn rk, compound_keys ->
+        sm_store_compound_batch_get_meta(state, rk, compound_keys)
+      end,
       compound_put: fn _rk, ck, value, expire_at_ms ->
         do_put(state, ck, value, expire_at_ms)
         :ok
@@ -3666,6 +3776,54 @@ defmodule Ferricstore.Raft.StateMachine do
         :ok
       end
     }
+  end
+
+  defp sm_store_compound_batch_get(state, redis_key, compound_keys) do
+    state
+    |> sm_store_compound_batch_get_meta(redis_key, compound_keys)
+    |> Enum.map(fn
+      {value, _exp} -> value
+      nil -> nil
+    end)
+  end
+
+  defp sm_store_compound_batch_get_meta(state, redis_key, compound_keys) do
+    {local_results, remote_keys} =
+      compound_keys
+      |> Enum.with_index()
+      |> Enum.reduce({%{}, []}, fn {compound_key, index}, {results, remote} ->
+        case do_get_meta(state, compound_key) do
+          nil -> {results, [{index, compound_key} | remote]}
+          {value, exp} -> {Map.put(results, index, {value, exp}), remote}
+        end
+      end)
+
+    results =
+      case {Enum.reverse(remote_keys), instance_ctx_for_state(state)} do
+        {[], _ctx} ->
+          local_results
+
+        {_remote, nil} ->
+          local_results
+
+        {remote, ctx} ->
+          remote_compound_keys = Enum.map(remote, fn {_index, compound_key} -> compound_key end)
+          remote_values = Router.compound_batch_get_meta(ctx, redis_key, remote_compound_keys)
+
+          remote
+          |> Enum.zip(remote_values)
+          |> Enum.reduce(local_results, fn
+            {{index, _compound_key}, {value, exp}}, acc ->
+              Map.put(acc, index, {value, exp})
+
+            {_remote_entry, _missing}, acc ->
+              acc
+          end)
+      end
+
+    compound_keys
+    |> Enum.with_index()
+    |> Enum.map(fn {_compound_key, index} -> Map.get(results, index) end)
   end
 
   defp instance_ctx_for_state(%{instance_ctx: %FerricStore.Instance{} = ctx}), do: ctx
