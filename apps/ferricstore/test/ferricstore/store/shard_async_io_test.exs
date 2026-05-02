@@ -763,6 +763,25 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert_receive {:tokio_complete, ^corr_id, :ok, []}, 5000
     end
 
+    test "oversized key returns error and does not append a corrupt record" do
+      dir = Path.join(System.tmp_dir!(), "async_oversized_key_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "00000.log")
+      File.touch!(path)
+
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      caller = self()
+      corr_id = 100
+      oversized_key = :binary.copy("k", 65_536)
+
+      :ok = NIF.v2_append_batch_async(caller, corr_id, path, [{oversized_key, "v", 0}])
+
+      assert_receive {:tokio_complete, ^corr_id, :error, reason}, 5000
+      assert reason =~ "key too large"
+      assert File.stat!(path).size == 0
+    end
+
     test "multiple concurrent async batches with different correlation IDs" do
       dir = Path.join(System.tmp_dir!(), "async_concurrent_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(dir)

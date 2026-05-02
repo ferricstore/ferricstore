@@ -1285,6 +1285,13 @@ fn v2_append_batch_async<'a>(
     // We must copy BEAM binaries into owned Vecs before spawning to Tokio
     // because Binary<'a> borrows from the NIF env which is destroyed when
     // this function returns.
+    for (key, value, _) in &records {
+        if let Err(reason) = log::validate_kv_sizes(key.as_slice(), value.as_slice()) {
+            send_tokio_error(env, &caller_pid, correlation_id, reason.as_str());
+            return Ok(atoms::ok().encode(env));
+        }
+    }
+
     let entries: Vec<(Vec<u8>, Vec<u8>, u64)> = records
         .iter()
         .map(|(k, v, exp)| (k.as_slice().to_vec(), v.as_slice().to_vec(), *exp))
@@ -1362,6 +1369,18 @@ fn v2_append_batch_async<'a>(
     });
 
     Ok(atoms::ok().encode(env))
+}
+
+fn send_tokio_error(env: Env<'_>, caller_pid: &LocalPid, correlation_id: u64, reason: &str) {
+    let msg = (
+        atoms::tokio_complete(),
+        correlation_id,
+        atoms::error(),
+        reason,
+    )
+        .encode(env);
+
+    let _ = env.send(caller_pid, msg);
 }
 
 // ===========================================================================
