@@ -363,7 +363,7 @@ defmodule Ferricstore.Application do
     for i <- 0..(shard_count - 1) do
       try do
         shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
-        active_file_path = :persistent_term.get({:ferricstore_active_file_path, i}, nil)
+        active_file_path = shutdown_active_file_path(i)
 
         if active_file_path && Ferricstore.FS.exists?(active_file_path) do
           Ferricstore.Bitcask.NIF.v2_fsync(active_file_path)
@@ -387,6 +387,16 @@ defmodule Ferricstore.Application do
     end
 
     Logger.info("Shutdown: Bitcask files fsynced")
+  end
+
+  defp shutdown_active_file_path(shard_index) do
+    case Ferricstore.Store.ActiveFile.get(shard_index) do
+      {_file_id, active_file_path, _shard_data_path} -> active_file_path
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
   end
 
   defp shutdown_flush_shards(shard_count) do
