@@ -49,6 +49,7 @@ defmodule Ferricstore.Store.Promotion do
   require Logger
 
   @promotion_marker_prefix "PM:"
+  @cold_read_timeout_ms 10_000
 
   @spec threshold() :: non_neg_integer()
   def threshold do
@@ -254,7 +255,7 @@ defmodule Ferricstore.Store.Promotion do
                 "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
               )
 
-            case NIF.v2_pread_at(file_path, offset) do
+            case read_cold_async(file_path, offset) do
               {:ok, v} when is_binary(v) -> v
               _ -> nil
             end
@@ -323,7 +324,7 @@ defmodule Ferricstore.Store.Promotion do
 
           {key, {:live, fid, file_path, offset, value_size, expire_at_ms}} ->
             value =
-              case NIF.v2_pread_at(file_path, offset) do
+              case read_cold_async(file_path, offset) do
                 {:ok, v} when v != nil -> v
                 _ -> nil
               end
@@ -436,13 +437,30 @@ defmodule Ferricstore.Store.Promotion do
     file_path =
       Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
 
-    case NIF.v2_pread_at(file_path, off) do
+    case read_cold_async(file_path, off) do
       {:ok, value} when value != nil -> value
       _ -> nil
     end
   end
 
   defp promotion_entry_value(_shard_data_path, _value, _fid, _off), do: nil
+
+  defp read_cold_async(path, offset) do
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    case NIF.v2_pread_at_async(self(), corr_id, path, offset) do
+      :ok ->
+        receive do
+          {:tokio_complete, ^corr_id, :ok, value} -> {:ok, value}
+          {:tokio_complete, ^corr_id, :error, reason} -> {:error, reason}
+        after
+          @cold_read_timeout_ms -> {:error, :timeout}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
 
   @spec type_label(atom()) :: binary()
   defp type_label(:hash), do: "hash"
