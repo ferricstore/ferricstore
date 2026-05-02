@@ -19,7 +19,7 @@ defmodule Ferricstore.FS do
   shape compatible with `File.rm_rf!/1`.
   """
 
-  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Bitcask.{Async, NIF}
 
   @type err_kind ::
           :not_found
@@ -65,24 +65,33 @@ defmodule Ferricstore.FS do
   @spec touch!(binary()) :: :ok
   def touch!(path) do
     case NIF.fs_touch(path) do
-      :ok -> :ok
-      {:error, reason} -> raise File.Error, reason: fmt_reason(reason), action: "touch", path: path
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        raise File.Error, reason: fmt_reason(reason), action: "touch", path: path
     end
   end
 
   @spec mkdir_p!(binary()) :: :ok
   def mkdir_p!(path) do
     case NIF.fs_mkdir_p(path) do
-      :ok -> :ok
-      {:error, reason} -> raise File.Error, reason: fmt_reason(reason), action: "mkdir_p", path: path
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        raise File.Error, reason: fmt_reason(reason), action: "mkdir_p", path: path
     end
   end
 
   @spec rename!(binary(), binary()) :: :ok
   def rename!(old_path, new_path) do
     case NIF.fs_rename(old_path, new_path) do
-      :ok -> :ok
-      {:error, reason} -> raise File.Error, reason: fmt_reason(reason), action: "rename", path: old_path
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        raise File.Error, reason: fmt_reason(reason), action: "rename", path: old_path
     end
   end
 
@@ -116,26 +125,24 @@ defmodule Ferricstore.FS do
   """
   @spec rm_rf(binary()) :: :ok | fs_error()
   def rm_rf(path) do
-    corr = :erlang.unique_integer([:positive])
-    case NIF.fs_rm_rf_async(self(), corr, path) do
-      :ok ->
-        receive do
-          {:tokio_complete, ^corr, :ok} -> :ok
-          {:tokio_complete, ^corr, :error, reason} -> {:error, reason}
-        after
-          @rm_rf_timeout_ms -> {:error, {:other, "rm_rf timed out"}}
-        end
-
-      {:error, _} = err ->
-        err
+    case Async.await(
+           fn proxy, corr -> NIF.fs_rm_rf_async(proxy, corr, path) end,
+           @rm_rf_timeout_ms
+         ) do
+      {:ok, :ok} -> :ok
+      {:error, :timeout} -> {:error, {:other, "rm_rf timed out"}}
+      {:error, _reason} = err -> err
     end
   end
 
   @spec rm_rf!(binary()) :: :ok
   def rm_rf!(path) do
     case rm_rf(path) do
-      :ok -> :ok
-      {:error, reason} -> raise File.Error, reason: fmt_reason(reason), action: "rm_rf", path: path
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        raise File.Error, reason: fmt_reason(reason), action: "rm_rf", path: path
     end
   end
 

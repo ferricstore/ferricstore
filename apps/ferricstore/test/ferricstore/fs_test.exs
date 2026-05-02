@@ -83,4 +83,38 @@ defmodule Ferricstore.FSTest do
       assert FS.dir?(f) == false
     end
   end
+
+  test "rm_rf does not wait on async NIF replies in caller mailbox" do
+    path = Path.expand("../../lib/ferricstore/fs.ex", __DIR__)
+
+    ast =
+      path
+      |> File.read!()
+      |> Code.string_to_quoted!(columns: true)
+
+    {_ast, violations} =
+      Macro.prewalk(ast, [], fn
+        {{:., meta, [mod, fun]}, _call_meta, [first_arg | _]} = node, acc
+        when is_atom(fun) ->
+          if async_nif_module?(mod) and String.ends_with?(Atom.to_string(fun), "_async") and
+               self_call?(first_arg) do
+            line = Keyword.get(meta, :line, 1)
+            {node, ["#{path}:#{line}: #{fun}/#{length(elem(node, 2))}" | acc]}
+          else
+            {node, acc}
+          end
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    assert Enum.reverse(violations) == []
+  end
+
+  defp async_nif_module?({:__aliases__, _, [:NIF]}), do: true
+  defp async_nif_module?({:__aliases__, _, [:Ferricstore, :Bitcask, :NIF]}), do: true
+  defp async_nif_module?(_), do: false
+
+  defp self_call?({:self, _, []}), do: true
+  defp self_call?(_), do: false
 end
