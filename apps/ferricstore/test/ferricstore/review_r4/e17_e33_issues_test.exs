@@ -27,39 +27,30 @@ defmodule Ferricstore.ReviewR4.E17E33IssuesTest do
   defp ustream, do: "review_r4_stream_#{:erlang.unique_integer([:positive])}"
 
   # =========================================================================
-  # E17: Stream parse_id_spec crashes on non-numeric IDs
-  # CONFIRMED BUG — String.to_integer/1 raises ArgumentError
+  # E17: Stream parse_id_spec rejects non-numeric IDs without crashing
+  # Regression guard — malformed explicit IDs return {:error, _}.
   # =========================================================================
 
-  describe "E17: parse_id_spec crashes on non-numeric IDs" do
-    test "XADD with malformed ID 'abc-def' raises instead of returning error" do
+  describe "E17: parse_id_spec rejects non-numeric IDs" do
+    test "XADD with malformed ID 'abc-def' returns an error" do
       store = MockStore.make()
       key = ustream()
 
-      # String.to_integer("abc") raises ArgumentError.
-      # A well-behaved handler should return {:error, _} instead.
-      assert_raise ArgumentError, fn ->
-        Stream.handle("XADD", [key, "abc-def", "field", "value"], store)
-      end
+      assert {:error, _} = Stream.handle("XADD", [key, "abc-def", "field", "value"], store)
     end
 
-    test "XADD with partial malformed ID 'abc' raises instead of returning error" do
+    test "XADD with partial malformed ID 'abc' returns an error" do
       store = MockStore.make()
       key = ustream()
 
-      assert_raise ArgumentError, fn ->
-        Stream.handle("XADD", [key, "abc", "field", "value"], store)
-      end
+      assert {:error, _} = Stream.handle("XADD", [key, "abc", "field", "value"], store)
     end
 
-    test "XADD with mixed malformed ID '123-abc' raises instead of returning error" do
+    test "XADD with mixed malformed ID '123-abc' returns an error" do
       store = MockStore.make()
       key = ustream()
 
-      # ms part is valid, seq part is not
-      assert_raise ArgumentError, fn ->
-        Stream.handle("XADD", [key, "123-abc", "field", "value"], store)
-      end
+      assert {:error, _} = Stream.handle("XADD", [key, "123-abc", "field", "value"], store)
     end
 
     test "XADD with valid explicit ID works fine" do
@@ -90,12 +81,13 @@ defmodule Ferricstore.ReviewR4.E17E33IssuesTest do
   describe "E19: SCAN cursor format" do
     test "SCAN uses key-based cursor (last key seen), not integer index" do
       # Build a store with several keys that sort alphabetically.
-      store = MockStore.make(%{
-        "aaa" => {"1", 0},
-        "bbb" => {"2", 0},
-        "ccc" => {"3", 0},
-        "ddd" => {"4", 0}
-      })
+      store =
+        MockStore.make(%{
+          "aaa" => {"1", 0},
+          "bbb" => {"2", 0},
+          "ccc" => {"3", 0},
+          "ddd" => {"4", 0}
+        })
 
       # First page: cursor "0" means start from beginning, count 2
       [next_cursor, batch1] = Generic.handle("SCAN", ["0", "COUNT", "2"], store)
@@ -115,21 +107,16 @@ defmodule Ferricstore.ReviewR4.E17E33IssuesTest do
   end
 
   # =========================================================================
-  # E20: OBJECT ENCODING returns "embstr" for integer values
-  # CONFIRMED BUG — Redis returns "int" for values that look like integers
+  # E20: OBJECT ENCODING returns "int" for integer values
+  # Regression guard — Redis-compatible integer encoding detection.
   # =========================================================================
 
   describe "E20: OBJECT ENCODING for integer-like string values" do
-    test "OBJECT ENCODING returns 'embstr' for '42', should be 'int'" do
+    test "OBJECT ENCODING returns 'int' for '42'" do
       store = MockStore.make(%{"mykey" => {"42", 0}})
 
       result = Generic.handle("OBJECT", ["ENCODING", "mykey"], store)
-      # BUG: returns "embstr" because it only checks byte_size <= 44,
-      # never checks if value is parseable as integer.
-      # Redis would return "int" for this.
-      assert result == "embstr"
-      # SHOULD be "int" for Redis compatibility:
-      # assert result == "int"
+      assert result == "int"
     end
 
     test "OBJECT ENCODING returns 'embstr' for short string" do
@@ -144,12 +131,12 @@ defmodule Ferricstore.ReviewR4.E17E33IssuesTest do
   end
 
   # =========================================================================
-  # E21: SETNX may overwrite compound-key data structures
-  # CONFIRMED BUG — exists? only checks the plain key, not compound type keys
+  # E21: SETNX must treat compound-key data structures as existing
+  # Regression guard — fixed by checking live type metadata before SETNX.
   # =========================================================================
 
   describe "E21: SETNX on compound-key data structures" do
-    test "SETNX overwrites a hash when only compound keys exist" do
+    test "SETNX does not overwrite a hash when only compound keys exist" do
       # Simulate a hash that only has compound keys (no plain key entry).
       # The type metadata is stored at "T:mykey\0" in the compound key space.
       # store.exists? checks only the plain "mykey" key in the store.
@@ -166,12 +153,11 @@ defmodule Ferricstore.ReviewR4.E17E33IssuesTest do
       # But store.exists? only checks the plain key, which doesn't exist.
       result = Strings.handle("SETNX", ["mykey", "overwrite!"], store)
 
-      # BUG: returns 1 (set succeeded) because exists? doesn't see compound keys
-      assert result == 1
+      assert result == 0
 
-      # After this, the hash data is orphaned and a plain string "overwrite!"
-      # is stored, silently corrupting the data structure.
-      assert store.get.("mykey") == "overwrite!"
+      refute store.get.("mykey") == "overwrite!"
+      assert store.compound_get.("mykey", type_key) == "hash"
+      assert store.compound_get.("mykey", field_key) == "value1"
     end
   end
 
@@ -219,23 +205,16 @@ defmodule Ferricstore.ReviewR4.E17E33IssuesTest do
   end
 
   # =========================================================================
-  # E24: PFADD with zero elements rejected
-  # CONFIRMED BUG — guard `when elements != []` rejects PFADD key (no elements)
+  # E24: PFADD with zero elements is accepted
+  # Regression guard — Redis accepts PFADD key with no elements.
   # =========================================================================
 
   describe "E24: PFADD with zero elements" do
-    test "PFADD with key but no elements returns wrong-number-of-args error" do
+    test "PFADD with key but no elements creates an empty HLL" do
       store = MockStore.make()
 
-      # Redis: PFADD key (no elements) creates the key if it doesn't exist
-      # and returns 1 (modified) or 0 (already exists, not modified).
-      # FerricStore: the guard `when elements != []` on line 50 causes
-      # this to fall through to the catch-all which returns an error.
       result = HyperLogLog.handle("PFADD", ["mykey"], store)
-      assert {:error, "ERR wrong number of arguments for 'pfadd' command"} == result
-
-      # In Redis, this should succeed and create an empty HLL structure.
-      # The fact that it returns an error is a divergence from Redis.
+      assert result == 1
     end
   end
 
@@ -404,23 +383,22 @@ defmodule Ferricstore.ReviewR4.E17E33IssuesTest do
   end
 
   # =========================================================================
-  # E32: COPY without REPLACE returns error instead of 0
-  # CONFIRMED BUG — Redis returns 0, FerricStore returns {:error, ...}
+  # E32: COPY without REPLACE returns 0 when destination exists
+  # Regression guard — Redis returns 0, not an error.
   # =========================================================================
 
   describe "E32: COPY without REPLACE when destination exists" do
-    test "COPY returns {:error, _} instead of 0 when dest exists and no REPLACE" do
-      store = MockStore.make(%{
-        "src" => {"v1", 0},
-        "dst" => {"v2", 0}
-      })
+    test "COPY returns 0 when dest exists and no REPLACE" do
+      store =
+        MockStore.make(%{
+          "src" => {"v1", 0},
+          "dst" => {"v2", 0}
+        })
 
       result = Generic.handle("COPY", ["src", "dst"], store)
 
-      # BUG: returns {:error, "ERR target key already exists"}
-      # Redis returns integer 0 (meaning: copy did not happen).
-      assert {:error, "ERR target key already exists"} == result
-      # SHOULD return 0 for Redis compatibility
+      assert 0 == result
+      assert store.get.("dst") == "v2"
     end
 
     test "COPY succeeds when destination does not exist" do
@@ -430,10 +408,11 @@ defmodule Ferricstore.ReviewR4.E17E33IssuesTest do
     end
 
     test "COPY with REPLACE succeeds when destination exists" do
-      store = MockStore.make(%{
-        "src" => {"v1", 0},
-        "dst" => {"v2", 0}
-      })
+      store =
+        MockStore.make(%{
+          "src" => {"v1", 0},
+          "dst" => {"v2", 0}
+        })
 
       result = Generic.handle("COPY", ["src", "dst", "REPLACE"], store)
       assert result == 1
