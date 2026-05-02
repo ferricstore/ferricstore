@@ -217,7 +217,7 @@ defmodule Ferricstore.Store.Shard do
     # replay and start from nil instead of the correct prior value.
     # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
     # Must run BEFORE recover_promoted so PM: markers are in ETS.
-    ShardLifecycle.recover_keydir(path, keydir, index)
+    ShardLifecycle.recover_keydir(path, keydir, index, ctx)
 
     # Start the Raft server for this shard (unless explicitly disabled).
     raft? =
@@ -240,7 +240,7 @@ defmodule Ferricstore.Store.Shard do
     # Migrate existing prob files: scan prob dir for files without
     # corresponding metadata markers in the keydir. Write markers so
     # DEL can clean up prob files and BF.INFO/CMS.INFO can recover metadata.
-    ShardLifecycle.migrate_prob_files(path, keydir, index)
+    ShardLifecycle.migrate_prob_files(path, keydir, index, ctx)
 
     # Publish active file metadata to ActiveFile registry
     Ferricstore.Store.ActiveFile.publish(ctx, index, active_file_id, active_file_path, path)
