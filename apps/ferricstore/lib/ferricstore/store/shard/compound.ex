@@ -16,6 +16,7 @@ defmodule Ferricstore.Store.Shard.Compound do
   @promoted_frag_threshold 0.5
   @promoted_dead_bytes_min 1_048_576
   @promoted_compaction_cooldown_ms 30_000
+  @cold_batch_read_timeout_ms 10_000
 
   # -------------------------------------------------------------------
   # Compound key handle_call handlers
@@ -32,11 +33,103 @@ defmodule Ferricstore.Store.Shard.Compound do
   @doc false
   def handle_compound_batch_get(redis_key, compound_keys, state) do
     {values, state} =
-      Enum.map_reduce(compound_keys, state, fn compound_key, state ->
-        compound_get_value(redis_key, compound_key, state)
-      end)
+      case promoted_store(state, redis_key) do
+        nil ->
+          compound_batch_get_shared(compound_keys, state)
+
+        _dedicated_path ->
+          Enum.map_reduce(compound_keys, state, fn compound_key, state ->
+            compound_get_value(redis_key, compound_key, state)
+          end)
+      end
 
     {:reply, values, state}
+  end
+
+  defp compound_batch_get_shared(compound_keys, state) do
+    {results, {state, cold_entries, _cold_count}} =
+      Enum.map_reduce(compound_keys, {state, [], 0}, fn compound_key,
+                                                        {state, cold_entries, cold_count} ->
+        case ShardETS.ets_lookup(state, compound_key) do
+          {:hit, value, _exp} ->
+            {{:value, value}, {state, cold_entries, cold_count}}
+
+          {:cold, fid, off, vsize, exp} ->
+            file_path = ShardETS.file_path(state.shard_data_path, fid)
+            entry = {state, compound_key, file_path, fid, off, vsize, exp}
+            {{:cold, cold_count}, {state, [entry | cold_entries], cold_count + 1}}
+
+          :expired ->
+            {{:value, nil}, {state, cold_entries, cold_count}}
+
+          :miss ->
+            if ShardETS.pending_cold?(state, compound_key) do
+              state = ShardFlush.flush_pending_for_read(state)
+
+              {{:value, ShardETS.warm_from_store(state, compound_key)},
+               {state, cold_entries, cold_count}}
+            else
+              {{:value, nil}, {state, cold_entries, cold_count}}
+            end
+        end
+      end)
+
+    cold_values =
+      cold_entries
+      |> Enum.reverse()
+      |> read_shared_cold_batch_async()
+      |> List.to_tuple()
+
+    values =
+      Enum.map(results, fn
+        {:value, value} -> value
+        {:cold, index} -> elem(cold_values, index)
+      end)
+
+    {values, state}
+  end
+
+  defp read_shared_cold_batch_async([]), do: []
+
+  defp read_shared_cold_batch_async(entries) do
+    locations =
+      Enum.map(entries, fn {_state, _compound_key, file_path, _fid, off, _vsize, _exp} ->
+        {file_path, off}
+      end)
+
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    values =
+      case NIF.v2_pread_batch_async(self(), corr_id, locations) do
+        :ok ->
+          receive do
+            {:tokio_complete, ^corr_id, :ok, values} when is_list(values) ->
+              if length(values) == length(entries) do
+                values
+              else
+                List.duplicate(nil, length(entries))
+              end
+
+            {:tokio_complete, ^corr_id, :error, _reason} ->
+              List.duplicate(nil, length(entries))
+          after
+            @cold_batch_read_timeout_ms ->
+              List.duplicate(nil, length(entries))
+          end
+
+        {:error, _reason} ->
+          List.duplicate(nil, length(entries))
+      end
+
+    Enum.zip(entries, values)
+    |> Enum.map(fn
+      {{state, compound_key, _file_path, fid, off, vsize, exp}, value} when value != nil ->
+        ShardETS.cold_read_warm_ets(state, compound_key, value, exp, fid, off, vsize)
+        value
+
+      {_entry, _value} ->
+        nil
+    end)
   end
 
   defp compound_get_value(redis_key, compound_key, state) do
