@@ -1,7 +1,10 @@
 defmodule Ferricstore.Store.BatchOperationsTest do
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.{CompoundKey, Router}
+  alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
 
   @ns_async "batch_test_async"
   @ns_quorum "batch_test_quorum"
@@ -190,6 +193,40 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         {file_id, file_path, shard_data_path} = original
         Ferricstore.Store.ActiveFile.publish(ctx(), 1, file_id, file_path, shard_data_path)
       end
+    end
+
+    test "large batch does not recover unaccepted value when async replication is overloaded" do
+      key = "#{@ns_async}:bap_overloaded_large_missing_#{System.unique_integer([:positive])}"
+      idx = Router.shard_for(ctx(), key)
+      large = :binary.copy("B", ctx().hot_cache_max_value_size + 1024)
+
+      on_exit(fn -> Batcher.reset_pending(idx) end)
+      fill_async_pending(idx, key)
+
+      assert {:error, "ERR async replication overloaded"} =
+               Router.batch_async_put(ctx(), [{key, large}])
+
+      assert nil == Router.get(ctx(), key)
+      assert nil == recovered_value_from_bitcask(ctx(), key)
+    end
+
+    test "large batch restores previous cold value when async replication is overloaded" do
+      key = "#{@ns_async}:bap_overloaded_large_existing_#{System.unique_integer([:positive])}"
+      idx = Router.shard_for(ctx(), key)
+      old = :binary.copy("O", ctx().hot_cache_max_value_size + 1024)
+      new = :binary.copy("N", ctx().hot_cache_max_value_size + 2048)
+
+      :ok = Router.put(ctx(), key, old, 0)
+      assert old == Router.get(ctx(), key)
+
+      on_exit(fn -> Batcher.reset_pending(idx) end)
+      fill_async_pending(idx, key)
+
+      assert {:error, "ERR async replication overloaded"} =
+               Router.batch_async_put(ctx(), [{key, new}])
+
+      assert old == Router.get(ctx(), key)
+      assert old == recovered_value_from_bitcask(ctx(), key)
     end
   end
 
@@ -597,6 +634,44 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     1..500
     |> Stream.map(fn i -> "#{prefix}:#{i}" end)
     |> Enum.find(fn key -> Router.shard_for(ctx, key) == shard_idx end)
+  end
+
+  defp fill_async_pending(idx, key) do
+    for _ <- 1..64 do
+      Batcher.__inject_async_pending__(
+        idx,
+        make_ref(),
+        [{:async, node(), {:put, key, "pending", 0}}],
+        0
+      )
+    end
+  end
+
+  defp recovered_value_from_bitcask(ctx, key) do
+    idx = Router.shard_for(ctx, key)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+    keydir = :ets.new(:batch_operations_recovery, [:set, :public])
+
+    try do
+      ShardLifecycle.recover_keydir(shard_path, keydir, idx)
+
+      case :ets.lookup(keydir, key) do
+        [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil ->
+          value
+
+        [{^key, nil, _exp, _lfu, fid, off, _vsize}] when is_integer(fid) ->
+          path =
+            Path.join(shard_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+
+          {:ok, value} = NIF.v2_pread_at(path, off)
+          value
+
+        [] ->
+          nil
+      end
+    after
+      :ets.delete(keydir)
+    end
   end
 
   defp pack_keys(keys) do

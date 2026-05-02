@@ -2011,6 +2011,8 @@ defmodule Ferricstore.Store.Router do
     held_latches = acquire_async_key_latches(ctx, locks)
 
     try do
+      large_previous = snapshot_batch_large_values(ctx, shard_batches)
+
       disk_locations =
         Enum.reduce(shard_batches, %{}, fn {idx, _keydir, _shard_kvs, _entries, _raft_cmds,
                                             large_disk_batch},
@@ -2040,8 +2042,12 @@ defmodule Ferricstore.Store.Router do
         shard_locations = Map.get(disk_locations, idx, %{})
 
         case async_submit_batch_to_raft(idx, raft_cmds) do
-          :ok -> :ok
-          {:error, reason} -> throw({:async_error, reason})
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            rollback_batch_large_puts(ctx, large_previous)
+            throw({:async_error, reason})
         end
 
         ets_tuples =
@@ -2085,6 +2091,22 @@ defmodule Ferricstore.Store.Router do
     |> Enum.with_index()
     |> Enum.filter(fn {{key, _value}, index} -> Map.fetch!(last_index_by_key, key) == index end)
     |> Enum.map(fn {kv, _index} -> kv end)
+  end
+
+  defp snapshot_batch_large_values(ctx, shard_batches) do
+    Enum.reduce(shard_batches, %{}, fn {idx, _keydir, _shard_kvs, _entries, _raft_cmds,
+                                        large_disk_batch},
+                                       acc ->
+      Enum.reduce(large_disk_batch, acc, fn {key, _value, _expire_at_ms}, snapshot_acc ->
+        Map.put(snapshot_acc, {idx, key}, snapshot_live_value(ctx, idx, key))
+      end)
+    end)
+  end
+
+  defp rollback_batch_large_puts(ctx, large_previous) do
+    Enum.each(large_previous, fn {{idx, key}, previous} ->
+      rollback_unaccepted_large_put(ctx, idx, key, previous)
+    end)
   end
 
   @doc """
