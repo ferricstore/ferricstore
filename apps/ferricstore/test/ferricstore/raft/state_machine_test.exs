@@ -1230,6 +1230,34 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert Enum.any?(records, &match?({"batch_cms", _off, _size, 0, false}, &1))
     end
 
+    test "probabilistic create failures in batch do not publish metadata", %{
+      state: state,
+      ets: ets,
+      dir: dir
+    } do
+      state = %{state | shard_index: 0}
+      prob_dir = Path.join(dir, "prob")
+      File.write!(prob_dir, "not-a-directory")
+
+      commands = [
+        {"batch_bloom_create_fail",
+         {:bloom_create, "batch_bloom_create_fail", 9586, 7,
+          {:bloom_meta, %{num_bits: 9586, num_hashes: 7, capacity: 1000, error_rate: 0.01}}}},
+        {"batch_cms_create_fail", {:cms_create, "batch_cms_create_fail", 100, 5}},
+        {"batch_cuckoo_create_fail", {:cuckoo_create, "batch_cuckoo_create_fail", 1024, 4}},
+        {"batch_topk_create_fail", {:topk_create, "batch_topk_create_fail", 10, 8, 7, 0.9}}
+      ]
+
+      {_state, {:ok, results}} =
+        StateMachine.apply(%{}, {:batch, Enum.map(commands, &elem(&1, 1))}, state)
+
+      assert Enum.all?(results, &match?({:error, _}, &1))
+
+      for {key, _cmd} <- commands do
+        assert [] == :ets.lookup(ets, key)
+      end
+    end
+
     test "mixed put and delete batch", %{state: state, ets: ets} do
       {state2, :ok} = StateMachine.apply(%{}, {:put, "mix_a", "va", 0}, state)
 
@@ -1342,6 +1370,62 @@ defmodule Ferricstore.Raft.StateMachineTest do
       ]
 
       assert :ok = StateMachine.__validate_pending_locations__(batch, locations)
+    end
+  end
+
+  describe "apply/3 probabilistic native failures" do
+    test "create failures do not publish metadata", %{state: state, ets: ets, dir: dir} do
+      state = %{state | shard_index: 0}
+      prob_dir = Path.join(dir, "prob")
+      File.write!(prob_dir, "not-a-directory")
+
+      commands = [
+        {"bloom_create_fail",
+         {:bloom_create, "bloom_create_fail", 9586, 7,
+          {:bloom_meta, %{num_bits: 9586, num_hashes: 7, capacity: 1000, error_rate: 0.01}}}},
+        {"cms_create_fail", {:cms_create, "cms_create_fail", 100, 5}},
+        {"cuckoo_create_fail", {:cuckoo_create, "cuckoo_create_fail", 1024, 4}},
+        {"topk_create_fail", {:topk_create, "topk_create_fail", 10, 8, 7, 0.9}}
+      ]
+
+      Enum.reduce(commands, state, fn {key, command}, acc_state ->
+        {next_state, result} = StateMachine.apply(%{}, command, acc_state)
+
+        assert {:error, _reason} = result
+        assert [] == :ets.lookup(ets, key)
+
+        next_state
+      end)
+    end
+
+    test "auto-create failures do not publish metadata", %{state: state, ets: ets, dir: dir} do
+      state = %{state | shard_index: 0}
+      prob_dir = Path.join(dir, "prob")
+      File.write!(prob_dir, "not-a-directory")
+
+      commands = [
+        {"bloom_add_fail",
+         {:bloom_add, "bloom_add_fail", "item",
+          %{num_bits: 9586, num_hashes: 7, capacity: 1000, error_rate: 0.01}}},
+        {"bloom_madd_fail",
+         {:bloom_madd, "bloom_madd_fail", ["item"],
+          %{num_bits: 9586, num_hashes: 7, capacity: 1000, error_rate: 0.01}}},
+        {"cms_merge_create_fail",
+         {:cms_merge, "cms_merge_create_fail", [], [], %{width: 100, depth: 5}}},
+        {"cuckoo_add_fail",
+         {:cuckoo_add, "cuckoo_add_fail", "item", %{capacity: 1024, bucket_size: 4}}},
+        {"cuckoo_addnx_fail",
+         {:cuckoo_addnx, "cuckoo_addnx_fail", "item", %{capacity: 1024, bucket_size: 4}}}
+      ]
+
+      Enum.reduce(commands, state, fn {key, command}, acc_state ->
+        {next_state, result} = StateMachine.apply(%{}, command, acc_state)
+
+        assert {:error, _reason} = result
+        assert [] == :ets.lookup(ets, key)
+
+        next_state
+      end)
     end
   end
 
