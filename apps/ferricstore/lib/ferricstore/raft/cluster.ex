@@ -116,6 +116,7 @@ defmodule Ferricstore.Raft.Cluster do
     ra_sys = Keyword.get(opts, :ra_system, @ra_system)
     membership = Keyword.get(opts, :membership, :voter)
     skip_below_index = Keyword.get(opts, :skip_below_index, 0)
+    instance_name = Keyword.get(opts, :instance_name, :default)
     server_id = shard_server_id(shard_index)
 
     machine_config = %{
@@ -125,6 +126,7 @@ defmodule Ferricstore.Raft.Cluster do
       active_file_path: active_file_path,
       ets: ets,
       data_dir: Ferricstore.DataDir.root_from_shard_path(shard_data_path),
+      instance_name: instance_name,
       skip_below_index: skip_below_index
     }
 
@@ -302,6 +304,7 @@ defmodule Ferricstore.Raft.Cluster do
       ) do
     ra_sys = Keyword.get(opts, :ra_system, @ra_system)
     membership = Keyword.get(opts, :membership, :voter)
+    instance_name = Keyword.get(opts, :instance_name, :default)
     server_id = shard_server_id(shard_index)
 
     machine_config = %{
@@ -310,7 +313,8 @@ defmodule Ferricstore.Raft.Cluster do
       active_file_id: active_file_id,
       active_file_path: active_file_path,
       ets: ets,
-      data_dir: Ferricstore.DataDir.root_from_shard_path(shard_data_path)
+      data_dir: Ferricstore.DataDir.root_from_shard_path(shard_data_path),
+      instance_name: instance_name
     }
 
     # In cluster mode, initial_members includes all configured nodes.

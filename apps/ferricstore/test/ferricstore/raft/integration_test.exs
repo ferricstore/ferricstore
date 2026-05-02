@@ -38,7 +38,12 @@ defmodule Ferricstore.Raft.IntegrationTest do
   defp keydir_for(key), do: :"keydir_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
 
   defp shard_pid_for(key) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
+    name =
+      Router.shard_name(
+        FerricStore.Instance.get(:default),
+        Router.shard_for(FerricStore.Instance.get(:default), key)
+      )
+
     Process.whereis(name)
   end
 
@@ -47,6 +52,15 @@ defmodule Ferricstore.Raft.IntegrationTest do
   # ---------------------------------------------------------------------------
 
   describe "Raft write path" do
+    test "state machine receives checkpoint-safe instance name for per-shard accounting" do
+      shard_id = Cluster.shard_server_id(0)
+
+      assert {:ok, {_, true}, _leader} =
+               :ra.local_query(shard_id, fn state ->
+                 state.instance_ctx == nil and state.instance_name == :default
+               end)
+    end
+
     test "SET through Router writes via Raft and is readable" do
       k = ukey("set_via_raft")
 
@@ -64,7 +78,12 @@ defmodule Ferricstore.Raft.IntegrationTest do
       assert [{^k, "dual_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
 
       # Flush pending writes to Bitcask before checking NIF directly
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), k))
+      shard_name =
+        Router.shard_name(
+          FerricStore.Instance.get(:default),
+          Router.shard_for(FerricStore.Instance.get(:default), k)
+        )
+
       GenServer.call(shard_name, :flush)
 
       # Flush background BitcaskWriter so deferred writes are on disk
@@ -122,7 +141,10 @@ defmodule Ferricstore.Raft.IntegrationTest do
     test "writes to different shards are independent" do
       # Generate keys that map to different shards
       keys = for i <- 1..20, do: ukey("multi_#{i}")
-      shard_indices = Enum.map(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end) |> Enum.uniq()
+
+      shard_indices =
+        Enum.map(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
+        |> Enum.uniq()
 
       # Should have keys in multiple shards
       assert length(shard_indices) >= 2
@@ -257,8 +279,10 @@ defmodule Ferricstore.Raft.IntegrationTest do
       assert new_pid != pid
 
       # Data should be recoverable from Bitcask
-      ShardHelpers.eventually(fn -> "survives_crash" == Router.get(FerricStore.Instance.get(:default), k) end,
-        "data should survive shard crash and be recovered from Bitcask")
+      ShardHelpers.eventually(
+        fn -> "survives_crash" == Router.get(FerricStore.Instance.get(:default), k) end,
+        "data should survive shard crash and be recovered from Bitcask"
+      )
     end
   end
 

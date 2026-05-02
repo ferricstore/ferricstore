@@ -137,6 +137,7 @@ defmodule Ferricstore.Raft.StateMachine do
           Ferricstore.DataDir.root_from_shard_path(config.shard_data_path)
         ),
       instance_ctx: Map.get(config, :instance_ctx),
+      instance_name: Map.get(config, :instance_name, :default),
       applied_count: 0,
       release_cursor_interval: interval,
       # When a node joins with pre-existing Bitcask data (from direct copy or
@@ -4334,14 +4335,31 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp keydir_binary_ref(%{instance_ctx: %{keydir_binary_bytes: ref}}) when ref != nil, do: ref
+  defp keydir_binary_ref(%{instance_ctx: %{keydir_binary_bytes: ref, shard_count: count}} = state)
+       when ref != nil do
+    shard_index = metrics_shard_index(state)
+    if shard_index < count, do: ref, else: nil
+  end
 
-  defp keydir_binary_ref(_) do
+  defp keydir_binary_ref(%{instance_name: name} = state) when is_atom(name) do
+    keydir_binary_ref_for_instance(name, metrics_shard_index(state))
+  end
+
+  defp keydir_binary_ref(state) do
+    keydir_binary_ref_for_instance(:default, metrics_shard_index(state))
+  end
+
+  defp metrics_shard_index(%{shard_index: shard_index}), do: shard_index
+  defp metrics_shard_index(%{index: index}), do: index
+
+  defp keydir_binary_ref_for_instance(name, shard_index) do
     try do
-      ctx = FerricStore.Instance.get(:default)
-      ctx && ctx.keydir_binary_bytes
+      %{keydir_binary_bytes: ref, shard_count: count} = FerricStore.Instance.get(name)
+      if ref != nil and shard_index < count, do: ref, else: nil
     rescue
       _ -> nil
+    catch
+      :exit, _ -> nil
     end
   end
 

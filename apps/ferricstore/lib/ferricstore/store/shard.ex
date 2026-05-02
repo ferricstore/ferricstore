@@ -222,7 +222,14 @@ defmodule Ferricstore.Store.Shard do
     # Start the Raft server for this shard (unless explicitly disabled).
     raft? =
       if Keyword.get(opts, :raft_enabled, true) do
-        ShardLifecycle.start_raft_if_available(index, path, active_file_id, active_file_path, ets)
+        ShardLifecycle.start_raft_if_available(
+          index,
+          path,
+          active_file_id,
+          active_file_path,
+          ets,
+          ctx.name
+        )
       else
         false
       end
@@ -789,7 +796,8 @@ defmodule Ferricstore.Store.Shard do
         release_cursor_interval: 20_000,
         cross_shard_locks: %{},
         cross_shard_intents: %{},
-        instance_ctx: state.instance_ctx
+        instance_ctx: state.instance_ctx,
+        instance_name: if(state.instance_ctx, do: state.instance_ctx.name, else: :default)
       }
 
       case Ferricstore.Raft.StateMachine.apply(%{}, command, sm_state) do

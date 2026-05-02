@@ -381,10 +381,18 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           binary(),
           non_neg_integer(),
           binary(),
-          :ets.tid()
+          :ets.tid(),
+          atom()
         ) :: boolean()
   @doc false
-  def start_raft_if_available(index, shard_data_path, active_file_id, active_file_path, ets) do
+  def start_raft_if_available(
+        index,
+        shard_data_path,
+        active_file_id,
+        active_file_path,
+        ets,
+        instance_name \\ :default
+      ) do
     batcher_name = Ferricstore.Raft.Batcher.batcher_name(index)
 
     if Process.whereis(batcher_name) != nil do
@@ -394,7 +402,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
                shard_data_path,
                active_file_id,
                active_file_path,
-               ets
+               ets,
+               instance_name: instance_name
              ) do
           :ok ->
             true
