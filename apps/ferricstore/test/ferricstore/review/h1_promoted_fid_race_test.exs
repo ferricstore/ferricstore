@@ -75,31 +75,66 @@ defmodule Ferricstore.Review.H1PromotedFidRaceTest do
       flush: fn -> :ok end,
       dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_scan, redis_key, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_count, redis_key, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
     }
@@ -107,7 +142,64 @@ defmodule Ferricstore.Review.H1PromotedFidRaceTest do
 
   defp ukey(base), do: "#{base}_#{:rand.uniform(9_999_999)}"
 
+  def handle_compaction_event(_event, measurements, metadata, {test_pid, key}) do
+    if metadata.redis_key == key do
+      send(test_pid, {:compaction, measurements.old_fid, measurements.new_fid})
+    end
+  end
+
   describe "promoted fid race after compaction" do
+    @tag timeout: 120_000
+    test "large promoted raft overwrites trigger compaction and keep ETS file ids valid" do
+      store = real_store()
+      key = ukey("promoted_raft_compact")
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      keydir = :"keydir_#{shard_idx}"
+      handler_id = "promoted-raft-compaction-#{key}"
+      test_pid = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :dedicated, :compaction],
+        &__MODULE__.handle_compaction_event/4,
+        {test_pid, key}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      pairs = Enum.flat_map(1..(@test_threshold + 1), fn i -> ["f_#{i}", "v_#{i}"] end)
+      assert Hash.handle("HSET", [key | pairs], store) == @test_threshold + 1
+
+      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      assert GenServer.call(shard, {:promoted?, key})
+
+      large_value = :binary.copy("x", 64 * 1024)
+      assert Hash.handle("HSET", [key, "hot", large_value], store) == 1
+
+      last_value =
+        Enum.reduce(1..24, large_value, fn i, _previous ->
+          value = large_value <> Integer.to_string(i)
+          assert Hash.handle("HSET", [key, "hot", value], store) == 0
+          value
+        end)
+
+      assert_receive {:compaction, old_fid, new_fid}, 10_000
+      assert new_fid > old_fid
+
+      data_dir = Application.fetch_env!(:ferricstore, :data_dir)
+      hash = :crypto.hash(:sha256, key) |> Base.encode16(case: :lower)
+      dedicated_path = Path.join([data_dir, "dedicated", "shard_#{shard_idx}", "hash:#{hash}"])
+      compound_key = "H:#{key}\0hot"
+
+      assert [{^compound_key, _value, _exp, _lfu, fid, offset, _vsize}] =
+               :ets.lookup(keydir, compound_key)
+
+      file_name = "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
+      assert File.exists?(Path.join(dedicated_path, file_name))
+      assert offset >= 0
+      assert Hash.handle("HGET", [key, "hot"], store) == last_value
+    end
+
     @tag timeout: 120_000
     @tag :skip
     # Flaky: compaction timing is non-deterministic and may not trigger within test window
@@ -123,12 +215,8 @@ defmodule Ferricstore.Review.H1PromotedFidRaceTest do
       :telemetry.attach(
         "fid-race-compaction-#{key}",
         [:ferricstore, :dedicated, :compaction],
-        fn _event, measurements, metadata, _config ->
-          if metadata.redis_key == key do
-            send(test_pid, {:compaction, measurements.old_fid, measurements.new_fid})
-          end
-        end,
-        nil
+        &__MODULE__.handle_compaction_event/4,
+        {test_pid, key}
       )
 
       # 1. Promote the hash by crossing the threshold.
@@ -244,12 +332,8 @@ defmodule Ferricstore.Review.H1PromotedFidRaceTest do
       :telemetry.attach(
         "multi-compact-#{key}",
         [:ferricstore, :dedicated, :compaction],
-        fn _event, measurements, metadata, _config ->
-          if metadata.redis_key == key do
-            send(test_pid, {:compaction, measurements.old_fid, measurements.new_fid})
-          end
-        end,
-        nil
+        &__MODULE__.handle_compaction_event/4,
+        {test_pid, key}
       )
 
       # Promote.
@@ -327,7 +411,9 @@ defmodule Ferricstore.Review.H1PromotedFidRaceTest do
       for j <- 0..19 do
         field = "cycle_#{target_cycles}_f_#{j}"
         val = Hash.handle("HGET", [key, field], store)
-        assert val != nil, "HGET returned nil for #{field} after #{target_cycles} compaction cycles"
+
+        assert val != nil,
+               "HGET returned nil for #{field} after #{target_cycles} compaction cycles"
       end
 
       :telemetry.detach("multi-compact-#{key}")

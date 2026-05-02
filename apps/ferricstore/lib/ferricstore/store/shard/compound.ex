@@ -321,17 +321,31 @@ defmodule Ferricstore.Store.Shard.Compound do
   # -------------------------------------------------------------------
 
   defp handle_compound_put_raft(redis_key, compound_key, value, expire_at_ms, state) do
+    tracked_state =
+      case promoted_store(state, redis_key) do
+        nil ->
+          state
+
+        _dedicated_path ->
+          track_promoted_dead_bytes(
+            state,
+            redis_key,
+            compound_key,
+            promoted_record_size(compound_key, value)
+          )
+      end
+
     result =
       Ferricstore.Raft.Batcher.write(
-        state.index,
+        tracked_state.index,
         {:compound_put, compound_key, value, expire_at_ms}
       )
 
-    new_version = state.write_version + 1
+    new_version = tracked_state.write_version + 1
 
     case result do
       :ok ->
-        new_state = %{state | write_version: new_version}
+        new_state = %{tracked_state | write_version: new_version}
 
         new_state =
           case promoted_store(new_state, redis_key) do
@@ -344,6 +358,10 @@ defmodule Ferricstore.Store.Shard.Compound do
       {:error, _} = err ->
         {:reply, err, state}
     end
+  end
+
+  defp promoted_record_size(compound_key, value) when is_binary(value) do
+    @record_header_size + byte_size(compound_key) + byte_size(value)
   end
 
   defp handle_compound_put_direct(redis_key, compound_key, value, expire_at_ms, state) do
