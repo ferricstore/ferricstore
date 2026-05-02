@@ -1807,24 +1807,13 @@ defmodule Ferricstore.Store.Router do
         {path, offset}
       end)
 
-    corr_id = System.unique_integer([:positive, :monotonic])
-
     values =
-      case Ferricstore.Bitcask.NIF.v2_pread_batch_async(self(), corr_id, locations) do
-        :ok ->
-          receive do
-            {:tokio_complete, ^corr_id, :ok, values} when is_list(values) ->
-              if length(values) == length(entries) do
-                values
-              else
-                List.duplicate(nil, length(entries))
-              end
-
-            {:tokio_complete, ^corr_id, :error, _reason} ->
-              List.duplicate(nil, length(entries))
-          after
-            @cold_batch_read_timeout_ms ->
-              List.duplicate(nil, length(entries))
+      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_batch_read_timeout_ms) do
+        {:ok, values} when is_list(values) ->
+          if length(values) == length(entries) do
+            values
+          else
+            List.duplicate(nil, length(entries))
           end
 
         {:error, _reason} ->
@@ -1844,20 +1833,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp read_cold_async(path, offset) do
-    corr_id = System.unique_integer([:positive, :monotonic])
-
-    case Ferricstore.Bitcask.NIF.v2_pread_at_async(self(), corr_id, path, offset) do
-      :ok ->
-        receive do
-          {:tokio_complete, ^corr_id, :ok, value} -> {:ok, value}
-          {:tokio_complete, ^corr_id, :error, reason} -> {:error, reason}
-        after
-          @cold_batch_read_timeout_ms -> {:error, :timeout}
-        end
-
-      {:error, _reason} = error ->
-        error
-    end
+    Ferricstore.Store.ColdRead.pread_at(path, offset, @cold_batch_read_timeout_ms)
   end
 
   @doc """

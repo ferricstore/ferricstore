@@ -3981,20 +3981,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp read_cold_async(path, offset) do
-    corr_id = System.unique_integer([:positive, :monotonic])
-
-    case NIF.v2_pread_at_async(self(), corr_id, path, offset) do
-      :ok ->
-        receive do
-          {:tokio_complete, ^corr_id, :ok, value} -> {:ok, value}
-          {:tokio_complete, ^corr_id, :error, reason} -> {:error, reason}
-        after
-          @cold_read_timeout_ms -> {:error, :timeout}
-        end
-
-      {:error, _reason} = error ->
-        error
-    end
+    Ferricstore.Store.ColdRead.pread_at(path, offset, @cold_read_timeout_ms)
   end
 
   # Returns the full file path for a log file within this shard's data dir.
