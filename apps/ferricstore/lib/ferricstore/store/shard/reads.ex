@@ -62,9 +62,9 @@ defmodule Ferricstore.Store.Shard.Reads do
       :expired ->
         {:reply, nil, state}
 
-      {:cold, fid, off, _vsize, _exp} ->
+      {:cold, fid, off, vsize, exp} ->
         p = ShardETS.file_path(state.shard_data_path, fid)
-        submit_cold_read(p, off, state, {from, key})
+        submit_cold_read(p, off, state, {from, key, exp, fid, off, vsize})
 
       :miss ->
         if ShardETS.pending_cold?(state, key) do
@@ -153,9 +153,9 @@ defmodule Ferricstore.Store.Shard.Reads do
       :expired ->
         {:reply, nil, state}
 
-      {:cold, fid, off, _vsize, exp} ->
+      {:cold, fid, off, vsize, exp} ->
         p = ShardETS.file_path(state.shard_data_path, fid)
-        submit_cold_read(p, off, state, {from, key, :meta, exp})
+        submit_cold_read(p, off, state, {from, key, :meta, exp, fid, off, vsize})
 
       :miss ->
         if ShardETS.pending_cold?(state, key) do

@@ -1063,6 +1063,14 @@ defmodule Ferricstore.Store.Shard do
   # (pending_reads lookup).
   def handle_info({:cold_read_timeout, corr_id}, state) do
     case Map.pop(state.pending_reads, corr_id) do
+      {{from, _key, _exp, _fid, _off, _vsize}, rest_pending} ->
+        GenServer.reply(from, nil)
+        {:noreply, %{state | pending_reads: rest_pending}}
+
+      {{from, _key, :meta, _exp, _fid, _off, _vsize}, rest_pending} ->
+        GenServer.reply(from, nil)
+        {:noreply, %{state | pending_reads: rest_pending}}
+
       {{from, _key}, rest_pending} ->
         GenServer.reply(from, nil)
         {:noreply, %{state | pending_reads: rest_pending}}
@@ -1085,21 +1093,36 @@ defmodule Ferricstore.Store.Shard do
       # Async read completion — look up in pending_reads
       true ->
         case Map.pop(state.pending_reads, corr_id) do
-          {{from, key}, rest_pending} ->
-            # Simple GET cold-read completion.
+          {{from, key, exp, fid, off, vsize}, rest_pending} ->
+            # Simple GET cold-read completion. Warm only if the ETS entry still
+            # points at the same disk location read by this request.
             if value != nil do
-              cold_read_warm_ets(state, key, value)
+              ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
             end
 
             GenServer.reply(from, value)
             {:noreply, %{state | pending_reads: rest_pending}}
 
-          {{from, key, :meta, exp}, rest_pending} ->
-            # GET_META cold-read completion — reply with {value, expire_at_ms}.
+          {{from, key, :meta, exp, fid, off, vsize}, rest_pending} ->
+            # GET_META cold-read completion. The reply may linearize before a
+            # later overwrite, but ETS warming must still be location-checked.
             if value != nil do
-              cold_read_warm_ets(state, key, value)
+              ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
             end
 
+            GenServer.reply(from, if(value != nil, do: {value, exp}, else: nil))
+            {:noreply, %{state | pending_reads: rest_pending}}
+
+          {{from, _key}, rest_pending} ->
+            # Legacy in-memory pending entry without disk location. Reply but
+            # do not warm, because the current ETS location may be newer than
+            # the value returned by the async read.
+            GenServer.reply(from, value)
+            {:noreply, %{state | pending_reads: rest_pending}}
+
+          {{from, _key, :meta, exp}, rest_pending} ->
+            # Legacy in-memory pending entry without disk location. Reply but
+            # skip warming for the same stale-completion reason as simple GET.
             GenServer.reply(from, if(value != nil, do: {value, exp}, else: nil))
             {:noreply, %{state | pending_reads: rest_pending}}
 
@@ -1120,6 +1143,14 @@ defmodule Ferricstore.Store.Shard do
       {:noreply, %{state | flush_in_flight: nil}}
     else
       case Map.pop(state.pending_reads, corr_id) do
+        {{from, _key, _exp, _fid, _off, _vsize}, rest_pending} ->
+          GenServer.reply(from, nil)
+          {:noreply, %{state | pending_reads: rest_pending}}
+
+        {{from, _key, :meta, _exp, _fid, _off, _vsize}, rest_pending} ->
+          GenServer.reply(from, nil)
+          {:noreply, %{state | pending_reads: rest_pending}}
+
         {{from, _key}, rest_pending} ->
           GenServer.reply(from, nil)
           {:noreply, %{state | pending_reads: rest_pending}}
@@ -1187,9 +1218,6 @@ defmodule Ferricstore.Store.Shard do
 
   defp prefix_count_entries(state_or_keydir, prefix),
     do: ShardETS.prefix_count_entries(state_or_keydir, prefix)
-
-  defp cold_read_warm_ets(state, key, value),
-    do: ShardETS.cold_read_warm_ets(state, key, value)
 
   # -------------------------------------------------------------------
   # Private: Raft write helpers
