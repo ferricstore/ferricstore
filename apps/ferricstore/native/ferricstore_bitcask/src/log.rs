@@ -27,6 +27,12 @@ pub const HEADER_SIZE: usize = 26;
 /// Sentinel `value_size` marking a tombstone (deleted key).
 /// Uses `u32::MAX` so that `value_size = 0` can represent a genuine empty value.
 pub const TOMBSTONE: u32 = u32::MAX;
+// Spec section 2G.4: max_value_size_bytes defaults to 512 MiB.
+// The on-disk format supports u32 (4 GiB) but FerricStore enforces a tighter
+// default to prevent accidental large-value writes that degrade cache behavior.
+const MAX_VALUE_SIZE: usize = 512 * 1024 * 1024;
+const BODY_LEN_FILE_SIZE_CHECK_THRESHOLD: usize = 64 * 1024;
+const STREAM_READ_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub struct LogError(pub String);
@@ -497,11 +503,6 @@ impl LogReader {
 /// message if either exceeds the on-disk format limits (key: u16, value: u32).
 pub(crate) fn validate_kv_sizes(key: &[u8], value: &[u8]) -> std::result::Result<(), String> {
     let max_key = usize::from(u16::MAX);
-    // Spec section 2G.4: max_value_size_bytes defaults to 512 MiB.
-    // The on-disk format supports u32 (4 GiB) but we enforce a tighter
-    // default to prevent accidental large-value writes that would
-    // degrade cache performance.
-    const MAX_VALUE_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
     if key.len() > max_key {
         return Err(format!(
             "key too large: {} bytes (max {max_key})",
@@ -515,6 +516,50 @@ pub(crate) fn validate_kv_sizes(key: &[u8], value: &[u8]) -> std::result::Result
         ));
     }
     Ok(())
+}
+
+fn decoded_value_size(value_size_raw: u32, is_tombstone: bool) -> Result<usize> {
+    if is_tombstone {
+        return Ok(0);
+    }
+
+    let value_size = value_size_raw as usize;
+    if value_size > MAX_VALUE_SIZE {
+        return Err(LogError(format!(
+            "value too large in log record: {value_size} bytes (max {MAX_VALUE_SIZE})"
+        )));
+    }
+    Ok(value_size)
+}
+
+fn checked_record_body_len(key_size: usize, value_size: usize) -> Result<usize> {
+    key_size
+        .checked_add(value_size)
+        .ok_or_else(|| LogError("record body length overflow".into()))
+}
+
+fn read_exact_vec(reader: &mut impl Read, len: usize, label: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(len.min(STREAM_READ_CHUNK_SIZE));
+    let mut chunk = [0u8; STREAM_READ_CHUNK_SIZE];
+    let mut remaining = len;
+
+    while remaining > 0 {
+        let to_read = remaining.min(STREAM_READ_CHUNK_SIZE);
+        match reader.read_exact(&mut chunk[..to_read]) {
+            Ok(()) => {
+                out.extend_from_slice(&chunk[..to_read]);
+                remaining -= to_read;
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(LogError(format!(
+                    "truncated record {label}: expected {len} bytes"
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(out)
 }
 
 /// Encode a record into a single `Vec` allocation.
@@ -595,15 +640,26 @@ fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
     let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
     let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
     let is_tombstone = value_size_raw == TOMBSTONE;
-    let value_size = if is_tombstone {
-        0
-    } else {
-        value_size_raw as usize
-    };
+    let value_size = decoded_value_size(value_size_raw, is_tombstone)?;
 
     // Step 2: pread key + value in a single call
     let actual_value_size = value_size;
-    let body_len = key_size + actual_value_size;
+    let body_len = checked_record_body_len(key_size, actual_value_size)?;
+    if body_len > BODY_LEN_FILE_SIZE_CHECK_THRESHOLD {
+        let body_start = offset
+            .checked_add(HEADER_SIZE as u64)
+            .ok_or_else(|| LogError("record body offset overflow".into()))?;
+        let body_end = body_start
+            .checked_add(body_len as u64)
+            .ok_or_else(|| LogError("record body end offset overflow".into()))?;
+        let file_len = file.metadata()?.len();
+        if body_end > file_len {
+            return Err(LogError(format!(
+                "record body extends past end of file: end={body_end}, file_len={file_len}"
+            )));
+        }
+    }
+
     let mut body = vec![0u8; body_len];
     if body_len > 0 {
         let body_offset = offset + HEADER_SIZE as u64;
@@ -658,16 +714,14 @@ fn read_next_record(reader: &mut impl Read) -> Result<Option<Record>> {
     let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
     let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
     let is_tombstone = value_size_raw == TOMBSTONE;
+    let value_size = decoded_value_size(value_size_raw, is_tombstone)?;
 
-    let mut key = vec![0u8; key_size];
-    reader.read_exact(&mut key)?;
+    let key = read_exact_vec(reader, key_size, "key")?;
 
     let value = if is_tombstone {
         vec![]
     } else {
-        let mut v = vec![0u8; value_size_raw as usize];
-        reader.read_exact(&mut v)?;
-        v
+        read_exact_vec(reader, value_size, "value")?
     };
 
     let mut hasher = crc32fast::Hasher::new();
@@ -963,6 +1017,37 @@ mod tests {
         let mut cursor = io::Cursor::new(header);
         // read_exact on key will hit UnexpectedEof → error
         assert!(read_next_record(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn read_next_record_rejects_large_truncated_body_before_full_allocation() {
+        let mut header = vec![0u8; HEADER_SIZE];
+        header[22..26].copy_from_slice(&(1024_u32 * 1024).to_le_bytes());
+
+        let mut cursor = io::Cursor::new(header);
+        let err = read_next_record(&mut cursor).unwrap_err();
+
+        assert!(
+            err.to_string().contains("truncated record value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn pread_record_rejects_large_body_beyond_file_end_before_allocation() {
+        let dir = temp_dir();
+        let path = dir.path().join("huge_truncated.log");
+        let mut header = vec![0u8; HEADER_SIZE];
+        header[22..26].copy_from_slice(&(1024_u32 * 1024).to_le_bytes());
+        fs::write(&path, &header).unwrap();
+
+        let file = File::open(&path).unwrap();
+        let err = pread_record_from_file(&file, 0).unwrap_err();
+
+        assert!(
+            err.to_string().contains("extends past end"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
