@@ -200,6 +200,56 @@ defmodule Ferricstore.Store.AsyncListOpTest do
       assert value_size == byte_size(large)
     end
 
+    test "RPUSH large element disk error is not accepted for async replication" do
+      ctx = ctx()
+      key = ukey("large_disk_error")
+      idx = Router.shard_for(ctx, key)
+      large = :binary.copy("x", ctx.hot_cache_max_value_size + 1024)
+      {file_id, file_path, shard_path} = Ferricstore.Store.ActiveFile.get(idx)
+
+      missing_path =
+        Path.join([
+          System.tmp_dir!(),
+          "missing_ferricstore_#{System.unique_integer([:positive])}",
+          "00000.log"
+        ])
+
+      handler_id = {:async_list_op, self(), make_ref()}
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :batcher, :async_flush],
+        fn _event, _measurements, meta, test_pid ->
+          if meta.shard_index == idx and meta.origin do
+            send(test_pid, :unexpected_async_flush)
+          end
+        end,
+        self()
+      )
+
+      Ferricstore.Store.ActiveFile.publish(idx, file_id, missing_path, Path.dirname(missing_path))
+
+      try do
+        assert {:error, "ERR disk write failed" <> _} =
+                 Router.list_op(ctx, key, {:rpush, [large]})
+
+        batcher_state = :sys.get_state(Batcher.batcher_name(idx))
+
+        assert batcher_state.slots == %{},
+               "failed local list write must not leave an async Raft command queued"
+      after
+        Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_path)
+      end
+
+      try do
+        Batcher.flush(idx)
+        refute_receive :unexpected_async_flush, 200
+        assert [] == Router.list_op(ctx, key, {:lrange, 0, -1})
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
     test "LPOP releases keydir binary memory for hot off-heap elements" do
       ctx = ctx()
       key = ukey("binary_accounting")

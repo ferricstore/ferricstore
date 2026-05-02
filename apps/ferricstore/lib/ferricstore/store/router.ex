@@ -28,6 +28,7 @@ defmodule Ferricstore.Store.Router do
   @slot_mask 1023
   @bitcask_header_size 26
   @cold_batch_read_timeout_ms 10_000
+  @async_list_rollback_key :ferricstore_async_list_originals
 
   defguardp valid_cold_file_ref(file_id, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(value_size) and
@@ -3068,44 +3069,70 @@ defmodule Ferricstore.Store.Router do
   def execute_list_op_inline(ctx, idx, {:list_op, key, operation} = cmd) do
     :telemetry.execute([:ferricstore, :rmw, :worker_list_op], %{}, %{shard_index: idx})
 
-    with :ok <- maybe_async_submit_list_op(idx, cmd, operation) do
-      store = build_origin_compound_store(ctx, idx)
-
-      case ensure_list_type_for_operation(key, operation, store) do
-        :ok ->
-          # Resolve the module at runtime to avoid the compile-time cycle
-          # ListOps → Ops → Router → ListOps. `list_ops_mod/0` returns an atom
-          # that xref cannot trace through.
-          result = :erlang.apply(list_ops_mod(), :execute, [key, store, operation])
-
-          if list_operation_mutating?(operation) do
-            wv_size = :counters.info(ctx.write_version).size
-            if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
-          end
-
-          result
-
-        {:error, _} = err ->
-          err
-      end
+    if list_operation_mutating?(operation) do
+      execute_mutating_list_op_inline(ctx, idx, cmd, fn ->
+        do_execute_list_op_inline(ctx, idx, key, operation)
+      end)
+    else
+      do_execute_list_op_inline(ctx, idx, key, operation)
     end
   end
 
   def execute_list_op_inline(ctx, idx, {:list_op_lmove, src_key, dst_key, from_dir, to_dir} = cmd) do
-    with :ok <- async_submit_to_raft(idx, cmd) do
+    execute_mutating_list_op_inline(ctx, idx, cmd, fn ->
       store = build_origin_compound_store(ctx, idx)
 
-      result =
-        :erlang.apply(list_ops_mod(), :execute_lmove, [src_key, dst_key, store, from_dir, to_dir])
+      :erlang.apply(list_ops_mod(), :execute_lmove, [src_key, dst_key, store, from_dir, to_dir])
+    end)
+  end
 
-      wv_size = :counters.info(ctx.write_version).size
-      if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
-      result
+  defp do_execute_list_op_inline(ctx, idx, key, operation) do
+    store = build_origin_compound_store(ctx, idx)
+
+    case ensure_list_type_for_operation(key, operation, store) do
+      :ok ->
+        # Resolve the module at runtime to avoid the compile-time cycle
+        # ListOps → Ops → Router → ListOps. `list_ops_mod/0` returns an atom
+        # that xref cannot trace through.
+        :erlang.apply(list_ops_mod(), :execute, [key, store, operation])
+
+      {:error, _} = err ->
+        err
     end
   end
 
-  defp maybe_async_submit_list_op(idx, cmd, operation) do
-    if list_operation_mutating?(operation), do: async_submit_to_raft(idx, cmd), else: :ok
+  defp execute_mutating_list_op_inline(ctx, idx, cmd, fun) do
+    previous_rollback = Process.get(@async_list_rollback_key)
+    Process.put(@async_list_rollback_key, %{ctx: ctx, idx: idx, originals: %{}})
+
+    # Do not enqueue the async Raft command until the origin-local list write
+    # succeeds. Large list elements can fail during Bitcask append; accepting
+    # Raft first would let a client-visible error apply later via replication.
+    try do
+      result = fun.()
+
+      cond do
+        match?({:error, _}, result) ->
+          rollback_async_list_originals(ctx, idx)
+          result
+
+        true ->
+          case async_submit_to_raft(idx, cmd) do
+            :ok ->
+              bump_write_version(ctx, idx)
+              result
+
+            {:error, _} = error ->
+              rollback_async_list_originals(ctx, idx)
+              error
+          end
+      end
+    after
+      case previous_rollback do
+        nil -> Process.delete(@async_list_rollback_key)
+        previous -> Process.put(@async_list_rollback_key, previous)
+      end
+    end
   end
 
   defp list_operation_mutating?({:lrange, _, _}), do: false
@@ -3145,9 +3172,11 @@ defmodule Ferricstore.Store.Router do
         origin_compound_get(ctx, idx, keydir, compound_key)
       end,
       compound_put: fn _redis_key, compound_key, value, exp ->
+        record_async_list_original(ctx, idx, compound_key)
         install_rmw_value(ctx, idx, compound_key, value, exp)
       end,
       compound_delete: fn _redis_key, compound_key ->
+        record_async_list_original(ctx, idx, compound_key)
         track_keydir_binary_delete(ctx, idx, keydir, compound_key)
         :ets.delete(keydir, compound_key)
         Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, compound_key)
@@ -3167,6 +3196,78 @@ defmodule Ferricstore.Store.Router do
         origin_key_exists?(ctx, idx, keydir, k)
       end
     }
+  end
+
+  defp record_async_list_original(ctx, idx, compound_key) do
+    case Process.get(@async_list_rollback_key) do
+      %{ctx: ^ctx, idx: ^idx, originals: originals} = rollback ->
+        unless Map.has_key?(originals, compound_key) do
+          Process.put(@async_list_rollback_key, %{
+            rollback
+            | originals:
+                Map.put(originals, compound_key, snapshot_live_value(ctx, idx, compound_key))
+          })
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp rollback_async_list_originals(ctx, idx) do
+    originals =
+      case Process.get(@async_list_rollback_key) do
+        %{ctx: ^ctx, idx: ^idx, originals: originals} -> originals
+        _ -> %{}
+      end
+
+    Enum.each(originals, fn
+      {compound_key, :missing} ->
+        rollback_async_list_key_to_missing(ctx, idx, compound_key)
+
+      {compound_key, {:value, value, expire_at_ms}} ->
+        rollback_async_list_key_to_value(ctx, idx, compound_key, value, expire_at_ms)
+    end)
+  end
+
+  defp rollback_async_list_key_to_missing(ctx, idx, compound_key) do
+    keydir = elem(ctx.keydir_refs, idx)
+    {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+
+    _ = Ferricstore.Bitcask.NIF.v2_append_ops_batch_nosync(file_path, [{:delete, compound_key}])
+    track_keydir_binary_delete(ctx, idx, keydir, compound_key)
+    :ets.delete(keydir, compound_key)
+  end
+
+  defp rollback_async_list_key_to_value(ctx, idx, compound_key, value, expire_at_ms) do
+    keydir = elem(ctx.keydir_refs, idx)
+    disk_value = to_disk_binary(value)
+
+    case nif_append_batch_with_file(ctx, idx, [{compound_key, disk_value, expire_at_ms}]) do
+      {:ok, file_id, [{offset, _record_size}]} ->
+        ets_value =
+          case value do
+            v when is_integer(v) ->
+              Integer.to_string(v)
+
+            v when is_float(v) ->
+              Float.to_string(v)
+
+            v when is_binary(v) ->
+              if byte_size(v) > ctx.hot_cache_max_value_size, do: nil, else: v
+          end
+
+        track_keydir_binary_insert(ctx, idx, keydir, compound_key, ets_value)
+
+        :ets.insert(
+          keydir,
+          {compound_key, ets_value, expire_at_ms, LFU.initial(), file_id, offset,
+           byte_size(disk_value)}
+        )
+
+      {:error, _reason} ->
+        :ok
+    end
   end
 
   defp origin_compound_get(ctx, idx, keydir, compound_key) do
