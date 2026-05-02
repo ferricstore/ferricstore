@@ -226,6 +226,9 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec cuckoo_file_exists(binary(), binary()) :: {:ok, boolean()} | {:error, term()}
   def cuckoo_file_exists(_path, _element), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec cuckoo_file_mexists(binary(), [binary()]) :: {:ok, [boolean()]} | {:error, term()}
+  def cuckoo_file_mexists(_path, _elements), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec cuckoo_file_count(binary(), binary()) :: {:ok, non_neg_integer()} | {:error, term()}
   def cuckoo_file_count(_path, _element), do: :erlang.nif_error(:nif_not_loaded)
 
@@ -235,6 +238,10 @@ defmodule Ferricstore.Bitcask.NIF do
   # -- Async Cuckoo read NIFs (Tokio spawn_blocking) --
   @spec cuckoo_file_exists_async(pid(), term(), binary(), binary()) :: :ok | {:error, term()}
   def cuckoo_file_exists_async(_caller_pid, _correlation_id, _path, _element),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec cuckoo_file_mexists_async(pid(), term(), binary(), [binary()]) :: :ok | {:error, term()}
+  def cuckoo_file_mexists_async(_caller_pid, _correlation_id, _path, _elements),
     do: :erlang.nif_error(:nif_not_loaded)
 
   @spec cuckoo_file_count_async(pid(), term(), binary(), binary()) :: :ok | {:error, term()}

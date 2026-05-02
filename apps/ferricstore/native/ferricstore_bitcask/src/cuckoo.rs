@@ -391,6 +391,33 @@ fn cuckoo_file_open_rw(path: &str) -> Result<File, FileOpenError> {
     })
 }
 
+fn cuckoo_file_exists_in_open_file(
+    file: &File,
+    hdr: &CuckooFileHeader,
+    element: &[u8],
+) -> Result<u64, String> {
+    let (fp, b1) =
+        cuckoo_file_fingerprint_and_bucket(element, hdr.fingerprint_size as usize, hdr.num_buckets);
+    let b2 = cuckoo_file_alternate_bucket(b1, &fp, hdr.num_buckets);
+
+    for bucket in &[b1, b2] {
+        for slot in 0..hdr.bucket_size {
+            let s = cuckoo_file_read_slot(
+                file,
+                *bucket,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            )?;
+            if s == fp {
+                return Ok(1);
+            }
+        }
+    }
+
+    Ok(0)
+}
+
 /// Encode a FileOpenError as an Erlang error term.
 fn encode_file_open_error(env: Env, err: FileOpenError) -> Term {
     match err {
@@ -861,34 +888,45 @@ pub fn cuckoo_file_exists<'a>(
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
 
-    let (fp, b1) = cuckoo_file_fingerprint_and_bucket(
-        element.as_slice(),
-        hdr.fingerprint_size as usize,
-        hdr.num_buckets,
-    );
-    let b2 = cuckoo_file_alternate_bucket(b1, &fp, hdr.num_buckets);
+    let result = match cuckoo_file_exists_in_open_file(&file, &hdr, element.as_slice()) {
+        Ok(result) => result,
+        Err(e) => return Ok((atoms::error(), e).encode(env)),
+    };
+    crate::fadvise_dontneed(&file, 0, 0);
+    Ok((atoms::ok(), result).encode(env))
+}
 
-    for bucket in &[b1, b2] {
-        for slot in 0..hdr.bucket_size {
-            let s = match cuckoo_file_read_slot(
-                &file,
-                *bucket,
-                slot as usize,
-                hdr.bucket_size,
-                hdr.fingerprint_size,
-            ) {
-                Ok(s) => s,
-                Err(e) => return Ok((atoms::error(), e).encode(env)),
-            };
-            if s == fp {
-                crate::fadvise_dontneed(&file, 0, 0);
-                return Ok((atoms::ok(), 1u64).encode(env));
-            }
+/// Check if multiple elements may exist in a cuckoo filter file.
+/// Returns `{:ok, [0|1, ...]}`, or `{:error, reason}`.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn cuckoo_file_mexists<'a>(
+    env: Env<'a>,
+    path: String,
+    elements: Vec<Binary<'a>>,
+) -> NifResult<Term<'a>> {
+    let file = match cuckoo_file_open_read(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            return Ok(encode_file_open_error(env, e));
+        }
+    };
+
+    let hdr = match cuckoo_read_header(&file) {
+        Ok(h) => h,
+        Err(e) => return Ok((atoms::error(), e).encode(env)),
+    };
+
+    let mut results = Vec::with_capacity(elements.len());
+    for element in elements {
+        match cuckoo_file_exists_in_open_file(&file, &hdr, element.as_slice()) {
+            Ok(result) => results.push(result),
+            Err(e) => return Ok((atoms::error(), e).encode(env)),
         }
     }
 
     crate::fadvise_dontneed(&file, 0, 0);
-    Ok((atoms::ok(), 0u64).encode(env))
+    Ok((atoms::ok(), results).encode(env))
 }
 
 /// Count occurrences of an element's fingerprint in a cuckoo filter file.
@@ -1002,30 +1040,58 @@ pub fn cuckoo_file_exists_async<'a>(
                 }
             })?;
             let hdr = cuckoo_read_header(&file).map_err(|e| e.clone())?;
-            let (fp, b1) = cuckoo_file_fingerprint_and_bucket(
-                &element_owned,
-                hdr.fingerprint_size as usize,
-                hdr.num_buckets,
-            );
-            let b2 = cuckoo_file_alternate_bucket(b1, &fp, hdr.num_buckets);
-            for bucket in &[b1, b2] {
-                for slot in 0..hdr.bucket_size {
-                    let s = cuckoo_file_read_slot(
-                        &file,
-                        *bucket,
-                        slot as usize,
-                        hdr.bucket_size,
-                        hdr.fingerprint_size,
-                    )
-                    .map_err(|e| e.clone())?;
-                    if s == fp {
-                        crate::fadvise_dontneed(&file, 0, 0);
-                        return Ok(1u64);
-                    }
+            let result = cuckoo_file_exists_in_open_file(&file, &hdr, &element_owned)?;
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(result)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(val) => (atoms::tokio_complete(), correlation_id, atoms::ok(), val).encode(env),
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+/// Async cuckoo mexists: one Tokio task and one waiter for the whole batch.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn cuckoo_file_mexists_async<'a>(
+    env: Env<'a>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+    elements: Vec<Binary<'a>>,
+) -> NifResult<Term<'a>> {
+    let elements_owned: Vec<Vec<u8>> = elements
+        .iter()
+        .map(|element| element.as_slice().to_vec())
+        .collect();
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
                 }
+            })?;
+            let hdr = cuckoo_read_header(&file)?;
+            let mut results = Vec::with_capacity(elements_owned.len());
+            for element in elements_owned {
+                results.push(cuckoo_file_exists_in_open_file(&file, &hdr, &element)?);
             }
             crate::fadvise_dontneed(&file, 0, 0);
-            Ok(0u64)
+            Ok(results)
         })
         .await
         .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));

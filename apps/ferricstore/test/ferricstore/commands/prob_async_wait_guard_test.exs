@@ -17,6 +17,15 @@ defmodule Ferricstore.Commands.ProbAsyncWaitGuardTest do
     assert violations == []
   end
 
+  test "CF.MEXISTS uses one batch async NIF instead of one waiter per element" do
+    # This guards the high-cardinality read path: one proxy/wait per element
+    # creates avoidable processes and serial waits for large CF.MEXISTS calls.
+    source = File.read!(Path.expand("../../../lib/ferricstore/commands/cuckoo.ex", __DIR__))
+
+    assert source =~ "NIF.cuckoo_file_mexists_async(proxy, corr_id, path, elements)"
+    refute source =~ "Enum.map(elements, fn element"
+  end
+
   defp direct_self_async_nif_calls(path) do
     ast =
       path

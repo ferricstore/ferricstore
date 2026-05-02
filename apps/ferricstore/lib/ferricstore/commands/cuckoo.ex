@@ -141,19 +141,20 @@ defmodule Ferricstore.Commands.Cuckoo do
     with :ok <- ProbType.check_expected(key, :cuckoo, store) do
       path = prob_path(store, key, "cuckoo")
 
-      case Ferricstore.FS.exists?(path) do
-        false ->
+      case await_nif(fn proxy, corr_id ->
+             NIF.cuckoo_file_mexists_async(proxy, corr_id, path, elements)
+           end) do
+        {:ok, results} ->
+          results
+
+        {:error, "enoent"} ->
           List.duplicate(0, length(elements))
 
-        true ->
-          Enum.map(elements, fn element ->
-            case await_nif(fn proxy, corr_id ->
-                   NIF.cuckoo_file_exists_async(proxy, corr_id, path, element)
-                 end) do
-              {:ok, result} -> result
-              {:error, _reason} -> 0
-            end
-          end)
+        {:error, :timeout} ->
+          {:error, "ERR timeout"}
+
+        {:error, reason} ->
+          {:error, "ERR cuckoo mexists failed: #{reason}"}
       end
     end
   end
