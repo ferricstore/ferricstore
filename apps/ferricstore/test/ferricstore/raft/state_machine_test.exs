@@ -306,6 +306,29 @@ defmodule Ferricstore.Raft.StateMachineTest do
                :ets.lookup(ets, "future_origin_getset")
     end
 
+    test "persists already-applied origin RMW when the local value is still pending", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      :ets.insert(ets, {"pending_origin_getset", "new", 0, 1, :pending, 0, 0})
+
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "pending_origin_getset", {:getset, "pending_origin_getset", "new"},
+            "old", 0, "new", 0}},
+          state
+        )
+
+      assert [{"pending_origin_getset", "new", 0, _lfu, 0, 0, 3}] =
+               :ets.lookup(ets, "pending_origin_getset")
+
+      assert {:ok, [{"pending_origin_getset", 0, 3, 0, false}]} =
+               NIF.v2_scan_file(active_file_path)
+    end
+
     test "replays origin GETEX when recovery has the old expiry", %{state: state, ets: ets} do
       old_expire_at_ms = Ferricstore.HLC.now_ms() + 10_000
       new_expire_at_ms = old_expire_at_ms + 10_000
