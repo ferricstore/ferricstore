@@ -21,7 +21,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
   Per the spec (section 2C.4):
   - `apply/3` is deterministic and runs on every node in the Raft group.
-  - Only synchronous NIF calls are allowed inside `apply/3`.
+  - Cold disk reads inside `apply/3` wait synchronously for deterministic
+    results, but submit the actual file I/O through async NIFs so Normal
+    schedulers do not run blocking pread work.
   - Effects (`send_msg`, `release_cursor`) are returned as the third element
     of the apply return tuple.
   - In single-node mode, the shard's Raft group has one member (self quorum),
@@ -71,6 +73,7 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.Store.{BitcaskWriter, LFU, ListOps, Promotion, Router, ValueCodec}
 
   @default_release_cursor_interval 20_000
+  @cold_read_timeout_ms 10_000
 
   defguardp valid_cold_location(file_id, offset, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
@@ -1574,7 +1577,7 @@ defmodule Ferricstore.Raft.StateMachine do
         [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
-          case NIF.v2_pread_at(path, off) do
+          case read_cold_async(path, off) do
             {:ok, v} -> v
             _ -> nil
           end
@@ -1586,7 +1589,7 @@ defmodule Ferricstore.Raft.StateMachine do
         when exp > now and valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
-          case NIF.v2_pread_at(path, off) do
+          case read_cold_async(path, off) do
             {:ok, v} -> v
             _ -> nil
           end
@@ -1619,7 +1622,7 @@ defmodule Ferricstore.Raft.StateMachine do
         [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
-          case NIF.v2_pread_at(path, off) do
+          case read_cold_async(path, off) do
             {:ok, v} -> {v, 0}
             _ -> nil
           end
@@ -1631,7 +1634,7 @@ defmodule Ferricstore.Raft.StateMachine do
         when exp > now and valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
-          case NIF.v2_pread_at(path, off) do
+          case read_cold_async(path, off) do
             {:ok, v} -> {v, exp}
             _ -> nil
           end
@@ -1681,7 +1684,7 @@ defmodule Ferricstore.Raft.StateMachine do
               if value == nil do
                 path = sm_file_path_from_path(data_path, fid)
 
-                case NIF.v2_pread_at(path, off) do
+                case read_cold_async(path, off) do
                   {:ok, v} -> v
                   _ -> nil
                 end
@@ -3958,7 +3961,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp warm_from_disk(state, key, expire_at_ms, fid, off) do
     path = sm_file_path(state, fid)
 
-    case NIF.v2_pread_at(path, off) do
+    case read_cold_async(path, off) do
       {:ok, value} when is_binary(value) ->
         v = value_for_ets(value, hot_cache_threshold(state))
         # Cold -> warm: previous ETS value was nil, only new value bytes matter
@@ -3968,6 +3971,23 @@ defmodule Ferricstore.Raft.StateMachine do
 
       _ ->
         :miss
+    end
+  end
+
+  defp read_cold_async(path, offset) do
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    case NIF.v2_pread_at_async(self(), corr_id, path, offset) do
+      :ok ->
+        receive do
+          {:tokio_complete, ^corr_id, :ok, value} -> {:ok, value}
+          {:tokio_complete, ^corr_id, :error, reason} -> {:error, reason}
+        after
+          @cold_read_timeout_ms -> {:error, :timeout}
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
