@@ -5127,7 +5127,9 @@ defmodule FerricStore do
         ordered_async_batch_results(length(kv_pairs), errors)
 
       errors == %{} and not pressure? and not keydir_pressure? ->
-        run_async_batch_put_result_list(ctx, kv_pairs)
+        valid_indexed
+        |> then(&run_async_batch_put(ctx, &1))
+        |> then(&ordered_async_batch_results(length(kv_pairs), &1))
 
       pressure? or keydir_pressure? ->
         {keydir_accepted_indexed, keydir_errors} =
@@ -5227,12 +5229,16 @@ defmodule FerricStore do
   defp run_async_batch_put(_ctx, []), do: %{}
 
   defp run_async_batch_put(ctx, indexed_kvs) do
-    kv_pairs = Enum.map(indexed_kvs, fn {_index, kv} -> kv end)
-    results = run_async_batch_put_result_list(ctx, kv_pairs)
-
     indexed_kvs
-    |> Enum.map(fn {index, _kv} -> index end)
-    |> Enum.zip(results)
+    |> Enum.group_by(fn {_index, {key, _value}} -> Router.shard_for(ctx, key) end)
+    |> Enum.flat_map(fn {_idx, shard_indexed_kvs} ->
+      kv_pairs = Enum.map(shard_indexed_kvs, fn {_index, kv} -> kv end)
+      results = run_async_batch_put_result_list(ctx, kv_pairs)
+
+      shard_indexed_kvs
+      |> Enum.map(fn {index, _kv} -> index end)
+      |> Enum.zip(results)
+    end)
     |> Map.new()
   end
 

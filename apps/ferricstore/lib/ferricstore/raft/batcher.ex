@@ -362,6 +362,22 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc """
+  Returns whether the local async Batcher can currently accept another
+  shard-local async submission.
+
+  Router uses this as a cheap preflight before multi-shard async batches so
+  an already-overloaded shard does not let earlier shard writes become locally
+  visible before the batch returns an overall error. The actual submit still
+  performs the authoritative check.
+  """
+  @spec async_accepting?(non_neg_integer()) :: boolean()
+  def async_accepting?(shard_index) do
+    GenServer.call(batcher_name(shard_index), :async_accepting?, 5_000)
+  catch
+    :exit, _ -> false
+  end
+
+  @doc """
   Submits a list of async commands to the batcher in a single cast.
 
   Same semantics as calling `async_submit/2` for each command, but sends
@@ -531,6 +547,10 @@ defmodule Ferricstore.Raft.Batcher do
 
       {:reply, :ok, new_state}
     end
+  end
+
+  def handle_call(:async_accepting?, _from, state) do
+    {:reply, not pending_full?(state), state}
   end
 
   def handle_call(:flush, from, state) do

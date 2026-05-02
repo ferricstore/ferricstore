@@ -2086,6 +2086,14 @@ defmodule Ferricstore.Store.Router do
     held_latches = acquire_async_key_latches(ctx, locks)
 
     try do
+      overloaded? =
+        Enum.any?(shard_batches, fn {idx, _keydir, _shard_kvs, _entries, _raft_cmds,
+                                     _large_disk_batch} ->
+          not Ferricstore.Raft.Batcher.async_accepting?(idx)
+        end)
+
+      if overloaded?, do: throw({:async_error, "ERR async replication overloaded"})
+
       large_previous = snapshot_batch_large_values(ctx, shard_batches)
 
       disk_locations =

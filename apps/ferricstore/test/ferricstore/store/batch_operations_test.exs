@@ -195,6 +195,20 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       end
     end
 
+    test "cross-shard async replication overload does not leave earlier shard writes visible" do
+      ok_key = key_for_shard(ctx(), "bap_cross_overload_ok", 0)
+      overloaded_key = key_for_shard(ctx(), "bap_cross_overload_blocked", 1)
+
+      on_exit(fn -> Batcher.reset_pending(1) end)
+      fill_async_pending(1, overloaded_key)
+
+      assert {:error, "ERR async replication overloaded"} =
+               Router.batch_async_put(ctx(), [{ok_key, "ok"}, {overloaded_key, "blocked"}])
+
+      assert nil == Router.get(ctx(), ok_key)
+      assert nil == Router.get(ctx(), overloaded_key)
+    end
+
     test "large batch does not recover unaccepted value when async replication is overloaded" do
       key = "#{@ns_async}:bap_overloaded_large_missing_#{System.unique_integer([:positive])}"
       idx = Router.shard_for(ctx(), key)
@@ -243,6 +257,26 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       for {key, value} <- kvs do
         assert {:ok, value} == FerricStore.get(key)
       end
+    end
+
+    test "all-async batch reports overload per shard instead of failing every key" do
+      ok_key = key_for_shard(ctx(), "bs_cross_overload_ok", 0)
+      overloaded_key = key_for_shard(ctx(), "bs_cross_overload_blocked", 1)
+
+      on_exit(fn -> Batcher.reset_pending(1) end)
+      fill_async_pending(1, overloaded_key)
+
+      assert [
+               :ok,
+               {:error, "ERR async replication overloaded"}
+             ] =
+               FerricStore.__async_batch_put_result_list__(
+                 ctx(),
+                 [{ok_key, "ok"}, {overloaded_key, "blocked"}]
+               )
+
+      assert "ok" == Router.get(ctx(), ok_key)
+      assert nil == Router.get(ctx(), overloaded_key)
     end
 
     test "all-quorum namespace returns list of :ok" do
