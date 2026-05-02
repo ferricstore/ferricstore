@@ -807,6 +807,19 @@ defmodule Ferricstore.ProbEdgeCasesTest do
       assert {:ok, [0]} = NIF.cms_file_query(path, ["not_here"])
     end
 
+    test "cms_file_incrby rejects counter overflow without mutating" do
+      dir = make_prob_dir("nif_cms_overflow")
+      path = Path.join(dir, "overflow.cms")
+      max_i64 = 9_223_372_036_854_775_807
+
+      assert {:ok, :ok} = NIF.cms_file_create(path, 100, 5)
+      assert {:ok, [^max_i64]} = NIF.cms_file_incrby(path, [{"hot", max_i64}])
+
+      assert {:error, reason} = NIF.cms_file_incrby(path, [{"hot", 1}])
+      assert reason =~ "overflow"
+      assert {:ok, [^max_i64]} = NIF.cms_file_query(path, ["hot"])
+    end
+
     test "cms_file_info returns correct metadata" do
       dir = make_prob_dir("nif_cms_info")
       path = Path.join(dir, "info.cms")

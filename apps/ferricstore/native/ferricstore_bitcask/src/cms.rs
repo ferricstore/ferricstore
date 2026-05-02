@@ -109,6 +109,16 @@ fn cms_file_size(width: u64, depth: u64) -> Result<u64, String> {
         .ok_or_else(|| "CMS file size overflow".into())
 }
 
+fn cms_next_total_count(total_count: u64, count: i64) -> Result<u64, String> {
+    if count >= 0 {
+        total_count
+            .checked_add(count as u64)
+            .ok_or_else(|| "CMS total count overflow".into())
+    } else {
+        Ok(total_count.saturating_sub(count.unsigned_abs()))
+    }
+}
+
 /// Read the CMS file header (width, depth, count) via pread.
 /// Returns `(width, depth, count)` or an error string.
 fn cms_file_read_header(file: &File) -> Result<(u64, u64, u64), String> {
@@ -247,6 +257,7 @@ pub fn cms_file_incrby<'a>(
     for (idx, (element, count)) in items.iter().enumerate() {
         let indices = hash_indices_standalone(element.as_slice(), width, depth);
         let mut min_val = i64::MAX;
+        let mut updates: Vec<(u64, i64)> = Vec::with_capacity(indices.len());
 
         for (row, &col) in indices.iter().enumerate() {
             let offset = MMAP_HEADER_SIZE as u64 + (row as u64 * width + col) * 8;
@@ -254,19 +265,34 @@ pub fn cms_file_incrby<'a>(
             // pread current counter value
             file.read_at(&mut buf, offset)
                 .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
-            let mut val = i64::from_le_bytes(buf);
+            let val = i64::from_le_bytes(buf);
 
-            // add count
-            val += count;
+            let next_val = match val.checked_add(*count) {
+                Some(next_val) => next_val,
+                None => {
+                    return Ok((
+                        atoms::error(),
+                        format!("CMS counter overflow: {val} + {count}"),
+                    )
+                        .encode(env));
+                }
+            };
 
-            // pwrite updated counter
-            file.write_at(&val.to_le_bytes(), offset)
-                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
-
-            min_val = min_val.min(val);
+            min_val = min_val.min(next_val);
+            updates.push((offset, next_val));
         }
 
-        total_count = total_count.wrapping_add(*count as u64);
+        let next_total_count = match cms_next_total_count(total_count, *count) {
+            Ok(next_total_count) => next_total_count,
+            Err(e) => return Ok((atoms::error(), e).encode(env)),
+        };
+
+        for (offset, next_val) in updates {
+            file.write_at(&next_val.to_le_bytes(), offset)
+                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+        }
+
+        total_count = next_total_count;
         counts.push(min_val);
 
         if idx % YIELD_CHECK_INTERVAL == 0 && idx > 0 {
