@@ -40,6 +40,18 @@ defmodule Ferricstore.ApplicationTest do
     end)
   end
 
+  defp stop_app_if_started(app) do
+    if application_started?(app) do
+      _ = Application.stop(app)
+    end
+  end
+
+  defp application_started?(app) do
+    Enum.any?(Application.started_applications(), fn {started_app, _desc, _vsn} ->
+      started_app == app
+    end)
+  end
+
   # ---------------------------------------------------------------------------
   # Supervisor tree basics
   # ---------------------------------------------------------------------------
@@ -62,6 +74,24 @@ defmodule Ferricstore.ApplicationTest do
   end
 
   describe "graceful shutdown" do
+    test "stopping the application stops the Ra system" do
+      server_started? = application_started?(:ferricstore_server)
+      system = Ferricstore.Raft.Cluster.system_name()
+
+      try do
+        stop_app_if_started(:ferricstore_server)
+        assert :ok = Application.stop(:ferricstore)
+        assert :ra_system.fetch(system) == :undefined
+      after
+        {:ok, _} = Application.ensure_all_started(:ferricstore)
+        ShardHelpers.wait_shards_alive()
+
+        if server_started? do
+          {:ok, _} = Application.ensure_all_started(:ferricstore_server)
+        end
+      end
+    end
+
     test "wal rollover reports unconsumed WAL files instead of silently succeeding" do
       log =
         capture_log(fn ->

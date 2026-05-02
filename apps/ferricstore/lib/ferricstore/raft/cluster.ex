@@ -87,6 +87,34 @@ defmodule Ferricstore.Raft.Cluster do
   end
 
   @doc """
+  Stops the FerricStore ra system and clears ra's system registry entry.
+
+  The ra system is started before the FerricStore supervisor tree, so it is not
+  a child of `Ferricstore.Supervisor`. The OTP application stop callback must
+  call this explicitly after supervised shards/batchers have shut down.
+  """
+  @spec stop_system() :: :ok | {:error, term()}
+  def stop_system do
+    case :ra_system.stop(@ra_system) do
+      :ok ->
+        :ok
+
+      {:error, {:not_found, _}} ->
+        :ok
+
+      {:error, :not_found} ->
+        :ok
+
+      {:error, reason} = error ->
+        Logger.warning("Failed to stop ra system #{inspect(@ra_system)}: #{inspect(reason)}")
+        error
+    end
+  catch
+    :exit, {:noproc, _} ->
+      :ok
+  end
+
+  @doc """
   Starts a ra server that joins an existing Raft group as a follower.
 
   Unlike `start_shard_server/6` which may create a new single-node group,

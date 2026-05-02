@@ -304,6 +304,12 @@ defmodule Ferricstore.Application do
     state
   end
 
+  @impl true
+  def stop(_state) do
+    _ = Ferricstore.Raft.Cluster.stop_system()
+    :ok
+  end
+
   defp runtime_shutdown_config do
     try do
       ctx = FerricStore.Instance.get(:default)
