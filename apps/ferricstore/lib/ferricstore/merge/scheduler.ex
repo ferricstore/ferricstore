@@ -65,6 +65,8 @@ defmodule Ferricstore.Merge.Scheduler do
   @default_merge_cooldown_ms 60_000
   @default_small_file_threshold 10_485_760
   @default_merge_retry_interval_ms 5_000
+  @default_compaction_call_timeout_ms 300_000
+  @trigger_check_timeout_ms 300_000
 
   @type merge_mode :: :hot | :bulk | :age
 
@@ -78,7 +80,8 @@ defmodule Ferricstore.Merge.Scheduler do
           dead_bytes_threshold: non_neg_integer(),
           merge_cooldown_ms: non_neg_integer(),
           small_file_threshold: non_neg_integer(),
-          merge_retry_interval_ms: non_neg_integer()
+          merge_retry_interval_ms: non_neg_integer(),
+          compaction_call_timeout_ms: pos_integer() | :infinity
         }
 
   defstruct [
@@ -184,11 +187,11 @@ defmodule Ferricstore.Merge.Scheduler do
   """
   @spec trigger_check(non_neg_integer() | GenServer.server()) :: :ok
   def trigger_check(index_or_server) when is_integer(index_or_server) do
-    GenServer.call(scheduler_name(index_or_server), :trigger_check)
+    GenServer.call(scheduler_name(index_or_server), :trigger_check, @trigger_check_timeout_ms)
   end
 
   def trigger_check(server) do
-    GenServer.call(server, :trigger_check)
+    GenServer.call(server, :trigger_check, @trigger_check_timeout_ms)
   end
 
   @doc false
@@ -369,7 +372,7 @@ defmodule Ferricstore.Merge.Scheduler do
       with {:ok, file_ids} <- select_files_for_merge(state, shard_name),
            :ok <- check_disk_space(state, shard_name, file_ids),
            :ok <- write_manifest(state, file_ids),
-           {:ok, compaction_result} <- run_compaction(shard_name, file_ids) do
+           {:ok, compaction_result} <- run_compaction(state, shard_name, file_ids) do
         {:ok, compaction_result, file_ids}
       end
 
@@ -504,8 +507,8 @@ defmodule Ferricstore.Merge.Scheduler do
     })
   end
 
-  defp run_compaction(shard_name, file_ids) do
-    case safe_call(shard_name, {:run_compaction, file_ids}) do
+  defp run_compaction(state, shard_name, file_ids) do
+    case safe_call(shard_name, {:run_compaction, file_ids}, state.config.compaction_call_timeout_ms) do
       {:ok, result} -> {:ok, result}
       {:error, reason} -> {:error, {:compaction_failed, reason}}
     end
@@ -567,6 +570,12 @@ defmodule Ferricstore.Merge.Scheduler do
           overrides,
           :merge_retry_interval_ms,
           app_config(:merge_retry_interval_ms, @default_merge_retry_interval_ms)
+        ),
+      compaction_call_timeout_ms:
+        Map.get(
+          overrides,
+          :compaction_call_timeout_ms,
+          app_config(:compaction_call_timeout_ms, @default_compaction_call_timeout_ms)
         )
     }
   end
@@ -598,8 +607,8 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   # Safe GenServer.call that catches exits (shard might be restarting).
-  defp safe_call(name, msg) do
-    GenServer.call(name, msg)
+  defp safe_call(name, msg, timeout \\ 5_000) do
+    GenServer.call(name, msg, timeout)
   catch
     :exit, reason ->
       {:error, {:shard_unavailable, reason}}

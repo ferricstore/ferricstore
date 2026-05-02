@@ -10,9 +10,31 @@ defmodule Ferricstore.Merge.SchedulerTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Merge.Scheduler
+  alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
   @scheduler_path Path.expand("../../../lib/ferricstore/merge/scheduler.ex", __DIR__)
+
+  defmodule SlowShard do
+    use GenServer
+
+    def start(opts), do: GenServer.start(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
+
+    @impl true
+    def init(opts), do: {:ok, Map.new(opts)}
+
+    @impl true
+    def handle_call(:file_sizes, _from, state), do: {:reply, {:ok, [{0, 1024}, {1, 1024}]}, state}
+
+    def handle_call(:available_disk_space, _from, state), do: {:reply, {:ok, 1_000_000_000}, state}
+
+    def handle_call({:run_compaction, [0]}, _from, state) do
+      send(state.parent, :slow_compaction_started)
+      Process.sleep(state.sleep_ms)
+      send(state.parent, :slow_compaction_finished)
+      {:reply, {:ok, {1, 0, 128}}, state}
+    end
+  end
 
   setup do
     ShardHelpers.flush_all_keys()
@@ -158,6 +180,50 @@ defmodule Ferricstore.Merge.SchedulerTest do
       assert :ok = Scheduler.trigger_check(0)
       status = Scheduler.status(0)
       assert status.merging == false
+    end
+
+    test "run_compaction can exceed GenServer default call timeout" do
+      ctx = FerricStore.Instance.get(:default)
+      shard_name = Router.shard_name(ctx, 0)
+      real_shard = Process.whereis(shard_name)
+      data_dir = Path.join(System.tmp_dir!(), "scheduler_slow_compaction_#{System.unique_integer([:positive])}")
+      shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+      File.mkdir_p!(shard_dir)
+      File.write!(Path.join(shard_dir, "00000.log"), "old")
+      File.write!(Path.join(shard_dir, "00001.log"), "active")
+
+      Process.unregister(shard_name)
+      {:ok, fake_shard} = SlowShard.start(name: shard_name, parent: self(), sleep_ms: 5_200)
+
+      {:ok, pid} =
+        Scheduler.start_link(
+          shard_index: 0,
+          data_dir: data_dir,
+          merge_config: %{
+            mode: :hot,
+            min_files_for_merge: 2,
+            merge_cooldown_ms: 0,
+            compaction_call_timeout_ms: 7_000
+          },
+          name: :test_scheduler_slow_compaction
+        )
+
+      try do
+        assert :ok = Scheduler.trigger_check(pid)
+        assert_receive :slow_compaction_started
+        assert_receive :slow_compaction_finished
+
+        status = GenServer.call(pid, :status)
+        assert status.merge_count == 1
+        assert status.total_bytes_reclaimed == 128
+      after
+        if Process.alive?(pid), do: GenServer.stop(pid)
+        ref = Process.monitor(fake_shard)
+        Process.exit(fake_shard, :kill)
+        assert_receive {:DOWN, ^ref, :process, ^fake_shard, :killed}, 1_000
+        if is_pid(real_shard) and Process.alive?(real_shard), do: Process.register(real_shard, shard_name)
+        File.rm_rf!(data_dir)
+      end
     end
   end
 
