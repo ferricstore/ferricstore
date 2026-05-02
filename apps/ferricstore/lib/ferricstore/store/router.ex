@@ -2004,12 +2004,14 @@ defmodule Ferricstore.Store.Router do
     skip_promotion = :atomics.get(ctx.pressure_flags, 3) == 1
 
     if byte_size(value) <= ctx.hot_cache_max_value_size and not skip_promotion do
+      lfu = LFU.initial()
+
       try do
         :ets.select_replace(keydir, [
           {
             {key, nil, :"$1", :"$2", file_id, offset, :"$3"},
             [],
-            [{{key, value, :"$1", :"$2", file_id, offset, :"$3"}}]
+            [{{key, value, :"$1", lfu, file_id, offset, :"$3"}}]
           }
         ])
 

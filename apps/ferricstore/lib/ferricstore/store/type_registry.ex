@@ -86,15 +86,19 @@ defmodule Ferricstore.Store.TypeRegistry do
   """
   @spec get_type(binary(), map()) :: binary()
   def get_type(redis_key, store) do
-    # Check compound key type registry first (for hash/set/zset)
-    type_key = CompoundKey.type_key(redis_key)
+    if Ops.has_compound?(store) do
+      # Check compound key type registry first (for hash/set/zset)
+      type_key = CompoundKey.type_key(redis_key)
 
-    case Ops.compound_get(store, redis_key, type_key) do
-      nil ->
-        plain_string_type(redis_key, store)
+      case Ops.compound_get(store, redis_key, type_key) do
+        nil ->
+          plain_string_type(redis_key, store)
 
-      type_str ->
-        live_type_or_none(redis_key, type_str, store)
+        type_str ->
+          live_type_or_none(redis_key, type_str, store)
+      end
+    else
+      plain_string_type(redis_key, store)
     end
   end
 

@@ -294,11 +294,13 @@ defmodule Ferricstore.Store.Shard.ETS do
   end
 
   defp warm_matching_cold_entry(keydir, key, value, exp, fid, off, vsize) do
+    lfu = LFU.initial()
+
     :ets.select_replace(keydir, [
       {
         {key, nil, exp, :"$1", fid, off, vsize},
         [],
-        [{{key, value, exp, :"$1", fid, off, vsize}}]
+        [{{key, value, exp, lfu, fid, off, vsize}}]
       }
     ])
   rescue
