@@ -89,6 +89,7 @@ defmodule Ferricstore.Merge.Scheduler do
     merging: false,
     last_merge_at: nil,
     last_merge_completed_at: nil,
+    last_merge_completed_mono_at: nil,
     merge_count: 0,
     total_bytes_reclaimed: 0,
     # Tracks the current file count from the last rotation notification.
@@ -289,8 +290,8 @@ defmodule Ferricstore.Merge.Scheduler do
 
   defp should_merge?(state) do
     cooldown_ok =
-      state.last_merge_completed_at == nil or
-        System.system_time(:millisecond) - state.last_merge_completed_at >=
+      state.last_merge_completed_mono_at == nil or
+        System.monotonic_time(:millisecond) - state.last_merge_completed_mono_at >=
           state.config.merge_cooldown_ms
 
     has_trigger =
@@ -383,12 +384,14 @@ defmodule Ferricstore.Merge.Scheduler do
         Semaphore.release(state.shard_index, state.semaphore)
 
         now_ms = System.system_time(:millisecond)
+        now_mono = System.monotonic_time(:millisecond)
 
         %{
           state
           | merging: false,
             last_merge_at: now_ms,
             last_merge_completed_at: now_ms,
+            last_merge_completed_mono_at: now_mono,
             merge_count: state.merge_count + 1,
             total_bytes_reclaimed: state.total_bytes_reclaimed + reclaimed,
             fragmentation_candidates: []

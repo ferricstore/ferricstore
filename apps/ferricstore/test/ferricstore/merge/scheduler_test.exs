@@ -12,6 +12,8 @@ defmodule Ferricstore.Merge.SchedulerTest do
   alias Ferricstore.Merge.Scheduler
   alias Ferricstore.Test.ShardHelpers
 
+  @scheduler_path Path.expand("../../../lib/ferricstore/merge/scheduler.ex", __DIR__)
+
   setup do
     ShardHelpers.flush_all_keys()
     :ok
@@ -100,6 +102,15 @@ defmodule Ferricstore.Merge.SchedulerTest do
   # ---------------------------------------------------------------------------
 
   describe "merge decision" do
+    test "cooldown decisions use monotonic elapsed time" do
+      source = File.read!(@scheduler_path)
+      [_before, rest] = String.split(source, "defp should_merge?", parts: 2)
+      [body | _after] = String.split(rest, "\n  defp mode_allows_merge?", parts: 2)
+
+      assert body =~ "System.monotonic_time(:millisecond)"
+      refute body =~ "System.system_time(:millisecond)"
+    end
+
     test "trigger_check with sufficient files attempts merge" do
       # Set file count above threshold via notification
       Scheduler.notify_rotation(0, 5)

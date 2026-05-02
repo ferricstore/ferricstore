@@ -55,7 +55,11 @@ defmodule Ferricstore.Merge.FragmentationTest do
 
       # Set last_merge_completed_at so cooldown blocks merge
       :sys.replace_state(pid, fn state ->
-        %{state | last_merge_completed_at: System.system_time(:millisecond)}
+        %{
+          state
+          | last_merge_completed_at: System.system_time(:millisecond),
+            last_merge_completed_mono_at: System.monotonic_time(:millisecond)
+        }
       end)
 
       GenServer.cast(pid, {:fragmentation, [1, 2], 5})
@@ -123,7 +127,11 @@ defmodule Ferricstore.Merge.FragmentationTest do
 
       # Simulate a recently completed merge
       :sys.replace_state(pid, fn state ->
-        %{state | last_merge_completed_at: System.system_time(:millisecond)}
+        %{
+          state
+          | last_merge_completed_at: System.system_time(:millisecond),
+            last_merge_completed_mono_at: System.monotonic_time(:millisecond)
+        }
       end)
 
       # Send file rotation that would normally trigger merge
@@ -155,7 +163,11 @@ defmodule Ferricstore.Merge.FragmentationTest do
 
       # Simulate a merge that completed long enough ago
       :sys.replace_state(pid, fn state ->
-        %{state | last_merge_completed_at: System.system_time(:millisecond) - 100}
+        %{
+          state
+          | last_merge_completed_at: System.system_time(:millisecond) - 100,
+            last_merge_completed_mono_at: System.monotonic_time(:millisecond) - 100
+        }
       end)
 
       # Send file rotation
