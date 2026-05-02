@@ -1240,7 +1240,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
         assert nil == GenServer.call(pid1, {:get, "a"})
 
-        assert {:ok, {_written, _dropped, _reclaimed}} =
+        assert {:error, {:no_compactable_files, [1]}} =
                  GenServer.call(pid1, {:run_compaction, [1]})
 
         assert File.exists?(log1)

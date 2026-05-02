@@ -639,10 +639,11 @@ defmodule Ferricstore.Store.Shard do
     # v2 compaction: for each file_id, collect live key offsets from ETS,
     # copy them to a new file, then replace the old file.
     # Track statistics for the merge scheduler.
-    {total_written, total_dropped, total_reclaimed, compacted_file_ids, failures} =
-      Enum.reduce(file_ids, {0, 0, 0, [], []}, fn fid,
-                                                  {written, dropped, reclaimed, compacted,
-                                                   failures} ->
+    {total_written, total_dropped, total_reclaimed, compacted_file_ids, skipped_file_ids,
+     failures} =
+      Enum.reduce(file_ids, {0, 0, 0, [], [], []}, fn fid,
+                                                      {written, dropped, reclaimed, compacted,
+                                                       skipped, failures} ->
         source = file_path(sp, fid)
 
         live_entries =
@@ -692,7 +693,7 @@ defmodule Ferricstore.Store.Shard do
                 end
 
               {written + length(live_entries), dropped, reclaimed + max(old_size - new_size, 0),
-               [fid | compacted], failures}
+               [fid | compacted], skipped, failures}
 
             {:ok, results} ->
               Logger.error(
@@ -702,7 +703,7 @@ defmodule Ferricstore.Store.Shard do
               _ = Ferricstore.FS.rm(dest)
 
               failure = {fid, {:copy_result_mismatch, length(live_entries), length(results)}}
-              {written, dropped, reclaimed, compacted, [failure | failures]}
+              {written, dropped, reclaimed, compacted, skipped, [failure | failures]}
 
             {:error, reason} ->
               Logger.error(
@@ -710,7 +711,9 @@ defmodule Ferricstore.Store.Shard do
               )
 
               _ = Ferricstore.FS.rm(dest)
-              {written, dropped, reclaimed, compacted, [{fid, {:copy_failed, reason}} | failures]}
+
+              {written, dropped, reclaimed, compacted, skipped,
+               [{fid, {:copy_failed, reason}} | failures]}
           end
         else
           # Tombstones are not represented in ETS, but they can still be
@@ -724,15 +727,15 @@ defmodule Ferricstore.Store.Shard do
             end
 
           if fid == state.active_file_id do
-            {written, dropped, reclaimed, compacted, failures}
+            {written, dropped, reclaimed, compacted, skipped, failures}
           else
             if tombstone_file?(source) do
               remove_hint_for_file(sp, fid)
-              {written, dropped, reclaimed, compacted, failures}
+              {written, dropped, reclaimed, compacted, [fid | skipped], failures}
             else
               remove_hint_for_file(sp, fid)
               _ = Ferricstore.FS.rm(source)
-              {written, dropped, reclaimed + old_size, [fid | compacted], failures}
+              {written, dropped, reclaimed + old_size, [fid | compacted], skipped, failures}
             end
           end
         end
@@ -758,8 +761,15 @@ defmodule Ferricstore.Store.Shard do
 
     reply =
       case failures do
-        [] -> {:ok, {total_written, total_dropped, total_reclaimed}}
-        [_ | _] -> {:error, {:compaction_failed, Enum.reverse(failures)}}
+        [] ->
+          if compacted_file_ids == [] and skipped_file_ids != [] do
+            {:error, {:no_compactable_files, Enum.reverse(skipped_file_ids)}}
+          else
+            {:ok, {total_written, total_dropped, total_reclaimed}}
+          end
+
+        [_ | _] ->
+          {:error, {:compaction_failed, Enum.reverse(failures)}}
       end
 
     {:reply, reply, %{state | file_stats: new_file_stats}}
