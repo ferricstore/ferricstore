@@ -71,8 +71,8 @@ defmodule Ferricstore.Raft.Batcher do
     Commands accumulate in a dedicated `{prefix, :async_origin}` slot and
     flush as one `ra.pipeline_command({:batch, [{:async, cmd}, ...]})` for
     replication. The state machine's `{:async, inner}` clause origin-skips
-    on the node that already has the ETS entry. No callers to reply to —
-    Router already returned `:ok` to its caller.
+    on the node that already has the ETS entry. Ordered callers are replied
+    after the pipeline submission; fire-and-forget callers have no reply.
 
   - `Batcher.write/2` on an async namespace (legacy callers) is the blocking
     entry; the caller is replied `:ok` immediately when the slot is flushed,
@@ -154,7 +154,7 @@ defmodule Ferricstore.Raft.Batcher do
   modes (which can happen if config changes mid-flight) are batched
   separately.
   """
-  @type slot_key :: {binary(), :quorum | :async}
+  @type slot_key :: {binary(), :quorum | :async | :async_origin}
 
   @typedoc """
   A slot holds the accumulated commands and callers for a single namespace
@@ -341,9 +341,10 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc """
-  Enqueues an async-durability write and waits until the Batcher has accepted
-  it into its local slot. The Raft submission is still asynchronous/batched,
-  but callers can distinguish accepted writes from local Batcher backpressure.
+  Enqueues an async-durability write and waits until the Batcher has submitted
+  its local slot to Raft. State-machine application is still asynchronous, but
+  callers do not observe success while the command only lives in a local timer
+  slot.
   """
   @spec async_submit_ordered(non_neg_integer(), command()) :: :ok | {:error, :overloaded}
   def async_submit_ordered(shard_index, inner_command) do
@@ -351,8 +352,21 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc """
-  Enqueues multiple async-durability writes and waits until the Batcher has
-  accepted the whole batch into local slots.
+  Enqueues an async-durability write and returns after the local Batcher has
+  accepted it into a slot.
+
+  This is intentionally weaker than `async_submit_ordered/2`: it preserves the
+  low-latency async RMW path where waiting for `ra.pipeline_command/4` would
+  dominate command latency. Use it only for commands whose caller explicitly
+  accepts async durability.
+  """
+  @spec async_enqueue_ordered(non_neg_integer(), command()) :: :ok | {:error, :overloaded}
+  def async_enqueue_ordered(shard_index, inner_command) do
+    GenServer.call(batcher_name(shard_index), {:async_enqueue_ordered, inner_command}, 5_000)
+  end
+
+  @doc """
+  Submits multiple async-durability writes as one Raft pipeline batch.
   """
   @spec async_submit_batch_ordered(non_neg_integer(), [command()]) :: :ok | {:error, :overloaded}
   def async_submit_batch_ordered(_shard_index, []), do: :ok
@@ -525,7 +539,16 @@ defmodule Ferricstore.Raft.Batcher do
     enqueue_write(command, remote_origin_from(origin_node, from), state)
   end
 
-  def handle_call({:async_submit_ordered, command}, _from, state) do
+  def handle_call({:async_submit_ordered, command}, from, state) do
+    if pending_full?(state) do
+      emit_async_submit_overloaded(state)
+      {:reply, {:error, :overloaded}, state}
+    else
+      enqueue_async_submit_under_capacity(command, state, from)
+    end
+  end
+
+  def handle_call({:async_enqueue_ordered, command}, _from, state) do
     if pending_full?(state) do
       emit_async_submit_overloaded(state)
       {:reply, {:error, :overloaded}, state}
@@ -535,17 +558,12 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
-  def handle_call({:async_submit_batch_ordered, commands}, _from, state) do
+  def handle_call({:async_submit_batch_ordered, commands}, from, state) do
     if pending_full?(state) do
       emit_async_submit_overloaded(state)
       {:reply, {:error, :overloaded}, state}
     else
-      {:noreply, new_state} =
-        Enum.reduce(commands, {:noreply, state}, fn cmd, {:noreply, st} ->
-          enqueue_async_submit_under_capacity(cmd, st)
-        end)
-
-      {:reply, :ok, new_state}
+      {:noreply, submit_async_origin(state, commands, [from])}
     end
   end
 
@@ -1127,17 +1145,23 @@ defmodule Ferricstore.Raft.Batcher do
 
     # Start timer on first write to this slot
     updated_slot =
-      if updated_slot.timer_ref == nil do
-        ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
-        %{updated_slot | timer_ref: ref}
-      else
-        updated_slot
+      cond do
+        from != nil ->
+          cancel_timer(updated_slot.timer_ref)
+          %{updated_slot | timer_ref: nil}
+
+        updated_slot.timer_ref == nil ->
+          ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
+          %{updated_slot | timer_ref: ref}
+
+        true ->
+          updated_slot
       end
 
     new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
 
     # Flush immediately if slot is full (O(1) count check instead of O(n) length)
-    if updated_slot.count >= state.max_batch_size do
+    if from != nil or updated_slot.count >= state.max_batch_size do
       do_flush_slot(new_state, slot_key)
     else
       {:noreply, new_state}
@@ -1183,7 +1207,7 @@ defmodule Ferricstore.Raft.Batcher do
               # Commands came via Batcher.async_submit (Router wrote locally).
               # Wrap each command as {:async, inner} so state machine can
               # origin-skip on the node that already has the ETS entry.
-              submit_async_origin(state, batch)
+              submit_async_origin(state, batch, froms)
 
             :async ->
               # Commands came via Batcher.write on an :async namespace
@@ -1250,7 +1274,8 @@ defmodule Ferricstore.Raft.Batcher do
   # Router.async_write_*). Router has already persisted locally (ETS + Bitcask
   # for big values) before calling async_submit. Commands are wrapped as
   # `{:async, inner}` so the state machine can origin-skip on the node that
-  # already has the ETS entry. No callers to reply to — Router already got :ok.
+  # already has the ETS entry. Ordered callers are replied after pipeline
+  # submission; fire-and-forget callers have no reply.
   #
   # Tracks the correlation in `pending` with `:async_no_reply` so that
   # Batcher.flush waiters can observe when all in-flight async commands have
@@ -1258,7 +1283,7 @@ defmodule Ferricstore.Raft.Batcher do
   # wrapped batch + retry_count + submission timestamp so that the
   # :rejected handler can re-submit to a hinted leader and the periodic
   # sweep can drop stalled entries.
-  defp submit_async_origin(state, batch) do
+  defp submit_async_origin(state, batch, submit_froms) do
     :telemetry.execute(
       [:ferricstore, :batcher, :async_flush],
       %{batch_size: length(batch)},
@@ -1273,7 +1298,7 @@ defmodule Ferricstore.Raft.Batcher do
     # follower as the origin and skips. Origin tagging is deterministic.
     origin = node()
     wrapped = Enum.map(batch, fn cmd -> {:async, origin, cmd} end)
-    submit_async_with_retry(state, wrapped, state.shard_id, 0)
+    submit_async_with_retry(state, wrapped, state.shard_id, 0, submit_froms)
   end
 
   # Flush path for commands accumulated via Batcher.write (blocking) on an
@@ -1299,15 +1324,19 @@ defmodule Ferricstore.Raft.Batcher do
   # track the correlation so :rejected can re-submit and :applied can clean
   # up. `retry_count` is the number of retries already attempted; starts
   # at 0 for the first submission.
-  defp submit_async_with_retry(state, wrapped_batch, target, retry_count) do
+  defp submit_async_with_retry(state, wrapped_batch, target, retry_count, submit_froms \\ []) do
     corr = make_ref()
     serialized = CommandClock.to_ttb({:batch, wrapped_batch})
     submit_result = pipeline_command(target, serialized, corr, :normal)
 
     if pipeline_submit_status(submit_result) == :ok do
+      reply_all_froms(submit_froms, :ok)
+
       entry = {[], :async_no_reply, wrapped_batch, retry_count, System.monotonic_time()}
       %{state | pending: Map.put(state.pending, corr, entry)}
     else
+      reply_all_froms(submit_froms, normalize_pipeline_error(submit_result))
+
       :telemetry.execute(
         [:ferricstore, :batcher, :async_dropped],
         %{batch_size: length(wrapped_batch)},
@@ -1404,8 +1433,7 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
-  # Enqueue an async_submit cast (from Router.async_write_*). No `from` to
-  # track — Router already returned :ok to its caller.
+  # Enqueue an async_submit cast. No `from` to track for fire-and-forget calls.
   defp enqueue_async_submit(command, state) do
     if pending_full?(state) do
       emit_async_submit_overloaded(state)
@@ -1427,7 +1455,7 @@ defmodule Ferricstore.Raft.Batcher do
     )
   end
 
-  defp enqueue_async_submit_under_capacity(command, state) do
+  defp enqueue_async_submit_under_capacity(command, state, from \\ nil) do
     prefix = extract_prefix(command)
     {{window_ms, _durability}, state} = lookup_ns_config(prefix, state)
     # Dedicated slot: commands here will be wrapped as {:async, inner} during
@@ -1444,8 +1472,7 @@ defmodule Ferricstore.Raft.Batcher do
     updated_slot = %{
       slot
       | cmds: [command | slot.cmds],
-        # No froms for async_submit — Router already replied.
-        froms: slot.froms,
+        froms: maybe_add_async_submit_from(slot.froms, from),
         window_ms: window_ms,
         count: Map.get(slot, :count, 0) + 1
     }
@@ -1466,6 +1493,9 @@ defmodule Ferricstore.Raft.Batcher do
       {:noreply, new_state}
     end
   end
+
+  defp maybe_add_async_submit_from(froms, nil), do: froms
+  defp maybe_add_async_submit_from(froms, from), do: [from | froms]
 
   defp pending_full?(state), do: map_size(state.pending) >= @max_pending
 

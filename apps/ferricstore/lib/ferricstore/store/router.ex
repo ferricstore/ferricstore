@@ -783,7 +783,7 @@ defmodule Ferricstore.Store.Router do
         {:origin_checked, key, raft_cmd, origin_check_value(before_value), before_expire_at_ms,
          origin_check_value(value), expire_at_ms}
 
-      with :ok <- async_submit_to_raft(idx, checked_cmd),
+      with :ok <- async_enqueue_to_raft(idx, checked_cmd),
            :ok <- install_rmw_value(ctx, idx, key, value, expire_at_ms) do
         success
       end
@@ -1351,10 +1351,21 @@ defmodule Ferricstore.Store.Router do
 
   # Enqueue an async write in the shard's Batcher. The Batcher still batches
   # many async commands into one Raft pipeline submission, but Router waits
-  # until the local Batcher accepts this command so backpressure is returned
-  # instead of exposing a local-only write as successful.
+  # until the slot is submitted to Raft so success is not based only on a
+  # local timer slot.
   defp async_submit_to_raft(idx, command) do
     case Ferricstore.Raft.Batcher.async_submit_ordered(idx, command) do
+      :ok -> :ok
+      {:error, :overloaded} -> {:error, "ERR async replication overloaded"}
+      {:error, reason} -> {:error, "ERR async replication failed: #{inspect(reason)}"}
+    end
+  end
+
+  # Latency-critical RMW commands use the weaker enqueue boundary by design:
+  # the command is locally visible immediately and replication is async. Ra
+  # apply still repairs pending Bitcask writes when it reaches the origin.
+  defp async_enqueue_to_raft(idx, command) do
+    case Ferricstore.Raft.Batcher.async_enqueue_ordered(idx, command) do
       :ok -> :ok
       {:error, :overloaded} -> {:error, "ERR async replication overloaded"}
       {:error, reason} -> {:error, "ERR async replication failed: #{inspect(reason)}"}
