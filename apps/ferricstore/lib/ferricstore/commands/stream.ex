@@ -472,40 +472,20 @@ defmodule Ferricstore.Commands.Stream do
         []
 
       [{^key, _len, _first, _last, _ms, _seq}] ->
-        # Scan all entries for this stream. In a production system this would
-        # use a Bitcask range scan or an ordered index. For v1, we retrieve
-        # all keys with the stream prefix and filter.
-        prefix = "X:#{key}" <> @sep
-
         selected_entries =
           store
-          |> stream_keys_for(prefix)
-          |> Enum.map(fn compound_key ->
-            id_str = String.replace_prefix(compound_key, prefix, "")
-            {id_str, parse_id!(id_str)}
-          end)
-          |> Enum.filter(fn {_id_str, id} ->
+          |> stream_entries_for(key)
+          |> Enum.map(fn {id_str, raw} -> {id_str, parse_id!(id_str), raw} end)
+          |> Enum.filter(fn {_id_str, id, _raw} ->
             id_in_range?(id, range_start, range_end)
           end)
-          |> Enum.sort_by(fn {_id_str, id} -> id end)
+          |> Enum.sort_by(fn {_id_str, id, _raw} -> id end)
           |> maybe_take(count)
 
-        entry_keys = Enum.map(selected_entries, fn {id_str, _id} -> prefix <> id_str end)
-
-        all_entries =
-          selected_entries
-          |> Enum.zip(Ops.batch_get(store, entry_keys))
-          |> Enum.map(fn
-            {{id_str, _id}, raw} when is_binary(raw) ->
-              fields = :erlang.binary_to_term(raw)
-              [id_str | fields]
-
-            {_entry, _missing} ->
-              nil
-          end)
-          |> Enum.reject(&is_nil/1)
-
-        all_entries
+        Enum.map(selected_entries, fn {id_str, _id, raw} ->
+          fields = :erlang.binary_to_term(raw)
+          [id_str | fields]
+        end)
     end
   end
 
@@ -579,8 +559,7 @@ defmodule Ferricstore.Commands.Stream do
 
     all_ids =
       store
-      |> stream_keys_for(prefix)
-      |> Enum.map(fn ck -> String.replace_prefix(ck, prefix, "") end)
+      |> stream_ids_for(key)
       |> Enum.sort_by(&parse_id!/1)
 
     current_len = length(all_ids)
@@ -616,8 +595,7 @@ defmodule Ferricstore.Commands.Stream do
   defp do_apply_trim_minid(key, prefix, min_id, store) do
     all_ids =
       store
-      |> stream_keys_for(prefix)
-      |> Enum.map(fn ck -> String.replace_prefix(ck, prefix, "") end)
+      |> stream_ids_for(key)
       |> Enum.sort_by(&parse_id!/1)
 
     {to_remove, _keep} =
@@ -683,8 +661,7 @@ defmodule Ferricstore.Commands.Stream do
       # Rebuild metadata from remaining entries.
       remaining_ids =
         store
-        |> stream_keys_for(prefix)
-        |> Enum.map(fn ck -> String.replace_prefix(ck, prefix, "") end)
+        |> stream_ids_for(key)
         |> Enum.sort_by(&parse_id!/1)
 
       if remaining_ids == [] do
@@ -1053,17 +1030,25 @@ defmodule Ferricstore.Commands.Stream do
     "X:#{stream_key}" <> @sep <> id_str
   end
 
-  defp stream_keys_for(store, prefix) do
-    Ops.keys(store)
-    |> Enum.filter(&String.starts_with?(&1, prefix))
+  defp stream_entries_for(store, stream_key) do
+    Ops.compound_scan(store, stream_key, stream_entry_prefix(stream_key))
+  end
+
+  defp stream_ids_for(store, stream_key) do
+    store
+    |> stream_entries_for(stream_key)
+    |> Enum.map(fn {id_str, _raw} -> id_str end)
   end
 
   # Count compound entries with prefix `X:<stream_key>\0` — used by XLEN as
   # the fallback path on nodes where the local `@meta_table` doesn't have
   # the stream registered (notably Raft followers).
   defp count_stream_entries(store, stream_key) do
-    prefix = "X:#{stream_key}" <> @sep
-    stream_keys_for(store, prefix) |> length()
+    Ops.compound_count(store, stream_key, stream_entry_prefix(stream_key))
+  end
+
+  defp stream_entry_prefix(stream_key) do
+    "X:#{stream_key}" <> @sep
   end
 
   # ---------------------------------------------------------------------------

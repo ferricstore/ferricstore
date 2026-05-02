@@ -248,7 +248,7 @@ defmodule Ferricstore.Commands.StreamTest do
       assert Enum.map(entries, &hd/1) == ["1-0", "2-0", "3-0"]
     end
 
-    test "XRANGE uses batch_get when the store provides it" do
+    test "XRANGE uses stream prefix scan without enumerating unrelated keys" do
       parent = self()
       {:ok, pid} = Agent.start_link(fn -> %{} end)
       key = ustream()
@@ -258,13 +258,22 @@ defmodule Ferricstore.Commands.StreamTest do
           Agent.update(pid, &Map.put(&1, entry_key, value))
           :ok
         end,
-        keys: fn -> Agent.get(pid, &Map.keys/1) end,
-        batch_get: fn keys ->
-          send(parent, {:batch_get, keys})
-          Agent.get(pid, fn state -> Enum.map(keys, &Map.get(state, &1)) end)
+        keys: fn ->
+          flunk("XRANGE should use compound_scan, not a full keyspace scan")
+        end,
+        compound_scan: fn ^key, prefix ->
+          send(parent, {:compound_scan, key, prefix})
+
+          Agent.get(pid, fn state ->
+            state
+            |> Enum.filter(fn {entry_key, _value} -> String.starts_with?(entry_key, prefix) end)
+            |> Enum.map(fn {entry_key, value} ->
+              {String.replace_prefix(entry_key, prefix, ""), value}
+            end)
+          end)
         end,
         get: fn entry_key ->
-          flunk("XRANGE should use batch_get, got per-entry GET for #{inspect(entry_key)}")
+          flunk("XRANGE should use compound_scan, got per-entry GET for #{inspect(entry_key)}")
         end
       }
 
@@ -274,7 +283,39 @@ defmodule Ferricstore.Commands.StreamTest do
       assert [["1-0", "f", "v1"], ["2-0", "f", "v2"]] ==
                Stream.handle("XRANGE", [key, "-", "+"], store)
 
-      assert_received {:batch_get, [_first, _second]}
+      assert_received {:compound_scan, ^key, "X:" <> _}
+    end
+
+    test "XLEN fallback counts by stream prefix without enumerating unrelated keys" do
+      parent = self()
+      {:ok, pid} = Agent.start_link(fn -> %{} end)
+      key = ustream()
+
+      store = %{
+        put: fn entry_key, value, _expire_at_ms ->
+          Agent.update(pid, &Map.put(&1, entry_key, value))
+          :ok
+        end,
+        keys: fn ->
+          flunk("XLEN fallback should use compound_count, not a full keyspace scan")
+        end,
+        compound_count: fn ^key, prefix ->
+          send(parent, {:compound_count, key, prefix})
+
+          Agent.get(pid, fn state ->
+            Enum.count(state, fn {entry_key, _value} ->
+              String.starts_with?(entry_key, prefix)
+            end)
+          end)
+        end
+      }
+
+      assert "1-0" == Stream.handle("XADD", [key, "1-0", "f", "v1"], store)
+      assert "2-0" == Stream.handle("XADD", [key, "2-0", "f", "v2"], store)
+      :ets.delete(Ferricstore.Stream.Meta, key)
+
+      assert 2 == Stream.handle("XLEN", [key], store)
+      assert_received {:compound_count, ^key, "X:" <> _}
     end
 
     test "XRANGE on nonexistent stream returns empty list" do
