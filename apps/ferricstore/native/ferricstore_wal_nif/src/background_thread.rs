@@ -294,7 +294,14 @@ fn drain_to_kernel_writer<W: Write>(
     }
 
     let bytes = taken.logical_len as u64;
-    write_all_retry(writer, taken.as_logical_slice())?;
+    if let Err(e) = write_all_retry(writer, taken.as_logical_slice()) {
+        let mut buf = buffer
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "buffer mutex poisoned"))?;
+        buf.prepend(taken.as_logical_slice());
+        return Err(e);
+    }
+
     file_size.fetch_add(bytes, Ordering::Release);
     Ok(true)
 }
@@ -467,6 +474,43 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(file_size.load(Ordering::Acquire), WAL_HEADER_SIZE);
+    }
+
+    #[test]
+    fn drain_to_kernel_restores_failed_bytes_before_concurrent_writes() {
+        struct AppendThenFail {
+            buffer: Arc<Mutex<AlignedBuffer>>,
+        }
+
+        impl Write for AppendThenFail {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                self.buffer.lock().unwrap().extend(b"new");
+                Err(io::Error::new(io::ErrorKind::Other, "forced write failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
+        {
+            let mut guard = buffer.lock().unwrap();
+            guard.extend(b"entry");
+        }
+
+        let file_size = AtomicU64::new(WAL_HEADER_SIZE);
+        let mut writer = AppendThenFail {
+            buffer: Arc::clone(&buffer),
+        };
+
+        let result = drain_to_kernel_writer(&mut writer, &buffer, &file_size);
+
+        assert!(result.is_err());
+        assert_eq!(file_size.load(Ordering::Acquire), WAL_HEADER_SIZE);
+
+        let restored = buffer.lock().unwrap().take();
+        assert_eq!(restored.as_logical_slice(), b"entrynew");
     }
 
     #[test]

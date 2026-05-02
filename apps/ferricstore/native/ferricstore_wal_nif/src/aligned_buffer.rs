@@ -55,6 +55,29 @@ impl AlignedBuffer {
         self.len += data.len();
     }
 
+    /// Prepend bytes before the current buffer contents.
+    ///
+    /// Used when a background WAL drain fails after taking bytes out of the
+    /// shared buffer. New writes may have arrived while the kernel write was in
+    /// flight, so the failed bytes must be restored before them to preserve WAL
+    /// order on retry.
+    pub fn prepend(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+
+        let required = self.len + data.len();
+        if required > self.capacity {
+            self.grow(required);
+        }
+
+        unsafe {
+            ptr::copy(self.ptr, self.ptr.add(data.len()), self.len);
+            ptr::copy_nonoverlapping(data.as_ptr(), self.ptr, data.len());
+        }
+        self.len = required;
+    }
+
     /// Take ownership of the buffer contents, replacing with a fresh empty buffer.
     /// Returns the data pointer, logical length, and padded length (for O_DIRECT).
     /// Caller is responsible for freeing the returned pointer via `free_aligned`.
@@ -226,6 +249,17 @@ mod tests {
         buf.extend(b"hello ");
         buf.extend(b"world");
         assert_eq!(buf.len(), 11);
+    }
+
+    #[test]
+    fn test_prepend_preserves_existing_order() {
+        let mut buf = AlignedBuffer::new();
+        buf.extend(b"new");
+        buf.prepend(b"entry");
+
+        let taken = buf.take();
+
+        assert_eq!(taken.as_logical_slice(), b"entrynew");
     }
 
     #[test]
