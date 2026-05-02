@@ -109,24 +109,22 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   def handle("CF.EXISTS", [key, element], store) do
-    with :ok <- ProbType.check_expected(key, :cuckoo, store) do
-      path = prob_path(store, key, "cuckoo")
+    path = prob_path(store, key, "cuckoo")
 
-      case await_nif(fn proxy, corr_id ->
-             NIF.cuckoo_file_exists_async(proxy, corr_id, path, element)
-           end) do
-        {:ok, result} ->
-          result
+    case await_nif(fn proxy, corr_id ->
+           NIF.cuckoo_file_exists_async(proxy, corr_id, path, element)
+         end) do
+      {:ok, result} ->
+        result
 
-        {:error, "enoent"} ->
-          0
+      {:error, "enoent"} ->
+        missing_or_wrongtype(key, store, 0)
 
-        {:error, :timeout} ->
-          {:error, "ERR timeout"}
+      {:error, :timeout} ->
+        {:error, "ERR timeout"}
 
-        {:error, reason} ->
-          {:error, "ERR cuckoo exists failed: #{reason}"}
-      end
+      {:error, reason} ->
+        {:error, "ERR cuckoo exists failed: #{reason}"}
     end
   end
 
@@ -138,24 +136,22 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   def handle("CF.MEXISTS", [key | elements], store) when elements != [] do
-    with :ok <- ProbType.check_expected(key, :cuckoo, store) do
-      path = prob_path(store, key, "cuckoo")
+    path = prob_path(store, key, "cuckoo")
 
-      case await_nif(fn proxy, corr_id ->
-             NIF.cuckoo_file_mexists_async(proxy, corr_id, path, elements)
-           end) do
-        {:ok, results} ->
-          results
+    case await_nif(fn proxy, corr_id ->
+           NIF.cuckoo_file_mexists_async(proxy, corr_id, path, elements)
+         end) do
+      {:ok, results} ->
+        results
 
-        {:error, "enoent"} ->
-          List.duplicate(0, length(elements))
+      {:error, "enoent"} ->
+        missing_or_wrongtype(key, store, List.duplicate(0, length(elements)))
 
-        {:error, :timeout} ->
-          {:error, "ERR timeout"}
+      {:error, :timeout} ->
+        {:error, "ERR timeout"}
 
-        {:error, reason} ->
-          {:error, "ERR cuckoo mexists failed: #{reason}"}
-      end
+      {:error, reason} ->
+        {:error, "ERR cuckoo mexists failed: #{reason}"}
     end
   end
 
@@ -167,24 +163,22 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   def handle("CF.COUNT", [key, element], store) do
-    with :ok <- ProbType.check_expected(key, :cuckoo, store) do
-      path = prob_path(store, key, "cuckoo")
+    path = prob_path(store, key, "cuckoo")
 
-      case await_nif(fn proxy, corr_id ->
-             NIF.cuckoo_file_count_async(proxy, corr_id, path, element)
-           end) do
-        {:ok, count} ->
-          count
+    case await_nif(fn proxy, corr_id ->
+           NIF.cuckoo_file_count_async(proxy, corr_id, path, element)
+         end) do
+      {:ok, count} ->
+        count
 
-        {:error, "enoent"} ->
-          0
+      {:error, "enoent"} ->
+        missing_or_wrongtype(key, store, 0)
 
-        {:error, :timeout} ->
-          {:error, "ERR timeout"}
+      {:error, :timeout} ->
+        {:error, "ERR timeout"}
 
-        {:error, reason} ->
-          {:error, "ERR cuckoo count failed: #{reason}"}
-      end
+      {:error, reason} ->
+        {:error, "ERR cuckoo count failed: #{reason}"}
     end
   end
 
@@ -196,45 +190,43 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   def handle("CF.INFO", [key], store) do
-    with :ok <- ProbType.check_expected(key, :cuckoo, store) do
-      path = prob_path(store, key, "cuckoo")
+    path = prob_path(store, key, "cuckoo")
 
-      case await_nif(fn proxy, corr_id ->
-             NIF.cuckoo_file_info_async(proxy, corr_id, path)
-           end) do
-        {:ok,
-         {num_buckets, bucket_size, fingerprint_size, num_items, num_deletes, total_slots,
-          max_kicks}} ->
-          [
-            "Size",
-            total_slots,
-            "Number of buckets",
-            num_buckets,
-            "Number of filters",
-            1,
-            "Number of items inserted",
-            num_items,
-            "Number of items deleted",
-            num_deletes,
-            "Bucket size",
-            bucket_size,
-            "Fingerprint size",
-            fingerprint_size,
-            "Max iterations",
-            max_kicks,
-            "Expansion rate",
-            0
-          ]
+    case await_nif(fn proxy, corr_id ->
+           NIF.cuckoo_file_info_async(proxy, corr_id, path)
+         end) do
+      {:ok,
+       {num_buckets, bucket_size, fingerprint_size, num_items, num_deletes, total_slots,
+        max_kicks}} ->
+        [
+          "Size",
+          total_slots,
+          "Number of buckets",
+          num_buckets,
+          "Number of filters",
+          1,
+          "Number of items inserted",
+          num_items,
+          "Number of items deleted",
+          num_deletes,
+          "Bucket size",
+          bucket_size,
+          "Fingerprint size",
+          fingerprint_size,
+          "Max iterations",
+          max_kicks,
+          "Expansion rate",
+          0
+        ]
 
-        {:error, "enoent"} ->
-          {:error, "ERR not found"}
+      {:error, "enoent"} ->
+        missing_or_wrongtype(key, store, {:error, "ERR not found"})
 
-        {:error, :timeout} ->
-          {:error, "ERR timeout"}
+      {:error, :timeout} ->
+        {:error, "ERR timeout"}
 
-        {:error, reason} ->
-          {:error, "ERR cuckoo info failed: #{reason}"}
-      end
+      {:error, reason} ->
+        {:error, "ERR cuckoo info failed: #{reason}"}
     end
   end
 
@@ -257,6 +249,13 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   defp await_nif(submit_fun), do: Async.await(submit_fun, @prob_read_timeout_ms)
+
+  defp missing_or_wrongtype(key, store, missing_result) do
+    case ProbType.check_expected(key, :cuckoo, store) do
+      :ok -> missing_result
+      {:error, _} = error -> error
+    end
+  end
 
   defp prob_path(store, key, ext) do
     safe = Base.url_encode64(key, padding: false)

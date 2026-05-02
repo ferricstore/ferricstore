@@ -68,17 +68,22 @@ defmodule Ferricstore.Commands.CMS do
 
   # CMS.QUERY — local stateless pread (async)
   def handle("CMS.QUERY", [key | elements], store) when elements != [] do
-    with :ok <- ProbType.check_expected(key, :cms, store) do
-      path = prob_path(store, key, "cms")
+    path = prob_path(store, key, "cms")
 
-      case await_nif(fn proxy, corr_id ->
-             NIF.cms_file_query_async(proxy, corr_id, path, elements)
-           end) do
-        {:ok, counts} -> counts
-        {:error, "enoent"} -> {:error, "ERR CMS: key does not exist"}
-        {:error, :timeout} -> {:error, "ERR timeout"}
-        {:error, reason} -> {:error, "ERR CMS query failed: #{reason}"}
-      end
+    case await_nif(fn proxy, corr_id ->
+           NIF.cms_file_query_async(proxy, corr_id, path, elements)
+         end) do
+      {:ok, counts} ->
+        counts
+
+      {:error, "enoent"} ->
+        missing_or_wrongtype(key, store, {:error, "ERR CMS: key does not exist"})
+
+      {:error, :timeout} ->
+        {:error, "ERR timeout"}
+
+      {:error, reason} ->
+        {:error, "ERR CMS query failed: #{reason}"}
     end
   end
 
@@ -104,24 +109,22 @@ defmodule Ferricstore.Commands.CMS do
 
   # CMS.INFO — local stateless pread (async)
   def handle("CMS.INFO", [key], store) do
-    with :ok <- ProbType.check_expected(key, :cms, store) do
-      path = prob_path(store, key, "cms")
+    path = prob_path(store, key, "cms")
 
-      case await_nif(fn proxy, corr_id ->
-             NIF.cms_file_info_async(proxy, corr_id, path)
-           end) do
-        {:ok, {width, depth, count}} ->
-          ["width", width, "depth", depth, "count", count]
+    case await_nif(fn proxy, corr_id ->
+           NIF.cms_file_info_async(proxy, corr_id, path)
+         end) do
+      {:ok, {width, depth, count}} ->
+        ["width", width, "depth", depth, "count", count]
 
-        {:error, "enoent"} ->
-          {:error, "ERR CMS: key does not exist"}
+      {:error, "enoent"} ->
+        missing_or_wrongtype(key, store, {:error, "ERR CMS: key does not exist"})
 
-        {:error, :timeout} ->
-          {:error, "ERR timeout"}
+      {:error, :timeout} ->
+        {:error, "ERR timeout"}
 
-        {:error, reason} ->
-          {:error, "ERR CMS info failed: #{reason}"}
-      end
+      {:error, reason} ->
+        {:error, "ERR CMS info failed: #{reason}"}
     end
   end
 
@@ -144,6 +147,13 @@ defmodule Ferricstore.Commands.CMS do
   # ---------------------------------------------------------------------------
 
   defp await_nif(submit_fun), do: Async.await(submit_fun, @prob_read_timeout_ms)
+
+  defp missing_or_wrongtype(key, store, missing_result) do
+    case ProbType.check_expected(key, :cms, store) do
+      :ok -> missing_result
+      {:error, _} = error -> error
+    end
+  end
 
   defp prob_path(store, key, ext) do
     safe = Base.url_encode64(key, padding: false)

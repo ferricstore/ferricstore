@@ -87,24 +87,22 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   def handle("BF.EXISTS", [key, element], store) do
-    with :ok <- ProbType.check_expected(key, :bloom, store) do
-      path = prob_path(store, key, "bloom")
+    path = prob_path(store, key, "bloom")
 
-      case await_nif(fn proxy, corr_id ->
-             NIF.bloom_file_exists_async(proxy, corr_id, path, element)
-           end) do
-        {:ok, result} ->
-          result
+    case await_nif(fn proxy, corr_id ->
+           NIF.bloom_file_exists_async(proxy, corr_id, path, element)
+         end) do
+      {:ok, result} ->
+        result
 
-        {:error, "enoent"} ->
-          0
+      {:error, "enoent"} ->
+        missing_or_wrongtype(key, store, 0)
 
-        {:error, :timeout} ->
-          {:error, "ERR timeout"}
+      {:error, :timeout} ->
+        {:error, "ERR timeout"}
 
-        {:error, reason} ->
-          {:error, "ERR bloom exists failed: #{reason}"}
-      end
+      {:error, reason} ->
+        {:error, "ERR bloom exists failed: #{reason}"}
     end
   end
 
@@ -117,24 +115,22 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   def handle("BF.MEXISTS", [key | elements], store) when elements != [] do
-    with :ok <- ProbType.check_expected(key, :bloom, store) do
-      path = prob_path(store, key, "bloom")
+    path = prob_path(store, key, "bloom")
 
-      case await_nif(fn proxy, corr_id ->
-             NIF.bloom_file_mexists_async(proxy, corr_id, path, elements)
-           end) do
-        {:ok, results} ->
-          results
+    case await_nif(fn proxy, corr_id ->
+           NIF.bloom_file_mexists_async(proxy, corr_id, path, elements)
+         end) do
+      {:ok, results} ->
+        results
 
-        {:error, "enoent"} ->
-          List.duplicate(0, length(elements))
+      {:error, "enoent"} ->
+        missing_or_wrongtype(key, store, List.duplicate(0, length(elements)))
 
-        {:error, :timeout} ->
-          {:error, "ERR timeout"}
+      {:error, :timeout} ->
+        {:error, "ERR timeout"}
 
-        {:error, reason} ->
-          {:error, "ERR bloom mexists failed: #{reason}"}
-      end
+      {:error, reason} ->
+        {:error, "ERR bloom mexists failed: #{reason}"}
     end
   end
 
@@ -147,24 +143,22 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   def handle("BF.CARD", [key], store) do
-    with :ok <- ProbType.check_expected(key, :bloom, store) do
-      path = prob_path(store, key, "bloom")
+    path = prob_path(store, key, "bloom")
 
-      case await_nif(fn proxy, corr_id ->
-             NIF.bloom_file_card_async(proxy, corr_id, path)
-           end) do
-        {:ok, count} ->
-          count
+    case await_nif(fn proxy, corr_id ->
+           NIF.bloom_file_card_async(proxy, corr_id, path)
+         end) do
+      {:ok, count} ->
+        count
 
-        {:error, "enoent"} ->
-          0
+      {:error, "enoent"} ->
+        missing_or_wrongtype(key, store, 0)
 
-        {:error, :timeout} ->
-          {:error, "ERR timeout"}
+      {:error, :timeout} ->
+        {:error, "ERR timeout"}
 
-        {:error, reason} ->
-          {:error, "ERR bloom card failed: #{reason}"}
-      end
+      {:error, reason} ->
+        {:error, "ERR bloom card failed: #{reason}"}
     end
   end
 
@@ -177,44 +171,42 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   def handle("BF.INFO", [key], store) do
-    with :ok <- ProbType.check_expected(key, :bloom, store) do
-      path = prob_path(store, key, "bloom")
+    path = prob_path(store, key, "bloom")
 
-      case await_nif(fn proxy, corr_id ->
-             NIF.bloom_file_info_async(proxy, corr_id, path)
-           end) do
-        {:ok, {num_bits, count, num_hashes}} ->
-          # Try to get capacity/error_rate from stored metadata
-          {capacity, error_rate} = recover_bloom_meta(key, store, num_bits, num_hashes)
+    case await_nif(fn proxy, corr_id ->
+           NIF.bloom_file_info_async(proxy, corr_id, path)
+         end) do
+      {:ok, {num_bits, count, num_hashes}} ->
+        # Try to get capacity/error_rate from stored metadata
+        {capacity, error_rate} = recover_bloom_meta(key, store, num_bits, num_hashes)
 
-          [
-            "Capacity",
-            capacity,
-            "Size",
-            count,
-            "Number of filters",
-            1,
-            "Number of items inserted",
-            count,
-            "Expansion rate",
-            0,
-            "Error rate",
-            error_rate,
-            "Number of hash functions",
-            num_hashes,
-            "Number of bits",
-            num_bits
-          ]
+        [
+          "Capacity",
+          capacity,
+          "Size",
+          count,
+          "Number of filters",
+          1,
+          "Number of items inserted",
+          count,
+          "Expansion rate",
+          0,
+          "Error rate",
+          error_rate,
+          "Number of hash functions",
+          num_hashes,
+          "Number of bits",
+          num_bits
+        ]
 
-        {:error, "enoent"} ->
-          {:error, "ERR not found"}
+      {:error, "enoent"} ->
+        missing_or_wrongtype(key, store, {:error, "ERR not found"})
 
-        {:error, :timeout} ->
-          {:error, "ERR timeout"}
+      {:error, :timeout} ->
+        {:error, "ERR timeout"}
 
-        {:error, reason} ->
-          {:error, "ERR bloom info failed: #{reason}"}
-      end
+      {:error, reason} ->
+        {:error, "ERR bloom info failed: #{reason}"}
     end
   end
 
@@ -256,6 +248,13 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
 
   defp await_nif(submit_fun), do: Async.await(submit_fun, @prob_read_timeout_ms)
+
+  defp missing_or_wrongtype(key, store, missing_result) do
+    case ProbType.check_expected(key, :bloom, store) do
+      :ok -> missing_result
+      {:error, _} = error -> error
+    end
+  end
 
   defp check_bloom_not_exists(key, store) do
     case ProbType.check_create(key, :bloom, store) do
