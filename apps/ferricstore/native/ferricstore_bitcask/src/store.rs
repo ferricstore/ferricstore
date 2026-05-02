@@ -963,7 +963,7 @@ fn format_float(val: f64) -> String {
     }
 }
 
-fn available_disk_space_for_path(path: &Path) -> Result<u64> {
+pub fn available_disk_space_for_path(path: &Path) -> Result<u64> {
     #[cfg(unix)]
     {
         use std::ffi::CString;

@@ -76,6 +76,9 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec v2_fsync_dir(binary()) :: :ok | {:error, term()}
   def v2_fsync_dir(_path), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec v2_available_disk_space(binary()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def v2_available_disk_space(_path), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec v2_write_hint_file(binary(), [
           {binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()}
         ]) :: :ok | {:error, term()}

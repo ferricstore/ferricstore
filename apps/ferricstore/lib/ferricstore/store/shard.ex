@@ -745,25 +745,7 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call(:available_disk_space, _from, state) do
-    sp = state.shard_data_path
-    # Use df to get available disk space for the shard data directory
-    case System.cmd("df", ["-k", sp], stderr_to_stdout: true) do
-      {output, 0} ->
-        lines = String.split(output, "\n", trim: true)
-
-        case lines do
-          [_header, data_line | _] ->
-            parts = String.split(data_line, ~r/\s+/)
-            available_kb = parts |> Enum.at(3, "0") |> String.to_integer()
-            {:reply, {:ok, available_kb * 1024}, state}
-
-          _ ->
-            {:reply, {:error, "unable to parse df output"}, state}
-        end
-
-      _ ->
-        {:reply, {:error, "df command failed"}, state}
-    end
+    {:reply, NIF.v2_available_disk_space(state.shard_data_path), state}
   end
 
   # Synchronous flush — used by tests and by delete to ensure durability.

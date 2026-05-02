@@ -650,6 +650,16 @@ fn v2_fsync_dir(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     }
 }
 
+/// Returns available bytes for the filesystem containing `path`.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_available_disk_space(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
+    match store::available_disk_space_for_path(std::path::Path::new(&path)) {
+        Ok(bytes) => Ok((atoms::ok(), bytes).encode(env)),
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
 /// Write a hint file from a list of entries.
 /// Each entry is `{key, file_id, offset, value_size, expire_at_ms}`.
 /// Returns `:ok` or `{:error, reason}`.
