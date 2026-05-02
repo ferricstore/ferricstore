@@ -641,6 +641,7 @@ defmodule Ferricstore.ProbEdgeCasesTest do
 
     test "stats includes all expected fields" do
       stats = MemoryGuard.stats()
+
       expected_keys = [
         :total_bytes,
         :max_bytes,
@@ -806,6 +807,36 @@ defmodule Ferricstore.ProbEdgeCasesTest do
       assert reason =~ "truncated"
     end
 
+    test "bloom_file_add rejects count overflow without wrapping header" do
+      dir = make_prob_dir("nif_bloom_count_overflow")
+      path = Path.join(dir, "overflow.bloom")
+      max_u64 = 18_446_744_073_709_551_615
+
+      assert {:ok, :ok} = NIF.bloom_file_create(path, 500, 5)
+      <<prefix::binary-size(24), _count::binary-size(8), rest::binary>> = File.read!(path)
+      File.write!(path, prefix <> <<max_u64::little-unsigned-64>> <> rest)
+
+      assert {:error, reason} = NIF.bloom_file_add(path, "hot")
+      assert reason =~ "overflow"
+      assert {:ok, ^max_u64} = NIF.bloom_file_card(path)
+    end
+
+    test "bloom_file_madd rejects count overflow without applying pending bits" do
+      dir = make_prob_dir("nif_bloom_madd_count_overflow")
+      path = Path.join(dir, "overflow.bloom")
+      max_u64 = 18_446_744_073_709_551_615
+      near_max = max_u64 - 1
+
+      assert {:ok, :ok} = NIF.bloom_file_create(path, 10_000, 5)
+      <<prefix::binary-size(24), _count::binary-size(8), rest::binary>> = File.read!(path)
+      File.write!(path, prefix <> <<near_max::little-unsigned-64>> <> rest)
+
+      assert {:error, reason} = NIF.bloom_file_madd(path, ["hot-a", "hot-b"])
+      assert reason =~ "overflow"
+      assert {:ok, ^near_max} = NIF.bloom_file_card(path)
+      assert {:ok, [0, 0]} = NIF.bloom_file_mexists(path, ["hot-a", "hot-b"])
+    end
+
     test "cms_file_create and query roundtrip" do
       dir = make_prob_dir("nif_cms")
       path = Path.join(dir, "test.cms")
@@ -963,10 +994,11 @@ defmodule Ferricstore.ProbEdgeCasesTest do
         end)
 
       # At some point, additions should fail with "filter is full"
-      has_full = Enum.any?(results, fn
-        {:error, "filter is full"} -> true
-        _ -> false
-      end)
+      has_full =
+        Enum.any?(results, fn
+          {:error, "filter is full"} -> true
+          _ -> false
+        end)
 
       # With capacity=2 and bucket_size=1, we should hit full quickly
       assert has_full, "filter should report full with only 2 slots"

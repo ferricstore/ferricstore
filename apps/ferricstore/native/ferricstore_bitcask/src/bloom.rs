@@ -20,6 +20,7 @@
 //!
 //! where h1 and h2 are derived from xxh3 with two different seeds.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
@@ -68,6 +69,12 @@ fn bloom_file_size(num_bits: u64) -> Result<u64, String> {
     (HEADER_SIZE as u64)
         .checked_add(byte_count)
         .ok_or_else(|| "bloom file size overflow".into())
+}
+
+fn bloom_count_after_add(count: u64) -> Result<u64, String> {
+    count
+        .checked_add(1)
+        .ok_or_else(|| "bloom count overflow".into())
 }
 
 fn bloom_read_exact_at(
@@ -220,6 +227,7 @@ pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> Ni
 
     let positions = file_hash_positions(element.as_slice(), num_bits, num_hashes);
     let mut any_new = false;
+    let mut new_count = None;
 
     for pos in positions {
         let byte_index = pos / 8;
@@ -233,6 +241,12 @@ pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> Ni
 
         let mask = 1u8 << bit_offset;
         if (buf[0] & mask) == 0 {
+            if new_count.is_none() {
+                match bloom_count_after_add(count) {
+                    Ok(next) => new_count = Some(next),
+                    Err(e) => return Ok((atoms::error(), e).encode(env)),
+                }
+            }
             buf[0] |= mask;
             file.write_at(&buf, file_offset)
                 .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite bit: {e}"))))?;
@@ -240,8 +254,7 @@ pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> Ni
         }
     }
 
-    if any_new {
-        let new_count = count + 1;
+    if let Some(new_count) = new_count {
         file.write_at(&new_count.to_le_bytes(), 24)
             .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite count: {e}"))))?;
     }
@@ -280,6 +293,13 @@ pub fn bloom_file_madd<'a>(
     };
 
     let mut results: Vec<u32> = Vec::with_capacity(elements.len());
+    let max_new_items = u64::try_from(elements.len()).unwrap_or(u64::MAX);
+    let overflow_possible = count.checked_add(max_new_items).is_none();
+    let mut pending_bits = if overflow_possible {
+        Some(HashMap::new())
+    } else {
+        None
+    };
 
     for (i, element) in elements.iter().enumerate() {
         let positions = file_hash_positions(element.as_slice(), num_bits, num_hashes);
@@ -296,7 +316,13 @@ pub fn bloom_file_madd<'a>(
             }
 
             let mask = 1u8 << bit_offset;
-            if (buf[0] & mask) == 0 {
+            if let Some(pending_bits) = pending_bits.as_mut() {
+                let current = *pending_bits.entry(file_offset).or_insert(buf[0]);
+                if (current & mask) == 0 {
+                    pending_bits.insert(file_offset, current | mask);
+                    any_new = true;
+                }
+            } else if (buf[0] & mask) == 0 {
                 buf[0] |= mask;
                 file.write_at(&buf, file_offset)
                     .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite bit: {e}"))))?;
@@ -305,12 +331,22 @@ pub fn bloom_file_madd<'a>(
         }
 
         if any_new {
-            count += 1;
+            count = match bloom_count_after_add(count) {
+                Ok(next) => next,
+                Err(e) => return Ok((atoms::error(), e).encode(env)),
+            };
         }
         results.push(u32::from(any_new));
 
         if i % YIELD_CHECK_INTERVAL == 0 && i > 0 {
             let _ = consume_timeslice(env, 1);
+        }
+    }
+
+    if let Some(pending_bits) = pending_bits {
+        for (file_offset, byte) in pending_bits {
+            file.write_at(&[byte], file_offset)
+                .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite bit: {e}"))))?;
         }
     }
 
@@ -714,6 +750,13 @@ mod tests {
         let pos1 = file_hash_positions(b"hello", 100_000, 7);
         let pos2 = file_hash_positions(b"world", 100_000, 7);
         assert_ne!(pos1, pos2);
+    }
+
+    #[test]
+    fn count_after_add_rejects_overflow() {
+        assert_eq!(bloom_count_after_add(0).unwrap(), 1);
+        assert_eq!(bloom_count_after_add(u64::MAX - 1).unwrap(), u64::MAX);
+        assert!(bloom_count_after_add(u64::MAX).is_err());
     }
 
     #[test]
