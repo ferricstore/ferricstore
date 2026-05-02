@@ -42,5 +42,21 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
 
       assert offset_1_after != offset_1_before or offset_3_after != offset_3_before
     end
+
+    test "copy failure is returned as a compaction error instead of success", %{
+      shard: shard,
+      keydir: keydir
+    } do
+      missing_file_id = 999
+      key = "compaction_missing_source"
+
+      :ets.insert(keydir, {key, nil, 0, 0, missing_file_id, 0, 16})
+
+      assert {:error, {:compaction_failed, failures}} =
+               GenServer.call(shard, {:run_compaction, [missing_file_id]})
+
+      assert [{^missing_file_id, {:copy_failed, _reason}}] = failures
+      assert [{^key, nil, 0, 0, ^missing_file_id, 0, 16}] = :ets.lookup(keydir, key)
+    end
   end
 end
