@@ -107,11 +107,29 @@ fn cuckoo_file_size(
         .ok_or_else(|| "cuckoo file size overflow".into())
 }
 
+fn cuckoo_read_exact_at(
+    file: &File,
+    buf: &mut [u8],
+    offset: u64,
+    label: &str,
+) -> Result<(), String> {
+    let mut read = 0;
+    while read < buf.len() {
+        let n = file
+            .read_at(&mut buf[read..], offset + read as u64)
+            .map_err(|e| format!("read {label}: {e}"))?;
+        if n == 0 {
+            return Err(format!("truncated cuckoo file while reading {label}"));
+        }
+        read += n;
+    }
+    Ok(())
+}
+
 /// Read and validate the 27-byte header from a file.
 fn cuckoo_read_header(file: &File) -> Result<CuckooFileHeader, String> {
     let mut hdr = [0u8; HEADER_SIZE];
-    file.read_at(&mut hdr, OFF_MAGIC)
-        .map_err(|e| format!("read header: {e}"))?;
+    cuckoo_read_exact_at(file, &mut hdr, OFF_MAGIC, "header")?;
 
     if hdr[0..2] != MAGIC {
         return Err("invalid cuckoo file magic".into());
@@ -217,8 +235,7 @@ fn cuckoo_file_read_slot(
 ) -> Result<Vec<u8>, String> {
     let offset = cuckoo_file_slot_offset(bucket_idx, slot_idx, bucket_size, fingerprint_size);
     let mut buf = vec![0u8; fingerprint_size as usize];
-    file.read_at(&mut buf, offset)
-        .map_err(|e| format!("read slot: {e}"))?;
+    cuckoo_read_exact_at(file, &mut buf, offset, "slot")?;
     Ok(buf)
 }
 
@@ -1280,6 +1297,18 @@ mod tests {
         std::fs::write(&path, [0u8; 10]).unwrap();
         let file = File::open(&path).unwrap();
         assert!(cuckoo_read_header(&file).is_err());
+    }
+
+    #[test]
+    fn read_slot_rejects_truncated_bucket_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short_slot.cuckoo");
+        std::fs::write(&path, [0u8; HEADER_SIZE]).unwrap();
+        let file = File::open(&path).unwrap();
+
+        let err = cuckoo_file_read_slot(&file, 0, 0, 4, 1).unwrap_err();
+
+        assert!(err.contains("truncated"));
     }
 
     #[test]

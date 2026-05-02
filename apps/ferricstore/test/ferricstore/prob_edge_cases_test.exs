@@ -905,6 +905,18 @@ defmodule Ferricstore.ProbEdgeCasesTest do
       assert {:ok, 0} = NIF.cuckoo_file_exists(path, "world")
     end
 
+    test "cuckoo_file_exists rejects truncated bucket region" do
+      dir = make_prob_dir("nif_cuckoo_truncated_exists")
+      path = Path.join(dir, "truncated.cuckoo")
+
+      assert {:ok, :ok} = NIF.cuckoo_file_create(path, 1024, 4)
+      <<header::binary-size(27), _::binary>> = File.read!(path)
+      File.write!(path, header)
+
+      assert {:error, reason} = NIF.cuckoo_file_exists(path, "hot")
+      assert reason =~ "truncated"
+    end
+
     test "cuckoo_file_del removes element" do
       dir = make_prob_dir("nif_cuckoo_del")
       path = Path.join(dir, "del.cuckoo")
