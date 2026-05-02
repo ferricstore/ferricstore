@@ -45,6 +45,9 @@ defmodule Ferricstore.Store.BitcaskWriter do
 
   @batch_size_threshold 2000
   @flush_interval_ms 1
+  @error_retry_interval_ms 50
+
+  @type flush_result :: :ok | {:error, {:flush_failed, pos_integer()}}
 
   @doc "Starts a BitcaskWriter for the given shard index."
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -157,7 +160,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
   Used in tests and before shard shutdown to ensure all deferred writes
   are persisted.
   """
-  @spec flush(non_neg_integer()) :: :ok
+  @spec flush(non_neg_integer()) :: flush_result()
   def flush(shard_index, timeout \\ 10_000) do
     try do
       GenServer.call(writer_name(shard_index), :flush, timeout)
@@ -234,9 +237,8 @@ defmodule Ferricstore.Store.BitcaskWriter do
     new_count = state.pending_count + length(entries)
 
     if new_count >= @batch_size_threshold do
-      do_flush(new_pending, state.shard_index)
-      cancel_timer(state.flush_timer)
-      {:noreply, %{state | pending: [], pending_count: 0, flush_timer: nil}}
+      {_result, state} = flush_pending_entries(new_pending, state)
+      {:noreply, state}
     else
       timer =
         if state.flush_timer == nil do
@@ -261,9 +263,8 @@ defmodule Ferricstore.Store.BitcaskWriter do
     {drained_pending, drained_count} = drain_mailbox(new_pending, new_count)
 
     if drained_count >= @batch_size_threshold do
-      do_flush(drained_pending, state.shard_index)
-      cancel_timer(state.flush_timer)
-      {:noreply, %{state | pending: [], pending_count: 0, flush_timer: nil}}
+      {_result, state} = flush_pending_entries(drained_pending, state)
+      {:noreply, state}
     else
       timer =
         if state.flush_timer == nil do
@@ -307,9 +308,8 @@ defmodule Ferricstore.Store.BitcaskWriter do
   end
 
   def handle_call(:flush, _from, state) do
-    do_flush(state.pending, state.shard_index)
-    cancel_timer(state.flush_timer)
-    {:reply, :ok, %{state | pending: [], pending_count: 0, flush_timer: nil}}
+    {result, state} = flush_pending_entries(state.pending, state)
+    {:reply, result, state}
   end
 
   @impl true
@@ -318,8 +318,8 @@ defmodule Ferricstore.Store.BitcaskWriter do
   end
 
   def handle_info(:flush_timer, state) do
-    do_flush(state.pending, state.shard_index)
-    {:noreply, %{state | pending: [], pending_count: 0, flush_timer: nil}}
+    {_result, state} = flush_pending_entries(state.pending, state)
+    {:noreply, state}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -335,11 +335,35 @@ defmodule Ferricstore.Store.BitcaskWriter do
     # Reverse to preserve insertion order, then group by file path.
     entries = Enum.reverse(pending)
 
-    entries
-    |> Enum.group_by(&entry_path/1)
-    |> Enum.each(fn {path, group} ->
-      flush_path_group(path, group, shard_index)
-    end)
+    failed =
+      entries
+      |> Enum.group_by(&entry_path/1)
+      |> Enum.flat_map(fn {path, group} ->
+        flush_path_group(path, group, shard_index)
+      end)
+
+    if failed == [], do: :ok, else: {:error, failed}
+  end
+
+  defp flush_pending_entries(pending, state) do
+    cancel_timer(state.flush_timer)
+
+    case do_flush(pending, state.shard_index) do
+      :ok ->
+        {:ok, %{state | pending: [], pending_count: 0, flush_timer: nil}}
+
+      {:error, failed_entries} ->
+        failed_count = length(failed_entries)
+        timer = Process.send_after(self(), :flush_timer, @error_retry_interval_ms)
+
+        {{:error, {:flush_failed, failed_count}},
+         %{
+           state
+           | pending: Enum.reverse(failed_entries),
+             pending_count: failed_count,
+             flush_timer: timer
+         }}
+    end
   end
 
   defp entry_path({:write, _ctx, path, _fid, _ets, _key, _value, _exp}), do: path
@@ -357,7 +381,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
     # Split into contiguous runs of writes vs tombstones to maximize batching.
     group
     |> chunk_by_type()
-    |> Enum.each(fn
+    |> Enum.flat_map(fn
       {:writes, write_entries} ->
         flush_write_batch(path, write_entries, shard_index)
 
@@ -434,23 +458,27 @@ defmodule Ferricstore.Store.BitcaskWriter do
           end
         end)
 
+        []
+
       {:error, reason} ->
         mark_disk_pressure(write_entries, shard_index)
 
         Logger.error(
-          "BitcaskWriter shard_#{shard_index}: flush failed for #{path}: #{inspect(reason)} — #{length(batch)} entries lost"
+          "BitcaskWriter shard_#{shard_index}: flush failed for #{path}: #{inspect(reason)} — retrying #{length(batch)} entries"
         )
+
+        write_entries
     end
   end
 
   defp flush_tombstone_batch(path, tombstone_entries, shard_index) do
-    dirty_contexts =
-      Enum.reduce(tombstone_entries, [], fn entry, acc ->
+    {dirty_contexts, failed_entries} =
+      Enum.reduce(tombstone_entries, {[], []}, fn entry, {dirty_acc, failed_acc} ->
         {instance_ctx, key} = normalize_tombstone_entry(entry)
 
         case NIF.v2_append_tombstone(path, key) do
           {:ok, _} ->
-            [instance_ctx | acc]
+            {[instance_ctx | dirty_acc], failed_acc}
 
           {:error, reason} ->
             set_disk_pressure(instance_ctx, shard_index)
@@ -459,11 +487,12 @@ defmodule Ferricstore.Store.BitcaskWriter do
               "BitcaskWriter shard_#{shard_index}: tombstone failed for #{path} key=#{inspect(key)}: #{inspect(reason)}"
             )
 
-            acc
+            {dirty_acc, [entry | failed_acc]}
         end
       end)
 
     mark_checkpoint_dirty_contexts(dirty_contexts, shard_index)
+    Enum.reverse(failed_entries)
   end
 
   defp normalize_write_entry({:write, ctx, path, fid, ets, key, value, exp}),

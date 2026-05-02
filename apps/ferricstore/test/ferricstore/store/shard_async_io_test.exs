@@ -275,6 +275,47 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert is_integer(offset) and offset >= 0
     end
 
+    test "BitcaskWriter keeps failed writes pending for retry" do
+      shard_index = 10_000 + System.unique_integer([:positive])
+      dir = Path.join(System.tmp_dir!(), "bitcask_writer_retry_#{shard_index}")
+      File.mkdir_p!(dir)
+      path = Path.join([dir, "missing_parent", "00000.log"])
+
+      keydir = :ets.new(:"bitcask_writer_retry_#{shard_index}", [:set, :public])
+      key = "writer:retry-pending"
+
+      {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
+
+      on_exit(fn ->
+        if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+
+        try do
+          :ets.delete(keydir)
+        rescue
+          ArgumentError -> :ok
+        end
+
+        File.rm_rf(dir)
+      end)
+
+      :ets.insert(keydir, {key, "new", 456, LFU.initial(), :pending, 0, 0})
+
+      :sys.replace_state(writer, fn state ->
+        %{
+          state
+          | pending: [{:write, nil, path, 0, keydir, key, "new", 456}],
+            pending_count: 1
+        }
+      end)
+
+      assert {:error, {:flush_failed, 1}} == BitcaskWriter.flush(shard_index)
+
+      state = :sys.get_state(writer)
+      assert state.pending_count == 1
+      assert [{:write, nil, ^path, 0, ^keydir, ^key, "new", 456}] = state.pending
+      assert [{^key, "new", 456, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, key)
+    end
+
     test "shard flush completion does not attach stale location to newer pending value" do
       keydir =
         :ets.new(:"shard_flush_stale_#{System.unique_integer([:positive])}", [
