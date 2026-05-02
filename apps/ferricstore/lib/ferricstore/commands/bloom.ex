@@ -308,11 +308,16 @@ defmodule Ferricstore.Commands.Bloom do
   defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
   defp resolve_prob_dir(%{bloom_registry: %{dir: dir}}, _key), do: dir
 
+  defp resolve_prob_dir(%FerricStore.Instance{} = ctx, key) do
+    idx = Ferricstore.Store.Router.shard_for(ctx, key)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+    Path.join(shard_path, "prob")
+  end
+
   defp resolve_prob_dir(_store, key) do
     ctx = FerricStore.Instance.get(:default)
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     idx = Ferricstore.Store.Router.shard_for(ctx, key)
-    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
     Path.join(shard_path, "prob")
   end
 
