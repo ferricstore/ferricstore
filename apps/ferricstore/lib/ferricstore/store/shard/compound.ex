@@ -169,16 +169,7 @@ defmodule Ferricstore.Store.Shard.Compound do
                 {value, state}
 
               {:ok, value, exp, fid, off, vsize} ->
-                ShardETS.ets_insert_with_location(
-                  state,
-                  compound_key,
-                  value,
-                  exp,
-                  fid,
-                  off,
-                  vsize
-                )
-
+                ShardETS.cold_read_warm_ets(state, compound_key, value, exp, fid, off, vsize)
                 {value, state}
 
               {:ok, value} ->
@@ -247,16 +238,7 @@ defmodule Ferricstore.Store.Shard.Compound do
                 {{value, exp}, state}
 
               {:ok, value, exp, fid, off, vsize} ->
-                ShardETS.ets_insert_with_location(
-                  state,
-                  compound_key,
-                  value,
-                  exp,
-                  fid,
-                  off,
-                  vsize
-                )
-
+                ShardETS.cold_read_warm_ets(state, compound_key, value, exp, fid, off, vsize)
                 {{value, exp}, state}
 
               {:ok, value} ->
