@@ -81,8 +81,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
     else
       case extract_plain_gets(commands) do
         {:ok, keys} ->
-          acl_ok = state.acl_cache == :full_access or
-                   (is_map(state.acl_cache) and state.acl_cache.commands == :all and state.acl_cache.keys == :all)
+          acl_ok =
+            state.acl_cache == :full_access or
+              (is_map(state.acl_cache) and state.acl_cache.commands == :all and
+                 state.acl_cache.keys == :all)
 
           # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
           if not acl_ok do
@@ -136,15 +138,20 @@ defmodule FerricstoreServer.Connection.Pipeline do
         {:ok, kv_pairs} ->
           ctx = state.instance_ctx
           live_ctx = FerricStore.Instance.get(:default)
-          acl_ok = state.acl_cache == :full_access or
-                   (is_map(state.acl_cache) and state.acl_cache.commands == :all and state.acl_cache.keys == :all)
+
+          acl_ok =
+            state.acl_cache == :full_access or
+              (is_map(state.acl_cache) and state.acl_cache.commands == :all and
+                 state.acl_cache.keys == :all)
 
           # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
           if not acl_ok do
             :fallback
           else
-            pressure_ok = :atomics.get(ctx.pressure_flags, 1) == 0 and
-                          :atomics.get(ctx.pressure_flags, 2) == 0
+            pressure_ok =
+              :atomics.get(ctx.pressure_flags, 1) == 0 and
+                :atomics.get(ctx.pressure_flags, 2) == 0
+
             # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
             if not pressure_ok do
               :fallback
@@ -160,8 +167,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
                   case classify_batch_durability(ctx, kv_pairs) do
                     :all_async ->
                       {:ok, do_batch_set_async(kv_pairs, state, send_response_fn)}
+
                     :all_quorum ->
                       {:ok, do_batch_set_quorum(kv_pairs, state, send_response_fn)}
+
                     :mixed ->
                       :fallback
                   end
@@ -181,7 +190,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp extract_plain_sets([], acc), do: {:ok, Enum.reverse(acc)}
 
-  defp extract_plain_sets([[name, key, value] | rest], acc) when is_binary(name) and is_binary(key) do
+  defp extract_plain_sets([[name, key, value] | rest], acc)
+       when is_binary(name) and is_binary(key) do
     if fast_upcase(name) == "SET" do
       extract_plain_sets(rest, [{key, value} | acc])
     else
@@ -192,14 +202,17 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp extract_plain_sets(_, _acc), do: :fallback
 
   defp classify_batch_durability(_ctx, []), do: :all_quorum
+
   defp classify_batch_durability(ctx, [{first_key, _} | rest]) do
     first = Router.durability_for_key_public(ctx, first_key)
     if all_same_durability?(ctx, rest, first), do: durability_to_class(first), else: :mixed
   end
 
   defp all_same_durability?(_ctx, [], _expected), do: true
+
   defp all_same_durability?(ctx, [{key, _} | rest], expected) do
-    Router.durability_for_key_public(ctx, key) == expected and all_same_durability?(ctx, rest, expected)
+    Router.durability_for_key_public(ctx, key) == expected and
+      all_same_durability?(ctx, rest, expected)
   end
 
   defp durability_to_class(:async), do: :all_async
@@ -207,10 +220,12 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp do_batch_set_async(kv_pairs, state, send_response_fn) do
     Stats.incr_commands_by(state.stats_counter, length(kv_pairs))
-    Router.batch_async_put(state.instance_ctx, kv_pairs)
 
-    ok = Encoder.ok_response()
-    response = List.duplicate(ok, length(kv_pairs))
+    response =
+      state.instance_ctx
+      |> Router.batch_async_put(kv_pairs)
+      |> encode_async_batch_result(length(kv_pairs))
+
     send_response_fn.(state.socket, state.transport, response)
     {:continue, state}
   end
@@ -219,10 +234,11 @@ defmodule FerricstoreServer.Connection.Pipeline do
     Stats.incr_commands_by(state.stats_counter, length(kv_pairs))
     results = Router.batch_quorum_put(state.instance_ctx, kv_pairs)
 
-    response = Enum.map(results, fn
-      :ok -> Encoder.ok_response()
-      {:error, _} = err -> Encoder.encode(err)
-    end)
+    response =
+      Enum.map(results, fn
+        :ok -> Encoder.ok_response()
+        {:error, _} = err -> Encoder.encode(err)
+      end)
 
     send_response_fn.(state.socket, state.transport, response)
     {:continue, state}
@@ -238,26 +254,33 @@ defmodule FerricstoreServer.Connection.Pipeline do
     if requires_auth?(state) or state.multi_state == :queuing do
       general_batch_dispatch(commands, state, handle_command_fn, send_response_fn)
     else
-      acl_ok = state.acl_cache == :full_access or
-               (is_map(state.acl_cache) and state.acl_cache.commands == :all and state.acl_cache.keys == :all)
+      acl_ok =
+        state.acl_cache == :full_access or
+          (is_map(state.acl_cache) and state.acl_cache.commands == :all and
+             state.acl_cache.keys == :all)
 
       # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
       if not acl_ok do
         general_batch_dispatch(commands, state, handle_command_fn, send_response_fn)
       else
         case classify_mixed_pipeline(commands) do
-          {:ok, ops} -> do_mixed_fast_path(ops, state, send_response_fn)
-          :fallback -> general_batch_dispatch(commands, state, handle_command_fn, send_response_fn)
+          {:ok, ops} ->
+            do_mixed_fast_path(ops, state, send_response_fn)
+
+          :fallback ->
+            general_batch_dispatch(commands, state, handle_command_fn, send_response_fn)
         end
       end
     end
   end
 
-  defp classify_mixed_pipeline(commands), do: classify_mixed_pipeline(commands, [], 0, MapSet.new())
+  defp classify_mixed_pipeline(commands),
+    do: classify_mixed_pipeline(commands, [], 0, MapSet.new())
 
   defp classify_mixed_pipeline([], acc, _idx, _written_keys), do: {:ok, Enum.reverse(acc)}
 
-  defp classify_mixed_pipeline([[name, key] | rest], acc, idx, written_keys) when is_binary(name) and is_binary(key) do
+  defp classify_mixed_pipeline([[name, key] | rest], acc, idx, written_keys)
+       when is_binary(name) and is_binary(key) do
     if fast_upcase(name) == "GET" do
       if MapSet.member?(written_keys, key) do
         :fallback
@@ -269,9 +292,15 @@ defmodule FerricstoreServer.Connection.Pipeline do
     end
   end
 
-  defp classify_mixed_pipeline([[name, key, value] | rest], acc, idx, written_keys) when is_binary(name) and is_binary(key) do
+  defp classify_mixed_pipeline([[name, key, value] | rest], acc, idx, written_keys)
+       when is_binary(name) and is_binary(key) do
     if fast_upcase(name) == "SET" do
-      classify_mixed_pipeline(rest, [{:set, idx, key, value} | acc], idx + 1, MapSet.put(written_keys, key))
+      classify_mixed_pipeline(
+        rest,
+        [{:set, idx, key, value} | acc],
+        idx + 1,
+        MapSet.put(written_keys, key)
+      )
     else
       :fallback
     end
@@ -297,18 +326,20 @@ defmodule FerricstoreServer.Connection.Pipeline do
           kv_pairs = Enum.map(set_ops, fn {_idx, key, value} -> {key, value} end)
           live_ctx = FerricStore.Instance.get(:default)
 
-          pressure_ok = :atomics.get(ctx.pressure_flags, 1) == 0 and
-                        :atomics.get(ctx.pressure_flags, 2) == 0
+          pressure_ok =
+            :atomics.get(ctx.pressure_flags, 1) == 0 and
+              :atomics.get(ctx.pressure_flags, 2) == 0
 
+          # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
           results =
-            # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
             if not pressure_ok do
               List.duplicate({:error, "ERR server under pressure"}, length(kv_pairs))
             else
               case live_ctx.durability_mode do
                 :all_async ->
-                  Router.batch_async_put(ctx, kv_pairs)
-                  List.duplicate(:ok, length(kv_pairs))
+                  ctx
+                  |> Router.batch_async_put(kv_pairs)
+                  |> expand_async_batch_result(length(kv_pairs))
 
                 :all_quorum ->
                   Router.batch_quorum_put(ctx, kv_pairs)
@@ -316,18 +347,26 @@ defmodule FerricstoreServer.Connection.Pipeline do
                 :mixed ->
                   {async_pairs, quorum_pairs, _} = split_by_durability(ctx, set_ops)
 
-                  async_results = if async_pairs != [] do
-                    Router.batch_async_put(ctx, Enum.map(async_pairs, fn {_idx, k, v} -> {k, v} end))
-                    List.duplicate(:ok, length(async_pairs))
-                  else
-                    []
-                  end
+                  async_results =
+                    if async_pairs != [] do
+                      kv_pairs = Enum.map(async_pairs, fn {_idx, k, v} -> {k, v} end)
 
-                  quorum_results = if quorum_pairs != [] do
-                    Router.batch_quorum_put(ctx, Enum.map(quorum_pairs, fn {_idx, k, v} -> {k, v} end))
-                  else
-                    []
-                  end
+                      ctx
+                      |> Router.batch_async_put(kv_pairs)
+                      |> expand_async_batch_result(length(async_pairs))
+                    else
+                      []
+                    end
+
+                  quorum_results =
+                    if quorum_pairs != [] do
+                      Router.batch_quorum_put(
+                        ctx,
+                        Enum.map(quorum_pairs, fn {_idx, k, v} -> {k, v} end)
+                      )
+                    else
+                      []
+                    end
 
                   recombine_set_results(async_pairs, async_results, quorum_pairs, quorum_results)
               end
@@ -336,20 +375,25 @@ defmodule FerricstoreServer.Connection.Pipeline do
           set_ops
           |> Enum.zip(results)
           |> Map.new(fn {{idx, _key, _value}, result} ->
-            encoded = case result do
-              :ok -> Encoder.ok_response()
-              {:error, _} = err -> Encoder.encode(err)
-            end
+            encoded =
+              case result do
+                :ok -> Encoder.ok_response()
+                {:error, _} = err -> Encoder.encode(err)
+              end
+
             {idx, encoded}
           end)
       end
 
     get_results =
       case get_ops do
-        [] -> %{}
+        [] ->
+          %{}
+
         _ ->
           keys = Enum.map(get_ops, &elem(&1, 1))
           values = Router.batch_get(ctx, keys)
+
           get_ops
           |> Enum.zip(values)
           |> Map.new(fn {{idx, _key}, value} -> {idx, Encoder.encode(value)} end)
@@ -361,16 +405,31 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp split_by_durability(ctx, set_ops) do
-    {async_ops, quorum_ops} = Enum.split_with(set_ops, fn {_idx, key, _value} ->
-      Router.durability_for_key_public(ctx, key) == :async
-    end)
+    {async_ops, quorum_ops} =
+      Enum.split_with(set_ops, fn {_idx, key, _value} ->
+        Router.durability_for_key_public(ctx, key) == :async
+      end)
+
     {async_ops, quorum_ops, nil}
   end
 
+  defp expand_async_batch_result(:ok, count), do: List.duplicate(:ok, count)
+  defp expand_async_batch_result({:error, _} = err, count), do: List.duplicate(err, count)
+
+  defp encode_async_batch_result(:ok, count), do: List.duplicate(Encoder.ok_response(), count)
+
+  defp encode_async_batch_result({:error, _} = err, count),
+    do: List.duplicate(Encoder.encode(err), count)
+
   defp recombine_set_results(async_ops, async_results, quorum_ops, quorum_results) do
-    async_map = async_ops |> Enum.zip(async_results) |> Map.new(fn {{idx, _, _}, r} -> {idx, r} end)
-    quorum_map = quorum_ops |> Enum.zip(quorum_results) |> Map.new(fn {{idx, _, _}, r} -> {idx, r} end)
+    async_map =
+      async_ops |> Enum.zip(async_results) |> Map.new(fn {{idx, _, _}, r} -> {idx, r} end)
+
+    quorum_map =
+      quorum_ops |> Enum.zip(quorum_results) |> Map.new(fn {{idx, _, _}, r} -> {idx, r} end)
+
     combined = Map.merge(async_map, quorum_map)
+
     (async_ops ++ quorum_ops)
     |> Enum.sort_by(fn {idx, _, _} -> idx end)
     |> Enum.map(fn {idx, _, _} -> Map.fetch!(combined, idx) end)
@@ -384,8 +443,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # (MULTI, AUTH, SUBSCRIBE, etc.) force a flush-and-sequential boundary.
 
   defp general_batch_dispatch(commands, state, handle_command_fn, send_response_fn) do
-    acl_ok = state.acl_cache == :full_access or
-             (is_map(state.acl_cache) and state.acl_cache.commands == :all and state.acl_cache.keys == :all)
+    acl_ok =
+      state.acl_cache == :full_access or
+        (is_map(state.acl_cache) and state.acl_cache.commands == :all and
+           state.acl_cache.keys == :all)
 
     if requires_auth?(state) or state.multi_state == :queuing or not acl_ok do
       sequential_dispatch(commands, state, handle_command_fn, send_response_fn)
@@ -396,14 +457,18 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
         {:split, pure_prefix, stateful_cmd, rest} ->
           case do_batch_pure(pure_prefix, state, send_response_fn) do
-            {:quit, _} = quit -> quit
+            {:quit, _} = quit ->
+              quit
+
             {:continue, new_state} ->
               case handle_command_fn.(stateful_cmd, new_state) do
                 {:quit, response, quit_state} ->
                   send_response_fn.(quit_state.socket, quit_state.transport, response)
                   {:quit, quit_state}
+
                 {:continue, response, new_state2} ->
                   send_response_fn.(new_state2.socket, new_state2.transport, response)
+
                   if rest == [] do
                     {:continue, new_state2}
                   else
@@ -423,7 +488,9 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp split_at_stateful([cmd | rest], state, acc) do
     name = extract_command_name(cmd)
-    if MapSet.member?(@stateful_cmds, name) or (is_binary(name) and String.starts_with?(name, "CLIENT")) do
+
+    if MapSet.member?(@stateful_cmds, name) or
+         (is_binary(name) and String.starts_with?(name, "CLIENT")) do
       {:split, Enum.reverse(acc), cmd, rest}
     else
       split_at_stateful(rest, state, [cmd | acc])
@@ -453,13 +520,16 @@ defmodule FerricstoreServer.Connection.Pipeline do
                   catch
                     :exit, {:noproc, _} ->
                       {:error, "ERR server not ready, shard process unavailable"}
+
                     :exit, {reason, _} ->
                       {:error, "ERR internal error: #{inspect(reason)}"}
                   end
+
                 {:error, _} = err ->
                   log_acl_denied(state, name)
                   err
               end
+
             {:error, _} = err ->
               log_acl_denied(state, name)
               err
@@ -519,6 +589,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp normalise_cmd({:inline, [name | args]}) when is_binary(name),
     do: {fast_upcase(name), args}
+
   defp normalise_cmd({:inline, []}), do: {"UNKNOWN", []}
   defp normalise_cmd([name | args]) when is_binary(name), do: {fast_upcase(name), args}
   defp normalise_cmd(_other), do: {"UNKNOWN", []}
