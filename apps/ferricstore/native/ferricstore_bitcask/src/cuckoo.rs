@@ -107,6 +107,24 @@ fn cuckoo_file_size(
         .ok_or_else(|| "cuckoo file size overflow".into())
 }
 
+fn cuckoo_num_items_after_insert(num_items: u64) -> Result<u64, String> {
+    num_items
+        .checked_add(1)
+        .ok_or_else(|| "cuckoo num_items overflow".into())
+}
+
+fn cuckoo_num_items_after_delete(num_items: u64) -> Result<u64, String> {
+    num_items
+        .checked_sub(1)
+        .ok_or_else(|| "cuckoo num_items underflow".into())
+}
+
+fn cuckoo_num_deletes_after_delete(num_deletes: u64) -> Result<u64, String> {
+    num_deletes
+        .checked_add(1)
+        .ok_or_else(|| "cuckoo num_deletes overflow".into())
+}
+
 fn cuckoo_read_exact_at(
     file: &File,
     buf: &mut [u8],
@@ -466,6 +484,10 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
         hdr.num_buckets,
     );
     let b2 = cuckoo_file_alternate_bucket(b1, &fp, hdr.num_buckets);
+    let next_num_items = match cuckoo_num_items_after_insert(hdr.num_items) {
+        Ok(next) => next,
+        Err(e) => return Ok((atoms::error(), e).encode(env)),
+    };
 
     // Try primary bucket.
     for slot in 0..hdr.bucket_size {
@@ -490,7 +512,7 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
             ) {
                 return Ok((atoms::error(), e).encode(env));
             }
-            if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
+            if let Err(e) = cuckoo_file_write_num_items(&file, next_num_items) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = crate::prob_fsync(&file) {
@@ -524,7 +546,7 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
             ) {
                 return Ok((atoms::error(), e).encode(env));
             }
-            if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
+            if let Err(e) = cuckoo_file_write_num_items(&file, next_num_items) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = crate::prob_fsync(&file) {
@@ -537,7 +559,7 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
 
     match cuckoo_file_try_eviction(&file, &hdr, fp, b1) {
         Ok(true) => {
-            if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
+            if let Err(e) = cuckoo_file_write_num_items(&file, next_num_items) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = crate::prob_fsync(&file) {
@@ -607,6 +629,11 @@ pub fn cuckoo_file_addnx<'a>(
         }
     }
 
+    let next_num_items = match cuckoo_num_items_after_insert(hdr.num_items) {
+        Ok(next) => next,
+        Err(e) => return Ok((atoms::error(), e).encode(env)),
+    };
+
     // Not found, try to add. Try primary bucket.
     for slot in 0..hdr.bucket_size {
         let s = match cuckoo_file_read_slot(
@@ -630,7 +657,7 @@ pub fn cuckoo_file_addnx<'a>(
             ) {
                 return Ok((atoms::error(), e).encode(env));
             }
-            if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
+            if let Err(e) = cuckoo_file_write_num_items(&file, next_num_items) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = crate::prob_fsync(&file) {
@@ -664,7 +691,7 @@ pub fn cuckoo_file_addnx<'a>(
             ) {
                 return Ok((atoms::error(), e).encode(env));
             }
-            if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
+            if let Err(e) = cuckoo_file_write_num_items(&file, next_num_items) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = crate::prob_fsync(&file) {
@@ -677,7 +704,7 @@ pub fn cuckoo_file_addnx<'a>(
 
     match cuckoo_file_try_eviction(&file, &hdr, fp, b1) {
         Ok(true) => {
-            if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
+            if let Err(e) = cuckoo_file_write_num_items(&file, next_num_items) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = crate::prob_fsync(&file) {
@@ -732,6 +759,14 @@ pub fn cuckoo_file_del<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
             Err(e) => return Ok((atoms::error(), e).encode(env)),
         };
         if s == fp {
+            let next_num_items = match cuckoo_num_items_after_delete(hdr.num_items) {
+                Ok(next) => next,
+                Err(e) => return Ok((atoms::error(), e).encode(env)),
+            };
+            let next_num_deletes = match cuckoo_num_deletes_after_delete(hdr.num_deletes) {
+                Ok(next) => next,
+                Err(e) => return Ok((atoms::error(), e).encode(env)),
+            };
             if let Err(e) = cuckoo_file_write_slot(
                 &file,
                 b1,
@@ -742,10 +777,10 @@ pub fn cuckoo_file_del<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
             ) {
                 return Ok((atoms::error(), e).encode(env));
             }
-            if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items.wrapping_sub(1)) {
+            if let Err(e) = cuckoo_file_write_num_items(&file, next_num_items) {
                 return Ok((atoms::error(), e).encode(env));
             }
-            if let Err(e) = cuckoo_file_write_num_deletes(&file, hdr.num_deletes + 1) {
+            if let Err(e) = cuckoo_file_write_num_deletes(&file, next_num_deletes) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = crate::prob_fsync(&file) {
@@ -769,6 +804,14 @@ pub fn cuckoo_file_del<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
             Err(e) => return Ok((atoms::error(), e).encode(env)),
         };
         if s == fp {
+            let next_num_items = match cuckoo_num_items_after_delete(hdr.num_items) {
+                Ok(next) => next,
+                Err(e) => return Ok((atoms::error(), e).encode(env)),
+            };
+            let next_num_deletes = match cuckoo_num_deletes_after_delete(hdr.num_deletes) {
+                Ok(next) => next,
+                Err(e) => return Ok((atoms::error(), e).encode(env)),
+            };
             if let Err(e) = cuckoo_file_write_slot(
                 &file,
                 b2,
@@ -779,10 +822,10 @@ pub fn cuckoo_file_del<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
             ) {
                 return Ok((atoms::error(), e).encode(env));
             }
-            if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items.wrapping_sub(1)) {
+            if let Err(e) = cuckoo_file_write_num_items(&file, next_num_items) {
                 return Ok((atoms::error(), e).encode(env));
             }
-            if let Err(e) = cuckoo_file_write_num_deletes(&file, hdr.num_deletes + 1) {
+            if let Err(e) = cuckoo_file_write_num_deletes(&file, next_num_deletes) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = crate::prob_fsync(&file) {
@@ -1291,6 +1334,16 @@ mod tests {
     }
 
     #[test]
+    fn counter_helpers_reject_overflow_and_underflow() {
+        assert_eq!(cuckoo_num_items_after_insert(0).unwrap(), 1);
+        assert!(cuckoo_num_items_after_insert(u64::MAX).is_err());
+        assert_eq!(cuckoo_num_items_after_delete(1).unwrap(), 0);
+        assert!(cuckoo_num_items_after_delete(0).is_err());
+        assert_eq!(cuckoo_num_deletes_after_delete(0).unwrap(), 1);
+        assert!(cuckoo_num_deletes_after_delete(u64::MAX).is_err());
+    }
+
+    #[test]
     fn truncated_header_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("truncated.cuckoo");
@@ -1524,6 +1577,7 @@ mod tests {
             hdr.num_buckets,
         );
         let b2 = cuckoo_file_alternate_bucket(b1, &fp, hdr.num_buckets);
+        let next_num_items = cuckoo_num_items_after_insert(hdr.num_items)?;
 
         // Try primary bucket.
         for slot in 0..hdr.bucket_size {
@@ -1543,7 +1597,7 @@ mod tests {
                     hdr.fingerprint_size,
                     &fp,
                 )?;
-                cuckoo_file_write_num_items(&file, hdr.num_items + 1)?;
+                cuckoo_file_write_num_items(&file, next_num_items)?;
                 return Ok(true);
             }
         }
@@ -1566,7 +1620,7 @@ mod tests {
                     hdr.fingerprint_size,
                     &fp,
                 )?;
-                cuckoo_file_write_num_items(&file, hdr.num_items + 1)?;
+                cuckoo_file_write_num_items(&file, next_num_items)?;
                 return Ok(true);
             }
         }
@@ -1609,7 +1663,7 @@ mod tests {
                         hdr.fingerprint_size,
                         &evicted,
                     )?;
-                    cuckoo_file_write_num_items(&file, hdr.num_items + 1)?;
+                    cuckoo_file_write_num_items(&file, next_num_items)?;
                     return Ok(true);
                 }
             }
@@ -1667,6 +1721,8 @@ mod tests {
                     hdr.fingerprint_size,
                 )?;
                 if s == fp {
+                    let next_num_items = cuckoo_num_items_after_delete(hdr.num_items)?;
+                    let next_num_deletes = cuckoo_num_deletes_after_delete(hdr.num_deletes)?;
                     cuckoo_file_write_slot(
                         &file,
                         *bucket,
@@ -1675,8 +1731,8 @@ mod tests {
                         hdr.fingerprint_size,
                         &empty,
                     )?;
-                    cuckoo_file_write_num_items(&file, hdr.num_items.wrapping_sub(1))?;
-                    cuckoo_file_write_num_deletes(&file, hdr.num_deletes + 1)?;
+                    cuckoo_file_write_num_items(&file, next_num_items)?;
+                    cuckoo_file_write_num_deletes(&file, next_num_deletes)?;
                     return Ok(true);
                 }
             }
@@ -1712,6 +1768,8 @@ mod tests {
             }
         }
 
+        let next_num_items = cuckoo_num_items_after_insert(hdr.num_items)?;
+
         // Not found — insert (try primary, then alternate, then eviction).
         for slot in 0..hdr.bucket_size {
             let s = cuckoo_file_read_slot(
@@ -1730,7 +1788,7 @@ mod tests {
                     hdr.fingerprint_size,
                     &fp,
                 )?;
-                cuckoo_file_write_num_items(&file, hdr.num_items + 1)?;
+                cuckoo_file_write_num_items(&file, next_num_items)?;
                 return Ok(1);
             }
         }
@@ -1751,7 +1809,7 @@ mod tests {
                     hdr.fingerprint_size,
                     &fp,
                 )?;
-                cuckoo_file_write_num_items(&file, hdr.num_items + 1)?;
+                cuckoo_file_write_num_items(&file, next_num_items)?;
                 return Ok(1);
             }
         }
@@ -1794,7 +1852,7 @@ mod tests {
                         hdr.fingerprint_size,
                         &evicted,
                     )?;
-                    cuckoo_file_write_num_items(&file, hdr.num_items + 1)?;
+                    cuckoo_file_write_num_items(&file, next_num_items)?;
                     return Ok(1);
                 }
             }

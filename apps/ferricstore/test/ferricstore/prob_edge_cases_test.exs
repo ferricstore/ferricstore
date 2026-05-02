@@ -948,6 +948,36 @@ defmodule Ferricstore.ProbEdgeCasesTest do
       assert reason =~ "truncated"
     end
 
+    test "cuckoo_file_add rejects item counter overflow without inserting" do
+      dir = make_prob_dir("nif_cuckoo_add_count_overflow")
+      path = Path.join(dir, "overflow.cuckoo")
+      max_u64 = 18_446_744_073_709_551_615
+
+      assert {:ok, :ok} = NIF.cuckoo_file_create(path, 1024, 4)
+      <<prefix::binary-size(11), _items::binary-size(8), rest::binary>> = File.read!(path)
+      File.write!(path, prefix <> <<max_u64::little-unsigned-64>> <> rest)
+
+      assert {:error, reason} = NIF.cuckoo_file_add(path, "hot")
+      assert reason =~ "overflow"
+      assert {:ok, 0} = NIF.cuckoo_file_exists(path, "hot")
+      assert {:ok, {_, _, _, ^max_u64, 0, _, _}} = NIF.cuckoo_file_info(path)
+    end
+
+    test "cuckoo_file_addnx rejects item counter overflow without inserting" do
+      dir = make_prob_dir("nif_cuckoo_addnx_count_overflow")
+      path = Path.join(dir, "overflow.cuckoo")
+      max_u64 = 18_446_744_073_709_551_615
+
+      assert {:ok, :ok} = NIF.cuckoo_file_create(path, 1024, 4)
+      <<prefix::binary-size(11), _items::binary-size(8), rest::binary>> = File.read!(path)
+      File.write!(path, prefix <> <<max_u64::little-unsigned-64>> <> rest)
+
+      assert {:error, reason} = NIF.cuckoo_file_addnx(path, "hot")
+      assert reason =~ "overflow"
+      assert {:ok, 0} = NIF.cuckoo_file_exists(path, "hot")
+      assert {:ok, {_, _, _, ^max_u64, 0, _, _}} = NIF.cuckoo_file_info(path)
+    end
+
     test "cuckoo_file_del removes element" do
       dir = make_prob_dir("nif_cuckoo_del")
       path = Path.join(dir, "del.cuckoo")
@@ -958,6 +988,23 @@ defmodule Ferricstore.ProbEdgeCasesTest do
 
       assert {:ok, 1} = NIF.cuckoo_file_del(path, "removeme")
       assert {:ok, 0} = NIF.cuckoo_file_exists(path, "removeme")
+    end
+
+    test "cuckoo_file_del rejects delete counter overflow without deleting" do
+      dir = make_prob_dir("nif_cuckoo_del_count_overflow")
+      path = Path.join(dir, "overflow.cuckoo")
+      max_u64 = 18_446_744_073_709_551_615
+
+      assert {:ok, :ok} = NIF.cuckoo_file_create(path, 1024, 4)
+      assert {:ok, 1} = NIF.cuckoo_file_add(path, "victim")
+
+      <<prefix::binary-size(19), _deletes::binary-size(8), rest::binary>> = File.read!(path)
+      File.write!(path, prefix <> <<max_u64::little-unsigned-64>> <> rest)
+
+      assert {:error, reason} = NIF.cuckoo_file_del(path, "victim")
+      assert reason =~ "overflow"
+      assert {:ok, 1} = NIF.cuckoo_file_exists(path, "victim")
+      assert {:ok, {_, _, _, 1, ^max_u64, _, _}} = NIF.cuckoo_file_info(path)
     end
 
     test "cuckoo_file_addnx prevents duplicates" do
