@@ -4107,7 +4107,8 @@ defmodule Ferricstore.Raft.StateMachine do
           state.shard_data_path,
           state.ets,
           state.data_dir,
-          state.shard_index
+          state.shard_index,
+          Map.get(state, :instance_ctx) || Map.get(state, :instance_name)
         )
     end
   end

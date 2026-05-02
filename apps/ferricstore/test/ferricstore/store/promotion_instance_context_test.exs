@@ -1,0 +1,81 @@
+defmodule Ferricstore.Store.PromotionInstanceContextTest do
+  @moduledoc false
+
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Store.{CompoundKey, Router}
+  alias Ferricstore.Test.IsolatedInstance
+
+  setup do
+    original = Application.get_env(:ferricstore, :promotion_threshold)
+
+    original_pt =
+      try do
+        :persistent_term.get(:ferricstore_promotion_threshold)
+      rescue
+        ArgumentError -> :not_set
+      end
+
+    Application.put_env(:ferricstore, :promotion_threshold, 1)
+    :persistent_term.put(:ferricstore_promotion_threshold, 1)
+
+    ctx = IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1_000_000)
+
+    on_exit(fn ->
+      IsolatedInstance.checkin(ctx)
+
+      if original do
+        Application.put_env(:ferricstore, :promotion_threshold, original)
+      else
+        Application.delete_env(:ferricstore, :promotion_threshold)
+      end
+
+      case original_pt do
+        :not_set -> :persistent_term.erase(:ferricstore_promotion_threshold)
+        val -> :persistent_term.put(:ferricstore_promotion_threshold, val)
+      end
+    end)
+
+    {:ok, ctx: ctx}
+  end
+
+  test "promotion in custom instances does not mutate default instance accounting", %{ctx: ctx} do
+    default_ctx = FerricStore.Instance.get(:default)
+    default_before = keydir_binary_total(default_ctx)
+    custom_before = keydir_binary_total(ctx)
+
+    redis_key =
+      "promoted_custom_instance_" <>
+        String.duplicate("k", 80) <> "_#{System.unique_integer([:positive])}"
+
+    assert :ok =
+             Router.compound_put(
+               ctx,
+               redis_key,
+               CompoundKey.hash_field(redis_key, "f1"),
+               String.duplicate("a", 80),
+               0
+             )
+
+    assert :ok =
+             Router.compound_put(
+               ctx,
+               redis_key,
+               CompoundKey.hash_field(redis_key, "f2"),
+               String.duplicate("b", 80),
+               0
+             )
+
+    shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
+    state = :sys.get_state(shard)
+    assert Map.has_key?(state.promoted_instances, redis_key)
+
+    assert keydir_binary_total(default_ctx) == default_before
+    assert keydir_binary_total(ctx) > custom_before
+  end
+
+  defp keydir_binary_total(ctx) do
+    1..ctx.shard_count
+    |> Enum.reduce(0, fn idx, acc -> acc + :atomics.get(ctx.keydir_binary_bytes, idx) end)
+  end
+end

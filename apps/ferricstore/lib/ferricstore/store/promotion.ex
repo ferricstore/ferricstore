@@ -107,15 +107,39 @@ defmodule Ferricstore.Store.Promotion do
     {:ok, path}
   end
 
-  @spec promote_hash!(binary(), reference(), atom(), binary(), non_neg_integer()) ::
+  @spec promote_hash!(binary(), reference(), atom(), binary(), non_neg_integer(), term()) ::
           {:ok, reference()} | {:error, term()}
-  def promote_hash!(redis_key, shared_store, keydir, data_dir, shard_index) do
-    promote_collection!(:hash, redis_key, shared_store, keydir, data_dir, shard_index)
+  def promote_hash!(redis_key, shared_store, keydir, data_dir, shard_index, instance_ctx \\ nil) do
+    promote_collection!(
+      :hash,
+      redis_key,
+      shared_store,
+      keydir,
+      data_dir,
+      shard_index,
+      instance_ctx
+    )
   end
 
-  @spec promote_collection!(atom(), binary(), binary(), atom(), binary(), non_neg_integer()) ::
+  @spec promote_collection!(
+          atom(),
+          binary(),
+          binary(),
+          atom(),
+          binary(),
+          non_neg_integer(),
+          term()
+        ) ::
           {:ok, reference()} | {:error, term()}
-  def promote_collection!(type, redis_key, shard_data_path, keydir, data_dir, shard_index) do
+  def promote_collection!(
+        type,
+        redis_key,
+        shard_data_path,
+        keydir,
+        data_dir,
+        shard_index,
+        instance_ctx \\ nil
+      ) do
     prefix = compound_prefix_for(type, redis_key)
     type_str = CompoundKey.encode_type(type)
     type_label = type_label(type)
@@ -162,7 +186,7 @@ defmodule Ferricstore.Store.Promotion do
     # Step 1: marker
     case NIF.v2_append_record(active_path, mk, type_str, 0) do
       {:ok, {moffset, mvsize}} ->
-        track_binary_insert(keydir, shard_index, mk, type_str)
+        track_binary_insert(keydir, shard_index, mk, type_str, instance_ctx)
         :ets.insert(keydir, {mk, type_str, 0, LFU.initial(), 0, moffset, mvsize})
 
       {:error, reason} ->
@@ -220,8 +244,8 @@ defmodule Ferricstore.Store.Promotion do
     {:ok, dedicated_path}
   end
 
-  @spec recover_promoted(binary(), atom(), binary(), non_neg_integer()) :: map()
-  def recover_promoted(shard_data_path, keydir, data_dir, shard_index) do
+  @spec recover_promoted(binary(), atom(), binary(), non_neg_integer(), term()) :: map()
+  def recover_promoted(shard_data_path, keydir, data_dir, shard_index, instance_ctx \\ nil) do
     # v2: promotion markers are recovered from ETS (populated by recover_keydir).
     # Use :ets.select with a match spec bound to the "PM:" prefix instead of
     # scanning every key in the keydir via :ets.foldl (memory audit L6).
@@ -319,7 +343,7 @@ defmodule Ferricstore.Store.Promotion do
         # Normal recovery path: dedicated has data, apply it.
         Enum.each(final_state, fn
           {key, :tombstone} ->
-            track_binary_delete(keydir, shard_index, key)
+            track_binary_delete(keydir, shard_index, key, instance_ctx)
             :ets.delete(keydir, key)
 
           {key, {:live, fid, file_path, offset, value_size, expire_at_ms}} ->
@@ -329,7 +353,7 @@ defmodule Ferricstore.Store.Promotion do
                 _ -> nil
               end
 
-            track_binary_insert(keydir, shard_index, key, value)
+            track_binary_insert(keydir, shard_index, key, value, instance_ctx)
 
             :ets.insert(
               keydir,
@@ -379,8 +403,15 @@ defmodule Ferricstore.Store.Promotion do
     end)
   end
 
-  @spec cleanup_promoted!(binary(), binary(), atom(), binary(), non_neg_integer()) :: :ok
-  def cleanup_promoted!(redis_key, shard_data_path, keydir, data_dir, shard_index) do
+  @spec cleanup_promoted!(binary(), binary(), atom(), binary(), non_neg_integer(), term()) :: :ok
+  def cleanup_promoted!(
+        redis_key,
+        shard_data_path,
+        keydir,
+        data_dir,
+        shard_index,
+        instance_ctx \\ nil
+      ) do
     mk = marker_key(redis_key)
 
     type =
@@ -409,7 +440,7 @@ defmodule Ferricstore.Store.Promotion do
         raise "promotion cleanup marker tombstone failed: #{inspect(reason)}"
     end
 
-    track_binary_delete(keydir, shard_index, mk)
+    track_binary_delete(keydir, shard_index, mk, instance_ctx)
     :ets.delete(keydir, mk)
 
     path = dedicated_path(data_dir, shard_index, type, redis_key)
@@ -525,17 +556,32 @@ defmodule Ferricstore.Store.Promotion do
 
   # -- Off-heap binary byte tracking --
 
-  defp keydir_binary_ref do
+  defp keydir_binary_ref(%{keydir_binary_bytes: ref, shard_count: count}, shard_index)
+       when ref != nil do
+    if shard_index < count, do: ref, else: nil
+  end
+
+  defp keydir_binary_ref(name, shard_index) when is_atom(name) do
+    keydir_binary_ref_for_instance(name, shard_index)
+  end
+
+  defp keydir_binary_ref(_instance_ctx, shard_index) do
+    keydir_binary_ref_for_instance(:default, shard_index)
+  end
+
+  defp keydir_binary_ref_for_instance(name, shard_index) do
     try do
-      ctx = FerricStore.Instance.get(:default)
-      ctx && ctx.keydir_binary_bytes
+      %{keydir_binary_bytes: ref, shard_count: count} = FerricStore.Instance.get(name)
+      if ref != nil and shard_index < count, do: ref, else: nil
     rescue
       _ -> nil
+    catch
+      :exit, _ -> nil
     end
   end
 
-  defp track_binary_insert(keydir, shard_index, key, new_val) do
-    ref = keydir_binary_ref()
+  defp track_binary_insert(keydir, shard_index, key, new_val, instance_ctx) do
+    ref = keydir_binary_ref(instance_ctx, shard_index)
 
     if ref do
       new_bytes = offheap_size(key) + offheap_size(new_val)
@@ -551,8 +597,8 @@ defmodule Ferricstore.Store.Promotion do
     end
   end
 
-  defp track_binary_delete(keydir, shard_index, key) do
-    ref = keydir_binary_ref()
+  defp track_binary_delete(keydir, shard_index, key, instance_ctx) do
+    ref = keydir_binary_ref(instance_ctx, shard_index)
 
     if ref do
       bytes =

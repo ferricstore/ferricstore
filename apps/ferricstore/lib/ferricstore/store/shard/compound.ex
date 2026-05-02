@@ -501,7 +501,8 @@ defmodule Ferricstore.Store.Shard.Compound do
           state.shard_data_path,
           state.keydir,
           state.data_dir,
-          state.index
+          state.index,
+          state.instance_ctx
         )
 
         new_promoted = Map.delete(state.promoted_instances, redis_key)
@@ -918,7 +919,8 @@ defmodule Ferricstore.Store.Shard.Compound do
                    state.shard_data_path,
                    state.keydir,
                    state.data_dir,
-                   state.index
+                   state.index,
+                   state.instance_ctx
                  ) do
               {:ok, dedicated_store} ->
                 new_promoted =
@@ -978,14 +980,28 @@ defmodule Ferricstore.Store.Shard.Compound do
 
   # -- Off-heap binary byte tracking --
 
-  defp keydir_binary_ref(%{instance_ctx: %{keydir_binary_bytes: ref}}) when ref != nil, do: ref
+  defp keydir_binary_ref(%{instance_ctx: %{keydir_binary_bytes: ref, shard_count: count}} = state)
+       when ref != nil do
+    index = Map.fetch!(state, :index)
+    if index < count, do: ref, else: nil
+  end
 
-  defp keydir_binary_ref(_) do
+  defp keydir_binary_ref(%{instance_name: name} = state) when is_atom(name) do
+    keydir_binary_ref_for_instance(name, Map.fetch!(state, :index))
+  end
+
+  defp keydir_binary_ref(state) do
+    keydir_binary_ref_for_instance(:default, Map.fetch!(state, :index))
+  end
+
+  defp keydir_binary_ref_for_instance(name, index) do
     try do
-      ctx = FerricStore.Instance.get(:default)
-      ctx && ctx.keydir_binary_bytes
+      %{keydir_binary_bytes: ref, shard_count: count} = FerricStore.Instance.get(name)
+      if ref != nil and index < count, do: ref, else: nil
     rescue
       _ -> nil
+    catch
+      :exit, _ -> nil
     end
   end
 

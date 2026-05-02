@@ -235,7 +235,7 @@ defmodule Ferricstore.Store.Shard do
       end
 
     # Recover promoted collection instances
-    promoted = Ferricstore.Store.Promotion.recover_promoted(path, keydir, data_dir, index)
+    promoted = Ferricstore.Store.Promotion.recover_promoted(path, keydir, data_dir, index, ctx)
 
     # Migrate existing prob files: scan prob dir for files without
     # corresponding metadata markers in the keydir. Write markers so
