@@ -303,6 +303,8 @@ defmodule Ferricstore.Store.Shard.Reads do
 
     case NIF.v2_pread_at_async(self(), corr_id, path, offset) do
       :ok ->
+        Process.send_after(self(), {:cold_read_timeout, corr_id}, @cold_read_timeout_ms)
+
         {:noreply,
          %{
            state

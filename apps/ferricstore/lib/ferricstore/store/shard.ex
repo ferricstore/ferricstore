@@ -1061,6 +1061,21 @@ defmodule Ferricstore.Store.Shard do
   # Handle Tokio async completion with correlation ID.
   # Dispatches to fsync completion (flush_in_flight match) or read completion
   # (pending_reads lookup).
+  def handle_info({:cold_read_timeout, corr_id}, state) do
+    case Map.pop(state.pending_reads, corr_id) do
+      {{from, _key}, rest_pending} ->
+        GenServer.reply(from, nil)
+        {:noreply, %{state | pending_reads: rest_pending}}
+
+      {{from, _key, :meta, _exp}, rest_pending} ->
+        GenServer.reply(from, nil)
+        {:noreply, %{state | pending_reads: rest_pending}}
+
+      {nil, _} ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:tokio_complete, corr_id, :ok, value}, state) do
     cond do
       # Async fsync completion — value is :ok for fsync
