@@ -1,5 +1,6 @@
 # Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Server do
+  alias Ferricstore.HLC
   alias Ferricstore.Store.Ops
   @moduledoc """
   Handles Redis server commands: PING, ECHO, DBSIZE, KEYS, FLUSHDB, FLUSHALL,
@@ -897,7 +898,7 @@ defmodule Ferricstore.Commands.Server do
   # Uses :ets.select_count for expires (O(n) at C level, no term creation)
   # and samples up to 20 keys per shard for avg_ttl.
   defp compute_expiry_stats(ctx) do
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
     count_spec = [{{:_, :_, :"$1", :_, :_, :_, :_}, [{:>, :"$1", 0}], [true]}]
     sample_spec = [{{:_, :_, :"$1", :_, :_, :_, :_}, [{:>, :"$1", 0}], [:"$1"]}]
 
