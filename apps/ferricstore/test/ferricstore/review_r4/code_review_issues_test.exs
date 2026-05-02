@@ -12,9 +12,6 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
 
   use ExUnit.Case, async: false
 
-  # Known review findings (E1-E16) — not yet addressed, skip by default
-  @moduletag :skip
-
   alias Ferricstore.Test.ShardHelpers
 
   setup do
@@ -43,8 +40,8 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       result = FerricStore.hget("e1_dst", "f1")
 
       assert result == {:ok, "v1"},
-        "E1 BUG: RENAME did not move hash compound sub-keys. " <>
-        "HGET on renamed key returned #{inspect(result)} instead of {:ok, \"v1\"}"
+             "E1 BUG: RENAME did not move hash compound sub-keys. " <>
+               "HGET on renamed key returned #{inspect(result)} instead of {:ok, \"v1\"}"
     end
 
     test "RENAME hash: old key should no longer have the fields" do
@@ -53,8 +50,9 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
 
       # Old key should not have data
       result = FerricStore.hget("e1_old", "field")
+
       assert result == {:ok, nil},
-        "After RENAME, old key still has field data: #{inspect(result)}"
+             "After RENAME, old key still has field data: #{inspect(result)}"
     end
   end
 
@@ -70,29 +68,31 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       store = Ferricstore.Test.MockStore.make()
 
       # GEOADD stores members with geohash-encoded scores
-      result = Ferricstore.Commands.Geo.handle(
-        "GEOADD",
-        ["geo_key", "13.361389", "38.115556", "Palermo"],
-        store
-      )
+      result =
+        Ferricstore.Commands.Geo.handle(
+          "GEOADD",
+          ["geo_key", "13.361389", "38.115556", "Palermo"],
+          store
+        )
 
       assert result == 1
 
       # Now try ZSCORE on the same key -- should return the score
       # BUG: Geo uses {:zset, [...]} in plain key store;
       # SortedSet uses compound keys Z:key\0member
-      zscore_result = Ferricstore.Commands.SortedSet.handle(
-        "ZSCORE",
-        ["geo_key", "Palermo"],
-        store
-      )
+      zscore_result =
+        Ferricstore.Commands.SortedSet.handle(
+          "ZSCORE",
+          ["geo_key", "Palermo"],
+          store
+        )
 
       # If formats are incompatible, ZSCORE will return nil (member not found)
       # or an error. If compatible, it returns a score string.
       refute is_nil(zscore_result),
-        "E2 BUG: ZSCORE returned nil for GEOADD member -- storage formats are incompatible. " <>
-        "Geo uses :erlang.term_to_binary({:zset, [...]}) in plain key, " <>
-        "SortedSet uses compound keys Z:key\\0member."
+             "E2 BUG: ZSCORE returned nil for GEOADD member -- storage formats are incompatible. " <>
+               "Geo uses :erlang.term_to_binary({:zset, [...]}) in plain key, " <>
+               "SortedSet uses compound keys Z:key\\0member."
     end
   end
 
@@ -121,20 +121,22 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       Ferricstore.Commands.Stream.ensure_meta_table()
 
       # XADD should work correctly
-      id = Ferricstore.Commands.Stream.handle(
-        "XADD",
-        ["e3_stream", "*", "field1", "value1"],
-        store
-      )
+      id =
+        Ferricstore.Commands.Stream.handle(
+          "XADD",
+          ["e3_stream", "*", "field1", "value1"],
+          store
+        )
 
       assert is_binary(id), "XADD should return an ID string, got: #{inspect(id)}"
 
       # XRANGE should find the entry
-      entries = Ferricstore.Commands.Stream.handle(
-        "XRANGE",
-        ["e3_stream", "-", "+"],
-        store
-      )
+      entries =
+        Ferricstore.Commands.Stream.handle(
+          "XRANGE",
+          ["e3_stream", "-", "+"],
+          store
+        )
 
       assert length(entries) == 1
       assert hd(entries) == [id, "field1", "value1"]
@@ -162,25 +164,28 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       Ferricstore.Commands.Hash.handle("HSET", ["e4_key", "f1", "v1"], store)
 
       # HEXPIRE should set expiry
-      result = Ferricstore.Commands.Hash.handle(
-        "HEXPIRE",
-        ["e4_key", "3600", "FIELDS", "1", "f1"],
-        store
-      )
+      result =
+        Ferricstore.Commands.Hash.handle(
+          "HEXPIRE",
+          ["e4_key", "3600", "FIELDS", "1", "f1"],
+          store
+        )
 
       assert result == [1], "HEXPIRE should return [1], got: #{inspect(result)}"
 
       # Check that HTTL returns a positive value
-      ttl_result = Ferricstore.Commands.Hash.handle(
-        "HTTL",
-        ["e4_key", "FIELDS", "1", "f1"],
-        store
-      )
+      ttl_result =
+        Ferricstore.Commands.Hash.handle(
+          "HTTL",
+          ["e4_key", "FIELDS", "1", "f1"],
+          store
+        )
 
       assert is_list(ttl_result)
       [ttl_val] = ttl_result
+
       assert ttl_val > 0 and ttl_val <= 3600,
-        "HTTL should return value between 0 and 3600, got: #{inspect(ttl_val)}"
+             "HTTL should return value between 0 and 3600, got: #{inspect(ttl_val)}"
     end
   end
 
@@ -205,11 +210,12 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       # -9223372036854775808 == @min_int64, so it passes the guard.
       # Then -(-9223372036854775808) = 9223372036854775808 which in Elixir is fine
       # (bignum), but store.incr will produce a value outside INT64 range.
-      result = Ferricstore.Commands.Strings.handle(
-        "DECRBY",
-        ["e5_key", "-9223372036854775808"],
-        store
-      )
+      result =
+        Ferricstore.Commands.Strings.handle(
+          "DECRBY",
+          ["e5_key", "-9223372036854775808"],
+          store
+        )
 
       # The negated delta becomes 9223372036854775808 which is MIN_INT64 negated.
       # In Redis, DECRBY -9223372036854775808 on "0" would produce
@@ -223,9 +229,7 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
         {:ok, value} when is_integer(value) ->
           # Bug if value is outside INT64 range and no error is returned
           if value > 9_223_372_036_854_775_807 or value < -9_223_372_036_854_775_808 do
-            flunk(
-              "E5 BUG: DECRBY returned #{value} which is outside INT64 range without error"
-            )
+            flunk("E5 BUG: DECRBY returned #{value} which is outside INT64 range without error")
           end
 
         other ->
@@ -238,11 +242,12 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       store = Ferricstore.Test.MockStore.make(%{"e5_key2" => {"9223372036854775806", 0}})
 
       # DECRBY key -2 means incr(key, 2), result = 9223372036854775808 > MAX_INT64
-      result = Ferricstore.Commands.Strings.handle(
-        "DECRBY",
-        ["e5_key2", "-2"],
-        store
-      )
+      result =
+        Ferricstore.Commands.Strings.handle(
+          "DECRBY",
+          ["e5_key2", "-2"],
+          store
+        )
 
       case result do
         {:error, _} ->
@@ -250,9 +255,7 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
 
         {:ok, value} when is_integer(value) ->
           if value > 9_223_372_036_854_775_807 do
-            flunk(
-              "E5 BUG: DECRBY produced #{value} exceeding MAX_INT64 without error"
-            )
+            flunk("E5 BUG: DECRBY produced #{value} exceeding MAX_INT64 without error")
           end
 
         other ->
@@ -276,9 +279,9 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       # BUG: FerricStore.expire uses Router.get_meta which reads the plain key.
       # Hash data is stored in compound keys, so Router.get_meta returns nil.
       assert result == {:ok, true},
-        "E6 BUG: EXPIRE returned #{inspect(result)} on hash key. " <>
-        "apply_expiry reads plain key via store.get_meta, but hash keys " <>
-        "have no plain key entry -- they use compound keys."
+             "E6 BUG: EXPIRE returned #{inspect(result)} on hash key. " <>
+               "apply_expiry reads plain key via store.get_meta, but hash keys " <>
+               "have no plain key entry -- they use compound keys."
     end
   end
 
@@ -288,49 +291,47 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
 
   describe "E7: LSET/LREM/LTRIM missing type checks" do
     test "LSET on a string key should return WRONGTYPE" do
-      # Store a plain string
-      :ok = FerricStore.set("e7_str", "hello")
-
-      store = build_store("e7_str")
+      store = Ferricstore.Test.MockStore.make(%{"e7_str" => {"hello", 0}})
 
       # LSET on a string key should return WRONGTYPE error
-      result = Ferricstore.Commands.List.handle(
-        "LSET",
-        ["e7_str", "0", "newval"],
-        store
-      )
+      result =
+        Ferricstore.Commands.List.handle(
+          "LSET",
+          ["e7_str", "0", "newval"],
+          store
+        )
 
       assert match?({:error, "WRONGTYPE" <> _}, result),
-        "E7 BUG: LSET on a string key returned #{inspect(result)} instead of WRONGTYPE error. " <>
-        "LSET does not call TypeRegistry.check_type."
+             "E7 BUG: LSET on a string key returned #{inspect(result)} instead of WRONGTYPE error. " <>
+               "LSET does not call TypeRegistry.check_type."
     end
 
     test "LREM on a string key should return WRONGTYPE" do
-      :ok = FerricStore.set("e7_str2", "hello")
-      store = build_store("e7_str2")
+      store = Ferricstore.Test.MockStore.make(%{"e7_str2" => {"hello", 0}})
 
-      result = Ferricstore.Commands.List.handle(
-        "LREM",
-        ["e7_str2", "0", "hello"],
-        store
-      )
+      result =
+        Ferricstore.Commands.List.handle(
+          "LREM",
+          ["e7_str2", "0", "hello"],
+          store
+        )
 
       assert match?({:error, "WRONGTYPE" <> _}, result),
-        "E7 BUG: LREM on a string key returned #{inspect(result)} instead of WRONGTYPE error"
+             "E7 BUG: LREM on a string key returned #{inspect(result)} instead of WRONGTYPE error"
     end
 
     test "LTRIM on a string key should return WRONGTYPE" do
-      :ok = FerricStore.set("e7_str3", "hello")
-      store = build_store("e7_str3")
+      store = Ferricstore.Test.MockStore.make(%{"e7_str3" => {"hello", 0}})
 
-      result = Ferricstore.Commands.List.handle(
-        "LTRIM",
-        ["e7_str3", "0", "1"],
-        store
-      )
+      result =
+        Ferricstore.Commands.List.handle(
+          "LTRIM",
+          ["e7_str3", "0", "1"],
+          store
+        )
 
       assert match?({:error, "WRONGTYPE" <> _}, result),
-        "E7 BUG: LTRIM on a string key returned #{inspect(result)} instead of WRONGTYPE error"
+             "E7 BUG: LTRIM on a string key returned #{inspect(result)} instead of WRONGTYPE error"
     end
   end
 
@@ -350,11 +351,12 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       )
 
       # HINCRBY by 2 should overflow INT64
-      result = Ferricstore.Commands.Hash.handle(
-        "HINCRBY",
-        ["e8_key", "counter", "2"],
-        store
-      )
+      result =
+        Ferricstore.Commands.Hash.handle(
+          "HINCRBY",
+          ["e8_key", "counter", "2"],
+          store
+        )
 
       # In Redis, this would return an error: "ERR increment or decrement would overflow"
       # In FerricStore, Elixir bignums allow the operation without overflow.
@@ -365,7 +367,7 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
         value when is_integer(value) and value > 9_223_372_036_854_775_807 ->
           flunk(
             "E8 BUG: HINCRBY returned #{value} exceeding MAX_INT64 without error. " <>
-            "Redis would return an overflow error."
+              "Redis would return an overflow error."
           )
 
         value when is_integer(value) ->
@@ -399,7 +401,7 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       {:ok, members} = FerricStore.sinter([set_a, set_b])
 
       assert "member2" in members,
-        "E9 BUG: SINTER across shards did not find 'member2'. Got: #{inspect(members)}"
+             "E9 BUG: SINTER across shards did not find 'member2'. Got: #{inspect(members)}"
     end
 
     test "SUNION with keys on different shards returns correct union" do
@@ -413,7 +415,7 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       {:ok, members} = FerricStore.sunion([set_a, set_b])
 
       assert "only_a" in members and "only_b" in members,
-        "E9 BUG: SUNION across shards missing members. Got: #{inspect(members)}"
+             "E9 BUG: SUNION across shards missing members. Got: #{inspect(members)}"
     end
   end
 
@@ -444,7 +446,7 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
         {_value, 0} ->
           flunk(
             "E10 BUG CONFIRMED: SETBIT cleared the TTL. " <>
-            "store.put.(key, new_value, 0) on line 76 of bitmap.ex sets expire_at_ms=0."
+              "store.put.(key, new_value, 0) on line 76 of bitmap.ex sets expire_at_ms=0."
           )
 
         {_value, exp} when exp == future ->
@@ -465,15 +467,17 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
 
   describe "E11: INCRBY result overflow" do
     test "INCRBY that causes result to exceed MAX_INT64 should error" do
-      store = Ferricstore.Test.MockStore.make(%{
-        "e11_key" => {"9223372036854775806", 0}
-      })
+      store =
+        Ferricstore.Test.MockStore.make(%{
+          "e11_key" => {"9223372036854775806", 0}
+        })
 
-      result = Ferricstore.Commands.Strings.handle(
-        "INCRBY",
-        ["e11_key", "2"],
-        store
-      )
+      result =
+        Ferricstore.Commands.Strings.handle(
+          "INCRBY",
+          ["e11_key", "2"],
+          store
+        )
 
       # Redis would return: ERR increment or decrement would overflow
       case result do
@@ -483,12 +487,12 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
         {:ok, value} when is_integer(value) and value > 9_223_372_036_854_775_807 ->
           flunk(
             "E11 BUG: INCRBY returned #{value} exceeding MAX_INT64 without error. " <>
-            "store.incr computes int_val + delta without checking the result range."
+              "store.incr computes int_val + delta without checking the result range."
           )
 
         {:ok, value} ->
           assert value <= 9_223_372_036_854_775_807,
-            "Result should be within INT64 range"
+                 "Result should be within INT64 range"
 
         other ->
           flunk("Unexpected result: #{inspect(other)}")
@@ -512,18 +516,19 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       )
 
       # OBJECT ENCODING should detect it as a hash
-      result = Ferricstore.Commands.Generic.handle(
-        "OBJECT",
-        ["ENCODING", "e12_hash"],
-        store
-      )
+      result =
+        Ferricstore.Commands.Generic.handle(
+          "OBJECT",
+          ["ENCODING", "e12_hash"],
+          store
+        )
 
       # BUG: OBJECT ENCODING checks store.exists?.(key), but hash keys
       # exist only as compound keys (T:key, H:key\0field), not as plain keys.
       # store.exists? checks the plain key store, so it returns false.
       assert result == "hashtable",
-        "E12 BUG: OBJECT ENCODING returned #{inspect(result)} for hash key. " <>
-        "store.exists? misses compound-key data structures."
+             "E12 BUG: OBJECT ENCODING returned #{inspect(result)} for hash key. " <>
+               "store.exists? misses compound-key data structures."
     end
   end
 
@@ -543,11 +548,12 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       )
 
       # ZRANDMEMBER with WITHSCORES
-      result = Ferricstore.Commands.SortedSet.handle(
-        "ZRANDMEMBER",
-        ["e13_key", "1", "WITHSCORES"],
-        store
-      )
+      result =
+        Ferricstore.Commands.SortedSet.handle(
+          "ZRANDMEMBER",
+          ["e13_key", "1", "WITHSCORES"],
+          store
+        )
 
       # The result should be ["member1", formatted_score]
       # BUG: select_random_zset_members (line 880) does:
@@ -568,7 +574,7 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
         # Check: is it a string? (compound_scan returns {member, score_str} where
         # score_str is the raw stored value). format_score would reformat it.
         assert is_binary(score_str),
-          "Score should be a string, got: #{inspect(score_str)}"
+               "Score should be a string, got: #{inspect(score_str)}"
       end
     end
   end
@@ -614,8 +620,8 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
         end
 
       refute match?({:error, :case_clause_error}, result),
-        "E14 BUG: DEL raised CaseClauseError for stream type. " <>
-        "The case statement in do_del_key is missing a 'stream' clause and has no catch-all."
+             "E14 BUG: DEL raised CaseClauseError for stream type. " <>
+               "The case statement in do_del_key is missing a 'stream' clause and has no catch-all."
     end
   end
 
@@ -635,23 +641,24 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       )
 
       # GETEX on a hash key should return WRONGTYPE
-      result = Ferricstore.Commands.Strings.handle(
-        "GETEX",
-        ["e15_hash"],
-        store
-      )
+      result =
+        Ferricstore.Commands.Strings.handle(
+          "GETEX",
+          ["e15_hash"],
+          store
+        )
 
       # GETEX without options calls store.get.(key) which returns nil for
       # data structures stored via compound keys. It does NOT check TypeRegistry.
       # The question is: does it return nil (wrong, should be WRONGTYPE) or error?
       assert match?({:error, "WRONGTYPE" <> _}, result) or is_nil(result),
-        "GETEX on hash key returned: #{inspect(result)}"
+             "GETEX on hash key returned: #{inspect(result)}"
 
       # Specifically check it IS NOT returning nil without checking type
       if is_nil(result) do
         flunk(
           "E15 BUG: GETEX returned nil for hash key instead of WRONGTYPE. " <>
-          "GETEX does not check TypeRegistry before reading."
+            "GETEX does not check TypeRegistry before reading."
         )
       end
     end
@@ -667,11 +674,12 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       )
 
       # SETNX on a hash key -- hash compound keys exist but plain key doesn't
-      result = Ferricstore.Commands.Strings.handle(
-        "SETNX",
-        ["e15_hash2", "overwrite_value"],
-        store
-      )
+      result =
+        Ferricstore.Commands.Strings.handle(
+          "SETNX",
+          ["e15_hash2", "overwrite_value"],
+          store
+        )
 
       # SETNX checks store.exists?.(key). Hash keys don't have a plain key
       # entry, so exists? returns false. SETNX then sets the key as a string,
@@ -679,13 +687,13 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       #
       # After SETNX, the key should still be a hash.
       assert match?({:error, "WRONGTYPE" <> _}, result) or result == 0,
-        "SETNX on hash key should return WRONGTYPE or 0 (key exists), got: #{inspect(result)}"
+             "SETNX on hash key should return WRONGTYPE or 0 (key exists), got: #{inspect(result)}"
 
       if result == 1 do
         flunk(
           "E15 BUG: SETNX returned 1 (set successfully) on hash key. " <>
-          "SETNX uses store.exists? which misses compound-key data structures, " <>
-          "then overwrites the hash with a string value."
+            "SETNX uses store.exists? which misses compound-key data structures, " <>
+            "then overwrites the hash with a string value."
         )
       end
     end
@@ -707,26 +715,19 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       )
 
       # APPEND on a hash key
-      result = Ferricstore.Commands.Strings.handle(
-        "APPEND",
-        ["e16_hash", "data"],
-        store
-      )
+      result =
+        Ferricstore.Commands.Strings.handle(
+          "APPEND",
+          ["e16_hash", "data"],
+          store
+        )
 
       # APPEND calls store.append.(key, value) directly without checking
       # TypeRegistry. The hash's plain key is nil, so append creates a new
       # string key, effectively corrupting the hash.
       assert match?({:error, "WRONGTYPE" <> _}, result),
-        "E16 BUG: APPEND on hash key returned #{inspect(result)} instead of WRONGTYPE. " <>
-        "APPEND does not check TypeRegistry before writing."
+             "E16 BUG: APPEND on hash key returned #{inspect(result)} instead of WRONGTYPE. " <>
+               "APPEND does not check TypeRegistry before writing."
     end
-  end
-
-  # ===========================================================================
-  # Helper: build a store map for a key that exists in the live system
-  # ===========================================================================
-
-  defp build_store(_key) do
-    Ferricstore.Test.MockStore.make()
   end
 end
