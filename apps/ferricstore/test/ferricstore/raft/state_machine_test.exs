@@ -365,6 +365,24 @@ defmodule Ferricstore.Raft.StateMachineTest do
              end)
     end
 
+    test "origin async DELETE persists tombstone even when Router already removed ETS", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      assert [] == :ets.lookup(ets, "origin_delete_missing_ets")
+
+      {_state2, :ok} =
+        StateMachine.apply(%{}, {:async, node(), {:delete, "origin_delete_missing_ets"}}, state)
+
+      assert [] == :ets.lookup(ets, "origin_delete_missing_ets")
+      assert {:ok, records} = NIF.v2_scan_file(active_file_path)
+
+      assert Enum.any?(records, fn {"origin_delete_missing_ets", _off, _size, _exp, tombstone?} ->
+               tombstone?
+             end)
+    end
+
     test "replays origin async GETDEL when recovery still has an older value", %{
       state: state,
       ets: ets,
@@ -382,6 +400,24 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert {:ok, records} = NIF.v2_scan_file(active_file_path)
 
       assert Enum.any?(records, fn {"origin_getdel", _off, _size, _exp, tombstone?} ->
+               tombstone?
+             end)
+    end
+
+    test "origin async GETDEL persists tombstone even when Router already removed ETS", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      assert [] == :ets.lookup(ets, "origin_getdel_missing_ets")
+
+      {_state2, nil} =
+        StateMachine.apply(%{}, {:async, node(), {:getdel, "origin_getdel_missing_ets"}}, state)
+
+      assert [] == :ets.lookup(ets, "origin_getdel_missing_ets")
+      assert {:ok, records} = NIF.v2_scan_file(active_file_path)
+
+      assert Enum.any?(records, fn {"origin_getdel_missing_ets", _off, _size, _exp, tombstone?} ->
                tombstone?
              end)
     end

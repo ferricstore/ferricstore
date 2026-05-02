@@ -1960,16 +1960,21 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_single(state, {:put, key, value, expire_at_ms})
   end
 
-  # DELETE/GETDEL are idempotent and must repair the origin on replay. During
-  # normal apply the Router already removed ETS, so this is a cheap no-op. After
-  # a crash before the local tombstone flush, recovery sees the old key and this
-  # writes the tombstone from the accepted Raft command.
+  # DELETE/GETDEL are idempotent and must persist an accepted tombstone on the
+  # origin even when Router already removed the ETS row. Router's local
+  # BitcaskWriter tombstone is asynchronous and can fail independently; the Ra
+  # entry is the authoritative repair path.
   defp apply_single(state, {:async, origin, {:delete, key}}) when origin == node() do
-    if ets_has?(state.ets, key), do: apply_single(state, {:delete, key}), else: :ok
+    apply_single(state, {:delete, key})
   end
 
   defp apply_single(state, {:async, origin, {:getdel, key}}) when origin == node() do
-    if ets_has?(state.ets, key), do: apply_single(state, {:getdel, key}), else: nil
+    if ets_has?(state.ets, key) do
+      apply_single(state, {:getdel, key})
+    else
+      _ = apply_single(state, {:delete, key})
+      nil
+    end
   end
 
   defp apply_single(
