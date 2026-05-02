@@ -11,6 +11,7 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
 
   alias Ferricstore.Commands.Native
   alias Ferricstore.FetchOrCompute
+  alias Ferricstore.Store.DiskPressure
   alias Ferricstore.Store.Router
 
   # Generates a unique key to prevent cross-test interference.
@@ -59,7 +60,13 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
     test "returns compute with the provided hint" do
       key = ukey("miss_with_hint")
 
-      result = Native.handle("FETCH_OR_COMPUTE", [key, "5000", "https://api.example.com/data"], dummy_store())
+      result =
+        Native.handle(
+          "FETCH_OR_COMPUTE",
+          [key, "5000", "https://api.example.com/data"],
+          dummy_store()
+        )
+
       assert ["compute", "https://api.example.com/data"] = result
 
       # Clean up.
@@ -79,7 +86,12 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       ["compute", _hint] = Native.handle("FETCH_OR_COMPUTE", [key, "10000"], dummy_store())
 
       # Deliver the result.
-      assert :ok = Native.handle("FETCH_OR_COMPUTE_RESULT", [key, "computed_value", "10000"], dummy_store())
+      assert :ok =
+               Native.handle(
+                 "FETCH_OR_COMPUTE_RESULT",
+                 [key, "computed_value", "10000"],
+                 dummy_store()
+               )
 
       # Value should now be in the store.
       assert "computed_value" == Router.get(FerricStore.Instance.get(:default), key)
@@ -89,7 +101,9 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       key = ukey("result_ttl")
 
       ["compute", _] = Native.handle("FETCH_OR_COMPUTE", [key, "5000"], dummy_store())
-      assert :ok = Native.handle("FETCH_OR_COMPUTE_RESULT", [key, "ttl_val", "5000"], dummy_store())
+
+      assert :ok =
+               Native.handle("FETCH_OR_COMPUTE_RESULT", [key, "ttl_val", "5000"], dummy_store())
 
       assert "ttl_val" == Router.get(FerricStore.Instance.get(:default), key)
       {_val, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), key)
@@ -106,6 +120,36 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       # Now fetching the same key should return hit.
       result = Native.handle("FETCH_OR_COMPUTE", [key, "5000"], dummy_store())
       assert ["hit", "done"] = result
+    end
+
+    test "returns write error and wakes waiters with error when storing result fails" do
+      key = "foc:result_pressure_#{:erlang.unique_integer([:positive])}"
+      ctx = FerricStore.Instance.get(:default)
+      idx = Router.shard_for(ctx, key)
+
+      assert :ok = Ferricstore.NamespaceConfig.set("foc", "durability", "async")
+
+      try do
+        assert {:compute, "hint"} = FetchOrCompute.fetch_or_compute(key, 5_000, "hint")
+
+        waiter =
+          Task.async(fn ->
+            FetchOrCompute.fetch_or_compute(key, 5_000, "hint")
+          end)
+
+        Process.sleep(50)
+        DiskPressure.set(ctx, idx)
+
+        assert {:error, "ERR disk pressure" <> _} =
+                 FetchOrCompute.fetch_or_compute_result(key, "computed_value", 5_000)
+
+        assert {:error, "ERR disk pressure" <> _} = Task.await(waiter, 1_000)
+        assert nil == Router.get(ctx, key)
+      after
+        DiskPressure.clear(ctx, idx)
+        Ferricstore.NamespaceConfig.set("foc", "durability", "quorum")
+        FetchOrCompute.fetch_or_compute_error(key, "cleanup")
+      end
     end
   end
 
@@ -178,7 +222,12 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       assert {:compute, "hint"} = Task.await(computer, 100)
 
       # Report error.
-      assert :ok = Native.handle("FETCH_OR_COMPUTE_ERROR", [key, "db connection failed"], dummy_store())
+      assert :ok =
+               Native.handle(
+                 "FETCH_OR_COMPUTE_ERROR",
+                 [key, "db connection failed"],
+                 dummy_store()
+               )
 
       # Waiter should receive the error.
       result = Task.await(waiter, 1000)
@@ -214,7 +263,9 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
     end
 
     test "FETCH_OR_COMPUTE with too many args returns error" do
-      assert {:error, msg} = Native.handle("FETCH_OR_COMPUTE", ["k", "5000", "h", "extra"], dummy_store())
+      assert {:error, msg} =
+               Native.handle("FETCH_OR_COMPUTE", ["k", "5000", "h", "extra"], dummy_store())
+
       assert msg =~ "wrong number of arguments"
     end
 
@@ -234,7 +285,9 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
     end
 
     test "FETCH_OR_COMPUTE_RESULT with non-integer ttl returns error" do
-      assert {:error, msg} = Native.handle("FETCH_OR_COMPUTE_RESULT", ["k", "v", "abc"], dummy_store())
+      assert {:error, msg} =
+               Native.handle("FETCH_OR_COMPUTE_RESULT", ["k", "v", "abc"], dummy_store())
+
       assert msg =~ "not an integer"
     end
 
@@ -244,7 +297,9 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
     end
 
     test "FETCH_OR_COMPUTE_ERROR with too many args returns error" do
-      assert {:error, msg} = Native.handle("FETCH_OR_COMPUTE_ERROR", ["k", "e", "extra"], dummy_store())
+      assert {:error, msg} =
+               Native.handle("FETCH_OR_COMPUTE_ERROR", ["k", "e", "extra"], dummy_store())
+
       assert msg =~ "wrong number of arguments"
     end
   end
@@ -276,7 +331,10 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       key = ukey("disp_focr")
       # First become the computer.
       ["compute", _] = Dispatcher.dispatch("FETCH_OR_COMPUTE", [key, "5000"], dummy_store())
-      assert :ok = Dispatcher.dispatch("FETCH_OR_COMPUTE_RESULT", [key, "v", "5000"], dummy_store())
+
+      assert :ok =
+               Dispatcher.dispatch("FETCH_OR_COMPUTE_RESULT", [key, "v", "5000"], dummy_store())
+
       assert "v" == Router.get(FerricStore.Instance.get(:default), key)
     end
 

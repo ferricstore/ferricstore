@@ -76,7 +76,7 @@ defmodule Ferricstore.FetchOrCompute do
   Stores the value via Router (Raft-replicated to all nodes), releases the
   distributed lock, and wakes all local waiters.
   """
-  @spec fetch_or_compute_result(binary(), binary(), pos_integer()) :: :ok
+  @spec fetch_or_compute_result(binary(), binary(), non_neg_integer()) :: :ok | {:error, term()}
   def fetch_or_compute_result(key, value, ttl_ms) do
     GenServer.call(__MODULE__, {:fetch_or_compute_result, key, value, ttl_ms})
   end
@@ -113,7 +113,12 @@ defmodule Ferricstore.FetchOrCompute do
         case :ets.lookup(@table, key) do
           [{^key, computer_pid, waiters, started_at, lock_hint, compute_id}] ->
             new_waiters = waiters ++ [{from, caller_pid}]
-            :ets.insert(@table, {key, computer_pid, new_waiters, started_at, lock_hint, compute_id})
+
+            :ets.insert(
+              @table,
+              {key, computer_pid, new_waiters, started_at, lock_hint, compute_id}
+            )
+
             {:noreply, state}
 
           [] ->
@@ -150,14 +155,18 @@ defmodule Ferricstore.FetchOrCompute do
       end
 
     ctx = FerricStore.Instance.get(:default)
-    Router.put(ctx, key, value, expire_at_ms)
+    write_result = Router.put(ctx, key, value, expire_at_ms)
 
     # Wake local waiters and release the cluster-wide lock.
     case :ets.lookup(@table, key) do
       [{^key, _computer_pid, waiters, _started, _hint, compute_id}] ->
-        Enum.each(waiters, fn {waiter_from, _pid} ->
-          GenServer.reply(waiter_from, {:ok, value})
-        end)
+        reply =
+          case write_result do
+            :ok -> {:ok, value}
+            {:error, _} = error -> error
+          end
+
+        Enum.each(waiters, fn {waiter_from, _pid} -> GenServer.reply(waiter_from, reply) end)
 
         _ = Router.unlock(ctx, lock_key(key), compute_id)
         :ets.delete(@table, key)
@@ -168,7 +177,7 @@ defmodule Ferricstore.FetchOrCompute do
         :ok
     end
 
-    {:reply, :ok, state}
+    {:reply, write_result, state}
   end
 
   def handle_call({:fetch_or_compute_error, key, error_msg}, _from, state) do
