@@ -541,7 +541,7 @@ defmodule Ferricstore.Store.Shard.Compound do
       when (exp == 0 or exp > now) and is_integer(fid) and is_integer(offset) and offset >= 0 ->
         file_path = dedicated_file_path(dedicated_path, fid)
 
-        case NIF.v2_pread_at(file_path, offset) do
+        case read_cold_async(file_path, offset) do
           {:ok, value} -> {:ok, value, exp}
           other -> other
         end
@@ -569,7 +569,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
               {_key, offset, _vsize, exp, false} ->
                 if exp == 0 or exp > now do
-                  case NIF.v2_pread_at(active, offset) do
+                  case read_cold_async(active, offset) do
                     {:ok, value} -> {:ok, value, exp}
                     other -> other
                   end
@@ -888,7 +888,7 @@ defmodule Ferricstore.Store.Shard.Compound do
       valid_promoted_cold_location?(fid, off, vsize) ->
         file_path = dedicated_file_path(dedicated_path, fid)
 
-        case NIF.v2_pread_at(file_path, off) do
+        case read_cold_async(file_path, off) do
           {:ok, cold_value} -> [{key, cold_value, exp} | acc]
           _ -> acc
         end
@@ -968,6 +968,23 @@ defmodule Ferricstore.Store.Shard.Compound do
 
       true ->
         nil
+    end
+  end
+
+  defp read_cold_async(path, offset) do
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    case NIF.v2_pread_at_async(self(), corr_id, path, offset) do
+      :ok ->
+        receive do
+          {:tokio_complete, ^corr_id, :ok, value} -> {:ok, value}
+          {:tokio_complete, ^corr_id, :error, reason} -> {:error, reason}
+        after
+          @cold_batch_read_timeout_ms -> {:error, :timeout}
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

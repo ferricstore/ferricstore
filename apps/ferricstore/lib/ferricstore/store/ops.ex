@@ -23,6 +23,7 @@ defmodule Ferricstore.Store.Ops do
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
   @overflow_error "ERR increment or decrement would overflow"
+  @cold_read_timeout_ms 10_000
 
   defguardp valid_cold_location(file_id, offset, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
@@ -1077,13 +1078,30 @@ defmodule Ferricstore.Store.Ops do
   defp read_promoted_cold_value(tx, compound_key, dedicated_path, fid, off, vsize, exp) do
     path = ShardETS.file_path(dedicated_path, fid)
 
-    case NIF.v2_pread_at(path, off) do
+    case read_cold_async(path, off) do
       {:ok, value} ->
         ShardETS.cold_read_warm_ets(tx.shard_state, compound_key, value, exp, fid, off, vsize)
         {value, exp}
 
       _ ->
         nil
+    end
+  end
+
+  defp read_cold_async(path, offset) do
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    case NIF.v2_pread_at_async(self(), corr_id, path, offset) do
+      :ok ->
+        receive do
+          {:tokio_complete, ^corr_id, :ok, value} -> {:ok, value}
+          {:tokio_complete, ^corr_id, :error, reason} -> {:error, reason}
+        after
+          @cold_read_timeout_ms -> {:error, :timeout}
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 end
