@@ -851,19 +851,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # commands through Raft without the library knowing what they are.
   # The server registers a raft_apply_hook callback on the Instance struct.
   def apply(meta, {:server_command, command}, state) do
-    hook =
-      case state.instance_ctx do
-        %{raft_apply_hook: fun} when is_function(fun) ->
-          fun
-
-        _ ->
-          try do
-            FerricStore.Instance.get(:default).raft_apply_hook
-          rescue
-            _ -> nil
-          end
-      end
-
+    hook = raft_apply_hook(state)
     result = if hook, do: hook.(command), else: {:error, :no_hook}
     bump_applied(meta, state, result)
   end
@@ -1082,6 +1070,27 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_now_ms do
     CommandTime.now_ms()
+  end
+
+  defp raft_apply_hook(%{instance_ctx: %{raft_apply_hook: fun}}) when is_function(fun), do: fun
+
+  defp raft_apply_hook(%{instance_name: name}) when is_atom(name) do
+    raft_apply_hook_for_instance(name)
+  end
+
+  defp raft_apply_hook(_state), do: raft_apply_hook_for_instance(:default)
+
+  defp raft_apply_hook_for_instance(name) do
+    try do
+      case FerricStore.Instance.get(name) do
+        %{raft_apply_hook: fun} when is_function(fun) -> fun
+        _ -> nil
+      end
+    rescue
+      _ -> nil
+    catch
+      :exit, _ -> nil
+    end
   end
 
   defp apply_pending_with_time(meta, state, fun) do
@@ -3427,15 +3436,7 @@ defmodule Ferricstore.Raft.StateMachine do
           # reads. If no ctx (uncommon in production) try the default
           # instance as a fallback so bitop/pfmerge still work in tests
           # that don't thread instance_ctx through to state machine config.
-          ctx =
-            state.instance_ctx ||
-              try do
-                FerricStore.Instance.get(:default)
-              rescue
-                ArgumentError -> nil
-              end
-
-          case ctx do
+          case instance_ctx_for_state(state) do
             nil -> nil
             c -> Router.get(c, key)
           end
@@ -3465,7 +3466,7 @@ defmodule Ferricstore.Raft.StateMachine do
         if live_key?(state, key) do
           true
         else
-          case state.instance_ctx do
+          case instance_ctx_for_state(state) do
             nil -> false
             ctx -> Router.exists?(ctx, key)
           end
@@ -3479,15 +3480,7 @@ defmodule Ferricstore.Raft.StateMachine do
       compound_get: fn rk, ck ->
         case do_get(state, ck) do
           nil ->
-            ctx =
-              state.instance_ctx ||
-                try do
-                  FerricStore.Instance.get(:default)
-                rescue
-                  ArgumentError -> nil
-                end
-
-            case ctx do
+            case instance_ctx_for_state(state) do
               nil -> nil
               ctx -> Router.compound_get(ctx, rk, ck)
             end
@@ -3536,6 +3529,22 @@ defmodule Ferricstore.Raft.StateMachine do
         :ok
       end
     }
+  end
+
+  defp instance_ctx_for_state(%{instance_ctx: %FerricStore.Instance{} = ctx}), do: ctx
+
+  defp instance_ctx_for_state(%{instance_name: name}) when is_atom(name) do
+    instance_ctx_by_name(name)
+  end
+
+  defp instance_ctx_for_state(_state), do: instance_ctx_by_name(:default)
+
+  defp instance_ctx_by_name(name) do
+    FerricStore.Instance.get(name)
+  rescue
+    _ -> nil
+  catch
+    :exit, _ -> nil
   end
 
   # Mirror of TypeRegistry.check_or_set but operates on state machine state.

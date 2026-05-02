@@ -134,6 +134,56 @@ defmodule Ferricstore.Raft.StateMachineTest do
         File.rm_rf!(root)
       end
     end
+
+    test "server_command apply resolves hook from checkpoint-safe instance_name" do
+      name = :"sm_hook_instance_#{System.unique_integer([:positive])}"
+      root = Path.join(System.tmp_dir!(), "sm_hook_#{System.unique_integer([:positive])}")
+      shard_path = Ferricstore.DataDir.shard_data_path(root, 0)
+      File.mkdir_p!(shard_path)
+
+      ets = :ets.new(:"sm_hook_ets_#{System.unique_integer([:positive])}", [:set, :public])
+
+      ctx =
+        FerricStore.Instance.build(name,
+          data_dir: root,
+          shard_count: 1,
+          raft_enabled: false,
+          max_memory_bytes: 256 * 1024 * 1024,
+          keydir_max_ram: 64 * 1024 * 1024
+        )
+
+      FerricStore.Instance.inject_callbacks(name,
+        raft_apply_hook: fn {:echo, value} -> {:custom_instance, value} end
+      )
+
+      try do
+        state =
+          StateMachine.init(%{
+            shard_index: 0,
+            shard_data_path: shard_path,
+            active_file_id: 0,
+            active_file_path: Path.join(shard_path, "00000.log"),
+            ets: ets,
+            instance_name: name
+          })
+
+        assert {_state, {:custom_instance, "ok"}} =
+                 StateMachine.apply(%{}, {:server_command, {:echo, "ok"}}, state)
+      after
+        FerricStore.Instance.cleanup(name)
+        safe_delete_ets(ets)
+        safe_delete_ets(elem(ctx.keydir_refs, 0))
+        safe_delete_ets(ctx.hotness_table)
+        safe_delete_ets(ctx.config_table)
+        File.rm_rf!(root)
+      end
+    end
+  end
+
+  defp safe_delete_ets(table) do
+    :ets.delete(table)
+  rescue
+    ArgumentError -> :ok
   end
 
   describe "origin async PUT replay" do
