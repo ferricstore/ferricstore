@@ -7,10 +7,11 @@ defmodule Ferricstore.Commands.TopK do
   TOPK.COUNT, TOPK.INFO) use stateless pread NIFs on local files.
   """
 
-  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Bitcask.{Async, NIF}
   alias Ferricstore.Commands.ProbType
   alias Ferricstore.Store.Ops
 
+  @prob_read_timeout_ms 5_000
   @default_width 8
   @default_depth 7
   @default_decay 0.9
@@ -76,15 +77,14 @@ defmodule Ferricstore.Commands.TopK do
   def handle("TOPK.QUERY", [key | elements], store) when elements != [] do
     with :ok <- ProbType.check_expected(key, :topk, store) do
       path = prob_path(store, key, "topk")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.topk_file_query_v2_async(self(), corr_id, path, elements)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok, result} -> result
-        {:tokio_complete, ^corr_id, :error, "enoent"} -> {:error, "ERR TOPK: key does not exist"}
-        {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR TOPK: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
+      case await_nif(fn proxy, corr_id ->
+             NIF.topk_file_query_v2_async(proxy, corr_id, path, elements)
+           end) do
+        {:ok, result} -> result
+        {:error, "enoent"} -> {:error, "ERR TOPK: key does not exist"}
+        {:error, :timeout} -> {:error, "ERR timeout"}
+        {:error, reason} -> {:error, "ERR TOPK: #{reason}"}
       end
     end
   end
@@ -100,15 +100,14 @@ defmodule Ferricstore.Commands.TopK do
   def handle("TOPK.LIST", [key], store) do
     with :ok <- ProbType.check_expected(key, :topk, store) do
       path = prob_path(store, key, "topk")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.topk_file_list_v2_async(self(), corr_id, path)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok, result} -> result
-        {:tokio_complete, ^corr_id, :error, "enoent"} -> {:error, "ERR TOPK: key does not exist"}
-        {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR topk list failed: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
+      case await_nif(fn proxy, corr_id ->
+             NIF.topk_file_list_v2_async(proxy, corr_id, path)
+           end) do
+        {:ok, result} -> result
+        {:error, "enoent"} -> {:error, "ERR TOPK: key does not exist"}
+        {:error, :timeout} -> {:error, "ERR timeout"}
+        {:error, reason} -> {:error, "ERR topk list failed: #{reason}"}
       end
     end
   end
@@ -132,15 +131,14 @@ defmodule Ferricstore.Commands.TopK do
   def handle("TOPK.COUNT", [key | elements], store) when elements != [] do
     with :ok <- ProbType.check_expected(key, :topk, store) do
       path = prob_path(store, key, "topk")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.topk_file_count_v2_async(self(), corr_id, path, elements)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok, result} -> result
-        {:tokio_complete, ^corr_id, :error, "enoent"} -> {:error, "ERR TOPK: key does not exist"}
-        {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR TOPK: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
+      case await_nif(fn proxy, corr_id ->
+             NIF.topk_file_count_v2_async(proxy, corr_id, path, elements)
+           end) do
+        {:ok, result} -> result
+        {:error, "enoent"} -> {:error, "ERR TOPK: key does not exist"}
+        {:error, :timeout} -> {:error, "ERR timeout"}
+        {:error, reason} -> {:error, "ERR TOPK: #{reason}"}
       end
     end
   end
@@ -156,20 +154,21 @@ defmodule Ferricstore.Commands.TopK do
   def handle("TOPK.INFO", [key], store) do
     with :ok <- ProbType.check_expected(key, :topk, store) do
       path = prob_path(store, key, "topk")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.topk_file_info_v2_async(self(), corr_id, path)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok, {k, width, depth, decay}} ->
+      case await_nif(fn proxy, corr_id ->
+             NIF.topk_file_info_v2_async(proxy, corr_id, path)
+           end) do
+        {:ok, {k, width, depth, decay}} ->
           ["k", k, "width", width, "depth", depth, "decay", decay]
 
-        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+        {:error, "enoent"} ->
           {:error, "ERR TOPK: key does not exist"}
 
-        {:tokio_complete, ^corr_id, :error, reason} ->
+        {:error, :timeout} ->
+          {:error, "ERR timeout"}
+
+        {:error, reason} ->
           {:error, "ERR TOPK: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
       end
     end
   end
@@ -198,21 +197,21 @@ defmodule Ferricstore.Commands.TopK do
       path = prob_path(store, key, "topk")
 
       # First: get list (async, await)
-      list_corr = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.topk_file_list_v2_async(self(), list_corr, path)
-
       items =
-        receive do
-          {:tokio_complete, ^list_corr, :ok, result} ->
+        case await_nif(fn proxy, corr_id ->
+               NIF.topk_file_list_v2_async(proxy, corr_id, path)
+             end) do
+          {:ok, result} ->
             result
 
-          {:tokio_complete, ^list_corr, :error, "enoent"} ->
+          {:error, "enoent"} ->
             {:error, "ERR TOPK: key does not exist"}
 
-          {:tokio_complete, ^list_corr, :error, reason} ->
+          {:error, :timeout} ->
+            {:error, "ERR timeout"}
+
+          {:error, reason} ->
             {:error, "ERR topk list failed: #{reason}"}
-        after
-          5000 -> {:error, "ERR timeout"}
         end
 
       case items do
@@ -221,20 +220,20 @@ defmodule Ferricstore.Commands.TopK do
 
         items when is_list(items) ->
           # Second: get counts (async, await)
-          count_corr = System.unique_integer([:positive, :monotonic])
-          :ok = NIF.topk_file_count_v2_async(self(), count_corr, path, items)
-
-          receive do
-            {:tokio_complete, ^count_corr, :ok, counts} ->
+          case await_nif(fn proxy, corr_id ->
+                 NIF.topk_file_count_v2_async(proxy, corr_id, path, items)
+               end) do
+            {:ok, counts} ->
               Enum.zip(items, counts) |> Enum.flat_map(fn {elem, count} -> [elem, count] end)
 
-            {:tokio_complete, ^count_corr, :error, "enoent"} ->
+            {:error, "enoent"} ->
               {:error, "ERR TOPK: key does not exist"}
 
-            {:tokio_complete, ^count_corr, :error, reason} ->
+            {:error, :timeout} ->
+              {:error, "ERR timeout"}
+
+            {:error, reason} ->
               {:error, "ERR topk list failed: #{reason}"}
-          after
-            5000 -> {:error, "ERR timeout"}
           end
       end
     end
@@ -252,6 +251,8 @@ defmodule Ferricstore.Commands.TopK do
   defp maybe_register_topk({:ok, _}, store, key), do: do_register_topk(store, key)
   defp maybe_register_topk(:ok, store, key), do: do_register_topk(store, key)
   defp maybe_register_topk(other, _store, _key), do: other
+
+  defp await_nif(submit_fun), do: Async.await(submit_fun, @prob_read_timeout_ms)
 
   defp do_register_topk(%FerricStore.Instance{}, _key) do
     # When using Instance struct, prob commands go through Raft and

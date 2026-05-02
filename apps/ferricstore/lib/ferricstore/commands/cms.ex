@@ -7,8 +7,10 @@ defmodule Ferricstore.Commands.CMS do
   CMS.INFO) use stateless pread NIFs on local files.
   """
 
-  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Bitcask.{Async, NIF}
   alias Ferricstore.Commands.ProbType
+
+  @prob_read_timeout_ms 5_000
 
   # -------------------------------------------------------------------
   # Public command handler
@@ -68,15 +70,14 @@ defmodule Ferricstore.Commands.CMS do
   def handle("CMS.QUERY", [key | elements], store) when elements != [] do
     with :ok <- ProbType.check_expected(key, :cms, store) do
       path = prob_path(store, key, "cms")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.cms_file_query_async(self(), corr_id, path, elements)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok, counts} -> counts
-        {:tokio_complete, ^corr_id, :error, "enoent"} -> {:error, "ERR CMS: key does not exist"}
-        {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR CMS query failed: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
+      case await_nif(fn proxy, corr_id ->
+             NIF.cms_file_query_async(proxy, corr_id, path, elements)
+           end) do
+        {:ok, counts} -> counts
+        {:error, "enoent"} -> {:error, "ERR CMS: key does not exist"}
+        {:error, :timeout} -> {:error, "ERR timeout"}
+        {:error, reason} -> {:error, "ERR CMS query failed: #{reason}"}
       end
     end
   end
@@ -105,20 +106,21 @@ defmodule Ferricstore.Commands.CMS do
   def handle("CMS.INFO", [key], store) do
     with :ok <- ProbType.check_expected(key, :cms, store) do
       path = prob_path(store, key, "cms")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.cms_file_info_async(self(), corr_id, path)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok, {width, depth, count}} ->
+      case await_nif(fn proxy, corr_id ->
+             NIF.cms_file_info_async(proxy, corr_id, path)
+           end) do
+        {:ok, {width, depth, count}} ->
           ["width", width, "depth", depth, "count", count]
 
-        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+        {:error, "enoent"} ->
           {:error, "ERR CMS: key does not exist"}
 
-        {:tokio_complete, ^corr_id, :error, reason} ->
+        {:error, :timeout} ->
+          {:error, "ERR timeout"}
+
+        {:error, reason} ->
           {:error, "ERR CMS info failed: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
       end
     end
   end
@@ -140,6 +142,8 @@ defmodule Ferricstore.Commands.CMS do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  defp await_nif(submit_fun), do: Async.await(submit_fun, @prob_read_timeout_ms)
 
   defp prob_path(store, key, ext) do
     safe = Base.url_encode64(key, padding: false)

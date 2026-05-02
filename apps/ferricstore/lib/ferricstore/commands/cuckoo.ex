@@ -7,9 +7,10 @@ defmodule Ferricstore.Commands.Cuckoo do
   CF.COUNT, CF.INFO) use stateless pread NIFs on local files.
   """
 
-  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Bitcask.{Async, NIF}
   alias Ferricstore.Commands.ProbType
 
+  @prob_read_timeout_ms 5_000
   @default_capacity 1024
   @bucket_size 4
 
@@ -110,20 +111,21 @@ defmodule Ferricstore.Commands.Cuckoo do
   def handle("CF.EXISTS", [key, element], store) do
     with :ok <- ProbType.check_expected(key, :cuckoo, store) do
       path = prob_path(store, key, "cuckoo")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.cuckoo_file_exists_async(self(), corr_id, path, element)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok, result} ->
+      case await_nif(fn proxy, corr_id ->
+             NIF.cuckoo_file_exists_async(proxy, corr_id, path, element)
+           end) do
+        {:ok, result} ->
           result
 
-        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+        {:error, "enoent"} ->
           0
 
-        {:tokio_complete, ^corr_id, :error, reason} ->
+        {:error, :timeout} ->
+          {:error, "ERR timeout"}
+
+        {:error, reason} ->
           {:error, "ERR cuckoo exists failed: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
       end
     end
   end
@@ -145,14 +147,11 @@ defmodule Ferricstore.Commands.Cuckoo do
 
         true ->
           Enum.map(elements, fn element ->
-            corr_id = System.unique_integer([:positive, :monotonic])
-            :ok = NIF.cuckoo_file_exists_async(self(), corr_id, path, element)
-
-            receive do
-              {:tokio_complete, ^corr_id, :ok, result} -> result
-              {:tokio_complete, ^corr_id, :error, _reason} -> 0
-            after
-              5000 -> 0
+            case await_nif(fn proxy, corr_id ->
+                   NIF.cuckoo_file_exists_async(proxy, corr_id, path, element)
+                 end) do
+              {:ok, result} -> result
+              {:error, _reason} -> 0
             end
           end)
       end
@@ -169,20 +168,21 @@ defmodule Ferricstore.Commands.Cuckoo do
   def handle("CF.COUNT", [key, element], store) do
     with :ok <- ProbType.check_expected(key, :cuckoo, store) do
       path = prob_path(store, key, "cuckoo")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.cuckoo_file_count_async(self(), corr_id, path, element)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok, count} ->
+      case await_nif(fn proxy, corr_id ->
+             NIF.cuckoo_file_count_async(proxy, corr_id, path, element)
+           end) do
+        {:ok, count} ->
           count
 
-        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+        {:error, "enoent"} ->
           0
 
-        {:tokio_complete, ^corr_id, :error, reason} ->
+        {:error, :timeout} ->
+          {:error, "ERR timeout"}
+
+        {:error, reason} ->
           {:error, "ERR cuckoo count failed: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
       end
     end
   end
@@ -197,11 +197,11 @@ defmodule Ferricstore.Commands.Cuckoo do
   def handle("CF.INFO", [key], store) do
     with :ok <- ProbType.check_expected(key, :cuckoo, store) do
       path = prob_path(store, key, "cuckoo")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.cuckoo_file_info_async(self(), corr_id, path)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok,
+      case await_nif(fn proxy, corr_id ->
+             NIF.cuckoo_file_info_async(proxy, corr_id, path)
+           end) do
+        {:ok,
          {num_buckets, bucket_size, fingerprint_size, num_items, num_deletes, total_slots,
           max_kicks}} ->
           [
@@ -225,13 +225,14 @@ defmodule Ferricstore.Commands.Cuckoo do
             0
           ]
 
-        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+        {:error, "enoent"} ->
           {:error, "ERR not found"}
 
-        {:tokio_complete, ^corr_id, :error, reason} ->
+        {:error, :timeout} ->
+          {:error, "ERR timeout"}
+
+        {:error, reason} ->
           {:error, "ERR cuckoo info failed: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
       end
     end
   end
@@ -253,6 +254,8 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  defp await_nif(submit_fun), do: Async.await(submit_fun, @prob_read_timeout_ms)
 
   defp prob_path(store, key, ext) do
     safe = Base.url_encode64(key, padding: false)

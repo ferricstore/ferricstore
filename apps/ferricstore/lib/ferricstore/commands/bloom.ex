@@ -19,8 +19,10 @@ defmodule Ferricstore.Commands.Bloom do
     * `BF.INFO key` -- returns filter metadata
   """
 
-  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Bitcask.{Async, NIF}
   alias Ferricstore.Commands.ProbType
+
+  @prob_read_timeout_ms 5_000
   @default_error_rate 0.01
   @default_capacity 100
 
@@ -87,20 +89,21 @@ defmodule Ferricstore.Commands.Bloom do
   def handle("BF.EXISTS", [key, element], store) do
     with :ok <- ProbType.check_expected(key, :bloom, store) do
       path = prob_path(store, key, "bloom")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.bloom_file_exists_async(self(), corr_id, path, element)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok, result} ->
+      case await_nif(fn proxy, corr_id ->
+             NIF.bloom_file_exists_async(proxy, corr_id, path, element)
+           end) do
+        {:ok, result} ->
           result
 
-        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+        {:error, "enoent"} ->
           0
 
-        {:tokio_complete, ^corr_id, :error, reason} ->
+        {:error, :timeout} ->
+          {:error, "ERR timeout"}
+
+        {:error, reason} ->
           {:error, "ERR bloom exists failed: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
       end
     end
   end
@@ -116,20 +119,21 @@ defmodule Ferricstore.Commands.Bloom do
   def handle("BF.MEXISTS", [key | elements], store) when elements != [] do
     with :ok <- ProbType.check_expected(key, :bloom, store) do
       path = prob_path(store, key, "bloom")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.bloom_file_mexists_async(self(), corr_id, path, elements)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok, results} ->
+      case await_nif(fn proxy, corr_id ->
+             NIF.bloom_file_mexists_async(proxy, corr_id, path, elements)
+           end) do
+        {:ok, results} ->
           results
 
-        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+        {:error, "enoent"} ->
           List.duplicate(0, length(elements))
 
-        {:tokio_complete, ^corr_id, :error, reason} ->
+        {:error, :timeout} ->
+          {:error, "ERR timeout"}
+
+        {:error, reason} ->
           {:error, "ERR bloom mexists failed: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
       end
     end
   end
@@ -145,20 +149,21 @@ defmodule Ferricstore.Commands.Bloom do
   def handle("BF.CARD", [key], store) do
     with :ok <- ProbType.check_expected(key, :bloom, store) do
       path = prob_path(store, key, "bloom")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.bloom_file_card_async(self(), corr_id, path)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok, count} ->
+      case await_nif(fn proxy, corr_id ->
+             NIF.bloom_file_card_async(proxy, corr_id, path)
+           end) do
+        {:ok, count} ->
           count
 
-        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+        {:error, "enoent"} ->
           0
 
-        {:tokio_complete, ^corr_id, :error, reason} ->
+        {:error, :timeout} ->
+          {:error, "ERR timeout"}
+
+        {:error, reason} ->
           {:error, "ERR bloom card failed: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
       end
     end
   end
@@ -174,11 +179,11 @@ defmodule Ferricstore.Commands.Bloom do
   def handle("BF.INFO", [key], store) do
     with :ok <- ProbType.check_expected(key, :bloom, store) do
       path = prob_path(store, key, "bloom")
-      corr_id = System.unique_integer([:positive, :monotonic])
-      :ok = NIF.bloom_file_info_async(self(), corr_id, path)
 
-      receive do
-        {:tokio_complete, ^corr_id, :ok, {num_bits, count, num_hashes}} ->
+      case await_nif(fn proxy, corr_id ->
+             NIF.bloom_file_info_async(proxy, corr_id, path)
+           end) do
+        {:ok, {num_bits, count, num_hashes}} ->
           # Try to get capacity/error_rate from stored metadata
           {capacity, error_rate} = recover_bloom_meta(key, store, num_bits, num_hashes)
 
@@ -201,13 +206,14 @@ defmodule Ferricstore.Commands.Bloom do
             num_bits
           ]
 
-        {:tokio_complete, ^corr_id, :error, "enoent"} ->
+        {:error, "enoent"} ->
           {:error, "ERR not found"}
 
-        {:tokio_complete, ^corr_id, :error, reason} ->
+        {:error, :timeout} ->
+          {:error, "ERR timeout"}
+
+        {:error, reason} ->
           {:error, "ERR bloom info failed: #{reason}"}
-      after
-        5000 -> {:error, "ERR timeout"}
       end
     end
   end
@@ -248,6 +254,8 @@ defmodule Ferricstore.Commands.Bloom do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  defp await_nif(submit_fun), do: Async.await(submit_fun, @prob_read_timeout_ms)
 
   defp check_bloom_not_exists(key, store) do
     case ProbType.check_create(key, :bloom, store) do
