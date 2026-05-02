@@ -7,6 +7,7 @@ defmodule Ferricstore.Store.Shard.Reads do
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
   @bitcask_header_size 26
+  @cold_read_timeout_ms 10_000
 
   defguardp valid_cold_location(file_id, offset, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
@@ -29,17 +30,41 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       {:cold, fid, off, _vsize, exp} ->
         # Cold key — value evicted from ETS but disk location known.
-        # Use synchronous pread (v2_pread_at_async NIF not yet available).
         p = ShardETS.file_path(state.shard_data_path, fid)
 
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
+        case read_cold_async(p, off) do
+          {:ok, value} when is_binary(value) ->
             ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, byte_size(value))
             {:reply, value, state}
 
           _ ->
             {:reply, nil, state}
         end
+
+      :miss ->
+        if ShardETS.pending_cold?(state, key) do
+          state = ShardFlush.flush_pending_for_read(state)
+          {:reply, do_get(state, key), state}
+        else
+          {:reply, nil, state}
+        end
+    end
+  end
+
+  @spec handle_get(binary(), GenServer.from(), map()) ::
+          {:reply, term(), map()} | {:noreply, map()}
+  @doc false
+  def handle_get(key, from, state) do
+    case ShardETS.ets_lookup(state, key) do
+      {:hit, value, _expire_at_ms} ->
+        {:reply, value, state}
+
+      :expired ->
+        {:reply, nil, state}
+
+      {:cold, fid, off, _vsize, _exp} ->
+        p = ShardETS.file_path(state.shard_data_path, fid)
+        submit_cold_read(p, off, state, {from, key})
 
       :miss ->
         if ShardETS.pending_cold?(state, key) do
@@ -96,17 +121,41 @@ defmodule Ferricstore.Store.Shard.Reads do
         {:reply, nil, state}
 
       {:cold, fid, off, _vsize, exp} ->
-        # Cold key — use synchronous pread (v2_pread_at_async NIF not yet available).
         p = ShardETS.file_path(state.shard_data_path, fid)
 
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
+        case read_cold_async(p, off) do
+          {:ok, value} when is_binary(value) ->
             ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, byte_size(value))
             {:reply, {value, exp}, state}
 
           _ ->
             {:reply, nil, state}
         end
+
+      :miss ->
+        if ShardETS.pending_cold?(state, key) do
+          state = ShardFlush.flush_pending_for_read(state)
+          {:reply, do_get_meta(state, key), state}
+        else
+          {:reply, nil, state}
+        end
+    end
+  end
+
+  @spec handle_get_meta(binary(), GenServer.from(), map()) ::
+          {:reply, {term(), non_neg_integer()} | nil, map()} | {:noreply, map()}
+  @doc false
+  def handle_get_meta(key, from, state) do
+    case ShardETS.ets_lookup(state, key) do
+      {:hit, value, expire_at_ms} ->
+        {:reply, {value, expire_at_ms}, state}
+
+      :expired ->
+        {:reply, nil, state}
+
+      {:cold, fid, off, _vsize, exp} ->
+        p = ShardETS.file_path(state.shard_data_path, fid)
+        submit_cold_read(p, off, state, {from, key, :meta, exp})
 
       :miss ->
         if ShardETS.pending_cold?(state, key) do
@@ -165,8 +214,8 @@ defmodule Ferricstore.Store.Shard.Reads do
         # Zero-copy cold read via v2 pread (ResourceBinary).
         p = ShardETS.file_path(state.shard_data_path, fid)
 
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
+        case read_cold_async(p, off) do
+          {:ok, value} when is_binary(value) ->
             ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
             value
 
@@ -203,8 +252,8 @@ defmodule Ferricstore.Store.Shard.Reads do
       {:cold, fid, off, vsize, exp} ->
         p = ShardETS.file_path(state.shard_data_path, fid)
 
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
+        case read_cold_async(p, off) do
+          {:ok, value} when is_binary(value) ->
             ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
             {value, exp}
 
@@ -238,7 +287,7 @@ defmodule Ferricstore.Store.Shard.Reads do
       when is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 ->
         # Cold key -- pread from disk
         p = ShardETS.file_path(state.shard_data_path, fid)
-        NIF.v2_pread_at(p, off)
+        read_cold_async(p, off)
 
       [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
         ShardETS.ets_delete_key(state, key)
@@ -246,6 +295,40 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       _ ->
         {:ok, nil}
+    end
+  end
+
+  defp submit_cold_read(path, offset, state, pending_entry) do
+    corr_id = state.next_correlation_id + 1
+
+    case NIF.v2_pread_at_async(self(), corr_id, path, offset) do
+      :ok ->
+        {:noreply,
+         %{
+           state
+           | next_correlation_id: corr_id,
+             pending_reads: Map.put(state.pending_reads, corr_id, pending_entry)
+         }}
+
+      {:error, _reason} ->
+        {:reply, nil, state}
+    end
+  end
+
+  defp read_cold_async(path, offset) do
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    case NIF.v2_pread_at_async(self(), corr_id, path, offset) do
+      :ok ->
+        receive do
+          {:tokio_complete, ^corr_id, :ok, value} -> {:ok, value}
+          {:tokio_complete, ^corr_id, :error, reason} -> {:error, reason}
+        after
+          @cold_read_timeout_ms -> {:error, :timeout}
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

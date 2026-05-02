@@ -299,12 +299,12 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   @impl true
-  def handle_call({:get, key}, _from, state), do: ShardReads.handle_get(key, state)
+  def handle_call({:get, key}, from, state), do: ShardReads.handle_get(key, from, state)
 
   def handle_call({:get_file_ref, key}, _from, state),
     do: ShardReads.handle_get_file_ref(key, state)
 
-  def handle_call({:get_meta, key}, _from, state), do: ShardReads.handle_get_meta(key, state)
+  def handle_call({:get_meta, key}, from, state), do: ShardReads.handle_get_meta(key, from, state)
 
   # Compound key scan: returns all live entries matching a prefix.
   # Used by HSCAN, SSCAN, ZSCAN via the compound_scan store callback.

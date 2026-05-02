@@ -29,6 +29,17 @@ defmodule Ferricstore.Store.RouterGetMetaGuardTest do
            "expected Router.batch_get/2 cold path to use v2_pread_batch_async/3"
   end
 
+  test "direct cold get and get_meta use async pread NIF" do
+    source = File.read!(@router_path)
+
+    # High-volume cold reads must not call blocking pread on a Normal scheduler.
+    assert source =~ "v2_pread_at_async",
+           "expected direct Router cold reads to use v2_pread_at_async/4"
+
+    refute Regex.match?(~r/(?<!_)v2_pread_at\(/, source),
+           "expected Router cold reads to avoid blocking v2_pread_at/2"
+  end
+
   defp function_body(ast, name, arity) do
     {_ast, body} =
       Macro.prewalk(ast, nil, fn

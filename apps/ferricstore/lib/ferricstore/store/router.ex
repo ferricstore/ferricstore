@@ -845,8 +845,8 @@ defmodule Ferricstore.Store.Router do
         path =
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
-        case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
-          {:ok, value} ->
+        case read_cold_async(path, offset) do
+          {:ok, value} when is_binary(value) ->
             warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
             {:hit, value, exp}
 
@@ -1587,8 +1587,8 @@ defmodule Ferricstore.Store.Router do
         path =
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
-        case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
-          {:ok, value} ->
+        case read_cold_async(path, offset) do
+          {:ok, value} when is_binary(value) ->
             Stats.record_cold_read(ctx, key)
             # Warm ETS: promote back to hot if value fits in cache
             warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
@@ -1748,6 +1748,23 @@ defmodule Ferricstore.Store.Router do
     end)
   end
 
+  defp read_cold_async(path, offset) do
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    case Ferricstore.Bitcask.NIF.v2_pread_at_async(self(), corr_id, path, offset) do
+      :ok ->
+        receive do
+          {:tokio_complete, ^corr_id, :ok, value} -> {:ok, value}
+          {:tokio_complete, ^corr_id, :error, reason} -> {:error, reason}
+        after
+          @cold_batch_read_timeout_ms -> {:error, :timeout}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
   @doc """
   Returns `{value, expire_at_ms}` for a live key, or `nil` if the key does
   not exist or is expired.
@@ -1774,8 +1791,8 @@ defmodule Ferricstore.Store.Router do
         path =
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
-        case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
-          {:ok, value} ->
+        case read_cold_async(path, offset) do
+          {:ok, value} when is_binary(value) ->
             Stats.record_cold_read(ctx, key)
             warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
             {value, expire_at_ms}
@@ -3166,8 +3183,8 @@ defmodule Ferricstore.Store.Router do
         path =
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
-        case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
-          {:ok, value} ->
+        case read_cold_async(path, offset) do
+          {:ok, value} when is_binary(value) ->
             warm_ets_after_cold_read(ctx, keydir, compound_key, value, file_id, offset)
             value
 
