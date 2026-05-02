@@ -20,7 +20,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   setup do
-    dir = Path.join(System.tmp_dir!(), "sm_test_#{:rand.uniform(9_999_999)}")
+    shard_index = 9000 + :rand.uniform(999)
+    root = Path.join(System.tmp_dir!(), "sm_test_#{:rand.uniform(9_999_999)}")
+    dir = Ferricstore.DataDir.shard_data_path(root, shard_index)
     File.mkdir_p!(dir)
 
     # v2: create a .log file instead of NIF.new
@@ -30,9 +32,6 @@ defmodule Ferricstore.Raft.StateMachineTest do
     suffix = :rand.uniform(9_999_999)
     keydir_name = :"sm_test_keydir_#{suffix}"
     :ets.new(keydir_name, [:set, :public, :named_table])
-
-    # Use a unique shard index to avoid name conflicts with other test processes.
-    shard_index = 9000 + :rand.uniform(999)
 
     state =
       StateMachine.init(%{
@@ -62,6 +61,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       end
 
       File.rm_rf!(dir)
+      File.rm_rf!(root)
     end)
 
     %{
@@ -112,7 +112,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       end
     end
 
-    test "derives legacy data_dir root from shard_N path" do
+    test "rejects legacy shard_N path outside canonical data layout" do
       root = Path.join(System.tmp_dir!(), "sm_legacy_dir_#{System.unique_integer([:positive])}")
       shard_path = Path.join(root, "shard_0")
       File.mkdir_p!(shard_path)
@@ -120,7 +120,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       ets = :ets.new(:"sm_legacy_dir_#{System.unique_integer([:positive])}", [:set, :public])
 
       try do
-        state =
+        assert_raise ArgumentError, ~r/expected canonical shard data path/, fn ->
           StateMachine.init(%{
             shard_index: 0,
             shard_data_path: shard_path,
@@ -128,8 +128,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
             active_file_path: Path.join(shard_path, "00000.log"),
             ets: ets
           })
-
-        assert state.data_dir == root
+        end
       after
         :ets.delete(ets)
         File.rm_rf!(root)
@@ -1452,43 +1451,20 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
   describe "release_cursor log compaction" do
     test "init/1 stores release_cursor_interval from config", %{store: _store, ets: ets} do
-      state =
-        StateMachine.init(%{
-          shard_index: 0,
-          shard_data_path: System.tmp_dir!(),
-          active_file_id: 0,
-          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
-          ets: ets
-        })
+      state = init_state_for_release_cursor(ets)
 
       assert is_integer(state.release_cursor_interval)
       assert state.release_cursor_interval > 0
     end
 
     test "init/1 accepts custom release_cursor_interval", %{store: _store, ets: ets} do
-      state =
-        StateMachine.init(%{
-          shard_index: 0,
-          shard_data_path: System.tmp_dir!(),
-          active_file_id: 0,
-          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
-          ets: ets,
-          release_cursor_interval: 500
-        })
+      state = init_state_for_release_cursor(ets, release_cursor_interval: 500)
 
       assert state.release_cursor_interval == 500
     end
 
     test "no release_cursor emitted before interval is reached", %{store: _store, ets: ets} do
-      state =
-        StateMachine.init(%{
-          shard_index: 0,
-          shard_data_path: System.tmp_dir!(),
-          active_file_id: 0,
-          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
-          ets: ets,
-          release_cursor_interval: 5
-        })
+      state = init_state_for_release_cursor(ets, release_cursor_interval: 5)
 
       # Apply 4 commands (below interval of 5) -- none should emit release_cursor
       result =
@@ -1512,14 +1488,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       interval = 5
 
       state =
-        StateMachine.init(%{
-          shard_index: 0,
-          shard_data_path: System.tmp_dir!(),
-          active_file_id: 0,
-          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
-          ets: ets,
-          release_cursor_interval: interval
-        })
+        init_state_for_release_cursor(ets, release_cursor_interval: interval)
 
       # Apply (interval - 1) commands without release_cursor
       state_before =
@@ -1614,14 +1583,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       interval = 3
 
       state =
-        StateMachine.init(%{
-          shard_index: 0,
-          shard_data_path: System.tmp_dir!(),
-          active_file_id: 0,
-          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
-          ets: ets,
-          release_cursor_interval: interval
-        })
+        init_state_for_release_cursor(ets, release_cursor_interval: interval)
 
       # Apply 9 commands, expect release_cursor at positions 3, 6, 9
       {_final_state, cursor_indices} =
@@ -1647,14 +1609,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       interval = 3
 
       state =
-        StateMachine.init(%{
-          shard_index: 0,
-          shard_data_path: System.tmp_dir!(),
-          active_file_id: 0,
-          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
-          ets: ets,
-          release_cursor_interval: interval
-        })
+        init_state_for_release_cursor(ets, release_cursor_interval: interval)
 
       # Put two keys (applied_count = 2), then delete at the 3rd apply
       meta1 = %{index: 10, term: 1, system_time: System.os_time(:millisecond)}
@@ -1682,14 +1637,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       interval = 5
 
       state =
-        StateMachine.init(%{
-          shard_index: 0,
-          shard_data_path: System.tmp_dir!(),
-          active_file_id: 0,
-          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
-          ets: ets,
-          release_cursor_interval: interval
-        })
+        init_state_for_release_cursor(ets, release_cursor_interval: interval)
 
       # Apply 3 single commands (applied_count = 3)
       state_before =
@@ -1746,14 +1694,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       interval = 3
 
       state =
-        StateMachine.init(%{
-          shard_index: 2,
-          shard_data_path: System.tmp_dir!(),
-          active_file_id: 0,
-          active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
-          ets: ets,
-          release_cursor_interval: interval
-        })
+        init_state_for_release_cursor(ets, shard_index: 2, release_cursor_interval: interval)
 
       # Apply 3 commands to trigger release_cursor
       state_after =
@@ -1799,6 +1740,29 @@ defmodule Ferricstore.Raft.StateMachineTest do
         active_file_id: file_id,
         active_file_path: Path.join(state.shard_data_path, "#{file_id}.log")
     }
+  end
+
+  defp init_state_for_release_cursor(ets, opts \\ []) do
+    shard_index = Keyword.get(opts, :shard_index, 0)
+    root = Path.join(System.tmp_dir!(), "sm_rc_#{System.unique_integer([:positive])}")
+    shard_path = Ferricstore.DataDir.shard_data_path(root, shard_index)
+    active_file_path = Path.join(shard_path, "00000.log")
+
+    File.mkdir_p!(shard_path)
+    File.touch!(active_file_path)
+    on_exit({:sm_release_cursor_root, root}, fn -> File.rm_rf!(root) end)
+
+    config =
+      %{
+        shard_index: shard_index,
+        shard_data_path: shard_path,
+        active_file_id: 0,
+        active_file_path: active_file_path,
+        ets: ets
+      }
+      |> Map.merge(Map.new(opts))
+
+    StateMachine.init(config)
   end
 
   defp set_opts(overrides) do
