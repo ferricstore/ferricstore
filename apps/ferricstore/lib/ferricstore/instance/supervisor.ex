@@ -29,23 +29,19 @@ defmodule FerricStore.Instance.Supervisor do
     # Ensure data directory layout exists
     Ferricstore.DataDir.ensure_layout!(ctx.data_dir, ctx.shard_count)
 
-    children =
-      [
-        # Stats (per-instance counters)
-        {Ferricstore.Stats, [name: :"#{name}.Stats", instance: ctx]},
-
-        # MemoryGuard (per-instance)
-        {Ferricstore.MemoryGuard, [
-          name: :"#{name}.MemoryGuard",
-          instance: ctx,
-          max_memory_bytes: ctx.max_memory_bytes,
-          keydir_max_ram: ctx.keydir_max_ram,
-          eviction_policy: ctx.eviction_policy
-        ]},
-
-        # Shard supervisor (starts N shards)
-        {Ferricstore.Store.ShardSupervisor, [name: :"#{name}.ShardSupervisor", instance: ctx]}
-      ]
+    children = [
+      # Stats and MemoryGuard are global application processes today. The
+      # instance context owns isolated counters/flags, but these GenServers are
+      # not instance-scoped yet, so embedded instances must not start duplicates.
+      {Ferricstore.Store.ShardSupervisor,
+       [
+         name: :"#{name}.ShardSupervisor",
+         data_dir: ctx.data_dir,
+         shard_count: ctx.shard_count,
+         instance_ctx: ctx,
+         raft_enabled: ctx.raft_enabled
+       ]}
+    ]
 
     Supervisor.init(children, strategy: :one_for_one, max_restarts: 20, max_seconds: 10)
   end

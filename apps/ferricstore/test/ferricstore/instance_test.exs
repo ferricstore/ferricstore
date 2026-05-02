@@ -2,11 +2,43 @@ defmodule Ferricstore.InstanceTest do
   @moduledoc "Tests that use FerricStore pattern works end-to-end."
   use ExUnit.Case, async: false
 
+  defmodule EmbeddedA do
+    use FerricStore, shard_count: 1, raft_enabled: false
+  end
+
+  defmodule EmbeddedB do
+    use FerricStore, shard_count: 1, raft_enabled: false
+  end
+
   # Use the :default instance (created at app boot)
   # In future: test with a custom isolated instance
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()
+  end
+
+  describe "use FerricStore embedded instances" do
+    test "start with isolated shard supervisors and data dirs" do
+      root = Path.join(System.tmp_dir!(), "ferricstore_embedded_#{System.unique_integer([:positive])}")
+      dir_a = Path.join(root, "a")
+      dir_b = Path.join(root, "b")
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        EmbeddedA.stop()
+        EmbeddedB.stop()
+        File.rm_rf(root)
+      end)
+
+      assert {:ok, _pid_a} = EmbeddedA.start_link(data_dir: dir_a, shard_count: 1, raft_enabled: false)
+      assert {:ok, _pid_b} = EmbeddedB.start_link(data_dir: dir_b, shard_count: 1, raft_enabled: false)
+
+      assert :ok = EmbeddedA.set("same-key", "from-a")
+      assert :ok = EmbeddedB.set("same-key", "from-b")
+
+      assert {:ok, "from-a"} = EmbeddedA.get("same-key")
+      assert {:ok, "from-b"} = EmbeddedB.get("same-key")
+    end
   end
 
   describe "FerricStore.Impl with default instance" do

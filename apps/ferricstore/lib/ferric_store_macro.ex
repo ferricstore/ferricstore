@@ -41,7 +41,12 @@ defmodule FerricStore.Macro do
       def stop do
         name = :"#{__MODULE__}.Supervisor"
         if pid = Process.whereis(name) do
-          Supervisor.stop(pid)
+          try do
+            Supervisor.stop(pid)
+          catch
+            :exit, _ -> :ok
+          end
+
           FerricStore.Instance.cleanup(__MODULE__)
         end
         :ok
