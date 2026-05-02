@@ -19,22 +19,22 @@ defmodule Ferricstore.Store.RouterGetMetaGuardTest do
              "value and expire_at_ms must come from one ETS row to avoid impossible pairs"
   end
 
-  test "batch_get cold reads use the async batch pread NIF" do
+  test "batch_get cold reads use the shared async batch cold reader" do
     source = File.read!(@router_path)
 
     # Cold values are the main product path for large values. batch_get/2 must
     # submit all cold disk reads together so one request does not serialize N
     # blocking preads on the caller process.
-    assert source =~ "v2_pread_batch_async",
-           "expected Router.batch_get/2 cold path to use v2_pread_batch_async/3"
+    assert source =~ "ColdRead.pread_batch",
+           "expected Router.batch_get/2 cold path to use ColdRead.pread_batch/2"
   end
 
-  test "direct cold get and get_meta use async pread NIF" do
+  test "direct cold get and get_meta use the shared async cold reader" do
     source = File.read!(@router_path)
 
     # High-volume cold reads must not call blocking pread on a Normal scheduler.
-    assert source =~ "v2_pread_at_async",
-           "expected direct Router cold reads to use v2_pread_at_async/4"
+    assert source =~ "ColdRead.pread_at",
+           "expected direct Router cold reads to use ColdRead.pread_at/3"
 
     refute Regex.match?(~r/(?<!_)v2_pread_at\(/, source),
            "expected Router cold reads to avoid blocking v2_pread_at/2"

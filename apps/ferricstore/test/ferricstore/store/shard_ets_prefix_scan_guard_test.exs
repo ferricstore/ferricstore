@@ -8,7 +8,10 @@ defmodule Ferricstore.Store.ShardETSPrefixScanGuardTest do
 
     # HGETALL and related compound scans can touch many cold large values.
     # Keep the scan path from regressing to one blocking pread per cold entry.
-    assert source =~ "v2_pread_batch_async",
-           "expected Shard.ETS prefix scan cold path to use v2_pread_batch_async/3"
+    assert source =~ "ColdRead.pread_batch",
+           "expected Shard.ETS prefix scan cold path to use ColdRead.pread_batch/2"
+
+    refute Regex.match?(~r/(?<!_)v2_pread_at\(/, source),
+           "expected Shard.ETS prefix scan cold path to avoid blocking v2_pread_at/2"
   end
 end
