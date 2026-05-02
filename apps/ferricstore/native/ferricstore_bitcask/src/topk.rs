@@ -293,7 +293,7 @@ fn v2_heap_add(
 
 /// Create a new TopK file at the given path.
 /// Returns `{:ok, :ok}` or `{:error, reason}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_create_v2(
     env: Env,
@@ -356,7 +356,7 @@ pub fn topk_file_create_v2(
 
 /// Add elements (each with increment 1) to a file-backed TopK.
 /// Returns a list: nil for no eviction, or the evicted element binary.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_add_v2<'a>(
     env: Env<'a>,
@@ -441,7 +441,7 @@ pub fn topk_file_add_v2<'a>(
 /// Increment elements by specified amounts in a file-backed TopK.
 /// `pairs` is a list of `{element_binary, increment}` tuples.
 /// Returns a list: nil for no eviction, or the evicted element binary.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_incrby_v2<'a>(
     env: Env<'a>,
@@ -522,7 +522,7 @@ pub fn topk_file_incrby_v2<'a>(
 
 /// Query whether elements are in the top-K heap of a file-backed TopK.
 /// Returns a list of 0 (not in top-K) or 1 (in top-K).
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_query_v2<'a>(
     env: Env<'a>,
@@ -565,7 +565,7 @@ pub fn topk_file_query_v2<'a>(
 
 /// List all elements in the top-K heap, sorted by count descending.
 /// Returns a list of element binaries.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_list_v2(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     let p = Path::new(&path);
@@ -615,7 +615,7 @@ pub fn topk_file_list_v2(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 
 /// Return CMS count estimates for the given elements from a file-backed TopK.
 /// Returns a list of i64 estimates.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_count_v2<'a>(
     env: Env<'a>,
@@ -652,7 +652,7 @@ pub fn topk_file_count_v2<'a>(
 }
 
 /// Return metadata from a file-backed TopK: `{k, width, depth, decay}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_info_v2(env: Env, path: String) -> NifResult<Term> {
     let p = Path::new(&path);
@@ -679,7 +679,7 @@ pub fn topk_file_info_v2(env: Env, path: String) -> NifResult<Term> {
 // ---------------------------------------------------------------------------
 
 /// Async topk query: spawns on Tokio, sends result to `caller_pid`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn topk_file_query_v2_async<'a>(
     env: Env<'a>,
@@ -735,7 +735,7 @@ pub fn topk_file_query_v2_async<'a>(
 
 /// Async topk list: spawns on Tokio, sends result to `caller_pid`.
 /// Returns element names as a list of byte vectors (encoded as binaries).
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn topk_file_list_v2_async(
     env: Env<'_>,
@@ -800,7 +800,7 @@ pub fn topk_file_list_v2_async(
 }
 
 /// Async topk count: spawns on Tokio, sends CMS estimates to `caller_pid`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn topk_file_count_v2_async<'a>(
     env: Env<'a>,
@@ -851,7 +851,7 @@ pub fn topk_file_count_v2_async<'a>(
 }
 
 /// Async topk info: spawns on Tokio, sends metadata to `caller_pid`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn topk_file_info_v2_async(
     env: Env<'_>,

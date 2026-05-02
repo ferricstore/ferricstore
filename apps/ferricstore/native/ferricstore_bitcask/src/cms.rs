@@ -141,7 +141,7 @@ impl CmsFileError {
 /// Create a new CMS file at `path` with the given dimensions.
 ///
 /// Returns `{:ok, :ok}` or `{:error, reason}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn cms_file_create(env: Env, path: String, width: u64, depth: u64) -> NifResult<Term> {
     if width == 0 {
@@ -194,7 +194,7 @@ pub fn cms_file_create(env: Env, path: String, width: u64, depth: u64) -> NifRes
 /// `items` is a list of `{element_binary, count_integer}` tuples.
 ///
 /// Returns `{:ok, [min_count, ...]}` or `{:error, reason}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn cms_file_incrby<'a>(
     env: Env<'a>,
@@ -265,7 +265,7 @@ pub fn cms_file_incrby<'a>(
 /// `elements` is a list of binaries.
 ///
 /// Returns `{:ok, [count, ...]}` or `{:error, reason}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn cms_file_query<'a>(
     env: Env<'a>,
@@ -310,7 +310,7 @@ pub fn cms_file_query<'a>(
 }
 
 /// Return CMS file info: `{:ok, {width, depth, count}}` or `{:error, reason}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn cms_file_info(env: Env, path: String) -> NifResult<Term> {
     let file = match crate::open_random_read(Path::new(&path)) {
@@ -333,7 +333,7 @@ pub fn cms_file_info(env: Env, path: String) -> NifResult<Term> {
 /// clamp negatives to 0, write back. Updates dst count.
 ///
 /// Returns `:ok` or `{:error, reason}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn cms_file_merge(
     env: Env<'_>,
@@ -444,7 +444,7 @@ pub fn cms_file_merge(
 // ---------------------------------------------------------------------------
 
 /// Async CMS query: spawns on Tokio, sends result to `caller_pid`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn cms_file_query_async<'a>(
     env: Env<'a>,
@@ -501,7 +501,7 @@ pub fn cms_file_query_async<'a>(
 }
 
 /// Async CMS info: spawns on Tokio, sends result to `caller_pid`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn cms_file_info_async(
     env: Env<'_>,

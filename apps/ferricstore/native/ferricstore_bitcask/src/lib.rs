@@ -1892,4 +1892,25 @@ mod fsync_dir_tests {
     }
 }
 
+#[cfg(test)]
+mod nif_scheduler_tests {
+    #[test]
+    fn file_backed_probabilistic_nifs_do_not_run_on_normal_schedulers() {
+        for path in ["src/bloom.rs", "src/cms.rs", "src/cuckoo.rs", "src/topk.rs"] {
+            let source =
+                std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+
+            for (line_idx, line) in source.lines().enumerate() {
+                if line.contains("#[rustler::nif") {
+                    assert!(
+                        line.contains("DirtyIo"),
+                        "{path}:{} file-backed probabilistic NIFs do pread/pwrite/fsync and must not block normal BEAM schedulers: {line}",
+                        line_idx + 1
+                    );
+                }
+            }
+        }
+    }
+}
+
 rustler::init!("Elixir.Ferricstore.Bitcask.NIF", load = load);
