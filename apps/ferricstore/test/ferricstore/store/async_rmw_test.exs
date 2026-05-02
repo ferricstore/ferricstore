@@ -23,6 +23,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.RmwCoordinator
+  alias Ferricstore.Test.IsolatedInstance
   alias Ferricstore.Test.ShardHelpers
 
   @ns "rmw_async"
@@ -78,6 +79,40 @@ defmodule Ferricstore.Store.AsyncRmwTest do
         assert [] == :ets.lookup(elem(isolated.latch_refs, idx), key)
       after
         cleanup_minimal_instance_context(isolated)
+      end
+    end
+
+    test "RmwCoordinator does not serialize same-key RMW across different instances" do
+      ctx_a = IsolatedInstance.checkout(shard_count: 1)
+      ctx_b = IsolatedInstance.checkout(shard_count: 1)
+      key = ukey("cross_instance_same_key")
+      idx = 0
+
+      holder_a = latch_holder()
+      holder_b = latch_holder()
+
+      try do
+        :ets.insert(elem(ctx_a.latch_refs, idx), {key, holder_a})
+        :ets.insert(elem(ctx_b.latch_refs, idx), {key, holder_b})
+
+        task_a = Task.async(fn -> RmwCoordinator.execute(idx, ctx_a, {:getdel, key}) end)
+        assert Task.yield(task_a, 50) == nil
+
+        task_b = Task.async(fn -> RmwCoordinator.execute(idx, ctx_b, {:getdel, key}) end)
+        assert Task.yield(task_b, 50) == nil
+
+        ref_b = Process.monitor(holder_b)
+        send(holder_b, :release)
+        assert_receive {:DOWN, ^ref_b, :process, ^holder_b, :normal}, 500
+
+        assert {:ok, nil} == Task.yield(task_b, 500)
+        assert Task.yield(task_a, 50) == nil
+      after
+        release_latch_holder(holder_a)
+        release_latch_holder(holder_b)
+
+        IsolatedInstance.checkin(ctx_a)
+        IsolatedInstance.checkin(ctx_b)
       end
     end
 
@@ -727,6 +762,19 @@ defmodule Ferricstore.Store.AsyncRmwTest do
         :timer.sleep(50)
         retry_rmw(fun, n - 1)
     end
+  end
+
+  defp latch_holder do
+    spawn(fn ->
+      receive do
+        :release -> :ok
+      end
+    end)
+  end
+
+  defp release_latch_holder(pid) when is_pid(pid) do
+    if Process.alive?(pid), do: send(pid, :release)
+    :ok
   end
 
   defp minimal_instance_context do

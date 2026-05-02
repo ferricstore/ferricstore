@@ -128,12 +128,12 @@ defmodule Ferricstore.Store.RmwCoordinator do
     {:noreply, state}
   end
 
-  def handle_info({:rmw_finished, key, from, result}, state) do
+  def handle_info({:rmw_finished, queue_key, from, result}, state) do
     GenServer.reply(from, result)
 
     state =
-      %{state | running: MapSet.delete(state.running, key)}
-      |> maybe_start_next(key)
+      %{state | running: MapSet.delete(state.running, queue_key)}
+      |> maybe_start_next(queue_key)
 
     {:noreply, state}
   end
@@ -154,32 +154,32 @@ defmodule Ferricstore.Store.RmwCoordinator do
     do: Ferricstore.Store.Router.execute_rmw_inline(ctx, idx, cmd)
 
   defp enqueue_rmw(state, from, ctx, cmd) do
-    key = key_of(cmd)
-    queue = Map.get(state.queues, key, :queue.new())
-    queues = Map.put(state.queues, key, :queue.in({from, ctx, cmd}, queue))
+    queue_key = queue_key(ctx, cmd)
+    queue = Map.get(state.queues, queue_key, :queue.new())
+    queues = Map.put(state.queues, queue_key, :queue.in({from, ctx, cmd}, queue))
 
     %{state | queues: queues}
-    |> maybe_start_next(key)
+    |> maybe_start_next(queue_key)
   end
 
-  defp maybe_start_next(state, key) do
-    if MapSet.member?(state.running, key) do
+  defp maybe_start_next(state, queue_key) do
+    if MapSet.member?(state.running, queue_key) do
       state
     else
-      case Map.fetch(state.queues, key) do
+      case Map.fetch(state.queues, queue_key) do
         {:ok, queue} ->
           case :queue.out(queue) do
             {{:value, {from, ctx, cmd}}, rest} ->
               queues =
                 if :queue.is_empty(rest),
-                  do: Map.delete(state.queues, key),
-                  else: Map.put(state.queues, key, rest)
+                  do: Map.delete(state.queues, queue_key),
+                  else: Map.put(state.queues, queue_key, rest)
 
-              start_key_worker(self(), state.idx, key, from, ctx, cmd)
-              %{state | queues: queues, running: MapSet.put(state.running, key)}
+              start_key_worker(self(), state.idx, queue_key, from, ctx, cmd)
+              %{state | queues: queues, running: MapSet.put(state.running, queue_key)}
 
             {:empty, _} ->
-              %{state | queues: Map.delete(state.queues, key)}
+              %{state | queues: Map.delete(state.queues, queue_key)}
           end
 
         :error ->
@@ -188,9 +188,9 @@ defmodule Ferricstore.Store.RmwCoordinator do
     end
   end
 
-  defp start_key_worker(parent, idx, key, from, ctx, cmd) do
+  defp start_key_worker(parent, idx, queue_key, from, ctx, cmd) do
     Task.start(fn ->
-      send(parent, {:rmw_finished, key, from, run_rmw(ctx, idx, cmd)})
+      send(parent, {:rmw_finished, queue_key, from, run_rmw(ctx, idx, cmd)})
     end)
   end
 
@@ -214,6 +214,12 @@ defmodule Ferricstore.Store.RmwCoordinator do
         {:error, "ERR RMW worker crashed"}
     end
   end
+
+  # Scheduling must include the instance name. The coordinator process is
+  # global per shard index, but each instance has its own ETS/keydir/latch
+  # tables. Serializing by raw user key would make unrelated tenants with
+  # the same key block each other under RMW contention.
+  defp queue_key(%FerricStore.Instance{name: name}, cmd), do: {name, key_of(cmd)}
 
   # Acquire the per-key latch. The coordinator starts at most one waiter task
   # per key, so same-key contention has no thundering herd.
