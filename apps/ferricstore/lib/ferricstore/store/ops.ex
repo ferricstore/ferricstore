@@ -12,6 +12,7 @@ defmodule Ferricstore.Store.Ops do
   """
 
   alias Ferricstore.HLC
+  alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.LocalTxStore
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -529,10 +530,10 @@ defmodule Ferricstore.Store.Ops do
     if local?(tx, redis_key) do
       case promoted_path(tx, redis_key) do
         nil ->
-          Enum.map(compound_keys, &local_read_value(tx, &1))
+          local_batch_read_values(tx, compound_keys, tx.shard_state.shard_data_path)
 
         dedicated_path ->
-          Enum.map(compound_keys, &local_promoted_read_value(tx, &1, dedicated_path))
+          local_batch_read_values(tx, compound_keys, dedicated_path)
       end
     else
       shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
@@ -578,10 +579,10 @@ defmodule Ferricstore.Store.Ops do
     if local?(tx, redis_key) do
       case promoted_path(tx, redis_key) do
         nil ->
-          Enum.map(compound_keys, &local_read_meta(tx, &1))
+          local_batch_read_meta(tx, compound_keys, tx.shard_state.shard_data_path)
 
         dedicated_path ->
-          Enum.map(compound_keys, &local_promoted_read_meta(tx, &1, dedicated_path))
+          local_batch_read_meta(tx, compound_keys, dedicated_path)
       end
     else
       shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
@@ -871,6 +872,92 @@ defmodule Ferricstore.Store.Ops do
           _error ->
             nil
         end
+    end
+  end
+
+  defp local_batch_read_values(tx, keys, data_path) do
+    tx
+    |> local_batch_read_meta(keys, data_path)
+    |> Enum.map(fn
+      {value, _exp} -> value
+      nil -> nil
+    end)
+  end
+
+  defp local_batch_read_meta(tx, keys, data_path) do
+    now = HLC.now_ms()
+
+    {warm_results, cold_reads} =
+      keys
+      |> Enum.with_index()
+      |> Enum.reduce({%{}, []}, fn {key, index}, {results, cold} ->
+        case tx_pending_meta(key) do
+          {value, exp} ->
+            {Map.put(results, index, {value, exp}), cold}
+
+          nil ->
+            local_batch_collect_ets(tx, key, index, data_path, now, results, cold)
+        end
+      end)
+
+    results = local_batch_read_cold(tx, warm_results, Enum.reverse(cold_reads))
+
+    keys
+    |> Enum.with_index()
+    |> Enum.map(fn {_key, index} -> Map.get(results, index) end)
+  end
+
+  defp local_batch_collect_ets(tx, key, index, data_path, now, results, cold) do
+    case :ets.lookup(tx.shard_state.keydir, key) do
+      [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
+        {Map.put(results, index, {value, 0}), cold}
+
+      [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+        {Map.put(results, index, {value, exp}), cold}
+
+      [{^key, nil, 0, _lfu, fid, off, vsize}]
+      when valid_cold_location(fid, off, vsize) ->
+        path = ShardETS.file_path(data_path, fid)
+        {results, [{index, key, path, fid, off, vsize, 0} | cold]}
+
+      [{^key, nil, exp, _lfu, fid, off, vsize}]
+      when exp > now and valid_cold_location(fid, off, vsize) ->
+        path = ShardETS.file_path(data_path, fid)
+        {results, [{index, key, path, fid, off, vsize, exp} | cold]}
+
+      [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
+        ShardETS.ets_delete_key(tx.shard_state, key)
+        {results, cold}
+
+      _ ->
+        {results, cold}
+    end
+  rescue
+    ArgumentError ->
+      {results, cold}
+  end
+
+  defp local_batch_read_cold(_tx, results, []), do: results
+
+  defp local_batch_read_cold(tx, results, cold_reads) do
+    locations =
+      Enum.map(cold_reads, fn {_index, _key, path, _fid, off, _vsize, _exp} -> {path, off} end)
+
+    case ColdRead.pread_batch(locations, @cold_read_timeout_ms) do
+      {:ok, values} when is_list(values) ->
+        cold_reads
+        |> Enum.zip(values)
+        |> Enum.reduce(results, fn
+          {{index, key, _path, fid, off, vsize, exp}, value}, acc when is_binary(value) ->
+            ShardETS.cold_read_warm_ets(tx.shard_state, key, value, exp, fid, off, vsize)
+            Map.put(acc, index, {value, exp})
+
+          {_read, _missing_or_error}, acc ->
+            acc
+        end)
+
+      _ ->
+        results
     end
   end
 
