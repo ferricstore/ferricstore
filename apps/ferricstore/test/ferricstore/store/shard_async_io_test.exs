@@ -973,6 +973,24 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   end
 
   describe "shared log compaction" do
+    test "manual compaction skips the active log file" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+      try do
+        active_path = Path.join([dir, "data", "shard_0", "00000.log"])
+        assert File.exists?(active_path)
+
+        assert {:ok, {0, 0, 0}} = GenServer.call(pid, {:run_compaction, [0]})
+        assert File.exists?(active_path)
+
+        assert :ok = GenServer.call(pid, {:put, "active_compaction_survives", "v", 0})
+        assert :ok = GenServer.call(pid, :flush)
+        assert "v" == GenServer.call(pid, {:get, "active_compaction_survives"})
+      after
+        cleanup_shard(pid, ctx, dir)
+      end
+    end
+
     test "drains deferred BitcaskWriter writes before selecting compacted records" do
       source =
         Path.expand("../../../lib/ferricstore/store/shard.ex", __DIR__)

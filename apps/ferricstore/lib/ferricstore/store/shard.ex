@@ -718,13 +718,17 @@ defmodule Ferricstore.Store.Shard do
               _ -> 0
             end
 
-          if tombstone_file?(source) do
-            remove_hint_for_file(sp, fid)
+          if fid == state.active_file_id do
             {written, dropped, reclaimed}
           else
-            remove_hint_for_file(sp, fid)
-            _ = Ferricstore.FS.rm(source)
-            {written, dropped, reclaimed + old_size}
+            if tombstone_file?(source) do
+              remove_hint_for_file(sp, fid)
+              {written, dropped, reclaimed}
+            else
+              remove_hint_for_file(sp, fid)
+              _ = Ferricstore.FS.rm(source)
+              {written, dropped, reclaimed + old_size}
+            end
           end
         end
       end)
