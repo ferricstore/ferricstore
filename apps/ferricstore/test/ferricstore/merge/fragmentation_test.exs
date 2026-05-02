@@ -13,6 +13,8 @@ defmodule Ferricstore.Merge.FragmentationTest do
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
+  @compound_path Path.expand("../../../lib/ferricstore/store/shard/compound.ex", __DIR__)
+
   setup_all do
     ShardHelpers.wait_shards_alive()
     :ok
@@ -21,6 +23,15 @@ defmodule Ferricstore.Merge.FragmentationTest do
   setup do
     ShardHelpers.flush_all_keys()
     :ok
+  end
+
+  test "promoted compaction cooldown uses monotonic elapsed time" do
+    source = File.read!(@compound_path)
+    [_before, rest] = String.split(source, "def bump_promoted_writes", parts: 2)
+    [body | _after] = String.split(rest, "\n  @spec promoted_dir_size", parts: 2)
+
+    assert body =~ "System.monotonic_time(:millisecond)"
+    refute body =~ "System.system_time(:millisecond)"
   end
 
   # ---------------------------------------------------------------------------

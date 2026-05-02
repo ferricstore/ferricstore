@@ -632,7 +632,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
         cooldown_ok =
           last == nil or
-            System.system_time(:millisecond) - last >= @promoted_compaction_cooldown_ms
+            System.monotonic_time(:millisecond) - last >= @promoted_compaction_cooldown_ms
 
         if frag >= @promoted_frag_threshold and dead >= @promoted_dead_bytes_min and cooldown_ok do
           state = compact_dedicated(state, redis_key, path)
@@ -642,7 +642,7 @@ defmodule Ferricstore.Store.Shard.Compound do
             info
             | dead_bytes: 0,
               total_bytes: new_total,
-              last_compacted_at: System.system_time(:millisecond)
+              last_compacted_at: System.monotonic_time(:millisecond)
           }
 
           new_promoted = Map.put(state.promoted_instances, redis_key, new_info)
