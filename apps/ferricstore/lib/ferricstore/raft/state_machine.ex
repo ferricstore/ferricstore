@@ -3496,18 +3496,46 @@ defmodule Ferricstore.Raft.StateMachine do
         :ok
       end,
       compound_scan: fn _rk, prefix ->
-        :ets.select(
-          state.ets,
-          [{{:"$1", :"$2", :_, :_, :_, :_, :_}, [], [{{:"$1", :"$2"}}]}]
-        )
-        |> Enum.filter(fn {k, _v} -> String.starts_with?(k, prefix) end)
+        local_results =
+          :ets.select(
+            state.ets,
+            [{{:"$1", :"$2", :_, :_, :_, :_, :_}, [], [{{:"$1", :"$2"}}]}]
+          )
+          |> Enum.filter(fn {k, _v} -> String.starts_with?(k, prefix) end)
+
+        if local_results != [] do
+          local_results
+        else
+          case instance_ctx_for_state(state) do
+            nil ->
+              []
+
+            ctx ->
+              redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
+              Router.compound_scan(ctx, redis_key, prefix)
+          end
+        end
       end,
       compound_count: fn _rk, prefix ->
-        :ets.select(
-          state.ets,
-          [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
-        )
-        |> Enum.count(fn k -> String.starts_with?(k, prefix) end)
+        local_count =
+          :ets.select(
+            state.ets,
+            [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
+          )
+          |> Enum.count(fn k -> String.starts_with?(k, prefix) end)
+
+        if local_count > 0 do
+          local_count
+        else
+          case instance_ctx_for_state(state) do
+            nil ->
+              0
+
+            ctx ->
+              redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
+              Router.compound_count(ctx, redis_key, prefix)
+          end
+        end
       end,
       compound_delete_prefix: fn _rk, prefix ->
         keys =
