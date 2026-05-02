@@ -304,6 +304,12 @@ fn write_all_retry<W: Write>(file: &mut W, data: &[u8]) -> io::Result<()> {
     let mut written = 0;
     while written < data.len() {
         match file.write(&data[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write WAL bytes",
+                ));
+            }
             Ok(n) => written += n,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
@@ -378,8 +384,6 @@ fn open_wal_file_linux(path: &str, pre_allocate_bytes: u64) -> io::Result<(File,
     if pre_allocate_bytes > 0 {
         let ret = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, pre_allocate_bytes as i64) };
         if ret != 0 {
-            drop(f);
-            let _ = std::fs::remove_file(path);
             return Err(io::Error::last_os_error());
         }
     };
@@ -528,6 +532,19 @@ mod tests {
         assert!(path.exists());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_open_wal_file_linux_preallocate_failure_preserves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+        std::fs::write(&path, b"RAWA\x01existing bytes").unwrap();
+
+        let result = open_wal_file_linux(path.to_str().unwrap(), u64::MAX);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"RAWA\x01existing bytes");
+    }
+
     #[test]
     fn test_write_all_retry() {
         let dir = tempfile::tempdir().unwrap();
@@ -548,6 +565,24 @@ mod tests {
         write_all_retry(&mut file, b"").unwrap();
         let contents = std::fs::read(&path).unwrap();
         assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn test_write_all_retry_zero_progress_is_write_zero() {
+        struct ZeroThenError;
+
+        impl Write for ZeroThenError {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let err = write_all_retry(&mut ZeroThenError, b"not written").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
     }
 
     #[test]
