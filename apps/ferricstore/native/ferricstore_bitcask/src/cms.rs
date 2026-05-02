@@ -119,6 +119,35 @@ fn cms_next_total_count(total_count: u64, count: i64) -> Result<u64, String> {
     }
 }
 
+fn cms_next_merge_total_count(
+    total_count: u64,
+    src_count: u64,
+    weight: i64,
+) -> Result<u64, String> {
+    let delta = (src_count as u128)
+        .checked_mul(weight.unsigned_abs() as u128)
+        .ok_or_else(|| "CMS total count overflow".to_string())?;
+
+    if weight >= 0 {
+        let next = (total_count as u128)
+            .checked_add(delta)
+            .ok_or_else(|| "CMS total count overflow".to_string())?;
+        u64::try_from(next).map_err(|_| "CMS total count overflow".to_string())
+    } else if delta >= total_count as u128 {
+        Ok(0)
+    } else {
+        Ok((total_count as u128 - delta) as u64)
+    }
+}
+
+fn cms_finalize_merge_counter(acc: i128) -> Result<i64, String> {
+    if acc < 0 {
+        Ok(0)
+    } else {
+        i64::try_from(acc).map_err(|_| "CMS counter overflow".to_string())
+    }
+}
+
 /// Read the CMS file header (width, depth, count) via pread.
 /// Returns `(width, depth, count)` or an error string.
 fn cms_file_read_header(file: &File) -> Result<(u64, u64, u64), String> {
@@ -411,7 +440,7 @@ pub fn cms_file_merge(
         Err(e) => return Ok(map_io_error(&e).encode(env)),
     };
 
-    let (dst_width, dst_depth, mut dst_count) = match cms_file_read_header(&dst_file) {
+    let (dst_width, dst_depth, dst_count) = match cms_file_read_header(&dst_file) {
         Ok(h) => h,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
@@ -436,9 +465,22 @@ pub fn cms_file_merge(
         src_files.push((src_file, src_count));
     }
 
+    if src_files.is_empty() {
+        return Ok(atoms::ok().encode(env));
+    }
+
+    let mut next_dst_count = dst_count;
+    for (j, (_, src_count)) in src_files.iter().enumerate() {
+        next_dst_count = match cms_next_merge_total_count(next_dst_count, *src_count, weights[j]) {
+            Ok(next_dst_count) => next_dst_count,
+            Err(e) => return Ok((atoms::error(), e).encode(env)),
+        };
+    }
+
     let total_counters = dst_width * dst_depth;
     let mut dst_buf = [0u8; 8];
     let mut src_buf = [0u8; 8];
+    let mut merged_counters = Vec::with_capacity(total_counters as usize);
 
     for i in 0..total_counters {
         let offset = MMAP_HEADER_SIZE as u64 + i * 8;
@@ -447,7 +489,7 @@ pub fn cms_file_merge(
         dst_file
             .read_at(&mut dst_buf, offset)
             .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
-        let mut val = i64::from_le_bytes(dst_buf);
+        let mut val = i128::from(i64::from_le_bytes(dst_buf));
 
         // Add weighted src counters
         for (j, (src_file, _)) in src_files.iter().enumerate() {
@@ -455,30 +497,37 @@ pub fn cms_file_merge(
                 .read_at(&mut src_buf, offset)
                 .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
             let src_val = i64::from_le_bytes(src_buf);
-            val += src_val * weights[j];
+            let delta = i128::from(src_val) * i128::from(weights[j]);
+            val = match val.checked_add(delta) {
+                Some(next) => next,
+                None => return Ok((atoms::error(), "CMS counter overflow").encode(env)),
+            };
         }
 
-        // Clamp negatives to 0
-        if val < 0 {
-            val = 0;
-        }
-
-        // Write back
-        dst_file
-            .write_at(&val.to_le_bytes(), offset)
-            .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+        let val = match cms_finalize_merge_counter(val) {
+            Ok(val) => val,
+            Err(e) => return Ok((atoms::error(), e).encode(env)),
+        };
+        merged_counters.push(val);
 
         if (i as usize) % YIELD_CHECK_INTERVAL == 0 && i > 0 {
             let _ = consume_timeslice(env, 1);
         }
     }
 
-    // Update dst count
-    for (j, (_, src_count)) in src_files.iter().enumerate() {
-        dst_count = (dst_count as i64 + *src_count as i64 * weights[j]) as u64;
+    for (i, val) in merged_counters.iter().enumerate() {
+        let offset = MMAP_HEADER_SIZE as u64 + (i as u64) * 8;
+        dst_file
+            .write_at(&val.to_le_bytes(), offset)
+            .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+
+        if i % YIELD_CHECK_INTERVAL == 0 && i > 0 {
+            let _ = consume_timeslice(env, 1);
+        }
     }
+
     dst_file
-        .write_at(&dst_count.to_le_bytes(), 24)
+        .write_at(&next_dst_count.to_le_bytes(), 24)
         .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
 
     // Durability: fsync the destination before returning. Sources are
@@ -1099,6 +1148,25 @@ mod tests {
         // 4 + 3*2 = 10
         let count = file_query_one(&dst, b"w");
         assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn merge_total_count_rejects_positive_overflow() {
+        let err = cms_next_merge_total_count(u64::MAX, 1, 1).unwrap_err();
+
+        assert!(err.contains("overflow"));
+    }
+
+    #[test]
+    fn merge_total_count_clamps_negative_delta_to_zero() {
+        assert_eq!(cms_next_merge_total_count(5, 10, -1).unwrap(), 0);
+    }
+
+    #[test]
+    fn merge_counter_rejects_positive_overflow() {
+        let err = cms_finalize_merge_counter(i128::from(i64::MAX) + 1).unwrap_err();
+
+        assert!(err.contains("overflow"));
     }
 
     #[test]

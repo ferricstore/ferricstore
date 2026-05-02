@@ -855,6 +855,22 @@ defmodule Ferricstore.ProbEdgeCasesTest do
       assert count >= 30
     end
 
+    test "cms_file_merge rejects counter overflow without mutating destination" do
+      dir = make_prob_dir("nif_cms_merge_overflow")
+      dst = Path.join(dir, "dst.cms")
+      src = Path.join(dir, "src.cms")
+      max_i64 = 9_223_372_036_854_775_807
+
+      assert {:ok, :ok} = NIF.cms_file_create(dst, 100, 5)
+      assert {:ok, :ok} = NIF.cms_file_create(src, 100, 5)
+      assert {:ok, [^max_i64]} = NIF.cms_file_incrby(dst, [{"hot", max_i64}])
+      assert {:ok, [1]} = NIF.cms_file_incrby(src, [{"hot", 1}])
+
+      assert {:error, reason} = NIF.cms_file_merge(dst, [src], [1])
+      assert reason =~ "overflow"
+      assert {:ok, [^max_i64]} = NIF.cms_file_query(dst, ["hot"])
+    end
+
     test "cuckoo_file_create and roundtrip" do
       dir = make_prob_dir("nif_cuckoo")
       path = Path.join(dir, "test.cuckoo")
