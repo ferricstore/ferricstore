@@ -23,8 +23,8 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
   - Namespace is decided by the parent redis_key, NOT by the compound_key.
     HSET user:1 name "alice" uses "user" namespace, not "H".
 
-  These tests fail until Router.async_compound_put / async_compound_delete
-  are implemented.
+  These tests guard async compound writes against local-only acknowledgements,
+  duplicate origin writes, and cold large-value read regressions.
   """
   use ExUnit.Case, async: false
 
@@ -72,6 +72,27 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       assert "alice" = Router.compound_get(ctx(), redis_key, ck)
     end
 
+    test "small compound_put writes one Bitcask record on the origin" do
+      redis_key = ukey("hash_single_disk_write")
+      ck = hash_field(redis_key, "name")
+      idx = Router.shard_for(ctx(), redis_key)
+      {_file_id, file_path, _shard_path} = Ferricstore.Store.ActiveFile.get(ctx(), idx)
+
+      :ok = Router.compound_put(ctx(), redis_key, ck, "alice", 0)
+      :ok = Batcher.flush(idx)
+      :ok = Ferricstore.Store.BitcaskWriter.flush(idx)
+
+      assert {:ok, records} = Ferricstore.Bitcask.NIF.v2_scan_file(file_path)
+
+      writes =
+        Enum.count(records, fn
+          {^ck, _off, _size, _exp, false} -> true
+          _ -> false
+        end)
+
+      assert writes == 1
+    end
+
     test "compound_batch_get preserves input order and missing entries" do
       redis_key = ukey("hash_batch")
       f1 = hash_field(redis_key, "first")
@@ -111,9 +132,6 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
 
       :ok = Router.compound_put(ctx(), redis_key, ck, big, 0)
 
-      # Known issue: large values in async mode can return nil if the data dir
-      # is cleaned while writes are still in flight. Use eventually to wait for
-      # the write to fully land.
       Ferricstore.Test.Utils.eventually(
         fn ->
           result = Router.compound_get(ctx(), redis_key, ck)

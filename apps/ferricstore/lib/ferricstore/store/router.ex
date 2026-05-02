@@ -1099,6 +1099,33 @@ defmodule Ferricstore.Store.Router do
     :ok
   end
 
+  defp install_async_put_value(ctx, idx, key, value, expire_at_ms) do
+    keydir = elem(ctx.keydir_refs, idx)
+    value_for_ets = value_for_hot_cache(ctx, value)
+    disk_value = to_disk_binary(value)
+
+    if value_for_ets == nil do
+      case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
+        {:ok, file_id, [{offset, _record_size}]} ->
+          track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
+
+          :ets.insert(
+            keydir,
+            {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
+          )
+
+          :ok
+
+        {:error, reason} ->
+          {:error, "ERR disk write failed: #{inspect(reason)}"}
+      end
+    else
+      track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
+      :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
+      :ok
+    end
+  end
+
   defp with_async_key_latch(ctx, idx, key, fun) do
     [{latch_tab, ^key}] = acquire_async_key_latches(ctx, [{idx, key}])
 
@@ -1152,6 +1179,13 @@ defmodule Ferricstore.Store.Router do
   defp to_disk_binary(v) when is_integer(v), do: Integer.to_string(v)
   defp to_disk_binary(v) when is_float(v), do: Float.to_string(v)
   defp to_disk_binary(v) when is_binary(v), do: v
+
+  defp value_for_hot_cache(_ctx, value) when is_integer(value), do: Integer.to_string(value)
+  defp value_for_hot_cache(_ctx, value) when is_float(value), do: Float.to_string(value)
+
+  defp value_for_hot_cache(ctx, value) when is_binary(value) do
+    if byte_size(value) > ctx.hot_cache_max_value_size, do: nil, else: value
+  end
 
   defp clear_compound_data_structure_for_string_put(ctx, idx, keydir, key) do
     if CompoundKey.internal_key?(key) do
@@ -3384,9 +3418,10 @@ defmodule Ferricstore.Store.Router do
     else
       previous = snapshot_live_value(ctx, idx, compound_key)
 
-      with :ok <- install_rmw_value(ctx, idx, compound_key, value, expire_at_ms) do
+      with :ok <- install_async_put_value(ctx, idx, compound_key, value, expire_at_ms) do
         case async_submit_to_raft(idx, {:put, compound_key, value, expire_at_ms}) do
           :ok ->
+            bump_write_version(ctx, idx)
             :ok
 
           {:error, _} = error ->
