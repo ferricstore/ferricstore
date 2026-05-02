@@ -25,6 +25,24 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     end
   end
 
+  test "blocking Bitcask cold-read and scan NIFs run on dirty IO schedulers" do
+    source = File.read!(@source)
+
+    # These functions open files and perform pread/scan/read_all work. Cold
+    # reads are user-facing, and recovery/compaction scans can be large; keep
+    # them off normal schedulers so slow disk cannot stall BEAM request CPU.
+    for function <- [
+          "v2_pread_at",
+          "v2_scan_file",
+          "v2_scan_file_from_offset",
+          "v2_scan_tombstones",
+          "v2_pread_batch",
+          "v2_read_hint_file"
+        ] do
+      assert_nif_schedule(source, function, "DirtyIo")
+    end
+  end
+
   defp assert_nif_schedule(source, function, schedule) do
     pattern =
       ~r/#\[rustler::nif\(schedule = "#{schedule}"\)\]\s*(?:#\[allow\([^\]]+\)\]\s*)?fn #{function}\b/

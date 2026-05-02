@@ -323,7 +323,7 @@ fn v2_append_batch<'a>(
 /// but not the value bytes. We pread from disk and return the value.
 ///
 /// No Mutex needed — pread is stateless and thread-safe.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_at(env: Env<'_>, path: String, offset: u64) -> NifResult<Term<'_>> {
     let p = std::path::Path::new(&path);
@@ -366,7 +366,7 @@ fn v2_pread_at(env: Env<'_>, path: String, offset: u64) -> NifResult<Term<'_>> {
 /// `{:ok, [{key, offset, value_size, expire_at_ms, is_tombstone}, ...]}`.
 ///
 /// Used by compaction and crash recovery to rebuild the ETS keydir.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_scan_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
     let p = std::path::Path::new(&path);
@@ -425,7 +425,7 @@ fn v2_scan_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
 ///
 /// Used by hint recovery to replay only active-file records appended after the
 /// hint boundary.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_scan_file_from_offset<'a>(
     env: Env<'a>,
@@ -487,7 +487,7 @@ fn v2_scan_file_from_offset<'a>(
 /// Used during hint recovery. Hint files contain only live entries, so startup
 /// must still apply tombstones from hinted logs. This scanner skips live value
 /// payloads instead of materializing them, preserving fast cold-value recovery.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_scan_tombstones<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
     use std::io::{Read, Seek, SeekFrom};
@@ -564,7 +564,7 @@ fn v2_scan_tombstones<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
 /// L-7 fix: sort offsets ascending before reading so the kernel's readahead
 /// benefits sequential access patterns. Results are re-ordered to match the
 /// original `locations` order before returning.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_batch<'a>(env: Env<'a>, path: String, locations: Vec<u64>) -> NifResult<Term<'a>> {
     let p = std::path::Path::new(&path);
@@ -687,7 +687,7 @@ fn v2_write_hint_file<'a>(
 
 /// Read a hint file and return all entries.
 /// Returns `{:ok, [{key, file_id, offset, value_size, expire_at_ms}, ...]}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_read_hint_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
     let p = std::path::Path::new(&path);
