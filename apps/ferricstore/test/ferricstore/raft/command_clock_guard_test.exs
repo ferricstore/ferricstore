@@ -32,6 +32,24 @@ defmodule Ferricstore.Raft.CommandClockGuardTest do
     assert violations == []
   end
 
+  test "direct raft scanner ignores comments and detects executable calls" do
+    source = """
+    defmodule Example do
+      # :ra.process_command(commented, :ignored)
+
+      def run(target) do
+        :ra.pipeline_command(target, :cmd, make_ref(), :normal)
+      end
+    end
+    """
+
+    assert [
+             {"lib/ferricstore/example.ex", 5,
+              ":ra.pipeline_command(target, :cmd, make_ref(), :normal)"}
+           ] =
+             direct_ra_calls_in_source("lib/ferricstore/example.ex", source)
+  end
+
   defp production_files do
     @root
     |> Path.join("lib/ferricstore/**/*.ex")
@@ -44,15 +62,30 @@ defmodule Ferricstore.Raft.CommandClockGuardTest do
 
     path
     |> File.read!()
-    |> String.split("\n")
-    |> Enum.with_index(1)
-    |> Enum.flat_map(fn {line, line_no} ->
-      if String.contains?(line, [":ra.process_command(", ":ra.pipeline_command("]) do
-        [{relative, line_no, String.trim(line)}]
-      else
-        []
-      end
-    end)
+    |> then(&direct_ra_calls_in_source(relative, &1))
+  end
+
+  defp direct_ra_calls_in_source(relative, source) do
+    lines =
+      source
+      |> String.split("\n")
+      |> Enum.with_index(1)
+      |> Map.new(fn {line, line_no} -> {line_no, String.trim(line)} end)
+
+    {:ok, ast} = Code.string_to_quoted(source)
+
+    {_ast, calls} =
+      Macro.prewalk(ast, [], fn
+        {{:., meta, [:ra, fun]}, _call_meta, args} = node, acc
+        when fun in [:process_command, :pipeline_command] and is_list(args) ->
+          line_no = Keyword.fetch!(meta, :line)
+          {node, [{relative, line_no, Map.fetch!(lines, line_no)} | acc]}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    Enum.reverse(calls)
   end
 
   defp allowed_call?({relative, _line_no, line}) do
