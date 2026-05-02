@@ -101,6 +101,31 @@ defmodule Ferricstore.InstanceTest do
     end
   end
 
+  describe "custom instance cleanup" do
+    test "removes latch ETS tables" do
+      name = :"cleanup_latch_#{System.unique_integer([:positive])}"
+      on_exit(fn -> FerricStore.Instance.cleanup(name) end)
+
+      ctx =
+        FerricStore.Instance.build(name,
+          data_dir: Path.join(System.tmp_dir!(), Atom.to_string(name)),
+          shard_count: 2,
+          raft_enabled: false
+        )
+
+      latch_0 = elem(ctx.latch_refs, 0)
+      latch_1 = elem(ctx.latch_refs, 1)
+
+      assert :ets.whereis(latch_0) != :undefined
+      assert :ets.whereis(latch_1) != :undefined
+
+      FerricStore.Instance.cleanup(name)
+
+      assert :ets.whereis(latch_0) == :undefined
+      assert :ets.whereis(latch_1) == :undefined
+    end
+  end
+
   describe "FerricStore.Impl with default instance" do
     test "set and get" do
       ctx = FerricStore.Instance.get(:default)

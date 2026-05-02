@@ -124,8 +124,12 @@ defmodule FerricStore.Instance do
       if name == :default do
         {
           try_get_pt(:ferricstore_pressure_flags, fn -> :atomics.new(3, signed: false) end),
-          try_get_pt(:ferricstore_disk_pressure, fn -> :atomics.new(shard_count, signed: false) end),
-          try_get_pt(:ferricstore_write_versions, fn -> :counters.new(shard_count, [:write_concurrency]) end),
+          try_get_pt(:ferricstore_disk_pressure, fn ->
+            :atomics.new(shard_count, signed: false)
+          end),
+          try_get_pt(:ferricstore_write_versions, fn ->
+            :counters.new(shard_count, [:write_concurrency])
+          end),
           :counters.new(10, [:atomics])
         }
       else
@@ -186,15 +190,26 @@ defmodule FerricStore.Instance do
     hotness_table =
       case :ets.whereis(hotness_name) do
         :undefined ->
-          :ets.new(hotness_name, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
-        _ref -> hotness_name
+          :ets.new(hotness_name, [
+            :set,
+            :public,
+            :named_table,
+            {:read_concurrency, true},
+            {:write_concurrency, :auto},
+            {:decentralized_counters, true}
+          ])
+
+        _ref ->
+          hotness_name
       end
 
     config_table =
       case :ets.whereis(config_name) do
         :undefined ->
           :ets.new(config_name, [:set, :public, :named_table, {:read_concurrency, true}])
-        _ref -> config_name
+
+        _ref ->
+          config_name
       end
 
     # Memory limits
@@ -221,8 +236,12 @@ defmodule FerricStore.Instance do
       lfu_log_factor: lfu_log_factor,
       lfu_initial_ref: lfu_initial_ref,
       hot_cache_max_value_size: Keyword.get(opts, :hot_cache_max_value_size, 65_536),
-      sync_flush_timeout_ms: Keyword.get(opts, :sync_flush_timeout_ms,
-        Application.get_env(:ferricstore, :sync_flush_timeout_ms, 5_000)),
+      sync_flush_timeout_ms:
+        Keyword.get(
+          opts,
+          :sync_flush_timeout_ms,
+          Application.get_env(:ferricstore, :sync_flush_timeout_ms, 5_000)
+        ),
       max_active_file_size: Keyword.get(opts, :max_active_file_size, 256 * 1024 * 1024),
       read_sample_rate: Keyword.get(opts, :read_sample_rate, 100),
       eviction_policy: Keyword.get(opts, :eviction_policy, :volatile_lfu),
@@ -282,6 +301,7 @@ defmodule FerricStore.Instance do
   """
   @spec cleanup(atom()) :: :ok
   def cleanup(name) do
+    cleanup_instance_tables(fetch_cached(name))
     :persistent_term.erase({FerricStore.Instance, name})
     :ok
   rescue
@@ -291,6 +311,42 @@ defmodule FerricStore.Instance do
   # ---------------------------------------------------------------------------
   # Private: build helpers
   # ---------------------------------------------------------------------------
+
+  defp fetch_cached(name) do
+    {:ok, :persistent_term.get({FerricStore.Instance, name})}
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp cleanup_instance_tables({:ok, %__MODULE__{name: :default}}), do: :ok
+  defp cleanup_instance_tables(:error), do: :ok
+
+  defp cleanup_instance_tables({:ok, %__MODULE__{} = ctx}) do
+    ctx.keydir_refs
+    |> tuple_values()
+    |> Enum.each(&delete_ets_table/1)
+
+    ctx.latch_refs
+    |> tuple_values()
+    |> Enum.each(&delete_ets_table/1)
+
+    delete_ets_table(ctx.hotness_table)
+    delete_ets_table(ctx.config_table)
+  end
+
+  defp tuple_values(tuple) when is_tuple(tuple), do: Tuple.to_list(tuple)
+  defp tuple_values(_other), do: []
+
+  defp delete_ets_table(table) when is_atom(table) or is_reference(table) do
+    case :ets.whereis(table) do
+      :undefined -> :ok
+      _tid -> :ets.delete(table)
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp delete_ets_table(_table), do: :ok
 
   defp build_slot_map(shard_count) do
     0..1023
@@ -372,13 +428,17 @@ defmodule FerricStore.Instance do
 
   defp cgroup_v2_limit do
     case File.read("/sys/fs/cgroup/memory.max") do
-      {:ok, "max\n"} -> nil
+      {:ok, "max\n"} ->
+        nil
+
       {:ok, data} ->
         case Integer.parse(String.trim(data)) do
           {bytes, _} when bytes > 0 -> bytes
           _ -> nil
         end
-      _ -> nil
+
+      _ ->
+        nil
     end
   end
 
@@ -389,13 +449,16 @@ defmodule FerricStore.Instance do
           {bytes, _} when bytes > 0 and bytes < 4_611_686_018_427_387_904 -> bytes
           _ -> nil
         end
-      _ -> nil
+
+      _ ->
+        nil
     end
   end
 
   defp host_total_memory do
     try do
       data = apply(:memsup, :get_system_memory_data, [])
+
       case data do
         list when is_list(list) -> Keyword.get(list, :total_memory)
         _ -> nil
