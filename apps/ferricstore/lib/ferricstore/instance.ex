@@ -139,8 +139,8 @@ defmodule FerricStore.Instance do
 
     # Per-shard dirty flag for the BitcaskCheckpointer. 1 = "a nosync
     # append happened since the last fsync_async". The checkpointer
-    # clears the flag before firing async fsync; writers re-set it on
-    # every batch. Read/written from any process — no GenServer hop.
+    # clears the flag after marking the fsync in-flight; writers re-set
+    # it on every batch. Read/written from any process — no GenServer hop.
     checkpoint_flags =
       if name == :default do
         try_get_pt(:ferricstore_checkpoint_flags, fn ->
@@ -151,9 +151,8 @@ defmodule FerricStore.Instance do
       end
 
     # Per-shard marker for checkpoint fsync calls that are currently in flight.
-    # `checkpoint_flags` is cleared before async fsync starts so writers can
-    # mark new dirty data; Raft release_cursor must also consult this marker
-    # before compacting log entries that protect page-cache-only Bitcask bytes.
+    # Set before `checkpoint_flags` is cleared so Raft release_cursor never
+    # observes a false-clean shard while Bitcask bytes are still page-cache-only.
     checkpoint_in_flight =
       if name == :default do
         try_get_pt(:ferricstore_checkpoint_in_flight, fn ->

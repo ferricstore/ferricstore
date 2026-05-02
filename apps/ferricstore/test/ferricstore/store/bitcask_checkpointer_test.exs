@@ -30,6 +30,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     catch
       :exit, {:noproc, _} -> :ok
       :exit, :noproc -> :ok
+      :exit, _ -> :ok
     end
   end
 
@@ -40,6 +41,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     ctx = %{
       name: :"test_ck_#{:erlang.unique_integer([:positive])}",
       checkpoint_flags: :atomics.new(1, signed: false),
+      checkpoint_in_flight: :atomics.new(1, signed: false),
       disk_pressure: :atomics.new(1, signed: false)
     }
 
@@ -75,7 +77,10 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     %{ctx: ctx, tmp: tmp, active_path: active_path}
   end
 
-  test "checkpointer fsyncs only when the dirty flag is set", %{ctx: ctx, active_path: active_path} do
+  test "checkpointer fsyncs only when the dirty flag is set", %{
+    ctx: ctx,
+    active_path: active_path
+  } do
     # Start checkpointer with a fast 20ms tick so we don't wait long.
     {:ok, pid} =
       BitcaskCheckpointer.start_link(
@@ -119,6 +124,44 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     assert :atomics.get(ctx.checkpoint_flags, 1) == 0
   end
 
+  test "async fsync submit errors reset dirty and in-flight markers", %{
+    ctx: ctx,
+    active_path: active_path
+  } do
+    parent = self()
+
+    ctx =
+      Map.put(ctx, :fsync_async, fn caller, corr_id, path ->
+        dirty = :atomics.get(ctx.checkpoint_flags, 1)
+        in_flight = :atomics.get(ctx.checkpoint_in_flight, 1)
+        send(parent, {:fsync_async_called, caller, corr_id, path, dirty, in_flight})
+        {:error, :submit_failed}
+      end)
+
+    {:ok, pid} =
+      BitcaskCheckpointer.start_link(
+        index: 0,
+        instance_ctx: ctx,
+        checkpoint_interval_ms: 10_000,
+        name: :"ck_submit_error_#{:erlang.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> safe_stop(pid) end)
+
+    :atomics.put(ctx.checkpoint_flags, 1, 1)
+
+    send(pid, :tick)
+
+    assert_receive {:fsync_async_called, ^pid, 1, ^active_path, 0, 1}, 2_000
+    assert_receive {:checkpoint, _meas, %{status: :error}}, 2_000
+    state = :sys.get_state(pid)
+
+    assert state.in_flight? == false
+    assert state.current_corr_id == nil
+    assert :atomics.get(ctx.checkpoint_flags, 1) == 1
+    assert :atomics.get(ctx.checkpoint_in_flight, 1) == 0
+  end
+
   test "writer via state-machine-style put raises the flag", %{ctx: ctx, active_path: active_path} do
     # Emulate the write-path: append a record, then flip the flag the
     # way StateMachine.flush_pending_writes does.
@@ -129,7 +172,10 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
            "writer must raise the dirty flag so the checkpointer picks it up"
   end
 
-  test "shutdown with a dirty shard fires a synchronous fsync", %{ctx: ctx, active_path: active_path} do
+  test "shutdown with a dirty shard fires a synchronous fsync", %{
+    ctx: ctx,
+    active_path: active_path
+  } do
     # Append a record via the NOSYNC NIF so the data is only in page
     # cache. Then raise the dirty flag and stop the checkpointer. The
     # terminate/2 barrier must run v2_fsync on the active file and emit
@@ -160,8 +206,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
 
     :ok = GenServer.stop(pid, :normal, 5_000)
 
-    assert_receive {:shutdown_sync, %{shard_index: 0},
-                    %{dirty?: true, result: :ok}},
+    assert_receive {:shutdown_sync, %{shard_index: 0}, %{dirty?: true, result: :ok}},
                    2_000,
                    "terminate/2 must fsync the active file on graceful shutdown"
 
@@ -195,8 +240,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
 
     :ok = GenServer.stop(pid, :normal, 5_000)
 
-    assert_receive {:shutdown_sync, %{shard_index: 0},
-                    %{dirty?: false, result: :clean}},
+    assert_receive {:shutdown_sync, %{shard_index: 0}, %{dirty?: false, result: :clean}},
                    2_000,
                    "terminate/2 must observe the clean flag and skip fsync"
   end

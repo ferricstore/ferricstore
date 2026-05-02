@@ -21,15 +21,18 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
 
       every checkpoint_interval_ms:
         if :atomics.get(checkpoint_flags, idx+1) == 1:
-          :atomics.put(checkpoint_flags, idx+1, 0)   # clear BEFORE fsync
           {_fid, active_path, _sp} = ActiveFile.get(idx)
+          :atomics.put(checkpoint_in_flight, idx+1, 1)
+          :atomics.put(checkpoint_flags, idx+1, 0)
           NIF.v2_fsync_async(self(), corr_id, active_path)
         else: skip (idle shard — no syscalls)
 
-  Clearing the flag before firing async-fsync is intentional: a writer
-  that arrives during the fsync re-sets the flag, so the next tick picks
-  it up. The current fsync may miss bytes from that concurrent write,
-  which is fine because Ra WAL is authoritative.
+  The in-flight marker is set before clearing the dirty flag. That avoids
+  a false-clean window where Raft could release log entries while Bitcask
+  bytes are still only in page cache. A writer that arrives during fsync
+  re-sets the dirty flag, so the next tick picks it up. The current fsync
+  may miss bytes from that concurrent write, which is fine because Ra WAL
+  is authoritative.
 
   On fsync error (disk full, I/O error), we re-set the flag so the next
   tick retries, and raise DiskPressure to shed writes.
@@ -222,8 +225,8 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
     reply =
       case ActiveFile.get(ctx, state.index) do
         {_fid, active_path, _sp} ->
-          if ctx, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 0)
           mark_checkpoint_in_flight(ctx, state.index, 1)
+          if ctx, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 0)
 
           try do
             case NIF.v2_fsync(active_path) do
@@ -263,23 +266,60 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
     flag_idx = state.index + 1
 
     if :atomics.get(state.instance_ctx.checkpoint_flags, flag_idx) == 1 do
-      :atomics.put(state.instance_ctx.checkpoint_flags, flag_idx, 0)
-
       case ActiveFile.get(state.instance_ctx, state.index) do
         {_fid, active_path, _sp} ->
           corr_id = state.next_corr_id
           mark_checkpoint_in_flight(state.instance_ctx, state.index, 1)
-          NIF.v2_fsync_async(self(), corr_id, active_path)
-          %{state | in_flight?: true, next_corr_id: corr_id + 1, current_corr_id: corr_id}
+          :atomics.put(state.instance_ctx.checkpoint_flags, flag_idx, 0)
+
+          case fsync_async(state.instance_ctx, self(), corr_id, active_path) do
+            :ok ->
+              %{state | in_flight?: true, next_corr_id: corr_id + 1, current_corr_id: corr_id}
+
+            {:error, reason} ->
+              checkpoint_submit_failed(state, reason)
+          end
       end
     else
       state
     end
   rescue
-    _ ->
+    exception ->
       :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 1)
       mark_checkpoint_in_flight(state.instance_ctx, state.index, 0)
+
+      :telemetry.execute(
+        [:ferricstore, :bitcask, :checkpoint],
+        %{shard_index: state.index},
+        %{status: :error, reason: Exception.message(exception)}
+      )
+
       state
+  end
+
+  defp fsync_async(ctx, caller, corr_id, active_path) do
+    case Map.get(ctx, :fsync_async) do
+      fun when is_function(fun, 3) -> fun.(caller, corr_id, active_path)
+      _ -> NIF.v2_fsync_async(caller, corr_id, active_path)
+    end
+  end
+
+  defp checkpoint_submit_failed(state, reason) do
+    :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 1)
+    mark_checkpoint_in_flight(state.instance_ctx, state.index, 0)
+    DiskPressure.set(state.instance_ctx, state.index)
+
+    :telemetry.execute(
+      [:ferricstore, :bitcask, :checkpoint],
+      %{shard_index: state.index},
+      %{status: :error, reason: reason}
+    )
+
+    Logger.error(
+      "BitcaskCheckpointer shard=#{state.index}: fsync submit failed: #{inspect(reason)}"
+    )
+
+    state
   end
 
   defp mark_checkpoint_in_flight(nil, _index, _value), do: :ok
