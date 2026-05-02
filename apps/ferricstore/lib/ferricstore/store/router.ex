@@ -27,6 +27,7 @@ defmodule Ferricstore.Store.Router do
 
   @slot_mask 1023
   @bitcask_header_size 26
+  @cold_batch_read_timeout_ms 10_000
 
   defguardp valid_cold_file_ref(file_id, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(value_size) and
@@ -1636,62 +1637,114 @@ defmodule Ferricstore.Store.Router do
   def batch_get(ctx, keys) do
     now = HLC.now_ms()
 
-    Enum.map(keys, fn key ->
-      idx = shard_for(ctx, key)
-      keydir = resolve_keydir(ctx, idx)
+    {results, {cold_entries, _cold_count}} =
+      Enum.map_reduce(keys, {[], 0}, fn key, {cold_entries, cold_count} ->
+        idx = shard_for(ctx, key)
+        keydir = resolve_keydir(ctx, idx)
 
-      case ets_get_full(ctx, idx, keydir, key, now) do
-        {:hit, value, lfu} ->
-          sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
-          value
+        case ets_get_full(ctx, idx, keydir, key, now) do
+          {:hit, value, lfu} ->
+            sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
+            {{:value, value}, {cold_entries, cold_count}}
 
-        {:cold, file_id, offset, value_size}
-        when valid_cold_location(file_id, offset, value_size) ->
-          shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+          {:cold, file_id, offset, value_size}
+          when valid_cold_location(file_id, offset, value_size) ->
+            shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
 
-          path =
-            Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+            path =
+              Path.join(
+                shard_path,
+                "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
+              )
 
-          case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
-            {:ok, value} ->
+            entry = {ctx, keydir, key, path, file_id, offset}
+            {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
+
+          {:cold, _file_id, _offset, _value_size} ->
+            result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
+
+            if result != nil do
               Stats.record_cold_read(ctx, key)
-              warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
-              value
+            else
+              Stats.incr_keyspace_misses(ctx)
+            end
 
-            _ ->
-              nil
-          end
+            {{:value, result}, {cold_entries, cold_count}}
 
-        {:cold, _file_id, _offset, _value_size} ->
-          result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
-
-          if result != nil do
-            Stats.record_cold_read(ctx, key)
-          else
+          :expired ->
             Stats.incr_keyspace_misses(ctx)
-          end
+            {{:value, nil}, {cold_entries, cold_count}}
 
-          result
-
-        :expired ->
-          Stats.incr_keyspace_misses(ctx)
-          nil
-
-        :miss ->
-          Stats.incr_keyspace_misses(ctx)
-          nil
-
-        :no_table ->
-          result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
-
-          if result != nil do
-            Stats.record_cold_read(ctx, key)
-          else
+          :miss ->
             Stats.incr_keyspace_misses(ctx)
+            {{:value, nil}, {cold_entries, cold_count}}
+
+          :no_table ->
+            result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
+
+            if result != nil do
+              Stats.record_cold_read(ctx, key)
+            else
+              Stats.incr_keyspace_misses(ctx)
+            end
+
+            {{:value, result}, {cold_entries, cold_count}}
+        end
+      end)
+
+    cold_values =
+      cold_entries
+      |> Enum.reverse()
+      |> read_cold_batch_async()
+      |> List.to_tuple()
+
+    Enum.map(results, fn
+      {:value, value} -> value
+      {:cold, index} -> elem(cold_values, index)
+    end)
+  end
+
+  defp read_cold_batch_async([]), do: []
+
+  defp read_cold_batch_async(entries) do
+    locations =
+      Enum.map(entries, fn {_ctx, _keydir, _key, path, _file_id, offset} ->
+        {path, offset}
+      end)
+
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    values =
+      case Ferricstore.Bitcask.NIF.v2_pread_batch_async(self(), corr_id, locations) do
+        :ok ->
+          receive do
+            {:tokio_complete, ^corr_id, :ok, values} when is_list(values) ->
+              if length(values) == length(entries) do
+                values
+              else
+                List.duplicate(nil, length(entries))
+              end
+
+            {:tokio_complete, ^corr_id, :error, _reason} ->
+              List.duplicate(nil, length(entries))
+          after
+            @cold_batch_read_timeout_ms ->
+              List.duplicate(nil, length(entries))
           end
 
-          result
+        {:error, _reason} ->
+          List.duplicate(nil, length(entries))
       end
+
+    Enum.zip(entries, values)
+    |> Enum.map(fn
+      {{ctx, keydir, key, _path, file_id, offset}, value} when value != nil ->
+        Stats.record_cold_read(ctx, key)
+        warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
+        value
+
+      {_entry, _value} ->
+        nil
     end)
   end
 

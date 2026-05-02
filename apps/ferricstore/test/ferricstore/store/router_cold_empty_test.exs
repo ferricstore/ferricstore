@@ -65,6 +65,38 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     assert [nil] == Router.batch_get(ctx, [key])
   end
 
+  test "batch_get preserves mixed cold result order including empty values", %{
+    ctx: ctx,
+    shard: shard,
+    keydir: keydir
+  } do
+    cold_empty = "cold_batch_empty:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    cold_large = "cold_batch_large:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    hot = "cold_batch_hot:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    large_value = :binary.copy("x", 2_048)
+
+    :ok = GenServer.call(shard, {:put, cold_empty, "", 0})
+    :ok = GenServer.call(shard, {:put, cold_large, large_value, 0})
+    :ok = GenServer.call(shard, {:put, hot, "hot", 0})
+    :ok = GenServer.call(shard, :flush)
+
+    assert [{^cold_empty, "", exp_empty, lfu_empty, fid_empty, off_empty, 0}] =
+             :ets.lookup(keydir, cold_empty)
+
+    :ets.insert(keydir, {cold_empty, nil, exp_empty, lfu_empty, fid_empty, off_empty, 0})
+
+    assert [{^cold_large, _stored, exp_large, lfu_large, fid_large, off_large, vsize_large}] =
+             :ets.lookup(keydir, cold_large)
+
+    :ets.insert(
+      keydir,
+      {cold_large, nil, exp_large, lfu_large, fid_large, off_large, vsize_large}
+    )
+
+    assert Router.batch_get(ctx, [cold_large, "missing", hot, cold_empty, cold_large]) ==
+             [large_value, nil, "hot", "", large_value]
+  end
+
   test "get_file_ref rejects cold rows with invalid offsets", %{ctx: ctx, keydir: keydir} do
     key = "cold_invalid_sendfile:" <> Integer.to_string(:erlang.unique_integer([:positive]))
     :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})

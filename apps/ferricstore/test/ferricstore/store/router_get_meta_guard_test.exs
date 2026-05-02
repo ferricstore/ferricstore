@@ -19,6 +19,16 @@ defmodule Ferricstore.Store.RouterGetMetaGuardTest do
              "value and expire_at_ms must come from one ETS row to avoid impossible pairs"
   end
 
+  test "batch_get cold reads use the async batch pread NIF" do
+    source = File.read!(@router_path)
+
+    # Cold values are the main product path for large values. batch_get/2 must
+    # submit all cold disk reads together so one request does not serialize N
+    # blocking preads on the caller process.
+    assert source =~ "v2_pread_batch_async",
+           "expected Router.batch_get/2 cold path to use v2_pread_batch_async/3"
+  end
+
   defp function_body(ast, name, arity) do
     {_ast, body} =
       Macro.prewalk(ast, nil, fn
