@@ -302,13 +302,15 @@ defmodule Ferricstore.Store.Shard.Reads do
 
     case NIF.v2_pread_at_async(self(), corr_id, path, offset) do
       :ok ->
-        Process.send_after(self(), {:cold_read_timeout, corr_id}, @cold_read_timeout_ms)
+        timer_ref =
+          Process.send_after(self(), {:cold_read_timeout, corr_id}, @cold_read_timeout_ms)
 
         {:noreply,
          %{
            state
            | next_correlation_id: corr_id,
-             pending_reads: Map.put(state.pending_reads, corr_id, pending_entry)
+             pending_reads:
+               Map.put(state.pending_reads, corr_id, {:pending_read, pending_entry, timer_ref})
          }}
 
       {:error, _reason} ->

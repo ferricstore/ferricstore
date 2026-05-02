@@ -1082,7 +1082,7 @@ defmodule Ferricstore.Store.Shard do
   # Dispatches to fsync completion (flush_in_flight match) or read completion
   # (pending_reads lookup).
   def handle_info({:cold_read_timeout, corr_id}, state) do
-    case Map.pop(state.pending_reads, corr_id) do
+    case pop_pending_read(state.pending_reads, corr_id, :keep_timer) do
       {{from, _key, _exp, _fid, _off, _vsize}, rest_pending} ->
         GenServer.reply(from, nil)
         {:noreply, %{state | pending_reads: rest_pending}}
@@ -1112,7 +1112,7 @@ defmodule Ferricstore.Store.Shard do
 
       # Async read completion — look up in pending_reads
       true ->
-        case Map.pop(state.pending_reads, corr_id) do
+        case pop_pending_read(state.pending_reads, corr_id, :cancel_timer) do
           {{from, key, exp, fid, off, vsize}, rest_pending} ->
             # Simple GET cold-read completion. Warm only if the ETS entry still
             # points at the same disk location read by this request.
@@ -1162,7 +1162,7 @@ defmodule Ferricstore.Store.Shard do
 
       {:noreply, %{state | flush_in_flight: nil}}
     else
-      case Map.pop(state.pending_reads, corr_id) do
+      case pop_pending_read(state.pending_reads, corr_id, :cancel_timer) do
         {{from, _key, _exp, _fid, _off, _vsize}, rest_pending} ->
           GenServer.reply(from, nil)
           {:noreply, %{state | pending_reads: rest_pending}}
@@ -1201,6 +1201,24 @@ defmodule Ferricstore.Store.Shard do
   def handle_info(_msg, state) do
     {:noreply, state}
   end
+
+  defp pop_pending_read(pending_reads, corr_id, timer_action) do
+    case Map.pop(pending_reads, corr_id) do
+      {{:pending_read, entry, timer_ref}, rest_pending} ->
+        maybe_cancel_pending_timer(timer_action, timer_ref)
+        {entry, rest_pending}
+
+      other ->
+        other
+    end
+  end
+
+  defp maybe_cancel_pending_timer(:cancel_timer, timer_ref) when is_reference(timer_ref) do
+    _ = Process.cancel_timer(timer_ref, async: false, info: false)
+    :ok
+  end
+
+  defp maybe_cancel_pending_timer(_timer_action, _timer_ref), do: :ok
 
   # -------------------------------------------------------------------
   # Graceful shutdown (spec 2C.6, step 8)
