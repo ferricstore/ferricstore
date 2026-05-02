@@ -178,10 +178,16 @@ defmodule Ferricstore.Commands.Bitmap do
     with :ok <- ensure_string_key(key, store),
          {:ok, bit_val} <- parse_bit_value(bit_str),
          {:ok, start_idx} <- parse_integer(start_str) do
-      current = Ops.get(store, key) || <<>>
-      len = byte_size(current)
-      start_resolved = resolve_index(start_idx, len)
-      bitpos_byte_range(current, bit_val, start_resolved, len - 1, false)
+      case bitpos_byte_range_from_size(store, key, bit_val, start_idx, nil, false) do
+        {:ok, result} ->
+          result
+
+        :unknown ->
+          current = Ops.get(store, key) || <<>>
+          len = byte_size(current)
+          start_resolved = resolve_index(start_idx, len)
+          bitpos_byte_range(current, bit_val, start_resolved, len - 1, false)
+      end
     end
   end
 
@@ -193,20 +199,32 @@ defmodule Ferricstore.Commands.Bitmap do
          {:ok, bit_val} <- parse_bit_value(bit_str),
          {:ok, start_idx} <- parse_integer(start_str),
          {:ok, end_idx} <- parse_integer(end_str) do
-      current = Ops.get(store, key) || <<>>
-
       case mode do
         :byte ->
-          len = byte_size(current)
-          s = resolve_index(start_idx, len)
-          e = resolve_index(end_idx, len)
-          bitpos_byte_range(current, bit_val, s, e, true)
+          case bitpos_byte_range_from_size(store, key, bit_val, start_idx, end_idx, true) do
+            {:ok, result} ->
+              result
+
+            :unknown ->
+              current = Ops.get(store, key) || <<>>
+              len = byte_size(current)
+              s = resolve_index(start_idx, len)
+              e = resolve_index(end_idx, len)
+              bitpos_byte_range(current, bit_val, s, e, true)
+          end
 
         :bit ->
-          total_bits = byte_size(current) * 8
-          s = resolve_index(start_idx, total_bits)
-          e = resolve_index(end_idx, total_bits)
-          bitpos_bit_range(current, bit_val, s, e)
+          case bitpos_bit_range_from_size(store, key, start_idx, end_idx) do
+            {:ok, result} ->
+              result
+
+            :unknown ->
+              current = Ops.get(store, key) || <<>>
+              total_bits = byte_size(current) * 8
+              s = resolve_index(start_idx, total_bits)
+              e = resolve_index(end_idx, total_bits)
+              bitpos_bit_range(current, bit_val, s, e)
+          end
       end
     end
   end
@@ -242,7 +260,7 @@ defmodule Ferricstore.Commands.Bitmap do
   # ===========================================================================
 
   defp byte_index_outside_value?(store, key, byte_index) do
-    case Ops.value_size(store, key) do
+    case metadata_value_size(store, key) do
       size when is_integer(size) -> byte_index >= size
       _ -> false
     end
@@ -254,7 +272,7 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp bitcount_range_empty_without_value?(store, key, :byte, start_idx, _end_idx)
        when start_idx >= 0 do
-    case Ops.value_size(store, key) do
+    case metadata_value_size(store, key) do
       size when is_integer(size) -> start_idx >= size
       _ -> false
     end
@@ -262,13 +280,67 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp bitcount_range_empty_without_value?(store, key, :bit, start_idx, _end_idx)
        when start_idx >= 0 do
-    case Ops.value_size(store, key) do
+    case metadata_value_size(store, key) do
       size when is_integer(size) -> start_idx >= size * 8
       _ -> false
     end
   end
 
   defp bitcount_range_empty_without_value?(_store, _key, _mode, _start_idx, _end_idx), do: false
+
+  defp bitpos_byte_range_from_size(store, key, bit_val, start_idx, end_idx, explicit_end) do
+    case metadata_value_size(store, key) do
+      size when is_integer(size) ->
+        start_resolved = resolve_index(start_idx, size)
+        end_resolved = if end_idx == nil, do: size - 1, else: resolve_index(end_idx, size)
+        start_byte = max(start_resolved, 0)
+        end_byte = min(end_resolved, size - 1)
+
+        cond do
+          start_byte > end_byte or start_byte >= size ->
+            {:ok, bitpos_empty_byte_range_result(bit_val, size, explicit_end)}
+
+          true ->
+            :unknown
+        end
+
+      _ ->
+        :unknown
+    end
+  end
+
+  defp bitpos_empty_byte_range_result(0, size, false), do: size * 8
+  defp bitpos_empty_byte_range_result(_bit_val, _size, _explicit_end), do: -1
+
+  defp bitpos_bit_range_from_size(store, key, start_idx, end_idx) do
+    case metadata_value_size(store, key) do
+      size when is_integer(size) ->
+        total_bits = size * 8
+        start_resolved = resolve_index(start_idx, total_bits)
+        end_resolved = resolve_index(end_idx, total_bits)
+        start_bit = max(start_resolved, 0)
+        end_bit = min(end_resolved, total_bits - 1)
+
+        if start_bit > end_bit or start_bit >= total_bits do
+          {:ok, -1}
+        else
+          :unknown
+        end
+
+      _ ->
+        :unknown
+    end
+  end
+
+  defp metadata_value_size(%FerricStore.Instance{} = store, key), do: Ops.value_size(store, key)
+
+  defp metadata_value_size(%Ferricstore.Store.LocalTxStore{} = store, key),
+    do: Ops.value_size(store, key)
+
+  defp metadata_value_size(%{value_size: value_size}, key) when is_function(value_size, 1),
+    do: value_size.(key)
+
+  defp metadata_value_size(_store, _key), do: :unknown
 
   # --- Parsing helpers -------------------------------------------------------
 

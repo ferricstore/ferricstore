@@ -774,6 +774,18 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert 16 == Bitmap.handle("BITPOS", ["allones", "0", "5"], store)
     end
 
+    test "BITPOS 0 with start beyond known cold size avoids loading value" do
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 2 end,
+        get: fn _key ->
+          flunk("BITPOS should not load a cold value when metadata proves the result")
+        end
+      }
+
+      assert 16 == Bitmap.handle("BITPOS", ["cold", "0", "5"], store)
+    end
+
     test "BITPOS 1 with start beyond string length returns -1" do
       store = MockStore.make(%{"short" => {<<0xFF>>, 0}})
 
@@ -781,10 +793,46 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert -1 == Bitmap.handle("BITPOS", ["short", "1", "5"], store)
     end
 
+    test "BITPOS 1 with start beyond known cold size avoids loading value" do
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 1 end,
+        get: fn _key ->
+          flunk("BITPOS should not load a cold value when metadata proves the result")
+        end
+      }
+
+      assert -1 == Bitmap.handle("BITPOS", ["cold", "1", "5"], store)
+    end
+
     test "BITPOS 0 with explicit end beyond string length returns -1" do
       # With explicit end range, no virtual bits — return -1
       store = MockStore.make(%{"allones" => {<<0xFF, 0xFF>>, 0}})
       assert -1 == Bitmap.handle("BITPOS", ["allones", "0", "5", "10"], store)
+    end
+
+    test "BITPOS with explicit byte range past known cold size avoids loading value" do
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 2 end,
+        get: fn _key ->
+          flunk("BITPOS should not load a cold value when metadata proves the result")
+        end
+      }
+
+      assert -1 == Bitmap.handle("BITPOS", ["cold", "0", "5", "10"], store)
+    end
+
+    test "BITPOS with explicit bit range past known cold size avoids loading value" do
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 2 end,
+        get: fn _key ->
+          flunk("BITPOS should not load a cold value when metadata proves the result")
+        end
+      }
+
+      assert -1 == Bitmap.handle("BITPOS", ["cold", "0", "16", "24", "BIT"], store)
     end
 
     test "BITOP result can be read with GETBIT" do
