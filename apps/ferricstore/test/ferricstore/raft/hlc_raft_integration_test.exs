@@ -24,9 +24,10 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
   setup do
     dir = Path.join(System.tmp_dir!(), "hlc_raft_test_#{:rand.uniform(9_999_999)}")
-    File.mkdir_p!(dir)
+    shard_path = Ferricstore.DataDir.shard_data_path(dir, 0)
+    File.mkdir_p!(shard_path)
 
-    active_file_path = Path.join(dir, "00000.log")
+    active_file_path = Path.join(shard_path, "00000.log")
     File.touch!(active_file_path)
 
     suffix = :rand.uniform(9_999_999)
@@ -36,7 +37,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
     state =
       StateMachine.init(%{
         shard_index: 0,
-        shard_data_path: dir,
+        shard_data_path: shard_path,
+        data_dir: dir,
         active_file_id: 0,
         active_file_path: active_file_path,
         ets: keydir_name
@@ -239,13 +241,15 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       dir: dir
     } do
       interval = 3
+      shard_path = Ferricstore.DataDir.shard_data_path(dir, 0)
 
       state =
         StateMachine.init(%{
           shard_index: 0,
-          shard_data_path: dir,
+          shard_data_path: shard_path,
+          data_dir: dir,
           active_file_id: 0,
-          active_file_path: Path.join(dir, "00000.log"),
+          active_file_path: Path.join(shard_path, "00000.log"),
           ets: ets,
           release_cursor_interval: interval
         })
@@ -267,7 +271,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       meta = %{index: 3, term: 1, system_time: System.os_time(:millisecond)}
       wrapped = {{:put, "rc_hlc_3", "v3", 0}, %{hlc_ts: hlc_ts}}
 
-      {new_state, {:applied_at, _, :ok}, effects} = StateMachine.apply(meta, wrapped, state_before)
+      {new_state, {:applied_at, _, :ok}, effects} =
+        StateMachine.apply(meta, wrapped, state_before)
 
       assert new_state.applied_count == 3
       cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
@@ -284,7 +289,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       # Reset HLC to zero
       ref = :persistent_term.get(:ferricstore_hlc_ref)
       :atomics.put(ref, 1, 0)
-  
+
       # Becoming leader should advance the HLC
       effects = StateMachine.state_enter(:leader, state)
 

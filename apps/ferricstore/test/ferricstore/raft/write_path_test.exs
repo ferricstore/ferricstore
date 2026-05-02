@@ -464,10 +464,11 @@ defmodule Ferricstore.Raft.WritePathTest do
 
   defp fresh_sm_state do
     dir = Path.join(System.tmp_dir!(), "wp_sm_#{:rand.uniform(9_999_999)}")
-    File.mkdir_p!(dir)
+    shard_path = Ferricstore.DataDir.shard_data_path(dir, 0)
+    File.mkdir_p!(shard_path)
 
     # v2: create a .log file instead of NIF.new
-    active_file_path = Path.join(dir, "00000.log")
+    active_file_path = Path.join(shard_path, "00000.log")
     File.touch!(active_file_path)
 
     suffix = :rand.uniform(9_999_999)
@@ -477,7 +478,7 @@ defmodule Ferricstore.Raft.WritePathTest do
     state =
       Ferricstore.Raft.StateMachine.init(%{
         shard_index: 0,
-        shard_data_path: dir,
+        shard_data_path: shard_path,
         data_dir: dir,
         active_file_id: 0,
         active_file_path: active_file_path,
