@@ -214,15 +214,16 @@ defmodule Ferricstore.Merge.Scheduler do
     config = build_config(merge_config)
     shard_data_dir = Ferricstore.DataDir.shard_data_path(data_dir, index)
 
+    # Recover from any interrupted merge on startup.
+    Manifest.recover_if_needed(shard_data_dir, index)
+
     state = %__MODULE__{
       shard_index: index,
       config: config,
       data_dir: shard_data_dir,
-      semaphore: semaphore
+      semaphore: semaphore,
+      file_count: count_existing_log_files(shard_data_dir)
     }
-
-    # Recover from any interrupted merge on startup.
-    Manifest.recover_if_needed(shard_data_dir, index)
 
     {:ok, state}
   end
@@ -577,6 +578,22 @@ defmodule Ferricstore.Merge.Scheduler do
       config when is_list(config) -> Keyword.get(config, key, default)
       config when is_map(config) -> Map.get(config, key, default)
       _ -> default
+    end
+  end
+
+  defp count_existing_log_files(shard_data_dir) do
+    case File.ls(shard_data_dir) do
+      {:ok, entries} -> Enum.count(entries, &bitcask_log_file?/1)
+      {:error, _reason} -> 0
+    end
+  end
+
+  defp bitcask_log_file?(name) do
+    with true <- String.ends_with?(name, ".log"),
+         {_, ""} <- name |> Path.rootname() |> Integer.parse() do
+      true
+    else
+      _ -> false
     end
   end
 

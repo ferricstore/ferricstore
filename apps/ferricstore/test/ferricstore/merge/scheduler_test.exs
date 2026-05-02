@@ -46,6 +46,31 @@ defmodule Ferricstore.Merge.SchedulerTest do
       assert is_integer(status.file_count)
       assert is_map(status.config)
     end
+
+    test "dedicated scheduler initializes file count from existing shard log files" do
+      data_dir = Path.join(System.tmp_dir!(), "scheduler_restart_#{System.unique_integer([:positive])}")
+      shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+      File.mkdir_p!(shard_dir)
+
+      File.write!(Path.join(shard_dir, "00000.log"), "old")
+      File.write!(Path.join(shard_dir, "00001.log"), "active")
+      File.write!(Path.join(shard_dir, "README.txt"), "ignored")
+
+      {:ok, pid} =
+        Scheduler.start_link(
+          shard_index: 0,
+          data_dir: data_dir,
+          merge_config: %{mode: :hot, min_files_for_merge: 100},
+          name: :test_scheduler_restart_file_count
+        )
+
+      try do
+        assert GenServer.call(pid, :status).file_count == 2
+      after
+        GenServer.stop(pid)
+        File.rm_rf!(data_dir)
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
