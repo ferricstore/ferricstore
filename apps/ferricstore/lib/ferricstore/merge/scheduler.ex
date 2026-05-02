@@ -412,8 +412,8 @@ defmodule Ferricstore.Merge.Scheduler do
     end
   end
 
-  defp select_files_for_merge(state, shard_name) do
-    with {:ok, file_sizes} <- safe_call(shard_name, :file_sizes),
+  defp select_files_for_merge(state, _shard_name) do
+    with {:ok, file_sizes} <- log_file_sizes(state.data_dir),
          {:ok, mergeable} <- pick_mergeable_files(file_sizes, state.config, state.fragmentation_candidates) do
       {:ok, mergeable}
     else
@@ -479,7 +479,7 @@ defmodule Ferricstore.Merge.Scheduler do
 
   defp check_disk_space(state, shard_name, file_ids) do
     with {:ok, available} <- safe_call(shard_name, :available_disk_space),
-         {:ok, file_sizes} <- safe_call(shard_name, :file_sizes) do
+         {:ok, file_sizes} <- log_file_sizes(state.data_dir) do
       # Sum the size of files being merged — worst case, the new merged file
       # is as large as all input files combined.
       input_bytes =
@@ -594,6 +594,30 @@ defmodule Ferricstore.Merge.Scheduler do
     case File.ls(shard_data_dir) do
       {:ok, entries} -> Enum.count(entries, &bitcask_log_file?/1)
       {:error, _reason} -> 0
+    end
+  end
+
+  defp log_file_sizes(shard_data_dir) do
+    sizes =
+      case File.ls(shard_data_dir) do
+        {:ok, entries} ->
+          entries
+          |> Enum.filter(&bitcask_log_file?/1)
+          |> Enum.flat_map(&log_file_size(shard_data_dir, &1))
+
+        {:error, _reason} ->
+          []
+      end
+
+    {:ok, sizes}
+  end
+
+  defp log_file_size(shard_data_dir, name) do
+    with {file_id, ""} <- name |> Path.rootname() |> Integer.parse(),
+         {:ok, %{size: size}} <- File.stat(Path.join(shard_data_dir, name)) do
+      [{file_id, size}]
+    else
+      _ -> []
     end
   end
 
