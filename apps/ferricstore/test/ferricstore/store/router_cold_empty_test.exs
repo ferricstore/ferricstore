@@ -182,6 +182,60 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
                     %{path: ^missing_path, reason: :missing_file}}
   end
 
+  test "direct cold reads retry when ETS changes after a cold read miss", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_direct_compacted:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    value = "compacted-direct-value"
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    current_path = Path.join(shard_path, "00001.log")
+    missing_path = Path.join(shard_path, "00009.log")
+
+    {:ok, {current_offset, _current_record_size}} =
+      NIF.v2_append_record(current_path, key, value, 0)
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 9, 0, byte_size(value)})
+
+    attach_pread_corrupt_handler(fn ->
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 1, current_offset, byte_size(value)})
+    end)
+
+    assert ^value = Router.get(ctx, key)
+
+    assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                    %{path: ^missing_path, reason: :missing_file}}
+  end
+
+  test "direct cold meta reads retry when ETS changes after a cold read miss", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_meta_compacted:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    value = "compacted-meta-value"
+    expire_at_ms = System.system_time(:millisecond) + 60_000
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    current_path = Path.join(shard_path, "00001.log")
+    missing_path = Path.join(shard_path, "00009.log")
+
+    {:ok, {current_offset, _current_record_size}} =
+      NIF.v2_append_record(current_path, key, value, expire_at_ms)
+
+    :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), 9, 0, byte_size(value)})
+
+    attach_pread_corrupt_handler(fn ->
+      :ets.insert(
+        keydir,
+        {key, nil, expire_at_ms, LFU.initial(), 1, current_offset, byte_size(value)}
+      )
+    end)
+
+    assert {^value, ^expire_at_ms} = Router.get_meta(ctx, key)
+
+    assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                    %{path: ^missing_path, reason: :missing_file}}
+  end
+
   test "batch cold reads emit telemetry when a cold record cannot be decoded", %{
     ctx: ctx,
     keydir: keydir
@@ -398,7 +452,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     assert [] == :ets.lookup(keydir, key)
   end
 
-  defp attach_pread_corrupt_handler do
+  defp attach_pread_corrupt_handler(callback \\ fn -> :ok end) do
     parent = self()
     handler_id = {__MODULE__, make_ref()}
 
@@ -407,6 +461,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
         handler_id,
         [:ferricstore, :bitcask, :pread_corrupt],
         fn event, measurements, metadata, _config ->
+          callback.()
           send(parent, {:pread_corrupt, event, measurements, metadata})
         end,
         nil

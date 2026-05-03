@@ -866,10 +866,7 @@ defmodule Ferricstore.Store.Router do
 
       [{^key, nil, exp, _, file_id, offset, value_size}]
       when (exp == 0 or exp > now) and valid_cold_location(file_id, offset, value_size) ->
-        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
-
-        path =
-          Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+        path = cold_file_path(ctx, idx, file_id)
 
         case read_cold_async(path, offset, key) do
           {:ok, value} when is_binary(value) ->
@@ -1793,10 +1790,7 @@ defmodule Ferricstore.Store.Router do
         # Read directly from Bitcask via NIF, bypassing the Shard GenServer.
         # The ETS entry has valid file_id/offset from when the write committed,
         # so pread works without flushing pending async writes.
-        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
-
-        path =
-          Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+        path = cold_file_path(ctx, idx, file_id)
 
         case read_cold_async(path, offset, key) do
           {:ok, value} when is_binary(value) ->
@@ -1806,7 +1800,25 @@ defmodule Ferricstore.Store.Router do
             value
 
           _ ->
-            nil
+            case retry_changed_cold_value(
+                   ctx,
+                   idx,
+                   keydir,
+                   key,
+                   {file_id, offset, value_size},
+                   now
+                 ) do
+              {:cold, value, retry_file_id, retry_offset} ->
+                Stats.record_cold_read(ctx, key)
+                warm_ets_after_cold_read(ctx, keydir, key, value, retry_file_id, retry_offset)
+                value
+
+              {:hot, value} ->
+                value
+
+              :miss ->
+                nil
+            end
         end
 
       {:cold, _file_id, _offset, _value_size} ->
@@ -1997,6 +2009,48 @@ defmodule Ferricstore.Store.Router do
     Ferricstore.Store.ColdRead.pread_at(path, offset, expected_key, @cold_batch_read_timeout_ms)
   end
 
+  defp retry_changed_cold_value(ctx, idx, keydir, key, original_location, now) do
+    case ets_get_full(ctx, idx, keydir, key, now) do
+      {:hit, value, lfu} ->
+        sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
+        {:hot, value}
+
+      {:cold, file_id, offset, value_size}
+      when valid_cold_location(file_id, offset, value_size) and
+             {file_id, offset, value_size} != original_location ->
+        path = cold_file_path(ctx, idx, file_id)
+
+        case read_cold_async(path, offset, key) do
+          {:ok, value} when is_binary(value) -> {:cold, value, file_id, offset}
+          _ -> :miss
+        end
+
+      _ ->
+        :miss
+    end
+  end
+
+  defp retry_changed_cold_meta(ctx, idx, keydir, key, original_location, now) do
+    case ets_get_meta_full(ctx, idx, keydir, key, now) do
+      {:hit, value, expire_at_ms, lfu} ->
+        sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
+        {:hot, value, expire_at_ms}
+
+      {:cold, file_id, offset, value_size, expire_at_ms}
+      when valid_cold_location(file_id, offset, value_size) and
+             {file_id, offset, value_size} != original_location ->
+        path = cold_file_path(ctx, idx, file_id)
+
+        case read_cold_async(path, offset, key) do
+          {:ok, value} when is_binary(value) -> {:cold, value, expire_at_ms, file_id, offset}
+          _ -> :miss
+        end
+
+      _ ->
+        :miss
+    end
+  end
+
   @doc """
   Returns `{value, expire_at_ms}` for a live key, or `nil` if the key does
   not exist or is expired.
@@ -2018,10 +2072,7 @@ defmodule Ferricstore.Store.Router do
       {:cold, file_id, offset, value_size, expire_at_ms}
       when valid_cold_location(file_id, offset, value_size) ->
         # Cold key — read value from disk directly, return with expire_at_ms.
-        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
-
-        path =
-          Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+        path = cold_file_path(ctx, idx, file_id)
 
         case read_cold_async(path, offset, key) do
           {:ok, value} when is_binary(value) ->
@@ -2030,7 +2081,25 @@ defmodule Ferricstore.Store.Router do
             {value, expire_at_ms}
 
           _ ->
-            nil
+            case retry_changed_cold_meta(
+                   ctx,
+                   idx,
+                   keydir,
+                   key,
+                   {file_id, offset, value_size},
+                   now
+                 ) do
+              {:cold, value, retry_expire_at_ms, retry_file_id, retry_offset} ->
+                Stats.record_cold_read(ctx, key)
+                warm_ets_after_cold_read(ctx, keydir, key, value, retry_file_id, retry_offset)
+                {value, retry_expire_at_ms}
+
+              {:hot, value, retry_expire_at_ms} ->
+                {value, retry_expire_at_ms}
+
+              :miss ->
+                nil
+            end
         end
 
       {:cold, _file_id, _offset, _value_size, _expire_at_ms} ->
