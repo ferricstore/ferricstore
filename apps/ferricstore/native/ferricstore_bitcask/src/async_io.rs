@@ -22,15 +22,21 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
 static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
-const MAX_BLOCKING_THREADS: usize = 16;
+const DEFAULT_MAX_BLOCKING_THREADS: usize = 16;
+const MIN_BLOCKING_THREADS: usize = 1;
+const MAX_BLOCKING_THREADS: usize = 256;
+const BLOCKING_THREADS_ENV: &str = "FERRICSTORE_TOKIO_BLOCKING_THREADS";
 
 /// Returns a reference to the global Tokio runtime, creating it on first call.
 ///
 /// H-8 fix: limits worker threads to `min(4, num_cpus)` and blocking IO
-/// threads to `MAX_BLOCKING_THREADS` instead of Tokio's high default. The
+/// threads to a measured/configurable cap instead of Tokio's high default. The
 /// runtime is only used for disk IO operations (pread, fsync), which are
 /// limited by NVMe parallelism; under bursts, extra work should queue instead
 /// of creating hundreds of competing OS threads beside BEAM schedulers.
+///
+/// `FERRICSTORE_TOKIO_BLOCKING_THREADS` is intentionally read once at runtime
+/// creation. Benchmark 16/32/64 by starting a fresh BEAM for each value.
 ///
 /// # Panics
 ///
@@ -41,9 +47,10 @@ pub fn runtime() -> &'static Runtime {
     TOKIO_RT.get_or_init(|| {
         let num_cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         let workers = num_cpus.clamp(1, 4);
+        let blocking_threads = blocking_thread_cap();
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
-            .max_blocking_threads(MAX_BLOCKING_THREADS)
+            .max_blocking_threads(blocking_threads)
             .thread_name("ferric-tokio")
             .enable_all()
             .build()
@@ -51,9 +58,29 @@ pub fn runtime() -> &'static Runtime {
     })
 }
 
+fn blocking_thread_cap() -> usize {
+    blocking_thread_cap_from_env_value(std::env::var(BLOCKING_THREADS_ENV).ok().as_deref())
+}
+
+fn blocking_thread_cap_from_env_value(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_BLOCKING_THREADS)
+        .clamp(MIN_BLOCKING_THREADS, MAX_BLOCKING_THREADS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_blocking_thread_cap_from_env_value() {
+        assert_eq!(blocking_thread_cap_from_env_value(None), 16);
+        assert_eq!(blocking_thread_cap_from_env_value(Some("")), 16);
+        assert_eq!(blocking_thread_cap_from_env_value(Some("bad")), 16);
+        assert_eq!(blocking_thread_cap_from_env_value(Some("32")), 32);
+        assert_eq!(blocking_thread_cap_from_env_value(Some("0")), 1);
+        assert_eq!(blocking_thread_cap_from_env_value(Some("9999")), 256);
+    }
 
     #[test]
     fn runtime_creates_successfully() {
@@ -305,8 +332,9 @@ mod tests {
             rt.block_on(handle).unwrap();
         }
 
+        let expected_cap = blocking_thread_cap();
         assert!(
-            max_seen.load(Ordering::SeqCst) <= MAX_BLOCKING_THREADS,
+            max_seen.load(Ordering::SeqCst) <= expected_cap,
             "spawn_blocking pool must be capped; saw {} concurrent blocking jobs",
             max_seen.load(Ordering::SeqCst)
         );
