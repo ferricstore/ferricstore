@@ -39,6 +39,37 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
 
   defp ctx, do: Process.get(:test_ctx)
 
+  def overload_later_shard_on_first_async_flush(
+        _event,
+        _measurements,
+        %{shard_index: first_idx, origin: true},
+        {test_pid, first_idx, second_idx, second_key}
+      ) do
+    for _ <- 1..64 do
+      Batcher.__inject_async_pending__(
+        second_idx,
+        make_ref(),
+        [{:async, node(), {:put, second_key, "pending", 0}}],
+        0
+      )
+    end
+
+    send(test_pid, :later_shard_overloaded)
+  end
+
+  def overload_later_shard_on_first_async_flush(_event, _measurements, _metadata, _config),
+    do: :ok
+
+  defp key_for_shard(prefix, shard_idx) do
+    Enum.find_value(1..100_000, fn i ->
+      key = "#{prefix}:#{shard_idx}:#{i}"
+
+      if Router.shard_for(ctx(), key) == shard_idx do
+        key
+      end
+    end)
+  end
+
   # ---------------------------------------------------------------------------
   # Pipeline / Batcher routing
   # ---------------------------------------------------------------------------
@@ -165,6 +196,62 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
                Router.batch_async_put(ctx(), [{key, "value"}])
 
       assert Router.get(ctx(), key) == nil
+    end
+
+    test "cross-shard batch async PUT reports partial unknown after some shard submits were accepted" do
+      prefix = "#{@ns}:partial_batch_#{:erlang.unique_integer([:positive])}"
+      kv_pairs = [{key_for_shard(prefix, 0), "v0"}, {key_for_shard(prefix, 1), "v1"}]
+
+      ordered_shards =
+        kv_pairs
+        |> Enum.group_by(fn {key, _value} -> Router.shard_for(ctx(), key) end)
+        |> Enum.map(fn {idx, _pairs} -> idx end)
+
+      [first_idx, second_idx] = ordered_shards
+
+      {first_key, _} =
+        Enum.find(kv_pairs, fn {key, _value} -> Router.shard_for(ctx(), key) == first_idx end)
+
+      {second_key, _} =
+        Enum.find(kv_pairs, fn {key, _value} -> Router.shard_for(ctx(), key) == second_idx end)
+
+      test_pid = self()
+      handler_id = {:cross_shard_batch_visibility, test_pid, make_ref()}
+
+      on_exit(fn ->
+        Batcher.reset_pending(first_idx)
+        Batcher.reset_pending(second_idx)
+      end)
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :batcher, :async_flush],
+          &__MODULE__.overload_later_shard_on_first_async_flush/4,
+          {test_pid, first_idx, second_idx, second_key}
+        )
+
+      try do
+        default_ctx = ctx()
+        task = Task.async(fn -> Router.batch_async_put(default_ctx, kv_pairs) end)
+
+        assert_receive :later_shard_overloaded, 5_000
+
+        assert {:error, message} = Task.await(task, 5_000)
+        assert message =~ "partial"
+        assert message =~ "unknown"
+
+        ShardHelpers.eventually(
+          fn -> Router.get(ctx(), first_key) == "v#{first_idx}" end,
+          "accepted shard key did not become visible",
+          20,
+          10
+        )
+
+        assert Router.get(ctx(), second_key) == nil
+      after
+        :telemetry.detach(handler_id)
+      end
     end
   end
 

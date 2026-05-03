@@ -2134,17 +2134,26 @@ defmodule Ferricstore.Store.Router do
           end
         end)
 
-      Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, raft_cmds, _large_disk_batch} ->
-        shard_locations = Map.get(disk_locations, idx, %{})
-
+      Enum.reduce(shard_batches, 0, fn {idx, _keydir, _shard_kvs, _entries, raft_cmds,
+                                        _large_disk_batch},
+                                       accepted_count ->
         case async_submit_batch_to_raft(idx, raft_cmds) do
           :ok ->
-            :ok
+            accepted_count + 1
 
           {:error, reason} ->
             rollback_batch_large_puts(ctx, large_previous)
-            throw({:async_error, reason})
+
+            if accepted_count > 0 do
+              throw({:partial_async_error, reason})
+            else
+              throw({:async_error, reason})
+            end
         end
+      end)
+
+      Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, _raft_cmds, _large_disk_batch} ->
+        shard_locations = Map.get(disk_locations, idx, %{})
 
         ets_tuples =
           Enum.map(entries, fn {key, value, value_for_ets} ->
@@ -2175,6 +2184,9 @@ defmodule Ferricstore.Store.Router do
 
     :throw, {:async_error, reason} ->
       {:error, reason}
+
+    :throw, {:partial_async_error, reason} ->
+      {:error, "ERR async replication partial outcome unknown: #{reason}"}
   end
 
   defp batch_local_put(ctx, kv_pairs) do
