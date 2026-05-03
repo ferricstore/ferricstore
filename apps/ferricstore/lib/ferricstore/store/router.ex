@@ -43,6 +43,14 @@ defmodule Ferricstore.Store.Router do
   @spec resolve_shard(FerricStore.Instance.t(), non_neg_integer()) :: atom()
   @doc false
   def resolve_shard(ctx, idx), do: elem(ctx.shard_names, idx)
+
+  defp safe_read_call(ctx, idx, request) do
+    {:ok, GenServer.call(resolve_shard(ctx, idx), request)}
+  catch
+    :exit, {:noproc, _} -> :unavailable
+    :exit, {:timeout, _} -> :unavailable
+  end
+
   @spec resolve_keydir(FerricStore.Instance.t(), non_neg_integer()) :: atom() | reference()
   @doc false
   def resolve_keydir(ctx, idx), do: elem(ctx.keydir_refs, idx)
@@ -1509,7 +1517,10 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, _file_id, _offset, _value_size} ->
         # Invalid file ref — fall back to GenServer.
-        GenServer.call(resolve_shard(ctx, idx), {:get_file_ref, key})
+        case safe_read_call(ctx, idx, {:get_file_ref, key}) do
+          {:ok, result} -> result
+          :unavailable -> nil
+        end
 
       :expired ->
         Stats.incr_keyspace_misses(ctx)
@@ -1567,7 +1578,11 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, _file_id, _offset, _value_size} ->
         # Cold entry but no valid file ref — ask GenServer
-        result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
+        result =
+          case safe_read_call(ctx, idx, {:get, key}) do
+            {:ok, value} -> value
+            :unavailable -> nil
+          end
 
         if result != nil do
           Stats.record_cold_read(ctx, key)
@@ -1588,7 +1603,11 @@ defmodule Ferricstore.Store.Router do
 
       :no_table ->
         # ETS table unavailable (shard restarting). Fall back to GenServer.
-        result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
+        result =
+          case safe_read_call(ctx, idx, {:get, key}) do
+            {:ok, value} -> value
+            :unavailable -> nil
+          end
 
         if result != nil do
           Stats.record_cold_read(ctx, key)
@@ -1718,7 +1737,11 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, _file_id, _offset, _value_size} ->
         # Cold entry but invalid file ref — ask GenServer.
-        result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
+        result =
+          case safe_read_call(ctx, idx, {:get, key}) do
+            {:ok, value} -> value
+            :unavailable -> nil
+          end
 
         if result != nil do
           Stats.record_cold_read(ctx, key)
@@ -1739,7 +1762,11 @@ defmodule Ferricstore.Store.Router do
 
       :no_table ->
         # ETS table unavailable (shard restarting). Fall back to GenServer.
-        result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
+        result =
+          case safe_read_call(ctx, idx, {:get, key}) do
+            {:ok, value} -> value
+            :unavailable -> nil
+          end
 
         if result != nil do
           Stats.record_cold_read(ctx, key)
@@ -1779,7 +1806,11 @@ defmodule Ferricstore.Store.Router do
             {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
 
           {:cold, _file_id, _offset, _value_size} ->
-            result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
+            result =
+              case safe_read_call(ctx, idx, {:get, key}) do
+                {:ok, value} -> value
+                :unavailable -> nil
+              end
 
             if result != nil do
               Stats.record_cold_read(ctx, key)
@@ -1798,7 +1829,11 @@ defmodule Ferricstore.Store.Router do
             {{:value, nil}, {cold_entries, cold_count}}
 
           :no_table ->
-            result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
+            result =
+              case safe_read_call(ctx, idx, {:get, key}) do
+                {:ok, value} -> value
+                :unavailable -> nil
+              end
 
             if result != nil do
               Stats.record_cold_read(ctx, key)
@@ -1920,7 +1955,11 @@ defmodule Ferricstore.Store.Router do
       {:cold, _file_id, _offset, _value_size, _expire_at_ms} ->
         # Invalid file ref — ask GenServer.
         Stats.record_cold_read(ctx, key)
-        GenServer.call(resolve_shard(ctx, idx), {:get_meta, key})
+
+        case safe_read_call(ctx, idx, {:get_meta, key}) do
+          {:ok, result} -> result
+          :unavailable -> nil
+        end
 
       :expired ->
         Stats.incr_keyspace_misses(ctx)
@@ -1932,7 +1971,11 @@ defmodule Ferricstore.Store.Router do
 
       :no_table ->
         Stats.record_cold_read(ctx, key)
-        GenServer.call(resolve_shard(ctx, idx), {:get_meta, key})
+
+        case safe_read_call(ctx, idx, {:get_meta, key}) do
+          {:ok, result} -> result
+          :unavailable -> nil
+        end
     end
   end
 
