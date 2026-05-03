@@ -71,7 +71,7 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.CommandTime
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{BitcaskWriter, LFU, ListOps, Promotion, Router, ValueCodec}
+  alias Ferricstore.Store.{BitcaskWriter, ColdRead, LFU, ListOps, Promotion, Router, ValueCodec}
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
   @default_release_cursor_interval 20_000
@@ -1851,22 +1851,44 @@ defmodule Ferricstore.Raft.StateMachine do
     locations = Enum.map(entries, fn {_field, key, path, off} -> {path, off, key} end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms) do
-        {:ok, values} when is_list(values) ->
-          if length(values) == length(entries) do
-            values
-          else
-            List.duplicate(nil, length(entries))
-          end
+      locations
+      |> Ferricstore.Store.ColdRead.pread_batch_keyed(@cold_read_timeout_ms)
+      |> normalize_state_machine_batch_values(length(entries))
 
-        {:error, _reason} ->
-          List.duplicate(nil, length(entries))
-      end
+    emit_state_machine_batch_cold_errors(entries, values, fn {_field, _key, path, _off} ->
+      path
+    end)
 
     Enum.zip(entries, values)
     |> Enum.map(fn
       {{field, _key, _path, _off}, value} when is_binary(value) -> {field, value}
       {_entry, _value} -> nil
+    end)
+  end
+
+  defp normalize_state_machine_batch_values({:ok, values}, count)
+       when is_list(values) and length(values) == count,
+       do: values
+
+  defp normalize_state_machine_batch_values({:ok, _bad_values}, count),
+    do: List.duplicate({:error, :batch_result_length_mismatch}, count)
+
+  defp normalize_state_machine_batch_values({:error, reason}, count),
+    do: List.duplicate({:error, reason}, count)
+
+  defp emit_state_machine_batch_cold_errors(entries, values, path_fun) do
+    entries
+    |> Enum.zip(values)
+    |> Enum.reduce(%{}, fn
+      {entry, {:error, raw_reason}}, acc ->
+        path = path_fun.(entry)
+        Map.update(acc, {path, raw_reason}, 1, &(&1 + 1))
+
+      {_entry, _value}, acc ->
+        acc
+    end)
+    |> Enum.each(fn {{path, raw_reason}, count} ->
+      ColdRead.emit_pread_error(path, raw_reason, count)
     end)
   end
 
@@ -2001,13 +2023,13 @@ defmodule Ferricstore.Raft.StateMachine do
     locations = Enum.map(cold_reads, fn {_index, key, path, off, _exp} -> {path, off, key} end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms) do
-        {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
-          values
+      locations
+      |> Ferricstore.Store.ColdRead.pread_batch_keyed(@cold_read_timeout_ms)
+      |> normalize_state_machine_batch_values(length(cold_reads))
 
-        _ ->
-          List.duplicate(nil, length(cold_reads))
-      end
+    emit_state_machine_batch_cold_errors(cold_reads, values, fn {_index, _key, path, _off, _exp} ->
+      path
+    end)
 
     cold_reads
     |> Enum.zip(values)
@@ -4313,13 +4335,13 @@ defmodule Ferricstore.Raft.StateMachine do
       end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms) do
-        {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
-          values
+      locations
+      |> Ferricstore.Store.ColdRead.pread_batch_keyed(@cold_read_timeout_ms)
+      |> normalize_state_machine_batch_values(length(cold_reads))
 
-        _ ->
-          List.duplicate(nil, length(cold_reads))
-      end
+    emit_state_machine_batch_cold_errors(cold_reads, values, fn {_index, _key, _exp, fid, _off} ->
+      path_fun.(state, fid)
+    end)
 
     cold_reads
     |> Enum.zip(values)
@@ -4454,13 +4476,13 @@ defmodule Ferricstore.Raft.StateMachine do
       end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms) do
-        {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
-          values
+      locations
+      |> Ferricstore.Store.ColdRead.pread_batch_keyed(@cold_read_timeout_ms)
+      |> normalize_state_machine_batch_values(length(cold_reads))
 
-        _ ->
-          List.duplicate(nil, length(cold_reads))
-      end
+    emit_state_machine_batch_cold_errors(cold_reads, values, fn {_index, _key, _exp, fid, _off} ->
+      path_fun.(state, fid)
+    end)
 
     cold_reads
     |> Enum.zip(values)
