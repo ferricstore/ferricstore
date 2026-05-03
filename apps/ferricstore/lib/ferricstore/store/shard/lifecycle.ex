@@ -479,8 +479,14 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     # Step 2: write v2 hint file for the active file so the next startup
     # can rebuild the keydir from hints instead of replaying the full log.
     hint_result = ShardFlush.write_hint_for_file(state, state.active_file_id)
+
+    hint_dir_fsync_result =
+      if hint_result == :ok do
+        NIF.v2_fsync_dir(state.shard_data_path)
+      end
+
     fsync_result = NIF.v2_fsync(state.active_file_path)
-    shutdown_errors = shutdown_errors(hint_result, fsync_result)
+    shutdown_errors = shutdown_errors(hint_result, hint_dir_fsync_result, fsync_result)
     shutdown_status = if shutdown_errors == [], do: :ok, else: :warning
 
     t_hint = System.monotonic_time(:microsecond)
@@ -501,9 +507,10 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     :ok
   end
 
-  defp shutdown_errors(hint_result, fsync_result) do
+  defp shutdown_errors(hint_result, hint_dir_fsync_result, fsync_result) do
     []
     |> maybe_shutdown_error(:hint_write, hint_result)
+    |> maybe_shutdown_error(:hint_dir_fsync, hint_dir_fsync_result)
     |> maybe_shutdown_error(:active_fsync, fsync_result)
     |> Enum.reverse()
   end
