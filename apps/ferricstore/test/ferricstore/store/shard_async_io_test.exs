@@ -1588,6 +1588,62 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
         Process.flag(:trap_exit, previous_trap_exit)
       end
     end
+
+    test "drops obsolete tombstones from mixed live files during compaction" do
+      previous_trap_exit = Process.flag(:trap_exit, true)
+      dir = Path.join(System.tmp_dir!(), "mixed_tombstone_drop_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+
+      name = :"mixed_tombstone_drop_#{:erlang.unique_integer([:positive])}"
+
+      ctx =
+        FerricStore.Instance.build(name,
+          data_dir: dir,
+          shard_count: 1
+        )
+
+      try do
+        :ok = Ferricstore.DataDir.ensure_layout!(dir, 1)
+        shard_dir = Ferricstore.DataDir.shard_data_path(dir, 0)
+
+        log0 = Path.join(shard_dir, "00000.log")
+        log1 = Path.join(shard_dir, "00001.log")
+        log2 = Path.join(shard_dir, "00002.log")
+
+        {:ok, [_]} = NIF.v2_append_batch(log0, [{"unrelated", "old", 0}])
+        {:ok, _} = NIF.v2_append_tombstone(log1, "obsolete-delete")
+        {:ok, [_]} = NIF.v2_append_batch(log1, [{"live", "kept", 0}])
+        File.touch!(log2)
+
+        assert {:ok, [_]} = NIF.v2_scan_tombstones(log1)
+
+        {:ok, pid1} =
+          Shard.start_link(
+            index: 0,
+            data_dir: dir,
+            flush_interval_ms: 5000,
+            instance_ctx: ctx
+          )
+
+        assert "kept" == GenServer.call(pid1, {:get, "live"})
+
+        assert {:ok, {1, 0, _reclaimed}} = GenServer.call(pid1, {:run_compaction, [1]})
+
+        assert {:ok, []} = NIF.v2_scan_tombstones(log1)
+        assert "kept" == GenServer.call(pid1, {:get, "live"})
+      after
+        case Process.whereis(Router.shard_name(ctx, 0)) do
+          pid when is_pid(pid) ->
+            cleanup_shard(pid, ctx, dir)
+
+          _ ->
+            FerricStore.Instance.cleanup(ctx.name)
+            File.rm_rf(dir)
+        end
+
+        Process.flag(:trap_exit, previous_trap_exit)
+      end
+    end
   end
 
   describe "file size accounting" do

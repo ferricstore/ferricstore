@@ -699,7 +699,7 @@ defmodule Ferricstore.Store.Shard do
 
             dest = Path.join(sp, "compact_#{fid}.log")
 
-            tombstone_offsets = tombstone_offsets(source)
+            tombstone_offsets = needed_tombstone_offsets(sp, fid, source)
 
             copy_result =
               if tombstone_offsets == [] do
@@ -1051,6 +1051,26 @@ defmodule Ferricstore.Store.Shard do
 
       _ ->
         []
+    end
+  end
+
+  defp needed_tombstone_offsets(shard_path, fid, path) do
+    with {:ok, tombstones} <- NIF.v2_scan_tombstones(path),
+         false <- tombstones == [],
+         tombstone_by_key =
+           Map.new(tombstones, fn {key, offset, _record_size, _expire_at_ms} -> {key, offset} end),
+         masked_keys = Map.keys(tombstone_by_key) |> MapSet.new(),
+         {:ok, files} <- Ferricstore.FS.ls(shard_path),
+         {:ok, states} <- scan_lower_tombstone_key_states(shard_path, files, fid, masked_keys) do
+      tombstone_by_key
+      |> Enum.filter(fn {key, _offset} -> Map.get(states, key) == :live end)
+      |> Enum.map(fn {_key, offset} -> offset end)
+    else
+      true ->
+        []
+
+      _ ->
+        tombstone_offsets(path)
     end
   end
 
