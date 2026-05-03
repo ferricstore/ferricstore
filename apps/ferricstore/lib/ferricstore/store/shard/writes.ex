@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.Writes do
   @moduledoc "Shard write-path handlers: put, delete, incr, append, getset, getdel, getex, and setrange with async flush and Raft support."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
@@ -14,7 +15,8 @@ defmodule Ferricstore.Store.Shard.Writes do
   # WRITE-PATH handlers (return {:reply, result, state} or {:noreply, state})
   # -------------------------------------------------------------------
 
-  @spec handle_put(binary(), term(), non_neg_integer(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
+  @spec handle_put(binary(), term(), non_neg_integer(), GenServer.from(), map()) ::
+          {:reply, term(), map()} | {:noreply, map()}
   @doc false
   def handle_put(key, value, expire_at_ms, from, state) do
     # Reject new-key writes when the keydir is at capacity (spec 2.4).
@@ -53,7 +55,16 @@ defmodule Ferricstore.Store.Shard.Writes do
         new_state = %{state | write_version: new_version}
 
         if state.flush_in_flight == nil do
-          {:reply, :ok, ShardFlush.flush_pending(new_state)}
+          flushed_state = ShardFlush.flush_pending(new_state)
+
+          case Map.get(flushed_state, :last_flush_error) do
+            nil ->
+              {:reply, :ok, flushed_state}
+
+            reason ->
+              rolled_back = rollback_failed_direct_put(flushed_state, key, existing)
+              {:reply, {:error, reason}, rolled_back}
+          end
         else
           {:reply, :ok, new_state}
         end
@@ -61,7 +72,44 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
-  @spec handle_delete(binary(), GenServer.from(), map()) :: {:reply, :ok, map()} | {:noreply, map()}
+  defp rollback_failed_direct_put(state, key, existing) do
+    ShardETS.ets_delete_key(state, key)
+
+    case existing do
+      [{^key, old_value, old_exp, _old_lfu, old_fid, old_off, old_vsize}]
+      when is_integer(old_fid) and old_fid >= 0 and is_integer(old_off) and old_off >= 0 and
+             is_integer(old_vsize) and old_vsize >= 0 ->
+        ShardETS.ets_insert_with_location(
+          state,
+          key,
+          old_value,
+          old_exp,
+          old_fid,
+          old_off,
+          old_vsize
+        )
+
+      [{^key, old_value, old_exp, _old_lfu, :pending, old_fid, old_vsize}] ->
+        :ets.insert(
+          state.keydir,
+          {key, old_value, old_exp, LFU.initial(), :pending, old_fid, old_vsize}
+        )
+
+      _ ->
+        :ok
+    end
+
+    new_pending =
+      Enum.reject(state.pending, fn {pending_key, _value, _exp} -> pending_key == key end)
+
+    state
+    |> Map.put(:pending, new_pending)
+    |> Map.put(:pending_count, length(new_pending))
+    |> Map.delete(:last_flush_error)
+  end
+
+  @spec handle_delete(binary(), GenServer.from(), map()) ::
+          {:reply, :ok, map()} | {:noreply, map()}
   @doc false
   def handle_delete(key, from, state) do
     if state.raft? do
@@ -76,24 +124,30 @@ defmodule Ferricstore.Store.Shard.Writes do
       case NIF.v2_append_tombstone(state.active_file_path, key) do
         {:ok, _} ->
           ShardETS.ets_delete_key(state, key)
+
           new_pending =
             case state.pending do
               [] -> []
               pending -> Enum.reject(pending, fn {k, _, _} -> k == key end)
             end
+
           new_version = state.write_version + 1
           {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
 
         {:error, reason} ->
           # Do NOT delete from ETS if the tombstone write failed —
           # the key would resurrect on restart (no tombstone on disk).
-          Logger.error("Shard #{state.index}: tombstone write failed for DELETE: #{inspect(reason)}")
+          Logger.error(
+            "Shard #{state.index}: tombstone write failed for DELETE: #{inspect(reason)}"
+          )
+
           {:reply, {:error, "ERR disk write failed: #{inspect(reason)}"}, state}
       end
     end
   end
 
-  @spec handle_incr(binary(), integer(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
+  @spec handle_incr(binary(), integer(), GenServer.from(), map()) ::
+          {:reply, term(), map()} | {:noreply, map()}
   @doc false
   def handle_incr(key, delta, from, state) do
     if state.raft? do
@@ -193,7 +247,8 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
-  @spec handle_incr_float(binary(), float(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
+  @spec handle_incr_float(binary(), float(), GenServer.from(), map()) ::
+          {:reply, term(), map()} | {:noreply, map()}
   @doc false
   def handle_incr_float(key, delta, from, state) do
     if state.raft? do
@@ -288,7 +343,8 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
-  @spec handle_append(binary(), binary(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
+  @spec handle_append(binary(), binary(), GenServer.from(), map()) ::
+          {:reply, term(), map()} | {:noreply, map()}
   @doc false
   def handle_append(key, suffix, from, state) do
     if state.raft? do
@@ -354,7 +410,8 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
-  @spec handle_getset(binary(), binary(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
+  @spec handle_getset(binary(), binary(), GenServer.from(), map()) ::
+          {:reply, term(), map()} | {:noreply, map()}
   @doc false
   def handle_getset(key, new_value, from, state) do
     if state.raft? do
@@ -372,8 +429,12 @@ defmodule Ferricstore.Store.Shard.Writes do
   defp handle_getset_direct(key, new_value, state) do
     {old, state} =
       case ShardETS.ets_lookup_warm(state, key) do
-        {:hit, value, _expire_at_ms} -> {value, state}
-        :expired -> {nil, state}
+        {:hit, value, _expire_at_ms} ->
+          {value, state}
+
+        :expired ->
+          {nil, state}
+
         :miss ->
           state = ShardFlush.await_in_flight(state)
           state = ShardFlush.flush_pending_sync(state)
@@ -392,7 +453,8 @@ defmodule Ferricstore.Store.Shard.Writes do
     {:reply, old, new_state}
   end
 
-  @spec handle_getdel(binary(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
+  @spec handle_getdel(binary(), GenServer.from(), map()) ::
+          {:reply, term(), map()} | {:noreply, map()}
   @doc false
   def handle_getdel(key, from, state) do
     if state.raft? do
@@ -410,8 +472,12 @@ defmodule Ferricstore.Store.Shard.Writes do
   defp handle_getdel_direct(key, state) do
     {old, state} =
       case ShardETS.ets_lookup_warm(state, key) do
-        {:hit, value, _expire_at_ms} -> {value, state}
-        :expired -> {nil, state}
+        {:hit, value, _expire_at_ms} ->
+          {value, state}
+
+        :expired ->
+          {nil, state}
+
         :miss ->
           state = ShardFlush.await_in_flight(state)
           state = ShardFlush.flush_pending_sync(state)
@@ -426,15 +492,20 @@ defmodule Ferricstore.Store.Shard.Writes do
       case NIF.v2_append_tombstone(state.active_file_path, key) do
         {:ok, _} ->
           ShardETS.ets_delete_key(state, key)
+
           new_pending =
             case state.pending do
               [] -> []
               pending -> Enum.reject(pending, fn {k, _, _} -> k == key end)
             end
+
           {:reply, old, %{state | pending: new_pending}}
 
         {:error, reason} ->
-          Logger.error("Shard #{state.index}: tombstone write failed for GETDEL: #{inspect(reason)}")
+          Logger.error(
+            "Shard #{state.index}: tombstone write failed for GETDEL: #{inspect(reason)}"
+          )
+
           {:reply, {:error, reason}, state}
       end
     else
@@ -442,7 +513,8 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
-  @spec handle_getex(binary(), non_neg_integer(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
+  @spec handle_getex(binary(), non_neg_integer(), GenServer.from(), map()) ::
+          {:reply, term(), map()} | {:noreply, map()}
   @doc false
   def handle_getex(key, expire_at_ms, from, state) do
     if state.raft? do
@@ -497,7 +569,8 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
-  @spec handle_setrange(binary(), non_neg_integer(), binary(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
+  @spec handle_setrange(binary(), non_neg_integer(), binary(), GenServer.from(), map()) ::
+          {:reply, term(), map()} | {:noreply, map()}
   @doc false
   def handle_setrange(key, offset, value, from, state) do
     if state.raft? do
@@ -508,15 +581,24 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_setrange_raft(key, offset, value, from, state) do
-    Ferricstore.Raft.Batcher.write_async_quorum(state.index, {:setrange, key, offset, value}, from)
+    Ferricstore.Raft.Batcher.write_async_quorum(
+      state.index,
+      {:setrange, key, offset, value},
+      from
+    )
+
     {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
   defp handle_setrange_direct(key, offset, value, state) do
     {old_val, expire_at_ms} =
       case ShardETS.ets_lookup_warm(state, key) do
-        {:hit, v, exp} -> {ShardETS.to_disk_binary(v), exp}
-        :expired -> {"", 0}
+        {:hit, v, exp} ->
+          {ShardETS.to_disk_binary(v), exp}
+
+        :expired ->
+          {"", 0}
+
         :miss ->
           state = ShardFlush.await_in_flight(state)
           state = ShardFlush.flush_pending_sync(state)
@@ -549,6 +631,7 @@ defmodule Ferricstore.Store.Shard.Writes do
       Enum.each(keys_to_delete, fn key ->
         Ferricstore.Raft.Batcher.write(state.index, {:delete, key})
       end)
+
       new_version = state.write_version + 1
       {:reply, :ok, %{state | write_version: new_version}}
     else

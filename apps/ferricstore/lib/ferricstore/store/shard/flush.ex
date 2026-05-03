@@ -49,12 +49,14 @@ defmodule Ferricstore.Store.Shard.Flush do
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)
 
-        state = %{
-          state
-          | pending: [],
-            pending_count: 0,
-            active_file_size: state.active_file_size + written
-        }
+        state =
+          %{
+            state
+            | pending: [],
+              pending_count: 0,
+              active_file_size: state.active_file_size + written
+          }
+          |> Map.put(:last_flush_error, nil)
 
         maybe_notify_fragmentation(state)
 
@@ -65,7 +67,7 @@ defmodule Ferricstore.Store.Shard.Flush do
           "Shard #{state.index}: flush_pending (nosync) failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries"
         )
 
-        state
+        Map.put(state, :last_flush_error, reason)
     end
   end
 
