@@ -279,6 +279,24 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
       Router.delete(ctx(), key)
       assert Router.get(ctx(), key) == nil
     end
+
+    test "DELETE persists a single tombstone after async Ra apply" do
+      c = ctx()
+      key = "#{@ns}:single_tombstone_#{:erlang.unique_integer([:positive])}"
+      idx = Router.shard_for(c, key)
+
+      :ok = Router.put(c, key, "present", 0)
+      :ok = Batcher.flush(idx)
+      :ok = BitcaskWriter.flush_all(c.shard_count)
+
+      assert :ok = Router.delete(c, key)
+      assert Router.get(c, key) == nil
+
+      :ok = Batcher.flush(idx)
+      :ok = BitcaskWriter.flush_all(c.shard_count)
+
+      assert tombstone_count(c, key) == 1
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -461,5 +479,26 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
     after
       :ets.delete(keydir)
     end
+  end
+
+  defp tombstone_count(ctx, key) do
+    idx = Router.shard_for(ctx, key)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+
+    shard_path
+    |> Path.join("*.log")
+    |> Path.wildcard()
+    |> Enum.reduce(0, fn path, acc ->
+      case NIF.v2_scan_tombstones(path) do
+        {:ok, tombstones} ->
+          acc +
+            Enum.count(tombstones, fn {tombstone_key, _off, _size, _exp} ->
+              tombstone_key == key
+            end)
+
+        {:error, _reason} ->
+          acc
+      end
+    end)
   end
 end
