@@ -74,6 +74,26 @@ defmodule Ferricstore.Store.OpsTest do
     end
   end
 
+  describe "LocalTxStore EXISTS" do
+    test "cold keys are detected from metadata without reading the value" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "ops:local_tx:exists_cold:#{System.unique_integer([:positive])}"
+      shard_index = Router.shard_for(ctx, key)
+      keydir = :ets.new(:"ops_local_tx_#{System.unique_integer([:positive])}", [:set, :public])
+
+      try do
+        :ets.insert(keydir, {key, nil, 0, LFU.initial(), 123, 456, 789})
+
+        tx = local_tx(ctx, shard_index, keydir, %{})
+
+        assert Ops.exists?(tx, key),
+               "EXISTS should trust valid cold keydir metadata instead of reading the value"
+      after
+        :ets.delete(keydir)
+      end
+    end
+  end
+
   describe "LocalTxStore batch reads" do
     test "local plain batch_get does not fall back to per-key get" do
       source = File.read!(@ops_path)

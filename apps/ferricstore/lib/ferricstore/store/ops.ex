@@ -205,24 +205,7 @@ defmodule Ferricstore.Store.Ops do
 
   def exists?(%LocalTxStore{} = tx, key) do
     if local?(tx, key) do
-      if tx_deleted?(key) do
-        false
-      else
-        case ShardETS.ets_lookup_warm(tx.shard_state, key) do
-          {:hit, _, _} ->
-            true
-
-          :expired ->
-            false
-
-          :miss ->
-            case ShardReads.v2_local_read(tx.shard_state, key) do
-              {:ok, nil} -> false
-              {:ok, _value} -> true
-              _error -> false
-            end
-        end
-      end
+      local_exists?(tx, key)
     else
       Router.exists?(tx.instance_ctx, key)
     end
@@ -873,6 +856,24 @@ defmodule Ferricstore.Store.Ops do
 
           _error ->
             nil
+        end
+    end
+  end
+
+  defp local_exists?(tx, key) do
+    cond do
+      tx_deleted?(key) ->
+        false
+
+      tx_pending_meta(key) != nil ->
+        true
+
+      true ->
+        case ShardETS.ets_lookup(tx.shard_state, key) do
+          {:hit, _value, _exp} -> true
+          {:cold, _fid, _off, _vsize, _exp} -> true
+          :expired -> false
+          :miss -> false
         end
     end
   end
