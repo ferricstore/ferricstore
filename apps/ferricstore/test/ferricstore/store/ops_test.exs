@@ -44,6 +44,36 @@ defmodule Ferricstore.Store.OpsTest do
     end
   end
 
+  describe "LocalTxStore read-modify-write TTL preservation" do
+    test "INCR preserves an existing local transaction TTL" do
+      assert_local_tx_rmw_preserves_ttl("1", fn tx, key ->
+        assert {:ok, 3} == Ops.incr(tx, key, 2)
+        {"3", 3}
+      end)
+    end
+
+    test "INCR_FLOAT preserves an existing local transaction TTL" do
+      assert_local_tx_rmw_preserves_ttl("1.5", fn tx, key ->
+        assert {:ok, 2.0} == Ops.incr_float(tx, key, 0.5)
+        {"2.0", 2.0}
+      end)
+    end
+
+    test "APPEND preserves an existing local transaction TTL" do
+      assert_local_tx_rmw_preserves_ttl("base", fn tx, key ->
+        assert {:ok, 9} == Ops.append(tx, key, "_tail")
+        {"base_tail", "base_tail"}
+      end)
+    end
+
+    test "SETRANGE preserves an existing local transaction TTL" do
+      assert_local_tx_rmw_preserves_ttl("abcdef", fn tx, key ->
+        assert {:ok, 6} == Ops.setrange(tx, key, 2, "XY")
+        {"abXYef", "abXYef"}
+      end)
+    end
+  end
+
   describe "LocalTxStore batch reads" do
     test "local plain batch_get does not fall back to per-key get" do
       source = File.read!(@ops_path)
@@ -403,6 +433,33 @@ defmodule Ferricstore.Store.OpsTest do
       %{expire_at_ms: 0, nx: false, xx: false, get: false, keepttl: false, has_expiry: false},
       overrides
     )
+  end
+
+  defp assert_local_tx_rmw_preserves_ttl(initial_value, mutate_fun) do
+    ctx = FerricStore.Instance.get(:default)
+    key = "ops:local_tx:rmw_ttl:#{System.unique_integer([:positive])}"
+    shard_index = Router.shard_for(ctx, key)
+    keydir = :ets.new(:"ops_local_tx_#{System.unique_integer([:positive])}", [:set, :public])
+    expire_at_ms = System.os_time(:millisecond) + 60_000
+
+    try do
+      Process.put(:tx_pending_values, %{})
+      Process.put(:tx_deleted_keys, MapSet.new())
+      :ets.insert(keydir, {key, initial_value, expire_at_ms, LFU.initial(), 0, 0, 0})
+
+      tx = local_tx(ctx, shard_index, keydir, %{})
+      {expected_ets_value, expected_pending_value} = mutate_fun.(tx, key)
+
+      assert [{^key, ^expected_ets_value, ^expire_at_ms, _lfu, :pending, _fid, _vsize}] =
+               :ets.lookup(keydir, key)
+
+      assert %{^key => {^expected_pending_value, ^expire_at_ms}} =
+               Process.get(:tx_pending_values)
+    after
+      Process.delete(:tx_pending_values)
+      Process.delete(:tx_deleted_keys)
+      :ets.delete(keydir)
+    end
   end
 
   defp local_tx(ctx, shard_index, keydir, promoted_instances) do

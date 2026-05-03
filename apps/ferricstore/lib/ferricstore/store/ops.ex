@@ -247,7 +247,7 @@ defmodule Ferricstore.Store.Ops do
 
   def incr(%LocalTxStore{} = tx, key, delta) do
     if local?(tx, key) do
-      current = local_read_value_for_rmw(tx, key)
+      {current, expire_at_ms} = local_read_meta_for_rmw(tx, key)
 
       case current do
         nil ->
@@ -267,9 +267,9 @@ defmodule Ferricstore.Store.Ops do
             {:ok, int_val} ->
               case checked_integer_add(int_val, delta) do
                 {:ok, new_val} ->
-                  ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
-                  tx_put_pending(key, new_val, 0)
-                  send(self(), {:tx_pending_write, key, new_val, 0})
+                  ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
+                  tx_put_pending(key, new_val, expire_at_ms)
+                  send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
                   {:ok, new_val}
 
                 :overflow ->
@@ -303,7 +303,7 @@ defmodule Ferricstore.Store.Ops do
 
   def incr_float(%LocalTxStore{} = tx, key, delta) do
     if local?(tx, key) do
-      current = local_read_value_for_rmw(tx, key)
+      {current, expire_at_ms} = local_read_meta_for_rmw(tx, key)
 
       case current do
         nil ->
@@ -317,9 +317,9 @@ defmodule Ferricstore.Store.Ops do
           case ShardETS.coerce_float(value) do
             {:ok, float_val} ->
               new_val = float_val + delta
-              ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
-              tx_put_pending(key, new_val, 0)
-              send(self(), {:tx_pending_write, key, new_val, 0})
+              ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
+              tx_put_pending(key, new_val, expire_at_ms)
+              send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
               {:ok, new_val}
 
             :error ->
@@ -340,16 +340,16 @@ defmodule Ferricstore.Store.Ops do
 
   def append(%LocalTxStore{} = tx, key, suffix) do
     if local?(tx, key) do
-      current =
-        case local_read_value_for_rmw(tx, key) do
-          nil -> ""
-          value -> ShardETS.to_disk_binary(value)
+      {current, expire_at_ms} =
+        case local_read_meta_for_rmw(tx, key) do
+          {nil, _exp} -> {"", 0}
+          {value, exp} -> {ShardETS.to_disk_binary(value), exp}
         end
 
       new_val = current <> suffix
-      ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
-      tx_put_pending(key, new_val, 0)
-      send(self(), {:tx_pending_write, key, new_val, 0})
+      ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
+      tx_put_pending(key, new_val, expire_at_ms)
+      send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
       {:ok, byte_size(new_val)}
     else
       Router.append(tx.instance_ctx, key, suffix)
@@ -424,16 +424,16 @@ defmodule Ferricstore.Store.Ops do
 
   def setrange(%LocalTxStore{} = tx, key, offset, value) do
     if local?(tx, key) do
-      old =
-        case local_read_value_for_rmw(tx, key) do
-          nil -> ""
-          v -> ShardETS.to_disk_binary(v)
+      {old, expire_at_ms} =
+        case local_read_meta_for_rmw(tx, key) do
+          {nil, _exp} -> {"", 0}
+          {v, exp} -> {ShardETS.to_disk_binary(v), exp}
         end
 
       new_val = ShardWrites.apply_setrange(old, offset, value)
-      ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
-      tx_put_pending(key, new_val, 0)
-      send(self(), {:tx_pending_write, key, new_val, 0})
+      ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
+      tx_put_pending(key, new_val, expire_at_ms)
+      send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
       {:ok, byte_size(new_val)}
     else
       Router.setrange(tx.instance_ctx, key, offset, value)
@@ -1151,8 +1151,31 @@ defmodule Ferricstore.Store.Ops do
 
   defp fallback_set_current_meta(_store, _key, false, false), do: nil
 
-  # Read value for read-modify-write ops (incr, getset, getdel, getex).
-  # Same as local_read_value but without warming ETS on cold read (matching original closures).
+  # Read {value, expire_at_ms} for local transaction read-modify-write ops.
+  # This preserves Redis' TTL semantics for INCR/APPEND/SETRANGE while keeping
+  # the same one-lookup hot path as the old value-only helper.
+  defp local_read_meta_for_rmw(tx, key) do
+    case tx_pending_meta(key) do
+      {value, exp} -> {value, exp}
+      nil -> local_read_meta_for_rmw_from_ets(tx, key)
+    end
+  end
+
+  defp local_read_meta_for_rmw_from_ets(tx, key) do
+    case ShardETS.ets_lookup_warm(tx.shard_state, key) do
+      {:hit, value, exp} ->
+        {value, exp}
+
+      :expired ->
+        {nil, 0}
+
+      :miss ->
+        {nil, 0}
+    end
+  end
+
+  # Read value for read-modify-write ops that intentionally discard TTL
+  # (GETSET) or delete/change it explicitly (GETDEL/GETEX).
   defp local_read_value_for_rmw(tx, key) do
     case tx_pending_meta(key) do
       {value, _exp} -> value
