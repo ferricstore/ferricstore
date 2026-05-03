@@ -35,6 +35,18 @@ defmodule FerricStore.Instance.Supervisor do
     # Ensure data directory layout exists
     Ferricstore.DataDir.ensure_layout!(ctx.data_dir, ctx.shard_count)
 
+    cleanup_children =
+      if name == :default do
+        []
+      else
+        [
+          Supervisor.child_spec({FerricStore.Instance.Cleanup, name},
+            id: :"#{name}.InstanceCleanup",
+            restart: :temporary
+          )
+        ]
+      end
+
     merge_children =
       if name == :default do
         []
@@ -55,7 +67,8 @@ defmodule FerricStore.Instance.Supervisor do
       end
 
     children =
-      merge_children ++
+      cleanup_children ++
+        merge_children ++
         [
           # Stats and MemoryGuard are global application processes today. The
           # instance context owns isolated counters/flags, but these GenServers are

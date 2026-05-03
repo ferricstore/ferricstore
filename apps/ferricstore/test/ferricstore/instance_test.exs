@@ -176,6 +176,36 @@ defmodule Ferricstore.InstanceTest do
   end
 
   describe "custom instance cleanup" do
+    test "parent supervisor shutdown removes cached custom instance context" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_embedded_parent_stop_#{System.unique_integer([:positive])}"
+        )
+
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        FerricStore.Instance.cleanup(EmbeddedDefaultOptions)
+        File.rm_rf(root)
+      end)
+
+      {:ok, parent} =
+        Supervisor.start_link(
+          [EmbeddedDefaultOptions.child_spec(data_dir: root, shard_count: 1)],
+          strategy: :one_for_one
+        )
+
+      assert :ok = EmbeddedDefaultOptions.set("parent-stop", "value")
+      assert {:ok, "value"} = EmbeddedDefaultOptions.get("parent-stop")
+
+      assert :ok = Supervisor.stop(parent)
+
+      assert_raise ArgumentError, fn ->
+        FerricStore.Instance.get(EmbeddedDefaultOptions)
+      end
+    end
+
     test "removes latch ETS tables" do
       name = :"cleanup_latch_#{System.unique_integer([:positive])}"
       on_exit(fn -> FerricStore.Instance.cleanup(name) end)
