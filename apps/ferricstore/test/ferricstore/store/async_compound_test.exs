@@ -9,7 +9,7 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
     durability_for_key(ctx, redis_key). When the parent redis_key's
     namespace is configured async, the write goes through an async fast
     path mirroring async_write_put: ETS + BitcaskWriter cast +
-    Batcher.async_submit, caller returns ~15-30μs.
+    Batcher.async_enqueue, caller returns ~15-30μs.
 
   - Read-your-writes holds on the origin — the compound_key is in ETS
     before the caller gets :ok.

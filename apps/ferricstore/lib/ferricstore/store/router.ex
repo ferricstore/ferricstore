@@ -3491,7 +3491,7 @@ defmodule Ferricstore.Store.Router do
       previous = snapshot_live_value(ctx, idx, compound_key)
 
       with :ok <- install_async_put_value(ctx, idx, compound_key, value, expire_at_ms) do
-        case async_submit_to_raft(idx, {:put, compound_key, value, expire_at_ms}) do
+        case async_enqueue_to_raft(idx, {:put, compound_key, value, expire_at_ms}) do
           :ok ->
             bump_write_version(ctx, idx)
             :ok
@@ -3517,7 +3517,7 @@ defmodule Ferricstore.Store.Router do
     if under_pressure do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
-      with :ok <- async_submit_to_raft(idx, {:delete, compound_key}) do
+      with :ok <- async_enqueue_to_raft(idx, {:delete, compound_key}) do
         keydir = elem(ctx.keydir_refs, idx)
         track_keydir_binary_delete(ctx, idx, keydir, compound_key)
         :ets.delete(keydir, compound_key)
