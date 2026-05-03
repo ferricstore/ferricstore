@@ -20,6 +20,7 @@ defmodule Ferricstore.Store.Router do
 
   alias Ferricstore.HLC
   alias Ferricstore.ErrorReasons
+  alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Stats
   alias Ferricstore.Store.{CompoundKey, LFU, ListOps, TypeRegistry, ValueCodec}
 
@@ -452,8 +453,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp forced_quorum_write(ctx, idx, command, origin_node) do
-    ref = make_ref()
-    from = {self(), ref}
+    {from, token} = ReplyAwaiter.new()
 
     if origin_node == node() do
       Ferricstore.Raft.Batcher.write_async_quorum(idx, command, from)
@@ -461,12 +461,7 @@ defmodule Ferricstore.Store.Router do
       Ferricstore.Raft.Batcher.write_async_quorum_forwarded(idx, command, from, origin_node)
     end
 
-    result =
-      receive do
-        {^ref, reply} -> reply
-      after
-        10_000 -> ErrorReasons.write_timeout_unknown()
-      end
+    result = ReplyAwaiter.await(token, 10_000, ErrorReasons.write_timeout_unknown())
 
     case result do
       # Local node isn't the leader for this shard. Forward via the same
@@ -2532,7 +2527,6 @@ defmodule Ferricstore.Store.Router do
 
   defp batch_quorum_put(ctx, kv_pairs, origin_node) do
     wv_size = :counters.info(ctx.write_version).size
-    me = self()
 
     # Single pass: group by shard, build cmds + indices lists simultaneously,
     # also remember the kv_pairs subset per shard so we can re-issue the
@@ -2551,16 +2545,16 @@ defmodule Ferricstore.Store.Router do
 
     shard_refs =
       Enum.map(by_shard, fn {shard_idx, {cmds, indices}} ->
-        ref = make_ref()
+        {from, token} = ReplyAwaiter.new()
         cmds = Enum.reverse(cmds)
 
         if origin_node == nil do
-          Ferricstore.Raft.Batcher.write_batch(shard_idx, cmds, {me, ref})
+          Ferricstore.Raft.Batcher.write_batch(shard_idx, cmds, from)
         else
-          Ferricstore.Raft.Batcher.write_batch_forwarded(shard_idx, cmds, {me, ref}, origin_node)
+          Ferricstore.Raft.Batcher.write_batch_forwarded(shard_idx, cmds, from, origin_node)
         end
 
-        {ref, shard_idx, Enum.reverse(indices)}
+        {token, shard_idx, Enum.reverse(indices)}
       end)
 
     results =
@@ -2604,19 +2598,20 @@ defmodule Ferricstore.Store.Router do
     elapsed = System.monotonic_time(:millisecond) - start
     timeout = max(10_000 - elapsed, 0)
 
-    receive do
-      {ref, result} when is_reference(ref) ->
-        case List.keytake(remaining_refs, ref, 0) do
-          {{^ref, shard_idx, indices}, rest} ->
-            acc = apply_shard_results(result, indices, shard_idx, wv_size, ctx, acc)
-            collect_shard_replies(rest, wv_size, ctx, acc, start)
+    refs_by_token =
+      Map.new(remaining_refs, fn {token, shard_idx, indices} ->
+        {token, {shard_idx, indices}}
+      end)
 
-          nil ->
-            collect_shard_replies(remaining_refs, wv_size, ctx, acc, start)
-        end
-    after
-      timeout -> acc
-    end
+    {_status, replies, _unresolved} =
+      remaining_refs
+      |> Enum.map(fn {token, _shard_idx, _indices} -> token end)
+      |> ReplyAwaiter.collect(timeout)
+
+    Enum.reduce(replies, acc, fn {token, result}, next_acc ->
+      {shard_idx, indices} = Map.fetch!(refs_by_token, token)
+      apply_shard_results(result, indices, shard_idx, wv_size, ctx, next_acc)
+    end)
   end
 
   defp apply_shard_results({:ok, results}, indices, shard_idx, wv_size, ctx, acc)
