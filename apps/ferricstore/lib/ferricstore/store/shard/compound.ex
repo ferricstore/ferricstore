@@ -1065,11 +1065,13 @@ defmodule Ferricstore.Store.Shard.Compound do
                    state.instance_ctx
                  ) do
               {:ok, dedicated_store} ->
+                total_bytes = promoted_dir_size(dedicated_store)
+
                 new_promoted =
                   Map.put(state.promoted_instances, redis_key, %{
                     path: dedicated_store,
                     writes: 0,
-                    total_bytes: 0,
+                    total_bytes: total_bytes,
                     dead_bytes: 0,
                     last_compacted_at: nil
                   })

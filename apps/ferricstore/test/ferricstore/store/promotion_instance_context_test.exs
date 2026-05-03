@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.{CompoundKey, Router}
+  alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Test.IsolatedInstance
 
   setup do
@@ -72,6 +73,36 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
 
     assert keydir_binary_total(default_ctx) == default_before
     assert keydir_binary_total(ctx) > custom_before
+  end
+
+  test "new promoted instance records its initial dedicated byte size", %{ctx: ctx} do
+    redis_key = "promoted_initial_size_#{System.unique_integer([:positive])}"
+
+    assert :ok =
+             Router.compound_put(
+               ctx,
+               redis_key,
+               CompoundKey.hash_field(redis_key, "f1"),
+               "value1",
+               0
+             )
+
+    assert :ok =
+             Router.compound_put(
+               ctx,
+               redis_key,
+               CompoundKey.hash_field(redis_key, "f2"),
+               "value2",
+               0
+             )
+
+    shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
+    state = :sys.get_state(shard)
+    info = Map.fetch!(state.promoted_instances, redis_key)
+
+    assert info.total_bytes == ShardCompound.promoted_dir_size(info.path)
+    assert info.total_bytes > 0
+    assert info.dead_bytes == 0
   end
 
   defp keydir_binary_total(ctx) do
