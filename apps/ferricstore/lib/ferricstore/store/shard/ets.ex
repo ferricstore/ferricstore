@@ -2,7 +2,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @moduledoc "ETS keydir operations: lookup, insert, delete, cold-read warming, LFU touch, hot-cache threshold enforcement, and prefix scans."
 
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{LFU, ValueCodec}
+  alias Ferricstore.Store.{ColdRead, LFU, ValueCodec}
 
   @cold_batch_read_timeout_ms 10_000
 
@@ -470,25 +470,38 @@ defmodule Ferricstore.Store.Shard.ETS do
     locations = Enum.map(entries, fn {_field, key, file_path, off} -> {file_path, off, key} end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch_keyed(
-             locations,
-             @cold_batch_read_timeout_ms
-           ) do
-        {:ok, values} when is_list(values) ->
-          if length(values) == length(entries) do
-            values
-          else
-            List.duplicate(nil, length(entries))
-          end
+      case ColdRead.pread_batch_keyed(locations, @cold_batch_read_timeout_ms) do
+        {:ok, values} when is_list(values) and length(values) == length(entries) ->
+          values
 
-        {:error, _reason} ->
-          List.duplicate(nil, length(entries))
+        {:ok, _bad_values} ->
+          List.duplicate({:error, :batch_result_length_mismatch}, length(entries))
+
+        {:error, reason} ->
+          List.duplicate({:error, reason}, length(entries))
       end
+
+    emit_prefix_cold_read_errors(entries, values)
 
     Enum.zip(entries, values)
     |> Enum.map(fn
       {{field, _key, _file_path, _off}, value} when is_binary(value) -> {field, value}
       {_entry, _value} -> nil
+    end)
+  end
+
+  defp emit_prefix_cold_read_errors(entries, values) do
+    entries
+    |> Enum.zip(values)
+    |> Enum.reduce(%{}, fn
+      {{_field, _key, file_path, _off}, {:error, raw_reason}}, acc ->
+        Map.update(acc, {file_path, raw_reason}, 1, &(&1 + 1))
+
+      {_entry, _value}, acc ->
+        acc
+    end)
+    |> Enum.each(fn {{path, raw_reason}, count} ->
+      ColdRead.emit_pread_error(path, raw_reason, count)
     end)
   end
 

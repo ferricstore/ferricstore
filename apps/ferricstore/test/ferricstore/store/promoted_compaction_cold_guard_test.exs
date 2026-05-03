@@ -14,6 +14,9 @@ defmodule Ferricstore.Store.PromotedCompactionColdGuardTest do
     assert compaction_section =~ "ColdRead.pread_batch",
            "promoted compaction should batch cold dedicated reads"
 
+    assert compaction_section =~ "ColdRead.emit_pread_error",
+           "promoted compaction should report corrupt/missing cold dedicated records"
+
     refute compaction_section =~ "read_cold_async(",
            "promoted compaction should not spawn one async waiter per cold entry"
   end

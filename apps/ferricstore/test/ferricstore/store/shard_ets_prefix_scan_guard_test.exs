@@ -11,6 +11,9 @@ defmodule Ferricstore.Store.ShardETSPrefixScanGuardTest do
     assert source =~ "ColdRead.pread_batch_keyed",
            "expected Shard.ETS prefix scan cold path to use keyed batched cold reads"
 
+    assert source =~ "ColdRead.emit_pread_error",
+           "expected Shard.ETS prefix scan cold path to report corrupt/missing cold records"
+
     refute Regex.match?(~r/(?<!_)v2_pread_at\(/, source),
            "expected Shard.ETS prefix scan cold path to avoid blocking v2_pread_at/2"
   end
