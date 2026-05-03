@@ -142,6 +142,33 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
                     %{path: ^path, reason: :nil_from_cold_location}}
   end
 
+  test "batch cold read corruption in one file does not hide valid keys from another file", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    bad_key = "cold_batch_bad_file:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    good_key = "cold_batch_good_file:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    good_value = "still-readable"
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    bad_path = Path.join(shard_path, "00000.log")
+    good_path = Path.join(shard_path, "00001.log")
+
+    {:ok, {bad_offset, _bad_record_size}} = NIF.v2_append_record(bad_path, bad_key, "bad", 0)
+
+    {:ok, {good_offset, _good_record_size}} =
+      NIF.v2_append_record(good_path, good_key, good_value, 0)
+
+    :ets.insert(keydir, {bad_key, nil, 0, LFU.initial(), 0, bad_offset, 3})
+    :ets.insert(keydir, {good_key, nil, 0, LFU.initial(), 1, good_offset, byte_size(good_value)})
+
+    {:ok, fd} = :file.open(bad_path, [:read, :write, :binary])
+    corrupt_at = bad_offset + @record_header_size + byte_size(bad_key)
+    :ok = :file.pwrite(fd, corrupt_at, <<"X">>)
+    :ok = :file.close(fd)
+
+    assert [nil, ^good_value] = Router.batch_get(ctx, [bad_key, good_key])
+  end
+
   test "batch_get preserves mixed cold result order including empty values", %{
     ctx: ctx,
     shard: shard,

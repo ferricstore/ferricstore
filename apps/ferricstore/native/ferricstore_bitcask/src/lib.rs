@@ -1294,14 +1294,14 @@ fn pread_batch_for_path(
     path: String,
     reads: Vec<(usize, u64)>,
 ) -> Result<Vec<(usize, Option<Vec<u8>>)>, String> {
+    let nil_results: Vec<(usize, Option<Vec<u8>>)> = reads
+        .iter()
+        .map(|(index, _offset)| (*index, None))
+        .collect();
+
     let file = match std::fs::File::open(std::path::Path::new(&path)) {
         Ok(file) => file,
-        Err(_e) => {
-            return Ok(reads
-                .into_iter()
-                .map(|(index, _offset)| (index, None))
-                .collect())
-        }
+        Err(_e) => return Ok(nil_results),
     };
 
     fadvise_random(&file);
@@ -1318,7 +1318,7 @@ fn pread_batch_for_path(
                 record.value
             }
             Ok(None) => None,
-            Err(e) => return Err(format!("pread batch {path}:{offset}: {e}")),
+            Err(_e) => return Ok(nil_results),
         };
 
         results.push((index, value));
@@ -1331,14 +1331,14 @@ fn pread_batch_for_path_keyed(
     path: String,
     reads: Vec<(usize, u64, Vec<u8>)>,
 ) -> Result<Vec<(usize, Option<Vec<u8>>)>, String> {
+    let nil_results: Vec<(usize, Option<Vec<u8>>)> = reads
+        .iter()
+        .map(|(index, _offset, _expected_key)| (*index, None))
+        .collect();
+
     let file = match std::fs::File::open(std::path::Path::new(&path)) {
         Ok(file) => file,
-        Err(_e) => {
-            return Ok(reads
-                .into_iter()
-                .map(|(index, _offset, _expected_key)| (index, None))
-                .collect())
-        }
+        Err(_e) => return Ok(nil_results),
     };
 
     fadvise_random(&file);
@@ -1360,7 +1360,7 @@ fn pread_batch_for_path_keyed(
                 }
             }
             Ok(None) => None,
-            Err(e) => return Err(format!("pread keyed batch {path}:{offset}: {e}")),
+            Err(_e) => return Ok(nil_results),
         };
 
         results.push((index, value));
@@ -2155,29 +2155,40 @@ mod audit_fix_tests {
     }
 
     #[test]
-    fn grouped_batch_pread_returns_error_on_corrupt_record() {
+    fn grouped_batch_pread_isolates_corrupt_files_to_their_indexes() {
         use std::os::unix::fs::FileExt;
 
         let dir = tmp();
-        let path = dir.path().join("00000000000000000001.log");
+        let bad_path = dir.path().join("00000000000000000001.log");
+        let good_path = dir.path().join("00000000000000000002.log");
 
-        let mut writer = log::LogWriter::open(&path, 1).unwrap();
-        let good = writer.write(b"good", b"value", 0).unwrap();
-        let corrupt = writer.write(b"corrupt", b"bad_value", 0).unwrap();
-        writer.sync().unwrap();
+        let mut bad_writer = log::LogWriter::open(&bad_path, 1).unwrap();
+        let bad_good = bad_writer.write(b"bad_good", b"value", 0).unwrap();
+        let corrupt = bad_writer.write(b"corrupt", b"bad_value", 0).unwrap();
+        bad_writer.sync().unwrap();
 
-        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut good_writer = log::LogWriter::open(&good_path, 2).unwrap();
+        let good = good_writer.write(b"good", b"value", 0).unwrap();
+        good_writer.sync().unwrap();
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&bad_path)
+            .unwrap();
         let corrupt_value_byte = corrupt + log::HEADER_SIZE as u64 + b"corrupt".len() as u64;
         file.write_at(b"X", corrupt_value_byte).unwrap();
         file.sync_data().unwrap();
 
-        let err = pread_batch_grouped(vec![
-            (path.to_string_lossy().into_owned(), good),
-            (path.to_string_lossy().into_owned(), corrupt),
+        let values = pread_batch_grouped(vec![
+            (bad_path.to_string_lossy().into_owned(), bad_good),
+            (good_path.to_string_lossy().into_owned(), good),
+            (bad_path.to_string_lossy().into_owned(), corrupt),
         ])
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.contains("CRC") || err.contains("mismatch"));
+        assert_eq!(values[0], None);
+        assert_eq!(values[1].as_deref(), Some(&b"value"[..]));
+        assert_eq!(values[2], None);
     }
 
     #[test]
@@ -2242,37 +2253,52 @@ mod audit_fix_tests {
     }
 
     #[test]
-    fn keyed_batch_pread_returns_error_on_corrupt_record() {
+    fn keyed_batch_pread_isolates_corrupt_files_to_their_indexes() {
         use std::os::unix::fs::FileExt;
 
         let dir = tmp();
-        let path = dir.path().join("00000000000000000001.log");
+        let bad_path = dir.path().join("00000000000000000001.log");
+        let good_path = dir.path().join("00000000000000000002.log");
 
-        let mut writer = log::LogWriter::open(&path, 1).unwrap();
-        let good_before = writer.write(b"good_before", b"value_before", 0).unwrap();
-        let corrupt = writer.write(b"corrupt", b"bad_value", 0).unwrap();
-        writer.sync().unwrap();
+        let mut bad_writer = log::LogWriter::open(&bad_path, 1).unwrap();
+        let bad_good = bad_writer.write(b"bad_good", b"value_before", 0).unwrap();
+        let corrupt = bad_writer.write(b"corrupt", b"bad_value", 0).unwrap();
+        bad_writer.sync().unwrap();
 
-        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut good_writer = log::LogWriter::open(&good_path, 2).unwrap();
+        let good = good_writer.write(b"good", b"value", 0).unwrap();
+        good_writer.sync().unwrap();
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&bad_path)
+            .unwrap();
         let corrupt_value_byte = corrupt + log::HEADER_SIZE as u64 + b"corrupt".len() as u64;
         file.write_at(b"X", corrupt_value_byte).unwrap();
         file.sync_data().unwrap();
 
-        let err = pread_batch_grouped_keyed(vec![
+        let values = pread_batch_grouped_keyed(vec![
             (
-                path.to_string_lossy().into_owned(),
-                good_before,
-                b"good_before".to_vec(),
+                bad_path.to_string_lossy().into_owned(),
+                bad_good,
+                b"bad_good".to_vec(),
             ),
             (
-                path.to_string_lossy().into_owned(),
+                good_path.to_string_lossy().into_owned(),
+                good,
+                b"good".to_vec(),
+            ),
+            (
+                bad_path.to_string_lossy().into_owned(),
                 corrupt,
                 b"corrupt".to_vec(),
             ),
         ])
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.contains("CRC") || err.contains("mismatch"));
+        assert_eq!(values[0], None);
+        assert_eq!(values[1].as_deref(), Some(&b"value"[..]));
+        assert_eq!(values[2], None);
     }
 
     #[test]
