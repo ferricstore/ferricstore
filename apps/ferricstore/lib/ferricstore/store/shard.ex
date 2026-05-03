@@ -1011,7 +1011,7 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp scan_lower_tombstone_key_states(shard_path, files, fid, masked_keys) do
-    result =
+    candidate_files =
       files
       |> Enum.flat_map(fn name ->
         with true <- String.ends_with?(name, ".log"),
@@ -1024,8 +1024,17 @@ defmodule Ferricstore.Store.Shard do
         end
       end)
       |> Enum.sort_by(fn {other_fid, _path} -> -other_fid end)
-      |> Enum.reduce_while({:ok, %{}, masked_keys}, fn {_other_fid, path},
-                                                       {:ok, states, unresolved_keys} ->
+
+    started_at = System.monotonic_time()
+    masked_key_count = MapSet.size(masked_keys)
+
+    result =
+      candidate_files
+      |> Enum.reduce_while({:ok, %{}, masked_keys, 0}, fn {_other_fid, path},
+                                                          {:ok, states, unresolved_keys,
+                                                           files_scanned} ->
+        next_files_scanned = files_scanned + 1
+
         case NIF.v2_scan_file(path) do
           {:ok, records} ->
             file_states =
@@ -1044,20 +1053,84 @@ defmodule Ferricstore.Store.Shard do
               Enum.reduce(Map.keys(file_states), unresolved_keys, &MapSet.delete(&2, &1))
 
             if MapSet.size(next_unresolved_keys) == 0 do
-              {:halt, {:ok, next_states}}
+              {:halt, {:ok, next_states, next_unresolved_keys, next_files_scanned}}
             else
-              {:cont, {:ok, next_states, next_unresolved_keys}}
+              {:cont, {:ok, next_states, next_unresolved_keys, next_files_scanned}}
             end
 
           {:error, reason} ->
-            {:halt, {:error, reason}}
+            {:halt, {:error, reason, next_files_scanned}}
         end
       end)
 
     case result do
-      {:ok, states, _unresolved_keys} -> {:ok, states}
-      other -> other
+      {:ok, states, unresolved_keys, files_scanned} ->
+        emit_tombstone_dependency_scan(
+          shard_path,
+          fid,
+          :ok,
+          started_at,
+          length(candidate_files),
+          files_scanned,
+          masked_key_count,
+          masked_key_count - MapSet.size(unresolved_keys)
+        )
+
+        {:ok, states}
+
+      {:error, reason, files_scanned} ->
+        emit_tombstone_dependency_scan(
+          shard_path,
+          fid,
+          :error,
+          started_at,
+          length(candidate_files),
+          files_scanned,
+          masked_key_count,
+          0,
+          reason
+        )
+
+        {:error, reason}
     end
+  end
+
+  defp emit_tombstone_dependency_scan(
+         shard_path,
+         fid,
+         status,
+         started_at,
+         candidate_files,
+         files_scanned,
+         masked_keys,
+         resolved_keys,
+         reason \\ nil
+       ) do
+    metadata = %{
+      shard_path: shard_path,
+      fid: fid,
+      status: status
+    }
+
+    metadata =
+      if reason == nil do
+        metadata
+      else
+        Map.put(metadata, :reason, reason)
+      end
+
+    :telemetry.execute(
+      [:ferricstore, :bitcask, :tombstone_dependency_scan],
+      %{
+        candidate_files: candidate_files,
+        files_scanned: files_scanned,
+        masked_keys: masked_keys,
+        resolved_keys: resolved_keys,
+        duration_us:
+          System.convert_time_unit(System.monotonic_time() - started_at, :native, :microsecond)
+      },
+      metadata
+    )
   end
 
   defp tombstone_offsets(path) do

@@ -1687,12 +1687,35 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
         assert nil == GenServer.call(pid1, {:get, "deleted"})
         assert "kept" == GenServer.call(pid1, {:get, "live"})
 
+        parent = self()
+        handler_id = {:tombstone_dependency_scan, self(), make_ref()}
+
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :bitcask, :tombstone_dependency_scan],
+          fn event, measurements, metadata, _config ->
+            send(parent, {:tombstone_dependency_scan, event, measurements, metadata})
+          end,
+          nil
+        )
+
+        on_exit(fn -> :telemetry.detach(handler_id) end)
+
         File.rm!(log0)
         File.mkdir!(log0)
 
         assert {:ok, {1, 0, _reclaimed}} = GenServer.call(pid1, {:run_compaction, [2]})
         assert {:ok, []} = NIF.v2_scan_tombstones(log2)
         assert "kept" == GenServer.call(pid1, {:get, "live"})
+
+        assert_receive {:tombstone_dependency_scan,
+                        [:ferricstore, :bitcask, :tombstone_dependency_scan],
+                        %{
+                          candidate_files: 2,
+                          files_scanned: 1,
+                          masked_keys: 1,
+                          resolved_keys: 1
+                        }, %{fid: 2, status: :ok}}
       after
         case Process.whereis(Router.shard_name(ctx, 0)) do
           pid when is_pid(pid) ->
