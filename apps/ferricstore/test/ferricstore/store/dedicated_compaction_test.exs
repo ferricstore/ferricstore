@@ -11,7 +11,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Commands.Hash
-  alias Ferricstore.Store.{Promotion, Router}
+  alias Ferricstore.Store.{CompoundKey, Promotion, Router}
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Test.ShardHelpers
 
@@ -351,6 +351,49 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
 
       count = Hash.handle("HLEN", [key], store)
       assert count == expected_count
+    end
+
+    test "concurrent promoted HSET wins over stale compaction snapshot" do
+      store = real_store()
+      key = ukey("compact_hset_race")
+      promote_hash(store, key)
+
+      ctx = FerricStore.Instance.get(:default)
+      shard_idx = Router.shard_for(ctx, key)
+      shard = Router.shard_name(ctx, shard_idx)
+      state = :sys.get_state(shard)
+      dedicated_path = state.promoted_instances[key].path
+      compound_key = CompoundKey.hash_field(key, "field_1")
+
+      assert [{^compound_key, "value_1", 0, _lfu, _fid, _off, _vsize}] =
+               :ets.lookup(state.keydir, compound_key)
+
+      test_pid = self()
+
+      Process.put(:ferricstore_promoted_compaction_after_collect_hook, fn ^key, live_entries ->
+        assert Enum.any?(live_entries, fn {entry_key, value, _exp} ->
+                 entry_key == compound_key and value == "value_1"
+               end)
+
+        task =
+          Task.async(fn ->
+            Hash.handle("HSET", [key, "field_1", "newer_value"], store)
+          end)
+
+        send(test_pid, {:promoted_compaction_race_task, task})
+        Process.sleep(50)
+      end)
+
+      try do
+        ShardCompound.compact_dedicated(state, key, dedicated_path)
+      after
+        Process.delete(:ferricstore_promoted_compaction_after_collect_hook)
+      end
+
+      assert_receive {:promoted_compaction_race_task, task}
+      Task.await(task, 5_000)
+
+      assert "newer_value" == Hash.handle("HGET", [key, "field_1"], store)
     end
   end
 

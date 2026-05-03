@@ -50,6 +50,7 @@ defmodule Ferricstore.Store.Promotion do
 
   @promotion_marker_prefix "PM:"
   @cold_read_timeout_ms 10_000
+  @compaction_latch_sleep_ms 1
 
   @spec threshold() :: non_neg_integer()
   def threshold do
@@ -76,6 +77,44 @@ defmodule Ferricstore.Store.Promotion do
 
   @spec marker_key(binary()) :: binary()
   def marker_key(redis_key), do: @promotion_marker_prefix <> redis_key
+
+  @doc """
+  Runs `fun` while holding the per-promoted-key compaction latch.
+
+  Promoted dedicated compaction rewrites member records into a newer log file.
+  Raft-applied promoted writes must not append to that same per-key log while
+  the rewrite snapshot is in progress, or disk replay order can resurrect stale
+  compacted records. The latch is only consulted on promoted dedicated paths.
+  """
+  @spec with_compaction_latch(map(), binary(), (-> term())) :: term()
+  def with_compaction_latch(owner, redis_key, fun) when is_function(fun, 0) do
+    case compaction_latch(owner, redis_key) do
+      nil ->
+        fun.()
+
+      {tab, latch_key} ->
+        acquire_compaction_latch(tab, latch_key)
+
+        try do
+          fun.()
+        after
+          :ets.take(tab, latch_key)
+        end
+    end
+  end
+
+  @doc """
+  Waits until no promoted compaction latch is held for `redis_key`.
+
+  Called by Raft apply before appending promoted dedicated writes/tombstones.
+  """
+  @spec await_compaction_latch(map(), binary()) :: :ok
+  def await_compaction_latch(owner, redis_key) do
+    case compaction_latch(owner, redis_key) do
+      nil -> :ok
+      {tab, latch_key} -> wait_compaction_latch_clear(tab, latch_key)
+    end
+  end
 
   @spec open_dedicated(binary(), non_neg_integer(), atom(), binary()) ::
           {:ok, binary()} | {:error, term()}
@@ -575,6 +614,66 @@ defmodule Ferricstore.Store.Promotion do
       [] -> Path.join(path, "00000.log")
       files -> files |> List.last() |> elem(1)
     end
+  end
+
+  defp compaction_latch(owner, redis_key) do
+    with %FerricStore.Instance{} = ctx <- latch_context(owner),
+         idx when is_integer(idx) and idx >= 0 <- latch_index(owner),
+         true <- idx < tuple_size(ctx.latch_refs) do
+      {elem(ctx.latch_refs, idx), {:promoted_compaction, redis_key}}
+    else
+      _ -> nil
+    end
+  end
+
+  defp latch_context(%FerricStore.Instance{} = ctx), do: ctx
+  defp latch_context(%{instance_ctx: %FerricStore.Instance{} = ctx}), do: ctx
+
+  defp latch_context(%{instance_name: name}) when is_atom(name) do
+    FerricStore.Instance.get(name)
+  rescue
+    _ -> nil
+  catch
+    :exit, _ -> nil
+  end
+
+  defp latch_context(_owner), do: nil
+
+  defp latch_index(%{index: index}), do: index
+  defp latch_index(%{shard_index: index}), do: index
+  defp latch_index(_owner), do: nil
+
+  defp acquire_compaction_latch(tab, latch_key) do
+    case :ets.insert_new(tab, {latch_key, self()}) do
+      true ->
+        :ok
+
+      false ->
+        wait_compaction_latch_clear(tab, latch_key)
+        acquire_compaction_latch(tab, latch_key)
+    end
+  end
+
+  defp wait_compaction_latch_clear(tab, latch_key) do
+    case :ets.lookup(tab, latch_key) do
+      [] -> :ok
+      [{^latch_key, owner}] -> wait_for_latch_owner(tab, latch_key, owner)
+    end
+  end
+
+  defp wait_for_latch_owner(tab, latch_key, owner) when is_pid(owner) do
+    if Process.alive?(owner) do
+      Process.sleep(@compaction_latch_sleep_ms)
+    else
+      :ets.take(tab, latch_key)
+    end
+
+    wait_compaction_latch_clear(tab, latch_key)
+  end
+
+  defp wait_for_latch_owner(tab, latch_key, _owner) do
+    Process.sleep(@compaction_latch_sleep_ms)
+    wait_compaction_latch_clear(tab, latch_key)
   end
 
   defp file_id_from_path(path) do

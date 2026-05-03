@@ -865,6 +865,12 @@ defmodule Ferricstore.Store.Shard.Compound do
   @spec compact_dedicated(map(), binary(), binary()) :: map()
   @doc false
   def compact_dedicated(state, redis_key, dedicated_path) do
+    Promotion.with_compaction_latch(state, redis_key, fn ->
+      do_compact_dedicated(state, redis_key, dedicated_path)
+    end)
+  end
+
+  defp do_compact_dedicated(state, redis_key, dedicated_path) do
     alias Ferricstore.Store.CompoundKey
 
     prefix = promoted_prefix_for(state, redis_key)
@@ -891,6 +897,7 @@ defmodule Ferricstore.Store.Shard.Compound do
       now = HLC.now_ms()
 
       live_entries = collect_promoted_live_entries(state, dedicated_path, prefix, now)
+      maybe_run_promoted_compaction_after_collect_hook(redis_key, live_entries)
 
       if live_entries == [] do
         # No live promoted members remain. Keep the newly touched empty
@@ -1049,6 +1056,13 @@ defmodule Ferricstore.Store.Shard.Compound do
       {{key, exp, _file_path, _off}, value} when is_binary(value) -> {key, value, exp}
       {_entry, _value} -> nil
     end)
+  end
+
+  defp maybe_run_promoted_compaction_after_collect_hook(redis_key, live_entries) do
+    case Process.get(:ferricstore_promoted_compaction_after_collect_hook) do
+      fun when is_function(fun, 2) -> fun.(redis_key, live_entries)
+      _ -> :ok
+    end
   end
 
   defp emit_promoted_cold_read_errors(entries, values) do

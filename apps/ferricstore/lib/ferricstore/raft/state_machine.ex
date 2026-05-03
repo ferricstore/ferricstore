@@ -1565,7 +1565,9 @@ defmodule Ferricstore.Raft.StateMachine do
       {:ok, byte_size(new_val)}
     end
 
-    promoted_put = fn compound_key, value, expire_at_ms, dedicated_path ->
+    promoted_put = fn redis_key, compound_key, value, expire_at_ms, dedicated_path ->
+      Promotion.await_compaction_latch(anchor_state, redis_key)
+
       value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
       disk_val = to_disk_binary(value)
       active = Promotion.find_active(dedicated_path)
@@ -1610,7 +1612,9 @@ defmodule Ferricstore.Raft.StateMachine do
       end
     end
 
-    promoted_delete = fn compound_key, dedicated_path ->
+    promoted_delete = fn redis_key, compound_key, dedicated_path ->
+      Promotion.await_compaction_latch(anchor_state, redis_key)
+
       if tx_binary_ref do
         bytes =
           case :ets.lookup(ctx.keydir, compound_key) do
@@ -1683,14 +1687,17 @@ defmodule Ferricstore.Raft.StateMachine do
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         case promoted_compound_path(ctx, redis_key, compound_key) do
-          nil -> local_put.(compound_key, value, expire_at_ms)
-          dedicated_path -> promoted_put.(compound_key, value, expire_at_ms, dedicated_path)
+          nil ->
+            local_put.(compound_key, value, expire_at_ms)
+
+          dedicated_path ->
+            promoted_put.(redis_key, compound_key, value, expire_at_ms, dedicated_path)
         end
       end,
       compound_delete: fn redis_key, compound_key ->
         case promoted_compound_path(ctx, redis_key, compound_key) do
           nil -> local_delete.(compound_key)
-          dedicated_path -> promoted_delete.(compound_key, dedicated_path)
+          dedicated_path -> promoted_delete.(redis_key, compound_key, dedicated_path)
         end
       end,
       compound_scan: fn redis_key, prefix ->
@@ -5348,14 +5355,24 @@ defmodule Ferricstore.Raft.StateMachine do
         do_put(state, compound_key, value, expire_at_ms)
 
       dedicated_path ->
-        do_promoted_compound_put(state, compound_key, value, expire_at_ms, dedicated_path)
+        do_promoted_compound_put(
+          state,
+          redis_key,
+          compound_key,
+          value,
+          expire_at_ms,
+          dedicated_path
+        )
     end
   end
 
   defp do_compound_delete(state, redis_key, compound_key) do
     case promoted_compound_path(state, redis_key, compound_key) do
-      nil -> do_delete(state, compound_key)
-      dedicated_path -> do_promoted_compound_delete(state, compound_key, dedicated_path)
+      nil ->
+        do_delete(state, compound_key)
+
+      dedicated_path ->
+        do_promoted_compound_delete(state, redis_key, compound_key, dedicated_path)
     end
   end
 
@@ -5378,7 +5395,16 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp do_promoted_compound_put(state, compound_key, value, expire_at_ms, dedicated_path) do
+  defp do_promoted_compound_put(
+         state,
+         redis_key,
+         compound_key,
+         value,
+         expire_at_ms,
+         dedicated_path
+       ) do
+    Promotion.await_compaction_latch(state, redis_key)
+
     value_for = value_for_ets(value, hot_cache_threshold(state))
     disk_val = to_disk_binary(value)
     active = Promotion.find_active(dedicated_path)
@@ -5409,7 +5435,9 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp do_promoted_compound_delete(state, compound_key, dedicated_path) do
+  defp do_promoted_compound_delete(state, redis_key, compound_key, dedicated_path) do
+    Promotion.await_compaction_latch(state, redis_key)
+
     track_keydir_binary_remove(state, compound_key)
     active = Promotion.find_active(dedicated_path)
 
