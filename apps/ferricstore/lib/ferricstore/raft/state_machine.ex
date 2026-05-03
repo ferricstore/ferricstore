@@ -1042,8 +1042,14 @@ defmodule Ferricstore.Raft.StateMachine do
     {state, result}
   end
 
-  defp record_cursor_metric(%{instance_ctx: instance_ctx, shard_index: shard_index}, field, index)
-       when is_map(instance_ctx) and is_atom(field) and is_integer(index) and index >= 0 do
+  defp record_cursor_metric(%{shard_index: shard_index} = state, field, index)
+       when is_atom(field) and is_integer(index) and index >= 0 do
+    instance_ctx =
+      case Map.get(state, :instance_ctx) do
+        ctx when is_map(ctx) -> ctx
+        _ -> instance_ctx_by_name(Map.get(state, :instance_name, :default))
+      end
+
     case Map.get(instance_ctx, field) do
       ref when is_reference(ref) ->
         size = :atomics.info(ref).size

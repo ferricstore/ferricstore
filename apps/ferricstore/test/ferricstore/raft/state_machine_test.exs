@@ -2164,6 +2164,39 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert :atomics.get(last_released_cursor_index, shard_index + 1) == 42
     end
 
+    test "release cursor metrics resolve instance context by name like production Raft config", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      instance_name = :"cursor_metric_instance_#{System.unique_integer([:positive])}"
+      root = Path.join(System.tmp_dir!(), Atom.to_string(instance_name))
+      File.rm_rf!(root)
+      File.mkdir_p!(root)
+
+      instance_ctx = FerricStore.Instance.build(instance_name, shard_count: shard_index + 1, data_dir: root)
+
+      on_exit({:cursor_metric_instance, instance_name}, fn ->
+        FerricStore.Instance.cleanup(instance_name)
+        File.rm_rf!(root)
+      end)
+
+      state = %{
+        state
+        | release_cursor_interval: 1,
+          instance_ctx: nil,
+          instance_name: instance_name
+      }
+
+      meta = %{index: 77, term: 1, system_time: System.os_time(:millisecond)}
+
+      {_new_state, {:applied_at, 77, nil}, effects} =
+        StateMachine.apply(meta, {:getdel, "released_cursor_metric_by_name_missing"}, state)
+
+      assert Enum.any?(effects, &match?({:release_cursor, 77, _}, &1))
+      assert :atomics.get(instance_ctx.last_applied_index, shard_index + 1) == 77
+      assert :atomics.get(instance_ctx.last_released_cursor_index, shard_index + 1) == 77
+    end
+
     test "release_cursor waits while checkpoint fsync is in flight", %{
       state: state,
       shard_index: shard_index
