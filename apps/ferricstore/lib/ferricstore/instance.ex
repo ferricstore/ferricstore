@@ -249,7 +249,7 @@ defmodule FerricStore.Instance do
       keydir_max_ram: keydir_max_ram,
       memory_limit: memory_limit,
       keydir_binary_bytes: keydir_binary_bytes,
-      raft_enabled: Keyword.get(opts, :raft_enabled, true),
+      raft_enabled: raft_enabled(name, opts),
       durability_mode: :all_quorum,
       hotness_table: hotness_table,
       config_table: config_table,
@@ -317,6 +317,9 @@ defmodule FerricStore.Instance do
   rescue
     ArgumentError -> :error
   end
+
+  defp raft_enabled(:default, opts), do: Keyword.get(opts, :raft_enabled, true)
+  defp raft_enabled(_name, _opts), do: false
 
   defp cleanup_instance_tables({:ok, %__MODULE__{name: :default}}), do: :ok
   defp cleanup_instance_tables(:error), do: :ok

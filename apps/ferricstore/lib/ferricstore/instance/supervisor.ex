@@ -2,11 +2,11 @@ defmodule FerricStore.Instance.Supervisor do
   @moduledoc """
   Per-instance supervision tree for a FerricStore instance.
 
-  Starts all processes needed for the instance: shards, batchers,
-  writers, merge schedulers, Raft system, MemoryGuard, Stats, etc.
+  Starts the custom instance shard tree and merge scheduler.
 
-  Each instance is fully isolated — its own ETS tables, Raft WAL,
-  data directory, and process tree.
+  Custom instances are local/direct only. The default application instance owns
+  the Raft system; allowing embedded instances to opt into Raft would collide
+  with default shard/server names until per-instance Raft systems exist.
   """
 
   use Supervisor
@@ -76,15 +76,10 @@ defmodule FerricStore.Instance.Supervisor do
   defp normalize_raft_opts(:default, opts), do: {:ok, opts}
 
   defp normalize_raft_opts(name, opts) do
-    case Keyword.fetch(opts, :raft_enabled) do
-      {:ok, true} ->
-        {:error, {:unsupported_custom_raft_instance, name}}
-
-      {:ok, false} ->
-        {:ok, opts}
-
-      :error ->
-        {:ok, Keyword.put(opts, :raft_enabled, false)}
+    if Keyword.has_key?(opts, :raft_enabled) do
+      {:error, {:unsupported_custom_option, name, :raft_enabled}}
+    else
+      {:ok, opts}
     end
   end
 end

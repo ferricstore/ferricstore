@@ -3,15 +3,11 @@ defmodule Ferricstore.InstanceTest do
   use ExUnit.Case, async: false
 
   defmodule EmbeddedA do
-    use FerricStore, shard_count: 1, raft_enabled: false
+    use FerricStore, shard_count: 1
   end
 
   defmodule EmbeddedB do
-    use FerricStore, shard_count: 1, raft_enabled: false
-  end
-
-  defmodule EmbeddedRaftRequested do
-    use FerricStore, shard_count: 1, raft_enabled: true
+    use FerricStore, shard_count: 1
   end
 
   defmodule EmbeddedDefaultOptions do
@@ -40,20 +36,20 @@ defmodule Ferricstore.InstanceTest do
         File.rm_rf(root)
       end)
 
-      assert {:ok, _pid_a} =
-               EmbeddedA.start_link(data_dir: dir_a, shard_count: 1, raft_enabled: false)
+      assert {:ok, _pid_a} = EmbeddedA.start_link(data_dir: dir_a, shard_count: 1)
 
-      assert {:ok, _pid_b} =
-               EmbeddedB.start_link(data_dir: dir_b, shard_count: 1, raft_enabled: false)
+      assert {:ok, _pid_b} = EmbeddedB.start_link(data_dir: dir_b, shard_count: 1)
 
       assert :ok = EmbeddedA.set("same-key", "from-a")
       assert :ok = EmbeddedB.set("same-key", "from-b")
 
       assert {:ok, "from-a"} = EmbeddedA.get("same-key")
       assert {:ok, "from-b"} = EmbeddedB.get("same-key")
+      assert false == EmbeddedA.__instance__().raft_enabled
+      assert false == EmbeddedB.__instance__().raft_enabled
     end
 
-    test "custom instances fail closed when Raft is requested" do
+    test "custom instances reject the raft_enabled option" do
       root =
         Path.join(
           System.tmp_dir!(),
@@ -63,15 +59,24 @@ defmodule Ferricstore.InstanceTest do
       File.rm_rf!(root)
 
       on_exit(fn ->
-        EmbeddedRaftRequested.stop()
         File.rm_rf(root)
       end)
 
-      assert {:error, {:unsupported_custom_raft_instance, EmbeddedRaftRequested}} =
-               EmbeddedRaftRequested.start_link(
+      assert_raise ArgumentError,
+                   ~r/:raft_enabled is not supported for custom FerricStore instances/,
+                   fn ->
+                     Code.compile_string("""
+                     defmodule Ferricstore.InstanceTest.EmbeddedRaftRequested#{System.unique_integer([:positive])} do
+                       use FerricStore, shard_count: 1, raft_enabled: true
+                     end
+                     """)
+                   end
+
+      assert {:error, {:unsupported_custom_option, EmbeddedA, :raft_enabled}} =
+               EmbeddedA.start_link(
                  data_dir: root,
                  shard_count: 1,
-                 raft_enabled: true
+                 raft_enabled: false
                )
 
       ctx = FerricStore.Instance.get(:default)
@@ -98,6 +103,18 @@ defmodule Ferricstore.InstanceTest do
       assert false == EmbeddedDefaultOptions.__instance__().raft_enabled
       assert :ok = EmbeddedDefaultOptions.set("same-key", "local")
       assert {:ok, "local"} = EmbeddedDefaultOptions.get("same-key")
+    end
+
+    test "direct custom instance builds force non-Raft mode" do
+      name = :"custom_direct_build_#{System.unique_integer([:positive])}"
+
+      ctx = FerricStore.Instance.build(name, shard_count: 1, raft_enabled: true)
+
+      try do
+        assert false == ctx.raft_enabled
+      after
+        FerricStore.Instance.cleanup(name)
+      end
     end
 
     test "custom instances start isolated merge schedulers" do

@@ -2,8 +2,9 @@ defmodule FerricStore do
   @moduledoc """
   Module-based cache instances for FerricStore.
 
-  Each module that calls `use FerricStore` gets its own fully isolated
-  cache instance with its own shards, ETS tables, Raft system, and config.
+  Each module that calls `use FerricStore` gets a local direct cache instance
+  with its own shards, ETS tables, data directory, and config. The default
+  application instance owns the Raft system.
 
   ## Usage
 

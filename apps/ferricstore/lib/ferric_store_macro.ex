@@ -20,12 +20,18 @@ defmodule FerricStore.Macro do
   """
 
   defmacro __using__(opts) do
+    if Keyword.has_key?(opts, :raft_enabled) do
+      raise ArgumentError,
+            ":raft_enabled is not supported for custom FerricStore instances; Raft is owned by the default application instance"
+    end
+
     # credo:disable-for-next-line Credo.Check.Refactor.LongQuoteBlocks
     quote do
       @ferricstore_opts unquote(opts)
 
       def child_spec(overrides \\ []) do
         opts = Keyword.merge(@ferricstore_opts, overrides)
+
         %{
           id: __MODULE__,
           start: {FerricStore.Instance.Supervisor, :start_link, [__MODULE__, opts]},
@@ -40,6 +46,7 @@ defmodule FerricStore.Macro do
 
       def stop do
         name = :"#{__MODULE__}.Supervisor"
+
         if pid = Process.whereis(name) do
           try do
             Supervisor.stop(pid)
@@ -49,6 +56,7 @@ defmodule FerricStore.Macro do
 
           FerricStore.Instance.cleanup(__MODULE__)
         end
+
         :ok
       end
 
