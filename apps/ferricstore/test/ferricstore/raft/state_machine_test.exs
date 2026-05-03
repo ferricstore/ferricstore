@@ -881,6 +881,192 @@ defmodule Ferricstore.Raft.StateMachineTest do
                :ets.lookup(ets, "cross_durable")
     end
 
+    test "failed cross-shard multi-target append does not leave replayable partial records", %{
+      state: state,
+      ets: ets,
+      active_file_path: shard0_file
+    } do
+      root =
+        Path.join(System.tmp_dir!(), "sm_cross_partial_#{System.unique_integer([:positive])}")
+
+      shard0 = 0
+      shard1 = 1
+      shard1_path = Ferricstore.DataDir.shard_data_path(root, shard1)
+      shard1_bad_active = Path.join(shard1_path, "active_is_directory.log")
+      ets1 = :ets.new(:"sm_cross_partial_#{System.unique_integer([:positive])}", [:set, :public])
+      instance_name = :"sm_cross_partial_#{System.unique_integer([:positive])}"
+
+      File.mkdir_p!(shard1_bad_active)
+      Ferricstore.Store.ActiveFile.init(2)
+
+      instance_ctx = %{
+        name: instance_name,
+        data_dir: root,
+        shard_count: 2,
+        keydir_refs: List.to_tuple([ets, ets1]),
+        keydir_binary_bytes: :atomics.new(2, signed: false),
+        checkpoint_flags: :atomics.new(shard1 + 1, signed: false),
+        checkpoint_in_flight: :atomics.new(shard1 + 1, signed: false),
+        disk_pressure: :atomics.new(shard1 + 1, signed: false),
+        hot_cache_max_value_size: 64
+      }
+
+      Ferricstore.Store.ActiveFile.publish(
+        instance_ctx,
+        shard0,
+        0,
+        shard0_file,
+        state.shard_data_path
+      )
+
+      Ferricstore.Store.ActiveFile.publish(
+        instance_ctx,
+        shard1,
+        0,
+        shard1_bad_active,
+        shard1_path
+      )
+
+      state = %{state | shard_index: shard0, instance_ctx: instance_ctx}
+
+      try do
+        {_new_state, {:error, {:bitcask_append_failed, _reason}}} =
+          StateMachine.apply(
+            %{system_time: Ferricstore.HLC.now_ms()},
+            {:cross_shard_tx,
+             [
+               {shard0, [{"SET", ["partial_success", "must-not-replay"]}], nil},
+               {shard1, [{"SET", ["partial_failure", "fail"]}], nil}
+             ]},
+            state
+          )
+
+        assert [] = :ets.lookup(ets, "partial_success")
+
+        recovered =
+          :ets.new(:"sm_cross_partial_recovered_#{System.unique_integer([:positive])}", [
+            :set,
+            :public
+          ])
+
+        try do
+          Ferricstore.Store.Shard.Lifecycle.recover_keydir(
+            state.shard_data_path,
+            recovered,
+            shard0,
+            instance_ctx
+          )
+
+          assert [] = :ets.lookup(recovered, "partial_success")
+        after
+          :ets.delete(recovered)
+        end
+      after
+        :ets.delete(ets1)
+        Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)
+        File.rm_rf!(root)
+      end
+    end
+
+    test "failed cross-shard multi-target overwrite restores replayable original record", %{
+      state: state,
+      ets: ets,
+      active_file_path: shard0_file
+    } do
+      root =
+        Path.join(System.tmp_dir!(), "sm_cross_partial_#{System.unique_integer([:positive])}")
+
+      shard0 = 0
+      shard1 = 1
+      shard1_path = Ferricstore.DataDir.shard_data_path(root, shard1)
+      shard1_bad_active = Path.join(shard1_path, "active_is_directory.log")
+      ets1 = :ets.new(:"sm_cross_partial_#{System.unique_integer([:positive])}", [:set, :public])
+      instance_name = :"sm_cross_partial_#{System.unique_integer([:positive])}"
+
+      {:ok, {old_offset, old_size}} =
+        NIF.v2_append_record(shard0_file, "partial_existing", "old", 0)
+
+      :ets.insert(
+        ets,
+        {"partial_existing", "old", 0, Ferricstore.Store.LFU.initial(), 0, old_offset, old_size}
+      )
+
+      File.mkdir_p!(shard1_bad_active)
+      Ferricstore.Store.ActiveFile.init(2)
+
+      instance_ctx = %{
+        name: instance_name,
+        data_dir: root,
+        shard_count: 2,
+        keydir_refs: List.to_tuple([ets, ets1]),
+        keydir_binary_bytes: :atomics.new(2, signed: false),
+        checkpoint_flags: :atomics.new(shard1 + 1, signed: false),
+        checkpoint_in_flight: :atomics.new(shard1 + 1, signed: false),
+        disk_pressure: :atomics.new(shard1 + 1, signed: false),
+        hot_cache_max_value_size: 64
+      }
+
+      Ferricstore.Store.ActiveFile.publish(
+        instance_ctx,
+        shard0,
+        0,
+        shard0_file,
+        state.shard_data_path
+      )
+
+      Ferricstore.Store.ActiveFile.publish(
+        instance_ctx,
+        shard1,
+        0,
+        shard1_bad_active,
+        shard1_path
+      )
+
+      state = %{state | shard_index: shard0, instance_ctx: instance_ctx}
+
+      try do
+        {_new_state, {:error, {:bitcask_append_failed, _reason}}} =
+          StateMachine.apply(
+            %{system_time: Ferricstore.HLC.now_ms()},
+            {:cross_shard_tx,
+             [
+               {shard0, [{"SET", ["partial_existing", "new"]}], nil},
+               {shard1, [{"SET", ["partial_failure", "fail"]}], nil}
+             ]},
+            state
+          )
+
+        assert [{"partial_existing", "old", 0, _, 0, ^old_offset, ^old_size}] =
+                 :ets.lookup(ets, "partial_existing")
+
+        recovered =
+          :ets.new(:"sm_cross_partial_recovered_#{System.unique_integer([:positive])}", [
+            :set,
+            :public
+          ])
+
+        try do
+          Ferricstore.Store.Shard.Lifecycle.recover_keydir(
+            state.shard_data_path,
+            recovered,
+            shard0,
+            instance_ctx
+          )
+
+          assert [{"partial_existing", nil, 0, _, 0, recovered_offset, 3}] =
+                   :ets.lookup(recovered, "partial_existing")
+
+          assert {:ok, "old"} = NIF.v2_pread_at(shard0_file, recovered_offset)
+        after
+          :ets.delete(recovered)
+        end
+      after
+        :ets.delete(ets1)
+        Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)
+        File.rm_rf!(root)
+      end
+    end
+
     test "cross-shard dispatched large SET has a cold location before acknowledgement", %{
       state: state,
       ets: ets,

@@ -411,6 +411,10 @@ defmodule Ferricstore.Raft.StateMachine do
           new_state = %{state | applied_count: old_count + 1}
           maybe_release_cursor(meta, old_count, new_state, error)
 
+        {:error, reason, flushed_state} ->
+          new_state = %{flushed_state | applied_count: old_count + 1}
+          maybe_release_cursor(meta, old_count, new_state, {:error, reason})
+
         {shard_results, flushed_state} ->
           new_state = %{flushed_state | applied_count: old_count + 1}
           maybe_release_cursor(meta, old_count, new_state, shard_results)
@@ -3032,9 +3036,16 @@ defmodule Ferricstore.Raft.StateMachine do
         {:ok, flushed_state} ->
           {result, flushed_state}
 
-        {:error, _reason} = error ->
+        {:error, reason, partial_state, successful_groups} ->
+          compensated_state =
+            compensate_cross_shard_partial_writes(
+              partial_state,
+              successful_groups,
+              Process.get(:sm_cross_shard_pending_originals, %{})
+            )
+
           rollback_cross_shard_pending_writes(state)
-          error
+          {:error, reason, compensated_state}
       end
     after
       Process.delete(:sm_cross_shard_pending_writes)
@@ -3050,8 +3061,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
     pending
     |> Enum.group_by(&cross_shard_pending_target/1)
-    |> Enum.reduce_while({:ok, state}, fn {{idx, file_path, file_id, keydir}, entries},
-                                          {:ok, acc_state} ->
+    |> Enum.reduce_while({:ok, state, []}, fn {{idx, file_path, file_id, keydir}, entries},
+                                              {:ok, acc_state, successful_groups} ->
       batch = Enum.map(entries, &cross_shard_pending_to_batch_entry/1)
       append_result = append_pending_batch(file_path, batch)
       validated_append_result = validate_append_result(batch, append_result)
@@ -3070,12 +3081,17 @@ defmodule Ferricstore.Raft.StateMachine do
             )
             |> mark_cross_shard_checkpoint_dirty(idx)
 
-          {:cont, {:ok, acc_state}}
+          group = {idx, file_path, file_id, keydir, entries}
+          {:cont, {:ok, acc_state, [group | successful_groups]}}
 
         {:error, reason} ->
-          {:halt, {:error, {:bitcask_append_failed, reason}}}
+          {:halt, {:error, {:bitcask_append_failed, reason}, acc_state, successful_groups}}
       end
     end)
+    |> case do
+      {:ok, flushed_state, _successful_groups} -> {:ok, flushed_state}
+      {:error, _reason, _partial_state, _successful_groups} = error -> error
+    end
   end
 
   defp cross_shard_pending_target(
@@ -3115,6 +3131,82 @@ defmodule Ferricstore.Raft.StateMachine do
         :ok
     end)
   end
+
+  defp compensate_cross_shard_partial_writes(state, successful_groups, originals) do
+    Enum.reduce(successful_groups, state, fn {idx, file_path, file_id, keydir, entries},
+                                             acc_state ->
+      compensation_batch =
+        entries
+        |> Enum.map(&cross_shard_pending_key/1)
+        |> Enum.uniq()
+        |> Enum.flat_map(fn key ->
+          cross_shard_compensation_batch_entry(
+            key,
+            Map.get(originals, {keydir, key}, {idx, :missing}),
+            file_path
+          )
+        end)
+
+      case compensation_batch do
+        [] ->
+          acc_state
+
+        _ ->
+          case append_pending_batch(file_path, compensation_batch) do
+            {:ok, _locations} ->
+              acc_state
+              |> track_cross_shard_append_bytes(
+                idx,
+                file_path,
+                file_id,
+                bitcask_record_bytes(compensation_batch)
+              )
+              |> mark_cross_shard_checkpoint_dirty(idx)
+
+            {:error, _reason} ->
+              mark_cross_shard_checkpoint_dirty(acc_state, idx)
+          end
+      end
+    end)
+  end
+
+  defp cross_shard_pending_key(
+         {:put, _idx, _keydir, _file_path, _file_id, key, _ets, _disk, _exp}
+       ),
+       do: key
+
+  defp cross_shard_pending_key({:delete, _idx, _keydir, _file_path, _file_id, key}), do: key
+
+  defp cross_shard_compensation_batch_entry(key, {_idx, :missing}, _file_path) do
+    [{:delete, key, nil}]
+  end
+
+  defp cross_shard_compensation_batch_entry(
+         key,
+         {_idx,
+          {:entry, {original_key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size}}},
+         _file_path
+       )
+       when original_key == key and is_binary(value) do
+    [{:put, key, value, expire_at_ms}]
+  end
+
+  defp cross_shard_compensation_batch_entry(
+         key,
+         {_idx, {:entry, {original_key, nil, expire_at_ms, _lfu, file_id, offset, _value_size}}},
+         file_path
+       )
+       when original_key == key do
+    shard_data_path = Path.dirname(file_path)
+    old_path = sm_file_path_from_path(shard_data_path, file_id)
+
+    case NIF.v2_pread_at(old_path, offset) do
+      {:ok, value} when is_binary(value) -> [{:put, key, value, expire_at_ms}]
+      _ -> []
+    end
+  end
+
+  defp cross_shard_compensation_batch_entry(_key, _original, _file_path), do: []
 
   defp record_cross_shard_pending_original(ctx, key) do
     originals = Process.get(:sm_cross_shard_pending_originals, %{})
