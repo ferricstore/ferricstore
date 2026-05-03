@@ -3719,7 +3719,7 @@ defmodule Ferricstore.Raft.StateMachine do
       # Compound ops: redis_key and compound_key live on the same shard by
       # design, so treat them identically to plain get/put/delete.
       compound_get: fn rk, ck ->
-        case do_get(state, ck) do
+        case sm_store_compound_get(state, rk, ck) do
           nil ->
             case instance_ctx_for_state(state) do
               nil -> nil
@@ -3730,8 +3730,8 @@ defmodule Ferricstore.Raft.StateMachine do
             value
         end
       end,
-      compound_get_meta: fn _rk, ck ->
-        case do_get_meta(state, ck) do
+      compound_get_meta: fn rk, ck ->
+        case sm_store_compound_get_meta(state, rk, ck) do
           nil -> nil
           {v, exp} -> {v, exp}
         end
@@ -3750,23 +3750,22 @@ defmodule Ferricstore.Raft.StateMachine do
         do_delete(state, ck)
         :ok
       end,
-      compound_scan: fn _rk, prefix ->
+      compound_scan: fn rk, prefix ->
         local_keys = sm_store_compound_local_keys(state, prefix)
 
         if local_keys != [] do
-          sm_store_compound_scan(state, local_keys)
+          sm_store_compound_scan(state, rk, prefix, local_keys)
         else
           case instance_ctx_for_state(state) do
             nil ->
               []
 
             ctx ->
-              redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
-              Router.compound_scan(ctx, redis_key, prefix)
+              Router.compound_scan(ctx, rk, prefix)
           end
         end
       end,
-      compound_count: fn _rk, prefix ->
+      compound_count: fn rk, prefix ->
         local_count =
           state
           |> sm_store_compound_local_keys(prefix)
@@ -3780,8 +3779,7 @@ defmodule Ferricstore.Raft.StateMachine do
               0
 
             ctx ->
-              redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
-              Router.compound_count(ctx, redis_key, prefix)
+              Router.compound_count(ctx, rk, prefix)
           end
         end
       end,
@@ -3810,8 +3808,45 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
-  defp sm_store_compound_scan(state, local_keys) do
-    values = sm_store_batch_get(state, local_keys)
+  defp sm_store_compound_get(state, redis_key, compound_key) do
+    case sm_store_compound_path_fun(state, redis_key, compound_key) do
+      nil ->
+        do_get(state, compound_key)
+
+      path_fun ->
+        case sm_store_batch_get(state, [compound_key], path_fun) do
+          [value] -> value
+          _ -> nil
+        end
+    end
+  end
+
+  defp sm_store_compound_get_meta(state, redis_key, compound_key) do
+    case sm_store_compound_path_fun(state, redis_key, compound_key) do
+      nil ->
+        do_get_meta(state, compound_key)
+
+      path_fun ->
+        case sm_store_batch_get(state, [compound_key], path_fun) do
+          [value] when is_binary(value) ->
+            case :ets.lookup(state.ets, compound_key) do
+              [{^compound_key, _ets_value, exp, _lfu, _fid, _off, _vsize}] -> {value, exp}
+              _ -> nil
+            end
+
+          _ ->
+            nil
+        end
+    end
+  end
+
+  defp sm_store_compound_scan(state, redis_key, prefix, local_keys) do
+    path_fun = sm_store_compound_path_fun(state, redis_key, prefix) || (&sm_file_path/2)
+    sm_store_compound_scan(state, local_keys, path_fun)
+  end
+
+  defp sm_store_compound_scan(state, local_keys, path_fun) do
+    values = sm_store_batch_get(state, local_keys, path_fun)
 
     local_keys
     |> Enum.zip(values)
@@ -3820,6 +3855,13 @@ defmodule Ferricstore.Raft.StateMachine do
       {_key, _value} -> []
     end)
     |> Enum.sort_by(fn {field, _value} -> field end)
+  end
+
+  defp sm_store_compound_path_fun(state, redis_key, compound_key_or_prefix) do
+    case promoted_compound_path(state, redis_key, compound_key_or_prefix) do
+      nil -> nil
+      dedicated_path -> fn _state, fid -> sm_file_path_from_path(dedicated_path, fid) end
+    end
   end
 
   defp sm_store_live_local_key?(state, key) do
@@ -3849,7 +3891,9 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp sm_store_batch_get(state, keys) do
+  defp sm_store_batch_get(state, keys), do: sm_store_batch_get(state, keys, &sm_file_path/2)
+
+  defp sm_store_batch_get(state, keys, path_fun) do
     {local_results, cold_reads, remote_entries} =
       keys
       |> Enum.with_index()
@@ -3857,7 +3901,7 @@ defmodule Ferricstore.Raft.StateMachine do
         sm_store_collect_batch_get(state, key, index, results, cold, remote)
       end)
 
-    results = sm_store_read_cold_batch(state, local_results, Enum.reverse(cold_reads))
+    results = sm_store_read_cold_batch(state, local_results, Enum.reverse(cold_reads), path_fun)
 
     remote_entries
     |> Enum.reverse()
@@ -3905,12 +3949,12 @@ defmodule Ferricstore.Raft.StateMachine do
       {results, cold, [{index, key} | remote]}
   end
 
-  defp sm_store_read_cold_batch(_state, results, []), do: results
+  defp sm_store_read_cold_batch(_state, results, [], _path_fun), do: results
 
-  defp sm_store_read_cold_batch(state, results, cold_reads) do
+  defp sm_store_read_cold_batch(state, results, cold_reads, path_fun) do
     locations =
       Enum.map(cold_reads, fn {_index, _key, _exp, fid, off} ->
-        {sm_file_path(state, fid), off}
+        {path_fun.(state, fid), off}
       end)
 
     values =

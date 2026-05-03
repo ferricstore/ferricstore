@@ -502,6 +502,54 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert [{^member_key, ^score, 0, _lfu, 0, ^cold_offset, ^cold_size}] =
                :ets.lookup(ets, member_key)
     end
+
+    test "compound_scan reads cold promoted zset values from dedicated Bitcask", %{
+      state: state,
+      ets: ets
+    } do
+      key = "geo_promoted_cold_scan_#{System.unique_integer([:positive])}"
+      member_key = CompoundKey.zset_member(key, "Palermo")
+
+      {_state2, 1} =
+        StateMachine.apply(
+          %{},
+          {:geo_op, "GEOADD", [key, "13.361389", "38.115556", "Palermo"]},
+          state
+        )
+
+      [{^member_key, score, 0, _lfu, _file_id, _offset, _value_size}] =
+        :ets.lookup(ets, member_key)
+
+      dedicated_path =
+        Ferricstore.Store.Promotion.dedicated_path(
+          state.data_dir,
+          state.shard_index,
+          :zset,
+          key
+        )
+
+      File.mkdir_p!(dedicated_path)
+      dedicated_file = Path.join(dedicated_path, "00000.log")
+      File.touch!(dedicated_file)
+
+      {:ok, [{cold_offset, cold_size}]} =
+        NIF.v2_append_batch(dedicated_file, [{member_key, score, 0}])
+
+      :ets.insert(ets, {member_key, nil, 0, 1, 0, cold_offset, cold_size})
+
+      {_state3, result} =
+        StateMachine.apply(
+          %{},
+          {:geo_op, "GEOSEARCH",
+           [key, "FROMLONLAT", "13.361389", "38.115556", "BYRADIUS", "1", "KM"]},
+          state
+        )
+
+      assert ["Palermo"] == result
+
+      assert [{^member_key, ^score, 0, _lfu, 0, ^cold_offset, ^cold_size}] =
+               :ets.lookup(ets, member_key)
+    end
   end
 
   # ---------------------------------------------------------------------------
