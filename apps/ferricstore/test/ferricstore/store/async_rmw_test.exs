@@ -21,6 +21,8 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Raft.Batcher
+  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.BitcaskWriter
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.RmwCoordinator
   alias Ferricstore.Test.IsolatedInstance
@@ -265,6 +267,24 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       :ok = Router.put(ctx(), k, "value", 0)
       assert "value" = Router.getdel(ctx(), k)
       assert Router.get(ctx(), k) == nil
+    end
+
+    test "GETDEL persists a single tombstone after async Ra apply" do
+      c = ctx()
+      k = ukey("getdel_single_tombstone")
+      idx = Router.shard_for(c, k)
+
+      :ok = Router.put(c, k, "value", 0)
+      :ok = Batcher.flush(idx)
+      :ok = BitcaskWriter.flush_all(c.shard_count)
+
+      assert "value" = Router.getdel(c, k)
+      assert Router.get(c, k) == nil
+
+      :ok = Batcher.flush(idx)
+      :ok = BitcaskWriter.flush_all(c.shard_count)
+
+      assert tombstone_count(c, k) == 1
     end
 
     test "GETDEL on nonexistent returns nil" do
@@ -917,5 +937,26 @@ defmodule Ferricstore.Store.AsyncRmwTest do
     lines
     |> Enum.at(line_no - 1, "")
     |> String.trim()
+  end
+
+  defp tombstone_count(ctx, key) do
+    idx = Router.shard_for(ctx, key)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+
+    shard_path
+    |> Path.join("*.log")
+    |> Path.wildcard()
+    |> Enum.reduce(0, fn path, acc ->
+      case NIF.v2_scan_tombstones(path) do
+        {:ok, tombstones} ->
+          acc +
+            Enum.count(tombstones, fn {tombstone_key, _off, _size, _exp} ->
+              tombstone_key == key
+            end)
+
+        {:error, _reason} ->
+          acc
+      end
+    end)
   end
 end
