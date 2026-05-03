@@ -794,10 +794,12 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   end
 
   defp expire_shared_key(state, key) do
+    tracked_state = ShardFlush.track_delete_dead_bytes(state, key)
+
     case NIF.v2_append_tombstone(state.active_file_path, key) do
       {:ok, _} ->
-        ShardETS.ets_delete_key(state, key)
-        state
+        ShardETS.ets_delete_key(tracked_state, key)
+        tracked_state
 
       {:error, reason} ->
         Logger.warning(

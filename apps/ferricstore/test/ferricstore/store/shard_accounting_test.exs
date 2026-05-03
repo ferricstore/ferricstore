@@ -6,6 +6,7 @@ defmodule Ferricstore.Store.ShardAccountingTest do
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
+  alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
 
   @record_header_size 26
 
@@ -155,6 +156,51 @@ defmodule Ferricstore.Store.ShardAccountingTest do
         stats = ShardFlush.compute_file_stats(dir, keydir)
 
         assert stats[0] == {100, 100 - (@record_header_size + byte_size(key))}
+      after
+        File.rm_rf(dir)
+        :ets.delete(keydir)
+      end
+    end
+
+    test "expiry sweep counts old shared records as dead bytes" do
+      keydir = new_keydir()
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore-expiry-accounting-#{System.unique_integer([:positive])}"
+        )
+
+      key = "accounting:expiry:dead"
+      old_fid = 2
+      old_value_size = 7
+      old_dead = 3
+      old_total = 150
+      active_path = Path.join(dir, "00003.log")
+      expired_at = Ferricstore.HLC.now_ms() - 1_000
+
+      try do
+        File.mkdir_p!(dir)
+        File.touch!(active_path)
+        :ets.insert(keydir, {key, nil, expired_at, LFU.initial(), old_fid, 8, old_value_size})
+
+        state = %{
+          index: 0,
+          keydir: keydir,
+          active_file_path: active_path,
+          file_stats: %{old_fid => {old_total, old_dead}},
+          promoted_instances: %{},
+          instance_ctx: nil,
+          sweep_at_ceiling_count: 0,
+          sweep_struggling: false
+        }
+
+        state = ShardLifecycle.do_expiry_sweep(state)
+
+        assert :ets.lookup(keydir, key) == []
+
+        assert state.file_stats[old_fid] ==
+                 {old_total, old_dead + @record_header_size + byte_size(key) + old_value_size}
       after
         File.rm_rf(dir)
         :ets.delete(keydir)
