@@ -57,7 +57,11 @@ defmodule Ferricstore.Test.ShardHelpers do
 
     for i <- 0..(shard_count - 1) do
       try do
-        active_path = :persistent_term.get({:ferricstore_active_file_path, i}, nil)
+        active_path =
+          case Ferricstore.Store.ActiveFile.get(i) do
+            {_file_id, path, _shard_data_path} -> path
+            _ -> nil
+          end
 
         if active_path && File.exists?(active_path) do
           Ferricstore.Bitcask.NIF.v2_fsync(active_path)
