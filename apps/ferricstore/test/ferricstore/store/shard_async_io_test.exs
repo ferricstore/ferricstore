@@ -16,6 +16,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.BitcaskWriter
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Router
@@ -1200,6 +1201,48 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert {flush_offset, _} = flush_pos
       assert {reduce_offset, _} = reduce_pos
       assert flush_offset < reduce_offset
+    end
+
+    test "ignores promoted dedicated entries when compacting shared log files" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+      try do
+        assert :ok = GenServer.call(pid, {:put, "shared_live", "shared-value", 0})
+        assert :ok = GenServer.call(pid, :flush)
+        assert :ok = force_rotate_active_file(pid)
+
+        promoted_key = "promoted_shared_compaction"
+        field_key = CompoundKey.hash_field(promoted_key, "field")
+
+        :sys.replace_state(pid, fn state ->
+          dedicated_path = Path.join([state.shard_data_path, "promoted", promoted_key])
+
+          :ets.insert(
+            state.keydir,
+            {field_key, "dedicated-value", 0, LFU.initial(), 0, 0, byte_size("dedicated-value")}
+          )
+
+          %{
+            state
+            | promoted_instances:
+                Map.put(state.promoted_instances, promoted_key, %{
+                  path: dedicated_path,
+                  type: :hash,
+                  total_bytes: 0,
+                  dead_bytes: 0,
+                  writes_since_compaction: 0,
+                  last_compaction_ms: 0
+                })
+          }
+        end)
+
+        assert {:ok, {1, 0, _reclaimed}} = GenServer.call(pid, {:run_compaction, [0]})
+
+        assert [{^field_key, "dedicated-value", 0, _lfu, 0, 0, _vsize}] =
+                 :ets.lookup(:sys.get_state(pid).keydir, field_key)
+      after
+        cleanup_shard(pid, ctx, dir)
+      end
     end
 
     test "removes stale hint when compacting a rewritten shared log file" do

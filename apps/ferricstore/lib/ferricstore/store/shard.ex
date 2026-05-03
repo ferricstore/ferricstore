@@ -47,6 +47,7 @@ defmodule Ferricstore.Store.Shard do
   use GenServer
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -650,7 +651,7 @@ defmodule Ferricstore.Store.Shard do
         live_entries =
           :ets.foldl(
             fn {key, _value, _exp, _lfu, f, off, _vsize}, acc ->
-              if f == fid, do: [{key, off} | acc], else: acc
+              if shared_compaction_entry?(state, key, f, fid), do: [{key, off} | acc], else: acc
             end,
             [],
             state.keydir
@@ -983,6 +984,29 @@ defmodule Ferricstore.Store.Shard do
     hint_name = "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.hint"
     _ = Ferricstore.FS.rm(Path.join(shard_path, hint_name))
     :ok
+  end
+
+  defp shared_compaction_entry?(state, key, fid, target_fid) do
+    fid == target_fid and not promoted_data_compound_entry?(state, key)
+  end
+
+  # Promoted collection data is stored in dedicated Bitcask dirs but reuses the
+  # same ETS location tuple shape. Shared-log compaction must not interpret
+  # those file ids and offsets as shared-log locations.
+  defp promoted_data_compound_entry?(state, <<"H:", _rest::binary>> = key),
+    do: promoted_parent?(state, key)
+
+  defp promoted_data_compound_entry?(state, <<"S:", _rest::binary>> = key),
+    do: promoted_parent?(state, key)
+
+  defp promoted_data_compound_entry?(state, <<"Z:", _rest::binary>> = key),
+    do: promoted_parent?(state, key)
+
+  defp promoted_data_compound_entry?(_state, _key), do: false
+
+  defp promoted_parent?(state, compound_key) do
+    redis_key = CompoundKey.extract_redis_key(compound_key)
+    Map.has_key?(state.promoted_instances, redis_key)
   end
 
   defp update_compacted_ets_locations(keydir, fid, live_entries, results) do
