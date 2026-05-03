@@ -785,7 +785,6 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       FerricStore.Instance.build(name,
         data_dir: dir,
         shard_count: 2,
-        raft_enabled: false,
         max_memory_bytes: 256 * 1024 * 1024,
         keydir_max_ram: 64 * 1024 * 1024
       )

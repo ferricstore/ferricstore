@@ -40,8 +40,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
     ctx =
       FerricStore.Instance.build(name,
         data_dir: dir,
-        shard_count: 1,
-        raft_enabled: false
+        shard_count: 1
       )
 
     Ferricstore.DataDir.ensure_layout!(dir, 1)
@@ -51,8 +50,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
         index: 0,
         data_dir: dir,
         flush_interval_ms: flush_ms,
-        instance_ctx: ctx,
-        raft_enabled: false
+        instance_ctx: ctx
       )
 
     {pid, 0, dir, ctx}
@@ -64,8 +62,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
         index: 0,
         data_dir: dir,
         flush_interval_ms: flush_ms,
-        instance_ctx: ctx,
-        raft_enabled: false
+        instance_ctx: ctx
       )
 
     pid
@@ -900,8 +897,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       ctx =
         FerricStore.Instance.build(name,
           data_dir: dir,
-          shard_count: 1,
-          raft_enabled: false
+          shard_count: 1
         )
 
       Ferricstore.DataDir.ensure_layout!(dir, 1)
@@ -924,9 +920,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
         File.rm_rf(dir)
       end)
 
-      child =
-        {Shard,
-         index: 0, data_dir: dir, flush_interval_ms: 5000, instance_ctx: ctx, raft_enabled: false}
+      child = {Shard, index: 0, data_dir: dir, flush_interval_ms: 5000, instance_ctx: ctx}
 
       {:ok, sup} = Supervisor.start_link([child], strategy: :one_for_one)
       pid = Process.whereis(Router.shard_name(ctx, 0))
@@ -1213,8 +1207,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       ctx =
         FerricStore.Instance.build(name,
           data_dir: dir,
-          shard_count: 1,
-          raft_enabled: false
+          shard_count: 1
         )
 
       try do
@@ -1234,8 +1227,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
             index: 0,
             data_dir: dir,
             flush_interval_ms: 5000,
-            instance_ctx: ctx,
-            raft_enabled: false
+            instance_ctx: ctx
           )
 
         assert nil == GenServer.call(pid1, {:get, "a"})
@@ -1273,8 +1265,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       ctx =
         FerricStore.Instance.build(name,
           data_dir: dir,
-          shard_count: 1,
-          raft_enabled: false
+          shard_count: 1
         )
 
       try do
@@ -1294,8 +1285,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
             index: 0,
             data_dir: dir,
             flush_interval_ms: 5000,
-            instance_ctx: ctx,
-            raft_enabled: false
+            instance_ctx: ctx
           )
 
         assert nil == GenServer.call(pid1, {:get, "a"})
@@ -1357,8 +1347,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       ctx =
         FerricStore.Instance.build(name,
           data_dir: dir,
-          shard_count: 1,
-          raft_enabled: false
+          shard_count: 1
         )
 
       try do
@@ -1379,8 +1368,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
             index: 0,
             data_dir: dir,
             flush_interval_ms: 5000,
-            instance_ctx: ctx,
-            raft_enabled: false
+            instance_ctx: ctx
           )
 
         assert nil == GenServer.call(pid1, {:get, "a"})

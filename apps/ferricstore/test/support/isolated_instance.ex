@@ -49,16 +49,14 @@ defmodule Ferricstore.Test.IsolatedInstance do
     # Ensure data dir layout (ETS tables created by Shard.init)
     Ferricstore.DataDir.ensure_layout!(tmp_dir, shard_count)
 
-    # Start shard GenServers WITHOUT Raft (direct ETS writes).
-    # No Raft system needed — avoids naming conflicts with production.
-    # For test isolation, we don't need replication — just correctness.
+    # Custom instance shards are local/direct; only the default application
+    # instance owns Raft.
     for i <- 0..(shard_count - 1) do
       {:ok, _pid} =
         Ferricstore.Store.Shard.start_link(
           index: i,
           data_dir: tmp_dir,
-          instance_ctx: ctx,
-          raft_enabled: false
+          instance_ctx: ctx
         )
     end
 

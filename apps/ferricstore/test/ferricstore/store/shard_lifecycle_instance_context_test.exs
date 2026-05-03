@@ -22,8 +22,7 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
       Ferricstore.Store.Shard.start_link(
         index: 0,
         data_dir: ctx.data_dir,
-        instance_ctx: ctx,
-        raft_enabled: false
+        instance_ctx: ctx
       )
 
     on_exit(fn -> cleanup_instance(ctx, pid) end)
@@ -45,7 +44,6 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
       FerricStore.Instance.build(name,
         data_dir: data_dir,
         shard_count: 1,
-        raft_enabled: false,
         max_memory_bytes: 256 * 1024 * 1024,
         keydir_max_ram: 64 * 1024 * 1024
       )

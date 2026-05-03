@@ -117,7 +117,7 @@ defmodule Ferricstore.CrossShardOp do
           length(keys) > @max_cross_shard_keys ->
             {:error, @too_many_keys_error}
 
-          not ctx.raft_enabled ->
+          ctx.name != :default ->
             execute_direct_cross_shard(ctx, shard_map, execute_fn)
 
           true ->

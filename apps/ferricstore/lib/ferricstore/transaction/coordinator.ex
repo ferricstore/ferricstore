@@ -28,11 +28,7 @@ defmodule Ferricstore.Transaction.Coordinator do
     if watches_clean?(watched_keys) do
       case classify_shards(queue, sandbox_namespace) do
         {:single_shard, shard_idx} ->
-          if raft_enabled?() do
-            execute_single_shard_raft(queue, shard_idx, sandbox_namespace)
-          else
-            execute_single_shard_direct(queue, shard_idx, sandbox_namespace)
-          end
+          execute_single_shard_raft(queue, shard_idx, sandbox_namespace)
 
         {:multi_shard, shard_groups, index_map} ->
           execute_cross_shard(shard_groups, index_map, length(queue), sandbox_namespace)
@@ -60,18 +56,6 @@ defmodule Ferricstore.Transaction.Coordinator do
       length(queue),
       sandbox_namespace
     )
-  end
-
-  defp execute_single_shard_direct(queue, shard_idx, sandbox_namespace) do
-    ctx = FerricStore.Instance.get(:default)
-    shard = Router.resolve_shard(ctx, shard_idx)
-
-    try do
-      GenServer.call(shard, {:tx_execute, queue, sandbox_namespace}, 10_000)
-    catch
-      :exit, {:noproc, _} -> {:error, "ERR server not ready"}
-      :exit, {reason, _} -> {:error, "ERR internal error: #{inspect(reason)}"}
-    end
   end
 
   # ---------------------------------------------------------------------------
@@ -136,10 +120,8 @@ defmodule Ferricstore.Transaction.Coordinator do
     end
   end
 
-  # Fallback: dispatch to each shard's GenServer sequentially.
-  # Used when the ra server is temporarily unavailable (e.g. during restart).
-  # Only allowed for explicit non-Raft instances; raft-enabled transactions must
-  # fail rather than acknowledge a local-only write.
+  # The default application instance owns Raft, so transaction submit failures
+  # must fail closed instead of acknowledging local-only writes.
   defp maybe_execute_cross_shard_sequential(
          shard_groups,
          index_map,
@@ -147,35 +129,8 @@ defmodule Ferricstore.Transaction.Coordinator do
          sandbox_namespace,
          reason
        ) do
-    if raft_enabled?() do
-      {:error, "ERR transaction raft unavailable: #{inspect(reason)}"}
-    else
-      execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
-    end
-  end
-
-  defp execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace) do
-    shard_results =
-      Enum.reduce(shard_groups, %{}, fn {shard_idx, cmds_with_indices}, acc ->
-        queue = Enum.map(cmds_with_indices, fn {_orig_idx, cmd, args} -> {cmd, args} end)
-        ctx = FerricStore.Instance.get(:default)
-        shard = Router.resolve_shard(ctx, shard_idx)
-
-        results =
-          try do
-            GenServer.call(shard, {:tx_execute, queue, sandbox_namespace}, 10_000)
-          catch
-            :exit, {:noproc, _} ->
-              Enum.map(queue, fn _ -> {:error, "ERR server not ready"} end)
-
-            :exit, {reason, _} ->
-              Enum.map(queue, fn _ -> {:error, "ERR internal error: #{inspect(reason)}"} end)
-          end
-
-        Map.put(acc, shard_idx, results)
-      end)
-
-    reassemble_results(shard_results, index_map, total)
+    _ = {shard_groups, index_map, total, sandbox_namespace}
+    {:error, "ERR transaction raft unavailable: #{inspect(reason)}"}
   end
 
   # Waits for ra_event with our correlation ref. Mirrors Router.wait_for_ra_applied.
@@ -310,13 +265,6 @@ defmodule Ferricstore.Transaction.Coordinator do
 
     ctx = FerricStore.Instance.get(:default)
     Router.shard_for(ctx, full_key)
-  end
-
-  defp raft_enabled? do
-    case FerricStore.Instance.get(:default) do
-      %{raft_enabled: enabled} -> enabled
-      _ -> Application.get_env(:ferricstore, :raft_enabled, true)
-    end
   end
 
   @spec extract_key([binary()]) :: binary()

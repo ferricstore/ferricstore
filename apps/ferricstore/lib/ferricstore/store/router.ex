@@ -256,7 +256,7 @@ defmodule Ferricstore.Store.Router do
   # primitive. Whitelisting at this seam keeps the rule local and obvious.
   @spec raft_write(FerricStore.Instance.t(), non_neg_integer(), binary(), tuple()) :: term()
   defp raft_write(ctx, idx, key, command) do
-    if ctx.raft_enabled do
+    if ctx.name == :default do
       cond do
         # Commands the Shard GenServer doesn't handle (json/bitmap/geo/hll/
         # tdigest "*_op" tuples). These must skip the shard and go directly
@@ -269,7 +269,8 @@ defmodule Ferricstore.Store.Router do
         true -> async_write(ctx, idx, command)
       end
     else
-      # No Raft — direct GenServer.call to the shard
+      # Custom embedded instances are local/direct. The default application
+      # instance owns Raft; there is no public switch that can disable it.
       GenServer.call(elem(ctx.shard_names, idx), command)
     end
   end

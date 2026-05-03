@@ -147,7 +147,6 @@ defmodule Ferricstore.Raft.StateMachineTest do
         FerricStore.Instance.build(name,
           data_dir: root,
           shard_count: 1,
-          raft_enabled: false,
           max_memory_bytes: 256 * 1024 * 1024,
           keydir_max_ram: 64 * 1024 * 1024
         )

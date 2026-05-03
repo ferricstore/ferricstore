@@ -30,23 +30,17 @@ defmodule Ferricstore.Store.ShardSupervisor do
         (instance_ctx && instance_ctx.data_dir) ||
         Keyword.fetch!(opts, :data_dir)
 
-    shard_count = Keyword.get(opts, :shard_count) || (instance_ctx && instance_ctx.shard_count) || 4
-
-    raft_enabled =
-      Keyword.get(
-        opts,
-        :raft_enabled,
-        if(instance_ctx,
-          do: instance_ctx.raft_enabled,
-          else: Application.get_env(:ferricstore, :raft_enabled, true)
-        )
-      )
+    shard_count =
+      Keyword.get(opts, :shard_count) || (instance_ctx && instance_ctx.shard_count) || 4
 
     children =
       Enum.flat_map(0..(shard_count - 1), fn i ->
         shard_opts = [index: i, data_dir: data_dir]
-        shard_opts = if instance_ctx, do: Keyword.put(shard_opts, :instance_ctx, instance_ctx), else: shard_opts
-        shard_opts = Keyword.put(shard_opts, :raft_enabled, raft_enabled)
+
+        shard_opts =
+          if instance_ctx,
+            do: Keyword.put(shard_opts, :instance_ctx, instance_ctx),
+            else: shard_opts
 
         [
           Supervisor.child_spec(
@@ -54,8 +48,7 @@ defmodule Ferricstore.Store.ShardSupervisor do
             id: :"shard_#{i}"
           ),
           Supervisor.child_spec(
-            {Ferricstore.Store.BitcaskCheckpointer,
-             [index: i, instance_ctx: instance_ctx]},
+            {Ferricstore.Store.BitcaskCheckpointer, [index: i, instance_ctx: instance_ctx]},
             id: :"checkpointer_#{i}"
           )
         ]

@@ -95,8 +95,7 @@ defmodule Ferricstore.Store.ActiveFileTest do
       ctx =
         FerricStore.Instance.build(:active_file_scope_test,
           data_dir: dir,
-          shard_count: 1,
-          raft_enabled: false
+          shard_count: 1
         )
 
       on_exit(fn ->

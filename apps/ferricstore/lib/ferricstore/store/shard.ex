@@ -219,9 +219,10 @@ defmodule Ferricstore.Store.Shard do
     # Must run BEFORE recover_promoted so PM: markers are in ETS.
     ShardLifecycle.recover_keydir(path, keydir, index, ctx)
 
-    # Start the Raft server for this shard (unless explicitly disabled).
+    # Only the default application instance owns Raft. Custom embedded shards
+    # run local/direct, and direct shard tests pass non-default instance_ctx.
     raft? =
-      if Keyword.get(opts, :raft_enabled, true) do
+      if ctx && ctx.name == :default do
         ShardLifecycle.start_raft_if_available(
           index,
           path,

@@ -45,8 +45,8 @@ defmodule Ferricstore.InstanceTest do
 
       assert {:ok, "from-a"} = EmbeddedA.get("same-key")
       assert {:ok, "from-b"} = EmbeddedB.get("same-key")
-      assert false == EmbeddedA.__instance__().raft_enabled
-      assert false == EmbeddedB.__instance__().raft_enabled
+      refute Map.has_key?(EmbeddedA.__instance__(), :raft_enabled)
+      refute Map.has_key?(EmbeddedB.__instance__(), :raft_enabled)
     end
 
     test "custom instances reject the raft_enabled option" do
@@ -100,20 +100,16 @@ defmodule Ferricstore.InstanceTest do
       end)
 
       assert {:ok, _pid} = EmbeddedDefaultOptions.start_link(data_dir: root, shard_count: 1)
-      assert false == EmbeddedDefaultOptions.__instance__().raft_enabled
+      refute Map.has_key?(EmbeddedDefaultOptions.__instance__(), :raft_enabled)
       assert :ok = EmbeddedDefaultOptions.set("same-key", "local")
       assert {:ok, "local"} = EmbeddedDefaultOptions.get("same-key")
     end
 
-    test "direct custom instance builds force non-Raft mode" do
+    test "direct instance builds reject raft_enabled option" do
       name = :"custom_direct_build_#{System.unique_integer([:positive])}"
 
-      ctx = FerricStore.Instance.build(name, shard_count: 1, raft_enabled: true)
-
-      try do
-        assert false == ctx.raft_enabled
-      after
-        FerricStore.Instance.cleanup(name)
+      assert_raise ArgumentError, ~r/:raft_enabled is not supported/, fn ->
+        FerricStore.Instance.build(name, shard_count: 1, raft_enabled: true)
       end
     end
 
@@ -187,8 +183,7 @@ defmodule Ferricstore.InstanceTest do
       ctx =
         FerricStore.Instance.build(name,
           data_dir: Path.join(System.tmp_dir!(), Atom.to_string(name)),
-          shard_count: 2,
-          raft_enabled: false
+          shard_count: 2
         )
 
       latch_0 = elem(ctx.latch_refs, 0)

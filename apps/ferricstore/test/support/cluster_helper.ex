@@ -124,9 +124,12 @@ defmodule Ferricstore.Test.ClusterHelper do
 
       # Set cluster_nodes so Raft.Cluster.start_shard_server uses all
       # nodes as initial_members for each shard's Raft group.
-      :ok = :rpc.call(node.name, Application, :put_env, [
-        :ferricstore, :cluster_nodes, node_names
-      ])
+      :ok =
+        :rpc.call(node.name, Application, :put_env, [
+          :ferricstore,
+          :cluster_nodes,
+          node_names
+        ])
     end)
 
     # Phase 4: Start FerricStore on all nodes CONCURRENTLY. This is critical
@@ -202,7 +205,10 @@ defmodule Ferricstore.Test.ClusterHelper do
     shards = Keyword.get(opts, :shards, 4)
     unique = :erlang.unique_integer([:positive])
     name = :"ferric_solo_#{unique}"
-    data_dir = Keyword.get(opts, :data_dir, Path.join(System.tmp_dir!(), "ferricstore_solo_#{unique}"))
+
+    data_dir =
+      Keyword.get(opts, :data_dir, Path.join(System.tmp_dir!(), "ferricstore_solo_#{unique}"))
+
     File.mkdir_p!(data_dir)
 
     code_paths = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
@@ -223,15 +229,13 @@ defmodule Ferricstore.Test.ClusterHelper do
     configure_remote_node(node_name, data_dir, shards)
 
     cluster_nodes = Keyword.get(opts, :cluster_nodes, [])
+
     if cluster_nodes != [] do
       :rpc.call(node_name, Application, :put_env, [:ferricstore, :cluster_nodes, cluster_nodes])
-      # New joiner nodes must start with raft_enabled: false so they don't
-      # create conflicting single-node Raft groups. The existing cluster's
-      # Manager will add them via auto-join (triggered by :nodeup).
-      :rpc.call(node_name, Application, :put_env, [:ferricstore, :raft_enabled, false])
     end
 
     cluster_role = Keyword.get(opts, :cluster_role)
+
     if cluster_role do
       :rpc.call(node_name, Application, :put_env, [:ferricstore, :cluster_role, cluster_role])
     end
@@ -241,6 +245,7 @@ defmodule Ferricstore.Test.ClusterHelper do
     # Wait for shards to be alive and accepting calls
     Enum.each(0..(shards - 1), fn i ->
       shard = :"Ferricstore.Store.Shard.#{i}"
+
       Enum.each(1..50, fn _ ->
         case :rpc.call(node_name, Process, :whereis, [shard]) do
           pid when is_pid(pid) -> :ok
@@ -406,6 +411,7 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     for n <- all_nodes, i <- 0..(shards - 1) do
       server_id = :rpc.call(n.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+
       try do
         :rpc.call(n.name, :ra, :stop_server, [ra_system, server_id])
       catch
@@ -433,6 +439,7 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     for n <- others, i <- 0..(shards - 1) do
       server_id = :rpc.call(n.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+
       try do
         :rpc.call(n.name, :ra, :restart_server, [ra_system, server_id])
       catch
@@ -462,30 +469,42 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     # Reconnect from both sides — use erpc with short timeout to avoid blocking
     connect = fn from, to ->
-      try do :erpc.call(from, Node, :connect, [to], 2_000)
-      catch _, _ -> false
+      try do
+        :erpc.call(from, Node, :connect, [to], 2_000)
+      catch
+        _, _ -> false
       end
     end
 
-    Ferricstore.Test.ShardHelpers.eventually(fn ->
-      Enum.each(others, fn other ->
-        connect.(other.name, node.name)
-        connect.(node.name, other.name)
-      end)
-      Process.sleep(200)
-      peers = :rpc.call(node.name, :erlang, :nodes, [], 2_000)
-      other_names = Enum.map(others, & &1.name)
-      connected = if is_list(peers), do: Enum.filter(peers, fn n -> n in other_names end), else: []
-      if length(connected) < length(others) do
-        raise "#{node.name} sees #{length(connected)}/#{length(others)} peers"
-      end
-    end, "heal should reconnect #{node.name}", 40, 500)
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn ->
+        Enum.each(others, fn other ->
+          connect.(other.name, node.name)
+          connect.(node.name, other.name)
+        end)
+
+        Process.sleep(200)
+        peers = :rpc.call(node.name, :erlang, :nodes, [], 2_000)
+        other_names = Enum.map(others, & &1.name)
+
+        connected =
+          if is_list(peers), do: Enum.filter(peers, fn n -> n in other_names end), else: []
+
+        if length(connected) < length(others) do
+          raise "#{node.name} sees #{length(connected)}/#{length(others)} peers"
+        end
+      end,
+      "heal should reconnect #{node.name}",
+      40,
+      500
+    )
 
     # Restart ra servers on the partitioned node
     ra_system = :rpc.call(node.name, Ferricstore.Raft.Cluster, :system_name, [])
 
     for i <- 0..(shards - 1) do
       server_id = :rpc.call(node.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+
       try do
         :rpc.call(node.name, :ra, :restart_server, [ra_system, server_id])
       catch
@@ -638,7 +657,9 @@ defmodule Ferricstore.Test.ClusterHelper do
           case :rpc.call(node.name, :ra, :members, [server_id]) do
             {:ok, _members, {_shard_name, leader_node}} ->
               MapSet.member?(alive_names, leader_node)
-            _ -> false
+
+            _ ->
+              false
           end
         end)
       end)

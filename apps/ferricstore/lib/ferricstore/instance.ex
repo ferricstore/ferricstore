@@ -42,7 +42,6 @@ defmodule FerricStore.Instance do
           keydir_max_ram: non_neg_integer(),
           memory_limit: non_neg_integer(),
           keydir_binary_bytes: reference(),
-          raft_enabled: boolean(),
           durability_mode: atom(),
           hotness_table: atom() | reference(),
           config_table: atom() | reference(),
@@ -82,7 +81,6 @@ defmodule FerricStore.Instance do
     :config_table,
     :keydir_binary_bytes,
     :latch_refs,
-    raft_enabled: true,
     connected_clients_fn: nil,
     process_rss_fn: nil,
     server_info_fn: nil,
@@ -98,6 +96,11 @@ defmodule FerricStore.Instance do
   """
   @spec build(atom(), keyword()) :: t()
   def build(name, opts) do
+    if Keyword.has_key?(opts, :raft_enabled) do
+      raise ArgumentError,
+            ":raft_enabled is not supported; Raft is owned by the default application instance"
+    end
+
     shard_count = Keyword.get(opts, :shard_count, 4)
     data_dir = Keyword.get(opts, :data_dir, "data")
 
@@ -249,7 +252,6 @@ defmodule FerricStore.Instance do
       keydir_max_ram: keydir_max_ram,
       memory_limit: memory_limit,
       keydir_binary_bytes: keydir_binary_bytes,
-      raft_enabled: raft_enabled(name, opts),
       durability_mode: :all_quorum,
       hotness_table: hotness_table,
       config_table: config_table,
@@ -317,9 +319,6 @@ defmodule FerricStore.Instance do
   rescue
     ArgumentError -> :error
   end
-
-  defp raft_enabled(:default, opts), do: Keyword.get(opts, :raft_enabled, true)
-  defp raft_enabled(_name, _opts), do: false
 
   defp cleanup_instance_tables({:ok, %__MODULE__{name: :default}}), do: :ok
   defp cleanup_instance_tables(:error), do: :ok

@@ -65,8 +65,7 @@ defmodule FerricStore.Instance.Supervisor do
              name: :"#{name}.ShardSupervisor",
              data_dir: ctx.data_dir,
              shard_count: ctx.shard_count,
-             instance_ctx: ctx,
-             raft_enabled: ctx.raft_enabled
+             instance_ctx: ctx
            ]}
         ]
 

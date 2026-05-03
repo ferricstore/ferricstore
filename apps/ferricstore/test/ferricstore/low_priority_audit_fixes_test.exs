@@ -364,16 +364,14 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       ctx =
         FerricStore.Instance.build(name,
           data_dir: dir,
-          shard_count: 1,
-          raft_enabled: false
+          shard_count: 1
         )
 
       {:ok, pid} =
         Ferricstore.Store.Shard.start_link(
           index: 0,
           data_dir: dir,
-          instance_ctx: ctx,
-          raft_enabled: false
+          instance_ctx: ctx
         )
 
       # The shard should start successfully
