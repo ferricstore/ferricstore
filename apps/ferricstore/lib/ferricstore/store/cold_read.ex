@@ -27,6 +27,7 @@ defmodule Ferricstore.Store.ColdRead do
       end,
       timeout_ms
     )
+    |> emit_pread_error(path)
   end
 
   @spec pread_at(binary(), non_neg_integer(), binary(), timeout()) :: result()
@@ -37,6 +38,7 @@ defmodule Ferricstore.Store.ColdRead do
       end,
       timeout_ms
     )
+    |> emit_pread_error(path)
   end
 
   @spec pread_batch([{binary(), non_neg_integer()}], timeout()) :: result()
@@ -149,4 +151,31 @@ defmodule Ferricstore.Store.ColdRead do
     |> Enum.reverse()
     |> Enum.map(fn path -> {path, groups |> Map.fetch!(path) |> Enum.reverse()} end)
   end
+
+  defp emit_pread_error({:error, reason} = result, path) do
+    :telemetry.execute(
+      [:ferricstore, :bitcask, :pread_corrupt],
+      %{count: 1},
+      %{path: path, reason: classify_pread_error(reason), raw_reason: reason}
+    )
+
+    result
+  end
+
+  defp emit_pread_error(result, _path), do: result
+
+  defp classify_pread_error(:timeout), do: :timeout
+
+  defp classify_pread_error(reason) when is_binary(reason) do
+    downcased = String.downcase(reason)
+
+    if String.contains?(downcased, "missing_file") or
+         String.contains?(downcased, "no such file") do
+      :missing_file
+    else
+      :corrupt_record
+    end
+  end
+
+  defp classify_pread_error(_reason), do: :corrupt_record
 end

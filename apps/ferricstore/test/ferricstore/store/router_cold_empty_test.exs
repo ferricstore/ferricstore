@@ -138,6 +138,50 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     assert [nil] == Router.batch_get(ctx, [key])
   end
 
+  test "direct cold reads emit telemetry when a cold record cannot be decoded", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_direct_corrupt:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    value = "stable-value"
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00000.log")
+
+    {:ok, {offset, _record_size}} = NIF.v2_append_record(path, key, value, 0)
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, offset, byte_size(value)})
+
+    {:ok, fd} = :file.open(path, [:read, :write, :binary])
+    corrupt_at = offset + @record_header_size + byte_size(key)
+    :ok = :file.pwrite(fd, corrupt_at, <<"X">>)
+    :ok = :file.close(fd)
+
+    attach_pread_corrupt_handler()
+
+    assert nil == Router.get(ctx, key)
+
+    assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                    %{path: ^path, reason: :corrupt_record}}
+  end
+
+  test "direct cold reads emit telemetry when a cold file is missing", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_direct_missing_file:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    missing_path = Path.join(shard_path, "00009.log")
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 9, 0, 5})
+
+    attach_pread_corrupt_handler()
+
+    assert nil == Router.get(ctx, key)
+
+    assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                    %{path: ^missing_path, reason: :missing_file}}
+  end
+
   test "batch cold reads emit telemetry when a cold record cannot be decoded", %{
     ctx: ctx,
     keydir: keydir
@@ -352,5 +396,22 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
 
     assert nil == Router.expire_at_ms(ctx, key)
     assert [] == :ets.lookup(keydir, key)
+  end
+
+  defp attach_pread_corrupt_handler do
+    parent = self()
+    handler_id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :bitcask, :pread_corrupt],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:pread_corrupt, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
   end
 end
