@@ -34,7 +34,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.{CompoundKey, LFU, Promotion}
+  alias Ferricstore.Store.{CompoundKey, LFU, LocalTxStore, Ops, Promotion}
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
 
   # ---------------------------------------------------------------------------
@@ -317,6 +317,23 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       end
     end
 
+    test "crash after step 1 keeps public compound reads on shared storage", ctx do
+      {redis_key, [{field_key, field_value} | _entries]} =
+        seed_hash_entries(ctx.active_path, ctx.keydir)
+
+      type_str = CompoundKey.encode_type(:hash)
+      mk = Promotion.marker_key(redis_key)
+      {:ok, {moff, mvs}} = NIF.v2_append_record(ctx.active_path, mk, type_str, 0)
+      :ets.insert(ctx.keydir, {mk, type_str, 0, LFU.initial(), 0, moff, mvs})
+
+      {:ok, _dedicated_path} =
+        Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+
+      promoted = simulate_restart(ctx)
+
+      assert field_value == Ops.compound_get(local_tx(ctx, promoted), redis_key, field_key)
+    end
+
     test "crash after step 2 (marker + dedicated, no tombstones)", ctx do
       {redis_key, entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
 
@@ -408,5 +425,27 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
              "if this assertion starts FAILING, the recovery path has been " <>
                "extended — update or remove this regression guard."
     end
+  end
+
+  defp local_tx(ctx, promoted_instances) do
+    instance_ctx =
+      FerricStore.Instance.build(
+        :"prom_atom_instance_#{:erlang.unique_integer([:positive])}",
+        data_dir: ctx.data_dir,
+        shard_count: 1
+      )
+
+    %LocalTxStore{
+      instance_ctx: instance_ctx,
+      shard_index: ctx.shard_index,
+      shard_state: %{
+        instance_ctx: instance_ctx,
+        keydir: ctx.keydir,
+        index: ctx.shard_index,
+        shard_data_path: ctx.shard_data_path,
+        data_dir: ctx.data_dir,
+        promoted_instances: promoted_instances
+      }
+    }
   end
 end

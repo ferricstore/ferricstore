@@ -326,11 +326,12 @@ defmodule Ferricstore.Store.Promotion do
 
       # Crash-safety fallback (docs/bitcask-background-fsync.md §D2):
       #
-      # If the marker exists but the dedicated dir is effectively empty
-      # (no live records), we crashed between step 1 (marker write) and
-      # step 2 (dedicated batch) of a marker-first promotion. In that
-      # case the compound keys in the SHARED log are still authoritative
-      # (step 3 tombstones hadn't run yet).
+      # If the marker exists but the dedicated dir has no records at all,
+      # we crashed between step 1 (marker write) and step 2 (dedicated
+      # batch) of a marker-first promotion. In that case the compound keys
+      # in the SHARED log are still authoritative (step 3 tombstones hadn't
+      # run yet), and returning a promoted instance would route public reads
+      # to the empty dedicated dir.
       #
       # recover_keydir (called before us) has already re-mapped those
       # compound keys back into the keydir from the shared log. We
@@ -343,6 +344,8 @@ defmodule Ferricstore.Store.Promotion do
             _ -> false
           end
         end)
+
+      dedicated_empty? = map_size(final_state) == 0
 
       if live_count > 0 do
         # Normal recovery path: dedicated has data, apply it.
@@ -365,46 +368,48 @@ defmodule Ferricstore.Store.Promotion do
               {key, value, expire_at_ms, LFU.initial(), fid, offset, value_size}
             )
         end)
-      else
-        # Fallback path: marker exists, dedicated empty. Compound keys
-        # in shared log (already in keydir via recover_keydir) are the
-        # source of truth. Do NOT apply tombstones from dedicated — if
-        # a tombstone somehow landed there without a corresponding live
-        # record, we still prefer the shared-log compound keys.
+      end
+
+      if dedicated_empty? do
+        # Fallback path: marker exists, dedicated has no records. Compound
+        # keys in shared log (already in keydir via recover_keydir) are the
+        # source of truth, so do not include this key in promoted_instances.
         Logger.info(
           "Promotion recovery: marker for #{inspect(redis_key)} exists but dedicated " <>
             "dir has no live records; falling back to compound keys in shared log."
         )
+
+        acc
+      else
+        total_bytes = dir_total_size(dedicated_path)
+
+        live_bytes =
+          Enum.reduce(final_state, 0, fn {key, entry}, acc ->
+            case entry do
+              :tombstone ->
+                acc
+
+              {:live, _fid, _path, _off, _vs, _exp} ->
+                case :ets.lookup(keydir, key) do
+                  [{^key, _v, _exp, _lfu, _f, _o, vsize}] when vsize > 0 ->
+                    acc + 26 + byte_size(key) + vsize
+
+                  _ ->
+                    acc
+                end
+            end
+          end)
+
+        dead_bytes = max(total_bytes - live_bytes, 0)
+
+        Map.put(acc, redis_key, %{
+          path: dedicated_path,
+          writes: 0,
+          total_bytes: total_bytes,
+          dead_bytes: dead_bytes,
+          last_compacted_at: nil
+        })
       end
-
-      total_bytes = dir_total_size(dedicated_path)
-
-      live_bytes =
-        Enum.reduce(final_state, 0, fn {key, entry}, acc ->
-          case entry do
-            :tombstone ->
-              acc
-
-            {:live, _fid, _path, _off, _vs, _exp} ->
-              case :ets.lookup(keydir, key) do
-                [{^key, _v, _exp, _lfu, _f, _o, vsize}] when vsize > 0 ->
-                  acc + 26 + byte_size(key) + vsize
-
-                _ ->
-                  acc
-              end
-          end
-        end)
-
-      dead_bytes = max(total_bytes - live_bytes, 0)
-
-      Map.put(acc, redis_key, %{
-        path: dedicated_path,
-        writes: 0,
-        total_bytes: total_bytes,
-        dead_bytes: dead_bytes,
-        last_compacted_at: nil
-      })
     end)
   end
 
