@@ -1419,6 +1419,7 @@ defmodule Ferricstore.Raft.StateMachine do
     %{
       get: local_get,
       get_meta: local_get_meta,
+      batch_get: fn keys -> cross_shard_batch_read(ctx, keys) end,
       put: local_put,
       delete: local_delete,
       exists?: local_exists,
@@ -1783,6 +1784,25 @@ defmodule Ferricstore.Raft.StateMachine do
       {value, _exp} -> value
       nil -> nil
     end)
+  end
+
+  defp cross_shard_batch_read(ctx, keys) do
+    deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+    entries =
+      keys
+      |> Enum.with_index()
+      |> Enum.reject(fn {key, _index} -> MapSet.member?(deleted, key) end)
+
+    entries
+    |> Enum.map(fn {key, _index} -> key end)
+    |> then(&cross_shard_ets_batch_read_meta_from_path(ctx, &1, ctx.shard_data_path))
+    |> Enum.map(fn
+      {value, _exp} -> value
+      nil -> nil
+    end)
+    |> then(&merge_indexed_values(%{}, entries, &1))
+    |> values_for_indexes(keys)
   end
 
   defp cross_shard_compound_batch_read_meta(_ctx, _redis_key, []), do: []
@@ -3667,6 +3687,7 @@ defmodule Ferricstore.Raft.StateMachine do
           {v, exp} -> {v, exp}
         end
       end,
+      batch_get: fn keys -> sm_store_batch_get(state, keys) end,
       put: fn key, value, expire_at_ms ->
         do_put(state, key, value, expire_at_ms)
         :ok
@@ -3778,6 +3799,103 @@ defmodule Ferricstore.Raft.StateMachine do
     }
   end
 
+  defp sm_store_batch_get(state, keys) do
+    {local_results, cold_reads, remote_entries} =
+      keys
+      |> Enum.with_index()
+      |> Enum.reduce({%{}, [], []}, fn {key, index}, {results, cold, remote} ->
+        sm_store_collect_batch_get(state, key, index, results, cold, remote)
+      end)
+
+    results = sm_store_read_cold_batch(state, local_results, Enum.reverse(cold_reads))
+
+    remote_entries
+    |> Enum.reverse()
+    |> sm_store_batch_remote_get(instance_ctx_for_state(state), results)
+    |> values_for_indexes(keys)
+  end
+
+  defp sm_store_collect_batch_get(state, key, index, results, cold, remote) do
+    case sm_pending_value_meta(key) do
+      {:hit, value, _exp} ->
+        {Map.put(results, index, value), cold, remote}
+
+      :miss ->
+        sm_store_collect_committed_batch_get(state, key, index, results, cold, remote)
+    end
+  end
+
+  defp sm_store_collect_committed_batch_get(state, key, index, results, cold, remote) do
+    now = apply_now_ms()
+
+    case :ets.lookup(state.ets, key) do
+      [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
+        {Map.put(results, index, value), cold, remote}
+
+      [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+        {results, [{index, key, 0, fid, off} | cold], remote}
+
+      [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+        {Map.put(results, index, value), cold, remote}
+
+      [{^key, nil, exp, _lfu, fid, off, vsize}]
+      when exp > now and valid_cold_location(fid, off, vsize) ->
+        {results, [{index, key, exp, fid, off} | cold], remote}
+
+      [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
+        track_keydir_binary_remove_known(state, key, value)
+        :ets.delete(state.ets, key)
+        {results, cold, [{index, key} | remote]}
+
+      [] ->
+        {results, cold, [{index, key} | remote]}
+    end
+  rescue
+    ArgumentError ->
+      {results, cold, [{index, key} | remote]}
+  end
+
+  defp sm_store_read_cold_batch(_state, results, []), do: results
+
+  defp sm_store_read_cold_batch(state, results, cold_reads) do
+    locations =
+      Enum.map(cold_reads, fn {_index, _key, _exp, fid, off} ->
+        {sm_file_path(state, fid), off}
+      end)
+
+    values =
+      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_read_timeout_ms) do
+        {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
+          values
+
+        _ ->
+          List.duplicate(nil, length(cold_reads))
+      end
+
+    cold_reads
+    |> Enum.zip(values)
+    |> Enum.reduce(results, fn
+      {{index, key, exp, fid, off}, value}, acc when is_binary(value) ->
+        ets_value = value_for_ets(value, hot_cache_threshold(state))
+        track_keydir_binary_warm(state, ets_value)
+        :ets.insert(state.ets, {key, ets_value, exp, LFU.initial(), fid, off, byte_size(value)})
+        Map.put(acc, index, value)
+
+      {_read, _value}, acc ->
+        acc
+    end)
+  end
+
+  defp sm_store_batch_remote_get([], _ctx, results), do: results
+  defp sm_store_batch_remote_get(_entries, nil, results), do: results
+
+  defp sm_store_batch_remote_get(entries, ctx, results) do
+    remote_keys = Enum.map(entries, fn {_index, key} -> key end)
+    remote_values = Router.batch_get(ctx, remote_keys)
+
+    merge_indexed_values(results, entries, remote_values)
+  end
+
   defp sm_store_compound_batch_get(state, redis_key, compound_keys) do
     state
     |> sm_store_compound_batch_get_meta(redis_key, compound_keys)
@@ -3824,6 +3942,20 @@ defmodule Ferricstore.Raft.StateMachine do
     compound_keys
     |> Enum.with_index()
     |> Enum.map(fn {_compound_key, index} -> Map.get(results, index) end)
+  end
+
+  defp merge_indexed_values(results, entries, values) do
+    entries
+    |> Enum.zip(values)
+    |> Enum.reduce(results, fn {{index, _key}, value}, acc ->
+      Map.put(acc, index, value)
+    end)
+  end
+
+  defp values_for_indexes(results, keys) do
+    keys
+    |> Enum.with_index()
+    |> Enum.map(fn {_key, index} -> Map.get(results, index) end)
   end
 
   defp instance_ctx_for_state(%{instance_ctx: %FerricStore.Instance{} = ctx}), do: ctx

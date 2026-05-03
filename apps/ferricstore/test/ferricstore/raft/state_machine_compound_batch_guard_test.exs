@@ -17,4 +17,15 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
     assert source =~ "compound_batch_get_meta:",
            "state-machine command store must provide compound_batch_get_meta"
   end
+
+  test "state-machine command stores expose plain batch reads" do
+    source = File.read!(@state_machine_path)
+
+    # MGET, JSON.MGET, PFCOUNT, PFMERGE, and BITOP call Ops.batch_get/2.
+    # During Raft apply the store is a map, so missing batch_get callbacks
+    # make Ops fall back to one closure call and one possible cold-read waiter
+    # per key. Keep this explicit to preserve batched cold reads in apply.
+    assert length(Regex.scan(~r/^\s+batch_get:/m, source)) >= 2,
+           "both state-machine command stores must provide batch_get for plain multi-key reads"
+  end
 end
