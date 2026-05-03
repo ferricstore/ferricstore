@@ -28,4 +28,22 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
     assert length(Regex.scan(~r/^\s+batch_get:/m, source)) >= 2,
            "both state-machine command stores must provide batch_get for plain multi-key reads"
   end
+
+  test "state-machine compound batch metadata reads use promoted-aware cold path" do
+    source = File.read!(@state_machine_path)
+    body = function_body(source, "sm_store_compound_batch_get_meta")
+
+    # HGETEX/HEXPIRE-style logic reads value+TTL for many fields. If this
+    # helper uses do_get_meta/2 directly, promoted cold fields are looked up in
+    # the shared Bitcask path and appear missing. Keep it on the same
+    # promoted-aware batched cold reader as compound_batch_get/3.
+    refute body =~ "do_get_meta(state, compound_key)",
+           "state-machine compound batch metadata reads must not bypass promoted cold storage"
+  end
+
+  defp function_body(source, function) do
+    [_before, rest] = String.split(source, "defp #{function}", parts: 2)
+    [body, _after] = String.split(rest, "\n  end\n", parts: 2)
+    body
+  end
 end

@@ -4053,16 +4053,28 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
+  defp sm_store_compound_batch_get_meta(_state, _redis_key, []), do: []
+
   defp sm_store_compound_batch_get_meta(state, redis_key, compound_keys) do
-    {local_results, remote_keys} =
+    path_fun =
+      sm_store_compound_path_fun(state, redis_key, List.first(compound_keys)) || (&sm_file_path/2)
+
+    {local_results, cold_reads, remote_keys} =
       compound_keys
       |> Enum.with_index()
-      |> Enum.reduce({%{}, []}, fn {compound_key, index}, {results, remote} ->
-        case do_get_meta(state, compound_key) do
-          nil -> {results, [{index, compound_key} | remote]}
-          {value, exp} -> {Map.put(results, index, {value, exp}), remote}
-        end
+      |> Enum.reduce({%{}, [], []}, fn {compound_key, index}, {results, cold, remote} ->
+        sm_store_collect_compound_batch_get_meta(
+          state,
+          compound_key,
+          index,
+          results,
+          cold,
+          remote
+        )
       end)
+
+    local_results =
+      sm_store_read_cold_meta_batch(state, local_results, Enum.reverse(cold_reads), path_fun)
 
     results =
       case {Enum.reverse(remote_keys), instance_ctx_for_state(state)} do
@@ -4090,6 +4102,77 @@ defmodule Ferricstore.Raft.StateMachine do
     compound_keys
     |> Enum.with_index()
     |> Enum.map(fn {_compound_key, index} -> Map.get(results, index) end)
+  end
+
+  defp sm_store_collect_compound_batch_get_meta(state, key, index, results, cold, remote) do
+    case sm_pending_value_meta(key) do
+      {:hit, value, exp} ->
+        {Map.put(results, index, {value, exp}), cold, remote}
+
+      :miss ->
+        sm_store_collect_committed_batch_get_meta(state, key, index, results, cold, remote)
+    end
+  end
+
+  defp sm_store_collect_committed_batch_get_meta(state, key, index, results, cold, remote) do
+    now = apply_now_ms()
+
+    case :ets.lookup(state.ets, key) do
+      [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
+        {Map.put(results, index, {value, 0}), cold, remote}
+
+      [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+        {results, [{index, key, 0, fid, off} | cold], remote}
+
+      [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+        {Map.put(results, index, {value, exp}), cold, remote}
+
+      [{^key, nil, exp, _lfu, fid, off, vsize}]
+      when exp > now and valid_cold_location(fid, off, vsize) ->
+        {results, [{index, key, exp, fid, off} | cold], remote}
+
+      [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
+        track_keydir_binary_remove_known(state, key, value)
+        :ets.delete(state.ets, key)
+        {results, cold, [{index, key} | remote]}
+
+      [] ->
+        {results, cold, [{index, key} | remote]}
+    end
+  rescue
+    ArgumentError ->
+      {results, cold, [{index, key} | remote]}
+  end
+
+  defp sm_store_read_cold_meta_batch(_state, results, [], _path_fun), do: results
+
+  defp sm_store_read_cold_meta_batch(state, results, cold_reads, path_fun) do
+    locations =
+      Enum.map(cold_reads, fn {_index, _key, _exp, fid, off} ->
+        {path_fun.(state, fid), off}
+      end)
+
+    values =
+      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_read_timeout_ms) do
+        {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
+          values
+
+        _ ->
+          List.duplicate(nil, length(cold_reads))
+      end
+
+    cold_reads
+    |> Enum.zip(values)
+    |> Enum.reduce(results, fn
+      {{index, key, exp, fid, off}, value}, acc when is_binary(value) ->
+        ets_value = value_for_ets(value, hot_cache_threshold(state))
+        track_keydir_binary_warm(state, ets_value)
+        :ets.insert(state.ets, {key, ets_value, exp, LFU.initial(), fid, off, byte_size(value)})
+        Map.put(acc, index, {value, exp})
+
+      {_read, _value}, acc ->
+        acc
+    end)
   end
 
   defp merge_indexed_values(results, entries, values) do
