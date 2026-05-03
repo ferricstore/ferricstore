@@ -177,6 +177,7 @@ defmodule Ferricstore.Raft.StateMachine do
       applied_count: 0,
       release_cursor_interval: interval,
       pending_release_cursor_index: nil,
+      pending_release_cursor_checkpoint_indices: MapSet.new(),
       # When a node joins with pre-existing Bitcask data (from direct copy or
       # object storage snapshot), skip_below_index prevents re-applying entries
       # that are already in Bitcask + ETS. Entries at or below this index are
@@ -1058,7 +1059,15 @@ defmodule Ferricstore.Raft.StateMachine do
   defp maybe_release_cursor(%{index: ra_index}, old_count, state, result) do
     state = consume_pending_state(state)
     checkpoint_clean_before_write? = Process.delete(:sm_checkpoint_clean_before_write) == true
+
+    checkpoint_dependencies_clean_before_write? =
+      Process.delete(:sm_checkpoint_dependencies_clean_before_write) == true
+
+    dirty_checkpoint_indices = consume_checkpoint_dirty_indices()
     previous_pending_release_index = Map.get(state, :pending_release_cursor_index)
+
+    previous_pending_checkpoint_indices =
+      Map.get(state, :pending_release_cursor_checkpoint_indices, MapSet.new())
 
     record_cursor_metric(state, :last_applied_index, ra_index)
 
@@ -1078,11 +1087,18 @@ defmodule Ferricstore.Raft.StateMachine do
 
     interval = state.release_cursor_interval
     crossed_interval? = div(old_count, interval) != div(state.applied_count, interval)
-    checkpoint_clean_now? = checkpoint_clean?(state)
+
+    checkpoint_clean_now? =
+      checkpoint_clean?(state) and checkpoint_indices_clean?(state, dirty_checkpoint_indices)
 
     {state, checkpoint_effects} =
       if crossed_interval? do
-        checkpoint_state = %{state | pending_release_cursor_index: ra_index}
+        checkpoint_state = %{
+          state
+          | pending_release_cursor_index: ra_index,
+            pending_release_cursor_checkpoint_indices:
+              MapSet.union(previous_pending_checkpoint_indices, dirty_checkpoint_indices)
+        }
 
         if checkpoint_clean_now? do
           {checkpoint_state, []}
@@ -1093,12 +1109,20 @@ defmodule Ferricstore.Raft.StateMachine do
         {state, []}
       end
 
+    pending_checkpoint_indices =
+      Map.get(state, :pending_release_cursor_checkpoint_indices, MapSet.new())
+
+    pending_checkpoint_clean? = checkpoint_indices_clean?(state, pending_checkpoint_indices)
+
     release_index =
       cond do
-        checkpoint_clean_now? ->
+        checkpoint_clean_now? and pending_checkpoint_clean? ->
           Map.get(state, :pending_release_cursor_index)
 
-        checkpoint_clean_before_write? ->
+        checkpoint_dependencies_clean_before_write? ->
+          previous_pending_release_index
+
+        checkpoint_clean_before_write? and pending_checkpoint_clean? ->
           previous_pending_release_index
 
         true ->
@@ -1119,6 +1143,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp maybe_release_cursor(_meta, _old_count, state, result) do
     state = consume_pending_state(state)
+    Process.delete(:sm_checkpoint_dependencies_clean_before_write)
+    Process.delete(:sm_checkpoint_dirty_indices)
 
     # No meta (e.g. cross-shard sub-apply) — pass through untouched.
     {state, result}
@@ -1139,7 +1165,11 @@ defmodule Ferricstore.Raft.StateMachine do
 
           state =
             if Map.get(state, :pending_release_cursor_index) == release_index do
-              %{state | pending_release_cursor_index: nil}
+              %{
+                state
+                | pending_release_cursor_index: nil,
+                  pending_release_cursor_checkpoint_indices: MapSet.new()
+              }
             else
               state
             end
@@ -1169,6 +1199,58 @@ defmodule Ferricstore.Raft.StateMachine do
          checkpoint_effects
        ),
        do: {state, checkpoint_effects}
+
+  defp consume_checkpoint_dirty_indices do
+    case Process.delete(:sm_checkpoint_dirty_indices) do
+      %MapSet{} = indices -> indices
+      indices when is_list(indices) -> MapSet.new(indices)
+      _ -> MapSet.new()
+    end
+  end
+
+  defp record_checkpoint_dirty_index(shard_index) when is_integer(shard_index) do
+    indices = Process.get(:sm_checkpoint_dirty_indices, MapSet.new())
+    Process.put(:sm_checkpoint_dirty_indices, MapSet.put(indices, shard_index))
+  end
+
+  defp record_checkpoint_dirty_index(_shard_index), do: :ok
+
+  defp remember_checkpoint_dependencies_clean_before_write(state) do
+    if Process.get(:sm_checkpoint_dependencies_clean_before_write) != true do
+      indices = Map.get(state, :pending_release_cursor_checkpoint_indices, MapSet.new())
+
+      if Enum.any?(indices) and checkpoint_indices_clean?(state, indices) do
+        Process.put(:sm_checkpoint_dependencies_clean_before_write, true)
+      end
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp checkpoint_indices_clean?(state, indices) do
+    Enum.all?(indices, fn shard_index -> checkpoint_index_clean?(state, shard_index) end)
+  end
+
+  defp checkpoint_index_clean?(state, shard_index) do
+    case checkpoint_ctx_for_state(state) do
+      nil ->
+        true
+
+      ctx ->
+        flag_idx = shard_index + 1
+
+        checkpoint_ref_clean?(Map.get(ctx, :checkpoint_flags), flag_idx) and
+          checkpoint_ref_clean?(Map.get(ctx, :checkpoint_in_flight), flag_idx)
+    end
+  rescue
+    _ -> false
+  end
+
+  defp checkpoint_ref_clean?(nil, _flag_idx), do: true
+
+  defp checkpoint_ref_clean?(ref, flag_idx) do
+    flag_idx > :atomics.info(ref).size or :atomics.get(ref, flag_idx) == 0
+  end
 
   defp consume_pending_state(state) do
     case Process.delete(:sm_pending_state) do
@@ -3540,7 +3622,9 @@ defmodule Ferricstore.Raft.StateMachine do
             remember_checkpoint_clean_before_write(state, ctx)
           end
 
+          remember_checkpoint_dependencies_clean_before_write(state)
           :atomics.put(ctx.checkpoint_flags, flag_idx, 1)
+          record_checkpoint_dirty_index(shard_index)
         end
 
         Ferricstore.Store.DiskPressure.clear(ctx, shard_index)
@@ -3784,7 +3868,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
         if flag_idx <= :atomics.info(ctx.checkpoint_flags).size do
           remember_checkpoint_clean_before_write(state, ctx)
+          remember_checkpoint_dependencies_clean_before_write(state)
           :atomics.put(ctx.checkpoint_flags, flag_idx, 1)
+          record_checkpoint_dirty_index(state.shard_index)
         end
 
         Ferricstore.Store.DiskPressure.clear(ctx, state.shard_index)
