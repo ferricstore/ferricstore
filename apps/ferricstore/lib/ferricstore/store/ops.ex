@@ -641,8 +641,7 @@ defmodule Ferricstore.Store.Ops do
       send(self(), {:tx_pending_write, compound_key, value, expire_at_ms})
       :ok
     else
-      shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
-      GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
+      Router.compound_put(tx.instance_ctx, redis_key, compound_key, value, expire_at_ms)
     end
   end
 
@@ -661,8 +660,7 @@ defmodule Ferricstore.Store.Ops do
       send(self(), {:tx_pending_delete, compound_key})
       :ok
     else
-      shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
-      GenServer.call(shard, {:compound_delete, redis_key, compound_key})
+      Router.compound_delete(tx.instance_ctx, redis_key, compound_key)
     end
   end
 
@@ -731,8 +729,7 @@ defmodule Ferricstore.Store.Ops do
 
       :ok
     else
-      shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
-      GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
+      Router.compound_delete_prefix(tx.instance_ctx, redis_key, prefix)
     end
   end
 

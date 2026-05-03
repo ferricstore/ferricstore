@@ -377,6 +377,27 @@ defmodule Ferricstore.Store.OpsTest do
     end
   end
 
+  describe "LocalTxStore remote compound writes" do
+    test "remote writes route through Router instead of direct shard calls" do
+      source = File.read!(@ops_path)
+
+      for request <- [
+            "{:compound_put, redis_key, compound_key, value, expire_at_ms}",
+            "{:compound_delete, redis_key, compound_key}",
+            "{:compound_delete_prefix, redis_key, prefix}"
+          ] do
+        refute source =~ "GenServer.call(shard, #{request})",
+               "remote LocalTxStore compound writes must use Router so Raft/durability routing is preserved"
+      end
+
+      assert source =~
+               "Router.compound_put(tx.instance_ctx, redis_key, compound_key, value, expire_at_ms)"
+
+      assert source =~ "Router.compound_delete(tx.instance_ctx, redis_key, compound_key)"
+      assert source =~ "Router.compound_delete_prefix(tx.instance_ctx, redis_key, prefix)"
+    end
+  end
+
   defp set_opts(overrides) do
     Map.merge(
       %{expire_at_ms: 0, nx: false, xx: false, get: false, keepttl: false, has_expiry: false},
