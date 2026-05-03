@@ -28,8 +28,8 @@ defmodule Ferricstore.FsUsageGuardTest do
 
   test "storage production code uses Ferricstore.FS for filesystem metadata" do
     offenders =
-      "lib/ferricstore/**/*.ex"
-      |> Path.wildcard()
+      ["lib/ferricstore/**/*.ex", "../ferricstore_server/lib/ferricstore_server/health/**/*.ex"]
+      |> Enum.flat_map(&Path.wildcard/1)
       |> Enum.reject(&MapSet.member?(@allowed_paths, &1))
       |> Enum.flat_map(&raw_file_metadata_calls/1)
 

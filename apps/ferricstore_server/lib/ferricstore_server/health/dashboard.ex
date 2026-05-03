@@ -686,29 +686,29 @@ defmodule FerricstoreServer.Health.Dashboard do
   # Returns {total_bytes, data_file_count, hint_file_count}.
   @spec scan_shard_dir(binary()) :: {non_neg_integer(), non_neg_integer(), non_neg_integer()}
   defp scan_shard_dir(shard_dir) do
-    try do
-      files = File.ls!(shard_dir)
+    case Ferricstore.FS.ls(shard_dir) do
+      {:ok, files} ->
+        Enum.reduce(files, {0, 0, 0}, fn file, {bytes, data, hints} ->
+          full_path = Path.join(shard_dir, file)
 
-      Enum.reduce(files, {0, 0, 0}, fn file, {bytes, data, hints} ->
-        full_path = Path.join(shard_dir, file)
+          file_size =
+            case File.stat(full_path) do
+              {:ok, %{size: size}} -> size
+              _ -> 0
+            end
 
-        file_size =
-          case File.stat(full_path) do
-            {:ok, %{size: size}} -> size
-            _ -> 0
-          end
+          is_data = String.ends_with?(file, ".log")
+          is_hint = String.ends_with?(file, ".hint")
 
-        is_data = String.ends_with?(file, ".log")
-        is_hint = String.ends_with?(file, ".hint")
+          {
+            bytes + file_size,
+            if(is_data, do: data + 1, else: data),
+            if(is_hint, do: hints + 1, else: hints)
+          }
+        end)
 
-        {
-          bytes + file_size,
-          if(is_data, do: data + 1, else: data),
-          if(is_hint, do: hints + 1, else: hints)
-        }
-      end)
-    rescue
-      _ -> {0, 0, 0}
+      {:error, _reason} ->
+        {0, 0, 0}
     end
   end
 
