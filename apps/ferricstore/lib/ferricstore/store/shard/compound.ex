@@ -760,18 +760,23 @@ defmodule Ferricstore.Store.Shard.Compound do
             System.monotonic_time(:millisecond) - last >= @promoted_compaction_cooldown_ms
 
         if frag >= @promoted_frag_threshold and dead >= @promoted_dead_bytes_min and cooldown_ok do
-          state = compact_dedicated(state, redis_key, path)
-          new_total = promoted_dir_size(path)
+          case compact_dedicated_result(state, redis_key, path) do
+            {:ok, state} ->
+              new_total = promoted_dir_size(path)
 
-          new_info = %{
-            info
-            | dead_bytes: 0,
-              total_bytes: new_total,
-              last_compacted_at: System.monotonic_time(:millisecond)
-          }
+              new_info = %{
+                info
+                | dead_bytes: 0,
+                  total_bytes: new_total,
+                  last_compacted_at: System.monotonic_time(:millisecond)
+              }
 
-          new_promoted = Map.put(state.promoted_instances, redis_key, new_info)
-          %{state | promoted_instances: new_promoted}
+              new_promoted = Map.put(state.promoted_instances, redis_key, new_info)
+              %{state | promoted_instances: new_promoted}
+
+            {:error, state} ->
+              %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, info)}
+          end
         else
           %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, info)}
         end
@@ -865,6 +870,11 @@ defmodule Ferricstore.Store.Shard.Compound do
   @spec compact_dedicated(map(), binary(), binary()) :: map()
   @doc false
   def compact_dedicated(state, redis_key, dedicated_path) do
+    {_status, state} = compact_dedicated_result(state, redis_key, dedicated_path)
+    state
+  end
+
+  defp compact_dedicated_result(state, redis_key, dedicated_path) do
     Promotion.with_compaction_latch(state, redis_key, fn ->
       do_compact_dedicated(state, redis_key, dedicated_path)
     end)
@@ -880,7 +890,7 @@ defmodule Ferricstore.Store.Shard.Compound do
         "Shard #{state.index}: cannot determine prefix for promoted key #{inspect(redis_key)}, skipping compaction"
       )
 
-      state
+      {:error, state}
     else
       active = Promotion.find_active(dedicated_path)
       # Sync outgoing active before we stop writing to it, so any last
@@ -905,7 +915,7 @@ defmodule Ferricstore.Store.Shard.Compound do
         # dedicated logs so accounting does not reset while bytes remain.
         remove_dedicated_logs_before(dedicated_path, new_fid)
         _ = NIF.v2_fsync_dir(dedicated_path)
-        state
+        {:ok, state}
       else
         batch = Enum.map(live_entries, fn {k, v, exp} -> {k, v, exp} end)
 
@@ -939,7 +949,7 @@ defmodule Ferricstore.Store.Shard.Compound do
               %{shard_index: state.index, redis_key: redis_key}
             )
 
-            state
+            {:ok, state}
 
           {:error, reason} ->
             Logger.error(
@@ -950,7 +960,7 @@ defmodule Ferricstore.Store.Shard.Compound do
             # so the rollback survives a subsequent crash.
             _ = Ferricstore.FS.rm(new_file)
             _ = NIF.v2_fsync_dir(dedicated_path)
-            state
+            {:error, state}
         end
       end
     end

@@ -2,7 +2,7 @@ defmodule Ferricstore.Store.ShardAccountingTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Store.LFU
+  alias Ferricstore.Store.{CompoundKey, LFU, Promotion}
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
@@ -251,6 +251,62 @@ defmodule Ferricstore.Store.ShardAccountingTest do
         assert info.total_bytes == 100
         assert info.dead_bytes == 6 + @record_header_size + byte_size(compound_key)
       after
+        :ets.delete(keydir)
+      end
+    end
+
+    test "failed dedicated compaction preserves retry accounting" do
+      keydir = new_keydir()
+      redis_key = "hash:promoted:compact:failed"
+      compound_key = CompoundKey.hash_field(redis_key, "field")
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore-promoted-compact-fail-#{System.unique_integer([:positive])}"
+        )
+
+      original_total = 2_200_000
+      original_dead = 1_200_000
+
+      try do
+        File.mkdir_p!(dir)
+        File.touch!(Path.join(dir, "00000.log"))
+
+        :ets.insert(keydir, {Promotion.marker_key(redis_key), "hash", 0, LFU.initial(), 0, 0, 4})
+        :ets.insert(keydir, {compound_key, "value", 0, LFU.initial(), 0, 32, 5})
+
+        state = %{
+          index: 0,
+          keydir: keydir,
+          instance_ctx: nil,
+          promoted_instances: %{
+            redis_key => %{
+              path: dir,
+              total_bytes: original_total,
+              dead_bytes: original_dead,
+              last_compacted_at: nil
+            }
+          }
+        }
+
+        Process.put(:ferricstore_promoted_compaction_after_collect_hook, fn ^redis_key,
+                                                                            _live_entries ->
+          # Force v2_append_batch/2 to fail without touching unrelated paths.
+          new_log = Path.join(dir, "00001.log")
+          File.rm(new_log)
+          File.mkdir!(new_log)
+        end)
+
+        after_state = ShardCompound.bump_promoted_writes(state, redis_key)
+        info = after_state.promoted_instances[redis_key]
+
+        assert info.dead_bytes == original_dead
+        assert info.total_bytes == original_total
+        assert info.last_compacted_at == nil
+      after
+        Process.delete(:ferricstore_promoted_compaction_after_collect_hook)
+        File.rm_rf(dir)
         :ets.delete(keydir)
       end
     end
