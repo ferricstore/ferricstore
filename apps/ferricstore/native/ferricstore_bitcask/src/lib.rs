@@ -80,6 +80,7 @@ mod atoms {
         tokio_complete,
         put,
         delete,
+        mismatch,
     }
 }
 
@@ -384,6 +385,98 @@ fn v2_pread_at(env: Env<'_>, path: String, offset: u64) -> NifResult<Term<'_>> {
                 Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
             }
         }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+fn read_exact_at_for_ref(
+    file: &std::fs::File,
+    buf: &mut [u8],
+    offset: u64,
+) -> Result<bool, String> {
+    let mut read_any = false;
+    let mut total = 0;
+
+    while total < buf.len() {
+        let read_offset = offset
+            .checked_add(total as u64)
+            .ok_or_else(|| "file ref validation offset overflow".to_string())?;
+
+        match file.read_at(&mut buf[total..], read_offset) {
+            Ok(0) if !read_any => return Ok(false),
+            Ok(0) => return Err("short read while validating file ref".to_string()),
+            Ok(n) => {
+                read_any = true;
+                total += n;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+
+    Ok(true)
+}
+
+fn validate_value_ref_from_file(
+    file: &std::fs::File,
+    offset: u64,
+    expected_key: &[u8],
+    expected_value_size: u64,
+) -> Result<Option<(u64, u64)>, String> {
+    let mut header = [0u8; log::HEADER_SIZE];
+    if !read_exact_at_for_ref(file, &mut header, offset)? {
+        return Ok(None);
+    }
+
+    let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
+    let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
+
+    if value_size_raw == log::TOMBSTONE || u64::from(value_size_raw) != expected_value_size {
+        return Ok(None);
+    }
+
+    let mut key = vec![0u8; key_size];
+    if key_size > 0 {
+        let key_offset = offset
+            .checked_add(log::HEADER_SIZE as u64)
+            .ok_or_else(|| "file ref key offset overflow".to_string())?;
+        read_exact_at_for_ref(file, &mut key, key_offset)?;
+    }
+
+    if key != expected_key {
+        return Ok(None);
+    }
+
+    let value_offset = offset
+        .checked_add(log::HEADER_SIZE as u64)
+        .and_then(|off| off.checked_add(key_size as u64))
+        .ok_or_else(|| "file ref value offset overflow".to_string())?;
+
+    Ok(Some((value_offset, expected_value_size)))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_validate_value_ref<'a>(
+    env: Env<'a>,
+    path: String,
+    offset: u64,
+    expected_key: Binary,
+    expected_value_size: u64,
+) -> NifResult<Term<'a>> {
+    match std::fs::File::open(std::path::Path::new(&path)) {
+        Ok(file) => match validate_value_ref_from_file(
+            &file,
+            offset,
+            expected_key.as_slice(),
+            expected_value_size,
+        ) {
+            Ok(Some((value_offset, value_size))) => {
+                Ok((atoms::ok(), (value_offset, value_size)).encode(env))
+            }
+            Ok(None) => Ok(atoms::mismatch().encode(env)),
+            Err(e) => Ok((atoms::error(), e).encode(env)),
+        },
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
     }
 }
@@ -1900,6 +1993,43 @@ mod audit_fix_tests {
         let record = log::pread_record_from_file(&file, 0).unwrap().unwrap();
         assert_eq!(&record.key, b"testkey");
         assert_eq!(record.value.as_ref().unwrap(), b"testvalue");
+    }
+
+    #[test]
+    fn value_ref_validation_rejects_mismatched_key_without_reading_value() {
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+        let offset;
+
+        {
+            let mut writer = log::LogWriter::open_small(&path, 1).unwrap();
+            offset = writer.write(b"key_b", b"value_b", 0).unwrap();
+            writer.sync().unwrap();
+        }
+
+        let file = std::fs::File::open(&path).unwrap();
+        let result = validate_value_ref_from_file(&file, offset, b"key_a", 7).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn value_ref_validation_returns_value_slice_for_matching_key_and_size() {
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+        let offset;
+
+        {
+            let mut writer = log::LogWriter::open_small(&path, 1).unwrap();
+            offset = writer.write(b"key_a", b"value_a", 0).unwrap();
+            writer.sync().unwrap();
+        }
+
+        let file = std::fs::File::open(&path).unwrap();
+        let result = validate_value_ref_from_file(&file, offset, b"key_a", 7).unwrap();
+        assert_eq!(
+            result,
+            Some((offset + log::HEADER_SIZE as u64 + b"key_a".len() as u64, 7))
+        );
     }
 
     #[test]

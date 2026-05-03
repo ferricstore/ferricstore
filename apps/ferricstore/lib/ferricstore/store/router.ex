@@ -26,7 +26,6 @@ defmodule Ferricstore.Store.Router do
   import Bitwise, only: [band: 2]
 
   @slot_mask 1023
-  @bitcask_header_size 26
   @cold_batch_read_timeout_ms 10_000
   @async_list_rollback_key :ferricstore_async_list_originals
 
@@ -1501,15 +1500,12 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, file_id, offset, value_size}
       when valid_cold_location(file_id, offset, value_size) ->
-        # Cold key — return file ref directly, no GenServer needed.
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
 
         path =
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
-        # Adjust offset to skip header and key bytes (sendfile needs value offset).
-        value_offset = offset + @bitcask_header_size + byte_size(key)
-        {path, value_offset, value_size}
+        validated_file_ref(path, offset, key, value_size)
 
       {:cold, _file_id, _offset, _value_size} ->
         # Invalid file ref — fall back to GenServer.
@@ -1554,16 +1550,20 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, file_id, offset, value_size}
       when valid_cold_location(file_id, offset, value_size) ->
-        # Value is on disk — return file ref for potential sendfile.
-        # Use DataDir directly to avoid GenServer roundtrip.
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
 
         path =
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
-        value_offset = offset + @bitcask_header_size + byte_size(key)
-        Stats.record_cold_read(ctx, key)
-        {:cold_ref, path, value_offset, value_size}
+        case validated_file_ref(path, offset, key, value_size) do
+          {^path, value_offset, ^value_size} ->
+            Stats.record_cold_read(ctx, key)
+            {:cold_ref, path, value_offset, value_size}
+
+          nil ->
+            Stats.incr_keyspace_misses(ctx)
+            :miss
+        end
 
       {:cold, _file_id, _offset, _value_size} ->
         # Cold entry but no valid file ref — ask GenServer
@@ -1597,6 +1597,13 @@ defmodule Ferricstore.Store.Router do
           Stats.incr_keyspace_misses(ctx)
           :miss
         end
+    end
+  end
+
+  defp validated_file_ref(path, record_offset, key, value_size) do
+    case Ferricstore.Bitcask.NIF.v2_validate_value_ref(path, record_offset, key, value_size) do
+      {:ok, {value_offset, ^value_size}} -> {path, value_offset, value_size}
+      _ -> nil
     end
   end
 

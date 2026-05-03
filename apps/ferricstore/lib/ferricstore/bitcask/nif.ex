@@ -39,6 +39,11 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec v2_pread_at(binary(), non_neg_integer()) :: {:ok, binary()} | {:error, term()}
   def v2_pread_at(_path, _offset), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec v2_validate_value_ref(binary(), non_neg_integer(), binary(), non_neg_integer()) ::
+          {:ok, {non_neg_integer(), non_neg_integer()}} | :mismatch | {:error, term()}
+  def v2_validate_value_ref(_path, _offset, _expected_key, _expected_value_size),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec v2_scan_file(binary()) ::
           {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()}]}
           | {:error, term()}

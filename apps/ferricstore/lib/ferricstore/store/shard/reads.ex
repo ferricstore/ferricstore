@@ -6,7 +6,6 @@ defmodule Ferricstore.Store.Shard.Reads do
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
-  @bitcask_header_size 26
   @cold_read_timeout_ms 10_000
 
   defguardp valid_cold_location(file_id, offset, value_size)
@@ -94,11 +93,8 @@ defmodule Ferricstore.Store.Shard.Reads do
         {:reply, nil, state}
 
       {:cold, fid, off, vsize, _exp} ->
-        # Cold key — location known from ETS 7-tuple.
-        # Adjust offset to skip header and key bytes to get to the value.
         p = ShardETS.file_path(state.shard_data_path, fid)
-        value_offset = off + @bitcask_header_size + byte_size(key)
-        {:reply, {p, value_offset, vsize}, state}
+        {:reply, validated_file_ref(p, off, key, vsize), state}
 
       :miss ->
         if ShardETS.pending_cold?(state, key) do
@@ -234,10 +230,17 @@ defmodule Ferricstore.Store.Shard.Reads do
     case ShardETS.ets_lookup(state, key) do
       {:cold, fid, off, vsize, _exp} ->
         p = ShardETS.file_path(state.shard_data_path, fid)
-        {p, off + @bitcask_header_size + byte_size(key), vsize}
+        validated_file_ref(p, off, key, vsize)
 
       _ ->
         nil
+    end
+  end
+
+  defp validated_file_ref(path, record_offset, key, value_size) do
+    case Ferricstore.Bitcask.NIF.v2_validate_value_ref(path, record_offset, key, value_size) do
+      {:ok, {value_offset, ^value_size}} -> {path, value_offset, value_size}
+      _ -> nil
     end
   end
 
