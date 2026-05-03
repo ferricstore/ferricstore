@@ -1323,6 +1323,7 @@ defmodule Ferricstore.Store.Router do
 
     case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, batch) do
       {:ok, locations} ->
+        mark_checkpoint_dirty(ctx, idx)
         {:ok, file_id, locations}
 
       {:error, reason} when is_binary(reason) ->
@@ -1330,8 +1331,12 @@ defmodule Ferricstore.Store.Router do
           {fresh_id, fresh_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
 
           case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(fresh_path, batch) do
-            {:ok, locations} -> {:ok, fresh_id, locations}
-            {:error, _} = err -> err
+            {:ok, locations} ->
+              mark_checkpoint_dirty(ctx, idx)
+              {:ok, fresh_id, locations}
+
+            {:error, _} = err ->
+              err
           end
         else
           {:error, reason}
@@ -1341,6 +1346,18 @@ defmodule Ferricstore.Store.Router do
         err
     end
   end
+
+  defp mark_checkpoint_dirty(%{checkpoint_flags: flags}, idx) when is_integer(idx) do
+    flag_idx = idx + 1
+
+    if flag_idx <= :atomics.info(flags).size do
+      :atomics.put(flags, flag_idx, 1)
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp mark_checkpoint_dirty(_ctx, _idx), do: :ok
 
   # -- Keydir binary memory tracking --
   # Only counts binaries > 64 bytes (refc binaries, off-heap).

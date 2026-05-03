@@ -63,6 +63,22 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
       )
     end
 
+    test "large async PUT marks Bitcask checkpoint dirty before Ra apply" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "alv_test:checkpoint_dirty_#{System.unique_integer([:positive])}"
+      idx = Router.shard_for(ctx, key)
+      flag_idx = idx + 1
+      value = cold_value(?d)
+
+      :atomics.put(ctx.checkpoint_flags, flag_idx, 0)
+      :atomics.put(ctx.checkpoint_in_flight, flag_idx, 0)
+
+      assert :ok = Router.put(ctx, key, value, 0)
+
+      assert :atomics.get(ctx.checkpoint_flags, flag_idx) == 1,
+             "Router nosync large writes must mark Bitcask dirty before release_cursor can advance"
+    end
+
     test "small value still works (inline ETS)" do
       :ok = Router.put(FerricStore.Instance.get(:default), "alv_test:small1", "hello", 0)
       assert Router.get(FerricStore.Instance.get(:default), "alv_test:small1") == "hello"
