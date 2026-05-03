@@ -1280,7 +1280,7 @@ fn pread_batch_for_path(
                 record.value
             }
             Ok(None) => None,
-            Err(_e) => None,
+            Err(e) => return Err(format!("pread batch {path}:{offset}: {e}")),
         };
 
         results.push((index, value));
@@ -1322,7 +1322,7 @@ fn pread_batch_for_path_keyed(
                 }
             }
             Ok(None) => None,
-            Err(_e) => None,
+            Err(e) => return Err(format!("pread keyed batch {path}:{offset}: {e}")),
         };
 
         results.push((index, value));
@@ -2117,6 +2117,32 @@ mod audit_fix_tests {
     }
 
     #[test]
+    fn grouped_batch_pread_returns_error_on_corrupt_record() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        let good = writer.write(b"good", b"value", 0).unwrap();
+        let corrupt = writer.write(b"corrupt", b"bad_value", 0).unwrap();
+        writer.sync().unwrap();
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let corrupt_value_byte = corrupt + log::HEADER_SIZE as u64 + b"corrupt".len() as u64;
+        file.write_at(b"X", corrupt_value_byte).unwrap();
+        file.sync_data().unwrap();
+
+        let err = pread_batch_grouped(vec![
+            (path.to_string_lossy().into_owned(), good),
+            (path.to_string_lossy().into_owned(), corrupt),
+        ])
+        .unwrap_err();
+
+        assert!(err.contains("CRC") || err.contains("mismatch"));
+    }
+
+    #[test]
     fn keyed_batch_pread_filters_mismatched_offsets_without_reordering() {
         let dir = tmp();
         let path_a = dir.path().join("00000000000000000001.log");
@@ -2178,7 +2204,7 @@ mod audit_fix_tests {
     }
 
     #[test]
-    fn keyed_batch_pread_isolates_corrupt_record_in_same_file() {
+    fn keyed_batch_pread_returns_error_on_corrupt_record() {
         use std::os::unix::fs::FileExt;
 
         let dir = tmp();
@@ -2187,7 +2213,6 @@ mod audit_fix_tests {
         let mut writer = log::LogWriter::open(&path, 1).unwrap();
         let good_before = writer.write(b"good_before", b"value_before", 0).unwrap();
         let corrupt = writer.write(b"corrupt", b"bad_value", 0).unwrap();
-        let good_after = writer.write(b"good_after", b"value_after", 0).unwrap();
         writer.sync().unwrap();
 
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -2195,7 +2220,7 @@ mod audit_fix_tests {
         file.write_at(b"X", corrupt_value_byte).unwrap();
         file.sync_data().unwrap();
 
-        let values = pread_batch_grouped_keyed(vec![
+        let err = pread_batch_grouped_keyed(vec![
             (
                 path.to_string_lossy().into_owned(),
                 good_before,
@@ -2206,17 +2231,10 @@ mod audit_fix_tests {
                 corrupt,
                 b"corrupt".to_vec(),
             ),
-            (
-                path.to_string_lossy().into_owned(),
-                good_after,
-                b"good_after".to_vec(),
-            ),
         ])
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(values[0].as_deref(), Some(&b"value_before"[..]));
-        assert_eq!(values[1], None);
-        assert_eq!(values[2].as_deref(), Some(&b"value_after"[..]));
+        assert!(err.contains("CRC") || err.contains("mismatch"));
     }
 
     #[test]
