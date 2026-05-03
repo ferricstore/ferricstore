@@ -2182,7 +2182,7 @@ defmodule Ferricstore.Store.Router do
           nil
       end
     rescue
-      ArgumentError -> nil
+      ArgumentError -> keydir_unavailable(ctx, idx, :expire_at_ms, nil)
     end
   end
 
@@ -2222,7 +2222,7 @@ defmodule Ferricstore.Store.Router do
           nil
       end
     rescue
-      ArgumentError -> nil
+      ArgumentError -> keydir_unavailable(ctx, idx, :value_size, nil)
     end
   end
 
@@ -2839,7 +2839,7 @@ defmodule Ferricstore.Store.Router do
           false
       end
     rescue
-      ArgumentError -> false
+      ArgumentError -> keydir_unavailable(ctx, idx, :exists, false)
     end
   end
 
@@ -3189,8 +3189,12 @@ defmodule Ferricstore.Store.Router do
     count
   rescue
     ArgumentError ->
-      emit_shard_unavailable(ctx, idx, :dbsize, :keydir_unavailable)
-      0
+      keydir_unavailable(ctx, idx, :dbsize, 0)
+  end
+
+  defp keydir_unavailable(ctx, idx, request, fallback) do
+    emit_shard_unavailable(ctx, idx, request, :keydir_unavailable)
+    fallback
   end
 
   @doc """

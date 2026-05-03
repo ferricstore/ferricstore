@@ -59,6 +59,29 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
                     %{request: :dbsize, reason: :keydir_unavailable, shard_index: 0}}
   end
 
+  test "metadata-only reads report unavailable keydir fallbacks" do
+    ctx = unavailable_ctx()
+    handler_id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :store, :shard_unavailable],
+        &__MODULE__.handle_telemetry/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert nil == Router.expire_at_ms(ctx, "restart:ttl")
+    assert nil == Router.value_size(ctx, "restart:size")
+    assert false == Router.exists?(ctx, "restart:exists")
+
+    assert_keydir_unavailable_event(:expire_at_ms)
+    assert_keydir_unavailable_event(:value_size)
+    assert_keydir_unavailable_event(:exists)
+  end
+
   test "unavailable shard fallbacks emit telemetry" do
     ctx = unavailable_ctx()
     handler_id = {__MODULE__, make_ref()}
@@ -141,5 +164,10 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
   defp assert_unavailable_event(request) do
     assert_receive {:telemetry_event, [:ferricstore, :store, :shard_unavailable], %{count: 1},
                     %{request: ^request, reason: :noproc, shard_index: 0}}
+  end
+
+  defp assert_keydir_unavailable_event(request) do
+    assert_receive {:telemetry_event, [:ferricstore, :store, :shard_unavailable], %{count: 1},
+                    %{request: ^request, reason: :keydir_unavailable, shard_index: 0}}
   end
 end
