@@ -2014,6 +2014,7 @@ defmodule Ferricstore.Store.Router do
             value
 
           :miss ->
+            Stats.incr_keyspace_misses(ctx)
             nil
         end
     end)

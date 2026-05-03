@@ -158,6 +158,18 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     assert [nil] == Router.batch_get(ctx, [key])
   end
 
+  test "failed batch cold GET increments keyspace misses", %{ctx: ctx, keydir: keydir} do
+    key = "cold_batch_missing_stats:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 9, 0, 5})
+
+    before_misses = Stats.keyspace_misses(ctx)
+    before_cold_reads = Stats.total_cold_reads(ctx)
+
+    assert [nil] == Router.batch_get(ctx, [key])
+    assert Stats.keyspace_misses(ctx) == before_misses + 1
+    assert Stats.total_cold_reads(ctx) == before_cold_reads
+  end
+
   test "batch cold read top-level errors preserve reason for telemetry" do
     source = File.read!(Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__))
     [_before, section] = String.split(source, "{:error, _reason} ->", parts: 2)
