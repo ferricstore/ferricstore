@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   @moduledoc "Shard-level CAS, distributed lock, rate-limit, and list operation handlers with Raft and direct-write paths."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Store.{ValueCodec}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
@@ -46,23 +47,19 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
   # Synchronous wrapper around Batcher.write_async_quorum: enqueues into the
   # quorum slot regardless of namespace, then receives the reply for this
-  # specific command.
+  # specific command. The alias-backed waiter drops late replies after timeout
+  # so connection/shard mailboxes do not retain stale Raft results.
   defp forced_quorum_call(shard_index, command) do
-    ref = make_ref()
+    {from, token} = ReplyAwaiter.new()
 
     from =
       case Process.get(:ferricstore_forward_origin) do
-        nil -> {self(), ref}
-        origin_node -> Ferricstore.Raft.Batcher.remote_origin_from(origin_node, {self(), ref})
+        nil -> from
+        origin_node -> Ferricstore.Raft.Batcher.remote_origin_from(origin_node, from)
       end
 
     Ferricstore.Raft.Batcher.write_async_quorum(shard_index, command, from)
-
-    receive do
-      {^ref, reply} -> reply
-    after
-      10_000 -> {:error, "ERR forced-quorum write timeout"}
-    end
+    ReplyAwaiter.await(token, 10_000, {:error, "ERR forced-quorum write timeout"})
   end
 
   defp handle_cas_direct(key, expected, new_value, ttl_ms, state) do

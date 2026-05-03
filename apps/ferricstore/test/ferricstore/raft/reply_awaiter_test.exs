@@ -46,4 +46,14 @@ defmodule Ferricstore.Raft.ReplyAwaiterTest do
     GenServer.reply(from, :late)
     refute_receive {_tag, :late}, 50
   end
+
+  test "forced quorum shard-native calls use alias-backed waiters" do
+    source =
+      Path.expand("../../..", __DIR__)
+      |> Path.join("lib/ferricstore/store/shard/native_ops.ex")
+      |> File.read!()
+
+    assert source =~ "ReplyAwaiter.new()"
+    refute source =~ "{self(), ref}"
+  end
 end
