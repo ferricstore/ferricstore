@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.ShardETSTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
@@ -130,6 +131,32 @@ defmodule Ferricstore.Store.ShardETSTest do
       assert [] == :ets.lookup(keydir, key)
     after
       :ets.delete(keydir)
+    end
+  end
+
+  test "prefix scan rejects mismatched cold offsets" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+
+    dir =
+      Path.join(System.tmp_dir!(), "shard_ets_prefix_stale_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+
+    prefix = "H:stale-scan"
+    key = prefix <> <<0>> <> "field"
+    other_key = "H:other-scan" <> <<0>> <> "field"
+    path = ShardETS.file_path(dir, 0)
+
+    try do
+      {:ok, [{other_offset, _}, {_key_offset, value_size}]} =
+        NIF.v2_append_batch(path, [{other_key, "wrong-value", 0}, {key, "right-value", 0}])
+
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
+
+      assert [] == ShardETS.prefix_scan_entries(keydir, prefix, dir)
+    after
+      :ets.delete(keydir)
+      File.rm_rf!(dir)
     end
   end
 

@@ -428,7 +428,7 @@ defmodule Ferricstore.Store.Shard.ETS do
           value == nil and shard_data_path != nil ->
             field = prefix_field(key)
             file_path = file_path(shard_data_path, fid)
-            entry = {field, file_path, off}
+            entry = {field, key, file_path, off}
             {[{:cold, cold_count} | tokens], {[entry | cold_entries], cold_count + 1}}
 
           value != nil ->
@@ -467,10 +467,13 @@ defmodule Ferricstore.Store.Shard.ETS do
   defp prefix_read_cold_batch_async([]), do: []
 
   defp prefix_read_cold_batch_async(entries) do
-    locations = Enum.map(entries, fn {_field, file_path, off} -> {file_path, off} end)
+    locations = Enum.map(entries, fn {_field, key, file_path, off} -> {file_path, off, key} end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_batch_read_timeout_ms) do
+      case Ferricstore.Store.ColdRead.pread_batch_keyed(
+             locations,
+             @cold_batch_read_timeout_ms
+           ) do
         {:ok, values} when is_list(values) ->
           if length(values) == length(entries) do
             values
@@ -484,7 +487,7 @@ defmodule Ferricstore.Store.Shard.ETS do
 
     Enum.zip(entries, values)
     |> Enum.map(fn
-      {{field, _file_path, _off}, value} when value != nil -> {field, value}
+      {{field, _key, _file_path, _off}, value} when value != nil -> {field, value}
       {_entry, _value} -> nil
     end)
   end
