@@ -16,6 +16,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.Batcher
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -90,6 +91,19 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
     test "key starting with colon has empty prefix" do
       assert "" == Batcher.extract_prefix({:delete, ":leadingcolon"})
+    end
+
+    test "compound keys use their parent Redis key namespace" do
+      key = "cmpd_async:user:1"
+
+      assert "cmpd_async" ==
+               Batcher.extract_prefix({:put, CompoundKey.hash_field(key, "name"), "alice", 0})
+
+      assert "cmpd_async" ==
+               Batcher.extract_prefix({:delete, CompoundKey.type_key(key)})
+
+      assert "cmpd_async" ==
+               Batcher.extract_prefix({:put, CompoundKey.list_meta_key(key), "meta", 0})
     end
   end
 

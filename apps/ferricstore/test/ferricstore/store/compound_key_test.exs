@@ -178,6 +178,20 @@ defmodule Ferricstore.Store.CompoundKeyTest do
     end
   end
 
+  describe "extract_redis_key/1" do
+    test "extracts parent key from compound data and metadata keys" do
+      key = "ns:user:123"
+
+      assert key == CompoundKey.extract_redis_key(CompoundKey.hash_field(key, "name"))
+      assert key == CompoundKey.extract_redis_key(CompoundKey.list_element(key, 1.0))
+      assert key == CompoundKey.extract_redis_key(CompoundKey.set_member(key, "tag"))
+      assert key == CompoundKey.extract_redis_key(CompoundKey.zset_member(key, "member"))
+      assert key == CompoundKey.extract_redis_key(CompoundKey.type_key(key))
+      assert key == CompoundKey.extract_redis_key(CompoundKey.list_meta_key(key))
+      assert key == CompoundKey.extract_redis_key("PM:" <> key)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Internal key detection
   # ---------------------------------------------------------------------------

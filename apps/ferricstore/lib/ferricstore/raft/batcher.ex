@@ -495,12 +495,22 @@ defmodule Ferricstore.Raft.Batcher do
       end
 
     if is_binary(key) do
-      case :binary.split(key, ":") do
-        [^key] -> "_root"
-        [prefix | _rest] -> prefix
-      end
+      key
+      |> Ferricstore.Store.CompoundKey.extract_redis_key()
+      |> extract_namespace_prefix()
     else
       "_root"
+    end
+  end
+
+  defp extract_namespace_prefix("") do
+    "_root"
+  end
+
+  defp extract_namespace_prefix(key) do
+    case :binary.split(key, ":") do
+      [^key] -> "_root"
+      [prefix | _rest] -> prefix
     end
   end
 

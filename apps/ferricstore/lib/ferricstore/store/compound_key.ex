@@ -183,13 +183,16 @@ defmodule Ferricstore.Store.CompoundKey do
   """
   @spec encode_position(number()) :: binary()
   def encode_position(position) when is_integer(position) and position >= 0 do
-    "P" <> String.pad_leading(Integer.to_string(position), 20, "0") <>
+    "P" <>
+      String.pad_leading(Integer.to_string(position), 20, "0") <>
       ".00000000000000000"
   end
 
   def encode_position(position) when is_integer(position) and position < 0 do
     comp_int = 99_999_999_999_999_999_999 - abs(position)
-    "N" <> String.pad_leading(Integer.to_string(comp_int), 20, "0") <>
+
+    "N" <>
+      String.pad_leading(Integer.to_string(comp_int), 20, "0") <>
       ".99999999999999999"
   end
 
@@ -198,7 +201,9 @@ defmodule Ferricstore.Store.CompoundKey do
     int_part = trunc(position)
     frac_part = position - int_part
     frac_digits = trunc(frac_part * 100_000_000_000_000_000)
-    "P" <> String.pad_leading(Integer.to_string(int_part), 20, "0") <>
+
+    "P" <>
+      String.pad_leading(Integer.to_string(int_part), 20, "0") <>
       "." <> String.pad_leading(Integer.to_string(frac_digits), 17, "0")
   end
 
@@ -215,7 +220,8 @@ defmodule Ferricstore.Store.CompoundKey do
     comp_int = 99_999_999_999_999_999_999 - int_part
     comp_frac = 99_999_999_999_999_999 - frac_digits
 
-    "N" <> String.pad_leading(Integer.to_string(comp_int), 20, "0") <>
+    "N" <>
+      String.pad_leading(Integer.to_string(comp_int), 20, "0") <>
       "." <> String.pad_leading(Integer.to_string(comp_frac), 17, "0")
   end
 
@@ -394,6 +400,9 @@ defmodule Ferricstore.Store.CompoundKey do
   def extract_redis_key(<<"S:", rest::binary>>), do: extract_before_separator(rest)
   def extract_redis_key(<<"Z:", rest::binary>>), do: extract_before_separator(rest)
   def extract_redis_key(<<"T:", rest::binary>>), do: rest
+  def extract_redis_key(<<"LM:", rest::binary>>), do: rest
+  def extract_redis_key(<<"VM:", rest::binary>>), do: extract_before_separator(rest)
+  def extract_redis_key(<<"PM:", rest::binary>>), do: rest
   def extract_redis_key(<<"V:", rest::binary>>), do: extract_before_separator(rest)
   def extract_redis_key(key), do: key
 
