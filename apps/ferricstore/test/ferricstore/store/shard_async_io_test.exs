@@ -1323,6 +1323,19 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert flush_offset < reduce_offset
     end
 
+    test "groups compaction live entries in one keydir pass before per-file work" do
+      source =
+        Path.expand("../../../lib/ferricstore/store/shard.ex", __DIR__)
+        |> File.read!()
+
+      fold_pos = :binary.match(source, "group_compaction_live_entries")
+      reduce_pos = :binary.match(source, "Enum.reduce(file_ids")
+
+      assert {fold_offset, _} = fold_pos
+      assert {reduce_offset, _} = reduce_pos
+      assert fold_offset < reduce_offset
+    end
+
     test "ignores promoted dedicated entries when compacting shared log files" do
       {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
 

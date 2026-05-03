@@ -668,21 +668,15 @@ defmodule Ferricstore.Store.Shard do
     # v2 compaction: for each file_id, collect live key offsets from ETS,
     # copy them to a new file, then replace the old file.
     # Track statistics for the merge scheduler.
+    live_entries_by_fid = group_compaction_live_entries(state, file_ids)
+
     {total_written, total_dropped, total_reclaimed, compacted_file_ids, skipped_file_ids,
      failures} =
       Enum.reduce(file_ids, {0, 0, 0, [], [], []}, fn fid,
                                                       {written, dropped, reclaimed, compacted,
                                                        skipped, failures} ->
         source = file_path(sp, fid)
-
-        live_entries =
-          :ets.foldl(
-            fn {key, _value, _exp, _lfu, f, off, _vsize}, acc ->
-              if shared_compaction_entry?(state, key, f, fid), do: [{key, off} | acc], else: acc
-            end,
-            [],
-            state.keydir
-          )
+        live_entries = Map.get(live_entries_by_fid, fid, [])
 
         cond do
           fid == state.active_file_id ->
@@ -1170,6 +1164,25 @@ defmodule Ferricstore.Store.Shard do
     hint_name = "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.hint"
     _ = Ferricstore.FS.rm(Path.join(shard_path, hint_name))
     :ok
+  end
+
+  defp group_compaction_live_entries(_state, []), do: %{}
+
+  defp group_compaction_live_entries(state, file_ids) do
+    target_fids = MapSet.new(file_ids)
+
+    :ets.foldl(
+      fn {key, _value, _exp, _lfu, fid, off, _vsize}, acc ->
+        if MapSet.member?(target_fids, fid) and fid != state.active_file_id and
+             shared_compaction_entry?(state, key, fid, fid) do
+          Map.update(acc, fid, [{key, off}], &[{key, off} | &1])
+        else
+          acc
+        end
+      end,
+      %{},
+      state.keydir
+    )
   end
 
   defp shared_compaction_entry?(state, key, fid, target_fid) do
