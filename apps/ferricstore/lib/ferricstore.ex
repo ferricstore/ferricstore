@@ -515,12 +515,7 @@ defmodule FerricStore do
   @spec mget([key()]) :: {:ok, [value() | nil]}
   def mget(keys) when is_list(keys) do
     ctx = default_ctx()
-
-    values =
-      Enum.map(keys, fn key ->
-        Router.get(ctx, key)
-      end)
-
+    values = Router.batch_get(ctx, keys)
     {:ok, values}
   end
 
@@ -5275,6 +5270,7 @@ defmodule FerricStore do
     %{
       get: fn k -> Router.get(ctx, k) end,
       get_meta: fn k -> Router.get_meta(ctx, k) end,
+      batch_get: fn keys -> Router.batch_get(ctx, keys) end,
       put: fn k, v, exp -> Router.put(ctx, k, v, exp) end,
       delete: fn k -> Router.delete(ctx, k) end,
       exists?: fn k -> Router.exists?(ctx, k) end,
@@ -5291,6 +5287,12 @@ defmodule FerricStore do
       end,
       compound_get_meta: fn redis_key, compound_key ->
         Router.compound_get_meta(ctx, redis_key, compound_key)
+      end,
+      compound_batch_get: fn redis_key, compound_keys ->
+        Router.compound_batch_get(ctx, redis_key, compound_keys)
+      end,
+      compound_batch_get_meta: fn redis_key, compound_keys ->
+        Router.compound_batch_get_meta(ctx, redis_key, compound_keys)
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
@@ -5331,6 +5333,7 @@ defmodule FerricStore do
     %{
       get: fn k -> Router.get(ctx, k) end,
       get_meta: fn k -> Router.get_meta(ctx, k) end,
+      batch_get: fn keys -> Router.batch_get(ctx, keys) end,
       put: fn k, v, exp -> Router.put(ctx, k, v, exp) end,
       delete: fn k -> Router.delete(ctx, k) end,
       exists?: fn k -> Router.exists?(ctx, k) end,
@@ -5459,6 +5462,7 @@ defmodule FerricStore do
     %{
       get: fn k -> Router.get(ctx, k) end,
       get_meta: fn k -> Router.get_meta(ctx, k) end,
+      batch_get: fn keys -> Router.batch_get(ctx, keys) end,
       put: fn k, v, exp -> Router.put(ctx, k, v, exp) end,
       delete: fn k -> Router.delete(ctx, k) end,
       exists?: fn k -> Router.exists?(ctx, k) end,
@@ -5472,6 +5476,12 @@ defmodule FerricStore do
       end,
       compound_get_meta: fn redis_key, compound_key ->
         Router.compound_get_meta(ctx, redis_key, compound_key)
+      end,
+      compound_batch_get: fn redis_key, compound_keys ->
+        Router.compound_batch_get(ctx, redis_key, compound_keys)
+      end,
+      compound_batch_get_meta: fn redis_key, compound_keys ->
+        Router.compound_batch_get_meta(ctx, redis_key, compound_keys)
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
