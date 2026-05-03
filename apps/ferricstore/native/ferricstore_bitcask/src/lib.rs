@@ -1227,11 +1227,12 @@ fn v2_pread_at_key_async<'a>(
 ///
 /// Each location is `{path, offset}`. All reads run concurrently on Tokio
 /// worker threads. When ALL reads complete, sends a single message:
-/// `{:tokio_complete, correlation_id, :ok, [value | nil, ...]}`
+/// `{:tokio_complete, correlation_id, :ok, [value | nil | {:error, reason}, ...]}`
 /// to the caller.
 ///
 /// This is the async counterpart of `v2_pread_batch/2` and is used by the
-/// MGET / GET_BATCH cold path.
+/// MGET / GET_BATCH cold path. Decode/read failures are reported per index
+/// so one corrupt record does not poison unrelated records in the batch.
 fn group_pread_locations(
     locations: Vec<(String, u64)>,
 ) -> (usize, Vec<(String, Vec<(usize, u64)>)>) {

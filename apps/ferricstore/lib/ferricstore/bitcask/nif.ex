@@ -59,7 +59,8 @@ defmodule Ferricstore.Bitcask.NIF do
           | {:error, term()}
   def v2_scan_tombstones(_path), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec v2_pread_batch(binary(), [non_neg_integer()]) :: {:ok, [binary()]} | {:error, term()}
+  @spec v2_pread_batch(binary(), [non_neg_integer()]) ::
+          {:ok, [binary() | nil]} | {:error, term()}
   def v2_pread_batch(_path, _locations), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec v2_fsync(binary()) :: :ok | {:error, term()}
@@ -130,6 +131,9 @@ defmodule Ferricstore.Bitcask.NIF do
   def v2_append_ops_batch_nosync(_path, _records), do: :erlang.nif_error(:nif_not_loaded)
 
   # -- v2 Tokio async IO NIFs --
+  @type pread_batch_value :: binary() | nil | {:error, binary()}
+  @type pread_batch_result :: [pread_batch_value()]
+
   @spec v2_pread_at_async(pid(), term(), binary(), non_neg_integer()) :: :ok | {:error, term()}
   def v2_pread_at_async(_caller_pid, _correlation_id, _path, _offset),
     do: :erlang.nif_error(:nif_not_loaded)
