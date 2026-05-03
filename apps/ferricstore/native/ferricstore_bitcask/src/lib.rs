@@ -374,11 +374,10 @@ fn v2_scan_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
     match log::LogReader::open(p) {
         Ok(mut reader) => {
             let records = reader
-                .iter_from_start_tolerant()
+                .iter_metadata_from_start_tolerant()
                 .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
 
             let mut results: Vec<Term<'a>> = Vec::with_capacity(records.len());
-            let mut offset: u64 = 0;
 
             for record in &records {
                 // M-REMAIN-1 fix: handle OOM gracefully instead of panicking.
@@ -394,24 +393,16 @@ fn v2_scan_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
                     }
                 };
 
-                let value_size = record.value.as_ref().map_or(0u32, |v| v.len() as u32);
-                let is_tombstone = record.value.is_none();
-
                 let tuple = (
                     key_bin,
-                    offset,
-                    value_size,
+                    record.offset,
+                    record.value_size,
                     record.expire_at_ms,
-                    is_tombstone,
+                    record.is_tombstone,
                 )
                     .encode(env);
 
                 results.push(tuple);
-
-                // Advance offset past this record
-                offset += (log::HEADER_SIZE
-                    + record.key.len()
-                    + record.value.as_ref().map_or(0, Vec::len)) as u64;
             }
 
             Ok((atoms::ok(), results).encode(env))
@@ -437,11 +428,10 @@ fn v2_scan_file_from_offset<'a>(
     match log::LogReader::open(p) {
         Ok(mut reader) => {
             let records = reader
-                .iter_from_offset_tolerant(start_offset)
+                .iter_metadata_from_offset_tolerant(start_offset)
                 .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
 
             let mut results: Vec<Term<'a>> = Vec::with_capacity(records.len());
-            let mut offset: u64 = start_offset;
 
             for record in &records {
                 let key_bin = match OwnedBinary::new(record.key.len()) {
@@ -456,23 +446,16 @@ fn v2_scan_file_from_offset<'a>(
                     }
                 };
 
-                let value_size = record.value.as_ref().map_or(0u32, |v| v.len() as u32);
-                let is_tombstone = record.value.is_none();
-
                 let tuple = (
                     key_bin,
-                    offset,
-                    value_size,
+                    record.offset,
+                    record.value_size,
                     record.expire_at_ms,
-                    is_tombstone,
+                    record.is_tombstone,
                 )
                     .encode(env);
 
                 results.push(tuple);
-
-                offset += (log::HEADER_SIZE
-                    + record.key.len()
-                    + record.value.as_ref().map_or(0, Vec::len)) as u64;
             }
 
             Ok((atoms::ok(), results).encode(env))

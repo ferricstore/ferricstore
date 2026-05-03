@@ -63,6 +63,18 @@ pub struct Record {
     pub value: Option<Vec<u8>>,
 }
 
+/// Metadata for a record whose value bytes were validated but not materialized.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecordMetadata {
+    pub timestamp_ms: u64,
+    pub expire_at_ms: u64,
+    pub key: Vec<u8>,
+    pub value_size: u32,
+    pub is_tombstone: bool,
+    pub offset: u64,
+    pub record_size: u64,
+}
+
 /// Writes new records to a log file (always appends).
 ///
 /// Uses the best available I/O backend selected at startup:
@@ -493,6 +505,24 @@ impl LogReader {
         }
         Ok(records)
     }
+
+    /// Iterate record metadata without materializing value bytes.
+    ///
+    /// Used by startup, recovery, and compaction keydir scans where only key,
+    /// offset, value size, expiry, and tombstone state are needed.
+    pub fn iter_metadata_from_start_tolerant(&mut self) -> Result<Vec<RecordMetadata>> {
+        self.file.seek(SeekFrom::Start(0))?;
+        iter_metadata_tolerant(&mut self.file, 0)
+    }
+
+    /// Iterate record metadata from an exact byte offset without materializing values.
+    pub fn iter_metadata_from_offset_tolerant(
+        &mut self,
+        offset: u64,
+    ) -> Result<Vec<RecordMetadata>> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        iter_metadata_tolerant(&mut self.file, offset)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +590,34 @@ fn read_exact_vec(reader: &mut impl Read, len: usize, label: &str) -> Result<Vec
     }
 
     Ok(out)
+}
+
+fn hash_exact(
+    reader: &mut impl Read,
+    len: usize,
+    hasher: &mut crc32fast::Hasher,
+    label: &str,
+) -> Result<()> {
+    let mut chunk = [0u8; STREAM_READ_CHUNK_SIZE];
+    let mut remaining = len;
+
+    while remaining > 0 {
+        let to_read = remaining.min(STREAM_READ_CHUNK_SIZE);
+        match reader.read_exact(&mut chunk[..to_read]) {
+            Ok(()) => {
+                hasher.update(&chunk[..to_read]);
+                remaining -= to_read;
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(LogError(format!(
+                    "truncated record {label}: expected {len} bytes"
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(())
 }
 
 /// Encode a record into a single `Vec` allocation.
@@ -746,6 +804,72 @@ fn read_next_record(reader: &mut impl Read) -> Result<Option<Record>> {
     };
 
     Ok(Some(record))
+}
+
+fn iter_metadata_tolerant(
+    reader: &mut impl Read,
+    start_offset: u64,
+) -> Result<Vec<RecordMetadata>> {
+    let mut records = Vec::new();
+    let mut offset = start_offset;
+
+    while let Ok(Some(record)) = read_next_record_metadata(reader, offset) {
+        offset = offset
+            .checked_add(record.record_size)
+            .ok_or_else(|| LogError("record offset overflow".into()))?;
+        records.push(record);
+    }
+
+    Ok(records)
+}
+
+fn read_next_record_metadata(
+    reader: &mut impl Read,
+    offset: u64,
+) -> Result<Option<RecordMetadata>> {
+    let mut header = [0u8; HEADER_SIZE];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+
+    let stored_crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let timestamp_ms = u64::from_le_bytes(header[4..12].try_into().unwrap());
+    let expire_at_ms = u64::from_le_bytes(header[12..20].try_into().unwrap());
+    let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
+    let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
+    let is_tombstone = value_size_raw == TOMBSTONE;
+    let value_size = decoded_value_size(value_size_raw, is_tombstone)?;
+
+    let key = read_exact_vec(reader, key_size, "key")?;
+
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&header[4..]);
+    hasher.update(&key);
+    if !is_tombstone {
+        hash_exact(reader, value_size, &mut hasher, "value")?;
+    }
+    let computed_crc = hasher.finalize();
+
+    if computed_crc != stored_crc {
+        return Err(LogError(format!(
+            "CRC mismatch: stored={stored_crc}, computed={computed_crc}"
+        )));
+    }
+
+    let record_size =
+        HEADER_SIZE as u64 + key_size as u64 + if is_tombstone { 0 } else { value_size as u64 };
+
+    Ok(Some(RecordMetadata {
+        timestamp_ms,
+        expire_at_ms,
+        key,
+        value_size: if is_tombstone { 0 } else { value_size_raw },
+        is_tombstone,
+        offset,
+        record_size,
+    }))
 }
 
 /// CRC32 using hardware acceleration (SSE4.2 on x86, ARM CRC on aarch64).
@@ -1048,6 +1172,58 @@ mod tests {
             err.to_string().contains("extends past end"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn metadata_iter_does_not_materialize_large_values() {
+        let dir = temp_dir();
+        let path = dir.path().join("metadata_scan.log");
+        let mut writer = LogWriter::open(&path, 1).unwrap();
+
+        let large = vec![0xAB; 2 * 1024 * 1024];
+        writer.write(b"large", &large, 123).unwrap();
+        writer.write(b"small", b"value", 456).unwrap();
+        drop(writer);
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_metadata_from_start_tolerant().unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].key, b"large");
+        assert_eq!(records[0].value_size, large.len() as u32);
+        assert_eq!(records[0].expire_at_ms, 123);
+        assert!(!records[0].is_tombstone);
+        assert_eq!(
+            records[0].record_size,
+            HEADER_SIZE as u64 + 5 + large.len() as u64
+        );
+
+        assert_eq!(records[1].key, b"small");
+        assert_eq!(records[1].value_size, 5);
+        assert_eq!(records[1].expire_at_ms, 456);
+        assert_eq!(records[1].offset, records[0].record_size);
+    }
+
+    #[test]
+    fn metadata_iter_from_offset_uses_absolute_offsets() {
+        let dir = temp_dir();
+        let path = dir.path().join("metadata_scan_offset.log");
+        let mut writer = LogWriter::open(&path, 1).unwrap();
+
+        let first = writer.write(b"k1", b"v1", 0).unwrap();
+        let second = writer.write(b"k2", b"v2", 789).unwrap();
+        drop(writer);
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_metadata_from_offset_tolerant(second).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, b"k2");
+        assert_eq!(records[0].offset, second);
+        assert_eq!(records[0].value_size, 2);
+        assert_eq!(records[0].expire_at_ms, 789);
+        assert_eq!(records[0].record_size, HEADER_SIZE as u64 + 2 + 2);
+        assert!(second > first);
     }
 
     #[test]
