@@ -310,6 +310,22 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
   # ---------------------------------------------------------------------------
 
   describe "marker-first promotion: every crash point recovers" do
+    test "partial dedicated recovery builds the shared compound fallback index once" do
+      source =
+        File.read!(Path.expand("../../../lib/ferricstore/store/promotion.ex", __DIR__))
+
+      [_match, recover_body] =
+        Regex.run(
+          ~r/(def recover_promoted\(.*?)(?=\n  defp shared_live_compound_keys_by_marker)/s,
+          source
+        )
+
+      assert recover_body =~ "shared_live_compound_keys_by_marker(keydir, marker_types)"
+
+      refute recover_body =~ "shared_uncovered_live_compound?(keydir",
+             "promotion recovery must not scan the full ETS table once per promoted marker"
+    end
+
     test "crash after step 1 (marker only) — fallback to compound keys in shared log", ctx do
       {redis_key, entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
 

@@ -296,8 +296,15 @@ defmodule Ferricstore.Store.Promotion do
       |> Enum.filter(fn {_, type_str} -> is_binary(type_str) end)
       |> Enum.uniq_by(fn {redis_key, _} -> redis_key end)
 
-    Enum.reduce(all_markers, %{}, fn {redis_key, type_str}, acc ->
-      type = CompoundKey.decode_type(type_str)
+    marker_types =
+      Map.new(all_markers, fn {redis_key, type_str} ->
+        {redis_key, CompoundKey.decode_type(type_str)}
+      end)
+
+    shared_live_compound_keys = shared_live_compound_keys_by_marker(keydir, marker_types)
+
+    Enum.reduce(all_markers, %{}, fn {redis_key, _type_str}, acc ->
+      type = Map.fetch!(marker_types, redis_key)
 
       {:ok, dedicated_path} = open_dedicated(data_dir, shard_index, type, redis_key)
 
@@ -346,9 +353,14 @@ defmodule Ferricstore.Store.Promotion do
           end
         end)
 
-      prefix = compound_prefix_for(type, redis_key)
       dedicated_keys = final_state |> Map.keys() |> MapSet.new()
-      partial_dedicated? = shared_uncovered_live_compound?(keydir, prefix, dedicated_keys)
+
+      partial_dedicated? =
+        shared_uncovered_live_compound?(
+          Map.get(shared_live_compound_keys, redis_key, MapSet.new()),
+          dedicated_keys
+        )
+
       dedicated_empty? = map_size(final_state) == 0
 
       if live_count > 0 and not partial_dedicated? do
@@ -417,24 +429,51 @@ defmodule Ferricstore.Store.Promotion do
     end)
   end
 
-  defp shared_uncovered_live_compound?(keydir, prefix, dedicated_keys) do
+  defp shared_live_compound_keys_by_marker(keydir, marker_types) do
     now = HLC.now_ms()
 
     :ets.foldl(
       fn
-        _entry, true ->
-          true
+        {key, _value, exp, _lfu, _fid, _off, _vsize}, acc when is_binary(key) ->
+          if live_hash_set_or_zset_compound?(key, exp, now) do
+            redis_key = CompoundKey.extract_redis_key(key)
 
-        {key, _value, exp, _lfu, _fid, _off, _vsize}, false when is_binary(key) ->
-          String.starts_with?(key, prefix) and not MapSet.member?(dedicated_keys, key) and
-            (exp == 0 or exp > now)
+            case Map.get(marker_types, redis_key) do
+              nil ->
+                acc
 
-        _entry, false ->
-          false
+              marker_type ->
+                if compound_key_type?(key, marker_type) do
+                  Map.update(acc, redis_key, MapSet.new([key]), &MapSet.put(&1, key))
+                else
+                  acc
+                end
+            end
+          else
+            acc
+          end
+
+        _entry, acc ->
+          acc
       end,
-      false,
+      %{},
       keydir
     )
+  end
+
+  defp live_hash_set_or_zset_compound?(key, exp, now) do
+    (exp == 0 or exp > now) and
+      (match?(<<"H:", _::binary>>, key) or match?(<<"S:", _::binary>>, key) or
+         match?(<<"Z:", _::binary>>, key))
+  end
+
+  defp compound_key_type?(<<"H:", _::binary>>, :hash), do: true
+  defp compound_key_type?(<<"S:", _::binary>>, :set), do: true
+  defp compound_key_type?(<<"Z:", _::binary>>, :zset), do: true
+  defp compound_key_type?(_key, _type), do: false
+
+  defp shared_uncovered_live_compound?(shared_keys, dedicated_keys) do
+    Enum.any?(shared_keys, fn key -> not MapSet.member?(dedicated_keys, key) end)
   end
 
   @spec cleanup_promoted!(binary(), binary(), atom(), binary(), non_neg_integer(), term()) :: :ok
