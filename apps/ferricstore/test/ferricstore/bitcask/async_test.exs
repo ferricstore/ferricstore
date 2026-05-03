@@ -72,4 +72,18 @@ defmodule Ferricstore.Bitcask.AsyncTest do
 
     refute_received _
   end
+
+  test "await flushes alias replies when timeout wins the receive race" do
+    source =
+      __DIR__
+      |> Path.join("../../../lib/ferricstore/bitcask/async.ex")
+      |> Path.expand()
+      |> File.read!()
+
+    assert source =~ "cleanup_alias(parent, ref)",
+           "timeout cleanup must flush process-alias replies so internal {ref, result} messages cannot leak into the caller mailbox"
+
+    assert source =~ "flush_alias_reply(ref)",
+           "alias cleanup must drain any reply that arrived before alias deactivation"
+  end
 end

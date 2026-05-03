@@ -37,17 +37,17 @@ defmodule Ferricstore.Bitcask.Async do
 
     receive do
       {^ref, result} ->
-        :erlang.unalias(parent)
+        cleanup_alias(parent, ref)
         result
     after
       timeout_ms ->
         receive do
           {^ref, result} ->
-            :erlang.unalias(parent)
+            cleanup_alias(parent, ref)
             result
         after
           0 ->
-            :erlang.unalias(parent)
+            cleanup_alias(parent, ref)
             send(proxy, {ref, :cancel})
             {:error, :timeout}
         end
@@ -87,6 +87,19 @@ defmodule Ferricstore.Bitcask.Async do
       {^ref, :cancel} -> :ok
     after
       0 -> send(parent, {ref, result})
+    end
+  end
+
+  defp cleanup_alias(parent, ref) do
+    :erlang.unalias(parent)
+    flush_alias_reply(ref)
+  end
+
+  defp flush_alias_reply(ref) do
+    receive do
+      {^ref, _result} -> flush_alias_reply(ref)
+    after
+      0 -> :ok
     end
   end
 end
