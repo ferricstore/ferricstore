@@ -186,6 +186,29 @@ defmodule Ferricstore.Raft.StateMachineTest do
     ArgumentError -> :ok
   end
 
+  describe "Bitcask rotation/accounting" do
+    test "applied writes rotate the active file when they exceed max_active_file_size", %{
+      state: state,
+      active_file_path: active_file_path
+    } do
+      state = %{state | max_active_file_size: 80}
+      value = String.duplicate("x", 48)
+
+      {state, :ok} = StateMachine.apply(%{}, {:put, "rotate_a", value, 0}, state)
+      {state, :ok} = StateMachine.apply(%{}, {:put, "rotate_b", value, 0}, state)
+
+      assert state.active_file_id > 0
+      assert state.active_file_size == 0
+      assert File.exists?(state.active_file_path)
+      assert state.active_file_path != active_file_path
+      assert {old_total, 0} = Map.fetch!(state.file_stats, 0)
+      assert old_total == File.stat!(active_file_path).size
+
+      assert {:ok, [{_key, _offset, _value_size, _expire_at_ms, false} | _]} =
+               NIF.v2_scan_file(active_file_path)
+    end
+  end
+
   describe "origin async PUT replay" do
     test "persists the pending origin value when ETS still matches the command", %{
       state: state,

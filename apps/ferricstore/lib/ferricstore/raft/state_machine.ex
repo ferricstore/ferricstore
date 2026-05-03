@@ -72,8 +72,13 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.HLC
   alias Ferricstore.Store.{BitcaskWriter, LFU, ListOps, Promotion, Router, ValueCodec}
+  alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
   @default_release_cursor_interval 20_000
+  @default_max_active_file_size 256 * 1024 * 1024
+  @default_fragmentation_threshold 0.5
+  @default_dead_bytes_threshold 134_217_728
+  @bitcask_record_header_size 26
   @cold_read_timeout_ms 10_000
 
   defguardp valid_cold_location(file_id, offset, value_size)
@@ -139,6 +144,29 @@ defmodule Ferricstore.Raft.StateMachine do
         ),
       instance_ctx: Map.get(config, :instance_ctx),
       instance_name: Map.get(config, :instance_name, :default),
+      active_file_size:
+        Map.get_lazy(config, :active_file_size, fn ->
+          file_size_or_zero(config.active_file_path)
+        end),
+      file_stats:
+        Map.get_lazy(config, :file_stats, fn ->
+          initial_file_stats(config.shard_data_path, config.ets, config.active_file_id)
+        end),
+      merge_config: Map.get(config, :merge_config, default_merge_config()),
+      max_active_file_size:
+        Map.get_lazy(config, :max_active_file_size, fn ->
+          case Map.get(config, :instance_ctx) do
+            %{max_active_file_size: max_file_size} ->
+              max_file_size
+
+            _ ->
+              Application.get_env(
+                :ferricstore,
+                :max_active_file_size,
+                @default_max_active_file_size
+              )
+          end
+        end),
       applied_count: 0,
       release_cursor_interval: interval,
       # When a node joins with pre-existing Bitcask data (from direct copy or
@@ -1011,6 +1039,7 @@ defmodule Ferricstore.Raft.StateMachine do
   @spec maybe_release_cursor(map(), non_neg_integer(), shard_state(), term()) ::
           {shard_state(), term()} | {shard_state(), term(), list()}
   defp maybe_release_cursor(%{index: ra_index}, old_count, state, result) do
+    state = consume_pending_state(state)
     record_cursor_metric(state, :last_applied_index, ra_index)
 
     # Wrap every reply with the ra_index it was applied at so the originating
@@ -1045,8 +1074,26 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp maybe_release_cursor(_meta, _old_count, state, result) do
+    state = consume_pending_state(state)
+
     # No meta (e.g. cross-shard sub-apply) — pass through untouched.
     {state, result}
+  end
+
+  defp consume_pending_state(state) do
+    case Process.delete(:sm_pending_state) do
+      nil ->
+        state
+
+      pending_state ->
+        %{
+          state
+          | active_file_id: pending_state.active_file_id,
+            active_file_path: pending_state.active_file_path,
+            active_file_size: pending_state.active_file_size,
+            file_stats: pending_state.file_stats
+        }
+    end
   end
 
   defp record_cursor_metric(%{shard_index: shard_index} = state, field, index)
@@ -3114,6 +3161,7 @@ defmodule Ferricstore.Raft.StateMachine do
       pending when is_list(pending) ->
         batch = Enum.reverse(pending)
         batch_bytes = bitcask_batch_bytes(batch)
+        record_bytes = bitcask_record_bytes(batch)
         delete_count = Enum.count(batch, &match?({:delete, _, _}, &1))
 
         case resolve_active_file(state) do
@@ -3149,6 +3197,9 @@ defmodule Ferricstore.Raft.StateMachine do
               {:ok, locations} ->
                 clear_disk_pressure(state)
                 apply_pending_locations(state, file_id, batch, locations)
+                state = track_bitcask_append_bytes(state, file_path, file_id, record_bytes)
+                Process.put(:sm_pending_state, state)
+                :ok
 
               {:error, reason} ->
                 set_disk_pressure(state)
@@ -3170,6 +3221,46 @@ defmodule Ferricstore.Raft.StateMachine do
       {:delete, key, _prob_path}, acc ->
         acc + byte_size(key)
     end)
+  end
+
+  defp bitcask_record_bytes(batch) do
+    Enum.reduce(batch, 0, fn
+      {:put, key, value, _expire_at_ms}, acc ->
+        acc + @bitcask_record_header_size + byte_size(key) + byte_size(value)
+
+      {:delete, key, _prob_path}, acc ->
+        acc + @bitcask_record_header_size + byte_size(key)
+    end)
+  end
+
+  defp track_bitcask_append_bytes(state, file_path, file_id, written_bytes)
+       when written_bytes > 0 do
+    state = %{state | active_file_path: file_path, active_file_id: file_id}
+    fid = state.active_file_id
+    {total, dead} = Map.get(state.file_stats, fid, {0, 0})
+
+    state
+    |> Map.put(:active_file_size, state.active_file_size + written_bytes)
+    |> Map.put(:file_stats, Map.put(state.file_stats, fid, {total + written_bytes, dead}))
+    |> maybe_rotate_state_machine_active_file()
+  end
+
+  defp track_bitcask_append_bytes(state, _file_path, _file_id, _written_bytes), do: state
+
+  defp maybe_rotate_state_machine_active_file(state) do
+    rotated =
+      state
+      |> Map.put(:index, state.shard_index)
+      |> Map.put(:keydir, state.ets)
+      |> ShardFlush.maybe_rotate_file()
+
+    %{
+      state
+      | active_file_id: rotated.active_file_id,
+        active_file_path: rotated.active_file_path,
+        active_file_size: rotated.active_file_size,
+        file_stats: rotated.file_stats
+    }
   end
 
   defp append_pending_batch(file_path, batch) do
@@ -3421,6 +3512,34 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp instance_data_path?(_ctx, _shard_data_path), do: false
+
+  defp initial_file_stats(shard_data_path, ets, active_file_id) do
+    stats = ShardFlush.compute_file_stats(shard_data_path, ets)
+
+    Map.put_new(
+      stats,
+      active_file_id,
+      {file_size_or_zero(bitcask_file_path(shard_data_path, active_file_id)), 0}
+    )
+  end
+
+  defp bitcask_file_path(shard_data_path, file_id) do
+    Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+  end
+
+  defp file_size_or_zero(path) do
+    case File.stat(path) do
+      {:ok, %{size: size}} -> size
+      _ -> 0
+    end
+  end
+
+  defp default_merge_config do
+    %{
+      fragmentation_threshold: @default_fragmentation_threshold,
+      dead_bytes_threshold: @default_dead_bytes_threshold
+    }
+  end
 
   defp duration_us(started_at) do
     System.monotonic_time()
