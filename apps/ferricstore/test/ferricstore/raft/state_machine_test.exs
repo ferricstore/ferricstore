@@ -2214,6 +2214,45 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert :atomics.get(last_released_cursor_index, shard_index + 1) == 42
     end
 
+    test "release_cursor is not emitted when replay-safe marker cannot persist", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      last_applied_index = :atomics.new(shard_index + 1, signed: false)
+      last_released_cursor_index = :atomics.new(shard_index + 1, signed: false)
+
+      invalid_marker_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "replay_safe_marker_file_#{System.unique_integer([:positive])}"
+        )
+
+      File.write!(invalid_marker_dir, "not a directory")
+      on_exit(fn -> File.rm(invalid_marker_dir) end)
+
+      state = %{
+        state
+        | release_cursor_interval: 1,
+          shard_data_path: invalid_marker_dir,
+          instance_ctx: %{
+            checkpoint_flags: :atomics.new(shard_index + 1, signed: false),
+            checkpoint_in_flight: :atomics.new(shard_index + 1, signed: false),
+            last_applied_index: last_applied_index,
+            last_released_cursor_index: last_released_cursor_index
+          }
+      }
+
+      meta = %{index: 43, term: 1, system_time: System.os_time(:millisecond)}
+
+      {_new_state, {:applied_at, 43, nil}, effects} =
+        StateMachine.apply(meta, {:getdel, "released_cursor_persist_failure"}, state)
+
+      refute Enum.any?(effects, &match?({:release_cursor, 43}, &1))
+      refute Enum.any?(effects, &match?({:checkpoint, 43, _}, &1))
+      assert :atomics.get(last_applied_index, shard_index + 1) == 43
+      assert :atomics.get(last_released_cursor_index, shard_index + 1) == 0
+    end
+
     test "release cursor metrics resolve instance context by name like production Raft config", %{
       state: state,
       shard_index: shard_index

@@ -21,6 +21,16 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
     assert ReplaySafeIndex.read(dir) == 0
   end
 
+  test "persist returns error when marker directory cannot be created" do
+    dir = tmp_dir()
+    File.write!(dir, "not a directory")
+
+    on_exit(fn -> File.rm(dir) end)
+
+    assert {:error, :enotdir} = ReplaySafeIndex.persist(dir, 456)
+    assert ReplaySafeIndex.read(dir) == 0
+  end
+
   defp tmp_dir do
     Path.join(System.tmp_dir!(), "replay_safe_index_#{System.unique_integer([:positive])}")
   end

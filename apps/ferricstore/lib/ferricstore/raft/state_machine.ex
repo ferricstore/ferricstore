@@ -1067,14 +1067,19 @@ defmodule Ferricstore.Raft.StateMachine do
 
     if div(old_count, interval) != div(state.applied_count, interval) and
          checkpoint_clean?(state) do
-      record_cursor_metric(state, :last_released_cursor_index, ra_index)
-      Ferricstore.Raft.ReplaySafeIndex.persist(state.shard_data_path, ra_index)
+      case Ferricstore.Raft.ReplaySafeIndex.persist(state.shard_data_path, ra_index) do
+        :ok ->
+          record_cursor_metric(state, :last_released_cursor_index, ra_index)
 
-      # Checkpoints are cheap, non-fsynced materializations used to accelerate
-      # unclean restart. The cursor effect promotes the latest completed
-      # checkpoint to a durable snapshot for log compaction when one exists.
-      {state, wrapped_result,
-       [notify_effect, {:checkpoint, ra_index, state}, {:release_cursor, ra_index}]}
+          # Checkpoints are cheap, non-fsynced materializations used to accelerate
+          # unclean restart. The cursor effect promotes the latest completed
+          # checkpoint to a durable snapshot for log compaction when one exists.
+          {state, wrapped_result,
+           [notify_effect, {:checkpoint, ra_index, state}, {:release_cursor, ra_index}]}
+
+        {:error, _reason} ->
+          {state, wrapped_result, [notify_effect]}
+      end
     else
       {state, wrapped_result, [notify_effect]}
     end
