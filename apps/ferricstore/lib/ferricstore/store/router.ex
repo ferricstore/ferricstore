@@ -1508,12 +1508,21 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, file_id, offset, value_size}
       when valid_cold_location(file_id, offset, value_size) ->
-        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+        path = cold_file_path(ctx, idx, file_id)
 
-        path =
-          Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+        case validated_file_ref(path, offset, key, value_size) do
+          {^path, value_offset, ^value_size} ->
+            {path, value_offset, value_size}
 
-        validated_file_ref(path, offset, key, value_size)
+          nil ->
+            case retry_changed_file_ref(ctx, idx, keydir, key, {file_id, offset, value_size}, now) do
+              {:cold_ref, retry_path, value_offset, retry_size} ->
+                {retry_path, value_offset, retry_size}
+
+              _ ->
+                nil
+            end
+        end
 
       {:cold, _file_id, _offset, _value_size} ->
         # Invalid file ref — fall back to GenServer.
@@ -1561,10 +1570,7 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, file_id, offset, value_size}
       when valid_cold_location(file_id, offset, value_size) ->
-        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
-
-        path =
-          Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+        path = cold_file_path(ctx, idx, file_id)
 
         case validated_file_ref(path, offset, key, value_size) do
           {^path, value_offset, ^value_size} ->
@@ -1572,8 +1578,18 @@ defmodule Ferricstore.Store.Router do
             {:cold_ref, path, value_offset, value_size}
 
           nil ->
-            Stats.incr_keyspace_misses(ctx)
-            :miss
+            case retry_changed_file_ref(ctx, idx, keydir, key, {file_id, offset, value_size}, now) do
+              {:cold_ref, retry_path, value_offset, retry_size} ->
+                Stats.record_cold_read(ctx, key)
+                {:cold_ref, retry_path, value_offset, retry_size}
+
+              {:hot, value} ->
+                {:hot, value}
+
+              :miss ->
+                Stats.incr_keyspace_misses(ctx)
+                :miss
+            end
         end
 
       {:cold, _file_id, _offset, _value_size} ->
@@ -1621,8 +1637,45 @@ defmodule Ferricstore.Store.Router do
 
   defp validated_file_ref(path, record_offset, key, value_size) do
     case Ferricstore.Bitcask.NIF.v2_validate_value_ref(path, record_offset, key, value_size) do
-      {:ok, {value_offset, ^value_size}} -> {path, value_offset, value_size}
-      _ -> nil
+      {:ok, {value_offset, ^value_size}} ->
+        {path, value_offset, value_size}
+
+      _ ->
+        maybe_run_validate_file_ref_miss_hook()
+        nil
+    end
+  end
+
+  defp retry_changed_file_ref(ctx, idx, keydir, key, original_location, now) do
+    case ets_get_full(ctx, idx, keydir, key, now) do
+      {:hit, value, lfu} ->
+        sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
+        {:hot, value}
+
+      {:cold, file_id, offset, value_size}
+      when valid_cold_location(file_id, offset, value_size) and
+             {file_id, offset, value_size} != original_location ->
+        path = cold_file_path(ctx, idx, file_id)
+
+        case validated_file_ref(path, offset, key, value_size) do
+          {^path, value_offset, ^value_size} -> {:cold_ref, path, value_offset, value_size}
+          nil -> :miss
+        end
+
+      _ ->
+        :miss
+    end
+  end
+
+  defp cold_file_path(ctx, idx, file_id) do
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+    Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+  end
+
+  defp maybe_run_validate_file_ref_miss_hook do
+    case Process.get(:ferricstore_router_validate_file_ref_miss_hook) do
+      fun when is_function(fun, 0) -> fun.()
+      _ -> :ok
     end
   end
 

@@ -47,6 +47,41 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     assert :miss == Router.get_with_file_ref(ctx, key)
   end
 
+  test "get_with_file_ref retries when compaction changes the cold row after validation misses",
+       %{
+         ctx: ctx,
+         keydir: keydir
+       } do
+    key = "cold_sendfile_compacted:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    other_key = key <> ":other"
+    value = "compacted-value"
+    value_size = byte_size(value)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    stale_path = Path.join(shard_path, "00000.log")
+    current_path = Path.join(shard_path, "00001.log")
+
+    {:ok, {stale_offset, _stale_record_size}} =
+      NIF.v2_append_record(stale_path, other_key, "wrong", 0)
+
+    {:ok, {current_offset, _current_record_size}} =
+      NIF.v2_append_record(current_path, key, value, 0)
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, stale_offset, value_size})
+
+    Process.put(:ferricstore_router_validate_file_ref_miss_hook, fn ->
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 1, current_offset, value_size})
+    end)
+
+    try do
+      assert {:cold_ref, ^current_path, value_offset, ^value_size} =
+               Router.get_with_file_ref(ctx, key)
+
+      assert is_integer(value_offset)
+    after
+      Process.delete(:ferricstore_router_validate_file_ref_miss_hook)
+    end
+  end
+
   test "direct cold reads do not crash on cold rows with invalid offsets", %{
     ctx: ctx,
     keydir: keydir
@@ -252,6 +287,38 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
 
     assert nil == Router.get_file_ref(ctx, key)
+  end
+
+  test "get_file_ref retries when compaction changes the cold row after validation misses", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_file_ref_compacted:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    other_key = key <> ":other"
+    value = "compacted-file-ref"
+    value_size = byte_size(value)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    stale_path = Path.join(shard_path, "00000.log")
+    current_path = Path.join(shard_path, "00001.log")
+
+    {:ok, {stale_offset, _stale_record_size}} =
+      NIF.v2_append_record(stale_path, other_key, "wrong", 0)
+
+    {:ok, {current_offset, _current_record_size}} =
+      NIF.v2_append_record(current_path, key, value, 0)
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, stale_offset, value_size})
+
+    Process.put(:ferricstore_router_validate_file_ref_miss_hook, fn ->
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 1, current_offset, value_size})
+    end)
+
+    try do
+      assert {^current_path, value_offset, ^value_size} = Router.get_file_ref(ctx, key)
+      assert is_integer(value_offset)
+    after
+      Process.delete(:ferricstore_router_validate_file_ref_miss_hook)
+    end
   end
 
   test "get_keydir_file_ref rejects cold rows with invalid offsets", %{ctx: ctx, keydir: keydir} do
