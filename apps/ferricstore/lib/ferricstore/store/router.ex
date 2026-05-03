@@ -355,7 +355,7 @@ defmodule Ferricstore.Store.Router do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
       with_async_key_latch(ctx, idx, key, fn ->
-        case async_submit_to_raft(idx, {:delete, key}) do
+        case async_enqueue_to_raft(idx, {:delete, key}) do
           :ok ->
             keydir = elem(ctx.keydir_refs, idx)
             track_keydir_binary_delete(ctx, idx, keydir, key)
@@ -1005,7 +1005,7 @@ defmodule Ferricstore.Store.Router do
       # hot cache) and readers would see nil until the async write completes.
       case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
         {:ok, file_id, [{offset, _record_size}]} ->
-          case async_submit_to_raft(idx, raft_cmd) do
+          case async_enqueue_to_raft(idx, raft_cmd) do
             :ok ->
               clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
               track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
@@ -1031,7 +1031,7 @@ defmodule Ferricstore.Store.Router do
     else
       # Small value: ETS insert only. Bitcask write deferred to state machine
       # apply (flush_pending_writes) — avoids per-key NIF overhead in Router.
-      with :ok <- async_submit_to_raft(idx, raft_cmd) do
+      with :ok <- async_enqueue_to_raft(idx, raft_cmd) do
         clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
         track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
         :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
@@ -1350,10 +1350,9 @@ defmodule Ferricstore.Store.Router do
   defp stored_value_size(value) when is_float(value), do: byte_size(Float.to_string(value))
   defp stored_value_size(value), do: value |> to_string() |> byte_size()
 
-  # Enqueue an async write in the shard's Batcher. The Batcher still batches
-  # many async commands into one Raft pipeline submission, but Router waits
-  # until the slot is submitted to Raft so success is not based only on a
-  # local timer slot.
+  # Stronger async boundary for flows that need Ra submit before publishing a
+  # local effect. Plain async SET/DEL use async_enqueue_to_raft/2 below so
+  # their latency is not tied to the namespace batch window.
   defp async_submit_to_raft(idx, command) do
     case Ferricstore.Raft.Batcher.async_submit_ordered(idx, command) do
       :ok -> :ok
@@ -1362,9 +1361,8 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  # Latency-critical RMW commands use the weaker enqueue boundary by design:
-  # the command is locally visible immediately and replication is async. Ra
-  # apply still repairs pending Bitcask writes when it reaches the origin.
+  # Latency-critical async writes wait only for local Batcher acceptance. That
+  # preserves async semantics while still surfacing local overload/down errors.
   defp async_enqueue_to_raft(idx, command) do
     case Ferricstore.Raft.Batcher.async_enqueue_ordered(idx, command) do
       :ok -> :ok

@@ -401,6 +401,25 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
              "async small-value SET avg latency #{avg_us}μs exceeded 5000μs; " <>
                "suggests call is blocking on Raft or the Batcher"
     end
+
+    test "async SET returns before namespace batch window flush" do
+      ns = "#{@ns}_slow_window_#{System.unique_integer([:positive])}"
+      on_exit(fn -> Ferricstore.NamespaceConfig.reset(ns) end)
+
+      assert :ok = Ferricstore.NamespaceConfig.set(ns, "durability", "async")
+      assert :ok = Ferricstore.NamespaceConfig.set(ns, "window_ms", "100")
+
+      {time_us, result} =
+        :timer.tc(fn ->
+          Router.put(ctx(), "#{ns}:key", "value", 0)
+        end)
+
+      assert result == :ok
+
+      assert time_us < 50_000,
+             "async SET took #{time_us}us with a 100ms namespace window; " <>
+               "it should return after local enqueue, not wait for Raft flush"
+    end
   end
 
   # ---------------------------------------------------------------------------
