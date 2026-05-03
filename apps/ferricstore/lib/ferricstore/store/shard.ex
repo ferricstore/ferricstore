@@ -1011,37 +1011,53 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp scan_lower_tombstone_key_states(shard_path, files, fid, masked_keys) do
-    files
-    |> Enum.flat_map(fn name ->
-      with true <- String.ends_with?(name, ".log"),
-           false <- String.starts_with?(name, "compact_"),
-           {other_fid, ""} <- Integer.parse(String.trim_trailing(name, ".log")),
-           true <- other_fid < fid do
-        [{other_fid, Path.join(shard_path, name)}]
-      else
-        _ -> []
-      end
-    end)
-    |> Enum.sort_by(fn {other_fid, _path} -> other_fid end)
-    |> Enum.reduce_while({:ok, %{}}, fn {_other_fid, path}, {:ok, states} ->
-      case NIF.v2_scan_file(path) do
-        {:ok, records} ->
-          next_states =
-            Enum.reduce(records, states, fn {key, _offset, _value_size, _expire_at_ms, tombstone?},
-                                            acc ->
-              if MapSet.member?(masked_keys, key) do
-                Map.put(acc, key, if(tombstone?, do: :tombstone, else: :live))
-              else
-                acc
-              end
-            end)
+    result =
+      files
+      |> Enum.flat_map(fn name ->
+        with true <- String.ends_with?(name, ".log"),
+             false <- String.starts_with?(name, "compact_"),
+             {other_fid, ""} <- Integer.parse(String.trim_trailing(name, ".log")),
+             true <- other_fid < fid do
+          [{other_fid, Path.join(shard_path, name)}]
+        else
+          _ -> []
+        end
+      end)
+      |> Enum.sort_by(fn {other_fid, _path} -> -other_fid end)
+      |> Enum.reduce_while({:ok, %{}, masked_keys}, fn {_other_fid, path},
+                                                       {:ok, states, unresolved_keys} ->
+        case NIF.v2_scan_file(path) do
+          {:ok, records} ->
+            file_states =
+              Enum.reduce(records, %{}, fn {key, _offset, _value_size, _expire_at_ms, tombstone?},
+                                           acc ->
+                if MapSet.member?(unresolved_keys, key) do
+                  Map.put(acc, key, if(tombstone?, do: :tombstone, else: :live))
+                else
+                  acc
+                end
+              end)
 
-          {:cont, {:ok, next_states}}
+            next_states = Map.merge(states, file_states)
 
-        {:error, reason} ->
-          {:halt, {:error, reason}}
-      end
-    end)
+            next_unresolved_keys =
+              Enum.reduce(Map.keys(file_states), unresolved_keys, &MapSet.delete(&2, &1))
+
+            if MapSet.size(next_unresolved_keys) == 0 do
+              {:halt, {:ok, next_states}}
+            else
+              {:cont, {:ok, next_states, next_unresolved_keys}}
+            end
+
+          {:error, reason} ->
+            {:halt, {:error, reason}}
+        end
+      end)
+
+    case result do
+      {:ok, states, _unresolved_keys} -> {:ok, states}
+      other -> other
+    end
   end
 
   defp tombstone_offsets(path) do

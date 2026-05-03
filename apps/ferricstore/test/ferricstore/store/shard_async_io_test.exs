@@ -1644,6 +1644,68 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
         Process.flag(:trap_exit, previous_trap_exit)
       end
     end
+
+    test "drops mixed-file tombstones after newest lower tombstone without scanning older files" do
+      previous_trap_exit = Process.flag(:trap_exit, true)
+
+      dir =
+        Path.join(System.tmp_dir!(), "mixed_tombstone_desc_scan_#{:rand.uniform(9_999_999)}")
+
+      File.mkdir_p!(dir)
+
+      name = :"mixed_tombstone_desc_scan_#{:erlang.unique_integer([:positive])}"
+
+      ctx =
+        FerricStore.Instance.build(name,
+          data_dir: dir,
+          shard_count: 1
+        )
+
+      try do
+        :ok = Ferricstore.DataDir.ensure_layout!(dir, 1)
+        shard_dir = Ferricstore.DataDir.shard_data_path(dir, 0)
+
+        log0 = Path.join(shard_dir, "00000.log")
+        log1 = Path.join(shard_dir, "00001.log")
+        log2 = Path.join(shard_dir, "00002.log")
+        log3 = Path.join(shard_dir, "00003.log")
+
+        {:ok, [_]} = NIF.v2_append_batch(log0, [{"deleted", "old", 0}])
+        {:ok, _} = NIF.v2_append_tombstone(log1, "deleted")
+        {:ok, _} = NIF.v2_append_tombstone(log2, "deleted")
+        {:ok, [_]} = NIF.v2_append_batch(log2, [{"live", "kept", 0}])
+        File.touch!(log3)
+
+        {:ok, pid1} =
+          Shard.start_link(
+            index: 0,
+            data_dir: dir,
+            flush_interval_ms: 5000,
+            instance_ctx: ctx
+          )
+
+        assert nil == GenServer.call(pid1, {:get, "deleted"})
+        assert "kept" == GenServer.call(pid1, {:get, "live"})
+
+        File.rm!(log0)
+        File.mkdir!(log0)
+
+        assert {:ok, {1, 0, _reclaimed}} = GenServer.call(pid1, {:run_compaction, [2]})
+        assert {:ok, []} = NIF.v2_scan_tombstones(log2)
+        assert "kept" == GenServer.call(pid1, {:get, "live"})
+      after
+        case Process.whereis(Router.shard_name(ctx, 0)) do
+          pid when is_pid(pid) ->
+            cleanup_shard(pid, ctx, dir)
+
+          _ ->
+            FerricStore.Instance.cleanup(ctx.name)
+            File.rm_rf(dir)
+        end
+
+        Process.flag(:trap_exit, previous_trap_exit)
+      end
+    end
   end
 
   describe "file size accounting" do
