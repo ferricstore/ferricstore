@@ -41,6 +41,21 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
   # Helper to generate a key without a colon (root namespace)
   defp rootkey(base), do: "nsbatcher_root_#{base}_#{:rand.uniform(9_999_999)}"
 
+  def forward_caller_quorum_submit(_event, measurements, metadata, {test_pid, shard_idx}) do
+    if metadata.shard_index == shard_idx do
+      send(test_pid, {:caller_quorum_submit, measurements, metadata})
+    end
+  end
+
+  defp drain_caller_quorum_submits(acc \\ []) do
+    receive do
+      {:caller_quorum_submit, measurements, metadata} ->
+        drain_caller_quorum_submits([{measurements, metadata} | acc])
+    after
+      100 -> Enum.reverse(acc)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Prefix extraction
   # ---------------------------------------------------------------------------
@@ -130,6 +145,60 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
       for k <- shard_keys do
         assert "batched_ns" == Router.get(FerricStore.Instance.get(:default), k)
+      end
+    end
+
+    test "caller-backed quorum writes share the namespace window before Ra submit" do
+      prefix = "callerwin_#{System.unique_integer([:positive])}"
+      :ok = NamespaceConfig.set(prefix, "window_ms", "50")
+
+      {shard_idx, [k1, k2]} =
+        1..20_000
+        |> Enum.reduce_while(%{}, fn i, by_shard ->
+          key = "#{prefix}:#{i}"
+          shard = Router.shard_for(FerricStore.Instance.get(:default), key)
+          keys = [key | Map.get(by_shard, shard, [])]
+
+          if length(keys) == 2 do
+            {:halt, {shard, Enum.reverse(keys)}}
+          else
+            {:cont, Map.put(by_shard, shard, keys)}
+          end
+        end)
+
+      test_pid = self()
+      handler_id = {:caller_backed_window_batching, test_pid, make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :batcher, :quorum_submit],
+          &__MODULE__.forward_caller_quorum_submit/4,
+          {test_pid, shard_idx}
+        )
+
+      try do
+        ref1 = make_ref()
+        ref2 = make_ref()
+
+        assert :ok == Batcher.write_async(shard_idx, {:put, k1, "v1", 0}, {self(), ref1})
+        assert :ok == Batcher.write_async(shard_idx, {:put, k2, "v2", 0}, {self(), ref2})
+
+        assert_receive {^ref1, :ok}, 5_000
+        assert_receive {^ref2, :ok}, 5_000
+
+        submits = drain_caller_quorum_submits()
+
+        assert Enum.any?(submits, fn {measurements, metadata} ->
+                 metadata.kind == :batch and measurements.batch_size == 2 and
+                   measurements.caller_count == 2
+               end),
+               "expected the two caller-backed writes to submit as one batch, got: #{inspect(submits)}"
+
+        assert "v1" == Router.get(FerricStore.Instance.get(:default), k1)
+        assert "v2" == Router.get(FerricStore.Instance.get(:default), k2)
+      after
+        :telemetry.detach(handler_id)
       end
     end
 

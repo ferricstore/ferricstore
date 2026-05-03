@@ -1143,25 +1143,18 @@ defmodule Ferricstore.Raft.Batcher do
         count: Map.get(slot, :count, 0) + 1
     }
 
-    # Start timer on first write to this slot
     updated_slot =
-      cond do
-        from != nil ->
-          cancel_timer(updated_slot.timer_ref)
-          %{updated_slot | timer_ref: nil}
-
-        updated_slot.timer_ref == nil ->
-          ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
-          %{updated_slot | timer_ref: ref}
-
-        true ->
-          updated_slot
+      if updated_slot.timer_ref == nil do
+        ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
+        %{updated_slot | timer_ref: ref}
+      else
+        updated_slot
       end
 
     new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
 
     # Flush immediately if slot is full (O(1) count check instead of O(n) length)
-    if from != nil or updated_slot.count >= state.max_batch_size do
+    if updated_slot.count >= state.max_batch_size do
       do_flush_slot(new_state, slot_key)
     else
       {:noreply, new_state}
