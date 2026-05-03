@@ -2038,6 +2038,18 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp retry_changed_cold_value(ctx, idx, keydir, key, original_location, now) do
+    case retry_changed_cold_value_once(ctx, idx, keydir, key, original_location, now) do
+      :unchanged_cold ->
+        retry_after_unchanged_cold_location(fn ->
+          retry_changed_cold_value_once(ctx, idx, keydir, key, original_location, now)
+        end)
+
+      result ->
+        result
+    end
+  end
+
+  defp retry_changed_cold_value_once(ctx, idx, keydir, key, original_location, now) do
     case ets_get_full(ctx, idx, keydir, key, now) do
       {:hit, value, lfu} ->
         sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
@@ -2053,12 +2065,29 @@ defmodule Ferricstore.Store.Router do
           _ -> :miss
         end
 
+      {:cold, file_id, offset, value_size}
+      when valid_cold_location(file_id, offset, value_size) and
+             {file_id, offset, value_size} == original_location ->
+        :unchanged_cold
+
       _ ->
         :miss
     end
   end
 
   defp retry_changed_cold_meta(ctx, idx, keydir, key, original_location, now) do
+    case retry_changed_cold_meta_once(ctx, idx, keydir, key, original_location, now) do
+      :unchanged_cold ->
+        retry_after_unchanged_cold_location(fn ->
+          retry_changed_cold_meta_once(ctx, idx, keydir, key, original_location, now)
+        end)
+
+      result ->
+        result
+    end
+  end
+
+  defp retry_changed_cold_meta_once(ctx, idx, keydir, key, original_location, now) do
     case ets_get_meta_full(ctx, idx, keydir, key, now) do
       {:hit, value, expire_at_ms, lfu} ->
         sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
@@ -2074,8 +2103,30 @@ defmodule Ferricstore.Store.Router do
           _ -> :miss
         end
 
+      {:cold, file_id, offset, value_size, _expire_at_ms}
+      when valid_cold_location(file_id, offset, value_size) and
+             {file_id, offset, value_size} == original_location ->
+        :unchanged_cold
+
       _ ->
         :miss
+    end
+  end
+
+  defp retry_after_unchanged_cold_location(retry_fun) when is_function(retry_fun, 0) do
+    maybe_run_cold_location_miss_hook()
+    Process.sleep(1)
+
+    case retry_fun.() do
+      :unchanged_cold -> :miss
+      result -> result
+    end
+  end
+
+  defp maybe_run_cold_location_miss_hook do
+    case Process.get(:ferricstore_router_cold_location_miss_hook) do
+      fun when is_function(fun, 0) -> fun.()
+      _ -> :ok
     end
   end
 

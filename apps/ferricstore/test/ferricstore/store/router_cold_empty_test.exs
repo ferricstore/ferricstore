@@ -93,6 +93,35 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     assert nil == Router.get_meta(ctx, key)
   end
 
+  test "direct cold read retries when compaction replaces file before ETS offset update", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_compaction_gap:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    value = "compacted-gap-value"
+    value_size = byte_size(value)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00000.log")
+
+    {:ok, {_dead_offset, _dead_record_size}} = NIF.v2_append_record(path, "dead", "old", 0)
+    {:ok, {old_offset, _old_record_size}} = NIF.v2_append_record(path, key, value, 0)
+
+    File.rm!(path)
+    {:ok, {new_offset, _new_record_size}} = NIF.v2_append_record(path, key, value, 0)
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, old_offset, value_size})
+
+    Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, new_offset, value_size})
+    end)
+
+    try do
+      assert ^value = Router.get(ctx, key)
+    after
+      Process.delete(:ferricstore_router_cold_location_miss_hook)
+    end
+  end
+
   test "batch cold reads do not crash on cold rows with invalid offsets", %{
     ctx: ctx,
     keydir: keydir
