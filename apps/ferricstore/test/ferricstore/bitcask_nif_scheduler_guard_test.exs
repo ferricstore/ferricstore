@@ -57,6 +57,16 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
            "v2_append_batch_async must not CRC/encode records on a Normal BEAM scheduler"
   end
 
+  test "async batch append copies BEAM binaries off normal schedulers" do
+    source = File.read!(@source)
+
+    # `v2_append_batch_async` must copy BEAM-owned binaries before handing the
+    # batch to Tokio because NIF env references cannot outlive the call. That
+    # copy can be proportional to full batch payload size, so keep it off
+    # Normal schedulers even though the disk write itself is async.
+    assert_nif_schedule(source, "v2_append_batch_async", "DirtyCpu")
+  end
+
   defp assert_nif_schedule(source, function, schedule) do
     pattern =
       ~r/#\[rustler::nif\(schedule = "#{schedule}"\)\]\s*(?:#\[allow\([^\]]+\)\]\s*)?fn #{function}\b/

@@ -185,8 +185,8 @@ impl LogWriter {
     /// responsible for calling `sync()` afterwards.
     ///
     /// This is the building block for `v2_append_batch_async`: records are
-    /// encoded on the NIF (BEAM Normal scheduler) thread, then the raw bytes
-    /// are written on a Tokio worker thread using this method.
+    /// encoded on a Tokio blocking worker thread, then the raw bytes are
+    /// written by the same worker using this method.
     ///
     /// # Errors
     ///

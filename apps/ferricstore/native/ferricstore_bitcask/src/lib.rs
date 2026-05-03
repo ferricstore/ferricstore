@@ -1313,18 +1313,16 @@ fn v2_append_ops_batch_nosync<'a>(
 }
 
 /// Async variant of `v2_append_batch`: copies BEAM binaries into owned
-/// memory on the calling scheduler, then submits validation, record encoding,
-/// write, and fsync to Tokio.
+/// memory, then submits validation, record encoding, write, and fsync to Tokio.
 /// Returns `:ok` immediately. When IO completes, sends
 /// `{:tokio_complete, correlation_id, :ok, [{offset, value_size}, ...]}` or
 /// `{:tokio_complete, correlation_id, :error, reason}` to `caller_pid`.
 ///
 /// ## Scheduler contract
 ///
-/// Runs on a Normal BEAM scheduler only long enough to copy BEAM binaries
-/// into owned memory. CRC/record encoding and file write + fsync run on a
-/// Tokio blocking worker.
-#[rustler::nif(schedule = "Normal")]
+/// Runs on a DirtyCpu scheduler while copying BEAM binaries into owned memory.
+/// CRC/record encoding and file write + fsync run on a Tokio blocking worker.
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_batch_async<'a>(
     env: Env<'a>,
@@ -1336,7 +1334,7 @@ fn v2_append_batch_async<'a>(
     // Step 1: Copy BEAM binaries into owned Vecs before spawning to Tokio
     // because Binary<'a> borrows from the NIF env which is destroyed when
     // this function returns. Validation and record encoding happen in the
-    // blocking worker below so large batches do not burn Normal scheduler time.
+    // blocking worker below so large batches do not burn BEAM scheduler time.
     let entries: Vec<(Vec<u8>, Vec<u8>, u64)> = records
         .iter()
         .map(|(k, v, exp)| (k.as_slice().to_vec(), v.as_slice().to_vec(), *exp))
