@@ -141,6 +141,32 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
            "top-level batch pread errors must preserve the reason instead of becoming nil_from_cold_location"
   end
 
+  test "batch cold read length mismatch emits explicit telemetry reason", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key1 = "cold_batch_mismatch_1:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    key2 = "cold_batch_mismatch_2:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+
+    :ets.insert(keydir, {key1, nil, 0, LFU.initial(), 0, 0, 5})
+    :ets.insert(keydir, {key2, nil, 0, LFU.initial(), 0, 10, 5})
+
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00000.log")
+
+    attach_pread_corrupt_handler()
+    Process.put(:ferricstore_router_pread_batch_keyed_result, {:ok, ["only-one-value"]})
+
+    try do
+      assert [nil, nil] == Router.batch_get(ctx, [key1, key2])
+
+      assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 2},
+                      %{path: ^path, reason: :batch_result_length_mismatch}}
+    after
+      Process.delete(:ferricstore_router_pread_batch_keyed_result)
+    end
+  end
+
   test "direct cold reads do not return a value from a mismatched key offset", %{
     ctx: ctx,
     keydir: keydir

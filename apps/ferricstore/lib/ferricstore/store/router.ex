@@ -1959,15 +1959,12 @@ defmodule Ferricstore.Store.Router do
       end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch_keyed(
-             locations,
-             @cold_batch_read_timeout_ms
-           ) do
+      case router_pread_batch_keyed(locations, @cold_batch_read_timeout_ms) do
         {:ok, values} when is_list(values) ->
           if length(values) == length(entries) do
             values
           else
-            List.duplicate(nil, length(entries))
+            List.duplicate({:error, :batch_result_length_mismatch}, length(entries))
           end
 
         {:error, reason} ->
@@ -2014,6 +2011,13 @@ defmodule Ferricstore.Store.Router do
     end)
   end
 
+  defp router_pread_batch_keyed(locations, timeout_ms) do
+    case Process.get(:ferricstore_router_pread_batch_keyed_result) do
+      nil -> Ferricstore.Store.ColdRead.pread_batch_keyed(locations, timeout_ms)
+      forced_result -> forced_result
+    end
+  end
+
   defp emit_batch_cold_read_corruption(corrupt_by_path) when map_size(corrupt_by_path) == 0,
     do: :ok
 
@@ -2035,6 +2039,9 @@ defmodule Ferricstore.Store.Router do
     do: :missing_file
 
   defp cold_batch_read_error_reason({:error, :timeout}), do: :timeout
+
+  defp cold_batch_read_error_reason({:error, :batch_result_length_mismatch}),
+    do: :batch_result_length_mismatch
 
   defp cold_batch_read_error_reason({:error, _reason}), do: :corrupt_record
 
