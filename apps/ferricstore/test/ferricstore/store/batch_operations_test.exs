@@ -39,6 +39,28 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       end
     end
 
+    test "small batch publish does not overwrite an already materialized Ra apply" do
+      ctx = default_ctx()
+      key = "#{@ns_async}:bap_materialized_race"
+      idx = Router.shard_for(ctx, key)
+      keydir = elem(ctx.keydir_refs, idx)
+
+      try do
+        :ets.insert(keydir, {key, "value", 0, 0, 7, 123, byte_size("value")})
+
+        Router.__install_batch_async_entries_for_test__(
+          ctx,
+          idx,
+          [{key, "value", "value"}],
+          %{}
+        )
+
+        assert [{^key, "value", 0, _lfu, 7, 123, 5}] = :ets.lookup(keydir, key)
+      after
+        :ets.delete(keydir, key)
+      end
+    end
+
     test "all-large batch: values > hot_cache_max written to disk" do
       big = :binary.copy("L", 100 * 1024)
       kvs = for i <- 1..5, do: {"#{@ns_async}:bap_large_#{i}", big}

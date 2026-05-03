@@ -2413,22 +2413,7 @@ defmodule Ferricstore.Store.Router do
 
       Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, _raft_cmds, _large_disk_batch} ->
         shard_locations = Map.get(disk_locations, idx, %{})
-
-        ets_tuples =
-          Enum.map(entries, fn {key, value, value_for_ets} ->
-            clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
-            track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
-
-            case Map.get(shard_locations, key) do
-              {file_id, offset, value_size} ->
-                {key, value_for_ets, 0, lfu_val, file_id, offset, value_size}
-
-              nil ->
-                {key, value_for_ets, 0, lfu_val, :pending, 0, byte_size(value)}
-            end
-          end)
-
-        :ets.insert(keydir, ets_tuples)
+        install_batch_async_entries(ctx, idx, keydir, entries, shard_locations, lfu_val)
 
         if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, length(shard_kvs))
       end)
@@ -2446,6 +2431,39 @@ defmodule Ferricstore.Store.Router do
 
     :throw, {:partial_async_error, reason} ->
       {:error, "ERR async replication partial outcome unknown: #{reason}"}
+  end
+
+  @doc false
+  def __install_batch_async_entries_for_test__(ctx, idx, entries, shard_locations) do
+    keydir = elem(ctx.keydir_refs, idx)
+    install_batch_async_entries(ctx, idx, keydir, entries, shard_locations, LFU.initial())
+  end
+
+  defp install_batch_async_entries(ctx, idx, keydir, entries, shard_locations, lfu_val) do
+    Enum.each(entries, fn {key, value, value_for_ets} ->
+      clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
+
+      case Map.get(shard_locations, key) do
+        {file_id, offset, value_size} ->
+          track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
+          :ets.insert(keydir, {key, value_for_ets, 0, lfu_val, file_id, offset, value_size})
+
+        nil ->
+          install_batch_async_pending_entry(ctx, idx, keydir, key, value, value_for_ets, lfu_val)
+      end
+    end)
+  end
+
+  defp install_batch_async_pending_entry(ctx, idx, keydir, key, value, value_for_ets, lfu_val) do
+    case :ets.lookup(keydir, key) do
+      [{^key, ^value_for_ets, 0, _lfu, fid, off, value_size}]
+      when fid != :pending and valid_cold_location(fid, off, value_size) ->
+        :ok
+
+      _ ->
+        track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
+        :ets.insert(keydir, {key, value_for_ets, 0, lfu_val, :pending, 0, byte_size(value)})
+    end
   end
 
   defp batch_local_put(ctx, kv_pairs) do
