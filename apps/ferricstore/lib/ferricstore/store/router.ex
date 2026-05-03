@@ -3146,7 +3146,10 @@ defmodule Ferricstore.Store.Router do
     sc = ctx.shard_count
 
     Enum.flat_map(0..(sc - 1), fn i ->
-      GenServer.call(resolve_shard(ctx, i), :keys)
+      case safe_read_call(ctx, i, :keys) do
+        {:ok, keys} -> keys
+        :unavailable -> []
+      end
     end)
   end
 

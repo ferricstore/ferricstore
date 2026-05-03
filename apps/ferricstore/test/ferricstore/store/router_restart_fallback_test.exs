@@ -21,6 +21,24 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
     assert nil == Router.get_meta(ctx, "restart:meta")
   end
 
+  test "keys skips unavailable shard and reports telemetry" do
+    ctx = unavailable_ctx()
+    handler_id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :store, :shard_unavailable],
+        &__MODULE__.handle_telemetry/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert [] == Router.keys(ctx)
+    assert_unavailable_event(:keys)
+  end
+
   test "unavailable shard fallbacks emit telemetry" do
     ctx = unavailable_ctx()
     handler_id = {__MODULE__, make_ref()}
