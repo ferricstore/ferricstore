@@ -3,14 +3,33 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
 
   @moduletag :guard
 
-  @source Path.expand("../../native/ferricstore_bitcask/src/lib.rs", __DIR__)
+  @native_src Path.expand("../../native/ferricstore_bitcask/src", __DIR__)
+  @source Path.join(@native_src, "lib.rs")
 
-  test "blocking Bitcask write/fsync NIFs run on dirty IO schedulers" do
+  test "Bitcask Rust NIFs do not use dirty schedulers" do
+    offenders =
+      @native_src
+      |> Path.join("**/*.rs")
+      |> Path.wildcard()
+      |> Enum.flat_map(fn path ->
+        path
+        |> File.read!()
+        |> String.split("\n")
+        |> Enum.with_index(1)
+        |> Enum.filter(fn {line, _line_no} ->
+          line =~ ~r/^\s*#\[rustler::nif\(schedule = "Dirty(?:Io|Cpu)"\)\]/
+        end)
+        |> Enum.map(fn {line, line_no} -> "#{Path.relative_to_cwd(path)}:#{line_no}:#{line}" end)
+      end)
+
+    assert offenders == [],
+           "Rust NIFs must stay on Normal schedulers; move long I/O to Tokio async instead:\n" <>
+             Enum.join(offenders, "\n")
+  end
+
+  test "blocking Bitcask write/fsync NIFs stay on normal schedulers" do
     source = File.read!(@source)
 
-    # These functions do synchronous file writes, fdatasync, hint commits, or
-    # compaction copies. They are not the async/Tokio hot path, so keep them off
-    # normal schedulers to avoid request CPU stalls under slow disk/backpressure.
     for function <- [
           "v2_append_record",
           "v2_append_tombstone",
@@ -24,16 +43,13 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
           "v2_copy_records",
           "v2_copy_records_preserve_tombstones"
         ] do
-      assert_nif_schedule(source, function, "DirtyIo")
+      assert_nif_schedule(source, function, "Normal")
     end
   end
 
-  test "blocking Bitcask cold-read and scan NIFs run on dirty IO schedulers" do
+  test "blocking Bitcask cold-read and scan NIFs stay on normal schedulers" do
     source = File.read!(@source)
 
-    # These functions open files and perform pread/scan/read_all work. Cold
-    # reads are user-facing, and recovery/compaction scans can be large; keep
-    # them off normal schedulers so slow disk cannot stall BEAM request CPU.
     for function <- [
           "v2_pread_at",
           "v2_scan_file",
@@ -42,7 +58,7 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
           "v2_pread_batch",
           "v2_read_hint_file"
         ] do
-      assert_nif_schedule(source, function, "DirtyIo")
+      assert_nif_schedule(source, function, "Normal")
     end
   end
 
@@ -57,29 +73,21 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
            "v2_append_batch_async must not CRC/encode records on a Normal BEAM scheduler"
   end
 
-  test "async batch append copies BEAM binaries off normal schedulers" do
+  test "async batch append submit stays on normal schedulers" do
     source = File.read!(@source)
 
-    # `v2_append_batch_async` must copy BEAM-owned binaries before handing the
-    # batch to Tokio because NIF env references cannot outlive the call. That
-    # copy can be proportional to full batch payload size, so keep it off
-    # Normal schedulers even though the disk write itself is async.
-    assert_nif_schedule(source, "v2_append_batch_async", "DirtyCpu")
+    assert_nif_schedule(source, "v2_append_batch_async", "Normal")
   end
 
-  test "async batch cold-read submit decodes large batches off normal schedulers" do
+  test "async batch cold-read submit stays on normal schedulers" do
     source = File.read!(@source)
 
-    # These NIFs submit the actual reads to Tokio, but Rustler still decodes the
-    # path/offset batch before the function returns. Large cold MGET/HMGET-style
-    # reads can carry thousands of offsets, so keep the submit/decode work off
-    # Normal schedulers while the blocking pread work stays on Tokio workers.
     for function <- [
           "v2_pread_batch_path_async",
           "v2_pread_batch_async",
           "v2_pread_batch_grouped_async"
         ] do
-      assert_nif_schedule(source, function, "DirtyCpu")
+      assert_nif_schedule(source, function, "Normal")
     end
   end
 

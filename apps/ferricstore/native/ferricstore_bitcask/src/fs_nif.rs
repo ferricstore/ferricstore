@@ -20,8 +20,8 @@
 //!   message.
 //!
 //! **Design rule:** NEVER use `schedule = "DirtyIo"` or `"DirtyCpu"` here.
-//! The whole point of this module is to keep disk I/O off the dirty pool
-//! so BEAM scheduler accounting stays correct.
+//! The whole point of this module is to keep disk I/O off the dirty pool so
+//! BEAM scheduler accounting stays correct; long I/O goes through Tokio async.
 
 use std::io;
 use std::path::Path;

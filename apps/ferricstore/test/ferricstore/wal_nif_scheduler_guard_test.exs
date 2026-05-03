@@ -16,15 +16,19 @@ defmodule Ferricstore.WalNifSchedulerGuardTest do
     assert_nif_schedule(source, "position", "Normal")
   end
 
-  test "blocking WAL NIF calls run on dirty IO schedulers" do
+  test "blocking WAL NIF calls stay on normal schedulers" do
     source = File.read!(@source)
 
-    # open can touch filesystem metadata and pre-allocation, close waits for
-    # drain+fdatasync, and pread performs recovery reads. Keep these off normal
-    # schedulers so startup/recovery/shutdown stalls do not steal request CPU.
-    assert_nif_schedule(source, "open", "DirtyIo")
-    assert_nif_schedule(source, "close", "DirtyIo")
-    assert_nif_schedule(source, "pread", "DirtyIo")
+    assert_nif_schedule(source, "open", "Normal")
+    assert_nif_schedule(source, "close", "Normal")
+    assert_nif_schedule(source, "pread", "Normal")
+  end
+
+  test "WAL Rust NIFs do not use dirty schedulers" do
+    source = File.read!(@source)
+
+    refute source =~ ~r/^\s*#\[rustler::nif\(schedule = "Dirty(?:Io|Cpu)"\)\]/m,
+           "WAL NIFs must stay on Normal schedulers; move long I/O to Tokio async instead"
   end
 
   defp assert_nif_schedule(source, function, schedule) do

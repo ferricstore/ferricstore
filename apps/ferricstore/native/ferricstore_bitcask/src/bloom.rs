@@ -146,7 +146,7 @@ fn encode_file_error(env: Env, fe: FileError) -> Term {
 
 /// Create a new bloom filter file at the given path.
 /// Returns `{:ok, :ok}` or `{:error, reason}`.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_create(
     env: Env,
@@ -212,7 +212,7 @@ pub fn bloom_file_create(
 /// Add an element to a bloom filter file via pread/pwrite.
 /// Returns `{:ok, 1}` if any bit was newly set, `{:ok, 0}` if all bits were already set.
 /// Returns `{:error, :enoent}` if the file does not exist.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> NifResult<Term<'a>> {
     let file = match crate::open_random_rw(Path::new(&path)) {
@@ -277,7 +277,7 @@ pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> Ni
 /// Add multiple elements to a bloom filter file via pread/pwrite.
 /// Returns `{:ok, [0|1, ...]}` with one result per element.
 /// Returns `{:error, :enoent}` if the file does not exist.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_madd<'a>(
     env: Env<'a>,
@@ -371,7 +371,7 @@ pub fn bloom_file_madd<'a>(
 /// Check if an element may exist in a bloom filter file via pread.
 /// Returns `{:ok, 1}` if possibly present, `{:ok, 0}` if definitely not.
 /// Returns `{:error, :enoent}` if the file does not exist.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_exists<'a>(
     env: Env<'a>,
@@ -413,7 +413,7 @@ pub fn bloom_file_exists<'a>(
 /// Check if multiple elements may exist in a bloom filter file via pread.
 /// Returns `{:ok, [0|1, ...]}` with one result per element.
 /// Returns `{:error, :enoent}` if the file does not exist.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_mexists<'a>(
     env: Env<'a>,
@@ -465,7 +465,7 @@ pub fn bloom_file_mexists<'a>(
 
 /// Return the insertion count from a bloom filter file header.
 /// Returns `{:ok, count}` or `{:error, :enoent}`.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_card(env: Env, path: String) -> NifResult<Term> {
     let file = match crate::open_random_read(Path::new(&path)) {
@@ -484,7 +484,7 @@ pub fn bloom_file_card(env: Env, path: String) -> NifResult<Term> {
 
 /// Return bloom filter info from a file header.
 /// Returns `{:ok, {num_bits, count, num_hashes}}` or `{:error, :enoent}`.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_info(env: Env, path: String) -> NifResult<Term> {
     let file = match crate::open_random_read(Path::new(&path)) {
@@ -506,7 +506,7 @@ pub fn bloom_file_info(env: Env, path: String) -> NifResult<Term> {
 // ---------------------------------------------------------------------------
 
 /// Async bloom exists: spawns on Tokio, sends result to `caller_pid`.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn bloom_file_exists_async<'a>(
     env: Env<'a>,
@@ -560,7 +560,7 @@ pub fn bloom_file_exists_async<'a>(
 }
 
 /// Async bloom mexists: spawns on Tokio, sends result to `caller_pid`.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn bloom_file_mexists_async<'a>(
     env: Env<'a>,
@@ -619,7 +619,7 @@ pub fn bloom_file_mexists_async<'a>(
 }
 
 /// Async bloom card: spawns on Tokio, sends result to `caller_pid`.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn bloom_file_card_async(
     env: Env<'_>,
@@ -659,7 +659,7 @@ pub fn bloom_file_card_async(
 }
 
 /// Async bloom info: spawns on Tokio, sends result to `caller_pid`.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn bloom_file_info_async(
     env: Env<'_>,

@@ -2,7 +2,8 @@
 //
 // Hot write/sync NIF functions run on normal BEAM schedulers (<1μs each).
 // Blocking I/O (write + fdatasync) runs on a dedicated background thread.
-// Startup/recovery/shutdown calls that can block use DirtyIo schedulers.
+// Startup/recovery/shutdown calls stay on Normal schedulers; long-running
+// runtime I/O belongs on the background thread/Tokio path, not dirty schedulers.
 //
 // Architecture:
 //   NIF calls → Mutex<AlignedBuffer> (shared) → FlushRequest channel → Background thread
@@ -45,7 +46,7 @@ mod atoms {
 /// commit_delay_us: microseconds to wait before fdatasync (default 200)
 /// pre_allocate_bytes: fallocate size (default 256MB)
 /// max_buffer_bytes: backpressure limit (default 64MB)
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 fn open(
     path: String,
     commit_delay_us: u64,
@@ -95,7 +96,7 @@ fn sync(
 
 /// Close the WAL file. Blocks until background thread drains, syncs, and exits.
 /// Timeout: 30 seconds.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 fn close<'a>(env: Env<'a>, handle: ResourceArc<WalHandle>) -> NifResult<Term<'a>> {
     match handle.close() {
         Ok(()) => Ok(atoms::ok().encode(env)),
@@ -110,7 +111,7 @@ fn position(handle: ResourceArc<WalHandle>) -> NifResult<(Atom, u64)> {
 }
 
 /// Read bytes from WAL at offset. Used during recovery.
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif(schedule = "Normal")]
 fn pread<'a>(
     env: Env<'a>,
     handle: ResourceArc<WalHandle>,

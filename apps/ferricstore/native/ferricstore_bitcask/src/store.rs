@@ -315,24 +315,17 @@ impl Store {
 
     /// Write multiple key-value pairs with a **single fsync** (group commit).
     ///
-    /// This is the correct write path for the BEAM integration. The Elixir shard
-    /// `GenServer` collects writes during a batch window (e.g. 1ms), then calls
-    /// `put_batch` once. One fsync serves all writes in the batch — the dirty
-    /// scheduler thread is occupied only for the duration of a single `sync_all`,
-    /// not once per write.
+    /// This is the legacy direct write path for the BEAM integration. Modern hot
+    /// paths batch or submit long I/O asynchronously so normal scheduler work is
+    /// bounded.
     ///
     /// ## BEAM scheduler note
     ///
-    /// Each NIF call with `schedule = "DirtyIo"` occupies one dirty scheduler
-    /// thread for its entire duration. BEAM has a fixed pool of dirty scheduler
-    /// threads (default: 10). If every `put` issues its own fsync, sustained
-    /// concurrent write load exhausts the pool and new NIF calls queue behind it
-    /// — this appears as write latency spikes on the Elixir side.
+    /// Each synchronous NIF call occupies a normal scheduler until it returns.
+    /// If every `put` issues its own fsync, sustained concurrent write load
+    /// appears as write latency spikes on the Elixir side.
     ///
-    /// `put_batch` amortises: N client writes → 1 NIF call → 1 fsync → 1 dirty
-    /// thread occupied for the batch window. The normal BEAM schedulers are never
-    /// blocked; only one dirty thread is occupied per batch, regardless of batch
-    /// size.
+    /// `put_batch` amortises: N client writes -> 1 NIF call -> 1 fsync.
     ///
     /// # Errors
     ///
