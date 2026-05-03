@@ -306,6 +306,38 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
                     %{path: ^missing_path, reason: :missing_file}}
   end
 
+  test "batch cold reads retry when ETS changes after a cold read miss", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_batch_compacted:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    good_key = key <> ":good"
+    value = "compacted-batch-value"
+    good_value = "batch-good-value"
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    current_path = Path.join(shard_path, "00001.log")
+    good_path = Path.join(shard_path, "00002.log")
+    missing_path = Path.join(shard_path, "00009.log")
+
+    {:ok, {current_offset, _current_record_size}} =
+      NIF.v2_append_record(current_path, key, value, 0)
+
+    {:ok, {good_offset, _good_record_size}} =
+      NIF.v2_append_record(good_path, good_key, good_value, 0)
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 9, 0, byte_size(value)})
+    :ets.insert(keydir, {good_key, nil, 0, LFU.initial(), 2, good_offset, byte_size(good_value)})
+
+    attach_pread_corrupt_handler(fn ->
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 1, current_offset, byte_size(value)})
+    end)
+
+    assert [^value, ^good_value] = Router.batch_get(ctx, [key, good_key])
+
+    assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                    %{path: ^missing_path, reason: :missing_file}}
+  end
+
   test "batch cold read corruption in one file does not hide valid keys from another file", %{
     ctx: ctx,
     keydir: keydir

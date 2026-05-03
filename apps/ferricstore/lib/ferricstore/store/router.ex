@@ -1880,15 +1880,9 @@ defmodule Ferricstore.Store.Router do
 
           {:cold, file_id, offset, value_size}
           when valid_cold_location(file_id, offset, value_size) ->
-            shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+            path = cold_file_path(ctx, idx, file_id)
 
-            path =
-              Path.join(
-                shard_path,
-                "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
-              )
-
-            entry = {ctx, keydir, key, path, file_id, offset}
+            entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
             {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
 
           {:cold, _file_id, _offset, _value_size} ->
@@ -1934,7 +1928,7 @@ defmodule Ferricstore.Store.Router do
     cold_values =
       cold_entries
       |> Enum.reverse()
-      |> read_cold_batch_async()
+      |> read_cold_batch_async(now)
       |> List.to_tuple()
 
     Enum.map(results, fn
@@ -1943,11 +1937,11 @@ defmodule Ferricstore.Store.Router do
     end)
   end
 
-  defp read_cold_batch_async([]), do: []
+  defp read_cold_batch_async([], _now), do: []
 
-  defp read_cold_batch_async(entries) do
+  defp read_cold_batch_async(entries, now) do
     locations =
-      Enum.map(entries, fn {_ctx, _keydir, key, path, _file_id, offset} ->
+      Enum.map(entries, fn {_ctx, _idx, _keydir, key, path, _file_id, offset, _value_size} ->
         {path, offset, key}
       end)
 
@@ -1967,23 +1961,44 @@ defmodule Ferricstore.Store.Router do
           List.duplicate(nil, length(entries))
       end
 
-    {read_values, corrupt_by_path} =
-      Enum.zip(entries, values)
-      |> Enum.map_reduce(%{}, fn
-        {{ctx, keydir, key, _path, file_id, offset}, value}, corrupt_by_path
-        when is_binary(value) ->
-          Stats.record_cold_read(ctx, key)
-          warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
-          {value, corrupt_by_path}
+    entry_values = Enum.zip(entries, values)
 
-        {{_ctx, _keydir, _key, path, _file_id, _offset}, value}, corrupt_by_path ->
+    corrupt_by_path =
+      Enum.reduce(entry_values, %{}, fn
+        {{_ctx, _idx, _keydir, _key, _path, _file_id, _offset, _value_size}, value},
+        corrupt_by_path
+        when is_binary(value) ->
+          corrupt_by_path
+
+        {{_ctx, _idx, _keydir, _key, path, _file_id, _offset, _value_size}, value},
+        corrupt_by_path ->
           reason = cold_batch_read_error_reason(value)
-          corrupt_by_path = Map.update(corrupt_by_path, {path, reason}, 1, &(&1 + 1))
-          {nil, corrupt_by_path}
+          Map.update(corrupt_by_path, {path, reason}, 1, &(&1 + 1))
       end)
 
     emit_batch_cold_read_corruption(corrupt_by_path)
-    read_values
+
+    Enum.map(entry_values, fn
+      {{ctx, _idx, keydir, key, _path, file_id, offset, _value_size}, value}
+      when is_binary(value) ->
+        Stats.record_cold_read(ctx, key)
+        warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
+        value
+
+      {{ctx, idx, keydir, key, _path, file_id, offset, value_size}, _value} ->
+        case retry_changed_cold_value(ctx, idx, keydir, key, {file_id, offset, value_size}, now) do
+          {:cold, value, retry_file_id, retry_offset} ->
+            Stats.record_cold_read(ctx, key)
+            warm_ets_after_cold_read(ctx, keydir, key, value, retry_file_id, retry_offset)
+            value
+
+          {:hot, value} ->
+            value
+
+          :miss ->
+            nil
+        end
+    end)
   end
 
   defp emit_batch_cold_read_corruption(corrupt_by_path) when map_size(corrupt_by_path) == 0,
