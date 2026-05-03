@@ -27,7 +27,7 @@ defmodule Ferricstore.Store.ColdRead do
       end,
       timeout_ms
     )
-    |> emit_pread_error(path)
+    |> emit_pread_result_error(path)
   end
 
   @spec pread_at(binary(), non_neg_integer(), binary(), timeout()) :: result()
@@ -38,7 +38,7 @@ defmodule Ferricstore.Store.ColdRead do
       end,
       timeout_ms
     )
-    |> emit_pread_error(path)
+    |> emit_pread_result_error(path)
   end
 
   @spec pread_batch([{binary(), non_neg_integer()}], timeout()) :: result()
@@ -74,6 +74,16 @@ defmodule Ferricstore.Store.ColdRead do
         end
       end,
       timeout_ms
+    )
+  end
+
+  @doc false
+  @spec emit_pread_error(binary(), term(), pos_integer()) :: :ok
+  def emit_pread_error(path, raw_reason, count \\ 1) when is_binary(path) and count > 0 do
+    :telemetry.execute(
+      [:ferricstore, :bitcask, :pread_corrupt],
+      %{count: count},
+      %{path: path, reason: classify_pread_error(raw_reason), raw_reason: raw_reason}
     )
   end
 
@@ -152,17 +162,13 @@ defmodule Ferricstore.Store.ColdRead do
     |> Enum.map(fn path -> {path, groups |> Map.fetch!(path) |> Enum.reverse()} end)
   end
 
-  defp emit_pread_error({:error, reason} = result, path) do
-    :telemetry.execute(
-      [:ferricstore, :bitcask, :pread_corrupt],
-      %{count: 1},
-      %{path: path, reason: classify_pread_error(reason), raw_reason: reason}
-    )
+  defp emit_pread_result_error({:error, reason} = result, path) do
+    emit_pread_error(path, reason)
 
     result
   end
 
-  defp emit_pread_error(result, _path), do: result
+  defp emit_pread_result_error(result, _path), do: result
 
   defp classify_pread_error(:timeout), do: :timeout
 

@@ -133,6 +133,61 @@ defmodule Ferricstore.Store.OpsTest do
         File.rm_rf(dir)
       end
     end
+
+    test "batch_get reports per-entry cold read errors and keeps good values" do
+      ctx = FerricStore.Instance.get(:default)
+      {shard_index, keys} = same_shard_keys(ctx, "ops:local_tx:plain-missing-file", 2)
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ops_local_tx_plain_missing_#{System.unique_integer([:positive])}"
+        )
+
+      keydir = :ets.new(:"ops_local_tx_#{System.unique_integer([:positive])}", [:set, :public])
+
+      try do
+        File.mkdir_p!(dir)
+        path = Path.join(dir, "00000.log")
+        File.touch!(path)
+        missing_path = Path.join(dir, "00009.log")
+
+        assert {:ok, [{good_off, good_size}]} =
+                 NIF.v2_append_batch_nosync(path, [{Enum.at(keys, 1), "good", 0}])
+
+        :ets.insert(keydir, {Enum.at(keys, 0), nil, 0, LFU.initial(), 9, 0, 8})
+        :ets.insert(keydir, {Enum.at(keys, 1), nil, 0, LFU.initial(), 0, good_off, good_size})
+
+        tx =
+          local_tx(ctx, shard_index, keydir, %{})
+          |> put_in([Access.key!(:shard_state), :shard_data_path], dir)
+
+        handler_id = {:ops_pread_corrupt, self(), make_ref()}
+        parent = self()
+
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :bitcask, :pread_corrupt],
+          fn event, measurements, metadata, _config ->
+            send(parent, {:pread_corrupt, event, measurements, metadata})
+          end,
+          nil
+        )
+
+        try do
+          assert [nil, "good"] == Ops.batch_get(tx, keys)
+
+          assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                          %{path: ^missing_path, reason: :missing_file}},
+                         1_000
+        after
+          :telemetry.detach(handler_id)
+        end
+      after
+        :ets.delete(keydir)
+        File.rm_rf(dir)
+      end
+    end
   end
 
   describe "LocalTxStore promoted compound reads" do

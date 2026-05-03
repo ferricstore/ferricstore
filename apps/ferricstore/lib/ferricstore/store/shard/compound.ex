@@ -3,7 +3,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{LFU, Promotion}
+  alias Ferricstore.Store.{ColdRead, LFU, Promotion}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
@@ -178,27 +178,15 @@ defmodule Ferricstore.Store.Shard.Compound do
     |> Enum.zip(values)
     |> Enum.reduce(%{}, fn
       {{_state, _compound_key, file_path, _fid, _off, _vsize, _exp}, {:error, raw_reason}}, acc ->
-        reason = classify_compound_cold_read_error(raw_reason)
-        Map.update(acc, {file_path, reason, raw_reason}, 1, &(&1 + 1))
+        Map.update(acc, {file_path, raw_reason}, 1, &(&1 + 1))
 
       {_entry, _value}, acc ->
         acc
     end)
-    |> Enum.each(fn {{path, reason, raw_reason}, count} ->
-      :telemetry.execute(
-        [:ferricstore, :bitcask, :pread_corrupt],
-        %{count: count},
-        %{path: path, reason: reason, raw_reason: raw_reason}
-      )
+    |> Enum.each(fn {{path, raw_reason}, count} ->
+      ColdRead.emit_pread_error(path, raw_reason, count)
     end)
   end
-
-  defp classify_compound_cold_read_error(reason) when is_binary(reason) do
-    if String.contains?(reason, "missing_file"), do: :missing_file, else: :corrupt_record
-  end
-
-  defp classify_compound_cold_read_error(:timeout), do: :timeout
-  defp classify_compound_cold_read_error(_reason), do: :corrupt_record
 
   defp compound_get_value(redis_key, compound_key, state) do
     case promoted_store_for_compound(state, redis_key, compound_key) do

@@ -991,7 +991,7 @@ defmodule Ferricstore.Store.Ops do
       Enum.map(cold_reads, fn {_index, key, path, _fid, off, _vsize, _exp} -> {path, off, key} end)
 
     case ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms) do
-      {:ok, values} when is_list(values) ->
+      {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
         cold_reads
         |> Enum.zip(values)
         |> Enum.reduce(results, fn
@@ -999,13 +999,30 @@ defmodule Ferricstore.Store.Ops do
             ShardETS.cold_read_warm_ets(tx.shard_state, key, value, exp, fid, off, vsize)
             Map.put(acc, index, {value, exp})
 
+          {{_index, _key, path, _fid, _off, _vsize, _exp}, {:error, reason}}, acc ->
+            ColdRead.emit_pread_error(path, reason)
+            acc
+
           {_read, _missing_or_error}, acc ->
             acc
         end)
 
-      _ ->
+      {:ok, _bad_values} ->
+        emit_local_batch_cold_errors(cold_reads, :batch_result_length_mismatch)
+        results
+
+      {:error, reason} ->
+        emit_local_batch_cold_errors(cold_reads, reason)
         results
     end
+  end
+
+  defp emit_local_batch_cold_errors(cold_reads, reason) do
+    cold_reads
+    |> Enum.reduce(%{}, fn {_index, _key, path, _fid, _off, _vsize, _exp}, acc ->
+      Map.update(acc, path, 1, &(&1 + 1))
+    end)
+    |> Enum.each(fn {path, count} -> ColdRead.emit_pread_error(path, reason, count) end)
   end
 
   defp local_set(tx, key, value, opts) do
