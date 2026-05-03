@@ -1031,20 +1031,15 @@ defmodule Ferricstore.Store.Shard do
                                                            files_scanned} ->
         next_files_scanned = files_scanned + 1
 
-        case NIF.v2_scan_file(path) do
+        case NIF.v2_scan_key_states(path, MapSet.to_list(unresolved_keys)) do
           {:ok, records} ->
             file_states =
-              Enum.reduce(records, %{}, fn {key, _offset, _value_size, expire_at_ms, tombstone?},
-                                           acc ->
-                if MapSet.member?(unresolved_keys, key) do
-                  Map.put(
-                    acc,
-                    key,
-                    tombstone_dependency_state(tombstone?, expire_at_ms, now_ms)
-                  )
-                else
-                  acc
-                end
+              Enum.reduce(records, %{}, fn {key, expire_at_ms, tombstone?}, acc ->
+                Map.put(
+                  acc,
+                  key,
+                  tombstone_dependency_state(tombstone?, expire_at_ms, now_ms)
+                )
               end)
 
             next_states = Map.merge(states, file_states)

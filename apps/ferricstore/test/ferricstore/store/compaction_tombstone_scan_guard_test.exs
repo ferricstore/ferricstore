@@ -17,4 +17,16 @@ defmodule Ferricstore.Store.CompactionTombstoneScanGuardTest do
     assert function_source =~ "MapSet.size(next_unresolved_keys) == 0",
            "stop scanning lower files once every tombstone key has a newest lower state"
   end
+
+  test "lower tombstone dependency scan uses key-state metadata scan" do
+    source = File.read!(@shard_path)
+    [_before, section] = String.split(source, "defp scan_lower_tombstone_key_states", parts: 2)
+    [function_source | _after] = String.split(section, "\n  defp tombstone_offsets", parts: 2)
+
+    assert function_source =~ "v2_scan_key_states",
+           "compaction tombstone dependency checks only need key/tombstone/expiry state, not live value payload hashing"
+
+    refute function_source =~ "v2_scan_file(path)",
+           "using v2_scan_file here hashes every live payload in lower files during compaction"
+  end
 end

@@ -713,6 +713,150 @@ fn v2_scan_tombstones<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
     }
 }
 
+/// Scan the newest state for a bounded set of keys in one file.
+/// `{:ok, [{key, expire_at_ms, is_tombstone}, ...]}`.
+///
+/// Used by compaction tombstone-dependency checks. It reads headers and keys
+/// and seeks over live values instead of hashing payload bytes; the caller only
+/// needs to know whether a lower file contains a live, expired, or tombstone
+/// state for each masked key.
+#[derive(Debug, PartialEq, Eq)]
+struct KeyStateScanRecord {
+    key: Vec<u8>,
+    expire_at_ms: u64,
+    is_tombstone: bool,
+}
+
+fn scan_key_states_from_path(
+    path: &std::path::Path,
+    masked_keys: &[Vec<u8>],
+) -> Result<Vec<KeyStateScanRecord>, String> {
+    use std::collections::{HashMap, HashSet};
+    use std::io::{Read, Seek, SeekFrom};
+
+    if masked_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let targets: HashSet<Vec<u8>> = masked_keys.iter().cloned().collect();
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+    let mut reader = std::io::BufReader::new(file);
+    let mut states: HashMap<Vec<u8>, (u64, bool)> = HashMap::new();
+    let mut offset: u64 = 0;
+
+    while offset < file_len {
+        let mut header = [0u8; log::HEADER_SIZE];
+
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(format!("key-state scan {path:?}:{offset}: {e}")),
+        }
+
+        let stored_crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        let expire_at_ms = u64::from_le_bytes(header[12..20].try_into().unwrap());
+        let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
+        let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
+        let is_tombstone = value_size_raw == log::TOMBSTONE;
+
+        let mut key = vec![0u8; key_size];
+        match reader.read_exact(&mut key) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(format!("key-state scan {path:?}:{offset}: {e}")),
+        }
+
+        if is_tombstone {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&header[4..]);
+            hasher.update(&key);
+            let computed_crc = hasher.finalize();
+
+            if computed_crc != stored_crc {
+                break;
+            }
+        }
+
+        if targets.contains(&key) {
+            states.insert(key.clone(), (expire_at_ms, is_tombstone));
+        }
+
+        let value_size = if is_tombstone {
+            0_u64
+        } else {
+            u64::from(value_size_raw)
+        };
+
+        let record_size = log::HEADER_SIZE as u64 + key_size as u64 + value_size;
+        let next_offset = offset
+            .checked_add(record_size)
+            .ok_or_else(|| format!("key-state scan {path:?}:{offset}: record offset overflow"))?;
+
+        if next_offset > file_len {
+            break;
+        }
+
+        if value_size > 0 {
+            reader
+                .seek(SeekFrom::Current(value_size as i64))
+                .map_err(|e| {
+                    format!("key-state scan {path:?}:{offset}: failed to skip value: {e}")
+                })?;
+        }
+
+        offset = next_offset;
+    }
+
+    Ok(states
+        .into_iter()
+        .map(|(key, (expire_at_ms, is_tombstone))| KeyStateScanRecord {
+            key,
+            expire_at_ms,
+            is_tombstone,
+        })
+        .collect())
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_scan_key_states<'a>(
+    env: Env<'a>,
+    path: String,
+    masked_keys: Vec<Binary>,
+) -> NifResult<Term<'a>> {
+    let p = std::path::Path::new(&path);
+    let keys: Vec<Vec<u8>> = masked_keys
+        .iter()
+        .map(|key| key.as_slice().to_vec())
+        .collect();
+
+    match scan_key_states_from_path(p, &keys) {
+        Ok(records) => {
+            let mut results: Vec<Term<'a>> = Vec::with_capacity(records.len());
+
+            for record in records {
+                let key_bin = match OwnedBinary::new(record.key.len()) {
+                    Some(mut ob) => {
+                        ob.as_mut_slice().copy_from_slice(&record.key);
+                        ob.release(env)
+                    }
+                    None => {
+                        return Ok(
+                            (atoms::error(), "out of memory allocating key binary").encode(env)
+                        );
+                    }
+                };
+
+                results.push((key_bin, record.expire_at_ms, record.is_tombstone).encode(env));
+            }
+
+            Ok((atoms::ok(), results).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
 /// Batch pread: read values at multiple offsets from the same file.
 /// Returns `{:ok, [value_binary | nil, ...]}`.
 ///
@@ -2388,6 +2532,102 @@ mod audit_fix_tests {
 
         let err = scan_tombstones_from_path(&path).unwrap_err();
         assert!(err.contains("unexpected EOF") || err.contains("failed to read key"));
+    }
+
+    #[test]
+    fn key_state_scan_returns_latest_masked_state_without_values() {
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        writer.write(b"a", &vec![b'x'; 128 * 1024], 11).unwrap();
+        writer
+            .write(b"ignored", &vec![b'y'; 128 * 1024], 0)
+            .unwrap();
+        writer.write_tombstone(b"a").unwrap();
+        writer.write(b"b", b"live", 22).unwrap();
+        writer.sync().unwrap();
+
+        let states =
+            scan_key_states_from_path(&path, &[b"a".to_vec(), b"b".to_vec(), b"missing".to_vec()])
+                .unwrap();
+
+        assert!(states
+            .iter()
+            .any(|state| { state.key == b"a" && state.expire_at_ms == 0 && state.is_tombstone }));
+
+        assert!(states
+            .iter()
+            .any(|state| { state.key == b"b" && state.expire_at_ms == 22 && !state.is_tombstone }));
+
+        assert!(!states.iter().any(|state| state.key == b"missing"));
+    }
+
+    #[test]
+    fn key_state_scan_tolerates_truncated_live_payload_after_key() {
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        writer.write(b"a", b"live", 7).unwrap();
+        writer.write(b"truncated", &vec![b'x'; 1024], 0).unwrap();
+        writer.sync().unwrap();
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 100)
+            .unwrap();
+
+        let states =
+            scan_key_states_from_path(&path, &[b"a".to_vec(), b"truncated".to_vec()]).unwrap();
+
+        assert!(states
+            .iter()
+            .any(|state| state.key == b"a" && state.expire_at_ms == 7 && !state.is_tombstone));
+
+        assert!(states
+            .iter()
+            .any(|state| state.key == b"truncated" && !state.is_tombstone));
+    }
+
+    #[test]
+    fn key_state_scan_does_not_trust_corrupt_tombstone() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        writer.write_tombstone(b"deleted").unwrap();
+        writer.sync().unwrap();
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        let mut header = [0u8; log::HEADER_SIZE];
+        file.read_exact(&mut header).unwrap();
+        let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as i64;
+        file.seek(SeekFrom::Current(key_size - 1)).unwrap();
+
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x01;
+        file.seek(SeekFrom::Current(-1)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+
+        let states = scan_key_states_from_path(&path, &[b"deleted".to_vec()]).unwrap();
+
+        assert!(
+            states.is_empty(),
+            "corrupt tombstone must not be trusted as a lower tombstone state"
+        );
     }
 
     #[test]
