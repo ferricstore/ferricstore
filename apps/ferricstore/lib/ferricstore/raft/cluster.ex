@@ -370,7 +370,9 @@ defmodule Ferricstore.Raft.Cluster do
       min_recovery_checkpoint_interval: 1
     }
 
-    case :ra.start_server(ra_sys, server_config) do
+    case profile_startup_phase(shard_index, :ra_start_server, fn ->
+           :ra.start_server(ra_sys, server_config)
+         end) do
       :ok ->
         trigger_and_wait(server_id)
 
@@ -404,8 +406,15 @@ defmodule Ferricstore.Raft.Cluster do
   end
 
   defp trigger_and_wait(server_id) do
-    :ra.trigger_election(server_id)
-    wait_for_leader(server_id)
+    shard_index = shard_index_from_server_id(server_id)
+
+    profile_startup_phase(shard_index, :ra_trigger_election, fn ->
+      :ra.trigger_election(server_id)
+    end)
+
+    profile_startup_phase(shard_index, :ra_wait_leader, fn ->
+      wait_for_leader(server_id)
+    end)
   end
 
   defp handle_already_started(ra_sys, server_id, server_config, shard_index) do
@@ -416,7 +425,9 @@ defmodule Ferricstore.Raft.Cluster do
     _ = :ra.stop_server(ra_sys, server_id)
     Process.sleep(100)
 
-    case :ra.start_server(ra_sys, server_config) do
+    case profile_startup_phase(shard_index, :ra_start_server_after_stop, fn ->
+           :ra.start_server(ra_sys, server_config)
+         end) do
       :ok ->
         trigger_and_wait(server_id)
 
@@ -433,7 +444,9 @@ defmodule Ferricstore.Raft.Cluster do
   end
 
   defp restart_existing_server(ra_sys, server_id, shard_index) do
-    case :ra.restart_server(ra_sys, server_id) do
+    case profile_startup_phase(shard_index, :ra_restart_server, fn ->
+           :ra.restart_server(ra_sys, server_id)
+         end) do
       :ok ->
         trigger_and_wait(server_id)
 
@@ -540,6 +553,27 @@ defmodule Ferricstore.Raft.Cluster do
 
   defp shard_cluster_name(shard_index) do
     :"ferricstore_shard_cluster_#{shard_index}"
+  end
+
+  defp profile_startup_phase(shard_index, phase, fun) when is_function(fun, 0) do
+    {duration_us, result} = :timer.tc(fun)
+
+    :telemetry.execute(
+      [:ferricstore, :shard, :startup_phase],
+      %{duration_us: duration_us},
+      %{shard_index: shard_index, phase: phase}
+    )
+
+    result
+  end
+
+  defp shard_index_from_server_id({name, _node}) when is_atom(name) do
+    name
+    |> Atom.to_string()
+    |> String.trim_leading("ferricstore_shard_")
+    |> String.to_integer()
+  rescue
+    _ -> -1
   end
 
   # Waits for the ra server to elect a leader. In single-node mode this
