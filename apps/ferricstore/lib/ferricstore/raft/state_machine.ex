@@ -2152,6 +2152,7 @@ defmodule Ferricstore.Raft.StateMachine do
     case origin_replay_decision(
            state,
            key,
+           inner_cmd,
            before_value,
            before_expire_at_ms,
            expected_value,
@@ -2565,6 +2566,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp origin_replay_decision(
          state,
          key,
+         inner_cmd,
          before_value,
          before_expire_at_ms,
          expected_value,
@@ -2581,15 +2583,65 @@ defmodule Ferricstore.Raft.StateMachine do
         :apply
 
       _other ->
-        if origin_pending_value?(state, key), do: :apply, else: :newer_local_value
+        pending_newer_origin_replay_decision(state, key, inner_cmd, expected_value)
     end
   end
 
-  defp origin_pending_value?(state, key) do
+  defp pending_newer_origin_replay_decision(state, key, inner_cmd, expected_value) do
     case :ets.lookup(state.ets, key) do
-      [{^key, _value, _expire_at_ms, _lfu, :pending, _off, _value_size}] -> true
+      [{^key, current_value, _expire_at_ms, _lfu, :pending, _off, _value_size}] ->
+        if pending_newer_value_includes_origin_command?(
+             inner_cmd,
+             current_value,
+             expected_value
+           ) do
+          :already_applied
+        else
+          :apply
+        end
+
+      _ ->
+        :newer_local_value
+    end
+  end
+
+  defp pending_newer_value_includes_origin_command?(
+         {:incr, _key, delta},
+         current_value,
+         expected_value
+       ) do
+    with {:ok, current} <- coerce_integer(current_value),
+         {:ok, expected} <- coerce_integer(expected_value) do
+      if delta >= 0, do: current >= expected, else: current <= expected
+    else
       _ -> false
     end
+  end
+
+  defp pending_newer_value_includes_origin_command?(
+         {:incr_float, _key, delta},
+         current_value,
+         expected_value
+       ) do
+    with {:ok, current} <- coerce_float(current_value),
+         {:ok, expected} <- coerce_float(expected_value) do
+      if delta >= 0.0, do: current >= expected, else: current <= expected
+    else
+      _ -> false
+    end
+  end
+
+  defp pending_newer_value_includes_origin_command?(
+         {:append, _key, _suffix},
+         current_value,
+         expected_value
+       )
+       when is_binary(current_value) and is_binary(expected_value) do
+    String.starts_with?(current_value, expected_value)
+  end
+
+  defp pending_newer_value_includes_origin_command?(_inner_cmd, _current_value, _expected_value) do
+    false
   end
 
   defp origin_command_already_in_current_value?(

@@ -348,6 +348,50 @@ defmodule Ferricstore.Raft.StateMachineTest do
                NIF.v2_scan_file(active_file_path)
     end
 
+    test "does not replay origin INCR when a newer pending value already includes it", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      :ets.insert(ets, {"pending_origin_incr_newer", "10", 0, 1, :pending, 0, 0})
+
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "pending_origin_incr_newer", {:incr, "pending_origin_incr_newer", 1},
+            "4", 0, "5", 0}},
+          state
+        )
+
+      assert [{"pending_origin_incr_newer", "10", 0, _lfu, :pending, 0, 0}] =
+               :ets.lookup(ets, "pending_origin_incr_newer")
+
+      assert {:ok, []} = NIF.v2_scan_file(active_file_path)
+    end
+
+    test "does not replay origin DECR when a newer pending value already includes it", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      :ets.insert(ets, {"pending_origin_decr_newer", "-10", 0, 1, :pending, 0, 0})
+
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "pending_origin_decr_newer",
+            {:incr, "pending_origin_decr_newer", -1}, "-4", 0, "-5", 0}},
+          state
+        )
+
+      assert [{"pending_origin_decr_newer", "-10", 0, _lfu, :pending, 0, 0}] =
+               :ets.lookup(ets, "pending_origin_decr_newer")
+
+      assert {:ok, []} = NIF.v2_scan_file(active_file_path)
+    end
+
     test "replays origin GETEX when recovery has the old expiry", %{state: state, ets: ets} do
       old_expire_at_ms = Ferricstore.HLC.now_ms() + 10_000
       new_expire_at_ms = old_expire_at_ms + 10_000
