@@ -92,6 +92,17 @@ defmodule Ferricstore.Store.RouterTest do
     end
   end
 
+  describe "async list timeout classification" do
+    test "list worker timeout is reported as unknown outcome" do
+      source = File.read!("lib/ferricstore/store/router.ex")
+
+      refute source =~ ~s({:error, "ERR list_op timeout"}),
+             "list mutations may still complete after the worker call times out; classify as unknown outcome"
+
+      assert source =~ "ErrorReasons.write_timeout_unknown()"
+    end
+  end
+
   describe "sendfile cold refs" do
     setup do
       ctx = IsolatedInstance.checkout(shard_count: 1)

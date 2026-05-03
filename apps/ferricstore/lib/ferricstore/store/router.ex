@@ -3491,7 +3491,7 @@ defmodule Ferricstore.Store.Router do
         10_000
       )
     catch
-      :exit, {:timeout, _} -> {:error, "ERR list_op timeout"}
+      :exit, {:timeout, _} -> ErrorReasons.write_timeout_unknown()
       :exit, {:noproc, _} -> {:error, "ERR RMW worker unavailable"}
       :exit, _ -> {:error, "ERR RMW worker crashed"}
     end
