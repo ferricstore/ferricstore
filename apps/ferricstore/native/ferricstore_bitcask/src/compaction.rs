@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::hint::{HintEntry, HintWriter};
 use crate::keydir::KeyDir;
-use crate::log::{LogReader, LogWriter, HEADER_SIZE};
+use crate::log::{LogReader, LogWriter};
 
 #[derive(Debug)]
 pub struct CompactionError(pub String);
@@ -106,44 +106,54 @@ pub fn compact(
         }
 
         let mut reader = LogReader::open(&source_log)?;
-        let mut offset: u64 = 0;
 
-        // Issue 4.1: use the tolerant iterator so that a partial tail record
-        // (from a previous crash) stops iteration silently rather than
-        // returning Err — matching startup recovery semantics.
-        let records = reader.iter_from_start_tolerant()?;
+        // Scan metadata first so stale or expired cold values are never
+        // materialized. Only offsets that are still live are read back below.
+        let records = reader.iter_metadata_from_start_tolerant()?;
 
         for record in records {
-            let record_len =
-                (HEADER_SIZE + record.key.len() + record.value.as_ref().map_or(0, Vec::len)) as u64;
-
-            // Only copy if this offset is still the live entry in the keydir
             let is_live = keydir
                 .get(&record.key)
-                .is_some_and(|e| e.file_id == fid && e.offset == offset);
+                .is_some_and(|e| e.file_id == fid && e.offset == record.offset);
 
             let is_expired = record.expire_at_ms != 0 && record.expire_at_ms <= now_ms;
 
-            if is_live && !is_expired {
-                if let Some(ref value) = record.value {
-                    let new_offset = writer.write(&record.key, value, record.expire_at_ms)?;
-                    #[allow(clippy::cast_possible_truncation)]
-                    hint_writer.write_entry(&HintEntry {
-                        file_id: new_file_id,
-                        offset: new_offset,
-                        value_size: value.len() as u32,
-                        expire_at_ms: record.expire_at_ms,
-                        key: record.key,
-                    })?;
-                    records_written += 1;
-                } else {
-                    records_dropped += 1; // tombstone for a live key — skip
-                }
-            } else {
+            if !is_live || is_expired || record.is_tombstone {
                 records_dropped += 1;
+                continue;
             }
 
-            offset += record_len;
+            match reader.read_at(record.offset)? {
+                Some(full_record) => {
+                    if full_record.key != record.key {
+                        return Err(CompactionError(format!(
+                            "record key changed while compacting offset {}",
+                            record.offset
+                        )));
+                    }
+
+                    if let Some(ref value) = full_record.value {
+                        let new_offset =
+                            writer.write(&full_record.key, value, full_record.expire_at_ms)?;
+                        hint_writer.write_entry(&HintEntry {
+                            file_id: new_file_id,
+                            offset: new_offset,
+                            value_size: record.value_size,
+                            expire_at_ms: full_record.expire_at_ms,
+                            key: full_record.key,
+                        })?;
+                        records_written += 1;
+                    } else {
+                        records_dropped += 1;
+                    }
+                }
+                None => {
+                    return Err(CompactionError(format!(
+                        "live record offset {} disappeared during compaction",
+                        record.offset
+                    )));
+                }
+            }
         }
     }
 
@@ -981,6 +991,24 @@ mod tests {
         assert!(
             output_size < input_size,
             "compacted output ({output_size} bytes) must be smaller than input ({input_size} bytes)"
+        );
+    }
+
+    #[test]
+    fn compact_uses_metadata_scan_before_copying_live_values() {
+        let source = include_str!("compaction.rs");
+        let compact_start = source.find("pub fn compact(").unwrap();
+        let compact_tail = &source[compact_start..];
+        let compact_end = compact_tail.find("pub fn remove_old_files").unwrap();
+        let compact_body = &compact_tail[..compact_end];
+
+        assert!(
+            compact_body.contains("iter_metadata_from_start_tolerant"),
+            "compact must scan metadata first so stale or expired large values are not materialized"
+        );
+        assert!(
+            !compact_body.contains("iter_from_start_tolerant()?"),
+            "compact must not load every source record value before deciding whether it is live"
         );
     }
 
