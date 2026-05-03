@@ -7,10 +7,10 @@ defmodule Ferricstore.Store.PromotionAsyncGuardTest do
     source = File.read!(@promotion_path)
 
     # Promotion recovery/compaction can scan many large cold entries. Keep those
-    # reads off Normal schedulers even though the maintenance flow waits for the
-    # value before mutating ETS.
-    assert source =~ "NIF.v2_pread_at_async",
-           "expected promotion cold reads to use v2_pread_at_async/4"
+    # reads async and keyed, so stale ETS offsets cannot promote another key's
+    # value under the promoted collection.
+    assert source =~ "ColdRead.pread_at(path, offset, key,",
+           "expected promotion cold reads to use keyed ColdRead.pread_at/4"
 
     refute Regex.match?(~r/NIF\.v2_pread_at\(/, source),
            "expected promotion cold reads to avoid blocking v2_pread_at/2"

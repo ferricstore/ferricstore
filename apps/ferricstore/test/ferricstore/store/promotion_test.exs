@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.PromotionTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Commands.{Hash, List, Set, SortedSet, Strings}
+  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
   alias Ferricstore.Store.{CompoundKey, Router}
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
@@ -658,6 +659,44 @@ defmodule Ferricstore.Store.PromotionTest do
         |> Map.new(fn [field, value] -> {field, value} end)
 
       assert result["field_1"] == "value_1"
+      assert result["extra_field"] == "extra_value"
+    end
+
+    test "promotion rejects mismatched cold offsets" do
+      store = real_store()
+      key = ukey("promote_stale_cold_offset")
+      ctx = FerricStore.Instance.get(:default)
+      idx = Router.shard_for(ctx, key)
+      keydir = elem(ctx.keydir_refs, idx)
+      {_file_id, file_path, _shard_path} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+
+      populate_hash(store, key, @test_threshold)
+      refute promoted?(key)
+
+      target_field = "stale_target"
+      target_key = CompoundKey.hash_field(key, target_field)
+      other_key = CompoundKey.hash_field(key, "stale_other")
+
+      {:ok, [{other_offset, _}, {_target_offset, target_size}]} =
+        NIF.v2_append_batch(file_path, [
+          {other_key, "wrong-value", 0},
+          {target_key, "right-value", 0}
+        ])
+
+      :ets.insert(
+        keydir,
+        {target_key, nil, 0, Ferricstore.Store.LFU.initial(), 0, other_offset, target_size}
+      )
+
+      assert 1 == Hash.handle("HSET", [key, "extra_field", "extra_value"], store)
+      assert promoted?(key)
+
+      result =
+        Hash.handle("HGETALL", [key], store)
+        |> Enum.chunk_every(2)
+        |> Map.new(fn [field, value] -> {field, value} end)
+
+      refute result[target_field] == "wrong-value"
       assert result["extra_field"] == "extra_value"
     end
   end

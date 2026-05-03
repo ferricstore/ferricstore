@@ -149,7 +149,7 @@ defmodule Ferricstore.Store.Promotion do
       :ets.foldl(
         fn {key, value, exp, _lfu, fid, off, _vsize}, acc ->
           if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
-            case promotion_entry_value(shard_data_path, value, fid, off) do
+            case promotion_entry_value(shard_data_path, key, value, fid, off) do
               nil -> acc
               live_value -> [{key, live_value, exp} | acc]
             end
@@ -279,7 +279,7 @@ defmodule Ferricstore.Store.Promotion do
                 "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
               )
 
-            case read_cold_async(file_path, offset) do
+            case read_cold_async(file_path, offset, full_key) do
               {:ok, v} when is_binary(v) -> v
               _ -> nil
             end
@@ -353,7 +353,7 @@ defmodule Ferricstore.Store.Promotion do
 
           {key, {:live, fid, file_path, offset, value_size, expire_at_ms}} ->
             value =
-              case read_cold_async(file_path, offset) do
+              case read_cold_async(file_path, offset, key) do
                 {:ok, v} when v != nil -> v
                 _ -> nil
               end
@@ -422,7 +422,7 @@ defmodule Ferricstore.Store.Promotion do
     type =
       case :ets.lookup(keydir, mk) do
         [{^mk, type_str, _exp, _lfu, fid, off, _vsize}] ->
-          case promotion_entry_value(shard_data_path, type_str, fid, off) do
+          case promotion_entry_value(shard_data_path, mk, type_str, fid, off) do
             type_str when is_binary(type_str) -> CompoundKey.decode_type(type_str)
             _ -> :hash
           end
@@ -469,23 +469,24 @@ defmodule Ferricstore.Store.Promotion do
   defp compound_prefix_for(:set, redis_key), do: CompoundKey.set_prefix(redis_key)
   defp compound_prefix_for(:zset, redis_key), do: CompoundKey.zset_prefix(redis_key)
 
-  defp promotion_entry_value(_shard_data_path, value, _fid, _off) when value != nil, do: value
+  defp promotion_entry_value(_shard_data_path, _key, value, _fid, _off) when value != nil,
+    do: value
 
-  defp promotion_entry_value(shard_data_path, nil, fid, off)
+  defp promotion_entry_value(shard_data_path, key, nil, fid, off)
        when is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 do
     file_path =
       Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
 
-    case read_cold_async(file_path, off) do
+    case read_cold_async(file_path, off, key) do
       {:ok, value} when value != nil -> value
       _ -> nil
     end
   end
 
-  defp promotion_entry_value(_shard_data_path, _value, _fid, _off), do: nil
+  defp promotion_entry_value(_shard_data_path, _key, _value, _fid, _off), do: nil
 
-  defp read_cold_async(path, offset) do
-    Ferricstore.Store.ColdRead.pread_at(path, offset, @cold_read_timeout_ms)
+  defp read_cold_async(path, offset, key) do
+    Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_read_timeout_ms)
   end
 
   @spec type_label(atom()) :: binary()
