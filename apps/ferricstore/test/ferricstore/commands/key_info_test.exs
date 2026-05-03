@@ -301,6 +301,42 @@ defmodule Ferricstore.Commands.KeyInfoTest do
       assert Map.has_key?(info, "hot_cache_status")
       assert Map.has_key?(info, "last_write_shard")
     end
+
+    test "KEY_INFO falls back instead of exiting while shard is unavailable" do
+      original_ctx = FerricStore.Instance.get(:default)
+      unavailable_ctx = unavailable_default_ctx()
+      handler_id = {__MODULE__, make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :store, :shard_unavailable],
+          &__MODULE__.handle_telemetry/4,
+          self()
+        )
+
+      :persistent_term.put({FerricStore.Instance, :default}, unavailable_ctx)
+
+      on_exit(fn ->
+        :telemetry.detach(handler_id)
+        :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
+      end)
+
+      result = Native.handle("KEY_INFO", ["ki_restart_missing"], dummy_store())
+      info = parse_info(result)
+
+      assert info["type"] == "none"
+      assert info["ttl_ms"] == "-2"
+      assert info["value_size"] == "0"
+
+      assert_receive {:telemetry_event, [:ferricstore, :store, :shard_unavailable], %{count: 1},
+                      %{
+                        instance: :default,
+                        request: :compound_get,
+                        reason: :noproc,
+                        shard_index: 0
+                      }}
+    end
   end
 
   # ===========================================================================
@@ -454,6 +490,29 @@ defmodule Ferricstore.Commands.KeyInfoTest do
 
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
+    }
+  end
+
+  def handle_telemetry(event, measurements, metadata, parent) do
+    send(parent, {:telemetry_event, event, measurements, metadata})
+  end
+
+  defp unavailable_default_ctx do
+    keydir = :ets.new(:"key_info_restart_fallback_#{System.unique_integer([:positive])}", [:set])
+    :ets.delete(keydir)
+
+    %FerricStore.Instance{
+      name: :default,
+      data_dir: System.tmp_dir!(),
+      data_dir_expanded: System.tmp_dir!(),
+      shard_count: 1,
+      slot_map: Tuple.duplicate(0, 1024),
+      shard_names: {:"missing_key_info_shard_#{System.unique_integer([:positive])}"},
+      keydir_refs: {keydir},
+      stats_counter: :counters.new(16, []),
+      write_version: :counters.new(1, []),
+      hot_cache_max_value_size: 1024,
+      read_sample_rate: 0
     }
   end
 end

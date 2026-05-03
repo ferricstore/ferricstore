@@ -128,19 +128,18 @@ defmodule Ferricstore.Commands.Native do
     idx = Router.shard_for(ctx, key)
     keydir = Router.resolve_keydir(ctx, idx)
     now = CommandTime.now_ms()
-    shard = Router.shard_name(ctx, idx)
 
     store = %{
       get: fn k -> Router.get(ctx, k) end,
       exists?: fn k -> Router.exists?(ctx, k) end,
       compound_get: fn redis_key, compound_key ->
-        GenServer.call(shard, {:compound_get, redis_key, compound_key})
+        Router.compound_get(ctx, redis_key, compound_key)
       end,
       compound_count: fn redis_key, prefix ->
-        GenServer.call(shard, {:compound_count, redis_key, prefix})
+        Router.compound_count(ctx, redis_key, prefix)
       end,
       compound_delete: fn redis_key, compound_key ->
-        GenServer.call(shard, {:compound_delete, redis_key, compound_key})
+        Router.compound_delete(ctx, redis_key, compound_key)
       end
     }
 
