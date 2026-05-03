@@ -47,9 +47,30 @@ defmodule Ferricstore.Store.Router do
   defp safe_read_call(ctx, idx, request) do
     {:ok, GenServer.call(resolve_shard(ctx, idx), request)}
   catch
-    :exit, {:noproc, _} -> :unavailable
-    :exit, {:timeout, _} -> :unavailable
+    :exit, {:noproc, _} ->
+      emit_shard_unavailable(ctx, idx, request, :noproc)
+      :unavailable
+
+    :exit, {:timeout, _} ->
+      emit_shard_unavailable(ctx, idx, request, :timeout)
+      :unavailable
   end
+
+  defp emit_shard_unavailable(ctx, idx, request, reason) do
+    :telemetry.execute(
+      [:ferricstore, :store, :shard_unavailable],
+      %{count: 1},
+      %{
+        instance: ctx.name,
+        shard_index: idx,
+        request: request_name(request),
+        reason: reason
+      }
+    )
+  end
+
+  defp request_name(request) when is_tuple(request), do: elem(request, 0)
+  defp request_name(request), do: request
 
   @spec resolve_keydir(FerricStore.Instance.t(), non_neg_integer()) :: atom() | reference()
   @doc false
