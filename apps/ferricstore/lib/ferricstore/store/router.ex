@@ -2265,6 +2265,8 @@ defmodule Ferricstore.Store.Router do
     batch_quorum_put(ctx, kv_pairs, nil)
   end
 
+  defp batch_quorum_put(_ctx, [], _origin_node), do: []
+
   defp batch_quorum_put(ctx, kv_pairs, origin_node) do
     wv_size = :counters.info(ctx.write_version).size
     me = self()

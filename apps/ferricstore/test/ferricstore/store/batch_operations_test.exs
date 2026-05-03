@@ -311,6 +311,10 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       end
     end
 
+    test "empty quorum batch returns empty list" do
+      assert [] = Router.batch_quorum_put(default_ctx(), [])
+    end
+
     test "mixed async/quorum namespaces preserves result order" do
       kvs = [
         {"#{@ns_async}:mix_1", "async_val"},
