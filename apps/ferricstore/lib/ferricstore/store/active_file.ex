@@ -101,7 +101,35 @@ defmodule Ferricstore.Store.ActiveFile do
     end
   end
 
+  @doc """
+  Removes active-file rows for a custom instance.
+
+  Called during instance cleanup. The generation bump invalidates process
+  dictionary caches that may still hold paths for the stopped instance.
+  """
+  @spec cleanup_instance(map()) :: :ok
+  def cleanup_instance(%{name: :default}), do: :ok
+
+  def cleanup_instance(%{name: name, shard_count: shard_count}) do
+    if :ets.whereis(@table) != :undefined and shard_count > 0 do
+      Enum.each(0..(shard_count - 1), fn shard_index ->
+        :ets.delete(@table, {name, shard_index})
+      end)
+
+      bump_generation()
+    end
+
+    :ok
+  end
+
   defp table_key(nil, shard_index), do: shard_index
   defp table_key(%{name: :default}, shard_index), do: shard_index
   defp table_key(%{name: name}, shard_index), do: {name, shard_index}
+
+  defp bump_generation do
+    case :persistent_term.get(@atomics_key, nil) do
+      nil -> :ok
+      ref -> :atomics.add(ref, 1, 1)
+    end
+  end
 end

@@ -108,6 +108,40 @@ defmodule Ferricstore.Store.ActiveFileTest do
       assert ActiveFile.get(0) == orig_af
       assert ActiveFile.get(ctx, 0) == {123, file_path, data_path}
     end
+
+    test "custom instance cleanup removes active file rows and process cache" do
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "active_file_cleanup_#{System.unique_integer([:positive])}"
+        )
+
+      data_path = Path.join(dir, "data/shard_0")
+      file_path = Path.join(data_path, "00000.log")
+      File.mkdir_p!(data_path)
+      File.touch!(file_path)
+
+      ctx =
+        FerricStore.Instance.build(:active_file_cleanup_test,
+          data_dir: dir,
+          shard_count: 1
+        )
+
+      on_exit(fn ->
+        FerricStore.Instance.cleanup(ctx.name)
+        File.rm_rf(dir)
+      end)
+
+      ActiveFile.publish(ctx, 0, 456, file_path, data_path)
+
+      assert ActiveFile.get(ctx, 0) == {456, file_path, data_path}
+
+      FerricStore.Instance.cleanup(ctx.name)
+
+      assert_raise MatchError, fn ->
+        ActiveFile.get(ctx, 0)
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------

@@ -324,6 +324,8 @@ defmodule FerricStore.Instance do
   defp cleanup_instance_tables(:error), do: :ok
 
   defp cleanup_instance_tables({:ok, %__MODULE__{} = ctx}) do
+    Ferricstore.Store.ActiveFile.cleanup_instance(ctx)
+
     ctx.keydir_refs
     |> tuple_values()
     |> Enum.each(&delete_ets_table/1)
