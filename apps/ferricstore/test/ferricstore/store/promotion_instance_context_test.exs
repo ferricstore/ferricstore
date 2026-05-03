@@ -151,6 +151,31 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
     assert :ets.lookup(state.keydir, expired_key) == []
   end
 
+  test "all-dead promoted compaction reclaims dedicated log bytes", %{ctx: ctx} do
+    redis_key = "promoted_all_dead_compaction_#{System.unique_integer([:positive])}"
+    value = String.duplicate("x", 600_000)
+    field1 = CompoundKey.hash_field(redis_key, "f1")
+    field2 = CompoundKey.hash_field(redis_key, "f2")
+
+    assert :ok = Router.compound_put(ctx, redis_key, field1, value, 0)
+    assert :ok = Router.compound_put(ctx, redis_key, field2, value, 0)
+
+    shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
+    promoted_before = :sys.get_state(shard).promoted_instances |> Map.fetch!(redis_key)
+    size_before = ShardCompound.promoted_dir_size(promoted_before.path)
+
+    assert size_before > 1_000_000
+
+    assert :ok = Router.compound_delete(ctx, redis_key, field1)
+    assert :ok = Router.compound_delete(ctx, redis_key, field2)
+
+    promoted_after = :sys.get_state(shard).promoted_instances |> Map.fetch!(redis_key)
+    size_after = ShardCompound.promoted_dir_size(promoted_after.path)
+
+    assert promoted_after.dead_bytes == 0
+    assert size_after < div(size_before, 10)
+  end
+
   defp keydir_binary_total(ctx) do
     1..ctx.shard_count
     |> Enum.reduce(0, fn idx, acc -> acc + :atomics.get(ctx.keydir_binary_bytes, idx) end)
