@@ -841,7 +841,7 @@ defmodule Ferricstore.Store.Router do
         path =
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
-        case read_cold_async(path, offset) do
+        case read_cold_async(path, offset, key) do
           {:ok, value} when is_binary(value) ->
             warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
             {:hit, value, exp}
@@ -1686,7 +1686,7 @@ defmodule Ferricstore.Store.Router do
         path =
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
-        case read_cold_async(path, offset) do
+        case read_cold_async(path, offset, key) do
           {:ok, value} when is_binary(value) ->
             Stats.record_cold_read(ctx, key)
             # Warm ETS: promote back to hot if value fits in cache
@@ -1807,12 +1807,15 @@ defmodule Ferricstore.Store.Router do
 
   defp read_cold_batch_async(entries) do
     locations =
-      Enum.map(entries, fn {_ctx, _keydir, _key, path, _file_id, offset} ->
-        {path, offset}
+      Enum.map(entries, fn {_ctx, _keydir, key, path, _file_id, offset} ->
+        {path, offset, key}
       end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_batch_read_timeout_ms) do
+      case Ferricstore.Store.ColdRead.pread_batch_keyed(
+             locations,
+             @cold_batch_read_timeout_ms
+           ) do
         {:ok, values} when is_list(values) ->
           if length(values) == length(entries) do
             values
@@ -1836,8 +1839,8 @@ defmodule Ferricstore.Store.Router do
     end)
   end
 
-  defp read_cold_async(path, offset) do
-    Ferricstore.Store.ColdRead.pread_at(path, offset, @cold_batch_read_timeout_ms)
+  defp read_cold_async(path, offset, expected_key) do
+    Ferricstore.Store.ColdRead.pread_at(path, offset, expected_key, @cold_batch_read_timeout_ms)
   end
 
   @doc """
@@ -1866,7 +1869,7 @@ defmodule Ferricstore.Store.Router do
         path =
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
-        case read_cold_async(path, offset) do
+        case read_cold_async(path, offset, key) do
           {:ok, value} when is_binary(value) ->
             Stats.record_cold_read(ctx, key)
             warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
@@ -3451,7 +3454,7 @@ defmodule Ferricstore.Store.Router do
         path =
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
-        case read_cold_async(path, offset) do
+        case read_cold_async(path, offset, compound_key) do
           {:ok, value} when is_binary(value) ->
             warm_ets_after_cold_read(ctx, keydir, compound_key, value, file_id, offset)
             value

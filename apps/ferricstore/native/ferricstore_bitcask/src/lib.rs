@@ -1024,6 +1024,73 @@ fn v2_pread_at_async(
     Ok(atoms::ok().encode(env))
 }
 
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_pread_at_key_async<'a>(
+    env: Env<'a>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+    offset: u64,
+    expected_key: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    let expected_key = expected_key.as_slice().to_vec();
+
+    async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let p = std::path::Path::new(&path);
+            std::fs::File::open(p)
+                .map_err(|e| log::LogError(e.to_string()))
+                .and_then(|file| {
+                    fadvise_random(&file);
+                    let record = log::pread_record_from_file(&file, offset);
+                    if let Ok(Some(ref r)) = record {
+                        let size =
+                            (log::HEADER_SIZE + r.key.len() + r.value.as_ref().map_or(0, Vec::len))
+                                as i64;
+                        fadvise_dontneed(&file, offset as i64, size);
+                    }
+                    record
+                })
+        })
+        .await
+        .unwrap_or_else(|e| Err(log::LogError(format!("spawn_blocking failed: {e}"))));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(Some(record)) if record.key == expected_key => match record.value {
+                Some(value) => {
+                    let resource = ResourceArc::new(ValueBuffer { data: value });
+                    let binary = resource.make_binary(env, |vb| &vb.data);
+                    (atoms::tokio_complete(), correlation_id, atoms::ok(), binary).encode(env)
+                }
+                None => (
+                    atoms::tokio_complete(),
+                    correlation_id,
+                    atoms::ok(),
+                    atoms::nil(),
+                )
+                    .encode(env),
+            },
+            Ok(Some(_)) | Ok(None) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::ok(),
+                atoms::nil(),
+            )
+                .encode(env),
+            Err(e) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                e.to_string(),
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
 /// Async batch pread: submit multiple offset reads to Tokio concurrently.
 /// Returns `:ok` immediately.
 ///
@@ -1069,6 +1136,29 @@ fn validate_grouped_pread_groups(groups: &[(String, Vec<(usize, u64)>)]) -> Resu
     Ok(count)
 }
 
+fn validate_grouped_keyed_pread_groups(
+    groups: &[(String, Vec<(usize, u64, Vec<u8>)>)],
+) -> Result<usize, String> {
+    let count: usize = groups.iter().map(|(_, reads)| reads.len()).sum();
+    let mut seen = vec![false; count];
+
+    for (_path, reads) in groups {
+        for (index, _offset, _expected_key) in reads {
+            if *index >= count {
+                return Err(format!(
+                    "grouped keyed pread index out of range: index={index}, count={count}"
+                ));
+            }
+
+            if std::mem::replace(&mut seen[*index], true) {
+                return Err(format!("grouped keyed pread duplicate index: {index}"));
+            }
+        }
+    }
+
+    Ok(count)
+}
+
 fn pread_batch_for_path(
     path: String,
     reads: Vec<(usize, u64)>,
@@ -1090,6 +1180,43 @@ fn pread_batch_for_path(
                     + record.value.as_ref().map_or(0, Vec::len)) as i64;
                 fadvise_dontneed(&file, offset as i64, size);
                 record.value
+            }
+            Ok(None) => None,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        results.push((index, value));
+    }
+
+    Ok(results)
+}
+
+fn pread_batch_for_path_keyed(
+    path: String,
+    reads: Vec<(usize, u64, Vec<u8>)>,
+) -> Result<Vec<(usize, Option<Vec<u8>>)>, String> {
+    let file = match std::fs::File::open(std::path::Path::new(&path)) {
+        Ok(file) => file,
+        Err(e) => return Err(e.to_string()),
+    };
+
+    fadvise_random(&file);
+
+    let mut results = Vec::with_capacity(reads.len());
+
+    for (index, offset, expected_key) in reads {
+        let value = match log::pread_record_from_file(&file, offset) {
+            Ok(Some(record)) => {
+                let size = (log::HEADER_SIZE
+                    + record.key.len()
+                    + record.value.as_ref().map_or(0, Vec::len)) as i64;
+                fadvise_dontneed(&file, offset as i64, size);
+
+                if record.key == expected_key {
+                    record.value
+                } else {
+                    None
+                }
             }
             Ok(None) => None,
             Err(e) => return Err(e.to_string()),
@@ -1160,6 +1287,30 @@ fn pread_batch_grouped(locations: Vec<(String, u64)>) -> Result<Vec<Option<Vec<u
     Ok(values)
 }
 
+#[cfg(test)]
+fn pread_batch_grouped_keyed(
+    locations: Vec<(String, u64, Vec<u8>)>,
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    let count = locations.len();
+    let mut grouped: std::collections::HashMap<String, Vec<(usize, u64, Vec<u8>)>> =
+        std::collections::HashMap::new();
+
+    for (index, (path, offset, expected_key)) in locations.into_iter().enumerate() {
+        grouped
+            .entry(path)
+            .or_default()
+            .push((index, offset, expected_key));
+    }
+
+    let mut values = vec![None; count];
+
+    for (path, reads) in grouped {
+        apply_grouped_pread_results(&mut values, pread_batch_for_path_keyed(path, reads)?);
+    }
+
+    Ok(values)
+}
+
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_batch_path_async(
@@ -1176,6 +1327,36 @@ fn v2_pread_batch_path_async(
         let result = tokio::task::spawn_blocking(move || {
             let mut values = vec![None; count];
             apply_grouped_pread_results(&mut values, pread_batch_for_path(path, reads)?);
+            Ok(values)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        send_pread_batch_result(caller_pid, correlation_id, result);
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_pread_batch_path_key_async<'a>(
+    env: Env<'a>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+    reads: Vec<(u64, Binary<'a>)>,
+) -> NifResult<Term<'a>> {
+    let count = reads.len();
+    let reads: Vec<(usize, u64, Vec<u8>)> = reads
+        .into_iter()
+        .enumerate()
+        .map(|(index, (offset, key))| (index, offset, key.as_slice().to_vec()))
+        .collect();
+
+    async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let mut values = vec![None; count];
+            apply_grouped_pread_results(&mut values, pread_batch_for_path_keyed(path, reads)?);
             Ok(values)
         })
         .await
@@ -1250,6 +1431,66 @@ fn v2_pread_batch_grouped_async(
         for (path, reads) in groups {
             handles.push(tokio::task::spawn_blocking(move || {
                 pread_batch_for_path(path, reads)
+            }));
+        }
+
+        let mut result: Result<Vec<Option<Vec<u8>>>, String> = Ok(vec![None; count]);
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(results)) => {
+                    if let Ok(values) = &mut result {
+                        apply_grouped_pread_results(values, results);
+                    }
+                }
+                Ok(Err(reason)) => {
+                    result = Err(reason);
+                    break;
+                }
+                Err(e) => {
+                    result = Err(format!("spawn_blocking: {e}"));
+                    break;
+                }
+            }
+        }
+
+        send_pread_batch_result(caller_pid, correlation_id, result);
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_pread_batch_grouped_key_async<'a>(
+    env: Env<'a>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    groups: Vec<(String, Vec<(usize, u64, Binary<'a>)>)>,
+) -> NifResult<Term<'a>> {
+    let groups: Vec<(String, Vec<(usize, u64, Vec<u8>)>)> = groups
+        .into_iter()
+        .map(|(path, reads)| {
+            let reads = reads
+                .into_iter()
+                .map(|(index, offset, key)| (index, offset, key.as_slice().to_vec()))
+                .collect();
+            (path, reads)
+        })
+        .collect();
+
+    async_io::runtime().spawn(async move {
+        let count = match validate_grouped_keyed_pread_groups(&groups) {
+            Ok(count) => count,
+            Err(reason) => {
+                send_pread_batch_result(caller_pid, correlation_id, Err(reason));
+                return;
+            }
+        };
+
+        let mut handles = Vec::with_capacity(groups.len());
+
+        for (path, reads) in groups {
+            handles.push(tokio::task::spawn_blocking(move || {
+                pread_batch_for_path_keyed(path, reads)
             }));
         }
 
@@ -1706,6 +1947,39 @@ mod audit_fix_tests {
     }
 
     #[test]
+    fn keyed_batch_pread_filters_mismatched_offsets_without_reordering() {
+        let dir = tmp();
+        let path_a = dir.path().join("00000000000000000001.log");
+        let path_b = dir.path().join("00000000000000000002.log");
+
+        let mut writer_a = log::LogWriter::open(&path_a, 1).unwrap();
+        let a0 = writer_a.write(b"a0", b"va0", 0).unwrap();
+        let a1 = writer_a.write(b"a1", b"va1", 0).unwrap();
+        writer_a.sync().unwrap();
+
+        let mut writer_b = log::LogWriter::open(&path_b, 2).unwrap();
+        let b0 = writer_b.write(b"b0", b"vb0", 0).unwrap();
+        writer_b.sync().unwrap();
+
+        let values = pread_batch_grouped_keyed(vec![
+            (path_b.to_string_lossy().into_owned(), b0, b"b0".to_vec()),
+            (path_a.to_string_lossy().into_owned(), a1, b"a0".to_vec()),
+            (path_a.to_string_lossy().into_owned(), a0, b"a0".to_vec()),
+            (
+                path_a.to_string_lossy().into_owned(),
+                999_999,
+                b"missing".to_vec(),
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(values[0].as_deref(), Some(&b"vb0"[..]));
+        assert_eq!(values[1], None);
+        assert_eq!(values[2].as_deref(), Some(&b"va0"[..]));
+        assert_eq!(values[3], None);
+    }
+
+    #[test]
     fn grouped_batch_pread_validation_rejects_sparse_and_duplicate_indexes() {
         let groups = vec![("a.log".to_string(), vec![(0, 10), (2, 20)])];
         let err = validate_grouped_pread_groups(&groups).unwrap_err();
@@ -1716,6 +1990,23 @@ mod audit_fix_tests {
             ("b.log".to_string(), vec![(0, 20)]),
         ];
         let err = validate_grouped_pread_groups(&groups).unwrap_err();
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn grouped_keyed_batch_pread_validation_rejects_sparse_and_duplicate_indexes() {
+        let groups = vec![(
+            "a.log".to_string(),
+            vec![(0, 10, b"a".to_vec()), (2, 20, b"b".to_vec())],
+        )];
+        let err = validate_grouped_keyed_pread_groups(&groups).unwrap_err();
+        assert!(err.contains("out of range"));
+
+        let groups = vec![
+            ("a.log".to_string(), vec![(0, 10, b"a".to_vec())]),
+            ("b.log".to_string(), vec![(0, 20, b"b".to_vec())]),
+        ];
+        let err = validate_grouped_keyed_pread_groups(&groups).unwrap_err();
         assert!(err.contains("duplicate"));
     }
 

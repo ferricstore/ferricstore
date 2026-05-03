@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
 
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Router
+  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Test.IsolatedInstance
 
   setup do
@@ -61,6 +62,41 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
   } do
     key = "cold_invalid_batch:" <> Integer.to_string(:erlang.unique_integer([:positive]))
     :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
+
+    assert [nil] == Router.batch_get(ctx, [key])
+  end
+
+  test "direct cold reads do not return a value from a mismatched key offset", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_stale_offset:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    other_key = key <> ":other"
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00000.log")
+
+    {:ok, [{other_offset, _}, {_key_offset, value_size}]} =
+      NIF.v2_append_batch(path, [{other_key, "wrong-value", 0}, {key, "right-value", 0}])
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
+
+    assert nil == Router.get(ctx, key)
+    assert nil == Router.get_meta(ctx, key)
+  end
+
+  test "batch cold reads do not return values from mismatched key offsets", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_batch_stale_offset:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    other_key = key <> ":other"
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00000.log")
+
+    {:ok, [{other_offset, _}, {_key_offset, value_size}]} =
+      NIF.v2_append_batch(path, [{other_key, "wrong-value", 0}, {key, "right-value", 0}])
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
 
     assert [nil] == Router.batch_get(ctx, [key])
   end
