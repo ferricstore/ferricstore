@@ -40,6 +40,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     # flag_idx = 1.
     ctx = %{
       name: :"test_ck_#{:erlang.unique_integer([:positive])}",
+      shard_count: 1,
       checkpoint_flags: :atomics.new(1, signed: false),
       checkpoint_in_flight: :atomics.new(1, signed: false),
       disk_pressure: :atomics.new(1, signed: false)
@@ -154,6 +155,60 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
 
     assert_receive {:fsync_async_called, ^pid, 1, ^active_path, 0, 1}, 2_000
     assert_receive {:checkpoint, _meas, %{status: :error}}, 2_000
+    state = :sys.get_state(pid)
+
+    assert state.in_flight? == false
+    assert state.current_corr_id == nil
+    assert :atomics.get(ctx.checkpoint_flags, 1) == 1
+    assert :atomics.get(ctx.checkpoint_in_flight, 1) == 0
+  end
+
+  test "dirty tick with a missing active file does not leave checkpoint in-flight stuck", %{
+    ctx: ctx
+  } do
+    ActiveFile.cleanup_instance(ctx)
+
+    {:ok, pid} =
+      BitcaskCheckpointer.start_link(
+        index: 0,
+        instance_ctx: ctx,
+        checkpoint_interval_ms: 10_000,
+        name: :"ck_missing_active_#{:erlang.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> safe_stop(pid) end)
+
+    :atomics.put(ctx.checkpoint_flags, 1, 1)
+
+    send(pid, :tick)
+
+    assert_receive {:checkpoint, %{shard_index: 0}, %{status: :error}}, 2_000
+    state = :sys.get_state(pid)
+
+    assert state.in_flight? == false
+    assert state.current_corr_id == nil
+    assert :atomics.get(ctx.checkpoint_flags, 1) == 1
+    assert :atomics.get(ctx.checkpoint_in_flight, 1) == 0
+  end
+
+  test "sync_now with a missing active file preserves dirty state and in-flight cleanliness", %{
+    ctx: ctx
+  } do
+    ActiveFile.cleanup_instance(ctx)
+
+    {:ok, pid} =
+      BitcaskCheckpointer.start_link(
+        index: 0,
+        instance_ctx: ctx,
+        checkpoint_interval_ms: 10_000,
+        name: :"ck_sync_missing_active_#{:erlang.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> safe_stop(pid) end)
+
+    :atomics.put(ctx.checkpoint_flags, 1, 1)
+
+    assert {:error, :not_initialized} = BitcaskCheckpointer.sync_now(pid)
     state = :sys.get_state(pid)
 
     assert state.in_flight? == false
