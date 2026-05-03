@@ -1022,6 +1022,8 @@ defmodule Ferricstore.Store.Shard do
     started_at = System.monotonic_time()
     masked_key_count = MapSet.size(masked_keys)
 
+    now_ms = Ferricstore.HLC.now_ms()
+
     result =
       candidate_files
       |> Enum.reduce_while({:ok, %{}, masked_keys, 0}, fn {_other_fid, path},
@@ -1032,10 +1034,14 @@ defmodule Ferricstore.Store.Shard do
         case NIF.v2_scan_file(path) do
           {:ok, records} ->
             file_states =
-              Enum.reduce(records, %{}, fn {key, _offset, _value_size, _expire_at_ms, tombstone?},
+              Enum.reduce(records, %{}, fn {key, _offset, _value_size, expire_at_ms, tombstone?},
                                            acc ->
                 if MapSet.member?(unresolved_keys, key) do
-                  Map.put(acc, key, if(tombstone?, do: :tombstone, else: :live))
+                  Map.put(
+                    acc,
+                    key,
+                    tombstone_dependency_state(tombstone?, expire_at_ms, now_ms)
+                  )
                 else
                   acc
                 end
@@ -1170,20 +1176,34 @@ defmodule Ferricstore.Store.Shard do
 
   defp group_compaction_live_entries(state, file_ids) do
     target_fids = MapSet.new(file_ids)
+    now_ms = Ferricstore.HLC.now_ms()
 
     :ets.foldl(
-      fn {key, _value, _exp, _lfu, fid, off, _vsize}, acc ->
-        if MapSet.member?(target_fids, fid) and fid != state.active_file_id and
-             shared_compaction_entry?(state, key, fid, fid) do
-          Map.update(acc, fid, [{key, off}], &[{key, off} | &1])
-        else
+      fn
+        {key, _value, expire_at_ms, _lfu, fid, off, _vsize}, acc
+        when expire_at_ms == 0 or expire_at_ms > now_ms ->
+          if MapSet.member?(target_fids, fid) and fid != state.active_file_id and
+               shared_compaction_entry?(state, key, fid, fid) do
+            Map.update(acc, fid, [{key, off}], &[{key, off} | &1])
+          else
+            acc
+          end
+
+        {_key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}, acc ->
           acc
-        end
       end,
       %{},
       state.keydir
     )
   end
+
+  defp tombstone_dependency_state(true, _expire_at_ms, _now_ms), do: :tombstone
+  defp tombstone_dependency_state(false, 0, _now_ms), do: :live
+
+  defp tombstone_dependency_state(false, expire_at_ms, now_ms) when expire_at_ms > now_ms,
+    do: :live
+
+  defp tombstone_dependency_state(false, _expire_at_ms, _now_ms), do: :expired
 
   defp shared_compaction_entry?(state, key, fid, target_fid) do
     fid == target_fid and not promoted_data_compound_entry?(state, key)
