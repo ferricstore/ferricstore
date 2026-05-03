@@ -30,6 +30,20 @@ defmodule FerricStore.Instance.Supervisor do
 
   @impl true
   def init({name, opts}) do
+    try do
+      init_instance(name, opts)
+    rescue
+      error ->
+        FerricStore.Instance.cleanup(name)
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        FerricStore.Instance.cleanup(name)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  defp init_instance(name, opts) do
     ctx = FerricStore.Instance.build(name, opts)
 
     # Ensure data directory layout exists

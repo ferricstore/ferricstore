@@ -227,6 +227,41 @@ defmodule Ferricstore.InstanceTest do
       assert :ets.whereis(latch_0) == :undefined
       assert :ets.whereis(latch_1) == :undefined
     end
+
+    test "failed custom startup cleans cached context and ETS tables" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_embedded_failed_start_#{System.unique_integer([:positive])}"
+        )
+
+      File.rm_rf!(root)
+      File.mkdir_p!(root)
+      invalid_data_dir = Path.join(root, "not_a_directory")
+      File.write!(invalid_data_dir, "not a directory")
+
+      on_exit(fn ->
+        FerricStore.Instance.cleanup(EmbeddedDefaultOptions)
+        File.rm_rf(root)
+      end)
+
+      previous_trap_exit = Process.flag(:trap_exit, true)
+
+      try do
+        assert {:error, _reason} =
+                 EmbeddedDefaultOptions.start_link(data_dir: invalid_data_dir, shard_count: 1)
+      after
+        Process.flag(:trap_exit, previous_trap_exit)
+      end
+
+      assert_raise ArgumentError, fn ->
+        FerricStore.Instance.get(EmbeddedDefaultOptions)
+      end
+
+      assert :ets.whereis(:"#{EmbeddedDefaultOptions}_latch_0") == :undefined
+      assert :ets.whereis(:"#{EmbeddedDefaultOptions}_hotness") == :undefined
+      assert :ets.whereis(:"#{EmbeddedDefaultOptions}_config") == :undefined
+    end
   end
 
   describe "FerricStore.Impl with default instance" do
