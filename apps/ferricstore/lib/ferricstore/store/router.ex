@@ -1211,7 +1211,7 @@ defmodule Ferricstore.Store.Router do
         case :ets.lookup(latch_tab, key) do
           [{^key, holder}] when is_pid(holder) ->
             if Process.alive?(holder) do
-              :erlang.yield()
+              latch_retry_backoff()
               wait_for_async_key_latch(latch_tab, key)
             else
               :ets.select_delete(latch_tab, [{{key, holder}, [], [true]}])
@@ -1219,9 +1219,16 @@ defmodule Ferricstore.Store.Router do
             end
 
           _ ->
-            :erlang.yield()
+            latch_retry_backoff()
             wait_for_async_key_latch(latch_tab, key)
         end
+    end
+  end
+
+  defp latch_retry_backoff do
+    receive do
+    after
+      1 -> :ok
     end
   end
 

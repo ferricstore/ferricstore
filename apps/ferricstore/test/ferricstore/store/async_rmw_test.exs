@@ -69,6 +69,32 @@ defmodule Ferricstore.Store.AsyncRmwTest do
     assert [] == :ets.lookup(keydir, key)
   end
 
+  describe "latch contention CPU guards" do
+    test "contended RMW/list latch waiters do not yield-spin" do
+      root = Path.expand("../../..", __DIR__)
+
+      paths = [
+        "lib/ferricstore/store/router.ex",
+        "lib/ferricstore/store/rmw_coordinator.ex"
+      ]
+
+      offenders =
+        paths
+        |> Enum.flat_map(fn path ->
+          root
+          |> Path.join(path)
+          |> File.read!()
+          |> String.split("\n")
+          |> Enum.with_index(1)
+          |> Enum.filter(fn {line, _line_no} -> String.contains?(line, ":erlang.yield()") end)
+          |> Enum.map(fn {_line, line_no} -> "#{path}:#{line_no}" end)
+        end)
+
+      assert offenders == [],
+             "RMW latch waiters must block/back off under contention, not yield-spin: #{inspect(offenders)}"
+    end
+  end
+
   describe "instance context on fallback path" do
     test "RmwCoordinator accepts the caller instance context" do
       isolated = minimal_instance_context()

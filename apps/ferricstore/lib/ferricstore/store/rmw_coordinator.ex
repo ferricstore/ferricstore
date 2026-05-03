@@ -286,7 +286,7 @@ defmodule Ferricstore.Store.RmwCoordinator do
         case :ets.lookup(tab, key) do
           [{^key, holder}] when is_pid(holder) ->
             if Process.alive?(holder) do
-              :erlang.yield()
+              latch_retry_backoff()
               wait_for_latch(tab, key)
             else
               # Orphaned latch — take over, but only delete THIS specific
@@ -299,9 +299,16 @@ defmodule Ferricstore.Store.RmwCoordinator do
 
           _ ->
             # Race: holder released between our insert_new and our lookup.
-            :erlang.yield()
+            latch_retry_backoff()
             wait_for_latch(tab, key)
         end
+    end
+  end
+
+  defp latch_retry_backoff do
+    receive do
+    after
+      1 -> :ok
     end
   end
 
