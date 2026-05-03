@@ -2205,7 +2205,6 @@ defmodule Ferricstore.Raft.StateMachine do
            expire_at_ms
          ) do
       :already_applied ->
-        maybe_queue_origin_checked_pending_put(state, key, expected_value, expire_at_ms)
         :ok
 
       :apply ->
@@ -2232,7 +2231,6 @@ defmodule Ferricstore.Raft.StateMachine do
        )
        when origin == node() do
     if origin_command_already_applied?(state, key, inner_cmd, expected_value, expire_at_ms) do
-      maybe_queue_origin_checked_pending_put(state, key, expected_value, expire_at_ms)
       :ok
     else
       apply_single(state, inner_cmd)
@@ -2584,21 +2582,6 @@ defmodule Ferricstore.Raft.StateMachine do
       _ ->
         apply_single(state, {:put, key, value, expire_at_ms})
     end
-  end
-
-  defp maybe_queue_origin_checked_pending_put(state, key, expected_value, expire_at_ms)
-       when expected_value != nil do
-    case :ets.lookup(state.ets, key) do
-      [{^key, ^expected_value, ^expire_at_ms, _lfu, :pending, 0, _vs}] ->
-        queue_pending_put(key, to_disk_binary(expected_value), expire_at_ms)
-
-      _ ->
-        :ok
-    end
-  end
-
-  defp maybe_queue_origin_checked_pending_put(_state, _key, _expected_value, _expire_at_ms) do
-    :ok
   end
 
   defp origin_command_already_applied?(state, key, inner_cmd, expected_value, expire_at_ms) do

@@ -358,6 +358,7 @@ defmodule Ferricstore.Store.Router do
         case async_enqueue_to_raft(idx, {:delete, key}) do
           :ok ->
             keydir = elem(ctx.keydir_refs, idx)
+            flush_pending_writer_for_key(idx, keydir, key)
             track_keydir_binary_delete(ctx, idx, keydir, key)
             :ets.delete(keydir, key)
 
@@ -707,6 +708,7 @@ defmodule Ferricstore.Store.Router do
       {:hit, v, _exp} ->
         with :ok <- async_submit_to_raft(idx, {:getdel, key}) do
           keydir = elem(ctx.keydir_refs, idx)
+          flush_pending_writer_for_key(idx, keydir, key)
           track_keydir_binary_delete(ctx, idx, keydir, key)
           :ets.delete(keydir, key)
 
@@ -921,6 +923,16 @@ defmodule Ferricstore.Store.Router do
       :ok
     else
       result
+    end
+  end
+
+  defp flush_pending_writer_for_key(idx, keydir, key) do
+    case :ets.lookup(keydir, key) do
+      [{^key, _value, _expire_at_ms, _lfu, :pending, _offset, _value_size}] ->
+        Ferricstore.Store.BitcaskWriter.flush(idx)
+
+      _ ->
+        :ok
     end
   end
 

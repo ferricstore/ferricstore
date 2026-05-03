@@ -176,6 +176,35 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   # ---------------------------------------------------------------------------
 
   describe "uncontended RMW correctness" do
+    test "origin async INCR pending path persists one value record" do
+      c = ctx()
+      k = ukey("incr_single_record")
+      idx = Router.shard_for(c, k)
+
+      assert {:ok, 1} = Router.incr(c, k, 1)
+      assert "1" == Router.get(c, k)
+
+      :ok = Batcher.flush(idx)
+      :ok = BitcaskWriter.flush_all(c.shard_count)
+
+      assert live_record_count(c, k) == 1
+    end
+
+    test "async DELETE after pending async INCR does not resurrect from Bitcask" do
+      c = ctx()
+      k = ukey("incr_delete_no_resurrect")
+      idx = Router.shard_for(c, k)
+
+      assert {:ok, 1} = Router.incr(c, k, 1)
+      assert :ok = Router.delete(c, k)
+      assert nil == Router.get(c, k)
+
+      :ok = Batcher.flush(idx)
+      :ok = BitcaskWriter.flush_all(c.shard_count)
+
+      assert nil == recovered_value_from_bitcask(c, k)
+    end
+
     test "INCR on nonexistent key returns delta and stores it" do
       k = ukey("incr_nokey")
       assert {:ok, 5} = Router.incr(ctx(), k, 5)
@@ -963,5 +992,53 @@ defmodule Ferricstore.Store.AsyncRmwTest do
           acc
       end
     end)
+  end
+
+  defp live_record_count(ctx, key) do
+    idx = Router.shard_for(ctx, key)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+
+    shard_path
+    |> Path.join("*.log")
+    |> Path.wildcard()
+    |> Enum.reduce(0, fn path, acc ->
+      case NIF.v2_scan_file(path) do
+        {:ok, records} ->
+          acc +
+            Enum.count(records, fn {record_key, _off, _size, _exp, tombstone?} ->
+              record_key == key and tombstone? == false
+            end)
+
+        {:error, _reason} ->
+          acc
+      end
+    end)
+  end
+
+  defp recovered_value_from_bitcask(ctx, key) do
+    idx = Router.shard_for(ctx, key)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+    keydir = :ets.new(:async_rmw_recovery, [:set, :public])
+
+    try do
+      Ferricstore.Store.Shard.Lifecycle.recover_keydir(shard_path, keydir, idx)
+
+      case :ets.lookup(keydir, key) do
+        [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil ->
+          value
+
+        [{^key, nil, _exp, _lfu, fid, off, _vsize}] when is_integer(fid) ->
+          path =
+            Path.join(shard_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+
+          {:ok, value} = NIF.v2_pread_at(path, off)
+          value
+
+        [] ->
+          nil
+      end
+    after
+      :ets.delete(keydir)
+    end
   end
 end

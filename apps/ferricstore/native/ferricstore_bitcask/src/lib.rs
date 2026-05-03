@@ -1172,7 +1172,7 @@ fn pread_batch_for_path(
 
     let mut results = Vec::with_capacity(reads.len());
 
-    for (index, offset) in reads {
+    for (index, offset) in sort_reads_by_offset(reads) {
         let value = match log::pread_record_from_file(&file, offset) {
             Ok(Some(record)) => {
                 let size = (log::HEADER_SIZE
@@ -1182,7 +1182,7 @@ fn pread_batch_for_path(
                 record.value
             }
             Ok(None) => None,
-            Err(e) => return Err(e.to_string()),
+            Err(_e) => None,
         };
 
         results.push((index, value));
@@ -1204,7 +1204,7 @@ fn pread_batch_for_path_keyed(
 
     let mut results = Vec::with_capacity(reads.len());
 
-    for (index, offset, expected_key) in reads {
+    for (index, offset, expected_key) in sort_keyed_reads_by_offset(reads) {
         let value = match log::pread_record_from_file(&file, offset) {
             Ok(Some(record)) => {
                 let size = (log::HEADER_SIZE
@@ -1219,13 +1219,25 @@ fn pread_batch_for_path_keyed(
                 }
             }
             Ok(None) => None,
-            Err(e) => return Err(e.to_string()),
+            Err(_e) => None,
         };
 
         results.push((index, value));
     }
 
     Ok(results)
+}
+
+fn sort_reads_by_offset(mut reads: Vec<(usize, u64)>) -> Vec<(usize, u64)> {
+    reads.sort_by_key(|(_index, offset)| *offset);
+    reads
+}
+
+fn sort_keyed_reads_by_offset(
+    mut reads: Vec<(usize, u64, Vec<u8>)>,
+) -> Vec<(usize, u64, Vec<u8>)> {
+    reads.sort_by_key(|(_index, offset, _expected_key)| *offset);
+    reads
 }
 
 fn apply_grouped_pread_results(
@@ -1977,6 +1989,66 @@ mod audit_fix_tests {
         assert_eq!(values[1], None);
         assert_eq!(values[2].as_deref(), Some(&b"va0"[..]));
         assert_eq!(values[3], None);
+    }
+
+    #[test]
+    fn keyed_batch_pread_isolates_corrupt_record_in_same_file() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        let good_before = writer.write(b"good_before", b"value_before", 0).unwrap();
+        let corrupt = writer.write(b"corrupt", b"bad_value", 0).unwrap();
+        let good_after = writer.write(b"good_after", b"value_after", 0).unwrap();
+        writer.sync().unwrap();
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let corrupt_value_byte = corrupt + log::HEADER_SIZE as u64 + b"corrupt".len() as u64;
+        file.write_at(b"X", corrupt_value_byte).unwrap();
+        file.sync_data().unwrap();
+
+        let values = pread_batch_grouped_keyed(vec![
+            (
+                path.to_string_lossy().into_owned(),
+                good_before,
+                b"good_before".to_vec(),
+            ),
+            (
+                path.to_string_lossy().into_owned(),
+                corrupt,
+                b"corrupt".to_vec(),
+            ),
+            (
+                path.to_string_lossy().into_owned(),
+                good_after,
+                b"good_after".to_vec(),
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(values[0].as_deref(), Some(&b"value_before"[..]));
+        assert_eq!(values[1], None);
+        assert_eq!(values[2].as_deref(), Some(&b"value_after"[..]));
+    }
+
+    #[test]
+    fn keyed_batch_pread_sorts_by_offset_but_preserves_result_order() {
+        let reads = vec![
+            (0usize, 300u64, b"third".to_vec()),
+            (1usize, 100u64, b"first".to_vec()),
+            (2usize, 200u64, b"second".to_vec()),
+        ];
+
+        let sorted = sort_keyed_reads_by_offset(reads);
+
+        assert_eq!(sorted[0].1, 100);
+        assert_eq!(sorted[1].1, 200);
+        assert_eq!(sorted[2].1, 300);
+        assert_eq!(sorted[0].0, 1);
+        assert_eq!(sorted[1].0, 2);
+        assert_eq!(sorted[2].0, 0);
     }
 
     #[test]
