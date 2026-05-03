@@ -2284,6 +2284,61 @@ defmodule Ferricstore.Raft.StateMachineTest do
              "Raft cursor must not advance past data that still needs a Bitcask checkpoint"
     end
 
+    test "release_cursor promotes prior checkpoint when shard was clean before next write", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      checkpoint_flags = :atomics.new(shard_index + 1, signed: false)
+      checkpoint_in_flight = :atomics.new(shard_index + 1, signed: false)
+      last_applied_index = :atomics.new(shard_index + 1, signed: false)
+      last_released_cursor_index = :atomics.new(shard_index + 1, signed: false)
+
+      state = %{
+        state
+        | release_cursor_interval: 2,
+          instance_ctx: %{
+            checkpoint_flags: checkpoint_flags,
+            checkpoint_in_flight: checkpoint_in_flight,
+            last_applied_index: last_applied_index,
+            last_released_cursor_index: last_released_cursor_index,
+            disk_pressure: :atomics.new(shard_index + 1, signed: false),
+            hot_cache_max_value_size: 64
+          }
+      }
+
+      {state, {:applied_at, 1, :ok}, effects1} =
+        StateMachine.apply(
+          %{index: 1, term: 1, system_time: System.os_time(:millisecond)},
+          {:put, "cursor_starve_1", "value", 0},
+          state
+        )
+
+      refute Enum.any?(effects1, &match?({:release_cursor, _}, &1))
+
+      {state, {:applied_at, 2, :ok}, effects2} =
+        StateMachine.apply(
+          %{index: 2, term: 1, system_time: System.os_time(:millisecond)},
+          {:put, "cursor_starve_2", "value", 0},
+          state
+        )
+
+      assert Enum.any?(effects2, &match?({:checkpoint, 2, _}, &1))
+      refute Enum.any?(effects2, &match?({:release_cursor, _}, &1))
+
+      :atomics.put(checkpoint_flags, shard_index + 1, 0)
+      :atomics.put(checkpoint_in_flight, shard_index + 1, 0)
+
+      {_state, {:applied_at, 3, :ok}, effects3} =
+        StateMachine.apply(
+          %{index: 3, term: 1, system_time: System.os_time(:millisecond)},
+          {:put, "cursor_starve_3", "value", 0},
+          state
+        )
+
+      assert Enum.any?(effects3, &match?({:release_cursor, 2}, &1))
+      assert :atomics.get(last_released_cursor_index, shard_index + 1) == 2
+    end
+
     test "release_cursor records last released cursor index when emitted", %{
       state: state,
       shard_index: shard_index

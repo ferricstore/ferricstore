@@ -176,6 +176,7 @@ defmodule Ferricstore.Raft.StateMachine do
         end),
       applied_count: 0,
       release_cursor_interval: interval,
+      pending_release_cursor_index: nil,
       # When a node joins with pre-existing Bitcask data (from direct copy or
       # object storage snapshot), skip_below_index prevents re-applying entries
       # that are already in Bitcask + ETS. Entries at or below this index are
@@ -1047,6 +1048,9 @@ defmodule Ferricstore.Raft.StateMachine do
           {shard_state(), term()} | {shard_state(), term(), list()}
   defp maybe_release_cursor(%{index: ra_index}, old_count, state, result) do
     state = consume_pending_state(state)
+    checkpoint_clean_before_write? = Process.delete(:sm_checkpoint_clean_before_write) == true
+    previous_pending_release_index = Map.get(state, :pending_release_cursor_index)
+
     record_cursor_metric(state, :last_applied_index, ra_index)
 
     # Wrap every reply with the ra_index it was applied at so the originating
@@ -1064,25 +1068,44 @@ defmodule Ferricstore.Raft.StateMachine do
     notify_effect = {:send_msg, batcher_name, {:locally_applied, ra_index}, [:local]}
 
     interval = state.release_cursor_interval
+    crossed_interval? = div(old_count, interval) != div(state.applied_count, interval)
+    checkpoint_clean_now? = checkpoint_clean?(state)
 
-    if div(old_count, interval) != div(state.applied_count, interval) and
-         checkpoint_clean?(state) do
-      case Ferricstore.Raft.ReplaySafeIndex.persist(state.shard_data_path, ra_index) do
-        :ok ->
-          record_cursor_metric(state, :last_released_cursor_index, ra_index)
+    {state, checkpoint_effects} =
+      if crossed_interval? do
+        checkpoint_state = %{state | pending_release_cursor_index: ra_index}
 
-          # Checkpoints are cheap, non-fsynced materializations used to accelerate
-          # unclean restart. The cursor effect promotes the latest completed
-          # checkpoint to a durable snapshot for log compaction when one exists.
-          {state, wrapped_result,
-           [notify_effect, {:checkpoint, ra_index, state}, {:release_cursor, ra_index}]}
-
-        {:error, _reason} ->
-          {state, wrapped_result, [notify_effect]}
+        if checkpoint_clean_now? do
+          {checkpoint_state, []}
+        else
+          {checkpoint_state, [{:checkpoint, ra_index, checkpoint_state}]}
+        end
+      else
+        {state, []}
       end
-    else
-      {state, wrapped_result, [notify_effect]}
-    end
+
+    release_index =
+      cond do
+        checkpoint_clean_now? ->
+          Map.get(state, :pending_release_cursor_index)
+
+        checkpoint_clean_before_write? ->
+          previous_pending_release_index
+
+        true ->
+          nil
+      end
+
+    {state, release_effects} =
+      release_cursor_effects(
+        state,
+        release_index,
+        ra_index,
+        crossed_interval?,
+        checkpoint_effects
+      )
+
+    {state, wrapped_result, [notify_effect | release_effects]}
   end
 
   defp maybe_release_cursor(_meta, _old_count, state, result) do
@@ -1091,6 +1114,52 @@ defmodule Ferricstore.Raft.StateMachine do
     # No meta (e.g. cross-shard sub-apply) — pass through untouched.
     {state, result}
   end
+
+  defp release_cursor_effects(
+         state,
+         release_index,
+         ra_index,
+         crossed_interval?,
+         checkpoint_effects
+       )
+       when is_integer(release_index) and release_index > 0 do
+    if release_index > cursor_metric(state, :last_released_cursor_index) do
+      case Ferricstore.Raft.ReplaySafeIndex.persist(state.shard_data_path, release_index) do
+        :ok ->
+          record_cursor_metric(state, :last_released_cursor_index, release_index)
+
+          state =
+            if Map.get(state, :pending_release_cursor_index) == release_index do
+              %{state | pending_release_cursor_index: nil}
+            else
+              state
+            end
+
+          checkpoint_effects =
+            if crossed_interval? and release_index == ra_index do
+              [{:checkpoint, ra_index, state} | checkpoint_effects]
+            else
+              checkpoint_effects
+            end
+
+          {state, Enum.reverse(checkpoint_effects) ++ [{:release_cursor, release_index}]}
+
+        {:error, _reason} ->
+          {state, checkpoint_effects}
+      end
+    else
+      {state, checkpoint_effects}
+    end
+  end
+
+  defp release_cursor_effects(
+         state,
+         _release_index,
+         _ra_index,
+         _crossed_interval?,
+         checkpoint_effects
+       ),
+       do: {state, checkpoint_effects}
 
   defp consume_pending_state(state) do
     case Process.delete(:sm_pending_state) do
@@ -1129,6 +1198,24 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp record_cursor_metric(_state, _field, _index), do: :ok
+
+  defp cursor_metric(%{shard_index: shard_index} = state, field) when is_atom(field) do
+    case checkpoint_ctx_for_state(state) |> metric_ref(field) do
+      ref when is_reference(ref) ->
+        size = :atomics.info(ref).size
+        if shard_index < size, do: :atomics.get(ref, shard_index + 1), else: 0
+
+      _ ->
+        0
+    end
+  rescue
+    _ -> 0
+  end
+
+  defp cursor_metric(_state, _field), do: 0
+
+  defp metric_ref(nil, _field), do: nil
+  defp metric_ref(ctx, field), do: Map.get(ctx, field)
 
   # A release_cursor lets ra compact log entries. For the Bitcask-backed state
   # machine, the log must not be released past writes that are still only in
@@ -1192,6 +1279,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp clear_stale_pending_state do
     Process.delete(:sm_pending_state)
+    Process.delete(:sm_checkpoint_clean_before_write)
     :ok
   end
 
@@ -3545,11 +3633,21 @@ defmodule Ferricstore.Raft.StateMachine do
         flag_idx = state.shard_index + 1
 
         if flag_idx <= :atomics.info(ctx.checkpoint_flags).size do
+          remember_checkpoint_clean_before_write(state, ctx)
           :atomics.put(ctx.checkpoint_flags, flag_idx, 1)
         end
 
         Ferricstore.Store.DiskPressure.clear(ctx, state.shard_index)
     end
+  end
+
+  defp remember_checkpoint_clean_before_write(state, ctx) do
+    if Process.get(:sm_checkpoint_clean_before_write) != true and
+         checkpoint_clean?(%{state | instance_ctx: ctx}) do
+      Process.put(:sm_checkpoint_clean_before_write, true)
+    end
+  rescue
+    _ -> :ok
   end
 
   defp checkpoint_ctx_for_state(%{instance_ctx: ctx}) when is_map(ctx), do: ctx
