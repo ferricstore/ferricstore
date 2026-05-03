@@ -3623,7 +3623,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_hincrby(state, redis_key, field, delta) do
     compound_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, field)
 
-    case do_get_meta(state, compound_key) do
+    case sm_store_compound_get_meta(state, redis_key, compound_key) do
       nil ->
         if delta > @int64_max or delta < @int64_min do
           {:error, "ERR increment or decrement would overflow"}
@@ -3654,7 +3654,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_hincrbyfloat(state, redis_key, field, delta) do
     compound_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, field)
 
-    case do_get_meta(state, compound_key) do
+    case sm_store_compound_get_meta(state, redis_key, compound_key) do
       nil ->
         new_val = delta * 1.0
         do_put(state, compound_key, Float.to_string(new_val), 0)
@@ -3685,11 +3685,11 @@ defmodule Ferricstore.Raft.StateMachine do
       compound_key = Ferricstore.Store.CompoundKey.zset_member(redis_key, member)
 
       current_score =
-        case do_get(state, compound_key) do
+        case sm_store_compound_get_meta(state, redis_key, compound_key) do
           nil ->
             0.0
 
-          score_val ->
+          {score_val, _expire_at_ms} ->
             score_str =
               case score_val do
                 v when is_binary(v) -> v
