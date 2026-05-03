@@ -12,6 +12,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.StateMachine
   alias Ferricstore.Store.BitcaskWriter
+  alias Ferricstore.Store.CompoundKey
 
   # ---------------------------------------------------------------------------
   # Setup: create a temporary Bitcask store and ETS table for each test.
@@ -442,6 +443,45 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert Enum.any?(records, fn {"origin_getdel_missing_ets", _off, _size, _exp, tombstone?} ->
                tombstone?
              end)
+    end
+  end
+
+  describe "state-machine compound reads" do
+    test "compound_scan reads cold local values from Bitcask", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      key = "geo_cold_scan_#{System.unique_integer([:positive])}"
+      member_key = CompoundKey.zset_member(key, "Palermo")
+
+      {_state2, 1} =
+        StateMachine.apply(
+          %{},
+          {:geo_op, "GEOADD", [key, "13.361389", "38.115556", "Palermo"]},
+          state
+        )
+
+      [{^member_key, score, 0, _lfu, _file_id, _offset, _value_size}] =
+        :ets.lookup(ets, member_key)
+
+      {:ok, [{cold_offset, cold_size}]} =
+        NIF.v2_append_batch(active_file_path, [{member_key, score, 0}])
+
+      :ets.insert(ets, {member_key, nil, 0, 1, 0, cold_offset, cold_size})
+
+      {_state3, result} =
+        StateMachine.apply(
+          %{},
+          {:geo_op, "GEOSEARCH",
+           [key, "FROMLONLAT", "13.361389", "38.115556", "BYRADIUS", "1", "KM"]},
+          state
+        )
+
+      assert ["Palermo"] == result
+
+      assert [{^member_key, ^score, 0, _lfu, 0, ^cold_offset, ^cold_size}] =
+               :ets.lookup(ets, member_key)
     end
   end
 

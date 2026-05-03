@@ -3744,15 +3744,10 @@ defmodule Ferricstore.Raft.StateMachine do
         :ok
       end,
       compound_scan: fn _rk, prefix ->
-        local_results =
-          :ets.select(
-            state.ets,
-            [{{:"$1", :"$2", :_, :_, :_, :_, :_}, [], [{{:"$1", :"$2"}}]}]
-          )
-          |> Enum.filter(fn {k, _v} -> String.starts_with?(k, prefix) end)
+        local_keys = sm_store_compound_local_keys(state, prefix)
 
-        if local_results != [] do
-          local_results
+        if local_keys != [] do
+          sm_store_compound_scan(state, local_keys)
         else
           case instance_ctx_for_state(state) do
             nil ->
@@ -3766,11 +3761,9 @@ defmodule Ferricstore.Raft.StateMachine do
       end,
       compound_count: fn _rk, prefix ->
         local_count =
-          :ets.select(
-            state.ets,
-            [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
-          )
-          |> Enum.count(fn k -> String.starts_with?(k, prefix) end)
+          state
+          |> sm_store_compound_local_keys(prefix)
+          |> Enum.count(fn key -> sm_store_live_local_key?(state, key) end)
 
         if local_count > 0 do
           local_count
@@ -3797,6 +3790,56 @@ defmodule Ferricstore.Raft.StateMachine do
         :ok
       end
     }
+  end
+
+  defp sm_store_compound_local_keys(state, prefix) do
+    prefix_size = byte_size(prefix)
+
+    state.ets
+    |> :ets.select([{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}])
+    |> Enum.filter(fn
+      <<^prefix::binary-size(prefix_size), _rest::binary>> -> true
+      _key -> false
+    end)
+  end
+
+  defp sm_store_compound_scan(state, local_keys) do
+    values = sm_store_batch_get(state, local_keys)
+
+    local_keys
+    |> Enum.zip(values)
+    |> Enum.flat_map(fn
+      {key, value} when is_binary(value) -> [{sm_prefix_field(key), value}]
+      {_key, _value} -> []
+    end)
+    |> Enum.sort_by(fn {field, _value} -> field end)
+  end
+
+  defp sm_store_live_local_key?(state, key) do
+    now = apply_now_ms()
+
+    case :ets.lookup(state.ets, key) do
+      [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
+        true
+
+      [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+        true
+
+      [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+        true
+
+      [{^key, nil, exp, _lfu, fid, off, vsize}]
+      when exp > now and valid_cold_location(fid, off, vsize) ->
+        true
+
+      [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
+        track_keydir_binary_remove_known(state, key, value)
+        :ets.delete(state.ets, key)
+        false
+
+      _ ->
+        false
+    end
   end
 
   defp sm_store_batch_get(state, keys) do
