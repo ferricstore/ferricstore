@@ -1303,17 +1303,18 @@ fn v2_append_ops_batch_nosync<'a>(
     }
 }
 
-/// Async variant of `v2_append_batch`: encodes records on the calling
-/// (Normal) scheduler thread, then submits the write+fsync to Tokio.
+/// Async variant of `v2_append_batch`: copies BEAM binaries into owned
+/// memory on the calling scheduler, then submits validation, record encoding,
+/// write, and fsync to Tokio.
 /// Returns `:ok` immediately. When IO completes, sends
 /// `{:tokio_complete, correlation_id, :ok, [{offset, value_size}, ...]}` or
 /// `{:tokio_complete, correlation_id, :error, reason}` to `caller_pid`.
 ///
 /// ## Scheduler contract
 ///
-/// Runs on a Normal BEAM scheduler. Record encoding is pure CPU work
-/// (microseconds). The actual file write + fsync runs on a Tokio worker
-/// thread — no BEAM scheduler is blocked during IO.
+/// Runs on a Normal BEAM scheduler only long enough to copy BEAM binaries
+/// into owned memory. CRC/record encoding and file write + fsync run on a
+/// Tokio blocking worker.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_batch_async<'a>(
@@ -1323,47 +1324,44 @@ fn v2_append_batch_async<'a>(
     path: String,
     records: Vec<(Binary<'a>, Binary<'a>, u64)>,
 ) -> NifResult<Term<'a>> {
-    // Step 1: Encode records on the Normal scheduler (pure CPU, no IO).
-    // We must copy BEAM binaries into owned Vecs before spawning to Tokio
+    // Step 1: Copy BEAM binaries into owned Vecs before spawning to Tokio
     // because Binary<'a> borrows from the NIF env which is destroyed when
-    // this function returns.
-    for (key, value, _) in &records {
-        if let Err(reason) = log::validate_kv_sizes(key.as_slice(), value.as_slice()) {
-            send_tokio_error(env, &caller_pid, correlation_id, reason.as_str());
-            return Ok(atoms::ok().encode(env));
-        }
-    }
-
+    // this function returns. Validation and record encoding happen in the
+    // blocking worker below so large batches do not burn Normal scheduler time.
     let entries: Vec<(Vec<u8>, Vec<u8>, u64)> = records
         .iter()
         .map(|(k, v, exp)| (k.as_slice().to_vec(), v.as_slice().to_vec(), *exp))
         .collect();
 
-    let encoded: Vec<Vec<u8>> = entries
-        .iter()
-        .map(|(key, value, expire_at_ms)| log::encode_record(key, value, *expire_at_ms))
-        .collect();
-
-    let value_sizes: Vec<usize> = entries.iter().map(|(_, v, _)| v.len()).collect();
-
     let owned_path = path;
 
-    // Step 2: Spawn IO to Tokio blocking thread pool — BEAM scheduler returns immediately.
+    // Step 2: Spawn CPU encoding + IO to Tokio blocking thread pool — BEAM
+    // scheduler returns immediately.
     async_io::runtime().spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             let p = std::path::Path::new(&owned_path);
             let file_id = parse_file_id(p);
 
+            for (key, value, _) in &entries {
+                log::validate_kv_sizes(key, value).map_err(|e| e.to_string())?;
+            }
+
             match log::LogWriter::open(p, file_id) {
                 Ok(mut writer) => {
-                    let mut offsets = Vec::with_capacity(encoded.len());
+                    let mut offsets = Vec::with_capacity(entries.len());
+                    let mut value_sizes = Vec::with_capacity(entries.len());
                     let mut write_err: Option<String> = None;
-                    for buf in &encoded {
-                        match writer.write_raw(buf) {
-                            Ok(off) => offsets.push(off),
+                    for (key, value, expire_at_ms) in &entries {
+                        let buf = log::encode_record(key, value, *expire_at_ms);
+                        match writer.write_raw(&buf) {
+                            Ok(off) => {
+                                offsets.push(off);
+                                value_sizes.push(value.len());
+                            }
                             Err(e) => {
                                 write_err = Some(e.to_string());
                                 offsets.clear();
+                                value_sizes.clear();
                                 break;
                             }
                         }
@@ -1411,18 +1409,6 @@ fn v2_append_batch_async<'a>(
     });
 
     Ok(atoms::ok().encode(env))
-}
-
-fn send_tokio_error(env: Env<'_>, caller_pid: &LocalPid, correlation_id: u64, reason: &str) {
-    let msg = (
-        atoms::tokio_complete(),
-        correlation_id,
-        atoms::error(),
-        reason,
-    )
-        .encode(env);
-
-    let _ = env.send(caller_pid, msg);
 }
 
 // ===========================================================================

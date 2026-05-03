@@ -46,11 +46,28 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     end
   end
 
+  test "async batch append does record encoding on Tokio blocking workers" do
+    source = File.read!(@source)
+    body = function_body(source, "v2_append_batch_async")
+
+    [normal_scheduler_prefix, _blocking_worker_suffix] =
+      String.split(body, "spawn_blocking", parts: 2)
+
+    refute normal_scheduler_prefix =~ "log::encode_record",
+           "v2_append_batch_async must not CRC/encode records on a Normal BEAM scheduler"
+  end
+
   defp assert_nif_schedule(source, function, schedule) do
     pattern =
       ~r/#\[rustler::nif\(schedule = "#{schedule}"\)\]\s*(?:#\[allow\([^\]]+\)\]\s*)?fn #{function}\b/
 
     assert source =~ pattern,
            "expected #{function}/N to use #[rustler::nif(schedule = \"#{schedule}\")]"
+  end
+
+  defp function_body(source, function) do
+    [_before, rest] = String.split(source, "fn #{function}", parts: 2)
+    [body, _after] = String.split(rest, "\n}\n\n", parts: 2)
+    body
   end
 end
