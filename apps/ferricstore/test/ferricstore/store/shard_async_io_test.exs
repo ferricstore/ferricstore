@@ -883,6 +883,29 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert_receive {:tokio_complete, ^corr_id, :ok, ["three", nil, "one"]}, 5000
     end
 
+    test "grouped async batch pread preserves original order across paths" do
+      dir = Path.join(System.tmp_dir!(), "async_pread_batch_grouped_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+      path_a = Path.join(dir, "00000.log")
+      path_b = Path.join(dir, "00001.log")
+
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      {:ok, {off_a1, _}} = NIF.v2_append_record(path_a, "grouped_a1", "a1", 0)
+      {:ok, {off_b1, _}} = NIF.v2_append_record(path_b, "grouped_b1", "b1", 0)
+      {:ok, {off_a2, _}} = NIF.v2_append_record(path_a, "grouped_a2", "a2", 0)
+
+      corr_id = 102
+
+      :ok =
+        NIF.v2_pread_batch_grouped_async(self(), corr_id, [
+          {path_a, [{0, off_a1}, {2, off_a2}]},
+          {path_b, [{1, off_b1}]}
+        ])
+
+      assert_receive {:tokio_complete, ^corr_id, :ok, ["a1", "b1", "a2"]}, 5000
+    end
+
     test "surfaces CRC errors instead of returning nil" do
       dir = Path.join(System.tmp_dir!(), "async_pread_batch_crc_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(dir)

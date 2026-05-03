@@ -1048,6 +1048,27 @@ fn group_pread_locations(
     (count, grouped.into_iter().collect())
 }
 
+fn validate_grouped_pread_groups(groups: &[(String, Vec<(usize, u64)>)]) -> Result<usize, String> {
+    let count: usize = groups.iter().map(|(_, reads)| reads.len()).sum();
+    let mut seen = vec![false; count];
+
+    for (_path, reads) in groups {
+        for (index, _offset) in reads {
+            if *index >= count {
+                return Err(format!(
+                    "grouped pread index out of range: index={index}, count={count}"
+                ));
+            }
+
+            if std::mem::replace(&mut seen[*index], true) {
+                return Err(format!("grouped pread duplicate index: {index}"));
+            }
+        }
+    }
+
+    Ok(count)
+}
+
 fn pread_batch_for_path(
     path: String,
     reads: Vec<(usize, u64)>,
@@ -1175,6 +1196,55 @@ fn v2_pread_batch_async(
 ) -> NifResult<Term<'_>> {
     async_io::runtime().spawn(async move {
         let (count, groups) = group_pread_locations(locations);
+        let mut handles = Vec::with_capacity(groups.len());
+
+        for (path, reads) in groups {
+            handles.push(tokio::task::spawn_blocking(move || {
+                pread_batch_for_path(path, reads)
+            }));
+        }
+
+        let mut result: Result<Vec<Option<Vec<u8>>>, String> = Ok(vec![None; count]);
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(results)) => {
+                    if let Ok(values) = &mut result {
+                        apply_grouped_pread_results(values, results);
+                    }
+                }
+                Ok(Err(reason)) => {
+                    result = Err(reason);
+                    break;
+                }
+                Err(e) => {
+                    result = Err(format!("spawn_blocking: {e}"));
+                    break;
+                }
+            }
+        }
+
+        send_pread_batch_result(caller_pid, correlation_id, result);
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_pread_batch_grouped_async(
+    env: Env<'_>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    groups: Vec<(String, Vec<(usize, u64)>)>,
+) -> NifResult<Term<'_>> {
+    async_io::runtime().spawn(async move {
+        let count = match validate_grouped_pread_groups(&groups) {
+            Ok(count) => count,
+            Err(reason) => {
+                send_pread_batch_result(caller_pid, correlation_id, Err(reason));
+                return;
+            }
+        };
+
         let mut handles = Vec::with_capacity(groups.len());
 
         for (path, reads) in groups {
@@ -1632,6 +1702,20 @@ mod audit_fix_tests {
         assert_eq!(values[1].as_deref(), Some(&b"va1"[..]));
         assert_eq!(values[2], None);
         assert_eq!(values[3].as_deref(), Some(&b"va0"[..]));
+    }
+
+    #[test]
+    fn grouped_batch_pread_validation_rejects_sparse_and_duplicate_indexes() {
+        let groups = vec![("a.log".to_string(), vec![(0, 10), (2, 20)])];
+        let err = validate_grouped_pread_groups(&groups).unwrap_err();
+        assert!(err.contains("out of range"));
+
+        let groups = vec![
+            ("a.log".to_string(), vec![(0, 10)]),
+            ("b.log".to_string(), vec![(0, 20)]),
+        ];
+        let err = validate_grouped_pread_groups(&groups).unwrap_err();
+        assert!(err.contains("duplicate"));
     }
 
     // ------------------------------------------------------------------

@@ -139,6 +139,14 @@ defmodule Ferricstore.Bitcask.NIF do
   def v2_pread_batch_path_async(_caller_pid, _correlation_id, _path, _offsets),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec v2_pread_batch_grouped_async(
+          pid(),
+          term(),
+          [{binary(), [{non_neg_integer(), non_neg_integer()}]}]
+        ) :: :ok | {:error, term()}
+  def v2_pread_batch_grouped_async(_caller_pid, _correlation_id, _groups),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec v2_fsync_async(pid(), term(), binary()) :: :ok | {:error, term()}
   def v2_fsync_async(_caller_pid, _correlation_id, _path), do: :erlang.nif_error(:nif_not_loaded)
 

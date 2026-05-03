@@ -30,6 +30,8 @@ defmodule Ferricstore.Store.ColdRead do
   end
 
   @spec pread_batch([{binary(), non_neg_integer()}], timeout()) :: result()
+  def pread_batch([], _timeout_ms), do: {:ok, []}
+
   def pread_batch(locations, timeout_ms) do
     await_tokio(
       fn proxy, corr_id ->
@@ -37,8 +39,8 @@ defmodule Ferricstore.Store.ColdRead do
           {:single_path, path, offsets} ->
             NIF.v2_pread_batch_path_async(proxy, corr_id, path, offsets)
 
-          {:multi_path, locations} ->
-            NIF.v2_pread_batch_async(proxy, corr_id, locations)
+          {:grouped_paths, groups} ->
+            NIF.v2_pread_batch_grouped_async(proxy, corr_id, groups)
         end
       end,
       timeout_ms
@@ -48,12 +50,12 @@ defmodule Ferricstore.Store.ColdRead do
   @doc false
   @spec pread_batch_submit_shape([{binary(), non_neg_integer()}]) ::
           {:single_path, binary(), [non_neg_integer()]}
-          | {:multi_path, [{binary(), non_neg_integer()}]}
+          | {:grouped_paths, [{binary(), [{non_neg_integer(), non_neg_integer()}]}]}
   def pread_batch_submit_shape([{path, offset} | rest] = locations) do
     same_path_offsets(rest, path, [offset], locations)
   end
 
-  def pread_batch_submit_shape(locations), do: {:multi_path, locations}
+  def pread_batch_submit_shape([]), do: {:grouped_paths, []}
 
   defp same_path_offsets([{path, offset} | rest], path, offsets, locations) do
     same_path_offsets(rest, path, [offset | offsets], locations)
@@ -63,5 +65,21 @@ defmodule Ferricstore.Store.ColdRead do
     {:single_path, path, Enum.reverse(offsets)}
   end
 
-  defp same_path_offsets(_rest, _path, _offsets, locations), do: {:multi_path, locations}
+  defp same_path_offsets(_rest, _path, _offsets, locations),
+    do: {:grouped_paths, group_paths(locations)}
+
+  defp group_paths(locations) do
+    {groups, order} =
+      locations
+      |> Enum.with_index()
+      |> Enum.reduce({%{}, []}, fn {{path, offset}, index}, {groups, order} ->
+        order = if Map.has_key?(groups, path), do: order, else: [path | order]
+        groups = Map.update(groups, path, [{index, offset}], &[{index, offset} | &1])
+        {groups, order}
+      end)
+
+    order
+    |> Enum.reverse()
+    |> Enum.map(fn path -> {path, groups |> Map.fetch!(path) |> Enum.reverse()} end)
+  end
 end

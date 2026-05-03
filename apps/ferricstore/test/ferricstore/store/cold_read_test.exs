@@ -69,9 +69,12 @@ defmodule Ferricstore.Store.ColdReadTest do
              ColdRead.pread_batch_submit_shape([{path, 10}, {path, 20}, {path, 30}])
   end
 
-  test "pread_batch keeps mixed-path submit shape unchanged" do
-    locations = [{"/tmp/00001.log", 10}, {"/tmp/00002.log", 20}]
+  test "pread_batch groups mixed paths without repeating the same path per offset" do
+    path_a = "/tmp/00001.log"
+    path_b = "/tmp/00002.log"
+    locations = [{path_a, 10}, {path_b, 20}, {path_a, 30}]
 
-    assert {:multi_path, ^locations} = ColdRead.pread_batch_submit_shape(locations)
+    assert {:grouped_paths, [{^path_a, [{0, 10}, {2, 30}]}, {^path_b, [{1, 20}]}]} =
+             ColdRead.pread_batch_submit_shape(locations)
   end
 end
