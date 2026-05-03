@@ -307,6 +307,7 @@ defmodule Ferricstore.Application do
   @impl true
   def stop(_state) do
     _ = Ferricstore.Raft.Cluster.stop_system()
+    FerricStore.Instance.cleanup(:default)
     :ok
   end
 

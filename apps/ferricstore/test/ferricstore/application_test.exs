@@ -82,6 +82,10 @@ defmodule Ferricstore.ApplicationTest do
         stop_app_if_started(:ferricstore_server)
         assert :ok = Application.stop(:ferricstore)
         assert :ra_system.fetch(system) == :undefined
+
+        assert_raise ArgumentError, fn ->
+          FerricStore.Instance.get(:default)
+        end
       after
         {:ok, _} = Application.ensure_all_started(:ferricstore)
         ShardHelpers.wait_shards_alive()
