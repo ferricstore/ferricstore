@@ -143,7 +143,9 @@ defmodule Ferricstore.Raft.Cluster do
       ) do
     ra_sys = Keyword.get(opts, :ra_system, @ra_system)
     membership = Keyword.get(opts, :membership, :voter)
-    skip_below_index = Keyword.get(opts, :skip_below_index, 0)
+
+    skip_below_index = replay_skip_below_index(shard_data_path, opts)
+
     instance_name = Keyword.get(opts, :instance_name, :default)
     server_id = shard_server_id(shard_index)
 
@@ -170,7 +172,7 @@ defmodule Ferricstore.Raft.Cluster do
       initial_members: initial_members,
       membership: membership,
       machine: {:module, Ferricstore.Raft.StateMachine, machine_config},
-      log_init_args: %{uid: shard_uid(shard_index)},
+      log_init_args: log_init_args_for_shard(shard_index),
       system: ra_sys,
       min_recovery_checkpoint_interval: 1
     }
@@ -333,6 +335,10 @@ defmodule Ferricstore.Raft.Cluster do
     ra_sys = Keyword.get(opts, :ra_system, @ra_system)
     membership = Keyword.get(opts, :membership, :voter)
     instance_name = Keyword.get(opts, :instance_name, :default)
+    wait_for_leader? = wait_for_leader_on_start?(opts)
+
+    skip_below_index = replay_skip_below_index(shard_data_path, opts)
+
     server_id = shard_server_id(shard_index)
 
     machine_config = %{
@@ -342,7 +348,8 @@ defmodule Ferricstore.Raft.Cluster do
       active_file_path: active_file_path,
       ets: ets,
       data_dir: Ferricstore.DataDir.root_from_shard_path(shard_data_path),
-      instance_name: instance_name
+      instance_name: instance_name,
+      skip_below_index: skip_below_index
     }
 
     # In cluster mode, initial_members includes all configured nodes.
@@ -365,7 +372,7 @@ defmodule Ferricstore.Raft.Cluster do
       initial_members: initial_members,
       membership: membership,
       machine: {:module, Ferricstore.Raft.StateMachine, machine_config},
-      log_init_args: %{uid: shard_uid(shard_index)},
+      log_init_args: log_init_args_for_shard(shard_index),
       system: ra_sys,
       min_recovery_checkpoint_interval: 1
     }
@@ -374,11 +381,92 @@ defmodule Ferricstore.Raft.Cluster do
            :ra.start_server(ra_sys, server_config)
          end) do
       :ok ->
-        trigger_and_wait(server_id)
+        maybe_trigger_and_wait(server_id, wait_for_leader?)
 
       {:error, reason} ->
-        handle_start_server_error(ra_sys, server_id, server_config, shard_index, reason)
+        handle_start_server_error(
+          ra_sys,
+          server_id,
+          server_config,
+          shard_index,
+          reason,
+          wait_for_leader?
+        )
     end
+  end
+
+  @doc false
+  @spec wait_for_leader_on_start?(keyword()) :: boolean()
+  def wait_for_leader_on_start?(opts) do
+    Keyword.get(opts, :wait_for_leader, true)
+  end
+
+  @doc false
+  @spec log_init_args_for_shard(non_neg_integer()) :: map()
+  def log_init_args_for_shard(shard_index) do
+    %{
+      uid: shard_uid(shard_index),
+      # `release_cursor_interval` counts logical commands. A single Ra entry can
+      # contain thousands of batched writes, so Ra's default snapshot interval
+      # can prevent released cursors from materializing before an unclean crash.
+      min_snapshot_interval: 1,
+      min_checkpoint_interval: 1
+    }
+  end
+
+  @doc false
+  @spec replay_skip_below_index(binary(), keyword()) :: non_neg_integer()
+  def replay_skip_below_index(shard_data_path, opts \\ []) do
+    max(
+      Keyword.get(opts, :skip_below_index, 0),
+      Ferricstore.Raft.ReplaySafeIndex.read(shard_data_path)
+    )
+  end
+
+  @doc """
+  Triggers and waits for all local shard Ra elections concurrently.
+
+  Shard GenServers defer this work during application startup so recovery does
+  not serialize replay/election across every shard. Readiness is still gated on
+  this function, so clients do not see the node as ready until all shard leaders
+  are available.
+  """
+  @spec trigger_shard_elections_parallel(non_neg_integer(), keyword()) :: :ok | {:error, term()}
+  def trigger_shard_elections_parallel(shard_count, opts \\ [])
+
+  def trigger_shard_elections_parallel(0, _opts), do: :ok
+
+  def trigger_shard_elections_parallel(shard_count, opts)
+      when is_integer(shard_count) and shard_count > 0 do
+    timeout = Keyword.get(opts, :timeout, 120_000)
+    max_concurrency = Keyword.get(opts, :max_concurrency, shard_count)
+
+    0..(shard_count - 1)
+    |> Task.async_stream(
+      fn shard_index ->
+        server_id = shard_server_id(shard_index)
+
+        case trigger_and_wait(server_id) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {shard_index, reason}}
+          other -> {:error, {shard_index, other}}
+        end
+      end,
+      max_concurrency: max_concurrency,
+      ordered: false,
+      timeout: timeout,
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce_while(:ok, fn
+      {:ok, :ok}, :ok ->
+        {:cont, :ok}
+
+      {:ok, {:error, reason}}, :ok ->
+        {:halt, {:error, reason}}
+
+      {:exit, reason}, :ok ->
+        {:halt, {:error, {:election_task_exit, reason}}}
+    end)
   end
 
   @doc false
@@ -405,19 +493,29 @@ defmodule Ferricstore.Raft.Cluster do
     :fail_closed
   end
 
+  defp maybe_trigger_and_wait(server_id, true), do: trigger_and_wait(server_id)
+  defp maybe_trigger_and_wait(_server_id, false), do: :ok
+
   defp trigger_and_wait(server_id) do
     shard_index = shard_index_from_server_id(server_id)
 
-    profile_startup_phase(shard_index, :ra_trigger_election, fn ->
-      :ra.trigger_election(server_id)
-    end)
+    case profile_startup_phase(shard_index, :ra_trigger_election, fn ->
+           :ra.trigger_election(server_id)
+         end) do
+      :ok ->
+        profile_startup_phase(shard_index, :ra_wait_leader, fn ->
+          wait_for_leader(server_id)
+        end)
 
-    profile_startup_phase(shard_index, :ra_wait_leader, fn ->
-      wait_for_leader(server_id)
-    end)
+      {:error, _reason} = err ->
+        err
+
+      other ->
+        {:error, other}
+    end
   end
 
-  defp handle_already_started(ra_sys, server_id, server_config, shard_index) do
+  defp handle_already_started(ra_sys, server_id, server_config, shard_index, wait_for_leader?) do
     Logger.info(
       "ra server for shard #{shard_index} already running, stopping and restarting with same UID"
     )
@@ -429,10 +527,10 @@ defmodule Ferricstore.Raft.Cluster do
            :ra.start_server(ra_sys, server_config)
          end) do
       :ok ->
-        trigger_and_wait(server_id)
+        maybe_trigger_and_wait(server_id, wait_for_leader?)
 
       {:error, :not_new} ->
-        restart_existing_server(ra_sys, server_id, shard_index)
+        restart_existing_server(ra_sys, server_id, shard_index, wait_for_leader?)
 
       {:error, retry_reason} = err ->
         Logger.error(
@@ -443,12 +541,12 @@ defmodule Ferricstore.Raft.Cluster do
     end
   end
 
-  defp restart_existing_server(ra_sys, server_id, shard_index) do
+  defp restart_existing_server(ra_sys, server_id, shard_index, wait_for_leader? \\ true) do
     case profile_startup_phase(shard_index, :ra_restart_server, fn ->
            :ra.restart_server(ra_sys, server_id)
          end) do
       :ok ->
-        trigger_and_wait(server_id)
+        maybe_trigger_and_wait(server_id, wait_for_leader?)
 
       {:error, restart_reason} = err ->
         Logger.error(
@@ -459,13 +557,20 @@ defmodule Ferricstore.Raft.Cluster do
     end
   end
 
-  defp handle_start_server_error(ra_sys, server_id, server_config, shard_index, reason) do
+  defp handle_start_server_error(
+         ra_sys,
+         server_id,
+         server_config,
+         shard_index,
+         reason,
+         wait_for_leader?
+       ) do
     case start_error_recovery_action(reason) do
       :same_uid_restart ->
-        handle_already_started(ra_sys, server_id, server_config, shard_index)
+        handle_already_started(ra_sys, server_id, server_config, shard_index, wait_for_leader?)
 
       :existing_state_restart ->
-        restart_existing_server(ra_sys, server_id, shard_index)
+        restart_existing_server(ra_sys, server_id, shard_index, wait_for_leader?)
 
       :fail_closed ->
         Logger.error("Failed to start ra server for shard #{shard_index}: #{inspect(reason)}")

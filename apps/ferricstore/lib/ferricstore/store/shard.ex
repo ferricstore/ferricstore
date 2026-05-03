@@ -233,7 +233,10 @@ defmodule Ferricstore.Store.Shard do
             active_file_id,
             active_file_path,
             ets,
-            ctx.name
+            ctx.name,
+            # Start all Ra servers first, then Application waits for all
+            # elections in parallel before marking the node ready.
+            wait_for_leader: false
           )
         end)
       else

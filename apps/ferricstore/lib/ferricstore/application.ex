@@ -236,33 +236,49 @@ defmodule Ferricstore.Application do
       max_seconds: max_s
     ]
 
-    result = Supervisor.start_link(children, opts)
+    case Supervisor.start_link(children, opts) do
+      {:ok, pid} = result ->
+        case Ferricstore.Raft.Cluster.trigger_shard_elections_parallel(shard_count) do
+          :ok ->
+            mark_started(shard_count)
+            result
 
-    case result do
-      {:ok, _pid} ->
-        # Mark the node as ready for Kubernetes readiness probes (spec 2C.1).
-        # In embedded mode, set_ready(true) is still called so that
-        # Health.ready?() returns true for any code that checks it.
-        Ferricstore.Health.set_ready(true)
+          {:error, reason} ->
+            stop_started_supervisor(pid)
+            cleanup_failed_start()
+            {:error, {:raft_election_failed, reason}}
+        end
 
-        :telemetry.execute(
-          [:ferricstore, :node, :startup_complete],
-          %{duration_ms: System.monotonic_time(:millisecond)},
-          %{shard_count: shard_count}
-        )
-
-        # Step 6 - Large value check:
-        # Scan keydir for values exceeding the configured threshold.
-        # Pure RAM scan -- keydir already holds value_size per entry, no disk reads.
-        # Non-blocking: fires before any traffic is served so operator sees the
-        # warning immediately.
-        check_large_values(shard_count)
-
-      _ ->
+      result ->
         cleanup_failed_start()
+        result
     end
+  end
 
-    result
+  defp mark_started(shard_count) do
+    # Mark the node as ready for Kubernetes readiness probes (spec 2C.1).
+    # In embedded mode, set_ready(true) is still called so that
+    # Health.ready?() returns true for any code that checks it.
+    Ferricstore.Health.set_ready(true)
+
+    :telemetry.execute(
+      [:ferricstore, :node, :startup_complete],
+      %{duration_ms: System.monotonic_time(:millisecond)},
+      %{shard_count: shard_count}
+    )
+
+    # Step 6 - Large value check:
+    # Scan keydir for values exceeding the configured threshold.
+    # Pure RAM scan -- keydir already holds value_size per entry, no disk reads.
+    # Non-blocking: fires before any traffic is served so operator sees the
+    # warning immediately.
+    check_large_values(shard_count)
+  end
+
+  defp stop_started_supervisor(pid) do
+    Supervisor.stop(pid)
+  catch
+    :exit, _reason -> :ok
   end
 
   @impl true

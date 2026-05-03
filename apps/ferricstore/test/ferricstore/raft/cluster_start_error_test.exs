@@ -41,6 +41,57 @@ defmodule Ferricstore.Raft.ClusterStartErrorTest do
     test "application checks ra system startup result" do
       assert ok_match_to_start_system?(@application_path)
     end
+
+    test "application waits for parallel shard elections before readiness" do
+      source = File.read!(@application_path)
+
+      election_pos =
+        :binary.match(source, "Ferricstore.Raft.Cluster.trigger_shard_elections_parallel")
+
+      ready_pos = :binary.match(source, "Ferricstore.Health.set_ready(true)")
+
+      assert match?({_, _}, election_pos)
+      assert match?({_, _}, ready_pos)
+
+      {election_offset, _} = election_pos
+      {ready_offset, _} = ready_pos
+
+      assert election_offset < ready_offset
+    end
+  end
+
+  describe "startup election mode" do
+    test "direct start waits for leader unless startup explicitly defers it" do
+      assert Cluster.wait_for_leader_on_start?([]) == true
+      assert Cluster.wait_for_leader_on_start?(wait_for_leader: true) == true
+      assert Cluster.wait_for_leader_on_start?(wait_for_leader: false) == false
+    end
+
+    test "raft log snapshots are allowed at every released cursor" do
+      args = Cluster.log_init_args_for_shard(0)
+
+      assert args.min_snapshot_interval == 1
+      assert args.min_checkpoint_interval == 1
+    end
+
+    test "recovery starts from the highest explicit or persisted replay-safe index" do
+      tmp_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_replay_skip_#{System.unique_integer([:positive])}"
+        )
+
+      on_exit(fn -> File.rm_rf!(tmp_dir) end)
+
+      assert Cluster.replay_skip_below_index(tmp_dir, []) == 0
+      assert Cluster.replay_skip_below_index(tmp_dir, skip_below_index: 40) == 40
+
+      :ok = Ferricstore.Raft.ReplaySafeIndex.persist(tmp_dir, 123)
+
+      assert Cluster.replay_skip_below_index(tmp_dir, []) == 123
+      assert Cluster.replay_skip_below_index(tmp_dir, skip_below_index: 40) == 123
+      assert Cluster.replay_skip_below_index(tmp_dir, skip_below_index: 200) == 200
+    end
   end
 
   defp ok_match_to_start_system?(path) do

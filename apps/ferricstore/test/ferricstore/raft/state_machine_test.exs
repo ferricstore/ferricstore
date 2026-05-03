@@ -2056,7 +2056,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
           {new_state, {:applied_at, _, :ok}, effects} =
             StateMachine.apply(meta, {:put, "rc_key_#{i}", "v#{i}", 0}, acc)
 
-          if Enum.any?(effects, &match?({:release_cursor, _, _}, &1)) do
+          if Enum.any?(effects, &match?({:release_cursor, _}, &1)) do
             flunk("release_cursor emitted before interval reached at apply #{i}")
           end
 
@@ -2093,12 +2093,16 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert new_state.applied_count == interval
 
-      # Verify the release_cursor effect
-      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
-      assert {:release_cursor, ra_index, cursor_state} = cursor_effect
+      # Verify the recovery checkpoint and release_cursor promotion effects.
+      checkpoint_effect = Enum.find(effects, &match?({:checkpoint, _, _}, &1))
+      assert {:checkpoint, ^interval, checkpoint_state} = checkpoint_effect
+      assert checkpoint_state.shard_index == 0
+      assert checkpoint_state.applied_count == interval
+
+      cursor_effect = Enum.find(effects, &match?({:release_cursor, _}, &1))
+      assert {:release_cursor, ra_index} = cursor_effect
       assert ra_index == interval
-      assert cursor_state.shard_index == 0
-      assert cursor_state.applied_count == interval
+      assert Ferricstore.Raft.ReplaySafeIndex.read(new_state.shard_data_path) == interval
     end
 
     test "release_cursor waits while the shard has uncheckpointed bitcask data", %{
@@ -2132,7 +2136,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert :atomics.get(last_applied_index, shard_index + 1) == 1
       assert :atomics.get(last_released_cursor_index, shard_index + 1) == 0
 
-      refute Enum.any?(effects, &match?({:release_cursor, 1, _}, &1)),
+      refute Enum.any?(effects, &match?({:release_cursor, 1}, &1)),
              "Raft cursor must not advance past data that still needs a Bitcask checkpoint"
     end
 
@@ -2159,7 +2163,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {_new_state, {:applied_at, 42, nil}, effects} =
         StateMachine.apply(meta, {:getdel, "released_cursor_metric_missing"}, state)
 
-      assert Enum.any?(effects, &match?({:release_cursor, 42, _}, &1))
+      assert Enum.any?(effects, &match?({:release_cursor, 42}, &1))
       assert :atomics.get(last_applied_index, shard_index + 1) == 42
       assert :atomics.get(last_released_cursor_index, shard_index + 1) == 42
     end
@@ -2173,7 +2177,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
       File.rm_rf!(root)
       File.mkdir_p!(root)
 
-      instance_ctx = FerricStore.Instance.build(instance_name, shard_count: shard_index + 1, data_dir: root)
+      instance_ctx =
+        FerricStore.Instance.build(instance_name, shard_count: shard_index + 1, data_dir: root)
 
       on_exit({:cursor_metric_instance, instance_name}, fn ->
         FerricStore.Instance.cleanup(instance_name)
@@ -2192,7 +2197,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {_new_state, {:applied_at, 77, nil}, effects} =
         StateMachine.apply(meta, {:getdel, "released_cursor_metric_by_name_missing"}, state)
 
-      assert Enum.any?(effects, &match?({:release_cursor, 77, _}, &1))
+      assert Enum.any?(effects, &match?({:release_cursor, 77}, &1))
       assert :atomics.get(instance_ctx.last_applied_index, shard_index + 1) == 77
       assert :atomics.get(instance_ctx.last_released_cursor_index, shard_index + 1) == 77
     end
@@ -2224,7 +2229,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {_new_state, {:applied_at, 1, nil}, effects} =
         StateMachine.apply(meta, {:getdel, "missing_during_checkpoint"}, state)
 
-      refute Enum.any?(effects, &match?({:release_cursor, 1, _}, &1)),
+      refute Enum.any?(effects, &match?({:release_cursor, 1}, &1)),
              "Raft cursor must not advance while Bitcask fsync is still in flight"
     end
 
@@ -2245,7 +2250,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {_new_state, {:applied_at, 1, nil}, effects} =
         StateMachine.apply(meta, {:getdel, "missing_custom_checkpoint_ctx"}, state)
 
-      refute Enum.any?(effects, &match?({:release_cursor, 1, _}, &1)),
+      refute Enum.any?(effects, &match?({:release_cursor, 1}, &1)),
              "custom instance state must fail closed until checkpoint atomics are resolved"
     end
 
@@ -2265,7 +2270,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
           cursor_idx =
             Enum.find_value(effects, fn
-              {:release_cursor, idx, _snap} -> idx
+              {:release_cursor, idx} -> idx
               _ -> nil
             end)
 
@@ -2296,8 +2301,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
       meta3 = %{index: 12, term: 1, system_time: System.os_time(:millisecond)}
       {_s3, {:applied_at, _, :ok}, effects} = StateMachine.apply(meta3, {:delete, "del_rc_a"}, s2)
 
-      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
-      assert {:release_cursor, 12, _cursor_state} = cursor_effect
+      cursor_effect = Enum.find(effects, &match?({:release_cursor, _}, &1))
+      assert {:release_cursor, 12} = cursor_effect
     end
 
     test "release_cursor emitted for batch that crosses interval boundary", %{
@@ -2336,8 +2341,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert results == [:ok, :ok, :ok]
       assert new_state.applied_count == 6
-      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
-      assert {:release_cursor, 4, _cursor_state} = cursor_effect
+      cursor_effect = Enum.find(effects, &match?({:release_cursor, _}, &1))
+      assert {:release_cursor, 4} = cursor_effect
     end
 
     test "release_cursor not emitted when meta has no index", %{state: state} do
@@ -2382,8 +2387,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {_new_state, {:applied_at, _, :ok}, effects} =
         StateMachine.apply(meta, {:put, "snap_3", "v3", 0}, state_after)
 
-      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
-      assert {:release_cursor, 3, cursor_state} = cursor_effect
+      checkpoint_effect = Enum.find(effects, &match?({:checkpoint, _, _}, &1))
+      assert {:checkpoint, 3, cursor_state} = checkpoint_effect
 
       # The snapshot state should reflect the current state
       assert cursor_state.shard_index == 2

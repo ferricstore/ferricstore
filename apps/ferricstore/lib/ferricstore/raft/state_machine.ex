@@ -52,10 +52,11 @@ defmodule Ferricstore.Raft.StateMachine do
   ## Log compaction (spec 2E.5)
 
   The Raft log grows unbounded unless compacted. Every
-  `:release_cursor_interval` applied commands (default: 1000), `apply/3`
-  emits a `{:release_cursor, ra_index, state}` effect. This tells ra that
-  all log entries up to `ra_index` are fully reflected in the given state
-  snapshot and can be safely truncated.
+  `:release_cursor_interval` applied commands (default: 20_000), `apply/3`
+  emits `{:checkpoint, ra_index, state}` and `{:release_cursor, ra_index}`
+  effects. This tells ra that all log entries up to `ra_index` are fully
+  reflected in the given state checkpoint and can be safely truncated after
+  the checkpoint is materialized.
 
   The interval is stored in the machine state at init time (from the config
   map or application env) so that `apply/3` remains deterministic -- it never
@@ -992,9 +993,9 @@ defmodule Ferricstore.Raft.StateMachine do
   # ---------------------------------------------------------------------------
 
   # Checks whether the applied_count crossed an interval boundary AND the
-  # ra meta contains a valid index. If both conditions are met, emits a
-  # `{:release_cursor, ra_index, state}` effect so ra can compact the log
-  # up to this point.
+  # ra meta contains a valid index. If both conditions are met, emits
+  # checkpoint/release_cursor effects so ra can compact the log up to this
+  # point.
   #
   # For single commands (put/delete), old_count + 1 == new applied_count,
   # so `div(old, interval) != div(new, interval)` is equivalent to
@@ -1031,7 +1032,13 @@ defmodule Ferricstore.Raft.StateMachine do
     if div(old_count, interval) != div(state.applied_count, interval) and
          checkpoint_clean?(state) do
       record_cursor_metric(state, :last_released_cursor_index, ra_index)
-      {state, wrapped_result, [notify_effect, {:release_cursor, ra_index, state}]}
+      Ferricstore.Raft.ReplaySafeIndex.persist(state.shard_data_path, ra_index)
+
+      # Checkpoints are cheap, non-fsynced materializations used to accelerate
+      # unclean restart. The cursor effect promotes the latest completed
+      # checkpoint to a durable snapshot for log compaction when one exists.
+      {state, wrapped_result,
+       [notify_effect, {:checkpoint, ra_index, state}, {:release_cursor, ra_index}]}
     else
       {state, wrapped_result, [notify_effect]}
     end

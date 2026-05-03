@@ -411,7 +411,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           non_neg_integer(),
           binary(),
           :ets.tid(),
-          atom()
+          atom(),
+          keyword()
         ) :: boolean()
   @doc false
   def start_raft_if_available(
@@ -420,7 +421,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         active_file_id,
         active_file_path,
         ets,
-        instance_name \\ :default
+        instance_name \\ :default,
+        opts \\ []
       ) do
     batcher_name = Ferricstore.Raft.Batcher.batcher_name(index)
 
@@ -432,7 +434,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
                active_file_id,
                active_file_path,
                ets,
-               instance_name: instance_name
+               Keyword.put_new(opts, :instance_name, instance_name)
              ) do
           :ok ->
             true
@@ -501,8 +503,12 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   end
 
   defp maybe_shutdown_error(errors, _operation, result) when result in [:ok, nil], do: errors
-  defp maybe_shutdown_error(errors, operation, {:error, reason}), do: [{operation, reason} | errors]
-  defp maybe_shutdown_error(errors, operation, other), do: [{operation, {:unexpected_result, other}} | errors]
+
+  defp maybe_shutdown_error(errors, operation, {:error, reason}),
+    do: [{operation, reason} | errors]
+
+  defp maybe_shutdown_error(errors, operation, other),
+    do: [{operation, {:unexpected_result, other}} | errors]
 
   defp log_shutdown_result(index, flush_us, hint_us, []) do
     Logger.info(

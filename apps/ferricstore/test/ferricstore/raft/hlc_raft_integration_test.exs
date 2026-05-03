@@ -275,8 +275,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
         StateMachine.apply(meta, wrapped, state_before)
 
       assert new_state.applied_count == 3
-      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
-      assert {:release_cursor, 3, _cursor_state} = cursor_effect
+      cursor_effect = Enum.find(effects, &match?({:release_cursor, _}, &1))
+      assert {:release_cursor, 3} = cursor_effect
     end
   end
 
