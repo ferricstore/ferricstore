@@ -2,6 +2,8 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
+  @record_header_size 26
+
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Router
   alias Ferricstore.Bitcask.NIF
@@ -99,6 +101,45 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
 
     assert [nil] == Router.batch_get(ctx, [key])
+  end
+
+  test "batch cold reads emit telemetry when a cold record cannot be decoded", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_batch_corrupt:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    value = "stable-value"
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00000.log")
+
+    {:ok, {offset, _record_size}} = NIF.v2_append_record(path, key, value, 0)
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, offset, byte_size(value)})
+
+    {:ok, fd} = :file.open(path, [:read, :write, :binary])
+    corrupt_at = offset + @record_header_size + byte_size(key)
+    :ok = :file.pwrite(fd, corrupt_at, <<"X">>)
+    :ok = :file.close(fd)
+
+    parent = self()
+    handler_id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :bitcask, :pread_corrupt],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:pread_corrupt, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert [nil] == Router.batch_get(ctx, [key])
+
+    assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                    %{path: ^path, reason: :nil_from_cold_location}}
   end
 
   test "batch_get preserves mixed cold result order including empty values", %{

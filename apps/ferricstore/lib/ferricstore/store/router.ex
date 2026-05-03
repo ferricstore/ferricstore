@@ -1846,15 +1846,34 @@ defmodule Ferricstore.Store.Router do
           List.duplicate(nil, length(entries))
       end
 
-    Enum.zip(entries, values)
-    |> Enum.map(fn
-      {{ctx, keydir, key, _path, file_id, offset}, value} when value != nil ->
-        Stats.record_cold_read(ctx, key)
-        warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
-        value
+    {read_values, corrupt_by_path} =
+      Enum.zip(entries, values)
+      |> Enum.map_reduce(%{}, fn
+        {{ctx, keydir, key, _path, file_id, offset}, value}, corrupt_by_path
+        when value != nil ->
+          Stats.record_cold_read(ctx, key)
+          warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
+          {value, corrupt_by_path}
 
-      {_entry, _value} ->
-        nil
+        {{_ctx, _keydir, _key, path, _file_id, _offset}, _value}, corrupt_by_path ->
+          corrupt_by_path = Map.update(corrupt_by_path, path, 1, &(&1 + 1))
+          {nil, corrupt_by_path}
+      end)
+
+    emit_batch_cold_read_corruption(corrupt_by_path)
+    read_values
+  end
+
+  defp emit_batch_cold_read_corruption(corrupt_by_path) when map_size(corrupt_by_path) == 0,
+    do: :ok
+
+  defp emit_batch_cold_read_corruption(corrupt_by_path) do
+    Enum.each(corrupt_by_path, fn {path, count} ->
+      :telemetry.execute(
+        [:ferricstore, :bitcask, :pread_corrupt],
+        %{count: count},
+        %{path: path, reason: :nil_from_cold_location}
+      )
     end)
   end
 
