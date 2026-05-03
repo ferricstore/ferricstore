@@ -186,8 +186,10 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       ShardHelpers.wait_shards_alive()
 
       # Data should be recovered from Bitcask.
-      ShardHelpers.eventually(fn -> value == Router.get(FerricStore.Instance.get(:default), key) end,
-        "Data should survive shard crash and be recovered from Bitcask")
+      ShardHelpers.eventually(
+        fn -> value == Router.get(FerricStore.Instance.get(:default), key) end,
+        "Data should survive shard crash and be recovered from Bitcask"
+      )
     end
 
     @tag :capture_log
@@ -207,8 +209,10 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # All 20 keys should still be readable.
       for {k, i} <- Enum.with_index(keys, 1) do
-        ShardHelpers.eventually(fn -> "val_#{i}" == Router.get(FerricStore.Instance.get(:default), k) end,
-          "Key #{k} should survive shard 0 crash")
+        ShardHelpers.eventually(
+          fn -> "val_#{i}" == Router.get(FerricStore.Instance.get(:default), k) end,
+          "Key #{k} should survive shard 0 crash"
+        )
       end
     end
   end
@@ -245,8 +249,10 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # The old cached entry is gone (ETS was recreated), but the data
       # is recoverable from Bitcask on the first GET.
-      ShardHelpers.eventually(fn -> "ets_test" == Router.get(FerricStore.Instance.get(:default), key) end,
-        "Data should be recoverable from Bitcask after restart")
+      ShardHelpers.eventually(
+        fn -> "ets_test" == Router.get(FerricStore.Instance.get(:default), key) end,
+        "Data should be recoverable from Bitcask after restart"
+      )
 
       # Now it should be back in ETS.
       assert [{^key, "ets_test", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets_name, key)
@@ -290,7 +296,9 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # Flush the shard that owns this key.
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-      :ok = GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), shard_idx), :flush)
+
+      :ok =
+        GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), shard_idx), :flush)
 
       # Kill that shard.
       {_old, _new} = kill_and_wait_restart(shard_idx)
@@ -298,10 +306,13 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # Verify data is recovered via TCP.
       # The shard may still be recovering its keydir from Bitcask, so retry.
-      ShardHelpers.eventually(fn ->
-        send_cmd(sock, ["GET", key])
-        recv_response(sock) == "before_crash"
-      end, "data should be recovered via TCP after shard restart")
+      ShardHelpers.eventually(
+        fn ->
+          send_cmd(sock, ["GET", key])
+          recv_response(sock) == "before_crash"
+        end,
+        "data should be recovered via TCP after shard restart"
+      )
 
       # New writes should also work.
       key2 = ukey("tcp_after")
@@ -330,6 +341,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
         )
 
       File.mkdir_p!(tmp_dir)
+
       on_exit(fn ->
         File.rm_rf(tmp_dir)
       end)
@@ -415,27 +427,40 @@ defmodule FerricstoreServer.NodeLifecycleTest do
   defp minimal_instance_ctx(data_dir) do
     n = 128
     nil_tuple = List.to_tuple(List.duplicate(nil, n))
+
     %FerricStore.Instance{
       name: :"nlc_test_#{:erlang.unique_integer([:positive])}",
-      data_dir: data_dir, shard_count: n, slot_map: nil_tuple,
-      shard_names: nil_tuple, keydir_refs: nil_tuple, ra_system: nil,
+      data_dir: data_dir,
+      shard_count: n,
+      slot_map: nil_tuple,
+      shard_names: nil_tuple,
+      keydir_refs: nil_tuple,
+      ra_system: nil,
       pressure_flags: :atomics.new(3, signed: false),
       disk_pressure: :atomics.new(n, signed: false),
       checkpoint_flags: :atomics.new(n, signed: false),
       write_version: :counters.new(n, [:write_concurrency]),
       stats_counter: :counters.new(10, [:atomics]),
-      lfu_decay_time: 1, lfu_log_factor: 10,
+      lfu_decay_time: 1,
+      lfu_log_factor: 10,
       lfu_initial_ref: :atomics.new(2, signed: false),
-      hot_cache_max_value_size: 65_536, sync_flush_timeout_ms: 5_000,
-      max_active_file_size: 64 * 1024 * 1024, read_sample_rate: 1,
-      eviction_policy: :volatile_lfu, max_memory_bytes: 1_073_741_824,
-      keydir_max_ram: 256 * 1024 * 1024, memory_limit: 1_073_741_824,
-      keydir_binary_bytes: :atomics.new(n, signed: true), latch_refs: nil_tuple,
-      raft_enabled: false, durability_mode: :quorum,
+      hot_cache_max_value_size: 65_536,
+      sync_flush_timeout_ms: 5_000,
+      max_active_file_size: 64 * 1024 * 1024,
+      read_sample_rate: 1,
+      eviction_policy: :volatile_lfu,
+      max_memory_bytes: 1_073_741_824,
+      keydir_max_ram: 256 * 1024 * 1024,
+      memory_limit: 1_073_741_824,
+      keydir_binary_bytes: :atomics.new(n, signed: true),
+      latch_refs: nil_tuple,
+      durability_mode: :quorum,
       hotness_table: :ets.new(:test_hotness, [:set, :public]),
       config_table: :ets.new(:test_config, [:set, :public]),
-      connected_clients_fn: fn -> 0 end, process_rss_fn: nil,
-      server_info_fn: fn -> %{} end, raft_apply_hook: nil
+      connected_clients_fn: fn -> 0 end,
+      process_rss_fn: nil,
+      server_info_fn: fn -> %{} end,
+      raft_apply_hook: nil
     }
   end
 end

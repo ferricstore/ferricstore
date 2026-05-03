@@ -79,7 +79,6 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
       key = "#{@ns}:ctx_probe"
 
       assert ctx().name == :default
-      refute Map.has_key?(ctx(), :raft_enabled)
       assert Router.durability_for_key_public(ctx(), key) == :async
     end
 

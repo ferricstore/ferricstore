@@ -96,11 +96,6 @@ defmodule FerricStore.Instance do
   """
   @spec build(atom(), keyword()) :: t()
   def build(name, opts) do
-    if Keyword.has_key?(opts, :raft_enabled) do
-      raise ArgumentError,
-            ":raft_enabled is not supported; Raft is owned by the default application instance"
-    end
-
     shard_count = Keyword.get(opts, :shard_count, 4)
     data_dir = Keyword.get(opts, :data_dir, "data")
 

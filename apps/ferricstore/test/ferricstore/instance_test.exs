@@ -45,44 +45,6 @@ defmodule Ferricstore.InstanceTest do
 
       assert {:ok, "from-a"} = EmbeddedA.get("same-key")
       assert {:ok, "from-b"} = EmbeddedB.get("same-key")
-      refute Map.has_key?(EmbeddedA.__instance__(), :raft_enabled)
-      refute Map.has_key?(EmbeddedB.__instance__(), :raft_enabled)
-    end
-
-    test "custom instances reject the raft_enabled option" do
-      root =
-        Path.join(
-          System.tmp_dir!(),
-          "ferricstore_embedded_raft_#{System.unique_integer([:positive])}"
-        )
-
-      File.rm_rf!(root)
-
-      on_exit(fn ->
-        File.rm_rf(root)
-      end)
-
-      assert_raise ArgumentError,
-                   ~r/:raft_enabled is not supported for custom FerricStore instances/,
-                   fn ->
-                     Code.compile_string("""
-                     defmodule Ferricstore.InstanceTest.EmbeddedRaftRequested#{System.unique_integer([:positive])} do
-                       use FerricStore, shard_count: 1, raft_enabled: true
-                     end
-                     """)
-                   end
-
-      assert {:error, {:unsupported_custom_option, EmbeddedA, :raft_enabled}} =
-               EmbeddedA.start_link(
-                 data_dir: root,
-                 shard_count: 1,
-                 raft_enabled: false
-               )
-
-      ctx = FerricStore.Instance.get(:default)
-      key = "embedded-raft-guard:#{System.unique_integer([:positive])}"
-      assert :ok = Ferricstore.Store.Router.put(ctx, key, "default-still-runs", 0)
-      assert "default-still-runs" = Ferricstore.Store.Router.get(ctx, key)
     end
 
     test "custom instances default to non-Raft local mode" do
@@ -100,17 +62,8 @@ defmodule Ferricstore.InstanceTest do
       end)
 
       assert {:ok, _pid} = EmbeddedDefaultOptions.start_link(data_dir: root, shard_count: 1)
-      refute Map.has_key?(EmbeddedDefaultOptions.__instance__(), :raft_enabled)
       assert :ok = EmbeddedDefaultOptions.set("same-key", "local")
       assert {:ok, "local"} = EmbeddedDefaultOptions.get("same-key")
-    end
-
-    test "direct instance builds reject raft_enabled option" do
-      name = :"custom_direct_build_#{System.unique_integer([:positive])}"
-
-      assert_raise ArgumentError, ~r/:raft_enabled is not supported/, fn ->
-        FerricStore.Instance.build(name, shard_count: 1, raft_enabled: true)
-      end
     end
 
     test "custom instances start isolated merge schedulers" do

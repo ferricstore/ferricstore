@@ -151,21 +151,28 @@ defmodule FerricstoreServer.ShutdownTest do
         found =
           Enum.any?(log_files, fn log_name ->
             log_path = Path.join(shard_dir, log_name)
+
             case NIF.v2_scan_file(log_path) do
               {:ok, records} ->
                 # Find the last non-tombstone entry for this key
-                last = records
+                last =
+                  records
                   |> Enum.filter(fn {rk, _, _, _, _} -> rk == k end)
                   |> List.last()
+
                 case last do
                   {^k, offset, _, _, false} ->
                     case NIF.v2_pread_at(log_path, offset) do
                       {:ok, ^v} -> true
                       _ -> false
                     end
-                  _ -> false
+
+                  _ ->
+                    false
                 end
-              _ -> false
+
+              _ ->
+                false
             end
           end)
 
@@ -209,14 +216,14 @@ defmodule FerricstoreServer.ShutdownTest do
     test "starting and stopping an isolated shard preserves written data" do
       # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
 
-
       # Start a shard outside the application supervisor tree with a
       # unique index and temporary directory to avoid conflicts.
-      tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_shutdown_iso_#{:rand.uniform(9_999_999)}")
+      tmp_dir =
+        Path.join(System.tmp_dir!(), "ferricstore_shutdown_iso_#{:rand.uniform(9_999_999)}")
+
       File.mkdir_p!(tmp_dir)
 
       on_exit(fn ->
-
         File.rm_rf(tmp_dir)
       end)
 
@@ -255,13 +262,12 @@ defmodule FerricstoreServer.ShutdownTest do
     test "after shutdown signal, pending writes are flushed" do
       # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
 
-
       # Start an isolated shard so we can stop it without affecting the
       # application supervisor tree.
       tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_term_flush_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(tmp_dir)
-      on_exit(fn ->
 
+      on_exit(fn ->
         File.rm_rf(tmp_dir)
       end)
 
@@ -296,11 +302,10 @@ defmodule FerricstoreServer.ShutdownTest do
     test "after shutdown, hint files exist on disk" do
       # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
 
-
       tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_term_hint_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(tmp_dir)
-      on_exit(fn ->
 
+      on_exit(fn ->
         File.rm_rf(tmp_dir)
       end)
 
@@ -330,11 +335,10 @@ defmodule FerricstoreServer.ShutdownTest do
     test "shard terminate/2 emits [:ferricstore, :shard, :shutdown] telemetry" do
       # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
 
-
       tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_term_telem_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(tmp_dir)
-      on_exit(fn ->
 
+      on_exit(fn ->
         File.rm_rf(tmp_dir)
       end)
 
@@ -361,7 +365,7 @@ defmodule FerricstoreServer.ShutdownTest do
       GenServer.stop(pid, :normal, 5_000)
 
       assert_receive {:telemetry_event, [:ferricstore, :shard, :shutdown], measurements,
-                       metadata},
+                      metadata},
                      1_000
 
       assert is_integer(measurements.flush_duration_us)
@@ -375,6 +379,7 @@ defmodule FerricstoreServer.ShutdownTest do
   defp minimal_instance_ctx(data_dir) do
     n = 128
     nil_tuple = List.to_tuple(List.duplicate(nil, n))
+
     %FerricStore.Instance{
       name: :"shutdown_test_#{:erlang.unique_integer([:positive])}",
       data_dir: data_dir,
@@ -401,7 +406,6 @@ defmodule FerricstoreServer.ShutdownTest do
       memory_limit: 1_073_741_824,
       keydir_binary_bytes: :atomics.new(n, signed: true),
       latch_refs: nil_tuple,
-      raft_enabled: false,
       durability_mode: :quorum,
       hotness_table: :ets.new(:test_hotness, [:set, :public]),
       config_table: :ets.new(:test_config, [:set, :public]),

@@ -20,11 +20,6 @@ defmodule FerricStore.Macro do
   """
 
   defmacro __using__(opts) do
-    if Keyword.has_key?(opts, :raft_enabled) do
-      raise ArgumentError,
-            ":raft_enabled is not supported for custom FerricStore instances; Raft is owned by the default application instance"
-    end
-
     # credo:disable-for-next-line Credo.Check.Refactor.LongQuoteBlocks
     quote do
       @ferricstore_opts unquote(opts)

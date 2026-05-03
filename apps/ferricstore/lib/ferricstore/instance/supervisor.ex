@@ -19,13 +19,7 @@ defmodule FerricStore.Instance.Supervisor do
   """
   @spec start_link(atom(), keyword()) :: Supervisor.on_start()
   def start_link(name, opts) do
-    case normalize_raft_opts(name, opts) do
-      {:ok, opts} ->
-        Supervisor.start_link(__MODULE__, {name, opts}, name: :"#{name}.Supervisor")
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+    Supervisor.start_link(__MODULE__, {name, opts}, name: :"#{name}.Supervisor")
   end
 
   @impl true
@@ -97,15 +91,5 @@ defmodule FerricStore.Instance.Supervisor do
         ]
 
     Supervisor.init(children, strategy: :one_for_one, max_restarts: 20, max_seconds: 10)
-  end
-
-  defp normalize_raft_opts(:default, opts), do: {:ok, opts}
-
-  defp normalize_raft_opts(name, opts) do
-    if Keyword.has_key?(opts, :raft_enabled) do
-      {:error, {:unsupported_custom_option, name, :raft_enabled}}
-    else
-      {:ok, opts}
-    end
   end
 end
