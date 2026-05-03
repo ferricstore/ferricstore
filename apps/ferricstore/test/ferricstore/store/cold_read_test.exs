@@ -61,4 +61,17 @@ defmodule Ferricstore.Store.ColdReadTest do
 
     refute_received _
   end
+
+  test "pread_batch uses same-path submit shape when every read hits one file" do
+    path = "/tmp/ferricstore-00001.log"
+
+    assert {:single_path, ^path, [10, 20, 30]} =
+             ColdRead.pread_batch_submit_shape([{path, 10}, {path, 20}, {path, 30}])
+  end
+
+  test "pread_batch keeps mixed-path submit shape unchanged" do
+    locations = [{"/tmp/00001.log", 10}, {"/tmp/00002.log", 20}]
+
+    assert {:multi_path, ^locations} = ColdRead.pread_batch_submit_shape(locations)
+  end
 end

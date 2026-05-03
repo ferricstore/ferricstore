@@ -33,9 +33,35 @@ defmodule Ferricstore.Store.ColdRead do
   def pread_batch(locations, timeout_ms) do
     await_tokio(
       fn proxy, corr_id ->
-        NIF.v2_pread_batch_async(proxy, corr_id, locations)
+        case pread_batch_submit_shape(locations) do
+          {:single_path, path, offsets} ->
+            NIF.v2_pread_batch_path_async(proxy, corr_id, path, offsets)
+
+          {:multi_path, locations} ->
+            NIF.v2_pread_batch_async(proxy, corr_id, locations)
+        end
       end,
       timeout_ms
     )
   end
+
+  @doc false
+  @spec pread_batch_submit_shape([{binary(), non_neg_integer()}]) ::
+          {:single_path, binary(), [non_neg_integer()]}
+          | {:multi_path, [{binary(), non_neg_integer()}]}
+  def pread_batch_submit_shape([{path, offset} | rest] = locations) do
+    same_path_offsets(rest, path, [offset], locations)
+  end
+
+  def pread_batch_submit_shape(locations), do: {:multi_path, locations}
+
+  defp same_path_offsets([{path, offset} | rest], path, offsets, locations) do
+    same_path_offsets(rest, path, [offset | offsets], locations)
+  end
+
+  defp same_path_offsets([], path, offsets, _locations) do
+    {:single_path, path, Enum.reverse(offsets)}
+  end
+
+  defp same_path_offsets(_rest, _path, _offsets, locations), do: {:multi_path, locations}
 end

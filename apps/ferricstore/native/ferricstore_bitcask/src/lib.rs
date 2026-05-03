@@ -1091,6 +1091,42 @@ fn apply_grouped_pread_results(
     }
 }
 
+fn send_pread_batch_result(
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    result: Result<Vec<Option<Vec<u8>>>, String>,
+) {
+    let mut msg_env = rustler::OwnedEnv::new();
+    let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+        Ok(values) => {
+            let results: Vec<Term> = values
+                .into_iter()
+                .map(|opt| match opt {
+                    Some(value) => {
+                        let resource = ResourceArc::new(ValueBuffer { data: value });
+                        resource.make_binary(env, |vb| &vb.data).encode(env)
+                    }
+                    None => atoms::nil().encode(env),
+                })
+                .collect();
+            (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::ok(),
+                results,
+            )
+                .encode(env)
+        }
+        Err(reason) => (
+            atoms::tokio_complete(),
+            correlation_id,
+            atoms::error(),
+            reason.as_str(),
+        )
+            .encode(env),
+    });
+}
+
 #[cfg(test)]
 fn pread_batch_grouped(locations: Vec<(String, u64)>) -> Result<Vec<Option<Vec<u8>>>, String> {
     let (count, groups) = group_pread_locations(locations);
@@ -1101,6 +1137,32 @@ fn pread_batch_grouped(locations: Vec<(String, u64)>) -> Result<Vec<Option<Vec<u
     }
 
     Ok(values)
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_pread_batch_path_async(
+    env: Env<'_>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+    offsets: Vec<u64>,
+) -> NifResult<Term<'_>> {
+    async_io::runtime().spawn(async move {
+        let count = offsets.len();
+        let reads: Vec<(usize, u64)> = offsets.into_iter().enumerate().collect();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut values = vec![None; count];
+            apply_grouped_pread_results(&mut values, pread_batch_for_path(path, reads)?);
+            Ok(values)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        send_pread_batch_result(caller_pid, correlation_id, result);
+    });
+    Ok(atoms::ok().encode(env))
 }
 
 #[rustler::nif(schedule = "Normal")]
@@ -1140,35 +1202,7 @@ fn v2_pread_batch_async(
             }
         }
 
-        let mut msg_env = rustler::OwnedEnv::new();
-        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
-            Ok(values) => {
-                let results: Vec<Term> = values
-                    .into_iter()
-                    .map(|opt| match opt {
-                        Some(value) => {
-                            let resource = ResourceArc::new(ValueBuffer { data: value });
-                            resource.make_binary(env, |vb| &vb.data).encode(env)
-                        }
-                        None => atoms::nil().encode(env),
-                    })
-                    .collect();
-                (
-                    atoms::tokio_complete(),
-                    correlation_id,
-                    atoms::ok(),
-                    results,
-                )
-                    .encode(env)
-            }
-            Err(reason) => (
-                atoms::tokio_complete(),
-                correlation_id,
-                atoms::error(),
-                reason.as_str(),
-            )
-                .encode(env),
-        });
+        send_pread_batch_result(caller_pid, correlation_id, result);
     });
     Ok(atoms::ok().encode(env))
 }

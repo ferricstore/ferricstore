@@ -866,6 +866,23 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   # ---------------------------------------------------------------------------
 
   describe "v2_pread_batch_async NIF" do
+    test "same-path async batch pread returns values in offset order" do
+      dir = Path.join(System.tmp_dir!(), "async_pread_batch_path_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "00000.log")
+
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      {:ok, {off1, _}} = NIF.v2_append_record(path, "batch_path_1", "one", 0)
+      {:ok, {off2, _}} = NIF.v2_append_tombstone(path, "batch_path_deleted")
+      {:ok, {off3, _}} = NIF.v2_append_record(path, "batch_path_3", "three", 0)
+
+      corr_id = 100
+      :ok = NIF.v2_pread_batch_path_async(self(), corr_id, path, [off3, off2, off1])
+
+      assert_receive {:tokio_complete, ^corr_id, :ok, ["three", nil, "one"]}, 5000
+    end
+
     test "surfaces CRC errors instead of returning nil" do
       dir = Path.join(System.tmp_dir!(), "async_pread_batch_crc_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(dir)
