@@ -1471,6 +1471,65 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
         Process.flag(:trap_exit, previous_trap_exit)
       end
     end
+
+    test "drops tombstone-only files when older files do not contain masked keys" do
+      previous_trap_exit = Process.flag(:trap_exit, true)
+      dir = Path.join(System.tmp_dir!(), "unneeded_tombstone_drop_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+
+      name = :"unneeded_tombstone_drop_#{:erlang.unique_integer([:positive])}"
+
+      ctx =
+        FerricStore.Instance.build(name,
+          data_dir: dir,
+          shard_count: 1
+        )
+
+      try do
+        :ok = Ferricstore.DataDir.ensure_layout!(dir, 1)
+        shard_dir = Ferricstore.DataDir.shard_data_path(dir, 0)
+
+        log0 = Path.join(shard_dir, "00000.log")
+        log1 = Path.join(shard_dir, "00001.log")
+        log2 = Path.join(shard_dir, "00002.log")
+
+        {:ok, [_]} = NIF.v2_append_batch(log0, [{"b", "live", 0}])
+        {:ok, _} = NIF.v2_append_tombstone(log1, "a")
+        File.touch!(log2)
+
+        {:ok, pid1} =
+          Shard.start_link(
+            index: 0,
+            data_dir: dir,
+            flush_interval_ms: 5000,
+            instance_ctx: ctx
+          )
+
+        assert nil == GenServer.call(pid1, {:get, "a"})
+        assert "live" == GenServer.call(pid1, {:get, "b"})
+
+        assert {:ok, {0, 0, reclaimed1}} = GenServer.call(pid1, {:run_compaction, [1]})
+        assert reclaimed1 > 0
+        refute File.exists?(log1)
+
+        :ok = GenServer.stop(pid1, :normal, 5_000)
+
+        pid2 = restart_shard(dir, ctx, 5000)
+        assert nil == GenServer.call(pid2, {:get, "a"})
+        assert "live" == GenServer.call(pid2, {:get, "b"})
+      after
+        case Process.whereis(Router.shard_name(ctx, 0)) do
+          pid when is_pid(pid) ->
+            cleanup_shard(pid, ctx, dir)
+
+          _ ->
+            FerricStore.Instance.cleanup(ctx.name)
+            File.rm_rf(dir)
+        end
+
+        Process.flag(:trap_exit, previous_trap_exit)
+      end
+    end
   end
 
   describe "file size accounting" do

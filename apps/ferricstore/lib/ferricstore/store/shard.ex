@@ -736,7 +736,7 @@ defmodule Ferricstore.Store.Shard do
             if tombstone_file?(source) do
               remove_hint_for_file(sp, fid)
 
-              if tombstone_file_still_needed?(sp, fid) do
+              if tombstone_file_still_needed?(sp, fid, source) do
                 {written, dropped, reclaimed, compacted, [fid | skipped], failures}
               else
                 _ = Ferricstore.FS.rm(source)
@@ -947,24 +947,55 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # A tombstone-only file protects deleted keys from older log files. Once no
-  # lower file id remains, there is nothing left for those tombstones to mask.
-  defp tombstone_file_still_needed?(shard_path, fid) do
-    case Ferricstore.FS.ls(shard_path) do
-      {:ok, files} ->
-        Enum.any?(files, fn name ->
-          with true <- String.ends_with?(name, ".log"),
-               false <- String.starts_with?(name, "compact_"),
-               {other_fid, ""} <- Integer.parse(String.trim_trailing(name, ".log")) do
-            other_fid < fid
-          else
-            _ -> false
-          end
-        end)
-
-      _ ->
-        true
+  # A tombstone-only file protects deleted keys only when older log history
+  # still contains a live version of one of those keys. Keeping the file just
+  # because any lower fid exists leaks tombstone-only logs for unrelated keys.
+  defp tombstone_file_still_needed?(shard_path, fid, tombstone_path) do
+    with {:ok, tombstones} <- NIF.v2_scan_tombstones(tombstone_path),
+         masked_keys =
+           MapSet.new(tombstones, fn {key, _offset, _record_size, _expire_at_ms} -> key end),
+         false <- MapSet.size(masked_keys) == 0,
+         {:ok, files} <- Ferricstore.FS.ls(shard_path),
+         {:ok, states} <- scan_lower_tombstone_key_states(shard_path, files, fid, masked_keys) do
+      Enum.any?(masked_keys, fn key -> Map.get(states, key) == :live end)
+    else
+      true -> false
+      _ -> true
     end
+  end
+
+  defp scan_lower_tombstone_key_states(shard_path, files, fid, masked_keys) do
+    files
+    |> Enum.flat_map(fn name ->
+      with true <- String.ends_with?(name, ".log"),
+           false <- String.starts_with?(name, "compact_"),
+           {other_fid, ""} <- Integer.parse(String.trim_trailing(name, ".log")),
+           true <- other_fid < fid do
+        [{other_fid, Path.join(shard_path, name)}]
+      else
+        _ -> []
+      end
+    end)
+    |> Enum.sort_by(fn {other_fid, _path} -> other_fid end)
+    |> Enum.reduce_while({:ok, %{}}, fn {_other_fid, path}, {:ok, states} ->
+      case NIF.v2_scan_file(path) do
+        {:ok, records} ->
+          next_states =
+            Enum.reduce(records, states, fn {key, _offset, _value_size, _expire_at_ms, tombstone?},
+                                            acc ->
+              if MapSet.member?(masked_keys, key) do
+                Map.put(acc, key, if(tombstone?, do: :tombstone, else: :live))
+              else
+                acc
+              end
+            end)
+
+          {:cont, {:ok, next_states}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp tombstone_offsets(path) do
