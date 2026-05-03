@@ -95,6 +95,38 @@ defmodule Ferricstore.Store.ShardETSTest do
     end
   end
 
+  test "warm lookup rejects mismatched cold offsets" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+
+    dir =
+      Path.join(System.tmp_dir!(), "shard_ets_warm_stale_#{System.unique_integer([:positive])}")
+
+    key = "ets:warm:stale-offset"
+    other_key = "ets:warm:other-offset"
+    path = ShardETS.file_path(dir, 0)
+
+    state = %{
+      keydir: keydir,
+      shard_data_path: dir,
+      instance_ctx: %{hot_cache_max_value_size: 64}
+    }
+
+    try do
+      File.mkdir_p!(dir)
+
+      {:ok, [{other_offset, _}, {_key_offset, value_size}]} =
+        NIF.v2_append_batch(path, [{other_key, "wrong-value", 0}, {key, "right-value", 0}])
+
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
+
+      assert :miss == ShardETS.ets_lookup_warm(state, key)
+      assert [{^key, nil, 0, _lfu, 0, ^other_offset, ^value_size}] = :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+      File.rm_rf!(dir)
+    end
+  end
+
   test "warm_from_store rejects malformed cold location without calling NIF" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
     key = "ets:warm-store:bad-offset"
@@ -112,6 +144,38 @@ defmodule Ferricstore.Store.ShardETSTest do
       assert [] == :ets.lookup(keydir, key)
     after
       :ets.delete(keydir)
+    end
+  end
+
+  test "warm_from_store rejects mismatched cold offsets" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+
+    dir =
+      Path.join(System.tmp_dir!(), "shard_ets_store_stale_#{System.unique_integer([:positive])}")
+
+    key = "ets:warm-store:stale-offset"
+    other_key = "ets:warm-store:other-offset"
+    path = ShardETS.file_path(dir, 0)
+
+    state = %{
+      keydir: keydir,
+      shard_data_path: dir,
+      instance_ctx: %{hot_cache_max_value_size: 64}
+    }
+
+    try do
+      File.mkdir_p!(dir)
+
+      {:ok, [{other_offset, _}, {_key_offset, value_size}]} =
+        NIF.v2_append_batch(path, [{other_key, "wrong-value", 0}, {key, "right-value", 0}])
+
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
+
+      assert nil == ShardETS.warm_from_store(state, key)
+      assert [{^key, nil, 0, _lfu, 0, ^other_offset, ^value_size}] = :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+      File.rm_rf!(dir)
     end
   end
 

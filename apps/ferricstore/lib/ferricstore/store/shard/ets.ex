@@ -79,7 +79,7 @@ defmodule Ferricstore.Store.Shard.ETS do
       {:cold, fid, off, _vsize, exp} ->
         p = file_path(state.shard_data_path, fid)
 
-        case read_cold_async(p, off) do
+        case read_cold_async(p, off, key) do
           {:ok, value} when is_binary(value) ->
             cold_read_warm_ets(state, key, value)
             {:hit, value, exp}
@@ -323,7 +323,7 @@ defmodule Ferricstore.Store.Shard.ETS do
       [{^key, nil, exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         p = file_path(state.shard_data_path, fid)
 
-        case read_cold_async(p, off) do
+        case read_cold_async(p, off, key) do
           {:ok, value} when is_binary(value) ->
             v = value_for_ets(value, hot_cache_threshold(state))
             track_binary_cold_to_warm(state, key, v)
@@ -353,7 +353,7 @@ defmodule Ferricstore.Store.Shard.ETS do
       [{^key, nil, exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         p = file_path(state.shard_data_path, fid)
 
-        case read_cold_async(p, off) do
+        case read_cold_async(p, off, key) do
           {:ok, value} when is_binary(value) ->
             v = value_for_ets(value, hot_cache_threshold(state))
             track_binary_cold_to_warm(state, key, v)
@@ -492,8 +492,8 @@ defmodule Ferricstore.Store.Shard.ETS do
     end)
   end
 
-  defp read_cold_async(path, offset) do
-    Ferricstore.Store.ColdRead.pread_at(path, offset, @cold_batch_read_timeout_ms)
+  defp read_cold_async(path, offset, key) do
+    Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_batch_read_timeout_ms)
   end
 
   @spec prefix_count_entries(map() | :ets.tid(), binary()) :: non_neg_integer()
