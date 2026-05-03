@@ -161,7 +161,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
       Enum.zip(entries, values)
       |> Enum.map(fn
-        {{state, compound_key, _file_path, fid, off, vsize, exp}, value} when value != nil ->
+        {{state, compound_key, _file_path, fid, off, vsize, exp}, value} when is_binary(value) ->
           ShardETS.cold_read_warm_ets(state, compound_key, value, exp, fid, off, vsize)
           value
 
@@ -1028,7 +1028,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
     Enum.zip(entries, values)
     |> Enum.map(fn
-      {{key, exp, _file_path, _off}, value} when value != nil -> {key, value, exp}
+      {{key, exp, _file_path, _off}, value} when is_binary(value) -> {key, value, exp}
       {_entry, _value} -> nil
     end)
   end

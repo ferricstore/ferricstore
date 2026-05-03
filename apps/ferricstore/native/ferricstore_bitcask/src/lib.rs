@@ -1290,23 +1290,57 @@ fn validate_grouped_keyed_pread_groups(
     Ok(count)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BatchReadValue {
+    Value(Vec<u8>),
+    Nil,
+    Error(String),
+}
+
+impl BatchReadValue {
+    #[cfg(test)]
+    fn as_deref(&self) -> Option<&[u8]> {
+        match self {
+            BatchReadValue::Value(value) => Some(value.as_slice()),
+            BatchReadValue::Nil | BatchReadValue::Error(_) => None,
+        }
+    }
+}
+
+fn missing_file_results<I>(path: &str, reads: I) -> Vec<(usize, BatchReadValue)>
+where
+    I: IntoIterator<Item = usize>,
+{
+    reads
+        .into_iter()
+        .map(|index| {
+            (
+                index,
+                BatchReadValue::Error(format!("missing_file: {path}")),
+            )
+        })
+        .collect()
+}
+
 fn pread_batch_for_path(
     path: String,
     reads: Vec<(usize, u64)>,
-) -> Result<Vec<(usize, Option<Vec<u8>>)>, String> {
-    let nil_results: Vec<(usize, Option<Vec<u8>>)> = reads
-        .iter()
-        .map(|(index, _offset)| (*index, None))
-        .collect();
+) -> Result<Vec<(usize, BatchReadValue)>, String> {
+    let read_count = reads.len();
 
     let file = match std::fs::File::open(std::path::Path::new(&path)) {
         Ok(file) => file,
-        Err(_e) => return Ok(nil_results),
+        Err(_e) => {
+            return Ok(missing_file_results(
+                &path,
+                reads.into_iter().map(|(index, _offset)| index),
+            ))
+        }
     };
 
     fadvise_random(&file);
 
-    let mut results = Vec::with_capacity(reads.len());
+    let mut results = Vec::with_capacity(read_count);
 
     for (index, offset) in sort_reads_by_offset(reads) {
         let value = match log::pread_record_from_file(&file, offset) {
@@ -1315,10 +1349,13 @@ fn pread_batch_for_path(
                     + record.key.len()
                     + record.value.as_ref().map_or(0, Vec::len)) as i64;
                 fadvise_dontneed(&file, offset as i64, size);
-                record.value
+                record
+                    .value
+                    .map(BatchReadValue::Value)
+                    .unwrap_or(BatchReadValue::Nil)
             }
-            Ok(None) => None,
-            Err(_e) => return Ok(nil_results),
+            Ok(None) => BatchReadValue::Nil,
+            Err(e) => BatchReadValue::Error(e.to_string()),
         };
 
         results.push((index, value));
@@ -1330,20 +1367,24 @@ fn pread_batch_for_path(
 fn pread_batch_for_path_keyed(
     path: String,
     reads: Vec<(usize, u64, Vec<u8>)>,
-) -> Result<Vec<(usize, Option<Vec<u8>>)>, String> {
-    let nil_results: Vec<(usize, Option<Vec<u8>>)> = reads
-        .iter()
-        .map(|(index, _offset, _expected_key)| (*index, None))
-        .collect();
+) -> Result<Vec<(usize, BatchReadValue)>, String> {
+    let read_count = reads.len();
 
     let file = match std::fs::File::open(std::path::Path::new(&path)) {
         Ok(file) => file,
-        Err(_e) => return Ok(nil_results),
+        Err(_e) => {
+            return Ok(missing_file_results(
+                &path,
+                reads
+                    .into_iter()
+                    .map(|(index, _offset, _expected_key)| index),
+            ))
+        }
     };
 
     fadvise_random(&file);
 
-    let mut results = Vec::with_capacity(reads.len());
+    let mut results = Vec::with_capacity(read_count);
 
     for (index, offset, expected_key) in sort_keyed_reads_by_offset(reads) {
         let value = match log::pread_record_from_file(&file, offset) {
@@ -1354,13 +1395,16 @@ fn pread_batch_for_path_keyed(
                 fadvise_dontneed(&file, offset as i64, size);
 
                 if record.key == expected_key {
-                    record.value
+                    record
+                        .value
+                        .map(BatchReadValue::Value)
+                        .unwrap_or(BatchReadValue::Nil)
                 } else {
-                    None
+                    BatchReadValue::Nil
                 }
             }
-            Ok(None) => None,
-            Err(_e) => return Ok(nil_results),
+            Ok(None) => BatchReadValue::Nil,
+            Err(e) => BatchReadValue::Error(e.to_string()),
         };
 
         results.push((index, value));
@@ -1380,8 +1424,8 @@ fn sort_keyed_reads_by_offset(mut reads: Vec<(usize, u64, Vec<u8>)>) -> Vec<(usi
 }
 
 fn apply_grouped_pread_results(
-    values: &mut [Option<Vec<u8>>],
-    results: Vec<(usize, Option<Vec<u8>>)>,
+    values: &mut [BatchReadValue],
+    results: Vec<(usize, BatchReadValue)>,
 ) {
     for (index, value) in results {
         if let Some(slot) = values.get_mut(index) {
@@ -1393,19 +1437,20 @@ fn apply_grouped_pread_results(
 fn send_pread_batch_result(
     caller_pid: LocalPid,
     correlation_id: u64,
-    result: Result<Vec<Option<Vec<u8>>>, String>,
+    result: Result<Vec<BatchReadValue>, String>,
 ) {
     let mut msg_env = rustler::OwnedEnv::new();
     let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
         Ok(values) => {
             let results: Vec<Term> = values
                 .into_iter()
-                .map(|opt| match opt {
-                    Some(value) => {
+                .map(|value| match value {
+                    BatchReadValue::Value(value) => {
                         let resource = ResourceArc::new(ValueBuffer { data: value });
                         resource.make_binary(env, |vb| &vb.data).encode(env)
                     }
-                    None => atoms::nil().encode(env),
+                    BatchReadValue::Nil => atoms::nil().encode(env),
+                    BatchReadValue::Error(reason) => (atoms::error(), reason.as_str()).encode(env),
                 })
                 .collect();
             (
@@ -1427,9 +1472,9 @@ fn send_pread_batch_result(
 }
 
 #[cfg(test)]
-fn pread_batch_grouped(locations: Vec<(String, u64)>) -> Result<Vec<Option<Vec<u8>>>, String> {
+fn pread_batch_grouped(locations: Vec<(String, u64)>) -> Result<Vec<BatchReadValue>, String> {
     let (count, groups) = group_pread_locations(locations);
-    let mut values = vec![None; count];
+    let mut values = vec![BatchReadValue::Nil; count];
 
     for (path, reads) in groups {
         apply_grouped_pread_results(&mut values, pread_batch_for_path(path, reads)?);
@@ -1441,7 +1486,7 @@ fn pread_batch_grouped(locations: Vec<(String, u64)>) -> Result<Vec<Option<Vec<u
 #[cfg(test)]
 fn pread_batch_grouped_keyed(
     locations: Vec<(String, u64, Vec<u8>)>,
-) -> Result<Vec<Option<Vec<u8>>>, String> {
+) -> Result<Vec<BatchReadValue>, String> {
     let count = locations.len();
     let mut grouped: std::collections::HashMap<String, Vec<(usize, u64, Vec<u8>)>> =
         std::collections::HashMap::new();
@@ -1453,7 +1498,7 @@ fn pread_batch_grouped_keyed(
             .push((index, offset, expected_key));
     }
 
-    let mut values = vec![None; count];
+    let mut values = vec![BatchReadValue::Nil; count];
 
     for (path, reads) in grouped {
         apply_grouped_pread_results(&mut values, pread_batch_for_path_keyed(path, reads)?);
@@ -1476,7 +1521,7 @@ fn v2_pread_batch_path_async(
         let reads: Vec<(usize, u64)> = offsets.into_iter().enumerate().collect();
 
         let result = tokio::task::spawn_blocking(move || {
-            let mut values = vec![None; count];
+            let mut values = vec![BatchReadValue::Nil; count];
             apply_grouped_pread_results(&mut values, pread_batch_for_path(path, reads)?);
             Ok(values)
         })
@@ -1506,7 +1551,7 @@ fn v2_pread_batch_path_key_async<'a>(
 
     async_io::runtime().spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
-            let mut values = vec![None; count];
+            let mut values = vec![BatchReadValue::Nil; count];
             apply_grouped_pread_results(&mut values, pread_batch_for_path_keyed(path, reads)?);
             Ok(values)
         })
@@ -1536,7 +1581,7 @@ fn v2_pread_batch_async(
             }));
         }
 
-        let mut result: Result<Vec<Option<Vec<u8>>>, String> = Ok(vec![None; count]);
+        let mut result: Result<Vec<BatchReadValue>, String> = Ok(vec![BatchReadValue::Nil; count]);
         for handle in handles {
             match handle.await {
                 Ok(Ok(results)) => {
@@ -1585,7 +1630,7 @@ fn v2_pread_batch_grouped_async(
             }));
         }
 
-        let mut result: Result<Vec<Option<Vec<u8>>>, String> = Ok(vec![None; count]);
+        let mut result: Result<Vec<BatchReadValue>, String> = Ok(vec![BatchReadValue::Nil; count]);
         for handle in handles {
             match handle.await {
                 Ok(Ok(results)) => {
@@ -1645,7 +1690,7 @@ fn v2_pread_batch_grouped_key_async<'a>(
             }));
         }
 
-        let mut result: Result<Vec<Option<Vec<u8>>>, String> = Ok(vec![None; count]);
+        let mut result: Result<Vec<BatchReadValue>, String> = Ok(vec![BatchReadValue::Nil; count]);
         for handle in handles {
             match handle.await {
                 Ok(Ok(results)) => {
@@ -2130,7 +2175,7 @@ mod audit_fix_tests {
 
         assert_eq!(values[0].as_deref(), Some(&b"vb0"[..]));
         assert_eq!(values[1].as_deref(), Some(&b"va1"[..]));
-        assert_eq!(values[2], None);
+        assert_eq!(values[2], BatchReadValue::Nil);
         assert_eq!(values[3].as_deref(), Some(&b"va0"[..]));
     }
 
@@ -2150,7 +2195,7 @@ mod audit_fix_tests {
         ])
         .unwrap();
 
-        assert_eq!(values[0], None);
+        assert!(matches!(values[0], BatchReadValue::Error(_)));
         assert_eq!(values[1].as_deref(), Some(&b"value"[..]));
     }
 
@@ -2186,9 +2231,9 @@ mod audit_fix_tests {
         ])
         .unwrap();
 
-        assert_eq!(values[0], None);
+        assert_eq!(values[0].as_deref(), Some(&b"value"[..]));
         assert_eq!(values[1].as_deref(), Some(&b"value"[..]));
-        assert_eq!(values[2], None);
+        assert!(matches!(values[2], BatchReadValue::Error(_)));
     }
 
     #[test]
@@ -2219,9 +2264,9 @@ mod audit_fix_tests {
         .unwrap();
 
         assert_eq!(values[0].as_deref(), Some(&b"vb0"[..]));
-        assert_eq!(values[1], None);
+        assert_eq!(values[1], BatchReadValue::Nil);
         assert_eq!(values[2].as_deref(), Some(&b"va0"[..]));
-        assert_eq!(values[3], None);
+        assert_eq!(values[3], BatchReadValue::Nil);
     }
 
     #[test]
@@ -2248,7 +2293,7 @@ mod audit_fix_tests {
         ])
         .unwrap();
 
-        assert_eq!(values[0], None);
+        assert!(matches!(values[0], BatchReadValue::Error(_)));
         assert_eq!(values[1].as_deref(), Some(&b"value"[..]));
     }
 
@@ -2296,9 +2341,9 @@ mod audit_fix_tests {
         ])
         .unwrap();
 
-        assert_eq!(values[0], None);
+        assert_eq!(values[0].as_deref(), Some(&b"value_before"[..]));
         assert_eq!(values[1].as_deref(), Some(&b"value"[..]));
-        assert_eq!(values[2], None);
+        assert!(matches!(values[2], BatchReadValue::Error(_)));
     }
 
     #[test]

@@ -908,7 +908,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert_receive {:tokio_complete, ^corr_id, :ok, ["a1", "b1", "a2"]}, 5000
     end
 
-    test "isolates CRC errors to nil results" do
+    test "isolates CRC errors to per-index error results" do
       dir = Path.join(System.tmp_dir!(), "async_pread_batch_crc_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(dir)
       path = Path.join(dir, "00000.log")
@@ -924,7 +924,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       corr_id = 101
       :ok = NIF.v2_pread_batch_async(self(), corr_id, [{path, offset}])
 
-      assert_receive {:tokio_complete, ^corr_id, :ok, [nil]}, 5000
+      assert_receive {:tokio_complete, ^corr_id, :ok, [{:error, reason}]}, 5000
+      assert reason =~ "CRC" or reason =~ "mismatch"
     end
   end
 

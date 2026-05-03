@@ -139,7 +139,38 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     assert [nil] == Router.batch_get(ctx, [key])
 
     assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
-                    %{path: ^path, reason: :nil_from_cold_location}}
+                    %{path: ^path, reason: :corrupt_record}}
+  end
+
+  test "batch cold reads emit telemetry when a cold file is missing", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_batch_missing_file:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    missing_path = Path.join(shard_path, "00009.log")
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 9, 0, 5})
+
+    parent = self()
+    handler_id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :bitcask, :pread_corrupt],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:pread_corrupt, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert [nil] == Router.batch_get(ctx, [key])
+
+    assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                    %{path: ^missing_path, reason: :missing_file}}
   end
 
   test "batch cold read corruption in one file does not hide valid keys from another file", %{
@@ -147,16 +178,30 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     keydir: keydir
   } do
     bad_key = "cold_batch_bad_file:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+
+    same_file_good_key =
+      "cold_batch_same_file_good:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+
     good_key = "cold_batch_good_file:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    same_file_good_value = "same-file-readable"
     good_value = "still-readable"
     shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
     bad_path = Path.join(shard_path, "00000.log")
     good_path = Path.join(shard_path, "00001.log")
 
+    {:ok, {same_file_good_offset, _same_file_good_record_size}} =
+      NIF.v2_append_record(bad_path, same_file_good_key, same_file_good_value, 0)
+
     {:ok, {bad_offset, _bad_record_size}} = NIF.v2_append_record(bad_path, bad_key, "bad", 0)
 
     {:ok, {good_offset, _good_record_size}} =
       NIF.v2_append_record(good_path, good_key, good_value, 0)
+
+    :ets.insert(
+      keydir,
+      {same_file_good_key, nil, 0, LFU.initial(), 0, same_file_good_offset,
+       byte_size(same_file_good_value)}
+    )
 
     :ets.insert(keydir, {bad_key, nil, 0, LFU.initial(), 0, bad_offset, 3})
     :ets.insert(keydir, {good_key, nil, 0, LFU.initial(), 1, good_offset, byte_size(good_value)})
@@ -166,7 +211,8 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     :ok = :file.pwrite(fd, corrupt_at, <<"X">>)
     :ok = :file.close(fd)
 
-    assert [nil, ^good_value] = Router.batch_get(ctx, [bad_key, good_key])
+    assert [^same_file_good_value, nil, ^good_value] =
+             Router.batch_get(ctx, [same_file_good_key, bad_key, good_key])
   end
 
   test "batch_get preserves mixed cold result order including empty values", %{

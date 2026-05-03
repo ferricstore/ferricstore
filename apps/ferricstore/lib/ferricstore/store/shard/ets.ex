@@ -487,7 +487,7 @@ defmodule Ferricstore.Store.Shard.ETS do
 
     Enum.zip(entries, values)
     |> Enum.map(fn
-      {{field, _key, _file_path, _off}, value} when value != nil -> {field, value}
+      {{field, _key, _file_path, _off}, value} when is_binary(value) -> {field, value}
       {_entry, _value} -> nil
     end)
   end

@@ -1856,7 +1856,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     Enum.zip(entries, values)
     |> Enum.map(fn
-      {{field, _key, _path, _off}, value} when value != nil -> {field, value}
+      {{field, _key, _path, _off}, value} when is_binary(value) -> {field, value}
       {_entry, _value} -> nil
     end)
   end
@@ -2003,7 +2003,7 @@ defmodule Ferricstore.Raft.StateMachine do
     cold_reads
     |> Enum.zip(values)
     |> Enum.reduce(results, fn
-      {{index, _key, _path, _off, exp}, value}, acc when value != nil ->
+      {{index, _key, _path, _off, exp}, value}, acc when is_binary(value) ->
         Map.put(acc, index, {value, exp})
 
       {_read, _value}, acc ->

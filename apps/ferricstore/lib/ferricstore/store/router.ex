@@ -1885,13 +1885,14 @@ defmodule Ferricstore.Store.Router do
       Enum.zip(entries, values)
       |> Enum.map_reduce(%{}, fn
         {{ctx, keydir, key, _path, file_id, offset}, value}, corrupt_by_path
-        when value != nil ->
+        when is_binary(value) ->
           Stats.record_cold_read(ctx, key)
           warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
           {value, corrupt_by_path}
 
-        {{_ctx, _keydir, _key, path, _file_id, _offset}, _value}, corrupt_by_path ->
-          corrupt_by_path = Map.update(corrupt_by_path, path, 1, &(&1 + 1))
+        {{_ctx, _keydir, _key, path, _file_id, _offset}, value}, corrupt_by_path ->
+          reason = cold_batch_read_error_reason(value)
+          corrupt_by_path = Map.update(corrupt_by_path, {path, reason}, 1, &(&1 + 1))
           {nil, corrupt_by_path}
       end)
 
@@ -1903,14 +1904,20 @@ defmodule Ferricstore.Store.Router do
     do: :ok
 
   defp emit_batch_cold_read_corruption(corrupt_by_path) do
-    Enum.each(corrupt_by_path, fn {path, count} ->
+    Enum.each(corrupt_by_path, fn {{path, reason}, count} ->
       :telemetry.execute(
         [:ferricstore, :bitcask, :pread_corrupt],
         %{count: count},
-        %{path: path, reason: :nil_from_cold_location}
+        %{path: path, reason: reason}
       )
     end)
   end
+
+  defp cold_batch_read_error_reason({:error, reason}) when is_binary(reason) do
+    if String.contains?(reason, "missing_file"), do: :missing_file, else: :corrupt_record
+  end
+
+  defp cold_batch_read_error_reason(_value), do: :nil_from_cold_location
 
   defp read_cold_async(path, offset, expected_key) do
     Ferricstore.Store.ColdRead.pread_at(path, offset, expected_key, @cold_batch_read_timeout_ms)
