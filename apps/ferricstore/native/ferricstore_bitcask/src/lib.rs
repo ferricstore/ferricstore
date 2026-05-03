@@ -1258,7 +1258,12 @@ fn pread_batch_for_path(
 ) -> Result<Vec<(usize, Option<Vec<u8>>)>, String> {
     let file = match std::fs::File::open(std::path::Path::new(&path)) {
         Ok(file) => file,
-        Err(e) => return Err(e.to_string()),
+        Err(_e) => {
+            return Ok(reads
+                .into_iter()
+                .map(|(index, _offset)| (index, None))
+                .collect())
+        }
     };
 
     fadvise_random(&file);
@@ -1290,7 +1295,12 @@ fn pread_batch_for_path_keyed(
 ) -> Result<Vec<(usize, Option<Vec<u8>>)>, String> {
     let file = match std::fs::File::open(std::path::Path::new(&path)) {
         Ok(file) => file,
-        Err(e) => return Err(e.to_string()),
+        Err(_e) => {
+            return Ok(reads
+                .into_iter()
+                .map(|(index, _offset, _expected_key)| (index, None))
+                .collect())
+        }
     };
 
     fadvise_random(&file);
@@ -1326,9 +1336,7 @@ fn sort_reads_by_offset(mut reads: Vec<(usize, u64)>) -> Vec<(usize, u64)> {
     reads
 }
 
-fn sort_keyed_reads_by_offset(
-    mut reads: Vec<(usize, u64, Vec<u8>)>,
-) -> Vec<(usize, u64, Vec<u8>)> {
+fn sort_keyed_reads_by_offset(mut reads: Vec<(usize, u64, Vec<u8>)>) -> Vec<(usize, u64, Vec<u8>)> {
     reads.sort_by_key(|(_index, offset, _expected_key)| *offset);
     reads
 }
@@ -2089,6 +2097,26 @@ mod audit_fix_tests {
     }
 
     #[test]
+    fn grouped_batch_pread_isolates_missing_files_to_their_indexes() {
+        let dir = tmp();
+        let good_path = dir.path().join("00000000000000000001.log");
+        let missing_path = dir.path().join("00000000000000000002.log");
+
+        let mut writer = log::LogWriter::open(&good_path, 1).unwrap();
+        let good_offset = writer.write(b"good", b"value", 0).unwrap();
+        writer.sync().unwrap();
+
+        let values = pread_batch_grouped(vec![
+            (missing_path.to_string_lossy().into_owned(), 0),
+            (good_path.to_string_lossy().into_owned(), good_offset),
+        ])
+        .unwrap();
+
+        assert_eq!(values[0], None);
+        assert_eq!(values[1].as_deref(), Some(&b"value"[..]));
+    }
+
+    #[test]
     fn keyed_batch_pread_filters_mismatched_offsets_without_reordering() {
         let dir = tmp();
         let path_a = dir.path().join("00000000000000000001.log");
@@ -2119,6 +2147,34 @@ mod audit_fix_tests {
         assert_eq!(values[1], None);
         assert_eq!(values[2].as_deref(), Some(&b"va0"[..]));
         assert_eq!(values[3], None);
+    }
+
+    #[test]
+    fn keyed_batch_pread_isolates_missing_files_to_their_indexes() {
+        let dir = tmp();
+        let good_path = dir.path().join("00000000000000000001.log");
+        let missing_path = dir.path().join("00000000000000000002.log");
+
+        let mut writer = log::LogWriter::open(&good_path, 1).unwrap();
+        let good_offset = writer.write(b"good", b"value", 0).unwrap();
+        writer.sync().unwrap();
+
+        let values = pread_batch_grouped_keyed(vec![
+            (
+                missing_path.to_string_lossy().into_owned(),
+                0,
+                b"missing".to_vec(),
+            ),
+            (
+                good_path.to_string_lossy().into_owned(),
+                good_offset,
+                b"good".to_vec(),
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(values[0], None);
+        assert_eq!(values[1].as_deref(), Some(&b"value"[..]));
     }
 
     #[test]
