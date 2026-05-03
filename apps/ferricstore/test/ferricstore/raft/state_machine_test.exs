@@ -290,10 +290,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
                :ets.lookup(ets, "old_origin_getset")
     end
 
-    test "does not replay origin GETSET over a newer local value", %{state: state, ets: ets} do
+    test "replays origin GETSET over an unaccepted pending local value", %{state: state, ets: ets} do
       :ets.insert(ets, {"future_origin_getset", "future", 0, 1, :pending, 0, 0})
 
-      {_state2, :ok} =
+      {_state2, "future"} =
         StateMachine.apply(
           %{},
           {:async, node(),
@@ -302,8 +302,27 @@ defmodule Ferricstore.Raft.StateMachineTest do
           state
         )
 
-      assert [{"future_origin_getset", "future", 0, _lfu, :pending, 0, 0}] =
+      assert [{"future_origin_getset", "new", 0, _lfu, 0, _off, 3}] =
                :ets.lookup(ets, "future_origin_getset")
+    end
+
+    test "does not replay origin GETSET over a durable newer local value", %{
+      state: state,
+      ets: ets
+    } do
+      :ets.insert(ets, {"durable_future_getset", "future", 0, 1, 0, 0, 6})
+
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "durable_future_getset", {:getset, "durable_future_getset", "new"},
+            "old", 0, "new", 0}},
+          state
+        )
+
+      assert [{"durable_future_getset", "future", 0, _lfu, 0, 0, 6}] =
+               :ets.lookup(ets, "durable_future_getset")
     end
 
     test "persists already-applied origin RMW when the local value is still pending", %{

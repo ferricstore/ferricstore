@@ -2581,7 +2581,14 @@ defmodule Ferricstore.Raft.StateMachine do
         :apply
 
       _other ->
-        :newer_local_value
+        if origin_pending_value?(state, key), do: :apply, else: :newer_local_value
+    end
+  end
+
+  defp origin_pending_value?(state, key) do
+    case :ets.lookup(state.ets, key) do
+      [{^key, _value, _expire_at_ms, _lfu, :pending, _off, _value_size}] -> true
+      _ -> false
     end
   end
 
