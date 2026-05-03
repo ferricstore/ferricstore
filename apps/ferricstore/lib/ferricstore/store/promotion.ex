@@ -345,14 +345,6 @@ defmodule Ferricstore.Store.Promotion do
       # compound keys back into the keydir from the shared log. We
       # simply leave them in place — by NOT overwriting them with
       # "missing from dedicated" we preserve the data.
-      live_count =
-        Enum.count(final_state, fn {_, entry} ->
-          case entry do
-            {:live, _, _, _, _, _} -> true
-            _ -> false
-          end
-        end)
-
       dedicated_keys = final_state |> Map.keys() |> MapSet.new()
 
       partial_dedicated? =
@@ -363,8 +355,10 @@ defmodule Ferricstore.Store.Promotion do
 
       dedicated_empty? = map_size(final_state) == 0
 
-      if live_count > 0 and not partial_dedicated? do
-        # Normal recovery path: dedicated has data, apply it.
+      if not dedicated_empty? and not partial_dedicated? do
+        # Normal recovery path: dedicated has a complete final state. Apply it
+        # even when that state is tombstone-only so stale shared rows cannot
+        # survive restart.
         Enum.each(final_state, fn
           {key, :tombstone} ->
             track_binary_delete(keydir, shard_index, key, instance_ctx)

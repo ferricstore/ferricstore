@@ -435,6 +435,33 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       end
     end
 
+    test "dedicated tombstone-only recovery removes stale shared rows", ctx do
+      redis_key = "user:tombstone-only"
+      field_key = CompoundKey.hash_field(redis_key, "name")
+      field_value = "stale_shared"
+
+      {:ok, {offset, value_size}} =
+        NIF.v2_append_record(ctx.active_path, field_key, field_value, 0)
+
+      :ets.insert(ctx.keydir, {field_key, field_value, 0, LFU.initial(), 0, offset, value_size})
+
+      type_str = CompoundKey.encode_type(:hash)
+      mk = Promotion.marker_key(redis_key)
+      {:ok, {moff, mvs}} = NIF.v2_append_record(ctx.active_path, mk, type_str, 0)
+      :ets.insert(ctx.keydir, {mk, type_str, 0, LFU.initial(), 0, moff, mvs})
+
+      {:ok, dedicated_path} =
+        Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+
+      dedicated_active = Promotion.find_active(dedicated_path)
+      {:ok, _delete_offset} = NIF.v2_append_tombstone(dedicated_active, field_key)
+
+      promoted = simulate_restart(ctx)
+
+      assert nil == Ops.compound_get(local_tx(ctx, promoted), redis_key, field_key)
+      assert [] == :ets.lookup(ctx.keydir, field_key)
+    end
+
     test "crash after step 3 (all three done) — same as full success", ctx do
       # This IS the full-success case, duplicated here for coverage
       # symmetry with the other crash points.
