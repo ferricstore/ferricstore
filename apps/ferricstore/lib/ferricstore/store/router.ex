@@ -3531,9 +3531,6 @@ defmodule Ferricstore.Store.Router do
         track_keydir_binary_delete(ctx, idx, keydir, compound_key)
         :ets.delete(keydir, compound_key)
 
-        {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
-        Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, compound_key)
-
         wv_size = :counters.info(ctx.write_version).size
         if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
 

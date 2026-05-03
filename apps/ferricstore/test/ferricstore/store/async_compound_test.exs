@@ -8,8 +8,9 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
   - Router.compound_put and Router.compound_delete dispatch on
     durability_for_key(ctx, redis_key). When the parent redis_key's
     namespace is configured async, the write goes through an async fast
-    path mirroring async_write_put: ETS + BitcaskWriter cast +
-    Batcher.async_enqueue, caller returns ~15-30μs.
+    path mirroring async_write_put: ETS + Batcher.async_enqueue, caller
+    returns ~15-30μs. Disk persistence is handled by state-machine apply
+    so origin deletes do not write duplicate tombstones.
 
   - Read-your-writes holds on the origin — the compound_key is in ETS
     before the caller gets :ok.
@@ -115,6 +116,31 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
 
       :ok = Router.compound_delete(ctx(), redis_key, ck)
       assert nil == Router.compound_get(ctx(), redis_key, ck)
+    end
+
+    test "small compound_delete writes one Bitcask tombstone on the origin" do
+      redis_key = ukey("hash_delete_single_tombstone")
+      ck = hash_field(redis_key, "name")
+      idx = Router.shard_for(ctx(), redis_key)
+      {_file_id, file_path, _shard_path} = Ferricstore.Store.ActiveFile.get(ctx(), idx)
+
+      :ok = Router.compound_put(ctx(), redis_key, ck, "alice", 0)
+      :ok = Batcher.flush(idx)
+      :ok = Ferricstore.Store.BitcaskWriter.flush(idx)
+
+      :ok = Router.compound_delete(ctx(), redis_key, ck)
+      :ok = Batcher.flush(idx)
+      :ok = Ferricstore.Store.BitcaskWriter.flush(idx)
+
+      assert {:ok, records} = NIF.v2_scan_file(file_path)
+
+      tombstones =
+        Enum.count(records, fn
+          {^ck, _off, _size, _exp, true} -> true
+          _ -> false
+        end)
+
+      assert tombstones == 1
     end
 
     test "compound_put waits on the per-field async latch" do
