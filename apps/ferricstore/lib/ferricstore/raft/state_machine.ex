@@ -406,11 +406,14 @@ defmodule Ferricstore.Raft.StateMachine do
           end)
         end)
 
-      new_state = %{state | applied_count: old_count + 1}
-
       case write_result do
-        {:error, _reason} = error -> maybe_release_cursor(meta, old_count, new_state, error)
-        shard_results -> maybe_release_cursor(meta, old_count, new_state, shard_results)
+        {:error, _reason} = error ->
+          new_state = %{state | applied_count: old_count + 1}
+          maybe_release_cursor(meta, old_count, new_state, error)
+
+        {shard_results, flushed_state} ->
+          new_state = %{flushed_state | applied_count: old_count + 1}
+          maybe_release_cursor(meta, old_count, new_state, shard_results)
       end
     end)
   end
@@ -3025,9 +3028,9 @@ defmodule Ferricstore.Raft.StateMachine do
     try do
       result = fun.()
 
-      case flush_cross_shard_pending_writes() do
-        :ok ->
-          result
+      case flush_cross_shard_pending_writes(state) do
+        {:ok, flushed_state} ->
+          {result, flushed_state}
 
         {:error, _reason} = error ->
           rollback_cross_shard_pending_writes(state)
@@ -3039,7 +3042,7 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flush_cross_shard_pending_writes do
+  defp flush_cross_shard_pending_writes(state) do
     pending =
       :sm_cross_shard_pending_writes
       |> Process.put([])
@@ -3047,7 +3050,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
     pending
     |> Enum.group_by(&cross_shard_pending_target/1)
-    |> Enum.reduce_while(:ok, fn {{file_path, file_id, keydir}, entries}, :ok ->
+    |> Enum.reduce_while({:ok, state}, fn {{idx, file_path, file_id, keydir}, entries},
+                                          {:ok, acc_state} ->
       batch = Enum.map(entries, &cross_shard_pending_to_batch_entry/1)
       append_result = append_pending_batch(file_path, batch)
       validated_append_result = validate_append_result(batch, append_result)
@@ -3055,7 +3059,18 @@ defmodule Ferricstore.Raft.StateMachine do
       case validated_append_result do
         {:ok, locations} ->
           apply_cross_shard_pending_locations(keydir, file_id, entries, locations)
-          {:cont, :ok}
+
+          acc_state =
+            acc_state
+            |> track_cross_shard_append_bytes(
+              idx,
+              file_path,
+              file_id,
+              bitcask_record_bytes(batch)
+            )
+            |> mark_cross_shard_checkpoint_dirty(idx)
+
+          {:cont, {:ok, acc_state}}
 
         {:error, reason} ->
           {:halt, {:error, {:bitcask_append_failed, reason}}}
@@ -3064,12 +3079,12 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp cross_shard_pending_target(
-         {:put, _idx, keydir, file_path, file_id, _key, _ets, _disk, _exp}
+         {:put, idx, keydir, file_path, file_id, _key, _ets, _disk, _exp}
        ),
-       do: {file_path, file_id, keydir}
+       do: {idx, file_path, file_id, keydir}
 
-  defp cross_shard_pending_target({:delete, _idx, keydir, file_path, file_id, _key}),
-    do: {file_path, file_id, keydir}
+  defp cross_shard_pending_target({:delete, idx, keydir, file_path, file_id, _key}),
+    do: {idx, file_path, file_id, keydir}
 
   defp cross_shard_pending_to_batch_entry(
          {:put, _idx, _keydir, _file_path, _file_id, key, _ets_value, disk_value, expire_at_ms}
@@ -3402,6 +3417,40 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp track_bitcask_append_bytes(state, _file_path, _file_id, _written_bytes), do: state
+
+  defp track_cross_shard_append_bytes(state, shard_index, file_path, file_id, written_bytes) do
+    if shard_index == state.shard_index do
+      track_bitcask_append_bytes(state, file_path, file_id, written_bytes)
+    else
+      state
+    end
+  end
+
+  defp mark_cross_shard_checkpoint_dirty(state, shard_index) do
+    case checkpoint_ctx_for_state(state) do
+      nil ->
+        if shard_index == state.shard_index do
+          clear_disk_pressure(state)
+        end
+
+      ctx ->
+        flag_idx = shard_index + 1
+
+        if flag_idx <= :atomics.info(ctx.checkpoint_flags).size do
+          if shard_index == state.shard_index do
+            remember_checkpoint_clean_before_write(state, ctx)
+          end
+
+          :atomics.put(ctx.checkpoint_flags, flag_idx, 1)
+        end
+
+        Ferricstore.Store.DiskPressure.clear(ctx, shard_index)
+    end
+
+    state
+  rescue
+    _ -> state
+  end
 
   defp maybe_rotate_state_machine_active_file(state) do
     rotated =

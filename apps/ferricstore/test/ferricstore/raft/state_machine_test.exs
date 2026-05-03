@@ -2332,6 +2332,51 @@ defmodule Ferricstore.Raft.StateMachineTest do
              "Raft cursor must not advance past data that still needs a Bitcask checkpoint"
     end
 
+    test "cross-shard SET dirties checkpoint state before release_cursor", %{
+      ets: ets,
+      shard_index: shard_index
+    } do
+      checkpoint_flags = :atomics.new(shard_index + 1, signed: false)
+      checkpoint_in_flight = :atomics.new(shard_index + 1, signed: false)
+      disk_pressure = :atomics.new(shard_index + 1, signed: false)
+      last_applied_index = :atomics.new(shard_index + 1, signed: false)
+      last_released_cursor_index = :atomics.new(shard_index + 1, signed: false)
+
+      state =
+        init_state_for_release_cursor(ets,
+          shard_index: shard_index,
+          release_cursor_interval: 1
+        )
+
+      state = %{
+        state
+        | instance_ctx: %{
+            checkpoint_flags: checkpoint_flags,
+            checkpoint_in_flight: checkpoint_in_flight,
+            disk_pressure: disk_pressure,
+            last_applied_index: last_applied_index,
+            last_released_cursor_index: last_released_cursor_index,
+            hot_cache_max_value_size: 64,
+            data_dir: state.data_dir
+          }
+      }
+
+      meta = %{index: 1, term: 1, system_time: System.os_time(:millisecond)}
+
+      {_new_state, {:applied_at, 1, %{^shard_index => [:ok]}}, effects} =
+        StateMachine.apply(
+          meta,
+          {:cross_shard_tx, [{shard_index, [{"SET", ["cross_cursor_dirty", "value"]}], nil}]},
+          state
+        )
+
+      assert :atomics.get(checkpoint_flags, shard_index + 1) == 1
+      assert :atomics.get(last_released_cursor_index, shard_index + 1) == 0
+
+      refute Enum.any?(effects, &match?({:release_cursor, 1}, &1)),
+             "cross-shard writes append to Bitcask and must not release Ra log before checkpoint fsync"
+    end
+
     test "release_cursor promotes prior checkpoint when shard was clean before next write", %{
       state: state,
       shard_index: shard_index
