@@ -2129,17 +2129,17 @@ defmodule Ferricstore.Store.Router do
           end
         end)
 
-      Enum.reduce(shard_batches, 0, fn {idx, _keydir, _shard_kvs, _entries, raft_cmds,
-                                        _large_disk_batch},
-                                       accepted_count ->
+      Enum.reduce(shard_batches, MapSet.new(), fn {idx, _keydir, _shard_kvs, _entries, raft_cmds,
+                                                   _large_disk_batch},
+                                                  accepted_idxs ->
         case async_submit_batch_to_raft(idx, raft_cmds) do
           :ok ->
-            accepted_count + 1
+            MapSet.put(accepted_idxs, idx)
 
           {:error, reason} ->
-            rollback_batch_large_puts(ctx, large_previous)
+            rollback_batch_large_puts(ctx, large_previous, accepted_idxs)
 
-            if accepted_count > 0 do
+            if MapSet.size(accepted_idxs) > 0 do
               throw({:partial_async_error, reason})
             else
               throw({:async_error, reason})
@@ -2219,9 +2219,11 @@ defmodule Ferricstore.Store.Router do
     end)
   end
 
-  defp rollback_batch_large_puts(ctx, large_previous) do
+  defp rollback_batch_large_puts(ctx, large_previous, accepted_idxs) do
     Enum.each(large_previous, fn {{idx, key}, previous} ->
-      rollback_unaccepted_large_put(ctx, idx, key, previous)
+      unless MapSet.member?(accepted_idxs, idx) do
+        rollback_unaccepted_large_put(ctx, idx, key, previous)
+      end
     end)
   end
 

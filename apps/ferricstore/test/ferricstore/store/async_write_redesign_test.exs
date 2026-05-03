@@ -252,6 +252,64 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
         :telemetry.detach(handler_id)
       end
     end
+
+    test "partial large batch failure does not rollback already accepted shards" do
+      c = ctx()
+      prefix = "#{@ns}:partial_large_#{:erlang.unique_integer([:positive])}"
+      large0 = :binary.copy("a", c.hot_cache_max_value_size + 1024)
+      large1 = :binary.copy("b", c.hot_cache_max_value_size + 1024)
+      kv_pairs = [{key_for_shard(prefix, 0), large0}, {key_for_shard(prefix, 1), large1}]
+
+      ordered_shards =
+        kv_pairs
+        |> Enum.group_by(fn {key, _value} -> Router.shard_for(c, key) end)
+        |> Enum.map(fn {idx, _pairs} -> idx end)
+
+      [first_idx, second_idx] = ordered_shards
+
+      {first_key, first_value} =
+        Enum.find(kv_pairs, fn {key, _value} -> Router.shard_for(c, key) == first_idx end)
+
+      {second_key, _} =
+        Enum.find(kv_pairs, fn {key, _value} -> Router.shard_for(c, key) == second_idx end)
+
+      test_pid = self()
+      handler_id = {:cross_shard_large_batch_visibility, test_pid, make_ref()}
+
+      on_exit(fn ->
+        Batcher.reset_pending(first_idx)
+        Batcher.reset_pending(second_idx)
+      end)
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :batcher, :async_flush],
+          &__MODULE__.overload_later_shard_on_first_async_flush/4,
+          {test_pid, first_idx, second_idx, second_key}
+        )
+
+      try do
+        task = Task.async(fn -> Router.batch_async_put(c, kv_pairs) end)
+
+        assert_receive :later_shard_overloaded, 5_000
+
+        assert {:error, message} = Task.await(task, 5_000)
+        assert message =~ "partial"
+        assert message =~ "unknown"
+
+        assert tombstone_count(c, first_key) == 0
+
+        ShardHelpers.eventually(
+          fn -> Router.get(c, first_key) == first_value end,
+          "accepted large shard key did not become visible",
+          20,
+          10
+        )
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
