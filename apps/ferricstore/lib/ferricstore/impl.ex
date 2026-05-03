@@ -10,7 +10,7 @@ defmodule FerricStore.Impl do
   # ---------------------------------------------------------------
 
   @spec set(FerricStore.Instance.t(), binary(), binary(), keyword()) ::
-          :ok | {:ok, binary() | nil} | {:ok, boolean()}
+          :ok | {:ok, binary() | nil} | {:ok, boolean()} | {:error, term()}
   def set(ctx, key, value, opts \\ []) do
     ttl = Keyword.get(opts, :ttl, 0)
     nx = Keyword.get(opts, :nx, false)
@@ -33,30 +33,37 @@ defmodule FerricStore.Impl do
   defp do_set(ctx, key, value, expire_at_ms, true, nx, xx) do
     old = Router.get(ctx, key)
 
-    unless (nx and old != nil) or (xx and old == nil) do
-      Router.put(ctx, key, value, expire_at_ms)
+    if (nx and old != nil) or (xx and old == nil) do
+      {:ok, old}
+    else
+      case Router.put(ctx, key, value, expire_at_ms) do
+        :ok -> {:ok, old}
+        {:error, _reason} = error -> error
+      end
     end
-
-    {:ok, old}
   end
 
   defp do_set(ctx, key, value, expire_at_ms, _get, true, _xx) do
     if Router.exists?(ctx, key) do
       {:ok, false}
     else
-      Router.put(ctx, key, value, expire_at_ms)
-      {:ok, true}
+      case Router.put(ctx, key, value, expire_at_ms) do
+        :ok -> {:ok, true}
+        {:error, _reason} = error -> error
+      end
     end
   end
 
   defp do_set(ctx, key, value, expire_at_ms, _get, _nx, true) do
-    if Router.exists?(ctx, key), do: Router.put(ctx, key, value, expire_at_ms)
-    :ok
+    if Router.exists?(ctx, key) do
+      Router.put(ctx, key, value, expire_at_ms)
+    else
+      :ok
+    end
   end
 
   defp do_set(ctx, key, value, expire_at_ms, _get, _nx, _xx) do
     Router.put(ctx, key, value, expire_at_ms)
-    :ok
   end
 
   @spec get(FerricStore.Instance.t(), binary(), keyword()) :: {:ok, binary() | nil}
@@ -64,17 +71,18 @@ defmodule FerricStore.Impl do
     {:ok, Router.get(ctx, key)}
   end
 
-  @spec del(FerricStore.Instance.t(), [binary()]) :: {:ok, non_neg_integer()}
+  @spec del(FerricStore.Instance.t(), [binary()]) :: {:ok, non_neg_integer()} | {:error, term()}
   def del(ctx, keys) when is_list(keys) do
-    count =
-      Enum.count(keys, fn key ->
-        case Router.delete(ctx, key) do
-          :ok -> true
-          _ -> true
-        end
-      end)
-
-    {:ok, count}
+    Enum.reduce_while(keys, 0, fn key, count ->
+      case Router.delete(ctx, key) do
+        :ok -> {:cont, count + 1}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      count when is_integer(count) -> {:ok, count}
+      {:error, _reason} = error -> error
+    end
   end
 
   @spec exists?(FerricStore.Instance.t(), binary()) :: {:ok, boolean()}
@@ -100,13 +108,14 @@ defmodule FerricStore.Impl do
     {:ok, results}
   end
 
-  @spec mset(FerricStore.Instance.t(), [{binary(), binary()}]) :: :ok
+  @spec mset(FerricStore.Instance.t(), [{binary(), binary()}]) :: :ok | {:error, term()}
   def mset(ctx, pairs) do
-    Enum.each(pairs, fn {key, value} ->
-      Router.put(ctx, key, value, 0)
+    Enum.reduce_while(pairs, :ok, fn {key, value}, :ok ->
+      case Router.put(ctx, key, value, 0) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
     end)
-
-    :ok
   end
 
   @spec append(FerricStore.Instance.t(), binary(), binary()) :: {:ok, non_neg_integer()}
@@ -143,28 +152,30 @@ defmodule FerricStore.Impl do
     {:ok, val}
   end
 
-  @spec setnx(FerricStore.Instance.t(), binary(), binary()) :: {:ok, boolean()}
+  @spec setnx(FerricStore.Instance.t(), binary(), binary()) :: {:ok, boolean()} | {:error, term()}
   def setnx(ctx, key, value) do
     if Router.exists?(ctx, key) do
       {:ok, false}
     else
-      Router.put(ctx, key, value, 0)
-      {:ok, true}
+      case Router.put(ctx, key, value, 0) do
+        :ok -> {:ok, true}
+        {:error, _reason} = error -> error
+      end
     end
   end
 
-  @spec setex(FerricStore.Instance.t(), binary(), pos_integer(), binary()) :: :ok
+  @spec setex(FerricStore.Instance.t(), binary(), pos_integer(), binary()) ::
+          :ok | {:error, term()}
   def setex(ctx, key, seconds, value) do
     expire_at_ms = HLC.now_ms() + seconds * 1000
     Router.put(ctx, key, value, expire_at_ms)
-    :ok
   end
 
-  @spec psetex(FerricStore.Instance.t(), binary(), pos_integer(), binary()) :: :ok
+  @spec psetex(FerricStore.Instance.t(), binary(), pos_integer(), binary()) ::
+          :ok | {:error, term()}
   def psetex(ctx, key, milliseconds, value) do
     expire_at_ms = HLC.now_ms() + milliseconds
     Router.put(ctx, key, value, expire_at_ms)
-    :ok
   end
 
   @spec getrange(FerricStore.Instance.t(), binary(), integer(), integer()) :: {:ok, binary()}
