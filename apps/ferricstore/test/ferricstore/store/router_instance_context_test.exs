@@ -3,6 +3,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
 
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.IsolatedInstance
 
   setup do
@@ -49,6 +50,34 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
 
     assert :ok = Router.batch_async_put(ctx, [{key, "custom"}])
     assert "custom" == Router.get(ctx, key)
+  end
+
+  test "custom async compound put does not use the default Raft batcher", %{ctx: ctx} do
+    key = "router:instance:async-compound:#{System.unique_integer([:positive])}"
+    field_key = CompoundKey.hash_field(key, "field")
+    custom_idx = Router.shard_for(ctx, key)
+    async_ctx = %{ctx | durability_mode: :all_async}
+
+    on_exit(fn -> Batcher.reset_pending(custom_idx) end)
+    fill_default_async_pending(custom_idx, field_key)
+
+    assert :ok = Router.compound_put(async_ctx, key, field_key, "custom", 0)
+    assert "custom" == Router.compound_get(async_ctx, key, field_key)
+  end
+
+  test "custom async compound delete does not use the default Raft batcher", %{ctx: ctx} do
+    key = "router:instance:async-compound-del:#{System.unique_integer([:positive])}"
+    field_key = CompoundKey.hash_field(key, "field")
+    custom_idx = Router.shard_for(ctx, key)
+    async_ctx = %{ctx | durability_mode: :all_async}
+
+    assert :ok = Router.compound_put(ctx, key, field_key, "before", 0)
+
+    on_exit(fn -> Batcher.reset_pending(custom_idx) end)
+    fill_default_async_pending(custom_idx, field_key)
+
+    assert :ok = Router.compound_delete(async_ctx, key, field_key)
+    assert nil == Router.compound_get(async_ctx, key, field_key)
   end
 
   defp same_shard_keys(ctx) do
