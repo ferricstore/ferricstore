@@ -477,6 +477,7 @@ defmodule Ferricstore.Store.Shard.Compound do
         case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
           {:ok, {fid, offset, record_size}} ->
             state = track_promoted_dead_bytes(state, redis_key, compound_key, record_size)
+            value_size = byte_size(value)
 
             ShardETS.ets_insert_with_location(
               state,
@@ -485,7 +486,7 @@ defmodule Ferricstore.Store.Shard.Compound do
               expire_at_ms,
               fid,
               offset,
-              record_size
+              value_size
             )
 
             {:reply, :ok, bump_promoted_writes(state, redis_key)}

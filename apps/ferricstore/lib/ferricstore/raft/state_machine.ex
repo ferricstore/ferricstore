@@ -1461,7 +1461,9 @@ defmodule Ferricstore.Raft.StateMachine do
       fid = parse_fid_from_path(active)
 
       case NIF.v2_append_record(active, compound_key, disk_val, expire_at_ms) do
-        {:ok, {offset, record_size}} ->
+        {:ok, {offset, _record_size}} ->
+          value_size = byte_size(disk_val)
+
           if tx_binary_ref do
             new_bytes = binary_byte_size(compound_key) + binary_byte_size(value_for)
 
@@ -1480,7 +1482,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
           :ets.insert(
             ctx.keydir,
-            {compound_key, value_for, expire_at_ms, LFU.initial(), fid, offset, record_size}
+            {compound_key, value_for, expire_at_ms, LFU.initial(), fid, offset, value_size}
           )
 
           sm_tx_put_pending(compound_key, value, expire_at_ms)
@@ -5080,12 +5082,14 @@ defmodule Ferricstore.Raft.StateMachine do
     fid = parse_fid_from_path(active)
 
     case NIF.v2_append_record(active, compound_key, disk_val, expire_at_ms) do
-      {:ok, {offset, record_size}} ->
+      {:ok, {offset, _record_size}} ->
+        value_size = byte_size(disk_val)
+
         track_keydir_binary_delta(state, compound_key, value_for)
 
         :ets.insert(
           state.ets,
-          {compound_key, value_for, expire_at_ms, LFU.initial(), fid, offset, record_size}
+          {compound_key, value_for, expire_at_ms, LFU.initial(), fid, offset, value_size}
         )
 
         sm_tx_put_pending(compound_key, value, expire_at_ms)

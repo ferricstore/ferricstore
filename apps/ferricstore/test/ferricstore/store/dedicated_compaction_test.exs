@@ -193,9 +193,10 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       compound_key = "H:#{key}\0new_field"
 
       case :ets.lookup(keydir, compound_key) do
-        [{^compound_key, _val, _exp, _lfu, fid, offset, _vsize}] ->
+        [{^compound_key, _val, _exp, _lfu, fid, offset, vsize}] ->
           assert is_integer(fid)
           assert offset > 0, "Expected non-zero offset, got #{offset}"
+          assert vsize == byte_size("new_value")
 
         [] ->
           flunk("Compound key not found in ETS")
