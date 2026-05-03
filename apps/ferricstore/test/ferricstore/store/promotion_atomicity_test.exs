@@ -257,6 +257,32 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       assert [{^mk, ^type_str, 0, _lfu, 0, 0, _vsize}] = :ets.lookup(ctx.keydir, mk)
       assert File.dir?(dedicated_path)
     end
+
+    test "cold zset marker cleanup removes the zset dedicated directory", ctx do
+      redis_key = "zset:cleanup:cold-marker"
+      mk = Promotion.marker_key(redis_key)
+      type_str = CompoundKey.encode_type(:zset)
+
+      {:ok, {offset, value_size}} = NIF.v2_append_record(ctx.active_path, mk, type_str, 0)
+      :ets.insert(ctx.keydir, {mk, nil, 0, LFU.initial(), 0, offset, value_size})
+
+      {:ok, zset_path} =
+        Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :zset, redis_key)
+
+      assert File.dir?(zset_path)
+
+      assert :ok =
+               Promotion.cleanup_promoted!(
+                 redis_key,
+                 ctx.shard_data_path,
+                 ctx.keydir,
+                 ctx.data_dir,
+                 ctx.shard_index
+               )
+
+      refute File.dir?(zset_path)
+      assert [] = :ets.lookup(ctx.keydir, mk)
+    end
   end
 
   # ---------------------------------------------------------------------------

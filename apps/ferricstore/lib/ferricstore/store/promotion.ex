@@ -421,8 +421,11 @@ defmodule Ferricstore.Store.Promotion do
 
     type =
       case :ets.lookup(keydir, mk) do
-        [{^mk, type_str, _exp, _lfu, _fid, _off, _vsize}] when type_str != nil ->
-          CompoundKey.decode_type(type_str)
+        [{^mk, type_str, _exp, _lfu, fid, off, _vsize}] ->
+          case promotion_entry_value(shard_data_path, type_str, fid, off) do
+            type_str when is_binary(type_str) -> CompoundKey.decode_type(type_str)
+            _ -> :hash
+          end
 
         _ ->
           :hash
