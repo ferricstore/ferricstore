@@ -548,7 +548,7 @@ defmodule Ferricstore.MemoryGuard do
     binary_bytes_ref = keydir_binary_bytes_ref()
 
     {keydir_bytes, shard_stats} =
-      Enum.reduce(0..(state.shard_count - 1), {0, %{}}, fn i, {kd_acc, shards_acc} ->
+      Enum.reduce(shard_indexes(state.shard_count), {0, %{}}, fn i, {kd_acc, shards_acc} ->
         ets_bytes = safe_ets_memory(:"keydir_#{i}")
         bin_bytes = safe_atomics_get(binary_bytes_ref, i + 1)
         kd_bytes = ets_bytes + bin_bytes
@@ -630,6 +630,9 @@ defmodule Ferricstore.MemoryGuard do
   rescue _ -> 0
   catch _, _ -> 0
   end
+
+  defp shard_indexes(count) when is_integer(count) and count > 0, do: 0..(count - 1)
+  defp shard_indexes(_count), do: []
 
   defp keydir_binary_bytes_ref do
     ctx = FerricStore.Instance.get(:default)

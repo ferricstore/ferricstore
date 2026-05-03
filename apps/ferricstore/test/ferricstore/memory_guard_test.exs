@@ -45,6 +45,21 @@ defmodule Ferricstore.MemoryGuardTest do
       assert stats.eviction_policy in [:volatile_lru, :allkeys_lru, :volatile_ttl, :noeviction]
     end
 
+    test "stats handles zero configured shards without probing negative shard ids" do
+      {:ok, pid} =
+        GenServer.start_link(MemoryGuard, [
+          interval_ms: 60_000,
+          max_memory_bytes: 1_073_741_824,
+          shard_count: 0
+        ])
+
+      stats = GenServer.call(pid, :stats)
+
+      assert stats.shards == %{}
+
+      GenServer.stop(pid)
+    end
+
     test "eviction_policy/0 returns configured policy" do
       policy = MemoryGuard.eviction_policy()
       assert policy == :volatile_lru
