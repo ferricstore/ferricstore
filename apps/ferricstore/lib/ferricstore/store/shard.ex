@@ -218,37 +218,49 @@ defmodule Ferricstore.Store.Shard do
     # replay and start from nil instead of the correct prior value.
     # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
     # Must run BEFORE recover_promoted so PM: markers are in ETS.
-    ShardLifecycle.recover_keydir(path, keydir, index, ctx)
+    profile_startup_phase(index, :recover_keydir, fn ->
+      ShardLifecycle.recover_keydir(path, keydir, index, ctx)
+    end)
 
     # Only the default application instance owns Raft. Custom embedded shards
     # run local/direct, and direct shard tests pass non-default instance_ctx.
     raft? =
       if ctx && ctx.name == :default do
-        ShardLifecycle.start_raft_if_available(
-          index,
-          path,
-          active_file_id,
-          active_file_path,
-          ets,
-          ctx.name
-        )
+        profile_startup_phase(index, :start_raft, fn ->
+          ShardLifecycle.start_raft_if_available(
+            index,
+            path,
+            active_file_id,
+            active_file_path,
+            ets,
+            ctx.name
+          )
+        end)
       else
         false
       end
 
     # Recover promoted collection instances
-    promoted = Ferricstore.Store.Promotion.recover_promoted(path, keydir, data_dir, index, ctx)
+    promoted =
+      profile_startup_phase(index, :recover_promoted, fn ->
+        Ferricstore.Store.Promotion.recover_promoted(path, keydir, data_dir, index, ctx)
+      end)
 
     # Migrate existing prob files: scan prob dir for files without
     # corresponding metadata markers in the keydir. Write markers so
     # DEL can clean up prob files and BF.INFO/CMS.INFO can recover metadata.
-    ShardLifecycle.migrate_prob_files(path, keydir, index, ctx)
+    profile_startup_phase(index, :migrate_prob_files, fn ->
+      ShardLifecycle.migrate_prob_files(path, keydir, index, ctx)
+    end)
 
     # Publish active file metadata to ActiveFile registry
     Ferricstore.Store.ActiveFile.publish(ctx, index, active_file_id, active_file_path, path)
 
     # Compute per-file dead bytes stats from disk sizes + ETS live data.
-    file_stats = compute_file_stats(path, keydir)
+    file_stats =
+      profile_startup_phase(index, :compute_file_stats, fn ->
+        compute_file_stats(path, keydir)
+      end)
 
     # Read merge config for fragmentation thresholds
     merge_config_overrides = Keyword.get(opts, :merge_config, %{})
@@ -291,6 +303,18 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp file_path(shard_path, file_id), do: ShardETS.file_path(shard_path, file_id)
+
+  defp profile_startup_phase(index, phase, fun) when is_function(fun, 0) do
+    {duration_us, result} = :timer.tc(fun)
+
+    :telemetry.execute(
+      [:ferricstore, :shard, :startup_phase],
+      %{duration_us: duration_us},
+      %{shard_index: index, phase: phase}
+    )
+
+    result
+  end
 
   # -------------------------------------------------------------------
   # handle_continue

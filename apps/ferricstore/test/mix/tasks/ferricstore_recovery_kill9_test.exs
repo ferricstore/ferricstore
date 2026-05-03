@@ -59,6 +59,21 @@ defmodule Mix.Tasks.FerricstoreRecoveryKill9Test do
     end
   end
 
+  describe "profile formatting" do
+    test "formats aggregated startup profile without spaces for marker transport" do
+      profile = %{
+        recover_keydir: 12,
+        start_raft: 34,
+        compute_file_stats: 56
+      }
+
+      formatted = RecoveryKill9.format_profile(profile)
+
+      assert formatted == "compute_file_stats:56,recover_keydir:12,start_raft:34"
+      refute String.contains?(formatted, " ")
+    end
+  end
+
   describe "child_env/2" do
     test "passes only harness settings to child process" do
       opts = %{

@@ -131,6 +131,16 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
     end
   end
 
+  @doc false
+  def format_profile(profile) when is_map(profile) do
+    profile
+    |> Enum.sort_by(fn {phase, _duration_us} -> Atom.to_string(phase) end)
+    |> Enum.map(fn {phase, duration_us} ->
+      Atom.to_string(phase) <> ":" <> Integer.to_string(duration_us)
+    end)
+    |> Enum.join(",")
+  end
+
   defp run_parent(opts) do
     Mix.shell().info("kill9 data_dir=#{opts.data_dir}")
     Mix.shell().info("kill9 writes=#{opts.writes} prefix=#{opts.prefix}")
@@ -159,6 +169,7 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
 
     Mix.shell().info("verify ok")
     Mix.shell().info("recovery_time_ms=#{verify_marker["recovery_ms"]}")
+    Mix.shell().info("recovery_profile_us=#{verify_marker["profile_us"]}")
     Mix.shell().info("dbsize=#{verify_marker["dbsize"]}")
     Mix.shell().info("data_dir=#{opts.data_dir}")
 
@@ -200,12 +211,14 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
 
   defp run_verifier_child(opts) do
     configure_child!(opts)
+    handler_id = attach_startup_profile()
 
     {recovery_us, :ok} =
       :timer.tc(fn ->
         start_ferricstore!(opts.timeout_ms)
       end)
 
+    profile = collect_startup_profile(handler_id)
     ctx = FerricStore.Instance.get(:default)
     verify_samples!(ctx, opts)
 
@@ -214,6 +227,7 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
       pid: :os.getpid(),
       writes: opts.writes,
       recovery_ms: div(recovery_us, 1000),
+      profile_us: format_profile(profile),
       dbsize: Router.dbsize(ctx)
     )
   end
@@ -238,6 +252,38 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
   defp start_ferricstore!(timeout_ms) do
     {:ok, _} = Application.ensure_all_started(:ferricstore)
     FerricStore.await_ready(timeout: timeout_ms)
+  end
+
+  defp attach_startup_profile do
+    {:ok, _} = Application.ensure_all_started(:telemetry)
+    owner = self()
+    handler_id = "ferricstore-kill9-profile-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :shard, :startup_phase],
+      fn _event, measurements, metadata, _config ->
+        send(owner, {:startup_profile, metadata.phase, measurements.duration_us})
+      end,
+      nil
+    )
+
+    handler_id
+  end
+
+  defp collect_startup_profile(handler_id) do
+    :telemetry.detach(handler_id)
+    drain_startup_profile(%{})
+  end
+
+  defp drain_startup_profile(acc) do
+    receive do
+      {:startup_profile, phase, duration_us}
+      when is_atom(phase) and is_integer(duration_us) ->
+        drain_startup_profile(Map.update(acc, phase, duration_us, &(&1 + duration_us)))
+    after
+      0 -> acc
+    end
   end
 
   defp verify_samples!(ctx, opts) do

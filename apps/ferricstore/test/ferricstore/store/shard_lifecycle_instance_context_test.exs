@@ -66,6 +66,44 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
     assert keydir_binary_total(ctx) > custom_before
   end
 
+  test "shard startup emits per-phase recovery profiling telemetry" do
+    ctx = build_instance()
+    test_pid = self()
+    handler_id = "shard-startup-profile-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :shard, :startup_phase],
+      fn event, measurements, metadata, _config ->
+        send(test_pid, {:startup_profile, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    {:ok, pid} =
+      Ferricstore.Store.Shard.start_link(
+        index: 0,
+        data_dir: ctx.data_dir,
+        instance_ctx: ctx
+      )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      cleanup_instance(ctx, pid)
+    end)
+
+    assert_receive {:startup_profile, [:ferricstore, :shard, :startup_phase],
+                    %{duration_us: duration}, %{shard_index: 0, phase: :recover_keydir}},
+                   1_000
+
+    assert is_integer(duration)
+    assert duration >= 0
+
+    assert_receive {:startup_profile, [:ferricstore, :shard, :startup_phase], %{duration_us: _},
+                    %{shard_index: 0, phase: :compute_file_stats}},
+                   1_000
+  end
+
   defp build_instance do
     name = :"lifecycle_instance_#{System.unique_integer([:positive])}"
 
