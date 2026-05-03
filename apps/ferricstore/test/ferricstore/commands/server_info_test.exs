@@ -150,6 +150,19 @@ defmodule Ferricstore.Commands.ServerInfoTest do
     end
   end
 
+  describe "INFO bitcask" do
+    test "exposes release cursor frontier metrics per shard" do
+      result = Server.handle("INFO", ["bitcask"], MockStore.make())
+
+      assert result =~ "# Bitcask"
+      assert result =~ "shard_0_last_applied_index:"
+      assert result =~ "shard_0_last_released_cursor_index:"
+      assert result =~ "shard_0_release_cursor_gap:"
+      assert result =~ "shard_0_checkpoint_dirty:"
+      assert result =~ "shard_0_checkpoint_in_flight:"
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # INFO clients
   # ---------------------------------------------------------------------------

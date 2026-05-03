@@ -2107,12 +2107,16 @@ defmodule Ferricstore.Raft.StateMachineTest do
     } do
       checkpoint_flags = :atomics.new(shard_index + 1, signed: false)
       disk_pressure = :atomics.new(shard_index + 1, signed: false)
+      last_applied_index = :atomics.new(shard_index + 1, signed: false)
+      last_released_cursor_index = :atomics.new(shard_index + 1, signed: false)
 
       state = %{
         state
         | release_cursor_interval: 1,
           instance_ctx: %{
             checkpoint_flags: checkpoint_flags,
+            last_applied_index: last_applied_index,
+            last_released_cursor_index: last_released_cursor_index,
             disk_pressure: disk_pressure,
             hot_cache_max_value_size: 64
           }
@@ -2125,9 +2129,39 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert new_state.applied_count == 1
       assert :atomics.get(checkpoint_flags, shard_index + 1) == 1
+      assert :atomics.get(last_applied_index, shard_index + 1) == 1
+      assert :atomics.get(last_released_cursor_index, shard_index + 1) == 0
 
       refute Enum.any?(effects, &match?({:release_cursor, 1, _}, &1)),
              "Raft cursor must not advance past data that still needs a Bitcask checkpoint"
+    end
+
+    test "release_cursor records last released cursor index when emitted", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      last_applied_index = :atomics.new(shard_index + 1, signed: false)
+      last_released_cursor_index = :atomics.new(shard_index + 1, signed: false)
+
+      state = %{
+        state
+        | release_cursor_interval: 1,
+          instance_ctx: %{
+            checkpoint_flags: :atomics.new(shard_index + 1, signed: false),
+            checkpoint_in_flight: :atomics.new(shard_index + 1, signed: false),
+            last_applied_index: last_applied_index,
+            last_released_cursor_index: last_released_cursor_index
+          }
+      }
+
+      meta = %{index: 42, term: 1, system_time: System.os_time(:millisecond)}
+
+      {_new_state, {:applied_at, 42, nil}, effects} =
+        StateMachine.apply(meta, {:getdel, "released_cursor_metric_missing"}, state)
+
+      assert Enum.any?(effects, &match?({:release_cursor, 42, _}, &1))
+      assert :atomics.get(last_applied_index, shard_index + 1) == 42
+      assert :atomics.get(last_released_cursor_index, shard_index + 1) == 42
     end
 
     test "release_cursor waits while checkpoint fsync is in flight", %{

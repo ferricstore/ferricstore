@@ -1010,6 +1010,8 @@ defmodule Ferricstore.Raft.StateMachine do
   @spec maybe_release_cursor(map(), non_neg_integer(), shard_state(), term()) ::
           {shard_state(), term()} | {shard_state(), term(), list()}
   defp maybe_release_cursor(%{index: ra_index}, old_count, state, result) do
+    record_cursor_metric(state, :last_applied_index, ra_index)
+
     # Wrap every reply with the ra_index it was applied at so the originating
     # Batcher can wait for the LOCAL state machine to also reach that index
     # before replying to the user. Otherwise a writer on a follower can see
@@ -1028,6 +1030,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     if div(old_count, interval) != div(state.applied_count, interval) and
          checkpoint_clean?(state) do
+      record_cursor_metric(state, :last_released_cursor_index, ra_index)
       {state, wrapped_result, [notify_effect, {:release_cursor, ra_index, state}]}
     else
       {state, wrapped_result, [notify_effect]}
@@ -1038,6 +1041,22 @@ defmodule Ferricstore.Raft.StateMachine do
     # No meta (e.g. cross-shard sub-apply) — pass through untouched.
     {state, result}
   end
+
+  defp record_cursor_metric(%{instance_ctx: instance_ctx, shard_index: shard_index}, field, index)
+       when is_map(instance_ctx) and is_atom(field) and is_integer(index) and index >= 0 do
+    case Map.get(instance_ctx, field) do
+      ref when is_reference(ref) ->
+        size = :atomics.info(ref).size
+        if shard_index < size, do: :atomics.put(ref, shard_index + 1, index)
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp record_cursor_metric(_state, _field, _index), do: :ok
 
   # A release_cursor lets ra compact log entries. For the Bitcask-backed state
   # machine, the log must not be released past writes that are still only in

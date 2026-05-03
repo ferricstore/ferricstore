@@ -765,6 +765,7 @@ defmodule Ferricstore.Commands.Server do
   defp build_section("bitcask", _store) do
     shard_count = shard_count()
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    instance_ctx = default_instance_ctx()
 
     fields =
       Enum.flat_map(0..(shard_count - 1), fn i ->
@@ -794,12 +795,22 @@ defmodule Ferricstore.Commands.Server do
           end
 
         merge_candidates = max(0, data_files - 1)
+        last_applied = atomic_metric(instance_ctx, :last_applied_index, i)
+        last_released = atomic_metric(instance_ctx, :last_released_cursor_index, i)
+        release_gap = max(last_applied - last_released, 0)
+        checkpoint_dirty = atomic_metric(instance_ctx, :checkpoint_flags, i)
+        checkpoint_in_flight = atomic_metric(instance_ctx, :checkpoint_in_flight, i)
 
         [
           {"shard_#{i}_data_file_count", Integer.to_string(data_files)},
           {"shard_#{i}_hint_file_count", Integer.to_string(hint_files)},
           {"shard_#{i}_total_size_bytes", Integer.to_string(total_bytes)},
-          {"shard_#{i}_merge_candidates", Integer.to_string(merge_candidates)}
+          {"shard_#{i}_merge_candidates", Integer.to_string(merge_candidates)},
+          {"shard_#{i}_last_applied_index", Integer.to_string(last_applied)},
+          {"shard_#{i}_last_released_cursor_index", Integer.to_string(last_released)},
+          {"shard_#{i}_release_cursor_gap", Integer.to_string(release_gap)},
+          {"shard_#{i}_checkpoint_dirty", Integer.to_string(checkpoint_dirty)},
+          {"shard_#{i}_checkpoint_in_flight", Integer.to_string(checkpoint_in_flight)}
         ]
       end)
 
@@ -889,6 +900,29 @@ defmodule Ferricstore.Commands.Server do
 
     format_section("Keydir_Analysis", fields)
   end
+
+  defp default_instance_ctx do
+    FerricStore.Instance.get(:default)
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  defp atomic_metric(%FerricStore.Instance{} = ctx, field, shard_index) do
+    case Map.get(ctx, field) do
+      ref when is_reference(ref) ->
+        size = :atomics.info(ref).size
+        if shard_index < size, do: :atomics.get(ref, shard_index + 1), else: 0
+
+      _ ->
+        0
+    end
+  rescue
+    _ -> 0
+  end
+
+  defp atomic_metric(_ctx, _field, _shard_index), do: 0
 
   # ---------------------------------------------------------------------------
   # Keyspace expiry stats helper
