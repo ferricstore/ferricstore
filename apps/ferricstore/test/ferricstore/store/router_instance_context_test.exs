@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.RouterInstanceContextTest do
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.IsolatedInstance
 
@@ -37,6 +38,17 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
 
     assert {:error, "WRONGTYPE" <> _} =
              Ferricstore.Commands.Hash.handle("HSET", [key, "field", "value"], ctx)
+  end
+
+  test "custom batch async put does not use the default Raft batcher", %{ctx: ctx} do
+    key = "router:instance:async-batch:#{System.unique_integer([:positive])}"
+    custom_idx = Router.shard_for(ctx, key)
+
+    on_exit(fn -> Batcher.reset_pending(custom_idx) end)
+    fill_default_async_pending(custom_idx, key)
+
+    assert :ok = Router.batch_async_put(ctx, [{key, "custom"}])
+    assert "custom" == Router.get(ctx, key)
   end
 
   defp same_shard_keys(ctx) do
@@ -82,5 +94,16 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
             do: {source, destination}
       end)
     end)
+  end
+
+  defp fill_default_async_pending(idx, key) do
+    for _ <- 1..64 do
+      Batcher.__inject_async_pending__(
+        idx,
+        make_ref(),
+        [{:async, node(), {:put, key, "pending", 0}}],
+        0
+      )
+    end
   end
 end

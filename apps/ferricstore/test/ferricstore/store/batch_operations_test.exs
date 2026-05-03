@@ -23,6 +23,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   end
 
   defp ctx, do: Process.get(:test_ctx)
+  defp default_ctx, do: FerricStore.Instance.get(:default)
 
   # ---------------------------------------------------------------------------
   # batch_async_put
@@ -31,20 +32,20 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   describe "batch_async_put" do
     test "all-small batch: values readable immediately" do
       kvs = for i <- 1..20, do: {"#{@ns_async}:bap_small_#{i}", "val_#{i}"}
-      :ok = Router.batch_async_put(ctx(), kvs)
+      :ok = Router.batch_async_put(default_ctx(), kvs)
 
       for {key, value} <- kvs do
-        assert Router.get(ctx(), key) == value
+        assert Router.get(default_ctx(), key) == value
       end
     end
 
     test "all-large batch: values > hot_cache_max written to disk" do
       big = :binary.copy("L", 100 * 1024)
       kvs = for i <- 1..5, do: {"#{@ns_async}:bap_large_#{i}", big}
-      :ok = Router.batch_async_put(ctx(), kvs)
+      :ok = Router.batch_async_put(default_ctx(), kvs)
 
       for {key, _} <- kvs do
-        assert Router.get(ctx(), key) == big
+        assert Router.get(default_ctx(), key) == big
       end
     end
 
@@ -60,60 +61,60 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         {"#{@ns_async}:bap_mix_s3", small}
       ]
 
-      :ok = Router.batch_async_put(ctx(), kvs)
+      :ok = Router.batch_async_put(default_ctx(), kvs)
 
       for {key, value} <- kvs do
-        assert Router.get(ctx(), key) == value
+        assert Router.get(default_ctx(), key) == value
       end
     end
 
     test "empty batch is a no-op" do
-      assert :ok = Router.batch_async_put(ctx(), [])
+      assert :ok = Router.batch_async_put(default_ctx(), [])
     end
 
     test "single-element batch works" do
       kvs = [{"#{@ns_async}:bap_single", "one"}]
-      :ok = Router.batch_async_put(ctx(), kvs)
-      assert Router.get(ctx(), "#{@ns_async}:bap_single") == "one"
+      :ok = Router.batch_async_put(default_ctx(), kvs)
+      assert Router.get(default_ctx(), "#{@ns_async}:bap_single") == "one"
     end
 
     test "overwrites existing keys" do
       key = "#{@ns_async}:bap_overwrite"
-      :ok = Router.put(ctx(), key, "original", 0)
-      assert Router.get(ctx(), key) == "original"
+      :ok = Router.put(default_ctx(), key, "original", 0)
+      assert Router.get(default_ctx(), key) == "original"
 
-      :ok = Router.batch_async_put(ctx(), [{key, "updated"}])
-      assert Router.get(ctx(), key) == "updated"
+      :ok = Router.batch_async_put(default_ctx(), [{key, "updated"}])
+      assert Router.get(default_ctx(), key) == "updated"
     end
 
     test "overwriting a compound key clears compound metadata and fields" do
       key = "#{@ns_async}:bap_overwrite_hash"
       field_key = CompoundKey.hash_field(key, "field")
 
-      :ok = Router.compound_put(ctx(), key, CompoundKey.type_key(key), "hash", 0)
-      :ok = Router.compound_put(ctx(), key, field_key, "hash_val", 0)
-      assert "hash" == Router.compound_get(ctx(), key, CompoundKey.type_key(key))
-      assert "hash_val" == Router.compound_get(ctx(), key, field_key)
+      :ok = Router.compound_put(default_ctx(), key, CompoundKey.type_key(key), "hash", 0)
+      :ok = Router.compound_put(default_ctx(), key, field_key, "hash_val", 0)
+      assert "hash" == Router.compound_get(default_ctx(), key, CompoundKey.type_key(key))
+      assert "hash_val" == Router.compound_get(default_ctx(), key, field_key)
 
-      :ok = Router.batch_async_put(ctx(), [{key, "string_val"}])
+      :ok = Router.batch_async_put(default_ctx(), [{key, "string_val"}])
 
-      assert "string_val" == Router.get(ctx(), key)
-      assert nil == Router.compound_get(ctx(), key, CompoundKey.type_key(key))
-      assert nil == Router.compound_get(ctx(), key, field_key)
+      assert "string_val" == Router.get(default_ctx(), key)
+      assert nil == Router.compound_get(default_ctx(), key, CompoundKey.type_key(key))
+      assert nil == Router.compound_get(default_ctx(), key, field_key)
     end
 
     test "duplicate keys in one async batch use the last value" do
       key = "#{@ns_async}:bap_duplicate"
 
-      :ok = Router.batch_async_put(ctx(), [{key, "first"}, {key, "second"}])
+      :ok = Router.batch_async_put(default_ctx(), [{key, "first"}, {key, "second"}])
 
-      assert Router.get(ctx(), key) == "second"
+      assert Router.get(default_ctx(), key) == "second"
     end
 
     test "mixed batch rolls back same-shard small keys when large disk write fails" do
-      {small_key, large_key} = same_shard_keys(ctx(), "bap_disk_fail")
-      idx = Router.shard_for(ctx(), small_key)
-      original = Ferricstore.Store.ActiveFile.get(ctx(), idx)
+      {small_key, large_key} = same_shard_keys(default_ctx(), "bap_disk_fail")
+      idx = Router.shard_for(default_ctx(), small_key)
+      original = Ferricstore.Store.ActiveFile.get(default_ctx(), idx)
 
       missing_dir =
         Path.join(
@@ -122,27 +123,34 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         )
 
       missing_path = Path.join(missing_dir, "00000.log")
-      Ferricstore.Store.ActiveFile.publish(ctx(), idx, 99_999, missing_path, missing_dir)
+      Ferricstore.Store.ActiveFile.publish(default_ctx(), idx, 99_999, missing_path, missing_dir)
 
       try do
         large = :binary.copy("X", 100 * 1024)
 
         assert {:error, "ERR disk write failed" <> _} =
-                 Router.batch_async_put(ctx(), [{small_key, "small"}, {large_key, large}])
+                 Router.batch_async_put(default_ctx(), [{small_key, "small"}, {large_key, large}])
 
-        assert nil == Router.get(ctx(), small_key)
-        assert nil == Router.get(ctx(), large_key)
+        assert nil == Router.get(default_ctx(), small_key)
+        assert nil == Router.get(default_ctx(), large_key)
       after
         {file_id, file_path, shard_data_path} = original
-        Ferricstore.Store.ActiveFile.publish(ctx(), idx, file_id, file_path, shard_data_path)
+
+        Ferricstore.Store.ActiveFile.publish(
+          default_ctx(),
+          idx,
+          file_id,
+          file_path,
+          shard_data_path
+        )
       end
     end
 
     test "failed mixed batch restores overwritten same-shard keys" do
-      {small_key, large_key} = same_shard_keys(ctx(), "bap_disk_fail_existing")
-      idx = Router.shard_for(ctx(), small_key)
-      :ok = Router.put(ctx(), small_key, "before", 0)
-      original = Ferricstore.Store.ActiveFile.get(ctx(), idx)
+      {small_key, large_key} = same_shard_keys(default_ctx(), "bap_disk_fail_existing")
+      idx = Router.shard_for(default_ctx(), small_key)
+      :ok = Router.put(default_ctx(), small_key, "before", 0)
+      original = Ferricstore.Store.ActiveFile.get(default_ctx(), idx)
 
       missing_dir =
         Path.join(
@@ -151,26 +159,33 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         )
 
       missing_path = Path.join(missing_dir, "00000.log")
-      Ferricstore.Store.ActiveFile.publish(ctx(), idx, 99_998, missing_path, missing_dir)
+      Ferricstore.Store.ActiveFile.publish(default_ctx(), idx, 99_998, missing_path, missing_dir)
 
       try do
         large = :binary.copy("Y", 100 * 1024)
 
         assert {:error, "ERR disk write failed" <> _} =
-                 Router.batch_async_put(ctx(), [{small_key, "after"}, {large_key, large}])
+                 Router.batch_async_put(default_ctx(), [{small_key, "after"}, {large_key, large}])
 
-        assert "before" == Router.get(ctx(), small_key)
-        assert nil == Router.get(ctx(), large_key)
+        assert "before" == Router.get(default_ctx(), small_key)
+        assert nil == Router.get(default_ctx(), large_key)
       after
         {file_id, file_path, shard_data_path} = original
-        Ferricstore.Store.ActiveFile.publish(ctx(), idx, file_id, file_path, shard_data_path)
+
+        Ferricstore.Store.ActiveFile.publish(
+          default_ctx(),
+          idx,
+          file_id,
+          file_path,
+          shard_data_path
+        )
       end
     end
 
     test "cross-shard failure does not leave earlier shard writes visible" do
-      small_key = key_for_shard(ctx(), "bap_cross_fail_small", 0)
-      large_key = key_for_shard(ctx(), "bap_cross_fail_large", 1)
-      original = Ferricstore.Store.ActiveFile.get(ctx(), 1)
+      small_key = key_for_shard(default_ctx(), "bap_cross_fail_small", 0)
+      large_key = key_for_shard(default_ctx(), "bap_cross_fail_large", 1)
+      original = Ferricstore.Store.ActiveFile.get(default_ctx(), 1)
 
       missing_dir =
         Path.join(
@@ -179,68 +194,75 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         )
 
       missing_path = Path.join(missing_dir, "00000.log")
-      Ferricstore.Store.ActiveFile.publish(ctx(), 1, 99_997, missing_path, missing_dir)
+      Ferricstore.Store.ActiveFile.publish(default_ctx(), 1, 99_997, missing_path, missing_dir)
 
       try do
         large = :binary.copy("Q", 100 * 1024)
 
         assert {:error, "ERR disk write failed" <> _} =
-                 Router.batch_async_put(ctx(), [{small_key, "small"}, {large_key, large}])
+                 Router.batch_async_put(default_ctx(), [{small_key, "small"}, {large_key, large}])
 
-        assert nil == Router.get(ctx(), small_key)
-        assert nil == Router.get(ctx(), large_key)
+        assert nil == Router.get(default_ctx(), small_key)
+        assert nil == Router.get(default_ctx(), large_key)
       after
         {file_id, file_path, shard_data_path} = original
-        Ferricstore.Store.ActiveFile.publish(ctx(), 1, file_id, file_path, shard_data_path)
+
+        Ferricstore.Store.ActiveFile.publish(
+          default_ctx(),
+          1,
+          file_id,
+          file_path,
+          shard_data_path
+        )
       end
     end
 
     test "cross-shard async replication overload does not leave earlier shard writes visible" do
-      ok_key = key_for_shard(ctx(), "bap_cross_overload_ok", 0)
-      overloaded_key = key_for_shard(ctx(), "bap_cross_overload_blocked", 1)
+      ok_key = key_for_shard(default_ctx(), "bap_cross_overload_ok", 0)
+      overloaded_key = key_for_shard(default_ctx(), "bap_cross_overload_blocked", 1)
 
       on_exit(fn -> Batcher.reset_pending(1) end)
       fill_async_pending(1, overloaded_key)
 
       assert {:error, "ERR async replication overloaded"} =
-               Router.batch_async_put(ctx(), [{ok_key, "ok"}, {overloaded_key, "blocked"}])
+               Router.batch_async_put(default_ctx(), [{ok_key, "ok"}, {overloaded_key, "blocked"}])
 
-      assert nil == Router.get(ctx(), ok_key)
-      assert nil == Router.get(ctx(), overloaded_key)
+      assert nil == Router.get(default_ctx(), ok_key)
+      assert nil == Router.get(default_ctx(), overloaded_key)
     end
 
     test "large batch does not recover unaccepted value when async replication is overloaded" do
       key = "#{@ns_async}:bap_overloaded_large_missing_#{System.unique_integer([:positive])}"
-      idx = Router.shard_for(ctx(), key)
-      large = :binary.copy("B", ctx().hot_cache_max_value_size + 1024)
+      idx = Router.shard_for(default_ctx(), key)
+      large = :binary.copy("B", default_ctx().hot_cache_max_value_size + 1024)
 
       on_exit(fn -> Batcher.reset_pending(idx) end)
       fill_async_pending(idx, key)
 
       assert {:error, "ERR async replication overloaded"} =
-               Router.batch_async_put(ctx(), [{key, large}])
+               Router.batch_async_put(default_ctx(), [{key, large}])
 
-      assert nil == Router.get(ctx(), key)
-      assert nil == recovered_value_from_bitcask(ctx(), key)
+      assert nil == Router.get(default_ctx(), key)
+      assert nil == recovered_value_from_bitcask(default_ctx(), key)
     end
 
     test "large batch restores previous cold value when async replication is overloaded" do
       key = "#{@ns_async}:bap_overloaded_large_existing_#{System.unique_integer([:positive])}"
-      idx = Router.shard_for(ctx(), key)
-      old = :binary.copy("O", ctx().hot_cache_max_value_size + 1024)
-      new = :binary.copy("N", ctx().hot_cache_max_value_size + 2048)
+      idx = Router.shard_for(default_ctx(), key)
+      old = :binary.copy("O", default_ctx().hot_cache_max_value_size + 1024)
+      new = :binary.copy("N", default_ctx().hot_cache_max_value_size + 2048)
 
-      :ok = Router.put(ctx(), key, old, 0)
-      assert old == Router.get(ctx(), key)
+      :ok = Router.put(default_ctx(), key, old, 0)
+      assert old == Router.get(default_ctx(), key)
 
       on_exit(fn -> Batcher.reset_pending(idx) end)
       fill_async_pending(idx, key)
 
       assert {:error, "ERR async replication overloaded"} =
-               Router.batch_async_put(ctx(), [{key, new}])
+               Router.batch_async_put(default_ctx(), [{key, new}])
 
-      assert old == Router.get(ctx(), key)
-      assert old == recovered_value_from_bitcask(ctx(), key)
+      assert old == Router.get(default_ctx(), key)
+      assert old == recovered_value_from_bitcask(default_ctx(), key)
     end
   end
 
@@ -260,8 +282,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     end
 
     test "all-async batch reports overload per shard instead of failing every key" do
-      ok_key = key_for_shard(ctx(), "bs_cross_overload_ok", 0)
-      overloaded_key = key_for_shard(ctx(), "bs_cross_overload_blocked", 1)
+      ok_key = key_for_shard(default_ctx(), "bs_cross_overload_ok", 0)
+      overloaded_key = key_for_shard(default_ctx(), "bs_cross_overload_blocked", 1)
 
       on_exit(fn -> Batcher.reset_pending(1) end)
       fill_async_pending(1, overloaded_key)
@@ -271,12 +293,12 @@ defmodule Ferricstore.Store.BatchOperationsTest do
                {:error, "ERR async replication overloaded"}
              ] =
                FerricStore.__async_batch_put_result_list__(
-                 ctx(),
+                 default_ctx(),
                  [{ok_key, "ok"}, {overloaded_key, "blocked"}]
                )
 
-      assert "ok" == Router.get(ctx(), ok_key)
-      assert nil == Router.get(ctx(), overloaded_key)
+      assert "ok" == Router.get(default_ctx(), ok_key)
+      assert nil == Router.get(default_ctx(), overloaded_key)
     end
 
     test "all-quorum namespace returns list of :ok" do
@@ -546,15 +568,15 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   describe "Router.get_keydir_file_ref" do
     test "does not return pending async locations as disk file refs" do
       key = "#{@ns_async}:pending_file_ref"
-      idx = Router.shard_for(ctx(), key)
-      keydir = elem(ctx().keydir_refs, idx)
+      idx = Router.shard_for(default_ctx(), key)
+      keydir = elem(default_ctx().keydir_refs, idx)
 
-      :ok = Router.batch_async_put(ctx(), [{key, "small"}])
+      :ok = Router.batch_async_put(default_ctx(), [{key, "small"}])
       assert [{^key, "small", 0, _lfu, :pending, 0, _vsize}] = :ets.lookup(keydir, key)
 
-      assert Router.get_keydir_file_ref(ctx(), key) == :miss
+      assert Router.get_keydir_file_ref(default_ctx(), key) == :miss
       assert [{^key, "small", 0, _lfu, :pending, 0, _vsize}] = :ets.lookup(keydir, key)
-      assert Router.get(ctx(), key) == "small"
+      assert Router.get(default_ctx(), key) == "small"
     end
 
     test "removes expired keys from ETS and byte accounting" do

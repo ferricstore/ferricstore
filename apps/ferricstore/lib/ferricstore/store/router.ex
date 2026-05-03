@@ -2055,6 +2055,10 @@ defmodule Ferricstore.Store.Router do
   """
   @spec batch_async_put(FerricStore.Instance.t(), [{binary(), binary()}]) ::
           :ok | {:error, binary()}
+  def batch_async_put(%{name: name} = ctx, kv_pairs) when name != :default do
+    batch_local_put(ctx, kv_pairs)
+  end
+
   def batch_async_put(ctx, kv_pairs) do
     lfu_val = LFU.initial()
     hot_max = ctx.hot_cache_max_value_size
@@ -2171,6 +2175,19 @@ defmodule Ferricstore.Store.Router do
 
     :throw, {:async_error, reason} ->
       {:error, reason}
+  end
+
+  defp batch_local_put(ctx, kv_pairs) do
+    # Embedded/custom instances are local/direct. They must not consult the
+    # default instance's Raft batchers; those global names are owned by the
+    # application instance and can be under unrelated backpressure.
+    Enum.reduce_while(kv_pairs, :ok, fn {key, value}, :ok ->
+      case put(ctx, key, value, 0) do
+        :ok -> {:cont, :ok}
+        {:error, _} = err -> {:halt, err}
+        other -> {:halt, {:error, inspect(other)}}
+      end
+    end)
   end
 
   defp dedupe_last_kvs(kv_pairs) do
