@@ -38,10 +38,20 @@ defmodule Ferricstore.Store.Shard.Compound do
           compound_batch_get_shared(compound_keys, state)
 
         dedicated_path ->
-          compound_batch_get_dedicated(dedicated_path, compound_keys, state)
+          if Enum.any?(compound_keys, &shared_log_compound_key?/1) do
+            compound_batch_get_mixed(redis_key, compound_keys, state)
+          else
+            compound_batch_get_dedicated(dedicated_path, compound_keys, state)
+          end
       end
 
     {:reply, values, state}
+  end
+
+  defp compound_batch_get_mixed(redis_key, compound_keys, state) do
+    Enum.map_reduce(compound_keys, state, fn compound_key, acc_state ->
+      compound_get_value(redis_key, compound_key, acc_state)
+    end)
   end
 
   defp compound_batch_get_shared(compound_keys, state) do
@@ -159,7 +169,7 @@ defmodule Ferricstore.Store.Shard.Compound do
   end
 
   defp compound_get_value(redis_key, compound_key, state) do
-    case promoted_store(state, redis_key) do
+    case promoted_store_for_compound(state, redis_key, compound_key) do
       nil ->
         case ShardETS.ets_lookup_warm(state, compound_key) do
           {:hit, value, _exp} ->
@@ -401,7 +411,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
   defp handle_compound_put_raft(redis_key, compound_key, value, expire_at_ms, state) do
     tracked_state =
-      case promoted_store(state, redis_key) do
+      case promoted_store_for_compound(state, redis_key, compound_key) do
         nil ->
           state
 
@@ -427,7 +437,7 @@ defmodule Ferricstore.Store.Shard.Compound do
         new_state = %{tracked_state | write_version: new_version}
 
         new_state =
-          case promoted_store(new_state, redis_key) do
+          case promoted_store_for_compound(new_state, redis_key, compound_key) do
             nil -> maybe_promote(new_state, redis_key, compound_key)
             _dedicated_path -> bump_promoted_writes(new_state, redis_key)
           end
@@ -444,7 +454,7 @@ defmodule Ferricstore.Store.Shard.Compound do
   end
 
   defp handle_compound_put_direct(redis_key, compound_key, value, expire_at_ms, state) do
-    case promoted_store(state, redis_key) do
+    case promoted_store_for_compound(state, redis_key, compound_key) do
       nil ->
         ShardETS.ets_insert(state, compound_key, value, expire_at_ms)
         new_pending = [{compound_key, value, expire_at_ms} | state.pending]
@@ -486,7 +496,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
   defp handle_compound_delete_raft(redis_key, compound_key, state) do
     tracked_state =
-      if promoted_store(state, redis_key) do
+      if promoted_store_for_compound(state, redis_key, compound_key) do
         track_promoted_delete_bytes(state, redis_key, compound_key)
       else
         state
@@ -498,7 +508,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     case result do
       :ok ->
         new_state =
-          if promoted_store(tracked_state, redis_key) do
+          if promoted_store_for_compound(tracked_state, redis_key, compound_key) do
             bump_promoted_writes(tracked_state, redis_key)
           else
             tracked_state
@@ -512,7 +522,7 @@ defmodule Ferricstore.Store.Shard.Compound do
   end
 
   defp handle_compound_delete_direct(redis_key, compound_key, state) do
-    case promoted_store(state, redis_key) do
+    case promoted_store_for_compound(state, redis_key, compound_key) do
       nil ->
         state = ShardFlush.await_in_flight(state)
         state = ShardFlush.flush_pending_sync(state)
@@ -620,6 +630,21 @@ defmodule Ferricstore.Store.Shard.Compound do
       nil -> nil
     end
   end
+
+  defp promoted_store_for_compound(state, redis_key, compound_key) do
+    if shared_log_compound_key?(compound_key) do
+      nil
+    else
+      promoted_store(state, redis_key)
+    end
+  end
+
+  # Type and promotion metadata are authoritative in the shared shard log.
+  # Promoted H/S/Z data rows use dedicated Bitcask files, but metadata rows
+  # keep shared-log offsets and must not be read through the dedicated path.
+  defp shared_log_compound_key?(<<"T:", _rest::binary>>), do: true
+  defp shared_log_compound_key?(<<"PM:", _rest::binary>>), do: true
+  defp shared_log_compound_key?(_key), do: false
 
   defp tombstone_and_delete_keys(state, keys) do
     Enum.reduce_while(keys, {:ok, state}, fn key, {:ok, acc_state} ->

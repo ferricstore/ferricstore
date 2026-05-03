@@ -214,6 +214,31 @@ defmodule Ferricstore.Store.PromotionTest do
       dedicated_path = Path.join([data_dir, "dedicated", "shard_#{shard_idx}", "hash:#{hash}"])
       assert File.dir?(dedicated_path)
     end
+
+    test "promoted hash type metadata survives shard restart" do
+      store = real_store()
+      key = ukey("promote_restart_type")
+
+      populate_hash(store, key, @test_threshold + 1)
+      assert promoted?(key)
+      assert {:simple, "hash"} = Strings.handle("TYPE", [key], store)
+
+      ShardHelpers.flush_all_shards()
+
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      old_pid = Process.whereis(shard)
+      ref = Process.monitor(old_pid)
+
+      Process.exit(old_pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^old_pid, :killed}, 2_000
+      ShardHelpers.wait_shards_alive()
+
+      assert promoted?(key)
+      assert {:simple, "hash"} = Strings.handle("TYPE", [key], store)
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SADD", [key, "member"], store)
+      assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
+    end
   end
 
   # ---------------------------------------------------------------------------
