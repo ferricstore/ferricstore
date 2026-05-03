@@ -186,8 +186,10 @@ defmodule Ferricstore.Store.Promotion do
     # Step 1: marker
     case NIF.v2_append_record(active_path, mk, type_str, 0) do
       {:ok, {moffset, mvsize}} ->
+        marker_fid = file_id_from_path(active_path)
+
         track_binary_insert(keydir, shard_index, mk, type_str, instance_ctx)
-        :ets.insert(keydir, {mk, type_str, 0, LFU.initial(), 0, moffset, mvsize})
+        :ets.insert(keydir, {mk, type_str, 0, LFU.initial(), marker_fid, moffset, mvsize})
 
       {:error, reason} ->
         Logger.error(
@@ -204,8 +206,7 @@ defmodule Ferricstore.Store.Promotion do
       batch = Enum.map(entries, fn {k, v, exp} -> {k, v, exp} end)
       dedicated_active = find_active(dedicated_path)
 
-      dedicated_fid =
-        dedicated_active |> Path.basename() |> String.trim_trailing(".log") |> String.to_integer()
+      dedicated_fid = file_id_from_path(dedicated_active)
 
       case NIF.v2_append_batch(dedicated_active, batch) do
         {:ok, locations} ->
@@ -507,6 +508,13 @@ defmodule Ferricstore.Store.Promotion do
       [] -> Path.join(path, "00000.log")
       files -> files |> List.last() |> elem(1)
     end
+  end
+
+  defp file_id_from_path(path) do
+    path
+    |> Path.basename()
+    |> String.trim_trailing(".log")
+    |> String.to_integer()
   end
 
   # Returns total size of all .log files in a directory.

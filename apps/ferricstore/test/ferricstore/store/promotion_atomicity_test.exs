@@ -196,6 +196,26 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       assert info.total_bytes > 0
       assert info.dead_bytes == 0
     end
+
+    test "promotion records marker location in the actual active file", ctx do
+      {redis_key, _entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
+
+      rotated_active = Path.join(ctx.shard_data_path, "00005.log")
+      File.touch!(rotated_active)
+
+      {:ok, _dedicated_path} =
+        Promotion.promote_collection!(
+          :hash,
+          redis_key,
+          ctx.shard_data_path,
+          ctx.keydir,
+          ctx.data_dir,
+          ctx.shard_index
+        )
+
+      mk = Promotion.marker_key(redis_key)
+      assert [{^mk, _type, 0, _lfu, 5, _off, _vsize}] = :ets.lookup(ctx.keydir, mk)
+    end
   end
 
   describe "dedicated batch failure" do
