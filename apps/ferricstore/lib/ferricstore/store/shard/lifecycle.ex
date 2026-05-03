@@ -74,7 +74,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
       {:ok, files} ->
         log_files =
           files
-          |> Enum.filter(&String.ends_with?(&1, ".log"))
+          |> Enum.filter(&regular_log_file?/1)
           |> Enum.sort_by(&log_file_id/1)
 
         Logger.debug(
@@ -544,6 +544,10 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         Logger.warning("Shard: removed leftover compaction temp file #{name}")
       end
     end)
+  end
+
+  defp regular_log_file?(name) do
+    String.ends_with?(name, ".log") and not String.starts_with?(name, "compact_")
   end
 
   defp recover_from_hints_or_logs(shard_path, keydir, shard_index, log_files, [], instance_ctx) do

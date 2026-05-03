@@ -40,6 +40,40 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
     assert {:ok, "new"} = NIF.v2_pread_at(Path.join(shard_path, "100000.log"), offset)
   end
 
+  test "recover_keydir ignores leftover compact temp logs" do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lifecycle_compact_tmp_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Path.join(tmp, "shard_0")
+    File.mkdir_p!(shard_path)
+
+    keydir =
+      :ets.new(:"lifecycle_compact_tmp_#{System.unique_integer([:positive])}", [:set, :public])
+
+    on_exit(fn ->
+      try do
+        :ets.delete(keydir)
+      rescue
+        _ -> :ok
+      end
+
+      File.rm_rf!(tmp)
+    end)
+
+    File.write!(Path.join(shard_path, "compact_1.log"), "partial compaction")
+    key = "recover_ignores_compact_tmp"
+    assert {:ok, _} = NIF.v2_append_record(Path.join(shard_path, "00000.log"), key, "value", 0)
+
+    ShardLifecycle.recover_keydir(shard_path, keydir, 0)
+
+    assert [{^key, nil, 0, _lfu, 0, offset, value_size}] = :ets.lookup(keydir, key)
+    assert value_size == byte_size("value")
+    assert {:ok, "value"} = NIF.v2_pread_at(Path.join(shard_path, "00000.log"), offset)
+  end
+
   test "recover_keydir during custom shard startup does not mutate default accounting" do
     default_ctx = FerricStore.Instance.get(:default)
     default_before = keydir_binary_total(default_ctx)
