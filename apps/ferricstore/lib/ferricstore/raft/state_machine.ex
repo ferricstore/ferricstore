@@ -1042,6 +1042,20 @@ defmodule Ferricstore.Raft.StateMachine do
   # A release_cursor lets ra compact log entries. For the Bitcask-backed state
   # machine, the log must not be released past writes that are still only in
   # the OS page cache; the checkpoint flag is cleared only after fsync succeeds.
+  defp checkpoint_clean?(%{instance_ctx: nil, instance_name: name, shard_index: shard_index})
+       when is_atom(name) and name != :default do
+    case instance_ctx_by_name(name) do
+      %FerricStore.Instance{} = instance_ctx ->
+        checkpoint_clean?(%{instance_ctx: instance_ctx, shard_index: shard_index})
+
+      _ ->
+        false
+    end
+  end
+
+  # Unit tests and old default-state-machine callers may not carry an
+  # Instance. Custom instances fail closed above because their checkpoint
+  # atomics are isolated by instance and must be resolved before log release.
   defp checkpoint_clean?(%{instance_ctx: nil}), do: true
 
   defp checkpoint_clean?(%{instance_ctx: instance_ctx, shard_index: shard_index})
@@ -2638,6 +2652,22 @@ defmodule Ferricstore.Raft.StateMachine do
        )
        when is_binary(current_value) and is_binary(expected_value) do
     String.starts_with?(current_value, expected_value)
+  end
+
+  defp pending_newer_value_includes_origin_command?(
+         {:setrange, _key, offset, value},
+         current_value,
+         expected_value
+       )
+       when is_integer(offset) and offset >= 0 and is_binary(value) and is_binary(current_value) and
+              is_binary(expected_value) do
+    range_size = byte_size(value)
+    range_end = offset + range_size
+
+    range_size == 0 or
+      (byte_size(current_value) >= range_end and byte_size(expected_value) >= range_end and
+         binary_part(current_value, offset, range_size) ==
+           binary_part(expected_value, offset, range_size))
   end
 
   defp pending_newer_value_includes_origin_command?(_inner_cmd, _current_value, _expected_value) do

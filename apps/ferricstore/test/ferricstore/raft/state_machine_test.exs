@@ -430,6 +430,31 @@ defmodule Ferricstore.Raft.StateMachineTest do
                :ets.lookup(ets, "old_origin_setrange")
     end
 
+    test "does not replay origin SETRANGE when a newer pending value already includes it", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      # Origin already applied SETRANGE("hello", 2, "X") => "heXlo", then a
+      # later local async command extended the pending value. Replaying the
+      # older Ra entry must not enqueue another Bitcask write.
+      :ets.insert(ets, {"pending_origin_setrange_newer", "heXlo!", 0, 1, :pending, 0, 0})
+
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "pending_origin_setrange_newer",
+            {:setrange, "pending_origin_setrange_newer", 2, "X"}, "hello", 0, "heXlo", 0}},
+          state
+        )
+
+      assert [{"pending_origin_setrange_newer", "heXlo!", 0, _lfu, :pending, 0, 0}] =
+               :ets.lookup(ets, "pending_origin_setrange_newer")
+
+      assert {:ok, []} = NIF.v2_scan_file(active_file_path)
+    end
+
     test "replays origin async DELETE when recovery still has an older value", %{
       state: state,
       ets: ets,
@@ -2086,6 +2111,27 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       refute Enum.any?(effects, &match?({:release_cursor, 1, _}, &1)),
              "Raft cursor must not advance while Bitcask fsync is still in flight"
+    end
+
+    test "release_cursor waits when custom instance checkpoint state is unresolved", %{
+      state: state
+    } do
+      name = :"missing_custom_instance_#{System.unique_integer([:positive])}"
+
+      state = %{
+        state
+        | release_cursor_interval: 1,
+          instance_ctx: nil,
+          instance_name: name
+      }
+
+      meta = %{index: 1, term: 1, system_time: System.os_time(:millisecond)}
+
+      {_new_state, {:applied_at, 1, nil}, effects} =
+        StateMachine.apply(meta, {:getdel, "missing_custom_checkpoint_ctx"}, state)
+
+      refute Enum.any?(effects, &match?({:release_cursor, 1, _}, &1)),
+             "custom instance state must fail closed until checkpoint atomics are resolved"
     end
 
     test "release_cursor emitted at every interval multiple", %{store: _store, ets: ets} do
