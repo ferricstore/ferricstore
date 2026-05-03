@@ -86,4 +86,26 @@ defmodule Ferricstore.Bitcask.AsyncTest do
     assert source =~ "flush_alias_reply(ref)",
            "alias cleanup must drain any reply that arrived before alias deactivation"
   end
+
+  test "timed-out await shuts down its proxy promptly" do
+    test_pid = self()
+
+    result =
+      Async.await(
+        fn proxy, corr_id ->
+          send(test_pid, {:proxy_started, proxy, corr_id})
+          Process.sleep(40)
+          :ok
+        end,
+        50
+      )
+
+    assert {:error, :timeout} = result
+    assert_receive {:proxy_started, proxy, _corr_id}
+
+    Process.sleep(5)
+
+    refute Process.alive?(proxy),
+           "timed-out async waits must not keep one proxy process alive for another full timeout"
+  end
 end

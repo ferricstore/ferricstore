@@ -66,19 +66,10 @@ defmodule Ferricstore.Bitcask.Async do
         maybe_send_result(parent, ref, {:error, reason})
 
       {^ref, :cancel} ->
-        proxy_drain(corr_id, timeout_ms)
+        :ok
     after
       timeout_ms ->
         :ok
-    end
-  end
-
-  defp proxy_drain(corr_id, timeout_ms) do
-    receive do
-      {:tokio_complete, ^corr_id, :ok} -> :ok
-      {:tokio_complete, ^corr_id, _status, _payload} -> :ok
-    after
-      timeout_ms -> :ok
     end
   end
 
