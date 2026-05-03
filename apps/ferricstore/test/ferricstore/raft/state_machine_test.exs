@@ -1061,6 +1061,50 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert [] == :ets.lookup(ets, "cross_bad_meta_offset")
     end
 
+    test "cross-shard read fallbacks report unavailable keydirs", %{
+      state: state,
+      ets: ets,
+      shard_index: shard_index
+    } do
+      handler_id = {__MODULE__, self(), make_ref()}
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :store, :shard_unavailable],
+          fn event, measurements, metadata, _config ->
+            send(parent, {:sm_keydir_unavailable, event, measurements, metadata})
+          end,
+          nil
+        )
+
+      try do
+        :ets.delete(ets)
+
+        {_new_state, %{^shard_index => [nil, -2, 0]}} =
+          StateMachine.apply(
+            %{system_time: Ferricstore.HLC.now_ms()},
+            {:cross_shard_tx,
+             [
+               {shard_index,
+                [
+                  {"GET", ["missing_keydir_get"]},
+                  {"PTTL", ["missing_keydir_pttl"]},
+                  {"HLEN", ["missing_keydir_hash"]}
+                ], nil}
+             ]},
+            state
+          )
+
+        assert_keydir_unavailable_event(:cross_shard_get)
+        assert_keydir_unavailable_event(:cross_shard_get_meta)
+        assert_keydir_unavailable_event(:cross_shard_prefix_count)
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
     test "stamped ratelimit ignores legacy embedded now_ms", %{
       state: state,
       ets: ets
@@ -2593,5 +2637,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
       %{expire_at_ms: 0, nx: false, xx: false, get: false, keepttl: false, has_expiry: false},
       overrides
     )
+  end
+
+  defp assert_keydir_unavailable_event(request) do
+    assert_receive {:sm_keydir_unavailable, [:ferricstore, :store, :shard_unavailable],
+                    %{count: 1},
+                    %{request: ^request, reason: :keydir_unavailable, source: :raft_apply}}
   end
 end

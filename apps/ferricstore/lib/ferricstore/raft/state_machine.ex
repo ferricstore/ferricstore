@@ -1600,7 +1600,7 @@ defmodule Ferricstore.Raft.StateMachine do
         cross_shard_compound_scan(ctx, redis_key, prefix)
       end,
       compound_count: fn _redis_key, prefix ->
-        cross_shard_prefix_count(ctx.keydir, prefix)
+        cross_shard_prefix_count(ctx, prefix)
       end,
       compound_delete_prefix: fn _redis_key, prefix ->
         cross_shard_delete_prefix(ctx, prefix, local_delete)
@@ -1732,7 +1732,9 @@ defmodule Ferricstore.Raft.StateMachine do
           nil
       end
     rescue
-      ArgumentError -> nil
+      ArgumentError ->
+        emit_cross_shard_keydir_unavailable(ctx, :cross_shard_get)
+        nil
     end
   end
 
@@ -1777,7 +1779,9 @@ defmodule Ferricstore.Raft.StateMachine do
           nil
       end
     rescue
-      ArgumentError -> nil
+      ArgumentError ->
+        emit_cross_shard_keydir_unavailable(ctx, :cross_shard_get_meta)
+        nil
     end
   end
 
@@ -1841,7 +1845,9 @@ defmodule Ferricstore.Raft.StateMachine do
       end)
       |> Enum.sort_by(fn {field, _} -> field end)
     rescue
-      ArgumentError -> []
+      ArgumentError ->
+        emit_cross_shard_keydir_unavailable(ctx, :cross_shard_prefix_scan)
+        []
     end
   end
 
@@ -2084,7 +2090,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp compound_type_from_key("Z:" <> _), do: :zset
   defp compound_type_from_key(_), do: nil
 
-  defp cross_shard_prefix_count(keydir, prefix) do
+  defp cross_shard_prefix_count(ctx, prefix) do
     prefix_len = byte_size(prefix)
     now = apply_now_ms()
 
@@ -2098,11 +2104,26 @@ defmodule Ferricstore.Raft.StateMachine do
     ]
 
     try do
-      :ets.select(keydir, ms)
+      :ets.select(ctx.keydir, ms)
       |> Enum.count(fn exp -> exp == 0 or exp > now end)
     rescue
-      ArgumentError -> 0
+      ArgumentError ->
+        emit_cross_shard_keydir_unavailable(ctx, :cross_shard_prefix_count)
+        0
     end
+  end
+
+  defp emit_cross_shard_keydir_unavailable(ctx, request) do
+    :telemetry.execute(
+      [:ferricstore, :store, :shard_unavailable],
+      %{count: 1},
+      %{
+        request: request,
+        reason: :keydir_unavailable,
+        shard_index: Map.get(ctx, :index),
+        source: :raft_apply
+      }
+    )
   end
 
   defp cross_shard_delete_prefix(ctx, prefix, delete_fn) do
