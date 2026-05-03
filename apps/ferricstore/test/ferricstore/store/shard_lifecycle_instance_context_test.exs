@@ -4,6 +4,41 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
+
+  test "recover_keydir replays log files by numeric file id" do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lifecycle_order_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Path.join(tmp, "shard_0")
+    File.mkdir_p!(shard_path)
+
+    keydir = :ets.new(:"lifecycle_order_#{System.unique_integer([:positive])}", [:set, :public])
+
+    on_exit(fn ->
+      try do
+        :ets.delete(keydir)
+      rescue
+        _ -> :ok
+      end
+
+      File.rm_rf!(tmp)
+    end)
+
+    key = "recover_numeric_order_key"
+
+    assert {:ok, _} = NIF.v2_append_record(Path.join(shard_path, "99999.log"), key, "old", 0)
+    assert {:ok, _} = NIF.v2_append_record(Path.join(shard_path, "100000.log"), key, "new", 0)
+
+    ShardLifecycle.recover_keydir(shard_path, keydir, 0)
+
+    assert [{^key, nil, 0, _lfu, 100_000, offset, value_size}] = :ets.lookup(keydir, key)
+    assert value_size == byte_size("new")
+    assert {:ok, "new"} = NIF.v2_pread_at(Path.join(shard_path, "100000.log"), offset)
+  end
 
   test "recover_keydir during custom shard startup does not mutate default accounting" do
     default_ctx = FerricStore.Instance.get(:default)
