@@ -152,12 +152,14 @@ defmodule Ferricstore.Store.Shard.Compound do
             if length(values) == length(entries) do
               values
             else
-              List.duplicate(nil, length(entries))
+              List.duplicate({:error, :batch_result_length_mismatch}, length(entries))
             end
 
-          {:error, _reason} ->
-            List.duplicate(nil, length(entries))
+          {:error, reason} ->
+            List.duplicate({:error, reason}, length(entries))
         end
+
+      emit_compound_batch_cold_read_errors(entries, values)
 
       Enum.zip(entries, values)
       |> Enum.map(fn
@@ -170,6 +172,33 @@ defmodule Ferricstore.Store.Shard.Compound do
       end)
     end
   end
+
+  defp emit_compound_batch_cold_read_errors(entries, values) do
+    entries
+    |> Enum.zip(values)
+    |> Enum.reduce(%{}, fn
+      {{_state, _compound_key, file_path, _fid, _off, _vsize, _exp}, {:error, raw_reason}}, acc ->
+        reason = classify_compound_cold_read_error(raw_reason)
+        Map.update(acc, {file_path, reason, raw_reason}, 1, &(&1 + 1))
+
+      {_entry, _value}, acc ->
+        acc
+    end)
+    |> Enum.each(fn {{path, reason, raw_reason}, count} ->
+      :telemetry.execute(
+        [:ferricstore, :bitcask, :pread_corrupt],
+        %{count: count},
+        %{path: path, reason: reason, raw_reason: raw_reason}
+      )
+    end)
+  end
+
+  defp classify_compound_cold_read_error(reason) when is_binary(reason) do
+    if String.contains?(reason, "missing_file"), do: :missing_file, else: :corrupt_record
+  end
+
+  defp classify_compound_cold_read_error(:timeout), do: :timeout
+  defp classify_compound_cold_read_error(_reason), do: :corrupt_record
 
   defp compound_get_value(redis_key, compound_key, state) do
     case promoted_store_for_compound(state, redis_key, compound_key) do

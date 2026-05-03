@@ -247,6 +247,44 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       assert [nil] == Router.compound_batch_get(ctx(), redis_key, [target])
     end
 
+    test "compound_batch_get reports missing cold files without poisoning good entries" do
+      redis_key = ukey("hash_batch_missing_file")
+      missing_key = hash_field(redis_key, "missing_file")
+      good_key = hash_field(redis_key, "good")
+      idx = Router.shard_for(ctx(), redis_key)
+      keydir = elem(ctx().keydir_refs, idx)
+      {file_id, path, shard_path} = Ferricstore.Store.ActiveFile.get(ctx(), idx)
+      missing_path = Path.join(shard_path, "00009.log")
+
+      {:ok, [{good_offset, good_size}]} = NIF.v2_append_batch(path, [{good_key, "good", 0}])
+
+      :ets.insert(keydir, {missing_key, nil, 0, LFU.initial(), 9, 0, 8})
+      :ets.insert(keydir, {good_key, nil, 0, LFU.initial(), file_id, good_offset, good_size})
+
+      handler_id = {:compound_pread_corrupt, self(), make_ref()}
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :bitcask, :pread_corrupt],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:pread_corrupt, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      try do
+        assert [nil, "good"] ==
+                 Router.compound_batch_get(ctx(), redis_key, [missing_key, good_key])
+
+        assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                        %{path: ^missing_path, reason: :missing_file}},
+                       1_000
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
     test "large compound_put restores previous value when Batcher is overloaded" do
       redis_key = ukey("hash_big_overloaded")
       ck = hash_field(redis_key, "big_field")
