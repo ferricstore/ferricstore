@@ -56,13 +56,7 @@ defmodule Ferricstore.Store.OpsTest do
     test "batch_get returns ordered cold values and warms matching ETS entries" do
       ctx = FerricStore.Instance.get(:default)
 
-      keys = [
-        "ops:local_tx:plain-batch-cold:a:#{System.unique_integer([:positive])}",
-        "ops:local_tx:plain-batch-cold:b:#{System.unique_integer([:positive])}",
-        "ops:local_tx:plain-batch-cold:c:#{System.unique_integer([:positive])}"
-      ]
-
-      shard_index = Router.shard_for(ctx, Enum.at(keys, 0))
+      {shard_index, keys} = same_shard_keys(ctx, "ops:local_tx:plain-batch-cold", 3)
 
       dir =
         Path.join(
@@ -100,14 +94,53 @@ defmodule Ferricstore.Store.OpsTest do
         File.rm_rf(dir)
       end
     end
+
+    test "batch_get rejects mismatched cold offsets" do
+      ctx = FerricStore.Instance.get(:default)
+
+      target = "ops:local_tx:plain-stale:target:#{System.unique_integer([:positive])}"
+      other = "ops:local_tx:plain-stale:other:#{System.unique_integer([:positive])}"
+      shard_index = Router.shard_for(ctx, target)
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ops_local_tx_plain_stale_#{System.unique_integer([:positive])}"
+        )
+
+      keydir = :ets.new(:"ops_local_tx_#{System.unique_integer([:positive])}", [:set, :public])
+
+      try do
+        File.mkdir_p!(dir)
+        path = Path.join(dir, "00000.log")
+        File.touch!(path)
+
+        assert {:ok, [{other_off, _}, {_target_off, target_size}]} =
+                 NIF.v2_append_batch_nosync(path, [
+                   {other, "wrong-value", 0},
+                   {target, "right-value", 0}
+                 ])
+
+        :ets.insert(keydir, {target, nil, 0, LFU.initial(), 0, other_off, target_size})
+
+        tx =
+          local_tx(ctx, shard_index, keydir, %{})
+          |> put_in([Access.key!(:shard_state), :shard_data_path], dir)
+
+        assert [nil] == Ops.batch_get(tx, [target])
+      after
+        :ets.delete(keydir)
+        File.rm_rf(dir)
+      end
+    end
   end
 
   describe "LocalTxStore promoted compound reads" do
     test "local compound batch reads use one cold pread batch" do
       source = File.read!(@ops_path)
 
-      assert source =~ "ColdRead.pread_batch",
-             "LocalTxStore compound_batch_get must batch cold reads instead of one waiter per field"
+      assert source =~ "ColdRead.pread_batch_keyed",
+             "LocalTxStore compound_batch_get must batch keyed cold reads instead of one waiter per field"
     end
 
     test "compound_batch_get returns ordered cold values and warms matching ETS entries" do
@@ -154,6 +187,45 @@ defmodule Ferricstore.Store.OpsTest do
 
         assert [{_, "va", 0, _lfu, 0, ^off_a, ^size_a}] = :ets.lookup(keydir, Enum.at(keys, 0))
         assert [{_, "vb", 0, _lfu, 0, ^off_b, ^size_b}] = :ets.lookup(keydir, Enum.at(keys, 1))
+      after
+        :ets.delete(keydir)
+        File.rm_rf(dir)
+      end
+    end
+
+    test "compound_batch_get rejects mismatched cold offsets" do
+      ctx = FerricStore.Instance.get(:default)
+      redis_key = "ops:local_tx:compound-stale:#{System.unique_integer([:positive])}"
+      target = "H:" <> redis_key <> <<0>> <> "target"
+      other = "H:" <> redis_key <> <<0>> <> "other"
+      shard_index = Router.shard_for(ctx, redis_key)
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ops_local_tx_compound_stale_#{System.unique_integer([:positive])}"
+        )
+
+      keydir = :ets.new(:"ops_local_tx_#{System.unique_integer([:positive])}", [:set, :public])
+
+      try do
+        File.mkdir_p!(dir)
+        path = Path.join(dir, "00000.log")
+        File.touch!(path)
+
+        assert {:ok, [{other_off, _}, {_target_off, target_size}]} =
+                 NIF.v2_append_batch_nosync(path, [
+                   {other, "wrong-value", 0},
+                   {target, "right-value", 0}
+                 ])
+
+        :ets.insert(keydir, {target, nil, 0, LFU.initial(), 0, other_off, target_size})
+
+        tx =
+          local_tx(ctx, shard_index, keydir, %{})
+          |> put_in([Access.key!(:shard_state), :shard_data_path], dir)
+
+        assert [nil] == Ops.compound_batch_get(tx, redis_key, [target])
       after
         :ets.delete(keydir)
         File.rm_rf(dir)
@@ -225,5 +297,18 @@ defmodule Ferricstore.Store.OpsTest do
         promoted_instances: promoted_instances
       }
     }
+  end
+
+  defp same_shard_keys(ctx, prefix, count) do
+    first = "#{prefix}:0:#{System.unique_integer([:positive])}"
+    shard_index = Router.shard_for(ctx, first)
+
+    keys =
+      Stream.iterate(1, &(&1 + 1))
+      |> Stream.map(fn i -> "#{prefix}:#{i}:#{System.unique_integer([:positive])}" end)
+      |> Stream.filter(fn key -> Router.shard_for(ctx, key) == shard_index end)
+      |> Enum.take(count - 1)
+
+    {shard_index, [first | keys]}
   end
 end

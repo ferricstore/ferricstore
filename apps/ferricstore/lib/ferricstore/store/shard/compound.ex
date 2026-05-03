@@ -139,12 +139,15 @@ defmodule Ferricstore.Store.Shard.Compound do
       []
     else
       locations =
-        Enum.map(entries, fn {_state, _compound_key, file_path, _fid, off, _vsize, _exp} ->
-          {file_path, off}
+        Enum.map(entries, fn {_state, compound_key, file_path, _fid, off, _vsize, _exp} ->
+          {file_path, off, compound_key}
         end)
 
       values =
-        case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_batch_read_timeout_ms) do
+        case Ferricstore.Store.ColdRead.pread_batch_keyed(
+               locations,
+               @cold_batch_read_timeout_ms
+             ) do
           {:ok, values} when is_list(values) ->
             if length(values) == length(entries) do
               values
@@ -681,7 +684,7 @@ defmodule Ferricstore.Store.Shard.Compound do
              offset >= 0 and is_integer(vsize) and vsize >= 0 ->
         file_path = dedicated_file_path(dedicated_path, fid)
 
-        case read_cold_async(file_path, offset) do
+        case read_cold_async(file_path, offset, compound_key) do
           {:ok, value} -> {:ok, value, exp, fid, offset, vsize}
           other -> other
         end
@@ -1004,10 +1007,10 @@ defmodule Ferricstore.Store.Shard.Compound do
   defp read_promoted_cold_batch([]), do: []
 
   defp read_promoted_cold_batch(entries) do
-    locations = Enum.map(entries, fn {_key, _exp, file_path, off} -> {file_path, off} end)
+    locations = Enum.map(entries, fn {key, _exp, file_path, off} -> {file_path, off, key} end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_batch_read_timeout_ms) do
+      case Ferricstore.Store.ColdRead.pread_batch_keyed(locations, @cold_batch_read_timeout_ms) do
         {:ok, values} when is_list(values) ->
           if length(values) == length(entries) do
             values
@@ -1100,8 +1103,8 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
-  defp read_cold_async(path, offset) do
-    Ferricstore.Store.ColdRead.pread_at(path, offset, @cold_batch_read_timeout_ms)
+  defp read_cold_async(path, offset, key) do
+    Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_batch_read_timeout_ms)
   end
 
   # -- Off-heap binary byte tracking --

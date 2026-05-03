@@ -6,20 +6,22 @@ defmodule Ferricstore.Store.CompoundBatchColdGuardTest do
                    __DIR__
                  )
 
-  test "compound batch cold reads use the async batch pread path" do
+  test "compound batch cold reads use the async keyed batch pread path" do
     ast = compound_ast()
     batch_reader_body = function_body(ast, :read_compound_cold_batch_async, 1)
 
     # HMGET/ZMSCORE/SMISMEMBER-style commands can read many cold large fields.
     # The shared compound batch path must submit those cold reads together
     # instead of serializing one blocking pread per field on the shard process.
+    # Include the expected key so a stale ETS offset cannot return another
+    # compound field's value after compaction or rollback repair.
     assert contains_remote_call?(
              batch_reader_body,
              [:Ferricstore, :Store, :ColdRead],
-             :pread_batch,
+             :pread_batch_keyed,
              2
            ),
-           "expected Shard.Compound batch get path to use ColdRead.pread_batch/2"
+           "expected Shard.Compound batch get path to use ColdRead.pread_batch_keyed/2"
   end
 
   test "promoted compound batch reads use a dedicated batch cold path" do

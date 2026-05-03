@@ -8,9 +8,10 @@ defmodule Ferricstore.Store.PromotedColdAsyncGuardTest do
     source = File.read!(@compound_path)
 
     # Promoted hashes/sets/zsets are the large-collection path. Their cold read
-    # fallbacks must not run blocking pread on a Normal scheduler.
-    assert source =~ "NIF.v2_pread_at_async",
-           "expected promoted compound cold reads to use v2_pread_at_async/4"
+    # fallbacks must stay async and include the expected key, so stale ETS
+    # offsets cannot return another promoted field's value.
+    assert source =~ "ColdRead.pread_at(path, offset, key,",
+           "expected promoted compound cold reads to use keyed ColdRead.pread_at/4"
 
     refute Regex.match?(~r/NIF\.v2_pread_at\(/, source),
            "expected promoted compound cold reads to avoid blocking v2_pread_at/2"
@@ -19,8 +20,8 @@ defmodule Ferricstore.Store.PromotedColdAsyncGuardTest do
   test "transaction promoted cold reads use async pread" do
     source = File.read!(@ops_path)
 
-    assert source =~ "NIF.v2_pread_at_async",
-           "expected transaction promoted cold reads to use v2_pread_at_async/4"
+    assert source =~ "ColdRead.pread_at(path, offset, key,",
+           "expected transaction promoted cold reads to use keyed ColdRead.pread_at/4"
 
     refute Regex.match?(~r/NIF\.v2_pread_at\(/, source),
            "expected transaction promoted cold reads to avoid blocking v2_pread_at/2"

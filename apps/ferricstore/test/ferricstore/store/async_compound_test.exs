@@ -28,8 +28,9 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
   """
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.Batcher
-  alias Ferricstore.Store.{CompoundKey, Router}
+  alias Ferricstore.Store.{CompoundKey, LFU, Router}
   alias Ferricstore.Test.ShardHelpers
 
   @ns "cmpd_async"
@@ -201,6 +202,23 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
         end,
         15_000
       )
+    end
+
+    test "compound_batch_get rejects mismatched cold offsets" do
+      redis_key = ukey("hash_batch_stale_offset")
+      target = hash_field(redis_key, "target")
+      other = hash_field(redis_key, "other")
+      idx = Router.shard_for(ctx(), redis_key)
+      keydir = elem(ctx().keydir_refs, idx)
+      shard_path = Ferricstore.DataDir.shard_data_path(ctx().data_dir, idx)
+      path = Path.join(shard_path, "00000.log")
+
+      {:ok, [{other_offset, _}, {_target_offset, value_size}]} =
+        NIF.v2_append_batch(path, [{other, "wrong-value", 0}, {target, "right-value", 0}])
+
+      :ets.insert(keydir, {target, nil, 0, LFU.initial(), 0, other_offset, value_size})
+
+      assert [nil] == Router.compound_batch_get(ctx(), redis_key, [target])
     end
 
     test "large compound_put restores previous value when Batcher is overloaded" do

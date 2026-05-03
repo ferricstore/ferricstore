@@ -988,9 +988,9 @@ defmodule Ferricstore.Store.Ops do
 
   defp local_batch_read_cold(tx, results, cold_reads) do
     locations =
-      Enum.map(cold_reads, fn {_index, _key, path, _fid, off, _vsize, _exp} -> {path, off} end)
+      Enum.map(cold_reads, fn {_index, key, path, _fid, off, _vsize, _exp} -> {path, off, key} end)
 
-    case ColdRead.pread_batch(locations, @cold_read_timeout_ms) do
+    case ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms) do
       {:ok, values} when is_list(values) ->
         cold_reads
         |> Enum.zip(values)
@@ -1211,7 +1211,7 @@ defmodule Ferricstore.Store.Ops do
   defp read_promoted_cold_value(tx, compound_key, dedicated_path, fid, off, vsize, exp) do
     path = ShardETS.file_path(dedicated_path, fid)
 
-    case read_cold_async(path, off) do
+    case read_cold_async(path, off, compound_key) do
       {:ok, value} ->
         ShardETS.cold_read_warm_ets(tx.shard_state, compound_key, value, exp, fid, off, vsize)
         {value, exp}
@@ -1221,7 +1221,7 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
-  defp read_cold_async(path, offset) do
-    Ferricstore.Store.ColdRead.pread_at(path, offset, @cold_read_timeout_ms)
+  defp read_cold_async(path, offset, key) do
+    Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_read_timeout_ms)
   end
 end
