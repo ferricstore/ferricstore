@@ -44,6 +44,64 @@ defmodule Ferricstore.Store.OpsTest do
     end
   end
 
+  describe "LocalTxStore batch reads" do
+    test "local plain batch_get does not fall back to per-key get" do
+      source = File.read!(@ops_path)
+
+      refute source =~
+               "def batch_get(%LocalTxStore{} = tx, keys), do: Enum.map(keys, &get(tx, &1))",
+             "LocalTxStore batch_get must batch local cold reads instead of one waiter per key"
+    end
+
+    test "batch_get returns ordered cold values and warms matching ETS entries" do
+      ctx = FerricStore.Instance.get(:default)
+
+      keys = [
+        "ops:local_tx:plain-batch-cold:a:#{System.unique_integer([:positive])}",
+        "ops:local_tx:plain-batch-cold:b:#{System.unique_integer([:positive])}",
+        "ops:local_tx:plain-batch-cold:c:#{System.unique_integer([:positive])}"
+      ]
+
+      shard_index = Router.shard_for(ctx, Enum.at(keys, 0))
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ops_local_tx_plain_batch_#{System.unique_integer([:positive])}"
+        )
+
+      keydir = :ets.new(:"ops_local_tx_#{System.unique_integer([:positive])}", [:set, :public])
+
+      try do
+        File.mkdir_p!(dir)
+        path = Path.join(dir, "00000.log")
+        File.touch!(path)
+
+        assert {:ok, [{off_a, size_a}, {off_b, size_b}]} =
+                 NIF.v2_append_batch_nosync(path, [
+                   {Enum.at(keys, 0), "va", 0},
+                   {Enum.at(keys, 1), "vb", 0}
+                 ])
+
+        :ets.insert(keydir, {Enum.at(keys, 0), nil, 0, LFU.initial(), 0, off_a, size_a})
+        :ets.insert(keydir, {Enum.at(keys, 1), nil, 0, LFU.initial(), 0, off_b, size_b})
+
+        tx =
+          local_tx(ctx, shard_index, keydir, %{})
+          |> put_in([Access.key!(:shard_state), :shard_data_path], dir)
+
+        assert ["va", nil, "vb"] ==
+                 Ops.batch_get(tx, [Enum.at(keys, 0), Enum.at(keys, 2), Enum.at(keys, 1)])
+
+        assert [{_, "va", 0, _lfu, 0, ^off_a, ^size_a}] = :ets.lookup(keydir, Enum.at(keys, 0))
+        assert [{_, "vb", 0, _lfu, 0, ^off_b, ^size_b}] = :ets.lookup(keydir, Enum.at(keys, 1))
+      after
+        :ets.delete(keydir)
+        File.rm_rf(dir)
+      end
+    end
+  end
+
   describe "LocalTxStore promoted compound reads" do
     test "local compound batch reads use one cold pread batch" do
       source = File.read!(@ops_path)

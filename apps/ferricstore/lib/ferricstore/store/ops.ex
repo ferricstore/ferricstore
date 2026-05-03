@@ -47,7 +47,7 @@ defmodule Ferricstore.Store.Ops do
   @spec batch_get(store(), [binary()]) :: [binary() | nil]
   def batch_get(%FerricStore.Instance{} = ctx, keys), do: Router.batch_get(ctx, keys)
 
-  def batch_get(%LocalTxStore{} = tx, keys), do: Enum.map(keys, &get(tx, &1))
+  def batch_get(%LocalTxStore{} = tx, keys), do: local_batch_get(tx, keys)
 
   def batch_get(store, keys) when is_map(store) do
     case store do
@@ -873,6 +873,53 @@ defmodule Ferricstore.Store.Ops do
             nil
         end
     end
+  end
+
+  defp local_batch_get(tx, keys) do
+    {local_entries, remote_entries} =
+      keys
+      |> Enum.with_index()
+      |> Enum.reduce({[], []}, fn {key, index}, {local_acc, remote_acc} ->
+        if local?(tx, key) do
+          if tx_deleted?(key),
+            do: {local_acc, remote_acc},
+            else: {[{index, key} | local_acc], remote_acc}
+        else
+          {local_acc, [{index, key} | remote_acc]}
+        end
+      end)
+
+    results =
+      local_entries
+      |> Enum.reverse()
+      |> local_batch_results(%{}, fn entries ->
+        entries
+        |> Enum.map(fn {_index, key} -> key end)
+        |> then(&local_batch_read_values(tx, &1, tx.shard_state.shard_data_path))
+      end)
+
+    results =
+      remote_entries
+      |> Enum.reverse()
+      |> local_batch_results(results, fn entries ->
+        entries
+        |> Enum.map(fn {_index, key} -> key end)
+        |> then(&Router.batch_get(tx.instance_ctx, &1))
+      end)
+
+    keys
+    |> Enum.with_index()
+    |> Enum.map(fn {_key, index} -> Map.get(results, index) end)
+  end
+
+  defp local_batch_results([], results, _read_fun), do: results
+
+  defp local_batch_results(entries, results, read_fun) do
+    entries
+    |> Enum.zip(read_fun.(entries))
+    |> Enum.reduce(results, fn {{index, _key}, value}, acc ->
+      Map.put(acc, index, value)
+    end)
   end
 
   defp local_batch_read_values(tx, keys, data_path) do
