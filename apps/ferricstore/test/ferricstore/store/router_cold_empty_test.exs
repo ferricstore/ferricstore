@@ -132,6 +132,15 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     assert [nil] == Router.batch_get(ctx, [key])
   end
 
+  test "batch cold read top-level errors preserve reason for telemetry" do
+    source = File.read!(Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__))
+    [_before, section] = String.split(source, "{:error, _reason} ->", parts: 2)
+    [branch | _after] = String.split(section, "    end\n\n    entry_values", parts: 2)
+
+    assert branch =~ "List.duplicate({:error, reason}, length(entries))",
+           "top-level batch pread errors must preserve the reason instead of becoming nil_from_cold_location"
+  end
+
   test "direct cold reads do not return a value from a mismatched key offset", %{
     ctx: ctx,
     keydir: keydir

@@ -1970,8 +1970,8 @@ defmodule Ferricstore.Store.Router do
             List.duplicate(nil, length(entries))
           end
 
-        {:error, _reason} ->
-          List.duplicate(nil, length(entries))
+        {:error, reason} ->
+          List.duplicate({:error, reason}, length(entries))
       end
 
     entry_values = Enum.zip(entries, values)
@@ -2030,6 +2030,13 @@ defmodule Ferricstore.Store.Router do
   defp cold_batch_read_error_reason({:error, reason}) when is_binary(reason) do
     if String.contains?(reason, "missing_file"), do: :missing_file, else: :corrupt_record
   end
+
+  defp cold_batch_read_error_reason({:error, reason}) when reason in [:missing_file, :enoent],
+    do: :missing_file
+
+  defp cold_batch_read_error_reason({:error, :timeout}), do: :timeout
+
+  defp cold_batch_read_error_reason({:error, _reason}), do: :corrupt_record
 
   defp cold_batch_read_error_reason(_value), do: :nil_from_cold_location
 
