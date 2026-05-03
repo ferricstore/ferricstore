@@ -3271,7 +3271,7 @@ defmodule Ferricstore.Raft.StateMachine do
         {file_path, file_id}
 
       :stale ->
-        if File.exists?(state.active_file_path) do
+        if Ferricstore.FS.exists?(state.active_file_path) do
           {state.active_file_path, state.active_file_id}
         else
           :stale
@@ -3284,7 +3284,7 @@ defmodule Ferricstore.Raft.StateMachine do
       {file_id, file_path, _data_path} =
         Ferricstore.Store.ActiveFile.get(state.instance_ctx, state.shard_index)
 
-      if File.exists?(file_path) do
+      if Ferricstore.FS.exists?(file_path) do
         {file_path, file_id}
       else
         :stale

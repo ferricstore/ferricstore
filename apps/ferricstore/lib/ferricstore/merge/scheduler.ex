@@ -615,7 +615,7 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   defp count_existing_log_files(shard_data_dir) do
-    case File.ls(shard_data_dir) do
+    case Ferricstore.FS.ls(shard_data_dir) do
       {:ok, entries} -> Enum.count(entries, &bitcask_log_file?/1)
       {:error, _reason} -> 0
     end
@@ -623,7 +623,7 @@ defmodule Ferricstore.Merge.Scheduler do
 
   defp log_file_sizes(shard_data_dir) do
     sizes =
-      case File.ls(shard_data_dir) do
+      case Ferricstore.FS.ls(shard_data_dir) do
         {:ok, entries} ->
           entries
           |> Enum.filter(&bitcask_log_file?/1)
