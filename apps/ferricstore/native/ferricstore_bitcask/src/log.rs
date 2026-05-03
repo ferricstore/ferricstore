@@ -684,12 +684,9 @@ pub fn pread_record_from_file(file: &File, offset: u64) -> Result<Option<Record>
 fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
     // Step 1: pread the header
     let mut header = [0u8; HEADER_SIZE];
-    match file.read_at(&mut header, offset) {
-        Ok(0) => return Ok(None),                    // EOF
-        Ok(n) if n < HEADER_SIZE => return Ok(None), // truncated header = EOF
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    match read_exact_at_or_eof(file, &mut header, offset, "header")? {
+        false => return Ok(None),
+        true => {}
     }
 
     let stored_crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
@@ -721,12 +718,7 @@ fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
     let mut body = vec![0u8; body_len];
     if body_len > 0 {
         let body_offset = offset + HEADER_SIZE as u64;
-        let n = file.read_at(&mut body, body_offset)?;
-        if n < body_len {
-            return Err(LogError(format!(
-                "pread short read: expected {body_len} B, got {n} B"
-            )));
-        }
+        read_exact_at_or_eof(file, &mut body, body_offset, "body")?;
     }
 
     let key = body[..key_size].to_vec();
@@ -756,6 +748,40 @@ fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
     };
 
     Ok(Some(record))
+}
+
+#[cfg(unix)]
+fn read_exact_at_or_eof(file: &File, buf: &mut [u8], offset: u64, label: &str) -> Result<bool> {
+    let mut read_total = 0usize;
+
+    while read_total < buf.len() {
+        let read_offset = offset
+            .checked_add(read_total as u64)
+            .ok_or_else(|| LogError(format!("pread {label} offset overflow")))?;
+
+        match file.read_at(&mut buf[read_total..], read_offset) {
+            Ok(0) if read_total == 0 => return Ok(false),
+            Ok(0) => {
+                return Err(LogError(format!(
+                    "pread {label} short read: expected {} B, got {read_total} B",
+                    buf.len()
+                )));
+            }
+            Ok(n) => read_total += n,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && read_total == 0 => {
+                return Ok(false);
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(LogError(format!(
+                    "pread {label} short read: expected {} B, got {read_total} B",
+                    buf.len()
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(true)
 }
 
 fn read_next_record(reader: &mut impl Read) -> Result<Option<Record>> {
@@ -2676,6 +2702,21 @@ mod tests {
         assert!(pread_record_from_file(&file, file_size + 1000)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn c2_c6_pread_record_from_file_truncated_header_is_error() {
+        let dir = temp_dir();
+        let path = dir.path().join("truncated_header.log");
+        fs::write(&path, vec![0u8; HEADER_SIZE - 1]).unwrap();
+
+        let file = File::open(&path).unwrap();
+        let err = pread_record_from_file(&file, 0).unwrap_err();
+
+        assert!(
+            err.to_string().contains("short read"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
