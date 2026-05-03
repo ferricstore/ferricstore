@@ -387,11 +387,20 @@ defmodule Ferricstore.Store.Shard.Flush do
             Map.put(acc, fid, size)
           end)
 
-        # 2. Sum live bytes per file from ETS (record_header + key + value per entry)
+        # 2. Sum non-expired live bytes per file from ETS
+        # (record_header + key + value per entry). Expired ETS rows are
+        # already logically dead, even when the periodic sweep has not removed
+        # them yet.
+        now_ms = Ferricstore.HLC.now_ms()
+
         live_per_file =
           :ets.foldl(
-            fn {key, _value, _exp, _lfu, fid, _off, vsize}, acc ->
-              accumulate_live_bytes(acc, key, fid, vsize)
+            fn {key, _value, expire_at_ms, _lfu, fid, _off, vsize}, acc ->
+              if live_expiry?(expire_at_ms, now_ms) do
+                accumulate_live_bytes(acc, key, fid, vsize)
+              else
+                acc
+              end
             end,
             %{},
             keydir
@@ -423,6 +432,10 @@ defmodule Ferricstore.Store.Shard.Flush do
       _ -> 0
     end
   end
+
+  defp live_expiry?(expire_at_ms, _now_ms) when expire_at_ms in [0, nil], do: true
+  defp live_expiry?(expire_at_ms, now_ms) when is_integer(expire_at_ms), do: expire_at_ms > now_ms
+  defp live_expiry?(_expire_at_ms, _now_ms), do: true
 
   defp merge_scheduler_name(%{name: :default}, index), do: :"Ferricstore.Merge.Scheduler.#{index}"
   defp merge_scheduler_name(%{name: name}, index), do: :"#{name}.Merge.Scheduler.#{index}"
