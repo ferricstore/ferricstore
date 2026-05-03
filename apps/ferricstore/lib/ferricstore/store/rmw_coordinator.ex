@@ -111,14 +111,14 @@ defmodule Ferricstore.Store.RmwCoordinator do
   end
 
   def handle_call(:sweep_latches_now, _from, state) do
-    sweep_known_context_latches(state)
+    state = sweep_known_context_latches(state)
 
     {:reply, :ok, state}
   end
 
   @impl true
   def handle_info(:sweep_latches, state) do
-    sweep_known_context_latches(state)
+    state = sweep_known_context_latches(state)
 
     Process.send_after(self(), :sweep_latches, @sweep_interval_ms)
     {:noreply, state}
@@ -211,34 +211,47 @@ defmodule Ferricstore.Store.RmwCoordinator do
     end
   end
 
+  defp remember_context(state, %FerricStore.Instance{name: :default}), do: state
+
   defp remember_context(state, %FerricStore.Instance{} = ctx) do
     %{state | contexts: Map.put(state.contexts, ctx.name, ctx)}
   end
 
   defp sweep_known_context_latches(state) do
-    state
-    |> known_contexts()
-    |> Enum.each(fn ctx ->
-      if state.idx < tuple_size(ctx.latch_refs) do
-        sweep_latch_table(elem(ctx.latch_refs, state.idx))
-      end
-    end)
+    if ctx = default_context() do
+      sweep_context_latches(ctx, state.idx)
+    end
+
+    contexts =
+      Enum.reduce(state.contexts, %{}, fn {name, ctx}, acc ->
+        if sweep_context_latches(ctx, state.idx) == :keep do
+          Map.put(acc, name, ctx)
+        else
+          acc
+        end
+      end)
+
+    %{state | contexts: contexts}
   end
 
-  defp sweep_latch_table(tab) do
+  defp sweep_context_latches(ctx, idx) do
+    with true <- idx < tuple_size(ctx.latch_refs),
+         tab <- elem(ctx.latch_refs, idx),
+         true <- latch_table_exists?(tab) do
+      do_sweep(tab)
+      :keep
+    else
+      _ -> :drop
+    end
+  end
+
+  defp latch_table_exists?(tab) do
     case :ets.whereis(tab) do
-      :undefined -> :ok
-      _tid -> do_sweep(tab)
+      :undefined -> false
+      _tid -> true
     end
   rescue
-    ArgumentError -> :ok
-  end
-
-  defp known_contexts(state) do
-    state.contexts
-    |> Map.put(:default, default_context())
-    |> Map.values()
-    |> Enum.reject(&is_nil/1)
+    ArgumentError -> false
   end
 
   defp default_context do

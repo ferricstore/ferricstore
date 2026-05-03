@@ -111,6 +111,20 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       end
     end
 
+    test "RmwCoordinator prunes checked-in custom instance contexts after sweep" do
+      isolated = minimal_instance_context()
+      idx = 0
+      name = isolated.name
+
+      assert nil == RmwCoordinator.execute(idx, isolated, {:getdel, ukey("register_prune_ctx")})
+      assert Map.has_key?(:sys.get_state(RmwCoordinator.name(idx)).contexts, name)
+
+      cleanup_minimal_instance_context(isolated)
+
+      assert :ok = RmwCoordinator.sweep_latches(idx)
+      refute Map.has_key?(:sys.get_state(RmwCoordinator.name(idx)).contexts, name)
+    end
+
     test "RmwCoordinator does not serialize same-key RMW across different instances" do
       ctx_a = IsolatedInstance.checkout(shard_count: 1)
       ctx_b = IsolatedInstance.checkout(shard_count: 1)
