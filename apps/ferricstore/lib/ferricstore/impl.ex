@@ -845,12 +845,10 @@ defmodule FerricStore.Impl do
         Path.join(shard_path, "prob")
       end,
       compound_get: fn redis_key, compound_key ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_get, redis_key, compound_key})
+        Router.compound_get(ctx, redis_key, compound_key)
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
+        Router.compound_get_meta(ctx, redis_key, compound_key)
       end,
       compound_batch_get: fn redis_key, compound_keys ->
         Router.compound_batch_get(ctx, redis_key, compound_keys)
@@ -859,24 +857,19 @@ defmodule FerricStore.Impl do
         Router.compound_batch_get_meta(ctx, redis_key, compound_keys)
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
+        Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_delete, redis_key, compound_key})
+        Router.compound_delete(ctx, redis_key, compound_key)
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_scan, redis_key, prefix})
+        Router.compound_scan(ctx, redis_key, prefix)
       end,
       compound_count: fn redis_key, prefix ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_count, redis_key, prefix})
+        Router.compound_count(ctx, redis_key, prefix)
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
+        Router.compound_delete_prefix(ctx, redis_key, prefix)
       end
     }
   end
