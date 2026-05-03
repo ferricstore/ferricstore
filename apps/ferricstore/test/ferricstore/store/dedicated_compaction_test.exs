@@ -12,6 +12,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Commands.Hash
   alias Ferricstore.Store.{Promotion, Router}
+  alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Test.ShardHelpers
 
   # Low threshold so we can trigger promotion in tests
@@ -24,6 +25,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
 
   setup do
     original_promo = Application.get_env(:ferricstore, :promotion_threshold)
+
     original_pt =
       try do
         :persistent_term.get(:ferricstore_promotion_threshold)
@@ -64,31 +66,66 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       flush: fn -> :ok end,
       dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_scan, redis_key, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_count, redis_key, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
     }
@@ -97,9 +134,11 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
   defp ukey(base), do: "#{base}_#{:rand.uniform(9_999_999)}"
 
   defp promote_hash(store, key) do
-    pairs = Enum.flat_map(1..(@test_threshold + 1), fn i ->
-      ["field_#{i}", "value_#{i}"]
-    end)
+    pairs =
+      Enum.flat_map(1..(@test_threshold + 1), fn i ->
+        ["field_#{i}", "value_#{i}"]
+      end)
+
     Hash.handle("HSET", [key | pairs], store)
     key
   end
@@ -114,6 +153,18 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
     case File.ls(dir) do
       {:ok, files} -> Enum.count(files, &String.ends_with?(&1, ".log"))
       _ -> 0
+    end
+  end
+
+  defp log_files(dir) do
+    case File.ls(dir) do
+      {:ok, files} ->
+        files
+        |> Enum.filter(&String.ends_with?(&1, ".log"))
+        |> Enum.sort()
+
+      _ ->
+        []
     end
   end
 
@@ -203,6 +254,34 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
   # ---------------------------------------------------------------------------
 
   describe "compaction on write count" do
+    test "dedicated compaction still runs after restart with cold promotion marker" do
+      store = real_store()
+      key = ukey("restart_compact")
+      promote_hash(store, key)
+
+      dir = dedicated_dir(key)
+      assert log_files(dir) == ["00000.log"]
+
+      ShardHelpers.flush_all_shards()
+      ShardHelpers.kill_shard_for_key(key)
+
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      state = :sys.get_state(shard)
+      marker_key = Promotion.marker_key(key)
+
+      assert [{^marker_key, "hash", _exp, _lfu, _fid, _off, _vsize}] =
+               :ets.lookup(state.keydir, marker_key)
+
+      :sys.replace_state(shard, fn state ->
+        dedicated_path = state.promoted_instances[key].path
+        ShardCompound.compact_dedicated(state, key, dedicated_path)
+      end)
+
+      assert log_files(dir) == ["00001.log"]
+      assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
+    end
+
     test "many writes trigger compaction and data is still readable" do
       store = real_store()
       key = ukey("compact_trigger")
@@ -296,9 +375,12 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       ShardHelpers.flush_all_shards()
       ShardHelpers.kill_shard_safely(shard_idx)
 
-      ShardHelpers.eventually(fn ->
-        "value_1" == Hash.handle("HGET", [key, "field_1"], store)
-      end, "field_1 should survive restart after compaction")
+      ShardHelpers.eventually(
+        fn ->
+          "value_1" == Hash.handle("HGET", [key, "field_1"], store)
+        end,
+        "field_1 should survive restart after compaction"
+      )
     end
 
     test "crash leaves two files — recovery reads both" do
@@ -318,14 +400,20 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       ShardHelpers.kill_shard_safely(shard_idx)
 
       # Old file entries survive
-      ShardHelpers.eventually(fn ->
-        "value_1" == Hash.handle("HGET", [key, "field_1"], store)
-      end, "field_1 from old file should survive")
+      ShardHelpers.eventually(
+        fn ->
+          "value_1" == Hash.handle("HGET", [key, "field_1"], store)
+        end,
+        "field_1 from old file should survive"
+      )
 
       # New file entries survive
-      ShardHelpers.eventually(fn ->
-        "crash_value" == Hash.handle("HGET", [key, "crash_field"], store)
-      end, "crash_field from new file should survive")
+      ShardHelpers.eventually(
+        fn ->
+          "crash_value" == Hash.handle("HGET", [key, "crash_field"], store)
+        end,
+        "crash_field from new file should survive"
+      )
     end
 
     test "last-write-wins across files on recovery" do
@@ -344,9 +432,12 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       ShardHelpers.flush_all_shards()
       ShardHelpers.kill_shard_safely(shard_idx)
 
-      ShardHelpers.eventually(fn ->
-        "overwritten" == Hash.handle("HGET", [key, "field_1"], store)
-      end, "field_1 should have value from newer file")
+      ShardHelpers.eventually(
+        fn ->
+          "overwritten" == Hash.handle("HGET", [key, "field_1"], store)
+        end,
+        "field_1 should have value from newer file"
+      )
     end
 
     test "tombstone in newer file deletes entry from older file" do
@@ -365,14 +456,20 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       ShardHelpers.kill_shard_safely(shard_idx)
 
       # field_1 deleted
-      ShardHelpers.eventually(fn ->
-        nil == Hash.handle("HGET", [key, "field_1"], store)
-      end, "field_1 should be deleted by tombstone")
+      ShardHelpers.eventually(
+        fn ->
+          nil == Hash.handle("HGET", [key, "field_1"], store)
+        end,
+        "field_1 should be deleted by tombstone"
+      )
 
       # Others survive
-      ShardHelpers.eventually(fn ->
-        "value_2" == Hash.handle("HGET", [key, "field_2"], store)
-      end, "field_2 should survive")
+      ShardHelpers.eventually(
+        fn ->
+          "value_2" == Hash.handle("HGET", [key, "field_2"], store)
+        end,
+        "field_2 should survive"
+      )
     end
   end
 

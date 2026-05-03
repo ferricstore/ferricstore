@@ -285,6 +285,11 @@ defmodule Ferricstore.Store.Promotion do
             end
           end
 
+        if value == nil and is_binary(type_str) do
+          track_binary_insert(keydir, shard_index, full_key, type_str, instance_ctx)
+          :ets.update_element(keydir, full_key, {2, type_str})
+        end
+
         {redis_key, type_str}
       end)
       |> Enum.filter(fn {_, type_str} -> is_binary(type_str) end)
