@@ -1,7 +1,11 @@
 defmodule Ferricstore.Bench.RecoveryTimeBenchTest do
   @moduledoc """
-  Benchmarks restart recovery cost when Ra has entries beyond the last emitted
-  release cursor.
+  Benchmarks in-process supervised shard recovery cost when Ra has entries
+  beyond the last emitted release cursor.
+
+  This is a regression metric that can run inside ExUnit. It does not replace
+  an external kill-9/full-BEAM restart harness because Ra may still write
+  recovery checkpoints during supervised restarts.
 
   Run with:
 
@@ -18,7 +22,7 @@ defmodule Ferricstore.Bench.RecoveryTimeBenchTest do
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
-  test "benchmark: restart recovery time with unreleased Ra entries" do
+  test "benchmark: supervised shard recovery time with unreleased Ra entries" do
     writes = bench_writes()
     original_interval = Application.get_env(:ferricstore, :release_cursor_interval)
 
@@ -49,12 +53,15 @@ defmodule Ferricstore.Bench.RecoveryTimeBenchTest do
     released_before_restart = max_atomic(instance_ctx, :last_released_cursor_index)
     gap_before_restart = max(applied_before_restart - released_before_restart, 0)
 
-    data_dir = Application.fetch_env!(:ferricstore, :data_dir)
-    server_started? = application_started?(:ferricstore_server)
-
-    {restart_us, :ok} =
+    {recovery_us, :ok} =
       :timer.tc(fn ->
-        restart_ferricstore(data_dir, server_started?)
+        shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+
+        for i <- 0..(shard_count - 1) do
+          ShardHelpers.kill_shard_safely(i, timeout: 30_000)
+        end
+
+        :ok
       end)
 
     restarted_ctx = FerricStore.Instance.get(:default)
@@ -73,13 +80,13 @@ defmodule Ferricstore.Bench.RecoveryTimeBenchTest do
 
       recovery bench writes=#{writes}
       write_time_ms=#{div(write_us, 1000)}
-      restart_time_ms=#{div(restart_us, 1000)}
+      supervised_shard_recovery_time_ms=#{div(recovery_us, 1000)}
       release_cursor_gap_before_restart=#{gap_before_restart}
       last_applied_before_restart=#{applied_before_restart}
       last_released_before_restart=#{released_before_restart}
     """)
 
-    assert restart_us > 0
+    assert recovery_us > 0
     assert gap_before_restart > 0
     assert applied_before_restart >= released_before_restart
   end
@@ -115,39 +122,5 @@ defmodule Ferricstore.Bench.RecoveryTimeBenchTest do
     end
   rescue
     _ -> 0
-  end
-
-  defp restart_ferricstore(data_dir, server_started?) do
-    stop_app_if_started(:ferricstore_server)
-    stop_app_if_started(:ferricstore)
-
-    try do
-      :ra_system.stop(Ferricstore.Raft.Cluster.system_name())
-    catch
-      _, _ -> :ok
-    end
-
-    Application.put_env(:ferricstore, :data_dir, data_dir)
-    {:ok, _} = Application.ensure_all_started(:ferricstore)
-    ShardHelpers.wait_shards_alive(30_000)
-
-    if server_started? do
-      {:ok, _} = Application.ensure_all_started(:ferricstore_server)
-    end
-
-    Ferricstore.Health.set_ready(true)
-    :ok
-  end
-
-  defp application_started?(app) do
-    Enum.any?(Application.started_applications(), fn {started_app, _desc, _vsn} ->
-      started_app == app
-    end)
-  end
-
-  defp stop_app_if_started(app) do
-    if application_started?(app) do
-      _ = Application.stop(app)
-    end
   end
 end
