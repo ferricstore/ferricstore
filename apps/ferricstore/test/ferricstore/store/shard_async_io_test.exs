@@ -1032,6 +1032,28 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert [{"b", nil, 0, _lfu, 1, ^b_offset, ^b_size}] = :ets.lookup(keydir, "b")
     end
 
+    test "recovers shard logs in numeric file id order past five digits" do
+      dir = Path.join(System.tmp_dir!(), "numeric_log_recovery_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      old_log = Path.join(dir, "99999.log")
+      new_log = Path.join(dir, "100000.log")
+
+      {:ok, {_old_offset, _old_size}} = NIF.v2_append_record(old_log, "rollover_key", "old", 0)
+
+      {:ok, {new_offset, _new_record_size}} =
+        NIF.v2_append_record(new_log, "rollover_key", "new", 0)
+
+      keydir = :ets.new(:numeric_log_recovery_keydir, [:set, :public])
+
+      Ferricstore.Store.Shard.Lifecycle.recover_keydir(dir, keydir, 0)
+
+      assert [{"rollover_key", nil, 0, _lfu, 100_000, ^new_offset, 3}] =
+               :ets.lookup(keydir, "rollover_key")
+    end
+
     test "replays log tail after stale active-file hint" do
       previous_trap_exit = Process.flag(:trap_exit, true)
 

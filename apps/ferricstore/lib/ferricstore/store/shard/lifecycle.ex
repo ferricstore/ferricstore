@@ -74,7 +74,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         log_files =
           files
           |> Enum.filter(&String.ends_with?(&1, ".log"))
-          |> Enum.sort()
+          |> Enum.sort_by(&log_file_id/1)
 
         Logger.debug(
           "Shard #{shard_index}: recover_keydir scanning #{length(log_files)} log file(s) at #{shard_path}"
@@ -84,7 +84,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         hint_files =
           files
           |> Enum.filter(&String.ends_with?(&1, ".hint"))
-          |> Enum.sort()
+          |> Enum.sort_by(&hint_file_id/1)
 
         recover_from_hints_or_logs(
           shard_path,
@@ -655,6 +655,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   end
 
   defp log_file_id(name), do: name |> String.trim_trailing(".log") |> String.to_integer()
+  defp hint_file_id(name), do: name |> String.trim_trailing(".hint") |> String.to_integer()
 
   defp recover_tombstones_from_log(shard_path, log_name, keydir, shard_index, instance_ctx) do
     log_path = Path.join(shard_path, log_name)
