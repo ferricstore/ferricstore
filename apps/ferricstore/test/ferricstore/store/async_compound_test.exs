@@ -116,6 +116,49 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       assert nil == Router.compound_get(ctx(), redis_key, ck)
     end
 
+    test "compound_put waits on the per-field async latch" do
+      redis_key = ukey("hash_latch_put")
+      ck = hash_field(redis_key, "name")
+      idx = Router.shard_for(ctx(), redis_key)
+      latch_tab = elem(ctx().latch_refs, idx)
+
+      assert :ets.insert_new(latch_tab, {ck, self()})
+
+      task =
+        Task.async(fn ->
+          Router.compound_put(ctx(), redis_key, ck, "alice", 0)
+        end)
+
+      refute Task.yield(task, 25)
+      assert nil == Router.compound_get(ctx(), redis_key, ck)
+
+      :ets.select_delete(latch_tab, [{{ck, self()}, [], [true]}])
+      assert :ok = Task.await(task, 1_000)
+      assert "alice" == Router.compound_get(ctx(), redis_key, ck)
+    end
+
+    test "compound_delete waits on the per-field async latch" do
+      redis_key = ukey("hash_latch_delete")
+      ck = hash_field(redis_key, "name")
+      idx = Router.shard_for(ctx(), redis_key)
+      latch_tab = elem(ctx().latch_refs, idx)
+
+      :ok = Router.compound_put(ctx(), redis_key, ck, "alice", 0)
+      assert :ets.insert_new(latch_tab, {ck, self()})
+
+      task =
+        Task.async(fn ->
+          Router.compound_delete(ctx(), redis_key, ck)
+        end)
+
+      refute Task.yield(task, 25)
+      assert "alice" == Router.compound_get(ctx(), redis_key, ck)
+
+      :ets.select_delete(latch_tab, [{{ck, self()}, [], [true]}])
+      assert :ok = Task.await(task, 1_000)
+      assert nil == Router.compound_get(ctx(), redis_key, ck)
+    end
+
     test "compound_put with TTL is readable before expiry" do
       redis_key = ukey("hash_ttl")
       ck = hash_field(redis_key, "ephemeral")

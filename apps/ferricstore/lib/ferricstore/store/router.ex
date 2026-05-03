@@ -3476,6 +3476,12 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_compound_put(ctx, idx, _redis_key, compound_key, value, expire_at_ms) do
+    with_async_key_latch(ctx, idx, compound_key, fn ->
+      do_async_compound_put(ctx, idx, compound_key, value, expire_at_ms)
+    end)
+  end
+
+  defp do_async_compound_put(ctx, idx, compound_key, value, expire_at_ms) do
     size = :atomics.info(ctx.disk_pressure).size
     under_pressure = idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
 
@@ -3499,6 +3505,12 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_compound_delete(ctx, idx, compound_key) do
+    with_async_key_latch(ctx, idx, compound_key, fn ->
+      do_async_compound_delete(ctx, idx, compound_key)
+    end)
+  end
+
+  defp do_async_compound_delete(ctx, idx, compound_key) do
     size = :atomics.info(ctx.disk_pressure).size
     under_pressure = idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
 
