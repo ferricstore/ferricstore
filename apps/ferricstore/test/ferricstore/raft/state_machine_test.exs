@@ -950,6 +950,36 @@ defmodule Ferricstore.Raft.StateMachineTest do
         )
     end
 
+    test "cross-shard GET rejects mismatched cold offsets", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path,
+      shard_index: shard_index
+    } do
+      key = "cross_cold_stale_offset"
+      other_key = "cross_cold_other_offset"
+
+      {:ok, [{other_offset, _}, {_key_offset, value_size}]} =
+        NIF.v2_append_batch(active_file_path, [
+          {other_key, "wrong-value", 0},
+          {key, "right-value", 0}
+        ])
+
+      :ets.insert(
+        ets,
+        {key, nil, 0, Ferricstore.Store.LFU.initial(), 0, other_offset, value_size}
+      )
+
+      {_new_state, %{^shard_index => [nil]}} =
+        StateMachine.apply(
+          %{system_time: Ferricstore.HLC.now_ms()},
+          {:cross_shard_tx, [{shard_index, [{"GET", [key]}], nil}]},
+          state
+        )
+
+      assert [{^key, nil, 0, _lfu, 0, ^other_offset, ^value_size}] = :ets.lookup(ets, key)
+    end
+
     test "cross-shard PTTL reads cold metadata from valid file id zero", %{
       state: state,
       ets: ets,
@@ -1454,6 +1484,32 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert result == :ok
       assert [{^key, "new", 0, _lfu, _fid, _off, 3}] = :ets.lookup(ets, key)
+    end
+  end
+
+  describe "apply/3 with {:append, key, suffix}" do
+    test "APPEND treats a mismatched cold offset as missing", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      key = "append_stale_cold_offset"
+      other_key = "append_other_cold_offset"
+
+      {:ok, [{other_offset, _}, {_key_offset, value_size}]} =
+        NIF.v2_append_batch(active_file_path, [
+          {other_key, "wrong-value", 0},
+          {key, "right-value", 0}
+        ])
+
+      :ets.insert(
+        ets,
+        {key, nil, 0, Ferricstore.Store.LFU.initial(), 0, other_offset, value_size}
+      )
+
+      {_new_state, {:ok, 1}} = StateMachine.apply(%{}, {:append, key, "!"}, state)
+
+      assert [{^key, "!", 0, _lfu, _fid, _off, 1}] = :ets.lookup(ets, key)
     end
   end
 

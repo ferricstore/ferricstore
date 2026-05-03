@@ -1595,7 +1595,7 @@ defmodule Ferricstore.Raft.StateMachine do
         [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
-          case read_cold_async(path, off) do
+          case read_cold_async(path, off, key) do
             {:ok, v} -> v
             _ -> nil
           end
@@ -1607,7 +1607,7 @@ defmodule Ferricstore.Raft.StateMachine do
         when exp > now and valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
-          case read_cold_async(path, off) do
+          case read_cold_async(path, off, key) do
             {:ok, v} -> v
             _ -> nil
           end
@@ -1640,7 +1640,7 @@ defmodule Ferricstore.Raft.StateMachine do
         [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
-          case read_cold_async(path, off) do
+          case read_cold_async(path, off, key) do
             {:ok, v} -> {v, 0}
             _ -> nil
           end
@@ -1652,7 +1652,7 @@ defmodule Ferricstore.Raft.StateMachine do
         when exp > now and valid_cold_location(fid, off, vsize) ->
           path = sm_file_path_from_path(data_path, fid)
 
-          case read_cold_async(path, off) do
+          case read_cold_async(path, off, key) do
             {:ok, v} -> {v, exp}
             _ -> nil
           end
@@ -1702,7 +1702,7 @@ defmodule Ferricstore.Raft.StateMachine do
             value == nil ->
               field = sm_prefix_field(key)
               path = sm_file_path_from_path(data_path, fid)
-              entry = {field, path, off}
+              entry = {field, key, path, off}
               {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
 
             true ->
@@ -1736,10 +1736,10 @@ defmodule Ferricstore.Raft.StateMachine do
   defp cross_shard_read_cold_batch([]), do: []
 
   defp cross_shard_read_cold_batch(entries) do
-    locations = Enum.map(entries, fn {_field, path, off} -> {path, off} end)
+    locations = Enum.map(entries, fn {_field, key, path, off} -> {path, off, key} end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_read_timeout_ms) do
+      case Ferricstore.Store.ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms) do
         {:ok, values} when is_list(values) ->
           if length(values) == length(entries) do
             values
@@ -1753,7 +1753,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     Enum.zip(entries, values)
     |> Enum.map(fn
-      {{field, _path, _off}, value} when value != nil -> {field, value}
+      {{field, _key, _path, _off}, value} when value != nil -> {field, value}
       {_entry, _value} -> nil
     end)
   end
@@ -1861,7 +1861,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
       [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         path = sm_file_path_from_path(data_path, fid)
-        {results, [{index, path, off, 0} | cold]}
+        {results, [{index, key, path, off, 0} | cold]}
 
       [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
         {Map.put(results, index, {value, exp}), cold}
@@ -1869,7 +1869,7 @@ defmodule Ferricstore.Raft.StateMachine do
       [{^key, nil, exp, _lfu, fid, off, vsize}]
       when exp > now and valid_cold_location(fid, off, vsize) ->
         path = sm_file_path_from_path(data_path, fid)
-        {results, [{index, path, off, exp} | cold]}
+        {results, [{index, key, path, off, exp} | cold]}
 
       [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
         cross_shard_delete_keydir_entry(ctx, key, nil)
@@ -1886,10 +1886,10 @@ defmodule Ferricstore.Raft.StateMachine do
   defp cross_shard_read_cold_meta_batch(results, []), do: results
 
   defp cross_shard_read_cold_meta_batch(results, cold_reads) do
-    locations = Enum.map(cold_reads, fn {_index, path, off, _exp} -> {path, off} end)
+    locations = Enum.map(cold_reads, fn {_index, key, path, off, _exp} -> {path, off, key} end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_read_timeout_ms) do
+      case Ferricstore.Store.ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms) do
         {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
           values
 
@@ -1900,7 +1900,7 @@ defmodule Ferricstore.Raft.StateMachine do
     cold_reads
     |> Enum.zip(values)
     |> Enum.reduce(results, fn
-      {{index, _path, _off, exp}, value}, acc when value != nil ->
+      {{index, _key, _path, _off, exp}, value}, acc when value != nil ->
         Map.put(acc, index, {value, exp})
 
       {_read, _value}, acc ->
@@ -4037,12 +4037,12 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp sm_store_read_cold_batch(state, results, cold_reads, path_fun) do
     locations =
-      Enum.map(cold_reads, fn {_index, _key, _exp, fid, off} ->
-        {path_fun.(state, fid), off}
+      Enum.map(cold_reads, fn {_index, key, _exp, fid, off} ->
+        {path_fun.(state, fid), off, key}
       end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_read_timeout_ms) do
+      case Ferricstore.Store.ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms) do
         {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
           values
 
@@ -4178,12 +4178,12 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp sm_store_read_cold_meta_batch(state, results, cold_reads, path_fun) do
     locations =
-      Enum.map(cold_reads, fn {_index, _key, _exp, fid, off} ->
-        {path_fun.(state, fid), off}
+      Enum.map(cold_reads, fn {_index, key, _exp, fid, off} ->
+        {path_fun.(state, fid), off, key}
       end)
 
     values =
-      case Ferricstore.Store.ColdRead.pread_batch(locations, @cold_read_timeout_ms) do
+      case Ferricstore.Store.ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms) do
         {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
           values
 
@@ -4630,7 +4630,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp warm_from_disk(state, key, expire_at_ms, fid, off) do
     path = sm_file_path(state, fid)
 
-    case read_cold_async(path, off) do
+    case read_cold_async(path, off, key) do
       {:ok, value} when is_binary(value) ->
         v = value_for_ets(value, hot_cache_threshold(state))
         # Cold -> warm: previous ETS value was nil, only new value bytes matter
@@ -4643,8 +4643,8 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp read_cold_async(path, offset) do
-    Ferricstore.Store.ColdRead.pread_at(path, offset, @cold_read_timeout_ms)
+  defp read_cold_async(path, offset, key) do
+    Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_read_timeout_ms)
   end
 
   # Returns the full file path for a log file within this shard's data dir.
