@@ -3800,12 +3800,14 @@ defmodule Ferricstore.Raft.StateMachine do
   defp sm_store_compound_local_keys(state, prefix) do
     prefix_size = byte_size(prefix)
 
-    state.ets
-    |> :ets.select([{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}])
-    |> Enum.filter(fn
-      <<^prefix::binary-size(prefix_size), _rest::binary>> -> true
-      _key -> false
-    end)
+    :ets.select(state.ets, [
+      {{:"$1", :_, :_, :_, :_, :_, :_},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_size},
+           {:==, {:binary_part, :"$1", 0, prefix_size}, prefix}}}
+       ], [:"$1"]}
+    ])
   end
 
   defp sm_store_compound_get(state, redis_key, compound_key) do
