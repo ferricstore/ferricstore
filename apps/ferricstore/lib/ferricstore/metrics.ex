@@ -26,6 +26,7 @@ defmodule Ferricstore.Metrics do
   | `ferricstore_slowlog_entries`            | gauge   | `SlowLog.len/0`              |
   | `ferricstore_namespace_window_ms`        | gauge   | `NamespaceConfig.get_all/0`   |
   | `ferricstore_namespace_durability`       | gauge   | `NamespaceConfig.get_all/0`   |
+  | `ferricstore_bitcask_*`                  | gauge   | per-shard checkpoint atomics  |
   | `ferricstore_prefix_*`                   | mixed   | `PrefixMetricsCache`          |
   | `ferricstore_quorum_*`                   | counter | `QuorumMetrics` telemetry     |
 
@@ -87,10 +88,11 @@ defmodule Ferricstore.Metrics do
       |> Enum.map_join("\n", &format_metric/1)
 
     ns = namespace_metrics_text()
+    checkpoint = checkpoint_metrics_text()
     prefix = prefix_metrics_text()
     quorum = Ferricstore.QuorumMetrics.prometheus_text()
 
-    [base, ns, prefix, quorum]
+    [base, ns, checkpoint, prefix, quorum]
     |> Enum.reject(&(&1 == ""))
     |> Enum.join("\n")
     |> Kernel.<>("\n")
@@ -211,6 +213,78 @@ defmodule Ferricstore.Metrics do
   @spec prefix_metrics_text() :: binary()
   defp prefix_metrics_text do
     Ferricstore.PrefixMetricsCache.text()
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: per-shard checkpoint/release cursor metrics
+  # ---------------------------------------------------------------------------
+
+  @spec checkpoint_metrics_text() :: binary()
+  defp checkpoint_metrics_text do
+    ctx = FerricStore.Instance.get(:default)
+
+    [
+      checkpoint_metric_family(
+        "ferricstore_bitcask_last_applied_index",
+        "Last Raft index applied by the Bitcask-backed state machine per shard",
+        fn shard -> atomic_metric(ctx, :last_applied_index, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_bitcask_last_released_cursor_index",
+        "Last Raft index released for log compaction per shard",
+        fn shard -> atomic_metric(ctx, :last_released_cursor_index, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_bitcask_release_cursor_gap",
+        "Difference between last applied and last released Raft cursor per shard",
+        fn shard ->
+          last_applied = atomic_metric(ctx, :last_applied_index, shard)
+          last_released = atomic_metric(ctx, :last_released_cursor_index, shard)
+
+          max(last_applied - last_released, 0)
+        end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_bitcask_checkpoint_dirty",
+        "Whether the shard has uncheckpointed Bitcask data",
+        fn shard -> atomic_metric(ctx, :checkpoint_flags, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_bitcask_checkpoint_in_flight",
+        "Whether a Bitcask fsync checkpoint is currently in flight",
+        fn shard -> atomic_metric(ctx, :checkpoint_in_flight, shard) end
+      )
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp checkpoint_metric_family(name, help, value_fun) when is_function(value_fun, 1) do
+    samples =
+      0..(shard_count() - 1)
+      |> Enum.map_join("\n", fn shard ->
+        "#{name}{shard_index=\"#{shard}\"} #{value_fun.(shard)}"
+      end)
+
+    "# HELP #{name} #{help}\n# TYPE #{name} gauge\n#{samples}"
+  end
+
+  defp atomic_metric(nil, _field, _shard), do: 0
+
+  defp atomic_metric(ctx, field, shard) when is_atom(field) and is_integer(shard) and shard >= 0 do
+    case Map.get(ctx, field) do
+      ref when is_reference(ref) ->
+        index = shard + 1
+        if index <= :atomics.info(ref).size, do: :atomics.get(ref, index), else: 0
+
+      _ ->
+        0
+    end
+  rescue
+    _ -> 0
+  end
+
+  defp shard_count do
+    Application.get_env(:ferricstore, :shard_count, 4)
   end
 
   # ---------------------------------------------------------------------------

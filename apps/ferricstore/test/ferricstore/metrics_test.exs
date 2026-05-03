@@ -241,6 +241,24 @@ defmodule Ferricstore.MetricsTest do
              )
     end
 
+    test "includes per-shard checkpoint and release cursor gauges" do
+      text = Metrics.handle("FERRICSTORE.METRICS", [])
+
+      expected_metrics = [
+        "ferricstore_bitcask_last_applied_index",
+        "ferricstore_bitcask_last_released_cursor_index",
+        "ferricstore_bitcask_release_cursor_gap",
+        "ferricstore_bitcask_checkpoint_dirty",
+        "ferricstore_bitcask_checkpoint_in_flight"
+      ]
+
+      for metric <- expected_metrics do
+        assert String.contains?(text, "# HELP #{metric} ")
+        assert String.contains?(text, "# TYPE #{metric} gauge")
+        assert String.contains?(text, ~s(#{metric}{shard_index="0"}))
+      end
+    end
+
     test "serves prefix metrics from cache instead of rescanning on every scrape" do
       PrefixMetricsCache.reset()
 
