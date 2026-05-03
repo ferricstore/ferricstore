@@ -19,6 +19,7 @@ defmodule FerricStore.Instance do
   @type t :: %__MODULE__{
           name: atom(),
           data_dir: binary(),
+          data_dir_expanded: binary(),
           shard_count: non_neg_integer(),
           slot_map: tuple(),
           shard_names: tuple(),
@@ -56,6 +57,7 @@ defmodule FerricStore.Instance do
   defstruct [
     :name,
     :data_dir,
+    :data_dir_expanded,
     :shard_count,
     :slot_map,
     :shard_names,
@@ -102,6 +104,7 @@ defmodule FerricStore.Instance do
   def build(name, opts) do
     shard_count = Keyword.get(opts, :shard_count, 4)
     data_dir = Keyword.get(opts, :data_dir, "data")
+    data_dir_expanded = Path.expand(data_dir)
 
     # Slot map: 1024 slots → shard indices
     slot_map = build_slot_map(shard_count)
@@ -243,6 +246,7 @@ defmodule FerricStore.Instance do
     ctx = %__MODULE__{
       name: name,
       data_dir: data_dir,
+      data_dir_expanded: data_dir_expanded,
       shard_count: shard_count,
       slot_map: slot_map,
       shard_names: shard_names,

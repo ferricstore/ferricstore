@@ -87,7 +87,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   @type shard_state :: %{
           shard_index: non_neg_integer(),
+          data_dir: binary(),
+          data_dir_expanded: binary(),
           shard_data_path: binary(),
+          shard_data_path_expanded: binary(),
           active_file_id: non_neg_integer(),
           active_file_path: binary(),
           ets: atom(),
@@ -121,6 +124,13 @@ defmodule Ferricstore.Raft.StateMachine do
   @impl true
   @spec init(map()) :: shard_state()
   def init(config) do
+    data_dir =
+      Map.get(
+        config,
+        :data_dir,
+        Ferricstore.DataDir.root_from_shard_path(config.shard_data_path)
+      )
+
     interval =
       Map.get_lazy(config, :release_cursor_interval, fn ->
         Application.get_env(
@@ -133,15 +143,12 @@ defmodule Ferricstore.Raft.StateMachine do
     %{
       shard_index: config.shard_index,
       shard_data_path: config.shard_data_path,
+      shard_data_path_expanded: Path.expand(config.shard_data_path),
       active_file_id: config.active_file_id,
       active_file_path: config.active_file_path,
       ets: config.ets,
-      data_dir:
-        Map.get(
-          config,
-          :data_dir,
-          Ferricstore.DataDir.root_from_shard_path(config.shard_data_path)
-        ),
+      data_dir: data_dir,
+      data_dir_expanded: Path.expand(data_dir),
       instance_ctx: Map.get(config, :instance_ctx),
       instance_name: Map.get(config, :instance_name, :default),
       active_file_size:
@@ -3488,10 +3495,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp checkpoint_ctx_for_state(%{instance_ctx: ctx}) when is_map(ctx), do: ctx
 
-  defp checkpoint_ctx_for_state(%{instance_name: :default, shard_data_path: shard_data_path}) do
+  defp checkpoint_ctx_for_state(%{instance_name: :default} = state) do
     case instance_ctx_by_name(:default) do
       %FerricStore.Instance{} = ctx ->
-        if instance_data_path?(ctx, shard_data_path), do: ctx, else: nil
+        if instance_data_path?(ctx, state), do: ctx, else: nil
 
       _ ->
         nil
@@ -3504,14 +3511,15 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp checkpoint_ctx_for_state(_state), do: nil
 
-  defp instance_data_path?(%FerricStore.Instance{data_dir: data_dir}, shard_data_path)
+  defp instance_data_path?(
+         %FerricStore.Instance{data_dir_expanded: data_dir},
+         %{shard_data_path_expanded: shard_data_path}
+       )
        when is_binary(data_dir) and is_binary(shard_data_path) do
-    data_dir = Path.expand(data_dir)
-    shard_data_path = Path.expand(shard_data_path)
     shard_data_path == data_dir or String.starts_with?(shard_data_path, data_dir <> "/")
   end
 
-  defp instance_data_path?(_ctx, _shard_data_path), do: false
+  defp instance_data_path?(_ctx, _state), do: false
 
   defp initial_file_stats(shard_data_path, ets, active_file_id) do
     stats = ShardFlush.compute_file_stats(shard_data_path, ets)

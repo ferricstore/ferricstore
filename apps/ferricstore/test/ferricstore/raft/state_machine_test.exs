@@ -2067,6 +2067,30 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert state.release_cursor_interval == 500
     end
 
+    test "init/1 caches expanded paths for release cursor checkpoint checks", %{
+      store: _store,
+      ets: ets
+    } do
+      state = init_state_for_release_cursor(ets)
+
+      assert state.data_dir_expanded == Path.expand(state.data_dir)
+      assert state.shard_data_path_expanded == Path.expand(state.shard_data_path)
+    end
+
+    test "checkpoint path ownership check does not expand paths during release cursor checks" do
+      source =
+        File.read!(Path.expand("../../../lib/ferricstore/raft/state_machine.ex", __DIR__))
+
+      [_match, body] =
+        Regex.run(
+          ~r/(defp instance_data_path\?\(.*?)(?=\n  defp initial_file_stats)/s,
+          source
+        )
+
+      refute body =~ "Path.expand",
+             "release_cursor checkpoint checks must use paths normalized at state-machine init"
+    end
+
     test "no release_cursor emitted before interval is reached", %{store: _store, ets: ets} do
       state = init_state_for_release_cursor(ets, release_cursor_interval: 5)
 

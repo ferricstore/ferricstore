@@ -847,11 +847,17 @@ defmodule Ferricstore.Store.Shard do
       # No Raft — apply directly via state machine.
       sm_state = %{
         shard_index: state.index,
+        data_dir: state.data_dir,
+        data_dir_expanded: Path.expand(state.data_dir),
         shard_data_path: state.shard_data_path,
+        shard_data_path_expanded: Path.expand(state.shard_data_path),
         active_file_id: state.active_file_id,
         active_file_path: state.active_file_path,
+        active_file_size: state.active_file_size,
+        file_stats: state.file_stats,
+        merge_config: state.merge_config,
+        max_active_file_size: state.max_active_file_size,
         ets: state.ets,
-        data_dir: state.data_dir,
         applied_count: 0,
         release_cursor_interval: 20_000,
         cross_shard_locks: %{},
@@ -861,10 +867,23 @@ defmodule Ferricstore.Store.Shard do
       }
 
       case Ferricstore.Raft.StateMachine.apply(%{}, command, sm_state) do
-        {_new_state, result} -> {:reply, result, state}
-        {_new_state, result, _effects} -> {:reply, result, state}
+        {new_sm_state, result} ->
+          {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+
+        {new_sm_state, result, _effects} ->
+          {:reply, result, apply_direct_sm_state(state, new_sm_state)}
       end
     end
+  end
+
+  defp apply_direct_sm_state(state, sm_state) do
+    %{
+      state
+      | active_file_id: Map.get(sm_state, :active_file_id, state.active_file_id),
+        active_file_path: Map.get(sm_state, :active_file_path, state.active_file_path),
+        active_file_size: Map.get(sm_state, :active_file_size, state.active_file_size),
+        file_stats: Map.get(sm_state, :file_stats, state.file_stats)
+    }
   end
 
   defp handle_forwarded_quorum(
