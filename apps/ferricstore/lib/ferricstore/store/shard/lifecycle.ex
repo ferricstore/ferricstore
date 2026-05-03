@@ -679,6 +679,34 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           recover_hint_tombstone(keydir, shard_index, fid, record, instance_ctx)
         end)
 
+      {:error, reason} ->
+        Logger.warning(
+          "Shard #{shard_index}: tombstone scan failed for #{log_path}: #{inspect(reason)}; falling back to full metadata scan"
+        )
+
+        recover_tombstones_from_full_scan(log_path, keydir, shard_index, fid, instance_ctx)
+    end
+  end
+
+  defp recover_tombstones_from_full_scan(log_path, keydir, shard_index, fid, instance_ctx) do
+    case NIF.v2_scan_file(log_path) do
+      {:ok, records} ->
+        Enum.each(records, fn
+          {key, offset, value_size, expire_at_ms, true} ->
+            record_size = @log_header_size + byte_size(key) + value_size
+
+            recover_hint_tombstone(
+              keydir,
+              shard_index,
+              fid,
+              {key, offset, record_size, expire_at_ms},
+              instance_ctx
+            )
+
+          _record ->
+            :ok
+        end)
+
       _ ->
         :ok
     end

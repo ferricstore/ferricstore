@@ -217,7 +217,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert {:ok, [{"deleted", ^delete_offset, ^delete_size, 0}]} = NIF.v2_scan_tombstones(path)
     end
 
-    test "tombstone scan stops before tombstones after a corrupt live record" do
+    test "tombstone scan returns error before tombstones after a corrupt live record" do
       dir = Path.join(System.tmp_dir!(), "tombstone_scan_corrupt_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(dir)
       path = Path.join(dir, "00000.log")
@@ -237,7 +237,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       :ok = :file.pwrite(fd, value_offset, <<0xFF>>)
       :ok = :file.close(fd)
 
-      assert {:ok, []} = NIF.v2_scan_tombstones(path)
+      assert {:error, reason} = NIF.v2_scan_tombstones(path)
+      assert reason =~ "CRC mismatch"
       assert {:ok, nil} = NIF.v2_pread_at(path, delete_offset)
     end
   end
@@ -1090,6 +1091,38 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       :ok = NIF.v2_write_hint_file(hint1, [{"b", 1, b_offset, b_size, 0}])
 
       keydir = :ets.new(:hint_tombstone_order_keydir, [:set, :public])
+
+      Ferricstore.Store.Shard.Lifecycle.recover_keydir(dir, keydir, 0)
+
+      assert [] == :ets.lookup(keydir, "a")
+      assert [{"b", nil, 0, _lfu, 1, ^b_offset, ^b_size}] = :ets.lookup(keydir, "b")
+    end
+
+    test "falls back to full scan when hinted tombstone scan sees corruption" do
+      dir = Path.join(System.tmp_dir!(), "hint_tombstone_corrupt_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(dir)
+
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      log0 = Path.join(dir, "00000.log")
+      hint0 = Path.join(dir, "00000.hint")
+      log1 = Path.join(dir, "00001.log")
+      hint1 = Path.join(dir, "00001.hint")
+
+      {:ok, [{a_offset, a_size}]} = NIF.v2_append_batch(log0, [{"a", "old", 0}])
+      :ok = NIF.v2_write_hint_file(hint0, [{"a", 0, a_offset, a_size, 0}])
+
+      {:ok, _delete_offset} = NIF.v2_append_tombstone(log1, "a")
+      {:ok, [{b_offset, b_size}]} = NIF.v2_append_batch(log1, [{"b", "live", 0}])
+      :ok = NIF.v2_write_hint_file(hint1, [{"b", 1, b_offset, b_size, 0}])
+
+      corrupt_offset = b_offset + 26 + byte_size("b")
+      {:ok, file} = :file.open(String.to_charlist(log1), [:read, :write, :binary])
+      :ok = :file.pwrite(file, corrupt_offset, "X")
+      :ok = :file.sync(file)
+      :ok = :file.close(file)
+
+      keydir = :ets.new(:hint_tombstone_corrupt_keydir, [:set, :public])
 
       Ferricstore.Store.Shard.Lifecycle.recover_keydir(dir, keydir, 0)
 

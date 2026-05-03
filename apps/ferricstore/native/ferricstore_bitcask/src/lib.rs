@@ -589,89 +589,127 @@ fn v2_scan_file_from_offset<'a>(
 /// Used during hint recovery. Hint files contain only live entries, so startup
 /// must still apply tombstones from hinted logs. This scanner skips live value
 /// payloads instead of materializing them, preserving fast cold-value recovery.
+#[derive(Debug, PartialEq, Eq)]
+struct TombstoneScanRecord {
+    key: Vec<u8>,
+    offset: u64,
+    record_size: u64,
+    expire_at_ms: u64,
+}
+
+fn scan_tombstones_from_path(path: &std::path::Path) -> Result<Vec<TombstoneScanRecord>, String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+    let mut reader = std::io::BufReader::new(file);
+    let mut results = Vec::new();
+    let mut offset: u64 = 0;
+
+    while offset < file_len {
+        let mut header = [0u8; log::HEADER_SIZE];
+        reader.read_exact(&mut header).map_err(|e| {
+            format!("tombstone scan {path:?}:{offset}: unexpected EOF in header: {e}")
+        })?;
+
+        let stored_crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        let expire_at_ms = u64::from_le_bytes(header[12..20].try_into().unwrap());
+        let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
+        let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
+
+        let mut key = vec![0u8; key_size];
+        reader
+            .read_exact(&mut key)
+            .map_err(|e| format!("tombstone scan {path:?}:{offset}: failed to read key: {e}"))?;
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header[4..]);
+        hasher.update(&key);
+
+        if value_size_raw == log::TOMBSTONE {
+            let actual_crc = hasher.finalize();
+
+            if actual_crc != stored_crc {
+                return Err(format!(
+                    "tombstone scan {path:?}:{offset}: CRC mismatch stored={stored_crc} actual={actual_crc}"
+                ));
+            }
+
+            let record_size = (log::HEADER_SIZE + key.len()) as u64;
+            results.push(TombstoneScanRecord {
+                key,
+                offset,
+                record_size,
+                expire_at_ms,
+            });
+            offset += record_size;
+        } else {
+            let mut remaining = value_size_raw as usize;
+            let mut buf = [0u8; 64 * 1024];
+
+            while remaining > 0 {
+                let chunk_len = remaining.min(buf.len());
+                let chunk = &mut buf[..chunk_len];
+
+                reader.read_exact(chunk).map_err(|e| {
+                    format!("tombstone scan {path:?}:{offset}: unexpected EOF in value: {e}")
+                })?;
+
+                hasher.update(chunk);
+                remaining -= chunk_len;
+            }
+
+            let actual_crc = hasher.finalize();
+
+            if actual_crc != stored_crc {
+                return Err(format!(
+                    "tombstone scan {path:?}:{offset}: CRC mismatch stored={stored_crc} actual={actual_crc}"
+                ));
+            }
+
+            offset += log::HEADER_SIZE as u64 + key_size as u64 + u64::from(value_size_raw);
+        }
+    }
+
+    Ok(results)
+}
+
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_scan_tombstones<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
-    use std::io::Read;
-
     let p = std::path::Path::new(&path);
 
-    match std::fs::File::open(p) {
-        Ok(file) => {
-            let mut reader = std::io::BufReader::new(file);
+    match scan_tombstones_from_path(p) {
+        Ok(records) => {
             let mut results: Vec<Term<'a>> = Vec::new();
-            let mut offset: u64 = 0;
 
-            'scan: loop {
-                let mut header = [0u8; log::HEADER_SIZE];
-
-                match reader.read_exact(&mut header) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
-                }
-
-                let stored_crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
-                let expire_at_ms = u64::from_le_bytes(header[12..20].try_into().unwrap());
-                let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
-                let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
-
-                let mut key = vec![0u8; key_size];
-                if reader.read_exact(&mut key).is_err() {
-                    break;
-                }
-
-                let mut hasher = crc32fast::Hasher::new();
-                hasher.update(&header[4..]);
-                hasher.update(&key);
-
-                if value_size_raw == log::TOMBSTONE {
-                    if hasher.finalize() != stored_crc {
-                        break;
+            for record in records {
+                let key_bin = match OwnedBinary::new(record.key.len()) {
+                    Some(mut ob) => {
+                        ob.as_mut_slice().copy_from_slice(&record.key);
+                        ob.release(env)
                     }
-
-                    let key_bin = match OwnedBinary::new(key.len()) {
-                        Some(mut ob) => {
-                            ob.as_mut_slice().copy_from_slice(&key);
-                            ob.release(env)
-                        }
-                        None => {
-                            return Ok(
-                                (atoms::error(), "out of memory allocating key binary").encode(env)
-                            );
-                        }
-                    };
-
-                    let record_size = (log::HEADER_SIZE + key.len()) as u64;
-                    results.push((key_bin, offset, record_size, expire_at_ms).encode(env));
-                    offset += record_size;
-                } else {
-                    let mut remaining = value_size_raw as usize;
-                    let mut buf = [0u8; 64 * 1024];
-
-                    while remaining > 0 {
-                        let chunk_len = remaining.min(buf.len());
-                        let chunk = &mut buf[..chunk_len];
-
-                        if reader.read_exact(chunk).is_err() {
-                            break 'scan;
-                        }
-
-                        hasher.update(chunk);
-                        remaining -= chunk_len;
+                    None => {
+                        return Ok(
+                            (atoms::error(), "out of memory allocating key binary").encode(env)
+                        );
                     }
+                };
 
-                    if hasher.finalize() != stored_crc {
-                        break;
-                    }
-
-                    offset += log::HEADER_SIZE as u64 + key_size as u64 + u64::from(value_size_raw);
-                }
+                results.push(
+                    (
+                        key_bin,
+                        record.offset,
+                        record.record_size,
+                        record.expire_at_ms,
+                    )
+                        .encode(env),
+                );
             }
 
             Ok((atoms::ok(), results).encode(env))
         }
-        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+        Err(e) => Ok((atoms::error(), e).encode(env)),
     }
 }
 
@@ -2235,6 +2273,49 @@ mod audit_fix_tests {
         .unwrap_err();
 
         assert!(err.contains("CRC") || err.contains("mismatch"));
+    }
+
+    #[test]
+    fn tombstone_scan_errors_on_corrupt_live_record_after_tombstone() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        writer.write_tombstone(b"deleted").unwrap();
+        let corrupt = writer.write(b"live", b"value", 0).unwrap();
+        writer.sync().unwrap();
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let corrupt_value_byte = corrupt + log::HEADER_SIZE as u64 + b"live".len() as u64;
+        file.write_at(b"X", corrupt_value_byte).unwrap();
+        file.sync_data().unwrap();
+
+        let err = scan_tombstones_from_path(&path).unwrap_err();
+        assert!(err.contains("CRC") || err.contains("mismatch"));
+    }
+
+    #[test]
+    fn tombstone_scan_errors_on_truncated_key_after_tombstone() {
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        writer.write_tombstone(b"deleted").unwrap();
+        writer.write_tombstone(b"truncated").unwrap();
+        writer.sync().unwrap();
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 3)
+            .unwrap();
+
+        let err = scan_tombstones_from_path(&path).unwrap_err();
+        assert!(err.contains("unexpected EOF") || err.contains("failed to read key"));
     }
 
     #[test]
