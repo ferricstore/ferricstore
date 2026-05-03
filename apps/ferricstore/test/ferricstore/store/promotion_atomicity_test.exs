@@ -380,6 +380,45 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       end
     end
 
+    test "crash during partial dedicated batch keeps public reads on shared storage", ctx do
+      redis_key = "user:partial-large"
+
+      entries =
+        Enum.map(~w(name email age city country), fn field ->
+          compound_key = CompoundKey.hash_field(redis_key, field)
+          value = :binary.copy("v", 70_000)
+
+          {:ok, {offset, value_size}} =
+            NIF.v2_append_record(ctx.active_path, compound_key, value, 0)
+
+          :ets.insert(ctx.keydir, {compound_key, nil, 0, LFU.initial(), 0, offset, value_size})
+          {compound_key, value}
+        end)
+
+      type_str = CompoundKey.encode_type(:hash)
+      mk = Promotion.marker_key(redis_key)
+      {:ok, {moff, mvs}} = NIF.v2_append_record(ctx.active_path, mk, type_str, 0)
+      :ets.insert(ctx.keydir, {mk, type_str, 0, LFU.initial(), 0, moff, mvs})
+
+      {:ok, dedicated_path} =
+        Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+
+      dedicated_active = Promotion.find_active(dedicated_path)
+
+      partial_batch =
+        entries
+        |> Enum.take(2)
+        |> Enum.map(fn {k, v} -> {k, v, 0} end)
+
+      {:ok, _locs} = NIF.v2_append_batch(dedicated_active, partial_batch)
+
+      promoted = simulate_restart(ctx)
+
+      for {field_key, field_value} <- entries do
+        assert field_value == Ops.compound_get(local_tx(ctx, promoted), redis_key, field_key)
+      end
+    end
+
     test "crash after step 3 (all three done) — same as full success", ctx do
       # This IS the full-success case, duplicated here for coverage
       # symmetry with the other crash points.

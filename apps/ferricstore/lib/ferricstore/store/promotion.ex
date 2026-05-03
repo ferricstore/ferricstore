@@ -346,9 +346,12 @@ defmodule Ferricstore.Store.Promotion do
           end
         end)
 
+      prefix = compound_prefix_for(type, redis_key)
+      dedicated_keys = final_state |> Map.keys() |> MapSet.new()
+      partial_dedicated? = shared_uncovered_live_compound?(keydir, prefix, dedicated_keys)
       dedicated_empty? = map_size(final_state) == 0
 
-      if live_count > 0 do
+      if live_count > 0 and not partial_dedicated? do
         # Normal recovery path: dedicated has data, apply it.
         Enum.each(final_state, fn
           {key, :tombstone} ->
@@ -371,13 +374,13 @@ defmodule Ferricstore.Store.Promotion do
         end)
       end
 
-      if dedicated_empty? do
+      if dedicated_empty? or partial_dedicated? do
         # Fallback path: marker exists, dedicated has no records. Compound
         # keys in shared log (already in keydir via recover_keydir) are the
         # source of truth, so do not include this key in promoted_instances.
         Logger.info(
           "Promotion recovery: marker for #{inspect(redis_key)} exists but dedicated " <>
-            "dir has no live records; falling back to compound keys in shared log."
+            "dir is incomplete; falling back to compound keys in shared log."
         )
 
         acc
@@ -412,6 +415,26 @@ defmodule Ferricstore.Store.Promotion do
         })
       end
     end)
+  end
+
+  defp shared_uncovered_live_compound?(keydir, prefix, dedicated_keys) do
+    now = HLC.now_ms()
+
+    :ets.foldl(
+      fn
+        _entry, true ->
+          true
+
+        {key, _value, exp, _lfu, _fid, _off, _vsize}, false when is_binary(key) ->
+          String.starts_with?(key, prefix) and not MapSet.member?(dedicated_keys, key) and
+            (exp == 0 or exp > now)
+
+        _entry, false ->
+          false
+      end,
+      false,
+      keydir
+    )
   end
 
   @spec cleanup_promoted!(binary(), binary(), atom(), binary(), non_neg_integer(), term()) :: :ok
