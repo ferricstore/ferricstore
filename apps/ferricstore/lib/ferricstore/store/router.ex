@@ -3188,7 +3188,9 @@ defmodule Ferricstore.Store.Router do
 
     count
   rescue
-    ArgumentError -> 0
+    ArgumentError ->
+      emit_shard_unavailable(ctx, idx, :dbsize, :keydir_unavailable)
+      0
   end
 
   @doc """

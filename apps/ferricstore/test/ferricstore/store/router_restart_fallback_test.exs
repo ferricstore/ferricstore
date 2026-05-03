@@ -39,6 +39,26 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
     assert_unavailable_event(:keys)
   end
 
+  test "dbsize reports unavailable keydir fallback" do
+    ctx = unavailable_ctx()
+    handler_id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :store, :shard_unavailable],
+        &__MODULE__.handle_telemetry/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert 0 == Router.dbsize(ctx)
+
+    assert_receive {:telemetry_event, [:ferricstore, :store, :shard_unavailable], %{count: 1},
+                    %{request: :dbsize, reason: :keydir_unavailable, shard_index: 0}}
+  end
+
   test "unavailable shard fallbacks emit telemetry" do
     ctx = unavailable_ctx()
     handler_id = {__MODULE__, make_ref()}
