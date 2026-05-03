@@ -22,16 +22,15 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
 static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
+const MAX_BLOCKING_THREADS: usize = 16;
 
 /// Returns a reference to the global Tokio runtime, creating it on first call.
 ///
-/// H-8 fix: limits worker threads to `min(4, num_cpus)` instead of the default
-/// (one per CPU core). The Tokio runtime is only used for disk IO operations
-/// (pread, fsync), which are limited by NVMe parallelism (4-8 outstanding IOs
-/// is optimal). On a 64-core server, the default would create 64 Tokio threads
-/// in addition to the BEAM's ~64 scheduler threads — 128 threads competing
-/// for CPU. With 4 workers the IO throughput is unchanged but context switching
-/// overhead drops significantly.
+/// H-8 fix: limits worker threads to `min(4, num_cpus)` and blocking IO
+/// threads to `MAX_BLOCKING_THREADS` instead of Tokio's high default. The
+/// runtime is only used for disk IO operations (pread, fsync), which are
+/// limited by NVMe parallelism; under bursts, extra work should queue instead
+/// of creating hundreds of competing OS threads beside BEAM schedulers.
 ///
 /// # Panics
 ///
@@ -44,6 +43,7 @@ pub fn runtime() -> &'static Runtime {
         let workers = num_cpus.clamp(1, 4);
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
+            .max_blocking_threads(MAX_BLOCKING_THREADS)
             .thread_name("ferric-tokio")
             .enable_all()
             .build()
@@ -270,6 +270,46 @@ mod tests {
             let result = rt.block_on(h).unwrap();
             assert!(result > 0);
         }
+    }
+
+    #[test]
+    fn spawn_blocking_pool_is_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let rt = runtime();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            let active = Arc::clone(&active);
+            let max_seen = Arc::clone(&max_seen);
+
+            handles.push(rt.spawn_blocking(move || {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+
+                max_seen
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |prev| {
+                        Some(prev.max(now))
+                    })
+                    .ok();
+
+                std::thread::sleep(Duration::from_millis(200));
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+
+        for handle in handles {
+            rt.block_on(handle).unwrap();
+        }
+
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= MAX_BLOCKING_THREADS,
+            "spawn_blocking pool must be capped; saw {} concurrent blocking jobs",
+            max_seen.load(Ordering::SeqCst)
+        );
     }
 
     // ------------------------------------------------------------------
