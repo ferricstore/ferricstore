@@ -3314,8 +3314,10 @@ defmodule Ferricstore.Store.Router do
         value
 
       _ ->
-        shard = elem(ctx.shard_names, idx)
-        GenServer.call(shard, {:compound_get, redis_key, compound_key})
+        case safe_read_call(ctx, idx, {:compound_get, redis_key, compound_key}) do
+          {:ok, value} -> value
+          :unavailable -> nil
+        end
     end
   end
 
@@ -3343,8 +3345,12 @@ defmodule Ferricstore.Store.Router do
           []
 
         keys ->
-          shard = elem(ctx.shard_names, idx)
-          GenServer.call(shard, {:compound_batch_get, redis_key, Enum.reverse(keys)})
+          pending_keys = Enum.reverse(keys)
+
+          case safe_read_call(ctx, idx, {:compound_batch_get, redis_key, pending_keys}) do
+            {:ok, values} -> values
+            :unavailable -> List.duplicate(nil, length(pending_keys))
+          end
       end
 
     {values, []} =
@@ -3359,15 +3365,23 @@ defmodule Ferricstore.Store.Router do
   @spec compound_get_meta(FerricStore.Instance.t(), binary(), binary()) ::
           {binary(), non_neg_integer()} | nil
   def compound_get_meta(ctx, redis_key, compound_key) do
-    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
-    GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
+    idx = shard_for(ctx, redis_key)
+
+    case safe_read_call(ctx, idx, {:compound_get_meta, redis_key, compound_key}) do
+      {:ok, meta} -> meta
+      :unavailable -> nil
+    end
   end
 
   @spec compound_batch_get_meta(FerricStore.Instance.t(), binary(), [binary()]) ::
           [{binary(), non_neg_integer()} | nil]
   def compound_batch_get_meta(ctx, redis_key, compound_keys) do
-    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
-    GenServer.call(shard, {:compound_batch_get_meta, redis_key, compound_keys})
+    idx = shard_for(ctx, redis_key)
+
+    case safe_read_call(ctx, idx, {:compound_batch_get_meta, redis_key, compound_keys}) do
+      {:ok, metas} -> metas
+      :unavailable -> List.duplicate(nil, length(compound_keys))
+    end
   end
 
   @spec compound_put(FerricStore.Instance.t(), binary(), binary(), binary(), non_neg_integer()) ::
@@ -3802,14 +3816,22 @@ defmodule Ferricstore.Store.Router do
 
   @spec compound_scan(FerricStore.Instance.t(), binary(), binary()) :: [{binary(), binary()}]
   def compound_scan(ctx, redis_key, prefix) do
-    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
-    GenServer.call(shard, {:compound_scan, redis_key, prefix})
+    idx = shard_for(ctx, redis_key)
+
+    case safe_read_call(ctx, idx, {:compound_scan, redis_key, prefix}) do
+      {:ok, results} -> results
+      :unavailable -> []
+    end
   end
 
   @spec compound_count(FerricStore.Instance.t(), binary(), binary()) :: non_neg_integer()
   def compound_count(ctx, redis_key, prefix) do
-    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
-    GenServer.call(shard, {:compound_count, redis_key, prefix})
+    idx = shard_for(ctx, redis_key)
+
+    case safe_read_call(ctx, idx, {:compound_count, redis_key, prefix}) do
+      {:ok, count} -> count
+      :unavailable -> 0
+    end
   end
 
   @spec compound_delete_prefix(FerricStore.Instance.t(), binary(), binary()) :: :ok
