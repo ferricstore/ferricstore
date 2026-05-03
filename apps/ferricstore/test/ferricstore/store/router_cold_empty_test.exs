@@ -7,6 +7,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Router
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Stats
   alias Ferricstore.Test.IsolatedInstance
 
   setup do
@@ -91,6 +92,31 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
 
     assert nil == Router.get(ctx, key)
     assert nil == Router.get_meta(ctx, key)
+  end
+
+  test "failed direct cold GET increments keyspace misses", %{ctx: ctx, keydir: keydir} do
+    key = "cold_missing_get_stats:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 99, 0, 5})
+
+    before_misses = Stats.keyspace_misses(ctx)
+
+    assert nil == Router.get(ctx, key)
+    assert Stats.keyspace_misses(ctx) == before_misses + 1
+  end
+
+  test "failed direct cold GET_META increments misses without cold-read success", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_missing_get_meta_stats:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 99, 0, 5})
+
+    before_misses = Stats.keyspace_misses(ctx)
+    before_cold_reads = Stats.total_cold_reads(ctx)
+
+    assert nil == Router.get_meta(ctx, key)
+    assert Stats.keyspace_misses(ctx) == before_misses + 1
+    assert Stats.total_cold_reads(ctx) == before_cold_reads
   end
 
   test "direct cold read retries when compaction replaces file before ETS offset update", %{

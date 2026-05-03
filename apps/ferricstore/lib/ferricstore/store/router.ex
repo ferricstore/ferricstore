@@ -1837,6 +1837,7 @@ defmodule Ferricstore.Store.Router do
                 value
 
               :miss ->
+                Stats.incr_keyspace_misses(ctx)
                 nil
             end
         end
@@ -2198,18 +2199,26 @@ defmodule Ferricstore.Store.Router do
                 {value, retry_expire_at_ms}
 
               :miss ->
+                Stats.incr_keyspace_misses(ctx)
                 nil
             end
         end
 
       {:cold, _file_id, _offset, _value_size, _expire_at_ms} ->
         # Invalid file ref — ask GenServer.
-        Stats.record_cold_read(ctx, key)
+        result =
+          case safe_read_call(ctx, idx, {:get_meta, key}) do
+            {:ok, result} -> result
+            :unavailable -> nil
+          end
 
-        case safe_read_call(ctx, idx, {:get_meta, key}) do
-          {:ok, result} -> result
-          :unavailable -> nil
+        if result != nil do
+          Stats.record_cold_read(ctx, key)
+        else
+          Stats.incr_keyspace_misses(ctx)
         end
+
+        result
 
       :expired ->
         Stats.incr_keyspace_misses(ctx)
@@ -2220,12 +2229,19 @@ defmodule Ferricstore.Store.Router do
         nil
 
       :no_table ->
-        Stats.record_cold_read(ctx, key)
+        result =
+          case safe_read_call(ctx, idx, {:get_meta, key}) do
+            {:ok, result} -> result
+            :unavailable -> nil
+          end
 
-        case safe_read_call(ctx, idx, {:get_meta, key}) do
-          {:ok, result} -> result
-          :unavailable -> nil
+        if result != nil do
+          Stats.record_cold_read(ctx, key)
+        else
+          Stats.incr_keyspace_misses(ctx)
         end
+
+        result
     end
   end
 
