@@ -458,7 +458,12 @@ defmodule Ferricstore.Store.AsyncRmwTest do
           end)
         end
 
-      Task.await_many(tasks, 90_000)
+      results = Task.await_many(tasks, 90_000) |> List.flatten()
+
+      assert Enum.all?(results, fn
+               {:ok, n} when is_integer(n) -> true
+               _ -> false
+             end)
 
       Ferricstore.Test.Utils.eventually(
         fn ->

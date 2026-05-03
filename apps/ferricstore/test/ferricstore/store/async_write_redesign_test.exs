@@ -441,7 +441,12 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
           end)
         end
 
-      Task.await_many(tasks, 30_000)
+      results = Task.await_many(tasks, 30_000) |> List.flatten()
+
+      assert Enum.all?(results, fn
+               {:ok, n} when is_integer(n) -> true
+               _ -> false
+             end)
 
       # 25 * 40 = 1000 increments. Latch+worker serializes all same-key
       # RMWs, so no lost updates. Final value must be exactly 1000.

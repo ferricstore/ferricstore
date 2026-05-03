@@ -2611,21 +2611,28 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp pending_newer_origin_replay_decision(state, key, _inner_cmd, expected_value) do
+  defp pending_newer_origin_replay_decision(state, key, inner_cmd, expected_value) do
     case :ets.lookup(state.ets, key) do
       [{^key, current_value, _expire_at_ms, _lfu, :pending, _off, _value_size}] ->
-        if current_value == expected_value do
-          :already_applied
-        else
-          # A pending local value has no Raft index attached, so we cannot prove
-          # it is a later accepted command rather than an unreplicated local
-          # effect. Materialize the accepted origin result; a genuinely later
-          # accepted command will replay after this entry in Raft order.
-          :apply_expected
-        end
+        pending_origin_replay_decision(inner_cmd, current_value, expected_value)
 
       _ ->
         :newer_local_value
+    end
+  end
+
+  defp pending_origin_replay_decision(_inner_cmd, expected_value, expected_value) do
+    :already_applied
+  end
+
+  defp pending_origin_replay_decision(inner_cmd, current_value, expected_value) do
+    if origin_command_provably_in_current_value?(inner_cmd, current_value, expected_value) do
+      :newer_local_value
+    else
+      # A pending local value has no Raft index attached. If this command type
+      # cannot prove that the pending value includes the accepted origin result,
+      # materialize the accepted value and let later Ra entries replay in order.
+      :apply_expected
     end
   end
 
@@ -2728,6 +2735,45 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp origin_command_already_in_current_value?(_inner_cmd, _current_value, _expected_value) do
     true
+  end
+
+  defp origin_command_provably_in_current_value?(
+         {:incr, _key, delta},
+         current_value,
+         expected_value
+       ) do
+    with {:ok, current} <- coerce_integer(current_value),
+         {:ok, expected} <- coerce_integer(expected_value) do
+      if delta >= 0, do: current >= expected, else: current <= expected
+    else
+      _ -> false
+    end
+  end
+
+  defp origin_command_provably_in_current_value?(
+         {:incr_float, _key, delta},
+         current_value,
+         expected_value
+       ) do
+    with {:ok, current} <- coerce_float(current_value),
+         {:ok, expected} <- coerce_float(expected_value) do
+      if delta >= 0.0, do: current >= expected, else: current <= expected
+    else
+      _ -> false
+    end
+  end
+
+  defp origin_command_provably_in_current_value?(
+         {:append, _key, _suffix},
+         current_value,
+         expected
+       )
+       when is_binary(current_value) and is_binary(expected) do
+    String.starts_with?(current_value, expected)
+  end
+
+  defp origin_command_provably_in_current_value?(_inner_cmd, _current_value, _expected_value) do
+    false
   end
 
   defp normalize_stamped_command({:ratelimit_add, key, window_ms, max, count, _legacy_now_ms}) do

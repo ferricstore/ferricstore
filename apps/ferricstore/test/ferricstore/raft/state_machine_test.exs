@@ -348,14 +348,13 @@ defmodule Ferricstore.Raft.StateMachineTest do
                NIF.v2_scan_file(active_file_path)
     end
 
-    test "replays origin INCR expected value over pending local value", %{
+    test "does not replay origin INCR over a provably newer pending local value", %{
       state: state,
-      ets: ets,
-      active_file_path: active_file_path
+      ets: ets
     } do
       :ets.insert(ets, {"pending_origin_incr_newer", "10", 0, 1, :pending, 0, 0})
 
-      {_state2, {:ok, 5}} =
+      {_state2, :ok} =
         StateMachine.apply(
           %{},
           {:async, node(),
@@ -364,21 +363,17 @@ defmodule Ferricstore.Raft.StateMachineTest do
           state
         )
 
-      assert [{"pending_origin_incr_newer", "5", 0, _lfu, 0, 0, 1}] =
+      assert [{"pending_origin_incr_newer", "10", 0, _lfu, :pending, 0, 0}] =
                :ets.lookup(ets, "pending_origin_incr_newer")
-
-      assert {:ok, [{"pending_origin_incr_newer", 0, 1, 0, false}]} =
-               NIF.v2_scan_file(active_file_path)
     end
 
-    test "replays origin DECR expected value over pending local value", %{
+    test "does not replay origin DECR over a provably newer pending local value", %{
       state: state,
-      ets: ets,
-      active_file_path: active_file_path
+      ets: ets
     } do
       :ets.insert(ets, {"pending_origin_decr_newer", "-10", 0, 1, :pending, 0, 0})
 
-      {_state2, {:ok, -5}} =
+      {_state2, :ok} =
         StateMachine.apply(
           %{},
           {:async, node(),
@@ -387,11 +382,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
           state
         )
 
-      assert [{"pending_origin_decr_newer", "-5", 0, _lfu, 0, 0, 2}] =
+      assert [{"pending_origin_decr_newer", "-10", 0, _lfu, :pending, 0, 0}] =
                :ets.lookup(ets, "pending_origin_decr_newer")
-
-      assert {:ok, [{"pending_origin_decr_newer", 0, 2, 0, false}]} =
-               NIF.v2_scan_file(active_file_path)
     end
 
     test "replays origin GETEX when recovery has the old expiry", %{state: state, ets: ets} do
