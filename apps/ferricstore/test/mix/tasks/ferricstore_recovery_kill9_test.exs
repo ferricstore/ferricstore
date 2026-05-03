@@ -8,6 +8,7 @@ defmodule Mix.Tasks.FerricstoreRecoveryKill9Test do
       opts = RecoveryKill9.parse_args!([])
 
       assert opts.writes == 2_000
+      assert opts.batch_size == 1_000
       assert opts.timeout_ms == 120_000
       assert opts.release_cursor_interval == 20_000
       assert opts.prefix =~ "kill9_"
@@ -19,6 +20,8 @@ defmodule Mix.Tasks.FerricstoreRecoveryKill9Test do
         RecoveryKill9.parse_args!([
           "--writes",
           "10",
+          "--batch-size",
+          "250",
           "--timeout-ms",
           "5000",
           "--release-cursor-interval",
@@ -30,6 +33,7 @@ defmodule Mix.Tasks.FerricstoreRecoveryKill9Test do
         ])
 
       assert opts.writes == 10
+      assert opts.batch_size == 250
       assert opts.timeout_ms == 5_000
       assert opts.release_cursor_interval == 100
       assert opts.prefix == "pfx"
@@ -60,6 +64,7 @@ defmodule Mix.Tasks.FerricstoreRecoveryKill9Test do
       opts = %{
         data_dir: "/tmp/ferricstore_manual",
         writes: 10,
+        batch_size: 250,
         timeout_ms: 5_000,
         prefix: "pfx",
         release_cursor_interval: 100
@@ -70,6 +75,7 @@ defmodule Mix.Tasks.FerricstoreRecoveryKill9Test do
       assert {"FERRICSTORE_KILL9_CHILD", "writer"} in env
       assert {"FERRICSTORE_KILL9_DATA_DIR", "/tmp/ferricstore_manual"} in env
       assert {"FERRICSTORE_KILL9_WRITES", "10"} in env
+      assert {"FERRICSTORE_KILL9_BATCH_SIZE", "250"} in env
       assert {"FERRICSTORE_KILL9_TIMEOUT_MS", "5000"} in env
       assert {"FERRICSTORE_KILL9_PREFIX", "pfx"} in env
       assert {"FERRICSTORE_KILL9_RELEASE_CURSOR_INTERVAL", "100"} in env
@@ -79,6 +85,7 @@ defmodule Mix.Tasks.FerricstoreRecoveryKill9Test do
       opts = %{
         data_dir: "/tmp/ferricstore_manual",
         writes: 10,
+        batch_size: 250,
         timeout_ms: 5_000,
         prefix: "pfx",
         release_cursor_interval: 100

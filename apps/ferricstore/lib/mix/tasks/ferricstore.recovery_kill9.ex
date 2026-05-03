@@ -14,6 +14,7 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
   Options:
 
     * `--writes N` - number of keys to write, default 2000
+    * `--batch-size N` - keys per quorum batch during setup, default 1000
     * `--data-dir PATH` - data directory, default is a temp directory
     * `--timeout-ms N` - child marker timeout, default 120000
     * `--release-cursor-interval N` - interval used by the child, default 20000
@@ -28,6 +29,7 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
   @shortdoc "Manual kill-9 recovery benchmark"
   @marker "FERRICSTORE_KILL9"
   @default_writes 2_000
+  @default_batch_size 1_000
   @default_timeout_ms 120_000
   @default_release_cursor_interval 20_000
 
@@ -46,6 +48,7 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
       OptionParser.parse(args,
         strict: [
           writes: :integer,
+          batch_size: :integer,
           data_dir: :string,
           timeout_ms: :integer,
           release_cursor_interval: :integer,
@@ -63,6 +66,8 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
 
     %{
       writes: positive_int!(Keyword.get(opts, :writes, @default_writes), "--writes"),
+      batch_size:
+        positive_int!(Keyword.get(opts, :batch_size, @default_batch_size), "--batch-size"),
       data_dir:
         Keyword.get(
           opts,
@@ -87,6 +92,7 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
       {"FERRICSTORE_KILL9_CHILD", Atom.to_string(mode)},
       {"FERRICSTORE_KILL9_DATA_DIR", opts.data_dir},
       {"FERRICSTORE_KILL9_WRITES", Integer.to_string(opts.writes)},
+      {"FERRICSTORE_KILL9_BATCH_SIZE", Integer.to_string(opts.batch_size)},
       {"FERRICSTORE_KILL9_TIMEOUT_MS", Integer.to_string(opts.timeout_ms)},
       {"FERRICSTORE_KILL9_PREFIX", opts.prefix},
       {"FERRICSTORE_KILL9_RELEASE_CURSOR_INTERVAL",
@@ -170,11 +176,7 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
 
     {write_us, :ok} =
       :timer.tc(fn ->
-        for i <- 1..opts.writes do
-          :ok = Router.put(ctx, key(opts.prefix, i), value(i), 0)
-        end
-
-        :ok
+        write_dataset!(ctx, opts)
       end)
 
     applied = max_atomic(ctx, :last_applied_index)
@@ -185,6 +187,7 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
       event: "WRITE_DONE",
       pid: :os.getpid(),
       writes: opts.writes,
+      batch_size: opts.batch_size,
       startup_ms: div(startup_us, 1000),
       write_ms: div(write_us, 1000),
       applied: applied,
@@ -219,6 +222,7 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
     %{
       data_dir: fetch_env!("FERRICSTORE_KILL9_DATA_DIR"),
       writes: env_int!("FERRICSTORE_KILL9_WRITES"),
+      batch_size: env_int!("FERRICSTORE_KILL9_BATCH_SIZE"),
       timeout_ms: env_int!("FERRICSTORE_KILL9_TIMEOUT_MS"),
       prefix: fetch_env!("FERRICSTORE_KILL9_PREFIX"),
       release_cursor_interval: env_int!("FERRICSTORE_KILL9_RELEASE_CURSOR_INTERVAL"),
@@ -247,6 +251,25 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
       case Router.get(ctx, key(opts.prefix, i)) do
         ^expected -> :ok
         other -> Mix.raise("key #{i} expected #{inspect(expected)}, got #{inspect(other)}")
+      end
+    end)
+  end
+
+  defp write_dataset!(ctx, opts) do
+    1..opts.writes
+    |> Enum.chunk_every(opts.batch_size)
+    |> Enum.each(fn indexes ->
+      kv_pairs = Enum.map(indexes, fn i -> {key(opts.prefix, i), value(i)} end)
+
+      case Router.batch_quorum_put(ctx, kv_pairs) do
+        results when is_list(results) ->
+          case Enum.find(results, &(&1 != :ok)) do
+            nil -> :ok
+            error -> Mix.raise("batch_quorum_put failed: #{inspect(error)}")
+          end
+
+        other ->
+          Mix.raise("batch_quorum_put returned unexpected result: #{inspect(other)}")
       end
     end)
   end
