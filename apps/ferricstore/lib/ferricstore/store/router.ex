@@ -3497,17 +3497,29 @@ defmodule Ferricstore.Store.Router do
     if under_pressure do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
-      previous = snapshot_live_value(ctx, idx, compound_key)
+      if large_value_for_hot_cache?(ctx, value) do
+        previous = snapshot_live_value(ctx, idx, compound_key)
 
-      with :ok <- install_async_put_value(ctx, idx, compound_key, value, expire_at_ms) do
-        case async_enqueue_to_raft(idx, {:put, compound_key, value, expire_at_ms}) do
-          :ok ->
-            bump_write_version(ctx, idx)
-            :ok
+        # Large cold values need a durable local file location before ETS can
+        # point readers at them. Keep disk-first, then roll back if Raft rejects.
+        with :ok <- install_async_put_value(ctx, idx, compound_key, value, expire_at_ms) do
+          case async_enqueue_to_raft(idx, {:put, compound_key, value, expire_at_ms}) do
+            :ok ->
+              bump_write_version(ctx, idx)
+              :ok
 
-          {:error, _} = error ->
-            rollback_installed_async_value(ctx, idx, compound_key, previous)
-            error
+            {:error, _} = error ->
+              rollback_installed_async_value(ctx, idx, compound_key, previous)
+              error
+          end
+        end
+      else
+        # Small values do not need a disk location before publication, so match
+        # plain async SET: do not expose a value until Raft accepts the command.
+        with :ok <- async_enqueue_to_raft(idx, {:put, compound_key, value, expire_at_ms}),
+             :ok <- install_async_put_value(ctx, idx, compound_key, value, expire_at_ms) do
+          bump_write_version(ctx, idx)
+          :ok
         end
       end
     end

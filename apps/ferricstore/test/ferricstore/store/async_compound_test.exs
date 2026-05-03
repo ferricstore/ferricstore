@@ -275,6 +275,14 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       assert old == Router.compound_get(ctx(), redis_key, ck)
     end
 
+    test "small compound_put enqueues before publishing to ETS" do
+      source = File.read!("lib/ferricstore/store/router.ex")
+
+      assert source =~
+               ~r/async_enqueue_to_raft\(idx, \{:put, compound_key, value, expire_at_ms\}\).*install_async_put_value\(ctx, idx, compound_key, value, expire_at_ms\)/s,
+             "small async compound PUT must not publish locally before Raft accepts the command"
+    end
+
     test "large compound_put disk error is not accepted for async replication" do
       redis_key = ukey("hash_big_disk_error")
       ck = hash_field(redis_key, "big_field")
