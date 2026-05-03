@@ -330,8 +330,11 @@ pub fn cms_file_incrby<'a>(
         };
 
         for (offset, next_val) in updates {
-            file.write_at(&next_val.to_le_bytes(), offset)
-                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+            if let Err(e) =
+                crate::write_all_at(&file, &next_val.to_le_bytes(), offset, "cms counter")
+            {
+                return Ok((atoms::error(), e).encode(env));
+            }
         }
 
         total_count = next_total_count;
@@ -343,8 +346,9 @@ pub fn cms_file_incrby<'a>(
     }
 
     // Update total count in header
-    file.write_at(&total_count.to_le_bytes(), 24)
-        .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+    if let Err(e) = crate::write_all_at(&file, &total_count.to_le_bytes(), 24, "cms count") {
+        return Ok((atoms::error(), e).encode(env));
+    }
 
     // Durability: fsync before returning the computed counts. CMS is a
     // read-modify-write on counters; replay after a partial-write crash
@@ -531,18 +535,18 @@ pub fn cms_file_merge(
 
     for (i, val) in merged_counters.iter().enumerate() {
         let offset = MMAP_HEADER_SIZE as u64 + (i as u64) * 8;
-        dst_file
-            .write_at(&val.to_le_bytes(), offset)
-            .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+        if let Err(e) = crate::write_all_at(&dst_file, &val.to_le_bytes(), offset, "cms counter") {
+            return Ok((atoms::error(), e).encode(env));
+        }
 
         if i % YIELD_CHECK_INTERVAL == 0 && i > 0 {
             let _ = consume_timeslice(env, 1);
         }
     }
 
-    dst_file
-        .write_at(&next_dst_count.to_le_bytes(), 24)
-        .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+    if let Err(e) = crate::write_all_at(&dst_file, &next_dst_count.to_le_bytes(), 24, "cms count") {
+        return Ok((atoms::error(), e).encode(env));
+    }
 
     // Durability: fsync the destination before returning. Sources are
     // read-only during merge so they don't need fsync.

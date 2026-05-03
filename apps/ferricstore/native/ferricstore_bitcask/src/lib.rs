@@ -52,6 +52,7 @@ pub mod topk;
 pub mod tracking_alloc;
 
 use rustler::{Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, ResourceArc, Term};
+use std::os::unix::fs::FileExt;
 
 /// A resource that owns a value buffer read from the Bitcask log.
 ///
@@ -201,6 +202,31 @@ pub fn fsync_dir(path: &str) -> Result<(), String> {
 /// after create.
 pub fn prob_fsync(file: &std::fs::File) -> Result<(), String> {
     file.sync_data().map_err(|e| format!("sync_data: {e}"))
+}
+
+/// Positioned write that rejects short writes.
+///
+/// POSIX `pwrite` may write fewer bytes than requested. The probabilistic
+/// file formats update fixed-width counters/slots in place, so callers must
+/// not treat a partial write as success.
+pub(crate) fn write_all_at(
+    file: &std::fs::File,
+    mut buf: &[u8],
+    mut offset: u64,
+    label: &str,
+) -> Result<(), String> {
+    while !buf.is_empty() {
+        match file.write_at(buf, offset) {
+            Ok(0) => return Err(format!("short pwrite {label}: wrote 0 bytes")),
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) => return Err(format!("pwrite {label}: {e}")),
+        }
+    }
+
+    Ok(())
 }
 
 /// Parse the numeric file_id from a log file path.
@@ -2013,6 +2039,24 @@ mod nif_scheduler_tests {
                         line_idx + 1
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn file_backed_probabilistic_writes_go_through_write_all_at() {
+        for path in ["src/bloom.rs", "src/cms.rs", "src/cuckoo.rs", "src/topk.rs"] {
+            let source =
+                std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+
+            let production_source = source.split("#[cfg(test)]").next().unwrap_or(&source);
+
+            for (line_idx, line) in production_source.lines().enumerate() {
+                assert!(
+                    !line.contains(".write_at("),
+                    "{path}:{} must use crate::write_all_at so short pwrite results cannot be reported as success: {line}",
+                    line_idx + 1
+                );
             }
         }
     }

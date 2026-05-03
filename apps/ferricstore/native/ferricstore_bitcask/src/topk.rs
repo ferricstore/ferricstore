@@ -200,9 +200,7 @@ fn v2_write_cms(file: &File, counters: &[i64]) -> Result<(), String> {
     for (i, &val) in counters.iter().enumerate() {
         buf[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
     }
-    file.write_at(&buf, TOPK_HEADER_SIZE as u64)
-        .map_err(|e| format!("write cms: {e}"))?;
-    Ok(())
+    crate::write_all_at(file, &buf, TOPK_HEADER_SIZE as u64, "topk cms")
 }
 
 /// A heap entry read from file.
@@ -261,15 +259,16 @@ fn v2_write_heap(
         // rest is already zeroed
     }
     if byte_len > 0 {
-        file.write_at(&buf, heap_base)
-            .map_err(|e| format!("write heap: {e}"))?;
+        crate::write_all_at(file, &buf, heap_base, "topk heap")?;
     }
 
     // Update heap_len in header at offset 28
-    file.write_at(&(entries.len() as u32).to_le_bytes(), 28)
-        .map_err(|e| format!("write heap_len: {e}"))?;
-
-    Ok(())
+    crate::write_all_at(
+        file,
+        &(entries.len() as u32).to_le_bytes(),
+        28,
+        "topk heap_len",
+    )
 }
 
 /// Helper: CMS increment using in-memory counters array. Returns min estimate.

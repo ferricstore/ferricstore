@@ -248,15 +248,17 @@ pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> Ni
                 }
             }
             buf[0] |= mask;
-            file.write_at(&buf, file_offset)
-                .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite bit: {e}"))))?;
+            if let Err(e) = crate::write_all_at(&file, &buf, file_offset, "bloom bit") {
+                return Ok((atoms::error(), e).encode(env));
+            }
             any_new = true;
         }
     }
 
     if let Some(new_count) = new_count {
-        file.write_at(&new_count.to_le_bytes(), 24)
-            .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite count: {e}"))))?;
+        if let Err(e) = crate::write_all_at(&file, &new_count.to_le_bytes(), 24, "bloom count") {
+            return Ok((atoms::error(), e).encode(env));
+        }
     }
 
     // Durability: fsync before returning :ok. Without this, a kernel panic
@@ -324,8 +326,9 @@ pub fn bloom_file_madd<'a>(
                 }
             } else if (buf[0] & mask) == 0 {
                 buf[0] |= mask;
-                file.write_at(&buf, file_offset)
-                    .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite bit: {e}"))))?;
+                if let Err(e) = crate::write_all_at(&file, &buf, file_offset, "bloom bit") {
+                    return Ok((atoms::error(), e).encode(env));
+                }
                 any_new = true;
             }
         }
@@ -345,14 +348,16 @@ pub fn bloom_file_madd<'a>(
 
     if let Some(pending_bits) = pending_bits {
         for (file_offset, byte) in pending_bits {
-            file.write_at(&[byte], file_offset)
-                .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite bit: {e}"))))?;
+            if let Err(e) = crate::write_all_at(&file, &[byte], file_offset, "bloom bit") {
+                return Ok((atoms::error(), e).encode(env));
+            }
         }
     }
 
     // Write final count once after all additions.
-    file.write_at(&count.to_le_bytes(), 24)
-        .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite count: {e}"))))?;
+    if let Err(e) = crate::write_all_at(&file, &count.to_le_bytes(), 24, "bloom count") {
+        return Ok((atoms::error(), e).encode(env));
+    }
 
     // Durability: one fsync per batch (amortized across all elements).
     if let Err(e) = crate::prob_fsync(&file) {

@@ -267,23 +267,27 @@ fn cuckoo_file_write_slot(
     fp: &[u8],
 ) -> Result<(), String> {
     let offset = cuckoo_file_slot_offset(bucket_idx, slot_idx, bucket_size, fingerprint_size);
-    file.write_at(fp, offset)
-        .map_err(|e| format!("write slot: {e}"))?;
-    Ok(())
+    crate::write_all_at(file, fp, offset, "cuckoo slot")
 }
 
 /// Write num_items to the header.
 fn cuckoo_file_write_num_items(file: &File, num_items: u64) -> Result<(), String> {
-    file.write_at(&num_items.to_le_bytes(), OFF_NUM_ITEMS)
-        .map_err(|e| format!("write num_items: {e}"))?;
-    Ok(())
+    crate::write_all_at(
+        file,
+        &num_items.to_le_bytes(),
+        OFF_NUM_ITEMS,
+        "cuckoo num_items",
+    )
 }
 
 /// Write num_deletes to the header.
 fn cuckoo_file_write_num_deletes(file: &File, num_deletes: u64) -> Result<(), String> {
-    file.write_at(&num_deletes.to_le_bytes(), OFF_NUM_DELETES)
-        .map_err(|e| format!("write num_deletes: {e}"))?;
-    Ok(())
+    crate::write_all_at(
+        file,
+        &num_deletes.to_le_bytes(),
+        OFF_NUM_DELETES,
+        "cuckoo num_deletes",
+    )
 }
 
 fn cuckoo_file_read_slot_staged(
