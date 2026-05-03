@@ -1181,10 +1181,19 @@ defmodule Ferricstore.Raft.StateMachine do
   defp checkpoint_clean?(_state), do: true
 
   defp with_apply_time(%{system_time: now_ms}, fun) when is_integer(now_ms) do
+    clear_stale_pending_state()
     CommandTime.with_now_ms(now_ms, fun)
   end
 
-  defp with_apply_time(_meta, fun), do: fun.()
+  defp with_apply_time(_meta, fun) do
+    clear_stale_pending_state()
+    fun.()
+  end
+
+  defp clear_stale_pending_state do
+    Process.delete(:sm_pending_state)
+    :ok
+  end
 
   defp apply_now_ms do
     CommandTime.now_ms()

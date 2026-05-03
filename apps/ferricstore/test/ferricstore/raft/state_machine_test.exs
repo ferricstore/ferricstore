@@ -2067,6 +2067,35 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert state.release_cursor_interval == 500
     end
 
+    test "apply does not inherit stale pending state from a previous crashed apply", %{
+      store: _store,
+      ets: ets
+    } do
+      state = init_state_for_release_cursor(ets)
+
+      stale_state = %{
+        state
+        | active_file_id: 99,
+          active_file_path: Path.join(state.shard_data_path, "00099.log"),
+          active_file_size: 12_345,
+          file_stats: %{99 => %{live_bytes: 1, dead_bytes: 0}}
+      }
+
+      Process.put(:sm_pending_state, stale_state)
+
+      try do
+        assert {new_state, _result, _effects} =
+                 StateMachine.apply(%{index: 1}, {:getdel, "missing_after_stale"}, state)
+
+        assert new_state.active_file_id == state.active_file_id
+        assert new_state.active_file_path == state.active_file_path
+        assert new_state.active_file_size == state.active_file_size
+        assert new_state.file_stats == state.file_stats
+      after
+        Process.delete(:sm_pending_state)
+      end
+    end
+
     test "init/1 caches expanded paths for release cursor checkpoint checks", %{
       store: _store,
       ets: ets
