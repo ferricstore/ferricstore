@@ -171,6 +171,7 @@ defmodule Ferricstore.Store.ColdRead do
   defp emit_pread_result_error(result, _path), do: result
 
   defp classify_pread_error(:timeout), do: :timeout
+  defp classify_pread_error(reason) when reason in [:missing_file, :enoent], do: :missing_file
 
   defp classify_pread_error(reason) when is_binary(reason) do
     downcased = String.downcase(reason)

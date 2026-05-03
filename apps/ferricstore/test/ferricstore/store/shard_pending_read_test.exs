@@ -4,6 +4,22 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard
 
+  setup do
+    handler_id = {:pending_read_telemetry, self(), make_ref()}
+    parent = self()
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :bitcask, :pread_corrupt],
+      &__MODULE__.handle_telemetry/4,
+      parent
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok
+  end
+
   test "cold read timeout removes simple pending read and replies nil" do
     tag = make_ref()
     state = %{flush_in_flight: nil, pending_reads: %{123 => {{self(), tag}, "key"}}}
@@ -24,11 +40,22 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
 
   test "cold read timeout removes location-stamped pending read and replies nil" do
     tag = make_ref()
-    state = %{flush_in_flight: nil, pending_reads: %{321 => {{self(), tag}, "key", 0, 1, 2, 3}}}
+    shard_data_path = Path.join(System.tmp_dir!(), "pending_read_timeout")
+
+    state = %{
+      flush_in_flight: nil,
+      shard_data_path: shard_data_path,
+      pending_reads: %{321 => {{self(), tag}, "key", 0, 1, 2, 3}}
+    }
 
     assert {:noreply, new_state} = Shard.handle_info({:cold_read_timeout, 321}, state)
     assert new_state.pending_reads == %{}
     assert_receive {^tag, nil}
+
+    assert_receive {:pread_telemetry, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                    %{path: path, reason: :timeout, raw_reason: :timeout}}
+
+    assert path == Path.join(shard_data_path, "00001.log")
   end
 
   test "cold read timeout ignores stale correlation ids" do
@@ -95,10 +122,12 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
     key = "pending:cancel-error-timeout"
     tag = make_ref()
     timer_ref = Process.send_after(self(), :unexpected_timeout, 60_000)
+    shard_data_path = Path.join(System.tmp_dir!(), "pending_read_error")
 
     state = %{
       flush_in_flight: nil,
-      pending_reads: %{126 => {:pending_read, {{self(), tag}, key}, timer_ref}}
+      shard_data_path: shard_data_path,
+      pending_reads: %{126 => {:pending_read, {{self(), tag}, key, 0, 7, 12, 3}, timer_ref}}
     }
 
     try do
@@ -109,6 +138,11 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
       assert_receive {^tag, nil}
       assert Process.read_timer(timer_ref) == false
       refute_received :unexpected_timeout
+
+      assert_receive {:pread_telemetry, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                      %{path: path, reason: :missing_file, raw_reason: :enoent}}
+
+      assert path == Path.join(shard_data_path, "00007.log")
     after
       Process.cancel_timer(timer_ref)
     end
@@ -136,5 +170,9 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
     after
       :ets.delete(keydir)
     end
+  end
+
+  def handle_telemetry(event, measurements, metadata, parent) do
+    send(parent, {:pread_telemetry, event, measurements, metadata})
   end
 end

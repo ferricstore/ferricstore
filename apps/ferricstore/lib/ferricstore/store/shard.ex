@@ -48,6 +48,7 @@ defmodule Ferricstore.Store.Shard do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -1349,11 +1350,13 @@ defmodule Ferricstore.Store.Shard do
   # (pending_reads lookup).
   def handle_info({:cold_read_timeout, corr_id}, state) do
     case pop_pending_read(state.pending_reads, corr_id, :keep_timer) do
-      {{from, _key, _exp, _fid, _off, _vsize}, rest_pending} ->
+      {{from, _key, _exp, _fid, _off, _vsize} = pending_entry, rest_pending} ->
+        emit_pending_read_error(state, pending_entry, :timeout)
         GenServer.reply(from, nil)
         {:noreply, %{state | pending_reads: rest_pending}}
 
-      {{from, _key, :meta, _exp, _fid, _off, _vsize}, rest_pending} ->
+      {{from, _key, :meta, _exp, _fid, _off, _vsize} = pending_entry, rest_pending} ->
+        emit_pending_read_error(state, pending_entry, :timeout)
         GenServer.reply(from, nil)
         {:noreply, %{state | pending_reads: rest_pending}}
 
@@ -1429,11 +1432,13 @@ defmodule Ferricstore.Store.Shard do
       {:noreply, %{state | flush_in_flight: nil}}
     else
       case pop_pending_read(state.pending_reads, corr_id, :cancel_timer) do
-        {{from, _key, _exp, _fid, _off, _vsize}, rest_pending} ->
+        {{from, _key, _exp, _fid, _off, _vsize} = pending_entry, rest_pending} ->
+          emit_pending_read_error(state, pending_entry, reason)
           GenServer.reply(from, nil)
           {:noreply, %{state | pending_reads: rest_pending}}
 
-        {{from, _key, :meta, _exp, _fid, _off, _vsize}, rest_pending} ->
+        {{from, _key, :meta, _exp, _fid, _off, _vsize} = pending_entry, rest_pending} ->
+          emit_pending_read_error(state, pending_entry, reason)
           GenServer.reply(from, nil)
           {:noreply, %{state | pending_reads: rest_pending}}
 
@@ -1485,6 +1490,27 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp maybe_cancel_pending_timer(_timer_action, _timer_ref), do: :ok
+
+  defp emit_pending_read_error(state, {_from, _key, _exp, fid, _off, _vsize}, reason) do
+    emit_pending_read_error_for_fid(state, fid, reason)
+  end
+
+  defp emit_pending_read_error(state, {_from, _key, :meta, _exp, fid, _off, _vsize}, reason) do
+    emit_pending_read_error_for_fid(state, fid, reason)
+  end
+
+  defp emit_pending_read_error(_state, _pending_entry, _reason), do: :ok
+
+  defp emit_pending_read_error_for_fid(%{shard_data_path: shard_data_path}, fid, reason)
+       when is_binary(shard_data_path) and is_integer(fid) and fid >= 0 do
+    shard_data_path
+    |> ShardETS.file_path(fid)
+    |> ColdRead.emit_pread_error(reason)
+  rescue
+    _ -> :ok
+  end
+
+  defp emit_pending_read_error_for_fid(_state, _fid, _reason), do: :ok
 
   # -------------------------------------------------------------------
   # Graceful shutdown (spec 2C.6, step 8)
