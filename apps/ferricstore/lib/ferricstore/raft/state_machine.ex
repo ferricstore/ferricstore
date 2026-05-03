@@ -4522,10 +4522,15 @@ defmodule Ferricstore.Raft.StateMachine do
   defp merge_indexed_values(results, entries, values) do
     entries
     |> Enum.zip(values)
-    |> Enum.reduce(results, fn {{index, _key}, value}, acc ->
-      Map.put(acc, index, value)
+    |> Enum.reduce(results, fn {entry, value}, acc ->
+      merge_indexed_value(acc, entry, value)
     end)
   end
+
+  defp merge_indexed_value(acc, {index, _key}, value) when is_integer(index),
+    do: Map.put(acc, index, value)
+
+  defp merge_indexed_value(acc, {_key, index}, value), do: Map.put(acc, index, value)
 
   defp values_for_indexes(results, keys) do
     keys

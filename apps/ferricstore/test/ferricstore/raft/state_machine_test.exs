@@ -964,6 +964,31 @@ defmodule Ferricstore.Raft.StateMachineTest do
         )
     end
 
+    test "cross-shard MGET preserves values from hot keydir entries", %{
+      state: state,
+      ets: ets,
+      shard_index: shard_index
+    } do
+      :ets.insert(
+        ets,
+        {"cross_mget_a", "value-a", 0, Ferricstore.Store.LFU.initial(), 0, 0,
+         byte_size("value-a")}
+      )
+
+      :ets.insert(
+        ets,
+        {"cross_mget_b", "value-b", 0, Ferricstore.Store.LFU.initial(), 0, 0,
+         byte_size("value-b")}
+      )
+
+      {_new_state, %{^shard_index => [["value-a", "value-b"]]}} =
+        StateMachine.apply(
+          %{system_time: Ferricstore.HLC.now_ms()},
+          {:cross_shard_tx, [{shard_index, [{"MGET", ["cross_mget_a", "cross_mget_b"]}], nil}]},
+          state
+        )
+    end
+
     test "cross-shard GET rejects mismatched cold offsets", %{
       state: state,
       ets: ets,
