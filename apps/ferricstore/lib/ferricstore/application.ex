@@ -259,7 +259,7 @@ defmodule Ferricstore.Application do
         check_large_values(shard_count)
 
       _ ->
-        :ok
+        cleanup_failed_start()
     end
 
     result
@@ -306,6 +306,13 @@ defmodule Ferricstore.Application do
 
   @impl true
   def stop(_state) do
+    _ = Ferricstore.Raft.Cluster.stop_system()
+    FerricStore.Instance.cleanup(:default)
+    :ok
+  end
+
+  defp cleanup_failed_start do
+    Ferricstore.Health.set_ready(false)
     _ = Ferricstore.Raft.Cluster.stop_system()
     FerricStore.Instance.cleanup(:default)
     :ok

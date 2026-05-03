@@ -96,6 +96,46 @@ defmodule Ferricstore.ApplicationTest do
       end
     end
 
+    test "failed startup clears partial Ra system and default instance context" do
+      server_started? = application_started?(:ferricstore_server)
+      system = Ferricstore.Raft.Cluster.system_name()
+
+      try do
+        stop_app_if_started(:ferricstore_server)
+        assert :ok = Application.stop(:ferricstore)
+
+        blocker =
+          spawn(fn ->
+            receive do
+              :stop -> :ok
+            end
+          end)
+
+        Process.register(blocker, Ferricstore.Stats)
+
+        assert {:error, {:ferricstore, _reason}} = Application.ensure_all_started(:ferricstore)
+        assert :ra_system.fetch(system) == :undefined
+
+        assert_raise ArgumentError, fn ->
+          FerricStore.Instance.get(:default)
+        end
+      after
+        stop_app_if_started(:ferricstore)
+
+        case Process.whereis(Ferricstore.Stats) do
+          nil -> :ok
+          pid -> Process.exit(pid, :kill)
+        end
+
+        {:ok, _} = Application.ensure_all_started(:ferricstore)
+        ShardHelpers.wait_shards_alive()
+
+        if server_started? do
+          {:ok, _} = Application.ensure_all_started(:ferricstore_server)
+        end
+      end
+    end
+
     test "wal rollover reports unconsumed WAL files instead of silently succeeding" do
       log =
         capture_log(fn ->
