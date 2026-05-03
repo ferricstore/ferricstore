@@ -886,9 +886,11 @@ defmodule Ferricstore.Raft.StateMachine do
   # commands through Raft without the library knowing what they are.
   # The server registers a raft_apply_hook callback on the Instance struct.
   def apply(meta, {:server_command, command}, state) do
-    hook = raft_apply_hook(state)
-    result = if hook, do: hook.(command), else: {:error, :no_hook}
-    bump_applied(meta, state, result)
+    with_apply_time(meta, fn ->
+      hook = raft_apply_hook(state)
+      result = if hook, do: hook.(command), else: {:error, :no_hook}
+      bump_applied(meta, state, result)
+    end)
   end
 
   def apply(meta, {inner_command, %{hlc_ts: {physical_ms, _logical} = remote_ts}}, state)

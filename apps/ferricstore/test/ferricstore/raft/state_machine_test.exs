@@ -178,6 +178,54 @@ defmodule Ferricstore.Raft.StateMachineTest do
         File.rm_rf!(root)
       end
     end
+
+    test "stamped server_command exposes stamped HLC time to hook" do
+      name = :"sm_hook_time_instance_#{System.unique_integer([:positive])}"
+      root = Path.join(System.tmp_dir!(), "sm_hook_time_#{System.unique_integer([:positive])}")
+      shard_path = Ferricstore.DataDir.shard_data_path(root, 0)
+      File.mkdir_p!(shard_path)
+
+      ets = :ets.new(:"sm_hook_time_ets_#{System.unique_integer([:positive])}", [:set, :public])
+      stamped_now = Ferricstore.HLC.now_ms() - 30_000
+
+      ctx =
+        FerricStore.Instance.build(name,
+          data_dir: root,
+          shard_count: 1,
+          max_memory_bytes: 256 * 1024 * 1024,
+          keydir_max_ram: 64 * 1024 * 1024
+        )
+
+      FerricStore.Instance.inject_callbacks(name,
+        raft_apply_hook: fn :now_ms -> Ferricstore.CommandTime.now_ms() end
+      )
+
+      try do
+        state =
+          StateMachine.init(%{
+            shard_index: 0,
+            shard_data_path: shard_path,
+            active_file_id: 0,
+            active_file_path: Path.join(shard_path, "00000.log"),
+            ets: ets,
+            instance_name: name
+          })
+
+        assert {_state, ^stamped_now} =
+                 StateMachine.apply(
+                   %{system_time: stamped_now + 60_000},
+                   {{:server_command, :now_ms}, %{hlc_ts: {stamped_now, 0}}},
+                   state
+                 )
+      after
+        FerricStore.Instance.cleanup(name)
+        safe_delete_ets(ets)
+        safe_delete_ets(elem(ctx.keydir_refs, 0))
+        safe_delete_ets(ctx.hotness_table)
+        safe_delete_ets(ctx.config_table)
+        File.rm_rf!(root)
+      end
+    end
   end
 
   defp safe_delete_ets(table) do
