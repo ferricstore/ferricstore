@@ -84,6 +84,30 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
     File.rm_rf(dir)
   end
 
+  defp force_rotate_active_file(pid) do
+    :sys.replace_state(pid, fn state ->
+      new_id = state.active_file_id + 1
+      sp = state.shard_data_path
+      new_path = Ferricstore.Store.Shard.ETS.file_path(sp, new_id)
+
+      Ferricstore.FS.touch!(new_path)
+
+      if ctx = Map.get(state, :instance_ctx) do
+        Ferricstore.Store.ActiveFile.publish(ctx, state.index, new_id, new_path, sp)
+      end
+
+      %{
+        state
+        | active_file_id: new_id,
+          active_file_path: new_path,
+          active_file_size: 0,
+          file_stats: Map.put(state.file_stats, new_id, {0, 0})
+      }
+    end)
+
+    :ok
+  end
+
   # ---------------------------------------------------------------------------
   # v2_append_batch_nosync NIF
   # ---------------------------------------------------------------------------
@@ -1009,7 +1033,9 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
     test "replays log tail after stale active-file hint" do
       previous_trap_exit = Process.flag(:trap_exit, true)
+
       {pid1, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
       key = "hint_tail_#{:erlang.unique_integer([:positive])}"
 
       try do
@@ -1140,6 +1166,29 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       end
     end
 
+    test "manual compaction skips the active log file even when it has live entries" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+      try do
+        active_path = Path.join([dir, "data", "shard_0", "00000.log"])
+        assert :ok = GenServer.call(pid, {:put, "active_live_compaction", "value", 0})
+        assert :ok = GenServer.call(pid, :flush)
+
+        size_before = File.stat!(active_path).size
+
+        assert {:ok, {0, 0, 0}} = GenServer.call(pid, {:run_compaction, [0]})
+        assert File.exists?(active_path)
+        assert File.stat!(active_path).size == size_before
+        assert "value" == GenServer.call(pid, {:get, "active_live_compaction"})
+
+        state = :sys.get_state(pid)
+        assert state.active_file_size == size_before
+        assert Map.fetch!(state.file_stats, 0) == {size_before, 0}
+      after
+        cleanup_shard(pid, ctx, dir)
+      end
+    end
+
     test "drains deferred BitcaskWriter writes before selecting compacted records" do
       source =
         Path.expand("../../../lib/ferricstore/store/shard.ex", __DIR__)
@@ -1183,6 +1232,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       :ok = GenServer.call(pid1, :flush)
       assert nil == GenServer.call(pid1, {:get, a})
       assert "live-b" == GenServer.call(pid1, {:get, b})
+
+      :ok = force_rotate_active_file(pid1)
 
       assert {:ok, {1, 0, _reclaimed}} = GenServer.call(pid1, {:run_compaction, [0]})
 

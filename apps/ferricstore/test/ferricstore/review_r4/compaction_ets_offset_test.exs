@@ -8,6 +8,7 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
 
   setup do
     ctx = IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 0)
+
     on_exit(fn -> IsolatedInstance.checkin(ctx) end)
 
     %{
@@ -27,6 +28,8 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
       assert :ok = GenServer.call(shard, :flush)
 
       assert :ok = GenServer.call(shard, {:delete, "c2_key_2"})
+
+      force_rotate_active_file(shard)
 
       [{_, nil, _, _, 0, offset_1_before, _}] = :ets.lookup(keydir, "c2_key_1")
       [{_, nil, _, _, 0, offset_3_before, _}] = :ets.lookup(keydir, "c2_key_3")
@@ -58,5 +61,23 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
       assert [{^missing_file_id, {:copy_failed, _reason}}] = failures
       assert [{^key, nil, 0, 0, ^missing_file_id, 0, 16}] = :ets.lookup(keydir, key)
     end
+  end
+
+  defp force_rotate_active_file(shard) do
+    :sys.replace_state(shard, fn state ->
+      new_id = state.active_file_id + 1
+      sp = state.shard_data_path
+      new_path = Ferricstore.Store.Shard.ETS.file_path(sp, new_id)
+
+      Ferricstore.FS.touch!(new_path)
+
+      %{
+        state
+        | active_file_id: new_id,
+          active_file_path: new_path,
+          active_file_size: 0,
+          file_stats: Map.put(state.file_stats, new_id, {0, 0})
+      }
+    end)
   end
 end

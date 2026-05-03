@@ -656,80 +656,82 @@ defmodule Ferricstore.Store.Shard do
             state.keydir
           )
 
-        if live_entries != [] do
-          offsets = Enum.map(live_entries, fn {_key, off} -> off end)
-
-          old_size =
-            case File.stat(source) do
-              {:ok, %{size: s}} -> s
-              _ -> 0
-            end
-
-          dest = Path.join(sp, "compact_#{fid}.log")
-
-          tombstone_offsets = tombstone_offsets(source)
-
-          copy_result =
-            if tombstone_offsets == [] do
-              NIF.v2_copy_records(source, dest, offsets)
-            else
-              NIF.v2_copy_records_preserve_tombstones(
-                source,
-                dest,
-                offsets,
-                tombstone_offsets
-              )
-            end
-
-          case copy_result do
-            {:ok, results} when length(results) == length(live_entries) ->
-              remove_hint_for_file(sp, fid)
-              Ferricstore.FS.rename!(dest, source)
-              update_compacted_ets_locations(state.keydir, fid, live_entries, results)
-
-              new_size =
-                case File.stat(source) do
-                  {:ok, %{size: s}} -> s
-                  _ -> 0
-                end
-
-              {written + length(live_entries), dropped, reclaimed + max(old_size - new_size, 0),
-               [fid | compacted], skipped, failures}
-
-            {:ok, results} ->
-              Logger.error(
-                "Shard #{state.index}: compaction copy_records result mismatch for #{source}: expected #{length(live_entries)}, got #{length(results)}"
-              )
-
-              _ = Ferricstore.FS.rm(dest)
-
-              failure = {fid, {:copy_result_mismatch, length(live_entries), length(results)}}
-              {written, dropped, reclaimed, compacted, skipped, [failure | failures]}
-
-            {:error, reason} ->
-              Logger.error(
-                "Shard #{state.index}: compaction copy_records failed for #{source}: #{inspect(reason)}"
-              )
-
-              _ = Ferricstore.FS.rm(dest)
-
-              {written, dropped, reclaimed, compacted, skipped,
-               [{fid, {:copy_failed, reason}} | failures]}
-          end
-        else
-          # Tombstones are not represented in ETS, but they can still be
-          # semantically live because they suppress older values in lower file
-          # ids. Per-file compaction cannot prove those older values are gone,
-          # so keep tombstone-only files for correctness.
-          old_size =
-            case File.stat(source) do
-              {:ok, %{size: s}} -> s
-              _ -> 0
-            end
-
-          if fid == state.active_file_id do
+        cond do
+          fid == state.active_file_id ->
             {written, dropped, reclaimed, compacted, skipped, failures}
-          else
+
+          live_entries != [] ->
+            offsets = Enum.map(live_entries, fn {_key, off} -> off end)
+
+            old_size =
+              case File.stat(source) do
+                {:ok, %{size: s}} -> s
+                _ -> 0
+              end
+
+            dest = Path.join(sp, "compact_#{fid}.log")
+
+            tombstone_offsets = tombstone_offsets(source)
+
+            copy_result =
+              if tombstone_offsets == [] do
+                NIF.v2_copy_records(source, dest, offsets)
+              else
+                NIF.v2_copy_records_preserve_tombstones(
+                  source,
+                  dest,
+                  offsets,
+                  tombstone_offsets
+                )
+              end
+
+            case copy_result do
+              {:ok, results} when length(results) == length(live_entries) ->
+                remove_hint_for_file(sp, fid)
+                Ferricstore.FS.rename!(dest, source)
+                update_compacted_ets_locations(state.keydir, fid, live_entries, results)
+
+                new_size =
+                  case File.stat(source) do
+                    {:ok, %{size: s}} -> s
+                    _ -> 0
+                  end
+
+                {written + length(live_entries), dropped, reclaimed + max(old_size - new_size, 0),
+                 [fid | compacted], skipped, failures}
+
+              {:ok, results} ->
+                Logger.error(
+                  "Shard #{state.index}: compaction copy_records result mismatch for #{source}: expected #{length(live_entries)}, got #{length(results)}"
+                )
+
+                _ = Ferricstore.FS.rm(dest)
+
+                failure = {fid, {:copy_result_mismatch, length(live_entries), length(results)}}
+                {written, dropped, reclaimed, compacted, skipped, [failure | failures]}
+
+              {:error, reason} ->
+                Logger.error(
+                  "Shard #{state.index}: compaction copy_records failed for #{source}: #{inspect(reason)}"
+                )
+
+                _ = Ferricstore.FS.rm(dest)
+
+                {written, dropped, reclaimed, compacted, skipped,
+                 [{fid, {:copy_failed, reason}} | failures]}
+            end
+
+          true ->
+            # Tombstones are not represented in ETS, but they can still be
+            # semantically live because they suppress older values in lower file
+            # ids. Per-file compaction cannot prove those older values are gone,
+            # so keep tombstone-only files for correctness.
+            old_size =
+              case File.stat(source) do
+                {:ok, %{size: s}} -> s
+                _ -> 0
+              end
+
             if tombstone_file?(source) do
               remove_hint_for_file(sp, fid)
 
@@ -744,7 +746,6 @@ defmodule Ferricstore.Store.Shard do
               _ = Ferricstore.FS.rm(source)
               {written, dropped, reclaimed + old_size, [fid | compacted], skipped, failures}
             end
-          end
         end
       end)
 
