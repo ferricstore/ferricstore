@@ -332,6 +332,51 @@ defmodule Ferricstore.Store.OpsTest do
     end
   end
 
+  describe "LocalTxStore remote compound reads" do
+    test "remote read fallbacks emit telemetry instead of exiting during shard restart" do
+      ctx = unavailable_remote_ctx()
+      keydir = elem(ctx.keydir_refs, 1)
+      tx = local_tx(ctx, 1, keydir, %{})
+      redis_key = "ops:remote_unavailable"
+      compound_key = "H:" <> redis_key <> <<0>> <> "field"
+      handler_id = {:ops_shard_unavailable, self(), make_ref()}
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :store, :shard_unavailable],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:shard_unavailable, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      try do
+        assert nil == Ops.compound_get(tx, redis_key, compound_key)
+        assert [nil] == Ops.compound_batch_get(tx, redis_key, [compound_key])
+        assert nil == Ops.compound_get_meta(tx, redis_key, compound_key)
+        assert [nil] == Ops.compound_batch_get_meta(tx, redis_key, [compound_key])
+        assert [] == Ops.compound_scan(tx, redis_key, "H:" <> redis_key <> <<0>>)
+        assert 0 == Ops.compound_count(tx, redis_key, "H:" <> redis_key <> <<0>>)
+
+        for request <- [
+              :compound_get,
+              :compound_batch_get,
+              :compound_get_meta,
+              :compound_batch_get_meta,
+              :compound_scan,
+              :compound_count
+            ] do
+          assert_receive {:shard_unavailable, [:ferricstore, :store, :shard_unavailable],
+                          %{count: 1}, %{request: ^request, reason: :noproc, shard_index: 0}},
+                         1_000
+        end
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+  end
+
   defp set_opts(overrides) do
     Map.merge(
       %{expire_at_ms: 0, nx: false, xx: false, get: false, keepttl: false, has_expiry: false},
@@ -365,5 +410,27 @@ defmodule Ferricstore.Store.OpsTest do
       |> Enum.take(count - 1)
 
     {shard_index, [first | keys]}
+  end
+
+  defp unavailable_remote_ctx do
+    keydir0 = :ets.new(:"ops_remote_unavailable_0_#{System.unique_integer([:positive])}", [:set])
+    keydir1 = :ets.new(:"ops_remote_unavailable_1_#{System.unique_integer([:positive])}", [:set])
+    :ets.delete(keydir0)
+
+    %FerricStore.Instance{
+      name: :"ops_remote_unavailable_#{System.unique_integer([:positive])}",
+      data_dir: System.tmp_dir!(),
+      data_dir_expanded: System.tmp_dir!(),
+      shard_count: 2,
+      slot_map: Tuple.duplicate(0, 1024),
+      shard_names:
+        {:"missing_ops_remote_shard_#{System.unique_integer([:positive])}",
+         :"unused_ops_local_shard_#{System.unique_integer([:positive])}"},
+      keydir_refs: {keydir0, keydir1},
+      stats_counter: :counters.new(16, []),
+      write_version: :counters.new(1, []),
+      hot_cache_max_value_size: 1024,
+      read_sample_rate: 0
+    }
   end
 end

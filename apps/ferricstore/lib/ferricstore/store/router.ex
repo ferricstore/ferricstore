@@ -44,7 +44,8 @@ defmodule Ferricstore.Store.Router do
   @doc false
   def resolve_shard(ctx, idx), do: elem(ctx.shard_names, idx)
 
-  defp safe_read_call(ctx, idx, request) do
+  @doc false
+  def safe_read_call(ctx, idx, request) do
     {:ok, GenServer.call(resolve_shard(ctx, idx), request)}
   catch
     :exit, {:noproc, _} ->

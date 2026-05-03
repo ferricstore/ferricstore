@@ -514,8 +514,12 @@ defmodule Ferricstore.Store.Ops do
         dedicated_path -> local_promoted_read_value(tx, compound_key, dedicated_path)
       end
     else
-      shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
-      GenServer.call(shard, {:compound_get, redis_key, compound_key})
+      idx = Router.shard_for(tx.instance_ctx, redis_key)
+
+      case Router.safe_read_call(tx.instance_ctx, idx, {:compound_get, redis_key, compound_key}) do
+        {:ok, value} -> value
+        :unavailable -> nil
+      end
     end
   end
 
@@ -536,8 +540,16 @@ defmodule Ferricstore.Store.Ops do
           local_batch_read_values(tx, compound_keys, dedicated_path)
       end
     else
-      shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
-      GenServer.call(shard, {:compound_batch_get, redis_key, compound_keys})
+      idx = Router.shard_for(tx.instance_ctx, redis_key)
+
+      case Router.safe_read_call(
+             tx.instance_ctx,
+             idx,
+             {:compound_batch_get, redis_key, compound_keys}
+           ) do
+        {:ok, values} -> values
+        :unavailable -> List.duplicate(nil, length(compound_keys))
+      end
     end
   end
 
@@ -562,8 +574,16 @@ defmodule Ferricstore.Store.Ops do
         dedicated_path -> local_promoted_read_meta(tx, compound_key, dedicated_path)
       end
     else
-      shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
-      GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
+      idx = Router.shard_for(tx.instance_ctx, redis_key)
+
+      case Router.safe_read_call(
+             tx.instance_ctx,
+             idx,
+             {:compound_get_meta, redis_key, compound_key}
+           ) do
+        {:ok, meta} -> meta
+        :unavailable -> nil
+      end
     end
   end
 
@@ -585,8 +605,16 @@ defmodule Ferricstore.Store.Ops do
           local_batch_read_meta(tx, compound_keys, dedicated_path)
       end
     else
-      shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
-      GenServer.call(shard, {:compound_batch_get_meta, redis_key, compound_keys})
+      idx = Router.shard_for(tx.instance_ctx, redis_key)
+
+      case Router.safe_read_call(
+             tx.instance_ctx,
+             idx,
+             {:compound_batch_get_meta, redis_key, compound_keys}
+           ) do
+        {:ok, metas} -> metas
+        :unavailable -> List.duplicate(nil, length(compound_keys))
+      end
     end
   end
 
@@ -654,8 +682,12 @@ defmodule Ferricstore.Store.Ops do
       |> merge_tx_pending_prefix(prefix)
       |> Enum.sort_by(fn {field, _} -> field end)
     else
-      shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
-      GenServer.call(shard, {:compound_scan, redis_key, prefix})
+      idx = Router.shard_for(tx.instance_ctx, redis_key)
+
+      case Router.safe_read_call(tx.instance_ctx, idx, {:compound_scan, redis_key, prefix}) do
+        {:ok, results} -> results
+        :unavailable -> []
+      end
     end
   end
 
@@ -670,8 +702,12 @@ defmodule Ferricstore.Store.Ops do
     if local?(tx, redis_key) do
       ShardETS.prefix_count_entries(tx.shard_state, prefix)
     else
-      shard = Router.resolve_shard(tx.instance_ctx, Router.shard_for(tx.instance_ctx, redis_key))
-      GenServer.call(shard, {:compound_count, redis_key, prefix})
+      idx = Router.shard_for(tx.instance_ctx, redis_key)
+
+      case Router.safe_read_call(tx.instance_ctx, idx, {:compound_count, redis_key, prefix}) do
+        {:ok, count} -> count
+        :unavailable -> 0
+      end
     end
   end
 
