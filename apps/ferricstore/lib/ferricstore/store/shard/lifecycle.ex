@@ -3,7 +3,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
-  alias Ferricstore.Store.LFU
+  alias Ferricstore.Store.{CompoundKey, LFU}
+  alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
@@ -186,11 +187,16 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
     count = length(expired_keys)
 
-    if count > 0 do
-      expire_keys(state, expired_keys)
-      incr_expired_stats(state, count)
-      Logger.debug("Shard #{state.index}: expiry sweep removed #{count} key(s)")
-    end
+    state =
+      if count > 0 do
+        state = expire_keys(state, expired_keys)
+
+        incr_expired_stats(state, count)
+        Logger.debug("Shard #{state.index}: expiry sweep removed #{count} key(s)")
+        state
+      else
+        state
+      end
 
     hit_ceiling = count >= max_keys and count > 0
     {new_ceiling_count, new_struggling} = update_sweep_ceiling(state, hit_ceiling, max_keys)
@@ -724,18 +730,66 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   end
 
   defp expire_keys(state, expired_keys) do
-    Enum.each(expired_keys, fn key ->
-      case NIF.v2_append_tombstone(state.active_file_path, key) do
-        {:ok, _} ->
-          ShardETS.ets_delete_key(state, key)
-
-        {:error, reason} ->
-          Logger.warning(
-            "Shard #{state.index}: tombstone write failed during expiry sweep for #{inspect(key)}: #{inspect(reason)}"
-          )
-      end
+    Enum.reduce(expired_keys, state, fn key, acc_state ->
+      expire_key(acc_state, key)
     end)
   end
+
+  defp expire_key(state, key) do
+    case promoted_expiry_target(state, key) do
+      {redis_key, dedicated_path} ->
+        tracked_state = ShardCompound.track_promoted_delete_bytes(state, redis_key, key)
+
+        case ShardCompound.promoted_tombstone(dedicated_path, key) do
+          {:ok, _} ->
+            ShardETS.ets_delete_key(tracked_state, key)
+            ShardCompound.bump_promoted_writes(tracked_state, redis_key)
+
+          {:error, reason} ->
+            Logger.warning(
+              "Shard #{state.index}: promoted tombstone write failed during expiry sweep for #{inspect(key)}: #{inspect(reason)}"
+            )
+
+            state
+        end
+
+      nil ->
+        expire_shared_key(state, key)
+    end
+  end
+
+  defp expire_shared_key(state, key) do
+    case NIF.v2_append_tombstone(state.active_file_path, key) do
+      {:ok, _} ->
+        ShardETS.ets_delete_key(state, key)
+        state
+
+      {:error, reason} ->
+        Logger.warning(
+          "Shard #{state.index}: tombstone write failed during expiry sweep for #{inspect(key)}: #{inspect(reason)}"
+        )
+
+        state
+    end
+  end
+
+  defp promoted_expiry_target(%{promoted_instances: promoted}, key) when is_binary(key) do
+    if promoted_member_key?(key) do
+      redis_key = CompoundKey.extract_redis_key(key)
+
+      case Map.get(promoted, redis_key) do
+        %{path: path} when is_binary(path) -> {redis_key, path}
+        _ -> nil
+      end
+    end
+  end
+
+  defp promoted_expiry_target(_state, _key), do: nil
+
+  defp promoted_member_key?(<<"H:", _rest::binary>>), do: true
+  defp promoted_member_key?(<<"S:", _rest::binary>>), do: true
+  defp promoted_member_key?(<<"Z:", _rest::binary>>), do: true
+  defp promoted_member_key?(_key), do: false
 
   defp incr_expired_stats(%{instance_ctx: nil}, count) do
     Ferricstore.Stats.incr_expired_keys(count)

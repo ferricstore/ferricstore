@@ -3,8 +3,10 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
 
   use ExUnit.Case, async: false
 
+  alias Ferricstore.HLC
   alias Ferricstore.Store.{CompoundKey, Router}
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
+  alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
   alias Ferricstore.Test.IsolatedInstance
 
   setup do
@@ -103,6 +105,50 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
     assert info.total_bytes == ShardCompound.promoted_dir_size(info.path)
     assert info.total_bytes > 0
     assert info.dead_bytes == 0
+  end
+
+  test "expiry sweep tracks dead bytes for promoted compound entries", %{ctx: ctx} do
+    redis_key = "promoted_expiry_accounting_#{System.unique_integer([:positive])}"
+
+    assert :ok =
+             Router.compound_put(
+               ctx,
+               redis_key,
+               CompoundKey.hash_field(redis_key, "f1"),
+               "value1",
+               0
+             )
+
+    assert :ok =
+             Router.compound_put(
+               ctx,
+               redis_key,
+               CompoundKey.hash_field(redis_key, "f2"),
+               "value2",
+               0
+             )
+
+    expired_key = CompoundKey.hash_field(redis_key, "expired")
+
+    assert :ok =
+             Router.compound_put(
+               ctx,
+               redis_key,
+               expired_key,
+               "gone",
+               HLC.now_ms() - 1
+             )
+
+    shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
+    state = :sys.get_state(shard)
+    before_info = Map.fetch!(state.promoted_instances, redis_key)
+
+    after_state = ShardLifecycle.do_expiry_sweep(state)
+    after_info = Map.fetch!(after_state.promoted_instances, redis_key)
+
+    assert after_info.dead_bytes > before_info.dead_bytes
+    assert ShardCompound.promoted_dir_size(after_info.path) > before_info.total_bytes
+    assert :ets.lookup(state.keydir, expired_key) == []
   end
 
   defp keydir_binary_total(ctx) do
