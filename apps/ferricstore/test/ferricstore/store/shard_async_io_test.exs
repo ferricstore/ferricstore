@@ -23,6 +23,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   alias Ferricstore.Store.Shard
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
+  alias Ferricstore.Store.Shard.Reads, as: ShardReads
 
   @header_size 26
 
@@ -924,6 +925,30 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
       assert_receive {:tokio_complete, ^corr_id, :error, reason}, 5000
       assert reason =~ "CRC" or reason =~ "mismatch"
+    end
+  end
+
+  describe "key-validated shard cold reads" do
+    test "shard GET and local transaction reads reject mismatched cold offsets" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+      try do
+        state = :sys.get_state(pid)
+        key = "shard_cold_stale_offset:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+        other_key = key <> ":other"
+        path = Path.join(state.shard_data_path, "00000.log")
+
+        {:ok, [{other_offset, _}, {_key_offset, value_size}]} =
+          NIF.v2_append_batch(path, [{other_key, "wrong-value", 0}, {key, "right-value", 0}])
+
+        :ets.insert(state.keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
+
+        assert nil == GenServer.call(pid, {:get, key})
+        assert nil == GenServer.call(pid, {:get_meta, key})
+        assert {:ok, nil} == ShardReads.v2_local_read(:sys.get_state(pid), key)
+      after
+        cleanup_shard(pid, ctx, dir)
+      end
     end
   end
 
