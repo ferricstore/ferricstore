@@ -266,7 +266,7 @@ defmodule Ferricstore.Store.Promotion do
 
     all_markers =
       :ets.select(keydir, match_spec)
-      |> Enum.map(fn {full_key, value, fid, offset} ->
+      |> Enum.flat_map(fn {full_key, value, fid, offset} ->
         <<"PM:", redis_key::binary>> = full_key
 
         # If value is nil (cold entry), read the type string from disk
@@ -291,21 +291,27 @@ defmodule Ferricstore.Store.Promotion do
           :ets.update_element(keydir, full_key, {2, type_str})
         end
 
-        {redis_key, type_str}
+        case decode_promoted_type(type_str) do
+          {:ok, type} ->
+            [{redis_key, type}]
+
+          :error ->
+            Logger.warning(
+              "Promotion recovery: ignoring invalid marker #{inspect(full_key)} with type #{inspect(type_str)}"
+            )
+
+            track_binary_delete(keydir, shard_index, full_key, instance_ctx)
+            :ets.delete(keydir, full_key)
+            []
+        end
       end)
-      |> Enum.filter(fn {_, type_str} -> is_binary(type_str) end)
       |> Enum.uniq_by(fn {redis_key, _} -> redis_key end)
 
-    marker_types =
-      Map.new(all_markers, fn {redis_key, type_str} ->
-        {redis_key, CompoundKey.decode_type(type_str)}
-      end)
+    marker_types = Map.new(all_markers)
 
     shared_live_compound_keys = shared_live_compound_keys_by_marker(keydir, marker_types)
 
-    Enum.reduce(all_markers, %{}, fn {redis_key, _type_str}, acc ->
-      type = Map.fetch!(marker_types, redis_key)
-
+    Enum.reduce(all_markers, %{}, fn {redis_key, type}, acc ->
       {:ok, dedicated_path} = open_dedicated(data_dir, shard_index, type, redis_key)
 
       log_files = list_log_files(dedicated_path)
@@ -465,6 +471,11 @@ defmodule Ferricstore.Store.Promotion do
   defp compound_key_type?(<<"S:", _::binary>>, :set), do: true
   defp compound_key_type?(<<"Z:", _::binary>>, :zset), do: true
   defp compound_key_type?(_key, _type), do: false
+
+  defp decode_promoted_type("hash"), do: {:ok, :hash}
+  defp decode_promoted_type("set"), do: {:ok, :set}
+  defp decode_promoted_type("zset"), do: {:ok, :zset}
+  defp decode_promoted_type(_type_str), do: :error
 
   defp shared_uncovered_live_compound?(shared_keys, dedicated_keys) do
     Enum.any?(shared_keys, fn key -> not MapSet.member?(dedicated_keys, key) end)

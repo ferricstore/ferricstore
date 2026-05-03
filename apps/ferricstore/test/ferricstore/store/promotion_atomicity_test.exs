@@ -310,6 +310,32 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
   # ---------------------------------------------------------------------------
 
   describe "marker-first promotion: every crash point recovers" do
+    test "invalid or unsupported promotion markers do not crash recovery", ctx do
+      normal_key = "normal_after_bad_marker"
+      {:ok, {offset, value_size}} = NIF.v2_append_record(ctx.active_path, normal_key, "live", 0)
+      :ets.insert(ctx.keydir, {normal_key, "live", 0, LFU.initial(), 0, offset, value_size})
+
+      invalid_marker = Promotion.marker_key("bad-marker")
+      {:ok, {bad_off, bad_size}} = NIF.v2_append_record(ctx.active_path, invalid_marker, "bad", 0)
+      :ets.insert(ctx.keydir, {invalid_marker, "bad", 0, LFU.initial(), 0, bad_off, bad_size})
+
+      list_marker = Promotion.marker_key("list-marker")
+      {:ok, {list_off, list_size}} = NIF.v2_append_record(ctx.active_path, list_marker, "list", 0)
+      :ets.insert(ctx.keydir, {list_marker, "list", 0, LFU.initial(), 0, list_off, list_size})
+
+      promoted = simulate_restart(ctx)
+
+      assert promoted == %{}
+
+      assert [{^normal_key, nil, 0, _lfu, 0, ^offset, _value_size}] =
+               :ets.lookup(ctx.keydir, normal_key)
+
+      assert {:cold_shared, "live"} == read_ckey(ctx, normal_key)
+
+      assert [] == :ets.lookup(ctx.keydir, invalid_marker)
+      assert [] == :ets.lookup(ctx.keydir, list_marker)
+    end
+
     test "partial dedicated recovery builds the shared compound fallback index once" do
       source =
         File.read!(Path.expand("../../../lib/ferricstore/store/promotion.ex", __DIR__))
