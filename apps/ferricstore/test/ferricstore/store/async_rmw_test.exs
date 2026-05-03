@@ -82,6 +82,35 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       end
     end
 
+    test "RmwCoordinator sweeps stale latches for custom instance contexts it has seen" do
+      isolated = minimal_instance_context()
+
+      try do
+        idx = 0
+        latch_tab = elem(isolated.latch_refs, idx)
+        stale_key = ukey("custom_stale_latch")
+
+        dead_holder =
+          spawn(fn ->
+            :ok
+          end)
+
+        ref = Process.monitor(dead_holder)
+        assert_receive {:DOWN, ^ref, :process, ^dead_holder, :normal}, 500
+
+        :ets.insert(latch_tab, {stale_key, dead_holder})
+
+        assert nil ==
+                 RmwCoordinator.execute(idx, isolated, {:getdel, ukey("register_custom_ctx")})
+
+        assert :ok = RmwCoordinator.sweep_latches(idx)
+
+        assert [] == :ets.lookup(latch_tab, stale_key)
+      after
+        cleanup_minimal_instance_context(isolated)
+      end
+    end
+
     test "RmwCoordinator does not serialize same-key RMW across different instances" do
       ctx_a = IsolatedInstance.checkout(shard_count: 1)
       ctx_b = IsolatedInstance.checkout(shard_count: 1)

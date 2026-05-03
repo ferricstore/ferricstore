@@ -88,7 +88,7 @@ defmodule Ferricstore.Store.RmwCoordinator do
     # The instance context may not be populated yet at application start
     # order. Defer lookup until first use, but remember the shard index.
     Process.send_after(self(), :sweep_latches, @sweep_interval_ms)
-    {:ok, %{idx: idx, queues: %{}, running: MapSet.new()}}
+    {:ok, %{idx: idx, queues: %{}, running: MapSet.new(), contexts: %{}}}
   end
 
   @impl true
@@ -100,29 +100,25 @@ defmodule Ferricstore.Store.RmwCoordinator do
         {:reply, {:error, "ERR instance not initialized"}, state}
 
       _ ->
+        state = remember_context(state, ctx)
         {:noreply, enqueue_rmw(state, from, ctx, cmd)}
     end
   end
 
   def handle_call({:rmw, %FerricStore.Instance{} = ctx, cmd}, from, state) do
+    state = remember_context(state, ctx)
     {:noreply, enqueue_rmw(state, from, ctx, cmd)}
   end
 
   def handle_call(:sweep_latches_now, _from, state) do
-    case FerricStore.Instance.get(:default) do
-      nil -> :ok
-      ctx -> do_sweep(elem(ctx.latch_refs, state.idx))
-    end
+    sweep_known_context_latches(state)
 
     {:reply, :ok, state}
   end
 
   @impl true
   def handle_info(:sweep_latches, state) do
-    case FerricStore.Instance.get(:default) do
-      nil -> :ok
-      ctx -> do_sweep(elem(ctx.latch_refs, state.idx))
-    end
+    sweep_known_context_latches(state)
 
     Process.send_after(self(), :sweep_latches, @sweep_interval_ms)
     {:noreply, state}
@@ -213,6 +209,42 @@ defmodule Ferricstore.Store.RmwCoordinator do
         Logger.error("RmwCoordinator: worker task failed: #{inspect({kind, reason})}")
         {:error, "ERR RMW worker crashed"}
     end
+  end
+
+  defp remember_context(state, %FerricStore.Instance{} = ctx) do
+    %{state | contexts: Map.put(state.contexts, ctx.name, ctx)}
+  end
+
+  defp sweep_known_context_latches(state) do
+    state
+    |> known_contexts()
+    |> Enum.each(fn ctx ->
+      if state.idx < tuple_size(ctx.latch_refs) do
+        sweep_latch_table(elem(ctx.latch_refs, state.idx))
+      end
+    end)
+  end
+
+  defp sweep_latch_table(tab) do
+    case :ets.whereis(tab) do
+      :undefined -> :ok
+      _tid -> do_sweep(tab)
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp known_contexts(state) do
+    state.contexts
+    |> Map.put(:default, default_context())
+    |> Map.values()
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp default_context do
+    FerricStore.Instance.get(:default)
+  rescue
+    ArgumentError -> nil
   end
 
   # Scheduling must include the instance name. The coordinator process is
