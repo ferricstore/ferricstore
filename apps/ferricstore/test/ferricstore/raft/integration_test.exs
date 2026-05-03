@@ -61,6 +61,18 @@ defmodule Ferricstore.Raft.IntegrationTest do
                end)
     end
 
+    test "default state machine marks checkpoint dirty through instance name fallback" do
+      ctx = FerricStore.Instance.get(:default)
+      key = ukey("checkpoint_dirty_default")
+      shard_index = Router.shard_for(ctx, key)
+
+      :atomics.put(ctx.checkpoint_flags, shard_index + 1, 0)
+
+      assert :ok = Router.put(ctx, key, "value", 0)
+
+      assert :atomics.get(ctx.checkpoint_flags, shard_index + 1) == 1
+    end
+
     test "SET through Router writes via Raft and is readable" do
       k = ukey("set_via_raft")
 

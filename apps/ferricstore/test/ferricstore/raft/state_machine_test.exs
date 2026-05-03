@@ -325,7 +325,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
                :ets.lookup(ets, "durable_future_getset")
     end
 
-    test "persists already-applied origin RMW when the local value is still pending", %{
+    test "does not duplicate already-applied origin RMW while local value is pending", %{
       state: state,
       ets: ets,
       active_file_path: active_file_path
@@ -341,11 +341,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
           state
         )
 
-      assert [{"pending_origin_getset", "new", 0, _lfu, 0, 0, 3}] =
+      assert [{"pending_origin_getset", "new", 0, _lfu, :pending, 0, 0}] =
                :ets.lookup(ets, "pending_origin_getset")
 
-      assert {:ok, [{"pending_origin_getset", 0, 3, 0, false}]} =
-               NIF.v2_scan_file(active_file_path)
+      assert {:ok, []} = NIF.v2_scan_file(active_file_path)
     end
 
     test "does not replay origin INCR over a provably newer pending local value", %{
@@ -2200,6 +2199,40 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert Enum.any?(effects, &match?({:release_cursor, 77}, &1))
       assert :atomics.get(instance_ctx.last_applied_index, shard_index + 1) == 77
       assert :atomics.get(instance_ctx.last_released_cursor_index, shard_index + 1) == 77
+    end
+
+    test "named state machine marks checkpoint dirty and blocks release after nosync write", %{
+      ets: ets
+    } do
+      instance_name = :"cursor_dirty_instance_#{System.unique_integer([:positive])}"
+      root = Path.join(System.tmp_dir!(), Atom.to_string(instance_name))
+      File.rm_rf!(root)
+      File.mkdir_p!(root)
+
+      instance_ctx = FerricStore.Instance.build(instance_name, shard_count: 1, data_dir: root)
+
+      on_exit({:cursor_dirty_instance, instance_name}, fn ->
+        FerricStore.Instance.cleanup(instance_name)
+        File.rm_rf!(root)
+      end)
+
+      state =
+        init_state_for_release_cursor(ets,
+          shard_index: 0,
+          release_cursor_interval: 1,
+          instance_ctx: nil,
+          instance_name: instance_name
+        )
+
+      meta = %{index: 88, term: 1, system_time: System.os_time(:millisecond)}
+
+      {new_state, {:applied_at, 88, :ok}, effects} =
+        StateMachine.apply(meta, {:put, "dirty_named_rc_key", "value", 0}, state)
+
+      assert new_state.applied_count == 1
+      assert :atomics.get(instance_ctx.checkpoint_flags, 1) == 1
+      refute Enum.any?(effects, &match?({:release_cursor, 88}, &1))
+      assert Ferricstore.Raft.ReplaySafeIndex.read(new_state.shard_data_path) == 0
     end
 
     test "release_cursor waits while checkpoint fsync is in flight", %{

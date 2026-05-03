@@ -1074,14 +1074,16 @@ defmodule Ferricstore.Raft.StateMachine do
   # A release_cursor lets ra compact log entries. For the Bitcask-backed state
   # machine, the log must not be released past writes that are still only in
   # the OS page cache; the checkpoint flag is cleared only after fsync succeeds.
-  defp checkpoint_clean?(%{instance_ctx: nil, instance_name: name, shard_index: shard_index})
-       when is_atom(name) and name != :default do
-    case instance_ctx_by_name(name) do
+  defp checkpoint_clean?(
+         %{instance_ctx: nil, instance_name: name, shard_index: shard_index} = state
+       )
+       when is_atom(name) do
+    case checkpoint_ctx_for_state(state) do
       %FerricStore.Instance{} = instance_ctx ->
         checkpoint_clean?(%{instance_ctx: instance_ctx, shard_index: shard_index})
 
       _ ->
-        false
+        name == :default
     end
   end
 
@@ -1096,14 +1098,22 @@ defmodule Ferricstore.Raft.StateMachine do
 
     checkpoint_flag_clean? =
       case Map.get(instance_ctx, :checkpoint_flags) do
-        nil -> true
-        checkpoint_flags -> :atomics.get(checkpoint_flags, flag_idx) == 0
+        nil ->
+          true
+
+        checkpoint_flags ->
+          flag_idx > :atomics.info(checkpoint_flags).size or
+            :atomics.get(checkpoint_flags, flag_idx) == 0
       end
 
     checkpoint_idle? =
       case Map.get(instance_ctx, :checkpoint_in_flight) do
-        nil -> true
-        checkpoint_in_flight -> :atomics.get(checkpoint_in_flight, flag_idx) == 0
+        nil ->
+          true
+
+        checkpoint_in_flight ->
+          flag_idx > :atomics.info(checkpoint_in_flight).size or
+            :atomics.get(checkpoint_in_flight, flag_idx) == 0
       end
 
     checkpoint_flag_clean? and checkpoint_idle?
@@ -3360,21 +3370,57 @@ defmodule Ferricstore.Raft.StateMachine do
   defp append_result_class(_), do: :unknown
 
   defp set_disk_pressure(state) do
-    if state.instance_ctx do
-      Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.shard_index)
-    else
-      Ferricstore.Store.DiskPressure.set(state.shard_index)
+    case checkpoint_ctx_for_state(state) do
+      nil ->
+        Ferricstore.Store.DiskPressure.set(state.shard_index)
+
+      ctx ->
+        Ferricstore.Store.DiskPressure.set(ctx, state.shard_index)
     end
   end
 
   defp clear_disk_pressure(state) do
-    if state.instance_ctx do
-      :atomics.put(state.instance_ctx.checkpoint_flags, state.shard_index + 1, 1)
-      Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.shard_index)
-    else
-      Ferricstore.Store.DiskPressure.clear(state.shard_index)
+    case checkpoint_ctx_for_state(state) do
+      nil ->
+        Ferricstore.Store.DiskPressure.clear(state.shard_index)
+
+      ctx ->
+        flag_idx = state.shard_index + 1
+
+        if flag_idx <= :atomics.info(ctx.checkpoint_flags).size do
+          :atomics.put(ctx.checkpoint_flags, flag_idx, 1)
+        end
+
+        Ferricstore.Store.DiskPressure.clear(ctx, state.shard_index)
     end
   end
+
+  defp checkpoint_ctx_for_state(%{instance_ctx: ctx}) when is_map(ctx), do: ctx
+
+  defp checkpoint_ctx_for_state(%{instance_name: :default, shard_data_path: shard_data_path}) do
+    case instance_ctx_by_name(:default) do
+      %FerricStore.Instance{} = ctx ->
+        if instance_data_path?(ctx, shard_data_path), do: ctx, else: nil
+
+      _ ->
+        nil
+    end
+  end
+
+  defp checkpoint_ctx_for_state(%{instance_name: name}) when is_atom(name) do
+    instance_ctx_by_name(name)
+  end
+
+  defp checkpoint_ctx_for_state(_state), do: nil
+
+  defp instance_data_path?(%FerricStore.Instance{data_dir: data_dir}, shard_data_path)
+       when is_binary(data_dir) and is_binary(shard_data_path) do
+    data_dir = Path.expand(data_dir)
+    shard_data_path = Path.expand(shard_data_path)
+    shard_data_path == data_dir or String.starts_with?(shard_data_path, data_dir <> "/")
+  end
+
+  defp instance_data_path?(_ctx, _shard_data_path), do: false
 
   defp duration_us(started_at) do
     System.monotonic_time()
