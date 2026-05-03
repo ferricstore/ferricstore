@@ -67,6 +67,22 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     assert_nif_schedule(source, "v2_append_batch_async", "DirtyCpu")
   end
 
+  test "async batch cold-read submit decodes large batches off normal schedulers" do
+    source = File.read!(@source)
+
+    # These NIFs submit the actual reads to Tokio, but Rustler still decodes the
+    # path/offset batch before the function returns. Large cold MGET/HMGET-style
+    # reads can carry thousands of offsets, so keep the submit/decode work off
+    # Normal schedulers while the blocking pread work stays on Tokio workers.
+    for function <- [
+          "v2_pread_batch_path_async",
+          "v2_pread_batch_async",
+          "v2_pread_batch_grouped_async"
+        ] do
+      assert_nif_schedule(source, function, "DirtyCpu")
+    end
+  end
+
   defp assert_nif_schedule(source, function, schedule) do
     pattern =
       ~r/#\[rustler::nif\(schedule = "#{schedule}"\)\]\s*(?:#\[allow\([^\]]+\)\]\s*)?fn #{function}\b/

@@ -1160,7 +1160,7 @@ fn pread_batch_grouped(locations: Vec<(String, u64)>) -> Result<Vec<Option<Vec<u
     Ok(values)
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_batch_path_async(
     env: Env<'_>,
@@ -1186,7 +1186,7 @@ fn v2_pread_batch_path_async(
     Ok(atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_batch_async(
     env: Env<'_>,
@@ -1228,7 +1228,7 @@ fn v2_pread_batch_async(
     Ok(atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_batch_grouped_async(
     env: Env<'_>,
