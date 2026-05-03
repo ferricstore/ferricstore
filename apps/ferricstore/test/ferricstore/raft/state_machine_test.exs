@@ -293,7 +293,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
     test "replays origin GETSET over an unaccepted pending local value", %{state: state, ets: ets} do
       :ets.insert(ets, {"future_origin_getset", "future", 0, 1, :pending, 0, 0})
 
-      {_state2, "future"} =
+      {_state2, "old"} =
         StateMachine.apply(
           %{},
           {:async, node(),
@@ -348,14 +348,14 @@ defmodule Ferricstore.Raft.StateMachineTest do
                NIF.v2_scan_file(active_file_path)
     end
 
-    test "does not replay origin INCR when a newer pending value already includes it", %{
+    test "replays origin INCR expected value over pending local value", %{
       state: state,
       ets: ets,
       active_file_path: active_file_path
     } do
       :ets.insert(ets, {"pending_origin_incr_newer", "10", 0, 1, :pending, 0, 0})
 
-      {_state2, :ok} =
+      {_state2, {:ok, 5}} =
         StateMachine.apply(
           %{},
           {:async, node(),
@@ -364,20 +364,21 @@ defmodule Ferricstore.Raft.StateMachineTest do
           state
         )
 
-      assert [{"pending_origin_incr_newer", "10", 0, _lfu, :pending, 0, 0}] =
+      assert [{"pending_origin_incr_newer", "5", 0, _lfu, 0, 0, 1}] =
                :ets.lookup(ets, "pending_origin_incr_newer")
 
-      assert {:ok, []} = NIF.v2_scan_file(active_file_path)
+      assert {:ok, [{"pending_origin_incr_newer", 0, 1, 0, false}]} =
+               NIF.v2_scan_file(active_file_path)
     end
 
-    test "does not replay origin DECR when a newer pending value already includes it", %{
+    test "replays origin DECR expected value over pending local value", %{
       state: state,
       ets: ets,
       active_file_path: active_file_path
     } do
       :ets.insert(ets, {"pending_origin_decr_newer", "-10", 0, 1, :pending, 0, 0})
 
-      {_state2, :ok} =
+      {_state2, {:ok, -5}} =
         StateMachine.apply(
           %{},
           {:async, node(),
@@ -386,10 +387,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
           state
         )
 
-      assert [{"pending_origin_decr_newer", "-10", 0, _lfu, :pending, 0, 0}] =
+      assert [{"pending_origin_decr_newer", "-5", 0, _lfu, 0, 0, 2}] =
                :ets.lookup(ets, "pending_origin_decr_newer")
 
-      assert {:ok, []} = NIF.v2_scan_file(active_file_path)
+      assert {:ok, [{"pending_origin_decr_newer", 0, 2, 0, false}]} =
+               NIF.v2_scan_file(active_file_path)
     end
 
     test "replays origin GETEX when recovery has the old expiry", %{state: state, ets: ets} do
@@ -430,17 +432,14 @@ defmodule Ferricstore.Raft.StateMachineTest do
                :ets.lookup(ets, "old_origin_setrange")
     end
 
-    test "does not replay origin SETRANGE when a newer pending value already includes it", %{
+    test "replays origin SETRANGE expected value over pending local value", %{
       state: state,
       ets: ets,
       active_file_path: active_file_path
     } do
-      # Origin already applied SETRANGE("hello", 2, "X") => "heXlo", then a
-      # later local async command extended the pending value. Replaying the
-      # older Ra entry must not enqueue another Bitcask write.
       :ets.insert(ets, {"pending_origin_setrange_newer", "heXlo!", 0, 1, :pending, 0, 0})
 
-      {_state2, :ok} =
+      {_state2, {:ok, 5}} =
         StateMachine.apply(
           %{},
           {:async, node(),
@@ -449,10 +448,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
           state
         )
 
-      assert [{"pending_origin_setrange_newer", "heXlo!", 0, _lfu, :pending, 0, 0}] =
+      assert [{"pending_origin_setrange_newer", "heXlo", 0, _lfu, 0, 0, 5}] =
                :ets.lookup(ets, "pending_origin_setrange_newer")
 
-      assert {:ok, []} = NIF.v2_scan_file(active_file_path)
+      assert {:ok, [{"pending_origin_setrange_newer", 0, 5, 0, false}]} =
+               NIF.v2_scan_file(active_file_path)
     end
 
     test "replays origin async DELETE when recovery still has an older value", %{

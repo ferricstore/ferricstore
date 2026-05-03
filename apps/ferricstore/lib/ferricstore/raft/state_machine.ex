@@ -2179,6 +2179,16 @@ defmodule Ferricstore.Raft.StateMachine do
       :apply ->
         apply_single(state, inner_cmd)
 
+      :apply_expected ->
+        apply_origin_checked_expected(
+          state,
+          key,
+          inner_cmd,
+          before_value,
+          expected_value,
+          expire_at_ms
+        )
+
       :newer_local_value ->
         :ok
     end
@@ -2601,17 +2611,17 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp pending_newer_origin_replay_decision(state, key, inner_cmd, expected_value) do
+  defp pending_newer_origin_replay_decision(state, key, _inner_cmd, expected_value) do
     case :ets.lookup(state.ets, key) do
       [{^key, current_value, _expire_at_ms, _lfu, :pending, _off, _value_size}] ->
-        if pending_newer_value_includes_origin_command?(
-             inner_cmd,
-             current_value,
-             expected_value
-           ) do
+        if current_value == expected_value do
           :already_applied
         else
-          :apply
+          # A pending local value has no Raft index attached, so we cannot prove
+          # it is a later accepted command rather than an unreplicated local
+          # effect. Materialize the accepted origin result; a genuinely later
+          # accepted command will replay after this entry in Raft order.
+          :apply_expected
         end
 
       _ ->
@@ -2619,59 +2629,70 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp pending_newer_value_includes_origin_command?(
-         {:incr, _key, delta},
-         current_value,
-         expected_value
+  defp apply_origin_checked_expected(
+         state,
+         key,
+         inner_cmd,
+         before_value,
+         expected_value,
+         expire_at_ms
        ) do
-    with {:ok, current} <- coerce_integer(current_value),
-         {:ok, expected} <- coerce_integer(expected_value) do
-      if delta >= 0, do: current >= expected, else: current <= expected
-    else
-      _ -> false
+    case expected_value do
+      nil ->
+        apply_single(state, inner_cmd)
+
+      value ->
+        do_put(state, key, value, expire_at_ms)
+        origin_checked_expected_result(inner_cmd, before_value, value)
     end
   end
 
-  defp pending_newer_value_includes_origin_command?(
-         {:incr_float, _key, delta},
-         current_value,
-         expected_value
-       ) do
-    with {:ok, current} <- coerce_float(current_value),
-         {:ok, expected} <- coerce_float(expected_value) do
-      if delta >= 0.0, do: current >= expected, else: current <= expected
-    else
-      _ -> false
+  defp origin_checked_expected_result({:incr, _key, _delta}, _before_value, expected_value) do
+    case coerce_integer(expected_value) do
+      {:ok, value} -> {:ok, value}
+      :error -> :ok
     end
   end
 
-  defp pending_newer_value_includes_origin_command?(
-         {:append, _key, _suffix},
-         current_value,
+  defp origin_checked_expected_result(
+         {:incr_float, _key, _delta},
+         _before_value,
          expected_value
-       )
-       when is_binary(current_value) and is_binary(expected_value) do
-    String.starts_with?(current_value, expected_value)
+       ) do
+    case coerce_float(expected_value) do
+      {:ok, value} -> {:ok, value}
+      :error -> :ok
+    end
   end
 
-  defp pending_newer_value_includes_origin_command?(
-         {:setrange, _key, offset, value},
-         current_value,
-         expected_value
-       )
-       when is_integer(offset) and offset >= 0 and is_binary(value) and is_binary(current_value) and
-              is_binary(expected_value) do
-    range_size = byte_size(value)
-    range_end = offset + range_size
-
-    range_size == 0 or
-      (byte_size(current_value) >= range_end and byte_size(expected_value) >= range_end and
-         binary_part(current_value, offset, range_size) ==
-           binary_part(expected_value, offset, range_size))
+  defp origin_checked_expected_result({:append, _key, _suffix}, _before_value, expected_value)
+       when is_binary(expected_value) do
+    {:ok, byte_size(expected_value)}
   end
 
-  defp pending_newer_value_includes_origin_command?(_inner_cmd, _current_value, _expected_value) do
-    false
+  defp origin_checked_expected_result({:getset, _key, _new_value}, before_value, _expected_value) do
+    before_value
+  end
+
+  defp origin_checked_expected_result(
+         {:getex, _key, _expire_at_ms},
+         _before_value,
+         expected_value
+       ) do
+    expected_value
+  end
+
+  defp origin_checked_expected_result(
+         {:setrange, _key, _offset, _value},
+         _before_value,
+         expected_value
+       )
+       when is_binary(expected_value) do
+    {:ok, byte_size(expected_value)}
+  end
+
+  defp origin_checked_expected_result(_inner_cmd, _before_value, _expected_value) do
+    :ok
   end
 
   defp origin_command_already_in_current_value?(
