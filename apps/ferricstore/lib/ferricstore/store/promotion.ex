@@ -51,6 +51,7 @@ defmodule Ferricstore.Store.Promotion do
   @promotion_marker_prefix "PM:"
   @cold_read_timeout_ms 10_000
   @compaction_latch_sleep_ms 1
+  @default_compaction_latch_timeout_ms 30_000
 
   @spec threshold() :: non_neg_integer()
   def threshold do
@@ -92,8 +93,8 @@ defmodule Ferricstore.Store.Promotion do
       nil ->
         fun.()
 
-      {tab, latch_key} ->
-        acquire_compaction_latch(tab, latch_key)
+      {tab, latch_key, shard_index} ->
+        acquire_compaction_latch(tab, latch_key, shard_index)
 
         try do
           fun.()
@@ -112,7 +113,7 @@ defmodule Ferricstore.Store.Promotion do
   def await_compaction_latch(owner, redis_key) do
     case compaction_latch(owner, redis_key) do
       nil -> :ok
-      {tab, latch_key} -> wait_compaction_latch_clear(tab, latch_key)
+      {tab, latch_key, shard_index} -> wait_compaction_latch_clear!(tab, latch_key, shard_index)
     end
   end
 
@@ -656,7 +657,7 @@ defmodule Ferricstore.Store.Promotion do
     with %FerricStore.Instance{} = ctx <- latch_context(owner),
          idx when is_integer(idx) and idx >= 0 <- latch_index(owner),
          true <- idx < tuple_size(ctx.latch_refs) do
-      {elem(ctx.latch_refs, idx), {:promoted_compaction, redis_key}}
+      {elem(ctx.latch_refs, idx), {:promoted_compaction, redis_key}, idx}
     else
       _ -> nil
     end
@@ -679,38 +680,93 @@ defmodule Ferricstore.Store.Promotion do
   defp latch_index(%{shard_index: index}), do: index
   defp latch_index(_owner), do: nil
 
-  defp acquire_compaction_latch(tab, latch_key) do
+  defp acquire_compaction_latch(tab, latch_key, shard_index) do
     case :ets.insert_new(tab, {latch_key, self()}) do
       true ->
         :ok
 
       false ->
-        wait_compaction_latch_clear(tab, latch_key)
-        acquire_compaction_latch(tab, latch_key)
+        wait_compaction_latch_clear!(tab, latch_key, shard_index)
+        acquire_compaction_latch(tab, latch_key, shard_index)
     end
   end
 
-  defp wait_compaction_latch_clear(tab, latch_key) do
+  defp wait_compaction_latch_clear!(tab, latch_key, shard_index) do
+    emit_compaction_latch_event(:blocked, shard_index, latch_key, 0)
+
+    started_ms = System.monotonic_time(:millisecond)
+    timeout_ms = compaction_latch_timeout_ms()
+
+    case wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms) do
+      :ok ->
+        :ok
+
+      {:error, {:timeout, wait_ms}} ->
+        raise "compaction latch timeout after #{wait_ms}ms for #{inspect(latch_key)}"
+    end
+  end
+
+  defp wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms) do
+    wait_ms = max(System.monotonic_time(:millisecond) - started_ms, 0)
+
+    if wait_ms >= timeout_ms do
+      emit_compaction_latch_event(:timeout, shard_index, latch_key, wait_ms)
+      {:error, {:timeout, wait_ms}}
+    else
+      do_wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms)
+    end
+  end
+
+  defp do_wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms) do
     case :ets.lookup(tab, latch_key) do
-      [] -> :ok
-      [{^latch_key, owner}] -> wait_for_latch_owner(tab, latch_key, owner)
+      [] ->
+        :ok
+
+      [{^latch_key, owner}] ->
+        wait_for_latch_owner(tab, latch_key, owner, shard_index, started_ms, timeout_ms)
     end
   end
 
-  defp wait_for_latch_owner(tab, latch_key, owner) when is_pid(owner) do
+  defp wait_for_latch_owner(tab, latch_key, owner, shard_index, started_ms, timeout_ms)
+       when is_pid(owner) do
     if Process.alive?(owner) do
       Process.sleep(@compaction_latch_sleep_ms)
     else
       :ets.take(tab, latch_key)
     end
 
-    wait_compaction_latch_clear(tab, latch_key)
+    wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms)
   end
 
-  defp wait_for_latch_owner(tab, latch_key, _owner) do
+  defp wait_for_latch_owner(tab, latch_key, _owner, shard_index, started_ms, timeout_ms) do
     Process.sleep(@compaction_latch_sleep_ms)
-    wait_compaction_latch_clear(tab, latch_key)
+    wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms)
   end
+
+  defp compaction_latch_timeout_ms do
+    Application.get_env(
+      :ferricstore,
+      :promotion_compaction_latch_timeout_ms,
+      @default_compaction_latch_timeout_ms
+    )
+  end
+
+  defp emit_compaction_latch_event(status, shard_index, latch_key, wait_ms) do
+    :telemetry.execute(
+      [:ferricstore, :promotion, :compaction_latch],
+      %{count: 1, wait_ms: wait_ms},
+      %{
+        status: status,
+        shard_index: shard_index,
+        redis_key_hash: compaction_latch_key_hash(latch_key)
+      }
+    )
+  end
+
+  defp compaction_latch_key_hash({:promoted_compaction, redis_key}) when is_binary(redis_key),
+    do: :erlang.phash2(redis_key)
+
+  defp compaction_latch_key_hash(_latch_key), do: :unknown
 
   defp file_id_from_path(path) do
     path
