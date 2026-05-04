@@ -41,6 +41,7 @@ defmodule Ferricstore.Merge.Scheduler do
         min_files_for_merge: 2,
         max_files_per_merge: 10,
         merge_window: {2, 4},
+        min_file_age_ms: 3_600_000,
         min_free_space_ratio: 0.1
   """
 
@@ -63,6 +64,7 @@ defmodule Ferricstore.Merge.Scheduler do
   @default_fragmentation_threshold 0.5
   @default_dead_bytes_threshold 134_217_728
   @default_merge_cooldown_ms 60_000
+  @default_min_file_age_ms 3_600_000
   @default_small_file_threshold 10_485_760
   @default_merge_retry_interval_ms 5_000
   @default_compaction_call_timeout_ms :infinity
@@ -79,6 +81,7 @@ defmodule Ferricstore.Merge.Scheduler do
           fragmentation_threshold: float(),
           dead_bytes_threshold: non_neg_integer(),
           merge_cooldown_ms: non_neg_integer(),
+          min_file_age_ms: non_neg_integer(),
           small_file_threshold: non_neg_integer(),
           merge_retry_interval_ms: non_neg_integer(),
           compaction_call_timeout_ms: pos_integer() | :infinity
@@ -317,8 +320,22 @@ defmodule Ferricstore.Merge.Scheduler do
       state.file_count >= state.config.min_files_for_merge or
         state.fragmentation_candidates != []
 
-    cooldown_ok and has_trigger and mode_allows_merge?(state.config)
+    cooldown_ok and has_trigger and mode_allows_merge?(state.config) and
+      age_mode_has_mergeable_files?(state)
   end
+
+  defp age_mode_has_mergeable_files?(%{config: %{mode: :age}} = state) do
+    with {:ok, file_sizes} <- log_file_sizes(state.data_dir),
+         file_sizes <- filter_age_mode_files(file_sizes, state.data_dir, state.config),
+         {:ok, _mergeable} <-
+           pick_mergeable_files(file_sizes, state.config, state.fragmentation_candidates) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp age_mode_has_mergeable_files?(_state), do: true
 
   defp mode_allows_merge?(%{mode: :hot}), do: true
 
@@ -437,6 +454,7 @@ defmodule Ferricstore.Merge.Scheduler do
 
   defp select_files_for_merge(state, _shard_name) do
     with {:ok, file_sizes} <- log_file_sizes(state.data_dir),
+         file_sizes <- filter_age_mode_files(file_sizes, state.data_dir, state.config),
          {:ok, mergeable} <-
            pick_mergeable_files(file_sizes, state.config, state.fragmentation_candidates) do
       {:ok, mergeable}
@@ -588,6 +606,12 @@ defmodule Ferricstore.Merge.Scheduler do
           :merge_cooldown_ms,
           app_config(:merge_cooldown_ms, @default_merge_cooldown_ms)
         ),
+      min_file_age_ms:
+        Map.get(
+          overrides,
+          :min_file_age_ms,
+          app_config(:min_file_age_ms, @default_min_file_age_ms)
+        ),
       small_file_threshold:
         Map.get(
           overrides,
@@ -609,6 +633,57 @@ defmodule Ferricstore.Merge.Scheduler do
           )
         )
     }
+  end
+
+  defp filter_age_mode_files(file_sizes, _data_dir, %{mode: mode}) when mode != :age,
+    do: file_sizes
+
+  defp filter_age_mode_files([], _data_dir, %{mode: :age}), do: []
+
+  defp filter_age_mode_files(file_sizes, data_dir, %{mode: :age, min_file_age_ms: min_age_ms}) do
+    {active_fid, _} = Enum.max_by(file_sizes, fn {fid, _size} -> fid end)
+    eligible = age_eligible_file_ids(data_dir, min_age_ms)
+
+    Enum.filter(file_sizes, fn {fid, _size} ->
+      fid == active_fid or MapSet.member?(eligible, fid)
+    end)
+  end
+
+  defp age_eligible_file_ids(shard_data_dir, min_age_ms) when min_age_ms <= 0 do
+    shard_data_dir
+    |> log_file_ids_with_mtime_ms()
+    |> Enum.map(fn {fid, _mtime_ms} -> fid end)
+    |> MapSet.new()
+  end
+
+  defp age_eligible_file_ids(shard_data_dir, min_age_ms) do
+    cutoff_ms = System.system_time(:millisecond) - min_age_ms
+
+    shard_data_dir
+    |> log_file_ids_with_mtime_ms()
+    |> Enum.filter(fn {_fid, mtime_ms} -> mtime_ms <= cutoff_ms end)
+    |> Enum.map(fn {fid, _mtime_ms} -> fid end)
+    |> MapSet.new()
+  end
+
+  defp log_file_ids_with_mtime_ms(shard_data_dir) do
+    case Ferricstore.FS.ls(shard_data_dir) do
+      {:ok, entries} ->
+        Enum.flat_map(entries, fn name ->
+          path = Path.join(shard_data_dir, name)
+
+          with true <- bitcask_log_file?(name),
+               {file_id, ""} <- name |> Path.rootname() |> Integer.parse(),
+               {:ok, %{mtime: mtime_s}} <- File.stat(path, time: :posix) do
+            [{file_id, mtime_s * 1_000}]
+          else
+            _ -> []
+          end
+        end)
+
+      {:error, _reason} ->
+        []
+    end
   end
 
   # A timed-out GenServer.call does not cancel work already running inside the

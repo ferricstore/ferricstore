@@ -397,6 +397,107 @@ defmodule Ferricstore.Merge.SchedulerTest do
       end
     end
 
+    test "age mode does not compact fresh inactive files before min file age" do
+      ctx = FerricStore.Instance.get(:default)
+      shard_name = Router.shard_name(ctx, 0)
+      real_shard = Process.whereis(shard_name)
+
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "scheduler_age_fresh_files_#{System.unique_integer([:positive])}"
+        )
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+      File.mkdir_p!(shard_dir)
+      File.write!(Path.join(shard_dir, "00000.log"), "fresh")
+      File.write!(Path.join(shard_dir, "00001.log"), "active")
+
+      Process.unregister(shard_name)
+      {:ok, fake_shard} = TrackingShard.start(name: shard_name, parent: self())
+
+      {:ok, pid} =
+        Scheduler.start_link(
+          shard_index: 0,
+          data_dir: data_dir,
+          merge_config: %{
+            mode: :age,
+            merge_window: {0, 24},
+            min_file_age_ms: 60_000,
+            min_files_for_merge: 2,
+            merge_cooldown_ms: 0
+          },
+          name: :test_scheduler_age_fresh_files
+        )
+
+      try do
+        assert :ok = Scheduler.trigger_check(pid)
+        refute_received :compaction_called
+      after
+        if Process.alive?(pid), do: GenServer.stop(pid)
+        ref = Process.monitor(fake_shard)
+        Process.exit(fake_shard, :kill)
+        assert_receive {:DOWN, ^ref, :process, ^fake_shard, :killed}, 1_000
+
+        if is_pid(real_shard) and Process.alive?(real_shard),
+          do: Process.register(real_shard, shard_name)
+
+        File.rm_rf!(data_dir)
+      end
+    end
+
+    test "age mode compacts inactive files after min file age" do
+      ctx = FerricStore.Instance.get(:default)
+      shard_name = Router.shard_name(ctx, 0)
+      real_shard = Process.whereis(shard_name)
+
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "scheduler_age_old_files_#{System.unique_integer([:positive])}"
+        )
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+      inactive_path = Path.join(shard_dir, "00000.log")
+
+      File.mkdir_p!(shard_dir)
+      File.write!(inactive_path, "old")
+      File.write!(Path.join(shard_dir, "00001.log"), "active")
+      File.touch!(inactive_path, {{2000, 1, 1}, {0, 0, 0}})
+
+      Process.unregister(shard_name)
+      {:ok, fake_shard} = TrackingShard.start(name: shard_name, parent: self())
+
+      {:ok, pid} =
+        Scheduler.start_link(
+          shard_index: 0,
+          data_dir: data_dir,
+          merge_config: %{
+            mode: :age,
+            merge_window: {0, 24},
+            min_file_age_ms: 60_000,
+            min_files_for_merge: 2,
+            merge_cooldown_ms: 0
+          },
+          name: :test_scheduler_age_old_files
+        )
+
+      try do
+        assert :ok = Scheduler.trigger_check(pid)
+        assert_receive :compaction_called, 1_000
+      after
+        if Process.alive?(pid), do: GenServer.stop(pid)
+        ref = Process.monitor(fake_shard)
+        Process.exit(fake_shard, :kill)
+        assert_receive {:DOWN, ^ref, :process, ^fake_shard, :killed}, 1_000
+
+        if is_pid(real_shard) and Process.alive?(real_shard),
+          do: Process.register(real_shard, shard_name)
+
+        File.rm_rf!(data_dir)
+      end
+    end
+
     test "fragmentation compaction retries after transient failure" do
       ctx = FerricStore.Instance.get(:default)
       shard_name = Router.shard_name(ctx, 0)
