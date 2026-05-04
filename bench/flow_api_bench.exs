@@ -14,6 +14,7 @@
 #   FLOW_API_CLAIM=10
 #   FLOW_API_CLAIM_SEED=5000
 #   FLOW_API_SHARDS=1
+#   FLOW_API_PARTITIONS=1
 #   FLOW_API_CASES=create,claim,lifecycle,retry,history
 #   BENCH_WARMUP=1
 #   BENCH_TIME=3
@@ -25,6 +26,7 @@ bench_parallel = System.get_env("BENCH_PARALLEL", "1") |> String.to_integer()
 claim_count = System.get_env("FLOW_API_CLAIM", "10") |> String.to_integer()
 claim_seed = System.get_env("FLOW_API_CLAIM_SEED", "5000") |> String.to_integer()
 shard_count = System.get_env("FLOW_API_SHARDS", "1") |> String.to_integer()
+partition_count = System.get_env("FLOW_API_PARTITIONS", "1") |> String.to_integer()
 
 cases =
   System.get_env("FLOW_API_CASES", "create,claim,lifecycle,retry,history")
@@ -53,106 +55,168 @@ IO.puts("=== FerricStore Native Flow API Bench ===")
 IO.puts("Data dir: #{bench_data_dir}")
 
 IO.puts(
-  "backlogs=#{Enum.join(backlogs, ",")} claim=#{claim_count} claim_seed=#{claim_seed} shards=#{shard_count} cases=#{Enum.join(cases, ",")} warmup=#{bench_warmup}s time=#{bench_time}s parallel=#{bench_parallel}\n"
+  "backlogs=#{Enum.join(backlogs, ",")} claim=#{claim_count} claim_seed=#{claim_seed} shards=#{shard_count} partitions=#{partition_count} cases=#{Enum.join(cases, ",")} warmup=#{bench_warmup}s time=#{bench_time}s parallel=#{bench_parallel}\n"
 )
 
 defmodule FlowApiBench do
   def flow_id(prefix, i), do: prefix <> ":" <> Integer.to_string(i)
 
-  def seed_due(prefix, type, count) do
+  def seed_due(prefix, type, count, partition_count) do
     Enum.each(1..count, fn i ->
+      id = flow_id(prefix, i)
+
       {:ok, _} =
-        FerricStore.flow_create(flow_id(prefix, i),
-          type: type,
-          state: "queued",
-          payload_ref: "payload:" <> flow_id(prefix, i),
-          run_at_ms: 1_000,
-          now_ms: 1_000
+        FerricStore.flow_create(
+          id,
+          maybe_partition(
+            [
+              type: type,
+              state: "queued",
+              payload_ref: "payload:" <> id,
+              run_at_ms: 1_000,
+              now_ms: 1_000
+            ],
+            partition_key(prefix, i, partition_count)
+          )
         )
     end)
   end
 
-  def create(prefix, type, counter) do
+  def create(prefix, type, counter, partition_count) do
     i = next_i(counter)
     id = flow_id(prefix, i)
 
     {:ok, flow} =
-      FerricStore.flow_create(id,
-        type: type,
-        state: "queued",
-        payload_ref: "payload:" <> id,
-        run_at_ms: 1_000,
-        now_ms: 1_000
+      FerricStore.flow_create(
+        id,
+        maybe_partition(
+          [
+            type: type,
+            state: "queued",
+            payload_ref: "payload:" <> id,
+            run_at_ms: 1_000,
+            now_ms: 1_000
+          ],
+          partition_key(prefix, i, partition_count)
+        )
       )
 
     flow
   end
 
-  def claim_due(type, count, counter) do
+  def claim_due(prefix, type, count, counter, partition_count) do
     i = next_i(counter)
 
     {:ok, claimed} =
-      FerricStore.flow_claim_due(type,
-        state: "queued",
-        worker: "worker-a",
-        lease_ms: 30_000,
-        limit: count,
-        now_ms: 1_000 + i
+      FerricStore.flow_claim_due(
+        type,
+        maybe_partition(
+          [
+            state: "queued",
+            worker: "worker-a",
+            lease_ms: 30_000,
+            limit: count,
+            now_ms: 1_000 + i
+          ],
+          partition_key(prefix, i, partition_count)
+        )
       )
 
     claimed
   end
 
-  def lifecycle(prefix, type, counter) do
-    flow = create(prefix, type, counter)
+  def lifecycle(prefix, type, counter, partition_count) do
+    flow = create(prefix, type, counter, partition_count)
+    partition_key = Map.get(flow, :partition_key)
 
     {:ok, [claimed]} =
-      FerricStore.flow_claim_due(type,
-        state: "queued",
-        worker: "worker-a",
-        lease_ms: 30_000,
-        limit: 1,
-        now_ms: 1_000
+      FerricStore.flow_claim_due(
+        type,
+        maybe_partition(
+          [
+            state: "queued",
+            worker: "worker-a",
+            lease_ms: 30_000,
+            limit: 1,
+            now_ms: 1_000
+          ],
+          partition_key
+        )
       )
 
     true = claimed.id == flow.id
-    {:ok, completed} = FerricStore.flow_complete(claimed.id, claimed.lease_token)
+
+    {:ok, completed} =
+      FerricStore.flow_complete(
+        claimed.id,
+        claimed.lease_token,
+        maybe_partition([], partition_key)
+      )
+
     completed
   end
 
-  def retry_cycle(prefix, type, counter) do
-    flow = create(prefix, type, counter)
+  def retry_cycle(prefix, type, counter, partition_count) do
+    flow = create(prefix, type, counter, partition_count)
+    partition_key = Map.get(flow, :partition_key)
 
     {:ok, [claimed]} =
-      FerricStore.flow_claim_due(type,
-        state: "queued",
-        worker: "worker-a",
-        lease_ms: 30_000,
-        limit: 1,
-        now_ms: 1_000
+      FerricStore.flow_claim_due(
+        type,
+        maybe_partition(
+          [
+            state: "queued",
+            worker: "worker-a",
+            lease_ms: 30_000,
+            limit: 1,
+            now_ms: 1_000
+          ],
+          partition_key
+        )
       )
 
     true = claimed.id == flow.id
 
     {:ok, retried} =
-      FerricStore.flow_retry(claimed.id, claimed.lease_token,
-        error_ref: "error:" <> claimed.id,
-        run_at_ms: 2_000,
-        now_ms: 1_500
+      FerricStore.flow_retry(
+        claimed.id,
+        claimed.lease_token,
+        maybe_partition(
+          [
+            error_ref: "error:" <> claimed.id,
+            run_at_ms: 2_000,
+            now_ms: 1_500
+          ],
+          partition_key
+        )
       )
 
     retried
   end
 
-  def history_read(prefix, type, counter) do
-    flow = lifecycle(prefix, type, counter)
-    {:ok, events} = FerricStore.flow_history(flow.id, count: 10)
+  def history_read(prefix, type, counter, partition_count) do
+    flow = lifecycle(prefix, type, counter, partition_count)
+
+    {:ok, events} =
+      FerricStore.flow_history(
+        flow.id,
+        maybe_partition([count: 10], Map.get(flow, :partition_key))
+      )
+
     events
   end
 
+  def partition_key(_prefix, _i, partition_count) when partition_count <= 1, do: nil
+
+  def partition_key(prefix, i, partition_count) do
+    prefix <> ":partition:" <> Integer.to_string(rem(i - 1, partition_count))
+  end
+
+  def maybe_partition(opts, nil), do: opts
+  def maybe_partition(opts, partition_key), do: Keyword.put(opts, :partition_key, partition_key)
+
   def next_i(counter) do
-    :counters.add(counter, 1, 1)
-    :counters.get(counter, 1)
+    :atomics.add_get(counter, 1, 1)
   end
 
   def timed(label, fun) do
@@ -180,26 +244,28 @@ try do
     retry_type = prefix <> ":retry"
     history_type = prefix <> ":history"
 
-    create_counter = :counters.new(1, [:atomics])
-    claim_counter = :counters.new(1, [:atomics])
-    lifecycle_counter = :counters.new(1, [:atomics])
-    retry_counter = :counters.new(1, [:atomics])
-    history_counter = :counters.new(1, [:atomics])
+    create_counter = :atomics.new(1, signed: false)
+    claim_counter = :atomics.new(1, signed: false)
+    lifecycle_counter = :atomics.new(1, signed: false)
+    retry_counter = :atomics.new(1, signed: false)
+    history_counter = :atomics.new(1, signed: false)
 
     IO.puts("\n--- backlog=#{backlog} ---")
 
     FlowApiBench.timed("seed due backlog #{backlog}", fn ->
-      FlowApiBench.seed_due(prefix <> ":due", due_type, backlog)
+      FlowApiBench.seed_due(prefix <> ":due", due_type, backlog, partition_count)
     end)
 
     FlowApiBench.timed("seed claim backlog #{claim_seed}", fn ->
-      FlowApiBench.seed_due(prefix <> ":claim", claim_type, claim_seed)
+      FlowApiBench.seed_due(prefix <> ":claim", claim_type, claim_seed, partition_count)
     end)
 
     benches =
       %{}
       |> FlowApiBench.maybe_put_bench(cases, "create", "flow_api create backlog=#{backlog}", fn ->
-        flow = FlowApiBench.create(prefix <> ":create", create_type, create_counter)
+        flow =
+          FlowApiBench.create(prefix <> ":create", create_type, create_counter, partition_count)
+
         true = flow.state == "queued"
       end)
       |> FlowApiBench.maybe_put_bench(
@@ -207,7 +273,15 @@ try do
         "claim",
         "flow_api claim_due#{claim_count} backlog=#{backlog}",
         fn ->
-          claimed = FlowApiBench.claim_due(claim_type, claim_count, claim_counter)
+          claimed =
+            FlowApiBench.claim_due(
+              prefix <> ":claim",
+              claim_type,
+              claim_count,
+              claim_counter,
+              partition_count
+            )
+
           true = length(claimed) == claim_count
         end
       )
@@ -216,7 +290,14 @@ try do
         "lifecycle",
         "flow_api lifecycle create-claim-complete backlog=#{backlog}",
         fn ->
-          flow = FlowApiBench.lifecycle(prefix <> ":life", lifecycle_type, lifecycle_counter)
+          flow =
+            FlowApiBench.lifecycle(
+              prefix <> ":life",
+              lifecycle_type,
+              lifecycle_counter,
+              partition_count
+            )
+
           true = flow.state == "completed"
         end
       )
@@ -225,7 +306,14 @@ try do
         "retry",
         "flow_api retry cycle backlog=#{backlog}",
         fn ->
-          flow = FlowApiBench.retry_cycle(prefix <> ":retry", retry_type, retry_counter)
+          flow =
+            FlowApiBench.retry_cycle(
+              prefix <> ":retry",
+              retry_type,
+              retry_counter,
+              partition_count
+            )
+
           true = flow.state == "queued"
         end
       )
@@ -234,7 +322,14 @@ try do
         "history",
         "flow_api lifecycle+history backlog=#{backlog}",
         fn ->
-          events = FlowApiBench.history_read(prefix <> ":history", history_type, history_counter)
+          events =
+            FlowApiBench.history_read(
+              prefix <> ":history",
+              history_type,
+              history_counter,
+              partition_count
+            )
+
           true = length(events) == 3
         end
       )
