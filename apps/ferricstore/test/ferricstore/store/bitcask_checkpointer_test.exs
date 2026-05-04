@@ -261,7 +261,8 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
 
     :ok = GenServer.stop(pid, :normal, 5_000)
 
-    assert_receive {:shutdown_sync, %{shard_index: 0}, %{dirty?: true, result: :ok}},
+    assert_receive {:shutdown_sync, %{shard_index: 0},
+                    %{dirty?: true, dirty_flag?: true, in_flight?: false, result: :ok}},
                    2_000,
                    "terminate/2 must fsync the active file on graceful shutdown"
 
@@ -295,7 +296,8 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
 
     :ok = GenServer.stop(pid, :normal, 5_000)
 
-    assert_receive {:shutdown_sync, %{shard_index: 0}, %{dirty?: false, result: :clean}},
+    assert_receive {:shutdown_sync, %{shard_index: 0},
+                    %{dirty?: false, dirty_flag?: false, in_flight?: false, result: :clean}},
                    2_000,
                    "terminate/2 must observe the clean flag and skip fsync"
   end
@@ -305,6 +307,16 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     active_path: active_path
   } do
     parent = self()
+    handler_id = "ck-shutdown-in-flight-#{:erlang.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :bitcask, :checkpoint_shutdown],
+      fn _e, meas, meta, _ -> send(parent, {:shutdown_sync, meas, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     ctx =
       Map.put(ctx, :fsync_async, fn caller, corr_id, path ->
@@ -328,6 +340,15 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     assert :atomics.get(ctx.checkpoint_in_flight, 1) == 1
 
     :ok = GenServer.stop(pid, :normal, 5_000)
+
+    assert_receive {:shutdown_sync, %{shard_index: 0},
+                    %{
+                      dirty?: true,
+                      dirty_flag?: false,
+                      in_flight?: true,
+                      result: :in_flight_retry
+                    }},
+                   2_000
 
     assert :atomics.get(ctx.checkpoint_flags, 1) == 1,
            "shutdown cannot prove the in-flight async fsync completed, so the next checkpointer must retry"

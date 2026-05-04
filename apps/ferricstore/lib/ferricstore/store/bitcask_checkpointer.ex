@@ -142,7 +142,12 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
     :telemetry.execute(
       [:ferricstore, :bitcask, :checkpoint_shutdown],
       %{shard_index: state.index},
-      %{dirty?: checkpoint_needed?, result: result}
+      %{
+        dirty?: checkpoint_needed?,
+        dirty_flag?: dirty?,
+        in_flight?: in_flight?,
+        result: result
+      }
     )
 
     :ok
