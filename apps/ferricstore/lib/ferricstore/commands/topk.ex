@@ -334,19 +334,12 @@ defmodule Ferricstore.Commands.TopK do
   defp apply_prob_locally(store, {:topk_create, key, k, width, depth, decay}) do
     path = prob_path(store, key, "topk")
     dir = Path.dirname(path)
-    created_dir? = not Ferricstore.FS.dir?(dir)
-    Ferricstore.FS.mkdir_p!(dir)
 
-    if created_dir? do
-      _ = NIF.v2_fsync_dir(Path.dirname(dir))
+    with :ok <- ensure_prob_dir(dir),
+         {:ok, _resource} = result <- NIF.topk_file_create_v2(path, k, width, depth, decay),
+         :ok <- prob_fsync_dir(dir, :prob_file_dir) do
+      result
     end
-
-    result = NIF.topk_file_create_v2(path, k, width, depth, decay)
-    # Fsync the prob dir so the new filename entry is durable. Matches
-    # the Raft state-machine path's `prob_fsync_dir` after every
-    # *_file_create.
-    _ = NIF.v2_fsync_dir(dir)
-    result
   end
 
   defp apply_prob_locally(store, {:topk_add, key, elements}) do
@@ -364,6 +357,28 @@ defmodule Ferricstore.Commands.TopK do
   defp normalize_result({:error, :enoent}), do: {:error, "ERR TOPK: key does not exist"}
   defp normalize_result({:error, _} = err), do: err
   defp normalize_result(other), do: other
+
+  defp ensure_prob_dir(dir) do
+    if Ferricstore.FS.dir?(dir) do
+      :ok
+    else
+      Ferricstore.FS.mkdir_p!(dir)
+      prob_fsync_dir(Path.dirname(dir), :create_prob_dir)
+    end
+  end
+
+  defp prob_fsync_dir(path, phase) do
+    result =
+      case Process.get(:ferricstore_prob_command_fsync_dir_hook) do
+        fun when is_function(fun, 1) -> fun.(path)
+        _ -> NIF.v2_fsync_dir(path)
+      end
+
+    case result do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:fsync_dir_failed, phase, reason}}
+    end
+  end
 
   defp parse_pos_integer(str, label) do
     case Integer.parse(str) do

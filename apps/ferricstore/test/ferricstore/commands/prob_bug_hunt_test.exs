@@ -46,6 +46,38 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
   alias Ferricstore.Commands.TopK
   alias Ferricstore.Test.MockStore
 
+  describe "probabilistic direct writes surface directory fsync failures" do
+    setup do
+      Process.put(:ferricstore_prob_command_fsync_dir_hook, fn _path -> {:error, :eio} end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_prob_command_fsync_dir_hook)
+      end)
+
+      :ok
+    end
+
+    test "BF.RESERVE returns an error when the prob file directory fsync fails" do
+      assert {:error, {:fsync_dir_failed, :prob_file_dir, :eio}} =
+               Bloom.handle("BF.RESERVE", ["bf_fsync", "0.01", "100"], MockStore.make())
+    end
+
+    test "CF.RESERVE returns an error when the prob file directory fsync fails" do
+      assert {:error, {:fsync_dir_failed, :prob_file_dir, :eio}} =
+               Cuckoo.handle("CF.RESERVE", ["cf_fsync", "100"], MockStore.make())
+    end
+
+    test "CMS.INITBYDIM returns an error when the prob file directory fsync fails" do
+      assert {:error, {:fsync_dir_failed, :prob_file_dir, :eio}} =
+               CMS.handle("CMS.INITBYDIM", ["cms_fsync", "100", "5"], MockStore.make())
+    end
+
+    test "TOPK.RESERVE returns an error when the prob file directory fsync fails" do
+      assert {:error, {:fsync_dir_failed, :prob_file_dir, :eio}} =
+               TopK.handle("TOPK.RESERVE", ["topk_fsync", "5"], MockStore.make())
+    end
+  end
+
   # ===========================================================================
   # Bloom filter (BF.*)
   # ===========================================================================

@@ -50,6 +50,7 @@ defmodule Ferricstore.Commands.Cuckoo do
         {:ok, 1} -> 1
         {:ok, _} -> 1
         :ok -> 1
+        {:error, {:fsync_dir_failed, _phase, _reason} = reason} -> {:error, reason}
         {:error, _} -> {:error, "ERR filter is full"}
         other -> other
       end
@@ -70,6 +71,7 @@ defmodule Ferricstore.Commands.Cuckoo do
 
       case result do
         {:ok, n} when n in [0, 1] -> n
+        {:error, {:fsync_dir_failed, _phase, _reason} = reason} -> {:error, reason}
         {:error, _} -> {:error, "ERR filter is full"}
         other -> other
       end
@@ -296,45 +298,33 @@ defmodule Ferricstore.Commands.Cuckoo do
   defp apply_prob_locally(store, {:cuckoo_create, key, capacity, bucket_size}) do
     path = prob_path(store, key, "cuckoo")
     dir = Path.dirname(path)
-    ensure_prob_dir(dir)
-    result = NIF.cuckoo_file_create(path, capacity, bucket_size)
-    _ = NIF.v2_fsync_dir(dir)
-    register_cuckoo_meta(result, store, key, capacity)
-    result
+
+    with :ok <- ensure_prob_dir(dir),
+         {:ok, _resource} = result <- NIF.cuckoo_file_create(path, capacity, bucket_size),
+         :ok <- prob_fsync_dir(dir, :prob_file_dir) do
+      register_cuckoo_meta(result, store, key, capacity)
+      result
+    end
   end
 
   defp apply_prob_locally(store, {:cuckoo_add, key, element, auto_params}) do
     path = prob_path(store, key, "cuckoo")
     dir = Path.dirname(path)
-    ensure_prob_dir(dir)
 
-    unless Ferricstore.FS.exists?(path) do
-      if auto_params do
-        %{capacity: cap, bucket_size: bs} = auto_params
-        result = NIF.cuckoo_file_create(path, cap, bs)
-        _ = NIF.v2_fsync_dir(dir)
-        register_cuckoo_meta(result, store, key, cap)
-      end
+    with :ok <- ensure_prob_dir(dir),
+         :ok <- maybe_auto_create_cuckoo(store, key, path, dir, auto_params) do
+      NIF.cuckoo_file_add(path, element)
     end
-
-    NIF.cuckoo_file_add(path, element)
   end
 
   defp apply_prob_locally(store, {:cuckoo_addnx, key, element, auto_params}) do
     path = prob_path(store, key, "cuckoo")
     dir = Path.dirname(path)
-    ensure_prob_dir(dir)
 
-    unless Ferricstore.FS.exists?(path) do
-      if auto_params do
-        %{capacity: cap, bucket_size: bs} = auto_params
-        result = NIF.cuckoo_file_create(path, cap, bs)
-        _ = NIF.v2_fsync_dir(dir)
-        register_cuckoo_meta(result, store, key, cap)
-      end
+    with :ok <- ensure_prob_dir(dir),
+         :ok <- maybe_auto_create_cuckoo(store, key, path, dir, auto_params) do
+      NIF.cuckoo_file_addnx(path, element)
     end
-
-    NIF.cuckoo_file_addnx(path, element)
   end
 
   defp apply_prob_locally(store, {:cuckoo_del, key, element}) do
@@ -342,15 +332,47 @@ defmodule Ferricstore.Commands.Cuckoo do
     NIF.cuckoo_file_del(path, element)
   end
 
+  defp maybe_auto_create_cuckoo(store, key, path, dir, auto_params) do
+    cond do
+      Ferricstore.FS.exists?(path) ->
+        :ok
+
+      is_map(auto_params) ->
+        %{capacity: cap, bucket_size: bs} = auto_params
+
+        with {:ok, _resource} = result <- NIF.cuckoo_file_create(path, cap, bs),
+             :ok <- prob_fsync_dir(dir, :prob_file_dir) do
+          register_cuckoo_meta(result, store, key, cap)
+          :ok
+        end
+
+      true ->
+        :ok
+    end
+  end
+
   # Creates the prob dir if missing and fsyncs its parent so the new
   # directory entry is durable.
   defp ensure_prob_dir(dir) do
-    unless Ferricstore.FS.dir?(dir) do
+    if Ferricstore.FS.dir?(dir) do
+      :ok
+    else
       Ferricstore.FS.mkdir_p!(dir)
-      _ = NIF.v2_fsync_dir(Path.dirname(dir))
+      prob_fsync_dir(Path.dirname(dir), :create_prob_dir)
     end
+  end
 
-    :ok
+  defp prob_fsync_dir(path, phase) do
+    result =
+      case Process.get(:ferricstore_prob_command_fsync_dir_hook) do
+        fun when is_function(fun, 1) -> fun.(path)
+        _ -> NIF.v2_fsync_dir(path)
+      end
+
+    case result do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:fsync_dir_failed, phase, reason}}
+    end
   end
 
   # Checks if a cuckoo filter key already exists. Uses store.exists? when
@@ -373,8 +395,6 @@ defmodule Ferricstore.Commands.Cuckoo do
       {:error, _} = error -> error
     end
   end
-
-  defp register_cuckoo_meta({:error, _}, _store, _key, _capacity), do: :ok
 
   defp register_cuckoo_meta(_result, store, key, capacity) do
     ProbType.register(store, key, {:cuckoo_meta, %{capacity: capacity}})

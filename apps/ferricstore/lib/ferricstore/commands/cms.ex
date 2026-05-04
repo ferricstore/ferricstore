@@ -194,11 +194,13 @@ defmodule Ferricstore.Commands.CMS do
   defp apply_prob_locally(store, {:cms_create, key, width, depth}) do
     path = prob_path(store, key, "cms")
     dir = Path.dirname(path)
-    ensure_prob_dir(dir)
-    result = NIF.cms_file_create(path, width, depth)
-    _ = NIF.v2_fsync_dir(dir)
-    register_cms_meta(result, store, key, width, depth)
-    result
+
+    with :ok <- ensure_prob_dir(dir),
+         {:ok, _resource} = result <- NIF.cms_file_create(path, width, depth),
+         :ok <- prob_fsync_dir(dir, :prob_file_dir) do
+      register_cms_meta(result, store, key, width, depth)
+      result
+    end
   end
 
   defp apply_prob_locally(store, {:cms_incrby, key, items}) do
@@ -210,27 +212,49 @@ defmodule Ferricstore.Commands.CMS do
   defp apply_prob_locally(store, {:cms_merge, dst_key, src_paths, weights, create_params}) do
     dst_path = prob_path(store, dst_key, "cms")
     dir = Path.dirname(dst_path)
-    ensure_prob_dir(dir)
 
-    unless Ferricstore.FS.exists?(dst_path) do
-      %{width: w, depth: d} = create_params
-      result = NIF.cms_file_create(dst_path, w, d)
-      _ = NIF.v2_fsync_dir(dir)
-      register_cms_meta(result, store, dst_key, w, d)
+    with :ok <- ensure_prob_dir(dir),
+         :ok <- maybe_create_merge_destination(store, dst_key, dst_path, dir, create_params) do
+      NIF.cms_file_merge(dst_path, src_paths, weights)
     end
+  end
 
-    NIF.cms_file_merge(dst_path, src_paths, weights)
+  defp maybe_create_merge_destination(store, dst_key, dst_path, dir, create_params) do
+    if Ferricstore.FS.exists?(dst_path) do
+      :ok
+    else
+      %{width: w, depth: d} = create_params
+
+      with {:ok, _resource} = result <- NIF.cms_file_create(dst_path, w, d),
+           :ok <- prob_fsync_dir(dir, :prob_file_dir) do
+        register_cms_meta(result, store, dst_key, w, d)
+        :ok
+      end
+    end
   end
 
   # Creates the prob dir if missing and fsyncs its parent so the new
   # directory entry is durable.
   defp ensure_prob_dir(dir) do
-    unless Ferricstore.FS.dir?(dir) do
+    if Ferricstore.FS.dir?(dir) do
+      :ok
+    else
       Ferricstore.FS.mkdir_p!(dir)
-      _ = NIF.v2_fsync_dir(Path.dirname(dir))
+      prob_fsync_dir(Path.dirname(dir), :create_prob_dir)
     end
+  end
 
-    :ok
+  defp prob_fsync_dir(path, phase) do
+    result =
+      case Process.get(:ferricstore_prob_command_fsync_dir_hook) do
+        fun when is_function(fun, 1) -> fun.(path)
+        _ -> NIF.v2_fsync_dir(path)
+      end
+
+    case result do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:fsync_dir_failed, phase, reason}}
+    end
   end
 
   defp check_not_exists(key, store) do
@@ -301,8 +325,6 @@ defmodule Ferricstore.Commands.CMS do
       end
     end)
   end
-
-  defp register_cms_meta({:error, _}, _store, _key, _width, _depth), do: :ok
 
   defp register_cms_meta(_result, store, key, width, depth) do
     ProbType.register(store, key, {:cms_meta, %{width: width, depth: depth}})

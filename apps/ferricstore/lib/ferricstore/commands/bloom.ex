@@ -363,62 +363,85 @@ defmodule Ferricstore.Commands.Bloom do
   # is durable — matches the Raft state-machine path.
   defp apply_prob_locally(store, {:bloom_create, key, num_bits, num_hashes, meta}) do
     path = prob_path(store, key, "bloom")
-    ensure_prob_dir(Path.dirname(path))
-    result = NIF.bloom_file_create(path, num_bits, num_hashes)
-    _ = NIF.v2_fsync_dir(Path.dirname(path))
-    register_bloom_meta(result, store, key, meta)
-    result
+    dir = Path.dirname(path)
+
+    with :ok <- ensure_prob_dir(dir),
+         {:ok, _resource} = result <- NIF.bloom_file_create(path, num_bits, num_hashes),
+         :ok <- prob_fsync_dir(dir, :prob_file_dir) do
+      register_bloom_meta(result, store, key, meta)
+      result
+    end
   end
 
   defp apply_prob_locally(store, {:bloom_add, key, element, auto_params}) do
     path = prob_path(store, key, "bloom")
     dir = Path.dirname(path)
-    ensure_prob_dir(dir)
-    created? = not Ferricstore.FS.exists?(path)
 
-    if created? do
-      if auto_params do
-        %{num_bits: nb, num_hashes: nh} = auto_params
-        result = NIF.bloom_file_create(path, nb, nh)
-        _ = NIF.v2_fsync_dir(dir)
-        register_bloom_meta(result, store, key, {:bloom_meta, Map.put(auto_params, :path, path)})
-      end
+    with :ok <- ensure_prob_dir(dir),
+         :ok <- maybe_auto_create_bloom(store, key, path, dir, auto_params) do
+      NIF.bloom_file_add(path, element)
     end
-
-    NIF.bloom_file_add(path, element)
   end
 
   defp apply_prob_locally(store, {:bloom_madd, key, elements, auto_params}) do
     path = prob_path(store, key, "bloom")
     dir = Path.dirname(path)
-    ensure_prob_dir(dir)
-    created? = not Ferricstore.FS.exists?(path)
 
-    if created? do
-      if auto_params do
-        %{num_bits: nb, num_hashes: nh} = auto_params
-        result = NIF.bloom_file_create(path, nb, nh)
-        _ = NIF.v2_fsync_dir(dir)
-        register_bloom_meta(result, store, key, {:bloom_meta, Map.put(auto_params, :path, path)})
-      end
+    with :ok <- ensure_prob_dir(dir),
+         :ok <- maybe_auto_create_bloom(store, key, path, dir, auto_params) do
+      NIF.bloom_file_madd(path, elements)
     end
-
-    NIF.bloom_file_madd(path, elements)
   end
 
-  defp register_bloom_meta({:error, _}, _store, _key, _meta), do: :ok
+  defp maybe_auto_create_bloom(store, key, path, dir, auto_params) do
+    cond do
+      Ferricstore.FS.exists?(path) ->
+        :ok
+
+      is_map(auto_params) ->
+        %{num_bits: nb, num_hashes: nh} = auto_params
+
+        with {:ok, _resource} = result <- NIF.bloom_file_create(path, nb, nh),
+             :ok <- prob_fsync_dir(dir, :prob_file_dir) do
+          register_bloom_meta(
+            result,
+            store,
+            key,
+            {:bloom_meta, Map.put(auto_params, :path, path)}
+          )
+
+          :ok
+        end
+
+      true ->
+        :ok
+    end
+  end
 
   defp register_bloom_meta(_result, store, key, meta), do: ProbType.register(store, key, meta)
 
   # Creates the prob dir if missing and fsyncs its parent so the new
   # directory entry is durable. No-op if the dir already exists.
   defp ensure_prob_dir(dir) do
-    unless Ferricstore.FS.dir?(dir) do
+    if Ferricstore.FS.dir?(dir) do
+      :ok
+    else
       Ferricstore.FS.mkdir_p!(dir)
-      _ = NIF.v2_fsync_dir(Path.dirname(dir))
+      prob_fsync_dir(Path.dirname(dir), :create_prob_dir)
     end
+  end
 
-    :ok
+  defp prob_fsync_dir(path, phase) do
+    result =
+      case Process.get(:ferricstore_prob_command_fsync_dir_hook) do
+        fun when is_function(fun, 1) -> fun.(path)
+        _ -> NIF.v2_fsync_dir(path)
+      end
+
+    case result do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:fsync_dir_failed, phase, reason}}
+    end
   end
 
   defp recover_bloom_meta(key, store, num_bits, num_hashes) do
