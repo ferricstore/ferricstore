@@ -334,5 +334,24 @@ defmodule Ferricstore.Merge.ManifestTest do
       assert File.exists?(Path.join(dir, "00001.log"))
       assert File.exists?(Path.join(dir, "00002.log"))
     end
+
+    test "recover_if_needed keeps manifest when partial-output cleanup fsync fails", %{dir: dir} do
+      :ok = Manifest.write(dir, %{shard_index: 0, input_file_ids: [1, 2]})
+      File.touch!(Path.join(dir, "compact_1.log"))
+
+      Process.put(:ferricstore_merge_manifest_fsync_dir_hook, fn ^dir ->
+        {:error, :eio}
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_merge_manifest_fsync_dir_hook)
+      end)
+
+      assert {:error, {:fsync_dir_failed, :cleanup_partial_output, :eio}} =
+               Manifest.recover_if_needed(dir, 0)
+
+      assert Manifest.exists?(dir),
+             "manifest must remain until cleanup removals are durable"
+    end
   end
 end

@@ -172,8 +172,9 @@ defmodule Ferricstore.Merge.Manifest do
         # Remove only temp files created by the current shard compaction path.
         # Numbered log files greater than the input set may be legitimate active
         # files when the crash happens after manifest write but before copy.
-        cleanup_partial_output(data_dir)
-        delete(data_dir)
+        with :ok <- cleanup_partial_output(data_dir) do
+          delete(data_dir)
+        end
 
       {:error, :corrupt_manifest} ->
         Logger.warning("Shard #{shard_index}: found corrupt merge manifest. Deleting it.")
@@ -229,15 +230,16 @@ defmodule Ferricstore.Merge.Manifest do
   defp cleanup_partial_output(data_dir) do
     case Ferricstore.FS.ls(data_dir) do
       {:ok, files} ->
-        files
-        |> Enum.filter(&partial_output_file?/1)
-        |> Enum.each(&remove_partial(&1, data_dir))
+        partials = Enum.filter(files, &partial_output_file?/1)
+        Enum.each(partials, &remove_partial(&1, data_dir))
 
-        # One dir fsync after the whole sweep so the removals are
-        # durable. Without this a double-crash can resurrect stale
-        # partial output files.
-        _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(data_dir)
-        :ok
+        if partials == [] do
+          :ok
+        else
+          # One dir fsync after the whole sweep so the removals are durable.
+          # Without this a double-crash can resurrect stale partial files.
+          fsync_dir(data_dir, :cleanup_partial_output)
+        end
 
       {:error, _reason} ->
         :ok
