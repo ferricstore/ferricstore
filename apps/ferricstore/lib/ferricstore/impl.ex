@@ -778,9 +778,9 @@ defmodule FerricStore.Impl do
 
   @spec flushdb(FerricStore.Instance.t()) :: :ok | {:error, term()}
   def flushdb(ctx) do
-    Ferricstore.Store.Ops.flush(ctx)
-
-    Ferricstore.ProbCleanup.flush_all(ctx.data_dir, ctx.shard_count)
+    with :ok <- Ferricstore.Store.Ops.flush(ctx) do
+      Ferricstore.ProbCleanup.flush_all(ctx.data_dir, ctx.shard_count)
+    end
   end
 
   # ---------------------------------------------------------------
