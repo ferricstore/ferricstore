@@ -123,27 +123,45 @@ defmodule Ferricstore.Store.Promotion do
     created_dir? = not Ferricstore.FS.dir?(path)
     Ferricstore.FS.mkdir_p!(path)
 
-    if created_dir? do
-      parent = Path.dirname(path)
-      _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(parent)
+    with :ok <- maybe_fsync_dir(created_dir?, Path.dirname(path), :create_dedicated_dir) do
+      active_file = Path.join(path, "00000.log")
+
+      # credo:disable-for-next-line Credo.Check.Refactor.UnlessWithElse
+      created_file? =
+        unless Ferricstore.FS.exists?(active_file) do
+          Ferricstore.FS.touch!(active_file)
+          true
+        else
+          false
+        end
+
+      with :ok <- maybe_fsync_dir(created_dir? or created_file?, path, :create_active_file) do
+        {:ok, path}
+      end
     end
+  end
 
-    active_file = Path.join(path, "00000.log")
+  defp maybe_fsync_dir(false, _path, _phase), do: :ok
+  defp maybe_fsync_dir(true, path, phase), do: fsync_dir(path, phase)
 
-    # credo:disable-for-next-line Credo.Check.Refactor.UnlessWithElse
-    created_file? =
-      unless Ferricstore.FS.exists?(active_file) do
-        Ferricstore.FS.touch!(active_file)
-        true
-      else
-        false
+  defp fsync_dir(path, phase) do
+    result =
+      case Process.get(:ferricstore_promotion_fsync_dir_hook) do
+        fun when is_function(fun, 1) -> fun.(path)
+        _ -> NIF.v2_fsync_dir(path)
       end
 
-    if created_dir? or created_file? do
-      _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(path)
-    end
+    case result do
+      :ok ->
+        :ok
 
-    {:ok, path}
+      {:error, reason} ->
+        Logger.error(
+          "Promotion: directory fsync failed during #{phase} for #{path}: #{inspect(reason)}"
+        )
+
+        {:error, {:fsync_dir_failed, phase, reason}}
+    end
   end
 
   @spec promote_hash!(binary(), reference(), atom(), binary(), non_neg_integer(), term()) ::
@@ -239,7 +257,18 @@ defmodule Ferricstore.Store.Promotion do
     end
 
     # Step 2: open dedicated + write batch
-    {:ok, dedicated_path} = open_dedicated(data_dir, shard_index, type, redis_key)
+    dedicated_path =
+      case open_dedicated(data_dir, shard_index, type, redis_key) do
+        {:ok, path} ->
+          path
+
+        {:error, reason} ->
+          Logger.error(
+            "Promotion: open dedicated failed for #{inspect(redis_key)}: #{inspect(reason)}"
+          )
+
+          raise "promotion open dedicated failed: #{inspect(reason)}"
+      end
 
     if entries != [] do
       batch = Enum.map(entries, fn {k, v, exp} -> {k, v, exp} end)
@@ -568,7 +597,14 @@ defmodule Ferricstore.Store.Promotion do
     if Ferricstore.FS.dir?(path) do
       Ferricstore.FS.rm_rf!(path)
       parent = Path.dirname(path)
-      _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(parent)
+
+      case fsync_dir(parent, :remove_dedicated_dir) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          raise "promotion cleanup directory fsync failed: #{inspect(reason)}"
+      end
     end
 
     Logger.debug("Cleaned up promoted #{type_label} #{inspect(redis_key)} (shard #{shard_index})")

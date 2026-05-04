@@ -75,6 +75,79 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
     }
   end
 
+  test "open_dedicated reports directory fsync failures", ctx do
+    Process.put(:ferricstore_promotion_fsync_dir_hook, fn path ->
+      send(self(), {:promotion_fsync_dir, path})
+      {:error, :eio}
+    end)
+
+    try do
+      redis_key = "hash:fsync-dir-failure"
+
+      assert {:error, {:fsync_dir_failed, :create_dedicated_dir, :eio}} =
+               Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+
+      dedicated_path = Promotion.dedicated_path(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+      assert_received {:promotion_fsync_dir, parent}
+      assert parent == Path.dirname(dedicated_path)
+    after
+      Process.delete(:ferricstore_promotion_fsync_dir_hook)
+    end
+  end
+
+  test "cleanup_promoted reports directory fsync failures after removing dedicated dir", ctx do
+    redis_key = "hash:cleanup-fsync-dir-failure"
+    mk = Promotion.marker_key(redis_key)
+    {:ok, {marker_offset, marker_size}} = NIF.v2_append_record(ctx.active_path, mk, "hash", 0)
+    :ets.insert(ctx.keydir, {mk, "hash", 0, LFU.initial(), 0, marker_offset, marker_size})
+
+    {:ok, dedicated_path} =
+      Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+
+    Process.put(:ferricstore_promotion_fsync_dir_hook, fn path ->
+      send(self(), {:promotion_fsync_dir, path})
+      {:error, :eio}
+    end)
+
+    try do
+      assert_raise RuntimeError, ~r/promotion cleanup directory fsync failed/, fn ->
+        Promotion.cleanup_promoted!(
+          redis_key,
+          ctx.shard_data_path,
+          ctx.keydir,
+          ctx.data_dir,
+          ctx.shard_index
+        )
+      end
+
+      assert_received {:promotion_fsync_dir, parent}
+      assert parent == Path.dirname(dedicated_path)
+    after
+      Process.delete(:ferricstore_promotion_fsync_dir_hook)
+    end
+  end
+
+  test "promote_collection reports open_dedicated fsync failures with context", ctx do
+    {redis_key, _entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
+
+    Process.put(:ferricstore_promotion_fsync_dir_hook, fn _path -> {:error, :eio} end)
+
+    try do
+      assert_raise RuntimeError, ~r/promotion open dedicated failed.*fsync_dir_failed/, fn ->
+        Promotion.promote_collection!(
+          :hash,
+          redis_key,
+          ctx.shard_data_path,
+          ctx.keydir,
+          ctx.data_dir,
+          ctx.shard_index
+        )
+      end
+    after
+      Process.delete(:ferricstore_promotion_fsync_dir_hook)
+    end
+  end
+
   defp seed_hash_entries(active_path, keydir) do
     redis_key = "user:1"
     fields = ~w(name email age city country)
