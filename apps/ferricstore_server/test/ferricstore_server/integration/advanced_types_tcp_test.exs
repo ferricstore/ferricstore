@@ -26,6 +26,10 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
     :ok = :gen_tcp.send(sock, data)
   end
 
+  defp send_inline(sock, parts) do
+    :ok = :gen_tcp.send(sock, Enum.join(parts, " ") <> "\r\n")
+  end
+
   defp recv_response(sock) do
     recv_response(sock, "")
   end
@@ -73,6 +77,18 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
   end
 
   defp ukey(name), do: "#{name}_#{:rand.uniform(999_999)}"
+
+  defp enable_sandbox_mode do
+    previous_sandbox_mode = Ferricstore.Config.get_value("sandbox_mode")
+    :ets.insert(:ferricstore_config, {"sandbox_mode", "enabled"})
+
+    on_exit(fn ->
+      case previous_sandbox_mode do
+        nil -> :ets.delete(:ferricstore_config, "sandbox_mode")
+        value -> :ets.insert(:ferricstore_config, {"sandbox_mode", value})
+      end
+    end)
+  end
 
   # ---------------------------------------------------------------------------
   # Setup — single listener for all tests
@@ -436,6 +452,105 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
       assert recv_response(reader) == source_count
       :gen_tcp.close(reader)
     end
+
+    test "concurrent pipelined PFMERGE operations preserve every source", %{
+      port: port
+    } do
+      setup_sock = connect_and_hello(port)
+      dest = ukey("pfmerge_pipeline_concurrent_dest")
+      source_count = 50
+
+      sources =
+        for i <- 1..source_count do
+          source = ukey("pfmerge_pipeline_concurrent_source")
+          send_cmd(setup_sock, ["PFADD", source, "elem:#{i}"])
+          assert recv_response(setup_sock) == 1
+          source
+        end
+
+      :gen_tcp.close(setup_sock)
+      parent = self()
+
+      tasks =
+        for source <- sources do
+          Task.async(fn ->
+            worker = connect_and_hello(port)
+            send(parent, {:ready, self()})
+
+            receive do
+              :go -> :ok
+            after
+              5_000 -> flunk("timed out waiting for concurrent pipelined PFMERGE release")
+            end
+
+            send_pipeline(worker, [
+              ["PFMERGE", dest, source],
+              ["PING"]
+            ])
+
+            responses = recv_n(worker, 2)
+            :gen_tcp.close(worker)
+            responses
+          end)
+        end
+
+      for _ <- 1..source_count do
+        assert_receive {:ready, _pid}, 5_000
+      end
+
+      Enum.each(tasks, fn task -> send(task.pid, :go) end)
+
+      assert Enum.map(tasks, &Task.await(&1, 30_000)) ==
+               List.duplicate([{:simple, "OK"}, {:simple, "PONG"}], source_count)
+
+      reader = connect_and_hello(port)
+      send_cmd(reader, ["PFCOUNT", dest])
+      assert recv_response(reader) == source_count
+      :gen_tcp.close(reader)
+    end
+  end
+
+  describe "SANDBOX server commands over TCP" do
+    test "sandbox FLUSHDB only clears sandbox keys and keeps outside probabilistic state", %{
+      port: port
+    } do
+      enable_sandbox_mode()
+
+      outside_key = ukey("sandbox_flushdb_outside")
+      outside_pf = ukey("sandbox_flushdb_pf_outside")
+      inside_key = ukey("sandbox_flushdb_inside")
+
+      outside = connect_and_hello(port)
+      send_cmd(outside, ["SET", outside_key, "outside"])
+      assert recv_response(outside) == {:simple, "OK"}
+      send_cmd(outside, ["PFADD", outside_pf, "a", "b", "c"])
+      assert recv_response(outside) == 1
+      :gen_tcp.close(outside)
+
+      sandbox = connect_and_hello(port)
+      send_cmd(sandbox, ["SANDBOX", "START"])
+      token = recv_response(sandbox)
+      send_cmd(sandbox, ["SET", inside_key, "inside"])
+      assert recv_response(sandbox) == {:simple, "OK"}
+
+      send_cmd(sandbox, ["FLUSHDB"])
+      assert recv_response(sandbox) == {:simple, "OK"}
+      send_cmd(sandbox, ["GET", inside_key])
+      assert recv_response(sandbox) == nil
+      :gen_tcp.close(sandbox)
+
+      reader = connect_and_hello(port)
+      send_cmd(reader, ["GET", outside_key])
+      assert recv_response(reader) == "outside"
+      send_cmd(reader, ["PFCOUNT", outside_pf])
+      assert recv_response(reader) == 3
+
+      send_inline(reader, ["SANDBOX", "JOIN", token])
+      assert recv_response(reader) == {:simple, "OK"}
+      send_cmd(reader, ["GET", inside_key])
+      assert recv_response(reader) == nil
+      :gen_tcp.close(reader)
+    end
   end
 
   # ===========================================================================
@@ -712,6 +827,69 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
                List.duplicate({:simple, "OK"}, field_count)
 
       reader = connect_and_hello(port)
+      send_cmd(reader, ["JSON.GET", k])
+      final = recv_response(reader) |> Jason.decode!()
+      :gen_tcp.close(reader)
+
+      assert Map.new(1..field_count, fn i -> {"f#{i}", i} end) == final
+    end
+
+    test "sandboxed concurrent JSON.SET path updates over TCP preserve every field", %{
+      port: port
+    } do
+      enable_sandbox_mode()
+
+      sock = connect_and_hello(port)
+      send_cmd(sock, ["SANDBOX", "START"])
+      token = recv_response(sock)
+
+      k = ukey("jsonset_sandbox_concurrent")
+      field_count = 50
+
+      root =
+        1..field_count
+        |> Map.new(fn i -> {"f#{i}", 0} end)
+        |> Jason.encode!()
+
+      send_cmd(sock, ["JSON.SET", k, "$", root])
+      assert recv_response(sock) == {:simple, "OK"}
+      :gen_tcp.close(sock)
+
+      parent = self()
+
+      tasks =
+        for i <- 1..field_count do
+          Task.async(fn ->
+            worker = connect_and_hello(port)
+            send_inline(worker, ["SANDBOX", "JOIN", token])
+            assert recv_response(worker) == {:simple, "OK"}
+            send(parent, {:ready, self()})
+
+            receive do
+              :go -> :ok
+            after
+              5_000 -> flunk("timed out waiting for sandboxed concurrent JSON.SET release")
+            end
+
+            send_cmd(worker, ["JSON.SET", k, "$.f#{i}", Integer.to_string(i)])
+            response = recv_response(worker)
+            :gen_tcp.close(worker)
+            response
+          end)
+        end
+
+      for _ <- 1..field_count do
+        assert_receive {:ready, _pid}, 5_000
+      end
+
+      Enum.each(tasks, fn task -> send(task.pid, :go) end)
+
+      assert Enum.map(tasks, &Task.await(&1, 30_000)) ==
+               List.duplicate({:simple, "OK"}, field_count)
+
+      reader = connect_and_hello(port)
+      send_inline(reader, ["SANDBOX", "JOIN", token])
+      assert recv_response(reader) == {:simple, "OK"}
       send_cmd(reader, ["JSON.GET", k])
       final = recv_response(reader) |> Jason.decode!()
       :gen_tcp.close(reader)

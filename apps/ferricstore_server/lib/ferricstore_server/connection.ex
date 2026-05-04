@@ -624,7 +624,7 @@ defmodule FerricstoreServer.Connection do
 
     result =
       try do
-        dispatch_store_command(cmd, args, ast, store)
+        dispatch_store_command(cmd, args, ast, store, state.instance_ctx, state.sandbox_namespace)
       catch
         :exit, {:noproc, _} ->
           {:error, "ERR server not ready, shard process unavailable"}
@@ -647,75 +647,95 @@ defmodule FerricstoreServer.Connection do
          _cmd,
          _args,
          {:pfadd, [key | elements]},
-         %FerricStore.Instance{} = store
+         _store,
+         ctx,
+         namespace
        ) do
-    Router.pfadd(store, key, elements)
+    Router.pfadd(ctx, namespace_key(namespace, key), elements)
   end
 
   defp dispatch_store_command(
          _cmd,
          _args,
          {:pfmerge, [dest_key | source_keys]},
-         %FerricStore.Instance{} = store
+         _store,
+         ctx,
+         namespace
        ) do
-    Router.pfmerge(store, dest_key, source_keys)
+    Router.pfmerge(
+      ctx,
+      namespace_key(namespace, dest_key),
+      namespace_keys(namespace, source_keys)
+    )
   end
 
   defp dispatch_store_command(
          _cmd,
          _args,
          {:json_set, key, path, value, flags},
-         %FerricStore.Instance{} = store
+         _store,
+         ctx,
+         namespace
        ) do
-    Router.json_set(store, key, path, value, flags)
+    Router.json_set(ctx, namespace_key(namespace, key), path, value, flags)
   end
 
   defp dispatch_store_command(
          _cmd,
          _args,
          {:json_del, key, path},
-         %FerricStore.Instance{} = store
+         _store,
+         ctx,
+         namespace
        ) do
-    Router.json_del(store, key, path)
+    Router.json_del(ctx, namespace_key(namespace, key), path)
   end
 
   defp dispatch_store_command(
          _cmd,
          _args,
          {:json_numincrby, key, path, increment},
-         %FerricStore.Instance{} = store
+         _store,
+         ctx,
+         namespace
        ) do
-    Router.json_numincrby(store, key, path, increment)
+    Router.json_numincrby(ctx, namespace_key(namespace, key), path, increment)
   end
 
   defp dispatch_store_command(
          _cmd,
          _args,
          {:json_arrappend, key, path, values},
-         %FerricStore.Instance{} = store
+         _store,
+         ctx,
+         namespace
        ) do
-    Router.json_arrappend(store, key, path, values)
+    Router.json_arrappend(ctx, namespace_key(namespace, key), path, values)
   end
 
   defp dispatch_store_command(
          _cmd,
          _args,
          {:json_toggle, key, path},
-         %FerricStore.Instance{} = store
+         _store,
+         ctx,
+         namespace
        ) do
-    Router.json_toggle(store, key, path)
+    Router.json_toggle(ctx, namespace_key(namespace, key), path)
   end
 
   defp dispatch_store_command(
          _cmd,
          _args,
          {:json_clear, key, path},
-         %FerricStore.Instance{} = store
+         _store,
+         ctx,
+         namespace
        ) do
-    Router.json_clear(store, key, path)
+    Router.json_clear(ctx, namespace_key(namespace, key), path)
   end
 
-  defp dispatch_store_command(cmd, args, ast, store) do
+  defp dispatch_store_command(cmd, args, ast, store, _ctx, _namespace) do
     if ast_store_command?(ast) do
       Dispatcher.dispatch_ast(ast, store)
     else
@@ -723,6 +743,14 @@ defmodule FerricstoreServer.Connection do
        "ERR unsupported command AST for '#{String.downcase(cmd)}' command with #{length(args)} args"}
     end
   end
+
+  defp namespace_key(nil, key), do: key
+  defp namespace_key(namespace, key) when is_binary(namespace), do: namespace <> key
+
+  defp namespace_keys(nil, keys), do: keys
+
+  defp namespace_keys(namespace, keys) when is_binary(namespace),
+    do: Enum.map(keys, &(namespace <> &1))
 
   defp internal_error(kind, reason),
     do: {:error, "ERR internal error: #{inspect({kind, reason})}"}

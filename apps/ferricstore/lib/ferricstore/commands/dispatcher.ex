@@ -549,6 +549,9 @@ defmodule Ferricstore.Commands.Dispatcher do
   defp dispatch_prob_ast({tag, _, _} = ast, store) when tag in ~w(bf_reserve)a,
     do: Bloom.handle_ast(ast, store)
 
+  defp dispatch_prob_ast({tag, _, _, _} = ast, store) when tag in ~w(bf_reserve)a,
+    do: Bloom.handle_ast(ast, store)
+
   defp dispatch_prob_ast({tag, _} = ast, store)
        when tag in ~w(cf_reserve cf_add cf_addnx cf_del cf_exists cf_mexists cf_count cf_info)a,
        do: Cuckoo.handle_ast(ast, store)

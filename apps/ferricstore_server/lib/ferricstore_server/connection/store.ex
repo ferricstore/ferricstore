@@ -9,12 +9,20 @@ defmodule FerricstoreServer.Connection.Store do
 
   def build_store(ctx, ns) when is_binary(ns) do
     raw = raw_store(ctx)
-    %{raw |
-      get: fn key -> raw.get.(ns <> key) end,
-      get_meta: fn key -> raw.get_meta.(ns <> key) end,
-      put: fn key, val, exp -> raw.put.(ns <> key, val, exp) end,
-      delete: fn key -> raw.delete.(ns <> key) end,
-      exists?: fn key -> raw.exists?.(ns <> key) end
+
+    %{
+      raw
+      | get: fn key -> raw.get.(ns <> key) end,
+        get_meta: fn key -> raw.get_meta.(ns <> key) end,
+        batch_get: fn keys -> raw.batch_get.(namespace_keys(ns, keys)) end,
+        put: fn key, val, exp -> raw.put.(ns <> key, val, exp) end,
+        delete: fn key -> raw.delete.(ns <> key) end,
+        exists?: fn key -> raw.exists?.(ns <> key) end,
+        keys: fn -> sandbox_keys(raw, ns) end,
+        flush: fn -> sandbox_flush(raw, ns) end,
+        dbsize: fn -> length(sandbox_keys(raw, ns)) end,
+        prob_dir_for_key: fn key -> raw.prob_dir_for_key.(ns <> key) end,
+        flush_prob_dirs: fn -> :ok end
     }
   end
 
@@ -26,6 +34,7 @@ defmodule FerricstoreServer.Connection.Store do
         store = build_raw_store(ctx)
         :persistent_term.put({:ferricstore_raw_store, ctx.name}, store)
         store
+
       store ->
         store
     end
@@ -37,6 +46,7 @@ defmodule FerricstoreServer.Connection.Store do
     %{
       get: fn key -> Router.get(ctx, key) end,
       get_meta: fn key -> Router.get_meta(ctx, key) end,
+      batch_get: fn keys -> Router.batch_get(ctx, keys) end,
       put: fn key, value, exp -> Router.put(ctx, key, value, exp) end,
       delete: fn key -> Router.delete(ctx, key) end,
       exists?: fn key -> Router.exists?(ctx, key) end,
@@ -60,7 +70,6 @@ defmodule FerricstoreServer.Connection.Store do
               :exit, _ -> :ok
             end
           end)
-
         end
 
         :ok
@@ -77,7 +86,9 @@ defmodule FerricstoreServer.Connection.Store do
       lock: fn key, owner, ttl -> Router.lock(ctx, key, owner, ttl) end,
       unlock: fn key, owner -> Router.unlock(ctx, key, owner) end,
       extend: fn key, owner, ttl -> Router.extend(ctx, key, owner, ttl) end,
-      ratelimit_add: fn key, window, max, count -> Router.ratelimit_add(ctx, key, window, max, count) end,
+      ratelimit_add: fn key, window, max, count ->
+        Router.ratelimit_add(ctx, key, window, max, count)
+      end,
       list_op: fn key, op -> Router.list_op(ctx, key, op) end,
       compound_get: fn redis_key, compound_key ->
         Router.compound_get(ctx, redis_key, compound_key)
@@ -85,6 +96,12 @@ defmodule FerricstoreServer.Connection.Store do
       compound_get_meta: fn redis_key, compound_key ->
         shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
         GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
+      end,
+      compound_batch_get: fn redis_key, compound_keys ->
+        Router.compound_batch_get(ctx, redis_key, compound_keys)
+      end,
+      compound_batch_get_meta: fn redis_key, compound_keys ->
+        Router.compound_batch_get_meta(ctx, redis_key, compound_keys)
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
@@ -114,7 +131,29 @@ defmodule FerricstoreServer.Connection.Store do
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
         Path.join(shard_path, "prob")
       end,
+      flush_prob_dirs: fn -> Ferricstore.ProbCleanup.flush_all(ctx.data_dir, ctx.shard_count) end,
       on_push: &Ferricstore.Waiters.notify_push/1
     }
   end
+
+  defp sandbox_keys(raw, ns) do
+    prefix_size = byte_size(ns)
+
+    raw.keys.()
+    |> Enum.filter(&String.starts_with?(&1, ns))
+    |> Enum.map(&binary_part(&1, prefix_size, byte_size(&1) - prefix_size))
+  end
+
+  defp sandbox_flush(raw, ns) do
+    raw.keys.()
+    |> Enum.filter(&String.starts_with?(&1, ns))
+    |> Enum.each(fn key ->
+      _ = raw.delete.(key)
+      :ok
+    end)
+
+    :ok
+  end
+
+  defp namespace_keys(ns, keys), do: Enum.map(keys, &(ns <> &1))
 end

@@ -120,7 +120,7 @@ defmodule Ferricstore.Commands.Server do
       # store.flush deletes keys via Raft which should clean up files via
       # maybe_delete_prob_file, but as a safety net we also wipe the prob
       # directories directly.
-      flush_all_prob_dirs()
+      flush_store_prob_dirs(store)
     end
   end
 
@@ -136,7 +136,7 @@ defmodule Ferricstore.Commands.Server do
     AuditLog.log(:dangerous_command, %{command: "FLUSHALL", args: args})
 
     with :ok <- Ops.flush(store) do
-      flush_all_prob_dirs()
+      flush_store_prob_dirs(store)
     end
   end
 
@@ -445,6 +445,19 @@ defmodule Ferricstore.Commands.Server do
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     Ferricstore.ProbCleanup.flush_all(data_dir, shard_count())
   end
+
+  defp flush_store_prob_dirs(%FerricStore.Instance{} = ctx) do
+    Ferricstore.ProbCleanup.flush_all(ctx.data_dir, ctx.shard_count)
+  end
+
+  defp flush_store_prob_dirs(store) when is_map(store) do
+    case Map.fetch(store, :flush_prob_dirs) do
+      {:ok, flush_prob_dirs} when is_function(flush_prob_dirs, 0) -> flush_prob_dirs.()
+      _ -> flush_all_prob_dirs()
+    end
+  end
+
+  defp flush_store_prob_dirs(_store), do: flush_all_prob_dirs()
 
   # ---------------------------------------------------------------------------
   # INFO section builders
