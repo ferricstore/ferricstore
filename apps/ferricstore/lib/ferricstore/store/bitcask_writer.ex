@@ -218,6 +218,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
     shard_index = Keyword.fetch!(opts, :shard_index)
 
     {:ok,
@@ -345,6 +346,27 @@ defmodule Ferricstore.Store.BitcaskWriter do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(_reason, %{pending: []}), do: :ok
+
+  def terminate(reason, state) do
+    cancel_timer(state.flush_timer)
+
+    case do_flush(state.pending, state.shard_index) do
+      :ok ->
+        Logger.debug(
+          "BitcaskWriter shard_#{state.shard_index}: flushed #{state.pending_count} pending entries during shutdown"
+        )
+
+      {:error, failed_entries} ->
+        Logger.warning(
+          "BitcaskWriter shard_#{state.shard_index}: shutdown flush failed for #{length(failed_entries)} pending entries (reason=#{inspect(reason)})"
+        )
+    end
+
+    :ok
+  end
 
   # -- Private --
 

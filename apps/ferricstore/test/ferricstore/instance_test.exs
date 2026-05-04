@@ -159,6 +159,47 @@ defmodule Ferricstore.InstanceTest do
       end
     end
 
+    test "custom instance shutdown flushes pending BitcaskWriter entries" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_embedded_writer_shutdown_#{System.unique_integer([:positive])}"
+        )
+
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        EmbeddedDefaultOptions.stop()
+        File.rm_rf(root)
+      end)
+
+      assert {:ok, _pid} = EmbeddedDefaultOptions.start_link(data_dir: root, shard_count: 1)
+
+      ctx = EmbeddedDefaultOptions.__instance__()
+      writer = Process.whereis(Ferricstore.Store.BitcaskWriter.writer_name(ctx, 0))
+      keydir = elem(ctx.keydir_refs, 0)
+      {file_id, file_path, _shard_path} = Ferricstore.Store.ActiveFile.get(ctx, 0)
+      key = "writer-shutdown-pending"
+      value = "survives-stop"
+
+      :ets.insert(
+        keydir,
+        {key, value, 0, Ferricstore.Store.LFU.initial(), :pending, 0, 0}
+      )
+
+      :sys.replace_state(writer, fn state ->
+        %{
+          state
+          | pending: [{:write, ctx, file_path, file_id, keydir, key, value, 0}],
+            pending_count: 1
+        }
+      end)
+
+      assert :ok = EmbeddedDefaultOptions.stop()
+      assert {:ok, _pid} = EmbeddedDefaultOptions.start_link(data_dir: root, shard_count: 1)
+      assert {:ok, ^value} = EmbeddedDefaultOptions.get(key)
+    end
+
     test "removes latch ETS tables" do
       name = :"cleanup_latch_#{System.unique_integer([:positive])}"
       on_exit(fn -> FerricStore.Instance.cleanup(name) end)

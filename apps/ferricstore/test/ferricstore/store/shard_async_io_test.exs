@@ -271,7 +271,11 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
 
       on_exit(fn ->
-        if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        try do
+          if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        catch
+          :exit, _ -> :ok
+        end
 
         try do
           :ets.delete(keydir)
@@ -309,7 +313,11 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
 
       on_exit(fn ->
-        if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        try do
+          if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        catch
+          :exit, _ -> :ok
+        end
 
         try do
           :ets.delete(keydir)
@@ -347,7 +355,11 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
 
       on_exit(fn ->
-        if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        try do
+          if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        catch
+          :exit, _ -> :ok
+        end
 
         try do
           :ets.delete(keydir)
@@ -382,7 +394,11 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       {:ok, writer} = SlowFlushWriter.start_link(writer_name)
 
       on_exit(fn ->
-        if Process.alive?(writer), do: GenServer.stop(writer, :kill, 100)
+        try do
+          if Process.alive?(writer), do: GenServer.stop(writer, :kill, 100)
+        catch
+          :exit, _ -> :ok
+        end
       end)
 
       assert {:error, {:flush_exit, {:timeout, _call}}} = BitcaskWriter.flush(shard_index, 1)
@@ -412,7 +428,12 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
 
       on_exit(fn ->
-        if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        try do
+          if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        catch
+          :exit, _ -> :ok
+        end
+
         File.rm_rf(dir)
       end)
 
