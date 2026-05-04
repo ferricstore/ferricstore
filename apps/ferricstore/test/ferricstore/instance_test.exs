@@ -14,6 +14,10 @@ defmodule Ferricstore.InstanceTest do
     use FerricStore, shard_count: 1
   end
 
+  defmodule EmbeddedStopFailure do
+    use FerricStore, shard_count: 1
+  end
+
   # Use the :default instance (created at app boot)
   # In future: test with a custom isolated instance
 
@@ -255,6 +259,28 @@ defmodule Ferricstore.InstanceTest do
       assert :ets.whereis(:"#{EmbeddedDefaultOptions}_latch_0") == :undefined
       assert :ets.whereis(:"#{EmbeddedDefaultOptions}_hotness") == :undefined
       assert :ets.whereis(:"#{EmbeddedDefaultOptions}_config") == :undefined
+    end
+
+    test "custom instance stop surfaces supervisor stop failures" do
+      name = :"#{EmbeddedStopFailure}.Supervisor"
+
+      fake_supervisor =
+        spawn(fn ->
+          receive do
+            _message -> exit(:boom)
+          end
+        end)
+
+      Process.register(fake_supervisor, name)
+
+      on_exit(fn ->
+        if pid = Process.whereis(name), do: Process.exit(pid, :kill)
+        FerricStore.Instance.cleanup(EmbeddedStopFailure)
+      end)
+
+      assert {{:boom, {:sys, :terminate, [^fake_supervisor, :normal, :infinity]}},
+              {GenServer, :stop, [^fake_supervisor, :normal, :infinity]}} =
+               catch_exit(EmbeddedStopFailure.stop())
     end
   end
 

@@ -46,7 +46,13 @@ defmodule FerricStore.Macro do
           try do
             Supervisor.stop(pid)
           catch
-            :exit, _ -> :ok
+            :exit,
+            {{:shutdown, {:sys, :terminate, [^pid, :normal, :infinity]}},
+             {GenServer, :stop, [^pid, :normal, :infinity]}} ->
+              :ok
+
+            :exit, {:noproc, {GenServer, :stop, [^pid, :normal, :infinity]}} ->
+              :ok
           end
 
           FerricStore.Instance.cleanup(__MODULE__)
