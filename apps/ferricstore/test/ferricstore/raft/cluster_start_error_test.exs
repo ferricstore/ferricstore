@@ -42,6 +42,28 @@ defmodule Ferricstore.Raft.ClusterStartErrorTest do
       assert ok_match_to_start_system?(@application_path)
     end
 
+    test "start_system reports ra directory fsync failure before starting ra" do
+      root =
+        Path.join(System.tmp_dir!(), "raft_cluster_fsync_#{System.unique_integer([:positive])}")
+
+      parent = self()
+
+      Process.put(:ferricstore_raft_cluster_fsync_dir_hook, fn path ->
+        send(parent, {:raft_cluster_fsync, path})
+        {:error, :eio}
+      end)
+
+      try do
+        assert {:error, {:fsync_dir_failed, :create_ra_dir, :eio}} =
+                 Cluster.start_system(root)
+
+        assert_received {:raft_cluster_fsync, ^root}
+      after
+        Process.delete(:ferricstore_raft_cluster_fsync_dir_hook)
+        File.rm_rf!(root)
+      end
+    end
+
     test "application waits for parallel shard elections before readiness" do
       source = File.read!(@application_path)
 

@@ -50,39 +50,60 @@ defmodule Ferricstore.Raft.Cluster do
     # manages its own files' durability internally, but the dir entry
     # itself needs the parent fsync or a kernel panic between mkdir
     # and ra's first file-create can lose the directory on reboot.
-    if created? do
-      _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(data_dir)
+    with :ok <- maybe_fsync_created_ra_dir(created?, data_dir) do
+      names = :ra_system.derive_names(@ra_system)
+
+      commit_delay_us =
+        Application.get_env(:ferricstore, :wal_commit_delay_us, 200)
+
+      config = %{
+        name: @ra_system,
+        names: names,
+        data_dir: ra_data_dir,
+        wal_data_dir: ra_data_dir,
+        segment_max_entries: 32_768,
+        wal_max_batch_size: 32_768,
+        wal_compute_checksums: true,
+        wal_pre_allocate: true,
+        wal_io_module: :ferricstore_wal_nif,
+        wal_commit_delay_us: commit_delay_us
+      }
+
+      case :ra_system.start(config) do
+        {:ok, _pid} ->
+          Logger.info("ra system started: #{inspect(@ra_system)}")
+          :ok
+
+        {:error, {:already_started, _pid}} ->
+          :ok
+
+        {:error, reason} = err ->
+          Logger.error("Failed to start ra system: #{inspect(reason)}")
+          err
+      end
     end
+  end
 
-    names = :ra_system.derive_names(@ra_system)
+  defp maybe_fsync_created_ra_dir(false, _data_dir), do: :ok
 
-    commit_delay_us =
-      Application.get_env(:ferricstore, :wal_commit_delay_us, 200)
-
-    config = %{
-      name: @ra_system,
-      names: names,
-      data_dir: ra_data_dir,
-      wal_data_dir: ra_data_dir,
-      segment_max_entries: 32_768,
-      wal_max_batch_size: 32_768,
-      wal_compute_checksums: true,
-      wal_pre_allocate: true,
-      wal_io_module: :ferricstore_wal_nif,
-      wal_commit_delay_us: commit_delay_us
-    }
-
-    case :ra_system.start(config) do
-      {:ok, _pid} ->
-        Logger.info("ra system started: #{inspect(@ra_system)}")
+  defp maybe_fsync_created_ra_dir(true, data_dir) do
+    case raft_cluster_fsync_dir(data_dir) do
+      :ok ->
         :ok
 
-      {:error, {:already_started, _pid}} ->
-        :ok
+      {:error, reason} ->
+        Logger.error(
+          "Failed to fsync ra directory parent #{data_dir} after creating ra/: #{inspect(reason)}"
+        )
 
-      {:error, reason} = err ->
-        Logger.error("Failed to start ra system: #{inspect(reason)}")
-        err
+        {:error, {:fsync_dir_failed, :create_ra_dir, reason}}
+    end
+  end
+
+  defp raft_cluster_fsync_dir(path) do
+    case Process.get(:ferricstore_raft_cluster_fsync_dir_hook) do
+      fun when is_function(fun, 1) -> fun.(path)
+      _ -> Ferricstore.Bitcask.NIF.v2_fsync_dir(path)
     end
   end
 
