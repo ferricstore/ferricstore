@@ -95,6 +95,13 @@ defmodule Ferricstore.Store.OpsTest do
   end
 
   describe "LocalTxStore batch reads" do
+    test "local single-key reads do not retry cold pread through value-only fallback" do
+      source = File.read!(@ops_path)
+
+      refute source =~ "ShardReads.v2_local_read",
+             "LocalTxStore single-key reads should trust ets_lookup_warm/2 so cold misses do not double pread or lose TTL metadata"
+    end
+
     test "local plain batch_get does not fall back to per-key get" do
       source = File.read!(@ops_path)
 

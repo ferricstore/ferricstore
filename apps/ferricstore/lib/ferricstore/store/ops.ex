@@ -16,7 +16,6 @@ defmodule Ferricstore.Store.Ops do
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.LocalTxStore
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
-  alias Ferricstore.Store.Shard.Reads, as: ShardReads
   alias Ferricstore.Store.Shard.Writes, as: ShardWrites
 
   @typep store :: FerricStore.Instance.t() | LocalTxStore.t() | map()
@@ -846,17 +845,7 @@ defmodule Ferricstore.Store.Ops do
         nil
 
       :miss ->
-        case ShardReads.v2_local_read(tx.shard_state, key) do
-          {:ok, nil} ->
-            nil
-
-          {:ok, value} ->
-            ShardETS.ets_insert(tx.shard_state, key, value, 0)
-            value
-
-          _error ->
-            nil
-        end
+        nil
     end
   end
 
@@ -895,17 +884,7 @@ defmodule Ferricstore.Store.Ops do
         nil
 
       :miss ->
-        case ShardReads.v2_local_read(tx.shard_state, key) do
-          {:ok, nil} ->
-            nil
-
-          {:ok, value} ->
-            ShardETS.ets_insert(tx.shard_state, key, value, 0)
-            {value, 0}
-
-          _error ->
-            nil
-        end
+        nil
     end
   end
 
@@ -1193,11 +1172,7 @@ defmodule Ferricstore.Store.Ops do
         nil
 
       :miss ->
-        case ShardReads.v2_local_read(tx.shard_state, key) do
-          {:ok, nil} -> nil
-          {:ok, v} -> v
-          _ -> nil
-        end
+        nil
     end
   end
 
