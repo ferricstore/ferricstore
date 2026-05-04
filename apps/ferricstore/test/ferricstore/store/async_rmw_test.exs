@@ -804,6 +804,39 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       assert Router.get(ctx(), key) == nil
     end
 
+    test "RmwCoordinator times out waiting for a stuck latch without later applying" do
+      original_timeout = Application.get_env(:ferricstore, :rmw_worker_latch_timeout_ms)
+      Application.put_env(:ferricstore, :rmw_worker_latch_timeout_ms, 5)
+
+      key = ukey("worker_latch_timeout")
+      idx = Router.shard_for(ctx(), key)
+      latch_tab = elem(ctx().latch_refs, idx)
+      holder = latch_holder()
+
+      assert :ets.insert_new(latch_tab, {key, holder})
+
+      task = Task.async(fn -> RmwCoordinator.execute(idx, ctx(), {:incr, key, 1}) end)
+
+      try do
+        assert {:ok, {:error, message}} = Task.yield(task, 500)
+        assert message =~ "RMW worker latch timeout"
+
+        release_latch_holder(holder)
+        Process.sleep(20)
+
+        assert Router.get(ctx(), key) == nil
+      after
+        Task.shutdown(task, :brutal_kill)
+        release_latch_holder(holder)
+        :ets.take(latch_tab, key)
+
+        case original_timeout do
+          nil -> Application.delete_env(:ferricstore, :rmw_worker_latch_timeout_ms)
+          value -> Application.put_env(:ferricstore, :rmw_worker_latch_timeout_ms, value)
+        end
+      end
+    end
+
     test "concurrent SETs and INCRs on same key never crash; final value is valid" do
       key = ukey("mixed")
       :ok = Router.put(ctx(), key, "0", 0)

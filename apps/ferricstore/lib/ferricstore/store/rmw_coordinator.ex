@@ -30,6 +30,7 @@ defmodule Ferricstore.Store.RmwCoordinator do
   require Logger
 
   @sweep_interval_ms 5_000
+  @default_worker_latch_timeout_ms 9_000
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -194,13 +195,28 @@ defmodule Ferricstore.Store.RmwCoordinator do
     try do
       latch_tab = elem(ctx.latch_refs, idx)
       keys = latch_keys_of(cmd)
+      started_ms = System.monotonic_time(:millisecond)
+      timeout_ms = worker_latch_timeout_ms()
 
-      Enum.each(keys, fn key -> wait_for_latch(latch_tab, key) end)
+      latch_result =
+        Enum.reduce_while(keys, :ok, fn key, :ok ->
+          case wait_for_latch(latch_tab, key, started_ms, timeout_ms) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
 
       try do
-        result = dispatch_inline(ctx, idx, cmd)
-        :telemetry.execute([:ferricstore, :rmw, :worker], %{}, %{shard_index: idx})
-        result
+        case latch_result do
+          :ok ->
+            result = dispatch_inline(ctx, idx, cmd)
+            :telemetry.execute([:ferricstore, :rmw, :worker], %{}, %{shard_index: idx})
+            result
+
+          {:error, {:timeout, wait_ms}} ->
+            emit_worker_latch_event(:timeout, idx, wait_ms)
+            {:error, "ERR RMW worker latch timeout after #{wait_ms}ms"}
+        end
       after
         release_latches(latch_tab, keys)
       end
@@ -277,32 +293,54 @@ defmodule Ferricstore.Store.RmwCoordinator do
   # immediately instead of waiting for the periodic sweeper. This handles
   # the "caller crashed before `:ets.take`" recovery path without a 5s
   # stall on the first RMW to the orphaned key.
-  defp wait_for_latch(tab, key) do
+  defp wait_for_latch(tab, key, started_ms, timeout_ms) do
     case :ets.insert_new(tab, {key, self()}) do
       true ->
         :ok
 
       false ->
-        case :ets.lookup(tab, key) do
-          [{^key, holder}] when is_pid(holder) ->
-            if Process.alive?(holder) do
-              latch_retry_backoff()
-              wait_for_latch(tab, key)
-            else
-              # Orphaned latch — take over, but only delete THIS specific
-              # dead holder's entry. Using `:ets.delete/2` unconditionally
-              # here would race with a fresh legitimate acquirer and corrupt
-              # the latch. select_delete matches on holder atomically.
-              :ets.select_delete(tab, [{{key, holder}, [], [true]}])
-              wait_for_latch(tab, key)
-            end
+        wait_ms = System.monotonic_time(:millisecond) - started_ms
 
-          _ ->
-            # Race: holder released between our insert_new and our lookup.
-            latch_retry_backoff()
-            wait_for_latch(tab, key)
+        if wait_ms >= timeout_ms do
+          {:error, {:timeout, wait_ms}}
+        else
+          case :ets.lookup(tab, key) do
+            [{^key, holder}] when is_pid(holder) ->
+              if Process.alive?(holder) do
+                latch_retry_backoff()
+                wait_for_latch(tab, key, started_ms, timeout_ms)
+              else
+                # Orphaned latch — take over, but only delete THIS specific
+                # dead holder's entry. Using `:ets.delete/2` unconditionally
+                # here would race with a fresh legitimate acquirer and corrupt
+                # the latch. select_delete matches on holder atomically.
+                :ets.select_delete(tab, [{{key, holder}, [], [true]}])
+                wait_for_latch(tab, key, started_ms, timeout_ms)
+              end
+
+            _ ->
+              # Race: holder released between our insert_new and our lookup.
+              latch_retry_backoff()
+              wait_for_latch(tab, key, started_ms, timeout_ms)
+          end
         end
     end
+  end
+
+  defp worker_latch_timeout_ms do
+    Application.get_env(
+      :ferricstore,
+      :rmw_worker_latch_timeout_ms,
+      @default_worker_latch_timeout_ms
+    )
+  end
+
+  defp emit_worker_latch_event(status, idx, wait_ms) do
+    :telemetry.execute(
+      [:ferricstore, :rmw, :worker_latch],
+      %{wait_ms: wait_ms},
+      %{status: status, shard_index: idx}
+    )
   end
 
   defp latch_retry_backoff do
