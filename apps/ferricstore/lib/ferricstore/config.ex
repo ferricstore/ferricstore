@@ -60,38 +60,38 @@ defmodule Ferricstore.Config do
   # Read-only parameters whose values are derived from Application env
   # or other runtime sources at init time. CONFIG SET on these returns an error.
   @read_only_params MapSet.new([
-    "maxmemory",
-    "maxclients",
-    "tcp-port",
-    "data-dir",
-    "tls-port",
-    "tls-cert-file",
-    "tls-key-file",
-    "tls-ca-cert-file",
-    "require-tls"
-  ])
+                      "maxmemory",
+                      "maxclients",
+                      "tcp-port",
+                      "data-dir",
+                      "tls-port",
+                      "tls-cert-file",
+                      "tls-key-file",
+                      "tls-ca-cert-file",
+                      "require-tls"
+                    ])
 
   # Read-write parameters with validators. Each key maps to a validator
   # function that returns :ok or {:error, reason}.
   @read_write_params MapSet.new([
-    "maxmemory-policy",
-    "notify-keyspace-events",
-    "slowlog-log-slower-than",
-    "slowlog-max-len",
-    "hz",
-    "keydir-max-ram",
-    "hot-cache-max-ram",
-    "hot-cache-min-ram",
-    "hot-cache-max-value-size"
-  ])
+                       "maxmemory-policy",
+                       "notify-keyspace-events",
+                       "slowlog-log-slower-than",
+                       "slowlog-max-len",
+                       "hz",
+                       "keydir-max-ram",
+                       "hot-cache-max-ram",
+                       "hot-cache-min-ram",
+                       "hot-cache-max-value-size"
+                     ])
 
   # Valid eviction policy names (string form used by Redis CONFIG SET)
   @valid_eviction_policies MapSet.new([
-    "volatile-lru",
-    "allkeys-lru",
-    "volatile-ttl",
-    "noeviction"
-  ])
+                             "volatile-lru",
+                             "allkeys-lru",
+                             "volatile-ttl",
+                             "noeviction"
+                           ])
 
   # Legacy read-write parameters that are stored but do not have special
   # validation or side-effects beyond updating the config map.
@@ -451,10 +451,13 @@ defmodule Ferricstore.Config do
       "slowlog-log-slower-than" => read_slowlog_threshold(),
       "slowlog-max-len" => read_slowlog_max_len(),
       "hz" => "10",
-      "keydir-max-ram" => Integer.to_string(Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024)),
+      "keydir-max-ram" =>
+        Integer.to_string(Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024)),
       "hot-cache-max-ram" => read_hot_cache_max_ram(),
-      "hot-cache-min-ram" => Integer.to_string(Application.get_env(:ferricstore, :hot_cache_min_ram, 64 * 1024 * 1024)),
-      "hot-cache-max-value-size" => Integer.to_string(Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536))
+      "hot-cache-min-ram" =>
+        Integer.to_string(Application.get_env(:ferricstore, :hot_cache_min_ram, 64 * 1024 * 1024)),
+      "hot-cache-max-value-size" =>
+        Integer.to_string(Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536))
     }
 
     Map.merge(@legacy_rw_defaults, Map.merge(read_only, read_write))
@@ -502,6 +505,7 @@ defmodule Ferricstore.Config do
         max_mem = Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824)
         keydir = Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024)
         Integer.to_string(max(max_mem - keydir, 64 * 1024 * 1024))
+
       val ->
         Integer.to_string(val)
     end
@@ -595,12 +599,15 @@ defmodule Ferricstore.Config do
     case Integer.parse(value) do
       {n, ""} when n > 0 ->
         min = Application.get_env(:ferricstore, :hot_cache_min_ram, 0)
+
         if n < min do
           {:error, "ERR hot-cache-max-ram (#{n}) must be >= hot-cache-min-ram (#{min})"}
         else
           :ok
         end
-      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'hot-cache-max-ram'"}
+
+      _ ->
+        {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'hot-cache-max-ram'"}
     end
   end
 
@@ -608,12 +615,15 @@ defmodule Ferricstore.Config do
     case Integer.parse(value) do
       {n, ""} when n > 0 ->
         max = Application.get_env(:ferricstore, :hot_cache_max_ram, :infinity)
+
         if max != :infinity and n > max do
           {:error, "ERR hot-cache-min-ram (#{n}) must be <= hot-cache-max-ram (#{max})"}
         else
           :ok
         end
-      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'hot-cache-min-ram'"}
+
+      _ ->
+        {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'hot-cache-min-ram'"}
     end
   end
 
@@ -630,7 +640,6 @@ defmodule Ferricstore.Config do
       _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'hot-cache-max-value-size'"}
     end
   end
-
 
   defp validate_param(_key, _value), do: :ok
 
@@ -663,31 +672,19 @@ defmodule Ferricstore.Config do
   defp apply_side_effect("keydir-max-ram", value) do
     {n, ""} = Integer.parse(value)
     Application.put_env(:ferricstore, :keydir_max_ram, n)
-    try do
-      Ferricstore.MemoryGuard.reconfigure(%{keydir_max_ram: n})
-    rescue _ -> :ok
-    catch _, _ -> :ok
-    end
+    reconfigure_memory_guard("keydir-max-ram", %{keydir_max_ram: n})
   end
 
   defp apply_side_effect("hot-cache-max-ram", value) do
     {n, ""} = Integer.parse(value)
     Application.put_env(:ferricstore, :hot_cache_max_ram, n)
-    try do
-      Ferricstore.MemoryGuard.reconfigure(%{hot_cache_max_ram: n})
-    rescue _ -> :ok
-    catch _, _ -> :ok
-    end
+    reconfigure_memory_guard("hot-cache-max-ram", %{hot_cache_max_ram: n})
   end
 
   defp apply_side_effect("hot-cache-min-ram", value) do
     {n, ""} = Integer.parse(value)
     Application.put_env(:ferricstore, :hot_cache_min_ram, n)
-    try do
-      Ferricstore.MemoryGuard.reconfigure(%{hot_cache_min_ram: n})
-    rescue _ -> :ok
-    catch _, _ -> :ok
-    end
+    reconfigure_memory_guard("hot-cache-min-ram", %{hot_cache_min_ram: n})
   end
 
   defp apply_side_effect("hot-cache-max-value-size", value) do
@@ -703,6 +700,27 @@ defmodule Ferricstore.Config do
 
   defp apply_side_effect(_key, _value), do: :ok
 
+  defp reconfigure_memory_guard(param, params) do
+    try do
+      memory_guard_reconfigure(params)
+    rescue
+      exception ->
+        emit_side_effect_failed(param, :memory_guard_reconfigure, :error, exception)
+        :ok
+    catch
+      kind, reason ->
+        emit_side_effect_failed(param, :memory_guard_reconfigure, kind, reason)
+        :ok
+    end
+  end
+
+  defp memory_guard_reconfigure(params) do
+    case Application.get_env(:ferricstore, :config_memory_guard_reconfigure_hook) do
+      fun when is_function(fun, 1) -> fun.(params)
+      _ -> Ferricstore.MemoryGuard.reconfigure(params)
+    end
+  end
+
   # -------------------------------------------------------------------
   # Private -- telemetry
   # -------------------------------------------------------------------
@@ -712,6 +730,14 @@ defmodule Ferricstore.Config do
       [:ferricstore, :config, :changed],
       %{},
       %{param: key, value: value, old_value: old_value}
+    )
+  end
+
+  defp emit_side_effect_failed(param, phase, kind, reason) do
+    :telemetry.execute(
+      [:ferricstore, :config, :side_effect_failed],
+      %{count: 1},
+      %{param: param, phase: phase, kind: kind, reason: reason}
     )
   end
 

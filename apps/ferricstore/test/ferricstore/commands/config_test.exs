@@ -42,6 +42,7 @@ defmodule Ferricstore.Commands.ConfigTest do
 
   defp reset_config_defaults do
     defaults = Config.defaults()
+
     Enum.each(defaults, fn {k, v} ->
       try do
         Config.set(k, v)
@@ -203,7 +204,13 @@ defmodule Ferricstore.Commands.ConfigTest do
 
   describe "CONFIG SET read-write parameters" do
     test "CONFIG SET maxmemory-policy volatile-ttl then GET returns new value" do
-      assert :ok = Server.handle("CONFIG", ["SET", "maxmemory-policy", "volatile-ttl"], MockStore.make())
+      assert :ok =
+               Server.handle(
+                 "CONFIG",
+                 ["SET", "maxmemory-policy", "volatile-ttl"],
+                 MockStore.make()
+               )
+
       result = Server.handle("CONFIG", ["GET", "maxmemory-policy"], MockStore.make())
       assert ["maxmemory-policy", "volatile-ttl"] = result
     end
@@ -214,13 +221,21 @@ defmodule Ferricstore.Commands.ConfigTest do
     end
 
     test "CONFIG SET maxmemory-policy with invalid value returns error" do
-      result = Server.handle("CONFIG", ["SET", "maxmemory-policy", "invalid-policy"], MockStore.make())
+      result =
+        Server.handle("CONFIG", ["SET", "maxmemory-policy", "invalid-policy"], MockStore.make())
+
       assert {:error, msg} = result
       assert msg =~ "Invalid argument"
     end
 
     test "CONFIG SET slowlog-log-slower-than updates threshold" do
-      assert :ok = Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "5000"], MockStore.make())
+      assert :ok =
+               Server.handle(
+                 "CONFIG",
+                 ["SET", "slowlog-log-slower-than", "5000"],
+                 MockStore.make()
+               )
+
       result = Server.handle("CONFIG", ["GET", "slowlog-log-slower-than"], MockStore.make())
       assert ["slowlog-log-slower-than", "5000"] = result
       # Verify Application env was updated (SlowLog reads from here)
@@ -228,13 +243,17 @@ defmodule Ferricstore.Commands.ConfigTest do
     end
 
     test "CONFIG SET slowlog-log-slower-than with -1 disables slowlog" do
-      assert :ok = Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "-1"], MockStore.make())
+      assert :ok =
+               Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "-1"], MockStore.make())
+
       result = Server.handle("CONFIG", ["GET", "slowlog-log-slower-than"], MockStore.make())
       assert ["slowlog-log-slower-than", "-1"] = result
     end
 
     test "CONFIG SET slowlog-log-slower-than with non-integer returns error" do
-      result = Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "abc"], MockStore.make())
+      result =
+        Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "abc"], MockStore.make())
+
       assert {:error, msg} = result
       assert msg =~ "Invalid argument"
     end
@@ -264,14 +283,19 @@ defmodule Ferricstore.Commands.ConfigTest do
     end
 
     test "CONFIG SET notify-keyspace-events accepts flag strings" do
-      assert :ok = Server.handle("CONFIG", ["SET", "notify-keyspace-events", "KEA"], MockStore.make())
+      assert :ok =
+               Server.handle("CONFIG", ["SET", "notify-keyspace-events", "KEA"], MockStore.make())
+
       result = Server.handle("CONFIG", ["GET", "notify-keyspace-events"], MockStore.make())
       assert ["notify-keyspace-events", "KEA"] = result
     end
 
     test "CONFIG SET notify-keyspace-events accepts empty string to disable" do
       Server.handle("CONFIG", ["SET", "notify-keyspace-events", "KEA"], MockStore.make())
-      assert :ok = Server.handle("CONFIG", ["SET", "notify-keyspace-events", ""], MockStore.make())
+
+      assert :ok =
+               Server.handle("CONFIG", ["SET", "notify-keyspace-events", ""], MockStore.make())
+
       result = Server.handle("CONFIG", ["GET", "notify-keyspace-events"], MockStore.make())
       assert ["notify-keyspace-events", ""] = result
     end
@@ -371,6 +395,52 @@ defmodule Ferricstore.Commands.ConfigTest do
       assert metadata.value == "50"
       assert is_binary(metadata.old_value)
     end
+
+    test "CONFIG SET emits telemetry when MemoryGuard reconfigure side effect fails" do
+      parent = self()
+      handler_id = {:config_side_effect_failed, parent, make_ref()}
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :config, :side_effect_failed],
+        &__MODULE__.handle_config_side_effect_failed/4,
+        parent
+      )
+
+      old_hook = Application.get_env(:ferricstore, :config_memory_guard_reconfigure_hook)
+
+      Application.put_env(
+        :ferricstore,
+        :config_memory_guard_reconfigure_hook,
+        fn %{keydir_max_ram: 12345} ->
+          raise "memory guard reconfigure exploded"
+        end
+      )
+
+      on_exit(fn ->
+        :telemetry.detach(handler_id)
+
+        case old_hook do
+          nil -> Application.delete_env(:ferricstore, :config_memory_guard_reconfigure_hook)
+          hook -> Application.put_env(:ferricstore, :config_memory_guard_reconfigure_hook, hook)
+        end
+      end)
+
+      assert :ok = Server.handle("CONFIG", ["SET", "keydir-max-ram", "12345"], MockStore.make())
+
+      assert_receive {:config_side_effect_failed, [:ferricstore, :config, :side_effect_failed],
+                      %{count: 1},
+                      %{
+                        param: "keydir-max-ram",
+                        phase: :memory_guard_reconfigure,
+                        kind: :error,
+                        reason: %RuntimeError{message: "memory guard reconfigure exploded"}
+                      }}
+    end
+  end
+
+  def handle_config_side_effect_failed(event, measurements, metadata, parent) do
+    send(parent, {:config_side_effect_failed, event, measurements, metadata})
   end
 
   # ---------------------------------------------------------------------------
