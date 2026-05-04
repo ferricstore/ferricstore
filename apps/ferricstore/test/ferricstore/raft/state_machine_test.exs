@@ -2647,6 +2647,76 @@ defmodule Ferricstore.Raft.StateMachineTest do
       end
     end
 
+    test "remote-only cross-shard SET rotates the remote active file when it grows past threshold",
+         %{ets: ets} do
+      shard0 = 0
+      shard1 = 1
+
+      root =
+        Path.join(System.tmp_dir!(), "sm_remote_rotate_#{System.unique_integer([:positive])}")
+
+      shard1_path = Ferricstore.DataDir.shard_data_path(root, shard1)
+      shard1_file = Path.join(shard1_path, "00000.log")
+      ets1 = :ets.new(:"sm_remote_rotate_#{System.unique_integer([:positive])}", [:set, :public])
+
+      File.mkdir_p!(shard1_path)
+      File.touch!(shard1_file)
+      Ferricstore.Store.ActiveFile.init(2)
+
+      state =
+        init_state_for_release_cursor(ets,
+          shard_index: shard0,
+          release_cursor_interval: 1
+        )
+
+      instance_ctx = %{
+        name: :"sm_remote_rotate_#{System.unique_integer([:positive])}",
+        data_dir: root,
+        shard_count: 2,
+        keydir_refs: List.to_tuple([ets, ets1]),
+        keydir_binary_bytes: :atomics.new(2, signed: false),
+        checkpoint_flags: :atomics.new(2, signed: false),
+        checkpoint_in_flight: :atomics.new(2, signed: false),
+        disk_pressure: :atomics.new(2, signed: false),
+        last_applied_index: :atomics.new(2, signed: false),
+        last_released_cursor_index: :atomics.new(2, signed: false),
+        hot_cache_max_value_size: 64,
+        max_active_file_size: 80
+      }
+
+      Ferricstore.Store.ActiveFile.publish(
+        instance_ctx,
+        shard0,
+        state.active_file_id,
+        state.active_file_path,
+        state.shard_data_path
+      )
+
+      Ferricstore.Store.ActiveFile.publish(instance_ctx, shard1, 0, shard1_file, shard1_path)
+
+      state = %{state | instance_ctx: instance_ctx}
+      value = :binary.copy("R", 120)
+
+      try do
+        {_state, {:applied_at, 1, %{^shard1 => [:ok]}}, _effects} =
+          StateMachine.apply(
+            %{index: 1, term: 1, system_time: System.os_time(:millisecond)},
+            {:cross_shard_tx, [{shard1, [{"SET", ["remote_rotate_key", value]}], nil}]},
+            state
+          )
+
+        assert {1, rotated_path, ^shard1_path} =
+                 Ferricstore.Store.ActiveFile.get(instance_ctx, shard1)
+
+        assert rotated_path == Path.join(shard1_path, "00001.log")
+        assert File.exists?(rotated_path)
+      after
+        :ets.delete(ets1)
+        Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)
+        File.rm_rf!(root)
+      end
+    end
+
     test "release_cursor promotes prior checkpoint when shard was clean before next write", %{
       state: state,
       shard_index: shard_index

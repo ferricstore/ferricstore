@@ -3603,9 +3603,66 @@ defmodule Ferricstore.Raft.StateMachine do
     if shard_index == state.shard_index do
       track_bitcask_append_bytes(state, file_path, file_id, written_bytes)
     else
+      maybe_rotate_remote_cross_shard_active_file(
+        state,
+        shard_index,
+        file_path,
+        file_id,
+        written_bytes
+      )
+
       state
     end
   end
+
+  defp maybe_rotate_remote_cross_shard_active_file(
+         state,
+         shard_index,
+         file_path,
+         file_id,
+         written_bytes
+       )
+       when written_bytes > 0 do
+    ctx = checkpoint_ctx_for_state(state)
+
+    with %{keydir_refs: keydir_refs} <- ctx,
+         true <- is_tuple(keydir_refs),
+         true <- shard_index >= 0 and shard_index < tuple_size(keydir_refs),
+         keydir <- elem(keydir_refs, shard_index),
+         {^file_id, ^file_path, shard_data_path} <-
+           Ferricstore.Store.ActiveFile.get(ctx, shard_index),
+         {:ok, %{size: active_file_size}} <- File.stat(file_path) do
+      max_active_file_size =
+        Map.get(ctx, :max_active_file_size, Map.get(state, :max_active_file_size))
+
+      %{
+        state
+        | shard_index: shard_index,
+          shard_data_path: shard_data_path,
+          shard_data_path_expanded: Path.expand(shard_data_path),
+          active_file_id: file_id,
+          active_file_path: file_path,
+          active_file_size: active_file_size,
+          file_stats: %{file_id => {active_file_size, 0}},
+          max_active_file_size: max_active_file_size,
+          ets: keydir
+      }
+      |> maybe_rotate_state_machine_active_file()
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_rotate_remote_cross_shard_active_file(
+         _state,
+         _shard_index,
+         _file_path,
+         _file_id,
+         _written_bytes
+       ),
+       do: :ok
 
   defp mark_cross_shard_checkpoint_dirty(state, shard_index) do
     case checkpoint_ctx_for_state(state) do
