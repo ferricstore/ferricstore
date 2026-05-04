@@ -10,6 +10,17 @@ defmodule Ferricstore.Store.OpsTest do
 
   @ops_path Path.expand("../../../lib/ferricstore/store/ops.ex", __DIR__)
 
+  describe "prob_dir/2" do
+    test "prefers key-specific directory callback over generic prob_dir callback" do
+      store = %{
+        prob_dir: fn -> "/wrong/prob" end,
+        prob_dir_for_key: fn "prob-key" -> "/right/prob" end
+      }
+
+      assert Ops.prob_dir(store, "prob-key") == "/right/prob"
+    end
+  end
+
   describe "LocalTxStore SET" do
     test "KEEPTTL preserves cold key TTL without reading the old value" do
       ctx = FerricStore.Instance.get(:default)

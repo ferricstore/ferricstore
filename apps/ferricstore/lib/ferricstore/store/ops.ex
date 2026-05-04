@@ -758,11 +758,11 @@ defmodule Ferricstore.Store.Ops do
     Path.join(tx.shard_state.shard_data_path, "prob")
   end
 
-  def prob_dir(store, _key) when is_map(store) and is_map_key(store, :prob_dir),
-    do: store.prob_dir.()
-
   def prob_dir(store, key) when is_map(store) and is_map_key(store, :prob_dir_for_key),
     do: store.prob_dir_for_key.(key)
+
+  def prob_dir(store, _key) when is_map(store) and is_map_key(store, :prob_dir),
+    do: store.prob_dir.()
 
   # --- Flush ---
 
