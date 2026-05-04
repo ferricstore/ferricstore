@@ -346,7 +346,8 @@ defmodule Ferricstore.Raft.Batcher do
   callers do not observe success while the command only lives in a local timer
   slot.
   """
-  @spec async_submit_ordered(non_neg_integer(), command()) :: :ok | {:error, :overloaded}
+  @spec async_submit_ordered(non_neg_integer(), command()) ::
+          :ok | {:error, :overloaded | {:ra_target_down, term()}}
   def async_submit_ordered(shard_index, inner_command) do
     GenServer.call(batcher_name(shard_index), {:async_submit_ordered, inner_command}, 5_000)
   end

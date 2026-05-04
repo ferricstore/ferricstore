@@ -294,6 +294,18 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       assert "root_val" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
+    test "ordered async submit spec documents Ra target-down errors" do
+      batcher_path = Path.expand("../../../lib/ferricstore/raft/batcher.ex", __DIR__)
+      source = File.read!(batcher_path)
+      [_prefix, spec_and_def] = String.split(source, "@spec async_submit_ordered", parts: 2)
+      [spec, _def_and_rest] = String.split(spec_and_def, "def async_submit_ordered", parts: 2)
+
+      # This call waits for Ra submission, so callers can see a local target-down
+      # error instead of a slot-only :ok. Keep the public contract in sync with
+      # the runtime behavior tested below.
+      assert spec =~ ":ra_target_down"
+    end
+
     test "ordered async submit returns pipeline errors instead of slot-only success" do
       shard = 90_000 + :rand.uniform(9_999)
       name = Batcher.batcher_name(shard)
