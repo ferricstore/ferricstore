@@ -2,8 +2,10 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Raft.Batcher
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.Promotion
   alias Ferricstore.Test.IsolatedInstance
 
   setup do
@@ -104,6 +106,27 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
 
     assert :ok = Router.put(ctx, key, "after")
     assert Router.get_version(ctx, key) > version_before
+  end
+
+  test "promoted async routing uses stamped command time", %{ctx: ctx} do
+    key = "router:instance:promoted-time:#{System.unique_integer([:positive])}"
+    idx = Router.shard_for(ctx, key)
+    marker = Promotion.marker_key(key)
+    stamped_now = Ferricstore.HLC.now_ms() - 60_000
+    marker_expire_at = stamped_now + 30_000
+
+    assert marker_expire_at < Ferricstore.HLC.now_ms()
+
+    :ets.insert(elem(ctx.keydir_refs, idx), {marker, "hash", marker_expire_at, 1, 0, 0, 0})
+    :atomics.put(ctx.disk_pressure, idx + 1, 1)
+
+    routed_ctx = %{ctx | name: :default, durability_mode: :all_async}
+    field_key = CompoundKey.hash_field(key, "field")
+
+    assert :ok =
+             CommandTime.with_now_ms(stamped_now, fn ->
+               Router.compound_put(routed_ctx, key, field_key, "value", 0)
+             end)
   end
 
   defp same_shard_keys(ctx) do

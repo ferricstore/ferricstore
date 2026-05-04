@@ -18,7 +18,7 @@ defmodule Ferricstore.Store.Router do
   argument, replacing all persistent_term lookups with instance-local state.
   """
 
-  alias Ferricstore.HLC
+  alias Ferricstore.{CommandTime, HLC}
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Stats
@@ -3796,7 +3796,7 @@ defmodule Ferricstore.Store.Router do
     case :ets.lookup(keydir, marker) do
       [{^marker, type, expire_at_ms, _lfu, _fid, _off, _value_size}]
       when type in ["hash", "set", "zset"] ->
-        expire_at_ms == 0 or expire_at_ms > HLC.now_ms()
+        expire_at_ms == 0 or expire_at_ms > CommandTime.now_ms()
 
       _ ->
         false
