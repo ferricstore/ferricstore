@@ -126,9 +126,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp dispatch_batch_get_results(
          keys,
          lookup_keys,
-         %{transport: :ranch_tcp} = state,
+         %{transport: transport} = state,
          send_response_fn
-       ) do
+       )
+       when transport in [:ranch_tcp, :ranch_ssl] do
     case safe_dispatch(fn ->
            Router.batch_get_with_file_refs(
              state.instance_ctx,
@@ -175,7 +176,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
       |> Enum.zip(results)
       |> Enum.reduce_while({:continue, state}, fn
         {{key, _lookup_key}, {:file_ref, path, offset, size}}, {:continue, acc_state} ->
-          case ConnSendfile.send_file_ref(key, path, offset, size, acc_state) do
+          case ConnSendfile.send_file_ref_response(key, path, offset, size, acc_state) do
             {:sent, new_state} ->
               {:cont, {:continue, new_state}}
 
@@ -457,7 +458,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
           lookup_keys = namespace_keys(state.sandbox_namespace, keys)
 
           get_dispatch =
-            if state.transport == :ranch_tcp do
+            if state.transport in [:ranch_tcp, :ranch_ssl] do
               fn ->
                 Router.batch_get_with_file_refs(ctx, lookup_keys, ConnSendfile.threshold_bytes())
               end
@@ -505,7 +506,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
       Enum.reduce_while(0..(count - 1), {:continue, state}, fn idx, {:continue, acc_state} ->
         case Map.get(primary_results, idx) || Map.get(fallback_results, idx) do
           {:file_ref, key, lookup_key, path, offset, size} ->
-            case ConnSendfile.send_file_ref(key, path, offset, size, acc_state) do
+            case ConnSendfile.send_file_ref_response(key, path, offset, size, acc_state) do
               {:sent, new_state} ->
                 {:cont, {:continue, new_state}}
 
@@ -792,7 +793,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
     result
   end
 
-  defp prefetch_pure_tcp_reads(commands, %{transport: :ranch_tcp} = state) do
+  defp prefetch_pure_tcp_reads(commands, %{transport: transport} = state)
+       when transport in [:ranch_tcp, :ranch_ssl] do
+    tcp? = transport == :ranch_tcp
+
     {gets, mgets, getranges} =
       commands
       |> Enum.with_index()
@@ -802,13 +806,13 @@ defmodule FerricstoreServer.Connection.Pipeline do
             {[{idx, key, namespace_key(state.sandbox_namespace, key)} | get_acc], mget_acc,
              getrange_acc}
 
-          {"MGET", keys, {:mget, keys}, keys} when is_list(keys) and keys != [] ->
+          {"MGET", keys, {:mget, keys}, keys} when tcp? and is_list(keys) and keys != [] ->
             lookup_keys = namespace_keys(state.sandbox_namespace, keys)
             {get_acc, [{idx, keys, lookup_keys} | mget_acc], getrange_acc}
 
           {"GETRANGE", [key, _start_arg, _end_arg] = args, {:getrange, key, start_idx, end_idx},
            [key]}
-          when is_binary(key) and is_integer(start_idx) and is_integer(end_idx) ->
+          when tcp? and is_binary(key) and is_integer(start_idx) and is_integer(end_idx) ->
             {get_acc, mget_acc, [{idx, args, key, start_idx, end_idx} | getrange_acc]}
 
           _ ->
@@ -980,7 +984,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
         end
 
       {:file_ref, key, lookup_key, path, offset, size}, {:continue, acc_state} ->
-        case ConnSendfile.send_file_ref(key, path, offset, size, acc_state) do
+        case ConnSendfile.send_file_ref_response(key, path, offset, size, acc_state) do
           {:sent, new_state} ->
             {:cont, {:continue, new_state}}
 

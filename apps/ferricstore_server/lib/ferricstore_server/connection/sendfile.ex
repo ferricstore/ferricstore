@@ -437,6 +437,13 @@ defmodule FerricstoreServer.Connection.Sendfile do
     end
   end
 
+  @doc false
+  def send_file_ref_response(key, path, offset, size, %{transport: :ranch_tcp} = state),
+    do: send_file_ref(key, path, offset, size, state)
+
+  def send_file_ref_response(key, path, offset, size, state),
+    do: stream_file_ref(key, path, offset, size, state)
+
   defp do_stream_file_get(path, offset, size, state) do
     case :file.open(path, [:read, :raw, :binary]) do
       {:ok, fd} ->

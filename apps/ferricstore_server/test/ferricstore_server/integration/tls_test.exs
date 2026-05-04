@@ -34,6 +34,11 @@ defmodule FerricstoreServer.Integration.TlsTest do
     :ok = :ssl.send(ssl_sock, data)
   end
 
+  defp send_pipeline(ssl_sock, commands) do
+    data = commands |> Enum.map(&Encoder.encode/1) |> IO.iodata_to_binary()
+    :ok = :ssl.send(ssl_sock, data)
+  end
+
   defp recv_response(ssl_sock) do
     case Process.get(@parsed_key, []) do
       [val | rest] ->
@@ -287,6 +292,38 @@ defmodule FerricstoreServer.Integration.TlsTest do
       assert recv_response(sock) == {:simple, "OK"}
       assert recv_response(sock) == {:simple, "OK"}
       assert recv_response(sock) == ["1", "2"]
+
+      :ssl.close(sock)
+    end
+
+    test "large cold GET in a mixed TLS pipeline streams bounded chunks", %{tls_port: port} do
+      attach_file_stream_handler(self())
+
+      sock = connect_tls_and_hello(port)
+      k = ukey("pipe_large_get_stream")
+      value = :binary.copy("P", Sendfile.threshold_bytes() + 131_072)
+
+      send_cmd(sock, ["SET", k, value])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :ssl.close(sock)
+      sock = connect_tls_and_hello(port)
+
+      send_pipeline(sock, [
+        ["GET", k],
+        ["PING"]
+      ])
+
+      assert recv_response(sock) == value
+      assert recv_response(sock) == {:simple, "PONG"}
+
+      size = byte_size(value)
+
+      assert_receive {:file_stream_event, [:ferricstore, :server, :file_stream],
+                      %{bytes: ^size, chunks: chunks}, %{result: :ok, transport: :ranch_ssl}},
+                     1000
+
+      assert chunks > 1
 
       :ssl.close(sock)
     end
