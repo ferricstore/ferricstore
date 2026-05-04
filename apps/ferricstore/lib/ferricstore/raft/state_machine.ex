@@ -604,6 +604,12 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
+  def apply(meta, {:pfmerge, dest_key, source_sketches}, state) do
+    apply_pending_with_time(meta, state, fn ->
+      do_pfmerge(state, dest_key, source_sketches)
+    end)
+  end
+
   def apply(meta, {:json_set, key, path, value, flags}, state) do
     apply_pending_with_time(meta, state, fn ->
       Json.handle_ast({:json_set, key, path, value, flags}, build_string_value_store(state))
@@ -3086,6 +3092,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:pfadd, key, elements}) do
     HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_value_store(state))
+  end
+
+  defp apply_single(state, {:pfmerge, dest_key, source_sketches}) do
+    do_pfmerge(state, dest_key, source_sketches)
   end
 
   defp apply_single(state, {:json_set, key, path, value, flags}) do
@@ -7012,6 +7022,34 @@ defmodule Ferricstore.Raft.StateMachine do
       exists?: fn key -> live_key?(state, key) end,
       compound_get: fn _redis_key, compound_key -> do_get(state, compound_key) end
     }
+  end
+
+  defp do_pfmerge(state, dest_key, source_sketches) when is_list(source_sketches) do
+    source_keys =
+      source_sketches
+      |> Enum.with_index()
+      |> Enum.map(fn {_sketch, idx} -> "\0__pfmerge_source__:" <> Integer.to_string(idx) end)
+
+    source_values = Map.new(Enum.zip(source_keys, source_sketches))
+    base_store = build_string_value_store(state)
+
+    store = %{
+      base_store
+      | batch_get: fn keys ->
+          Enum.map(keys, fn key ->
+            Map.get(source_values, key) || do_get(state, key)
+          end)
+        end,
+        compound_get: fn redis_key, compound_key ->
+          if Map.has_key?(source_values, redis_key) do
+            nil
+          else
+            do_get(state, compound_key)
+          end
+        end
+    }
+
+    HyperLogLog.handle_ast({:pfmerge, [dest_key | source_keys]}, store)
   end
 
   # Builds a compound store for list/hash/set operations inside the state

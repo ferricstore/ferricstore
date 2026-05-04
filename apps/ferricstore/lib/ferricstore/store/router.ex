@@ -19,6 +19,7 @@ defmodule Ferricstore.Store.Router do
   """
 
   alias Ferricstore.{CommandTime, HLC}
+  alias Ferricstore.HyperLogLog, as: HLL
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Stats
@@ -289,6 +290,8 @@ defmodule Ferricstore.Store.Router do
   def always_quorum?({:ratelimit_add, _, _, _, _, _}), do: true
   def always_quorum?({:spop, _, _}), do: true
   def always_quorum?({:zpop, _, _, _}), do: true
+  def always_quorum?({:pfadd, _, _}), do: true
+  def always_quorum?({:pfmerge, _, _}), do: true
   def always_quorum?({:json_set, _, _, _, _}), do: true
   def always_quorum?({:json_del, _, _}), do: true
   def always_quorum?({:json_numincrby, _, _, _}), do: true
@@ -3232,6 +3235,18 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc false
+  def pfmerge(ctx, dest_key, source_keys)
+      when is_binary(dest_key) and is_list(source_keys) and source_keys != [] do
+    with {:ok, [_dest_sketch | source_sketches]} <-
+           hll_read_sketches(ctx, [dest_key | source_keys]) do
+      forced_single_key_quorum(ctx, dest_key, {:pfmerge, dest_key, source_sketches})
+    end
+  end
+
+  def pfmerge(_ctx, _dest_key, _source_keys),
+    do: {:error, "ERR wrong number of arguments for 'pfmerge' command"}
+
+  @doc false
   def spop(ctx, key, count) when is_binary(key) and (is_nil(count) or is_integer(count)) do
     forced_single_key_quorum(ctx, key, {:spop, key, count})
   end
@@ -3283,6 +3298,50 @@ defmodule Ferricstore.Store.Router do
   defp forced_single_key_quorum(ctx, key, command) do
     idx = shard_for(ctx, key)
     forced_quorum_write(ctx, idx, command, node())
+  end
+
+  @hll_wrongtype_error {:error,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value"}
+
+  defp hll_read_sketches(ctx, keys) do
+    with :ok <- hll_ensure_string_keys(ctx, keys) do
+      ctx
+      |> batch_get(keys)
+      |> Enum.map(fn
+        nil -> HLL.new()
+        value -> value
+      end)
+      |> hll_validate_sketches()
+    end
+  end
+
+  defp hll_ensure_string_keys(ctx, keys) do
+    Enum.reduce_while(keys, :ok, fn key, :ok ->
+      if hll_compound_data_structure_key?(ctx, key) do
+        {:halt, @hll_wrongtype_error}
+      else
+        {:cont, :ok}
+      end
+    end)
+  end
+
+  defp hll_compound_data_structure_key?(ctx, key) do
+    compound_get(ctx, key, CompoundKey.type_key(key)) != nil and
+      TypeRegistry.get_type(key, ctx) != "none"
+  end
+
+  defp hll_validate_sketches(sketches) do
+    Enum.reduce_while(sketches, {:ok, []}, fn sketch, {:ok, acc} ->
+      if HLL.valid_sketch?(sketch) do
+        {:cont, {:ok, [sketch | acc]}}
+      else
+        {:halt, @hll_wrongtype_error}
+      end
+    end)
+    |> case do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      {:error, _} = err -> err
+    end
   end
 
   @doc """

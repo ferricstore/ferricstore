@@ -655,6 +655,15 @@ defmodule FerricstoreServer.Connection do
   defp dispatch_store_command(
          _cmd,
          _args,
+         {:pfmerge, [dest_key | source_keys]},
+         %FerricStore.Instance{} = store
+       ) do
+    Router.pfmerge(store, dest_key, source_keys)
+  end
+
+  defp dispatch_store_command(
+         _cmd,
+         _args,
          {:json_set, key, path, value, flags},
          %FerricStore.Instance{} = store
        ) do

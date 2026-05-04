@@ -145,6 +145,7 @@ defmodule Ferricstore.Raft.Batcher do
           | {:compound_delete, binary()}
           | {:compound_delete_prefix, binary()}
           | {:pfadd, binary(), [binary()]}
+          | {:pfmerge, binary(), [binary()]}
           | {:spop, binary(), nil | non_neg_integer()}
           | {:zpop, binary(), non_neg_integer(), :min | :max}
           | {:json_set, binary(), binary() | list(), binary(), list()}

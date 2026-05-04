@@ -384,6 +384,58 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
 
       :gen_tcp.close(sock)
     end
+
+    test "concurrent PFMERGE operations into one destination preserve every source", %{
+      port: port
+    } do
+      setup_sock = connect_and_hello(port)
+      dest = ukey("pfmerge_concurrent_dest")
+      source_count = 50
+
+      sources =
+        for i <- 1..source_count do
+          source = ukey("pfmerge_concurrent_source")
+          send_cmd(setup_sock, ["PFADD", source, "elem:#{i}"])
+          assert recv_response(setup_sock) == 1
+          source
+        end
+
+      :gen_tcp.close(setup_sock)
+      parent = self()
+
+      tasks =
+        for source <- sources do
+          Task.async(fn ->
+            worker = connect_and_hello(port)
+            send(parent, {:ready, self()})
+
+            receive do
+              :go -> :ok
+            after
+              5_000 -> flunk("timed out waiting for concurrent PFMERGE release")
+            end
+
+            send_cmd(worker, ["PFMERGE", dest, source])
+            response = recv_response(worker)
+            :gen_tcp.close(worker)
+            response
+          end)
+        end
+
+      for _ <- 1..source_count do
+        assert_receive {:ready, _pid}, 5_000
+      end
+
+      Enum.each(tasks, fn task -> send(task.pid, :go) end)
+
+      assert Enum.map(tasks, &Task.await(&1, 30_000)) ==
+               List.duplicate({:simple, "OK"}, source_count)
+
+      reader = connect_and_hello(port)
+      send_cmd(reader, ["PFCOUNT", dest])
+      assert recv_response(reader) == source_count
+      :gen_tcp.close(reader)
+    end
   end
 
   # ===========================================================================

@@ -633,6 +633,21 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp dispatch_store_command(
          _name,
          _args,
+         {:pfmerge, [dest_key | source_keys]},
+         _store,
+         ctx,
+         namespace
+       ) do
+    Router.pfmerge(
+      ctx,
+      namespace_key(namespace, dest_key),
+      namespace_keys(namespace, source_keys)
+    )
+  end
+
+  defp dispatch_store_command(
+         _name,
+         _args,
          {:json_set, key, path, value, flags},
          _store,
          ctx,
@@ -697,6 +712,11 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp namespace_key(nil, key), do: key
   defp namespace_key(namespace, key) when is_binary(namespace), do: namespace <> key
+
+  defp namespace_keys(nil, keys), do: keys
+
+  defp namespace_keys(namespace, keys) when is_binary(namespace),
+    do: Enum.map(keys, &(namespace <> &1))
 
   defp safe_dispatch(fun) do
     {:ok, fun.()}
