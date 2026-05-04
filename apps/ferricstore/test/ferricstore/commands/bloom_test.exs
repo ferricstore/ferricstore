@@ -84,6 +84,22 @@ defmodule Ferricstore.Commands.BloomTest do
       assert File.exists?(path)
     end
 
+    test "uses key-specific probabilistic directory when available" do
+      wrong_dir = make_temp_dir()
+      right_dir = make_temp_dir()
+      key = "key_specific_bloom"
+      safe = Base.url_encode64(key, padding: false)
+
+      store =
+        make_store(dir: wrong_dir)
+        |> Map.put(:prob_dir, fn -> wrong_dir end)
+        |> Map.put(:prob_dir_for_key, fn ^key -> right_dir end)
+
+      assert :ok = Bloom.handle("BF.RESERVE", [key, "0.01", "1000"], store)
+      assert File.exists?(Path.join(right_dir, "#{safe}.bloom"))
+      refute File.exists?(Path.join(wrong_dir, "#{safe}.bloom"))
+    end
+
     test "returns error when key already exists" do
       store = make_store()
       assert :ok = Bloom.handle("BF.RESERVE", ["mybloom", "0.01", "100"], store)

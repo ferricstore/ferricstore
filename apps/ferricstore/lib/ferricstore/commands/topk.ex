@@ -306,10 +306,10 @@ defmodule Ferricstore.Commands.TopK do
     Path.join(prob_dir, "#{safe}.#{ext}")
   end
 
+  defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
+
   defp resolve_prob_dir(%{prob_dir: prob_dir_fn}, _key) when is_function(prob_dir_fn),
     do: prob_dir_fn.()
-
-  defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
 
   defp resolve_prob_dir(%FerricStore.Instance{} = ctx, key) do
     idx = Ferricstore.Store.Router.shard_for(ctx, key)

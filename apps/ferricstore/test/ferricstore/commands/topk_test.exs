@@ -16,6 +16,26 @@ defmodule Ferricstore.Commands.TopKTest do
       assert store.exists?.("hot_keys")
     end
 
+    test "uses key-specific probabilistic directory when available" do
+      wrong_dir =
+        Path.join(System.tmp_dir!(), "topk_wrong_prob_#{System.unique_integer([:positive])}")
+
+      right_dir =
+        Path.join(System.tmp_dir!(), "topk_right_prob_#{System.unique_integer([:positive])}")
+
+      key = "key_specific_topk"
+      safe = Base.url_encode64(key, padding: false)
+
+      store =
+        MockStore.make()
+        |> Map.put(:prob_dir, fn -> wrong_dir end)
+        |> Map.put(:prob_dir_for_key, fn ^key -> right_dir end)
+
+      assert :ok = TopK.handle("TOPK.RESERVE", [key, "10"], store)
+      assert File.exists?(Path.join(right_dir, "#{safe}.topk"))
+      refute File.exists?(Path.join(wrong_dir, "#{safe}.topk"))
+    end
+
     test "creates a Top-K tracker with custom dimensions" do
       store = MockStore.make()
 

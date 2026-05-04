@@ -23,6 +23,26 @@ defmodule Ferricstore.Commands.CuckooTest do
       assert 1 = Cuckoo.handle("CF.ADD", ["mycf", "test"], store)
     end
 
+    test "uses key-specific probabilistic directory when available" do
+      wrong_dir =
+        Path.join(System.tmp_dir!(), "cuckoo_wrong_prob_#{System.unique_integer([:positive])}")
+
+      right_dir =
+        Path.join(System.tmp_dir!(), "cuckoo_right_prob_#{System.unique_integer([:positive])}")
+
+      key = "key_specific_cuckoo"
+      safe = Base.url_encode64(key, padding: false)
+
+      store =
+        ProbMockStore.make_cuckoo()
+        |> Map.put(:prob_dir, fn -> wrong_dir end)
+        |> Map.put(:prob_dir_for_key, fn ^key -> right_dir end)
+
+      assert :ok = Cuckoo.handle("CF.RESERVE", [key, "1024"], store)
+      assert File.exists?(Path.join(right_dir, "#{safe}.cuckoo"))
+      refute File.exists?(Path.join(wrong_dir, "#{safe}.cuckoo"))
+    end
+
     test "returns error when key already exists" do
       store = ProbMockStore.make_cuckoo()
       assert :ok = Cuckoo.handle("CF.RESERVE", ["mycf", "1024"], store)
