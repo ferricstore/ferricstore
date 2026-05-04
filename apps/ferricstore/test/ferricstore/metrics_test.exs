@@ -210,6 +210,18 @@ defmodule Ferricstore.MetricsTest do
         %{shard_index: 2, status: :ok}
       )
 
+      :telemetry.execute(
+        [:ferricstore, :batcher, :local_apply_waiters],
+        %{depth: 5, oldest_age_ms: 13},
+        %{shard_index: 2}
+      )
+
+      :telemetry.execute(
+        [:ferricstore, :batcher, :local_apply_timeout],
+        %{count: 2},
+        %{shard_index: 2}
+      )
+
       text = Metrics.handle("FERRICSTORE.METRICS", [])
 
       assert String.contains?(text, "# TYPE ferricstore_quorum_submit_total counter")
@@ -242,6 +254,21 @@ defmodule Ferricstore.MetricsTest do
       assert String.contains?(
                text,
                ~s(ferricstore_quorum_bitcask_append_batch_bytes_total{shard_index="2",status="ok"} 42)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_batcher_local_apply_waiters{shard_index="2"} 5)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_batcher_local_apply_waiter_oldest_age_ms{shard_index="2"} 13)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_batcher_local_apply_timeout_total{shard_index="2"} 2)
              )
     end
 

@@ -438,6 +438,12 @@ defmodule Ferricstore.Raft.Batcher do
       GenServer.call(name, {:await_local_applied, ra_index}, timeout_ms)
     catch
       :exit, {:timeout, _} ->
+        :telemetry.execute(
+          [:ferricstore, :batcher, :local_apply_timeout],
+          %{count: 1},
+          %{shard_index: shard_index, ra_index: ra_index, timeout_ms: timeout_ms}
+        )
+
         GenServer.cast(name, {:cancel_await_local_applied, self()})
         {:error, :timeout}
     end
@@ -623,8 +629,7 @@ defmodule Ferricstore.Raft.Batcher do
     if state.last_local_applied >= ra_index do
       {:reply, :ok, state}
     else
-      waiter = {ra_index, :await_caller, [from], :ok}
-      {:noreply, %{state | local_apply_waiters: [waiter | state.local_apply_waiters]}}
+      {:noreply, enqueue_local_apply_waiter(state, ra_index, :await_caller, [from], :ok)}
     end
   end
 
@@ -677,20 +682,23 @@ defmodule Ferricstore.Raft.Batcher do
       _ -> :ok
     end)
 
-    Enum.each(state.local_apply_waiters, fn {_idx, kind, froms, _result} ->
-      do_reply(kind, froms, {:error, :reset}, 0)
+    Enum.each(state.local_apply_waiters, fn waiter ->
+      do_reply(waiter_kind(waiter), waiter_froms(waiter), {:error, :reset}, 0)
     end)
 
     Enum.each(state.flush_waiters, &GenServer.reply(&1, :ok))
 
-    {:reply, :ok,
-     %{
-       state
-       | pending: %{},
-         flush_waiters: [],
-         local_apply_waiters: [],
-         async_local_apply_index: state.last_local_applied
-     }}
+    new_state =
+      %{
+        state
+        | pending: %{},
+          flush_waiters: [],
+          local_apply_waiters: [],
+          async_local_apply_index: state.last_local_applied
+      }
+      |> emit_local_apply_waiters()
+
+    {:reply, :ok, new_state}
   end
 
   @impl true
@@ -716,10 +724,16 @@ defmodule Ferricstore.Raft.Batcher do
     waiters =
       Enum.reject(state.local_apply_waiters, fn
         {_idx, :await_caller, [{pid, _tag}], _result} -> pid == caller_pid
+        {_idx, :await_caller, [{pid, _tag}], _result, _mono} -> pid == caller_pid
         _waiter -> false
       end)
 
-    {:noreply, maybe_reply_flush_waiters(%{state | local_apply_waiters: waiters})}
+    new_state =
+      %{state | local_apply_waiters: waiters}
+      |> emit_local_apply_waiters()
+      |> maybe_reply_flush_waiters()
+
+    {:noreply, new_state}
   end
 
   def handle_cast({:write_batch, cmds, cmd_count, from}, state) do
@@ -924,8 +938,7 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   defp gate_reply(state, ra_index, kind, froms, result) do
-    waiter = {ra_index, kind, froms, result}
-    %{state | local_apply_waiters: [waiter | state.local_apply_waiters]}
+    enqueue_local_apply_waiter(state, ra_index, kind, froms, result)
   end
 
   defp track_async_local_apply(state, ra_index) when is_integer(ra_index) and ra_index > 0 do
@@ -973,12 +986,72 @@ defmodule Ferricstore.Raft.Batcher do
 
   defp drain_local_apply_waiters(%{last_local_applied: lla} = state) do
     {ready, still_waiting} =
-      Enum.split_with(state.local_apply_waiters, fn {idx, _, _, _} -> idx <= lla end)
+      Enum.split_with(state.local_apply_waiters, fn waiter -> waiter_index(waiter) <= lla end)
 
-    Enum.each(ready, fn {idx, kind, froms, result} -> do_reply(kind, froms, result, idx) end)
+    Enum.each(ready, fn waiter ->
+      do_reply(
+        waiter_kind(waiter),
+        waiter_froms(waiter),
+        waiter_result(waiter),
+        waiter_index(waiter)
+      )
+    end)
 
-    %{state | local_apply_waiters: still_waiting}
+    new_state = %{state | local_apply_waiters: still_waiting}
+
+    if ready == [] do
+      new_state
+    else
+      emit_local_apply_waiters(new_state)
+    end
   end
+
+  defp enqueue_local_apply_waiter(state, ra_index, kind, froms, result) do
+    waiter = {ra_index, kind, froms, result, System.monotonic_time()}
+
+    %{state | local_apply_waiters: [waiter | state.local_apply_waiters]}
+    |> emit_local_apply_waiters()
+  end
+
+  defp emit_local_apply_waiters(state, now \\ System.monotonic_time()) do
+    waiters = state.local_apply_waiters
+
+    :telemetry.execute(
+      [:ferricstore, :batcher, :local_apply_waiters],
+      %{depth: length(waiters), oldest_age_ms: oldest_local_apply_waiter_age_ms(waiters, now)},
+      %{shard_index: state.shard_index}
+    )
+
+    state
+  end
+
+  defp oldest_local_apply_waiter_age_ms([], _now), do: 0
+
+  defp oldest_local_apply_waiter_age_ms(waiters, now) do
+    oldest =
+      Enum.reduce(waiters, now, fn waiter, acc ->
+        min(waiter_enqueued_at(waiter), acc)
+      end)
+
+    (now - oldest)
+    |> max(0)
+    |> System.convert_time_unit(:native, :millisecond)
+  end
+
+  defp waiter_index({idx, _kind, _froms, _result}), do: idx
+  defp waiter_index({idx, _kind, _froms, _result, _mono}), do: idx
+
+  defp waiter_kind({_idx, kind, _froms, _result}), do: kind
+  defp waiter_kind({_idx, kind, _froms, _result, _mono}), do: kind
+
+  defp waiter_froms({_idx, _kind, froms, _result}), do: froms
+  defp waiter_froms({_idx, _kind, froms, _result, _mono}), do: froms
+
+  defp waiter_result({_idx, _kind, _froms, result}), do: result
+  defp waiter_result({_idx, _kind, _froms, result, _mono}), do: result
+
+  defp waiter_enqueued_at({_idx, _kind, _froms, _result}), do: System.monotonic_time()
+  defp waiter_enqueued_at({_idx, _kind, _froms, _result, mono}), do: mono
 
   @impl true
   def terminate(_reason, state) do
@@ -1005,8 +1078,8 @@ defmodule Ferricstore.Raft.Batcher do
 
     # Reply to callers whose Ra entry committed but whose local state machine
     # had not caught up before shutdown.
-    Enum.each(state.local_apply_waiters, fn {_idx, _kind, froms, _result} ->
-      Enum.each(froms, fn from ->
+    Enum.each(state.local_apply_waiters, fn waiter ->
+      Enum.each(waiter_froms(waiter), fn from ->
         safe_reply(from, {:error, :batcher_terminated})
       end)
     end)

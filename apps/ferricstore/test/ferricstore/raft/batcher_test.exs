@@ -158,6 +158,37 @@ defmodule Ferricstore.Raft.BatcherTest do
                Batcher.await_local_applied(shard_index, last_local_applied + 1_000, 25)
     end
 
+    test "await_local_applied timeout emits telemetry" do
+      shard_index = 0
+      batcher = Batcher.batcher_name(shard_index)
+      %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
+      target_index = last_local_applied + 1_000
+      handler_id = {:batcher_local_apply_timeout, self(), make_ref()}
+      test_pid = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :batcher, :local_apply_timeout],
+        fn event, measurements, metadata, _config ->
+          send(test_pid, {:batcher_telemetry, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn ->
+        :telemetry.detach(handler_id)
+        send(batcher, {:locally_applied, target_index})
+        Batcher.reset_pending(shard_index)
+      end)
+
+      assert {:error, :timeout} = Batcher.await_local_applied(shard_index, target_index, 25)
+
+      assert_receive {:batcher_telemetry, [:ferricstore, :batcher, :local_apply_timeout],
+                      %{count: 1},
+                      %{shard_index: ^shard_index, ra_index: ^target_index, timeout_ms: 25}},
+                     1_000
+    end
+
     test "local quorum caller is not replied before local apply reaches the raft index" do
       shard_index = 0
       batcher = Batcher.batcher_name(shard_index)
@@ -186,6 +217,58 @@ defmodule Ferricstore.Raft.BatcherTest do
 
       send(batcher, {:locally_applied, ra_index})
       assert_receive {^reply_ref, :ok}, 1_000
+    end
+
+    test "queued local apply waiters emit depth and oldest age telemetry" do
+      shard_index = 0
+      batcher = Batcher.batcher_name(shard_index)
+      %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
+      ra_index = last_local_applied + 1_000
+      corr = make_ref()
+      reply_ref = make_ref()
+      handler_id = {:batcher_local_apply_waiters, self(), make_ref()}
+      test_pid = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :batcher, :local_apply_waiters],
+        fn event, measurements, metadata, _config ->
+          send(test_pid, {:batcher_telemetry, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn ->
+        :telemetry.detach(handler_id)
+        send(batcher, {:locally_applied, ra_index})
+        Batcher.reset_pending(shard_index)
+      end)
+
+      :ok =
+        Batcher.__inject_quorum_pending_at__(
+          shard_index,
+          corr,
+          [{self(), reply_ref}],
+          :single,
+          System.monotonic_time()
+        )
+
+      send(batcher, {:ra_event, :leader, {:applied, [{corr, {:applied_at, ra_index, :ok}}]}})
+
+      assert_receive {:batcher_telemetry, [:ferricstore, :batcher, :local_apply_waiters],
+                      %{depth: 1, oldest_age_ms: oldest_age_ms}, %{shard_index: ^shard_index}},
+                     1_000
+
+      assert is_integer(oldest_age_ms)
+      assert oldest_age_ms >= 0
+      refute_receive {^reply_ref, :ok}, 50
+
+      send(batcher, {:locally_applied, ra_index})
+      assert_receive {^reply_ref, :ok}, 1_000
+
+      assert_receive {:batcher_telemetry, [:ferricstore, :batcher, :local_apply_waiters],
+                      %{depth: 0, oldest_age_ms: 0}, %{shard_index: ^shard_index}},
+                     1_000
     end
 
     test "flush waits for local apply waiters after raft apply drains pending" do

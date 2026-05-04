@@ -15,6 +15,8 @@ defmodule Ferricstore.QuorumMetrics do
   @events [
     [:ferricstore, :batcher, :slot_flush],
     [:ferricstore, :batcher, :quorum_submit],
+    [:ferricstore, :batcher, :local_apply_waiters],
+    [:ferricstore, :batcher, :local_apply_timeout],
     [:ferricstore, :raft, :apply],
     [:ferricstore, :bitcask, :append]
   ]
@@ -46,6 +48,15 @@ defmodule Ferricstore.QuorumMetrics do
     submit_command_bytes_total:
       {"ferricstore_quorum_submit_command_bytes_total", :counter,
        "Total serialized command bytes submitted through the quorum path"},
+    local_apply_waiters:
+      {"ferricstore_batcher_local_apply_waiters", :gauge,
+       "Current number of quorum replies waiting for local Raft apply"},
+    local_apply_waiter_oldest_age_ms:
+      {"ferricstore_batcher_local_apply_waiter_oldest_age_ms", :gauge,
+       "Age in milliseconds of the oldest quorum reply waiting for local Raft apply"},
+    local_apply_timeout_total:
+      {"ferricstore_batcher_local_apply_timeout_total", :counter,
+       "Total timeouts while waiting for local Raft apply"},
     apply_total:
       {"ferricstore_quorum_apply_total", :counter,
        "Total number of Raft state-machine apply calls"},
@@ -134,6 +145,33 @@ defmodule Ferricstore.QuorumMetrics do
     increment(:submit_command_bytes_total, labels, measurement(measurements, :command_bytes))
   end
 
+  def handle_event(
+        [:ferricstore, :batcher, :local_apply_waiters],
+        measurements,
+        metadata,
+        _config
+      ) do
+    labels = [shard_index: shard_label(Map.get(metadata, :shard_index))]
+
+    set_metric(:local_apply_waiters, labels, measurement(measurements, :depth))
+
+    set_metric(
+      :local_apply_waiter_oldest_age_ms,
+      labels,
+      measurement(measurements, :oldest_age_ms)
+    )
+  end
+
+  def handle_event(
+        [:ferricstore, :batcher, :local_apply_timeout],
+        measurements,
+        metadata,
+        _config
+      ) do
+    labels = [shard_index: shard_label(Map.get(metadata, :shard_index))]
+    increment(:local_apply_timeout_total, labels, measurement(measurements, :count))
+  end
+
   def handle_event([:ferricstore, :raft, :apply], measurements, metadata, _config) do
     labels = [
       shard_index: shard_label(Map.get(metadata, :shard_index)),
@@ -219,6 +257,18 @@ defmodule Ferricstore.QuorumMetrics do
 
     try do
       :ets.update_counter(@table, key, {2, amount}, {key, 0})
+      :ok
+    rescue
+      ArgumentError -> :ok
+    end
+  end
+
+  @spec set_metric(metric_id(), labels(), integer()) :: :ok
+  defp set_metric(metric_id, labels, value) do
+    key = {metric_id, labels}
+
+    try do
+      :ets.insert(@table, {key, counter_value(value)})
       :ok
     rescue
       ArgumentError -> :ok
