@@ -869,6 +869,12 @@ defmodule Ferricstore.Store.Promotion do
             :ok
 
           {:error, reason} ->
+            :telemetry.execute(
+              [:ferricstore, :promotion, :compact_temp_cleanup_failed],
+              %{count: 1},
+              %{path: path, name: name, reason: reason}
+            )
+
             Logger.warning(
               "Promotion recovery: failed to remove leftover compact temp file #{name} " <>
                 "at #{path}: #{inspect(reason)}"

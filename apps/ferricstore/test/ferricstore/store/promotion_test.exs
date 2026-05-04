@@ -97,13 +97,34 @@ defmodule Ferricstore.Store.PromotionTest do
     File.mkdir!(Path.join(dedicated_path, "compact_1.log"))
 
     :ets.insert(keydir, {marker_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
+    compact_dir = Path.join(dedicated_path, "compact_1.log")
+    parent = self()
+    handler_id = {:promotion_compact_temp_cleanup_failed, parent, make_ref()}
 
-    log =
-      capture_log(fn ->
-        assert %{} = Promotion.recover_promoted(shard_path, keydir, root, 0)
-      end)
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :promotion, :compact_temp_cleanup_failed],
+      fn event, measurements, metadata, _config ->
+        send(parent, {:compact_temp_cleanup_failed, event, measurements, metadata})
+      end,
+      nil
+    )
 
-    assert log =~ "Promotion recovery: failed to remove leftover compact temp file compact_1.log"
+    try do
+      log =
+        capture_log(fn ->
+          assert %{} = Promotion.recover_promoted(shard_path, keydir, root, 0)
+        end)
+
+      assert log =~ "Promotion recovery: failed to remove leftover compact temp file compact_1.log"
+
+      assert_receive {:compact_temp_cleanup_failed,
+                      [:ferricstore, :promotion, :compact_temp_cleanup_failed], %{count: 1},
+                      %{path: ^compact_dir, name: "compact_1.log", reason: {_kind, _message}}},
+                     1_000
+    after
+      :telemetry.detach(handler_id)
+    end
   end
 
   # Builds a store map backed by the real Router with promotion-aware

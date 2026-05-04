@@ -558,6 +558,12 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
             Logger.warning("Shard: removed leftover compaction temp file #{name}")
 
           {:error, reason} ->
+            :telemetry.execute(
+              [:ferricstore, :shard, :compact_temp_cleanup_failed],
+              %{count: 1},
+              %{path: path, name: name, reason: reason}
+            )
+
             Logger.error(
               "Shard: failed to remove leftover compaction temp file #{name}: #{inspect(reason)}"
             )

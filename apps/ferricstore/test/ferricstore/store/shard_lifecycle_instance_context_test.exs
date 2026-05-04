@@ -94,14 +94,35 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
     File.write!(Path.join(shard_path, "00000.log"), "active")
     compact_dir = Path.join(shard_path, "compact_1.log")
     File.mkdir!(compact_dir)
+    parent = self()
+    handler_id = {:shard_compact_temp_cleanup_failed, parent, make_ref()}
 
-    log =
-      capture_log(fn ->
-        assert {0, 6} = ShardLifecycle.discover_active_file(shard_path)
-      end)
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :shard, :compact_temp_cleanup_failed],
+      fn event, measurements, metadata, _config ->
+        send(parent, {:compact_temp_cleanup_failed, event, measurements, metadata})
+      end,
+      nil
+    )
 
-    assert log =~ "failed to remove leftover compaction temp file compact_1.log"
-    assert File.dir?(compact_dir)
+    try do
+      log =
+        capture_log(fn ->
+          assert {0, 6} = ShardLifecycle.discover_active_file(shard_path)
+        end)
+
+      assert log =~ "failed to remove leftover compaction temp file compact_1.log"
+
+      assert_receive {:compact_temp_cleanup_failed,
+                      [:ferricstore, :shard, :compact_temp_cleanup_failed], %{count: 1},
+                      %{path: ^compact_dir, name: "compact_1.log", reason: {_kind, _message}}},
+                     1_000
+
+      assert File.dir?(compact_dir)
+    after
+      :telemetry.detach(handler_id)
+    end
   end
 
   test "discover_active_file fails closed when shard path cannot be listed" do
