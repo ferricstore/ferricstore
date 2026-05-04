@@ -13,6 +13,8 @@
 #   FLOW_API_BACKLOGS=1000,10000
 #   FLOW_API_CLAIM=10
 #   FLOW_API_CLAIM_SEED=5000
+#   FLOW_API_SHARDS=1
+#   FLOW_API_CASES=create,claim,lifecycle,retry,history
 #   BENCH_WARMUP=1
 #   BENCH_TIME=3
 #   BENCH_PARALLEL=1
@@ -22,6 +24,12 @@ bench_time = System.get_env("BENCH_TIME", "3") |> String.to_integer()
 bench_parallel = System.get_env("BENCH_PARALLEL", "1") |> String.to_integer()
 claim_count = System.get_env("FLOW_API_CLAIM", "10") |> String.to_integer()
 claim_seed = System.get_env("FLOW_API_CLAIM_SEED", "5000") |> String.to_integer()
+shard_count = System.get_env("FLOW_API_SHARDS", "1") |> String.to_integer()
+
+cases =
+  System.get_env("FLOW_API_CASES", "create,claim,lifecycle,retry,history")
+  |> String.split(",", trim: true)
+  |> MapSet.new()
 
 backlogs =
   System.get_env("FLOW_API_BACKLOGS", "1000,10000")
@@ -36,7 +44,7 @@ File.mkdir_p!(bench_data_dir)
 Application.put_env(:ferricstore, :data_dir, bench_data_dir)
 Application.put_env(:ferricstore, :port, 0)
 Application.put_env(:ferricstore, :health_port, 0)
-Application.put_env(:ferricstore, :shard_count, 1)
+Application.put_env(:ferricstore, :shard_count, shard_count)
 Application.put_env(:ferricstore, :hot_cache_max_value_size, 512)
 
 {:ok, _} = Application.ensure_all_started(:ferricstore)
@@ -45,7 +53,7 @@ IO.puts("=== FerricStore Native Flow API Bench ===")
 IO.puts("Data dir: #{bench_data_dir}")
 
 IO.puts(
-  "backlogs=#{Enum.join(backlogs, ",")} claim=#{claim_count} claim_seed=#{claim_seed} warmup=#{bench_warmup}s time=#{bench_time}s parallel=#{bench_parallel}\n"
+  "backlogs=#{Enum.join(backlogs, ",")} claim=#{claim_count} claim_seed=#{claim_seed} shards=#{shard_count} cases=#{Enum.join(cases, ",")} warmup=#{bench_warmup}s time=#{bench_time}s parallel=#{bench_parallel}\n"
 )
 
 defmodule FlowApiBench do
@@ -156,6 +164,10 @@ defmodule FlowApiBench do
   def short(list) when is_list(list), do: length(list)
   def short(%{id: id, state: state}), do: %{id: id, state: state}
   def short(other), do: other
+
+  def maybe_put_bench(benches, cases, case_name, label, fun) do
+    if MapSet.member?(cases, case_name), do: Map.put(benches, label, fun), else: benches
+  end
 end
 
 try do
@@ -184,29 +196,51 @@ try do
       FlowApiBench.seed_due(prefix <> ":claim", claim_type, claim_seed)
     end)
 
-    Benchee.run(
-      %{
-        "flow_api create backlog=#{backlog}" => fn ->
-          flow = FlowApiBench.create(prefix <> ":create", create_type, create_counter)
-          true = flow.state == "queued"
-        end,
-        "flow_api claim_due#{claim_count} backlog=#{backlog}" => fn ->
+    benches =
+      %{}
+      |> FlowApiBench.maybe_put_bench(cases, "create", "flow_api create backlog=#{backlog}", fn ->
+        flow = FlowApiBench.create(prefix <> ":create", create_type, create_counter)
+        true = flow.state == "queued"
+      end)
+      |> FlowApiBench.maybe_put_bench(
+        cases,
+        "claim",
+        "flow_api claim_due#{claim_count} backlog=#{backlog}",
+        fn ->
           claimed = FlowApiBench.claim_due(claim_type, claim_count, claim_counter)
-          true = length(claimed) <= claim_count
-        end,
-        "flow_api lifecycle create-claim-complete backlog=#{backlog}" => fn ->
+          true = length(claimed) == claim_count
+        end
+      )
+      |> FlowApiBench.maybe_put_bench(
+        cases,
+        "lifecycle",
+        "flow_api lifecycle create-claim-complete backlog=#{backlog}",
+        fn ->
           flow = FlowApiBench.lifecycle(prefix <> ":life", lifecycle_type, lifecycle_counter)
           true = flow.state == "completed"
-        end,
-        "flow_api retry cycle backlog=#{backlog}" => fn ->
+        end
+      )
+      |> FlowApiBench.maybe_put_bench(
+        cases,
+        "retry",
+        "flow_api retry cycle backlog=#{backlog}",
+        fn ->
           flow = FlowApiBench.retry_cycle(prefix <> ":retry", retry_type, retry_counter)
           true = flow.state == "queued"
-        end,
-        "flow_api lifecycle+history backlog=#{backlog}" => fn ->
+        end
+      )
+      |> FlowApiBench.maybe_put_bench(
+        cases,
+        "history",
+        "flow_api lifecycle+history backlog=#{backlog}",
+        fn ->
           events = FlowApiBench.history_read(prefix <> ":history", history_type, history_counter)
           true = length(events) == 3
         end
-      },
+      )
+
+    Benchee.run(
+      benches,
       warmup: bench_warmup,
       time: bench_time,
       parallel: bench_parallel,
