@@ -904,7 +904,7 @@ defmodule Ferricstore.Store.Router do
 
         case read_cold_async(path, offset, key) do
           {:ok, value} when is_binary(value) ->
-            warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
+            warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
             {:hit, value, exp}
 
           _ ->
@@ -1883,7 +1883,7 @@ defmodule Ferricstore.Store.Router do
           {:ok, value} when is_binary(value) ->
             Stats.record_cold_read(ctx, key)
             # Warm ETS: promote back to hot if value fits in cache
-            warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
+            warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
             value
 
           _ ->
@@ -1897,7 +1897,17 @@ defmodule Ferricstore.Store.Router do
                  ) do
               {:cold, value, retry_file_id, retry_offset} ->
                 Stats.record_cold_read(ctx, key)
-                warm_ets_after_cold_read(ctx, keydir, key, value, retry_file_id, retry_offset)
+
+                warm_ets_after_cold_read(
+                  ctx,
+                  idx,
+                  keydir,
+                  key,
+                  value,
+                  retry_file_id,
+                  retry_offset
+                )
+
                 value
 
               {:hot, value} ->
@@ -2093,17 +2103,17 @@ defmodule Ferricstore.Store.Router do
     emit_batch_cold_read_corruption(corrupt_by_path)
 
     Enum.map(entry_values, fn
-      {{ctx, _idx, keydir, key, _path, file_id, offset, _value_size}, value}
+      {{ctx, idx, keydir, key, _path, file_id, offset, _value_size}, value}
       when is_binary(value) ->
         Stats.record_cold_read(ctx, key)
-        warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
+        warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
         value
 
       {{ctx, idx, keydir, key, _path, file_id, offset, value_size}, _value} ->
         case retry_changed_cold_value(ctx, idx, keydir, key, {file_id, offset, value_size}, now) do
           {:cold, value, retry_file_id, retry_offset} ->
             Stats.record_cold_read(ctx, key)
-            warm_ets_after_cold_read(ctx, keydir, key, value, retry_file_id, retry_offset)
+            warm_ets_after_cold_read(ctx, idx, keydir, key, value, retry_file_id, retry_offset)
             value
 
           {:hot, value} ->
@@ -2281,7 +2291,7 @@ defmodule Ferricstore.Store.Router do
         case read_cold_async(path, offset, key) do
           {:ok, value} when is_binary(value) ->
             Stats.record_cold_read(ctx, key)
-            warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
+            warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
             {value, expire_at_ms}
 
           _ ->
@@ -2295,7 +2305,17 @@ defmodule Ferricstore.Store.Router do
                  ) do
               {:cold, value, retry_expire_at_ms, retry_file_id, retry_offset} ->
                 Stats.record_cold_read(ctx, key)
-                warm_ets_after_cold_read(ctx, keydir, key, value, retry_file_id, retry_offset)
+
+                warm_ets_after_cold_read(
+                  ctx,
+                  idx,
+                  keydir,
+                  key,
+                  value,
+                  retry_file_id,
+                  retry_offset
+                )
+
                 {value, retry_expire_at_ms}
 
               {:hot, value, retry_expire_at_ms} ->
@@ -2468,6 +2488,11 @@ defmodule Ferricstore.Store.Router do
   # write_concurrency so this is safe from any process.
   @doc false
   def warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset) do
+    warm_ets_after_cold_read(ctx, keydir_index(ctx, keydir), keydir, key, value, file_id, offset)
+  end
+
+  @doc false
+  def warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset) do
     # Skip promotion when under memory pressure — prevents evict/re-promote
     # thrashing where MemoryGuard evicts values and cold reads immediately
     # re-cache them. skip_promotion? is set at :pressure level (85%+).
@@ -2477,13 +2502,18 @@ defmodule Ferricstore.Store.Router do
       lfu = LFU.initial()
 
       try do
-        :ets.select_replace(keydir, [
-          {
-            {key, nil, :"$1", :"$2", file_id, offset, :"$3"},
-            [],
-            [{{key, value, :"$1", lfu, file_id, offset, :"$3"}}]
-          }
-        ])
+        replaced =
+          :ets.select_replace(keydir, [
+            {
+              {key, nil, :"$1", :"$2", file_id, offset, :"$3"},
+              [],
+              [{{key, value, :"$1", lfu, file_id, offset, :"$3"}}]
+            }
+          ])
+
+        if replaced > 0 do
+          track_keydir_binary_warm(ctx, idx, value)
+        end
 
         :ok
       rescue
@@ -2491,6 +2521,24 @@ defmodule Ferricstore.Store.Router do
       end
     end
   end
+
+  defp keydir_index(%{keydir_refs: refs, shard_count: count}, keydir)
+       when is_tuple(refs) and is_integer(count) and count > 0 do
+    Enum.find(0..(count - 1), fn idx -> elem(refs, idx) == keydir end)
+  end
+
+  defp keydir_index(_ctx, _keydir), do: nil
+
+  defp track_keydir_binary_warm(%{keydir_binary_bytes: ref}, idx, value)
+       when is_integer(idx) do
+    bytes = offheap_size(value)
+
+    if bytes > 0 and idx >= 0 and idx < :atomics.info(ref).size do
+      :atomics.add(ref, idx + 1, bytes)
+    end
+  end
+
+  defp track_keydir_binary_warm(_ctx, _idx, _value), do: :ok
 
   @max_key_size 65_535
   @max_value_size 512 * 1024 * 1024
@@ -3994,7 +4042,7 @@ defmodule Ferricstore.Store.Router do
 
         case read_cold_async(path, offset, compound_key) do
           {:ok, value} when is_binary(value) ->
-            warm_ets_after_cold_read(ctx, keydir, compound_key, value, file_id, offset)
+            warm_ets_after_cold_read(ctx, idx, keydir, compound_key, value, file_id, offset)
             value
 
           _ ->
