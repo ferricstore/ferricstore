@@ -159,6 +159,32 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
     assert_unavailable_event(:compound_count)
   end
 
+  test "custom compound writes return errors and report unavailable shards" do
+    ctx = unavailable_ctx()
+    redis_key = "restart:compound_write"
+    compound_key = "H:" <> redis_key <> <<0>> <> "field"
+    handler_id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :store, :shard_unavailable],
+        &__MODULE__.handle_telemetry/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert {:error, "ERR shard not available"} ==
+             Router.compound_put(ctx, redis_key, compound_key, "value", 0)
+
+    assert {:error, "ERR shard not available"} ==
+             Router.compound_delete(ctx, redis_key, compound_key)
+
+    assert_unavailable_event(:compound_put)
+    assert_unavailable_event(:compound_delete)
+  end
+
   def handle_telemetry(event, measurements, metadata, parent) do
     send(parent, {:telemetry_event, event, measurements, metadata})
   end

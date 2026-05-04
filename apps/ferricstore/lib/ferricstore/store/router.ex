@@ -63,6 +63,22 @@ defmodule Ferricstore.Store.Router do
       :unavailable
   end
 
+  defp safe_write_call(ctx, idx, request) do
+    GenServer.call(resolve_shard(ctx, idx), request)
+  catch
+    :exit, {:noproc, _} ->
+      emit_shard_unavailable(ctx, idx, request, :noproc)
+      {:error, "ERR shard not available"}
+
+    :exit, {:timeout, _} ->
+      emit_shard_unavailable(ctx, idx, request, :timeout)
+      ErrorReasons.write_timeout_unknown()
+
+    :exit, _reason ->
+      emit_shard_unavailable(ctx, idx, request, :exit)
+      {:error, "ERR shard not available"}
+  end
+
   defp emit_shard_unavailable(ctx, idx, request, reason) do
     :telemetry.execute(
       [:ferricstore, :store, :shard_unavailable],
@@ -3582,10 +3598,7 @@ defmodule Ferricstore.Store.Router do
           async_compound_put(ctx, idx, redis_key, compound_key, value, expire_at_ms)
       end
     else
-      GenServer.call(
-        elem(ctx.shard_names, idx),
-        {:compound_put, redis_key, compound_key, value, expire_at_ms}
-      )
+      safe_write_call(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
     end
   end
 
@@ -3602,7 +3615,7 @@ defmodule Ferricstore.Store.Router do
           async_compound_delete(ctx, idx, compound_key)
       end
     else
-      GenServer.call(elem(ctx.shard_names, idx), {:compound_delete, redis_key, compound_key})
+      safe_write_call(ctx, idx, {:compound_delete, redis_key, compound_key})
     end
   end
 
