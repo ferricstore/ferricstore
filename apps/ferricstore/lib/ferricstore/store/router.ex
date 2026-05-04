@@ -300,6 +300,10 @@ defmodule Ferricstore.Store.Router do
   def always_quorum?({:topk_create, _, _, _, _, _}), do: true
   def always_quorum?({:topk_add, _, _}), do: true
   def always_quorum?({:topk_incrby, _, _}), do: true
+  def always_quorum?({:flow_create, _, _}), do: true
+  def always_quorum?({:flow_claim_due, _, _}), do: true
+  def always_quorum?({:flow_complete, _, _}), do: true
+  def always_quorum?({:flow_retry, _, _}), do: true
   def always_quorum?(_), do: false
 
   # NOTE: json/bitmap/geo/hll/tdigest ops route through async_write →
@@ -3102,6 +3106,55 @@ defmodule Ferricstore.Store.Router do
           {:error, _} = err ->
             err
         end
+    end
+  end
+
+  @doc false
+  def flow_create(ctx, %{id: id} = attrs) when is_binary(id) do
+    key = Ferricstore.Flow.Keys.state_key(id)
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_create, key, attrs})
+    end
+  end
+
+  @doc false
+  def flow_claim_due(ctx, %{type: type, state: state, priority: priority} = attrs)
+      when is_binary(type) and is_binary(state) and is_integer(priority) do
+    key = Ferricstore.Flow.Keys.due_key(type, state, priority)
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_claim_due, key, attrs})
+    end
+  end
+
+  @doc false
+  def flow_complete(ctx, %{id: id} = attrs) when is_binary(id) do
+    key = Ferricstore.Flow.Keys.state_key(id)
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_complete, key, attrs})
+    end
+  end
+
+  @doc false
+  def flow_retry(ctx, %{id: id} = attrs) when is_binary(id) do
+    key = Ferricstore.Flow.Keys.state_key(id)
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_retry, key, attrs})
     end
   end
 

@@ -354,6 +354,143 @@ defmodule FerricStore do
   end
 
   @doc """
+  Creates a durable Flow record.
+
+  Required option: `:type`.
+  Common options: `:state`, `:payload_ref`, `:run_at_ms`, `:priority`.
+  """
+  @spec flow_create(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_create(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.create(default_ctx(), id, opts)
+  end
+
+  def flow_create(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_create(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Returns the latest Flow state record for `id`."
+  @spec flow_get(binary()) :: {:ok, map() | nil} | {:error, binary()}
+  def flow_get(id) when is_binary(id), do: Ferricstore.Flow.get(default_ctx(), id)
+
+  def flow_get(_id), do: {:error, "ERR flow id must be a non-empty string"}
+
+  @doc """
+  Claims due Flow records for a type.
+
+  Required option: `:worker`.
+  Common options: `:state`, `:lease_ms`, `:limit`, `:priority`, `:now_ms`.
+  """
+  @spec flow_claim_due(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_claim_due(type, opts) when is_binary(type) and is_list(opts) do
+    Ferricstore.Flow.claim_due(default_ctx(), type, opts)
+  end
+
+  def flow_claim_due(type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def flow_claim_due(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Completes a claimed Flow record when `lease_token` matches."
+  @spec flow_complete(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_complete(id, lease_token, opts \\ [])
+
+  def flow_complete(id, lease_token, opts)
+      when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    Ferricstore.Flow.complete(default_ctx(), id, lease_token, opts)
+  end
+
+  def flow_complete(id, _lease_token, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_complete(_id, lease_token, _opts) when not is_binary(lease_token),
+    do: {:error, "ERR flow lease_token must be a string"}
+
+  def flow_complete(_id, _lease_token, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Clears a claim and reschedules a Flow record when `lease_token` matches."
+  @spec flow_retry(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_retry(id, lease_token, opts)
+      when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    Ferricstore.Flow.retry(default_ctx(), id, lease_token, opts)
+  end
+
+  def flow_retry(id, _lease_token, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_retry(_id, lease_token, _opts) when not is_binary(lease_token),
+    do: {:error, "ERR flow lease_token must be a string"}
+
+  def flow_retry(_id, _lease_token, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Returns Flow history events for `id`."
+  @spec flow_history(binary(), keyword()) :: {:ok, [{binary(), map()}]} | {:error, binary()}
+  def flow_history(id, opts \\ [])
+
+  def flow_history(id, opts) when is_binary(id) and is_list(opts) do
+    history_key = Ferricstore.Flow.Keys.history_key(id)
+
+    with :ok <- flow_validate_opts(opts),
+         :ok <- flow_validate_id(id),
+         :ok <- flow_validate_key_size(history_key),
+         {:ok, count} <- flow_history_count(opts) do
+      case xrange(history_key, "-", "+", count: count) do
+        {:ok, entries} ->
+          {:ok, Enum.map(entries, &flow_history_entry_to_tuple/1)}
+
+        {:error, _} = error ->
+          error
+      end
+    end
+  end
+
+  def flow_history(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_history(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  defp flow_history_entry_to_tuple({event_id, fields}) when is_list(fields) do
+    {event_id, flow_fields_to_map(fields)}
+  end
+
+  defp flow_history_entry_to_tuple([event_id | fields]) when is_list(fields) do
+    {event_id, flow_fields_to_map(fields)}
+  end
+
+  defp flow_fields_to_map(fields) when is_list(fields) do
+    fields
+    |> Enum.chunk_every(2)
+    |> Map.new(fn [key, value] -> {key, value} end)
+  end
+
+  defp flow_validate_opts(opts) do
+    if Keyword.keyword?(opts) do
+      :ok
+    else
+      {:error, "ERR flow opts must be a keyword list"}
+    end
+  end
+
+  defp flow_validate_id(id) when is_binary(id) and id != "", do: :ok
+  defp flow_validate_id(_id), do: {:error, "ERR flow id must be a non-empty string"}
+
+  defp flow_validate_key_size(key) do
+    if byte_size(key) <= Router.max_key_size() do
+      :ok
+    else
+      {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+    end
+  end
+
+  defp flow_history_count(opts) do
+    case Keyword.get(opts, :count, 100) do
+      value when is_integer(value) and value > 0 -> {:ok, value}
+      _ -> {:error, "ERR flow count must be a positive integer"}
+    end
+  end
+
+  @doc """
   Deletes one or more keys from the store.
 
   Accepts a single key or a list of keys. Returns `{:ok, count}` where

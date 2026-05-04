@@ -72,6 +72,8 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.CommandTime
   alias Ferricstore.Commands.Dispatcher
+  alias Ferricstore.Flow
+  alias Ferricstore.Flow.Keys, as: FlowKeys
   alias Ferricstore.HLC
 
   alias Ferricstore.Store.{
@@ -855,6 +857,24 @@ defmodule Ferricstore.Raft.StateMachine do
       path = prob_path(state, key, "topk")
       NIF.topk_file_incrby_v2(path, pairs)
     end)
+  end
+
+  # -- Flow --
+
+  def apply(meta, {:flow_create, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_create(state, attrs) end)
+  end
+
+  def apply(meta, {:flow_claim_due, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_claim_due(state, attrs) end)
+  end
+
+  def apply(meta, {:flow_complete, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_complete(state, attrs) end)
+  end
+
+  def apply(meta, {:flow_retry, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_retry(state, attrs) end)
   end
 
   # ---------------------------------------------------------------------------
@@ -2870,6 +2890,22 @@ defmodule Ferricstore.Raft.StateMachine do
     do_ratelimit_add(state, key, window_ms, max, count, now_ms)
   end
 
+  defp apply_single(state, {:flow_create, _key, attrs}) do
+    do_flow_create(state, attrs)
+  end
+
+  defp apply_single(state, {:flow_claim_due, _key, attrs}) do
+    do_flow_claim_due(state, attrs)
+  end
+
+  defp apply_single(state, {:flow_complete, _key, attrs}) do
+    do_flow_complete(state, attrs)
+  end
+
+  defp apply_single(state, {:flow_retry, _key, attrs}) do
+    do_flow_retry(state, attrs)
+  end
+
   # -- Probabilistic data structure commands in batch/cross_shard_tx --
 
   defp apply_single(state, {:bloom_create, key, num_bits, num_hashes, prob_meta}) do
@@ -3696,6 +3732,283 @@ defmodule Ferricstore.Raft.StateMachine do
       Process.delete(:sm_pending_values)
     end
   end
+
+  defp do_flow_create(state, %{id: id, type: type, state: flow_state} = attrs) do
+    state_key = FlowKeys.state_key(id)
+
+    case flow_read_record(state, id) do
+      nil ->
+        now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+        run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
+        priority = Map.get(attrs, :priority, 0)
+
+        record = %{
+          id: id,
+          type: type,
+          state: flow_state,
+          version: 1,
+          attempts: 0,
+          created_at_ms: now_ms,
+          updated_at_ms: now_ms,
+          next_run_at_ms: run_at_ms,
+          priority: priority,
+          payload_ref: Map.get(attrs, :payload_ref),
+          result_ref: nil,
+          error_ref: nil,
+          lease_owner: nil,
+          lease_token: nil,
+          lease_deadline_ms: 0
+        }
+
+        with :ok <- do_put(state, state_key, flow_encode(record), 0),
+             :ok <- flow_due_put(state, record),
+             :ok <- flow_history_put(state, record, "created", now_ms) do
+          {:ok, record}
+        end
+
+      _existing ->
+        {:error, "ERR flow already exists"}
+    end
+  end
+
+  defp do_flow_claim_due(
+         state,
+         %{
+           type: type,
+           state: expected_state,
+           worker: worker,
+           lease_ms: lease_ms,
+           limit: limit,
+           priority: priority,
+           now_ms: now_ms
+         }
+       ) do
+    due_key = FlowKeys.due_key(type, expected_state, priority)
+    flow_ensure_due_index_ready(state, due_key)
+
+    claimed =
+      state.zset_score_index_name
+      |> ZSetIndex.range_slice(due_key, :neg_inf, {:inclusive, now_ms * 1.0}, false, 0, limit)
+      |> Enum.reduce([], fn {id, _score}, acc ->
+        case flow_claim_candidate(state, due_key, id, expected_state, worker, lease_ms, now_ms) do
+          {:ok, record} -> [record | acc]
+          :skip -> acc
+        end
+      end)
+      |> Enum.reverse()
+
+    {:ok, claimed}
+  end
+
+  defp do_flow_complete(state, %{id: id, lease_token: lease_token} = attrs) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+
+    with {:ok, record} <- flow_require_record(state, id),
+         :ok <- flow_require_running_lease(record, lease_token) do
+      next =
+        record
+        |> Map.merge(%{
+          state: "completed",
+          version: Map.fetch!(record, :version) + 1,
+          updated_at_ms: now_ms,
+          result_ref: Map.get(attrs, :result_ref),
+          lease_owner: nil,
+          lease_token: nil,
+          lease_deadline_ms: 0,
+          next_run_at_ms: nil
+        })
+
+      with :ok <- flow_due_delete(state, record),
+           :ok <- do_put(state, FlowKeys.state_key(id), flow_encode(next), 0),
+           :ok <- flow_history_put(state, next, "completed", now_ms) do
+        {:ok, next}
+      end
+    end
+  end
+
+  defp do_flow_retry(state, %{id: id, lease_token: lease_token, run_at_ms: run_at_ms} = attrs) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+
+    with {:ok, record} <- flow_require_record(state, id),
+         :ok <- flow_require_running_lease(record, lease_token) do
+      next =
+        record
+        |> Map.merge(%{
+          state: "queued",
+          version: Map.fetch!(record, :version) + 1,
+          attempts: Map.get(record, :attempts, 0) + 1,
+          updated_at_ms: now_ms,
+          next_run_at_ms: run_at_ms,
+          error_ref: Map.get(attrs, :error_ref),
+          lease_owner: nil,
+          lease_token: nil,
+          lease_deadline_ms: 0
+        })
+
+      with :ok <- flow_due_delete(state, record),
+           :ok <- do_put(state, FlowKeys.state_key(id), flow_encode(next), 0),
+           :ok <- flow_due_put(state, next),
+           :ok <- flow_history_put(state, next, "retry", now_ms) do
+        {:ok, next}
+      end
+    end
+  end
+
+  defp flow_claim_candidate(state, due_key, id, expected_state, worker, lease_ms, now_ms) do
+    case flow_read_record(state, id) do
+      nil ->
+        flow_due_delete_from_key(state, due_key, id)
+        :skip
+
+      %{state: ^expected_state} = record ->
+        next_version = Map.fetch!(record, :version) + 1
+        deadline_ms = now_ms + lease_ms
+
+        token =
+          worker <> ":" <> Integer.to_string(now_ms) <> ":" <> Integer.to_string(next_version)
+
+        next =
+          record
+          |> Map.merge(%{
+            state: "running",
+            version: next_version,
+            updated_at_ms: now_ms,
+            lease_owner: worker,
+            lease_token: token,
+            lease_deadline_ms: deadline_ms,
+            next_run_at_ms: deadline_ms
+          })
+
+        with :ok <- flow_due_delete_from_key(state, due_key, id),
+             :ok <- do_put(state, FlowKeys.state_key(id), flow_encode(next), 0),
+             :ok <- flow_due_put(state, next),
+             :ok <- flow_history_put(state, next, "claimed", now_ms) do
+          {:ok, next}
+        else
+          _ -> :skip
+        end
+
+      _record ->
+        flow_due_delete_from_key(state, due_key, id)
+        :skip
+    end
+  end
+
+  defp flow_require_record(state, id) do
+    case flow_read_record(state, id) do
+      nil -> {:error, "ERR flow not found"}
+      record -> {:ok, record}
+    end
+  end
+
+  defp flow_require_running_lease(%{state: "running", lease_token: token}, token), do: :ok
+  defp flow_require_running_lease(_record, _token), do: {:error, "ERR stale flow lease"}
+
+  defp flow_read_record(state, id) do
+    case ets_lookup(state, FlowKeys.state_key(id)) do
+      {:hit, value, _expire_at_ms} when is_binary(value) ->
+        try do
+          Flow.decode_record(value)
+        rescue
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp flow_due_put(state, %{next_run_at_ms: nil}), do: flow_ensure_due_type(state, nil)
+
+  defp flow_due_put(state, %{type: type, state: flow_state, priority: priority, id: id} = record) do
+    due_key = FlowKeys.due_key(type, flow_state, priority)
+    score_str = Float.to_string(Map.fetch!(record, :next_run_at_ms) * 1.0)
+    compound_key = CompoundKey.zset_member(due_key, id)
+
+    with :ok <- flow_ensure_due_type(state, due_key),
+         :ok <- do_put(state, compound_key, score_str, 0) do
+      flow_zset_put(state, due_key, id, score_str)
+    end
+  end
+
+  defp flow_due_delete(state, %{type: type, state: flow_state, priority: priority, id: id}) do
+    flow_due_delete_by_values(state, id, type, flow_state, priority)
+  end
+
+  defp flow_due_delete_by_values(_state, _id, nil, _flow_state, _priority), do: :ok
+
+  defp flow_due_delete_by_values(state, id, type, flow_state, priority) do
+    due_key = FlowKeys.due_key(type, flow_state, priority)
+    flow_due_delete_from_key(state, due_key, id)
+  end
+
+  defp flow_due_delete_from_key(state, due_key, id) do
+    compound_key = CompoundKey.zset_member(due_key, id)
+
+    with :ok <- do_delete(state, compound_key) do
+      flow_zset_delete(state, due_key, id)
+    end
+  end
+
+  defp flow_ensure_due_type(_state, nil), do: :ok
+
+  defp flow_ensure_due_type(state, due_key) do
+    do_put(state, CompoundKey.type_key(due_key), CompoundKey.encode_type(:zset), 0)
+  end
+
+  defp flow_ensure_due_index_ready(
+         %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+         due_key
+       )
+       when lookup != nil and index != nil do
+    if :ets.whereis(lookup) != :undefined and :ets.whereis(index) != :undefined do
+      :ets.insert_new(lookup, {{:count, due_key}, 0})
+      :ets.insert(lookup, {{:ready, due_key}, true})
+    end
+
+    :ok
+  end
+
+  defp flow_zset_put(
+         %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+         due_key,
+         id,
+         score_str
+       )
+       when lookup != nil and index != nil do
+    flow_ensure_due_index_ready(
+      %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+      due_key
+    )
+
+    ZSetIndex.put_member(index, lookup, due_key, id, score_str)
+  end
+
+  defp flow_zset_delete(
+         %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+         due_key,
+         id
+       )
+       when lookup != nil and index != nil do
+    ZSetIndex.delete_member(index, lookup, due_key, id)
+  end
+
+  defp flow_history_put(state, %{id: id, version: version}, event, now_ms) do
+    event_id = Integer.to_string(now_ms) <> "-" <> Integer.to_string(version)
+
+    fields = [
+      "event",
+      event,
+      "version",
+      Integer.to_string(version),
+      "at",
+      Integer.to_string(now_ms)
+    ]
+
+    do_put(state, FlowKeys.stream_entry_key(id, event_id), :erlang.term_to_binary(fields), 0)
+  end
+
+  defp flow_encode(record), do: :erlang.term_to_binary(record)
 
   defp do_put(state, key, value, expire_at_ms) do
     maybe_clear_compound_data_structure_for_string_put(state, key)
