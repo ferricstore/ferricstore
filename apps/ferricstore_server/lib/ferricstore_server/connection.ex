@@ -67,6 +67,7 @@ defmodule FerricstoreServer.Connection do
   alias FerricstoreServer.Connection.Blocking, as: ConnBlocking
   alias FerricstoreServer.Connection.Pipeline, as: ConnPipeline
   alias FerricstoreServer.Connection.PubSub, as: ConnPubSub
+  alias FerricstoreServer.Connection.Send, as: ConnSend
   alias FerricstoreServer.Connection.Sendfile, as: ConnSendfile
   alias FerricstoreServer.Connection.Store, as: ConnStore
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
@@ -167,8 +168,8 @@ defmodule FerricstoreServer.Connection do
       error_msg =
         Encoder.encode({:error, "ERR TLS required: plaintext connections are not permitted"})
 
-      # transport.send accepts iodata directly; no need to flatten to binary.
-      transport.send(socket, error_msg)
+      # Transport accepts iodata directly; no need to flatten to binary.
+      ConnSend.send(socket, transport, error_msg, :tls_required)
       transport.close(socket)
     else
       # active: N delivers N TCP messages before the socket goes passive,
@@ -192,8 +193,8 @@ defmodule FerricstoreServer.Connection do
       case FerricstoreServer.Acl.check_protected_mode(peer) do
         {:error, reason} ->
           error_msg = Encoder.encode({:error, reason})
-          # transport.send accepts iodata directly; no need to flatten to binary.
-          transport.send(socket, error_msg)
+          # Transport accepts iodata directly; no need to flatten to binary.
+          ConnSend.send(socket, transport, error_msg, :protected_mode)
           Stats.decr_connections()
           transport.close(socket)
 
@@ -284,8 +285,10 @@ defmodule FerricstoreServer.Connection do
         transport.close(socket)
 
       {:tracking_invalidation, iodata, _keys} ->
-        transport.send(socket, iodata)
-        loop(state)
+        case send_tracked(state, iodata, :tracking_invalidation) do
+          :ok -> loop(state)
+          {:error, _reason} -> :ok
+        end
 
       {:acl_invalidate, username} ->
         loop(ConnAuth.maybe_refresh_acl_cache(state, username))
@@ -873,9 +876,21 @@ defmodule FerricstoreServer.Connection do
   # ---------------------------------------------------------------------------
 
   defp send_response(socket, transport, iodata) do
-    case transport.send(socket, iodata) do
-      :ok -> :ok
-      {:error, _} -> :ok
+    _ = ConnSend.send(socket, transport, iodata, :response)
+    :ok
+  end
+
+  defp send_tracked(%__MODULE__{socket: socket, transport: transport} = state, iodata, phase) do
+    metadata = %{client_id: state.client_id}
+
+    case ConnSend.send(socket, transport, iodata, phase, metadata) do
+      :ok ->
+        :ok
+
+      {:error, _reason} = error ->
+        cleanup_connection(state)
+        transport.close(socket)
+        error
     end
   end
 
@@ -923,17 +938,25 @@ defmodule FerricstoreServer.Connection do
 
       {:pubsub_message, channel, message} ->
         push = {:push, ["message", channel, message]}
-        transport.send(socket, Encoder.encode(push))
-        pubsub_loop(state)
+
+        case send_tracked(state, Encoder.encode(push), :pubsub_message) do
+          :ok -> pubsub_loop(state)
+          {:error, _reason} -> :ok
+        end
 
       {:pubsub_pmessage, pattern, channel, message} ->
         push = {:push, ["pmessage", pattern, channel, message]}
-        transport.send(socket, Encoder.encode(push))
-        pubsub_loop(state)
+
+        case send_tracked(state, Encoder.encode(push), :pubsub_pmessage) do
+          :ok -> pubsub_loop(state)
+          {:error, _reason} -> :ok
+        end
 
       {:tracking_invalidation, iodata, _keys} ->
-        transport.send(socket, iodata)
-        pubsub_loop(state)
+        case send_tracked(state, iodata, :tracking_invalidation) do
+          :ok -> pubsub_loop(state)
+          {:error, _reason} -> :ok
+        end
 
       {:acl_invalidate, username} ->
         pubsub_loop(ConnAuth.maybe_refresh_acl_cache(state, username))
