@@ -780,56 +780,7 @@ defmodule FerricStore.Impl do
   def flushdb(ctx) do
     Ferricstore.Store.Ops.flush(ctx)
 
-    # Clean prob dirs across all shards. Fsync each prob dir after the
-    # rm loop so the removals survive a crash.
-    Enum.reduce_while(0..(ctx.shard_count - 1), :ok, fn i, :ok ->
-      shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, i)
-      prob_dir = Path.join(shard_path, "prob")
-
-      case clear_prob_dir(prob_dir) do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp clear_prob_dir(prob_dir) do
-    case Ferricstore.FS.ls(prob_dir) do
-      {:ok, []} ->
-        :ok
-
-      {:ok, files} ->
-        with :ok <- delete_prob_files(prob_dir, files),
-             :ok <- prob_fsync_dir(prob_dir, :flush_prob_dir) do
-          :ok
-        end
-
-      {:error, _reason} ->
-        :ok
-    end
-  end
-
-  defp delete_prob_files(prob_dir, files) do
-    Enum.reduce_while(files, :ok, fn file, :ok ->
-      case Ferricstore.FS.rm(Path.join(prob_dir, file)) do
-        :ok -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, {:delete_prob_file_failed, file, reason}}}
-      end
-    end)
-  end
-
-  defp prob_fsync_dir(path, phase) do
-    case prob_fsync_dir_result(path) do
-      :ok -> :ok
-      {:error, reason} -> {:error, {:fsync_dir_failed, phase, reason}}
-    end
-  end
-
-  defp prob_fsync_dir_result(path) do
-    case Process.get(:ferricstore_prob_command_fsync_dir_hook) do
-      fun when is_function(fun, 1) -> fun.(path)
-      _ -> Ferricstore.Bitcask.NIF.v2_fsync_dir(path)
-    end
+    Ferricstore.ProbCleanup.flush_all(ctx.data_dir, ctx.shard_count)
   end
 
   # ---------------------------------------------------------------

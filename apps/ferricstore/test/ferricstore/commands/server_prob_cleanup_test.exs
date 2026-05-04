@@ -41,4 +41,25 @@ defmodule Ferricstore.Commands.ServerProbCleanupTest do
 
     assert Ferricstore.FS.exists?(prob_dir)
   end
+
+  test "FLUSHDB surfaces probabilistic directory listing failures", %{prob_dir: prob_dir} do
+    Process.delete(:ferricstore_prob_command_fsync_dir_hook)
+    File.rm_rf!(prob_dir)
+    File.mkdir_p!(Path.dirname(prob_dir))
+    File.write!(prob_dir, "not a directory")
+
+    assert {:error, {:list_prob_dir_failed, ^prob_dir, {:not_a_directory, _message}}} =
+             Server.handle("FLUSHDB", [], MockStore.make())
+  end
+
+  test "FLUSHDB surfaces unexpected probabilistic cleanup exceptions", %{prob_dir: prob_dir} do
+    Process.put(:ferricstore_prob_command_fsync_dir_hook, fn ^prob_dir ->
+      raise "prob cleanup exploded"
+    end)
+
+    assert {:error, {:flush_prob_dirs_failed, :error, %RuntimeError{message: message}}} =
+             Server.handle("FLUSHDB", [], MockStore.make())
+
+    assert message == "prob cleanup exploded"
+  end
 end

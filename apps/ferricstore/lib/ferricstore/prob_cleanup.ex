@@ -1,0 +1,69 @@
+defmodule Ferricstore.ProbCleanup do
+  @moduledoc false
+
+  @spec flush_all(binary(), pos_integer()) :: :ok | {:error, term()}
+  def flush_all(data_dir, shard_count) do
+    try do
+      Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
+        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
+        prob_dir = Path.join(shard_path, "prob")
+
+        case clear_dir(prob_dir) do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+    rescue
+      exception -> {:error, {:flush_prob_dirs_failed, :error, exception}}
+    catch
+      kind, reason -> {:error, {:flush_prob_dirs_failed, kind, reason}}
+    end
+  end
+
+  @spec clear_dir(binary()) :: :ok | {:error, term()}
+  def clear_dir(prob_dir) do
+    if Ferricstore.FS.exists?(prob_dir) do
+      case Ferricstore.FS.ls(prob_dir) do
+        {:ok, []} ->
+          :ok
+
+        {:ok, files} ->
+          with :ok <- delete_files(prob_dir, files),
+               :ok <- fsync_dir(prob_dir, :flush_prob_dir) do
+            :ok
+          end
+
+        {:error, {:not_found, _message}} ->
+          :ok
+
+        {:error, reason} ->
+          {:error, {:list_prob_dir_failed, prob_dir, reason}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp delete_files(prob_dir, files) do
+    Enum.reduce_while(files, :ok, fn file, :ok ->
+      case Ferricstore.FS.rm(Path.join(prob_dir, file)) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:delete_prob_file_failed, file, reason}}}
+      end
+    end)
+  end
+
+  defp fsync_dir(path, phase) do
+    case fsync_dir_result(path) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:fsync_dir_failed, phase, reason}}
+    end
+  end
+
+  defp fsync_dir_result(path) do
+    case Process.get(:ferricstore_prob_command_fsync_dir_hook) do
+      fun when is_function(fun, 1) -> fun.(path)
+      _ -> Ferricstore.Bitcask.NIF.v2_fsync_dir(path)
+    end
+  end
+end

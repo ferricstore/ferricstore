@@ -439,57 +439,7 @@ defmodule Ferricstore.Commands.Server do
 
   defp flush_all_prob_dirs do
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    shard_count = shard_count()
-
-    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
-      shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
-      prob_dir = Path.join(shard_path, "prob")
-
-      case clear_prob_dir(prob_dir) do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-  rescue
-    _ -> :ok
-  end
-
-  defp clear_prob_dir(prob_dir) do
-    with true <- Ferricstore.FS.exists?(prob_dir),
-         {:ok, files} <- Ferricstore.FS.ls(prob_dir) do
-      with :ok <- delete_prob_files(prob_dir, files),
-           :ok <- prob_fsync_dir(prob_dir, :flush_prob_dir) do
-        :ok
-      end
-    else
-      _ -> :ok
-    end
-  end
-
-  defp delete_prob_files(prob_dir, files) do
-    Enum.reduce_while(files, :ok, fn file, :ok ->
-      case Ferricstore.FS.rm(Path.join(prob_dir, file)) do
-        :ok -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, {:delete_prob_file_failed, file, reason}}}
-      end
-    end)
-  end
-
-  defp prob_fsync_dir(path, phase) do
-    case prob_fsync_dir_result(path) do
-      # Fsync the prob dir so the removals are durable — without this
-      # a crash after FLUSHDB can resurrect probabilistic filter files
-      # that were supposed to be wiped.
-      :ok -> :ok
-      {:error, reason} -> {:error, {:fsync_dir_failed, phase, reason}}
-    end
-  end
-
-  defp prob_fsync_dir_result(path) do
-    case Process.get(:ferricstore_prob_command_fsync_dir_hook) do
-      fun when is_function(fun, 1) -> fun.(path)
-      _ -> Ferricstore.Bitcask.NIF.v2_fsync_dir(path)
-    end
+    Ferricstore.ProbCleanup.flush_all(data_dir, shard_count())
   end
 
   # ---------------------------------------------------------------------------
