@@ -458,6 +458,9 @@ fn parse<'a>(env: Env<'a>, data: Binary<'a>, max_value_size: usize) -> NifResult
                 commands.push(term);
                 pos = new_pos;
             }
+            ParseResult::Skip(new_pos) => {
+                pos = new_pos;
+            }
             ParseResult::Incomplete => break,
             ParseResult::Error(reason) => {
                 return Ok((atoms::error(), reason).encode(env));
@@ -495,6 +498,9 @@ fn parse_commands<'a>(
                 commands.push(term);
                 pos = new_pos;
             }
+            ParseResult::Skip(new_pos) => {
+                pos = new_pos;
+            }
             ParseResult::Incomplete => break,
             ParseResult::Error(reason) => {
                 return Ok((atoms::error(), reason).encode(env));
@@ -514,6 +520,7 @@ fn parse_commands<'a>(
 
 enum ParseResult<'a> {
     Ok(Term<'a>, usize),
+    Skip(usize),
     Incomplete,
     Error(Term<'a>),
 }
@@ -620,14 +627,11 @@ fn parse_command_array<'a>(
     };
 
     if count == 0 {
-        return ParseResult::Ok(
-            make_command_term(env, b"UNKNOWN", "UNKNOWN".encode(env), Vec::new(), &[]),
-            after_crlf,
-        );
+        return ParseResult::Skip(after_crlf);
     }
 
     let (cmd_start, cmd_len, mut cur) =
-        match parse_command_bulk_arg(env, buf, after_crlf, max_value_size, false) {
+        match parse_command_bulk_arg(env, buf, after_crlf, max_value_size, true) {
             SizedPayloadRange::Ok(start, len, new_pos) => (start, len, new_pos),
             SizedPayloadRange::Incomplete => return ParseResult::Incomplete,
             SizedPayloadRange::Error(term) => return ParseResult::Error(term),
@@ -677,10 +681,7 @@ fn parse_inline_command<'a>(
 
     let ranges = split_inline_ranges(line, pos);
     if ranges.is_empty() {
-        return ParseResult::Ok(
-            make_command_term(env, b"UNKNOWN", "UNKNOWN".encode(env), Vec::new(), &[]),
-            after_crlf,
-        );
+        return ParseResult::Skip(after_crlf);
     }
 
     let (cmd_start, cmd_len) = ranges[0];
@@ -760,6 +761,7 @@ fn parse_array<'a>(
             }
             ParseResult::Incomplete => return ParseResult::Incomplete,
             ParseResult::Error(e) => return ParseResult::Error(e),
+            ParseResult::Skip(_) => return ParseResult::Error(atoms::protocol_error().encode(env)),
         }
     }
 
@@ -1062,6 +1064,7 @@ fn parse_set<'a>(
             }
             ParseResult::Incomplete => return ParseResult::Incomplete,
             ParseResult::Error(e) => return ParseResult::Error(e),
+            ParseResult::Skip(_) => return ParseResult::Error(atoms::protocol_error().encode(env)),
         }
     }
 
@@ -1202,6 +1205,9 @@ fn parse_counted_elements<'a>(
             }
             ParseResult::Incomplete => return CountedElements::Incomplete,
             ParseResult::Error(e) => return CountedElements::Error(e),
+            ParseResult::Skip(_) => {
+                return CountedElements::Error(atoms::protocol_error().encode(env))
+            }
         }
     }
 
@@ -1241,6 +1247,9 @@ fn parse_map_term<'a>(
             }
             ParseResult::Incomplete => return ParseMapResult::Incomplete,
             ParseResult::Error(e) => return ParseMapResult::Error(e),
+            ParseResult::Skip(_) => {
+                return ParseMapResult::Error(atoms::protocol_error().encode(env))
+            }
         };
 
         let value = match parse_one(env, data, buf, cur, max_value_size, depth + 1) {
@@ -1250,6 +1259,9 @@ fn parse_map_term<'a>(
             }
             ParseResult::Incomplete => return ParseMapResult::Incomplete,
             ParseResult::Error(e) => return ParseMapResult::Error(e),
+            ParseResult::Skip(_) => {
+                return ParseMapResult::Error(atoms::protocol_error().encode(env))
+            }
         };
 
         map = match map.map_put(key, value) {

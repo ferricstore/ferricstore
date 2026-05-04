@@ -415,11 +415,20 @@ defmodule FerricstoreServer.Resp.ParserTest do
                Parser.parse_commands("*1\r\n$5\r\nhello\r\n", 4)
     end
 
-    test "allows empty binary arguments but rejects empty command name" do
+    test "allows empty binary arguments and keeps empty command names dispatchable" do
       assert {:ok, [{:command, "SET", ["k", ""], {:set, "k", ""}, ["k"]}], ""} =
                Parser.parse_commands("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$0\r\n\r\n")
 
-      assert {:error, :invalid_command_argument} = Parser.parse_commands("*1\r\n$0\r\n\r\n")
+      assert {:ok, [{:command, "", [], {:unknown, "", []}, []}], ""} =
+               Parser.parse_commands("*1\r\n$0\r\n\r\n")
+    end
+
+    test "skips true empty commands without poisoning the connection buffer" do
+      assert {:ok, [], ""} = Parser.parse_commands("\r\n")
+      assert {:ok, [], ""} = Parser.parse_commands("*0\r\n")
+
+      assert {:ok, [{:command, "PING", [], :ping, []}], ""} =
+               Parser.parse_commands("\r\nPING\r\n")
     end
 
     test "preserves embedded NUL bytes in command args, AST, and key extraction" do
