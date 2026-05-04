@@ -200,40 +200,47 @@ defmodule FerricstoreServer.Connection do
           transport.close(socket)
 
         :ok ->
-          # Populate ACL cache for the default user at connection init.
-          # This avoids ETS lookups on every command for the common case.
-          default_cache = ConnAuth.build_acl_cache("default")
+          if maxclients_exceeded?() do
+            error_msg = Encoder.encode({:error, "ERR max number of clients reached"})
+            ConnSend.send(socket, transport, error_msg, :maxclients)
+            Stats.decr_connections()
+            transport.close(socket)
+          else
+            # Populate ACL cache for the default user at connection init.
+            # This avoids ETS lookups on every command for the common case.
+            default_cache = ConnAuth.build_acl_cache("default")
 
-          # Join the ACL invalidation process group so we receive
-          # {:acl_invalidate, username} messages when ACL rules change.
-          join_acl_invalidation_group()
+            # Join the ACL invalidation process group so we receive
+            # {:acl_invalidate, username} messages when ACL rules change.
+            join_acl_invalidation_group()
 
-          # Transitional: build instance ctx from global persistent_term state.
-          # Will be replaced once listeners pass ctx explicitly.
-          ctx = default_instance_ctx()
+            # Transitional: build instance ctx from global persistent_term state.
+            # Will be replaced once listeners pass ctx explicitly.
+            ctx = default_instance_ctx()
 
-          state = %__MODULE__{
-            socket: socket,
-            transport: transport,
-            client_id: generate_client_id(),
-            client_name: nil,
-            created_at: System.monotonic_time(:millisecond),
-            peer: peer,
-            instance_ctx: ctx,
-            stats_counter: ctx.stats_counter,
-            require_auth: Ferricstore.Config.get_value("requirepass") != "",
-            tracking: ClientTracking.new_config(),
-            acl_cache: default_cache,
-            active_mode: active_mode
-          }
+            state = %__MODULE__{
+              socket: socket,
+              transport: transport,
+              client_id: generate_client_id(),
+              client_name: nil,
+              created_at: System.monotonic_time(:millisecond),
+              peer: peer,
+              instance_ctx: ctx,
+              stats_counter: ctx.stats_counter,
+              require_auth: Ferricstore.Config.get_value("requirepass") != "",
+              tracking: ClientTracking.new_config(),
+              acl_cache: default_cache,
+              active_mode: active_mode
+            }
 
-          AuditLog.log(:connection_open, %{
-            client_id: state.client_id,
-            client_ip: format_peer(peer)
-          })
+            AuditLog.log(:connection_open, %{
+              client_id: state.client_id,
+              client_ip: format_peer(peer)
+            })
 
-          ConnRegistry.register(state.client_id, self())
-          loop(state)
+            ConnRegistry.register(state.client_id, self())
+            loop(state)
+          end
       end
     end
   end
@@ -1017,6 +1024,11 @@ defmodule FerricstoreServer.Connection do
   # Returns true when the require-tls configuration flag is set.
   defp require_tls? do
     Application.get_env(:ferricstore, :require_tls, false) == true
+  end
+
+  defp maxclients_exceeded? do
+    maxclients = Application.get_env(:ferricstore, :maxclients, 10_000)
+    is_integer(maxclients) and maxclients > 0 and Stats.active_connections() > maxclients
   end
 
   # ---------------------------------------------------------------------------

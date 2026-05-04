@@ -343,18 +343,29 @@ defmodule FerricstoreServer.ReviewR4Test do
   end
 
   # ---------------------------------------------------------------------------
-  # B5. Max clients not enforced — CONFIRMED (no custom enforcement)
+  # B5. Max clients are enforced at connection init.
   # ---------------------------------------------------------------------------
 
   describe "B5: max connections enforcement" do
-    test "connections can be established (no explicit max_connections)" do
-      socks = Enum.map(1..5, fn _ -> connect() end)
+    test "rejects connections beyond maxclients" do
+      old_maxclients = Application.get_env(:ferricstore, :maxclients, 10_000)
+      current_active = Ferricstore.Stats.active_connections()
 
-      Enum.each(socks, fn sock ->
-        assert "PONG" == unwrap(cmd(sock, ["PING"]))
-      end)
+      try do
+        Application.put_env(:ferricstore, :maxclients, current_active + 1)
 
-      Enum.each(socks, &:gen_tcp.close/1)
+        allowed = connect()
+        assert "PONG" == unwrap(cmd(allowed, ["PING"]))
+
+        rejected = connect()
+        assert match?({:error, "ERR max number of clients reached" <> _}, recv_one(rejected))
+
+        assert {:tcp_error, :closed} = recv_one(rejected, 1_000)
+
+        :gen_tcp.close(allowed)
+      after
+        Application.put_env(:ferricstore, :maxclients, old_maxclients)
+      end
     end
   end
 
