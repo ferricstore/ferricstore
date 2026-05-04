@@ -50,7 +50,19 @@ defmodule Ferricstore.Raft.ReplaySafeIndex do
         :ok
 
       {:error, _reason} = error ->
-        _ = Ferricstore.FS.rm(tmp_path)
+        case Ferricstore.FS.rm(tmp_path) do
+          :ok ->
+            :ok
+
+          {:error, {:not_found, _}} ->
+            :ok
+
+          {:error, cleanup_reason} ->
+            Logger.warning(
+              "failed to remove raft replay-safe tmp index #{tmp_path}: #{inspect(cleanup_reason)}"
+            )
+        end
+
         Logger.warning("failed to persist raft replay-safe index #{index}: #{inspect(error)}")
         error
     end

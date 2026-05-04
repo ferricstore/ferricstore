@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.ReplaySafeIndexTest do
   use ExUnit.Case, async: true
+  import ExUnit.CaptureLog
 
   alias Ferricstore.Raft.ReplaySafeIndex
 
@@ -29,6 +30,22 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
 
     assert {:error, :enotdir} = ReplaySafeIndex.persist(dir, 456)
     assert ReplaySafeIndex.read(dir) == 0
+  end
+
+  test "persist reports tmp cleanup failure" do
+    dir = tmp_dir()
+    File.mkdir_p!(dir)
+    tmp_path = ReplaySafeIndex.path(dir) <> ".tmp"
+    File.mkdir!(tmp_path)
+
+    on_exit(fn -> File.rm_rf(dir) end)
+
+    log =
+      capture_log(fn ->
+        assert {:error, _reason} = ReplaySafeIndex.persist(dir, 789)
+      end)
+
+    assert log =~ "failed to remove raft replay-safe tmp index"
   end
 
   defp tmp_dir do
