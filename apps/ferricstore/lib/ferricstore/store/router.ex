@@ -287,6 +287,8 @@ defmodule Ferricstore.Store.Router do
   def always_quorum?({:extend, _, _, _}), do: true
   def always_quorum?({:ratelimit_add, _, _, _, _}), do: true
   def always_quorum?({:ratelimit_add, _, _, _, _, _}), do: true
+  def always_quorum?({:spop, _, _}), do: true
+  def always_quorum?({:zpop, _, _, _}), do: true
 
   # Probabilistic structures: results (e.g., Bloom "was it new?", TopK
   # evicted member, CMS post-increment count) are computed by the state
@@ -3221,6 +3223,21 @@ defmodule Ferricstore.Store.Router do
   @doc false
   def pfadd(ctx, key, elements) when is_binary(key) and is_list(elements) do
     forced_single_key_quorum(ctx, key, {:pfadd, key, elements})
+  end
+
+  @doc false
+  def spop(ctx, key, count) when is_binary(key) and (is_nil(count) or is_integer(count)) do
+    forced_single_key_quorum(ctx, key, {:spop, key, count})
+  end
+
+  @doc false
+  def zpopmin(ctx, key, count) when is_binary(key) and is_integer(count) do
+    forced_single_key_quorum(ctx, key, {:zpop, key, count, :min})
+  end
+
+  @doc false
+  def zpopmax(ctx, key, count) when is_binary(key) and is_integer(count) do
+    forced_single_key_quorum(ctx, key, {:zpop, key, count, :max})
   end
 
   @doc false

@@ -52,6 +52,30 @@ defmodule Ferricstore.Store.RmwCommandsTest do
     end
   end
 
+  defp run_concurrent(count, fun) do
+    parent = self()
+
+    tasks =
+      for _ <- 1..count do
+        Task.async(fn ->
+          send(parent, :ready)
+
+          receive do
+            :go -> fun.()
+          after
+            5_000 -> flunk("concurrent task was not released")
+          end
+        end)
+      end
+
+    for _ <- 1..count do
+      assert_receive :ready, 5_000
+    end
+
+    Enum.each(tasks, fn task -> send(task.pid, :go) end)
+    Task.await_many(tasks, 30_000)
+  end
+
   # ---------------------------------------------------------------------------
   # SETBIT
   # ---------------------------------------------------------------------------
@@ -68,6 +92,7 @@ defmodule Ferricstore.Store.RmwCommandsTest do
       _ = Task.await_many(tasks, 30_000)
 
       assert {:ok, val} = FerricStore.get(key)
+
       assert popcount(val) == 50,
              "expected 50 bits set, got #{popcount(val)}"
     end
@@ -167,6 +192,7 @@ defmodule Ferricstore.Store.RmwCommandsTest do
       _ = Task.await_many(tasks, 30_000)
 
       assert {:ok, card} = FerricStore.pfcount([key])
+
       assert card >= 90 and card <= 110,
              "expected cardinality ~100, got #{card}"
     end
@@ -242,8 +268,10 @@ defmodule Ferricstore.Store.RmwCommandsTest do
       tasks =
         for i <- 1..20 do
           Task.async(fn ->
-            FerricStore.bitop(:and, "dest_#{i}_#{:erlang.unique_integer([:positive])}",
-              ["src_a", "src_b"])
+            FerricStore.bitop(:and, "dest_#{i}_#{:erlang.unique_integer([:positive])}", [
+              "src_a",
+              "src_b"
+            ])
           end)
         end
 
@@ -273,6 +301,63 @@ defmodule Ferricstore.Store.RmwCommandsTest do
 
       assert {:ok, score} = FerricStore.zscore(key, "m1")
       assert score == 50.0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Pop commands
+  # ---------------------------------------------------------------------------
+
+  describe "concurrent pop commands" do
+    test "concurrent SPOP callers never receive the same member" do
+      key = ukey("spop_q")
+      members = for i <- 1..100, do: "m#{i}"
+      assert {:ok, 100} = FerricStore.sadd(key, members)
+
+      results = run_concurrent(100, fn -> FerricStore.spop(key) end)
+
+      popped =
+        Enum.map(results, fn
+          {:ok, member} when is_binary(member) -> member
+          other -> flunk("unexpected SPOP result: #{inspect(other)}")
+        end)
+
+      assert Enum.uniq(popped) == popped
+      assert {:ok, 0} = FerricStore.scard(key)
+    end
+
+    test "concurrent ZPOPMIN callers never receive the same member" do
+      key = ukey("zpopmin_q")
+      members = for i <- 1..100, do: {i * 1.0, "m#{i}"}
+      assert {:ok, 100} = FerricStore.zadd(key, members)
+
+      results = run_concurrent(100, fn -> FerricStore.zpopmin(key, 1) end)
+
+      popped =
+        Enum.map(results, fn
+          {:ok, [{member, _score}]} -> member
+          other -> flunk("unexpected ZPOPMIN result: #{inspect(other)}")
+        end)
+
+      assert Enum.uniq(popped) == popped
+      assert {:ok, 0} = FerricStore.zcard(key)
+    end
+
+    test "concurrent ZPOPMAX callers never receive the same member" do
+      key = ukey("zpopmax_q")
+      members = for i <- 1..100, do: {i * 1.0, "m#{i}"}
+      assert {:ok, 100} = FerricStore.zadd(key, members)
+
+      results = run_concurrent(100, fn -> FerricStore.zpopmax(key, 1) end)
+
+      popped =
+        Enum.map(results, fn
+          {:ok, [{member, _score}]} -> member
+          other -> flunk("unexpected ZPOPMAX result: #{inspect(other)}")
+        end)
+
+      assert Enum.uniq(popped) == popped
+      assert {:ok, 0} = FerricStore.zcard(key)
     end
   end
 

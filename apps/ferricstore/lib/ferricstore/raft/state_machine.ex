@@ -598,6 +598,34 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_with_time(meta, state, fn -> do_zincrby(state, key, increment, member) end)
   end
 
+  def apply(meta, {:pfadd, key, elements}, state) do
+    apply_pending_with_time(meta, state, fn ->
+      HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_value_store(state))
+    end)
+  end
+
+  def apply(meta, {:json_numincrby, key, path, increment}, state) do
+    apply_pending_with_time(meta, state, fn ->
+      Json.handle_ast({:json_numincrby, key, path, increment}, build_string_value_store(state))
+    end)
+  end
+
+  def apply(meta, {:json_arrappend, key, path, values}, state) do
+    apply_pending_with_time(meta, state, fn ->
+      Json.handle_ast({:json_arrappend, key, path, values}, build_string_value_store(state))
+    end)
+  end
+
+  def apply(meta, {:spop, key, count}, state) do
+    apply_pending_with_time(meta, state, fn ->
+      do_spop(state, key, count, Map.get(meta, :index, 0))
+    end)
+  end
+
+  def apply(meta, {:zpop, key, count, direction}, state) do
+    apply_pending_with_time(meta, state, fn -> do_zpop(state, key, count, direction) end)
+  end
+
   def apply(meta, {:cas, key, expected, new_value, ttl_ms}, state) do
     apply_pending_with_time(meta, state, fn -> do_cas(state, key, expected, new_value, ttl_ms) end)
   end
@@ -3086,6 +3114,14 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:zincrby, key, increment, member}) do
     do_zincrby(state, key, increment, member)
+  end
+
+  defp apply_single(state, {:spop, key, count}) do
+    do_spop(state, key, count, 0)
+  end
+
+  defp apply_single(state, {:zpop, key, count, direction}) do
+    do_zpop(state, key, count, direction)
   end
 
   defp apply_single(state, {:cas, key, expected, new_value, ttl_ms}) do
@@ -6132,6 +6168,115 @@ defmodule Ferricstore.Raft.StateMachine do
       zset_index_put(state, redis_key, compound_key, new_str)
       new_str
     end
+  end
+
+  defp do_spop(_state, _redis_key, count, _seed) when not (is_nil(count) or is_integer(count)),
+    do: {:error, "ERR value is not an integer or out of range"}
+
+  defp do_spop(_state, _redis_key, count, _seed) when is_integer(count) and count < 0,
+    do: {:error, "ERR value is not an integer or out of range"}
+
+  defp do_spop(state, redis_key, count, seed) do
+    store = build_compound_store(state)
+
+    with :ok <- Ferricstore.Store.TypeRegistry.check_type(redis_key, :set, store) do
+      prefix = CompoundKey.set_prefix(redis_key)
+
+      members =
+        state
+        |> shard_ets_state()
+        |> Ferricstore.Store.Shard.ETS.prefix_scan_entries(prefix, state.shard_data_path)
+        |> Enum.map(fn {member, _value} -> member end)
+        |> Enum.sort()
+
+      pop_count = if is_nil(count), do: 1, else: count
+
+      # Raft apply must be deterministic on every replica. Use the committed
+      # Ra index as the selection seed instead of caller-side randomness.
+      selected = deterministic_take(members, pop_count, {redis_key, seed})
+
+      Enum.each(selected, fn member ->
+        do_compound_delete(state, redis_key, CompoundKey.set_member(redis_key, member))
+      end)
+
+      if selected != [] and
+           Ferricstore.Store.Shard.ETS.prefix_count_entries(
+             shard_ets_state(state),
+             prefix
+           ) == 0 do
+        do_compound_delete(state, redis_key, CompoundKey.type_key(redis_key))
+      end
+
+      if is_nil(count), do: List.first(selected), else: selected
+    end
+  end
+
+  defp do_zpop(_state, _redis_key, count, _direction)
+       when not is_integer(count) or count < 0,
+       do: {:error, "ERR value is not an integer or out of range"}
+
+  defp do_zpop(state, redis_key, count, direction) when direction in [:min, :max] do
+    store = build_compound_store(state)
+
+    with :ok <- Ferricstore.Store.TypeRegistry.check_type(redis_key, :zset, store) do
+      prefix = CompoundKey.zset_prefix(redis_key)
+
+      sorted =
+        state
+        |> shard_ets_state()
+        |> Ferricstore.Store.Shard.ETS.prefix_scan_entries(prefix, state.shard_data_path)
+        |> Enum.map(fn {member, score_value} ->
+          {member, zpop_score(score_value)}
+        end)
+        |> Enum.sort_by(fn {member, score} -> {score, member} end)
+
+      sorted = if direction == :max, do: Enum.reverse(sorted), else: sorted
+      selected = Enum.take(sorted, count)
+
+      result =
+        Enum.flat_map(selected, fn {member, score} ->
+          do_compound_delete(state, redis_key, CompoundKey.zset_member(redis_key, member))
+          [member, format_zset_score(score)]
+        end)
+
+      if selected != [] and
+           Ferricstore.Store.Shard.ETS.prefix_count_entries(
+             shard_ets_state(state),
+             prefix
+           ) == 0 do
+        do_compound_delete(state, redis_key, CompoundKey.type_key(redis_key))
+      end
+
+      result
+    end
+  end
+
+  defp do_zpop(_state, _redis_key, _count, _direction),
+    do: {:error, "ERR syntax error"}
+
+  defp deterministic_take(_members, 0, _seed), do: []
+  defp deterministic_take([], _count, _seed), do: []
+
+  defp deterministic_take(members, count, seed) do
+    size = length(members)
+    count = min(count, size)
+    start = :erlang.phash2(seed, size)
+    {left, right} = Enum.split(members, start)
+    Enum.take(right ++ left, count)
+  end
+
+  defp zpop_score(score) when is_binary(score) do
+    case Float.parse(score) do
+      {parsed, ""} -> parsed
+      _ -> 0.0
+    end
+  end
+
+  defp zpop_score(score) when is_number(score), do: score * 1.0
+  defp zpop_score(_score), do: 0.0
+
+  defp format_zset_score(score) when is_float(score) do
+    :erlang.float_to_binary(score, [:compact, decimals: 17])
   end
 
   defp sm_store_compound_get_meta(state, redis_key, compound_key) do

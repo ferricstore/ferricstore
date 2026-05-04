@@ -3198,12 +3198,8 @@ defmodule FerricStore do
   """
   @spec spop(key(), non_neg_integer() | nil) :: {:ok, binary() | [binary()] | nil} | write_error()
   def spop(key, count \\ nil) do
-    store = build_compound_store(key)
-
-    ast = if is_nil(count), do: {:spop, key}, else: {:spop, key, count}
-
-    ast
-    |> Set.handle_ast(store)
+    default_ctx()
+    |> Router.spop(key, count)
     |> wrap_result()
   end
 
@@ -3556,8 +3552,7 @@ defmodule FerricStore do
   """
   @spec zpopmin(key(), pos_integer()) :: {:ok, [{binary(), float()}]}
   def zpopmin(key, count \\ 1) do
-    store = build_compound_store(key)
-    result = SortedSet.handle_ast({:zpopmin, key, count}, store)
+    result = Router.zpopmin(default_ctx(), key, count)
 
     case result do
       {:error, _} = err ->
@@ -3593,8 +3588,7 @@ defmodule FerricStore do
   """
   @spec zpopmax(key(), pos_integer()) :: {:ok, [{binary(), float()}]}
   def zpopmax(key, count \\ 1) do
-    store = build_compound_store(key)
-    result = SortedSet.handle_ast({:zpopmax, key, count}, store)
+    result = Router.zpopmax(default_ctx(), key, count)
 
     case result do
       {:error, _} = err ->

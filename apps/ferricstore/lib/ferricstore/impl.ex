@@ -364,15 +364,9 @@ defmodule FerricStore.Impl do
   @spec spop(FerricStore.Instance.t(), binary(), pos_integer()) ::
           {:ok, term()} | {:error, binary()}
   def spop(ctx, key, count) do
-    store = build_store(ctx)
-
-    if count == 1 do
-      result = Set.handle_ast({:spop, key}, store)
-      wrap_result(result)
-    else
-      result = Set.handle_ast({:spop, key, count}, store)
-      wrap_result(result)
-    end
+    ctx
+    |> Router.spop(key, count)
+    |> wrap_result()
   end
 
   # ---------------------------------------------------------------
