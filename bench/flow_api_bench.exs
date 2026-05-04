@@ -84,6 +84,10 @@ defmodule FlowApiBench do
 
   def create(prefix, type, counter, partition_count) do
     i = next_i(counter)
+    create_with(prefix, type, i, partition_key(prefix, i, partition_count))
+  end
+
+  def create_with(prefix, type, i, partition_key) do
     id = flow_id(prefix, i)
 
     {:ok, flow} =
@@ -97,7 +101,7 @@ defmodule FlowApiBench do
             run_at_ms: 1_000,
             now_ms: 1_000
           ],
-          partition_key(prefix, i, partition_count)
+          partition_key
         )
       )
 
@@ -126,12 +130,14 @@ defmodule FlowApiBench do
   end
 
   def lifecycle(prefix, type, counter, partition_count) do
-    flow = create(prefix, type, counter, partition_count)
-    partition_key = Map.get(flow, :partition_key)
+    i = next_i(counter)
+    flow_type = type <> ":" <> Integer.to_string(i)
+    partition_key = partition_key(prefix, i, partition_count)
+    flow = create_with(prefix, flow_type, i, partition_key)
 
     {:ok, [claimed]} =
       FerricStore.flow_claim_due(
-        type,
+        flow_type,
         maybe_partition(
           [
             state: "queued",
@@ -157,12 +163,14 @@ defmodule FlowApiBench do
   end
 
   def retry_cycle(prefix, type, counter, partition_count) do
-    flow = create(prefix, type, counter, partition_count)
-    partition_key = Map.get(flow, :partition_key)
+    i = next_i(counter)
+    flow_type = type <> ":" <> Integer.to_string(i)
+    partition_key = partition_key(prefix, i, partition_count)
+    flow = create_with(prefix, flow_type, i, partition_key)
 
     {:ok, [claimed]} =
       FerricStore.flow_claim_due(
-        type,
+        flow_type,
         maybe_partition(
           [
             state: "queued",
