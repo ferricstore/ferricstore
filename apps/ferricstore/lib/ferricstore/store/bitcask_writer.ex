@@ -195,23 +195,37 @@ defmodule Ferricstore.Store.BitcaskWriter do
   Flushes all running BitcaskWriter processes.
 
   Iterates through shard indices 0..N-1 (default N=4) and flushes each
-  writer that is alive. Silently ignores writers that are not running.
+  writer that is alive. Missing writers are ignored; writer failures are
+  returned with their shard index.
   Used in tests that need all background writes to be on disk before
   simulating eviction or verifying disk state.
   """
-  @spec flush_all(non_neg_integer()) :: :ok
-  def flush_all(shard_count \\ 4) do
-    for i <- 0..(shard_count - 1) do
-      try do
-        flush(i)
-      rescue
-        _ -> :ok
-      catch
-        :exit, _ -> :ok
-      end
-    end
+  @spec flush_all(non_neg_integer(), timeout()) :: :ok | {:error, [{non_neg_integer(), term()}]}
+  def flush_all(shard_count \\ 4, timeout \\ 10_000) do
+    failures =
+      Enum.reduce(0..(shard_count - 1), [], fn i, acc ->
+        case flush_writer_for_all(i, timeout) do
+          :ok -> acc
+          {:error, reason} -> [{i, reason} | acc]
+          other -> [{i, {:unexpected_flush_result, other}} | acc]
+        end
+      end)
 
-    :ok
+    case failures do
+      [] -> :ok
+      failures -> {:error, Enum.reverse(failures)}
+    end
+  end
+
+  defp flush_writer_for_all(shard_index, timeout) do
+    try do
+      flush(shard_index, timeout)
+    rescue
+      error -> {:error, {:flush_exception, error}}
+    catch
+      :exit, reason -> {:error, {:flush_exit, reason}}
+      kind, reason -> {:error, {:flush_throw, kind, reason}}
+    end
   end
 
   # -- Callbacks --

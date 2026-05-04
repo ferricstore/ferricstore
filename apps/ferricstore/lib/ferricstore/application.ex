@@ -304,7 +304,7 @@ defmodule Ferricstore.Application do
     {shard_count, data_dir} = runtime_shutdown_config()
 
     shutdown_flush_batchers(shard_count)
-    shutdown_flush_bitcask_writers(shard_count)
+    bitcask_writer_result = shutdown_flush_bitcask_writers(shard_count)
     bitcask_fsync_result = shutdown_fsync_bitcask(shard_count, data_dir)
     shutdown_flush_shards(shard_count)
     wal_rollover_result = shutdown_wal_rollover(data_dir)
@@ -312,14 +312,14 @@ defmodule Ferricstore.Application do
 
     elapsed = System.monotonic_time(:millisecond) - t0
 
-    case {bitcask_fsync_result, wal_rollover_result} do
-      {:ok, :ok} ->
+    case {bitcask_writer_result, bitcask_fsync_result, wal_rollover_result} do
+      {:ok, :ok, :ok} ->
         Logger.info("Shutdown: graceful flush complete in #{elapsed}ms")
 
-      {bitcask_result, wal_result} ->
+      {writer_result, bitcask_result, wal_result} ->
         Logger.warning(
           "Shutdown: graceful flush complete with warnings in #{elapsed}ms " <>
-            "(bitcask_fsync=#{inspect(bitcask_result)}, wal_rollover=#{inspect(wal_result)})"
+            "(bitcask_writer=#{inspect(writer_result)}, bitcask_fsync=#{inspect(bitcask_result)}, wal_rollover=#{inspect(wal_result)})"
         )
     end
 
@@ -375,13 +375,22 @@ defmodule Ferricstore.Application do
 
   defp shutdown_flush_bitcask_writers(shard_count) do
     # Step 3: Flush all BitcaskWriters — drain deferred disk writes
-    try do
-      Ferricstore.Store.BitcaskWriter.flush_all(shard_count)
-    catch
-      :exit, _ -> :ok
+    result =
+      try do
+        Ferricstore.Store.BitcaskWriter.flush_all(shard_count)
+      catch
+        :exit, reason -> {:error, {:flush_all_exit, reason}}
+      end
+
+    case result do
+      :ok ->
+        Logger.info("Shutdown: BitcaskWriters flushed")
+
+      {:error, reason} ->
+        Logger.warning("Shutdown: BitcaskWriter flush incomplete: #{inspect(reason)}")
     end
 
-    Logger.info("Shutdown: BitcaskWriters flushed")
+    result
   end
 
   defp shutdown_fsync_bitcask(shard_count, data_dir) do

@@ -404,6 +404,30 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert {:error, {:flush_exit, {:timeout, _call}}} = BitcaskWriter.flush(shard_index, 1)
     end
 
+    test "BitcaskWriter flush_all reports writer failures" do
+      shard_index = 64
+      writer_name = BitcaskWriter.writer_name(shard_index)
+
+      if existing = Process.whereis(writer_name) do
+        flunk(
+          "unexpected BitcaskWriter already registered for shard #{shard_index}: #{inspect(existing)}"
+        )
+      end
+
+      {:ok, writer} = SlowFlushWriter.start_link(writer_name)
+
+      on_exit(fn ->
+        try do
+          if Process.alive?(writer), do: GenServer.stop(writer, :kill, 100)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
+
+      assert {:error, [{^shard_index, {:flush_exit, {:timeout, _call}}}]} =
+               BitcaskWriter.flush_all(shard_index + 1, 1)
+    end
+
     test "BitcaskWriter batches tombstone runs through the ops NIF" do
       source =
         Path.expand("../../../lib/ferricstore/store/bitcask_writer.ex", __DIR__)
