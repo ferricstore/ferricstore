@@ -2017,6 +2017,35 @@ defmodule Ferricstore.Store.Router do
   defp read_cold_batch_async([], _now), do: []
 
   defp read_cold_batch_async(entries, now) do
+    {unique_entries, value_indexes} = dedupe_cold_batch_entries(entries)
+    unique_values = read_unique_cold_batch_async(unique_entries, now) |> List.to_tuple()
+
+    Enum.map(value_indexes, fn index -> elem(unique_values, index) end)
+  end
+
+  defp dedupe_cold_batch_entries(entries) do
+    {unique_entries, _index_by_location, value_indexes} =
+      Enum.reduce(entries, {[], %{}, []}, fn entry, {unique_acc, index_acc, value_index_acc} ->
+        location = cold_batch_entry_location(entry)
+
+        case Map.fetch(index_acc, location) do
+          {:ok, index} ->
+            {unique_acc, index_acc, [index | value_index_acc]}
+
+          :error ->
+            index = map_size(index_acc)
+            {[entry | unique_acc], Map.put(index_acc, location, index), [index | value_index_acc]}
+        end
+      end)
+
+    {Enum.reverse(unique_entries), Enum.reverse(value_indexes)}
+  end
+
+  defp cold_batch_entry_location({_ctx, _idx, _keydir, key, path, _file_id, offset, _value_size}) do
+    {path, offset, key}
+  end
+
+  defp read_unique_cold_batch_async(entries, now) do
     locations =
       Enum.map(entries, fn {_ctx, _idx, _keydir, key, path, _file_id, offset, _value_size} ->
         {path, offset, key}

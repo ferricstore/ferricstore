@@ -549,6 +549,29 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
              [large_value, nil, "hot", "", large_value]
   end
 
+  test "batch_get deduplicates duplicate cold locations before pread", %{
+    ctx: ctx,
+    shard: shard,
+    keydir: keydir
+  } do
+    key = "cold_batch_duplicate:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    value = :binary.copy("d", 2_048)
+
+    :ok = GenServer.call(shard, {:put, key, value, 0})
+    :ok = GenServer.call(shard, :flush)
+
+    assert [{^key, _stored, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, key)
+    :ets.insert(keydir, {key, nil, exp, lfu, fid, off, vsize})
+
+    Process.put(:ferricstore_router_pread_batch_keyed_result, {:ok, [value]})
+
+    try do
+      assert [^value, ^value] = Router.batch_get(ctx, [key, key])
+    after
+      Process.delete(:ferricstore_router_pread_batch_keyed_result)
+    end
+  end
+
   test "get_file_ref rejects cold rows with invalid offsets", %{ctx: ctx, keydir: keydir} do
     key = "cold_invalid_sendfile:" <> Integer.to_string(:erlang.unique_integer([:positive]))
     :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
