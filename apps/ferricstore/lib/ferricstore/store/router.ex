@@ -170,12 +170,11 @@ defmodule Ferricstore.Store.Router do
         # Leader's batcher detected a cross-node caller and tagged the reply
         # with the ra_index. Barrier on local apply so reads on this node
         # see the just-written value (read-your-write across redirects).
-        {:remote_applied_at, ra_index, real_result} ->
-          _ = Ferricstore.Raft.Batcher.await_local_applied(idx, ra_index, 5_000)
-          real_result
+        {:remote_applied_at, _ra_index, _real_result} ->
+          barrier_forwarded_result(idx, result, 5_000)
 
         other ->
-          other
+          barrier_forwarded_result(idx, other, 5_000)
       end
     catch
       _, reason ->
@@ -205,17 +204,20 @@ defmodule Ferricstore.Store.Router do
         )
 
       case result do
-        {:remote_applied_at, ra_index, real_result} ->
-          _ = Ferricstore.Raft.Batcher.await_local_applied(idx, ra_index, 5_000)
-          real_result
+        {:remote_applied_at, _ra_index, _real_result} ->
+          barrier_forwarded_result(idx, result, 5_000)
 
         other ->
-          other
+          barrier_forwarded_result(idx, other, 5_000)
       end
     catch
       _, reason -> forward_failure_result(reason)
     end
   end
+
+  @doc false
+  def __barrier_forwarded_result__(idx, result, timeout_ms \\ 5_000),
+    do: barrier_forwarded_result(idx, result, timeout_ms)
 
   @doc false
   @spec __forward_batch_failure_results__(term(), non_neg_integer()) :: [
@@ -238,6 +240,15 @@ defmodule Ferricstore.Store.Router do
   defp forward_timeout?(:timeout), do: true
   defp forward_timeout?({:timeout, _}), do: true
   defp forward_timeout?(_reason), do: false
+
+  defp barrier_forwarded_result(idx, {:remote_applied_at, ra_index, real_result}, timeout_ms) do
+    case Ferricstore.Raft.Batcher.await_local_applied(idx, ra_index, timeout_ms) do
+      :ok -> real_result
+      {:error, _reason} -> ErrorReasons.write_timeout_unknown()
+    end
+  end
+
+  defp barrier_forwarded_result(_idx, other, _timeout_ms), do: other
 
   @doc false
   # Public-but-undocumented entry point invoked via erpc from peer nodes
@@ -2875,14 +2886,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp unwrap_forwarded_batch_results(shard_idx, results) when is_list(results) do
-    Enum.map(results, fn
-      {:remote_applied_at, ra_index, real_result} ->
-        _ = Ferricstore.Raft.Batcher.await_local_applied(shard_idx, ra_index, 5_000)
-        real_result
-
-      other ->
-        other
-    end)
+    Enum.map(results, &barrier_forwarded_result(shard_idx, &1, 5_000))
   end
 
   defp unwrap_forwarded_batch_results(_shard_idx, other), do: other

@@ -427,7 +427,15 @@ defmodule Ferricstore.Raft.Batcher do
   @spec await_local_applied(non_neg_integer(), non_neg_integer(), non_neg_integer()) ::
           :ok | {:error, :timeout}
   def await_local_applied(shard_index, ra_index, timeout_ms \\ 10_000) do
-    GenServer.call(batcher_name(shard_index), {:await_local_applied, ra_index}, timeout_ms)
+    name = batcher_name(shard_index)
+
+    try do
+      GenServer.call(name, {:await_local_applied, ra_index}, timeout_ms)
+    catch
+      :exit, {:timeout, _} ->
+        GenServer.cast(name, {:cancel_await_local_applied, self()})
+        {:error, :timeout}
+    end
   end
 
   @doc """
@@ -690,6 +698,16 @@ defmodule Ferricstore.Raft.Batcher do
 
   def handle_cast({:write_quorum, command, reply_to}, state) do
     enqueue_write_forced_quorum(command, reply_to, state)
+  end
+
+  def handle_cast({:cancel_await_local_applied, caller_pid}, state) do
+    waiters =
+      Enum.reject(state.local_apply_waiters, fn
+        {_idx, :await_caller, [{pid, _tag}], _result} -> pid == caller_pid
+        _waiter -> false
+      end)
+
+    {:noreply, maybe_reply_flush_waiters(%{state | local_apply_waiters: waiters})}
   end
 
   def handle_cast({:write_batch, cmds, cmd_count, from}, state) do

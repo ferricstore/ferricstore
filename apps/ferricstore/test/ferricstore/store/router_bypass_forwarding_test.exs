@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.RouterBypassForwardingTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Raft.Batcher
+  alias Ferricstore.ErrorReasons
   alias Ferricstore.Store.Router
 
   defmodule FakeBatcher do
@@ -48,5 +49,31 @@ defmodule Ferricstore.Store.RouterBypassForwardingTest do
              apply(Router, :run_bypass_locally, [ctx, command, origin_node])
 
     assert_receive {:write_quorum, ^command, {:remote_origin, ^origin_node, {_pid, _ref}}}
+  end
+
+  test "forwarded applied result returns unknown outcome when local apply barrier times out" do
+    shard_index = 0
+    batcher = Batcher.batcher_name(shard_index)
+    %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
+
+    assert ErrorReasons.write_timeout_unknown() ==
+             Router.__barrier_forwarded_result__(
+               shard_index,
+               {:remote_applied_at, last_local_applied + 1_000, :ok},
+               25
+             )
+  end
+
+  test "forwarded applied result returns leader result after local apply barrier passes" do
+    shard_index = 0
+    batcher = Batcher.batcher_name(shard_index)
+    %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
+
+    assert :ok ==
+             Router.__barrier_forwarded_result__(
+               shard_index,
+               {:remote_applied_at, last_local_applied, :ok},
+               25
+             )
   end
 end

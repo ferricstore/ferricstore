@@ -149,6 +149,15 @@ defmodule Ferricstore.Raft.BatcherTest do
   end
 
   describe "local apply gating" do
+    test "await_local_applied returns timeout instead of exiting" do
+      shard_index = 0
+      batcher = Batcher.batcher_name(shard_index)
+      %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
+
+      assert {:error, :timeout} =
+               Batcher.await_local_applied(shard_index, last_local_applied + 1_000, 25)
+    end
+
     test "local quorum caller is not replied before local apply reaches the raft index" do
       shard_index = 0
       batcher = Batcher.batcher_name(shard_index)
