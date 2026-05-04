@@ -29,4 +29,49 @@ defmodule Ferricstore.DataDirTest do
       DataDir.root_from_shard_path(Path.join(root, "shard_2"))
     end
   end
+
+  test "ensure_layout reports directory fsync failures for newly created layout" do
+    root =
+      Path.join(System.tmp_dir!(), "data_dir_fsync_fail_#{System.unique_integer([:positive])}")
+
+    parent = self()
+
+    Process.put(:ferricstore_data_dir_fsync_dir_hook, fn path ->
+      send(parent, {:data_dir_fsync, path})
+      {:error, :eio}
+    end)
+
+    try do
+      assert_raise RuntimeError, ~r/DataDir layout fsync failed.*create_root.*:eio/, fn ->
+        DataDir.ensure_layout!(root, 1)
+      end
+
+      assert_received {:data_dir_fsync, fsync_path}
+      assert fsync_path == Path.dirname(root)
+    after
+      Process.delete(:ferricstore_data_dir_fsync_dir_hook)
+      File.rm_rf!(root)
+    end
+  end
+
+  test "ensure_layout does not fsync on idempotent existing layout" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "data_dir_idempotent_fsync_#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      assert :ok = DataDir.ensure_layout!(root, 1)
+
+      Process.put(:ferricstore_data_dir_fsync_dir_hook, fn path ->
+        flunk("did not expect idempotent layout to fsync #{path}")
+      end)
+
+      assert :ok = DataDir.ensure_layout!(root, 1)
+    after
+      Process.delete(:ferricstore_data_dir_fsync_dir_hook)
+      File.rm_rf!(root)
+    end
+  end
 end

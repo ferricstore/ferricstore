@@ -21,9 +21,12 @@ defmodule Ferricstore.DataDir do
   is needed.
   """
 
+  alias Ferricstore.Bitcask.NIF
+
   require Logger
 
   @top_level_dirs ~w(data dedicated prob raft registry hints)
+  @sharded_dirs ~w(data dedicated prob raft)
 
   @doc """
   Creates the full directory layout under `data_dir`.
@@ -50,23 +53,74 @@ defmodule Ferricstore.DataDir do
   """
   @spec ensure_layout!(binary(), pos_integer()) :: :ok
   def ensure_layout!(data_dir, shard_count \\ 4) do
-    Ferricstore.FS.mkdir_p!(data_dir)
+    created_dirs = maybe_create_dir([], data_dir, :create_root)
 
-    # Directories that get per-shard subdirectories
-    sharded_dirs = ~w(data dedicated prob raft)
+    created_dirs =
+      Enum.reduce(@top_level_dirs, created_dirs, fn dir, acc ->
+        maybe_create_dir(acc, Path.join(data_dir, dir), :create_top_level_dir)
+      end)
 
-    for dir <- sharded_dirs, i <- 0..(shard_count - 1) do
-      Ferricstore.FS.mkdir_p!(Path.join([data_dir, dir, "shard_#{i}"]))
-    end
+    created_dirs =
+      Enum.reduce(@sharded_dirs, created_dirs, fn dir, acc ->
+        Enum.reduce(0..(shard_count - 1), acc, fn i, shard_acc ->
+          maybe_create_dir(shard_acc, Path.join([data_dir, dir, "shard_#{i}"]), :create_shard_dir)
+        end)
+      end)
 
-    # Top-level-only directories (no per-shard subdivision)
-    for dir <- ~w(registry hints) do
-      Ferricstore.FS.mkdir_p!(Path.join(data_dir, dir))
-    end
+    fsync_created_dir_parents!(created_dirs)
 
     Logger.debug("DataDir layout ensured under #{data_dir} (#{shard_count} shards)")
 
     :ok
+  end
+
+  defp maybe_create_dir(created_dirs, path, phase) do
+    created? = not Ferricstore.FS.dir?(path)
+    Ferricstore.FS.mkdir_p!(path)
+
+    if created? do
+      [{phase, path} | created_dirs]
+    else
+      created_dirs
+    end
+  end
+
+  defp fsync_created_dir_parents!(created_dirs) do
+    created_dirs
+    |> Enum.reverse()
+    |> unique_parent_fsyncs()
+    |> Enum.each(fn {phase, created_path, parent_path} ->
+      case fsync_dir(parent_path) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          raise "DataDir layout fsync failed during #{phase} for #{parent_path} " <>
+                  "after creating #{created_path}: #{inspect(reason)}"
+      end
+    end)
+  end
+
+  defp unique_parent_fsyncs(created_dirs) do
+    {fsyncs, _seen} =
+      Enum.reduce(created_dirs, {[], MapSet.new()}, fn {phase, created_path}, {acc, seen} ->
+        parent_path = Path.dirname(created_path)
+
+        if MapSet.member?(seen, parent_path) do
+          {acc, seen}
+        else
+          {[{phase, created_path, parent_path} | acc], MapSet.put(seen, parent_path)}
+        end
+      end)
+
+    Enum.reverse(fsyncs)
+  end
+
+  defp fsync_dir(path) do
+    case Process.get(:ferricstore_data_dir_fsync_dir_hook) do
+      fun when is_function(fun, 1) -> fun.(path)
+      _ -> NIF.v2_fsync_dir(path)
+    end
   end
 
   @doc """
