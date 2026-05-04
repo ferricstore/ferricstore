@@ -223,6 +223,39 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
       :ok = Batcher.write(shard_index, {:put, k, "after_restart", 0})
       assert Router.get(ctx(), k) == "after_restart"
     end
+
+    test "terminate replies to callers waiting for local apply" do
+      shard_index = 0
+      batcher_name = Batcher.batcher_name(shard_index)
+      pid = Process.whereis(batcher_name)
+      assert is_pid(pid)
+
+      %{last_local_applied: last_local_applied} = :sys.get_state(batcher_name)
+      ra_index = last_local_applied + 1_000
+      corr = make_ref()
+      reply_ref = make_ref()
+
+      :ok =
+        Batcher.__inject_quorum_pending_at__(
+          shard_index,
+          corr,
+          [{self(), reply_ref}],
+          :single,
+          System.monotonic_time()
+        )
+
+      send(batcher_name, {:ra_event, :leader, {:applied, [{corr, {:applied_at, ra_index, :ok}}]}})
+      refute_receive {^reply_ref, _}, 50
+
+      monitor_ref = Process.monitor(pid)
+      :ok = GenServer.stop(batcher_name, :shutdown, 2_000)
+
+      assert_receive {^reply_ref, {:error, :batcher_terminated}}, 1_000
+      assert_receive {:DOWN, ^monitor_ref, :process, ^pid, :shutdown}, 1_000
+
+      ShardHelpers.wait_shards_alive()
+      assert Process.whereis(batcher_name) != pid
+    end
   end
 
   # ---------------------------------------------------------------------------

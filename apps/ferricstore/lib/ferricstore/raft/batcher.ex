@@ -1003,6 +1003,14 @@ defmodule Ferricstore.Raft.Batcher do
         end)
     end)
 
+    # Reply to callers whose Ra entry committed but whose local state machine
+    # had not caught up before shutdown.
+    Enum.each(state.local_apply_waiters, fn {_idx, _kind, froms, _result} ->
+      Enum.each(froms, fn from ->
+        safe_reply(from, {:error, :batcher_terminated})
+      end)
+    end)
+
     # Reply to flush barrier waiters.
     Enum.each(state.flush_waiters, fn from ->
       safe_reply(from, {:error, :batcher_terminated})
