@@ -1,6 +1,7 @@
 defmodule Ferricstore.MetricsTest do
   @moduledoc false
   use ExUnit.Case, async: false
+  import ExUnit.CaptureLog
 
   alias Ferricstore.Metrics
   alias Ferricstore.PrefixMetricsCache
@@ -116,7 +117,9 @@ defmodule Ferricstore.MetricsTest do
         # Handle labeled metrics: metric_name{labels} value
         value_str =
           case Regex.run(~r/\}\s+(.+)$/, line) do
-            [_, val] -> val
+            [_, val] ->
+              val
+
             nil ->
               [_name, val] = String.split(line, " ", parts: 2)
               val
@@ -145,6 +148,7 @@ defmodule Ferricstore.MetricsTest do
         # (labeled metrics have {labels} appended)
         for sample_name <- sample_names do
           base_name = sample_name |> String.split("{") |> hd()
+
           assert base_name == type_name,
                  "TYPE name (#{type_name}) does not match sample name (#{sample_name})"
         end
@@ -297,6 +301,19 @@ defmodule Ferricstore.MetricsTest do
                refreshed_text,
                ~s(ferricstore_prefix_key_count{prefix="#{prefix}"} 1)
              )
+    end
+
+    test "prefix metrics cache ignores stale ra_event messages without error logging" do
+      pid = Process.whereis(PrefixMetricsCache)
+      assert is_pid(pid)
+
+      log =
+        capture_log(fn ->
+          send(pid, {:ra_event, {:stale_shard, :nonode@nohost}, {:applied, []}})
+          Process.sleep(20)
+        end)
+
+      refute log =~ "received unexpected message"
     end
   end
 

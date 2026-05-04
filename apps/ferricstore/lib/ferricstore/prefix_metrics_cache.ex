@@ -92,6 +92,13 @@ defmodule Ferricstore.PrefixMetricsCache do
     {:noreply, state}
   end
 
+  @impl true
+  def handle_info({:ra_event, _from, _event}, state) do
+    # Ra pipeline replies can occasionally arrive late to a reused pid after a
+    # test or supervisor restart. They are unrelated to metrics cache state.
+    {:noreply, state}
+  end
+
   @spec cache_entry() :: {:ok, binary(), integer()} | :missing
   defp cache_entry do
     try do
