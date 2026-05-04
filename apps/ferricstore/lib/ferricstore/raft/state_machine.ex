@@ -1554,23 +1554,21 @@ defmodule Ferricstore.Raft.StateMachine do
       if MapSet.member?(deleted, key) do
         false
       else
-        sm_tx_pending_meta(key) != nil or cross_shard_ets_read(ctx, key) != nil
+        sm_tx_pending_meta(key) != nil or cross_shard_ets_exists?(ctx, key)
       end
     end
 
     local_incr = fn key, delta ->
-      current = local_get.(key)
-
-      case current do
+      case local_get_meta.(key) do
         nil ->
           local_put.(key, delta, 0)
           {:ok, delta}
 
-        value ->
+        {value, expire_at_ms} ->
           case coerce_integer(value) do
             {:ok, int_val} ->
               new_val = int_val + delta
-              local_put.(key, new_val, 0)
+              local_put.(key, new_val, expire_at_ms)
               {:ok, new_val}
 
             :error ->
@@ -1580,19 +1578,17 @@ defmodule Ferricstore.Raft.StateMachine do
     end
 
     local_incr_float = fn key, delta ->
-      current = local_get.(key)
-
-      case current do
+      case local_get_meta.(key) do
         nil ->
           new_val = delta * 1.0
           local_put.(key, new_val, 0)
           {:ok, new_val}
 
-        value ->
+        {value, expire_at_ms} ->
           case coerce_float(value) do
             {:ok, float_val} ->
               new_val = float_val + delta
-              local_put.(key, new_val, 0)
+              local_put.(key, new_val, expire_at_ms)
               {:ok, new_val}
 
             :error ->
@@ -1602,16 +1598,16 @@ defmodule Ferricstore.Raft.StateMachine do
     end
 
     local_append = fn key, suffix ->
-      current =
-        case local_get.(key) do
-          nil -> ""
-          v when is_integer(v) -> Integer.to_string(v)
-          v when is_float(v) -> Float.to_string(v)
-          v -> v
+      {current, expire_at_ms} =
+        case local_get_meta.(key) do
+          nil -> {"", 0}
+          {v, exp} when is_integer(v) -> {Integer.to_string(v), exp}
+          {v, exp} when is_float(v) -> {Float.to_string(v), exp}
+          {v, exp} -> {v, exp}
         end
 
       new_val = current <> suffix
-      local_put.(key, new_val, 0)
+      local_put.(key, new_val, expire_at_ms)
       {:ok, byte_size(new_val)}
     end
 
@@ -1634,16 +1630,16 @@ defmodule Ferricstore.Raft.StateMachine do
     end
 
     local_setrange = fn key, offset, value ->
-      old =
-        case local_get.(key) do
-          nil -> ""
-          v when is_integer(v) -> Integer.to_string(v)
-          v when is_float(v) -> Float.to_string(v)
-          v -> v
+      {old, expire_at_ms} =
+        case local_get_meta.(key) do
+          nil -> {"", 0}
+          {v, exp} when is_integer(v) -> {Integer.to_string(v), exp}
+          {v, exp} when is_float(v) -> {Float.to_string(v), exp}
+          {v, exp} -> {v, exp}
         end
 
       new_val = sm_apply_setrange(old, offset, value)
-      local_put.(key, new_val, 0)
+      local_put.(key, new_val, expire_at_ms)
       {:ok, byte_size(new_val)}
     end
 
@@ -1880,6 +1876,33 @@ defmodule Ferricstore.Raft.StateMachine do
   # Reads a value from a shard's keydir ETS table with cold-read fallback.
   defp cross_shard_ets_read(ctx, key) do
     cross_shard_ets_read_from_path(ctx, key, ctx.shard_data_path)
+  end
+
+  defp cross_shard_ets_exists?(ctx, key) do
+    now = apply_now_ms()
+
+    try do
+      case :ets.lookup(ctx.keydir, key) do
+        [{^key, value, exp, _lfu, _fid, _off, _vsize}]
+        when value != nil and (exp == 0 or exp > now) ->
+          true
+
+        [{^key, nil, exp, _lfu, fid, off, vsize}]
+        when (exp == 0 or exp > now) and valid_cold_location(fid, off, vsize) ->
+          true
+
+        [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
+          cross_shard_delete_keydir_entry(ctx, key, value)
+          false
+
+        _ ->
+          false
+      end
+    rescue
+      ArgumentError ->
+        emit_cross_shard_keydir_unavailable(ctx, :cross_shard_exists)
+        false
+    end
   end
 
   defp cross_shard_ets_read_from_path(ctx, key, data_path) do

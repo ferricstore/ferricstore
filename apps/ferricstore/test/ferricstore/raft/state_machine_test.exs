@@ -856,6 +856,61 @@ defmodule Ferricstore.Raft.StateMachineTest do
                :ets.lookup(ets, "stamped_setex")
     end
 
+    test "cross-shard dispatched RMW commands preserve existing TTL", %{
+      state: state,
+      ets: ets,
+      shard_index: shard_index
+    } do
+      expire_at_ms = Ferricstore.HLC.now_ms() + 60_000
+
+      cases = [
+        {"cross_tx_incr_ttl", "5", {"INCR", ["cross_tx_incr_ttl"]}, "6"},
+        {"cross_tx_append_ttl", "base", {"APPEND", ["cross_tx_append_ttl", "-tail"]},
+         "base-tail"},
+        {"cross_tx_setrange_ttl", "abcdef", {"SETRANGE", ["cross_tx_setrange_ttl", "2", "ZZ"]},
+         "abZZef"}
+      ]
+
+      Enum.each(cases, fn {key, initial, command, expected} ->
+        :ets.insert(
+          ets,
+          {key, initial, expire_at_ms, Ferricstore.Store.LFU.initial(), 0, 0, byte_size(initial)}
+        )
+
+        {_new_state, %{^shard_index => [_result]}} =
+          StateMachine.apply(
+            %{system_time: Ferricstore.HLC.now_ms()},
+            {:cross_shard_tx, [{shard_index, [command], nil}]},
+            state
+          )
+
+        assert [{^key, ^expected, ^expire_at_ms, _lfu, _fid, _off, _vsize}] =
+                 :ets.lookup(ets, key)
+      end)
+    end
+
+    test "cross-shard dispatched EXISTS uses cold metadata without pread", %{
+      state: state,
+      ets: ets,
+      shard_index: shard_index
+    } do
+      key = "cross_tx_exists_cold"
+
+      :ets.insert(
+        ets,
+        {key, nil, 0, Ferricstore.Store.LFU.initial(), 0, 999_999, byte_size("large-cold")}
+      )
+
+      {_new_state, %{^shard_index => [1]}} =
+        StateMachine.apply(
+          %{system_time: Ferricstore.HLC.now_ms()},
+          {:cross_shard_tx, [{shard_index, [{"EXISTS", [key]}], nil}]},
+          state
+        )
+
+      assert [{^key, nil, 0, _lfu, 0, 999_999, _vsize}] = :ets.lookup(ets, key)
+    end
+
     test "cross-shard dispatched SET is appended before acknowledgement", %{
       state: state,
       ets: ets,
