@@ -24,6 +24,33 @@ defmodule Ferricstore.Commands.CMSTest do
       assert File.exists?(prob_file_path(store, "mysketch", "cms"))
     end
 
+    test "uses key-specific probabilistic directory when available" do
+      wrong_dir =
+        Path.join(System.tmp_dir!(), "cms_wrong_prob_#{System.unique_integer([:positive])}")
+
+      right_dir =
+        Path.join(System.tmp_dir!(), "cms_right_prob_#{System.unique_integer([:positive])}")
+
+      key = "key_specific_cms"
+      safe = Base.url_encode64(key, padding: false)
+      wrong_path = Path.join(wrong_dir, "#{safe}.cms")
+      right_path = Path.join(right_dir, "#{safe}.cms")
+
+      store =
+        ProbMockStore.make_cms()
+        |> Map.put(:prob_dir, fn -> wrong_dir end)
+        |> Map.put(:prob_dir_for_key, fn ^key -> right_dir end)
+
+      try do
+        assert :ok = CMS.handle("CMS.INITBYDIM", [key, "100", "7"], store)
+        assert File.exists?(right_path)
+        refute File.exists?(wrong_path)
+      after
+        File.rm_rf!(wrong_dir)
+        File.rm_rf!(right_dir)
+      end
+    end
+
     test "returns error when key already exists" do
       store = ProbMockStore.make_cms()
       assert :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
