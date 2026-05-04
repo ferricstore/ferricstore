@@ -58,6 +58,12 @@ defmodule Ferricstore.Raft.ReplaySafeIndex do
             :ok
 
           {:error, cleanup_reason} ->
+            :telemetry.execute(
+              [:ferricstore, :raft, :replay_safe_index, :cleanup_failed],
+              %{count: 1},
+              %{path: tmp_path, reason: cleanup_reason}
+            )
+
             Logger.warning(
               "failed to remove raft replay-safe tmp index #{tmp_path}: #{inspect(cleanup_reason)}"
             )

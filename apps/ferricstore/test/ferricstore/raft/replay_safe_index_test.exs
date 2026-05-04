@@ -37,8 +37,22 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
     File.mkdir_p!(dir)
     tmp_path = ReplaySafeIndex.path(dir) <> ".tmp"
     File.mkdir!(tmp_path)
+    parent = self()
+    handler_id = {:replay_safe_index_cleanup_failed, parent, make_ref()}
 
-    on_exit(fn -> File.rm_rf(dir) end)
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :raft, :replay_safe_index, :cleanup_failed],
+      fn event, measurements, metadata, _config ->
+        send(parent, {:cleanup_failed, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      File.rm_rf(dir)
+    end)
 
     log =
       capture_log(fn ->
@@ -46,6 +60,10 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
       end)
 
     assert log =~ "failed to remove raft replay-safe tmp index"
+
+    assert_receive {:cleanup_failed, [:ferricstore, :raft, :replay_safe_index, :cleanup_failed],
+                    %{count: 1}, %{path: ^tmp_path, reason: {_kind, _message}}},
+                   1_000
   end
 
   defp tmp_dir do
