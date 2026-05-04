@@ -608,6 +608,39 @@ defmodule Ferricstore.Raft.StateMachineTest do
              end)
     end
 
+    test "DELETE aborts when pending PUT cannot be flushed before tombstone", %{
+      state: state,
+      ets: ets,
+      dir: dir,
+      shard_index: shard_index,
+      writer_pid: writer_pid,
+      active_file_path: active_file_path
+    } do
+      key = "pending_delete_ordering"
+      missing_path = Path.join([dir, "missing_parent", "00000.log"])
+      :ets.insert(ets, {key, "value", 0, 1, :pending, 0, 0})
+
+      :sys.replace_state(writer_pid, fn writer_state ->
+        %{
+          writer_state
+          | pending: [{:write, nil, missing_path, 0, ets, key, "value", 0}],
+            pending_count: 1
+        }
+      end)
+
+      {_state2, {:error, {:bitcask_writer_flush_failed, {:flush_failed, 1}}}} =
+        StateMachine.apply(%{}, {:delete, key}, state)
+
+      assert [{^key, "value", 0, _lfu, :pending, 0, 0}] = :ets.lookup(ets, key)
+      assert {:ok, records} = NIF.v2_scan_file(active_file_path)
+
+      refute Enum.any?(records, fn {record_key, _off, _size, _exp, tombstone?} ->
+               record_key == key and tombstone?
+             end)
+
+      assert shard_index == state.shard_index
+    end
+
     test "origin async DELETE persists tombstone even when Router already removed ETS", %{
       state: state,
       ets: ets,
@@ -662,6 +695,36 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert Enum.any?(records, fn {"origin_getdel_missing_ets", _off, _size, _exp, tombstone?} ->
                tombstone?
+             end)
+    end
+
+    test "GETDEL returns flush error when pending PUT cannot be ordered before tombstone", %{
+      state: state,
+      ets: ets,
+      dir: dir,
+      writer_pid: writer_pid,
+      active_file_path: active_file_path
+    } do
+      key = "pending_getdel_ordering"
+      missing_path = Path.join([dir, "missing_parent", "00000.log"])
+      :ets.insert(ets, {key, "value", 0, 1, :pending, 0, 0})
+
+      :sys.replace_state(writer_pid, fn writer_state ->
+        %{
+          writer_state
+          | pending: [{:write, nil, missing_path, 0, ets, key, "value", 0}],
+            pending_count: 1
+        }
+      end)
+
+      {_state2, {:error, {:bitcask_writer_flush_failed, {:flush_failed, 1}}}} =
+        StateMachine.apply(%{}, {:getdel, key}, state)
+
+      assert [{^key, "value", 0, _lfu, :pending, 0, 0}] = :ets.lookup(ets, key)
+      assert {:ok, records} = NIF.v2_scan_file(active_file_path)
+
+      refute Enum.any?(records, fn {record_key, _off, _size, _exp, tombstone?} ->
+               record_key == key and tombstone?
              end)
     end
   end

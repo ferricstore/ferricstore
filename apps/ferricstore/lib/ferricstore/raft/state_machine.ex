@@ -67,6 +67,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
   import Bitwise
 
+  require Logger
+
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.CommandTime
   alias Ferricstore.Commands.Dispatcher
@@ -4135,20 +4137,21 @@ defmodule Ferricstore.Raft.StateMachine do
     # first to ensure the PUT record lands on disk BEFORE the tombstone.
     # Without this, a background PUT arriving after the tombstone would
     # resurrect the key on recovery (Bitcask last-record-wins semantics).
-    flush_pending_for_key(state, key)
-    prob_path = prob_file_path_for_delete(state, key)
+    with :ok <- flush_pending_for_key(state, key) do
+      prob_path = prob_file_path_for_delete(state, key)
 
-    case resolve_active_file(state) do
-      :stale ->
-        set_disk_pressure(state)
-        {:error, :active_file_unavailable}
+      case resolve_active_file(state) do
+        :stale ->
+          set_disk_pressure(state)
+          {:error, :active_file_unavailable}
 
-      {_file_path, _file_id} ->
-        record_pending_original(state, key)
-        track_keydir_binary_remove(state, key)
-        :ets.delete(state.ets, key)
-        queue_pending_delete(key, prob_path)
-        :ok
+        {_file_path, _file_id} ->
+          record_pending_original(state, key)
+          track_keydir_binary_remove(state, key)
+          :ets.delete(state.ets, key)
+          queue_pending_delete(key, prob_path)
+          :ok
+      end
     end
   end
 
@@ -4159,11 +4162,23 @@ defmodule Ferricstore.Raft.StateMachine do
     case :ets.lookup(state.ets, key) do
       [{^key, _v, _e, _lfu, :pending, _off, _vs}] ->
         try do
-          BitcaskWriter.flush(state.shard_index)
+          case BitcaskWriter.flush(state.shard_index) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              Logger.warning(
+                "Shard #{state.shard_index}: pending write flush failed before tombstone for #{inspect(key)}: #{inspect(reason)}"
+              )
+
+              {:error, {:bitcask_writer_flush_failed, reason}}
+          end
         rescue
-          _ -> :ok
+          error ->
+            {:error, {:bitcask_writer_flush_failed, {:exception, error}}}
         catch
-          :exit, _ -> :ok
+          :exit, reason ->
+            {:error, {:bitcask_writer_flush_failed, {:exit, reason}}}
         end
 
       _ ->
@@ -4319,10 +4334,13 @@ defmodule Ferricstore.Raft.StateMachine do
       old = do_get(state, key)
 
       if old != nil do
-        do_delete(state, key)
+        case do_delete(state, key) do
+          :ok -> old
+          {:error, _reason} = error -> error
+        end
+      else
+        old
       end
-
-      old
     end
   end
 
