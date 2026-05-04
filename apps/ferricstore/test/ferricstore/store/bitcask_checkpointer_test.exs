@@ -299,4 +299,40 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
                    2_000,
                    "terminate/2 must observe the clean flag and skip fsync"
   end
+
+  test "shutdown while async fsync is in flight re-dirties and clears in-flight", %{
+    ctx: ctx,
+    active_path: active_path
+  } do
+    parent = self()
+
+    ctx =
+      Map.put(ctx, :fsync_async, fn caller, corr_id, path ->
+        send(parent, {:fsync_async_called, caller, corr_id, path})
+        :ok
+      end)
+
+    {:ok, pid} =
+      BitcaskCheckpointer.start_link(
+        index: 0,
+        instance_ctx: ctx,
+        checkpoint_interval_ms: 10_000,
+        name: :"ck_shutdown_in_flight_#{:erlang.unique_integer([:positive])}"
+      )
+
+    :atomics.put(ctx.checkpoint_flags, 1, 1)
+    send(pid, :tick)
+
+    assert_receive {:fsync_async_called, ^pid, 1, ^active_path}, 2_000
+    assert :atomics.get(ctx.checkpoint_flags, 1) == 0
+    assert :atomics.get(ctx.checkpoint_in_flight, 1) == 1
+
+    :ok = GenServer.stop(pid, :normal, 5_000)
+
+    assert :atomics.get(ctx.checkpoint_flags, 1) == 1,
+           "shutdown cannot prove the in-flight async fsync completed, so the next checkpointer must retry"
+
+    assert :atomics.get(ctx.checkpoint_in_flight, 1) == 0,
+           "a stopped checkpointer must not leave release_cursor permanently gated"
+  end
 end

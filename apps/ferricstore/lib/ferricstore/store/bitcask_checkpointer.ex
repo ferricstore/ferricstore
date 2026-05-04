@@ -114,23 +114,35 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
     flag_idx = state.index + 1
 
     dirty? = ctx && :atomics.get(ctx.checkpoint_flags, flag_idx) == 1
+    in_flight? = state.in_flight? or checkpoint_in_flight?(ctx, flag_idx)
+    checkpoint_needed? = dirty? or in_flight?
 
     result =
-      if dirty? do
-        case ActiveFile.get(ctx, state.index) do
-          {_fid, active_path, _sp} ->
-            r = NIF.v2_fsync(active_path)
-            if r == :ok, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 0)
-            r
-        end
-      else
-        :clean
+      cond do
+        in_flight? ->
+          if ctx do
+            :atomics.put(ctx.checkpoint_flags, flag_idx, 1)
+            mark_checkpoint_in_flight(ctx, state.index, 0)
+          end
+
+          :in_flight_retry
+
+        dirty? ->
+          case ActiveFile.get(ctx, state.index) do
+            {_fid, active_path, _sp} ->
+              r = NIF.v2_fsync(active_path)
+              if r == :ok, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 0)
+              r
+          end
+
+        true ->
+          :clean
       end
 
     :telemetry.execute(
       [:ferricstore, :bitcask, :checkpoint_shutdown],
       %{shard_index: state.index},
-      %{dirty?: dirty?, result: result}
+      %{dirty?: checkpoint_needed?, result: result}
     )
 
     :ok
@@ -329,5 +341,20 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
       nil -> :ok
       checkpoint_in_flight -> :atomics.put(checkpoint_in_flight, index + 1, value)
     end
+  end
+
+  defp checkpoint_in_flight?(nil, _flag_idx), do: false
+
+  defp checkpoint_in_flight?(ctx, flag_idx) do
+    case Map.get(ctx, :checkpoint_in_flight) do
+      nil ->
+        false
+
+      checkpoint_in_flight ->
+        flag_idx <= :atomics.info(checkpoint_in_flight).size and
+          :atomics.get(checkpoint_in_flight, flag_idx) == 1
+    end
+  rescue
+    _ -> false
   end
 end
