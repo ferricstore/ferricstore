@@ -262,6 +262,49 @@ defmodule Ferricstore.Store.OpsTest do
              "LocalTxStore compound_batch_get must batch keyed cold reads instead of one waiter per field"
     end
 
+    test "promoted type metadata reads cold value from shared shard log" do
+      ctx = FerricStore.Instance.get(:default)
+      redis_key = "ops:local_tx:promoted-type:#{System.unique_integer([:positive])}"
+      type_key = "T:" <> redis_key
+      shard_index = Router.shard_for(ctx, redis_key)
+
+      shared_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ops_local_tx_promoted_shared_#{System.unique_integer([:positive])}"
+        )
+
+      dedicated_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ops_local_tx_promoted_dedicated_#{System.unique_integer([:positive])}"
+        )
+
+      keydir = :ets.new(:"ops_local_tx_#{System.unique_integer([:positive])}", [:set, :public])
+
+      try do
+        File.mkdir_p!(shared_dir)
+        File.mkdir_p!(dedicated_dir)
+        shared_path = Path.join(shared_dir, "00000.log")
+        File.touch!(shared_path)
+
+        assert {:ok, [{off, size}]} =
+                 NIF.v2_append_batch_nosync(shared_path, [{type_key, "hash", 0}])
+
+        :ets.insert(keydir, {type_key, nil, 0, LFU.initial(), 0, off, size})
+
+        tx =
+          local_tx(ctx, shard_index, keydir, Map.put(%{}, redis_key, %{path: dedicated_dir}))
+          |> put_in([Access.key!(:shard_state), :shard_data_path], shared_dir)
+
+        assert "hash" == Ops.compound_get(tx, redis_key, type_key)
+      after
+        :ets.delete(keydir)
+        File.rm_rf(shared_dir)
+        File.rm_rf(dedicated_dir)
+      end
+    end
+
     test "compound_batch_get returns ordered cold values and warms matching ETS entries" do
       ctx = FerricStore.Instance.get(:default)
       redis_key = "ops:local_tx:batch-cold:#{System.unique_integer([:positive])}"

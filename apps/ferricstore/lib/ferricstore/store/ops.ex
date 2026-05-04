@@ -492,8 +492,15 @@ defmodule Ferricstore.Store.Ops do
   def compound_get(%LocalTxStore{} = tx, redis_key, compound_key) do
     if local?(tx, redis_key) do
       case promoted_path(tx, redis_key) do
-        nil -> local_read_value(tx, compound_key)
-        dedicated_path -> local_promoted_read_value(tx, compound_key, dedicated_path)
+        nil ->
+          local_read_value(tx, compound_key)
+
+        dedicated_path ->
+          if shared_log_compound_key?(compound_key) do
+            local_read_value(tx, compound_key)
+          else
+            local_promoted_read_value(tx, compound_key, dedicated_path)
+          end
       end
     else
       idx = Router.shard_for(tx.instance_ctx, redis_key)
@@ -519,7 +526,11 @@ defmodule Ferricstore.Store.Ops do
           local_batch_read_values(tx, compound_keys, tx.shard_state.shard_data_path)
 
         dedicated_path ->
-          local_batch_read_values(tx, compound_keys, dedicated_path)
+          if Enum.any?(compound_keys, &shared_log_compound_key?/1) do
+            Enum.map(compound_keys, &compound_get(tx, redis_key, &1))
+          else
+            local_batch_read_values(tx, compound_keys, dedicated_path)
+          end
       end
     else
       idx = Router.shard_for(tx.instance_ctx, redis_key)
@@ -552,8 +563,15 @@ defmodule Ferricstore.Store.Ops do
   def compound_get_meta(%LocalTxStore{} = tx, redis_key, compound_key) do
     if local?(tx, redis_key) do
       case promoted_path(tx, redis_key) do
-        nil -> local_read_meta(tx, compound_key)
-        dedicated_path -> local_promoted_read_meta(tx, compound_key, dedicated_path)
+        nil ->
+          local_read_meta(tx, compound_key)
+
+        dedicated_path ->
+          if shared_log_compound_key?(compound_key) do
+            local_read_meta(tx, compound_key)
+          else
+            local_promoted_read_meta(tx, compound_key, dedicated_path)
+          end
       end
     else
       idx = Router.shard_for(tx.instance_ctx, redis_key)
@@ -584,7 +602,11 @@ defmodule Ferricstore.Store.Ops do
           local_batch_read_meta(tx, compound_keys, tx.shard_state.shard_data_path)
 
         dedicated_path ->
-          local_batch_read_meta(tx, compound_keys, dedicated_path)
+          if Enum.any?(compound_keys, &shared_log_compound_key?/1) do
+            Enum.map(compound_keys, &compound_get_meta(tx, redis_key, &1))
+          else
+            local_batch_read_meta(tx, compound_keys, dedicated_path)
+          end
       end
     else
       idx = Router.shard_for(tx.instance_ctx, redis_key)
@@ -1220,6 +1242,10 @@ defmodule Ferricstore.Store.Ops do
       _ -> nil
     end
   end
+
+  defp shared_log_compound_key?(<<"T:", _rest::binary>>), do: true
+  defp shared_log_compound_key?(<<"PM:", _rest::binary>>), do: true
+  defp shared_log_compound_key?(_key), do: false
 
   defp local_promoted_read_value(tx, compound_key, dedicated_path) do
     case tx_pending_meta(compound_key) ||
