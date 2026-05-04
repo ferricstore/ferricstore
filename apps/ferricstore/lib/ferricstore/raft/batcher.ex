@@ -457,7 +457,53 @@ defmodule Ferricstore.Raft.Batcher do
   """
   @spec flush(non_neg_integer()) :: :ok
   def flush(shard_index) do
-    GenServer.call(batcher_name(shard_index), :flush, 10_000)
+    flush(shard_index, 10_000)
+  end
+
+  @spec flush(non_neg_integer(), timeout()) :: :ok
+  def flush(shard_index, timeout) do
+    GenServer.call(batcher_name(shard_index), :flush, timeout)
+  end
+
+  @doc """
+  Flushes all running Raft batchers.
+
+  Missing batchers are ignored so partial test/custom-instance topologies can
+  reuse this helper. Live batchers that fail, time out, or return unexpected
+  results are reported with their shard index so shutdown does not fail open.
+  """
+  @spec flush_all(non_neg_integer(), timeout()) :: :ok | {:error, [{non_neg_integer(), term()}]}
+  def flush_all(shard_count \\ 4, timeout \\ 10_000) do
+    failures =
+      shard_count
+      |> shard_indices()
+      |> Enum.reduce([], fn shard_index, acc ->
+        case flush_batcher_for_all(shard_index, timeout) do
+          :ok -> acc
+          {:error, reason} -> [{shard_index, reason} | acc]
+          other -> [{shard_index, {:unexpected_flush_result, other}} | acc]
+        end
+      end)
+
+    case failures do
+      [] -> :ok
+      failures -> {:error, Enum.reverse(failures)}
+    end
+  end
+
+  defp shard_indices(0), do: []
+  defp shard_indices(shard_count), do: 0..(shard_count - 1)
+
+  defp flush_batcher_for_all(shard_index, timeout) do
+    try do
+      flush(shard_index, timeout)
+    rescue
+      error -> {:error, {:flush_exception, error}}
+    catch
+      :exit, {:noproc, _call} -> :ok
+      :exit, reason -> {:error, {:flush_exit, reason}}
+      kind, reason -> {:error, {:flush_throw, kind, reason}}
+    end
   end
 
   @doc """

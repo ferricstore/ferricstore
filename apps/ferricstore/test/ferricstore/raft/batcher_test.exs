@@ -16,6 +16,16 @@ defmodule Ferricstore.Raft.BatcherTest do
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
+  defmodule SlowBatcher do
+    use GenServer
+
+    def start(name), do: GenServer.start(__MODULE__, nil, name: name)
+    @impl true
+    def init(nil), do: {:ok, nil}
+    @impl true
+    def handle_call(:flush, _from, state), do: {:noreply, state}
+  end
+
   setup_all do
     ShardHelpers.wait_shards_alive()
 
@@ -46,6 +56,26 @@ defmodule Ferricstore.Raft.BatcherTest do
     test "batcher_name/1 returns expected atom" do
       assert Batcher.batcher_name(0) == :"Ferricstore.Raft.Batcher.0"
       assert Batcher.batcher_name(3) == :"Ferricstore.Raft.Batcher.3"
+    end
+
+    test "flush_all reports stuck batchers" do
+      shard_index = 64
+      name = Batcher.batcher_name(shard_index)
+
+      if existing = Process.whereis(name) do
+        flunk(
+          "unexpected Batcher already registered for shard #{shard_index}: #{inspect(existing)}"
+        )
+      end
+
+      {:ok, pid} = SlowBatcher.start(name)
+
+      on_exit(fn ->
+        if Process.alive?(pid), do: Process.exit(pid, :kill)
+      end)
+
+      assert {:error, [{^shard_index, {:flush_exit, {:timeout, _call}}}]} =
+               Batcher.flush_all(shard_index + 1, 1)
     end
   end
 

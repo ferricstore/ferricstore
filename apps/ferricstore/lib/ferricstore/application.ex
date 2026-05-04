@@ -303,7 +303,7 @@ defmodule Ferricstore.Application do
 
     {shard_count, data_dir} = runtime_shutdown_config()
 
-    shutdown_flush_batchers(shard_count)
+    batcher_result = shutdown_flush_batchers(shard_count)
     bitcask_writer_result = shutdown_flush_bitcask_writers(shard_count)
     bitcask_fsync_result = shutdown_fsync_bitcask(shard_count, data_dir)
     shutdown_flush_shards(shard_count)
@@ -312,14 +312,14 @@ defmodule Ferricstore.Application do
 
     elapsed = System.monotonic_time(:millisecond) - t0
 
-    case {bitcask_writer_result, bitcask_fsync_result, wal_rollover_result} do
-      {:ok, :ok, :ok} ->
+    case {batcher_result, bitcask_writer_result, bitcask_fsync_result, wal_rollover_result} do
+      {:ok, :ok, :ok, :ok} ->
         Logger.info("Shutdown: graceful flush complete in #{elapsed}ms")
 
-      {writer_result, bitcask_result, wal_result} ->
+      {batcher_result, writer_result, bitcask_result, wal_result} ->
         Logger.warning(
           "Shutdown: graceful flush complete with warnings in #{elapsed}ms " <>
-            "(bitcask_writer=#{inspect(writer_result)}, bitcask_fsync=#{inspect(bitcask_result)}, wal_rollover=#{inspect(wal_result)})"
+            "(batcher=#{inspect(batcher_result)}, bitcask_writer=#{inspect(writer_result)}, bitcask_fsync=#{inspect(bitcask_result)}, wal_rollover=#{inspect(wal_result)})"
         )
     end
 
@@ -362,15 +362,22 @@ defmodule Ferricstore.Application do
 
   defp shutdown_flush_batchers(shard_count) do
     # Step 2: Flush all Raft batchers — drain pending commands to Raft
-    for i <- 0..(shard_count - 1) do
+    result =
       try do
-        Ferricstore.Raft.Batcher.flush(i)
+        Ferricstore.Raft.Batcher.flush_all(shard_count)
       catch
-        :exit, _ -> :ok
+        :exit, reason -> {:error, {:flush_all_exit, reason}}
       end
+
+    case result do
+      :ok ->
+        Logger.info("Shutdown: batchers flushed")
+
+      {:error, reason} ->
+        Logger.warning("Shutdown: batcher flush incomplete: #{inspect(reason)}")
     end
 
-    Logger.info("Shutdown: batchers flushed")
+    result
   end
 
   defp shutdown_flush_bitcask_writers(shard_count) do
