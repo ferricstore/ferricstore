@@ -1381,6 +1381,46 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert flush_offset < reduce_offset
     end
 
+    test "aborts compaction when deferred BitcaskWriter flush fails" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      shard_path = Ferricstore.DataDir.shard_data_path(dir, 0)
+      source = Path.join(shard_path, "00000.log")
+      writer = Process.whereis(BitcaskWriter.writer_name(0))
+
+      try do
+        {:ok, {_dead_offset, _dead_record_size}} = NIF.v2_append_record(source, "dead", "old", 0)
+        {:ok, {live_offset, _live_record_size}} = NIF.v2_append_record(source, "live", "value", 0)
+        source_size = File.stat!(source).size
+
+        keydir = :sys.get_state(pid).keydir
+        :ets.insert(keydir, {"live", nil, 0, LFU.initial(), 0, live_offset, byte_size("value")})
+
+        assert :ok = force_rotate_active_file(pid)
+
+        bad_path = Path.join([dir, "missing_parent", "00000.log"])
+
+        :sys.replace_state(writer, fn state ->
+          %{
+            state
+            | pending: [{:write, nil, bad_path, 0, keydir, "pending", "new", 0}],
+              pending_count: 1
+          }
+        end)
+
+        assert {:error, {:bitcask_writer_flush_failed, {:flush_failed, 1}}} =
+                 GenServer.call(pid, {:run_compaction, [0]})
+
+        assert File.stat!(source).size == source_size
+        assert {:ok, "value"} = NIF.v2_pread_at(source, live_offset)
+      after
+        if writer && Process.alive?(writer) do
+          :sys.replace_state(writer, fn state -> %{state | pending: [], pending_count: 0} end)
+        end
+
+        cleanup_shard(pid, ctx, dir)
+      end
+    end
+
     test "groups compaction live entries in one keydir pass before per-file work" do
       source =
         Path.expand("../../../lib/ferricstore/store/shard.ex", __DIR__)
