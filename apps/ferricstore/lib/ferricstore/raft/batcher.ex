@@ -75,9 +75,9 @@ defmodule Ferricstore.Raft.Batcher do
     after the pipeline submission; fire-and-forget callers have no reply.
 
   - `Batcher.write/2` on an async namespace (legacy callers) is the blocking
-    entry; the caller is replied `:ok` immediately when the slot is flushed,
-    commands go to Raft as a regular `{:batch, [cmds]}` (no `{:async, ...}`
-    wrapper) and the state machine applies them normally on every node.
+    entry; the caller is replied after Ra accepts the slot submission, commands
+    go to Raft as a regular `{:batch, [cmds]}` (no `{:async, ...}` wrapper)
+    and the state machine applies them normally on every node.
 
   ## Why a separate GenServer?
 
@@ -1151,16 +1151,10 @@ defmodule Ferricstore.Raft.Batcher do
 
     slot = Map.get(state.slots, slot_key, new_slot(window_ms))
 
-    # For async durability: reply immediately, do not wait for flush timer.
-    # The caller gets :ok now; the write is batched and flushed in background.
-    if durability == :async do
-      GenServer.reply(from, :ok)
-    end
-
     updated_slot = %{
       slot
       | cmds: [command | slot.cmds],
-        froms: if(durability == :async, do: slot.froms, else: [from | slot.froms]),
+        froms: [from | slot.froms],
         window_ms: window_ms,
         count: Map.get(slot, :count, 0) + 1
     }
@@ -1228,8 +1222,8 @@ defmodule Ferricstore.Raft.Batcher do
               # Commands came via Batcher.write on an :async namespace
               # (blocking callers, e.g. RMW ops via Shard). Router did NOT
               # write locally — state machine must apply the inner command.
-              # Reply :ok to the blocked callers, then submit as a regular
-              # batch (no {:async, ...} wrapper).
+              # Reply after Ra accepts the regular batch (no {:async, ...}
+              # wrapper), so target-down/submit errors are visible.
               submit_async_ns(state, batch, froms)
 
             :quorum ->
@@ -1318,9 +1312,9 @@ defmodule Ferricstore.Raft.Batcher do
 
   # Flush path for commands accumulated via Batcher.write (blocking) on an
   # :async-durability namespace. Router did NOT write locally — the state
-  # machine must apply the inner command. Reply :ok to blocked callers, then
-  # submit commands as a regular batch (unwrapped) via ra.pipeline_command.
-  # Tracks the correlation in `pending` so flush waiters observe completion.
+  # machine must apply the inner command. Reply to blocked callers after Ra
+  # accepts the submission, then track the correlation in `pending` so flush
+  # waiters observe completion.
   defp submit_async_ns(state, batch, froms) do
     :telemetry.execute(
       [:ferricstore, :batcher, :async_flush],
@@ -1328,8 +1322,7 @@ defmodule Ferricstore.Raft.Batcher do
       %{shard_index: state.shard_index, origin: false}
     )
 
-    Enum.each(froms, fn from -> GenServer.reply(from, :ok) end)
-    submit_async_with_retry(state, batch, state.shard_id, 0)
+    submit_async_with_retry(state, batch, state.shard_id, 0, froms)
   end
 
   # Shared helper for initial async submission and retries after :rejected.

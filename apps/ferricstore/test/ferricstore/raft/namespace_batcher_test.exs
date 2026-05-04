@@ -354,10 +354,9 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       k = pkey("ephemeral", "async_test")
       shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
-      # Async durability: the Batcher replies :ok to the caller immediately
-      # when the slot is flushed and submits the batch to Raft in the
-      # background. The data becomes visible once the state machine
-      # applies the replicated batch.
+      # Async durability: the Batcher replies after Ra accepts the submission.
+      # The data becomes visible once the state machine applies the replicated
+      # batch.
       assert :ok == Batcher.write(shard, {:put, k, "async_val", 0})
 
       ShardHelpers.eventually(
@@ -368,6 +367,31 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
         30,
         20
       )
+    end
+
+    test "async namespace write reports missing local Ra target instead of early success" do
+      prefix = "async_missing_target"
+      NamespaceConfig.set(prefix, "durability", "async")
+      NamespaceConfig.set(prefix, "window_ms", "1")
+
+      shard = 110_000 + :rand.uniform(9_999)
+      name = Batcher.batcher_name(shard)
+
+      {:ok, pid} =
+        Batcher.start_link(shard_id: :missing_async_namespace_target, shard_index: shard)
+
+      on_exit(fn ->
+        try do
+          if Process.alive?(pid), do: GenServer.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
+
+      assert {:error, {:ra_target_down, :missing_async_namespace_target}} =
+               Batcher.write(shard, {:put, pkey(prefix, "down"), "v", 0})
+
+      assert Process.whereis(name) == pid
     end
 
     test "quorum durability commands complete successfully" do
