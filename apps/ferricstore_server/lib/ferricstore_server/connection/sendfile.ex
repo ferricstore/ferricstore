@@ -12,6 +12,9 @@ defmodule FerricstoreServer.Connection.Sendfile do
                               65_536
                             )
 
+  @spec threshold_bytes() :: pos_integer()
+  def threshold_bytes, do: @sendfile_threshold_bytes
+
   @doc """
   Handles the GET command with sendfile optimization for `:ranch_tcp` transport.
   Falls back to normal dispatch for non-sendfile cases.
@@ -22,8 +25,10 @@ defmodule FerricstoreServer.Connection.Sendfile do
   def dispatch_get([key], state, dispatch_normal_fn) do
     if in_pubsub_mode?(state) do
       {:continue,
-       Encoder.encode({:error, "ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"}),
-       state}
+       Encoder.encode(
+         {:error,
+          "ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"}
+       ), state}
     else
       fast_get(key, state, dispatch_normal_fn)
     end
@@ -42,7 +47,12 @@ defmodule FerricstoreServer.Connection.Sendfile do
         encode_get_result(value, lookup_key, state)
 
       {:cold_ref, path, offset, size} when size >= @sendfile_threshold_bytes ->
-        handle_sendfile_result(do_sendfile_get(key, path, offset, size, state), key, state, dispatch_normal_fn)
+        handle_sendfile_result(
+          send_file_ref(key, path, offset, size, state),
+          key,
+          state,
+          dispatch_normal_fn
+        )
 
       {:cold_ref, _path, _offset, _size} ->
         dispatch_normal_fn.("GET", [key], state)
@@ -62,9 +72,21 @@ defmodule FerricstoreServer.Connection.Sendfile do
     {:continue, Encoder.encode(value), new_state}
   end
 
-  defp handle_sendfile_result({:sent, new_state}, _key, _state, _fn), do: {:continue, "", new_state}
-  defp handle_sendfile_result({:error_after_header, _reason}, _key, state, _fn), do: {:quit, "", state}
-  defp handle_sendfile_result(:fallback, key, state, dispatch_normal_fn), do: dispatch_normal_fn.("GET", [key], state)
+  defp handle_sendfile_result({:sent, new_state}, _key, _state, _fn),
+    do: {:continue, "", new_state}
+
+  defp handle_sendfile_result({:error_after_header, _reason}, _key, state, _fn),
+    do: {:quit, "", state}
+
+  defp handle_sendfile_result(:fallback, key, state, dispatch_normal_fn),
+    do: dispatch_normal_fn.("GET", [key], state)
+
+  @doc false
+  def send_file_ref(key, path, offset, size, state) do
+    result = do_sendfile_get(key, path, offset, size, state)
+    emit_sendfile_result(result, size, state)
+    result
+  end
 
   defp do_sendfile_get(key, path, offset, size, state) do
     socket = state.socket
@@ -100,7 +122,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   defp send_file_and_trailer(socket, fd, offset, size, key, state) do
     case :file.sendfile(fd, socket, offset, size, []) do
-      {:ok, _sent} ->
+      {:ok, ^size} ->
         case :gen_tcp.send(socket, "\r\n") do
           :ok ->
             new_state = ConnTracking.maybe_track_read("GET", [key], :sendfile_ok, state)
@@ -110,11 +132,36 @@ defmodule FerricstoreServer.Connection.Sendfile do
             {:error_after_header, reason}
         end
 
+      {:ok, sent} ->
+        {:error_after_header, {:short_sendfile, sent, size}}
+
       {:error, reason} ->
         {:error_after_header, reason}
     end
   end
 
+  defp emit_sendfile_result({:sent, _state}, size, state) do
+    emit_sendfile(:ok, size, state, %{})
+  end
+
+  defp emit_sendfile_result(:fallback, size, state) do
+    emit_sendfile(:fallback, size, state, %{})
+  end
+
+  defp emit_sendfile_result({:error_after_header, reason}, size, state) do
+    emit_sendfile(:error_after_header, size, state, %{reason: reason})
+  end
+
+  defp emit_sendfile(result, size, state, metadata) do
+    :telemetry.execute(
+      [:ferricstore, :server, :sendfile],
+      %{bytes: size},
+      Map.merge(%{result: result, client_id: state.client_id}, metadata)
+    )
+  end
+
   defp in_pubsub_mode?(%{pubsub_channels: nil}), do: false
-  defp in_pubsub_mode?(state), do: MapSet.size(state.pubsub_channels) > 0 or MapSet.size(state.pubsub_patterns) > 0
+
+  defp in_pubsub_mode?(state),
+    do: MapSet.size(state.pubsub_channels) > 0 or MapSet.size(state.pubsub_patterns) > 0
 end

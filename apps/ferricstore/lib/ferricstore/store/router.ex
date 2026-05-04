@@ -2143,6 +2143,144 @@ defmodule Ferricstore.Store.Router do
     end)
   end
 
+  @doc """
+  Batch GET variant for TCP large-value streaming.
+
+  It performs the same single ETS pass as `batch_get/2`, but cold entries whose
+  value size is at least `min_file_ref_size` are returned as validated
+  `{:file_ref, path, value_offset, size}` tuples instead of being materialized
+  into BEAM binaries. Stale or invalid refs fall back to the normal batched cold
+  pread path.
+  """
+  @spec batch_get_with_file_refs(FerricStore.Instance.t(), [binary()], non_neg_integer()) :: [
+          binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}
+        ]
+  def batch_get_with_file_refs(ctx, keys, min_file_ref_size) do
+    now = HLC.now_ms()
+
+    {results, {cold_entries, _cold_count}} =
+      Enum.map_reduce(keys, {[], 0}, fn key, {cold_entries, cold_count} ->
+        idx = shard_for(ctx, key)
+        keydir = resolve_keydir(ctx, idx)
+
+        case ets_get_full(ctx, idx, keydir, key, now) do
+          {:hit, value, lfu} ->
+            sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
+            {{:value, value}, {cold_entries, cold_count}}
+
+          {:cold, file_id, offset, value_size}
+          when valid_cold_location(file_id, offset, value_size) ->
+            path = cold_file_path(ctx, idx, file_id)
+
+            maybe_file_ref_or_cold_entry(
+              ctx,
+              idx,
+              keydir,
+              key,
+              path,
+              file_id,
+              offset,
+              value_size,
+              min_file_ref_size,
+              cold_entries,
+              cold_count
+            )
+
+          {:cold, _file_id, _offset, _value_size} ->
+            result =
+              case safe_read_call(ctx, idx, {:get, key}) do
+                {:ok, value} -> value
+                :unavailable -> nil
+              end
+
+            if result != nil do
+              Stats.record_cold_read(ctx, key)
+            else
+              Stats.incr_keyspace_misses(ctx)
+            end
+
+            {{:value, result}, {cold_entries, cold_count}}
+
+          :expired ->
+            Stats.incr_keyspace_misses(ctx)
+            {{:value, nil}, {cold_entries, cold_count}}
+
+          :miss ->
+            Stats.incr_keyspace_misses(ctx)
+            {{:value, nil}, {cold_entries, cold_count}}
+
+          :no_table ->
+            result =
+              case safe_read_call(ctx, idx, {:get, key}) do
+                {:ok, value} -> value
+                :unavailable -> nil
+              end
+
+            if result != nil do
+              Stats.record_cold_read(ctx, key)
+            else
+              Stats.incr_keyspace_misses(ctx)
+            end
+
+            {{:value, result}, {cold_entries, cold_count}}
+        end
+      end)
+
+    cold_values =
+      cold_entries
+      |> Enum.reverse()
+      |> read_cold_batch_async(now)
+      |> List.to_tuple()
+
+    Enum.map(results, fn
+      {:value, value} -> value
+      {:file_ref, path, offset, size} -> {:file_ref, path, offset, size}
+      {:cold, index} -> elem(cold_values, index)
+    end)
+  end
+
+  defp maybe_file_ref_or_cold_entry(
+         ctx,
+         idx,
+         keydir,
+         key,
+         path,
+         file_id,
+         offset,
+         value_size,
+         min_file_ref_size,
+         cold_entries,
+         cold_count
+       )
+       when value_size >= min_file_ref_size do
+    case validated_file_ref(path, offset, key, value_size) do
+      {^path, value_offset, ^value_size} ->
+        Stats.record_cold_read(ctx, key)
+        {{:file_ref, path, value_offset, value_size}, {cold_entries, cold_count}}
+
+      nil ->
+        entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
+        {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
+    end
+  end
+
+  defp maybe_file_ref_or_cold_entry(
+         ctx,
+         idx,
+         keydir,
+         key,
+         path,
+         file_id,
+         offset,
+         value_size,
+         _min_file_ref_size,
+         cold_entries,
+         cold_count
+       ) do
+    entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
+    {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
+  end
+
   defp read_cold_batch_async([], _now), do: []
 
   defp read_cold_batch_async(entries, now) do

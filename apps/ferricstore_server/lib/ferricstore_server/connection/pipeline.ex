@@ -7,6 +7,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
+  alias FerricstoreServer.Connection.Sendfile, as: ConnSendfile
   alias FerricstoreServer.Connection.Store, as: ConnStore
   alias FerricstoreServer.Connection.TcpOpts
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
@@ -100,17 +101,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
           if not acl_ok do
             :fallback
           else
-            ctx = state.instance_ctx
             Stats.incr_commands_by(state.stats_counter, length(keys))
+            lookup_keys = namespace_keys(state.sandbox_namespace, keys)
 
-            response =
-              case safe_dispatch(fn -> Router.batch_get(ctx, keys) end) do
-                {:ok, values} -> Enum.map(values, &Encoder.encode/1)
-                {:error, err} -> List.duplicate(Encoder.encode(err), length(keys))
-              end
-
-            send_response_fn.(state.socket, state.transport, response)
-            {:ok, {:continue, state}}
+            {:ok, dispatch_batch_get_results(keys, lookup_keys, state, send_response_fn)}
           end
 
         :fallback ->
@@ -128,6 +122,89 @@ defmodule FerricstoreServer.Connection.Pipeline do
        do: extract_plain_gets(rest, [key | acc])
 
   defp extract_plain_gets(_, _acc), do: :fallback
+
+  defp dispatch_batch_get_results(
+         keys,
+         lookup_keys,
+         %{transport: :ranch_tcp} = state,
+         send_response_fn
+       ) do
+    case safe_dispatch(fn ->
+           Router.batch_get_with_file_refs(
+             state.instance_ctx,
+             lookup_keys,
+             ConnSendfile.threshold_bytes()
+           )
+         end) do
+      {:ok, results} ->
+        if Enum.any?(results, &match?({:file_ref, _, _, _}, &1)) do
+          stream_get_results(keys, lookup_keys, results, state, send_response_fn)
+        else
+          send_response_fn.(state.socket, state.transport, Enum.map(results, &Encoder.encode/1))
+          {:continue, state}
+        end
+
+      {:error, err} ->
+        send_response_fn.(
+          state.socket,
+          state.transport,
+          List.duplicate(Encoder.encode(err), length(keys))
+        )
+
+        {:continue, state}
+    end
+  end
+
+  defp dispatch_batch_get_results(_keys, lookup_keys, state, send_response_fn) do
+    response =
+      case safe_dispatch(fn -> Router.batch_get(state.instance_ctx, lookup_keys) end) do
+        {:ok, values} -> Enum.map(values, &Encoder.encode/1)
+        {:error, err} -> List.duplicate(Encoder.encode(err), length(lookup_keys))
+      end
+
+    send_response_fn.(state.socket, state.transport, response)
+    {:continue, state}
+  end
+
+  defp stream_get_results(keys, lookup_keys, results, state, send_response_fn) do
+    TcpOpts.set_cork(state.socket, true)
+
+    result =
+      keys
+      |> Enum.zip(lookup_keys)
+      |> Enum.zip(results)
+      |> Enum.reduce_while({:continue, state}, fn
+        {{key, _lookup_key}, {:file_ref, path, offset, size}}, {:continue, acc_state} ->
+          case ConnSendfile.send_file_ref(key, path, offset, size, acc_state) do
+            {:sent, new_state} ->
+              {:cont, {:continue, new_state}}
+
+            :fallback ->
+              send_response_fn.(
+                acc_state.socket,
+                acc_state.transport,
+                Encoder.encode(
+                  Router.get(
+                    acc_state.instance_ctx,
+                    namespace_key(acc_state.sandbox_namespace, key)
+                  )
+                )
+              )
+
+              {:cont, {:continue, acc_state}}
+
+            {:error_after_header, _reason} ->
+              {:halt, {:quit, acc_state}}
+          end
+
+        {{_key, _lookup_key}, value}, {:continue, acc_state} ->
+          send_response_fn.(acc_state.socket, acc_state.transport, Encoder.encode(value))
+          {:cont, {:continue, acc_state}}
+      end)
+
+    TcpOpts.set_cork(state.socket, false)
+    result
+  end
 
   # ---------------------------------------------------------------------------
   # Batch SET fast path
@@ -377,21 +454,82 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
         _ ->
           keys = Enum.map(get_ops, &elem(&1, 1))
+          lookup_keys = namespace_keys(state.sandbox_namespace, keys)
 
-          case safe_dispatch(fn -> Router.batch_get(ctx, keys) end) do
+          get_dispatch =
+            if state.transport == :ranch_tcp do
+              fn ->
+                Router.batch_get_with_file_refs(ctx, lookup_keys, ConnSendfile.threshold_bytes())
+              end
+            else
+              fn -> Router.batch_get(ctx, lookup_keys) end
+            end
+
+          case safe_dispatch(get_dispatch) do
             {:ok, values} ->
               get_ops
+              |> Enum.zip(lookup_keys)
               |> Enum.zip(values)
-              |> Map.new(fn {{idx, _key}, value} -> {idx, Encoder.encode(value)} end)
+              |> Map.new(fn
+                {{{idx, key}, lookup_key}, {:file_ref, path, offset, size}} ->
+                  {idx, {:file_ref, key, lookup_key, path, offset, size}}
+
+                {{{idx, _key}, _lookup_key}, value} ->
+                  {idx, Encoder.encode(value)}
+              end)
 
             {:error, err} ->
               Map.new(get_ops, fn {idx, _key} -> {idx, Encoder.encode(err)} end)
           end
       end
 
-    response = for i <- 0..(count - 1), do: Map.get(get_results, i) || Map.get(set_results, i)
-    send_response_fn.(state.socket, state.transport, response)
-    {:continue, state}
+    if map_has_file_ref?(get_results) do
+      stream_indexed_results(count, get_results, set_results, state, send_response_fn)
+    else
+      response = for i <- 0..(count - 1), do: Map.get(get_results, i) || Map.get(set_results, i)
+      send_response_fn.(state.socket, state.transport, response)
+      {:continue, state}
+    end
+  end
+
+  defp map_has_file_ref?(results) do
+    Enum.any?(results, fn {_idx, result} ->
+      match?({:file_ref, _key, _lookup_key, _path, _offset, _size}, result)
+    end)
+  end
+
+  defp stream_indexed_results(count, primary_results, fallback_results, state, send_response_fn) do
+    TcpOpts.set_cork(state.socket, true)
+
+    result =
+      Enum.reduce_while(0..(count - 1), {:continue, state}, fn idx, {:continue, acc_state} ->
+        case Map.get(primary_results, idx) || Map.get(fallback_results, idx) do
+          {:file_ref, key, lookup_key, path, offset, size} ->
+            case ConnSendfile.send_file_ref(key, path, offset, size, acc_state) do
+              {:sent, new_state} ->
+                {:cont, {:continue, new_state}}
+
+              :fallback ->
+                send_response_fn.(
+                  acc_state.socket,
+                  acc_state.transport,
+                  Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
+                )
+
+                {:cont, {:continue, acc_state}}
+
+              {:error_after_header, _reason} ->
+                {:halt, {:quit, acc_state}}
+            end
+
+          encoded ->
+            send_response_fn.(acc_state.socket, acc_state.transport, encoded)
+            {:cont, {:continue, acc_state}}
+        end
+      end)
+
+    TcpOpts.set_cork(state.socket, false)
+    result
   end
 
   defp mixed_set_results(%{durability_mode: :all_async}, ctx, _set_ops, kv_pairs) do
@@ -585,9 +723,12 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp do_batch_pure(commands, state, send_response_fn) do
     store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
+    prefetched_gets = prefetch_pure_tcp_gets(commands, state)
 
     {action, responses} =
-      Enum.reduce_while(commands, {:continue, []}, fn cmd, {:continue, acc} ->
+      commands
+      |> Enum.with_index()
+      |> Enum.reduce_while({:continue, []}, fn {cmd, idx}, {:continue, acc} ->
         {name, args, ast, keys} = command_parts(cmd)
         Stats.incr_commands(state.stats_counter)
 
@@ -598,17 +739,13 @@ defmodule FerricstoreServer.Connection.Pipeline do
                 :ok ->
                   try do
                     result =
-                      dispatch_store_command(
-                        name,
-                        args,
-                        ast,
-                        store,
-                        state.instance_ctx,
-                        state.sandbox_namespace
-                      )
+                      dispatch_pure_command(idx, name, args, ast, store, state, prefetched_gets)
 
-                    ConnTracking.maybe_notify_keyspace(name, args, result)
-                    ConnTracking.maybe_notify_tracking(name, args, result, state)
+                    unless match?({:file_ref, _key, _lookup_key, _path, _offset, _size}, result) do
+                      ConnTracking.maybe_notify_keyspace(name, args, result)
+                      ConnTracking.maybe_notify_tracking(name, args, result, state)
+                    end
+
                     result
                   catch
                     :exit, {:noproc, _} ->
@@ -631,14 +768,124 @@ defmodule FerricstoreServer.Connection.Pipeline do
               err
           end
 
-        {:cont, {:continue, [Encoder.encode(result) | acc]}}
+        {:cont, {:continue, [response_entry(result) | acc]}}
       end)
 
-    if state.transport == :ranch_tcp, do: TcpOpts.set_cork(state.socket, true)
-    send_response_fn.(state.socket, state.transport, Enum.reverse(responses))
-    if state.transport == :ranch_tcp, do: TcpOpts.set_cork(state.socket, false)
+    responses = Enum.reverse(responses)
 
-    {action, state}
+    if state.transport == :ranch_tcp, do: TcpOpts.set_cork(state.socket, true)
+
+    result =
+      if Enum.any?(responses, &match?({:file_ref, _key, _lookup_key, _path, _offset, _size}, &1)) do
+        stream_response_entries(responses, state, send_response_fn)
+      else
+        send_response_fn.(
+          state.socket,
+          state.transport,
+          Enum.map(responses, fn {:encoded, encoded} -> encoded end)
+        )
+
+        {action, state}
+      end
+
+    if state.transport == :ranch_tcp, do: TcpOpts.set_cork(state.socket, false)
+    result
+  end
+
+  defp prefetch_pure_tcp_gets(commands, %{transport: :ranch_tcp} = state) do
+    gets =
+      commands
+      |> Enum.with_index()
+      |> Enum.reduce([], fn {cmd, idx}, acc ->
+        case command_parts(cmd) do
+          {"GET", [key], {:get, key}, [key]} when is_binary(key) ->
+            [{idx, key, namespace_key(state.sandbox_namespace, key)} | acc]
+
+          _ ->
+            acc
+        end
+      end)
+      |> Enum.reverse()
+
+    case gets do
+      [] ->
+        %{}
+
+      _ ->
+        lookup_keys = Enum.map(gets, fn {_idx, _key, lookup_key} -> lookup_key end)
+
+        case safe_dispatch(fn ->
+               Router.batch_get_with_file_refs(
+                 state.instance_ctx,
+                 lookup_keys,
+                 ConnSendfile.threshold_bytes()
+               )
+             end) do
+          {:ok, results} ->
+            gets
+            |> Enum.zip(results)
+            |> Map.new(fn
+              {{idx, key, lookup_key}, {:file_ref, path, offset, size}} ->
+                {idx, {:file_ref, key, lookup_key, path, offset, size}}
+
+              {{idx, _key, _lookup_key}, value} ->
+                {idx, value}
+            end)
+
+          {:error, err} ->
+            Map.new(gets, fn {idx, _key, _lookup_key} -> {idx, err} end)
+        end
+    end
+  end
+
+  defp prefetch_pure_tcp_gets(_commands, _state), do: %{}
+
+  defp dispatch_pure_command(idx, name, args, ast, store, state, prefetched_gets) do
+    case Map.fetch(prefetched_gets, idx) do
+      {:ok, result} ->
+        result
+
+      :error ->
+        dispatch_store_command(
+          name,
+          args,
+          ast,
+          store,
+          state.instance_ctx,
+          state.sandbox_namespace
+        )
+    end
+  end
+
+  defp response_entry({:file_ref, _key, _lookup_key, _path, _offset, _size} = file_ref),
+    do: file_ref
+
+  defp response_entry(result), do: {:encoded, Encoder.encode(result)}
+
+  defp stream_response_entries(entries, state, send_response_fn) do
+    Enum.reduce_while(entries, {:continue, state}, fn
+      {:file_ref, key, lookup_key, path, offset, size}, {:continue, acc_state} ->
+        case ConnSendfile.send_file_ref(key, path, offset, size, acc_state) do
+          {:sent, new_state} ->
+            {:cont, {:continue, new_state}}
+
+          :fallback ->
+            send_response_fn.(
+              acc_state.socket,
+              acc_state.transport,
+              Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
+            )
+
+            {:cont, {:continue, acc_state}}
+
+          {:error_after_header, _reason} ->
+            {:halt, {:quit, acc_state}}
+        end
+
+      {:encoded, encoded}, {:continue, acc_state} ->
+        send_response_fn.(acc_state.socket, acc_state.transport, encoded)
+        {:cont, {:continue, acc_state}}
+    end)
   end
 
   defp log_acl_denied(state, name) do

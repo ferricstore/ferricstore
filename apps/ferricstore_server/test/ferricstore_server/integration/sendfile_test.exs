@@ -31,6 +31,11 @@ defmodule FerricstoreServer.Integration.SendfileTest do
     :ok = :gen_tcp.send(sock, data)
   end
 
+  defp send_pipeline(sock, commands) do
+    data = commands |> Enum.map(&Encoder.encode/1) |> IO.iodata_to_binary()
+    :ok = :gen_tcp.send(sock, data)
+  end
+
   defp recv_response(sock) do
     recv_response(sock, "")
   end
@@ -78,6 +83,21 @@ defmodule FerricstoreServer.Integration.SendfileTest do
   end
 
   defp ukey(suffix), do: "sendfile_test:#{suffix}:#{System.unique_integer([:positive])}"
+
+  defp attach_sendfile_handler(test_pid) do
+    id = {__MODULE__, test_pid, System.unique_integer([:positive])}
+
+    :telemetry.attach(
+      id,
+      [:ferricstore, :server, :sendfile],
+      fn event, measurements, metadata, pid ->
+        send(pid, {:sendfile_event, event, measurements, metadata})
+      end,
+      test_pid
+    )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+  end
 
   setup_all do
     # The application supervisor already starts the Ranch listener.
@@ -242,7 +262,11 @@ defmodule FerricstoreServer.Integration.SendfileTest do
     test "multiple large GETs in sequence work correctly", %{port: port} do
       sock = connect_and_hello(port)
       keys = Enum.map(1..3, fn i -> ukey("multi_large_#{i}") end)
-      values = Enum.map(1..3, fn i -> :binary.copy(<<rem(64 + i, 256)>>, @sendfile_threshold + i * 1000) end)
+
+      values =
+        Enum.map(1..3, fn i ->
+          :binary.copy(<<rem(64 + i, 256)>>, @sendfile_threshold + i * 1000)
+        end)
 
       for {k, v} <- Enum.zip(keys, values) do
         send_cmd(sock, ["SET", k, v])
@@ -290,6 +314,101 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       assert Enum.at(results, 2) == {:simple, "PONG"}
       assert Enum.at(results, 3) == small_val
       assert Enum.at(results, 4) == large_val
+
+      :gen_tcp.close(sock)
+    end
+
+    test "true pipelined large GETs use sendfile and preserve response order", %{port: port} do
+      attach_sendfile_handler(self())
+
+      sock = connect_and_hello(port)
+      keys = Enum.map(1..3, fn i -> ukey("true_pipe_large_#{i}") end)
+      values = Enum.map(1..3, fn i -> :binary.copy(<<i>>, @sendfile_threshold + i * 4096) end)
+
+      for {key, value} <- Enum.zip(keys, values) do
+        send_cmd(sock, ["SET", key, value])
+        assert recv_response(sock) == {:simple, "OK"}
+      end
+
+      :gen_tcp.close(sock)
+      sock = connect_and_hello(port)
+
+      send_pipeline(sock, Enum.map(keys, &["GET", &1]))
+
+      assert recv_n(sock, length(keys)) == values
+
+      for value <- values do
+        size = byte_size(value)
+
+        assert_receive {:sendfile_event, [:ferricstore, :server, :sendfile], %{bytes: ^size},
+                        %{result: :ok}},
+                       1000
+      end
+
+      :gen_tcp.close(sock)
+    end
+
+    test "mixed GET and SET pipeline streams cold GETs with sendfile", %{port: port} do
+      attach_sendfile_handler(self())
+
+      sock = connect_and_hello(port)
+      large_key = ukey("mixed_pipe_large")
+      set_key = ukey("mixed_pipe_set")
+      large_value = :binary.copy("M", @sendfile_threshold + 4096)
+
+      send_cmd(sock, ["SET", large_key, large_value])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :gen_tcp.close(sock)
+      sock = connect_and_hello(port)
+
+      send_pipeline(sock, [
+        ["GET", large_key],
+        ["SET", set_key, "after"],
+        ["GET", large_key]
+      ])
+
+      assert recv_n(sock, 3) == [large_value, {:simple, "OK"}, large_value]
+
+      for _ <- 1..2 do
+        size = byte_size(large_value)
+
+        assert_receive {:sendfile_event, [:ferricstore, :server, :sendfile], %{bytes: ^size},
+                        %{result: :ok}},
+                       1000
+      end
+
+      :gen_tcp.close(sock)
+    end
+
+    test "general GET and PING pipeline streams cold GETs with sendfile", %{port: port} do
+      attach_sendfile_handler(self())
+
+      sock = connect_and_hello(port)
+      large_key = ukey("general_pipe_large")
+      large_value = :binary.copy("G", @sendfile_threshold + 4096)
+
+      send_cmd(sock, ["SET", large_key, large_value])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :gen_tcp.close(sock)
+      sock = connect_and_hello(port)
+
+      send_pipeline(sock, [
+        ["GET", large_key],
+        ["PING"],
+        ["GET", large_key]
+      ])
+
+      assert recv_n(sock, 3) == [large_value, {:simple, "PONG"}, large_value]
+
+      for _ <- 1..2 do
+        size = byte_size(large_value)
+
+        assert_receive {:sendfile_event, [:ferricstore, :server, :sendfile], %{bytes: ^size},
+                        %{result: :ok}},
+                       1000
+      end
 
       :gen_tcp.close(sock)
     end
