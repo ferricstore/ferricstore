@@ -4226,14 +4226,41 @@ defmodule Ferricstore.Store.Router do
           {:ok, [{binary(), float()}]} | :unavailable
   def zset_score_range(ctx, redis_key, min_bound, max_bound, reverse?) do
     idx = shard_for(ctx, redis_key)
-    safe_read_call(ctx, idx, {:zset_score_range, redis_key, min_bound, max_bound, reverse?})
+
+    ctx
+    |> safe_read_call(idx, {:zset_score_range, redis_key, min_bound, max_bound, reverse?})
+    |> unwrap_zset_index_reply()
+  end
+
+  @spec zset_score_range_slice(
+          FerricStore.Instance.t(),
+          binary(),
+          term(),
+          term(),
+          boolean(),
+          non_neg_integer(),
+          non_neg_integer() | :all
+        ) ::
+          {:ok, [{binary(), float()}]} | :unavailable
+  def zset_score_range_slice(ctx, redis_key, min_bound, max_bound, reverse?, offset, count) do
+    idx = shard_for(ctx, redis_key)
+
+    ctx
+    |> safe_read_call(
+      idx,
+      {:zset_score_range_slice, redis_key, min_bound, max_bound, reverse?, offset, count}
+    )
+    |> unwrap_zset_index_reply()
   end
 
   @spec zset_score_count(FerricStore.Instance.t(), binary(), term(), term()) ::
           {:ok, non_neg_integer()} | :unavailable
   def zset_score_count(ctx, redis_key, min_bound, max_bound) do
     idx = shard_for(ctx, redis_key)
-    safe_read_call(ctx, idx, {:zset_score_count, redis_key, min_bound, max_bound})
+
+    ctx
+    |> safe_read_call(idx, {:zset_score_count, redis_key, min_bound, max_bound})
+    |> unwrap_zset_index_reply()
   end
 
   @spec zset_rank_range(
@@ -4246,15 +4273,24 @@ defmodule Ferricstore.Store.Router do
           {:ok, [{binary(), float()}]} | :unavailable
   def zset_rank_range(ctx, redis_key, start_idx, stop_idx, reverse?) do
     idx = shard_for(ctx, redis_key)
-    safe_read_call(ctx, idx, {:zset_rank_range, redis_key, start_idx, stop_idx, reverse?})
+
+    ctx
+    |> safe_read_call(idx, {:zset_rank_range, redis_key, start_idx, stop_idx, reverse?})
+    |> unwrap_zset_index_reply()
   end
 
   @spec zset_member_rank(FerricStore.Instance.t(), binary(), binary(), boolean()) ::
           {:ok, non_neg_integer() | nil} | :unavailable
   def zset_member_rank(ctx, redis_key, member, reverse?) do
     idx = shard_for(ctx, redis_key)
-    safe_read_call(ctx, idx, {:zset_member_rank, redis_key, member, reverse?})
+
+    ctx
+    |> safe_read_call(idx, {:zset_member_rank, redis_key, member, reverse?})
+    |> unwrap_zset_index_reply()
   end
+
+  defp unwrap_zset_index_reply({:ok, {:ok, result}}), do: {:ok, result}
+  defp unwrap_zset_index_reply(other), do: other
 
   @spec compound_delete_prefix(FerricStore.Instance.t(), binary(), binary()) :: :ok
   def compound_delete_prefix(ctx, redis_key, prefix) do

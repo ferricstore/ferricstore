@@ -73,7 +73,18 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.CommandTime
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{BitcaskWriter, ColdRead, LFU, ListOps, Promotion, Router, ValueCodec}
+
+  alias Ferricstore.Store.{
+    BitcaskWriter,
+    ColdRead,
+    CompoundKey,
+    LFU,
+    ListOps,
+    Promotion,
+    Router,
+    ValueCodec
+  }
+
   alias Ferricstore.Store.Shard.ZSetIndex
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Transaction.Ast, as: TxAst
@@ -1470,7 +1481,9 @@ defmodule Ferricstore.Raft.StateMachine do
           data_dir: data_dir,
           shard_data_path: anchor_state.shard_data_path,
           active_file_path: anchor_state.active_file_path,
-          active_file_id: anchor_state.active_file_id
+          active_file_id: anchor_state.active_file_id,
+          zset_score_index_name: anchor_state.zset_score_index_name,
+          zset_score_lookup_name: anchor_state.zset_score_lookup_name
         }
       else
         {file_id, file_path, shard_data_path} =
@@ -1483,6 +1496,11 @@ defmodule Ferricstore.Raft.StateMachine do
             :"keydir_#{shard_idx}"
           end
 
+        instance_name = if instance_ctx, do: instance_ctx.name, else: anchor_state.instance_name
+
+        {zset_score_index_name, zset_score_lookup_name} =
+          ZSetIndex.table_names(instance_name, shard_idx)
+
         %{
           instance_ctx: instance_ctx,
           keydir: keydir,
@@ -1490,7 +1508,9 @@ defmodule Ferricstore.Raft.StateMachine do
           data_dir: data_dir,
           shard_data_path: shard_data_path,
           active_file_path: file_path,
-          active_file_id: file_id
+          active_file_id: file_id,
+          zset_score_index_name: zset_score_index_name,
+          zset_score_lookup_name: zset_score_lookup_name
         }
       end
 
@@ -1817,6 +1837,49 @@ defmodule Ferricstore.Raft.StateMachine do
       end,
       compound_delete_prefix: fn _redis_key, prefix ->
         cross_shard_delete_prefix(ctx, prefix, local_delete)
+      end,
+      zset_score_range: fn redis_key, min_bound, max_bound, reverse? ->
+        cross_shard_zset_index_read(ctx, redis_key, fn state ->
+          {:ok,
+           ZSetIndex.range(state.zset_score_index, redis_key, min_bound, max_bound, reverse?)}
+        end)
+      end,
+      zset_score_range_slice: fn redis_key, min_bound, max_bound, reverse?, offset, count ->
+        cross_shard_zset_index_read(ctx, redis_key, fn state ->
+          {:ok,
+           ZSetIndex.range_slice(
+             state.zset_score_index,
+             redis_key,
+             min_bound,
+             max_bound,
+             reverse?,
+             offset,
+             count
+           )}
+        end)
+      end,
+      zset_score_count: fn redis_key, min_bound, max_bound ->
+        cross_shard_zset_index_read(ctx, redis_key, fn state ->
+          {:ok, ZSetIndex.count(state.zset_score_index, redis_key, min_bound, max_bound)}
+        end)
+      end,
+      zset_rank_range: fn redis_key, start_idx, stop_idx, reverse? ->
+        cross_shard_zset_index_read(ctx, redis_key, fn state ->
+          {:ok,
+           ZSetIndex.rank_range(state.zset_score_index, redis_key, start_idx, stop_idx, reverse?)}
+        end)
+      end,
+      zset_member_rank: fn redis_key, member, reverse? ->
+        cross_shard_zset_index_read(ctx, redis_key, fn state ->
+          {:ok,
+           ZSetIndex.member_rank(
+             state.zset_score_index,
+             state.zset_score_lookup,
+             redis_key,
+             member,
+             reverse?
+           )}
+        end)
       end,
       prob_dir: fn ->
         Path.join(ctx.shard_data_path, "prob")
@@ -2299,6 +2362,48 @@ defmodule Ferricstore.Raft.StateMachine do
       end
 
     sm_merge_tx_pending_prefix(results, prefix)
+  end
+
+  defp cross_shard_zset_index_read(ctx, redis_key, fun) do
+    cond do
+      not sm_zset_index_clean?() ->
+        :unavailable
+
+      not zset_index_tables?(ctx) ->
+        :unavailable
+
+      true ->
+        ctx
+        |> cross_shard_zset_index_state(redis_key)
+        |> fun.()
+    end
+  end
+
+  defp cross_shard_zset_index_state(ctx, redis_key) do
+    prefix = CompoundKey.zset_prefix(redis_key)
+    data_path = promoted_compound_path(ctx, redis_key, prefix) || ctx.shard_data_path
+
+    state = %{
+      keydir: ctx.keydir,
+      shard_data_path: ctx.shard_data_path,
+      zset_score_index: ctx.zset_score_index_name,
+      zset_score_lookup: ctx.zset_score_lookup_name,
+      zset_index_ready: MapSet.new()
+    }
+
+    ZSetIndex.ensure(state, redis_key, prefix, data_path)
+  end
+
+  defp zset_index_tables?(%{zset_score_index_name: index, zset_score_lookup_name: lookup})
+       when is_atom(index) and is_atom(lookup) do
+    :ets.info(index) != :undefined and :ets.info(lookup) != :undefined
+  end
+
+  defp zset_index_tables?(_ctx), do: false
+
+  defp sm_zset_index_clean? do
+    map_size(Process.get(:tx_pending_values, %{})) == 0 and
+      MapSet.size(Process.get(:tx_deleted_keys, MapSet.new())) == 0
   end
 
   defp promoted_compound_path(ctx, redis_key, compound_key_or_prefix) do
@@ -5483,7 +5588,11 @@ defmodule Ferricstore.Raft.StateMachine do
          value
        )
        when index != nil and lookup != nil do
-    ZSetIndex.apply_put_to_tables(index, lookup, redis_key, key, to_disk_binary(value))
+    if zset_index_tables?(%{zset_score_index_name: index, zset_score_lookup_name: lookup}) do
+      ZSetIndex.apply_put_to_tables(index, lookup, redis_key, key, to_disk_binary(value))
+    end
+
+    :ok
   end
 
   defp zset_index_put(_state, _redis_key, _key, _value), do: :ok
@@ -5494,7 +5603,11 @@ defmodule Ferricstore.Raft.StateMachine do
          key
        )
        when index != nil and lookup != nil do
-    ZSetIndex.apply_delete_to_tables(index, lookup, redis_key, key)
+    if zset_index_tables?(%{zset_score_index_name: index, zset_score_lookup_name: lookup}) do
+      ZSetIndex.apply_delete_to_tables(index, lookup, redis_key, key)
+    end
+
+    :ok
   end
 
   defp zset_index_delete(_state, _redis_key, _key), do: :ok
@@ -5504,7 +5617,11 @@ defmodule Ferricstore.Raft.StateMachine do
          redis_key
        )
        when index != nil and lookup != nil do
-    ZSetIndex.clear_key(index, lookup, redis_key)
+    if zset_index_tables?(%{zset_score_index_name: index, zset_score_lookup_name: lookup}) do
+      ZSetIndex.clear_key(index, lookup, redis_key)
+    end
+
+    :ok
   end
 
   defp zset_index_clear(_state, _redis_key), do: :ok

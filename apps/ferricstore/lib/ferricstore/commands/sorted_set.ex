@@ -472,26 +472,34 @@ defmodule Ferricstore.Commands.SortedSet do
               max_bound = raw_score_bound(max_val, max_excl)
 
               filtered =
-                case Ops.zset_score_range(store, key, min_bound, max_bound, false) do
+                case Ops.zset_score_range_slice(
+                       store,
+                       key,
+                       min_bound,
+                       max_bound,
+                       false,
+                       offset,
+                       count
+                     ) do
                   {:ok, members} ->
                     members
 
                   :unavailable ->
-                    key
-                    |> load_members(store)
-                    |> Enum.filter(fn {_member, score} ->
-                      score_gte?(score, min_val, min_excl) and
-                        score_lte?(score, max_val, max_excl)
-                    end)
-                    |> sort_members(false)
+                    zrangebyscore_full_range(
+                      key,
+                      min_bound,
+                      max_bound,
+                      false,
+                      offset,
+                      count,
+                      store
+                    )
                 end
 
-              paginated = apply_limit(filtered, offset, count)
-
               if with_scores do
-                Enum.flat_map(paginated, fn {member, score} -> [member, format_score(score)] end)
+                Enum.flat_map(filtered, fn {member, score} -> [member, format_score(score)] end)
               else
-                Enum.map(paginated, fn {member, _score} -> member end)
+                Enum.map(filtered, fn {member, _score} -> member end)
               end
           end
 
@@ -522,26 +530,34 @@ defmodule Ferricstore.Commands.SortedSet do
               max_bound = raw_score_bound(max_val, max_excl)
 
               filtered =
-                case Ops.zset_score_range(store, key, min_bound, max_bound, true) do
+                case Ops.zset_score_range_slice(
+                       store,
+                       key,
+                       min_bound,
+                       max_bound,
+                       true,
+                       offset,
+                       count
+                     ) do
                   {:ok, members} ->
                     members
 
                   :unavailable ->
-                    key
-                    |> load_members(store)
-                    |> Enum.filter(fn {_member, score} ->
-                      score_gte?(score, min_val, min_excl) and
-                        score_lte?(score, max_val, max_excl)
-                    end)
-                    |> sort_members(true)
+                    zrangebyscore_full_range(
+                      key,
+                      min_bound,
+                      max_bound,
+                      true,
+                      offset,
+                      count,
+                      store
+                    )
                 end
 
-              paginated = apply_limit(filtered, offset, count)
-
               if with_scores do
-                Enum.flat_map(paginated, fn {member, score} -> [member, format_score(score)] end)
+                Enum.flat_map(filtered, fn {member, score} -> [member, format_score(score)] end)
               else
-                Enum.map(paginated, fn {member, _score} -> member end)
+                Enum.map(filtered, fn {member, _score} -> member end)
               end
           end
 
@@ -971,27 +987,46 @@ defmodule Ferricstore.Commands.SortedSet do
     with :ok <- TypeRegistry.check_type(key, :zset, store),
          {:ok, with_scores, offset, count} <- typed_range_by_score_opts(opts) do
       filtered =
-        case Ops.zset_score_range(store, key, min_bound, max_bound, reverse?) do
+        case Ops.zset_score_range_slice(
+               store,
+               key,
+               min_bound,
+               max_bound,
+               reverse?,
+               offset,
+               count
+             ) do
           {:ok, members} ->
             members
 
           :unavailable ->
-            key
-            |> load_members(store)
-            |> Enum.filter(fn {_member, score} ->
-              score_gte_bound?(score, min_bound) and score_lte_bound?(score, max_bound)
-            end)
-            |> sort_members(reverse?)
+            zrangebyscore_full_range(key, min_bound, max_bound, reverse?, offset, count, store)
         end
 
-      paginated = apply_limit(filtered, offset, count)
-
       if with_scores do
-        Enum.flat_map(paginated, fn {member, score} -> [member, format_score(score)] end)
+        Enum.flat_map(filtered, fn {member, score} -> [member, format_score(score)] end)
       else
-        Enum.map(paginated, fn {member, _score} -> member end)
+        Enum.map(filtered, fn {member, _score} -> member end)
       end
     end
+  end
+
+  defp zrangebyscore_full_range(key, min_bound, max_bound, reverse?, offset, count, store) do
+    filtered =
+      case Ops.zset_score_range(store, key, min_bound, max_bound, reverse?) do
+        {:ok, members} ->
+          members
+
+        :unavailable ->
+          key
+          |> load_members(store)
+          |> Enum.filter(fn {_member, score} ->
+            score_gte_bound?(score, min_bound) and score_lte_bound?(score, max_bound)
+          end)
+          |> sort_members(reverse?)
+      end
+
+    apply_limit(filtered, offset, count)
   end
 
   defp load_sorted_members(key, store) do

@@ -18,6 +18,7 @@ defmodule Ferricstore.Store.Ops do
   alias Ferricstore.Store.LocalTxStore
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Writes, as: ShardWrites
+  alias Ferricstore.Store.Shard.ZSetIndex
 
   @typep store :: FerricStore.Instance.t() | LocalTxStore.t() | map()
   @max_int64 9_223_372_036_854_775_807
@@ -759,8 +760,11 @@ defmodule Ferricstore.Store.Ops do
   def zset_score_range(%FerricStore.Instance{} = ctx, redis_key, min_bound, max_bound, reverse?),
     do: Router.zset_score_range(ctx, redis_key, min_bound, max_bound, reverse?)
 
-  def zset_score_range(%LocalTxStore{}, _redis_key, _min_bound, _max_bound, _reverse?),
-    do: :unavailable
+  def zset_score_range(%LocalTxStore{} = tx, redis_key, min_bound, max_bound, reverse?) do
+    local_zset_index_read(tx, redis_key, fn state ->
+      {:ok, ZSetIndex.range(state.zset_score_index, redis_key, min_bound, max_bound, reverse?)}
+    end)
+  end
 
   def zset_score_range(store, redis_key, min_bound, max_bound, reverse?) when is_map(store) do
     case store do
@@ -772,12 +776,80 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
+  @spec zset_score_range_slice(
+          store(),
+          binary(),
+          term(),
+          term(),
+          boolean(),
+          non_neg_integer(),
+          non_neg_integer() | :all
+        ) ::
+          {:ok, [{binary(), float()}]} | :unavailable
+  def zset_score_range_slice(
+        %FerricStore.Instance{} = ctx,
+        redis_key,
+        min_bound,
+        max_bound,
+        reverse?,
+        offset,
+        count
+      ),
+      do:
+        Router.zset_score_range_slice(
+          ctx,
+          redis_key,
+          min_bound,
+          max_bound,
+          reverse?,
+          offset,
+          count
+        )
+
+  def zset_score_range_slice(
+        %LocalTxStore{} = tx,
+        redis_key,
+        min_bound,
+        max_bound,
+        reverse?,
+        offset,
+        count
+      ) do
+    local_zset_index_read(tx, redis_key, fn state ->
+      {:ok,
+       ZSetIndex.range_slice(
+         state.zset_score_index,
+         redis_key,
+         min_bound,
+         max_bound,
+         reverse?,
+         offset,
+         count
+       )}
+    end)
+  end
+
+  def zset_score_range_slice(store, redis_key, min_bound, max_bound, reverse?, offset, count)
+      when is_map(store) do
+    case store do
+      %{zset_score_range_slice: fun} when is_function(fun, 6) ->
+        fun.(redis_key, min_bound, max_bound, reverse?, offset, count)
+
+      _ ->
+        :unavailable
+    end
+  end
+
   @spec zset_score_count(store(), binary(), term(), term()) ::
           {:ok, non_neg_integer()} | :unavailable
   def zset_score_count(%FerricStore.Instance{} = ctx, redis_key, min_bound, max_bound),
     do: Router.zset_score_count(ctx, redis_key, min_bound, max_bound)
 
-  def zset_score_count(%LocalTxStore{}, _redis_key, _min_bound, _max_bound), do: :unavailable
+  def zset_score_count(%LocalTxStore{} = tx, redis_key, min_bound, max_bound) do
+    local_zset_index_read(tx, redis_key, fn state ->
+      {:ok, ZSetIndex.count(state.zset_score_index, redis_key, min_bound, max_bound)}
+    end)
+  end
 
   def zset_score_count(store, redis_key, min_bound, max_bound) when is_map(store) do
     case store do
@@ -794,8 +866,12 @@ defmodule Ferricstore.Store.Ops do
   def zset_rank_range(%FerricStore.Instance{} = ctx, redis_key, start_idx, stop_idx, reverse?),
     do: Router.zset_rank_range(ctx, redis_key, start_idx, stop_idx, reverse?)
 
-  def zset_rank_range(%LocalTxStore{}, _redis_key, _start_idx, _stop_idx, _reverse?),
-    do: :unavailable
+  def zset_rank_range(%LocalTxStore{} = tx, redis_key, start_idx, stop_idx, reverse?) do
+    local_zset_index_read(tx, redis_key, fn state ->
+      {:ok,
+       ZSetIndex.rank_range(state.zset_score_index, redis_key, start_idx, stop_idx, reverse?)}
+    end)
+  end
 
   def zset_rank_range(store, redis_key, start_idx, stop_idx, reverse?) when is_map(store) do
     case store do
@@ -812,7 +888,18 @@ defmodule Ferricstore.Store.Ops do
   def zset_member_rank(%FerricStore.Instance{} = ctx, redis_key, member, reverse?),
     do: Router.zset_member_rank(ctx, redis_key, member, reverse?)
 
-  def zset_member_rank(%LocalTxStore{}, _redis_key, _member, _reverse?), do: :unavailable
+  def zset_member_rank(%LocalTxStore{} = tx, redis_key, member, reverse?) do
+    local_zset_index_read(tx, redis_key, fn state ->
+      {:ok,
+       ZSetIndex.member_rank(
+         state.zset_score_index,
+         state.zset_score_lookup,
+         redis_key,
+         member,
+         reverse?
+       )}
+    end)
+  end
 
   def zset_member_rank(store, redis_key, member, reverse?) when is_map(store) do
     case store do
@@ -957,6 +1044,43 @@ defmodule Ferricstore.Store.Ops do
   # ===================================================================
 
   defp local?(tx, key), do: Router.shard_for(tx.instance_ctx, key) == tx.shard_index
+
+  defp local_zset_index_read(%LocalTxStore{} = tx, redis_key, fun) do
+    cond do
+      not local?(tx, redis_key) ->
+        :unavailable
+
+      not tx_zset_index_clean?() ->
+        :unavailable
+
+      not local_zset_tables?(tx.shard_state) ->
+        :unavailable
+
+      true ->
+        redis_key
+        |> local_zset_index_state(tx)
+        |> fun.()
+    end
+  end
+
+  defp local_zset_index_state(redis_key, tx) do
+    data_path = promoted_path(tx, redis_key) || tx.shard_state.shard_data_path
+    prefix = CompoundKey.zset_prefix(redis_key)
+
+    ZSetIndex.ensure(tx.shard_state, redis_key, prefix, data_path)
+  end
+
+  defp local_zset_tables?(%{zset_score_index: index, zset_score_lookup: lookup})
+       when is_atom(index) and is_atom(lookup) do
+    :ets.info(index) != :undefined and :ets.info(lookup) != :undefined
+  end
+
+  defp local_zset_tables?(_state), do: false
+
+  defp tx_zset_index_clean? do
+    map_size(Process.get(:tx_pending_values, %{})) == 0 and
+      MapSet.size(Process.get(:tx_deleted_keys, MapSet.new())) == 0
+  end
 
   defp stored_value_size(value) when is_binary(value), do: byte_size(value)
   defp stored_value_size(value) when is_integer(value), do: byte_size(Integer.to_string(value))

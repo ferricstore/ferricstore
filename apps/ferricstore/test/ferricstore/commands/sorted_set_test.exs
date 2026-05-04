@@ -498,6 +498,37 @@ defmodule Ferricstore.Commands.SortedSetTest do
       assert_receive {:zset_score_range, "zs", {:inclusive, 1.0}, {:inclusive, 3.0}, false}
     end
 
+    test "ZRANGEBYSCORE pushes LIMIT into score-index slice when available" do
+      parent = self()
+      base_store = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1", "a", "2", "b", "3", "c"], base_store)
+
+      store =
+        Map.put(base_store, :zset_score_range_slice, fn redis_key,
+                                                        min_bound,
+                                                        max_bound,
+                                                        reverse?,
+                                                        offset,
+                                                        count ->
+          send(
+            parent,
+            {:zset_score_range_slice, redis_key, min_bound, max_bound, reverse?, offset, count}
+          )
+
+          {:ok, [{"b", 2.0}]}
+        end)
+
+      assert ["b", "2.0"] ==
+               SortedSet.handle(
+                 "ZRANGEBYSCORE",
+                 ["zs", "1", "3", "WITHSCORES", "LIMIT", "1", "1"],
+                 store
+               )
+
+      assert_receive {:zset_score_range_slice, "zs", {:inclusive, 1.0}, {:inclusive, 3.0}, false,
+                      1, 1}
+    end
+
     test "ZREVRANGEBYSCORE passes reverse flag to score-index range" do
       parent = self()
       base_store = MockStore.make()

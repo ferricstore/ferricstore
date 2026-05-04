@@ -45,18 +45,59 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
   @spec range(:ets.tid(), binary(), term(), term(), boolean()) :: [{binary(), float()}]
   def range(index_table, redis_key, min_bound, max_bound, reverse?) do
-    items =
-      index_table
-      |> scan_range(redis_key, min_bound, max_bound)
-      |> Enum.reverse()
+    range_slice(index_table, redis_key, min_bound, max_bound, reverse?, 0, :all)
+  end
 
-    if reverse?, do: Enum.reverse(items), else: items
+  @spec range_slice(
+          :ets.tid(),
+          binary(),
+          term(),
+          term(),
+          boolean(),
+          non_neg_integer(),
+          non_neg_integer() | :all
+        ) :: [{binary(), float()}]
+  def range_slice(_index_table, _redis_key, _min_bound, _max_bound, _reverse?, _offset, 0),
+    do: []
+
+  def range_slice(index_table, redis_key, min_bound, max_bound, false, offset, count) do
+    collect_score_slice(
+      forward_range_first(index_table, redis_key, min_bound),
+      index_table,
+      redis_key,
+      min_bound,
+      max_bound,
+      offset,
+      count,
+      &next_key/2,
+      []
+    )
+  end
+
+  def range_slice(index_table, redis_key, min_bound, max_bound, true, offset, count) do
+    collect_score_slice(
+      reverse_range_first(index_table, redis_key, max_bound),
+      index_table,
+      redis_key,
+      min_bound,
+      max_bound,
+      offset,
+      count,
+      &prev_key/2,
+      []
+    )
   end
 
   @spec count(:ets.tid(), binary(), term(), term()) :: non_neg_integer()
   def count(index_table, redis_key, min_bound, max_bound) do
-    start = range_start(redis_key, min_bound)
-    count_range(index_table, :ets.next(index_table, start), redis_key, min_bound, max_bound, 0)
+    count_range(
+      index_table,
+      forward_range_first(index_table, redis_key, min_bound),
+      redis_key,
+      min_bound,
+      max_bound,
+      0
+    )
   end
 
   @spec rank_range(:ets.tid(), binary(), non_neg_integer(), non_neg_integer(), boolean()) ::
@@ -86,8 +127,8 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
       if :ets.member(index_table, target) do
         rank_until(
-          index_table,
           :ets.next(index_table, first_before(redis_key)),
+          index_table,
           redis_key,
           target,
           0,
@@ -105,8 +146,8 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
       if :ets.member(index_table, target) do
         rank_until(
-          index_table,
           :ets.prev(index_table, first_after(redis_key)),
+          index_table,
           redis_key,
           target,
           0,
@@ -245,11 +286,6 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     end
   end
 
-  defp scan_range(index_table, redis_key, min_bound, max_bound) do
-    start = range_start(redis_key, min_bound)
-    do_scan_range(index_table, :ets.next(index_table, start), redis_key, min_bound, max_bound, [])
-  end
-
   defp count_range(_table, :"$end_of_table", _redis_key, _min_bound, _max_bound, acc), do: acc
 
   defp count_range(table, key, redis_key, min_bound, max_bound, acc) do
@@ -268,6 +304,78 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
       _ ->
         acc
+    end
+  end
+
+  defp collect_score_slice(
+         :"$end_of_table",
+         _table,
+         _redis_key,
+         _min_bound,
+         _max_bound,
+         _offset,
+         _count,
+         _next,
+         acc
+       ) do
+    Enum.reverse(acc)
+  end
+
+  defp collect_score_slice(key, table, redis_key, min_bound, max_bound, offset, count, next, acc) do
+    case key do
+      {^redis_key, @index_tag, score, member} ->
+        cond do
+          not score_lte_bound?(score, max_bound) ->
+            Enum.reverse(acc)
+
+          not score_gte_bound?(score, min_bound) ->
+            Enum.reverse(acc)
+
+          offset > 0 ->
+            collect_score_slice(
+              next.(table, key),
+              table,
+              redis_key,
+              min_bound,
+              max_bound,
+              offset - 1,
+              count,
+              next,
+              acc
+            )
+
+          count == :all ->
+            collect_score_slice(
+              next.(table, key),
+              table,
+              redis_key,
+              min_bound,
+              max_bound,
+              offset,
+              count,
+              next,
+              [{member, score} | acc]
+            )
+
+          count > 0 ->
+            collect_score_slice(
+              next.(table, key),
+              table,
+              redis_key,
+              min_bound,
+              max_bound,
+              offset,
+              count - 1,
+              next,
+              [{member, score} | acc]
+            )
+
+          true ->
+            Enum.reverse(acc)
+        end
+
+      _ ->
+        Enum.reverse(acc)
     end
   end
 
@@ -338,39 +446,55 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     end
   end
 
-  defp do_scan_range(_table, :"$end_of_table", _redis_key, _min_bound, _max_bound, acc), do: acc
-
-  defp do_scan_range(table, key, redis_key, min_bound, max_bound, acc) do
-    case key do
-      {^redis_key, @index_tag, score, member} ->
-        cond do
-          not score_lte_bound?(score, max_bound) ->
-            acc
-
-          score_gte_bound?(score, min_bound) ->
-            do_scan_range(table, :ets.next(table, key), redis_key, min_bound, max_bound, [
-              {member, score} | acc
-            ])
-
-          true ->
-            do_scan_range(table, :ets.next(table, key), redis_key, min_bound, max_bound, acc)
-        end
-
-      _ ->
-        acc
-    end
+  defp forward_range_first(table, redis_key, :neg_inf) do
+    :ets.next(table, first_before(redis_key))
   end
 
-  defp range_start(redis_key, :neg_inf), do: {redis_key, @index_tag}
-  defp range_start(redis_key, {:inclusive, score}), do: {redis_key, @index_tag, score}
-  defp range_start(redis_key, {:exclusive, score}), do: {redis_key, @index_tag, score}
-
-  defp range_start(redis_key, :inf) do
-    {redis_key, @index_tag}
+  defp forward_range_first(table, redis_key, {:inclusive, score}) do
+    :ets.next(table, before_score_ties(redis_key, score))
   end
 
-  defp first_before(redis_key), do: {redis_key, @index_tag}
-  defp first_after(redis_key), do: {redis_key, @index_tag + 1}
+  defp forward_range_first(table, redis_key, {:exclusive, score}) do
+    table
+    |> :ets.next(before_score_ties(redis_key, score))
+    |> after_score_ties(table, redis_key, score)
+  end
+
+  defp forward_range_first(_table, _redis_key, :inf), do: :"$end_of_table"
+
+  defp reverse_range_first(table, redis_key, :inf) do
+    :ets.prev(table, first_after(redis_key))
+  end
+
+  defp reverse_range_first(_table, _redis_key, :neg_inf), do: :"$end_of_table"
+
+  defp reverse_range_first(table, redis_key, {:inclusive, score}) do
+    boundary =
+      table
+      |> :ets.next(before_score_ties(redis_key, score))
+      |> after_score_ties(table, redis_key, score)
+
+    :ets.prev(table, boundary)
+  end
+
+  defp reverse_range_first(table, redis_key, {:exclusive, score}) do
+    :ets.prev(table, before_score_ties(redis_key, score))
+  end
+
+  defp before_score_ties(redis_key, score), do: {redis_key, @index_tag, score, nil}
+
+  defp after_score_ties(:"$end_of_table", _table, redis_key, _score), do: first_after(redis_key)
+
+  defp after_score_ties({redis_key, @index_tag, score, _member} = key, table, redis_key, score) do
+    table
+    |> :ets.next(key)
+    |> after_score_ties(table, redis_key, score)
+  end
+
+  defp after_score_ties(key, _table, _redis_key, _score), do: key
+
+  defp first_before(redis_key), do: {redis_key, @index_tag - 1, nil, nil}
+  defp first_after(redis_key), do: {redis_key, @index_tag + 1, nil, nil}
   defp next_key(table, key), do: :ets.next(table, key)
   defp prev_key(table, key), do: :ets.prev(table, key)
 

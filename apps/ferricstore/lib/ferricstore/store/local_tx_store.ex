@@ -29,7 +29,10 @@ defmodule Ferricstore.Store.LocalTxStore do
         index: state.index,
         shard_data_path: state.shard_data_path,
         data_dir: state.data_dir,
-        promoted_instances: state.promoted_instances
+        promoted_instances: state.promoted_instances,
+        zset_score_index: state.zset_score_index,
+        zset_score_lookup: state.zset_score_lookup,
+        zset_index_ready: state.zset_index_ready
       }
     }
   end

@@ -90,6 +90,44 @@ defmodule SortedSetBench do
     Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
   end
 
+  def zrangebyscore_limit(key) do
+    unwrap_range_result(
+      Ferricstore.Commands.SortedSet.handle(
+        "ZRANGEBYSCORE",
+        [key, "-inf", "+inf", "LIMIT", "0", "10"],
+        FerricStore.Instance.get(:default)
+      )
+    )
+  end
+
+  def zrevrangebyscore_limit(key) do
+    unwrap_range_result(
+      Ferricstore.Commands.SortedSet.handle(
+        "ZREVRANGEBYSCORE",
+        [key, "+inf", "-inf", "LIMIT", "0", "10"],
+        FerricStore.Instance.get(:default)
+      )
+    )
+  end
+
+  def unwrap_range_result({:ok, {:ok, result}}), do: result
+  def unwrap_range_result({:ok, result}), do: result
+  def unwrap_range_result(result) when is_list(result), do: result
+
+  def unwrap_range_result(other) do
+    raise("unexpected range result: #{inspect(other)}")
+  end
+
+  def zrangebyscore_limit_batch(key, depth) do
+    queue =
+      for _ <- 1..depth do
+        {"ZRANGEBYSCORE", [key, "-inf", "+inf", "LIMIT", "0", "10"],
+         {:zrangebyscore, key, :neg_inf, :inf, [{:limit, {0, 10}}]}}
+      end
+
+    Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
+  end
+
   def tcp_connect(port) do
     {:ok, socket} =
       :gen_tcp.connect(~c"127.0.0.1", port, [
@@ -159,6 +197,8 @@ try do
     FerricStore.zscore(key, SortedSetBench.member(mid))
     FerricStore.zrange(key, 0, 9)
     FerricStore.zrangebyscore(key, low_score, high_score)
+    SortedSetBench.zrangebyscore_limit(key)
+    SortedSetBench.zrevrangebyscore_limit(key)
     FerricStore.zcount(key, low_score, high_score)
 
     tcp_zscore =
@@ -181,6 +221,19 @@ try do
         {socket, payload}
       end
 
+    tcp_zrangebyscore_limit =
+      if tcp? do
+        socket = SortedSetBench.tcp_connect(tcp_port)
+
+        payload =
+          SortedSetBench.resp_pipeline(
+            ["ZRANGEBYSCORE", key, "-inf", "+inf", "LIMIT", "0", "10"],
+            batch_depth
+          )
+
+        {socket, payload}
+      end
+
     base_jobs = %{
       "zscore hit size=#{size}" => fn ->
         {:ok, _} = FerricStore.zscore(key, SortedSetBench.member(mid))
@@ -196,6 +249,14 @@ try do
         {:ok, result} = FerricStore.zrangebyscore(key, low_score, high_score)
         true = is_list(result)
       end,
+      "zrangebyscore full-limit10 size=#{size}" => fn ->
+        result = SortedSetBench.zrangebyscore_limit(key)
+        true = length(result) == 10
+      end,
+      "zrevrangebyscore full-limit10 size=#{size}" => fn ->
+        result = SortedSetBench.zrevrangebyscore_limit(key)
+        true = length(result) == 10
+      end,
       "zcount 10ish size=#{size}" => fn ->
         {:ok, count} = FerricStore.zcount(key, low_score, high_score)
         true = is_integer(count)
@@ -206,6 +267,10 @@ try do
       end,
       "batch#{batch_depth} zrangebyscore size=#{size}" => fn ->
         results = SortedSetBench.zrangebyscore_batch(key, low_score, high_score, batch_depth)
+        true = length(results) == batch_depth
+      end,
+      "batch#{batch_depth} zrangebyscore full-limit10 size=#{size}" => fn ->
+        results = SortedSetBench.zrangebyscore_limit_batch(key, batch_depth)
         true = length(results) == batch_depth
       end
     }
@@ -220,6 +285,11 @@ try do
           end,
           "tcp-pipeline#{batch_depth} zrangebyscore size=#{size}" => fn ->
             {socket, payload} = tcp_zrangebyscore
+            results = SortedSetBench.tcp_roundtrip(socket, payload, batch_depth)
+            true = length(results) == batch_depth
+          end,
+          "tcp-pipeline#{batch_depth} zrangebyscore full-limit10 size=#{size}" => fn ->
+            {socket, payload} = tcp_zrangebyscore_limit
             results = SortedSetBench.tcp_roundtrip(socket, payload, batch_depth)
             true = length(results) == batch_depth
           end
@@ -239,6 +309,7 @@ try do
 
     if tcp_zscore, do: :gen_tcp.close(elem(tcp_zscore, 0))
     if tcp_zrangebyscore, do: :gen_tcp.close(elem(tcp_zrangebyscore, 0))
+    if tcp_zrangebyscore_limit, do: :gen_tcp.close(elem(tcp_zrangebyscore_limit, 0))
   end)
 after
   IO.puts("\nCleaning up bench data directory: #{bench_data_dir}")

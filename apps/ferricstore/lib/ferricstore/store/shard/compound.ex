@@ -550,6 +550,41 @@ defmodule Ferricstore.Store.Shard.Compound do
      state}
   end
 
+  @spec handle_zset_score_range_slice(
+          binary(),
+          term(),
+          term(),
+          boolean(),
+          non_neg_integer(),
+          non_neg_integer() | :all,
+          map()
+        ) ::
+          {:reply, {:ok, [{binary(), float()}]}, map()}
+  @doc false
+  def handle_zset_score_range_slice(
+        redis_key,
+        min_bound,
+        max_bound,
+        reverse?,
+        offset,
+        count,
+        state
+      ) do
+    state = ensure_zset_score_index(state, redis_key)
+
+    {:reply,
+     {:ok,
+      ZSetIndex.range_slice(
+        state.zset_score_index,
+        redis_key,
+        min_bound,
+        max_bound,
+        reverse?,
+        offset,
+        count
+      )}, state}
+  end
+
   @spec handle_zset_score_count(binary(), term(), term(), map()) ::
           {:reply, {:ok, non_neg_integer()}, map()}
   @doc false

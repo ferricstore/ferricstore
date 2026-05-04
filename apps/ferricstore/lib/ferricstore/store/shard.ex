@@ -603,6 +603,22 @@ defmodule Ferricstore.Store.Shard do
     ShardCompound.handle_zset_score_range(redis_key, min_bound, max_bound, reverse?, state)
   end
 
+  def handle_call(
+        {:zset_score_range_slice, redis_key, min_bound, max_bound, reverse?, offset, count},
+        _from,
+        state
+      ) do
+    ShardCompound.handle_zset_score_range_slice(
+      redis_key,
+      min_bound,
+      max_bound,
+      reverse?,
+      offset,
+      count,
+      state
+    )
+  end
+
   def handle_call({:zset_score_count, redis_key, min_bound, max_bound}, _from, state) do
     ShardCompound.handle_zset_score_count(redis_key, min_bound, max_bound, state)
   end
