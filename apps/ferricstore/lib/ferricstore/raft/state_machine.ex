@@ -5659,6 +5659,7 @@ defmodule Ferricstore.Raft.StateMachine do
         do_delete_prefix(state, prefix)
 
       _dedicated_path ->
+        Promotion.await_compaction_latch(state, redis_key)
         delete_compound_prefix_from_ets(state, prefix)
 
         Promotion.cleanup_promoted!(

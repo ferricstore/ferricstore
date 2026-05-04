@@ -12,7 +12,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.StateMachine
   alias Ferricstore.Store.BitcaskWriter
-  alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.{CompoundKey, LFU, Promotion}
 
   # ---------------------------------------------------------------------------
   # Setup: create a temporary Bitcask store and ETS table for each test.
@@ -232,6 +232,59 @@ defmodule Ferricstore.Raft.StateMachineTest do
     :ets.delete(table)
   rescue
     ArgumentError -> :ok
+  end
+
+  describe "promoted compound prefix delete" do
+    test "waits for promoted compaction latch before cleanup", %{
+      state: state,
+      ets: ets,
+      shard_index: shard_index
+    } do
+      redis_key = "promoted_prefix_delete_latch_#{System.unique_integer([:positive])}"
+      prefix = CompoundKey.hash_prefix(redis_key)
+      compound_key = CompoundKey.hash_field(redis_key, "field")
+      dedicated_path = Promotion.dedicated_path(state.data_dir, shard_index, :hash, redis_key)
+
+      File.mkdir_p!(dedicated_path)
+      File.touch!(Path.join(dedicated_path, "00000.log"))
+      :ets.insert(ets, {compound_key, "value", 0, LFU.initial(), 0, 0, 5})
+
+      latch_tab =
+        :ets.new(:"sm_promoted_prefix_latch_#{System.unique_integer([:positive])}", [
+          :set,
+          :public
+        ])
+
+      latch_key = {:promoted_compaction, redis_key}
+      assert :ets.insert_new(latch_tab, {latch_key, self()})
+
+      latch_refs =
+        List.duplicate(latch_tab, shard_index + 1)
+        |> List.to_tuple()
+
+      instance_ctx = %FerricStore.Instance{
+        name: :state_machine_test,
+        data_dir: state.data_dir,
+        data_dir_expanded: state.data_dir,
+        latch_refs: latch_refs
+      }
+
+      state = %{state | instance_ctx: instance_ctx}
+
+      task =
+        Task.async(fn ->
+          StateMachine.apply(%{}, {:compound_delete_prefix, prefix}, state)
+        end)
+
+      try do
+        refute Task.yield(task, 50)
+
+        :ets.delete(latch_tab, latch_key)
+        assert {%{}, :ok} = Task.await(task, 1_000)
+      after
+        safe_delete_ets(latch_tab)
+      end
+    end
   end
 
   describe "Bitcask rotation/accounting" do
