@@ -104,9 +104,18 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   def handle("DEL", keys, store) do
-    Enum.reduce(keys, 0, fn key, acc ->
-      if do_del_key(key, store), do: acc + 1, else: acc
+    keys
+    |> Enum.reduce_while({:ok, 0}, fn key, {:ok, acc} ->
+      case do_del_key(key, store) do
+        true -> {:cont, {:ok, acc + 1}}
+        false -> {:cont, {:ok, acc}}
+        {:error, _reason} = error -> {:halt, error}
+      end
     end)
+    |> case do
+      {:ok, count} -> count
+      {:error, _reason} = error -> error
+    end
   end
 
   def handle("EXISTS", [], _store) do
@@ -910,9 +919,14 @@ defmodule Ferricstore.Commands.Strings do
             true
           else
             if Ops.exists?(store, key) do
-              maybe_delete_prob_file(key, store)
-              Ops.delete(store, key)
-              true
+              case maybe_delete_prob_file(key, store) do
+                :ok ->
+                  Ops.delete(store, key)
+                  true
+
+                {:error, _reason} = error ->
+                  error
+              end
             else
               false
             end

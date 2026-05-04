@@ -194,11 +194,15 @@ defmodule Ferricstore.Commands.TopK do
   # Deletion
   # ---------------------------------------------------------------------------
 
-  @spec nif_delete(binary(), map()) :: :ok
+  @spec nif_delete(binary(), map()) :: :ok | {:error, term()}
   def nif_delete(key, store) do
     path = prob_path(store, key, "topk")
-    _ = Ferricstore.FS.rm(path)
-    :ok
+
+    case Ferricstore.FS.rm(path) do
+      :ok -> prob_fsync_dir(Path.dirname(path), :delete_prob_file)
+      {:error, {:not_found, _msg}} -> :ok
+      {:error, reason} -> {:error, {:delete_prob_file_failed, reason}}
+    end
   end
 
   # ---------------------------------------------------------------------------

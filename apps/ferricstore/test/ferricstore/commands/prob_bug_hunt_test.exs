@@ -78,6 +78,48 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
     end
   end
 
+  describe "probabilistic direct deletes surface directory fsync failures" do
+    setup do
+      store = MockStore.make()
+
+      assert :ok = Bloom.handle("BF.RESERVE", ["bf_delete_fsync", "0.01", "100"], store)
+      assert :ok = Cuckoo.handle("CF.RESERVE", ["cf_delete_fsync", "100"], store)
+      assert :ok = CMS.handle("CMS.INITBYDIM", ["cms_delete_fsync", "100", "5"], store)
+      assert :ok = TopK.handle("TOPK.RESERVE", ["topk_delete_fsync", "5"], store)
+
+      Process.put(:ferricstore_prob_command_fsync_dir_hook, fn _path -> {:error, :eio} end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_prob_command_fsync_dir_hook)
+      end)
+
+      %{store: store}
+    end
+
+    test "per-structure delete helpers return an error when the prob dir fsync fails", %{
+      store: store
+    } do
+      assert {:error, {:fsync_dir_failed, :delete_prob_file, :eio}} =
+               Bloom.nif_delete("bf_delete_fsync", store)
+
+      assert {:error, {:fsync_dir_failed, :delete_prob_file, :eio}} =
+               Cuckoo.nif_delete("cf_delete_fsync", store)
+
+      assert {:error, {:fsync_dir_failed, :delete_prob_file, :eio}} =
+               CMS.nif_delete("cms_delete_fsync", store)
+
+      assert {:error, {:fsync_dir_failed, :delete_prob_file, :eio}} =
+               TopK.nif_delete("topk_delete_fsync", store)
+    end
+
+    test "DEL surfaces probabilistic sidecar cleanup errors instead of reporting success", %{
+      store: store
+    } do
+      assert {:error, {:fsync_dir_failed, :delete_prob_file, :eio}} =
+               Strings.handle("DEL", ["bf_delete_fsync"], store)
+    end
+  end
+
   # ===========================================================================
   # Bloom filter (BF.*)
   # ===========================================================================
