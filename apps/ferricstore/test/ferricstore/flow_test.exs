@@ -86,6 +86,9 @@ defmodule Ferricstore.FlowTest do
     assert {:error, "ERR flow run_at_ms must be a non-negative integer"} =
              FerricStore.flow_create("bad-run-at", type: "checkout", run_at_ms: -1)
 
+    assert {:error, "ERR flow priority must be between 0 and 2"} =
+             FerricStore.flow_create("bad-priority", type: "checkout", priority: 3)
+
     assert {:error, "ERR flow partition_key must be a non-empty string or :global"} =
              FerricStore.flow_create("bad-partition", type: "checkout", partition_key: "")
 
@@ -465,6 +468,86 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert claimed.id == live_id
+  end
+
+  test "flow_claim_due drains higher priorities before lower priorities by default" do
+    low_id = uid("flow-low-priority")
+    high_id = uid("flow-high-priority")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(low_id,
+               type: "priority",
+               priority: 0,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_create(high_id,
+               type: "priority",
+               priority: 2,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [high]} =
+             FerricStore.flow_claim_due("priority",
+               worker: "worker-priority",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert high.id == high_id
+
+    assert {:ok, [low]} =
+             FerricStore.flow_claim_due("priority",
+               worker: "worker-priority",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert low.id == low_id
+  end
+
+  test "flow_claim_due priority option targets one priority band" do
+    low_id = uid("flow-low-priority-target")
+    high_id = uid("flow-high-priority-target")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(low_id,
+               type: "priority-target",
+               priority: 0,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_create(high_id,
+               type: "priority-target",
+               priority: 2,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [low]} =
+             FerricStore.flow_claim_due("priority-target",
+               worker: "worker-priority",
+               lease_ms: 30_000,
+               limit: 1,
+               priority: 0,
+               now_ms: 1_000
+             )
+
+    assert low.id == low_id
+
+    assert {:ok, [high]} =
+             FerricStore.flow_claim_due("priority-target",
+               worker: "worker-priority",
+               lease_ms: 30_000,
+               limit: 1,
+               priority: 2,
+               now_ms: 1_000
+             )
+
+    assert high.id == high_id
   end
 
   test "flow_complete enforces lease token guard and writes terminal state" do

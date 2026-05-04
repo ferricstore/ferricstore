@@ -4038,12 +4038,76 @@ defmodule Ferricstore.Raft.StateMachine do
          } = attrs
        ) do
     partition_key = Map.get(attrs, :partition_key)
+
+    claimed =
+      flow_claim_due_priorities(
+        state,
+        type,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        partition_key,
+        flow_claim_priorities(priority),
+        limit,
+        []
+      )
+
+    {:ok, claimed}
+  end
+
+  defp flow_claim_priorities(nil), do: [2, 1, 0]
+  defp flow_claim_priorities(priority), do: [priority]
+
+  defp flow_claim_due_priorities(
+         _state,
+         _type,
+         _expected_state,
+         _worker,
+         _lease_ms,
+         _now_ms,
+         _partition_key,
+         _priorities,
+         limit,
+         claimed
+       )
+       when length(claimed) >= limit do
+    claimed |> Enum.reverse() |> Enum.take(limit)
+  end
+
+  defp flow_claim_due_priorities(
+         _state,
+         _type,
+         _expected_state,
+         _worker,
+         _lease_ms,
+         _now_ms,
+         _partition_key,
+         [],
+         _limit,
+         claimed
+       ) do
+    Enum.reverse(claimed)
+  end
+
+  defp flow_claim_due_priorities(
+         state,
+         type,
+         expected_state,
+         worker,
+         lease_ms,
+         now_ms,
+         partition_key,
+         [priority | rest],
+         limit,
+         claimed
+       ) do
     due_key = FlowKeys.due_key(type, expected_state, priority, partition_key)
     flow_ensure_due_index_ready(state, due_key)
 
-    max_scan = max(limit * 16, limit + 64)
+    max_scan = max((limit - length(claimed)) * 16, limit + 64)
 
-    claimed =
+    next_claimed =
       flow_claim_due_scan(
         state,
         due_key,
@@ -4055,11 +4119,23 @@ defmodule Ferricstore.Raft.StateMachine do
         limit,
         max_scan,
         0,
-        0,
-        []
+        length(claimed),
+        claimed
       )
+      |> Enum.reverse()
 
-    {:ok, claimed}
+    flow_claim_due_priorities(
+      state,
+      type,
+      expected_state,
+      worker,
+      lease_ms,
+      now_ms,
+      partition_key,
+      rest,
+      limit,
+      next_claimed
+    )
   end
 
   defp flow_claim_due_scan(

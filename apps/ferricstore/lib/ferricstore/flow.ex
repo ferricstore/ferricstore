@@ -5,6 +5,7 @@ defmodule Ferricstore.Flow do
 
   @default_state "queued"
   @default_priority 0
+  @max_priority 2
   @default_lease_ms 30_000
   @default_limit 1
 
@@ -16,7 +17,7 @@ defmodule Ferricstore.Flow do
          {:ok, payload_ref} <- optional_binary_or_nil(opts, :payload_ref, nil),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
-         {:ok, priority} <- optional_non_neg_integer(opts, :priority, @default_priority),
+         {:ok, priority} <- optional_priority(opts, @default_priority),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_flow_keys(id, type, state, priority, partition_key) do
       attrs = %{
@@ -53,10 +54,10 @@ defmodule Ferricstore.Flow do
          {:ok, worker} <- required_binary(opts, :worker),
          {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
          {:ok, limit} <- optional_pos_integer(opts, :limit, @default_limit),
-         {:ok, priority} <- optional_non_neg_integer(opts, :priority, @default_priority),
+         {:ok, priority} <- optional_priority_or_nil(opts),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
          {:ok, partition_key} <- optional_partition_key(opts),
-         :ok <- validate_key_size(__MODULE__.Keys.due_key(type, state, priority, partition_key)) do
+         :ok <- validate_claim_due_keys(type, state, priority, partition_key) do
       attrs = %{
         type: type,
         state: state,
@@ -105,7 +106,7 @@ defmodule Ferricstore.Flow do
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
-         {:ok, priority} <- optional_non_neg_integer_or_nil(opts, :priority, nil) do
+         {:ok, priority} <- optional_priority_or_nil(opts) do
       Router.flow_transition(ctx, %{
         id: id,
         from_state: from_state,
@@ -276,12 +277,32 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp optional_non_neg_integer_or_nil(opts, key, default) do
-    case Keyword.get(opts, key, default) do
-      nil -> {:ok, nil}
-      value when is_integer(value) and value >= 0 -> {:ok, value}
-      _ -> {:error, "ERR flow #{key} must be a non-negative integer"}
+  defp optional_priority(opts, default) do
+    case Keyword.get(opts, :priority, default) do
+      value when is_integer(value) and value >= 0 and value <= @max_priority -> {:ok, value}
+      _ -> {:error, "ERR flow priority must be between 0 and #{@max_priority}"}
     end
+  end
+
+  defp optional_priority_or_nil(opts) do
+    case Keyword.get(opts, :priority, nil) do
+      nil -> {:ok, nil}
+      value when is_integer(value) and value >= 0 and value <= @max_priority -> {:ok, value}
+      _ -> {:error, "ERR flow priority must be between 0 and #{@max_priority}"}
+    end
+  end
+
+  defp validate_claim_due_keys(type, state, nil, partition_key) do
+    Enum.reduce_while(@max_priority..0//-1, :ok, fn priority, :ok ->
+      case validate_key_size(__MODULE__.Keys.due_key(type, state, priority, partition_key)) do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp validate_claim_due_keys(type, state, priority, partition_key) do
+    validate_key_size(__MODULE__.Keys.due_key(type, state, priority, partition_key))
   end
 
   defp optional_pos_integer(opts, key, default) do
