@@ -1003,6 +1003,98 @@ defmodule Ferricstore.FlowTest do
     assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == ["claimed", "completed"]
   end
 
+  test "flow_rewind restores a previous history state and reindexes atomically" do
+    id = uid("flow-rewind")
+
+    assert {:ok, _} = FerricStore.flow_create(id, type: "rewind", run_at_ms: 1_000, now_ms: 1_000)
+
+    assert {:ok, [{created_event_id, %{"event" => "created", "state" => "queued"}} | _]} =
+             FerricStore.flow_history(id, count: 10)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("rewind",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, completed} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert completed.state == "completed"
+    assert {:ok, %{queued: 0, completed: 1}} = FerricStore.flow_info("rewind")
+
+    assert {:ok, rewound} =
+             FerricStore.flow_rewind(id,
+               to_event: created_event_id,
+               run_at_ms: 5_000,
+               expect_state: "completed",
+               now_ms: 3_000
+             )
+
+    assert rewound.state == "queued"
+    assert rewound.next_run_at_ms == 5_000
+    assert rewound.lease_token == nil
+    assert rewound.lease_owner == nil
+    assert rewound.fencing_token == completed.fencing_token + 1
+
+    assert {:ok, %{queued: 1, completed: 0}} = FerricStore.flow_info("rewind")
+
+    assert {:ok, [claimed_again]} =
+             FerricStore.flow_claim_due("rewind",
+               worker: "worker-b",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 5_000
+             )
+
+    assert claimed_again.id == id
+    assert claimed_again.state == "running"
+
+    assert {:ok, events} = FerricStore.flow_history(id, count: 10)
+
+    assert Enum.any?(events, fn {_event_id, fields} ->
+             fields["event"] == "rewound" and fields["rewound_to_event_id"] == created_event_id
+           end)
+  end
+
+  test "flow_rewind validates target, expected state, and active leases" do
+    id = uid("flow-rewind-guard")
+
+    assert {:ok, _} = FerricStore.flow_create(id, type: "rewind-guard", run_at_ms: 1_000)
+    assert {:ok, [{created_event_id, _fields} | _]} = FerricStore.flow_history(id, count: 10)
+
+    assert {:error, "ERR flow wrong state"} =
+             FerricStore.flow_rewind(id,
+               to_event: created_event_id,
+               expect_state: "completed"
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("rewind-guard",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:error, "ERR flow cannot rewind leased flow"} =
+             FerricStore.flow_rewind(id, to_event: created_event_id)
+
+    assert {:ok, _} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert {:error, "ERR flow rewind target event not found"} =
+             FerricStore.flow_rewind(id, to_event: "999999-0")
+  end
+
   test "terminal ttl expires flow state record" do
     id = uid("flow-terminal-ttl")
 

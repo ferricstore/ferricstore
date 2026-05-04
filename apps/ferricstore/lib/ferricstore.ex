@@ -483,6 +483,17 @@ defmodule FerricStore do
 
   def flow_cancel(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc "Rewinds a Flow record to a previous history event without rewriting history."
+  @spec flow_rewind(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_rewind(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.rewind(default_ctx(), id, opts)
+  end
+
+  def flow_rewind(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_rewind(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Lists Flow records for `type` from the state index."
   @spec flow_list(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
   def flow_list(type, opts \\ [])

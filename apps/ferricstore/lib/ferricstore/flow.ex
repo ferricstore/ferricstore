@@ -234,6 +234,34 @@ defmodule Ferricstore.Flow do
     observe_flow(:cancel, started, result, %{flow_id: id})
   end
 
+  def rewind(ctx, id, opts) when is_binary(id) and is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with :ok <- validate_opts(opts),
+           :ok <- validate_id(id),
+           {:ok, to_event} <- required_binary(opts, :to_event),
+           {:ok, expect_state} <- optional_binary_or_nil(opts, :expect_state, nil),
+           {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms),
+           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
+           {:ok, partition_key} <- optional_partition_key(opts),
+           :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+           :ok <- validate_key_size(__MODULE__.Keys.history_key(id, partition_key)) do
+        Router.flow_rewind(ctx, %{
+          id: id,
+          to_event: to_event,
+          expect_state: expect_state,
+          run_at_ms: run_at_ms,
+          reason_ref: reason_ref,
+          now_ms: now,
+          partition_key: partition_key
+        })
+      end
+
+    observe_flow(:rewind, started, result, %{flow_id: id})
+  end
+
   def decode_record(value) when is_binary(value), do: :erlang.binary_to_term(value)
 
   defp flow_start_time, do: System.monotonic_time()
@@ -371,6 +399,7 @@ defmodule Ferricstore.Flow do
   defp flow_event_name(:fail), do: "failed"
   defp flow_event_name(:cancel), do: "cancelled"
   defp flow_event_name(:complete), do: "completed"
+  defp flow_event_name(:rewind), do: "rewound"
   defp flow_event_name(command), do: Atom.to_string(command)
 
   defp safe_publish(channel, message) do

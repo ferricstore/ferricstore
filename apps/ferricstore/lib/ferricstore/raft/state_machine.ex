@@ -895,6 +895,10 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_with_time(meta, state, fn -> do_flow_cancel(state, attrs) end)
   end
 
+  def apply(meta, {:flow_rewind, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_rewind(state, attrs) end)
+  end
+
   # ---------------------------------------------------------------------------
   # HLC-wrapped commands (spec 2G.6)
   #
@@ -3136,6 +3140,10 @@ defmodule Ferricstore.Raft.StateMachine do
     do_flow_cancel(state, attrs)
   end
 
+  defp apply_single(state, {:flow_rewind, _key, attrs}) do
+    do_flow_rewind(state, attrs)
+  end
+
   # -- Probabilistic data structure commands in batch/cross_shard_tx --
 
   defp apply_single(state, {:bloom_create, key, num_bits, num_hashes, prob_meta}) do
@@ -4461,6 +4469,37 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp do_flow_rewind(state, %{id: id, to_event: to_event} = attrs) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
+
+    with {:ok, record} <- flow_require_record(state, id, partition_key),
+         :ok <- flow_require_rewindable(record),
+         :ok <- flow_require_expected_state(record, Map.get(attrs, :expect_state)),
+         {:ok, target_fields} <- flow_history_event_fields(state, id, to_event, partition_key),
+         {:ok, next} <- flow_rewind_record(record, target_fields, attrs, now_ms) do
+      next = Map.put(next, :rewound_to_event_id, to_event)
+
+      with :ok <- flow_validate_record_keys(record),
+           :ok <- flow_validate_record_keys(next),
+           :ok <- flow_due_delete(state, record),
+           :ok <- flow_index_delete(state, record),
+           :ok <-
+             do_put(
+               state,
+               FlowKeys.state_key(id, partition_key),
+               flow_encode(next),
+               flow_record_expire_at(next)
+             ),
+           :ok <- flow_due_put(state, next),
+           :ok <- flow_index_put(state, next),
+           :ok <- flow_history_put(state, next, "rewound", now_ms),
+           :ok <- flow_history_trim(state, next) do
+        {:ok, Map.delete(next, :rewound_to_event_id)}
+      end
+    end
+  end
+
   defp flow_claim_candidate(
          state,
          due_key,
@@ -4533,6 +4572,7 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flow_require_expected_state(_record, nil), do: :ok
   defp flow_require_expected_state(%{state: expected_state}, expected_state), do: :ok
   defp flow_require_expected_state(_record, _expected_state), do: {:error, "ERR flow wrong state"}
 
@@ -4550,6 +4590,11 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_require_transition_lease(%{lease_token: nil}, nil), do: :ok
   defp flow_require_transition_lease(%{lease_token: token}, token), do: :ok
   defp flow_require_transition_lease(_record, _token), do: {:error, "ERR stale flow lease"}
+
+  defp flow_require_rewindable(%{lease_token: token}) when is_binary(token),
+    do: {:error, "ERR flow cannot rewind leased flow"}
+
+  defp flow_require_rewindable(_record), do: :ok
 
   defp flow_validate_record_keys(
          %{id: id, type: type, state: flow_state, priority: priority} = record
@@ -4609,6 +4654,126 @@ defmodule Ferricstore.Raft.StateMachine do
 
       _ ->
         nil
+    end
+  end
+
+  defp flow_history_event_fields(state, id, event_id, partition_key) do
+    history_key = FlowKeys.history_key(id, partition_key)
+    prefix = "X:" <> history_key <> <<0>>
+    target_key = prefix <> event_id
+
+    state
+    |> shard_ets_state()
+    |> Ferricstore.Store.Shard.ETS.prefix_scan_entries(prefix, state.shard_data_path)
+    |> Enum.find(fn {entry_id, _value} -> prefix <> entry_id == target_key end)
+    |> case do
+      {_entry_id, value} ->
+        {:ok, value |> flow_decode_history_fields() |> flow_history_fields_to_map()}
+
+      nil ->
+        {:error, "ERR flow rewind target event not found"}
+    end
+  end
+
+  defp flow_decode_history_fields(value) when is_binary(value) do
+    try do
+      :erlang.binary_to_term(value)
+    rescue
+      _ -> []
+    end
+  end
+
+  defp flow_decode_history_fields(value) when is_list(value), do: value
+  defp flow_decode_history_fields(_value), do: []
+
+  defp flow_history_fields_to_map(fields) when is_list(fields) do
+    fields
+    |> Enum.chunk_every(2)
+    |> Enum.reduce(%{}, fn
+      [key, value], acc when is_binary(key) -> Map.put(acc, key, value)
+      _pair, acc -> acc
+    end)
+  end
+
+  defp flow_rewind_record(record, fields, attrs, now_ms) do
+    with {:ok, target_state} <- flow_history_required_field(fields, "state"),
+         {:ok, priority} <-
+           flow_history_integer_field(fields, "priority", Map.get(record, :priority, 0)),
+         {:ok, attempts} <-
+           flow_history_integer_field(fields, "attempts", Map.get(record, :attempts, 0)),
+         {:ok, history_run_at_ms} <- flow_history_optional_integer_field(fields, "next_run_at_ms"),
+         {:ok, created_at_ms} <-
+           flow_history_integer_field(
+             fields,
+             "created_at_ms",
+             Map.get(record, :created_at_ms, now_ms)
+           ) do
+      next_run_at_ms =
+        case Map.get(attrs, :run_at_ms) do
+          value when is_integer(value) -> value
+          _ -> history_run_at_ms
+        end
+
+      {:ok,
+       record
+       |> Map.merge(%{
+         state: target_state,
+         version: Map.fetch!(record, :version) + 1,
+         attempts: attempts,
+         fencing_token: Map.get(record, :fencing_token, 0) + 1,
+         created_at_ms: created_at_ms,
+         updated_at_ms: now_ms,
+         next_run_at_ms: next_run_at_ms,
+         priority: priority,
+         payload_ref: flow_nilable_history_field(fields, "payload_ref"),
+         result_ref: flow_nilable_history_field(fields, "result_ref"),
+         error_ref:
+           Map.get(attrs, :reason_ref) || flow_nilable_history_field(fields, "error_ref"),
+         lease_owner: nil,
+         lease_token: nil,
+         lease_deadline_ms: 0
+       })}
+    end
+  end
+
+  defp flow_history_required_field(fields, key) do
+    case Map.get(fields, key) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, "ERR flow rewind target event cannot restore state"}
+    end
+  end
+
+  defp flow_history_integer_field(fields, key, default) do
+    case Map.get(fields, key) do
+      nil -> {:ok, default}
+      value -> flow_parse_history_integer(value)
+    end
+  end
+
+  defp flow_history_optional_integer_field(fields, key) do
+    case Map.get(fields, key) do
+      nil -> {:ok, nil}
+      "" -> {:ok, nil}
+      value -> flow_parse_history_integer(value)
+    end
+  end
+
+  defp flow_parse_history_integer(value) when is_integer(value), do: {:ok, value}
+
+  defp flow_parse_history_integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} -> {:ok, int}
+      _ -> {:error, "ERR flow rewind target event cannot restore state"}
+    end
+  end
+
+  defp flow_parse_history_integer(_value),
+    do: {:error, "ERR flow rewind target event cannot restore state"}
+
+  defp flow_nilable_history_field(fields, key) do
+    case Map.get(fields, key) do
+      "" -> nil
+      value -> value
     end
   end
 
@@ -4762,15 +4927,75 @@ defmodule Ferricstore.Raft.StateMachine do
       "version",
       Integer.to_string(version),
       "at",
-      Integer.to_string(now_ms)
+      Integer.to_string(now_ms),
+      "id",
+      id,
+      "type",
+      Map.get(record, :type, ""),
+      "state",
+      Map.get(record, :state, ""),
+      "priority",
+      record |> Map.get(:priority, 0) |> Integer.to_string(),
+      "attempts",
+      record |> Map.get(:attempts, 0) |> Integer.to_string(),
+      "fencing_token",
+      record |> Map.get(:fencing_token, 0) |> Integer.to_string(),
+      "created_at_ms",
+      record |> Map.get(:created_at_ms, now_ms) |> Integer.to_string(),
+      "updated_at_ms",
+      record |> Map.get(:updated_at_ms, now_ms) |> Integer.to_string(),
+      "next_run_at_ms",
+      flow_history_integer_or_empty(Map.get(record, :next_run_at_ms)),
+      "lease_deadline_ms",
+      flow_history_integer_or_empty(Map.get(record, :lease_deadline_ms)),
+      "lease_owner",
+      Map.get(record, :lease_owner) || "",
+      "payload_ref",
+      Map.get(record, :payload_ref) || "",
+      "result_ref",
+      Map.get(record, :result_ref) || "",
+      "error_ref",
+      Map.get(record, :error_ref) || "",
+      "rewound_to_event_id",
+      Map.get(record, :rewound_to_event_id) || ""
     ]
 
-    do_put(
-      state,
-      FlowKeys.stream_entry_key(id, event_id, partition_key),
-      :erlang.term_to_binary(fields),
-      0
-    )
+    history_key = FlowKeys.history_key(id, partition_key)
+    compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
+
+    with :ok <- do_put(state, compound_key, :erlang.term_to_binary(fields), 0) do
+      flow_history_index_put(history_key, event_id, compound_key)
+    end
+  end
+
+  defp flow_history_integer_or_empty(value) when is_integer(value), do: Integer.to_string(value)
+  defp flow_history_integer_or_empty(_value), do: ""
+
+  defp flow_history_index_put(history_key, event_id, compound_key) do
+    Ferricstore.Commands.Stream.ensure_meta_table()
+
+    {ms, seq} = flow_parse_event_id(event_id)
+    meta_table = Ferricstore.Stream.Meta
+    index_table = Ferricstore.Stream.Index
+
+    case :ets.lookup(meta_table, history_key) do
+      [] ->
+        :ets.insert(meta_table, {history_key, 1, event_id, event_id, ms, seq})
+
+      [{^history_key, len, first, _last, _last_ms, _last_seq}] ->
+        :ets.insert(meta_table, {history_key, len + 1, first, event_id, ms, seq})
+    end
+
+    :ets.insert(index_table, {{history_key, ms, seq}, event_id, compound_key})
+    :ets.insert(index_table, {{:ready, history_key}, true})
+    :ok
+  end
+
+  defp flow_parse_event_id(event_id) do
+    case String.split(event_id, "-", parts: 2) do
+      [ms, seq] -> {flow_parse_integer(ms), flow_parse_integer(seq)}
+      _ -> {0, 0}
+    end
   end
 
   defp flow_history_trim(_state, %{history_max_events: nil}), do: :ok

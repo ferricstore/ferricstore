@@ -307,6 +307,7 @@ defmodule Ferricstore.Store.Router do
   def always_quorum?({:flow_retry, _, _}), do: true
   def always_quorum?({:flow_fail, _, _}), do: true
   def always_quorum?({:flow_cancel, _, _}), do: true
+  def always_quorum?({:flow_rewind, _, _}), do: true
   def always_quorum?(_), do: false
 
   # NOTE: json/bitmap/geo/hll/tdigest ops route through async_write →
@@ -3195,6 +3196,18 @@ defmodule Ferricstore.Store.Router do
     else
       idx = shard_for(ctx, key)
       raft_write(ctx, idx, key, {:flow_cancel, key, attrs})
+    end
+  end
+
+  @doc false
+  def flow_rewind(ctx, %{id: id} = attrs) when is_binary(id) do
+    key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_rewind, key, attrs})
     end
   end
 

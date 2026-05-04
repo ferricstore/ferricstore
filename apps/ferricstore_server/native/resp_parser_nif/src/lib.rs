@@ -1566,6 +1566,7 @@ enum CommandAstKind {
     FlowRetry,
     FlowFail,
     FlowCancel,
+    FlowRewind,
     FlowList,
     FlowInfo,
     FlowStuck,
@@ -1798,6 +1799,7 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"FLOW.RETRY" => CommandAstKind::FlowRetry,
         b"FLOW.FAIL" => CommandAstKind::FlowFail,
         b"FLOW.CANCEL" => CommandAstKind::FlowCancel,
+        b"FLOW.REWIND" => CommandAstKind::FlowRewind,
         b"FLOW.LIST" => CommandAstKind::FlowList,
         b"FLOW.INFO" => CommandAstKind::FlowInfo,
         b"FLOW.STUCK" => CommandAstKind::FlowStuck,
@@ -2227,6 +2229,7 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowRetry => make_flow_retry_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowFail => make_flow_fail_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCancel => make_flow_cancel_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowRewind => make_flow_rewind_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowList => make_flow_list_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowInfo => make_flow_info_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowStuck => make_flow_stuck_command_ast(env, args, arg_bytes),
@@ -5195,6 +5198,33 @@ fn make_flow_cancel_command_ast<'a>(
     }
 }
 
+fn make_flow_rewind_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_rewind");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.rewind")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_rewind_option) {
+        Ok(opts) => {
+            if flow_has_option(arg_bytes, 1, b"TO_EVENT") {
+                (tag, args[0], opts).encode(env)
+            } else {
+                (
+                    tag,
+                    args[0],
+                    generic_ast_error(env, b"ERR flow to_event is required"),
+                )
+                    .encode(env)
+            }
+        }
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
 fn make_flow_list_command_ast<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -5282,6 +5312,17 @@ fn parse_flow_options<'a>(
         idx += 2;
     }
     Ok(opts)
+}
+
+fn flow_has_option(arg_bytes: &[&[u8]], start: usize, name: &[u8]) -> bool {
+    let mut idx = start;
+    while idx < arg_bytes.len() {
+        if ascii_eq_ignore_case(arg_bytes[idx], name) {
+            return true;
+        }
+        idx += 2;
+    }
+    false
 }
 
 #[derive(Clone, Copy)]
@@ -5445,6 +5486,28 @@ fn flow_cancel_option<'a>(
             (b"LEASE_TOKEN", "lease_token", FlowOptType::Binary),
             (b"REASON_REF", "reason_ref", FlowOptType::Binary),
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_rewind_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"TO_EVENT", "to_event", FlowOptType::Binary),
+            (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
+            (b"EXPECT_STATE", "expect_state", FlowOptType::Binary),
+            (b"REASON_REF", "reason_ref", FlowOptType::Binary),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -5933,7 +5996,7 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"TDIGEST.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"RATELIMIT.ADD" => vec![0],
         b"FLOW.CREATE" | b"FLOW.GET" | b"FLOW.COMPLETE" | b"FLOW.TRANSITION" | b"FLOW.RETRY"
-        | b"FLOW.FAIL" | b"FLOW.CANCEL" | b"FLOW.HISTORY" => vec![0],
+        | b"FLOW.FAIL" | b"FLOW.CANCEL" | b"FLOW.REWIND" | b"FLOW.HISTORY" => vec![0],
         b"MEMORY" => {
             if argc > 1 && ascii_eq_ignore_case(arg_bytes[0], b"USAGE") {
                 vec![1]

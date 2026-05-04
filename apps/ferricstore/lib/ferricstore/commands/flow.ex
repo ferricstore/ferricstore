@@ -52,6 +52,10 @@ defmodule Ferricstore.Commands.Flow do
     FerricStore.flow_cancel(id, opts) |> normalize_result()
   end
 
+  def handle_ast({:flow_rewind, id, opts}, _store) when is_binary(id) and is_list(opts) do
+    FerricStore.flow_rewind(id, opts) |> normalize_result()
+  end
+
   def handle_ast({:flow_list, type, opts}, _store) when is_binary(type) and is_list(opts) do
     FerricStore.flow_list(type, opts) |> normalize_result()
   end

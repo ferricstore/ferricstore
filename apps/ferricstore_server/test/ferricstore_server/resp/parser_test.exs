@@ -1696,7 +1696,27 @@ defmodule FerricstoreServer.Resp.ParserTest do
                  {:flow_fail, "flow-1", "lease-1", [fencing_token: 1, error_ref: "err-1"]},
                  ["flow-1"]},
                 {:command, "FLOW.CANCEL", ["flow-1", "FENCING", "1", "REASON_REF", "reason-1"],
-                 {:flow_cancel, "flow-1", [fencing_token: 1, reason_ref: "reason-1"]}, ["flow-1"]}
+                 {:flow_cancel, "flow-1", [fencing_token: 1, reason_ref: "reason-1"]},
+                 ["flow-1"]},
+                {:command, "FLOW.REWIND",
+                 [
+                   "flow-1",
+                   "TO_EVENT",
+                   "1000-1",
+                   "RUN_AT",
+                   "5000",
+                   "EXPECT_STATE",
+                   "completed",
+                   "REASON_REF",
+                   "manual"
+                 ],
+                 {:flow_rewind, "flow-1",
+                  [
+                    to_event: "1000-1",
+                    run_at_ms: 5000,
+                    expect_state: "completed",
+                    reason_ref: "manual"
+                  ]}, ["flow-1"]}
               ], ""} =
                Parser.parse_commands(
                  "flow.create flow-1 TYPE checkout STATE queued RUN_AT 1000 PRIORITY 2 PARTITION tenant-a TTL 5000 HISTORY_MAX_EVENTS 10\r\n" <>
@@ -1705,7 +1725,8 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "flow.transition flow-1 queued running FENCING 1 LEASE_TOKEN lease-1\r\n" <>
                    "flow.retry flow-1 lease-1 FENCING 1 RUN_AT 2000\r\n" <>
                    "flow.fail flow-1 lease-1 FENCING 1 ERROR_REF err-1\r\n" <>
-                   "flow.cancel flow-1 FENCING 1 REASON_REF reason-1\r\n"
+                   "flow.cancel flow-1 FENCING 1 REASON_REF reason-1\r\n" <>
+                   "flow.rewind flow-1 TO_EVENT 1000-1 RUN_AT 5000 EXPECT_STATE completed REASON_REF manual\r\n"
                )
     end
 
@@ -1743,12 +1764,15 @@ defmodule FerricstoreServer.Resp.ParserTest do
                  []},
                 {:command, "FLOW.COMPLETE", ["f", "l"],
                  {:flow_complete,
-                  {:error, "ERR wrong number of arguments for 'flow.complete' command"}}, ["f"]}
+                  {:error, "ERR wrong number of arguments for 'flow.complete' command"}}, ["f"]},
+                {:command, "FLOW.REWIND", ["f", "RUN_AT", "1"],
+                 {:flow_rewind, "f", {:error, "ERR flow to_event is required"}}, ["f"]}
               ], ""} =
                Parser.parse_commands(
                  "flow.create f TYPE t PRIORITY x\r\n" <>
                    "flow.claim_due t WORKER w LIMIT 0\r\n" <>
-                   "flow.complete f l\r\n"
+                   "flow.complete f l\r\n" <>
+                   "flow.rewind f RUN_AT 1\r\n"
                )
     end
   end
