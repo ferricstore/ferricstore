@@ -106,6 +106,50 @@ defmodule FerricstoreServer.Resp.ParserFuzzTest do
     end
   end
 
+  test "adversarial command-mode frames preserve AST tuple contract or error cleanly" do
+    key_with_nul = <<"k", 0, "1">>
+    value_with_nul = <<"v", 0, "2">>
+
+    frames = [
+      {"non-array RESP3 attribute", "|0\r\n*1\r\n$4\r\nPING\r\n"},
+      {"malformed RESP3 attribute", "|1\r\n$1\r\nk\r\n"},
+      {"nested array argument", "*2\r\n$3\r\nGET\r\n*1\r\n$1\r\nk\r\n"},
+      {"integer argument", "*2\r\n$3\r\nGET\r\n:1\r\n"},
+      {"null argument", "*2\r\n$3\r\nGET\r\n_\r\n"},
+      {"oversized array", "*1048577\r\n"},
+      {"negative command array", "*-1\r\n"},
+      {"invalid count", "*abc\r\n"},
+      {"partial command name", "*1\r\n$4\r\nPI"},
+      {"partial argument", "*2\r\n$3\r\nGET\r\n$3\r\nab"},
+      {"embedded nul command", "*2\r\n$3\r\nGET\r\n$3\r\n" <> key_with_nul <> "\r\n"},
+      {"embedded nul set",
+       "*3\r\n$3\r\nSET\r\n$3\r\n" <>
+         key_with_nul <> "\r\n$3\r\n" <> value_with_nul <> "\r\n"}
+    ]
+
+    for {label, frame} <- frames do
+      assert_no_crash("Parser.parse_commands/1 crashed for #{label}", fn ->
+        assert_command_parser_result(Parser.parse_commands(frame))
+      end)
+    end
+  end
+
+  test "generated command frames keep command tuple shape stable" do
+    seed_rand()
+
+    command_names = ["GET", "SET", "MGET", "MSET", "DEL", "EXISTS", "JSON.GET", "PFADD", ""]
+
+    for _ <- 1..@iterations do
+      command = Enum.random(command_names)
+      args = random_list(:rand.uniform(6) - 1, fn -> random_binary(:rand.uniform(16) - 1) end)
+      frame = command_frame([command | args])
+
+      assert_no_crash("Parser.parse_commands/1 crashed for #{inspect(frame, limit: 80)}", fn ->
+        assert_command_parser_result(Parser.parse_commands(frame))
+      end)
+    end
+  end
+
   defp seed_rand do
     :rand.seed(:exsss, {0xF3, 0xE2, 0xD1})
   end
@@ -177,11 +221,42 @@ defmodule FerricstoreServer.Resp.ParserFuzzTest do
     if count <= 0, do: <<>>, else: for(_ <- 1..count, into: <<>>, do: <<Enum.random(0..255)>>)
   end
 
+  defp command_frame(parts) do
+    IO.iodata_to_binary([
+      "*",
+      Integer.to_string(length(parts)),
+      "\r\n",
+      Enum.map(parts, fn part ->
+        ["$", Integer.to_string(byte_size(part)), "\r\n", part, "\r\n"]
+      end)
+    ])
+  end
+
   defp assert_parser_result({:ok, values, rest}) when is_list(values) and is_binary(rest), do: :ok
   defp assert_parser_result({:error, _reason}), do: :ok
 
   defp assert_parser_result(other) do
     flunk("unexpected parser result: #{inspect(other)}")
+  end
+
+  defp assert_command_parser_result({:ok, commands, rest})
+       when is_list(commands) and is_binary(rest) do
+    Enum.each(commands, fn
+      {:command, cmd, args, ast, keys}
+      when is_binary(cmd) and is_list(args) and is_list(keys) ->
+        assert Enum.all?(args, &is_binary/1)
+        assert Enum.all?(keys, &is_binary/1)
+        assert is_tuple(ast) or is_atom(ast)
+
+      other ->
+        flunk("unexpected command tuple: #{inspect(other)}")
+    end)
+  end
+
+  defp assert_command_parser_result({:error, _reason}), do: :ok
+
+  defp assert_command_parser_result(other) do
+    flunk("unexpected command parser result: #{inspect(other)}")
   end
 
   defp assert_no_crash(message, fun) do
