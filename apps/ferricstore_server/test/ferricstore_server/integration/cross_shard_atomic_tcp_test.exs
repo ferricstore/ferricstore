@@ -191,6 +191,45 @@ defmodule FerricstoreServer.Integration.CrossShardAtomicTcpTest do
       assert recv_response(sock) == [["mget_0", "mget_1"]]
     end
 
+    test "multi-key write is visible to later command on lower shard", %{
+      sock: sock,
+      k0: k0,
+      k1: k1
+    } do
+      send_cmd(sock, ["MULTI"])
+      assert recv_response(sock) == ok()
+
+      send_cmd(sock, ["MSET", k1, "ordered_1", k0, "ordered_0"])
+      assert recv_response(sock) == queued()
+
+      send_cmd(sock, ["GET", k0])
+      assert recv_response(sock) == queued()
+
+      send_cmd(sock, ["EXEC"])
+      assert recv_response(sock) == [ok(), "ordered_0"]
+    end
+
+    test "interleaved multi-key AST commands execute in original transaction order", %{
+      sock: sock,
+      k0: k0,
+      k1: k1
+    } do
+      send_cmd(sock, ["MULTI"])
+      assert recv_response(sock) == ok()
+
+      send_cmd(sock, ["MSET", k1, "first_1", k0, "first_0"])
+      assert recv_response(sock) == queued()
+
+      send_cmd(sock, ["SET", k0, "second_0"])
+      assert recv_response(sock) == queued()
+
+      send_cmd(sock, ["MGET", k1, k0])
+      assert recv_response(sock) == queued()
+
+      send_cmd(sock, ["EXEC"])
+      assert recv_response(sock) == [ok(), ok(), ["first_1", "second_0"]]
+    end
+
     test "MULTI with GET + SET across shards, EXEC — results in order", %{
       sock: sock,
       k0: k0,

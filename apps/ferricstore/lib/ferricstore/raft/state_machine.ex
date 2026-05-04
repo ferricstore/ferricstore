@@ -410,37 +410,40 @@ defmodule Ferricstore.Raft.StateMachine do
 
       write_result =
         with_cross_shard_pending_writes(state, fn ->
-          Enum.reduce(shard_batches, %{}, fn {shard_idx, queue, sandbox_namespace}, acc ->
-            store = build_cross_shard_store(shard_idx, state)
+          ordered_entries = cross_shard_ordered_entries(shard_batches)
 
-            Process.put(:tx_deleted_keys, MapSet.new())
-            Process.put(:tx_pending_values, %{})
+          Process.put(:tx_deleted_keys, MapSet.new())
+          Process.put(:tx_pending_values, %{})
 
-            results =
-              try do
-                Enum.map(queue, fn entry ->
-                  ast =
-                    entry
-                    |> TxAst.command_ast()
-                    |> TxAst.namespace_first_key(sandbox_namespace)
+          try do
+            {results_by_position, _stores} =
+              Enum.reduce(ordered_entries, {%{}, %{}}, fn
+                {_orig_idx, shard_idx, pos, entry, sandbox_namespace}, {results, stores} ->
+                  {store, stores} =
+                    case Map.fetch(stores, shard_idx) do
+                      {:ok, cached} ->
+                        {cached, stores}
 
-                  try do
-                    Dispatcher.dispatch_ast(ast, store)
-                  catch
-                    :exit, {:noproc, _} ->
-                      {:error, "ERR server not ready, shard process unavailable"}
+                      :error ->
+                        store = build_cross_shard_store(shard_idx, state)
+                        {store, Map.put(stores, shard_idx, store)}
+                    end
 
-                    :exit, {reason, _} ->
-                      {:error, "ERR internal error: #{inspect(reason)}"}
-                  end
-                end)
-              after
-                Process.delete(:tx_deleted_keys)
-                Process.delete(:tx_pending_values)
-              end
+                  result = dispatch_cross_shard_entry(entry, sandbox_namespace, store)
 
-            Map.put(acc, shard_idx, results)
-          end)
+                  results =
+                    Map.update(results, shard_idx, %{pos => result}, fn shard_results ->
+                      Map.put(shard_results, pos, result)
+                    end)
+
+                  {results, stores}
+              end)
+
+            cross_shard_results_by_batch_position(shard_batches, results_by_position)
+          after
+            Process.delete(:tx_deleted_keys)
+            Process.delete(:tx_pending_values)
+          end
         end)
 
       case write_result do
@@ -1476,6 +1479,60 @@ defmodule Ferricstore.Raft.StateMachine do
     with_apply_time(meta, fn ->
       result = do_prob_command(state, fun)
       bump_applied(meta, state, result)
+    end)
+  end
+
+  defp cross_shard_ordered_entries(shard_batches) do
+    {_next_legacy_index, entries} =
+      Enum.reduce(shard_batches, {0, []}, fn {shard_idx, queue, sandbox_namespace},
+                                             {next_legacy_index, acc} ->
+        {next_legacy_index, batch_entries} =
+          queue
+          |> Enum.with_index()
+          |> Enum.reduce({next_legacy_index, []}, fn
+            {{orig_idx, entry}, pos}, {next, inner} when is_integer(orig_idx) ->
+              {max(next, orig_idx + 1),
+               [{orig_idx, shard_idx, pos, entry, sandbox_namespace} | inner]}
+
+            {entry, pos}, {next, inner} ->
+              {next + 1, [{next, shard_idx, pos, entry, sandbox_namespace} | inner]}
+          end)
+
+        {next_legacy_index, batch_entries ++ acc}
+      end)
+
+    Enum.sort_by(entries, fn {orig_idx, _shard_idx, _pos, _entry, _sandbox_namespace} ->
+      orig_idx
+    end)
+  end
+
+  defp dispatch_cross_shard_entry(entry, sandbox_namespace, store) do
+    ast =
+      entry
+      |> TxAst.command_ast()
+      |> TxAst.namespace_first_key(sandbox_namespace)
+
+    try do
+      Dispatcher.dispatch_ast(ast, store)
+    catch
+      :exit, {:noproc, _} ->
+        {:error, "ERR server not ready, shard process unavailable"}
+
+      :exit, {reason, _} ->
+        {:error, "ERR internal error: #{inspect(reason)}"}
+    end
+  end
+
+  defp cross_shard_results_by_batch_position(shard_batches, results_by_position) do
+    Map.new(shard_batches, fn {shard_idx, queue, _sandbox_namespace} ->
+      shard_positions = Map.get(results_by_position, shard_idx, %{})
+
+      results =
+        queue
+        |> Enum.with_index()
+        |> Enum.map(fn {_entry, pos} -> Map.fetch!(shard_positions, pos) end)
+
+      {shard_idx, results}
     end)
   end
 

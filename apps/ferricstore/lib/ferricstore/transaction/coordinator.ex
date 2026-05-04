@@ -68,8 +68,7 @@ defmodule Ferricstore.Transaction.Coordinator do
 
     shard_batches =
       Enum.map(shard_groups, fn {shard_idx, cmds_with_indices} ->
-        cmds = Enum.map(cmds_with_indices, fn {_orig_idx, entry} -> entry end)
-        {shard_idx, cmds, sandbox_namespace}
+        {shard_idx, cmds_with_indices, sandbox_namespace}
       end)
 
     command = {:cross_shard_tx, shard_batches}
