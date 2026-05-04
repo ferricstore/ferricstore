@@ -257,6 +257,39 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     end
   end
 
+  @spec put_members(:ets.tid(), :ets.tid(), binary(), [{binary(), binary()}]) :: :ok
+  def put_members(index_table, lookup_table, redis_key, member_score_pairs) do
+    delta =
+      Enum.reduce(member_score_pairs, 0, fn {member, score_str}, acc ->
+        case parse_score(score_str) do
+          {:ok, score} ->
+            existing? =
+              case :ets.lookup(lookup_table, {redis_key, member}) do
+                [{{^redis_key, ^member}, old_score}] ->
+                  :ets.delete(index_table, {redis_key, @index_tag, old_score, member})
+                  true
+
+                [] ->
+                  false
+              end
+
+            :ets.insert(index_table, {{redis_key, @index_tag, score, member}, true})
+            :ets.insert(lookup_table, {{redis_key, member}, score})
+
+            if existing?, do: acc, else: acc + 1
+
+          :error ->
+            acc
+        end
+      end)
+
+    if delta != 0 do
+      increment_count(lookup_table, redis_key, delta)
+    end
+
+    :ok
+  end
+
   @spec delete_member(:ets.tid(), :ets.tid(), binary(), binary()) :: :ok
   def delete_member(index_table, lookup_table, redis_key, member) do
     case :ets.lookup(lookup_table, {redis_key, member}) do
@@ -268,6 +301,28 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
       [] ->
         :ok
     end
+  end
+
+  @spec delete_members(:ets.tid(), :ets.tid(), binary(), [binary()]) :: :ok
+  def delete_members(index_table, lookup_table, redis_key, members) do
+    deleted =
+      Enum.reduce(members, 0, fn member, acc ->
+        case :ets.lookup(lookup_table, {redis_key, member}) do
+          [{{^redis_key, ^member}, score}] ->
+            :ets.delete(index_table, {redis_key, @index_tag, score, member})
+            :ets.delete(lookup_table, {redis_key, member})
+            acc + 1
+
+          [] ->
+            acc
+        end
+      end)
+
+    if deleted != 0 do
+      increment_count(lookup_table, redis_key, -deleted)
+    end
+
+    :ok
   end
 
   @spec clear_key(:ets.tid(), :ets.tid(), binary()) :: :ok

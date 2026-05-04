@@ -4321,28 +4321,19 @@ defmodule Ferricstore.Raft.StateMachine do
       Enum.reverse(claimed)
     else
       {next_claimed_count, next_claimed} =
-        Enum.reduce_while(candidates, {claimed_count, claimed}, fn {id, _score}, {count, acc} ->
-          {next_count, next_acc} =
-            case flow_claim_candidate(
-                   state,
-                   due_key,
-                   id,
-                   expected_state,
-                   worker,
-                   lease_ms,
-                   now_ms,
-                   partition_key
-                 ) do
-              {:ok, record} -> {count + 1, [record | acc]}
-              :skip -> {count, acc}
-            end
-
-          if next_count >= limit do
-            {:halt, {next_count, next_acc}}
-          else
-            {:cont, {next_count, next_acc}}
-          end
-        end)
+        flow_claim_candidate_batch(
+          state,
+          due_key,
+          expected_state,
+          worker,
+          lease_ms,
+          now_ms,
+          partition_key,
+          candidates,
+          limit - claimed_count,
+          claimed_count,
+          claimed
+        )
 
       flow_claim_due_scan(
         state,
@@ -4359,6 +4350,84 @@ defmodule Ferricstore.Raft.StateMachine do
         next_claimed
       )
     end
+  end
+
+  defp flow_claim_candidate_batch(
+         state,
+         due_key,
+         expected_state,
+         worker,
+         lease_ms,
+         now_ms,
+         partition_key,
+         candidates,
+         remaining,
+         claimed_count,
+         claimed
+       ) do
+    {plans, stale_due_ids} =
+      flow_plan_claim_candidates(
+        state,
+        due_key,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        partition_key,
+        candidates,
+        remaining
+      )
+
+    case flow_apply_claim_batch(state, due_key, plans, stale_due_ids, now_ms) do
+      :ok ->
+        next_claimed =
+          Enum.reduce(plans, claimed, fn {_record, next}, acc -> [next | acc] end)
+
+        {claimed_count + length(plans), next_claimed}
+
+      {:error, _reason} ->
+        {claimed_count, claimed}
+    end
+  end
+
+  defp flow_plan_claim_candidates(
+         state,
+         _due_key,
+         expected_state,
+         worker,
+         lease_ms,
+         now_ms,
+         partition_key,
+         candidates,
+         remaining
+       ) do
+    {plans, stale_due_ids, _count} =
+      Enum.reduce_while(candidates, {[], [], 0}, fn {id, _score}, {plans, stale_due_ids, count} ->
+        if count >= remaining do
+          {:halt, {plans, stale_due_ids, count}}
+        else
+          case flow_prepare_claim_candidate(
+                 state,
+                 id,
+                 expected_state,
+                 worker,
+                 lease_ms,
+                 now_ms,
+                 partition_key
+               ) do
+            {:ok, record, next} ->
+              {:cont, {[{record, next} | plans], stale_due_ids, count + 1}}
+
+            :delete_due ->
+              {:cont, {plans, [id | stale_due_ids], count}}
+
+            :skip ->
+              {:cont, {plans, stale_due_ids, count}}
+          end
+        end
+      end)
+
+    {Enum.reverse(plans), Enum.reverse(stale_due_ids)}
   end
 
   defp do_flow_complete(state, %{id: id, lease_token: lease_token} = attrs) do
@@ -4604,9 +4673,8 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_claim_candidate(
+  defp flow_prepare_claim_candidate(
          state,
-         due_key,
          id,
          expected_state,
          worker,
@@ -4616,8 +4684,7 @@ defmodule Ferricstore.Raft.StateMachine do
        ) do
     case flow_read_record(state, id, partition_key) do
       nil ->
-        flow_due_delete_from_key(state, due_key, id)
-        :skip
+        :delete_due
 
       %{state: ^expected_state} = record ->
         next_version = Map.fetch!(record, :version) + 1
@@ -4644,29 +4711,118 @@ defmodule Ferricstore.Raft.StateMachine do
           })
 
         with :ok <- flow_validate_record_keys(record),
-             :ok <- flow_validate_record_keys(next),
-             :ok <- flow_due_delete_from_key(state, due_key, id),
-             :ok <- flow_index_delete(state, record),
-             :ok <-
-               flow_put(
-                 state,
-                 FlowKeys.state_key(id, partition_key),
-                 flow_encode(next),
-                 flow_record_expire_at(next)
-               ),
-             :ok <- flow_due_put(state, next),
-             :ok <- flow_index_put(state, next),
-             :ok <- flow_history_put(state, next, "claimed", now_ms),
-             :ok <- flow_history_trim(state, next) do
-          {:ok, next}
+             :ok <- flow_validate_record_keys(next) do
+          {:ok, record, next}
         else
           _ -> :skip
         end
 
       _record ->
-        flow_due_delete_from_key(state, due_key, id)
-        :skip
+        :delete_due
     end
+  end
+
+  defp flow_apply_claim_batch(_state, _due_key, [], [], _now_ms), do: :ok
+
+  defp flow_apply_claim_batch(state, due_key, plans, stale_due_ids, now_ms) do
+    claimed_ids = Enum.map(plans, fn {_record, next} -> next.id end)
+    all_due_delete_ids = stale_due_ids ++ claimed_ids
+
+    with :ok <- flow_zset_delete_members_from_key(state, due_key, all_due_delete_ids),
+         :ok <- flow_claim_delete_old_indexes(state, plans),
+         :ok <- flow_claim_put_state_records(state, plans),
+         :ok <- flow_due_put_many(state, Enum.map(plans, fn {_record, next} -> next end)),
+         :ok <- flow_claim_put_running_indexes(state, plans),
+         :ok <- flow_claim_put_history(state, plans, now_ms) do
+      :ok
+    end
+  end
+
+  defp flow_claim_delete_old_indexes(state, plans) do
+    state_deletes =
+      Enum.map(plans, fn {record, _next} ->
+        partition_key = Map.get(record, :partition_key)
+        {FlowKeys.state_index_key(record.type, record.state, partition_key), record.id}
+      end)
+
+    running_deletes =
+      plans
+      |> Enum.flat_map(fn
+        {%{state: "running"} = record, _next} ->
+          partition_key = Map.get(record, :partition_key)
+
+          [
+            {FlowKeys.inflight_index_key(record.type, partition_key), record.id},
+            {FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key),
+             record.id}
+          ]
+
+        _plan ->
+          []
+      end)
+
+    flow_zset_index_delete_grouped(state, state_deletes ++ running_deletes)
+  end
+
+  defp flow_claim_put_state_records(state, plans) do
+    Enum.each(plans, fn {_record, next} ->
+      partition_key = Map.get(next, :partition_key)
+
+      flow_put(
+        state,
+        FlowKeys.state_key(next.id, partition_key),
+        flow_encode(next),
+        flow_record_expire_at(next)
+      )
+    end)
+
+    :ok
+  end
+
+  defp flow_claim_put_running_indexes(state, plans) do
+    plans
+    |> Enum.reduce(%{}, fn {_record, next}, acc ->
+      partition_key = Map.get(next, :partition_key)
+      updated_score = Float.to_string(Map.get(next, :updated_at_ms, 0) * 1.0)
+      lease_score = Float.to_string(Map.get(next, :lease_deadline_ms, 0) * 1.0)
+
+      acc
+      |> flow_claim_add_zset_entry(
+        FlowKeys.state_index_key(next.type, next.state, partition_key),
+        next.id,
+        updated_score
+      )
+      |> flow_claim_add_zset_entry(
+        FlowKeys.inflight_index_key(next.type, partition_key),
+        next.id,
+        lease_score
+      )
+      |> flow_claim_add_zset_entry(
+        FlowKeys.worker_index_key(Map.get(next, :lease_owner, ""), partition_key),
+        next.id,
+        lease_score
+      )
+    end)
+    |> Enum.each(fn {key, member_score_pairs} ->
+      flow_zset_put_many(state, key, Enum.reverse(member_score_pairs))
+    end)
+
+    :ok
+  end
+
+  defp flow_claim_add_zset_entry(acc, key, member, score) do
+    Map.update(acc, key, [{member, score}], &[{member, score} | &1])
+  end
+
+  defp flow_claim_put_history(state, plans, now_ms) do
+    Ferricstore.Commands.Stream.ensure_meta_table()
+
+    Enum.each(plans, fn {_record, next} ->
+      flow_history_put_ready(state, next, "claimed", now_ms)
+      flow_history_trim(state, next)
+    end)
+
+    :ok
   end
 
   defp flow_require_record(state, id, partition_key) do
@@ -4934,6 +5090,28 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flow_zset_delete_members_from_key(_state, _due_key, []), do: :ok
+
+  defp flow_zset_delete_members_from_key(state, due_key, ids) do
+    ids = Enum.uniq(ids)
+
+    Enum.each(ids, fn id ->
+      flow_delete(state, CompoundKey.zset_member(due_key, id))
+    end)
+
+    flow_zset_delete_many(state, due_key, ids)
+  end
+
+  defp flow_zset_index_delete_grouped(state, key_ids) do
+    key_ids
+    |> Enum.group_by(fn {key, _id} -> key end, fn {_key, id} -> id end)
+    |> Enum.each(fn {key, ids} ->
+      flow_zset_delete_many(state, key, Enum.uniq(ids))
+    end)
+
+    :ok
+  end
+
   defp flow_index_put(state, %{id: id, type: type, state: flow_state} = record) do
     partition_key = Map.get(record, :partition_key)
     state_index_key = FlowKeys.state_index_key(type, flow_state, partition_key)
@@ -4961,7 +5139,7 @@ defmodule Ferricstore.Raft.StateMachine do
     partition_key = Map.get(record, :partition_key)
     state_index_key = FlowKeys.state_index_key(type, flow_state, partition_key)
 
-    with :ok <- flow_zset_delete_from_key(state, state_index_key, id) do
+    with :ok <- flow_zset_delete(state, state_index_key, id) do
       flow_running_index_delete(state, record)
     end
   end
@@ -4971,17 +5149,61 @@ defmodule Ferricstore.Raft.StateMachine do
     inflight_index_key = FlowKeys.inflight_index_key(type, partition_key)
     worker_index_key = FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key)
 
-    with :ok <- flow_zset_delete_from_key(state, inflight_index_key, id) do
-      flow_zset_delete_from_key(state, worker_index_key, id)
+    with :ok <- flow_zset_delete(state, inflight_index_key, id) do
+      flow_zset_delete(state, worker_index_key, id)
     end
   end
 
   defp flow_running_index_delete(_state, _record), do: :ok
 
+  defp flow_due_put_many(_state, []), do: :ok
+
+  defp flow_due_put_many(state, records) do
+    records
+    |> Enum.group_by(fn record ->
+      partition_key = Map.get(record, :partition_key)
+      FlowKeys.due_key(record.type, record.state, record.priority, partition_key)
+    end)
+    |> Enum.reduce_while(:ok, fn {due_key, due_records}, :ok ->
+      member_score_pairs =
+        Enum.map(due_records, fn record ->
+          score_str = Float.to_string(Map.fetch!(record, :next_run_at_ms) * 1.0)
+          {record.id, score_str}
+        end)
+
+      result =
+        with :ok <- flow_ensure_due_type(state, due_key),
+             :ok <- flow_put_zset_member_scores(state, due_key, member_score_pairs) do
+          flow_zset_put_many(state, due_key, member_score_pairs)
+        end
+
+      case result do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_put_zset_member_scores(state, due_key, member_score_pairs) do
+    Enum.each(member_score_pairs, fn {id, score_str} ->
+      flow_put(state, CompoundKey.zset_member(due_key, id), score_str, 0)
+    end)
+
+    :ok
+  end
+
   defp flow_ensure_due_type(_state, nil), do: :ok
 
   defp flow_ensure_due_type(state, due_key) do
-    flow_put(state, CompoundKey.type_key(due_key), CompoundKey.encode_type(:zset), 0)
+    type_key = CompoundKey.type_key(due_key)
+
+    case ets_lookup(state, type_key) do
+      {:hit, _value, _expire_at_ms} ->
+        :ok
+
+      :miss ->
+        flow_put(state, type_key, CompoundKey.encode_type(:zset), 0)
+    end
   end
 
   defp flow_ensure_due_index_ready(
@@ -5012,6 +5234,20 @@ defmodule Ferricstore.Raft.StateMachine do
     ZSetIndex.put_member(index, lookup, due_key, id, score_str)
   end
 
+  defp flow_zset_put_many(
+         %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+         due_key,
+         member_score_pairs
+       )
+       when lookup != nil and index != nil do
+    flow_ensure_due_index_ready(
+      %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+      due_key
+    )
+
+    ZSetIndex.put_members(index, lookup, due_key, member_score_pairs)
+  end
+
   defp flow_zset_delete(
          %{zset_score_lookup_name: lookup, zset_score_index_name: index},
          due_key,
@@ -5021,7 +5257,21 @@ defmodule Ferricstore.Raft.StateMachine do
     ZSetIndex.delete_member(index, lookup, due_key, id)
   end
 
-  defp flow_history_put(state, %{id: id, version: version} = record, event, now_ms) do
+  defp flow_zset_delete_many(
+         %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+         due_key,
+         ids
+       )
+       when lookup != nil and index != nil do
+    ZSetIndex.delete_members(index, lookup, due_key, ids)
+  end
+
+  defp flow_history_put(state, record, event, now_ms) do
+    Ferricstore.Commands.Stream.ensure_meta_table()
+    flow_history_put_ready(state, record, event, now_ms)
+  end
+
+  defp flow_history_put_ready(state, %{id: id, version: version} = record, event, now_ms) do
     event_id = Integer.to_string(now_ms) <> "-" <> Integer.to_string(version)
     partition_key = Map.get(record, :partition_key)
 
@@ -5076,8 +5326,6 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_history_integer_or_empty(_value), do: ""
 
   defp flow_history_index_put(history_key, event_id, compound_key) do
-    Ferricstore.Commands.Stream.ensure_meta_table()
-
     {ms, seq} = flow_parse_event_id(event_id)
     meta_table = Ferricstore.Stream.Meta
     index_table = Ferricstore.Stream.Index

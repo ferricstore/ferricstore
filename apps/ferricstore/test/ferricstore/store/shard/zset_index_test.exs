@@ -81,6 +81,29 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
     assert 1 == ZSetIndex.member_rank(index, lookup, "zs", "b", true)
   end
 
+  test "bulk put updates members and keeps count exact", %{index: index, lookup: lookup} do
+    insert_members(index, lookup, "zs", [{"a", "1"}, {"b", "2"}])
+
+    assert :ok == ZSetIndex.put_members(index, lookup, "zs", [{"b", "4"}, {"c", "3"}])
+
+    assert 3 == ZSetIndex.count(index, lookup, "zs", :neg_inf, :inf)
+    assert [{"a", 1.0}, {"c", 3.0}, {"b", 4.0}] == ZSetIndex.rank_range(index, "zs", 0, 2, false)
+    assert 2 == ZSetIndex.member_rank(index, lookup, "zs", "b", false)
+  end
+
+  test "bulk delete removes only present members and keeps count exact", %{
+    index: index,
+    lookup: lookup
+  } do
+    insert_members(index, lookup, "zs", [{"a", "1"}, {"b", "2"}, {"c", "3"}])
+
+    assert :ok == ZSetIndex.delete_members(index, lookup, "zs", ["a", "missing", "c"])
+
+    assert 1 == ZSetIndex.count(index, lookup, "zs", :neg_inf, :inf)
+    assert [{"b", 2.0}] == ZSetIndex.rank_range(index, "zs", 0, 10, false)
+    assert nil == ZSetIndex.member_rank(index, lookup, "zs", "a", false)
+  end
+
   defp insert_members(index, lookup, redis_key, members) do
     Enum.each(members, fn {member, score} ->
       ZSetIndex.put_member(index, lookup, redis_key, member, score)
