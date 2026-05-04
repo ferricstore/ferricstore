@@ -305,21 +305,21 @@ defmodule Ferricstore.Application do
 
     shutdown_flush_batchers(shard_count)
     shutdown_flush_bitcask_writers(shard_count)
-    shutdown_fsync_bitcask(shard_count, data_dir)
+    bitcask_fsync_result = shutdown_fsync_bitcask(shard_count, data_dir)
     shutdown_flush_shards(shard_count)
     wal_rollover_result = shutdown_wal_rollover(data_dir)
     shutdown_check_snapshots(shard_count)
 
     elapsed = System.monotonic_time(:millisecond) - t0
 
-    case wal_rollover_result do
-      :ok ->
+    case {bitcask_fsync_result, wal_rollover_result} do
+      {:ok, :ok} ->
         Logger.info("Shutdown: graceful flush complete in #{elapsed}ms")
 
-      {:error, reason} ->
+      {bitcask_result, wal_result} ->
         Logger.warning(
           "Shutdown: graceful flush complete with warnings in #{elapsed}ms " <>
-            "(wal_rollover=#{inspect(reason)})"
+            "(bitcask_fsync=#{inspect(bitcask_result)}, wal_rollover=#{inspect(wal_result)})"
         )
     end
 
@@ -390,33 +390,17 @@ defmodule Ferricstore.Application do
     # Without fsync, a subsequent Process.exit(:kill) can lose unsynced data
     # on Linux (Docker overlayfs). macOS APFS retains page cache across kills.
 
-    for i <- 0..(shard_count - 1) do
-      try do
-        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
-        active_file_path = shutdown_active_file_path(i)
+    result = fsync_bitcask_for_shutdown(shard_count, data_dir)
 
-        if active_file_path && Ferricstore.FS.exists?(active_file_path) do
-          Ferricstore.Bitcask.NIF.v2_fsync(active_file_path)
-        else
-          # Fallback: fsync all log files in the shard directory
-          case Ferricstore.FS.ls(shard_path) do
-            {:ok, files} ->
-              files
-              |> Enum.filter(&String.ends_with?(&1, ".log"))
-              |> Enum.each(fn f ->
-                Ferricstore.Bitcask.NIF.v2_fsync(Path.join(shard_path, f))
-              end)
+    case result do
+      :ok ->
+        Logger.info("Shutdown: Bitcask files fsynced")
 
-            _ ->
-              :ok
-          end
-        end
-      catch
-        _, _ -> :ok
-      end
+      {:error, failures} ->
+        Logger.warning("Shutdown: Bitcask fsync incomplete: #{inspect(failures)}")
     end
 
-    Logger.info("Shutdown: Bitcask files fsynced")
+    result
   end
 
   defp shutdown_active_file_path(shard_index) do
@@ -428,6 +412,87 @@ defmodule Ferricstore.Application do
   catch
     _, _ -> nil
   end
+
+  @doc false
+  def fsync_bitcask_for_shutdown(shard_count, data_dir, opts \\ []) do
+    active_file_path = Keyword.get(opts, :active_file_path, &shutdown_active_file_path/1)
+    exists? = Keyword.get(opts, :exists?, &Ferricstore.FS.exists?/1)
+    fsync = Keyword.get(opts, :fsync, &Ferricstore.Bitcask.NIF.v2_fsync/1)
+    list_log_files = Keyword.get(opts, :list_log_files, &shutdown_list_log_files/1)
+
+    failures =
+      0..(shard_count - 1)
+      |> Enum.reduce([], fn shard_index, acc ->
+        case fsync_bitcask_shard_for_shutdown(
+               shard_index,
+               data_dir,
+               active_file_path,
+               exists?,
+               fsync,
+               list_log_files
+             ) do
+          :ok -> acc
+          {:error, reason} -> [{shard_index, reason} | acc]
+        end
+      end)
+      |> Enum.reverse()
+
+    case failures do
+      [] -> :ok
+      failures -> {:error, failures}
+    end
+  end
+
+  defp fsync_bitcask_shard_for_shutdown(
+         shard_index,
+         data_dir,
+         active_file_path,
+         exists?,
+         fsync,
+         list_log_files
+       ) do
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    active_path = active_file_path.(shard_index)
+
+    cond do
+      active_path && exists?.(active_path) ->
+        case fsync.(active_path) do
+          :ok -> :ok
+          {:ok, _} -> :ok
+          {:error, reason} -> {:error, {:active_file_fsync_failed, active_path, reason}}
+          other -> {:error, {:active_file_fsync_failed, active_path, other}}
+        end
+
+      true ->
+        fsync_log_files_for_shutdown(shard_path, fsync, list_log_files)
+    end
+  catch
+    kind, reason -> {:error, {:fsync_crashed, kind, reason}}
+  end
+
+  defp fsync_log_files_for_shutdown(shard_path, fsync, list_log_files) do
+    case list_log_files.(shard_path) do
+      {:ok, files} ->
+        files
+        |> Enum.filter(&String.ends_with?(&1, ".log"))
+        |> Enum.reduce(:ok, fn filename, acc ->
+          path = Path.join(shard_path, filename)
+
+          case {acc, fsync.(path)} do
+            {:ok, :ok} -> :ok
+            {:ok, {:ok, _}} -> :ok
+            {:ok, {:error, reason}} -> {:error, {:log_file_fsync_failed, path, reason}}
+            {:ok, other} -> {:error, {:log_file_fsync_failed, path, other}}
+            {{:error, _} = error, _} -> error
+          end
+        end)
+
+      {:error, reason} ->
+        {:error, {:list_log_files_failed, shard_path, reason}}
+    end
+  end
+
+  defp shutdown_list_log_files(shard_path), do: Ferricstore.FS.ls(shard_path)
 
   defp shutdown_flush_shards(shard_count) do
     # Step 4: Flush all shards — hint files + fsync

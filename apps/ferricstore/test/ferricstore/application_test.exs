@@ -227,6 +227,28 @@ defmodule Ferricstore.ApplicationTest do
 
       assert {:ok, ^value} = NIF.v2_pread_at(path, offset)
     end
+
+    test "shutdown Bitcask fsync reports active-file and fallback listing failures" do
+      assert {:error,
+              [
+                {0, {:active_file_fsync_failed, "/tmp/active.log", :eio}},
+                {1, {:list_log_files_failed, "/tmp/data/shard_1", {:permission_denied, "nope"}}}
+              ]} =
+               Ferricstore.Application.fsync_bitcask_for_shutdown(2, "/tmp",
+                 active_file_path: fn
+                   0 -> "/tmp/active.log"
+                   1 -> nil
+                 end,
+                 exists?: fn
+                   "/tmp/active.log" -> true
+                   _ -> false
+                 end,
+                 fsync: fn "/tmp/active.log" -> {:error, :eio} end,
+                 list_log_files: fn "/tmp/data/shard_1" ->
+                   {:error, {:permission_denied, "nope"}}
+                 end
+               )
+    end
   end
 
   # ---------------------------------------------------------------------------
