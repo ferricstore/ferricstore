@@ -120,6 +120,62 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
              Ferricstore.Store.Shard.Flush.compute_file_stats(shard_path, keydir)
   end
 
+  test "recover_from_log fails closed and emits telemetry when scan target is missing" do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lifecycle_missing_log_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Path.join(tmp, "shard_0")
+    File.mkdir_p!(shard_path)
+
+    keydir =
+      :ets.new(:"lifecycle_missing_log_#{System.unique_integer([:positive])}", [:set, :public])
+
+    handler_id = {__MODULE__, self(), make_ref()}
+    parent = self()
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :bitcask, :recovery_scan_failed],
+      fn event, measurements, metadata, _config ->
+        send(parent, {:recovery_scan_failed, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+
+      try do
+        :ets.delete(keydir)
+      rescue
+        _ -> :ok
+      end
+
+      File.rm_rf!(tmp)
+    end)
+
+    assert capture_log(fn ->
+             assert_raise RuntimeError, ~r/recover_from_log failed to scan/, fn ->
+               ShardLifecycle.recover_from_log(shard_path, "00000.log", keydir, 0)
+             end
+           end) =~ "recover_from_log failed to scan"
+
+    assert_receive {:recovery_scan_failed, [:ferricstore, :bitcask, :recovery_scan_failed],
+                    %{count: 1},
+                    %{
+                      operation: :recover_from_log,
+                      path: missing_path,
+                      shard_index: 0,
+                      reason: reason
+                    }}
+
+    assert missing_path == Path.join(shard_path, "00000.log")
+    assert is_binary(reason)
+  end
+
   test "discover_active_file reports leftover compact temp cleanup failures" do
     tmp =
       Path.join(

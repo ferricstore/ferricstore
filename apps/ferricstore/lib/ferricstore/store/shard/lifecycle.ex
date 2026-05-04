@@ -139,8 +139,11 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           recover_record(keydir, shard_index, fid, record, instance_ctx)
         end)
 
-      _ ->
-        :ok
+      {:error, reason} ->
+        fail_recovery_scan!(:recover_from_log, log_path, shard_index, reason)
+
+      other ->
+        fail_recovery_scan!(:recover_from_log, log_path, shard_index, {:unexpected, other})
     end
   end
 
@@ -161,8 +164,16 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           recover_record(keydir, shard_index, fid, record, instance_ctx)
         end)
 
-      _ ->
-        :ok
+      {:error, reason} ->
+        fail_recovery_scan!(:recover_from_log_from_offset, log_path, shard_index, reason)
+
+      other ->
+        fail_recovery_scan!(
+          :recover_from_log_from_offset,
+          log_path,
+          shard_index,
+          {:unexpected, other}
+        )
     end
   end
 
@@ -760,9 +771,31 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
             :ok
         end)
 
-      _ ->
-        :ok
+      {:error, reason} ->
+        fail_recovery_scan!(:recover_tombstones_from_full_scan, log_path, shard_index, reason)
+
+      other ->
+        fail_recovery_scan!(
+          :recover_tombstones_from_full_scan,
+          log_path,
+          shard_index,
+          {:unexpected, other}
+        )
     end
+  end
+
+  defp fail_recovery_scan!(operation, log_path, shard_index, reason) do
+    :telemetry.execute(
+      [:ferricstore, :bitcask, :recovery_scan_failed],
+      %{count: 1},
+      %{operation: operation, path: log_path, shard_index: shard_index, reason: inspect(reason)}
+    )
+
+    Logger.error(
+      "Shard #{shard_index}: #{operation} failed to scan #{log_path}: #{inspect(reason)}"
+    )
+
+    raise "#{operation} failed to scan #{log_path}: #{inspect(reason)}"
   end
 
   defp recover_hint_tombstone(
