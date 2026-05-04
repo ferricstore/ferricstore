@@ -2876,7 +2876,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
           file_stats: %{99 => %{live_bytes: 1, dead_bytes: 0}}
       }
 
-      Process.put(:sm_pending_state, stale_state)
+      Process.put(:sm_apply_state, %{pending_state: stale_state})
 
       try do
         assert {new_state, _result, _effects} =
@@ -2887,7 +2887,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
         assert new_state.active_file_size == state.active_file_size
         assert new_state.file_stats == state.file_stats
       after
-        Process.delete(:sm_pending_state)
+        Process.delete(:sm_apply_state)
       end
     end
 
@@ -2905,7 +2905,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
           file_stats: %{99 => %{live_bytes: 1, dead_bytes: 0}}
       }
 
-      Process.put(:sm_pending_state, stale_state)
+      Process.put(:sm_apply_state, %{pending_state: stale_state})
 
       try do
         assert {new_state, _result, _effects} =
@@ -2916,7 +2916,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
         assert new_state.active_file_size == state.active_file_size
         assert new_state.file_stats == state.file_stats
       after
-        Process.delete(:sm_pending_state)
+        Process.delete(:sm_apply_state)
       end
     end
 

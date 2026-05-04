@@ -6,7 +6,7 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
                         __DIR__
                       )
 
-  test "apply entry clears checkpoint dependency process state" do
+  test "apply entry clears consolidated apply process state" do
     source = File.read!(@state_machine_path)
 
     [_match, body] =
@@ -15,17 +15,23 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
         source
       )
 
-    assert body =~ "Process.delete(:sm_checkpoint_dependencies_clean_before_write)",
-           "stale dependency-clean state can release a Ra cursor after a crashed apply"
-
-    assert body =~ "Process.delete(:sm_checkpoint_clean_before_write)",
-           "stale shard-clean state can release a Ra cursor after a crashed apply"
-
-    assert body =~ "Process.delete(:sm_checkpoint_dirty_indices)",
-           "stale dirty checkpoint indices can block or misdirect the next release decision"
+    assert body =~ "Process.delete(@sm_apply_state_key)",
+           "stale consolidated apply state can release a Ra cursor after a crashed apply"
   end
 
-  test "no-meta apply path clears shard-clean process state" do
+  test "release cursor apply state uses one process dictionary key" do
+    source = File.read!(@state_machine_path)
+
+    refute source =~ ":sm_pending_state"
+    refute source =~ ":sm_checkpoint_dependencies_clean_before_write"
+    refute source =~ ":sm_checkpoint_clean_before_write"
+    refute source =~ ":sm_checkpoint_dirty_indices"
+    refute source =~ ":sm_release_cursor_blocked"
+
+    assert source =~ "@sm_apply_state_key :sm_apply_state"
+  end
+
+  test "no-meta apply path clears consolidated apply process state" do
     source = File.read!(@state_machine_path)
 
     [_match, body] =
@@ -34,8 +40,8 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
         source
       )
 
-    assert body =~ "Process.delete(:sm_checkpoint_clean_before_write)",
-           "cross-shard sub-apply without Ra meta must not leak stale clean-state into the next apply"
+    assert body =~ "Process.delete(@sm_apply_state_key)",
+           "cross-shard sub-apply without Ra meta must not leak stale apply-state into the next apply"
   end
 
   test "checkpoint clean does not fail open for unresolved instance context" do

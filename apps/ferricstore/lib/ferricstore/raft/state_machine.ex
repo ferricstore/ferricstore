@@ -101,6 +101,7 @@ defmodule Ferricstore.Raft.StateMachine do
   @cold_read_timeout_ms 10_000
   @cold_location_retry_attempts 8
   @cold_location_retry_sleep_ms 1
+  @sm_apply_state_key :sm_apply_state
 
   defguardp valid_cold_location(file_id, offset, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
@@ -1064,11 +1065,11 @@ defmodule Ferricstore.Raft.StateMachine do
           {shard_state(), term()} | {shard_state(), term(), list()}
   defp maybe_release_cursor(%{index: ra_index}, old_count, state, result) do
     state = consume_pending_state(state)
-    checkpoint_clean_before_write? = Process.delete(:sm_checkpoint_clean_before_write) == true
-    release_cursor_blocked? = Process.delete(:sm_release_cursor_blocked) == true
+    checkpoint_clean_before_write? = apply_state_pop(:checkpoint_clean_before_write) == true
+    release_cursor_blocked? = apply_state_pop(:release_cursor_blocked) == true
 
     checkpoint_dependencies_clean_before_write? =
-      Process.delete(:sm_checkpoint_dependencies_clean_before_write) == true
+      apply_state_pop(:checkpoint_dependencies_clean_before_write) == true
 
     dirty_checkpoint_indices = consume_checkpoint_dirty_indices()
     previous_pending_release_index = Map.get(state, :pending_release_cursor_index)
@@ -1158,10 +1159,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp maybe_release_cursor(_meta, _old_count, state, result) do
     state = consume_pending_state(state)
-    Process.delete(:sm_checkpoint_clean_before_write)
-    Process.delete(:sm_checkpoint_dependencies_clean_before_write)
-    Process.delete(:sm_checkpoint_dirty_indices)
-    Process.delete(:sm_release_cursor_blocked)
+    Process.delete(@sm_apply_state_key)
 
     # No meta (e.g. cross-shard sub-apply) — pass through untouched.
     {state, result}
@@ -1220,7 +1218,7 @@ defmodule Ferricstore.Raft.StateMachine do
        do: {state, checkpoint_effects}
 
   defp block_release_cursor_for_apply do
-    Process.put(:sm_release_cursor_blocked, true)
+    apply_state_put(:release_cursor_blocked, true)
   end
 
   defp record_release_cursor_blocked_apply(state, true) do
@@ -1245,7 +1243,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp consume_checkpoint_dirty_indices do
-    case Process.delete(:sm_checkpoint_dirty_indices) do
+    case apply_state_pop(:checkpoint_dirty_indices) do
       %MapSet{} = indices -> indices
       indices when is_list(indices) -> MapSet.new(indices)
       _ -> MapSet.new()
@@ -1253,18 +1251,18 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp record_checkpoint_dirty_index(shard_index) when is_integer(shard_index) do
-    indices = Process.get(:sm_checkpoint_dirty_indices, MapSet.new())
-    Process.put(:sm_checkpoint_dirty_indices, MapSet.put(indices, shard_index))
+    indices = apply_state_get(:checkpoint_dirty_indices, MapSet.new())
+    apply_state_put(:checkpoint_dirty_indices, MapSet.put(indices, shard_index))
   end
 
   defp record_checkpoint_dirty_index(_shard_index), do: :ok
 
   defp remember_checkpoint_dependencies_clean_before_write(state) do
-    if Process.get(:sm_checkpoint_dependencies_clean_before_write) != true do
+    if apply_state_get(:checkpoint_dependencies_clean_before_write) != true do
       indices = Map.get(state, :pending_release_cursor_checkpoint_indices, MapSet.new())
 
       if Enum.any?(indices) and checkpoint_indices_clean?(state, indices) do
-        Process.put(:sm_checkpoint_dependencies_clean_before_write, true)
+        apply_state_put(:checkpoint_dependencies_clean_before_write, true)
       end
     end
   rescue
@@ -1297,7 +1295,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp consume_pending_state(state) do
-    case Process.delete(:sm_pending_state) do
+    case apply_state_pop(:pending_state) do
       nil ->
         state
 
@@ -1310,6 +1308,30 @@ defmodule Ferricstore.Raft.StateMachine do
             file_stats: pending_state.file_stats
         }
     end
+  end
+
+  defp apply_state_get(field, default \\ nil) do
+    @sm_apply_state_key
+    |> Process.get(%{})
+    |> Map.get(field, default)
+  end
+
+  defp apply_state_put(field, value) do
+    state = Process.get(@sm_apply_state_key, %{})
+    Process.put(@sm_apply_state_key, Map.put(state, field, value))
+  end
+
+  defp apply_state_pop(field, default \\ nil) do
+    state = Process.get(@sm_apply_state_key, %{})
+    {value, state} = Map.pop(state, field, default)
+
+    if map_size(state) == 0 do
+      Process.delete(@sm_apply_state_key)
+    else
+      Process.put(@sm_apply_state_key, state)
+    end
+
+    value
   end
 
   defp record_cursor_metric(%{shard_index: shard_index} = state, field, index)
@@ -1426,11 +1448,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp clear_stale_pending_state do
-    Process.delete(:sm_pending_state)
-    Process.delete(:sm_checkpoint_clean_before_write)
-    Process.delete(:sm_checkpoint_dependencies_clean_before_write)
-    Process.delete(:sm_checkpoint_dirty_indices)
-    Process.delete(:sm_release_cursor_blocked)
+    Process.delete(@sm_apply_state_key)
     :ok
   end
 
@@ -1544,7 +1562,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # For the anchor shard (matching state.shard_index), uses state directly.
   # For remote shards, reads active file info from persistent_term.
   defp build_cross_shard_store(shard_idx, anchor_state) do
-    instance_ctx = anchor_state.instance_ctx || instance_ctx_for_state(anchor_state)
+    instance_ctx = cross_shard_instance_ctx(anchor_state)
 
     data_dir =
       if instance_ctx do
@@ -1564,7 +1582,7 @@ defmodule Ferricstore.Raft.StateMachine do
           end)
 
         fn key ->
-          Map.fetch!(ctx_by_shard, Router.shard_for(instance_ctx, key))
+          Map.fetch!(ctx_by_shard, cross_shard_route_key(instance_ctx, key, shard_idx))
         end
       else
         fn _key -> default_ctx end
@@ -2031,6 +2049,41 @@ defmodule Ferricstore.Raft.StateMachine do
         zset_score_index_name: zset_score_index_name,
         zset_score_lookup_name: zset_score_lookup_name
       }
+    end
+  end
+
+  defp cross_shard_route_key(%{slot_map: _} = instance_ctx, key, _default_idx) do
+    Router.shard_for(instance_ctx, key)
+  end
+
+  defp cross_shard_route_key(_instance_ctx, _key, default_idx), do: default_idx
+
+  defp cross_shard_instance_ctx(%{instance_ctx: %FerricStore.Instance{} = ctx} = state) do
+    if instance_data_path?(ctx, state), do: ctx, else: nil
+  end
+
+  defp cross_shard_instance_ctx(%{instance_ctx: ctx}) when is_map(ctx) do
+    if Map.has_key?(ctx, :shard_count) and Map.has_key?(ctx, :keydir_refs) do
+      ctx
+    else
+      nil
+    end
+  end
+
+  defp cross_shard_instance_ctx(state) do
+    case instance_ctx_for_state(state) do
+      %FerricStore.Instance{} = ctx ->
+        if instance_data_path?(ctx, state), do: ctx, else: nil
+
+      ctx when is_map(ctx) ->
+        if Map.has_key?(ctx, :shard_count) and Map.has_key?(ctx, :keydir_refs) do
+          ctx
+        else
+          nil
+        end
+
+      _ ->
+        nil
     end
   end
 
@@ -4381,7 +4434,7 @@ defmodule Ferricstore.Raft.StateMachine do
                 clear_disk_pressure(state)
                 apply_pending_locations(state, file_id, batch, locations)
                 state = track_bitcask_append_bytes(state, file_path, file_id, record_bytes)
-                Process.put(:sm_pending_state, state)
+                apply_state_put(:pending_state, state)
                 :ok
 
               {:error, reason} ->
@@ -4766,9 +4819,9 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp remember_checkpoint_clean_before_write(state, ctx) do
-    if Process.get(:sm_checkpoint_clean_before_write) != true and
+    if apply_state_get(:checkpoint_clean_before_write) != true and
          checkpoint_clean?(%{state | instance_ctx: ctx}) do
-      Process.put(:sm_checkpoint_clean_before_write, true)
+      apply_state_put(:checkpoint_clean_before_write, true)
     end
   rescue
     _ -> :ok
