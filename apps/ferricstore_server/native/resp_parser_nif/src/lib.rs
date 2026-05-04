@@ -662,7 +662,7 @@ fn parse_command_array<'a>(
 
 fn parse_inline_command<'a>(
     env: Env<'a>,
-    data: &Binary<'a>,
+    _data: &Binary<'a>,
     buf: &[u8],
     pos: usize,
 ) -> ParseResult<'a> {
@@ -679,21 +679,24 @@ fn parse_inline_command<'a>(
         ));
     }
 
-    let ranges = split_inline_ranges(line, pos);
-    if ranges.is_empty() {
+    let tokens = match parse_inline_token_bytes(line) {
+        Ok(tokens) => tokens,
+        Err(message) => return ParseResult::Error(make_binary_term(env, message)),
+    };
+
+    if tokens.is_empty() {
         return ParseResult::Skip(after_crlf);
     }
 
-    let (cmd_start, cmd_len) = ranges[0];
-    let cmd_bytes = uppercase_bytes(&buf[cmd_start..cmd_start + cmd_len]);
-    let cmd = make_uppercase_term(env, data, buf, cmd_start, cmd_len);
-    let mut args = Vec::with_capacity(ranges.len() - 1);
-    let mut arg_bytes = Vec::with_capacity(ranges.len() - 1);
+    let cmd_bytes = uppercase_bytes(&tokens[0]);
+    let cmd = make_binary_term(env, &cmd_bytes);
+    let mut args = Vec::with_capacity(tokens.len() - 1);
 
-    for &(start, len) in &ranges[1..] {
-        args.push(unsafe { data.make_subbinary_unchecked(start, len) }.encode(env));
-        arg_bytes.push(&buf[start..start + len]);
+    for token in &tokens[1..] {
+        args.push(make_binary_term(env, token));
     }
+
+    let arg_bytes: Vec<&[u8]> = tokens[1..].iter().map(|token| token.as_slice()).collect();
 
     ParseResult::Ok(
         make_command_term(env, &cmd_bytes, cmd, args, &arg_bytes),
@@ -1136,16 +1139,16 @@ fn parse_inline<'a>(env: Env<'a>, buf: &[u8], pos: usize) -> ParseResult<'a> {
         ));
     }
 
-    // Inline tokens must be copied — they're substrings split on whitespace,
-    // not contiguous ranges of the input binary.
-    let tokens: Vec<Term<'a>> = line
-        .split(|&b| b == b' ' || b == b'\t')
-        .filter(|s| !s.is_empty())
-        .map(|token| {
-            let mut bin = NewBinary::new(env, token.len());
-            bin.as_mut_slice().copy_from_slice(token);
-            bin.into()
-        })
+    let token_bytes = match parse_inline_token_bytes(line) {
+        Ok(tokens) => tokens,
+        Err(message) => return ParseResult::Error(make_binary_term(env, message)),
+    };
+
+    // Inline tokens are copied because quoted strings may need unescaping and
+    // may not be contiguous sub-binaries of the input buffer.
+    let tokens: Vec<Term<'a>> = token_bytes
+        .iter()
+        .map(|token| make_binary_term(env, token))
         .collect();
 
     ParseResult::Ok((atoms::inline(), tokens).encode(env), after_crlf)
@@ -1555,6 +1558,18 @@ enum CommandAstKind {
     TdigestMax,
     TdigestInfo,
     TdigestMerge,
+    FlowCreate,
+    FlowGet,
+    FlowClaimDue,
+    FlowComplete,
+    FlowTransition,
+    FlowRetry,
+    FlowFail,
+    FlowCancel,
+    FlowList,
+    FlowInfo,
+    FlowStuck,
+    FlowHistory,
     Blpop,
     Brpop,
     Blmove,
@@ -1775,6 +1790,18 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"TDIGEST.MAX" => CommandAstKind::TdigestMax,
         b"TDIGEST.INFO" => CommandAstKind::TdigestInfo,
         b"TDIGEST.MERGE" => CommandAstKind::TdigestMerge,
+        b"FLOW.CREATE" => CommandAstKind::FlowCreate,
+        b"FLOW.GET" => CommandAstKind::FlowGet,
+        b"FLOW.CLAIM_DUE" => CommandAstKind::FlowClaimDue,
+        b"FLOW.COMPLETE" => CommandAstKind::FlowComplete,
+        b"FLOW.TRANSITION" => CommandAstKind::FlowTransition,
+        b"FLOW.RETRY" => CommandAstKind::FlowRetry,
+        b"FLOW.FAIL" => CommandAstKind::FlowFail,
+        b"FLOW.CANCEL" => CommandAstKind::FlowCancel,
+        b"FLOW.LIST" => CommandAstKind::FlowList,
+        b"FLOW.INFO" => CommandAstKind::FlowInfo,
+        b"FLOW.STUCK" => CommandAstKind::FlowStuck,
+        b"FLOW.HISTORY" => CommandAstKind::FlowHistory,
         b"BLPOP" => CommandAstKind::Blpop,
         b"BRPOP" => CommandAstKind::Brpop,
         b"BLMOVE" => CommandAstKind::Blmove,
@@ -2192,6 +2219,18 @@ fn make_command_ast<'a>(
             make_exact_arity_list_ast(env, "tdigest_info", args, b"tdigest.info", 1)
         }
         CommandAstKind::TdigestMerge => make_tdigest_merge_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowCreate => make_flow_create_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowGet => make_flow_get_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowClaimDue => make_flow_claim_due_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowComplete => make_flow_complete_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowTransition => make_flow_transition_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowRetry => make_flow_retry_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowFail => make_flow_fail_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowCancel => make_flow_cancel_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowList => make_flow_list_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowInfo => make_flow_info_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowStuck => make_flow_stuck_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowHistory => make_flow_history_command_ast(env, args, arg_bytes),
         CommandAstKind::Blpop => make_blocking_pop_command_ast(
             env,
             atoms::blpop(),
@@ -5032,6 +5071,505 @@ fn make_tdigest_merge_command_ast<'a>(
     (tag, args[0], src_keys, opts).encode(env)
 }
 
+fn make_flow_create_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_create");
+    if args.len() < 3 {
+        return (tag, wrong_number_error(env, b"flow.create")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_create_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
+fn make_flow_get_command_ast<'a>(env: Env<'a>, args: &[Term<'a>], arg_bytes: &[&[u8]]) -> Term<'a> {
+    let tag = atom(env, "flow_get");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.get")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_partition_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
+fn make_flow_claim_due_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_claim_due");
+    if args.len() < 3 {
+        return (tag, wrong_number_error(env, b"flow.claim_due")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_claim_due_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
+fn make_flow_complete_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_complete");
+    if args.len() < 4 {
+        return (tag, wrong_number_error(env, b"flow.complete")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 2, flow_terminal_option) {
+        Ok(opts) => (tag, args[0], args[1], opts).encode(env),
+        Err(err) => (tag, args[0], args[1], err).encode(env),
+    }
+}
+
+fn make_flow_transition_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_transition");
+    if args.len() < 5 {
+        return (tag, wrong_number_error(env, b"flow.transition")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 3, flow_transition_option) {
+        Ok(opts) => (tag, args[0], args[1], args[2], opts).encode(env),
+        Err(err) => (tag, args[0], args[1], args[2], err).encode(env),
+    }
+}
+
+fn make_flow_retry_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_retry");
+    if args.len() < 4 {
+        return (tag, wrong_number_error(env, b"flow.retry")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 2, flow_retry_option) {
+        Ok(opts) => (tag, args[0], args[1], opts).encode(env),
+        Err(err) => (tag, args[0], args[1], err).encode(env),
+    }
+}
+
+fn make_flow_fail_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_fail");
+    if args.len() < 4 {
+        return (tag, wrong_number_error(env, b"flow.fail")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 2, flow_fail_option) {
+        Ok(opts) => (tag, args[0], args[1], opts).encode(env),
+        Err(err) => (tag, args[0], args[1], err).encode(env),
+    }
+}
+
+fn make_flow_cancel_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_cancel");
+    if args.len() < 3 {
+        return (tag, wrong_number_error(env, b"flow.cancel")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_cancel_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
+fn make_flow_list_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_list");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.list")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_list_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
+fn make_flow_info_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_info");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.info")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_partition_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
+fn make_flow_stuck_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_stuck");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.stuck")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_stuck_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
+fn make_flow_history_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_history");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.history")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_history_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
+type FlowOptionParser<'a> =
+    fn(Env<'a>, &[Term<'a>], &[&[u8]], usize) -> Result<Option<Term<'a>>, Term<'a>>;
+
+fn parse_flow_options<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    start: usize,
+    parser: FlowOptionParser<'a>,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    if (args.len() - start) % 2 != 0 {
+        return Err(generic_ast_error(env, b"ERR syntax error"));
+    }
+
+    let mut opts = Vec::with_capacity((args.len() - start) / 2);
+    let mut idx = start;
+    while idx < args.len() {
+        if let Some(opt) = parser(env, args, arg_bytes, idx)? {
+            opts.push(opt);
+        }
+        idx += 2;
+    }
+    Ok(opts)
+}
+
+#[derive(Clone, Copy)]
+enum FlowOptType<'a> {
+    Binary,
+    NonNegative,
+    Positive(&'a [u8]),
+    Partition,
+}
+
+fn flow_create_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"TYPE", "type", FlowOptType::Binary),
+            (b"STATE", "state", FlowOptType::Binary),
+            (b"PAYLOAD_REF", "payload_ref", FlowOptType::Binary),
+            (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"PRIORITY", "priority", FlowOptType::NonNegative),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"TTL", "ttl_ms", FlowOptType::NonNegative),
+            (
+                b"HISTORY_MAX_EVENTS",
+                "history_max_events",
+                FlowOptType::Positive(b"history_max_events"),
+            ),
+        ],
+    )
+}
+
+fn flow_claim_due_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"WORKER", "worker", FlowOptType::Binary),
+            (b"STATE", "state", FlowOptType::Binary),
+            (b"LEASE_MS", "lease_ms", FlowOptType::Positive(b"lease_ms")),
+            (b"LIMIT", "limit", FlowOptType::Positive(b"limit")),
+            (b"PRIORITY", "priority", FlowOptType::NonNegative),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_terminal_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"FENCING", "fencing_token", FlowOptType::NonNegative),
+            (b"RESULT_REF", "result_ref", FlowOptType::Binary),
+            (b"TTL", "ttl_ms", FlowOptType::NonNegative),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_transition_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"FENCING", "fencing_token", FlowOptType::NonNegative),
+            (b"LEASE_TOKEN", "lease_token", FlowOptType::Binary),
+            (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
+            (b"PRIORITY", "priority", FlowOptType::NonNegative),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_retry_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"FENCING", "fencing_token", FlowOptType::NonNegative),
+            (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
+            (b"ERROR_REF", "error_ref", FlowOptType::Binary),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_fail_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"FENCING", "fencing_token", FlowOptType::NonNegative),
+            (b"ERROR_REF", "error_ref", FlowOptType::Binary),
+            (b"TTL", "ttl_ms", FlowOptType::NonNegative),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_cancel_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"FENCING", "fencing_token", FlowOptType::NonNegative),
+            (b"LEASE_TOKEN", "lease_token", FlowOptType::Binary),
+            (b"REASON_REF", "reason_ref", FlowOptType::Binary),
+            (b"TTL", "ttl_ms", FlowOptType::NonNegative),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_list_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"STATE", "state", FlowOptType::Binary),
+            (b"COUNT", "count", FlowOptType::Positive(b"count")),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_stuck_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"COUNT", "count", FlowOptType::Positive(b"count")),
+            (b"OLDER_THAN", "older_than_ms", FlowOptType::NonNegative),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_history_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"COUNT", "count", FlowOptType::Positive(b"count")),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_partition_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[(b"PARTITION", "partition_key", FlowOptType::Partition)],
+    )
+}
+
+fn flow_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+    specs: &[(&[u8], &str, FlowOptType<'_>)],
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    for (wire, key, opt_type) in specs {
+        if ascii_eq_ignore_case(arg_bytes[idx], *wire) {
+            return flow_option_value(env, *key, *opt_type, args[idx + 1], arg_bytes[idx + 1]);
+        }
+    }
+    Err(generic_ast_error(env, b"ERR syntax error"))
+}
+
+fn flow_option_value<'a>(
+    env: Env<'a>,
+    key: &str,
+    opt_type: FlowOptType<'_>,
+    value_term: Term<'a>,
+    value_bytes: &[u8],
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    let key_atom = atom(env, key);
+
+    match opt_type {
+        FlowOptType::Binary => Ok(Some((key_atom, value_term).encode(env))),
+        FlowOptType::Partition if ascii_eq_ignore_case(value_bytes, b"GLOBAL") => Ok(None),
+        FlowOptType::Partition => Ok(Some((key_atom, value_term).encode(env))),
+        FlowOptType::NonNegative => match parse_int_bytes(value_bytes) {
+            Some(value) if value >= 0 => Ok(Some((key_atom, value).encode(env))),
+            _ => Err(generic_ast_error(
+                env,
+                b"ERR value is not an integer or out of range",
+            )),
+        },
+        FlowOptType::Positive(label) => match parse_int_bytes(value_bytes) {
+            Some(value) if value > 0 => Ok(Some((key_atom, value).encode(env))),
+            _ => {
+                let mut msg = b"ERR flow ".to_vec();
+                msg.extend_from_slice(label);
+                msg.extend_from_slice(b" must be a positive integer");
+                Err(generic_ast_error(env, &msg))
+            }
+        },
+    }
+}
+
 fn parse_element_count_pairs_ast<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -5394,6 +5932,8 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"CMS.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"TDIGEST.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"RATELIMIT.ADD" => vec![0],
+        b"FLOW.CREATE" | b"FLOW.GET" | b"FLOW.COMPLETE" | b"FLOW.TRANSITION" | b"FLOW.RETRY"
+        | b"FLOW.FAIL" | b"FLOW.CANCEL" | b"FLOW.HISTORY" => vec![0],
         b"MEMORY" => {
             if argc > 1 && ascii_eq_ignore_case(arg_bytes[0], b"USAGE") {
                 vec![1]
@@ -5952,25 +6492,74 @@ fn uppercase_binary_term<'a>(env: Env<'a>, bytes: &[u8]) -> Term<'a> {
     make_binary_term(env, &uppercase_bytes(bytes))
 }
 
-fn split_inline_ranges(line: &[u8], base: usize) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut start: Option<usize> = None;
+fn parse_inline_token_bytes(line: &[u8]) -> Result<Vec<Vec<u8>>, &'static [u8]> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
 
-    for (idx, &byte) in line.iter().enumerate() {
-        if byte == b' ' || byte == b'\t' {
-            if let Some(token_start) = start.take() {
-                ranges.push((base + token_start, idx - token_start));
+    while i < line.len() {
+        while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
+            i += 1;
+        }
+
+        if i >= line.len() {
+            break;
+        }
+
+        let quote = line[i];
+
+        if quote == b'"' || quote == b'\'' {
+            i += 1;
+            let mut token = Vec::new();
+            let mut closed = false;
+
+            while i < line.len() {
+                match line[i] {
+                    b if b == quote => {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                    b'\\' if quote == b'"' => {
+                        i += 1;
+
+                        if i >= line.len() {
+                            return Err(b"ERR Protocol error: unbalanced quotes in request");
+                        }
+
+                        token.push(match line[i] {
+                            b'n' => b'\n',
+                            b'r' => b'\r',
+                            b't' => b'\t',
+                            b'b' => 8,
+                            b'a' => 7,
+                            other => other,
+                        });
+                        i += 1;
+                    }
+                    byte => {
+                        token.push(byte);
+                        i += 1;
+                    }
+                }
             }
-        } else if start.is_none() {
-            start = Some(idx);
+
+            if !closed {
+                return Err(b"ERR Protocol error: unbalanced quotes in request");
+            }
+
+            tokens.push(token);
+        } else {
+            let start = i;
+
+            while i < line.len() && line[i] != b' ' && line[i] != b'\t' {
+                i += 1;
+            }
+
+            tokens.push(line[start..i].to_vec());
         }
     }
 
-    if let Some(token_start) = start {
-        ranges.push((base + token_start, line.len() - token_start));
-    }
-
-    ranges
+    Ok(tokens)
 }
 
 fn parse_non_negative_count(data: &[u8]) -> Result<usize, String> {

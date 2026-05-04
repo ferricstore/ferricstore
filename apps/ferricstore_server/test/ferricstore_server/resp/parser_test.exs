@@ -1125,8 +1125,8 @@ defmodule FerricstoreServer.Resp.ParserTest do
                  {:json_get, "doc", [{"$.a", ["a"]}, {"$['b']", ["b"]}]}, ["doc"]},
                 {:command, "JSON.NUMINCRBY", ["doc", "$.n", "1.5"],
                  {:json_numincrby, "doc", ["n"], 1.5}, ["doc"]},
-                {:command, "JSON.ARRAPPEND", ["doc", "$.arr", "1", ~s("x")],
-                 {:json_arrappend, "doc", ["arr"], ["1", ~s("x")]}, ["doc"]},
+                {:command, "JSON.ARRAPPEND", ["doc", "$.arr", "1", "x"],
+                 {:json_arrappend, "doc", ["arr"], ["1", "x"]}, ["doc"]},
                 {:command, "JSON.MGET", ["a", "b", "$.name"], {:json_mget, ["a", "b"], ["name"]},
                  ["a", "b"]}
               ], ""} =
@@ -1631,6 +1631,125 @@ defmodule FerricstoreServer.Resp.ParserTest do
 
     test "float-like value in integer position returns error" do
       assert {:error, {:invalid_integer, "3.14"}} = Parser.parse(":3.14\r\n")
+    end
+  end
+
+  describe "Flow command AST" do
+    test "parses Flow write commands into typed Rust AST" do
+      assert {:ok,
+              [
+                {:command, "FLOW.CREATE",
+                 [
+                   "flow-1",
+                   "TYPE",
+                   "checkout",
+                   "STATE",
+                   "queued",
+                   "RUN_AT",
+                   "1000",
+                   "PRIORITY",
+                   "2",
+                   "PARTITION",
+                   "tenant-a",
+                   "TTL",
+                   "5000",
+                   "HISTORY_MAX_EVENTS",
+                   "10"
+                 ],
+                 {:flow_create, "flow-1",
+                  [
+                    type: "checkout",
+                    state: "queued",
+                    run_at_ms: 1000,
+                    priority: 2,
+                    partition_key: "tenant-a",
+                    ttl_ms: 5000,
+                    history_max_events: 10
+                  ]}, ["flow-1"]},
+                {:command, "FLOW.CLAIM_DUE",
+                 [
+                   "checkout",
+                   "WORKER",
+                   "worker-a",
+                   "LEASE_MS",
+                   "30000",
+                   "LIMIT",
+                   "100",
+                   "NOW",
+                   "1000"
+                 ],
+                 {:flow_claim_due, "checkout",
+                  [worker: "worker-a", lease_ms: 30000, limit: 100, now_ms: 1000]}, []},
+                {:command, "FLOW.COMPLETE",
+                 ["flow-1", "lease-1", "FENCING", "1", "RESULT_REF", "result-1"],
+                 {:flow_complete, "flow-1", "lease-1",
+                  [fencing_token: 1, result_ref: "result-1"]}, ["flow-1"]},
+                {:command, "FLOW.TRANSITION",
+                 ["flow-1", "queued", "running", "FENCING", "1", "LEASE_TOKEN", "lease-1"],
+                 {:flow_transition, "flow-1", "queued", "running",
+                  [fencing_token: 1, lease_token: "lease-1"]}, ["flow-1"]},
+                {:command, "FLOW.RETRY", ["flow-1", "lease-1", "FENCING", "1", "RUN_AT", "2000"],
+                 {:flow_retry, "flow-1", "lease-1", [fencing_token: 1, run_at_ms: 2000]},
+                 ["flow-1"]},
+                {:command, "FLOW.FAIL",
+                 ["flow-1", "lease-1", "FENCING", "1", "ERROR_REF", "err-1"],
+                 {:flow_fail, "flow-1", "lease-1", [fencing_token: 1, error_ref: "err-1"]},
+                 ["flow-1"]},
+                {:command, "FLOW.CANCEL", ["flow-1", "FENCING", "1", "REASON_REF", "reason-1"],
+                 {:flow_cancel, "flow-1", [fencing_token: 1, reason_ref: "reason-1"]}, ["flow-1"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "flow.create flow-1 TYPE checkout STATE queued RUN_AT 1000 PRIORITY 2 PARTITION tenant-a TTL 5000 HISTORY_MAX_EVENTS 10\r\n" <>
+                   "flow.claim_due checkout WORKER worker-a LEASE_MS 30000 LIMIT 100 NOW 1000\r\n" <>
+                   "flow.complete flow-1 lease-1 FENCING 1 RESULT_REF result-1\r\n" <>
+                   "flow.transition flow-1 queued running FENCING 1 LEASE_TOKEN lease-1\r\n" <>
+                   "flow.retry flow-1 lease-1 FENCING 1 RUN_AT 2000\r\n" <>
+                   "flow.fail flow-1 lease-1 FENCING 1 ERROR_REF err-1\r\n" <>
+                   "flow.cancel flow-1 FENCING 1 REASON_REF reason-1\r\n"
+               )
+    end
+
+    test "parses Flow read commands into typed Rust AST" do
+      assert {:ok,
+              [
+                {:command, "FLOW.GET", ["flow-1", "PARTITION", "GLOBAL"],
+                 {:flow_get, "flow-1", []}, ["flow-1"]},
+                {:command, "FLOW.LIST", ["checkout", "STATE", "queued", "COUNT", "25"],
+                 {:flow_list, "checkout", [state: "queued", count: 25]}, []},
+                {:command, "FLOW.INFO", ["checkout", "PARTITION", "tenant-a"],
+                 {:flow_info, "checkout", [partition_key: "tenant-a"]}, []},
+                {:command, "FLOW.STUCK", ["checkout", "OLDER_THAN", "1000", "COUNT", "10"],
+                 {:flow_stuck, "checkout", [older_than_ms: 1000, count: 10]}, []},
+                {:command, "FLOW.HISTORY", ["flow-1", "COUNT", "10"],
+                 {:flow_history, "flow-1", [count: 10]}, ["flow-1"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "flow.get flow-1 PARTITION GLOBAL\r\n" <>
+                   "flow.list checkout STATE queued COUNT 25\r\n" <>
+                   "flow.info checkout PARTITION tenant-a\r\n" <>
+                   "flow.stuck checkout OLDER_THAN 1000 COUNT 10\r\n" <>
+                   "flow.history flow-1 COUNT 10\r\n"
+               )
+    end
+
+    test "keeps Flow option parse errors inside AST" do
+      assert {:ok,
+              [
+                {:command, "FLOW.CREATE", ["f", "TYPE", "t", "PRIORITY", "x"],
+                 {:flow_create, "f", {:error, "ERR value is not an integer or out of range"}},
+                 ["f"]},
+                {:command, "FLOW.CLAIM_DUE", ["t", "WORKER", "w", "LIMIT", "0"],
+                 {:flow_claim_due, "t", {:error, "ERR flow limit must be a positive integer"}},
+                 []},
+                {:command, "FLOW.COMPLETE", ["f", "l"],
+                 {:flow_complete,
+                  {:error, "ERR wrong number of arguments for 'flow.complete' command"}}, ["f"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "flow.create f TYPE t PRIORITY x\r\n" <>
+                   "flow.claim_due t WORKER w LIMIT 0\r\n" <>
+                   "flow.complete f l\r\n"
+               )
     end
   end
 

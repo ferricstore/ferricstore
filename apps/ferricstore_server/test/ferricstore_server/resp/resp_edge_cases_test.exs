@@ -583,6 +583,18 @@ defmodule FerricstoreServer.Resp.RespEdgeCasesTest do
       assert {:ok, [{:inline, ["GET", "key"]}], ""} = Parser.parse("GET key  \r\n")
     end
 
+    test "inline command preserves spaces inside double quotes" do
+      assert {:ok, [{:inline, ["SET", "key", "hello world"]}], ""} =
+               Parser.parse("SET key \"hello world\"\r\n")
+    end
+
+    test "command parser preserves quoted inline args" do
+      assert {:ok,
+              [{:command, "SET", ["key", "hello world"], {:set, "key", "hello world"}, ["key"]}],
+              ""} =
+               Parser.parse_commands("SET key \"hello world\"\r\n")
+    end
+
     test "inline command with tabs between tokens" do
       assert {:ok, [{:inline, ["GET", "key"]}], ""} = Parser.parse("GET\tkey\r\n")
     end

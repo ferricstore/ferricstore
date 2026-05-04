@@ -159,31 +159,19 @@ defmodule FerricstoreServer.ReviewR4Test do
   end
 
   # ---------------------------------------------------------------------------
-  # B9. Inline command parsing doesn't handle quoted strings — CONFIRMED BUG
+  # B9. Inline command parsing should handle Redis-style quoted strings.
   # ---------------------------------------------------------------------------
 
-  describe "B9: inline parser does not handle quoted strings" do
-    # parser.ex:448:
-    #   tokens = :binary.split(line, [<<" ">>, <<"\t">>], [:global, :trim_all])
-
-    test "inline parser splits quoted strings on whitespace" do
+  describe "B9: inline parser handles quoted strings" do
+    test "inline parser preserves spaces inside double quotes" do
       sock = connect()
       key = ukey("b9")
 
       :ok = :gen_tcp.send(sock, "SET #{key} \"hello world\"\r\n")
-      result = unwrap(recv_one(sock))
+      assert "OK" == unwrap(recv_one(sock))
 
-      case result do
-        "OK" ->
-          :ok = :gen_tcp.send(sock, "GET #{key}\r\n")
-          stored = unwrap(recv_one(sock))
-          refute stored == "hello world",
-                 "Expected inline parser NOT to handle quotes, but it did"
-
-        {:error, _msg} ->
-          # SET got wrong number of args - confirms the bug
-          assert true
-      end
+      :ok = :gen_tcp.send(sock, "GET #{key}\r\n")
+      assert "hello world" == unwrap(recv_one(sock))
 
       :gen_tcp.close(sock)
     end
@@ -366,17 +354,12 @@ defmodule FerricstoreServer.ReviewR4Test do
   # ---------------------------------------------------------------------------
 
   describe "B9 unit: inline parser behavior" do
-    test "splits on whitespace without quote handling" do
+    test "preserves quoted whitespace" do
       input = "SET mykey \"hello world\"\r\n"
 
       case Parser.parse(input) do
         {:ok, [{:inline, tokens} | _], _rest} ->
-          refute tokens == ["SET", "mykey", "hello world"],
-                 "Parser should NOT handle quoted strings in inline mode"
-
-          assert length(tokens) > 3 or
-                   Enum.any?(tokens, &String.contains?(&1, "\"")),
-                 "Expected raw quote chars or extra tokens from naive whitespace split"
+          assert tokens == ["SET", "mykey", "hello world"]
 
         other ->
           flunk("Unexpected parse result: #{inspect(other)}")
