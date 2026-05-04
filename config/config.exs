@@ -8,6 +8,8 @@ config :ferricstore, :ferricstore_wal_nif,
   skip_compilation?: true,
   load_from: {:ferricstore, "priv/native/ferricstore_wal_nif"}
 
+config :ra, logger_module: Ferricstore.Raft.SafeRaLogger
+
 # TCP server port (default: 6379, matches Redis)
 config :ferricstore, :port, 6379
 

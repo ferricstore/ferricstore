@@ -132,6 +132,12 @@ defmodule Ferricstore.Application do
     # overriding the fork's beam with a potentially stale patched version.
     install_patched_wal()
 
+    # Ra formats one snapshot debug event with `~b` even though the size can be
+    # `undefined`; use our delegate so long debug/chaos runs do not spam
+    # formatter crashes while keeping the rest of Ra logging intact.
+    :ok = Ferricstore.Raft.SafeRaLogger.install_filter()
+    :ok = :ra_env.configure_logger(Ferricstore.Raft.SafeRaLogger)
+
     # Start Erlang distribution if cluster is configured.
     # Must happen before ra system start so ra can communicate across nodes.
     maybe_start_distribution()
