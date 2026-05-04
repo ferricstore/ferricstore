@@ -84,6 +84,12 @@ defmodule Ferricstore.Merge.Manifest do
             :ok
 
           {:error, cleanup_reason} ->
+            :telemetry.execute(
+              [:ferricstore, :merge, :manifest, :cleanup_failed],
+              %{count: 1},
+              %{path: tmp_path, reason: cleanup_reason}
+            )
+
             Logger.warning(
               "Failed to remove merge manifest tmp file #{tmp_path}: #{inspect(cleanup_reason)}"
             )

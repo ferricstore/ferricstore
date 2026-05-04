@@ -52,12 +52,30 @@ defmodule Ferricstore.Merge.ManifestTest do
       tmp_path = Path.join(dir, "merge_manifest.bin.tmp")
       File.mkdir!(tmp_path)
 
+      parent = self()
+      handler_id = {:merge_manifest_cleanup_failed, parent, make_ref()}
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :merge, :manifest, :cleanup_failed],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:cleanup_failed, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
       log =
         capture_log(fn ->
           assert {:error, _reason} = Manifest.write(dir, %{shard_index: 0, input_file_ids: [1]})
         end)
 
       assert log =~ "Failed to remove merge manifest tmp file"
+
+      assert_receive {:cleanup_failed, [:ferricstore, :merge, :manifest, :cleanup_failed],
+                      %{count: 1}, %{path: ^tmp_path, reason: {_kind, _message}}},
+                     500
     end
   end
 
