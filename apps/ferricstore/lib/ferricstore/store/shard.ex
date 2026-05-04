@@ -607,6 +607,14 @@ defmodule Ferricstore.Store.Shard do
     ShardCompound.handle_zset_score_count(redis_key, min_bound, max_bound, state)
   end
 
+  def handle_call({:zset_rank_range, redis_key, start_idx, stop_idx, reverse?}, _from, state) do
+    ShardCompound.handle_zset_rank_range(redis_key, start_idx, stop_idx, reverse?, state)
+  end
+
+  def handle_call({:zset_member_rank, redis_key, member, reverse?}, _from, state) do
+    ShardCompound.handle_zset_member_rank(redis_key, member, reverse?, state)
+  end
+
   def handle_call({:compound_delete_prefix, redis_key, prefix}, _from, state) do
     redis_key
     |> ShardCompound.handle_compound_delete_prefix(prefix, state)

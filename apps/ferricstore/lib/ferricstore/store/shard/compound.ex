@@ -560,6 +560,35 @@ defmodule Ferricstore.Store.Shard.Compound do
      state}
   end
 
+  @spec handle_zset_rank_range(binary(), non_neg_integer(), non_neg_integer(), boolean(), map()) ::
+          {:reply, {:ok, [{binary(), float()}]}, map()}
+  @doc false
+  def handle_zset_rank_range(redis_key, start_idx, stop_idx, reverse?, state) do
+    state = ensure_zset_score_index(state, redis_key)
+
+    {:reply,
+     {:ok,
+      ZSetIndex.rank_range(state.zset_score_index, redis_key, start_idx, stop_idx, reverse?)},
+     state}
+  end
+
+  @spec handle_zset_member_rank(binary(), binary(), boolean(), map()) ::
+          {:reply, {:ok, non_neg_integer() | nil}, map()}
+  @doc false
+  def handle_zset_member_rank(redis_key, member, reverse?, state) do
+    state = ensure_zset_score_index(state, redis_key)
+
+    {:reply,
+     {:ok,
+      ZSetIndex.member_rank(
+        state.zset_score_index,
+        state.zset_score_lookup,
+        redis_key,
+        member,
+        reverse?
+      )}, state}
+  end
+
   @spec handle_compound_delete_prefix(binary(), binary(), map()) :: {:reply, :ok, map()}
   @doc false
   def handle_compound_delete_prefix(redis_key, prefix, state) do

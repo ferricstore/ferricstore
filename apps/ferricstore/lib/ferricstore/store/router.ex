@@ -4236,6 +4236,26 @@ defmodule Ferricstore.Store.Router do
     safe_read_call(ctx, idx, {:zset_score_count, redis_key, min_bound, max_bound})
   end
 
+  @spec zset_rank_range(
+          FerricStore.Instance.t(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          boolean()
+        ) ::
+          {:ok, [{binary(), float()}]} | :unavailable
+  def zset_rank_range(ctx, redis_key, start_idx, stop_idx, reverse?) do
+    idx = shard_for(ctx, redis_key)
+    safe_read_call(ctx, idx, {:zset_rank_range, redis_key, start_idx, stop_idx, reverse?})
+  end
+
+  @spec zset_member_rank(FerricStore.Instance.t(), binary(), binary(), boolean()) ::
+          {:ok, non_neg_integer() | nil} | :unavailable
+  def zset_member_rank(ctx, redis_key, member, reverse?) do
+    idx = shard_for(ctx, redis_key)
+    safe_read_call(ctx, idx, {:zset_member_rank, redis_key, member, reverse?})
+  end
+
   @spec compound_delete_prefix(FerricStore.Instance.t(), binary(), binary()) :: :ok
   def compound_delete_prefix(ctx, redis_key, prefix) do
     idx = shard_for(ctx, redis_key)

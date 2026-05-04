@@ -190,6 +190,21 @@ defmodule Ferricstore.Commands.SortedSetTest do
       SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
       assert nil == SortedSet.handle("ZRANK", ["zs", "missing"], store)
     end
+
+    test "ZRANK uses score-index member rank when available" do
+      parent = self()
+      base_store = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1.0", "a", "2.0", "b", "3.0", "c"], base_store)
+
+      store =
+        Map.put(base_store, :zset_member_rank, fn redis_key, member, reverse? ->
+          send(parent, {:zset_member_rank, redis_key, member, reverse?})
+          {:ok, 1}
+        end)
+
+      assert 1 == SortedSet.handle("ZRANK", ["zs", "b"], store)
+      assert_receive {:zset_member_rank, "zs", "b", false}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -226,6 +241,23 @@ defmodule Ferricstore.Commands.SortedSetTest do
       store = MockStore.make()
       SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
       assert [] == SortedSet.handle("ZRANGE", ["zs", "5", "1"], store)
+    end
+
+    test "ZRANGE uses score-index rank range when available" do
+      parent = self()
+      base_store = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1.0", "a", "2.0", "b", "3.0", "c"], base_store)
+
+      store =
+        Map.put(base_store, :zset_rank_range, fn redis_key, start_idx, stop_idx, reverse? ->
+          send(parent, {:zset_rank_range, redis_key, start_idx, stop_idx, reverse?})
+          {:ok, [{"b", 2.0}, {"c", 3.0}]}
+        end)
+
+      assert ["b", "2.0", "c", "3.0"] ==
+               SortedSet.handle("ZRANGE", ["zs", "1", "2", "WITHSCORES"], store)
+
+      assert_receive {:zset_rank_range, "zs", 1, 2, false}
     end
   end
 

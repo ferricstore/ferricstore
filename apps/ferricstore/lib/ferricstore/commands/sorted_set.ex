@@ -144,32 +144,12 @@ defmodule Ferricstore.Commands.SortedSet do
   # ---------------------------------------------------------------------------
 
   def handle("ZRANGE", [key, start_str, stop_str | opts], store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      case {Integer.parse(start_str), Integer.parse(stop_str)} do
-        {{start, ""}, {stop, ""}} ->
-          sorted = load_sorted_members(key, store)
-          len = length(sorted)
-          start_idx = normalize_index(start, len)
-          stop_idx = normalize_index(stop, len)
-          with_scores = "WITHSCORES" in opts
+    case {Integer.parse(start_str), Integer.parse(stop_str)} do
+      {{start, ""}, {stop, ""}} ->
+        zrange_rank_parsed(key, start, stop, "WITHSCORES" in opts, false, store)
 
-          if start_idx > stop_idx or start_idx >= len do
-            []
-          else
-            sliced = Enum.slice(sorted, start_idx..stop_idx)
-
-            if with_scores do
-              Enum.flat_map(sliced, fn {member, score} ->
-                [member, format_score(score)]
-              end)
-            else
-              Enum.map(sliced, fn {member, _score} -> member end)
-            end
-          end
-
-        _ ->
-          {:error, "ERR value is not an integer or out of range"}
-      end
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
 
@@ -182,32 +162,12 @@ defmodule Ferricstore.Commands.SortedSet do
   # ---------------------------------------------------------------------------
 
   def handle("ZREVRANGE", [key, start_str, stop_str | opts], store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      case {Integer.parse(start_str), Integer.parse(stop_str)} do
-        {{start, ""}, {stop, ""}} ->
-          sorted = load_sorted_members(key, store) |> Enum.reverse()
-          len = length(sorted)
-          start_idx = normalize_index(start, len)
-          stop_idx = normalize_index(stop, len)
-          with_scores = "WITHSCORES" in opts
+    case {Integer.parse(start_str), Integer.parse(stop_str)} do
+      {{start, ""}, {stop, ""}} ->
+        zrange_rank_parsed(key, start, stop, "WITHSCORES" in opts, true, store)
 
-          if start_idx > stop_idx or start_idx >= len do
-            []
-          else
-            sliced = Enum.slice(sorted, start_idx..stop_idx)
-
-            if with_scores do
-              Enum.flat_map(sliced, fn {member, score} ->
-                [member, format_score(score)]
-              end)
-            else
-              Enum.map(sliced, fn {member, _score} -> member end)
-            end
-          end
-
-        _ ->
-          {:error, "ERR value is not an integer or out of range"}
-      end
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
 
@@ -684,12 +644,18 @@ defmodule Ferricstore.Commands.SortedSet do
 
   defp zrank_member(key, member, reverse?, store) do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      sorted = load_sorted_members(key, store)
-      ranked = if reverse?, do: Enum.reverse(sorted), else: sorted
+      case Ops.zset_member_rank(store, key, member, reverse?) do
+        {:ok, rank} ->
+          rank
 
-      case Enum.find_index(ranked, fn {m, _s} -> m == member end) do
-        nil -> nil
-        idx -> idx
+        :unavailable ->
+          sorted = load_sorted_members(key, store)
+          ranked = if reverse?, do: Enum.reverse(sorted), else: sorted
+
+          case Enum.find_index(ranked, fn {m, _s} -> m == member end) do
+            nil -> nil
+            idx -> idx
+          end
       end
     end
   end
@@ -873,29 +839,55 @@ defmodule Ferricstore.Commands.SortedSet do
 
   defp zrange_rank_parsed(key, start, stop, with_scores, reverse?, store) do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      sorted =
-        if reverse? do
-          load_sorted_members(key, store) |> Enum.reverse()
-        else
-          load_sorted_members(key, store)
-        end
+      {start_idx, stop_idx} = normalize_rank_bounds(key, start, stop, store)
 
-      len = length(sorted)
-      start_idx = normalize_index(start, len)
-      stop_idx = normalize_index(stop, len)
-
-      if start_idx > stop_idx or start_idx >= len do
-        []
-      else
-        sliced = Enum.slice(sorted, start_idx..stop_idx)
-
-        if with_scores do
-          Enum.flat_map(sliced, fn {member, score} -> [member, format_score(score)] end)
-        else
-          Enum.map(sliced, fn {member, _score} -> member end)
-        end
-      end
+      zrange_rank_from_index_or_scan(key, start_idx, stop_idx, with_scores, reverse?, store)
     end
+  end
+
+  defp normalize_rank_bounds(key, start, stop, store) when start < 0 or stop < 0 do
+    len = zcard_count(key, store)
+    {normalize_index(start, len), normalize_index(stop, len)}
+  end
+
+  defp normalize_rank_bounds(_key, start, stop, _store), do: {start, stop}
+
+  defp zrange_rank_from_index_or_scan(_key, start_idx, stop_idx, _with_scores, _reverse?, _store)
+       when start_idx > stop_idx do
+    []
+  end
+
+  defp zrange_rank_from_index_or_scan(key, start_idx, stop_idx, with_scores, reverse?, store) do
+    case Ops.zset_rank_range(store, key, start_idx, stop_idx, reverse?) do
+      {:ok, members} ->
+        format_rank_members(members, with_scores)
+
+      :unavailable ->
+        sorted =
+          if reverse? do
+            load_sorted_members(key, store) |> Enum.reverse()
+          else
+            load_sorted_members(key, store)
+          end
+
+        len = length(sorted)
+
+        if start_idx >= len do
+          []
+        else
+          sorted
+          |> Enum.slice(start_idx..stop_idx)
+          |> format_rank_members(with_scores)
+        end
+    end
+  end
+
+  defp format_rank_members(members, true) do
+    Enum.flat_map(members, fn {member, score} -> [member, format_score(score)] end)
+  end
+
+  defp format_rank_members(members, false) do
+    Enum.map(members, fn {member, _score} -> member end)
   end
 
   defp zcount_parsed(key, min_bound, max_bound, store) do
@@ -1006,6 +998,11 @@ defmodule Ferricstore.Commands.SortedSet do
     key
     |> load_members(store)
     |> sort_members(false)
+  end
+
+  defp zcard_count(key, store) do
+    prefix = CompoundKey.zset_prefix(key)
+    Ops.compound_count(store, key, prefix)
   end
 
   defp load_members(key, store) do

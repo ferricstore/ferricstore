@@ -30,6 +30,20 @@ defmodule Ferricstore.EmbeddedExtendedSortedSetTest do
       FerricStore.zadd("zr:key2", [{1.0, "a"}])
       assert {:ok, nil} = FerricStore.zrank("zr:key2", "z")
     end
+
+    test "rank index stays current after score update and removal" do
+      key = "zr:index_mutation"
+      FerricStore.zadd(key, [{1.0, "a"}, {2.0, "b"}, {3.0, "c"}])
+
+      assert {:ok, 1} = FerricStore.zrank(key, "b")
+
+      FerricStore.zadd(key, [{0.5, "b"}])
+      assert {:ok, 0} = FerricStore.zrank(key, "b")
+
+      FerricStore.zrem(key, ["b"])
+      assert {:ok, nil} = FerricStore.zrank(key, "b")
+      assert {:ok, ["a", "c"]} = FerricStore.zrange(key, 0, -1)
+    end
   end
 
   describe "zrevrank/2" do

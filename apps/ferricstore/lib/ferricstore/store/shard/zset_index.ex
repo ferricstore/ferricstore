@@ -55,9 +55,67 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
   @spec count(:ets.tid(), binary(), term(), term()) :: non_neg_integer()
   def count(index_table, redis_key, min_bound, max_bound) do
+    start = range_start(redis_key, min_bound)
+    count_range(index_table, :ets.next(index_table, start), redis_key, min_bound, max_bound, 0)
+  end
+
+  @spec rank_range(:ets.tid(), binary(), non_neg_integer(), non_neg_integer(), boolean()) ::
+          [{binary(), float()}]
+  def rank_range(_index_table, _redis_key, start_idx, stop_idx, _reverse?)
+      when start_idx > stop_idx do
+    []
+  end
+
+  def rank_range(index_table, redis_key, start_idx, stop_idx, false) do
     index_table
-    |> scan_range(redis_key, min_bound, max_bound)
-    |> Enum.reduce(0, fn _item, acc -> acc + 1 end)
+    |> :ets.next(first_before(redis_key))
+    |> collect_rank_range(index_table, redis_key, start_idx, stop_idx, 0, &next_key/2, [])
+  end
+
+  def rank_range(index_table, redis_key, start_idx, stop_idx, true) do
+    index_table
+    |> :ets.prev(first_after(redis_key))
+    |> collect_rank_range(index_table, redis_key, start_idx, stop_idx, 0, &prev_key/2, [])
+  end
+
+  @spec member_rank(:ets.tid(), :ets.tid(), binary(), binary(), boolean()) ::
+          non_neg_integer() | nil
+  def member_rank(index_table, lookup_table, redis_key, member, false) do
+    with [{{^redis_key, ^member}, score}] <- :ets.lookup(lookup_table, {redis_key, member}) do
+      target = {redis_key, @index_tag, score, member}
+
+      if :ets.member(index_table, target) do
+        rank_until(
+          index_table,
+          :ets.next(index_table, first_before(redis_key)),
+          redis_key,
+          target,
+          0,
+          &next_key/2
+        )
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  def member_rank(index_table, lookup_table, redis_key, member, true) do
+    with [{{^redis_key, ^member}, score}] <- :ets.lookup(lookup_table, {redis_key, member}) do
+      target = {redis_key, @index_tag, score, member}
+
+      if :ets.member(index_table, target) do
+        rank_until(
+          index_table,
+          :ets.prev(index_table, first_after(redis_key)),
+          redis_key,
+          target,
+          0,
+          &prev_key/2
+        )
+      end
+    else
+      _ -> nil
+    end
   end
 
   @spec apply_put(map(), binary(), binary(), binary()) :: map()
@@ -192,6 +250,94 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     do_scan_range(index_table, :ets.next(index_table, start), redis_key, min_bound, max_bound, [])
   end
 
+  defp count_range(_table, :"$end_of_table", _redis_key, _min_bound, _max_bound, acc), do: acc
+
+  defp count_range(table, key, redis_key, min_bound, max_bound, acc) do
+    case key do
+      {^redis_key, @index_tag, score, _member} ->
+        cond do
+          not score_lte_bound?(score, max_bound) ->
+            acc
+
+          score_gte_bound?(score, min_bound) ->
+            count_range(table, :ets.next(table, key), redis_key, min_bound, max_bound, acc + 1)
+
+          true ->
+            count_range(table, :ets.next(table, key), redis_key, min_bound, max_bound, acc)
+        end
+
+      _ ->
+        acc
+    end
+  end
+
+  defp collect_rank_range(
+         :"$end_of_table",
+         _table,
+         _redis_key,
+         _start_idx,
+         _stop_idx,
+         _rank,
+         _next,
+         acc
+       ) do
+    Enum.reverse(acc)
+  end
+
+  defp collect_rank_range(key, table, redis_key, start_idx, stop_idx, rank, next, acc) do
+    case key do
+      {^redis_key, @index_tag, score, member} ->
+        cond do
+          rank > stop_idx ->
+            Enum.reverse(acc)
+
+          rank >= start_idx ->
+            collect_rank_range(
+              next.(table, key),
+              table,
+              redis_key,
+              start_idx,
+              stop_idx,
+              rank + 1,
+              next,
+              [
+                {member, score} | acc
+              ]
+            )
+
+          true ->
+            collect_rank_range(
+              next.(table, key),
+              table,
+              redis_key,
+              start_idx,
+              stop_idx,
+              rank + 1,
+              next,
+              acc
+            )
+        end
+
+      _ ->
+        Enum.reverse(acc)
+    end
+  end
+
+  defp rank_until(:"$end_of_table", _table, _redis_key, _target, _rank, _next), do: nil
+
+  defp rank_until(key, table, redis_key, target, rank, next) do
+    case key do
+      ^target ->
+        rank
+
+      {^redis_key, @index_tag, _score, _member} ->
+        rank_until(next.(table, key), table, redis_key, target, rank + 1, next)
+
+      _ ->
+        nil
+    end
+  end
+
   defp do_scan_range(_table, :"$end_of_table", _redis_key, _min_bound, _max_bound, acc), do: acc
 
   defp do_scan_range(table, key, redis_key, min_bound, max_bound, acc) do
@@ -222,6 +368,11 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
   defp range_start(redis_key, :inf) do
     {redis_key, @index_tag}
   end
+
+  defp first_before(redis_key), do: {redis_key, @index_tag}
+  defp first_after(redis_key), do: {redis_key, @index_tag + 1}
+  defp next_key(table, key), do: :ets.next(table, key)
+  defp prev_key(table, key), do: :ets.prev(table, key)
 
   defp score_gte_bound?(_score, :neg_inf), do: true
   defp score_gte_bound?(_score, :inf), do: false

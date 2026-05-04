@@ -789,6 +789,41 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
+  @spec zset_rank_range(store(), binary(), non_neg_integer(), non_neg_integer(), boolean()) ::
+          {:ok, [{binary(), float()}]} | :unavailable
+  def zset_rank_range(%FerricStore.Instance{} = ctx, redis_key, start_idx, stop_idx, reverse?),
+    do: Router.zset_rank_range(ctx, redis_key, start_idx, stop_idx, reverse?)
+
+  def zset_rank_range(%LocalTxStore{}, _redis_key, _start_idx, _stop_idx, _reverse?),
+    do: :unavailable
+
+  def zset_rank_range(store, redis_key, start_idx, stop_idx, reverse?) when is_map(store) do
+    case store do
+      %{zset_rank_range: fun} when is_function(fun, 4) ->
+        fun.(redis_key, start_idx, stop_idx, reverse?)
+
+      _ ->
+        :unavailable
+    end
+  end
+
+  @spec zset_member_rank(store(), binary(), binary(), boolean()) ::
+          {:ok, non_neg_integer() | nil} | :unavailable
+  def zset_member_rank(%FerricStore.Instance{} = ctx, redis_key, member, reverse?),
+    do: Router.zset_member_rank(ctx, redis_key, member, reverse?)
+
+  def zset_member_rank(%LocalTxStore{}, _redis_key, _member, _reverse?), do: :unavailable
+
+  def zset_member_rank(store, redis_key, member, reverse?) when is_map(store) do
+    case store do
+      %{zset_member_rank: fun} when is_function(fun, 3) ->
+        fun.(redis_key, member, reverse?)
+
+      _ ->
+        :unavailable
+    end
+  end
+
   @spec compound_delete_prefix(store(), binary(), binary()) :: :ok
   def compound_delete_prefix(%FerricStore.Instance{} = ctx, redis_key, prefix),
     do: Router.compound_delete_prefix(ctx, redis_key, prefix)
