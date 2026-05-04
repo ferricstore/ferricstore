@@ -128,6 +128,40 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
       assert {:ok, value <> suffix} == FerricStore.get(key)
     end
 
+    test "APPEND retries when a cold location changes during compaction race" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "alv_test:append_cold_retry_#{System.unique_integer([:positive])}"
+      value = cold_value(?r)
+      suffix = "tail"
+      idx = Router.shard_for(ctx, key)
+      keydir = elem(ctx.keydir_refs, idx)
+      test_pid = self()
+
+      assert Router.durability_for_key_public(ctx, key) == :async
+
+      :ok = Router.put(ctx, key, value, 0)
+      assert_cold_key(key)
+
+      assert [{^key, nil, exp, lfu, file_id, _offset, value_size} = live_entry] =
+               :ets.lookup(keydir, key)
+
+      stale_file_id = file_id + 10_000
+      :ets.insert(keydir, {key, nil, exp, lfu, stale_file_id, 0, value_size})
+
+      Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+        send(test_pid, :cold_location_retry_hook)
+        :ets.insert(keydir, live_entry)
+      end)
+
+      try do
+        assert {:ok, byte_size(value) + byte_size(suffix)} == FerricStore.append(key, suffix)
+        assert_receive :cold_location_retry_hook, 500
+        assert {:ok, value <> suffix} == FerricStore.get(key)
+      after
+        Process.delete(:ferricstore_router_cold_location_miss_hook)
+      end
+    end
+
     test "APPEND returns disk error instead of acknowledging failed large RMW write" do
       ctx = FerricStore.Instance.get(:default)
       key = "alv_test:append_large_disk_error"

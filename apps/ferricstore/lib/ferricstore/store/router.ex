@@ -827,6 +827,7 @@ defmodule Ferricstore.Store.Router do
       [{^key, nil, exp, _, file_id, offset, value_size}]
       when (exp == 0 or exp > now) and valid_cold_location(file_id, offset, value_size) ->
         path = cold_file_path(ctx, idx, file_id)
+        original_location = {file_id, offset, value_size}
 
         case read_cold_async(path, offset, key) do
           {:ok, value} when is_binary(value) ->
@@ -834,7 +835,26 @@ defmodule Ferricstore.Store.Router do
             {:hit, value, exp}
 
           _ ->
-            :missing
+            case retry_changed_cold_meta(ctx, idx, keydir, key, original_location, now) do
+              {:hot, value, retry_expire_at_ms} ->
+                {:hit, value, retry_expire_at_ms}
+
+              {:cold, value, retry_expire_at_ms, retry_file_id, retry_offset} ->
+                warm_ets_after_cold_read(
+                  ctx,
+                  idx,
+                  keydir,
+                  key,
+                  value,
+                  retry_file_id,
+                  retry_offset
+                )
+
+                {:hit, value, retry_expire_at_ms}
+
+              :miss ->
+                :missing
+            end
         end
 
       [{^key, _value, _exp, _, _, _, _}] ->
