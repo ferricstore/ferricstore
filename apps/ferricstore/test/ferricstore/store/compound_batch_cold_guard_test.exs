@@ -91,6 +91,20 @@ defmodule Ferricstore.Store.CompoundBatchColdGuardTest do
            "expected promoted compound batch metadata get to use the shared batched cold reader"
   end
 
+  test "shared compound batch metadata reads use the batched cold path" do
+    ast = compound_ast()
+    shared_body = function_body(ast, :compound_batch_get_meta_shared, 3)
+
+    # Commands such as HGETEX/HTTL/HPTTL fetch value+TTL metadata for many
+    # fields. Cold non-promoted fields should be read in one keyed batch, just
+    # like HMGET, rather than serializing through the single-field helper.
+    assert contains_local_call?(shared_body, :read_compound_cold_batch_async, 1),
+           "expected shared compound batch metadata get to batch cold reads"
+
+    refute contains_local_call?(shared_body, :compound_get_meta_value, 3),
+           "shared compound batch metadata get must not serialize through compound_get_meta_value/3"
+  end
+
   defp compound_ast do
     @compound_path
     |> File.read!()

@@ -369,10 +369,55 @@ defmodule Ferricstore.Store.Shard.Compound do
     {:reply, metas, state}
   end
 
-  defp compound_batch_get_meta_shared(redis_key, compound_keys, state) do
-    Enum.map_reduce(compound_keys, state, fn compound_key, state ->
-      compound_get_meta_value(redis_key, compound_key, state)
-    end)
+  defp compound_batch_get_meta_shared(_redis_key, compound_keys, state) do
+    {results, {state, cold_entries, _cold_count}} =
+      Enum.map_reduce(compound_keys, {state, [], 0}, fn compound_key,
+                                                        {state, cold_entries, cold_count} ->
+        case ShardETS.ets_lookup(state, compound_key) do
+          {:hit, value, expire_at_ms} ->
+            {{:value, {value, expire_at_ms}}, {state, cold_entries, cold_count}}
+
+          {:cold, fid, off, vsize, exp} ->
+            file_path = ShardETS.file_path(state.shard_data_path, fid)
+            entry = {state, compound_key, file_path, fid, off, vsize, exp}
+            {{:cold, cold_count}, {state, [entry | cold_entries], cold_count + 1}}
+
+          :expired ->
+            {{:value, nil}, {state, cold_entries, cold_count}}
+
+          :miss ->
+            if ShardETS.pending_cold?(state, compound_key) do
+              state = ShardFlush.flush_pending_for_read(state)
+
+              {{:value, ShardETS.warm_meta_from_store(state, compound_key)},
+               {state, cold_entries, cold_count}}
+            else
+              {{:value, nil}, {state, cold_entries, cold_count}}
+            end
+        end
+      end)
+
+    cold_entries = Enum.reverse(cold_entries)
+
+    cold_metas =
+      read_compound_cold_batch_async(cold_entries)
+      |> Enum.zip(cold_entries)
+      |> Enum.map(fn
+        {nil, _entry} ->
+          nil
+
+        {value, {_state, _compound_key, _file_path, _fid, _off, _vsize, exp}} ->
+          {value, exp}
+      end)
+      |> List.to_tuple()
+
+    metas =
+      Enum.map(results, fn
+        {:value, meta} -> meta
+        {:cold, index} -> elem(cold_metas, index)
+      end)
+
+    {metas, state}
   end
 
   defp compound_batch_get_meta_dedicated(dedicated_path, compound_keys, state) do
