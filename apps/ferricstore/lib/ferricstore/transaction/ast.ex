@@ -1,7 +1,7 @@
 defmodule Ferricstore.Transaction.Ast do
   @moduledoc false
 
-  @type queue_entry :: {binary(), [term()], term()}
+  @type queue_entry :: {binary(), [term()], term()} | {binary(), [term()]}
 
   @non_key_list_tags ~w(
     acl auth client cluster_demote cluster_failover cluster_join cluster_leave cluster_promote
@@ -12,39 +12,51 @@ defmodule Ferricstore.Transaction.Ast do
   def normalize_entry({cmd, args, ast}) when is_binary(cmd) and is_list(args),
     do: {cmd, args, ast}
 
-  if Mix.env() == :test do
-    def normalize_entry({cmd, args}) when is_binary(cmd) and is_list(args) do
-      frame = encode_test_command(cmd, args)
-      parser = Module.concat([FerricstoreServer, Resp, Parser])
+  # Pre-AST Ra logs can contain transaction queue entries as `{cmd, args}`.
+  # Keep this replay shim compiled in every environment; otherwise a production
+  # node upgraded after the AST migration can fail while replaying old entries.
+  def normalize_entry({cmd, args}) when is_binary(cmd) and is_list(args) do
+    frame = encode_legacy_command(cmd, args)
+    parser = Module.concat([FerricstoreServer, Resp, Parser])
 
-      case apply(parser, :parse_commands, [frame]) do
-        {:ok, [{:command, parsed_cmd, parsed_args, ast, _keys}], ""} ->
-          {parsed_cmd, parsed_args, ast}
+    case Code.ensure_loaded(parser) do
+      {:module, ^parser} ->
+        parse_legacy_entry!(parser, frame)
 
-        {:ok, _other, _rest} ->
-          raise ArgumentError, "invalid transaction test command frame"
-
-        {:error, reason} ->
-          raise ArgumentError, "invalid transaction test command frame: #{inspect(reason)}"
-      end
+      {:error, reason} ->
+        raise ArgumentError,
+              "legacy transaction command replay requires #{inspect(parser)}: #{inspect(reason)}"
     end
-
-    defp encode_test_command(name, args) do
-      parts = [to_command_binary(name) | Enum.map(args, &to_command_binary/1)]
-
-      IO.iodata_to_binary([
-        "*",
-        Integer.to_string(length(parts)),
-        "\r\n",
-        Enum.map(parts, fn part ->
-          ["$", Integer.to_string(byte_size(part)), "\r\n", part, "\r\n"]
-        end)
-      ])
-    end
-
-    defp to_command_binary(value) when is_binary(value), do: value
-    defp to_command_binary(value), do: to_string(value)
   end
+
+  defp parse_legacy_entry!(parser, frame) do
+    case apply(parser, :parse_commands, [frame]) do
+      {:ok, [{:command, parsed_cmd, parsed_args, ast, _keys}], ""} ->
+        {parsed_cmd, parsed_args, ast}
+
+      {:ok, _other, _rest} ->
+        raise ArgumentError, "invalid legacy transaction command frame"
+
+      {:error, reason} ->
+        raise ArgumentError, "invalid legacy transaction command frame: #{inspect(reason)}"
+    end
+  end
+
+  defp encode_legacy_command(name, args) do
+    parts = [to_command_binary(name) | Enum.map(args, &to_command_binary/1)]
+
+    IO.iodata_to_binary([
+      "*",
+      Integer.to_string(length(parts)),
+      "\r\n",
+      Enum.map(parts, fn part ->
+        ["$", Integer.to_string(byte_size(part)), "\r\n", part, "\r\n"]
+      end)
+    ])
+  end
+
+  defp to_command_binary(value) when is_binary(value), do: value
+  defp to_command_binary(value), do: to_string(value)
 
   @spec command_name(queue_entry()) :: binary()
   def command_name(entry) do

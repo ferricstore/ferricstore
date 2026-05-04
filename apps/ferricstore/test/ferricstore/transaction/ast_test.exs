@@ -3,12 +3,20 @@ defmodule Ferricstore.Transaction.AstTest do
 
   alias Ferricstore.Transaction.Ast, as: TxAst
 
-  test "test two-tuple queue entries are normalized through the Rust RESP parser" do
+  test "legacy two-tuple queue entries are normalized through the Rust RESP parser" do
     assert {"SET", ["k", "v", "nx"], {:set, "k", "v", [:nx]}} =
              TxAst.normalize_entry({"set", ["k", "v", "nx"]})
 
     assert {:set, "k", "v", {:error, "ERR XX and NX options at the same time are not compatible"}} =
              TxAst.command_ast({"SET", ["k", "v", "NX", "XX"]})
+  end
+
+  test "legacy two-tuple replay normalization is not test-only" do
+    source =
+      File.read!(Path.expand("../../../lib/ferricstore/transaction/ast.ex", __DIR__))
+
+    refute source =~ "if Mix.env() == :test",
+           "Ra logs can contain pre-AST {cmd, args} transaction entries; replay normalization must be compiled in production too"
   end
 
   test "namespaces multi-key AST shapes used by transaction execution" do
