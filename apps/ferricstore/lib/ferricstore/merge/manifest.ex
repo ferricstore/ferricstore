@@ -181,7 +181,8 @@ defmodule Ferricstore.Merge.Manifest do
         # Remove only temp files created by the current shard compaction path.
         # Numbered log files greater than the input set may be legitimate active
         # files when the crash happens after manifest write but before copy.
-        with :ok <- cleanup_partial_output(data_dir) do
+        with :ok <- run_before_cleanup_hook(),
+             :ok <- cleanup_partial_output(data_dir) do
           delete(data_dir)
         end
 
@@ -251,8 +252,19 @@ defmodule Ferricstore.Merge.Manifest do
           end
         end
 
-      {:error, _reason} ->
-        :ok
+      {:error, reason} ->
+        Logger.error(
+          "Failed to list shard data directory during merge partial cleanup at #{data_dir}: #{inspect(reason)}"
+        )
+
+        {:error, {:cleanup_partial_output_list_failed, data_dir, reason}}
+    end
+  end
+
+  defp run_before_cleanup_hook do
+    case Process.get(:ferricstore_merge_manifest_before_cleanup_hook) do
+      fun when is_function(fun, 0) -> fun.()
+      _ -> :ok
     end
   end
 

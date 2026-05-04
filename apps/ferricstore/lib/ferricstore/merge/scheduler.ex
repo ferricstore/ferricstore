@@ -234,19 +234,25 @@ defmodule Ferricstore.Merge.Scheduler do
     config = build_config(merge_config)
     shard_data_dir = Ferricstore.DataDir.shard_data_path(data_dir, index)
 
-    # Recover from any interrupted merge on startup.
-    Manifest.recover_if_needed(shard_data_dir, index)
+    # Recover from any interrupted merge on startup. Fail closed if recovery
+    # cannot prove partial files were cleaned up; starting the scheduler with
+    # an unknown merge state can make later compactions act on stale files.
+    case Manifest.recover_if_needed(shard_data_dir, index) do
+      :ok ->
+        state = %__MODULE__{
+          shard_index: index,
+          config: config,
+          data_dir: shard_data_dir,
+          semaphore: semaphore,
+          instance_ctx: instance_ctx,
+          file_count: count_existing_log_files(shard_data_dir)
+        }
 
-    state = %__MODULE__{
-      shard_index: index,
-      config: config,
-      data_dir: shard_data_dir,
-      semaphore: semaphore,
-      instance_ctx: instance_ctx,
-      file_count: count_existing_log_files(shard_data_dir)
-    }
+        {:ok, state}
 
-    {:ok, state}
+      {:error, reason} ->
+        {:stop, {:merge_manifest_recovery_failed, index, reason}}
+    end
   end
 
   @impl true

@@ -186,6 +186,38 @@ defmodule Ferricstore.Merge.SchedulerTest do
         File.rm_rf!(data_dir)
       end
     end
+
+    test "init fails closed when interrupted merge recovery fails" do
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "scheduler_manifest_recovery_fail_#{System.unique_integer([:positive])}"
+        )
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+      File.mkdir_p!(shard_dir)
+      :ok = Ferricstore.Merge.Manifest.write(shard_dir, %{shard_index: 0, input_file_ids: [1]})
+
+      Process.put(:ferricstore_merge_manifest_before_cleanup_hook, fn ->
+        File.rm_rf!(shard_dir)
+        File.write!(shard_dir, "not a directory")
+      end)
+
+      try do
+        assert {:stop,
+                {:merge_manifest_recovery_failed, 0,
+                 {:cleanup_partial_output_list_failed, ^shard_dir, {_kind, _message}}}} =
+                 Scheduler.init(
+                   shard_index: 0,
+                   data_dir: data_dir,
+                   merge_config: %{mode: :hot, min_files_for_merge: 100},
+                   name: :test_scheduler_manifest_recovery_fail
+                 )
+      after
+        Process.delete(:ferricstore_merge_manifest_before_cleanup_hook)
+        File.rm_rf!(data_dir)
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------

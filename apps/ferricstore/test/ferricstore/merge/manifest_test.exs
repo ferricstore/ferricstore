@@ -380,5 +380,21 @@ defmodule Ferricstore.Merge.ManifestTest do
       assert Manifest.exists?(dir),
              "manifest must remain until all partial output removals succeed"
     end
+
+    test "recover_if_needed reports partial-output list failures", %{dir: dir} do
+      :ok = Manifest.write(dir, %{shard_index: 0, input_file_ids: [1, 2]})
+
+      Process.put(:ferricstore_merge_manifest_before_cleanup_hook, fn ->
+        File.rm_rf!(dir)
+        File.write!(dir, "not a directory")
+      end)
+
+      try do
+        assert {:error, {:cleanup_partial_output_list_failed, ^dir, {_kind, _message}}} =
+                 Manifest.recover_if_needed(dir, 0)
+      after
+        Process.delete(:ferricstore_merge_manifest_before_cleanup_hook)
+      end
+    end
   end
 end
