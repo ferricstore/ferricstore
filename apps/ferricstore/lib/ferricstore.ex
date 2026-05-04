@@ -4926,8 +4926,10 @@ defmodule FerricStore do
       iex> FerricStore.flushall()
       :ok
 
+  Returns `{:error, reason}` when delegated cleanup cannot make filesystem
+  namespace changes durable.
   """
-  @spec flushall() :: :ok
+  @spec flushall() :: :ok | {:error, term()}
   def flushall, do: flushdb()
 
   # ---------------------------------------------------------------------------

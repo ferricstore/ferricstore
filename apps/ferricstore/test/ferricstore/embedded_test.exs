@@ -899,6 +899,15 @@ defmodule Ferricstore.EmbeddedTest do
     end
   end
 
+  describe "flushall/0" do
+    test "public spec includes propagated flushdb errors" do
+      source = File.read!(Path.expand("../../lib/ferricstore.ex", __DIR__))
+
+      assert source =~ "@spec flushall() :: :ok | {:error, term()}",
+             "flushall/0 delegates to flushdb/0 and must advertise propagated cleanup errors"
+    end
+  end
+
   # ===========================================================================
   # Pipeline — new commands
   # ===========================================================================
