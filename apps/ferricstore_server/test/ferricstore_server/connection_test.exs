@@ -496,6 +496,33 @@ defmodule FerricstoreServer.ConnectionTest do
     :gen_tcp.close(sock)
   end
 
+  test "blank inline command is skipped and connection remains usable", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    send_raw(sock, "\r\n")
+    assert {:error, :timeout} = :gen_tcp.recv(sock, 0, 50)
+
+    send_command(sock, ["PING"])
+    assert recv(sock) == "+PONG\r\n"
+    :gen_tcp.close(sock)
+  end
+
+  test "empty bulk command name returns unknown command error without closing", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    send_raw(sock, "*1\r\n$0\r\n\r\n")
+    data = recv(sock)
+    assert String.contains?(data, "unknown command ''")
+
+    send_command(sock, ["PING"])
+    assert recv(sock) == "+PONG\r\n"
+    :gen_tcp.close(sock)
+  end
+
   # ---------------------------------------------------------------------------
   # Greeting map fields — all expected key/value pairs
   # ---------------------------------------------------------------------------
