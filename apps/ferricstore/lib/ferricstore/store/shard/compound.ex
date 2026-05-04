@@ -800,7 +800,7 @@ defmodule Ferricstore.Store.Shard.Compound do
   defp handle_compound_put_direct(redis_key, compound_key, value, expire_at_ms, state) do
     case promoted_store_for_compound(state, redis_key, compound_key) do
       nil ->
-        ShardETS.ets_insert(state, compound_key, value, expire_at_ms)
+        true = ShardETS.ets_insert(state, compound_key, value, expire_at_ms)
         new_pending = [{compound_key, value, expire_at_ms} | state.pending]
         new_version = state.write_version + 1
         new_state = %{state | pending: new_pending, write_version: new_version}

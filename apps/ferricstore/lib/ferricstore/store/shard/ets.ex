@@ -544,7 +544,14 @@ defmodule Ferricstore.Store.Shard.ETS do
        [{:andalso, prefix_guard, {:andalso, live_exp_guard, valid_cold_guard}}], [true]}
     ]
 
-    count = :ets.select_count(keydir, live_hot_ms) + :ets.select_count(keydir, live_cold_ms)
+    live_pending_ms = [
+      {{:"$1", nil, :"$3", :_, :pending, :_, :_}, [{:andalso, prefix_guard, live_exp_guard}],
+       [true]}
+    ]
+
+    count =
+      :ets.select_count(keydir, live_hot_ms) + :ets.select_count(keydir, live_cold_ms) +
+        :ets.select_count(keydir, live_pending_ms)
 
     if state != nil do
       delete_expired_prefix_entries(state, keydir, prefix, prefix_len, now)
@@ -584,7 +591,7 @@ defmodule Ferricstore.Store.Shard.ETS do
     keydir
     |> :ets.select(cold_ms)
     |> Enum.each(fn {key, fid, off, vsize} ->
-      unless valid_cold_location(fid, off, vsize) do
+      unless fid == :pending or valid_cold_location(fid, off, vsize) do
         delete_prefix_entry(state, keydir, key)
       end
     end)

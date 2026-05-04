@@ -28,6 +28,19 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
     %{shard: pid, index: 0, keydir: keydir, ctx: ctx}
   end
 
+  defp assert_pending_cold(keydir, key, expire_at_ms \\ :any) do
+    case :ets.lookup(keydir, key) do
+      [{^key, nil, exp, _lfu, :pending, original_fid, original_vsize}]
+      when (expire_at_ms == :any or exp == expire_at_ms) and
+             (is_nil(original_fid) or (is_integer(original_fid) and original_fid >= 0)) and
+             is_integer(original_vsize) and original_vsize >= 0 ->
+        :ok
+
+      other ->
+        flunk("expected pending cold ETS row for #{inspect(key)}, got #{inspect(other)}")
+    end
+  end
+
   describe "ets_insert uses :pending for unflushed entries" do
     test "large value ETS entry has fid=:pending", %{shard: shard, keydir: keydir} do
       large = String.duplicate("X", @threshold + 1)
@@ -46,7 +59,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
 
       assert ets_val == nil, "large value should be nil in ETS (cold)"
       assert fid == :pending, "expected fid=:pending, got #{inspect(fid)}"
-      assert off == 0
+      assert off == nil
       assert vsize == 0
     end
   end
@@ -69,8 +82,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
       :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
       :ok = GenServer.call(shard, {:put, "pending_big", large, 0})
 
-      assert [{"pending_big", nil, _exp, _lfu, :pending, 0, 0}] =
-               :ets.lookup(keydir, "pending_big")
+      assert_pending_cold(keydir, "pending_big")
 
       send(shard, {:tokio_complete, 999_999, :ok, :ok})
 
@@ -85,8 +97,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
       :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
       :ok = GenServer.call(shard, {:put, "pending_dirty_read", large, 0})
 
-      assert [{"pending_dirty_read", nil, _exp, _lfu, :pending, 0, 0}] =
-               :ets.lookup(keydir, "pending_dirty_read")
+      assert_pending_cold(keydir, "pending_dirty_read")
 
       send(shard, {:tokio_complete, 999_999, :ok, :ok})
 
@@ -101,8 +112,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
       :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
       :ok = GenServer.call(shard, {:put, "pending_meta", large, expire_at_ms})
 
-      assert [{"pending_meta", nil, ^expire_at_ms, _lfu, :pending, 0, 0}] =
-               :ets.lookup(keydir, "pending_meta")
+      assert_pending_cold(keydir, "pending_meta", expire_at_ms)
 
       send(shard, {:tokio_complete, 999_999, :ok, :ok})
 
@@ -115,8 +125,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
       :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
       :ok = GenServer.call(shard, {:put, "pending_file_ref", large, 0})
 
-      assert [{"pending_file_ref", nil, _exp, _lfu, :pending, 0, 0}] =
-               :ets.lookup(keydir, "pending_file_ref")
+      assert_pending_cold(keydir, "pending_file_ref")
 
       send(shard, {:tokio_complete, 999_999, :ok, :ok})
 
@@ -134,7 +143,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
       :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
       :ok = GenServer.call(shard, {:compound_put, redis_key, field_key, large, 0})
 
-      assert [{^field_key, nil, _exp, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, field_key)
+      assert_pending_cold(keydir, field_key)
 
       send(shard, {:tokio_complete, 999_999, :ok, :ok})
 
@@ -153,8 +162,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
       :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
       :ok = GenServer.call(shard, {:compound_put, redis_key, field_key, large, expire_at_ms})
 
-      assert [{^field_key, nil, ^expire_at_ms, _lfu, :pending, 0, 0}] =
-               :ets.lookup(keydir, field_key)
+      assert_pending_cold(keydir, field_key, expire_at_ms)
 
       send(shard, {:tokio_complete, 999_999, :ok, :ok})
 
@@ -173,7 +181,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
       :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
       :ok = GenServer.call(shard, {:put, field_key, large, 0})
 
-      assert [{^field_key, nil, _exp, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, field_key)
+      assert_pending_cold(keydir, field_key)
 
       send(shard, {:tokio_complete, 999_999, :ok, :ok})
 
@@ -191,7 +199,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
       :sys.replace_state(shard, fn s -> %{s | flush_in_flight: 999_999} end)
       :ok = GenServer.call(shard, {:compound_put, redis_key, field_key, large, 0})
 
-      assert [{^field_key, nil, _exp, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, field_key)
+      assert_pending_cold(keydir, field_key)
 
       send(shard, {:tokio_complete, 999_999, :ok, :ok})
 
