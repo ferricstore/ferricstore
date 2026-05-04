@@ -81,6 +81,13 @@ defmodule Ferricstore.Store.Router do
       {:error, "ERR shard not available"}
   end
 
+  @doc false
+  @spec with_key_latch(FerricStore.Instance.t(), binary(), (-> term())) :: term()
+  def with_key_latch(ctx, key, fun) when is_binary(key) and is_function(fun, 0) do
+    idx = shard_for(ctx, key)
+    with_async_key_latch(ctx, idx, key, fun)
+  end
+
   defp emit_shard_unavailable(ctx, idx, request, reason) do
     :telemetry.execute(
       [:ferricstore, :store, :shard_unavailable],

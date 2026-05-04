@@ -710,13 +710,18 @@ defmodule FerricStore.Impl do
         c -> c * 1.0
       end
 
-    TDigest.handle_ast({:tdigest_create, key, compression}, store)
+    Router.with_key_latch(ctx, key, fn ->
+      TDigest.handle_ast({:tdigest_create, key, compression}, store)
+    end)
   end
 
   @spec tdigest_add(FerricStore.Instance.t(), binary(), [number()]) :: :ok | {:error, binary()}
   def tdigest_add(ctx, key, values) do
     store = build_store(ctx)
-    TDigest.handle_ast({:tdigest_add, key, Enum.map(values, &(&1 * 1.0))}, store)
+
+    Router.with_key_latch(ctx, key, fn ->
+      TDigest.handle_ast({:tdigest_add, key, Enum.map(values, &(&1 * 1.0))}, store)
+    end)
   end
 
   @spec tdigest_quantile(FerricStore.Instance.t(), binary(), [number()]) ::
@@ -759,7 +764,10 @@ defmodule FerricStore.Impl do
   @spec tdigest_reset(FerricStore.Instance.t(), binary()) :: :ok | {:error, binary()}
   def tdigest_reset(ctx, key) do
     store = build_store(ctx)
-    TDigest.handle_ast({:tdigest_reset, [key]}, store)
+
+    Router.with_key_latch(ctx, key, fn ->
+      TDigest.handle_ast({:tdigest_reset, [key]}, store)
+    end)
   end
 
   # ---------------------------------------------------------------

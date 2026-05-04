@@ -3379,7 +3379,8 @@ defmodule Ferricstore.Raft.StateMachine do
           current_expire_at_ms,
           before_value,
           before_expire_at_ms,
-          expected_value
+          expected_value,
+          expire_at_ms
         )
 
       _ ->
@@ -3431,7 +3432,8 @@ defmodule Ferricstore.Raft.StateMachine do
           current_expire_at_ms,
           current_value,
           current_expire_at_ms,
-          expected_value
+          expected_value,
+          current_expire_at_ms
         )
 
       _ ->
@@ -3445,7 +3447,8 @@ defmodule Ferricstore.Raft.StateMachine do
          current_expire_at_ms,
          before_value,
          before_expire_at_ms,
-         nil
+         nil,
+         _expected_expire_at_ms
        )
        when current_value != before_value or current_expire_at_ms != before_expire_at_ms do
     :newer_local_value
@@ -3457,10 +3460,24 @@ defmodule Ferricstore.Raft.StateMachine do
          current_expire_at_ms,
          before_value,
          before_expire_at_ms,
-         nil
+         nil,
+         _expected_expire_at_ms
        )
        when current_value != before_value or current_expire_at_ms != before_expire_at_ms do
     :newer_local_value
+  end
+
+  defp pending_origin_replay_decision(
+         _inner_cmd,
+         current_value,
+         current_expire_at_ms,
+         _before_value,
+         _before_expire_at_ms,
+         expected_value,
+         expected_expire_at_ms
+       )
+       when current_value == expected_value and current_expire_at_ms == expected_expire_at_ms do
+    :already_applied
   end
 
   defp pending_origin_replay_decision(
@@ -3469,7 +3486,8 @@ defmodule Ferricstore.Raft.StateMachine do
          _current_expire_at_ms,
          _before_value,
          _before_expire_at_ms,
-         expected_value
+         expected_value,
+         _expected_expire_at_ms
        ) do
     if origin_command_provably_in_current_value?(inner_cmd, current_value, expected_value) do
       :newer_local_value

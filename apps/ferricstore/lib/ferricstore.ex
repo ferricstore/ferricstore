@@ -4369,7 +4369,11 @@ defmodule FerricStore do
   """
   @spec tdigest_create(key()) :: :ok | {:error, binary()}
   def tdigest_create(key) do
-    TDigest.handle_ast({:tdigest_create, key, nil}, build_tdigest_store(key))
+    ctx = default_ctx()
+
+    Router.with_key_latch(ctx, key, fn ->
+      TDigest.handle_ast({:tdigest_create, key, nil}, build_tdigest_store(ctx))
+    end)
   end
 
   @doc """
@@ -4388,10 +4392,14 @@ defmodule FerricStore do
   """
   @spec tdigest_add(key(), [number()]) :: :ok | {:error, binary()}
   def tdigest_add(key, values) when is_list(values) do
-    TDigest.handle_ast(
-      {:tdigest_add, key, Enum.map(values, &(&1 * 1.0))},
-      build_tdigest_store(key)
-    )
+    ctx = default_ctx()
+
+    Router.with_key_latch(ctx, key, fn ->
+      TDigest.handle_ast(
+        {:tdigest_add, key, Enum.map(values, &(&1 * 1.0))},
+        build_tdigest_store(ctx)
+      )
+    end)
   end
 
   @doc """
@@ -4412,7 +4420,7 @@ defmodule FerricStore do
   """
   @spec tdigest_quantile(key(), [float()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_quantile(key, quantiles) when is_list(quantiles) do
-    store = build_tdigest_store(key)
+    store = build_tdigest_store()
     result = TDigest.handle_ast({:tdigest_quantile, key, Enum.map(quantiles, &(&1 * 1.0))}, store)
     wrap_result(result)
   end
@@ -4436,7 +4444,7 @@ defmodule FerricStore do
   """
   @spec tdigest_cdf(key(), [number()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_cdf(key, values) when is_list(values) do
-    store = build_tdigest_store(key)
+    store = build_tdigest_store()
     result = TDigest.handle_ast({:tdigest_cdf, key, Enum.map(values, &(&1 * 1.0))}, store)
     wrap_result(result)
   end
@@ -4452,7 +4460,7 @@ defmodule FerricStore do
   """
   @spec tdigest_min(key()) :: {:ok, binary()} | {:error, binary()}
   def tdigest_min(key) do
-    store = build_tdigest_store(key)
+    store = build_tdigest_store()
     result = TDigest.handle_ast({:tdigest_min, [key]}, store)
     wrap_result(result)
   end
@@ -4468,7 +4476,7 @@ defmodule FerricStore do
   """
   @spec tdigest_max(key()) :: {:ok, binary()} | {:error, binary()}
   def tdigest_max(key) do
-    store = build_tdigest_store(key)
+    store = build_tdigest_store()
     result = TDigest.handle_ast({:tdigest_max, [key]}, store)
     wrap_result(result)
   end
@@ -4489,7 +4497,7 @@ defmodule FerricStore do
   """
   @spec tdigest_info(key()) :: {:ok, list()} | {:error, binary()}
   def tdigest_info(key) do
-    store = build_tdigest_store(key)
+    store = build_tdigest_store()
     result = TDigest.handle_ast({:tdigest_info, [key]}, store)
     wrap_result(result)
   end
@@ -4505,7 +4513,11 @@ defmodule FerricStore do
   """
   @spec tdigest_reset(key()) :: :ok | {:error, binary()}
   def tdigest_reset(key) do
-    TDigest.handle_ast({:tdigest_reset, [key]}, build_tdigest_store(key))
+    ctx = default_ctx()
+
+    Router.with_key_latch(ctx, key, fn ->
+      TDigest.handle_ast({:tdigest_reset, [key]}, build_tdigest_store(ctx))
+    end)
   end
 
   @doc """
@@ -4529,7 +4541,7 @@ defmodule FerricStore do
   """
   @spec tdigest_trimmed_mean(key(), float(), float()) :: {:ok, binary()} | {:error, binary()}
   def tdigest_trimmed_mean(key, lo, hi) do
-    store = build_tdigest_store(key)
+    store = build_tdigest_store()
 
     result = TDigest.handle_ast({:tdigest_trimmed_mean, key, lo * 1.0, hi * 1.0}, store)
 
@@ -4551,7 +4563,7 @@ defmodule FerricStore do
   """
   @spec tdigest_rank(key(), [number()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_rank(key, values) when is_list(values) do
-    store = build_tdigest_store(key)
+    store = build_tdigest_store()
     result = TDigest.handle_ast({:tdigest_rank, key, Enum.map(values, &(&1 * 1.0))}, store)
     wrap_result(result)
   end
@@ -4571,7 +4583,7 @@ defmodule FerricStore do
   """
   @spec tdigest_revrank(key(), [number()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_revrank(key, values) when is_list(values) do
-    store = build_tdigest_store(key)
+    store = build_tdigest_store()
     result = TDigest.handle_ast({:tdigest_revrank, key, Enum.map(values, &(&1 * 1.0))}, store)
     wrap_result(result)
   end
@@ -4591,7 +4603,7 @@ defmodule FerricStore do
   """
   @spec tdigest_byrank(key(), [integer()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_byrank(key, ranks) when is_list(ranks) do
-    store = build_tdigest_store(key)
+    store = build_tdigest_store()
     result = TDigest.handle_ast({:tdigest_byrank, key, ranks}, store)
     wrap_result(result)
   end
@@ -4611,7 +4623,7 @@ defmodule FerricStore do
   """
   @spec tdigest_byrevrank(key(), [integer()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_byrevrank(key, ranks) when is_list(ranks) do
-    store = build_tdigest_store(key)
+    store = build_tdigest_store()
     result = TDigest.handle_ast({:tdigest_byrevrank, key, ranks}, store)
     wrap_result(result)
   end
@@ -4649,7 +4661,11 @@ defmodule FerricStore do
           {:ok, non_neg_integer()} | {:error, binary()}
   def geoadd(key, members) when is_list(members) do
     pairs = Enum.map(members, fn {lng, lat, member} -> {lng * 1.0, lat * 1.0, member} end)
-    wrap_result(Geo.handle_ast({:geoadd, key, [], pairs}, build_compound_store(key)))
+    ctx = default_ctx()
+
+    Router.with_key_latch(ctx, key, fn ->
+      wrap_result(Geo.handle_ast({:geoadd, key, [], pairs}, build_compound_store(key)))
+    end)
   end
 
   @doc """
@@ -5819,9 +5835,7 @@ defmodule FerricStore do
   # TDigest commands now enter through typed command AST handlers with this
   # store. Writes use prob_write so replicas materialize the same mmap files.
 
-  defp build_tdigest_store(_resolved_key) do
-    ctx = default_ctx()
-
+  defp build_tdigest_store(ctx \\ default_ctx()) do
     %{
       get: fn key ->
         case Router.get(ctx, key) do
