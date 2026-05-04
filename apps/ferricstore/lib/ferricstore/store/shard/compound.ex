@@ -896,43 +896,48 @@ defmodule Ferricstore.Store.Shard.Compound do
       # Sync outgoing active before we stop writing to it, so any last
       # pre-compaction bytes are durable regardless of when the page
       # cache writes back.
-      _ = NIF.v2_fsync(active)
-
       old_fid = parse_fid_from_path(active)
       new_fid = old_fid + 1
       new_file = dedicated_file_path(dedicated_path, new_fid)
-      Ferricstore.FS.touch!(new_file)
 
-      case dedicated_fsync_dir(state, dedicated_path, :create_active) do
+      case dedicated_fsync_file(state, active, :sync_old_active) do
         :ok ->
-          now = HLC.now_ms()
+          Ferricstore.FS.touch!(new_file)
 
-          case collect_promoted_live_entries(state, dedicated_path, prefix, now) do
-            {:ok, live_entries} ->
-              maybe_run_promoted_compaction_after_collect_hook(redis_key, live_entries)
+          case dedicated_fsync_dir(state, dedicated_path, :create_active) do
+            :ok ->
+              now = HLC.now_ms()
 
-              compact_promoted_live_entries(
-                state,
-                redis_key,
-                dedicated_path,
-                new_file,
-                old_fid,
-                new_fid,
-                live_entries
-              )
+              case collect_promoted_live_entries(state, dedicated_path, prefix, now) do
+                {:ok, live_entries} ->
+                  maybe_run_promoted_compaction_after_collect_hook(redis_key, live_entries)
 
-            {:error, reason} ->
-              Logger.error(
-                "Shard #{state.index}: dedicated compaction read failed: #{inspect(reason)}"
-              )
+                  compact_promoted_live_entries(
+                    state,
+                    redis_key,
+                    dedicated_path,
+                    new_file,
+                    old_fid,
+                    new_fid,
+                    live_entries
+                  )
 
+                {:error, reason} ->
+                  Logger.error(
+                    "Shard #{state.index}: dedicated compaction read failed: #{inspect(reason)}"
+                  )
+
+                  _ = Ferricstore.FS.rm(new_file)
+                  _ = dedicated_fsync_dir(state, dedicated_path, :rollback_new_active)
+                  {:error, state}
+              end
+
+            {:error, _reason} ->
               _ = Ferricstore.FS.rm(new_file)
-              _ = dedicated_fsync_dir(state, dedicated_path, :rollback_new_active)
               {:error, state}
           end
 
         {:error, _reason} ->
-          _ = Ferricstore.FS.rm(new_file)
           {:error, state}
       end
     end
@@ -1034,6 +1039,26 @@ defmodule Ferricstore.Store.Shard.Compound do
       {:error, reason} ->
         Logger.error(
           "Shard #{state.index}: dedicated compaction directory fsync failed during #{phase} for #{dedicated_path}: #{inspect(reason)}"
+        )
+
+        {:error, reason}
+    end
+  end
+
+  defp dedicated_fsync_file(state, path, phase) do
+    result =
+      case Process.get(:ferricstore_promoted_compaction_fsync_file_hook) do
+        fun when is_function(fun, 1) -> fun.(path)
+        _ -> NIF.v2_fsync(path)
+      end
+
+    case result do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "Shard #{state.index}: dedicated compaction file fsync failed during #{phase} for #{path}: #{inspect(reason)}"
         )
 
         {:error, reason}
