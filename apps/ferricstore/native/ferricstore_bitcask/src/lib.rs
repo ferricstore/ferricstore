@@ -597,6 +597,28 @@ struct TombstoneScanRecord {
     expire_at_ms: u64,
 }
 
+const SCAN_VALUE_HASH_CHUNK_SIZE: usize = 64 * 1024;
+
+fn read_value_into_crc<R: std::io::Read>(
+    reader: &mut R,
+    hasher: &mut crc32fast::Hasher,
+    mut remaining: u64,
+    context: &str,
+) -> Result<(), String> {
+    let mut buf = [0u8; SCAN_VALUE_HASH_CHUNK_SIZE];
+
+    while remaining > 0 {
+        let read_len = remaining.min(buf.len() as u64) as usize;
+        reader
+            .read_exact(&mut buf[..read_len])
+            .map_err(|e| format!("{context}: unexpected EOF in value: {e}"))?;
+        hasher.update(&buf[..read_len]);
+        remaining -= read_len as u64;
+    }
+
+    Ok(())
+}
+
 fn scan_tombstones_from_path(path: &std::path::Path) -> Result<Vec<TombstoneScanRecord>, String> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -725,7 +747,7 @@ fn scan_key_states_from_path(
     masked_keys: &[Vec<u8>],
 ) -> Result<Vec<KeyStateScanRecord>, String> {
     use std::collections::{HashMap, HashSet};
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Read;
 
     if masked_keys.is_empty() {
         return Ok(Vec::new());
@@ -768,22 +790,9 @@ fn scan_key_states_from_path(
             Err(e) => return Err(format!("key-state scan {path:?}:{offset}: {e}")),
         }
 
-        if is_tombstone {
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&header[4..]);
-            hasher.update(&key);
-            let computed_crc = hasher.finalize();
-
-            if computed_crc != stored_crc {
-                return Err(format!(
-                    "key-state scan {path:?}:{offset}: CRC mismatch stored={stored_crc} actual={computed_crc}"
-                ));
-            }
-        }
-
-        if targets.contains(&key) {
-            states.insert(key.clone(), (expire_at_ms, is_tombstone));
-        }
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header[4..]);
+        hasher.update(&key);
 
         let value_size = if is_tombstone {
             0_u64
@@ -802,12 +811,23 @@ fn scan_key_states_from_path(
             ));
         }
 
-        if value_size > 0 {
-            reader
-                .seek(SeekFrom::Current(value_size as i64))
-                .map_err(|e| {
-                    format!("key-state scan {path:?}:{offset}: failed to skip value: {e}")
-                })?;
+        read_value_into_crc(
+            &mut reader,
+            &mut hasher,
+            value_size,
+            &format!("key-state scan {path:?}:{offset}"),
+        )?;
+
+        let computed_crc = hasher.finalize();
+
+        if computed_crc != stored_crc {
+            return Err(format!(
+                "key-state scan {path:?}:{offset}: CRC mismatch stored={stored_crc} actual={computed_crc}"
+            ));
+        }
+
+        if targets.contains(&key) {
+            states.insert(key.clone(), (expire_at_ms, is_tombstone));
         }
 
         offset = next_offset;
@@ -2600,6 +2620,36 @@ mod audit_fix_tests {
         .unwrap_err();
 
         assert!(err.contains("unexpected EOF in value"));
+    }
+
+    #[test]
+    fn key_state_scan_errors_when_live_value_size_swallows_later_record() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        let corrupt_offset = writer.write(b"corrupt", b"value", 0).unwrap();
+        writer.write(b"deleted", b"live", 0).unwrap();
+        writer.sync().unwrap();
+
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        let corrupt_value_start =
+            corrupt_offset + log::HEADER_SIZE as u64 + b"corrupt".len() as u64;
+        let oversized_value_len = u32::try_from(file_len - corrupt_value_start).unwrap();
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_at(&oversized_value_len.to_le_bytes(), corrupt_offset + 22)
+            .unwrap();
+        file.sync_data().unwrap();
+
+        let err = scan_key_states_from_path(&path, &[b"deleted".to_vec()]).unwrap_err();
+
+        assert!(
+            err.contains("CRC mismatch"),
+            "corrupt live record must fail the key-state scan, got {err:?}"
+        );
     }
 
     #[test]
