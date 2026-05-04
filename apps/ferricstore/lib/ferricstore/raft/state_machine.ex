@@ -4097,7 +4097,7 @@ defmodule Ferricstore.Raft.StateMachine do
         }
 
         with :ok <- flow_validate_record_keys(record),
-             :ok <- do_put(state, state_key, flow_encode(record), flow_record_expire_at(record)),
+             :ok <- flow_put(state, state_key, flow_encode(record), flow_record_expire_at(record)),
              :ok <- flow_due_put(state, record),
              :ok <- flow_index_put(state, record),
              :ok <- flow_history_put(state, record, "created", now_ms),
@@ -4358,7 +4358,7 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
            :ok <-
-             do_put(
+             flow_put(
                state,
                FlowKeys.state_key(id, partition_key),
                flow_encode(next),
@@ -4403,7 +4403,7 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
            :ok <-
-             do_put(
+             flow_put(
                state,
                FlowKeys.state_key(id, partition_key),
                flow_encode(next),
@@ -4446,7 +4446,7 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
            :ok <-
-             do_put(
+             flow_put(
                state,
                FlowKeys.state_key(id, partition_key),
                flow_encode(next),
@@ -4488,7 +4488,7 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
            :ok <-
-             do_put(
+             flow_put(
                state,
                FlowKeys.state_key(id, partition_key),
                flow_encode(next),
@@ -4529,7 +4529,7 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
            :ok <-
-             do_put(
+             flow_put(
                state,
                FlowKeys.state_key(id, partition_key),
                flow_encode(next),
@@ -4559,7 +4559,7 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
            :ok <-
-             do_put(
+             flow_put(
                state,
                FlowKeys.state_key(id, partition_key),
                flow_encode(next),
@@ -4618,7 +4618,7 @@ defmodule Ferricstore.Raft.StateMachine do
              :ok <- flow_due_delete_from_key(state, due_key, id),
              :ok <- flow_index_delete(state, record),
              :ok <-
-               do_put(
+               flow_put(
                  state,
                  FlowKeys.state_key(id, partition_key),
                  flow_encode(next),
@@ -4860,7 +4860,7 @@ defmodule Ferricstore.Raft.StateMachine do
     compound_key = CompoundKey.zset_member(due_key, id)
 
     with :ok <- flow_ensure_due_type(state, due_key),
-         :ok <- do_put(state, compound_key, score_str, 0) do
+         :ok <- flow_put(state, compound_key, score_str, 0) do
       flow_zset_put(state, due_key, id, score_str)
     end
   end
@@ -4899,7 +4899,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_zset_delete_from_key(state, due_key, id) do
     compound_key = CompoundKey.zset_member(due_key, id)
 
-    with :ok <- do_delete(state, compound_key) do
+    with :ok <- flow_delete(state, compound_key) do
       flow_zset_delete(state, due_key, id)
     end
   end
@@ -4951,7 +4951,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_ensure_due_type(_state, nil), do: :ok
 
   defp flow_ensure_due_type(state, due_key) do
-    do_put(state, CompoundKey.type_key(due_key), CompoundKey.encode_type(:zset), 0)
+    flow_put(state, CompoundKey.type_key(due_key), CompoundKey.encode_type(:zset), 0)
   end
 
   defp flow_ensure_due_index_ready(
@@ -5037,7 +5037,7 @@ defmodule Ferricstore.Raft.StateMachine do
     history_key = FlowKeys.history_key(id, partition_key)
     compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
 
-    with :ok <- do_put(state, compound_key, :erlang.term_to_binary(fields), 0) do
+    with :ok <- flow_put(state, compound_key, :erlang.term_to_binary(fields), 0) do
       flow_history_index_put(history_key, event_id, compound_key)
     end
   end
@@ -5093,7 +5093,7 @@ defmodule Ferricstore.Raft.StateMachine do
     entries
     |> Enum.take(max(length(entries) - max, 0))
     |> Enum.each(fn event_id ->
-      do_delete(state, <<prefix::binary-size(prefix_len), event_id::binary>>)
+      flow_delete(state, <<prefix::binary-size(prefix_len), event_id::binary>>)
     end)
 
     :ok
@@ -5127,7 +5127,14 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp do_put(state, key, value, expire_at_ms) do
     maybe_clear_compound_data_structure_for_string_put(state, key)
+    raw_put(state, key, value, expire_at_ms)
+  end
 
+  defp flow_put(state, key, value, expire_at_ms) do
+    raw_put(state, key, value, expire_at_ms)
+  end
+
+  defp raw_put(state, key, value, expire_at_ms) do
     ets_val = value_for_ets(value, hot_cache_threshold(state))
     disk_val = to_disk_binary(value)
 
@@ -5149,6 +5156,14 @@ defmodule Ferricstore.Raft.StateMachine do
     # at the end of apply/3 before returning to ra.
     queue_pending_put(key, disk_val, expire_at_ms)
 
+    :ok
+  end
+
+  defp flow_delete(state, key) do
+    record_pending_original(state, key)
+    track_keydir_binary_remove(state, key)
+    :ets.delete(state.ets, key)
+    queue_pending_delete(key, nil)
     :ok
   end
 

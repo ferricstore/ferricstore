@@ -290,6 +290,46 @@ defmodule Ferricstore.FlowTest do
              )
   end
 
+  test "flow_claim_due leases large batches without duplicates and drains due members" do
+    type = uid("flow-claim-large")
+    ids = for i <- 1..100, do: "#{type}:#{i}"
+
+    for id <- ids do
+      assert {:ok, _} =
+               FerricStore.flow_create(id,
+                 type: type,
+                 state: "queued",
+                 payload_ref: "payload:" <> id,
+                 run_at_ms: 1_000,
+                 now_ms: 1_000
+               )
+    end
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               state: "queued",
+               worker: "worker-large",
+               lease_ms: 30_000,
+               limit: 100,
+               now_ms: 1_000
+             )
+
+    claimed_ids = Enum.map(claimed, & &1.id)
+    assert length(claimed_ids) == 100
+    assert MapSet.new(claimed_ids) == MapSet.new(ids)
+    assert Enum.all?(claimed, &(&1.state == "running"))
+    assert Enum.all?(claimed, &(&1.lease_owner == "worker-large"))
+
+    assert {:ok, []} =
+             FerricStore.flow_claim_due(type,
+               state: "queued",
+               worker: "worker-large-2",
+               lease_ms: 30_000,
+               limit: 100,
+               now_ms: 1_000
+             )
+  end
+
   test "partition_key keeps related flow keys on one shard and can spread partitions" do
     {partition_a, partition_b} = different_partition_keys()
     id = uid("flow-partition-keys")
