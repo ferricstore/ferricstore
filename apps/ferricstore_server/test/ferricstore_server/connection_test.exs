@@ -185,6 +185,103 @@ defmodule FerricstoreServer.ConnectionTest do
     :gen_tcp.close(sock)
   end
 
+  test "single FLOW.CREATE command dispatches through typed AST", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    id = "single-flow:" <> Integer.to_string(System.unique_integer([:positive]))
+    partition = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    send_command(sock, [
+      "FLOW.CREATE",
+      id,
+      "TYPE",
+      "single-flow",
+      "PARTITION",
+      partition,
+      "RUN_AT",
+      "1000"
+    ])
+
+    assert [%{"id" => ^id, "type" => "single-flow", "partition_key" => ^partition}] =
+             recv_values(sock, 1)
+
+    :gen_tcp.close(sock)
+  end
+
+  test "pipelined FLOW.CREATE commands batch internally with independent replies", %{port: port} do
+    handler_id = {__MODULE__, self(), :flow_create_pipeline, System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :batcher, :quorum_submit],
+        &__MODULE__.handle_quorum_submit/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    partition = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+    type = "pipeline-flow:" <> Integer.to_string(System.unique_integer([:positive]))
+    id_a = "pipeline-flow-a:" <> Integer.to_string(System.unique_integer([:positive]))
+    id_b = "pipeline-flow-b:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    pipeline =
+      IO.iodata_to_binary([
+        Encoder.encode([
+          "FLOW.CREATE",
+          id_a,
+          "TYPE",
+          type,
+          "PARTITION",
+          partition,
+          "RUN_AT",
+          "1000"
+        ]),
+        Encoder.encode([
+          "FLOW.CREATE",
+          id_a,
+          "TYPE",
+          type,
+          "PARTITION",
+          partition,
+          "RUN_AT",
+          "1000"
+        ]),
+        Encoder.encode([
+          "FLOW.CREATE",
+          id_b,
+          "TYPE",
+          type,
+          "PARTITION",
+          partition,
+          "RUN_AT",
+          "1000"
+        ])
+      ])
+
+    send_raw(sock, pipeline)
+
+    assert [
+             %{"id" => ^id_a},
+             {:error, "ERR flow already exists"},
+             %{"id" => ^id_b}
+           ] = recv_values(sock, 3)
+
+    assert_receive {:quorum_submit, [:ferricstore, :batcher, :quorum_submit],
+                    %{batch_size: batch_size}, %{kind: :batch}},
+                   1_000
+
+    assert batch_size >= 3
+    :gen_tcp.close(sock)
+  end
+
   test "empty command frames are skipped and do not poison the connection buffer", %{port: port} do
     sock = connect(port)
     send_raw(sock, hello3())
@@ -662,6 +759,10 @@ defmodule FerricstoreServer.ConnectionTest do
   # Private test helpers
   # ---------------------------------------------------------------------------
 
+  def handle_quorum_submit(event, measurements, metadata, test_pid) do
+    send(test_pid, {:quorum_submit, event, measurements, metadata})
+  end
+
   defp recv_all(_sock, _pattern, 0), do: ""
 
   defp recv_all(sock, pattern, count) do
@@ -686,6 +787,31 @@ defmodule FerricstoreServer.ConnectionTest do
     case :gen_tcp.recv(sock, 0, timeout) do
       {:ok, chunk} -> recv_at_least(sock, min_bytes, timeout, acc <> chunk)
       {:error, _} -> acc
+    end
+  end
+
+  defp recv_values(sock, count), do: recv_values(sock, count, "", 20)
+
+  defp recv_values(_sock, count, acc, attempts) when attempts <= 0 do
+    case Parser.parse(acc) do
+      {:ok, values, _rest} when length(values) >= count -> Enum.take(values, count)
+      other -> flunk("expected #{count} RESP values, got #{inspect(other)} from #{inspect(acc)}")
+    end
+  end
+
+  defp recv_values(sock, count, acc, attempts) do
+    case Parser.parse(acc) do
+      {:ok, values, _rest} when length(values) >= count ->
+        Enum.take(values, count)
+
+      _ ->
+        case :gen_tcp.recv(sock, 0, 500) do
+          {:ok, chunk} ->
+            recv_values(sock, count, acc <> chunk, attempts - 1)
+
+          {:error, reason} ->
+            flunk("socket closed before #{count} RESP values: #{inspect(reason)}")
+        end
     end
   end
 

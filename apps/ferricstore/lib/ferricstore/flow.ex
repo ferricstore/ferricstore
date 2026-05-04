@@ -21,6 +21,43 @@ defmodule Ferricstore.Flow do
     observe_flow(:create, started, result, %{flow_id: id})
   end
 
+  @doc false
+  def create_batch_independent(_ctx, []), do: []
+
+  def create_batch_independent(ctx, creates) when is_list(creates) do
+    started = flow_start_time()
+
+    {valid, indexed_results} =
+      creates
+      |> Enum.with_index()
+      |> Enum.reduce({[], %{}}, fn
+        {{id, opts}, idx}, {valid_acc, result_acc} when is_binary(id) and is_list(opts) ->
+          case create_attrs(id, opts, now_ms()) do
+            {:ok, attrs} -> {[{idx, attrs} | valid_acc], result_acc}
+            {:error, _reason} = error -> {valid_acc, Map.put(result_acc, idx, error)}
+          end
+
+        {_bad, idx}, {valid_acc, result_acc} ->
+          {valid_acc, Map.put(result_acc, idx, {:error, "ERR flow opts must be a keyword list"})}
+      end)
+
+    valid = Enum.reverse(valid)
+    valid_results = Router.flow_create_batch(ctx, Enum.map(valid, fn {_idx, attrs} -> attrs end))
+
+    indexed_results =
+      valid
+      |> Enum.map(fn {idx, _attrs} -> idx end)
+      |> Enum.zip(valid_results)
+      |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+
+    results = for idx <- 0..(length(creates) - 1), do: Map.fetch!(indexed_results, idx)
+    observe_flow_batch(:create, started, results)
+    results
+  end
+
+  def create_batch_independent(_ctx, _creates),
+    do: [{:error, "ERR flow opts must be a keyword list"}]
+
   def create_many(ctx, partition_key, items, opts)
       when is_list(items) and is_list(opts) do
     started = flow_start_time()
@@ -275,6 +312,22 @@ defmodule Ferricstore.Flow do
     publish_flow_notifications(command, result)
 
     result
+  end
+
+  defp observe_flow_batch(command, started, results) do
+    records =
+      results
+      |> Enum.flat_map(fn
+        {:ok, record} when is_map(record) -> [record]
+        _ -> []
+      end)
+
+    measurements = flow_measurements(started, command, {:ok, records})
+    metadata = flow_metadata({:ok, records}, %{flow_id: nil})
+
+    :telemetry.execute([:ferricstore, :flow, command, :stop], measurements, metadata)
+    publish_flow_notifications(command, {:ok, records})
+    :ok
   end
 
   defp flow_measurements(started, command, result) do

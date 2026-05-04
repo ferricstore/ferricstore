@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.Dispatcher
+  alias Ferricstore.Commands.Flow, as: FlowCommand
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
@@ -65,8 +66,17 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
       :fallback ->
         case try_batch_set_fast_path(commands, state, send_response_fn) do
-          {:ok, result} -> result
-          :fallback -> try_mixed_fast_path(commands, state, handle_command_fn, send_response_fn)
+          {:ok, result} ->
+            result
+
+          :fallback ->
+            case try_batch_flow_create_fast_path(commands, state, send_response_fn) do
+              {:ok, result} ->
+                result
+
+              :fallback ->
+                try_mixed_fast_path(commands, state, handle_command_fn, send_response_fn)
+            end
         end
     end
   end
@@ -437,6 +447,63 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp encode_async_batch_result({:error, _} = err, count),
     do: List.duplicate(Encoder.encode(err), count)
+
+  # ---------------------------------------------------------------------------
+  # Batch FLOW.CREATE fast path
+  # ---------------------------------------------------------------------------
+  # Pipelined one-by-one creates keep per-command semantics, but can still share
+  # one Raft batch. This is intentionally not FLOW.CREATE_MANY: one duplicate
+  # fails only that command, while surrounding creates still commit.
+
+  defp try_batch_flow_create_fast_path(commands, state, send_response_fn) do
+    if requires_auth?(state) or state.multi_state == :queuing do
+      :fallback
+    else
+      acl_ok =
+        state.acl_cache == :full_access or
+          (is_map(state.acl_cache) and state.acl_cache.commands == :all and
+             state.acl_cache.keys == :all)
+
+      if acl_ok do
+        case extract_flow_creates(commands) do
+          {:ok, creates} ->
+            Stats.incr_commands_by(state.stats_counter, length(creates))
+
+            response =
+              state.instance_ctx
+              |> Ferricstore.Flow.create_batch_independent(creates)
+              |> Enum.map(&encode_flow_result/1)
+
+            send_response_fn.(state.socket, state.transport, response)
+            {:ok, {:continue, state}}
+
+          :fallback ->
+            :fallback
+        end
+      else
+        :fallback
+      end
+    end
+  end
+
+  defp extract_flow_creates(commands), do: extract_flow_creates(commands, [])
+
+  defp extract_flow_creates([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp extract_flow_creates(
+         [{:command, "FLOW.CREATE", _args, {:flow_create, id, opts}, _keys} | rest],
+         acc
+       )
+       when is_binary(id) and is_list(opts),
+       do: extract_flow_creates(rest, [{id, opts} | acc])
+
+  defp extract_flow_creates(_commands, _acc), do: :fallback
+
+  defp encode_flow_result(result) do
+    result
+    |> FlowCommand.normalize_result()
+    |> Encoder.encode()
+  end
 
   defp recombine_set_results(async_ops, async_results, quorum_ops, quorum_results) do
     async_map =

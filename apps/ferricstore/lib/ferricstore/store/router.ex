@@ -2949,6 +2949,66 @@ defmodule Ferricstore.Store.Router do
     batch_quorum_put(ctx, kv_pairs, nil)
   end
 
+  defp batch_quorum_commands(ctx, keyed_commands) do
+    batch_quorum_commands(ctx, keyed_commands, nil)
+  end
+
+  defp batch_quorum_commands(_ctx, [], _origin_node), do: []
+
+  defp batch_quorum_commands(ctx, keyed_commands, origin_node) do
+    wv_size = :counters.info(ctx.write_version).size
+
+    {by_shard, count, by_shard_commands} =
+      keyed_commands
+      |> Enum.reduce({%{}, 0, %{}}, fn {key, command}, {shards, i, commands_map} ->
+        idx = shard_for(ctx, key)
+        {cmds, indices} = Map.get(shards, idx, {[], []})
+
+        {
+          Map.put(shards, idx, {[command | cmds], [i | indices]}),
+          i + 1,
+          Map.update(commands_map, idx, [{key, command}], fn acc -> [{key, command} | acc] end)
+        }
+      end)
+
+    shard_refs =
+      Enum.map(by_shard, fn {shard_idx, {cmds, indices}} ->
+        {from, token} = ReplyAwaiter.new()
+        cmds = Enum.reverse(cmds)
+
+        if origin_node == nil do
+          Ferricstore.Raft.Batcher.write_batch(shard_idx, cmds, from)
+        else
+          Ferricstore.Raft.Batcher.write_batch_forwarded(shard_idx, cmds, from, origin_node)
+        end
+
+        {token, shard_idx, Enum.reverse(indices)}
+      end)
+
+    results =
+      collect_shard_replies(shard_refs, wv_size, ctx, %{}, System.monotonic_time(:millisecond))
+
+    results =
+      Enum.reduce(by_shard_commands, results, fn {shard_idx, commands}, acc ->
+        {_cmds, indices} = Map.fetch!(by_shard, shard_idx)
+        first_index = List.last(indices)
+
+        case Map.get(acc, first_index) do
+          {:error, {:not_leader, {_shard_name, leader_node}}} when is_atom(leader_node) ->
+            merge_forwarded_commands(acc, by_shard, shard_idx, commands, leader_node, ctx)
+
+          {:error, {:not_leader, leader_node}} when is_atom(leader_node) ->
+            merge_forwarded_commands(acc, by_shard, shard_idx, commands, leader_node, ctx)
+
+          _ ->
+            acc
+        end
+      end)
+
+    0..(count - 1)
+    |> Enum.map(fn i -> Map.get(results, i, ErrorReasons.write_timeout_unknown()) end)
+  end
+
   defp batch_quorum_put(_ctx, [], _origin_node), do: []
 
   defp batch_quorum_put(ctx, kv_pairs, origin_node) do
@@ -3013,6 +3073,17 @@ defmodule Ferricstore.Store.Router do
     {_, indices} = Map.fetch!(by_shard, shard_idx)
     indices = Enum.reverse(indices)
     new_results = forward_batch_to_leader(ctx, leader_node, shard_idx, Enum.reverse(kvs))
+
+    Enum.zip(indices, new_results)
+    |> Enum.reduce(acc, fn {i, r}, a -> Map.put(a, i, r) end)
+  end
+
+  defp merge_forwarded_commands(acc, by_shard, shard_idx, commands, leader_node, ctx) do
+    {_, indices} = Map.fetch!(by_shard, shard_idx)
+    indices = Enum.reverse(indices)
+
+    new_results =
+      forward_batch_commands_to_leader(ctx, leader_node, shard_idx, Enum.reverse(commands))
 
     Enum.zip(indices, new_results)
     |> Enum.reduce(acc, fn {i, r}, a -> Map.put(a, i, r) end)
@@ -3095,9 +3166,45 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  defp forward_batch_commands_to_leader(_ctx, leader_node, _shard_idx, keyed_commands)
+       when leader_node == node() do
+    Enum.map(keyed_commands, fn _ -> {:error, "ERR not leader, election in progress"} end)
+  end
+
+  defp forward_batch_commands_to_leader(_ctx, leader_node, shard_idx, keyed_commands) do
+    try do
+      remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
+
+      leader_results =
+        :erpc.call(
+          leader_node,
+          __MODULE__,
+          :__forwarded_batch_quorum_commands__,
+          [remote_ctx, keyed_commands, node()],
+          10_000
+        )
+
+      unwrap_forwarded_batch_results(shard_idx, leader_results)
+    catch
+      _, reason ->
+        require Logger
+
+        Logger.warning(
+          "batch command forward to #{inspect(leader_node)} failed: #{inspect(reason)}"
+        )
+
+        __forward_batch_failure_results__(reason, length(keyed_commands))
+    end
+  end
+
   @doc false
   def __forwarded_batch_quorum_put__(ctx, kv_pairs, origin_node) do
     batch_quorum_put(ctx, kv_pairs, origin_node)
+  end
+
+  @doc false
+  def __forwarded_batch_quorum_commands__(ctx, keyed_commands, origin_node) do
+    batch_quorum_commands(ctx, keyed_commands, origin_node)
   end
 
   defp unwrap_forwarded_batch_results(shard_idx, results) when is_list(results) do
@@ -3141,6 +3248,51 @@ defmodule Ferricstore.Store.Router do
     else
       idx = shard_for(ctx, key)
       raft_write(ctx, idx, key, {:flow_create, key, attrs})
+    end
+  end
+
+  @doc false
+  def flow_create_batch(_ctx, []), do: []
+
+  def flow_create_batch(ctx, attrs_list) when is_list(attrs_list) do
+    if ctx.name == :default do
+      {valid, indexed_results} =
+        attrs_list
+        |> Enum.with_index()
+        |> Enum.reduce({[], %{}}, fn
+          {%{id: id} = attrs, idx}, {valid_acc, result_acc} when is_binary(id) ->
+            key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+            if byte_size(key) > @max_key_size do
+              {valid_acc,
+               Map.put(
+                 result_acc,
+                 idx,
+                 {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+               )}
+            else
+              {[{idx, key, {:flow_create, key, attrs}} | valid_acc], result_acc}
+            end
+
+          {_attrs, idx}, {valid_acc, result_acc} ->
+            {valid_acc,
+             Map.put(result_acc, idx, {:error, "ERR flow id must be a non-empty string"})}
+        end)
+
+      valid = Enum.reverse(valid)
+
+      valid_results =
+        batch_quorum_commands(ctx, Enum.map(valid, fn {_idx, key, cmd} -> {key, cmd} end))
+
+      indexed_results =
+        valid
+        |> Enum.map(fn {idx, _key, _cmd} -> idx end)
+        |> Enum.zip(valid_results)
+        |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+
+      for idx <- 0..(length(attrs_list) - 1), do: Map.fetch!(indexed_results, idx)
+    else
+      Enum.map(attrs_list, &flow_create(ctx, &1))
     end
   end
 

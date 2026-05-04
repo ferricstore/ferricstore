@@ -82,11 +82,12 @@ defmodule Ferricstore.Commands.Flow do
 
   def handle_ast(_ast, _store), do: {:error, "ERR unsupported flow command AST"}
 
-  defp normalize_result({:ok, records}) when is_list(records),
+  @doc false
+  def normalize_result({:ok, records}) when is_list(records),
     do: Enum.map(records, &normalize_value/1)
 
-  defp normalize_result({:ok, value}), do: normalize_value(value)
-  defp normalize_result({:error, _} = error), do: error
+  def normalize_result({:ok, value}), do: normalize_value(value)
+  def normalize_result({:error, _} = error), do: error
 
   defp normalize_value(nil), do: nil
 
