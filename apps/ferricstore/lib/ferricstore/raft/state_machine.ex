@@ -1378,6 +1378,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp clear_stale_pending_state do
     Process.delete(:sm_pending_state)
     Process.delete(:sm_checkpoint_clean_before_write)
+    Process.delete(:sm_checkpoint_dependencies_clean_before_write)
     :ok
   end
 
