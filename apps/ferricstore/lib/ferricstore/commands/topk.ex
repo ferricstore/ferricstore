@@ -16,6 +16,33 @@ defmodule Ferricstore.Commands.TopK do
   @default_depth 7
   @default_decay 0.9
 
+  @spec handle_ast(term(), map()) :: term()
+  def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+  def handle_ast({tag, _key, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+
+  def handle_ast({:topk_reserve, key, k, width, depth, decay}, store) do
+    with :ok <- check_not_exists(key, store) do
+      store
+      |> do_prob_write({:topk_create, key, k, width, depth, decay * 1.0})
+      |> maybe_register_topk(store, key)
+    end
+  end
+
+  def handle_ast({:topk_add, args}, store), do: topk_add_args(args, store)
+
+  def handle_ast({:topk_incrby, key, pairs}, store) do
+    with :ok <- ProbType.check_expected(key, :topk, store) do
+      result = do_prob_write(store, {:topk_incrby, key, pairs})
+      normalize_result(result)
+    end
+  end
+
+  def handle_ast({:topk_query, args}, store), do: topk_query_args(args, store)
+  def handle_ast({:topk_count, args}, store), do: topk_count_args(args, store)
+  def handle_ast({:topk_info, args}, store), do: topk_info_args(args, store)
+  def handle_ast({:topk_list, key, false}, store), do: topk_list_key(key, store)
+  def handle_ast({:topk_list, key, true}, store), do: do_list_with_count(key, store)
+
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
 
@@ -43,16 +70,7 @@ defmodule Ferricstore.Commands.TopK do
   # TOPK.ADD key element [element ...] — write through Raft
   # ---------------------------------------------------------------------------
 
-  def handle("TOPK.ADD", [key | elements], store) when elements != [] do
-    with :ok <- ProbType.check_expected(key, :topk, store) do
-      result = do_prob_write(store, {:topk_add, key, elements})
-      normalize_result(result)
-    end
-  end
-
-  def handle("TOPK.ADD", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'topk.add' command"}
-  end
+  def handle("TOPK.ADD", args, store), do: topk_add_args(args, store)
 
   # ---------------------------------------------------------------------------
   # TOPK.INCRBY key element count [element count ...] — write through Raft
@@ -74,7 +92,50 @@ defmodule Ferricstore.Commands.TopK do
   # TOPK.QUERY key element [element ...] — local stateless pread
   # ---------------------------------------------------------------------------
 
-  def handle("TOPK.QUERY", [key | elements], store) when elements != [] do
+  def handle("TOPK.QUERY", args, store), do: topk_query_args(args, store)
+
+  # ---------------------------------------------------------------------------
+  # TOPK.LIST key [WITHCOUNT] — local stateless pread
+  # ---------------------------------------------------------------------------
+
+  def handle("TOPK.LIST", [key], store), do: topk_list_key(key, store)
+
+  def handle("TOPK.LIST", [key, withcount], store) when is_binary(withcount) do
+    if String.upcase(withcount) != "WITHCOUNT" do
+      {:error, "ERR syntax error"}
+    else
+      do_list_with_count(key, store)
+    end
+  end
+
+  def handle("TOPK.LIST", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'topk.list' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # TOPK.COUNT key element [element ...] — local stateless pread
+  # ---------------------------------------------------------------------------
+
+  def handle("TOPK.COUNT", args, store), do: topk_count_args(args, store)
+
+  # ---------------------------------------------------------------------------
+  # TOPK.INFO key — local stateless pread
+  # ---------------------------------------------------------------------------
+
+  def handle("TOPK.INFO", args, store), do: topk_info_args(args, store)
+
+  defp topk_add_args([key | elements], store) when elements != [] do
+    with :ok <- ProbType.check_expected(key, :topk, store) do
+      result = do_prob_write(store, {:topk_add, key, elements})
+      normalize_result(result)
+    end
+  end
+
+  defp topk_add_args(_args, _store) do
+    {:error, "ERR wrong number of arguments for 'topk.add' command"}
+  end
+
+  defp topk_query_args([key | elements], store) when elements != [] do
     path = prob_path(store, key, "topk")
 
     case await_nif(fn proxy, corr_id ->
@@ -94,15 +155,11 @@ defmodule Ferricstore.Commands.TopK do
     end
   end
 
-  def handle("TOPK.QUERY", _args, _store) do
+  defp topk_query_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'topk.query' command"}
   end
 
-  # ---------------------------------------------------------------------------
-  # TOPK.LIST key [WITHCOUNT] — local stateless pread
-  # ---------------------------------------------------------------------------
-
-  def handle("TOPK.LIST", [key], store) do
+  defp topk_list_key(key, store) do
     path = prob_path(store, key, "topk")
 
     case await_nif(fn proxy, corr_id ->
@@ -122,23 +179,7 @@ defmodule Ferricstore.Commands.TopK do
     end
   end
 
-  def handle("TOPK.LIST", [key, withcount], store) when is_binary(withcount) do
-    if String.upcase(withcount) != "WITHCOUNT" do
-      {:error, "ERR syntax error"}
-    else
-      do_list_with_count(key, store)
-    end
-  end
-
-  def handle("TOPK.LIST", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'topk.list' command"}
-  end
-
-  # ---------------------------------------------------------------------------
-  # TOPK.COUNT key element [element ...] — local stateless pread
-  # ---------------------------------------------------------------------------
-
-  def handle("TOPK.COUNT", [key | elements], store) when elements != [] do
+  defp topk_count_args([key | elements], store) when elements != [] do
     path = prob_path(store, key, "topk")
 
     case await_nif(fn proxy, corr_id ->
@@ -158,15 +199,11 @@ defmodule Ferricstore.Commands.TopK do
     end
   end
 
-  def handle("TOPK.COUNT", _args, _store) do
+  defp topk_count_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'topk.count' command"}
   end
 
-  # ---------------------------------------------------------------------------
-  # TOPK.INFO key — local stateless pread
-  # ---------------------------------------------------------------------------
-
-  def handle("TOPK.INFO", [key], store) do
+  defp topk_info_args([key], store) do
     path = prob_path(store, key, "topk")
 
     case await_nif(fn proxy, corr_id ->
@@ -186,7 +223,7 @@ defmodule Ferricstore.Commands.TopK do
     end
   end
 
-  def handle("TOPK.INFO", _args, _store) do
+  defp topk_info_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'topk.info' command"}
   end
 

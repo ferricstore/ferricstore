@@ -2,6 +2,7 @@
 defmodule Ferricstore.Commands.Server do
   alias Ferricstore.HLC
   alias Ferricstore.Store.Ops
+
   @moduledoc """
   Handles Redis server commands: PING, ECHO, DBSIZE, KEYS, FLUSHDB, FLUSHALL,
   INFO, COMMAND, SELECT, LOLWUT, and DEBUG.
@@ -132,7 +133,7 @@ defmodule Ferricstore.Commands.Server do
   def handle("FLUSHALL", args, store) when args in [[], ["ASYNC"], ["SYNC"]] do
     AuditLog.log(:dangerous_command, %{command: "FLUSHALL", args: args})
     Ops.flush(store)
-    :ok
+    flush_all_prob_dirs()
   end
 
   def handle("FLUSHALL", _args, _store) do
@@ -281,42 +282,56 @@ defmodule Ferricstore.Commands.Server do
     AuditLog.log(:dangerous_command, %{command: "DEBUG", args: ["FLUSHALL"]})
     handle("FLUSHALL", [], store)
   end
+
   def handle("DEBUG", ["SET-DURABILITY", mode], _store) when mode in ["quorum", "async"] do
     atom_mode = if mode == "quorum", do: :all_quorum, else: :all_async
     FerricStore.Instance.update_durability_mode(:default, atom_mode)
     {:simple, "OK durability_mode=#{atom_mode}"}
   end
+
   def handle("DEBUG", ["BATCHER-STATS"], _store) do
     ctx = FerricStore.Instance.get(:default)
     shard_count = ctx.shard_count
 
-    batcher_parts = for i <- 0..(shard_count - 1) do
-      name = :"Ferricstore.Raft.Batcher.#{i}"
-      case Process.whereis(name) do
-        nil -> "B#{i}=down"
-        pid ->
-          info = Process.info(pid, [:message_queue_len, :reductions])
-          "B#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
+    batcher_parts =
+      for i <- 0..(shard_count - 1) do
+        name = :"Ferricstore.Raft.Batcher.#{i}"
+
+        case Process.whereis(name) do
+          nil ->
+            "B#{i}=down"
+
+          pid ->
+            info = Process.info(pid, [:message_queue_len, :reductions])
+            "B#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
+        end
       end
-    end
 
     wal_name = :ra_ferricstore_raft_log_wal
-    wal_part = case Process.whereis(wal_name) do
-      nil -> "WAL=down"
-      pid ->
-        info = Process.info(pid, [:message_queue_len, :reductions])
-        "WAL:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
-    end
 
-    ra_parts = for i <- 0..(shard_count - 1) do
-      name = :"ferricstore_shard_#{i}"
-      case Process.whereis(name) do
-        nil -> "R#{i}=down"
+    wal_part =
+      case Process.whereis(wal_name) do
+        nil ->
+          "WAL=down"
+
         pid ->
           info = Process.info(pid, [:message_queue_len, :reductions])
-          "R#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
+          "WAL:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
       end
-    end
+
+    ra_parts =
+      for i <- 0..(shard_count - 1) do
+        name = :"ferricstore_shard_#{i}"
+
+        case Process.whereis(name) do
+          nil ->
+            "R#{i}=down"
+
+          pid ->
+            info = Process.info(pid, [:message_queue_len, :reductions])
+            "R#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
+        end
+      end
 
     all = batcher_parts ++ [wal_part] ++ ra_parts
     {:simple, Enum.join(all, " | ")}
@@ -353,8 +368,13 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   def handle("MODULE", ["LIST" | _], _store), do: []
-  def handle("MODULE", ["LOAD" | _], _store), do: {:error, "ERR FerricStore does not support modules"}
-  def handle("MODULE", ["UNLOAD" | _], _store), do: {:error, "ERR FerricStore does not support modules"}
+
+  def handle("MODULE", ["LOAD" | _], _store),
+    do: {:error, "ERR FerricStore does not support modules"}
+
+  def handle("MODULE", ["UNLOAD" | _], _store),
+    do: {:error, "ERR FerricStore does not support modules"}
+
   def handle("MODULE", _, _store), do: {:error, "ERR unknown subcommand for 'module' command"}
 
   # ---------------------------------------------------------------------------
@@ -362,7 +382,9 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   def handle("WAITAOF", [_, _, _], _store), do: [0, 0]
-  def handle("WAITAOF", _args, _store), do: {:error, "ERR wrong number of arguments for 'waitaof' command"}
+
+  def handle("WAITAOF", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'waitaof' command"}
 
   # ---------------------------------------------------------------------------
   # SLOWLOG
@@ -474,7 +496,21 @@ defmodule Ferricstore.Commands.Server do
   # INFO section builders
   # ---------------------------------------------------------------------------
 
-  @all_sections ["server", "clients", "memory", "keyspace", "stats", "persistence", "replication", "cpu", "namespace_config", "raft", "bitcask", "ferricstore", "keydir_analysis"]
+  @all_sections [
+    "server",
+    "clients",
+    "memory",
+    "keyspace",
+    "stats",
+    "persistence",
+    "replication",
+    "cpu",
+    "namespace_config",
+    "raft",
+    "bitcask",
+    "ferricstore",
+    "keydir_analysis"
+  ]
 
   # Read shard_count from persistent_term (set by application.ex) with
   # Application.get_env fallback for early startup / test environments.
@@ -563,6 +599,7 @@ defmodule Ferricstore.Commands.Server do
           case :ets.info(:"keydir_#{i}", :memory) do
             words when is_integer(words) ->
               acc + words * :erlang.system_info(:wordsize)
+
             _ ->
               acc
           end
@@ -599,7 +636,14 @@ defmodule Ferricstore.Commands.Server do
 
   defp build_section("keyspace", store) do
     key_count = Ops.dbsize(store)
-    ctx = try do FerricStore.Instance.get(:default) rescue _ -> nil end
+
+    ctx =
+      try do
+        FerricStore.Instance.get(:default)
+      rescue
+        _ -> nil
+      end
+
     {expires, avg_ttl} = if ctx, do: compute_expiry_stats(ctx), else: {0, 0}
 
     fields = [
@@ -610,11 +654,13 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp build_section("stats", _store) do
-    rate = try do
-      FerricStore.Instance.get(:default).read_sample_rate
-    rescue
-      ArgumentError -> 100
-    end
+    rate =
+      try do
+        FerricStore.Instance.get(:default).read_sample_rate
+      rescue
+        ArgumentError -> 100
+      end
+
     hot_sampled = Stats.total_hot_reads(FerricStore.Instance.get(:default))
     cold_sampled = Stats.total_cold_reads(FerricStore.Instance.get(:default))
     hits_sampled = Stats.keyspace_hits(FerricStore.Instance.get(:default))
@@ -626,7 +672,11 @@ defmodule Ferricstore.Commands.Server do
     hits_est = hits_sampled * rate
     total_reads = hits_est + misses
     hit_ratio = if total_reads > 0, do: Float.round(hits_est / total_reads * 100, 2), else: 0.0
-    hot_pct = if hot_est + cold_est > 0, do: Float.round(hot_est / (hot_est + cold_est) * 100, 2), else: 0.0
+
+    hot_pct =
+      if hot_est + cold_est > 0,
+        do: Float.round(hot_est / (hot_est + cold_est) * 100, 2),
+        else: 0.0
 
     fields = [
       {"total_connections_received", Integer.to_string(Stats.total_connections())},
@@ -720,11 +770,14 @@ defmodule Ferricstore.Commands.Server do
           case :ra.members(shard_id) do
             {:ok, _members, leader} ->
               # Get counters from ra_counters
-              counters = try do
-                :ra_counters.overview(shard_id)
-              rescue _ -> %{}
-              catch _, _ -> %{}
-              end
+              counters =
+                try do
+                  :ra_counters.overview(shard_id)
+                rescue
+                  _ -> %{}
+                catch
+                  _, _ -> %{}
+                end
 
               role =
                 if leader == shard_id do
@@ -803,14 +856,17 @@ defmodule Ferricstore.Commands.Server do
               {:ok, files} ->
                 data = Enum.filter(files, &String.ends_with?(&1, ".log"))
                 hints = Enum.filter(files, &String.ends_with?(&1, ".hint"))
+
                 total =
                   Enum.reduce(files, 0, fn f, acc ->
                     path = Path.join(shard_dir, f)
+
                     case File.stat(path) do
                       {:ok, %{size: size}} -> acc + size
                       _ -> acc
                     end
                   end)
+
                 {length(data), length(hints), total}
 
               {:error, _} ->
@@ -853,26 +909,33 @@ defmodule Ferricstore.Commands.Server do
     raft_committed =
       Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
         shard_id = {:"ferricstore_shard_#{i}", node()}
+
         try do
           counters = :ra_counters.overview(shard_id)
           acc + Map.get(counters, :last_applied, 0)
-        rescue _ -> acc
-        catch _, _ -> acc
+        rescue
+          _ -> acc
+        catch
+          _, _ -> acc
         end
       end)
 
     hot_cache_evictions =
       try do
         :persistent_term.get({Ferricstore.Stats, :hot_cache_evictions}, 0)
-      rescue _ -> 0
-      catch _, _ -> 0
+      rescue
+        _ -> 0
+      catch
+        _, _ -> 0
       end
 
     keydir_full_rejections =
       try do
         :persistent_term.get({Ferricstore.Stats, :keydir_full_rejections}, 0)
-      rescue _ -> 0
-      catch _, _ -> 0
+      rescue
+        _ -> 0
+      catch
+        _, _ -> 0
       end
 
     fields = [
@@ -895,18 +958,25 @@ defmodule Ferricstore.Commands.Server do
     prefix_data =
       Enum.reduce(0..(shard_count - 1), %{}, fn i, acc ->
         table = :"keydir_#{i}"
-        try do
-          :ets.foldl(fn {key, _value, _exp, _lfu, _fid, _off, _vsize}, inner_acc ->
-            prefix = Ferricstore.Stats.extract_prefix(key)
-            # Estimate per-key bytes: key binary + value + expire_at + LFU + ETS tuple overhead
-            key_bytes = byte_size(key) + 8 + 8 + 64
 
-            current = Map.get(inner_acc, prefix, {0, 0})
-            {count, bytes} = current
-            Map.put(inner_acc, prefix, {count + 1, bytes + key_bytes})
-          end, acc, table)
-        rescue _ -> acc
-        catch _, _ -> acc
+        try do
+          :ets.foldl(
+            fn {key, _value, _exp, _lfu, _fid, _off, _vsize}, inner_acc ->
+              prefix = Ferricstore.Stats.extract_prefix(key)
+              # Estimate per-key bytes: key binary + value + expire_at + LFU + ETS tuple overhead
+              key_bytes = byte_size(key) + 8 + 8 + 64
+
+              current = Map.get(inner_acc, prefix, {0, 0})
+              {count, bytes} = current
+              Map.put(inner_acc, prefix, {count + 1, bytes + key_bytes})
+            end,
+            acc,
+            table
+          )
+        rescue
+          _ -> acc
+        catch
+          _, _ -> acc
         end
       end)
 
@@ -966,24 +1036,31 @@ defmodule Ferricstore.Commands.Server do
       for i <- 0..(ctx.shard_count - 1), reduce: {0, []} do
         {exp_acc, ttl_acc} ->
           keydir = elem(ctx.keydir_refs, i)
+
           try do
             count = :ets.select_count(keydir, count_spec)
-            samples = case :ets.select(keydir, sample_spec, 20) do
-              {results, _cont} -> results
-              :"$end_of_table" -> []
-            end
+
+            samples =
+              case :ets.select(keydir, sample_spec, 20) do
+                {results, _cont} -> results
+                :"$end_of_table" -> []
+              end
+
             {exp_acc + count, samples ++ ttl_acc}
           rescue
             ArgumentError -> {exp_acc, ttl_acc}
           end
       end
 
-    avg_ttl = case ttl_samples do
-      [] -> 0
-      _ ->
-        remaining = Enum.map(ttl_samples, fn exp -> max(0, exp - now) end)
-        div(Enum.sum(remaining), length(remaining))
-    end
+    avg_ttl =
+      case ttl_samples do
+        [] ->
+          0
+
+        _ ->
+          remaining = Enum.map(ttl_samples, fn exp -> max(0, exp - now) end)
+          div(Enum.sum(remaining), length(remaining))
+      end
 
     {total_expires, avg_ttl}
   end
@@ -1042,7 +1119,8 @@ defmodule Ferricstore.Commands.Server do
     |> Enum.flat_map(fn {k, v} -> [k, v] end)
   end
 
-  defp handle_config("GET", _args), do: {:error, "ERR wrong number of arguments for 'config|get' command"}
+  defp handle_config("GET", _args),
+    do: {:error, "ERR wrong number of arguments for 'config|get' command"}
 
   defp handle_config("SET", ["LOCAL" | rest]) do
     handle_config_set_local(rest)
@@ -1066,7 +1144,8 @@ defmodule Ferricstore.Commands.Server do
     end
   end
 
-  defp handle_config("SET", _args), do: {:error, "ERR wrong number of arguments for 'config|set' command"}
+  defp handle_config("SET", _args),
+    do: {:error, "ERR wrong number of arguments for 'config|set' command"}
 
   defp handle_config("RESETSTAT", []) do
     Stats.reset()
@@ -1074,11 +1153,15 @@ defmodule Ferricstore.Commands.Server do
     :ok
   end
 
-  defp handle_config("RESETSTAT", _), do: {:error, "ERR wrong number of arguments for 'config|resetstat' command"}
+  defp handle_config("RESETSTAT", _),
+    do: {:error, "ERR wrong number of arguments for 'config|resetstat' command"}
+
   defp handle_config("REWRITE", []) do
     Ferricstore.Config.rewrite()
   end
-  defp handle_config("REWRITE", _), do: {:error, "ERR wrong number of arguments for 'config|rewrite' command"}
+
+  defp handle_config("REWRITE", _),
+    do: {:error, "ERR wrong number of arguments for 'config|rewrite' command"}
 
   defp handle_config(subcmd, _) do
     {:error, "ERR unknown subcommand '#{String.downcase(subcmd)}' for 'config' command"}
@@ -1111,6 +1194,7 @@ defmodule Ferricstore.Commands.Server do
   # the pattern match `["LOCAL" | rest]` works regardless of client casing.
   defp upcase_local_modifier(["local" | rest]), do: ["LOCAL" | rest]
   defp upcase_local_modifier(["Local" | rest]), do: ["LOCAL" | rest]
+
   defp upcase_local_modifier([first | rest]) when is_binary(first) do
     if String.upcase(first) == "LOCAL" do
       ["LOCAL" | rest]
@@ -1118,6 +1202,7 @@ defmodule Ferricstore.Commands.Server do
       [first | rest]
     end
   end
+
   defp upcase_local_modifier(args), do: args
 
   # ---------------------------------------------------------------------------
@@ -1129,5 +1214,4 @@ defmodule Ferricstore.Commands.Server do
       [id, timestamp_us, duration_us, command]
     end)
   end
-
 end

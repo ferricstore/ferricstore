@@ -17,6 +17,25 @@ defmodule Ferricstore.Commands.StringsTest do
       assert "value" == store.get.("key")
     end
 
+    test "executes Rust SET AST without reparsing option binaries" do
+      store = MockStore.make()
+
+      assert nil ==
+               Strings.handle_ast({:set, "key", "value", [{:ex, 10}, :nx, :get]}, store)
+
+      assert "value" == store.get.("key")
+      assert nil == Strings.handle_ast({:set, "key", "new", [:nx]}, store)
+      assert "value" == store.get.("key")
+    end
+
+    test "returns Rust SET AST option errors unchanged" do
+      assert {:error, "ERR syntax error"} =
+               Strings.handle_ast(
+                 {:set, "key", "value", {:error, "ERR syntax error"}},
+                 MockStore.make()
+               )
+    end
+
     test "SET with EX sets expiry in seconds" do
       store = MockStore.make()
       assert :ok = Strings.handle("SET", ["key", "value", "EX", "10"], store)

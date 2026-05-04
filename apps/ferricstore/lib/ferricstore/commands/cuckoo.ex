@@ -18,6 +18,26 @@ defmodule Ferricstore.Commands.Cuckoo do
   # Public command handler
   # -------------------------------------------------------------------
 
+  @spec handle_ast(term(), map()) :: term()
+  def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+  def handle_ast({tag, _key, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+
+  def handle_ast({:cf_reserve, key, capacity}, store) do
+    with :ok <- check_cuckoo_not_exists(key, store) do
+      store
+      |> do_prob_write({:cuckoo_create, key, capacity, @bucket_size})
+      |> normalize_create_result()
+    end
+  end
+
+  def handle_ast({:cf_add, args}, store), do: cf_add_args(args, store)
+  def handle_ast({:cf_addnx, args}, store), do: cf_addnx_args(args, store)
+  def handle_ast({:cf_del, args}, store), do: cf_del_args(args, store)
+  def handle_ast({:cf_exists, args}, store), do: cf_exists_args(args, store)
+  def handle_ast({:cf_mexists, args}, store), do: cf_mexists_args(args, store)
+  def handle_ast({:cf_count, args}, store), do: cf_count_args(args, store)
+  def handle_ast({:cf_info, args}, store), do: cf_info_args(args, store)
+
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
 
@@ -41,7 +61,15 @@ defmodule Ferricstore.Commands.Cuckoo do
   # CF.ADD key element — write through Raft
   # ---------------------------------------------------------------------------
 
-  def handle("CF.ADD", [key, element], store) do
+  def handle("CF.ADD", args, store), do: cf_add_args(args, store)
+  def handle("CF.ADDNX", args, store), do: cf_addnx_args(args, store)
+  def handle("CF.DEL", args, store), do: cf_del_args(args, store)
+  def handle("CF.EXISTS", args, store), do: cf_exists_args(args, store)
+  def handle("CF.MEXISTS", args, store), do: cf_mexists_args(args, store)
+  def handle("CF.COUNT", args, store), do: cf_count_args(args, store)
+  def handle("CF.INFO", args, store), do: cf_info_args(args, store)
+
+  defp cf_add_args([key, element], store) do
     with :ok <- ProbType.check_expected(key, :cuckoo, store) do
       auto_params = %{capacity: @default_capacity, bucket_size: @bucket_size}
       result = do_prob_write(store, {:cuckoo_add, key, element, auto_params})
@@ -57,14 +85,10 @@ defmodule Ferricstore.Commands.Cuckoo do
     end
   end
 
-  def handle("CF.ADD", _args, _store),
+  defp cf_add_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'cf.add' command"}
 
-  # ---------------------------------------------------------------------------
-  # CF.ADDNX key element — write through Raft
-  # ---------------------------------------------------------------------------
-
-  def handle("CF.ADDNX", [key, element], store) do
+  defp cf_addnx_args([key, element], store) do
     with :ok <- ProbType.check_expected(key, :cuckoo, store) do
       auto_params = %{capacity: @default_capacity, bucket_size: @bucket_size}
       result = do_prob_write(store, {:cuckoo_addnx, key, element, auto_params})
@@ -78,14 +102,10 @@ defmodule Ferricstore.Commands.Cuckoo do
     end
   end
 
-  def handle("CF.ADDNX", _args, _store),
+  defp cf_addnx_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'cf.addnx' command"}
 
-  # ---------------------------------------------------------------------------
-  # CF.DEL key element — write through Raft
-  # ---------------------------------------------------------------------------
-
-  def handle("CF.DEL", [key, element], store) do
+  defp cf_del_args([key, element], store) do
     with :ok <- ProbType.check_expected(key, :cuckoo, store) do
       path = prob_path(store, key, "cuckoo")
 
@@ -103,14 +123,10 @@ defmodule Ferricstore.Commands.Cuckoo do
     end
   end
 
-  def handle("CF.DEL", _args, _store),
+  defp cf_del_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'cf.del' command"}
 
-  # ---------------------------------------------------------------------------
-  # CF.EXISTS key element — local stateless pread
-  # ---------------------------------------------------------------------------
-
-  def handle("CF.EXISTS", [key, element], store) do
+  defp cf_exists_args([key, element], store) do
     path = prob_path(store, key, "cuckoo")
 
     case await_nif(fn proxy, corr_id ->
@@ -130,14 +146,10 @@ defmodule Ferricstore.Commands.Cuckoo do
     end
   end
 
-  def handle("CF.EXISTS", _args, _store),
+  defp cf_exists_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'cf.exists' command"}
 
-  # ---------------------------------------------------------------------------
-  # CF.MEXISTS key element [element ...] — local stateless pread
-  # ---------------------------------------------------------------------------
-
-  def handle("CF.MEXISTS", [key | elements], store) when elements != [] do
+  defp cf_mexists_args([key | elements], store) when elements != [] do
     path = prob_path(store, key, "cuckoo")
 
     case await_nif(fn proxy, corr_id ->
@@ -157,14 +169,10 @@ defmodule Ferricstore.Commands.Cuckoo do
     end
   end
 
-  def handle("CF.MEXISTS", _args, _store),
+  defp cf_mexists_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'cf.mexists' command"}
 
-  # ---------------------------------------------------------------------------
-  # CF.COUNT key element — local stateless pread
-  # ---------------------------------------------------------------------------
-
-  def handle("CF.COUNT", [key, element], store) do
+  defp cf_count_args([key, element], store) do
     path = prob_path(store, key, "cuckoo")
 
     case await_nif(fn proxy, corr_id ->
@@ -184,14 +192,10 @@ defmodule Ferricstore.Commands.Cuckoo do
     end
   end
 
-  def handle("CF.COUNT", _args, _store),
+  defp cf_count_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'cf.count' command"}
 
-  # ---------------------------------------------------------------------------
-  # CF.INFO key — local stateless pread
-  # ---------------------------------------------------------------------------
-
-  def handle("CF.INFO", [key], store) do
+  defp cf_info_args([key], store) do
     path = prob_path(store, key, "cuckoo")
 
     case await_nif(fn proxy, corr_id ->
@@ -232,7 +236,7 @@ defmodule Ferricstore.Commands.Cuckoo do
     end
   end
 
-  def handle("CF.INFO", _args, _store),
+  defp cf_info_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'cf.info' command"}
 
   # ---------------------------------------------------------------------------

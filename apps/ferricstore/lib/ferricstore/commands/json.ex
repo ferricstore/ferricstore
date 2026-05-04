@@ -42,17 +42,87 @@ defmodule Ferricstore.Commands.Json do
   @wrongtype_msg "WRONGTYPE Operation against a key holding the wrong kind of value"
 
   @doc """
+  Handles typed JSON command AST terms produced by the Rust RESP parser.
+  """
+  @spec handle_ast(term(), map()) :: term()
+  def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+
+  def handle_ast({tag, _key, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+
+  def handle_ast({:json_set, key, path, value, flags}, store) do
+    with {:ok, new_value} <- decode_json_value(value),
+         {:ok, nx?, xx?} <- ast_set_flags(flags) do
+      do_json_set(key, path, new_value, nx?, xx?, store)
+    end
+  end
+
+  def handle_ast({:json_get, key, paths}, store) do
+    with_json(key, store, &do_json_get_specs(&1, paths))
+  end
+
+  def handle_ast({:json_del, key, []}, store), do: do_json_del_root(key, store)
+  def handle_ast({:json_del, key, path}, store), do: do_json_del_path(key, path, store)
+
+  def handle_ast({:json_numincrby, key, path, incr}, store) do
+    with {:ok, root} <- read_json_required(key, store) do
+      do_numincrby(root, key, path, incr, store)
+    end
+  end
+
+  def handle_ast({:json_type, key, []}, store),
+    do: with_json_at_path(key, "$", store, &json_type/1, nil)
+
+  def handle_ast({:json_type, key, path}, store) do
+    with_json_at_path(key, path, store, &json_type/1, _default_on_miss = nil)
+  end
+
+  def handle_ast({:json_strlen, key, []}, store),
+    do: with_json_at_path(key, "$", store, &strlen_value/1, nil)
+
+  def handle_ast({:json_strlen, key, path}, store) do
+    with_json_at_path(key, path, store, &strlen_value/1, nil)
+  end
+
+  def handle_ast({:json_objkeys, key, []}, store),
+    do: with_json_at_path(key, "$", store, &objkeys_value/1, nil)
+
+  def handle_ast({:json_objkeys, key, path}, store) do
+    with_json_at_path(key, path, store, &objkeys_value/1, nil)
+  end
+
+  def handle_ast({:json_objlen, key, []}, store),
+    do: with_json_at_path(key, "$", store, &objlen_value/1, nil)
+
+  def handle_ast({:json_objlen, key, path}, store) do
+    with_json_at_path(key, path, store, &objlen_value/1, nil)
+  end
+
+  def handle_ast({:json_arrappend, key, path, values}, store) do
+    with {:ok, decoded} <- decode_json_values(values),
+         {:ok, root} <- read_json_required(key, store) do
+      do_arrappend(root, key, path, decoded, store)
+    end
+  end
+
+  def handle_ast({:json_arrlen, key, []}, store),
+    do: with_json_at_path(key, "$", store, &arrlen_value/1, nil)
+
+  def handle_ast({:json_arrlen, key, path}, store) do
+    with_json_at_path(key, path, store, &arrlen_value/1, nil)
+  end
+
+  def handle_ast({:json_toggle, key, path}, store) do
+    with {:ok, root} <- read_json_required(key, store) do
+      do_toggle(root, key, path, store)
+    end
+  end
+
+  def handle_ast({:json_clear, key, []}, store), do: do_json_clear_path(key, "$", store)
+  def handle_ast({:json_clear, key, path}, store), do: do_json_clear_path(key, path, store)
+  def handle_ast({:json_mget, keys, path}, store), do: mget_many(keys, path, store)
+
+  @doc """
   Handles a JSON command.
-
-  ## Parameters
-
-    - `cmd` - Uppercased command name (e.g. `"JSON.SET"`, `"JSON.GET"`)
-    - `args` - List of string arguments
-    - `store` - Injected store map with `get`, `put`, `delete`, `exists?` callbacks
-
-  ## Returns
-
-  Plain Elixir term: `:ok`, `nil`, integer, string, list, or `{:error, message}`.
   """
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
@@ -104,7 +174,7 @@ defmodule Ferricstore.Commands.Json do
     do_json_del_path(key, path, store)
   end
 
-  def handle("JSON.DEL", [], _store) do
+  def handle("JSON.DEL", _args, _store) do
     {:error, "ERR wrong number of arguments for 'json.del' command"}
   end
 
@@ -137,7 +207,7 @@ defmodule Ferricstore.Commands.Json do
     with_json_at_path(key, path, store, &json_type/1, _default_on_miss = nil)
   end
 
-  def handle("JSON.TYPE", [], _store) do
+  def handle("JSON.TYPE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'json.type' command"}
   end
 
@@ -160,7 +230,7 @@ defmodule Ferricstore.Commands.Json do
     with_json_at_path(key, path, store, &strlen_value/1, nil)
   end
 
-  def handle("JSON.STRLEN", [], _store) do
+  def handle("JSON.STRLEN", _args, _store) do
     {:error, "ERR wrong number of arguments for 'json.strlen' command"}
   end
 
@@ -183,7 +253,7 @@ defmodule Ferricstore.Commands.Json do
     with_json_at_path(key, path, store, &objkeys_value/1, nil)
   end
 
-  def handle("JSON.OBJKEYS", [], _store) do
+  def handle("JSON.OBJKEYS", _args, _store) do
     {:error, "ERR wrong number of arguments for 'json.objkeys' command"}
   end
 
@@ -206,7 +276,7 @@ defmodule Ferricstore.Commands.Json do
     with_json_at_path(key, path, store, &objlen_value/1, nil)
   end
 
-  def handle("JSON.OBJLEN", [], _store) do
+  def handle("JSON.OBJLEN", _args, _store) do
     {:error, "ERR wrong number of arguments for 'json.objlen' command"}
   end
 
@@ -244,7 +314,7 @@ defmodule Ferricstore.Commands.Json do
     with_json_at_path(key, path, store, &arrlen_value/1, nil)
   end
 
-  def handle("JSON.ARRLEN", [], _store) do
+  def handle("JSON.ARRLEN", _args, _store) do
     {:error, "ERR wrong number of arguments for 'json.arrlen' command"}
   end
 
@@ -286,7 +356,7 @@ defmodule Ferricstore.Commands.Json do
     do_json_clear_path(key, path, store)
   end
 
-  def handle("JSON.CLEAR", [], _store) do
+  def handle("JSON.CLEAR", _args, _store) do
     {:error, "ERR wrong number of arguments for 'json.clear' command"}
   end
 
@@ -369,6 +439,9 @@ defmodule Ferricstore.Commands.Json do
 
       :not_found ->
         0
+
+      {:error, _} = err ->
+        err
     end
   end
 
@@ -517,7 +590,14 @@ defmodule Ferricstore.Commands.Json do
   defp set_on_missing_key(_key, _path, _new_value, true = _xx?, _store), do: nil
 
   defp set_on_missing_key(key, path, new_value, _xx?, store) do
-    case build_from_path(parse_path(path), new_value) do
+    case parse_path(path) do
+      :error -> {:error, "ERR invalid JSONPath syntax"}
+      segments -> build_missing_json_path(key, segments, new_value, store)
+    end
+  end
+
+  defp build_missing_json_path(key, segments, new_value, store) do
+    case build_from_path(segments, new_value) do
       {:ok, root} -> write_json(key, root, store)
       :error -> {:error, "ERR cannot create path in empty document"}
     end
@@ -592,6 +672,28 @@ defmodule Ferricstore.Commands.Json do
 
   defp do_json_get(root, paths) do
     result = Map.new(paths, &path_to_kv(root, &1))
+    Jason.encode!(result)
+  end
+
+  defp do_json_get_specs(root, []), do: Jason.encode!(root)
+
+  defp do_json_get_specs(root, [{_raw_path, segments}]) do
+    case get_at_path(root, segments) do
+      {:ok, val} -> Jason.encode!(val)
+      :not_found -> nil
+      {:error, _} = err -> err
+    end
+  end
+
+  defp do_json_get_specs(root, path_specs) do
+    result =
+      Map.new(path_specs, fn {raw_path, segments} ->
+        case get_at_path(root, segments) do
+          {:ok, val} -> {raw_path, val}
+          :not_found -> {raw_path, nil}
+        end
+      end)
+
     Jason.encode!(result)
   end
 
@@ -703,6 +805,7 @@ defmodule Ferricstore.Commands.Json do
   # Parses a JSONPath string into a list of path segments.
   # Supports: $, $.field, $.field.subfield, $[0], $.field[0].name
   @spec parse_path(binary()) :: [binary() | non_neg_integer()] | :error
+  defp parse_path(segments) when is_list(segments), do: segments
   defp parse_path("$"), do: []
   defp parse_path(<<"$", rest::binary>>), do: parse_path_segments(rest, [])
   defp parse_path(_), do: :error
@@ -710,8 +813,10 @@ defmodule Ferricstore.Commands.Json do
   defp parse_path_segments(<<>>, acc), do: Enum.reverse(acc)
 
   defp parse_path_segments(<<".", rest::binary>>, acc) do
-    {field, remainder} = read_field(rest)
-    parse_path_segments(remainder, [field | acc])
+    case read_field(rest) do
+      {:ok, field, remainder} -> parse_path_segments(remainder, [field | acc])
+      :error -> :error
+    end
   end
 
   defp parse_path_segments(<<"[", rest::binary>>, acc) do
@@ -721,16 +826,22 @@ defmodule Ferricstore.Commands.Json do
     end
   end
 
-  defp parse_path_segments(_, acc), do: Enum.reverse(acc)
+  defp parse_path_segments(_, _acc), do: :error
 
   # Reads a field name up to the next `.`, `[`, or end of string.
   defp read_field(str) do
     case :binary.match(str, [<<".">>, <<"[">>]) do
       {pos, _len} ->
-        {binary_part(str, 0, pos), binary_part(str, pos, byte_size(str) - pos)}
+        field = binary_part(str, 0, pos)
+
+        if field == "" do
+          :error
+        else
+          {:ok, field, binary_part(str, pos, byte_size(str) - pos)}
+        end
 
       :nomatch ->
-        {str, <<>>}
+        if str == "", do: :error, else: {:ok, str, <<>>}
     end
   end
 
@@ -749,11 +860,19 @@ defmodule Ferricstore.Commands.Json do
   end
 
   defp parse_bracket_content(<<"\"", _::binary>> = inner, remainder) do
-    {:ok, String.slice(inner, 1..-2//1), remainder}
+    if byte_size(inner) >= 2 and String.ends_with?(inner, "\"") do
+      {:ok, String.slice(inner, 1..-2//1), remainder}
+    else
+      :error
+    end
   end
 
   defp parse_bracket_content(<<"'", _::binary>> = inner, remainder) do
-    {:ok, String.slice(inner, 1..-2//1), remainder}
+    if byte_size(inner) >= 2 and String.ends_with?(inner, "'") do
+      {:ok, String.slice(inner, 1..-2//1), remainder}
+    else
+      :error
+    end
   end
 
   defp parse_bracket_content(inner, remainder) do
@@ -829,8 +948,8 @@ defmodule Ferricstore.Commands.Json do
   end
 
   # Deletes a value at a parsed path within a decoded JSON structure.
-  @spec delete_at_path(term(), [binary() | non_neg_integer()]) ::
-          {:ok, term()} | :not_found
+  @spec delete_at_path(term(), [binary() | non_neg_integer()] | :error) ::
+          {:ok, term()} | :not_found | {:error, binary()}
   defp delete_at_path(_value, :error), do: {:error, "ERR invalid JSONPath syntax"}
   defp delete_at_path(_value, []), do: :not_found
 
@@ -971,6 +1090,12 @@ defmodule Ferricstore.Commands.Json do
   # ===========================================================================
   # Private — SET flag parsing
   # ===========================================================================
+
+  defp ast_set_flags([]), do: {:ok, false, false}
+  defp ast_set_flags([:nx]), do: {:ok, true, false}
+  defp ast_set_flags([:xx]), do: {:ok, false, true}
+  defp ast_set_flags({:error, msg}), do: {:error, msg}
+  defp ast_set_flags(_), do: {:error, "ERR syntax error"}
 
   @spec parse_set_flags([binary()]) :: {:ok, boolean(), boolean()} | {:error, binary()}
   defp parse_set_flags([]), do: {:ok, false, false}

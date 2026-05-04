@@ -34,6 +34,15 @@ defmodule Ferricstore.Commands.HyperLogLog do
   @wrongtype_error {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
 
   @doc """
+  Handles typed HyperLogLog command AST terms produced by the Rust RESP parser.
+  """
+  @spec handle_ast(term(), map()) :: term()
+  def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+  def handle_ast({:pfadd, args}, store), do: pfadd_args(args, store)
+  def handle_ast({:pfcount, args}, store), do: pfcount_args(args, store)
+  def handle_ast({:pfmerge, args}, store), do: pfmerge_args(args, store)
+
+  @doc """
   Handles a HyperLogLog command.
 
   ## Parameters
@@ -53,7 +62,25 @@ defmodule Ferricstore.Commands.HyperLogLog do
   # PFADD key element [element ...]
   # ---------------------------------------------------------------------------
 
-  def handle("PFADD", [key], store) do
+  def handle("PFADD", args, store), do: pfadd_args(args, store)
+
+  # ---------------------------------------------------------------------------
+  # PFCOUNT key [key ...]
+  # ---------------------------------------------------------------------------
+
+  def handle("PFCOUNT", args, store), do: pfcount_args(args, store)
+
+  # ---------------------------------------------------------------------------
+  # PFMERGE destkey sourcekey [sourcekey ...]
+  # ---------------------------------------------------------------------------
+
+  def handle("PFMERGE", args, store), do: pfmerge_args(args, store)
+
+  # ---------------------------------------------------------------------------
+  # Private helpers
+  # ---------------------------------------------------------------------------
+
+  defp pfadd_args([key], store) do
     case ensure_not_compound_key(key, store) do
       :ok ->
         case Ops.get(store, key) do
@@ -73,7 +100,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
     end
   end
 
-  def handle("PFADD", [key | elements], store) when elements != [] do
+  defp pfadd_args([key | elements], store) when elements != [] do
     sketch = get_or_new(key, store)
 
     case validate_sketch(sketch) do
@@ -96,15 +123,11 @@ defmodule Ferricstore.Commands.HyperLogLog do
     end
   end
 
-  def handle("PFADD", _args, _store) do
+  defp pfadd_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'pfadd' command"}
   end
 
-  # ---------------------------------------------------------------------------
-  # PFCOUNT key [key ...]
-  # ---------------------------------------------------------------------------
-
-  def handle("PFCOUNT", keys, store) when keys != [] do
+  defp pfcount_args(keys, store) when keys != [] do
     case read_sketches(keys, store) do
       {:ok, [single]} ->
         HLL.count(single)
@@ -119,15 +142,11 @@ defmodule Ferricstore.Commands.HyperLogLog do
     end
   end
 
-  def handle("PFCOUNT", _args, _store) do
+  defp pfcount_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'pfcount' command"}
   end
 
-  # ---------------------------------------------------------------------------
-  # PFMERGE destkey sourcekey [sourcekey ...]
-  # ---------------------------------------------------------------------------
-
-  def handle("PFMERGE", [destkey | source_keys], store) when source_keys != [] do
+  defp pfmerge_args([destkey | source_keys], store) when source_keys != [] do
     case read_sketches([destkey | source_keys], store) do
       {:ok, sketches} ->
         merged = Enum.reduce(sketches, &HLL.merge/2)
@@ -139,13 +158,9 @@ defmodule Ferricstore.Commands.HyperLogLog do
     end
   end
 
-  def handle("PFMERGE", _args, _store) do
+  defp pfmerge_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'pfmerge' command"}
   end
-
-  # ---------------------------------------------------------------------------
-  # Private helpers
-  # ---------------------------------------------------------------------------
 
   # Returns the existing sketch for `key`, or a new empty sketch if the key
   # does not exist.

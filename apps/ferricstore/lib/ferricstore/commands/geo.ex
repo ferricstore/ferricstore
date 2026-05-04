@@ -51,6 +51,85 @@ defmodule Ferricstore.Commands.Geo do
   # ---------------------------------------------------------------------------
 
   @doc """
+  Handles typed Geo command AST terms produced by the Rust RESP parser.
+  """
+  @spec handle_ast(term(), map()) :: term()
+  def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+
+  def handle_ast({:geoadd, key, flags, pairs}, store) do
+    with {:ok, zset} <- read_zset(store, key) do
+      do_geoadd(store, key, zset, pairs, flags)
+    end
+  end
+
+  def handle_ast({:geopos, args}, store), do: geopos_args(args, store)
+  def handle_ast({:geohash, args}, store), do: geohash_args(args, store)
+
+  def handle_ast({:geodist, _key, _member1, _member2, {:error, msg}}, _store),
+    do: {:error, msg}
+
+  def handle_ast({:geodist, key, member1, member2, unit}, store) do
+    with {:ok, zset} <- read_zset(store, key) do
+      map = zset_to_member_map(zset)
+
+      case {Map.get(map, member1), Map.get(map, member2)} do
+        {nil, _} ->
+          nil
+
+        {_, nil} ->
+          nil
+
+        {score1, score2} ->
+          {lng1, lat1} = geohash_decode(score1)
+          {lng2, lat2} = geohash_decode(score2)
+          dist_m = haversine(lat1, lng1, lat2, lng2)
+          dist = dist_m / @unit_conversions[unit]
+          format_distance(dist)
+      end
+    end
+  end
+
+  def handle_ast({:geosearch, _key, {:error, msg}}, _store), do: {:error, msg}
+
+  def handle_ast({:geosearch, key, opts}, store) do
+    opts = Map.new(opts)
+
+    with {:ok, center_lng, center_lat} <- resolve_center(opts, store, key),
+         {:ok, zset} <- read_zset(store, key) do
+      do_geosearch(zset, center_lng, center_lat, opts)
+    end
+  end
+
+  def handle_ast({:geosearchstore, _destination, _source, {:error, msg}}, _store),
+    do: {:error, msg}
+
+  def handle_ast({:geosearchstore, destination, source, opts}, store) do
+    opts = Map.new(opts)
+
+    with {:ok, center_lng, center_lat} <- resolve_center(opts, store, source),
+         {:ok, zset} <- read_zset(store, source) do
+      matches = find_matching_members(zset, center_lng, center_lat, opts)
+      sorted = sort_matches(matches, opts)
+      limited = apply_count(sorted, opts)
+
+      if limited == [] do
+        delete_key_data(store, destination)
+        0
+      else
+        new_zset =
+          limited
+          |> Enum.map(fn {score, member, _dist} -> {score, member} end)
+          |> Enum.sort()
+
+        case replace_zset(store, destination, new_zset) do
+          :ok -> length(limited)
+          {:error, _} = err -> err
+        end
+      end
+    end
+  end
+
+  @doc """
   Handles a geo command.
 
   ## Parameters
@@ -86,26 +165,7 @@ defmodule Ferricstore.Commands.Geo do
   # GEOPOS key member [member ...]
   # ---------------------------------------------------------------------------
 
-  def handle("GEOPOS", [key | members], store) when members != [] do
-    with {:ok, zset} <- read_zset(store, key) do
-      map = zset_to_member_map(zset)
-
-      Enum.map(members, fn member ->
-        case Map.get(map, member) do
-          nil ->
-            nil
-
-          score ->
-            {lng, lat} = geohash_decode(score)
-            [format_coord(lng), format_coord(lat)]
-        end
-      end)
-    end
-  end
-
-  def handle("GEOPOS", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'geopos' command"}
-  end
+  def handle("GEOPOS", args, store), do: geopos_args(args, store)
 
   # ---------------------------------------------------------------------------
   # GEODIST key member1 member2 [M|KM|FT|MI]
@@ -151,22 +211,7 @@ defmodule Ferricstore.Commands.Geo do
   # GEOHASH key member [member ...]
   # ---------------------------------------------------------------------------
 
-  def handle("GEOHASH", [key | members], store) when members != [] do
-    with {:ok, zset} <- read_zset(store, key) do
-      map = zset_to_member_map(zset)
-
-      Enum.map(members, fn member ->
-        case Map.get(map, member) do
-          nil -> nil
-          score -> encode_geohash_string(score)
-        end
-      end)
-    end
-  end
-
-  def handle("GEOHASH", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'geohash' command"}
-  end
+  def handle("GEOHASH", args, store), do: geohash_args(args, store)
 
   # ---------------------------------------------------------------------------
   # GEOSEARCH key FROMLONLAT lng lat|FROMMEMBER member
@@ -217,6 +262,44 @@ defmodule Ferricstore.Commands.Geo do
 
   def handle("GEOSEARCHSTORE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'geosearchstore' command"}
+  end
+
+  defp geopos_args([key | members], store) when members != [] do
+    with {:ok, zset} <- read_zset(store, key) do
+      map = zset_to_member_map(zset)
+
+      Enum.map(members, fn member ->
+        case Map.get(map, member) do
+          nil ->
+            nil
+
+          score ->
+            {lng, lat} = geohash_decode(score)
+            [format_coord(lng), format_coord(lat)]
+        end
+      end)
+    end
+  end
+
+  defp geopos_args(_args, _store) do
+    {:error, "ERR wrong number of arguments for 'geopos' command"}
+  end
+
+  defp geohash_args([key | members], store) when members != [] do
+    with {:ok, zset} <- read_zset(store, key) do
+      map = zset_to_member_map(zset)
+
+      Enum.map(members, fn member ->
+        case Map.get(map, member) do
+          nil -> nil
+          score -> encode_geohash_string(score)
+        end
+      end)
+    end
+  end
+
+  defp geohash_args(_args, _store) do
+    {:error, "ERR wrong number of arguments for 'geohash' command"}
   end
 
   # ===========================================================================

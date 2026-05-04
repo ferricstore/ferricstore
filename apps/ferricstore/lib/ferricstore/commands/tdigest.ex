@@ -54,6 +54,92 @@ defmodule Ferricstore.Commands.TDigest do
 
   Plain Elixir term: `:ok`, float, list, or `{:error, message}`.
   """
+  @spec handle_ast(term(), map()) :: term()
+  def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+  def handle_ast({tag, _key, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+
+  def handle_ast({:tdigest_create, key, nil}, store) do
+    handle_ast({:tdigest_create, key, 100}, store)
+  end
+
+  def handle_ast({:tdigest_create, key, compression}, store) do
+    with :ok <- check_create_available(key, store) do
+      create_digest(key, compression, store)
+    end
+  end
+
+  def handle_ast({:tdigest_add, key, floats}, store) do
+    with {:ok, digest} <- get_digest(store, key) do
+      updated = Core.add_many(digest, floats)
+      persist!(key, updated, store)
+      :ok
+    end
+  end
+
+  def handle_ast({:tdigest_reset, [key]}, store), do: reset_digest(key, store)
+
+  def handle_ast({:tdigest_quantile, key, quantiles}, store) do
+    with {:ok, digest} <- get_digest(store, key) do
+      quantiles
+      |> Enum.map(fn q -> Core.quantile(digest, q) end)
+      |> format_float_results()
+    end
+  end
+
+  def handle_ast({:tdigest_cdf, key, floats}, store) do
+    with {:ok, digest} <- get_digest(store, key) do
+      floats
+      |> Enum.map(fn v -> Core.cdf(digest, v) end)
+      |> format_float_results()
+    end
+  end
+
+  def handle_ast({:tdigest_rank, key, floats}, store) do
+    with {:ok, digest} <- get_digest(store, key) do
+      Enum.map(floats, fn v -> Core.rank(digest, v) end)
+    end
+  end
+
+  def handle_ast({:tdigest_revrank, key, floats}, store) do
+    with {:ok, digest} <- get_digest(store, key) do
+      Enum.map(floats, fn v -> Core.rev_rank(digest, v) end)
+    end
+  end
+
+  def handle_ast({:tdigest_byrank, key, ranks}, store) do
+    with {:ok, digest} <- get_digest(store, key) do
+      ranks
+      |> Enum.map(fn r -> Core.by_rank(digest, r) end)
+      |> format_rank_results()
+    end
+  end
+
+  def handle_ast({:tdigest_byrevrank, key, ranks}, store) do
+    with {:ok, digest} <- get_digest(store, key) do
+      ranks
+      |> Enum.map(fn r -> Core.by_rev_rank(digest, r) end)
+      |> format_rank_results()
+    end
+  end
+
+  def handle_ast({:tdigest_trimmed_mean, key, lo, hi}, store) do
+    with {:ok, digest} <- get_digest(store, key) do
+      digest
+      |> Core.trimmed_mean(lo, hi)
+      |> format_single_float()
+    end
+  end
+
+  def handle_ast({:tdigest_min, [key]}, store), do: min_digest(key, store)
+  def handle_ast({:tdigest_max, [key]}, store), do: max_digest(key, store)
+  def handle_ast({:tdigest_info, [key]}, store), do: info_digest(key, store)
+
+  def handle_ast({:tdigest_merge, dest, src_keys, opts}, store) do
+    with {:ok, src_digests} <- load_source_digests(store, src_keys) do
+      do_merge(store, dest, src_digests, opts)
+    end
+  end
+
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
 
@@ -103,13 +189,7 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.RESET key
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.RESET", [key], store) do
-    with {:ok, digest} <- get_digest(store, key) do
-      updated = Core.reset(digest)
-      persist!(key, updated, store)
-      :ok
-    end
-  end
+  def handle("TDIGEST.RESET", [key], store), do: reset_digest(key, store)
 
   def handle("TDIGEST.RESET", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.reset' command"}
@@ -234,14 +314,7 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.MIN key
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.MIN", [key], store) do
-    with {:ok, digest} <- get_digest(store, key) do
-      case digest.min do
-        nil -> "nan"
-        val -> format_number(val)
-      end
-    end
-  end
+  def handle("TDIGEST.MIN", [key], store), do: min_digest(key, store)
 
   def handle("TDIGEST.MIN", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.min' command"}
@@ -251,14 +324,7 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.MAX key
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.MAX", [key], store) do
-    with {:ok, digest} <- get_digest(store, key) do
-      case digest.max do
-        nil -> "nan"
-        val -> format_number(val)
-      end
-    end
-  end
+  def handle("TDIGEST.MAX", [key], store), do: max_digest(key, store)
 
   def handle("TDIGEST.MAX", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.max' command"}
@@ -268,30 +334,7 @@ defmodule Ferricstore.Commands.TDigest do
   # TDIGEST.INFO key
   # ---------------------------------------------------------------------------
 
-  def handle("TDIGEST.INFO", [key], store) do
-    with {:ok, digest} <- get_digest(store, key) do
-      info = Core.info(digest)
-
-      [
-        "Compression",
-        info.compression,
-        "Capacity",
-        info.capacity,
-        "Merged nodes",
-        info.merged_nodes,
-        "Unmerged nodes",
-        info.unmerged_nodes,
-        "Merged weight",
-        format_number(info.merged_weight),
-        "Unmerged weight",
-        format_number(info.unmerged_weight),
-        "Total compressions",
-        info.total_compressions,
-        "Memory usage",
-        info.memory_usage
-      ]
-    end
-  end
+  def handle("TDIGEST.INFO", [key], store), do: info_digest(key, store)
 
   def handle("TDIGEST.INFO", _args, _store) do
     {:error, "ERR wrong number of arguments for 'tdigest.info' command"}
@@ -316,6 +359,57 @@ defmodule Ferricstore.Commands.TDigest do
   # ===========================================================================
   # Private: store operations
   # ===========================================================================
+
+  defp reset_digest(key, store) do
+    with {:ok, digest} <- get_digest(store, key) do
+      updated = Core.reset(digest)
+      persist!(key, updated, store)
+      :ok
+    end
+  end
+
+  defp min_digest(key, store) do
+    with {:ok, digest} <- get_digest(store, key) do
+      case digest.min do
+        nil -> "nan"
+        val -> format_number(val)
+      end
+    end
+  end
+
+  defp max_digest(key, store) do
+    with {:ok, digest} <- get_digest(store, key) do
+      case digest.max do
+        nil -> "nan"
+        val -> format_number(val)
+      end
+    end
+  end
+
+  defp info_digest(key, store) do
+    with {:ok, digest} <- get_digest(store, key) do
+      info = Core.info(digest)
+
+      [
+        "Compression",
+        info.compression,
+        "Capacity",
+        info.capacity,
+        "Merged nodes",
+        info.merged_nodes,
+        "Unmerged nodes",
+        info.unmerged_nodes,
+        "Merged weight",
+        format_number(info.merged_weight),
+        "Unmerged weight",
+        format_number(info.unmerged_weight),
+        "Total compressions",
+        info.total_compressions,
+        "Memory usage",
+        info.memory_usage
+      ]
+    end
+  end
 
   defp get_digest(store, key) do
     case Ops.get(store, key) do

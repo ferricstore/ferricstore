@@ -1,15 +1,49 @@
 defmodule Ferricstore.Transaction.Ast do
   @moduledoc false
 
-  @type queue_entry :: {binary(), [term()]} | {binary(), [term()], term()}
+  @type queue_entry :: {binary(), [term()], term()}
+
+  @non_key_list_tags ~w(
+    acl auth client cluster_demote cluster_failover cluster_join cluster_leave cluster_promote
+    command config debug hello module sandbox select slowlog
+  )a
 
   @spec normalize_entry(queue_entry()) :: {binary(), [term()], term()}
   def normalize_entry({cmd, args, ast}) when is_binary(cmd) and is_list(args),
     do: {cmd, args, ast}
 
-  def normalize_entry({cmd, args}) when is_binary(cmd) and is_list(args) do
-    normalized = normalize_command_name(cmd)
-    {normalized, args, legacy_ast(normalized, args)}
+  if Mix.env() == :test do
+    def normalize_entry({cmd, args}) when is_binary(cmd) and is_list(args) do
+      frame = encode_test_command(cmd, args)
+      parser = Module.concat([FerricstoreServer, Resp, Parser])
+
+      case apply(parser, :parse_commands, [frame]) do
+        {:ok, [{:command, parsed_cmd, parsed_args, ast, _keys}], ""} ->
+          {parsed_cmd, parsed_args, ast}
+
+        {:ok, _other, _rest} ->
+          raise ArgumentError, "invalid transaction test command frame"
+
+        {:error, reason} ->
+          raise ArgumentError, "invalid transaction test command frame: #{inspect(reason)}"
+      end
+    end
+
+    defp encode_test_command(name, args) do
+      parts = [to_command_binary(name) | Enum.map(args, &to_command_binary/1)]
+
+      IO.iodata_to_binary([
+        "*",
+        Integer.to_string(length(parts)),
+        "\r\n",
+        Enum.map(parts, fn part ->
+          ["$", Integer.to_string(byte_size(part)), "\r\n", part, "\r\n"]
+        end)
+      ])
+    end
+
+    defp to_command_binary(value) when is_binary(value), do: value
+    defp to_command_binary(value), do: to_string(value)
   end
 
   @spec command_name(queue_entry()) :: binary()
@@ -34,16 +68,82 @@ defmodule Ferricstore.Transaction.Ast do
   def namespace_first_key(ast, nil), do: ast
   def namespace_first_key(ast, ""), do: ast
 
+  def namespace_first_key({:unknown, _cmd, _args} = ast, _ns), do: ast
+  def namespace_first_key({:object, :help} = ast, _ns), do: ast
+  def namespace_first_key({:object, {:error, _reason}} = ast, _ns), do: ast
+
+  def namespace_first_key({:object, subcmd, key}, ns),
+    do: {:object, subcmd, namespace_key(key, ns)}
+
+  def namespace_first_key({tag, args} = ast, _ns)
+      when tag in @non_key_list_tags and is_list(args),
+      do: ast
+
+  def namespace_first_key({tag, _subcmd, _args} = ast, _ns)
+      when tag in @non_key_list_tags,
+      do: ast
+
+  def namespace_first_key({tag, keys}, ns)
+      when tag in [:del, :unlink, :exists, :mget, :sinter, :sunion, :sdiff, :pfcount] and
+             is_list(keys),
+      do: {tag, namespace_keys(keys, ns)}
+
+  def namespace_first_key({tag, args}, ns) when tag in [:mset, :msetnx] and is_list(args),
+    do: {tag, namespace_key_value_args(args, ns)}
+
+  def namespace_first_key({tag, keys}, ns)
+      when tag in [:sdiffstore, :sinterstore, :sunionstore, :pfmerge] and is_list(keys),
+      do: {tag, namespace_keys(keys, ns)}
+
+  def namespace_first_key({:sintercard, keys, limit}, ns) when is_list(keys),
+    do: {:sintercard, namespace_keys(keys, ns), limit}
+
+  def namespace_first_key({:bitop, op, dest, source_keys}, ns) when is_list(source_keys),
+    do: {:bitop, op, namespace_key(dest, ns), namespace_keys(source_keys, ns)}
+
+  def namespace_first_key({:copy, src, dest, replace}, ns),
+    do: {:copy, namespace_key(src, ns), namespace_key(dest, ns), replace}
+
+  def namespace_first_key({tag, src, dest}, ns) when tag in [:rename, :renamenx],
+    do: {tag, namespace_key(src, ns), namespace_key(dest, ns)}
+
+  def namespace_first_key({tag, src, dest, from_dir, to_dir}, ns) when tag in [:lmove],
+    do: {tag, namespace_key(src, ns), namespace_key(dest, ns), from_dir, to_dir}
+
+  def namespace_first_key({:blmove, src, dest, from_dir, to_dir, timeout_ms}, ns),
+    do: {:blmove, namespace_key(src, ns), namespace_key(dest, ns), from_dir, to_dir, timeout_ms}
+
+  def namespace_first_key({tag, keys, timeout_ms}, ns)
+      when tag in [:blpop, :brpop] and is_list(keys),
+      do: {tag, namespace_keys(keys, ns), timeout_ms}
+
+  def namespace_first_key({:blmpop, keys, direction, count, timeout_ms}, ns) when is_list(keys),
+    do: {:blmpop, namespace_keys(keys, ns), direction, count, timeout_ms}
+
+  def namespace_first_key({:json_mget, keys, path}, ns) when is_list(keys),
+    do: {:json_mget, namespace_keys(keys, ns), path}
+
+  def namespace_first_key({tag, dest, source_keys, tail}, ns)
+      when tag in [:cms_merge, :tdigest_merge] and is_list(source_keys),
+      do: {tag, namespace_key(dest, ns), namespace_keys(source_keys, ns), tail}
+
+  def namespace_first_key({:xread, count, block, stream_ids}, ns) when is_list(stream_ids),
+    do: {:xread, count, block, namespace_stream_ids(stream_ids, ns)}
+
+  def namespace_first_key({:xreadgroup, group, consumer, {count, block, stream_ids}}, ns)
+      when is_list(stream_ids),
+      do: {:xreadgroup, group, consumer, {count, block, namespace_stream_ids(stream_ids, ns)}}
+
   def namespace_first_key({tag, [key | rest]}, ns) when is_atom(tag) and is_binary(key),
-    do: {tag, [ns <> key | rest]}
+    do: {tag, [namespace_key(key, ns) | rest]}
 
   def namespace_first_key({tag, key}, ns) when is_atom(tag) and is_binary(key),
-    do: {tag, ns <> key}
+    do: {tag, namespace_key(key, ns)}
 
   def namespace_first_key(ast, ns) when is_tuple(ast) do
     case Tuple.to_list(ast) do
       [tag, key | rest] when is_atom(tag) and is_binary(key) ->
-        List.to_tuple([tag, ns <> key | rest])
+        List.to_tuple([tag, namespace_key(key, ns) | rest])
 
       _ ->
         ast
@@ -52,84 +152,24 @@ defmodule Ferricstore.Transaction.Ast do
 
   def namespace_first_key(ast, _ns), do: ast
 
-  defp normalize_command_name(cmd) do
-    if cmd == String.upcase(cmd), do: cmd, else: String.upcase(cmd)
+  defp namespace_key(key, ns) when is_binary(key), do: ns <> key
+  defp namespace_key(key, _ns), do: key
+
+  defp namespace_keys(keys, ns), do: Enum.map(keys, &namespace_key(&1, ns))
+
+  defp namespace_key_value_args(args, ns) do
+    args
+    |> Enum.chunk_every(2)
+    |> Enum.flat_map(fn
+      [key, value] -> [namespace_key(key, ns), value]
+      [key] -> [namespace_key(key, ns)]
+    end)
   end
 
-  defp legacy_ast("SET", [key, value]), do: {:set, key, value}
-  defp legacy_ast("SET", [key, value | opts]), do: {:set, key, value, parse_set_options(opts)}
-  defp legacy_ast("GET", [key]), do: {:get, key}
-  defp legacy_ast("DEL", keys), do: {:del, keys}
-  defp legacy_ast("INCR", [key]), do: {:incr, key}
-  defp legacy_ast("PING", []), do: :ping
-  defp legacy_ast("PING", args), do: {:ping, args}
-  defp legacy_ast("HSET", args), do: {:hset, args}
-  defp legacy_ast("HGET", [key, field]), do: {:hget, key, field}
-  defp legacy_ast("HGETALL", [key]), do: {:hgetall, key}
-  defp legacy_ast(cmd, args), do: {:raw, cmd, args}
-
-  defp parse_set_options(opts), do: parse_set_options(opts, [], false)
-
-  defp parse_set_options([], acc, _has_expiry) do
-    cond do
-      :nx in acc and :xx in acc ->
-        {:error, "ERR XX and NX options at the same time are not compatible"}
-
-      true ->
-        Enum.reverse(acc)
-    end
+  defp namespace_stream_ids(stream_ids, ns) do
+    Enum.map(stream_ids, fn
+      {key, id} -> {namespace_key(key, ns), id}
+      other -> other
+    end)
   end
-
-  defp parse_set_options([opt | rest], acc, has_expiry) when is_binary(opt) do
-    case String.upcase(opt) do
-      "NX" ->
-        parse_set_options(rest, [:nx | acc], has_expiry)
-
-      "XX" ->
-        parse_set_options(rest, [:xx | acc], has_expiry)
-
-      "GET" ->
-        parse_set_options(rest, [:get | acc], has_expiry)
-
-      "KEEPTTL" ->
-        if has_expiry do
-          {:error, "ERR syntax error"}
-        else
-          parse_set_options(rest, [:keepttl | acc], true)
-        end
-
-      "EX" ->
-        parse_set_expiry(rest, acc, has_expiry, :ex, 1_000)
-
-      "PX" ->
-        parse_set_expiry(rest, acc, has_expiry, :px, 1)
-
-      "EXAT" ->
-        parse_set_expiry(rest, acc, has_expiry, :exat, 1)
-
-      "PXAT" ->
-        parse_set_expiry(rest, acc, has_expiry, :pxat, 1)
-
-      _ ->
-        {:error, "ERR syntax error, option '#{opt}' not recognized"}
-    end
-  end
-
-  defp parse_set_options(_opts, _acc, _has_expiry), do: {:error, "ERR syntax error"}
-
-  defp parse_set_expiry([value | rest], acc, false, tag, _unit) when is_binary(value) do
-    with {parsed, ""} <- Integer.parse(value),
-         true <- parsed > 0 do
-      parse_set_options(rest, [{tag, parsed} | acc], true)
-    else
-      false -> {:error, "ERR invalid expire time in 'set' command"}
-      _ -> {:error, "ERR value is not an integer or out of range"}
-    end
-  end
-
-  defp parse_set_expiry([_value | _rest], _acc, true, _tag, _unit),
-    do: {:error, "ERR syntax error"}
-
-  defp parse_set_expiry(_rest, _acc, _has_expiry, _tag, _unit),
-    do: {:error, "ERR syntax error"}
 end

@@ -93,19 +93,7 @@ defmodule Ferricstore.Commands.Stream do
   # XLEN key
   # -------------------------------------------------------------------------
 
-  def handle("XLEN", [key], store) do
-    # `@meta_table` is local-only (not Raft-replicated), so on a follower we
-    # don't have it. Fall back to counting the stream's compound entries —
-    # those go through Router.compound_put and are present on every node.
-    # On the originating node we still consult the meta table for O(1) speed
-    # when populated; followers and post-migration always count via prefix.
-    ensure_meta_table()
-
-    case :ets.lookup(@meta_table, key) do
-      [{^key, len, _first, _last, _ms, _seq}] -> len
-      [] -> count_stream_entries(store, key)
-    end
-  end
+  def handle("XLEN", [key], store), do: xlen_key(key, store)
 
   def handle("XLEN", _args, _store) do
     {:error, "ERR wrong number of arguments for 'xlen' command"}
@@ -262,6 +250,104 @@ defmodule Ferricstore.Commands.Stream do
 
   def handle("XACK", _args, _store) do
     {:error, "ERR wrong number of arguments for 'xack' command"}
+  end
+
+  @spec handle_ast(term(), map()) :: term()
+  def handle_ast(ast, store)
+
+  def handle_ast({:xadd, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:xadd, key, {id_spec, fields, trim_opts, nomkstream}}, store)
+      when is_list(fields) and is_boolean(nomkstream) do
+    trim_opts = if trim_opts == nil, do: nil, else: trim_opts
+    do_xadd(key, id_spec, fields, trim_opts, nomkstream, store)
+  end
+
+  def handle_ast({:xlen, key}, store), do: xlen_key(key, store)
+  def handle_ast({:xrange, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:xrevrange, _key, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:xrange, key, range_start, range_end, count}, store) do
+    do_xrange(key, range_start, range_end, count, store)
+  end
+
+  def handle_ast({:xrevrange, key, range_start, range_end, count}, store) do
+    entries =
+      key
+      |> do_xrange(range_start, range_end, :infinity, store)
+      |> Enum.reverse()
+
+    case count do
+      :infinity -> entries
+      n when is_integer(n) -> Enum.take(entries, n)
+    end
+  end
+
+  def handle_ast({:xread, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:xread, count, :no_block, stream_ids}, store) do
+    do_xread(stream_ids, count, store)
+  end
+
+  def handle_ast({:xread, count, {:block, timeout_ms}, stream_ids}, store) do
+    result = do_xread(stream_ids, count, store)
+
+    if result == [] do
+      {:block, timeout_ms, stream_ids, count}
+    else
+      result
+    end
+  end
+
+  def handle_ast({:xtrim, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:xtrim, key, trim_opts}, store), do: do_trim(key, trim_opts, store)
+
+  def handle_ast({:xdel, key, ids}, store) when is_list(ids) and ids != [],
+    do: do_xdel(key, ids, store)
+
+  def handle_ast({:xinfo_stream, key}, store), do: do_xinfo_stream(key, store)
+  def handle_ast({:xinfo, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:xgroup, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:xgroup_create, key, group, id_str, mkstream}, _store)
+      when is_boolean(mkstream) do
+    do_xgroup_create(key, group, id_str, mkstream)
+  end
+
+  def handle_ast({:xreadgroup, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:xreadgroup, group, consumer, {count, :no_block, stream_ids}}, store) do
+    do_xreadgroup(group, consumer, stream_ids, count, store)
+  end
+
+  def handle_ast({:xreadgroup, group, consumer, {count, {:block, timeout_ms}, stream_ids}}, store) do
+    result = do_xreadgroup(group, consumer, stream_ids, count, store)
+
+    if result == [] do
+      {:block, timeout_ms, stream_ids, count}
+    else
+      result
+    end
+  end
+
+  def handle_ast({:xack, key, group, ids}, _store) when is_list(ids) and ids != [] do
+    do_xack(key, group, ids)
+  end
+
+  def handle_ast(_ast, _store), do: {:error, "ERR unsupported stream command AST"}
+
+  defp xlen_key(key, store) do
+    # `@meta_table` is local-only (not Raft-replicated), so on a follower we
+    # don't have it. Fall back to counting the stream's compound entries —
+    # those go through Router.compound_put and are present on every node.
+    # On the originating node we still consult the meta table for O(1) speed
+    # when populated; followers and post-migration always count via prefix.
+    ensure_meta_table()
+
+    case :ets.lookup(@meta_table, key) do
+      [{^key, len, _first, _last, _ms, _seq}] -> len
+      [] -> count_stream_entries(store, key)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -433,7 +519,7 @@ defmodule Ferricstore.Commands.Stream do
 
         # Serialize field-value pairs as Erlang binary term.
         encoded = :erlang.term_to_binary(fields)
-        Ops.put(store, compound_key, encoded, 0)
+        put_stream_entry(store, key, compound_key, encoded)
 
         # Update metadata.
         {new_len, new_first} =
@@ -568,7 +654,7 @@ defmodule Ferricstore.Commands.Stream do
       to_remove = Enum.take(all_ids, current_len - max_len)
 
       Enum.each(to_remove, fn id_str ->
-        Ops.delete(store, prefix <> id_str)
+        delete_stream_entry(store, key, prefix <> id_str)
       end)
 
       deleted_count = length(to_remove)
@@ -604,7 +690,7 @@ defmodule Ferricstore.Commands.Stream do
       end)
 
     Enum.each(to_remove, fn id_str ->
-      Ops.delete(store, prefix <> id_str)
+      delete_stream_entry(store, key, prefix <> id_str)
     end)
 
     deleted_count = length(to_remove)
@@ -650,7 +736,7 @@ defmodule Ferricstore.Commands.Stream do
         compound_key = prefix <> id_str
 
         if Ops.exists?(store, compound_key) do
-          Ops.delete(store, compound_key)
+          delete_stream_entry(store, key, compound_key)
           acc + 1
         else
           acc
@@ -1028,6 +1114,22 @@ defmodule Ferricstore.Commands.Stream do
 
   defp stream_entry_key(stream_key, id_str) do
     "X:#{stream_key}" <> @sep <> id_str
+  end
+
+  defp put_stream_entry(store, stream_key, compound_key, encoded) do
+    if Ops.has_compound?(store) do
+      Ops.compound_put(store, stream_key, compound_key, encoded, 0)
+    else
+      Ops.put(store, compound_key, encoded, 0)
+    end
+  end
+
+  defp delete_stream_entry(store, stream_key, compound_key) do
+    if Ops.has_compound?(store) do
+      Ops.compound_delete(store, stream_key, compound_key)
+    else
+      Ops.delete(store, compound_key)
+    end
   end
 
   defp stream_entries_for(store, stream_key) do

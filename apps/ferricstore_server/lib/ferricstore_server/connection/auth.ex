@@ -44,11 +44,13 @@ defmodule FerricstoreServer.Connection.Auth do
   @spec dispatch_auth([binary()], map()) ::
           {:continue, iodata(), map()} | {:quit, iodata(), map()}
   def dispatch_auth([], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}), state}
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}),
+     state}
   end
 
   def dispatch_auth([_, _, _ | _], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}), state}
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}),
+     state}
   end
 
   def dispatch_auth(args, state) do
@@ -66,7 +68,15 @@ defmodule FerricstoreServer.Connection.Auth do
     has_acl_password = acl_user != nil and acl_user.password != nil
     has_requirepass = requirepass != nil and requirepass != ""
 
-    do_dispatch_auth(has_acl_password, has_requirepass, username, password, requirepass, client_ip, state)
+    do_dispatch_auth(
+      has_acl_password,
+      has_requirepass,
+      username,
+      password,
+      requirepass,
+      client_ip,
+      state
+    )
   end
 
   # ── ACL subcommand dispatch ────────────────────────────────────────────
@@ -82,7 +92,8 @@ defmodule FerricstoreServer.Connection.Auth do
   end
 
   def dispatch_acl("SETUSER", [], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl|setuser' command"}), state}
+    {:continue,
+     Encoder.encode({:error, "ERR wrong number of arguments for 'acl|setuser' command"}), state}
   end
 
   def dispatch_acl("SETUSER", [username | rules], state) do
@@ -109,7 +120,8 @@ defmodule FerricstoreServer.Connection.Auth do
   end
 
   def dispatch_acl("DELUSER", [], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl|deluser' command"}), state}
+    {:continue,
+     Encoder.encode({:error, "ERR wrong number of arguments for 'acl|deluser' command"}), state}
   end
 
   def dispatch_acl("DELUSER", usernames, state) do
@@ -131,7 +143,9 @@ defmodule FerricstoreServer.Connection.Auth do
   end
 
   def dispatch_acl("CAT", _, state) do
-    cats = ~w(keyspace read write set sortedset list hash string bitmap hyperloglog geo stream pubsub admin fast slow blocking dangerous connection transaction server generic)
+    cats =
+      ~w(keyspace read write set sortedset list hash string bitmap hyperloglog geo stream pubsub admin fast slow blocking dangerous connection transaction server generic)
+
     {:continue, Encoder.encode(cats), state}
   end
 
@@ -147,7 +161,8 @@ defmodule FerricstoreServer.Connection.Auth do
         {:continue, Encoder.encode(entries), state}
 
       _ ->
-        {:continue, Encoder.encode({:error, "ERR value is not an integer or out of range"}), state}
+        {:continue, Encoder.encode({:error, "ERR value is not an integer or out of range"}),
+         state}
     end
   end
 
@@ -172,11 +187,15 @@ defmodule FerricstoreServer.Connection.Auth do
   end
 
   def dispatch_acl("GETUSER", [], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl|getuser' command"}), state}
+    {:continue,
+     Encoder.encode({:error, "ERR wrong number of arguments for 'acl|getuser' command"}), state}
   end
 
   def dispatch_acl(_, _, state) do
-    {:continue, Encoder.encode({:error, "ERR unknown subcommand or wrong number of arguments for 'acl' command"}), state}
+    {:continue,
+     Encoder.encode(
+       {:error, "ERR unknown subcommand or wrong number of arguments for 'acl' command"}
+     ), state}
   end
 
   # ── ACL cache ──────────────────────────────────────────────────────────
@@ -217,8 +236,11 @@ defmodule FerricstoreServer.Connection.Auth do
   def check_command_cached(:full_access, _cmd), do: :ok
 
   # Fast path: full-access user with no denied commands — skip all MapSet ops.
-  def check_command_cached(%{commands: :all, denied_commands: %MapSet{map: denied_map}, enabled: true}, _cmd)
-       when map_size(denied_map) == 0 do
+  def check_command_cached(
+        %{commands: :all, denied_commands: %MapSet{map: denied_map}, enabled: true},
+        _cmd
+      )
+      when map_size(denied_map) == 0 do
     :ok
   end
 
@@ -249,23 +271,19 @@ defmodule FerricstoreServer.Connection.Auth do
 
   @spec check_keys_cached(map() | :full_access | nil, binary(), [binary()]) ::
           :ok | {:error, binary()}
-  def check_keys_cached(nil, _cmd, _args), do: :ok
-  def check_keys_cached(:full_access, _cmd, _args), do: :ok
-  def check_keys_cached(%{keys: :all}, _cmd, _args), do: :ok
+  def check_keys_cached(nil, _cmd, _keys), do: :ok
+  def check_keys_cached(:full_access, _cmd, _keys), do: :ok
+  def check_keys_cached(%{keys: :all}, _cmd, _keys), do: :ok
 
-  def check_keys_cached(%{keys: patterns}, cmd, args) do
-    alias Ferricstore.Commands.Catalog
-
-    case Catalog.get_keys_upper(cmd, args) do
-      {:ok, []} ->
+  def check_keys_cached(%{keys: patterns}, cmd, keys) when is_list(keys) do
+    case keys do
+      [] ->
         :ok
 
-      {:ok, keys} ->
-        access_type = command_access_type(cmd)
-        check_all_keys(keys, access_type, patterns)
-
-      {:error, _} ->
-        :ok
+      keys ->
+        cmd
+        |> command_access_type()
+        |> then(&check_all_keys(keys, &1, patterns))
     end
   end
 
@@ -350,7 +368,9 @@ defmodule FerricstoreServer.Connection.Auth do
       {:ok, ^username} ->
         AuditLog.log(:auth_success, %{username: username, client_ip: client_ip})
         new_cache = build_acl_cache(username)
-        {:continue, Encoder.encode(:ok), %{state | authenticated: true, username: username, acl_cache: new_cache}}
+
+        {:continue, Encoder.encode(:ok),
+         %{state | authenticated: true, username: username, acl_cache: new_cache}}
 
       {:error, reason} ->
         AuditLog.log(:auth_failure, %{username: username, client_ip: client_ip})
@@ -362,8 +382,10 @@ defmodule FerricstoreServer.Connection.Auth do
 
   defp do_dispatch_auth(false, false, _user, _pass, _rp, _ip, state) do
     {:continue,
-     Encoder.encode({:error, "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?"}),
-     state}
+     Encoder.encode(
+       {:error,
+        "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?"}
+     ), state}
   end
 
   defp do_dispatch_auth(true, _has_rp, username, password, _rp, client_ip, state) do
@@ -374,10 +396,15 @@ defmodule FerricstoreServer.Connection.Auth do
     if constant_time_equal?(password, requirepass) do
       AuditLog.log(:auth_success, %{username: "default", client_ip: client_ip})
       new_cache = build_acl_cache("default")
-      {:continue, Encoder.encode(:ok), %{state | authenticated: true, username: "default", acl_cache: new_cache}}
+
+      {:continue, Encoder.encode(:ok),
+       %{state | authenticated: true, username: "default", acl_cache: new_cache}}
     else
       AuditLog.log(:auth_failure, %{username: "default", client_ip: client_ip})
-      {:continue, Encoder.encode({:error, "WRONGPASS invalid username-password pair or user is disabled."}), state}
+
+      {:continue,
+       Encoder.encode({:error, "WRONGPASS invalid username-password pair or user is disabled."}),
+       state}
     end
   end
 

@@ -16,6 +16,49 @@ defmodule Ferricstore.Commands.CMS do
   # Public command handler
   # -------------------------------------------------------------------
 
+  @spec handle_ast(term(), map()) :: term()
+  def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+  def handle_ast({tag, _key, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+
+  def handle_ast({:cms_initbydim, key, width, depth}, store) do
+    with :ok <- check_not_exists(key, store) do
+      result = do_prob_write(store, {:cms_create, key, width, depth})
+
+      case result do
+        {:ok, _} -> :ok
+        :ok -> :ok
+        other -> other
+      end
+    end
+  end
+
+  def handle_ast({:cms_initbyprob, key, error, prob}, store) do
+    width = ceil(:math.exp(1) / error)
+    depth = ceil(:math.log(1.0 / prob))
+    handle_ast({:cms_initbydim, key, width, depth}, store)
+  end
+
+  def handle_ast({:cms_incrby, key, pairs}, store) do
+    with :ok <- ProbType.check_expected(key, :cms, store) do
+      result = do_prob_write(store, {:cms_incrby, key, pairs})
+      normalize_result(result)
+    end
+  end
+
+  def handle_ast({:cms_query, args}, store), do: cms_query_args(args, store)
+  def handle_ast({:cms_info, args}, store), do: cms_info_args(args, store)
+
+  def handle_ast({:cms_merge, dst, src_keys, weights}, store) do
+    with :ok <- ProbType.check_expected(dst, :cms, store),
+         :ok <- check_source_types(src_keys, store),
+         {:ok, first_w, first_d} <- get_first_sketch_dims(store, src_keys),
+         :ok <- validate_sketch_dims(store, src_keys, first_w, first_d) do
+      create_params = %{width: first_w, depth: first_d}
+      result = do_prob_write(store, {:cms_merge, dst, src_keys, weights, create_params})
+      normalize_result(result)
+    end
+  end
+
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
 
@@ -67,7 +110,28 @@ defmodule Ferricstore.Commands.CMS do
     do: {:error, "ERR wrong number of arguments for 'cms.incrby' command"}
 
   # CMS.QUERY — local stateless pread (async)
-  def handle("CMS.QUERY", [key | elements], store) when elements != [] do
+  def handle("CMS.QUERY", args, store), do: cms_query_args(args, store)
+
+  def handle("CMS.MERGE", [dst, numkeys_str | rest], store) do
+    with {:ok, numkeys} <- parse_pos_integer(numkeys_str, "numkeys"),
+         {:ok, src_keys, weights} <- parse_merge_args(rest, numkeys),
+         :ok <- ProbType.check_expected(dst, :cms, store),
+         :ok <- check_source_types(src_keys, store),
+         {:ok, first_w, first_d} <- get_first_sketch_dims(store, src_keys),
+         :ok <- validate_sketch_dims(store, src_keys, first_w, first_d) do
+      create_params = %{width: first_w, depth: first_d}
+      result = do_prob_write(store, {:cms_merge, dst, src_keys, weights, create_params})
+      normalize_result(result)
+    end
+  end
+
+  def handle("CMS.MERGE", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'cms.merge' command"}
+
+  # CMS.INFO — local stateless pread (async)
+  def handle("CMS.INFO", args, store), do: cms_info_args(args, store)
+
+  defp cms_query_args([key | elements], store) when elements != [] do
     path = prob_path(store, key, "cms")
 
     case await_nif(fn proxy, corr_id ->
@@ -87,27 +151,10 @@ defmodule Ferricstore.Commands.CMS do
     end
   end
 
-  def handle("CMS.QUERY", _args, _store),
+  defp cms_query_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'cms.query' command"}
 
-  def handle("CMS.MERGE", [dst, numkeys_str | rest], store) do
-    with {:ok, numkeys} <- parse_pos_integer(numkeys_str, "numkeys"),
-         {:ok, src_keys, weights} <- parse_merge_args(rest, numkeys),
-         :ok <- ProbType.check_expected(dst, :cms, store),
-         :ok <- check_source_types(src_keys, store),
-         {:ok, first_w, first_d} <- get_first_sketch_dims(store, src_keys),
-         :ok <- validate_sketch_dims(store, src_keys, first_w, first_d) do
-      create_params = %{width: first_w, depth: first_d}
-      result = do_prob_write(store, {:cms_merge, dst, src_keys, weights, create_params})
-      normalize_result(result)
-    end
-  end
-
-  def handle("CMS.MERGE", _args, _store),
-    do: {:error, "ERR wrong number of arguments for 'cms.merge' command"}
-
-  # CMS.INFO — local stateless pread (async)
-  def handle("CMS.INFO", [key], store) do
+  defp cms_info_args([key], store) do
     path = prob_path(store, key, "cms")
 
     case await_nif(fn proxy, corr_id ->
@@ -127,7 +174,7 @@ defmodule Ferricstore.Commands.CMS do
     end
   end
 
-  def handle("CMS.INFO", _args, _store),
+  defp cms_info_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'cms.info' command"}
 
   # ---------------------------------------------------------------------------

@@ -75,6 +75,7 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.HLC
   alias Ferricstore.Store.{BitcaskWriter, ColdRead, LFU, ListOps, Promotion, Router, ValueCodec}
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
+  alias Ferricstore.Transaction.Ast, as: TxAst
 
   @default_release_cursor_interval 20_000
   @default_max_active_file_size 256 * 1024 * 1024
@@ -387,11 +388,14 @@ defmodule Ferricstore.Raft.StateMachine do
 
             results =
               try do
-                Enum.map(queue, fn {cmd, args} ->
-                  namespaced_args = namespace_args(args, sandbox_namespace)
+                Enum.map(queue, fn entry ->
+                  ast =
+                    entry
+                    |> TxAst.command_ast()
+                    |> TxAst.namespace_first_key(sandbox_namespace)
 
                   try do
-                    Dispatcher.dispatch(cmd, namespaced_args, store)
+                    Dispatcher.dispatch_ast(ast, store)
                   catch
                     :exit, {:noproc, _} ->
                       {:error, "ERR server not ready, shard process unavailable"}
@@ -558,53 +562,6 @@ defmodule Ferricstore.Raft.StateMachine do
   # Also sets the type metadata atomically if absent (first write to the key).
   def apply(meta, {:zincrby, key, increment, member}, state) do
     apply_pending_with_time(meta, state, fn -> do_zincrby(state, key, increment, member) end)
-  end
-
-  # Generic JSON RMW — dispatches to Ferricstore.Commands.Json.handle with
-  # a state-machine-scoped store. Covers JSON.SET / JSON.DEL(path) /
-  # JSON.NUMINCRBY / JSON.ARRAPPEND / JSON.ARRPOP / JSON.ARRINSERT /
-  # JSON.STRAPPEND / JSON.TOGGLE / JSON.CLEAR / JSON.MERGE. Read-only
-  # ops (JSON.GET, JSON.TYPE, etc.) still run in the caller; only RMW
-  # goes through Raft.
-  def apply(meta, {:json_op, cmd, args}, state) do
-    apply_pending_with_time(meta, state, fn ->
-      Ferricstore.Commands.Json.handle(cmd, args, build_sm_store(state))
-    end)
-  end
-
-  # Atomic HyperLogLog RMW — PFADD reads HLL blob, merges hashed elements,
-  # writes back. PFMERGE reads N sources + destination, writes merged blob.
-  def apply(meta, {:hll_op, cmd, args}, state) do
-    apply_pending_with_time(meta, state, fn ->
-      Ferricstore.Commands.HyperLogLog.handle(cmd, args, build_sm_store(state))
-    end)
-  end
-
-  # Generic bitmap RMW — covers BITOP (merge N sources into destination) and
-  # BITFIELD (multi-subcommand RMW on one bitmap). SETBIT has its own apply
-  # clause above for the hot-path single-bit case.
-  def apply(meta, {:bitmap_op, cmd, args}, state) do
-    apply_pending_with_time(meta, state, fn ->
-      Ferricstore.Commands.Bitmap.handle(cmd, args, build_sm_store(state))
-    end)
-  end
-
-  # Geo RMW — GEOADD merges members into the zset blob; GEOSEARCHSTORE
-  # writes a filtered subset to destination. Read-only ops (GEOPOS / GEODIST
-  # / GEOHASH / GEOSEARCH) don't go through this path.
-  def apply(meta, {:geo_op, cmd, args}, state) do
-    apply_pending_with_time(meta, state, fn ->
-      Ferricstore.Commands.Geo.handle(cmd, args, build_sm_store(state))
-    end)
-  end
-
-  # TDigest RMW — TDIGEST.ADD/RESET/MERGE/CREATE. The old latch-based
-  # serialization (with_tdigest_latch in ferricstore.ex) had subtle races
-  # with orphan cleanup; state-machine dispatch removes the latch entirely.
-  def apply(meta, {:tdigest_op, cmd, args}, state) do
-    apply_pending_with_time(meta, state, fn ->
-      Ferricstore.Commands.TDigest.handle(cmd, args, build_sm_store(state))
-    end)
   end
 
   def apply(meta, {:cas, key, expected, new_value, ttl_ms}, state) do
@@ -1572,8 +1529,8 @@ defmodule Ferricstore.Raft.StateMachine do
         nil
       else
         case sm_tx_pending_meta(key) do
-          {value, _exp} -> value
-          nil -> cross_shard_ets_read(ctx, key)
+          {value, _exp} -> normalize_get_value(value)
+          nil -> ctx |> cross_shard_ets_read(key) |> normalize_get_value()
         end
       end
     end
@@ -1843,11 +1800,6 @@ defmodule Ferricstore.Raft.StateMachine do
     }
   end
 
-  defp namespace_args(args, nil), do: args
-  defp namespace_args([], _ns), do: []
-  defp namespace_args([key | rest], ns) when is_binary(key), do: [ns <> key | rest]
-  defp namespace_args(args, _ns), do: args
-
   defp sm_tx_pending_meta(key) do
     pending = Process.get(:tx_pending_values, %{})
 
@@ -1867,6 +1819,14 @@ defmodule Ferricstore.Raft.StateMachine do
         nil
     end
   end
+
+  defp normalize_get_value(nil), do: nil
+  defp normalize_get_value(value) when is_integer(value), do: Integer.to_string(value)
+
+  defp normalize_get_value(value) when is_float(value),
+    do: Ferricstore.Store.ValueCodec.format_float(value)
+
+  defp normalize_get_value(value), do: value
 
   defp sm_tx_put_pending(key, value, expire_at_ms) do
     pending = Process.get(:tx_pending_values, %{})
@@ -2464,40 +2424,6 @@ defmodule Ferricstore.Raft.StateMachine do
     ets_has?(state.ets, Ferricstore.Store.CompoundKey.zset_member(key, member))
   end
 
-  # JSON ops: first arg is always the key (JSON.SET key path value, etc.).
-  defp async_key_present?(state, {:json_op, _cmd, [key | _]}) do
-    ets_has?(state.ets, key)
-  end
-
-  # HLL ops: first arg is always the key (PFADD key ..., PFMERGE dest ...).
-  defp async_key_present?(state, {:hll_op, _cmd, [key | _]}) do
-    ets_has?(state.ets, key)
-  end
-
-  # Bitmap ops: BITFIELD has the key as the first arg; BITOP has [op, destkey | srcs].
-  defp async_key_present?(state, {:bitmap_op, "BITOP", [_op, destkey | _]}) do
-    ets_has?(state.ets, destkey)
-  end
-
-  defp async_key_present?(state, {:bitmap_op, _cmd, [key | _]}) when is_binary(key) do
-    ets_has?(state.ets, key)
-  end
-
-  # Geo ops: GEOADD has key first; GEOSEARCHSTORE has [dest, source | ...]
-  # — dest is the written key.
-  defp async_key_present?(state, {:geo_op, "GEOSEARCHSTORE", [dest | _]}) do
-    ets_has?(state.ets, dest)
-  end
-
-  defp async_key_present?(state, {:geo_op, _cmd, [key | _]}) when is_binary(key) do
-    ets_has?(state.ets, key)
-  end
-
-  # TDigest ops: first arg is always the key.
-  defp async_key_present?(state, {:tdigest_op, _cmd, [key | _]}) when is_binary(key) do
-    ets_has?(state.ets, key)
-  end
-
   # List ops check the canonical type marker written by the origin before
   # submit. On replicas the marker is absent, so they apply the inner op.
   defp async_key_present?(state, {:list_op, key, _op}) do
@@ -2773,26 +2699,6 @@ defmodule Ferricstore.Raft.StateMachine do
     do_zincrby(state, key, increment, member)
   end
 
-  defp apply_single(state, {:json_op, cmd, args}) do
-    Ferricstore.Commands.Json.handle(cmd, args, build_sm_store(state))
-  end
-
-  defp apply_single(state, {:hll_op, cmd, args}) do
-    Ferricstore.Commands.HyperLogLog.handle(cmd, args, build_sm_store(state))
-  end
-
-  defp apply_single(state, {:bitmap_op, cmd, args}) do
-    Ferricstore.Commands.Bitmap.handle(cmd, args, build_sm_store(state))
-  end
-
-  defp apply_single(state, {:geo_op, cmd, args}) do
-    Ferricstore.Commands.Geo.handle(cmd, args, build_sm_store(state))
-  end
-
-  defp apply_single(state, {:tdigest_op, cmd, args}) do
-    Ferricstore.Commands.TDigest.handle(cmd, args, build_sm_store(state))
-  end
-
   defp apply_single(state, {:cas, key, expected, new_value, ttl_ms}) do
     do_cas(state, key, expected, new_value, ttl_ms)
   end
@@ -3045,8 +2951,15 @@ defmodule Ferricstore.Raft.StateMachine do
          expire_at_ms
        ) do
     case :ets.lookup(state.ets, key) do
-      [{^key, current_value, _expire_at_ms, _lfu, :pending, _off, _value_size}] ->
-        pending_origin_replay_decision(inner_cmd, current_value, expected_value)
+      [{^key, current_value, current_expire_at_ms, _lfu, :pending, _off, _value_size}] ->
+        pending_origin_replay_decision(
+          inner_cmd,
+          current_value,
+          current_expire_at_ms,
+          before_value,
+          before_expire_at_ms,
+          expected_value
+        )
 
       _ ->
         committed_origin_replay_decision(
@@ -3090,15 +3003,53 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp pending_newer_origin_replay_decision(state, key, inner_cmd, expected_value) do
     case :ets.lookup(state.ets, key) do
-      [{^key, current_value, _expire_at_ms, _lfu, :pending, _off, _value_size}] ->
-        pending_origin_replay_decision(inner_cmd, current_value, expected_value)
+      [{^key, current_value, current_expire_at_ms, _lfu, :pending, _off, _value_size}] ->
+        pending_origin_replay_decision(
+          inner_cmd,
+          current_value,
+          current_expire_at_ms,
+          current_value,
+          current_expire_at_ms,
+          expected_value
+        )
 
       _ ->
         :newer_local_value
     end
   end
 
-  defp pending_origin_replay_decision(inner_cmd, current_value, expected_value) do
+  defp pending_origin_replay_decision(
+         {:delete, _key},
+         current_value,
+         current_expire_at_ms,
+         before_value,
+         before_expire_at_ms,
+         nil
+       )
+       when current_value != before_value or current_expire_at_ms != before_expire_at_ms do
+    :newer_local_value
+  end
+
+  defp pending_origin_replay_decision(
+         {:getdel, _key},
+         current_value,
+         current_expire_at_ms,
+         before_value,
+         before_expire_at_ms,
+         nil
+       )
+       when current_value != before_value or current_expire_at_ms != before_expire_at_ms do
+    :newer_local_value
+  end
+
+  defp pending_origin_replay_decision(
+         inner_cmd,
+         current_value,
+         _current_expire_at_ms,
+         _before_value,
+         _before_expire_at_ms,
+         expected_value
+       ) do
     if origin_command_provably_in_current_value?(inner_cmd, current_value, expected_value) do
       :newer_local_value
     else
@@ -4662,172 +4613,6 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  # Builds a single-shard store that satisfies the command-handler store
-  # interface (get/put/delete/exists?/keys). Writes always go through
-  # `do_put` on the LOCAL shard (the one Raft routed this command to).
-  # Reads prefer local ETS but fall back to `Router.get` — reads are
-  # side-effect-free and safe from any process, which lets commands like
-  # PFMERGE read source keys that hash to other shards.
-  #
-  # Intended for RMW commands migrated into Raft (JSON, PFADD, BITOP, etc.).
-  # All writes go through do_put so they participate in with_pending_writes
-  # batching.
-  defp build_sm_store(state) do
-    local_read = fn key ->
-      case do_get(state, key) do
-        nil ->
-          # Not on this shard — fall back to cross-shard Router.get if we
-          # have an instance_ctx. This covers PFMERGE-style multi-source
-          # reads. If no ctx (uncommon in production) try the default
-          # instance as a fallback so bitop/pfmerge still work in tests
-          # that don't thread instance_ctx through to state machine config.
-          case instance_ctx_for_state(state) do
-            nil -> nil
-            c -> Router.get(c, key)
-          end
-
-        v ->
-          v
-      end
-    end
-
-    %{
-      get: local_read,
-      get_meta: fn key ->
-        case do_get_meta(state, key) do
-          nil -> nil
-          {v, exp} -> {v, exp}
-        end
-      end,
-      batch_get: fn keys -> sm_store_batch_get(state, keys) end,
-      put: fn key, value, expire_at_ms ->
-        do_put(state, key, value, expire_at_ms)
-        :ok
-      end,
-      delete: fn key ->
-        do_delete(state, key)
-        :ok
-      end,
-      exists?: fn key ->
-        if live_key?(state, key) do
-          true
-        else
-          case instance_ctx_for_state(state) do
-            nil -> false
-            ctx -> Router.exists?(ctx, key)
-          end
-        end
-      end,
-      keys: fn ->
-        :ets.select(state.ets, [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}])
-      end,
-      # Compound ops: redis_key and compound_key live on the same shard by
-      # design, so treat them identically to plain get/put/delete.
-      compound_get: fn rk, ck ->
-        case sm_store_compound_get(state, rk, ck) do
-          nil ->
-            case instance_ctx_for_state(state) do
-              nil -> nil
-              ctx -> Router.compound_get(ctx, rk, ck)
-            end
-
-          value ->
-            value
-        end
-      end,
-      compound_get_meta: fn rk, ck ->
-        case sm_store_compound_get_meta(state, rk, ck) do
-          nil -> nil
-          {v, exp} -> {v, exp}
-        end
-      end,
-      compound_batch_get: fn rk, compound_keys ->
-        sm_store_compound_batch_get(state, rk, compound_keys)
-      end,
-      compound_batch_get_meta: fn rk, compound_keys ->
-        sm_store_compound_batch_get_meta(state, rk, compound_keys)
-      end,
-      compound_put: fn _rk, ck, value, expire_at_ms ->
-        do_put(state, ck, value, expire_at_ms)
-        :ok
-      end,
-      compound_delete: fn _rk, ck ->
-        do_delete(state, ck)
-        :ok
-      end,
-      compound_scan: fn rk, prefix ->
-        local_keys = sm_store_compound_local_keys(state, prefix)
-
-        if local_keys != [] do
-          sm_store_compound_scan(state, rk, prefix, local_keys)
-        else
-          case instance_ctx_for_state(state) do
-            nil ->
-              []
-
-            ctx ->
-              Router.compound_scan(ctx, rk, prefix)
-          end
-        end
-      end,
-      compound_count: fn rk, prefix ->
-        local_count =
-          state
-          |> sm_store_compound_local_keys(prefix)
-          |> Enum.count(fn key -> sm_store_live_local_key?(state, key) end)
-
-        if local_count > 0 do
-          local_count
-        else
-          case instance_ctx_for_state(state) do
-            nil ->
-              0
-
-            ctx ->
-              Router.compound_count(ctx, rk, prefix)
-          end
-        end
-      end,
-      compound_delete_prefix: fn _rk, prefix ->
-        keys =
-          :ets.select(
-            state.ets,
-            [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
-          )
-          |> Enum.filter(fn k -> String.starts_with?(k, prefix) end)
-
-        Enum.each(keys, fn k -> do_delete(state, k) end)
-        :ok
-      end
-    }
-  end
-
-  defp sm_store_compound_local_keys(state, prefix) do
-    prefix_size = byte_size(prefix)
-
-    :ets.select(state.ets, [
-      {{:"$1", :_, :_, :_, :_, :_, :_},
-       [
-         {:andalso, {:is_binary, :"$1"},
-          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_size},
-           {:==, {:binary_part, :"$1", 0, prefix_size}, prefix}}}
-       ], [:"$1"]}
-    ])
-  end
-
-  defp sm_store_compound_get(state, redis_key, compound_key) do
-    case sm_store_compound_path_fun(state, redis_key, compound_key) do
-      nil ->
-        do_get(state, compound_key)
-
-      path_fun ->
-        case sm_store_batch_get(state, [compound_key], path_fun) do
-          [value] -> value
-          _ -> nil
-        end
-    end
-  end
-
   defp sm_store_compound_get_meta(state, redis_key, compound_key) do
     case sm_store_compound_path_fun(state, redis_key, compound_key) do
       nil ->
@@ -4847,58 +4632,12 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp sm_store_compound_scan(state, redis_key, prefix, local_keys) do
-    path_fun = sm_store_compound_path_fun(state, redis_key, prefix) || (&sm_file_path/2)
-    sm_store_compound_scan(state, local_keys, path_fun)
-  end
-
-  defp sm_store_compound_scan(state, local_keys, path_fun) do
-    values = sm_store_batch_get(state, local_keys, path_fun)
-
-    local_keys
-    |> Enum.zip(values)
-    |> Enum.flat_map(fn
-      {key, value} when is_binary(value) -> [{sm_prefix_field(key), value}]
-      {_key, _value} -> []
-    end)
-    |> Enum.sort_by(fn {field, _value} -> field end)
-  end
-
   defp sm_store_compound_path_fun(state, redis_key, compound_key_or_prefix) do
     case promoted_compound_path(state, redis_key, compound_key_or_prefix) do
       nil -> nil
       dedicated_path -> fn _state, fid -> sm_file_path_from_path(dedicated_path, fid) end
     end
   end
-
-  defp sm_store_live_local_key?(state, key) do
-    now = apply_now_ms()
-
-    case :ets.lookup(state.ets, key) do
-      [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-        true
-
-      [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-        true
-
-      [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-        true
-
-      [{^key, nil, exp, _lfu, fid, off, vsize}]
-      when exp > now and valid_cold_location(fid, off, vsize) ->
-        true
-
-      [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
-        track_keydir_binary_remove_known(state, key, value)
-        :ets.delete(state.ets, key)
-        false
-
-      _ ->
-        false
-    end
-  end
-
-  defp sm_store_batch_get(state, keys), do: sm_store_batch_get(state, keys, &sm_file_path/2)
 
   defp sm_store_batch_get(state, keys, path_fun) do
     {local_results, cold_reads, remote_entries} =
@@ -4995,137 +4734,6 @@ defmodule Ferricstore.Raft.StateMachine do
     remote_values = Router.batch_get(ctx, remote_keys)
 
     merge_indexed_values(results, entries, remote_values)
-  end
-
-  defp sm_store_compound_batch_get(state, redis_key, compound_keys) do
-    state
-    |> sm_store_compound_batch_get_meta(redis_key, compound_keys)
-    |> Enum.map(fn
-      {value, _exp} -> value
-      nil -> nil
-    end)
-  end
-
-  defp sm_store_compound_batch_get_meta(_state, _redis_key, []), do: []
-
-  defp sm_store_compound_batch_get_meta(state, redis_key, compound_keys) do
-    path_fun =
-      sm_store_compound_path_fun(state, redis_key, List.first(compound_keys)) || (&sm_file_path/2)
-
-    {local_results, cold_reads, remote_keys} =
-      compound_keys
-      |> Enum.with_index()
-      |> Enum.reduce({%{}, [], []}, fn {compound_key, index}, {results, cold, remote} ->
-        sm_store_collect_compound_batch_get_meta(
-          state,
-          compound_key,
-          index,
-          results,
-          cold,
-          remote
-        )
-      end)
-
-    local_results =
-      sm_store_read_cold_meta_batch(state, local_results, Enum.reverse(cold_reads), path_fun)
-
-    results =
-      case {Enum.reverse(remote_keys), instance_ctx_for_state(state)} do
-        {[], _ctx} ->
-          local_results
-
-        {_remote, nil} ->
-          local_results
-
-        {remote, ctx} ->
-          remote_compound_keys = Enum.map(remote, fn {_index, compound_key} -> compound_key end)
-          remote_values = Router.compound_batch_get_meta(ctx, redis_key, remote_compound_keys)
-
-          remote
-          |> Enum.zip(remote_values)
-          |> Enum.reduce(local_results, fn
-            {{index, _compound_key}, {value, exp}}, acc ->
-              Map.put(acc, index, {value, exp})
-
-            {_remote_entry, _missing}, acc ->
-              acc
-          end)
-      end
-
-    compound_keys
-    |> Enum.with_index()
-    |> Enum.map(fn {_compound_key, index} -> Map.get(results, index) end)
-  end
-
-  defp sm_store_collect_compound_batch_get_meta(state, key, index, results, cold, remote) do
-    case sm_pending_value_meta(key) do
-      {:hit, value, exp} ->
-        {Map.put(results, index, {value, exp}), cold, remote}
-
-      :miss ->
-        sm_store_collect_committed_batch_get_meta(state, key, index, results, cold, remote)
-    end
-  end
-
-  defp sm_store_collect_committed_batch_get_meta(state, key, index, results, cold, remote) do
-    now = apply_now_ms()
-
-    case :ets.lookup(state.ets, key) do
-      [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-        {Map.put(results, index, {value, 0}), cold, remote}
-
-      [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-        {results, [{index, key, 0, fid, off} | cold], remote}
-
-      [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-        {Map.put(results, index, {value, exp}), cold, remote}
-
-      [{^key, nil, exp, _lfu, fid, off, vsize}]
-      when exp > now and valid_cold_location(fid, off, vsize) ->
-        {results, [{index, key, exp, fid, off} | cold], remote}
-
-      [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
-        track_keydir_binary_remove_known(state, key, value)
-        :ets.delete(state.ets, key)
-        {results, cold, [{index, key} | remote]}
-
-      [] ->
-        {results, cold, [{index, key} | remote]}
-    end
-  rescue
-    ArgumentError ->
-      {results, cold, [{index, key} | remote]}
-  end
-
-  defp sm_store_read_cold_meta_batch(_state, results, [], _path_fun), do: results
-
-  defp sm_store_read_cold_meta_batch(state, results, cold_reads, path_fun) do
-    locations =
-      Enum.map(cold_reads, fn {_index, key, _exp, fid, off} ->
-        {path_fun.(state, fid), off, key}
-      end)
-
-    values =
-      locations
-      |> Ferricstore.Store.ColdRead.pread_batch_keyed(@cold_read_timeout_ms)
-      |> normalize_state_machine_batch_values(length(cold_reads))
-
-    emit_state_machine_batch_cold_errors(cold_reads, values, fn {_index, _key, _exp, fid, _off} ->
-      path_fun.(state, fid)
-    end)
-
-    cold_reads
-    |> Enum.zip(values)
-    |> Enum.reduce(results, fn
-      {{index, key, exp, fid, off}, value}, acc when is_binary(value) ->
-        ets_value = value_for_ets(value, hot_cache_threshold(state))
-        track_keydir_binary_warm(state, ets_value)
-        :ets.insert(state.ets, {key, ets_value, exp, LFU.initial(), fid, off, byte_size(value)})
-        Map.put(acc, index, {value, exp})
-
-      {_read, _value}, acc ->
-        acc
-    end)
   end
 
   defp merge_indexed_values(results, entries, values) do

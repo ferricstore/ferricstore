@@ -237,20 +237,15 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
   # ===========================================================================
 
   describe "BLPOP on multiple keys -- first non-empty wins" do
-    test "non-blocking: returns nil when list data is in compound keys (not store.get)" do
+    test "non-blocking: returns value from first non-empty compound list key" do
       store = MockStore.make()
       # k2 has data, k1 and k3 are empty
       List.handle("RPUSH", ["k2", "from_k2"], store)
       List.handle("RPUSH", ["k3", "from_k3"], store)
 
-      # The non-blocking handle/3 uses store.get which only finds plain string
-      # keys, not compound-key-based lists. This returns nil because list data
-      # is stored via compound keys (LM:, L: prefixes).
-      # The connection-level dispatch correctly uses LPOP for blocking ops.
       result = Blocking.handle("BLPOP", ["k1", "k2", "k3", "1"], store)
 
-      # Known: non-blocking handle can't see compound-key lists via store.get
-      assert result == nil
+      assert result == ["k2", "from_k2"]
     end
 
     test "returns value from first non-empty key immediately over TCP", context do

@@ -73,16 +73,7 @@ defmodule Ferricstore.Commands.Strings do
     {:error, "ERR wrong number of arguments for 'type' command"}
   end
 
-  def handle("GET", [""], _store), do: {:error, "ERR empty key"}
-  def handle("GET", [key], _store) when byte_size(key) > 65_535, do: {:error, "ERR key too large"}
-
-  def handle("GET", [key], store) do
-    case read_string_value(key, store) do
-      {:value, value} -> value
-      :missing -> nil
-      @wrongtype_error -> @wrongtype_error
-    end
-  end
+  def handle("GET", [key], store), do: get_key(key, store)
 
   def handle("GET", _args, _store) do
     {:error, "ERR wrong number of arguments for 'get' command"}
@@ -99,77 +90,49 @@ defmodule Ferricstore.Commands.Strings do
     {:error, "ERR wrong number of arguments for 'set' command"}
   end
 
+  @set_opts_default %{
+    expire_at_ms: 0,
+    nx: false,
+    xx: false,
+    get: false,
+    keepttl: false,
+    has_expiry: false
+  }
+
   def handle("DEL", [], _store) do
     {:error, "ERR wrong number of arguments for 'del' command"}
   end
 
-  def handle("DEL", keys, store) do
-    keys
-    |> Enum.reduce_while({:ok, 0}, fn key, {:ok, acc} ->
-      case do_del_key(key, store) do
-        true -> {:cont, {:ok, acc + 1}}
-        false -> {:cont, {:ok, acc}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, count} -> count
-      {:error, _reason} = error -> error
-    end
-  end
+  def handle("DEL", keys, store), do: del_keys(keys, store)
 
   def handle("EXISTS", [], _store) do
     {:error, "ERR wrong number of arguments for 'exists' command"}
   end
 
-  def handle("EXISTS", keys, store) do
-    Enum.reduce(keys, 0, fn key, acc ->
-      exists = Ops.exists?(store, key)
-      # Also check TypeRegistry for compound-key-based data structures
-      # (lists, hashes, sets, zsets) that don't use the plain key store.
-      exists =
-        exists or
-          (Ops.has_compound?(store) and TypeRegistry.get_type(key, store) != "none")
-
-      if exists, do: acc + 1, else: acc
-    end)
-  end
+  def handle("EXISTS", keys, store), do: exists_keys(keys, store)
 
   def handle("MGET", [], _store) do
     {:error, "ERR wrong number of arguments for 'mget' command"}
   end
 
-  def handle("MGET", keys, store), do: Ops.batch_get(store, keys)
+  def handle("MGET", keys, store), do: mget_keys(keys, store)
 
   def handle("MSET", [], _store) do
     {:error, "ERR wrong number of arguments for 'mset' command"}
   end
 
-  def handle("MSET", args, store) do
-    if even_length?(args) do
-      # Direct recursive processing avoids chunked enumeration intermediate lists.
-      case mset_validate(args) do
-        :ok ->
-          mset_exec(args, store)
-
-        {:error, _} = err ->
-          err
-      end
-    else
-      {:error, "ERR wrong number of arguments for 'mset' command"}
-    end
-  end
+  def handle("MSET", args, store), do: mset_args(args, store)
 
   # ---------------------------------------------------------------------------
   # INCR / DECR / INCRBY / DECRBY
   # ---------------------------------------------------------------------------
 
-  def handle("INCR", [key], store), do: incr_string_key(key, 1, store)
+  def handle("INCR", [key], store), do: incr_key(key, store)
 
   def handle("INCR", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'incr' command"}
 
-  def handle("DECR", [key], store), do: incr_string_key(key, -1, store)
+  def handle("DECR", [key], store), do: decr_key(key, store)
 
   def handle("DECR", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'decr' command"}
@@ -217,22 +180,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("INCRBYFLOAT", [key, delta_str], store) do
     case parse_float_arg(delta_str) do
       {:ok, delta} ->
-        incr_result =
-          case ensure_string_key(key, store) do
-            :ok -> Ops.incr_float(store, key, delta)
-            @wrongtype_error -> @wrongtype_error
-          end
-
-        case incr_result do
-          {:ok, new_val} when is_float(new_val) ->
-            Ferricstore.Store.ValueCodec.format_float(new_val)
-
-          {:ok, new_str} when is_binary(new_str) ->
-            new_str
-
-          {:error, _} = err ->
-            err
-        end
+        incr_string_key_float(key, delta, store)
 
       :error ->
         {:error, "ERR value is not a valid float"}
@@ -246,18 +194,7 @@ defmodule Ferricstore.Commands.Strings do
   # APPEND
   # ---------------------------------------------------------------------------
 
-  def handle("APPEND", [key, value], store) do
-    case ensure_string_key(key, store) do
-      :ok ->
-        case Ops.append(store, key, value) do
-          {:ok, new_len} -> new_len
-          {:error, _} = err -> err
-        end
-
-      @wrongtype_error ->
-        @wrongtype_error
-    end
-  end
+  def handle("APPEND", [key, value], store), do: append_value(key, value, store)
 
   def handle("APPEND", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'append' command"}
@@ -266,13 +203,7 @@ defmodule Ferricstore.Commands.Strings do
   # STRLEN
   # ---------------------------------------------------------------------------
 
-  def handle("STRLEN", [key], store) do
-    case read_string_size(key, store) do
-      :missing -> 0
-      @wrongtype_error -> @wrongtype_error
-      {:size, size} -> size
-    end
-  end
+  def handle("STRLEN", [key], store), do: strlen_key(key, store)
 
   def handle("STRLEN", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'strlen' command"}
@@ -281,12 +212,7 @@ defmodule Ferricstore.Commands.Strings do
   # GETSET (deprecated but supported)
   # ---------------------------------------------------------------------------
 
-  def handle("GETSET", [key, value], store) do
-    case ensure_string_key(key, store) do
-      :ok -> Ops.getset(store, key, value)
-      @wrongtype_error -> @wrongtype_error
-    end
-  end
+  def handle("GETSET", [key, value], store), do: getset_value(key, value, store)
 
   def handle("GETSET", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'getset' command"}
@@ -295,12 +221,7 @@ defmodule Ferricstore.Commands.Strings do
   # GETDEL
   # ---------------------------------------------------------------------------
 
-  def handle("GETDEL", [key], store) do
-    case ensure_string_key(key, store) do
-      :ok -> Ops.getdel(store, key)
-      @wrongtype_error -> @wrongtype_error
-    end
-  end
+  def handle("GETDEL", [key], store), do: getdel_key(key, store)
 
   def handle("GETDEL", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'getdel' command"}
@@ -326,19 +247,7 @@ defmodule Ferricstore.Commands.Strings do
   # SETNX
   # ---------------------------------------------------------------------------
 
-  def handle("SETNX", [key, value], store) do
-    opts = %{expire_at_ms: 0, nx: true, xx: false, get: false, keepttl: false}
-
-    if compound_data_structure_key?(key, store) do
-      0
-    else
-      case Ops.set(store, key, value, opts) do
-        :ok -> 1
-        nil -> 0
-        {:error, _} = err -> err
-      end
-    end
-  end
+  def handle("SETNX", [key, value], store), do: setnx_value(key, value, store)
 
   def handle("SETNX", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'setnx' command"}
@@ -350,8 +259,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("SETEX", [key, secs_str, value], store) do
     case Integer.parse(secs_str) do
       {secs, ""} when secs > 0 ->
-        expire_at_ms = CommandTime.now_ms() + secs * 1_000
-        replace_string_key(key, value, expire_at_ms, store)
+        setex_parsed(key, secs, value, store)
 
       {_secs, ""} ->
         {:error, "ERR invalid expire time in 'setex' command"}
@@ -371,8 +279,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("PSETEX", [key, ms_str, value], store) do
     case Integer.parse(ms_str) do
       {ms, ""} when ms > 0 ->
-        expire_at_ms = CommandTime.now_ms() + ms
-        replace_string_key(key, value, expire_at_ms, store)
+        psetex_parsed(key, ms, value, store)
 
       {_ms, ""} ->
         {:error, "ERR invalid expire time in 'psetex' command"}
@@ -392,17 +299,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("GETRANGE", [key, start_str, end_str], store) do
     with {start_idx, ""} <- Integer.parse(start_str),
          {end_idx, ""} <- Integer.parse(end_str) do
-      case metadata_value_size(store, key) do
-        size when is_integer(size) ->
-          if getrange_empty_for_size?(size, start_idx, end_idx) do
-            if compound_data_structure_key?(key, store), do: @wrongtype_error, else: ""
-          else
-            read_getrange_value(key, start_idx, end_idx, store)
-          end
-
-        _unknown_or_missing ->
-          read_getrange_value(key, start_idx, end_idx, store)
-      end
+      getrange_parsed(key, start_idx, end_idx, store)
     else
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
@@ -421,16 +318,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("SETRANGE", [key, offset_str, value], store) do
     case Integer.parse(offset_str) do
       {offset, ""} when offset >= 0 and offset <= @max_setrange_offset ->
-        case ensure_string_key(key, store) do
-          :ok ->
-            case Ops.setrange(store, key, offset, value) do
-              {:ok, new_len} -> new_len
-              {:error, _} = err -> err
-            end
-
-          @wrongtype_error ->
-            @wrongtype_error
-        end
+        setrange_parsed(key, offset, value, store)
 
       {offset, ""} when offset > @max_setrange_offset ->
         {:error, "ERR string exceeds maximum allowed size (512MB)"}
@@ -453,7 +341,234 @@ defmodule Ferricstore.Commands.Strings do
   def handle("MSETNX", [], _store),
     do: {:error, "ERR wrong number of arguments for 'msetnx' command"}
 
-  def handle("MSETNX", args, store) do
+  def handle("MSETNX", args, store), do: msetnx_args(args, store)
+
+  @doc false
+  def handle_ast({:get, key}, store) when is_binary(key), do: get_key(key, store)
+
+  def handle_ast({:get, _args}, _store),
+    do: {:error, "ERR wrong number of arguments for 'get' command"}
+
+  def handle_ast({:del, keys}, store) when is_list(keys) and keys != [], do: del_keys(keys, store)
+
+  def handle_ast({:exists, keys}, store) when is_list(keys) and keys != [],
+    do: exists_keys(keys, store)
+
+  def handle_ast({:mget, keys}, store) when is_list(keys) and keys != [],
+    do: mget_keys(keys, store)
+
+  def handle_ast({:mset, args}, store), do: mset_args(args, store)
+  def handle_ast({:incr, key}, store), do: incr_key(key, store)
+  def handle_ast({:decr, key}, store), do: decr_key(key, store)
+  def handle_ast({:append, key, value}, store), do: append_value(key, value, store)
+  def handle_ast({:strlen, key}, store), do: strlen_key(key, store)
+  def handle_ast({:getset, key, value}, store), do: getset_value(key, value, store)
+  def handle_ast({:getdel, key}, store), do: getdel_key(key, store)
+  def handle_ast({:setnx, key, value}, store), do: setnx_value(key, value, store)
+  def handle_ast({:msetnx, args}, store), do: msetnx_args(args, store)
+
+  def handle_ast({:set, "", _value}, _store), do: {:error, "ERR empty key"}
+  def handle_ast({:set, "", _value, _opts}, _store), do: {:error, "ERR empty key"}
+
+  def handle_ast({:incrby, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:decrby, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:incrbyfloat, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:getex, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:setex, _key, {:error, reason}, _value}, _store), do: {:error, reason}
+  def handle_ast({:psetex, _key, {:error, reason}, _value}, _store), do: {:error, reason}
+  def handle_ast({:getrange, _key, {:error, reason}, _stop}, _store), do: {:error, reason}
+  def handle_ast({:getrange, _key, _start, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:setrange, _key, {:error, reason}, _value}, _store), do: {:error, reason}
+
+  def handle_ast({:incrby, key, delta}, store) when is_integer(delta),
+    do: incr_string_key(key, delta, store)
+
+  def handle_ast({:decrby, key, delta}, store) when is_integer(delta),
+    do: incr_string_key(key, -delta, store)
+
+  def handle_ast({:incrbyfloat, key, delta}, store) when is_float(delta),
+    do: incr_string_key_float(key, delta, store)
+
+  def handle_ast({:getex, key}, store) do
+    case read_string_value(key, store) do
+      {:value, value} -> value
+      :missing -> nil
+      @wrongtype_error -> @wrongtype_error
+    end
+  end
+
+  def handle_ast({:getex, key, :persist}, store), do: getex_parsed(key, 0, store)
+
+  def handle_ast({:getex, key, {:ex, secs}}, store) when is_integer(secs),
+    do: getex_parsed(key, CommandTime.now_ms() + secs * 1_000, store)
+
+  def handle_ast({:getex, key, {:px, ms}}, store) when is_integer(ms),
+    do: getex_parsed(key, CommandTime.now_ms() + ms, store)
+
+  def handle_ast({:getex, key, {:exat, ts}}, store) when is_integer(ts),
+    do: getex_parsed(key, ts * 1_000, store)
+
+  def handle_ast({:getex, key, {:pxat, ts}}, store) when is_integer(ts),
+    do: getex_parsed(key, ts, store)
+
+  def handle_ast({:setex, key, seconds, value}, store) when is_integer(seconds) do
+    if seconds > 0 do
+      setex_parsed(key, seconds, value, store)
+    else
+      {:error, "ERR invalid expire time in 'setex' command"}
+    end
+  end
+
+  def handle_ast({:psetex, key, ms, value}, store) when is_integer(ms) do
+    if ms > 0 do
+      psetex_parsed(key, ms, value, store)
+    else
+      {:error, "ERR invalid expire time in 'psetex' command"}
+    end
+  end
+
+  def handle_ast({:getrange, key, start_idx, end_idx}, store)
+      when is_integer(start_idx) and is_integer(end_idx),
+      do: getrange_parsed(key, start_idx, end_idx, store)
+
+  def handle_ast({:setrange, key, offset, value}, store) when is_integer(offset) do
+    cond do
+      offset >= 0 and offset <= @max_setrange_offset ->
+        setrange_parsed(key, offset, value, store)
+
+      offset > @max_setrange_offset ->
+        {:error, "ERR string exceeds maximum allowed size (512MB)"}
+
+      true ->
+        {:error, "ERR offset is out of range"}
+    end
+  end
+
+  def handle_ast({:set, key, _value}, _store) when byte_size(key) > 65_535,
+    do: {:error, "ERR key too large"}
+
+  def handle_ast({:set, key, _value, _opts}, _store) when byte_size(key) > 65_535,
+    do: {:error, "ERR key too large"}
+
+  def handle_ast({:set, key, value}, store),
+    do: do_set_parsed(key, value, @set_opts_default, store)
+
+  def handle_ast({:set, _key, _value, {:error, reason}}, _store) when is_binary(reason),
+    do: {:error, reason}
+
+  def handle_ast({:set, key, value, opts}, store) when is_list(opts) do
+    with {:ok, parsed} <- set_opts_from_ast(opts) do
+      do_set_parsed(key, value, parsed, store)
+    end
+  end
+
+  def handle_ast(_ast, _store), do: {:error, "ERR wrong number of arguments for 'set' command"}
+
+  defp get_key("", _store), do: {:error, "ERR empty key"}
+  defp get_key(key, _store) when byte_size(key) > 65_535, do: {:error, "ERR key too large"}
+
+  defp get_key(key, store) do
+    case read_string_value(key, store) do
+      {:value, value} -> value
+      :missing -> nil
+      @wrongtype_error -> @wrongtype_error
+    end
+  end
+
+  defp del_keys(keys, store) do
+    keys
+    |> Enum.reduce_while({:ok, 0}, fn key, {:ok, acc} ->
+      case do_del_key(key, store) do
+        true -> {:cont, {:ok, acc + 1}}
+        false -> {:cont, {:ok, acc}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, count} -> count
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp exists_keys(keys, store) do
+    Enum.reduce(keys, 0, fn key, acc ->
+      exists = Ops.exists?(store, key)
+      # Also check TypeRegistry for compound-key-based data structures
+      # (lists, hashes, sets, zsets) that don't use the plain key store.
+      exists =
+        exists or
+          (Ops.has_compound?(store) and TypeRegistry.get_type(key, store) != "none")
+
+      if exists, do: acc + 1, else: acc
+    end)
+  end
+
+  defp mget_keys(keys, store), do: Ops.batch_get(store, keys)
+
+  defp mset_args(args, store) do
+    if even_length?(args) do
+      case mset_validate(args) do
+        :ok -> mset_exec(args, store)
+        {:error, _} = err -> err
+      end
+    else
+      {:error, "ERR wrong number of arguments for 'mset' command"}
+    end
+  end
+
+  defp incr_key(key, store), do: incr_string_key(key, 1, store)
+  defp decr_key(key, store), do: incr_string_key(key, -1, store)
+
+  defp append_value(key, value, store) do
+    case ensure_string_key(key, store) do
+      :ok ->
+        case Ops.append(store, key, value) do
+          {:ok, new_len} -> new_len
+          {:error, _} = err -> err
+        end
+
+      @wrongtype_error ->
+        @wrongtype_error
+    end
+  end
+
+  defp strlen_key(key, store) do
+    case read_string_size(key, store) do
+      :missing -> 0
+      @wrongtype_error -> @wrongtype_error
+      {:size, size} -> size
+    end
+  end
+
+  defp getset_value(key, value, store) do
+    case ensure_string_key(key, store) do
+      :ok -> Ops.getset(store, key, value)
+      @wrongtype_error -> @wrongtype_error
+    end
+  end
+
+  defp getdel_key(key, store) do
+    case ensure_string_key(key, store) do
+      :ok -> Ops.getdel(store, key)
+      @wrongtype_error -> @wrongtype_error
+    end
+  end
+
+  defp setnx_value(key, value, store) do
+    opts = %{expire_at_ms: 0, nx: true, xx: false, get: false, keepttl: false}
+
+    if compound_data_structure_key?(key, store) do
+      0
+    else
+      case Ops.set(store, key, value, opts) do
+        :ok -> 1
+        nil -> 0
+        {:error, _} = err -> err
+      end
+    end
+  end
+
+  defp msetnx_args(args, store) do
     if even_length?(args) do
       keys = extract_keys(args)
 
@@ -484,10 +599,7 @@ defmodule Ferricstore.Commands.Strings do
   defp do_getex(key, opts, store) do
     case parse_getex_opts(opts) do
       {:ok, expire_at_ms} ->
-        case ensure_string_key(key, store) do
-          :ok -> Ops.getex(store, key, expire_at_ms)
-          @wrongtype_error -> @wrongtype_error
-        end
+        getex_parsed(key, expire_at_ms, store)
 
       {:error, _} = err ->
         err
@@ -497,6 +609,32 @@ defmodule Ferricstore.Commands.Strings do
   defp incr_string_key(key, delta, store) do
     case ensure_string_key(key, store) do
       :ok -> Ops.incr(store, key, delta)
+      @wrongtype_error -> @wrongtype_error
+    end
+  end
+
+  defp incr_string_key_float(key, delta, store) do
+    incr_result =
+      case ensure_string_key(key, store) do
+        :ok -> Ops.incr_float(store, key, delta)
+        @wrongtype_error -> @wrongtype_error
+      end
+
+    case incr_result do
+      {:ok, new_val} when is_float(new_val) ->
+        Ferricstore.Store.ValueCodec.format_float(new_val)
+
+      {:ok, new_str} when is_binary(new_str) ->
+        new_str
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp getex_parsed(key, expire_at_ms, store) do
+    case ensure_string_key(key, store) do
+      :ok -> Ops.getex(store, key, expire_at_ms)
       @wrongtype_error -> @wrongtype_error
     end
   end
@@ -573,6 +711,20 @@ defmodule Ferricstore.Commands.Strings do
 
   defp metadata_value_size(_store, _key), do: :unknown
 
+  defp getrange_parsed(key, start_idx, end_idx, store) do
+    case metadata_value_size(store, key) do
+      size when is_integer(size) ->
+        if getrange_empty_for_size?(size, start_idx, end_idx) do
+          if compound_data_structure_key?(key, store), do: @wrongtype_error, else: ""
+        else
+          read_getrange_value(key, start_idx, end_idx, store)
+        end
+
+      _unknown_or_missing ->
+        read_getrange_value(key, start_idx, end_idx, store)
+    end
+  end
+
   defp read_getrange_value(key, start_idx, end_idx, store) do
     case read_string_value(key, store) do
       :missing -> ""
@@ -644,34 +796,51 @@ defmodule Ferricstore.Commands.Strings do
 
   defp do_set(key, value, opts, store) do
     with {:ok, parsed} <- parse_set_opts(opts) do
-      cond do
-        parsed.get and compound_data_structure_key?(key, store) ->
-          @wrongtype_error
-
-        parsed.nx and compound_data_structure_key?(key, store) ->
-          nil
-
-        compound_data_structure_key?(key, store) ->
-          replace_string_key(key, value, parsed.expire_at_ms, store)
-
-        parsed.nx or parsed.xx or parsed.get or parsed.keepttl ->
-          Ops.set(store, key, value, parsed)
-
-        true ->
-          replace_string_key(key, value, parsed.expire_at_ms, store)
-      end
+      do_set_parsed(key, value, parsed, store)
     end
   end
 
-  # Accumulator map for SET option parsing. All fields start at their defaults.
-  @set_opts_default %{
-    expire_at_ms: 0,
-    nx: false,
-    xx: false,
-    get: false,
-    keepttl: false,
-    has_expiry: false
-  }
+  defp setex_parsed(key, secs, value, store) do
+    expire_at_ms = CommandTime.now_ms() + secs * 1_000
+    replace_string_key(key, value, expire_at_ms, store)
+  end
+
+  defp psetex_parsed(key, ms, value, store) do
+    expire_at_ms = CommandTime.now_ms() + ms
+    replace_string_key(key, value, expire_at_ms, store)
+  end
+
+  defp setrange_parsed(key, offset, value, store) do
+    case ensure_string_key(key, store) do
+      :ok ->
+        case Ops.setrange(store, key, offset, value) do
+          {:ok, new_len} -> new_len
+          {:error, _} = err -> err
+        end
+
+      @wrongtype_error ->
+        @wrongtype_error
+    end
+  end
+
+  defp do_set_parsed(key, value, parsed, store) do
+    cond do
+      parsed.get and compound_data_structure_key?(key, store) ->
+        @wrongtype_error
+
+      parsed.nx and compound_data_structure_key?(key, store) ->
+        nil
+
+      compound_data_structure_key?(key, store) ->
+        replace_string_key(key, value, parsed.expire_at_ms, store)
+
+      parsed.nx or parsed.xx or parsed.get or parsed.keepttl ->
+        Ops.set(store, key, value, parsed)
+
+      true ->
+        replace_string_key(key, value, parsed.expire_at_ms, store)
+    end
+  end
 
   defp parse_set_opts(opts), do: parse_set_opts(opts, @set_opts_default)
 
@@ -766,6 +935,39 @@ defmodule Ferricstore.Commands.Strings do
   defp parse_set_opts([unknown | _rest], _acc) do
     {:error, "ERR syntax error, option '#{unknown}' not recognized"}
   end
+
+  defp set_opts_from_ast(opts), do: set_opts_from_ast(opts, @set_opts_default)
+
+  defp set_opts_from_ast([], acc), do: {:ok, acc}
+  defp set_opts_from_ast([:nx | rest], acc), do: set_opts_from_ast(rest, %{acc | nx: true})
+  defp set_opts_from_ast([:xx | rest], acc), do: set_opts_from_ast(rest, %{acc | xx: true})
+  defp set_opts_from_ast([:get | rest], acc), do: set_opts_from_ast(rest, %{acc | get: true})
+
+  defp set_opts_from_ast([:keepttl | rest], acc) do
+    set_opts_from_ast(rest, %{acc | keepttl: true, has_expiry: true})
+  end
+
+  defp set_opts_from_ast([{:ex, seconds} | rest], acc) when is_integer(seconds) do
+    set_opts_from_ast(rest, %{
+      acc
+      | expire_at_ms: CommandTime.now_ms() + seconds * 1000,
+        has_expiry: true
+    })
+  end
+
+  defp set_opts_from_ast([{:px, ms} | rest], acc) when is_integer(ms) do
+    set_opts_from_ast(rest, %{acc | expire_at_ms: CommandTime.now_ms() + ms, has_expiry: true})
+  end
+
+  defp set_opts_from_ast([{:exat, seconds} | rest], acc) when is_integer(seconds) do
+    set_opts_from_ast(rest, %{acc | expire_at_ms: seconds * 1000, has_expiry: true})
+  end
+
+  defp set_opts_from_ast([{:pxat, ms} | rest], acc) when is_integer(ms) do
+    set_opts_from_ast(rest, %{acc | expire_at_ms: ms, has_expiry: true})
+  end
+
+  defp set_opts_from_ast(_opts, _acc), do: {:error, "ERR syntax error"}
 
   # ---------------------------------------------------------------------------
   # Private — MSET/MSETNX helpers (direct recursion, no chunked enumeration)
@@ -921,8 +1123,10 @@ defmodule Ferricstore.Commands.Strings do
             if Ops.exists?(store, key) do
               case maybe_delete_prob_file(key, store) do
                 :ok ->
-                  Ops.delete(store, key)
-                  true
+                  case Ops.delete(store, key) do
+                    :ok -> true
+                    {:error, _reason} = error -> error
+                  end
 
                 {:error, _reason} = error ->
                   error
@@ -964,8 +1168,10 @@ defmodule Ferricstore.Commands.Strings do
       end
     else
       if Ops.exists?(store, key) do
-        Ops.delete(store, key)
-        true
+        case Ops.delete(store, key) do
+          :ok -> true
+          {:error, _reason} = error -> error
+        end
       else
         false
       end

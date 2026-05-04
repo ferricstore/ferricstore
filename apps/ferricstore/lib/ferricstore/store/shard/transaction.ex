@@ -1,13 +1,15 @@
 defmodule Ferricstore.Store.Shard.Transaction do
   @moduledoc "Executes a queued MULTI/EXEC command batch inside a shard using a local transaction store."
 
+  alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Store.LocalTxStore
+  alias Ferricstore.Transaction.Ast, as: TxAst
 
   # -------------------------------------------------------------------
   # Transaction execution handler
   # -------------------------------------------------------------------
 
-  @spec handle_tx_execute([{binary(), [term()]}], binary() | nil, map()) ::
+  @spec handle_tx_execute([TxAst.queue_entry()], binary() | nil, map()) ::
           {:reply, [term()], map()}
   @doc false
   def handle_tx_execute(queue, sandbox_namespace, state) do
@@ -17,11 +19,14 @@ defmodule Ferricstore.Store.Shard.Transaction do
 
     results =
       try do
-        Enum.map(queue, fn {cmd, args} ->
-          namespaced_args = namespace_args(args, sandbox_namespace)
+        Enum.map(queue, fn entry ->
+          ast =
+            entry
+            |> TxAst.command_ast()
+            |> TxAst.namespace_first_key(sandbox_namespace)
 
           try do
-            Ferricstore.Commands.Dispatcher.dispatch(cmd, namespaced_args, store)
+            Dispatcher.dispatch_ast(ast, store)
           catch
             :exit, {:noproc, _} ->
               {:error, "ERR server not ready, shard process unavailable"}
@@ -42,7 +47,6 @@ defmodule Ferricstore.Store.Shard.Transaction do
   # Helpers
   # -------------------------------------------------------------------
 
-  @spec namespace_args([term()], binary() | nil) :: [term()]
   @doc false
   def namespace_args(args, nil), do: args
   def namespace_args([], _ns), do: []

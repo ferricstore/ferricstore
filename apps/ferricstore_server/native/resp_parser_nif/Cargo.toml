@@ -8,7 +8,7 @@ name = "resp_parser_nif"
 crate-type = ["cdylib"]
 
 [dependencies]
-rustler = { version = "0.37", default-features = false, features = ["derive"] }
+rustler = { version = "0.37", default-features = false, features = ["derive", "big_integer"] }
 
 [features]
 default = ["nif_version_2_16"]

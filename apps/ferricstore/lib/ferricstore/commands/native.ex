@@ -109,6 +109,69 @@ defmodule Ferricstore.Commands.Native do
   def handle("FETCH_OR_COMPUTE_ERROR", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'fetch_or_compute_error' command"}
 
+  @spec handle_ast(term(), map()) :: term()
+  def handle_ast({:cas, {:error, _} = err}, _store), do: err
+
+  def handle_ast({:cas, key, expected, new_value, ttl_ms}, _store) do
+    ctx = FerricStore.Instance.get(:default)
+    Router.cas(ctx, key, expected, new_value, ttl_ms)
+  end
+
+  def handle_ast({:cas, _args}, _store),
+    do: {:error, "ERR wrong number of arguments for 'cas' command"}
+
+  def handle_ast({:lock, {:error, _} = err}, _store), do: err
+  def handle_ast({:lock, _key, _owner, {:error, _} = err}, _store), do: err
+
+  def handle_ast({:lock, key, owner, ttl_ms}, _store) do
+    ctx = FerricStore.Instance.get(:default)
+    Router.lock(ctx, key, owner, ttl_ms)
+  end
+
+  def handle_ast({:unlock, {:error, _} = err}, _store), do: err
+
+  def handle_ast({:unlock, key, owner}, _store) do
+    ctx = FerricStore.Instance.get(:default)
+    Router.unlock(ctx, key, owner)
+  end
+
+  def handle_ast({:extend, {:error, _} = err}, _store), do: err
+  def handle_ast({:extend, _key, _owner, {:error, _} = err}, _store), do: err
+
+  def handle_ast({:extend, key, owner, ttl_ms}, _store) do
+    ctx = FerricStore.Instance.get(:default)
+    Router.extend(ctx, key, owner, ttl_ms)
+  end
+
+  def handle_ast({:ratelimit_add, {:error, _} = err}, _store), do: err
+
+  def handle_ast({:ratelimit_add, key, window_ms, max, count}, _store) do
+    ctx = FerricStore.Instance.get(:default)
+    Router.ratelimit_add(ctx, key, window_ms, max, count)
+  end
+
+  def handle_ast({:ferricstore_key_info, {:error, _} = err}, _store), do: err
+  def handle_ast({:ferricstore_key_info, key}, _store), do: do_key_info(key)
+
+  def handle_ast({:fetch_or_compute, _key, {:error, _} = err}, _store), do: err
+
+  def handle_ast({:fetch_or_compute, key, ttl_ms, hint}, _store),
+    do: do_fetch_or_compute_ast(key, ttl_ms, hint)
+
+  def handle_ast({:fetch_or_compute_result, _key, {:error, _} = err}, _store), do: err
+
+  def handle_ast({:fetch_or_compute_result, key, value, ttl_ms}, _store),
+    do: Ferricstore.FetchOrCompute.fetch_or_compute_result(key, value, ttl_ms)
+
+  def handle_ast({:fetch_or_compute_error, key, msg}, _store),
+    do: Ferricstore.FetchOrCompute.fetch_or_compute_error(key, msg)
+
+  def handle_ast({tag, _args}, _store)
+      when tag in ~w(lock unlock extend ratelimit_add fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a do
+    {:error,
+     "ERR wrong number of arguments for '#{String.replace(to_string(tag), "_", ".")}' command"}
+  end
+
   defp do_ratelimit_add(key, wms, max_str, cnt) do
     with {w, ""} <- Integer.parse(wms),
          true <- w > 0,
@@ -209,6 +272,15 @@ defmodule Ferricstore.Commands.Native do
 
       _ ->
         {:error, "ERR value is not an integer or out of range"}
+    end
+  end
+
+  defp do_fetch_or_compute_ast(key, ttl_ms, hint) do
+    case Ferricstore.FetchOrCompute.fetch_or_compute(key, ttl_ms, hint) do
+      {:hit, v} -> ["hit", v]
+      {:compute, ch} -> ["compute", ch]
+      {:ok, v} -> ["hit", v]
+      {:error, reason} -> {:error, "ERR compute failed: " <> reason}
     end
   end
 end

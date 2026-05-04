@@ -320,7 +320,18 @@ defmodule FerricstoreServer.Acl do
         commands = format_commands(user.commands)
         keys = format_keys(user.keys)
 
-        ["flags", flags, "passwords", passwords, "commands", commands, "keys", keys, "channels", "&*"]
+        [
+          "flags",
+          flags,
+          "passwords",
+          passwords,
+          "commands",
+          commands,
+          "keys",
+          keys,
+          "channels",
+          "&*"
+        ]
     end
   end
 
@@ -433,14 +444,17 @@ defmodule FerricstoreServer.Acl do
 
     case get_user(username) do
       nil ->
-        {:error, "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+        {:error,
+         "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
 
       %{enabled: false} ->
-        {:error, "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+        {:error,
+         "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
 
       %{commands: :all, denied_commands: denied} ->
         if MapSet.member?(denied, cmd) do
-          {:error, "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+          {:error,
+           "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
         else
           :ok
         end
@@ -449,7 +463,8 @@ defmodule FerricstoreServer.Acl do
         if MapSet.member?(cmds, cmd) do
           :ok
         else
-          {:error, "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+          {:error,
+           "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
         end
     end
   end
@@ -479,10 +494,12 @@ defmodule FerricstoreServer.Acl do
   def check_key_access(username, key, access_type) do
     case get_user(username) do
       nil ->
-        {:error, "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+        {:error,
+         "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
 
       %{enabled: false} ->
-        {:error, "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+        {:error,
+         "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
 
       %{keys: :all} ->
         :ok
@@ -491,7 +508,8 @@ defmodule FerricstoreServer.Acl do
         if key_matches_any?(key, access_type, patterns) do
           :ok
         else
-          {:error, "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+          {:error,
+           "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
         end
     end
   end
@@ -557,7 +575,13 @@ defmodule FerricstoreServer.Acl do
 
     # The \\A and \\z anchors ensure full-string match. The 's' flag makes
     # '.' match newlines (though keys shouldn't contain them).
-    Regex.compile!("\\A" <> regex_str <> "\\z", "s")
+    case Regex.compile("\\A" <> regex_str <> "\\z", "s") do
+      {:ok, regex} ->
+        regex
+
+      {:error, _} ->
+        Regex.compile!("\\A" <> Regex.escape(pattern) <> "\\z", "s")
+    end
   end
 
   defp compile_glob_chars([], acc), do: Enum.reverse(acc)
@@ -974,7 +998,8 @@ defmodule FerricstoreServer.Acl do
     case Base.decode64(stored_hash) do
       {:ok, <<salt::binary-16, hash::binary-32>>} ->
         # Try PBKDF2 first (new format)
-        pbkdf2 = :crypto.pbkdf2_hmac(:sha256, password, salt, @pbkdf2_iterations, @pbkdf2_key_length)
+        pbkdf2 =
+          :crypto.pbkdf2_hmac(:sha256, password, salt, @pbkdf2_iterations, @pbkdf2_key_length)
 
         if :crypto.hash_equals(pbkdf2, hash) do
           true
@@ -1041,7 +1066,8 @@ defmodule FerricstoreServer.Acl do
     {:ok, %{user | commands: :all, denied_commands: MapSet.new()}}
   end
 
-  defp parse_rule(user, "-@all"), do: {:ok, %{user | commands: MapSet.new(), denied_commands: MapSet.new()}}
+  defp parse_rule(user, "-@all"),
+    do: {:ok, %{user | commands: MapSet.new(), denied_commands: MapSet.new()}}
 
   # +@category -- expand the category to individual commands and add them all.
   # When commands is :all, also remove the category commands from denied_commands.
@@ -1061,7 +1087,8 @@ defmodule FerricstoreServer.Acl do
         end
 
       :error ->
-        {:error, "ERR Error in ACL SETUSER modifier '+@#{category}': Unknown command category '#{category}'"}
+        {:error,
+         "ERR Error in ACL SETUSER modifier '+@#{category}': Unknown command category '#{category}'"}
     end
   end
 
@@ -1082,7 +1109,8 @@ defmodule FerricstoreServer.Acl do
         end
 
       :error ->
-        {:error, "ERR Error in ACL SETUSER modifier '-@#{category}': Unknown command category '#{category}'"}
+        {:error,
+         "ERR Error in ACL SETUSER modifier '-@#{category}': Unknown command category '#{category}'"}
     end
   end
 
@@ -1177,13 +1205,17 @@ defmodule FerricstoreServer.Acl do
 
   @spec insert_default_user() :: true
   defp insert_default_user do
-    :ets.insert(@table, {"default", %{
-      enabled: true,
-      password: nil,
-      commands: :all,
-      denied_commands: MapSet.new(),
-      keys: :all
-    }})
+    :ets.insert(
+      @table,
+      {"default",
+       %{
+         enabled: true,
+         password: nil,
+         commands: :all,
+         denied_commands: MapSet.new(),
+         keys: :all
+       }}
+    )
   end
 
   # ---------------------------------------------------------------------------
@@ -1425,7 +1457,7 @@ defmodule FerricstoreServer.Acl do
               (denied
                |> MapSet.to_list()
                |> Enum.sort()
-               |> Enum.map(&("-#{String.downcase(&1)}")))
+               |> Enum.map(&"-#{String.downcase(&1)}"))
           end
 
         cmds ->
@@ -1436,7 +1468,7 @@ defmodule FerricstoreServer.Acl do
               (cmds
                |> MapSet.to_list()
                |> Enum.sort()
-               |> Enum.map(&("+#{String.downcase(&1)}")))
+               |> Enum.map(&"+#{String.downcase(&1)}"))
           end
       end
 

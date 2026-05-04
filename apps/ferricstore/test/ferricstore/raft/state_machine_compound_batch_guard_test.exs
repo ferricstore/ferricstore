@@ -25,20 +25,19 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
     # During Raft apply the store is a map, so missing batch_get callbacks
     # make Ops fall back to one closure call and one possible cold-read waiter
     # per key. Keep this explicit to preserve batched cold reads in apply.
-    assert length(Regex.scan(~r/^\s+batch_get:/m, source)) >= 2,
-           "both state-machine command stores must provide batch_get for plain multi-key reads"
+    assert source =~ ~r/batch_get: fn keys -> cross_shard_batch_read\(ctx, keys\) end/,
+           "state-machine command store must provide batch_get for plain multi-key reads"
   end
 
-  test "state-machine compound batch metadata reads use promoted-aware cold path" do
+  test "state-machine compound batch metadata reads use keyed batched cold path" do
     source = File.read!(@state_machine_path)
-    body = function_body(source, "sm_store_compound_batch_get_meta")
+    body = function_body(source, "cross_shard_read_cold_meta_batch")
 
     # HGETEX/HEXPIRE-style logic reads value+TTL for many fields. If this
-    # helper uses do_get_meta/2 directly, promoted cold fields are looked up in
-    # the shared Bitcask path and appear missing. Keep it on the same
-    # promoted-aware batched cold reader as compound_batch_get/3.
-    refute body =~ "do_get_meta(state, compound_key)",
-           "state-machine compound batch metadata reads must not bypass promoted cold storage"
+    # helper falls back to one pread per field, large hashes/sets/zsets create
+    # one waiter per cold member. Keep the promoted-aware batched reader.
+    assert body =~ "ColdRead.pread_batch_keyed",
+           "state-machine compound batch metadata reads must use the keyed batched cold reader"
   end
 
   defp function_body(source, function) do

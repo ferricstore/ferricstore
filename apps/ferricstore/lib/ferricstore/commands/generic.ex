@@ -77,7 +77,7 @@ defmodule Ferricstore.Commands.Generic do
   def handle("UNLINK", keys, store) do
     # UNLINK has the same semantics as DEL for data-structure cleanup;
     # async reclaim is deferred to merge.
-    Ferricstore.Commands.Strings.handle("DEL", keys, store)
+    Ferricstore.Commands.Strings.handle_ast({:del, keys}, store)
   end
 
   # ---------------------------------------------------------------------------
@@ -85,21 +85,7 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   def handle("RENAME", [key, newkey], store) do
-    CrossShardOp.execute(
-      [{key, :read_write}, {newkey, :write}],
-      fn unified_store ->
-        case key_entry(unified_store, key) do
-          nil ->
-            {:error, "ERR no such key"}
-
-          entry ->
-            rename_entry(key, newkey, entry, unified_store)
-            :ok
-        end
-      end,
-      intent: %{command: :rename, keys: %{source: key, dest: newkey}, value_hashes: %{}},
-      store: store
-    )
+    rename_key(key, newkey, store)
   end
 
   def handle("RENAME", _args, _store) do
@@ -111,29 +97,7 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   def handle("RENAMENX", [key, newkey], store) do
-    CrossShardOp.execute(
-      [{key, :read_write}, {newkey, :write}],
-      fn unified_store ->
-        case key_entry(unified_store, key) do
-          nil ->
-            {:error, "ERR no such key"}
-
-          _entry when key == newkey ->
-            # Same key -- always 0 since destination "exists"
-            0
-
-          entry ->
-            if key_exists?(unified_store, newkey) do
-              0
-            else
-              rename_entry(key, newkey, entry, unified_store)
-              1
-            end
-        end
-      end,
-      intent: %{command: :renamenx, keys: %{source: key, dest: newkey}, value_hashes: %{}},
-      store: store
-    )
+    renamenx_key(key, newkey, store)
   end
 
   def handle("RENAMENX", _args, _store) do
@@ -169,12 +133,7 @@ defmodule Ferricstore.Commands.Generic do
   # RANDOMKEY
   # ---------------------------------------------------------------------------
 
-  def handle("RANDOMKEY", [], store) do
-    case Ops.keys(store) |> CompoundKey.user_visible_keys() do
-      [] -> nil
-      keys -> Enum.random(keys)
-    end
-  end
+  def handle("RANDOMKEY", [], store), do: random_key(store)
 
   def handle("RANDOMKEY", _args, _store) do
     {:error, "ERR wrong number of arguments for 'randomkey' command"}
@@ -198,13 +157,7 @@ defmodule Ferricstore.Commands.Generic do
   # EXPIRETIME
   # ---------------------------------------------------------------------------
 
-  def handle("EXPIRETIME", [key], store) do
-    case key_meta(store, key) do
-      nil -> -2
-      0 -> -1
-      expire_at_ms -> div(expire_at_ms, 1_000)
-    end
-  end
+  def handle("EXPIRETIME", [key], store), do: expiretime_key(key, store)
 
   def handle("EXPIRETIME", _args, _store) do
     {:error, "ERR wrong number of arguments for 'expiretime' command"}
@@ -214,13 +167,7 @@ defmodule Ferricstore.Commands.Generic do
   # PEXPIRETIME
   # ---------------------------------------------------------------------------
 
-  def handle("PEXPIRETIME", [key], store) do
-    case key_meta(store, key) do
-      nil -> -2
-      0 -> -1
-      expire_at_ms -> expire_at_ms
-    end
-  end
+  def handle("PEXPIRETIME", [key], store), do: pexpiretime_key(key, store)
 
   def handle("PEXPIRETIME", _args, _store) do
     {:error, "ERR wrong number of arguments for 'pexpiretime' command"}
@@ -251,6 +198,96 @@ defmodule Ferricstore.Commands.Generic do
     {:error, "ERR wrong number of arguments for 'wait' command"}
   end
 
+  @spec handle_ast(term(), map()) :: term()
+  def handle_ast(ast, store)
+
+  def handle_ast({:type, key}, store), do: {:simple, TypeRegistry.get_type(key, store)}
+
+  def handle_ast({:unlink, keys}, store) when is_list(keys) and keys != [] do
+    Ferricstore.Commands.Strings.handle_ast({:del, keys}, store)
+  end
+
+  def handle_ast({:rename, key, newkey}, store), do: rename_key(key, newkey, store)
+  def handle_ast({:renamenx, key, newkey}, store), do: renamenx_key(key, newkey, store)
+  def handle_ast({:copy, _source, _destination, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:copy, source, destination, replace?}, store) when is_boolean(replace?) do
+    CrossShardOp.execute(
+      [{source, :read}, {destination, :write}],
+      fn unified_store ->
+        do_copy(source, destination, replace?, unified_store)
+      end,
+      intent: %{command: :copy, keys: %{source: source, dest: destination}, value_hashes: %{}},
+      store: store
+    )
+  end
+
+  def handle_ast({:randomkey, []}, store), do: random_key(store)
+  def handle_ast({:scan, _cursor, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:scan, cursor, opts}, store) when is_binary(cursor) and is_list(opts) do
+    match_pattern = Keyword.get(opts, :match)
+    count = Keyword.get(opts, :count, 10)
+    type_filter = Keyword.get(opts, :type)
+    do_scan(cursor, match_pattern, count, type_filter, store)
+  end
+
+  def handle_ast({:expiretime, key}, store), do: expiretime_key(key, store)
+  def handle_ast({:pexpiretime, key}, store), do: pexpiretime_key(key, store)
+  def handle_ast({:object, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:object, :encoding, key}, store), do: do_object("ENCODING", [key], store)
+  def handle_ast({:object, :freq, key}, store), do: do_object("FREQ", [key], store)
+  def handle_ast({:object, :idletime, key}, store), do: do_object("IDLETIME", [key], store)
+  def handle_ast({:object, :refcount, key}, store), do: do_object("REFCOUNT", [key], store)
+  def handle_ast({:object, :help}, store), do: do_object("HELP", [], store)
+  def handle_ast({:wait, _numreplicas, _timeout}, _store), do: 0
+
+  def handle_ast(_ast, _store), do: {:error, "ERR unsupported generic command AST"}
+
+  defp rename_key(key, newkey, store) do
+    CrossShardOp.execute(
+      [{key, :read_write}, {newkey, :write}],
+      fn unified_store ->
+        case key_entry(unified_store, key) do
+          nil ->
+            {:error, "ERR no such key"}
+
+          entry ->
+            rename_entry(key, newkey, entry, unified_store)
+            :ok
+        end
+      end,
+      intent: %{command: :rename, keys: %{source: key, dest: newkey}, value_hashes: %{}},
+      store: store
+    )
+  end
+
+  defp renamenx_key(key, newkey, store) do
+    CrossShardOp.execute(
+      [{key, :read_write}, {newkey, :write}],
+      fn unified_store ->
+        case key_entry(unified_store, key) do
+          nil ->
+            {:error, "ERR no such key"}
+
+          _entry when key == newkey ->
+            # Same key -- always 0 since destination "exists"
+            0
+
+          entry ->
+            if key_exists?(unified_store, newkey) do
+              0
+            else
+              rename_entry(key, newkey, entry, unified_store)
+              1
+            end
+        end
+      end,
+      intent: %{command: :renamenx, keys: %{source: key, dest: newkey}, value_hashes: %{}},
+      store: store
+    )
+  end
+
   defp key_meta(store, key) do
     case Ops.expire_at_ms(store, key) do
       nil -> compound_expire_at_ms(store, key)
@@ -276,6 +313,29 @@ defmodule Ferricstore.Commands.Generic do
   defp live_compound_expire_at_ms(store, key, expected_type, expire_at_ms) do
     if TypeRegistry.get_type(key, store) == expected_type do
       expire_at_ms
+    end
+  end
+
+  defp random_key(store) do
+    case Ops.keys(store) |> CompoundKey.user_visible_keys() do
+      [] -> nil
+      keys -> Enum.random(keys)
+    end
+  end
+
+  defp expiretime_key(key, store) do
+    case key_meta(store, key) do
+      nil -> -2
+      0 -> -1
+      expire_at_ms -> div(expire_at_ms, 1_000)
+    end
+  end
+
+  defp pexpiretime_key(key, store) do
+    case key_meta(store, key) do
+      nil -> -2
+      0 -> -1
+      expire_at_ms -> expire_at_ms
     end
   end
 
@@ -500,7 +560,7 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp delete_key(key, store) do
-    Ferricstore.Commands.Strings.handle("DEL", [key], store)
+    Ferricstore.Commands.Strings.handle_ast({:del, [key]}, store)
   end
 
   defp copy_compound_meta(source, destination, type, store) do

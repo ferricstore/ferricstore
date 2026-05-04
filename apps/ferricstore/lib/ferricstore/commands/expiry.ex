@@ -105,6 +105,49 @@ defmodule Ferricstore.Commands.Expiry do
     {:error, "ERR wrong number of arguments for 'persist' command"}
   end
 
+  @doc false
+  def handle_ast(ast, store)
+
+  def handle_ast({:expire, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:pexpire, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:expireat, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:pexpireat, _key, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:expire, key, secs}, store) when is_integer(secs),
+    do: set_expiry_seconds_parsed(key, secs, :none, store)
+
+  def handle_ast({:pexpire, key, ms}, store) when is_integer(ms),
+    do: set_expiry_ms_parsed(key, ms, :none, store)
+
+  def handle_ast({:expireat, key, ts}, store) when is_integer(ts),
+    do: set_expiry_at_seconds_parsed(key, ts, :none, store)
+
+  def handle_ast({:pexpireat, key, ts}, store) when is_integer(ts),
+    do: set_expiry_at_ms_parsed(key, ts, :none, store)
+
+  def handle_ast({:expire, _key, _secs, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:pexpire, _key, _ms, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:expireat, _key, _ts, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:pexpireat, _key, _ts, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:expire, key, secs, flag}, store) when is_integer(secs),
+    do: set_expiry_seconds_parsed(key, secs, flag, store)
+
+  def handle_ast({:pexpire, key, ms, flag}, store) when is_integer(ms),
+    do: set_expiry_ms_parsed(key, ms, flag, store)
+
+  def handle_ast({:expireat, key, ts, flag}, store) when is_integer(ts),
+    do: set_expiry_at_seconds_parsed(key, ts, flag, store)
+
+  def handle_ast({:pexpireat, key, ts, flag}, store) when is_integer(ts),
+    do: set_expiry_at_ms_parsed(key, ts, flag, store)
+
+  def handle_ast({:ttl, key}, store), do: get_ttl_seconds(key, store)
+  def handle_ast({:pttl, key}, store), do: get_ttl_ms(key, store)
+  def handle_ast({:persist, key}, store), do: do_persist(key, store)
+
+  def handle_ast(_ast, _store), do: {:error, "ERR unsupported expiry command AST"}
+
   # ---------------------------------------------------------------------------
   # Private — EXPIRE / PEXPIRE (relative)
   # ---------------------------------------------------------------------------
@@ -134,6 +177,18 @@ defmodule Ferricstore.Commands.Expiry do
         {:error, "ERR value is not an integer or out of range"}
     end
   end
+
+  defp set_expiry_seconds_parsed(key, secs, _flag, store) when secs <= 0,
+    do: delete_if_exists(key, store)
+
+  defp set_expiry_seconds_parsed(key, secs, flag, store),
+    do: apply_expiry(key, CommandTime.now_ms() + secs * 1_000, flag, store)
+
+  defp set_expiry_ms_parsed(key, ms, _flag, store) when ms <= 0,
+    do: delete_if_exists(key, store)
+
+  defp set_expiry_ms_parsed(key, ms, flag, store),
+    do: apply_expiry(key, CommandTime.now_ms() + ms, flag, store)
 
   # ---------------------------------------------------------------------------
   # Private — EXPIREAT / PEXPIREAT (absolute)
@@ -169,12 +224,30 @@ defmodule Ferricstore.Commands.Expiry do
     end
   end
 
+  defp set_expiry_at_seconds_parsed(key, ts, flag, store) do
+    expire_at_ms = ts * 1_000
+
+    if expire_at_ms <= CommandTime.now_ms() do
+      delete_if_exists(key, store)
+    else
+      apply_expiry(key, expire_at_ms, flag, store)
+    end
+  end
+
+  defp set_expiry_at_ms_parsed(key, ts, flag, store) do
+    if ts <= CommandTime.now_ms() do
+      delete_if_exists(key, store)
+    else
+      apply_expiry(key, ts, flag, store)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Private — apply expiry to existing key
   # ---------------------------------------------------------------------------
 
   defp delete_if_exists(key, store) do
-    Ferricstore.Commands.Strings.handle("DEL", [key], store)
+    Ferricstore.Commands.Strings.handle_ast({:del, [key]}, store)
   end
 
   defp apply_expiry(key, expire_at_ms, flag, store) do

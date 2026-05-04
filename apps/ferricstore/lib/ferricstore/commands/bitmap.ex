@@ -255,6 +255,159 @@ defmodule Ferricstore.Commands.Bitmap do
     {:error, "ERR wrong number of arguments for 'bitop' command"}
   end
 
+  @spec handle_ast(term(), map()) :: term()
+  def handle_ast(ast, store)
+
+  def handle_ast({:setbit, _key, {:error, reason}, _bit}, _store), do: {:error, reason}
+  def handle_ast({:setbit, _key, _offset, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:getbit, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:bitcount, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:bitpos, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:bitpos, _key, _bit, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:bitop, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:setbit, key, offset, bit_val}, store)
+      when is_integer(offset) and offset >= 0 and bit_val in [0, 1] do
+    with :ok <- ensure_string_key(key, store),
+         :ok <- check_bit_offset(offset) do
+      {current, expire_at_ms} =
+        case Ops.get_meta(store, key) do
+          nil -> {<<>>, 0}
+          {value, exp} -> {value, exp}
+        end
+
+      byte_index = div(offset, 8)
+      extended = extend_binary(current, byte_index + 1)
+      old_byte = :binary.at(extended, byte_index)
+      bit_position = 7 - rem(offset, 8)
+      old_bit = old_byte >>> bit_position &&& 1
+
+      new_byte =
+        case bit_val do
+          1 -> old_byte ||| 1 <<< bit_position
+          0 -> old_byte &&& Bitwise.bnot(1 <<< bit_position)
+        end
+
+      <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
+      new_value = <<prefix::binary, new_byte::8, suffix::binary>>
+
+      Ops.put(store, key, new_value, expire_at_ms)
+      old_bit
+    end
+  end
+
+  def handle_ast({:getbit, key, offset}, store) when is_integer(offset) and offset >= 0 do
+    with :ok <- ensure_string_key(key, store),
+         :ok <- check_bit_offset(offset) do
+      byte_index = div(offset, 8)
+
+      if byte_index_outside_value?(store, key, byte_index) do
+        0
+      else
+        current = Ops.get(store, key) || <<>>
+
+        if byte_index >= byte_size(current) do
+          0
+        else
+          byte = :binary.at(current, byte_index)
+          bit_position = 7 - rem(offset, 8)
+          byte >>> bit_position &&& 1
+        end
+      end
+    end
+  end
+
+  def handle_ast({:bitcount, key}, store) do
+    with :ok <- ensure_string_key(key, store) do
+      current = Ops.get(store, key) || <<>>
+      popcount(current)
+    end
+  end
+
+  def handle_ast({:bitcount, key, {start_idx, end_idx, mode}}, store)
+      when is_integer(start_idx) and is_integer(end_idx) and mode in [:byte, :bit] do
+    with :ok <- ensure_string_key(key, store) do
+      if bitcount_range_empty_without_value?(store, key, mode, start_idx, end_idx) do
+        0
+      else
+        current = Ops.get(store, key) || <<>>
+
+        case mode do
+          :byte -> bitcount_byte_range(current, start_idx, end_idx)
+          :bit -> bitcount_bit_range(current, start_idx, end_idx)
+        end
+      end
+    end
+  end
+
+  def handle_ast({:bitpos, key, bit_val, :all}, store) when bit_val in [0, 1] do
+    with :ok <- ensure_string_key(key, store) do
+      current = Ops.get(store, key) || <<>>
+      bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
+    end
+  end
+
+  def handle_ast({:bitpos, key, bit_val, {:start, start_idx}}, store)
+      when bit_val in [0, 1] and is_integer(start_idx) do
+    with :ok <- ensure_string_key(key, store) do
+      case bitpos_byte_range_from_size(store, key, bit_val, start_idx, nil, false) do
+        {:ok, result} ->
+          result
+
+        :unknown ->
+          current = Ops.get(store, key) || <<>>
+          len = byte_size(current)
+          start_resolved = resolve_index(start_idx, len)
+          bitpos_byte_range(current, bit_val, start_resolved, len - 1, false)
+      end
+    end
+  end
+
+  def handle_ast({:bitpos, key, bit_val, {start_idx, end_idx, mode}}, store)
+      when bit_val in [0, 1] and is_integer(start_idx) and is_integer(end_idx) and
+             mode in [:byte, :bit] do
+    with :ok <- ensure_string_key(key, store) do
+      case mode do
+        :byte ->
+          case bitpos_byte_range_from_size(store, key, bit_val, start_idx, end_idx, true) do
+            {:ok, result} ->
+              result
+
+            :unknown ->
+              current = Ops.get(store, key) || <<>>
+              len = byte_size(current)
+              s = resolve_index(start_idx, len)
+              e = resolve_index(end_idx, len)
+              bitpos_byte_range(current, bit_val, s, e, true)
+          end
+
+        :bit ->
+          case bitpos_bit_range_from_size(store, key, start_idx, end_idx) do
+            {:ok, result} ->
+              result
+
+            :unknown ->
+              current = Ops.get(store, key) || <<>>
+              total_bits = byte_size(current) * 8
+              s = resolve_index(start_idx, total_bits)
+              e = resolve_index(end_idx, total_bits)
+              bitpos_bit_range(current, bit_val, s, e)
+          end
+      end
+    end
+  end
+
+  def handle_ast({:bitop, op, destkey, source_keys}, store)
+      when op in [:band, :bor, :bxor, :bnot] and is_list(source_keys) and source_keys != [] do
+    with {:ok, result} <- execute_bitop_ast(op, source_keys, store) do
+      clear_compound_data_structure(destkey, store)
+      Ops.put(store, destkey, result, 0)
+      byte_size(result)
+    end
+  end
+
+  def handle_ast(_ast, _store), do: {:error, "ERR unsupported bitmap command AST"}
+
   # ===========================================================================
   # Private helpers
   # ===========================================================================
@@ -626,6 +779,34 @@ defmodule Ferricstore.Commands.Bitmap do
   end
 
   defp execute_bitop(_op, _keys, _store), do: {:error, "ERR syntax error"}
+
+  defp execute_bitop_ast(:bnot, [src_key], store) do
+    with {:ok, src} <- read_source(src_key, store) do
+      {:ok, bitop_not(src)}
+    end
+  end
+
+  defp execute_bitop_ast(:bnot, _keys, _store) do
+    {:error, "ERR BITOP NOT requires one and only one key"}
+  end
+
+  defp execute_bitop_ast(op, source_keys, store) when op in [:band, :bor, :bxor] do
+    with {:ok, values} <- read_sources(source_keys, store) do
+      max_len = values |> Enum.map(&byte_size/1) |> Enum.max()
+      padded = Enum.map(values, &pad_binary(&1, max_len))
+
+      result =
+        case op do
+          :band -> bitop_combine(padded, &Bitwise.band/2)
+          :bor -> bitop_combine(padded, &Bitwise.bor/2)
+          :bxor -> bitop_combine(padded, &Bitwise.bxor/2)
+        end
+
+      {:ok, result}
+    end
+  end
+
+  defp execute_bitop_ast(_op, _keys, _store), do: {:error, "ERR syntax error"}
 
   defp read_sources(source_keys, store) do
     with :ok <- ensure_string_keys(source_keys, store) do

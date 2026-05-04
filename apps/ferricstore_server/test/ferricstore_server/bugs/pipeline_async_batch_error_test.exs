@@ -36,8 +36,8 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     handle_command_fn = flunking_handle_fn("SET pipeline fast path")
 
     commands = [
-      ["SET", key, "v1"],
-      ["SET", "#{@ns}:same_batch:#{System.unique_integer([:positive])}", "v2"]
+      {:command, "SET", [key, "v1"], {:set, key, "v1"}, [key]},
+      set_ast("#{@ns}:same_batch:#{System.unique_integer([:positive])}", "v2")
     ]
 
     assert {:continue, ^state} =
@@ -63,8 +63,8 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     handle_command_fn = flunking_handle_fn("mixed GET/SET pipeline fast path")
 
     commands = [
-      ["GET", "#{@ns}:missing:#{System.unique_integer([:positive])}"],
-      ["SET", set_key, "v1"]
+      get_ast("#{@ns}:missing:#{System.unique_integer([:positive])}"),
+      {:command, "SET", [set_key, "v1"], {:set, set_key, "v1"}, [set_key]}
     ]
 
     assert {:continue, ^state} =
@@ -98,6 +98,9 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
       flunk("expected #{path}, got fallback for #{inspect(command)}")
     end
   end
+
+  defp get_ast(key), do: {:command, "GET", [key], {:get, key}, [key]}
+  defp set_ast(key, value), do: {:command, "SET", [key, value], {:set, key, value}, [key]}
 
   defp fill_async_pending(idx, key) do
     for _ <- 1..64 do

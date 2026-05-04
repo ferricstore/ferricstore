@@ -19,8 +19,9 @@ defmodule Ferricstore.Transaction.Coordinator do
 
   alias Ferricstore.Raft.CommandClock
   alias Ferricstore.Store.Router
+  alias Ferricstore.Transaction.Ast, as: TxAst
 
-  @spec execute([{binary(), [binary()]}], %{binary() => non_neg_integer()}, binary() | nil) ::
+  @spec execute([TxAst.queue_entry()], %{binary() => non_neg_integer()}, binary() | nil) ::
           [term()] | nil | {:error, binary()}
   def execute([], _watched_keys, _sandbox_namespace), do: []
 
@@ -47,7 +48,7 @@ defmodule Ferricstore.Transaction.Coordinator do
       shard_idx =>
         queue
         |> Enum.with_index()
-        |> Enum.map(fn {{cmd, args}, orig_idx} -> {orig_idx, cmd, args} end)
+        |> Enum.map(fn {entry, orig_idx} -> {orig_idx, entry} end)
     }
 
     execute_cross_shard(
@@ -67,7 +68,7 @@ defmodule Ferricstore.Transaction.Coordinator do
 
     shard_batches =
       Enum.map(shard_groups, fn {shard_idx, cmds_with_indices} ->
-        cmds = Enum.map(cmds_with_indices, fn {_orig_idx, cmd, args} -> {cmd, args} end)
+        cmds = Enum.map(cmds_with_indices, fn {_orig_idx, entry} -> entry end)
         {shard_idx, cmds, sandbox_namespace}
       end)
 
@@ -191,14 +192,17 @@ defmodule Ferricstore.Transaction.Coordinator do
   # whichever shard the keyed commands target, so they never cause CROSSSLOT.
   @keyless_commands MapSet.new(~w(PING ECHO DBSIZE TIME RANDOMKEY))
 
-  @spec classify_shards([{binary(), [binary()]}], binary() | nil) ::
+  @spec classify_shards([TxAst.queue_entry()], binary() | nil) ::
           {:single_shard, non_neg_integer()}
           | {:multi_shard, %{non_neg_integer() => list()}, %{non_neg_integer() => tuple()}}
   defp classify_shards(queue, sandbox_namespace) do
     indexed =
       queue
       |> Enum.with_index()
-      |> Enum.map(fn {{cmd, args}, idx} ->
+      |> Enum.map(fn {entry, idx} ->
+        cmd = TxAst.command_name(entry)
+        args = TxAst.command_args(entry)
+
         shard_idx =
           if MapSet.member?(@keyless_commands, cmd) do
             :keyless
@@ -206,25 +210,25 @@ defmodule Ferricstore.Transaction.Coordinator do
             command_shard(args, sandbox_namespace)
           end
 
-        {idx, cmd, args, shard_idx}
+        {idx, entry, shard_idx}
       end)
 
     # Find the first keyed shard to assign keyless commands to.
     # If all commands are keyless, they all go to shard 0.
     default_shard =
       Enum.find_value(indexed, 0, fn
-        {_, _, _, :keyless} -> nil
-        {_, _, _, shard} -> shard
+        {_, _, :keyless} -> nil
+        {_, _, shard} -> shard
       end)
 
     # Replace :keyless with the default shard
     indexed =
       Enum.map(indexed, fn
-        {idx, cmd, args, :keyless} -> {idx, cmd, args, default_shard}
+        {idx, entry, :keyless} -> {idx, entry, default_shard}
         entry -> entry
       end)
 
-    shard_indices = indexed |> Enum.map(fn {_, _, _, s} -> s end) |> Enum.uniq()
+    shard_indices = indexed |> Enum.map(fn {_, _, s} -> s end) |> Enum.uniq()
 
     case shard_indices do
       [single] ->
@@ -234,8 +238,8 @@ defmodule Ferricstore.Transaction.Coordinator do
         shard_groups =
           Enum.group_by(
             indexed,
-            fn {_idx, _cmd, _args, shard_idx} -> shard_idx end,
-            fn {idx, cmd, args, _shard_idx} -> {idx, cmd, args} end
+            fn {_idx, _entry, shard_idx} -> shard_idx end,
+            fn {idx, entry, _shard_idx} -> {idx, entry} end
           )
 
         index_map = build_index_map(shard_groups)
@@ -248,7 +252,7 @@ defmodule Ferricstore.Transaction.Coordinator do
     Enum.reduce(shard_groups, %{}, fn {shard_idx, cmds}, acc ->
       cmds
       |> Enum.with_index()
-      |> Enum.reduce(acc, fn {{orig_idx, _cmd, _args}, pos}, inner ->
+      |> Enum.reduce(acc, fn {{orig_idx, _entry}, pos}, inner ->
         Map.put(inner, orig_idx, {shard_idx, pos})
       end)
     end)

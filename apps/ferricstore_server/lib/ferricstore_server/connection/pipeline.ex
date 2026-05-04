@@ -37,7 +37,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   1. All GETs → direct ETS batch lookup
   2. All SETs → batch Raft/ETS insert
   3. Mixed GET+SET → split, batch each, reassemble
-  4. Other pure commands → batch Dispatcher.dispatch with per-command ACL
+  4. Other pure commands → batch Dispatcher.dispatch_ast with per-command ACL
   5. Stateful (MULTI/AUTH/etc) → sequential through handle_command_fn
   """
   @spec pipeline_dispatch(
@@ -109,13 +109,9 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp extract_plain_gets([], acc), do: {:ok, Enum.reverse(acc)}
 
-  defp extract_plain_gets([[name, key] | rest], acc) when is_binary(name) and is_binary(key) do
-    if fast_upcase(name) == "GET" do
-      extract_plain_gets(rest, [key | acc])
-    else
-      :fallback
-    end
-  end
+  defp extract_plain_gets([{:command, "GET", [key], {:get, key}, [key]} | rest], acc)
+       when is_binary(key),
+       do: extract_plain_gets(rest, [key | acc])
 
   defp extract_plain_gets(_, _acc), do: :fallback
 
@@ -190,14 +186,12 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp extract_plain_sets([], acc), do: {:ok, Enum.reverse(acc)}
 
-  defp extract_plain_sets([[name, key, value] | rest], acc)
-       when is_binary(name) and is_binary(key) do
-    if fast_upcase(name) == "SET" do
-      extract_plain_sets(rest, [{key, value} | acc])
-    else
-      :fallback
-    end
-  end
+  defp extract_plain_sets(
+         [{:command, "SET", [key, value], {:set, key, value}, [key]} | rest],
+         acc
+       )
+       when is_binary(key) and is_binary(value),
+       do: extract_plain_sets(rest, [{key, value} | acc])
 
   defp extract_plain_sets(_, _acc), do: :fallback
 
@@ -279,32 +273,34 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp classify_mixed_pipeline([], acc, _idx, _written_keys), do: {:ok, Enum.reverse(acc)}
 
-  defp classify_mixed_pipeline([[name, key] | rest], acc, idx, written_keys)
-       when is_binary(name) and is_binary(key) do
-    if fast_upcase(name) == "GET" do
-      if MapSet.member?(written_keys, key) do
-        :fallback
-      else
-        classify_mixed_pipeline(rest, [{:get, idx, key} | acc], idx + 1, written_keys)
-      end
-    else
+  defp classify_mixed_pipeline(
+         [{:command, "GET", [key], {:get, key}, [key]} | rest],
+         acc,
+         idx,
+         written_keys
+       )
+       when is_binary(key) do
+    if MapSet.member?(written_keys, key) do
       :fallback
+    else
+      classify_mixed_pipeline(rest, [{:get, idx, key} | acc], idx + 1, written_keys)
     end
   end
 
-  defp classify_mixed_pipeline([[name, key, value] | rest], acc, idx, written_keys)
-       when is_binary(name) and is_binary(key) do
-    if fast_upcase(name) == "SET" do
-      classify_mixed_pipeline(
-        rest,
-        [{:set, idx, key, value} | acc],
-        idx + 1,
-        MapSet.put(written_keys, key)
-      )
-    else
-      :fallback
-    end
-  end
+  defp classify_mixed_pipeline(
+         [{:command, "SET", [key, value], {:set, key, value}, [key]} | rest],
+         acc,
+         idx,
+         written_keys
+       )
+       when is_binary(key) and is_binary(value),
+       do:
+         classify_mixed_pipeline(
+           rest,
+           [{:set, idx, key, value} | acc],
+           idx + 1,
+           MapSet.put(written_keys, key)
+         )
 
   defp classify_mixed_pipeline(_, _, _, _), do: :fallback
 
@@ -504,16 +500,16 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
     {action, responses} =
       Enum.reduce_while(commands, {:continue, []}, fn cmd, {:continue, acc} ->
-        {name, args} = normalise_cmd(cmd)
+        {name, args, ast, keys} = command_parts(cmd)
         Stats.incr_commands(state.stats_counter)
 
         result =
           case ConnAuth.check_command_cached(state.acl_cache, name) do
             :ok ->
-              case ConnAuth.check_keys_cached(state.acl_cache, name, args) do
+              case ConnAuth.check_keys_cached(state.acl_cache, name, keys) do
                 :ok ->
                   try do
-                    result = Dispatcher.dispatch(name, args, store)
+                    result = dispatch_store_command(name, args, ast, store)
                     ConnTracking.maybe_notify_keyspace(name, args, result)
                     ConnTracking.maybe_notify_tracking(name, args, result, state)
                     result
@@ -584,18 +580,33 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp fast_upcase(<<first, _::binary>> = cmd) when first >= ?A and first <= ?Z, do: cmd
-  defp fast_upcase(cmd), do: String.upcase(cmd)
+  defp command_parts({:command, name, args, ast, keys})
+       when is_binary(name) and is_list(args) and is_list(keys),
+       do: {name, args, ast, keys}
 
-  defp normalise_cmd({:inline, [name | args]}) when is_binary(name),
-    do: {fast_upcase(name), args}
+  defp command_parts(_other), do: {"UNKNOWN", [], {:unknown, "UNKNOWN", []}, []}
 
-  defp normalise_cmd({:inline, []}), do: {"UNKNOWN", []}
-  defp normalise_cmd([name | args]) when is_binary(name), do: {fast_upcase(name), args}
-  defp normalise_cmd(_other), do: {"UNKNOWN", []}
+  defp dispatch_store_command(name, args, ast, store)
+       when is_tuple(ast) and tuple_size(ast) in 2..5 do
+    case Dispatcher.dispatch_ast(ast, store) do
+      {:error, "ERR unsupported command AST"} ->
+        {:error,
+         "ERR unsupported command AST for '#{String.downcase(name)}' command with #{length(args)} args"}
 
-  defp extract_command_name([name | _]) when is_binary(name), do: fast_upcase(name)
-  defp extract_command_name({:inline, [name | _]}) when is_binary(name), do: fast_upcase(name)
+      result ->
+        result
+    end
+  end
+
+  defp dispatch_store_command(_name, _args, ast, store) when ast in ~w(ping)a,
+    do: Dispatcher.dispatch_ast(ast, store)
+
+  defp dispatch_store_command(name, args, _ast, _store) do
+    {:error,
+     "ERR unsupported command AST for '#{String.downcase(name)}' command with #{length(args)} args"}
+  end
+
+  defp extract_command_name({:command, name, _args, _ast, _keys}) when is_binary(name), do: name
   defp extract_command_name(_), do: "UNKNOWN"
 
   defp requires_auth?(state) do

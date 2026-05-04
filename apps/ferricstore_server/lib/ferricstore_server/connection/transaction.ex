@@ -4,7 +4,6 @@ defmodule FerricstoreServer.Connection.Transaction do
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Store.Router
-  alias FerricstoreServer.Connection.Store, as: ConnStore
 
   # Maximum commands queued inside a MULTI transaction (100K).
   @max_multi_queue_size 100_000
@@ -30,7 +29,15 @@ defmodule FerricstoreServer.Connection.Transaction do
 
   def dispatch_exec(_args, state) do
     result = execute_transaction(state)
-    new_state = %{state | multi_state: :none, multi_queue: [], multi_queue_count: 0, watched_keys: %{}}
+
+    new_state = %{
+      state
+      | multi_state: :none,
+        multi_queue: [],
+        multi_queue_count: 0,
+        watched_keys: %{}
+    }
+
     {:continue, Encoder.encode(result), new_state}
   end
 
@@ -41,20 +48,26 @@ defmodule FerricstoreServer.Connection.Transaction do
   end
 
   def dispatch_discard(_args, state) do
-    new_state = %{state | multi_state: :none, multi_queue: [], multi_queue_count: 0, watched_keys: %{}}
+    new_state = %{
+      state
+      | multi_state: :none,
+        multi_queue: [],
+        multi_queue_count: 0,
+        watched_keys: %{}
+    }
+
     {:continue, Encoder.encode(:ok), new_state}
   end
 
   @spec dispatch_watch(list(), map()) :: conn_result()
   @doc false
   def dispatch_watch(_args, %{multi_state: :queuing} = state) do
-    {:continue,
-     Encoder.encode({:error, "ERR WATCH inside MULTI is not allowed"}), state}
+    {:continue, Encoder.encode({:error, "ERR WATCH inside MULTI is not allowed"}), state}
   end
 
   def dispatch_watch([], state) do
-    {:continue,
-     Encoder.encode({:error, "ERR wrong number of arguments for 'watch' command"}), state}
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'watch' command"}),
+     state}
   end
 
   def dispatch_watch(keys, state) do
@@ -68,8 +81,7 @@ defmodule FerricstoreServer.Connection.Transaction do
       {:continue, Encoder.encode(:ok), %{state | watched_keys: new_watched}}
     catch
       :exit, {reason, _} ->
-        {:continue,
-         Encoder.encode({:error, "ERR server not ready: #{inspect(reason)}"}), state}
+        {:continue, Encoder.encode({:error, "ERR server not ready: #{inspect(reason)}"}), state}
     end
   end
 
@@ -79,14 +91,20 @@ defmodule FerricstoreServer.Connection.Transaction do
     {:continue, Encoder.encode(:ok), %{state | watched_keys: %{}}}
   end
 
-  @spec dispatch_queue(binary(), list(), map()) :: conn_result()
+  @spec dispatch_queue(binary(), list(), term(), map()) :: conn_result()
   @doc """
   Handles queuing of commands during MULTI mode. Called when `multi_state: :queuing`
   for commands that are not in the passthrough set (EXEC, DISCARD, MULTI, WATCH, UNWATCH).
   """
-  def dispatch_queue(cmd, args, state) do
+  def dispatch_queue(cmd, args, ast, state) do
     if state.multi_queue_count >= @max_multi_queue_size do
-      new_state = %{state | multi_state: :none, multi_queue: [], multi_queue_count: 0, watched_keys: %{}}
+      new_state = %{
+        state
+        | multi_state: :none,
+          multi_queue: [],
+          multi_queue_count: 0,
+          watched_keys: %{}
+      }
 
       {:continue,
        Encoder.encode(
@@ -94,13 +112,13 @@ defmodule FerricstoreServer.Connection.Transaction do
           "ERR MULTI queue overflow (max #{@max_multi_queue_size} commands), transaction discarded"}
        ), new_state}
     else
-      store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
-
-      case validate_command(cmd, args, store) do
+      case validate_command(cmd, ast) do
         :ok ->
-          new_queue = [{cmd, args} | state.multi_queue]
+          new_queue = [{cmd, args, ast} | state.multi_queue]
           new_count = state.multi_queue_count + 1
-          {:continue, Encoder.encode({:simple, "QUEUED"}), %{state | multi_queue: new_queue, multi_queue_count: new_count}}
+
+          {:continue, Encoder.encode({:simple, "QUEUED"}),
+           %{state | multi_queue: new_queue, multi_queue_count: new_count}}
 
         {:error, _msg} = err ->
           {:continue, Encoder.encode(err), state}
@@ -122,14 +140,24 @@ defmodule FerricstoreServer.Connection.Transaction do
   # Command validation (for queue-time syntax checking)
   # ---------------------------------------------------------------------------
 
-  defp validate_command(cmd, args, _store) do
+  defp validate_command(cmd, ast) do
     noop_store = build_noop_store()
 
-    case Dispatcher.dispatch(cmd, args, noop_store) do
-      {:error, "ERR unknown command" <> _} = err -> err
-      {:error, "ERR wrong number of arguments" <> _} = err -> err
-      {:error, "ERR syntax error" <> _} = err -> err
-      _ -> :ok
+    case Dispatcher.dispatch_ast(ast, noop_store) do
+      {:error, "ERR unsupported command AST"} ->
+        {:error, "ERR unknown command '#{String.downcase(cmd)}', with args beginning with: "}
+
+      {:error, "ERR unknown command" <> _} = err ->
+        err
+
+      {:error, "ERR wrong number of arguments" <> _} = err ->
+        err
+
+      {:error, "ERR syntax error" <> _} = err ->
+        err
+
+      _ ->
+        :ok
     end
   end
 

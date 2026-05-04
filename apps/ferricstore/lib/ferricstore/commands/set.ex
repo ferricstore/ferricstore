@@ -499,9 +499,339 @@ defmodule Ferricstore.Commands.Set do
     {:error, "ERR wrong number of arguments for 'sintercard' command"}
   end
 
+  @doc false
+  def handle_ast(ast, store)
+
+  def handle_ast({:sadd, args}, store), do: sadd_args(args, store)
+  def handle_ast({:srem, args}, store), do: srem_args(args, store)
+  def handle_ast({:smismember, args}, store), do: smismember_args(args, store)
+  def handle_ast({:sinter, args}, store), do: sinter_keys(args, store)
+  def handle_ast({:sunion, args}, store), do: sunion_keys(args, store)
+  def handle_ast({:sdiff, args}, store), do: sdiff_keys(args, store)
+  def handle_ast({:sdiffstore, args}, store), do: sdiffstore_args(args, store)
+  def handle_ast({:sinterstore, args}, store), do: sinterstore_args(args, store)
+  def handle_ast({:sunionstore, args}, store), do: sunionstore_args(args, store)
+
+  def handle_ast({:smembers, key}, store), do: smembers_key(key, store)
+  def handle_ast({:sismember, key, member}, store), do: sismember_member(key, member, store)
+  def handle_ast({:scard, key}, store), do: scard_key(key, store)
+
+  def handle_ast({:smove, source, destination, member}, store),
+    do: smove_member(source, destination, member, store)
+
+  def handle_ast({:srandmember, key}, store), do: srandmember_one(key, store)
+  def handle_ast({:srandmember, _key, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:srandmember, key, count}, store) when is_integer(count) do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      key
+      |> get_members_list(store)
+      |> select_random_members(count)
+    end
+  end
+
+  def handle_ast({:spop, key}, store), do: spop_one(key, store)
+  def handle_ast({:spop, _key, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:spop, key, count}, store) when is_integer(count) and count >= 0,
+    do: spop_count(key, count, store)
+
+  def handle_ast({:sscan, _key, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:sscan, key, cursor, opts}, store) when is_integer(cursor) and cursor >= 0,
+    do: sscan_typed(key, cursor, opts, store)
+
+  def handle_ast({:sintercard, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:sintercard, keys, limit}, store)
+      when is_list(keys) and is_integer(limit) and limit >= 0,
+      do: sintercard_typed(keys, limit, store)
+
+  def handle_ast(_ast, _store), do: {:error, "ERR unsupported set command AST"}
+
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  defp sadd_args([key | members], store) when members != [] do
+    with :ok <- TypeRegistry.check_or_set(key, :set, store) do
+      compound_keys =
+        members
+        |> Enum.uniq()
+        |> Enum.map(&CompoundKey.set_member(key, &1))
+
+      new_keys =
+        store
+        |> Ops.compound_batch_get(key, compound_keys)
+        |> Enum.zip(compound_keys)
+        |> Enum.flat_map(fn
+          {nil, compound_key} -> [compound_key]
+          {_value, _compound_key} -> []
+        end)
+
+      Enum.each(new_keys, &Ops.compound_put(store, key, &1, @presence_marker, 0))
+      length(new_keys)
+    end
+  end
+
+  defp sadd_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'sadd' command"}
+
+  defp srem_args([key | members], store) when members != [] do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      compound_keys =
+        members
+        |> Enum.uniq()
+        |> Enum.map(&CompoundKey.set_member(key, &1))
+
+      removed_keys =
+        store
+        |> Ops.compound_batch_get(key, compound_keys)
+        |> Enum.zip(compound_keys)
+        |> Enum.flat_map(fn
+          {nil, _compound_key} -> []
+          {_value, compound_key} -> [compound_key]
+        end)
+
+      Enum.each(removed_keys, &Ops.compound_delete(store, key, &1))
+
+      removed = length(removed_keys)
+
+      maybe_cleanup_empty_set(key, removed, store)
+      removed
+    end
+  end
+
+  defp srem_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'srem' command"}
+
+  defp smembers_key(key, store) do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      key
+      |> get_members_list(store)
+    end
+  end
+
+  defp sismember_member(key, member, store) do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      compound_key = CompoundKey.set_member(key, member)
+      if Ops.compound_get(store, key, compound_key) != nil, do: 1, else: 0
+    end
+  end
+
+  defp smismember_args([key | members], store) when members != [] do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      compound_keys = Enum.map(members, &CompoundKey.set_member(key, &1))
+
+      store
+      |> Ops.compound_batch_get(key, compound_keys)
+      |> Enum.map(fn
+        nil -> 0
+        _value -> 1
+      end)
+    end
+  end
+
+  defp smismember_args(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'smismember' command"}
+
+  defp scard_key(key, store) do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      prefix = CompoundKey.set_prefix(key)
+      Ops.compound_count(store, key, prefix)
+    end
+  end
+
+  defp sinter_keys([_ | _] = keys, store) do
+    with :ok <- check_all_types(keys, store) do
+      sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
+
+      result =
+        case sets do
+          [first | rest] -> Enum.reduce(rest, first, &MapSet.intersection(&2, &1))
+          [] -> MapSet.new()
+        end
+
+      MapSet.to_list(result)
+    end
+  end
+
+  defp sinter_keys(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'sinter' command"}
+
+  defp sunion_keys([_ | _] = keys, store) do
+    with :ok <- check_all_types(keys, store) do
+      sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
+      result = Enum.reduce(sets, MapSet.new(), &MapSet.union(&2, &1))
+      MapSet.to_list(result)
+    end
+  end
+
+  defp sunion_keys(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'sunion' command"}
+
+  defp sdiff_keys([first_key | rest_keys], store) do
+    with :ok <- check_all_types([first_key | rest_keys], store) do
+      first_set = get_members_set(first_key, store)
+      rest_sets = Enum.map(rest_keys, fn key -> get_members_set(key, store) end)
+      result = Enum.reduce(rest_sets, first_set, &MapSet.difference(&2, &1))
+      MapSet.to_list(result)
+    end
+  end
+
+  defp sdiff_keys(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'sdiff' command"}
+
+  defp smove_member(source, destination, member, store) do
+    CrossShardOp.execute(
+      [{source, :read_write}, {destination, :write}],
+      fn unified_store ->
+        do_smove(source, destination, member, unified_store)
+      end,
+      intent: %{command: :smove, keys: %{source: source, dest: destination}, value_hashes: %{}},
+      store: store
+    )
+  end
+
+  defp sdiffstore_args([destination | [_ | _] = keys], store) do
+    store_result_at(destination, keys, :sdiffstore, store, fn source_keys, unified_store ->
+      first_set = get_members_set(hd(source_keys), unified_store)
+      rest_sets = Enum.map(tl(source_keys), fn key -> get_members_set(key, unified_store) end)
+      Enum.reduce(rest_sets, first_set, &MapSet.difference(&2, &1))
+    end)
+  end
+
+  defp sdiffstore_args(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'sdiffstore' command"}
+
+  defp sinterstore_args([destination | [_ | _] = keys], store) do
+    store_result_at(destination, keys, :sinterstore, store, fn source_keys, unified_store ->
+      sets = Enum.map(source_keys, fn key -> get_members_set(key, unified_store) end)
+
+      case sets do
+        [first | rest] -> Enum.reduce(rest, first, &MapSet.intersection(&2, &1))
+        [] -> MapSet.new()
+      end
+    end)
+  end
+
+  defp sinterstore_args(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'sinterstore' command"}
+
+  defp sunionstore_args([destination | [_ | _] = keys], store) do
+    store_result_at(destination, keys, :sunionstore, store, fn source_keys, unified_store ->
+      sets = Enum.map(source_keys, fn key -> get_members_set(key, unified_store) end)
+      Enum.reduce(sets, MapSet.new(), &MapSet.union(&2, &1))
+    end)
+  end
+
+  defp sunionstore_args(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'sunionstore' command"}
+
+  defp store_result_at(destination, keys, command, store, result_fun) do
+    keys_with_roles =
+      [{destination, :write}] ++ Enum.map(keys, fn key -> {key, :read} end)
+
+    CrossShardOp.execute(
+      keys_with_roles,
+      fn unified_store ->
+        with :ok <- check_all_types(keys, unified_store) do
+          destination
+          |> store_set_at(result_fun.(keys, unified_store), unified_store)
+        end
+      end,
+      intent: %{
+        command: command,
+        keys: %{dest: destination, sources: keys},
+        value_hashes: %{}
+      },
+      store: store
+    )
+  end
+
+  defp srandmember_one(key, store) do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      case get_members_list(key, store) do
+        [] -> nil
+        members -> Enum.random(members)
+      end
+    end
+  end
+
+  defp spop_one(key, store) do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      case get_members_list(key, store) do
+        [] ->
+          nil
+
+        members ->
+          member = Enum.random(members)
+          compound_key = CompoundKey.set_member(key, member)
+          Ops.compound_delete(store, key, compound_key)
+          maybe_cleanup_empty_set(key, 1, store)
+          member
+      end
+    end
+  end
+
+  defp spop_count(key, count, store) do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      members = get_members_list(key, store)
+      selected = Enum.take_random(members, count)
+
+      removed =
+        Enum.reduce(selected, 0, fn member, acc ->
+          compound_key = CompoundKey.set_member(key, member)
+          Ops.compound_delete(store, key, compound_key)
+          acc + 1
+        end)
+
+      if removed > 0 do
+        maybe_cleanup_empty_set(key, removed, store)
+      end
+
+      selected
+    end
+  end
+
+  defp sscan_typed(key, cursor, opts, store) do
+    with :ok <- TypeRegistry.check_type(key, :set, store),
+         {:ok, match_pattern, count} <- typed_scan_opts(opts) do
+      prefix = CompoundKey.set_prefix(key)
+      pairs = Ops.compound_scan(store, key, prefix)
+      members = Enum.map(pairs, fn {member, _} -> member end)
+
+      filtered =
+        case match_pattern do
+          nil ->
+            members
+
+          pattern ->
+            Enum.filter(members, fn member -> Ferricstore.GlobMatcher.match?(member, pattern) end)
+        end
+
+      {next_cursor, batch} = paginate(filtered, cursor, count)
+      [next_cursor, batch]
+    end
+  end
+
+  defp sintercard_typed(keys, limit, store) do
+    with :ok <- check_all_types(keys, store) do
+      sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
+
+      intersection =
+        case sets do
+          [first | others] -> Enum.reduce(others, first, &MapSet.intersection(&2, &1))
+          [] -> MapSet.new()
+        end
+
+      count = MapSet.size(intersection)
+
+      if limit > 0 and count > limit do
+        limit
+      else
+        count
+      end
+    end
+  end
 
   # Core SMOVE logic, extracted for use inside CrossShardOp.execute.
   defp do_smove(source, destination, member, store) do
@@ -639,6 +969,21 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
   # SSCAN helpers
   # ---------------------------------------------------------------------------
+
+  defp typed_scan_opts(opts), do: do_typed_scan_opts(opts, nil, 10)
+
+  defp do_typed_scan_opts([], match, count), do: {:ok, match, count}
+
+  defp do_typed_scan_opts([{:match, pattern} | rest], _match, count) when is_binary(pattern) do
+    do_typed_scan_opts(rest, pattern, count)
+  end
+
+  defp do_typed_scan_opts([{:count, count} | rest], match, _count)
+       when is_integer(count) and count > 0 do
+    do_typed_scan_opts(rest, match, count)
+  end
+
+  defp do_typed_scan_opts(_opts, _match, _count), do: {:error, "ERR syntax error"}
 
   defp parse_cursor(cursor_str) do
     case Integer.parse(cursor_str) do

@@ -212,7 +212,7 @@ defmodule Ferricstore.Commands.Blocking do
   def handle("BRPOPLPUSH", args, store) do
     case parse_brpoplpush_args(args) do
       {:ok, source, destination, _timeout_ms} ->
-        List.handle("LMOVE", [source, destination, "RIGHT", "LEFT"], store)
+        List.handle_ast({:lmove, source, destination, :right, :left}, store)
 
       {:error, _} = err ->
         err
@@ -222,7 +222,7 @@ defmodule Ferricstore.Commands.Blocking do
   def handle("BLMOVE", args, store) do
     case parse_blmove_args(args) do
       {:ok, source, destination, from_dir, to_dir, _timeout_ms} ->
-        List.handle("LMOVE", [source, destination, to_string(from_dir), to_string(to_dir)], store)
+        List.handle_ast({:lmove, source, destination, from_dir, to_dir}, store)
 
       {:error, _} = err ->
         err

@@ -2,106 +2,115 @@ defmodule FerricstoreServer.Connection.Blocking do
   @moduledoc "Blocking command handlers (BLPOP, BRPOP, BLMOVE, BLMPOP, XREAD BLOCK) with waiter registration and client-disconnect detection."
 
   alias FerricstoreServer.Resp.Encoder
-  alias Ferricstore.Commands.{Blocking, List}
+  alias Ferricstore.Commands.List
   alias Ferricstore.Commands.Stream, as: StreamCmd
   alias Ferricstore.Waiters
   alias FerricstoreServer.Connection.Store, as: ConnStore
 
   @type conn_result :: {:continue, iodata(), map()} | {:block, map()} | {:close, iodata(), map()}
 
-  @spec dispatch_blpop(list(), map()) :: conn_result()
+  @spec dispatch_blpop_ast([binary()], non_neg_integer(), map()) :: conn_result()
   @doc false
-  def dispatch_blpop(args, state) do
-    dispatch_blocking(:blpop, args, state)
+  def dispatch_blpop_ast(keys, timeout_ms, state) do
+    dispatch_blocking_parsed(:blpop, keys, timeout_ms, state)
   end
 
-  @spec dispatch_brpop(list(), map()) :: conn_result()
+  @spec dispatch_brpop_ast([binary()], non_neg_integer(), map()) :: conn_result()
   @doc false
-  def dispatch_brpop(args, state) do
-    dispatch_blocking(:brpop, args, state)
+  def dispatch_brpop_ast(keys, timeout_ms, state) do
+    dispatch_blocking_parsed(:brpop, keys, timeout_ms, state)
   end
 
-  @spec dispatch_blmove(list(), map()) :: conn_result()
+  @spec dispatch_blmove_ast(
+          binary(),
+          binary(),
+          :left | :right,
+          :left | :right,
+          non_neg_integer(),
+          map()
+        ) :: conn_result()
   @doc false
-  def dispatch_blmove(args, state) do
-    case Blocking.parse_blmove_args(args) do
-      {:ok, source, destination, from_dir, to_dir, timeout_ms} ->
-        store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
+  def dispatch_blmove_ast(source, destination, from_dir, to_dir, timeout_ms, state) do
+    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
 
-        # Try immediate LMOVE
-        case List.handle("LMOVE", [source, destination, to_string(from_dir), to_string(to_dir)], store) do
-          nil ->
-            # Source is empty -- block if timeout allows
-            if timeout_ms == 0 do
-              do_blmove_wait([source], 300_000, source, destination, from_dir, to_dir, store, state)
-            else
-              do_blmove_wait([source], timeout_ms, source, destination, from_dir, to_dir, store, state)
-            end
-
-          {:error, _} = err ->
-            {:continue, Encoder.encode(err), state}
-
-          value ->
-            {:continue, Encoder.encode(value), state}
+    # Try immediate LMOVE
+    case List.handle(
+           "LMOVE",
+           [source, destination, to_string(from_dir), to_string(to_dir)],
+           store
+         ) do
+      nil ->
+        # Source is empty -- block if timeout allows
+        if timeout_ms == 0 do
+          do_blmove_wait([source], 300_000, source, destination, from_dir, to_dir, store, state)
+        else
+          do_blmove_wait(
+            [source],
+            timeout_ms,
+            source,
+            destination,
+            from_dir,
+            to_dir,
+            store,
+            state
+          )
         end
 
       {:error, _} = err ->
         {:continue, Encoder.encode(err), state}
+
+      value ->
+        {:continue, Encoder.encode(value), state}
     end
   end
 
-  @spec dispatch_blmpop(list(), map()) :: conn_result()
+  @spec dispatch_blmpop_ast([binary()], :left | :right, pos_integer(), non_neg_integer(), map()) ::
+          conn_result()
   @doc false
-  def dispatch_blmpop(args, state) do
-    case Blocking.parse_blmpop_args(args) do
-      {:ok, keys, direction, count, timeout_ms} ->
-        store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
-        pop_cmd = if direction == :left, do: "LPOP", else: "RPOP"
+  def dispatch_blmpop_ast(keys, direction, count, timeout_ms, state) do
+    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
+    pop_cmd = if direction == :left, do: "LPOP", else: "RPOP"
 
-        # Build the count arg list: omit count arg when count == 1
-        # to get a single-element return (not wrapped in a list)
-        pop_args_fn = fn key ->
-          if count == 1, do: [key], else: [key, to_string(count)]
+    # Build the count arg list: omit count arg when count == 1
+    # to get a single-element return (not wrapped in a list)
+    pop_args_fn = fn key ->
+      if count == 1, do: [key], else: [key, to_string(count)]
+    end
+
+    # Try immediate pop on each key (first non-empty wins)
+    immediate =
+      Enum.find_value(keys, fn key ->
+        case List.handle(pop_cmd, pop_args_fn.(key), store) do
+          nil -> nil
+          {:error, _} -> nil
+          value -> {key, value}
         end
+      end)
 
-        # Try immediate pop on each key (first non-empty wins)
-        immediate =
-          Enum.find_value(keys, fn key ->
-            case List.handle(pop_cmd, pop_args_fn.(key), store) do
-              nil -> nil
-              {:error, _} -> nil
-              value -> {key, value}
-            end
-          end)
+    case immediate do
+      {key, value} ->
+        # Wrap single value into a list for consistent BLMPOP format
+        elements = if is_list(value), do: value, else: [value]
+        {:continue, Encoder.encode([key, elements]), state}
 
-        case immediate do
-          {key, value} ->
-            # Wrap single value into a list for consistent BLMPOP format
-            elements = if is_list(value), do: value, else: [value]
-            {:continue, Encoder.encode([key, elements]), state}
-
-          nil ->
-            if timeout_ms == 0 do
-              do_blmpop_wait(keys, 300_000, pop_cmd, pop_args_fn, store, state)
-            else
-              do_blmpop_wait(keys, timeout_ms, pop_cmd, pop_args_fn, store, state)
-            end
+      nil ->
+        if timeout_ms == 0 do
+          do_blmpop_wait(keys, 300_000, pop_cmd, pop_args_fn, store, state)
+        else
+          do_blmpop_wait(keys, timeout_ms, pop_cmd, pop_args_fn, store, state)
         end
-
-      {:error, _} = err ->
-        {:continue, Encoder.encode(err), state}
     end
   end
 
-  @spec dispatch_xread(list(), map()) :: conn_result()
+  @spec dispatch_xread_ast(term(), list(), map()) :: conn_result()
   @doc false
-  def dispatch_xread(args, state) do
+  def dispatch_xread_ast(ast, args, state) do
     alias Ferricstore.Commands.Dispatcher
     store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
 
     result =
       try do
-        Dispatcher.dispatch("XREAD", args, store)
+        Dispatcher.dispatch_ast(ast, store)
       catch
         :exit, {:noproc, _} ->
           {:error, "ERR server not ready, shard process unavailable"}
@@ -110,6 +119,10 @@ defmodule FerricstoreServer.Connection.Blocking do
           {:error, "ERR internal error: #{inspect(reason)}"}
       end
 
+    handle_xread_result(result, args, store, state)
+  end
+
+  defp handle_xread_result(result, args, store, state) do
     case result do
       {:block, timeout_ms, stream_ids, count} ->
         dispatch_xread_block(timeout_ms, stream_ids, count, store, state)
@@ -127,35 +140,29 @@ defmodule FerricstoreServer.Connection.Blocking do
   # Internal helpers
   # ---------------------------------------------------------------------------
 
-  defp dispatch_blocking(pop_dir, args, state) do
-    case Blocking.parse_blpop_args(args) do
-      {:ok, keys, timeout_ms} ->
-        store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
-        pop_cmd = if pop_dir == :blpop, do: "LPOP", else: "RPOP"
+  defp dispatch_blocking_parsed(pop_dir, keys, timeout_ms, state) do
+    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
+    pop_cmd = if pop_dir == :blpop, do: "LPOP", else: "RPOP"
 
-        # Try immediate pop on each key (first non-empty wins)
-        immediate =
-          Enum.find_value(keys, fn key ->
-            case List.handle(pop_cmd, [key], store) do
-              nil -> nil
-              {:error, _} -> nil
-              value -> [key, value]
-            end
-          end)
-
-        if immediate do
-          {:continue, Encoder.encode(immediate), state}
-        else
-          if timeout_ms == 0 do
-            # timeout=0 means block forever (Redis semantics), but we cap at 5 min
-            do_block_wait(keys, 300_000, pop_cmd, store, state)
-          else
-            do_block_wait(keys, timeout_ms, pop_cmd, store, state)
-          end
+    # Try immediate pop on each key (first non-empty wins)
+    immediate =
+      Enum.find_value(keys, fn key ->
+        case List.handle(pop_cmd, [key], store) do
+          nil -> nil
+          {:error, _} -> nil
+          value -> [key, value]
         end
+      end)
 
-      {:error, _} = err ->
-        {:continue, Encoder.encode(err), state}
+    if immediate do
+      {:continue, Encoder.encode(immediate), state}
+    else
+      if timeout_ms == 0 do
+        # timeout=0 means block forever (Redis semantics), but we cap at 5 min
+        do_block_wait(keys, 300_000, pop_cmd, store, state)
+      else
+        do_block_wait(keys, timeout_ms, pop_cmd, store, state)
+      end
     end
   end
 
@@ -229,7 +236,11 @@ defmodule FerricstoreServer.Connection.Blocking do
     Enum.each(keys, fn key -> Waiters.register(key, self(), deadline) end)
 
     notify_fn = fn _notified_key ->
-      case List.handle("LMOVE", [source, destination, to_string(from_dir), to_string(to_dir)], store) do
+      case List.handle(
+             "LMOVE",
+             [source, destination, to_string(from_dir), to_string(to_dir)],
+             store
+           ) do
         nil -> nil
         {:error, _} -> nil
         value -> {:ok, value}
@@ -260,8 +271,12 @@ defmodule FerricstoreServer.Connection.Blocking do
 
     notify_fn = fn notified_key ->
       case List.handle(pop_cmd, pop_args_fn.(notified_key), store) do
-        nil -> nil
-        {:error, _} -> nil
+        nil ->
+          nil
+
+        {:error, _} ->
+          nil
+
         value ->
           elements = if is_list(value), do: value, else: [value]
           {:ok, [notified_key, elements]}
@@ -314,8 +329,10 @@ defmodule FerricstoreServer.Connection.Blocking do
       end
     end
 
-    result = generic_wait_loop(state, deadline, effective_timeout, notify_fn,
-                               waiter_msg: :stream_waiter_notify)
+    result =
+      generic_wait_loop(state, deadline, effective_timeout, notify_fn,
+        waiter_msg: :stream_waiter_notify
+      )
 
     # Cleanup: unregister from all stream keys.
     Enum.each(keys, fn key -> StreamCmd.unregister_stream_waiter(key, self()) end)

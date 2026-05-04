@@ -30,6 +30,24 @@ defmodule Ferricstore.Commands.Bloom do
   # Public command handler
   # -------------------------------------------------------------------
 
+  @spec handle_ast(term(), map()) :: term()
+  def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+  def handle_ast({tag, _key, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
+
+  def handle_ast({:bf_reserve, key, error_rate, capacity}, store) do
+    with :ok <- validate_error_rate(error_rate),
+         :ok <- check_bloom_not_exists(key, store) do
+      do_bloom_reserve(key, capacity, error_rate, store)
+    end
+  end
+
+  def handle_ast({:bf_add, args}, store), do: bf_add_args(args, store)
+  def handle_ast({:bf_madd, args}, store), do: bf_madd_args(args, store)
+  def handle_ast({:bf_exists, args}, store), do: bf_exists_args(args, store)
+  def handle_ast({:bf_mexists, args}, store), do: bf_mexists_args(args, store)
+  def handle_ast({:bf_card, args}, store), do: bf_card_args(args, store)
+  def handle_ast({:bf_info, args}, store), do: bf_info_args(args, store)
+
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
 
@@ -54,7 +72,39 @@ defmodule Ferricstore.Commands.Bloom do
   # BF.ADD key element — write through Raft
   # ---------------------------------------------------------------------------
 
-  def handle("BF.ADD", [key, element], store) do
+  def handle("BF.ADD", args, store), do: bf_add_args(args, store)
+
+  # ---------------------------------------------------------------------------
+  # BF.MADD key element [element ...] — write through Raft
+  # ---------------------------------------------------------------------------
+
+  def handle("BF.MADD", args, store), do: bf_madd_args(args, store)
+
+  # ---------------------------------------------------------------------------
+  # BF.EXISTS key element — local stateless pread
+  # ---------------------------------------------------------------------------
+
+  def handle("BF.EXISTS", args, store), do: bf_exists_args(args, store)
+
+  # ---------------------------------------------------------------------------
+  # BF.MEXISTS key element [element ...] — local stateless pread
+  # ---------------------------------------------------------------------------
+
+  def handle("BF.MEXISTS", args, store), do: bf_mexists_args(args, store)
+
+  # ---------------------------------------------------------------------------
+  # BF.CARD key — local stateless pread
+  # ---------------------------------------------------------------------------
+
+  def handle("BF.CARD", args, store), do: bf_card_args(args, store)
+
+  # ---------------------------------------------------------------------------
+  # BF.INFO key — local stateless pread
+  # ---------------------------------------------------------------------------
+
+  def handle("BF.INFO", args, store), do: bf_info_args(args, store)
+
+  defp bf_add_args([key, element], store) do
     with :ok <- ProbType.check_expected(key, :bloom, store) do
       auto_params = default_auto_create_params()
       result = do_prob_write(store, {:bloom_add, key, element, auto_params})
@@ -62,15 +112,11 @@ defmodule Ferricstore.Commands.Bloom do
     end
   end
 
-  def handle("BF.ADD", _args, _store) do
+  defp bf_add_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'bf.add' command"}
   end
 
-  # ---------------------------------------------------------------------------
-  # BF.MADD key element [element ...] — write through Raft
-  # ---------------------------------------------------------------------------
-
-  def handle("BF.MADD", [key | elements], store) when elements != [] do
+  defp bf_madd_args([key | elements], store) when elements != [] do
     with :ok <- ProbType.check_expected(key, :bloom, store) do
       auto_params = default_auto_create_params()
       result = do_prob_write(store, {:bloom_madd, key, elements, auto_params})
@@ -78,15 +124,11 @@ defmodule Ferricstore.Commands.Bloom do
     end
   end
 
-  def handle("BF.MADD", _args, _store) do
+  defp bf_madd_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'bf.madd' command"}
   end
 
-  # ---------------------------------------------------------------------------
-  # BF.EXISTS key element — local stateless pread
-  # ---------------------------------------------------------------------------
-
-  def handle("BF.EXISTS", [key, element], store) do
+  defp bf_exists_args([key, element], store) do
     path = prob_path(store, key, "bloom")
 
     case await_nif(fn proxy, corr_id ->
@@ -106,15 +148,11 @@ defmodule Ferricstore.Commands.Bloom do
     end
   end
 
-  def handle("BF.EXISTS", _args, _store) do
+  defp bf_exists_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'bf.exists' command"}
   end
 
-  # ---------------------------------------------------------------------------
-  # BF.MEXISTS key element [element ...] — local stateless pread
-  # ---------------------------------------------------------------------------
-
-  def handle("BF.MEXISTS", [key | elements], store) when elements != [] do
+  defp bf_mexists_args([key | elements], store) when elements != [] do
     path = prob_path(store, key, "bloom")
 
     case await_nif(fn proxy, corr_id ->
@@ -134,15 +172,11 @@ defmodule Ferricstore.Commands.Bloom do
     end
   end
 
-  def handle("BF.MEXISTS", _args, _store) do
+  defp bf_mexists_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'bf.mexists' command"}
   end
 
-  # ---------------------------------------------------------------------------
-  # BF.CARD key — local stateless pread
-  # ---------------------------------------------------------------------------
-
-  def handle("BF.CARD", [key], store) do
+  defp bf_card_args([key], store) do
     path = prob_path(store, key, "bloom")
 
     case await_nif(fn proxy, corr_id ->
@@ -162,15 +196,11 @@ defmodule Ferricstore.Commands.Bloom do
     end
   end
 
-  def handle("BF.CARD", _args, _store) do
+  defp bf_card_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'bf.card' command"}
   end
 
-  # ---------------------------------------------------------------------------
-  # BF.INFO key — local stateless pread
-  # ---------------------------------------------------------------------------
-
-  def handle("BF.INFO", [key], store) do
+  defp bf_info_args([key], store) do
     path = prob_path(store, key, "bloom")
 
     case await_nif(fn proxy, corr_id ->
@@ -210,7 +240,7 @@ defmodule Ferricstore.Commands.Bloom do
     end
   end
 
-  def handle("BF.INFO", _args, _store) do
+  defp bf_info_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'bf.info' command"}
   end
 

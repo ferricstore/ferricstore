@@ -301,7 +301,9 @@ defmodule Ferricstore.Commands.Hash do
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
         expire_at_ms = CommandTime.now_ms() + seconds * 1000
-        {unique_fields, compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
+
+        {unique_fields, compound_keys, metas_by_field} =
+          batch_hash_field_metas(fields, key, store)
 
         unique_fields
         |> Enum.zip(compound_keys)
@@ -343,7 +345,9 @@ defmodule Ferricstore.Commands.Hash do
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
         now = CommandTime.now_ms()
-        {_unique_fields, _compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
+
+        {_unique_fields, _compound_keys, metas_by_field} =
+          batch_hash_field_metas(fields, key, store)
 
         Enum.map(fields, fn field ->
           case Map.fetch!(metas_by_field, field) do
@@ -376,7 +380,8 @@ defmodule Ferricstore.Commands.Hash do
     with {:ok, count} <- parse_positive_integer(count_str, "count"),
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
-        {unique_fields, compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
+        {unique_fields, compound_keys, metas_by_field} =
+          batch_hash_field_metas(fields, key, store)
 
         unique_fields
         |> Enum.zip(compound_keys)
@@ -422,7 +427,9 @@ defmodule Ferricstore.Commands.Hash do
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
         expire_at_ms = CommandTime.now_ms() + ms
-        {unique_fields, compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
+
+        {unique_fields, compound_keys, metas_by_field} =
+          batch_hash_field_metas(fields, key, store)
 
         unique_fields
         |> Enum.zip(compound_keys)
@@ -464,7 +471,9 @@ defmodule Ferricstore.Commands.Hash do
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
         now = CommandTime.now_ms()
-        {_unique_fields, _compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
+
+        {_unique_fields, _compound_keys, metas_by_field} =
+          batch_hash_field_metas(fields, key, store)
 
         Enum.map(fields, fn field ->
           case Map.fetch!(metas_by_field, field) do
@@ -497,7 +506,8 @@ defmodule Ferricstore.Commands.Hash do
     with {:ok, count} <- parse_positive_integer(count_str, "count"),
          :ok <- validate_field_count(count, fields) do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
-        {_unique_fields, _compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
+        {_unique_fields, _compound_keys, metas_by_field} =
+          batch_hash_field_metas(fields, key, store)
 
         Enum.map(fields, fn field ->
           case Map.fetch!(metas_by_field, field) do
@@ -743,9 +753,297 @@ defmodule Ferricstore.Commands.Hash do
     {:error, "ERR wrong number of arguments for 'hrandfield' command"}
   end
 
+  @doc false
+  def handle_ast(ast, store)
+
+  def handle_ast({:hset, args}, store), do: hset_args(args, store)
+  def handle_ast({:hdel, args}, store), do: hdel_args(args, store)
+  def handle_ast({:hmget, args}, store), do: hmget_args(args, store)
+
+  def handle_ast({:hget, key, field}, store), do: hget_field(key, field, store)
+  def handle_ast({:hgetall, key}, store), do: hgetall_key(key, store)
+  def handle_ast({:hexists, key, field}, store), do: hexists_field(key, field, store)
+  def handle_ast({:hkeys, key}, store), do: hkeys_key(key, store)
+  def handle_ast({:hvals, key}, store), do: hvals_key(key, store)
+  def handle_ast({:hlen, key}, store), do: hlen_key(key, store)
+
+  def handle_ast({:hsetnx, key, field, value}, store),
+    do: hsetnx_field(key, field, value, store)
+
+  def handle_ast({:hstrlen, key, field}, store), do: hstrlen_field(key, field, store)
+  def handle_ast({:hscan, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:hscan, key, cursor, opts}, store), do: hscan_typed(key, cursor, opts, store)
+
+  def handle_ast({:hincrby, _key, _field, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:hincrby, key, field, increment}, store) when is_integer(increment) do
+    with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
+      do_hincrby(key, field, increment, store)
+    end
+  end
+
+  def handle_ast({:hincrbyfloat, _key, _field, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:hincrbyfloat, key, field, increment}, store) when is_float(increment) do
+    with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
+      hincrbyfloat_parsed(key, field, increment, store)
+    end
+  end
+
+  def handle_ast({:hrandfield, key}, store), do: hrandfield_one(key, store)
+  def handle_ast({:hrandfield, _key, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:hrandfield, key, count}, store) when is_integer(count),
+    do: hrandfield_parsed(key, count, false, store)
+
+  def handle_ast({:hrandfield, _key, _count, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:hrandfield, key, count, :withvalues}, store) when is_integer(count),
+    do: hrandfield_parsed(key, count, true, store)
+
+  def handle_ast({:hexpire, _key, {:error, reason}, _fields}, _store), do: {:error, reason}
+  def handle_ast({:hpexpire, _key, {:error, reason}, _fields}, _store), do: {:error, reason}
+  def handle_ast({:hsetex, _key, {:error, reason}, _pairs}, _store), do: {:error, reason}
+  def handle_ast({:hgetex, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:hgetex, _key, {:error, reason}, _fields}, _store), do: {:error, reason}
+  def handle_ast({:httl, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:hpersist, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:hpttl, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:hexpiretime, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:hgetdel, _key, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:hexpire, key, seconds, fields}, store)
+      when is_integer(seconds) and is_list(fields) do
+    hash_expire_fields(key, fields, CommandTime.now_ms() + seconds * 1000, store)
+  end
+
+  def handle_ast({:hpexpire, key, ms, fields}, store) when is_integer(ms) and is_list(fields) do
+    hash_expire_fields(key, fields, CommandTime.now_ms() + ms, store)
+  end
+
+  def handle_ast({:httl, key, fields}, store) when is_list(fields),
+    do: hash_ttl_fields(key, fields, :seconds, store)
+
+  def handle_ast({:hpttl, key, fields}, store) when is_list(fields),
+    do: hash_ttl_fields(key, fields, :milliseconds, store)
+
+  def handle_ast({:hpersist, key, fields}, store) when is_list(fields),
+    do: hash_persist_fields(key, fields, store)
+
+  def handle_ast({:hexpiretime, key, fields}, store) when is_list(fields),
+    do: hash_expiretime_fields(key, fields, store)
+
+  def handle_ast({:hgetdel, key, fields}, store) when is_list(fields),
+    do: hgetdel_fields(key, fields, store)
+
+  def handle_ast({:hgetex, key, :persist, fields}, store) when is_list(fields),
+    do: hgetex_parsed(key, fields, 0, store)
+
+  def handle_ast({:hgetex, key, {:ex, seconds}, fields}, store)
+      when is_integer(seconds) and is_list(fields),
+      do: hgetex_parsed(key, fields, CommandTime.now_ms() + seconds * 1000, store)
+
+  def handle_ast({:hgetex, key, {:px, ms}, fields}, store)
+      when is_integer(ms) and is_list(fields),
+      do: hgetex_parsed(key, fields, CommandTime.now_ms() + ms, store)
+
+  def handle_ast({:hgetex, key, {:exat, ts}, fields}, store)
+      when is_integer(ts) and is_list(fields),
+      do: hgetex_parsed(key, fields, ts * 1000, store)
+
+  def handle_ast({:hgetex, key, {:pxat, ts}, fields}, store)
+      when is_integer(ts) and is_list(fields),
+      do: hgetex_parsed(key, fields, ts, store)
+
+  def handle_ast({:hsetex, key, seconds, field_value_pairs}, store)
+      when is_integer(seconds) and is_list(field_value_pairs) do
+    if even_length?(field_value_pairs) do
+      with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
+        expire_at_ms = CommandTime.now_ms() + seconds * 1000
+        hset_pairs_with_ttl(field_value_pairs, key, store, expire_at_ms, 0)
+      end
+    else
+      {:error, "ERR wrong number of arguments for 'hsetex' command"}
+    end
+  end
+
+  def handle_ast(_ast, _store), do: {:error, "ERR unsupported hash command AST"}
+
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  defp hset_args([key, _f, _v | _] = args, store) do
+    [_ | field_value_pairs] = args
+
+    if even_length?(field_value_pairs) do
+      with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
+        hset_pairs(field_value_pairs, key, store, 0)
+      end
+    else
+      {:error, "ERR wrong number of arguments for 'hset' command"}
+    end
+  end
+
+  defp hset_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'hset' command"}
+
+  defp hget_field(key, field, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      compound_key = CompoundKey.hash_field(key, field)
+      Ops.compound_get(store, key, compound_key)
+    end
+  end
+
+  defp hdel_args([key | fields], store) when fields != [] do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      compound_keys =
+        fields
+        |> Enum.uniq()
+        |> Enum.map(&CompoundKey.hash_field(key, &1))
+
+      deleted_keys =
+        store
+        |> Ops.compound_batch_get(key, compound_keys)
+        |> Enum.zip(compound_keys)
+        |> Enum.flat_map(fn
+          {nil, _compound_key} -> []
+          {_value, compound_key} -> [compound_key]
+        end)
+
+      Enum.each(deleted_keys, &Ops.compound_delete(store, key, &1))
+
+      deleted = length(deleted_keys)
+
+      maybe_cleanup_empty_hash(key, deleted, store)
+      deleted
+    end
+  end
+
+  defp hdel_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'hdel' command"}
+
+  defp hmget_args([key | fields], store) when fields != [] do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
+      Ops.compound_batch_get(store, key, compound_keys)
+    end
+  end
+
+  defp hmget_args(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'hmget' command"}
+
+  defp hgetall_key(key, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      prefix = CompoundKey.hash_prefix(key)
+      pairs = Ops.compound_scan(store, key, prefix)
+      Enum.flat_map(pairs, fn {field, value} -> [field, value] end)
+    end
+  end
+
+  defp hlen_key(key, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      prefix = CompoundKey.hash_prefix(key)
+      Ops.compound_count(store, key, prefix)
+    end
+  end
+
+  defp hexists_field(key, field, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      compound_key = CompoundKey.hash_field(key, field)
+      if Ops.compound_get(store, key, compound_key) != nil, do: 1, else: 0
+    end
+  end
+
+  defp hkeys_key(key, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      prefix = CompoundKey.hash_prefix(key)
+      pairs = Ops.compound_scan(store, key, prefix)
+      Enum.map(pairs, fn {field, _value} -> field end)
+    end
+  end
+
+  defp hvals_key(key, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      prefix = CompoundKey.hash_prefix(key)
+      pairs = Ops.compound_scan(store, key, prefix)
+      Enum.map(pairs, fn {_field, value} -> value end)
+    end
+  end
+
+  defp hsetnx_field(key, field, value, store) do
+    with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
+      compound_key = CompoundKey.hash_field(key, field)
+
+      if Ops.compound_get(store, key, compound_key) != nil do
+        0
+      else
+        Ops.compound_put(store, key, compound_key, value, 0)
+        1
+      end
+    end
+  end
+
+  defp hstrlen_field(key, field, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      compound_key = CompoundKey.hash_field(key, field)
+
+      case Ops.compound_get(store, key, compound_key) do
+        nil -> 0
+        value -> byte_size(value)
+      end
+    end
+  end
+
+  defp hrandfield_one(key, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      prefix = CompoundKey.hash_prefix(key)
+      pairs = Ops.compound_scan(store, key, prefix)
+
+      case pairs do
+        [] ->
+          nil
+
+        _ ->
+          {field, _value} = Enum.random(pairs)
+          field
+      end
+    end
+  end
+
+  defp hscan_typed(key, cursor, opts, store) when is_integer(cursor) and cursor >= 0 do
+    with :ok <- TypeRegistry.check_type(key, :hash, store),
+         {:ok, match_pattern, count} <- typed_scan_opts(opts) do
+      prefix = CompoundKey.hash_prefix(key)
+      pairs = Ops.compound_scan(store, key, prefix)
+      fields = Enum.map(pairs, fn {field, _value} -> field end)
+
+      filtered =
+        case match_pattern do
+          nil ->
+            fields
+
+          pattern ->
+            Enum.filter(fields, fn field -> Ferricstore.GlobMatcher.match?(field, pattern) end)
+        end
+
+      {next_cursor, batch} = paginate(filtered, cursor, count)
+      [next_cursor, batch]
+    end
+  end
+
+  defp hscan_typed(_key, _cursor, _opts, _store), do: {:error, "ERR invalid cursor"}
+
+  defp typed_scan_opts(opts), do: typed_scan_opts(opts, nil, 10)
+
+  defp typed_scan_opts([], match_pattern, count), do: {:ok, match_pattern, count}
+
+  defp typed_scan_opts([{:match, pattern} | rest], _match_pattern, count),
+    do: typed_scan_opts(rest, pattern, count)
+
+  defp typed_scan_opts([{:count, count} | rest], match_pattern, _count)
+       when is_integer(count) and count > 0,
+       do: typed_scan_opts(rest, match_pattern, count)
+
+  defp typed_scan_opts(_opts, _match_pattern, _count), do: {:error, "ERR syntax error"}
 
   defp do_hincrby(key, field, increment, store) do
     compound_key = CompoundKey.hash_field(key, field)
@@ -764,6 +1062,164 @@ defmodule Ferricstore.Commands.Hash do
 
       :error ->
         {:error, "ERR hash value is not an integer"}
+    end
+  end
+
+  defp hincrbyfloat_parsed(key, field, increment, store) do
+    compound_key = CompoundKey.hash_field(key, field)
+    current = Ops.compound_get(store, key, compound_key)
+
+    case parse_float_value(current) do
+      {:ok, current_float} ->
+        new_val = current_float + increment
+        result_str = format_float(new_val)
+        Ops.compound_put(store, key, compound_key, result_str, 0)
+        result_str
+
+      :error ->
+        {:error, "ERR hash value is not a valid float"}
+    end
+  end
+
+  defp hrandfield_parsed(key, count, with_values, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      prefix = CompoundKey.hash_prefix(key)
+      pairs = Ops.compound_scan(store, key, prefix)
+      select_random_fields(pairs, count, with_values)
+    end
+  end
+
+  defp hash_expire_fields(key, fields, expire_at_ms, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      {unique_fields, compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
+
+      unique_fields
+      |> Enum.zip(compound_keys)
+      |> Enum.each(fn {field, compound_key} ->
+        case Map.fetch!(metas_by_field, field) do
+          {value, _old_expire} -> Ops.compound_put(store, key, compound_key, value, expire_at_ms)
+          nil -> :ok
+        end
+      end)
+
+      Enum.map(fields, fn field ->
+        case Map.fetch!(metas_by_field, field) do
+          nil -> -2
+          {_value, _old_expire} -> 1
+        end
+      end)
+    end
+  end
+
+  defp hash_ttl_fields(key, fields, unit, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      now = CommandTime.now_ms()
+
+      {_unique_fields, _compound_keys, metas_by_field} =
+        batch_hash_field_metas(fields, key, store)
+
+      Enum.map(fields, fn field ->
+        case Map.fetch!(metas_by_field, field) do
+          nil ->
+            -2
+
+          {_value, 0} ->
+            -1
+
+          {_value, expire_at_ms} ->
+            remaining_ms = expire_at_ms - now
+
+            cond do
+              remaining_ms <= 0 -> -2
+              unit == :seconds -> div(remaining_ms, 1000)
+              true -> remaining_ms
+            end
+        end
+      end)
+    end
+  end
+
+  defp hash_persist_fields(key, fields, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      {unique_fields, compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
+
+      unique_fields
+      |> Enum.zip(compound_keys)
+      |> Enum.each(fn {field, compound_key} ->
+        case Map.fetch!(metas_by_field, field) do
+          {value, expire_at_ms} when expire_at_ms != 0 ->
+            Ops.compound_put(store, key, compound_key, value, 0)
+
+          _nil_or_persistent ->
+            :ok
+        end
+      end)
+
+      Enum.map(fields, fn field ->
+        case Map.fetch!(metas_by_field, field) do
+          nil -> -2
+          {_value, 0} -> -1
+          {_value, _expire_at_ms} -> 1
+        end
+      end)
+    end
+  end
+
+  defp hash_expiretime_fields(key, fields, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      {_unique_fields, _compound_keys, metas_by_field} =
+        batch_hash_field_metas(fields, key, store)
+
+      Enum.map(fields, fn field ->
+        case Map.fetch!(metas_by_field, field) do
+          nil -> -2
+          {_value, 0} -> -1
+          {_value, expire_at_ms} -> div(expire_at_ms, 1000)
+        end
+      end)
+    end
+  end
+
+  defp hgetdel_fields(key, fields, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      compound_keys =
+        fields
+        |> Enum.uniq()
+        |> Enum.map(&CompoundKey.hash_field(key, &1))
+
+      values_by_key =
+        store
+        |> Ops.compound_batch_get(key, compound_keys)
+        |> then(&Enum.zip(compound_keys, &1))
+        |> Map.new()
+
+      {results, deleted_keys} =
+        Enum.reduce(fields, {[], MapSet.new()}, fn field, {acc, deleted} ->
+          compound_key = CompoundKey.hash_field(key, field)
+
+          cond do
+            MapSet.member?(deleted, compound_key) ->
+              {[nil | acc], deleted}
+
+            is_nil(Map.get(values_by_key, compound_key)) ->
+              {[nil | acc], deleted}
+
+            true ->
+              value = Map.fetch!(values_by_key, compound_key)
+              {[value | acc], MapSet.put(deleted, compound_key)}
+          end
+        end)
+
+      results = Enum.reverse(results)
+      Enum.each(deleted_keys, &Ops.compound_delete(store, key, &1))
+      maybe_cleanup_empty_hash(key, MapSet.size(deleted_keys), store)
+      results
+    end
+  end
+
+  defp hgetex_parsed(key, fields, expire_at_ms, store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      hgetex_fields(fields, key, store, expire_at_ms)
     end
   end
 
