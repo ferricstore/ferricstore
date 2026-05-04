@@ -3616,6 +3616,23 @@ defmodule Ferricstore.Store.Router do
         sampled_read_bookkeeping_fast(ctx, keydir, compound_key, lfu)
         value
 
+      {:cold, file_id, offset, value_size}
+      when valid_cold_location(file_id, offset, value_size) ->
+        path = cold_file_path(ctx, idx, file_id)
+
+        case read_cold_async(path, offset, compound_key) do
+          {:ok, value} when is_binary(value) ->
+            Stats.record_cold_read(ctx, compound_key)
+            warm_ets_after_cold_read(ctx, idx, keydir, compound_key, value, file_id, offset)
+            value
+
+          _ ->
+            case safe_read_call(ctx, idx, {:compound_get, redis_key, compound_key}) do
+              {:ok, value} -> value
+              :unavailable -> nil
+            end
+        end
+
       _ ->
         case safe_read_call(ctx, idx, {:compound_get, redis_key, compound_key}) do
           {:ok, value} -> value
@@ -3669,10 +3686,36 @@ defmodule Ferricstore.Store.Router do
           {binary(), non_neg_integer()} | nil
   def compound_get_meta(ctx, redis_key, compound_key) do
     idx = shard_for(ctx, redis_key)
+    keydir = resolve_keydir(ctx, idx)
+    now = HLC.now_ms()
 
-    case safe_read_call(ctx, idx, {:compound_get_meta, redis_key, compound_key}) do
-      {:ok, meta} -> meta
-      :unavailable -> nil
+    case ets_get_meta_full(ctx, idx, keydir, compound_key, now) do
+      {:hit, value, expire_at_ms, lfu} ->
+        sampled_read_bookkeeping_fast(ctx, keydir, compound_key, lfu)
+        {value, expire_at_ms}
+
+      {:cold, file_id, offset, value_size, expire_at_ms}
+      when valid_cold_location(file_id, offset, value_size) ->
+        path = cold_file_path(ctx, idx, file_id)
+
+        case read_cold_async(path, offset, compound_key) do
+          {:ok, value} when is_binary(value) ->
+            Stats.record_cold_read(ctx, compound_key)
+            warm_ets_after_cold_read(ctx, idx, keydir, compound_key, value, file_id, offset)
+            {value, expire_at_ms}
+
+          _ ->
+            case safe_read_call(ctx, idx, {:compound_get_meta, redis_key, compound_key}) do
+              {:ok, meta} -> meta
+              :unavailable -> nil
+            end
+        end
+
+      _ ->
+        case safe_read_call(ctx, idx, {:compound_get_meta, redis_key, compound_key}) do
+          {:ok, meta} -> meta
+          :unavailable -> nil
+        end
     end
   end
 

@@ -4,7 +4,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
 
   @record_header_size 26
 
-  alias Ferricstore.Store.LFU
+  alias Ferricstore.Store.{CompoundKey, LFU}
   alias Ferricstore.Store.Router
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Stats
@@ -92,6 +92,72 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
 
     assert nil == Router.get(ctx, key)
     assert nil == Router.get_meta(ctx, key)
+  end
+
+  test "compound_get reads a valid shared cold row without the shard GenServer", %{
+    ctx: ctx,
+    shard: shard,
+    keydir: keydir
+  } do
+    redis_key = "cold_compound_direct:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    compound_key = CompoundKey.hash_field(redis_key, "field")
+    value = "compound-cold-value"
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00000.log")
+
+    {:ok, {offset, _record_size}} = NIF.v2_append_record(path, compound_key, value, 0)
+    :ets.insert(keydir, {compound_key, nil, 0, LFU.initial(), 0, offset, byte_size(value)})
+
+    shard_name = elem(ctx.shard_names, 0)
+    Process.unregister(shard_name)
+
+    try do
+      assert [{^compound_key, nil, 0, _lfu, 0, ^offset, _vsize}] =
+               :ets.lookup(keydir, compound_key)
+
+      assert value == Router.compound_get(ctx, redis_key, compound_key)
+    after
+      if Process.alive?(shard) and Process.whereis(shard_name) == nil do
+        Process.register(shard, shard_name)
+      end
+    end
+  end
+
+  test "compound_get_meta reads a valid shared cold row without the shard GenServer", %{
+    ctx: ctx,
+    shard: shard,
+    keydir: keydir
+  } do
+    redis_key =
+      "cold_compound_meta_direct:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+
+    compound_key = CompoundKey.hash_field(redis_key, "field")
+    value = "compound-cold-meta-value"
+    expire_at_ms = Ferricstore.HLC.now_ms() + 60_000
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00000.log")
+
+    {:ok, {offset, _record_size}} =
+      NIF.v2_append_record(path, compound_key, value, expire_at_ms)
+
+    :ets.insert(
+      keydir,
+      {compound_key, nil, expire_at_ms, LFU.initial(), 0, offset, byte_size(value)}
+    )
+
+    shard_name = elem(ctx.shard_names, 0)
+    Process.unregister(shard_name)
+
+    try do
+      assert [{^compound_key, nil, ^expire_at_ms, _lfu, 0, ^offset, _vsize}] =
+               :ets.lookup(keydir, compound_key)
+
+      assert {value, expire_at_ms} == Router.compound_get_meta(ctx, redis_key, compound_key)
+    after
+      if Process.alive?(shard) and Process.whereis(shard_name) == nil do
+        Process.register(shard, shard_name)
+      end
+    end
   end
 
   test "failed direct cold GET increments keyspace misses", %{ctx: ctx, keydir: keydir} do
