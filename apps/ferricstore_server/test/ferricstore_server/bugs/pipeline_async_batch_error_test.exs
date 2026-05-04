@@ -74,6 +74,42 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     assert response == "_\r\n-ERR async replication overloaded\r\n"
   end
 
+  test "general pure pipeline converts command raises into Redis error replies" do
+    ctx = FerricStore.Instance.get(:default)
+    raw_store_key = {:ferricstore_raw_store, ctx.name}
+    old_raw_store = :persistent_term.get(raw_store_key, :missing)
+
+    raising_store =
+      ctx
+      |> FerricstoreServer.Connection.Store.build_raw_store()
+      |> Map.put(:incr, fn _key, _delta -> raise "async key latch timeout after 5ms" end)
+
+    :persistent_term.put(raw_store_key, raising_store)
+
+    on_exit(fn ->
+      case old_raw_store do
+        :missing -> :persistent_term.erase(raw_store_key)
+        store -> :persistent_term.put(raw_store_key, store)
+      end
+    end)
+
+    state = connection_state(ctx)
+    send_response_fn = capture_response_fn()
+    handle_command_fn = flunking_handle_fn("general pure pipeline error containment")
+
+    commands = [
+      {:command, "INCR", ["raise"], {:incr, "raise"}, ["raise"]},
+      {:command, "PING", [], :ping, []}
+    ]
+
+    assert {:continue, ^state} =
+             Pipeline.pipeline_dispatch(commands, state, handle_command_fn, send_response_fn)
+
+    assert_receive {:pipeline_response, response}
+    assert response =~ "-ERR internal error:"
+    assert response =~ "+PONG\r\n"
+  end
+
   defp connection_state(ctx) do
     %Connection{
       socket: :socket,

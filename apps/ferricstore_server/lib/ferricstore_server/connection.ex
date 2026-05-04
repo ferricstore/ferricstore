@@ -491,6 +491,9 @@ defmodule FerricstoreServer.Connection do
 
         :exit, {reason, _} ->
           {{:error, "ERR internal error: #{inspect(reason)}"}, conn_state}
+
+        kind, reason ->
+          {internal_error(kind, reason), conn_state}
       end
 
     updated_state = %{
@@ -612,6 +615,9 @@ defmodule FerricstoreServer.Connection do
 
         :exit, {reason, _} ->
           {:error, "ERR internal error: #{inspect(reason)}"}
+
+        kind, reason ->
+          internal_error(kind, reason)
       end
 
     ConnTracking.maybe_notify_keyspace(cmd, args, result)
@@ -629,6 +635,9 @@ defmodule FerricstoreServer.Connection do
        "ERR unsupported command AST for '#{String.downcase(cmd)}' command with #{length(args)} args"}
     end
   end
+
+  defp internal_error(kind, reason),
+    do: {:error, "ERR internal error: #{inspect({kind, reason})}"}
 
   defp dispatch_get_sendfile_ast([key], ast, state)
        when byte_size(key) > 0 and byte_size(key) <= 65_535 do

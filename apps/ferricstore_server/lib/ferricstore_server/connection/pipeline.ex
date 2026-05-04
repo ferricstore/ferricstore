@@ -92,9 +92,13 @@ defmodule FerricstoreServer.Connection.Pipeline do
           else
             ctx = state.instance_ctx
             Stats.incr_commands_by(state.stats_counter, length(keys))
-            values = Router.batch_get(ctx, keys)
 
-            response = Enum.map(values, &Encoder.encode/1)
+            response =
+              case safe_dispatch(fn -> Router.batch_get(ctx, keys) end) do
+                {:ok, values} -> Enum.map(values, &Encoder.encode/1)
+                {:error, err} -> List.duplicate(Encoder.encode(err), length(keys))
+              end
+
             send_response_fn.(state.socket, state.transport, response)
             {:ok, {:continue, state}}
           end
@@ -216,9 +220,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
     Stats.incr_commands_by(state.stats_counter, length(kv_pairs))
 
     response =
-      state.instance_ctx
-      |> Router.batch_async_put(kv_pairs)
-      |> encode_async_batch_result(length(kv_pairs))
+      case safe_dispatch(fn -> Router.batch_async_put(state.instance_ctx, kv_pairs) end) do
+        {:ok, result} -> encode_async_batch_result(result, length(kv_pairs))
+        {:error, err} -> List.duplicate(Encoder.encode(err), length(kv_pairs))
+      end
 
     send_response_fn.(state.socket, state.transport, response)
     {:continue, state}
@@ -226,13 +231,18 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp do_batch_set_quorum(kv_pairs, state, send_response_fn) do
     Stats.incr_commands_by(state.stats_counter, length(kv_pairs))
-    results = Router.batch_quorum_put(state.instance_ctx, kv_pairs)
 
     response =
-      Enum.map(results, fn
-        :ok -> Encoder.ok_response()
-        {:error, _} = err -> Encoder.encode(err)
-      end)
+      case safe_dispatch(fn -> Router.batch_quorum_put(state.instance_ctx, kv_pairs) end) do
+        {:ok, results} ->
+          Enum.map(results, fn
+            :ok -> Encoder.ok_response()
+            {:error, _} = err -> Encoder.encode(err)
+          end)
+
+        {:error, err} ->
+          List.duplicate(Encoder.encode(err), length(kv_pairs))
+      end
 
     send_response_fn.(state.socket, state.transport, response)
     {:continue, state}
@@ -331,40 +341,9 @@ defmodule FerricstoreServer.Connection.Pipeline do
             if not pressure_ok do
               List.duplicate({:error, "ERR server under pressure"}, length(kv_pairs))
             else
-              case live_ctx.durability_mode do
-                :all_async ->
-                  ctx
-                  |> Router.batch_async_put(kv_pairs)
-                  |> expand_async_batch_result(length(kv_pairs))
-
-                :all_quorum ->
-                  Router.batch_quorum_put(ctx, kv_pairs)
-
-                :mixed ->
-                  {async_pairs, quorum_pairs, _} = split_by_durability(ctx, set_ops)
-
-                  async_results =
-                    if async_pairs != [] do
-                      kv_pairs = Enum.map(async_pairs, fn {_idx, k, v} -> {k, v} end)
-
-                      ctx
-                      |> Router.batch_async_put(kv_pairs)
-                      |> expand_async_batch_result(length(async_pairs))
-                    else
-                      []
-                    end
-
-                  quorum_results =
-                    if quorum_pairs != [] do
-                      Router.batch_quorum_put(
-                        ctx,
-                        Enum.map(quorum_pairs, fn {_idx, k, v} -> {k, v} end)
-                      )
-                    else
-                      []
-                    end
-
-                  recombine_set_results(async_pairs, async_results, quorum_pairs, quorum_results)
+              case safe_dispatch(fn -> mixed_set_results(live_ctx, ctx, set_ops, kv_pairs) end) do
+                {:ok, results} -> results
+                {:error, err} -> List.duplicate(err, length(kv_pairs))
               end
             end
 
@@ -388,16 +367,58 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
         _ ->
           keys = Enum.map(get_ops, &elem(&1, 1))
-          values = Router.batch_get(ctx, keys)
 
-          get_ops
-          |> Enum.zip(values)
-          |> Map.new(fn {{idx, _key}, value} -> {idx, Encoder.encode(value)} end)
+          case safe_dispatch(fn -> Router.batch_get(ctx, keys) end) do
+            {:ok, values} ->
+              get_ops
+              |> Enum.zip(values)
+              |> Map.new(fn {{idx, _key}, value} -> {idx, Encoder.encode(value)} end)
+
+            {:error, err} ->
+              Map.new(get_ops, fn {idx, _key} -> {idx, Encoder.encode(err)} end)
+          end
       end
 
     response = for i <- 0..(count - 1), do: Map.get(get_results, i) || Map.get(set_results, i)
     send_response_fn.(state.socket, state.transport, response)
     {:continue, state}
+  end
+
+  defp mixed_set_results(%{durability_mode: :all_async}, ctx, _set_ops, kv_pairs) do
+    ctx
+    |> Router.batch_async_put(kv_pairs)
+    |> expand_async_batch_result(length(kv_pairs))
+  end
+
+  defp mixed_set_results(%{durability_mode: :all_quorum}, ctx, _set_ops, kv_pairs) do
+    Router.batch_quorum_put(ctx, kv_pairs)
+  end
+
+  defp mixed_set_results(%{durability_mode: :mixed}, ctx, set_ops, _kv_pairs) do
+    {async_pairs, quorum_pairs, _} = split_by_durability(ctx, set_ops)
+
+    async_results =
+      if async_pairs != [] do
+        kv_pairs = Enum.map(async_pairs, fn {_idx, k, v} -> {k, v} end)
+
+        ctx
+        |> Router.batch_async_put(kv_pairs)
+        |> expand_async_batch_result(length(async_pairs))
+      else
+        []
+      end
+
+    quorum_results =
+      if quorum_pairs != [] do
+        Router.batch_quorum_put(
+          ctx,
+          Enum.map(quorum_pairs, fn {_idx, k, v} -> {k, v} end)
+        )
+      else
+        []
+      end
+
+    recombine_set_results(async_pairs, async_results, quorum_pairs, quorum_results)
   end
 
   defp split_by_durability(ctx, set_ops) do
@@ -519,6 +540,9 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
                     :exit, {reason, _} ->
                       {:error, "ERR internal error: #{inspect(reason)}"}
+
+                    kind, reason ->
+                      internal_error(kind, reason)
                   end
 
                 {:error, _} = err ->
@@ -605,6 +629,22 @@ defmodule FerricstoreServer.Connection.Pipeline do
     {:error,
      "ERR unsupported command AST for '#{String.downcase(name)}' command with #{length(args)} args"}
   end
+
+  defp safe_dispatch(fun) do
+    {:ok, fun.()}
+  catch
+    :exit, {:noproc, _} ->
+      {:error, {:error, "ERR server not ready, shard process unavailable"}}
+
+    :exit, {reason, _} ->
+      {:error, {:error, "ERR internal error: #{inspect(reason)}"}}
+
+    kind, reason ->
+      {:error, internal_error(kind, reason)}
+  end
+
+  defp internal_error(kind, reason),
+    do: {:error, "ERR internal error: #{inspect({kind, reason})}"}
 
   defp extract_command_name({:command, name, _args, _ast, _keys}) when is_binary(name), do: name
   defp extract_command_name(_), do: "UNKNOWN"
