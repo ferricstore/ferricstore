@@ -743,7 +743,11 @@ fn scan_key_states_from_path(
 
         match reader.read_exact(&mut header) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(format!(
+                    "key-state scan {path:?}:{offset}: unexpected EOF in header"
+                ));
+            }
             Err(e) => return Err(format!("key-state scan {path:?}:{offset}: {e}")),
         }
 
@@ -756,7 +760,11 @@ fn scan_key_states_from_path(
         let mut key = vec![0u8; key_size];
         match reader.read_exact(&mut key) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(format!(
+                    "key-state scan {path:?}:{offset}: unexpected EOF in key"
+                ));
+            }
             Err(e) => return Err(format!("key-state scan {path:?}:{offset}: {e}")),
         }
 
@@ -767,7 +775,9 @@ fn scan_key_states_from_path(
             let computed_crc = hasher.finalize();
 
             if computed_crc != stored_crc {
-                break;
+                return Err(format!(
+                    "key-state scan {path:?}:{offset}: CRC mismatch stored={stored_crc} actual={computed_crc}"
+                ));
             }
         }
 
@@ -787,7 +797,9 @@ fn scan_key_states_from_path(
             .ok_or_else(|| format!("key-state scan {path:?}:{offset}: record offset overflow"))?;
 
         if next_offset > file_len {
-            break;
+            return Err(format!(
+                "key-state scan {path:?}:{offset}: unexpected EOF in value"
+            ));
         }
 
         if value_size > 0 {
@@ -2559,13 +2571,14 @@ mod audit_fix_tests {
     }
 
     #[test]
-    fn key_state_scan_tolerates_truncated_live_payload_after_key() {
+    fn key_state_scan_errors_on_truncated_live_payload_before_later_tombstone() {
         let dir = tmp();
         let path = dir.path().join("00000000000000000001.log");
 
         let mut writer = log::LogWriter::open(&path, 1).unwrap();
         writer.write(b"a", b"live", 7).unwrap();
         writer.write(b"truncated", &vec![b'x'; 1024], 0).unwrap();
+        writer.write_tombstone(b"later_delete").unwrap();
         writer.sync().unwrap();
 
         let len = std::fs::metadata(&path).unwrap().len();
@@ -2576,16 +2589,17 @@ mod audit_fix_tests {
             .set_len(len - 100)
             .unwrap();
 
-        let states =
-            scan_key_states_from_path(&path, &[b"a".to_vec(), b"truncated".to_vec()]).unwrap();
+        let err = scan_key_states_from_path(
+            &path,
+            &[
+                b"a".to_vec(),
+                b"truncated".to_vec(),
+                b"later_delete".to_vec(),
+            ],
+        )
+        .unwrap_err();
 
-        assert!(states
-            .iter()
-            .any(|state| state.key == b"a" && state.expire_at_ms == 7 && !state.is_tombstone));
-
-        assert!(states
-            .iter()
-            .any(|state| state.key == b"truncated" && !state.is_tombstone));
+        assert!(err.contains("unexpected EOF in value"));
     }
 
     #[test]
@@ -2617,11 +2631,11 @@ mod audit_fix_tests {
         file.write_all(&byte).unwrap();
         file.sync_all().unwrap();
 
-        let states = scan_key_states_from_path(&path, &[b"deleted".to_vec()]).unwrap();
+        let err = scan_key_states_from_path(&path, &[b"deleted".to_vec()]).unwrap_err();
 
         assert!(
-            states.is_empty(),
-            "corrupt tombstone must not be trusted as a lower tombstone state"
+            err.contains("CRC mismatch"),
+            "corrupt tombstone must fail the key-state scan, got {err:?}"
         );
     }
 
