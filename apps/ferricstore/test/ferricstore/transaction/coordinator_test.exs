@@ -118,6 +118,22 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       assert result == ["existing", :ok, "updated"]
     end
 
+    test "legacy SET NX options execute through AST bridge", %{same1: s1} do
+      Router.put(FerricStore.Instance.get(:default), s1, "existing", 0)
+
+      result = Coordinator.execute([{"SET", [s1, "skipped", "NX"]}], %{}, nil)
+
+      assert result == [nil]
+      assert Router.get(FerricStore.Instance.get(:default), s1) == "existing"
+    end
+
+    test "legacy SET rejects conflicting NX and XX through AST bridge", %{same1: s1} do
+      result = Coordinator.execute([{"SET", [s1, "value", "NX", "XX"]}], %{}, nil)
+
+      assert result == [{:error, "ERR XX and NX options at the same time are not compatible"}]
+      assert Router.get(FerricStore.Instance.get(:default), s1) == nil
+    end
+
     test "large SET is visible to later GET in same transaction", %{same1: s1} do
       ctx = FerricStore.Instance.get(:default)
       large = :binary.copy("x", ctx.hot_cache_max_value_size + 1024)
