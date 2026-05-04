@@ -77,6 +77,49 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
     assert {:ok, "value"} = NIF.v2_pread_at(Path.join(shard_path, "00000.log"), offset)
   end
 
+  test "shard startup ignores non-numeric log-shaped files" do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lifecycle_stray_logs_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Path.join(tmp, "shard_0")
+    File.mkdir_p!(shard_path)
+
+    keydir =
+      :ets.new(:"lifecycle_stray_logs_#{System.unique_integer([:positive])}", [:set, :public])
+
+    on_exit(fn ->
+      try do
+        :ets.delete(keydir)
+      rescue
+        _ -> :ok
+      end
+
+      File.rm_rf!(tmp)
+    end)
+
+    File.write!(Path.join(shard_path, "notes.log"), "not a bitcask log")
+    File.write!(Path.join(shard_path, "notes.hint"), "not a bitcask hint")
+
+    key = "recover_ignores_stray_log_names"
+
+    assert {:ok, {_offset, _size}} =
+             NIF.v2_append_record(Path.join(shard_path, "00000.log"), key, "value", 0)
+
+    assert {0, active_size} = ShardLifecycle.discover_active_file(shard_path)
+    assert active_size > 0
+
+    ShardLifecycle.recover_keydir(shard_path, keydir, 0)
+    assert [{^key, nil, 0, _lfu, 0, offset, value_size}] = :ets.lookup(keydir, key)
+    assert value_size == byte_size("value")
+    assert {:ok, "value"} = NIF.v2_pread_at(Path.join(shard_path, "00000.log"), offset)
+
+    assert %{0 => {^active_size, 0}} =
+             Ferricstore.Store.Shard.Flush.compute_file_stats(shard_path, keydir)
+  end
+
   test "discover_active_file reports leftover compact temp cleanup failures" do
     tmp =
       Path.join(

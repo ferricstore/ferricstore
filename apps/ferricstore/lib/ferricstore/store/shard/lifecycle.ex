@@ -45,13 +45,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
         max_id =
           files
-          |> Enum.filter(fn name ->
-            String.ends_with?(name, ".log") and not String.starts_with?(name, "compact_")
-          end)
-          |> Enum.reduce(-1, fn name, best ->
-            id = name |> String.trim_trailing(".log") |> String.to_integer()
-            max(id, best)
-          end)
+          |> Enum.flat_map(&regular_log_file_id/1)
+          |> Enum.reduce(-1, fn id, best -> max(id, best) end)
 
         if max_id < 0 do
           {0, 0}
@@ -86,7 +81,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         # Try hint files first for faster recovery
         hint_files =
           files
-          |> Enum.filter(&String.ends_with?(&1, ".hint"))
+          |> Enum.filter(&regular_hint_file?/1)
           |> Enum.sort_by(&hint_file_id/1)
 
         recover_from_hints_or_logs(
@@ -573,7 +568,28 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   end
 
   defp regular_log_file?(name) do
-    String.ends_with?(name, ".log") and not String.starts_with?(name, "compact_")
+    match?([_fid], regular_log_file_id(name))
+  end
+
+  defp regular_hint_file?(name), do: numeric_file_id(name, ".hint") != nil
+
+  defp regular_log_file_id(name) do
+    case numeric_file_id(name, ".log") do
+      nil -> []
+      fid -> [fid]
+    end
+  end
+
+  defp numeric_file_id(name, suffix) do
+    with true <- String.ends_with?(name, suffix),
+         false <- String.starts_with?(name, "compact_"),
+         stem <- String.trim_trailing(name, suffix),
+         {fid, ""} <- Integer.parse(stem),
+         true <- fid >= 0 do
+      fid
+    else
+      _ -> nil
+    end
   end
 
   defp recover_from_hints_or_logs(shard_path, keydir, shard_index, log_files, [], instance_ctx) do

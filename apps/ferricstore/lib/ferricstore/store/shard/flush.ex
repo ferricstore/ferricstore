@@ -379,12 +379,15 @@ defmodule Ferricstore.Store.Shard.Flush do
         # 1. Get total bytes per file from disk
         file_totals =
           files
-          |> Enum.filter(&String.ends_with?(&1, ".log"))
-          |> Enum.reject(&String.starts_with?(&1, "compact_"))
           |> Enum.reduce(%{}, fn name, acc ->
-            fid = name |> String.trim_trailing(".log") |> String.to_integer()
-            size = file_size_or_zero(Path.join(shard_path, name))
-            Map.put(acc, fid, size)
+            case regular_log_file_id(name) do
+              nil ->
+                acc
+
+              fid ->
+                size = file_size_or_zero(Path.join(shard_path, name))
+                Map.put(acc, fid, size)
+            end
           end)
 
         # 2. Sum non-expired live bytes per file from ETS
@@ -430,6 +433,18 @@ defmodule Ferricstore.Store.Shard.Flush do
     case File.stat(path) do
       {:ok, %{size: s}} -> s
       _ -> 0
+    end
+  end
+
+  defp regular_log_file_id(name) do
+    with true <- String.ends_with?(name, ".log"),
+         false <- String.starts_with?(name, "compact_"),
+         stem <- String.trim_trailing(name, ".log"),
+         {fid, ""} <- Integer.parse(stem),
+         true <- fid >= 0 do
+      fid
+    else
+      _ -> nil
     end
   end
 
