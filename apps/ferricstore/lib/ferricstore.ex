@@ -483,6 +483,77 @@ defmodule FerricStore do
 
   def flow_cancel(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc "Lists Flow records for `type` from the state index."
+  @spec flow_list(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_list(type, opts \\ [])
+
+  def flow_list(type, opts) when is_binary(type) and is_list(opts) do
+    with :ok <- flow_validate_opts(opts),
+         :ok <- flow_validate_type(type),
+         {:ok, state} <- flow_state(opts),
+         {:ok, partition_key} <- flow_partition_key(opts),
+         {:ok, count} <- flow_history_count(opts),
+         index_key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key),
+         :ok <- flow_validate_key_size(index_key),
+         {:ok, ids} <- zrange(index_key, 0, count - 1) do
+      flow_records_for_ids(ids, partition_key)
+    end
+  end
+
+  def flow_list(type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def flow_list(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Returns Flow index counters for `type`."
+  @spec flow_info(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_info(type, opts \\ [])
+
+  def flow_info(type, opts) when is_binary(type) and is_list(opts) do
+    with :ok <- flow_validate_opts(opts),
+         :ok <- flow_validate_type(type),
+         {:ok, partition_key} <- flow_partition_key(opts),
+         {:ok, counts} <- flow_state_counts(type, partition_key),
+         inflight_key = Ferricstore.Flow.Keys.inflight_index_key(type, partition_key),
+         :ok <- flow_validate_key_size(inflight_key),
+         {:ok, inflight} <- zcard(inflight_key) do
+      {:ok,
+       counts
+       |> Map.put(:type, type)
+       |> Map.put(:partition_key, partition_key)
+       |> Map.put(:inflight, inflight)}
+    end
+  end
+
+  def flow_info(type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def flow_info(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Lists running Flow records with expired lease deadlines."
+  @spec flow_stuck(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_stuck(type, opts \\ [])
+
+  def flow_stuck(type, opts) when is_binary(type) and is_list(opts) do
+    with :ok <- flow_validate_opts(opts),
+         :ok <- flow_validate_type(type),
+         {:ok, partition_key} <- flow_partition_key(opts),
+         {:ok, count} <- flow_history_count(opts),
+         {:ok, older_than_ms} <- flow_non_neg_integer(opts, :older_than_ms, 0),
+         {:ok, now_ms} <- flow_non_neg_integer(opts, :now_ms, System.os_time(:millisecond)),
+         index_key = Ferricstore.Flow.Keys.inflight_index_key(type, partition_key),
+         :ok <- flow_validate_key_size(index_key),
+         cutoff = now_ms - older_than_ms,
+         {:ok, ids} <- zrangebyscore(index_key, "-inf", Integer.to_string(cutoff)) do
+      ids |> Enum.take(count) |> flow_records_for_ids(partition_key)
+    end
+  end
+
+  def flow_stuck(type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def flow_stuck(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Returns Flow history events for `id`."
   @spec flow_history(binary(), keyword()) :: {:ok, [{binary(), map()}]} | {:error, binary()}
   def flow_history(id, opts \\ [])
@@ -534,6 +605,9 @@ defmodule FerricStore do
   defp flow_validate_id(id) when is_binary(id) and id != "", do: :ok
   defp flow_validate_id(_id), do: {:error, "ERR flow id must be a non-empty string"}
 
+  defp flow_validate_type(type) when is_binary(type) and type != "", do: :ok
+  defp flow_validate_type(_type), do: {:error, "ERR flow type must be a non-empty string"}
+
   defp flow_validate_key_size(key) do
     if byte_size(key) <= Router.max_key_size() do
       :ok
@@ -547,6 +621,49 @@ defmodule FerricStore do
       value when is_integer(value) and value > 0 -> {:ok, value}
       _ -> {:error, "ERR flow count must be a positive integer"}
     end
+  end
+
+  defp flow_state(opts) do
+    case Keyword.get(opts, :state, "queued") do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, "ERR flow state must be a non-empty string"}
+    end
+  end
+
+  defp flow_non_neg_integer(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value >= 0 -> {:ok, value}
+      _ -> {:error, "ERR flow #{key} must be a non-negative integer"}
+    end
+  end
+
+  defp flow_records_for_ids(ids, partition_key) do
+    ids
+    |> Enum.reduce_while({:ok, []}, fn id, {:ok, acc} ->
+      case flow_get(id, partition_key: partition_key) do
+        {:ok, nil} -> {:cont, {:ok, acc}}
+        {:ok, record} -> {:cont, {:ok, [record | acc]}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, records} -> {:ok, Enum.reverse(records)}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp flow_state_counts(type, partition_key) do
+    ["queued", "running", "completed", "failed", "cancelled"]
+    |> Enum.reduce_while({:ok, %{}}, fn state, {:ok, acc} ->
+      key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key)
+
+      with :ok <- flow_validate_key_size(key),
+           {:ok, count} <- zcard(key) do
+        {:cont, {:ok, Map.put(acc, String.to_atom(state), count)}}
+      else
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp flow_partition_key(opts) do

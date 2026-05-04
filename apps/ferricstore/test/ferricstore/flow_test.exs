@@ -280,6 +280,54 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, [^id]} = FerricStore.zrange(completed_index, 0, -1)
   end
 
+  test "flow_list, flow_info, and flow_stuck read lifecycle indexes" do
+    due_id = uid("flow-list-due")
+    running_id = uid("flow-list-running")
+    done_id = uid("flow-list-done")
+    type = "ops"
+
+    assert {:ok, _} = FerricStore.flow_create(due_id, type: type, run_at_ms: 2_000)
+    assert {:ok, _} = FerricStore.flow_create(running_id, type: type, run_at_ms: 1_000)
+    assert {:ok, _} = FerricStore.flow_create(done_id, type: type, run_at_ms: 1_000)
+
+    assert {:ok, [claimed_running, claimed_done]} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-ops",
+               lease_ms: 50,
+               limit: 2,
+               now_ms: 1_000
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_complete(claimed_done.id, claimed_done.lease_token,
+               fencing_token: claimed_done.fencing_token
+             )
+
+    assert {:ok, queued} = FerricStore.flow_list(type, state: "queued", count: 10)
+    assert Enum.map(queued, & &1.id) == [due_id]
+
+    assert {:ok, running} = FerricStore.flow_list(type, state: "running", count: 10)
+    assert Enum.map(running, & &1.id) == [claimed_running.id]
+
+    assert {:ok, completed} = FerricStore.flow_list(type, state: "completed", count: 10)
+    assert Enum.map(completed, & &1.id) == [claimed_done.id]
+
+    assert {:ok, info} = FerricStore.flow_info(type)
+    assert info.queued == 1
+    assert info.running == 1
+    assert info.completed == 1
+    assert info.inflight == 1
+
+    assert {:ok, stuck} =
+             FerricStore.flow_stuck(type,
+               older_than_ms: 0,
+               count: 10,
+               now_ms: 1_051
+             )
+
+    assert Enum.map(stuck, & &1.id) == [claimed_running.id]
+  end
+
   test "partition_key scopes claim, complete, retry, get, and history" do
     partition = uid("tenant")
     id = uid("flow-partition")
