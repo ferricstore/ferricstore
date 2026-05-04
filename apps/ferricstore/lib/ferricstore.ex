@@ -416,6 +416,28 @@ defmodule FerricStore do
   def flow_complete(_id, _lease_token, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc "Moves a Flow record from one state to another, optionally guarded by a lease token."
+  @spec flow_transition(binary(), binary(), binary(), keyword()) ::
+          {:ok, map()} | {:error, binary()}
+  def flow_transition(id, from_state, to_state, opts \\ [])
+
+  def flow_transition(id, from_state, to_state, opts)
+      when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts) do
+    Ferricstore.Flow.transition(default_ctx(), id, from_state, to_state, opts)
+  end
+
+  def flow_transition(id, _from_state, _to_state, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_transition(_id, from_state, _to_state, _opts) when not is_binary(from_state),
+    do: {:error, "ERR flow from must be a non-empty string"}
+
+  def flow_transition(_id, _from_state, to_state, _opts) when not is_binary(to_state),
+    do: {:error, "ERR flow to must be a non-empty string"}
+
+  def flow_transition(_id, _from_state, _to_state, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Clears a claim and reschedules a Flow record when `lease_token` matches."
   @spec flow_retry(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_retry(id, lease_token, opts)
@@ -430,6 +452,36 @@ defmodule FerricStore do
     do: {:error, "ERR flow lease_token must be a string"}
 
   def flow_retry(_id, _lease_token, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Fails a running Flow record when `lease_token` matches."
+  @spec flow_fail(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_fail(id, lease_token, opts \\ [])
+
+  def flow_fail(id, lease_token, opts)
+      when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    Ferricstore.Flow.fail(default_ctx(), id, lease_token, opts)
+  end
+
+  def flow_fail(id, _lease_token, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_fail(_id, lease_token, _opts) when not is_binary(lease_token),
+    do: {:error, "ERR flow lease_token must be a string"}
+
+  def flow_fail(_id, _lease_token, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Cancels a Flow record, optionally guarded by a lease token."
+  @spec flow_cancel(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_cancel(id, opts \\ [])
+
+  def flow_cancel(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.cancel(default_ctx(), id, opts)
+  end
+
+  def flow_cancel(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_cancel(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc "Returns Flow history events for `id`."
   @spec flow_history(binary(), keyword()) :: {:ok, [{binary(), map()}]} | {:error, binary()}

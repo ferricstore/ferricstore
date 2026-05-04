@@ -91,6 +91,31 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  def transition(ctx, id, from_state, to_state, opts \\ [])
+      when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         :ok <- validate_state(:from, from_state),
+         :ok <- validate_state(:to, to_state),
+         {:ok, lease_token} <- optional_lease_token(opts),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+         {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
+         {:ok, priority} <- optional_non_neg_integer_or_nil(opts, :priority, nil) do
+      Router.flow_transition(ctx, %{
+        id: id,
+        from_state: from_state,
+        to_state: to_state,
+        lease_token: lease_token,
+        run_at_ms: run_at_ms,
+        priority: priority,
+        now_ms: now,
+        partition_key: partition_key
+      })
+    end
+  end
+
   def retry(ctx, id, lease_token, opts)
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
     with :ok <- validate_opts(opts),
@@ -106,6 +131,43 @@ defmodule Ferricstore.Flow do
         lease_token: lease_token,
         run_at_ms: run_at_ms,
         error_ref: error_ref,
+        now_ms: now,
+        partition_key: partition_key
+      })
+    end
+  end
+
+  def fail(ctx, id, lease_token, opts \\ [])
+      when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         :ok <- validate_lease_token(lease_token),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+         {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil) do
+      Router.flow_fail(ctx, %{
+        id: id,
+        lease_token: lease_token,
+        error_ref: error_ref,
+        now_ms: now,
+        partition_key: partition_key
+      })
+    end
+  end
+
+  def cancel(ctx, id, opts \\ []) when is_binary(id) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         {:ok, lease_token} <- optional_lease_token(opts),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+         {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil) do
+      Router.flow_cancel(ctx, %{
+        id: id,
+        lease_token: lease_token,
+        reason_ref: reason_ref,
         now_ms: now,
         partition_key: partition_key
       })
@@ -128,10 +190,21 @@ defmodule Ferricstore.Flow do
   defp validate_type(type) when is_binary(type) and type != "", do: :ok
   defp validate_type(_type), do: {:error, "ERR flow type must be a non-empty string"}
 
+  defp validate_state(_name, state) when is_binary(state) and state != "", do: :ok
+  defp validate_state(name, _state), do: {:error, "ERR flow #{name} must be a non-empty string"}
+
   defp validate_lease_token(token) when is_binary(token) and token != "", do: :ok
 
   defp validate_lease_token(_token),
     do: {:error, "ERR flow lease_token must be a non-empty string"}
+
+  defp optional_lease_token(opts) do
+    case Keyword.get(opts, :lease_token, nil) do
+      nil -> {:ok, nil}
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, "ERR flow lease_token must be a non-empty string"}
+    end
+  end
 
   defp validate_flow_keys(id, type, state, priority, partition_key) do
     with :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
@@ -180,6 +253,14 @@ defmodule Ferricstore.Flow do
 
   defp optional_non_neg_integer(opts, key, default) do
     case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value >= 0 -> {:ok, value}
+      _ -> {:error, "ERR flow #{key} must be a non-negative integer"}
+    end
+  end
+
+  defp optional_non_neg_integer_or_nil(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      nil -> {:ok, nil}
       value when is_integer(value) and value >= 0 -> {:ok, value}
       _ -> {:error, "ERR flow #{key} must be a non-negative integer"}
     end

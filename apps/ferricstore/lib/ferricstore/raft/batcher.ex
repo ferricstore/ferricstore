@@ -151,7 +151,10 @@ defmodule Ferricstore.Raft.Batcher do
           | {:flow_create, binary(), map()}
           | {:flow_claim_due, binary(), map()}
           | {:flow_complete, binary(), map()}
+          | {:flow_transition, binary(), map()}
           | {:flow_retry, binary(), map()}
+          | {:flow_fail, binary(), map()}
+          | {:flow_cancel, binary(), map()}
           | {:origin_checked, binary(), command(), binary() | nil, non_neg_integer()}
           | {:origin_checked, binary(), command(), binary() | nil, non_neg_integer(),
              binary() | nil, non_neg_integer()}

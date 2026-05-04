@@ -879,8 +879,20 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_with_time(meta, state, fn -> do_flow_complete(state, attrs) end)
   end
 
+  def apply(meta, {:flow_transition, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_transition(state, attrs) end)
+  end
+
   def apply(meta, {:flow_retry, _key, attrs}, state) when is_map(attrs) do
     apply_pending_with_time(meta, state, fn -> do_flow_retry(state, attrs) end)
+  end
+
+  def apply(meta, {:flow_fail, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_fail(state, attrs) end)
+  end
+
+  def apply(meta, {:flow_cancel, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_cancel(state, attrs) end)
   end
 
   # ---------------------------------------------------------------------------
@@ -3108,8 +3120,20 @@ defmodule Ferricstore.Raft.StateMachine do
     do_flow_complete(state, attrs)
   end
 
+  defp apply_single(state, {:flow_transition, _key, attrs}) do
+    do_flow_transition(state, attrs)
+  end
+
   defp apply_single(state, {:flow_retry, _key, attrs}) do
     do_flow_retry(state, attrs)
+  end
+
+  defp apply_single(state, {:flow_fail, _key, attrs}) do
+    do_flow_fail(state, attrs)
+  end
+
+  defp apply_single(state, {:flow_cancel, _key, attrs}) do
+    do_flow_cancel(state, attrs)
   end
 
   # -- Probabilistic data structure commands in batch/cross_shard_tx --
@@ -4014,27 +4038,133 @@ defmodule Ferricstore.Raft.StateMachine do
     due_key = FlowKeys.due_key(type, expected_state, priority, partition_key)
     flow_ensure_due_index_ready(state, due_key)
 
+    max_scan = max(limit * 16, limit + 64)
+
     claimed =
-      state.zset_score_index_name
-      |> ZSetIndex.range_slice(due_key, :neg_inf, {:inclusive, now_ms * 1.0}, false, 0, limit)
-      |> Enum.reduce([], fn {id, _score}, acc ->
-        case flow_claim_candidate(
-               state,
-               due_key,
-               id,
-               expected_state,
-               worker,
-               lease_ms,
-               now_ms,
-               partition_key
-             ) do
-          {:ok, record} -> [record | acc]
-          :skip -> acc
-        end
-      end)
-      |> Enum.reverse()
+      flow_claim_due_scan(
+        state,
+        due_key,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        partition_key,
+        limit,
+        max_scan,
+        0,
+        0,
+        []
+      )
 
     {:ok, claimed}
+  end
+
+  defp flow_claim_due_scan(
+         _state,
+         _due_key,
+         _expected_state,
+         _worker,
+         _lease_ms,
+         _now_ms,
+         _partition_key,
+         limit,
+         _max_scan,
+         _scanned,
+         claimed_count,
+         claimed
+       )
+       when claimed_count >= limit do
+    claimed |> Enum.reverse() |> Enum.take(limit)
+  end
+
+  defp flow_claim_due_scan(
+         _state,
+         _due_key,
+         _expected_state,
+         _worker,
+         _lease_ms,
+         _now_ms,
+         _partition_key,
+         _limit,
+         max_scan,
+         scanned,
+         _claimed_count,
+         claimed
+       )
+       when scanned >= max_scan do
+    Enum.reverse(claimed)
+  end
+
+  defp flow_claim_due_scan(
+         state,
+         due_key,
+         expected_state,
+         worker,
+         lease_ms,
+         now_ms,
+         partition_key,
+         limit,
+         max_scan,
+         scanned,
+         claimed_count,
+         claimed
+       ) do
+    remaining = limit - claimed_count
+    batch_size = min(max(remaining * 2, 32), max_scan - scanned)
+
+    candidates =
+      ZSetIndex.range_slice(
+        state.zset_score_index_name,
+        due_key,
+        :neg_inf,
+        {:inclusive, now_ms * 1.0},
+        false,
+        0,
+        batch_size
+      )
+
+    if candidates == [] do
+      Enum.reverse(claimed)
+    else
+      {next_claimed_count, next_claimed} =
+        Enum.reduce_while(candidates, {claimed_count, claimed}, fn {id, _score}, {count, acc} ->
+          {next_count, next_acc} =
+            case flow_claim_candidate(
+                   state,
+                   due_key,
+                   id,
+                   expected_state,
+                   worker,
+                   lease_ms,
+                   now_ms,
+                   partition_key
+                 ) do
+              {:ok, record} -> {count + 1, [record | acc]}
+              :skip -> {count, acc}
+            end
+
+          if next_count >= limit do
+            {:halt, {next_count, next_acc}}
+          else
+            {:cont, {next_count, next_acc}}
+          end
+        end)
+
+      flow_claim_due_scan(
+        state,
+        due_key,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        partition_key,
+        limit,
+        max_scan,
+        scanned + length(candidates),
+        next_claimed_count,
+        next_claimed
+      )
+    end
   end
 
   defp do_flow_complete(state, %{id: id, lease_token: lease_token} = attrs) do
@@ -4056,9 +4186,43 @@ defmodule Ferricstore.Raft.StateMachine do
           next_run_at_ms: nil
         })
 
-      with :ok <- flow_due_delete(state, record),
+      with :ok <- flow_validate_record_keys(next),
+           :ok <- flow_due_delete(state, record),
            :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
            :ok <- flow_history_put(state, next, "completed", now_ms) do
+        {:ok, next}
+      end
+    end
+  end
+
+  defp do_flow_transition(
+         state,
+         %{id: id, from_state: from_state, to_state: to_state, run_at_ms: run_at_ms} = attrs
+       ) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
+
+    with {:ok, record} <- flow_require_record(state, id, partition_key),
+         :ok <- flow_require_expected_state(record, from_state),
+         :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)) do
+      next =
+        record
+        |> Map.merge(%{
+          state: to_state,
+          version: Map.fetch!(record, :version) + 1,
+          updated_at_ms: now_ms,
+          next_run_at_ms: run_at_ms,
+          priority: Map.get(attrs, :priority) || Map.get(record, :priority, 0),
+          lease_owner: nil,
+          lease_token: nil,
+          lease_deadline_ms: 0
+        })
+
+      with :ok <- flow_validate_record_keys(next),
+           :ok <- flow_due_delete(state, record),
+           :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
+           :ok <- flow_due_put(state, next),
+           :ok <- flow_history_put(state, next, "transitioned", now_ms) do
         {:ok, next}
       end
     end
@@ -4084,10 +4248,67 @@ defmodule Ferricstore.Raft.StateMachine do
           lease_deadline_ms: 0
         })
 
-      with :ok <- flow_due_delete(state, record),
+      with :ok <- flow_validate_record_keys(next),
+           :ok <- flow_due_delete(state, record),
            :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
            :ok <- flow_due_put(state, next),
            :ok <- flow_history_put(state, next, "retry", now_ms) do
+        {:ok, next}
+      end
+    end
+  end
+
+  defp do_flow_fail(state, %{id: id, lease_token: lease_token} = attrs) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
+
+    with {:ok, record} <- flow_require_record(state, id, partition_key),
+         :ok <- flow_require_running_lease(record, lease_token) do
+      next =
+        record
+        |> Map.merge(%{
+          state: "failed",
+          version: Map.fetch!(record, :version) + 1,
+          updated_at_ms: now_ms,
+          error_ref: Map.get(attrs, :error_ref),
+          lease_owner: nil,
+          lease_token: nil,
+          lease_deadline_ms: 0,
+          next_run_at_ms: nil
+        })
+
+      with :ok <- flow_validate_record_keys(next),
+           :ok <- flow_due_delete(state, record),
+           :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
+           :ok <- flow_history_put(state, next, "failed", now_ms) do
+        {:ok, next}
+      end
+    end
+  end
+
+  defp do_flow_cancel(state, %{id: id} = attrs) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
+
+    with {:ok, record} <- flow_require_record(state, id, partition_key),
+         :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)) do
+      next =
+        record
+        |> Map.merge(%{
+          state: "cancelled",
+          version: Map.fetch!(record, :version) + 1,
+          updated_at_ms: now_ms,
+          error_ref: Map.get(attrs, :reason_ref),
+          lease_owner: nil,
+          lease_token: nil,
+          lease_deadline_ms: 0,
+          next_run_at_ms: nil
+        })
+
+      with :ok <- flow_validate_record_keys(next),
+           :ok <- flow_due_delete(state, record),
+           :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
+           :ok <- flow_history_put(state, next, "cancelled", now_ms) do
         {:ok, next}
       end
     end
@@ -4149,8 +4370,45 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flow_require_expected_state(%{state: expected_state}, expected_state), do: :ok
+  defp flow_require_expected_state(_record, _expected_state), do: {:error, "ERR flow wrong state"}
+
   defp flow_require_running_lease(%{state: "running", lease_token: token}, token), do: :ok
   defp flow_require_running_lease(_record, _token), do: {:error, "ERR stale flow lease"}
+
+  defp flow_require_transition_lease(%{lease_token: nil}, nil), do: :ok
+  defp flow_require_transition_lease(%{lease_token: token}, token), do: :ok
+  defp flow_require_transition_lease(_record, _token), do: {:error, "ERR stale flow lease"}
+
+  defp flow_validate_record_keys(
+         %{id: id, type: type, state: flow_state, priority: priority} = record
+       ) do
+    partition_key = Map.get(record, :partition_key)
+
+    with :ok <- flow_validate_key_size(FlowKeys.state_key(id, partition_key)),
+         :ok <- flow_validate_key_size(FlowKeys.history_key(id, partition_key)),
+         :ok <-
+           flow_validate_key_size(
+             FlowKeys.stream_entry_key(
+               id,
+               "18446744073709551615-18446744073709551615",
+               partition_key
+             )
+           ) do
+      case Map.get(record, :next_run_at_ms) do
+        nil -> :ok
+        _ -> flow_validate_key_size(FlowKeys.due_key(type, flow_state, priority, partition_key))
+      end
+    end
+  end
+
+  defp flow_validate_key_size(key) do
+    if byte_size(key) <= Router.max_key_size() do
+      :ok
+    else
+      {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+    end
+  end
 
   defp flow_read_record(state, id, partition_key) do
     case ets_lookup(state, FlowKeys.state_key(id, partition_key)) do
