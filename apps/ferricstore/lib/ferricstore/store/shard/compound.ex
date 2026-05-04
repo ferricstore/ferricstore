@@ -987,10 +987,10 @@ defmodule Ferricstore.Store.Shard.Compound do
       # No live promoted members remain. Keep the newly touched empty
       # active file so future writes have a valid target, and remove old
       # dedicated logs so accounting does not reset while bytes remain.
-      remove_dedicated_logs_before(dedicated_path, new_fid)
-
-      case dedicated_fsync_dir(state, dedicated_path, :remove_old_logs) do
-        :ok -> {:ok, state}
+      with :ok <- remove_dedicated_logs_before(state, dedicated_path, new_fid),
+           :ok <- dedicated_fsync_dir(state, dedicated_path, :remove_old_logs) do
+        {:ok, state}
+      else
         {:error, _reason} -> {:error, state}
       end
     else
@@ -1012,23 +1012,21 @@ defmodule Ferricstore.Store.Shard.Compound do
             )
           end)
 
-          remove_dedicated_logs_before(dedicated_path, new_fid)
+          with :ok <- remove_dedicated_logs_before(state, dedicated_path, new_fid),
+               :ok <- dedicated_fsync_dir(state, dedicated_path, :remove_old_logs) do
+            Logger.debug(
+              "Shard #{state.index}: compacted dedicated #{inspect(redis_key)} " <>
+                "(#{length(live_entries)} live entries, fid #{old_fid} -> #{new_fid})"
+            )
 
-          case dedicated_fsync_dir(state, dedicated_path, :remove_old_logs) do
-            :ok ->
-              Logger.debug(
-                "Shard #{state.index}: compacted dedicated #{inspect(redis_key)} " <>
-                  "(#{length(live_entries)} live entries, fid #{old_fid} -> #{new_fid})"
-              )
+            :telemetry.execute(
+              [:ferricstore, :dedicated, :compaction],
+              %{live_entries: length(live_entries), old_fid: old_fid, new_fid: new_fid},
+              %{shard_index: state.index, redis_key: redis_key}
+            )
 
-              :telemetry.execute(
-                [:ferricstore, :dedicated, :compaction],
-                %{live_entries: length(live_entries), old_fid: old_fid, new_fid: new_fid},
-                %{shard_index: state.index, redis_key: redis_key}
-              )
-
-              {:ok, state}
-
+            {:ok, state}
+          else
             {:error, _reason} ->
               {:error, state}
           end
@@ -1096,16 +1094,32 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
-  defp remove_dedicated_logs_before(dedicated_path, new_fid) do
+  defp remove_dedicated_logs_before(state, dedicated_path, new_fid) do
     case Ferricstore.FS.ls(dedicated_path) do
       {:ok, files} ->
-        Enum.each(files, fn name ->
+        Enum.reduce_while(files, :ok, fn name, :ok ->
           if String.ends_with?(name, ".log") do
             fid = name |> String.trim_trailing(".log") |> String.to_integer()
 
             if fid < new_fid do
-              _ = Ferricstore.FS.rm(Path.join(dedicated_path, name))
+              path = Path.join(dedicated_path, name)
+
+              case Ferricstore.FS.rm(path) do
+                :ok ->
+                  {:cont, :ok}
+
+                {:error, reason} ->
+                  Logger.error(
+                    "Shard #{state.index}: dedicated compaction failed to remove old log #{path}: #{inspect(reason)}"
+                  )
+
+                  {:halt, {:error, {:remove_old_log_failed, path, reason}}}
+              end
+            else
+              {:cont, :ok}
             end
+          else
+            {:cont, :ok}
           end
         end)
 

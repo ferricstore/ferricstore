@@ -389,6 +389,56 @@ defmodule Ferricstore.Store.ShardAccountingTest do
       end
     end
 
+    test "dedicated compaction old-log removal failure preserves retry accounting" do
+      keydir = new_keydir()
+      redis_key = "hash:promoted:compact:remove_failed"
+      compound_key = CompoundKey.hash_field(redis_key, "field")
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore-promoted-compact-remove-fail-#{System.unique_integer([:positive])}"
+        )
+
+      original_total = 2_200_000
+      original_dead = 1_200_000
+      stale_dir = Path.join(dir, "00000.log")
+
+      try do
+        File.mkdir_p!(dir)
+        File.mkdir!(stale_dir)
+        File.touch!(Path.join(dir, "00001.log"))
+
+        :ets.insert(keydir, {Promotion.marker_key(redis_key), "hash", 0, LFU.initial(), 0, 0, 4})
+        :ets.insert(keydir, {compound_key, "value", 0, LFU.initial(), 1, 0, 5})
+
+        state = %{
+          index: 0,
+          keydir: keydir,
+          instance_ctx: nil,
+          promoted_instances: %{
+            redis_key => %{
+              path: dir,
+              total_bytes: original_total,
+              dead_bytes: original_dead,
+              last_compacted_at: nil
+            }
+          }
+        }
+
+        after_state = ShardCompound.bump_promoted_writes(state, redis_key)
+        info = after_state.promoted_instances[redis_key]
+
+        assert File.dir?(stale_dir)
+        assert info.dead_bytes == original_dead
+        assert info.total_bytes == original_total
+        assert info.last_compacted_at == nil
+      after
+        File.rm_rf(dir)
+        :ets.delete(keydir)
+      end
+    end
+
     test "dedicated compaction active-file fsync failure preserves retry accounting" do
       keydir = new_keydir()
       redis_key = "hash:promoted:compact:file_fsync_failed"
