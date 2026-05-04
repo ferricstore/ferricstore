@@ -374,6 +374,36 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
         assert read_ckey(ctx, ckey) != :missing
       end
     end
+
+    test "promotion aborts when shared tombstone batch append fails", ctx do
+      {redis_key, _entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
+
+      Process.put(:ferricstore_promotion_before_shared_tombstones_hook, fn ->
+        File.rm!(ctx.active_path)
+        File.mkdir!(ctx.active_path)
+      end)
+
+      try do
+        assert_raise RuntimeError, ~r/promotion shared tombstone write failed/, fn ->
+          Promotion.promote_collection!(
+            :hash,
+            redis_key,
+            ctx.shard_data_path,
+            ctx.keydir,
+            ctx.data_dir,
+            ctx.shard_index
+          )
+        end
+
+        mk = Promotion.marker_key(redis_key)
+        assert [{^mk, _type, 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ctx.keydir, mk)
+
+        dedicated_path = Promotion.dedicated_path(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+        assert File.dir?(dedicated_path)
+      after
+        Process.delete(:ferricstore_promotion_before_shared_tombstones_hook)
+      end
+    end
   end
 
   describe "cleanup failure" do

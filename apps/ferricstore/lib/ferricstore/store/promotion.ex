@@ -294,18 +294,39 @@ defmodule Ferricstore.Store.Promotion do
       end
     end
 
-    # Step 3: tombstone compound keys in shared log (LAST step)
-    Enum.each(entries, fn {key, _value, _exp} ->
-      case NIF.v2_append_tombstone(active_path, key) do
-        {:ok, _} ->
-          :ok
+    # Step 3: tombstone compound keys in shared log (LAST step).
+    # Batch tombstones and fsync once. If this crashes before the fsync,
+    # recovery is still safe because marker + dedicated data are already
+    # durable, and any un-tombstoned shared keys remain valid fallback copies.
+    # If the write/fsync returns an error, fail closed so the caller does not
+    # observe a successful promotion whose shared-log cleanup may be missing.
+    tombstone_ops = Enum.map(entries, fn {key, _value, _exp} -> {:delete, key} end)
+
+    if tombstone_ops != [] do
+      run_before_shared_tombstones_hook()
+
+      case NIF.v2_append_ops_batch_nosync(active_path, tombstone_ops) do
+        {:ok, _locations} ->
+          case NIF.v2_fsync(active_path) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              Logger.error(
+                "Promotion: tombstone batch fsync failed for #{inspect(redis_key)}: #{inspect(reason)}"
+              )
+
+              raise "promotion shared tombstone fsync failed: #{inspect(reason)}"
+          end
 
         {:error, reason} ->
-          Logger.warning(
-            "Promotion: tombstone write failed for #{inspect(key)}: #{inspect(reason)}"
+          Logger.error(
+            "Promotion: tombstone batch write failed for #{inspect(redis_key)}: #{inspect(reason)}"
           )
+
+          raise "promotion shared tombstone write failed: #{inspect(reason)}"
       end
-    end)
+    end
 
     Logger.info(
       "Promoted #{type_label} #{inspect(redis_key)} to dedicated Bitcask " <>
@@ -313,6 +334,13 @@ defmodule Ferricstore.Store.Promotion do
     )
 
     {:ok, dedicated_path}
+  end
+
+  defp run_before_shared_tombstones_hook do
+    case Process.get(:ferricstore_promotion_before_shared_tombstones_hook) do
+      fun when is_function(fun, 0) -> fun.()
+      _ -> :ok
+    end
   end
 
   @spec recover_promoted(binary(), atom(), binary(), non_neg_integer(), term()) :: map()

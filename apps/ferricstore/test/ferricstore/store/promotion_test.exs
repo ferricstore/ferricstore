@@ -53,6 +53,16 @@ defmodule Ferricstore.Store.PromotionTest do
     end)
   end
 
+  test "promotion batches shared tombstones after dedicated copy" do
+    source =
+      __DIR__
+      |> Path.join("../../../lib/ferricstore/store/promotion.ex")
+      |> File.read!()
+
+    assert source =~ "v2_append_ops_batch_nosync(active_path, tombstone_ops)"
+    assert source =~ "v2_fsync(active_path)"
+  end
+
   test "promoted recovery reports leftover compact temp cleanup failures" do
     root =
       Path.join(
