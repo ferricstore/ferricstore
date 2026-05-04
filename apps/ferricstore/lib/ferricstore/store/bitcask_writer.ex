@@ -47,7 +47,8 @@ defmodule Ferricstore.Store.BitcaskWriter do
   @flush_interval_ms 1
   @error_retry_interval_ms 50
 
-  @type flush_result :: :ok | {:error, {:flush_failed, pos_integer()}}
+  @type flush_error :: {:flush_failed, pos_integer()} | {:flush_exit, term()}
+  @type flush_result :: :ok | {:error, flush_error()}
 
   @doc "Starts a BitcaskWriter for the given shard index."
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -165,9 +166,12 @@ defmodule Ferricstore.Store.BitcaskWriter do
     try do
       GenServer.call(writer_name(shard_index), :flush, timeout)
     catch
-      :exit, _ -> :ok
+      :exit, reason -> normalize_flush_exit(reason)
     end
   end
+
+  defp normalize_flush_exit({:noproc, _call}), do: :ok
+  defp normalize_flush_exit(reason), do: {:error, {:flush_exit, reason}}
 
   @doc """
   Flushes all running BitcaskWriter processes.

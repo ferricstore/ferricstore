@@ -27,6 +27,16 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
   @header_size 26
 
+  defmodule SlowFlushWriter do
+    use GenServer
+
+    def start_link(name), do: GenServer.start_link(__MODULE__, nil, name: name)
+    @impl true
+    def init(nil), do: {:ok, nil}
+    @impl true
+    def handle_call(:flush, _from, state), do: {:noreply, state}
+  end
+
   setup do
     :ok
   end
@@ -364,6 +374,18 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert state.pending_count == 1
       assert [{:write, nil, ^path, 0, ^keydir, ^key, "new", 456}] = state.pending
       assert [{^key, "new", 456, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, key)
+    end
+
+    test "BitcaskWriter flush reports timeout instead of pretending the drain succeeded" do
+      shard_index = 10_000 + System.unique_integer([:positive])
+      writer_name = BitcaskWriter.writer_name(shard_index)
+      {:ok, writer} = SlowFlushWriter.start_link(writer_name)
+
+      on_exit(fn ->
+        if Process.alive?(writer), do: GenServer.stop(writer, :kill, 100)
+      end)
+
+      assert {:error, {:flush_exit, {:timeout, _call}}} = BitcaskWriter.flush(shard_index, 1)
     end
 
     test "BitcaskWriter batches tombstone runs through the ops NIF" do
