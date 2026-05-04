@@ -432,6 +432,7 @@ defmodule Ferricstore.Merge.Scheduler do
 
   defp retryable_merge_error?(:no_files), do: false
   defp retryable_merge_error?(:not_enough_files), do: false
+  defp retryable_merge_error?({:compaction_failed, {:no_compactable_files, _file_ids}}), do: false
   defp retryable_merge_error?(_reason), do: true
 
   defp select_files_for_merge(state, _shard_name) do

@@ -83,6 +83,24 @@ defmodule Ferricstore.Merge.SchedulerTest do
     end
   end
 
+  defmodule NoCompactionShard do
+    use GenServer
+
+    def start(opts), do: GenServer.start(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
+
+    @impl true
+    def init(opts), do: {:ok, Map.new(opts)}
+
+    @impl true
+    def handle_call(:available_disk_space, _from, state),
+      do: {:reply, {:ok, 1_000_000_000}, state}
+
+    def handle_call({:run_compaction, [0]}, _from, state) do
+      send(state.parent, :no_compaction_attempt)
+      {:reply, {:error, {:no_compactable_files, [0]}}, state}
+    end
+  end
+
   defmodule BlockingShard do
     use GenServer
 
@@ -433,6 +451,62 @@ defmodule Ferricstore.Merge.SchedulerTest do
         status = GenServer.call(pid, :status)
         assert status.fragmentation_candidates == []
         assert status.total_bytes_reclaimed == 128
+      after
+        if Process.alive?(pid), do: GenServer.stop(pid)
+        ref = Process.monitor(fake_shard)
+        Process.exit(fake_shard, :kill)
+        assert_receive {:DOWN, ^ref, :process, ^fake_shard, :killed}, 1_000
+
+        if is_pid(real_shard) and Process.alive?(real_shard),
+          do: Process.register(real_shard, shard_name)
+
+        File.rm_rf!(data_dir)
+      end
+    end
+
+    test "fragmentation no-compaction result clears candidates without retrying" do
+      ctx = FerricStore.Instance.get(:default)
+      shard_name = Router.shard_name(ctx, 0)
+      real_shard = Process.whereis(shard_name)
+
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "scheduler_frag_no_compaction_#{System.unique_integer([:positive])}"
+        )
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+      File.mkdir_p!(shard_dir)
+      File.write!(Path.join(shard_dir, "00000.log"), "old")
+      File.write!(Path.join(shard_dir, "00001.log"), "active")
+
+      Process.unregister(shard_name)
+      {:ok, fake_shard} = NoCompactionShard.start(name: shard_name, parent: self())
+
+      {:ok, pid} =
+        Scheduler.start_link(
+          shard_index: 0,
+          data_dir: data_dir,
+          merge_config: %{
+            mode: :hot,
+            min_files_for_merge: 100,
+            merge_cooldown_ms: 0,
+            merge_retry_interval_ms: 25
+          },
+          name: :test_scheduler_frag_no_compaction
+        )
+
+      try do
+        GenServer.cast(pid, {:fragmentation, [0], 2})
+
+        assert_receive :no_compaction_attempt, 1_000
+        Process.sleep(75)
+        refute_receive :no_compaction_attempt, 100
+
+        scheduler_state = :sys.get_state(pid)
+        assert scheduler_state.retry_ref == nil
+        status = GenServer.call(pid, :status)
+        assert status.fragmentation_candidates == []
       after
         if Process.alive?(pid), do: GenServer.stop(pid)
         ref = Process.monitor(fake_shard)
