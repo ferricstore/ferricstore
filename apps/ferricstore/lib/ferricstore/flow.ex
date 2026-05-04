@@ -322,6 +322,18 @@ defmodule Ferricstore.Flow do
         ":due:" <> type <> ":" <> state <> ":p" <> Integer.to_string(priority)
     end
 
+    def state_index_key(type, state, partition_key \\ nil) do
+      "flow:" <> tag(partition_key) <> ":idx:state:" <> type <> ":" <> state
+    end
+
+    def inflight_index_key(type, partition_key \\ nil) do
+      "flow:" <> tag(partition_key) <> ":idx:inflight:" <> type
+    end
+
+    def worker_index_key(worker, partition_key \\ nil) do
+      "flow:" <> tag(partition_key) <> ":idx:worker:" <> worker
+    end
+
     def stream_entry_key(id, event_id, partition_key \\ nil) do
       "X:" <> history_key(id, partition_key) <> <<0>> <> event_id
     end

@@ -4012,8 +4012,10 @@ defmodule Ferricstore.Raft.StateMachine do
           lease_deadline_ms: 0
         }
 
-        with :ok <- do_put(state, state_key, flow_encode(record), 0),
+        with :ok <- flow_validate_record_keys(record),
+             :ok <- do_put(state, state_key, flow_encode(record), 0),
              :ok <- flow_due_put(state, record),
+             :ok <- flow_index_put(state, record),
              :ok <- flow_history_put(state, record, "created", now_ms) do
           {:ok, record}
         end
@@ -4188,9 +4190,12 @@ defmodule Ferricstore.Raft.StateMachine do
           next_run_at_ms: nil
         })
 
-      with :ok <- flow_validate_record_keys(next),
+      with :ok <- flow_validate_record_keys(record),
+           :ok <- flow_validate_record_keys(next),
            :ok <- flow_due_delete(state, record),
+           :ok <- flow_index_delete(state, record),
            :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
+           :ok <- flow_index_put(state, next),
            :ok <- flow_history_put(state, next, "completed", now_ms) do
         {:ok, next}
       end
@@ -4221,10 +4226,13 @@ defmodule Ferricstore.Raft.StateMachine do
           lease_deadline_ms: 0
         })
 
-      with :ok <- flow_validate_record_keys(next),
+      with :ok <- flow_validate_record_keys(record),
+           :ok <- flow_validate_record_keys(next),
            :ok <- flow_due_delete(state, record),
+           :ok <- flow_index_delete(state, record),
            :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
            :ok <- flow_due_put(state, next),
+           :ok <- flow_index_put(state, next),
            :ok <- flow_history_put(state, next, "transitioned", now_ms) do
         {:ok, next}
       end
@@ -4252,10 +4260,13 @@ defmodule Ferricstore.Raft.StateMachine do
           lease_deadline_ms: 0
         })
 
-      with :ok <- flow_validate_record_keys(next),
+      with :ok <- flow_validate_record_keys(record),
+           :ok <- flow_validate_record_keys(next),
            :ok <- flow_due_delete(state, record),
+           :ok <- flow_index_delete(state, record),
            :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
            :ok <- flow_due_put(state, next),
+           :ok <- flow_index_put(state, next),
            :ok <- flow_history_put(state, next, "retry", now_ms) do
         {:ok, next}
       end
@@ -4282,9 +4293,12 @@ defmodule Ferricstore.Raft.StateMachine do
           next_run_at_ms: nil
         })
 
-      with :ok <- flow_validate_record_keys(next),
+      with :ok <- flow_validate_record_keys(record),
+           :ok <- flow_validate_record_keys(next),
            :ok <- flow_due_delete(state, record),
+           :ok <- flow_index_delete(state, record),
            :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
+           :ok <- flow_index_put(state, next),
            :ok <- flow_history_put(state, next, "failed", now_ms) do
         {:ok, next}
       end
@@ -4311,9 +4325,12 @@ defmodule Ferricstore.Raft.StateMachine do
           next_run_at_ms: nil
         })
 
-      with :ok <- flow_validate_record_keys(next),
+      with :ok <- flow_validate_record_keys(record),
+           :ok <- flow_validate_record_keys(next),
            :ok <- flow_due_delete(state, record),
+           :ok <- flow_index_delete(state, record),
            :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
+           :ok <- flow_index_put(state, next),
            :ok <- flow_history_put(state, next, "cancelled", now_ms) do
         {:ok, next}
       end
@@ -4357,9 +4374,13 @@ defmodule Ferricstore.Raft.StateMachine do
             next_run_at_ms: deadline_ms
           })
 
-        with :ok <- flow_due_delete_from_key(state, due_key, id),
+        with :ok <- flow_validate_record_keys(record),
+             :ok <- flow_validate_record_keys(next),
+             :ok <- flow_due_delete_from_key(state, due_key, id),
+             :ok <- flow_index_delete(state, record),
              :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
              :ok <- flow_due_put(state, next),
+             :ok <- flow_index_put(state, next),
              :ok <- flow_history_put(state, next, "claimed", now_ms) do
           {:ok, next}
         else
@@ -4404,6 +4425,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     with :ok <- flow_validate_key_size(FlowKeys.state_key(id, partition_key)),
          :ok <- flow_validate_key_size(FlowKeys.history_key(id, partition_key)),
+         :ok <- flow_validate_key_size(FlowKeys.state_index_key(type, flow_state, partition_key)),
          :ok <-
            flow_validate_key_size(
              FlowKeys.stream_entry_key(
@@ -4412,12 +4434,28 @@ defmodule Ferricstore.Raft.StateMachine do
                partition_key
              )
            ) do
-      case Map.get(record, :next_run_at_ms) do
-        nil -> :ok
-        _ -> flow_validate_key_size(FlowKeys.due_key(type, flow_state, priority, partition_key))
+      with :ok <- flow_validate_due_key(record, type, flow_state, priority, partition_key) do
+        flow_validate_running_index_keys(record, type, partition_key)
       end
     end
   end
+
+  defp flow_validate_due_key(record, type, flow_state, priority, partition_key) do
+    case Map.get(record, :next_run_at_ms) do
+      nil -> :ok
+      _ -> flow_validate_key_size(FlowKeys.due_key(type, flow_state, priority, partition_key))
+    end
+  end
+
+  defp flow_validate_running_index_keys(%{state: "running"} = record, type, partition_key) do
+    with :ok <- flow_validate_key_size(FlowKeys.inflight_index_key(type, partition_key)) do
+      flow_validate_key_size(
+        FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key)
+      )
+    end
+  end
+
+  defp flow_validate_running_index_keys(_record, _type, _partition_key), do: :ok
 
   defp flow_validate_key_size(key) do
     if byte_size(key) <= Router.max_key_size() do
@@ -4483,12 +4521,60 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_due_delete_from_key(state, due_key, id) do
+    flow_zset_delete_from_key(state, due_key, id)
+  end
+
+  defp flow_zset_delete_from_key(state, due_key, id) do
     compound_key = CompoundKey.zset_member(due_key, id)
 
     with :ok <- do_delete(state, compound_key) do
       flow_zset_delete(state, due_key, id)
     end
   end
+
+  defp flow_index_put(state, %{id: id, type: type, state: flow_state} = record) do
+    partition_key = Map.get(record, :partition_key)
+    state_index_key = FlowKeys.state_index_key(type, flow_state, partition_key)
+    updated_score = Float.to_string(Map.get(record, :updated_at_ms, 0) * 1.0)
+
+    with :ok <- flow_zset_put(state, state_index_key, id, updated_score) do
+      flow_running_index_put(state, record)
+    end
+  end
+
+  defp flow_running_index_put(state, %{state: "running", id: id, type: type} = record) do
+    partition_key = Map.get(record, :partition_key)
+    lease_score = Float.to_string(Map.get(record, :lease_deadline_ms, 0) * 1.0)
+    inflight_index_key = FlowKeys.inflight_index_key(type, partition_key)
+    worker_index_key = FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key)
+
+    with :ok <- flow_zset_put(state, inflight_index_key, id, lease_score) do
+      flow_zset_put(state, worker_index_key, id, lease_score)
+    end
+  end
+
+  defp flow_running_index_put(_state, _record), do: :ok
+
+  defp flow_index_delete(state, %{id: id, type: type, state: flow_state} = record) do
+    partition_key = Map.get(record, :partition_key)
+    state_index_key = FlowKeys.state_index_key(type, flow_state, partition_key)
+
+    with :ok <- flow_zset_delete_from_key(state, state_index_key, id) do
+      flow_running_index_delete(state, record)
+    end
+  end
+
+  defp flow_running_index_delete(state, %{state: "running", id: id, type: type} = record) do
+    partition_key = Map.get(record, :partition_key)
+    inflight_index_key = FlowKeys.inflight_index_key(type, partition_key)
+    worker_index_key = FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key)
+
+    with :ok <- flow_zset_delete_from_key(state, inflight_index_key, id) do
+      flow_zset_delete_from_key(state, worker_index_key, id)
+    end
+  end
+
+  defp flow_running_index_delete(_state, _record), do: :ok
 
   defp flow_ensure_due_type(_state, nil), do: :ok
 

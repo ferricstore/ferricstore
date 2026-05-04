@@ -211,11 +211,73 @@ defmodule Ferricstore.FlowTest do
     state_a = Ferricstore.Flow.Keys.state_key(id, partition_a)
     history_a = Ferricstore.Flow.Keys.history_key(id, partition_a)
     due_a = Ferricstore.Flow.Keys.due_key("email", "queued", 0, partition_a)
+    state_index_a = Ferricstore.Flow.Keys.state_index_key("email", "queued", partition_a)
+    inflight_index_a = Ferricstore.Flow.Keys.inflight_index_key("email", partition_a)
+    worker_index_a = Ferricstore.Flow.Keys.worker_index_key("worker-a", partition_a)
     state_b = Ferricstore.Flow.Keys.state_key(id, partition_b)
 
     assert shard_for(state_a) == shard_for(history_a)
     assert shard_for(state_a) == shard_for(due_a)
+    assert shard_for(state_a) == shard_for(state_index_a)
+    assert shard_for(state_a) == shard_for(inflight_index_a)
+    assert shard_for(state_a) == shard_for(worker_index_a)
     assert shard_for(state_a) != shard_for(state_b)
+  end
+
+  test "flow lifecycle maintains state, inflight, and worker indexes" do
+    id = uid("flow-index")
+    type = "indexed"
+    worker = "worker-index"
+    queued_index = Ferricstore.Flow.Keys.state_index_key(type, "queued")
+    running_index = Ferricstore.Flow.Keys.state_index_key(type, "running")
+    completed_index = Ferricstore.Flow.Keys.state_index_key(type, "completed")
+    inflight_index = Ferricstore.Flow.Keys.inflight_index_key(type)
+    worker_index = Ferricstore.Flow.Keys.worker_index_key(worker)
+
+    assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_000)
+    assert {:ok, [^id]} = FerricStore.zrange(queued_index, 0, -1)
+
+    assert {:ok, [first_claim]} =
+             FerricStore.flow_claim_due(type,
+               worker: worker,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, []} = FerricStore.zrange(queued_index, 0, -1)
+    assert {:ok, [^id]} = FerricStore.zrange(running_index, 0, -1)
+    assert {:ok, [^id]} = FerricStore.zrange(inflight_index, 0, -1)
+    assert {:ok, [^id]} = FerricStore.zrange(worker_index, 0, -1)
+
+    assert {:ok, _retried} =
+             FerricStore.flow_retry(id, first_claim.lease_token,
+               fencing_token: first_claim.fencing_token,
+               run_at_ms: 2_000
+             )
+
+    assert {:ok, [^id]} = FerricStore.zrange(queued_index, 0, -1)
+    assert {:ok, []} = FerricStore.zrange(running_index, 0, -1)
+    assert {:ok, []} = FerricStore.zrange(inflight_index, 0, -1)
+    assert {:ok, []} = FerricStore.zrange(worker_index, 0, -1)
+
+    assert {:ok, [second_claim]} =
+             FerricStore.flow_claim_due(type,
+               worker: worker,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 2_000
+             )
+
+    assert {:ok, _completed} =
+             FerricStore.flow_complete(id, second_claim.lease_token,
+               fencing_token: second_claim.fencing_token
+             )
+
+    assert {:ok, []} = FerricStore.zrange(running_index, 0, -1)
+    assert {:ok, []} = FerricStore.zrange(inflight_index, 0, -1)
+    assert {:ok, []} = FerricStore.zrange(worker_index, 0, -1)
+    assert {:ok, [^id]} = FerricStore.zrange(completed_index, 0, -1)
   end
 
   test "partition_key scopes claim, complete, retry, get, and history" do
