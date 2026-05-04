@@ -1114,6 +1114,8 @@ defmodule Ferricstore.Raft.StateMachine do
           nil
       end
 
+    record_release_cursor_blocked_apply(state, release_cursor_blocked?)
+
     if release_cursor_blocked? do
       {state, wrapped_result, [notify_effect]}
     else
@@ -1195,6 +1197,27 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp block_release_cursor_for_apply do
     Process.put(:sm_release_cursor_blocked, true)
+  end
+
+  defp record_release_cursor_blocked_apply(state, true) do
+    count = cursor_metric(state, :release_cursor_blocked_apply_count) + 1
+    record_cursor_metric(state, :release_cursor_blocked_apply_count, count)
+
+    :telemetry.execute(
+      [:ferricstore, :raft, :release_cursor, :blocked],
+      %{count: 1, consecutive_count: count},
+      %{shard_index: Map.get(state, :shard_index)}
+    )
+  rescue
+    _ -> :ok
+  end
+
+  defp record_release_cursor_blocked_apply(state, false) do
+    if cursor_metric(state, :release_cursor_blocked_apply_count) != 0 do
+      record_cursor_metric(state, :release_cursor_blocked_apply_count, 0)
+    end
+  rescue
+    _ -> :ok
   end
 
   defp consume_checkpoint_dirty_indices do

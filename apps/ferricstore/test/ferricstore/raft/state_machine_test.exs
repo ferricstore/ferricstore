@@ -2958,6 +2958,95 @@ defmodule Ferricstore.Raft.StateMachineTest do
              "Raft cursor must not advance past data that still needs a Bitcask checkpoint"
     end
 
+    test "release_cursor block metric records consecutive blocked applies", %{
+      ets: ets
+    } do
+      shard0 = 0
+      shard1 = 1
+      root = Path.join(System.tmp_dir!(), "sm_blocked_rc_#{System.unique_integer([:positive])}")
+      shard1_path = Ferricstore.DataDir.shard_data_path(root, shard1)
+      bad_active_path = Path.join(shard1_path, "active_as_dir.log")
+      ets1 = :ets.new(:"sm_blocked_rc_#{System.unique_integer([:positive])}", [:set, :public])
+
+      File.mkdir_p!(bad_active_path)
+      Ferricstore.Store.ActiveFile.init(2)
+
+      checkpoint_flags = :atomics.new(2, signed: false)
+      checkpoint_in_flight = :atomics.new(2, signed: false)
+      disk_pressure = :atomics.new(2, signed: false)
+      last_applied_index = :atomics.new(2, signed: false)
+      last_released_cursor_index = :atomics.new(2, signed: false)
+      release_cursor_blocked_apply_count = :atomics.new(2, signed: false)
+
+      state =
+        init_state_for_release_cursor(ets,
+          shard_index: shard0,
+          release_cursor_interval: 1
+        )
+
+      instance_ctx = %{
+        name: :"sm_blocked_rc_#{System.unique_integer([:positive])}",
+        data_dir: root,
+        shard_count: 2,
+        keydir_refs: List.to_tuple([ets, ets1]),
+        keydir_binary_bytes: :atomics.new(2, signed: false),
+        checkpoint_flags: checkpoint_flags,
+        checkpoint_in_flight: checkpoint_in_flight,
+        disk_pressure: disk_pressure,
+        last_applied_index: last_applied_index,
+        last_released_cursor_index: last_released_cursor_index,
+        release_cursor_blocked_apply_count: release_cursor_blocked_apply_count,
+        hot_cache_max_value_size: 64
+      }
+
+      Ferricstore.Store.ActiveFile.publish(
+        instance_ctx,
+        shard0,
+        state.active_file_id,
+        state.active_file_path,
+        state.shard_data_path
+      )
+
+      Ferricstore.Store.ActiveFile.publish(instance_ctx, shard1, 0, bad_active_path, shard1_path)
+      state = %{state | instance_ctx: instance_ctx}
+
+      # The old cold location intentionally points at a missing retired file.
+      # If shard1 fails after shard0 accepted its write, compensation must fail
+      # instead of releasing Ra's cursor past divergent Bitcask state.
+      key = "blocked_cold_original"
+      :ets.insert(ets, {key, nil, 0, 0, 1, 0, 5})
+
+      try do
+        {state, {:applied_at, 1, {:error, {:cross_shard_compensation_failed, _reason}}},
+         effects1} =
+          StateMachine.apply(
+            %{index: 1, term: 1, system_time: System.os_time(:millisecond)},
+            {:cross_shard_tx,
+             [
+               {shard0, [{"SET", [key, "new"]}], nil},
+               {shard1, [{"SET", ["blocked_remote_fail", "value"]}], nil}
+             ]},
+            state
+          )
+
+        assert :atomics.get(release_cursor_blocked_apply_count, shard0 + 1) == 1
+        refute Enum.any?(effects1, &match?({:release_cursor, _}, &1))
+
+        {_state, {:applied_at, 2, nil}, _effects2} =
+          StateMachine.apply(
+            %{index: 2, term: 1, system_time: System.os_time(:millisecond)},
+            {:getdel, "unblocked_missing"},
+            state
+          )
+
+        assert :atomics.get(release_cursor_blocked_apply_count, shard0 + 1) == 0
+      after
+        :ets.delete(ets1)
+        Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)
+        File.rm_rf!(root)
+      end
+    end
+
     test "cross-shard SET dirties checkpoint state before release_cursor", %{
       ets: ets,
       shard_index: shard_index

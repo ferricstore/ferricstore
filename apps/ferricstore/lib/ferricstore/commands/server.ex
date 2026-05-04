@@ -880,6 +880,10 @@ defmodule Ferricstore.Commands.Server do
         last_applied = atomic_metric(instance_ctx, :last_applied_index, i)
         last_released = atomic_metric(instance_ctx, :last_released_cursor_index, i)
         release_gap = max(last_applied - last_released, 0)
+
+        release_cursor_blocked_apply_count =
+          atomic_metric(instance_ctx, :release_cursor_blocked_apply_count, i)
+
         checkpoint_dirty = atomic_metric(instance_ctx, :checkpoint_flags, i)
         checkpoint_in_flight = atomic_metric(instance_ctx, :checkpoint_in_flight, i)
 
@@ -891,6 +895,8 @@ defmodule Ferricstore.Commands.Server do
           {"shard_#{i}_last_applied_index", Integer.to_string(last_applied)},
           {"shard_#{i}_last_released_cursor_index", Integer.to_string(last_released)},
           {"shard_#{i}_release_cursor_gap", Integer.to_string(release_gap)},
+          {"shard_#{i}_release_cursor_blocked_apply_count",
+           Integer.to_string(release_cursor_blocked_apply_count)},
           {"shard_#{i}_checkpoint_dirty", Integer.to_string(checkpoint_dirty)},
           {"shard_#{i}_checkpoint_in_flight", Integer.to_string(checkpoint_in_flight)}
         ]

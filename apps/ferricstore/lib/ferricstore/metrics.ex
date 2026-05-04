@@ -250,6 +250,11 @@ defmodule Ferricstore.Metrics do
         fn shard -> atomic_metric(ctx, :pending_release_cursor_checkpoint_count, shard) end
       ),
       checkpoint_metric_family(
+        "ferricstore_bitcask_release_cursor_blocked_apply_count",
+        "Consecutive applies whose Raft cursor release was blocked by replay-safety compensation",
+        fn shard -> atomic_metric(ctx, :release_cursor_blocked_apply_count, shard) end
+      ),
+      checkpoint_metric_family(
         "ferricstore_bitcask_checkpoint_dirty",
         "Whether the shard has uncheckpointed Bitcask data",
         fn shard -> atomic_metric(ctx, :checkpoint_flags, shard) end

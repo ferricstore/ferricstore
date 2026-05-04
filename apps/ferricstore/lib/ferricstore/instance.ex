@@ -32,6 +32,7 @@ defmodule FerricStore.Instance do
           last_applied_index: reference(),
           last_released_cursor_index: reference(),
           pending_release_cursor_checkpoint_count: reference(),
+          release_cursor_blocked_apply_count: reference(),
           write_version: reference(),
           stats_counter: reference(),
           lfu_decay_time: non_neg_integer(),
@@ -71,6 +72,7 @@ defmodule FerricStore.Instance do
     :last_applied_index,
     :last_released_cursor_index,
     :pending_release_cursor_checkpoint_count,
+    :release_cursor_blocked_apply_count,
     :write_version,
     :stats_counter,
     :lfu_decay_time,
@@ -203,6 +205,15 @@ defmodule FerricStore.Instance do
         :atomics.new(shard_count, signed: false)
       end
 
+    release_cursor_blocked_apply_count =
+      if name == :default do
+        try_get_pt(:ferricstore_release_cursor_blocked_apply_count, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
     # Per-shard counter for off-heap binary bytes in ETS keydirs.
     # :ets.info(:memory) doesn't count refc binaries (> 64 bytes).
     # We track insertions/deletions to give MemoryGuard accurate numbers.
@@ -271,6 +282,7 @@ defmodule FerricStore.Instance do
       last_applied_index: last_applied_index,
       last_released_cursor_index: last_released_cursor_index,
       pending_release_cursor_checkpoint_count: pending_release_cursor_checkpoint_count,
+      release_cursor_blocked_apply_count: release_cursor_blocked_apply_count,
       write_version: write_version,
       stats_counter: stats_counter,
       lfu_decay_time: lfu_decay_time,
