@@ -1,6 +1,7 @@
 defmodule Ferricstore.Commands.ConfigTest do
   @moduledoc false
   use ExUnit.Case, async: false
+  import ExUnit.CaptureLog
 
   alias Ferricstore.Commands.Server
   alias Ferricstore.Config
@@ -14,6 +15,7 @@ defmodule Ferricstore.Commands.ConfigTest do
     orig_eviction = Application.get_env(:ferricstore, :eviction_policy)
     orig_slowlog_us = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
     orig_slowlog_max = Application.get_env(:ferricstore, :slowlog_max_len)
+    orig_data_dir = Application.get_env(:ferricstore, :data_dir)
 
     # Reset read-write config params to defaults BEFORE each test so that
     # leftover state from other modules does not leak into this module.
@@ -24,6 +26,13 @@ defmodule Ferricstore.Commands.ConfigTest do
 
       # Restore Application env
       if orig_eviction, do: Application.put_env(:ferricstore, :eviction_policy, orig_eviction)
+
+      if orig_data_dir do
+        Application.put_env(:ferricstore, :data_dir, orig_data_dir)
+      else
+        Application.delete_env(:ferricstore, :data_dir)
+      end
+
       if orig_slowlog_us, do: Ferricstore.SlowLog.set_threshold(orig_slowlog_us)
       if orig_slowlog_max, do: Ferricstore.SlowLog.set_max_len(orig_slowlog_max)
     end)
@@ -424,6 +433,31 @@ defmodule Ferricstore.Commands.ConfigTest do
     test "CONFIG REWRITE with args returns error" do
       result = Server.handle("CONFIG", ["REWRITE", "extra"], MockStore.make())
       assert {:error, _} = result
+    end
+
+    test "CONFIG REWRITE reports tmp cleanup failure" do
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore-config-rewrite-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(dir)
+      Application.put_env(:ferricstore, :data_dir, dir)
+
+      tmp_path = Ferricstore.Config.config_file_path() <> ".tmp"
+      File.mkdir!(tmp_path)
+
+      try do
+        log =
+          capture_log(fn ->
+            assert {:error, _reason} = Server.handle("CONFIG", ["REWRITE"], MockStore.make())
+          end)
+
+        assert log =~ "failed to remove config rewrite tmp file"
+      after
+        File.rm_rf(dir)
+      end
     end
   end
 

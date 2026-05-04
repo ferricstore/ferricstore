@@ -55,6 +55,8 @@ defmodule Ferricstore.Config do
 
   use GenServer
 
+  require Logger
+
   # Read-only parameters whose values are derived from Application env
   # or other runtime sources at init time. CONFIG SET on these returns an error.
   @read_only_params MapSet.new([
@@ -403,7 +405,19 @@ defmodule Ferricstore.Config do
       :ok
     else
       {:error, reason} ->
-        _ = Ferricstore.FS.rm(tmp_path)
+        case Ferricstore.FS.rm(tmp_path) do
+          :ok ->
+            :ok
+
+          {:error, {:not_found, _}} ->
+            :ok
+
+          {:error, cleanup_reason} ->
+            Logger.warning(
+              "CONFIG REWRITE failed to remove config rewrite tmp file #{tmp_path}: #{inspect(cleanup_reason)}"
+            )
+        end
+
         {:error, "ERR failed to write/rename config file: #{inspect(reason)}"}
     end
   end
