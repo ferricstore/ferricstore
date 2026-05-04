@@ -34,6 +34,23 @@ defmodule FerricstoreServer.Connection.Sendfile do
     end
   end
 
+  @doc """
+  Handles MGET over plain TCP without materializing large cold bulk elements.
+
+  RESP arrays still need an array header, so this streams the header first, then
+  sends normal encoded elements for nil/hot/small values and sendfile-backed
+  bulk elements for large cold refs.
+  """
+  def dispatch_mget(keys, state, dispatch_normal_fn) when is_list(keys) and keys != [] do
+    if in_pubsub_mode?(state) do
+      dispatch_normal_fn.("MGET", keys, state)
+    else
+      fast_mget(keys, state, dispatch_normal_fn)
+    end
+  end
+
+  def dispatch_mget(keys, state, dispatch_normal_fn), do: dispatch_normal_fn.("MGET", keys, state)
+
   # ---------------------------------------------------------------------------
   # Internal
   # ---------------------------------------------------------------------------
@@ -72,6 +89,97 @@ defmodule FerricstoreServer.Connection.Sendfile do
     {:continue, Encoder.encode(value), new_state}
   end
 
+  defp fast_mget(keys, state, dispatch_normal_fn) do
+    lookup_keys = namespace_keys(state.sandbox_namespace, keys)
+
+    case fetch_mget_with_file_refs(state.instance_ctx, lookup_keys) do
+      {:ok, results} ->
+        if Enum.any?(results, &match?({:file_ref, _, _, _}, &1)) do
+          handle_mget_sendfile_result(
+            send_mget_array(keys, lookup_keys, results, state),
+            keys,
+            state,
+            dispatch_normal_fn
+          )
+        else
+          dispatch_normal_fn.("MGET", keys, state)
+        end
+
+      :error ->
+        dispatch_normal_fn.("MGET", keys, state)
+    end
+  end
+
+  defp fetch_mget_with_file_refs(instance_ctx, lookup_keys) do
+    {:ok, Router.batch_get_with_file_refs(instance_ctx, lookup_keys, threshold_bytes())}
+  catch
+    _, _ -> :error
+  end
+
+  defp handle_mget_sendfile_result({:sent, new_state}, _keys, _state, _fn),
+    do: {:continue, "", new_state}
+
+  defp handle_mget_sendfile_result({:error_after_header, _reason}, _keys, state, _fn),
+    do: {:quit, "", state}
+
+  defp handle_mget_sendfile_result(:fallback, keys, state, dispatch_normal_fn),
+    do: dispatch_normal_fn.("MGET", keys, state)
+
+  defp send_mget_array(keys, lookup_keys, results, state) do
+    socket = state.socket
+    TcpOpts.set_cork(socket, true)
+
+    try do
+      case :gen_tcp.send(socket, ["*", Integer.to_string(length(keys)), "\r\n"]) do
+        :ok ->
+          stream_mget_elements(keys, lookup_keys, results, state)
+
+        {:error, _reason} ->
+          :fallback
+      end
+    after
+      TcpOpts.set_cork(socket, false)
+    end
+  end
+
+  defp stream_mget_elements(keys, lookup_keys, results, state) do
+    keys
+    |> Enum.zip(lookup_keys)
+    |> Enum.zip(results)
+    |> Enum.reduce_while({:sent, state}, fn
+      {{key, lookup_key}, {:file_ref, path, offset, size}}, {:sent, acc_state} ->
+        case send_file_ref_element(key, path, offset, size, acc_state) do
+          {:sent, new_state} ->
+            {:cont, {:sent, new_state}}
+
+          :fallback ->
+            case :gen_tcp.send(
+                   acc_state.socket,
+                   Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
+                 ) do
+              :ok -> {:cont, {:sent, acc_state}}
+              {:error, reason} -> {:halt, {:error_after_header, reason}}
+            end
+
+          {:error_after_header, _reason} = error ->
+            {:halt, error}
+        end
+
+      {{_key, _lookup_key}, value}, {:sent, acc_state} ->
+        case :gen_tcp.send(acc_state.socket, Encoder.encode(value)) do
+          :ok -> {:cont, {:sent, acc_state}}
+          {:error, reason} -> {:halt, {:error_after_header, reason}}
+        end
+    end)
+    |> case do
+      {:sent, new_state} ->
+        {:sent, ConnTracking.maybe_track_read("MGET", keys, :sendfile_ok, new_state)}
+
+      other ->
+        other
+    end
+  end
+
   defp handle_sendfile_result({:sent, new_state}, _key, _state, _fn),
     do: {:continue, "", new_state}
 
@@ -83,18 +191,25 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   @doc false
   def send_file_ref(key, path, offset, size, state) do
-    result = do_sendfile_get(key, path, offset, size, state)
+    result = do_sendfile_get(key, path, offset, size, state, true)
     emit_sendfile_result(result, size, state)
     result
   end
 
-  defp do_sendfile_get(key, path, offset, size, state) do
+  @doc false
+  def send_file_ref_element(key, path, offset, size, state) do
+    result = do_sendfile_get(key, path, offset, size, state, false)
+    emit_sendfile_result(result, size, state)
+    result
+  end
+
+  defp do_sendfile_get(key, path, offset, size, state, track_read?) do
     socket = state.socket
 
     case :file.open(path, [:read, :raw, :binary]) do
       {:ok, fd} ->
         try do
-          send_with_cork(socket, fd, offset, size, key, state)
+          send_with_cork(socket, fd, offset, size, key, state, track_read?)
         after
           :file.close(fd)
         end
@@ -104,13 +219,13 @@ defmodule FerricstoreServer.Connection.Sendfile do
     end
   end
 
-  defp send_with_cork(socket, fd, offset, size, key, state) do
+  defp send_with_cork(socket, fd, offset, size, key, state, track_read?) do
     header = [?$, Integer.to_string(size), "\r\n"]
     TcpOpts.set_cork(socket, true)
 
     case :gen_tcp.send(socket, header) do
       :ok ->
-        result = send_file_and_trailer(socket, fd, offset, size, key, state)
+        result = send_file_and_trailer(socket, fd, offset, size, key, state, track_read?)
         TcpOpts.set_cork(socket, false)
         result
 
@@ -120,12 +235,18 @@ defmodule FerricstoreServer.Connection.Sendfile do
     end
   end
 
-  defp send_file_and_trailer(socket, fd, offset, size, key, state) do
+  defp send_file_and_trailer(socket, fd, offset, size, key, state, track_read?) do
     case :file.sendfile(fd, socket, offset, size, []) do
       {:ok, ^size} ->
         case :gen_tcp.send(socket, "\r\n") do
           :ok ->
-            new_state = ConnTracking.maybe_track_read("GET", [key], :sendfile_ok, state)
+            new_state =
+              if track_read? do
+                ConnTracking.maybe_track_read("GET", [key], :sendfile_ok, state)
+              else
+                state
+              end
+
             {:sent, new_state}
 
           {:error, reason} ->
@@ -164,4 +285,9 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   defp in_pubsub_mode?(state),
     do: MapSet.size(state.pubsub_channels) > 0 or MapSet.size(state.pubsub_patterns) > 0
+
+  defp namespace_keys(nil, keys), do: keys
+
+  defp namespace_keys(namespace, keys) when is_binary(namespace),
+    do: Enum.map(keys, &(namespace <> &1))
 end

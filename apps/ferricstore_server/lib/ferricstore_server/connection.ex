@@ -462,6 +462,9 @@ defmodule FerricstoreServer.Connection do
       cmd == "GET" and state.transport == :ranch_tcp ->
         dispatch_get_sendfile_ast(args, ast, state)
 
+      cmd == "MGET" and state.transport == :ranch_tcp ->
+        dispatch_mget_sendfile_ast(args, ast, state)
+
       blocking_ast?(ast) ->
         dispatch_blocking_ast(ast, args, state)
 
@@ -763,6 +766,12 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp dispatch_get_sendfile_ast(args, ast, state), do: dispatch_normal("GET", args, ast, state)
+
+  defp dispatch_mget_sendfile_ast(args, ast, state) do
+    ConnSendfile.dispatch_mget(args, state, fn _cmd, _args, fallback_state ->
+      dispatch_normal("MGET", args, ast, fallback_state)
+    end)
+  end
 
   defp dispatch_pubsub_mode_ast(cmd, args, ast, state) do
     cond do

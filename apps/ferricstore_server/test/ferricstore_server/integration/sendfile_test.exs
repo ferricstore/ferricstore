@@ -412,6 +412,79 @@ defmodule FerricstoreServer.Integration.SendfileTest do
 
       :gen_tcp.close(sock)
     end
+
+    test "MGET streams large cold bulk elements with sendfile", %{port: port} do
+      attach_sendfile_handler(self())
+
+      sock = connect_and_hello(port)
+      keys = Enum.map(1..3, fn i -> ukey("mget_large_#{i}") end)
+      missing = ukey("mget_missing")
+
+      values =
+        Enum.map(1..3, fn i -> :binary.copy(<<10 + i>>, @sendfile_threshold + i * 2048) end)
+
+      for {key, value} <- Enum.zip(keys, values) do
+        send_cmd(sock, ["SET", key, value])
+        assert recv_response(sock) == {:simple, "OK"}
+      end
+
+      :gen_tcp.close(sock)
+      sock = connect_and_hello(port)
+
+      send_cmd(sock, ["MGET", Enum.at(keys, 0), missing, Enum.at(keys, 1), Enum.at(keys, 2)])
+
+      assert recv_response(sock) == [
+               Enum.at(values, 0),
+               nil,
+               Enum.at(values, 1),
+               Enum.at(values, 2)
+             ]
+
+      for value <- values do
+        size = byte_size(value)
+
+        assert_receive {:sendfile_event, [:ferricstore, :server, :sendfile], %{bytes: ^size},
+                        %{result: :ok}},
+                       1000
+      end
+
+      :gen_tcp.close(sock)
+    end
+
+    test "pipelined MGET and PING streams large cold MGET elements with sendfile", %{port: port} do
+      attach_sendfile_handler(self())
+
+      sock = connect_and_hello(port)
+      keys = Enum.map(1..2, fn i -> ukey("pipe_mget_large_#{i}") end)
+
+      values =
+        Enum.map(1..2, fn i -> :binary.copy(<<20 + i>>, @sendfile_threshold + i * 2048) end)
+
+      for {key, value} <- Enum.zip(keys, values) do
+        send_cmd(sock, ["SET", key, value])
+        assert recv_response(sock) == {:simple, "OK"}
+      end
+
+      :gen_tcp.close(sock)
+      sock = connect_and_hello(port)
+
+      send_pipeline(sock, [
+        ["MGET", Enum.at(keys, 0), Enum.at(keys, 1)],
+        ["PING"]
+      ])
+
+      assert recv_n(sock, 2) == [values, {:simple, "PONG"}]
+
+      for value <- values do
+        size = byte_size(value)
+
+        assert_receive {:sendfile_event, [:ferricstore, :server, :sendfile], %{bytes: ^size},
+                        %{result: :ok}},
+                       1000
+      end
+
+      :gen_tcp.close(sock)
+    end
   end
 
   # ---------------------------------------------------------------------------
