@@ -56,6 +56,35 @@ defmodule Ferricstore.Commands.ServerProbCleanupTest do
     refute_received :unexpected_prob_cleanup
   end
 
+  test "FLUSHDB partial flush failure preserves sidecars for keys not flushed", %{
+    prob_dir: prob_dir
+  } do
+    flushed_path = Path.join(prob_dir, "flushed.bloom")
+    remaining_path = Path.join(prob_dir, "remaining.bloom")
+
+    File.write!(flushed_path, "flushed bits")
+    File.write!(remaining_path, "remaining bits")
+
+    Process.put(:ferricstore_prob_command_fsync_dir_hook, fn _path ->
+      send(self(), :unexpected_prob_cleanup)
+      :ok
+    end)
+
+    store =
+      Map.put(MockStore.make(%{"remaining" => {"prob meta", 0}}), :flush, fn ->
+        File.rm!(flushed_path)
+        {:error, {:flush_key_failed, "remaining", :eio}}
+      end)
+
+    assert {:error, {:flush_key_failed, "remaining", :eio}} =
+             Server.handle("FLUSHDB", [], store)
+
+    refute Ferricstore.FS.exists?(flushed_path)
+    assert Ferricstore.FS.exists?(remaining_path)
+    assert store.get.("remaining") == "prob meta"
+    refute_received :unexpected_prob_cleanup
+  end
+
   test "FLUSHALL returns store flush errors before cleanup", %{prob_dir: prob_dir} do
     store = Map.put(MockStore.make(), :flush, fn -> {:error, :flush_failed} end)
     stale_path = Path.join(prob_dir, "stale.bloom")
