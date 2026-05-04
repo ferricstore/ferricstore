@@ -3872,19 +3872,38 @@ defmodule Ferricstore.Raft.StateMachine do
 
     try do
       result = fun.()
-      flush_result = flush_pending_writes(state)
-      emit_raft_apply_telemetry(state, started_at, result, flush_result)
 
-      case flush_result do
-        :ok -> result
-        {:error, _reason} = error -> error
+      if pending_write_error_result?(result) do
+        rollback_pending_writes(state)
+        emit_raft_apply_telemetry(state, started_at, result, :rolled_back)
+        result
+      else
+        flush_result = flush_pending_writes(state)
+        emit_raft_apply_telemetry(state, started_at, result, flush_result)
+
+        case flush_result do
+          :ok -> result
+          {:error, _reason} = error -> error
+        end
       end
+    rescue
+      error ->
+        rollback_pending_writes(state)
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        rollback_pending_writes(state)
+        :erlang.raise(kind, reason, __STACKTRACE__)
     after
       Process.delete(:sm_pending_writes)
       Process.delete(:sm_pending_originals)
       Process.delete(:sm_pending_values)
     end
   end
+
+  defp pending_write_error_result?({:error, _reason}), do: true
+  defp pending_write_error_result?({:error, _reason, _state}), do: true
+  defp pending_write_error_result?(_result), do: false
 
   defp do_flow_create(state, %{id: id, type: type, state: flow_state} = attrs) do
     partition_key = Map.get(attrs, :partition_key)
