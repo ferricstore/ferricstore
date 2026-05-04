@@ -413,6 +413,12 @@ defmodule Ferricstore.Config do
             :ok
 
           {:error, cleanup_reason} ->
+            :telemetry.execute(
+              [:ferricstore, :config, :rewrite, :cleanup_failed],
+              %{count: 1},
+              %{path: tmp_path, reason: cleanup_reason}
+            )
+
             Logger.warning(
               "CONFIG REWRITE failed to remove config rewrite tmp file #{tmp_path}: #{inspect(cleanup_reason)}"
             )

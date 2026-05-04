@@ -447,6 +447,17 @@ defmodule Ferricstore.Commands.ConfigTest do
 
       tmp_path = Ferricstore.Config.config_file_path() <> ".tmp"
       File.mkdir!(tmp_path)
+      parent = self()
+      handler_id = {:config_rewrite_cleanup_failed, parent, make_ref()}
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :config, :rewrite, :cleanup_failed],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:cleanup_failed, event, measurements, metadata})
+        end,
+        nil
+      )
 
       try do
         log =
@@ -455,7 +466,12 @@ defmodule Ferricstore.Commands.ConfigTest do
           end)
 
         assert log =~ "failed to remove config rewrite tmp file"
+
+        assert_receive {:cleanup_failed, [:ferricstore, :config, :rewrite, :cleanup_failed],
+                        %{count: 1}, %{path: ^tmp_path, reason: {_kind, _message}}},
+                       1_000
       after
+        :telemetry.detach(handler_id)
         File.rm_rf(dir)
       end
     end
