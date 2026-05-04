@@ -19,7 +19,8 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
     replication without new code (compound_key is just a binary key
     from the state machine's view).
 
-  - Promotion check is skipped on the async path (documented trade-off).
+  - Promotion growth is skipped on the async path (documented trade-off), but
+    already-promoted parents still route through the promoted quorum path.
 
   - Namespace is decided by the parent redis_key, NOT by the compound_key.
     HSET user:1 name "alice" uses "user" namespace, not "H".
@@ -52,6 +53,39 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
   defp ukey(base), do: "#{@ns}:#{base}_#{:erlang.unique_integer([:positive])}"
 
   defp hash_field(redis_key, field), do: CompoundKey.hash_field(redis_key, field)
+
+  defp with_promotion_threshold(threshold) do
+    original = Application.get_env(:ferricstore, :promotion_threshold)
+
+    original_pt =
+      try do
+        :persistent_term.get(:ferricstore_promotion_threshold)
+      rescue
+        ArgumentError -> :not_set
+      end
+
+    Application.put_env(:ferricstore, :promotion_threshold, threshold)
+    :persistent_term.put(:ferricstore_promotion_threshold, threshold)
+
+    on_exit(fn ->
+      if original do
+        Application.put_env(:ferricstore, :promotion_threshold, original)
+      else
+        Application.delete_env(:ferricstore, :promotion_threshold)
+      end
+
+      case original_pt do
+        :not_set -> :persistent_term.erase(:ferricstore_promotion_threshold)
+        value -> :persistent_term.put(:ferricstore_promotion_threshold, value)
+      end
+    end)
+  end
+
+  defp promoted?(redis_key) do
+    idx = Router.shard_for(ctx(), redis_key)
+    shard = Router.shard_name(ctx(), idx)
+    GenServer.call(shard, {:promoted?, redis_key})
+  end
 
   defp pending_async_commands(idx) do
     Batcher.batcher_name(idx)
@@ -235,6 +269,41 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
         end,
         15_000
       )
+    end
+
+    test "already-promoted hashes keep large async writes in the promoted store" do
+      with_promotion_threshold(1)
+
+      redis_key = ukey("promoted_hash_big_async")
+      first = hash_field(redis_key, "first")
+      second = hash_field(redis_key, "second")
+      big_field = hash_field(redis_key, "big")
+      big = :binary.copy("x", ctx().hot_cache_max_value_size + 1024)
+
+      :ok = Ferricstore.NamespaceConfig.set(@ns, "durability", "quorum")
+      assert :ok = Router.compound_put(ctx(), redis_key, first, "one", 0)
+      assert :ok = Router.compound_put(ctx(), redis_key, second, "two", 0)
+      assert promoted?(redis_key)
+
+      idx = Router.shard_for(ctx(), redis_key)
+      keydir = elem(ctx().keydir_refs, idx)
+      marker = Ferricstore.Store.Promotion.marker_key(redis_key)
+      {_file_id, shared_path, _shard_path} = Ferricstore.Store.ActiveFile.get(ctx(), idx)
+      assert [{^marker, "hash", _exp, _lfu, _fid, _off, _size}] = :ets.lookup(keydir, marker)
+
+      :ok = Ferricstore.NamespaceConfig.set(@ns, "durability", "async")
+      assert :ok = Router.compound_put(ctx(), redis_key, big_field, big, 0)
+
+      Ferricstore.Test.Utils.eventually(fn ->
+        assert big == Router.compound_get(ctx(), redis_key, big_field)
+      end)
+
+      assert {:ok, records} = NIF.v2_scan_file(shared_path)
+
+      refute Enum.any?(records, fn
+               {^big_field, _off, _size, _exp, false} -> true
+               _ -> false
+             end)
     end
 
     test "compound_batch_get reads large values" do

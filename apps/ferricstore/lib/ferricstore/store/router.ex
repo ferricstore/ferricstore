@@ -22,7 +22,7 @@ defmodule Ferricstore.Store.Router do
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Stats
-  alias Ferricstore.Store.{CompoundKey, LFU, ListOps, TypeRegistry, ValueCodec}
+  alias Ferricstore.Store.{CompoundKey, LFU, ListOps, Promotion, TypeRegistry, ValueCodec}
 
   import Bitwise, only: [band: 2]
 
@@ -3646,7 +3646,11 @@ defmodule Ferricstore.Store.Router do
           quorum_write(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
 
         :async ->
-          async_compound_put(ctx, idx, redis_key, compound_key, value, expire_at_ms)
+          if promoted_parent?(ctx, idx, redis_key) do
+            quorum_write(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
+          else
+            async_compound_put(ctx, idx, redis_key, compound_key, value, expire_at_ms)
+          end
       end
     else
       safe_write_call(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
@@ -3663,7 +3667,11 @@ defmodule Ferricstore.Store.Router do
           quorum_write(ctx, idx, {:compound_delete, redis_key, compound_key})
 
         :async ->
-          async_compound_delete(ctx, idx, compound_key)
+          if promoted_parent?(ctx, idx, redis_key) do
+            quorum_write(ctx, idx, {:compound_delete, redis_key, compound_key})
+          else
+            async_compound_delete(ctx, idx, compound_key)
+          end
       end
     else
       safe_write_call(ctx, idx, {:compound_delete, redis_key, compound_key})
@@ -3679,11 +3687,26 @@ defmodule Ferricstore.Store.Router do
   # compound_delete) based on the PARENT redis_key's namespace, so the user-
   # facing abstraction "HSET is in the `user` namespace" holds.
   #
-  # Promotion check is intentionally skipped on the async path. Hashes that
+  # Promotion growth is intentionally skipped on the async path. Hashes that
   # grow large in an async namespace stay in the shared Bitcask log instead
-  # of being promoted to a dedicated file. Acceptable trade-off; users who
-  # want promotion can configure the namespace as quorum.
+  # of being promoted to a dedicated file. Already-promoted parents are the
+  # exception: their mutations must route through the quorum/promoted path so
+  # ETS file locations keep pointing at the dedicated Bitcask directory.
   # ---------------------------------------------------------------------------
+
+  defp promoted_parent?(ctx, idx, redis_key) do
+    keydir = elem(ctx.keydir_refs, idx)
+    marker = Promotion.marker_key(redis_key)
+
+    case :ets.lookup(keydir, marker) do
+      [{^marker, type, expire_at_ms, _lfu, _fid, _off, _value_size}]
+      when type in ["hash", "set", "zset"] ->
+        expire_at_ms == 0 or expire_at_ms > HLC.now_ms()
+
+      _ ->
+        false
+    end
+  end
 
   # Async list_op latch-first dispatch. On CAS win: execute inline under
   # the per-key latch. On loss: bounce to RmwCoordinator via direct
