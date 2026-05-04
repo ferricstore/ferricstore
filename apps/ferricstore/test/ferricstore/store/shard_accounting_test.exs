@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.ShardAccountingTest do
   @moduledoc false
   use ExUnit.Case, async: true
+  import ExUnit.CaptureLog
 
   alias Ferricstore.Store.{CompoundKey, LFU, Promotion}
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
@@ -330,6 +331,58 @@ defmodule Ferricstore.Store.ShardAccountingTest do
         assert info.dead_bytes == original_dead
         assert info.total_bytes == original_total
         assert info.last_compacted_at == nil
+      after
+        Process.delete(:ferricstore_promoted_compaction_after_collect_hook)
+        File.rm_rf(dir)
+        :ets.delete(keydir)
+      end
+    end
+
+    test "failed dedicated compaction reports rollback cleanup failure" do
+      keydir = new_keydir()
+      redis_key = "hash:promoted:compact:rollback_cleanup_failed"
+      compound_key = CompoundKey.hash_field(redis_key, "field")
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore-promoted-compact-rollback-fail-#{System.unique_integer([:positive])}"
+        )
+
+      try do
+        File.mkdir_p!(dir)
+        File.touch!(Path.join(dir, "00000.log"))
+
+        :ets.insert(keydir, {Promotion.marker_key(redis_key), "hash", 0, LFU.initial(), 0, 0, 4})
+        :ets.insert(keydir, {compound_key, "value", 0, LFU.initial(), 0, 32, 5})
+
+        state = %{
+          index: 0,
+          keydir: keydir,
+          instance_ctx: nil,
+          promoted_instances: %{
+            redis_key => %{
+              path: dir,
+              total_bytes: 2_200_000,
+              dead_bytes: 1_200_000,
+              last_compacted_at: nil
+            }
+          }
+        }
+
+        Process.put(:ferricstore_promoted_compaction_after_collect_hook, fn ^redis_key,
+                                                                            _live_entries ->
+          new_log = Path.join(dir, "00001.log")
+          File.rm(new_log)
+          File.mkdir!(new_log)
+        end)
+
+        log =
+          capture_log(fn ->
+            _after_state = ShardCompound.bump_promoted_writes(state, redis_key)
+          end)
+
+        assert log =~ "dedicated compaction rollback failed to remove new active file"
       after
         Process.delete(:ferricstore_promoted_compaction_after_collect_hook)
         File.rm_rf(dir)

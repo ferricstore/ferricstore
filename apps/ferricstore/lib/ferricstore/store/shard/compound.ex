@@ -1036,8 +1036,7 @@ defmodule Ferricstore.Store.Shard.Compound do
             "Shard #{state.index}: dedicated compaction append result mismatch: expected #{length(live_entries)}, got #{length(results)}"
           )
 
-          _ = Ferricstore.FS.rm(new_file)
-          _ = dedicated_fsync_dir(state, dedicated_path, :rollback_new_active)
+          rollback_new_active_file(state, dedicated_path, new_file)
           {:error, state}
 
         {:error, reason} ->
@@ -1047,11 +1046,28 @@ defmodule Ferricstore.Store.Shard.Compound do
 
           # Roll back the `touch!(new_file)` on write error. Fsync
           # so the rollback survives a subsequent crash.
-          _ = Ferricstore.FS.rm(new_file)
-          _ = dedicated_fsync_dir(state, dedicated_path, :rollback_new_active)
+          rollback_new_active_file(state, dedicated_path, new_file)
           {:error, state}
       end
     end
+  end
+
+  defp rollback_new_active_file(state, dedicated_path, new_file) do
+    case Ferricstore.FS.rm(new_file) do
+      :ok ->
+        :ok
+
+      {:error, {:not_found, _}} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Shard #{state.index}: dedicated compaction rollback failed to remove new active file #{new_file}: #{inspect(reason)}"
+        )
+    end
+
+    _ = dedicated_fsync_dir(state, dedicated_path, :rollback_new_active)
+    :ok
   end
 
   defp dedicated_fsync_dir(state, dedicated_path, phase) do
