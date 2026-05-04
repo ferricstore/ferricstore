@@ -497,13 +497,14 @@ defmodule Ferricstore.Store.Shard.Flush do
           # Initialize file_stats for the new file
           new_file_stats = Map.put(state.file_stats, new_id, {0, 0})
 
-          # Notify the merge scheduler that a rotation happened.
-          # file_count = new_id + 1 (files are 0-indexed: 0, 1, ..., new_id).
+          # Notify the merge scheduler that a rotation happened. File ids can
+          # have gaps after compaction deletes old logs, so use tracked live
+          # file count instead of deriving count from the newest id.
           # Direct cast avoids the Merge.Scheduler → ... → Shard.Flush cycle.
           try do
             GenServer.cast(
               merge_scheduler_name(Map.get(state, :instance_ctx), state.index),
-              {:file_rotated, new_id + 1}
+              {:file_rotated, map_size(new_file_stats)}
             )
           catch
             :exit, _ -> :ok

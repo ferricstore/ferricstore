@@ -4,6 +4,23 @@ defmodule Ferricstore.Store.Shard.FlushTest do
   alias Ferricstore.Store.DiskPressure
   alias Ferricstore.Store.Shard.Flush
 
+  defmodule CaptureScheduler do
+    use GenServer
+
+    def start_link(opts) do
+      GenServer.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
+    end
+
+    @impl true
+    def init(opts), do: {:ok, Map.new(opts)}
+
+    @impl true
+    def handle_cast(message, %{parent: parent} = state) do
+      send(parent, {:scheduler_cast, message})
+      {:noreply, state}
+    end
+  end
+
   test "flush_pending_sync keeps checkpoint dirty when empty-pending fsync fails" do
     ctx = %{
       checkpoint_flags: :atomics.new(1, signed: false),
@@ -72,6 +89,46 @@ defmodule Ferricstore.Store.Shard.FlushTest do
       refute File.exists?(new_path)
       assert DiskPressure.under_pressure?(ctx, 0)
     after
+      :ets.delete(keydir)
+      File.rm_rf!(dir)
+    end
+  end
+
+  test "maybe_rotate_file reports actual file count after file id gaps" do
+    Ferricstore.Store.ActiveFile.init(1)
+
+    instance_name = :"rotation_gap_#{System.unique_integer([:positive])}"
+    scheduler_name = :"#{instance_name}.Merge.Scheduler.0"
+    ctx = %{name: instance_name}
+    dir = Path.join(System.tmp_dir!(), "rotation_gap_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+    active_path = Path.join(dir, "00042.log")
+    File.write!(active_path, "active")
+
+    keydir = :ets.new(:"rotation_gap_#{System.unique_integer([:positive])}", [:set, :public])
+    {:ok, scheduler} = CaptureScheduler.start_link(name: scheduler_name, parent: self())
+
+    state = %{
+      active_file_id: 42,
+      active_file_path: active_path,
+      active_file_size: 10_000,
+      file_stats: %{42 => {10_000, 0}},
+      index: 0,
+      instance_ctx: ctx,
+      keydir: keydir,
+      max_active_file_size: 1_024,
+      pending: [],
+      shard_data_path: dir
+    }
+
+    try do
+      new_state = Flush.maybe_rotate_file(state)
+
+      assert new_state.active_file_id == 43
+      assert_receive {:scheduler_cast, {:file_rotated, 2}}, 1_000
+    after
+      if Process.alive?(scheduler), do: GenServer.stop(scheduler)
       :ets.delete(keydir)
       File.rm_rf!(dir)
     end
