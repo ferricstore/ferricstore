@@ -366,6 +366,53 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert [{^key, "new", 456, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, key)
     end
 
+    test "BitcaskWriter batches tombstone runs through the ops NIF" do
+      source =
+        Path.expand("../../../lib/ferricstore/store/bitcask_writer.ex", __DIR__)
+        |> File.read!()
+
+      [_before, flush_tombstones] = String.split(source, "defp flush_tombstone_batch", parts: 2)
+
+      [function_source | _after] =
+        String.split(flush_tombstones, "\n  defp normalize_write_entry", parts: 2)
+
+      assert function_source =~ "NIF.v2_append_ops_batch_nosync(path, ops)",
+             "tombstone runs should be one batched append NIF call, not one NIF call per key"
+    end
+
+    test "BitcaskWriter persists a tombstone run in order" do
+      shard_index = 10_000 + System.unique_integer([:positive])
+      dir = Path.join(System.tmp_dir!(), "bitcask_writer_tombstone_batch_#{shard_index}")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "00000.log")
+      File.touch!(path)
+
+      {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
+
+      on_exit(fn ->
+        if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        File.rm_rf(dir)
+      end)
+
+      :sys.replace_state(writer, fn state ->
+        %{
+          state
+          | pending: [
+              {:tombstone, nil, path, "deleted:2"},
+              {:tombstone, nil, path, "deleted:1"}
+            ],
+            pending_count: 2
+        }
+      end)
+
+      assert :ok == BitcaskWriter.flush(shard_index)
+
+      assert {:ok, [{"deleted:1", off1, _size1, 0}, {"deleted:2", off2, _size2, 0}]} =
+               NIF.v2_scan_tombstones(path)
+
+      assert off1 < off2
+    end
+
     test "shard flush completion does not attach stale location to newer pending value" do
       keydir =
         :ets.new(:"shard_flush_stale_#{System.unique_integer([:positive])}", [

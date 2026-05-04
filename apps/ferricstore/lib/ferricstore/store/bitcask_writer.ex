@@ -472,27 +472,57 @@ defmodule Ferricstore.Store.BitcaskWriter do
   end
 
   defp flush_tombstone_batch(path, tombstone_entries, shard_index) do
-    {dirty_contexts, failed_entries} =
-      Enum.reduce(tombstone_entries, {[], []}, fn entry, {dirty_acc, failed_acc} ->
-        {instance_ctx, key} = normalize_tombstone_entry(entry)
+    normalized = Enum.map(tombstone_entries, &normalize_tombstone_entry/1)
+    ops = Enum.map(normalized, fn {_instance_ctx, key} -> {:delete, key} end)
 
-        case NIF.v2_append_tombstone(path, key) do
-          {:ok, _} ->
-            {[instance_ctx | dirty_acc], failed_acc}
+    case NIF.v2_append_ops_batch_nosync(path, ops) do
+      {:ok, locations} ->
+        if valid_tombstone_locations?(locations, length(ops)) do
+          normalized
+          |> Enum.map(fn {instance_ctx, _key} -> instance_ctx end)
+          |> mark_checkpoint_dirty_contexts(shard_index)
 
-          {:error, reason} ->
-            set_disk_pressure(instance_ctx, shard_index)
+          []
+        else
+          mark_tombstone_batch_failed(normalized, shard_index)
 
-            Logger.error(
-              "BitcaskWriter shard_#{shard_index}: tombstone failed for #{path} key=#{inspect(key)}: #{inspect(reason)}"
-            )
+          Logger.error(
+            "BitcaskWriter shard_#{shard_index}: tombstone batch result mismatch for #{path}: #{inspect(locations)}"
+          )
 
-            {dirty_acc, [entry | failed_acc]}
+          tombstone_entries
         end
-      end)
 
-    mark_checkpoint_dirty_contexts(dirty_contexts, shard_index)
-    Enum.reverse(failed_entries)
+      {:error, reason} ->
+        mark_tombstone_batch_failed(normalized, shard_index)
+
+        Logger.error(
+          "BitcaskWriter shard_#{shard_index}: tombstone batch failed for #{path}: #{inspect(reason)}"
+        )
+
+        tombstone_entries
+    end
+  end
+
+  defp valid_tombstone_locations?(locations, expected_count)
+       when length(locations) == expected_count do
+    Enum.all?(locations, fn
+      {:delete, offset, record_size}
+      when is_integer(offset) and offset >= 0 and is_integer(record_size) and record_size >= 0 ->
+        true
+
+      _ ->
+        false
+    end)
+  end
+
+  defp valid_tombstone_locations?(_locations, _expected_count), do: false
+
+  defp mark_tombstone_batch_failed(normalized_entries, shard_index) do
+    normalized_entries
+    |> Enum.map(fn {instance_ctx, _key} -> instance_ctx end)
+    |> Enum.uniq()
+    |> Enum.each(&set_disk_pressure(&1, shard_index))
   end
 
   defp normalize_write_entry({:write, ctx, path, fid, ets, key, value, exp}),
