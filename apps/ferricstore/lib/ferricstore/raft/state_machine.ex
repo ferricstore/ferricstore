@@ -72,6 +72,8 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.CommandTime
   alias Ferricstore.Commands.Dispatcher
+  alias Ferricstore.Commands.HyperLogLog
+  alias Ferricstore.Commands.Json
   alias Ferricstore.Flow
   alias Ferricstore.Flow.Keys, as: FlowKeys
   alias Ferricstore.HLC
@@ -1485,7 +1487,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # For the anchor shard (matching state.shard_index), uses state directly.
   # For remote shards, reads active file info from persistent_term.
   defp build_cross_shard_store(shard_idx, anchor_state) do
-    instance_ctx = anchor_state.instance_ctx
+    instance_ctx = anchor_state.instance_ctx || instance_ctx_for_state(anchor_state)
 
     data_dir =
       if instance_ctx do
@@ -1494,51 +1496,26 @@ defmodule Ferricstore.Raft.StateMachine do
         anchor_state.data_dir
       end
 
-    ctx =
-      if shard_idx == anchor_state.shard_index do
-        %{
-          instance_ctx: instance_ctx,
-          keydir: anchor_state.ets,
-          index: shard_idx,
-          data_dir: data_dir,
-          shard_data_path: anchor_state.shard_data_path,
-          active_file_path: anchor_state.active_file_path,
-          active_file_id: anchor_state.active_file_id,
-          zset_score_index_name: anchor_state.zset_score_index_name,
-          zset_score_lookup_name: anchor_state.zset_score_lookup_name
-        }
+    default_ctx = cross_shard_ctx(anchor_state, shard_idx, data_dir, instance_ctx)
+
+    ctx_for_key =
+      if instance_ctx do
+        ctx_by_shard =
+          0..(instance_ctx.shard_count - 1)
+          |> Map.new(fn idx ->
+            {idx, cross_shard_ctx(anchor_state, idx, data_dir, instance_ctx)}
+          end)
+
+        fn key ->
+          Map.fetch!(ctx_by_shard, Router.shard_for(instance_ctx, key))
+        end
       else
-        {file_id, file_path, shard_data_path} =
-          Ferricstore.Store.ActiveFile.get(instance_ctx, shard_idx)
-
-        keydir =
-          if instance_ctx do
-            elem(instance_ctx.keydir_refs, shard_idx)
-          else
-            :"keydir_#{shard_idx}"
-          end
-
-        instance_name = if instance_ctx, do: instance_ctx.name, else: anchor_state.instance_name
-
-        {zset_score_index_name, zset_score_lookup_name} =
-          ZSetIndex.table_names(instance_name, shard_idx)
-
-        %{
-          instance_ctx: instance_ctx,
-          keydir: keydir,
-          index: shard_idx,
-          data_dir: data_dir,
-          shard_data_path: shard_data_path,
-          active_file_path: file_path,
-          active_file_id: file_id,
-          zset_score_index_name: zset_score_index_name,
-          zset_score_lookup_name: zset_score_lookup_name
-        }
+        fn _key -> default_ctx end
       end
 
     tx_binary_ref = keydir_binary_ref(anchor_state)
 
-    local_put = fn key, value, expire_at_ms ->
+    put_in_ctx = fn ctx, key, value, expire_at_ms ->
       value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
       disk_val = to_disk_binary(value)
 
@@ -1574,7 +1551,11 @@ defmodule Ferricstore.Raft.StateMachine do
       :ok
     end
 
-    local_delete = fn key ->
+    local_put = fn key, value, expire_at_ms ->
+      put_in_ctx.(ctx_for_key.(key), key, value, expire_at_ms)
+    end
+
+    delete_in_ctx = fn ctx, key ->
       record_cross_shard_pending_original(ctx, key)
 
       if tx_binary_ref do
@@ -1595,7 +1576,12 @@ defmodule Ferricstore.Raft.StateMachine do
       :ok
     end
 
+    local_delete = fn key ->
+      delete_in_ctx.(ctx_for_key.(key), key)
+    end
+
     local_get = fn key ->
+      ctx = ctx_for_key.(key)
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
       if MapSet.member?(deleted, key) do
@@ -1609,6 +1595,7 @@ defmodule Ferricstore.Raft.StateMachine do
     end
 
     local_get_meta = fn key ->
+      ctx = ctx_for_key.(key)
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
       if MapSet.member?(deleted, key) do
@@ -1622,6 +1609,7 @@ defmodule Ferricstore.Raft.StateMachine do
     end
 
     local_exists = fn key ->
+      ctx = ctx_for_key.(key)
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
       if MapSet.member?(deleted, key) do
@@ -1717,6 +1705,7 @@ defmodule Ferricstore.Raft.StateMachine do
     end
 
     promoted_put = fn redis_key, compound_key, value, expire_at_ms, dedicated_path ->
+      ctx = ctx_for_key.(redis_key)
       Promotion.await_compaction_latch(anchor_state, redis_key)
 
       value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
@@ -1764,6 +1753,7 @@ defmodule Ferricstore.Raft.StateMachine do
     end
 
     promoted_delete = fn redis_key, compound_key, dedicated_path ->
+      ctx = ctx_for_key.(redis_key)
       Promotion.await_compaction_latch(anchor_state, redis_key)
 
       if tx_binary_ref do
@@ -1797,7 +1787,7 @@ defmodule Ferricstore.Raft.StateMachine do
     %{
       get: local_get,
       get_meta: local_get_meta,
-      batch_get: fn keys -> cross_shard_batch_read(ctx, keys) end,
+      batch_get: fn keys -> cross_shard_routed_batch_read(keys, ctx_for_key) end,
       put: local_put,
       delete: local_delete,
       exists?: local_exists,
@@ -1825,48 +1815,63 @@ defmodule Ferricstore.Raft.StateMachine do
       end,
       list_op: fn key, op -> Router.list_op(instance_ctx, key, op) end,
       compound_get: fn redis_key, compound_key ->
+        ctx = ctx_for_key.(redis_key)
         cross_shard_compound_read(ctx, redis_key, compound_key)
       end,
       compound_get_meta: fn redis_key, compound_key ->
+        ctx = ctx_for_key.(redis_key)
         cross_shard_compound_read_meta(ctx, redis_key, compound_key)
       end,
       compound_batch_get: fn redis_key, compound_keys ->
+        ctx = ctx_for_key.(redis_key)
         cross_shard_compound_batch_read(ctx, redis_key, compound_keys)
       end,
       compound_batch_get_meta: fn redis_key, compound_keys ->
+        ctx = ctx_for_key.(redis_key)
         cross_shard_compound_batch_read_meta(ctx, redis_key, compound_keys)
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+        ctx = ctx_for_key.(redis_key)
+
         case promoted_compound_path(ctx, redis_key, compound_key) do
           nil ->
-            local_put.(compound_key, value, expire_at_ms)
+            put_in_ctx.(ctx, compound_key, value, expire_at_ms)
 
           dedicated_path ->
             promoted_put.(redis_key, compound_key, value, expire_at_ms, dedicated_path)
         end
       end,
       compound_delete: fn redis_key, compound_key ->
+        ctx = ctx_for_key.(redis_key)
+
         case promoted_compound_path(ctx, redis_key, compound_key) do
-          nil -> local_delete.(compound_key)
+          nil -> delete_in_ctx.(ctx, compound_key)
           dedicated_path -> promoted_delete.(redis_key, compound_key, dedicated_path)
         end
       end,
       compound_scan: fn redis_key, prefix ->
+        ctx = ctx_for_key.(redis_key)
         cross_shard_compound_scan(ctx, redis_key, prefix)
       end,
-      compound_count: fn _redis_key, prefix ->
+      compound_count: fn redis_key, prefix ->
+        ctx = ctx_for_key.(redis_key)
         cross_shard_prefix_count(ctx, prefix)
       end,
-      compound_delete_prefix: fn _redis_key, prefix ->
-        cross_shard_delete_prefix(ctx, prefix, local_delete)
+      compound_delete_prefix: fn redis_key, prefix ->
+        ctx = ctx_for_key.(redis_key)
+        cross_shard_delete_prefix(ctx, prefix, fn key -> delete_in_ctx.(ctx, key) end)
       end,
       zset_score_range: fn redis_key, min_bound, max_bound, reverse? ->
+        ctx = ctx_for_key.(redis_key)
+
         cross_shard_zset_index_read(ctx, redis_key, fn state ->
           {:ok,
            ZSetIndex.range(state.zset_score_index, redis_key, min_bound, max_bound, reverse?)}
         end)
       end,
       zset_score_range_slice: fn redis_key, min_bound, max_bound, reverse?, offset, count ->
+        ctx = ctx_for_key.(redis_key)
+
         cross_shard_zset_index_read(ctx, redis_key, fn state ->
           {:ok,
            ZSetIndex.range_slice(
@@ -1881,6 +1886,8 @@ defmodule Ferricstore.Raft.StateMachine do
         end)
       end,
       zset_score_count: fn redis_key, min_bound, max_bound ->
+        ctx = ctx_for_key.(redis_key)
+
         cross_shard_zset_index_read(ctx, redis_key, fn state ->
           {:ok,
            ZSetIndex.count(
@@ -1893,12 +1900,16 @@ defmodule Ferricstore.Raft.StateMachine do
         end)
       end,
       zset_rank_range: fn redis_key, start_idx, stop_idx, reverse? ->
+        ctx = ctx_for_key.(redis_key)
+
         cross_shard_zset_index_read(ctx, redis_key, fn state ->
           {:ok,
            ZSetIndex.rank_range(state.zset_score_index, redis_key, start_idx, stop_idx, reverse?)}
         end)
       end,
       zset_member_rank: fn redis_key, member, reverse? ->
+        ctx = ctx_for_key.(redis_key)
+
         cross_shard_zset_index_read(ctx, redis_key, fn state ->
           {:ok,
            ZSetIndex.member_rank(
@@ -1911,16 +1922,59 @@ defmodule Ferricstore.Raft.StateMachine do
         end)
       end,
       prob_dir: fn ->
-        Path.join(ctx.shard_data_path, "prob")
+        Path.join(default_ctx.shard_data_path, "prob")
       end,
       prob_write: fn command ->
         # Within cross-shard tx, prob writes are applied directly
         # (the state machine is already applying through Raft)
         apply_prob_locally(instance_ctx, command)
       end,
-      shard_index: ctx.index,
+      shard_index: default_ctx.index,
       data_dir: data_dir
     }
+  end
+
+  defp cross_shard_ctx(anchor_state, shard_idx, data_dir, instance_ctx) do
+    if shard_idx == anchor_state.shard_index do
+      %{
+        instance_ctx: instance_ctx,
+        keydir: anchor_state.ets,
+        index: shard_idx,
+        data_dir: data_dir,
+        shard_data_path: anchor_state.shard_data_path,
+        active_file_path: anchor_state.active_file_path,
+        active_file_id: anchor_state.active_file_id,
+        zset_score_index_name: anchor_state.zset_score_index_name,
+        zset_score_lookup_name: anchor_state.zset_score_lookup_name
+      }
+    else
+      {file_id, file_path, shard_data_path} =
+        Ferricstore.Store.ActiveFile.get(instance_ctx, shard_idx)
+
+      keydir =
+        if instance_ctx do
+          elem(instance_ctx.keydir_refs, shard_idx)
+        else
+          :"keydir_#{shard_idx}"
+        end
+
+      instance_name = if instance_ctx, do: instance_ctx.name, else: anchor_state.instance_name
+
+      {zset_score_index_name, zset_score_lookup_name} =
+        ZSetIndex.table_names(instance_name, shard_idx)
+
+      %{
+        instance_ctx: instance_ctx,
+        keydir: keydir,
+        index: shard_idx,
+        data_dir: data_dir,
+        shard_data_path: shard_data_path,
+        active_file_path: file_path,
+        active_file_id: file_id,
+        zset_score_index_name: zset_score_index_name,
+        zset_score_lookup_name: zset_score_lookup_name
+      }
+    end
   end
 
   defp sm_tx_pending_meta(key) do
@@ -2292,6 +2346,36 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
     |> then(&merge_indexed_values(%{}, entries, &1))
     |> values_for_indexes(keys)
+  end
+
+  defp cross_shard_routed_batch_read(keys, ctx_for_key) do
+    grouped =
+      keys
+      |> Enum.with_index()
+      |> Enum.reduce(%{}, fn {key, index}, acc ->
+        ctx = ctx_for_key.(key)
+
+        Map.update(acc, ctx.index, {ctx, [{key, index}]}, fn {existing_ctx, entries} ->
+          {existing_ctx, [{key, index} | entries]}
+        end)
+      end)
+
+    results =
+      Enum.reduce(grouped, %{}, fn {_idx, {ctx, entries}}, acc ->
+        ordered = Enum.reverse(entries)
+        shard_keys = Enum.map(ordered, fn {key, _index} -> key end)
+        shard_values = cross_shard_batch_read(ctx, shard_keys)
+
+        ordered
+        |> Enum.zip(shard_values)
+        |> Enum.reduce(acc, fn {{_key, index}, value}, inner ->
+          Map.put(inner, index, value)
+        end)
+      end)
+
+    keys
+    |> Enum.with_index()
+    |> Enum.map(fn {_key, index} -> Map.get(results, index) end)
   end
 
   defp cross_shard_compound_batch_read_meta(_ctx, _redis_key, []), do: []
@@ -2820,6 +2904,18 @@ defmodule Ferricstore.Raft.StateMachine do
       :ok -> do_compound_delete_prefix(state, redis_key, prefix)
       {:error, :key_locked} -> {:error, :key_locked}
     end
+  end
+
+  defp apply_single(state, {:pfadd, key, elements}) do
+    HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_value_store(state))
+  end
+
+  defp apply_single(state, {:json_numincrby, key, path, increment}) do
+    Json.handle_ast({:json_numincrby, key, path, increment}, build_string_value_store(state))
+  end
+
+  defp apply_single(state, {:json_arrappend, key, path, values}) do
+    Json.handle_ast({:json_arrappend, key, path, values}, build_string_value_store(state))
   end
 
   defp apply_single(state, {:incr, key, delta}) do
@@ -5788,6 +5884,17 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp ensure_list_type_for_operation(key, _operation, store),
     do: Ferricstore.Store.TypeRegistry.check_type(key, :list, store)
+
+  defp build_string_value_store(state) do
+    %{
+      get: fn key -> do_get(state, key) end,
+      get_meta: fn key -> do_get_meta(state, key) end,
+      batch_get: fn keys -> Enum.map(keys, &do_get(state, &1)) end,
+      put: fn key, value, expire_at_ms -> do_put(state, key, value, expire_at_ms) end,
+      exists?: fn key -> live_key?(state, key) end,
+      compound_get: fn _redis_key, compound_key -> do_get(state, compound_key) end
+    }
+  end
 
   # Builds a compound store for list/hash/set operations inside the state
   # machine. Uses do_put/do_delete/do_get directly (already inside apply context,

@@ -3158,6 +3158,28 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @doc false
+  def pfadd(ctx, key, elements) when is_binary(key) and is_list(elements) do
+    forced_single_key_quorum(ctx, key, {:pfadd, key, elements})
+  end
+
+  @doc false
+  def json_numincrby(ctx, key, path, increment)
+      when is_binary(key) and is_binary(path) and is_number(increment) do
+    forced_single_key_quorum(ctx, key, {:json_numincrby, key, path, increment})
+  end
+
+  @doc false
+  def json_arrappend(ctx, key, path, values)
+      when is_binary(key) and is_binary(path) and is_list(values) do
+    forced_single_key_quorum(ctx, key, {:json_arrappend, key, path, values})
+  end
+
+  defp forced_single_key_quorum(ctx, key, command) do
+    idx = shard_for(ctx, key)
+    forced_quorum_write(ctx, idx, command, node())
+  end
+
   @doc """
   Atomically applies Redis SET options in Raft order.
 

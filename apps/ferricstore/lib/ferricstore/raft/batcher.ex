@@ -144,6 +144,9 @@ defmodule Ferricstore.Raft.Batcher do
           | {:compound_put, binary(), binary(), non_neg_integer()}
           | {:compound_delete, binary()}
           | {:compound_delete_prefix, binary()}
+          | {:pfadd, binary(), [binary()]}
+          | {:json_numincrby, binary(), binary(), number()}
+          | {:json_arrappend, binary(), binary(), [binary()]}
           | {:flow_create, binary(), map()}
           | {:flow_claim_due, binary(), map()}
           | {:flow_complete, binary(), map()}

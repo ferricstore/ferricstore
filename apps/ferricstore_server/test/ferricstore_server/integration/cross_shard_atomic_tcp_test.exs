@@ -149,6 +149,48 @@ defmodule FerricstoreServer.Integration.CrossShardAtomicTcpTest do
       assert recv_response(sock) == "s3"
     end
 
+    test "single MSET inside MULTI writes every key to its owning shard", %{
+      sock: sock,
+      k0: k0,
+      k1: k1
+    } do
+      send_cmd(sock, ["MULTI"])
+      assert recv_response(sock) == ok()
+
+      send_cmd(sock, ["MSET", k0, "mset_0", k1, "mset_1"])
+      assert recv_response(sock) == queued()
+
+      send_cmd(sock, ["EXEC"])
+      assert recv_response(sock) == [ok()]
+
+      send_cmd(sock, ["GET", k0])
+      assert recv_response(sock) == "mset_0"
+
+      send_cmd(sock, ["GET", k1])
+      assert recv_response(sock) == "mset_1"
+    end
+
+    test "single MGET inside MULTI reads every key from its owning shard", %{
+      sock: sock,
+      k0: k0,
+      k1: k1
+    } do
+      send_cmd(sock, ["SET", k0, "mget_0"])
+      assert recv_response(sock) == ok()
+
+      send_cmd(sock, ["SET", k1, "mget_1"])
+      assert recv_response(sock) == ok()
+
+      send_cmd(sock, ["MULTI"])
+      assert recv_response(sock) == ok()
+
+      send_cmd(sock, ["MGET", k0, k1])
+      assert recv_response(sock) == queued()
+
+      send_cmd(sock, ["EXEC"])
+      assert recv_response(sock) == [["mget_0", "mget_1"]]
+    end
+
     test "MULTI with GET + SET across shards, EXEC — results in order", %{
       sock: sock,
       k0: k0,

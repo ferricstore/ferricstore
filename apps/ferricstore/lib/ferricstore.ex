@@ -4684,8 +4684,8 @@ defmodule FerricStore do
         err
 
       parsed ->
-        "JSON.NUMINCRBY"
-        |> execute_single_ast([key, path, increment], {:json_numincrby, key, path, parsed})
+        default_ctx()
+        |> Router.json_numincrby(key, path, parsed)
         |> wrap_result()
     end
   end
@@ -4712,8 +4712,8 @@ defmodule FerricStore do
   """
   @spec json_arrappend(key(), binary(), [binary()]) :: {:ok, term()} | {:error, binary()}
   def json_arrappend(key, path, values) when is_list(values) do
-    "JSON.ARRAPPEND"
-    |> execute_single_ast([key, path | values], {:json_arrappend, key, path, values})
+    default_ctx()
+    |> Router.json_arrappend(key, path, values)
     |> wrap_result()
   end
 
@@ -4936,7 +4936,7 @@ defmodule FerricStore do
   """
   @spec pfadd(key(), [binary()]) :: {:ok, boolean()} | {:error, binary()}
   def pfadd(key, elements) when is_list(elements) do
-    case execute_single_ast("PFADD", [key | elements], {:pfadd, [key | elements]}) do
+    case Router.pfadd(default_ctx(), key, elements) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -5209,14 +5209,6 @@ defmodule FerricStore do
 
   defp wrap_result({:error, _} = err), do: err
   defp wrap_result(result), do: {:ok, result}
-
-  defp execute_single_ast(command, args, ast) when is_binary(command) and is_list(args) do
-    case Ferricstore.Transaction.Coordinator.execute([{command, args, ast}], %{}, nil) do
-      [result] -> result
-      {:error, _} = err -> err
-      nil -> {:error, "ERR transaction aborted"}
-    end
-  end
 
   defp parse_zbound("-inf"), do: :neg_inf
   defp parse_zbound("+inf"), do: :inf
