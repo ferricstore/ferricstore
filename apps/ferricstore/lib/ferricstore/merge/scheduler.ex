@@ -419,9 +419,20 @@ defmodule Ferricstore.Merge.Scheduler do
 
         Manifest.delete(state.data_dir)
         Semaphore.release(state.shard_index, state.semaphore)
-        %{state | merging: false, fragmentation_candidates: []}
+
+        state = %{state | merging: false}
+
+        if retryable_merge_error?(reason) do
+          schedule_retry(state)
+        else
+          %{state | fragmentation_candidates: []}
+        end
     end
   end
+
+  defp retryable_merge_error?(:no_files), do: false
+  defp retryable_merge_error?(:not_enough_files), do: false
+  defp retryable_merge_error?(_reason), do: true
 
   defp select_files_for_merge(state, _shard_name) do
     with {:ok, file_sizes} <- log_file_sizes(state.data_dir),
