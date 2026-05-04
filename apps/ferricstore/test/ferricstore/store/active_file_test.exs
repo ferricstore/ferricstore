@@ -142,6 +142,23 @@ defmodule Ferricstore.Store.ActiveFileTest do
         ActiveFile.get(ctx, 0)
       end
     end
+
+    test "process cache is pruned when active-file generation changes" do
+      try do
+        for i <- 1..5 do
+          ctx = %{name: :"active_file_cache_#{i}", shard_count: 1}
+          path = "/tmp/active-file-cache-#{i}.log"
+
+          ActiveFile.publish(ctx, 0, 0, path, "/tmp")
+          assert {0, ^path, "/tmp"} = ActiveFile.get(ctx, 0)
+          ActiveFile.cleanup_instance(ctx)
+        end
+
+        assert active_file_cache_size() <= 1
+      after
+        clear_active_file_cache()
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -159,5 +176,22 @@ defmodule Ferricstore.Store.ActiveFileTest do
       assert is_integer(val)
       assert val >= 1_048_576
     end
+  end
+
+  defp active_file_cache_size do
+    Process.get()
+    |> Enum.count(fn
+      {{:active_file_cache, _key}, _value} -> true
+      _ -> false
+    end)
+  end
+
+  defp clear_active_file_cache do
+    Process.get()
+    |> Enum.each(fn
+      {{:active_file_cache, _key} = key, _value} -> Process.delete(key)
+      {:active_file_cache_generation, _value} -> Process.delete(:active_file_cache_generation)
+      _ -> :ok
+    end)
   end
 end

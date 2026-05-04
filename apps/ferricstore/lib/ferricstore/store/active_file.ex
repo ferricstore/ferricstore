@@ -89,6 +89,8 @@ defmodule Ferricstore.Store.ActiveFile do
         {file_id, file_path, shard_data_path}
 
       _ ->
+        prune_process_cache_if_generation_changed(current_gen)
+
         [{^table_key, file_id, file_path, shard_data_path}] =
           :ets.lookup(@table, table_key)
 
@@ -125,6 +127,23 @@ defmodule Ferricstore.Store.ActiveFile do
   defp table_key(nil, shard_index), do: shard_index
   defp table_key(%{name: :default}, shard_index), do: shard_index
   defp table_key(%{name: name}, shard_index), do: {name, shard_index}
+
+  defp prune_process_cache_if_generation_changed(current_gen) do
+    case Process.get(:active_file_cache_generation) do
+      ^current_gen ->
+        :ok
+
+      _ ->
+        Process.get()
+        |> Enum.each(fn
+          {{:active_file_cache, _key} = key, _value} -> Process.delete(key)
+          _ -> :ok
+        end)
+
+        Process.put(:active_file_cache_generation, current_gen)
+        :ok
+    end
+  end
 
   defp bump_generation do
     case :persistent_term.get(@atomics_key, nil) do
