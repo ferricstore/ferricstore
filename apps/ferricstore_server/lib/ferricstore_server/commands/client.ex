@@ -166,7 +166,33 @@ defmodule FerricstoreServer.Commands.Client do
     {{:error, "ERR wrong number of arguments for 'client|getredir' command"}, conn_state}
   end
 
-  def handle("KILL", _args, conn_state, _store), do: {:ok, conn_state}
+  def handle("KILL", ["ID", id], conn_state, _store) do
+    with {client_id, ""} <- Integer.parse(id),
+         :ok <-
+           FerricstoreServer.Connection.Registry.kill(
+             client_id,
+             Map.get(conn_state, :conn_pid, self())
+           ) do
+      {:ok, conn_state}
+    else
+      :error ->
+        {{:error, "ERR value is not an integer or out of range"}, conn_state}
+
+      {:error, :self} ->
+        {{:error, "ERR I won't kill myself"}, conn_state}
+
+      {:error, :not_found} ->
+        {{:error, "ERR No such client"}, conn_state}
+
+      {_client_id, _rest} ->
+        {{:error, "ERR value is not an integer or out of range"}, conn_state}
+    end
+  end
+
+  def handle("KILL", _args, conn_state, _store) do
+    {{:error, "ERR syntax error"}, conn_state}
+  end
+
   def handle("PAUSE", _args, conn_state, _store), do: {:ok, conn_state}
   def handle("UNPAUSE", _args, conn_state, _store), do: {:ok, conn_state}
 

@@ -67,6 +67,7 @@ defmodule FerricstoreServer.Connection do
   alias FerricstoreServer.Connection.Blocking, as: ConnBlocking
   alias FerricstoreServer.Connection.Pipeline, as: ConnPipeline
   alias FerricstoreServer.Connection.PubSub, as: ConnPubSub
+  alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Connection.Send, as: ConnSend
   alias FerricstoreServer.Connection.Sendfile, as: ConnSendfile
   alias FerricstoreServer.Connection.Store, as: ConnStore
@@ -231,6 +232,7 @@ defmodule FerricstoreServer.Connection do
             client_ip: format_peer(peer)
           })
 
+          ConnRegistry.register(state.client_id, self())
           loop(state)
       end
     end
@@ -289,6 +291,10 @@ defmodule FerricstoreServer.Connection do
           :ok -> loop(state)
           {:error, _reason} -> :ok
         end
+
+      :client_kill ->
+        cleanup_connection(state)
+        transport.close(socket)
 
       {:acl_invalidate, username} ->
         loop(ConnAuth.maybe_refresh_acl_cache(state, username))
@@ -958,6 +964,10 @@ defmodule FerricstoreServer.Connection do
           {:error, _reason} -> :ok
         end
 
+      :client_kill ->
+        cleanup_connection(state)
+        transport.close(socket)
+
       {:acl_invalidate, username} ->
         pubsub_loop(ConnAuth.maybe_refresh_acl_cache(state, username))
     end
@@ -980,6 +990,7 @@ defmodule FerricstoreServer.Connection do
     cleanup_pubsub(state)
     ClientTracking.cleanup(self())
     Ferricstore.Commands.Stream.cleanup_stream_waiters(self())
+    ConnRegistry.unregister(state.client_id, self())
     Stats.decr_connections()
   end
 

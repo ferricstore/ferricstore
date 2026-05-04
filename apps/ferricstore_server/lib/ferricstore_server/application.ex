@@ -35,6 +35,7 @@ defmodule FerricstoreServer.Application do
 
     # Initialize ClientTracking ETS tables before any connection starts.
     FerricstoreServer.ClientTracking.init_tables()
+    FerricstoreServer.Connection.Registry.init_table()
 
     children =
       [

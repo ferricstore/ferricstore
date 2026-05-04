@@ -321,15 +321,24 @@ defmodule FerricstoreServer.ReviewR4Test do
   end
 
   # ---------------------------------------------------------------------------
-  # B6. CLIENT KILL is a stub — CONFIRMED (incomplete implementation)
+  # B6. CLIENT KILL closes the target connection by client ID.
   # ---------------------------------------------------------------------------
 
   describe "B6: CLIENT KILL implementation" do
-    test "CLIENT KILL is a no-op stub" do
-      sock = connect()
-      result = unwrap(cmd(sock, ["CLIENT", "KILL", "ID", "99999"]))
-      assert result == "OK"
-      :gen_tcp.close(sock)
+    test "CLIENT KILL ID closes the target connection" do
+      controller = connect()
+      target = connect()
+
+      target_id = cmd(target, ["CLIENT", "ID"])
+      assert is_integer(target_id)
+
+      assert "OK" ==
+               unwrap(cmd(controller, ["CLIENT", "KILL", "ID", Integer.to_string(target_id)]))
+
+      assert {:tcp_error, :closed} = recv_one(target, 1_000)
+      assert "PONG" == unwrap(cmd(controller, ["PING"]))
+
+      :gen_tcp.close(controller)
     end
   end
 

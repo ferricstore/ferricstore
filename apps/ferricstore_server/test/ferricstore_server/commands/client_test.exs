@@ -567,6 +567,66 @@ defmodule FerricstoreServer.Commands.ClientTest do
   end
 
   # ---------------------------------------------------------------------------
+  # CLIENT KILL
+  # ---------------------------------------------------------------------------
+
+  describe "CLIENT KILL" do
+    setup do
+      FerricstoreServer.Connection.Registry.init_table()
+      :ok
+    end
+
+    test "kills a registered client by ID" do
+      parent = self()
+
+      target =
+        spawn(fn ->
+          receive do
+            :client_kill -> send(parent, :client_killed)
+          end
+        end)
+
+      conn = make_conn_state(%{conn_pid: self()})
+
+      FerricstoreServer.Connection.Registry.register(9001, target)
+
+      assert {:ok, ^conn} = Client.handle("KILL", ["ID", "9001"], conn, store())
+      assert_receive :client_killed
+
+      Process.exit(target, :kill)
+    end
+
+    test "rejects killing the current client" do
+      conn = make_conn_state(%{client_id: 9002, conn_pid: self()})
+      FerricstoreServer.Connection.Registry.register(9002, self())
+
+      {{:error, msg}, ^conn} = Client.handle("KILL", ["ID", "9002"], conn, store())
+      assert msg =~ "won't kill myself"
+    end
+
+    test "returns an error for missing client ID" do
+      conn = make_conn_state()
+
+      {{:error, msg}, ^conn} = Client.handle("KILL", ["ID", "999999999"], conn, store())
+      assert msg =~ "No such client"
+    end
+
+    test "rejects non-integer IDs" do
+      conn = make_conn_state()
+
+      {{:error, msg}, ^conn} = Client.handle("KILL", ["ID", "abc"], conn, store())
+      assert msg =~ "not an integer"
+    end
+
+    test "rejects unsupported forms" do
+      conn = make_conn_state()
+
+      {{:error, msg}, ^conn} = Client.handle("KILL", [], conn, store())
+      assert msg =~ "syntax error"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # CLIENT TRACKING round-trip: ON then OFF clears ETS
   # ---------------------------------------------------------------------------
 
