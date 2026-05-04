@@ -4663,12 +4663,15 @@ defmodule FerricStore do
   """
   @spec json_numincrby(key(), binary(), binary()) :: {:ok, binary()} | {:error, binary()}
   def json_numincrby(key, path, increment) do
-    wrap_result(
-      Json.handle_ast(
-        {:json_numincrby, key, path, parse_json_number(increment)},
-        build_string_store(key)
-      )
-    )
+    case parse_json_number(increment) do
+      {:error, _} = err ->
+        err
+
+      parsed ->
+        "JSON.NUMINCRBY"
+        |> execute_single_ast([key, path, increment], {:json_numincrby, key, path, parsed})
+        |> wrap_result()
+    end
   end
 
   @doc """
@@ -4693,7 +4696,9 @@ defmodule FerricStore do
   """
   @spec json_arrappend(key(), binary(), [binary()]) :: {:ok, term()} | {:error, binary()}
   def json_arrappend(key, path, values) when is_list(values) do
-    wrap_result(Json.handle_ast({:json_arrappend, key, path, values}, build_string_store(key)))
+    "JSON.ARRAPPEND"
+    |> execute_single_ast([key, path | values], {:json_arrappend, key, path, values})
+    |> wrap_result()
   end
 
   @doc """
@@ -4915,7 +4920,7 @@ defmodule FerricStore do
   """
   @spec pfadd(key(), [binary()]) :: {:ok, boolean()} | {:error, binary()}
   def pfadd(key, elements) when is_list(elements) do
-    case HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_store(key)) do
+    case execute_single_ast("PFADD", [key | elements], {:pfadd, [key | elements]}) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -5189,6 +5194,14 @@ defmodule FerricStore do
   defp wrap_result({:error, _} = err), do: err
   defp wrap_result(result), do: {:ok, result}
 
+  defp execute_single_ast(command, args, ast) when is_binary(command) and is_list(args) do
+    case Ferricstore.Transaction.Coordinator.execute([{command, args, ast}], %{}, nil) do
+      [result] -> result
+      {:error, _} = err -> err
+      nil -> {:error, "ERR transaction aborted"}
+    end
+  end
+
   defp parse_zbound("-inf"), do: :neg_inf
   defp parse_zbound("+inf"), do: :inf
   defp parse_zbound("inf"), do: :inf
@@ -5241,12 +5254,19 @@ defmodule FerricStore do
     end
   end
 
-  defp parse_json_number(value) when is_number(value), do: value * 1.0
+  defp parse_json_number(value) when is_number(value), do: value
 
   defp parse_json_number(value) when is_binary(value) do
-    case Float.parse(value) do
-      {number, ""} -> number
-      _ -> {:error, "ERR value is not a valid float"}
+    if String.contains?(value, ".") do
+      case Float.parse(value) do
+        {number, ""} -> number
+        _ -> {:error, "ERR value is not a valid float"}
+      end
+    else
+      case Integer.parse(value) do
+        {number, ""} -> number
+        _ -> {:error, "ERR value is not a valid float"}
+      end
     end
   end
 
