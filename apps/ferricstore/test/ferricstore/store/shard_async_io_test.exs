@@ -1310,6 +1310,41 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       end
     end
 
+    test "manual compaction skips the registry active log after external rotation" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+      try do
+        shard_path = Path.join([dir, "data", "shard_0"])
+        registry_active_path = Path.join(shard_path, "00001.log")
+        key = "registry_active_compaction_survives"
+        value = "registry-active-value"
+
+        Ferricstore.FS.touch!(registry_active_path)
+        Ferricstore.Store.ActiveFile.publish(ctx, 0, 1, registry_active_path, shard_path)
+
+        {:ok, [{offset, _value_size}]} =
+          NIF.v2_append_batch(registry_active_path, [{key, value, 0}])
+
+        state = :sys.get_state(pid)
+        assert state.active_file_id == 0
+        assert {1, ^registry_active_path, ^shard_path} = Ferricstore.Store.ActiveFile.get(ctx, 0)
+
+        :ets.insert(state.keydir, {key, value, 0, LFU.initial(), 1, offset, byte_size(value)})
+
+        size_before = File.stat!(registry_active_path).size
+
+        assert {:ok, {0, 0, 0}} = GenServer.call(pid, {:run_compaction, [1]})
+        assert File.stat!(registry_active_path).size == size_before
+        assert "registry-active-value" == GenServer.call(pid, {:get, key})
+
+        state = :sys.get_state(pid)
+        assert state.active_file_id == 1
+        assert Map.fetch!(state.file_stats, 1) == {size_before, 0}
+      after
+        cleanup_shard(pid, ctx, dir)
+      end
+    end
+
     test "manual compaction drops expired-only inactive files" do
       {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
 

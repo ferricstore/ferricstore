@@ -659,11 +659,13 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call({:run_compaction, file_ids}, _from, state) do
     state = await_in_flight(state)
+    state = sync_active_file_from_registry(state)
     state = flush_pending_sync(state)
     # Router async/RMW paths can leave small values queued in BitcaskWriter with
     # ETS file_id=:pending. Drain those writes before compaction snapshots ETS,
     # otherwise a source file can be removed while the writer still targets it.
     Ferricstore.Store.BitcaskWriter.flush(state.index)
+    state = sync_active_file_from_registry(state)
     sp = state.shard_data_path
 
     # v2 compaction: for each file_id, collect live key offsets from ETS,
@@ -879,6 +881,37 @@ defmodule Ferricstore.Store.Shard do
         active_file_size: Map.get(sm_state, :active_file_size, state.active_file_size),
         file_stats: Map.get(sm_state, :file_stats, state.file_stats)
     }
+  end
+
+  defp sync_active_file_from_registry(%{instance_ctx: nil} = state), do: state
+
+  defp sync_active_file_from_registry(state) do
+    case Ferricstore.Store.ActiveFile.get(state.instance_ctx, state.index) do
+      {fid, path, shard_path}
+      when fid != state.active_file_id or path != state.active_file_path ->
+        active_size = active_file_size(path)
+
+        %{
+          state
+          | active_file_id: fid,
+            active_file_path: path,
+            active_file_size: active_size,
+            shard_data_path: shard_path,
+            file_stats: Map.put(state.file_stats, fid, {active_size, 0})
+        }
+
+      _current ->
+        state
+    end
+  rescue
+    _ -> state
+  end
+
+  defp active_file_size(path) do
+    case File.stat(path) do
+      {:ok, %{size: size}} -> size
+      {:error, _reason} -> 0
+    end
   end
 
   defp handle_forwarded_quorum(
