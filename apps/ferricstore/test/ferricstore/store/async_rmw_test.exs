@@ -540,6 +540,8 @@ defmodule Ferricstore.Store.AsyncRmwTest do
                _ -> false
              end)
 
+      assert results |> Enum.map(fn {:ok, n} -> n end) |> Enum.sort() == Enum.to_list(1..1000)
+
       Ferricstore.Test.Utils.eventually(
         fn ->
           assert Router.get(ctx(), key) == "1000"
@@ -846,6 +848,20 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   # ---------------------------------------------------------------------------
 
   describe "worker crash" do
+    test "bad custom context returns worker error instead of timing out caller" do
+      bad_ctx = %FerricStore.Instance{
+        name: :"rmw_bad_ctx_#{System.unique_integer([:positive])}",
+        latch_refs: {}
+      }
+
+      assert {:error, "ERR RMW worker crashed"} ==
+               GenServer.call(
+                 RmwCoordinator.name(0),
+                 {:rmw, bad_ctx, {:getdel, ukey("bad_ctx")}},
+                 100
+               )
+    end
+
     @tag timeout: 10_000
     test "killing the RmwCoordinator returns an error then recovers" do
       key = ukey("worker_crash")

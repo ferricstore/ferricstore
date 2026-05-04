@@ -2975,6 +2975,9 @@ defmodule Ferricstore.Raft.StateMachine do
       nil when before_value == nil ->
         :apply
 
+      nil when expected_value == nil ->
+        :apply_expected
+
       _other ->
         pending_newer_origin_replay_decision(state, key, inner_cmd, expected_value)
     end
@@ -3003,6 +3006,18 @@ defmodule Ferricstore.Raft.StateMachine do
       # materialize the accepted value and let later Ra entries replay in order.
       :apply_expected
     end
+  end
+
+  defp apply_origin_checked_expected(
+         state,
+         key,
+         {:getdel, _key},
+         before_value,
+         nil,
+         _expire_at_ms
+       ) do
+    _ = do_delete(state, key)
+    origin_checked_expected_result({:getdel, key}, before_value, nil)
   end
 
   defp apply_origin_checked_expected(
@@ -3139,6 +3154,22 @@ defmodule Ferricstore.Raft.StateMachine do
        )
        when is_binary(current_value) and is_binary(expected) do
     String.starts_with?(current_value, expected)
+  end
+
+  defp origin_command_provably_in_current_value?(
+         {:put, _key, _value, _expire_at_ms},
+         _current_value,
+         _expected_value
+       ) do
+    true
+  end
+
+  defp origin_command_provably_in_current_value?({:delete, _key}, _current_value, nil) do
+    true
+  end
+
+  defp origin_command_provably_in_current_value?({:getdel, _key}, _current_value, nil) do
+    true
   end
 
   defp origin_command_provably_in_current_value?(_inner_cmd, _current_value, _expected_value) do

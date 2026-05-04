@@ -191,10 +191,10 @@ defmodule Ferricstore.Store.RmwCoordinator do
   end
 
   defp run_rmw(ctx, idx, cmd) do
-    latch_tab = elem(ctx.latch_refs, idx)
-    keys = latch_keys_of(cmd)
-
     try do
+      latch_tab = elem(ctx.latch_refs, idx)
+      keys = latch_keys_of(cmd)
+
       Enum.each(keys, fn key -> wait_for_latch(latch_tab, key) end)
 
       try do

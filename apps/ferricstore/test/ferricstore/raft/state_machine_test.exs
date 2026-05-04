@@ -466,6 +466,140 @@ defmodule Ferricstore.Raft.StateMachineTest do
                :ets.lookup(ets, "durable_future_getset")
     end
 
+    test "does not replay stale origin PUT over a durable newer local value", %{
+      state: state,
+      ets: ets
+    } do
+      :ets.insert(ets, {"durable_future_put", "future", 0, 1, 0, 0, 6})
+
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "durable_future_put", {:put, "durable_future_put", "old", 0}, nil, 0,
+            "old", 0}},
+          state
+        )
+
+      assert [{"durable_future_put", "future", 0, _lfu, 0, 0, 6}] =
+               :ets.lookup(ets, "durable_future_put")
+    end
+
+    test "does not replay stale origin DELETE over a durable newer local value", %{
+      state: state,
+      ets: ets
+    } do
+      :ets.insert(ets, {"durable_future_delete", "future", 0, 1, 0, 0, 6})
+
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "durable_future_delete", {:delete, "durable_future_delete"}, "old",
+            0, nil, 0}},
+          state
+        )
+
+      assert [{"durable_future_delete", "future", 0, _lfu, 0, 0, 6}] =
+               :ets.lookup(ets, "durable_future_delete")
+    end
+
+    test "does not replay stale origin GETDEL over a durable newer local value", %{
+      state: state,
+      ets: ets
+    } do
+      :ets.insert(ets, {"durable_future_getdel", "future", 0, 1, 0, 0, 6})
+
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "durable_future_getdel", {:getdel, "durable_future_getdel"}, "old",
+            0, nil, 0}},
+          state
+        )
+
+      assert [{"durable_future_getdel", "future", 0, _lfu, 0, 0, 6}] =
+               :ets.lookup(ets, "durable_future_getdel")
+    end
+
+    test "does not replay stale origin PUT over a pending newer local value", %{
+      state: state,
+      ets: ets
+    } do
+      :ets.insert(ets, {"pending_future_put", "future", 0, 1, :pending, 0, 0})
+
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "pending_future_put", {:put, "pending_future_put", "old", 0}, nil, 0,
+            "old", 0}},
+          state
+        )
+
+      assert [{"pending_future_put", "future", 0, _lfu, :pending, 0, 0}] =
+               :ets.lookup(ets, "pending_future_put")
+    end
+
+    test "does not replay stale origin DELETE over a pending newer local value", %{
+      state: state,
+      ets: ets
+    } do
+      :ets.insert(ets, {"pending_future_delete", "future", 0, 1, :pending, 0, 0})
+
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "pending_future_delete", {:delete, "pending_future_delete"}, "old",
+            0, nil, 0}},
+          state
+        )
+
+      assert [{"pending_future_delete", "future", 0, _lfu, :pending, 0, 0}] =
+               :ets.lookup(ets, "pending_future_delete")
+    end
+
+    test "does not replay stale origin GETDEL over a pending newer local value", %{
+      state: state,
+      ets: ets
+    } do
+      :ets.insert(ets, {"pending_future_getdel", "future", 0, 1, :pending, 0, 0})
+
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "pending_future_getdel", {:getdel, "pending_future_getdel"}, "old",
+            0, nil, 0}},
+          state
+        )
+
+      assert [{"pending_future_getdel", "future", 0, _lfu, :pending, 0, 0}] =
+               :ets.lookup(ets, "pending_future_getdel")
+    end
+
+    test "replays origin GETDEL tombstone when local delete already removed the key", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      {_state2, :ok} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, "origin_getdel_tombstone", {:getdel, "origin_getdel_tombstone"},
+            "old", 0, nil, 0}},
+          state
+        )
+
+      assert [] == :ets.lookup(ets, "origin_getdel_tombstone")
+
+      assert {:ok, [{"origin_getdel_tombstone", _offset, _record_size, 0, true}]} =
+               NIF.v2_scan_file(active_file_path)
+    end
+
     test "does not duplicate already-applied origin RMW while local value is pending", %{
       state: state,
       ets: ets,

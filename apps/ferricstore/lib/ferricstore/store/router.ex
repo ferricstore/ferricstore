@@ -406,7 +406,10 @@ defmodule Ferricstore.Store.Router do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
       with_async_key_latch(ctx, idx, key, fn ->
-        case async_enqueue_to_raft(idx, {:delete, key}) do
+        previous = snapshot_live_value(ctx, idx, key)
+        raft_cmd = origin_checked_command(key, {:delete, key}, previous, nil, 0)
+
+        case async_enqueue_to_raft(idx, raft_cmd) do
           :ok ->
             keydir = elem(ctx.keydir_refs, idx)
             flush_pending_writer_for_key(ctx, idx, keydir, key)
@@ -750,8 +753,11 @@ defmodule Ferricstore.Store.Router do
       :missing ->
         nil
 
-      {:hit, v, _exp} ->
-        with :ok <- async_submit_to_raft(idx, {:getdel, key}) do
+      {:hit, v, exp} ->
+        previous = {:value, v, exp}
+        raft_cmd = origin_checked_command(key, {:getdel, key}, previous, nil, 0)
+
+        with :ok <- async_submit_to_raft(idx, raft_cmd) do
           keydir = elem(ctx.keydir_refs, idx)
           flush_pending_writer_for_key(ctx, idx, keydir, key)
           track_keydir_binary_delete(ctx, idx, keydir, key)
@@ -1029,7 +1035,10 @@ defmodule Ferricstore.Store.Router do
 
   defp do_async_write_put(ctx, idx, key, value, expire_at_ms) do
     keydir = elem(ctx.keydir_refs, idx)
-    raft_cmd = {:put, key, value, expire_at_ms}
+    previous = snapshot_live_value(ctx, idx, key)
+
+    raft_cmd =
+      origin_checked_command(key, {:put, key, value, expire_at_ms}, previous, value, expire_at_ms)
 
     value_for_ets =
       case value do
@@ -1046,8 +1055,6 @@ defmodule Ferricstore.Store.Router do
     disk_value = to_disk_binary(value)
 
     if value_for_ets == nil do
-      previous = snapshot_live_value(ctx, idx, key)
-
       # Large value: sync NIF write to get offset, then ETS with real location.
       # Cannot use async BitcaskWriter because ETS value is nil (too large for
       # hot cache) and readers would see nil until the async write completes.
@@ -1095,6 +1102,17 @@ defmodule Ferricstore.Store.Router do
       {:hit, value, expire_at_ms} -> {:value, value, expire_at_ms}
       :missing -> :missing
     end
+  end
+
+  defp origin_checked_command(key, inner_cmd, previous, expected_value, expire_at_ms) do
+    {before_value, before_expire_at_ms} =
+      case previous do
+        {:value, value, exp} -> {origin_check_value(value), exp}
+        :missing -> {nil, 0}
+      end
+
+    {:origin_checked, key, inner_cmd, before_value, before_expire_at_ms,
+     origin_check_value(expected_value), expire_at_ms}
   end
 
   defp rollback_unaccepted_large_put(ctx, idx, key, {:value, previous_value, expire_at_ms}) do
