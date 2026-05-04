@@ -1437,6 +1437,58 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       end
     end
 
+    test "manual compaction reports all-dead source removal failure" do
+      previous_trap_exit = Process.flag(:trap_exit, true)
+
+      dir =
+        Path.join(System.tmp_dir!(), "shared_compaction_rm_fail_#{:rand.uniform(9_999_999)}")
+
+      File.mkdir_p!(dir)
+
+      name = :"shared_compaction_rm_fail_#{:erlang.unique_integer([:positive])}"
+
+      ctx =
+        FerricStore.Instance.build(name,
+          data_dir: dir,
+          shard_count: 1
+        )
+
+      try do
+        :ok = Ferricstore.DataDir.ensure_layout!(dir, 1)
+        shard_dir = Ferricstore.DataDir.shard_data_path(dir, 0)
+        source = Path.join(shard_dir, "00000.log")
+        active = Path.join(shard_dir, "00001.log")
+
+        File.rm(source)
+        File.mkdir!(source)
+        File.touch!(active)
+
+        {:ok, pid} =
+          Shard.start_link(
+            index: 0,
+            data_dir: dir,
+            flush_interval_ms: 5000,
+            instance_ctx: ctx
+          )
+
+        assert {:error, {:compaction_failed, [{0, {:remove_failed, _reason}}]}} =
+                 GenServer.call(pid, {:run_compaction, [0]})
+
+        assert File.dir?(source)
+      after
+        case Process.whereis(Router.shard_name(ctx, 0)) do
+          pid when is_pid(pid) ->
+            cleanup_shard(pid, ctx, dir)
+
+          _ ->
+            FerricStore.Instance.cleanup(ctx.name)
+            File.rm_rf(dir)
+        end
+
+        Process.flag(:trap_exit, previous_trap_exit)
+      end
+    end
+
     test "drains deferred BitcaskWriter writes before selecting compacted records" do
       source =
         Path.expand("../../../lib/ferricstore/store/shard.ex", __DIR__)

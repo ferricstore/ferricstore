@@ -815,13 +815,27 @@ defmodule Ferricstore.Store.Shard do
                 if tombstone_file_still_needed?(sp, fid, source) do
                   {written, dropped, reclaimed, compacted, [fid | skipped], failures}
                 else
-                  _ = Ferricstore.FS.rm(source)
-                  {written, dropped, reclaimed + old_size, [fid | compacted], skipped, failures}
+                  case remove_compacted_source(state, source) do
+                    :ok ->
+                      {written, dropped, reclaimed + old_size, [fid | compacted], skipped,
+                       failures}
+
+                    {:error, reason} ->
+                      {written, dropped, reclaimed, compacted, skipped,
+                       [{fid, {:remove_failed, reason}} | failures]}
+                  end
                 end
               else
                 remove_hint_for_file(sp, fid)
-                _ = Ferricstore.FS.rm(source)
-                {written, dropped, reclaimed + old_size, [fid | compacted], skipped, failures}
+
+                case remove_compacted_source(state, source) do
+                  :ok ->
+                    {written, dropped, reclaimed + old_size, [fid | compacted], skipped, failures}
+
+                  {:error, reason} ->
+                    {written, dropped, reclaimed, compacted, skipped,
+                     [{fid, {:remove_failed, reason}} | failures]}
+                end
               end
           end
         end)
@@ -1097,6 +1111,20 @@ defmodule Ferricstore.Store.Shard do
     case NIF.v2_scan_tombstones(path) do
       {:ok, [_ | _]} -> true
       _ -> false
+    end
+  end
+
+  defp remove_compacted_source(state, source) do
+    case Ferricstore.FS.rm(source) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "Shard #{state.index}: compaction failed to remove source #{source}: #{inspect(reason)}"
+        )
+
+        {:error, reason}
     end
   end
 
