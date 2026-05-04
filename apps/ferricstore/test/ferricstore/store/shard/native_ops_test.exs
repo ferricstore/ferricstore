@@ -1,8 +1,36 @@
 defmodule Ferricstore.Store.Shard.NativeOpsTest do
   use ExUnit.Case, async: true
 
+  alias Ferricstore.ErrorReasons
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Shard.NativeOps
+
+  test "forwarded compound result returns unknown outcome when local apply barrier times out" do
+    shard_index = 0
+    batcher = Batcher.batcher_name(shard_index)
+    %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
+
+    assert ErrorReasons.write_timeout_unknown() ==
+             NativeOps.__barrier_forwarded_result__(
+               shard_index,
+               {:remote_applied_at, last_local_applied + 1_000, :ok},
+               25
+             )
+  end
+
+  test "forwarded compound result returns leader result after local apply barrier passes" do
+    shard_index = 0
+    batcher = Batcher.batcher_name(shard_index)
+    %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
+
+    assert :ok ==
+             NativeOps.__barrier_forwarded_result__(
+               shard_index,
+               {:remote_applied_at, last_local_applied, :ok},
+               25
+             )
+  end
 
   test "direct list compound_put does not update ETS when Bitcask append fails" do
     keydir = :ets.new(:"native_ops_test_#{System.unique_integer([:positive])}", [:set, :public])

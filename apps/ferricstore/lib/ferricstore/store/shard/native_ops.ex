@@ -544,18 +544,24 @@ defmodule Ferricstore.Store.Shard.NativeOps do
           10_000
         )
 
-      case result do
-        {:remote_applied_at, ra_index, real_result} ->
-          _ = Ferricstore.Raft.Batcher.await_local_applied(state.index, ra_index, 5_000)
-          real_result
-
-        other ->
-          other
-      end
+      barrier_forwarded_result(state.index, result, 5_000)
     catch
       _, _ -> {:error, "ERR leader unavailable"}
     end
   end
+
+  @doc false
+  def __barrier_forwarded_result__(idx, result, timeout_ms \\ 5_000),
+    do: barrier_forwarded_result(idx, result, timeout_ms)
+
+  defp barrier_forwarded_result(idx, {:remote_applied_at, ra_index, real_result}, timeout_ms) do
+    case Ferricstore.Raft.Batcher.await_local_applied(idx, ra_index, timeout_ms) do
+      :ok -> real_result
+      {:error, _reason} -> Ferricstore.ErrorReasons.write_timeout_unknown()
+    end
+  end
+
+  defp barrier_forwarded_result(_idx, other, _timeout_ms), do: other
 
   @spec build_list_compound_store_direct(binary(), map()) :: map()
   @doc false
