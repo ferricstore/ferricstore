@@ -835,7 +835,7 @@ defmodule Ferricstore.Commands.Stream do
       Enum.reduce(ids, 0, fn id_str, acc ->
         compound_key = prefix <> id_str
 
-        if Ops.exists?(store, compound_key) do
+        if stream_entry_exists?(store, key, compound_key) do
           delete_stream_entry(store, key, compound_key)
           acc + 1
         else
@@ -848,6 +848,14 @@ defmodule Ferricstore.Commands.Stream do
     end
 
     deleted
+  end
+
+  defp stream_entry_exists?(store, stream_key, compound_key) do
+    if Ops.has_compound?(store) do
+      Ops.compound_get(store, stream_key, compound_key) != nil
+    else
+      Ops.exists?(store, compound_key)
+    end
   end
 
   # ---------------------------------------------------------------------------
