@@ -728,7 +728,7 @@ defmodule Ferricstore.Store.Ops do
         ShardETS.ets_delete_key(tx.shard_state, key)
         tx_drop_pending(key)
         tx_mark_deleted(key)
-        send(self(), {:tx_pending_delete, key})
+        send(self(), tx_compound_delete_message(tx, redis_key, key))
       end)
 
       :ok

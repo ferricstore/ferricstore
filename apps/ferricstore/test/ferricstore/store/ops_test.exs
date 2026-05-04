@@ -543,6 +543,37 @@ defmodule Ferricstore.Store.OpsTest do
         :ets.delete(keydir)
       end
     end
+
+    test "promoted prefix deletes carry redis key for every dedicated field" do
+      ctx = FerricStore.Instance.get(:default)
+      redis_key = "ops:local_tx:promoted-prefix-delete:#{System.unique_integer([:positive])}"
+      prefix = "H:" <> redis_key <> <<0>>
+      field_a = prefix <> "a"
+      field_b = prefix <> "b"
+      other_key = "H:" <> redis_key <> ":other"
+      shard_index = Router.shard_for(ctx, redis_key)
+      keydir = :ets.new(:"ops_local_tx_#{System.unique_integer([:positive])}", [:set, :public])
+      dedicated_dir = Path.join(System.tmp_dir!(), "ops_local_tx_promoted_prefix_delete")
+
+      try do
+        tx = local_tx(ctx, shard_index, keydir, Map.put(%{}, redis_key, %{path: dedicated_dir}))
+        :ets.insert(keydir, {field_a, "a", 0, LFU.initial(), 0, 0, 1})
+        :ets.insert(keydir, {field_b, "b", 0, LFU.initial(), 0, 10, 1})
+        :ets.insert(keydir, {other_key, "other", 0, LFU.initial(), 0, 20, 5})
+
+        assert :ok = Ops.compound_delete_prefix(tx, redis_key, prefix)
+
+        assert_receive {:tx_pending_compound_delete, ^redis_key, ^field_a}
+        assert_receive {:tx_pending_compound_delete, ^redis_key, ^field_b}
+        refute_receive {:tx_pending_delete, ^field_a}
+        refute_receive {:tx_pending_delete, ^field_b}
+        assert [{^other_key, "other", 0, _lfu, 0, 20, 5}] = :ets.lookup(keydir, other_key)
+      after
+        Process.delete(:tx_pending_values)
+        Process.delete(:tx_deleted_keys)
+        :ets.delete(keydir)
+      end
+    end
   end
 
   defp set_opts(overrides) do
