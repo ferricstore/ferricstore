@@ -790,8 +790,25 @@ defmodule Ferricstore.Store.Shard do
         end)
 
       # Dir fsync makes rename/rm entries durable so a kernel panic after
-      # compaction doesn't resurrect pre-merge filenames.
-      _ = NIF.v2_fsync_dir(sp)
+      # compaction doesn't resurrect pre-merge filenames. If this fails, the
+      # namespace was changed in this running process, so keep file_stats in
+      # sync with reality but return an error to the scheduler/operator.
+      dir_fsync_failure =
+        if compacted_file_ids == [] do
+          nil
+        else
+          case compaction_fsync_dir(state, sp) do
+            :ok ->
+              nil
+
+            {:error, reason} ->
+              Logger.error(
+                "Shard #{state.index}: compaction directory fsync failed for #{sp}: #{inspect(reason)}"
+              )
+
+              {:dir_fsync_failed, reason}
+          end
+        end
 
       # Reset file_stats for compacted files: dead bytes are now gone,
       # total bytes reflect the new compacted file size.
@@ -808,16 +825,22 @@ defmodule Ferricstore.Store.Shard do
         end)
 
       reply =
-        case failures do
-          [] ->
+        case {dir_fsync_failure, failures} do
+          {nil, []} ->
             if compacted_file_ids == [] and skipped_file_ids != [] do
               {:error, {:no_compactable_files, Enum.reverse(skipped_file_ids)}}
             else
               {:ok, {total_written, total_dropped, total_reclaimed}}
             end
 
-          [_ | _] ->
+          {nil, [_ | _]} ->
             {:error, {:compaction_failed, Enum.reverse(failures)}}
+
+          {failure, []} ->
+            {:error, {:compaction_failed, [failure]}}
+
+          {failure, [_ | _]} ->
+            {:error, {:compaction_failed, Enum.reverse(failures, [failure])}}
         end
 
       {:reply, reply, %{state | file_stats: new_file_stats}}
@@ -1735,6 +1758,13 @@ defmodule Ferricstore.Store.Shard do
 
   defp compute_file_stats(shard_path, keydir),
     do: ShardFlush.compute_file_stats(shard_path, keydir)
+
+  defp compaction_fsync_dir(state, path) do
+    case Map.get(state, :compaction_fsync_dir_fun) do
+      fun when is_function(fun, 1) -> fun.(path)
+      _ -> NIF.v2_fsync_dir(path)
+    end
+  end
 
   defp schedule_drain_pending(ms), do: ShardFlush.schedule_drain_pending(ms)
 

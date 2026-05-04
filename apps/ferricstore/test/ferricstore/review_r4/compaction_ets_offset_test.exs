@@ -61,6 +61,28 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
       assert [{^missing_file_id, {:copy_failed, _reason}}] = failures
       assert [{^key, nil, 0, 0, ^missing_file_id, 0, 16}] = :ets.lookup(keydir, key)
     end
+
+    test "directory fsync failure after namespace changes is returned as compaction error", %{
+      shard: shard,
+      keydir: keydir
+    } do
+      assert :ok = GenServer.call(shard, {:put, "fsync_fail_key", "value_1", 0})
+      assert :ok = GenServer.call(shard, {:put, "fsync_fail_dead", "dead_value", 0})
+      assert :ok = GenServer.call(shard, :flush)
+
+      assert :ok = GenServer.call(shard, {:delete, "fsync_fail_dead"})
+      force_rotate_active_file(shard)
+
+      :sys.replace_state(shard, fn state ->
+        Map.put(state, :compaction_fsync_dir_fun, fn _path -> {:error, :eio} end)
+      end)
+
+      assert {:error, {:compaction_failed, failures}} =
+               GenServer.call(shard, {:run_compaction, [0]})
+
+      assert [{:dir_fsync_failed, :eio}] = failures
+      assert [{_, nil, 0, _, 0, _offset, _size}] = :ets.lookup(keydir, "fsync_fail_key")
+    end
   end
 
   defp force_rotate_active_file(shard) do
@@ -70,6 +92,7 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
       new_path = Ferricstore.Store.Shard.ETS.file_path(sp, new_id)
 
       Ferricstore.FS.touch!(new_path)
+      Ferricstore.Store.ActiveFile.publish(state.instance_ctx, state.index, new_id, new_path, sp)
 
       %{
         state
