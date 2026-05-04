@@ -39,6 +39,9 @@ defmodule Ferricstore.Store.Router do
   defguardp valid_cold_location(file_id, offset, value_size)
             when valid_cold_file_ref(file_id, value_size) and is_integer(offset) and offset >= 0
 
+  defguardp valid_pending_value_size(value_size)
+            when is_integer(value_size) and value_size >= 0
+
   # ---------------------------------------------------------------------------
   # Shard resolution helpers
   # ---------------------------------------------------------------------------
@@ -2292,11 +2295,19 @@ defmodule Ferricstore.Store.Router do
         when valid_cold_location(fid, off, vsize) ->
           0
 
+        [{^key, nil, 0, _lfu, :pending, _off, vsize}]
+        when valid_pending_value_size(vsize) ->
+          0
+
         [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
           exp
 
         [{^key, nil, exp, _lfu, fid, off, vsize}]
         when exp > now and valid_cold_location(fid, off, vsize) ->
+          exp
+
+        [{^key, nil, exp, _lfu, :pending, _off, vsize}]
+        when exp > now and valid_pending_value_size(vsize) ->
           exp
 
         [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
@@ -2332,11 +2343,19 @@ defmodule Ferricstore.Store.Router do
         [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           vsize
 
+        [{^key, nil, 0, _lfu, :pending, _off, vsize}]
+        when valid_pending_value_size(vsize) ->
+          vsize
+
         [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
           stored_value_size(value)
 
         [{^key, nil, exp, _lfu, fid, off, vsize}]
         when exp > now and valid_cold_location(fid, off, vsize) ->
+          vsize
+
+        [{^key, nil, exp, _lfu, :pending, _off, vsize}]
+        when exp > now and valid_pending_value_size(vsize) ->
           vsize
 
         [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->

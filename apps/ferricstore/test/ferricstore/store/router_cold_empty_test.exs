@@ -642,6 +642,14 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     assert [] == :ets.lookup(keydir, key)
   end
 
+  test "value_size preserves live pending cold rows", %{ctx: ctx, keydir: keydir} do
+    key = "cold_pending_value_size:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), :pending, 0, 8192})
+
+    assert 8192 == Router.value_size(ctx, key)
+    assert [{^key, nil, 0, _lfu, :pending, 0, 8192}] = :ets.lookup(keydir, key)
+  end
+
   test "exists rejects cold rows with invalid offsets", %{ctx: ctx, keydir: keydir} do
     key = "cold_invalid_exists:" <> Integer.to_string(:erlang.unique_integer([:positive]))
     :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
@@ -657,6 +665,15 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
 
     assert nil == Router.expire_at_ms(ctx, key)
     assert [] == :ets.lookup(keydir, key)
+  end
+
+  test "expire_at_ms preserves live pending cold rows", %{ctx: ctx, keydir: keydir} do
+    key = "cold_pending_expire_at:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    expire_at_ms = System.system_time(:millisecond) + 60_000
+    :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), :pending, 0, 8192})
+
+    assert expire_at_ms == Router.expire_at_ms(ctx, key)
+    assert [{^key, nil, ^expire_at_ms, _lfu, :pending, 0, 8192}] = :ets.lookup(keydir, key)
   end
 
   defp attach_pread_corrupt_handler(callback \\ fn -> :ok end) do
