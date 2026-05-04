@@ -540,8 +540,17 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   defp cleanup_compact_temps(shard_path, files) do
     Enum.each(files, fn name ->
       if String.starts_with?(name, "compact_") and String.ends_with?(name, ".log") do
-        _ = Ferricstore.FS.rm(Path.join(shard_path, name))
-        Logger.warning("Shard: removed leftover compaction temp file #{name}")
+        path = Path.join(shard_path, name)
+
+        case Ferricstore.FS.rm(path) do
+          :ok ->
+            Logger.warning("Shard: removed leftover compaction temp file #{name}")
+
+          {:error, reason} ->
+            Logger.error(
+              "Shard: failed to remove leftover compaction temp file #{name}: #{inspect(reason)}"
+            )
+        end
       end
     end)
   end

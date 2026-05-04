@@ -3,6 +3,8 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
 
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.Shard
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
@@ -73,6 +75,33 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
     assert [{^key, nil, 0, _lfu, 0, offset, value_size}] = :ets.lookup(keydir, key)
     assert value_size == byte_size("value")
     assert {:ok, "value"} = NIF.v2_pread_at(Path.join(shard_path, "00000.log"), offset)
+  end
+
+  test "discover_active_file reports leftover compact temp cleanup failures" do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lifecycle_compact_tmp_fail_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Path.join(tmp, "shard_0")
+    File.mkdir_p!(shard_path)
+
+    on_exit(fn ->
+      File.rm_rf!(tmp)
+    end)
+
+    File.write!(Path.join(shard_path, "00000.log"), "active")
+    compact_dir = Path.join(shard_path, "compact_1.log")
+    File.mkdir!(compact_dir)
+
+    log =
+      capture_log(fn ->
+        assert {0, 6} = ShardLifecycle.discover_active_file(shard_path)
+      end)
+
+    assert log =~ "failed to remove leftover compaction temp file compact_1.log"
+    assert File.dir?(compact_dir)
   end
 
   test "recover_keydir during custom shard startup does not mutate default accounting" do
