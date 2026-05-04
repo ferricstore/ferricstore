@@ -1679,46 +1679,9 @@ defmodule FerricStore do
       :ok = FerricStore.flushdb()
 
   """
-  @spec flushdb() :: :ok
+  @spec flushdb() :: :ok | {:error, term()}
   def flushdb do
-    ctx = default_ctx()
-    shard_count = ctx.shard_count
-
-    for i <- 0..(shard_count - 1) do
-      shard = Router.shard_name(ctx, i)
-
-      raw_keys =
-        try do
-          :ets.foldl(fn {key, _, _, _, _, _, _}, acc -> [key | acc] end, [], :"keydir_#{i}")
-        rescue
-          ArgumentError -> []
-        end
-
-      Enum.each(raw_keys, fn key ->
-        try do
-          GenServer.call(shard, {:delete, key}, 10_000)
-        catch
-          :exit, _ -> :ok
-        end
-      end)
-
-      # Clear probabilistic structure registries for this shard.
-      # These are local mmap handles / NIF resources not managed by Raft.
-      clear_shard_registries(i)
-    end
-
-    :ok
-  end
-
-  defp clear_shard_registries(_shard_index) do
-    # Close mmap handles and delete files for probabilistic structures.
-    # create_table on an existing table calls close_all + delete_all_objects.
-    #
-    # NOTE: This runs locally on the node executing FLUSHDB. In single-node
-    # mode, this is sufficient. In multi-node mode, followers clear keys via
-    # Raft but NOT registries — a {:flush_registries} Raft command would be
-    # needed to propagate registry cleanup to all nodes.
-    # Legacy registry tables removed — prob structures use stateless pread/pwrite NIFs now.
+    FerricStore.Impl.flushdb(default_ctx())
   end
 
   # ---------------------------------------------------------------------------

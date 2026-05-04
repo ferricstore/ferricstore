@@ -866,6 +866,37 @@ defmodule Ferricstore.EmbeddedTest do
       assert {:ok, nil} = FerricStore.get("flush:a")
       assert {:ok, nil} = FerricStore.get("flush:b")
     end
+
+    test "removes stale probabilistic sidecar files" do
+      ctx = FerricStore.Instance.get(:default)
+      prob_dir = Path.join(Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0), "prob")
+      stale_path = Path.join(prob_dir, "embedded_stale.bloom")
+
+      File.mkdir_p!(prob_dir)
+      File.write!(stale_path, "bits")
+
+      assert :ok = FerricStore.flushdb()
+      refute Ferricstore.FS.exists?(stale_path)
+    end
+
+    test "surfaces probabilistic directory fsync failures" do
+      ctx = FerricStore.Instance.get(:default)
+      prob_dir = Path.join(Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0), "prob")
+
+      File.mkdir_p!(prob_dir)
+      File.write!(Path.join(prob_dir, "embedded_fsync.bloom"), "bits")
+
+      Process.put(:ferricstore_prob_command_fsync_dir_hook, fn
+        ^prob_dir -> {:error, :eio}
+        _path -> :ok
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_prob_command_fsync_dir_hook)
+      end)
+
+      assert {:error, {:fsync_dir_failed, :flush_prob_dir, :eio}} = FerricStore.flushdb()
+    end
   end
 
   # ===========================================================================
