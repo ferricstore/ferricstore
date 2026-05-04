@@ -84,11 +84,7 @@ defmodule Ferricstore.Merge.Manifest do
             :ok
 
           {:error, cleanup_reason} ->
-            :telemetry.execute(
-              [:ferricstore, :merge, :manifest, :cleanup_failed],
-              %{count: 1},
-              %{path: tmp_path, reason: cleanup_reason}
-            )
+            emit_cleanup_failed(:write_tmp_cleanup, tmp_path, cleanup_reason)
 
             Logger.warning(
               "Failed to remove merge manifest tmp file #{tmp_path}: #{inspect(cleanup_reason)}"
@@ -232,6 +228,8 @@ defmodule Ferricstore.Merge.Manifest do
         :ok
 
       {:error, reason} ->
+        emit_cleanup_failed(phase, path, reason)
+
         Logger.error(
           "Failed to fsync merge manifest directory during #{phase} at #{path}: #{inspect(reason)}"
         )
@@ -259,6 +257,8 @@ defmodule Ferricstore.Merge.Manifest do
         end
 
       {:error, reason} ->
+        emit_cleanup_failed(:cleanup_partial_output_list, data_dir, reason)
+
         Logger.error(
           "Failed to list shard data directory during merge partial cleanup at #{data_dir}: #{inspect(reason)}"
         )
@@ -296,8 +296,18 @@ defmodule Ferricstore.Merge.Manifest do
         :ok
 
       {:error, reason} ->
+        emit_cleanup_failed(:remove_partial_output, path, reason)
+
         Logger.error("Failed to remove partial merge output #{path}: #{inspect(reason)}")
         {:error, {:remove_partial_failed, path, reason}}
     end
+  end
+
+  defp emit_cleanup_failed(phase, path, reason) do
+    :telemetry.execute(
+      [:ferricstore, :merge, :manifest, :cleanup_failed],
+      %{count: 1},
+      %{phase: phase, path: path, reason: reason}
+    )
   end
 end

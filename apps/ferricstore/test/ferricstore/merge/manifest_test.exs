@@ -52,19 +52,7 @@ defmodule Ferricstore.Merge.ManifestTest do
       tmp_path = Path.join(dir, "merge_manifest.bin.tmp")
       File.mkdir!(tmp_path)
 
-      parent = self()
-      handler_id = {:merge_manifest_cleanup_failed, parent, make_ref()}
-
-      :telemetry.attach(
-        handler_id,
-        [:ferricstore, :merge, :manifest, :cleanup_failed],
-        fn event, measurements, metadata, _config ->
-          send(parent, {:cleanup_failed, event, measurements, metadata})
-        end,
-        nil
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
+      attach_manifest_cleanup_failed_handler()
 
       log =
         capture_log(fn ->
@@ -164,6 +152,65 @@ defmodule Ferricstore.Merge.ManifestTest do
 
       # Partial output file should be cleaned up.
       refute File.exists?(Path.join(dir, "compact_1.log"))
+    end
+
+    test "emits telemetry when partial cleanup fsync fails", %{dir: dir} do
+      attach_manifest_cleanup_failed_handler()
+
+      File.write!(Path.join(dir, "00000000000000000001.log"), "input1")
+      File.write!(Path.join(dir, "compact_1.log"), "partial_output")
+      assert :ok = Manifest.write(dir, %{shard_index: 0, input_file_ids: [1]})
+
+      Process.put(:ferricstore_merge_manifest_fsync_dir_hook, fn ^dir ->
+        {:error, :eio}
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_merge_manifest_fsync_dir_hook)
+      end)
+
+      assert {:error, {:fsync_dir_failed, :cleanup_partial_output, :eio}} =
+               Manifest.recover_if_needed(dir, 0)
+
+      assert_receive {:cleanup_failed, [:ferricstore, :merge, :manifest, :cleanup_failed],
+                      %{count: 1}, %{phase: :cleanup_partial_output, path: ^dir, reason: :eio}}
+    end
+
+    test "emits telemetry when partial output removal fails", %{dir: dir} do
+      attach_manifest_cleanup_failed_handler()
+
+      partial_path = Path.join(dir, "compact_1.log")
+      File.mkdir!(partial_path)
+      assert :ok = Manifest.write(dir, %{shard_index: 0, input_file_ids: [1]})
+
+      assert {:error, {:remove_partial_failed, ^partial_path, _reason}} =
+               Manifest.recover_if_needed(dir, 0)
+
+      assert_receive {:cleanup_failed, [:ferricstore, :merge, :manifest, :cleanup_failed],
+                      %{count: 1},
+                      %{phase: :remove_partial_output, path: ^partial_path, reason: _reason}}
+    end
+
+    test "emits telemetry when partial cleanup cannot list the shard dir", %{dir: dir} do
+      attach_manifest_cleanup_failed_handler()
+
+      assert :ok = Manifest.write(dir, %{shard_index: 0, input_file_ids: [1]})
+
+      Process.put(:ferricstore_merge_manifest_before_cleanup_hook, fn ->
+        File.rm_rf!(dir)
+        File.write!(dir, "not a directory")
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_merge_manifest_before_cleanup_hook)
+      end)
+
+      assert {:error, {:cleanup_partial_output_list_failed, ^dir, _reason}} =
+               Manifest.recover_if_needed(dir, 0)
+
+      assert_receive {:cleanup_failed, [:ferricstore, :merge, :manifest, :cleanup_failed],
+                      %{count: 1},
+                      %{phase: :cleanup_partial_output_list, path: ^dir, reason: _reason}}
     end
 
     test "handles corrupt manifest gracefully", %{dir: dir} do
@@ -324,6 +371,24 @@ defmodule Ferricstore.Merge.ManifestTest do
       assert :ok = Manifest.delete(shard_dir)
       refute Manifest.exists?(shard_dir)
     end
+  end
+
+  defp attach_manifest_cleanup_failed_handler do
+    parent = self()
+    handler_id = {:merge_manifest_cleanup_failed, parent, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :merge, :manifest, :cleanup_failed],
+      &__MODULE__.handle_manifest_cleanup_failed/4,
+      parent
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  def handle_manifest_cleanup_failed(event, measurements, metadata, parent) do
+    send(parent, {:cleanup_failed, event, measurements, metadata})
   end
 
   describe "durability" do
