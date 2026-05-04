@@ -390,6 +390,62 @@ defmodule Ferricstore.Store.ShardAccountingTest do
       end
     end
 
+    test "dedicated compaction read failure reports rollback cleanup failure" do
+      keydir = new_keydir()
+      redis_key = "hash:promoted:compact:read_rollback_cleanup_failed"
+      compound_key = CompoundKey.hash_field(redis_key, "missing_cold")
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore-promoted-compact-read-rollback-fail-#{System.unique_integer([:positive])}"
+        )
+
+      try do
+        File.mkdir_p!(dir)
+        File.touch!(Path.join(dir, "00000.log"))
+
+        :ets.insert(keydir, {Promotion.marker_key(redis_key), "hash", 0, LFU.initial(), 0, 0, 4})
+        :ets.insert(keydir, {compound_key, nil, 0, LFU.initial(), 99, 0, 128})
+
+        state = %{
+          index: 0,
+          keydir: keydir,
+          instance_ctx: nil,
+          promoted_instances: %{
+            redis_key => %{
+              path: dir,
+              total_bytes: 2_200_000,
+              dead_bytes: 1_200_000,
+              last_compacted_at: nil
+            }
+          }
+        }
+
+        Process.put(:ferricstore_promoted_compaction_fsync_dir_hook, fn ^dir ->
+          new_log = Path.join(dir, "00001.log")
+
+          if File.regular?(new_log) do
+            File.rm!(new_log)
+            File.mkdir!(new_log)
+          end
+
+          :ok
+        end)
+
+        log =
+          capture_log(fn ->
+            _after_state = ShardCompound.bump_promoted_writes(state, redis_key)
+          end)
+
+        assert log =~ "dedicated compaction rollback failed to remove new active file"
+      after
+        Process.delete(:ferricstore_promoted_compaction_fsync_dir_hook)
+        File.rm_rf(dir)
+        :ets.delete(keydir)
+      end
+    end
+
     test "dedicated compaction dir fsync failure preserves retry accounting" do
       keydir = new_keydir()
       redis_key = "hash:promoted:compact:fsync_failed"

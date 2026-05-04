@@ -958,13 +958,12 @@ defmodule Ferricstore.Store.Shard.Compound do
                     "Shard #{state.index}: dedicated compaction read failed: #{inspect(reason)}"
                   )
 
-                  _ = Ferricstore.FS.rm(new_file)
-                  _ = dedicated_fsync_dir(state, dedicated_path, :rollback_new_active)
+                  rollback_new_active_file(state, dedicated_path, new_file)
                   {:error, state}
               end
 
             {:error, _reason} ->
-              _ = Ferricstore.FS.rm(new_file)
+              rollback_new_active_file(state, dedicated_path, new_file)
               {:error, state}
           end
 
