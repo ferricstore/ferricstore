@@ -2241,6 +2241,51 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert File.exists?(prob_path)
     end
 
+    test "prob sidecar cleanup fsync failure emits telemetry", %{
+      state: state,
+      dir: dir,
+      shard_index: shard_index
+    } do
+      key = "prob_delete_fsync_telemetry"
+      prob_dir = Path.join(dir, "prob")
+      File.mkdir_p!(prob_dir)
+      prob_path = Path.join(prob_dir, "#{Base.url_encode64(key, padding: false)}.cms")
+      File.write!(prob_path, "cms")
+
+      handler_id = {__MODULE__, self(), :prob_sidecar_delete_failed}
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :prob, :sidecar_delete_failed],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:prob_sidecar_delete_failed, event, measurements, metadata})
+        end,
+        self()
+      )
+
+      Process.put(:ferricstore_prob_fsync_dir_hook, fn
+        ^prob_dir -> {:error, :eio}
+        _path -> :ok
+      end)
+
+      on_exit(fn ->
+        :telemetry.detach(handler_id)
+        Process.delete(:ferricstore_prob_fsync_dir_hook)
+      end)
+
+      meta = :erlang.term_to_binary({:cms_meta, %{width: 1, depth: 1}})
+      {state2, :ok} = StateMachine.apply(%{}, {:put, key, meta, 0}, state)
+      {_state3, :ok} = StateMachine.apply(%{}, {:delete, key}, state2)
+
+      assert_receive {:prob_sidecar_delete_failed, [:ferricstore, :prob, :sidecar_delete_failed],
+                      %{count: 1},
+                      %{
+                        shard_index: ^shard_index,
+                        path: ^prob_path,
+                        reason: {:fsync_dir_failed, :prob_file_dir, :eio}
+                      }}
+    end
+
     test "append failure rolls back deleted entry in a mixed batch", %{state: state, ets: ets} do
       {state2, :ok} =
         StateMachine.apply(%{}, {:put, "delete_append_failure_keep", "old", 0}, state)

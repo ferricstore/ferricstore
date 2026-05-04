@@ -6160,10 +6160,39 @@ defmodule Ferricstore.Raft.StateMachine do
   defp maybe_delete_prob_file_path(_state, nil), do: :ok
 
   defp maybe_delete_prob_file_path(state, path) do
-    try do
-      if Ferricstore.FS.rm(path) == :ok, do: prob_fsync_dir(state), else: :ok
-    rescue
-      _ -> :ok
+    result =
+      try do
+        case Ferricstore.FS.rm(path) do
+          :ok -> prob_fsync_dir(state)
+          {:error, {:not_found, _}} -> :ok
+          {:error, reason} -> {:error, {:delete_prob_file_failed, reason}}
+          other -> {:error, {:unexpected_delete_prob_file_result, other}}
+        end
+      rescue
+        error -> {:error, {:delete_prob_file_exception, error}}
+      catch
+        :exit, reason -> {:error, {:delete_prob_file_exit, reason}}
+      end
+
+    case result do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "StateMachine probabilistic sidecar delete failed for #{path}: #{inspect(reason)}"
+        )
+
+        emit_prob_sidecar_delete_failed(state, path, reason)
+        :ok
     end
+  end
+
+  defp emit_prob_sidecar_delete_failed(state, path, reason) do
+    :telemetry.execute(
+      [:ferricstore, :prob, :sidecar_delete_failed],
+      %{count: 1},
+      %{shard_index: state.shard_index, path: path, reason: reason}
+    )
   end
 end
