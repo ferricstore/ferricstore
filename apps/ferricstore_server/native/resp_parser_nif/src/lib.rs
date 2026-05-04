@@ -1560,6 +1560,7 @@ enum CommandAstKind {
     TdigestInfo,
     TdigestMerge,
     FlowCreate,
+    FlowCreateMany,
     FlowGet,
     FlowClaimDue,
     FlowComplete,
@@ -1793,6 +1794,7 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"TDIGEST.INFO" => CommandAstKind::TdigestInfo,
         b"TDIGEST.MERGE" => CommandAstKind::TdigestMerge,
         b"FLOW.CREATE" => CommandAstKind::FlowCreate,
+        b"FLOW.CREATE_MANY" => CommandAstKind::FlowCreateMany,
         b"FLOW.GET" => CommandAstKind::FlowGet,
         b"FLOW.CLAIM_DUE" => CommandAstKind::FlowClaimDue,
         b"FLOW.COMPLETE" => CommandAstKind::FlowComplete,
@@ -2223,6 +2225,7 @@ fn make_command_ast<'a>(
         }
         CommandAstKind::TdigestMerge => make_tdigest_merge_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCreate => make_flow_create_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowCreateMany => make_flow_create_many_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowGet => make_flow_get_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowClaimDue => make_flow_claim_due_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowComplete => make_flow_complete_command_ast(env, args, arg_bytes),
@@ -5091,6 +5094,47 @@ fn make_flow_create_command_ast<'a>(
     }
 }
 
+fn make_flow_create_many_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_create_many");
+    if args.len() < 6 {
+        return (tag, wrong_number_error(env, b"flow.create_many")).encode(env);
+    }
+
+    let Some(items_idx) = flow_find_option(arg_bytes, 1, b"ITEMS") else {
+        return (
+            tag,
+            args[0],
+            generic_ast_error(env, b"ERR flow items are required"),
+        )
+            .encode(env);
+    };
+
+    if items_idx == args.len() - 1 || (args.len() - items_idx - 1) % 2 != 0 {
+        return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
+    }
+
+    let opts =
+        match parse_flow_options_until(env, args, arg_bytes, 1, items_idx, flow_create_option) {
+            Ok(opts) => opts,
+            Err(err) => return (tag, args[0], err).encode(env),
+        };
+
+    let mut items = Vec::with_capacity((args.len() - items_idx - 1) / 2);
+    let mut idx = items_idx + 1;
+    while idx < args.len() {
+        let id = args[idx];
+        let payload_ref = args[idx + 1];
+        items.push((atom(env, "id"), id, atom(env, "payload_ref"), payload_ref).encode(env));
+        idx += 2;
+    }
+
+    (tag, args[0], items, opts).encode(env)
+}
+
 fn make_flow_get_command_ast<'a>(env: Env<'a>, args: &[Term<'a>], arg_bytes: &[&[u8]]) -> Term<'a> {
     let tag = atom(env, "flow_get");
     if args.is_empty() {
@@ -5313,6 +5357,40 @@ fn parse_flow_options<'a>(
         idx += 2;
     }
     Ok(opts)
+}
+
+fn parse_flow_options_until<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    start: usize,
+    end: usize,
+    parser: FlowOptionParser<'a>,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    if (end - start) % 2 != 0 {
+        return Err(generic_ast_error(env, b"ERR syntax error"));
+    }
+
+    let mut opts = Vec::with_capacity((end - start) / 2);
+    let mut idx = start;
+    while idx < end {
+        if let Some(opt) = parser(env, args, arg_bytes, idx)? {
+            opts.push(opt);
+        }
+        idx += 2;
+    }
+    Ok(opts)
+}
+
+fn flow_find_option(arg_bytes: &[&[u8]], start: usize, name: &[u8]) -> Option<usize> {
+    let mut idx = start;
+    while idx < arg_bytes.len() {
+        if ascii_eq_ignore_case(arg_bytes[idx], name) {
+            return Some(idx);
+        }
+        idx += 2;
+    }
+    None
 }
 
 fn flow_has_option(arg_bytes: &[&[u8]], start: usize, name: &[u8]) -> bool {
@@ -6010,8 +6088,9 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"CMS.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"TDIGEST.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"RATELIMIT.ADD" => vec![0],
-        b"FLOW.CREATE" | b"FLOW.GET" | b"FLOW.COMPLETE" | b"FLOW.TRANSITION" | b"FLOW.RETRY"
-        | b"FLOW.FAIL" | b"FLOW.CANCEL" | b"FLOW.REWIND" | b"FLOW.HISTORY" => vec![0],
+        b"FLOW.CREATE" | b"FLOW.CREATE_MANY" | b"FLOW.GET" | b"FLOW.COMPLETE"
+        | b"FLOW.TRANSITION" | b"FLOW.RETRY" | b"FLOW.FAIL" | b"FLOW.CANCEL" | b"FLOW.REWIND"
+        | b"FLOW.HISTORY" => vec![0],
         b"MEMORY" => {
             if argc > 1 && ascii_eq_ignore_case(arg_bytes[0], b"USAGE") {
                 vec![1]
@@ -7702,6 +7781,22 @@ mod tests {
         assert_eq!(
             classify_command_ast(b"TDIGEST.MERGE", 1),
             CommandAstKind::TdigestMerge
+        );
+    }
+
+    #[test]
+    fn ast_classifies_flow_commands_even_for_error_arity() {
+        assert_eq!(
+            classify_command_ast(b"FLOW.CREATE", 0),
+            CommandAstKind::FlowCreate
+        );
+        assert_eq!(
+            classify_command_ast(b"FLOW.CREATE_MANY", 0),
+            CommandAstKind::FlowCreateMany
+        );
+        assert_eq!(
+            classify_command_ast(b"FLOW.CLAIM_DUE", 0),
+            CommandAstKind::FlowClaimDue
         );
     }
 

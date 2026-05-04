@@ -319,6 +319,7 @@ defmodule Ferricstore.Store.Router do
   def always_quorum?({:topk_add, _, _}), do: true
   def always_quorum?({:topk_incrby, _, _}), do: true
   def always_quorum?({:flow_create, _, _}), do: true
+  def always_quorum?({:flow_create_many, _, _}), do: true
   def always_quorum?({:flow_claim_due, _, _}), do: true
   def always_quorum?({:flow_complete, _, _}), do: true
   def always_quorum?({:flow_transition, _, _}), do: true
@@ -3140,6 +3141,19 @@ defmodule Ferricstore.Store.Router do
     else
       idx = shard_for(ctx, key)
       raft_write(ctx, idx, key, {:flow_create, key, attrs})
+    end
+  end
+
+  @doc false
+  def flow_create_many(ctx, partition_key, attrs_list)
+      when is_binary(partition_key) and is_list(attrs_list) do
+    key = Ferricstore.Flow.Keys.state_key("__batch__", partition_key)
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_create_many, key, %{records: attrs_list}})
     end
   end
 

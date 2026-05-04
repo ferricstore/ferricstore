@@ -14,37 +14,31 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with :ok <- validate_opts(opts),
-           :ok <- validate_id(id),
-           {:ok, type} <- required_binary(opts, :type),
-           {:ok, state} <- optional_binary(opts, :state, @default_state),
-           {:ok, payload_ref} <- optional_binary_or_nil(opts, :payload_ref, nil),
-           :ok <- validate_ref_size(:payload_ref, payload_ref),
-           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-           {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
-           {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-           {:ok, history_max_events} <- optional_pos_integer_or_nil(opts, :history_max_events),
-           {:ok, priority} <- optional_priority(opts, @default_priority),
-           {:ok, partition_key} <- optional_partition_key(opts),
-           :ok <- validate_flow_keys(id, type, state, priority, partition_key) do
-        attrs = %{
-          id: id,
-          type: type,
-          state: state,
-          payload_ref: payload_ref,
-          run_at_ms: run_at_ms,
-          ttl_ms: ttl_ms,
-          history_max_events: history_max_events,
-          priority: priority,
-          now_ms: now,
-          partition_key: partition_key
-        }
-
+      with {:ok, attrs} <- create_attrs(id, opts, now_ms()) do
         Router.flow_create(ctx, attrs)
       end
 
     observe_flow(:create, started, result, %{flow_id: id})
   end
+
+  def create_many(ctx, partition_key, items, opts)
+      when is_list(items) and is_list(opts) do
+    started = flow_start_time()
+    now = now_ms()
+
+    result =
+      with {:ok, partition_key} <- required_partition_key(partition_key),
+           :ok <- validate_create_many_items(items),
+           {:ok, attrs_list} <- create_many_attrs(items, opts, partition_key, now),
+           :ok <- validate_unique_create_ids(attrs_list) do
+        Router.flow_create_many(ctx, partition_key, attrs_list)
+      end
+
+    observe_flow(:create, started, result, %{flow_id: nil})
+  end
+
+  def create_many(_ctx, _partition_key, _items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
 
   def get(ctx, id, opts \\ []) when is_binary(id) and is_list(opts) do
     with :ok <- validate_id(id),
@@ -350,8 +344,8 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp publish_flow_notifications(_command, {:ok, records}) when is_list(records) do
-    Enum.each(records, &publish_flow_record(:claim_due, &1))
+  defp publish_flow_notifications(command, {:ok, records}) when is_list(records) do
+    Enum.each(records, &publish_flow_record(command, &1))
   end
 
   defp publish_flow_notifications(command, {:ok, record}) when is_map(record) do
@@ -467,6 +461,104 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp create_attrs(id, opts, default_now) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         {:ok, type} <- required_binary(opts, :type),
+         {:ok, state} <- optional_binary(opts, :state, @default_state),
+         {:ok, payload_ref} <- optional_binary_or_nil(opts, :payload_ref, nil),
+         :ok <- validate_ref_size(:payload_ref, payload_ref),
+         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, default_now),
+         {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
+         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
+         {:ok, history_max_events} <- optional_pos_integer_or_nil(opts, :history_max_events),
+         {:ok, priority} <- optional_priority(opts, @default_priority),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_flow_keys(id, type, state, priority, partition_key) do
+      {:ok,
+       %{
+         id: id,
+         type: type,
+         state: state,
+         payload_ref: payload_ref,
+         run_at_ms: run_at_ms,
+         ttl_ms: ttl_ms,
+         history_max_events: history_max_events,
+         priority: priority,
+         now_ms: now,
+         partition_key: partition_key
+       }}
+    end
+  end
+
+  defp create_many_attrs(items, opts, partition_key, default_now) do
+    Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
+      with {:ok, id, item_opts} <- create_many_item_opts(item),
+           {:ok, attrs} <-
+             create_attrs(
+               id,
+               opts |> Keyword.merge(item_opts) |> Keyword.put(:partition_key, partition_key),
+               default_now
+             ) do
+        {:cont, {:ok, [attrs | acc]}}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, attrs_list} -> {:ok, Enum.reverse(attrs_list)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp create_many_item_opts(id) when is_binary(id), do: {:ok, id, []}
+
+  defp create_many_item_opts(%{id: id} = item) when is_binary(id) do
+    {:ok, id, create_many_item_payload_ref(item)}
+  end
+
+  defp create_many_item_opts(%{"id" => id} = item) when is_binary(id) do
+    {:ok, id, create_many_item_payload_ref(item)}
+  end
+
+  defp create_many_item_opts({id, item_opts}) when is_binary(id) and is_list(item_opts) do
+    if Keyword.keyword?(item_opts) do
+      {:ok, id, item_opts}
+    else
+      {:error, "ERR flow opts must be a keyword list"}
+    end
+  end
+
+  defp create_many_item_opts({:id, id, :payload_ref, payload_ref}) when is_binary(id) do
+    {:ok, id, [payload_ref: payload_ref]}
+  end
+
+  defp create_many_item_opts(_item), do: {:error, "ERR flow id must be a non-empty string"}
+
+  defp create_many_item_payload_ref(item) do
+    cond do
+      Map.has_key?(item, :payload_ref) -> [payload_ref: Map.get(item, :payload_ref)]
+      Map.has_key?(item, "payload_ref") -> [payload_ref: Map.get(item, "payload_ref")]
+      true -> []
+    end
+  end
+
+  defp validate_create_many_items([_ | _]), do: :ok
+  defp validate_create_many_items(_items), do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp validate_unique_create_ids(attrs_list) do
+    {_seen, result} =
+      Enum.reduce_while(attrs_list, {MapSet.new(), :ok}, fn %{id: id}, {seen, :ok} ->
+        if MapSet.member?(seen, id) do
+          {:halt, {seen, {:error, "ERR flow duplicate id in batch"}}}
+        else
+          {:cont, {MapSet.put(seen, id), :ok}}
+        end
+      end)
+
+    result
+  end
+
   defp required_binary(opts, key) do
     case Keyword.fetch(opts, key) do
       {:ok, value} when is_binary(value) and value != "" -> {:ok, value}
@@ -572,6 +664,14 @@ defmodule Ferricstore.Flow do
       :global -> {:ok, nil}
       value when is_binary(value) and value != "" -> {:ok, value}
       _ -> {:error, "ERR flow partition_key must be a non-empty string or :global"}
+    end
+  end
+
+  defp required_partition_key(partition_key) do
+    case optional_partition_key(partition_key: partition_key) do
+      {:ok, nil} -> {:error, "ERR flow partition_key is required"}
+      {:ok, value} -> {:ok, value}
+      {:error, _reason} = error -> error
     end
   end
 

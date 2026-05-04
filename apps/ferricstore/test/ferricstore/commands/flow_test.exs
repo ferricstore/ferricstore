@@ -48,6 +48,43 @@ defmodule Ferricstore.Commands.FlowTest do
              Dispatcher.dispatch("FLOW.HISTORY", [id, "COUNT", "10"], MockStore.make())
   end
 
+  test "dispatches Flow create_many through Rust AST" do
+    partition = uid("tenant")
+    type = uid("flow-command-bulk")
+    id_a = uid("flow-command-bulk-a")
+    id_b = uid("flow-command-bulk-b")
+
+    assert [
+             %{"id" => ^id_a, "type" => ^type, "partition_key" => ^partition},
+             %{"id" => ^id_b, "type" => ^type, "partition_key" => ^partition}
+           ] =
+             Dispatcher.dispatch(
+               "FLOW.CREATE_MANY",
+               [
+                 partition,
+                 "TYPE",
+                 type,
+                 "RUN_AT",
+                 "1000",
+                 "NOW",
+                 "1000",
+                 "ITEMS",
+                 id_a,
+                 "payload:" <> id_a,
+                 id_b,
+                 "payload:" <> id_b
+               ],
+               MockStore.make()
+             )
+
+    assert [%{"id" => ^id_a}, %{"id" => ^id_b}] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [type, "WORKER", "worker-a", "LIMIT", "10", "NOW", "1000", "PARTITION", partition],
+               MockStore.make()
+             )
+  end
+
   test "dispatches Flow claim and complete through Rust AST" do
     id = uid("flow-command-complete")
 
@@ -157,6 +194,7 @@ defmodule Ferricstore.Commands.FlowTest do
   test "Flow commands are visible in COMMAND catalog" do
     names = Dispatcher.dispatch("COMMAND", ["LIST"], MockStore.make())
     assert "flow.create" in names
+    assert "flow.create_many" in names
     assert "flow.claim_due" in names
     assert "flow.complete" in names
     assert "flow.rewind" in names

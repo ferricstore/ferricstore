@@ -94,6 +94,75 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id, type: "checkout", state: "queued")
   end
 
+  test "flow_create_many creates one-partition batch atomically" do
+    partition = uid("tenant")
+    type = uid("bulk-create")
+    id_a = uid("bulk-a")
+    id_b = uid("bulk-b")
+
+    assert {:ok, flows} =
+             FerricStore.flow_create_many(
+               partition,
+               [
+                 %{id: id_a, payload_ref: "payload:" <> id_a},
+                 %{id: id_b, payload_ref: "payload:" <> id_b}
+               ],
+               type: type,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert Enum.map(flows, & &1.id) == [id_a, id_b]
+    assert Enum.all?(flows, &(&1.partition_key == partition))
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-a",
+               limit: 10,
+               now_ms: 1_000
+             )
+
+    assert claimed |> Enum.map(& &1.id) |> MapSet.new() == MapSet.new([id_a, id_b])
+  end
+
+  test "flow_create_many rejects missing partition and rolls back duplicate batches" do
+    partition = uid("tenant")
+    type = uid("bulk-atomic")
+    existing_id = uid("bulk-existing")
+    new_id = uid("bulk-new")
+
+    assert {:error, "ERR flow partition_key is required"} =
+             FerricStore.flow_create_many(nil, [%{id: new_id}], type: type)
+
+    assert {:ok, _} =
+             FerricStore.flow_create(existing_id,
+               type: type,
+               partition_key: partition,
+               run_at_ms: 1_000
+             )
+
+    assert {:error, "ERR flow already exists"} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: existing_id}, %{id: new_id}],
+               type: type,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, nil} = FerricStore.flow_get(new_id, partition_key: partition)
+
+    assert {:error, "ERR flow duplicate id in batch"} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: new_id}, %{id: new_id}],
+               type: type,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, nil} = FerricStore.flow_get(new_id, partition_key: partition)
+  end
+
   test "flow_create emits telemetry and wakeup pubsub notifications" do
     id = uid("flow-observe")
     attach_flow_telemetry([[:ferricstore, :flow, :create, :stop]])

@@ -331,6 +331,15 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Creates a workflow record."
     },
     %{
+      name: "flow.create_many",
+      arity: -7,
+      flags: ["write", "denyoom"],
+      first_key: 1,
+      last_key: 1,
+      step: 1,
+      summary: "Creates a one-partition workflow batch atomically."
+    },
+    %{
       name: "flow.get",
       arity: -2,
       flags: ["readonly", "fast"],

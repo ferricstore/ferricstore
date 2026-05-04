@@ -156,6 +156,7 @@ defmodule Ferricstore.Raft.Batcher do
           | {:json_clear, binary(), binary() | list()}
           | {:cross_shard_tx, list()}
           | {:flow_create, binary(), map()}
+          | {:flow_create_many, binary(), map()}
           | {:flow_claim_due, binary(), map()}
           | {:flow_complete, binary(), map()}
           | {:flow_transition, binary(), map()}

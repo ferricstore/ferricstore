@@ -369,6 +369,22 @@ defmodule FerricStore do
 
   def flow_create(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc """
+  Creates a durable batch of Flow records in one partition.
+
+  The batch is all-or-nothing because every item routes to the same shard.
+  Required option: `:type`.
+  """
+  @spec flow_create_many(binary(), list(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_create_many(partition_key, items, opts \\ [])
+
+  def flow_create_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.create_many(default_ctx(), partition_key, items, opts)
+  end
+
+  def flow_create_many(_partition_key, _items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Returns the latest Flow state record for `id`."
   @spec flow_get(binary(), keyword()) :: {:ok, map() | nil} | {:error, binary()}
   def flow_get(id, opts \\ [])

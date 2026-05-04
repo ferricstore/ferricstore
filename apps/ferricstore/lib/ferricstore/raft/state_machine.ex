@@ -929,6 +929,10 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_with_time(meta, state, fn -> do_flow_create(state, attrs) end)
   end
 
+  def apply(meta, {:flow_create_many, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_create_many(state, attrs) end)
+  end
+
   def apply(meta, {:flow_claim_due, _key, attrs}, state) when is_map(attrs) do
     apply_pending_with_time(meta, state, fn -> do_flow_claim_due(state, attrs) end)
   end
@@ -3202,6 +3206,10 @@ defmodule Ferricstore.Raft.StateMachine do
     do_flow_create(state, attrs)
   end
 
+  defp apply_single(state, {:flow_create_many, _key, attrs}) do
+    do_flow_create_many(state, attrs)
+  end
+
   defp apply_single(state, {:flow_claim_due, _key, attrs}) do
     do_flow_claim_due(state, attrs)
   end
@@ -4094,49 +4102,109 @@ defmodule Ferricstore.Raft.StateMachine do
   defp pending_write_error_result?({:error, _reason, _state}), do: true
   defp pending_write_error_result?(_result), do: false
 
-  defp do_flow_create(state, %{id: id, type: type, state: flow_state} = attrs) do
+  defp do_flow_create(state, %{id: id} = attrs) do
     partition_key = Map.get(attrs, :partition_key)
     state_key = FlowKeys.state_key(id, partition_key)
 
     case flow_read_record(state, id, partition_key) do
       nil ->
-        now_ms = Map.get(attrs, :now_ms, apply_now_ms())
-        run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
-        priority = Map.get(attrs, :priority, 0)
-
-        record = %{
-          id: id,
-          type: type,
-          state: flow_state,
-          version: 1,
-          attempts: 0,
-          fencing_token: 0,
-          created_at_ms: now_ms,
-          updated_at_ms: now_ms,
-          next_run_at_ms: run_at_ms,
-          priority: priority,
-          ttl_ms: Map.get(attrs, :ttl_ms),
-          history_max_events: Map.get(attrs, :history_max_events),
-          partition_key: partition_key,
-          payload_ref: Map.get(attrs, :payload_ref),
-          result_ref: nil,
-          error_ref: nil,
-          lease_owner: nil,
-          lease_token: nil,
-          lease_deadline_ms: 0
-        }
+        record = flow_create_record(attrs)
 
         with :ok <- flow_validate_record_keys(record),
              :ok <- flow_put(state, state_key, flow_encode(record), flow_record_expire_at(record)),
              :ok <- flow_due_put(state, record),
              :ok <- flow_index_put(state, record),
-             :ok <- flow_history_put(state, record, "created", now_ms),
+             :ok <- flow_history_put(state, record, "created", Map.get(record, :created_at_ms)),
              :ok <- flow_history_trim(state, record) do
           {:ok, record}
         end
 
       _existing ->
         {:error, "ERR flow already exists"}
+    end
+  end
+
+  defp do_flow_create_many(state, %{records: [_ | _] = attrs_list}) do
+    with :ok <- flow_create_many_unique?(attrs_list),
+         {:ok, records} <- flow_create_many_prepare(state, attrs_list),
+         :ok <- flow_create_many_apply(state, records) do
+      {:ok, records}
+    end
+  end
+
+  defp do_flow_create_many(_state, _attrs),
+    do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp flow_create_record(%{id: id, type: type, state: flow_state} = attrs) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
+    priority = Map.get(attrs, :priority, 0)
+
+    %{
+      id: id,
+      type: type,
+      state: flow_state,
+      version: 1,
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: now_ms,
+      updated_at_ms: now_ms,
+      next_run_at_ms: run_at_ms,
+      priority: priority,
+      ttl_ms: Map.get(attrs, :ttl_ms),
+      history_max_events: Map.get(attrs, :history_max_events),
+      partition_key: Map.get(attrs, :partition_key),
+      payload_ref: Map.get(attrs, :payload_ref),
+      result_ref: nil,
+      error_ref: nil,
+      lease_owner: nil,
+      lease_token: nil,
+      lease_deadline_ms: 0
+    }
+  end
+
+  defp flow_create_many_unique?(attrs_list) do
+    {_seen, result} =
+      Enum.reduce_while(attrs_list, {MapSet.new(), :ok}, fn %{id: id}, {seen, :ok} ->
+        if MapSet.member?(seen, id) do
+          {:halt, {seen, {:error, "ERR flow duplicate id in batch"}}}
+        else
+          {:cont, {MapSet.put(seen, id), :ok}}
+        end
+      end)
+
+    result
+  end
+
+  defp flow_create_many_prepare(state, attrs_list) do
+    Enum.reduce_while(attrs_list, {:ok, []}, fn %{id: id} = attrs, {:ok, acc} ->
+      partition_key = Map.get(attrs, :partition_key)
+
+      case flow_read_record(state, id, partition_key) do
+        nil ->
+          record = flow_create_record(attrs)
+
+          case flow_validate_record_keys(record) do
+            :ok -> {:cont, {:ok, [record | acc]}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+
+        _existing ->
+          {:halt, {:error, "ERR flow already exists"}}
+      end
+    end)
+    |> case do
+      {:ok, records} -> {:ok, Enum.reverse(records)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_create_many_apply(state, records) do
+    with :ok <- flow_create_put_state_records(state, records),
+         :ok <- flow_due_put_many(state, records),
+         :ok <- flow_index_put_many(state, records),
+         :ok <- flow_create_put_history(state, records) do
+      :ok
     end
   end
 
@@ -4779,6 +4847,21 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
+  defp flow_create_put_state_records(state, records) do
+    Enum.each(records, fn record ->
+      partition_key = Map.get(record, :partition_key)
+
+      flow_put(
+        state,
+        FlowKeys.state_key(record.id, partition_key),
+        flow_encode(record),
+        flow_record_expire_at(record)
+      )
+    end)
+
+    :ok
+  end
+
   defp flow_claim_put_running_indexes(state, plans) do
     plans
     |> Enum.reduce(%{}, fn {_record, next}, acc ->
@@ -4810,6 +4893,45 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
+  defp flow_index_put_many(state, records) do
+    records
+    |> Enum.reduce(%{}, fn record, acc ->
+      partition_key = Map.get(record, :partition_key)
+      updated_score = Float.to_string(Map.get(record, :updated_at_ms, 0) * 1.0)
+
+      acc =
+        flow_claim_add_zset_entry(
+          acc,
+          FlowKeys.state_index_key(record.type, record.state, partition_key),
+          record.id,
+          updated_score
+        )
+
+      if Map.get(record, :state) == "running" do
+        lease_score = Float.to_string(Map.get(record, :lease_deadline_ms, 0) * 1.0)
+
+        acc
+        |> flow_claim_add_zset_entry(
+          FlowKeys.inflight_index_key(record.type, partition_key),
+          record.id,
+          lease_score
+        )
+        |> flow_claim_add_zset_entry(
+          FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key),
+          record.id,
+          lease_score
+        )
+      else
+        acc
+      end
+    end)
+    |> Enum.each(fn {key, member_score_pairs} ->
+      flow_zset_put_many(state, key, Enum.reverse(member_score_pairs))
+    end)
+
+    :ok
+  end
+
   defp flow_claim_add_zset_entry(acc, key, member, score) do
     Map.update(acc, key, [{member, score}], &[{member, score} | &1])
   end
@@ -4820,6 +4942,17 @@ defmodule Ferricstore.Raft.StateMachine do
     Enum.each(plans, fn {_record, next} ->
       flow_history_put_ready(state, next, "claimed", now_ms)
       flow_history_trim(state, next)
+    end)
+
+    :ok
+  end
+
+  defp flow_create_put_history(state, records) do
+    Ferricstore.Commands.Stream.ensure_meta_table()
+
+    Enum.each(records, fn record ->
+      flow_history_put_ready(state, record, "created", Map.get(record, :created_at_ms))
+      flow_history_trim(state, record)
     end)
 
     :ok
