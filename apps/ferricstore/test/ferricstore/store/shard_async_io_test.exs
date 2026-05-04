@@ -1506,7 +1506,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
       shard_path = Ferricstore.DataDir.shard_data_path(dir, 0)
       source = Path.join(shard_path, "00000.log")
-      writer = Process.whereis(BitcaskWriter.writer_name(0))
+      {:ok, writer} = BitcaskWriter.start_link(shard_index: 0, instance_ctx: ctx)
 
       try do
         {:ok, {_dead_offset, _dead_record_size}} = NIF.v2_append_record(source, "dead", "old", 0)
@@ -1523,7 +1523,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
         :sys.replace_state(writer, fn state ->
           %{
             state
-            | pending: [{:write, nil, bad_path, 0, keydir, "pending", "new", 0}],
+            | pending: [{:write, ctx, bad_path, 0, keydir, "pending", "new", 0}],
               pending_count: 1
           }
         end)
@@ -1536,6 +1536,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       after
         if writer && Process.alive?(writer) do
           :sys.replace_state(writer, fn state -> %{state | pending: [], pending_count: 0} end)
+          GenServer.stop(writer, :normal, 5_000)
         end
 
         cleanup_shard(pid, ctx, dir)
