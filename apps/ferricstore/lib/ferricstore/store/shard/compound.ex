@@ -39,7 +39,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
         dedicated_path ->
           if Enum.any?(compound_keys, &shared_log_compound_key?/1) do
-            compound_batch_get_mixed(redis_key, compound_keys, state)
+            compound_batch_get_mixed(dedicated_path, compound_keys, state)
           else
             compound_batch_get_dedicated(dedicated_path, compound_keys, state)
           end
@@ -48,10 +48,86 @@ defmodule Ferricstore.Store.Shard.Compound do
     {:reply, values, state}
   end
 
-  defp compound_batch_get_mixed(redis_key, compound_keys, state) do
-    Enum.map_reduce(compound_keys, state, fn compound_key, acc_state ->
-      compound_get_value(redis_key, compound_key, acc_state)
-    end)
+  defp compound_batch_get_mixed(dedicated_path, compound_keys, state) do
+    {results, {state, shared_entries, _shared_count, dedicated_entries, _dedicated_count}} =
+      Enum.map_reduce(compound_keys, {state, [], 0, [], 0}, fn compound_key,
+                                                               {state, shared_entries,
+                                                                shared_count, dedicated_entries,
+                                                                dedicated_count} ->
+        if shared_log_compound_key?(compound_key) do
+          case ShardETS.ets_lookup(state, compound_key) do
+            {:hit, value, _exp} ->
+              {{:value, value},
+               {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
+
+            {:cold, fid, off, vsize, exp} ->
+              file_path = ShardETS.file_path(state.shard_data_path, fid)
+              entry = {state, compound_key, file_path, fid, off, vsize, exp}
+
+              {{:shared_cold, shared_count},
+               {state, [entry | shared_entries], shared_count + 1, dedicated_entries,
+                dedicated_count}}
+
+            :expired ->
+              {{:value, nil},
+               {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
+
+            :miss ->
+              if ShardETS.pending_cold?(state, compound_key) do
+                state = ShardFlush.flush_pending_for_read(state)
+
+                {{:value, ShardETS.warm_from_store(state, compound_key)},
+                 {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
+              else
+                {{:value, nil},
+                 {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
+              end
+          end
+        else
+          case ShardETS.ets_lookup(state, compound_key) do
+            {:hit, value, _exp} ->
+              {{:value, value},
+               {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
+
+            {:cold, fid, off, vsize, exp} ->
+              file_path = dedicated_file_path(dedicated_path, fid)
+              entry = {state, compound_key, file_path, fid, off, vsize, exp}
+
+              {{:dedicated_cold, dedicated_count},
+               {state, shared_entries, shared_count, [entry | dedicated_entries],
+                dedicated_count + 1}}
+
+            :expired ->
+              {{:value, nil},
+               {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
+
+            :miss ->
+              {{:value, nil},
+               {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
+          end
+        end
+      end)
+
+    shared_values =
+      shared_entries
+      |> Enum.reverse()
+      |> read_shared_cold_batch_async()
+      |> List.to_tuple()
+
+    dedicated_values =
+      dedicated_entries
+      |> Enum.reverse()
+      |> read_compound_cold_batch_async()
+      |> List.to_tuple()
+
+    values =
+      Enum.map(results, fn
+        {:value, value} -> value
+        {:shared_cold, index} -> elem(shared_values, index)
+        {:dedicated_cold, index} -> elem(dedicated_values, index)
+      end)
+
+    {values, state}
   end
 
   defp compound_batch_get_shared(compound_keys, state) do

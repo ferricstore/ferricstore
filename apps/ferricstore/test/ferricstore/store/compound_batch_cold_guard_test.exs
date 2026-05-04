@@ -56,6 +56,23 @@ defmodule Ferricstore.Store.CompoundBatchColdGuardTest do
            "expected promoted compound batch get to use the shared batched cold reader"
   end
 
+  test "mixed promoted compound batch reads keep both cold paths batched" do
+    ast = compound_ast()
+    mixed_body = function_body(ast, :compound_batch_get_mixed, 3)
+
+    # Promoted batches can contain shared-log keys such as type/promotion
+    # markers plus dedicated member keys. That path must partition the batch
+    # and read each cold side in one submission, not fall back to per-key reads.
+    assert contains_local_call?(mixed_body, :read_shared_cold_batch_async, 1),
+           "expected mixed promoted batch get to batch shared-log cold reads"
+
+    assert contains_local_call?(mixed_body, :read_compound_cold_batch_async, 1),
+           "expected mixed promoted batch get to batch dedicated cold reads"
+
+    refute contains_local_call?(mixed_body, :compound_get_value, 3),
+           "mixed promoted batch get must not serialize through compound_get_value/3"
+  end
+
   test "promoted compound batch metadata reads use a dedicated batch cold path" do
     ast = compound_ast()
     batch_get_meta_body = function_body(ast, :handle_compound_batch_get_meta, 3)
