@@ -251,6 +251,21 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       assert nil == recovered_value_from_bitcask(c, k)
     end
 
+    test "async GETDEL after pending async INCR does not resurrect from Bitcask" do
+      c = ctx()
+      k = ukey("incr_getdel_no_resurrect")
+      idx = Router.shard_for(c, k)
+
+      assert {:ok, 1} = Router.incr(c, k, 1)
+      assert "1" == Router.getdel(c, k)
+      assert nil == Router.get(c, k)
+
+      :ok = Batcher.flush(idx)
+      :ok = BitcaskWriter.flush_all(c.shard_count)
+
+      assert nil == recovered_value_from_bitcask(c, k)
+    end
+
     test "INCR on nonexistent key returns delta and stores it" do
       k = ukey("incr_nokey")
       assert {:ok, 5} = Router.incr(ctx(), k, 5)

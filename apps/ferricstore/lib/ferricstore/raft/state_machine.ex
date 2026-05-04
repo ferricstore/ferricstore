@@ -3265,13 +3265,11 @@ defmodule Ferricstore.Raft.StateMachine do
     true
   end
 
-  defp origin_command_provably_in_current_value?({:delete, _key}, _current_value, nil) do
-    true
-  end
+  # Deletes are materialized as tombstones, not as a value shape. A pending
+  # value can never prove that a later DELETE/GETDEL has already reached disk.
+  defp origin_command_provably_in_current_value?({:delete, _key}, _current_value, nil), do: false
 
-  defp origin_command_provably_in_current_value?({:getdel, _key}, _current_value, nil) do
-    true
-  end
+  defp origin_command_provably_in_current_value?({:getdel, _key}, _current_value, nil), do: false
 
   defp origin_command_provably_in_current_value?(_inner_cmd, _current_value, _expected_value) do
     false
