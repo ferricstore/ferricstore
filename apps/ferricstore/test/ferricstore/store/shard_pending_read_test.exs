@@ -206,7 +206,73 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
     end
   end
 
+  test "nil async cold read retry exhaustion emits telemetry" do
+    attach_cold_retry_exhausted_handler()
+
+    keydir = :ets.new(:"pending_read_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "pending:compaction-retry-exhausted"
+    tag = make_ref()
+    shard_data_path = Path.join(System.tmp_dir!(), "pending_read_retry_exhausted")
+
+    state = %{
+      index: 2,
+      flush_in_flight: nil,
+      keydir: keydir,
+      shard_data_path: shard_data_path,
+      instance_ctx: %{hot_cache_max_value_size: 64},
+      pending_reads: %{}
+    }
+
+    try do
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 7, 12, 3})
+
+      pending_entry = {{self(), tag}, key, 0, 7, 12, 3}
+
+      assert {:noreply, ^state} = Shard.handle_info({:cold_read_retry, pending_entry, 0}, state)
+      assert_receive {^tag, nil}
+
+      path = Path.join(shard_data_path, "00007.log")
+
+      assert_receive {:pread_telemetry, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                      %{
+                        path: ^path,
+                        reason: :corrupt_record,
+                        raw_reason: :missing_live_cold_entry
+                      }}
+
+      assert_receive {:cold_retry_exhausted, [:ferricstore, :store, :cold_read_retry_exhausted],
+                      %{count: 1, attempts: 8},
+                      %{
+                        source: :shard,
+                        operation: :get,
+                        shard_index: 2,
+                        path: ^path,
+                        reason: :missing_live_cold_entry
+                      }}
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   def handle_telemetry(event, measurements, metadata, parent) do
     send(parent, {:pread_telemetry, event, measurements, metadata})
+  end
+
+  defp attach_cold_retry_exhausted_handler do
+    parent = self()
+    handler_id = {:pending_read_retry_exhausted, parent, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :store, :cold_read_retry_exhausted],
+      &__MODULE__.handle_cold_retry_exhausted/4,
+      parent
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  def handle_cold_retry_exhausted(event, measurements, metadata, parent) do
+    send(parent, {:cold_retry_exhausted, event, measurements, metadata})
   end
 end

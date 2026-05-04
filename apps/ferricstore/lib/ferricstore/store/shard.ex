@@ -1928,6 +1928,7 @@ defmodule Ferricstore.Store.Shard do
         {:retry_later, pending_entry, attempts_left - 1}
 
       {:cold, ^fid, ^off, ^vsize, _exp} ->
+        emit_cold_retry_exhausted(state, pending_entry, :get, :missing_live_cold_entry)
         emit_pending_read_error(state, pending_entry, :missing_live_cold_entry)
         {:reply, from, nil}
 
@@ -1958,6 +1959,7 @@ defmodule Ferricstore.Store.Shard do
         {:retry_later, pending_entry, attempts_left - 1}
 
       {:cold, ^fid, ^off, ^vsize, _exp} ->
+        emit_cold_retry_exhausted(state, pending_entry, :get_meta, :missing_live_cold_entry)
         emit_pending_read_error(state, pending_entry, :missing_live_cold_entry)
         {:reply, from, nil}
 
@@ -1979,6 +1981,77 @@ defmodule Ferricstore.Store.Shard do
 
   defp resolve_nil_cold_read(_state, {from, _key, :meta, _exp}, _attempts_left),
     do: {:reply, from, nil}
+
+  defp emit_cold_retry_exhausted(
+         %{index: shard_index, shard_data_path: shard_data_path},
+         {_from, key, _exp, fid, off, vsize},
+         operation,
+         reason
+       )
+       when is_binary(shard_data_path) and is_integer(fid) and fid >= 0 do
+    emit_cold_retry_exhausted_for_location(
+      shard_index,
+      shard_data_path,
+      key,
+      fid,
+      off,
+      vsize,
+      operation,
+      reason
+    )
+  end
+
+  defp emit_cold_retry_exhausted(
+         %{index: shard_index, shard_data_path: shard_data_path},
+         {_from, key, :meta, _exp, fid, off, vsize},
+         operation,
+         reason
+       )
+       when is_binary(shard_data_path) and is_integer(fid) and fid >= 0 do
+    emit_cold_retry_exhausted_for_location(
+      shard_index,
+      shard_data_path,
+      key,
+      fid,
+      off,
+      vsize,
+      operation,
+      reason
+    )
+  end
+
+  defp emit_cold_retry_exhausted(_state, _pending_entry, _operation, _reason), do: :ok
+
+  defp emit_cold_retry_exhausted_for_location(
+         shard_index,
+         shard_data_path,
+         key,
+         fid,
+         off,
+         vsize,
+         operation,
+         reason
+       ) do
+    path = ShardETS.file_path(shard_data_path, fid)
+
+    :telemetry.execute(
+      [:ferricstore, :store, :cold_read_retry_exhausted],
+      %{count: 1, attempts: @cold_read_compaction_retry_attempts},
+      %{
+        source: :shard,
+        operation: operation,
+        shard_index: shard_index,
+        redis_key_hash: :erlang.phash2(key),
+        path: path,
+        file_id: fid,
+        offset: off,
+        value_size: vsize,
+        reason: reason
+      }
+    )
+  rescue
+    _ -> :ok
+  end
 
   defp resubmit_cold_read(state, {from, key, _exp, fid, off, _vsize} = pending_entry) do
     path = ShardETS.file_path(state.shard_data_path, fid)
