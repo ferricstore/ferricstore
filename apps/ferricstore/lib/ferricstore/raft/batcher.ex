@@ -187,7 +187,12 @@ defmodule Ferricstore.Raft.Batcher do
     # Replies pending local apply: list of {ra_index, kind, froms, result}
     # waiting for `last_local_applied >= ra_index`. Drained in order on each
     # `:locally_applied` message.
-    local_apply_waiters: []
+    local_apply_waiters: [],
+    # Highest async Ra index whose leader-applied event has arrived but that
+    # this node may not have locally applied yet. Async callers are not blocked
+    # on this, but flush/shutdown barriers must wait so local state-machine
+    # side effects are caught up before reporting the shard drained.
+    async_local_apply_index: 0
   ]
 
   # ---------------------------------------------------------------------------
@@ -604,7 +609,7 @@ defmodule Ferricstore.Raft.Batcher do
 
     # Reply only after in-flight commands have applied through Ra and the
     # local state machine has caught up to those Ra indexes.
-    if map_size(new_state.pending) == 0 and new_state.local_apply_waiters == [] do
+    if flush_drained?(new_state) do
       {:reply, :ok, new_state}
     else
       {:noreply, %{new_state | flush_waiters: [from | new_state.flush_waiters]}}
@@ -678,7 +683,14 @@ defmodule Ferricstore.Raft.Batcher do
 
     Enum.each(state.flush_waiters, &GenServer.reply(&1, :ok))
 
-    {:reply, :ok, %{state | pending: %{}, flush_waiters: [], local_apply_waiters: []}}
+    {:reply, :ok,
+     %{
+       state
+       | pending: %{},
+         flush_waiters: [],
+         local_apply_waiters: [],
+         async_local_apply_index: state.last_local_applied
+     }}
   end
 
   @impl true
@@ -756,10 +768,10 @@ defmodule Ferricstore.Raft.Batcher do
 
           # Async entries: no callers to reply to. Just track and clear.
           {{_froms, :async_no_reply}, new_pending} ->
-            %{acc | pending: new_pending}
+            track_async_local_apply(%{acc | pending: new_pending}, ra_index)
 
           {{_froms, :async_no_reply, _batch, _retry, _mono}, new_pending} ->
-            %{acc | pending: new_pending}
+            track_async_local_apply(%{acc | pending: new_pending}, ra_index)
 
           {{froms, :single, _mono}, new_pending} ->
             acc2 = %{acc | pending: new_pending}
@@ -915,6 +927,12 @@ defmodule Ferricstore.Raft.Batcher do
     waiter = {ra_index, kind, froms, result}
     %{state | local_apply_waiters: [waiter | state.local_apply_waiters]}
   end
+
+  defp track_async_local_apply(state, ra_index) when is_integer(ra_index) and ra_index > 0 do
+    %{state | async_local_apply_index: max(state.async_local_apply_index, ra_index)}
+  end
+
+  defp track_async_local_apply(state, _ra_index), do: state
 
   # When the caller is on a different node, it was forwarded by
   # Router.forward_to_leader. Send the result wrapped with the ra_index so
@@ -1514,15 +1532,22 @@ defmodule Ferricstore.Raft.Batcher do
   # are all applied AND the local state machine has caught up to all their
   # indices (no entries left in `local_apply_waiters`).
   @spec maybe_reply_flush_waiters(%__MODULE__{}) :: %__MODULE__{}
-  defp maybe_reply_flush_waiters(
-         %{pending: pending, flush_waiters: waiters, local_apply_waiters: lwaiters} = state
-       ) do
-    if map_size(pending) == 0 and lwaiters == [] and waiters != [] do
+  defp maybe_reply_flush_waiters(%{flush_waiters: waiters} = state) do
+    if flush_drained?(state) and waiters != [] do
       Enum.each(waiters, fn from -> GenServer.reply(from, :ok) end)
       %{state | flush_waiters: []}
     else
       state
     end
+  end
+
+  defp flush_drained?(%{
+         pending: pending,
+         local_apply_waiters: lwaiters,
+         last_local_applied: last_local_applied,
+         async_local_apply_index: async_local_apply_index
+       }) do
+    map_size(pending) == 0 and lwaiters == [] and last_local_applied >= async_local_apply_index
   end
 
   # Drop pending entries whose submission timestamp is older than the TTL.

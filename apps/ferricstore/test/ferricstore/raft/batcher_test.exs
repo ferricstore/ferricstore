@@ -219,6 +219,35 @@ defmodule Ferricstore.Raft.BatcherTest do
       assert :ok = Task.await(flush_task, 1_000)
       assert_receive {^reply_ref, {:remote_applied_at, ^ra_index, :ok}}, 1_000
     end
+
+    test "flush waits for async raft applies to reach the local state machine" do
+      shard_index = 0
+      batcher = Batcher.batcher_name(shard_index)
+      %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
+      ra_index = last_local_applied + 1_000
+      corr = make_ref()
+
+      on_exit(fn ->
+        send(batcher, {:locally_applied, ra_index})
+        Batcher.reset_pending(shard_index)
+      end)
+
+      :ok =
+        Batcher.__inject_async_pending__(
+          shard_index,
+          corr,
+          [{:put, "batcher_async_flush_barrier", "v", 0}],
+          0
+        )
+
+      send(batcher, {:ra_event, :leader, {:applied, [{corr, {:applied_at, ra_index, :ok}}]}})
+
+      flush_task = Task.async(fn -> Batcher.flush(shard_index) end)
+      refute Task.yield(flush_task, 50)
+
+      send(batcher, {:locally_applied, ra_index})
+      assert :ok = Task.await(flush_task, 1_000)
+    end
   end
 
   # ---------------------------------------------------------------------------
