@@ -26,6 +26,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     Cluster,
     Cuckoo,
     Expiry,
+    Flow,
     Generic,
     Geo,
     Hash,
@@ -475,17 +476,31 @@ defmodule Ferricstore.Commands.Dispatcher do
       when tag in ~w(cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a,
       do: Native.handle_ast(ast, store)
 
+  def dispatch_ast({tag, _args} = ast, store)
+      when tag in ~w(flow_create flow_get flow_claim_due flow_complete flow_transition flow_retry flow_fail flow_cancel flow_list flow_info flow_stuck flow_history)a,
+      do: Flow.handle_ast(ast, store)
+
   def dispatch_ast({tag, _, _} = ast, store)
       when tag in ~w(unlock ferricstore_key_info)a,
       do: Native.handle_ast(ast, store)
+
+  def dispatch_ast({tag, _, _} = ast, store)
+      when tag in ~w(flow_create flow_get flow_claim_due flow_cancel flow_list flow_info flow_stuck flow_history)a,
+      do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)
       when tag in ~w(lock extend fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a,
       do: Native.handle_ast(ast, store)
 
+  def dispatch_ast({tag, _, _, _} = ast, store)
+      when tag in ~w(flow_complete flow_retry flow_fail)a,
+      do: Flow.handle_ast(ast, store)
+
   def dispatch_ast({tag, _, _, _, _} = ast, store)
       when tag in ~w(cas ratelimit_add)a,
       do: Native.handle_ast(ast, store)
+
+  def dispatch_ast({:flow_transition, _, _, _, _} = ast, store), do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _args} = ast, store)
       when tag in ~w(cluster_health cluster_stats cluster_keyslot cluster_slots cluster_status cluster_join cluster_leave cluster_failover cluster_promote cluster_demote cluster_role ferricstore_hotness)a,
