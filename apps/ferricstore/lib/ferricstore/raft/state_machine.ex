@@ -1041,6 +1041,11 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_locations(state, file_id, batch, locations)
   end
 
+  @doc false
+  def __compensate_cross_shard_partial_writes_for_test__(state, successful_groups, originals) do
+    compensate_cross_shard_partial_writes(state, successful_groups, originals)
+  end
+
   # ---------------------------------------------------------------------------
   # Private: release_cursor compaction
   # ---------------------------------------------------------------------------
@@ -1066,6 +1071,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp maybe_release_cursor(%{index: ra_index}, old_count, state, result) do
     state = consume_pending_state(state)
     checkpoint_clean_before_write? = Process.delete(:sm_checkpoint_clean_before_write) == true
+    release_cursor_blocked? = Process.delete(:sm_release_cursor_blocked) == true
 
     checkpoint_dependencies_clean_before_write? =
       Process.delete(:sm_checkpoint_dependencies_clean_before_write) == true
@@ -1136,22 +1142,28 @@ defmodule Ferricstore.Raft.StateMachine do
           nil
       end
 
-    {state, release_effects} =
-      release_cursor_effects(
-        state,
-        release_index,
-        ra_index,
-        crossed_interval?,
-        checkpoint_effects
-      )
+    if release_cursor_blocked? do
+      {state, wrapped_result, [notify_effect]}
+    else
+      {state, release_effects} =
+        release_cursor_effects(
+          state,
+          release_index,
+          ra_index,
+          crossed_interval?,
+          checkpoint_effects
+        )
 
-    {state, wrapped_result, [notify_effect | release_effects]}
+      {state, wrapped_result, [notify_effect | release_effects]}
+    end
   end
 
   defp maybe_release_cursor(_meta, _old_count, state, result) do
     state = consume_pending_state(state)
+    Process.delete(:sm_checkpoint_clean_before_write)
     Process.delete(:sm_checkpoint_dependencies_clean_before_write)
     Process.delete(:sm_checkpoint_dirty_indices)
+    Process.delete(:sm_release_cursor_blocked)
 
     # No meta (e.g. cross-shard sub-apply) — pass through untouched.
     {state, result}
@@ -1206,6 +1218,10 @@ defmodule Ferricstore.Raft.StateMachine do
          checkpoint_effects
        ),
        do: {state, checkpoint_effects}
+
+  defp block_release_cursor_for_apply do
+    Process.put(:sm_release_cursor_blocked, true)
+  end
 
   defp consume_checkpoint_dirty_indices do
     case Process.delete(:sm_checkpoint_dirty_indices) do
@@ -1380,6 +1396,7 @@ defmodule Ferricstore.Raft.StateMachine do
     Process.delete(:sm_checkpoint_clean_before_write)
     Process.delete(:sm_checkpoint_dependencies_clean_before_write)
     Process.delete(:sm_checkpoint_dirty_indices)
+    Process.delete(:sm_release_cursor_blocked)
     :ok
   end
 
@@ -3247,15 +3264,20 @@ defmodule Ferricstore.Raft.StateMachine do
           {result, flushed_state}
 
         {:error, reason, partial_state, successful_groups} ->
-          compensated_state =
-            compensate_cross_shard_partial_writes(
-              partial_state,
-              successful_groups,
-              Process.get(:sm_cross_shard_pending_originals, %{})
-            )
+          case compensate_cross_shard_partial_writes(
+                 partial_state,
+                 successful_groups,
+                 Process.get(:sm_cross_shard_pending_originals, %{})
+               ) do
+            {:ok, compensated_state} ->
+              rollback_cross_shard_pending_writes(state)
+              {:error, reason, compensated_state}
 
-          rollback_cross_shard_pending_writes(state)
-          {:error, reason, compensated_state}
+            {:error, compensation_reason, compensated_state} ->
+              rollback_cross_shard_pending_writes(state)
+              block_release_cursor_for_apply()
+              {:error, {:cross_shard_compensation_failed, compensation_reason}, compensated_state}
+          end
       end
     after
       Process.delete(:sm_cross_shard_pending_writes)
@@ -3343,41 +3365,56 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp compensate_cross_shard_partial_writes(state, successful_groups, originals) do
-    Enum.reduce(successful_groups, state, fn {idx, file_path, file_id, keydir, entries},
-                                             acc_state ->
-      compensation_batch =
-        entries
-        |> Enum.map(&cross_shard_pending_key/1)
-        |> Enum.uniq()
-        |> Enum.flat_map(fn key ->
-          cross_shard_compensation_batch_entry(
-            key,
-            Map.get(originals, {keydir, key}, {idx, :missing}),
-            file_path
-          )
-        end)
+    Enum.reduce_while(successful_groups, {:ok, state}, fn {idx, file_path, file_id, keydir,
+                                                           entries},
+                                                          {:ok, acc_state} ->
+      case cross_shard_compensation_batch(idx, keydir, file_path, entries, originals) do
+        {:ok, []} ->
+          {:cont, {:ok, acc_state}}
 
-      case compensation_batch do
-        [] ->
-          acc_state
-
-        _ ->
+        {:ok, compensation_batch} ->
           case append_pending_batch(file_path, compensation_batch) do
             {:ok, _locations} ->
-              acc_state
-              |> track_cross_shard_append_bytes(
-                idx,
-                file_path,
-                file_id,
-                bitcask_record_bytes(compensation_batch)
-              )
-              |> mark_cross_shard_checkpoint_dirty(idx)
+              compensated_state =
+                acc_state
+                |> track_cross_shard_append_bytes(
+                  idx,
+                  file_path,
+                  file_id,
+                  bitcask_record_bytes(compensation_batch)
+                )
+                |> mark_cross_shard_checkpoint_dirty(idx)
 
-            {:error, _reason} ->
-              mark_cross_shard_checkpoint_dirty(acc_state, idx)
+              {:cont, {:ok, compensated_state}}
+
+            {:error, reason} ->
+              compensated_state = mark_cross_shard_checkpoint_dirty(acc_state, idx)
+              {:halt, {:error, {:compensation_append_failed, reason}, compensated_state}}
           end
+
+        {:error, reason} ->
+          compensated_state = mark_cross_shard_checkpoint_dirty(acc_state, idx)
+          {:halt, {:error, reason, compensated_state}}
       end
     end)
+  end
+
+  defp cross_shard_compensation_batch(idx, keydir, file_path, entries, originals) do
+    entries
+    |> Enum.map(&cross_shard_pending_key/1)
+    |> Enum.uniq()
+    |> Enum.reduce_while({:ok, []}, fn key, {:ok, acc} ->
+      original = Map.get(originals, {keydir, key}, {idx, :missing})
+
+      case cross_shard_compensation_batch_entry(key, original, file_path) do
+        {:ok, batch_entries} -> {:cont, {:ok, [batch_entries | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, batches} -> {:ok, batches |> Enum.reverse() |> List.flatten()}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp cross_shard_pending_key(
@@ -3388,7 +3425,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp cross_shard_pending_key({:delete, _idx, _keydir, _file_path, _file_id, key}), do: key
 
   defp cross_shard_compensation_batch_entry(key, {_idx, :missing}, _file_path) do
-    [{:delete, key, nil}]
+    {:ok, [{:delete, key, nil}]}
   end
 
   defp cross_shard_compensation_batch_entry(
@@ -3398,7 +3435,7 @@ defmodule Ferricstore.Raft.StateMachine do
          _file_path
        )
        when original_key == key and is_binary(value) do
-    [{:put, key, value, expire_at_ms}]
+    {:ok, [{:put, key, value, expire_at_ms}]}
   end
 
   defp cross_shard_compensation_batch_entry(
@@ -3411,12 +3448,19 @@ defmodule Ferricstore.Raft.StateMachine do
     old_path = sm_file_path_from_path(shard_data_path, file_id)
 
     case ColdRead.pread_at(old_path, offset, key, @cold_read_timeout_ms) do
-      {:ok, value} when is_binary(value) -> [{:put, key, value, expire_at_ms}]
-      _ -> []
+      {:ok, value} when is_binary(value) ->
+        {:ok, [{:put, key, value, expire_at_ms}]}
+
+      {:error, reason} ->
+        {:error, {:compensation_read_failed, key, reason}}
+
+      other ->
+        {:error, {:compensation_read_failed, key, other}}
     end
   end
 
-  defp cross_shard_compensation_batch_entry(_key, _original, _file_path), do: []
+  defp cross_shard_compensation_batch_entry(key, original, _file_path),
+    do: {:error, {:compensation_original_mismatch, key, original}}
 
   defp record_cross_shard_pending_original(ctx, key) do
     originals = Process.get(:sm_cross_shard_pending_originals, %{})

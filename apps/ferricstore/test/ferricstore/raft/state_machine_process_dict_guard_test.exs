@@ -24,4 +24,17 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
     assert body =~ "Process.delete(:sm_checkpoint_dirty_indices)",
            "stale dirty checkpoint indices can block or misdirect the next release decision"
   end
+
+  test "no-meta apply path clears shard-clean process state" do
+    source = File.read!(@state_machine_path)
+
+    [_match, body] =
+      Regex.run(
+        ~r/(defp maybe_release_cursor\(_meta, _old_count, state, result\) do.*?)(?=\n  defp release_cursor_effects)/s,
+        source
+      )
+
+    assert body =~ "Process.delete(:sm_checkpoint_clean_before_write)",
+           "cross-shard sub-apply without Ra meta must not leak stale clean-state into the next apply"
+  end
 end
