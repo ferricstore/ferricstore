@@ -1071,6 +1071,11 @@ defmodule Ferricstore.Raft.Batcher do
   # Accumulates write_batch commands into the quorum slot, flushing when
   # count >= max_batch_size or on next message loop (timer 0). Rejects
   # new batches when too many ra commands are already in flight.
+  defp enqueue_write_batch([], _cmd_count, from, state) do
+    reply_from(from, {:ok, []})
+    {:noreply, state}
+  end
+
   defp enqueue_write_batch(cmds, cmd_count, from, state) do
     if map_size(state.pending) >= @max_pending do
       reply_from(from, {:error, :overloaded})

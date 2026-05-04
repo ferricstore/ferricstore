@@ -109,6 +109,24 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
       end
     end
 
+    test "write_batch with no commands replies with an empty result and keeps batcher alive" do
+      shard_index = 0
+      batcher_pid = Process.whereis(Batcher.batcher_name(shard_index))
+      assert is_pid(batcher_pid)
+      monitor_ref = Process.monitor(batcher_pid)
+
+      try do
+        ref = make_ref()
+        :ok = Batcher.write_batch(shard_index, [], {self(), ref})
+
+        assert_receive {^ref, {:ok, []}}, 1_000
+        refute_receive {:DOWN, ^monitor_ref, :process, ^batcher_pid, _reason}, 100
+        assert Process.alive?(batcher_pid)
+      after
+        Process.demonitor(monitor_ref, [:flush])
+      end
+    end
+
     test "immediate Ra pipeline failure replies and does not leak pending" do
       k = ukey("pipeline_fail")
       shard_index = Router.shard_for(ctx(), k)
