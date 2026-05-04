@@ -8,6 +8,7 @@ defmodule Ferricstore.Flow do
   @max_priority 2
   @default_lease_ms 30_000
   @default_limit 1
+  @max_ref_size 4_096
 
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
     started = flow_start_time()
@@ -18,6 +19,7 @@ defmodule Ferricstore.Flow do
            {:ok, type} <- required_binary(opts, :type),
            {:ok, state} <- optional_binary(opts, :state, @default_state),
            {:ok, payload_ref} <- optional_binary_or_nil(opts, :payload_ref, nil),
+           :ok <- validate_ref_size(:payload_ref, payload_ref),
            {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
            {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
            {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
@@ -100,7 +102,8 @@ defmodule Ferricstore.Flow do
            :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
            {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
            {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-           {:ok, result_ref} <- optional_binary_or_nil(opts, :result_ref, nil) do
+           {:ok, result_ref} <- optional_binary_or_nil(opts, :result_ref, nil),
+           :ok <- validate_ref_size(:result_ref, result_ref) do
         Router.flow_complete(ctx, %{
           id: id,
           lease_token: lease_token,
@@ -164,7 +167,8 @@ defmodule Ferricstore.Flow do
            :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
            {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
            {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
-           {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil) do
+           {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil),
+           :ok <- validate_ref_size(:error_ref, error_ref) do
         Router.flow_retry(ctx, %{
           id: id,
           lease_token: lease_token,
@@ -192,7 +196,8 @@ defmodule Ferricstore.Flow do
            :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
            {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
            {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-           {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil) do
+           {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil),
+           :ok <- validate_ref_size(:error_ref, error_ref) do
         Router.flow_fail(ctx, %{
           id: id,
           lease_token: lease_token,
@@ -219,7 +224,8 @@ defmodule Ferricstore.Flow do
            :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
            {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
            {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-           {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil) do
+           {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
+           :ok <- validate_ref_size(:reason_ref, reason_ref) do
         Router.flow_cancel(ctx, %{
           id: id,
           lease_token: lease_token,
@@ -245,6 +251,7 @@ defmodule Ferricstore.Flow do
            {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms),
            {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
            {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
+           :ok <- validate_ref_size(:reason_ref, reason_ref),
            {:ok, partition_key} <- optional_partition_key(opts),
            :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
            :ok <- validate_key_size(__MODULE__.Keys.history_key(id, partition_key)) do
@@ -480,6 +487,16 @@ defmodule Ferricstore.Flow do
       nil -> {:ok, nil}
       value when is_binary(value) -> {:ok, value}
       _ -> {:error, "ERR flow #{key} must be a string"}
+    end
+  end
+
+  defp validate_ref_size(_key, nil), do: :ok
+
+  defp validate_ref_size(key, value) when is_binary(value) do
+    if byte_size(value) <= @max_ref_size do
+      :ok
+    else
+      {:error, "ERR flow #{key} too large (max #{@max_ref_size} bytes)"}
     end
   end
 

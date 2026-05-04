@@ -167,6 +167,7 @@ mod atoms {
 
 const MAX_ARRAY_COUNT: i64 = 1_048_576;
 const MAX_RESP_NESTING_DEPTH: usize = 128;
+const FLOW_MAX_REF_SIZE: usize = 4_096;
 
 // =========================================================================
 // Pure parsing layer — no Env/Term, fully testable.
@@ -5328,6 +5329,7 @@ fn flow_has_option(arg_bytes: &[&[u8]], start: usize, name: &[u8]) -> bool {
 #[derive(Clone, Copy)]
 enum FlowOptType<'a> {
     Binary,
+    Ref(&'a [u8]),
     NonNegative,
     Positive(&'a [u8]),
     Partition,
@@ -5347,7 +5349,11 @@ fn flow_create_option<'a>(
         &[
             (b"TYPE", "type", FlowOptType::Binary),
             (b"STATE", "state", FlowOptType::Binary),
-            (b"PAYLOAD_REF", "payload_ref", FlowOptType::Binary),
+            (
+                b"PAYLOAD_REF",
+                "payload_ref",
+                FlowOptType::Ref(b"payload_ref"),
+            ),
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
@@ -5398,7 +5404,7 @@ fn flow_terminal_option<'a>(
         idx,
         &[
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
-            (b"RESULT_REF", "result_ref", FlowOptType::Binary),
+            (b"RESULT_REF", "result_ref", FlowOptType::Ref(b"result_ref")),
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
@@ -5442,7 +5448,7 @@ fn flow_retry_option<'a>(
         &[
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
-            (b"ERROR_REF", "error_ref", FlowOptType::Binary),
+            (b"ERROR_REF", "error_ref", FlowOptType::Ref(b"error_ref")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -5462,7 +5468,7 @@ fn flow_fail_option<'a>(
         idx,
         &[
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
-            (b"ERROR_REF", "error_ref", FlowOptType::Binary),
+            (b"ERROR_REF", "error_ref", FlowOptType::Ref(b"error_ref")),
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
@@ -5484,7 +5490,7 @@ fn flow_cancel_option<'a>(
         &[
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
             (b"LEASE_TOKEN", "lease_token", FlowOptType::Binary),
-            (b"REASON_REF", "reason_ref", FlowOptType::Binary),
+            (b"REASON_REF", "reason_ref", FlowOptType::Ref(b"reason_ref")),
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
@@ -5507,7 +5513,7 @@ fn flow_rewind_option<'a>(
             (b"TO_EVENT", "to_event", FlowOptType::Binary),
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"EXPECT_STATE", "expect_state", FlowOptType::Binary),
-            (b"REASON_REF", "reason_ref", FlowOptType::Binary),
+            (b"REASON_REF", "reason_ref", FlowOptType::Ref(b"reason_ref")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -5612,6 +5618,15 @@ fn flow_option_value<'a>(
 
     match opt_type {
         FlowOptType::Binary => Ok(Some((key_atom, value_term).encode(env))),
+        FlowOptType::Ref(_label) if value_bytes.len() <= FLOW_MAX_REF_SIZE => {
+            Ok(Some((key_atom, value_term).encode(env)))
+        }
+        FlowOptType::Ref(label) => {
+            let mut msg = b"ERR flow ".to_vec();
+            msg.extend_from_slice(label);
+            msg.extend_from_slice(b" too large (max 4096 bytes)");
+            Err(generic_ast_error(env, &msg))
+        }
         FlowOptType::Partition if ascii_eq_ignore_case(value_bytes, b"GLOBAL") => Ok(None),
         FlowOptType::Partition => Ok(Some((key_atom, value_term).encode(env))),
         FlowOptType::NonNegative => match parse_int_bytes(value_bytes) {

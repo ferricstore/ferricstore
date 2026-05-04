@@ -234,6 +234,23 @@ defmodule Ferricstore.FlowTest do
 
     assert {:error, "ERR key too large" <> _} =
              FerricStore.flow_create(large_id, type: "checkout")
+
+    huge_ref = String.duplicate("p", 4_097)
+
+    assert {:error, "ERR flow payload_ref too large" <> _} =
+             FerricStore.flow_create("huge-payload-ref", type: "checkout", payload_ref: huge_ref)
+
+    assert {:error, "ERR flow result_ref too large" <> _} =
+             FerricStore.flow_complete("flow", "token", fencing_token: 0, result_ref: huge_ref)
+
+    assert {:error, "ERR flow error_ref too large" <> _} =
+             FerricStore.flow_retry("flow", "token", fencing_token: 0, error_ref: huge_ref)
+
+    assert {:error, "ERR flow reason_ref too large" <> _} =
+             FerricStore.flow_cancel("flow", fencing_token: 0, reason_ref: huge_ref)
+
+    assert {:error, "ERR flow reason_ref too large" <> _} =
+             FerricStore.flow_rewind("flow", to_event: "1-1", reason_ref: huge_ref)
   end
 
   test "flow_claim_due atomically leases due flows and removes them from due set" do

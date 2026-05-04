@@ -1754,10 +1754,15 @@ defmodule FerricstoreServer.Resp.ParserTest do
     end
 
     test "keeps Flow option parse errors inside AST" do
+      huge_ref = String.duplicate("p", 4_097)
+
       assert {:ok,
               [
                 {:command, "FLOW.CREATE", ["f", "TYPE", "t", "PRIORITY", "x"],
                  {:flow_create, "f", {:error, "ERR value is not an integer or out of range"}},
+                 ["f"]},
+                {:command, "FLOW.CREATE", ["f", "TYPE", "t", "PAYLOAD_REF", ^huge_ref],
+                 {:flow_create, "f", {:error, "ERR flow payload_ref too large (max 4096 bytes)"}},
                  ["f"]},
                 {:command, "FLOW.CLAIM_DUE", ["t", "WORKER", "w", "LIMIT", "0"],
                  {:flow_claim_due, "t", {:error, "ERR flow limit must be a positive integer"}},
@@ -1770,6 +1775,7 @@ defmodule FerricstoreServer.Resp.ParserTest do
               ], ""} =
                Parser.parse_commands(
                  "flow.create f TYPE t PRIORITY x\r\n" <>
+                   "flow.create f TYPE t PAYLOAD_REF #{huge_ref}\r\n" <>
                    "flow.claim_due t WORKER w LIMIT 0\r\n" <>
                    "flow.complete f l\r\n" <>
                    "flow.rewind f RUN_AT 1\r\n"
