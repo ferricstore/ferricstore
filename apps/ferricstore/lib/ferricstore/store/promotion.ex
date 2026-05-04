@@ -740,6 +740,11 @@ defmodule Ferricstore.Store.Promotion do
         :ok
 
       {:error, {:timeout, wait_ms}} ->
+        Logger.error(
+          "Promoted compaction latch timeout after #{wait_ms}ms for #{inspect(latch_key)} " <>
+            "on shard #{inspect(shard_index)}"
+        )
+
         raise "compaction latch timeout after #{wait_ms}ms for #{inspect(latch_key)}"
     end
   end

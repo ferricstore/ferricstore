@@ -1,6 +1,8 @@
 defmodule Ferricstore.Store.PromotionLatchTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Ferricstore.Store.Promotion
 
   setup do
@@ -40,17 +42,24 @@ defmodule Ferricstore.Store.PromotionLatchTest do
       nil
     )
 
-    task = Task.async(fn -> Promotion.await_compaction_latch(owner, redis_key) end)
-
     try do
-      assert {:exit, {%RuntimeError{message: message}, _stack}} = Task.yield(task, 500)
-      assert message =~ "compaction latch timeout"
+      log =
+        capture_log(fn ->
+          task = Task.async(fn -> Promotion.await_compaction_latch(owner, redis_key) end)
 
-      assert_receive {:promotion_latch_telemetry, [:ferricstore, :promotion, :compaction_latch],
-                      %{wait_ms: wait_ms}, %{status: :timeout, shard_index: 0}},
-                     1_000
+          assert {:exit, {%RuntimeError{message: message}, _stack}} = Task.yield(task, 500)
+          assert message =~ "compaction latch timeout"
 
-      assert wait_ms >= 5
+          assert_receive {:promotion_latch_telemetry,
+                          [:ferricstore, :promotion, :compaction_latch], %{wait_ms: wait_ms},
+                          %{status: :timeout, shard_index: 0}},
+                         1_000
+
+          assert wait_ms >= 5
+        end)
+
+      assert log =~ "Promoted compaction latch timeout"
+      assert log =~ inspect(latch_key)
     after
       Process.flag(:trap_exit, original_trap_exit)
       :telemetry.detach(handler_id)
