@@ -816,18 +816,29 @@ defmodule Ferricstore.Commands.Server do
                     path = Path.join(shard_dir, f)
 
                     case File.stat(path) do
-                      {:ok, %{size: size}} -> acc + size
-                      _ -> acc
+                      {:ok, %{size: size}} ->
+                        acc + size
+
+                      {:error, reason} ->
+                        emit_info_bitcask_scan_failed(:stat_shard_file, i, path, reason)
+                        acc
                     end
                   end)
 
                 {length(data), length(hints), total}
 
-              {:error, _} ->
+              {:error, reason} ->
+                emit_info_bitcask_scan_failed(:list_shard_dir, i, shard_dir, reason)
                 {0, 0, 0}
             end
           rescue
-            _ -> {0, 0, 0}
+            kind ->
+              emit_info_bitcask_scan_failed(:scan_shard_dir, i, shard_dir, kind)
+              {0, 0, 0}
+          catch
+            kind, reason ->
+              emit_info_bitcask_scan_failed(:scan_shard_dir, i, shard_dir, {kind, reason})
+              {0, 0, 0}
           end
 
         merge_candidates = max(0, data_files - 1)
@@ -955,6 +966,21 @@ defmodule Ferricstore.Commands.Server do
     fields = [{"distinct_prefixes", Integer.to_string(distinct_prefixes)} | prefix_fields]
 
     format_section("Keydir_Analysis", fields)
+  end
+
+  defp emit_info_bitcask_scan_failed(phase, shard_index, path, reason) do
+    :telemetry.execute(
+      [:ferricstore, :commands, :info, :bitcask_scan_failed],
+      %{count: 1},
+      %{
+        phase: phase,
+        shard_index: shard_index,
+        path: path,
+        reason: reason
+      }
+    )
+  rescue
+    _ -> :ok
   end
 
   defp default_instance_ctx do
