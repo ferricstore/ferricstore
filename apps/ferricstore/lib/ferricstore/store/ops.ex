@@ -961,63 +961,91 @@ defmodule Ferricstore.Store.Ops do
 
   # --- Flush ---
 
-  @spec flush(store()) :: :ok
+  @spec flush(store()) :: :ok | {:error, term()}
   def flush(%FerricStore.Instance{} = ctx) do
-    ctx
-    |> Router.keys()
-    |> CompoundKey.user_visible_keys()
-    |> Enum.each(&flush_key(ctx, &1))
-
-    clear_stream_tables()
-    :ok
+    with :ok <- flush_keys(ctx, Router.keys(ctx)) do
+      clear_stream_tables()
+      :ok
+    end
   end
 
   def flush(%LocalTxStore{} = tx) do
-    tx.instance_ctx
-    |> Router.keys()
-    |> CompoundKey.user_visible_keys()
-    |> Enum.each(&flush_key(tx.instance_ctx, &1))
-
-    clear_stream_tables()
-    :ok
+    with :ok <- flush_keys(tx.instance_ctx, Router.keys(tx.instance_ctx)) do
+      clear_stream_tables()
+      :ok
+    end
   end
 
   def flush(store) when is_map(store), do: store.flush.()
+
+  defp flush_keys(store, keys) do
+    keys
+    |> CompoundKey.user_visible_keys()
+    |> Enum.reduce_while(:ok, fn key, :ok ->
+      case flush_key(store, key) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+        other -> {:halt, {:error, {:flush_key_failed, key, other}}}
+      end
+    end)
+  end
 
   defp flush_key(store, key) do
     type_key = CompoundKey.type_key(key)
 
     case compound_get(store, key, type_key) do
       "hash" ->
-        compound_delete_prefix(store, key, CompoundKey.hash_prefix(key))
-        compound_delete(store, key, type_key)
+        run_flush_steps(key, [
+          fn -> compound_delete_prefix(store, key, CompoundKey.hash_prefix(key)) end,
+          fn -> compound_delete(store, key, type_key) end
+        ])
 
       "list" ->
-        compound_delete_prefix(store, key, CompoundKey.list_prefix(key))
-        compound_delete(store, key, CompoundKey.list_meta_key(key))
-        compound_delete(store, key, type_key)
-        delete(store, key)
+        run_flush_steps(key, [
+          fn -> compound_delete_prefix(store, key, CompoundKey.list_prefix(key)) end,
+          fn -> compound_delete(store, key, CompoundKey.list_meta_key(key)) end,
+          fn -> compound_delete(store, key, type_key) end,
+          fn -> delete(store, key) end
+        ])
 
       "set" ->
-        compound_delete_prefix(store, key, CompoundKey.set_prefix(key))
-        compound_delete(store, key, type_key)
+        run_flush_steps(key, [
+          fn -> compound_delete_prefix(store, key, CompoundKey.set_prefix(key)) end,
+          fn -> compound_delete(store, key, type_key) end
+        ])
 
       "zset" ->
-        compound_delete_prefix(store, key, CompoundKey.zset_prefix(key))
-        compound_delete(store, key, type_key)
+        run_flush_steps(key, [
+          fn -> compound_delete_prefix(store, key, CompoundKey.zset_prefix(key)) end,
+          fn -> compound_delete(store, key, type_key) end
+        ])
 
       "stream" ->
-        compound_delete_prefix(store, key, "X:" <> key <> <<0>>)
-        compound_delete(store, key, type_key)
-        delete(store, key)
+        run_flush_steps(key, [
+          fn -> compound_delete_prefix(store, key, "X:" <> key <> <<0>>) end,
+          fn -> compound_delete(store, key, type_key) end,
+          fn -> delete(store, key) end
+        ])
 
       nil ->
         delete(store, key)
 
       _unknown ->
-        compound_delete(store, key, type_key)
-        delete(store, key)
+        run_flush_steps(key, [
+          fn -> compound_delete(store, key, type_key) end,
+          fn -> delete(store, key) end
+        ])
     end
+  end
+
+  defp run_flush_steps(key, steps) do
+    Enum.reduce_while(steps, :ok, fn step, :ok ->
+      case step.() do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+        other -> {:halt, {:error, {:flush_key_failed, key, other}}}
+      end
+    end)
   end
 
   defp clear_stream_tables do

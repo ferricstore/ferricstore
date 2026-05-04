@@ -42,6 +42,12 @@ defmodule Ferricstore.Commands.ServerProbCleanupTest do
     assert Ferricstore.FS.exists?(prob_dir)
   end
 
+  test "FLUSHDB returns store flush errors before cleanup" do
+    store = Map.put(MockStore.make(), :flush, fn -> {:error, :flush_failed} end)
+
+    assert {:error, :flush_failed} = Server.handle("FLUSHDB", [], store)
+  end
+
   test "FLUSHDB surfaces probabilistic directory listing failures", %{prob_dir: prob_dir} do
     Process.delete(:ferricstore_prob_command_fsync_dir_hook)
     File.rm_rf!(prob_dir)

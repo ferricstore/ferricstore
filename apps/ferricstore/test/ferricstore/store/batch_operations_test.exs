@@ -3,7 +3,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.Batcher
-  alias Ferricstore.Store.{CompoundKey, Router}
+  alias Ferricstore.Store.{CompoundKey, DiskPressure, Ops, Router}
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
 
   @ns_async "batch_test_async"
@@ -317,6 +317,25 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
       assert old == Router.get(default_ctx(), key)
       assert old == recovered_value_from_bitcask(default_ctx(), key)
+    end
+  end
+
+  describe "flush" do
+    test "surfaces delete failures instead of reporting success" do
+      ctx = default_ctx()
+      key = "#{@ns_async}:flush_pressure_#{System.unique_integer([:positive])}"
+      idx = Router.shard_for(ctx, key)
+
+      :ok = Router.put(ctx, key, "value", 0)
+      DiskPressure.set(ctx, idx)
+
+      try do
+        assert {:error, "ERR disk pressure on shard " <> _} = Ops.flush(ctx)
+        assert "value" == Router.get(ctx, key)
+      after
+        DiskPressure.clear(ctx, idx)
+        Router.delete(ctx, key)
+      end
     end
   end
 
