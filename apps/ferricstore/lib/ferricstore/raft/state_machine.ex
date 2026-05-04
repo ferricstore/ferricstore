@@ -625,45 +625,31 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   def apply(meta, {:unlock_keys, keys, owner_ref}, state) do
-    {new_state, result} = do_unlock_keys(state, keys, owner_ref)
-    old_count = state.applied_count
-    new_state = %{new_state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_control_with_time(meta, state, fn -> do_unlock_keys(state, keys, owner_ref) end)
   end
 
   def apply(meta, {:cross_shard_intent, owner_ref, intent_map}, state) do
-    {new_state, result} = do_write_intent(state, owner_ref, intent_map)
-    old_count = state.applied_count
-    new_state = %{new_state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_control_with_time(meta, state, fn -> do_write_intent(state, owner_ref, intent_map) end)
   end
 
   def apply(meta, {:delete_intent, owner_ref}, state) do
-    {new_state, result} = do_delete_intent(state, owner_ref)
-    old_count = state.applied_count
-    new_state = %{new_state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_control_with_time(meta, state, fn -> do_delete_intent(state, owner_ref) end)
   end
 
   def apply(meta, {:get_intents}, state) do
-    result = do_get_intents(state)
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_control_with_time(meta, state, fn -> {state, do_get_intents(state)} end)
   end
 
   def apply(meta, {:get_lock_count}, state) do
-    result = map_size(Map.get(state, :cross_shard_locks, %{}))
-    old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, result)
+    apply_control_with_time(meta, state, fn ->
+      {state, map_size(Map.get(state, :cross_shard_locks, %{}))}
+    end)
   end
 
   def apply(meta, {:clear_locks}, state) do
-    new_state = %{state | cross_shard_locks: %{}, cross_shard_intents: %{}}
-    old_count = state.applied_count
-    new_state = %{new_state | applied_count: old_count + 1}
-    maybe_release_cursor(meta, old_count, new_state, :ok)
+    apply_control_with_time(meta, state, fn ->
+      {%{state | cross_shard_locks: %{}, cross_shard_intents: %{}}, :ok}
+    end)
   end
 
   def apply(meta, {:locked_put, key, value, expire_at_ms, owner_ref}, state) do
@@ -1439,6 +1425,15 @@ defmodule Ferricstore.Raft.StateMachine do
     with_apply_time(meta, fn ->
       result = with_pending_writes(state, fun)
       bump_applied(meta, state, result)
+    end)
+  end
+
+  defp apply_control_with_time(meta, state, fun) do
+    with_apply_time(meta, fn ->
+      {new_state, result} = fun.()
+      old_count = state.applied_count
+      new_state = %{new_state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
     end)
   end
 

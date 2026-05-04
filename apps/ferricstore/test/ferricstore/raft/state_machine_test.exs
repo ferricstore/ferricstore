@@ -2839,6 +2839,35 @@ defmodule Ferricstore.Raft.StateMachineTest do
       end
     end
 
+    test "cross-shard control apply does not inherit stale pending state", %{
+      store: _store,
+      ets: ets
+    } do
+      state = init_state_for_release_cursor(ets)
+
+      stale_state = %{
+        state
+        | active_file_id: 99,
+          active_file_path: Path.join(state.shard_data_path, "00099.log"),
+          active_file_size: 12_345,
+          file_stats: %{99 => %{live_bytes: 1, dead_bytes: 0}}
+      }
+
+      Process.put(:sm_pending_state, stale_state)
+
+      try do
+        assert {new_state, _result, _effects} =
+                 StateMachine.apply(%{index: 1}, {:cross_shard_intent, make_ref(), %{}}, state)
+
+        assert new_state.active_file_id == state.active_file_id
+        assert new_state.active_file_path == state.active_file_path
+        assert new_state.active_file_size == state.active_file_size
+        assert new_state.file_stats == state.file_stats
+      after
+        Process.delete(:sm_pending_state)
+      end
+    end
+
     test "init/1 caches expanded paths for release cursor checkpoint checks", %{
       store: _store,
       ets: ets
