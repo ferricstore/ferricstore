@@ -5179,10 +5179,17 @@ defmodule FerricStore do
   """
   @spec pfmerge(key(), [key()]) :: :ok | {:error, binary()}
   def pfmerge(dest_key, source_keys) when is_list(source_keys) do
-    case HyperLogLog.handle_ast(
-           {:pfmerge, [dest_key | source_keys]},
-           build_string_store(dest_key)
-         ) do
+    ctx = default_ctx()
+
+    result =
+      Router.with_key_latch(ctx, dest_key, fn ->
+        HyperLogLog.handle_ast(
+          {:pfmerge, [dest_key | source_keys]},
+          build_string_store(dest_key)
+        )
+      end)
+
+    case result do
       :ok -> :ok
       {:error, _} = err -> err
     end

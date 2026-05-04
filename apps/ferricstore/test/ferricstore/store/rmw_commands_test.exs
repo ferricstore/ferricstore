@@ -53,15 +53,19 @@ defmodule Ferricstore.Store.RmwCommandsTest do
   end
 
   defp run_concurrent(count, fun) do
+    run_concurrent(count, fn _item -> fun.() end, List.duplicate(:ok, count))
+  end
+
+  defp run_concurrent(count, fun, items) do
     parent = self()
 
     tasks =
-      for _ <- 1..count do
+      for item <- items do
         Task.async(fn ->
           send(parent, :ready)
 
           receive do
-            :go -> fun.()
+            :go -> fun.(item)
           after
             5_000 -> flunk("concurrent task was not released")
           end
@@ -209,6 +213,33 @@ defmodule Ferricstore.Store.RmwCommandsTest do
 
       assert {:ok, card} = FerricStore.pfcount([key])
       assert card >= 90 and card <= 110
+    end
+  end
+
+  describe "concurrent PFMERGE" do
+    test "concurrent merges into the same destination preserve all source sketches" do
+      dest = ukey("pfmerge_dest")
+
+      source_keys =
+        for source_idx <- 1..20 do
+          source = ukey("pfmerge_src_#{source_idx}")
+          elements = for elem_idx <- 1..100, do: "s#{source_idx}:#{elem_idx}"
+          assert {:ok, true} = FerricStore.pfadd(source, elements)
+          source
+        end
+
+      results =
+        run_concurrent(
+          length(source_keys),
+          fn source ->
+            FerricStore.pfmerge(dest, [source])
+          end,
+          source_keys
+        )
+
+      assert Enum.all?(results, &(&1 == :ok))
+      assert {:ok, card} = FerricStore.pfcount([dest])
+      assert card >= 1_800 and card <= 2_200, "expected cardinality ~2000, got #{card}"
     end
   end
 
