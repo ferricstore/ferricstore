@@ -360,7 +360,8 @@ defmodule Ferricstore.Raft.Batcher do
   dominate command latency. Use it only for commands whose caller explicitly
   accepts async durability.
   """
-  @spec async_enqueue_ordered(non_neg_integer(), command()) :: :ok | {:error, :overloaded}
+  @spec async_enqueue_ordered(non_neg_integer(), command()) ::
+          :ok | {:error, :overloaded | {:ra_target_down, term()}}
   def async_enqueue_ordered(shard_index, inner_command) do
     GenServer.call(batcher_name(shard_index), {:async_enqueue_ordered, inner_command}, 5_000)
   end
@@ -559,12 +560,19 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   def handle_call({:async_enqueue_ordered, command}, _from, state) do
-    if pending_full?(state) do
-      emit_async_submit_overloaded(state)
-      {:reply, {:error, :overloaded}, state}
-    else
-      {:noreply, new_state} = enqueue_async_submit_under_capacity(command, state)
-      {:reply, :ok, new_state}
+    cond do
+      pending_full?(state) ->
+        emit_async_submit_overloaded(state)
+        {:reply, {:error, :overloaded}, state}
+
+      not local_pipeline_target_alive?(state.shard_id) ->
+        error = {:error, {:ra_target_down, state.shard_id}}
+        emit_async_submit_failed(state, 1, error)
+        {:reply, error, state}
+
+      true ->
+        {:noreply, new_state} = enqueue_async_submit_under_capacity(command, state)
+        {:reply, :ok, new_state}
     end
   end
 
@@ -1459,6 +1467,18 @@ defmodule Ferricstore.Raft.Batcher do
 
     Logger.warning(
       "Batcher shard=#{state.shard_index}: async command not enqueued because pending is full"
+    )
+  end
+
+  defp emit_async_submit_failed(state, batch_size, reason) do
+    :telemetry.execute(
+      [:ferricstore, :batcher, :async_dropped],
+      %{batch_size: batch_size},
+      %{shard_index: state.shard_index, reason: reason}
+    )
+
+    Logger.warning(
+      "Batcher shard=#{state.shard_index}: async command not enqueued because Raft target is unavailable: #{inspect(reason)}"
     )
   end
 

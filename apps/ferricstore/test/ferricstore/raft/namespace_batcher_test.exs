@@ -313,6 +313,29 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
       assert Process.whereis(name) == pid
     end
+
+    test "ordered async enqueue rejects known-down local Ra targets before reporting success" do
+      shard = 100_000 + :rand.uniform(9_999)
+      name = Batcher.batcher_name(shard)
+
+      {:ok, pid} = Batcher.start_link(shard_id: :missing_async_enqueue_target, shard_index: shard)
+
+      on_exit(fn ->
+        try do
+          if Process.alive?(pid), do: GenServer.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
+
+      assert {:error, {:ra_target_down, :missing_async_enqueue_target}} =
+               Batcher.async_enqueue_ordered(
+                 shard,
+                 {:put, pkey("ordered_async", "enqueue_down"), "v", 0}
+               )
+
+      assert Process.whereis(name) == pid
+    end
   end
 
   # ---------------------------------------------------------------------------
