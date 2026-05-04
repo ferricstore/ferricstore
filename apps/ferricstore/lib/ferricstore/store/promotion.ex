@@ -743,12 +743,7 @@ defmodule Ferricstore.Store.Promotion do
   defp list_log_files(dir) do
     case Ferricstore.FS.ls(dir) do
       {:ok, files} ->
-        # Delete leftover compaction temp files (same as shared shard C2 fix)
-        Enum.each(files, fn name ->
-          if String.starts_with?(name, "compact_") and String.ends_with?(name, ".log") do
-            _ = Ferricstore.FS.rm(Path.join(dir, name))
-          end
-        end)
+        cleanup_leftover_compaction_temp_files(dir, files)
 
         files
         |> Enum.filter(fn name ->
@@ -763,6 +758,25 @@ defmodule Ferricstore.Store.Promotion do
       _ ->
         []
     end
+  end
+
+  defp cleanup_leftover_compaction_temp_files(dir, files) do
+    Enum.each(files, fn name ->
+      if String.starts_with?(name, "compact_") and String.ends_with?(name, ".log") do
+        path = Path.join(dir, name)
+
+        case Ferricstore.FS.rm(path) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning(
+              "Promotion recovery: failed to remove leftover compact temp file #{name} " <>
+                "at #{path}: #{inspect(reason)}"
+            )
+        end
+      end
+    end)
   end
 
   # -- Off-heap binary byte tracking --

@@ -2,11 +2,12 @@ defmodule Ferricstore.Store.PromotionTest do
   @moduledoc false
 
   use ExUnit.Case, async: false
+  import ExUnit.CaptureLog
 
   alias Ferricstore.Commands.{Hash, List, Set, SortedSet, Strings}
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{CompoundKey, Router}
+  alias Ferricstore.Store.{CompoundKey, Promotion, Router}
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Test.ShardHelpers
 
@@ -50,6 +51,49 @@ defmodule Ferricstore.Store.PromotionTest do
 
       ShardHelpers.wait_shards_alive()
     end)
+  end
+
+  test "promoted recovery reports leftover compact temp cleanup failures" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "promotion_compact_cleanup_fail_#{System.unique_integer([:positive])}"
+      )
+
+    keydir =
+      :ets.new(:"promotion_compact_cleanup_fail_#{System.unique_integer([:positive])}", [
+        :set,
+        :public
+      ])
+
+    on_exit(fn ->
+      try do
+        :ets.delete(keydir)
+      rescue
+        ArgumentError -> :ok
+      end
+
+      File.rm_rf(root)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(root, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(root, 0)
+    redis_key = "recover-temp-cleanup-fail"
+    marker_key = Promotion.marker_key(redis_key)
+    dedicated_path = Promotion.dedicated_path(root, 0, :hash, redis_key)
+
+    File.mkdir_p!(dedicated_path)
+    File.touch!(Path.join(dedicated_path, "00000.log"))
+    File.mkdir!(Path.join(dedicated_path, "compact_1.log"))
+
+    :ets.insert(keydir, {marker_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
+
+    log =
+      capture_log(fn ->
+        assert %{} = Promotion.recover_promoted(shard_path, keydir, root, 0)
+      end)
+
+    assert log =~ "Promotion recovery: failed to remove leftover compact temp file compact_1.log"
   end
 
   # Builds a store map backed by the real Router with promotion-aware
