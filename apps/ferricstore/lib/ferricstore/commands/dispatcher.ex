@@ -507,7 +507,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   def dispatch_ast({:pubsub, args}, _store), do: PubSub.handle_ast({:pubsub, args})
 
   def dispatch_ast({:unknown, cmd, _args}, _store) when is_binary(cmd),
-    do: {:error, "ERR unknown command '#{String.downcase(cmd)}', with args beginning with: "}
+    do: unknown_command(cmd)
 
   def dispatch_ast({tag, args}, _store) when is_atom(tag) and is_list(args) do
     wrong_arity_ast(tag)
@@ -521,6 +521,9 @@ defmodule Ferricstore.Commands.Dispatcher do
       _ -> {:error, "ERR unsupported command AST"}
     end
   end
+
+  defp unknown_command(cmd) when is_binary(cmd),
+    do: {:error, "ERR unknown command '#{String.downcase(cmd)}', with args beginning with: "}
 
   defp dispatch_prob_ast({tag, _} = ast, store)
        when tag in ~w(bf_reserve bf_add bf_madd bf_exists bf_mexists bf_card bf_info)a,
@@ -607,6 +610,8 @@ defmodule Ferricstore.Commands.Dispatcher do
     frame, lets the Rust parser build the AST, then dispatches that AST.
     """
     @spec dispatch(binary(), [binary()], map()) :: term()
+    def dispatch("", _args, _store), do: unknown_command("")
+
     def dispatch(name, args, store) do
       start = System.monotonic_time(:microsecond)
       frame = encode_test_command(name, args)
