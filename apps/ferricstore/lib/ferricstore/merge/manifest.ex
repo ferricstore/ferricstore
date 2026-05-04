@@ -79,7 +79,16 @@ defmodule Ferricstore.Merge.Manifest do
     else
       {:error, reason} = err ->
         # Clean up tmp file on failure.
-        _ = Ferricstore.FS.rm(tmp_path)
+        case Ferricstore.FS.rm(tmp_path) do
+          :ok ->
+            :ok
+
+          {:error, cleanup_reason} ->
+            Logger.warning(
+              "Failed to remove merge manifest tmp file #{tmp_path}: #{inspect(cleanup_reason)}"
+            )
+        end
+
         Logger.error("Failed to write merge manifest at #{manifest_path}: #{inspect(reason)}")
         err
     end

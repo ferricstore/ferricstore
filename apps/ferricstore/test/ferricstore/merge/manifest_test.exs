@@ -1,5 +1,6 @@
 defmodule Ferricstore.Merge.ManifestTest do
   use ExUnit.Case, async: true
+  import ExUnit.CaptureLog
 
   alias Ferricstore.Merge.Manifest
 
@@ -45,6 +46,18 @@ defmodule Ferricstore.Merge.ManifestTest do
       assert {:ok, read_plan} = Manifest.read(dir)
       assert read_plan.started_at >= before
       assert read_plan.started_at <= after_write
+    end
+
+    test "reports tmp cleanup failure when manifest write fails", %{dir: dir} do
+      tmp_path = Path.join(dir, "merge_manifest.bin.tmp")
+      File.mkdir!(tmp_path)
+
+      log =
+        capture_log(fn ->
+          assert {:error, _reason} = Manifest.write(dir, %{shard_index: 0, input_file_ids: [1]})
+        end)
+
+      assert log =~ "Failed to remove merge manifest tmp file"
     end
   end
 
