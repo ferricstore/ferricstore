@@ -353,5 +353,19 @@ defmodule Ferricstore.Merge.ManifestTest do
       assert Manifest.exists?(dir),
              "manifest must remain until cleanup removals are durable"
     end
+
+    test "recover_if_needed keeps manifest when removing partial output fails", %{dir: dir} do
+      :ok = Manifest.write(dir, %{shard_index: 0, input_file_ids: [1, 2]})
+      stale_dir = Path.join(dir, "compact_1.log")
+      File.mkdir!(stale_dir)
+
+      assert {:error, {:remove_partial_failed, ^stale_dir, {_kind, _message}}} =
+               Manifest.recover_if_needed(dir, 0)
+
+      assert File.dir?(stale_dir)
+
+      assert Manifest.exists?(dir),
+             "manifest must remain until all partial output removals succeed"
+    end
   end
 end

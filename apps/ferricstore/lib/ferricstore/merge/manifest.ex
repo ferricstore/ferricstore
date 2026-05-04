@@ -231,14 +231,15 @@ defmodule Ferricstore.Merge.Manifest do
     case Ferricstore.FS.ls(data_dir) do
       {:ok, files} ->
         partials = Enum.filter(files, &partial_output_file?/1)
-        Enum.each(partials, &remove_partial(&1, data_dir))
 
-        if partials == [] do
-          :ok
-        else
-          # One dir fsync after the whole sweep so the removals are durable.
-          # Without this a double-crash can resurrect stale partial files.
-          fsync_dir(data_dir, :cleanup_partial_output)
+        with :ok <- remove_partials(partials, data_dir) do
+          if partials == [] do
+            :ok
+          else
+            # One dir fsync after the whole sweep so the removals are durable.
+            # Without this a double-crash can resurrect stale partial files.
+            fsync_dir(data_dir, :cleanup_partial_output)
+          end
         end
 
       {:error, _reason} ->
@@ -250,9 +251,26 @@ defmodule Ferricstore.Merge.Manifest do
     String.starts_with?(name, "compact_") and String.ends_with?(name, ".log")
   end
 
+  defp remove_partials(partials, data_dir) do
+    Enum.reduce_while(partials, :ok, fn name, :ok ->
+      case remove_partial(name, data_dir) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
   defp remove_partial(name, data_dir) do
+    path = Path.join(data_dir, name)
     Logger.info("Removing partial merge output: #{name}")
-    _ = Ferricstore.FS.rm(Path.join(data_dir, name))
-    :ok
+
+    case Ferricstore.FS.rm(path) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("Failed to remove partial merge output #{path}: #{inspect(reason)}")
+        {:error, {:remove_partial_failed, path, reason}}
+    end
   end
 end
