@@ -594,9 +594,9 @@ defmodule Ferricstore.Raft.Batcher do
     # Flush all pending slots (submits pipelined ra commands)
     new_state = flush_all_slots(state)
 
-    # If there are in-flight pipelined commands, defer the reply until they
-    # all complete. Otherwise reply immediately.
-    if map_size(new_state.pending) == 0 do
+    # Reply only after in-flight commands have applied through Ra and the
+    # local state machine has caught up to those Ra indexes.
+    if map_size(new_state.pending) == 0 and new_state.local_apply_waiters == [] do
       {:reply, :ok, new_state}
     else
       {:noreply, %{new_state | flush_waiters: [from | new_state.flush_waiters]}}
@@ -664,9 +664,13 @@ defmodule Ferricstore.Raft.Batcher do
       _ -> :ok
     end)
 
+    Enum.each(state.local_apply_waiters, fn {_idx, kind, froms, _result} ->
+      do_reply(kind, froms, {:error, :reset}, 0)
+    end)
+
     Enum.each(state.flush_waiters, &GenServer.reply(&1, :ok))
 
-    {:reply, :ok, %{state | pending: %{}, flush_waiters: []}}
+    {:reply, :ok, %{state | pending: %{}, flush_waiters: [], local_apply_waiters: []}}
   end
 
   @impl true
@@ -873,22 +877,11 @@ defmodule Ferricstore.Raft.Batcher do
   defp unwrap_applied({:applied_at, ra_index, real_result}), do: {ra_index, real_result}
   defp unwrap_applied(other), do: {0, other}
 
-  # Reply now if:
-  #   1. ra_index = 0 (legacy WAL entry, no wrap), or
-  #   2. local SM has already applied at this index, or
-  #   3. all callers are LOCAL — the gate exists to prevent read-your-write
-  #      violations across leader redirects (cross-node case). When the
-  #      caller's pid is on this node, the application is already on the same
-  #      node as the local SM; ra's `:applied` event arriving here means the
-  #      local SM has applied (we're the leader) or will apply via normal ra
-  #      replication. Either way the local caller observing :ok will then
-  #      issue subsequent reads to the same node, and the SM applies before
-  #      reads have a chance to interleave (apply runs on the ra dirty thread,
-  #      reply runs on this Batcher process — ordered by ra's mailbox).
-  #
-  # The cross-node case (caller is on a different node) STILL goes through the
-  # waiter queue: the leader's Batcher tags the reply via maybe_wrap_remote,
-  # and the originating node's Router barriers via await_local_applied.
+  # Reply now if the legacy result has no Ra index or if the local state machine
+  # has already applied this index. Otherwise all callers wait for
+  # `{:locally_applied, ra_index}`. That includes local callers: Ra's applied
+  # event is not a sufficient read-your-write barrier for the Router/Shard read
+  # path, which observes this node's ETS.
   defp gate_reply(state, 0, kind, froms, result) do
     do_reply(kind, froms, result, 0)
     state
@@ -901,30 +894,9 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   defp gate_reply(state, ra_index, kind, froms, result) do
-    if all_local_callers?(froms) do
-      do_reply(kind, froms, result, ra_index)
-      state
-    else
-      waiter = {ra_index, kind, froms, result}
-      %{state | local_apply_waiters: [waiter | state.local_apply_waiters]}
-    end
+    waiter = {ra_index, kind, froms, result}
+    %{state | local_apply_waiters: [waiter | state.local_apply_waiters]}
   end
-
-  # All caller pids belong to this node — no read-your-write barrier needed
-  # because the caller will issue subsequent reads on this same node where
-  # the local SM apply happens-before-or-after this reply via the ra mailbox.
-  defp all_local_callers?(froms) do
-    Enum.all?(froms, fn
-      {pid, _ref} when is_pid(pid) -> node(pid) == node()
-      {:remote_origin, origin_node, _from} -> origin_node == node()
-      {:batch_from, from, _count} -> local_from?(from)
-      _ -> false
-    end)
-  end
-
-  defp local_from?({pid, _ref}) when is_pid(pid), do: node(pid) == node()
-  defp local_from?({:remote_origin, origin_node, _from}), do: origin_node == node()
-  defp local_from?(_from), do: false
 
   # When the caller is on a different node, it was forwarded by
   # Router.forward_to_leader. Send the result wrapped with the ra_index so

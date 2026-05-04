@@ -104,7 +104,8 @@ defmodule Ferricstore.Raft.BatcherTest do
         end
 
       # Group keys by shard
-      by_shard = Enum.group_by(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
+      by_shard =
+        Enum.group_by(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
 
       # Pick a shard that has multiple keys to test batching
       {shard_idx, shard_keys} = Enum.max_by(by_shard, fn {_, ks} -> length(ks) end)
@@ -144,6 +145,70 @@ defmodule Ferricstore.Raft.BatcherTest do
       :ok = Batcher.flush(shard_index)
 
       assert "flushed" == Router.get(FerricStore.Instance.get(:default), k)
+    end
+  end
+
+  describe "local apply gating" do
+    test "local quorum caller is not replied before local apply reaches the raft index" do
+      shard_index = 0
+      batcher = Batcher.batcher_name(shard_index)
+      %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
+      ra_index = last_local_applied + 1_000
+      corr = make_ref()
+      reply_ref = make_ref()
+
+      on_exit(fn ->
+        send(batcher, {:locally_applied, ra_index})
+        Batcher.reset_pending(shard_index)
+      end)
+
+      :ok =
+        Batcher.__inject_quorum_pending_at__(
+          shard_index,
+          corr,
+          [{self(), reply_ref}],
+          :single,
+          System.monotonic_time()
+        )
+
+      send(batcher, {:ra_event, :leader, {:applied, [{corr, {:applied_at, ra_index, :ok}}]}})
+
+      refute_receive {^reply_ref, :ok}, 50
+
+      send(batcher, {:locally_applied, ra_index})
+      assert_receive {^reply_ref, :ok}, 1_000
+    end
+
+    test "flush waits for local apply waiters after raft apply drains pending" do
+      shard_index = 0
+      batcher = Batcher.batcher_name(shard_index)
+      %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
+      ra_index = last_local_applied + 1_000
+      corr = make_ref()
+      reply_ref = make_ref()
+
+      on_exit(fn ->
+        send(batcher, {:locally_applied, ra_index})
+        Batcher.reset_pending(shard_index)
+      end)
+
+      :ok =
+        Batcher.__inject_quorum_pending_at__(
+          shard_index,
+          corr,
+          [{:remote_origin, :remote@nohost, {self(), reply_ref}}],
+          :single,
+          System.monotonic_time()
+        )
+
+      send(batcher, {:ra_event, :leader, {:applied, [{corr, {:applied_at, ra_index, :ok}}]}})
+
+      flush_task = Task.async(fn -> Batcher.flush(shard_index) end)
+      refute Task.yield(flush_task, 50)
+
+      send(batcher, {:locally_applied, ra_index})
+      assert :ok = Task.await(flush_task, 1_000)
+      assert_receive {^reply_ref, {:remote_applied_at, ^ra_index, :ok}}, 1_000
     end
   end
 
