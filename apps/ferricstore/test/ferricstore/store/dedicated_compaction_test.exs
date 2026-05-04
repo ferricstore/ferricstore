@@ -11,7 +11,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Commands.Hash
-  alias Ferricstore.Store.{CompoundKey, Promotion, Router}
+  alias Ferricstore.Store.{CompoundKey, LFU, Promotion, Router}
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Test.ShardHelpers
 
@@ -394,6 +394,36 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       Task.await(task, 5_000)
 
       assert "newer_value" == Hash.handle("HGET", [key, "field_1"], store)
+    end
+
+    test "dedicated compaction aborts when a live cold entry cannot be read" do
+      store = real_store()
+      key = ukey("compact_cold_missing")
+      promote_hash(store, key)
+
+      ctx = FerricStore.Instance.get(:default)
+      shard_idx = Router.shard_for(ctx, key)
+      shard = Router.shard_name(ctx, shard_idx)
+      state = :sys.get_state(shard)
+      dedicated_path = state.promoted_instances[key].path
+      missing_compound_key = CompoundKey.hash_field(key, "missing_cold")
+
+      refute File.exists?(Path.join(dedicated_path, "00099.log"))
+
+      :ets.insert(
+        state.keydir,
+        {missing_compound_key, nil, 0, LFU.initial(), 99, 0, 128}
+      )
+
+      assert log_files(dedicated_path) == ["00000.log"]
+
+      ShardCompound.compact_dedicated(state, key, dedicated_path)
+
+      assert File.exists?(Path.join(dedicated_path, "00000.log")),
+             "old dedicated log must stay until every live cold row was copied"
+
+      refute File.exists?(Path.join(dedicated_path, "00001.log")),
+             "failed compaction must roll back the newly touched target log"
     end
   end
 

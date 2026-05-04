@@ -906,62 +906,102 @@ defmodule Ferricstore.Store.Shard.Compound do
 
       now = HLC.now_ms()
 
-      live_entries = collect_promoted_live_entries(state, dedicated_path, prefix, now)
-      maybe_run_promoted_compaction_after_collect_hook(redis_key, live_entries)
+      case collect_promoted_live_entries(state, dedicated_path, prefix, now) do
+        {:ok, live_entries} ->
+          maybe_run_promoted_compaction_after_collect_hook(redis_key, live_entries)
 
-      if live_entries == [] do
-        # No live promoted members remain. Keep the newly touched empty
-        # active file so future writes have a valid target, and remove old
-        # dedicated logs so accounting does not reset while bytes remain.
-        remove_dedicated_logs_before(dedicated_path, new_fid)
-        _ = NIF.v2_fsync_dir(dedicated_path)
-        {:ok, state}
-      else
-        batch = Enum.map(live_entries, fn {k, v, exp} -> {k, v, exp} end)
-
-        case NIF.v2_append_batch(new_file, batch) do
-          {:ok, results} ->
-            ref = keydir_binary_ref(state)
-
+          compact_promoted_live_entries(
+            state,
+            redis_key,
+            dedicated_path,
+            new_file,
+            old_fid,
+            new_fid,
             live_entries
-            |> Enum.zip(results)
-            |> Enum.each(fn {{key, value, expire_at_ms}, {offset, value_size}} ->
-              value_for_ets = ShardETS.value_for_ets(value, ShardETS.hot_cache_threshold(state))
-              track_binary_insert(ref, state, key, value_for_ets)
+          )
 
-              :ets.insert(
-                state.keydir,
-                {key, value_for_ets, expire_at_ms, LFU.initial(), new_fid, offset, value_size}
-              )
-            end)
+        {:error, reason} ->
+          Logger.error(
+            "Shard #{state.index}: dedicated compaction read failed: #{inspect(reason)}"
+          )
 
-            remove_dedicated_logs_before(dedicated_path, new_fid)
-            _ = NIF.v2_fsync_dir(dedicated_path)
+          _ = Ferricstore.FS.rm(new_file)
+          _ = NIF.v2_fsync_dir(dedicated_path)
+          {:error, state}
+      end
+    end
+  end
 
-            Logger.debug(
-              "Shard #{state.index}: compacted dedicated #{inspect(redis_key)} " <>
-                "(#{length(live_entries)} live entries, fid #{old_fid} -> #{new_fid})"
+  defp compact_promoted_live_entries(
+         state,
+         redis_key,
+         dedicated_path,
+         new_file,
+         old_fid,
+         new_fid,
+         live_entries
+       ) do
+    if live_entries == [] do
+      # No live promoted members remain. Keep the newly touched empty
+      # active file so future writes have a valid target, and remove old
+      # dedicated logs so accounting does not reset while bytes remain.
+      remove_dedicated_logs_before(dedicated_path, new_fid)
+      _ = NIF.v2_fsync_dir(dedicated_path)
+      {:ok, state}
+    else
+      batch = Enum.map(live_entries, fn {k, v, exp} -> {k, v, exp} end)
+
+      case NIF.v2_append_batch(new_file, batch) do
+        {:ok, results} when length(results) == length(live_entries) ->
+          ref = keydir_binary_ref(state)
+
+          live_entries
+          |> Enum.zip(results)
+          |> Enum.each(fn {{key, value, expire_at_ms}, {offset, value_size}} ->
+            value_for_ets = ShardETS.value_for_ets(value, ShardETS.hot_cache_threshold(state))
+            track_binary_insert(ref, state, key, value_for_ets)
+
+            :ets.insert(
+              state.keydir,
+              {key, value_for_ets, expire_at_ms, LFU.initial(), new_fid, offset, value_size}
             )
+          end)
 
-            :telemetry.execute(
-              [:ferricstore, :dedicated, :compaction],
-              %{live_entries: length(live_entries), old_fid: old_fid, new_fid: new_fid},
-              %{shard_index: state.index, redis_key: redis_key}
-            )
+          remove_dedicated_logs_before(dedicated_path, new_fid)
+          _ = NIF.v2_fsync_dir(dedicated_path)
 
-            {:ok, state}
+          Logger.debug(
+            "Shard #{state.index}: compacted dedicated #{inspect(redis_key)} " <>
+              "(#{length(live_entries)} live entries, fid #{old_fid} -> #{new_fid})"
+          )
 
-          {:error, reason} ->
-            Logger.error(
-              "Shard #{state.index}: dedicated compaction write failed: #{inspect(reason)}"
-            )
+          :telemetry.execute(
+            [:ferricstore, :dedicated, :compaction],
+            %{live_entries: length(live_entries), old_fid: old_fid, new_fid: new_fid},
+            %{shard_index: state.index, redis_key: redis_key}
+          )
 
-            # Roll back the `touch!(new_file)` on write error. Fsync
-            # so the rollback survives a subsequent crash.
-            _ = Ferricstore.FS.rm(new_file)
-            _ = NIF.v2_fsync_dir(dedicated_path)
-            {:error, state}
-        end
+          {:ok, state}
+
+        {:ok, results} ->
+          Logger.error(
+            "Shard #{state.index}: dedicated compaction append result mismatch: expected #{length(live_entries)}, got #{length(results)}"
+          )
+
+          _ = Ferricstore.FS.rm(new_file)
+          _ = NIF.v2_fsync_dir(dedicated_path)
+          {:error, state}
+
+        {:error, reason} ->
+          Logger.error(
+            "Shard #{state.index}: dedicated compaction write failed: #{inspect(reason)}"
+          )
+
+          # Roll back the `touch!(new_file)` on write error. Fsync
+          # so the rollback survives a subsequent crash.
+          _ = Ferricstore.FS.rm(new_file)
+          _ = NIF.v2_fsync_dir(dedicated_path)
+          {:error, state}
       end
     end
   end
@@ -1024,25 +1064,27 @@ defmodule Ferricstore.Store.Shard.Compound do
         state.keydir
       )
 
-    cold_values =
-      cold_entries
-      |> Enum.reverse()
-      |> read_promoted_cold_batch()
-      |> List.to_tuple()
+    case read_promoted_cold_batch(Enum.reverse(cold_entries)) do
+      {:ok, cold_values} ->
+        cold_values = List.to_tuple(cold_values)
 
-    Enum.flat_map(tokens, fn
-      {:value, entry} ->
-        [entry]
+        live_entries =
+          Enum.flat_map(tokens, fn
+            {:value, entry} ->
+              [entry]
 
-      {:cold, index} ->
-        case elem(cold_values, index) do
-          nil -> []
-          entry -> [entry]
-        end
-    end)
+            {:cold, index} ->
+              [elem(cold_values, index)]
+          end)
+
+        {:ok, live_entries}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
-  defp read_promoted_cold_batch([]), do: []
+  defp read_promoted_cold_batch([]), do: {:ok, []}
 
   defp read_promoted_cold_batch(entries) do
     locations = Enum.map(entries, fn {key, _exp, file_path, off} -> {file_path, off, key} end)
@@ -1061,11 +1103,26 @@ defmodule Ferricstore.Store.Shard.Compound do
 
     emit_promoted_cold_read_errors(entries, values)
 
-    Enum.zip(entries, values)
-    |> Enum.map(fn
-      {{key, exp, _file_path, _off}, value} when is_binary(value) -> {key, value, exp}
-      {_entry, _value} -> nil
-    end)
+    {live_entries, errors} =
+      Enum.zip(entries, values)
+      |> Enum.reduce({[], []}, fn
+        {{key, exp, _file_path, _off}, value}, {live_entries, errors} when is_binary(value) ->
+          {[{key, value, exp} | live_entries], errors}
+
+        {{key, _exp, file_path, off}, {:error, reason}}, {live_entries, errors} ->
+          {live_entries, [{key, file_path, off, reason} | errors]}
+
+        {{key, _exp, file_path, off}, nil}, {live_entries, errors} ->
+          {live_entries, [{key, file_path, off, :missing_live_cold_entry} | errors]}
+
+        {{key, _exp, file_path, off}, value}, {live_entries, errors} ->
+          {live_entries, [{key, file_path, off, {:unexpected_cold_value, value}} | errors]}
+      end)
+
+    case errors do
+      [] -> {:ok, Enum.reverse(live_entries)}
+      [_ | _] -> {:error, {:cold_read_failed, Enum.reverse(errors)}}
+    end
   end
 
   defp maybe_run_promoted_compaction_after_collect_hook(redis_key, live_entries) do
@@ -1081,6 +1138,9 @@ defmodule Ferricstore.Store.Shard.Compound do
     |> Enum.reduce(%{}, fn
       {{_key, _exp, file_path, _off}, {:error, raw_reason}}, acc ->
         Map.update(acc, {file_path, raw_reason}, 1, &(&1 + 1))
+
+      {{_key, _exp, file_path, _off}, nil}, acc ->
+        Map.update(acc, {file_path, :missing_live_cold_entry}, 1, &(&1 + 1))
 
       {_entry, _value}, acc ->
         acc
