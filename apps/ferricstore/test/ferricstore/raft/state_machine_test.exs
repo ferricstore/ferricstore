@@ -289,6 +289,46 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert {:ok, [{"missing_origin_put", 0, 1, 0, false}]} = NIF.v2_scan_file(active_file_path)
     end
 
+    test "replays origin large PUT over an older cold value", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      key = "origin_large_put"
+      old_value = String.duplicate("o", 70_000)
+      new_value = String.duplicate("n", 70_000)
+
+      {:ok, [{old_offset, _old_record_size}]} =
+        NIF.v2_append_batch(active_file_path, [{key, old_value, 0}])
+
+      :ets.insert(ets, {key, nil, 0, 1, 0, old_offset, byte_size(old_value)})
+
+      {_state2, :ok} =
+        StateMachine.apply(%{}, {:async, node(), {:put, key, new_value, 0}}, state)
+
+      assert [{^key, nil, 0, _lfu, 0, new_offset, 70_000}] = :ets.lookup(ets, key)
+      refute new_offset == old_offset
+      assert {:ok, ^new_value} = NIF.v2_pread_at(active_file_path, new_offset)
+    end
+
+    test "does not duplicate an already-applied origin large PUT", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      key = "origin_large_put_applied"
+      value = String.duplicate("v", 70_000)
+
+      {:ok, [{offset, _record_size}]} = NIF.v2_append_batch(active_file_path, [{key, value, 0}])
+      :ets.insert(ets, {key, nil, 0, 1, 0, offset, byte_size(value)})
+
+      {_state2, :ok} =
+        StateMachine.apply(%{}, {:async, node(), {:put, key, value, 0}}, state)
+
+      assert [{^key, nil, 0, _lfu, 0, ^offset, 70_000}] = :ets.lookup(ets, key)
+      assert {:ok, [{^key, ^offset, 70_000, 0, false}]} = NIF.v2_scan_file(active_file_path)
+    end
+
     test "does not persist a stale origin PUT after local RMW changed the pending ETS value", %{
       state: state,
       ets: ets,

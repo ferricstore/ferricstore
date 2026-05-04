@@ -2897,22 +2897,41 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_origin_async_put(state, key, value, expire_at_ms) do
     expected_value = value_for_ets(value, hot_cache_threshold(state))
+    disk_value = to_disk_binary(value)
 
     case :ets.lookup(state.ets, key) do
       [{^key, ^expected_value, ^expire_at_ms, _lfu, :pending, 0, _vs}]
       when expected_value != nil ->
-        queue_pending_put(key, to_disk_binary(value), expire_at_ms)
+        queue_pending_put(key, disk_value, expire_at_ms)
         :ok
 
       [{^key, ^expected_value, ^expire_at_ms, _lfu, fid, off, vs}]
       when fid != :pending and valid_cold_location(fid, off, vs) ->
-        :ok
+        if origin_cold_put_already_applied?(state, key, fid, off, vs, disk_value) do
+          :ok
+        else
+          apply_single(state, {:put, key, value, expire_at_ms})
+        end
 
       [{^key, _other_value, _other_exp, _lfu, :pending, _off, _vs}] ->
         :ok
 
       _ ->
         apply_single(state, {:put, key, value, expire_at_ms})
+    end
+  end
+
+  defp origin_cold_put_already_applied?(_state, _key, _fid, _off, value_size, disk_value)
+       when value_size != byte_size(disk_value) do
+    false
+  end
+
+  defp origin_cold_put_already_applied?(state, key, fid, off, _value_size, disk_value) do
+    path = sm_file_path(state, fid)
+
+    case read_cold_async(path, off, key) do
+      {:ok, ^disk_value} -> true
+      _ -> false
     end
   end
 
