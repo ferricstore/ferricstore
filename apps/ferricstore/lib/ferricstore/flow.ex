@@ -17,7 +17,8 @@ defmodule Ferricstore.Flow do
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
          {:ok, priority} <- optional_non_neg_integer(opts, :priority, @default_priority),
-         :ok <- validate_flow_keys(id, type, state, priority) do
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_flow_keys(id, type, state, priority, partition_key) do
       attrs = %{
         id: id,
         type: type,
@@ -25,17 +26,20 @@ defmodule Ferricstore.Flow do
         payload_ref: payload_ref,
         run_at_ms: run_at_ms,
         priority: priority,
-        now_ms: now
+        now_ms: now,
+        partition_key: partition_key
       }
 
       Router.flow_create(ctx, attrs)
     end
   end
 
-  def get(ctx, id) when is_binary(id) do
+  def get(ctx, id, opts \\ []) when is_binary(id) and is_list(opts) do
     with :ok <- validate_id(id),
-         :ok <- validate_key_size(__MODULE__.Keys.state_key(id)) do
-      case Router.get(ctx, __MODULE__.Keys.state_key(id)) do
+         :ok <- validate_opts(opts),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)) do
+      case Router.get(ctx, __MODULE__.Keys.state_key(id, partition_key)) do
         nil -> {:ok, nil}
         value when is_binary(value) -> {:ok, decode_record(value)}
       end
@@ -51,7 +55,8 @@ defmodule Ferricstore.Flow do
          {:ok, limit} <- optional_pos_integer(opts, :limit, @default_limit),
          {:ok, priority} <- optional_non_neg_integer(opts, :priority, @default_priority),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-         :ok <- validate_key_size(__MODULE__.Keys.due_key(type, state, priority)) do
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.due_key(type, state, priority, partition_key)) do
       attrs = %{
         type: type,
         state: state,
@@ -59,7 +64,8 @@ defmodule Ferricstore.Flow do
         lease_ms: lease_ms,
         limit: limit,
         priority: priority,
-        now_ms: now
+        now_ms: now,
+        partition_key: partition_key
       }
 
       Router.flow_claim_due(ctx, attrs)
@@ -71,14 +77,16 @@ defmodule Ferricstore.Flow do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
          :ok <- validate_lease_token(lease_token),
-         :ok <- validate_key_size(__MODULE__.Keys.state_key(id)),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
          {:ok, result_ref} <- optional_binary_or_nil(opts, :result_ref, nil) do
       Router.flow_complete(ctx, %{
         id: id,
         lease_token: lease_token,
         result_ref: result_ref,
-        now_ms: now
+        now_ms: now,
+        partition_key: partition_key
       })
     end
   end
@@ -88,7 +96,8 @@ defmodule Ferricstore.Flow do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
          :ok <- validate_lease_token(lease_token),
-         :ok <- validate_key_size(__MODULE__.Keys.state_key(id)),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
          {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil) do
@@ -97,7 +106,8 @@ defmodule Ferricstore.Flow do
         lease_token: lease_token,
         run_at_ms: run_at_ms,
         error_ref: error_ref,
-        now_ms: now
+        now_ms: now,
+        partition_key: partition_key
       })
     end
   end
@@ -123,12 +133,16 @@ defmodule Ferricstore.Flow do
   defp validate_lease_token(_token),
     do: {:error, "ERR flow lease_token must be a non-empty string"}
 
-  defp validate_flow_keys(id, type, state, priority) do
-    with :ok <- validate_key_size(__MODULE__.Keys.state_key(id)),
-         :ok <- validate_key_size(__MODULE__.Keys.history_key(id)),
-         :ok <- validate_key_size(__MODULE__.Keys.due_key(type, state, priority)) do
+  defp validate_flow_keys(id, type, state, priority, partition_key) do
+    with :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+         :ok <- validate_key_size(__MODULE__.Keys.history_key(id, partition_key)),
+         :ok <- validate_key_size(__MODULE__.Keys.due_key(type, state, priority, partition_key)) do
       validate_key_size(
-        __MODULE__.Keys.stream_entry_key(id, "18446744073709551615-18446744073709551615")
+        __MODULE__.Keys.stream_entry_key(
+          id,
+          "18446744073709551615-18446744073709551615",
+          partition_key
+        )
       )
     end
   end
@@ -178,20 +192,47 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp optional_partition_key(opts) do
+    case Keyword.get(opts, :partition_key, nil) do
+      nil -> {:ok, nil}
+      :global -> {:ok, nil}
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, "ERR flow partition_key must be a non-empty string or :global"}
+    end
+  end
+
   defp now_ms, do: System.os_time(:millisecond)
 
   defmodule Keys do
     @moduledoc false
 
-    @tag "{flow}"
+    @global_tag "{flow}"
+    @partition_tag_prefix "{flow:"
 
-    def state_key(id), do: "flow:" <> @tag <> ":state:" <> id
-    def history_key(id), do: "flow:" <> @tag <> ":history:" <> id
-
-    def due_key(type, state, priority) do
-      "flow:" <> @tag <> ":due:" <> type <> ":" <> state <> ":p" <> Integer.to_string(priority)
+    def state_key(id, partition_key \\ nil) do
+      "flow:" <> tag(partition_key) <> ":state:" <> id
     end
 
-    def stream_entry_key(id, event_id), do: "X:" <> history_key(id) <> <<0>> <> event_id
+    def history_key(id, partition_key \\ nil) do
+      "flow:" <> tag(partition_key) <> ":history:" <> id
+    end
+
+    def due_key(type, state, priority, partition_key \\ nil) do
+      "flow:" <>
+        tag(partition_key) <>
+        ":due:" <> type <> ":" <> state <> ":p" <> Integer.to_string(priority)
+    end
+
+    def stream_entry_key(id, event_id, partition_key \\ nil) do
+      "X:" <> history_key(id, partition_key) <> <<0>> <> event_id
+    end
+
+    def tag(nil), do: @global_tag
+    def tag(:global), do: @global_tag
+
+    def tag(partition_key) when is_binary(partition_key) do
+      @partition_tag_prefix <>
+        Base.encode16(:crypto.hash(:sha256, partition_key), case: :lower) <> "}"
+    end
   end
 end

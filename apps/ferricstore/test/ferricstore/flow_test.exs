@@ -15,6 +15,32 @@ defmodule Ferricstore.FlowTest do
 
   defp uid(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"
 
+  defp shard_for(key) do
+    Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), key)
+  end
+
+  defp different_partition_keys do
+    base = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    first =
+      1..64
+      |> Enum.map(&"#{base}:#{&1}")
+      |> Enum.find(fn key ->
+        shard_for(Ferricstore.Flow.Keys.state_key("probe", key)) !=
+          shard_for(Ferricstore.Flow.Keys.state_key("probe", nil))
+      end)
+
+    second =
+      1..64
+      |> Enum.map(&"#{base}:other:#{&1}")
+      |> Enum.find(fn key ->
+        shard_for(Ferricstore.Flow.Keys.state_key("probe", key)) !=
+          shard_for(Ferricstore.Flow.Keys.state_key("probe", first))
+      end)
+
+    {first, second}
+  end
+
   test "flow_create stores state and prevents duplicate ids" do
     id = uid("flow-create")
 
@@ -58,6 +84,12 @@ defmodule Ferricstore.FlowTest do
 
     assert {:error, "ERR flow run_at_ms must be a non-negative integer"} =
              FerricStore.flow_create("bad-run-at", type: "checkout", run_at_ms: -1)
+
+    assert {:error, "ERR flow partition_key must be a non-empty string or :global"} =
+             FerricStore.flow_create("bad-partition", type: "checkout", partition_key: "")
+
+    assert {:error, "ERR flow opts must be a keyword list"} =
+             FerricStore.flow_get("bad-get", ["bad"])
 
     assert {:error, "ERR flow type must be a non-empty string"} =
              FerricStore.flow_claim_due("", worker: "worker-a")
@@ -126,6 +158,77 @@ defmodule Ferricstore.FlowTest do
                limit: 10,
                now_ms: 1_000
              )
+  end
+
+  test "partition_key keeps related flow keys on one shard and can spread partitions" do
+    {partition_a, partition_b} = different_partition_keys()
+    id = uid("flow-partition-keys")
+
+    state_a = Ferricstore.Flow.Keys.state_key(id, partition_a)
+    history_a = Ferricstore.Flow.Keys.history_key(id, partition_a)
+    due_a = Ferricstore.Flow.Keys.due_key("email", "queued", 0, partition_a)
+    state_b = Ferricstore.Flow.Keys.state_key(id, partition_b)
+
+    assert shard_for(state_a) == shard_for(history_a)
+    assert shard_for(state_a) == shard_for(due_a)
+    assert shard_for(state_a) != shard_for(state_b)
+  end
+
+  test "partition_key scopes claim, complete, retry, get, and history" do
+    partition = uid("tenant")
+    id = uid("flow-partition")
+
+    assert {:ok, flow} =
+             FerricStore.flow_create(id,
+               type: "email",
+               partition_key: partition,
+               state: "queued",
+               run_at_ms: 1_000,
+               now_ms: 999
+             )
+
+    assert flow.partition_key == partition
+
+    assert {:ok, nil} = FerricStore.flow_get(id)
+    assert {:ok, fetched} = FerricStore.flow_get(id, partition_key: partition)
+    assert fetched.id == id
+
+    assert {:ok, []} =
+             FerricStore.flow_claim_due("email",
+               state: "queued",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("email",
+               partition_key: partition,
+               state: "queued",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert claimed.partition_key == partition
+
+    assert {:error, "ERR flow not found"} =
+             FerricStore.flow_complete(id, claimed.lease_token)
+
+    assert {:ok, completed} =
+             FerricStore.flow_complete(id, claimed.lease_token, partition_key: partition)
+
+    assert completed.state == "completed"
+
+    assert {:ok, events} = FerricStore.flow_history(id, partition_key: partition)
+
+    assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed",
+             "completed"
+           ]
   end
 
   test "flow_complete enforces lease token guard and writes terminal state" do

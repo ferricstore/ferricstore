@@ -3111,7 +3111,7 @@ defmodule Ferricstore.Store.Router do
 
   @doc false
   def flow_create(ctx, %{id: id} = attrs) when is_binary(id) do
-    key = Ferricstore.Flow.Keys.state_key(id)
+    key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
 
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
@@ -3124,7 +3124,7 @@ defmodule Ferricstore.Store.Router do
   @doc false
   def flow_claim_due(ctx, %{type: type, state: state, priority: priority} = attrs)
       when is_binary(type) and is_binary(state) and is_integer(priority) do
-    key = Ferricstore.Flow.Keys.due_key(type, state, priority)
+    key = Ferricstore.Flow.Keys.due_key(type, state, priority, Map.get(attrs, :partition_key))
 
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
@@ -3136,7 +3136,7 @@ defmodule Ferricstore.Store.Router do
 
   @doc false
   def flow_complete(ctx, %{id: id} = attrs) when is_binary(id) do
-    key = Ferricstore.Flow.Keys.state_key(id)
+    key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
 
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
@@ -3148,7 +3148,7 @@ defmodule Ferricstore.Store.Router do
 
   @doc false
   def flow_retry(ctx, %{id: id} = attrs) when is_binary(id) do
-    key = Ferricstore.Flow.Keys.state_key(id)
+    key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
 
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}

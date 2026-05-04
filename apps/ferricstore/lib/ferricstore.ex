@@ -370,10 +370,17 @@ defmodule FerricStore do
   def flow_create(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc "Returns the latest Flow state record for `id`."
-  @spec flow_get(binary()) :: {:ok, map() | nil} | {:error, binary()}
-  def flow_get(id) when is_binary(id), do: Ferricstore.Flow.get(default_ctx(), id)
+  @spec flow_get(binary(), keyword()) :: {:ok, map() | nil} | {:error, binary()}
+  def flow_get(id, opts \\ [])
 
-  def flow_get(_id), do: {:error, "ERR flow id must be a non-empty string"}
+  def flow_get(id, opts) when is_binary(id) and is_list(opts) do
+    Ferricstore.Flow.get(default_ctx(), id, opts)
+  end
+
+  def flow_get(id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_get(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
   Claims due Flow records for a type.
@@ -429,10 +436,10 @@ defmodule FerricStore do
   def flow_history(id, opts \\ [])
 
   def flow_history(id, opts) when is_binary(id) and is_list(opts) do
-    history_key = Ferricstore.Flow.Keys.history_key(id)
-
     with :ok <- flow_validate_opts(opts),
          :ok <- flow_validate_id(id),
+         {:ok, partition_key} <- flow_partition_key(opts),
+         history_key = Ferricstore.Flow.Keys.history_key(id, partition_key),
          :ok <- flow_validate_key_size(history_key),
          {:ok, count} <- flow_history_count(opts) do
       case xrange(history_key, "-", "+", count: count) do
@@ -487,6 +494,15 @@ defmodule FerricStore do
     case Keyword.get(opts, :count, 100) do
       value when is_integer(value) and value > 0 -> {:ok, value}
       _ -> {:error, "ERR flow count must be a positive integer"}
+    end
+  end
+
+  defp flow_partition_key(opts) do
+    case Keyword.get(opts, :partition_key, nil) do
+      nil -> {:ok, nil}
+      :global -> {:ok, nil}
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, "ERR flow partition_key must be a non-empty string or :global"}
     end
   end
 

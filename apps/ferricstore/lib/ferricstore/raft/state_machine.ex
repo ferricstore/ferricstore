@@ -3734,9 +3734,10 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_flow_create(state, %{id: id, type: type, state: flow_state} = attrs) do
-    state_key = FlowKeys.state_key(id)
+    partition_key = Map.get(attrs, :partition_key)
+    state_key = FlowKeys.state_key(id, partition_key)
 
-    case flow_read_record(state, id) do
+    case flow_read_record(state, id, partition_key) do
       nil ->
         now_ms = Map.get(attrs, :now_ms, apply_now_ms())
         run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
@@ -3752,6 +3753,7 @@ defmodule Ferricstore.Raft.StateMachine do
           updated_at_ms: now_ms,
           next_run_at_ms: run_at_ms,
           priority: priority,
+          partition_key: partition_key,
           payload_ref: Map.get(attrs, :payload_ref),
           result_ref: nil,
           error_ref: nil,
@@ -3781,16 +3783,26 @@ defmodule Ferricstore.Raft.StateMachine do
            limit: limit,
            priority: priority,
            now_ms: now_ms
-         }
+         } = attrs
        ) do
-    due_key = FlowKeys.due_key(type, expected_state, priority)
+    partition_key = Map.get(attrs, :partition_key)
+    due_key = FlowKeys.due_key(type, expected_state, priority, partition_key)
     flow_ensure_due_index_ready(state, due_key)
 
     claimed =
       state.zset_score_index_name
       |> ZSetIndex.range_slice(due_key, :neg_inf, {:inclusive, now_ms * 1.0}, false, 0, limit)
       |> Enum.reduce([], fn {id, _score}, acc ->
-        case flow_claim_candidate(state, due_key, id, expected_state, worker, lease_ms, now_ms) do
+        case flow_claim_candidate(
+               state,
+               due_key,
+               id,
+               expected_state,
+               worker,
+               lease_ms,
+               now_ms,
+               partition_key
+             ) do
           {:ok, record} -> [record | acc]
           :skip -> acc
         end
@@ -3802,8 +3814,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp do_flow_complete(state, %{id: id, lease_token: lease_token} = attrs) do
     now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
 
-    with {:ok, record} <- flow_require_record(state, id),
+    with {:ok, record} <- flow_require_record(state, id, partition_key),
          :ok <- flow_require_running_lease(record, lease_token) do
       next =
         record
@@ -3819,7 +3832,7 @@ defmodule Ferricstore.Raft.StateMachine do
         })
 
       with :ok <- flow_due_delete(state, record),
-           :ok <- do_put(state, FlowKeys.state_key(id), flow_encode(next), 0),
+           :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
            :ok <- flow_history_put(state, next, "completed", now_ms) do
         {:ok, next}
       end
@@ -3828,8 +3841,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp do_flow_retry(state, %{id: id, lease_token: lease_token, run_at_ms: run_at_ms} = attrs) do
     now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
 
-    with {:ok, record} <- flow_require_record(state, id),
+    with {:ok, record} <- flow_require_record(state, id, partition_key),
          :ok <- flow_require_running_lease(record, lease_token) do
       next =
         record
@@ -3846,7 +3860,7 @@ defmodule Ferricstore.Raft.StateMachine do
         })
 
       with :ok <- flow_due_delete(state, record),
-           :ok <- do_put(state, FlowKeys.state_key(id), flow_encode(next), 0),
+           :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
            :ok <- flow_due_put(state, next),
            :ok <- flow_history_put(state, next, "retry", now_ms) do
         {:ok, next}
@@ -3854,8 +3868,17 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_claim_candidate(state, due_key, id, expected_state, worker, lease_ms, now_ms) do
-    case flow_read_record(state, id) do
+  defp flow_claim_candidate(
+         state,
+         due_key,
+         id,
+         expected_state,
+         worker,
+         lease_ms,
+         now_ms,
+         partition_key
+       ) do
+    case flow_read_record(state, id, partition_key) do
       nil ->
         flow_due_delete_from_key(state, due_key, id)
         :skip
@@ -3880,7 +3903,7 @@ defmodule Ferricstore.Raft.StateMachine do
           })
 
         with :ok <- flow_due_delete_from_key(state, due_key, id),
-             :ok <- do_put(state, FlowKeys.state_key(id), flow_encode(next), 0),
+             :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
              :ok <- flow_due_put(state, next),
              :ok <- flow_history_put(state, next, "claimed", now_ms) do
           {:ok, next}
@@ -3894,8 +3917,8 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_require_record(state, id) do
-    case flow_read_record(state, id) do
+  defp flow_require_record(state, id, partition_key) do
+    case flow_read_record(state, id, partition_key) do
       nil -> {:error, "ERR flow not found"}
       record -> {:ok, record}
     end
@@ -3904,8 +3927,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_require_running_lease(%{state: "running", lease_token: token}, token), do: :ok
   defp flow_require_running_lease(_record, _token), do: {:error, "ERR stale flow lease"}
 
-  defp flow_read_record(state, id) do
-    case ets_lookup(state, FlowKeys.state_key(id)) do
+  defp flow_read_record(state, id, partition_key) do
+    case ets_lookup(state, FlowKeys.state_key(id, partition_key)) do
       {:hit, value, _expire_at_ms} when is_binary(value) ->
         try do
           Flow.decode_record(value)
@@ -3921,7 +3944,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_due_put(state, %{next_run_at_ms: nil}), do: flow_ensure_due_type(state, nil)
 
   defp flow_due_put(state, %{type: type, state: flow_state, priority: priority, id: id} = record) do
-    due_key = FlowKeys.due_key(type, flow_state, priority)
+    partition_key = Map.get(record, :partition_key)
+    due_key = FlowKeys.due_key(type, flow_state, priority, partition_key)
     score_str = Float.to_string(Map.fetch!(record, :next_run_at_ms) * 1.0)
     compound_key = CompoundKey.zset_member(due_key, id)
 
@@ -3931,14 +3955,30 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_due_delete(state, %{type: type, state: flow_state, priority: priority, id: id}) do
-    flow_due_delete_by_values(state, id, type, flow_state, priority)
+  defp flow_due_delete(
+         %{} = state,
+         %{
+           type: type,
+           state: flow_state,
+           priority: priority,
+           id: id
+         } = record
+       ) do
+    flow_due_delete_by_values(
+      state,
+      id,
+      type,
+      flow_state,
+      priority,
+      Map.get(record, :partition_key)
+    )
   end
 
-  defp flow_due_delete_by_values(_state, _id, nil, _flow_state, _priority), do: :ok
+  defp flow_due_delete_by_values(_state, _id, nil, _flow_state, _priority, _partition_key),
+    do: :ok
 
-  defp flow_due_delete_by_values(state, id, type, flow_state, priority) do
-    due_key = FlowKeys.due_key(type, flow_state, priority)
+  defp flow_due_delete_by_values(state, id, type, flow_state, priority, partition_key) do
+    due_key = FlowKeys.due_key(type, flow_state, priority, partition_key)
     flow_due_delete_from_key(state, due_key, id)
   end
 
@@ -3993,8 +4033,9 @@ defmodule Ferricstore.Raft.StateMachine do
     ZSetIndex.delete_member(index, lookup, due_key, id)
   end
 
-  defp flow_history_put(state, %{id: id, version: version}, event, now_ms) do
+  defp flow_history_put(state, %{id: id, version: version} = record, event, now_ms) do
     event_id = Integer.to_string(now_ms) <> "-" <> Integer.to_string(version)
+    partition_key = Map.get(record, :partition_key)
 
     fields = [
       "event",
@@ -4005,7 +4046,12 @@ defmodule Ferricstore.Raft.StateMachine do
       Integer.to_string(now_ms)
     ]
 
-    do_put(state, FlowKeys.stream_entry_key(id, event_id), :erlang.term_to_binary(fields), 0)
+    do_put(
+      state,
+      FlowKeys.stream_entry_key(id, event_id, partition_key),
+      :erlang.term_to_binary(fields),
+      0
+    )
   end
 
   defp flow_encode(record), do: :erlang.term_to_binary(record)
