@@ -17,7 +17,7 @@ WORKDIR /app
 RUN mix local.hex --force && mix local.rebar --force
 
 ENV MIX_ENV=prod
-ENV FERRICSTORE_BUILD_NIF=1
+ENV FERRICSTORE_BUILD=1
 
 # Copy mix files (all apps needed for umbrella resolution)
 COPY mix.exs mix.lock ./
@@ -31,6 +31,7 @@ COPY config/config.exs config/prod.exs config/runtime.exs config/
 COPY apps/ferricstore/native apps/ferricstore/native
 COPY apps/ferricstore/lib apps/ferricstore/lib
 COPY apps/ferricstore/priv apps/ferricstore/priv
+COPY apps/ferricstore_server/native apps/ferricstore_server/native
 COPY apps/ferricstore_server/lib apps/ferricstore_server/lib
 # Stub lib dirs for ecto/session so umbrella compiles
 RUN mkdir -p apps/ferricstore_ecto/lib apps/ferricstore_session/lib
@@ -38,13 +39,24 @@ COPY rel rel
 
 RUN mix deps.get --only prod
 
-# Build NIF
+# Build NIFs
 RUN cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
+RUN cargo build --release --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
+RUN cargo build --release --manifest-path apps/ferricstore_server/native/resp_parser_nif/Cargo.toml
 RUN mkdir -p apps/ferricstore/priv/native && \
     cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so \
        apps/ferricstore/priv/native/libferricstore_bitcask.so && \
     cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so \
-       apps/ferricstore/priv/native/ferricstore_bitcask.so
+       apps/ferricstore/priv/native/ferricstore_bitcask.so && \
+    cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so \
+       apps/ferricstore/priv/native/libferricstore_wal_nif.so && \
+    cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so \
+       apps/ferricstore/priv/native/ferricstore_wal_nif.so
+RUN mkdir -p apps/ferricstore_server/priv/native && \
+    cp apps/ferricstore_server/native/resp_parser_nif/target/release/libresp_parser_nif.so \
+       apps/ferricstore_server/priv/native/libresp_parser_nif.so && \
+    cp apps/ferricstore_server/native/resp_parser_nif/target/release/libresp_parser_nif.so \
+       apps/ferricstore_server/priv/native/resp_parser_nif.so
 
 # Compile everything (deps + app code)
 RUN mix compile

@@ -38,19 +38,19 @@ jobs:
 
       - name: Wait for all precompiled NIF artifacts
         run: |
-          # Both crates × 6 targets = 12 artifacts.
-          # Mac targets also produce .sha256 files, so total is 16.
-          # Conservatively, wait until we see at least 12 .tar.gz files
-          # for each crate.
+          # Three crates x six targets = 18 tarballs. The RESP parser NIF
+          # lives in ferricstore_server, but it is release-critical for the
+          # standalone package and must be present before checksum generation.
           set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
           for i in $(seq 1 90); do
             ASSETS=$(gh release view "v${VERSION}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' 2>/dev/null || true)
             BITCASK_COUNT=$(echo "$ASSETS" | grep -c "ferricstore_bitcask-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
             WAL_COUNT=$(echo "$ASSETS" | grep -c "ferricstore_wal_nif-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
-            echo "Attempt $i/90: bitcask=$BITCASK_COUNT/6, wal=$WAL_COUNT/6"
-            if [ "$BITCASK_COUNT" -ge 6 ] && [ "$WAL_COUNT" -ge 6 ]; then
-              echo "All 12 NIF artifacts present."
+            RESP_COUNT=$(echo "$ASSETS" | grep -c "resp_parser_nif-v${VERSION}-nif-2.16-.*\.tar\.gz$" || true)
+            echo "Attempt $i/90: bitcask=$BITCASK_COUNT/6, wal=$WAL_COUNT/6, resp=$RESP_COUNT/6"
+            if [ "$BITCASK_COUNT" -ge 6 ] && [ "$WAL_COUNT" -ge 6 ] && [ "$RESP_COUNT" -ge 6 ]; then
+              echo "All 18 NIF artifacts present."
               break
             fi
             if [ "$i" = "90" ]; then
@@ -106,6 +106,13 @@ jobs:
             "checksum-ferricstore_wal_nif.exs" \
             "ferricstore_wal_nif-v${VERSION}-*.tar.gz" \
             "libferricstore_wal_nif-v${VERSION}-*.tar.gz"
+
+          cd ../ferricstore_server
+
+          generate_checksum_file \
+            "checksum-Elixir.FerricstoreServer.Resp.ParserNif.exs" \
+            "resp_parser_nif-v${VERSION}-*.tar.gz" \
+            "libresp_parser_nif-v${VERSION}-*.tar.gz"
 
       # Publish in dependency order: core first, then packages that depend on it
       - name: Publish ferricstore (core)

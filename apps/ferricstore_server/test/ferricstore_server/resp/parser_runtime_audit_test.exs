@@ -5,6 +5,26 @@ defmodule FerricstoreServer.Resp.ParserRuntimeAuditTest do
 
   defp read!(path), do: File.read!(Path.join(@repo_root, path))
 
+  test "RESP parser NIF uses the precompiled release artifact path" do
+    nif_source = read!("apps/ferricstore_server/lib/ferricstore_server/resp/parser_nif.ex")
+    mix_source = read!("apps/ferricstore_server/mix.exs")
+    release_workflow = read!(".github/workflows/release.yml")
+    hex_publish_workflow = read!(".github/workflows/hex-publish.yml")
+
+    assert nif_source =~ "use RustlerPrecompiled",
+           "RESP parser is release-critical; it must load the same precompiled artifact shape as the Bitcask and WAL NIFs instead of requiring a manually copied local .so"
+
+    assert nif_source =~ ~s(crate: "resp_parser_nif")
+    assert nif_source =~ "force_build:"
+    assert mix_source =~ ":rustler_precompiled"
+
+    assert release_workflow =~
+             ~s(crate: ["ferricstore_bitcask", "ferricstore_wal_nif", "resp_parser_nif"])
+
+    assert hex_publish_workflow =~ "RESP_COUNT"
+    assert hex_publish_workflow =~ "checksum-Elixir.FerricstoreServer.Resp.ParserNif.exs"
+  end
+
   test "server transaction and blocking runtime do not call legacy Dispatcher.dispatch" do
     paths = [
       "apps/ferricstore_server/lib/ferricstore_server/connection/transaction.ex",

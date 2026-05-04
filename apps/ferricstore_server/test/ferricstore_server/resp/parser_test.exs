@@ -149,6 +149,16 @@ defmodule FerricstoreServer.Resp.ParserTest do
       input = "*3\r\n$3\r\nfoo\r\n_\r\n$3\r\nbar\r\n"
       assert {:ok, [["foo", nil, "bar"]], ""} = Parser.parse(input)
     end
+
+    test "rejects oversized arrays with the public error contract" do
+      over_limit = 1_048_577
+
+      assert {:error, "ERR protocol error: array too large"} =
+               Parser.parse("*#{over_limit}\r\n")
+
+      assert {:error, "ERR protocol error: array too large"} =
+               Parser.parse_commands("*#{over_limit}\r\n")
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -410,6 +420,32 @@ defmodule FerricstoreServer.Resp.ParserTest do
                Parser.parse_commands("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$0\r\n\r\n")
 
       assert {:error, :invalid_command_argument} = Parser.parse_commands("*1\r\n$0\r\n\r\n")
+    end
+
+    test "preserves embedded NUL bytes in command args, AST, and key extraction" do
+      key = <<"k", 0, "1">>
+      value = <<"v", 0, "2">>
+      input = "*3\r\n$3\r\nSET\r\n$3\r\n" <> key <> "\r\n$3\r\n" <> value <> "\r\n"
+
+      assert {:ok, [{:command, "SET", [^key, ^value], {:set, ^key, ^value}, [^key]}], ""} =
+               Parser.parse_commands(input)
+    end
+
+    test "malformed command arity does not become executable single-key AST" do
+      input = "*3\r\n$3\r\nGET\r\n$1\r\na\r\n$1\r\nb\r\n"
+
+      assert {:ok, [{:command, "GET", ["a", "b"], ast, ["a"]}], ""} =
+               Parser.parse_commands(input)
+
+      assert ast == {:get, ["a", "b"]}
+      refute match?({:get, key} when is_binary(key), ast)
+    end
+
+    test "rejects null bulk and RESP3 non-bulk command arguments" do
+      assert {:error, {:invalid_bulk_length, -1}} = Parser.parse_commands("*1\r\n$-1\r\n")
+
+      assert {:error, :invalid_command_argument} =
+               Parser.parse_commands("*2\r\n$3\r\nGET\r\n_\r\n")
     end
 
     test "parses SET EX/NX/GET options into Rust AST" do
@@ -1351,6 +1387,15 @@ defmodule FerricstoreServer.Resp.ParserTest do
       # Map header says 2 entries but only 1 key provided
       assert {:ok, [], "%2\r\n$3\r\nfoo\r\n"} = Parser.parse("%2\r\n$3\r\nfoo\r\n")
     end
+
+    test "server command parser preserves partial command frames at every split" do
+      wire = "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+
+      for split <- 0..(byte_size(wire) - 1) do
+        prefix = binary_part(wire, 0, split)
+        assert {:ok, [], ^prefix} = Parser.parse_commands(prefix)
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -1480,6 +1525,14 @@ defmodule FerricstoreServer.Resp.ParserTest do
 
     test "parses empty attribute" do
       assert {:ok, [{:attribute, %{}}], ""} = Parser.parse("|0\r\n")
+    end
+
+    test "rejects malformed attributes and command-mode attributes" do
+      assert {:error, {:invalid_map_count, "-1"}} = Parser.parse("|-1\r\n")
+      assert {:ok, [], "|1\r\n$1\r\nk\r\n"} = Parser.parse("|1\r\n$1\r\nk\r\n")
+
+      assert {:error, :invalid_command_format} =
+               Parser.parse_commands("|0\r\n*1\r\n$4\r\nPING\r\n")
     end
   end
 
