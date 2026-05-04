@@ -3029,6 +3029,32 @@ defmodule Ferricstore.Raft.StateMachine do
          expected_value,
          expire_at_ms
        ) do
+    case :ets.lookup(state.ets, key) do
+      [{^key, current_value, _expire_at_ms, _lfu, :pending, _off, _value_size}] ->
+        pending_origin_replay_decision(inner_cmd, current_value, expected_value)
+
+      _ ->
+        committed_origin_replay_decision(
+          state,
+          key,
+          inner_cmd,
+          before_value,
+          before_expire_at_ms,
+          expected_value,
+          expire_at_ms
+        )
+    end
+  end
+
+  defp committed_origin_replay_decision(
+         state,
+         key,
+         inner_cmd,
+         before_value,
+         before_expire_at_ms,
+         expected_value,
+         expire_at_ms
+       ) do
     case do_get_meta(state, key) do
       {^expected_value, ^expire_at_ms} when expected_value != nil ->
         :already_applied
@@ -3055,10 +3081,6 @@ defmodule Ferricstore.Raft.StateMachine do
       _ ->
         :newer_local_value
     end
-  end
-
-  defp pending_origin_replay_decision(_inner_cmd, expected_value, expected_value) do
-    :already_applied
   end
 
   defp pending_origin_replay_decision(inner_cmd, current_value, expected_value) do

@@ -653,14 +653,14 @@ defmodule Ferricstore.Raft.StateMachineTest do
                NIF.v2_scan_file(active_file_path)
     end
 
-    test "does not duplicate already-applied origin RMW while local value is pending", %{
+    test "materializes pending origin GETSET even when value equals expected", %{
       state: state,
       ets: ets,
       active_file_path: active_file_path
     } do
       :ets.insert(ets, {"pending_origin_getset", "new", 0, 1, :pending, 0, 0})
 
-      {_state2, :ok} =
+      {_state2, "old"} =
         StateMachine.apply(
           %{},
           {:async, node(),
@@ -669,10 +669,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
           state
         )
 
-      assert [{"pending_origin_getset", "new", 0, _lfu, :pending, 0, 0}] =
+      assert [{"pending_origin_getset", "new", 0, _lfu, 0, 0, 3}] =
                :ets.lookup(ets, "pending_origin_getset")
 
-      assert {:ok, []} = NIF.v2_scan_file(active_file_path)
+      assert {:ok, [{"pending_origin_getset", 0, 3, 0, false}]} =
+               NIF.v2_scan_file(active_file_path)
     end
 
     test "does not replay origin INCR over a provably newer pending local value", %{
