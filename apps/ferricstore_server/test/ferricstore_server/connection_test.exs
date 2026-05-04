@@ -185,6 +185,18 @@ defmodule FerricstoreServer.ConnectionTest do
     :gen_tcp.close(sock)
   end
 
+  test "empty command frames are skipped and do not poison the connection buffer", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    send_raw(sock, "\r\n*0\r\nPING\r\n")
+
+    data = recv(sock)
+    assert data == "+PONG\r\n"
+    :gen_tcp.close(sock)
+  end
+
   # ---------------------------------------------------------------------------
   # QUIT
   # ---------------------------------------------------------------------------
