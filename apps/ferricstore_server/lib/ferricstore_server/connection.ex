@@ -465,6 +465,9 @@ defmodule FerricstoreServer.Connection do
       cmd == "MGET" and state.transport == :ranch_tcp ->
         dispatch_mget_sendfile_ast(args, ast, state)
 
+      cmd == "GETRANGE" and state.transport == :ranch_tcp ->
+        dispatch_getrange_sendfile_ast(args, ast, state)
+
       blocking_ast?(ast) ->
         dispatch_blocking_ast(ast, args, state)
 
@@ -772,6 +775,25 @@ defmodule FerricstoreServer.Connection do
       dispatch_normal("MGET", args, ast, fallback_state)
     end)
   end
+
+  defp dispatch_getrange_sendfile_ast(
+         [key, _start_arg, _end_arg] = args,
+         {:getrange, key, start_idx, end_idx} = ast,
+         state
+       )
+       when is_binary(key) and is_integer(start_idx) and is_integer(end_idx) do
+    ConnSendfile.dispatch_getrange(args, key, start_idx, end_idx, state, fn fallback_state ->
+      dispatch_normal("GETRANGE", args, ast, fallback_state)
+    end)
+  end
+
+  defp dispatch_getrange_sendfile_ast(args, _ast, state) when length(args) != 3 do
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'getrange' command"}),
+     state}
+  end
+
+  defp dispatch_getrange_sendfile_ast(args, ast, state),
+    do: dispatch_normal("GETRANGE", args, ast, state)
 
   defp dispatch_pubsub_mode_ast(cmd, args, ast, state) do
     cond do

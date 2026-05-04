@@ -485,6 +485,40 @@ defmodule FerricstoreServer.Integration.SendfileTest do
 
       :gen_tcp.close(sock)
     end
+
+    test "GETRANGE streams large cold slices with sendfile", %{port: port} do
+      attach_sendfile_handler(self())
+
+      sock = connect_and_hello(port)
+      key = ukey("getrange_large")
+      prefix = :binary.copy("P", 128)
+      slice = :binary.copy("S", @sendfile_threshold + 8192)
+      suffix = :binary.copy("T", 128)
+      value = [prefix, slice, suffix] |> IO.iodata_to_binary()
+
+      send_cmd(sock, ["SET", key, value])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :gen_tcp.close(sock)
+      sock = connect_and_hello(port)
+
+      first = byte_size(prefix)
+      last = first + byte_size(slice) - 1
+      send_cmd(sock, ["GETRANGE", key, Integer.to_string(first), Integer.to_string(last)])
+
+      assert recv_response(sock) == slice
+
+      size = byte_size(slice)
+
+      assert_receive {:sendfile_event, [:ferricstore, :server, :sendfile], %{bytes: ^size},
+                      %{result: :ok}},
+                     1000
+
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock) == {:simple, "PONG"}
+
+      :gen_tcp.close(sock)
+    end
   end
 
   # ---------------------------------------------------------------------------

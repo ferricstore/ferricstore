@@ -51,6 +51,21 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   def dispatch_mget(keys, state, dispatch_normal_fn), do: dispatch_normal_fn.("MGET", keys, state)
 
+  @doc """
+  Handles GETRANGE over plain TCP without materializing the full cold value.
+
+  Large cold slices are streamed with sendfile. Smaller cold slices are read
+  with a bounded pread of only the requested bytes.
+  """
+  def dispatch_getrange(args, key, start_idx, end_idx, state, dispatch_normal_fn)
+      when is_list(args) and is_binary(key) and is_integer(start_idx) and is_integer(end_idx) do
+    if in_pubsub_mode?(state) do
+      dispatch_normal_fn.(state)
+    else
+      fast_getrange(args, key, start_idx, end_idx, state, dispatch_normal_fn)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Internal
   # ---------------------------------------------------------------------------
@@ -114,6 +129,153 @@ defmodule FerricstoreServer.Connection.Sendfile do
     {:ok, Router.batch_get_with_file_refs(instance_ctx, lookup_keys, threshold_bytes())}
   catch
     _, _ -> :error
+  end
+
+  defp fast_getrange(args, key, start_idx, end_idx, state, dispatch_normal_fn) do
+    lookup_key = namespace_key(state.sandbox_namespace, key)
+
+    case fetch_get_with_file_ref(state.instance_ctx, lookup_key) do
+      {:ok, {:cold_ref, path, value_offset, value_size}} ->
+        case normalize_byte_range(value_size, start_idx, end_idx) do
+          :empty ->
+            new_state = ConnTracking.maybe_track_read("GETRANGE", args, "", state)
+            {:continue, Encoder.encode(""), new_state}
+
+          {relative_offset, count} when count >= @sendfile_threshold_bytes ->
+            handle_getrange_send_result(
+              send_file_range(args, path, value_offset + relative_offset, count, state),
+              state,
+              dispatch_normal_fn
+            )
+
+          {relative_offset, count} ->
+            case pread_file_range(path, value_offset + relative_offset, count) do
+              {:ok, value} ->
+                new_state = ConnTracking.maybe_track_read("GETRANGE", args, value, state)
+                {:continue, Encoder.encode(value), new_state}
+
+              :fallback ->
+                dispatch_normal_fn.(state)
+            end
+        end
+
+      {:ok, _other} ->
+        dispatch_normal_fn.(state)
+
+      :error ->
+        dispatch_normal_fn.(state)
+    end
+  end
+
+  defp fetch_get_with_file_ref(instance_ctx, lookup_key) do
+    {:ok, Router.get_with_file_ref(instance_ctx, lookup_key)}
+  catch
+    _, _ -> :error
+  end
+
+  defp handle_getrange_send_result({:sent, new_state}, _state, _fn),
+    do: {:continue, "", new_state}
+
+  defp handle_getrange_send_result({:error_after_header, _reason}, state, _fn),
+    do: {:quit, "", state}
+
+  defp handle_getrange_send_result(:fallback, state, dispatch_normal_fn),
+    do: dispatch_normal_fn.(state)
+
+  @doc false
+  def send_file_range(args, path, offset, size, state) do
+    result = do_sendfile_range(path, offset, size, state)
+    emit_sendfile_result(result, size, state)
+
+    case result do
+      {:sent, new_state} ->
+        {:sent, ConnTracking.maybe_track_read("GETRANGE", args, :sendfile_ok, new_state)}
+
+      other ->
+        other
+    end
+  end
+
+  defp do_sendfile_range(path, offset, size, state) do
+    socket = state.socket
+
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          send_file_range_with_cork(socket, fd, offset, size, state)
+        after
+          :file.close(fd)
+        end
+
+      {:error, _reason} ->
+        :fallback
+    end
+  end
+
+  defp send_file_range_with_cork(socket, fd, offset, size, state) do
+    header = [?$, Integer.to_string(size), "\r\n"]
+    TcpOpts.set_cork(socket, true)
+
+    case :gen_tcp.send(socket, header) do
+      :ok ->
+        result = send_file_range_and_trailer(socket, fd, offset, size, state)
+        TcpOpts.set_cork(socket, false)
+        result
+
+      {:error, _reason} ->
+        TcpOpts.set_cork(socket, false)
+        :fallback
+    end
+  end
+
+  defp send_file_range_and_trailer(socket, fd, offset, size, state) do
+    case :file.sendfile(fd, socket, offset, size, []) do
+      {:ok, ^size} ->
+        case :gen_tcp.send(socket, "\r\n") do
+          :ok -> {:sent, state}
+          {:error, reason} -> {:error_after_header, reason}
+        end
+
+      {:ok, sent} when sent < size ->
+        {:error_after_header, :partial_send}
+
+      {:error, reason} ->
+        {:error_after_header, reason}
+    end
+  end
+
+  defp pread_file_range(path, offset, size) do
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          case :file.pread(fd, offset, size) do
+            {:ok, value} when byte_size(value) == size -> {:ok, value}
+            _ -> :fallback
+          end
+        after
+          :file.close(fd)
+        end
+
+      {:error, _reason} ->
+        :fallback
+    end
+  end
+
+  defp normalize_byte_range(0, _start_idx, _end_idx), do: :empty
+
+  defp normalize_byte_range(size, start_idx, end_idx) when size > 0 do
+    start_norm = if start_idx < 0, do: max(size + start_idx, 0), else: start_idx
+    end_norm = if end_idx < 0, do: size + end_idx, else: end_idx
+
+    start_clamped = min(start_norm, size)
+    end_clamped = min(end_norm, size - 1)
+
+    if start_clamped > end_clamped do
+      :empty
+    else
+      count = end_clamped - start_clamped + 1
+      {start_clamped, count}
+    end
   end
 
   defp handle_mget_sendfile_result({:sent, new_state}, _keys, _state, _fn),
@@ -290,4 +452,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   defp namespace_keys(namespace, keys) when is_binary(namespace),
     do: Enum.map(keys, &(namespace <> &1))
+
+  defp namespace_key(nil, key), do: key
+  defp namespace_key(namespace, key) when is_binary(namespace), do: namespace <> key
 end
