@@ -4768,7 +4768,7 @@ defmodule FerricStore do
   """
   @spec json_set(key(), binary(), binary()) :: :ok | {:error, binary()}
   def json_set(key, path, value) do
-    case Json.handle_ast({:json_set, key, path, value, []}, build_string_store(key)) do
+    case Router.json_set(default_ctx(), key, path, value, []) do
       :ok -> :ok
       {:error, _} = err -> err
     end

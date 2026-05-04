@@ -286,6 +286,36 @@ defmodule Ferricstore.Store.RmwCommandsTest do
     end
   end
 
+  describe "concurrent JSON.SET" do
+    test "concurrent path updates on one document preserve all fields" do
+      key = ukey("json_set_paths_q")
+
+      root =
+        1..50
+        |> Map.new(fn i -> {"f#{i}", 0} end)
+        |> Jason.encode!()
+
+      :ok = FerricStore.json_set(key, "$", root)
+
+      results =
+        run_concurrent(
+          50,
+          fn i ->
+            FerricStore.json_set(key, "$.f#{i}", Integer.to_string(i))
+          end,
+          Enum.to_list(1..50)
+        )
+
+      assert Enum.all?(results, &(&1 == :ok))
+      assert {:ok, json} = FerricStore.json_get(key, "$")
+      decoded = Jason.decode!(json)
+
+      for i <- 1..50 do
+        assert decoded["f#{i}"] == i
+      end
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # BITOP (merges N source bitmaps into destination)
   # ---------------------------------------------------------------------------

@@ -147,6 +147,7 @@ defmodule Ferricstore.Raft.Batcher do
           | {:pfadd, binary(), [binary()]}
           | {:spop, binary(), nil | non_neg_integer()}
           | {:zpop, binary(), non_neg_integer(), :min | :max}
+          | {:json_set, binary(), binary(), binary(), list()}
           | {:json_numincrby, binary(), binary(), number()}
           | {:json_arrappend, binary(), binary(), [binary()]}
           | {:cross_shard_tx, list()}
