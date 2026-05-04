@@ -505,6 +505,18 @@ defmodule Ferricstore.Store.OpsTest do
     end
   end
 
+  describe "LocalTxStore compound scan performance guards" do
+    test "pending prefix merge reads HLC once per scan, not once per pending key" do
+      source = File.read!(@ops_path)
+      [_before, section] = String.split(source, "defp merge_tx_pending_prefix", parts: 2)
+      [function_body | _after] = String.split(section, "defp read_promoted_cold_value", parts: 2)
+
+      assert function_body =~ "now_ms = HLC.now_ms()"
+      assert String.replace(function_body, "now_ms = HLC.now_ms()", "") =~ "exp > now_ms"
+      refute String.replace(function_body, "now_ms = HLC.now_ms()", "") =~ "HLC.now_ms()"
+    end
+  end
+
   describe "LocalTxStore promoted compound writes" do
     test "promoted field writes carry redis key so persistence uses dedicated storage" do
       ctx = FerricStore.Instance.get(:default)

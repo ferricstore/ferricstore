@@ -1321,6 +1321,7 @@ defmodule Ferricstore.Store.Ops do
   defp merge_tx_pending_prefix(results, prefix) do
     deleted = Process.get(:tx_deleted_keys, MapSet.new())
     prefix_len = byte_size(prefix)
+    now_ms = HLC.now_ms()
 
     base =
       results
@@ -1331,7 +1332,7 @@ defmodule Ferricstore.Store.Ops do
     |> Enum.reduce(base, fn
       {key, {value, exp}}, acc when is_binary(key) and byte_size(key) >= prefix_len ->
         if String.starts_with?(key, prefix) and not MapSet.member?(deleted, key) and
-             (exp == 0 or exp > HLC.now_ms()) do
+             (exp == 0 or exp > now_ms) do
           field =
             case :binary.split(key, <<0>>) do
               [_pre, sub] -> sub
