@@ -7,10 +7,10 @@ defmodule Ferricstore.Raft.StateMachineAsyncReadGuardTest do
     source = File.read!(@state_machine_path)
 
     # Cross-shard command apply can read cold large values. Keep the disk I/O
-    # off Normal schedulers while still waiting synchronously for deterministic
-    # apply results.
-    assert source =~ "NIF.v2_pread_at_async",
-           "expected Raft state-machine cold reads to use v2_pread_at_async/4"
+    # behind the ColdRead async helper while still waiting synchronously for
+    # deterministic apply results. Do not call the blocking pread NIF here.
+    assert source =~ "ColdRead.pread_at",
+           "expected Raft state-machine cold reads to use ColdRead.pread_at/*"
 
     refute Regex.match?(~r/NIF\.v2_pread_at\(/, source),
            "expected Raft state-machine cold reads to avoid blocking v2_pread_at/2"

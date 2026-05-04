@@ -3410,7 +3410,7 @@ defmodule Ferricstore.Raft.StateMachine do
     shard_data_path = Path.dirname(file_path)
     old_path = sm_file_path_from_path(shard_data_path, file_id)
 
-    case NIF.v2_pread_at(old_path, offset) do
+    case ColdRead.pread_at(old_path, offset, key, @cold_read_timeout_ms) do
       {:ok, value} when is_binary(value) -> [{:put, key, value, expire_at_ms}]
       _ -> []
     end
