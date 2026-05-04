@@ -782,7 +782,7 @@ defmodule Ferricstore.Store.Shard do
                     "Shard #{state.index}: compaction copy_records result mismatch for #{source}: expected #{length(live_entries)}, got #{length(results)}"
                   )
 
-                  _ = Ferricstore.FS.rm(dest)
+                  remove_compaction_temp(state, dest)
 
                   failure = {fid, {:copy_result_mismatch, length(live_entries), length(results)}}
                   {written, dropped, reclaimed, compacted, skipped, [failure | failures]}
@@ -792,7 +792,7 @@ defmodule Ferricstore.Store.Shard do
                     "Shard #{state.index}: compaction copy_records failed for #{source}: #{inspect(reason)}"
                   )
 
-                  _ = Ferricstore.FS.rm(dest)
+                  remove_compaction_temp(state, dest)
 
                   {written, dropped, reclaimed, compacted, skipped,
                    [{fid, {:copy_failed, reason}} | failures]}
@@ -1306,6 +1306,21 @@ defmodule Ferricstore.Store.Shard do
     hint_name = "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.hint"
     _ = Ferricstore.FS.rm(Path.join(shard_path, hint_name))
     :ok
+  end
+
+  defp remove_compaction_temp(state, path) do
+    case Ferricstore.FS.rm(path) do
+      :ok ->
+        :ok
+
+      {:error, {:not_found, _}} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Shard #{state.index}: failed to remove compaction temp file #{path}: #{inspect(reason)}"
+        )
+    end
   end
 
   defp group_compaction_live_entries(_state, []), do: %{}

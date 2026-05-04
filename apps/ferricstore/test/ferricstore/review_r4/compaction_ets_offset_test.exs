@@ -1,5 +1,6 @@
 defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
   use ExUnit.Case, async: false
+  import ExUnit.CaptureLog
 
   alias Ferricstore.Test.IsolatedInstance
 
@@ -60,6 +61,26 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
 
       assert [{^missing_file_id, {:copy_failed, _reason}}] = failures
       assert [{^key, nil, 0, 0, ^missing_file_id, 0, 16}] = :ets.lookup(keydir, key)
+    end
+
+    test "copy failure reports temp cleanup failure", %{shard: shard} do
+      assert :ok = GenServer.call(shard, {:put, "copy_cleanup_key", "value_1", 0})
+      assert :ok = GenServer.call(shard, :flush)
+
+      force_rotate_active_file(shard)
+
+      state = :sys.get_state(shard)
+      compact_tmp_dir = Path.join(state.shard_data_path, "compact_0.log")
+      File.mkdir!(compact_tmp_dir)
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:compaction_failed, [{0, {:copy_failed, _reason}}]}} =
+                   GenServer.call(shard, {:run_compaction, [0]})
+        end)
+
+      assert log =~ "failed to remove compaction temp file"
+      assert File.dir?(compact_tmp_dir)
     end
 
     test "directory fsync failure after namespace changes is returned as compaction error", %{
