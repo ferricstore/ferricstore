@@ -100,18 +100,10 @@ defmodule FerricstoreServer.ReviewR4Test do
   defp ukey(base), do: "r4_#{base}_#{:rand.uniform(9_999_999)}"
 
   # ---------------------------------------------------------------------------
-  # B3. send_response silent errors — CONFIRMED BUG
+  # B3. send_response failures emit telemetry and do not crash the server.
   # ---------------------------------------------------------------------------
 
-  describe "B3: send_response/2 silently returns :ok on error" do
-    # connection.ex:2184-2189:
-    #   defp send_response(socket, transport, iodata) do
-    #     case transport.send(socket, iodata) do
-    #       :ok -> :ok
-    #       {:error, _} -> :ok    <-- swallows error
-    #     end
-    #   end
-
+  describe "B3: send_response/2 handles disconnected clients" do
     test "server does not crash when client disconnects mid-pipeline" do
       sock = connect()
       key = ukey("b3")
@@ -297,7 +289,7 @@ defmodule FerricstoreServer.ReviewR4Test do
   end
 
   # ---------------------------------------------------------------------------
-  # B2. PubSub send errors silently dropped — CONFIRMED BUG
+  # B2. PubSub send errors use the shared send telemetry path.
   # ---------------------------------------------------------------------------
 
   describe "B2: pubsub message delivery on send failure" do

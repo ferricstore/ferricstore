@@ -46,6 +46,8 @@ defmodule FerricstoreServer.Health.Endpoint do
 
   @behaviour :ranch_protocol
 
+  alias FerricstoreServer.Connection.Send, as: ConnSend
+
   @listener_ref :"#{__MODULE__}"
 
   # ---------------------------------------------------------------------------
@@ -289,7 +291,7 @@ defmodule FerricstoreServer.Health.Endpoint do
         "\r\n" <>
         body
 
-    transport.send(socket, response)
+    ConnSend.send(socket, transport, response, :health_response)
     :ok
   end
 end
