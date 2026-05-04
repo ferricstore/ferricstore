@@ -1017,6 +1017,8 @@ defmodule Ferricstore.Store.Router do
       # hot cache) and readers would see nil until the async write completes.
       case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
         {:ok, file_id, [{offset, _record_size}]} ->
+          maybe_after_large_async_prewrite_hook(ctx, idx, key)
+
           case async_enqueue_to_raft(idx, raft_cmd) do
             :ok ->
               clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
@@ -1079,8 +1081,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp rollback_unaccepted_large_put(ctx, idx, key, :missing) do
-    {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
-    _ = Ferricstore.Bitcask.NIF.v2_append_ops_batch_nosync(file_path, [{:delete, key}])
+    _ = append_delete_tombstone_nosync(ctx, idx, key)
     :ok
   end
 
@@ -1118,8 +1119,7 @@ defmodule Ferricstore.Store.Router do
 
   defp rollback_installed_async_value(ctx, idx, key, :missing) do
     keydir = elem(ctx.keydir_refs, idx)
-    {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
-    _ = Ferricstore.Bitcask.NIF.v2_append_ops_batch_nosync(file_path, [{:delete, key}])
+    _ = append_delete_tombstone_nosync(ctx, idx, key)
     track_keydir_binary_delete(ctx, idx, keydir, key)
     :ets.delete(keydir, key)
     maybe_apply_async_zset_delete(ctx, idx, key)
@@ -1467,6 +1467,26 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp mark_checkpoint_dirty(_ctx, _idx), do: :ok
+
+  defp append_delete_tombstone_nosync(ctx, idx, key) do
+    {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
+
+    case Ferricstore.Bitcask.NIF.v2_append_ops_batch_nosync(file_path, [{:delete, key}]) do
+      {:ok, _locations} = ok ->
+        mark_checkpoint_dirty(ctx, idx)
+        ok
+
+      other ->
+        other
+    end
+  end
+
+  defp maybe_after_large_async_prewrite_hook(ctx, idx, key) do
+    case Process.get(:ferricstore_router_after_large_async_prewrite_hook) do
+      fun when is_function(fun, 3) -> fun.(ctx, idx, key)
+      _ -> :ok
+    end
+  end
 
   # -- Keydir binary memory tracking --
   # Only counts binaries > 64 bytes (refc binaries, off-heap).
@@ -4044,9 +4064,8 @@ defmodule Ferricstore.Store.Router do
 
   defp rollback_async_list_key_to_missing(ctx, idx, compound_key) do
     keydir = elem(ctx.keydir_refs, idx)
-    {_, file_path, _} = Ferricstore.Store.ActiveFile.get(ctx, idx)
 
-    _ = Ferricstore.Bitcask.NIF.v2_append_ops_batch_nosync(file_path, [{:delete, compound_key}])
+    _ = append_delete_tombstone_nosync(ctx, idx, compound_key)
     track_keydir_binary_delete(ctx, idx, keydir, compound_key)
     :ets.delete(keydir, compound_key)
   end

@@ -176,6 +176,42 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
       assert recovered_value_from_bitcask(ctx(), key) == nil
     end
 
+    test "large async PUT rollback tombstone marks checkpoint dirty after prewrite flag is cleared" do
+      c = ctx()
+      key = "#{@ns}:overloaded_large_missing_checkpoint_#{:erlang.unique_integer([:positive])}"
+      idx = Router.shard_for(c, key)
+      flag_idx = idx + 1
+      large = :binary.copy("x", c.hot_cache_max_value_size + 1024)
+      test_pid = self()
+
+      on_exit(fn ->
+        Batcher.reset_pending(idx)
+        Process.delete(:ferricstore_router_after_large_async_prewrite_hook)
+      end)
+
+      for _ <- 1..64 do
+        Batcher.__inject_async_pending__(
+          idx,
+          make_ref(),
+          [{:async, node(), {:put, key, "pending", 0}}],
+          0
+        )
+      end
+
+      Process.put(:ferricstore_router_after_large_async_prewrite_hook, fn _ctx, ^idx, ^key ->
+        :atomics.put(c.checkpoint_flags, flag_idx, 0)
+        send(test_pid, :prewrite_dirty_flag_cleared)
+      end)
+
+      assert {:error, "ERR async replication overloaded"} = Router.put(c, key, large, 0)
+      assert_receive :prewrite_dirty_flag_cleared
+
+      assert :atomics.get(c.checkpoint_flags, flag_idx) == 1,
+             "rollback tombstone must re-mark checkpoint dirty after checkpointer clears prewrite"
+
+      assert recovered_value_from_bitcask(c, key) == nil
+    end
+
     test "batch async PUT does not become locally visible when Batcher is overloaded" do
       key = "#{@ns}:overloaded_batch_put_#{:erlang.unique_integer([:positive])}"
       idx = Router.shard_for(ctx(), key)
