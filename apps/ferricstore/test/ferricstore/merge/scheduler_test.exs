@@ -218,6 +218,30 @@ defmodule Ferricstore.Merge.SchedulerTest do
         File.rm_rf!(data_dir)
       end
     end
+
+    test "init fails closed when existing log files cannot be counted" do
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "scheduler_log_count_fail_#{System.unique_integer([:positive])}"
+        )
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+      File.mkdir_p!(Path.dirname(shard_dir))
+      File.write!(shard_dir, "not a directory")
+
+      try do
+        assert {:stop, {:merge_log_file_count_failed, 0, {_kind, _message}}} =
+                 Scheduler.init(
+                   shard_index: 0,
+                   data_dir: data_dir,
+                   merge_config: %{mode: :hot, min_files_for_merge: 100},
+                   name: :test_scheduler_log_count_fail
+                 )
+      after
+        File.rm_rf!(data_dir)
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------

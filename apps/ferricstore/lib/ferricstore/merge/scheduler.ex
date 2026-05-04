@@ -239,16 +239,22 @@ defmodule Ferricstore.Merge.Scheduler do
     # an unknown merge state can make later compactions act on stale files.
     case Manifest.recover_if_needed(shard_data_dir, index) do
       :ok ->
-        state = %__MODULE__{
-          shard_index: index,
-          config: config,
-          data_dir: shard_data_dir,
-          semaphore: semaphore,
-          instance_ctx: instance_ctx,
-          file_count: count_existing_log_files(shard_data_dir)
-        }
+        case count_existing_log_files(shard_data_dir) do
+          {:ok, file_count} ->
+            state = %__MODULE__{
+              shard_index: index,
+              config: config,
+              data_dir: shard_data_dir,
+              semaphore: semaphore,
+              instance_ctx: instance_ctx,
+              file_count: file_count
+            }
 
-        {:ok, state}
+            {:ok, state}
+
+          {:error, reason} ->
+            {:stop, {:merge_log_file_count_failed, index, reason}}
+        end
 
       {:error, reason} ->
         {:stop, {:merge_manifest_recovery_failed, index, reason}}
@@ -709,8 +715,15 @@ defmodule Ferricstore.Merge.Scheduler do
 
   defp count_existing_log_files(shard_data_dir) do
     case Ferricstore.FS.ls(shard_data_dir) do
-      {:ok, entries} -> Enum.count(entries, &bitcask_log_file?/1)
-      {:error, _reason} -> 0
+      {:ok, entries} ->
+        {:ok, Enum.count(entries, &bitcask_log_file?/1)}
+
+      {:error, reason} ->
+        Logger.error(
+          "Failed to list shard data directory for merge scheduler startup at #{shard_data_dir}: #{inspect(reason)}"
+        )
+
+        {:error, reason}
     end
   end
 
