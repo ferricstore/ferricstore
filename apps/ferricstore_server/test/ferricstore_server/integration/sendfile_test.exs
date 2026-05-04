@@ -519,6 +519,73 @@ defmodule FerricstoreServer.Integration.SendfileTest do
 
       :gen_tcp.close(sock)
     end
+
+    test "pipelined GETRANGE and PING streams large cold slices with sendfile", %{port: port} do
+      attach_sendfile_handler(self())
+
+      sock = connect_and_hello(port)
+      key = ukey("pipe_getrange_large")
+      prefix = :binary.copy("A", 64)
+      slice = :binary.copy("B", @sendfile_threshold + 4096)
+      value = IO.iodata_to_binary([prefix, slice, :binary.copy("C", 64)])
+
+      send_cmd(sock, ["SET", key, value])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :gen_tcp.close(sock)
+      sock = connect_and_hello(port)
+
+      first = byte_size(prefix)
+      last = first + byte_size(slice) - 1
+
+      send_pipeline(sock, [
+        ["GETRANGE", key, Integer.to_string(first), Integer.to_string(last)],
+        ["PING"]
+      ])
+
+      assert recv_n(sock, 2) == [slice, {:simple, "PONG"}]
+
+      size = byte_size(slice)
+
+      assert_receive {:sendfile_event, [:ferricstore, :server, :sendfile], %{bytes: ^size},
+                      %{result: :ok}},
+                     1000
+
+      :gen_tcp.close(sock)
+    end
+
+    test "pipelined GETRANGE reads only requested small cold slices", %{port: port} do
+      attach_sendfile_handler(self())
+
+      sock = connect_and_hello(port)
+      key = ukey("pipe_getrange_small")
+      prefix = :binary.copy("A", 128)
+      slice = "small-cold-slice"
+      suffix = :binary.copy("C", @sendfile_threshold + 8192)
+      value = IO.iodata_to_binary([prefix, slice, suffix])
+
+      send_cmd(sock, ["SET", key, value])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :gen_tcp.close(sock)
+      sock = connect_and_hello(port)
+
+      first = byte_size(prefix)
+      last = first + byte_size(slice) - 1
+
+      send_pipeline(sock, [
+        ["GETRANGE", key, Integer.to_string(first), Integer.to_string(last)],
+        ["GETRANGE", key, Integer.to_string(byte_size(value) + 10), "-1"],
+        ["PING"]
+      ])
+
+      assert recv_n(sock, 3) == [slice, "", {:simple, "PONG"}]
+
+      refute_receive {:sendfile_event, [:ferricstore, :server, :sendfile], _measurements, _meta},
+                     100
+
+      :gen_tcp.close(sock)
+    end
   end
 
   # ---------------------------------------------------------------------------

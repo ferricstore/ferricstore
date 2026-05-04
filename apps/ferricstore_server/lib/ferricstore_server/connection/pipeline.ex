@@ -793,20 +793,26 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp prefetch_pure_tcp_reads(commands, %{transport: :ranch_tcp} = state) do
-    {gets, mgets} =
+    {gets, mgets, getranges} =
       commands
       |> Enum.with_index()
-      |> Enum.reduce({[], []}, fn {cmd, idx}, {get_acc, mget_acc} ->
+      |> Enum.reduce({[], [], []}, fn {cmd, idx}, {get_acc, mget_acc, getrange_acc} ->
         case command_parts(cmd) do
           {"GET", [key], {:get, key}, [key]} when is_binary(key) ->
-            {[{idx, key, namespace_key(state.sandbox_namespace, key)} | get_acc], mget_acc}
+            {[{idx, key, namespace_key(state.sandbox_namespace, key)} | get_acc], mget_acc,
+             getrange_acc}
 
           {"MGET", keys, {:mget, keys}, keys} when is_list(keys) and keys != [] ->
             lookup_keys = namespace_keys(state.sandbox_namespace, keys)
-            {get_acc, [{idx, keys, lookup_keys} | mget_acc]}
+            {get_acc, [{idx, keys, lookup_keys} | mget_acc], getrange_acc}
+
+          {"GETRANGE", [key, _start_arg, _end_arg] = args, {:getrange, key, start_idx, end_idx},
+           [key]}
+          when is_binary(key) and is_integer(start_idx) and is_integer(end_idx) ->
+            {get_acc, mget_acc, [{idx, args, key, start_idx, end_idx} | getrange_acc]}
 
           _ ->
-            {get_acc, mget_acc}
+            {get_acc, mget_acc, getrange_acc}
         end
       end)
 
@@ -814,6 +820,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
     |> Enum.reverse()
     |> prefetch_tcp_get_ops(state)
     |> Map.merge(prefetch_tcp_mget_ops(Enum.reverse(mgets), state))
+    |> Map.merge(prefetch_tcp_getrange_ops(Enum.reverse(getranges), state))
   end
 
   defp prefetch_pure_tcp_reads(_commands, _state), do: %{}
@@ -853,6 +860,18 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp prefetch_tcp_mget_ops(mgets, state) do
     Map.new(mgets, fn {idx, keys, lookup_keys} ->
       {idx, prefetch_tcp_mget_result(keys, lookup_keys, state)}
+    end)
+  end
+
+  defp prefetch_tcp_getrange_ops(getranges, state) do
+    Enum.reduce(getranges, %{}, fn {idx, args, key, start_idx, end_idx}, acc ->
+      case ConnSendfile.getrange_cold_response(args, key, start_idx, end_idx, state) do
+        :fallback ->
+          acc
+
+        result ->
+          Map.put(acc, idx, result)
+      end
     end)
   end
 
@@ -909,11 +928,23 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp response_entry({:file_ref, _key, _lookup_key, _path, _offset, _size} = file_ref),
     do: file_ref
 
+  defp response_entry(
+         {:file_range, _args, _key, _start_idx, _end_idx, _path, _offset, _size} = file_range
+       ),
+       do: file_range
+
   defp response_entry({:array, _keys, _elements} = array), do: array
+  defp response_entry({:value, value}), do: {:encoded, Encoder.encode(value)}
 
   defp response_entry(result), do: {:encoded, Encoder.encode(result)}
 
   defp streaming_response?({:file_ref, _key, _lookup_key, _path, _offset, _size}), do: true
+
+  defp streaming_response?(
+         {:file_range, _args, _key, _start_idx, _end_idx, _path, _offset, _size}
+       ),
+       do: true
+
   defp streaming_response?({:array, _keys, _elements}), do: true
   defp streaming_response?(_result), do: false
 
@@ -923,6 +954,26 @@ defmodule FerricstoreServer.Connection.Pipeline do
         case stream_array_response(keys, elements, acc_state, send_response_fn) do
           {:sent, new_state} ->
             {:cont, {:continue, new_state}}
+
+          {:error_after_header, _reason} ->
+            {:halt, {:quit, acc_state}}
+        end
+
+      {:file_range, args, key, start_idx, end_idx, path, offset, size}, {:continue, acc_state} ->
+        case ConnSendfile.send_file_range(args, path, offset, size, acc_state) do
+          {:sent, new_state} ->
+            {:cont, {:continue, new_state}}
+
+          :fallback ->
+            send_response_fn.(
+              acc_state.socket,
+              acc_state.transport,
+              Encoder.encode(
+                ConnSendfile.materialize_getrange(key, start_idx, end_idx, acc_state)
+              )
+            )
+
+            {:cont, {:continue, acc_state}}
 
           {:error_after_header, _reason} ->
             {:halt, {:quit, acc_state}}

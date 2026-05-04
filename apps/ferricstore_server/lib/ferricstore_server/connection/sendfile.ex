@@ -132,38 +132,46 @@ defmodule FerricstoreServer.Connection.Sendfile do
   end
 
   defp fast_getrange(args, key, start_idx, end_idx, state, dispatch_normal_fn) do
+    case getrange_cold_response(args, key, start_idx, end_idx, state) do
+      {:value, value} ->
+        new_state = ConnTracking.maybe_track_read("GETRANGE", args, value, state)
+        {:continue, Encoder.encode(value), new_state}
+
+      {:file_range, ^args, ^key, ^start_idx, ^end_idx, path, offset, count} ->
+        handle_getrange_send_result(
+          send_file_range(args, path, offset, count, state),
+          state,
+          dispatch_normal_fn
+        )
+
+      :fallback ->
+        dispatch_normal_fn.(state)
+    end
+  end
+
+  @doc false
+  def getrange_cold_response(args, key, start_idx, end_idx, state) do
     lookup_key = namespace_key(state.sandbox_namespace, key)
 
     case fetch_get_with_file_ref(state.instance_ctx, lookup_key) do
       {:ok, {:cold_ref, path, value_offset, value_size}} ->
         case normalize_byte_range(value_size, start_idx, end_idx) do
           :empty ->
-            new_state = ConnTracking.maybe_track_read("GETRANGE", args, "", state)
-            {:continue, Encoder.encode(""), new_state}
+            {:value, ""}
 
           {relative_offset, count} when count >= @sendfile_threshold_bytes ->
-            handle_getrange_send_result(
-              send_file_range(args, path, value_offset + relative_offset, count, state),
-              state,
-              dispatch_normal_fn
-            )
+            {:file_range, args, key, start_idx, end_idx, path, value_offset + relative_offset,
+             count}
 
           {relative_offset, count} ->
             case pread_file_range(path, value_offset + relative_offset, count) do
-              {:ok, value} ->
-                new_state = ConnTracking.maybe_track_read("GETRANGE", args, value, state)
-                {:continue, Encoder.encode(value), new_state}
-
-              :fallback ->
-                dispatch_normal_fn.(state)
+              {:ok, value} -> {:value, value}
+              :fallback -> :fallback
             end
         end
 
-      {:ok, _other} ->
-        dispatch_normal_fn.(state)
-
-      :error ->
-        dispatch_normal_fn.(state)
+      _other ->
+        :fallback
     end
   end
 
@@ -171,6 +179,23 @@ defmodule FerricstoreServer.Connection.Sendfile do
     {:ok, Router.get_with_file_ref(instance_ctx, lookup_key)}
   catch
     _, _ -> :error
+  end
+
+  @doc false
+  def materialize_getrange(key, start_idx, end_idx, state) do
+    case Router.get(state.instance_ctx, namespace_key(state.sandbox_namespace, key)) do
+      nil ->
+        ""
+
+      value when is_binary(value) ->
+        slice_value(value, start_idx, end_idx)
+
+      value when is_integer(value) ->
+        value |> Integer.to_string() |> slice_value(start_idx, end_idx)
+
+      value when is_float(value) ->
+        value |> Float.to_string() |> slice_value(start_idx, end_idx)
+    end
   end
 
   defp handle_getrange_send_result({:sent, new_state}, _state, _fn),
@@ -275,6 +300,13 @@ defmodule FerricstoreServer.Connection.Sendfile do
     else
       count = end_clamped - start_clamped + 1
       {start_clamped, count}
+    end
+  end
+
+  defp slice_value(value, start_idx, end_idx) do
+    case normalize_byte_range(byte_size(value), start_idx, end_idx) do
+      :empty -> ""
+      {offset, count} -> binary_part(value, offset, count)
     end
   end
 
