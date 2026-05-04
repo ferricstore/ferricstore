@@ -10,7 +10,6 @@ defmodule FerricstoreServer.ConnectionTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-
   defp connect(port) do
     {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false, packet: :raw])
     sock
@@ -489,9 +488,7 @@ defmodule FerricstoreServer.ConnectionTest do
     _greeting = recv(sock)
 
     send_raw(sock, "*0\r\n")
-    data = recv(sock)
-    assert is_binary(data)
-    assert byte_size(data) > 0
+    assert {:error, :timeout} = :gen_tcp.recv(sock, 0, 50)
 
     send_command(sock, ["PING"])
     pong = recv(sock)
