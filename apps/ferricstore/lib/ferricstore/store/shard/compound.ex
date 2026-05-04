@@ -999,7 +999,7 @@ defmodule Ferricstore.Store.Shard.Compound do
         "Shard #{state.index}: cannot determine prefix for promoted key #{inspect(redis_key)}, skipping compaction"
       )
 
-      {:error, state}
+      fail_dedicated_compaction(state, redis_key, dedicated_path, :prefix, :missing_prefix)
     else
       active = Promotion.find_active(dedicated_path)
       # Sync outgoing active before we stop writing to it, so any last
@@ -1037,16 +1037,23 @@ defmodule Ferricstore.Store.Shard.Compound do
                   )
 
                   rollback_new_active_file(state, dedicated_path, new_file)
-                  {:error, state}
+
+                  fail_dedicated_compaction(
+                    state,
+                    redis_key,
+                    dedicated_path,
+                    :collect_live_entries,
+                    reason
+                  )
               end
 
-            {:error, _reason} ->
+            {:error, reason} ->
               rollback_new_active_file(state, dedicated_path, new_file)
-              {:error, state}
+              fail_dedicated_compaction(state, redis_key, dedicated_path, :create_active, reason)
           end
 
-        {:error, _reason} ->
-          {:error, state}
+        {:error, reason} ->
+          fail_dedicated_compaction(state, redis_key, dedicated_path, :sync_old_active, reason)
       end
     end
   end
@@ -1068,7 +1075,8 @@ defmodule Ferricstore.Store.Shard.Compound do
            :ok <- dedicated_fsync_dir(state, dedicated_path, :remove_old_logs) do
         {:ok, state}
       else
-        {:error, _reason} -> {:error, state}
+        {:error, reason} ->
+          fail_dedicated_compaction(state, redis_key, dedicated_path, :remove_old_logs, reason)
       end
     else
       batch = Enum.map(live_entries, fn {k, v, exp} -> {k, v, exp} end)
@@ -1104,8 +1112,14 @@ defmodule Ferricstore.Store.Shard.Compound do
 
             {:ok, state}
           else
-            {:error, _reason} ->
-              {:error, state}
+            {:error, reason} ->
+              fail_dedicated_compaction(
+                state,
+                redis_key,
+                dedicated_path,
+                :remove_old_logs,
+                reason
+              )
           end
 
         {:ok, results} ->
@@ -1114,7 +1128,14 @@ defmodule Ferricstore.Store.Shard.Compound do
           )
 
           rollback_new_active_file(state, dedicated_path, new_file)
-          {:error, state}
+
+          fail_dedicated_compaction(
+            state,
+            redis_key,
+            dedicated_path,
+            :append,
+            {:append_result_mismatch, length(live_entries), length(results)}
+          )
 
         {:error, reason} ->
           Logger.error(
@@ -1124,10 +1145,43 @@ defmodule Ferricstore.Store.Shard.Compound do
           # Roll back the `touch!(new_file)` on write error. Fsync
           # so the rollback survives a subsequent crash.
           rollback_new_active_file(state, dedicated_path, new_file)
-          {:error, state}
+          fail_dedicated_compaction(state, redis_key, dedicated_path, :append, reason)
       end
     end
   end
+
+  defp fail_dedicated_compaction(state, redis_key, dedicated_path, phase, reason) do
+    :telemetry.execute(
+      [:ferricstore, :dedicated, :compaction_failed],
+      %{count: 1, error_count: dedicated_compaction_error_count(reason)},
+      %{
+        shard_index: state.index,
+        phase: phase,
+        reason: dedicated_compaction_failure_reason(reason),
+        path: dedicated_path,
+        redis_key_hash: :erlang.phash2(redis_key)
+      }
+    )
+
+    {:error, state}
+  end
+
+  defp dedicated_compaction_error_count({:cold_read_failed, errors}) when is_list(errors),
+    do: length(errors)
+
+  defp dedicated_compaction_error_count(_reason), do: 1
+
+  defp dedicated_compaction_failure_reason({:cold_read_failed, _errors}), do: :cold_read_failed
+
+  defp dedicated_compaction_failure_reason({:append_result_mismatch, _expected, _got}),
+    do: :append_result_mismatch
+
+  defp dedicated_compaction_failure_reason({:remove_old_log_failed, _path, _reason}),
+    do: :remove_old_log_failed
+
+  defp dedicated_compaction_failure_reason(reason) when is_atom(reason), do: reason
+  defp dedicated_compaction_failure_reason({reason, _detail}) when is_atom(reason), do: reason
+  defp dedicated_compaction_failure_reason(_reason), do: :error
 
   defp rollback_new_active_file(state, dedicated_path, new_file) do
     case Ferricstore.FS.rm(new_file) do

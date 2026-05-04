@@ -149,6 +149,23 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
     Promotion.dedicated_path(data_dir, shard_idx, :hash, key)
   end
 
+  defp attach_dedicated_compaction_failed_handler do
+    parent = self()
+    handler_id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :dedicated, :compaction_failed],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:dedicated_compaction_failed, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
   defp log_file_count(dir) do
     case File.ls(dir) do
       {:ok, files} -> Enum.count(files, &String.ends_with?(&1, ".log"))
@@ -417,7 +434,21 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
 
       assert log_files(dedicated_path) == ["00000.log"]
 
+      attach_dedicated_compaction_failed_handler()
+
       ShardCompound.compact_dedicated(state, key, dedicated_path)
+
+      assert_receive {:dedicated_compaction_failed,
+                      [:ferricstore, :dedicated, :compaction_failed], %{count: 1, error_count: 1},
+                      %{
+                        shard_index: ^shard_idx,
+                        phase: :collect_live_entries,
+                        reason: :cold_read_failed,
+                        path: ^dedicated_path,
+                        redis_key_hash: key_hash
+                      }}
+
+      assert is_integer(key_hash)
 
       assert File.exists?(Path.join(dedicated_path, "00000.log")),
              "old dedicated log must stay until every live cold row was copied"
