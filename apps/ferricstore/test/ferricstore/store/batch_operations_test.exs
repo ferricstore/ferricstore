@@ -266,6 +266,25 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert nil == Router.get(default_ctx(), overloaded_key)
     end
 
+    test "direct batch_async_put rejects pressured shards before publishing writes" do
+      ctx = default_ctx()
+      pressured_key = "#{@ns_async}:bap_pressure_#{System.unique_integer([:positive])}"
+      ok_key = different_shard_key(ctx, pressured_key, "#{@ns_async}:bap_pressure_ok")
+      idx = Router.shard_for(ctx, pressured_key)
+
+      Ferricstore.Store.DiskPressure.set(ctx, idx)
+
+      try do
+        assert {:error, "ERR disk pressure on shard " <> _} =
+                 Router.batch_async_put(ctx, [{pressured_key, "blocked"}, {ok_key, "allowed"}])
+
+        assert nil == Router.get(ctx, pressured_key)
+        assert nil == Router.get(ctx, ok_key)
+      after
+        Ferricstore.Store.DiskPressure.clear(ctx, idx)
+      end
+    end
+
     test "large batch does not recover unaccepted value when async replication is overloaded" do
       key = "#{@ns_async}:bap_overloaded_large_missing_#{System.unique_integer([:positive])}"
       idx = Router.shard_for(default_ctx(), key)

@@ -399,6 +399,11 @@ defmodule Ferricstore.Store.Router do
   # For read-modify-write (INCR etc.), concurrent same-key mutations are
   # serialized via the per-key latch + RmwCoordinator worker. No lost updates.
 
+  defp shard_under_disk_pressure?(ctx, idx) do
+    size = :atomics.info(ctx.disk_pressure).size
+    idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
+  end
+
   defp async_write(ctx, idx, {:put, key, value, expire_at_ms}) do
     size = :atomics.info(ctx.disk_pressure).size
     under_pressure = if idx < size, do: :atomics.get(ctx.disk_pressure, idx + 1) == 1, else: false
@@ -2663,13 +2668,17 @@ defmodule Ferricstore.Store.Router do
   shard, fires BitcaskWriter casts and Raft submissions individually
   (they batch internally). Returns `:ok` or `{:error, reason}`.
 
-  Caller must validate key/value sizes and check pressure flags before
-  calling. This skips all per-key validation for speed.
+  Caller must validate key/value sizes before calling. This skips per-key
+  validation for speed, but still rejects pressured shards before publishing
+  any writes so a mixed batch cannot partially bypass disk-pressure backoff.
   """
   @spec batch_async_put(FerricStore.Instance.t(), [{binary(), binary()}]) ::
           :ok | {:error, binary()}
   def batch_async_put(%{name: name} = ctx, kv_pairs) when name != :default do
-    batch_local_put(ctx, kv_pairs)
+    case pressured_batch_shard(ctx, kv_pairs) do
+      nil -> batch_local_put(ctx, kv_pairs)
+      idx -> {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
+    end
   end
 
   def batch_async_put(ctx, kv_pairs) do
@@ -2701,86 +2710,95 @@ defmodule Ferricstore.Store.Router do
         {idx, keydir, shard_kvs, Enum.reverse(entries), large_disk_batch}
       end)
 
-    locks =
-      for {idx, _keydir, _shard_kvs, entries, _large_disk_batch} <- shard_batches,
-          {key, _value, _value_for_ets} <- entries do
-        {idx, key}
-      end
+    pressured_idx =
+      Enum.find_value(shard_batches, fn {idx, _keydir, _shard_kvs, _entries, _large_disk_batch} ->
+        if shard_under_disk_pressure?(ctx, idx), do: idx, else: nil
+      end)
 
-    case acquire_async_key_latches(ctx, locks) do
-      {:ok, held_latches} ->
-        try do
-          overloaded? =
-            Enum.any?(shard_batches, fn {idx, _keydir, _shard_kvs, _entries, _large_disk_batch} ->
-              not Ferricstore.Raft.Batcher.async_accepting?(idx)
-            end)
-
-          if overloaded?, do: throw({:async_error, "ERR async replication overloaded"})
-
-          large_previous = snapshot_batch_large_values(ctx, shard_batches)
-
-          disk_locations =
-            Enum.reduce(
-              shard_batches,
-              %{},
-              fn {idx, _keydir, _shard_kvs, _entries, large_disk_batch}, acc ->
-                if large_disk_batch == [] do
-                  acc
-                else
-                  reversed = Enum.reverse(large_disk_batch)
-
-                  case nif_append_batch_with_file(ctx, idx, reversed) do
-                    {:ok, file_id, locations} ->
-                      shard_locations =
-                        Enum.zip(reversed, locations)
-                        |> Map.new(fn {{key, value, _exp}, {offset, _rec_size}} ->
-                          {key, {file_id, offset, byte_size(value)}}
-                        end)
-
-                      Map.put(acc, idx, shard_locations)
-
-                    {:error, reason} ->
-                      throw({:disk_error, reason})
-                  end
-                end
-              end
-            )
-
-          Enum.reduce(shard_batches, MapSet.new(), fn {idx, _keydir, _shard_kvs, entries,
-                                                       _large_disk_batch},
-                                                      accepted_idxs ->
-            raft_cmds = build_origin_checked_batch_put_commands(ctx, idx, entries)
-
-            case async_submit_batch_to_raft(idx, raft_cmds) do
-              :ok ->
-                MapSet.put(accepted_idxs, idx)
-
-              {:error, reason} ->
-                rollback_batch_large_puts(ctx, large_previous, accepted_idxs)
-
-                if MapSet.size(accepted_idxs) > 0 do
-                  throw({:partial_async_error, reason})
-                else
-                  throw({:async_error, reason})
-                end
-            end
-          end)
-
-          Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, _large_disk_batch} ->
-            shard_locations = Map.get(disk_locations, idx, %{})
-            install_batch_async_entries(ctx, idx, keydir, entries, shard_locations, lfu_val)
-
-            if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, length(shard_kvs))
-          end)
-        after
-          release_async_key_latches(held_latches)
+    if pressured_idx do
+      {:error, "ERR disk pressure on shard #{pressured_idx}, rejecting async write"}
+    else
+      locks =
+        for {idx, _keydir, _shard_kvs, entries, _large_disk_batch} <- shard_batches,
+            {key, _value, _value_for_ets} <- entries do
+          {idx, key}
         end
 
-      {:error, {:timeout, wait_ms}} ->
-        throw({:async_error, async_key_latch_timeout_error_message(wait_ms)})
-    end
+      case acquire_async_key_latches(ctx, locks) do
+        {:ok, held_latches} ->
+          try do
+            overloaded? =
+              Enum.any?(shard_batches, fn {idx, _keydir, _shard_kvs, _entries, _large_disk_batch} ->
+                not Ferricstore.Raft.Batcher.async_accepting?(idx)
+              end)
 
-    :ok
+            if overloaded?, do: throw({:async_error, "ERR async replication overloaded"})
+
+            large_previous = snapshot_batch_large_values(ctx, shard_batches)
+
+            disk_locations =
+              Enum.reduce(
+                shard_batches,
+                %{},
+                fn {idx, _keydir, _shard_kvs, _entries, large_disk_batch}, acc ->
+                  if large_disk_batch == [] do
+                    acc
+                  else
+                    reversed = Enum.reverse(large_disk_batch)
+
+                    case nif_append_batch_with_file(ctx, idx, reversed) do
+                      {:ok, file_id, locations} ->
+                        shard_locations =
+                          Enum.zip(reversed, locations)
+                          |> Map.new(fn {{key, value, _exp}, {offset, _rec_size}} ->
+                            {key, {file_id, offset, byte_size(value)}}
+                          end)
+
+                        Map.put(acc, idx, shard_locations)
+
+                      {:error, reason} ->
+                        throw({:disk_error, reason})
+                    end
+                  end
+                end
+              )
+
+            Enum.reduce(shard_batches, MapSet.new(), fn {idx, _keydir, _shard_kvs, entries,
+                                                         _large_disk_batch},
+                                                        accepted_idxs ->
+              raft_cmds = build_origin_checked_batch_put_commands(ctx, idx, entries)
+
+              case async_submit_batch_to_raft(idx, raft_cmds) do
+                :ok ->
+                  MapSet.put(accepted_idxs, idx)
+
+                {:error, reason} ->
+                  rollback_batch_large_puts(ctx, large_previous, accepted_idxs)
+
+                  if MapSet.size(accepted_idxs) > 0 do
+                    throw({:partial_async_error, reason})
+                  else
+                    throw({:async_error, reason})
+                  end
+              end
+            end)
+
+            Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, _large_disk_batch} ->
+              shard_locations = Map.get(disk_locations, idx, %{})
+              install_batch_async_entries(ctx, idx, keydir, entries, shard_locations, lfu_val)
+
+              if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, length(shard_kvs))
+            end)
+          after
+            release_async_key_latches(held_latches)
+          end
+
+        {:error, {:timeout, wait_ms}} ->
+          throw({:async_error, async_key_latch_timeout_error_message(wait_ms)})
+      end
+
+      :ok
+    end
   catch
     :throw, {:disk_error, reason} ->
       {:error, "ERR disk write failed: #{inspect(reason)}"}
@@ -2835,6 +2853,13 @@ defmodule Ferricstore.Store.Router do
         {:error, _} = err -> {:halt, err}
         other -> {:halt, {:error, inspect(other)}}
       end
+    end)
+  end
+
+  defp pressured_batch_shard(ctx, kv_pairs) do
+    Enum.find_value(kv_pairs, fn {key, _value} ->
+      idx = shard_for(ctx, key)
+      if shard_under_disk_pressure?(ctx, idx), do: idx, else: nil
     end)
   end
 
