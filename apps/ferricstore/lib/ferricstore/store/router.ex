@@ -30,6 +30,7 @@ defmodule Ferricstore.Store.Router do
   @cold_batch_read_timeout_ms 10_000
   @cold_location_retry_attempts 8
   @cold_location_retry_sleep_ms 1
+  @default_async_key_latch_timeout_ms 30_000
   @async_list_rollback_key :ferricstore_async_list_originals
 
   defguardp valid_cold_file_ref(file_id, value_size)
@@ -1205,24 +1206,41 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp with_async_key_latch(ctx, idx, key, fun) do
-    [{latch_tab, ^key}] = acquire_async_key_latches(ctx, [{idx, key}])
+    case acquire_async_key_latches(ctx, [{idx, key}]) do
+      {:ok, [{latch_tab, ^key}]} ->
+        try do
+          fun.()
+        after
+          release_async_key_latches([{latch_tab, key}])
+        end
 
-    try do
-      fun.()
-    after
-      release_async_key_latches([{latch_tab, key}])
+      {:error, {:timeout, wait_ms}} ->
+        async_key_latch_timeout_error(wait_ms)
     end
   end
 
   defp acquire_async_key_latches(ctx, locks) do
-    locks
-    |> Enum.uniq()
-    |> Enum.sort()
-    |> Enum.map(fn {idx, key} ->
-      latch_tab = elem(ctx.latch_refs, idx)
-      wait_for_async_key_latch(latch_tab, key)
-      {latch_tab, key}
-    end)
+    result =
+      locks
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.reduce_while([], fn {idx, key}, held ->
+        latch_tab = elem(ctx.latch_refs, idx)
+
+        case wait_for_async_key_latch(latch_tab, idx, key) do
+          :ok ->
+            {:cont, [{latch_tab, key} | held]}
+
+          {:error, reason} ->
+            release_async_key_latches(held)
+            {:halt, {:error, reason}}
+        end
+      end)
+
+    case result do
+      {:error, _reason} = error -> error
+      held -> {:ok, Enum.reverse(held)}
+    end
   end
 
   defp try_acquire_async_key_latches(ctx, locks) do
@@ -1252,27 +1270,78 @@ defmodule Ferricstore.Store.Router do
     end)
   end
 
-  defp wait_for_async_key_latch(latch_tab, key) do
+  defp wait_for_async_key_latch(latch_tab, idx, key) do
     case :ets.insert_new(latch_tab, {key, self()}) do
       true ->
         :ok
 
       false ->
-        case :ets.lookup(latch_tab, key) do
-          [{^key, holder}] when is_pid(holder) ->
-            if Process.alive?(holder) do
-              latch_retry_backoff()
-              wait_for_async_key_latch(latch_tab, key)
-            else
-              :ets.select_delete(latch_tab, [{{key, holder}, [], [true]}])
-              wait_for_async_key_latch(latch_tab, key)
-            end
+        emit_async_key_latch_event(:blocked, idx, key, 0)
 
-          _ ->
-            latch_retry_backoff()
-            wait_for_async_key_latch(latch_tab, key)
+        wait_for_async_key_latch(
+          latch_tab,
+          idx,
+          key,
+          System.monotonic_time(:millisecond),
+          async_key_latch_timeout_ms()
+        )
+    end
+  end
+
+  defp wait_for_async_key_latch(latch_tab, idx, key, started_ms, timeout_ms) do
+    case :ets.insert_new(latch_tab, {key, self()}) do
+      true ->
+        :ok
+
+      false ->
+        wait_ms = max(System.monotonic_time(:millisecond) - started_ms, 0)
+
+        if wait_ms >= timeout_ms do
+          emit_async_key_latch_event(:timeout, idx, key, wait_ms)
+          {:error, {:timeout, wait_ms}}
+        else
+          wait_for_async_key_latch_holder(latch_tab, idx, key, started_ms, timeout_ms)
         end
     end
+  end
+
+  defp wait_for_async_key_latch_holder(latch_tab, idx, key, started_ms, timeout_ms) do
+    case :ets.lookup(latch_tab, key) do
+      [{^key, holder}] when is_pid(holder) ->
+        if Process.alive?(holder) do
+          latch_retry_backoff()
+        else
+          :ets.select_delete(latch_tab, [{{key, holder}, [], [true]}])
+        end
+
+      _ ->
+        latch_retry_backoff()
+    end
+
+    wait_for_async_key_latch(latch_tab, idx, key, started_ms, timeout_ms)
+  end
+
+  defp async_key_latch_timeout_ms do
+    Application.get_env(
+      :ferricstore,
+      :router_async_key_latch_timeout_ms,
+      @default_async_key_latch_timeout_ms
+    )
+  end
+
+  defp async_key_latch_timeout_error(wait_ms) do
+    {:error, async_key_latch_timeout_error_message(wait_ms)}
+  end
+
+  defp async_key_latch_timeout_error_message(wait_ms),
+    do: "ERR async key latch timeout after #{wait_ms}ms"
+
+  defp emit_async_key_latch_event(status, idx, key, wait_ms) do
+    :telemetry.execute(
+      [:ferricstore, :store, :async_key_latch],
+      %{count: 1, wait_ms: wait_ms},
+      %{status: status, shard_index: idx, redis_key_hash: :erlang.phash2(key)}
+    )
   end
 
   defp latch_retry_backoff do
@@ -2603,70 +2672,77 @@ defmodule Ferricstore.Store.Router do
         {idx, key}
       end
 
-    held_latches = acquire_async_key_latches(ctx, locks)
+    case acquire_async_key_latches(ctx, locks) do
+      {:ok, held_latches} ->
+        try do
+          overloaded? =
+            Enum.any?(shard_batches, fn {idx, _keydir, _shard_kvs, _entries, _large_disk_batch} ->
+              not Ferricstore.Raft.Batcher.async_accepting?(idx)
+            end)
 
-    try do
-      overloaded? =
-        Enum.any?(shard_batches, fn {idx, _keydir, _shard_kvs, _entries, _large_disk_batch} ->
-          not Ferricstore.Raft.Batcher.async_accepting?(idx)
-        end)
+          if overloaded?, do: throw({:async_error, "ERR async replication overloaded"})
 
-      if overloaded?, do: throw({:async_error, "ERR async replication overloaded"})
+          large_previous = snapshot_batch_large_values(ctx, shard_batches)
 
-      large_previous = snapshot_batch_large_values(ctx, shard_batches)
+          disk_locations =
+            Enum.reduce(
+              shard_batches,
+              %{},
+              fn {idx, _keydir, _shard_kvs, _entries, large_disk_batch}, acc ->
+                if large_disk_batch == [] do
+                  acc
+                else
+                  reversed = Enum.reverse(large_disk_batch)
 
-      disk_locations =
-        Enum.reduce(shard_batches, %{}, fn {idx, _keydir, _shard_kvs, _entries, large_disk_batch},
-                                           acc ->
-          if large_disk_batch == [] do
-            acc
-          else
-            reversed = Enum.reverse(large_disk_batch)
+                  case nif_append_batch_with_file(ctx, idx, reversed) do
+                    {:ok, file_id, locations} ->
+                      shard_locations =
+                        Enum.zip(reversed, locations)
+                        |> Map.new(fn {{key, value, _exp}, {offset, _rec_size}} ->
+                          {key, {file_id, offset, byte_size(value)}}
+                        end)
 
-            case nif_append_batch_with_file(ctx, idx, reversed) do
-              {:ok, file_id, locations} ->
-                shard_locations =
-                  Enum.zip(reversed, locations)
-                  |> Map.new(fn {{key, value, _exp}, {offset, _rec_size}} ->
-                    {key, {file_id, offset, byte_size(value)}}
-                  end)
+                      Map.put(acc, idx, shard_locations)
 
-                Map.put(acc, idx, shard_locations)
+                    {:error, reason} ->
+                      throw({:disk_error, reason})
+                  end
+                end
+              end
+            )
+
+          Enum.reduce(shard_batches, MapSet.new(), fn {idx, _keydir, _shard_kvs, entries,
+                                                       _large_disk_batch},
+                                                      accepted_idxs ->
+            raft_cmds = build_origin_checked_batch_put_commands(ctx, idx, entries)
+
+            case async_submit_batch_to_raft(idx, raft_cmds) do
+              :ok ->
+                MapSet.put(accepted_idxs, idx)
 
               {:error, reason} ->
-                throw({:disk_error, reason})
+                rollback_batch_large_puts(ctx, large_previous, accepted_idxs)
+
+                if MapSet.size(accepted_idxs) > 0 do
+                  throw({:partial_async_error, reason})
+                else
+                  throw({:async_error, reason})
+                end
             end
-          end
-        end)
+          end)
 
-      Enum.reduce(shard_batches, MapSet.new(), fn {idx, _keydir, _shard_kvs, entries,
-                                                   _large_disk_batch},
-                                                  accepted_idxs ->
-        raft_cmds = build_origin_checked_batch_put_commands(ctx, idx, entries)
+          Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, _large_disk_batch} ->
+            shard_locations = Map.get(disk_locations, idx, %{})
+            install_batch_async_entries(ctx, idx, keydir, entries, shard_locations, lfu_val)
 
-        case async_submit_batch_to_raft(idx, raft_cmds) do
-          :ok ->
-            MapSet.put(accepted_idxs, idx)
-
-          {:error, reason} ->
-            rollback_batch_large_puts(ctx, large_previous, accepted_idxs)
-
-            if MapSet.size(accepted_idxs) > 0 do
-              throw({:partial_async_error, reason})
-            else
-              throw({:async_error, reason})
-            end
+            if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, length(shard_kvs))
+          end)
+        after
+          release_async_key_latches(held_latches)
         end
-      end)
 
-      Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, _large_disk_batch} ->
-        shard_locations = Map.get(disk_locations, idx, %{})
-        install_batch_async_entries(ctx, idx, keydir, entries, shard_locations, lfu_val)
-
-        if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, length(shard_kvs))
-      end)
-    after
-      release_async_key_latches(held_latches)
+      {:error, {:timeout, wait_ms}} ->
+        throw({:async_error, async_key_latch_timeout_error_message(wait_ms)})
     end
 
     :ok

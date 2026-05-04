@@ -701,6 +701,52 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       assert Router.get(ctx(), key) == "1"
     end
 
+    test "async SET returns an error and emits telemetry when same-key latch wait times out" do
+      original_timeout = Application.get_env(:ferricstore, :router_async_key_latch_timeout_ms)
+      Application.put_env(:ferricstore, :router_async_key_latch_timeout_ms, 5)
+
+      key = ukey("set_latch_timeout")
+      idx = Router.shard_for(ctx(), key)
+      latch_tab = elem(ctx().latch_refs, idx)
+      holder = spawn(fn -> Process.sleep(:infinity) end)
+      handler_id = {:async_key_latch_timeout, self(), make_ref()}
+      test_pid = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :store, :async_key_latch],
+        fn event, measurements, metadata, _config ->
+          send(test_pid, {:async_key_latch_telemetry, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      assert :ets.insert_new(latch_tab, {key, holder})
+      task = Task.async(fn -> Router.put(ctx(), key, "1", 0) end)
+
+      try do
+        assert {:ok, {:error, message}} = Task.yield(task, 500)
+        assert message =~ "async key latch timeout"
+        assert Router.get(ctx(), key) == nil
+
+        assert_receive {:async_key_latch_telemetry, [:ferricstore, :store, :async_key_latch],
+                        %{wait_ms: wait_ms}, %{status: :timeout, shard_index: ^idx}},
+                       1_000
+
+        assert wait_ms >= 5
+      after
+        if Process.alive?(task.pid), do: Task.shutdown(task, :brutal_kill)
+        Process.exit(holder, :kill)
+        :ets.take(latch_tab, key)
+        :telemetry.detach(handler_id)
+
+        case original_timeout do
+          nil -> Application.delete_env(:ferricstore, :router_async_key_latch_timeout_ms)
+          value -> Application.put_env(:ferricstore, :router_async_key_latch_timeout_ms, value)
+        end
+      end
+    end
+
     test "async batch SET waits behind existing same-key RMW latches before publishing" do
       key = ukey("batch_set_latch")
       other_key = ukey("batch_set_latch_other")
