@@ -799,13 +799,13 @@ defmodule Ferricstore.Store.Router do
          before_expire_at_ms,
          success
        ) do
-    if large_value_for_hot_cache?(ctx, value) do
-      install_large_rmw_and_submit(ctx, idx, key, value, expire_at_ms, raft_cmd, success)
-    else
-      checked_cmd =
-        {:origin_checked, key, raft_cmd, origin_check_value(before_value), before_expire_at_ms,
-         origin_check_value(value), expire_at_ms}
+    checked_cmd =
+      {:origin_checked, key, raft_cmd, origin_check_value(before_value), before_expire_at_ms,
+       origin_check_value(value), expire_at_ms}
 
+    if large_value_for_hot_cache?(ctx, value) do
+      install_large_rmw_and_submit(ctx, idx, key, value, expire_at_ms, checked_cmd, success)
+    else
       with :ok <- async_enqueue_to_raft(idx, checked_cmd),
            :ok <- install_rmw_value(ctx, idx, key, value, expire_at_ms) do
         success
@@ -813,14 +813,14 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp install_large_rmw_and_submit(ctx, idx, key, value, expire_at_ms, raft_cmd, success) do
+  defp install_large_rmw_and_submit(ctx, idx, key, value, expire_at_ms, checked_cmd, success) do
     keydir = elem(ctx.keydir_refs, idx)
     previous = snapshot_live_value(ctx, idx, key)
     disk_value = to_disk_binary(value)
 
     case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
       {:ok, file_id, [{offset, _record_size}]} ->
-        case async_submit_to_raft(idx, raft_cmd) do
+        case async_submit_to_raft(idx, checked_cmd) do
           :ok ->
             track_keydir_binary_insert(ctx, idx, keydir, key, nil)
 

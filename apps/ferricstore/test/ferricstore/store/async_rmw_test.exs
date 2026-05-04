@@ -93,6 +93,26 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       assert offenders == [],
              "RMW latch waiters must block/back off under contention, not yield-spin: #{inspect(offenders)}"
     end
+
+    test "large RMW submits origin_checked command for crash replay correctness" do
+      router_path =
+        Path.expand(
+          "../../../lib/ferricstore/store/router.ex",
+          __DIR__
+        )
+
+      source = File.read!(router_path)
+
+      assert source =~
+               "defp install_large_rmw_and_submit(ctx, idx, key, value, expire_at_ms, checked_cmd, success)"
+
+      assert source =~ "case async_submit_to_raft(idx, checked_cmd) do",
+             """
+             Large async RMW must submit the origin_checked command, not the raw
+             APPEND/SETRANGE/etc. If crash recovery sees only the old cold value,
+             a raw origin command can be skipped by ETS-presence detection.
+             """
+    end
   end
 
   describe "instance context on fallback path" do

@@ -557,6 +557,36 @@ defmodule Ferricstore.Raft.StateMachineTest do
                NIF.v2_scan_file(active_file_path)
     end
 
+    test "replays origin checked large APPEND over an older cold value", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path
+    } do
+      key = "old_origin_large_append"
+      old_value = String.duplicate("o", 70_000)
+      suffix = String.duplicate("n", 2048)
+      expected_value = old_value <> suffix
+
+      {:ok, [{old_offset, _old_record_size}]} =
+        NIF.v2_append_batch(active_file_path, [{key, old_value, 0}])
+
+      :ets.insert(ets, {key, nil, 0, 1, 0, old_offset, byte_size(old_value)})
+
+      {_state2, {:ok, expected_size}} =
+        StateMachine.apply(
+          %{},
+          {:async, node(),
+           {:origin_checked, key, {:append, key, suffix}, old_value, 0, expected_value, 0}},
+          state
+        )
+
+      assert expected_size == byte_size(expected_value)
+      assert [{^key, nil, 0, _lfu, 0, new_offset, value_size}] = :ets.lookup(ets, key)
+      assert value_size == byte_size(expected_value)
+      refute new_offset == old_offset
+      assert {:ok, ^expected_value} = NIF.v2_pread_at(active_file_path, new_offset)
+    end
+
     test "replays origin async DELETE when recovery still has an older value", %{
       state: state,
       ets: ets,
