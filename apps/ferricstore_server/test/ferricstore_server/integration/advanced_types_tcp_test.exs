@@ -21,6 +21,11 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
     :ok = :gen_tcp.send(sock, data)
   end
 
+  defp send_pipeline(sock, commands) do
+    data = commands |> Enum.map(&Encoder.encode/1) |> IO.iodata_to_binary()
+    :ok = :gen_tcp.send(sock, data)
+  end
+
   defp recv_response(sock) do
     recv_response(sock, "")
   end
@@ -253,6 +258,89 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
       assert recv_response(sock) == 1
 
       :gen_tcp.close(sock)
+    end
+
+    test "concurrent PFADD updates over TCP preserve every element", %{port: port} do
+      k = ukey("pfadd_concurrent")
+      element_count = 50
+      parent = self()
+
+      tasks =
+        for i <- 1..element_count do
+          Task.async(fn ->
+            worker = connect_and_hello(port)
+            send(parent, {:ready, self()})
+
+            receive do
+              :go -> :ok
+            after
+              5_000 -> flunk("timed out waiting for concurrent PFADD release")
+            end
+
+            send_cmd(worker, ["PFADD", k, "elem:#{i}"])
+            response = recv_response(worker)
+            :gen_tcp.close(worker)
+            response
+          end)
+        end
+
+      for _ <- 1..element_count do
+        assert_receive {:ready, _pid}, 5_000
+      end
+
+      Enum.each(tasks, fn task -> send(task.pid, :go) end)
+
+      assert Enum.all?(Enum.map(tasks, &Task.await(&1, 30_000)), &(&1 in [0, 1]))
+
+      reader = connect_and_hello(port)
+      send_cmd(reader, ["PFCOUNT", k])
+      assert recv_response(reader) == element_count
+      :gen_tcp.close(reader)
+    end
+
+    test "concurrent pipelined PFADD updates preserve every element", %{port: port} do
+      k = ukey("pfadd_pipeline_concurrent")
+      element_count = 50
+      parent = self()
+
+      tasks =
+        for i <- 1..element_count do
+          Task.async(fn ->
+            worker = connect_and_hello(port)
+            send(parent, {:ready, self()})
+
+            receive do
+              :go -> :ok
+            after
+              5_000 -> flunk("timed out waiting for concurrent pipelined PFADD release")
+            end
+
+            send_pipeline(worker, [
+              ["PFADD", k, "elem:#{i}"],
+              ["PING"]
+            ])
+
+            responses = recv_n(worker, 2)
+            :gen_tcp.close(worker)
+            responses
+          end)
+        end
+
+      for _ <- 1..element_count do
+        assert_receive {:ready, _pid}, 5_000
+      end
+
+      Enum.each(tasks, fn task -> send(task.pid, :go) end)
+
+      assert Enum.all?(Enum.map(tasks, &Task.await(&1, 30_000)), fn
+               [result, {:simple, "PONG"}] -> result in [0, 1]
+               _ -> false
+             end)
+
+      reader = connect_and_hello(port)
+      send_cmd(reader, ["PFCOUNT", k])
+      assert recv_response(reader) == element_count
+      :gen_tcp.close(reader)
     end
   end
 
@@ -570,6 +658,62 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
 
       assert Enum.map(tasks, &Task.await(&1, 30_000)) ==
                List.duplicate({:simple, "OK"}, field_count)
+
+      reader = connect_and_hello(port)
+      send_cmd(reader, ["JSON.GET", k])
+      final = recv_response(reader) |> Jason.decode!()
+      :gen_tcp.close(reader)
+
+      assert Map.new(1..field_count, fn i -> {"f#{i}", i} end) == final
+    end
+
+    test "concurrent pipelined JSON.SET path updates preserve every field", %{port: port} do
+      sock = connect_and_hello(port)
+      k = ukey("jsonset_pipeline_concurrent")
+      field_count = 50
+
+      root =
+        1..field_count
+        |> Map.new(fn i -> {"f#{i}", 0} end)
+        |> Jason.encode!()
+
+      send_cmd(sock, ["JSON.SET", k, "$", root])
+      assert recv_response(sock) == {:simple, "OK"}
+      :gen_tcp.close(sock)
+
+      parent = self()
+
+      tasks =
+        for i <- 1..field_count do
+          Task.async(fn ->
+            worker = connect_and_hello(port)
+            send(parent, {:ready, self()})
+
+            receive do
+              :go -> :ok
+            after
+              5_000 -> flunk("timed out waiting for concurrent pipelined JSON.SET release")
+            end
+
+            send_pipeline(worker, [
+              ["JSON.SET", k, "$.f#{i}", Integer.to_string(i)],
+              ["PING"]
+            ])
+
+            responses = recv_n(worker, 2)
+            :gen_tcp.close(worker)
+            responses
+          end)
+        end
+
+      for _ <- 1..field_count do
+        assert_receive {:ready, _pid}, 5_000
+      end
+
+      Enum.each(tasks, fn task -> send(task.pid, :go) end)
+
+      assert Enum.map(tasks, &Task.await(&1, 30_000)) ==
+               List.duplicate([{:simple, "OK"}, {:simple, "PONG"}], field_count)
 
       reader = connect_and_hello(port)
       send_cmd(reader, ["JSON.GET", k])

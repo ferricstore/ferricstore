@@ -646,6 +646,15 @@ defmodule FerricstoreServer.Connection do
   defp dispatch_store_command(
          _cmd,
          _args,
+         {:pfadd, [key | elements]},
+         %FerricStore.Instance{} = store
+       ) do
+    Router.pfadd(store, key, elements)
+  end
+
+  defp dispatch_store_command(
+         _cmd,
+         _args,
          {:json_set, key, path, value, flags},
          %FerricStore.Instance{} = store
        ) do
