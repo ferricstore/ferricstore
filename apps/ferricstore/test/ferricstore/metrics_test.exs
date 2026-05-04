@@ -279,6 +279,7 @@ defmodule Ferricstore.MetricsTest do
         "ferricstore_bitcask_last_applied_index",
         "ferricstore_bitcask_last_released_cursor_index",
         "ferricstore_bitcask_release_cursor_gap",
+        "ferricstore_bitcask_pending_release_cursor_checkpoint_count",
         "ferricstore_bitcask_checkpoint_dirty",
         "ferricstore_bitcask_checkpoint_in_flight"
       ]

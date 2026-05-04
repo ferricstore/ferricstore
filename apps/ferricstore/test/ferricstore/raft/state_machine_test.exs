@@ -3106,6 +3106,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       disk_pressure = :atomics.new(2, signed: false)
       last_applied_index = :atomics.new(2, signed: false)
       last_released_cursor_index = :atomics.new(2, signed: false)
+      pending_release_cursor_checkpoint_count = :atomics.new(2, signed: false)
 
       state =
         init_state_for_release_cursor(ets,
@@ -3124,6 +3125,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
         disk_pressure: disk_pressure,
         last_applied_index: last_applied_index,
         last_released_cursor_index: last_released_cursor_index,
+        pending_release_cursor_checkpoint_count: pending_release_cursor_checkpoint_count,
         hot_cache_max_value_size: 64
       }
 
@@ -3149,6 +3151,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
         assert :atomics.get(checkpoint_flags, shard1 + 1) == 1
         assert :atomics.get(last_released_cursor_index, shard0 + 1) == 0
+        assert :atomics.get(pending_release_cursor_checkpoint_count, shard0 + 1) == 1
 
         refute Enum.any?(effects1, &match?({:release_cursor, 1}, &1)),
                "coordinator Ra log must wait for remote Bitcask checkpoint durability"
@@ -3165,6 +3168,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
         assert Enum.any?(effects2, &match?({:release_cursor, 2}, &1))
         assert :atomics.get(last_released_cursor_index, shard0 + 1) == 2
+        assert :atomics.get(pending_release_cursor_checkpoint_count, shard0 + 1) == 0
       after
         :ets.delete(ets1)
         Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)

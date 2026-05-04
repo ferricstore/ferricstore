@@ -245,6 +245,11 @@ defmodule Ferricstore.Metrics do
         end
       ),
       checkpoint_metric_family(
+        "ferricstore_bitcask_pending_release_cursor_checkpoint_count",
+        "Number of shard checkpoint dependencies blocking Raft cursor release",
+        fn shard -> atomic_metric(ctx, :pending_release_cursor_checkpoint_count, shard) end
+      ),
+      checkpoint_metric_family(
         "ferricstore_bitcask_checkpoint_dirty",
         "Whether the shard has uncheckpointed Bitcask data",
         fn shard -> atomic_metric(ctx, :checkpoint_flags, shard) end

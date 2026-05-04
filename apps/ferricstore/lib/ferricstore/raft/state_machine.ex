@@ -1122,6 +1122,8 @@ defmodule Ferricstore.Raft.StateMachine do
         {state, []}
       end
 
+    record_pending_checkpoint_count(state)
+
     pending_checkpoint_indices =
       Map.get(state, :pending_release_cursor_checkpoint_indices, MapSet.new())
 
@@ -1192,6 +1194,8 @@ defmodule Ferricstore.Raft.StateMachine do
             else
               state
             end
+
+          record_pending_checkpoint_count(state)
 
           checkpoint_effects =
             if crossed_interval? and release_index == ra_index do
@@ -1312,6 +1316,17 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp record_cursor_metric(_state, _field, _index), do: :ok
+
+  defp record_pending_checkpoint_count(state) do
+    count =
+      state
+      |> Map.get(:pending_release_cursor_checkpoint_indices, MapSet.new())
+      |> MapSet.size()
+
+    record_cursor_metric(state, :pending_release_cursor_checkpoint_count, count)
+  rescue
+    _ -> :ok
+  end
 
   defp cursor_metric(%{shard_index: shard_index} = state, field) when is_atom(field) do
     case checkpoint_ctx_for_state(state) |> metric_ref(field) do
