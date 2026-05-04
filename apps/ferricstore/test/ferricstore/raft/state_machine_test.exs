@@ -2549,6 +2549,29 @@ defmodule Ferricstore.Raft.StateMachineTest do
   end
 
   describe "apply/3 probabilistic native failures" do
+    test "create reports prob directory parent fsync failure", %{state: state, ets: ets, dir: dir} do
+      key = "bloom_create_prob_dir_fsync_fail"
+
+      Process.put(:ferricstore_prob_fsync_dir_hook, fn ^dir ->
+        {:error, :eio}
+      end)
+
+      try do
+        {_state2, result} =
+          StateMachine.apply(
+            %{},
+            {:bloom_create, key, 9586, 7,
+             {:bloom_meta, %{num_bits: 9586, num_hashes: 7, capacity: 1000, error_rate: 0.01}}},
+            state
+          )
+
+        assert {:error, {:fsync_dir_failed, :create_prob_dir, :eio}} = result
+        assert [] == :ets.lookup(ets, key)
+      after
+        Process.delete(:ferricstore_prob_fsync_dir_hook)
+      end
+    end
+
     test "create failures do not publish metadata", %{state: state, ets: ets, dir: dir} do
       state = %{state | shard_index: 0}
       prob_dir = Path.join(dir, "prob")

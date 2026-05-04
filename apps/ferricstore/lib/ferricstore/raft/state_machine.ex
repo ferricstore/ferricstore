@@ -773,11 +773,12 @@ defmodule Ferricstore.Raft.StateMachine do
   def apply(meta, {:bloom_add, key, element, auto_create_params}, state) do
     apply_prob_with_time(meta, state, fn ->
       path = prob_path(state, key, "bloom")
-      ensure_prob_dir(state)
 
-      case auto_create_bloom_if_needed(state, path, key, auto_create_params) do
-        :ok -> NIF.bloom_file_add(path, element)
-        {:error, _reason} = error -> error
+      with :ok <- ensure_prob_dir(state) do
+        case auto_create_bloom_if_needed(state, path, key, auto_create_params) do
+          :ok -> NIF.bloom_file_add(path, element)
+          {:error, _reason} = error -> error
+        end
       end
     end)
   end
@@ -785,11 +786,12 @@ defmodule Ferricstore.Raft.StateMachine do
   def apply(meta, {:bloom_madd, key, elements, auto_create_params}, state) do
     apply_prob_with_time(meta, state, fn ->
       path = prob_path(state, key, "bloom")
-      ensure_prob_dir(state)
 
-      case auto_create_bloom_if_needed(state, path, key, auto_create_params) do
-        :ok -> NIF.bloom_file_madd(path, elements)
-        {:error, _reason} = error -> error
+      with :ok <- ensure_prob_dir(state) do
+        case auto_create_bloom_if_needed(state, path, key, auto_create_params) do
+          :ok -> NIF.bloom_file_madd(path, elements)
+          {:error, _reason} = error -> error
+        end
       end
     end)
   end
@@ -813,11 +815,12 @@ defmodule Ferricstore.Raft.StateMachine do
   def apply(meta, {:cms_merge, dst_key, src_paths, weights, create_params}, state) do
     apply_prob_with_time(meta, state, fn ->
       dst_path = prob_path(state, dst_key, "cms")
-      ensure_prob_dir(state)
 
-      case maybe_create_cms_merge_dst(state, dst_path, dst_key, create_params) do
-        :ok -> NIF.cms_file_merge(dst_path, src_paths, weights)
-        {:error, _reason} = error -> error
+      with :ok <- ensure_prob_dir(state) do
+        case maybe_create_cms_merge_dst(state, dst_path, dst_key, create_params) do
+          :ok -> NIF.cms_file_merge(dst_path, src_paths, weights)
+          {:error, _reason} = error -> error
+        end
       end
     end)
   end
@@ -833,11 +836,12 @@ defmodule Ferricstore.Raft.StateMachine do
   def apply(meta, {:cuckoo_add, key, element, auto_create_params}, state) do
     apply_prob_with_time(meta, state, fn ->
       path = prob_path(state, key, "cuckoo")
-      ensure_prob_dir(state)
 
-      case auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
-        :ok -> NIF.cuckoo_file_add(path, element)
-        {:error, _reason} = error -> error
+      with :ok <- ensure_prob_dir(state) do
+        case auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
+          :ok -> NIF.cuckoo_file_add(path, element)
+          {:error, _reason} = error -> error
+        end
       end
     end)
   end
@@ -845,11 +849,12 @@ defmodule Ferricstore.Raft.StateMachine do
   def apply(meta, {:cuckoo_addnx, key, element, auto_create_params}, state) do
     apply_prob_with_time(meta, state, fn ->
       path = prob_path(state, key, "cuckoo")
-      ensure_prob_dir(state)
 
-      case auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
-        :ok -> NIF.cuckoo_file_addnx(path, element)
-        {:error, _reason} = error -> error
+      with :ok <- ensure_prob_dir(state) do
+        case auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
+          :ok -> NIF.cuckoo_file_addnx(path, element)
+          {:error, _reason} = error -> error
+        end
       end
     end)
   end
@@ -2787,11 +2792,12 @@ defmodule Ferricstore.Raft.StateMachine do
   defp apply_single(state, {:bloom_add, key, element, auto_create_params}) do
     do_prob_command(state, fn ->
       path = prob_path(state, key, "bloom")
-      ensure_prob_dir(state)
 
-      case auto_create_bloom_if_needed(state, path, key, auto_create_params) do
-        :ok -> NIF.bloom_file_add(path, element)
-        {:error, _reason} = error -> error
+      with :ok <- ensure_prob_dir(state) do
+        case auto_create_bloom_if_needed(state, path, key, auto_create_params) do
+          :ok -> NIF.bloom_file_add(path, element)
+          {:error, _reason} = error -> error
+        end
       end
     end)
   end
@@ -2799,11 +2805,12 @@ defmodule Ferricstore.Raft.StateMachine do
   defp apply_single(state, {:bloom_madd, key, elements, auto_create_params}) do
     do_prob_command(state, fn ->
       path = prob_path(state, key, "bloom")
-      ensure_prob_dir(state)
 
-      case auto_create_bloom_if_needed(state, path, key, auto_create_params) do
-        :ok -> NIF.bloom_file_madd(path, elements)
-        {:error, _reason} = error -> error
+      with :ok <- ensure_prob_dir(state) do
+        case auto_create_bloom_if_needed(state, path, key, auto_create_params) do
+          :ok -> NIF.bloom_file_madd(path, elements)
+          {:error, _reason} = error -> error
+        end
       end
     end)
   end
@@ -2824,11 +2831,12 @@ defmodule Ferricstore.Raft.StateMachine do
   defp apply_single(state, {:cms_merge, dst_key, src_paths, weights, create_params}) do
     do_prob_command(state, fn ->
       dst_path = prob_path(state, dst_key, "cms")
-      ensure_prob_dir(state)
 
-      case maybe_create_cms_merge_dst(state, dst_path, dst_key, create_params) do
-        :ok -> NIF.cms_file_merge(dst_path, src_paths, weights)
-        {:error, _reason} = error -> error
+      with :ok <- ensure_prob_dir(state) do
+        case maybe_create_cms_merge_dst(state, dst_path, dst_key, create_params) do
+          :ok -> NIF.cms_file_merge(dst_path, src_paths, weights)
+          {:error, _reason} = error -> error
+        end
       end
     end)
   end
@@ -2842,11 +2850,12 @@ defmodule Ferricstore.Raft.StateMachine do
   defp apply_single(state, {:cuckoo_add, key, element, auto_create_params}) do
     do_prob_command(state, fn ->
       path = prob_path(state, key, "cuckoo")
-      ensure_prob_dir(state)
 
-      case auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
-        :ok -> NIF.cuckoo_file_add(path, element)
-        {:error, _reason} = error -> error
+      with :ok <- ensure_prob_dir(state) do
+        case auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
+          :ok -> NIF.cuckoo_file_add(path, element)
+          {:error, _reason} = error -> error
+        end
       end
     end)
   end
@@ -2854,11 +2863,12 @@ defmodule Ferricstore.Raft.StateMachine do
   defp apply_single(state, {:cuckoo_addnx, key, element, auto_create_params}) do
     do_prob_command(state, fn ->
       path = prob_path(state, key, "cuckoo")
-      ensure_prob_dir(state)
 
-      case auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
-        :ok -> NIF.cuckoo_file_addnx(path, element)
-        {:error, _reason} = error -> error
+      with :ok <- ensure_prob_dir(state) do
+        case auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
+          :ok -> NIF.cuckoo_file_addnx(path, element)
+          {:error, _reason} = error -> error
+        end
       end
     end)
   end
@@ -5969,9 +5979,11 @@ defmodule Ferricstore.Raft.StateMachine do
   defp ensure_prob_dir(state) do
     dir = prob_dir(state)
 
-    unless Ferricstore.FS.exists?(dir) do
+    if Ferricstore.FS.exists?(dir) do
+      :ok
+    else
       Ferricstore.FS.mkdir_p!(dir)
-      _ = NIF.v2_fsync_dir(Path.dirname(dir))
+      prob_fsync_dir(Path.dirname(dir), :create_prob_dir)
     end
   end
 
@@ -5979,14 +5991,34 @@ defmodule Ferricstore.Raft.StateMachine do
   # filename entry durable. The NIF already fsynced the file's data;
   # this fsyncs the directory so the entry itself is durable.
   defp prob_fsync_dir(state) do
-    NIF.v2_fsync_dir(prob_dir(state))
+    prob_fsync_dir(prob_dir(state), :prob_file_dir)
+  end
+
+  defp prob_fsync_dir(path, phase) do
+    result =
+      case Process.get(:ferricstore_prob_fsync_dir_hook) do
+        fun when is_function(fun, 1) -> fun.(path)
+        _ -> NIF.v2_fsync_dir(path)
+      end
+
+    case result do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "StateMachine probabilistic directory fsync failed during #{phase} for #{path}: #{inspect(reason)}"
+        )
+
+        {:error, {:fsync_dir_failed, phase, reason}}
+    end
   end
 
   defp create_bloom_metadata(state, key, num_bits, num_hashes, prob_meta) do
     path = prob_path(state, key, "bloom")
-    ensure_prob_dir(state)
 
-    with :ok <- prob_create_and_fsync(state, NIF.bloom_file_create(path, num_bits, num_hashes)) do
+    with :ok <- ensure_prob_dir(state),
+         :ok <- prob_create_and_fsync(state, NIF.bloom_file_create(path, num_bits, num_hashes)) do
       do_put(state, key, :erlang.term_to_binary(prob_meta), 0)
       :ok
     end
@@ -5994,9 +6026,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp create_cms_metadata(state, key, width, depth) do
     path = prob_path(state, key, "cms")
-    ensure_prob_dir(state)
 
-    with :ok <- prob_create_and_fsync(state, NIF.cms_file_create(path, width, depth)) do
+    with :ok <- ensure_prob_dir(state),
+         :ok <- prob_create_and_fsync(state, NIF.cms_file_create(path, width, depth)) do
       meta_val = {:cms_meta, %{width: width, depth: depth}}
       do_put(state, key, :erlang.term_to_binary(meta_val), 0)
       :ok
@@ -6019,9 +6051,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp create_cuckoo_metadata(state, key, capacity, bucket_size) do
     path = prob_path(state, key, "cuckoo")
-    ensure_prob_dir(state)
 
-    with :ok <- prob_create_and_fsync(state, NIF.cuckoo_file_create(path, capacity, bucket_size)) do
+    with :ok <- ensure_prob_dir(state),
+         :ok <- prob_create_and_fsync(state, NIF.cuckoo_file_create(path, capacity, bucket_size)) do
       meta_val = {:cuckoo_meta, %{capacity: capacity}}
       do_put(state, key, :erlang.term_to_binary(meta_val), 0)
       :ok
@@ -6030,9 +6062,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp create_topk_metadata(state, key, k, width, depth, decay) do
     path = prob_path(state, key, "topk")
-    ensure_prob_dir(state)
 
-    with :ok <-
+    with :ok <- ensure_prob_dir(state),
+         :ok <-
            prob_create_and_fsync(state, NIF.topk_file_create_v2(path, k, width, depth, decay)) do
       meta_val = {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
       do_put(state, key, :erlang.term_to_binary(meta_val), 0)
