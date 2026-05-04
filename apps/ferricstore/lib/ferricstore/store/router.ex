@@ -290,6 +290,7 @@ defmodule Ferricstore.Store.Router do
   def always_quorum?({:spop, _, _}), do: true
   def always_quorum?({:zpop, _, _, _}), do: true
   def always_quorum?({:json_set, _, _, _, _}), do: true
+  def always_quorum?({:json_del, _, _}), do: true
 
   # Probabilistic structures: results (e.g., Bloom "was it new?", TopK
   # evicted member, CMS post-increment count) are computed by the state
@@ -3245,6 +3246,11 @@ defmodule Ferricstore.Store.Router do
   def json_set(ctx, key, path, value, flags)
       when is_binary(key) and is_binary(path) and is_binary(value) and is_list(flags) do
     forced_single_key_quorum(ctx, key, {:json_set, key, path, value, flags})
+  end
+
+  @doc false
+  def json_del(ctx, key, path) when is_binary(key) and is_binary(path) do
+    forced_single_key_quorum(ctx, key, {:json_del, key, path})
   end
 
   @doc false

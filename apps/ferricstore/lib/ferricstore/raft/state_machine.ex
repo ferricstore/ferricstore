@@ -610,6 +610,12 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
+  def apply(meta, {:json_del, key, path}, state) do
+    apply_pending_with_time(meta, state, fn ->
+      Json.handle_ast({:json_del, key, path}, build_string_value_store(state))
+    end)
+  end
+
   def apply(meta, {:json_numincrby, key, path, increment}, state) do
     apply_pending_with_time(meta, state, fn ->
       Json.handle_ast({:json_numincrby, key, path, increment}, build_string_value_store(state))
@@ -3072,6 +3078,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:json_set, key, path, value, flags}) do
     Json.handle_ast({:json_set, key, path, value, flags}, build_string_value_store(state))
+  end
+
+  defp apply_single(state, {:json_del, key, path}) do
+    Json.handle_ast({:json_del, key, path}, build_string_value_store(state))
   end
 
   defp apply_single(state, {:json_numincrby, key, path, increment}) do

@@ -4822,7 +4822,7 @@ defmodule FerricStore do
   """
   @spec json_del(key(), binary()) :: {:ok, term()} | {:error, binary()}
   def json_del(key, path \\ "$") do
-    wrap_result(Json.handle_ast({:json_del, key, path}, build_string_store(key)))
+    wrap_result(Router.json_del(default_ctx(), key, path))
   end
 
   @doc """

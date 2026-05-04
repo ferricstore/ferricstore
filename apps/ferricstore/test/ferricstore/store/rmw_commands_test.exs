@@ -316,6 +316,36 @@ defmodule Ferricstore.Store.RmwCommandsTest do
     end
   end
 
+  describe "concurrent JSON.DEL" do
+    test "concurrent path deletes on one document remove all targeted fields" do
+      key = ukey("json_del_paths_q")
+
+      root =
+        1..50
+        |> Map.new(fn i -> {"f#{i}", i} end)
+        |> Jason.encode!()
+
+      :ok = FerricStore.json_set(key, "$", root)
+
+      results =
+        run_concurrent(
+          50,
+          fn i ->
+            FerricStore.json_del(key, "$.f#{i}")
+          end,
+          Enum.to_list(1..50)
+        )
+
+      assert Enum.all?(results, &(&1 == {:ok, 1}))
+      assert {:ok, json} = FerricStore.json_get(key, "$")
+      decoded = Jason.decode!(json)
+
+      for i <- 1..50 do
+        refute Map.has_key?(decoded, "f#{i}")
+      end
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # BITOP (merges N source bitmaps into destination)
   # ---------------------------------------------------------------------------
