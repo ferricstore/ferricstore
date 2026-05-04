@@ -28,6 +28,8 @@ defmodule Ferricstore.Store.Router do
 
   @slot_mask 1023
   @cold_batch_read_timeout_ms 10_000
+  @cold_location_retry_attempts 8
+  @cold_location_retry_sleep_ms 1
   @async_list_rollback_key :ferricstore_async_list_originals
 
   defguardp valid_cold_file_ref(file_id, value_size)
@@ -1685,6 +1687,18 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp retry_changed_file_ref(ctx, idx, keydir, key, original_location, now) do
+    case retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now) do
+      :unchanged_cold ->
+        retry_after_unchanged_cold_location(fn ->
+          retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now)
+        end)
+
+      result ->
+        result
+    end
+  end
+
+  defp retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now) do
     case ets_get_full(ctx, idx, keydir, key, now) do
       {:hit, value, lfu} ->
         sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
@@ -1699,6 +1713,11 @@ defmodule Ferricstore.Store.Router do
           {^path, value_offset, ^value_size} -> {:cold_ref, path, value_offset, value_size}
           nil -> :miss
         end
+
+      {:cold, file_id, offset, value_size}
+      when valid_cold_location(file_id, offset, value_size) and
+             {file_id, offset, value_size} == original_location ->
+        :unchanged_cold
 
       _ ->
         :miss
@@ -2137,11 +2156,17 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp retry_after_unchanged_cold_location(retry_fun) when is_function(retry_fun, 0) do
+    retry_after_unchanged_cold_location(retry_fun, @cold_location_retry_attempts)
+  end
+
+  defp retry_after_unchanged_cold_location(_retry_fun, 0), do: :miss
+
+  defp retry_after_unchanged_cold_location(retry_fun, attempts_left) do
     maybe_run_cold_location_miss_hook()
-    Process.sleep(1)
+    Process.sleep(@cold_location_retry_sleep_ms)
 
     case retry_fun.() do
-      :unchanged_cold -> :miss
+      :unchanged_cold -> retry_after_unchanged_cold_location(retry_fun, attempts_left - 1)
       result -> result
     end
   end

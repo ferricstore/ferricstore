@@ -148,6 +148,41 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     end
   end
 
+  test "direct cold read waits through a delayed compaction ETS update", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_compaction_delayed:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    value = "delayed-compacted-value"
+    value_size = byte_size(value)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00000.log")
+
+    {:ok, {_dead_offset, _dead_record_size}} = NIF.v2_append_record(path, "dead", "old", 0)
+    {:ok, {old_offset, _old_record_size}} = NIF.v2_append_record(path, key, value, 0)
+
+    File.rm!(path)
+    {:ok, {new_offset, _new_record_size}} = NIF.v2_append_record(path, key, value, 0)
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, old_offset, value_size})
+
+    Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+      misses = Process.get(:delayed_compaction_misses, 0) + 1
+      Process.put(:delayed_compaction_misses, misses)
+
+      if misses == 2 do
+        :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, new_offset, value_size})
+      end
+    end)
+
+    try do
+      assert ^value = Router.get(ctx, key)
+    after
+      Process.delete(:ferricstore_router_cold_location_miss_hook)
+      Process.delete(:delayed_compaction_misses)
+    end
+  end
+
   test "batch cold reads do not crash on cold rows with invalid offsets", %{
     ctx: ctx,
     keydir: keydir
@@ -550,6 +585,44 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
       assert is_integer(value_offset)
     after
       Process.delete(:ferricstore_router_validate_file_ref_miss_hook)
+    end
+  end
+
+  test "get_file_ref waits through a delayed compaction ETS update", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_file_ref_delayed:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    other_key = key <> ":other"
+    value = "delayed-file-ref"
+    value_size = byte_size(value)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    stale_path = Path.join(shard_path, "00000.log")
+    current_path = Path.join(shard_path, "00001.log")
+
+    {:ok, {stale_offset, _stale_record_size}} =
+      NIF.v2_append_record(stale_path, other_key, "wrong", 0)
+
+    {:ok, {current_offset, _current_record_size}} =
+      NIF.v2_append_record(current_path, key, value, 0)
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, stale_offset, value_size})
+
+    Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+      misses = Process.get(:delayed_file_ref_misses, 0) + 1
+      Process.put(:delayed_file_ref_misses, misses)
+
+      if misses == 2 do
+        :ets.insert(keydir, {key, nil, 0, LFU.initial(), 1, current_offset, value_size})
+      end
+    end)
+
+    try do
+      assert {^current_path, value_offset, ^value_size} = Router.get_file_ref(ctx, key)
+      assert is_integer(value_offset)
+    after
+      Process.delete(:ferricstore_router_cold_location_miss_hook)
+      Process.delete(:delayed_file_ref_misses)
     end
   end
 
