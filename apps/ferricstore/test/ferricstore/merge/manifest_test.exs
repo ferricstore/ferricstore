@@ -74,6 +74,22 @@ defmodule Ferricstore.Merge.ManifestTest do
     test "returns :ok when no manifest exists", %{dir: dir} do
       assert :ok = Manifest.delete(dir)
     end
+
+    test "reports directory fsync failure after removing the manifest", %{dir: dir} do
+      plan = %{shard_index: 0, input_file_ids: [1]}
+      assert :ok = Manifest.write(dir, plan)
+
+      Process.put(:ferricstore_merge_manifest_fsync_dir_hook, fn ^dir ->
+        {:error, :eio}
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_merge_manifest_fsync_dir_hook)
+      end)
+
+      assert {:error, {:fsync_dir_failed, :delete_manifest, :eio}} = Manifest.delete(dir)
+      refute Manifest.exists?(dir)
+    end
   end
 
   describe "exists?/1" do

@@ -74,7 +74,7 @@ defmodule Ferricstore.Merge.Manifest do
 
     with :ok <- File.write(tmp_path, binary),
          :ok <- Ferricstore.FS.rename(tmp_path, manifest_path),
-         :ok <- Ferricstore.Bitcask.NIF.v2_fsync_dir(Path.dirname(manifest_path)) do
+         :ok <- fsync_dir(Path.dirname(manifest_path), :write_manifest) do
       :ok
     else
       {:error, reason} = err ->
@@ -125,8 +125,7 @@ defmodule Ferricstore.Merge.Manifest do
         # Fsync the directory so the manifest's removal is durable —
         # otherwise on a crash the stale manifest can re-appear and
         # trigger a spurious "interrupted merge" cleanup on next boot.
-        _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(data_dir)
-        :ok
+        fsync_dir(data_dir, :delete_manifest)
 
       {:error, {:not_found, _}} ->
         :ok
@@ -202,6 +201,26 @@ defmodule Ferricstore.Merge.Manifest do
 
   defp manifest_path(data_dir) do
     Path.join(data_dir, @manifest_filename)
+  end
+
+  defp fsync_dir(path, phase) do
+    result =
+      case Process.get(:ferricstore_merge_manifest_fsync_dir_hook) do
+        fun when is_function(fun, 1) -> fun.(path)
+        _ -> Ferricstore.Bitcask.NIF.v2_fsync_dir(path)
+      end
+
+    case result do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "Failed to fsync merge manifest directory during #{phase} at #{path}: #{inspect(reason)}"
+        )
+
+        {:error, {:fsync_dir_failed, phase, reason}}
+    end
   end
 
   # Remove only compaction temp files created by Shard.handle_call({:run_compaction, ...}).
