@@ -374,6 +374,26 @@ defmodule Ferricstore.InstanceTest do
       :ok = FerricStore.Impl.flushdb(ctx)
       assert {:ok, nil} = FerricStore.Impl.get(ctx, "impl_flush")
     end
+
+    test "flushdb surfaces probabilistic directory fsync failures" do
+      ctx = FerricStore.Instance.get(:default)
+      prob_dir = Path.join(Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0), "prob")
+
+      File.mkdir_p!(prob_dir)
+      File.write!(Path.join(prob_dir, "impl_stale.bloom"), "bits")
+
+      Process.put(:ferricstore_prob_command_fsync_dir_hook, fn
+        ^prob_dir -> {:error, :eio}
+        _path -> :ok
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_prob_command_fsync_dir_hook)
+      end)
+
+      assert {:error, {:fsync_dir_failed, :flush_prob_dir, :eio}} =
+               FerricStore.Impl.flushdb(ctx)
+    end
   end
 
   defp eventually(fun, attempts \\ 50)
