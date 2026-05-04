@@ -299,6 +299,31 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
       assert_receive {^ref, {:error, :overloaded}}, 1_000
     end
 
+    test "forwarded write_batch replies overloaded without crashing when pending is full", %{
+      idx: idx
+    } do
+      key = same_shard_key(idx, "forwarded_batch_overload")
+      ref = make_ref()
+      batcher_pid = Process.whereis(Batcher.batcher_name(idx))
+      monitor_ref = Process.monitor(batcher_pid)
+
+      try do
+        :ok =
+          Batcher.write_batch_forwarded(
+            idx,
+            [{:put, key, "v", 0}],
+            {self(), ref},
+            :follower@nohost
+          )
+
+        assert_receive {^ref, {:error, :overloaded}}, 1_000
+        refute_receive {:DOWN, ^monitor_ref, :process, ^batcher_pid, _reason}, 100
+        assert Process.alive?(batcher_pid)
+      after
+        Process.demonitor(monitor_ref, [:flush])
+      end
+    end
+
     test "async_submit emits dropped telemetry when pending is full", %{idx: idx} do
       handler = {:edge_backpressure, self(), make_ref()}
 

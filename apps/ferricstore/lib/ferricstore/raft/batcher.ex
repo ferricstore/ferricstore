@@ -1073,8 +1073,7 @@ defmodule Ferricstore.Raft.Batcher do
   # new batches when too many ra commands are already in flight.
   defp enqueue_write_batch(cmds, cmd_count, from, state) do
     if map_size(state.pending) >= @max_pending do
-      {pid, ref} = from
-      send(pid, {ref, {:error, :overloaded}})
+      reply_from(from, {:error, :overloaded})
       {:noreply, state}
     else
       prefix = extract_prefix(hd(cmds))
