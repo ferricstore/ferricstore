@@ -665,7 +665,9 @@ defmodule Ferricstore.Store.Shard.Compound do
         )
 
         new_promoted = Map.delete(state.promoted_instances, redis_key)
-        {:reply, :ok, %{state | promoted_instances: new_promoted}}
+
+        {:reply, :ok,
+         %{state | promoted_instances: new_promoted, write_version: state.write_version + 1}}
     end
   end
 

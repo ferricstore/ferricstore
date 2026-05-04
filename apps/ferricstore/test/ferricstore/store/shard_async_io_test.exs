@@ -16,7 +16,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.{CompoundKey, Promotion}
   alias Ferricstore.Store.BitcaskWriter
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Router
@@ -685,6 +685,33 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert Enum.any?(records, &match?({^field_one, _off, 0, 0, true}, &1))
       assert Enum.any?(records, &match?({^field_two, _off, 0, 0, true}, &1))
       refute Enum.any?(records, &match?({^other_field, _off, 0, 0, true}, &1))
+    end
+
+    test "direct promoted compound_delete_prefix increments write version" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
+
+      redis_key = "promoted_hash_prefix_delete_version"
+      prefix = CompoundKey.hash_prefix(redis_key)
+      field = CompoundKey.hash_field(redis_key, "one")
+      dedicated_path = Promotion.dedicated_path(dir, 0, :hash, redis_key)
+
+      :ok = GenServer.call(pid, {:compound_put, redis_key, field, "1", 0})
+      File.mkdir_p!(dedicated_path)
+      File.touch!(Path.join(dedicated_path, "00000.log"))
+
+      :sys.replace_state(pid, fn state ->
+        %{
+          state
+          | promoted_instances: Map.put(state.promoted_instances, redis_key, dedicated_path)
+        }
+      end)
+
+      before_version = GenServer.call(pid, {:get_version, redis_key})
+      :ok = GenServer.call(pid, {:compound_delete_prefix, redis_key, prefix})
+
+      assert before_version + 1 == GenServer.call(pid, {:get_version, redis_key})
+      assert nil == GenServer.call(pid, {:compound_get, redis_key, field})
     end
 
     test "multiple puts before flush are all readable" do
