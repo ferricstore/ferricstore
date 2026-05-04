@@ -74,9 +74,22 @@ defmodule FerricStore.Instance.Supervisor do
         ]
       end
 
+    bitcask_writer_children =
+      if name == :default do
+        []
+      else
+        Enum.map(0..(ctx.shard_count - 1), fn i ->
+          Supervisor.child_spec(
+            {Ferricstore.Store.BitcaskWriter, shard_index: i, instance_ctx: ctx},
+            id: :"#{name}.BitcaskWriter.#{i}"
+          )
+        end)
+      end
+
     children =
       cleanup_children ++
         merge_children ++
+        bitcask_writer_children ++
         [
           # Stats and MemoryGuard are global application processes today. The
           # instance context owns isolated counters/flags, but these GenServers are

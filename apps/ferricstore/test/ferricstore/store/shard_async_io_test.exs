@@ -1442,7 +1442,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
         Path.expand("../../../lib/ferricstore/store/shard.ex", __DIR__)
         |> File.read!()
 
-      flush_pos = :binary.match(source, "BitcaskWriter.flush(state.index)")
+      flush_pos = :binary.match(source, "BitcaskWriter.flush(state.instance_ctx, state.index)")
       reduce_pos = :binary.match(source, "Enum.reduce(file_ids")
 
       assert {flush_offset, _} = flush_pos

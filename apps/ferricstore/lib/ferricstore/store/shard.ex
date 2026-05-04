@@ -668,7 +668,7 @@ defmodule Ferricstore.Store.Shard do
       # Router async/RMW paths can leave small values queued in BitcaskWriter with
       # ETS file_id=:pending. Drain those writes before compaction snapshots ETS,
       # otherwise a source file can be removed while the writer still targets it.
-      case Ferricstore.Store.BitcaskWriter.flush(state.index) do
+      case Ferricstore.Store.BitcaskWriter.flush(state.instance_ctx, state.index) do
         :ok ->
           :ok
 

@@ -54,12 +54,18 @@ defmodule Ferricstore.Store.BitcaskWriter do
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     shard_index = Keyword.fetch!(opts, :shard_index)
-    GenServer.start_link(__MODULE__, opts, name: writer_name(shard_index))
+    instance_ctx = Keyword.get(opts, :instance_ctx)
+    GenServer.start_link(__MODULE__, opts, name: writer_name(instance_ctx, shard_index))
   end
 
   @doc "Returns the registered name for a shard's BitcaskWriter."
   @spec writer_name(non_neg_integer()) :: atom()
   def writer_name(shard_index), do: :"Ferricstore.Store.BitcaskWriter.#{shard_index}"
+
+  @spec writer_name(FerricStore.Instance.t() | map() | nil, non_neg_integer()) :: atom()
+  def writer_name(nil, shard_index), do: writer_name(shard_index)
+  def writer_name(%{name: :default}, shard_index), do: writer_name(shard_index)
+  def writer_name(%{name: name}, shard_index), do: :"#{name}.Store.BitcaskWriter.#{shard_index}"
 
   @doc """
   Queues a deferred Bitcask write for background processing.
@@ -98,7 +104,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
         expire_at_ms
       ) do
     GenServer.cast(
-      writer_name(shard_index),
+      writer_name(instance_ctx, shard_index),
       {:write, instance_ctx, active_file_path, active_file_id, ets_table, key, value,
        expire_at_ms}
     )
@@ -150,7 +156,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
   @spec delete(FerricStore.Instance.t() | nil, non_neg_integer(), binary(), binary()) :: :ok
   def delete(instance_ctx, shard_index, active_file_path, key) do
     GenServer.cast(
-      writer_name(shard_index),
+      writer_name(instance_ctx, shard_index),
       {:tombstone, instance_ctx, active_file_path, key}
     )
   end
@@ -162,9 +168,21 @@ defmodule Ferricstore.Store.BitcaskWriter do
   are persisted.
   """
   @spec flush(non_neg_integer()) :: flush_result()
-  def flush(shard_index, timeout \\ 10_000) do
+  def flush(shard_index), do: flush(nil, shard_index, 10_000)
+
+  @spec flush(non_neg_integer(), timeout()) :: flush_result()
+  def flush(shard_index, timeout) when is_integer(shard_index) do
+    flush(nil, shard_index, timeout)
+  end
+
+  @spec flush(FerricStore.Instance.t() | map() | nil, non_neg_integer()) :: flush_result()
+  def flush(instance_ctx, shard_index), do: flush(instance_ctx, shard_index, 10_000)
+
+  @spec flush(FerricStore.Instance.t() | map() | nil, non_neg_integer(), timeout()) ::
+          flush_result()
+  def flush(instance_ctx, shard_index, timeout) do
     try do
-      GenServer.call(writer_name(shard_index), :flush, timeout)
+      GenServer.call(writer_name(instance_ctx, shard_index), :flush, timeout)
     catch
       :exit, reason -> normalize_flush_exit(reason)
     end

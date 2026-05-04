@@ -4163,7 +4163,7 @@ defmodule Ferricstore.Raft.StateMachine do
     case :ets.lookup(state.ets, key) do
       [{^key, _v, _e, _lfu, :pending, _off, _vs}] ->
         try do
-          case BitcaskWriter.flush(state.shard_index) do
+          case BitcaskWriter.flush(state.instance_ctx, state.shard_index) do
             :ok ->
               :ok
 

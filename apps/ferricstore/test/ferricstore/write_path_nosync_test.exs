@@ -358,6 +358,22 @@ defmodule Ferricstore.WritePathNosyncTest do
       assert BitcaskWriter.writer_name(3) == :"Ferricstore.Store.BitcaskWriter.3"
     end
 
+    test "BitcaskWriter writer_name is instance-scoped for custom instances" do
+      ctx = %{name: :"writer_instance_#{System.unique_integer([:positive])}"}
+      shard_index = 70_000 + :rand.uniform(9_999)
+
+      assert BitcaskWriter.writer_name(ctx, shard_index) != BitcaskWriter.writer_name(shard_index)
+
+      {:ok, pid} = BitcaskWriter.start_link(shard_index: shard_index, instance_ctx: ctx)
+
+      try do
+        assert Process.whereis(BitcaskWriter.writer_name(ctx, shard_index)) == pid
+        assert Process.whereis(BitcaskWriter.writer_name(shard_index)) == nil
+      after
+        if Process.alive?(pid), do: GenServer.stop(pid)
+      end
+    end
+
     test "all 4 BitcaskWriter processes are alive" do
       for i <- 0..3 do
         name = BitcaskWriter.writer_name(i)
