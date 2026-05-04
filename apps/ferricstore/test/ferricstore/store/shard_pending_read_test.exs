@@ -172,6 +172,40 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
     end
   end
 
+  test "nil async cold read waits briefly for compaction ETS update" do
+    keydir = :ets.new(:"pending_read_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "pending:compaction-delayed-update"
+    tag = make_ref()
+
+    state = %{
+      flush_in_flight: nil,
+      keydir: keydir,
+      shard_data_path: Path.join(System.tmp_dir!(), "pending_read_retry"),
+      instance_ctx: %{hot_cache_max_value_size: 64},
+      pending_reads: %{127 => {{self(), tag}, key, 0, 7, 12, 3}}
+    }
+
+    try do
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 7, 12, 3})
+
+      assert {:noreply, retry_state} = Shard.handle_info({:tokio_complete, 127, :ok, nil}, state)
+      assert retry_state.pending_reads == %{}
+      refute_receive {^tag, _}, 0
+
+      :ets.insert(keydir, {key, "new", 0, LFU.initial(), 8, 24, 3})
+
+      assert_receive {:cold_read_retry, pending_entry, attempts_left}, 100
+
+      assert {:noreply, final_state} =
+               Shard.handle_info({:cold_read_retry, pending_entry, attempts_left}, retry_state)
+
+      assert final_state.pending_reads == %{}
+      assert_receive {^tag, "new"}
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   def handle_telemetry(event, measurements, metadata, parent) do
     send(parent, {:pread_telemetry, event, measurements, metadata})
   end

@@ -64,6 +64,9 @@ defmodule Ferricstore.Store.Shard do
   # How often (ms) to flush the pending write queue to disk.
   # 1ms gives up to 50k batched writes/s per shard (4 shards → 200k/s total).
   @flush_interval_ms 1
+  @cold_read_timeout_ms 10_000
+  @cold_read_compaction_retry_attempts 8
+  @cold_read_compaction_retry_delay_ms 1
 
   # Default maximum active file size before rotation (256 MB).
   # Configurable via :max_active_file_size application env.
@@ -1422,6 +1425,10 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
+  def handle_info({:cold_read_retry, pending_entry, attempts_left}, state) do
+    retry_or_reply_nil_cold_read(state, pending_entry, attempts_left)
+  end
+
   def handle_info({:tokio_complete, corr_id, :ok, value}, state) do
     cond do
       # Async fsync completion — value is :ok for fsync
@@ -1436,20 +1443,30 @@ defmodule Ferricstore.Store.Shard do
             # points at the same disk location read by this request.
             if value != nil do
               ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
+              GenServer.reply(from, value)
+              {:noreply, %{state | pending_reads: rest_pending}}
+            else
+              retry_or_reply_nil_cold_read(
+                %{state | pending_reads: rest_pending},
+                {from, key, exp, fid, off, vsize},
+                @cold_read_compaction_retry_attempts
+              )
             end
-
-            GenServer.reply(from, value)
-            {:noreply, %{state | pending_reads: rest_pending}}
 
           {{from, key, :meta, exp, fid, off, vsize}, rest_pending} ->
             # GET_META cold-read completion. The reply may linearize before a
             # later overwrite, but ETS warming must still be location-checked.
             if value != nil do
               ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
+              GenServer.reply(from, {value, exp})
+              {:noreply, %{state | pending_reads: rest_pending}}
+            else
+              retry_or_reply_nil_cold_read(
+                %{state | pending_reads: rest_pending},
+                {from, key, :meta, exp, fid, off, vsize},
+                @cold_read_compaction_retry_attempts
+              )
             end
-
-            GenServer.reply(from, if(value != nil, do: {value, exp}, else: nil))
-            {:noreply, %{state | pending_reads: rest_pending}}
 
           {{from, _key}, rest_pending} ->
             # Legacy in-memory pending entry without disk location. Reply but
@@ -1560,6 +1577,139 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp emit_pending_read_error_for_fid(_state, _fid, _reason), do: :ok
+
+  defp retry_or_reply_nil_cold_read(state, pending_entry, attempts_left) do
+    case resolve_nil_cold_read(state, pending_entry, attempts_left) do
+      {:reply, from, reply} ->
+        GenServer.reply(from, reply)
+        {:noreply, state}
+
+      {:retry_later, pending_entry, next_attempts_left} ->
+        Process.send_after(
+          self(),
+          {:cold_read_retry, pending_entry, next_attempts_left},
+          @cold_read_compaction_retry_delay_ms
+        )
+
+        {:noreply, state}
+
+      {:resubmit, pending_entry} ->
+        resubmit_cold_read(state, pending_entry)
+    end
+  end
+
+  defp resolve_nil_cold_read(
+         state,
+         {from, key, _exp, fid, off, vsize} = pending_entry,
+         attempts_left
+       ) do
+    case ShardETS.ets_lookup(state, key) do
+      {:hit, value, _expire_at_ms} ->
+        {:reply, from, value}
+
+      {:cold, ^fid, ^off, ^vsize, _exp} when attempts_left > 0 ->
+        {:retry_later, pending_entry, attempts_left - 1}
+
+      {:cold, ^fid, ^off, ^vsize, _exp} ->
+        emit_pending_read_error(state, pending_entry, :missing_live_cold_entry)
+        {:reply, from, nil}
+
+      {:cold, new_fid, new_off, new_vsize, new_exp} ->
+        {:resubmit, {from, key, new_exp, new_fid, new_off, new_vsize}}
+
+      :expired ->
+        {:reply, from, nil}
+
+      :miss ->
+        {:reply, from, nil}
+
+      _ ->
+        {:reply, from, nil}
+    end
+  end
+
+  defp resolve_nil_cold_read(
+         state,
+         {from, key, :meta, _exp, fid, off, vsize} = pending_entry,
+         attempts_left
+       ) do
+    case ShardETS.ets_lookup(state, key) do
+      {:hit, value, expire_at_ms} ->
+        {:reply, from, {value, expire_at_ms}}
+
+      {:cold, ^fid, ^off, ^vsize, _exp} when attempts_left > 0 ->
+        {:retry_later, pending_entry, attempts_left - 1}
+
+      {:cold, ^fid, ^off, ^vsize, _exp} ->
+        emit_pending_read_error(state, pending_entry, :missing_live_cold_entry)
+        {:reply, from, nil}
+
+      {:cold, new_fid, new_off, new_vsize, new_exp} ->
+        {:resubmit, {from, key, :meta, new_exp, new_fid, new_off, new_vsize}}
+
+      :expired ->
+        {:reply, from, nil}
+
+      :miss ->
+        {:reply, from, nil}
+
+      _ ->
+        {:reply, from, nil}
+    end
+  end
+
+  defp resolve_nil_cold_read(_state, {from, _key}, _attempts_left), do: {:reply, from, nil}
+
+  defp resolve_nil_cold_read(_state, {from, _key, :meta, _exp}, _attempts_left),
+    do: {:reply, from, nil}
+
+  defp resubmit_cold_read(state, {from, key, _exp, fid, off, _vsize} = pending_entry) do
+    path = ShardETS.file_path(state.shard_data_path, fid)
+    corr_id = state.next_correlation_id + 1
+
+    case NIF.v2_pread_at_key_async(self(), corr_id, path, off, key) do
+      :ok ->
+        timer_ref =
+          Process.send_after(self(), {:cold_read_timeout, corr_id}, @cold_read_timeout_ms)
+
+        {:noreply,
+         %{
+           state
+           | next_correlation_id: corr_id,
+             pending_reads:
+               Map.put(state.pending_reads, corr_id, {:pending_read, pending_entry, timer_ref})
+         }}
+
+      {:error, reason} ->
+        emit_pending_read_error(state, pending_entry, reason)
+        GenServer.reply(from, nil)
+        {:noreply, state}
+    end
+  end
+
+  defp resubmit_cold_read(state, {from, key, :meta, _exp, fid, off, _vsize} = pending_entry) do
+    path = ShardETS.file_path(state.shard_data_path, fid)
+    corr_id = state.next_correlation_id + 1
+
+    case NIF.v2_pread_at_key_async(self(), corr_id, path, off, key) do
+      :ok ->
+        timer_ref =
+          Process.send_after(self(), {:cold_read_timeout, corr_id}, @cold_read_timeout_ms)
+
+        {:noreply,
+         %{
+           state
+           | next_correlation_id: corr_id,
+             pending_reads:
+               Map.put(state.pending_reads, corr_id, {:pending_read, pending_entry, timer_ref})
+         }}
+
+      {:error, reason} ->
+        emit_pending_read_error(state, pending_entry, reason)
+        GenServer.reply(from, nil)
+        {:noreply, state}
+    end
+  end
 
   # -------------------------------------------------------------------
   # Graceful shutdown (spec 2C.6, step 8)
