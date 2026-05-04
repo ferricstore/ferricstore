@@ -329,20 +329,50 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert {:ok, [{^key, ^offset, 70_000, 0, false}]} = NIF.v2_scan_file(active_file_path)
     end
 
-    test "does not persist a stale origin PUT after local RMW changed the pending ETS value", %{
+    test "persists stale origin PUT for replay without publishing over newer pending ETS", %{
       state: state,
       ets: ets,
-      active_file_path: active_file_path
+      active_file_path: active_file_path,
+      shard_index: shard_index
     } do
       # Router may apply a later async RMW locally before the earlier async PUT
       # reaches StateMachine.apply/3. The origin replay must not write the old
-      # command value over the newer local value in Bitcask recovery order.
-      :ets.insert(ets, {"stale_origin_put", "new", 0, 1, :pending, 0, 0})
+      # command value over the newer local value in ETS, but the earlier Ra
+      # entry still needs a Bitcask record before its cursor can be released.
+      checkpoint_flags = :atomics.new(shard_index + 1, signed: false)
+      checkpoint_in_flight = :atomics.new(shard_index + 1, signed: false)
+      disk_pressure = :atomics.new(shard_index + 1, signed: false)
+      last_applied_index = :atomics.new(shard_index + 1, signed: false)
+      last_released_cursor_index = :atomics.new(shard_index + 1, signed: false)
+      key = "stale_origin_put"
 
-      {_state2, :ok} =
-        StateMachine.apply(%{}, {:async, node(), {:put, "stale_origin_put", "old", 0}}, state)
+      state = %{
+        state
+        | release_cursor_interval: 1,
+          instance_ctx: %{
+            checkpoint_flags: checkpoint_flags,
+            checkpoint_in_flight: checkpoint_in_flight,
+            disk_pressure: disk_pressure,
+            last_applied_index: last_applied_index,
+            last_released_cursor_index: last_released_cursor_index,
+            hot_cache_max_value_size: 64
+          }
+      }
 
-      assert {:ok, []} = NIF.v2_scan_file(active_file_path)
+      :ets.insert(ets, {key, "new", 0, 1, :pending, 0, 0})
+
+      meta = %{index: 1, term: 1, system_time: System.os_time(:millisecond)}
+
+      {_state2, {:applied_at, 1, :ok}, effects} =
+        StateMachine.apply(meta, {:async, node(), {:put, key, "old", 0}}, state)
+
+      assert [{^key, "new", 0, _lfu, :pending, 0, 0}] = :ets.lookup(ets, key)
+      assert {:ok, [{^key, old_offset, 3, 0, false}]} = NIF.v2_scan_file(active_file_path)
+      assert {:ok, "old"} = NIF.v2_pread_at(active_file_path, old_offset)
+      assert :atomics.get(checkpoint_flags, shard_index + 1) == 1
+      assert :atomics.get(last_released_cursor_index, shard_index + 1) == 0
+
+      refute Enum.any?(effects, &match?({:release_cursor, 1}, &1))
     end
 
     test "replays origin RMW when recovery has no local value", %{

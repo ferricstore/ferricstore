@@ -2916,6 +2916,7 @@ defmodule Ferricstore.Raft.StateMachine do
         end
 
       [{^key, _other_value, _other_exp, _lfu, :pending, _off, _vs}] ->
+        queue_pending_put(key, disk_value, expire_at_ms)
         :ok
 
       _ ->
