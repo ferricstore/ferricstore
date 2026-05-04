@@ -69,18 +69,35 @@ defmodule Ferricstore.ReviewR4.D14StaleActiveFileTest do
       # and the file grows. Nobody tracks this growth or triggers rotation
       # for the state machine's file. The file just keeps growing.
 
+      root = Path.join(System.tmp_dir!(), "ferricstore_d14_#{System.unique_integer([:positive])}")
+      shard_data_path = Path.join([root, "data", "shard_0"])
+      File.mkdir_p!(shard_data_path)
+      ets = :ets.new(:d14_stale_active_file, [:set, :public])
+
+      on_exit(fn ->
+        File.rm_rf!(root)
+
+        try do
+          :ets.delete(ets)
+        rescue
+          ArgumentError -> :ok
+        end
+      end)
+
+      active_file_path = Path.join(shard_data_path, "00001.log")
+
       config = %{
         shard_index: 0,
-        shard_data_path: "/tmp/test",
+        shard_data_path: shard_data_path,
         active_file_id: 1,
-        active_file_path: "/tmp/test/00001.log",
-        ets: :test_ets,
+        active_file_path: active_file_path,
+        ets: ets
       }
 
       state = Ferricstore.Raft.StateMachine.init(config)
 
       assert state.active_file_id == 1
-      assert state.active_file_path == "/tmp/test/00001.log"
+      assert state.active_file_path == active_file_path
 
       # After hypothetical shard rotation, state still has old values
       # There is no command to update these fields
