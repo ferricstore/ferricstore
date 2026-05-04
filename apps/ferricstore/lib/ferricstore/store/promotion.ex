@@ -45,6 +45,7 @@ defmodule Ferricstore.Store.Promotion do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
   alias Ferricstore.Store.{CompoundKey, LFU}
+  alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   require Logger
 
@@ -434,18 +435,21 @@ defmodule Ferricstore.Store.Promotion do
         # Normal recovery path: dedicated has a complete final state. Apply it
         # even when that state is tombstone-only so stale shared rows cannot
         # survive restart.
+        hot_cache_threshold = recover_hot_cache_threshold(instance_ctx)
+
         Enum.each(final_state, fn
           {key, :tombstone} ->
             track_binary_delete(keydir, shard_index, key, instance_ctx)
             :ets.delete(keydir, key)
 
           {key, {:live, fid, file_path, offset, value_size, expire_at_ms}} ->
-            value =
+            disk_value =
               case read_cold_async(file_path, offset, key) do
                 {:ok, v} when v != nil -> v
                 _ -> nil
               end
 
+            value = ShardETS.value_for_ets(disk_value, hot_cache_threshold)
             track_binary_insert(keydir, shard_index, key, value, instance_ctx)
 
             :ets.insert(
@@ -497,6 +501,12 @@ defmodule Ferricstore.Store.Promotion do
       end
     end)
   end
+
+  defp recover_hot_cache_threshold(%{hot_cache_max_value_size: threshold})
+       when is_integer(threshold) and threshold >= 0,
+       do: threshold
+
+  defp recover_hot_cache_threshold(_instance_ctx), do: 65_536
 
   defp shared_live_compound_keys_by_marker(keydir, marker_types) do
     now = HLC.now_ms()

@@ -179,6 +179,20 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
     )
   end
 
+  defp simulate_restart(ctx, instance_ctx) do
+    :ets.delete_all_objects(ctx.keydir)
+
+    ShardLifecycle.recover_keydir(ctx.shard_data_path, ctx.keydir, ctx.shard_index)
+
+    Promotion.recover_promoted(
+      ctx.shard_data_path,
+      ctx.keydir,
+      ctx.data_dir,
+      ctx.shard_index,
+      instance_ctx
+    )
+  end
+
   # Reads a compound key through the keydir: returns its on-disk value
   # by pread-ing at the (file_id, offset) the keydir records.
   defp read_ckey(ctx, ckey) do
@@ -268,6 +282,45 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       info = Map.fetch!(promoted, redis_key)
       assert info.total_bytes > 0
       assert info.dead_bytes == 0
+    end
+
+    test "recovered promoted entries keep large values cold in ETS", ctx do
+      redis_key = "cold:promoted:restart"
+      large_value = String.duplicate("x", 128)
+
+      entries =
+        Enum.map(~w(field_a field_b), fn field ->
+          compound_key = CompoundKey.hash_field(redis_key, field)
+
+          {:ok, {offset, value_size}} =
+            NIF.v2_append_record(ctx.active_path, compound_key, large_value, 0)
+
+          :ets.insert(ctx.keydir, {compound_key, nil, 0, LFU.initial(), 0, offset, value_size})
+          {compound_key, large_value}
+        end)
+
+      {:ok, _dedicated_path} =
+        Promotion.promote_collection!(
+          :hash,
+          redis_key,
+          ctx.shard_data_path,
+          ctx.keydir,
+          ctx.data_dir,
+          ctx.shard_index
+        )
+
+      instance_ctx = %{hot_cache_max_value_size: 8, keydir_binary_bytes: nil, shard_count: 1}
+      promoted = simulate_restart(ctx, instance_ctx)
+      info = Map.fetch!(promoted, redis_key)
+
+      for {compound_key, expected_value} <- entries do
+        assert [{^compound_key, nil, 0, _lfu, fid, off, value_size}] =
+                 :ets.lookup(ctx.keydir, compound_key)
+
+        assert value_size == byte_size(expected_value)
+        path = Path.join(info.path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+        assert {:ok, ^expected_value} = NIF.v2_pread_at(path, off)
+      end
     end
 
     test "promotion records marker location in the actual active file", ctx do
