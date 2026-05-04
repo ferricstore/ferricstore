@@ -154,6 +154,38 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
     end
   end
 
+  test "probabilistic migration fails closed when prob directory cannot be listed" do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lifecycle_prob_ls_fail_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Path.join(tmp, "shard_0")
+    File.mkdir_p!(shard_path)
+    File.write!(Path.join(shard_path, "prob"), "not a directory")
+
+    keydir =
+      :ets.new(:"lifecycle_prob_ls_fail_#{System.unique_integer([:positive])}", [
+        :set,
+        :public
+      ])
+
+    on_exit(fn ->
+      try do
+        :ets.delete(keydir)
+      rescue
+        _ -> :ok
+      end
+
+      File.rm_rf!(tmp)
+    end)
+
+    assert_raise RuntimeError, ~r/migrate_prob_files failed to list/, fn ->
+      ShardLifecycle.migrate_prob_files(shard_path, keydir, 0)
+    end
+  end
+
   test "recover_keydir during custom shard startup does not mutate default accounting" do
     default_ctx = FerricStore.Instance.get(:default)
     default_before = keydir_binary_total(default_ctx)

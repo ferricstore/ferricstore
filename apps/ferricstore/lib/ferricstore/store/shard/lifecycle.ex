@@ -262,8 +262,15 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           Logger.info("Shard: migrated #{migrated} existing prob file(s) to Raft metadata")
         end
 
-      {:error, _reason} ->
+      {:error, {:not_found, _}} ->
         :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "Shard #{index}: migrate_prob_files failed to list #{prob_dir}: #{inspect(reason)}"
+        )
+
+        raise "migrate_prob_files failed to list #{prob_dir}: #{inspect(reason)}"
     end
   end
 
