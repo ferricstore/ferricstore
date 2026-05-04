@@ -1347,10 +1347,12 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  # Unit tests and old default-state-machine callers may not carry an
-  # Instance. Custom instances fail closed above because their checkpoint
-  # atomics are isolated by instance and must be resolved before log release.
-  defp checkpoint_clean?(%{instance_ctx: nil}), do: true
+  # Only legacy/default state-machine callers may release without an Instance.
+  # Any unresolved custom or malformed state fails closed because checkpoint
+  # atomics are instance-owned and releasing Ra early can discard the only
+  # durable copy of un-fsynced Bitcask writes.
+  defp checkpoint_clean?(%{instance_ctx: nil, instance_name: :default}), do: true
+  defp checkpoint_clean?(%{instance_ctx: nil}), do: false
 
   defp checkpoint_clean?(%{instance_ctx: instance_ctx, shard_index: shard_index})
        when is_map(instance_ctx) do
