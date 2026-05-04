@@ -845,17 +845,28 @@ defmodule Ferricstore.Store.Promotion do
         cleanup_leftover_compaction_temp_files(dir, files)
 
         files
-        |> Enum.filter(fn name ->
-          String.ends_with?(name, ".log") and not String.starts_with?(name, "compact_")
-        end)
-        |> Enum.map(fn name ->
-          fid = name |> String.trim_trailing(".log") |> String.to_integer()
-          {fid, Path.join(dir, name)}
+        |> Enum.flat_map(fn name ->
+          case numeric_log_file_id(name) do
+            {:ok, fid} -> [{fid, Path.join(dir, name)}]
+            :skip -> []
+          end
         end)
         |> Enum.sort_by(fn {fid, _} -> fid end)
 
       _ ->
         []
+    end
+  end
+
+  defp numeric_log_file_id(name) do
+    with true <- String.ends_with?(name, ".log"),
+         false <- String.starts_with?(name, "compact_"),
+         stem <- String.trim_trailing(name, ".log"),
+         {fid, ""} <- Integer.parse(stem),
+         true <- fid >= 0 do
+      {:ok, fid}
+    else
+      _ -> :skip
     end
   end
 

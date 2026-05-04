@@ -1133,11 +1133,16 @@ defmodule Ferricstore.Store.Shard.Compound do
     case Ferricstore.FS.ls(dir_path) do
       {:ok, files} ->
         files
-        |> Enum.filter(&String.ends_with?(&1, ".log"))
         |> Enum.reduce(0, fn name, acc ->
-          case File.stat(Path.join(dir_path, name)) do
-            {:ok, %{size: s}} -> acc + s
-            _ -> acc
+          case dedicated_log_file_id(name) do
+            {:ok, _fid} ->
+              case File.stat(Path.join(dir_path, name)) do
+                {:ok, %{size: s}} -> acc + s
+                _ -> acc
+              end
+
+            :skip ->
+              acc
           end
         end)
 
@@ -1466,10 +1471,8 @@ defmodule Ferricstore.Store.Shard.Compound do
     case Ferricstore.FS.ls(dedicated_path) do
       {:ok, files} ->
         Enum.reduce_while(files, :ok, fn name, :ok ->
-          if String.ends_with?(name, ".log") do
-            fid = name |> String.trim_trailing(".log") |> String.to_integer()
-
-            if fid < new_fid do
+          case dedicated_log_file_id(name) do
+            {:ok, fid} when fid < new_fid ->
               path = Path.join(dedicated_path, name)
 
               case Ferricstore.FS.rm(path) do
@@ -1483,16 +1486,29 @@ defmodule Ferricstore.Store.Shard.Compound do
 
                   {:halt, {:error, {:remove_old_log_failed, path, reason}}}
               end
-            else
+
+            {:ok, _fid} ->
               {:cont, :ok}
-            end
-          else
-            {:cont, :ok}
+
+            :skip ->
+              {:cont, :ok}
           end
         end)
 
       _ ->
         :ok
+    end
+  end
+
+  defp dedicated_log_file_id(name) do
+    with true <- String.ends_with?(name, ".log"),
+         false <- String.starts_with?(name, "compact_"),
+         stem <- String.trim_trailing(name, ".log"),
+         {fid, ""} <- Integer.parse(stem),
+         true <- fid >= 0 do
+      {:ok, fid}
+    else
+      _ -> :skip
     end
   end
 

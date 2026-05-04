@@ -300,6 +300,27 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
     end
 
+    test "dedicated compaction ignores non-numeric log-shaped files" do
+      store = real_store()
+      key = ukey("compact_stray_log")
+      promote_hash(store, key)
+
+      dir = dedicated_dir(key)
+      File.write!(Path.join(dir, "notes.log"), "not a bitcask log")
+
+      ctx = FerricStore.Instance.get(:default)
+      shard_idx = Router.shard_for(ctx, key)
+      shard = Router.shard_name(ctx, shard_idx)
+
+      :sys.replace_state(shard, fn state ->
+        dedicated_path = state.promoted_instances[key].path
+        ShardCompound.compact_dedicated(state, key, dedicated_path)
+      end)
+
+      assert File.exists?(Path.join(dir, "notes.log"))
+      assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
+    end
+
     test "many writes trigger compaction and data is still readable" do
       store = real_store()
       key = ukey("compact_trigger")
