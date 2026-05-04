@@ -1000,6 +1000,44 @@ defmodule Ferricstore.Store.Ops do
   defp local_batch_read_cold(_tx, results, []), do: results
 
   defp local_batch_read_cold(tx, results, cold_reads) do
+    {unique_reads, fanout_indexes} = dedupe_local_batch_cold_reads(cold_reads)
+    unique_results = read_unique_local_batch_cold(tx, unique_reads)
+
+    Enum.reduce(fanout_indexes, results, fn {original_index, unique_index}, acc ->
+      case Map.fetch(unique_results, unique_index) do
+        {:ok, value} -> Map.put(acc, original_index, value)
+        :error -> acc
+      end
+    end)
+  end
+
+  defp dedupe_local_batch_cold_reads(cold_reads) do
+    {unique_reads, _index_by_location, fanout_indexes} =
+      Enum.reduce(cold_reads, {[], %{}, []}, fn read, {unique_acc, index_acc, fanout_acc} ->
+        original_index = elem(read, 0)
+        location = local_batch_cold_read_location(read)
+
+        case Map.fetch(index_acc, location) do
+          {:ok, unique_index} ->
+            {unique_acc, index_acc, [{original_index, unique_index} | fanout_acc]}
+
+          :error ->
+            unique_index = map_size(index_acc)
+            unique_read = put_elem(read, 0, unique_index)
+
+            {[unique_read | unique_acc], Map.put(index_acc, location, unique_index),
+             [{original_index, unique_index} | fanout_acc]}
+        end
+      end)
+
+    {Enum.reverse(unique_reads), Enum.reverse(fanout_indexes)}
+  end
+
+  defp local_batch_cold_read_location({_index, key, path, _fid, off, _vsize, _exp}) do
+    {path, off, key}
+  end
+
+  defp read_unique_local_batch_cold(tx, cold_reads) do
     locations =
       Enum.map(cold_reads, fn {_index, key, path, _fid, off, _vsize, _exp} -> {path, off, key} end)
 
@@ -1007,7 +1045,7 @@ defmodule Ferricstore.Store.Ops do
       {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
         cold_reads
         |> Enum.zip(values)
-        |> Enum.reduce(results, fn
+        |> Enum.reduce(%{}, fn
           {{index, key, _path, fid, off, vsize, exp}, value}, acc when is_binary(value) ->
             ShardETS.cold_read_warm_ets(tx.shard_state, key, value, exp, fid, off, vsize)
             Map.put(acc, index, {value, exp})
@@ -1022,11 +1060,11 @@ defmodule Ferricstore.Store.Ops do
 
       {:ok, _bad_values} ->
         emit_local_batch_cold_errors(cold_reads, :batch_result_length_mismatch)
-        results
+        %{}
 
       {:error, reason} ->
         emit_local_batch_cold_errors(cold_reads, reason)
-        results
+        %{}
     end
   end
 

@@ -110,6 +110,13 @@ defmodule Ferricstore.Store.OpsTest do
              "LocalTxStore batch_get must batch local cold reads instead of one waiter per key"
     end
 
+    test "local cold batch reads deduplicate repeated physical locations" do
+      source = File.read!(@ops_path)
+
+      assert source =~ "dedupe_local_batch_cold_reads",
+             "LocalTxStore batch reads should pread each repeated cold {path, offset, key} once and fan out the result"
+    end
+
     test "batch_get returns ordered cold values and warms matching ETS entries" do
       ctx = FerricStore.Instance.get(:default)
 
