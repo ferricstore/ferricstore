@@ -149,18 +149,163 @@ defmodule Ferricstore.Store.Shard do
     # exits. That path drains pending writes and writes the active hint file.
     Process.flag(:trap_exit, true)
 
-    index = Keyword.fetch!(opts, :index)
-    data_dir = Keyword.fetch!(opts, :data_dir)
-    flush_ms = Keyword.get(opts, :flush_interval_ms, @flush_interval_ms)
-    ctx = Keyword.get(opts, :instance_ctx)
+    try do
+      index = Keyword.fetch!(opts, :index)
+      data_dir = Keyword.fetch!(opts, :data_dir)
+      flush_ms = Keyword.get(opts, :flush_interval_ms, @flush_interval_ms)
+      ctx = Keyword.get(opts, :instance_ctx)
+      fsync_dir_fun = Keyword.get(opts, :fsync_dir_fun, &NIF.v2_fsync_dir/1)
 
-    path = Ferricstore.DataDir.shard_data_path(data_dir, index)
+      path = Ferricstore.DataDir.shard_data_path(data_dir, index)
+
+      {active_file_id, active_file_size, active_file_path} =
+        ensure_initial_files!(path, index, fsync_dir_fun)
+
+      # Create/clear named ETS tables.
+      # Use instance-scoped names from ctx if available, else default naming.
+      keydir_name =
+        if ctx, do: elem(ctx.keydir_refs, index), else: :"keydir_#{index}"
+
+      keydir =
+        case :ets.whereis(keydir_name) do
+          :undefined ->
+            :ets.new(keydir_name, [
+              :set,
+              :public,
+              :named_table,
+              {:read_concurrency, true},
+              {:write_concurrency, :auto},
+              {:decentralized_counters, true}
+            ])
+
+          _ref ->
+            :ets.delete_all_objects(keydir_name)
+            # Reset off-heap binary byte counter for this shard
+            if ctx != nil and ctx.keydir_binary_bytes != nil do
+              :atomics.put(ctx.keydir_binary_bytes, index + 1, 0)
+            end
+
+            keydir_name
+        end
+
+      # Remove any leftover hot_cache table from a previous run.
+      case :ets.whereis(:"hot_cache_#{index}") do
+        :undefined -> :ok
+        _ref -> :ets.delete(:"hot_cache_#{index}")
+      end
+
+      ets = keydir
+
+      # v2: recover ETS keydir from hint files or by scanning log files BEFORE
+      # starting Raft. This ensures cold entries ({key, nil, ..., fid, off, vsize})
+      # are in ETS when ra replays WAL entries via apply/3. Without this, replayed
+      # read-modify-write commands (INCR, APPEND, etc.) see ETS misses during
+      # replay and start from nil instead of the correct prior value.
+      # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
+      # Must run BEFORE recover_promoted so PM: markers are in ETS.
+      profile_startup_phase(index, :recover_keydir, fn ->
+        ShardLifecycle.recover_keydir(path, keydir, index, ctx)
+      end)
+
+      # Only the default application instance owns Raft. Custom embedded shards
+      # run local/direct, and direct shard tests pass non-default instance_ctx.
+      raft? =
+        if ctx && ctx.name == :default do
+          profile_startup_phase(index, :start_raft, fn ->
+            ShardLifecycle.start_raft_if_available(
+              index,
+              path,
+              active_file_id,
+              active_file_path,
+              ets,
+              ctx.name,
+              # Start all Ra servers first, then Application waits for all
+              # elections in parallel before marking the node ready.
+              wait_for_leader: false
+            )
+          end)
+        else
+          false
+        end
+
+      # Recover promoted collection instances
+      promoted =
+        profile_startup_phase(index, :recover_promoted, fn ->
+          Ferricstore.Store.Promotion.recover_promoted(path, keydir, data_dir, index, ctx)
+        end)
+
+      # Migrate existing prob files: scan prob dir for files without
+      # corresponding metadata markers in the keydir. Write markers so
+      # DEL can clean up prob files and BF.INFO/CMS.INFO can recover metadata.
+      profile_startup_phase(index, :migrate_prob_files, fn ->
+        ShardLifecycle.migrate_prob_files(path, keydir, index, ctx)
+      end)
+
+      # Publish active file metadata to ActiveFile registry
+      Ferricstore.Store.ActiveFile.publish(ctx, index, active_file_id, active_file_path, path)
+
+      # Compute per-file dead bytes stats from disk sizes + ETS live data.
+      file_stats =
+        profile_startup_phase(index, :compute_file_stats, fn ->
+          compute_file_stats(path, keydir)
+        end)
+
+      # Read merge config for fragmentation thresholds
+      merge_config_overrides = Keyword.get(opts, :merge_config, %{})
+
+      merge_config = %{
+        fragmentation_threshold:
+          Map.get(
+            merge_config_overrides,
+            :fragmentation_threshold,
+            @default_fragmentation_threshold
+          ),
+        dead_bytes_threshold:
+          Map.get(merge_config_overrides, :dead_bytes_threshold, @default_dead_bytes_threshold)
+      }
+
+      schedule_drain_pending(flush_ms)
+      ShardLifecycle.schedule_expiry_sweep()
+      ShardLifecycle.schedule_frag_check()
+      max_file_size = if ctx, do: ctx.max_active_file_size, else: @default_max_active_file_size
+
+      {:ok,
+       %__MODULE__{
+         ets: keydir,
+         keydir: keydir,
+         index: index,
+         data_dir: data_dir,
+         shard_data_path: path,
+         instance_ctx: ctx,
+         active_file_id: active_file_id,
+         active_file_path: active_file_path,
+         active_file_size: active_file_size,
+         pending: [],
+         flush_in_flight: nil,
+         promoted_instances: promoted,
+         file_stats: file_stats,
+         merge_config: merge_config,
+         raft?: raft?,
+         max_active_file_size: max_file_size
+       }, {:continue, {:flush_interval, flush_ms}}}
+    catch
+      {:shard_init_failed, reason} -> {:stop, reason}
+    end
+  end
+
+  defp file_path(shard_path, file_id), do: ShardETS.file_path(shard_path, file_id)
+
+  defp ensure_initial_files!(path, index, fsync_dir_fun) do
     dir_created? = not Ferricstore.FS.dir?(path)
     Ferricstore.FS.mkdir_p!(path)
 
-    if dir_created? do
-      _ = NIF.v2_fsync_dir(Path.dirname(path))
-    end
+    maybe_fsync_startup_dir!(
+      dir_created?,
+      Path.dirname(path),
+      :create_shard_dir,
+      index,
+      fsync_dir_fun
+    )
 
     # v2: scan data_dir for existing .log files, find highest file_id
     {active_file_id, active_file_size} = ShardLifecycle.discover_active_file(path)
@@ -176,140 +321,32 @@ defmodule Ferricstore.Store.Shard do
         false
       end
 
-    if dir_created? or file_created? do
-      _ = NIF.v2_fsync_dir(path)
-    end
+    maybe_fsync_startup_dir!(
+      dir_created? or file_created?,
+      path,
+      :create_active_file,
+      index,
+      fsync_dir_fun
+    )
 
-    # Create/clear named ETS tables.
-    # Use instance-scoped names from ctx if available, else default naming.
-    keydir_name =
-      if ctx, do: elem(ctx.keydir_refs, index), else: :"keydir_#{index}"
-
-    keydir =
-      case :ets.whereis(keydir_name) do
-        :undefined ->
-          :ets.new(keydir_name, [
-            :set,
-            :public,
-            :named_table,
-            {:read_concurrency, true},
-            {:write_concurrency, :auto},
-            {:decentralized_counters, true}
-          ])
-
-        _ref ->
-          :ets.delete_all_objects(keydir_name)
-          # Reset off-heap binary byte counter for this shard
-          if ctx != nil and ctx.keydir_binary_bytes != nil do
-            :atomics.put(ctx.keydir_binary_bytes, index + 1, 0)
-          end
-
-          keydir_name
-      end
-
-    # Remove any leftover hot_cache table from a previous run.
-    case :ets.whereis(:"hot_cache_#{index}") do
-      :undefined -> :ok
-      _ref -> :ets.delete(:"hot_cache_#{index}")
-    end
-
-    ets = keydir
-
-    # v2: recover ETS keydir from hint files or by scanning log files BEFORE
-    # starting Raft. This ensures cold entries ({key, nil, ..., fid, off, vsize})
-    # are in ETS when ra replays WAL entries via apply/3. Without this, replayed
-    # read-modify-write commands (INCR, APPEND, etc.) see ETS misses during
-    # replay and start from nil instead of the correct prior value.
-    # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
-    # Must run BEFORE recover_promoted so PM: markers are in ETS.
-    profile_startup_phase(index, :recover_keydir, fn ->
-      ShardLifecycle.recover_keydir(path, keydir, index, ctx)
-    end)
-
-    # Only the default application instance owns Raft. Custom embedded shards
-    # run local/direct, and direct shard tests pass non-default instance_ctx.
-    raft? =
-      if ctx && ctx.name == :default do
-        profile_startup_phase(index, :start_raft, fn ->
-          ShardLifecycle.start_raft_if_available(
-            index,
-            path,
-            active_file_id,
-            active_file_path,
-            ets,
-            ctx.name,
-            # Start all Ra servers first, then Application waits for all
-            # elections in parallel before marking the node ready.
-            wait_for_leader: false
-          )
-        end)
-      else
-        false
-      end
-
-    # Recover promoted collection instances
-    promoted =
-      profile_startup_phase(index, :recover_promoted, fn ->
-        Ferricstore.Store.Promotion.recover_promoted(path, keydir, data_dir, index, ctx)
-      end)
-
-    # Migrate existing prob files: scan prob dir for files without
-    # corresponding metadata markers in the keydir. Write markers so
-    # DEL can clean up prob files and BF.INFO/CMS.INFO can recover metadata.
-    profile_startup_phase(index, :migrate_prob_files, fn ->
-      ShardLifecycle.migrate_prob_files(path, keydir, index, ctx)
-    end)
-
-    # Publish active file metadata to ActiveFile registry
-    Ferricstore.Store.ActiveFile.publish(ctx, index, active_file_id, active_file_path, path)
-
-    # Compute per-file dead bytes stats from disk sizes + ETS live data.
-    file_stats =
-      profile_startup_phase(index, :compute_file_stats, fn ->
-        compute_file_stats(path, keydir)
-      end)
-
-    # Read merge config for fragmentation thresholds
-    merge_config_overrides = Keyword.get(opts, :merge_config, %{})
-
-    merge_config = %{
-      fragmentation_threshold:
-        Map.get(
-          merge_config_overrides,
-          :fragmentation_threshold,
-          @default_fragmentation_threshold
-        ),
-      dead_bytes_threshold:
-        Map.get(merge_config_overrides, :dead_bytes_threshold, @default_dead_bytes_threshold)
-    }
-
-    schedule_drain_pending(flush_ms)
-    ShardLifecycle.schedule_expiry_sweep()
-    ShardLifecycle.schedule_frag_check()
-    max_file_size = if ctx, do: ctx.max_active_file_size, else: @default_max_active_file_size
-
-    {:ok,
-     %__MODULE__{
-       ets: keydir,
-       keydir: keydir,
-       index: index,
-       data_dir: data_dir,
-       shard_data_path: path,
-       instance_ctx: ctx,
-       active_file_id: active_file_id,
-       active_file_path: active_file_path,
-       active_file_size: active_file_size,
-       pending: [],
-       flush_in_flight: nil,
-       promoted_instances: promoted,
-       file_stats: file_stats,
-       merge_config: merge_config,
-       raft?: raft?,
-       max_active_file_size: max_file_size
-     }, {:continue, {:flush_interval, flush_ms}}}
+    {active_file_id, active_file_size, active_file_path}
   end
 
-  defp file_path(shard_path, file_id), do: ShardETS.file_path(shard_path, file_id)
+  defp maybe_fsync_startup_dir!(false, _path, _phase, _index, _fsync_dir_fun), do: :ok
+
+  defp maybe_fsync_startup_dir!(true, path, phase, index, fsync_dir_fun) do
+    case fsync_dir_fun.(path) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "Shard #{index} startup failed to fsync #{phase} directory #{inspect(path)}: #{inspect(reason)}"
+        )
+
+        throw({:shard_init_failed, {:fsync_dir_failed, phase, reason}})
+    end
+  end
 
   defp profile_startup_phase(index, phase, fun) when is_function(fun, 0) do
     {duration_us, result} = :timer.tc(fun)

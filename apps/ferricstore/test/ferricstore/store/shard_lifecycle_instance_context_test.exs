@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.Shard
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
 
   test "recover_keydir replays log files by numeric file id" do
@@ -138,7 +139,77 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
                    1_000
   end
 
-  defp build_instance do
+  test "shard startup reports directory fsync failure instead of starting dirty storage" do
+    ctx = build_instance(ensure_layout?: false)
+    parent = self()
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    fsync_dir_fun = fn path ->
+      send(parent, {:startup_fsync_dir, path})
+      {:error, :eio}
+    end
+
+    result =
+      Shard.start_link(
+        index: 0,
+        data_dir: ctx.data_dir,
+        instance_ctx: ctx,
+        fsync_dir_fun: fsync_dir_fun
+      )
+
+    started_pid =
+      case result do
+        {:ok, pid} -> pid
+        _ -> nil
+      end
+
+    on_exit(fn ->
+      Process.flag(:trap_exit, previous_trap_exit)
+      cleanup_instance(ctx, started_pid)
+    end)
+
+    assert {:error, {:fsync_dir_failed, :create_shard_dir, :eio}} = result
+
+    expected_parent = Path.join(ctx.data_dir, "data")
+    assert_received {:startup_fsync_dir, ^expected_parent}
+  end
+
+  test "shard startup reports active file directory fsync failure" do
+    ctx = build_instance()
+    parent = self()
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    fsync_dir_fun = fn path ->
+      send(parent, {:startup_fsync_dir, path})
+      {:error, :enospc}
+    end
+
+    result =
+      Shard.start_link(
+        index: 0,
+        data_dir: ctx.data_dir,
+        instance_ctx: ctx,
+        fsync_dir_fun: fsync_dir_fun
+      )
+
+    started_pid =
+      case result do
+        {:ok, pid} -> pid
+        _ -> nil
+      end
+
+    on_exit(fn ->
+      Process.flag(:trap_exit, previous_trap_exit)
+      cleanup_instance(ctx, started_pid)
+    end)
+
+    assert {:error, {:fsync_dir_failed, :create_active_file, :enospc}} = result
+
+    expected_shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    assert_received {:startup_fsync_dir, ^expected_shard_path}
+  end
+
+  defp build_instance(opts \\ []) do
     name = :"lifecycle_instance_#{System.unique_integer([:positive])}"
 
     data_dir =
@@ -155,7 +226,10 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
         keydir_max_ram: 64 * 1024 * 1024
       )
 
-    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    if Keyword.get(opts, :ensure_layout?, true) do
+      Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    end
+
     ctx
   end
 
