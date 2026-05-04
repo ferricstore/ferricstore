@@ -1304,7 +1304,21 @@ defmodule Ferricstore.Store.Shard do
     # Dropping the hint forces startup to scan the log instead of trusting
     # stale offsets that can resurrect deleted keys.
     hint_name = "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.hint"
-    _ = Ferricstore.FS.rm(Path.join(shard_path, hint_name))
+    hint_path = Path.join(shard_path, hint_name)
+
+    case Ferricstore.FS.rm(hint_path) do
+      :ok ->
+        :ok
+
+      {:error, {:not_found, _}} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "failed to remove stale compaction hint file #{hint_path}: #{inspect(reason)}"
+        )
+    end
+
     :ok
   end
 

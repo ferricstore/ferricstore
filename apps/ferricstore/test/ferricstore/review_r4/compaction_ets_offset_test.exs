@@ -83,6 +83,25 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
       assert File.dir?(compact_tmp_dir)
     end
 
+    test "successful compaction reports stale hint cleanup failure", %{shard: shard} do
+      assert :ok = GenServer.call(shard, {:put, "hint_cleanup_key", "value_1", 0})
+      assert :ok = GenServer.call(shard, :flush)
+
+      force_rotate_active_file(shard)
+
+      state = :sys.get_state(shard)
+      hint_dir = Path.join(state.shard_data_path, "00000.hint")
+      File.mkdir!(hint_dir)
+
+      log =
+        capture_log(fn ->
+          assert {:ok, {1, 0, _reclaimed}} = GenServer.call(shard, {:run_compaction, [0]})
+        end)
+
+      assert log =~ "failed to remove stale compaction hint file"
+      assert File.dir?(hint_dir)
+    end
+
     test "directory fsync failure after namespace changes is returned as compaction error", %{
       shard: shard,
       keydir: keydir
