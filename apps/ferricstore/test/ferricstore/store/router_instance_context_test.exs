@@ -80,6 +80,32 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert nil == Router.compound_get(async_ctx, key, field_key)
   end
 
+  test "custom write version survives shard process restart", %{ctx: ctx} do
+    key = "router:instance:version-restart:#{System.unique_integer([:positive])}"
+    idx = Router.shard_for(ctx, key)
+    shard_name = elem(ctx.shard_names, idx)
+
+    assert :ok = Router.put(ctx, key, "before")
+    version_before = Router.get_version(ctx, key)
+    assert version_before > 0
+
+    shard_name
+    |> Process.whereis()
+    |> GenServer.stop(:normal, 5_000)
+
+    {:ok, _pid} =
+      Ferricstore.Store.Shard.start_link(
+        index: idx,
+        data_dir: ctx.data_dir,
+        instance_ctx: ctx
+      )
+
+    assert version_before == Router.get_version(ctx, key)
+
+    assert :ok = Router.put(ctx, key, "after")
+    assert Router.get_version(ctx, key) > version_before
+  end
+
   defp same_shard_keys(ctx) do
     base = System.unique_integer([:positive])
     default_ctx = FerricStore.Instance.get(:default)

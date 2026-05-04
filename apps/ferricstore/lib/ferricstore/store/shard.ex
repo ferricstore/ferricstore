@@ -420,17 +420,7 @@ defmodule Ferricstore.Store.Shard do
   # with the shared atomic counter (incremented by Router for quorum bypass writes).
   # This ensures WATCH detects mutations regardless of which write path was used.
   def handle_call({:get_version, _key}, _from, state) do
-    ctx = state.instance_ctx
-
-    shared =
-      if ctx do
-        size = :counters.info(ctx.write_version).size
-        if state.index < size, do: :counters.get(ctx.write_version, state.index + 1), else: 0
-      else
-        Ferricstore.Store.WriteVersion.get(state.index)
-      end
-
-    {:reply, state.write_version + shared, state}
+    {:reply, max(state.write_version, shared_write_version(state)), state}
   end
 
   # -------------------------------------------------------------------
@@ -440,7 +430,9 @@ defmodule Ferricstore.Store.Shard do
   # Delete all entries matching a compound key prefix.
   # Uses :ets.select match spec instead of :ets.foldl full-table scan.
   def handle_call({:delete_prefix, prefix}, _from, state) do
-    ShardWrites.handle_delete_prefix(prefix, state)
+    prefix
+    |> ShardWrites.handle_delete_prefix(state)
+    |> track_write_version_result(state)
   end
 
   def handle_call({:put, _key, _value, _expire_at_ms}, _from, %{writes_paused: true} = state) do
@@ -464,52 +456,70 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call({:put, key, value, expire_at_ms}, from, state) do
-    ShardWrites.handle_put(key, value, expire_at_ms, from, state)
+    key
+    |> ShardWrites.handle_put(value, expire_at_ms, from, state)
+    |> track_write_version_result(state)
   end
 
   # Atomic increment: reads current value, parses as integer, adds delta, writes back.
   # Returns {:ok, new_integer} or {:error, reason}.
   def handle_call({:incr, key, delta}, from, state) do
-    ShardWrites.handle_incr(key, delta, from, state)
+    key
+    |> ShardWrites.handle_incr(delta, from, state)
+    |> track_write_version_result(state)
   end
 
   # Atomic float increment: reads current value, parses as float, adds delta, writes back.
   # Returns {:ok, new_float_string} or {:error, reason}.
   def handle_call({:incr_float, key, delta}, from, state) do
-    ShardWrites.handle_incr_float(key, delta, from, state)
+    key
+    |> ShardWrites.handle_incr_float(delta, from, state)
+    |> track_write_version_result(state)
   end
 
   # Atomic append: reads current value (or ""), appends suffix, writes back.
   # Returns {:ok, new_byte_length}.
   def handle_call({:append, key, suffix}, from, state) do
-    ShardWrites.handle_append(key, suffix, from, state)
+    key
+    |> ShardWrites.handle_append(suffix, from, state)
+    |> track_write_version_result(state)
   end
 
   # Atomic get-and-set: returns old value (or nil), sets new value.
   def handle_call({:getset, key, new_value}, from, state) do
-    ShardWrites.handle_getset(key, new_value, from, state)
+    key
+    |> ShardWrites.handle_getset(new_value, from, state)
+    |> track_write_version_result(state)
   end
 
   # Atomic get-and-delete: returns value (or nil), deletes key.
   def handle_call({:getdel, key}, from, state) do
-    ShardWrites.handle_getdel(key, from, state)
+    key
+    |> ShardWrites.handle_getdel(from, state)
+    |> track_write_version_result(state)
   end
 
   # Atomic get-and-update-expiry: returns value, updates TTL.
   # expire_at_ms = 0 means PERSIST (remove expiry).
   def handle_call({:getex, key, expire_at_ms}, from, state) do
-    ShardWrites.handle_getex(key, expire_at_ms, from, state)
+    key
+    |> ShardWrites.handle_getex(expire_at_ms, from, state)
+    |> track_write_version_result(state)
   end
 
   # Atomic set-range: overwrites portion of string at offset with value.
   # Zero-pads if key doesn't exist or string is shorter than offset.
   # Returns {:ok, new_byte_length}.
   def handle_call({:setrange, key, offset, value}, from, state) do
-    ShardWrites.handle_setrange(key, offset, value, from, state)
+    key
+    |> ShardWrites.handle_setrange(offset, value, from, state)
+    |> track_write_version_result(state)
   end
 
   def handle_call({:delete, key}, from, state) do
-    ShardWrites.handle_delete(key, from, state)
+    key
+    |> ShardWrites.handle_delete(from, state)
+    |> track_write_version_result(state)
   end
 
   # -------------------------------------------------------------------
@@ -533,11 +543,15 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call({:compound_put, redis_key, compound_key, value, expire_at_ms}, _from, state) do
-    ShardCompound.handle_compound_put(redis_key, compound_key, value, expire_at_ms, state)
+    redis_key
+    |> ShardCompound.handle_compound_put(compound_key, value, expire_at_ms, state)
+    |> track_write_version_result(state)
   end
 
   def handle_call({:compound_delete, redis_key, compound_key}, _from, state) do
-    ShardCompound.handle_compound_delete(redis_key, compound_key, state)
+    redis_key
+    |> ShardCompound.handle_compound_delete(compound_key, state)
+    |> track_write_version_result(state)
   end
 
   def handle_call({:compound_scan, redis_key, prefix}, _from, state) do
@@ -549,7 +563,9 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call({:compound_delete_prefix, redis_key, prefix}, _from, state) do
-    ShardCompound.handle_compound_delete_prefix(redis_key, prefix, state)
+    redis_key
+    |> ShardCompound.handle_compound_delete_prefix(prefix, state)
+    |> track_write_version_result(state)
   end
 
   # -------------------------------------------------------------------
@@ -557,23 +573,33 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   def handle_call({:cas, key, expected, new_value, ttl_ms}, _from, state) do
-    ShardNativeOps.handle_cas(key, expected, new_value, ttl_ms, state)
+    key
+    |> ShardNativeOps.handle_cas(expected, new_value, ttl_ms, state)
+    |> track_write_version_result(state)
   end
 
   def handle_call({:lock, key, owner, ttl_ms}, _from, state) do
-    ShardNativeOps.handle_lock(key, owner, ttl_ms, state)
+    key
+    |> ShardNativeOps.handle_lock(owner, ttl_ms, state)
+    |> track_write_version_result(state)
   end
 
   def handle_call({:unlock, key, owner}, _from, state) do
-    ShardNativeOps.handle_unlock(key, owner, state)
+    key
+    |> ShardNativeOps.handle_unlock(owner, state)
+    |> track_write_version_result(state)
   end
 
   def handle_call({:extend, key, owner, ttl_ms}, _from, state) do
-    ShardNativeOps.handle_extend(key, owner, ttl_ms, state)
+    key
+    |> ShardNativeOps.handle_extend(owner, ttl_ms, state)
+    |> track_write_version_result(state)
   end
 
   def handle_call({:ratelimit_add, key, window_ms, max, count}, _from, state) do
-    ShardNativeOps.handle_ratelimit_add(key, window_ms, max, count, state)
+    key
+    |> ShardNativeOps.handle_ratelimit_add(window_ms, max, count, state)
+    |> track_write_version_result(state)
   end
 
   # 6-tuple variant: includes pre-computed now_ms from Router.raft_write.
@@ -582,7 +608,9 @@ defmodule Ferricstore.Store.Shard do
   # only and other nodes never see the increment. Falls back to direct in
   # non-Raft mode.
   def handle_call({:ratelimit_add, key, window_ms, max, count, _now_ms}, _from, state) do
-    ShardNativeOps.handle_ratelimit_add(key, window_ms, max, count, state)
+    key
+    |> ShardNativeOps.handle_ratelimit_add(window_ms, max, count, state)
+    |> track_write_version_result(state)
   end
 
   # -------------------------------------------------------------------
@@ -590,11 +618,15 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   def handle_call({:list_op, key, operation}, _from, state) do
-    ShardNativeOps.handle_list_op(key, operation, state)
+    key
+    |> ShardNativeOps.handle_list_op(operation, state)
+    |> track_write_version_result(state)
   end
 
   def handle_call({:list_op_lmove, src_key, dst_key, from_dir, to_dir}, _from, state) do
-    ShardNativeOps.handle_list_op_lmove(src_key, dst_key, from_dir, to_dir, state)
+    src_key
+    |> ShardNativeOps.handle_list_op_lmove(dst_key, from_dir, to_dir, state)
+    |> track_write_version_result(state)
   end
 
   # -------------------------------------------------------------------
@@ -602,7 +634,9 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   def handle_call({:tx_execute, queue, sandbox_namespace}, _from, state) do
-    ShardTransaction.handle_tx_execute(queue, sandbox_namespace, state)
+    queue
+    |> ShardTransaction.handle_tx_execute(sandbox_namespace, state)
+    |> track_write_version_result(state)
   end
 
   # Check if a redis_key has been promoted to dedicated storage.
@@ -974,6 +1008,66 @@ defmodule Ferricstore.Store.Shard do
         active_file_size: Map.get(sm_state, :active_file_size, state.active_file_size),
         file_stats: Map.get(sm_state, :file_stats, state.file_stats)
     }
+  end
+
+  defp shared_write_version(%{instance_ctx: %{write_version: write_version}, index: index}) do
+    counter_value(write_version, index)
+  end
+
+  defp shared_write_version(%{instance_ctx: nil, index: index}) do
+    Ferricstore.Store.WriteVersion.get(index)
+  rescue
+    _ -> 0
+  end
+
+  defp counter_value(write_version, index) do
+    size = :counters.info(write_version).size
+    if index < size, do: :counters.get(write_version, index + 1), else: 0
+  rescue
+    _ -> 0
+  end
+
+  defp track_write_version_result({:reply, reply, new_state}, old_state) do
+    {:reply, reply, mirror_direct_write_version(new_state, old_state)}
+  end
+
+  defp track_write_version_result({:noreply, new_state}, old_state) do
+    {:noreply, mirror_direct_write_version(new_state, old_state)}
+  end
+
+  defp track_write_version_result(other, _old_state), do: other
+
+  # Custom/direct shards do not go through Router's quorum bump, so mirror
+  # their local WATCH token into the instance counter that survives shard restart.
+  defp mirror_direct_write_version(
+         %{write_version: new_version} = new_state,
+         %{raft?: false, write_version: old_version}
+       )
+       when new_version > old_version do
+    bump_shared_write_version(new_state, new_version - old_version)
+    new_state
+  end
+
+  defp mirror_direct_write_version(new_state, _old_state), do: new_state
+
+  defp bump_shared_write_version(
+         %{instance_ctx: %{write_version: write_version}, index: index},
+         delta
+       ) do
+    size = :counters.info(write_version).size
+    if index < size, do: :counters.add(write_version, index + 1, delta)
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp bump_shared_write_version(%{instance_ctx: nil, index: index}, delta) do
+    ref = :persistent_term.get(:ferricstore_write_versions)
+    size = :counters.info(ref).size
+    if index < size, do: :counters.add(ref, index + 1, delta)
+    :ok
+  rescue
+    _ -> :ok
   end
 
   defp sync_active_file_from_registry(%{instance_ctx: nil} = state), do: state
