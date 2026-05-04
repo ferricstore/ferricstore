@@ -13,6 +13,33 @@ defmodule Ferricstore.FlowTest do
     :ok
   end
 
+  defp attach_flow_telemetry(events) do
+    test_pid = self()
+
+    handler_ids =
+      Enum.map(events, fn event ->
+        handler_id = {__MODULE__, self(), event, System.unique_integer([:positive])}
+
+        :ok =
+          :telemetry.attach(
+            handler_id,
+            event,
+            &__MODULE__.handle_telemetry/4,
+            test_pid
+          )
+
+        handler_id
+      end)
+
+    on_exit(fn ->
+      Enum.each(handler_ids, &:telemetry.detach/1)
+    end)
+  end
+
+  def handle_telemetry(event, measurements, metadata, test_pid) do
+    send(test_pid, {:flow_telemetry, event, measurements, metadata})
+  end
+
   defp uid(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"
 
   defp shard_for(key) do
@@ -65,6 +92,45 @@ defmodule Ferricstore.FlowTest do
 
     assert {:error, "ERR flow already exists"} =
              FerricStore.flow_create(id, type: "checkout", state: "queued")
+  end
+
+  test "flow_create emits telemetry and wakeup pubsub notifications" do
+    id = uid("flow-observe")
+    attach_flow_telemetry([[:ferricstore, :flow, :create, :stop]])
+
+    changed_channel = "flow_changed:#{id}"
+    due_channel = "flow_due:observability"
+
+    :ok = Ferricstore.PubSub.subscribe(changed_channel, self())
+    :ok = Ferricstore.PubSub.subscribe(due_channel, self())
+
+    on_exit(fn ->
+      Ferricstore.PubSub.unsubscribe(changed_channel, self())
+      Ferricstore.PubSub.unsubscribe(due_channel, self())
+    end)
+
+    assert {:ok, %{id: ^id}} =
+             FerricStore.flow_create(id,
+               type: "observability",
+               state: "queued",
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert_receive {:flow_telemetry, [:ferricstore, :flow, :create, :stop], measurements,
+                    metadata}
+
+    assert %{duration_ms: duration_ms, count: 1} = measurements
+    assert is_integer(duration_ms) and duration_ms >= 0
+    assert %{flow_id: ^id, flow_type: "observability", result: :ok, reason: nil} = metadata
+
+    assert_receive {:pubsub_message, ^changed_channel, changed_message}
+    assert changed_message =~ "event=created"
+    assert changed_message =~ "state=queued"
+
+    assert_receive {:pubsub_message, ^due_channel, due_message}
+    assert due_message =~ "event=created"
+    assert due_message =~ "id=#{id}"
   end
 
   test "flow APIs reject malformed inputs before raft apply" do

@@ -10,33 +10,38 @@ defmodule Ferricstore.Flow do
   @default_limit 1
 
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
-    with :ok <- validate_opts(opts),
-         :ok <- validate_id(id),
-         {:ok, type} <- required_binary(opts, :type),
-         {:ok, state} <- optional_binary(opts, :state, @default_state),
-         {:ok, payload_ref} <- optional_binary_or_nil(opts, :payload_ref, nil),
-         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-         {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
-         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-         {:ok, history_max_events} <- optional_pos_integer_or_nil(opts, :history_max_events),
-         {:ok, priority} <- optional_priority(opts, @default_priority),
-         {:ok, partition_key} <- optional_partition_key(opts),
-         :ok <- validate_flow_keys(id, type, state, priority, partition_key) do
-      attrs = %{
-        id: id,
-        type: type,
-        state: state,
-        payload_ref: payload_ref,
-        run_at_ms: run_at_ms,
-        ttl_ms: ttl_ms,
-        history_max_events: history_max_events,
-        priority: priority,
-        now_ms: now,
-        partition_key: partition_key
-      }
+    started = flow_start_time()
 
-      Router.flow_create(ctx, attrs)
-    end
+    result =
+      with :ok <- validate_opts(opts),
+           :ok <- validate_id(id),
+           {:ok, type} <- required_binary(opts, :type),
+           {:ok, state} <- optional_binary(opts, :state, @default_state),
+           {:ok, payload_ref} <- optional_binary_or_nil(opts, :payload_ref, nil),
+           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
+           {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
+           {:ok, history_max_events} <- optional_pos_integer_or_nil(opts, :history_max_events),
+           {:ok, priority} <- optional_priority(opts, @default_priority),
+           {:ok, partition_key} <- optional_partition_key(opts),
+           :ok <- validate_flow_keys(id, type, state, priority, partition_key) do
+        attrs = %{
+          id: id,
+          type: type,
+          state: state,
+          payload_ref: payload_ref,
+          run_at_ms: run_at_ms,
+          ttl_ms: ttl_ms,
+          history_max_events: history_max_events,
+          priority: priority,
+          now_ms: now,
+          partition_key: partition_key
+        }
+
+        Router.flow_create(ctx, attrs)
+      end
+
+    observe_flow(:create, started, result, %{flow_id: id})
   end
 
   def get(ctx, id, opts \\ []) when is_binary(id) and is_list(opts) do
@@ -52,150 +57,327 @@ defmodule Ferricstore.Flow do
   end
 
   def claim_due(ctx, type, opts) when is_binary(type) and is_list(opts) do
-    with :ok <- validate_opts(opts),
-         :ok <- validate_type(type),
-         {:ok, state} <- optional_binary(opts, :state, @default_state),
-         {:ok, worker} <- required_binary(opts, :worker),
-         {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
-         {:ok, limit} <- optional_pos_integer(opts, :limit, @default_limit),
-         {:ok, priority} <- optional_priority_or_nil(opts),
-         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-         {:ok, partition_key} <- optional_partition_key(opts),
-         :ok <- validate_claim_due_keys(type, state, priority, partition_key) do
-      attrs = %{
-        type: type,
-        state: state,
-        worker: worker,
-        lease_ms: lease_ms,
-        limit: limit,
-        priority: priority,
-        now_ms: now,
-        partition_key: partition_key
-      }
+    started = flow_start_time()
 
-      Router.flow_claim_due(ctx, attrs)
-    end
+    result =
+      with :ok <- validate_opts(opts),
+           :ok <- validate_type(type),
+           {:ok, state} <- optional_binary(opts, :state, @default_state),
+           {:ok, worker} <- required_binary(opts, :worker),
+           {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
+           {:ok, limit} <- optional_pos_integer(opts, :limit, @default_limit),
+           {:ok, priority} <- optional_priority_or_nil(opts),
+           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, partition_key} <- optional_partition_key(opts),
+           :ok <- validate_claim_due_keys(type, state, priority, partition_key) do
+        attrs = %{
+          type: type,
+          state: state,
+          worker: worker,
+          lease_ms: lease_ms,
+          limit: limit,
+          priority: priority,
+          now_ms: now,
+          partition_key: partition_key
+        }
+
+        Router.flow_claim_due(ctx, attrs)
+      end
+
+    observe_flow(:claim_due, started, result, %{flow_type: type})
   end
 
   def complete(ctx, id, lease_token, opts \\ [])
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
-    with :ok <- validate_opts(opts),
-         :ok <- validate_id(id),
-         :ok <- validate_lease_token(lease_token),
-         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
-         {:ok, partition_key} <- optional_partition_key(opts),
-         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-         {:ok, result_ref} <- optional_binary_or_nil(opts, :result_ref, nil) do
-      Router.flow_complete(ctx, %{
-        id: id,
-        lease_token: lease_token,
-        fencing_token: fencing_token,
-        ttl_ms: ttl_ms,
-        result_ref: result_ref,
-        now_ms: now,
-        partition_key: partition_key
-      })
-    end
+    started = flow_start_time()
+
+    result =
+      with :ok <- validate_opts(opts),
+           :ok <- validate_id(id),
+           :ok <- validate_lease_token(lease_token),
+           {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+           {:ok, partition_key} <- optional_partition_key(opts),
+           :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
+           {:ok, result_ref} <- optional_binary_or_nil(opts, :result_ref, nil) do
+        Router.flow_complete(ctx, %{
+          id: id,
+          lease_token: lease_token,
+          fencing_token: fencing_token,
+          ttl_ms: ttl_ms,
+          result_ref: result_ref,
+          now_ms: now,
+          partition_key: partition_key
+        })
+      end
+
+    observe_flow(:complete, started, result, %{flow_id: id})
   end
 
   def transition(ctx, id, from_state, to_state, opts \\ [])
       when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts) do
-    with :ok <- validate_opts(opts),
-         :ok <- validate_id(id),
-         :ok <- validate_state(:from, from_state),
-         :ok <- validate_state(:to, to_state),
-         {:ok, lease_token} <- optional_lease_token(opts),
-         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
-         {:ok, partition_key} <- optional_partition_key(opts),
-         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-         {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
-         {:ok, priority} <- optional_priority_or_nil(opts) do
-      Router.flow_transition(ctx, %{
-        id: id,
-        from_state: from_state,
-        to_state: to_state,
-        lease_token: lease_token,
-        fencing_token: fencing_token,
-        run_at_ms: run_at_ms,
-        priority: priority,
-        now_ms: now,
-        partition_key: partition_key
-      })
-    end
+    started = flow_start_time()
+
+    result =
+      with :ok <- validate_opts(opts),
+           :ok <- validate_id(id),
+           :ok <- validate_state(:from, from_state),
+           :ok <- validate_state(:to, to_state),
+           {:ok, lease_token} <- optional_lease_token(opts),
+           {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+           {:ok, partition_key} <- optional_partition_key(opts),
+           :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
+           {:ok, priority} <- optional_priority_or_nil(opts) do
+        Router.flow_transition(ctx, %{
+          id: id,
+          from_state: from_state,
+          to_state: to_state,
+          lease_token: lease_token,
+          fencing_token: fencing_token,
+          run_at_ms: run_at_ms,
+          priority: priority,
+          now_ms: now,
+          partition_key: partition_key
+        })
+      end
+
+    observe_flow(:transition, started, result, %{
+      flow_id: id,
+      from_state: from_state,
+      to_state: to_state
+    })
   end
 
   def retry(ctx, id, lease_token, opts)
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
-    with :ok <- validate_opts(opts),
-         :ok <- validate_id(id),
-         :ok <- validate_lease_token(lease_token),
-         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
-         {:ok, partition_key} <- optional_partition_key(opts),
-         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-         {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
-         {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil) do
-      Router.flow_retry(ctx, %{
-        id: id,
-        lease_token: lease_token,
-        fencing_token: fencing_token,
-        run_at_ms: run_at_ms,
-        error_ref: error_ref,
-        now_ms: now,
-        partition_key: partition_key
-      })
-    end
+    started = flow_start_time()
+
+    result =
+      with :ok <- validate_opts(opts),
+           :ok <- validate_id(id),
+           :ok <- validate_lease_token(lease_token),
+           {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+           {:ok, partition_key} <- optional_partition_key(opts),
+           :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
+           {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil) do
+        Router.flow_retry(ctx, %{
+          id: id,
+          lease_token: lease_token,
+          fencing_token: fencing_token,
+          run_at_ms: run_at_ms,
+          error_ref: error_ref,
+          now_ms: now,
+          partition_key: partition_key
+        })
+      end
+
+    observe_flow(:retry, started, result, %{flow_id: id})
   end
 
   def fail(ctx, id, lease_token, opts \\ [])
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
-    with :ok <- validate_opts(opts),
-         :ok <- validate_id(id),
-         :ok <- validate_lease_token(lease_token),
-         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
-         {:ok, partition_key} <- optional_partition_key(opts),
-         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-         {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil) do
-      Router.flow_fail(ctx, %{
-        id: id,
-        lease_token: lease_token,
-        fencing_token: fencing_token,
-        ttl_ms: ttl_ms,
-        error_ref: error_ref,
-        now_ms: now,
-        partition_key: partition_key
-      })
-    end
+    started = flow_start_time()
+
+    result =
+      with :ok <- validate_opts(opts),
+           :ok <- validate_id(id),
+           :ok <- validate_lease_token(lease_token),
+           {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+           {:ok, partition_key} <- optional_partition_key(opts),
+           :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
+           {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil) do
+        Router.flow_fail(ctx, %{
+          id: id,
+          lease_token: lease_token,
+          fencing_token: fencing_token,
+          ttl_ms: ttl_ms,
+          error_ref: error_ref,
+          now_ms: now,
+          partition_key: partition_key
+        })
+      end
+
+    observe_flow(:fail, started, result, %{flow_id: id})
   end
 
   def cancel(ctx, id, opts \\ []) when is_binary(id) and is_list(opts) do
-    with :ok <- validate_opts(opts),
-         :ok <- validate_id(id),
-         {:ok, lease_token} <- optional_lease_token(opts),
-         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
-         {:ok, partition_key} <- optional_partition_key(opts),
-         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-         {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil) do
-      Router.flow_cancel(ctx, %{
-        id: id,
-        lease_token: lease_token,
-        fencing_token: fencing_token,
-        ttl_ms: ttl_ms,
-        reason_ref: reason_ref,
-        now_ms: now,
-        partition_key: partition_key
-      })
-    end
+    started = flow_start_time()
+
+    result =
+      with :ok <- validate_opts(opts),
+           :ok <- validate_id(id),
+           {:ok, lease_token} <- optional_lease_token(opts),
+           {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+           {:ok, partition_key} <- optional_partition_key(opts),
+           :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
+           {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil) do
+        Router.flow_cancel(ctx, %{
+          id: id,
+          lease_token: lease_token,
+          fencing_token: fencing_token,
+          ttl_ms: ttl_ms,
+          reason_ref: reason_ref,
+          now_ms: now,
+          partition_key: partition_key
+        })
+      end
+
+    observe_flow(:cancel, started, result, %{flow_id: id})
   end
 
   def decode_record(value) when is_binary(value), do: :erlang.binary_to_term(value)
+
+  defp flow_start_time, do: System.monotonic_time()
+
+  defp observe_flow(command, started, result, fallback_metadata) do
+    measurements = flow_measurements(started, command, result)
+    metadata = flow_metadata(result, fallback_metadata)
+
+    :telemetry.execute([:ferricstore, :flow, command, :stop], measurements, metadata)
+    publish_flow_notifications(command, result)
+
+    result
+  end
+
+  defp flow_measurements(started, command, result) do
+    count = result_count(result)
+
+    %{
+      duration_ms:
+        System.convert_time_unit(System.monotonic_time() - started, :native, :millisecond),
+      count: count,
+      claimed: if(command == :claim_due, do: count, else: 0)
+    }
+  end
+
+  defp result_count({:ok, records}) when is_list(records), do: length(records)
+  defp result_count({:ok, nil}), do: 0
+  defp result_count({:ok, _record}), do: 1
+  defp result_count(_result), do: 0
+
+  defp flow_metadata({:ok, records}, fallback) when is_list(records) do
+    records
+    |> List.first(%{})
+    |> flow_record_metadata()
+    |> Map.merge(fallback, fn _key, record_value, fallback_value ->
+      record_value || fallback_value
+    end)
+    |> Map.merge(%{result: :ok, reason: nil})
+  end
+
+  defp flow_metadata({:ok, record}, fallback) when is_map(record) do
+    record
+    |> flow_record_metadata()
+    |> Map.merge(fallback, fn _key, record_value, fallback_value ->
+      record_value || fallback_value
+    end)
+    |> Map.merge(%{result: :ok, reason: nil})
+  end
+
+  defp flow_metadata({:ok, _value}, fallback),
+    do: Map.merge(fallback, %{result: :ok, reason: nil})
+
+  defp flow_metadata({:error, reason}, fallback) when is_binary(reason) do
+    Map.merge(fallback, %{result: :error, reason: flow_error_reason(reason)})
+  end
+
+  defp flow_metadata(_result, fallback),
+    do: Map.merge(fallback, %{result: :error, reason: :error})
+
+  defp flow_record_metadata(record) when is_map(record) do
+    %{
+      flow_id: Map.get(record, :id),
+      flow_type: Map.get(record, :type),
+      to_state: Map.get(record, :state),
+      worker_id: Map.get(record, :lease_owner),
+      fencing_token: Map.get(record, :fencing_token)
+    }
+  end
+
+  defp flow_record_metadata(_record), do: %{}
+
+  defp flow_error_reason(reason) do
+    cond do
+      String.contains?(reason, "wrong state") -> :wrong_state
+      String.contains?(reason, "stale flow lease") -> :stale_token
+      String.contains?(reason, "not found") -> :missing
+      String.contains?(reason, "already exists") -> :exists
+      true -> :error
+    end
+  end
+
+  defp publish_flow_notifications(_command, {:ok, records}) when is_list(records) do
+    Enum.each(records, &publish_flow_record(:claim_due, &1))
+  end
+
+  defp publish_flow_notifications(command, {:ok, record}) when is_map(record) do
+    publish_flow_record(command, record)
+  end
+
+  defp publish_flow_notifications(_command, _result), do: :ok
+
+  defp publish_flow_record(command, %{id: id, type: type} = record)
+       when is_binary(id) and is_binary(type) do
+    message = flow_pubsub_message(command, record)
+
+    safe_publish("flow_changed:" <> id, message)
+    safe_publish("flow_type_changed:" <> type, message)
+
+    if publish_due_wakeup?(command, record) do
+      safe_publish("flow_due:" <> type, message)
+    end
+
+    :ok
+  end
+
+  defp publish_flow_record(_command, _record), do: :ok
+
+  defp publish_due_wakeup?(command, record)
+       when command in [:create, :transition, :retry] do
+    is_integer(Map.get(record, :next_run_at_ms)) and Map.get(record, :state) != "running"
+  end
+
+  defp publish_due_wakeup?(_command, _record), do: false
+
+  defp flow_pubsub_message(command, record) do
+    [
+      "event=",
+      flow_event_name(command),
+      ";id=",
+      Map.get(record, :id, ""),
+      ";type=",
+      Map.get(record, :type, ""),
+      ";state=",
+      Map.get(record, :state, ""),
+      ";version=",
+      record |> Map.get(:version, 0) |> Integer.to_string()
+    ]
+    |> IO.iodata_to_binary()
+  end
+
+  defp flow_event_name(:create), do: "created"
+  defp flow_event_name(:claim_due), do: "claimed"
+  defp flow_event_name(:transition), do: "transitioned"
+  defp flow_event_name(:retry), do: "retry"
+  defp flow_event_name(:fail), do: "failed"
+  defp flow_event_name(:cancel), do: "cancelled"
+  defp flow_event_name(:complete), do: "completed"
+  defp flow_event_name(command), do: Atom.to_string(command)
+
+  defp safe_publish(channel, message) do
+    Ferricstore.PubSub.publish(channel, message)
+  rescue
+    _ -> 0
+  end
 
   defp validate_opts(opts) do
     if Keyword.keyword?(opts) do
