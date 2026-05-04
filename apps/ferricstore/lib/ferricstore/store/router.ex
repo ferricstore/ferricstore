@@ -3950,7 +3950,7 @@ defmodule Ferricstore.Store.Router do
           result
 
         true ->
-          case async_submit_to_raft(idx, cmd) do
+          case async_enqueue_to_raft(idx, cmd) do
             :ok ->
               bump_write_version(ctx, idx)
               result
