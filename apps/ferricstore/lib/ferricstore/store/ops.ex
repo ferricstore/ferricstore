@@ -847,7 +847,14 @@ defmodule Ferricstore.Store.Ops do
 
   def zset_score_count(%LocalTxStore{} = tx, redis_key, min_bound, max_bound) do
     local_zset_index_read(tx, redis_key, fn state ->
-      {:ok, ZSetIndex.count(state.zset_score_index, redis_key, min_bound, max_bound)}
+      {:ok,
+       ZSetIndex.count(
+         state.zset_score_index,
+         state.zset_score_lookup,
+         redis_key,
+         min_bound,
+         max_bound
+       )}
     end)
   end
 

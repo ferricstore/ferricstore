@@ -591,8 +591,15 @@ defmodule Ferricstore.Store.Shard.Compound do
   def handle_zset_score_count(redis_key, min_bound, max_bound, state) do
     state = ensure_zset_score_index(state, redis_key)
 
-    {:reply, {:ok, ZSetIndex.count(state.zset_score_index, redis_key, min_bound, max_bound)},
-     state}
+    {:reply,
+     {:ok,
+      ZSetIndex.count(
+        state.zset_score_index,
+        state.zset_score_lookup,
+        redis_key,
+        min_bound,
+        max_bound
+      )}, state}
   end
 
   @spec handle_zset_rank_range(binary(), non_neg_integer(), non_neg_integer(), boolean(), map()) ::

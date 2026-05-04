@@ -25,6 +25,7 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
       true ->
         clear_key(state.zset_score_index, state.zset_score_lookup, redis_key)
+        :ets.insert(state.zset_score_lookup, {{:count, redis_key}, 0})
 
         state
         |> ShardETS.prefix_scan_entries(prefix, data_path)
@@ -88,8 +89,12 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     )
   end
 
-  @spec count(:ets.tid(), binary(), term(), term()) :: non_neg_integer()
-  def count(index_table, redis_key, min_bound, max_bound) do
+  @spec count(:ets.tid(), :ets.tid(), binary(), term(), term()) :: non_neg_integer()
+  def count(_index_table, lookup_table, redis_key, :neg_inf, :inf) do
+    count_all(lookup_table, redis_key)
+  end
+
+  def count(index_table, _lookup_table, redis_key, min_bound, max_bound) do
     count_range(
       index_table,
       forward_range_first(index_table, redis_key, min_bound),
@@ -244,6 +249,7 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
         delete_member(index_table, lookup_table, redis_key, member)
         :ets.insert(index_table, {{redis_key, @index_tag, score, member}, true})
         :ets.insert(lookup_table, {{redis_key, member}, score})
+        increment_count(lookup_table, redis_key, 1)
         :ok
 
       :error ->
@@ -257,6 +263,7 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
       [{{^redis_key, ^member}, score}] ->
         :ets.delete(index_table, {redis_key, @index_tag, score, member})
         :ets.delete(lookup_table, {redis_key, member})
+        increment_count(lookup_table, redis_key, -1)
 
       [] ->
         :ok
@@ -268,6 +275,19 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     delete_index_entries(index_table, :ets.next(index_table, {redis_key, @index_tag}), redis_key)
     :ets.match_delete(lookup_table, {{redis_key, :_}, :_})
     :ets.delete(lookup_table, {:ready, redis_key})
+    :ets.delete(lookup_table, {:count, redis_key})
+    :ok
+  end
+
+  defp count_all(lookup_table, redis_key) do
+    case :ets.lookup(lookup_table, {:count, redis_key}) do
+      [{{:count, ^redis_key}, count}] when is_integer(count) and count >= 0 -> count
+      _ -> 0
+    end
+  end
+
+  defp increment_count(lookup_table, redis_key, delta) do
+    :ets.update_counter(lookup_table, {:count, redis_key}, {2, delta}, {{:count, redis_key}, 0})
     :ok
   end
 

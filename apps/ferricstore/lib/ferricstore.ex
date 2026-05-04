@@ -5372,29 +5372,6 @@ defmodule FerricStore do
       compound_count: fn redis_key, prefix -> Router.compound_count(ctx, redis_key, prefix) end,
       compound_delete_prefix: fn redis_key, prefix ->
         Router.compound_delete_prefix(ctx, redis_key, prefix)
-      end,
-      zset_score_range: fn redis_key, min_bound, max_bound, reverse? ->
-        Router.zset_score_range(ctx, redis_key, min_bound, max_bound, reverse?)
-      end,
-      zset_score_range_slice: fn redis_key, min_bound, max_bound, reverse?, offset, count ->
-        Router.zset_score_range_slice(
-          ctx,
-          redis_key,
-          min_bound,
-          max_bound,
-          reverse?,
-          offset,
-          count
-        )
-      end,
-      zset_score_count: fn redis_key, min_bound, max_bound ->
-        Router.zset_score_count(ctx, redis_key, min_bound, max_bound)
-      end,
-      zset_rank_range: fn redis_key, start_idx, stop_idx, reverse? ->
-        Router.zset_rank_range(ctx, redis_key, start_idx, stop_idx, reverse?)
-      end,
-      zset_member_rank: fn redis_key, member, reverse? ->
-        Router.zset_member_rank(ctx, redis_key, member, reverse?)
       end
     }
   end
@@ -5583,6 +5560,29 @@ defmodule FerricStore do
       compound_count: fn redis_key, prefix -> Router.compound_count(ctx, redis_key, prefix) end,
       compound_delete_prefix: fn redis_key, prefix ->
         Router.compound_delete_prefix(ctx, redis_key, prefix)
+      end,
+      zset_score_range: fn redis_key, min_bound, max_bound, reverse? ->
+        Router.zset_score_range(ctx, redis_key, min_bound, max_bound, reverse?)
+      end,
+      zset_score_range_slice: fn redis_key, min_bound, max_bound, reverse?, offset, count ->
+        Router.zset_score_range_slice(
+          ctx,
+          redis_key,
+          min_bound,
+          max_bound,
+          reverse?,
+          offset,
+          count
+        )
+      end,
+      zset_score_count: fn redis_key, min_bound, max_bound ->
+        Router.zset_score_count(ctx, redis_key, min_bound, max_bound)
+      end,
+      zset_rank_range: fn redis_key, start_idx, stop_idx, reverse? ->
+        Router.zset_rank_range(ctx, redis_key, start_idx, stop_idx, reverse?)
+      end,
+      zset_member_rank: fn redis_key, member, reverse? ->
+        Router.zset_member_rank(ctx, redis_key, member, reverse?)
       end
     }
   end

@@ -69,7 +69,8 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
     assert [{"a", 1.0}] ==
              ZSetIndex.range(index, "zs", {:inclusive, 1.0}, {:exclusive, 2.0}, true)
 
-    assert 2 == ZSetIndex.count(index, "zs", {:inclusive, 2.0}, {:inclusive, 2.0})
+    assert 2 == ZSetIndex.count(index, lookup, "zs", {:inclusive, 2.0}, {:inclusive, 2.0})
+    assert 4 == ZSetIndex.count(index, lookup, "zs", :neg_inf, :inf)
   end
 
   test "rank cursors stay inside the redis key namespace", %{index: index, lookup: lookup} do

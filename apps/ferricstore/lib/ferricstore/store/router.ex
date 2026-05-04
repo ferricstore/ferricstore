@@ -23,6 +23,7 @@ defmodule Ferricstore.Store.Router do
   alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Stats
   alias Ferricstore.Store.{CompoundKey, LFU, ListOps, Promotion, TypeRegistry, ValueCodec}
+  alias Ferricstore.Store.Shard.ZSetIndex
 
   import Bitwise, only: [band: 2]
 
@@ -1088,6 +1089,8 @@ defmodule Ferricstore.Store.Router do
           {key, ets_value, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
         )
 
+        maybe_apply_async_zset_put(ctx, idx, key, disk_value)
+
       {:error, _reason} ->
         :ok
     end
@@ -1099,6 +1102,7 @@ defmodule Ferricstore.Store.Router do
     _ = Ferricstore.Bitcask.NIF.v2_append_ops_batch_nosync(file_path, [{:delete, key}])
     track_keydir_binary_delete(ctx, idx, keydir, key)
     :ets.delete(keydir, key)
+    maybe_apply_async_zset_delete(ctx, idx, key)
     :ok
   end
 
@@ -1117,6 +1121,7 @@ defmodule Ferricstore.Store.Router do
             {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
           )
 
+          maybe_apply_async_zset_put(ctx, idx, key, disk_value)
           :ok
 
         {:error, reason} ->
@@ -1125,7 +1130,46 @@ defmodule Ferricstore.Store.Router do
     else
       track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
       :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
+      maybe_apply_async_zset_put(ctx, idx, key, disk_value)
       :ok
+    end
+  end
+
+  defp maybe_apply_async_zset_put(ctx, idx, compound_key, score_str) do
+    with {:ok, redis_key} <- zset_redis_key(compound_key),
+         {:ok, index, lookup} <- zset_index_tables(ctx, idx) do
+      ZSetIndex.apply_put_to_tables(index, lookup, redis_key, compound_key, score_str)
+    end
+
+    :ok
+  end
+
+  defp maybe_apply_async_zset_delete(ctx, idx, compound_key) do
+    with {:ok, redis_key} <- zset_redis_key(compound_key),
+         {:ok, index, lookup} <- zset_index_tables(ctx, idx) do
+      ZSetIndex.apply_delete_to_tables(index, lookup, redis_key, compound_key)
+    end
+
+    :ok
+  end
+
+  defp zset_redis_key(compound_key) do
+    redis_key = CompoundKey.extract_redis_key(compound_key)
+
+    if String.starts_with?(compound_key, CompoundKey.zset_prefix(redis_key)) do
+      {:ok, redis_key}
+    else
+      :error
+    end
+  end
+
+  defp zset_index_tables(ctx, idx) do
+    {index, lookup} = ZSetIndex.table_names(ctx.name, idx)
+
+    if :ets.info(index) != :undefined and :ets.info(lookup) != :undefined do
+      {:ok, index, lookup}
+    else
+      :error
     end
   end
 
@@ -4193,6 +4237,7 @@ defmodule Ferricstore.Store.Router do
         keydir = elem(ctx.keydir_refs, idx)
         track_keydir_binary_delete(ctx, idx, keydir, compound_key)
         :ets.delete(keydir, compound_key)
+        maybe_apply_async_zset_delete(ctx, idx, compound_key)
 
         wv_size = :counters.info(ctx.write_version).size
         if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)

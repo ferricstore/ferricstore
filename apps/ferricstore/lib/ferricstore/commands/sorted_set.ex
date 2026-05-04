@@ -678,8 +678,14 @@ defmodule Ferricstore.Commands.SortedSet do
 
   defp zcard_key(key, store) do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      prefix = CompoundKey.zset_prefix(key)
-      Ops.compound_count(store, key, prefix)
+      case Ops.zset_score_count(store, key, :neg_inf, :inf) do
+        {:ok, count} ->
+          count
+
+        :unavailable ->
+          prefix = CompoundKey.zset_prefix(key)
+          Ops.compound_count(store, key, prefix)
+      end
     end
   end
 

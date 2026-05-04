@@ -1860,7 +1860,14 @@ defmodule Ferricstore.Raft.StateMachine do
       end,
       zset_score_count: fn redis_key, min_bound, max_bound ->
         cross_shard_zset_index_read(ctx, redis_key, fn state ->
-          {:ok, ZSetIndex.count(state.zset_score_index, redis_key, min_bound, max_bound)}
+          {:ok,
+           ZSetIndex.count(
+             state.zset_score_index,
+             state.zset_score_lookup,
+             redis_key,
+             min_bound,
+             max_bound
+           )}
         end)
       end,
       zset_rank_range: fn redis_key, start_idx, stop_idx, reverse? ->
@@ -4744,7 +4751,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
       new_score = current_score + increment * 1.0
       new_str = Float.to_string(new_score)
+
       do_put(state, compound_key, new_str, 0)
+      zset_index_put(state, redis_key, compound_key, new_str)
       new_str
     end
   end
