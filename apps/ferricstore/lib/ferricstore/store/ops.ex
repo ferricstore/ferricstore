@@ -529,7 +529,7 @@ defmodule Ferricstore.Store.Ops do
 
         dedicated_path ->
           if Enum.any?(compound_keys, &shared_log_compound_key?/1) do
-            Enum.map(compound_keys, &compound_get(tx, redis_key, &1))
+            local_promoted_batch_read_values(tx, compound_keys, dedicated_path)
           else
             local_batch_read_values(tx, compound_keys, dedicated_path)
           end
@@ -605,7 +605,7 @@ defmodule Ferricstore.Store.Ops do
 
         dedicated_path ->
           if Enum.any?(compound_keys, &shared_log_compound_key?/1) do
-            Enum.map(compound_keys, &compound_get_meta(tx, redis_key, &1))
+            local_promoted_batch_read_meta(tx, compound_keys, dedicated_path)
           else
             local_batch_read_meta(tx, compound_keys, dedicated_path)
           end
@@ -1294,6 +1294,45 @@ defmodule Ferricstore.Store.Ops do
     do: Ferricstore.Store.ValueCodec.format_float(value)
 
   defp normalize_get_value(value), do: value
+
+  defp local_promoted_batch_read_values(tx, keys, dedicated_path) do
+    local_promoted_batch_read(tx, keys, dedicated_path, &local_batch_read_values/3)
+  end
+
+  defp local_promoted_batch_read_meta(tx, keys, dedicated_path) do
+    local_promoted_batch_read(tx, keys, dedicated_path, &local_batch_read_meta/3)
+  end
+
+  defp local_promoted_batch_read(tx, keys, dedicated_path, read_fun) do
+    {shared_entries, dedicated_entries} =
+      keys
+      |> Enum.with_index()
+      |> Enum.split_with(fn {key, _index} -> shared_log_compound_key?(key) end)
+
+    %{}
+    |> local_promoted_batch_partition(
+      tx,
+      shared_entries,
+      tx.shard_state.shard_data_path,
+      read_fun
+    )
+    |> local_promoted_batch_partition(tx, dedicated_entries, dedicated_path, read_fun)
+    |> then(fn results ->
+      keys
+      |> Enum.with_index()
+      |> Enum.map(fn {_key, index} -> Map.get(results, index) end)
+    end)
+  end
+
+  defp local_promoted_batch_partition(results, _tx, [], _data_path, _read_fun), do: results
+
+  defp local_promoted_batch_partition(results, tx, entries, data_path, read_fun) do
+    partition_keys = Enum.map(entries, fn {key, _index} -> key end)
+
+    entries
+    |> Enum.zip(read_fun.(tx, partition_keys, data_path))
+    |> Enum.reduce(results, fn {{_key, index}, value}, acc -> Map.put(acc, index, value) end)
+  end
 
   defp local_batch_read_meta(tx, keys, data_path) do
     now = HLC.now_ms()

@@ -271,6 +271,12 @@ defmodule Ferricstore.Store.OpsTest do
 
       assert source =~ "ColdRead.pread_batch_keyed",
              "LocalTxStore compound_batch_get must batch keyed cold reads instead of one waiter per field"
+
+      refute source =~ "Enum.map(compound_keys, &compound_get(tx, redis_key, &1))",
+             "LocalTxStore promoted mixed compound_batch_get must partition and batch, not serialize per key"
+
+      refute source =~ "Enum.map(compound_keys, &compound_get_meta(tx, redis_key, &1))",
+             "LocalTxStore promoted mixed compound_batch_get_meta must partition and batch, not serialize per key"
     end
 
     test "promoted type metadata reads cold value from shared shard log" do
