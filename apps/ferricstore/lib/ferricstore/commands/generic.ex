@@ -170,7 +170,7 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   def handle("RANDOMKEY", [], store) do
-    case Ops.keys(store) do
+    case Ops.keys(store) |> CompoundKey.user_visible_keys() do
       [] -> nil
       keys -> Enum.random(keys)
     end

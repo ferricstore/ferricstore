@@ -344,6 +344,11 @@ defmodule Ferricstore.Commands.GenericTest do
       assert "only" == Generic.handle("RANDOMKEY", [], store)
     end
 
+    test "RANDOMKEY returns logical names instead of internal compound keys" do
+      store = MockStore.make(%{CompoundKey.type_key("hash") => {"hash", 0}})
+      assert "hash" == Generic.handle("RANDOMKEY", [], store)
+    end
+
     test "RANDOMKEY with args returns error" do
       assert {:error, _} = Generic.handle("RANDOMKEY", ["extra"], MockStore.make())
     end
