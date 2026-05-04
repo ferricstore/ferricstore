@@ -46,10 +46,12 @@ defmodule Ferricstore.Commands.Stream do
 
   @meta_table Ferricstore.Stream.Meta
   @groups_table Ferricstore.Stream.Groups
+  @index_table Ferricstore.Stream.Index
   @stream_waiters_table :ferricstore_stream_waiters
 
   # Null byte separator between stream key and entry ID in compound keys.
   @sep <<0>>
+  @max_int64 9_223_372_036_854_775_807
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -123,13 +125,7 @@ defmodule Ferricstore.Commands.Stream do
     with {:ok, count} <- parse_count_opt(rest),
          {:ok, range_start} <- parse_range_id(start_str, :min),
          {:ok, range_end} <- parse_range_id(end_str, :max) do
-      entries = do_xrange(key, range_start, range_end, :infinity, store)
-      entries = Enum.reverse(entries)
-
-      case count do
-        :infinity -> entries
-        n -> Enum.take(entries, n)
-      end
+      do_xrevrange(key, range_start, range_end, count, store)
     end
   end
 
@@ -272,15 +268,7 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   def handle_ast({:xrevrange, key, range_start, range_end, count}, store) do
-    entries =
-      key
-      |> do_xrange(range_start, range_end, :infinity, store)
-      |> Enum.reverse()
-
-    case count do
-      :infinity -> entries
-      n when is_integer(n) -> Enum.take(entries, n)
-    end
+    do_xrevrange(key, range_start, range_end, count, store)
   end
 
   def handle_ast({:xread, {:error, reason}}, _store), do: {:error, reason}
@@ -412,6 +400,24 @@ defmodule Ferricstore.Commands.Stream do
         :ok
     end
 
+    case :ets.whereis(@index_table) do
+      :undefined ->
+        try do
+          :ets.new(@index_table, [
+            :ordered_set,
+            :public,
+            :named_table,
+            {:read_concurrency, true},
+            {:write_concurrency, true}
+          ])
+        rescue
+          ArgumentError -> :ok
+        end
+
+      _ref ->
+        :ok
+    end
+
     :ok
   end
 
@@ -520,6 +526,7 @@ defmodule Ferricstore.Commands.Stream do
         # Serialize field-value pairs as Erlang binary term.
         encoded = :erlang.term_to_binary(fields)
         put_stream_entry(store, key, compound_key, encoded)
+        maybe_index_stream_put(store, key, id_str, compound_key, meta_entries)
 
         # Update metadata.
         {new_len, new_first} =
@@ -553,6 +560,27 @@ defmodule Ferricstore.Commands.Stream do
   defp do_xrange(key, range_start, range_end, count, store) do
     ensure_meta_table()
 
+    if Ops.has_compound?(store) do
+      indexed_stream_range(key, range_start, range_end, count, false, store)
+    else
+      scanned_stream_range(key, range_start, range_end, count, store)
+    end
+  end
+
+  defp do_xrevrange(key, range_start, range_end, count, store) do
+    ensure_meta_table()
+
+    if Ops.has_compound?(store) do
+      indexed_stream_range(key, range_start, range_end, count, true, store)
+    else
+      key
+      |> scanned_stream_range(range_start, range_end, :infinity, store)
+      |> Enum.reverse()
+      |> maybe_take(count)
+    end
+  end
+
+  defp scanned_stream_range(key, range_start, range_end, count, store) do
     case :ets.lookup(@meta_table, key) do
       [] ->
         []
@@ -572,6 +600,14 @@ defmodule Ferricstore.Commands.Stream do
           fields = :erlang.binary_to_term(raw)
           [id_str | fields]
         end)
+    end
+  end
+
+  defp indexed_stream_range(key, range_start, range_end, count, reverse?, store) do
+    with :ok <- ensure_stream_index(key, store) do
+      key
+      |> stream_index_slice(range_start, range_end, count, reverse?)
+      |> decode_indexed_stream_entries(key, store)
     end
   end
 
@@ -641,6 +677,23 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   defp apply_trim(key, {:maxlen, _approx, max_len}, store) do
+    if Ops.has_compound?(store) do
+      apply_trim_maxlen_indexed(key, max_len, store)
+    else
+      apply_trim_maxlen_scanned(key, max_len, store)
+    end
+  end
+
+  defp apply_trim(key, {:minid, _approx, min_id_str}, store) do
+    prefix = "X:#{key}" <> @sep
+
+    case parse_full_id(min_id_str) do
+      {:error, _} = err -> err
+      {:ok, min_id} -> do_apply_trim_minid(key, prefix, min_id, store)
+    end
+  end
+
+  defp apply_trim_maxlen_scanned(key, max_len, store) do
     prefix = "X:#{key}" <> @sep
 
     all_ids =
@@ -669,16 +722,15 @@ defmodule Ferricstore.Commands.Stream do
     end
   end
 
-  defp apply_trim(key, {:minid, _approx, min_id_str}, store) do
-    prefix = "X:#{key}" <> @sep
-
-    case parse_full_id(min_id_str) do
-      {:error, _} = err -> err
-      {:ok, min_id} -> do_apply_trim_minid(key, prefix, min_id, store)
+  defp do_apply_trim_minid(key, prefix, min_id, store) do
+    if Ops.has_compound?(store) do
+      do_apply_trim_minid_indexed(key, min_id, store)
+    else
+      do_apply_trim_minid_scanned(key, prefix, min_id, store)
     end
   end
 
-  defp do_apply_trim_minid(key, prefix, min_id, store) do
+  defp do_apply_trim_minid_scanned(key, prefix, min_id, store) do
     all_ids =
       store
       |> stream_ids_for(key)
@@ -701,6 +753,54 @@ defmodule Ferricstore.Commands.Stream do
     end
 
     deleted_count
+  end
+
+  defp apply_trim_maxlen_indexed(key, max_len, store) do
+    ensure_stream_index(key, store)
+
+    case :ets.lookup(@meta_table, key) do
+      [{^key, len, _first, last, ms, seq}] when len > max_len ->
+        delete_count = len - max_len
+
+        key
+        |> stream_index_ids(delete_count)
+        |> Enum.each(fn id_str ->
+          delete_stream_entry(store, key, stream_entry_key(key, id_str))
+        end)
+
+        update_meta_after_index_mutation(key, max_len, last, ms, seq, store)
+        delete_count
+
+      _ ->
+        0
+    end
+  end
+
+  defp do_apply_trim_minid_indexed(key, min_id, store) do
+    ensure_stream_index(key, store)
+
+    case :ets.lookup(@meta_table, key) do
+      [{^key, len, _first, last, ms, seq}] ->
+        to_remove =
+          key
+          |> stream_index_slice(:min, exclusive_upper_bound(min_id), :infinity, false)
+          |> Enum.map(fn {id_str, _compound_key} -> id_str end)
+
+        Enum.each(to_remove, fn id_str ->
+          delete_stream_entry(store, key, stream_entry_key(key, id_str))
+        end)
+
+        deleted_count = length(to_remove)
+
+        if deleted_count > 0 do
+          update_meta_after_index_mutation(key, len - deleted_count, last, ms, seq, store)
+        end
+
+        deleted_count
+
+      [] ->
+        0
+    end
   end
 
   defp update_meta_after_trim(key, []) do
@@ -744,32 +844,7 @@ defmodule Ferricstore.Commands.Stream do
       end)
 
     if deleted > 0 do
-      # Rebuild metadata from remaining entries.
-      remaining_ids =
-        store
-        |> stream_ids_for(key)
-        |> Enum.sort_by(&parse_id!/1)
-
-      if remaining_ids == [] do
-        # Stream is now empty. Keep the stream in metadata with length 0
-        # but preserve last_id for future XADD ordering.
-        case :ets.lookup(@meta_table, key) do
-          [{^key, _len, _first, last, ms, seq}] ->
-            :ets.insert(@meta_table, {key, 0, "0-0", last, ms, seq})
-
-          [] ->
-            :ok
-        end
-      else
-        first_str = List.first(remaining_ids)
-        last_str = List.last(remaining_ids)
-        {last_ms, last_seq} = parse_id!(last_str)
-
-        :ets.insert(
-          @meta_table,
-          {key, length(remaining_ids), first_str, last_str, last_ms, last_seq}
-        )
-      end
+      update_meta_after_xdel(key, deleted, store)
     end
 
     deleted
@@ -1127,6 +1202,7 @@ defmodule Ferricstore.Commands.Stream do
   defp delete_stream_entry(store, stream_key, compound_key) do
     if Ops.has_compound?(store) do
       Ops.compound_delete(store, stream_key, compound_key)
+      delete_stream_index_entry(stream_key, compound_key)
     else
       Ops.delete(store, compound_key)
     end
@@ -1151,6 +1227,257 @@ defmodule Ferricstore.Commands.Stream do
 
   defp stream_entry_prefix(stream_key) do
     "X:#{stream_key}" <> @sep
+  end
+
+  defp maybe_index_stream_put(store, stream_key, id_str, compound_key, meta_entries) do
+    if Ops.has_compound?(store) do
+      insert_stream_index_entry(stream_key, id_str, compound_key)
+
+      if stream_index_ready?(stream_key) or meta_entries == [] do
+        mark_stream_index_ready(stream_key)
+      end
+    end
+
+    :ok
+  end
+
+  defp ensure_stream_index(stream_key, store) do
+    ensure_meta_table()
+
+    unless stream_index_ready?(stream_key) do
+      rebuild_stream_index(stream_key, store)
+    end
+
+    :ok
+  end
+
+  defp rebuild_stream_index(stream_key, store) do
+    clear_stream_index(stream_key)
+
+    store
+    |> stream_entries_for(stream_key)
+    |> Enum.each(fn {id_str, _raw} ->
+      insert_stream_index_entry(stream_key, id_str, stream_entry_key(stream_key, id_str))
+    end)
+
+    mark_stream_index_ready(stream_key)
+  end
+
+  defp stream_index_ready?(stream_key) do
+    :ets.lookup(@index_table, {:ready, stream_key}) != []
+  end
+
+  defp mark_stream_index_ready(stream_key) do
+    :ets.insert(@index_table, {{:ready, stream_key}, true})
+  end
+
+  defp clear_stream_index(stream_key) do
+    :ets.select_delete(@index_table, [{{{stream_key, :_, :_}, :_, :_}, [], [true]}])
+    :ets.delete(@index_table, {:ready, stream_key})
+  end
+
+  defp insert_stream_index_entry(stream_key, id_str, compound_key) do
+    {ms, seq} = parse_id!(id_str)
+    :ets.insert(@index_table, {{stream_key, ms, seq}, id_str, compound_key})
+  end
+
+  defp delete_stream_index_entry(stream_key, compound_key) do
+    prefix = stream_entry_prefix(stream_key)
+
+    if String.starts_with?(compound_key, prefix) do
+      id_str = String.replace_prefix(compound_key, prefix, "")
+      {ms, seq} = parse_id!(id_str)
+      :ets.delete(@index_table, {stream_key, ms, seq})
+    end
+  end
+
+  defp stream_index_slice(_stream_key, _range_start, _range_end, 0, _reverse?), do: []
+
+  defp stream_index_slice(stream_key, range_start, range_end, count, false) do
+    stream_key
+    |> forward_stream_index_first(range_start)
+    |> collect_stream_index(
+      stream_key,
+      range_start,
+      range_end,
+      count,
+      &next_stream_index_key/1,
+      []
+    )
+  end
+
+  defp stream_index_slice(stream_key, range_start, range_end, count, true) do
+    stream_key
+    |> reverse_stream_index_first(range_end)
+    |> collect_stream_index(
+      stream_key,
+      range_start,
+      range_end,
+      count,
+      &prev_stream_index_key/1,
+      []
+    )
+  end
+
+  defp forward_stream_index_first(stream_key, :min) do
+    :ets.next(@index_table, {stream_key, -1, -1})
+  end
+
+  defp forward_stream_index_first(stream_key, {ms, seq}) do
+    :ets.next(@index_table, {stream_key, ms, seq - 1})
+  end
+
+  defp reverse_stream_index_first(stream_key, :max) do
+    :ets.prev(@index_table, {stream_key, @max_int64, @max_int64})
+  end
+
+  defp reverse_stream_index_first(stream_key, {ms, seq}) do
+    key = {stream_key, ms, seq}
+
+    case :ets.lookup(@index_table, key) do
+      [{^key, _id_str, _compound_key}] -> key
+      [] -> :ets.prev(@index_table, key)
+    end
+  end
+
+  defp next_stream_index_key(:"$end_of_table"), do: :"$end_of_table"
+  defp next_stream_index_key(key), do: :ets.next(@index_table, key)
+
+  defp prev_stream_index_key(:"$end_of_table"), do: :"$end_of_table"
+  defp prev_stream_index_key(key), do: :ets.prev(@index_table, key)
+
+  defp collect_stream_index(:"$end_of_table", _stream_key, _start, _end, _count, _next, acc),
+    do: Enum.reverse(acc)
+
+  defp collect_stream_index(
+         {stream_key, ms, seq} = key,
+         stream_key,
+         range_start,
+         range_end,
+         count,
+         next,
+         acc
+       ) do
+    id = {ms, seq}
+
+    cond do
+      count == 0 ->
+        Enum.reverse(acc)
+
+      not id_in_range?(id, range_start, range_end) ->
+        Enum.reverse(acc)
+
+      true ->
+        case :ets.lookup(@index_table, key) do
+          [{^key, id_str, compound_key}] ->
+            collect_stream_index(
+              next.(key),
+              stream_key,
+              range_start,
+              range_end,
+              decrement_stream_index_count(count),
+              next,
+              [{id_str, compound_key} | acc]
+            )
+
+          [] ->
+            collect_stream_index(next.(key), stream_key, range_start, range_end, count, next, acc)
+        end
+    end
+  end
+
+  defp collect_stream_index(_other_key, _stream_key, _start, _end, _count, _next, acc),
+    do: Enum.reverse(acc)
+
+  defp decrement_stream_index_count(:infinity), do: :infinity
+  defp decrement_stream_index_count(count), do: count - 1
+
+  defp stream_index_ids(stream_key, count) do
+    stream_key
+    |> stream_index_slice(:min, :max, count, false)
+    |> Enum.map(fn {id_str, _compound_key} -> id_str end)
+  end
+
+  defp stream_index_first_last(stream_key) do
+    first_key = forward_stream_index_first(stream_key, :min)
+    last_key = reverse_stream_index_first(stream_key, :max)
+
+    with {^stream_key, _first_ms, _first_seq} <- first_key,
+         {^stream_key, _last_ms, _last_seq} <- last_key,
+         [{^first_key, first_id, _first_compound_key}] <- :ets.lookup(@index_table, first_key),
+         [{^last_key, last_id, _last_compound_key}] <- :ets.lookup(@index_table, last_key) do
+      {first_id, last_id}
+    else
+      _ -> nil
+    end
+  end
+
+  defp update_meta_after_index_mutation(key, remaining_len, old_last, old_ms, old_seq, store)
+       when remaining_len <= 0 do
+    if Ops.has_compound?(store) do
+      :ets.insert(@meta_table, {key, 0, "0-0", old_last, old_ms, old_seq})
+    else
+      update_meta_after_trim(key, [])
+    end
+  end
+
+  defp update_meta_after_index_mutation(key, remaining_len, _old_last, _old_ms, _old_seq, store) do
+    if Ops.has_compound?(store) do
+      case stream_index_first_last(key) do
+        {first_str, last_str} ->
+          {last_ms, last_seq} = parse_id!(last_str)
+          :ets.insert(@meta_table, {key, remaining_len, first_str, last_str, last_ms, last_seq})
+
+        nil ->
+          remaining_ids =
+            store
+            |> stream_ids_for(key)
+            |> Enum.sort_by(&parse_id!/1)
+
+          update_meta_after_trim(key, remaining_ids)
+      end
+    else
+      remaining_ids =
+        store
+        |> stream_ids_for(key)
+        |> Enum.sort_by(&parse_id!/1)
+
+      update_meta_after_trim(key, remaining_ids)
+    end
+  end
+
+  defp update_meta_after_xdel(key, deleted, store) do
+    case :ets.lookup(@meta_table, key) do
+      [{^key, len, _first, last, ms, seq}] ->
+        update_meta_after_index_mutation(key, max(len - deleted, 0), last, ms, seq, store)
+
+      [] ->
+        remaining_ids =
+          store
+          |> stream_ids_for(key)
+          |> Enum.sort_by(&parse_id!/1)
+
+        update_meta_after_trim(key, remaining_ids)
+    end
+  end
+
+  defp exclusive_upper_bound({ms, seq}), do: {ms, seq - 1}
+
+  defp decode_indexed_stream_entries([], _stream_key, _store), do: []
+
+  defp decode_indexed_stream_entries(index_entries, stream_key, store) do
+    compound_keys = Enum.map(index_entries, fn {_id_str, compound_key} -> compound_key end)
+    raw_values = Ops.compound_batch_get(store, stream_key, compound_keys)
+
+    index_entries
+    |> Enum.zip(raw_values)
+    |> Enum.flat_map(fn
+      {{id_str, _compound_key}, raw} when is_binary(raw) ->
+        [[id_str | :erlang.binary_to_term(raw)]]
+
+      _missing ->
+        []
+    end)
   end
 
   # ---------------------------------------------------------------------------

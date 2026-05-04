@@ -7,10 +7,11 @@ defmodule Ferricstore.Commands.StreamTest do
 
   # Each test gets a unique stream key to avoid interference.
   defp ustream, do: "stream_#{:rand.uniform(999_999)}"
+  defp ids(entries), do: Enum.map(entries, &hd/1)
 
   # Clean up ETS tables between tests to prevent state leaking.
   setup do
-    for table <- [Ferricstore.Stream.Meta, Ferricstore.Stream.Groups] do
+    for table <- [Ferricstore.Stream.Meta, Ferricstore.Stream.Groups, Ferricstore.Stream.Index] do
       if :ets.whereis(table) != :undefined do
         :ets.delete_all_objects(table)
       end
@@ -284,6 +285,88 @@ defmodule Ferricstore.Commands.StreamTest do
                Stream.handle("XRANGE", [key, "-", "+"], store)
 
       assert_received {:compound_scan, ^key, "X:" <> _}
+    end
+
+    test "XRANGE uses ordered stream index without repeated prefix scans" do
+      parent = self()
+      {:ok, pid} = Agent.start_link(fn -> %{} end)
+      key = ustream()
+
+      store = %{
+        put: fn entry_key, value, _expire_at_ms ->
+          Agent.update(pid, &Map.put(&1, entry_key, value))
+          :ok
+        end,
+        compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
+          Agent.update(pid, &Map.put(&1, compound_key, {value, expire_at_ms}))
+          :ok
+        end,
+        compound_scan: fn ^key, prefix ->
+          send(parent, {:compound_scan, key, prefix})
+
+          Agent.get(pid, fn state ->
+            state
+            |> Enum.filter(fn {entry_key, _value} -> String.starts_with?(entry_key, prefix) end)
+            |> Enum.map(fn
+              {entry_key, {value, _expire_at_ms}} ->
+                {String.replace_prefix(entry_key, prefix, ""), value}
+
+              {entry_key, value} ->
+                {String.replace_prefix(entry_key, prefix, ""), value}
+            end)
+          end)
+        end,
+        compound_batch_get: fn _redis_key, compound_keys ->
+          Agent.get(pid, fn state ->
+            Enum.map(compound_keys, fn compound_key ->
+              case Map.get(state, compound_key) do
+                {value, _expire_at_ms} -> value
+                value -> value
+              end
+            end)
+          end)
+        end,
+        compound_get: fn _redis_key, compound_key ->
+          Agent.get(pid, fn state ->
+            case Map.get(state, compound_key) do
+              {value, _expire_at_ms} -> value
+              value -> value
+            end
+          end)
+        end,
+        compound_delete: fn _redis_key, compound_key ->
+          Agent.update(pid, &Map.delete(&1, compound_key))
+          :ok
+        end,
+        exists?: fn compound_key -> Agent.get(pid, &Map.has_key?(&1, compound_key)) end,
+        get: fn entry_key -> Agent.get(pid, &Map.get(&1, entry_key)) end
+      }
+
+      for i <- 1..20, do: Stream.handle("XADD", [key, "#{i}-0", "f", "#{i}"], store)
+
+      assert Enum.map(Stream.handle("XRANGE", [key, "-", "+", "COUNT", "3"], store), &hd/1) ==
+               ["1-0", "2-0", "3-0"]
+
+      refute_received {:compound_scan, ^key, "X:" <> _}
+
+      assert Enum.map(Stream.handle("XRANGE", [key, "10-0", "+", "COUNT", "3"], store), &hd/1) ==
+               ["10-0", "11-0", "12-0"]
+
+      refute_received {:compound_scan, ^key, "X:" <> _}
+    end
+
+    test "ordered stream index tracks XADD and XDEL after warm build" do
+      store = MockStore.make()
+      key = ustream()
+
+      for i <- 1..3, do: Stream.handle("XADD", [key, "#{i}-0", "f", "#{i}"], store)
+      assert ["1-0", "2-0", "3-0"] = ids(Stream.handle("XRANGE", [key, "-", "+"], store))
+
+      assert 1 == Stream.handle("XDEL", [key, "2-0"], store)
+      assert "4-0" == Stream.handle("XADD", [key, "4-0", "f", "4"], store)
+
+      assert ["1-0", "3-0", "4-0"] = ids(Stream.handle("XRANGE", [key, "-", "+"], store))
+      assert ["4-0", "3-0", "1-0"] = ids(Stream.handle("XREVRANGE", [key, "+", "-"], store))
     end
 
     test "XLEN fallback counts by stream prefix without enumerating unrelated keys" do
