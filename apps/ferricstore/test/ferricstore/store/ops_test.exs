@@ -505,6 +505,46 @@ defmodule Ferricstore.Store.OpsTest do
     end
   end
 
+  describe "LocalTxStore promoted compound writes" do
+    test "promoted field writes carry redis key so persistence uses dedicated storage" do
+      ctx = FerricStore.Instance.get(:default)
+      redis_key = "ops:local_tx:promoted-write:#{System.unique_integer([:positive])}"
+      field_key = "H:" <> redis_key <> <<0>> <> "field"
+      shard_index = Router.shard_for(ctx, redis_key)
+      keydir = :ets.new(:"ops_local_tx_#{System.unique_integer([:positive])}", [:set, :public])
+      dedicated_dir = Path.join(System.tmp_dir!(), "ops_local_tx_promoted_write")
+
+      try do
+        tx = local_tx(ctx, shard_index, keydir, Map.put(%{}, redis_key, %{path: dedicated_dir}))
+
+        assert :ok = Ops.compound_put(tx, redis_key, field_key, "value", 0)
+        assert_receive {:tx_pending_compound_write, ^redis_key, ^field_key, "value", 0}
+        refute_receive {:tx_pending_write, ^field_key, "value", 0}
+      after
+        :ets.delete(keydir)
+      end
+    end
+
+    test "promoted field deletes carry redis key so persistence deletes dedicated storage" do
+      ctx = FerricStore.Instance.get(:default)
+      redis_key = "ops:local_tx:promoted-delete:#{System.unique_integer([:positive])}"
+      field_key = "H:" <> redis_key <> <<0>> <> "field"
+      shard_index = Router.shard_for(ctx, redis_key)
+      keydir = :ets.new(:"ops_local_tx_#{System.unique_integer([:positive])}", [:set, :public])
+      dedicated_dir = Path.join(System.tmp_dir!(), "ops_local_tx_promoted_delete")
+
+      try do
+        tx = local_tx(ctx, shard_index, keydir, Map.put(%{}, redis_key, %{path: dedicated_dir}))
+
+        assert :ok = Ops.compound_delete(tx, redis_key, field_key)
+        assert_receive {:tx_pending_compound_delete, ^redis_key, ^field_key}
+        refute_receive {:tx_pending_delete, ^field_key}
+      after
+        :ets.delete(keydir)
+      end
+    end
+  end
+
   defp set_opts(overrides) do
     Map.merge(
       %{expire_at_ms: 0, nx: false, xx: false, get: false, keepttl: false, has_expiry: false},

@@ -1319,6 +1319,43 @@ defmodule Ferricstore.Store.Shard do
   @impl true
   # Handle pending writes from tx_execute. These are queued via send/2
   # during transaction execution to persist ETS-only writes to Bitcask.
+  def handle_info(
+        {:tx_pending_compound_write, redis_key, compound_key, value, expire_at_ms},
+        state
+      ) do
+    case ShardCompound.handle_compound_put(redis_key, compound_key, value, expire_at_ms, state) do
+      {:reply, :ok, new_state} ->
+        {:noreply, new_state}
+
+      {:reply, {:error, reason}, new_state} ->
+        Logger.error(
+          "Shard #{state.index}: tx promoted compound write failed: #{inspect(reason)}"
+        )
+
+        {:noreply, new_state}
+
+      {:reply, _other, new_state} ->
+        {:noreply, new_state}
+    end
+  end
+
+  def handle_info({:tx_pending_compound_delete, redis_key, compound_key}, state) do
+    case ShardCompound.handle_compound_delete(redis_key, compound_key, state) do
+      {:reply, :ok, new_state} ->
+        {:noreply, new_state}
+
+      {:reply, {:error, reason}, new_state} ->
+        Logger.error(
+          "Shard #{state.index}: tx promoted compound delete failed: #{inspect(reason)}"
+        )
+
+        {:noreply, new_state}
+
+      {:reply, _other, new_state} ->
+        {:noreply, new_state}
+    end
+  end
+
   def handle_info({:tx_pending_write, key, value, expire_at_ms}, state) do
     new_pending = [{key, value, expire_at_ms} | state.pending]
     new_version = state.write_version + 1

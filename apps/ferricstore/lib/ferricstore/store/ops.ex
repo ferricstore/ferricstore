@@ -642,7 +642,7 @@ defmodule Ferricstore.Store.Ops do
       ShardETS.ets_insert(tx.shard_state, compound_key, value, expire_at_ms)
       tx_put_pending(compound_key, value, expire_at_ms)
       tx_undelete(compound_key)
-      send(self(), {:tx_pending_write, compound_key, value, expire_at_ms})
+      send(self(), tx_compound_write_message(tx, redis_key, compound_key, value, expire_at_ms))
       :ok
     else
       Router.compound_put(tx.instance_ctx, redis_key, compound_key, value, expire_at_ms)
@@ -661,7 +661,7 @@ defmodule Ferricstore.Store.Ops do
       ShardETS.ets_delete_key(tx.shard_state, compound_key)
       tx_drop_pending(compound_key)
       tx_mark_deleted(compound_key)
-      send(self(), {:tx_pending_delete, compound_key})
+      send(self(), tx_compound_delete_message(tx, redis_key, compound_key))
       :ok
     else
       Router.compound_delete(tx.instance_ctx, redis_key, compound_key)
@@ -1246,6 +1246,34 @@ defmodule Ferricstore.Store.Ops do
   defp shared_log_compound_key?(<<"T:", _rest::binary>>), do: true
   defp shared_log_compound_key?(<<"PM:", _rest::binary>>), do: true
   defp shared_log_compound_key?(_key), do: false
+
+  defp tx_compound_write_message(tx, redis_key, compound_key, value, expire_at_ms) do
+    case promoted_path(tx, redis_key) do
+      nil ->
+        {:tx_pending_write, compound_key, value, expire_at_ms}
+
+      _dedicated_path ->
+        if shared_log_compound_key?(compound_key) do
+          {:tx_pending_write, compound_key, value, expire_at_ms}
+        else
+          {:tx_pending_compound_write, redis_key, compound_key, value, expire_at_ms}
+        end
+    end
+  end
+
+  defp tx_compound_delete_message(tx, redis_key, compound_key) do
+    case promoted_path(tx, redis_key) do
+      nil ->
+        {:tx_pending_delete, compound_key}
+
+      _dedicated_path ->
+        if shared_log_compound_key?(compound_key) do
+          {:tx_pending_delete, compound_key}
+        else
+          {:tx_pending_compound_delete, redis_key, compound_key}
+        end
+    end
+  end
 
   defp local_promoted_read_value(tx, compound_key, dedicated_path) do
     case tx_pending_meta(compound_key) ||
