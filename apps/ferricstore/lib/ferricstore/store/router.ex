@@ -1120,6 +1120,7 @@ defmodule Ferricstore.Store.Router do
   defp rollback_installed_async_value(ctx, idx, key, :missing) do
     keydir = elem(ctx.keydir_refs, idx)
     _ = append_delete_tombstone_nosync(ctx, idx, key)
+    Ferricstore.Store.BitcaskWriter.discard_pending(ctx, idx, key)
     track_keydir_binary_delete(ctx, idx, keydir, key)
     :ets.delete(keydir, key)
     maybe_apply_async_zset_delete(ctx, idx, key)
@@ -4066,6 +4067,7 @@ defmodule Ferricstore.Store.Router do
     keydir = elem(ctx.keydir_refs, idx)
 
     _ = append_delete_tombstone_nosync(ctx, idx, compound_key)
+    Ferricstore.Store.BitcaskWriter.discard_pending(ctx, idx, compound_key)
     track_keydir_binary_delete(ctx, idx, keydir, compound_key)
     :ets.delete(keydir, compound_key)
   end

@@ -314,6 +314,7 @@ defmodule Ferricstore.Store.AsyncListOpTest do
       end
 
       try do
+        assert :ok = Ferricstore.Store.BitcaskWriter.flush(ctx, idx)
         Batcher.flush(idx)
         refute_receive :unexpected_async_flush, 200
         assert [] == Router.list_op(ctx, key, {:lrange, 0, -1})

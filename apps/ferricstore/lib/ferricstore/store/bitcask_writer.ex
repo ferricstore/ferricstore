@@ -228,6 +228,32 @@ defmodule Ferricstore.Store.BitcaskWriter do
     end
   end
 
+  @doc """
+  Drops queued deferred writes for keys that were rolled back before reaching
+  Bitcask.
+
+  Rollback code appends its own compensation tombstone/value synchronously, so
+  leaving the original pending writer entry behind is both obsolete and harmful:
+  if the original path disappeared, the writer would retry forever and poison
+  later flushes.
+  """
+  @spec discard_pending(FerricStore.Instance.t() | map() | nil, non_neg_integer(), binary()) ::
+          :ok
+  def discard_pending(instance_ctx, shard_index, key) when is_binary(key) do
+    discard_pending(instance_ctx, shard_index, [key])
+  end
+
+  @spec discard_pending(FerricStore.Instance.t() | map() | nil, non_neg_integer(), [binary()]) ::
+          :ok
+  def discard_pending(instance_ctx, shard_index, keys) when is_list(keys) do
+    try do
+      GenServer.call(writer_name(instance_ctx, shard_index), {:discard_pending, keys}, 5_000)
+    catch
+      :exit, {:noproc, _call} -> :ok
+      :exit, _reason -> :ok
+    end
+  end
+
   # -- Callbacks --
 
   @impl true
@@ -349,6 +375,21 @@ defmodule Ferricstore.Store.BitcaskWriter do
     {:reply, result, state}
   end
 
+  def handle_call({:discard_pending, keys}, _from, state) do
+    keyset = MapSet.new(keys)
+    pending = Enum.reject(state.pending, &MapSet.member?(keyset, pending_entry_key(&1)))
+
+    state =
+      if pending == [] do
+        cancel_timer(state.flush_timer)
+        %{state | pending: [], pending_count: 0, flush_timer: nil}
+      else
+        %{state | pending: pending, pending_count: length(pending)}
+      end
+
+    {:reply, :ok, state}
+  end
+
   @impl true
   def handle_info(:flush_timer, %{pending: []} = state) do
     {:noreply, %{state | flush_timer: nil}}
@@ -431,6 +472,12 @@ defmodule Ferricstore.Store.BitcaskWriter do
   defp entry_path({:write, path, _fid, _ets, _key, _value, _exp}), do: path
   defp entry_path({:tombstone, path, _key}), do: path
   defp entry_path({path, _fid, _ets, _key, _value, _exp}), do: path
+
+  defp pending_entry_key({:write, _ctx, _path, _fid, _ets, key, _value, _exp}), do: key
+  defp pending_entry_key({:write, _path, _fid, _ets, key, _value, _exp}), do: key
+  defp pending_entry_key({:tombstone, _ctx, _path, key}), do: key
+  defp pending_entry_key({:tombstone, _path, key}), do: key
+  defp pending_entry_key({_path, _fid, _ets, key, _value, _exp}), do: key
 
   # Processes a group of entries for a single file path. Consecutive writes
   # are batched into a single v2_append_batch_nosync call for efficiency.
