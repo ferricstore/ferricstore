@@ -465,6 +465,47 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert {"old_origin_incr", _offset, 1, 0, false} = List.last(records)
     end
 
+    test "replays origin APPEND when cold location changes during apply read", %{
+      state: state,
+      ets: ets
+    } do
+      key = "old_origin_append_cold_retry"
+      value = :binary.copy("r", 70_000)
+      suffix = "tail"
+      expected = value <> suffix
+      test_pid = self()
+
+      {state, :ok} = StateMachine.apply(%{}, {:put, key, value, 0}, state)
+
+      assert [{^key, nil, 0, lfu, file_id, _offset, value_size} = live_entry] =
+               :ets.lookup(ets, key)
+
+      :ets.insert(ets, {key, nil, 0, lfu, file_id + 10_000, 0, value_size})
+
+      Process.put(:ferricstore_state_machine_cold_location_miss_hook, fn ->
+        send(test_pid, :state_machine_cold_location_retry_hook)
+        :ets.insert(ets, live_entry)
+      end)
+
+      try do
+        {state, {:ok, expected_size}} =
+          StateMachine.apply(
+            %{},
+            {:async, node(),
+             {:origin_checked, key, {:append, key, suffix}, value, 0, expected, 0}},
+            state
+          )
+
+        assert expected_size == byte_size(expected)
+        assert_receive :state_machine_cold_location_retry_hook, 500
+        assert [{^key, nil, 0, _lfu, fid, off, ^expected_size}] = :ets.lookup(ets, key)
+        assert {:ok, ^expected} = NIF.v2_pread_at(state.active_file_path, off)
+        assert fid == state.active_file_id
+      after
+        Process.delete(:ferricstore_state_machine_cold_location_miss_hook)
+      end
+    end
+
     test "replays origin GETSET when recovery has the pre-command value", %{
       state: state,
       ets: ets
@@ -3046,8 +3087,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       :ets.insert(ets, {key, nil, 0, 0, 1, 0, 5})
 
       try do
-        {state, {:applied_at, 1, {:error, {:cross_shard_compensation_failed, _reason}}},
-         effects1} =
+        {state, {:applied_at, 1, {:error, {:cross_shard_compensation_failed, _reason}}}, effects1} =
           StateMachine.apply(
             %{index: 1, term: 1, system_time: System.os_time(:millisecond)},
             {:cross_shard_tx,

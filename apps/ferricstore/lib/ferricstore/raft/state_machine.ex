@@ -95,6 +95,8 @@ defmodule Ferricstore.Raft.StateMachine do
   @default_dead_bytes_threshold 134_217_728
   @bitcask_record_header_size 26
   @cold_read_timeout_ms 10_000
+  @cold_location_retry_attempts 8
+  @cold_location_retry_sleep_ms 1
 
   defguardp valid_cold_location(file_id, offset, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
@@ -5276,7 +5278,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp warm_from_bitcask(state, key) do
     case :ets.lookup(state.ets, key) do
       [{^key, nil, _exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-        warm_from_disk(state, key, 0, fid, off)
+        warm_from_disk(state, key, 0, fid, off, vsize)
 
       [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
         track_keydir_binary_remove_known(state, key, nil)
@@ -5292,7 +5294,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp warm_from_bitcask_with_exp(state, key, exp) do
     case :ets.lookup(state.ets, key) do
       [{^key, nil, _exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-        warm_from_disk(state, key, exp, fid, off)
+        warm_from_disk(state, key, exp, fid, off, vsize)
 
       [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
         track_keydir_binary_remove_known(state, key, nil)
@@ -5308,8 +5310,9 @@ defmodule Ferricstore.Raft.StateMachine do
   # Reads a value from disk at the given file_id + offset, warms ETS, and
   # returns {:hit, value, expire_at_ms}.
   # Applies the hot_cache_max_value_size threshold when re-warming ETS.
-  defp warm_from_disk(state, key, expire_at_ms, fid, off) do
+  defp warm_from_disk(state, key, expire_at_ms, fid, off, vsize) do
     path = sm_file_path(state, fid)
+    original_location = {fid, off, vsize}
 
     case read_cold_async(path, off, key) do
       {:ok, value} when is_binary(value) ->
@@ -5320,7 +5323,44 @@ defmodule Ferricstore.Raft.StateMachine do
         {:hit, value, expire_at_ms}
 
       _ ->
+        retry_warm_from_changed_cold_location(
+          state,
+          key,
+          original_location,
+          @cold_location_retry_attempts
+        )
+    end
+  end
+
+  defp retry_warm_from_changed_cold_location(_state, _key, _original_location, 0), do: :miss
+
+  defp retry_warm_from_changed_cold_location(state, key, original_location, attempts_left) do
+    maybe_run_cold_location_miss_hook()
+    Process.sleep(@cold_location_retry_sleep_ms)
+    now = apply_now_ms()
+
+    case :ets.lookup(state.ets, key) do
+      [{^key, value, exp, _lfu, _fid, _off, _vsize}]
+      when value != nil and (exp == 0 or exp > now) ->
+        {:hit, value, exp}
+
+      [{^key, nil, exp, _lfu, fid, off, vsize}]
+      when (exp == 0 or exp > now) and valid_cold_location(fid, off, vsize) ->
+        if {fid, off, vsize} == original_location do
+          retry_warm_from_changed_cold_location(state, key, original_location, attempts_left - 1)
+        else
+          warm_from_disk(state, key, exp, fid, off, vsize)
+        end
+
+      _ ->
         :miss
+    end
+  end
+
+  defp maybe_run_cold_location_miss_hook do
+    case Process.get(:ferricstore_state_machine_cold_location_miss_hook) do
+      fun when is_function(fun, 0) -> fun.()
+      _ -> :ok
     end
   end
 
