@@ -134,6 +134,29 @@ defmodule Ferricstore.Bitcask.NIF do
           {:ok, [append_op_location()]} | {:error, term()}
   def v2_append_ops_batch_nosync(_path, _records), do: :erlang.nif_error(:nif_not_loaded)
 
+  # -- LMDB Flow state backend --
+  @type lmdb_op ::
+          {:put, binary(), binary()} | {:put_new, binary(), binary()} | {:delete, binary()}
+  @type lmdb_original :: {binary(), :missing | {:value, binary()}}
+
+  @spec lmdb_get(binary(), binary(), non_neg_integer()) ::
+          {:ok, binary()} | :not_found | {:error, term()}
+  def lmdb_get(_path, _key, _map_size), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_put(binary(), binary(), binary(), non_neg_integer()) :: :ok | {:error, term()}
+  def lmdb_put(_path, _key, _value, _map_size), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_delete(binary(), binary(), non_neg_integer()) :: :ok | {:error, term()}
+  def lmdb_delete(_path, _key, _map_size), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_write_batch(binary(), [lmdb_op()], non_neg_integer()) :: :ok | {:error, term()}
+  def lmdb_write_batch(_path, _ops, _map_size), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_write_batch_with_originals(binary(), [lmdb_op()], non_neg_integer()) ::
+          {:ok, [lmdb_original()]} | {:error, term()}
+  def lmdb_write_batch_with_originals(_path, _ops, _map_size),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   # -- v2 Tokio async IO NIFs --
   @type pread_batch_value :: binary() | nil | {:error, binary()}
   @type pread_batch_result :: [pread_batch_value()]

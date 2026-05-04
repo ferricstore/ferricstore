@@ -3379,6 +3379,35 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc false
+  def flow_get(ctx, id, partition_key) when is_binary(id) do
+    key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    if Ferricstore.Flow.LMDB.enabled?() do
+      idx = shard_for(ctx, key)
+
+      path =
+        ctx.data_dir |> Ferricstore.DataDir.shard_data_path(idx) |> Ferricstore.Flow.LMDB.path()
+
+      case Ferricstore.Flow.LMDB.get(path, key) do
+        {:ok, blob} ->
+          case Ferricstore.Flow.LMDB.decode_value(blob, System.os_time(:millisecond)) do
+            {:ok, value} -> value
+            :expired -> nil
+            :error -> nil
+          end
+
+        :not_found ->
+          nil
+
+        {:error, _reason} ->
+          nil
+      end
+    else
+      get(ctx, key)
+    end
+  end
+
+  @doc false
   def flow_create(ctx, %{id: id} = attrs) when is_binary(id) do
     key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
 

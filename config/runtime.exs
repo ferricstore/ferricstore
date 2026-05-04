@@ -20,8 +20,7 @@ if config_env() == :prod do
   # Durability
   # ---------------------------------------------------------------------------
   config :ferricstore,
-    default_durability:
-      String.to_atom(System.get_env("FERRICSTORE_DURABILITY", "quorum"))
+    default_durability: String.to_atom(System.get_env("FERRICSTORE_DURABILITY", "quorum"))
 
   # ---------------------------------------------------------------------------
   # Memory & Eviction
@@ -32,6 +31,9 @@ if config_env() == :prod do
     max_value_size: String.to_integer(System.get_env("FERRICSTORE_MAX_VALUE_SIZE", "1048576")),
     hot_cache_max_value_size:
       String.to_integer(System.get_env("FERRICSTORE_HOT_CACHE_MAX_VALUE_SIZE", "65536")),
+    flow_lmdb_enabled: System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
+    flow_lmdb_map_size:
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAP_SIZE", "68719476736")),
     memory_guard_interval_ms:
       String.to_integer(System.get_env("FERRICSTORE_MEMORY_GUARD_INTERVAL_MS", "5000"))
 
@@ -95,8 +97,7 @@ if config_env() == :prod do
          "once" -> :once
          n -> String.to_integer(n)
        end),
-    tcp_nodelay:
-      System.get_env("FERRICSTORE_TCP_NODELAY", "true") == "true",
+    tcp_nodelay: System.get_env("FERRICSTORE_TCP_NODELAY", "true") == "true",
     tcp_recbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_RECBUF", "131072")),
     tcp_sndbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_SNDBUF", "131072"))
 

@@ -53,6 +53,7 @@ pub mod tracking_alloc;
 
 use rustler::{Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, ResourceArc, Term};
 use std::os::unix::fs::FileExt;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A resource that owns a value buffer read from the Bitcask log.
 ///
@@ -81,6 +82,9 @@ mod atoms {
         put,
         delete,
         mismatch,
+        not_found,
+        missing,
+        value,
     }
 }
 
@@ -89,6 +93,21 @@ enum NifBatchWrite<'a> {
     Put(Binary<'a>, Binary<'a>, u64),
     Delete(Binary<'a>),
 }
+
+#[derive(rustler::NifTaggedEnum)]
+enum LmdbBatchWrite<'a> {
+    Put(Binary<'a>, Binary<'a>),
+    PutNew(Binary<'a>, Binary<'a>),
+    Delete(Binary<'a>),
+}
+
+struct LmdbStore {
+    env: heed::Env,
+    db: heed::Database<heed::types::Bytes, heed::types::Bytes>,
+}
+
+static LMDB_STORES: OnceLock<Mutex<std::collections::HashMap<String, Arc<LmdbStore>>>> =
+    OnceLock::new();
 
 #[allow(non_local_definitions)]
 fn load(env: Env, _info: Term) -> bool {
@@ -2021,6 +2040,212 @@ fn v2_append_ops_batch_nosync<'a>(
         }
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
     }
+}
+
+fn lmdb_store(path: &str, map_size: u64) -> Result<Arc<LmdbStore>, String> {
+    let stores = LMDB_STORES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+
+    {
+        let guard = stores
+            .lock()
+            .map_err(|_| "lmdb cache poisoned".to_string())?;
+        if let Some(store) = guard.get(path) {
+            return Ok(Arc::clone(store));
+        }
+    }
+
+    std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    let map_size = usize::try_from(map_size).map_err(|_| "lmdb map_size too large".to_string())?;
+
+    let env = unsafe {
+        heed::EnvOpenOptions::new()
+            .map_size(map_size)
+            .max_dbs(4)
+            .open(path)
+            .map_err(|e| e.to_string())?
+    };
+
+    let mut wtxn = env.write_txn().map_err(|e| e.to_string())?;
+    let db = env
+        .create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("flow_state"))
+        .map_err(|e| e.to_string())?;
+    wtxn.commit().map_err(|e| e.to_string())?;
+
+    let store = Arc::new(LmdbStore { env, db });
+    let mut guard = stores
+        .lock()
+        .map_err(|_| "lmdb cache poisoned".to_string())?;
+    Ok(Arc::clone(
+        guard.entry(path.to_string()).or_insert_with(|| store),
+    ))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_get<'a>(env: Env<'a>, path: String, key: Binary<'a>, map_size: u64) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let rtxn = match store.env.read_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            match store.db.get(&rtxn, key.as_slice()) {
+                Ok(Some(value)) => {
+                    let mut binary = OwnedBinary::new(value.len()).ok_or_else(|| {
+                        rustler::Error::Term(Box::new("failed to allocate binary"))
+                    })?;
+                    binary.as_mut_slice().copy_from_slice(value);
+                    Ok((atoms::ok(), binary.release(env)).encode(env))
+                }
+                Ok(None) => Ok(atoms::not_found().encode(env)),
+                Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+            }
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_put<'a>(
+    env: Env<'a>,
+    path: String,
+    key: Binary<'a>,
+    value: Binary<'a>,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    lmdb_write_batch_impl(
+        env,
+        path,
+        vec![LmdbBatchWrite::Put(key, value)],
+        map_size,
+        false,
+    )
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_delete<'a>(
+    env: Env<'a>,
+    path: String,
+    key: Binary<'a>,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    lmdb_write_batch_impl(
+        env,
+        path,
+        vec![LmdbBatchWrite::Delete(key)],
+        map_size,
+        false,
+    )
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_write_batch<'a>(
+    env: Env<'a>,
+    path: String,
+    records: Vec<LmdbBatchWrite<'a>>,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    lmdb_write_batch_impl(env, path, records, map_size, false)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_write_batch_with_originals<'a>(
+    env: Env<'a>,
+    path: String,
+    records: Vec<LmdbBatchWrite<'a>>,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    lmdb_write_batch_impl(env, path, records, map_size, true)
+}
+
+fn lmdb_write_batch_impl<'a>(
+    env: Env<'a>,
+    path: String,
+    records: Vec<LmdbBatchWrite<'a>>,
+    map_size: u64,
+    return_originals: bool,
+) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let mut wtxn = match store.env.write_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let mut seen = std::collections::HashSet::new();
+            let mut originals: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+
+            for record in &records {
+                let key = match record {
+                    LmdbBatchWrite::Put(key, _)
+                    | LmdbBatchWrite::PutNew(key, _)
+                    | LmdbBatchWrite::Delete(key) => key.as_slice(),
+                };
+
+                if return_originals && seen.insert(key.to_vec()) {
+                    if matches!(record, LmdbBatchWrite::PutNew(_, _)) {
+                        originals.push((key.to_vec(), None));
+                    } else {
+                        match store.db.get(&wtxn, key) {
+                            Ok(Some(value)) => {
+                                originals.push((key.to_vec(), Some(value.to_vec())));
+                            }
+                            Ok(None) => originals.push((key.to_vec(), None)),
+                            Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                        }
+                    }
+                }
+
+                let result = match record {
+                    LmdbBatchWrite::Put(key, value) | LmdbBatchWrite::PutNew(key, value) => {
+                        store.db.put(&mut wtxn, key.as_slice(), value.as_slice())
+                    }
+                    LmdbBatchWrite::Delete(key) => {
+                        store.db.delete(&mut wtxn, key.as_slice()).map(|_| ())
+                    }
+                };
+
+                if let Err(e) = result {
+                    return Ok((atoms::error(), e.to_string()).encode(env));
+                }
+            }
+
+            match wtxn.commit() {
+                Ok(()) if return_originals => {
+                    let mut terms = Vec::with_capacity(originals.len());
+
+                    for (key, original) in originals {
+                        let key_term = binary_term(env, &key)?;
+                        let original_term = match original {
+                            Some(value) => {
+                                let value_term = binary_term(env, &value)?;
+                                (atoms::value(), value_term).encode(env)
+                            }
+                            None => atoms::missing().encode(env),
+                        };
+                        terms.push((key_term, original_term).encode(env));
+                    }
+
+                    Ok((atoms::ok(), terms).encode(env))
+                }
+                Ok(()) => Ok(atoms::ok().encode(env)),
+                Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+            }
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+fn binary_term<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
+    let mut binary =
+        OwnedBinary::new(bytes.len()).ok_or_else(|| rustler::Error::Term(Box::new("oom")))?;
+    binary.as_mut_slice().copy_from_slice(bytes);
+    Ok(binary.release(env).encode(env))
 }
 
 /// Async variant of `v2_append_batch`: copies BEAM binaries into owned

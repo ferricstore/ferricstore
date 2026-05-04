@@ -185,6 +185,12 @@ defmodule Ferricstore.Raft.StateMachine do
             ZSetIndex.table_names(Map.get(config, :instance_name, :default), config.shard_index),
             1
           ),
+      flow_lmdb_enabled:
+        Map.get_lazy(config, :flow_lmdb_enabled, fn -> Ferricstore.Flow.LMDB.enabled?() end),
+      flow_lmdb_path:
+        Map.get_lazy(config, :flow_lmdb_path, fn ->
+          Ferricstore.Flow.LMDB.path(config.shard_data_path)
+        end),
       active_file_size:
         Map.get_lazy(config, :active_file_size, fn ->
           file_size_or_zero(config.active_file_path)
@@ -4073,6 +4079,9 @@ defmodule Ferricstore.Raft.StateMachine do
     Process.put(:sm_pending_writes, [])
     Process.put(:sm_pending_originals, %{})
     Process.put(:sm_pending_values, %{})
+    Process.put(:sm_pending_lmdb_ops, [])
+    Process.put(:sm_pending_lmdb_originals, %{})
+    Process.put(:sm_pending_lmdb_values, %{})
     started_at = System.monotonic_time()
 
     try do
@@ -4103,6 +4112,9 @@ defmodule Ferricstore.Raft.StateMachine do
       Process.delete(:sm_pending_writes)
       Process.delete(:sm_pending_originals)
       Process.delete(:sm_pending_values)
+      Process.delete(:sm_pending_lmdb_ops)
+      Process.delete(:sm_pending_lmdb_originals)
+      Process.delete(:sm_pending_lmdb_values)
     end
   end
 
@@ -4119,7 +4131,13 @@ defmodule Ferricstore.Raft.StateMachine do
         record = flow_create_record(attrs)
 
         with :ok <- flow_validate_record_keys(record),
-             :ok <- flow_put(state, state_key, flow_encode(record), flow_record_expire_at(record)),
+             :ok <-
+               flow_put_new_state_record(
+                 state,
+                 state_key,
+                 flow_encode(record),
+                 flow_record_expire_at(record)
+               ),
              :ok <- flow_due_put(state, record),
              :ok <- flow_index_put(state, record),
              :ok <- flow_history_put(state, record, "created", Map.get(record, :created_at_ms)),
@@ -4533,7 +4551,7 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
            :ok <-
-             flow_put(
+             flow_put_state_record(
                state,
                FlowKeys.state_key(id, partition_key),
                flow_encode(next),
@@ -4622,7 +4640,7 @@ defmodule Ferricstore.Raft.StateMachine do
     with :ok <- flow_due_delete(state, record),
          :ok <- flow_index_delete(state, record),
          :ok <-
-           flow_put(
+           flow_put_state_record(
              state,
              FlowKeys.state_key(next.id, partition_key),
              flow_encode(next),
@@ -4725,7 +4743,7 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
            :ok <-
-             flow_put(
+             flow_put_state_record(
                state,
                FlowKeys.state_key(id, partition_key),
                flow_encode(next),
@@ -4767,7 +4785,7 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
            :ok <-
-             flow_put(
+             flow_put_state_record(
                state,
                FlowKeys.state_key(id, partition_key),
                flow_encode(next),
@@ -4808,7 +4826,7 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
            :ok <-
-             flow_put(
+             flow_put_state_record(
                state,
                FlowKeys.state_key(id, partition_key),
                flow_encode(next),
@@ -4838,7 +4856,7 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
            :ok <-
-             flow_put(
+             flow_put_state_record(
                state,
                FlowKeys.state_key(id, partition_key),
                flow_encode(next),
@@ -4962,7 +4980,7 @@ defmodule Ferricstore.Raft.StateMachine do
     Enum.each(plans, fn {_record, next} ->
       partition_key = Map.get(next, :partition_key)
 
-      flow_put(
+      flow_put_state_record(
         state,
         FlowKeys.state_key(next.id, partition_key),
         flow_encode(next),
@@ -4977,7 +4995,7 @@ defmodule Ferricstore.Raft.StateMachine do
     Enum.each(records, fn record ->
       partition_key = Map.get(record, :partition_key)
 
-      flow_put(
+      flow_put_new_state_record(
         state,
         FlowKeys.state_key(record.id, partition_key),
         flow_encode(record),
@@ -5174,7 +5192,19 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_read_record(state, id, partition_key) do
-    case ets_lookup(state, FlowKeys.state_key(id, partition_key)) do
+    key = FlowKeys.state_key(id, partition_key)
+
+    case flow_read_lmdb_record(state, key) do
+      {:ok, record} ->
+        record
+
+      :miss ->
+        flow_read_ets_record(state, key)
+    end
+  end
+
+  defp flow_read_ets_record(state, key) do
+    case ets_lookup(state, key) do
       {:hit, value, _expire_at_ms} when is_binary(value) ->
         try do
           Flow.decode_record(value)
@@ -5184,6 +5214,48 @@ defmodule Ferricstore.Raft.StateMachine do
 
       _ ->
         nil
+    end
+  end
+
+  defp flow_read_lmdb_record(state, key) do
+    cond do
+      not flow_lmdb_enabled?(state) ->
+        :miss
+
+      Map.has_key?(Process.get(:sm_pending_lmdb_values, %{}), key) ->
+        flow_decode_pending_lmdb_record(Process.get(:sm_pending_lmdb_values, %{}), key)
+
+      true ->
+        case Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), key) do
+          {:ok, blob} -> flow_decode_lmdb_blob(blob)
+          :not_found -> :miss
+          {:error, _reason} -> :miss
+        end
+    end
+  end
+
+  defp flow_decode_pending_lmdb_record(pending, key) do
+    case Map.get(pending, key) do
+      {:put, blob} -> flow_decode_lmdb_blob(blob)
+      :delete -> :miss
+      _ -> :miss
+    end
+  end
+
+  defp flow_decode_lmdb_blob(blob) do
+    case Ferricstore.Flow.LMDB.decode_value(blob, apply_now_ms()) do
+      {:ok, value} ->
+        try do
+          {:ok, Flow.decode_record(value)}
+        rescue
+          _ -> :miss
+        end
+
+      :expired ->
+        :miss
+
+      :error ->
+        :miss
     end
   end
 
@@ -5709,6 +5781,28 @@ defmodule Ferricstore.Raft.StateMachine do
     raw_put(state, key, value, expire_at_ms)
   end
 
+  defp flow_put_state_record(state, key, value, expire_at_ms) do
+    if flow_lmdb_enabled?(state) do
+      record_pending_original(state, key)
+      track_keydir_binary_remove(state, key)
+      :ets.delete(state.ets, key)
+      queue_pending_lmdb_put(state, key, value, expire_at_ms)
+    else
+      flow_put(state, key, value, expire_at_ms)
+    end
+  end
+
+  defp flow_put_new_state_record(state, key, value, expire_at_ms) do
+    if flow_lmdb_enabled?(state) do
+      record_pending_original(state, key)
+      track_keydir_binary_remove(state, key)
+      :ets.delete(state.ets, key)
+      queue_pending_lmdb_put_new(state, key, value, expire_at_ms)
+    else
+      flow_put(state, key, value, expire_at_ms)
+    end
+  end
+
   defp raw_put(state, key, value, expire_at_ms) do
     ets_val = value_for_ets(value, hot_cache_threshold(state))
     disk_val = to_disk_binary(value)
@@ -5824,11 +5918,17 @@ defmodule Ferricstore.Raft.StateMachine do
   # ETS entries with real file_id/offset. Called at the end of every apply/3
   # — no :pending entries remain after this returns.
   defp flush_pending_writes(state) do
-    case Process.put(:sm_pending_writes, []) do
-      [] ->
+    lmdb_result = flush_pending_lmdb(state)
+
+    case {lmdb_result, Process.put(:sm_pending_writes, [])} do
+      {{:error, reason}, _pending} ->
+        rollback_pending_lmdb(state)
+        {:error, {:lmdb_write_failed, reason}}
+
+      {:ok, []} ->
         :ok
 
-      pending when is_list(pending) ->
+      {:ok, pending} when is_list(pending) ->
         batch = Enum.reverse(pending)
         batch_bytes = bitcask_batch_bytes(batch)
         record_bytes = bitcask_record_bytes(batch)
@@ -5878,7 +5978,7 @@ defmodule Ferricstore.Raft.StateMachine do
             end
         end
 
-      _ ->
+      {:ok, _} ->
         :ok
     end
   end
@@ -6339,7 +6439,75 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flow_lmdb_enabled?(%{flow_lmdb_enabled: true}), do: true
+  defp flow_lmdb_enabled?(_state), do: false
+
+  defp flow_lmdb_record_path(state), do: Map.fetch!(state, :flow_lmdb_path)
+
+  defp queue_pending_lmdb_put(_state, key, value, expire_at_ms) do
+    blob = Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)
+
+    pending = Process.get(:sm_pending_lmdb_ops, [])
+    Process.put(:sm_pending_lmdb_ops, [{:put, key, blob} | pending])
+
+    pending_values = Process.get(:sm_pending_lmdb_values, %{})
+    Process.put(:sm_pending_lmdb_values, Map.put(pending_values, key, {:put, blob}))
+    :ok
+  end
+
+  defp queue_pending_lmdb_put_new(_state, key, value, expire_at_ms) do
+    blob = Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)
+
+    pending = Process.get(:sm_pending_lmdb_ops, [])
+    Process.put(:sm_pending_lmdb_ops, [{:put_new, key, blob} | pending])
+
+    pending_values = Process.get(:sm_pending_lmdb_values, %{})
+    Process.put(:sm_pending_lmdb_values, Map.put(pending_values, key, {:put, blob}))
+    :ok
+  end
+
+  defp flush_pending_lmdb(state) do
+    case Process.put(:sm_pending_lmdb_ops, []) do
+      [] ->
+        :ok
+
+      pending when is_list(pending) ->
+        case Ferricstore.Flow.LMDB.write_batch_with_originals(
+               flow_lmdb_record_path(state),
+               Enum.reverse(pending)
+             ) do
+          {:ok, originals} ->
+            Process.put(:sm_pending_lmdb_originals, Map.new(originals))
+            :ok
+
+          {:error, _reason} = error ->
+            error
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp rollback_pending_lmdb(state) do
+    originals = Process.get(:sm_pending_lmdb_originals, %{})
+
+    if originals != %{} and flow_lmdb_enabled?(state) do
+      ops =
+        Enum.map(originals, fn
+          {key, {:value, value}} -> {:put, key, value}
+          {key, :missing} -> {:delete, key}
+        end)
+
+      Ferricstore.Flow.LMDB.write_batch(flow_lmdb_record_path(state), ops)
+    end
+
+    :ok
+  end
+
   defp rollback_pending_writes(state) do
+    rollback_pending_lmdb(state)
+
     Process.get(:sm_pending_originals, %{})
     |> Enum.each(fn
       {key, {:entry, entry}} ->

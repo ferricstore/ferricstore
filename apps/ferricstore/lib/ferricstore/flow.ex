@@ -82,7 +82,7 @@ defmodule Ferricstore.Flow do
          :ok <- validate_opts(opts),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)) do
-      case Router.get(ctx, __MODULE__.Keys.state_key(id, partition_key)) do
+      case Router.flow_get(ctx, id, partition_key) do
         nil -> {:ok, nil}
         value when is_binary(value) -> {:ok, decode_record(value)}
       end
