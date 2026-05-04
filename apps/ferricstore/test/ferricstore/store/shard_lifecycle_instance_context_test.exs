@@ -104,6 +104,56 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
     assert File.dir?(compact_dir)
   end
 
+  test "discover_active_file fails closed when shard path cannot be listed" do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lifecycle_discover_ls_fail_#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(tmp)
+    shard_path = Path.join(tmp, "shard_0")
+    File.write!(shard_path, "not a directory")
+
+    on_exit(fn -> File.rm_rf!(tmp) end)
+
+    assert_raise RuntimeError, ~r/discover_active_file failed to list/, fn ->
+      ShardLifecycle.discover_active_file(shard_path)
+    end
+  end
+
+  test "recover_keydir fails closed when shard path cannot be listed" do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lifecycle_recover_ls_fail_#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(tmp)
+    shard_path = Path.join(tmp, "shard_0")
+    File.write!(shard_path, "not a directory")
+
+    keydir =
+      :ets.new(:"lifecycle_recover_ls_fail_#{System.unique_integer([:positive])}", [
+        :set,
+        :public
+      ])
+
+    on_exit(fn ->
+      try do
+        :ets.delete(keydir)
+      rescue
+        _ -> :ok
+      end
+
+      File.rm_rf!(tmp)
+    end)
+
+    assert_raise RuntimeError, ~r/recover_keydir failed to list/, fn ->
+      ShardLifecycle.recover_keydir(shard_path, keydir, 0)
+    end
+  end
+
   test "recover_keydir during custom shard startup does not mutate default accounting" do
     default_ctx = FerricStore.Instance.get(:default)
     default_before = keydir_binary_total(default_ctx)

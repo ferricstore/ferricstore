@@ -60,8 +60,10 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           {max_id, size}
         end
 
-      {:error, _} ->
-        {0, 0}
+      {:error, reason} ->
+        Logger.error("discover_active_file failed to list #{shard_path}: #{inspect(reason)}")
+
+        raise "discover_active_file failed to list #{shard_path}: #{inspect(reason)}"
     end
   end
 
@@ -97,9 +99,11 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         )
 
       {:error, reason} ->
-        Logger.warning(
+        Logger.error(
           "Shard #{shard_index}: recover_keydir failed to list #{shard_path}: #{inspect(reason)}"
         )
+
+        raise "recover_keydir failed to list #{shard_path}: #{inspect(reason)}"
     end
 
     ets_size = :ets.info(keydir, :size)
