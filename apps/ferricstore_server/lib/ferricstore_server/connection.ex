@@ -985,11 +985,11 @@ defmodule FerricstoreServer.Connection do
        do: true
 
   defp ast_store_command?({tag, _, _, _, _})
-       when tag in ~w(linsert lmove zrange zrevrange zrangebyscore zrevrangebyscore xrange xrevrange xgroup_create json_set geodist cas ratelimit_add flow_transition)a,
+       when tag in ~w(linsert lmove zrange zrevrange zrangebyscore zrevrangebyscore xrange xrevrange xgroup_create json_set geodist cas ratelimit_add flow_transition flow_transition_many)a,
        do: true
 
   defp ast_store_command?({tag, _, _, _, _, _})
-       when tag in ~w(topk_reserve)a,
+       when tag in ~w(topk_reserve flow_transition_many)a,
        do: true
 
   defp ast_store_command?(tag) when tag in ~w(ping)a, do: true

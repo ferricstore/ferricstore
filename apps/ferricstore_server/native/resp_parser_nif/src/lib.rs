@@ -1565,6 +1565,7 @@ enum CommandAstKind {
     FlowClaimDue,
     FlowComplete,
     FlowTransition,
+    FlowTransitionMany,
     FlowRetry,
     FlowFail,
     FlowCancel,
@@ -1799,6 +1800,7 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"FLOW.CLAIM_DUE" => CommandAstKind::FlowClaimDue,
         b"FLOW.COMPLETE" => CommandAstKind::FlowComplete,
         b"FLOW.TRANSITION" => CommandAstKind::FlowTransition,
+        b"FLOW.TRANSITION_MANY" => CommandAstKind::FlowTransitionMany,
         b"FLOW.RETRY" => CommandAstKind::FlowRetry,
         b"FLOW.FAIL" => CommandAstKind::FlowFail,
         b"FLOW.CANCEL" => CommandAstKind::FlowCancel,
@@ -2230,6 +2232,9 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowClaimDue => make_flow_claim_due_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowComplete => make_flow_complete_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowTransition => make_flow_transition_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowTransitionMany => {
+            make_flow_transition_many_command_ast(env, args, arg_bytes)
+        }
         CommandAstKind::FlowRetry => make_flow_retry_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowFail => make_flow_fail_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCancel => make_flow_cancel_command_ast(env, args, arg_bytes),
@@ -5195,6 +5200,90 @@ fn make_flow_transition_command_ast<'a>(
     }
 }
 
+fn make_flow_transition_many_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_transition_many");
+    if args.len() < 7 {
+        return (tag, wrong_number_error(env, b"flow.transition_many")).encode(env);
+    }
+
+    let Some(items_idx) = flow_find_option(arg_bytes, 3, b"ITEMS") else {
+        return (
+            tag,
+            args[0],
+            args[1],
+            args[2],
+            generic_ast_error(env, b"ERR flow items are required"),
+        )
+            .encode(env);
+    };
+
+    if items_idx == args.len() - 1 || (args.len() - items_idx - 1) % 3 != 0 {
+        return (
+            tag,
+            args[0],
+            args[1],
+            args[2],
+            generic_ast_error(env, b"ERR syntax error"),
+        )
+            .encode(env);
+    }
+
+    let opts = match parse_flow_options_until(
+        env,
+        args,
+        arg_bytes,
+        3,
+        items_idx,
+        flow_transition_many_option,
+    ) {
+        Ok(opts) => opts,
+        Err(err) => return (tag, args[0], args[1], args[2], err).encode(env),
+    };
+
+    let mut items = Vec::with_capacity((args.len() - items_idx - 1) / 3);
+    let mut idx = items_idx + 1;
+    while idx < args.len() {
+        let fencing_token = match parse_int_bytes(arg_bytes[idx + 1]) {
+            Some(value) if value >= 0 => value,
+            _ => {
+                return (
+                    tag,
+                    args[0],
+                    args[1],
+                    args[2],
+                    generic_ast_error(env, b"ERR value is not an integer or out of range"),
+                )
+                    .encode(env)
+            }
+        };
+
+        let lease_token = if ascii_eq_ignore_case(arg_bytes[idx + 2], b"-") {
+            atoms::nil().encode(env)
+        } else {
+            args[idx + 2]
+        };
+
+        items.push(
+            (
+                atom(env, "id"),
+                args[idx],
+                atom(env, "fencing_token"),
+                fencing_token,
+                atom(env, "lease_token"),
+                lease_token,
+            )
+                .encode(env),
+        );
+        idx += 3;
+    }
+
+    (tag, args[0], args[1], args[2], items, opts).encode(env)
+}
+
 fn make_flow_retry_command_ast<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -5508,6 +5597,25 @@ fn flow_transition_option<'a>(
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_transition_many_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
+            (b"PRIORITY", "priority", FlowOptType::NonNegative),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
         ],
     )
 }
@@ -6089,8 +6197,8 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"TDIGEST.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"RATELIMIT.ADD" => vec![0],
         b"FLOW.CREATE" | b"FLOW.CREATE_MANY" | b"FLOW.GET" | b"FLOW.COMPLETE"
-        | b"FLOW.TRANSITION" | b"FLOW.RETRY" | b"FLOW.FAIL" | b"FLOW.CANCEL" | b"FLOW.REWIND"
-        | b"FLOW.HISTORY" => vec![0],
+        | b"FLOW.TRANSITION" | b"FLOW.TRANSITION_MANY" | b"FLOW.RETRY" | b"FLOW.FAIL"
+        | b"FLOW.CANCEL" | b"FLOW.REWIND" | b"FLOW.HISTORY" => vec![0],
         b"MEMORY" => {
             if argc > 1 && ascii_eq_ignore_case(arg_bytes[0], b"USAGE") {
                 vec![1]

@@ -323,6 +323,7 @@ defmodule Ferricstore.Store.Router do
   def always_quorum?({:flow_claim_due, _, _}), do: true
   def always_quorum?({:flow_complete, _, _}), do: true
   def always_quorum?({:flow_transition, _, _}), do: true
+  def always_quorum?({:flow_transition_many, _, _}), do: true
   def always_quorum?({:flow_retry, _, _}), do: true
   def always_quorum?({:flow_fail, _, _}), do: true
   def always_quorum?({:flow_cancel, _, _}), do: true
@@ -3482,6 +3483,64 @@ defmodule Ferricstore.Store.Router do
     else
       idx = shard_for(ctx, key)
       raft_write(ctx, idx, key, {:flow_transition, key, attrs})
+    end
+  end
+
+  @doc false
+  def flow_transition_batch(_ctx, []), do: []
+
+  def flow_transition_batch(ctx, attrs_list) when is_list(attrs_list) do
+    if ctx.name == :default do
+      {valid, indexed_results} =
+        attrs_list
+        |> Enum.with_index()
+        |> Enum.reduce({[], %{}}, fn
+          {%{id: id} = attrs, idx}, {valid_acc, result_acc} when is_binary(id) ->
+            key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+            if byte_size(key) > @max_key_size do
+              {valid_acc,
+               Map.put(
+                 result_acc,
+                 idx,
+                 {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+               )}
+            else
+              {[{idx, key, {:flow_transition, key, attrs}} | valid_acc], result_acc}
+            end
+
+          {_attrs, idx}, {valid_acc, result_acc} ->
+            {valid_acc,
+             Map.put(result_acc, idx, {:error, "ERR flow id must be a non-empty string"})}
+        end)
+
+      valid = Enum.reverse(valid)
+
+      valid_results =
+        batch_quorum_commands(ctx, Enum.map(valid, fn {_idx, key, cmd} -> {key, cmd} end))
+
+      indexed_results =
+        valid
+        |> Enum.map(fn {idx, _key, _cmd} -> idx end)
+        |> Enum.zip(valid_results)
+        |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+
+      for idx <- 0..(length(attrs_list) - 1), do: Map.fetch!(indexed_results, idx)
+    else
+      Enum.map(attrs_list, &flow_transition(ctx, &1))
+    end
+  end
+
+  @doc false
+  def flow_transition_many(ctx, partition_key, attrs_list)
+      when is_binary(partition_key) and is_list(attrs_list) do
+    key = Ferricstore.Flow.Keys.state_key("__transition_batch__", partition_key)
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_transition_many, key, %{records: attrs_list}})
     end
   end
 

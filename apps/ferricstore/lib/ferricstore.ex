@@ -454,6 +454,39 @@ defmodule FerricStore do
   def flow_transition(_id, _from_state, _to_state, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc """
+  Moves a same-partition batch of Flow records from one state to another.
+
+  The batch is all-or-nothing because every item routes to the same shard.
+  Each item must provide `:id` and `:fencing_token`; `:lease_token` is optional.
+  """
+  @spec flow_transition_many(binary(), binary(), binary(), list(), keyword()) ::
+          {:ok, [map()]} | {:error, binary()}
+  def flow_transition_many(partition_key, from_state, to_state, items, opts \\ [])
+
+  def flow_transition_many(partition_key, from_state, to_state, items, opts)
+      when is_binary(from_state) and is_binary(to_state) and is_list(items) and is_list(opts) do
+    Ferricstore.Flow.transition_many(
+      default_ctx(),
+      partition_key,
+      from_state,
+      to_state,
+      items,
+      opts
+    )
+  end
+
+  def flow_transition_many(_partition_key, from_state, _to_state, _items, _opts)
+      when not is_binary(from_state),
+      do: {:error, "ERR flow from must be a non-empty string"}
+
+  def flow_transition_many(_partition_key, _from_state, to_state, _items, _opts)
+      when not is_binary(to_state),
+      do: {:error, "ERR flow to must be a non-empty string"}
+
+  def flow_transition_many(_partition_key, _from_state, _to_state, _items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Clears a claim and reschedules a Flow record when `lease_token` matches."
   @spec flow_retry(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_retry(id, lease_token, opts)

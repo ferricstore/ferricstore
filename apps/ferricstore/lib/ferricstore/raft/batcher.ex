@@ -160,6 +160,7 @@ defmodule Ferricstore.Raft.Batcher do
           | {:flow_claim_due, binary(), map()}
           | {:flow_complete, binary(), map()}
           | {:flow_transition, binary(), map()}
+          | {:flow_transition_many, binary(), map()}
           | {:flow_retry, binary(), map()}
           | {:flow_fail, binary(), map()}
           | {:flow_cancel, binary(), map()}

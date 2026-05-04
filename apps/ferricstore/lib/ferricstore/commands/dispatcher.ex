@@ -502,7 +502,12 @@ defmodule Ferricstore.Commands.Dispatcher do
       when tag in ~w(cas ratelimit_add)a,
       do: Native.handle_ast(ast, store)
 
-  def dispatch_ast({:flow_transition, _, _, _, _} = ast, store), do: Flow.handle_ast(ast, store)
+  def dispatch_ast({tag, _, _, _, _} = ast, store)
+      when tag in ~w(flow_transition flow_transition_many)a,
+      do: Flow.handle_ast(ast, store)
+
+  def dispatch_ast({:flow_transition_many, _, _, _, _, _} = ast, store),
+    do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _args} = ast, store)
       when tag in ~w(cluster_health cluster_stats cluster_keyslot cluster_slots cluster_status cluster_join cluster_leave cluster_failover cluster_promote cluster_demote cluster_role ferricstore_hotness)a,

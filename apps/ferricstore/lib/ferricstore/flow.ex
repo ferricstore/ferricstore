@@ -154,28 +154,8 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with :ok <- validate_opts(opts),
-           :ok <- validate_id(id),
-           :ok <- validate_state(:from, from_state),
-           :ok <- validate_state(:to, to_state),
-           {:ok, lease_token} <- optional_lease_token(opts),
-           {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
-           {:ok, partition_key} <- optional_partition_key(opts),
-           :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-           {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
-           {:ok, priority} <- optional_priority_or_nil(opts) do
-        Router.flow_transition(ctx, %{
-          id: id,
-          from_state: from_state,
-          to_state: to_state,
-          lease_token: lease_token,
-          fencing_token: fencing_token,
-          run_at_ms: run_at_ms,
-          priority: priority,
-          now_ms: now,
-          partition_key: partition_key
-        })
+      with {:ok, attrs} <- transition_attrs(id, from_state, to_state, opts) do
+        Router.flow_transition(ctx, attrs)
       end
 
     observe_flow(:transition, started, result, %{
@@ -184,6 +164,69 @@ defmodule Ferricstore.Flow do
       to_state: to_state
     })
   end
+
+  def transition_many(ctx, partition_key, from_state, to_state, items, opts)
+      when is_binary(from_state) and is_binary(to_state) and is_list(items) and is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with {:ok, partition_key} <- required_partition_key(partition_key),
+           :ok <- validate_transition_many_items(items),
+           {:ok, attrs_list} <-
+             transition_many_attrs(items, opts, partition_key, from_state, to_state),
+           :ok <- validate_unique_transition_ids(attrs_list) do
+        Router.flow_transition_many(ctx, partition_key, attrs_list)
+      end
+
+    observe_flow(:transition, started, result, %{
+      flow_id: nil,
+      from_state: from_state,
+      to_state: to_state
+    })
+  end
+
+  def transition_many(_ctx, _partition_key, _from_state, _to_state, _items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc false
+  def transition_batch_independent(_ctx, []), do: []
+
+  def transition_batch_independent(ctx, transitions) when is_list(transitions) do
+    started = flow_start_time()
+
+    {valid, indexed_results} =
+      transitions
+      |> Enum.with_index()
+      |> Enum.reduce({[], %{}}, fn
+        {{id, from_state, to_state, opts}, idx}, {valid_acc, result_acc}
+        when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts) ->
+          case transition_attrs(id, from_state, to_state, opts) do
+            {:ok, attrs} -> {[{idx, attrs} | valid_acc], result_acc}
+            {:error, _reason} = error -> {valid_acc, Map.put(result_acc, idx, error)}
+          end
+
+        {_bad, idx}, {valid_acc, result_acc} ->
+          {valid_acc, Map.put(result_acc, idx, {:error, "ERR flow opts must be a keyword list"})}
+      end)
+
+    valid = Enum.reverse(valid)
+
+    valid_results =
+      Router.flow_transition_batch(ctx, Enum.map(valid, fn {_idx, attrs} -> attrs end))
+
+    indexed_results =
+      valid
+      |> Enum.map(fn {idx, _attrs} -> idx end)
+      |> Enum.zip(valid_results)
+      |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+
+    results = for idx <- 0..(length(transitions) - 1), do: Map.fetch!(indexed_results, idx)
+    observe_flow_batch(:transition, started, results)
+    results
+  end
+
+  def transition_batch_independent(_ctx, _transitions),
+    do: [{:error, "ERR flow opts must be a keyword list"}]
 
   def retry(ctx, id, lease_token, opts)
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
@@ -596,10 +639,116 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp transition_attrs(id, from_state, to_state, opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         :ok <- validate_state(:from, from_state),
+         :ok <- validate_state(:to, to_state),
+         {:ok, lease_token} <- optional_lease_token(opts),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+         {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
+         {:ok, priority} <- optional_priority_or_nil(opts) do
+      {:ok,
+       %{
+         id: id,
+         from_state: from_state,
+         to_state: to_state,
+         lease_token: lease_token,
+         fencing_token: fencing_token,
+         run_at_ms: run_at_ms,
+         priority: priority,
+         now_ms: now,
+         partition_key: partition_key
+       }}
+    end
+  end
+
+  defp transition_many_attrs(items, opts, partition_key, from_state, to_state) do
+    Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
+      with {:ok, id, item_opts} <- transition_many_item_opts(item),
+           {:ok, attrs} <-
+             transition_attrs(
+               id,
+               from_state,
+               to_state,
+               opts |> Keyword.merge(item_opts) |> Keyword.put(:partition_key, partition_key)
+             ) do
+        {:cont, {:ok, [attrs | acc]}}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, attrs_list} -> {:ok, Enum.reverse(attrs_list)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp transition_many_item_opts(%{id: id, fencing_token: fencing_token} = item)
+       when is_binary(id) do
+    {:ok, id, [fencing_token: fencing_token] ++ transition_many_item_lease_token(item)}
+  end
+
+  defp transition_many_item_opts(%{"id" => id, "fencing_token" => fencing_token} = item)
+       when is_binary(id) do
+    {:ok, id, [fencing_token: fencing_token] ++ transition_many_item_lease_token(item)}
+  end
+
+  defp transition_many_item_opts({id, item_opts}) when is_binary(id) and is_list(item_opts) do
+    if Keyword.keyword?(item_opts) do
+      {:ok, id, item_opts}
+    else
+      {:error, "ERR flow opts must be a keyword list"}
+    end
+  end
+
+  defp transition_many_item_opts(
+         {:id, id, :fencing_token, fencing_token, :lease_token, lease_token}
+       )
+       when is_binary(id) do
+    opts =
+      if is_nil(lease_token),
+        do: [fencing_token: fencing_token],
+        else: [fencing_token: fencing_token, lease_token: lease_token]
+
+    {:ok, id, opts}
+  end
+
+  defp transition_many_item_opts(_item), do: {:error, "ERR flow id must be a non-empty string"}
+
+  defp transition_many_item_lease_token(item) do
+    cond do
+      Map.has_key?(item, :lease_token) -> [lease_token: Map.get(item, :lease_token)]
+      Map.has_key?(item, "lease_token") -> [lease_token: Map.get(item, "lease_token")]
+      true -> []
+    end
+  end
+
   defp validate_create_many_items([_ | _]), do: :ok
   defp validate_create_many_items(_items), do: {:error, "ERR flow items must be a non-empty list"}
 
+  defp validate_transition_many_items([_ | _]), do: :ok
+
+  defp validate_transition_many_items(_items),
+    do: {:error, "ERR flow items must be a non-empty list"}
+
   defp validate_unique_create_ids(attrs_list) do
+    {_seen, result} =
+      Enum.reduce_while(attrs_list, {MapSet.new(), :ok}, fn %{id: id}, {seen, :ok} ->
+        if MapSet.member?(seen, id) do
+          {:halt, {seen, {:error, "ERR flow duplicate id in batch"}}}
+        else
+          {:cont, {MapSet.put(seen, id), :ok}}
+        end
+      end)
+
+    result
+  end
+
+  defp validate_unique_transition_ids(attrs_list) do
     {_seen, result} =
       Enum.reduce_while(attrs_list, {MapSet.new(), :ok}, fn %{id: id}, {seen, :ok} ->
         if MapSet.member?(seen, id) do

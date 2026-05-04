@@ -945,6 +945,10 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_with_time(meta, state, fn -> do_flow_transition(state, attrs) end)
   end
 
+  def apply(meta, {:flow_transition_many, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_transition_many(state, attrs) end)
+  end
+
   def apply(meta, {:flow_retry, _key, attrs}, state) when is_map(attrs) do
     apply_pending_with_time(meta, state, fn -> do_flow_retry(state, attrs) end)
   end
@@ -3222,6 +3226,10 @@ defmodule Ferricstore.Raft.StateMachine do
     do_flow_transition(state, attrs)
   end
 
+  defp apply_single(state, {:flow_transition_many, _key, attrs}) do
+    do_flow_transition_many(state, attrs)
+  end
+
   defp apply_single(state, {:flow_retry, _key, attrs}) do
     do_flow_retry(state, attrs)
   end
@@ -4546,6 +4554,44 @@ defmodule Ferricstore.Raft.StateMachine do
     now_ms = Map.get(attrs, :now_ms, apply_now_ms())
     partition_key = Map.get(attrs, :partition_key)
 
+    with {:ok, record, next} <-
+           flow_prepare_transition_record(
+             state,
+             attrs,
+             id,
+             from_state,
+             to_state,
+             run_at_ms,
+             now_ms
+           ),
+         :ok <- flow_apply_transition(state, record, next, partition_key, now_ms) do
+      {:ok, next}
+    end
+  end
+
+  defp do_flow_transition_many(state, %{records: [_ | _] = attrs_list}) do
+    with :ok <- flow_transition_many_same_partition?(attrs_list),
+         :ok <- flow_transition_many_unique?(attrs_list),
+         {:ok, plans} <- flow_transition_many_prepare(state, attrs_list),
+         :ok <- flow_transition_many_apply(state, plans) do
+      {:ok, Enum.map(plans, fn {_record, next} -> next end)}
+    end
+  end
+
+  defp do_flow_transition_many(_state, _attrs),
+    do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp flow_prepare_transition_record(
+         state,
+         attrs,
+         id,
+         from_state,
+         to_state,
+         run_at_ms,
+         now_ms
+       ) do
+    partition_key = Map.get(attrs, :partition_key)
+
     with {:ok, record} <- flow_require_record(state, id, partition_key),
          :ok <- flow_require_expected_state(record, from_state),
          :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
@@ -4566,22 +4612,88 @@ defmodule Ferricstore.Raft.StateMachine do
         })
 
       with :ok <- flow_validate_record_keys(record),
-           :ok <- flow_validate_record_keys(next),
-           :ok <- flow_due_delete(state, record),
-           :ok <- flow_index_delete(state, record),
-           :ok <-
-             flow_put(
-               state,
-               FlowKeys.state_key(id, partition_key),
-               flow_encode(next),
-               flow_record_expire_at(next)
-             ),
-           :ok <- flow_due_put(state, next),
-           :ok <- flow_index_put(state, next),
-           :ok <- flow_history_put(state, next, "transitioned", now_ms),
-           :ok <- flow_history_trim(state, next) do
-        {:ok, next}
+           :ok <- flow_validate_record_keys(next) do
+        {:ok, record, next}
       end
+    end
+  end
+
+  defp flow_apply_transition(state, record, next, partition_key, now_ms) do
+    with :ok <- flow_due_delete(state, record),
+         :ok <- flow_index_delete(state, record),
+         :ok <-
+           flow_put(
+             state,
+             FlowKeys.state_key(next.id, partition_key),
+             flow_encode(next),
+             flow_record_expire_at(next)
+           ),
+         :ok <- flow_due_put(state, next),
+         :ok <- flow_index_put(state, next),
+         :ok <- flow_history_put(state, next, "transitioned", now_ms),
+         :ok <- flow_history_trim(state, next) do
+      :ok
+    end
+  end
+
+  defp flow_transition_many_same_partition?(attrs_list) do
+    case attrs_list |> Enum.map(&Map.get(&1, :partition_key)) |> Enum.uniq() do
+      [partition_key] when is_binary(partition_key) and partition_key != "" -> :ok
+      _ -> {:error, "ERR flow partition_key is required"}
+    end
+  end
+
+  defp flow_transition_many_unique?(attrs_list) do
+    {_seen, result} =
+      Enum.reduce_while(attrs_list, {MapSet.new(), :ok}, fn %{id: id}, {seen, :ok} ->
+        if MapSet.member?(seen, id) do
+          {:halt, {seen, {:error, "ERR flow duplicate id in batch"}}}
+        else
+          {:cont, {MapSet.put(seen, id), :ok}}
+        end
+      end)
+
+    result
+  end
+
+  defp flow_transition_many_prepare(state, attrs_list) do
+    Enum.reduce_while(attrs_list, {:ok, []}, fn
+      %{id: id, from_state: from_state, to_state: to_state, run_at_ms: run_at_ms} = attrs,
+      {:ok, acc} ->
+        now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+
+        case flow_prepare_transition_record(
+               state,
+               attrs,
+               id,
+               from_state,
+               to_state,
+               run_at_ms,
+               now_ms
+             ) do
+          {:ok, record, next} -> {:cont, {:ok, [{record, next} | acc]}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+
+      _bad, {:ok, _acc} ->
+        {:halt, {:error, "ERR flow id must be a non-empty string"}}
+    end)
+    |> case do
+      {:ok, plans} -> {:ok, Enum.reverse(plans)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_transition_many_apply(state, plans) do
+    next_records = Enum.map(plans, fn {_record, next} -> next end)
+
+    with :ok <- flow_transition_delete_old_due(state, plans),
+         :ok <- flow_claim_delete_old_indexes(state, plans),
+         :ok <- flow_claim_put_state_records(state, plans),
+         :ok <- flow_due_put_many(state, next_records),
+         :ok <- flow_index_put_many(state, next_records),
+         :ok <- flow_transition_put_history(state, plans) do
+      :ok
     end
   end
 
@@ -4832,6 +4944,20 @@ defmodule Ferricstore.Raft.StateMachine do
     flow_zset_index_delete_grouped(state, state_deletes ++ running_deletes)
   end
 
+  defp flow_transition_delete_old_due(state, plans) do
+    plans
+    |> Enum.group_by(fn {record, _next} ->
+      partition_key = Map.get(record, :partition_key)
+      FlowKeys.due_key(record.type, record.state, record.priority, partition_key)
+    end)
+    |> Enum.each(fn {due_key, due_plans} ->
+      ids = Enum.map(due_plans, fn {record, _next} -> record.id end)
+      flow_zset_delete_members_from_key(state, due_key, ids)
+    end)
+
+    :ok
+  end
+
   defp flow_claim_put_state_records(state, plans) do
     Enum.each(plans, fn {_record, next} ->
       partition_key = Map.get(next, :partition_key)
@@ -4947,6 +5073,17 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
+  defp flow_transition_put_history(state, plans) do
+    Ferricstore.Commands.Stream.ensure_meta_table()
+
+    Enum.each(plans, fn {_record, next} ->
+      flow_history_put_ready(state, next, "transitioned", Map.get(next, :updated_at_ms))
+      flow_history_trim(state, next)
+    end)
+
+    :ok
+  end
+
   defp flow_create_put_history(state, records) do
     Ferricstore.Commands.Stream.ensure_meta_table()
 
@@ -5052,6 +5189,33 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_history_event_fields(state, id, event_id, partition_key) do
     history_key = FlowKeys.history_key(id, partition_key)
+
+    case flow_history_indexed_event_fields(state, history_key, event_id) do
+      {:ok, _fields} = ok -> ok
+      :miss -> flow_history_scanned_event_fields(state, history_key, event_id)
+    end
+  end
+
+  defp flow_history_indexed_event_fields(state, history_key, event_id) do
+    {ms, seq} = flow_parse_event_id(event_id)
+    index_key = {history_key, ms, seq}
+
+    case :ets.lookup(Ferricstore.Stream.Index, index_key) do
+      [{^index_key, ^event_id, compound_key}] ->
+        case ets_lookup(state, compound_key) do
+          {:hit, value, _expire_at_ms} ->
+            {:ok, value |> flow_decode_history_fields() |> flow_history_fields_to_map()}
+
+          _ ->
+            :miss
+        end
+
+      _ ->
+        :miss
+    end
+  end
+
+  defp flow_history_scanned_event_fields(state, history_key, event_id) do
     prefix = "X:" <> history_key <> <<0>>
     target_key = prefix <> event_id
 

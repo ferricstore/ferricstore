@@ -19,6 +19,9 @@ shard_count = System.get_env("FLOW_100K_SHARDS", "4") |> String.to_integer()
 partition_count = System.get_env("FLOW_100K_PARTITIONS", "4") |> String.to_integer()
 seed_concurrency = System.get_env("FLOW_100K_SEED_CONCURRENCY", "32") |> String.to_integer()
 
+transition_many_batch =
+  System.get_env("FLOW_100K_TRANSITION_MANY_BATCH", "100") |> String.to_integer()
+
 claim_limits =
   System.get_env("FLOW_100K_CLAIM_LIMITS", "10,100")
   |> String.split(",", trim: true)
@@ -44,6 +47,7 @@ defmodule Flow100kStateBench do
         shard_count,
         partition_count,
         seed_concurrency,
+        transition_many_batch,
         claim_limits,
         bench_data_dir
       ) do
@@ -58,7 +62,7 @@ defmodule Flow100kStateBench do
       "backlog=#{backlog} iterations=#{iterations} shards=#{shard_count} partitions=#{partition_count} claim_limits=#{Enum.join(claim_limits, ",")}"
     )
 
-    IO.puts("seed_concurrency=#{seed_concurrency}")
+    IO.puts("seed_concurrency=#{seed_concurrency} transition_many_batch=#{transition_many_batch}")
 
     memory_before = :erlang.memory(:total)
 
@@ -126,6 +130,9 @@ defmodule Flow100kStateBench do
       |> add(bench_stuck(prefix, backlog, iterations, partition_count))
       |> add_many(bench_claim_due(prefix, backlog, iterations, partition_count, claim_limits))
       |> add(bench_transition(prefix, backlog, iterations, partition_count))
+      |> add(
+        bench_transition_many(prefix, backlog, iterations, partition_count, transition_many_batch)
+      )
       |> add(bench_complete(prefix, backlog, iterations, partition_count))
       |> add(bench_retry(prefix, backlog, iterations, partition_count))
       |> add(bench_fail(prefix, backlog, iterations, partition_count))
@@ -141,6 +148,7 @@ defmodule Flow100kStateBench do
       shards: shard_count,
       partitions: partition_count,
       seed_concurrency: seed_concurrency,
+      transition_many_batch: transition_many_batch,
       claim_limits: claim_limits,
       memory_before: memory_before,
       memory_after_seed: memory_after_seed,
@@ -287,6 +295,46 @@ defmodule Flow100kStateBench do
           run_at_ms: 2_000,
           now_ms: 2_000,
           partition_key: partition(prefix, i, partition_count)
+        )
+
+      transitioned
+    end)
+  end
+
+  defp bench_transition_many(prefix, backlog, iterations, partition_count, batch_size) do
+    flow_type = type(prefix, "transition_many")
+
+    timed("seed transition_many #{iterations}x#{batch_size}", fn ->
+      for i <- 1..iterations do
+        partition_key = partition(prefix, i, partition_count)
+
+        items =
+          for j <- 1..batch_size do
+            %{id: id(prefix, "transition_many", i, j)}
+          end
+
+        {:ok, _flows} =
+          FerricStore.flow_create_many(partition_key, items,
+            type: flow_type,
+            state: "queued",
+            run_at_ms: 1_000,
+            now_ms: 1_000
+          )
+      end
+    end)
+
+    result("flow.transition_many batch=#{batch_size} under #{backlog}", iterations, fn i ->
+      partition_key = partition(prefix, i, partition_count)
+
+      items =
+        for j <- 1..batch_size do
+          %{id: id(prefix, "transition_many", i, j), fencing_token: 0}
+        end
+
+      {:ok, transitioned} =
+        FerricStore.flow_transition_many(partition_key, "queued", "waiting", items,
+          run_at_ms: 2_000,
+          now_ms: 2_000
         )
 
       transitioned
@@ -545,6 +593,7 @@ defmodule Flow100kStateBench do
       "- shards: #{config.shards}",
       "- partitions: #{config.partitions}",
       "- seed_concurrency: #{config.seed_concurrency}",
+      "- transition_many_batch: #{config.transition_many_batch}",
       "- claim_limits: #{Enum.join(config.claim_limits, ",")}",
       "- beam_memory_before: #{config.memory_before}",
       "- beam_memory_after_seed: #{config.memory_after_seed}",
@@ -574,6 +623,10 @@ defmodule Flow100kStateBench do
 
   defp sample_index(i, backlog), do: rem(i * 7919, backlog) + 1
   defp id(prefix, group, i), do: prefix <> ":" <> group <> ":" <> Integer.to_string(i)
+
+  defp id(prefix, group, i, j),
+    do: prefix <> ":" <> group <> ":" <> Integer.to_string(i) <> ":" <> Integer.to_string(j)
+
   defp type(prefix, group), do: prefix <> ":" <> group
 
   defp partition(_prefix, _i, partition_count) when partition_count <= 1, do: nil
@@ -590,6 +643,7 @@ try do
     shard_count,
     partition_count,
     seed_concurrency,
+    transition_many_batch,
     claim_limits,
     bench_data_dir
   )

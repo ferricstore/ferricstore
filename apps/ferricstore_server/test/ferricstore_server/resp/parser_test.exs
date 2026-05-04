@@ -1688,6 +1688,28 @@ defmodule FerricstoreServer.Resp.ParserTest do
                  ["flow-1", "queued", "running", "FENCING", "1", "LEASE_TOKEN", "lease-1"],
                  {:flow_transition, "flow-1", "queued", "running",
                   [fencing_token: 1, lease_token: "lease-1"]}, ["flow-1"]},
+                {:command, "FLOW.TRANSITION_MANY",
+                 [
+                   "tenant-a",
+                   "queued",
+                   "running",
+                   "RUN_AT",
+                   "2000",
+                   "NOW",
+                   "1000",
+                   "ITEMS",
+                   "flow-1",
+                   "1",
+                   "-",
+                   "flow-2",
+                   "2",
+                   "lease-2"
+                 ],
+                 {:flow_transition_many, "tenant-a", "queued", "running",
+                  [
+                    {:id, "flow-1", :fencing_token, 1, :lease_token, nil},
+                    {:id, "flow-2", :fencing_token, 2, :lease_token, "lease-2"}
+                  ], [run_at_ms: 2000, now_ms: 1000]}, ["tenant-a"]},
                 {:command, "FLOW.RETRY", ["flow-1", "lease-1", "FENCING", "1", "RUN_AT", "2000"],
                  {:flow_retry, "flow-1", "lease-1", [fencing_token: 1, run_at_ms: 2000]},
                  ["flow-1"]},
@@ -1723,6 +1745,7 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "flow.claim_due checkout WORKER worker-a LEASE_MS 30000 LIMIT 100 NOW 1000\r\n" <>
                    "flow.complete flow-1 lease-1 FENCING 1 RESULT_REF result-1\r\n" <>
                    "flow.transition flow-1 queued running FENCING 1 LEASE_TOKEN lease-1\r\n" <>
+                   "flow.transition_many tenant-a queued running RUN_AT 2000 NOW 1000 ITEMS flow-1 1 - flow-2 2 lease-2\r\n" <>
                    "flow.retry flow-1 lease-1 FENCING 1 RUN_AT 2000\r\n" <>
                    "flow.fail flow-1 lease-1 FENCING 1 ERROR_REF err-1\r\n" <>
                    "flow.cancel flow-1 FENCING 1 REASON_REF reason-1\r\n" <>

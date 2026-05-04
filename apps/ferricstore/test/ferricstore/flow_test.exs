@@ -920,6 +920,106 @@ defmodule Ferricstore.FlowTest do
            ]
   end
 
+  test "flow_transition_many atomically moves one-partition batch" do
+    partition = uid("tenant-transition")
+    type = uid("bulk-transition")
+    id_a = uid("transition-a")
+    id_b = uid("transition-b")
+
+    assert {:ok, _} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: id_a}, %{id: id_b}],
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000,
+               now_ms: 900
+             )
+
+    assert {:ok, transitioned} =
+             FerricStore.flow_transition_many(
+               partition,
+               "queued",
+               "ready",
+               [
+                 %{id: id_a, fencing_token: 0},
+                 %{id: id_b, fencing_token: 0}
+               ],
+               run_at_ms: 2_000,
+               now_ms: 1_100
+             )
+
+    assert Enum.map(transitioned, & &1.id) == [id_a, id_b]
+    assert Enum.all?(transitioned, &(&1.state == "ready"))
+    assert Enum.all?(transitioned, &(&1.partition_key == partition))
+
+    assert {:ok, []} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               state: "queued",
+               worker: "worker-a",
+               limit: 10,
+               now_ms: 2_000
+             )
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               state: "ready",
+               worker: "worker-a",
+               limit: 10,
+               now_ms: 2_000
+             )
+
+    assert claimed |> Enum.map(& &1.id) |> MapSet.new() == MapSet.new([id_a, id_b])
+  end
+
+  test "flow_transition_many rolls back when any item fails guard" do
+    partition = uid("tenant-transition-rollback")
+    type = uid("bulk-transition-rollback")
+    id_a = uid("transition-good")
+    id_b = uid("transition-bad")
+
+    assert {:ok, _} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: id_a}, %{id: id_b}],
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000
+             )
+
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_transition_many(
+               partition,
+               "queued",
+               "ready",
+               [
+                 %{id: id_a, fencing_token: 0},
+                 %{id: id_b, fencing_token: 1}
+               ],
+               run_at_ms: 2_000
+             )
+
+    assert {:ok, fetched_a} = FerricStore.flow_get(id_a, partition_key: partition)
+    assert {:ok, fetched_b} = FerricStore.flow_get(id_b, partition_key: partition)
+    assert fetched_a.state == "queued"
+    assert fetched_b.state == "queued"
+    assert fetched_a.version == 1
+    assert fetched_b.version == 1
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               state: "queued",
+               worker: "worker-a",
+               limit: 10,
+               now_ms: 1_000
+             )
+
+    assert claimed |> Enum.map(& &1.id) |> MapSet.new() == MapSet.new([id_a, id_b])
+  end
+
   test "flow_transition enforces expected state and running lease guard" do
     id = uid("flow-transition-guard")
 
@@ -1127,6 +1227,44 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, events} = FerricStore.flow_history(id, count: 10)
     assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == ["claimed", "completed"]
+  end
+
+  test "flow_rewind rejects trimmed target event with stale stream index" do
+    id = uid("flow-rewind-trimmed")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: "rewind-trimmed",
+               run_at_ms: 1_000,
+               history_max_events: 2,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [{created_event_id, _fields} | _]} = FerricStore.flow_history(id, count: 10)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("rewind-trimmed",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, _completed} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert {:ok, events} = FerricStore.flow_history(id, count: 10)
+    assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == ["claimed", "completed"]
+
+    assert {:error, "ERR flow rewind target event not found"} =
+             FerricStore.flow_rewind(id,
+               to_event: created_event_id,
+               expect_state: "completed",
+               now_ms: 3_000
+             )
   end
 
   test "flow_rewind restores a previous history state and reindexes atomically" do
