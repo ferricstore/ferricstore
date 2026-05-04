@@ -332,6 +332,23 @@ defmodule Ferricstore.Commands.CMSTest do
       assert [2] = CMS.handle("CMS.QUERY", ["dst", "b"], store)
     end
 
+    test "replicates source keys instead of local absolute paths" do
+      store = ProbMockStore.make_cms()
+      :ok = CMS.handle("CMS.INITBYDIM", ["src1", "100", "7"], store)
+      :ok = CMS.handle("CMS.INITBYDIM", ["src2", "100", "7"], store)
+
+      test_pid = self()
+      store = Map.put(store, :prob_write, fn command ->
+        send(test_pid, {:prob_write, command})
+        :ok
+      end)
+
+      assert :ok = CMS.handle("CMS.MERGE", ["dst", "2", "src1", "src2"], store)
+
+      assert_receive {:prob_write, {:cms_merge, "dst", ["src1", "src2"], [1, 1], params}}
+      assert params == %{width: 100, depth: 7}
+    end
+
     test "merges single source sketch" do
       store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["src1", "50", "5"], store)

@@ -2459,6 +2459,57 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert Enum.any?(records, &match?({"batch_cms", _off, _size, 0, false}, &1))
     end
 
+    test "CMS merge resolves replicated source keys through local shard paths" do
+      root = Path.join(System.tmp_dir!(), "sm_cms_merge_#{System.unique_integer([:positive])}")
+      instance_name = :"sm_cms_merge_#{System.unique_integer([:positive])}"
+      ctx = FerricStore.Instance.build(instance_name, data_dir: root, shard_count: 4)
+
+      src_key = key_for_shard(ctx, "cms_src", 1)
+      dst_key = key_for_shard(ctx, "cms_dst", 0)
+      src_dir = Path.join(Ferricstore.DataDir.shard_data_path(root, 1), "prob")
+      dst_shard_path = Ferricstore.DataDir.shard_data_path(root, 0)
+      dst_dir = Path.join(dst_shard_path, "prob")
+      src_path = prob_test_path(src_dir, src_key, "cms")
+      dst_path = prob_test_path(dst_dir, dst_key, "cms")
+
+      ets = :ets.new(:"sm_cms_merge_#{System.unique_integer([:positive])}", [:set, :public])
+
+      try do
+        File.mkdir_p!(src_dir)
+        File.mkdir_p!(dst_shard_path)
+        File.touch!(Path.join(dst_shard_path, "00000.log"))
+
+        assert {:ok, _} = NIF.cms_file_create(src_path, 64, 4)
+        assert {:ok, _} = NIF.cms_file_incrby(src_path, [{"element", 9}])
+
+        state =
+          StateMachine.init(%{
+            shard_index: 0,
+            shard_data_path: dst_shard_path,
+            active_file_id: 0,
+            active_file_path: Path.join(dst_shard_path, "00000.log"),
+            ets: ets,
+            instance_ctx: ctx,
+            instance_name: instance_name
+          })
+
+        apply_result =
+          StateMachine.apply(
+            %{},
+            {:cms_merge, dst_key, [src_key], [1], %{width: 64, depth: 4}},
+            state
+          )
+
+        assert :ok = apply_result_value(apply_result)
+
+        assert {:ok, [9]} = NIF.cms_file_query(dst_path, ["element"])
+      after
+        :ets.delete(ets)
+        FerricStore.Instance.cleanup(instance_name)
+        File.rm_rf!(root)
+      end
+    end
+
     test "probabilistic create failures in batch do not publish metadata", %{
       state: state,
       ets: ets,
@@ -3624,6 +3675,22 @@ defmodule Ferricstore.Raft.StateMachineTest do
       overrides
     )
   end
+
+  defp key_for_shard(ctx, prefix, shard_index) do
+    0..10_000
+    |> Enum.find_value(fn i ->
+      key = "#{prefix}:#{i}"
+      if Ferricstore.Store.Router.shard_for(ctx, key) == shard_index, do: key
+    end)
+  end
+
+  defp prob_test_path(dir, key, ext) do
+    Path.join(dir, "#{Base.url_encode64(key, padding: false)}.#{ext}")
+  end
+
+  defp apply_result_value({_state, {:applied_at, _now_ms, result}, _effects}), do: result
+  defp apply_result_value({_state, result, _effects}), do: result
+  defp apply_result_value({_state, result}), do: result
 
   defp assert_keydir_unavailable_event(request) do
     assert_receive {:sm_keydir_unavailable, [:ferricstore, :store, :shard_unavailable],

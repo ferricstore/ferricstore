@@ -98,8 +98,7 @@ defmodule Ferricstore.Commands.CMS do
          {:ok, first_w, first_d} <- get_first_sketch_dims(store, src_keys),
          :ok <- validate_sketch_dims(store, src_keys, first_w, first_d) do
       create_params = %{width: first_w, depth: first_d}
-      src_paths = Enum.map(src_keys, &prob_path(store, &1, "cms"))
-      result = do_prob_write(store, {:cms_merge, dst, src_paths, weights, create_params})
+      result = do_prob_write(store, {:cms_merge, dst, src_keys, weights, create_params})
       normalize_result(result)
     end
   end
@@ -213,9 +212,9 @@ defmodule Ferricstore.Commands.CMS do
     NIF.cms_file_incrby(path, items)
   end
 
-  # src_paths are pre-resolved absolute paths from the handler
-  defp apply_prob_locally(store, {:cms_merge, dst_key, src_paths, weights, create_params}) do
+  defp apply_prob_locally(store, {:cms_merge, dst_key, src_keys, weights, create_params}) do
     dst_path = prob_path(store, dst_key, "cms")
+    src_paths = Enum.map(src_keys, &prob_path(store, &1, "cms"))
     dir = Path.dirname(dst_path)
 
     with :ok <- ensure_prob_dir(dir),

@@ -811,10 +811,10 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
-  # src_paths are pre-resolved absolute paths (sources may be on different shards)
-  def apply(meta, {:cms_merge, dst_key, src_paths, weights, create_params}, state) do
+  def apply(meta, {:cms_merge, dst_key, src_keys, weights, create_params}, state) do
     apply_prob_with_time(meta, state, fn ->
       dst_path = prob_path(state, dst_key, "cms")
+      src_paths = cms_source_paths(state, src_keys)
 
       with :ok <- ensure_prob_dir(state) do
         case maybe_create_cms_merge_dst(state, dst_path, dst_key, create_params) do
@@ -2828,9 +2828,10 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
-  defp apply_single(state, {:cms_merge, dst_key, src_paths, weights, create_params}) do
+  defp apply_single(state, {:cms_merge, dst_key, src_keys, weights, create_params}) do
     do_prob_command(state, fn ->
       dst_path = prob_path(state, dst_key, "cms")
+      src_paths = cms_source_paths(state, src_keys)
 
       with :ok <- ensure_prob_dir(state) do
         case maybe_create_cms_merge_dst(state, dst_path, dst_key, create_params) do
@@ -5967,6 +5968,27 @@ defmodule Ferricstore.Raft.StateMachine do
   defp prob_path(state, key, ext) do
     safe = Base.url_encode64(key, padding: false)
     prob_dir = prob_dir(state)
+    Path.join(prob_dir, "#{safe}.#{ext}")
+  end
+
+  defp cms_source_paths(state, src_keys) do
+    Enum.map(src_keys, &prob_path_for_key(state, &1, "cms"))
+  end
+
+  defp prob_path_for_key(state, key, ext) do
+    safe = Base.url_encode64(key, padding: false)
+
+    prob_dir =
+      case instance_ctx_for_state(state) do
+        %FerricStore.Instance{} = ctx ->
+          idx = Router.shard_for(ctx, key)
+          shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+          Path.join(shard_path, "prob")
+
+        _ ->
+          prob_dir(state)
+      end
+
     Path.join(prob_dir, "#{safe}.#{ext}")
   end
 
