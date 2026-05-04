@@ -1806,9 +1806,12 @@ defmodule Ferricstore.Store.Router do
   defp retry_changed_file_ref(ctx, idx, keydir, key, original_location, now) do
     case retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now) do
       :unchanged_cold ->
-        retry_after_unchanged_cold_location(fn ->
-          retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now)
-        end)
+        retry_after_unchanged_cold_location(
+          fn ->
+            retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now)
+          end,
+          cold_retry_metadata(ctx, idx, key, :file_ref)
+        )
 
       result ->
         result
@@ -2238,9 +2241,12 @@ defmodule Ferricstore.Store.Router do
   defp retry_changed_cold_value(ctx, idx, keydir, key, original_location, now) do
     case retry_changed_cold_value_once(ctx, idx, keydir, key, original_location, now) do
       :unchanged_cold ->
-        retry_after_unchanged_cold_location(fn ->
-          retry_changed_cold_value_once(ctx, idx, keydir, key, original_location, now)
-        end)
+        retry_after_unchanged_cold_location(
+          fn ->
+            retry_changed_cold_value_once(ctx, idx, keydir, key, original_location, now)
+          end,
+          cold_retry_metadata(ctx, idx, key, :value)
+        )
 
       result ->
         result
@@ -2276,9 +2282,12 @@ defmodule Ferricstore.Store.Router do
   defp retry_changed_cold_meta(ctx, idx, keydir, key, original_location, now) do
     case retry_changed_cold_meta_once(ctx, idx, keydir, key, original_location, now) do
       :unchanged_cold ->
-        retry_after_unchanged_cold_location(fn ->
-          retry_changed_cold_meta_once(ctx, idx, keydir, key, original_location, now)
-        end)
+        retry_after_unchanged_cold_location(
+          fn ->
+            retry_changed_cold_meta_once(ctx, idx, keydir, key, original_location, now)
+          end,
+          cold_retry_metadata(ctx, idx, key, :meta)
+        )
 
       result ->
         result
@@ -2311,20 +2320,46 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp retry_after_unchanged_cold_location(retry_fun) when is_function(retry_fun, 0) do
-    retry_after_unchanged_cold_location(retry_fun, @cold_location_retry_attempts)
+  defp retry_after_unchanged_cold_location(retry_fun, metadata) when is_function(retry_fun, 0) do
+    retry_after_unchanged_cold_location(retry_fun, metadata, @cold_location_retry_attempts)
   end
 
-  defp retry_after_unchanged_cold_location(_retry_fun, 0), do: :miss
+  defp retry_after_unchanged_cold_location(_retry_fun, metadata, 0) do
+    emit_cold_retry_exhausted(metadata)
+    :miss
+  end
 
-  defp retry_after_unchanged_cold_location(retry_fun, attempts_left) do
+  defp retry_after_unchanged_cold_location(retry_fun, metadata, attempts_left) do
     maybe_run_cold_location_miss_hook()
     Process.sleep(@cold_location_retry_sleep_ms)
 
     case retry_fun.() do
-      :unchanged_cold -> retry_after_unchanged_cold_location(retry_fun, attempts_left - 1)
-      result -> result
+      :unchanged_cold ->
+        retry_after_unchanged_cold_location(retry_fun, metadata, attempts_left - 1)
+
+      result ->
+        result
     end
+  end
+
+  defp cold_retry_metadata(ctx, idx, key, operation) do
+    %{
+      instance: ctx.name,
+      shard_index: idx,
+      operation: operation,
+      reason: :unchanged_cold_location,
+      redis_key_hash: :erlang.phash2(key)
+    }
+  end
+
+  defp emit_cold_retry_exhausted(nil), do: :ok
+
+  defp emit_cold_retry_exhausted(metadata) do
+    :telemetry.execute(
+      [:ferricstore, :store, :cold_read_retry_exhausted],
+      %{count: 1, attempts: @cold_location_retry_attempts},
+      metadata
+    )
   end
 
   defp maybe_run_cold_location_miss_hook do

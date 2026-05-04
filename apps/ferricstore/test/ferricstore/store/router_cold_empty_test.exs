@@ -385,6 +385,36 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
                     %{path: ^missing_path, reason: :missing_file}}
   end
 
+  test "direct cold reads emit telemetry when unchanged cold-location retries exhaust", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_direct_retry_exhausted:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    missing_path = Path.join(shard_path, "00009.log")
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 9, 0, 5})
+
+    attach_pread_corrupt_handler()
+    attach_cold_retry_exhausted_handler()
+
+    assert nil == Router.get(ctx, key)
+
+    assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                    %{path: ^missing_path, reason: :missing_file}}
+
+    assert_receive {:cold_retry_exhausted, [:ferricstore, :store, :cold_read_retry_exhausted],
+                    %{count: 1, attempts: 8},
+                    %{
+                      shard_index: 0,
+                      operation: :value,
+                      reason: :unchanged_cold_location,
+                      redis_key_hash: key_hash
+                    }}
+
+    assert is_integer(key_hash)
+  end
+
   test "direct cold reads retry when ETS changes after a cold read miss", %{
     ctx: ctx,
     keydir: keydir
@@ -437,6 +467,37 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
 
     assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
                     %{path: ^missing_path, reason: :missing_file}}
+  end
+
+  test "direct cold meta reads emit telemetry when unchanged cold-location retries exhaust", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_meta_retry_exhausted:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    expire_at_ms = System.system_time(:millisecond) + 60_000
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    missing_path = Path.join(shard_path, "00009.log")
+
+    :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), 9, 0, 5})
+
+    attach_pread_corrupt_handler()
+    attach_cold_retry_exhausted_handler()
+
+    assert nil == Router.get_meta(ctx, key)
+
+    assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                    %{path: ^missing_path, reason: :missing_file}}
+
+    assert_receive {:cold_retry_exhausted, [:ferricstore, :store, :cold_read_retry_exhausted],
+                    %{count: 1, attempts: 8},
+                    %{
+                      shard_index: 0,
+                      operation: :meta,
+                      reason: :unchanged_cold_location,
+                      redis_key_hash: key_hash
+                    }}
+
+    assert is_integer(key_hash)
   end
 
   test "batch cold reads emit telemetry when a cold record cannot be decoded", %{
@@ -507,6 +568,36 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
 
     assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
                     %{path: ^missing_path, reason: :missing_file}}
+  end
+
+  test "batch cold reads emit telemetry when unchanged cold-location retries exhaust", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_batch_retry_exhausted:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    missing_path = Path.join(shard_path, "00009.log")
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 9, 0, 5})
+
+    attach_pread_corrupt_handler()
+    attach_cold_retry_exhausted_handler()
+
+    assert [nil] == Router.batch_get(ctx, [key])
+
+    assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                    %{path: ^missing_path, reason: :missing_file}}
+
+    assert_receive {:cold_retry_exhausted, [:ferricstore, :store, :cold_read_retry_exhausted],
+                    %{count: 1, attempts: 8},
+                    %{
+                      shard_index: 0,
+                      operation: :value,
+                      reason: :unchanged_cold_location,
+                      redis_key_hash: key_hash
+                    }}
+
+    assert is_integer(key_hash)
   end
 
   test "batch cold reads retry when ETS changes after a cold read miss", %{
@@ -776,6 +867,23 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
         fn event, measurements, metadata, _config ->
           callback.()
           send(parent, {:pread_corrupt, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp attach_cold_retry_exhausted_handler do
+    parent = self()
+    handler_id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :store, :cold_read_retry_exhausted],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:cold_retry_exhausted, event, measurements, metadata})
         end,
         nil
       )
