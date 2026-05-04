@@ -459,7 +459,7 @@ defmodule FerricstoreServer.Connection do
       connection_ast?(ast) ->
         dispatch_connection_ast(ast, state)
 
-      cmd == "GET" and state.transport == :ranch_tcp ->
+      cmd == "GET" and state.transport in [:ranch_tcp, :ranch_ssl] ->
         dispatch_get_sendfile_ast(args, ast, state)
 
       cmd == "MGET" and state.transport == :ranch_tcp ->

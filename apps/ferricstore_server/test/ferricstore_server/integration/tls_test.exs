@@ -15,6 +15,7 @@ defmodule FerricstoreServer.Integration.TlsTest do
   use ExUnit.Case, async: false
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Connection.Sendfile
   alias FerricstoreServer.TlsListener
   alias Ferricstore.Test.TlsCertHelper
 
@@ -83,6 +84,21 @@ defmodule FerricstoreServer.Integration.TlsTest do
   end
 
   defp ukey(base), do: "tls_#{base}_#{:rand.uniform(9_999_999)}"
+
+  defp attach_file_stream_handler(test_pid) do
+    id = {__MODULE__, test_pid, :file_stream, System.unique_integer([:positive])}
+
+    :telemetry.attach(
+      id,
+      [:ferricstore, :server, :file_stream],
+      fn event, measurements, metadata, _config ->
+        send(test_pid, {:file_stream_event, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+  end
 
   # ---------------------------------------------------------------------------
   # Setup: generate certs + start TLS listener
@@ -182,6 +198,36 @@ defmodule FerricstoreServer.Integration.TlsTest do
 
       send_cmd(sock, ["GET", k])
       assert recv_response(sock) == nil
+
+      :ssl.close(sock)
+    end
+
+    test "large cold GET streams bounded file chunks over TLS", %{tls_port: port} do
+      attach_file_stream_handler(self())
+
+      sock = connect_tls_and_hello(port)
+      k = ukey("large_get_stream")
+      value = :binary.copy("T", Sendfile.threshold_bytes() + 131_072)
+
+      send_cmd(sock, ["SET", k, value])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :ssl.close(sock)
+      sock = connect_tls_and_hello(port)
+
+      send_cmd(sock, ["GET", k])
+      assert recv_response(sock) == value
+
+      size = byte_size(value)
+
+      assert_receive {:file_stream_event, [:ferricstore, :server, :file_stream],
+                      %{bytes: ^size, chunks: chunks}, %{result: :ok, transport: :ranch_ssl}},
+                     1000
+
+      assert chunks > 1
+
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock) == {:simple, "PONG"}
 
       :ssl.close(sock)
     end
@@ -385,6 +431,7 @@ defmodule FerricstoreServer.Integration.TlsTest do
       tcp_send(tcp_sock, ["CONFIG", "GET", "tls-*"])
       result = tcp_recv(tcp_sock)
       assert is_list(result)
+
       # Should have at least tls-port, tls-cert-file, tls-key-file, tls-ca-cert-file = 4 pairs = 8 elements
       assert length(result) >= 8
 

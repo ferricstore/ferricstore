@@ -1,8 +1,9 @@
 defmodule FerricstoreServer.Connection.Sendfile do
-  @moduledoc "Zero-copy sendfile optimization for large GET responses over ranch_tcp."
+  @moduledoc "Large cold-value response streaming for GET/MGET/GETRANGE."
 
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Store.Router
+  alias FerricstoreServer.Connection.Send, as: ConnSend
   alias FerricstoreServer.Connection.TcpOpts
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
 
@@ -12,11 +13,18 @@ defmodule FerricstoreServer.Connection.Sendfile do
                               65_536
                             )
 
+  @file_stream_chunk_bytes Application.compile_env(
+                             :ferricstore_server,
+                             :file_stream_chunk_bytes,
+                             65_536
+                           )
+
   @spec threshold_bytes() :: pos_integer()
   def threshold_bytes, do: @sendfile_threshold_bytes
 
   @doc """
-  Handles the GET command with sendfile optimization for `:ranch_tcp` transport.
+  Handles the GET command with sendfile optimization for `:ranch_tcp` transport
+  and bounded chunk streaming for encrypted transports.
   Falls back to normal dispatch for non-sendfile cases.
 
   The `dispatch_normal_fn` parameter is a function `(cmd, args, state) -> result`
@@ -79,12 +87,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
         encode_get_result(value, lookup_key, state)
 
       {:cold_ref, path, offset, size} when size >= @sendfile_threshold_bytes ->
-        handle_sendfile_result(
-          send_file_ref(key, path, offset, size, state),
-          key,
-          state,
-          dispatch_normal_fn
-        )
+        stream_large_get_ref(key, path, offset, size, state, dispatch_normal_fn)
 
       {:cold_ref, _path, _offset, _size} ->
         dispatch_normal_fn.("GET", [key], state)
@@ -95,6 +98,31 @@ defmodule FerricstoreServer.Connection.Sendfile do
       :miss ->
         dispatch_normal_fn.("GET", [key], state)
     end
+  end
+
+  defp stream_large_get_ref(
+         key,
+         path,
+         offset,
+         size,
+         %{transport: :ranch_tcp} = state,
+         dispatch_normal_fn
+       ) do
+    handle_sendfile_result(
+      send_file_ref(key, path, offset, size, state),
+      key,
+      state,
+      dispatch_normal_fn
+    )
+  end
+
+  defp stream_large_get_ref(key, path, offset, size, state, dispatch_normal_fn) do
+    handle_file_stream_result(
+      stream_file_ref(key, path, offset, size, state),
+      key,
+      state,
+      dispatch_normal_fn
+    )
   end
 
   defp encode_get_result(value, lookup_key, state) do
@@ -383,6 +411,98 @@ defmodule FerricstoreServer.Connection.Sendfile do
   defp handle_sendfile_result(:fallback, key, state, dispatch_normal_fn),
     do: dispatch_normal_fn.("GET", [key], state)
 
+  defp handle_file_stream_result({:sent, new_state}, _key, _state, _fn),
+    do: {:continue, "", new_state}
+
+  defp handle_file_stream_result({:error_after_header, _reason}, _key, state, _fn),
+    do: {:quit, "", state}
+
+  defp handle_file_stream_result(:fallback, key, state, dispatch_normal_fn),
+    do: dispatch_normal_fn.("GET", [key], state)
+
+  @doc false
+  def stream_file_ref(key, path, offset, size, state) do
+    result = do_stream_file_get(path, offset, size, state)
+    emit_file_stream_result(result, size, state)
+
+    case result do
+      {:sent, new_state, _chunks} ->
+        {:sent, ConnTracking.maybe_track_read("GET", [key], :file_stream_ok, new_state)}
+
+      :fallback ->
+        :fallback
+
+      {:error_after_header, reason, _chunks} ->
+        {:error_after_header, reason}
+    end
+  end
+
+  defp do_stream_file_get(path, offset, size, state) do
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          stream_file_get_open(fd, offset, size, state)
+        after
+          :file.close(fd)
+        end
+
+      {:error, _reason} ->
+        :fallback
+    end
+  end
+
+  defp stream_file_get_open(fd, offset, size, state) do
+    header = [?$, Integer.to_string(size), "\r\n"]
+
+    case ConnSend.send(state.socket, state.transport, header, :file_stream_header, %{
+           client_id: state.client_id
+         }) do
+      :ok ->
+        case stream_file_chunks(fd, offset, size, state, 0) do
+          {:ok, chunks} ->
+            case ConnSend.send(state.socket, state.transport, "\r\n", :file_stream_trailer, %{
+                   client_id: state.client_id
+                 }) do
+              :ok -> {:sent, state, chunks}
+              {:error, reason} -> {:error_after_header, reason, chunks}
+            end
+
+          {:error, reason, chunks} ->
+            {:error_after_header, reason, chunks}
+        end
+
+      {:error, _reason} ->
+        :fallback
+    end
+  end
+
+  defp stream_file_chunks(_fd, _offset, 0, _state, chunks), do: {:ok, chunks}
+
+  defp stream_file_chunks(fd, offset, remaining, state, chunks) do
+    read_size = min(remaining, @file_stream_chunk_bytes)
+
+    case :file.pread(fd, offset, read_size) do
+      {:ok, data} when is_binary(data) and byte_size(data) > 0 ->
+        sent = byte_size(data)
+
+        case ConnSend.send(state.socket, state.transport, data, :file_stream_chunk, %{
+               client_id: state.client_id
+             }) do
+          :ok -> stream_file_chunks(fd, offset + sent, remaining - sent, state, chunks + 1)
+          {:error, reason} -> {:error, reason, chunks}
+        end
+
+      {:ok, _empty} ->
+        {:error, :eof, chunks}
+
+      :eof ->
+        {:error, :eof, chunks}
+
+      {:error, reason} ->
+        {:error, reason, chunks}
+    end
+  end
+
   @doc false
   def send_file_ref(key, path, offset, size, state) do
     result = do_sendfile_get(key, path, offset, size, state, true)
@@ -472,6 +592,29 @@ defmodule FerricstoreServer.Connection.Sendfile do
       [:ferricstore, :server, :sendfile],
       %{bytes: size},
       Map.merge(%{result: result, client_id: state.client_id}, metadata)
+    )
+  end
+
+  defp emit_file_stream_result({:sent, _state, chunks}, size, state) do
+    emit_file_stream(:ok, size, chunks, state, %{})
+  end
+
+  defp emit_file_stream_result(:fallback, size, state) do
+    emit_file_stream(:fallback, size, 0, state, %{})
+  end
+
+  defp emit_file_stream_result({:error_after_header, reason, chunks}, size, state) do
+    emit_file_stream(:error_after_header, size, chunks, state, %{reason: reason})
+  end
+
+  defp emit_file_stream(result, size, chunks, state, metadata) do
+    :telemetry.execute(
+      [:ferricstore, :server, :file_stream],
+      %{bytes: size, chunks: chunks},
+      Map.merge(
+        %{result: result, client_id: state.client_id, transport: state.transport},
+        metadata
+      )
     )
   end
 
