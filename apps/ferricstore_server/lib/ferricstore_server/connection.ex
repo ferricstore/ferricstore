@@ -643,6 +643,60 @@ defmodule FerricstoreServer.Connection do
     {:continue, Encoder.encode(result), new_state}
   end
 
+  defp dispatch_store_command(
+         _cmd,
+         _args,
+         {:json_set, key, path, value, flags},
+         %FerricStore.Instance{} = store
+       ) do
+    Router.json_set(store, key, path, value, flags)
+  end
+
+  defp dispatch_store_command(
+         _cmd,
+         _args,
+         {:json_del, key, path},
+         %FerricStore.Instance{} = store
+       ) do
+    Router.json_del(store, key, path)
+  end
+
+  defp dispatch_store_command(
+         _cmd,
+         _args,
+         {:json_numincrby, key, path, increment},
+         %FerricStore.Instance{} = store
+       ) do
+    Router.json_numincrby(store, key, path, increment)
+  end
+
+  defp dispatch_store_command(
+         _cmd,
+         _args,
+         {:json_arrappend, key, path, values},
+         %FerricStore.Instance{} = store
+       ) do
+    Router.json_arrappend(store, key, path, values)
+  end
+
+  defp dispatch_store_command(
+         _cmd,
+         _args,
+         {:json_toggle, key, path},
+         %FerricStore.Instance{} = store
+       ) do
+    Router.json_toggle(store, key, path)
+  end
+
+  defp dispatch_store_command(
+         _cmd,
+         _args,
+         {:json_clear, key, path},
+         %FerricStore.Instance{} = store
+       ) do
+    Router.json_clear(store, key, path)
+  end
+
   defp dispatch_store_command(cmd, args, ast, store) do
     if ast_store_command?(ast) do
       Dispatcher.dispatch_ast(ast, store)

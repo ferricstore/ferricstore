@@ -147,10 +147,12 @@ defmodule Ferricstore.Raft.Batcher do
           | {:pfadd, binary(), [binary()]}
           | {:spop, binary(), nil | non_neg_integer()}
           | {:zpop, binary(), non_neg_integer(), :min | :max}
-          | {:json_set, binary(), binary(), binary(), list()}
-          | {:json_del, binary(), binary()}
-          | {:json_numincrby, binary(), binary(), number()}
-          | {:json_arrappend, binary(), binary(), [binary()]}
+          | {:json_set, binary(), binary() | list(), binary(), list()}
+          | {:json_del, binary(), binary() | list()}
+          | {:json_numincrby, binary(), binary() | list(), number()}
+          | {:json_arrappend, binary(), binary() | list(), [binary()]}
+          | {:json_toggle, binary(), binary() | list()}
+          | {:json_clear, binary(), binary() | list()}
           | {:cross_shard_tx, list()}
           | {:flow_create, binary(), map()}
           | {:flow_claim_due, binary(), map()}

@@ -94,8 +94,17 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
       sock = connect_and_hello(port)
       k = ukey("geo")
 
-      send_cmd(sock, ["GEOADD", k, "13.361389", "38.115556", "Palermo",
-                       "15.087269", "37.502669", "Catania"])
+      send_cmd(sock, [
+        "GEOADD",
+        k,
+        "13.361389",
+        "38.115556",
+        "Palermo",
+        "15.087269",
+        "37.502669",
+        "Catania"
+      ])
+
       assert recv_response(sock) == 2
 
       :gen_tcp.close(sock)
@@ -124,8 +133,17 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
       sock = connect_and_hello(port)
       k = ukey("geodist")
 
-      send_cmd(sock, ["GEOADD", k, "13.361389", "38.115556", "Palermo",
-                       "15.087269", "37.502669", "Catania"])
+      send_cmd(sock, [
+        "GEOADD",
+        k,
+        "13.361389",
+        "38.115556",
+        "Palermo",
+        "15.087269",
+        "37.502669",
+        "Catania"
+      ])
+
       assert recv_response(sock) == 2
 
       send_cmd(sock, ["GEODIST", k, "Palermo", "Catania", "km"])
@@ -160,8 +178,17 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
       sock = connect_and_hello(port)
       k = ukey("geosearch")
 
-      send_cmd(sock, ["GEOADD", k, "13.361389", "38.115556", "Palermo",
-                       "15.087269", "37.502669", "Catania"])
+      send_cmd(sock, [
+        "GEOADD",
+        k,
+        "13.361389",
+        "38.115556",
+        "Palermo",
+        "15.087269",
+        "37.502669",
+        "Catania"
+      ])
+
       assert recv_response(sock) == 2
 
       send_cmd(sock, ["GEOSEARCH", k, "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "ASC"])
@@ -179,12 +206,32 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
       src = ukey("geoss_src")
       dst = ukey("geoss_dst")
 
-      send_cmd(sock, ["GEOADD", src, "13.361389", "38.115556", "Palermo",
-                       "15.087269", "37.502669", "Catania"])
+      send_cmd(sock, [
+        "GEOADD",
+        src,
+        "13.361389",
+        "38.115556",
+        "Palermo",
+        "15.087269",
+        "37.502669",
+        "Catania"
+      ])
+
       assert recv_response(sock) == 2
 
-      send_cmd(sock, ["GEOSEARCHSTORE", dst, src, "FROMLONLAT", "15", "37",
-                       "BYRADIUS", "200", "km", "ASC"])
+      send_cmd(sock, [
+        "GEOSEARCHSTORE",
+        dst,
+        src,
+        "FROMLONLAT",
+        "15",
+        "37",
+        "BYRADIUS",
+        "200",
+        "km",
+        "ASC"
+      ])
+
       count = recv_response(sock)
       assert is_integer(count)
       assert count >= 1
@@ -478,6 +525,58 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
       assert recv_response(sock) == {:simple, "OK"}
 
       :gen_tcp.close(sock)
+    end
+
+    test "concurrent JSON.SET path updates over TCP preserve every field", %{port: port} do
+      sock = connect_and_hello(port)
+      k = ukey("jsonset_concurrent")
+      field_count = 50
+
+      root =
+        1..field_count
+        |> Map.new(fn i -> {"f#{i}", 0} end)
+        |> Jason.encode!()
+
+      send_cmd(sock, ["JSON.SET", k, "$", root])
+      assert recv_response(sock) == {:simple, "OK"}
+      :gen_tcp.close(sock)
+
+      parent = self()
+
+      tasks =
+        for i <- 1..field_count do
+          Task.async(fn ->
+            worker = connect_and_hello(port)
+            send(parent, {:ready, self()})
+
+            receive do
+              :go -> :ok
+            after
+              5_000 -> flunk("timed out waiting for concurrent JSON.SET release")
+            end
+
+            send_cmd(worker, ["JSON.SET", k, "$.f#{i}", Integer.to_string(i)])
+            response = recv_response(worker)
+            :gen_tcp.close(worker)
+            response
+          end)
+        end
+
+      for _ <- 1..field_count do
+        assert_receive {:ready, _pid}, 5_000
+      end
+
+      Enum.each(tasks, fn task -> send(task.pid, :go) end)
+
+      assert Enum.map(tasks, &Task.await(&1, 30_000)) ==
+               List.duplicate({:simple, "OK"}, field_count)
+
+      reader = connect_and_hello(port)
+      send_cmd(reader, ["JSON.GET", k])
+      final = recv_response(reader) |> Jason.decode!()
+      :gen_tcp.close(reader)
+
+      assert Map.new(1..field_count, fn i -> {"f#{i}", i} end) == final
     end
   end
 

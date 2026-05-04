@@ -628,6 +628,18 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
+  def apply(meta, {:json_toggle, key, path}, state) do
+    apply_pending_with_time(meta, state, fn ->
+      Json.handle_ast({:json_toggle, key, path}, build_string_value_store(state))
+    end)
+  end
+
+  def apply(meta, {:json_clear, key, path}, state) do
+    apply_pending_with_time(meta, state, fn ->
+      Json.handle_ast({:json_clear, key, path}, build_string_value_store(state))
+    end)
+  end
+
   def apply(meta, {:spop, key, count}, state) do
     apply_pending_with_time(meta, state, fn ->
       do_spop(state, key, count, Map.get(meta, :index, 0))
@@ -3090,6 +3102,14 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:json_arrappend, key, path, values}) do
     Json.handle_ast({:json_arrappend, key, path, values}, build_string_value_store(state))
+  end
+
+  defp apply_single(state, {:json_toggle, key, path}) do
+    Json.handle_ast({:json_toggle, key, path}, build_string_value_store(state))
+  end
+
+  defp apply_single(state, {:json_clear, key, path}) do
+    Json.handle_ast({:json_clear, key, path}, build_string_value_store(state))
   end
 
   defp apply_single(state, {:incr, key, delta}) do
@@ -6988,6 +7008,7 @@ defmodule Ferricstore.Raft.StateMachine do
       get_meta: fn key -> do_get_meta(state, key) end,
       batch_get: fn keys -> Enum.map(keys, &do_get(state, &1)) end,
       put: fn key, value, expire_at_ms -> do_put(state, key, value, expire_at_ms) end,
+      delete: fn key -> do_delete(state, key) end,
       exists?: fn key -> live_key?(state, key) end,
       compound_get: fn _redis_key, compound_key -> do_get(state, compound_key) end
     }

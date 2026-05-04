@@ -291,6 +291,10 @@ defmodule Ferricstore.Store.Router do
   def always_quorum?({:zpop, _, _, _}), do: true
   def always_quorum?({:json_set, _, _, _, _}), do: true
   def always_quorum?({:json_del, _, _}), do: true
+  def always_quorum?({:json_numincrby, _, _, _}), do: true
+  def always_quorum?({:json_arrappend, _, _, _}), do: true
+  def always_quorum?({:json_toggle, _, _}), do: true
+  def always_quorum?({:json_clear, _, _}), do: true
 
   # Probabilistic structures: results (e.g., Bloom "was it new?", TopK
   # evicted member, CMS post-increment count) are computed by the state
@@ -3244,25 +3248,36 @@ defmodule Ferricstore.Store.Router do
 
   @doc false
   def json_set(ctx, key, path, value, flags)
-      when is_binary(key) and is_binary(path) and is_binary(value) and is_list(flags) do
+      when is_binary(key) and (is_binary(path) or is_list(path)) and is_binary(value) and
+             is_list(flags) do
     forced_single_key_quorum(ctx, key, {:json_set, key, path, value, flags})
   end
 
   @doc false
-  def json_del(ctx, key, path) when is_binary(key) and is_binary(path) do
+  def json_del(ctx, key, path) when is_binary(key) and (is_binary(path) or is_list(path)) do
     forced_single_key_quorum(ctx, key, {:json_del, key, path})
   end
 
   @doc false
   def json_numincrby(ctx, key, path, increment)
-      when is_binary(key) and is_binary(path) and is_number(increment) do
+      when is_binary(key) and (is_binary(path) or is_list(path)) and is_number(increment) do
     forced_single_key_quorum(ctx, key, {:json_numincrby, key, path, increment})
   end
 
   @doc false
   def json_arrappend(ctx, key, path, values)
-      when is_binary(key) and is_binary(path) and is_list(values) do
+      when is_binary(key) and (is_binary(path) or is_list(path)) and is_list(values) do
     forced_single_key_quorum(ctx, key, {:json_arrappend, key, path, values})
+  end
+
+  @doc false
+  def json_toggle(ctx, key, path) when is_binary(key) and (is_binary(path) or is_list(path)) do
+    forced_single_key_quorum(ctx, key, {:json_toggle, key, path})
+  end
+
+  @doc false
+  def json_clear(ctx, key, path) when is_binary(key) and (is_binary(path) or is_list(path)) do
+    forced_single_key_quorum(ctx, key, {:json_clear, key, path})
   end
 
   defp forced_single_key_quorum(ctx, key, command) do
