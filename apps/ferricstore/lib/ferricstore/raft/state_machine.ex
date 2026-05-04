@@ -2499,7 +2499,9 @@ defmodule Ferricstore.Raft.StateMachine do
       keys = :ets.select(ctx.keydir, ms)
       Enum.each(keys, fn key -> delete_fn.(key) end)
     rescue
-      ArgumentError -> :ok
+      ArgumentError ->
+        emit_cross_shard_keydir_unavailable(ctx, :cross_shard_delete_prefix)
+        :ok
     end
 
     :ok

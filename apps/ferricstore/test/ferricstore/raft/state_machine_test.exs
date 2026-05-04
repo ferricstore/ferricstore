@@ -1726,6 +1726,17 @@ defmodule Ferricstore.Raft.StateMachineTest do
       end
     end
 
+    test "cross-shard prefix delete reports unavailable keydirs" do
+      source =
+        File.read!(Path.expand("../../../lib/ferricstore/raft/state_machine.ex", __DIR__))
+
+      [_, body] = String.split(source, "defp cross_shard_delete_prefix", parts: 2)
+      body = body |> String.split("defp sm_file_path_from_path", parts: 2) |> hd()
+
+      assert body =~ "emit_cross_shard_keydir_unavailable(ctx, :cross_shard_delete_prefix)",
+             "cross_shard_delete_prefix/3 must emit shard_unavailable before returning :ok on a missing ETS keydir"
+    end
+
     test "stamped ratelimit ignores legacy embedded now_ms", %{
       state: state,
       ets: ets
