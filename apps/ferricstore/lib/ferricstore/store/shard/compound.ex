@@ -138,39 +138,70 @@ defmodule Ferricstore.Store.Shard.Compound do
     if entries == [] do
       []
     else
-      locations =
-        Enum.map(entries, fn {_state, compound_key, file_path, _fid, off, _vsize, _exp} ->
-          {file_path, off, compound_key}
-        end)
+      {unique_entries, value_indexes} = dedupe_compound_cold_batch_entries(entries)
+      unique_values = read_unique_compound_cold_batch_async(unique_entries) |> List.to_tuple()
 
-      values =
-        case Ferricstore.Store.ColdRead.pread_batch_keyed(
-               locations,
-               @cold_batch_read_timeout_ms
-             ) do
-          {:ok, values} when is_list(values) ->
-            if length(values) == length(entries) do
-              values
-            else
-              List.duplicate({:error, :batch_result_length_mismatch}, length(entries))
-            end
-
-          {:error, reason} ->
-            List.duplicate({:error, reason}, length(entries))
-        end
-
-      emit_compound_batch_cold_read_errors(entries, values)
-
-      Enum.zip(entries, values)
-      |> Enum.map(fn
-        {{state, compound_key, _file_path, fid, off, vsize, exp}, value} when is_binary(value) ->
-          ShardETS.cold_read_warm_ets(state, compound_key, value, exp, fid, off, vsize)
-          value
-
-        {_entry, _value} ->
-          nil
-      end)
+      Enum.map(value_indexes, fn index -> elem(unique_values, index) end)
     end
+  end
+
+  defp dedupe_compound_cold_batch_entries(entries) do
+    {unique_entries, _index_by_location, value_indexes} =
+      Enum.reduce(entries, {[], %{}, []}, fn entry, {unique_acc, index_acc, value_index_acc} ->
+        location = compound_cold_batch_entry_location(entry)
+
+        case Map.fetch(index_acc, location) do
+          {:ok, index} ->
+            {unique_acc, index_acc, [index | value_index_acc]}
+
+          :error ->
+            index = map_size(index_acc)
+            {[entry | unique_acc], Map.put(index_acc, location, index), [index | value_index_acc]}
+        end
+      end)
+
+    {Enum.reverse(unique_entries), Enum.reverse(value_indexes)}
+  end
+
+  defp compound_cold_batch_entry_location(
+         {_state, compound_key, file_path, _fid, off, _vsize, _exp}
+       ) do
+    {file_path, off, compound_key}
+  end
+
+  defp read_unique_compound_cold_batch_async(entries) do
+    locations =
+      Enum.map(entries, fn {_state, compound_key, file_path, _fid, off, _vsize, _exp} ->
+        {file_path, off, compound_key}
+      end)
+
+    values =
+      case Ferricstore.Store.ColdRead.pread_batch_keyed(
+             locations,
+             @cold_batch_read_timeout_ms
+           ) do
+        {:ok, values} when is_list(values) ->
+          if length(values) == length(entries) do
+            values
+          else
+            List.duplicate({:error, :batch_result_length_mismatch}, length(entries))
+          end
+
+        {:error, reason} ->
+          List.duplicate({:error, reason}, length(entries))
+      end
+
+    emit_compound_batch_cold_read_errors(entries, values)
+
+    Enum.zip(entries, values)
+    |> Enum.map(fn
+      {{state, compound_key, _file_path, fid, off, vsize, exp}, value} when is_binary(value) ->
+        ShardETS.cold_read_warm_ets(state, compound_key, value, exp, fid, off, vsize)
+        value
+
+      {_entry, _value} ->
+        nil
+    end)
   end
 
   defp emit_compound_batch_cold_read_errors(entries, values) do

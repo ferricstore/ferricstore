@@ -8,7 +8,7 @@ defmodule Ferricstore.Store.CompoundBatchColdGuardTest do
 
   test "compound batch cold reads use the async keyed batch pread path" do
     ast = compound_ast()
-    batch_reader_body = function_body(ast, :read_compound_cold_batch_async, 1)
+    batch_reader_body = function_body(ast, :read_unique_compound_cold_batch_async, 1)
 
     # HMGET/ZMSCORE/SMISMEMBER-style commands can read many cold large fields.
     # The shared compound batch path must submit those cold reads together
@@ -22,6 +22,18 @@ defmodule Ferricstore.Store.CompoundBatchColdGuardTest do
              2
            ),
            "expected Shard.Compound batch get path to use ColdRead.pread_batch_keyed/2"
+  end
+
+  test "compound batch cold reads deduplicate repeated physical locations" do
+    ast = compound_ast()
+    batch_reader_body = function_body(ast, :read_compound_cold_batch_async, 1)
+
+    # Commands such as HMGET/ZMSCORE may legally repeat fields. When repeated
+    # fields are cold large values, the reader should submit one physical pread
+    # for each unique {path, offset, key} and expand that value back into every
+    # requested position.
+    assert contains_local_call?(batch_reader_body, :dedupe_compound_cold_batch_entries, 1),
+           "expected compound batch cold reads to deduplicate duplicate cold locations"
   end
 
   test "promoted compound batch reads use a dedicated batch cold path" do
