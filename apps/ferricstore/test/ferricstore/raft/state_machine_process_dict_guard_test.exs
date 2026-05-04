@@ -20,5 +20,8 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
 
     assert body =~ "Process.delete(:sm_checkpoint_clean_before_write)",
            "stale shard-clean state can release a Ra cursor after a crashed apply"
+
+    assert body =~ "Process.delete(:sm_checkpoint_dirty_indices)",
+           "stale dirty checkpoint indices can block or misdirect the next release decision"
   end
 end
