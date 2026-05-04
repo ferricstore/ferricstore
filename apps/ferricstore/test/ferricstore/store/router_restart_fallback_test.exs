@@ -82,6 +82,27 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
     assert_keydir_unavailable_event(:exists)
   end
 
+  test "get_version falls back to shared counter and reports unavailable shard" do
+    ctx = unavailable_ctx()
+    handler_id = {__MODULE__, make_ref()}
+
+    :counters.add(ctx.write_version, 1, 7)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :store, :shard_unavailable],
+        &__MODULE__.handle_telemetry/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert 7 == Router.get_version(ctx, "restart:version")
+
+    assert_unavailable_event(:get_version)
+  end
+
   test "unavailable shard fallbacks emit telemetry" do
     ctx = unavailable_ctx()
     handler_id = {__MODULE__, make_ref()}

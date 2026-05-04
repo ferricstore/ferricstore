@@ -3367,7 +3367,19 @@ defmodule Ferricstore.Store.Router do
   """
   @spec get_version(FerricStore.Instance.t(), binary()) :: non_neg_integer()
   def get_version(ctx, key) do
-    GenServer.call(resolve_shard(ctx, shard_for(ctx, key)), {:get_version, key})
+    idx = shard_for(ctx, key)
+
+    case safe_read_call(ctx, idx, {:get_version, key}) do
+      {:ok, version} -> version
+      :unavailable -> shared_write_version(ctx, idx)
+    end
+  end
+
+  defp shared_write_version(%{write_version: write_version}, idx) do
+    size = :counters.info(write_version).size
+    if idx < size, do: :counters.get(write_version, idx + 1), else: 0
+  rescue
+    _ -> 0
   end
 
   @doc """
