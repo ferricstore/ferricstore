@@ -550,6 +550,37 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       )
     end
 
+    @tag timeout: 120_000
+    test "batch async PUT origin replay does not overwrite later INCRs" do
+      key = ukey("batch_origin_then_incr")
+      :ok = Router.batch_async_put(ctx(), [{key, "0"}])
+
+      tasks =
+        for _ <- 1..25 do
+          Task.async(fn ->
+            for _ <- 1..40 do
+              incr_with_retry(ctx(), key, 1)
+            end
+          end)
+        end
+
+      results = Task.await_many(tasks, 90_000) |> List.flatten()
+
+      assert Enum.all?(results, fn
+               {:ok, n} when is_integer(n) -> true
+               _ -> false
+             end)
+
+      assert results |> Enum.map(fn {:ok, n} -> n end) |> Enum.sort() == Enum.to_list(1..1000)
+
+      Ferricstore.Test.Utils.eventually(
+        fn ->
+          assert Router.get(ctx(), key) == "1000"
+        end,
+        5000
+      )
+    end
+
     test "concurrent APPENDs produce a string of the correct total length" do
       key = ukey("concurrent_append")
 

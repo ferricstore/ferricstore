@@ -61,6 +61,31 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
     |> Enum.flat_map(fn slot -> Enum.reverse(slot.cmds) end)
   end
 
+  describe "origin replay safety" do
+    test "compound put/delete submit origin-checked commands" do
+      source =
+        Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__)
+        |> File.read!()
+
+      assert source =~ "origin_checked_command("
+      assert source =~ "{:put, compound_key, value, expire_at_ms}"
+
+      assert source =~
+               "async_enqueue_to_raft(idx, raft_cmd)",
+             """
+             compound_put must not submit raw {:put, compound_key, value, exp} origin commands.
+             A delayed origin replay can overwrite newer compound values.
+             """
+
+      assert source =~
+               "origin_checked_command(compound_key, {:delete, compound_key}, previous, nil, 0)",
+             """
+             compound_delete must not submit raw {:delete, compound_key} origin commands.
+             A delayed origin replay can delete newer compound values.
+             """
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Single-caller correctness — HSET + HGET
   # ---------------------------------------------------------------------------
@@ -317,7 +342,7 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       source = File.read!("lib/ferricstore/store/router.ex")
 
       assert source =~
-               ~r/async_enqueue_to_raft\(idx, \{:put, compound_key, value, expire_at_ms\}\).*install_async_put_value\(ctx, idx, compound_key, value, expire_at_ms\)/s,
+               ~r/async_enqueue_to_raft\(idx, raft_cmd\).*install_async_put_value\(ctx, idx, compound_key, value, expire_at_ms\)/s,
              "small async compound PUT must not publish locally before Raft accepts the command"
     end
 

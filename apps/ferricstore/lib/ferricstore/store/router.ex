@@ -2492,11 +2492,9 @@ defmodule Ferricstore.Store.Router do
         keydir = elem(ctx.keydir_refs, idx)
         effective_kvs = dedupe_last_kvs(shard_kvs)
 
-        {entries, raft_cmds, large_disk_batch} =
-          Enum.reduce(effective_kvs, {[], [], []}, fn {key, value},
-                                                      {entry_acc, raft_acc, disk_acc} ->
+        {entries, large_disk_batch} =
+          Enum.reduce(effective_kvs, {[], []}, fn {key, value}, {entry_acc, disk_acc} ->
             value_for_ets = if byte_size(value) > hot_max, do: nil, else: value
-            raft_cmd = {:put, key, value, 0}
 
             disk_acc =
               if value_for_ets == nil do
@@ -2505,14 +2503,14 @@ defmodule Ferricstore.Store.Router do
                 disk_acc
               end
 
-            {[{key, value, value_for_ets} | entry_acc], [raft_cmd | raft_acc], disk_acc}
+            {[{key, value, value_for_ets} | entry_acc], disk_acc}
           end)
 
-        {idx, keydir, shard_kvs, Enum.reverse(entries), Enum.reverse(raft_cmds), large_disk_batch}
+        {idx, keydir, shard_kvs, Enum.reverse(entries), large_disk_batch}
       end)
 
     locks =
-      for {idx, _keydir, _shard_kvs, entries, _raft_cmds, _large_disk_batch} <- shard_batches,
+      for {idx, _keydir, _shard_kvs, entries, _large_disk_batch} <- shard_batches,
           {key, _value, _value_for_ets} <- entries do
         {idx, key}
       end
@@ -2521,8 +2519,7 @@ defmodule Ferricstore.Store.Router do
 
     try do
       overloaded? =
-        Enum.any?(shard_batches, fn {idx, _keydir, _shard_kvs, _entries, _raft_cmds,
-                                     _large_disk_batch} ->
+        Enum.any?(shard_batches, fn {idx, _keydir, _shard_kvs, _entries, _large_disk_batch} ->
           not Ferricstore.Raft.Batcher.async_accepting?(idx)
         end)
 
@@ -2531,8 +2528,7 @@ defmodule Ferricstore.Store.Router do
       large_previous = snapshot_batch_large_values(ctx, shard_batches)
 
       disk_locations =
-        Enum.reduce(shard_batches, %{}, fn {idx, _keydir, _shard_kvs, _entries, _raft_cmds,
-                                            large_disk_batch},
+        Enum.reduce(shard_batches, %{}, fn {idx, _keydir, _shard_kvs, _entries, large_disk_batch},
                                            acc ->
           if large_disk_batch == [] do
             acc
@@ -2555,9 +2551,11 @@ defmodule Ferricstore.Store.Router do
           end
         end)
 
-      Enum.reduce(shard_batches, MapSet.new(), fn {idx, _keydir, _shard_kvs, _entries, raft_cmds,
+      Enum.reduce(shard_batches, MapSet.new(), fn {idx, _keydir, _shard_kvs, entries,
                                                    _large_disk_batch},
                                                   accepted_idxs ->
+        raft_cmds = build_origin_checked_batch_put_commands(ctx, idx, entries)
+
         case async_submit_batch_to_raft(idx, raft_cmds) do
           :ok ->
             MapSet.put(accepted_idxs, idx)
@@ -2573,7 +2571,7 @@ defmodule Ferricstore.Store.Router do
         end
       end)
 
-      Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, _raft_cmds, _large_disk_batch} ->
+      Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, _large_disk_batch} ->
         shard_locations = Map.get(disk_locations, idx, %{})
         install_batch_async_entries(ctx, idx, keydir, entries, shard_locations, lfu_val)
 
@@ -2654,12 +2652,18 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp snapshot_batch_large_values(ctx, shard_batches) do
-    Enum.reduce(shard_batches, %{}, fn {idx, _keydir, _shard_kvs, _entries, _raft_cmds,
-                                        large_disk_batch},
+    Enum.reduce(shard_batches, %{}, fn {idx, _keydir, _shard_kvs, _entries, large_disk_batch},
                                        acc ->
       Enum.reduce(large_disk_batch, acc, fn {key, _value, _expire_at_ms}, snapshot_acc ->
         Map.put(snapshot_acc, {idx, key}, snapshot_live_value(ctx, idx, key))
       end)
+    end)
+  end
+
+  defp build_origin_checked_batch_put_commands(ctx, idx, entries) do
+    Enum.map(entries, fn {key, value, _value_for_ets} ->
+      previous = snapshot_live_value(ctx, idx, key)
+      origin_checked_command(key, {:put, key, value, 0}, previous, value, 0)
     end)
   end
 
@@ -3975,13 +3979,22 @@ defmodule Ferricstore.Store.Router do
     if under_pressure do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
-      if large_value_for_hot_cache?(ctx, value) do
-        previous = snapshot_live_value(ctx, idx, compound_key)
+      previous = snapshot_live_value(ctx, idx, compound_key)
 
+      raft_cmd =
+        origin_checked_command(
+          compound_key,
+          {:put, compound_key, value, expire_at_ms},
+          previous,
+          value,
+          expire_at_ms
+        )
+
+      if large_value_for_hot_cache?(ctx, value) do
         # Large cold values need a durable local file location before ETS can
         # point readers at them. Keep disk-first, then roll back if Raft rejects.
         with :ok <- install_async_put_value(ctx, idx, compound_key, value, expire_at_ms) do
-          case async_enqueue_to_raft(idx, {:put, compound_key, value, expire_at_ms}) do
+          case async_enqueue_to_raft(idx, raft_cmd) do
             :ok ->
               bump_write_version(ctx, idx)
               :ok
@@ -3994,7 +4007,7 @@ defmodule Ferricstore.Store.Router do
       else
         # Small values do not need a disk location before publication, so match
         # plain async SET: do not expose a value until Raft accepts the command.
-        with :ok <- async_enqueue_to_raft(idx, {:put, compound_key, value, expire_at_ms}),
+        with :ok <- async_enqueue_to_raft(idx, raft_cmd),
              :ok <- install_async_put_value(ctx, idx, compound_key, value, expire_at_ms) do
           bump_write_version(ctx, idx)
           :ok
@@ -4016,7 +4029,10 @@ defmodule Ferricstore.Store.Router do
     if under_pressure do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
-      with :ok <- async_enqueue_to_raft(idx, {:delete, compound_key}) do
+      previous = snapshot_live_value(ctx, idx, compound_key)
+      raft_cmd = origin_checked_command(compound_key, {:delete, compound_key}, previous, nil, 0)
+
+      with :ok <- async_enqueue_to_raft(idx, raft_cmd) do
         keydir = elem(ctx.keydir_refs, idx)
         track_keydir_binary_delete(ctx, idx, keydir, compound_key)
         :ets.delete(keydir, compound_key)

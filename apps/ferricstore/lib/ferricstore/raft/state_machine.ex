@@ -2539,7 +2539,13 @@ defmodule Ferricstore.Raft.StateMachine do
            expire_at_ms
          ) do
       :already_applied ->
-        :ok
+        maybe_queue_already_applied_origin_put(
+          state,
+          key,
+          inner_cmd,
+          expected_value,
+          expire_at_ms
+        )
 
       :apply ->
         apply_single(state, inner_cmd)
@@ -2895,6 +2901,32 @@ defmodule Ferricstore.Raft.StateMachine do
       _ ->
         :ok
     end
+  end
+
+  defp maybe_queue_already_applied_origin_put(
+         state,
+         key,
+         {:put, _key, value, expire_at_ms},
+         expected_value,
+         expire_at_ms
+       ) do
+    case :ets.lookup(state.ets, key) do
+      [{^key, ^expected_value, ^expire_at_ms, _lfu, :pending, _off, _value_size}] ->
+        queue_pending_put(key, to_disk_binary(value), expire_at_ms)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp maybe_queue_already_applied_origin_put(
+         _state,
+         _key,
+         _inner_cmd,
+         _expected_value,
+         _expire_at_ms
+       ) do
+    :ok
   end
 
   defp apply_origin_async_put(state, key, value, expire_at_ms) do

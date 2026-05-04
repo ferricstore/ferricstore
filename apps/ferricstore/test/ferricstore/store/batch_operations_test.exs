@@ -30,6 +30,19 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   # ---------------------------------------------------------------------------
 
   describe "batch_async_put" do
+    test "submits origin-checked PUT commands for stale replay safety" do
+      source =
+        Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__)
+        |> File.read!()
+
+      assert source =~
+               "origin_checked_command(key, {:put, key, value, 0}, previous, value, 0)",
+             """
+             batch_async_put must not submit raw {:put, key, value, 0} origin commands.
+             A delayed origin replay of the raw PUT can overwrite later local RMW writes.
+             """
+    end
+
     test "all-small batch: values readable immediately" do
       kvs = for i <- 1..20, do: {"#{@ns_async}:bap_small_#{i}", "val_#{i}"}
       :ok = Router.batch_async_put(default_ctx(), kvs)
