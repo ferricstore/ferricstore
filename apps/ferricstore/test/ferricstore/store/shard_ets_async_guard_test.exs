@@ -8,8 +8,11 @@ defmodule Ferricstore.Store.ShardETSAsyncGuardTest do
 
     # RMW and compound read helpers use these warm paths. Keep disk reads on the
     # async NIF path so a cold value does not block a Normal scheduler.
-    assert source =~ "NIF.v2_pread_at_async",
-           "expected Shard.ETS warm helpers to use v2_pread_at_async/4"
+    assert source =~ "ColdRead.pread_batch_keyed",
+           "expected Shard.ETS prefix warm helpers to use keyed batched async cold reads"
+
+    assert source =~ "ColdRead.pread_at",
+           "expected Shard.ETS point warm helper to use ColdRead async wrapper"
 
     refute Regex.match?(~r/NIF\.v2_pread_at\(/, source),
            "expected Shard.ETS warm helpers to avoid blocking v2_pread_at/2"

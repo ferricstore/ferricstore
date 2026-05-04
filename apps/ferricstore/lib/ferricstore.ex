@@ -51,6 +51,25 @@ defmodule FerricStore do
   end
 
   alias Ferricstore.HLC
+
+  alias Ferricstore.Commands.{
+    Bitmap,
+    Bloom,
+    CMS,
+    Cuckoo,
+    Expiry,
+    Generic,
+    Geo,
+    Hash,
+    HyperLogLog,
+    Json,
+    Set,
+    SortedSet,
+    Strings,
+    TDigest,
+    TopK
+  }
+
   alias Ferricstore.Store.Router
 
   # Transitional: resolve ctx from the :default instance.
@@ -328,7 +347,7 @@ defmodule FerricStore do
   end
 
   def get(key, _opts) do
-    case Ferricstore.Commands.Strings.handle("GET", [key], build_string_store(key)) do
+    case Strings.handle_ast({:get, key}, build_string_store(key)) do
       {:error, _} = err -> err
       value -> {:ok, value}
     end
@@ -361,7 +380,7 @@ defmodule FerricStore do
   def del(keys) when is_list(keys) do
     store = build_compound_store(hd(keys))
 
-    case Ferricstore.Commands.Strings.handle("DEL", keys, store) do
+    case Strings.handle_ast({:del, keys}, store) do
       {:error, _} = err -> err
       count -> {:ok, count}
     end
@@ -592,7 +611,7 @@ defmodule FerricStore do
   """
   @spec strlen(key()) :: {:ok, non_neg_integer()}
   def strlen(key) do
-    case Ferricstore.Commands.Strings.handle("STRLEN", [key], build_string_store(key)) do
+    case Strings.handle_ast({:strlen, key}, build_string_store(key)) do
       {:error, _} = err -> err
       len -> {:ok, len}
     end
@@ -694,7 +713,7 @@ defmodule FerricStore do
 
     case expire_at_ms do
       nil ->
-        case Ferricstore.Commands.Strings.handle("GETEX", [key], build_string_store(key)) do
+        case Strings.handle_ast({:getex, key}, build_string_store(key)) do
           {:error, _} = err -> err
           result -> {:ok, result}
         end
@@ -797,11 +816,7 @@ defmodule FerricStore do
   """
   @spec getrange(key(), integer(), integer()) :: {:ok, binary()}
   def getrange(key, start, stop) do
-    case Ferricstore.Commands.Strings.handle(
-           "GETRANGE",
-           [key, to_string(start), to_string(stop)],
-           build_string_store(key)
-         ) do
+    case Strings.handle_ast({:getrange, key, start, stop}, build_string_store(key)) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end
@@ -910,7 +925,7 @@ defmodule FerricStore do
     args =
       Enum.flat_map(fields, fn {k, v} -> [to_string(k), to_string(v)] end)
 
-    case Ferricstore.Commands.Hash.handle("HSET", [key | args], store) do
+    case Hash.handle_ast({:hset, [key | args]}, store) do
       {:error, _} = err -> err
       _count -> :ok
     end
@@ -939,7 +954,7 @@ defmodule FerricStore do
   def hget(key, field) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Hash.handle("HGET", [key, to_string(field)], store) do
+    case Hash.handle_ast({:hget, key, to_string(field)}, store) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end
@@ -965,7 +980,7 @@ defmodule FerricStore do
   def hgetall(key) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Hash.handle("HGETALL", [key], store) do
+    case Hash.handle_ast({:hgetall, key}, store) do
       {:error, _} = err ->
         err
 
@@ -1163,7 +1178,7 @@ defmodule FerricStore do
   def sadd(key, members) when is_list(members) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Set.handle("SADD", [key | members], store) do
+    case Set.handle_ast({:sadd, [key | members]}, store) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end
@@ -1189,7 +1204,7 @@ defmodule FerricStore do
   def srem(key, members) when is_list(members) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Set.handle("SREM", [key | members], store) do
+    case Set.handle_ast({:srem, [key | members]}, store) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end
@@ -1216,7 +1231,7 @@ defmodule FerricStore do
   def smembers(key) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Set.handle("SMEMBERS", [key], store) do
+    case Set.handle_ast({:smembers, key}, store) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end
@@ -1245,7 +1260,7 @@ defmodule FerricStore do
   def sismember(key, member) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Set.handle("SISMEMBER", [key, member], store) do
+    case Set.handle_ast({:sismember, key, member}, store) do
       {:error, _} = err -> err
       result -> {:ok, result == 1}
     end
@@ -1270,7 +1285,7 @@ defmodule FerricStore do
   def scard(key) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Set.handle("SCARD", [key], store) do
+    case Set.handle_ast({:scard, key}, store) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end
@@ -1301,13 +1316,9 @@ defmodule FerricStore do
   def zadd(key, score_member_pairs) when is_list(score_member_pairs) do
     store = build_compound_store(key)
 
-    # Build the ZADD args: key score1 member1 score2 member2 ...
-    args =
-      Enum.flat_map(score_member_pairs, fn {score, member} ->
-        [to_string(score * 1.0), member]
-      end)
+    pairs = Enum.map(score_member_pairs, fn {score, member} -> {score * 1.0, member} end)
 
-    case Ferricstore.Commands.SortedSet.handle("ZADD", [key | args], store) do
+    case SortedSet.handle_ast({:zadd, key, [], pairs}, store) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end
@@ -1344,10 +1355,7 @@ defmodule FerricStore do
     store = build_compound_store(key)
     with_scores = Keyword.get(opts, :withscores, false)
 
-    args = [key, to_string(start), to_string(stop)]
-    args = if with_scores, do: args ++ ["WITHSCORES"], else: args
-
-    case Ferricstore.Commands.SortedSet.handle("ZRANGE", args, store) do
+    case SortedSet.handle_ast({:zrange, key, start, stop, with_scores}, store) do
       {:error, _} = err ->
         err
 
@@ -1387,7 +1395,7 @@ defmodule FerricStore do
   def zscore(key, member) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.SortedSet.handle("ZSCORE", [key, member], store) do
+    case SortedSet.handle_ast({:zscore, key, member}, store) do
       {:error, _} = err ->
         err
 
@@ -1419,7 +1427,7 @@ defmodule FerricStore do
   def zcard(key) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.SortedSet.handle("ZCARD", [key], store) do
+    case SortedSet.handle_ast({:zcard, key}, store) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end
@@ -1445,7 +1453,7 @@ defmodule FerricStore do
   def zrem(key, members) when is_list(members) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.SortedSet.handle("ZREM", [key | members], store) do
+    case SortedSet.handle_ast({:zrem, [key | members]}, store) do
       {:error, _} = err -> err
       result -> {:ok, result}
     end
@@ -1596,7 +1604,7 @@ defmodule FerricStore do
   """
   @spec exists(key()) :: boolean()
   def exists(key) do
-    Ferricstore.Commands.Strings.handle("EXISTS", [key], build_compound_store(key)) == 1
+    Strings.handle_ast({:exists, [key]}, build_compound_store(key)) == 1
   end
 
   @doc """
@@ -1707,11 +1715,7 @@ defmodule FerricStore do
   """
   @spec expire(key(), non_neg_integer()) :: {:ok, boolean()}
   def expire(key, ttl_ms) when is_integer(ttl_ms) and ttl_ms > 0 do
-    case Ferricstore.Commands.Expiry.handle(
-           "PEXPIRE",
-           [key, to_string(ttl_ms)],
-           build_compound_store(key)
-         ) do
+    case Expiry.handle_ast({:pexpire, key, ttl_ms}, build_compound_store(key)) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -1743,7 +1747,7 @@ defmodule FerricStore do
   """
   @spec ttl(key()) :: {:ok, non_neg_integer() | nil}
   def ttl(key) do
-    case Ferricstore.Commands.Expiry.handle("PTTL", [key], build_compound_store(key)) do
+    case Expiry.handle_ast({:pttl, key}, build_compound_store(key)) do
       ttl_ms when ttl_ms < 0 -> {:ok, nil}
       ttl_ms -> {:ok, ttl_ms}
     end
@@ -1783,9 +1787,8 @@ defmodule FerricStore do
   @spec copy(key(), key(), keyword()) :: {:ok, boolean()} | {:error, binary()}
   def copy(source, destination, opts \\ []) do
     replace = Keyword.get(opts, :replace, false)
-    args = [source, destination] ++ if replace, do: ["REPLACE"], else: []
 
-    case Ferricstore.Commands.Generic.handle("COPY", args, %{}) do
+    case Generic.handle_ast({:copy, source, destination, replace}, %{}) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -1815,11 +1818,7 @@ defmodule FerricStore do
   """
   @spec rename(key(), key()) :: :ok | {:error, binary()}
   def rename(source, destination) do
-    Ferricstore.Commands.Generic.handle(
-      "RENAME",
-      [source, destination],
-      %{}
-    )
+    Generic.handle_ast({:rename, source, destination}, %{})
   end
 
   @doc """
@@ -1848,11 +1847,7 @@ defmodule FerricStore do
   """
   @spec renamenx(key(), key()) :: {:ok, boolean()} | {:error, binary()}
   def renamenx(source, destination) do
-    case Ferricstore.Commands.Generic.handle(
-           "RENAMENX",
-           [source, destination],
-           %{}
-         ) do
+    case Generic.handle_ast({:renamenx, source, destination}, %{}) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -1983,7 +1978,7 @@ defmodule FerricStore do
   """
   @spec persist(key()) :: {:ok, boolean()}
   def persist(key) do
-    case Ferricstore.Commands.Expiry.handle("PERSIST", [key], build_compound_store(key)) do
+    case Expiry.handle_ast({:persist, key}, build_compound_store(key)) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -2028,11 +2023,7 @@ defmodule FerricStore do
   """
   @spec expireat(key(), non_neg_integer()) :: {:ok, boolean()}
   def expireat(key, unix_ts_seconds) do
-    case Ferricstore.Commands.Expiry.handle(
-           "EXPIREAT",
-           [key, to_string(unix_ts_seconds)],
-           build_compound_store(key)
-         ) do
+    case Expiry.handle_ast({:expireat, key, unix_ts_seconds}, build_compound_store(key)) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -2058,11 +2049,7 @@ defmodule FerricStore do
   """
   @spec pexpireat(key(), non_neg_integer()) :: {:ok, boolean()}
   def pexpireat(key, unix_ts_ms) do
-    case Ferricstore.Commands.Expiry.handle(
-           "PEXPIREAT",
-           [key, to_string(unix_ts_ms)],
-           build_compound_store(key)
-         ) do
+    case Expiry.handle_ast({:pexpireat, key, unix_ts_ms}, build_compound_store(key)) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -2094,7 +2081,7 @@ defmodule FerricStore do
   """
   @spec expiretime(key()) :: {:ok, integer()}
   def expiretime(key) do
-    {:ok, Ferricstore.Commands.Generic.handle("EXPIRETIME", [key], build_compound_store(key))}
+    {:ok, Generic.handle_ast({:expiretime, key}, build_compound_store(key))}
   end
 
   @doc """
@@ -2122,7 +2109,7 @@ defmodule FerricStore do
   """
   @spec pexpiretime(key()) :: {:ok, integer()}
   def pexpiretime(key) do
-    {:ok, Ferricstore.Commands.Generic.handle("PEXPIRETIME", [key], build_compound_store(key))}
+    {:ok, Generic.handle_ast({:pexpiretime, key}, build_compound_store(key))}
   end
 
   @doc """
@@ -2187,7 +2174,7 @@ defmodule FerricStore do
   @spec getbit(key(), non_neg_integer()) :: {:ok, 0 | 1}
   def getbit(key, offset) do
     store = build_string_store(key)
-    result = Ferricstore.Commands.Bitmap.handle("GETBIT", [key, to_string(offset)], store)
+    result = Bitmap.handle_ast({:getbit, key, offset}, store)
     wrap_result(result)
   end
 
@@ -2214,14 +2201,14 @@ defmodule FerricStore do
     start = Keyword.get(opts, :start)
     stop = Keyword.get(opts, :stop)
 
-    args =
+    ast =
       if start != nil and stop != nil do
-        [key, to_string(start), to_string(stop)]
+        {:bitcount, key, {start, stop, :byte}}
       else
-        [key]
+        {:bitcount, key}
       end
 
-    result = Ferricstore.Commands.Bitmap.handle("BITCOUNT", args, store)
+    result = Bitmap.handle_ast(ast, store)
     wrap_result(result)
   end
 
@@ -2246,8 +2233,18 @@ defmodule FerricStore do
   """
   @spec bitop(atom(), key(), [key()]) :: {:ok, non_neg_integer()}
   def bitop(op, dest_key, source_keys) when is_atom(op) and is_list(source_keys) do
-    op_str = op |> Atom.to_string() |> String.upcase()
-    wrap_result(Router.bitmap_op(default_ctx(), "BITOP", [op_str, dest_key | source_keys]))
+    ast_op =
+      case op do
+        :and -> :band
+        :or -> :bor
+        :xor -> :bxor
+        :not -> :bnot
+        _ -> op
+      end
+
+    wrap_result(
+      Bitmap.handle_ast({:bitop, ast_op, dest_key, source_keys}, build_string_store(dest_key))
+    )
   end
 
   @doc """
@@ -2273,19 +2270,19 @@ defmodule FerricStore do
     start = Keyword.get(opts, :start)
     stop = Keyword.get(opts, :stop)
 
-    args =
+    ast =
       cond do
         start != nil and stop != nil ->
-          [key, to_string(bit_value), to_string(start), to_string(stop)]
+          {:bitpos, key, bit_value, {start, stop, :byte}}
 
         start != nil ->
-          [key, to_string(bit_value), to_string(start)]
+          {:bitpos, key, bit_value, {:start, start}}
 
         true ->
-          [key, to_string(bit_value)]
+          {:bitpos, key, bit_value, :all}
       end
 
-    result = Ferricstore.Commands.Bitmap.handle("BITPOS", args, store)
+    result = Bitmap.handle_ast(ast, store)
     wrap_result(result)
   end
 
@@ -2314,7 +2311,7 @@ defmodule FerricStore do
     store = build_compound_store(key)
     str_fields = Enum.map(fields, &to_string/1)
 
-    case Ferricstore.Commands.Hash.handle("HDEL", [key | str_fields], store) do
+    case Hash.handle_ast({:hdel, [key | str_fields]}, store) do
       {:error, _} = err -> err
       count -> {:ok, count}
     end
@@ -2343,7 +2340,7 @@ defmodule FerricStore do
   def hexists(key, field) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Hash.handle("HEXISTS", [key, to_string(field)], store) do
+    case Hash.handle_ast({:hexists, key, to_string(field)}, store) do
       {:error, _} = err -> err
       1 -> true
       0 -> false
@@ -2369,7 +2366,7 @@ defmodule FerricStore do
   def hlen(key) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Hash.handle("HLEN", [key], store) do
+    case Hash.handle_ast({:hlen, key}, store) do
       {:error, _} = err -> err
       count -> {:ok, count}
     end
@@ -2396,7 +2393,7 @@ defmodule FerricStore do
   def hkeys(key) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Hash.handle("HKEYS", [key], store) do
+    case Hash.handle_ast({:hkeys, key}, store) do
       {:error, _} = err -> err
       keys_list -> {:ok, keys_list}
     end
@@ -2423,7 +2420,7 @@ defmodule FerricStore do
   def hvals(key) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Hash.handle("HVALS", [key], store) do
+    case Hash.handle_ast({:hvals, key}, store) do
       {:error, _} = err -> err
       vals_list -> {:ok, vals_list}
     end
@@ -2450,7 +2447,7 @@ defmodule FerricStore do
     store = build_compound_store(key)
     str_fields = Enum.map(fields, &to_string/1)
 
-    case Ferricstore.Commands.Hash.handle("HMGET", [key | str_fields], store) do
+    case Hash.handle_ast({:hmget, [key | str_fields]}, store) do
       {:error, _} = err -> err
       values -> {:ok, values}
     end
@@ -2524,11 +2521,7 @@ defmodule FerricStore do
   def hsetnx(key, field, value) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Hash.handle(
-           "HSETNX",
-           [key, to_string(field), to_string(value)],
-           store
-         ) do
+    case Hash.handle_ast({:hsetnx, key, to_string(field), to_string(value)}, store) do
       {:error, _} = err -> err
       1 -> {:ok, true}
       0 -> {:ok, false}
@@ -2563,17 +2556,13 @@ defmodule FerricStore do
 
     case count do
       nil ->
-        case Ferricstore.Commands.Hash.handle("HRANDFIELD", [key], store) do
+        case Hash.handle_ast({:hrandfield, key}, store) do
           {:error, _} = err -> err
           result -> {:ok, result}
         end
 
       n when is_integer(n) ->
-        case Ferricstore.Commands.Hash.handle(
-               "HRANDFIELD",
-               [key, Integer.to_string(n)],
-               store
-             ) do
+        case Hash.handle_ast({:hrandfield, key, n}, store) do
           {:error, _} = err -> err
           result -> {:ok, result}
         end
@@ -2599,7 +2588,7 @@ defmodule FerricStore do
   def hstrlen(key, field) do
     store = build_compound_store(key)
 
-    case Ferricstore.Commands.Hash.handle("HSTRLEN", [key, to_string(field)], store) do
+    case Hash.handle_ast({:hstrlen, key, to_string(field)}, store) do
       {:error, _} = err -> err
       len -> {:ok, len}
     end
@@ -2743,10 +2732,7 @@ defmodule FerricStore do
   @spec lmove(key(), key(), :left | :right, :left | :right) :: {:ok, binary() | nil}
   def lmove(source, destination, from_dir, to_dir)
       when from_dir in [:left, :right] and to_dir in [:left, :right] do
-    from = from_dir |> Atom.to_string() |> String.upcase()
-    to = to_dir |> Atom.to_string() |> String.upcase()
-
-    Ferricstore.Commands.List.handle("LMOVE", [source, destination, from, to], %{})
+    Ferricstore.Commands.List.handle_ast({:lmove, source, destination, from_dir, to_dir}, %{})
     |> wrap_result()
   end
 
@@ -2849,10 +2835,10 @@ defmodule FerricStore do
   def srandmember(key, count \\ nil) do
     store = build_compound_store(key)
 
-    args = if is_nil(count), do: [key], else: [key, to_string(count)]
+    ast = if is_nil(count), do: {:srandmember, key}, else: {:srandmember, key, count}
 
-    "SRANDMEMBER"
-    |> Ferricstore.Commands.Set.handle(args, store)
+    ast
+    |> Set.handle_ast(store)
     |> wrap_result()
   end
 
@@ -2881,10 +2867,10 @@ defmodule FerricStore do
   def spop(key, count \\ nil) do
     store = build_compound_store(key)
 
-    args = if is_nil(count), do: [key], else: [key, to_string(count)]
+    ast = if is_nil(count), do: {:spop, key}, else: {:spop, key, count}
 
-    "SPOP"
-    |> Ferricstore.Commands.Set.handle(args, store)
+    ast
+    |> Set.handle_ast(store)
     |> wrap_result()
   end
 
@@ -2907,7 +2893,7 @@ defmodule FerricStore do
   def sdiff([]), do: {:ok, []}
 
   def sdiff(keys) when is_list(keys) do
-    result = Ferricstore.Commands.Set.handle("SDIFF", keys, build_compound_store(hd(keys)))
+    result = Set.handle_ast({:sdiff, keys}, build_compound_store(hd(keys)))
     wrap_result(result)
   end
 
@@ -2929,7 +2915,7 @@ defmodule FerricStore do
   def sinter([]), do: {:ok, []}
 
   def sinter(keys) when is_list(keys) do
-    result = Ferricstore.Commands.Set.handle("SINTER", keys, build_compound_store(hd(keys)))
+    result = Set.handle_ast({:sinter, keys}, build_compound_store(hd(keys)))
     wrap_result(result)
   end
 
@@ -2951,7 +2937,7 @@ defmodule FerricStore do
   def sunion([]), do: {:ok, []}
 
   def sunion(keys) when is_list(keys) do
-    result = Ferricstore.Commands.Set.handle("SUNION", keys, build_compound_store(hd(keys)))
+    result = Set.handle_ast({:sunion, keys}, build_compound_store(hd(keys)))
     wrap_result(result)
   end
 
@@ -2971,7 +2957,8 @@ defmodule FerricStore do
   """
   @spec sdiffstore(key(), [key()]) :: {:ok, non_neg_integer()}
   def sdiffstore(destination, keys) when is_list(keys) do
-    result = Ferricstore.Commands.Set.handle("SDIFFSTORE", [destination | keys], %{})
+    result = Set.handle_ast({:sdiffstore, [destination | keys]}, %{})
+
     wrap_result(result)
   end
 
@@ -2991,7 +2978,8 @@ defmodule FerricStore do
   """
   @spec sinterstore(key(), [key()]) :: {:ok, non_neg_integer()}
   def sinterstore(destination, keys) when is_list(keys) do
-    result = Ferricstore.Commands.Set.handle("SINTERSTORE", [destination | keys], %{})
+    result = Set.handle_ast({:sinterstore, [destination | keys]}, %{})
+
     wrap_result(result)
   end
 
@@ -3011,7 +2999,8 @@ defmodule FerricStore do
   """
   @spec sunionstore(key(), [key()]) :: {:ok, non_neg_integer()}
   def sunionstore(destination, keys) when is_list(keys) do
-    result = Ferricstore.Commands.Set.handle("SUNIONSTORE", [destination | keys], %{})
+    result = Set.handle_ast({:sunionstore, [destination | keys]}, %{})
+
     wrap_result(result)
   end
 
@@ -3039,12 +3028,7 @@ defmodule FerricStore do
   """
   @spec sintercard([key()], keyword()) :: {:ok, non_neg_integer()}
   def sintercard(keys, opts \\ []) when is_list(keys) do
-    numkeys = Integer.to_string(length(keys))
     limit = Keyword.get(opts, :limit, 0)
-
-    args =
-      [numkeys | keys] ++
-        if limit > 0, do: ["LIMIT", Integer.to_string(limit)], else: []
 
     store =
       case keys do
@@ -3052,7 +3036,7 @@ defmodule FerricStore do
         [] -> build_compound_store("")
       end
 
-    result = Ferricstore.Commands.Set.handle("SINTERCARD", args, store)
+    result = Set.handle_ast({:sintercard, keys, limit}, store)
     wrap_result(result)
   end
 
@@ -3082,7 +3066,7 @@ defmodule FerricStore do
   @spec zrank(key(), binary()) :: {:ok, non_neg_integer() | nil}
   def zrank(key, member) do
     store = build_compound_store(key)
-    result = Ferricstore.Commands.SortedSet.handle("ZRANK", [key, member], store)
+    result = SortedSet.handle_ast({:zrank, key, member}, store)
     wrap_result(result)
   end
 
@@ -3108,7 +3092,7 @@ defmodule FerricStore do
   @spec zrevrank(key(), binary()) :: {:ok, non_neg_integer() | nil}
   def zrevrank(key, member) do
     store = build_compound_store(key)
-    result = Ferricstore.Commands.SortedSet.handle("ZREVRANK", [key, member], store)
+    result = SortedSet.handle_ast({:zrevrank, key, member}, store)
     wrap_result(result)
   end
 
@@ -3134,7 +3118,10 @@ defmodule FerricStore do
   @spec zrangebyscore(key(), binary(), binary(), keyword()) :: {:ok, [binary()]}
   def zrangebyscore(key, min, max, _opts \\ []) do
     store = build_compound_store(key)
-    result = Ferricstore.Commands.SortedSet.handle("ZRANGEBYSCORE", [key, min, max], store)
+
+    result =
+      SortedSet.handle_ast({:zrangebyscore, key, parse_zbound(min), parse_zbound(max), []}, store)
+
     wrap_result(result)
   end
 
@@ -3157,7 +3144,7 @@ defmodule FerricStore do
   @spec zcount(key(), binary(), binary()) :: {:ok, non_neg_integer()}
   def zcount(key, min, max) do
     store = build_compound_store(key)
-    result = Ferricstore.Commands.SortedSet.handle("ZCOUNT", [key, min, max], store)
+    result = SortedSet.handle_ast({:zcount, key, parse_zbound(min), parse_zbound(max)}, store)
     wrap_result(result)
   end
 
@@ -3210,11 +3197,11 @@ defmodule FerricStore do
 
     case count do
       nil ->
-        result = Ferricstore.Commands.SortedSet.handle("ZRANDMEMBER", [key], store)
+        result = SortedSet.handle_ast({:zrandmember, key}, store)
         wrap_result(result)
 
       n ->
-        result = Ferricstore.Commands.SortedSet.handle("ZRANDMEMBER", [key, to_string(n)], store)
+        result = SortedSet.handle_ast({:zrandmember, key, n, false}, store)
         wrap_result(result)
     end
   end
@@ -3237,7 +3224,7 @@ defmodule FerricStore do
   @spec zpopmin(key(), pos_integer()) :: {:ok, [{binary(), float()}]}
   def zpopmin(key, count \\ 1) do
     store = build_compound_store(key)
-    result = Ferricstore.Commands.SortedSet.handle("ZPOPMIN", [key, to_string(count)], store)
+    result = SortedSet.handle_ast({:zpopmin, key, count}, store)
 
     case result do
       {:error, _} = err ->
@@ -3274,7 +3261,7 @@ defmodule FerricStore do
   @spec zpopmax(key(), pos_integer()) :: {:ok, [{binary(), float()}]}
   def zpopmax(key, count \\ 1) do
     store = build_compound_store(key)
-    result = Ferricstore.Commands.SortedSet.handle("ZPOPMAX", [key, to_string(count)], store)
+    result = SortedSet.handle_ast({:zpopmax, key, count}, store)
 
     case result do
       {:error, _} = err ->
@@ -3309,7 +3296,7 @@ defmodule FerricStore do
   @spec zmscore(key(), [binary()]) :: {:ok, [float() | nil]}
   def zmscore(key, members) when is_list(members) do
     store = build_compound_store(key)
-    result = Ferricstore.Commands.SortedSet.handle("ZMSCORE", [key | members], store)
+    result = SortedSet.handle_ast({:zmscore, [key | members]}, store)
 
     case result do
       {:error, _} = err ->
@@ -3357,7 +3344,10 @@ defmodule FerricStore do
   @spec xadd(key(), [binary()]) :: {:ok, binary()} | {:error, binary()}
   def xadd(key, fields) when is_list(fields) do
     store = build_stream_store(key)
-    result = Ferricstore.Commands.Stream.handle("XADD", [key, "*" | fields], store)
+
+    result =
+      Ferricstore.Commands.Stream.handle_ast({:xadd, key, {:auto, fields, nil, false}}, store)
+
     wrap_result(result)
   end
 
@@ -3377,7 +3367,7 @@ defmodule FerricStore do
   @spec xlen(key()) :: {:ok, non_neg_integer()}
   def xlen(key) do
     store = build_stream_store(key)
-    result = Ferricstore.Commands.Stream.handle("XLEN", [key], store)
+    result = Ferricstore.Commands.Stream.handle_ast({:xlen, key}, store)
     wrap_result(result)
   end
 
@@ -3407,9 +3397,15 @@ defmodule FerricStore do
   def xrange(key, start, stop, opts \\ []) do
     store = build_stream_store(key)
     count = Keyword.get(opts, :count)
-    args = [key, start, stop]
-    args = if count, do: args ++ ["COUNT", to_string(count)], else: args
-    result = Ferricstore.Commands.Stream.handle("XRANGE", args, store)
+    count = if count, do: count, else: :infinity
+
+    result =
+      Ferricstore.Commands.Stream.handle_ast(
+        {:xrange, key, parse_stream_range_id(start, true), parse_stream_range_id(stop, false),
+         count},
+        store
+      )
+
     wrap_result(result)
   end
 
@@ -3434,9 +3430,15 @@ defmodule FerricStore do
   def xrevrange(key, stop, start, opts \\ []) do
     store = build_stream_store(key)
     count = Keyword.get(opts, :count)
-    args = [key, stop, start]
-    args = if count, do: args ++ ["COUNT", to_string(count)], else: args
-    result = Ferricstore.Commands.Stream.handle("XREVRANGE", args, store)
+    count = if count, do: count, else: :infinity
+
+    result =
+      Ferricstore.Commands.Stream.handle_ast(
+        {:xrevrange, key, parse_stream_range_id(start, true), parse_stream_range_id(stop, false),
+         count},
+        store
+      )
+
     wrap_result(result)
   end
 
@@ -3465,7 +3467,7 @@ defmodule FerricStore do
     maxlen = Keyword.fetch!(opts, :maxlen)
 
     result =
-      Ferricstore.Commands.Stream.handle("XTRIM", [key, "MAXLEN", to_string(maxlen)], store)
+      Ferricstore.Commands.Stream.handle_ast({:xtrim, key, {:maxlen, false, maxlen}}, store)
 
     wrap_result(result)
   end
@@ -3485,12 +3487,7 @@ defmodule FerricStore do
   @spec bf_reserve(key(), float(), pos_integer()) :: :ok | {:error, binary()}
   def bf_reserve(key, error_rate, capacity) do
     store = build_prob_store(key)
-
-    Ferricstore.Commands.Bloom.handle(
-      "BF.RESERVE",
-      [key, to_string(error_rate), to_string(capacity)],
-      store
-    )
+    Bloom.handle_ast({:bf_reserve, key, error_rate * 1.0, capacity}, store)
   end
 
   @doc """
@@ -3509,7 +3506,7 @@ defmodule FerricStore do
   @spec bf_add(key(), binary()) :: {:ok, 0 | 1}
   def bf_add(key, element) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Bloom.handle("BF.ADD", [key, element], store)
+    result = Bloom.handle_ast({:bf_add, [key, element]}, store)
     wrap_result(result)
   end
 
@@ -3524,7 +3521,7 @@ defmodule FerricStore do
   @spec bf_madd(key(), [binary()]) :: {:ok, [0 | 1]}
   def bf_madd(key, elements) when is_list(elements) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Bloom.handle("BF.MADD", [key | elements], store)
+    result = Bloom.handle_ast({:bf_madd, [key | elements]}, store)
     wrap_result(result)
   end
 
@@ -3540,7 +3537,7 @@ defmodule FerricStore do
   @spec bf_exists(key(), binary()) :: {:ok, 0 | 1}
   def bf_exists(key, element) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Bloom.handle("BF.EXISTS", [key, element], store)
+    result = Bloom.handle_ast({:bf_exists, [key, element]}, store)
     wrap_result(result)
   end
 
@@ -3555,7 +3552,7 @@ defmodule FerricStore do
   @spec bf_mexists(key(), [binary()]) :: {:ok, [0 | 1]}
   def bf_mexists(key, elements) when is_list(elements) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Bloom.handle("BF.MEXISTS", [key | elements], store)
+    result = Bloom.handle_ast({:bf_mexists, [key | elements]}, store)
     wrap_result(result)
   end
 
@@ -3575,7 +3572,7 @@ defmodule FerricStore do
   @spec bf_card(key()) :: {:ok, non_neg_integer()}
   def bf_card(key) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Bloom.handle("BF.CARD", [key], store)
+    result = Bloom.handle_ast({:bf_card, [key]}, store)
     wrap_result(result)
   end
 
@@ -3596,7 +3593,7 @@ defmodule FerricStore do
   @spec bf_info(key()) :: {:ok, list()} | {:error, binary()}
   def bf_info(key) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Bloom.handle("BF.INFO", [key], store)
+    result = Bloom.handle_ast({:bf_info, [key]}, store)
     wrap_result(result)
   end
 
@@ -3625,7 +3622,7 @@ defmodule FerricStore do
   @spec cf_reserve(key(), pos_integer()) :: :ok | {:error, binary()}
   def cf_reserve(key, capacity) do
     store = build_prob_store(key)
-    Ferricstore.Commands.Cuckoo.handle("CF.RESERVE", [key, to_string(capacity)], store)
+    Cuckoo.handle_ast({:cf_reserve, key, capacity}, store)
   end
 
   @doc """
@@ -3647,7 +3644,7 @@ defmodule FerricStore do
   @spec cf_add(key(), binary()) :: {:ok, 0 | 1} | {:error, binary()}
   def cf_add(key, element) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Cuckoo.handle("CF.ADD", [key, element], store)
+    result = Cuckoo.handle_ast({:cf_add, [key, element]}, store)
     wrap_result(result)
   end
 
@@ -3672,7 +3669,7 @@ defmodule FerricStore do
   @spec cf_addnx(key(), binary()) :: {:ok, 0 | 1} | {:error, binary()}
   def cf_addnx(key, element) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Cuckoo.handle("CF.ADDNX", [key, element], store)
+    result = Cuckoo.handle_ast({:cf_addnx, [key, element]}, store)
     wrap_result(result)
   end
 
@@ -3696,7 +3693,7 @@ defmodule FerricStore do
   @spec cf_del(key(), binary()) :: {:ok, 0 | 1}
   def cf_del(key, element) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Cuckoo.handle("CF.DEL", [key, element], store)
+    result = Cuckoo.handle_ast({:cf_del, [key, element]}, store)
     wrap_result(result)
   end
 
@@ -3717,7 +3714,7 @@ defmodule FerricStore do
   @spec cf_exists(key(), binary()) :: {:ok, 0 | 1}
   def cf_exists(key, element) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Cuckoo.handle("CF.EXISTS", [key, element], store)
+    result = Cuckoo.handle_ast({:cf_exists, [key, element]}, store)
     wrap_result(result)
   end
 
@@ -3738,7 +3735,7 @@ defmodule FerricStore do
   @spec cf_mexists(key(), [binary()]) :: {:ok, [0 | 1]}
   def cf_mexists(key, elements) when is_list(elements) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Cuckoo.handle("CF.MEXISTS", [key | elements], store)
+    result = Cuckoo.handle_ast({:cf_mexists, [key | elements]}, store)
     wrap_result(result)
   end
 
@@ -3758,7 +3755,7 @@ defmodule FerricStore do
   @spec cf_count(key(), binary()) :: {:ok, non_neg_integer()}
   def cf_count(key, element) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Cuckoo.handle("CF.COUNT", [key, element], store)
+    result = Cuckoo.handle_ast({:cf_count, [key, element]}, store)
     wrap_result(result)
   end
 
@@ -3779,7 +3776,7 @@ defmodule FerricStore do
   @spec cf_info(key()) :: {:ok, list()} | {:error, binary()}
   def cf_info(key) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.Cuckoo.handle("CF.INFO", [key], store)
+    result = Cuckoo.handle_ast({:cf_info, [key]}, store)
     wrap_result(result)
   end
 
@@ -3810,12 +3807,7 @@ defmodule FerricStore do
   @spec cms_initbydim(key(), pos_integer(), pos_integer()) :: :ok | {:error, binary()}
   def cms_initbydim(key, width, depth) do
     store = build_prob_store(key)
-
-    Ferricstore.Commands.CMS.handle(
-      "CMS.INITBYDIM",
-      [key, to_string(width), to_string(depth)],
-      store
-    )
+    CMS.handle_ast({:cms_initbydim, key, width, depth}, store)
   end
 
   @doc """
@@ -3838,12 +3830,7 @@ defmodule FerricStore do
   @spec cms_initbyprob(key(), float(), float()) :: :ok | {:error, binary()}
   def cms_initbyprob(key, error, probability) do
     store = build_prob_store(key)
-
-    Ferricstore.Commands.CMS.handle(
-      "CMS.INITBYPROB",
-      [key, to_string(error), to_string(probability)],
-      store
-    )
+    CMS.handle_ast({:cms_initbyprob, key, error * 1.0, probability * 1.0}, store)
   end
 
   @doc """
@@ -3869,8 +3856,7 @@ defmodule FerricStore do
           {:ok, [non_neg_integer()]} | {:error, binary()}
   def cms_incrby(key, pairs) when is_list(pairs) do
     store = build_prob_store(key)
-    args = Enum.flat_map(pairs, fn {element, count} -> [element, to_string(count)] end)
-    result = Ferricstore.Commands.CMS.handle("CMS.INCRBY", [key | args], store)
+    result = CMS.handle_ast({:cms_incrby, key, pairs}, store)
     wrap_result(result)
   end
 
@@ -3893,7 +3879,7 @@ defmodule FerricStore do
   @spec cms_query(key(), [binary()]) :: {:ok, [non_neg_integer()]} | {:error, binary()}
   def cms_query(key, elements) when is_list(elements) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.CMS.handle("CMS.QUERY", [key | elements], store)
+    result = CMS.handle_ast({:cms_query, [key | elements]}, store)
     wrap_result(result)
   end
 
@@ -3914,7 +3900,7 @@ defmodule FerricStore do
   @spec cms_info(key()) :: {:ok, list()} | {:error, binary()}
   def cms_info(key) do
     store = build_prob_store(key)
-    result = Ferricstore.Commands.CMS.handle("CMS.INFO", [key], store)
+    result = CMS.handle_ast({:cms_info, [key]}, store)
     wrap_result(result)
   end
 
@@ -3943,7 +3929,7 @@ defmodule FerricStore do
   @spec topk_reserve(key(), pos_integer()) :: :ok | {:error, binary()}
   def topk_reserve(key, k) do
     store = build_topk_store(key)
-    Ferricstore.Commands.TopK.handle("TOPK.RESERVE", [key, to_string(k)], store)
+    TopK.handle_ast({:topk_reserve, key, k, 8, 7, 0.9}, store)
   end
 
   @doc """
@@ -3965,7 +3951,7 @@ defmodule FerricStore do
   @spec topk_add(key(), [binary()]) :: {:ok, list()} | {:error, binary()}
   def topk_add(key, elements) when is_list(elements) do
     store = build_topk_store(key)
-    result = Ferricstore.Commands.TopK.handle("TOPK.ADD", [key | elements], store)
+    result = TopK.handle_ast({:topk_add, [key | elements]}, store)
     wrap_result(result)
   end
 
@@ -3985,7 +3971,7 @@ defmodule FerricStore do
   @spec topk_query(key(), [binary()]) :: {:ok, list()} | {:error, binary()}
   def topk_query(key, elements) when is_list(elements) do
     store = build_topk_store(key)
-    result = Ferricstore.Commands.TopK.handle("TOPK.QUERY", [key | elements], store)
+    result = TopK.handle_ast({:topk_query, [key | elements]}, store)
     wrap_result(result)
   end
 
@@ -4006,7 +3992,7 @@ defmodule FerricStore do
   @spec topk_list(key()) :: {:ok, [binary()]} | {:error, binary()}
   def topk_list(key) do
     store = build_topk_store(key)
-    result = Ferricstore.Commands.TopK.handle("TOPK.LIST", [key], store)
+    result = TopK.handle_ast({:topk_list, key, false}, store)
     wrap_result(result)
   end
 
@@ -4027,7 +4013,7 @@ defmodule FerricStore do
   @spec topk_info(key()) :: {:ok, list()} | {:error, binary()}
   def topk_info(key) do
     store = build_topk_store(key)
-    result = Ferricstore.Commands.TopK.handle("TOPK.INFO", [key], store)
+    result = TopK.handle_ast({:topk_info, [key]}, store)
     wrap_result(result)
   end
 
@@ -4050,7 +4036,7 @@ defmodule FerricStore do
   """
   @spec tdigest_create(key()) :: :ok | {:error, binary()}
   def tdigest_create(key) do
-    Router.tdigest_op(default_ctx(), "TDIGEST.CREATE", [key])
+    TDigest.handle_ast({:tdigest_create, key, nil}, build_tdigest_store(key))
   end
 
   @doc """
@@ -4069,8 +4055,10 @@ defmodule FerricStore do
   """
   @spec tdigest_add(key(), [number()]) :: :ok | {:error, binary()}
   def tdigest_add(key, values) when is_list(values) do
-    value_strs = Enum.map(values, &to_string(&1 * 1.0))
-    Router.tdigest_op(default_ctx(), "TDIGEST.ADD", [key | value_strs])
+    TDigest.handle_ast(
+      {:tdigest_add, key, Enum.map(values, &(&1 * 1.0))},
+      build_tdigest_store(key)
+    )
   end
 
   @doc """
@@ -4092,8 +4080,7 @@ defmodule FerricStore do
   @spec tdigest_quantile(key(), [float()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_quantile(key, quantiles) when is_list(quantiles) do
     store = build_tdigest_store(key)
-    qs = Enum.map(quantiles, &to_string(&1 * 1.0))
-    result = Ferricstore.Commands.TDigest.handle("TDIGEST.QUANTILE", [key | qs], store)
+    result = TDigest.handle_ast({:tdigest_quantile, key, Enum.map(quantiles, &(&1 * 1.0))}, store)
     wrap_result(result)
   end
 
@@ -4117,8 +4104,7 @@ defmodule FerricStore do
   @spec tdigest_cdf(key(), [number()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_cdf(key, values) when is_list(values) do
     store = build_tdigest_store(key)
-    vs = Enum.map(values, &to_string(&1 * 1.0))
-    result = Ferricstore.Commands.TDigest.handle("TDIGEST.CDF", [key | vs], store)
+    result = TDigest.handle_ast({:tdigest_cdf, key, Enum.map(values, &(&1 * 1.0))}, store)
     wrap_result(result)
   end
 
@@ -4134,7 +4120,7 @@ defmodule FerricStore do
   @spec tdigest_min(key()) :: {:ok, binary()} | {:error, binary()}
   def tdigest_min(key) do
     store = build_tdigest_store(key)
-    result = Ferricstore.Commands.TDigest.handle("TDIGEST.MIN", [key], store)
+    result = TDigest.handle_ast({:tdigest_min, [key]}, store)
     wrap_result(result)
   end
 
@@ -4150,7 +4136,7 @@ defmodule FerricStore do
   @spec tdigest_max(key()) :: {:ok, binary()} | {:error, binary()}
   def tdigest_max(key) do
     store = build_tdigest_store(key)
-    result = Ferricstore.Commands.TDigest.handle("TDIGEST.MAX", [key], store)
+    result = TDigest.handle_ast({:tdigest_max, [key]}, store)
     wrap_result(result)
   end
 
@@ -4171,7 +4157,7 @@ defmodule FerricStore do
   @spec tdigest_info(key()) :: {:ok, list()} | {:error, binary()}
   def tdigest_info(key) do
     store = build_tdigest_store(key)
-    result = Ferricstore.Commands.TDigest.handle("TDIGEST.INFO", [key], store)
+    result = TDigest.handle_ast({:tdigest_info, [key]}, store)
     wrap_result(result)
   end
 
@@ -4186,7 +4172,7 @@ defmodule FerricStore do
   """
   @spec tdigest_reset(key()) :: :ok | {:error, binary()}
   def tdigest_reset(key) do
-    Router.tdigest_op(default_ctx(), "TDIGEST.RESET", [key])
+    TDigest.handle_ast({:tdigest_reset, [key]}, build_tdigest_store(key))
   end
 
   @doc """
@@ -4212,12 +4198,7 @@ defmodule FerricStore do
   def tdigest_trimmed_mean(key, lo, hi) do
     store = build_tdigest_store(key)
 
-    result =
-      Ferricstore.Commands.TDigest.handle(
-        "TDIGEST.TRIMMED_MEAN",
-        [key, to_string(lo * 1.0), to_string(hi * 1.0)],
-        store
-      )
+    result = TDigest.handle_ast({:tdigest_trimmed_mean, key, lo * 1.0, hi * 1.0}, store)
 
     wrap_result(result)
   end
@@ -4238,8 +4219,7 @@ defmodule FerricStore do
   @spec tdigest_rank(key(), [number()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_rank(key, values) when is_list(values) do
     store = build_tdigest_store(key)
-    vs = Enum.map(values, &to_string(&1 * 1.0))
-    result = Ferricstore.Commands.TDigest.handle("TDIGEST.RANK", [key | vs], store)
+    result = TDigest.handle_ast({:tdigest_rank, key, Enum.map(values, &(&1 * 1.0))}, store)
     wrap_result(result)
   end
 
@@ -4259,8 +4239,7 @@ defmodule FerricStore do
   @spec tdigest_revrank(key(), [number()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_revrank(key, values) when is_list(values) do
     store = build_tdigest_store(key)
-    vs = Enum.map(values, &to_string(&1 * 1.0))
-    result = Ferricstore.Commands.TDigest.handle("TDIGEST.REVRANK", [key | vs], store)
+    result = TDigest.handle_ast({:tdigest_revrank, key, Enum.map(values, &(&1 * 1.0))}, store)
     wrap_result(result)
   end
 
@@ -4280,8 +4259,7 @@ defmodule FerricStore do
   @spec tdigest_byrank(key(), [integer()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_byrank(key, ranks) when is_list(ranks) do
     store = build_tdigest_store(key)
-    rs = Enum.map(ranks, &to_string/1)
-    result = Ferricstore.Commands.TDigest.handle("TDIGEST.BYRANK", [key | rs], store)
+    result = TDigest.handle_ast({:tdigest_byrank, key, ranks}, store)
     wrap_result(result)
   end
 
@@ -4301,8 +4279,7 @@ defmodule FerricStore do
   @spec tdigest_byrevrank(key(), [integer()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_byrevrank(key, ranks) when is_list(ranks) do
     store = build_tdigest_store(key)
-    rs = Enum.map(ranks, &to_string/1)
-    result = Ferricstore.Commands.TDigest.handle("TDIGEST.BYREVRANK", [key | rs], store)
+    result = TDigest.handle_ast({:tdigest_byrevrank, key, ranks}, store)
     wrap_result(result)
   end
 
@@ -4338,12 +4315,8 @@ defmodule FerricStore do
   @spec geoadd(key(), [{number(), number(), binary()}]) ::
           {:ok, non_neg_integer()} | {:error, binary()}
   def geoadd(key, members) when is_list(members) do
-    args =
-      Enum.flat_map(members, fn {lng, lat, member} ->
-        [to_string(lng * 1.0), to_string(lat * 1.0), member]
-      end)
-
-    wrap_result(Router.geo_op(default_ctx(), "GEOADD", [key | args]))
+    pairs = Enum.map(members, fn {lng, lat, member} -> {lng * 1.0, lat * 1.0, member} end)
+    wrap_result(Geo.handle_ast({:geoadd, key, [], pairs}, build_compound_store(key)))
   end
 
   @doc """
@@ -4371,7 +4344,7 @@ defmodule FerricStore do
   @spec geodist(key(), binary(), binary(), binary()) :: {:ok, binary()} | {:error, binary()}
   def geodist(key, member1, member2, unit \\ "m") do
     store = build_compound_store(key)
-    result = Ferricstore.Commands.Geo.handle("GEODIST", [key, member1, member2, unit], store)
+    result = Geo.handle_ast({:geodist, key, member1, member2, normalize_geo_unit(unit)}, store)
     wrap_result(result)
   end
 
@@ -4394,7 +4367,7 @@ defmodule FerricStore do
   @spec geohash(key(), [binary()]) :: {:ok, list()} | {:error, binary()}
   def geohash(key, members) when is_list(members) do
     store = build_compound_store(key)
-    result = Ferricstore.Commands.Geo.handle("GEOHASH", [key | members], store)
+    result = Geo.handle_ast({:geohash, [key | members]}, store)
     wrap_result(result)
   end
 
@@ -4415,7 +4388,7 @@ defmodule FerricStore do
   @spec geopos(key(), [binary()]) :: {:ok, list()} | {:error, binary()}
   def geopos(key, members) when is_list(members) do
     store = build_compound_store(key)
-    result = Ferricstore.Commands.Geo.handle("GEOPOS", [key | members], store)
+    result = Geo.handle_ast({:geopos, [key | members]}, store)
     wrap_result(result)
   end
 
@@ -4452,7 +4425,7 @@ defmodule FerricStore do
   """
   @spec json_set(key(), binary(), binary()) :: :ok | {:error, binary()}
   def json_set(key, path, value) do
-    case Router.json_op(default_ctx(), "JSON.SET", [key, path, value]) do
+    case Json.handle_ast({:json_set, key, path, value, []}, build_string_store(key)) do
       :ok -> :ok
       {:error, _} = err -> err
     end
@@ -4484,7 +4457,7 @@ defmodule FerricStore do
   @spec json_get(key(), binary()) :: {:ok, binary()} | {:error, binary()}
   def json_get(key, path \\ "$") do
     store = build_string_store(key)
-    result = Ferricstore.Commands.Json.handle("JSON.GET", [key, path], store)
+    result = Json.handle_ast({:json_get, key, [{path, parse_json_path(path)}]}, store)
     wrap_result(result)
   end
 
@@ -4506,7 +4479,7 @@ defmodule FerricStore do
   """
   @spec json_del(key(), binary()) :: {:ok, term()} | {:error, binary()}
   def json_del(key, path \\ "$") do
-    wrap_result(Router.json_op(default_ctx(), "JSON.DEL", [key, path]))
+    wrap_result(Json.handle_ast({:json_del, key, path}, build_string_store(key)))
   end
 
   @doc """
@@ -4527,7 +4500,7 @@ defmodule FerricStore do
   @spec json_type(key(), binary()) :: {:ok, binary()} | {:error, binary()}
   def json_type(key, path \\ "$") do
     store = build_string_store(key)
-    result = Ferricstore.Commands.Json.handle("JSON.TYPE", [key, path], store)
+    result = Json.handle_ast({:json_type, key, path}, store)
     wrap_result(result)
   end
 
@@ -4553,7 +4526,12 @@ defmodule FerricStore do
   """
   @spec json_numincrby(key(), binary(), binary()) :: {:ok, binary()} | {:error, binary()}
   def json_numincrby(key, path, increment) do
-    wrap_result(Router.json_op(default_ctx(), "JSON.NUMINCRBY", [key, path, increment]))
+    wrap_result(
+      Json.handle_ast(
+        {:json_numincrby, key, path, parse_json_number(increment)},
+        build_string_store(key)
+      )
+    )
   end
 
   @doc """
@@ -4578,7 +4556,7 @@ defmodule FerricStore do
   """
   @spec json_arrappend(key(), binary(), [binary()]) :: {:ok, term()} | {:error, binary()}
   def json_arrappend(key, path, values) when is_list(values) do
-    wrap_result(Router.json_op(default_ctx(), "JSON.ARRAPPEND", [key, path | values]))
+    wrap_result(Json.handle_ast({:json_arrappend, key, path, values}, build_string_store(key)))
   end
 
   @doc """
@@ -4593,7 +4571,7 @@ defmodule FerricStore do
   @spec json_arrlen(key(), binary()) :: {:ok, integer()} | {:error, binary()}
   def json_arrlen(key, path \\ "$") do
     store = build_string_store(key)
-    result = Ferricstore.Commands.Json.handle("JSON.ARRLEN", [key, path], store)
+    result = Json.handle_ast({:json_arrlen, key, path}, store)
     wrap_result(result)
   end
 
@@ -4609,7 +4587,7 @@ defmodule FerricStore do
   @spec json_strlen(key(), binary()) :: {:ok, integer()} | {:error, binary()}
   def json_strlen(key, path \\ "$") do
     store = build_string_store(key)
-    result = Ferricstore.Commands.Json.handle("JSON.STRLEN", [key, path], store)
+    result = Json.handle_ast({:json_strlen, key, path}, store)
     wrap_result(result)
   end
 
@@ -4625,7 +4603,7 @@ defmodule FerricStore do
   @spec json_objkeys(key(), binary()) :: {:ok, list()} | {:error, binary()}
   def json_objkeys(key, path \\ "$") do
     store = build_string_store(key)
-    result = Ferricstore.Commands.Json.handle("JSON.OBJKEYS", [key, path], store)
+    result = Json.handle_ast({:json_objkeys, key, path}, store)
     wrap_result(result)
   end
 
@@ -4641,7 +4619,7 @@ defmodule FerricStore do
   @spec json_objlen(key(), binary()) :: {:ok, integer()} | {:error, binary()}
   def json_objlen(key, path \\ "$") do
     store = build_string_store(key)
-    result = Ferricstore.Commands.Json.handle("JSON.OBJLEN", [key, path], store)
+    result = Json.handle_ast({:json_objlen, key, path}, store)
     wrap_result(result)
   end
 
@@ -4800,7 +4778,7 @@ defmodule FerricStore do
   """
   @spec pfadd(key(), [binary()]) :: {:ok, boolean()} | {:error, binary()}
   def pfadd(key, elements) when is_list(elements) do
-    case Router.hll_op(default_ctx(), "PFADD", [key | elements]) do
+    case HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_store(key)) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -4830,7 +4808,7 @@ defmodule FerricStore do
   @spec pfcount([key()]) :: {:ok, non_neg_integer()} | {:error, binary()}
   def pfcount(keys) when is_list(keys) do
     store = build_string_store(hd(keys))
-    result = Ferricstore.Commands.HyperLogLog.handle("PFCOUNT", keys, store)
+    result = HyperLogLog.handle_ast({:pfcount, keys}, store)
     wrap_result(result)
   end
 
@@ -4853,7 +4831,10 @@ defmodule FerricStore do
   """
   @spec pfmerge(key(), [key()]) :: :ok | {:error, binary()}
   def pfmerge(dest_key, source_keys) when is_list(source_keys) do
-    case Router.hll_op(default_ctx(), "PFMERGE", [dest_key | source_keys]) do
+    case HyperLogLog.handle_ast(
+           {:pfmerge, [dest_key | source_keys]},
+           build_string_store(dest_key)
+         ) do
       :ok -> :ok
       {:error, _} = err -> err
     end
@@ -5071,6 +5052,124 @@ defmodule FerricStore do
   defp wrap_result({:error, _} = err), do: err
   defp wrap_result(result), do: {:ok, result}
 
+  defp parse_zbound("-inf"), do: :neg_inf
+  defp parse_zbound("+inf"), do: :inf
+  defp parse_zbound("inf"), do: :inf
+
+  defp parse_zbound("(" <> rest) do
+    case Float.parse(rest) do
+      {score, ""} -> {:exclusive, score}
+      _ -> {:error, "ERR min or max is not a float"}
+    end
+  end
+
+  defp parse_zbound(value) when is_binary(value) do
+    case Float.parse(value) do
+      {score, ""} -> {:inclusive, score}
+      _ -> {:error, "ERR min or max is not a float"}
+    end
+  end
+
+  defp parse_stream_range_id("-", true), do: :min
+  defp parse_stream_range_id("+", false), do: :max
+
+  defp parse_stream_range_id(id, _is_start) do
+    case String.split(id, "-", parts: 2) do
+      [ms, seq] ->
+        with {ms_int, ""} <- Integer.parse(ms),
+             {seq_int, ""} <- Integer.parse(seq),
+             true <- ms_int >= 0 and seq_int >= 0 do
+          {ms_int, seq_int}
+        else
+          _ -> {:error, "ERR Invalid stream ID specified as stream command argument"}
+        end
+
+      [ms] ->
+        with {ms_int, ""} <- Integer.parse(ms),
+             true <- ms_int >= 0 do
+          {ms_int, 0}
+        else
+          _ -> {:error, "ERR Invalid stream ID specified as stream command argument"}
+        end
+    end
+  end
+
+  defp normalize_geo_unit(unit) when is_binary(unit) do
+    case String.upcase(unit) do
+      value when value in ["M", "KM", "FT", "MI"] ->
+        value
+
+      _ ->
+        {:error, "ERR unsupported unit provided. please use M, KM, FT, MI"}
+    end
+  end
+
+  defp parse_json_number(value) when is_number(value), do: value * 1.0
+
+  defp parse_json_number(value) when is_binary(value) do
+    case Float.parse(value) do
+      {number, ""} -> number
+      _ -> {:error, "ERR value is not a valid float"}
+    end
+  end
+
+  defp parse_json_path("$"), do: []
+
+  defp parse_json_path(<<"$", rest::binary>>) do
+    parse_json_path_segments(rest, [])
+  end
+
+  defp parse_json_path(_path), do: :error
+
+  defp parse_json_path_segments("", acc), do: Enum.reverse(acc)
+
+  defp parse_json_path_segments("." <> rest, acc) do
+    case :binary.match(rest, [".", "["]) do
+      {0, _} ->
+        :error
+
+      {pos, _} ->
+        segment = binary_part(rest, 0, pos)
+        parse_json_path_segments(binary_part(rest, pos, byte_size(rest) - pos), [segment | acc])
+
+      :nomatch ->
+        if rest == "", do: :error, else: Enum.reverse([rest | acc])
+    end
+  end
+
+  defp parse_json_path_segments("[" <> rest, acc) do
+    case :binary.match(rest, "]") do
+      {pos, 1} ->
+        inner = binary_part(rest, 0, pos)
+        tail = binary_part(rest, pos + 1, byte_size(rest) - pos - 1)
+
+        case parse_json_bracket_segment(inner) do
+          :error -> :error
+          segment -> parse_json_path_segments(tail, [segment | acc])
+        end
+
+      :nomatch ->
+        :error
+    end
+  end
+
+  defp parse_json_path_segments(_rest, _acc), do: :error
+
+  defp parse_json_bracket_segment(<<"\"", inner::binary>>) do
+    if String.ends_with?(inner, "\""), do: String.slice(inner, 0..-2//1), else: :error
+  end
+
+  defp parse_json_bracket_segment(<<"'", inner::binary>>) do
+    if String.ends_with?(inner, "'"), do: String.slice(inner, 0..-2//1), else: :error
+  end
+
+  defp parse_json_bracket_segment(inner) do
+    case Integer.parse(inner) do
+      {idx, ""} -> idx
+      _ -> :error
+    end
+  end
+
   defp batch_async_put_result_list(ctx, kv_pairs) do
     __async_batch_put_result_list__(ctx, kv_pairs)
   end
@@ -5263,6 +5362,9 @@ defmodule FerricStore do
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
       end,
+      compound_batch_put: fn redis_key, entries ->
+        Router.compound_batch_put(ctx, redis_key, entries)
+      end,
       compound_delete: fn redis_key, compound_key ->
         Router.compound_delete(ctx, redis_key, compound_key)
       end,
@@ -5369,12 +5471,8 @@ defmodule FerricStore do
   # ---------------------------------------------------------------------------
   # Private — TDigest store builder
   # ---------------------------------------------------------------------------
-  # TDigest RMW commands (TDIGEST.ADD/RESET/MERGE/CREATE) are now serialized
-  # by Raft — Router.tdigest_op submits {:tdigest_op, cmd, args} to the
-  # state machine, which calls TDigest.handle/3 with a state-machine-scoped
-  # store. Concurrent callers are serialized by Raft log order, so no latch
-  # is needed. Read-only tdigest commands (quantile/cdf/info/etc.) still
-  # run in the caller process via build_tdigest_store below.
+  # TDigest commands now enter through typed command AST handlers with this
+  # store. Writes use prob_write so replicas materialize the same mmap files.
 
   defp build_tdigest_store(_resolved_key) do
     ctx = default_ctx()
@@ -5451,6 +5549,9 @@ defmodule FerricStore do
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
+      end,
+      compound_batch_put: fn redis_key, entries ->
+        Router.compound_batch_put(ctx, redis_key, entries)
       end,
       compound_delete: fn redis_key, compound_key ->
         Router.compound_delete(ctx, redis_key, compound_key)
@@ -5865,6 +5966,7 @@ defmodule FerricStore.Pipe do
 
   defp to_resp_command({:set, key, value, opts}) do
     args = [key, value]
+    ast_opts = set_ast_options(opts)
 
     args =
       case Keyword.get(opts, :ttl) do
@@ -5891,23 +5993,32 @@ defmodule FerricStore.Pipe do
     args =
       if Keyword.get(opts, :xx, false), do: args ++ ["XX"], else: args
 
-    {"SET", args}
+    {"SET", args, {:set, key, value, ast_opts}}
   end
 
-  defp to_resp_command({:get, key}), do: {"GET", [key]}
-  defp to_resp_command({:del, key}), do: {"DEL", [key]}
-  defp to_resp_command({:incr, key}), do: {"INCR", [key]}
-  defp to_resp_command({:incr_by, key, amount}), do: {"INCRBY", [key, Integer.to_string(amount)]}
+  defp to_resp_command({:get, key}), do: {"GET", [key], {:get, key}}
+  defp to_resp_command({:del, key}), do: {"DEL", [key], {:del, [key]}}
+  defp to_resp_command({:incr, key}), do: {"INCR", [key], {:incr, key}}
+
+  defp to_resp_command({:incr_by, key, amount}),
+    do: {"INCRBY", [key, Integer.to_string(amount)], {:incrby, key, amount}}
 
   defp to_resp_command({:hset, key, fields}) do
     flat = Enum.flat_map(fields, fn {k, v} -> [to_string(k), to_string(v)] end)
-    {"HSET", [key | flat]}
+    args = [key | flat]
+    {"HSET", args, {:hset, args}}
   end
 
-  defp to_resp_command({:hget, key, field}), do: {"HGET", [key, field]}
-  defp to_resp_command({:lpush, key, elements}), do: {"LPUSH", [key | elements]}
-  defp to_resp_command({:rpush, key, elements}), do: {"RPUSH", [key | elements]}
-  defp to_resp_command({:sadd, key, members}), do: {"SADD", [key | members]}
+  defp to_resp_command({:hget, key, field}), do: {"HGET", [key, field], {:hget, key, field}}
+
+  defp to_resp_command({:lpush, key, elements}),
+    do: {"LPUSH", [key | elements], {:lpush, [key | elements]}}
+
+  defp to_resp_command({:rpush, key, elements}),
+    do: {"RPUSH", [key | elements], {:rpush, [key | elements]}}
+
+  defp to_resp_command({:sadd, key, members}),
+    do: {"SADD", [key | members], {:sadd, [key | members]}}
 
   defp to_resp_command({:zadd, key, pairs}) do
     flat =
@@ -5915,11 +6026,32 @@ defmodule FerricStore.Pipe do
         [to_string(score), member]
       end)
 
-    {"ZADD", [key | flat]}
+    args = [key | flat]
+    {"ZADD", args, {:zadd, args}}
   end
 
   defp to_resp_command({:expire, key, ttl_ms}) do
-    {"PEXPIRE", [key, Integer.to_string(ttl_ms)]}
+    {"PEXPIRE", [key, Integer.to_string(ttl_ms)], {:pexpire, key, ttl_ms}}
+  end
+
+  defp set_ast_options(opts) do
+    []
+    |> maybe_add_set_expiry(opts)
+    |> maybe_add_set_flag(opts, :nx)
+    |> maybe_add_set_flag(opts, :xx)
+  end
+
+  defp maybe_add_set_expiry(acc, opts) do
+    cond do
+      Keyword.get(opts, :ttl) not in [nil, 0] -> [{:px, Keyword.fetch!(opts, :ttl)} | acc]
+      Keyword.has_key?(opts, :ex) -> [{:ex, Keyword.fetch!(opts, :ex)} | acc]
+      Keyword.has_key?(opts, :px) -> [{:px, Keyword.fetch!(opts, :px)} | acc]
+      true -> acc
+    end
+  end
+
+  defp maybe_add_set_flag(acc, opts, flag) do
+    if Keyword.get(opts, flag, false), do: [flag | acc], else: acc
   end
 end
 
@@ -6056,6 +6188,7 @@ defmodule FerricStore.Tx do
 
   defp to_resp_command({:set, key, value, opts}) do
     args = [key, value]
+    ast_opts = set_ast_options(opts)
 
     args =
       case Keyword.get(opts, :ex) do
@@ -6075,23 +6208,32 @@ defmodule FerricStore.Tx do
     args =
       if Keyword.get(opts, :xx, false), do: args ++ ["XX"], else: args
 
-    {"SET", args}
+    {"SET", args, {:set, key, value, ast_opts}}
   end
 
-  defp to_resp_command({:get, key}), do: {"GET", [key]}
-  defp to_resp_command({:del, key}), do: {"DEL", [key]}
-  defp to_resp_command({:incr, key}), do: {"INCR", [key]}
-  defp to_resp_command({:incr_by, key, amount}), do: {"INCRBY", [key, Integer.to_string(amount)]}
+  defp to_resp_command({:get, key}), do: {"GET", [key], {:get, key}}
+  defp to_resp_command({:del, key}), do: {"DEL", [key], {:del, [key]}}
+  defp to_resp_command({:incr, key}), do: {"INCR", [key], {:incr, key}}
+
+  defp to_resp_command({:incr_by, key, amount}),
+    do: {"INCRBY", [key, Integer.to_string(amount)], {:incrby, key, amount}}
 
   defp to_resp_command({:hset, key, fields}) do
     flat = Enum.flat_map(fields, fn {k, v} -> [to_string(k), to_string(v)] end)
-    {"HSET", [key | flat]}
+    args = [key | flat]
+    {"HSET", args, {:hset, args}}
   end
 
-  defp to_resp_command({:hget, key, field}), do: {"HGET", [key, field]}
-  defp to_resp_command({:lpush, key, elements}), do: {"LPUSH", [key | elements]}
-  defp to_resp_command({:rpush, key, elements}), do: {"RPUSH", [key | elements]}
-  defp to_resp_command({:sadd, key, members}), do: {"SADD", [key | members]}
+  defp to_resp_command({:hget, key, field}), do: {"HGET", [key, field], {:hget, key, field}}
+
+  defp to_resp_command({:lpush, key, elements}),
+    do: {"LPUSH", [key | elements], {:lpush, [key | elements]}}
+
+  defp to_resp_command({:rpush, key, elements}),
+    do: {"RPUSH", [key | elements], {:rpush, [key | elements]}}
+
+  defp to_resp_command({:sadd, key, members}),
+    do: {"SADD", [key | members], {:sadd, [key | members]}}
 
   defp to_resp_command({:zadd, key, pairs}) do
     flat =
@@ -6099,10 +6241,30 @@ defmodule FerricStore.Tx do
         [to_string(score), member]
       end)
 
-    {"ZADD", [key | flat]}
+    args = [key | flat]
+    {"ZADD", args, {:zadd, args}}
   end
 
   defp to_resp_command({:expire, key, ttl_ms}) do
-    {"PEXPIRE", [key, Integer.to_string(ttl_ms)]}
+    {"PEXPIRE", [key, Integer.to_string(ttl_ms)], {:pexpire, key, ttl_ms}}
+  end
+
+  defp set_ast_options(opts) do
+    []
+    |> maybe_add_set_expiry(opts)
+    |> maybe_add_set_flag(opts, :nx)
+    |> maybe_add_set_flag(opts, :xx)
+  end
+
+  defp maybe_add_set_expiry(acc, opts) do
+    cond do
+      Keyword.has_key?(opts, :ex) -> [{:ex, Keyword.fetch!(opts, :ex)} | acc]
+      Keyword.has_key?(opts, :px) -> [{:px, Keyword.fetch!(opts, :px)} | acc]
+      true -> acc
+    end
+  end
+
+  defp maybe_add_set_flag(acc, opts, flag) do
+    if Keyword.get(opts, flag, false), do: [flag | acc], else: acc
   end
 end

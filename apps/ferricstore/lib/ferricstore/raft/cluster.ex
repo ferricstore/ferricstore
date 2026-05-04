@@ -178,7 +178,9 @@ defmodule Ferricstore.Raft.Cluster do
       ets: ets,
       data_dir: Ferricstore.DataDir.root_from_shard_path(shard_data_path),
       instance_name: instance_name,
-      skip_below_index: skip_below_index
+      skip_below_index: skip_below_index,
+      zset_score_index_name: Keyword.get(opts, :zset_score_index_name),
+      zset_score_lookup_name: Keyword.get(opts, :zset_score_lookup_name)
     }
 
     initial_members =
@@ -370,7 +372,9 @@ defmodule Ferricstore.Raft.Cluster do
       ets: ets,
       data_dir: Ferricstore.DataDir.root_from_shard_path(shard_data_path),
       instance_name: instance_name,
-      skip_below_index: skip_below_index
+      skip_below_index: skip_below_index,
+      zset_score_index_name: Keyword.get(opts, :zset_score_index_name),
+      zset_score_lookup_name: Keyword.get(opts, :zset_score_lookup_name)
     }
 
     # In cluster mode, initial_members includes all configured nodes.

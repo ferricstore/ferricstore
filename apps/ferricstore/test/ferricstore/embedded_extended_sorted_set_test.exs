@@ -63,6 +63,19 @@ defmodule Ferricstore.EmbeddedExtendedSortedSetTest do
       FerricStore.zadd("zbs:key3", [{1.0, "a"}])
       assert {:ok, []} = FerricStore.zrangebyscore("zbs:key3", "10", "20")
     end
+
+    test "score index stays current after zadd updates and zrem" do
+      key = "zbs:index_mutation"
+      FerricStore.zadd(key, [{1.0, "a"}, {2.0, "b"}, {3.0, "c"}])
+
+      assert {:ok, ["a", "b", "c"]} = FerricStore.zrangebyscore(key, "-inf", "+inf")
+
+      FerricStore.zadd(key, [{10.0, "b"}, {0.5, "d"}])
+      assert {:ok, ["d", "a"]} = FerricStore.zrangebyscore(key, "-inf", "2")
+
+      FerricStore.zrem(key, ["a"])
+      assert {:ok, ["d"]} = FerricStore.zrangebyscore(key, "-inf", "2")
+    end
   end
 
   describe "zcount/3" do
@@ -79,6 +92,16 @@ defmodule Ferricstore.EmbeddedExtendedSortedSetTest do
     test "returns 0 for out-of-range" do
       FerricStore.zadd("zc:key3", [{1.0, "a"}])
       assert {:ok, 0} = FerricStore.zcount("zc:key3", "10", "20")
+    end
+
+    test "score index count stays current after zincrby" do
+      key = "zc:index_mutation"
+      FerricStore.zadd(key, [{1.0, "a"}, {2.0, "b"}])
+
+      assert {:ok, 2} = FerricStore.zcount(key, "-inf", "2")
+
+      assert {:ok, _score} = FerricStore.zincrby(key, 5.0, "a")
+      assert {:ok, 1} = FerricStore.zcount(key, "-inf", "2")
     end
   end
 
@@ -220,6 +243,7 @@ defmodule Ferricstore.EmbeddedExtendedSortedSetTest do
       for i <- 1..10 do
         FerricStore.xadd("xt:key", ["i", to_string(i)])
       end
+
       assert {:ok, trimmed} = FerricStore.xtrim("xt:key", maxlen: 5)
       assert is_integer(trimmed) and trimmed >= 0
       assert {:ok, len} = FerricStore.xlen("xt:key")

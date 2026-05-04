@@ -6,6 +6,7 @@ defmodule Ferricstore.Store.Shard.Compound do
   alias Ferricstore.Store.{ColdRead, LFU, Promotion}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
+  alias Ferricstore.Store.Shard.ZSetIndex
 
   require Logger
 
@@ -479,6 +480,22 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec handle_compound_batch_put(
+          binary(),
+          [{binary(), binary(), non_neg_integer()}],
+          map()
+        ) :: {:reply, term(), map()}
+  @doc false
+  def handle_compound_batch_put(_redis_key, [], state), do: {:reply, :ok, state}
+
+  def handle_compound_batch_put(redis_key, entries, state) do
+    if state.raft? do
+      handle_compound_batch_put_raft(redis_key, entries, state)
+    else
+      handle_compound_batch_put_direct(redis_key, entries, state)
+    end
+  end
+
   @spec handle_compound_delete(binary(), binary(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_compound_delete(redis_key, compound_key, state) do
@@ -520,6 +537,27 @@ defmodule Ferricstore.Store.Shard.Compound do
       _dedicated_path ->
         {:reply, ShardETS.prefix_count_entries(state, prefix), state}
     end
+  end
+
+  @spec handle_zset_score_range(binary(), term(), term(), boolean(), map()) ::
+          {:reply, {:ok, [{binary(), float()}]}, map()}
+  @doc false
+  def handle_zset_score_range(redis_key, min_bound, max_bound, reverse?, state) do
+    state = ensure_zset_score_index(state, redis_key)
+
+    {:reply,
+     {:ok, ZSetIndex.range(state.zset_score_index, redis_key, min_bound, max_bound, reverse?)},
+     state}
+  end
+
+  @spec handle_zset_score_count(binary(), term(), term(), map()) ::
+          {:reply, {:ok, non_neg_integer()}, map()}
+  @doc false
+  def handle_zset_score_count(redis_key, min_bound, max_bound, state) do
+    state = ensure_zset_score_index(state, redis_key)
+
+    {:reply, {:ok, ZSetIndex.count(state.zset_score_index, redis_key, min_bound, max_bound)},
+     state}
   end
 
   @spec handle_compound_delete_prefix(binary(), binary(), map()) :: {:reply, :ok, map()}
@@ -569,12 +607,75 @@ defmodule Ferricstore.Store.Shard.Compound do
             _dedicated_path -> bump_promoted_writes(new_state, redis_key)
           end
 
+        new_state = ZSetIndex.apply_put(new_state, redis_key, compound_key, value)
+
         {:reply, :ok, new_state}
 
       {:error, _} = err ->
         {:reply, err, state}
     end
   end
+
+  defp handle_compound_batch_put_raft(redis_key, entries, state) do
+    tracked_state =
+      Enum.reduce(entries, state, fn {compound_key, value, _expire_at_ms}, acc ->
+        case promoted_store_for_compound(acc, redis_key, compound_key) do
+          nil ->
+            acc
+
+          _dedicated_path ->
+            track_promoted_dead_bytes(
+              acc,
+              redis_key,
+              compound_key,
+              promoted_record_size(compound_key, value)
+            )
+        end
+      end)
+
+    commands =
+      Enum.map(entries, fn {compound_key, value, expire_at_ms} ->
+        {:compound_put, compound_key, value, expire_at_ms}
+      end)
+
+    result = Ferricstore.Raft.Batcher.write(tracked_state.index, {:batch, commands})
+    new_version = tracked_state.write_version + 1
+
+    case normalize_compound_batch_result(result) do
+      :ok ->
+        new_state = %{tracked_state | write_version: new_version}
+
+        new_state =
+          case List.last(entries) do
+            {compound_key, _value, _expire_at_ms} ->
+              case promoted_store_for_compound(new_state, redis_key, compound_key) do
+                nil -> maybe_promote(new_state, redis_key, compound_key)
+                _dedicated_path -> bump_promoted_writes(new_state, redis_key)
+              end
+
+            nil ->
+              new_state
+          end
+
+        new_state = ZSetIndex.apply_puts(new_state, redis_key, entries)
+
+        {:reply, :ok, new_state}
+
+      {:error, _} = err ->
+        {:reply, err, state}
+    end
+  end
+
+  defp normalize_compound_batch_result({:ok, results}) when is_list(results) do
+    case Enum.find(results, &match?({:error, _}, &1)) do
+      nil -> :ok
+      {:error, _} = err -> err
+    end
+  end
+
+  defp normalize_compound_batch_result(:ok), do: :ok
+  defp normalize_compound_batch_result({:error, _} = err), do: err
+  defp normalize_compound_batch_result(other), do: {:error, other}
 
   defp promoted_record_size(compound_key, value) when is_binary(value) do
     @record_header_size + byte_size(compound_key) + byte_size(value)
@@ -594,6 +695,7 @@ defmodule Ferricstore.Store.Shard.Compound do
             else: new_state
 
         new_state = maybe_promote(new_state, redis_key, compound_key)
+        new_state = ZSetIndex.apply_put(new_state, redis_key, compound_key, value)
 
         {:reply, :ok, new_state}
 
@@ -613,13 +715,29 @@ defmodule Ferricstore.Store.Shard.Compound do
               value_size
             )
 
-            {:reply, :ok, bump_promoted_writes(state, redis_key)}
+            new_state =
+              state
+              |> bump_promoted_writes(redis_key)
+              |> ZSetIndex.apply_put(redis_key, compound_key, value)
+
+            {:reply, :ok, new_state}
 
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted write failed: #{inspect(reason)}")
             {:reply, {:error, reason}, state}
         end
     end
+  end
+
+  defp handle_compound_batch_put_direct(redis_key, entries, state) do
+    Enum.reduce_while(entries, {:reply, :ok, state}, fn {compound_key, value, expire_at_ms},
+                                                        {:reply, :ok, acc_state} ->
+      case handle_compound_put_direct(redis_key, compound_key, value, expire_at_ms, acc_state) do
+        {:reply, :ok, new_state} -> {:cont, {:reply, :ok, new_state}}
+        {:reply, {:error, _} = err, new_state} -> {:halt, {:reply, err, new_state}}
+        {:reply, other, new_state} -> {:halt, {:reply, other, new_state}}
+      end
+    end)
   end
 
   defp handle_compound_delete_raft(redis_key, compound_key, state) do
@@ -641,6 +759,8 @@ defmodule Ferricstore.Store.Shard.Compound do
           else
             tracked_state
           end
+
+        new_state = ZSetIndex.apply_delete(new_state, redis_key, compound_key)
 
         {:reply, :ok, %{new_state | write_version: new_version}}
 
@@ -667,7 +787,13 @@ defmodule Ferricstore.Store.Shard.Compound do
               end
 
             new_version = state.write_version + 1
-            {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
+
+            new_state =
+              state
+              |> Map.merge(%{pending: new_pending, write_version: new_version})
+              |> ZSetIndex.apply_delete(redis_key, compound_key)
+
+            {:reply, :ok, new_state}
 
           {:error, reason} ->
             Logger.error(
@@ -683,7 +809,13 @@ defmodule Ferricstore.Store.Shard.Compound do
         case promoted_tombstone(dedicated_path, compound_key) do
           {:ok, _} ->
             ShardETS.ets_delete_key(state, compound_key)
-            {:reply, :ok, bump_promoted_writes(state, redis_key)}
+
+            new_state =
+              state
+              |> bump_promoted_writes(redis_key)
+              |> ZSetIndex.apply_delete(redis_key, compound_key)
+
+            {:reply, :ok, new_state}
 
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted tombstone failed: #{inspect(reason)}")
@@ -699,7 +831,12 @@ defmodule Ferricstore.Store.Shard.Compound do
     case result do
       :ok ->
         new_promoted = Map.delete(state.promoted_instances, redis_key)
-        {:reply, :ok, %{state | promoted_instances: new_promoted, write_version: new_version}}
+
+        new_state =
+          %{state | promoted_instances: new_promoted, write_version: new_version}
+          |> ZSetIndex.clear_ready_key(redis_key)
+
+        {:reply, :ok, new_state}
 
       {:error, _} = err ->
         {:reply, err, state}
@@ -716,7 +853,11 @@ defmodule Ferricstore.Store.Shard.Compound do
 
         case tombstone_and_delete_keys(state, keys_to_delete) do
           {:ok, new_state} ->
-            {:reply, :ok, %{new_state | write_version: new_state.write_version + 1}}
+            new_state =
+              %{new_state | write_version: new_state.write_version + 1}
+              |> ZSetIndex.clear_ready_key(redis_key)
+
+            {:reply, :ok, new_state}
 
           {{:error, reason}, new_state} ->
             Logger.error(
@@ -742,14 +883,23 @@ defmodule Ferricstore.Store.Shard.Compound do
 
         new_promoted = Map.delete(state.promoted_instances, redis_key)
 
-        {:reply, :ok,
-         %{state | promoted_instances: new_promoted, write_version: state.write_version + 1}}
+        new_state =
+          %{state | promoted_instances: new_promoted, write_version: state.write_version + 1}
+          |> ZSetIndex.clear_ready_key(redis_key)
+
+        {:reply, :ok, new_state}
     end
   end
 
   # -------------------------------------------------------------------
   # Promotion helpers
   # -------------------------------------------------------------------
+
+  defp ensure_zset_score_index(state, redis_key) do
+    prefix = Ferricstore.Store.CompoundKey.zset_prefix(redis_key)
+    data_path = promoted_store(state, redis_key) || state.shard_data_path
+    ZSetIndex.ensure(state, redis_key, prefix, data_path)
+  end
 
   @spec promoted_store(map(), binary()) :: binary() | nil
   @doc false
@@ -1413,6 +1563,13 @@ defmodule Ferricstore.Store.Shard.Compound do
 
     threshold = Promotion.threshold()
 
+    # Promotion is a one-time structural migration per collection. Keeping it
+    # inline preserves the current crash-safe semantics, but it can add a cold
+    # create latency spike when a large hash/set/zset first crosses the
+    # threshold. If that p99 path becomes important, move promotion to a
+    # background job that keeps reads on shared compound keys until the dedicated
+    # copy and marker are fully durable. Do not prioritize that over steady-state
+    # score-index work for long-lived hot sorted sets.
     if threshold == 0 or Map.has_key?(state.promoted_instances, redis_key) do
       state
     else

@@ -58,6 +58,7 @@ defmodule Ferricstore.Store.Shard do
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
   alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
   alias Ferricstore.Store.Shard.Writes, as: ShardWrites
+  alias Ferricstore.Store.Shard.ZSetIndex
 
   require Logger
 
@@ -114,7 +115,10 @@ defmodule Ferricstore.Store.Shard do
     # Maximum active file size before rotation. Cached from Application env
     # at init time. Updated via handle_cast(:update_max_active_file_size, n).
     max_active_file_size: 256 * 1024 * 1024,
-    writes_paused: false
+    writes_paused: false,
+    zset_score_index: nil,
+    zset_score_lookup: nil,
+    zset_index_ready: MapSet.new()
   ]
 
   # -------------------------------------------------------------------
@@ -196,6 +200,11 @@ defmodule Ferricstore.Store.Shard do
 
       ets = keydir
 
+      instance_name = if ctx, do: ctx.name, else: :default
+      {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, index)
+      ensure_zset_index_table!(zset_score_index, :ordered_set)
+      ensure_zset_index_table!(zset_score_lookup, :set)
+
       # v2: recover ETS keydir from hint files or by scanning log files BEFORE
       # starting Raft. This ensures cold entries ({key, nil, ..., fid, off, vsize})
       # are in ETS when ra replays WAL entries via apply/3. Without this, replayed
@@ -221,7 +230,9 @@ defmodule Ferricstore.Store.Shard do
               ctx.name,
               # Start all Ra servers first, then Application waits for all
               # elections in parallel before marking the node ready.
-              wait_for_leader: false
+              wait_for_leader: false,
+              zset_score_index_name: zset_score_index,
+              zset_score_lookup_name: zset_score_lookup
             )
           end)
         else
@@ -286,7 +297,10 @@ defmodule Ferricstore.Store.Shard do
          file_stats: file_stats,
          merge_config: merge_config,
          raft?: raft?,
-         max_active_file_size: max_file_size
+         max_active_file_size: max_file_size,
+         zset_score_index: zset_score_index,
+         zset_score_lookup: zset_score_lookup,
+         zset_index_ready: MapSet.new()
        }, {:continue, {:flush_interval, flush_ms}}}
     catch
       {:shard_init_failed, reason} -> {:stop, reason}
@@ -294,6 +308,23 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp file_path(shard_path, file_id), do: ShardETS.file_path(shard_path, file_id)
+
+  defp ensure_zset_index_table!(table_name, table_type) do
+    case :ets.whereis(table_name) do
+      :undefined ->
+        :ets.new(table_name, [
+          table_type,
+          :public,
+          :named_table,
+          {:read_concurrency, true},
+          {:write_concurrency, :auto}
+        ])
+
+      _tid ->
+        :ets.delete_all_objects(table_name)
+        table_name
+    end
+  end
 
   defp ensure_initial_files!(path, index, fsync_dir_fun) do
     dir_created? = not Ferricstore.FS.dir?(path)
@@ -548,6 +579,12 @@ defmodule Ferricstore.Store.Shard do
     |> track_write_version_result(state)
   end
 
+  def handle_call({:compound_batch_put, redis_key, entries}, _from, state) do
+    redis_key
+    |> ShardCompound.handle_compound_batch_put(entries, state)
+    |> track_write_version_result(state)
+  end
+
   def handle_call({:compound_delete, redis_key, compound_key}, _from, state) do
     redis_key
     |> ShardCompound.handle_compound_delete(compound_key, state)
@@ -560,6 +597,14 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call({:compound_count, redis_key, prefix}, _from, state) do
     ShardCompound.handle_compound_count(redis_key, prefix, state)
+  end
+
+  def handle_call({:zset_score_range, redis_key, min_bound, max_bound, reverse?}, _from, state) do
+    ShardCompound.handle_zset_score_range(redis_key, min_bound, max_bound, reverse?, state)
+  end
+
+  def handle_call({:zset_score_count, redis_key, min_bound, max_bound}, _from, state) do
+    ShardCompound.handle_zset_score_count(redis_key, min_bound, max_bound, state)
   end
 
   def handle_call({:compound_delete_prefix, redis_key, prefix}, _from, state) do

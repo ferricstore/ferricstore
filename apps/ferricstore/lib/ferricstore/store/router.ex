@@ -141,16 +141,7 @@ defmodule Ferricstore.Store.Router do
     if leader_node == node() do
       {:error, "ERR not leader, election in progress"}
     else
-      cond do
-        bypass_shard?(command) ->
-          # No shard handler exists for these tuples (json/bitmap/geo/hll/
-          # tdigest "*_op"). Forward by re-running async_write on the leader
-          # node — its local Batcher is the leader and won't reject.
-          forward_bypass_to_leader(leader_node, idx, command)
-
-        true ->
-          forward_via_shard_call(ctx, leader_node, idx, command)
-      end
+      forward_via_shard_call(ctx, leader_node, idx, command)
     end
   end
 
@@ -191,31 +182,6 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp forward_bypass_to_leader(leader_node, idx, command) do
-    try do
-      remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
-
-      result =
-        :erpc.call(
-          leader_node,
-          __MODULE__,
-          :run_bypass_locally,
-          [remote_ctx, command, node()],
-          10_000
-        )
-
-      case result do
-        {:remote_applied_at, _ra_index, _real_result} ->
-          barrier_forwarded_result(idx, result, 5_000)
-
-        other ->
-          barrier_forwarded_result(idx, other, 5_000)
-      end
-    catch
-      _, reason -> forward_failure_result(reason)
-    end
-  end
-
   @doc false
   def __barrier_forwarded_result__(idx, result, timeout_ms \\ 5_000),
     do: barrier_forwarded_result(idx, result, timeout_ms)
@@ -250,36 +216,6 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp barrier_forwarded_result(_idx, other, _timeout_ms), do: other
-
-  @doc false
-  # Public-but-undocumented entry point invoked via erpc from peer nodes
-  # when a bypass_shard? command is forwarded to its shard's leader.
-  # Re-runs the command on the local (leader) node, going through the
-  # normal raft_write path which now recognizes us as the leader.
-  def run_bypass_locally(ctx, command), do: run_bypass_locally(ctx, command, node())
-
-  @doc false
-  def run_bypass_locally(ctx, command, origin_node) do
-    key =
-      case command do
-        {:json_op, _, [k | _]} -> k
-        {:bitmap_op, "BITOP", [_op, dest | _]} -> dest
-        {:bitmap_op, _, [k | _]} -> k
-        {:geo_op, "GEOSEARCHSTORE", [dest | _]} -> dest
-        {:geo_op, _, [k | _]} -> k
-        {:hll_op, _, [k | _]} -> k
-        {:tdigest_op, "TDIGEST.MERGE", [dest | _]} -> dest
-        {:tdigest_op, _, [k | _]} -> k
-      end
-
-    idx = shard_for(ctx, key)
-
-    if origin_node == node() do
-      raft_write(ctx, idx, key, command)
-    else
-      forced_quorum_write(ctx, idx, command, origin_node)
-    end
-  end
 
   @doc "Public wrapper for durability_for_key, used by batch SET fast path."
   @spec durability_for_key_public(FerricStore.Instance.t(), binary()) :: :quorum | :async
@@ -321,12 +257,6 @@ defmodule Ferricstore.Store.Router do
   defp raft_write(ctx, idx, key, command) do
     if ctx.name == :default do
       cond do
-        # Commands the Shard GenServer doesn't handle (json/bitmap/geo/hll/
-        # tdigest "*_op" tuples). These must skip the shard and go directly
-        # via Batcher to Raft. async_write uses Batcher.write_async_quorum
-        # which submits to the forced-quorum slot and returns the actual
-        # state machine result (RMW-safe).
-        bypass_shard?(command) -> async_write(ctx, idx, command)
         always_quorum?(command) -> quorum_write(ctx, idx, command)
         durability_for_key(ctx, key) == :quorum -> quorum_write(ctx, idx, command)
         true -> async_write(ctx, idx, command)
@@ -337,17 +267,6 @@ defmodule Ferricstore.Store.Router do
       GenServer.call(elem(ctx.shard_names, idx), command)
     end
   end
-
-  # Tuples that have no Shard.handle_call clause. Sending them through
-  # quorum_write would deadlock the shard caller for 10s. The forced-quorum
-  # batcher slot already gives us strong consistency and the real return
-  # value, so these route there directly regardless of namespace.
-  defp bypass_shard?({:json_op, _, _}), do: true
-  defp bypass_shard?({:bitmap_op, _, _}), do: true
-  defp bypass_shard?({:geo_op, _, _}), do: true
-  defp bypass_shard?({:hll_op, _, _}), do: true
-  defp bypass_shard?({:tdigest_op, _, _}), do: true
-  defp bypass_shard?(_), do: false
 
   # Linearizable primitives — must NEVER take the async path even if the
   # namespace is configured `:async`. Adding a new coordination primitive?
@@ -3425,139 +3344,6 @@ defmodule Ferricstore.Store.Router do
     raft_write(ctx, shard_for(ctx, key), key, {:zincrby, key, increment, member})
   end
 
-  @doc """
-  Runs a JSON RMW command atomically via Raft. `cmd` is the Redis command
-  name (e.g. "JSON.SET"), `args` is the argument list starting with the key.
-  The state machine dispatches to `Ferricstore.Commands.Json.handle/3` with
-  a state-machine-scoped store, so concurrent callers serialize through
-  the Raft log — no lost updates.
-  """
-  @spec json_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
-  def json_op(ctx, cmd, [key | _] = args) do
-    raft_write(ctx, shard_for(ctx, key), key, {:json_op, cmd, args})
-  end
-
-  @doc """
-  Runs a HyperLogLog RMW command (PFADD / PFMERGE) atomically via Raft.
-  PFCOUNT is read-only and should not go through this path.
-  """
-  @spec hll_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
-  def hll_op(ctx, "PFMERGE", [destkey | source_keys] = args) when source_keys != [] do
-    keys_with_roles = [{destkey, :write} | Enum.map(source_keys, &{&1, :read})]
-
-    Ferricstore.CrossShardOp.execute(
-      keys_with_roles,
-      fn _store ->
-        raft_write(ctx, shard_for(ctx, destkey), destkey, {:hll_op, "PFMERGE", args})
-      end,
-      intent: %{command: :pfmerge, keys: %{targets: [destkey | source_keys]}},
-      instance: ctx
-    )
-  end
-
-  def hll_op(ctx, cmd, [key | _] = args) do
-    raft_write(ctx, shard_for(ctx, key), key, {:hll_op, cmd, args})
-  end
-
-  @doc """
-  Runs a Bitmap RMW command (BITOP / BITFIELD) atomically via Raft. SETBIT
-  has its own `setbit/4` path. GETBIT/BITCOUNT/BITPOS are read-only and do
-  not go through this path.
-  """
-  @spec bitmap_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
-  # BITOP reads multiple source keys and writes a destination — the sources
-  # may live on different shards. Use CrossShardOp for cross-shard correctness;
-  # if all keys (sources + dest) hash to the same shard, the same path
-  # collapses to a single-shard quorum write transparently.
-  def bitmap_op(ctx, "BITOP", [_op_str, destkey | source_keys] = args) do
-    keys_with_roles = [{destkey, :write} | Enum.map(source_keys, &{&1, :read})]
-
-    Ferricstore.CrossShardOp.execute(
-      keys_with_roles,
-      fn _store ->
-        # Dispatch through the normal raft path with the dest's shard as the
-        # coordinator. With CrossShardOp's locks held this is now safe even
-        # if the source is on a different shard (the read in execute_bitop
-        # is consistent because the lock blocks concurrent writers).
-        raft_write(ctx, shard_for(ctx, destkey), destkey, {:bitmap_op, "BITOP", args})
-      end,
-      intent: %{command: :bitop, keys: %{targets: [destkey | source_keys]}},
-      instance: ctx
-    )
-  end
-
-  def bitmap_op(ctx, cmd, [key | _] = args) do
-    raft_write(ctx, shard_for(ctx, key), key, {:bitmap_op, cmd, args})
-  end
-
-  @doc """
-  Runs a Geo RMW command (GEOADD, GEOSEARCHSTORE) atomically via Raft.
-  GEOSEARCHSTORE routes by the destination key; GEOADD routes by the key.
-  Read-only ops (GEOPOS, GEODIST, GEOHASH, GEOSEARCH) don't go through here.
-  """
-  @spec geo_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
-  def geo_op(ctx, "GEOSEARCHSTORE", [dest, source | _] = args) do
-    keys_with_roles = [{dest, :write}, {source, :read}]
-
-    Ferricstore.CrossShardOp.execute(
-      keys_with_roles,
-      fn _store ->
-        raft_write(ctx, shard_for(ctx, dest), dest, {:geo_op, "GEOSEARCHSTORE", args})
-      end,
-      intent: %{command: :geosearchstore, keys: %{dest: dest, source: source}},
-      instance: ctx
-    )
-  end
-
-  def geo_op(ctx, "GEOSEARCHSTORE", [dest | _] = args) do
-    raft_write(ctx, shard_for(ctx, dest), dest, {:geo_op, "GEOSEARCHSTORE", args})
-  end
-
-  def geo_op(ctx, cmd, [key | _] = args) do
-    raft_write(ctx, shard_for(ctx, key), key, {:geo_op, cmd, args})
-  end
-
-  @doc """
-  Runs a TDigest RMW command (TDIGEST.ADD / RESET / MERGE / CREATE)
-  atomically via Raft. Read-only ops (QUANTILE, CDF, INFO, RANK, etc.)
-  stay in the caller process.
-  """
-  @spec tdigest_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
-  def tdigest_op(ctx, "TDIGEST.MERGE", [dest | _] = args) do
-    source_keys = tdigest_merge_source_keys(args)
-
-    if source_keys == [] do
-      raft_write(ctx, shard_for(ctx, dest), dest, {:tdigest_op, "TDIGEST.MERGE", args})
-    else
-      keys_with_roles = [{dest, :write} | Enum.map(source_keys, &{&1, :read})]
-
-      Ferricstore.CrossShardOp.execute(
-        keys_with_roles,
-        fn _store ->
-          raft_write(ctx, shard_for(ctx, dest), dest, {:tdigest_op, "TDIGEST.MERGE", args})
-        end,
-        intent: %{command: :tdigest_merge, keys: %{targets: [dest | source_keys]}},
-        instance: ctx
-      )
-    end
-  end
-
-  def tdigest_op(ctx, cmd, [key | _] = args) do
-    raft_write(ctx, shard_for(ctx, key), key, {:tdigest_op, cmd, args})
-  end
-
-  defp tdigest_merge_source_keys([_dest, numkeys_str | rest]) do
-    case Integer.parse(to_string(numkeys_str)) do
-      {numkeys, ""} when numkeys > 0 and length(rest) >= numkeys ->
-        Enum.take(rest, numkeys)
-
-      _ ->
-        []
-    end
-  end
-
-  defp tdigest_merge_source_keys(_args), do: []
-
   @doc "Returns all live (non-expired, non-deleted) keys across every shard."
   @spec keys(FerricStore.Instance.t()) :: [binary()]
   def keys(ctx) do
@@ -3885,6 +3671,33 @@ defmodule Ferricstore.Store.Router do
       end
     else
       safe_write_call(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
+    end
+  end
+
+  @spec compound_batch_put(
+          FerricStore.Instance.t(),
+          binary(),
+          [{binary(), binary(), non_neg_integer()}]
+        ) :: :ok | {:error, term()}
+  def compound_batch_put(_ctx, _redis_key, []), do: :ok
+
+  def compound_batch_put(ctx, redis_key, entries) do
+    idx = shard_for(ctx, redis_key)
+
+    if ctx.name == :default do
+      case durability_for_key(ctx, redis_key) do
+        :quorum ->
+          quorum_write(ctx, idx, {:compound_batch_put, redis_key, entries})
+
+        :async ->
+          if promoted_parent?(ctx, idx, redis_key) do
+            quorum_write(ctx, idx, {:compound_batch_put, redis_key, entries})
+          else
+            async_compound_batch_put(ctx, idx, entries)
+          end
+      end
+    else
+      safe_write_call(ctx, idx, {:compound_batch_put, redis_key, entries})
     end
   end
 
@@ -4299,6 +4112,67 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  defp async_compound_batch_put(ctx, idx, entries) do
+    locks = Enum.map(entries, fn {compound_key, _value, _expire_at_ms} -> {idx, compound_key} end)
+
+    case acquire_async_key_latches(ctx, locks) do
+      {:ok, held_latches} ->
+        try do
+          do_async_compound_batch_put(ctx, idx, entries)
+        after
+          release_async_key_latches(held_latches)
+        end
+
+      {:error, {:timeout, wait_ms}} ->
+        async_key_latch_timeout_error(wait_ms)
+    end
+  end
+
+  defp do_async_compound_batch_put(ctx, idx, entries) do
+    size = :atomics.info(ctx.disk_pressure).size
+    under_pressure = idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
+
+    cond do
+      under_pressure ->
+        {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
+
+      Enum.any?(entries, fn {_compound_key, value, _expire_at_ms} ->
+        large_value_for_hot_cache?(ctx, value)
+      end) ->
+        Enum.reduce_while(entries, :ok, fn {compound_key, value, expire_at_ms}, :ok ->
+          case do_async_compound_put(ctx, idx, compound_key, value, expire_at_ms) do
+            :ok -> {:cont, :ok}
+            {:error, _} = err -> {:halt, err}
+            other -> {:halt, {:error, inspect(other)}}
+          end
+        end)
+
+      true ->
+        commands =
+          Enum.map(entries, fn {compound_key, value, expire_at_ms} ->
+            previous = snapshot_live_value(ctx, idx, compound_key)
+
+            origin_checked_command(
+              compound_key,
+              {:put, compound_key, value, expire_at_ms},
+              previous,
+              value,
+              expire_at_ms
+            )
+          end)
+
+        with :ok <- async_submit_batch_to_raft(idx, commands) do
+          Enum.each(entries, fn {compound_key, value, expire_at_ms} ->
+            :ok = install_async_put_value(ctx, idx, compound_key, value, expire_at_ms)
+          end)
+
+          size = :counters.info(ctx.write_version).size
+          if idx < size, do: :counters.add(ctx.write_version, idx + 1, length(entries))
+          :ok
+        end
+    end
+  end
+
   defp async_compound_delete(ctx, idx, compound_key) do
     with_async_key_latch(ctx, idx, compound_key, fn ->
       do_async_compound_delete(ctx, idx, compound_key)
@@ -4346,6 +4220,20 @@ defmodule Ferricstore.Store.Router do
       {:ok, count} -> count
       :unavailable -> 0
     end
+  end
+
+  @spec zset_score_range(FerricStore.Instance.t(), binary(), term(), term(), boolean()) ::
+          {:ok, [{binary(), float()}]} | :unavailable
+  def zset_score_range(ctx, redis_key, min_bound, max_bound, reverse?) do
+    idx = shard_for(ctx, redis_key)
+    safe_read_call(ctx, idx, {:zset_score_range, redis_key, min_bound, max_bound, reverse?})
+  end
+
+  @spec zset_score_count(FerricStore.Instance.t(), binary(), term(), term()) ::
+          {:ok, non_neg_integer()} | :unavailable
+  def zset_score_count(ctx, redis_key, min_bound, max_bound) do
+    idx = shard_for(ctx, redis_key)
+    safe_read_call(ctx, idx, {:zset_score_count, redis_key, min_bound, max_bound})
   end
 
   @spec compound_delete_prefix(FerricStore.Instance.t(), binary(), binary()) :: :ok

@@ -13,6 +13,7 @@ defmodule Ferricstore.Store.Ops do
 
   alias Ferricstore.HLC
   alias Ferricstore.Store.ColdRead
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.LocalTxStore
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -652,6 +653,43 @@ defmodule Ferricstore.Store.Ops do
   def compound_put(store, redis_key, compound_key, value, exp) when is_map(store),
     do: store.compound_put.(redis_key, compound_key, value, exp)
 
+  @spec compound_batch_put(store(), binary(), [{binary(), binary(), non_neg_integer()}]) :: :ok
+  def compound_batch_put(_store, _redis_key, []), do: :ok
+
+  def compound_batch_put(%FerricStore.Instance{} = ctx, redis_key, entries),
+    do: Router.compound_batch_put(ctx, redis_key, entries)
+
+  def compound_batch_put(%LocalTxStore{} = tx, redis_key, entries) do
+    if local?(tx, redis_key) do
+      Enum.each(entries, fn {compound_key, value, expire_at_ms} ->
+        ShardETS.ets_insert(tx.shard_state, compound_key, value, expire_at_ms)
+        tx_put_pending(compound_key, value, expire_at_ms)
+        tx_undelete(compound_key)
+        send(self(), tx_compound_write_message(tx, redis_key, compound_key, value, expire_at_ms))
+      end)
+
+      :ok
+    else
+      Router.compound_batch_put(tx.instance_ctx, redis_key, entries)
+    end
+  end
+
+  def compound_batch_put(store, redis_key, entries) when is_map(store) do
+    case store do
+      %{compound_batch_put: compound_batch_put_fun} when is_function(compound_batch_put_fun, 2) ->
+        compound_batch_put_fun.(redis_key, entries)
+
+      _ ->
+        Enum.reduce_while(entries, :ok, fn {compound_key, value, expire_at_ms}, :ok ->
+          case compound_put(store, redis_key, compound_key, value, expire_at_ms) do
+            :ok -> {:cont, :ok}
+            {:error, _} = err -> {:halt, err}
+            other -> {:halt, {:error, inspect(other)}}
+          end
+        end)
+    end
+  end
+
   @spec compound_delete(store(), binary(), binary()) :: :ok
   def compound_delete(%FerricStore.Instance{} = ctx, redis_key, compound_key),
     do: Router.compound_delete(ctx, redis_key, compound_key)
@@ -716,6 +754,41 @@ defmodule Ferricstore.Store.Ops do
   def compound_count(store, redis_key, prefix) when is_map(store),
     do: store.compound_count.(redis_key, prefix)
 
+  @spec zset_score_range(store(), binary(), term(), term(), boolean()) ::
+          {:ok, [{binary(), float()}]} | :unavailable
+  def zset_score_range(%FerricStore.Instance{} = ctx, redis_key, min_bound, max_bound, reverse?),
+    do: Router.zset_score_range(ctx, redis_key, min_bound, max_bound, reverse?)
+
+  def zset_score_range(%LocalTxStore{}, _redis_key, _min_bound, _max_bound, _reverse?),
+    do: :unavailable
+
+  def zset_score_range(store, redis_key, min_bound, max_bound, reverse?) when is_map(store) do
+    case store do
+      %{zset_score_range: fun} when is_function(fun, 4) ->
+        fun.(redis_key, min_bound, max_bound, reverse?)
+
+      _ ->
+        :unavailable
+    end
+  end
+
+  @spec zset_score_count(store(), binary(), term(), term()) ::
+          {:ok, non_neg_integer()} | :unavailable
+  def zset_score_count(%FerricStore.Instance{} = ctx, redis_key, min_bound, max_bound),
+    do: Router.zset_score_count(ctx, redis_key, min_bound, max_bound)
+
+  def zset_score_count(%LocalTxStore{}, _redis_key, _min_bound, _max_bound), do: :unavailable
+
+  def zset_score_count(store, redis_key, min_bound, max_bound) when is_map(store) do
+    case store do
+      %{zset_score_count: fun} when is_function(fun, 3) ->
+        fun.(redis_key, min_bound, max_bound)
+
+      _ ->
+        :unavailable
+    end
+  end
+
   @spec compound_delete_prefix(store(), binary(), binary()) :: :ok
   def compound_delete_prefix(%FerricStore.Instance{} = ctx, redis_key, prefix),
     do: Router.compound_delete_prefix(ctx, redis_key, prefix)
@@ -768,16 +841,70 @@ defmodule Ferricstore.Store.Ops do
 
   @spec flush(store()) :: :ok
   def flush(%FerricStore.Instance{} = ctx) do
-    Enum.each(Router.keys(ctx), fn k -> Router.delete(ctx, k) end)
+    ctx
+    |> Router.keys()
+    |> CompoundKey.user_visible_keys()
+    |> Enum.each(&flush_key(ctx, &1))
+
+    clear_stream_tables()
     :ok
   end
 
   def flush(%LocalTxStore{} = tx) do
-    Enum.each(Router.keys(tx.instance_ctx), fn k -> Router.delete(tx.instance_ctx, k) end)
+    tx.instance_ctx
+    |> Router.keys()
+    |> CompoundKey.user_visible_keys()
+    |> Enum.each(&flush_key(tx.instance_ctx, &1))
+
+    clear_stream_tables()
     :ok
   end
 
   def flush(store) when is_map(store), do: store.flush.()
+
+  defp flush_key(store, key) do
+    type_key = CompoundKey.type_key(key)
+
+    case compound_get(store, key, type_key) do
+      "hash" ->
+        compound_delete_prefix(store, key, CompoundKey.hash_prefix(key))
+        compound_delete(store, key, type_key)
+
+      "list" ->
+        compound_delete_prefix(store, key, CompoundKey.list_prefix(key))
+        compound_delete(store, key, CompoundKey.list_meta_key(key))
+        compound_delete(store, key, type_key)
+        delete(store, key)
+
+      "set" ->
+        compound_delete_prefix(store, key, CompoundKey.set_prefix(key))
+        compound_delete(store, key, type_key)
+
+      "zset" ->
+        compound_delete_prefix(store, key, CompoundKey.zset_prefix(key))
+        compound_delete(store, key, type_key)
+
+      "stream" ->
+        compound_delete_prefix(store, key, "X:" <> key <> <<0>>)
+        compound_delete(store, key, type_key)
+        delete(store, key)
+
+      nil ->
+        delete(store, key)
+
+      _unknown ->
+        compound_delete(store, key, type_key)
+        delete(store, key)
+    end
+  end
+
+  defp clear_stream_tables do
+    Enum.each([Ferricstore.Stream.Meta, Ferricstore.Stream.Groups], fn table ->
+      if :ets.whereis(table) != :undefined do
+        :ets.delete_all_objects(table)
+      end
+    end)
+  end
 
   # --- On push callback (for Waiters notification) ---
 
@@ -853,8 +980,8 @@ defmodule Ferricstore.Store.Ops do
   # Read value from local ETS, cold-read fallback. Returns value or nil.
   defp local_read_value(tx, key) do
     case tx_pending_meta(key) do
-      {value, _exp} -> value
-      nil -> local_read_value_from_ets(tx, key)
+      {value, _exp} -> normalize_get_value(value)
+      nil -> tx |> local_read_value_from_ets(key) |> normalize_get_value()
     end
   end
 
@@ -961,10 +1088,18 @@ defmodule Ferricstore.Store.Ops do
     tx
     |> local_batch_read_meta(keys, data_path)
     |> Enum.map(fn
-      {value, _exp} -> value
+      {value, _exp} -> normalize_get_value(value)
       nil -> nil
     end)
   end
+
+  defp normalize_get_value(nil), do: nil
+  defp normalize_get_value(value) when is_integer(value), do: Integer.to_string(value)
+
+  defp normalize_get_value(value) when is_float(value),
+    do: Ferricstore.Store.ValueCodec.format_float(value)
+
+  defp normalize_get_value(value), do: value
 
   defp local_batch_read_meta(tx, keys, data_path) do
     now = HLC.now_ms()

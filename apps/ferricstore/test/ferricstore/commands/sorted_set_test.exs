@@ -124,6 +124,29 @@ defmodule Ferricstore.Commands.SortedSetTest do
       assert Enum.sort([a_key, b_key, c_key]) == Enum.sort(member_keys)
       refute_received {:compound_put, _, _}
     end
+
+    test "ZADD batches member writes when store supports compound_batch_put" do
+      parent = self()
+      base_store = MockStore.make()
+
+      store =
+        Map.put(base_store, :compound_batch_put, fn redis_key, entries ->
+          send(parent, {:compound_batch_put, redis_key, entries})
+
+          Enum.each(entries, fn {compound_key, value, expire_at_ms} ->
+            base_store.compound_put.(redis_key, compound_key, value, expire_at_ms)
+          end)
+
+          :ok
+        end)
+
+      assert 3 == SortedSet.handle("ZADD", ["zs", "1", "a", "2", "b", "3", "c"], store)
+
+      assert_receive {:compound_batch_put, "zs", entries}
+      assert length(entries) == 3
+      assert Enum.all?(entries, fn {compound_key, _value, 0} -> is_binary(compound_key) end)
+      refute_receive {:compound_batch_put, _, _}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -365,6 +388,99 @@ defmodule Ferricstore.Commands.SortedSetTest do
 
     test "ZCOUNT on nonexistent key returns 0" do
       assert 0 == SortedSet.handle("ZCOUNT", ["nonexistent", "-inf", "+inf"], MockStore.make())
+    end
+
+    test "ZCOUNT uses score-index count when store supports it" do
+      parent = self()
+      base_store = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1", "a", "2", "b", "3", "c"], base_store)
+
+      store =
+        Map.put(base_store, :zset_score_count, fn redis_key, min_bound, max_bound ->
+          send(parent, {:zset_score_count, redis_key, min_bound, max_bound})
+          {:ok, 2}
+        end)
+
+      assert 2 == SortedSet.handle("ZCOUNT", ["zs", "1", "2"], store)
+
+      assert_receive {:zset_score_count, "zs", {:inclusive, 1.0}, {:inclusive, 2.0}}
+    end
+  end
+
+  describe "ZRANGEBYSCORE ordering" do
+    test "ZRANGEBYSCORE sorts only matching members by score then member" do
+      store = MockStore.make()
+
+      SortedSet.handle(
+        "ZADD",
+        ["zs", "9", "outside", "2", "b", "1", "z", "2", "a", "3", "c"],
+        store
+      )
+
+      assert ["a", "b"] == SortedSet.handle("ZRANGEBYSCORE", ["zs", "2", "2"], store)
+    end
+
+    test "ZREVRANGEBYSCORE reverses score and member tie order after filtering" do
+      store = MockStore.make()
+
+      SortedSet.handle(
+        "ZADD",
+        ["zs", "9", "outside", "2", "b", "1", "z", "2", "a", "3", "c"],
+        store
+      )
+
+      assert ["b", "a"] == SortedSet.handle("ZREVRANGEBYSCORE", ["zs", "2", "2"], store)
+    end
+
+    test "ZRANGEBYSCORE applies LIMIT after score ordering" do
+      store = MockStore.make()
+
+      SortedSet.handle(
+        "ZADD",
+        ["zs", "3", "c", "1", "a", "2", "b", "5", "e", "4", "d"],
+        store
+      )
+
+      assert ["b", "c"] ==
+               SortedSet.handle("ZRANGEBYSCORE", ["zs", "-inf", "+inf", "LIMIT", "1", "2"], store)
+    end
+
+    test "ZRANGEBYSCORE uses score-index range before applying LIMIT and WITHSCORES" do
+      parent = self()
+      base_store = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1", "a", "2", "b", "3", "c"], base_store)
+
+      store =
+        Map.put(base_store, :zset_score_range, fn redis_key, min_bound, max_bound, reverse? ->
+          send(parent, {:zset_score_range, redis_key, min_bound, max_bound, reverse?})
+          {:ok, [{"a", 1.0}, {"b", 2.0}, {"c", 3.0}]}
+        end)
+
+      assert ["b", "2.0"] ==
+               SortedSet.handle(
+                 "ZRANGEBYSCORE",
+                 ["zs", "1", "3", "WITHSCORES", "LIMIT", "1", "1"],
+                 store
+               )
+
+      assert_receive {:zset_score_range, "zs", {:inclusive, 1.0}, {:inclusive, 3.0}, false}
+    end
+
+    test "ZREVRANGEBYSCORE passes reverse flag to score-index range" do
+      parent = self()
+      base_store = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1", "a", "2", "b"], base_store)
+
+      store =
+        Map.put(base_store, :zset_score_range, fn redis_key, min_bound, max_bound, reverse? ->
+          send(parent, {:zset_score_range, redis_key, min_bound, max_bound, reverse?})
+          {:ok, [{"b", 2.0}, {"a", 1.0}]}
+        end)
+
+      assert ["b"] ==
+               SortedSet.handle("ZREVRANGEBYSCORE", ["zs", "2", "1", "LIMIT", "0", "1"], store)
+
+      assert_receive {:zset_score_range, "zs", {:inclusive, 1.0}, {:inclusive, 2.0}, true}
     end
   end
 

@@ -3,7 +3,19 @@ defmodule FerricStore.Impl do
 
   alias Ferricstore.HLC
   alias Ferricstore.Store.Router
-  alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TopK, TDigest}
+
+  alias Ferricstore.Commands.{
+    Bloom,
+    CMS,
+    Cuckoo,
+    Expiry,
+    Hash,
+    Set,
+    SortedSet,
+    Strings,
+    TDigest,
+    TopK
+  }
 
   # ---------------------------------------------------------------
   # Strings
@@ -73,16 +85,10 @@ defmodule FerricStore.Impl do
 
   @spec del(FerricStore.Instance.t(), [binary()]) :: {:ok, non_neg_integer()} | {:error, term()}
   def del(ctx, keys) when is_list(keys) do
-    Enum.reduce_while(keys, 0, fn key, count ->
-      case Router.delete(ctx, key) do
-        :ok -> {:cont, count + 1}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      count when is_integer(count) -> {:ok, count}
-      {:error, _reason} = error -> error
-    end
+    ctx
+    |> build_store()
+    |> then(&Strings.handle_ast({:del, keys}, &1))
+    |> wrap_result()
   end
 
   @spec exists?(FerricStore.Instance.t(), binary()) :: {:ok, boolean()}
@@ -205,20 +211,20 @@ defmodule FerricStore.Impl do
   @spec expire(FerricStore.Instance.t(), binary(), integer()) :: 0 | 1 | {:error, binary()}
   def expire(ctx, key, seconds) do
     store = build_store(ctx)
-    Ferricstore.Commands.Expiry.handle("PEXPIRE", [key, to_string(seconds * 1000)], store)
+    Expiry.handle_ast({:pexpire, key, seconds * 1000}, store)
   end
 
   @spec pexpire(FerricStore.Instance.t(), binary(), integer()) :: 0 | 1 | {:error, binary()}
   def pexpire(ctx, key, milliseconds) do
     store = build_store(ctx)
-    Ferricstore.Commands.Expiry.handle("PEXPIRE", [key, to_string(milliseconds)], store)
+    Expiry.handle_ast({:pexpire, key, milliseconds}, store)
   end
 
   @spec ttl(FerricStore.Instance.t(), binary()) :: {:ok, integer()}
   def ttl(ctx, key) do
     store = build_store(ctx)
 
-    case Ferricstore.Commands.Expiry.handle("PTTL", [key], store) do
+    case Expiry.handle_ast({:pttl, key}, store) do
       ms when is_integer(ms) and ms > 0 -> {:ok, ms}
       -1 -> {:ok, -1}
       -2 -> {:ok, -2}
@@ -234,7 +240,7 @@ defmodule FerricStore.Impl do
   @spec persist(FerricStore.Instance.t(), binary()) :: 0 | 1
   def persist(ctx, key) do
     store = build_store(ctx)
-    Ferricstore.Commands.Expiry.handle("PERSIST", [key], store)
+    Expiry.handle_ast({:persist, key}, store)
   end
 
   # ---------------------------------------------------------------
@@ -245,7 +251,7 @@ defmodule FerricStore.Impl do
   def hset(ctx, key, fields) when is_map(fields) do
     store = build_store(ctx)
     args = [key | Enum.flat_map(fields, fn {k, v} -> [to_string(k), to_string(v)] end)]
-    result = Ferricstore.Commands.Hash.handle("HSET", args, store)
+    result = Hash.handle_ast({:hset, args}, store)
     wrap_result(result)
   end
 
@@ -253,14 +259,14 @@ defmodule FerricStore.Impl do
           {:ok, binary() | nil} | {:error, binary()}
   def hget(ctx, key, field) do
     store = build_store(ctx)
-    result = Ferricstore.Commands.Hash.handle("HGET", [key, to_string(field)], store)
+    result = Hash.handle_ast({:hget, key, to_string(field)}, store)
     wrap_result(result)
   end
 
   @spec hgetall(FerricStore.Instance.t(), binary()) :: {:ok, map()} | {:error, binary()}
   def hgetall(ctx, key) do
     store = build_store(ctx)
-    result = Ferricstore.Commands.Hash.handle("HGETALL", [key], store)
+    result = Hash.handle_ast({:hgetall, key}, store)
 
     case result do
       list when is_list(list) ->
@@ -279,7 +285,7 @@ defmodule FerricStore.Impl do
   def hdel(ctx, key, fields) when is_list(fields) do
     store = build_store(ctx)
     args = [key | Enum.map(fields, &to_string/1)]
-    result = Ferricstore.Commands.Hash.handle("HDEL", args, store)
+    result = Hash.handle_ast({:hdel, args}, store)
     wrap_result(result)
   end
 
@@ -287,7 +293,7 @@ defmodule FerricStore.Impl do
           {:ok, boolean()} | {:error, binary()}
   def hexists(ctx, key, field) do
     store = build_store(ctx)
-    result = Ferricstore.Commands.Hash.handle("HEXISTS", [key, to_string(field)], store)
+    result = Hash.handle_ast({:hexists, key, to_string(field)}, store)
 
     case result do
       {:error, _} = err -> err
@@ -298,7 +304,7 @@ defmodule FerricStore.Impl do
   @spec hlen(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def hlen(ctx, key) do
     store = build_store(ctx)
-    result = Ferricstore.Commands.Hash.handle("HLEN", [key], store)
+    result = Hash.handle_ast({:hlen, key}, store)
     wrap_result(result)
   end
 
@@ -306,7 +312,7 @@ defmodule FerricStore.Impl do
           integer() | {:error, binary()}
   def hincrby(ctx, key, field, amount) do
     store = build_store(ctx)
-    Ferricstore.Commands.Hash.handle("HINCRBY", [key, to_string(field), to_string(amount)], store)
+    Hash.handle_ast({:hincrby, key, to_string(field), amount}, store)
   end
 
   # ---------------------------------------------------------------
@@ -317,7 +323,7 @@ defmodule FerricStore.Impl do
   def sadd(ctx, key, members) when is_list(members) do
     store = build_store(ctx)
     args = [key | Enum.map(members, &to_string/1)]
-    result = Ferricstore.Commands.Set.handle("SADD", args, store)
+    result = Set.handle_ast({:sadd, args}, store)
     wrap_result(result)
   end
 
@@ -325,14 +331,14 @@ defmodule FerricStore.Impl do
   def srem(ctx, key, members) when is_list(members) do
     store = build_store(ctx)
     args = [key | Enum.map(members, &to_string/1)]
-    result = Ferricstore.Commands.Set.handle("SREM", args, store)
+    result = Set.handle_ast({:srem, args}, store)
     wrap_result(result)
   end
 
   @spec smembers(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def smembers(ctx, key) do
     store = build_store(ctx)
-    result = Ferricstore.Commands.Set.handle("SMEMBERS", [key], store)
+    result = Set.handle_ast({:smembers, key}, store)
     wrap_result(result)
   end
 
@@ -340,7 +346,7 @@ defmodule FerricStore.Impl do
           {:ok, boolean()} | {:error, binary()}
   def sismember(ctx, key, member) do
     store = build_store(ctx)
-    result = Ferricstore.Commands.Set.handle("SISMEMBER", [key, to_string(member)], store)
+    result = Set.handle_ast({:sismember, key, to_string(member)}, store)
 
     case result do
       {:error, _} = err -> err
@@ -351,7 +357,7 @@ defmodule FerricStore.Impl do
   @spec scard(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def scard(ctx, key) do
     store = build_store(ctx)
-    result = Ferricstore.Commands.Set.handle("SCARD", [key], store)
+    result = Set.handle_ast({:scard, key}, store)
     wrap_result(result)
   end
 
@@ -361,10 +367,10 @@ defmodule FerricStore.Impl do
     store = build_store(ctx)
 
     if count == 1 do
-      result = Ferricstore.Commands.Set.handle("SPOP", [key], store)
+      result = Set.handle_ast({:spop, key}, store)
       wrap_result(result)
     else
-      result = Ferricstore.Commands.Set.handle("SPOP", [key, to_string(count)], store)
+      result = Set.handle_ast({:spop, key, count}, store)
       wrap_result(result)
     end
   end
@@ -378,7 +384,7 @@ defmodule FerricStore.Impl do
   def lpush(ctx, key, values) when is_list(values) do
     store = build_store(ctx)
     args = [key | Enum.map(values, &to_string/1)]
-    result = Ferricstore.Commands.List.handle("LPUSH", args, store)
+    result = Ferricstore.Commands.List.handle_ast({:lpush, args}, store)
     wrap_result(result)
   end
 
@@ -387,7 +393,7 @@ defmodule FerricStore.Impl do
   def rpush(ctx, key, values) when is_list(values) do
     store = build_store(ctx)
     args = [key | Enum.map(values, &to_string/1)]
-    result = Ferricstore.Commands.List.handle("RPUSH", args, store)
+    result = Ferricstore.Commands.List.handle_ast({:rpush, args}, store)
     wrap_result(result)
   end
 
@@ -397,10 +403,10 @@ defmodule FerricStore.Impl do
     store = build_store(ctx)
 
     if count == 1 do
-      result = Ferricstore.Commands.List.handle("LPOP", [key], store)
+      result = Ferricstore.Commands.List.handle_ast({:lpop, key}, store)
       wrap_result(result)
     else
-      result = Ferricstore.Commands.List.handle("LPOP", [key, to_string(count)], store)
+      result = Ferricstore.Commands.List.handle_ast({:lpop, key, count}, store)
       wrap_result(result)
     end
   end
@@ -411,10 +417,10 @@ defmodule FerricStore.Impl do
     store = build_store(ctx)
 
     if count == 1 do
-      result = Ferricstore.Commands.List.handle("RPOP", [key], store)
+      result = Ferricstore.Commands.List.handle_ast({:rpop, key}, store)
       wrap_result(result)
     else
-      result = Ferricstore.Commands.List.handle("RPOP", [key, to_string(count)], store)
+      result = Ferricstore.Commands.List.handle_ast({:rpop, key, count}, store)
       wrap_result(result)
     end
   end
@@ -425,7 +431,7 @@ defmodule FerricStore.Impl do
     store = build_store(ctx)
 
     result =
-      Ferricstore.Commands.List.handle("LRANGE", [key, to_string(start), to_string(stop)], store)
+      Ferricstore.Commands.List.handle_ast({:lrange, key, start, stop}, store)
 
     wrap_result(result)
   end
@@ -433,7 +439,7 @@ defmodule FerricStore.Impl do
   @spec llen(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def llen(ctx, key) do
     store = build_store(ctx)
-    result = Ferricstore.Commands.List.handle("LLEN", [key], store)
+    result = Ferricstore.Commands.List.handle_ast({:llen, key}, store)
     wrap_result(result)
   end
 
@@ -446,26 +452,22 @@ defmodule FerricStore.Impl do
   def zadd(ctx, key, members) when is_list(members) do
     store = build_store(ctx)
 
-    args = [
-      key
-      | Enum.flat_map(members, fn {score, member} -> [to_string(score), to_string(member)] end)
-    ]
-
-    result = Ferricstore.Commands.SortedSet.handle("ZADD", args, store)
+    pairs = Enum.map(members, fn {score, member} -> {score * 1.0, to_string(member)} end)
+    result = SortedSet.handle_ast({:zadd, key, [], pairs}, store)
     wrap_result(result)
   end
 
   @spec zcard(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def zcard(ctx, key) do
     store = build_store(ctx)
-    result = Ferricstore.Commands.SortedSet.handle("ZCARD", [key], store)
+    result = SortedSet.handle_ast({:zcard, key}, store)
     wrap_result(result)
   end
 
   @spec zscore(FerricStore.Instance.t(), binary(), binary()) :: {:ok, term()} | {:error, binary()}
   def zscore(ctx, key, member) do
     store = build_store(ctx)
-    result = Ferricstore.Commands.SortedSet.handle("ZSCORE", [key, to_string(member)], store)
+    result = SortedSet.handle_ast({:zscore, key, to_string(member)}, store)
     wrap_result(result)
   end
 
@@ -473,9 +475,8 @@ defmodule FerricStore.Impl do
           {:ok, term()} | {:error, binary()}
   def zrange(ctx, key, start, stop, opts) do
     store = build_store(ctx)
-    args = [key, to_string(start), to_string(stop)]
-    args = if Keyword.get(opts, :withscores, false), do: args ++ ["WITHSCORES"], else: args
-    result = Ferricstore.Commands.SortedSet.handle("ZRANGE", args, store)
+    with_scores = Keyword.get(opts, :withscores, false)
+    result = SortedSet.handle_ast({:zrange, key, start, stop, with_scores}, store)
     wrap_result(result)
   end
 
@@ -483,7 +484,7 @@ defmodule FerricStore.Impl do
   def zrem(ctx, key, members) when is_list(members) do
     store = build_store(ctx)
     args = [key | Enum.map(members, &to_string/1)]
-    result = Ferricstore.Commands.SortedSet.handle("ZREM", args, store)
+    result = SortedSet.handle_ast({:zrem, args}, store)
     wrap_result(result)
   end
 
@@ -495,13 +496,13 @@ defmodule FerricStore.Impl do
           :ok | {:error, binary()}
   def bf_reserve(ctx, key, error_rate, capacity) do
     store = build_prob_store(ctx, key)
-    Bloom.handle("BF.RESERVE", [key, to_string(error_rate), to_string(capacity)], store)
+    Bloom.handle_ast({:bf_reserve, key, error_rate * 1.0, capacity}, store)
   end
 
   @spec bf_add(FerricStore.Instance.t(), binary(), binary()) :: {:ok, term()} | {:error, binary()}
   def bf_add(ctx, key, element) do
     store = build_prob_store(ctx, key)
-    result = Bloom.handle("BF.ADD", [key, element], store)
+    result = Bloom.handle_ast({:bf_add, [key, element]}, store)
     wrap_result(result)
   end
 
@@ -509,7 +510,7 @@ defmodule FerricStore.Impl do
           {:ok, term()} | {:error, binary()}
   def bf_madd(ctx, key, elements) do
     store = build_prob_store(ctx, key)
-    result = Bloom.handle("BF.MADD", [key | elements], store)
+    result = Bloom.handle_ast({:bf_madd, [key | elements]}, store)
     wrap_result(result)
   end
 
@@ -517,7 +518,7 @@ defmodule FerricStore.Impl do
           {:ok, term()} | {:error, binary()}
   def bf_exists(ctx, key, element) do
     store = build_prob_store(ctx, key)
-    result = Bloom.handle("BF.EXISTS", [key, element], store)
+    result = Bloom.handle_ast({:bf_exists, [key, element]}, store)
     wrap_result(result)
   end
 
@@ -525,21 +526,21 @@ defmodule FerricStore.Impl do
           {:ok, term()} | {:error, binary()}
   def bf_mexists(ctx, key, elements) do
     store = build_prob_store(ctx, key)
-    result = Bloom.handle("BF.MEXISTS", [key | elements], store)
+    result = Bloom.handle_ast({:bf_mexists, [key | elements]}, store)
     wrap_result(result)
   end
 
   @spec bf_card(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def bf_card(ctx, key) do
     store = build_prob_store(ctx, key)
-    result = Bloom.handle("BF.CARD", [key], store)
+    result = Bloom.handle_ast({:bf_card, [key]}, store)
     wrap_result(result)
   end
 
   @spec bf_info(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def bf_info(ctx, key) do
     store = build_prob_store(ctx, key)
-    result = Bloom.handle("BF.INFO", [key], store)
+    result = Bloom.handle_ast({:bf_info, [key]}, store)
     wrap_result(result)
   end
 
@@ -551,22 +552,21 @@ defmodule FerricStore.Impl do
           :ok | {:error, binary()}
   def cms_initbydim(ctx, key, width, depth) do
     store = build_prob_store(ctx, key)
-    CMS.handle("CMS.INITBYDIM", [key, to_string(width), to_string(depth)], store)
+    CMS.handle_ast({:cms_initbydim, key, width, depth}, store)
   end
 
   @spec cms_initbyprob(FerricStore.Instance.t(), binary(), number(), number()) ::
           :ok | {:error, binary()}
   def cms_initbyprob(ctx, key, error, probability) do
     store = build_prob_store(ctx, key)
-    CMS.handle("CMS.INITBYPROB", [key, to_string(error), to_string(probability)], store)
+    CMS.handle_ast({:cms_initbyprob, key, error * 1.0, probability * 1.0}, store)
   end
 
   @spec cms_incrby(FerricStore.Instance.t(), binary(), [{binary(), pos_integer()}]) ::
           {:ok, term()} | {:error, binary()}
   def cms_incrby(ctx, key, pairs) do
     store = build_prob_store(ctx, key)
-    args = [key | Enum.flat_map(pairs, fn {elem, count} -> [elem, to_string(count)] end)]
-    result = CMS.handle("CMS.INCRBY", args, store)
+    result = CMS.handle_ast({:cms_incrby, key, pairs}, store)
     wrap_result(result)
   end
 
@@ -574,14 +574,14 @@ defmodule FerricStore.Impl do
           {:ok, term()} | {:error, binary()}
   def cms_query(ctx, key, elements) do
     store = build_prob_store(ctx, key)
-    result = CMS.handle("CMS.QUERY", [key | elements], store)
+    result = CMS.handle_ast({:cms_query, [key | elements]}, store)
     wrap_result(result)
   end
 
   @spec cms_info(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def cms_info(ctx, key) do
     store = build_prob_store(ctx, key)
-    result = CMS.handle("CMS.INFO", [key], store)
+    result = CMS.handle_ast({:cms_info, [key]}, store)
     wrap_result(result)
   end
 
@@ -589,8 +589,7 @@ defmodule FerricStore.Impl do
           :ok | {:error, binary()}
   def cms_merge(ctx, dest, sources, _opts \\ []) do
     store = build_prob_store(ctx, dest)
-    args = [dest, to_string(length(sources))] ++ sources
-    CMS.handle("CMS.MERGE", args, store)
+    CMS.handle_ast({:cms_merge, dest, sources, List.duplicate(1, length(sources))}, store)
   end
 
   # ---------------------------------------------------------------
@@ -600,13 +599,13 @@ defmodule FerricStore.Impl do
   @spec cf_reserve(FerricStore.Instance.t(), binary(), pos_integer()) :: :ok | {:error, binary()}
   def cf_reserve(ctx, key, capacity) do
     store = build_prob_store(ctx, key)
-    Cuckoo.handle("CF.RESERVE", [key, to_string(capacity)], store)
+    Cuckoo.handle_ast({:cf_reserve, key, capacity}, store)
   end
 
   @spec cf_add(FerricStore.Instance.t(), binary(), binary()) :: {:ok, term()} | {:error, binary()}
   def cf_add(ctx, key, element) do
     store = build_prob_store(ctx, key)
-    result = Cuckoo.handle("CF.ADD", [key, element], store)
+    result = Cuckoo.handle_ast({:cf_add, [key, element]}, store)
     wrap_result(result)
   end
 
@@ -614,14 +613,14 @@ defmodule FerricStore.Impl do
           {:ok, term()} | {:error, binary()}
   def cf_addnx(ctx, key, element) do
     store = build_prob_store(ctx, key)
-    result = Cuckoo.handle("CF.ADDNX", [key, element], store)
+    result = Cuckoo.handle_ast({:cf_addnx, [key, element]}, store)
     wrap_result(result)
   end
 
   @spec cf_del(FerricStore.Instance.t(), binary(), binary()) :: {:ok, term()} | {:error, binary()}
   def cf_del(ctx, key, element) do
     store = build_prob_store(ctx, key)
-    result = Cuckoo.handle("CF.DEL", [key, element], store)
+    result = Cuckoo.handle_ast({:cf_del, [key, element]}, store)
     wrap_result(result)
   end
 
@@ -629,7 +628,7 @@ defmodule FerricStore.Impl do
           {:ok, term()} | {:error, binary()}
   def cf_exists(ctx, key, element) do
     store = build_prob_store(ctx, key)
-    result = Cuckoo.handle("CF.EXISTS", [key, element], store)
+    result = Cuckoo.handle_ast({:cf_exists, [key, element]}, store)
     wrap_result(result)
   end
 
@@ -637,7 +636,7 @@ defmodule FerricStore.Impl do
           {:ok, term()} | {:error, binary()}
   def cf_mexists(ctx, key, elements) do
     store = build_prob_store(ctx, key)
-    result = Cuckoo.handle("CF.MEXISTS", [key | elements], store)
+    result = Cuckoo.handle_ast({:cf_mexists, [key | elements]}, store)
     wrap_result(result)
   end
 
@@ -645,14 +644,14 @@ defmodule FerricStore.Impl do
           {:ok, term()} | {:error, binary()}
   def cf_count(ctx, key, element) do
     store = build_prob_store(ctx, key)
-    result = Cuckoo.handle("CF.COUNT", [key, element], store)
+    result = Cuckoo.handle_ast({:cf_count, [key, element]}, store)
     wrap_result(result)
   end
 
   @spec cf_info(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def cf_info(ctx, key) do
     store = build_prob_store(ctx, key)
-    result = Cuckoo.handle("CF.INFO", [key], store)
+    result = Cuckoo.handle_ast({:cf_info, [key]}, store)
     wrap_result(result)
   end
 
@@ -664,14 +663,14 @@ defmodule FerricStore.Impl do
           :ok | {:error, binary()}
   def topk_reserve(ctx, key, k) do
     store = build_prob_store(ctx, key)
-    TopK.handle("TOPK.RESERVE", [key, to_string(k)], store)
+    TopK.handle_ast({:topk_reserve, key, k, 8, 7, 0.9}, store)
   end
 
   @spec topk_add(FerricStore.Instance.t(), binary(), [binary()]) ::
           {:ok, term()} | {:error, binary()}
   def topk_add(ctx, key, elements) do
     store = build_prob_store(ctx, key)
-    result = TopK.handle("TOPK.ADD", [key | elements], store)
+    result = TopK.handle_ast({:topk_add, [key | elements]}, store)
     wrap_result(result)
   end
 
@@ -679,21 +678,21 @@ defmodule FerricStore.Impl do
           {:ok, term()} | {:error, binary()}
   def topk_query(ctx, key, elements) do
     store = build_prob_store(ctx, key)
-    result = TopK.handle("TOPK.QUERY", [key | elements], store)
+    result = TopK.handle_ast({:topk_query, [key | elements]}, store)
     wrap_result(result)
   end
 
   @spec topk_list(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def topk_list(ctx, key) do
     store = build_prob_store(ctx, key)
-    result = TopK.handle("TOPK.LIST", [key], store)
+    result = TopK.handle_ast({:topk_list, key, false}, store)
     wrap_result(result)
   end
 
   @spec topk_info(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def topk_info(ctx, key) do
     store = build_prob_store(ctx, key)
-    result = TopK.handle("TOPK.INFO", [key], store)
+    result = TopK.handle_ast({:topk_info, [key]}, store)
     wrap_result(result)
   end
 
@@ -704,30 +703,27 @@ defmodule FerricStore.Impl do
   @spec tdigest_create(FerricStore.Instance.t(), binary(), keyword()) :: :ok | {:error, binary()}
   def tdigest_create(ctx, key, opts \\ []) do
     store = build_store(ctx)
-    args = [key]
 
-    args =
+    compression =
       case Keyword.get(opts, :compression) do
-        nil -> args
-        c -> args ++ ["COMPRESSION", to_string(c)]
+        nil -> nil
+        c -> c * 1.0
       end
 
-    TDigest.handle("TDIGEST.CREATE", args, store)
+    TDigest.handle_ast({:tdigest_create, key, compression}, store)
   end
 
   @spec tdigest_add(FerricStore.Instance.t(), binary(), [number()]) :: :ok | {:error, binary()}
   def tdigest_add(ctx, key, values) do
     store = build_store(ctx)
-    args = [key | Enum.map(values, &to_string/1)]
-    TDigest.handle("TDIGEST.ADD", args, store)
+    TDigest.handle_ast({:tdigest_add, key, Enum.map(values, &(&1 * 1.0))}, store)
   end
 
   @spec tdigest_quantile(FerricStore.Instance.t(), binary(), [number()]) ::
           {:ok, term()} | {:error, binary()}
   def tdigest_quantile(ctx, key, quantiles) do
     store = build_store(ctx)
-    args = [key | Enum.map(quantiles, &to_string/1)]
-    result = TDigest.handle("TDIGEST.QUANTILE", args, store)
+    result = TDigest.handle_ast({:tdigest_quantile, key, Enum.map(quantiles, &(&1 * 1.0))}, store)
     wrap_result(result)
   end
 
@@ -735,36 +731,35 @@ defmodule FerricStore.Impl do
           {:ok, term()} | {:error, binary()}
   def tdigest_cdf(ctx, key, values) do
     store = build_store(ctx)
-    args = [key | Enum.map(values, &to_string/1)]
-    result = TDigest.handle("TDIGEST.CDF", args, store)
+    result = TDigest.handle_ast({:tdigest_cdf, key, Enum.map(values, &(&1 * 1.0))}, store)
     wrap_result(result)
   end
 
   @spec tdigest_min(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def tdigest_min(ctx, key) do
     store = build_store(ctx)
-    result = TDigest.handle("TDIGEST.MIN", [key], store)
+    result = TDigest.handle_ast({:tdigest_min, [key]}, store)
     wrap_result(result)
   end
 
   @spec tdigest_max(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def tdigest_max(ctx, key) do
     store = build_store(ctx)
-    result = TDigest.handle("TDIGEST.MAX", [key], store)
+    result = TDigest.handle_ast({:tdigest_max, [key]}, store)
     wrap_result(result)
   end
 
   @spec tdigest_info(FerricStore.Instance.t(), binary()) :: {:ok, term()} | {:error, binary()}
   def tdigest_info(ctx, key) do
     store = build_store(ctx)
-    result = TDigest.handle("TDIGEST.INFO", [key], store)
+    result = TDigest.handle_ast({:tdigest_info, [key]}, store)
     wrap_result(result)
   end
 
   @spec tdigest_reset(FerricStore.Instance.t(), binary()) :: :ok | {:error, binary()}
   def tdigest_reset(ctx, key) do
     store = build_store(ctx)
-    TDigest.handle("TDIGEST.RESET", [key], store)
+    TDigest.handle_ast({:tdigest_reset, [key]}, store)
   end
 
   # ---------------------------------------------------------------
@@ -783,7 +778,8 @@ defmodule FerricStore.Impl do
 
   @spec flushdb(FerricStore.Instance.t()) :: :ok | {:error, term()}
   def flushdb(ctx) do
-    Router.keys(ctx) |> Enum.each(&Router.delete(ctx, &1))
+    Ferricstore.Store.Ops.flush(ctx)
+
     # Clean prob dirs across all shards. Fsync each prob dir after the
     # rm loop so the removals survive a crash.
     Enum.reduce_while(0..(ctx.shard_count - 1), :ok, fn i, :ok ->
@@ -891,6 +887,9 @@ defmodule FerricStore.Impl do
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
+      end,
+      compound_batch_put: fn redis_key, entries ->
+        Router.compound_batch_put(ctx, redis_key, entries)
       end,
       compound_delete: fn redis_key, compound_key ->
         Router.compound_delete(ctx, redis_key, compound_key)

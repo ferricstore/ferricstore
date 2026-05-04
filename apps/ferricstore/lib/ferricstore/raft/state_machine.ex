@@ -74,6 +74,7 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.HLC
   alias Ferricstore.Store.{BitcaskWriter, ColdRead, LFU, ListOps, Promotion, Router, ValueCodec}
+  alias Ferricstore.Store.Shard.ZSetIndex
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Transaction.Ast, as: TxAst
 
@@ -154,6 +155,18 @@ defmodule Ferricstore.Raft.StateMachine do
       data_dir_expanded: Path.expand(data_dir),
       instance_ctx: Map.get(config, :instance_ctx),
       instance_name: Map.get(config, :instance_name, :default),
+      zset_score_index_name:
+        Map.get(config, :zset_score_index_name) ||
+          elem(
+            ZSetIndex.table_names(Map.get(config, :instance_name, :default), config.shard_index),
+            0
+          ),
+      zset_score_lookup_name:
+        Map.get(config, :zset_score_lookup_name) ||
+          elem(
+            ZSetIndex.table_names(Map.get(config, :instance_name, :default), config.shard_index),
+            1
+          ),
       active_file_size:
         Map.get_lazy(config, :active_file_size, fn ->
           file_size_or_zero(config.active_file_path)
@@ -5319,50 +5332,71 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_compound_put(state, redis_key, compound_key, value, expire_at_ms) do
-    case promoted_compound_path(state, redis_key, compound_key) do
-      nil ->
-        do_put(state, compound_key, value, expire_at_ms)
+    result =
+      case promoted_compound_path(state, redis_key, compound_key) do
+        nil ->
+          do_put(state, compound_key, value, expire_at_ms)
 
-      dedicated_path ->
-        do_promoted_compound_put(
-          state,
-          redis_key,
-          compound_key,
-          value,
-          expire_at_ms,
-          dedicated_path
-        )
+        dedicated_path ->
+          do_promoted_compound_put(
+            state,
+            redis_key,
+            compound_key,
+            value,
+            expire_at_ms,
+            dedicated_path
+          )
+      end
+
+    if result == :ok do
+      zset_index_put(state, redis_key, compound_key, value)
     end
+
+    result
   end
 
   defp do_compound_delete(state, redis_key, compound_key) do
-    case promoted_compound_path(state, redis_key, compound_key) do
-      nil ->
-        do_delete(state, compound_key)
+    result =
+      case promoted_compound_path(state, redis_key, compound_key) do
+        nil ->
+          do_delete(state, compound_key)
 
-      dedicated_path ->
-        do_promoted_compound_delete(state, redis_key, compound_key, dedicated_path)
+        dedicated_path ->
+          do_promoted_compound_delete(state, redis_key, compound_key, dedicated_path)
+      end
+
+    if result == :ok do
+      zset_index_delete(state, redis_key, compound_key)
     end
+
+    result
   end
 
   defp do_compound_delete_prefix(state, redis_key, prefix) do
-    case promoted_compound_path(state, redis_key, prefix) do
-      nil ->
-        do_delete_prefix(state, prefix)
+    result =
+      case promoted_compound_path(state, redis_key, prefix) do
+        nil ->
+          do_delete_prefix(state, prefix)
 
-      _dedicated_path ->
-        Promotion.await_compaction_latch(state, redis_key)
-        delete_compound_prefix_from_ets(state, prefix)
+        _dedicated_path ->
+          Promotion.await_compaction_latch(state, redis_key)
+          delete_compound_prefix_from_ets(state, prefix)
 
-        Promotion.cleanup_promoted!(
-          redis_key,
-          state.shard_data_path,
-          state.ets,
-          state.data_dir,
-          state.shard_index,
-          Map.get(state, :instance_ctx) || Map.get(state, :instance_name)
-        )
+          Promotion.cleanup_promoted!(
+            redis_key,
+            state.shard_data_path,
+            state.ets,
+            state.data_dir,
+            state.shard_index,
+            Map.get(state, :instance_ctx) || Map.get(state, :instance_name)
+          )
+      end
+
+    if result == :ok do
+      zset_index_clear(state, redis_key)
     end
+
+    result
   end
 
   defp do_promoted_compound_put(
@@ -5423,6 +5457,39 @@ defmodule Ferricstore.Raft.StateMachine do
         err
     end
   end
+
+  defp zset_index_put(
+         %{zset_score_index_name: index, zset_score_lookup_name: lookup},
+         redis_key,
+         key,
+         value
+       )
+       when index != nil and lookup != nil do
+    ZSetIndex.apply_put_to_tables(index, lookup, redis_key, key, to_disk_binary(value))
+  end
+
+  defp zset_index_put(_state, _redis_key, _key, _value), do: :ok
+
+  defp zset_index_delete(
+         %{zset_score_index_name: index, zset_score_lookup_name: lookup},
+         redis_key,
+         key
+       )
+       when index != nil and lookup != nil do
+    ZSetIndex.apply_delete_to_tables(index, lookup, redis_key, key)
+  end
+
+  defp zset_index_delete(_state, _redis_key, _key), do: :ok
+
+  defp zset_index_clear(
+         %{zset_score_index_name: index, zset_score_lookup_name: lookup},
+         redis_key
+       )
+       when index != nil and lookup != nil do
+    ZSetIndex.clear_key(index, lookup, redis_key)
+  end
+
+  defp zset_index_clear(_state, _redis_key), do: :ok
 
   defp delete_compound_prefix_from_ets(state, prefix) do
     prefix_len = byte_size(prefix)
