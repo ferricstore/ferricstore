@@ -4003,6 +4003,8 @@ defmodule Ferricstore.Raft.StateMachine do
           updated_at_ms: now_ms,
           next_run_at_ms: run_at_ms,
           priority: priority,
+          ttl_ms: Map.get(attrs, :ttl_ms),
+          history_max_events: Map.get(attrs, :history_max_events),
           partition_key: partition_key,
           payload_ref: Map.get(attrs, :payload_ref),
           result_ref: nil,
@@ -4013,10 +4015,11 @@ defmodule Ferricstore.Raft.StateMachine do
         }
 
         with :ok <- flow_validate_record_keys(record),
-             :ok <- do_put(state, state_key, flow_encode(record), 0),
+             :ok <- do_put(state, state_key, flow_encode(record), flow_record_expire_at(record)),
              :ok <- flow_due_put(state, record),
              :ok <- flow_index_put(state, record),
-             :ok <- flow_history_put(state, record, "created", now_ms) do
+             :ok <- flow_history_put(state, record, "created", now_ms),
+             :ok <- flow_history_trim(state, record) do
           {:ok, record}
         end
 
@@ -4260,6 +4263,8 @@ defmodule Ferricstore.Raft.StateMachine do
           version: Map.fetch!(record, :version) + 1,
           updated_at_ms: now_ms,
           result_ref: Map.get(attrs, :result_ref),
+          ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :ttl_ms),
+          history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0,
@@ -4270,9 +4275,16 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_validate_record_keys(next),
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
-           :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
+           :ok <-
+             do_put(
+               state,
+               FlowKeys.state_key(id, partition_key),
+               flow_encode(next),
+               flow_record_expire_at(next)
+             ),
            :ok <- flow_index_put(state, next),
-           :ok <- flow_history_put(state, next, "completed", now_ms) do
+           :ok <- flow_history_put(state, next, "completed", now_ms),
+           :ok <- flow_history_trim(state, next) do
         {:ok, next}
       end
     end
@@ -4297,6 +4309,8 @@ defmodule Ferricstore.Raft.StateMachine do
           updated_at_ms: now_ms,
           next_run_at_ms: run_at_ms,
           priority: Map.get(attrs, :priority) || Map.get(record, :priority, 0),
+          ttl_ms: Map.get(record, :ttl_ms),
+          history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0
@@ -4306,10 +4320,17 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_validate_record_keys(next),
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
-           :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
+           :ok <-
+             do_put(
+               state,
+               FlowKeys.state_key(id, partition_key),
+               flow_encode(next),
+               flow_record_expire_at(next)
+             ),
            :ok <- flow_due_put(state, next),
            :ok <- flow_index_put(state, next),
-           :ok <- flow_history_put(state, next, "transitioned", now_ms) do
+           :ok <- flow_history_put(state, next, "transitioned", now_ms),
+           :ok <- flow_history_trim(state, next) do
         {:ok, next}
       end
     end
@@ -4331,6 +4352,8 @@ defmodule Ferricstore.Raft.StateMachine do
           updated_at_ms: now_ms,
           next_run_at_ms: run_at_ms,
           error_ref: Map.get(attrs, :error_ref),
+          ttl_ms: Map.get(record, :ttl_ms),
+          history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0
@@ -4340,10 +4363,17 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_validate_record_keys(next),
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
-           :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
+           :ok <-
+             do_put(
+               state,
+               FlowKeys.state_key(id, partition_key),
+               flow_encode(next),
+               flow_record_expire_at(next)
+             ),
            :ok <- flow_due_put(state, next),
            :ok <- flow_index_put(state, next),
-           :ok <- flow_history_put(state, next, "retry", now_ms) do
+           :ok <- flow_history_put(state, next, "retry", now_ms),
+           :ok <- flow_history_trim(state, next) do
         {:ok, next}
       end
     end
@@ -4363,6 +4393,8 @@ defmodule Ferricstore.Raft.StateMachine do
           version: Map.fetch!(record, :version) + 1,
           updated_at_ms: now_ms,
           error_ref: Map.get(attrs, :error_ref),
+          ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :ttl_ms),
+          history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0,
@@ -4373,9 +4405,16 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_validate_record_keys(next),
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
-           :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
+           :ok <-
+             do_put(
+               state,
+               FlowKeys.state_key(id, partition_key),
+               flow_encode(next),
+               flow_record_expire_at(next)
+             ),
            :ok <- flow_index_put(state, next),
-           :ok <- flow_history_put(state, next, "failed", now_ms) do
+           :ok <- flow_history_put(state, next, "failed", now_ms),
+           :ok <- flow_history_trim(state, next) do
         {:ok, next}
       end
     end
@@ -4395,6 +4434,8 @@ defmodule Ferricstore.Raft.StateMachine do
           version: Map.fetch!(record, :version) + 1,
           updated_at_ms: now_ms,
           error_ref: Map.get(attrs, :reason_ref),
+          ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :ttl_ms),
+          history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0,
@@ -4405,9 +4446,16 @@ defmodule Ferricstore.Raft.StateMachine do
            :ok <- flow_validate_record_keys(next),
            :ok <- flow_due_delete(state, record),
            :ok <- flow_index_delete(state, record),
-           :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
+           :ok <-
+             do_put(
+               state,
+               FlowKeys.state_key(id, partition_key),
+               flow_encode(next),
+               flow_record_expire_at(next)
+             ),
            :ok <- flow_index_put(state, next),
-           :ok <- flow_history_put(state, next, "cancelled", now_ms) do
+           :ok <- flow_history_put(state, next, "cancelled", now_ms),
+           :ok <- flow_history_trim(state, next) do
         {:ok, next}
       end
     end
@@ -4444,6 +4492,8 @@ defmodule Ferricstore.Raft.StateMachine do
             version: next_version,
             fencing_token: next_fencing_token,
             updated_at_ms: now_ms,
+            ttl_ms: Map.get(record, :ttl_ms),
+            history_max_events: Map.get(record, :history_max_events),
             lease_owner: worker,
             lease_token: token,
             lease_deadline_ms: deadline_ms,
@@ -4454,10 +4504,17 @@ defmodule Ferricstore.Raft.StateMachine do
              :ok <- flow_validate_record_keys(next),
              :ok <- flow_due_delete_from_key(state, due_key, id),
              :ok <- flow_index_delete(state, record),
-             :ok <- do_put(state, FlowKeys.state_key(id, partition_key), flow_encode(next), 0),
+             :ok <-
+               do_put(
+                 state,
+                 FlowKeys.state_key(id, partition_key),
+                 flow_encode(next),
+                 flow_record_expire_at(next)
+               ),
              :ok <- flow_due_put(state, next),
              :ok <- flow_index_put(state, next),
-             :ok <- flow_history_put(state, next, "claimed", now_ms) do
+             :ok <- flow_history_put(state, next, "claimed", now_ms),
+             :ok <- flow_history_trim(state, next) do
           {:ok, next}
         else
           _ -> :skip
@@ -4715,6 +4772,57 @@ defmodule Ferricstore.Raft.StateMachine do
       0
     )
   end
+
+  defp flow_history_trim(_state, %{history_max_events: nil}), do: :ok
+  defp flow_history_trim(_state, %{history_max_events: max}) when not is_integer(max), do: :ok
+
+  defp flow_history_trim(state, %{id: id, history_max_events: max} = record) when max > 0 do
+    partition_key = Map.get(record, :partition_key)
+    history_key = FlowKeys.history_key(id, partition_key)
+    prefix = "X:" <> history_key <> <<0>>
+    prefix_len = byte_size(prefix)
+
+    entries =
+      Ferricstore.Store.Shard.ETS.prefix_scan_entries(
+        shard_ets_state(state),
+        prefix,
+        state.shard_data_path
+      )
+      |> Enum.map(fn {event_id, _value} -> event_id end)
+      |> Enum.sort_by(&flow_event_sort_key/1)
+
+    entries
+    |> Enum.take(max(length(entries) - max, 0))
+    |> Enum.each(fn event_id ->
+      do_delete(state, <<prefix::binary-size(prefix_len), event_id::binary>>)
+    end)
+
+    :ok
+  end
+
+  defp flow_history_trim(_state, _record), do: :ok
+
+  defp flow_event_sort_key(event_id) do
+    case String.split(event_id, "-", parts: 2) do
+      [ms, seq] ->
+        {flow_parse_integer(seq), flow_parse_integer(ms)}
+
+      _ ->
+        {0, 0}
+    end
+  end
+
+  defp flow_parse_integer(value) do
+    case Integer.parse(value) do
+      {int, ""} -> int
+      _ -> 0
+    end
+  end
+
+  defp flow_record_expire_at(%{ttl_ms: ttl_ms}) when is_integer(ttl_ms) and ttl_ms > 0,
+    do: apply_now_ms() + ttl_ms
+
+  defp flow_record_expire_at(_record), do: 0
 
   defp flow_encode(record), do: :erlang.term_to_binary(record)
 

@@ -909,4 +909,55 @@ defmodule Ferricstore.FlowTest do
              "completed"
            ]
   end
+
+  test "flow history retention keeps only latest configured events" do
+    id = uid("flow-history-retention")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: "audit-retention",
+               run_at_ms: 1_000,
+               history_max_events: 2
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("audit-retention",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token
+             )
+
+    assert {:ok, events} = FerricStore.flow_history(id, count: 10)
+    assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == ["claimed", "completed"]
+  end
+
+  test "terminal ttl expires flow state record" do
+    id = uid("flow-terminal-ttl")
+
+    assert {:ok, _} = FerricStore.flow_create(id, type: "ttl", run_at_ms: 1_000)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("ttl",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               ttl_ms: 20
+             )
+
+    Process.sleep(40)
+
+    assert {:ok, nil} = FerricStore.flow_get(id)
+  end
 end

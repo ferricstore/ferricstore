@@ -17,6 +17,8 @@ defmodule Ferricstore.Flow do
          {:ok, payload_ref} <- optional_binary_or_nil(opts, :payload_ref, nil),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
+         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
+         {:ok, history_max_events} <- optional_pos_integer_or_nil(opts, :history_max_events),
          {:ok, priority} <- optional_priority(opts, @default_priority),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_flow_keys(id, type, state, priority, partition_key) do
@@ -26,6 +28,8 @@ defmodule Ferricstore.Flow do
         state: state,
         payload_ref: payload_ref,
         run_at_ms: run_at_ms,
+        ttl_ms: ttl_ms,
+        history_max_events: history_max_events,
         priority: priority,
         now_ms: now,
         partition_key: partition_key
@@ -82,11 +86,13 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
          {:ok, result_ref} <- optional_binary_or_nil(opts, :result_ref, nil) do
       Router.flow_complete(ctx, %{
         id: id,
         lease_token: lease_token,
         fencing_token: fencing_token,
+        ttl_ms: ttl_ms,
         result_ref: result_ref,
         now_ms: now,
         partition_key: partition_key
@@ -153,11 +159,13 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
          {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil) do
       Router.flow_fail(ctx, %{
         id: id,
         lease_token: lease_token,
         fencing_token: fencing_token,
+        ttl_ms: ttl_ms,
         error_ref: error_ref,
         now_ms: now,
         partition_key: partition_key
@@ -173,11 +181,13 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
          {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil) do
       Router.flow_cancel(ctx, %{
         id: id,
         lease_token: lease_token,
         fencing_token: fencing_token,
+        ttl_ms: ttl_ms,
         reason_ref: reason_ref,
         now_ms: now,
         partition_key: partition_key
@@ -274,6 +284,22 @@ defmodule Ferricstore.Flow do
     case Keyword.get(opts, key, default) do
       value when is_integer(value) and value >= 0 -> {:ok, value}
       _ -> {:error, "ERR flow #{key} must be a non-negative integer"}
+    end
+  end
+
+  defp optional_non_neg_integer_or_nil(opts, key) do
+    case Keyword.get(opts, key, nil) do
+      nil -> {:ok, nil}
+      value when is_integer(value) and value >= 0 -> {:ok, value}
+      _ -> {:error, "ERR flow #{key} must be a non-negative integer"}
+    end
+  end
+
+  defp optional_pos_integer_or_nil(opts, key) do
+    case Keyword.get(opts, key, nil) do
+      nil -> {:ok, nil}
+      value when is_integer(value) and value > 0 -> {:ok, value}
+      _ -> {:error, "ERR flow #{key} must be a positive integer"}
     end
   end
 
