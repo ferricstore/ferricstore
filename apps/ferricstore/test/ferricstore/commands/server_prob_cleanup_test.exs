@@ -36,8 +36,13 @@ defmodule Ferricstore.Commands.ServerProbCleanupTest do
   end
 
   test "FLUSHDB surfaces probabilistic directory fsync failures", %{prob_dir: prob_dir} do
+    attach_prob_cleanup_failed_handler()
+
     assert {:error, {:fsync_dir_failed, :flush_prob_dir, :eio}} =
              Server.handle("FLUSHDB", [], MockStore.make())
+
+    assert_receive {:prob_cleanup_failed, [:ferricstore, :prob_cleanup, :failed], %{count: 1},
+                    %{phase: :flush_prob_dir, path: ^prob_dir, reason: :eio}}
 
     assert Ferricstore.FS.exists?(prob_dir)
   end
@@ -100,6 +105,8 @@ defmodule Ferricstore.Commands.ServerProbCleanupTest do
   end
 
   test "FLUSHDB surfaces probabilistic directory listing failures", %{prob_dir: prob_dir} do
+    attach_prob_cleanup_failed_handler()
+
     Process.delete(:ferricstore_prob_command_fsync_dir_hook)
     File.rm_rf!(prob_dir)
     File.mkdir_p!(Path.dirname(prob_dir))
@@ -107,9 +114,18 @@ defmodule Ferricstore.Commands.ServerProbCleanupTest do
 
     assert {:error, {:list_prob_dir_failed, ^prob_dir, {:not_a_directory, _message}}} =
              Server.handle("FLUSHDB", [], MockStore.make())
+
+    assert_receive {:prob_cleanup_failed, [:ferricstore, :prob_cleanup, :failed], %{count: 1},
+                    %{
+                      phase: :list_prob_dir,
+                      path: ^prob_dir,
+                      reason: {:not_a_directory, _}
+                    }}
   end
 
   test "FLUSHDB surfaces unexpected probabilistic cleanup exceptions", %{prob_dir: prob_dir} do
+    attach_prob_cleanup_failed_handler()
+
     Process.put(:ferricstore_prob_command_fsync_dir_hook, fn ^prob_dir ->
       raise "prob cleanup exploded"
     end)
@@ -118,5 +134,33 @@ defmodule Ferricstore.Commands.ServerProbCleanupTest do
              Server.handle("FLUSHDB", [], MockStore.make())
 
     assert message == "prob cleanup exploded"
+
+    assert_receive {:prob_cleanup_failed, [:ferricstore, :prob_cleanup, :failed], %{count: 1},
+                    %{
+                      phase: :flush_prob_dirs,
+                      path: data_dir,
+                      reason: %RuntimeError{message: "prob cleanup exploded"},
+                      kind: :error
+                    }}
+
+    assert data_dir == Application.get_env(:ferricstore, :data_dir)
+  end
+
+  defp attach_prob_cleanup_failed_handler do
+    parent = self()
+    handler_id = {:prob_cleanup_failed, parent, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :prob_cleanup, :failed],
+      &__MODULE__.handle_prob_cleanup_failed/4,
+      parent
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  def handle_prob_cleanup_failed(event, measurements, metadata, parent) do
+    send(parent, {:prob_cleanup_failed, event, measurements, metadata})
   end
 end

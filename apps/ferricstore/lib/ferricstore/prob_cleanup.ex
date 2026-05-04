@@ -14,9 +14,13 @@ defmodule Ferricstore.ProbCleanup do
         end
       end)
     rescue
-      exception -> {:error, {:flush_prob_dirs_failed, :error, exception}}
+      exception ->
+        emit_failure(:flush_prob_dirs, data_dir, exception, %{kind: :error})
+        {:error, {:flush_prob_dirs_failed, :error, exception}}
     catch
-      kind, reason -> {:error, {:flush_prob_dirs_failed, kind, reason}}
+      kind, reason ->
+        emit_failure(:flush_prob_dirs, data_dir, reason, %{kind: kind})
+        {:error, {:flush_prob_dirs_failed, kind, reason}}
     end
   end
 
@@ -37,6 +41,7 @@ defmodule Ferricstore.ProbCleanup do
           :ok
 
         {:error, reason} ->
+          emit_failure(:list_prob_dir, prob_dir, reason)
           {:error, {:list_prob_dir_failed, prob_dir, reason}}
       end
     else
@@ -46,17 +51,27 @@ defmodule Ferricstore.ProbCleanup do
 
   defp delete_files(prob_dir, files) do
     Enum.reduce_while(files, :ok, fn file, :ok ->
-      case Ferricstore.FS.rm(Path.join(prob_dir, file)) do
-        :ok -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, {:delete_prob_file_failed, file, reason}}}
+      path = Path.join(prob_dir, file)
+
+      case Ferricstore.FS.rm(path) do
+        :ok ->
+          {:cont, :ok}
+
+        {:error, reason} ->
+          emit_failure(:delete_prob_file, path, reason)
+          {:halt, {:error, {:delete_prob_file_failed, file, reason}}}
       end
     end)
   end
 
   defp fsync_dir(path, phase) do
     case fsync_dir_result(path) do
-      :ok -> :ok
-      {:error, reason} -> {:error, {:fsync_dir_failed, phase, reason}}
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        emit_failure(phase, path, reason)
+        {:error, {:fsync_dir_failed, phase, reason}}
     end
   end
 
@@ -65,5 +80,15 @@ defmodule Ferricstore.ProbCleanup do
       fun when is_function(fun, 1) -> fun.(path)
       _ -> Ferricstore.Bitcask.NIF.v2_fsync_dir(path)
     end
+  end
+
+  defp emit_failure(phase, path, reason, extra_metadata \\ %{}) do
+    metadata =
+      extra_metadata
+      |> Map.put(:phase, phase)
+      |> Map.put(:path, path)
+      |> Map.put(:reason, reason)
+
+    :telemetry.execute([:ferricstore, :prob_cleanup, :failed], %{count: 1}, metadata)
   end
 end
