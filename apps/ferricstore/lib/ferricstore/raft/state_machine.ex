@@ -3998,6 +3998,7 @@ defmodule Ferricstore.Raft.StateMachine do
           state: flow_state,
           version: 1,
           attempts: 0,
+          fencing_token: 0,
           created_at_ms: now_ms,
           updated_at_ms: now_ms,
           next_run_at_ms: run_at_ms,
@@ -4172,7 +4173,8 @@ defmodule Ferricstore.Raft.StateMachine do
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
-         :ok <- flow_require_running_lease(record, lease_token) do
+         :ok <- flow_require_running_lease(record, lease_token),
+         :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
       next =
         record
         |> Map.merge(%{
@@ -4204,6 +4206,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
          :ok <- flow_require_expected_state(record, from_state),
+         :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
          :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)) do
       next =
         record
@@ -4233,7 +4236,8 @@ defmodule Ferricstore.Raft.StateMachine do
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
-         :ok <- flow_require_running_lease(record, lease_token) do
+         :ok <- flow_require_running_lease(record, lease_token),
+         :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
       next =
         record
         |> Map.merge(%{
@@ -4263,7 +4267,8 @@ defmodule Ferricstore.Raft.StateMachine do
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
-         :ok <- flow_require_running_lease(record, lease_token) do
+         :ok <- flow_require_running_lease(record, lease_token),
+         :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
       next =
         record
         |> Map.merge(%{
@@ -4291,6 +4296,7 @@ defmodule Ferricstore.Raft.StateMachine do
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
+         :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
          :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)) do
       next =
         record
@@ -4331,16 +4337,19 @@ defmodule Ferricstore.Raft.StateMachine do
 
       %{state: ^expected_state} = record ->
         next_version = Map.fetch!(record, :version) + 1
+        next_fencing_token = Map.get(record, :fencing_token, 0) + 1
         deadline_ms = now_ms + lease_ms
 
         token =
-          worker <> ":" <> Integer.to_string(now_ms) <> ":" <> Integer.to_string(next_version)
+          worker <>
+            ":" <> Integer.to_string(now_ms) <> ":" <> Integer.to_string(next_fencing_token)
 
         next =
           record
           |> Map.merge(%{
             state: "running",
             version: next_version,
+            fencing_token: next_fencing_token,
             updated_at_ms: now_ms,
             lease_owner: worker,
             lease_token: token,
@@ -4375,6 +4384,14 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_require_running_lease(%{state: "running", lease_token: token}, token), do: :ok
   defp flow_require_running_lease(_record, _token), do: {:error, "ERR stale flow lease"}
+
+  defp flow_require_fencing_token(record, fencing_token) do
+    if Map.get(record, :fencing_token, 0) == fencing_token do
+      :ok
+    else
+      {:error, "ERR stale flow lease"}
+    end
+  end
 
   defp flow_require_transition_lease(%{lease_token: nil}, nil), do: :ok
   defp flow_require_transition_lease(%{lease_token: token}, token), do: :ok

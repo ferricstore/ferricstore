@@ -56,6 +56,7 @@ defmodule Ferricstore.FlowTest do
     assert flow.type == "checkout"
     assert flow.state == "queued"
     assert flow.version == 1
+    assert flow.fencing_token == 0
     assert flow.payload_ref == "payload:" <> id
 
     assert {:ok, fetched} = FerricStore.flow_get(id)
@@ -106,8 +107,11 @@ defmodule Ferricstore.FlowTest do
     assert {:error, "ERR flow lease_token must be a non-empty string"} =
              FerricStore.flow_complete("flow", "")
 
+    assert {:error, "ERR flow fencing_token is required"} =
+             FerricStore.flow_complete("flow", "token")
+
     assert {:error, "ERR flow now_ms must be a non-negative integer"} =
-             FerricStore.flow_retry("flow", "token", now_ms: -1)
+             FerricStore.flow_retry("flow", "token", fencing_token: 0, now_ms: -1)
 
     assert {:error, "ERR flow id must be a non-empty string"} =
              FerricStore.flow_history("")
@@ -133,17 +137,26 @@ defmodule Ferricstore.FlowTest do
     assert {:error, "ERR flow lease_token must be a non-empty string"} =
              FerricStore.flow_transition("flow", "queued", "done", lease_token: "")
 
+    assert {:error, "ERR flow fencing_token is required"} =
+             FerricStore.flow_transition("flow", "queued", "done")
+
     assert {:error, "ERR flow lease_token must be a non-empty string"} =
              FerricStore.flow_fail("flow", "")
 
+    assert {:error, "ERR flow fencing_token is required"} =
+             FerricStore.flow_fail("flow", "token")
+
     assert {:error, "ERR flow now_ms must be a non-negative integer"} =
-             FerricStore.flow_fail("flow", "token", now_ms: -1)
+             FerricStore.flow_fail("flow", "token", fencing_token: 0, now_ms: -1)
 
     assert {:error, "ERR flow id must be a non-empty string"} =
              FerricStore.flow_cancel("")
 
     assert {:error, "ERR flow opts must be a keyword list"} =
              FerricStore.flow_cancel("flow", ["bad"])
+
+    assert {:error, "ERR flow fencing_token is required"} =
+             FerricStore.flow_cancel("flow")
 
     assert {:error, "ERR flow partition_key must be a non-empty string or :global"} =
              FerricStore.flow_claim_due("email", worker: "worker-a", partition_key: "")
@@ -178,6 +191,7 @@ defmodule Ferricstore.FlowTest do
     assert claimed.state == "running"
     assert claimed.lease_owner == "worker-a"
     assert is_binary(claimed.lease_token)
+    assert claimed.fencing_token == 1
     assert claimed.version == 2
 
     assert {:ok, []} =
@@ -245,10 +259,15 @@ defmodule Ferricstore.FlowTest do
     assert claimed.partition_key == partition
 
     assert {:error, "ERR flow not found"} =
-             FerricStore.flow_complete(id, claimed.lease_token)
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token
+             )
 
     assert {:ok, completed} =
-             FerricStore.flow_complete(id, claimed.lease_token, partition_key: partition)
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               partition_key: partition
+             )
 
     assert completed.state == "completed"
 
@@ -354,10 +373,20 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_complete(id, "wrong-token", result_ref: "result:" <> id)
+             FerricStore.flow_complete(id, "wrong-token",
+               fencing_token: claimed.fencing_token,
+               result_ref: "result:" <> id
+             )
+
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token + 1,
+               result_ref: "result:" <> id
+             )
 
     assert {:ok, completed} =
              FerricStore.flow_complete(claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
                result_ref: "result:" <> id
              )
 
@@ -382,8 +411,16 @@ defmodule Ferricstore.FlowTest do
                now_ms: 1_000
              )
 
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token + 1,
+               error_ref: "error:" <> id,
+               run_at_ms: 2_000
+             )
+
     assert {:ok, retried} =
              FerricStore.flow_retry(claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
                error_ref: "error:" <> id,
                run_at_ms: 2_000
              )
@@ -460,6 +497,7 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, transitioned} =
              FerricStore.flow_transition(id, "payment_pending", "email_pending",
+               fencing_token: 0,
                run_at_ms: 2_000,
                now_ms: 1_100
              )
@@ -504,7 +542,10 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id, type: "checkout", state: "queued", run_at_ms: 1_000)
 
     assert {:error, "ERR flow wrong state"} =
-             FerricStore.flow_transition(id, "running", "completed", run_at_ms: 1_000)
+             FerricStore.flow_transition(id, "running", "completed",
+               fencing_token: 0,
+               run_at_ms: 1_000
+             )
 
     assert {:ok, fetched} = FerricStore.flow_get(id)
     assert fetched.state == "queued"
@@ -520,11 +561,22 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_transition(id, "running", "next", run_at_ms: 2_000)
+             FerricStore.flow_transition(id, "running", "next",
+               fencing_token: claimed.fencing_token,
+               run_at_ms: 2_000
+             )
+
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_transition(id, "running", "next",
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token + 1,
+               run_at_ms: 2_000
+             )
 
     assert {:ok, transitioned} =
              FerricStore.flow_transition(id, "running", "next",
                lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
                run_at_ms: 2_000
              )
 
@@ -541,6 +593,7 @@ defmodule Ferricstore.FlowTest do
 
     assert {:error, "ERR key too large" <> _} =
              FerricStore.flow_transition(id, "queued", huge_state,
+               fencing_token: 0,
                run_at_ms: 2_000,
                now_ms: 1_100
              )
@@ -581,8 +634,16 @@ defmodule Ferricstore.FlowTest do
 
     assert claimed.id == fail_id
 
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_fail(fail_id, claimed.lease_token,
+               fencing_token: claimed.fencing_token + 1,
+               error_ref: "error:" <> fail_id,
+               now_ms: 1_500
+             )
+
     assert {:ok, failed} =
              FerricStore.flow_fail(fail_id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
                error_ref: "error:" <> fail_id,
                now_ms: 1_500
              )
@@ -594,6 +655,7 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, cancelled} =
              FerricStore.flow_cancel(cancel_id,
+               fencing_token: 0,
                reason_ref: "reason:" <> cancel_id,
                now_ms: 1_500
              )
@@ -641,7 +703,11 @@ defmodule Ferricstore.FlowTest do
                now_ms: 1_000
              )
 
-    assert {:ok, _} = FerricStore.flow_complete(id, claimed.lease_token)
+    assert {:ok, _} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token
+             )
+
     assert {:ok, events} = FerricStore.flow_history(id, count: 10)
 
     assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == [

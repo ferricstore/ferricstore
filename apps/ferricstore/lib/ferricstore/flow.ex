@@ -77,6 +77,7 @@ defmodule Ferricstore.Flow do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
          :ok <- validate_lease_token(lease_token),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
@@ -84,6 +85,7 @@ defmodule Ferricstore.Flow do
       Router.flow_complete(ctx, %{
         id: id,
         lease_token: lease_token,
+        fencing_token: fencing_token,
         result_ref: result_ref,
         now_ms: now,
         partition_key: partition_key
@@ -98,6 +100,7 @@ defmodule Ferricstore.Flow do
          :ok <- validate_state(:from, from_state),
          :ok <- validate_state(:to, to_state),
          {:ok, lease_token} <- optional_lease_token(opts),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
@@ -108,6 +111,7 @@ defmodule Ferricstore.Flow do
         from_state: from_state,
         to_state: to_state,
         lease_token: lease_token,
+        fencing_token: fencing_token,
         run_at_ms: run_at_ms,
         priority: priority,
         now_ms: now,
@@ -121,6 +125,7 @@ defmodule Ferricstore.Flow do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
          :ok <- validate_lease_token(lease_token),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
@@ -129,6 +134,7 @@ defmodule Ferricstore.Flow do
       Router.flow_retry(ctx, %{
         id: id,
         lease_token: lease_token,
+        fencing_token: fencing_token,
         run_at_ms: run_at_ms,
         error_ref: error_ref,
         now_ms: now,
@@ -142,6 +148,7 @@ defmodule Ferricstore.Flow do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
          :ok <- validate_lease_token(lease_token),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
@@ -149,6 +156,7 @@ defmodule Ferricstore.Flow do
       Router.flow_fail(ctx, %{
         id: id,
         lease_token: lease_token,
+        fencing_token: fencing_token,
         error_ref: error_ref,
         now_ms: now,
         partition_key: partition_key
@@ -160,6 +168,7 @@ defmodule Ferricstore.Flow do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
          {:ok, lease_token} <- optional_lease_token(opts),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
@@ -167,6 +176,7 @@ defmodule Ferricstore.Flow do
       Router.flow_cancel(ctx, %{
         id: id,
         lease_token: lease_token,
+        fencing_token: fencing_token,
         reason_ref: reason_ref,
         now_ms: now,
         partition_key: partition_key
@@ -248,6 +258,14 @@ defmodule Ferricstore.Flow do
       nil -> {:ok, nil}
       value when is_binary(value) -> {:ok, value}
       _ -> {:error, "ERR flow #{key} must be a string"}
+    end
+  end
+
+  defp required_non_neg_integer(opts, key) do
+    case Keyword.fetch(opts, key) do
+      {:ok, value} when is_integer(value) and value >= 0 -> {:ok, value}
+      {:ok, _} -> {:error, "ERR flow #{key} must be a non-negative integer"}
+      :error -> {:error, "ERR flow #{key} is required"}
     end
   end
 
