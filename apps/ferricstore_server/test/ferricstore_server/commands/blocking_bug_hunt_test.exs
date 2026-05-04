@@ -35,6 +35,7 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Commands.{Blocking, List}
+  alias FerricstoreServer.Connection.Blocking, as: ConnBlocking
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
   alias Ferricstore.Test.MockStore
@@ -115,6 +116,33 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
   # TCP helpers
   # ===========================================================================
 
+  test "blocking list dispatch converts storage raises into error replies" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "blocking_raise"
+    state = %FerricstoreServer.Connection{instance_ctx: ctx, sandbox_namespace: nil}
+    type_key = Ferricstore.Store.CompoundKey.type_key(key)
+    meta_key = Ferricstore.Store.CompoundKey.list_meta_key(key)
+
+    with_raw_store(ctx, fn raw ->
+      raw
+      |> Map.put(:compound_get, fn
+        ^key, ^type_key -> "list"
+        ^key, ^meta_key -> :erlang.term_to_binary({1, 0, 0})
+        _redis_key, _compound_key -> nil
+      end)
+      |> Map.put(:compound_scan, fn ^key, _prefix -> raise "async key latch timeout after 5ms" end)
+    end)
+
+    try do
+      assert {:continue, response, ^state} =
+               ConnBlocking.dispatch_blpop_ast([key], 1, state)
+
+      assert IO.iodata_to_binary(response) =~ "-ERR internal error:"
+    after
+      restore_raw_store(ctx)
+    end
+  end
+
   # Raw helpers used in setup_all (before context is available)
   defp send_cmd_raw(sock, cmd) do
     data = IO.iodata_to_binary(Encoder.encode(cmd))
@@ -177,6 +205,29 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
   end
 
   defp ukey(name), do: "bughunt_#{name}_#{:erlang.unique_integer([:positive])}"
+
+  defp with_raw_store(ctx, update_fn) do
+    raw_store_key = raw_store_key(ctx)
+    old_raw_store = :persistent_term.get(raw_store_key, :missing)
+    Process.put({__MODULE__, :old_raw_store, ctx.name}, old_raw_store)
+
+    ctx
+    |> FerricstoreServer.Connection.Store.build_raw_store()
+    |> update_fn.()
+    |> then(&:persistent_term.put(raw_store_key, &1))
+  end
+
+  defp restore_raw_store(ctx) do
+    raw_store_key = raw_store_key(ctx)
+
+    case Process.delete({__MODULE__, :old_raw_store, ctx.name}) do
+      :missing -> :persistent_term.erase(raw_store_key)
+      nil -> :persistent_term.erase(raw_store_key)
+      store -> :persistent_term.put(raw_store_key, store)
+    end
+  end
+
+  defp raw_store_key(ctx), do: {:ferricstore_raw_store, ctx.name}
 
   # Skips a test if TCP is not healthy (shard crash loop in working tree).
   defp require_tcp!(%{tcp_healthy: true}), do: :ok
