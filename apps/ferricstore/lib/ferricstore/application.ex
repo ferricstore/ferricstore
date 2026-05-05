@@ -188,6 +188,18 @@ defmodule Ferricstore.Application do
         )
       end)
 
+    flow_lmdb_writer_children =
+      if Ferricstore.Flow.LMDB.mirror?() do
+        Enum.map(0..(shard_count - 1), fn i ->
+          Supervisor.child_spec(
+            {Ferricstore.Flow.LMDBWriter, shard_index: i, data_dir: data_dir},
+            id: :"flow_lmdb_writer_#{i}"
+          )
+        end)
+      else
+        []
+      end
+
     # Async RMW fallback coordinator — one per shard. Handles contended RMW
     # commands that lost the per-key latch in Router.async_rmw. See
     # docs/async-rmw-design.md.
@@ -220,6 +232,7 @@ defmodule Ferricstore.Application do
         ] ++
         batcher_children ++
         bitcask_writer_children ++
+        flow_lmdb_writer_children ++
         rmw_coordinator_children ++
         [
           {Ferricstore.Store.ShardSupervisor,
@@ -305,6 +318,7 @@ defmodule Ferricstore.Application do
 
     batcher_result = shutdown_flush_batchers(shard_count)
     bitcask_writer_result = shutdown_flush_bitcask_writers(shard_count)
+    shutdown_flush_flow_lmdb_writers(shard_count)
     bitcask_fsync_result = shutdown_fsync_bitcask(shard_count, data_dir)
     shutdown_flush_shards(shard_count)
     wal_rollover_result = shutdown_wal_rollover(data_dir)
@@ -398,6 +412,21 @@ defmodule Ferricstore.Application do
     end
 
     result
+  end
+
+  defp shutdown_flush_flow_lmdb_writers(shard_count) do
+    if Ferricstore.Flow.LMDB.mirror?() do
+      case Ferricstore.Flow.LMDBWriter.flush_all(shard_count) do
+        :ok ->
+          Logger.info("Shutdown: Flow LMDB writers flushed")
+
+        {:error, reason} ->
+          Logger.warning("Shutdown: Flow LMDB writer flush incomplete: #{inspect(reason)}")
+      end
+    end
+  catch
+    :exit, reason ->
+      Logger.warning("Shutdown: Flow LMDB writer flush failed: #{inspect(reason)}")
   end
 
   defp shutdown_fsync_bitcask(shard_count, data_dir) do

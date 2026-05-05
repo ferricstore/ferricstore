@@ -94,7 +94,195 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
     GenServer.stop(writer)
   end
 
+  test "writer coalesces many marker requests to latest index" do
+    shard_index = 110_000 + System.unique_integer([:positive])
+    batcher_name = Batcher.batcher_name(shard_index)
+    writer_name = ReplaySafeIndexWriter.process_name(shard_index, nil)
+    dir = tmp_dir()
+    parent = self()
+    handler_id = {:replay_safe_index_coalesce, parent, make_ref()}
+
+    Process.register(parent, batcher_name)
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :raft, :replay_safe_index, :persist],
+      fn event, measurements, metadata, _config ->
+        send(parent, {:persist_event, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      if Process.whereis(batcher_name) == parent, do: Process.unregister(batcher_name)
+      File.rm_rf(dir)
+    end)
+
+    {:ok, writer} =
+      ReplaySafeIndexWriter.start_link(
+        shard_index: shard_index,
+        shard_data_path: dir,
+        name: writer_name,
+        flush_delay_ms: 25
+      )
+
+    assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 100)
+    assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 101)
+    assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 150)
+
+    assert_receive {:"$gen_cast", {:async_submit, {:release_cursor_poke, 150}}}, 1_000
+
+    assert_receive {:persist_event, [:ferricstore, :raft, :replay_safe_index, :persist],
+                    %{index: 150, requested_index: 150, durable_index: 150, lag: 0},
+                    %{status: :ok, shard_index: ^shard_index}},
+                   1_000
+
+    refute_receive {:"$gen_cast", {:async_submit, {:release_cursor_poke, 100}}}, 50
+    refute_receive {:"$gen_cast", {:async_submit, {:release_cursor_poke, 101}}}, 50
+    assert ReplaySafeIndex.read(dir) == 150
+
+    GenServer.stop(writer)
+  end
+
+  test "writer records requested lag and persist failure metrics" do
+    shard_index = 0
+    dir = tmp_dir()
+    File.write!(dir, "not a directory")
+    parent = self()
+    handler_id = {:replay_safe_index_failure, parent, make_ref()}
+    requested = :atomics.new(1, signed: false)
+    durable = :atomics.new(1, signed: false)
+    failures = :atomics.new(1, signed: false)
+    instance_name = :"replay_safe_failure_#{System.unique_integer([:positive])}"
+
+    instance_ctx = %{
+      name: instance_name,
+      replay_safe_index: durable,
+      replay_safe_requested_index: requested,
+      replay_safe_persist_failures: failures
+    }
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :raft, :replay_safe_index, :persist],
+      fn event, measurements, metadata, _config ->
+        send(parent, {:persist_event, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      File.rm(dir)
+    end)
+
+    {:ok, writer} =
+      ReplaySafeIndexWriter.start_link(
+        shard_index: shard_index,
+        shard_data_path: dir,
+        instance_ctx: instance_ctx
+      )
+
+    assert :requested = ReplaySafeIndexWriter.request(instance_ctx, shard_index, dir, 456)
+
+    assert_receive {:persist_event, [:ferricstore, :raft, :replay_safe_index, :persist],
+                    %{index: 456, requested_index: 456, durable_index: 0, lag: 456},
+                    %{status: :error, shard_index: ^shard_index}},
+                   1_000
+
+    assert :atomics.get(requested, 1) == 456
+    assert :atomics.get(durable, 1) == 0
+    assert :atomics.get(failures, 1) == 1
+
+    GenServer.stop(writer)
+  end
+
+  test "writer restart publishes existing durable marker after crash before release" do
+    shard_index = 0
+    dir = tmp_dir()
+    durable = :atomics.new(1, signed: false)
+    instance_name = :"replay_safe_restart_#{System.unique_integer([:positive])}"
+    instance_ctx = %{name: instance_name, replay_safe_index: durable}
+
+    assert :ok = ReplaySafeIndex.persist(dir, 777)
+
+    {:ok, writer} =
+      ReplaySafeIndexWriter.start_link(
+        shard_index: shard_index,
+        shard_data_path: dir,
+        instance_ctx: instance_ctx
+      )
+
+    assert :atomics.get(durable, 1) == 777
+    assert :durable = ReplaySafeIndexWriter.request(instance_ctx, shard_index, dir, 777)
+
+    GenServer.stop(writer)
+    File.rm_rf(dir)
+  end
+
+  test "writer crash before flush does not publish false durable marker" do
+    shard_index = 0
+    dir = tmp_dir()
+    durable = :atomics.new(1, signed: false)
+    requested = :atomics.new(1, signed: false)
+    instance_name = :"replay_safe_preflush_#{System.unique_integer([:positive])}"
+
+    instance_ctx = %{
+      name: instance_name,
+      replay_safe_index: durable,
+      replay_safe_requested_index: requested
+    }
+
+    {:ok, writer} =
+      ReplaySafeIndexWriter.start_link(
+        shard_index: shard_index,
+        shard_data_path: dir,
+        instance_ctx: instance_ctx,
+        flush_delay_ms: 1_000
+      )
+
+    assert :requested = ReplaySafeIndexWriter.request(instance_ctx, shard_index, dir, 888)
+    GenServer.stop(writer)
+
+    assert ReplaySafeIndex.read(dir) == 0
+    assert :atomics.get(durable, 1) == 0
+    assert :atomics.get(requested, 1) == 888
+
+    {:ok, writer2} =
+      ReplaySafeIndexWriter.start_link(
+        shard_index: shard_index,
+        shard_data_path: dir,
+        instance_ctx: instance_ctx
+      )
+
+    assert :atomics.get(durable, 1) == 0
+    assert :requested = ReplaySafeIndexWriter.request(instance_ctx, shard_index, dir, 889)
+    assert wait_until(fn -> ReplaySafeIndex.read(dir) == 889 end)
+
+    GenServer.stop(writer2)
+    File.rm_rf(dir)
+  end
+
   defp tmp_dir do
     Path.join(System.tmp_dir!(), "replay_safe_index_#{System.unique_integer([:positive])}")
+  end
+
+  defp wait_until(fun, timeout_ms \\ 1_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    wait_until(fun, deadline, nil)
+  end
+
+  defp wait_until(fun, deadline, _last) do
+    if fun.() do
+      true
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        false
+      else
+        Process.sleep(10)
+        wait_until(fun, deadline, nil)
+      end
+    end
   end
 end

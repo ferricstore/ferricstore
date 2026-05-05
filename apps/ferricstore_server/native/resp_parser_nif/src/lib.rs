@@ -5109,6 +5109,8 @@ fn make_flow_create_many_command_ast<'a>(
         return (tag, wrong_number_error(env, b"flow.create_many")).encode(env);
     }
 
+    let mixed = ascii_eq_ignore_case(arg_bytes[0], b"MIXED");
+
     let Some(items_idx) = flow_find_option(arg_bytes, 1, b"ITEMS") else {
         return (
             tag,
@@ -5118,7 +5120,8 @@ fn make_flow_create_many_command_ast<'a>(
             .encode(env);
     };
 
-    if items_idx == args.len() - 1 || (args.len() - items_idx - 1) % 2 != 0 {
+    let item_width = if mixed { 3 } else { 2 };
+    if items_idx == args.len() - 1 || (args.len() - items_idx - 1) % item_width != 0 {
         return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
     }
 
@@ -5128,16 +5131,36 @@ fn make_flow_create_many_command_ast<'a>(
             Err(err) => return (tag, args[0], err).encode(env),
         };
 
-    let mut items = Vec::with_capacity((args.len() - items_idx - 1) / 2);
+    let mut items = Vec::with_capacity((args.len() - items_idx - 1) / item_width);
     let mut idx = items_idx + 1;
     while idx < args.len() {
-        let id = args[idx];
-        let payload_ref = args[idx + 1];
-        items.push((atom(env, "id"), id, atom(env, "payload_ref"), payload_ref).encode(env));
-        idx += 2;
+        if mixed {
+            let item_opts = vec![
+                (atom(env, "partition_key"), args[idx + 1]).encode(env),
+                (atom(env, "payload_ref"), args[idx + 2]).encode(env),
+            ];
+            items.push((args[idx], item_opts).encode(env));
+        } else {
+            items.push(
+                (
+                    atom(env, "id"),
+                    args[idx],
+                    atom(env, "payload_ref"),
+                    args[idx + 1],
+                )
+                    .encode(env),
+            );
+        }
+        idx += item_width;
     }
 
-    (tag, args[0], items, opts).encode(env)
+    let partition = if mixed {
+        atoms::nil().encode(env)
+    } else {
+        args[0]
+    };
+
+    (tag, partition, items, opts).encode(env)
 }
 
 fn make_flow_get_command_ast<'a>(env: Env<'a>, args: &[Term<'a>], arg_bytes: &[&[u8]]) -> Term<'a> {
@@ -5210,6 +5233,8 @@ fn make_flow_transition_many_command_ast<'a>(
         return (tag, wrong_number_error(env, b"flow.transition_many")).encode(env);
     }
 
+    let mixed = ascii_eq_ignore_case(arg_bytes[0], b"MIXED");
+
     let Some(items_idx) = flow_find_option(arg_bytes, 3, b"ITEMS") else {
         return (
             tag,
@@ -5221,7 +5246,8 @@ fn make_flow_transition_many_command_ast<'a>(
             .encode(env);
     };
 
-    if items_idx == args.len() - 1 || (args.len() - items_idx - 1) % 3 != 0 {
+    let item_width = if mixed { 4 } else { 3 };
+    if items_idx == args.len() - 1 || (args.len() - items_idx - 1) % item_width != 0 {
         return (
             tag,
             args[0],
@@ -5244,10 +5270,13 @@ fn make_flow_transition_many_command_ast<'a>(
         Err(err) => return (tag, args[0], args[1], args[2], err).encode(env),
     };
 
-    let mut items = Vec::with_capacity((args.len() - items_idx - 1) / 3);
+    let mut items = Vec::with_capacity((args.len() - items_idx - 1) / item_width);
     let mut idx = items_idx + 1;
     while idx < args.len() {
-        let fencing_token = match parse_int_bytes(arg_bytes[idx + 1]) {
+        let fencing_idx = if mixed { idx + 2 } else { idx + 1 };
+        let lease_idx = if mixed { idx + 3 } else { idx + 2 };
+
+        let fencing_token = match parse_int_bytes(arg_bytes[fencing_idx]) {
             Some(value) if value >= 0 => value,
             _ => {
                 return (
@@ -5261,27 +5290,44 @@ fn make_flow_transition_many_command_ast<'a>(
             }
         };
 
-        let lease_token = if ascii_eq_ignore_case(arg_bytes[idx + 2], b"-") {
+        let lease_token = if ascii_eq_ignore_case(arg_bytes[lease_idx], b"-") {
             atoms::nil().encode(env)
         } else {
-            args[idx + 2]
+            args[lease_idx]
         };
 
-        items.push(
-            (
-                atom(env, "id"),
-                args[idx],
-                atom(env, "fencing_token"),
-                fencing_token,
-                atom(env, "lease_token"),
-                lease_token,
+        if mixed {
+            let mut item_opts = vec![
+                (atom(env, "partition_key"), args[idx + 1]).encode(env),
+                (atom(env, "fencing_token"), fencing_token).encode(env),
+            ];
+            if !ascii_eq_ignore_case(arg_bytes[lease_idx], b"-") {
+                item_opts.push((atom(env, "lease_token"), lease_token).encode(env));
+            }
+            items.push((args[idx], item_opts).encode(env));
+        } else {
+            items.push(
+                (
+                    atom(env, "id"),
+                    args[idx],
+                    atom(env, "fencing_token"),
+                    fencing_token,
+                    atom(env, "lease_token"),
+                    lease_token,
+                )
+                    .encode(env),
             )
-                .encode(env),
-        );
-        idx += 3;
+        }
+        idx += item_width;
     }
 
-    (tag, args[0], args[1], args[2], items, opts).encode(env)
+    let partition = if mixed {
+        atoms::nil().encode(env)
+    } else {
+        args[0]
+    };
+
+    (tag, partition, args[1], args[2], items, opts).encode(env)
 }
 
 fn make_flow_retry_command_ast<'a>(
@@ -6196,9 +6242,12 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"CMS.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"TDIGEST.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"RATELIMIT.ADD" => vec![0],
-        b"FLOW.CREATE" | b"FLOW.CREATE_MANY" | b"FLOW.GET" | b"FLOW.COMPLETE"
-        | b"FLOW.TRANSITION" | b"FLOW.TRANSITION_MANY" | b"FLOW.RETRY" | b"FLOW.FAIL"
-        | b"FLOW.CANCEL" | b"FLOW.REWIND" | b"FLOW.HISTORY" => vec![0],
+        b"FLOW.CREATE_MANY" => flow_create_many_key_indices(arg_bytes),
+        b"FLOW.TRANSITION_MANY" => flow_transition_many_key_indices(arg_bytes),
+        b"FLOW.CREATE" | b"FLOW.GET" | b"FLOW.COMPLETE" | b"FLOW.TRANSITION" | b"FLOW.RETRY"
+        | b"FLOW.FAIL" | b"FLOW.CANCEL" | b"FLOW.REWIND" | b"FLOW.HISTORY" => {
+            vec![0]
+        }
         b"MEMORY" => {
             if argc > 1 && ascii_eq_ignore_case(arg_bytes[0], b"USAGE") {
                 vec![1]
@@ -6381,6 +6430,53 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
 
         _ => Vec::new(),
     }
+}
+
+fn flow_create_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
+    if arg_bytes.is_empty() || !ascii_eq_ignore_case(arg_bytes[0], b"MIXED") {
+        return vec![0];
+    }
+
+    let Some(items_idx) = option_index(arg_bytes, 1, b"ITEMS") else {
+        return vec![0];
+    };
+
+    let mut keys = Vec::new();
+    let mut idx = items_idx + 1;
+    while idx + 2 < arg_bytes.len() {
+        keys.push(idx + 1);
+        idx += 3;
+    }
+    keys
+}
+
+fn flow_transition_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
+    if arg_bytes.is_empty() || !ascii_eq_ignore_case(arg_bytes[0], b"MIXED") {
+        return vec![0];
+    }
+
+    let Some(items_idx) = option_index(arg_bytes, 3, b"ITEMS") else {
+        return vec![0];
+    };
+
+    let mut keys = Vec::new();
+    let mut idx = items_idx + 1;
+    while idx + 3 < arg_bytes.len() {
+        keys.push(idx + 1);
+        idx += 4;
+    }
+    keys
+}
+
+fn option_index(arg_bytes: &[&[u8]], start: usize, name: &[u8]) -> Option<usize> {
+    let mut idx = start;
+    while idx < arg_bytes.len() {
+        if ascii_eq_ignore_case(arg_bytes[idx], name) {
+            return Some(idx);
+        }
+        idx += 2;
+    }
+    None
 }
 
 fn all_indices(argc: usize) -> Vec<usize> {

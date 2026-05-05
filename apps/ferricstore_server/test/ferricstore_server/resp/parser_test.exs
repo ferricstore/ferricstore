@@ -1776,6 +1776,59 @@ defmodule FerricstoreServer.Resp.ParserTest do
                )
     end
 
+    test "parses mixed-partition Flow many commands into typed Rust AST" do
+      assert {:ok,
+              [
+                {:command, "FLOW.CREATE_MANY",
+                 [
+                   "MIXED",
+                   "TYPE",
+                   "iot",
+                   "RUN_AT",
+                   "1000",
+                   "ITEMS",
+                   "flow-1",
+                   "device-a",
+                   "payload-1",
+                   "flow-2",
+                   "device-b",
+                   "payload-2"
+                 ],
+                 {:flow_create_many, nil,
+                  [
+                    {"flow-1", [partition_key: "device-a", payload_ref: "payload-1"]},
+                    {"flow-2", [partition_key: "device-b", payload_ref: "payload-2"]}
+                  ], [type: "iot", run_at_ms: 1000]}, ["device-a", "device-b"]},
+                {:command, "FLOW.TRANSITION_MANY",
+                 [
+                   "MIXED",
+                   "queued",
+                   "ready",
+                   "RUN_AT",
+                   "2000",
+                   "ITEMS",
+                   "flow-1",
+                   "device-a",
+                   "1",
+                   "-",
+                   "flow-2",
+                   "device-b",
+                   "2",
+                   "lease-2"
+                 ],
+                 {:flow_transition_many, nil, "queued", "ready",
+                  [
+                    {"flow-1", [partition_key: "device-a", fencing_token: 1]},
+                    {"flow-2",
+                     [partition_key: "device-b", fencing_token: 2, lease_token: "lease-2"]}
+                  ], [run_at_ms: 2000]}, ["device-a", "device-b"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "flow.create_many MIXED TYPE iot RUN_AT 1000 ITEMS flow-1 device-a payload-1 flow-2 device-b payload-2\r\n" <>
+                   "flow.transition_many MIXED queued ready RUN_AT 2000 ITEMS flow-1 device-a 1 - flow-2 device-b 2 lease-2\r\n"
+               )
+    end
+
     test "keeps Flow option parse errors inside AST" do
       huge_ref = String.duplicate("p", 4_097)
 

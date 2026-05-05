@@ -157,6 +157,15 @@ defmodule Ferricstore.Bitcask.NIF do
   def lmdb_write_batch_with_originals(_path, _ops, _map_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_prefix_entries(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, [{binary(), binary()}]} | {:error, term()}
+  def lmdb_prefix_entries(_path, _prefix, _limit, _map_size),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_prefix_count(binary(), binary(), non_neg_integer()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def lmdb_prefix_count(_path, _prefix, _map_size), do: :erlang.nif_error(:nif_not_loaded)
+
   # -- v2 Tokio async IO NIFs --
   @type pread_batch_value :: binary() | nil | {:error, binary()}
   @type pread_batch_result :: [pread_batch_value()]

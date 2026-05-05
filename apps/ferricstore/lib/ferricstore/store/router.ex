@@ -3667,28 +3667,46 @@ defmodule Ferricstore.Store.Router do
   def flow_get(ctx, id, partition_key) when is_binary(id) do
     key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
-    if Ferricstore.Flow.LMDB.enabled?() do
-      idx = shard_for(ctx, key)
+    cond do
+      Ferricstore.Flow.LMDB.write_through?() ->
+        flow_get_lmdb(ctx, key)
 
-      path =
-        ctx.data_dir |> Ferricstore.DataDir.shard_data_path(idx) |> Ferricstore.Flow.LMDB.path()
+      Ferricstore.Flow.LMDB.mirror?() ->
+        case get(ctx, key) do
+          nil -> flow_get_lmdb(ctx, key)
+          value -> value
+        end
 
-      case Ferricstore.Flow.LMDB.get(path, key) do
-        {:ok, blob} ->
-          case Ferricstore.Flow.LMDB.decode_value(blob, System.os_time(:millisecond)) do
-            {:ok, value} -> value
-            :expired -> nil
-            :error -> nil
-          end
+      true ->
+        get(ctx, key)
+    end
+  end
 
-        :not_found ->
-          nil
+  defp flow_get_lmdb(ctx, key) do
+    idx = shard_for(ctx, key)
 
-        {:error, _reason} ->
-          nil
-      end
-    else
-      get(ctx, key)
+    path =
+      ctx.data_dir |> Ferricstore.DataDir.shard_data_path(idx) |> Ferricstore.Flow.LMDB.path()
+
+    case Ferricstore.Flow.LMDB.get(path, key) do
+      {:ok, blob} ->
+        case Ferricstore.Flow.LMDB.decode_value(blob, System.os_time(:millisecond)) do
+          {:ok, value} ->
+            value
+
+          :expired ->
+            Ferricstore.Flow.LMDB.delete_state_artifacts(path, key)
+            nil
+
+          :error ->
+            nil
+        end
+
+      :not_found ->
+        nil
+
+      {:error, _reason} ->
+        nil
     end
   end
 
@@ -3760,6 +3778,80 @@ defmodule Ferricstore.Store.Router do
       idx = shard_for(ctx, key)
       raft_write(ctx, idx, key, {:flow_create_many, key, %{records: attrs_list}})
     end
+  end
+
+  def flow_create_many(ctx, nil, attrs_list) when is_list(attrs_list) do
+    flow_many_by_shard(ctx, attrs_list, :flow_create_many, "__batch__")
+  end
+
+  defp flow_many_by_shard(ctx, attrs_list, command, batch_id)
+       when command in [:flow_create_many, :flow_transition_many] do
+    indexed =
+      attrs_list
+      |> Enum.with_index()
+      |> Enum.map(fn {%{id: id, partition_key: partition_key} = attrs, idx}
+                     when is_binary(id) and is_binary(partition_key) ->
+        key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+        shard_idx = shard_for(ctx, key)
+        {idx, shard_idx, attrs}
+      end)
+
+    groups =
+      indexed
+      |> Enum.group_by(fn {_idx, shard_idx, _attrs} -> shard_idx end)
+      |> Enum.map(fn {shard_idx, group} ->
+        attrs = Enum.map(group, fn {_idx, _shard_idx, attrs} -> attrs end)
+        partition_key = attrs |> hd() |> Map.fetch!(:partition_key)
+        key = Ferricstore.Flow.Keys.state_key(batch_id, partition_key)
+        original_indices = Enum.map(group, fn {idx, _shard_idx, _attrs} -> idx end)
+        {shard_idx, key, original_indices, {command, key, %{records: attrs}}}
+      end)
+
+    case Enum.find(groups, fn {_shard_idx, key, _indices, _cmd} ->
+           byte_size(key) > @max_key_size
+         end) do
+      {_shard_idx, _key, indices, _cmd} ->
+        error = {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+        {:ok, flow_many_error_results(length(indexed), indices, error)}
+
+      nil ->
+        keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
+        group_results = batch_quorum_commands(ctx, keyed_commands)
+        expand_flow_many_results(length(indexed), groups, group_results)
+    end
+  end
+
+  defp flow_many_error_results(count, error_indices, error) do
+    error_set = MapSet.new(error_indices)
+
+    0..(count - 1)
+    |> Enum.map(fn idx ->
+      if MapSet.member?(error_set, idx), do: error, else: ErrorReasons.write_timeout_unknown()
+    end)
+  end
+
+  defp expand_flow_many_results(count, groups, group_results) do
+    expanded =
+      group_results
+      |> Enum.zip(groups)
+      |> Enum.reduce(%{}, fn
+        {{:ok, records}, {_shard_idx, _key, indices, _cmd}}, acc when is_list(records) ->
+          indices
+          |> Enum.zip(records)
+          |> Enum.reduce(acc, fn {idx, record}, next -> Map.put(next, idx, record) end)
+
+        {{:error, _reason} = error, {_shard_idx, _key, indices, _cmd}}, acc ->
+          Enum.reduce(indices, acc, fn idx, next -> Map.put(next, idx, error) end)
+
+        {other, {_shard_idx, _key, indices, _cmd}}, acc ->
+          Enum.reduce(indices, acc, fn idx, next -> Map.put(next, idx, other) end)
+      end)
+
+    results =
+      0..(count - 1)
+      |> Enum.map(fn idx -> Map.get(expanded, idx, ErrorReasons.write_timeout_unknown()) end)
+
+    {:ok, results}
   end
 
   @doc false
@@ -3856,6 +3948,10 @@ defmodule Ferricstore.Store.Router do
       idx = shard_for(ctx, key)
       raft_write(ctx, idx, key, {:flow_transition_many, key, %{records: attrs_list}})
     end
+  end
+
+  def flow_transition_many(ctx, nil, attrs_list) when is_list(attrs_list) do
+    flow_many_by_shard(ctx, attrs_list, :flow_transition_many, "__transition_batch__")
   end
 
   @doc false

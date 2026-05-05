@@ -85,6 +85,39 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches mixed-partition Flow create_many through Rust AST" do
+    type = uid("flow-command-mixed")
+    partition_a = uid("device-a")
+    partition_b = uid("device-b")
+    id_a = uid("flow-command-mixed-a")
+    id_b = uid("flow-command-mixed-b")
+
+    assert [
+             %{"id" => ^id_a, "type" => ^type, "partition_key" => ^partition_a},
+             %{"id" => ^id_b, "type" => ^type, "partition_key" => ^partition_b}
+           ] =
+             Dispatcher.dispatch(
+               "FLOW.CREATE_MANY",
+               [
+                 "MIXED",
+                 "TYPE",
+                 type,
+                 "RUN_AT",
+                 "1000",
+                 "NOW",
+                 "1000",
+                 "ITEMS",
+                 id_a,
+                 partition_a,
+                 "payload:" <> id_a,
+                 id_b,
+                 partition_b,
+                 "payload:" <> id_b
+               ],
+               MockStore.make()
+             )
+  end
+
   test "dispatches Flow claim and complete through Rust AST" do
     id = uid("flow-command-complete")
 

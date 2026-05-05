@@ -21,7 +21,8 @@ defmodule Ferricstore.Commands.Flow do
   end
 
   def handle_ast({:flow_create_many, partition_key, items, opts}, _store)
-      when is_binary(partition_key) and is_list(items) and is_list(opts) do
+      when (is_binary(partition_key) or is_nil(partition_key)) and is_list(items) and
+             is_list(opts) do
     FerricStore.flow_create_many(partition_key, items, opts) |> normalize_result()
   end
 
@@ -47,8 +48,8 @@ defmodule Ferricstore.Commands.Flow do
         {:flow_transition_many, partition_key, from_state, to_state, items, opts},
         _store
       )
-      when is_binary(partition_key) and is_binary(from_state) and is_binary(to_state) and
-             is_list(items) and is_list(opts) do
+      when (is_binary(partition_key) or is_nil(partition_key)) and is_binary(from_state) and
+             is_binary(to_state) and is_list(items) and is_list(opts) do
     FerricStore.flow_transition_many(partition_key, from_state, to_state, items, opts)
     |> normalize_result()
   end

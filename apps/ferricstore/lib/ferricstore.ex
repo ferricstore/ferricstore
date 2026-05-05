@@ -370,12 +370,14 @@ defmodule FerricStore do
   def flow_create(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
-  Creates a durable batch of Flow records in one partition.
+  Creates a durable batch of Flow records.
 
-  The batch is all-or-nothing because every item routes to the same shard.
+  When `partition_key` is set, the batch is all-or-nothing because every item
+  routes to the same shard. When `partition_key` is `nil`, each item must carry
+  `:partition_key`; items are grouped by shard and each shard group is atomic.
   Required option: `:type`.
   """
-  @spec flow_create_many(binary(), list(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  @spec flow_create_many(binary() | nil, list(), keyword()) :: {:ok, [map()]} | {:error, binary()}
   def flow_create_many(partition_key, items, opts \\ [])
 
   def flow_create_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
@@ -455,12 +457,14 @@ defmodule FerricStore do
     do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
-  Moves a same-partition batch of Flow records from one state to another.
+  Moves a batch of Flow records from one state to another.
 
-  The batch is all-or-nothing because every item routes to the same shard.
+  When `partition_key` is set, the batch is all-or-nothing because every item
+  routes to the same shard. When `partition_key` is `nil`, each item must carry
+  `:partition_key`; items are grouped by shard and each shard group is atomic.
   Each item must provide `:id` and `:fencing_token`; `:lease_token` is optional.
   """
-  @spec flow_transition_many(binary(), binary(), binary(), list(), keyword()) ::
+  @spec flow_transition_many(binary() | nil, binary(), binary(), list(), keyword()) ::
           {:ok, [map()]} | {:error, binary()}
   def flow_transition_many(partition_key, from_state, to_state, items, opts \\ [])
 
@@ -555,7 +559,7 @@ defmodule FerricStore do
          {:ok, count} <- flow_history_count(opts),
          index_key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key),
          :ok <- flow_validate_key_size(index_key),
-         {:ok, ids} <- zrange(index_key, 0, count - 1) do
+         {:ok, ids} <- flow_index_ids(index_key, state, count) do
       flow_records_for_ids(ids, partition_key)
     end
   end
@@ -718,10 +722,128 @@ defmodule FerricStore do
       key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key)
 
       with :ok <- flow_validate_key_size(key),
-           {:ok, count} <- zcard(key) do
+           {:ok, count} <- flow_index_count(key, state) do
         {:cont, {:ok, Map.put(acc, String.to_atom(state), count)}}
       else
         {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_index_ids(index_key, state, count) do
+    with {:ok, ram_ids} <- zrange(index_key, 0, count - 1),
+         {:ok, lmdb_ids} <- flow_terminal_lmdb_ids(index_key, state, count) do
+      {:ok, (ram_ids ++ lmdb_ids) |> Enum.uniq() |> Enum.take(count)}
+    end
+  end
+
+  defp flow_index_count(index_key, state) do
+    with {:ok, ram_count} <- zcard(index_key),
+         {:ok, lmdb_count} <- flow_terminal_lmdb_count(index_key, state) do
+      {:ok, ram_count + lmdb_count}
+    end
+  end
+
+  defp flow_terminal_lmdb_ids(_index_key, state, _count)
+       when state not in ["completed", "failed", "cancelled"],
+       do: {:ok, []}
+
+  defp flow_terminal_lmdb_ids(_index_key, _state, count) when count <= 0, do: {:ok, []}
+
+  defp flow_terminal_lmdb_ids(index_key, _state, count) do
+    if Ferricstore.Flow.LMDB.mirror?() do
+      ctx = default_ctx()
+      prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
+      now_ms = System.os_time(:millisecond)
+
+      ctx.data_dir
+      |> flow_lmdb_shard_paths(ctx.shard_count)
+      |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
+        with {:ok, total} <- Ferricstore.Flow.LMDB.prefix_count(path, prefix),
+             {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, total) do
+          {:cont, {:ok, flow_decode_terminal_index_entries(entries, path, now_ms) ++ acc}}
+        else
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, entries} ->
+          ids =
+            entries
+            |> Enum.sort_by(fn {id, updated_at_ms} -> {updated_at_ms, id} end)
+            |> Enum.map(fn {id, _updated_at_ms} -> id end)
+            |> Enum.take(count)
+
+          {:ok, ids}
+
+        {:error, _reason} = error ->
+          error
+      end
+    else
+      {:ok, []}
+    end
+  end
+
+  defp flow_terminal_lmdb_count(_index_key, state)
+       when state not in ["completed", "failed", "cancelled"],
+       do: {:ok, 0}
+
+  defp flow_terminal_lmdb_count(index_key, _state) do
+    if Ferricstore.Flow.LMDB.mirror?() do
+      ctx = default_ctx()
+      prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
+      now_ms = System.os_time(:millisecond)
+
+      ctx.data_dir
+      |> flow_lmdb_shard_paths(ctx.shard_count)
+      |> Enum.reduce_while({:ok, 0}, fn path, {:ok, acc} ->
+        case Ferricstore.Flow.LMDB.prefix_count(path, prefix) do
+          {:ok, 0} ->
+            {:cont, {:ok, acc}}
+
+          {:ok, count} ->
+            case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count) do
+              {:ok, entries} ->
+                live_count =
+                  entries |> flow_decode_terminal_index_entries(path, now_ms) |> length()
+
+                {:cont, {:ok, acc + live_count}}
+
+              {:error, _reason} = error ->
+                {:halt, error}
+            end
+
+          {:error, _reason} = error ->
+            {:halt, error}
+        end
+      end)
+    else
+      {:ok, 0}
+    end
+  end
+
+  defp flow_lmdb_shard_paths(data_dir, shard_count) do
+    Enum.map(0..(shard_count - 1), fn shard_index ->
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+    end)
+  end
+
+  defp flow_decode_terminal_index_entries(entries, path, now_ms) do
+    entries
+    |> Enum.flat_map(fn {key, value} ->
+      case Ferricstore.Flow.LMDB.decode_terminal_index_value(value) do
+        {:ok, {id, updated_at_ms, expire_at_ms, _state_key}}
+        when expire_at_ms <= 0 or expire_at_ms > now_ms ->
+          [{id, updated_at_ms}]
+
+        {:ok, {_id, _updated_at_ms, _expire_at_ms, state_key}} ->
+          Ferricstore.Flow.LMDB.delete_terminal_index_entry(path, key, state_key)
+          []
+
+        :error ->
+          []
       end
     end)
   end

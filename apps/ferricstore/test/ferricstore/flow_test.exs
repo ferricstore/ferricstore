@@ -68,6 +68,23 @@ defmodule Ferricstore.FlowTest do
     {first, second}
   end
 
+  defp mixed_partition_keys do
+    base = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    groups =
+      1..256
+      |> Enum.map(&"#{base}:#{&1}")
+      |> Enum.group_by(fn key -> shard_for(Ferricstore.Flow.Keys.state_key("probe", key)) end)
+
+    {same_shard, [same_a, same_b | _]} =
+      Enum.find(groups, fn {_shard, keys} -> length(keys) >= 2 end)
+
+    {other_shard, [other | _]} = Enum.find(groups, fn {shard, _keys} -> shard != same_shard end)
+
+    assert same_shard != other_shard
+    {same_a, same_b, other}
+  end
+
   test "flow_create stores state and prevents duplicate ids" do
     id = uid("flow-create")
 
@@ -161,6 +178,43 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, nil} = FerricStore.flow_get(new_id, partition_key: partition)
+  end
+
+  test "flow_create_many spans shards and rolls back failing shard group" do
+    {same_a, same_b, other} = mixed_partition_keys()
+    type = uid("bulk-mixed-create")
+    existing_id = uid("bulk-mixed-existing")
+    same_new_id = uid("bulk-mixed-same")
+    other_new_id = uid("bulk-mixed-other")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(existing_id,
+               type: type,
+               partition_key: same_a,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, results} =
+             FerricStore.flow_create_many(
+               nil,
+               [
+                 %{id: existing_id, partition_key: same_a},
+                 %{id: same_new_id, partition_key: same_b},
+                 %{id: other_new_id, partition_key: other}
+               ],
+               type: type,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert [
+             {:error, "ERR flow already exists"},
+             {:error, "ERR flow already exists"},
+             %{id: ^other_new_id, partition_key: ^other}
+           ] = results
+
+    assert {:ok, nil} = FerricStore.flow_get(same_new_id, partition_key: same_b)
+    assert {:ok, %{id: ^other_new_id}} = FerricStore.flow_get(other_new_id, partition_key: other)
   end
 
   test "flow_create emits telemetry and wakeup pubsub notifications" do
@@ -1018,6 +1072,48 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert claimed |> Enum.map(& &1.id) |> MapSet.new() == MapSet.new([id_a, id_b])
+  end
+
+  test "flow_transition_many spans shards and rolls back failing shard group" do
+    {same_a, same_b, other} = mixed_partition_keys()
+    type = uid("bulk-mixed-transition")
+    bad_id = uid("transition-mixed-bad")
+    same_id = uid("transition-mixed-same")
+    other_id = uid("transition-mixed-other")
+
+    for {id, partition} <- [{bad_id, same_a}, {same_id, same_b}, {other_id, other}] do
+      assert {:ok, _} =
+               FerricStore.flow_create(id,
+                 type: type,
+                 partition_key: partition,
+                 state: "queued",
+                 run_at_ms: 1_000
+               )
+    end
+
+    assert {:ok, results} =
+             FerricStore.flow_transition_many(
+               nil,
+               "queued",
+               "ready",
+               [
+                 %{id: bad_id, partition_key: same_a, fencing_token: 1},
+                 %{id: same_id, partition_key: same_b, fencing_token: 0},
+                 %{id: other_id, partition_key: other, fencing_token: 0}
+               ],
+               run_at_ms: 2_000,
+               now_ms: 1_100
+             )
+
+    assert [
+             {:error, "ERR stale flow lease"},
+             {:error, "ERR stale flow lease"},
+             %{id: ^other_id, partition_key: ^other, state: "ready"}
+           ] = results
+
+    assert {:ok, %{state: "queued"}} = FerricStore.flow_get(bad_id, partition_key: same_a)
+    assert {:ok, %{state: "queued"}} = FerricStore.flow_get(same_id, partition_key: same_b)
+    assert {:ok, %{state: "ready"}} = FerricStore.flow_get(other_id, partition_key: other)
   end
 
   test "flow_transition enforces expected state and running lease guard" do

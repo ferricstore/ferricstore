@@ -857,6 +857,13 @@ defmodule Ferricstore.Commands.Server do
         merge_candidates = max(0, data_files - 1)
         last_applied = atomic_metric(instance_ctx, :last_applied_index, i)
         last_released = atomic_metric(instance_ctx, :last_released_cursor_index, i)
+        replay_safe = atomic_metric(instance_ctx, :replay_safe_index, i)
+        replay_safe_requested = atomic_metric(instance_ctx, :replay_safe_requested_index, i)
+        replay_safe_lag = max(replay_safe_requested - replay_safe, 0)
+
+        replay_safe_persist_failures =
+          atomic_metric(instance_ctx, :replay_safe_persist_failures, i)
+
         release_gap = max(last_applied - last_released, 0)
 
         release_cursor_blocked_apply_count =
@@ -872,6 +879,11 @@ defmodule Ferricstore.Commands.Server do
           {"shard_#{i}_merge_candidates", Integer.to_string(merge_candidates)},
           {"shard_#{i}_last_applied_index", Integer.to_string(last_applied)},
           {"shard_#{i}_last_released_cursor_index", Integer.to_string(last_released)},
+          {"shard_#{i}_replay_safe_index", Integer.to_string(replay_safe)},
+          {"shard_#{i}_replay_safe_requested_index", Integer.to_string(replay_safe_requested)},
+          {"shard_#{i}_replay_safe_lag", Integer.to_string(replay_safe_lag)},
+          {"shard_#{i}_replay_safe_persist_failures",
+           Integer.to_string(replay_safe_persist_failures)},
           {"shard_#{i}_release_cursor_gap", Integer.to_string(release_gap)},
           {"shard_#{i}_release_cursor_blocked_apply_count",
            Integer.to_string(release_cursor_blocked_apply_count)},

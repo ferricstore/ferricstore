@@ -45,6 +45,11 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
       on kernel panic we replay up to one interval's worth of Ra log
       entries and rebuild Bitcask exactly. Short intervals mean more
       fsync syscalls per shard for no durability gain.
+    * `:checkpoint_idle_ms` (default 250ms) — if writes are still moving
+      when a tick fires, defer the active-file fsync until the shard has
+      been idle for this long.
+    * `:checkpoint_max_delay_ms` (default 60_000ms) — force fsync after
+      this much dirty time even under continuous writes, bounding replay.
   """
   use GenServer
 
@@ -55,6 +60,8 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   require Logger
 
   @default_interval_ms 10_000
+  @default_idle_ms 250
+  @default_max_delay_ms 60_000
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -87,6 +94,14 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
       Keyword.get(opts, :checkpoint_interval_ms) ||
         Application.get_env(:ferricstore, :checkpoint_interval_ms, @default_interval_ms)
 
+    idle_ms =
+      Keyword.get(opts, :checkpoint_idle_ms) ||
+        Application.get_env(:ferricstore, :checkpoint_idle_ms, @default_idle_ms)
+
+    max_delay_ms =
+      Keyword.get(opts, :checkpoint_max_delay_ms) ||
+        Application.get_env(:ferricstore, :checkpoint_max_delay_ms, @default_max_delay_ms)
+
     # Trap exits so `terminate/2` runs on graceful shutdown and we can
     # synchronously fsync the active file before the supervisor returns.
     Process.flag(:trap_exit, true)
@@ -95,9 +110,14 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
       index: index,
       instance_ctx: ctx,
       interval_ms: interval_ms,
+      idle_ms: idle_ms,
+      max_delay_ms: max_delay_ms,
       in_flight?: false,
       next_corr_id: 1,
-      current_corr_id: nil
+      current_corr_id: nil,
+      dirty_since_ms: nil,
+      last_write_seen_ms: monotonic_ms(),
+      last_write_version: write_version(ctx, index)
     }
 
     schedule_tick(state)
@@ -283,22 +303,39 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
     flag_idx = state.index + 1
 
     if :atomics.get(state.instance_ctx.checkpoint_flags, flag_idx) == 1 do
-      case ActiveFile.get(state.instance_ctx, state.index) do
-        {_fid, active_path, _sp} ->
-          corr_id = state.next_corr_id
-          mark_checkpoint_in_flight(state.instance_ctx, state.index, 1)
-          :atomics.put(state.instance_ctx.checkpoint_flags, flag_idx, 0)
+      case checkpoint_decision(state) do
+        {:defer, state, reason, measurements} ->
+          emit_checkpoint_deferred(state, reason, measurements)
+          state
 
-          case fsync_async(state.instance_ctx, self(), corr_id, active_path) do
-            :ok ->
-              %{state | in_flight?: true, next_corr_id: corr_id + 1, current_corr_id: corr_id}
+        {:fire, state} ->
+          case ActiveFile.get(state.instance_ctx, state.index) do
+            {_fid, active_path, _sp} ->
+              corr_id = state.next_corr_id
+              mark_checkpoint_in_flight(state.instance_ctx, state.index, 1)
+              :atomics.put(state.instance_ctx.checkpoint_flags, flag_idx, 0)
 
-            {:error, reason} ->
-              checkpoint_submit_failed(state, reason)
+              case fsync_async(state.instance_ctx, self(), corr_id, active_path) do
+                :ok ->
+                  %{
+                    state
+                    | in_flight?: true,
+                      next_corr_id: corr_id + 1,
+                      current_corr_id: corr_id,
+                      dirty_since_ms: nil
+                  }
+
+                {:error, reason} ->
+                  checkpoint_submit_failed(state, reason)
+              end
           end
       end
     else
-      state
+      %{
+        state
+        | dirty_since_ms: nil,
+          last_write_version: write_version(state.instance_ctx, state.index)
+      }
     end
   rescue
     exception ->
@@ -312,6 +349,64 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
       )
 
       state
+  end
+
+  defp checkpoint_decision(state) do
+    now = monotonic_ms()
+    current_version = write_version(state.instance_ctx, state.index)
+    new_dirty? = state.dirty_since_ms == nil
+    dirty_since = state.dirty_since_ms || now
+    write_moved? = current_version != state.last_write_version
+    last_write_seen = if write_moved?, do: now, else: state.last_write_seen_ms
+    dirty_age_ms = now - dirty_since
+    idle_age_ms = now - last_write_seen
+
+    state = %{
+      state
+      | dirty_since_ms: dirty_since,
+        last_write_seen_ms: last_write_seen,
+        last_write_version: current_version
+    }
+
+    cond do
+      dirty_age_ms >= state.max_delay_ms ->
+        {:fire, state}
+
+      write_moved? ->
+        {:defer, state, :active_writes,
+         %{dirty_age_ms: dirty_age_ms, idle_ms: idle_age_ms, write_version: current_version}}
+
+      new_dirty? ->
+        {:fire, state}
+
+      idle_age_ms < state.idle_ms ->
+        {:defer, state, :idle_gap,
+         %{dirty_age_ms: dirty_age_ms, idle_ms: idle_age_ms, write_version: current_version}}
+
+      true ->
+        {:fire, state}
+    end
+  end
+
+  defp write_version(%{write_version: ref}, index) do
+    size = :counters.info(ref).size
+    if index < size, do: :counters.get(ref, index + 1), else: 0
+  rescue
+    _ -> 0
+  end
+
+  defp write_version(_ctx, _index), do: 0
+
+  defp monotonic_ms do
+    System.monotonic_time(:millisecond)
+  end
+
+  defp emit_checkpoint_deferred(state, reason, measurements) do
+    :telemetry.execute(
+      [:ferricstore, :bitcask, :checkpoint],
+      Map.put(measurements, :shard_index, state.index),
+      %{status: :deferred, reason: reason}
+    )
   end
 
   defp fsync_async(ctx, caller, corr_id, active_path) do

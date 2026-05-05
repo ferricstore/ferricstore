@@ -216,6 +216,17 @@ defmodule Ferricstore.Store.Shard do
         ShardLifecycle.recover_keydir(path, keydir, index, ctx)
       end)
 
+      profile_startup_phase(index, :flow_lmdb_rebuild, fn ->
+        Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+          path,
+          keydir,
+          index,
+          ctx,
+          zset_score_index,
+          zset_score_lookup
+        )
+      end)
+
       # Only the default application instance owns Raft. Custom embedded shards
       # run local/direct, and direct shard tests pass non-default instance_ctx.
       raft? =
@@ -1056,7 +1067,11 @@ defmodule Ferricstore.Store.Shard do
         cross_shard_locks: %{},
         cross_shard_intents: %{},
         instance_ctx: state.instance_ctx,
-        instance_name: if(state.instance_ctx, do: state.instance_ctx.name, else: :default)
+        instance_name: if(state.instance_ctx, do: state.instance_ctx.name, else: :default),
+        zset_score_index_name: state.zset_score_index,
+        zset_score_lookup_name: state.zset_score_lookup,
+        flow_lmdb_enabled: Ferricstore.Flow.LMDB.enabled?(),
+        flow_lmdb_path: Ferricstore.Flow.LMDB.path(state.shard_data_path)
       }
 
       case Ferricstore.Raft.StateMachine.apply(%{}, command, sm_state) do

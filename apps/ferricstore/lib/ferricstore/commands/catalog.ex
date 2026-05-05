@@ -337,7 +337,7 @@ defmodule Ferricstore.Commands.Catalog do
       first_key: 1,
       last_key: 1,
       step: 1,
-      summary: "Creates a one-partition workflow batch atomically."
+      summary: "Creates workflow records, atomic per partition/shard group."
     },
     %{
       name: "flow.get",
@@ -374,6 +374,15 @@ defmodule Ferricstore.Commands.Catalog do
       last_key: 1,
       step: 1,
       summary: "Moves a workflow record between states."
+    },
+    %{
+      name: "flow.transition_many",
+      arity: -8,
+      flags: ["write"],
+      first_key: 1,
+      last_key: 1,
+      step: 1,
+      summary: "Moves workflow records between states, atomic per partition/shard group."
     },
     %{
       name: "flow.retry",

@@ -2166,13 +2166,94 @@ fn lmdb_write_batch_with_originals<'a>(
     lmdb_write_batch_impl(env, path, records, map_size, true)
 }
 
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_prefix_entries<'a>(
+    env: Env<'a>,
+    path: String,
+    prefix: Binary<'a>,
+    limit: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let rtxn = match store.env.read_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let iter = match store.db.prefix_iter(&rtxn, prefix.as_slice()) {
+                Ok(iter) => iter,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let max = usize::try_from(limit).unwrap_or(usize::MAX);
+            let mut entries = Vec::new();
+
+            for item in iter.take(max) {
+                match item {
+                    Ok((key, value)) => {
+                        let key_term = binary_term(env, key)?;
+                        let value_term = binary_term(env, value)?;
+                        entries.push((key_term, value_term).encode(env));
+                    }
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                }
+            }
+
+            Ok((atoms::ok(), entries).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_prefix_count<'a>(
+    env: Env<'a>,
+    path: String,
+    prefix: Binary<'a>,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let rtxn = match store.env.read_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let iter = match store.db.prefix_iter(&rtxn, prefix.as_slice()) {
+                Ok(iter) => iter,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let mut count = 0_u64;
+
+            for item in iter {
+                if let Err(e) = item {
+                    return Ok((atoms::error(), e.to_string()).encode(env));
+                }
+
+                count += 1;
+            }
+
+            Ok((atoms::ok(), count).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
 fn lmdb_write_batch_impl<'a>(
     env: Env<'a>,
     path: String,
-    records: Vec<LmdbBatchWrite<'a>>,
+    mut records: Vec<LmdbBatchWrite<'a>>,
     map_size: u64,
     return_originals: bool,
 ) -> NifResult<Term<'a>> {
+    if records.len() > 1 && lmdb_record_keys_are_unique(&records) {
+        records.sort_unstable_by(|left, right| lmdb_record_key(left).cmp(lmdb_record_key(right)));
+    }
+
     match lmdb_store(&path, map_size) {
         Ok(store) => {
             let mut wtxn = match store.env.write_txn() {
@@ -2242,6 +2323,26 @@ fn lmdb_write_batch_impl<'a>(
         }
         Err(e) => Ok((atoms::error(), e).encode(env)),
     }
+}
+
+fn lmdb_record_key<'a>(record: &'a LmdbBatchWrite<'_>) -> &'a [u8] {
+    match record {
+        LmdbBatchWrite::Put(key, _)
+        | LmdbBatchWrite::PutNew(key, _)
+        | LmdbBatchWrite::Delete(key) => key.as_slice(),
+    }
+}
+
+fn lmdb_record_keys_are_unique(records: &[LmdbBatchWrite<'_>]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(records.len());
+
+    for record in records {
+        if !seen.insert(lmdb_record_key(record).to_vec()) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn binary_term<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {

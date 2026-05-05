@@ -278,6 +278,10 @@ defmodule Ferricstore.MetricsTest do
       expected_metrics = [
         "ferricstore_bitcask_last_applied_index",
         "ferricstore_bitcask_last_released_cursor_index",
+        "ferricstore_bitcask_replay_safe_index",
+        "ferricstore_bitcask_replay_safe_requested_index",
+        "ferricstore_bitcask_replay_safe_lag",
+        "ferricstore_bitcask_replay_safe_persist_failures_total",
         "ferricstore_bitcask_release_cursor_gap",
         "ferricstore_bitcask_pending_release_cursor_checkpoint_count",
         "ferricstore_bitcask_release_cursor_blocked_apply_count",

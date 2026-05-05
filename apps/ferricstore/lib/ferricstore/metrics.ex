@@ -105,35 +105,30 @@ defmodule Ferricstore.Metrics do
   @spec metrics() :: [{binary(), metric_type(), binary(), non_neg_integer()}]
   defp metrics do
     [
-      {"ferricstore_connected_clients", :gauge,
-       "Number of active client connections", connected_clients()},
+      {"ferricstore_connected_clients", :gauge, "Number of active client connections",
+       connected_clients()},
       {"ferricstore_total_connections_received", :counter,
-       "Total number of TCP connections accepted since startup",
-       Stats.total_connections()},
+       "Total number of TCP connections accepted since startup", Stats.total_connections()},
       {"ferricstore_total_commands_processed", :counter,
-       "Total number of commands dispatched since startup",
-       Stats.total_commands()},
+       "Total number of commands dispatched since startup", Stats.total_commands()},
       {"ferricstore_hot_reads_total", :counter,
        "Total number of reads served from the ETS hot cache",
        Stats.total_hot_reads(FerricStore.Instance.get(:default))},
       {"ferricstore_cold_reads_total", :counter,
        "Total number of reads that fell through to Bitcask on disk",
        Stats.total_cold_reads(FerricStore.Instance.get(:default))},
-      {"ferricstore_used_memory_bytes", :gauge,
-       "Total BEAM VM memory usage in bytes", :erlang.memory(:total)},
+      {"ferricstore_used_memory_bytes", :gauge, "Total BEAM VM memory usage in bytes",
+       :erlang.memory(:total)},
       {"ferricstore_keydir_used_bytes", :gauge,
-       "Total ETS memory used by shard keydir tables in bytes",
-       keydir_used_bytes()},
-      {"ferricstore_uptime_seconds", :gauge,
-       "Server uptime in seconds", Stats.uptime_seconds()},
+       "Total ETS memory used by shard keydir tables in bytes", keydir_used_bytes()},
+      {"ferricstore_uptime_seconds", :gauge, "Server uptime in seconds", Stats.uptime_seconds()},
       {"ferricstore_blocked_clients", :gauge,
        "Number of clients blocked on BLPOP/BRPOP/BLMOVE/BLMPOP",
        safe_ets_size(:ferricstore_waiters)},
       {"ferricstore_tracking_clients", :gauge,
        "Number of clients with client-side caching tracking enabled",
        safe_ets_size(:ferricstore_tracking_connections)},
-      {"ferricstore_slowlog_entries", :gauge,
-       "Current number of entries in the slow log",
+      {"ferricstore_slowlog_entries", :gauge, "Current number of entries in the slow log",
        slowlog_len()}
     ]
   end
@@ -156,6 +151,7 @@ defmodule Ferricstore.Metrics do
   @spec connected_clients() :: non_neg_integer()
   defp connected_clients do
     ctx = FerricStore.Instance.get(:default)
+
     case ctx.connected_clients_fn do
       nil -> 0
       fun -> fun.()
@@ -173,6 +169,7 @@ defmodule Ferricstore.Metrics do
         case :ets.info(keydir, :memory) do
           words when is_integer(words) ->
             acc + words * :erlang.system_info(:wordsize)
+
           _ ->
             acc
         end
@@ -235,6 +232,31 @@ defmodule Ferricstore.Metrics do
         fn shard -> atomic_metric(ctx, :last_released_cursor_index, shard) end
       ),
       checkpoint_metric_family(
+        "ferricstore_bitcask_replay_safe_index",
+        "Last replay-safe Raft index marker durably persisted per shard",
+        fn shard -> atomic_metric(ctx, :replay_safe_index, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_bitcask_replay_safe_requested_index",
+        "Highest replay-safe Raft index requested for durable marker persistence per shard",
+        fn shard -> atomic_metric(ctx, :replay_safe_requested_index, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_bitcask_replay_safe_lag",
+        "Difference between requested and durable replay-safe marker index per shard",
+        fn shard ->
+          requested = atomic_metric(ctx, :replay_safe_requested_index, shard)
+          durable = atomic_metric(ctx, :replay_safe_index, shard)
+
+          max(requested - durable, 0)
+        end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_bitcask_replay_safe_persist_failures_total",
+        "Total replay-safe marker persist failures per shard",
+        fn shard -> atomic_metric(ctx, :replay_safe_persist_failures, shard) end
+      ),
+      checkpoint_metric_family(
         "ferricstore_bitcask_release_cursor_gap",
         "Difference between last applied and last released Raft cursor per shard",
         fn shard ->
@@ -280,7 +302,8 @@ defmodule Ferricstore.Metrics do
 
   defp atomic_metric(nil, _field, _shard), do: 0
 
-  defp atomic_metric(ctx, field, shard) when is_atom(field) and is_integer(shard) and shard >= 0 do
+  defp atomic_metric(ctx, field, shard)
+       when is_atom(field) and is_integer(shard) and shard >= 0 do
     case Map.get(ctx, field) do
       ref when is_reference(ref) ->
         index = shard + 1

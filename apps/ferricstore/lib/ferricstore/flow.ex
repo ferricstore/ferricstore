@@ -64,7 +64,7 @@ defmodule Ferricstore.Flow do
     now = now_ms()
 
     result =
-      with {:ok, partition_key} <- required_partition_key(partition_key),
+      with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
            :ok <- validate_create_many_items(items),
            {:ok, attrs_list} <- create_many_attrs(items, opts, partition_key, now),
            :ok <- validate_unique_create_ids(attrs_list) do
@@ -170,7 +170,7 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, partition_key} <- required_partition_key(partition_key),
+      with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
            :ok <- validate_transition_many_items(items),
            {:ok, attrs_list} <-
              transition_many_attrs(items, opts, partition_key, from_state, to_state),
@@ -590,10 +590,13 @@ defmodule Ferricstore.Flow do
   defp create_many_attrs(items, opts, partition_key, default_now) do
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, item_opts} <- create_many_item_opts(item),
+           {:ok, item_partition_key} <- many_item_partition_key(partition_key, item_opts),
            {:ok, attrs} <-
              create_attrs(
                id,
-               opts |> Keyword.merge(item_opts) |> Keyword.put(:partition_key, partition_key),
+               opts
+               |> Keyword.merge(Keyword.delete(item_opts, :partition_key))
+               |> Keyword.put(:partition_key, item_partition_key),
                default_now
              ) do
         {:cont, {:ok, [attrs | acc]}}
@@ -610,11 +613,11 @@ defmodule Ferricstore.Flow do
   defp create_many_item_opts(id) when is_binary(id), do: {:ok, id, []}
 
   defp create_many_item_opts(%{id: id} = item) when is_binary(id) do
-    {:ok, id, create_many_item_payload_ref(item)}
+    {:ok, id, create_many_item_opts_from_map(item)}
   end
 
   defp create_many_item_opts(%{"id" => id} = item) when is_binary(id) do
-    {:ok, id, create_many_item_payload_ref(item)}
+    {:ok, id, create_many_item_opts_from_map(item)}
   end
 
   defp create_many_item_opts({id, item_opts}) when is_binary(id) and is_list(item_opts) do
@@ -629,14 +632,17 @@ defmodule Ferricstore.Flow do
     {:ok, id, [payload_ref: payload_ref]}
   end
 
+  defp create_many_item_opts({:id, id, :partition_key, partition_key, :payload_ref, payload_ref})
+       when is_binary(id) do
+    {:ok, id, [partition_key: partition_key, payload_ref: payload_ref]}
+  end
+
   defp create_many_item_opts(_item), do: {:error, "ERR flow id must be a non-empty string"}
 
-  defp create_many_item_payload_ref(item) do
-    cond do
-      Map.has_key?(item, :payload_ref) -> [payload_ref: Map.get(item, :payload_ref)]
-      Map.has_key?(item, "payload_ref") -> [payload_ref: Map.get(item, "payload_ref")]
-      true -> []
-    end
+  defp create_many_item_opts_from_map(item) do
+    []
+    |> maybe_put_item_opt(:payload_ref, item, :payload_ref, "payload_ref")
+    |> maybe_put_item_opt(:partition_key, item, :partition_key, "partition_key")
   end
 
   defp transition_attrs(id, from_state, to_state, opts) do
@@ -669,12 +675,15 @@ defmodule Ferricstore.Flow do
   defp transition_many_attrs(items, opts, partition_key, from_state, to_state) do
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, item_opts} <- transition_many_item_opts(item),
+           {:ok, item_partition_key} <- many_item_partition_key(partition_key, item_opts),
            {:ok, attrs} <-
              transition_attrs(
                id,
                from_state,
                to_state,
-               opts |> Keyword.merge(item_opts) |> Keyword.put(:partition_key, partition_key)
+               opts
+               |> Keyword.merge(Keyword.delete(item_opts, :partition_key))
+               |> Keyword.put(:partition_key, item_partition_key)
              ) do
         {:cont, {:ok, [attrs | acc]}}
       else
@@ -689,12 +698,16 @@ defmodule Ferricstore.Flow do
 
   defp transition_many_item_opts(%{id: id, fencing_token: fencing_token} = item)
        when is_binary(id) do
-    {:ok, id, [fencing_token: fencing_token] ++ transition_many_item_lease_token(item)}
+    {:ok, id,
+     [fencing_token: fencing_token] ++
+       transition_many_item_lease_token(item) ++ transition_many_item_partition_key(item)}
   end
 
   defp transition_many_item_opts(%{"id" => id, "fencing_token" => fencing_token} = item)
        when is_binary(id) do
-    {:ok, id, [fencing_token: fencing_token] ++ transition_many_item_lease_token(item)}
+    {:ok, id,
+     [fencing_token: fencing_token] ++
+       transition_many_item_lease_token(item) ++ transition_many_item_partition_key(item)}
   end
 
   defp transition_many_item_opts({id, item_opts}) when is_binary(id) and is_list(item_opts) do
@@ -717,6 +730,23 @@ defmodule Ferricstore.Flow do
     {:ok, id, opts}
   end
 
+  defp transition_many_item_opts(
+         {:id, id, :partition_key, partition_key, :fencing_token, fencing_token, :lease_token,
+          lease_token}
+       )
+       when is_binary(id) do
+    opts =
+      if is_nil(lease_token),
+        do: [partition_key: partition_key, fencing_token: fencing_token],
+        else: [
+          partition_key: partition_key,
+          fencing_token: fencing_token,
+          lease_token: lease_token
+        ]
+
+    {:ok, id, opts}
+  end
+
   defp transition_many_item_opts(_item), do: {:error, "ERR flow id must be a non-empty string"}
 
   defp transition_many_item_lease_token(item) do
@@ -724,6 +754,39 @@ defmodule Ferricstore.Flow do
       Map.has_key?(item, :lease_token) -> [lease_token: Map.get(item, :lease_token)]
       Map.has_key?(item, "lease_token") -> [lease_token: Map.get(item, "lease_token")]
       true -> []
+    end
+  end
+
+  defp transition_many_item_partition_key(item) do
+    []
+    |> maybe_put_item_opt(:partition_key, item, :partition_key, "partition_key")
+  end
+
+  defp maybe_put_item_opt(opts, opt_key, item, atom_key, string_key) do
+    cond do
+      Map.has_key?(item, atom_key) -> Keyword.put(opts, opt_key, Map.get(item, atom_key))
+      Map.has_key?(item, string_key) -> Keyword.put(opts, opt_key, Map.get(item, string_key))
+      true -> opts
+    end
+  end
+
+  defp many_item_partition_key(nil, item_opts) do
+    item_opts
+    |> Keyword.get(:partition_key)
+    |> required_partition_key()
+  end
+
+  defp many_item_partition_key(partition_key, item_opts) when is_binary(partition_key) do
+    case Keyword.fetch(item_opts, :partition_key) do
+      {:ok, item_partition_key} ->
+        case required_partition_key(item_partition_key) do
+          {:ok, ^partition_key} -> {:ok, partition_key}
+          {:ok, _other} -> {:error, "ERR flow partition_key mismatch in batch"}
+          {:error, _reason} = error -> error
+        end
+
+      :error ->
+        {:ok, partition_key}
     end
   end
 

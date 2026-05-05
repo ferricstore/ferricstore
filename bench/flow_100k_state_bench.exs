@@ -12,17 +12,22 @@
 #   FLOW_100K_PARTITIONS=4
 #   FLOW_100K_SEED_CONCURRENCY=32
 #   FLOW_100K_CLAIM_LIMITS=10,100
+#   FLOW_100K_CREATE_MANY_BATCH=100
 
 backlog = System.get_env("FLOW_100K_BACKLOG", "100000") |> String.to_integer()
 iterations = System.get_env("FLOW_100K_ITER", "200") |> String.to_integer()
 shard_count = System.get_env("FLOW_100K_SHARDS", "4") |> String.to_integer()
 partition_count = System.get_env("FLOW_100K_PARTITIONS", "4") |> String.to_integer()
 seed_concurrency = System.get_env("FLOW_100K_SEED_CONCURRENCY", "32") |> String.to_integer()
+create_many_batch = System.get_env("FLOW_100K_CREATE_MANY_BATCH", "100") |> String.to_integer()
 
 transition_many_batch =
   System.get_env("FLOW_100K_TRANSITION_MANY_BATCH", "100") |> String.to_integer()
 
 flow_lmdb_enabled = System.get_env("FLOW_LMDB", "0") in ["1", "true", "TRUE"]
+
+flow_lmdb_mode =
+  System.get_env("FLOW_LMDB_MODE", if(flow_lmdb_enabled, do: "mirror", else: "off"))
 
 claim_limits =
   System.get_env("FLOW_100K_CLAIM_LIMITS", "10,100")
@@ -40,6 +45,7 @@ Application.put_env(:ferricstore, :health_port, 0)
 Application.put_env(:ferricstore, :shard_count, shard_count)
 Application.put_env(:ferricstore, :hot_cache_max_value_size, 512)
 Application.put_env(:ferricstore, :flow_lmdb_enabled, flow_lmdb_enabled)
+Application.put_env(:ferricstore, :flow_lmdb_mode, flow_lmdb_mode)
 
 {:ok, _} = Application.ensure_all_started(:ferricstore)
 
@@ -50,8 +56,10 @@ defmodule Flow100kStateBench do
         shard_count,
         partition_count,
         seed_concurrency,
+        create_many_batch,
         transition_many_batch,
         flow_lmdb_enabled,
+        flow_lmdb_mode,
         claim_limits,
         bench_data_dir
       ) do
@@ -67,7 +75,7 @@ defmodule Flow100kStateBench do
     )
 
     IO.puts(
-      "seed_concurrency=#{seed_concurrency} transition_many_batch=#{transition_many_batch} flow_lmdb=#{flow_lmdb_enabled}"
+      "seed_concurrency=#{seed_concurrency} create_many_batch=#{create_many_batch} transition_many_batch=#{transition_many_batch} flow_lmdb=#{flow_lmdb_enabled} flow_lmdb_mode=#{flow_lmdb_mode}"
     )
 
     memory_before = :erlang.memory(:total)
@@ -98,6 +106,7 @@ defmodule Flow100kStateBench do
           flow
         end)
       )
+      |> add(bench_create_many(prefix, backlog, iterations, partition_count, create_many_batch))
       |> add(
         result("flow.get from #{backlog}", iterations, fn i ->
           index = sample_index(i, backlog)
@@ -154,8 +163,10 @@ defmodule Flow100kStateBench do
       shards: shard_count,
       partitions: partition_count,
       seed_concurrency: seed_concurrency,
+      create_many_batch: create_many_batch,
       transition_many_batch: transition_many_batch,
       flow_lmdb_enabled: flow_lmdb_enabled,
+      flow_lmdb_mode: flow_lmdb_mode,
       claim_limits: claim_limits,
       memory_before: memory_before,
       memory_after_seed: memory_after_seed,
@@ -191,6 +202,29 @@ defmodule Flow100kStateBench do
     |> Enum.each(fn
       {:ok, _} -> :ok
       {:exit, reason} -> raise "seed task failed: #{inspect(reason)}"
+    end)
+  end
+
+  defp bench_create_many(prefix, backlog, iterations, partition_count, batch_size) do
+    flow_type = type(prefix, "create_many")
+
+    result("flow.create_many batch=#{batch_size} under #{backlog}", iterations, fn i ->
+      partition_key = partition(prefix, i, partition_count)
+
+      items =
+        for j <- 1..batch_size do
+          %{id: id(prefix, "create_many", i, j)}
+        end
+
+      {:ok, flows} =
+        FerricStore.flow_create_many(partition_key, items,
+          type: flow_type,
+          state: "queued",
+          run_at_ms: 1_000,
+          now_ms: 1_000
+        )
+
+      flows
     end)
   end
 
@@ -600,8 +634,10 @@ defmodule Flow100kStateBench do
       "- shards: #{config.shards}",
       "- partitions: #{config.partitions}",
       "- seed_concurrency: #{config.seed_concurrency}",
+      "- create_many_batch: #{config.create_many_batch}",
       "- transition_many_batch: #{config.transition_many_batch}",
       "- flow_lmdb_enabled: #{config.flow_lmdb_enabled}",
+      "- flow_lmdb_mode: #{config.flow_lmdb_mode}",
       "- claim_limits: #{Enum.join(config.claim_limits, ",")}",
       "- beam_memory_before: #{config.memory_before}",
       "- beam_memory_after_seed: #{config.memory_after_seed}",
@@ -651,8 +687,10 @@ try do
     shard_count,
     partition_count,
     seed_concurrency,
+    create_many_batch,
     transition_many_batch,
     flow_lmdb_enabled,
+    flow_lmdb_mode,
     claim_limits,
     bench_data_dir
   )

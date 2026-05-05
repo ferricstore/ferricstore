@@ -291,22 +291,23 @@ impl LogWriter {
             validate_kv_sizes(key, value).map_err(LogError)?;
         }
 
-        let encoded: Vec<Vec<u8>> = entries
-            .iter()
-            .map(|(key, value, expire_at_ms)| encode_record(key, value, *expire_at_ms))
-            .collect();
-
-        // H-2 fix: combine all encoded records into a single buffer and write
-        // once, instead of calling append() N times through BufWriter.
-        let total_len: usize = encoded.iter().map(Vec::len).sum();
+        // Encode directly into one combined buffer. This keeps the H-2 single
+        // append syscall, but avoids one Vec allocation and one memcpy per
+        // record on hot batched paths (Flow create_many/transition_many).
+        let total_len = entries.iter().try_fold(0usize, |acc, (key, value, _)| {
+            acc.checked_add(record_len(key.len(), value.len()))
+                .ok_or_else(|| LogError("batch record length overflow".into()))
+        })?;
         let mut combined = Vec::with_capacity(total_len);
-        let mut offsets = Vec::with_capacity(encoded.len());
+        let mut offsets = Vec::with_capacity(entries.len());
         let mut running = self.backend.offset();
-        for buf in &encoded {
+
+        for (key, value, expire_at_ms) in entries {
             offsets.push(running);
-            combined.extend_from_slice(buf);
-            running += buf.len() as u64;
+            encode_record_into(&mut combined, key, value, *expire_at_ms);
+            running += record_len(key.len(), value.len()) as u64;
         }
+
         self.backend
             .append(&combined)
             .map_err(|e| LogError(e.to_string()))?;
@@ -348,24 +349,20 @@ impl LogWriter {
             }
         }
 
-        let encoded: Vec<Vec<u8>> = entries
-            .iter()
-            .map(|entry| match entry {
-                BatchWrite::Put {
-                    key,
-                    value,
-                    expire_at_ms,
-                } => encode_record(key, value, *expire_at_ms),
-                BatchWrite::Delete { key } => encode_tombstone(key),
-            })
-            .collect();
+        let total_len = entries.iter().try_fold(0usize, |acc, entry| {
+            let len = match entry {
+                BatchWrite::Put { key, value, .. } => record_len(key.len(), value.len()),
+                BatchWrite::Delete { key } => tombstone_len(key.len()),
+            };
 
-        let total_len: usize = encoded.iter().map(Vec::len).sum();
+            acc.checked_add(len)
+                .ok_or_else(|| LogError("batch record length overflow".into()))
+        })?;
         let mut combined = Vec::with_capacity(total_len);
-        let mut results = Vec::with_capacity(encoded.len());
+        let mut results = Vec::with_capacity(entries.len());
         let mut running = self.backend.offset();
 
-        for (entry, buf) in entries.iter().zip(&encoded) {
+        for entry in entries {
             match entry {
                 BatchWrite::Put { value, .. } => {
                     results.push(BatchWriteResult::Put {
@@ -381,8 +378,20 @@ impl LogWriter {
                 }
             }
 
-            combined.extend_from_slice(buf);
-            running += buf.len() as u64;
+            match entry {
+                BatchWrite::Put {
+                    key,
+                    value,
+                    expire_at_ms,
+                } => {
+                    encode_record_into(&mut combined, key, value, *expire_at_ms);
+                    running += record_len(key.len(), value.len()) as u64;
+                }
+                BatchWrite::Delete { key } => {
+                    encode_tombstone_into(&mut combined, key);
+                    running += tombstone_len(key.len()) as u64;
+                }
+            }
         }
 
         self.backend
@@ -635,45 +644,63 @@ fn hash_exact(
 ///
 /// C-1 fix: uses `crc32fast` for hardware-accelerated CRC32 (SSE4.2 / ARM CRC).
 pub(crate) fn encode_record(key: &[u8], value: &[u8], expire_at_ms: u64) -> Vec<u8> {
+    let total = record_len(key.len(), value.len());
+    let mut buf = Vec::with_capacity(total);
+    encode_record_into(&mut buf, key, value, expire_at_ms);
+    buf
+}
+
+fn encode_tombstone(key: &[u8]) -> Vec<u8> {
+    let total = tombstone_len(key.len());
+    let mut buf = Vec::with_capacity(total);
+    encode_tombstone_into(&mut buf, key);
+    buf
+}
+
+fn record_len(key_len: usize, value_len: usize) -> usize {
+    HEADER_SIZE + key_len + value_len
+}
+
+fn tombstone_len(key_len: usize) -> usize {
+    HEADER_SIZE + key_len
+}
+
+fn encode_record_into(buf: &mut Vec<u8>, key: &[u8], value: &[u8], expire_at_ms: u64) {
+    let start = buf.len();
     let now_ms = now_ms();
     #[allow(clippy::cast_possible_truncation)]
     let key_size = key.len() as u16;
     #[allow(clippy::cast_possible_truncation)]
     let value_size = value.len() as u32;
 
-    let total = HEADER_SIZE + key.len() + value.len();
-    let mut buf = Vec::with_capacity(total);
-    // Reserve CRC slot (will be patched below)
     buf.extend_from_slice(&[0u8; 4]);
-    // Write body directly into the single buffer
     buf.extend_from_slice(&now_ms.to_le_bytes());
     buf.extend_from_slice(&expire_at_ms.to_le_bytes());
     buf.extend_from_slice(&key_size.to_le_bytes());
     buf.extend_from_slice(&value_size.to_le_bytes());
     buf.extend_from_slice(key);
     buf.extend_from_slice(value);
-    // Compute CRC over body (everything after the 4-byte CRC field)
-    let crc = crc32(&buf[4..]);
-    buf[0..4].copy_from_slice(&crc.to_le_bytes());
-    buf
+
+    let crc = crc32(&buf[start + 4..]);
+    buf[start..start + 4].copy_from_slice(&crc.to_le_bytes());
 }
 
-fn encode_tombstone(key: &[u8]) -> Vec<u8> {
+fn encode_tombstone_into(buf: &mut Vec<u8>, key: &[u8]) {
     // Tombstone: value_size = TOMBSTONE (u32::MAX), no value bytes.
+    let start = buf.len();
     let now_ms = now_ms();
     #[allow(clippy::cast_possible_truncation)]
     let key_size = key.len() as u16;
-    let total = HEADER_SIZE + key.len();
-    let mut buf = Vec::with_capacity(total);
+
     buf.extend_from_slice(&[0u8; 4]); // CRC placeholder
     buf.extend_from_slice(&now_ms.to_le_bytes());
     buf.extend_from_slice(&0u64.to_le_bytes()); // expire_at_ms = 0
     buf.extend_from_slice(&key_size.to_le_bytes());
     buf.extend_from_slice(&TOMBSTONE.to_le_bytes()); // sentinel
     buf.extend_from_slice(key);
-    let crc = crc32(&buf[4..]);
-    buf[0..4].copy_from_slice(&crc.to_le_bytes());
-    buf
+
+    let crc = crc32(&buf[start + 4..]);
+    buf[start..start + 4].copy_from_slice(&crc.to_le_bytes());
 }
 
 /// Read a record at `offset` using `pread` (1 syscall instead of seek+read = 2).
