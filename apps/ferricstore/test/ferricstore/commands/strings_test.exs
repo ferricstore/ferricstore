@@ -3,6 +3,7 @@ defmodule Ferricstore.Commands.StringsTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.{Stream, Strings}
+  alias Ferricstore.Commands.Hash
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
@@ -104,6 +105,40 @@ defmodule Ferricstore.Commands.StringsTest do
       store = MockStore.make(%{"key" => {"old", 0}})
       assert :ok = Strings.handle("SET", ["key", "new"], store)
       assert "new" == store.get.("key")
+    end
+
+    test "SET returns compound cleanup errors before overwriting hash" do
+      base = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["key", "field", "value"], base)
+
+      store =
+        base
+        |> Map.put(:compound_delete_prefix, fn "key", _prefix -> {:error, :disk_full} end)
+        |> Map.put(:put, fn "key", _value, _expire_at_ms ->
+          flunk("SET should not write string when compound cleanup fails")
+        end)
+
+      assert {:error, :disk_full} = Strings.handle("SET", ["key", "string"], store)
+      assert "value" == Hash.handle("HGET", ["key", "field"], base)
+    end
+
+    test "SET returns type marker cleanup errors before overwriting compound key" do
+      base = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["key", "field", "value"], base)
+      type_key = CompoundKey.type_key("key")
+
+      store =
+        base
+        |> Map.put(:compound_delete, fn
+          "key", ^type_key -> {:error, :disk_full}
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+        |> Map.put(:put, fn "key", _value, _expire_at_ms ->
+          flunk("SET should not write string when type cleanup fails")
+        end)
+
+      assert {:error, :disk_full} = Strings.handle("SET", ["key", "string"], store)
+      assert "hash" == base.compound_get.("key", type_key)
     end
 
     test "SET with EX and NX combined works when key absent" do

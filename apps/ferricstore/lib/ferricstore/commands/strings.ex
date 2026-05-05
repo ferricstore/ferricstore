@@ -1026,8 +1026,9 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   defp replace_string_key(key, value, expire_at_ms, store) do
-    clear_compound_data_structure(key, store)
-    Ops.put(store, key, value, expire_at_ms)
+    with :ok <- clear_compound_data_structure(key, store) do
+      Ops.put(store, key, value, expire_at_ms)
+    end
   end
 
   defp compound_data_structure_key?(key, store) do
@@ -1051,20 +1052,24 @@ defmodule Ferricstore.Commands.Strings do
           :ok
 
         type ->
-          clear_compound_prefix(key, type, store)
-          Ops.compound_delete(store, key, type_key)
+          with :ok <- clear_compound_prefix(key, type, store),
+               :ok <- Ops.compound_delete(store, key, type_key) do
+            :ok
+          end
       end
+    else
+      :ok
     end
-
-    :ok
   end
 
   defp clear_compound_prefix(key, "hash", store),
     do: Ops.compound_delete_prefix(store, key, CompoundKey.hash_prefix(key))
 
   defp clear_compound_prefix(key, "list", store) do
-    Ops.compound_delete_prefix(store, key, CompoundKey.list_prefix(key))
-    Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))
+    with :ok <- Ops.compound_delete_prefix(store, key, CompoundKey.list_prefix(key)),
+         :ok <- Ops.compound_delete(store, key, CompoundKey.list_meta_key(key)) do
+      :ok
+    end
   end
 
   defp clear_compound_prefix(key, "set", store),
