@@ -21,20 +21,19 @@ defmodule Ferricstore.Store.RmwCommandsTest do
     - ZINCRBY (sorted-set score delta)
     - GEOADD (geo index)
 
-  Each command is tested in BOTH quorum and async namespaces — the state
-  machine is the serialization point for both; the async path just uses
-  the forced-quorum Batcher route (write_async_quorum) because RMW
-  commands return computed values the caller needs.
+  Some tests use a distinct key prefix to prove the same serialized quorum
+  path works for prefixed keys. The removed namespace async durability mode is
+  not part of this coverage.
   """
   use ExUnit.Case, async: false
 
   alias Ferricstore.Test.ShardHelpers
 
-  @async_ns "rmw_async"
+  @prefixed_ns "rmw_prefixed"
 
   setup do
     ShardHelpers.flush_all_keys()
-    Ferricstore.NamespaceConfig.reset(@async_ns)
+    Ferricstore.NamespaceConfig.reset(@prefixed_ns)
 
     on_exit(fn ->
       ShardHelpers.flush_all_keys()
@@ -44,7 +43,7 @@ defmodule Ferricstore.Store.RmwCommandsTest do
   end
 
   defp ukey(base), do: "#{base}_#{:erlang.unique_integer([:positive])}"
-  defp akey(base), do: "#{@async_ns}:#{base}_#{:erlang.unique_integer([:positive])}"
+  defp pkey(base), do: "#{@prefixed_ns}:#{base}_#{:erlang.unique_integer([:positive])}"
 
   defp popcount(bin) when is_binary(bin) do
     for <<b::1 <- bin>>, b == 1, reduce: 0 do
@@ -101,8 +100,8 @@ defmodule Ferricstore.Store.RmwCommandsTest do
              "expected 50 bits set, got #{popcount(val)}"
     end
 
-    test "50 distinct offsets all land (async namespace)" do
-      key = akey("setbit_a")
+    test "50 distinct offsets all land (prefixed key)" do
+      key = pkey("setbit_p")
 
       tasks =
         for i <- 0..49 do
@@ -134,8 +133,8 @@ defmodule Ferricstore.Store.RmwCommandsTest do
       assert {:ok, "50"} = FerricStore.hget(key, "counter")
     end
 
-    test "50 concurrent HINCRBY by 1 on same field sum to 50 (async)" do
-      key = akey("hincrby_a")
+    test "50 concurrent HINCRBY by 1 on same field sum to 50 (prefixed key)" do
+      key = pkey("hincrby_p")
 
       tasks =
         for _ <- 1..50 do
@@ -201,8 +200,8 @@ defmodule Ferricstore.Store.RmwCommandsTest do
              "expected cardinality ~100, got #{card}"
     end
 
-    test "100 concurrent PFADDs (async) yield cardinality ~100" do
-      key = akey("pfadd_a")
+    test "100 concurrent PFADDs (prefixed key) yield cardinality ~100" do
+      key = pkey("pfadd_p")
 
       tasks =
         for i <- 1..100 do

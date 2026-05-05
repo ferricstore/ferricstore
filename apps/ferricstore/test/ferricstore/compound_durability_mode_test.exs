@@ -1,9 +1,10 @@
 defmodule Ferricstore.CompoundDurabilityModeTest do
   @moduledoc """
-  Tests that compound operations (list, hash, set, sorted set) respect
-  the namespace durability mode — both quorum and async paths should work.
+  Tests that compound operations (list, hash, set, sorted set) work through
+  the quorum write path.
 
-  Verifies that data written through each mode is readable after write.
+  Verifies that data written through each command family is readable after
+  write.
   """
 
   use ExUnit.Case, async: false
