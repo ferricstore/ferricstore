@@ -5,6 +5,7 @@ defmodule Ferricstore.Commands.ProbType do
   alias Ferricstore.Store.TypeRegistry
 
   @wrongtype "WRONGTYPE Operation against a key holding the wrong kind of value"
+  @max_prob_meta_value_size 8_192
 
   @spec check_expected(binary(), atom(), map()) :: :ok | {:error, binary()}
   def check_expected(key, expected, store) do
@@ -47,6 +48,9 @@ defmodule Ferricstore.Commands.ProbType do
 
   defp raw_value_type(key, store) do
     cond do
+      large_metadata_value?(key, store) ->
+        :other
+
       has_get?(store) ->
         store
         |> Ops.get(key)
@@ -58,6 +62,25 @@ defmodule Ferricstore.Commands.ProbType do
   rescue
     _ -> nil
   end
+
+  defp large_metadata_value?(key, store) do
+    case metadata_value_size(store, key) do
+      size when is_integer(size) and size > @max_prob_meta_value_size -> true
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp metadata_value_size(%FerricStore.Instance{} = store, key), do: Ops.value_size(store, key)
+
+  defp metadata_value_size(%Ferricstore.Store.LocalTxStore{} = store, key),
+    do: Ops.value_size(store, key)
+
+  defp metadata_value_size(%{value_size: value_size}, key) when is_function(value_size, 1),
+    do: value_size.(key)
+
+  defp metadata_value_size(_store, _key), do: :unknown
 
   defp decode_raw_type(nil), do: nil
 
