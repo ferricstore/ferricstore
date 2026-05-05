@@ -72,7 +72,6 @@ defmodule Ferricstore.Commands.TDigest do
     with {:ok, digest} <- get_digest(store, key) do
       updated = Core.add_many(digest, floats)
       persist!(key, updated, store)
-      :ok
     end
   end
 
@@ -177,7 +176,6 @@ defmodule Ferricstore.Commands.TDigest do
          {:ok, floats} <- parse_float_list(values) do
       updated = Core.add_many(digest, floats)
       persist!(key, updated, store)
-      :ok
     end
   end
 
@@ -364,7 +362,6 @@ defmodule Ferricstore.Commands.TDigest do
     with {:ok, digest} <- get_digest(store, key) do
       updated = Core.reset(digest)
       persist!(key, updated, store)
-      :ok
     end
   end
 
@@ -461,7 +458,6 @@ defmodule Ferricstore.Commands.TDigest do
   defp create_digest(key, compression, store) do
     digest = Core.new(compression)
     persist!(key, digest, store)
-    :ok
   end
 
   defp key_held_by_other_registry?(key, store) do
@@ -565,7 +561,6 @@ defmodule Ferricstore.Commands.TDigest do
 
     merged = Core.merge_many(all_digests, final_compression)
     persist!(dest, merged, store)
-    :ok
   end
 
   defp parse_merge_args(args, numkeys) when length(args) < numkeys do

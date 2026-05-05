@@ -72,19 +72,28 @@ defmodule Ferricstore.Commands.TDigestTest do
 
     test "returns error with zero compression" do
       store = MockStore.make()
-      assert {:error, msg} = TDigestCmd.handle("TDIGEST.CREATE", ["key", "COMPRESSION", "0"], store)
+
+      assert {:error, msg} =
+               TDigestCmd.handle("TDIGEST.CREATE", ["key", "COMPRESSION", "0"], store)
+
       assert msg =~ "positive integer"
     end
 
     test "returns error with negative compression" do
       store = MockStore.make()
-      assert {:error, msg} = TDigestCmd.handle("TDIGEST.CREATE", ["key", "COMPRESSION", "-10"], store)
+
+      assert {:error, msg} =
+               TDigestCmd.handle("TDIGEST.CREATE", ["key", "COMPRESSION", "-10"], store)
+
       assert msg =~ "positive integer"
     end
 
     test "returns error with non-integer compression" do
       store = MockStore.make()
-      assert {:error, msg} = TDigestCmd.handle("TDIGEST.CREATE", ["key", "COMPRESSION", "abc"], store)
+
+      assert {:error, msg} =
+               TDigestCmd.handle("TDIGEST.CREATE", ["key", "COMPRESSION", "abc"], store)
+
       assert msg =~ "not an integer"
     end
 
@@ -98,6 +107,15 @@ defmodule Ferricstore.Commands.TDigestTest do
       store = MockStore.make()
       assert {:error, msg} = TDigestCmd.handle("TDIGEST.CREATE", ["key", "COMPRESSION"], store)
       assert msg =~ "wrong number of arguments"
+    end
+
+    test "returns write error when digest creation fails" do
+      store =
+        MockStore.make()
+        |> Map.put(:put, fn "mydigest", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
+      refute store.exists?.("mydigest")
     end
   end
 
@@ -115,7 +133,13 @@ defmodule Ferricstore.Commands.TDigestTest do
     test "adds multiple values in one call" do
       store = MockStore.make()
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
-      assert :ok = TDigestCmd.handle("TDIGEST.ADD", ["mydigest", "3.2", "7.8", "15.1", "200.3"], store)
+
+      assert :ok =
+               TDigestCmd.handle(
+                 "TDIGEST.ADD",
+                 ["mydigest", "3.2", "7.8", "15.1", "200.3"],
+                 store
+               )
     end
 
     test "returns error for non-existent key" do
@@ -195,8 +219,20 @@ defmodule Ferricstore.Commands.TDigestTest do
 
       info = TDigestCmd.handle("TDIGEST.INFO", ["mydigest"], store)
       # Total count should be 5 (merged_weight + unmerged_weight)
-      ["Compression", _, "Capacity", _, "Merged nodes", _mn, "Unmerged nodes", _un,
-       "Merged weight", mw, "Unmerged weight", uw | _] = info
+      [
+        "Compression",
+        _,
+        "Capacity",
+        _,
+        "Merged nodes",
+        _mn,
+        "Unmerged nodes",
+        _un,
+        "Merged weight",
+        mw,
+        "Unmerged weight",
+        uw | _
+      ] = info
 
       total = parse_float_str(mw) + parse_float_str(uw)
       assert_in_delta total, 5.0, 0.01
@@ -205,7 +241,22 @@ defmodule Ferricstore.Commands.TDigestTest do
     test "mixed valid and invalid values returns error and does not persist partial" do
       store = MockStore.make()
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
-      assert {:error, _} = TDigestCmd.handle("TDIGEST.ADD", ["mydigest", "1.0", "abc", "3.0"], store)
+
+      assert {:error, _} =
+               TDigestCmd.handle("TDIGEST.ADD", ["mydigest", "1.0", "abc", "3.0"], store)
+    end
+
+    test "returns write error when add persistence fails" do
+      store =
+        MockStore.make()
+        |> tap(fn store -> :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store) end)
+        |> Map.put(:put, fn "mydigest", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = TDigestCmd.handle("TDIGEST.ADD", ["mydigest", "12.5"], store)
+
+      info = TDigestCmd.handle("TDIGEST.INFO", ["mydigest"], store)
+      assert "0.0" == find_info_field(info, "Merged weight")
+      assert "0.0" == find_info_field(info, "Unmerged weight")
     end
   end
 
@@ -270,6 +321,20 @@ defmodule Ferricstore.Commands.TDigestTest do
       store = MockStore.make()
       assert {:error, _} = TDigestCmd.handle("TDIGEST.RESET", [], store)
     end
+
+    test "returns write error when reset persistence fails" do
+      store = MockStore.make()
+      :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
+      :ok = TDigestCmd.handle("TDIGEST.ADD", ["mydigest", "12.5"], store)
+
+      failing_store =
+        Map.put(store, :put, fn "mydigest", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} =
+               TDigestCmd.handle("TDIGEST.RESET", ["mydigest"], failing_store)
+
+      assert "12.5" == TDigestCmd.handle("TDIGEST.MIN", ["mydigest"], failing_store)
+    end
   end
 
   # ===========================================================================
@@ -282,9 +347,25 @@ defmodule Ferricstore.Commands.TDigestTest do
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
 
       info = TDigestCmd.handle("TDIGEST.INFO", ["mydigest"], store)
-      assert ["Compression", _, "Capacity", _, "Merged nodes", _,
-              "Unmerged nodes", _, "Merged weight", _, "Unmerged weight", _,
-              "Total compressions", _, "Memory usage", _] = info
+
+      assert [
+               "Compression",
+               _,
+               "Capacity",
+               _,
+               "Merged nodes",
+               _,
+               "Unmerged nodes",
+               _,
+               "Merged weight",
+               _,
+               "Unmerged weight",
+               _,
+               "Total compressions",
+               _,
+               "Memory usage",
+               _
+             ] = info
     end
 
     test "compression matches creation parameter" do
@@ -301,8 +382,21 @@ defmodule Ferricstore.Commands.TDigestTest do
       :ok = TDigestCmd.handle("TDIGEST.ADD", ["mydigest", "1.0", "2.0", "3.0"], store)
 
       info = TDigestCmd.handle("TDIGEST.INFO", ["mydigest"], store)
-      ["Compression", _, "Capacity", _, "Merged nodes", _mn, "Unmerged nodes", _un,
-       "Merged weight", mw, "Unmerged weight", uw | _] = info
+
+      [
+        "Compression",
+        _,
+        "Capacity",
+        _,
+        "Merged nodes",
+        _mn,
+        "Unmerged nodes",
+        _un,
+        "Merged weight",
+        mw,
+        "Unmerged weight",
+        uw | _
+      ] = info
 
       total = parse_float_str(mw) + parse_float_str(uw)
       assert_in_delta total, 3.0, 0.01
@@ -384,7 +478,9 @@ defmodule Ferricstore.Commands.TDigestTest do
     test "correct with negative values" do
       store = MockStore.make()
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
-      :ok = TDigestCmd.handle("TDIGEST.ADD", ["mydigest", "-5.0", "10.0", "-100.0", "50.0"], store)
+
+      :ok =
+        TDigestCmd.handle("TDIGEST.ADD", ["mydigest", "-5.0", "10.0", "-100.0", "50.0"], store)
 
       min_val = parse_float_str(TDigestCmd.handle("TDIGEST.MIN", ["mydigest"], store))
       max_val = parse_float_str(TDigestCmd.handle("TDIGEST.MAX", ["mydigest"], store))
@@ -457,8 +553,10 @@ defmodule Ferricstore.Commands.TDigestTest do
       [result] = TDigestCmd.handle("TDIGEST.QUANTILE", ["mydigest", "0.5"], store)
       p50 = parse_float_str(result)
 
-      assert_in_delta p50, 500.0, 500.0 * 0.05,
-        "p50 of uniform [1..1000] expected ~500, got #{p50}"
+      assert_in_delta p50,
+                      500.0,
+                      500.0 * 0.05,
+                      "p50 of uniform [1..1000] expected ~500, got #{p50}"
     end
 
     test "p95 of uniform 1..1000 within 2% of 950" do
@@ -471,8 +569,10 @@ defmodule Ferricstore.Commands.TDigestTest do
       [result] = TDigestCmd.handle("TDIGEST.QUANTILE", ["mydigest", "0.95"], store)
       p95 = parse_float_str(result)
 
-      assert_in_delta p95, 950.0, 950.0 * 0.02,
-        "p95 of uniform [1..1000] expected ~950, got #{p95}"
+      assert_in_delta p95,
+                      950.0,
+                      950.0 * 0.02,
+                      "p95 of uniform [1..1000] expected ~950, got #{p95}"
     end
 
     test "p99 of uniform 1..1000 within 2% of 990" do
@@ -485,8 +585,10 @@ defmodule Ferricstore.Commands.TDigestTest do
       [result] = TDigestCmd.handle("TDIGEST.QUANTILE", ["mydigest", "0.99"], store)
       p99 = parse_float_str(result)
 
-      assert_in_delta p99, 990.0, 990.0 * 0.02,
-        "p99 of uniform [1..1000] expected ~990, got #{p99}"
+      assert_in_delta p99,
+                      990.0,
+                      990.0 * 0.02,
+                      "p99 of uniform [1..1000] expected ~990, got #{p99}"
     end
 
     test "p50 of normal distribution within 5%" do
@@ -495,21 +597,22 @@ defmodule Ferricstore.Commands.TDigestTest do
 
       # Generate normal-like distribution via Box-Muller (using deterministic seed)
       :rand.seed(:exsss, {42, 42, 42})
-      values = for _ <- 1..5000 do
-        # Box-Muller transform: mean=100, stddev=10
-        u1 = :rand.uniform()
-        u2 = :rand.uniform()
-        z = :math.sqrt(-2.0 * :math.log(u1)) * :math.cos(2.0 * :math.pi() * u2)
-        Float.to_string(100.0 + 10.0 * z)
-      end
+
+      values =
+        for _ <- 1..5000 do
+          # Box-Muller transform: mean=100, stddev=10
+          u1 = :rand.uniform()
+          u2 = :rand.uniform()
+          z = :math.sqrt(-2.0 * :math.log(u1)) * :math.cos(2.0 * :math.pi() * u2)
+          Float.to_string(100.0 + 10.0 * z)
+        end
 
       :ok = TDigestCmd.handle("TDIGEST.ADD", ["mydigest" | values], store)
 
       [result] = TDigestCmd.handle("TDIGEST.QUANTILE", ["mydigest", "0.5"], store)
       p50 = parse_float_str(result)
 
-      assert_in_delta p50, 100.0, 5.0,
-        "p50 of Normal(100,10) expected ~100, got #{p50}"
+      assert_in_delta p50, 100.0, 5.0, "p50 of Normal(100,10) expected ~100, got #{p50}"
     end
 
     test "handles multiple quantiles in one call" do
@@ -519,7 +622,9 @@ defmodule Ferricstore.Commands.TDigestTest do
       values = Enum.map(1..1000, &Integer.to_string/1)
       :ok = TDigestCmd.handle("TDIGEST.ADD", ["mydigest" | values], store)
 
-      results = TDigestCmd.handle("TDIGEST.QUANTILE", ["mydigest", "0.25", "0.5", "0.75", "0.99"], store)
+      results =
+        TDigestCmd.handle("TDIGEST.QUANTILE", ["mydigest", "0.25", "0.5", "0.75", "0.99"], store)
+
       assert length(results) == 4
 
       [q25, q50, q75, q99] = Enum.map(results, &parse_float_str/1)
@@ -621,8 +726,11 @@ defmodule Ferricstore.Commands.TDigestTest do
 
       for q <- ["0.0", "0.25", "0.5", "0.75", "1.0"] do
         [result] = TDigestCmd.handle("TDIGEST.QUANTILE", ["mydigest", q], store)
-        assert_in_delta parse_float_str(result), 42.0, 0.1,
-          "quantile #{q} of all-42 should be 42, got #{result}"
+
+        assert_in_delta parse_float_str(result),
+                        42.0,
+                        0.1,
+                        "quantile #{q} of all-42 should be 42, got #{result}"
       end
     end
 
@@ -676,6 +784,7 @@ defmodule Ferricstore.Commands.TDigestTest do
 
       # Each quantile value should be >= the previous
       pairs = Enum.zip(floats, tl(floats))
+
       Enum.each(pairs, fn {a, b} ->
         assert a <= b, "quantile values should be monotonically increasing: #{a} > #{b}"
       end)
@@ -729,8 +838,11 @@ defmodule Ferricstore.Commands.TDigestTest do
 
       [result] = TDigestCmd.handle("TDIGEST.CDF", ["mydigest", "500.0"], store)
       cdf_med = parse_float_str(result)
-      assert_in_delta cdf_med, 0.5, 0.05,
-        "CDF(500) of uniform [1..1000] should be ~0.5, got #{cdf_med}"
+
+      assert_in_delta cdf_med,
+                      0.5,
+                      0.05,
+                      "CDF(500) of uniform [1..1000] should be ~0.5, got #{cdf_med}"
     end
 
     test "CDF of value below min is 0" do
@@ -776,6 +888,7 @@ defmodule Ferricstore.Commands.TDigestTest do
       floats = Enum.map(results, &parse_float_str/1)
 
       pairs = Enum.zip(floats, tl(floats))
+
       Enum.each(pairs, fn {a, b} ->
         assert a <= b, "CDF should be monotonically increasing: #{a} > #{b}"
       end)
@@ -834,13 +947,23 @@ defmodule Ferricstore.Commands.TDigestTest do
 
     test "merges three digests" do
       store = MockStore.make()
+
       for k <- ["s1", "s2", "s3"] do
         :ok = TDigestCmd.handle("TDIGEST.CREATE", [k], store)
       end
 
-      :ok = TDigestCmd.handle("TDIGEST.ADD", ["s1" | Enum.map(1..333, &Integer.to_string/1)], store)
-      :ok = TDigestCmd.handle("TDIGEST.ADD", ["s2" | Enum.map(334..666, &Integer.to_string/1)], store)
-      :ok = TDigestCmd.handle("TDIGEST.ADD", ["s3" | Enum.map(667..1000, &Integer.to_string/1)], store)
+      :ok =
+        TDigestCmd.handle("TDIGEST.ADD", ["s1" | Enum.map(1..333, &Integer.to_string/1)], store)
+
+      :ok =
+        TDigestCmd.handle("TDIGEST.ADD", ["s2" | Enum.map(334..666, &Integer.to_string/1)], store)
+
+      :ok =
+        TDigestCmd.handle(
+          "TDIGEST.ADD",
+          ["s3" | Enum.map(667..1000, &Integer.to_string/1)],
+          store
+        )
 
       assert :ok = TDigestCmd.handle("TDIGEST.MERGE", ["dst", "3", "s1", "s2", "s3"], store)
 
@@ -854,8 +977,15 @@ defmodule Ferricstore.Commands.TDigestTest do
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["src1", "COMPRESSION", "50"], store)
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["src2", "COMPRESSION", "200"], store)
 
-      :ok = TDigestCmd.handle("TDIGEST.ADD", ["src1" | Enum.map(1..100, &Integer.to_string/1)], store)
-      :ok = TDigestCmd.handle("TDIGEST.ADD", ["src2" | Enum.map(101..200, &Integer.to_string/1)], store)
+      :ok =
+        TDigestCmd.handle("TDIGEST.ADD", ["src1" | Enum.map(1..100, &Integer.to_string/1)], store)
+
+      :ok =
+        TDigestCmd.handle(
+          "TDIGEST.ADD",
+          ["src2" | Enum.map(101..200, &Integer.to_string/1)],
+          store
+        )
 
       # Should use max compression (200) when COMPRESSION not specified
       assert :ok = TDigestCmd.handle("TDIGEST.MERGE", ["dst", "2", "src1", "src2"], store)
@@ -869,7 +999,12 @@ defmodule Ferricstore.Commands.TDigestTest do
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["src1", "COMPRESSION", "100"], store)
       :ok = TDigestCmd.handle("TDIGEST.ADD", ["src1", "1.0", "2.0", "3.0"], store)
 
-      assert :ok = TDigestCmd.handle("TDIGEST.MERGE", ["dst", "1", "src1", "COMPRESSION", "300"], store)
+      assert :ok =
+               TDigestCmd.handle(
+                 "TDIGEST.MERGE",
+                 ["dst", "1", "src1", "COMPRESSION", "300"],
+                 store
+               )
 
       info = TDigestCmd.handle("TDIGEST.INFO", ["dst"], store)
       assert find_info_field(info, "Compression") == 300
@@ -887,7 +1022,8 @@ defmodule Ferricstore.Commands.TDigestTest do
 
       # After OVERRIDE, dst should only contain src1's data (not the old 1000.0)
       max_val = parse_float_str(TDigestCmd.handle("TDIGEST.MAX", ["dst"], store))
-      assert max_val <= 3.1  # Should not contain 1000.0
+      # Should not contain 1000.0
+      assert max_val <= 3.1
     end
 
     test "merged quantiles close to combined reference" do
@@ -914,8 +1050,10 @@ defmodule Ferricstore.Commands.TDigestTest do
         ref_val = parse_float_str(ref_result)
 
         # Merged result should be within 10% of the reference
-        assert_in_delta merged_val, ref_val, ref_val * 0.10,
-          "q=#{q_str}: merged=#{merged_val} vs ref=#{ref_val}"
+        assert_in_delta merged_val,
+                        ref_val,
+                        ref_val * 0.10,
+                        "q=#{q_str}: merged=#{merged_val} vs ref=#{ref_val}"
       end
     end
 
@@ -948,8 +1086,12 @@ defmodule Ferricstore.Commands.TDigestTest do
       store = MockStore.make()
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["src1"], store)
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["src2"], store)
-      :ok = TDigestCmd.handle("TDIGEST.ADD", ["src1" | Enum.map(1..30, &Integer.to_string/1)], store)
-      :ok = TDigestCmd.handle("TDIGEST.ADD", ["src2" | Enum.map(1..70, &Integer.to_string/1)], store)
+
+      :ok =
+        TDigestCmd.handle("TDIGEST.ADD", ["src1" | Enum.map(1..30, &Integer.to_string/1)], store)
+
+      :ok =
+        TDigestCmd.handle("TDIGEST.ADD", ["src2" | Enum.map(1..70, &Integer.to_string/1)], store)
 
       :ok = TDigestCmd.handle("TDIGEST.MERGE", ["dst", "2", "src1", "src2"], store)
 
@@ -977,6 +1119,20 @@ defmodule Ferricstore.Commands.TDigestTest do
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["src1"], store)
       assert {:error, _} = TDigestCmd.handle("TDIGEST.MERGE", ["dst", "3", "src1"], store)
     end
+
+    test "returns write error when merge persistence fails" do
+      store = MockStore.make()
+      :ok = TDigestCmd.handle("TDIGEST.CREATE", ["src1"], store)
+      :ok = TDigestCmd.handle("TDIGEST.ADD", ["src1", "1.0"], store)
+
+      failing_store =
+        Map.put(store, :put, fn "dst", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} =
+               TDigestCmd.handle("TDIGEST.MERGE", ["dst", "1", "src1"], failing_store)
+
+      refute store.exists?.("dst")
+    end
   end
 
   # ===========================================================================
@@ -994,8 +1150,7 @@ defmodule Ferricstore.Commands.TDigestTest do
       tm = parse_float_str(result)
 
       # True mean of 1..100 = 50.5
-      assert_in_delta tm, 50.5, 50.5 * 0.05,
-        "trimmed mean 0-1 should be ~50.5, got #{tm}"
+      assert_in_delta tm, 50.5, 50.5 * 0.05, "trimmed mean 0-1 should be ~50.5, got #{tm}"
     end
 
     test "trimmed mean 0.25 0.75 is the IQR mean" do
@@ -1036,13 +1191,18 @@ defmodule Ferricstore.Commands.TDigestTest do
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
       :ok = TDigestCmd.handle("TDIGEST.ADD", ["mydigest", "1.0"], store)
 
-      assert {:error, msg} = TDigestCmd.handle("TDIGEST.TRIMMED_MEAN", ["mydigest", "0.5", "0.5"], store)
+      assert {:error, msg} =
+               TDigestCmd.handle("TDIGEST.TRIMMED_MEAN", ["mydigest", "0.5", "0.5"], store)
+
       assert msg =~ "less than"
     end
 
     test "returns error for non-existent key" do
       store = MockStore.make()
-      assert {:error, msg} = TDigestCmd.handle("TDIGEST.TRIMMED_MEAN", ["missing", "0.0", "1.0"], store)
+
+      assert {:error, msg} =
+               TDigestCmd.handle("TDIGEST.TRIMMED_MEAN", ["missing", "0.0", "1.0"], store)
+
       assert msg =~ "does not exist"
     end
 
@@ -1134,7 +1294,8 @@ defmodule Ferricstore.Commands.TDigestTest do
       :ok = TDigestCmd.handle("TDIGEST.ADD", ["mydigest", "10.0", "20.0", "30.0"], store)
 
       [rr] = TDigestCmd.handle("TDIGEST.REVRANK", ["mydigest", "5.0"], store)
-      assert rr == 3  # count
+      # count
+      assert rr == 3
     end
 
     test "returns error for non-existent key" do
@@ -1265,7 +1426,13 @@ defmodule Ferricstore.Commands.TDigestTest do
     test "mix of positive and negative" do
       store = MockStore.make()
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
-      :ok = TDigestCmd.handle("TDIGEST.ADD", ["mydigest", "-100.0", "-50.0", "0.0", "50.0", "100.0"], store)
+
+      :ok =
+        TDigestCmd.handle(
+          "TDIGEST.ADD",
+          ["mydigest", "-100.0", "-50.0", "0.0", "50.0", "100.0"],
+          store
+        )
 
       min_val = parse_float_str(TDigestCmd.handle("TDIGEST.MIN", ["mydigest"], store))
       max_val = parse_float_str(TDigestCmd.handle("TDIGEST.MAX", ["mydigest"], store))
@@ -1365,8 +1532,10 @@ defmodule Ferricstore.Commands.TDigestTest do
         random_val = parse_float_str(random_result)
 
         # Both should be within 10% of the true value
-        assert_in_delta sorted_val, random_val, 500.0 * 0.15,
-          "q=#{q_str}: sorted=#{sorted_val} vs random=#{random_val}"
+        assert_in_delta sorted_val,
+                        random_val,
+                        500.0 * 0.15,
+                        "q=#{q_str}: sorted=#{sorted_val} vs random=#{random_val}"
       end
     end
 
@@ -1451,8 +1620,9 @@ defmodule Ferricstore.Commands.TDigestTest do
         end)
 
       info = Core.info(digest)
+
       assert info.memory_usage < 100_000,
-        "memory usage #{info.memory_usage} bytes, expected < 100KB"
+             "memory usage #{info.memory_usage} bytes, expected < 100KB"
     end
 
     test "sequential adds from 10 batches" do
@@ -1559,7 +1729,11 @@ defmodule Ferricstore.Commands.TDigestTest do
       assert is_list(Dispatcher.dispatch("TDIGEST.REVRANK", ["mydigest", "2.0"], store))
       assert is_list(Dispatcher.dispatch("TDIGEST.BYRANK", ["mydigest", "0"], store))
       assert is_list(Dispatcher.dispatch("TDIGEST.BYREVRANK", ["mydigest", "0"], store))
-      assert is_binary(Dispatcher.dispatch("TDIGEST.TRIMMED_MEAN", ["mydigest", "0.0", "1.0"], store))
+
+      assert is_binary(
+               Dispatcher.dispatch("TDIGEST.TRIMMED_MEAN", ["mydigest", "0.0", "1.0"], store)
+             )
+
       assert is_binary(Dispatcher.dispatch("TDIGEST.MIN", ["mydigest"], store))
       assert is_binary(Dispatcher.dispatch("TDIGEST.MAX", ["mydigest"], store))
       assert is_list(Dispatcher.dispatch("TDIGEST.INFO", ["mydigest"], store))
@@ -1582,7 +1756,8 @@ defmodule Ferricstore.Commands.TDigestTest do
 
       for cmd <- tdigest_cmds do
         assert {:ok, entry} = Catalog.lookup(cmd),
-          "catalog should have entry for #{cmd}"
+               "catalog should have entry for #{cmd}"
+
         assert entry.name == cmd
       end
     end
@@ -1644,7 +1819,13 @@ defmodule Ferricstore.Commands.TDigestTest do
       store = MockStore.make()
 
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
-      :ok = TDigestCmd.handle("TDIGEST.ADD", ["mydigest" | Enum.map(1..1000, &Integer.to_string/1)], store)
+
+      :ok =
+        TDigestCmd.handle(
+          "TDIGEST.ADD",
+          ["mydigest" | Enum.map(1..1000, &Integer.to_string/1)],
+          store
+        )
 
       # Query before simulated reload
       [before] = TDigestCmd.handle("TDIGEST.QUANTILE", ["mydigest", "0.5"], store)
@@ -1754,10 +1935,11 @@ defmodule Ferricstore.Commands.TDigestTest do
     end
 
     test "merge_many combines multiple digests" do
-      digests = for i <- 0..4 do
-        values = Enum.map((i * 20 + 1)..((i + 1) * 20), &(&1 / 1))
-        Core.new() |> Core.add_many(values)
-      end
+      digests =
+        for i <- 0..4 do
+          values = Enum.map((i * 20 + 1)..((i + 1) * 20), &(&1 / 1))
+          Core.new() |> Core.add_many(values)
+        end
 
       merged = Core.merge_many(digests, 100)
       assert merged.count == 100
@@ -1834,8 +2016,9 @@ defmodule Ferricstore.Commands.TDigestTest do
       for q <- [0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99] do
         estimated = Core.quantile(digest, q)
         error = abs(estimated - q)
+
         assert error < 0.02,
-          "q=#{q}: estimated=#{estimated}, error=#{error}, expected < 0.02"
+               "q=#{q}: estimated=#{estimated}, error=#{error}, expected < 0.02"
       end
     end
 
@@ -1849,8 +2032,9 @@ defmodule Ferricstore.Commands.TDigestTest do
       for q <- [0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99] do
         estimated = Core.quantile(digest, q)
         error = abs(estimated - q)
+
         assert error < 0.01,
-          "q=#{q}: estimated=#{estimated}, error=#{error}, expected < 0.01"
+               "q=#{q}: estimated=#{estimated}, error=#{error}, expected < 0.01"
       end
     end
 
@@ -1864,9 +2048,12 @@ defmodule Ferricstore.Commands.TDigestTest do
 
       # 10 digests of 10K each
       chunks = Enum.chunk_every(all_values, 10_000)
-      digests = Enum.map(chunks, fn chunk ->
-        Core.new(100) |> Core.add_many(chunk)
-      end)
+
+      digests =
+        Enum.map(chunks, fn chunk ->
+          Core.new(100) |> Core.add_many(chunk)
+        end)
+
       merged = Core.merge_many(digests, 100)
 
       for q <- [0.5, 0.95, 0.99] do
@@ -1875,7 +2062,7 @@ defmodule Ferricstore.Commands.TDigestTest do
         diff = abs(single_val - merged_val)
 
         assert diff < 0.02,
-          "q=#{q}: single=#{single_val}, merged=#{merged_val}, diff=#{diff}"
+               "q=#{q}: single=#{single_val}, merged=#{merged_val}, diff=#{diff}"
       end
     end
   end
@@ -1890,7 +2077,9 @@ defmodule Ferricstore.Commands.TDigestTest do
 
   defp parse_float_str(str) when is_binary(str) do
     case Float.parse(str) do
-      {f, _} -> f
+      {f, _} ->
+        f
+
       :error ->
         case Integer.parse(str) do
           {i, _} -> i / 1
