@@ -41,7 +41,31 @@ defmodule FerricstoreServer.KeyspaceNotificationsTest do
     test "returns true with A flag for any event" do
       assert KeyspaceNotifications.should_notify?("set", "KA")
       assert KeyspaceNotifications.should_notify?("del", "KA")
+      assert KeyspaceNotifications.should_notify?("hset", "KA")
+      assert KeyspaceNotifications.should_notify?("lpush", "KA")
+      assert KeyspaceNotifications.should_notify?("sadd", "KA")
+      assert KeyspaceNotifications.should_notify?("zadd", "KA")
       assert KeyspaceNotifications.should_notify?("expired", "EA")
+    end
+
+    test "returns true for full string command family with $ flag" do
+      for event <- ~w(set setrange incrby decrby incrbyfloat getdel mset) do
+        assert KeyspaceNotifications.should_notify?(event, "K$")
+      end
+    end
+
+    test "returns true for collection event category flags" do
+      assert KeyspaceNotifications.should_notify?("hset", "Kh")
+      assert KeyspaceNotifications.should_notify?("lpush", "Kl")
+      assert KeyspaceNotifications.should_notify?("sadd", "Ks")
+      assert KeyspaceNotifications.should_notify?("zadd", "Kz")
+    end
+
+    test "collection category flags do not cross-match other types" do
+      refute KeyspaceNotifications.should_notify?("hset", "Kl")
+      refute KeyspaceNotifications.should_notify?("lpush", "Ks")
+      refute KeyspaceNotifications.should_notify?("sadd", "Kz")
+      refute KeyspaceNotifications.should_notify?("zadd", "Kh")
     end
 
     test "returns false for string event with Kg (no $ flag)" do

@@ -15,9 +15,13 @@ defmodule Ferricstore.KeyspaceNotifications do
     * `K` -- enable `__keyspace@0__:<key>` channel
     * `E` -- enable `__keyevent@0__:<event>` channel
     * `g` -- generic commands: DEL, EXPIRE, RENAME, PERSIST, COPY
-    * `$` -- string commands: SET, INCR, APPEND, GETSET
+    * `$` -- string commands: SET, INCR, APPEND, GETSET, SETRANGE
+    * `h` -- hash commands: HSET, HDEL, HINCRBY
+    * `l` -- list commands: LPUSH, LPOP, LREM, LMOVE
+    * `s` -- set commands: SADD, SREM, SPOP, SMOVE
+    * `z` -- sorted set commands: ZADD, ZREM, ZINCRBY, ZPOP*
     * `x` -- expired events
-    * `A` -- alias for all event types (g$x)
+    * `A` -- alias for all event types
 
   At least one of `K` or `E` must be present along with at least one event
   type flag for notifications to fire.
@@ -31,8 +35,50 @@ defmodule Ferricstore.KeyspaceNotifications do
       Ferricstore.Config.set("notify-keyspace-events", "E$")
   """
 
-  @generic_events ~w(del expire rename persist copy)
-  @string_events ~w(set incr append getset mset)
+  @event_flags %{
+    "del" => "g",
+    "expire" => "g",
+    "pexpire" => "g",
+    "expireat" => "g",
+    "pexpireat" => "g",
+    "rename" => "g",
+    "persist" => "g",
+    "copy" => "g",
+    "set" => "$",
+    "mset" => "$",
+    "append" => "$",
+    "getset" => "$",
+    "getdel" => "$",
+    "setrange" => "$",
+    "incr" => "$",
+    "incrby" => "$",
+    "incrbyfloat" => "$",
+    "decr" => "$",
+    "decrby" => "$",
+    "hset" => "h",
+    "hdel" => "h",
+    "hincrby" => "h",
+    "hincrbyfloat" => "h",
+    "lpush" => "l",
+    "rpush" => "l",
+    "lpop" => "l",
+    "rpop" => "l",
+    "lset" => "l",
+    "linsert" => "l",
+    "ltrim" => "l",
+    "lrem" => "l",
+    "lmove" => "l",
+    "sadd" => "s",
+    "srem" => "s",
+    "spop" => "s",
+    "smove" => "s",
+    "zadd" => "z",
+    "zrem" => "z",
+    "zincrby" => "z",
+    "zpopmin" => "z",
+    "zpopmax" => "z",
+    "expired" => "x"
+  }
 
   @doc """
   Fires keyspace and/or keyevent notifications for a key mutation.
@@ -91,8 +137,9 @@ defmodule Ferricstore.KeyspaceNotifications do
 
     has_channel? and
       (String.contains?(flags, "A") or
-         (event in @generic_events and String.contains?(flags, "g")) or
-         (event in @string_events and String.contains?(flags, "$")) or
-         (event == "expired" and String.contains?(flags, "x")))
+         case Map.get(@event_flags, event) do
+           nil -> false
+           flag -> String.contains?(flags, flag)
+         end)
   end
 end
