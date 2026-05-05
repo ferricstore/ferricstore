@@ -35,7 +35,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     value1 = :binary.copy("a", ctx.hot_cache_max_value_size + 256)
     value2 = :binary.copy("b", ctx.hot_cache_max_value_size + 512)
 
-    :ok = Router.batch_async_put(ctx, [{key1, value1}, {key2, value2}])
+    :ok = Router.batch_put(ctx, [{key1, value1}, {key2, value2}])
 
     state = %{
       instance_ctx: ctx,

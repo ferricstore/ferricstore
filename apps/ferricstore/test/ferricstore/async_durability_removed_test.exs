@@ -53,6 +53,29 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     refute function_exported?(FerricStore, :__async_batch_put_result_list__, 2)
   end
 
+  test "active tests do not call removed async batch APIs" do
+    repo_root = Path.expand("../../../..", __DIR__)
+
+    offenders =
+      [
+        Path.join(repo_root, "apps/ferricstore/test/**/*.exs"),
+        Path.join(repo_root, "apps/ferricstore_server/test/**/*.exs")
+      ]
+      |> Enum.flat_map(&Path.wildcard/1)
+      |> Enum.reject(&(&1 == __ENV__.file))
+      |> Enum.flat_map(fn path ->
+        source = File.read!(path)
+
+        for token <- ["batch_async_put", "__async_batch_put_result_list__"],
+            String.contains?(source, token),
+            active_test_file?(source) do
+          {Path.relative_to(path, repo_root), token}
+        end
+      end)
+
+    assert offenders == []
+  end
+
   test "tests no longer keep removed RMW coordinator contract alive" do
     repo_root = Path.expand("../../../..", __DIR__)
 
@@ -180,4 +203,6 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
 
     assert offenders == []
   end
+
+  defp active_test_file?(source), do: not String.contains?(source, "@moduletag skip:")
 end
