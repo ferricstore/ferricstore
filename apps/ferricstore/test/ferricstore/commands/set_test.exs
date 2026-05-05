@@ -752,6 +752,40 @@ defmodule Ferricstore.Commands.SetTest do
       assert 2 == Set.handle("SCARD", ["dst"], store)
     end
 
+    test "SMOVE does not delete source when destination write fails" do
+      parent = self()
+      src_type_key = CompoundKey.type_key("src")
+      dst_type_key = CompoundKey.type_key("dst")
+      src_member_key = CompoundKey.set_member("src", "a")
+      dst_member_key = CompoundKey.set_member("dst", "a")
+
+      store = %{
+        get: fn _key -> nil end,
+        compound_get: fn
+          "src", ^src_type_key -> "set"
+          "dst", ^dst_type_key -> "set"
+          "src", ^src_member_key -> "1"
+          "dst", ^dst_member_key -> nil
+          _redis_key, _compound_key -> nil
+        end,
+        compound_put: fn "dst", ^dst_member_key, "1", 0 ->
+          {:error, :disk_full}
+        end,
+        compound_batch_delete: fn "src", compound_keys ->
+          send(parent, {:source_deleted, compound_keys})
+          :ok
+        end,
+        compound_delete: fn "src", compound_key ->
+          send(parent, {:source_deleted, [compound_key]})
+          :ok
+        end,
+        compound_count: fn "src", _prefix -> 1 end
+      }
+
+      assert {:error, :disk_full} == Set.handle("SMOVE", ["src", "dst", "a"], store)
+      refute_received {:source_deleted, _}
+    end
+
     test "SMOVE with wrong number of arguments returns error" do
       store = MockStore.make()
       assert {:error, _} = Set.handle("SMOVE", ["src", "dst"], store)

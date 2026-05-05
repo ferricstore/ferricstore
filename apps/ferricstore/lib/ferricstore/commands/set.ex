@@ -868,20 +868,55 @@ defmodule Ferricstore.Commands.Set do
          :ok <- TypeRegistry.check_type(destination, :set, store) do
       compound_key = CompoundKey.set_member(source, member)
 
-      if Ops.compound_get(store, source, compound_key) == nil do
-        0
-      else
-        # Remove from source
-        Ops.compound_delete(store, source, compound_key)
-        maybe_cleanup_empty_set(source, 1, store)
+      cond do
+        Ops.compound_get(store, source, compound_key) == nil ->
+          0
 
-        # Add to destination (check_or_set for destination since it may not exist)
-        TypeRegistry.check_or_set(destination, :set, store)
-        dst_key = CompoundKey.set_member(destination, member)
-        Ops.compound_put(store, destination, dst_key, @presence_marker, 0)
-        1
+        source == destination ->
+          1
+
+        true ->
+          dst_key = CompoundKey.set_member(destination, member)
+          destination_had_member? = Ops.compound_get(store, destination, dst_key) != nil
+
+          case maybe_put_smove_destination(destination_had_member?, destination, dst_key, store) do
+            :ok ->
+              case Ops.compound_batch_delete(store, source, [compound_key]) do
+                :ok ->
+                  maybe_cleanup_empty_set(source, 1, store)
+                  1
+
+                {:error, _} = err ->
+                  maybe_rollback_smove_destination(
+                    destination_had_member?,
+                    destination,
+                    dst_key,
+                    store
+                  )
+
+                  err
+              end
+
+            {:error, _} = err ->
+              err
+          end
       end
     end
+  end
+
+  defp maybe_put_smove_destination(true, _destination, _dst_key, _store), do: :ok
+
+  defp maybe_put_smove_destination(false, destination, dst_key, store) do
+    with :ok <- TypeRegistry.check_or_set(destination, :set, store) do
+      Ops.compound_put(store, destination, dst_key, @presence_marker, 0)
+    end
+  end
+
+  defp maybe_rollback_smove_destination(true, _destination, _dst_key, _store), do: :ok
+
+  defp maybe_rollback_smove_destination(false, destination, dst_key, store) do
+    _ = Ops.compound_batch_delete(store, destination, [dst_key])
+    :ok
   end
 
   # Clears any existing set at `destination`, writes `members` as a new set,
