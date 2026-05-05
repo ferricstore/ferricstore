@@ -1308,6 +1308,8 @@ defmodule Ferricstore.FlowTest do
                history_max_events: 2
              )
 
+    assert {:ok, [{created_event_id, _fields}]} = FerricStore.flow_history(id, count: 10)
+
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due("audit-retention",
                worker: "worker-a",
@@ -1322,7 +1324,20 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, events} = FerricStore.flow_history(id, count: 10)
+    event_ids = Enum.map(events, fn {event_id, _fields} -> event_id end)
+
     assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == ["claimed", "completed"]
+    refute created_event_id in event_ids
+
+    history_key = Ferricstore.Flow.Keys.history_key(id)
+    {created_ms, created_seq} = flow_history_test_parse_id(created_event_id)
+
+    assert [{^history_key, 2, first_id, last_id, _last_ms, _last_seq}] =
+             :ets.lookup(Ferricstore.Stream.Meta, history_key)
+
+    assert first_id == List.first(event_ids)
+    assert last_id == List.last(event_ids)
+    assert [] = :ets.lookup(Ferricstore.Stream.Index, {history_key, created_ms, created_seq})
   end
 
   test "flow_rewind rejects trimmed target event with stale stream index" do
@@ -1477,5 +1492,10 @@ defmodule Ferricstore.FlowTest do
     Process.sleep(40)
 
     assert {:ok, nil} = FerricStore.flow_get(id)
+  end
+
+  defp flow_history_test_parse_id(event_id) do
+    [ms, seq] = String.split(event_id, "-", parts: 2)
+    {String.to_integer(ms), String.to_integer(seq)}
   end
 end

@@ -5875,8 +5875,9 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_history_put_ready(state, %{id: id, version: version} = record, event, now_ms) do
-    event_id = Integer.to_string(now_ms) <> "-" <> Integer.to_string(version)
     partition_key = Map.get(record, :partition_key)
+    history_key = FlowKeys.history_key(id, partition_key)
+    event_id = flow_history_next_event_id(history_key, now_ms, version)
 
     fields = [
       "event",
@@ -5917,12 +5918,25 @@ defmodule Ferricstore.Raft.StateMachine do
       Map.get(record, :rewound_to_event_id) || ""
     ]
 
-    history_key = FlowKeys.history_key(id, partition_key)
     compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
 
     with :ok <- flow_put(state, compound_key, :erlang.term_to_binary(fields), 0) do
       flow_history_index_put(history_key, event_id, compound_key)
     end
+  end
+
+  defp flow_history_next_event_id(history_key, now_ms, version) do
+    ms =
+      case :ets.lookup(Ferricstore.Stream.Meta, history_key) do
+        [{^history_key, _len, _first, _last, last_ms, _last_seq}]
+        when is_integer(last_ms) and last_ms > now_ms ->
+          last_ms
+
+        _ ->
+          now_ms
+      end
+
+    Integer.to_string(ms) <> "-" <> Integer.to_string(version)
   end
 
   defp flow_history_integer_or_empty(value) when is_integer(value), do: Integer.to_string(value)
@@ -5959,37 +5973,90 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_history_trim(state, %{id: id, history_max_events: max} = record) when max > 0 do
     partition_key = Map.get(record, :partition_key)
     history_key = FlowKeys.history_key(id, partition_key)
-    prefix = "X:" <> history_key <> <<0>>
-    prefix_len = byte_size(prefix)
 
-    entries =
-      Ferricstore.Store.Shard.ETS.prefix_scan_entries(
-        shard_ets_state(state),
-        prefix,
-        state.shard_data_path
-      )
-      |> Enum.map(fn {event_id, _value} -> event_id end)
-      |> Enum.sort_by(&flow_event_sort_key/1)
+    case :ets.lookup(Ferricstore.Stream.Meta, history_key) do
+      [{^history_key, len, _first, last, last_ms, last_seq}] when len > max ->
+        delete_count = len - max
+        deleted = flow_history_trim_oldest(state, history_key, delete_count, 0)
+        remaining = max(len - deleted, 0)
+        flow_history_update_meta_after_trim(history_key, remaining, last, last_ms, last_seq)
 
-    entries
-    |> Enum.take(max(length(entries) - max, 0))
-    |> Enum.each(fn event_id ->
-      flow_delete(state, <<prefix::binary-size(prefix_len), event_id::binary>>)
-    end)
+      _ ->
+        :ok
+    end
 
     :ok
   end
 
   defp flow_history_trim(_state, _record), do: :ok
 
-  defp flow_event_sort_key(event_id) do
-    case String.split(event_id, "-", parts: 2) do
-      [ms, seq] ->
-        {flow_parse_integer(seq), flow_parse_integer(ms)}
+  defp flow_history_trim_oldest(_state, _history_key, 0, deleted), do: deleted
+
+  defp flow_history_trim_oldest(state, history_key, remaining, deleted) do
+    case :ets.next(Ferricstore.Stream.Index, {history_key, -1, -1}) do
+      {^history_key, _ms, _seq} = index_key ->
+        case :ets.lookup(Ferricstore.Stream.Index, index_key) do
+          [{^index_key, _event_id, compound_key}] ->
+            flow_delete(state, compound_key)
+            :ets.delete(Ferricstore.Stream.Index, index_key)
+            flow_history_trim_oldest(state, history_key, remaining - 1, deleted + 1)
+
+          [] ->
+            flow_history_trim_oldest(state, history_key, remaining - 1, deleted)
+        end
 
       _ ->
-        {0, 0}
+        deleted
     end
+  end
+
+  defp flow_history_update_meta_after_trim(
+         history_key,
+         remaining,
+         old_last,
+         old_last_ms,
+         old_last_seq
+       )
+       when remaining <= 0 do
+    :ets.insert(
+      Ferricstore.Stream.Meta,
+      {history_key, 0, "0-0", old_last, old_last_ms, old_last_seq}
+    )
+
+    :ok
+  end
+
+  defp flow_history_update_meta_after_trim(
+         history_key,
+         remaining,
+         old_last,
+         old_last_ms,
+         old_last_seq
+       ) do
+    case :ets.next(Ferricstore.Stream.Index, {history_key, -1, -1}) do
+      {^history_key, _ms, _seq} = first_key ->
+        case :ets.lookup(Ferricstore.Stream.Index, first_key) do
+          [{^first_key, first_id, _compound_key}] ->
+            :ets.insert(
+              Ferricstore.Stream.Meta,
+              {history_key, remaining, first_id, old_last, old_last_ms, old_last_seq}
+            )
+
+          [] ->
+            flow_history_update_meta_after_trim(
+              history_key,
+              0,
+              old_last,
+              old_last_ms,
+              old_last_seq
+            )
+        end
+
+      _ ->
+        flow_history_update_meta_after_trim(history_key, 0, old_last, old_last_ms, old_last_seq)
+    end
+
+    :ok
   end
 
   defp flow_parse_integer(value) do
