@@ -195,6 +195,24 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert :ets.lookup(:ferricstore_tracking, destination) == []
   end
 
+  test "GETEX tracking invalidates only when an expiry option mutates an existing key" do
+    key = "tracking:getex"
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+
+    ClientTracking.track_key(self(), key, tracking)
+    Tracking.maybe_notify_tracking("GETEX", [key], "value", %{tracking: tracking})
+    refute_received {:tracking_invalidation, _, _}
+    assert :ets.lookup(:ferricstore_tracking, key) == [{key, self()}]
+
+    Tracking.maybe_notify_tracking("GETEX", [key, "EX", "10"], nil, %{tracking: tracking})
+    refute_received {:tracking_invalidation, _, _}
+    assert :ets.lookup(:ferricstore_tracking, key) == [{key, self()}]
+
+    Tracking.maybe_notify_tracking("GETEX", [key, "EX", "10"], "value", %{tracking: tracking})
+    assert_receive {:tracking_invalidation, _payload, [^key]}
+    assert :ets.lookup(:ferricstore_tracking, key) == []
+  end
+
   test "zero-result no-op writes do not invalidate tracked keys" do
     {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
 
@@ -314,6 +332,21 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert_received {:pubsub_message, "__keyspace@0__:" <> ^destination, "rename"}
     assert_received {:pubsub_message, "__keyevent@0__:rename", ^source}
     assert_received {:pubsub_message, "__keyevent@0__:rename", ^destination}
+  end
+
+  test "GETEX keyspace notification fires only when an expiry option mutates an existing key" do
+    key = "tracking:keyspace:getex"
+    Config.set("notify-keyspace-events", "KE$")
+    PubSub.subscribe("__keyspace@0__:#{key}", self())
+    PubSub.subscribe("__keyevent@0__:getex", self())
+
+    Tracking.maybe_notify_keyspace("GETEX", [key], "value")
+    Tracking.maybe_notify_keyspace("GETEX", [key, "EX", "10"], nil)
+    refute_received {:pubsub_message, _, _}
+
+    Tracking.maybe_notify_keyspace("GETEX", [key, "EX", "10"], "value")
+    assert_received {:pubsub_message, "__keyspace@0__:" <> ^key, "getex"}
+    assert_received {:pubsub_message, "__keyevent@0__:getex", ^key}
   end
 
   test "zero-result no-op writes do not fire keyspace notifications" do

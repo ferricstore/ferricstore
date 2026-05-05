@@ -31,7 +31,7 @@ defmodule FerricstoreServer.Connection.Tracking do
     GEOADD GEOSEARCHSTORE
     XADD XTRIM XDEL
     JSON.SET JSON.DEL JSON.NUMINCRBY JSON.TOGGLE JSON.CLEAR JSON.ARRAPPEND
-    GETSET GETDEL
+    GETSET GETDEL GETEX
     CAS LOCK UNLOCK EXTEND)
 
   # O(1) MapSet lookups for hot-path classification.
@@ -65,6 +65,7 @@ defmodule FerricstoreServer.Connection.Tracking do
     "APPEND" => "append",
     "GETSET" => "getset",
     "GETDEL" => "getdel",
+    "GETEX" => "getex",
     "SETRANGE" => "setrange",
     "INCR" => "incr",
     "DECR" => "decr",
@@ -113,6 +114,8 @@ defmodule FerricstoreServer.Connection.Tracking do
   @doc false
   @spec maybe_notify_keyspace(binary(), [binary()], term()) :: :ok
   def maybe_notify_keyspace(cmd, _args, 0) when cmd in @zero_result_noop_cmds, do: :ok
+  def maybe_notify_keyspace("GETEX", [_key], _result), do: :ok
+  def maybe_notify_keyspace("GETEX", _args, nil), do: :ok
 
   def maybe_notify_keyspace(cmd, args, result) do
     case Map.get(@keyspace_events, cmd) do
@@ -278,6 +281,8 @@ defmodule FerricstoreServer.Connection.Tracking do
   @spec maybe_notify_tracking(binary(), [binary()], term(), map()) :: :ok
   def maybe_notify_tracking(_cmd, _args, {:error, _}, _state), do: :ok
   def maybe_notify_tracking(cmd, _args, 0, _state) when cmd in @zero_result_noop_cmds, do: :ok
+  def maybe_notify_tracking("GETEX", [_key], _result, _state), do: :ok
+  def maybe_notify_tracking("GETEX", _args, nil, _state), do: :ok
 
   def maybe_notify_tracking(cmd, args, _result, _state) do
     if MapSet.member?(@write_cmds_set, cmd) do
