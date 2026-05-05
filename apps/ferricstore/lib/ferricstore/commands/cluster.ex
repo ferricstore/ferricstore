@@ -101,8 +101,7 @@ defmodule Ferricstore.Commands.Cluster do
   end
 
   def handle("CLUSTER.KEYSLOT", [key], _store) do
-    ctx = FerricStore.Instance.get(:default)
-    Router.slot_for(ctx, key)
+    SlotMap.slot_for_key(key)
   end
 
   def handle("CLUSTER.KEYSLOT", _args, _store) do
@@ -110,7 +109,7 @@ defmodule Ferricstore.Commands.Cluster do
   end
 
   def handle("CLUSTER.SLOTS", [], _store) do
-    slot_map = SlotMap.get()
+    slot_map = current_slot_map()
     ranges = SlotMap.slot_ranges(slot_map)
 
     Enum.map(ranges, fn {start_slot, end_slot, shard_index} ->
@@ -287,20 +286,29 @@ defmodule Ferricstore.Commands.Cluster do
     entries = Stats.hotness_top(top_n)
 
     header = [
-      "hot_reads", Integer.to_string(Stats.total_hot_reads(FerricStore.Instance.get(:default))),
-      "cold_reads", Integer.to_string(Stats.total_cold_reads(FerricStore.Instance.get(:default))),
-      "hot_read_pct", format_pct(Stats.hot_read_pct()),
-      "cold_reads_per_second", format_pct(Stats.cold_reads_per_second()),
-      "top_n", Integer.to_string(top_n)
+      "hot_reads",
+      Integer.to_string(Stats.total_hot_reads()),
+      "cold_reads",
+      Integer.to_string(Stats.total_cold_reads()),
+      "hot_read_pct",
+      format_pct(Stats.hot_read_pct()),
+      "cold_reads_per_second",
+      format_pct(Stats.cold_reads_per_second()),
+      "top_n",
+      Integer.to_string(top_n)
     ]
 
     prefix_entries =
       Enum.flat_map(entries, fn {prefix, hot, cold, cold_pct} ->
         [
-          "prefix", prefix,
-          "hot", Integer.to_string(hot),
-          "cold", Integer.to_string(cold),
-          "cold_pct", format_pct(cold_pct)
+          "prefix",
+          prefix,
+          "hot",
+          Integer.to_string(hot),
+          "cold",
+          Integer.to_string(cold),
+          "cold_pct",
+          format_pct(cold_pct)
         ]
       end)
 
@@ -314,21 +322,25 @@ defmodule Ferricstore.Commands.Cluster do
   end
 
   defp parse_top_n([], default), do: default
+
   defp parse_top_n(["TOP", n_str | _], default) do
     case Integer.parse(n_str) do
       {n, ""} when n > 0 -> n
       _ -> default
     end
   end
+
   defp parse_top_n([_ | rest], default), do: parse_top_n(rest, default)
 
   defp parse_window([], default), do: default
+
   defp parse_window(["WINDOW", s_str | _], default) do
     case Integer.parse(s_str) do
       {s, ""} when s > 0 -> s
       _ -> default
     end
   end
+
   defp parse_window([_ | rest], default), do: parse_window(rest, default)
 
   defp format_pct(val) when is_float(val) do
@@ -340,17 +352,17 @@ defmodule Ferricstore.Commands.Cluster do
   # -------------------------------------------------------------------
 
   defp collect_shard_info do
-    ctx = FerricStore.Instance.get(:default)
-    shard_count = ctx.shard_count
+    ctx = default_instance()
+    shard_count = if ctx, do: ctx.shard_count, else: configured_shard_count()
+
     Enum.map(0..(shard_count - 1), fn index ->
       keydir = :"keydir_#{index}"
-      ctx = FerricStore.Instance.get(:default)
-      name = Router.shard_name(ctx, index)
+      name = if ctx, do: Router.shard_name(ctx, index), else: nil
 
       info =
         try do
-          keys = :ets.info(keydir, :size)
-          keydir_words = :ets.info(keydir, :memory)
+          keys = ets_count(keydir)
+          keydir_words = ets_memory(keydir)
           word_size = :erlang.system_info(:wordsize)
           memory_bytes = keydir_words * word_size
 
@@ -368,6 +380,39 @@ defmodule Ferricstore.Commands.Cluster do
 
       {index, info}
     end)
+  end
+
+  defp default_instance do
+    FerricStore.Instance.get(:default)
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp current_slot_map do
+    SlotMap.get()
+  rescue
+    ArgumentError -> SlotMap.build_uniform(configured_shard_count())
+  end
+
+  defp configured_shard_count do
+    :persistent_term.get(
+      :ferricstore_shard_count,
+      Application.get_env(:ferricstore, :shard_count, 4)
+    )
+  end
+
+  defp ets_count(table) do
+    case :ets.info(table, :size) do
+      n when is_integer(n) -> n
+      _ -> 0
+    end
+  end
+
+  defp ets_memory(table) do
+    case :ets.info(table, :memory) do
+      n when is_integer(n) -> n
+      _ -> 0
+    end
   end
 
   # Returns "leader" or "follower" for the given shard on this node.
