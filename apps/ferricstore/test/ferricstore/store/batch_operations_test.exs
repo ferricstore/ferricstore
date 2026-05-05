@@ -6,14 +6,14 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   alias Ferricstore.Store.{CompoundKey, DiskPressure, Ops, Router}
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
 
-  @ns_async "batch_test_async"
+  @ns_batch "batch_test_batch"
   @ns_quorum "batch_test_quorum"
 
   setup do
     ctx = Ferricstore.Test.IsolatedInstance.checkout()
 
     on_exit(fn ->
-      Ferricstore.NamespaceConfig.reset(@ns_async)
+      Ferricstore.NamespaceConfig.reset(@ns_batch)
       Ferricstore.Test.IsolatedInstance.checkin(ctx)
     end)
 
@@ -44,7 +44,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     end
 
     test "all-small batch: values readable immediately" do
-      kvs = for i <- 1..20, do: {"#{@ns_async}:bap_small_#{i}", "val_#{i}"}
+      kvs = for i <- 1..20, do: {"#{@ns_batch}:bap_small_#{i}", "val_#{i}"}
       :ok = Router.batch_put(default_ctx(), kvs)
 
       for {key, value} <- kvs do
@@ -54,7 +54,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
     test "small batch publish does not overwrite an already materialized Ra apply" do
       ctx = default_ctx()
-      key = "#{@ns_async}:bap_materialized_race"
+      key = "#{@ns_batch}:bap_materialized_race"
       idx = Router.shard_for(ctx, key)
       keydir = elem(ctx.keydir_refs, idx)
 
@@ -76,7 +76,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
     test "all-large batch: values > hot_cache_max written to disk" do
       big = :binary.copy("L", 100 * 1024)
-      kvs = for i <- 1..5, do: {"#{@ns_async}:bap_large_#{i}", big}
+      kvs = for i <- 1..5, do: {"#{@ns_batch}:bap_large_#{i}", big}
       :ok = Router.batch_put(default_ctx(), kvs)
 
       for {key, _} <- kvs do
@@ -89,11 +89,11 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       big = :binary.copy("M", 100 * 1024)
 
       kvs = [
-        {"#{@ns_async}:bap_mix_s1", small},
-        {"#{@ns_async}:bap_mix_l1", big},
-        {"#{@ns_async}:bap_mix_s2", small},
-        {"#{@ns_async}:bap_mix_l2", big},
-        {"#{@ns_async}:bap_mix_s3", small}
+        {"#{@ns_batch}:bap_mix_s1", small},
+        {"#{@ns_batch}:bap_mix_l1", big},
+        {"#{@ns_batch}:bap_mix_s2", small},
+        {"#{@ns_batch}:bap_mix_l2", big},
+        {"#{@ns_batch}:bap_mix_s3", small}
       ]
 
       :ok = Router.batch_put(default_ctx(), kvs)
@@ -108,13 +108,13 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     end
 
     test "single-element batch works" do
-      kvs = [{"#{@ns_async}:bap_single", "one"}]
+      kvs = [{"#{@ns_batch}:bap_single", "one"}]
       :ok = Router.batch_put(default_ctx(), kvs)
-      assert Router.get(default_ctx(), "#{@ns_async}:bap_single") == "one"
+      assert Router.get(default_ctx(), "#{@ns_batch}:bap_single") == "one"
     end
 
     test "overwrites existing keys" do
-      key = "#{@ns_async}:bap_overwrite"
+      key = "#{@ns_batch}:bap_overwrite"
       :ok = Router.put(default_ctx(), key, "original", 0)
       assert Router.get(default_ctx(), key) == "original"
 
@@ -123,7 +123,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     end
 
     test "overwriting a compound key clears compound metadata and fields" do
-      key = "#{@ns_async}:bap_overwrite_hash"
+      key = "#{@ns_batch}:bap_overwrite_hash"
       field_key = CompoundKey.hash_field(key, "field")
 
       :ok = Router.compound_put(default_ctx(), key, CompoundKey.type_key(key), "hash", 0)
@@ -138,8 +138,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert nil == Router.compound_get(default_ctx(), key, field_key)
     end
 
-    test "duplicate keys in one async batch use the last value" do
-      key = "#{@ns_async}:bap_duplicate"
+    test "duplicate keys in one batch use the last value" do
+      key = "#{@ns_batch}:bap_duplicate"
 
       :ok = Router.batch_put(default_ctx(), [{key, "first"}, {key, "second"}])
 
@@ -277,8 +277,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
            "async durability direct pressure preflight removed; quorum write pressure is exercised elsewhere"
     test "direct batch_put rejects pressured shards before publishing writes" do
       ctx = default_ctx()
-      pressured_key = "#{@ns_async}:bap_pressure_#{System.unique_integer([:positive])}"
-      ok_key = different_shard_key(ctx, pressured_key, "#{@ns_async}:bap_pressure_ok")
+      pressured_key = "#{@ns_batch}:bap_pressure_#{System.unique_integer([:positive])}"
+      ok_key = different_shard_key(ctx, pressured_key, "#{@ns_batch}:bap_pressure_ok")
       idx = Router.shard_for(ctx, pressured_key)
 
       Ferricstore.Store.DiskPressure.set(ctx, idx)
@@ -297,7 +297,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     @tag skip:
            "async durability overload recovery path removed; default instance writes now submit through quorum"
     test "large batch does not recover unaccepted value when raft replication is overloaded" do
-      key = "#{@ns_async}:bap_overloaded_large_missing_#{System.unique_integer([:positive])}"
+      key = "#{@ns_batch}:bap_overloaded_large_missing_#{System.unique_integer([:positive])}"
       idx = Router.shard_for(default_ctx(), key)
       large = :binary.copy("B", default_ctx().hot_cache_max_value_size + 1024)
 
@@ -314,7 +314,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     @tag skip:
            "async durability overload rollback path removed; default instance writes now submit through quorum"
     test "large batch restores previous cold value when raft replication is overloaded" do
-      key = "#{@ns_async}:bap_overloaded_large_existing_#{System.unique_integer([:positive])}"
+      key = "#{@ns_batch}:bap_overloaded_large_existing_#{System.unique_integer([:positive])}"
       idx = Router.shard_for(default_ctx(), key)
       old = :binary.copy("O", default_ctx().hot_cache_max_value_size + 1024)
       new = :binary.copy("N", default_ctx().hot_cache_max_value_size + 2048)
@@ -338,7 +338,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
            "async durability delete pressure path removed; quorum delete failures need a Ra apply injection hook"
     test "surfaces delete failures instead of reporting success" do
       ctx = default_ctx()
-      key = "#{@ns_async}:flush_pressure_#{System.unique_integer([:positive])}"
+      key = "#{@ns_batch}:flush_pressure_#{System.unique_integer([:positive])}"
       idx = Router.shard_for(ctx, key)
 
       :ok = Router.put(ctx, key, "value", 0)
@@ -361,7 +361,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   describe "FerricStore.batch_set" do
     @tag skip: "async durability namespace removed; quorum batch_set coverage remains below"
     test "all-async namespace returns list of :ok" do
-      kvs = for i <- 1..10, do: {"#{@ns_async}:bs_#{i}", "v#{i}"}
+      kvs = for i <- 1..10, do: {"#{@ns_batch}:bs_#{i}", "v#{i}"}
       results = FerricStore.batch_set(kvs)
       assert results == List.duplicate(:ok, 10)
 
@@ -387,9 +387,9 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     @tag skip: "mixed async/quorum namespace routing removed; all namespaces are quorum"
     test "mixed async/quorum namespaces preserves result order" do
       kvs = [
-        {"#{@ns_async}:mix_1", "async_val"},
+        {"#{@ns_batch}:mix_1", "async_val"},
         {"#{@ns_quorum}:mix_2", "quorum_val"},
-        {"#{@ns_async}:mix_3", "async_val2"},
+        {"#{@ns_batch}:mix_3", "async_val2"},
         {"#{@ns_quorum}:mix_4", "quorum_val2"}
       ]
 
@@ -397,9 +397,9 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert length(results) == 4
       assert Enum.all?(results, &(&1 == :ok))
 
-      assert {:ok, "async_val"} == FerricStore.get("#{@ns_async}:mix_1")
+      assert {:ok, "async_val"} == FerricStore.get("#{@ns_batch}:mix_1")
       assert {:ok, "quorum_val"} == FerricStore.get("#{@ns_quorum}:mix_2")
-      assert {:ok, "async_val2"} == FerricStore.get("#{@ns_async}:mix_3")
+      assert {:ok, "async_val2"} == FerricStore.get("#{@ns_batch}:mix_3")
       assert {:ok, "quorum_val2"} == FerricStore.get("#{@ns_quorum}:mix_4")
     end
 
@@ -451,8 +451,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
            "async durability per-shard pressure partial success removed; quorum batch_set is all quorum"
     test "async disk pressure rejects only pressured async batch_set keys" do
       default_ctx = FerricStore.Instance.get(:default)
-      pressured_key = "#{@ns_async}:bs_pressure_#{System.unique_integer([:positive])}"
-      ok_key = different_shard_key(default_ctx, pressured_key, "#{@ns_async}:bs_pressure_ok")
+      pressured_key = "#{@ns_batch}:bs_pressure_#{System.unique_integer([:positive])}"
+      ok_key = different_shard_key(default_ctx, pressured_key, "#{@ns_batch}:bs_pressure_ok")
       idx = Router.shard_for(default_ctx, pressured_key)
 
       Ferricstore.Store.DiskPressure.set(default_ctx, idx)
@@ -473,8 +473,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     @tag skip:
            "async durability keydir pressure semantics removed; quorum batch_set validation is covered elsewhere"
     test "async keydir pressure rejects new batch_set keys but allows updates" do
-      existing_key = "#{@ns_async}:bs_keydir_existing_#{System.unique_integer([:positive])}"
-      new_key = "#{@ns_async}:bs_keydir_new_#{System.unique_integer([:positive])}"
+      existing_key = "#{@ns_batch}:bs_keydir_existing_#{System.unique_integer([:positive])}"
+      new_key = "#{@ns_batch}:bs_keydir_new_#{System.unique_integer([:positive])}"
 
       assert [:ok] = FerricStore.batch_set([{existing_key, "old"}])
 
@@ -497,7 +497,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
            "async durability preflight validation path removed; quorum command validation is covered elsewhere"
     test "async batch_set rejects overlarge keys before writing" do
       default_ctx = FerricStore.Instance.get(:default)
-      key = "#{@ns_async}:" <> String.duplicate("k", 65_536)
+      key = "#{@ns_batch}:" <> String.duplicate("k", 65_536)
       keydir = elem(default_ctx.keydir_refs, Router.shard_for(default_ctx, key))
 
       assert [{:error, "ERR key too large (max 65535 bytes)"}] =
@@ -650,7 +650,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   describe "Router.get_keydir_file_ref" do
     @tag skip: "pending async ETS locations removed from default durability path"
     test "does not return pending async locations as disk file refs" do
-      key = "#{@ns_async}:pending_file_ref"
+      key = "#{@ns_batch}:pending_file_ref"
       idx = Router.shard_for(default_ctx(), key)
       keydir = elem(default_ctx().keydir_refs, idx)
 
@@ -714,12 +714,12 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Async delete origin-skip correctness
+  # Delete origin-skip correctness
   # ---------------------------------------------------------------------------
 
-  describe "async delete" do
+  describe "delete replay" do
     test "delete is applied on all nodes (not skipped on origin)" do
-      key = "#{@ns_async}:del_origin_#{:erlang.unique_integer([:positive])}"
+      key = "#{@ns_batch}:del_origin_#{:erlang.unique_integer([:positive])}"
       :ok = Router.put(ctx(), key, "present", 0)
       assert Router.get(ctx(), key) == "present"
 
@@ -731,7 +731,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     end
 
     test "batch delete followed by set works correctly" do
-      key = "#{@ns_async}:del_then_set_#{:erlang.unique_integer([:positive])}"
+      key = "#{@ns_batch}:del_then_set_#{:erlang.unique_integer([:positive])}"
       :ok = Router.put(ctx(), key, "first", 0)
       Router.delete(ctx(), key)
       :ok = Router.put(ctx(), key, "second", 0)
@@ -744,7 +744,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   # ---------------------------------------------------------------------------
 
   defp same_shard_keys(ctx, base) do
-    prefix = "#{@ns_async}:#{base}:#{System.unique_integer([:positive])}"
+    prefix = "#{@ns_batch}:#{base}:#{System.unique_integer([:positive])}"
     keys = for i <- 1..200, do: "#{prefix}:#{i}"
 
     Enum.find_value(keys, fn left ->
@@ -768,7 +768,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   end
 
   defp key_for_shard(ctx, base, shard_idx) do
-    prefix = "#{@ns_async}:#{base}:#{System.unique_integer([:positive])}"
+    prefix = "#{@ns_batch}:#{base}:#{System.unique_integer([:positive])}"
 
     1..500
     |> Stream.map(fn i -> "#{prefix}:#{i}" end)

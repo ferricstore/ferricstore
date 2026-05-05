@@ -111,6 +111,31 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     assert offenders == []
   end
 
+  test "active tests do not use async durability fixture names for quorum flows" do
+    repo_root = Path.expand("../../../..", __DIR__)
+
+    offenders =
+      Path.join(repo_root, "apps/ferricstore/test/**/*.exs")
+      |> Path.wildcard()
+      |> Enum.reject(&(&1 == __ENV__.file))
+      |> Enum.flat_map(fn path ->
+        source = File.read!(path)
+
+        for token <- [
+              "@ns_async",
+              "batch_test_async",
+              "duplicate keys in one async batch",
+              ~s(describe "async delete")
+            ],
+            active_test_file?(source),
+            String.contains?(source, token) do
+          {Path.relative_to(path, repo_root), token}
+        end
+      end)
+
+    assert offenders == []
+  end
+
   test "tests no longer keep removed RMW coordinator contract alive" do
     repo_root = Path.expand("../../../..", __DIR__)
 
