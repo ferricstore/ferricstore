@@ -75,4 +75,14 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert :ets.lookup(:ferricstore_tracking, "g1") == []
     assert :ets.lookup(:ferricstore_tracking, "STREAMS") == []
   end
+
+  test "XINFO tracks the stream key instead of the subcommand token" do
+    stream = "tracking:xinfo:a"
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+
+    Tracking.maybe_track_read("XINFO", ["STREAM", stream], %{}, %{tracking: tracking})
+
+    assert :ets.lookup(:ferricstore_tracking, stream) == [{stream, self()}]
+    assert :ets.lookup(:ferricstore_tracking, "STREAM") == []
+  end
 end
