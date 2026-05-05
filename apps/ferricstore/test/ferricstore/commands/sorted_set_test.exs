@@ -337,19 +337,23 @@ defmodule Ferricstore.Commands.SortedSetTest do
           send(parent, {:compound_batch_get, member_keys})
           ["1.0", "2.0", nil]
         end,
-        compound_delete: fn "zs", compound_key ->
-          send(parent, {:compound_delete, compound_key})
+        compound_batch_delete: fn "zs", compound_keys ->
+          send(parent, {:compound_batch_delete, compound_keys})
           :ok
+        end,
+        compound_delete: fn "zs", compound_key ->
+          flunk(
+            "ZREM should use compound_batch_delete, got per-member delete #{inspect(compound_key)}"
+          )
         end,
         compound_count: fn "zs", _prefix -> 1 end
       }
 
       assert 2 == SortedSet.handle("ZREM", ["zs", "a", "a", "b", "missing"], store)
       assert_received {:compound_batch_get, ^member_keys}
-      assert_received {:compound_delete, deleted_a}
-      assert_received {:compound_delete, deleted_b}
-      assert Enum.sort([deleted_a, deleted_b]) == Enum.sort(Enum.take(member_keys, 2))
-      refute_received {:compound_delete, _}
+      assert_received {:compound_batch_delete, deleted_keys}
+      assert Enum.sort(deleted_keys) == Enum.sort(Enum.take(member_keys, 2))
+      refute_received {:compound_batch_delete, _}
     end
 
     test "ZREM cleans up type metadata when sorted set becomes empty" do

@@ -551,6 +551,18 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec handle_compound_batch_delete(binary(), [binary()], map()) :: {:reply, term(), map()}
+  @doc false
+  def handle_compound_batch_delete(_redis_key, [], state), do: {:reply, :ok, state}
+
+  def handle_compound_batch_delete(redis_key, compound_keys, state) do
+    if state.raft? do
+      handle_compound_batch_delete_raft(redis_key, compound_keys, state)
+    else
+      handle_compound_batch_delete_direct(redis_key, compound_keys, state)
+    end
+  end
+
   @spec handle_compound_scan(binary(), binary(), map()) :: {:reply, [{binary(), binary()}], map()}
   @doc false
   def handle_compound_scan(redis_key, prefix, state) do
@@ -885,6 +897,41 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  defp handle_compound_batch_delete_raft(redis_key, compound_keys, state) do
+    tracked_state =
+      Enum.reduce(compound_keys, state, fn compound_key, acc ->
+        if promoted_store_for_compound(acc, redis_key, compound_key) do
+          track_promoted_delete_bytes(acc, redis_key, compound_key)
+        else
+          acc
+        end
+      end)
+
+    commands = Enum.map(compound_keys, &{:compound_delete, &1})
+    result = Ferricstore.Raft.Batcher.write(tracked_state.index, {:batch, commands})
+    new_version = tracked_state.write_version + 1
+
+    case normalize_compound_batch_result(result) do
+      :ok ->
+        new_state =
+          Enum.reduce(compound_keys, tracked_state, fn compound_key, acc ->
+            acc =
+              if promoted_store_for_compound(acc, redis_key, compound_key) do
+                bump_promoted_writes(acc, redis_key)
+              else
+                acc
+              end
+
+            ZSetIndex.apply_delete(acc, redis_key, compound_key)
+          end)
+
+        {:reply, :ok, %{new_state | write_version: new_version}}
+
+      {:error, _} = err ->
+        {:reply, err, state}
+    end
+  end
+
   defp handle_compound_delete_direct(redis_key, compound_key, state) do
     case promoted_store_for_compound(state, redis_key, compound_key) do
       nil ->
@@ -938,6 +985,17 @@ defmodule Ferricstore.Store.Shard.Compound do
             {:reply, {:error, reason}, state}
         end
     end
+  end
+
+  defp handle_compound_batch_delete_direct(redis_key, compound_keys, state) do
+    Enum.reduce_while(compound_keys, {:reply, :ok, state}, fn compound_key,
+                                                              {:reply, :ok, acc_state} ->
+      case handle_compound_delete_direct(redis_key, compound_key, acc_state) do
+        {:reply, :ok, new_state} -> {:cont, {:reply, :ok, new_state}}
+        {:reply, {:error, _} = err, new_state} -> {:halt, {:reply, err, new_state}}
+        {:reply, other, new_state} -> {:halt, {:reply, other, new_state}}
+      end
+    end)
   end
 
   defp handle_compound_delete_prefix_raft(redis_key, prefix, state) do

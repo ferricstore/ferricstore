@@ -3604,6 +3604,20 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @spec compound_batch_delete(FerricStore.Instance.t(), binary(), [binary()]) ::
+          :ok | {:error, term()}
+  def compound_batch_delete(_ctx, _redis_key, []), do: :ok
+
+  def compound_batch_delete(ctx, redis_key, compound_keys) do
+    idx = shard_for(ctx, redis_key)
+
+    if ctx.name == :default do
+      quorum_write(ctx, idx, {:compound_batch_delete, redis_key, compound_keys})
+    else
+      safe_write_call(ctx, idx, {:compound_batch_delete, redis_key, compound_keys})
+    end
+  end
+
   defp origin_compound_get(ctx, idx, keydir, compound_key) do
     now = HLC.now_ms()
 

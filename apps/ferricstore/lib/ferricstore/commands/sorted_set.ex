@@ -705,19 +705,23 @@ defmodule Ferricstore.Commands.SortedSet do
           {_value, compound_key} -> [compound_key]
         end)
 
-      Enum.each(removed_keys, &Ops.compound_delete(store, key, &1))
-
       removed = length(removed_keys)
 
-      if removed > 0 do
-        prefix = CompoundKey.zset_prefix(key)
+      case Ops.compound_batch_delete(store, key, removed_keys) do
+        :ok ->
+          if removed > 0 do
+            prefix = CompoundKey.zset_prefix(key)
 
-        if Ops.compound_count(store, key, prefix) == 0 do
-          TypeRegistry.delete_type(key, store)
-        end
+            if Ops.compound_count(store, key, prefix) == 0 do
+              TypeRegistry.delete_type(key, store)
+            end
+          end
+
+          removed
+
+        {:error, _} = err ->
+          err
       end
-
-      removed
     end
   end
 

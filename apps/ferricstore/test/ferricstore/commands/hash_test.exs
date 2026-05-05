@@ -186,19 +186,23 @@ defmodule Ferricstore.Commands.HashTest do
           send(parent, {:compound_batch_get, field_keys})
           ["v1", "v2", nil]
         end,
-        compound_delete: fn "hash", compound_key ->
-          send(parent, {:compound_delete, compound_key})
+        compound_batch_delete: fn "hash", compound_keys ->
+          send(parent, {:compound_batch_delete, compound_keys})
           :ok
+        end,
+        compound_delete: fn "hash", compound_key ->
+          flunk(
+            "HDEL should use compound_batch_delete, got per-field delete #{inspect(compound_key)}"
+          )
         end,
         compound_count: fn "hash", _prefix -> 1 end
       }
 
       assert 2 == Hash.handle("HDEL", ["hash", "f1", "f1", "f2", "missing"], store)
       assert_received {:compound_batch_get, ^field_keys}
-      assert_received {:compound_delete, deleted_f1}
-      assert_received {:compound_delete, deleted_f2}
-      assert Enum.sort([deleted_f1, deleted_f2]) == Enum.sort(Enum.take(field_keys, 2))
-      refute_received {:compound_delete, _}
+      assert_received {:compound_batch_delete, deleted_keys}
+      assert Enum.sort(deleted_keys) == Enum.sort(Enum.take(field_keys, 2))
+      refute_received {:compound_batch_delete, _}
     end
 
     test "HDEL with no fields returns error" do

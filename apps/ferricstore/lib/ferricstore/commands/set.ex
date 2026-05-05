@@ -88,12 +88,16 @@ defmodule Ferricstore.Commands.Set do
           {_value, compound_key} -> [compound_key]
         end)
 
-      Enum.each(removed_keys, &Ops.compound_delete(store, key, &1))
-
       removed = length(removed_keys)
 
-      maybe_cleanup_empty_set(key, removed, store)
-      removed
+      case Ops.compound_batch_delete(store, key, removed_keys) do
+        :ok ->
+          maybe_cleanup_empty_set(key, removed, store)
+          removed
+
+        {:error, _} = err ->
+          err
+      end
     end
   end
 
@@ -599,12 +603,16 @@ defmodule Ferricstore.Commands.Set do
           {_value, compound_key} -> [compound_key]
         end)
 
-      Enum.each(removed_keys, &Ops.compound_delete(store, key, &1))
-
       removed = length(removed_keys)
 
-      maybe_cleanup_empty_set(key, removed, store)
-      removed
+      case Ops.compound_batch_delete(store, key, removed_keys) do
+        :ok ->
+          maybe_cleanup_empty_set(key, removed, store)
+          removed
+
+        {:error, _} = err ->
+          err
+      end
     end
   end
 

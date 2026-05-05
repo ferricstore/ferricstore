@@ -799,6 +799,44 @@ defmodule Ferricstore.Store.Ops do
   def compound_delete(store, redis_key, compound_key) when is_map(store),
     do: store.compound_delete.(redis_key, compound_key)
 
+  @spec compound_batch_delete(store(), binary(), [binary()]) :: :ok | {:error, term()}
+  def compound_batch_delete(_store, _redis_key, []), do: :ok
+
+  def compound_batch_delete(%FerricStore.Instance{} = ctx, redis_key, compound_keys),
+    do: Router.compound_batch_delete(ctx, redis_key, compound_keys)
+
+  def compound_batch_delete(%LocalTxStore{} = tx, redis_key, compound_keys) do
+    if local?(tx, redis_key) do
+      Enum.each(compound_keys, fn compound_key ->
+        ShardETS.ets_delete_key(tx.shard_state, compound_key)
+        tx_drop_pending(compound_key)
+        tx_mark_deleted(compound_key)
+        send(self(), tx_compound_delete_message(tx, redis_key, compound_key))
+      end)
+
+      :ok
+    else
+      Router.compound_batch_delete(tx.instance_ctx, redis_key, compound_keys)
+    end
+  end
+
+  def compound_batch_delete(store, redis_key, compound_keys) when is_map(store) do
+    case store do
+      %{compound_batch_delete: compound_batch_delete_fun}
+      when is_function(compound_batch_delete_fun, 2) ->
+        compound_batch_delete_fun.(redis_key, compound_keys)
+
+      _ ->
+        Enum.reduce_while(compound_keys, :ok, fn compound_key, :ok ->
+          case compound_delete(store, redis_key, compound_key) do
+            :ok -> {:cont, :ok}
+            {:error, _} = err -> {:halt, err}
+            other -> {:halt, {:error, inspect(other)}}
+          end
+        end)
+    end
+  end
+
   @spec compound_scan(store(), binary(), binary()) :: [{binary(), binary()}]
   def compound_scan(%FerricStore.Instance{} = ctx, redis_key, prefix),
     do: Router.compound_scan(ctx, redis_key, prefix)

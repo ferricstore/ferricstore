@@ -105,12 +105,16 @@ defmodule Ferricstore.Commands.Hash do
           {_value, compound_key} -> [compound_key]
         end)
 
-      Enum.each(deleted_keys, &Ops.compound_delete(store, key, &1))
-
       deleted = length(deleted_keys)
 
-      maybe_cleanup_empty_hash(key, deleted, store)
-      deleted
+      case Ops.compound_batch_delete(store, key, deleted_keys) do
+        :ok ->
+          maybe_cleanup_empty_hash(key, deleted, store)
+          deleted
+
+        {:error, _} = err ->
+          err
+      end
     end
   end
 
@@ -566,13 +570,17 @@ defmodule Ferricstore.Commands.Hash do
           end)
 
         results = Enum.reverse(results)
-        Enum.each(deleted_keys, &Ops.compound_delete(store, key, &1))
-
         # Clean up type metadata if hash is now empty
         deleted_count = MapSet.size(deleted_keys)
-        maybe_cleanup_empty_hash(key, deleted_count, store)
 
-        results
+        case Ops.compound_batch_delete(store, key, MapSet.to_list(deleted_keys)) do
+          :ok ->
+            maybe_cleanup_empty_hash(key, deleted_count, store)
+            results
+
+          {:error, _} = err ->
+            err
+        end
       end
     end
   end
@@ -908,12 +916,16 @@ defmodule Ferricstore.Commands.Hash do
           {_value, compound_key} -> [compound_key]
         end)
 
-      Enum.each(deleted_keys, &Ops.compound_delete(store, key, &1))
-
       deleted = length(deleted_keys)
 
-      maybe_cleanup_empty_hash(key, deleted, store)
-      deleted
+      case Ops.compound_batch_delete(store, key, deleted_keys) do
+        :ok ->
+          maybe_cleanup_empty_hash(key, deleted, store)
+          deleted
+
+        {:error, _} = err ->
+          err
+      end
     end
   end
 
@@ -1213,9 +1225,16 @@ defmodule Ferricstore.Commands.Hash do
         end)
 
       results = Enum.reverse(results)
-      Enum.each(deleted_keys, &Ops.compound_delete(store, key, &1))
-      maybe_cleanup_empty_hash(key, MapSet.size(deleted_keys), store)
-      results
+      deleted_count = MapSet.size(deleted_keys)
+
+      case Ops.compound_batch_delete(store, key, MapSet.to_list(deleted_keys)) do
+        :ok ->
+          maybe_cleanup_empty_hash(key, deleted_count, store)
+          results
+
+        {:error, _} = err ->
+          err
+      end
     end
   end
 

@@ -603,6 +603,12 @@ defmodule Ferricstore.Store.Shard do
     |> track_write_version_result(state)
   end
 
+  def handle_call({:compound_batch_delete, redis_key, compound_keys}, _from, state) do
+    redis_key
+    |> ShardCompound.handle_compound_batch_delete(compound_keys, state)
+    |> track_write_version_result(state)
+  end
+
   def handle_call({:compound_scan, redis_key, prefix}, _from, state) do
     ShardCompound.handle_compound_scan(redis_key, prefix, state)
   end
@@ -1268,6 +1274,10 @@ defmodule Ferricstore.Store.Shard do
 
   defp handle_forwarded_quorum({:compound_delete, redis_key, compound_key}, _from, state) do
     ShardCompound.handle_compound_delete(redis_key, compound_key, state)
+  end
+
+  defp handle_forwarded_quorum({:compound_batch_delete, redis_key, compound_keys}, _from, state) do
+    ShardCompound.handle_compound_batch_delete(redis_key, compound_keys, state)
   end
 
   defp handle_forwarded_quorum({:compound_delete_prefix, redis_key, prefix}, _from, state) do

@@ -111,6 +111,13 @@ defmodule Ferricstore.Test.MockStore do
         Agent.update(pid, &Map.delete(&1, compound_key))
         :ok
       end,
+      compound_batch_delete: fn _redis_key, compound_keys ->
+        Agent.update(pid, fn state ->
+          Enum.reduce(compound_keys, state, &Map.delete(&2, &1))
+        end)
+
+        :ok
+      end,
       compound_scan: fn _redis_key, prefix ->
         Agent.get(pid, fn state ->
           now = System.os_time(:millisecond)

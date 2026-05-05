@@ -133,6 +133,7 @@ defmodule Ferricstore.Raft.Batcher do
           | {:list_op, binary(), term()}
           | {:compound_put, binary(), binary(), non_neg_integer()}
           | {:compound_delete, binary()}
+          | {:compound_batch_delete, binary(), [binary()]}
           | {:compound_delete_prefix, binary()}
           | {:pfadd, binary(), [binary()]}
           | {:pfmerge, binary(), [binary()]}

@@ -132,19 +132,23 @@ defmodule Ferricstore.Commands.SetTest do
           send(parent, {:compound_batch_get, member_keys})
           ["1", "1", nil]
         end,
-        compound_delete: fn "myset", compound_key ->
-          send(parent, {:compound_delete, compound_key})
+        compound_batch_delete: fn "myset", compound_keys ->
+          send(parent, {:compound_batch_delete, compound_keys})
           :ok
+        end,
+        compound_delete: fn "myset", compound_key ->
+          flunk(
+            "SREM should use compound_batch_delete, got per-member delete #{inspect(compound_key)}"
+          )
         end,
         compound_count: fn "myset", _prefix -> 1 end
       }
 
       assert 2 == Set.handle("SREM", ["myset", "a", "a", "b", "missing"], store)
       assert_received {:compound_batch_get, ^member_keys}
-      assert_received {:compound_delete, deleted_a}
-      assert_received {:compound_delete, deleted_b}
-      assert Enum.sort([deleted_a, deleted_b]) == Enum.sort(Enum.take(member_keys, 2))
-      refute_received {:compound_delete, _}
+      assert_received {:compound_batch_delete, deleted_keys}
+      assert Enum.sort(deleted_keys) == Enum.sort(Enum.take(member_keys, 2))
+      refute_received {:compound_batch_delete, _}
     end
 
     test "SREM cleans up type metadata when set becomes empty" do
