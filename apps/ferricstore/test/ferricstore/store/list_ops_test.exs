@@ -139,6 +139,46 @@ defmodule Ferricstore.Store.ListOpsTest do
     assert {:error, "disk full"} == ListOps.execute_lmove("src", "dst", store, :left, :right)
   end
 
+  test "LSET returns element write errors" do
+    meta_key = CompoundKey.list_meta_key("list")
+    pos = 0
+
+    store = %{
+      compound_get: fn "list", ^meta_key ->
+        :erlang.term_to_binary({1, -1_000_000_000, 1_000_000_000})
+      end,
+      compound_put: fn "list", <<"L:list", _rest::binary>>, "new", 0 -> {:error, "disk full"} end,
+      compound_scan: fn "list", _prefix ->
+        [{CompoundKey.encode_position(pos), "old"}]
+      end
+    }
+
+    assert {:error, "disk full"} == ListOps.execute("list", store, {:lset, 0, "new"})
+  end
+
+  test "LINSERT returns element write errors before metadata update" do
+    meta_key = CompoundKey.list_meta_key("list")
+
+    store = %{
+      compound_get: fn "list", ^meta_key ->
+        :erlang.term_to_binary({1, -1_000_000_000, 1_000_000_000})
+      end,
+      compound_put: fn
+        "list", <<"L:list", _rest::binary>>, "new", 0 ->
+          {:error, "disk full"}
+
+        "list", <<"LM:list">>, _meta, 0 ->
+          flunk("LINSERT must not update metadata after element write failure")
+      end,
+      compound_scan: fn "list", _prefix ->
+        [{CompoundKey.encode_position(0), "pivot"}]
+      end
+    }
+
+    assert {:error, "disk full"} ==
+             ListOps.execute("list", store, {:linsert, :after, "pivot", "new"})
+  end
+
   test "read-only commands treat corrupt persisted metadata as missing list" do
     store = corrupt_meta_store(<<131, 100, 0, 12, "made_up_atom">>)
 

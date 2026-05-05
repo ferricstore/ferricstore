@@ -312,8 +312,10 @@ defmodule Ferricstore.Store.ListOps do
 
     if norm >= 0 and norm < len do
       {old_pos, _} = sorted_elements(key, store) |> Enum.at(norm)
-      Ops.compound_put(store, key, CompoundKey.list_element(key, old_pos), element, 0)
-      :ok
+
+      store
+      |> Ops.compound_put(key, CompoundKey.list_element(key, old_pos), element, 0)
+      |> write_result()
     else
       {:error, "ERR index out of range"}
     end
@@ -435,16 +437,19 @@ defmodule Ferricstore.Store.ListOps do
               end
           end
 
-        Ops.compound_put(store, key, CompoundKey.list_element(key, new_pos), element, 0)
-
-        write_meta(
-          key,
-          store,
-          {len + 1, min(left_pos, new_pos - @position_step),
-           max(right_pos, new_pos + @position_step)}
-        )
-
-        len + 1
+        with :ok <-
+               store
+               |> Ops.compound_put(key, CompoundKey.list_element(key, new_pos), element, 0)
+               |> write_result(),
+             :ok <-
+               write_meta(
+                 key,
+                 store,
+                 {len + 1, min(left_pos, new_pos - @position_step),
+                  max(right_pos, new_pos + @position_step)}
+               ) do
+          len + 1
+        end
     end
   end
 
