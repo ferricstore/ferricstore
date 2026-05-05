@@ -598,6 +598,44 @@ defmodule Ferricstore.Commands.SetTest do
       assert 2 == Set.handle("SCARD", ["myset"], store)
     end
 
+    test "SPOP with count batches member deletes" do
+      parent = self()
+      type_key = CompoundKey.type_key("myset")
+
+      member_keys = [
+        CompoundKey.set_member("myset", "a"),
+        CompoundKey.set_member("myset", "b"),
+        CompoundKey.set_member("myset", "c")
+      ]
+
+      store = %{
+        compound_get: fn
+          "myset", ^type_key -> "set"
+          "myset", _compound_key -> nil
+        end,
+        compound_scan: fn "myset", _prefix ->
+          [{"a", "1"}, {"b", "1"}, {"c", "1"}]
+        end,
+        compound_batch_delete: fn "myset", compound_keys ->
+          send(parent, {:compound_batch_delete, compound_keys})
+          :ok
+        end,
+        compound_delete: fn "myset", compound_key ->
+          flunk(
+            "SPOP should use compound_batch_delete, got per-member delete #{inspect(compound_key)}"
+          )
+        end,
+        compound_count: fn "myset", _prefix -> 1 end
+      }
+
+      result = Set.handle("SPOP", ["myset", "2"], store)
+      assert length(result) == 2
+      assert_received {:compound_batch_delete, deleted_keys}
+      assert length(deleted_keys) == 2
+      assert Enum.all?(deleted_keys, &(&1 in member_keys))
+      refute_received {:compound_batch_delete, _}
+    end
+
     test "SPOP with count > set size returns all members and empties set" do
       store = MockStore.make()
       Set.handle("SADD", ["myset", "a", "b"], store)

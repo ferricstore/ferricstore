@@ -313,9 +313,15 @@ defmodule Ferricstore.Commands.Set do
         _ ->
           member = Enum.random(members)
           compound_key = CompoundKey.set_member(key, member)
-          Ops.compound_delete(store, key, compound_key)
-          maybe_cleanup_empty_set(key, 1, store)
-          member
+
+          case Ops.compound_batch_delete(store, key, [compound_key]) do
+            :ok ->
+              maybe_cleanup_empty_set(key, 1, store)
+              member
+
+            {:error, _} = err ->
+              err
+          end
       end
     end
   end
@@ -326,19 +332,20 @@ defmodule Ferricstore.Commands.Set do
         {count, ""} when count >= 0 ->
           members = get_members_list(key, store)
           selected = Enum.take_random(members, count)
+          compound_keys = Enum.map(selected, &CompoundKey.set_member(key, &1))
+          removed = length(compound_keys)
 
-          removed =
-            Enum.reduce(selected, 0, fn member, acc ->
-              compound_key = CompoundKey.set_member(key, member)
-              Ops.compound_delete(store, key, compound_key)
-              acc + 1
-            end)
+          case Ops.compound_batch_delete(store, key, compound_keys) do
+            :ok ->
+              if removed > 0 do
+                maybe_cleanup_empty_set(key, removed, store)
+              end
 
-          if removed > 0 do
-            maybe_cleanup_empty_set(key, removed, store)
+              selected
+
+            {:error, _} = err ->
+              err
           end
-
-          selected
 
         {_count, ""} ->
           {:error, "ERR value is not an integer or out of range"}
@@ -780,9 +787,15 @@ defmodule Ferricstore.Commands.Set do
         members ->
           member = Enum.random(members)
           compound_key = CompoundKey.set_member(key, member)
-          Ops.compound_delete(store, key, compound_key)
-          maybe_cleanup_empty_set(key, 1, store)
-          member
+
+          case Ops.compound_batch_delete(store, key, [compound_key]) do
+            :ok ->
+              maybe_cleanup_empty_set(key, 1, store)
+              member
+
+            {:error, _} = err ->
+              err
+          end
       end
     end
   end
@@ -791,19 +804,20 @@ defmodule Ferricstore.Commands.Set do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
       members = get_members_list(key, store)
       selected = Enum.take_random(members, count)
+      compound_keys = Enum.map(selected, &CompoundKey.set_member(key, &1))
+      removed = length(compound_keys)
 
-      removed =
-        Enum.reduce(selected, 0, fn member, acc ->
-          compound_key = CompoundKey.set_member(key, member)
-          Ops.compound_delete(store, key, compound_key)
-          acc + 1
-        end)
+      case Ops.compound_batch_delete(store, key, compound_keys) do
+        :ok ->
+          if removed > 0 do
+            maybe_cleanup_empty_set(key, removed, store)
+          end
 
-      if removed > 0 do
-        maybe_cleanup_empty_set(key, removed, store)
+          selected
+
+        {:error, _} = err ->
+          err
       end
-
-      selected
     end
   end
 

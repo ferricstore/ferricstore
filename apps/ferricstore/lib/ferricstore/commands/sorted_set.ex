@@ -304,20 +304,27 @@ defmodule Ferricstore.Commands.SortedSet do
 
           result =
             Enum.flat_map(to_pop, fn {member, score} ->
-              compound_key = CompoundKey.zset_member(key, member)
-              Ops.compound_delete(store, key, compound_key)
               [member, format_score(score)]
             end)
 
-          if to_pop != [] do
-            prefix = CompoundKey.zset_prefix(key)
+          compound_keys =
+            Enum.map(to_pop, fn {member, _score} -> CompoundKey.zset_member(key, member) end)
 
-            if Ops.compound_count(store, key, prefix) == 0 do
-              TypeRegistry.delete_type(key, store)
-            end
+          case Ops.compound_batch_delete(store, key, compound_keys) do
+            :ok ->
+              if to_pop != [] do
+                prefix = CompoundKey.zset_prefix(key)
+
+                if Ops.compound_count(store, key, prefix) == 0 do
+                  TypeRegistry.delete_type(key, store)
+                end
+              end
+
+              result
+
+            {:error, _} = err ->
+              err
           end
-
-          result
 
         _ ->
           {:error, "ERR value is not an integer or out of range"}
@@ -346,20 +353,27 @@ defmodule Ferricstore.Commands.SortedSet do
 
           result =
             Enum.flat_map(to_pop, fn {member, score} ->
-              compound_key = CompoundKey.zset_member(key, member)
-              Ops.compound_delete(store, key, compound_key)
               [member, format_score(score)]
             end)
 
-          if to_pop != [] do
-            prefix = CompoundKey.zset_prefix(key)
+          compound_keys =
+            Enum.map(to_pop, fn {member, _score} -> CompoundKey.zset_member(key, member) end)
 
-            if Ops.compound_count(store, key, prefix) == 0 do
-              TypeRegistry.delete_type(key, store)
-            end
+          case Ops.compound_batch_delete(store, key, compound_keys) do
+            :ok ->
+              if to_pop != [] do
+                prefix = CompoundKey.zset_prefix(key)
+
+                if Ops.compound_count(store, key, prefix) == 0 do
+                  TypeRegistry.delete_type(key, store)
+                end
+              end
+
+              result
+
+            {:error, _} = err ->
+              err
           end
-
-          result
 
         _ ->
           {:error, "ERR value is not an integer or out of range"}
@@ -945,20 +959,27 @@ defmodule Ferricstore.Commands.SortedSet do
 
       result =
         Enum.flat_map(to_pop, fn {member, score} ->
-          compound_key = CompoundKey.zset_member(key, member)
-          Ops.compound_delete(store, key, compound_key)
           [member, format_score(score)]
         end)
 
-      if to_pop != [] do
-        prefix = CompoundKey.zset_prefix(key)
+      compound_keys =
+        Enum.map(to_pop, fn {member, _score} -> CompoundKey.zset_member(key, member) end)
 
-        if Ops.compound_count(store, key, prefix) == 0 do
-          TypeRegistry.delete_type(key, store)
-        end
+      case Ops.compound_batch_delete(store, key, compound_keys) do
+        :ok ->
+          if to_pop != [] do
+            prefix = CompoundKey.zset_prefix(key)
+
+            if Ops.compound_count(store, key, prefix) == 0 do
+              TypeRegistry.delete_type(key, store)
+            end
+          end
+
+          result
+
+        {:error, _} = err ->
+          err
       end
-
-      result
     end
   end
 

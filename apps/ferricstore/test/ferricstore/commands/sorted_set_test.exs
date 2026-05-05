@@ -580,6 +580,40 @@ defmodule Ferricstore.Commands.SortedSetTest do
       assert Enum.at(result, 2) == "b"
     end
 
+    test "ZPOPMIN with count batches member deletes" do
+      parent = self()
+      type_key = CompoundKey.type_key("zs")
+
+      member_keys = [
+        CompoundKey.zset_member("zs", "a"),
+        CompoundKey.zset_member("zs", "b")
+      ]
+
+      store = %{
+        compound_get: fn
+          "zs", ^type_key -> "zset"
+          "zs", _compound_key -> nil
+        end,
+        compound_scan: fn "zs", _prefix ->
+          [{"b", "2.0"}, {"a", "1.0"}, {"c", "3.0"}]
+        end,
+        compound_batch_delete: fn "zs", compound_keys ->
+          send(parent, {:compound_batch_delete, compound_keys})
+          :ok
+        end,
+        compound_delete: fn "zs", compound_key ->
+          flunk(
+            "ZPOPMIN should use compound_batch_delete, got per-member delete #{inspect(compound_key)}"
+          )
+        end,
+        compound_count: fn "zs", _prefix -> 1 end
+      }
+
+      assert ["a", "1.0", "b", "2.0"] == SortedSet.handle("ZPOPMIN", ["zs", "2"], store)
+      assert_received {:compound_batch_delete, ^member_keys}
+      refute_received {:compound_batch_delete, _}
+    end
+
     test "ZPOPMIN on empty key returns empty list" do
       store = MockStore.make()
       assert [] == SortedSet.handle("ZPOPMIN", ["nonexistent"], store)
@@ -599,6 +633,40 @@ defmodule Ferricstore.Commands.SortedSetTest do
       SortedSet.handle("ZADD", ["zs", "1.0", "a", "3.0", "c"], store)
       SortedSet.handle("ZPOPMAX", ["zs"], store)
       assert nil == SortedSet.handle("ZSCORE", ["zs", "c"], store)
+    end
+
+    test "ZPOPMAX with count batches member deletes" do
+      parent = self()
+      type_key = CompoundKey.type_key("zs")
+
+      member_keys = [
+        CompoundKey.zset_member("zs", "c"),
+        CompoundKey.zset_member("zs", "b")
+      ]
+
+      store = %{
+        compound_get: fn
+          "zs", ^type_key -> "zset"
+          "zs", _compound_key -> nil
+        end,
+        compound_scan: fn "zs", _prefix ->
+          [{"b", "2.0"}, {"a", "1.0"}, {"c", "3.0"}]
+        end,
+        compound_batch_delete: fn "zs", compound_keys ->
+          send(parent, {:compound_batch_delete, compound_keys})
+          :ok
+        end,
+        compound_delete: fn "zs", compound_key ->
+          flunk(
+            "ZPOPMAX should use compound_batch_delete, got per-member delete #{inspect(compound_key)}"
+          )
+        end,
+        compound_count: fn "zs", _prefix -> 1 end
+      }
+
+      assert ["c", "3.0", "b", "2.0"] == SortedSet.handle("ZPOPMAX", ["zs", "2"], store)
+      assert_received {:compound_batch_delete, ^member_keys}
+      refute_received {:compound_batch_delete, _}
     end
   end
 
