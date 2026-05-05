@@ -151,26 +151,24 @@ defmodule Ferricstore.Store.ListOps do
     count = length(sorted)
     values = Enum.map(sorted, fn {_pos, val} -> val end)
 
-    # Delete all old entries
-    Enum.each(sorted, fn {pos, _val} ->
-      Ops.compound_delete(store, key, CompoundKey.list_element(key, pos))
-    end)
-
-    # Re-insert with evenly spaced positions
     new_sorted =
       Enum.with_index(values)
       |> Enum.map(fn {val, idx} ->
         new_pos = idx * @position_step
-        Ops.compound_put(store, key, CompoundKey.list_element(key, new_pos), val, 0)
         {new_pos, val}
       end)
 
-    # Update metadata
+    with :ok <- delete_elements(key, store, sorted),
+         :ok <- put_elements(key, store, new_sorted),
+         :ok <- write_rebalanced_meta(key, store, count, new_sorted) do
+      {:ok, new_sorted}
+    end
+  end
+
+  defp write_rebalanced_meta(key, store, count, new_sorted) do
     {min_pos, _} = hd(new_sorted)
     {max_pos, _} = List.last(new_sorted)
     write_meta(key, store, {count, min_pos - @position_step, max_pos + @position_step})
-
-    new_sorted
   end
 
   defp update_meta_from_remaining(key, store, new_len, remaining) do
@@ -398,46 +396,8 @@ defmodule Ferricstore.Store.ListOps do
         -1
 
       idx ->
-        new_pos =
-          case direction do
-            :before ->
-              if idx == 0 do
-                pos_to_int(elem(hd(sorted), 0)) - @position_step
-              else
-                a = pos_to_int(elem(Enum.at(sorted, idx - 1), 0))
-                b = pos_to_int(elem(Enum.at(sorted, idx), 0))
-                mid = div(a + b, 2)
-
-                if mid == a or mid == b do
-                  rebalanced = rebalance_positions(key, store, sorted)
-                  a2 = pos_to_int(elem(Enum.at(rebalanced, idx - 1), 0))
-                  b2 = pos_to_int(elem(Enum.at(rebalanced, idx), 0))
-                  div(a2 + b2, 2)
-                else
-                  mid
-                end
-              end
-
-            :after ->
-              if idx == length(sorted) - 1 do
-                pos_to_int(elem(List.last(sorted), 0)) + @position_step
-              else
-                a = pos_to_int(elem(Enum.at(sorted, idx), 0))
-                b = pos_to_int(elem(Enum.at(sorted, idx + 1), 0))
-                mid = div(a + b, 2)
-
-                if mid == a or mid == b do
-                  rebalanced = rebalance_positions(key, store, sorted)
-                  a2 = pos_to_int(elem(Enum.at(rebalanced, idx), 0))
-                  b2 = pos_to_int(elem(Enum.at(rebalanced, idx + 1), 0))
-                  div(a2 + b2, 2)
-                else
-                  mid
-                end
-              end
-          end
-
-        with :ok <-
+        with {:ok, new_pos} <- linsert_position(key, store, sorted, direction, idx),
+             :ok <-
                store
                |> Ops.compound_put(key, CompoundKey.list_element(key, new_pos), element, 0)
                |> write_result(),
@@ -491,6 +451,38 @@ defmodule Ferricstore.Store.ListOps do
 
   defp do_execute(key, store, meta, {:rpushx, elems}),
     do: do_execute(key, store, meta, {:rpush, elems})
+
+  defp linsert_position(_key, _store, sorted, :before, 0) do
+    {:ok, pos_to_int(elem(hd(sorted), 0)) - @position_step}
+  end
+
+  defp linsert_position(key, store, sorted, :before, idx) do
+    midpoint_or_rebalance(key, store, sorted, idx - 1, idx)
+  end
+
+  defp linsert_position(_key, _store, sorted, :after, idx) when idx == length(sorted) - 1 do
+    {:ok, pos_to_int(elem(List.last(sorted), 0)) + @position_step}
+  end
+
+  defp linsert_position(key, store, sorted, :after, idx) do
+    midpoint_or_rebalance(key, store, sorted, idx, idx + 1)
+  end
+
+  defp midpoint_or_rebalance(key, store, sorted, left_idx, right_idx) do
+    a = pos_to_int(elem(Enum.at(sorted, left_idx), 0))
+    b = pos_to_int(elem(Enum.at(sorted, right_idx), 0))
+    mid = div(a + b, 2)
+
+    if mid == a or mid == b do
+      with {:ok, rebalanced} <- rebalance_positions(key, store, sorted) do
+        a2 = pos_to_int(elem(Enum.at(rebalanced, left_idx), 0))
+        b2 = pos_to_int(elem(Enum.at(rebalanced, right_idx), 0))
+        {:ok, div(a2 + b2, 2)}
+      end
+    else
+      {:ok, mid}
+    end
+  end
 
   defp do_lpush_new(key, store, elements) do
     reversed = Enum.reverse(elements)

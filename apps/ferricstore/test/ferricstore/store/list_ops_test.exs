@@ -179,6 +179,90 @@ defmodule Ferricstore.Store.ListOpsTest do
              ListOps.execute("list", store, {:linsert, :after, "pivot", "new"})
   end
 
+  test "LINSERT rebalance returns delete errors before rewriting positions" do
+    meta_key = CompoundKey.list_meta_key("list")
+    old_keys = [CompoundKey.list_element("list", 0), CompoundKey.list_element("list", 1)]
+
+    store = %{
+      compound_get: fn "list", ^meta_key -> :erlang.term_to_binary({2, -1, 2}) end,
+      compound_batch_delete: fn "list", ^old_keys -> {:error, "disk full"} end,
+      compound_batch_put: fn "list", _entries ->
+        flunk("LINSERT rebalance must not rewrite positions after delete failure")
+      end,
+      compound_delete: fn "list", compound_key ->
+        flunk("LINSERT rebalance should batch deletes, got #{inspect(compound_key)}")
+      end,
+      compound_put: fn
+        "list", ^meta_key, _meta, 0 ->
+          flunk("LINSERT rebalance must not update metadata after delete failure")
+
+        "list", compound_key, _value, 0 ->
+          flunk(
+            "LINSERT rebalance must not insert after delete failure: #{inspect(compound_key)}"
+          )
+      end,
+      compound_scan: fn "list", _prefix ->
+        [
+          {CompoundKey.encode_position(0), "a"},
+          {CompoundKey.encode_position(1), "b"}
+        ]
+      end
+    }
+
+    assert {:error, "disk full"} ==
+             ListOps.execute("list", store, {:linsert, :after, "a", "x"})
+  end
+
+  test "LINSERT rebalance batches position rewrite before inserting new element" do
+    parent = self()
+    meta_key = CompoundKey.list_meta_key("list")
+    old_keys = [CompoundKey.list_element("list", 0), CompoundKey.list_element("list", 1)]
+
+    store = %{
+      compound_get: fn "list", ^meta_key -> :erlang.term_to_binary({2, -1, 2}) end,
+      compound_batch_delete: fn "list", ^old_keys ->
+        send(parent, {:rebalance_delete, old_keys})
+        :ok
+      end,
+      compound_batch_put: fn "list", entries ->
+        send(parent, {:rebalance_put, entries})
+        :ok
+      end,
+      compound_delete: fn "list", compound_key ->
+        flunk("LINSERT rebalance should batch deletes, got #{inspect(compound_key)}")
+      end,
+      compound_put: fn
+        "list", ^meta_key, meta, 0 when is_binary(meta) ->
+          :ok
+
+        "list", <<"L:list", _rest::binary>>, "x", 0 ->
+          :ok
+
+        "list", compound_key, _value, 0 ->
+          flunk("LINSERT rebalance should batch old element writes, got #{inspect(compound_key)}")
+      end,
+      compound_scan: fn "list", _prefix ->
+        [
+          {CompoundKey.encode_position(0), "a"},
+          {CompoundKey.encode_position(1), "b"}
+        ]
+      end
+    }
+
+    assert 3 == ListOps.execute("list", store, {:linsert, :after, "a", "x"})
+
+    assert_received {:rebalance_delete, ^old_keys}
+    assert_received {:rebalance_put, entries}
+
+    assert [
+             {_, "a", 0},
+             {_, "b", 0}
+           ] = entries
+
+    refute_received {:rebalance_delete, _}
+    refute_received {:rebalance_put, _}
+  end
+
   test "read-only commands treat corrupt persisted metadata as missing list" do
     store = corrupt_meta_store(<<131, 100, 0, 12, "made_up_atom">>)
 
