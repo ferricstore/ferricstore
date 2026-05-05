@@ -94,6 +94,7 @@ defmodule Ferricstore.Store.Shard do
     :active_file_size,
     pending: [],
     pending_count: 0,
+    last_flush_error: nil,
     flush_in_flight: nil,
     write_version: 0,
     sweep_at_ceiling_count: 0,
@@ -1023,7 +1024,11 @@ defmodule Ferricstore.Store.Shard do
   def handle_call(:flush, _from, state) do
     state = await_in_flight(state)
     state = flush_pending_sync(state)
-    {:reply, :ok, state}
+
+    case Map.get(state, :last_flush_error) do
+      nil -> {:reply, :ok, state}
+      reason -> {:reply, {:error, {:flush_failed, reason}}, state}
+    end
   end
 
   # Synchronous expiry sweep — used by tests to trigger a sweep and wait for

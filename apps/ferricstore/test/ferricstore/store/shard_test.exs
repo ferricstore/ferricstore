@@ -63,6 +63,30 @@ defmodule Ferricstore.Store.ShardTest do
     end
   end
 
+  describe "flush" do
+    test "returns an error when pending writes cannot be persisted", %{shard: shard} do
+      missing_dir =
+        Path.join(System.tmp_dir!(), "missing_flush_dir_#{System.unique_integer([:positive])}")
+
+      missing_path = Path.join(missing_dir, "00000.log")
+
+      :sys.replace_state(shard, fn state ->
+        %{
+          state
+          | active_file_path: missing_path,
+            pending: [{"flush_fail", "value", 0}],
+            pending_count: 1
+        }
+      end)
+
+      assert {:error, {:flush_failed, _reason}} = GenServer.call(shard, :flush)
+
+      state = :sys.get_state(shard)
+      assert state.pending_count == 1
+      assert state.pending != []
+    end
+  end
+
   describe "delete" do
     test "delete existing key returns :ok", %{shard: shard} do
       :ok = GenServer.call(shard, {:put, "key", "value", 0})

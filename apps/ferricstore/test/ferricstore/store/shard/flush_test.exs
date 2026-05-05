@@ -40,10 +40,11 @@ defmodule Ferricstore.Store.Shard.FlushTest do
       pending: []
     }
 
-    assert ^state = Flush.flush_pending_sync(state)
+    flushed = Flush.flush_pending_sync(state)
 
     assert :atomics.get(ctx.checkpoint_flags, 1) == 1
     assert DiskPressure.under_pressure?(ctx, 0)
+    assert Map.fetch!(flushed, :last_flush_error) != nil
   end
 
   test "maybe_rotate_file does not publish a new active file when old-file fsync fails" do

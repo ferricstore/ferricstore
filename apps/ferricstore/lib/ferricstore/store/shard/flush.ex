@@ -88,6 +88,7 @@ defmodule Ferricstore.Store.Shard.Flush do
         :ok ->
           :atomics.put(state.instance_ctx.checkpoint_flags, idx + 1, 0)
           Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
+          Map.put(state, :last_flush_error, nil)
 
         {:error, reason} ->
           Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.index)
@@ -95,10 +96,12 @@ defmodule Ferricstore.Store.Shard.Flush do
           Logger.error(
             "Shard #{state.index}: flush_pending_sync fsync failed: #{inspect(reason)} — keeping checkpoint dirty"
           )
-      end
-    end
 
-    state
+          Map.put(state, :last_flush_error, reason)
+      end
+    else
+      state
+    end
   end
 
   def flush_pending_sync(%{pending: pending} = state) do
@@ -124,12 +127,14 @@ defmodule Ferricstore.Store.Shard.Flush do
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)
 
-        state = %{
-          state
-          | pending: [],
-            pending_count: 0,
-            active_file_size: state.active_file_size + written
-        }
+        state =
+          %{
+            state
+            | pending: [],
+              pending_count: 0,
+              active_file_size: state.active_file_size + written
+          }
+          |> Map.put(:last_flush_error, nil)
 
         maybe_notify_fragmentation(state)
 
@@ -140,7 +145,7 @@ defmodule Ferricstore.Store.Shard.Flush do
           "Shard #{state.index}: flush_pending_sync failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries"
         )
 
-        state
+        Map.put(state, :last_flush_error, reason)
     end
   end
 
