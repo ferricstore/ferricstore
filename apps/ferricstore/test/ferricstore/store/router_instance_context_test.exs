@@ -48,7 +48,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     custom_idx = Router.shard_for(ctx, key)
 
     on_exit(fn -> Batcher.reset_pending(custom_idx) end)
-    fill_default_async_pending(custom_idx, key)
+    fill_default_origin_pending(custom_idx, key)
 
     assert :ok = Router.batch_put(ctx, [{key, "custom"}])
     assert "custom" == Router.get(ctx, key)
@@ -60,7 +60,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     custom_idx = Router.shard_for(ctx, key)
 
     on_exit(fn -> Batcher.reset_pending(custom_idx) end)
-    fill_default_async_pending(custom_idx, field_key)
+    fill_default_origin_pending(custom_idx, field_key)
 
     assert :ok = Router.compound_put(ctx, key, field_key, "custom", 0)
     assert "custom" == Router.compound_get(ctx, key, field_key)
@@ -74,7 +74,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert :ok = Router.compound_put(ctx, key, field_key, "before", 0)
 
     on_exit(fn -> Batcher.reset_pending(custom_idx) end)
-    fill_default_async_pending(custom_idx, field_key)
+    fill_default_origin_pending(custom_idx, field_key)
 
     assert :ok = Router.compound_delete(ctx, key, field_key)
     assert nil == Router.compound_get(ctx, key, field_key)
@@ -172,9 +172,9 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     end)
   end
 
-  defp fill_default_async_pending(idx, key) do
+  defp fill_default_origin_pending(idx, key) do
     for _ <- 1..64 do
-      Batcher.__inject_async_pending__(
+      Batcher.__inject_origin_pending__(
         idx,
         make_ref(),
         [{:async, node(), {:put, key, "pending", 0}}],

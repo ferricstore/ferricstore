@@ -3,6 +3,7 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
 
   alias Ferricstore.Commands.Namespace
   alias Ferricstore.NamespaceConfig
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
 
   setup do
@@ -57,6 +58,15 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
   test "router no longer exposes removed local-origin inline write helpers" do
     refute function_exported?(Router, :execute_rmw_inline, 3)
     refute function_exported?(Router, :execute_list_op_inline, 3)
+  end
+
+  test "batcher no longer exposes async-named local-origin write helpers" do
+    refute function_exported?(Batcher, :async_submit, 2)
+    refute function_exported?(Batcher, :async_submit_ordered, 2)
+    refute function_exported?(Batcher, :async_enqueue_ordered, 2)
+    refute function_exported?(Batcher, :async_submit_batch_ordered, 2)
+    refute function_exported?(Batcher, :async_accepting?, 1)
+    refute function_exported?(Batcher, :async_submit_batch, 2)
   end
 
   test "active tests do not call removed async batch APIs" do

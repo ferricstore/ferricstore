@@ -333,7 +333,7 @@ defmodule Ferricstore.Raft.BatcherTest do
       assert_receive {^reply_ref, {:remote_applied_at, ^ra_index, :ok}}, 1_000
     end
 
-    test "flush waits for async raft applies to reach the local state machine" do
+    test "flush waits for origin replay raft applies to reach the local state machine" do
       shard_index = 0
       batcher = Batcher.batcher_name(shard_index)
       %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
@@ -346,7 +346,7 @@ defmodule Ferricstore.Raft.BatcherTest do
       end)
 
       :ok =
-        Batcher.__inject_async_pending__(
+        Batcher.__inject_origin_pending__(
           shard_index,
           corr,
           [{:put, "batcher_async_flush_barrier", "v", 0}],

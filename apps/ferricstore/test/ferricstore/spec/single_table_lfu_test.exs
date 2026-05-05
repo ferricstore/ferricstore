@@ -792,7 +792,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 39: async path writes to single table
     test "39. async write applies to single table" do
-      # Async durability writes go through Router → Batcher.async_submit →
+      # Internal origin replay goes through Router → Batcher.origin_submit →
       # Raft. Verify that after the batch applies, the keydir has the
       # 7-element tuple shape shared with the quorum path.
       Router.put(FerricStore.Instance.get(:default), "async_key", "async_val")

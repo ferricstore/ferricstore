@@ -63,7 +63,7 @@ defmodule Ferricstore.Raft.Batcher do
   correlation reference. Callers are replied to when the `ra_event`
   notification arrives confirming the command was applied.
 
-  The module still has an internal `{prefix, :async_origin}` slot for
+  The module still has an internal `{prefix, :origin_replay}` slot for
   low-level local-origin replication helpers such as release-cursor pokes.
   That path is not namespace durability: it is explicit, internal, and wraps
   commands as `{:async, origin, cmd}` so the state machine can origin-skip
@@ -93,16 +93,16 @@ defmodule Ferricstore.Raft.Batcher do
 
   @default_max_batch_size 50_000
 
-  # Async retry tuning (Option R1 from the rejected-retry design). When Ra
-  # returns :rejected {:not_leader, hint, corr} for an async batch, the
-  # Batcher re-submits to the hinted leader up to @max_async_retries times
+  # Origin retry tuning (Option R1 from the rejected-retry design). When Ra
+  # returns :rejected {:not_leader, hint, corr} for an origin replay batch, the
+  # Batcher re-submits to the hinted leader up to @max_origin_retries times
   # before giving up.
-  @max_async_retries 3
+  @max_origin_retries 3
 
   # Pending entries that don't receive :applied or :rejected within this
   # window are dropped by the periodic sweep. Guards against lost ra_event
   # messages (shouldn't happen, but bounded memory beats unbounded leak).
-  @async_pending_ttl_ms 30_000
+  @origin_pending_ttl_ms 30_000
   # Quorum callers (blocked on :single/:batch) get a longer TTL — their
   # `GenServer.call` default timeout is 5s, but Router's quorum_write uses
   # 10s. Use 30s as a safety net: anything pending longer than 30s means
@@ -111,7 +111,7 @@ defmodule Ferricstore.Raft.Batcher do
 
   # Periodic sweep interval. Tight enough to catch stalls quickly, loose
   # enough not to burn CPU scanning an empty pending map.
-  @async_pending_sweep_ms 10_000
+  @origin_pending_sweep_ms 10_000
 
   @type command ::
           {:put, binary(), binary(), non_neg_integer()}
@@ -161,10 +161,10 @@ defmodule Ferricstore.Raft.Batcher do
 
   @typedoc """
   A slot key identifies a unique batching bucket by namespace prefix and
-  submission mode. Normal writes always use `:quorum`; `:async_origin` is
+  submission mode. Normal writes always use `:quorum`; `:origin_replay` is
   reserved for explicit internal local-origin replication helpers.
   """
-  @type slot_key :: {binary(), :quorum | :async_origin}
+  @type slot_key :: {binary(), :quorum | :origin_replay}
 
   @typedoc """
   A slot holds the accumulated commands and callers for a single namespace
@@ -198,11 +198,11 @@ defmodule Ferricstore.Raft.Batcher do
     # waiting for `last_local_applied >= ra_index`. Drained in order on each
     # `:locally_applied` message.
     local_apply_waiters: [],
-    # Highest async Ra index whose leader-applied event has arrived but that
+    # Highest origin replay Ra index whose leader-applied event has arrived but that
     # this node may not have locally applied yet. Async callers are not blocked
     # on this, but flush/shutdown barriers must wait so local state-machine
     # side effects are caught up before reporting the shard drained.
-    async_local_apply_index: 0
+    origin_local_apply_index: 0
   ]
 
   # ---------------------------------------------------------------------------
@@ -346,73 +346,73 @@ defmodule Ferricstore.Raft.Batcher do
     * `shard_index` -- zero-based shard index
     * `inner_command` -- the raw write command (e.g. `{:put, k, v, exp}`)
   """
-  @spec async_submit(non_neg_integer(), command()) :: :ok
-  def async_submit(shard_index, inner_command) do
-    GenServer.cast(batcher_name(shard_index), {:async_submit, inner_command})
+  @spec origin_submit(non_neg_integer(), command()) :: :ok
+  def origin_submit(shard_index, inner_command) do
+    GenServer.cast(batcher_name(shard_index), {:origin_submit, inner_command})
   end
 
   @doc """
   Enqueues an explicit internal local-origin replication command and waits
   until the Batcher has submitted its local slot to Raft.
   """
-  @spec async_submit_ordered(non_neg_integer(), command()) ::
+  @spec origin_submit_ordered(non_neg_integer(), command()) ::
           :ok | {:error, :overloaded | {:ra_target_down, term()}}
-  def async_submit_ordered(shard_index, inner_command) do
-    GenServer.call(batcher_name(shard_index), {:async_submit_ordered, inner_command}, 5_000)
+  def origin_submit_ordered(shard_index, inner_command) do
+    GenServer.call(batcher_name(shard_index), {:origin_submit_ordered, inner_command}, 5_000)
   end
 
   @doc """
   Enqueues an explicit internal local-origin replication command and returns
   after the local Batcher has accepted it into a slot.
 
-  This is intentionally weaker than `async_submit_ordered/2`: it preserves the
+  This is intentionally weaker than `origin_submit_ordered/2`: it preserves the
   low-latency local-origin helper path where waiting for
   `ra.pipeline_command/4` would dominate command latency. It must not be used
   to reintroduce namespace-local weak writes.
   """
-  @spec async_enqueue_ordered(non_neg_integer(), command()) ::
+  @spec origin_enqueue_ordered(non_neg_integer(), command()) ::
           :ok | {:error, :overloaded | {:ra_target_down, term()}}
-  def async_enqueue_ordered(shard_index, inner_command) do
-    GenServer.call(batcher_name(shard_index), {:async_enqueue_ordered, inner_command}, 5_000)
+  def origin_enqueue_ordered(shard_index, inner_command) do
+    GenServer.call(batcher_name(shard_index), {:origin_enqueue_ordered, inner_command}, 5_000)
   end
 
   @doc """
   Submits multiple explicit internal local-origin replication commands as one
   Raft pipeline batch.
   """
-  @spec async_submit_batch_ordered(non_neg_integer(), [command()]) :: :ok | {:error, :overloaded}
-  def async_submit_batch_ordered(_shard_index, []), do: :ok
+  @spec origin_submit_batch_ordered(non_neg_integer(), [command()]) :: :ok | {:error, :overloaded}
+  def origin_submit_batch_ordered(_shard_index, []), do: :ok
 
-  def async_submit_batch_ordered(shard_index, commands) do
-    GenServer.call(batcher_name(shard_index), {:async_submit_batch_ordered, commands}, 5_000)
+  def origin_submit_batch_ordered(shard_index, commands) do
+    GenServer.call(batcher_name(shard_index), {:origin_submit_batch_ordered, commands}, 5_000)
   end
 
   @doc """
-  Returns whether the local async Batcher can currently accept another
-  shard-local async submission.
+  Returns whether the local origin replay Batcher can currently accept another
+  shard-local origin replay submission.
 
-  Router uses this as a cheap preflight before multi-shard async batches so
+  Router uses this as a cheap preflight before multi-shard origin replay batches so
   an already-overloaded shard does not let earlier shard writes become locally
   visible before the batch returns an overall error. The actual submit still
   performs the authoritative check.
   """
-  @spec async_accepting?(non_neg_integer()) :: boolean()
-  def async_accepting?(shard_index) do
-    GenServer.call(batcher_name(shard_index), :async_accepting?, 5_000)
+  @spec origin_accepting?(non_neg_integer()) :: boolean()
+  def origin_accepting?(shard_index) do
+    GenServer.call(batcher_name(shard_index), :origin_accepting?, 5_000)
   catch
     :exit, _ -> false
   end
 
   @doc """
-  Submits a list of async commands to the batcher in a single cast.
+  Submits a list of origin replay commands to the batcher in a single cast.
 
-  Same semantics as calling `async_submit/2` for each command, but sends
+  Same semantics as calling `origin_submit/2` for each command, but sends
   one GenServer cast instead of N, reducing message passing overhead for
   batched internal submissions.
   """
-  @spec async_submit_batch(non_neg_integer(), [command()]) :: :ok
-  def async_submit_batch(shard_index, commands) do
-    GenServer.cast(batcher_name(shard_index), {:async_submit_batch, commands})
+  @spec origin_submit_batch(non_neg_integer(), [command()]) :: :ok
+  def origin_submit_batch(shard_index, commands) do
+    GenServer.cast(batcher_name(shard_index), {:origin_submit_batch, commands})
   end
 
   @doc """
@@ -606,8 +606,8 @@ defmodule Ferricstore.Raft.Batcher do
       max_batch_size: max_batch_size
     }
 
-    # Kick off the periodic async-pending sweep (TTL-drop lost entries).
-    Process.send_after(self(), :sweep_async_pending, @async_pending_sweep_ms)
+    # Kick off the periodic origin-pending sweep (TTL-drop lost entries).
+    Process.send_after(self(), :sweep_origin_pending, @origin_pending_sweep_ms)
 
     {:ok, state}
   end
@@ -621,42 +621,42 @@ defmodule Ferricstore.Raft.Batcher do
     enqueue_write(command, remote_origin_from(origin_node, from), state)
   end
 
-  def handle_call({:async_submit_ordered, command}, from, state) do
+  def handle_call({:origin_submit_ordered, command}, from, state) do
     if pending_full?(state) do
-      emit_async_submit_overloaded(state)
+      emit_origin_submit_overloaded(state)
       {:reply, {:error, :overloaded}, state}
     else
-      enqueue_async_submit_under_capacity(command, state, from)
+      enqueue_origin_submit_under_capacity(command, state, from)
     end
   end
 
-  def handle_call({:async_enqueue_ordered, command}, _from, state) do
+  def handle_call({:origin_enqueue_ordered, command}, _from, state) do
     cond do
       pending_full?(state) ->
-        emit_async_submit_overloaded(state)
+        emit_origin_submit_overloaded(state)
         {:reply, {:error, :overloaded}, state}
 
       not local_pipeline_target_alive?(state.shard_id) ->
         error = {:error, {:ra_target_down, state.shard_id}}
-        emit_async_submit_failed(state, 1, error)
+        emit_origin_submit_failed(state, 1, error)
         {:reply, error, state}
 
       true ->
-        {:noreply, new_state} = enqueue_async_submit_under_capacity(command, state)
+        {:noreply, new_state} = enqueue_origin_submit_under_capacity(command, state)
         {:reply, :ok, new_state}
     end
   end
 
-  def handle_call({:async_submit_batch_ordered, commands}, from, state) do
+  def handle_call({:origin_submit_batch_ordered, commands}, from, state) do
     if pending_full?(state) do
-      emit_async_submit_overloaded(state)
+      emit_origin_submit_overloaded(state)
       {:reply, {:error, :overloaded}, state}
     else
-      {:noreply, submit_async_origin(state, commands, [from])}
+      {:noreply, submit_origin_replay(state, commands, [from])}
     end
   end
 
-  def handle_call(:async_accepting?, _from, state) do
+  def handle_call(:origin_accepting?, _from, state) do
     {:reply, not pending_full?(state), state}
   end
 
@@ -686,8 +686,8 @@ defmodule Ferricstore.Raft.Batcher do
 
   # Test-only hooks. See the __-prefixed public functions at the end of
   # the module for the corresponding API.
-  def handle_call({:__inject_async_pending__, corr, batch, retry_count, mono}, _from, state) do
-    entry = {[], :async_no_reply, batch, retry_count, mono}
+  def handle_call({:__inject_origin_pending__, corr, batch, retry_count, mono}, _from, state) do
+    entry = {[], :origin_no_reply, batch, retry_count, mono}
     {:reply, :ok, %{state | pending: Map.put(state.pending, corr, entry)}}
   end
 
@@ -697,10 +697,10 @@ defmodule Ferricstore.Raft.Batcher do
     {:reply, :ok, %{state | pending: Map.put(state.pending, corr, entry)}}
   end
 
-  def handle_call(:__latest_async_corr__, _from, state) do
+  def handle_call(:__latest_origin_corr__, _from, state) do
     latest =
       Enum.reduce(state.pending, {nil, 0}, fn
-        {corr, {_froms, :async_no_reply, _batch, _retry, mono}}, {_best_corr, best_mono}
+        {corr, {_froms, :origin_no_reply, _batch, _retry, mono}}, {_best_corr, best_mono}
         when mono > best_mono ->
           {corr, mono}
 
@@ -716,7 +716,7 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   def handle_call(:__sweep_pending_now__, _from, state) do
-    {:reply, :ok, sweep_async_pending(state)}
+    {:reply, :ok, sweep_origin_pending(state)}
   end
 
   # Test-only: force-clear all pending correlations and flush waiters.
@@ -745,7 +745,7 @@ defmodule Ferricstore.Raft.Batcher do
         | pending: %{},
           flush_waiters: [],
           local_apply_waiters: [],
-          async_local_apply_index: state.last_local_applied
+          origin_local_apply_index: state.last_local_applied
       }
       |> emit_local_apply_waiters()
 
@@ -757,13 +757,13 @@ defmodule Ferricstore.Raft.Batcher do
     enqueue_write(command, reply_to, state)
   end
 
-  def handle_cast({:async_submit, inner_command}, state) do
-    enqueue_async_submit(inner_command, state)
+  def handle_cast({:origin_submit, inner_command}, state) do
+    enqueue_origin_submit(inner_command, state)
   end
 
-  def handle_cast({:async_submit_batch, commands}, state) do
+  def handle_cast({:origin_submit_batch, commands}, state) do
     Enum.reduce(commands, {:noreply, state}, fn cmd, {:noreply, st} ->
-      enqueue_async_submit(cmd, st)
+      enqueue_origin_submit(cmd, st)
     end)
   end
 
@@ -832,11 +832,11 @@ defmodule Ferricstore.Raft.Batcher do
             acc
 
           # Async entries: no callers to reply to. Just track and clear.
-          {{_froms, :async_no_reply}, new_pending} ->
-            track_async_local_apply(%{acc | pending: new_pending}, ra_index)
+          {{_froms, :origin_no_reply}, new_pending} ->
+            track_origin_local_apply(%{acc | pending: new_pending}, ra_index)
 
-          {{_froms, :async_no_reply, _batch, _retry, _mono}, new_pending} ->
-            track_async_local_apply(%{acc | pending: new_pending}, ra_index)
+          {{_froms, :origin_no_reply, _batch, _retry, _mono}, new_pending} ->
+            track_origin_local_apply(%{acc | pending: new_pending}, ra_index)
 
           {{froms, :single, _mono}, new_pending} ->
             acc2 = %{acc | pending: new_pending}
@@ -867,8 +867,8 @@ defmodule Ferricstore.Raft.Batcher do
     {:noreply, new_state}
   end
 
-  # Handle rejected commands (not_leader). For async entries we re-submit
-  # to the hinted leader up to @max_async_retries times before dropping.
+  # Handle rejected commands (not_leader). For origin replay entries we re-submit
+  # to the hinted leader up to @max_origin_retries times before dropping.
   # For quorum entries we reply :error to the blocked caller so the
   # application can retry itself.
   def handle_info({:ra_event, _from_id, {:rejected, {not_leader, maybe_leader, corr}}}, state) do
@@ -876,8 +876,8 @@ defmodule Ferricstore.Raft.Batcher do
       {nil, _pending} ->
         {:noreply, state}
 
-      # Retry-aware async entry. Has the original batch + retry_count.
-      {{_froms, :async_no_reply, batch, retry_count, _mono}, new_pending} ->
+      # Retry-aware origin replay entry. Has the original batch + retry_count.
+      {{_froms, :origin_no_reply, batch, retry_count, _mono}, new_pending} ->
         state_without = %{state | pending: new_pending}
 
         target =
@@ -887,23 +887,23 @@ defmodule Ferricstore.Raft.Batcher do
           end
 
         new_state =
-          if retry_count < @max_async_retries do
+          if retry_count < @max_origin_retries do
             :telemetry.execute(
-              [:ferricstore, :batcher, :async_retry],
+              [:ferricstore, :batcher, :origin_retry],
               %{retry_count: retry_count + 1, batch_size: length(batch)},
               %{shard_index: state.shard_index, target: inspect(target)}
             )
 
-            submit_async_with_retry(state_without, batch, target, retry_count + 1)
+            submit_origin_with_retry(state_without, batch, target, retry_count + 1)
           else
             :telemetry.execute(
-              [:ferricstore, :batcher, :async_dropped],
+              [:ferricstore, :batcher, :origin_dropped],
               %{batch_size: length(batch)},
               %{shard_index: state.shard_index, reason: :max_retries}
             )
 
             Logger.warning(
-              "Batcher shard=#{state.shard_index}: async batch of #{length(batch)} commands dropped after #{@max_async_retries} retries"
+              "Batcher shard=#{state.shard_index}: origin replay batch of #{length(batch)} commands dropped after #{@max_origin_retries} retries"
             )
 
             state_without
@@ -911,8 +911,8 @@ defmodule Ferricstore.Raft.Batcher do
 
         {:noreply, maybe_reply_flush_waiters(new_state)}
 
-      # Legacy async shape without retry info — drop silently.
-      {{_froms, :async_no_reply}, new_pending} ->
+      # Legacy origin shape without retry info — drop silently.
+      {{_froms, :origin_no_reply}, new_pending} ->
         {:noreply, maybe_reply_flush_waiters(%{state | pending: new_pending})}
 
       # Quorum entry — local server isn't leader. Reply :not_leader so
@@ -938,11 +938,11 @@ defmodule Ferricstore.Raft.Batcher do
 
   # Periodic sweep of pending entries whose :applied or :rejected never
   # arrived (bounds memory against lost ra_events / pathological cluster
-  # states). Only affects the retry-aware async entries; everything else
+  # states). Only affects the retry-aware origin replay entries; everything else
   # is either still in flight or will be resolved when the ra_event arrives.
-  def handle_info(:sweep_async_pending, state) do
-    new_state = sweep_async_pending(state)
-    Process.send_after(self(), :sweep_async_pending, @async_pending_sweep_ms)
+  def handle_info(:sweep_origin_pending, state) do
+    new_state = sweep_origin_pending(state)
+    Process.send_after(self(), :sweep_origin_pending, @origin_pending_sweep_ms)
     {:noreply, new_state}
   end
 
@@ -992,11 +992,11 @@ defmodule Ferricstore.Raft.Batcher do
     enqueue_local_apply_waiter(state, ra_index, kind, froms, result)
   end
 
-  defp track_async_local_apply(state, ra_index) when is_integer(ra_index) and ra_index > 0 do
-    %{state | async_local_apply_index: max(state.async_local_apply_index, ra_index)}
+  defp track_origin_local_apply(state, ra_index) when is_integer(ra_index) and ra_index > 0 do
+    %{state | origin_local_apply_index: max(state.origin_local_apply_index, ra_index)}
   end
 
-  defp track_async_local_apply(state, _ra_index), do: state
+  defp track_origin_local_apply(state, _ra_index), do: state
 
   # When the caller is on a different node, it was forwarded by
   # Router.forward_to_leader. Send the result wrapped with the ra_index so
@@ -1118,7 +1118,7 @@ defmodule Ferricstore.Raft.Batcher do
     # entries (retry-aware 5-tuple or legacy 3-tuple) have no froms to
     # reply to — Router already got :ok.
     Enum.each(state.pending, fn
-      {_corr, {_froms, :async_no_reply, _batch, _retry, _mono}} ->
+      {_corr, {_froms, :origin_no_reply, _batch, _retry, _mono}} ->
         :ok
 
       {_corr, {froms, _kind, _mono}} ->
@@ -1346,11 +1346,11 @@ defmodule Ferricstore.Raft.Batcher do
 
         new_state =
           case write_path do
-            :async_origin ->
+            :origin_replay ->
               # Explicit internal local-origin helper. Wrap each command as
               # {:async, origin, inner} so state machine can origin-skip
               # effects that were already applied locally.
-              submit_async_origin(state, batch, froms)
+              submit_origin_replay(state, batch, froms)
 
             :quorum ->
               pipeline_submit(state, batch, froms)
@@ -1405,22 +1405,22 @@ defmodule Ferricstore.Raft.Batcher do
     track_or_reject_quorum_submit(state, corr, froms, :batch, submit_result)
   end
 
-  # Flush path for commands accumulated via Batcher.async_submit (called by
-  # Router.async_write_*). Router has already persisted locally (ETS + Bitcask
-  # for big values) before calling async_submit. Commands are wrapped as
-  # `{:async, inner}` so the state machine can origin-skip on the node that
-  # already has the ETS entry. Ordered callers are replied after pipeline
-  # submission; fire-and-forget callers have no reply.
+  # Flush path for commands accumulated via Batcher.origin_submit. The caller
+  # has already performed the local side effect before calling origin_submit.
+  # Commands are wrapped as `{:async, origin, inner}` because that is the
+  # state-machine replay tag; it is not a client-visible durability mode.
+  # Ordered callers are replied after pipeline submission; fire-and-forget
+  # callers have no reply.
   #
-  # Tracks the correlation in `pending` with `:async_no_reply` so that
-  # Batcher.flush waiters can observe when all in-flight async commands have
+  # Tracks the correlation in `pending` with `:origin_no_reply` so that
+  # Batcher.flush waiters can observe when all in-flight origin replay commands have
   # applied to the state machine. The stored tuple carries the already-
   # wrapped batch + retry_count + submission timestamp so that the
   # :rejected handler can re-submit to a hinted leader and the periodic
   # sweep can drop stalled entries.
-  defp submit_async_origin(state, batch, submit_froms) do
+  defp submit_origin_replay(state, batch, submit_froms) do
     :telemetry.execute(
-      [:ferricstore, :batcher, :async_flush],
+      [:ferricstore, :batcher, :origin_flush],
       %{batch_size: length(batch)},
       %{shard_index: state.shard_index, origin: true}
     )
@@ -1433,17 +1433,17 @@ defmodule Ferricstore.Raft.Batcher do
     # follower as the origin and skips. Origin tagging is deterministic.
     origin = node()
     wrapped = Enum.map(batch, fn cmd -> {:async, origin, cmd} end)
-    submit_async_with_retry(state, wrapped, state.shard_id, 0, submit_froms)
+    submit_origin_with_retry(state, wrapped, state.shard_id, 0, submit_froms)
   end
 
-  # Shared helper for initial async submission and retries after :rejected.
+  # Shared helper for initial origin replay submission and retries after :rejected.
   # `wrapped_batch` is the already-prepared payload (with or without the
-  # {:async, ...} wrapper — caller's choice, not interpreted here). We
+  # {:async, ...} replay wrapper — caller's choice, not interpreted here). We
   # serialize once and hand to Ra via pipeline_command on `target`, then
   # track the correlation so :rejected can re-submit and :applied can clean
   # up. `retry_count` is the number of retries already attempted; starts
   # at 0 for the first submission.
-  defp submit_async_with_retry(state, wrapped_batch, target, retry_count, submit_froms \\ []) do
+  defp submit_origin_with_retry(state, wrapped_batch, target, retry_count, submit_froms \\ []) do
     corr = make_ref()
     serialized = CommandClock.to_ttb({:batch, wrapped_batch})
     submit_result = pipeline_command(target, serialized, corr, :normal)
@@ -1451,19 +1451,19 @@ defmodule Ferricstore.Raft.Batcher do
     if pipeline_submit_status(submit_result) == :ok do
       reply_all_froms(submit_froms, :ok)
 
-      entry = {[], :async_no_reply, wrapped_batch, retry_count, System.monotonic_time()}
+      entry = {[], :origin_no_reply, wrapped_batch, retry_count, System.monotonic_time()}
       %{state | pending: Map.put(state.pending, corr, entry)}
     else
       reply_all_froms(submit_froms, normalize_pipeline_error(submit_result))
 
       :telemetry.execute(
-        [:ferricstore, :batcher, :async_dropped],
+        [:ferricstore, :batcher, :origin_dropped],
         %{batch_size: length(wrapped_batch)},
         %{shard_index: state.shard_index, reason: submit_result}
       )
 
       Logger.warning(
-        "Batcher shard=#{state.shard_index}: async batch of #{length(wrapped_batch)} commands not submitted to Raft: #{inspect(submit_result)}"
+        "Batcher shard=#{state.shard_index}: origin replay batch of #{length(wrapped_batch)} commands not submitted to Raft: #{inspect(submit_result)}"
       )
 
       maybe_reply_flush_waiters(state)
@@ -1550,55 +1550,55 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
-  # Enqueue an async_submit cast. No `from` to track for fire-and-forget calls.
-  defp enqueue_async_submit(command, state) do
+  # Enqueue an origin_submit cast. No `from` to track for fire-and-forget calls.
+  defp enqueue_origin_submit(command, state) do
     if pending_full?(state) do
-      emit_async_submit_overloaded(state)
+      emit_origin_submit_overloaded(state)
       {:noreply, state}
     else
-      enqueue_async_submit_under_capacity(command, state)
+      enqueue_origin_submit_under_capacity(command, state)
     end
   end
 
-  defp emit_async_submit_overloaded(state) do
+  defp emit_origin_submit_overloaded(state) do
     :telemetry.execute(
-      [:ferricstore, :batcher, :async_dropped],
+      [:ferricstore, :batcher, :origin_dropped],
       %{batch_size: 1},
       %{shard_index: state.shard_index, reason: :overloaded}
     )
 
     Logger.warning(
-      "Batcher shard=#{state.shard_index}: async command not enqueued because pending is full"
+      "Batcher shard=#{state.shard_index}: origin replay command not enqueued because pending is full"
     )
   end
 
-  defp emit_async_submit_failed(state, batch_size, reason) do
+  defp emit_origin_submit_failed(state, batch_size, reason) do
     :telemetry.execute(
-      [:ferricstore, :batcher, :async_dropped],
+      [:ferricstore, :batcher, :origin_dropped],
       %{batch_size: batch_size},
       %{shard_index: state.shard_index, reason: reason}
     )
 
     Logger.warning(
-      "Batcher shard=#{state.shard_index}: async command not enqueued because Raft target is unavailable: #{inspect(reason)}"
+      "Batcher shard=#{state.shard_index}: origin replay command not enqueued because Raft target is unavailable: #{inspect(reason)}"
     )
   end
 
-  defp enqueue_async_submit_under_capacity(command, state, from \\ nil) do
+  defp enqueue_origin_submit_under_capacity(command, state, from \\ nil) do
     prefix = extract_prefix(command)
     {window_ms, state} = lookup_ns_config(prefix, state)
     # Dedicated internal slot: commands here will be wrapped as
     # {:async, origin, inner} during flush so the state machine can origin-skip
-    # effects that were already applied locally. This is not namespace async
-    # durability.
-    slot_key = {prefix, :async_origin}
+    # effects that were already applied locally. This is not a namespace
+    # durability mode.
+    slot_key = {prefix, :origin_replay}
 
     slot = Map.get(state.slots, slot_key, new_slot(window_ms))
 
     updated_slot = %{
       slot
       | cmds: [command | slot.cmds],
-        froms: maybe_add_async_submit_from(slot.froms, from),
+        froms: maybe_add_origin_submit_from(slot.froms, from),
         window_ms: window_ms,
         count: Map.get(slot, :count, 0) + 1
     }
@@ -1620,8 +1620,8 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
-  defp maybe_add_async_submit_from(froms, nil), do: froms
-  defp maybe_add_async_submit_from(froms, from), do: [from | froms]
+  defp maybe_add_origin_submit_from(froms, nil), do: froms
+  defp maybe_add_origin_submit_from(froms, from), do: [from | froms]
 
   defp pending_full?(state), do: map_size(state.pending) >= @max_pending
 
@@ -1642,18 +1642,18 @@ defmodule Ferricstore.Raft.Batcher do
          pending: pending,
          local_apply_waiters: lwaiters,
          last_local_applied: last_local_applied,
-         async_local_apply_index: async_local_apply_index
+         origin_local_apply_index: origin_local_apply_index
        }) do
-    map_size(pending) == 0 and lwaiters == [] and last_local_applied >= async_local_apply_index
+    map_size(pending) == 0 and lwaiters == [] and last_local_applied >= origin_local_apply_index
   end
 
   # Drop pending entries whose submission timestamp is older than the TTL.
   #
   # Two classes of entries expire:
   #
-  #   * `:async_no_reply` (retry-aware) — silently drop; caller already
+  #   * `:origin_no_reply` (retry-aware) — silently drop; caller already
   #     got `:ok` when the command was enqueued. Emits
-  #     `[:ferricstore, :batcher, :async_dropped]` telemetry.
+  #     `[:ferricstore, :batcher, :origin_dropped]` telemetry.
   #
   #   * `:single` / `:batch` (quorum callers) — reply with an unknown-outcome
   #     timeout error to every blocked `from` so they unblock, then drop. Emits
@@ -1662,32 +1662,32 @@ defmodule Ferricstore.Raft.Batcher do
   #     crash: without it, a caller blocked on `GenServer.call(..., :flush)`
   #     or on a `Batcher.write/2` would hang until its own `GenServer.call`
   #     timeout, and flush_waiters could hang indefinitely.
-  @spec sweep_async_pending(%__MODULE__{}) :: %__MODULE__{}
-  defp sweep_async_pending(state) do
-    ttl_native = System.convert_time_unit(@async_pending_ttl_ms, :millisecond, :native)
+  @spec sweep_origin_pending(%__MODULE__{}) :: %__MODULE__{}
+  defp sweep_origin_pending(state) do
+    ttl_native = System.convert_time_unit(@origin_pending_ttl_ms, :millisecond, :native)
     quorum_ttl_native = System.convert_time_unit(@quorum_pending_ttl_ms, :millisecond, :native)
     now = System.monotonic_time()
-    async_cutoff = now - ttl_native
+    origin_cutoff = now - ttl_native
     quorum_cutoff = now - quorum_ttl_native
 
     {expired, kept} =
       Enum.split_with(state.pending, fn
-        {_corr, {_froms, :async_no_reply, _batch, _retry, mono}} -> mono < async_cutoff
+        {_corr, {_froms, :origin_no_reply, _batch, _retry, mono}} -> mono < origin_cutoff
         {_corr, {_froms, :single, mono}} -> mono < quorum_cutoff
         {_corr, {_froms, :batch, mono}} -> mono < quorum_cutoff
         _ -> false
       end)
 
     Enum.each(expired, fn
-      {_corr, {_froms, :async_no_reply, batch, _retry, _mono}} ->
+      {_corr, {_froms, :origin_no_reply, batch, _retry, _mono}} ->
         :telemetry.execute(
-          [:ferricstore, :batcher, :async_dropped],
+          [:ferricstore, :batcher, :origin_dropped],
           %{batch_size: length(batch)},
           %{shard_index: state.shard_index, reason: :ttl}
         )
 
         Logger.warning(
-          "Batcher shard=#{state.shard_index}: async batch of #{length(batch)} commands dropped after #{@async_pending_ttl_ms}ms TTL (ra_event lost)"
+          "Batcher shard=#{state.shard_index}: origin replay batch of #{length(batch)} commands dropped after #{@origin_pending_ttl_ms}ms TTL (ra_event lost)"
         )
 
       {_corr, {froms, kind, _mono}} when kind in [:single, :batch] ->
@@ -1799,34 +1799,34 @@ defmodule Ferricstore.Raft.Batcher do
   # ---------------------------------------------------------------------------
   # Test-only hooks
   #
-  # These functions exist to drive the async retry flow from tests without
+  # These functions exist to drive the origin retry flow from tests without
   # needing a live Ra cluster to produce :rejected events. They're public
   # but leading-underscore-flagged to discourage non-test callers. Nothing
   # in `lib/` depends on them.
   # ---------------------------------------------------------------------------
 
   @doc false
-  @spec __inject_async_pending__(non_neg_integer(), reference(), [tuple()], non_neg_integer()) ::
+  @spec __inject_origin_pending__(non_neg_integer(), reference(), [tuple()], non_neg_integer()) ::
           :ok
-  def __inject_async_pending__(shard_index, corr, batch, retry_count) do
+  def __inject_origin_pending__(shard_index, corr, batch, retry_count) do
     GenServer.call(
       batcher_name(shard_index),
-      {:__inject_async_pending__, corr, batch, retry_count, System.monotonic_time()}
+      {:__inject_origin_pending__, corr, batch, retry_count, System.monotonic_time()}
     )
   end
 
   @doc false
-  @spec __inject_async_pending_at__(
+  @spec __inject_origin_pending_at__(
           non_neg_integer(),
           reference(),
           [tuple()],
           non_neg_integer(),
           integer()
         ) :: :ok
-  def __inject_async_pending_at__(shard_index, corr, batch, retry_count, submitted_mono) do
+  def __inject_origin_pending_at__(shard_index, corr, batch, retry_count, submitted_mono) do
     GenServer.call(
       batcher_name(shard_index),
-      {:__inject_async_pending__, corr, batch, retry_count, submitted_mono}
+      {:__inject_origin_pending__, corr, batch, retry_count, submitted_mono}
     )
   end
 
@@ -1846,9 +1846,9 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc false
-  @spec __latest_async_corr__(non_neg_integer()) :: reference() | nil
-  def __latest_async_corr__(shard_index) do
-    GenServer.call(batcher_name(shard_index), :__latest_async_corr__)
+  @spec __latest_origin_corr__(non_neg_integer()) :: reference() | nil
+  def __latest_origin_corr__(shard_index) do
+    GenServer.call(batcher_name(shard_index), :__latest_origin_corr__)
   end
 
   @doc false

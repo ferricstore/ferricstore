@@ -294,11 +294,11 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       assert "root_val" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
-    test "ordered async submit spec documents Ra target-down errors" do
+    test "origin ordered submit spec documents Ra target-down errors" do
       batcher_path = Path.expand("../../../lib/ferricstore/raft/batcher.ex", __DIR__)
       source = File.read!(batcher_path)
-      [_prefix, spec_and_def] = String.split(source, "@spec async_submit_ordered", parts: 2)
-      [spec, _def_and_rest] = String.split(spec_and_def, "def async_submit_ordered", parts: 2)
+      [_prefix, spec_and_def] = String.split(source, "@spec origin_submit_ordered", parts: 2)
+      [spec, _def_and_rest] = String.split(spec_and_def, "def origin_submit_ordered", parts: 2)
 
       # This call waits for Ra submission, so callers can see a local target-down
       # error instead of a slot-only :ok. Keep the public contract in sync with
@@ -306,11 +306,12 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       assert spec =~ ":ra_target_down"
     end
 
-    test "ordered async submit returns pipeline errors instead of slot-only success" do
+    test "origin ordered submit returns pipeline errors instead of slot-only success" do
       shard = 90_000 + :rand.uniform(9_999)
       name = Batcher.batcher_name(shard)
 
-      {:ok, pid} = Batcher.start_link(shard_id: :missing_ordered_async_target, shard_index: shard)
+      {:ok, pid} =
+        Batcher.start_link(shard_id: :missing_origin_ordered_target, shard_index: shard)
 
       on_exit(fn ->
         try do
@@ -320,17 +321,21 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
         end
       end)
 
-      assert {:error, {:ra_target_down, :missing_ordered_async_target}} =
-               Batcher.async_submit_ordered(shard, {:put, pkey("ordered_async", "down"), "v", 0})
+      assert {:error, {:ra_target_down, :missing_origin_ordered_target}} =
+               Batcher.origin_submit_ordered(
+                 shard,
+                 {:put, pkey("origin_ordered", "down"), "v", 0}
+               )
 
       assert Process.whereis(name) == pid
     end
 
-    test "ordered async enqueue rejects known-down local Ra targets before reporting success" do
+    test "origin ordered enqueue rejects known-down local Ra targets before reporting success" do
       shard = 100_000 + :rand.uniform(9_999)
       name = Batcher.batcher_name(shard)
 
-      {:ok, pid} = Batcher.start_link(shard_id: :missing_async_enqueue_target, shard_index: shard)
+      {:ok, pid} =
+        Batcher.start_link(shard_id: :missing_origin_enqueue_target, shard_index: shard)
 
       on_exit(fn ->
         try do
@@ -340,10 +345,10 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
         end
       end)
 
-      assert {:error, {:ra_target_down, :missing_async_enqueue_target}} =
-               Batcher.async_enqueue_ordered(
+      assert {:error, {:ra_target_down, :missing_origin_enqueue_target}} =
+               Batcher.origin_enqueue_ordered(
                  shard,
-                 {:put, pkey("ordered_async", "enqueue_down"), "v", 0}
+                 {:put, pkey("origin_ordered", "enqueue_down"), "v", 0}
                )
 
       assert Process.whereis(name) == pid

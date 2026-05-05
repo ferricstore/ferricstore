@@ -34,7 +34,7 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
     for i <- 1..count do
       corr = make_ref()
       batch = [{:put, "edge:pending:#{idx}:#{i}", "v", 0}]
-      Batcher.__inject_async_pending__(idx, corr, batch, 0)
+      Batcher.__inject_origin_pending__(idx, corr, batch, 0)
     end
   end
 
@@ -263,7 +263,7 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
   # ---------------------------------------------------------------------------
 
   describe "flush with mixed pending" do
-    test "flush waits for both async and quorum in-flight commands" do
+    test "flush waits for both origin replay and quorum in-flight commands" do
       k = ukey("flush_mixed")
       shard_index = Router.shard_for(ctx(), k)
 
@@ -375,13 +375,13 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
       end
     end
 
-    test "async_submit emits dropped telemetry when pending is full", %{idx: idx} do
+    test "origin_submit emits dropped telemetry when pending is full", %{idx: idx} do
       handler = {:edge_backpressure, self(), make_ref()}
 
       :ok =
         :telemetry.attach(
           handler,
-          [:ferricstore, :batcher, :async_dropped],
+          [:ferricstore, :batcher, :origin_dropped],
           fn event, measurements, metadata, pid ->
             send(pid, {:telemetry, event, measurements, metadata})
           end,
@@ -389,11 +389,11 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
         )
 
       try do
-        key = same_shard_key(idx, "async_overload")
+        key = same_shard_key(idx, "origin_overload")
 
-        :ok = Batcher.async_submit(idx, {:put, key, "v", 0})
+        :ok = Batcher.origin_submit(idx, {:put, key, "v", 0})
 
-        assert_receive {:telemetry, [:ferricstore, :batcher, :async_dropped], %{batch_size: 1},
+        assert_receive {:telemetry, [:ferricstore, :batcher, :origin_dropped], %{batch_size: 1},
                         %{reason: :overloaded}},
                        1_000
       after
@@ -411,11 +411,11 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
       assert :ok == Batcher.reset_pending(0)
     end
 
-    test "reset_pending clears injected async entries" do
+    test "reset_pending clears injected origin replay entries" do
       idx = 0
       corr = make_ref()
       batch = [{:put, "edge:fake_reset", "v", 0}]
-      Batcher.__inject_async_pending__(idx, corr, batch, 0)
+      Batcher.__inject_origin_pending__(idx, corr, batch, 0)
 
       assert Batcher.__has_pending__(idx, corr)
 
@@ -426,7 +426,7 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Sweep clears stale async entries (quorum sweep tested via async_retry_test)
+  # Sweep clears stale origin replay entries (quorum sweep tested via async_retry_test)
   # ---------------------------------------------------------------------------
 
   describe "sweep clears stale entries" do
@@ -435,15 +435,15 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
       :ok = Batcher.__sweep_pending_now__(1)
     end
 
-    test "sweep removes old async entry but keeps fresh one" do
+    test "sweep removes old origin replay entry but keeps fresh one" do
       idx = 0
       old_corr = make_ref()
       fresh_corr = make_ref()
       batch = [{:put, "edge:sweep_test", "v", 0}]
 
       old_mono = System.monotonic_time() - System.convert_time_unit(60_000, :millisecond, :native)
-      Batcher.__inject_async_pending_at__(idx, old_corr, batch, 0, old_mono)
-      Batcher.__inject_async_pending__(idx, fresh_corr, batch, 0)
+      Batcher.__inject_origin_pending_at__(idx, old_corr, batch, 0, old_mono)
+      Batcher.__inject_origin_pending__(idx, fresh_corr, batch, 0)
 
       assert Batcher.__has_pending__(idx, old_corr)
       assert Batcher.__has_pending__(idx, fresh_corr)

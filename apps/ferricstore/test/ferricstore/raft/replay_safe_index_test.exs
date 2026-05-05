@@ -88,7 +88,7 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
       )
 
     assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 321)
-    assert_receive {:"$gen_cast", {:async_submit, {:release_cursor_poke, 321}}}, 1_000
+    assert_receive {:"$gen_cast", {:origin_submit, {:release_cursor_poke, 321}}}, 1_000
     assert ReplaySafeIndex.read(dir) == 321
 
     GenServer.stop(writer)
@@ -131,15 +131,15 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
     assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 101)
     assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 150)
 
-    assert_receive {:"$gen_cast", {:async_submit, {:release_cursor_poke, 150}}}, 1_000
+    assert_receive {:"$gen_cast", {:origin_submit, {:release_cursor_poke, 150}}}, 1_000
 
     assert_receive {:persist_event, [:ferricstore, :raft, :replay_safe_index, :persist],
                     %{index: 150, requested_index: 150, durable_index: 150, lag: 0},
                     %{status: :ok, shard_index: ^shard_index}},
                    1_000
 
-    refute_receive {:"$gen_cast", {:async_submit, {:release_cursor_poke, 100}}}, 50
-    refute_receive {:"$gen_cast", {:async_submit, {:release_cursor_poke, 101}}}, 50
+    refute_receive {:"$gen_cast", {:origin_submit, {:release_cursor_poke, 100}}}, 50
+    refute_receive {:"$gen_cast", {:origin_submit, {:release_cursor_poke, 101}}}, 50
     assert ReplaySafeIndex.read(dir) == 150
 
     GenServer.stop(writer)
@@ -265,7 +265,8 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
   end
 
   defp tmp_dir do
-    Path.join(System.tmp_dir!(), "replay_safe_index_#{System.unique_integer([:positive])}")
+    suffix = "#{System.os_time(:nanosecond)}_#{System.unique_integer([:positive])}"
+    Path.join(System.tmp_dir!(), "replay_safe_index_#{suffix}")
   end
 
   defp wait_until(fun, timeout_ms \\ 1_000) do

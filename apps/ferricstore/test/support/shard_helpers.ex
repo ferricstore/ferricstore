@@ -118,7 +118,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     end)
 
     # Batcher.flush now waits for all in-flight async commands (tracked in
-    # `pending` with :async_no_reply) to apply via ra_event before replying.
+    # `pending` with :origin_no_reply) to apply via ra_event before replying.
     # AsyncApplyWorker is deprecated — no drain needed.
     Enum.each(0..(shard_count - 1), fn i ->
       try do

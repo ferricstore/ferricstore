@@ -565,7 +565,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp poke_release_cursor(state, index) do
-    Ferricstore.Raft.Batcher.async_submit(state.shard_index, {:release_cursor_poke, index})
+    Ferricstore.Raft.Batcher.origin_submit(state.shard_index, {:release_cursor_poke, index})
   catch
     :exit, _reason -> :ok
   end
