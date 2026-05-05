@@ -83,6 +83,33 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     end
   end
 
+  test "get_with_file_ref flushes pending cold rows as file refs instead of materializing",
+       %{
+         ctx: ctx,
+         shard: shard,
+         keydir: keydir
+       } do
+    key = "cold_pending_sendfile:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    value = :binary.copy("p", 2048)
+    value_size = byte_size(value)
+
+    :sys.replace_state(shard, fn state ->
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), :pending, 0, value_size})
+
+      %{
+        state
+        | pending: [{key, value, 0} | state.pending],
+          pending_count: state.pending_count + 1
+      }
+    end)
+
+    assert [{^key, nil, 0, _lfu, :pending, 0, ^value_size}] = :ets.lookup(keydir, key)
+
+    assert {:cold_ref, path, value_offset, ^value_size} = Router.get_with_file_ref(ctx, key)
+    assert File.exists?(path)
+    assert is_integer(value_offset)
+  end
+
   test "batch_get_with_file_refs retries file refs after validation misses instead of materializing",
        %{
          ctx: ctx,

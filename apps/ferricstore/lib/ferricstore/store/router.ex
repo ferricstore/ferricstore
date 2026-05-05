@@ -1787,20 +1787,9 @@ defmodule Ferricstore.Store.Router do
         end
 
       {:cold, _file_id, _offset, _value_size} ->
-        # Cold entry but no valid file ref — ask GenServer
-        result =
-          case safe_read_call(ctx, idx, {:get, key}) do
-            {:ok, value} -> value
-            :unavailable -> nil
-          end
-
-        if result != nil do
-          Stats.record_cold_read(ctx, key)
-          {:cold_value, result}
-        else
-          Stats.incr_keyspace_misses(ctx)
-          :miss
-        end
+        # Cold entry but no valid file ref. Ask the shard to flush pending
+        # writes and return a file ref before falling back to materialization.
+        shard_file_ref_or_value(ctx, idx, key)
 
       :expired ->
         Stats.incr_keyspace_misses(ctx)
@@ -1813,6 +1802,18 @@ defmodule Ferricstore.Store.Router do
 
       :no_table ->
         # ETS table unavailable (shard restarting). Fall back to GenServer.
+        shard_file_ref_or_value(ctx, idx, key)
+    end
+  end
+
+  defp shard_file_ref_or_value(ctx, idx, key) do
+    case safe_read_call(ctx, idx, {:get_file_ref, key}) do
+      {:ok, {path, value_offset, value_size}}
+      when is_binary(path) and is_integer(value_offset) and is_integer(value_size) ->
+        Stats.record_cold_read(ctx, key)
+        {:cold_ref, path, value_offset, value_size}
+
+      _ ->
         result =
           case safe_read_call(ctx, idx, {:get, key}) do
             {:ok, value} -> value
