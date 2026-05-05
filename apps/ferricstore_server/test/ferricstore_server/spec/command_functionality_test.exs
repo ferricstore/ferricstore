@@ -32,9 +32,6 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
   # Generates a unique key to prevent cross-test interference.
   defp ukey(base), do: "spec_#{base}_#{System.unique_integer([:positive])}"
 
-  # Dummy store map -- native commands ignore it and call Router directly.
-  defp dummy_store, do: %{}
-
   # Builds a real store map backed by the application-supervised shards.
   # This mirrors the store construction in Connection.build_raw_store/0.
   defp build_real_store do
@@ -60,6 +57,9 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
       getdel: fn k -> Router.getdel(FerricStore.Instance.get(:default), k) end,
       getex: fn k, e -> Router.getex(FerricStore.Instance.get(:default), k, e) end,
       setrange: fn k, o, v -> Router.setrange(FerricStore.Instance.get(:default), k, o, v) end,
+      ratelimit_add: fn k, window, max, count ->
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window, max, count)
+      end,
       list_op: fn k, op -> Router.list_op(FerricStore.Instance.get(:default), k, op) end,
       compound_get: fn redis_key, compound_key ->
         shard =
@@ -194,21 +194,20 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
     end
 
     @tag :spec_ttl_010
-    test "key-level EXPIRE returns 0 for hash keys (compound key architecture)" do
-      # FerricStore stores hash fields as compound keys without a top-level
-      # sentinel entry. Therefore, key-level EXPIRE returns 0 for hash keys.
-      # This is a known architectural deviation from Redis. Use HEXPIRE for
-      # per-field expiry instead.
+    test "key-level EXPIRE applies to hash keys" do
       alias Ferricstore.Commands.Dispatcher
 
       key = ukey("ttl010_keylevel")
       store = build_real_store()
 
-      # Create a hash.
       assert 1 == Dispatcher.dispatch("HSET", [key, "f1", "v1"], store)
+      assert "v1" == Dispatcher.dispatch("HGET", [key, "f1"], store)
 
-      # Key-level EXPIRE returns 0 because there is no top-level key.
-      assert 0 == Dispatcher.dispatch("EXPIRE", [key, "1"], store)
+      assert 1 == Dispatcher.dispatch("EXPIRE", [key, "1"], store)
+
+      Process.sleep(1_200)
+
+      assert nil == Dispatcher.dispatch("HGET", [key, "f1"], store)
     end
   end
 
@@ -221,21 +220,22 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
     test "rate limits for different keys are independent" do
       key_a = ukey("rl005_a")
       key_b = ukey("rl005_b")
+      store = build_real_store()
 
       # Fill up key_a to its limit of 5.
       for _ <- 1..5 do
-        ["allowed" | _] = Native.handle("RATELIMIT.ADD", [key_a, "10000", "5"], dummy_store())
+        ["allowed" | _] = Native.handle("RATELIMIT.ADD", [key_a, "10000", "5"], store)
       end
 
       # key_a is now at limit.
-      ["denied" | _] = Native.handle("RATELIMIT.ADD", [key_a, "10000", "5"], dummy_store())
+      ["denied" | _] = Native.handle("RATELIMIT.ADD", [key_a, "10000", "5"], store)
 
       # key_b should still be fully available -- completely independent.
-      result_b = Native.handle("RATELIMIT.ADD", [key_b, "10000", "5"], dummy_store())
+      result_b = Native.handle("RATELIMIT.ADD", [key_b, "10000", "5"], store)
       assert ["allowed", 1, 4, _ms_reset] = result_b
 
       # Add a few more to key_b -- should work.
-      result_b2 = Native.handle("RATELIMIT.ADD", [key_b, "10000", "5"], dummy_store())
+      result_b2 = Native.handle("RATELIMIT.ADD", [key_b, "10000", "5"], store)
       assert ["allowed", 2, 3, _ms_reset] = result_b2
     end
   end
@@ -248,18 +248,19 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
       # rate:u1:minute vs rate:u1:hour).
       key_minute = ukey("rl006_min")
       key_hour = ukey("rl006_hour")
+      store = build_real_store()
 
       # Short window (500ms), limit 3 -- CI-friendly timing.
       for _ <- 1..3 do
-        ["allowed" | _] = Native.handle("RATELIMIT.ADD", [key_minute, "500", "3"], dummy_store())
+        ["allowed" | _] = Native.handle("RATELIMIT.ADD", [key_minute, "500", "3"], store)
       end
 
       # Minute-window key is now at limit.
-      result_min = Native.handle("RATELIMIT.ADD", [key_minute, "500", "3"], dummy_store())
+      result_min = Native.handle("RATELIMIT.ADD", [key_minute, "500", "3"], store)
       assert ["denied" | _] = result_min
 
       # Hour-window key with higher limit should still be available.
-      result_hour = Native.handle("RATELIMIT.ADD", [key_hour, "3600000", "1000"], dummy_store())
+      result_hour = Native.handle("RATELIMIT.ADD", [key_hour, "3600000", "1000"], store)
       assert ["allowed", 1, 999, _ms_reset] = result_hour
 
       # The sliding window approximation requires waiting for 2x the window
@@ -269,7 +270,7 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
       Process.sleep(1_200)
 
       # Short window should have fully reset.
-      result_min_after = Native.handle("RATELIMIT.ADD", [key_minute, "500", "3"], dummy_store())
+      result_min_after = Native.handle("RATELIMIT.ADD", [key_minute, "500", "3"], store)
       assert ["allowed" | _] = result_min_after
     end
   end
