@@ -54,6 +54,11 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     refute function_exported?(Router, :__install_batch_async_entries_for_test__, 4)
   end
 
+  test "router no longer exposes removed local-origin inline write helpers" do
+    refute function_exported?(Router, :execute_rmw_inline, 3)
+    refute function_exported?(Router, :execute_list_op_inline, 3)
+  end
+
   test "active tests do not call removed async batch APIs" do
     repo_root = Path.expand("../../../..", __DIR__)
 
@@ -202,7 +207,11 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
               "Async cross-shard",
               "async cross-shard",
               "ERR async",
-              "ERR async key latch"
+              "ERR async key latch",
+              "async_enqueue_to_raft",
+              "execute_rmw_inline",
+              "execute_list_op_inline",
+              "execute_mutating_list_op_inline"
             ],
             String.contains?(source, token) do
           {Path.relative_to(path, repo_root), token}
