@@ -233,8 +233,7 @@ defmodule Ferricstore.Commands.Hash do
       if Ops.compound_get(store, key, compound_key) != nil do
         0
       else
-        Ops.compound_put(store, key, compound_key, value, 0)
-        1
+        write_hash_field(store, key, compound_key, value, 1)
       end
     end
   end
@@ -276,8 +275,7 @@ defmodule Ferricstore.Commands.Hash do
             {:ok, current_float} ->
               new_val = current_float + increment
               result_str = format_float(new_val)
-              Ops.compound_put(store, key, compound_key, result_str, 0)
-              result_str
+              write_hash_field(store, key, compound_key, result_str, result_str)
 
             :error ->
               {:error, "ERR hash value is not a valid float"}
@@ -986,8 +984,7 @@ defmodule Ferricstore.Commands.Hash do
       if Ops.compound_get(store, key, compound_key) != nil do
         0
       else
-        Ops.compound_put(store, key, compound_key, value, 0)
-        1
+        write_hash_field(store, key, compound_key, value, 1)
       end
     end
   end
@@ -1063,8 +1060,7 @@ defmodule Ferricstore.Commands.Hash do
       {:ok, current_int} ->
         case checked_integer_add(current_int, increment) do
           {:ok, new_val} ->
-            Ops.compound_put(store, key, compound_key, Integer.to_string(new_val), 0)
-            new_val
+            write_hash_field(store, key, compound_key, Integer.to_string(new_val), new_val)
 
           :overflow ->
             {:error, @overflow_error}
@@ -1083,11 +1079,19 @@ defmodule Ferricstore.Commands.Hash do
       {:ok, current_float} ->
         new_val = current_float + increment
         result_str = format_float(new_val)
-        Ops.compound_put(store, key, compound_key, result_str, 0)
-        result_str
+        write_hash_field(store, key, compound_key, result_str, result_str)
 
       :error ->
         {:error, "ERR hash value is not a valid float"}
+    end
+  end
+
+  defp write_hash_field(store, key, compound_key, value, success) do
+    case Ops.compound_put(store, key, compound_key, value, 0) do
+      :ok -> success
+      true -> success
+      {:error, _reason} = error -> error
+      other -> {:error, other}
     end
   end
 

@@ -391,6 +391,21 @@ defmodule Ferricstore.Commands.HashTest do
     test "HSETNX with wrong arity returns error" do
       assert {:error, _} = Hash.handle("HSETNX", ["hash", "f1"], MockStore.make())
     end
+
+    test "HSETNX returns field write errors" do
+      type_key = CompoundKey.type_key("hash")
+      field_key = CompoundKey.hash_field("hash", "f1")
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key -> "hash"
+          "hash", ^field_key -> nil
+        end,
+        compound_put: fn "hash", ^field_key, "v1", 0 -> {:error, "disk full"} end
+      }
+
+      assert {:error, "disk full"} == Hash.handle("HSETNX", ["hash", "f1", "v1"], store)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -467,6 +482,21 @@ defmodule Ferricstore.Commands.HashTest do
       store = MockStore.make()
       assert {:error, _} = Hash.handle("HINCRBY", ["hash", "f1", "abc"], store)
     end
+
+    test "HINCRBY returns field write errors" do
+      type_key = CompoundKey.type_key("hash")
+      field_key = CompoundKey.hash_field("hash", "counter")
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key -> "hash"
+          "hash", ^field_key -> nil
+        end,
+        compound_put: fn "hash", ^field_key, "5", 0 -> {:error, "disk full"} end
+      }
+
+      assert {:error, "disk full"} == Hash.handle("HINCRBY", ["hash", "counter", "5"], store)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -498,6 +528,24 @@ defmodule Ferricstore.Commands.HashTest do
     test "HINCRBYFLOAT with non-float increment returns error" do
       store = MockStore.make()
       assert {:error, _} = Hash.handle("HINCRBYFLOAT", ["hash", "f1", "abc"], store)
+    end
+
+    test "HINCRBYFLOAT returns field write errors" do
+      type_key = CompoundKey.type_key("hash")
+      field_key = CompoundKey.hash_field("hash", "price")
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key -> "hash"
+          "hash", ^field_key -> nil
+        end,
+        compound_put: fn "hash", ^field_key, value, 0 when is_binary(value) ->
+          {:error, "disk full"}
+        end
+      }
+
+      assert {:error, "disk full"} ==
+               Hash.handle("HINCRBYFLOAT", ["hash", "price", "3.14"], store)
     end
   end
 
