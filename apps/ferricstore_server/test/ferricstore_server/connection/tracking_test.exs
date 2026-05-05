@@ -362,4 +362,24 @@ defmodule FerricstoreServer.Connection.TrackingTest do
       assert_received {:pubsub_message, "__keyevent@0__:" <> ^event, ^key}
     end)
   end
+
+  test "stream writes fire keyspace notifications with stream category flag" do
+    Config.set("notify-keyspace-events", "KEt")
+
+    events = [
+      {"XADD", ["tracking:keyspace:xadd", "*", "field", "value"], "xadd", "1-0"},
+      {"XDEL", ["tracking:keyspace:xdel", "1-0"], "xdel", 1},
+      {"XTRIM", ["tracking:keyspace:xtrim", "MAXLEN", "10"], "xtrim", 1}
+    ]
+
+    Enum.each(events, fn {cmd, [key | _] = args, event, result} ->
+      PubSub.subscribe("__keyspace@0__:#{key}", self())
+      PubSub.subscribe("__keyevent@0__:#{event}", self())
+
+      Tracking.maybe_notify_keyspace(cmd, args, result)
+
+      assert_received {:pubsub_message, "__keyspace@0__:" <> ^key, ^event}
+      assert_received {:pubsub_message, "__keyevent@0__:" <> ^event, ^key}
+    end)
+  end
 end

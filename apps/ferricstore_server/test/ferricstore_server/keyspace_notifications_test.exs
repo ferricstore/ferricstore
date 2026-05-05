@@ -59,6 +59,7 @@ defmodule FerricstoreServer.KeyspaceNotificationsTest do
       assert KeyspaceNotifications.should_notify?("lpush", "Kl")
       assert KeyspaceNotifications.should_notify?("sadd", "Ks")
       assert KeyspaceNotifications.should_notify?("zadd", "Kz")
+      assert KeyspaceNotifications.should_notify?("xadd", "Kt")
     end
 
     test "collection category flags do not cross-match other types" do
@@ -66,6 +67,7 @@ defmodule FerricstoreServer.KeyspaceNotificationsTest do
       refute KeyspaceNotifications.should_notify?("lpush", "Ks")
       refute KeyspaceNotifications.should_notify?("sadd", "Kz")
       refute KeyspaceNotifications.should_notify?("zadd", "Kh")
+      refute KeyspaceNotifications.should_notify?("xadd", "Kz")
     end
 
     test "returns false for string event with Kg (no $ flag)" do

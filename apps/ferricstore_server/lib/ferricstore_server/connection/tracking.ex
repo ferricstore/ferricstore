@@ -102,7 +102,10 @@ defmodule FerricstoreServer.Connection.Tracking do
     "ZADD" => "zadd",
     "ZREM" => "zrem",
     "ZINCRBY" => "zincrby",
-    "COPY" => "copy"
+    "COPY" => "copy",
+    "XADD" => "xadd",
+    "XDEL" => "xdel",
+    "XTRIM" => "xtrim"
   }
 
   @doc false

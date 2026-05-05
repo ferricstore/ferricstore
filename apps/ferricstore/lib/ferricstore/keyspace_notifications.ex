@@ -20,6 +20,7 @@ defmodule Ferricstore.KeyspaceNotifications do
     * `l` -- list commands: LPUSH, LPOP, LREM, LMOVE
     * `s` -- set commands: SADD, SREM, SPOP, SMOVE
     * `z` -- sorted set commands: ZADD, ZREM, ZINCRBY, ZPOP*
+    * `t` -- stream commands: XADD, XDEL, XTRIM
     * `x` -- expired events
     * `A` -- alias for all event types
 
@@ -77,6 +78,9 @@ defmodule Ferricstore.KeyspaceNotifications do
     "zincrby" => "z",
     "zpopmin" => "z",
     "zpopmax" => "z",
+    "xadd" => "t",
+    "xdel" => "t",
+    "xtrim" => "t",
     "expired" => "x"
   }
 
