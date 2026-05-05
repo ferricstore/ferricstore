@@ -45,4 +45,29 @@ defmodule Ferricstore.MemoryGuardDefaultInstanceTest do
       end
     end
   end
+
+  test "periodic checks survive missing default instance during startup or teardown" do
+    original = :persistent_term.get(@default_instance_key, :missing)
+
+    if original != :missing do
+      :persistent_term.erase(@default_instance_key)
+    end
+
+    pid =
+      case Process.whereis(MemoryGuard) do
+        nil -> start_supervised!({MemoryGuard, interval_ms: 60_000})
+        pid -> pid
+      end
+
+    try do
+      send(pid, :check)
+      Process.sleep(20)
+
+      assert Process.alive?(pid)
+    after
+      if original != :missing do
+        :persistent_term.put(@default_instance_key, original)
+      end
+    end
+  end
 end

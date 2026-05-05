@@ -408,14 +408,7 @@ defmodule Ferricstore.MemoryGuard do
         target_evict(state, stats, 0.80, 1000)
     end
 
-    # Publish pressure levels to atomics for lock-free hot-path reads.
-    ref = FerricStore.Instance.get(:default).pressure_flags
-    # Slot 1: keydir_full — reject new key writes (only at :reject)
-    :atomics.put(ref, 1, if(stats.keydir_pressure_level == :reject, do: 1, else: 0))
-    # Slot 2: reject_writes — reject ALL writes (only :reject + :noeviction)
-    :atomics.put(ref, 2, if(stats.pressure_level == :reject and state.eviction_policy == :noeviction, do: 1, else: 0))
-    # Slot 3: skip_promotion — don't re-cache cold reads (at :pressure and :reject)
-    :atomics.put(ref, 3, if(stats.pressure_level in [:pressure, :reject], do: 1, else: 0))
+    publish_pressure_flags(stats, state)
 
     %{state | last_pressure_level: stats.pressure_level, keydir_pressure_level: stats.keydir_pressure_level}
   end
@@ -444,8 +437,10 @@ defmodule Ferricstore.MemoryGuard do
         end)
 
       if total_evicted > 0 do
-        ctx = FerricStore.Instance.get(:default)
-        Ferricstore.Stats.incr_evicted_keys(ctx, total_evicted)
+        case default_instance() do
+          nil -> :ok
+          ctx -> Ferricstore.Stats.incr_evicted_keys(ctx, total_evicted)
+        end
       end
 
       :ok
@@ -825,8 +820,36 @@ defmodule Ferricstore.MemoryGuard do
     end
   end
 
-  defp default_process_rss_fn do
+  defp publish_pressure_flags(stats, state) do
+    case default_pressure_flags() do
+      nil ->
+        :ok
+
+      ref ->
+        # Slot 1: keydir_full — reject new key writes (only at :reject)
+        :atomics.put(ref, 1, if(stats.keydir_pressure_level == :reject, do: 1, else: 0))
+        # Slot 2: reject_writes — reject ALL writes (only :reject + :noeviction)
+        reject? = stats.pressure_level == :reject and state.eviction_policy == :noeviction
+        :atomics.put(ref, 2, if(reject?, do: 1, else: 0))
+        # Slot 3: skip_promotion — don't re-cache cold reads (at :pressure and :reject)
+        :atomics.put(ref, 3, if(stats.pressure_level in [:pressure, :reject], do: 1, else: 0))
+        :ok
+    end
+  end
+
+  defp default_pressure_flags do
     case :persistent_term.get({FerricStore.Instance, :default}, nil) do
+      %{pressure_flags: ref} -> ref
+      _missing_or_stale -> nil
+    end
+  end
+
+  defp default_instance do
+    :persistent_term.get({FerricStore.Instance, :default}, nil)
+  end
+
+  defp default_process_rss_fn do
+    case default_instance() do
       %{process_rss_fn: fun} -> fun
       _missing_or_stale -> nil
     end
