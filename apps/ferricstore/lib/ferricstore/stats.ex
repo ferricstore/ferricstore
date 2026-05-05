@@ -110,7 +110,11 @@ defmodule Ferricstore.Stats do
   @spec decr_connections() :: :ok
   def decr_connections do
     try do
-      :counters.add(FerricStore.Instance.get(:default).stats_counter, @counter_active_connections, -1)
+      :counters.add(
+        FerricStore.Instance.get(:default).stats_counter,
+        @counter_active_connections,
+        -1
+      )
     rescue
       ArgumentError -> :ok
     end
@@ -122,7 +126,13 @@ defmodule Ferricstore.Stats do
   @spec active_connections() :: non_neg_integer()
   def active_connections do
     try do
-      max(0, :counters.get(FerricStore.Instance.get(:default).stats_counter, @counter_active_connections))
+      max(
+        0,
+        :counters.get(
+          FerricStore.Instance.get(:default).stats_counter,
+          @counter_active_connections
+        )
+      )
     rescue
       ArgumentError -> 0
     end
@@ -152,15 +162,14 @@ defmodule Ferricstore.Stats do
   @doc "Returns the total number of connections received since startup."
   @spec total_connections() :: non_neg_integer()
   def total_connections do
-    :counters.get(FerricStore.Instance.get(:default).stats_counter, @counter_connections)
+    counter_get(@counter_connections)
   end
 
   @doc "Returns the total number of commands processed since startup."
   @spec total_commands() :: non_neg_integer()
   def total_commands do
-    :counters.get(FerricStore.Instance.get(:default).stats_counter, @counter_commands)
+    counter_get(@counter_commands)
   end
-
 
   @doc "Increments the keyspace_hits counter by 1."
   @spec incr_keyspace_hits() :: :ok
@@ -168,76 +177,89 @@ defmodule Ferricstore.Stats do
     :counters.add(FerricStore.Instance.get(:default).stats_counter, @counter_keyspace_hits, 1)
     :ok
   end
+
   @doc "Increments the keyspace_hits counter using instance ctx."
   @spec incr_keyspace_hits(FerricStore.Instance.t()) :: :ok
   def incr_keyspace_hits(ctx) do
     :counters.add(ctx.stats_counter, @counter_keyspace_hits, 1)
     :ok
   end
+
   @doc "Increments the keyspace_misses counter by 1."
   @spec incr_keyspace_misses() :: :ok
   def incr_keyspace_misses do
     :counters.add(FerricStore.Instance.get(:default).stats_counter, @counter_keyspace_misses, 1)
     :ok
   end
+
   @doc "Increments the keyspace_misses counter using instance ctx."
   @spec incr_keyspace_misses(FerricStore.Instance.t()) :: :ok
   def incr_keyspace_misses(ctx) do
     :counters.add(ctx.stats_counter, @counter_keyspace_misses, 1)
     :ok
   end
+
   @doc "Returns the total number of successful key lookups since startup."
   @spec keyspace_hits() :: non_neg_integer()
-  def keyspace_hits, do: :counters.get(FerricStore.Instance.get(:default).stats_counter, @counter_keyspace_hits)
+  def keyspace_hits, do: counter_get(@counter_keyspace_hits)
   @doc "Returns keyspace hits using instance ctx."
   @spec keyspace_hits(FerricStore.Instance.t()) :: non_neg_integer()
   def keyspace_hits(ctx), do: :counters.get(ctx.stats_counter, @counter_keyspace_hits)
   @doc "Returns the total number of failed key lookups since startup."
   @spec keyspace_misses() :: non_neg_integer()
-  def keyspace_misses, do: :counters.get(FerricStore.Instance.get(:default).stats_counter, @counter_keyspace_misses)
+  def keyspace_misses, do: counter_get(@counter_keyspace_misses)
   @doc "Returns keyspace misses using instance ctx."
   @spec keyspace_misses(FerricStore.Instance.t()) :: non_neg_integer()
   def keyspace_misses(ctx), do: :counters.get(ctx.stats_counter, @counter_keyspace_misses)
   @doc "Increments the expired_keys counter by `count`."
   @spec incr_expired_keys(non_neg_integer()) :: :ok
   def incr_expired_keys(0), do: :ok
+
   def incr_expired_keys(count) when is_integer(count) and count > 0 do
     :counters.add(FerricStore.Instance.get(:default).stats_counter, @counter_expired_keys, count)
     :ok
   end
+
   @doc "Increments the expired_keys counter using instance ctx."
   @spec incr_expired_keys(FerricStore.Instance.t(), non_neg_integer()) :: :ok
   def incr_expired_keys(_ctx, 0), do: :ok
+
   def incr_expired_keys(ctx, count) when is_integer(count) and count > 0 do
     :counters.add(ctx.stats_counter, @counter_expired_keys, count)
     :ok
   end
+
   @doc "Increments the evicted_keys counter by `count`."
   @spec incr_evicted_keys(non_neg_integer()) :: :ok
   def incr_evicted_keys(0), do: :ok
+
   def incr_evicted_keys(count) when is_integer(count) and count > 0 do
     :counters.add(FerricStore.Instance.get(:default).stats_counter, @counter_evicted_keys, count)
     :ok
   end
+
   @doc "Increments the evicted_keys counter using instance ctx."
   @spec incr_evicted_keys(FerricStore.Instance.t(), non_neg_integer()) :: :ok
   def incr_evicted_keys(_ctx, 0), do: :ok
+
   def incr_evicted_keys(ctx, count) when is_integer(count) and count > 0 do
     :counters.add(ctx.stats_counter, @counter_evicted_keys, count)
     :ok
   end
+
   @doc "Returns expired keys count."
   @spec expired_keys() :: non_neg_integer()
-  def expired_keys, do: :counters.get(FerricStore.Instance.get(:default).stats_counter, @counter_expired_keys)
+  def expired_keys, do: counter_get(@counter_expired_keys)
   @doc "Returns evicted keys count."
   @spec evicted_keys() :: non_neg_integer()
-  def evicted_keys, do: :counters.get(FerricStore.Instance.get(:default).stats_counter, @counter_evicted_keys)
+  def evicted_keys, do: counter_get(@counter_evicted_keys)
   @doc "Returns evicted keys count using instance ctx."
   @spec evicted_keys(FerricStore.Instance.t()) :: non_neg_integer()
   def evicted_keys(ctx), do: :counters.get(ctx.stats_counter, @counter_evicted_keys)
   @doc "Returns expired keys count using instance ctx."
   @spec expired_keys(FerricStore.Instance.t()) :: non_neg_integer()
-  def expired_keys(ctx) when is_map(ctx), do: :counters.get(ctx.stats_counter, @counter_expired_keys)
+  def expired_keys(ctx) when is_map(ctx),
+    do: :counters.get(ctx.stats_counter, @counter_expired_keys)
 
   @doc "Increments the keys_with_expiry counter (key gained a TTL)."
   @spec incr_keys_with_expiry() :: :ok
@@ -257,7 +279,7 @@ defmodule Ferricstore.Stats do
 
   @doc "Returns the number of keys that currently have a TTL set."
   @spec keys_with_expiry() :: non_neg_integer()
-  def keys_with_expiry, do: max(0, :counters.get(FerricStore.Instance.get(:default).stats_counter, @counter_keys_with_expiry))
+  def keys_with_expiry, do: max(0, counter_get(@counter_keys_with_expiry))
 
   @doc """
   Records a hot read (ETS cache hit) for the given key.
@@ -319,13 +341,13 @@ defmodule Ferricstore.Stats do
 
   @doc "Returns the total number of hot reads (ETS cache hits) since startup."
   @spec total_hot_reads() :: non_neg_integer()
-  def total_hot_reads, do: total_hot_reads(FerricStore.Instance.get(:default))
+  def total_hot_reads, do: counter_get(@counter_hot_reads)
   @spec total_hot_reads(FerricStore.Instance.t()) :: non_neg_integer()
   def total_hot_reads(ctx), do: :counters.get(ctx.stats_counter, @counter_hot_reads)
 
   @doc "Returns the total number of cold reads (Bitcask fallbacks) since startup."
   @spec total_cold_reads() :: non_neg_integer()
-  def total_cold_reads, do: total_cold_reads(FerricStore.Instance.get(:default))
+  def total_cold_reads, do: counter_get(@counter_cold_reads)
   @spec total_cold_reads(FerricStore.Instance.t()) :: non_neg_integer()
   def total_cold_reads(ctx), do: :counters.get(ctx.stats_counter, @counter_cold_reads)
 
@@ -416,20 +438,22 @@ defmodule Ferricstore.Stats do
   @doc "Returns the server uptime in seconds."
   @spec uptime_seconds() :: non_neg_integer()
   def uptime_seconds do
-    start = :persistent_term.get({__MODULE__, :start_time})
-    div(System.monotonic_time(:millisecond) - start, 1000)
+    case :persistent_term.get({__MODULE__, :start_time}, nil) do
+      nil -> 0
+      start -> div(System.monotonic_time(:millisecond) - start, 1000)
+    end
   end
 
   @doc "Returns the random hex run ID generated at startup."
   @spec run_id() :: binary()
   def run_id do
-    :persistent_term.get({__MODULE__, :run_id})
+    :persistent_term.get({__MODULE__, :run_id}, String.duplicate("0", 40))
   end
 
   @doc "Returns the server start time as a monotonic millisecond timestamp."
   @spec start_time() :: integer()
   def start_time do
-    :persistent_term.get({__MODULE__, :start_time})
+    :persistent_term.get({__MODULE__, :start_time}, System.monotonic_time(:millisecond))
   end
 
   @doc """
@@ -508,7 +532,14 @@ defmodule Ferricstore.Stats do
     # without going through this GenServer.
     case :ets.whereis(@hotness_table) do
       :undefined ->
-        :ets.new(@hotness_table, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
+        :ets.new(@hotness_table, [
+          :set,
+          :public,
+          :named_table,
+          {:read_concurrency, true},
+          {:write_concurrency, :auto},
+          {:decentralized_counters, true}
+        ])
 
       _ref ->
         :ets.delete_all_objects(@hotness_table)
@@ -521,6 +552,11 @@ defmodule Ferricstore.Stats do
   # Private
   # ---------------------------------------------------------------------------
 
+  defp counter_get(index) do
+    :counters.get(FerricStore.Instance.get(:default).stats_counter, index)
+  rescue
+    ArgumentError -> 0
+  end
 
   # Resolves the prefix to track: if the hotness table already has this prefix
   # or the table has room, use the prefix as-is. Otherwise bucket into "_other".

@@ -111,11 +111,9 @@ defmodule Ferricstore.Metrics do
       {"ferricstore_total_commands_processed", :counter,
        "Total number of commands dispatched since startup", Stats.total_commands()},
       {"ferricstore_hot_reads_total", :counter,
-       "Total number of reads served from the ETS hot cache",
-       Stats.total_hot_reads(FerricStore.Instance.get(:default))},
+       "Total number of reads served from the ETS hot cache", Stats.total_hot_reads()},
       {"ferricstore_cold_reads_total", :counter,
-       "Total number of reads that fell through to Bitcask on disk",
-       Stats.total_cold_reads(FerricStore.Instance.get(:default))},
+       "Total number of reads that fell through to Bitcask on disk", Stats.total_cold_reads()},
       {"ferricstore_used_memory_bytes", :gauge, "Total BEAM VM memory usage in bytes",
        :erlang.memory(:total)},
       {"ferricstore_keydir_used_bytes", :gauge,
@@ -149,12 +147,19 @@ defmodule Ferricstore.Metrics do
 
   @spec connected_clients() :: non_neg_integer()
   defp connected_clients do
-    ctx = FerricStore.Instance.get(:default)
+    case default_instance() do
+      nil -> 0
+      ctx -> connected_clients(ctx)
+    end
+  end
 
+  defp connected_clients(ctx) do
     case ctx.connected_clients_fn do
       nil -> 0
       fun -> fun.()
     end
+  rescue
+    _ -> 0
   end
 
   @spec keydir_used_bytes() :: non_neg_integer()
@@ -217,7 +222,7 @@ defmodule Ferricstore.Metrics do
 
   @spec checkpoint_metrics_text() :: binary()
   defp checkpoint_metrics_text do
-    ctx = FerricStore.Instance.get(:default)
+    ctx = default_instance()
 
     [
       checkpoint_metric_family(
@@ -317,6 +322,12 @@ defmodule Ferricstore.Metrics do
 
   defp shard_count do
     Application.get_env(:ferricstore, :shard_count, 4)
+  end
+
+  defp default_instance do
+    FerricStore.Instance.get(:default)
+  rescue
+    ArgumentError -> nil
   end
 
   # ---------------------------------------------------------------------------

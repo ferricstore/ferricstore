@@ -615,17 +615,11 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp build_section("stats", _store) do
-    rate =
-      try do
-        FerricStore.Instance.get(:default).read_sample_rate
-      rescue
-        ArgumentError -> 100
-      end
-
-    hot_sampled = Stats.total_hot_reads(FerricStore.Instance.get(:default))
-    cold_sampled = Stats.total_cold_reads(FerricStore.Instance.get(:default))
-    hits_sampled = Stats.keyspace_hits(FerricStore.Instance.get(:default))
-    misses = Stats.keyspace_misses(FerricStore.Instance.get(:default))
+    rate = read_sample_rate()
+    hot_sampled = Stats.total_hot_reads()
+    cold_sampled = Stats.total_cold_reads()
+    hits_sampled = Stats.keyspace_hits()
+    misses = Stats.keyspace_misses()
 
     # Estimated actuals: sampled counters × sample rate
     hot_est = hot_sampled * rate
@@ -649,8 +643,8 @@ defmodule Ferricstore.Commands.Server do
       {"cold_reads", Integer.to_string(cold_est)},
       {"hot_cache_hit_ratio", format_float_field(hot_pct)},
       {"read_sample_rate", "1:#{rate}"},
-      {"expired_keys", Integer.to_string(Stats.expired_keys(FerricStore.Instance.get(:default)))},
-      {"evicted_keys", Integer.to_string(Stats.evicted_keys(FerricStore.Instance.get(:default)))}
+      {"expired_keys", Integer.to_string(Stats.expired_keys())},
+      {"evicted_keys", Integer.to_string(Stats.evicted_keys())}
     ]
 
     format_section("Stats", fields)
@@ -1090,6 +1084,12 @@ defmodule Ferricstore.Commands.Server do
 
   defp format_float_field(val) do
     :erlang.float_to_binary(val, [{:decimals, 2}])
+  end
+
+  defp read_sample_rate do
+    FerricStore.Instance.get(:default).read_sample_rate
+  rescue
+    ArgumentError -> 100
   end
 
   defp format_bytes(bytes) when bytes < 1024, do: "#{bytes}B"
