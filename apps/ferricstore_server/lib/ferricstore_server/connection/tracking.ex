@@ -164,6 +164,12 @@ defmodule FerricstoreServer.Connection.Tracking do
         new_tracking = ClientTracking.track_keys(conn_pid, keys, state.tracking)
         %{state | tracking: new_tracking}
 
+      "XREAD" ->
+        new_tracking =
+          ClientTracking.track_keys(conn_pid, xread_stream_keys(args), state.tracking)
+
+        %{state | tracking: new_tracking}
+
       _ ->
         # Single-key commands: first arg is the key
         case args do
@@ -178,6 +184,16 @@ defmodule FerricstoreServer.Connection.Tracking do
   end
 
   def maybe_track_read(_cmd, _args, _result, state), do: state
+
+  defp xread_stream_keys(args) do
+    with stream_idx when is_integer(stream_idx) <-
+           Enum.find_index(args, &(String.upcase(&1) == "STREAMS")),
+         stream_args when stream_args != [] <- Enum.drop(args, stream_idx + 1) do
+      Enum.take(stream_args, div(length(stream_args), 2))
+    else
+      _ -> []
+    end
+  end
 
   # After a successful write command, notify all tracking connections.
   # This can be called from any process (connection process or Task).
