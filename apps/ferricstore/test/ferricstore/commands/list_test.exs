@@ -12,6 +12,7 @@ defmodule Ferricstore.Commands.ListTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.{Dispatcher, Hash, List, Strings}
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
   describe "storage path guards" do
@@ -30,6 +31,36 @@ defmodule Ferricstore.Commands.ListTest do
   end
 
   defp app_path(path), do: Path.expand("../../../#{path}", __DIR__)
+
+  defp list_cleanup_failure_store do
+    type_key = CompoundKey.type_key("mylist")
+    meta_key = CompoundKey.list_meta_key("mylist")
+    element_key = CompoundKey.list_element("mylist", 0)
+    {:ok, meta_deleted} = Agent.start_link(fn -> false end)
+
+    %{
+      compound_get: fn
+        "mylist", ^type_key ->
+          "list"
+
+        "mylist", ^meta_key ->
+          unless Agent.get(meta_deleted, & &1) do
+            :erlang.term_to_binary({1, -1_000_000_000, 1_000_000_000})
+          end
+      end,
+      compound_batch_delete: fn "mylist", [^element_key] -> :ok end,
+      compound_delete: fn
+        "mylist", ^meta_key ->
+          Agent.update(meta_deleted, fn _ -> true end)
+          :ok
+
+        "mylist", ^type_key ->
+          {:error, :disk_full}
+      end,
+      compound_put: fn _redis_key, _compound_key, _value, _expire_at_ms -> :ok end,
+      compound_scan: fn "mylist", _prefix -> [{CompoundKey.encode_position(0), "a"}] end
+    }
+  end
 
   # ===========================================================================
   # LPUSH
@@ -151,6 +182,20 @@ defmodule Ferricstore.Commands.ListTest do
       List.handle("RPUSH", ["mylist", "a"], store)
       List.handle("LPOP", ["mylist"], store)
       assert nil == List.handle("LPOP", ["mylist"], store)
+    end
+
+    test "cleans up type metadata when list becomes empty" do
+      store = MockStore.make()
+      List.handle("LPUSH", ["mylist", "a"], store)
+
+      assert "a" == List.handle("LPOP", ["mylist"], store)
+      assert nil == store.compound_get.("mylist", "T:mylist")
+    end
+
+    test "returns type cleanup errors after removing the last element" do
+      store = list_cleanup_failure_store()
+
+      assert {:error, :disk_full} == List.handle("LPOP", ["mylist"], store)
     end
 
     test "returns nil on non-existent key" do
