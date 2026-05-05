@@ -5567,6 +5567,21 @@ fn flow_create_option<'a>(
                 "payload_ref",
                 FlowOptType::Ref(b"payload_ref"),
             ),
+            (
+                b"PARENT_FLOW_ID",
+                "parent_flow_id",
+                FlowOptType::Ref(b"parent_flow_id"),
+            ),
+            (
+                b"ROOT_FLOW_ID",
+                "root_flow_id",
+                FlowOptType::Ref(b"root_flow_id"),
+            ),
+            (
+                b"CORRELATION_ID",
+                "correlation_id",
+                FlowOptType::Ref(b"correlation_id"),
+            ),
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PRIORITY", "priority", FlowOptType::NonNegative),

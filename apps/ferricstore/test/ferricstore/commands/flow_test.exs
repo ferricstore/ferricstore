@@ -32,11 +32,18 @@ defmodule Ferricstore.Commands.FlowTest do
                  "1000",
                  "PRIORITY",
                  "2",
+                 "ROOT_FLOW_ID",
+                 "checkout-root",
+                 "CORRELATION_ID",
+                 "order-123",
                  "HISTORY_MAX_EVENTS",
                  "5"
                ],
                MockStore.make()
              )
+
+    assert %{"root_flow_id" => "checkout-root", "correlation_id" => "order-123"} =
+             Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
 
     assert %{"id" => ^id, "type" => "checkout"} =
              Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())

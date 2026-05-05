@@ -111,6 +111,67 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id, type: "checkout", state: "queued")
   end
 
+  test "flow_create stores debug lineage metadata and indexes it" do
+    id = uid("flow-lineage-child")
+    parent = uid("flow-lineage-parent")
+    root = uid("flow-lineage-root")
+    correlation = uid("order")
+    partition = uid("tenant")
+
+    assert {:ok, flow} =
+             FerricStore.flow_create(id,
+               type: "lineage",
+               partition_key: partition,
+               parent_flow_id: parent,
+               root_flow_id: root,
+               correlation_id: correlation,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert flow.parent_flow_id == parent
+    assert flow.root_flow_id == root
+    assert flow.correlation_id == correlation
+
+    assert {:ok, [^id]} =
+             FerricStore.zrange(Ferricstore.Flow.Keys.parent_index_key(parent, partition), 0, 10)
+
+    assert {:ok, [^id]} =
+             FerricStore.zrange(Ferricstore.Flow.Keys.root_index_key(root, partition), 0, 10)
+
+    assert {:ok, [^id]} =
+             FerricStore.zrange(
+               Ferricstore.Flow.Keys.correlation_index_key(correlation, partition),
+               0,
+               10
+             )
+
+    assert {:ok, [{_event_id, fields}]} =
+             FerricStore.flow_history(id, partition_key: partition, count: 10)
+
+    assert fields["parent_flow_id"] == parent
+    assert fields["root_flow_id"] == root
+    assert fields["correlation_id"] == correlation
+  end
+
+  test "flow_create stores default root without indexing one unique root per flow" do
+    id = uid("flow-lineage-root-default")
+    partition = uid("tenant")
+
+    assert {:ok, flow} =
+             FerricStore.flow_create(id,
+               type: "lineage",
+               partition_key: partition,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert flow.root_flow_id == id
+
+    assert {:ok, []} =
+             FerricStore.zrange(Ferricstore.Flow.Keys.root_index_key(id, partition), 0, 10)
+  end
+
   test "flow_create_many creates one-partition batch atomically" do
     partition = uid("tenant")
     type = uid("bulk-create")

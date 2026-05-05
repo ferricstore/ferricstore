@@ -4324,6 +4324,9 @@ defmodule Ferricstore.Raft.StateMachine do
       history_max_events: Map.get(attrs, :history_max_events),
       partition_key: Map.get(attrs, :partition_key),
       payload_ref: Map.get(attrs, :payload_ref),
+      parent_flow_id: Map.get(attrs, :parent_flow_id),
+      root_flow_id: Map.get(attrs, :root_flow_id) || id,
+      correlation_id: Map.get(attrs, :correlation_id),
       result_ref: nil,
       error_ref: nil,
       lease_owner: nil,
@@ -5227,23 +5230,26 @@ defmodule Ferricstore.Raft.StateMachine do
           updated_score
         )
 
-      if Map.get(record, :state) == "running" do
-        lease_score = Float.to_string(Map.get(record, :lease_deadline_ms, 0) * 1.0)
+      acc =
+        if Map.get(record, :state) == "running" do
+          lease_score = Float.to_string(Map.get(record, :lease_deadline_ms, 0) * 1.0)
 
-        acc
-        |> flow_claim_add_zset_entry(
-          FlowKeys.inflight_index_key(record.type, partition_key),
-          record.id,
-          lease_score
-        )
-        |> flow_claim_add_zset_entry(
-          FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key),
-          record.id,
-          lease_score
-        )
-      else
-        acc
-      end
+          acc
+          |> flow_claim_add_zset_entry(
+            FlowKeys.inflight_index_key(record.type, partition_key),
+            record.id,
+            lease_score
+          )
+          |> flow_claim_add_zset_entry(
+            FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key),
+            record.id,
+            lease_score
+          )
+        else
+          acc
+        end
+
+      flow_add_metadata_index_entries(acc, record, updated_score)
     end)
     |> Enum.each(fn {key, member_score_pairs} ->
       flow_zset_put_many(state, key, Enum.reverse(member_score_pairs))
@@ -5336,8 +5342,9 @@ defmodule Ferricstore.Raft.StateMachine do
                partition_key
              )
            ) do
-      with :ok <- flow_validate_due_key(record, type, flow_state, priority, partition_key) do
-        flow_validate_running_index_keys(record, type, partition_key)
+      with :ok <- flow_validate_due_key(record, type, flow_state, priority, partition_key),
+           :ok <- flow_validate_running_index_keys(record, type, partition_key) do
+        flow_validate_metadata_index_keys(record, partition_key)
       end
     end
   end
@@ -5358,6 +5365,33 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_validate_running_index_keys(_record, _type, _partition_key), do: :ok
+
+  defp flow_validate_metadata_index_keys(record, partition_key) do
+    id = Map.get(record, :id)
+
+    [
+      {Map.get(record, :parent_flow_id), &FlowKeys.parent_index_key(&1, partition_key)},
+      {flow_non_default_root_flow_id(record, id), &FlowKeys.root_index_key(&1, partition_key)},
+      {Map.get(record, :correlation_id), &FlowKeys.correlation_index_key(&1, partition_key)}
+    ]
+    |> Enum.reduce_while(:ok, fn
+      {value, key_fun}, :ok when is_binary(value) and value != "" ->
+        case flow_validate_key_size(key_fun.(value)) do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+
+      _entry, :ok ->
+        {:cont, :ok}
+    end)
+  end
+
+  defp flow_non_default_root_flow_id(record, id) do
+    case Map.get(record, :root_flow_id) do
+      ^id -> nil
+      root_flow_id -> root_flow_id
+    end
+  end
 
   defp flow_validate_key_size(key) do
     if byte_size(key) <= Router.max_key_size() do
@@ -5588,6 +5622,9 @@ defmodule Ferricstore.Raft.StateMachine do
          next_run_at_ms: next_run_at_ms,
          priority: priority,
          payload_ref: flow_nilable_history_field(fields, "payload_ref"),
+         parent_flow_id: flow_nilable_history_field(fields, "parent_flow_id"),
+         root_flow_id: flow_nilable_history_field(fields, "root_flow_id") || Map.get(record, :id),
+         correlation_id: flow_nilable_history_field(fields, "correlation_id"),
          result_ref: flow_nilable_history_field(fields, "result_ref"),
          error_ref:
            Map.get(attrs, :reason_ref) || flow_nilable_history_field(fields, "error_ref"),
@@ -5719,10 +5756,67 @@ defmodule Ferricstore.Raft.StateMachine do
     state_index_key = FlowKeys.state_index_key(type, flow_state, partition_key)
     updated_score = Float.to_string(Map.get(record, :updated_at_ms, 0) * 1.0)
 
-    with :ok <- flow_zset_put(state, state_index_key, id, updated_score) do
+    with :ok <- flow_zset_put(state, state_index_key, id, updated_score),
+         :ok <- flow_metadata_index_put(state, record, updated_score) do
       flow_running_index_put(state, record)
     end
   end
+
+  defp flow_metadata_index_put(state, record, score) do
+    record
+    |> flow_metadata_index_entries(score)
+    |> Enum.each(fn {key, id, score} -> flow_zset_put(state, key, id, score) end)
+
+    :ok
+  end
+
+  defp flow_add_metadata_index_entries(acc, record, score) do
+    record
+    |> flow_metadata_index_entries(score)
+    |> Enum.reduce(acc, fn {key, id, score}, acc ->
+      flow_claim_add_zset_entry(acc, key, id, score)
+    end)
+  end
+
+  defp flow_metadata_index_entries(record, score) do
+    partition_key = Map.get(record, :partition_key)
+    id = Map.get(record, :id)
+
+    []
+    |> flow_metadata_index_entry(
+      :parent,
+      Map.get(record, :parent_flow_id),
+      partition_key,
+      id,
+      score
+    )
+    |> flow_metadata_index_entry(:root, Map.get(record, :root_flow_id), partition_key, id, score)
+    |> flow_metadata_index_entry(
+      :correlation,
+      Map.get(record, :correlation_id),
+      partition_key,
+      id,
+      score
+    )
+  end
+
+  defp flow_metadata_index_entry(entries, :root, value, _partition_key, id, _score)
+       when value in [nil, "", id],
+       do: entries
+
+  defp flow_metadata_index_entry(entries, kind, value, partition_key, id, score)
+       when is_binary(value) and value != "" do
+    key =
+      case kind do
+        :parent -> FlowKeys.parent_index_key(value, partition_key)
+        :root -> FlowKeys.root_index_key(value, partition_key)
+        :correlation -> FlowKeys.correlation_index_key(value, partition_key)
+      end
+
+    [{key, id, score} | entries]
+  end
+
+  defp flow_metadata_index_entry(entries, _kind, _value, _partition_key, _id, _score), do: entries
 
   defp flow_running_index_put(state, %{state: "running", id: id, type: type} = record) do
     partition_key = Map.get(record, :partition_key)
@@ -5910,6 +6004,12 @@ defmodule Ferricstore.Raft.StateMachine do
       Map.get(record, :lease_owner) || "",
       "payload_ref",
       Map.get(record, :payload_ref) || "",
+      "parent_flow_id",
+      Map.get(record, :parent_flow_id) || "",
+      "root_flow_id",
+      Map.get(record, :root_flow_id) || "",
+      "correlation_id",
+      Map.get(record, :correlation_id) || "",
       "result_ref",
       Map.get(record, :result_ref) || "",
       "error_ref",

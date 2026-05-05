@@ -564,6 +564,13 @@ defmodule Ferricstore.Flow do
          {:ok, state} <- optional_binary(opts, :state, @default_state),
          {:ok, payload_ref} <- optional_binary_or_nil(opts, :payload_ref, nil),
          :ok <- validate_ref_size(:payload_ref, payload_ref),
+         {:ok, parent_flow_id} <- optional_binary_or_nil(opts, :parent_flow_id, nil),
+         :ok <- validate_ref_size(:parent_flow_id, parent_flow_id),
+         {:ok, root_flow_id} <- optional_binary_or_nil(opts, :root_flow_id, nil),
+         :ok <- validate_ref_size(:root_flow_id, root_flow_id),
+         root_flow_id = root_flow_id || id,
+         {:ok, correlation_id} <- optional_binary_or_nil(opts, :correlation_id, nil),
+         :ok <- validate_ref_size(:correlation_id, correlation_id),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, default_now),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
          {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
@@ -577,6 +584,9 @@ defmodule Ferricstore.Flow do
          type: type,
          state: state,
          payload_ref: payload_ref,
+         parent_flow_id: parent_flow_id,
+         root_flow_id: root_flow_id,
+         correlation_id: correlation_id,
          run_at_ms: run_at_ms,
          ttl_ms: ttl_ms,
          history_max_events: history_max_events,
@@ -643,6 +653,9 @@ defmodule Ferricstore.Flow do
     []
     |> maybe_put_item_opt(:payload_ref, item, :payload_ref, "payload_ref")
     |> maybe_put_item_opt(:partition_key, item, :partition_key, "partition_key")
+    |> maybe_put_item_opt(:parent_flow_id, item, :parent_flow_id, "parent_flow_id")
+    |> maybe_put_item_opt(:root_flow_id, item, :root_flow_id, "root_flow_id")
+    |> maybe_put_item_opt(:correlation_id, item, :correlation_id, "correlation_id")
   end
 
   defp transition_attrs(id, from_state, to_state, opts) do
@@ -972,6 +985,18 @@ defmodule Ferricstore.Flow do
 
     def worker_index_key(worker, partition_key \\ nil) do
       "flow:" <> tag(partition_key) <> ":idx:worker:" <> worker
+    end
+
+    def parent_index_key(parent_flow_id, partition_key \\ nil) do
+      "flow:" <> tag(partition_key) <> ":idx:parent:" <> parent_flow_id
+    end
+
+    def root_index_key(root_flow_id, partition_key \\ nil) do
+      "flow:" <> tag(partition_key) <> ":idx:root:" <> root_flow_id
+    end
+
+    def correlation_index_key(correlation_id, partition_key \\ nil) do
+      "flow:" <> tag(partition_key) <> ":idx:correlation:" <> correlation_id
     end
 
     def stream_entry_key(id, event_id, partition_key \\ nil) do
