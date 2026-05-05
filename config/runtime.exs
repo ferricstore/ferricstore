@@ -32,8 +32,20 @@ if config_env() == :prod do
     hot_cache_max_value_size:
       String.to_integer(System.get_env("FERRICSTORE_HOT_CACHE_MAX_VALUE_SIZE", "65536")),
     flow_lmdb_enabled: System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
+    flow_lmdb_mode:
+      System.get_env(
+        "FERRICSTORE_FLOW_LMDB_MODE",
+        if(System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
+          do: "mirror",
+          else: "off"
+        )
+      ),
     flow_lmdb_map_size:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAP_SIZE", "68719476736")),
+    flow_lmdb_flush_interval_ms:
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_INTERVAL_MS", "10")),
+    flow_lmdb_max_batch_ops:
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_BATCH_OPS", "1000")),
     memory_guard_interval_ms:
       String.to_integer(System.get_env("FERRICSTORE_MEMORY_GUARD_INTERVAL_MS", "5000"))
 

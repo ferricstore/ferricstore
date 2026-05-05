@@ -75,11 +75,15 @@ jobs:
         run: |
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
+          cargo build --release --manifest-path apps/ferricstore_server/native/resp_parser_nif/Cargo.toml
           mkdir -p apps/ferricstore/priv/native
+          mkdir -p apps/ferricstore_server/priv/native
           cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/libferricstore_bitcask.so
           cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/ferricstore_bitcask.so
           cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so apps/ferricstore/priv/native/libferricstore_wal_nif.so
           cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so apps/ferricstore/priv/native/ferricstore_wal_nif.so
+          cp apps/ferricstore_server/native/resp_parser_nif/target/release/libresp_parser_nif.so apps/ferricstore_server/priv/native/libresp_parser_nif.so
+          cp apps/ferricstore_server/native/resp_parser_nif/target/release/libresp_parser_nif.so apps/ferricstore_server/priv/native/resp_parser_nif.so
 
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
@@ -94,6 +98,7 @@ jobs:
             _build
             deps
             apps/ferricstore/priv/native
+            apps/ferricstore_server/priv/native
           key: build-Linux-${{ github.sha }}
 
   # ===========================================================================
@@ -159,11 +164,15 @@ jobs:
         run: |
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
+          cargo build --release --manifest-path apps/ferricstore_server/native/resp_parser_nif/Cargo.toml
           mkdir -p apps/ferricstore/priv/native
+          mkdir -p apps/ferricstore_server/priv/native
           cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib apps/ferricstore/priv/native/libferricstore_bitcask.so
           cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib apps/ferricstore/priv/native/ferricstore_bitcask.so
           cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.dylib apps/ferricstore/priv/native/libferricstore_wal_nif.so
           cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.dylib apps/ferricstore/priv/native/ferricstore_wal_nif.so
+          cp apps/ferricstore_server/native/resp_parser_nif/target/release/libresp_parser_nif.dylib apps/ferricstore_server/priv/native/libresp_parser_nif.so
+          cp apps/ferricstore_server/native/resp_parser_nif/target/release/libresp_parser_nif.dylib apps/ferricstore_server/priv/native/resp_parser_nif.so
 
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
@@ -178,6 +187,7 @@ jobs:
             _build
             deps
             apps/ferricstore/priv/native
+            apps/ferricstore_server/priv/native
           key: build-macOS-${{ github.sha }}
 
   # ===========================================================================
@@ -200,6 +210,7 @@ jobs:
             _build
             deps
             apps/ferricstore/priv/native
+            apps/ferricstore_server/priv/native
           key: build-Linux-${{ github.sha }}
       - name: Run ferricstore tests
         run: mix test apps/ferricstore/test --timeout 30000
@@ -227,6 +238,7 @@ jobs:
             _build
             deps
             apps/ferricstore/priv/native
+            apps/ferricstore_server/priv/native
           key: build-macOS-${{ github.sha }}
       - name: Run ferricstore tests
         run: mix test apps/ferricstore/test --timeout 30000
@@ -257,6 +269,7 @@ jobs:
             _build
             deps
             apps/ferricstore/priv/native
+            apps/ferricstore_server/priv/native
           key: build-Linux-${{ github.sha }}
       - name: Run ferricstore_server tests
         run: mix test apps/ferricstore_server/test --timeout 30000
@@ -284,6 +297,7 @@ jobs:
             _build
             deps
             apps/ferricstore/priv/native
+            apps/ferricstore_server/priv/native
           key: build-macOS-${{ github.sha }}
       - name: Run ferricstore_server tests
         run: mix test apps/ferricstore_server/test --timeout 30000
@@ -391,4 +405,3 @@ jobs:
           name: test-results-cluster
           path: test-results/
           retention-days: 14
-

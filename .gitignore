@@ -36,6 +36,11 @@ ferricstore-*.tar
 .claude/worktrees/
 apps/ferricstore/data/
 apps/ferricstore/priv/native/*.so
+apps/ferricstore/priv/native/*.dll
+apps/ferricstore/priv/native/*.dylib
+apps/ferricstore_server/priv/native/*.so
+apps/ferricstore_server/priv/native/*.dll
+apps/ferricstore_server/priv/native/*.dylib
 apps/ferricstore/priv/patched/*.beam
 .claude/
 test-results/
