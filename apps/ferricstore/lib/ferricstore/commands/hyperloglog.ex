@@ -32,6 +32,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
   alias Ferricstore.HyperLogLog, as: HLL
 
   @wrongtype_error {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+  @sketch_size HLL.num_registers()
 
   @doc """
   Handles typed HyperLogLog command AST terms produced by the Rust RESP parser.
@@ -83,16 +84,19 @@ defmodule Ferricstore.Commands.HyperLogLog do
   defp pfadd_args([key], store) do
     case ensure_not_compound_key(key, store) do
       :ok ->
-        case Ops.get(store, key) do
-          nil ->
+        case hll_size_state(key, store) do
+          :missing ->
             Ops.put(store, key, HLL.new(), 0)
             1
 
-          sketch ->
-            case validate_sketch(sketch) do
-              :ok -> 0
-              {:error, _} = err -> err
-            end
+          :valid_size ->
+            0
+
+          :invalid_size ->
+            @wrongtype_error
+
+          :unknown ->
+            pfadd_no_elements_from_value(key, store)
         end
 
       @wrongtype_error ->
@@ -125,6 +129,20 @@ defmodule Ferricstore.Commands.HyperLogLog do
 
   defp pfadd_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'pfadd' command"}
+  end
+
+  defp pfadd_no_elements_from_value(key, store) do
+    case Ops.get(store, key) do
+      nil ->
+        Ops.put(store, key, HLL.new(), 0)
+        1
+
+      sketch ->
+        case validate_sketch(sketch) do
+          :ok -> 0
+          {:error, _} = err -> err
+        end
+    end
   end
 
   defp pfcount_args(keys, store) when keys != [] do
@@ -164,13 +182,22 @@ defmodule Ferricstore.Commands.HyperLogLog do
 
   # Returns the existing sketch for `key`, or a new empty sketch if the key
   # does not exist.
-  @spec get_or_new(binary(), map()) :: binary()
+  @spec get_or_new(binary(), map()) :: binary() | {:error, binary()}
   defp get_or_new(key, store) do
     case ensure_not_compound_key(key, store) do
       :ok ->
-        case Ops.get(store, key) do
-          nil -> HLL.new()
-          value -> value
+        case hll_size_state(key, store) do
+          :missing ->
+            HLL.new()
+
+          :invalid_size ->
+            @wrongtype_error
+
+          :valid_size ->
+            Ops.get(store, key) || HLL.new()
+
+          :unknown ->
+            Ops.get(store, key) || HLL.new()
         end
 
       @wrongtype_error ->
@@ -179,16 +206,48 @@ defmodule Ferricstore.Commands.HyperLogLog do
   end
 
   defp read_sketches(keys, store) do
-    with :ok <- ensure_not_compound_keys(keys, store) do
+    with :ok <- ensure_not_compound_keys(keys, store),
+         :ok <- ensure_hll_candidate_sizes(keys, store) do
       store
       |> Ops.batch_get(keys)
       |> Enum.map(fn
-        nil -> HLL.new()
-        value -> value
+        nil ->
+          HLL.new()
+
+        value ->
+          value
       end)
       |> validate_sketches()
     end
   end
+
+  defp ensure_hll_candidate_sizes(keys, store) do
+    Enum.reduce_while(keys, :ok, fn key, :ok ->
+      case hll_size_state(key, store) do
+        :invalid_size -> {:halt, @wrongtype_error}
+        _ -> {:cont, :ok}
+      end
+    end)
+  end
+
+  defp hll_size_state(key, store) do
+    case metadata_value_size(store, key) do
+      nil -> :missing
+      @sketch_size -> :valid_size
+      size when is_integer(size) -> :invalid_size
+      :unknown -> :unknown
+    end
+  end
+
+  defp metadata_value_size(%FerricStore.Instance{} = store, key), do: Ops.value_size(store, key)
+
+  defp metadata_value_size(%Ferricstore.Store.LocalTxStore{} = store, key),
+    do: Ops.value_size(store, key)
+
+  defp metadata_value_size(%{value_size: value_size}, key) when is_function(value_size, 1),
+    do: value_size.(key)
+
+  defp metadata_value_size(_store, _key), do: :unknown
 
   defp ensure_not_compound_keys(keys, store) do
     Enum.reduce_while(keys, :ok, fn key, :ok ->

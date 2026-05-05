@@ -99,6 +99,22 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
       assert msg =~ "WRONGTYPE"
     end
 
+    test "PFADD rejects wrong-size cold value from metadata without loading it" do
+      store = wrong_size_cold_store(%{"mykey" => 1_048_576})
+
+      assert {:error, msg} = HLLCmd.handle("PFADD", ["mykey", "elem"], store)
+      assert msg =~ "WRONGTYPE"
+      refute_received {:loaded_cold_hll_candidate, "mykey"}
+    end
+
+    test "PFADD with no elements rejects wrong-size cold value without loading it" do
+      store = wrong_size_cold_store(%{"mykey" => 1_048_576})
+
+      assert {:error, msg} = HLLCmd.handle("PFADD", ["mykey"], store)
+      assert msg =~ "WRONGTYPE"
+      refute_received {:loaded_cold_hll_candidate, "mykey"}
+    end
+
     test "PFADD to a compound key returns WRONGTYPE and preserves it" do
       store = MockStore.make()
       Set.handle("SADD", ["mykey", "member"], store)
@@ -215,6 +231,14 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
       assert msg =~ "WRONGTYPE"
     end
 
+    test "PFCOUNT rejects wrong-size cold value from metadata without batch loading it" do
+      store = wrong_size_cold_store(%{"mykey" => 1_048_576})
+
+      assert {:error, msg} = HLLCmd.handle("PFCOUNT", ["mykey"], store)
+      assert msg =~ "WRONGTYPE"
+      refute_received {:batch_loaded_cold_hll_candidates, ["mykey"]}
+    end
+
     test "PFCOUNT on a compound key returns WRONGTYPE" do
       store = MockStore.make()
       Set.handle("SADD", ["mykey", "member"], store)
@@ -319,6 +343,14 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
       assert msg =~ "WRONGTYPE"
     end
 
+    test "PFMERGE rejects wrong-size cold source from metadata without batch loading it" do
+      store = wrong_size_cold_store(%{"dest" => HLL.num_registers(), "bad" => 1_048_576})
+
+      assert {:error, msg} = HLLCmd.handle("PFMERGE", ["dest", "bad"], store)
+      assert msg =~ "WRONGTYPE"
+      refute_received {:batch_loaded_cold_hll_candidates, ["dest", "bad"]}
+    end
+
     test "PFMERGE with dest holding non-HLL value returns WRONGTYPE error" do
       store = MockStore.make(%{"dest" => {"not-a-sketch", 0}})
 
@@ -388,5 +420,29 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
       Dispatcher.dispatch("PFADD", ["src", "a"], store)
       assert :ok = Dispatcher.dispatch("PFMERGE", ["dest", "src"], store)
     end
+  end
+
+  defp wrong_size_cold_store(sizes) do
+    parent = self()
+
+    %{
+      value_size: fn key -> Map.get(sizes, key) end,
+      get: fn key ->
+        send(parent, {:loaded_cold_hll_candidate, key})
+        :binary.copy(<<0>>, Map.fetch!(sizes, key))
+      end,
+      batch_get: fn keys ->
+        send(parent, {:batch_loaded_cold_hll_candidates, keys})
+
+        Enum.map(keys, fn key ->
+          case Map.get(sizes, key) do
+            nil -> nil
+            size -> :binary.copy(<<0>>, size)
+          end
+        end)
+      end,
+      put: fn _key, _value, _expire_at_ms -> :ok end,
+      compound_get: fn _redis_key, _compound_key -> nil end
+    }
   end
 end
