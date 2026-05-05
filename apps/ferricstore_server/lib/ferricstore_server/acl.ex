@@ -1019,12 +1019,21 @@ defmodule FerricstoreServer.Acl do
   # ---------------------------------------------------------------------------
 
   @spec apply_rules(user(), [binary()]) :: {:ok, user()} | {:error, binary()}
-  defp apply_rules(user, []), do: {:ok, user}
+  defp apply_rules(user, rules), do: apply_rules(user, rules, [])
 
-  defp apply_rules(user, [rule | rest]) do
-    case parse_rule(user, rule) do
-      {:ok, updated} -> apply_rules(updated, rest)
-      {:error, _} = err -> err
+  defp apply_rules(user, [], pending_key_patterns),
+    do: {:ok, flush_pending_key_patterns(user, pending_key_patterns)}
+
+  defp apply_rules(user, [rule | rest], pending_key_patterns) do
+    case parse_key_rule(user, rule, pending_key_patterns) do
+      {:ok, updated, next_pending} ->
+        apply_rules(updated, rest, next_pending)
+
+      :not_key_rule ->
+        case parse_rule(user, rule) do
+          {:ok, updated} -> apply_rules(updated, rest, pending_key_patterns)
+          {:error, _} = err -> err
+        end
     end
   end
 
@@ -1039,24 +1048,6 @@ defmodule FerricstoreServer.Acl do
 
   defp parse_rule(user, "nopass"), do: {:ok, %{user | password: nil}}
   defp parse_rule(user, "resetpass"), do: {:ok, %{user | password: nil}}
-
-  defp parse_rule(user, "%R~" <> pattern) do
-    compiled = {pattern, :read, compile_glob(pattern)}
-    add_key_pattern(user, compiled)
-  end
-
-  defp parse_rule(user, "%W~" <> pattern) do
-    compiled = {pattern, :write, compile_glob(pattern)}
-    add_key_pattern(user, compiled)
-  end
-
-  defp parse_rule(user, "~" <> pattern) do
-    compiled = {pattern, :rw, compile_glob(pattern)}
-    add_key_pattern(user, compiled)
-  end
-
-  defp parse_rule(user, "resetkeys"), do: {:ok, %{user | keys: []}}
-  defp parse_rule(user, "allkeys"), do: {:ok, %{user | keys: :all}}
 
   defp parse_rule(user, "allcommands") do
     {:ok, %{user | commands: :all, denied_commands: MapSet.new()}}
@@ -1148,14 +1139,42 @@ defmodule FerricstoreServer.Acl do
     {:error, "ERR Error in ACL SETUSER modifier '#{rule}': Syntax error"}
   end
 
-  # Appends a compiled key pattern to the user's key list.
-  # If the user currently has :all keys access, replaces it with just this pattern.
-  @spec add_key_pattern(user(), key_pattern()) :: {:ok, user()}
-  defp add_key_pattern(user, compiled_pattern) do
-    case user.keys do
-      :all -> {:ok, %{user | keys: [compiled_pattern]}}
-      patterns -> {:ok, %{user | keys: patterns ++ [compiled_pattern]}}
-    end
+  defp parse_key_rule(user, "%R~" <> pattern, pending_key_patterns) do
+    queue_key_pattern(user, {pattern, :read, compile_glob(pattern)}, pending_key_patterns)
+  end
+
+  defp parse_key_rule(user, "%W~" <> pattern, pending_key_patterns) do
+    queue_key_pattern(user, {pattern, :write, compile_glob(pattern)}, pending_key_patterns)
+  end
+
+  defp parse_key_rule(user, "~" <> pattern, pending_key_patterns) do
+    queue_key_pattern(user, {pattern, :rw, compile_glob(pattern)}, pending_key_patterns)
+  end
+
+  defp parse_key_rule(user, "resetkeys", _pending_key_patterns),
+    do: {:ok, %{user | keys: []}, []}
+
+  defp parse_key_rule(user, "allkeys", _pending_key_patterns),
+    do: {:ok, %{user | keys: :all}, []}
+
+  defp parse_key_rule(_user, _rule, _pending_key_patterns), do: :not_key_rule
+
+  defp queue_key_pattern(%{keys: :all} = user, compiled_pattern, pending_key_patterns) do
+    {:ok, %{user | keys: []}, [compiled_pattern | pending_key_patterns]}
+  end
+
+  defp queue_key_pattern(user, compiled_pattern, pending_key_patterns) do
+    {:ok, user, [compiled_pattern | pending_key_patterns]}
+  end
+
+  defp flush_pending_key_patterns(user, []), do: user
+
+  defp flush_pending_key_patterns(%{keys: []} = user, pending_key_patterns) do
+    %{user | keys: Enum.reverse(pending_key_patterns)}
+  end
+
+  defp flush_pending_key_patterns(user, pending_key_patterns) do
+    %{user | keys: user.keys ++ Enum.reverse(pending_key_patterns)}
   end
 
   # ---------------------------------------------------------------------------
@@ -1555,20 +1574,31 @@ defmodule FerricstoreServer.Acl do
       keys: []
     }
 
-    result =
-      Enum.reduce_while(tokens, {:ok, base}, fn token, {:ok, user} ->
-        case parse_file_token(user, token) do
-          {:ok, updated} ->
-            {:cont, {:ok, updated}}
-
-          {:error, reason} ->
-            {:halt, {:error, "ERR Invalid ACL line #{line_num}: #{reason}"}}
-        end
-      end)
+    result = parse_file_rules(tokens, line_num, base, [])
 
     case result do
       {:ok, user_map} -> {:ok, {username, user_map}}
       {:error, _} = err -> err
+    end
+  end
+
+  defp parse_file_rules([], _line_num, user, pending_key_patterns) do
+    {:ok, flush_pending_key_patterns(user, pending_key_patterns)}
+  end
+
+  defp parse_file_rules([token | rest], line_num, user, pending_key_patterns) do
+    case parse_file_key_token(user, token, pending_key_patterns) do
+      {:ok, updated, next_pending} ->
+        parse_file_rules(rest, line_num, updated, next_pending)
+
+      :not_key_token ->
+        case parse_file_token(user, token) do
+          {:ok, updated} ->
+            parse_file_rules(rest, line_num, updated, pending_key_patterns)
+
+          {:error, reason} ->
+            {:error, "ERR Invalid ACL line #{line_num}: #{reason}"}
+        end
     end
   end
 
@@ -1592,25 +1622,6 @@ defmodule FerricstoreServer.Acl do
       :error ->
         {:error, "invalid password hash encoding"}
     end
-  end
-
-  defp parse_file_token(user, "~*"), do: {:ok, %{user | keys: :all}}
-  defp parse_file_token(user, "allkeys"), do: {:ok, %{user | keys: :all}}
-  defp parse_file_token(user, "resetkeys"), do: {:ok, %{user | keys: []}}
-
-  defp parse_file_token(user, "%R~" <> pattern) do
-    compiled = {pattern, :read, compile_glob(pattern)}
-    file_add_key_pattern(user, compiled)
-  end
-
-  defp parse_file_token(user, "%W~" <> pattern) do
-    compiled = {pattern, :write, compile_glob(pattern)}
-    file_add_key_pattern(user, compiled)
-  end
-
-  defp parse_file_token(user, "~" <> pattern) do
-    compiled = {pattern, :rw, compile_glob(pattern)}
-    file_add_key_pattern(user, compiled)
   end
 
   # Channel patterns (accepted but not enforced beyond &*)
@@ -1700,13 +1711,33 @@ defmodule FerricstoreServer.Acl do
     {:error, "unknown token '#{token}'"}
   end
 
-  # Adds a key pattern during file parsing. If keys is already :all,
-  # additional specific patterns after ~* don't downgrade -- :all is kept.
-  @spec file_add_key_pattern(user(), key_pattern()) :: {:ok, user()}
-  defp file_add_key_pattern(user, compiled_pattern) do
+  defp parse_file_key_token(user, "~*", _pending_key_patterns),
+    do: {:ok, %{user | keys: :all}, []}
+
+  defp parse_file_key_token(user, "allkeys", _pending_key_patterns),
+    do: {:ok, %{user | keys: :all}, []}
+
+  defp parse_file_key_token(user, "resetkeys", _pending_key_patterns),
+    do: {:ok, %{user | keys: []}, []}
+
+  defp parse_file_key_token(user, "%R~" <> pattern, pending_key_patterns) do
+    queue_file_key_pattern(user, {pattern, :read, compile_glob(pattern)}, pending_key_patterns)
+  end
+
+  defp parse_file_key_token(user, "%W~" <> pattern, pending_key_patterns) do
+    queue_file_key_pattern(user, {pattern, :write, compile_glob(pattern)}, pending_key_patterns)
+  end
+
+  defp parse_file_key_token(user, "~" <> pattern, pending_key_patterns) do
+    queue_file_key_pattern(user, {pattern, :rw, compile_glob(pattern)}, pending_key_patterns)
+  end
+
+  defp parse_file_key_token(_user, _token, _pending_key_patterns), do: :not_key_token
+
+  defp queue_file_key_pattern(user, compiled_pattern, pending_key_patterns) do
     case user.keys do
-      :all -> {:ok, %{user | keys: :all}}
-      patterns -> {:ok, %{user | keys: patterns ++ [compiled_pattern]}}
+      :all -> {:ok, user, pending_key_patterns}
+      _patterns -> {:ok, user, [compiled_pattern | pending_key_patterns]}
     end
   end
 

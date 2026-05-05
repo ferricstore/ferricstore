@@ -100,9 +100,10 @@ defmodule FerricstoreServer.AclPersistenceTest do
         |> String.split("\n")
         |> Enum.filter(&String.starts_with?(&1, "user "))
 
-      names = Enum.map(lines, fn line ->
-        line |> String.split(" ") |> Enum.at(1)
-      end)
+      names =
+        Enum.map(lines, fn line ->
+          line |> String.split(" ") |> Enum.at(1)
+        end)
 
       assert names == Enum.sort(names)
     end
@@ -322,6 +323,21 @@ defmodule FerricstoreServer.AclPersistenceTest do
       assert key_globs(user.keys) == ["cache:*", "session:*"]
     end
 
+    test "loads many key patterns in file order", %{tmp_dir: dir} do
+      patterns = Enum.map(1..128, &"tenant:#{&1}:*")
+      rules = Enum.map_join(patterns, " ", &"~#{&1}")
+
+      File.write!(
+        Acl.acl_file_path(dir),
+        "user default on nopass ~* &* +@all\nuser alice on nopass #{rules} &* +@all\n"
+      )
+
+      assert :ok = Acl.load(dir)
+
+      user = Acl.get_user("alice")
+      assert key_globs(user.keys) == patterns
+    end
+
     test "preserves nopass users", %{tmp_dir: dir} do
       assert :ok = Acl.set_user("alice", ["on", "nopass"])
       assert :ok = Acl.save(dir)
@@ -415,7 +431,11 @@ defmodule FerricstoreServer.AclPersistenceTest do
 
     test "rejects file with invalid password hash encoding", %{tmp_dir: dir} do
       path = Acl.acl_file_path(dir)
-      File.write!(path, "user default on nopass ~* &* +@all\nuser alice on #not-valid-base64!!! ~* &* +@all\n")
+
+      File.write!(
+        path,
+        "user default on nopass ~* &* +@all\nuser alice on #not-valid-base64!!! ~* &* +@all\n"
+      )
 
       assert {:error, msg} = Acl.load(dir)
       assert msg =~ "invalid password hash"
@@ -425,7 +445,11 @@ defmodule FerricstoreServer.AclPersistenceTest do
       # Valid base64 but wrong length (not 48 bytes decoded)
       short_hash = Base.encode64("tooshort")
       path = Acl.acl_file_path(dir)
-      File.write!(path, "user default on nopass ~* &* +@all\nuser alice on ##{short_hash} ~* &* +@all\n")
+
+      File.write!(
+        path,
+        "user default on nopass ~* &* +@all\nuser alice on ##{short_hash} ~* &* +@all\n"
+      )
 
       assert {:error, msg} = Acl.load(dir)
       assert msg =~ "invalid password hash length"
@@ -480,7 +504,11 @@ defmodule FerricstoreServer.AclPersistenceTest do
 
     test "handles Windows line endings (CRLF)", %{tmp_dir: dir} do
       path = Acl.acl_file_path(dir)
-      File.write!(path, "user default on nopass ~* &* +@all\r\nuser alice on nopass ~* &* +@all\r\n")
+
+      File.write!(
+        path,
+        "user default on nopass ~* &* +@all\r\nuser alice on nopass ~* &* +@all\r\n"
+      )
 
       assert :ok = Acl.load(dir)
       assert Acl.get_user("alice") != nil
@@ -488,7 +516,11 @@ defmodule FerricstoreServer.AclPersistenceTest do
 
     test "handles trailing whitespace", %{tmp_dir: dir} do
       path = Acl.acl_file_path(dir)
-      File.write!(path, "user default on nopass ~* &* +@all   \nuser alice on nopass ~* &* +@all  \n")
+
+      File.write!(
+        path,
+        "user default on nopass ~* &* +@all   \nuser alice on nopass ~* &* +@all  \n"
+      )
 
       assert :ok = Acl.load(dir)
       assert Acl.get_user("alice") != nil
@@ -669,7 +701,10 @@ defmodule FerricstoreServer.AclPersistenceTest do
       Application.put_env(:ferricstore, :data_dir, dir)
 
       on_exit(fn ->
-        if prev_auto, do: Application.put_env(:ferricstore, :acl_auto_save, prev_auto), else: Application.delete_env(:ferricstore, :acl_auto_save)
+        if prev_auto,
+          do: Application.put_env(:ferricstore, :acl_auto_save, prev_auto),
+          else: Application.delete_env(:ferricstore, :acl_auto_save)
+
         if prev_dir, do: Application.put_env(:ferricstore, :data_dir, prev_dir)
       end)
 
@@ -691,7 +726,10 @@ defmodule FerricstoreServer.AclPersistenceTest do
       Application.put_env(:ferricstore, :data_dir, dir)
 
       on_exit(fn ->
-        if prev_auto, do: Application.put_env(:ferricstore, :acl_auto_save, prev_auto), else: Application.delete_env(:ferricstore, :acl_auto_save)
+        if prev_auto,
+          do: Application.put_env(:ferricstore, :acl_auto_save, prev_auto),
+          else: Application.delete_env(:ferricstore, :acl_auto_save)
+
         if prev_dir, do: Application.put_env(:ferricstore, :data_dir, prev_dir)
       end)
 
@@ -719,7 +757,10 @@ defmodule FerricstoreServer.AclPersistenceTest do
       Application.put_env(:ferricstore, :data_dir, dir)
 
       on_exit(fn ->
-        if prev_auto, do: Application.put_env(:ferricstore, :acl_auto_save, prev_auto), else: Application.delete_env(:ferricstore, :acl_auto_save)
+        if prev_auto,
+          do: Application.put_env(:ferricstore, :acl_auto_save, prev_auto),
+          else: Application.delete_env(:ferricstore, :acl_auto_save)
+
         if prev_dir, do: Application.put_env(:ferricstore, :data_dir, prev_dir)
       end)
 
@@ -842,10 +883,13 @@ defmodule FerricstoreServer.AclPersistenceTest do
 
       # On slow CI the GenServer may still be processing the load.
       # Retry until the user count stabilizes.
-      eventually(fn ->
-        users = Acl.list_users()
-        length(users) == 1001
-      end, "expected 1001 users (1000 + default) after load")
+      eventually(
+        fn ->
+          users = Acl.list_users()
+          length(users) == 1001
+        end,
+        "expected 1001 users (1000 + default) after load"
+      )
 
       # Spot check authentication
       assert {:ok, _} = Acl.authenticate("user_0001", "pass1")
@@ -919,7 +963,9 @@ defmodule FerricstoreServer.AclPersistenceTest do
 
       contents = File.read!(Acl.acl_file_path(dir))
       # User with no commands should not have +@all in the file
-      alice_line = contents |> String.split("\n") |> Enum.find(&String.contains?(&1, "user alice"))
+      alice_line =
+        contents |> String.split("\n") |> Enum.find(&String.contains?(&1, "user alice"))
+
       refute alice_line =~ "+@all"
 
       Acl.reset!()

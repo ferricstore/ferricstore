@@ -186,11 +186,35 @@ defmodule FerricstoreServer.AclTest do
       assert key_globs(user.keys) == ["cache:*", "session:*"]
     end
 
+    test "many key patterns preserve order without per-pattern list appends" do
+      source =
+        Path.join([__DIR__, "../../lib/ferricstore_server/acl.ex"])
+        |> Path.expand()
+        |> File.read!()
+
+      refute source =~ "patterns ++ [compiled_pattern]"
+
+      patterns = Enum.map(1..128, &"tenant:#{&1}:*")
+      rules = ["on" | Enum.map(patterns, &"~#{&1}")]
+
+      assert :ok = Acl.set_user("alice", rules)
+      user = Acl.get_user("alice")
+      assert key_globs(user.keys) == patterns
+    end
+
     test "allkeys sets keys to :all" do
       assert :ok = Acl.set_user("alice", ["on", "~cache:*"])
       assert :ok = Acl.set_user("alice", ["allkeys"])
       user = Acl.get_user("alice")
       assert user.keys == :all
+    end
+
+    test "resetkeys and allkeys discard queued key patterns in order" do
+      assert :ok = Acl.set_user("alice", ["on", "~before:*", "resetkeys", "~after:*"])
+      assert key_globs(Acl.get_user("alice").keys) == ["after:*"]
+
+      assert :ok = Acl.set_user("bob", ["on", "~before:*", "allkeys", "~after:*"])
+      assert key_globs(Acl.get_user("bob").keys) == ["after:*"]
     end
 
     test "~* on new user replaces default :all with explicit pattern" do
@@ -261,14 +285,15 @@ defmodule FerricstoreServer.AclTest do
 
   describe "set_user/2 with combined rules" do
     test "applies all rules in order" do
-      assert :ok = Acl.set_user("alice", [
-        "on",
-        ">s3cret",
-        "~cache:*",
-        "-@all",
-        "+get",
-        "+set"
-      ])
+      assert :ok =
+               Acl.set_user("alice", [
+                 "on",
+                 ">s3cret",
+                 "~cache:*",
+                 "-@all",
+                 "+get",
+                 "+set"
+               ])
 
       user = Acl.get_user("alice")
       assert user.enabled == true
@@ -374,10 +399,12 @@ defmodule FerricstoreServer.AclTest do
       assert :ok = Acl.set_user("bob", ["on"])
 
       users = Acl.list_users()
-      names = Enum.map(users, fn s ->
-        # Extract username from "user <name> on/off ..."
-        s |> String.split(" ") |> Enum.at(1)
-      end)
+
+      names =
+        Enum.map(users, fn s ->
+          # Extract username from "user <name> on/off ..."
+          s |> String.split(" ") |> Enum.at(1)
+        end)
 
       assert names == Enum.sort(names)
     end
