@@ -168,4 +168,40 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert_received {:pubsub_message, "__keyevent@0__:mset", ^key_a}
     assert_received {:pubsub_message, "__keyevent@0__:mset", ^key_b}
   end
+
+  test "RENAME keyspace notification fires for source and destination" do
+    source = "tracking:keyspace:rename:src"
+    destination = "tracking:keyspace:rename:dst"
+    Config.set("notify-keyspace-events", "KEg")
+    PubSub.subscribe("__keyspace@0__:#{source}", self())
+    PubSub.subscribe("__keyspace@0__:#{destination}", self())
+    PubSub.subscribe("__keyevent@0__:rename", self())
+
+    Tracking.maybe_notify_keyspace("RENAME", [source, destination], :ok)
+
+    assert_received {:pubsub_message, "__keyspace@0__:" <> ^source, "rename"}
+    assert_received {:pubsub_message, "__keyspace@0__:" <> ^destination, "rename"}
+    assert_received {:pubsub_message, "__keyevent@0__:rename", ^source}
+    assert_received {:pubsub_message, "__keyevent@0__:rename", ^destination}
+  end
+
+  test "RENAMENX keyspace notification fires only when rename succeeds" do
+    source = "tracking:keyspace:renamenx:src"
+    destination = "tracking:keyspace:renamenx:dst"
+    Config.set("notify-keyspace-events", "KEg")
+    PubSub.subscribe("__keyspace@0__:#{source}", self())
+    PubSub.subscribe("__keyspace@0__:#{destination}", self())
+    PubSub.subscribe("__keyevent@0__:rename", self())
+
+    Tracking.maybe_notify_keyspace("RENAMENX", [source, destination], 0)
+
+    refute_received {:pubsub_message, _, _}
+
+    Tracking.maybe_notify_keyspace("RENAMENX", [source, destination], 1)
+
+    assert_received {:pubsub_message, "__keyspace@0__:" <> ^source, "rename"}
+    assert_received {:pubsub_message, "__keyspace@0__:" <> ^destination, "rename"}
+    assert_received {:pubsub_message, "__keyevent@0__:rename", ^source}
+    assert_received {:pubsub_message, "__keyevent@0__:rename", ^destination}
+  end
 end

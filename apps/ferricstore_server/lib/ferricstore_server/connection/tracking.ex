@@ -63,6 +63,7 @@ defmodule FerricstoreServer.Connection.Tracking do
     "PEXPIREAT" => "pexpireat",
     "PERSIST" => "persist",
     "RENAME" => "rename",
+    "RENAMENX" => "rename",
     "LPUSH" => "lpush",
     "RPUSH" => "rpush",
     "LPOP" => "lpop",
@@ -121,6 +122,18 @@ defmodule FerricstoreServer.Connection.Tracking do
   end
 
   def do_notify_keyspace("COPY", _event, _args, _result), do: :ok
+
+  def do_notify_keyspace("RENAME", event, [source, destination], :ok) do
+    KeyspaceNotifications.notify(source, event)
+    KeyspaceNotifications.notify(destination, event)
+  end
+
+  def do_notify_keyspace("RENAMENX", event, [source, destination], 1) do
+    KeyspaceNotifications.notify(source, event)
+    KeyspaceNotifications.notify(destination, event)
+  end
+
+  def do_notify_keyspace("RENAMENX", _event, _args, _result), do: :ok
 
   def do_notify_keyspace("LMOVE", event, [source, destination | _], :ok) do
     KeyspaceNotifications.notify(source, event)
