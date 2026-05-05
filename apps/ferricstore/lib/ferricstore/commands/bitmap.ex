@@ -59,34 +59,10 @@ defmodule Ferricstore.Commands.Bitmap do
          {:ok, offset} <- parse_non_negative_integer(offset_str, "bit offset"),
          :ok <- check_bit_offset(offset),
          {:ok, bit_val} <- parse_bit_value(bit_str) do
-      {current, expire_at_ms} =
-        case Ops.get_meta(store, key) do
-          nil -> {<<>>, 0}
-          {value, exp} -> {value, exp}
-        end
-
-      byte_index = div(offset, 8)
-      # Extend the binary with zero bytes if needed
-      extended = extend_binary(current, byte_index + 1)
-
-      # Read the old bit
-      old_byte = :binary.at(extended, byte_index)
-      bit_position = 7 - rem(offset, 8)
-      old_bit = old_byte >>> bit_position &&& 1
-
-      # Set the new bit
-      new_byte =
-        case bit_val do
-          1 -> old_byte ||| 1 <<< bit_position
-          0 -> old_byte &&& Bitwise.bnot(1 <<< bit_position)
-        end
-
-      # Replace the byte in the binary
-      <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
-      new_value = <<prefix::binary, new_byte::8, suffix::binary>>
-
-      Ops.put(store, key, new_value, expire_at_ms)
-      old_bit
+      case setbit_noop_from_store(store, key, offset, bit_val) do
+        {:ok, old_bit} -> old_bit
+        :unknown -> setbit_rewrite(key, offset, bit_val, store)
+      end
     end
   end
 
@@ -483,6 +459,64 @@ defmodule Ferricstore.Commands.Bitmap do
       <<byte>> -> byte
       _ -> nil
     end
+  end
+
+  defp setbit_noop_from_store(store, key, offset, bit_val) do
+    byte_index = div(offset, 8)
+
+    with size when is_integer(size) and byte_index < size <-
+           setbit_noop_candidate_size(store, key),
+         byte when is_integer(byte) <- byte_at(store, key, byte_index) do
+      bit_position = 7 - rem(offset, 8)
+      old_bit = byte >>> bit_position &&& 1
+
+      if old_bit == bit_val, do: {:ok, old_bit}, else: :unknown
+    else
+      _ -> :unknown
+    end
+  end
+
+  defp setbit_noop_candidate_size(%FerricStore.Instance{} = store, key) do
+    case Ferricstore.Store.Router.get_keydir_file_ref(store, key) do
+      {:ok, {_fid, _offset, value_size}} -> value_size
+      :miss -> :unknown
+    end
+  end
+
+  defp setbit_noop_candidate_size(%{value_size: value_size}, key) when is_function(value_size, 1),
+    do: value_size.(key)
+
+  defp setbit_noop_candidate_size(_store, _key), do: :unknown
+
+  defp setbit_rewrite(key, offset, bit_val, store) do
+    {current, expire_at_ms} =
+      case Ops.get_meta(store, key) do
+        nil -> {<<>>, 0}
+        {value, exp} -> {value, exp}
+      end
+
+    byte_index = div(offset, 8)
+    # Extend the binary with zero bytes if needed
+    extended = extend_binary(current, byte_index + 1)
+
+    # Read the old bit
+    old_byte = :binary.at(extended, byte_index)
+    bit_position = 7 - rem(offset, 8)
+    old_bit = old_byte >>> bit_position &&& 1
+
+    # Set the new bit
+    new_byte =
+      case bit_val do
+        1 -> old_byte ||| 1 <<< bit_position
+        0 -> old_byte &&& Bitwise.bnot(1 <<< bit_position)
+      end
+
+    # Replace the byte in the binary
+    <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
+    new_value = <<prefix::binary, new_byte::8, suffix::binary>>
+
+    Ops.put(store, key, new_value, expire_at_ms)
+    old_bit
   end
 
   defp bitcount_range_empty_without_value?(_store, _key, _mode, start_idx, end_idx)

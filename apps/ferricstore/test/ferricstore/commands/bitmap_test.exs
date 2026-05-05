@@ -62,6 +62,35 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert 1 == Bitmap.handle("SETBIT", ["mykey", "0", "1"], store)
     end
 
+    test "no-op on cold byte reads only the target byte" do
+      parent = self()
+
+      store = %{
+        value_size: fn
+          "cold" -> 2
+        end,
+        getrange: fn
+          "cold", 0, 0 ->
+            send(parent, {:read_byte, 0})
+            <<0b10000000>>
+        end,
+        get_meta: fn "cold" ->
+          send(parent, :loaded_full_cold_value)
+          {<<0b10000000, 0>>, 0}
+        end,
+        put: fn "cold", _value, _expire_at_ms ->
+          send(parent, :rewrote_cold_value)
+          :ok
+        end,
+        compound_get: fn _redis_key, _compound_key -> nil end
+      }
+
+      assert 1 == Bitmap.handle("SETBIT", ["cold", "0", "1"], store)
+      assert_received {:read_byte, 0}
+      refute_received :loaded_full_cold_value
+      refute_received :rewrote_cold_value
+    end
+
     test "at offset 0 sets MSB of byte 0" do
       store = MockStore.make()
       assert 0 == Bitmap.handle("SETBIT", ["mykey", "0", "1"], store)
