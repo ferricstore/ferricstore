@@ -68,6 +68,25 @@ defmodule FerricstoreServer.PubSubTest do
     sock
   end
 
+  defp eventually(fun, timeout_ms \\ 500) when is_function(fun, 0) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_eventually(fun, deadline)
+  end
+
+  defp do_eventually(fun, deadline) do
+    try do
+      fun.()
+    rescue
+      error in [ExUnit.AssertionError] ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          reraise error, __STACKTRACE__
+        else
+          Process.sleep(10)
+          do_eventually(fun, deadline)
+        end
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Setup
   # ---------------------------------------------------------------------------
@@ -95,6 +114,17 @@ defmodule FerricstoreServer.PubSubTest do
       assert_receive {:pubsub_message, "news", "hello world"}, 1000
     end
 
+    test "duplicate exact subscription is idempotent" do
+      PubSub.subscribe("news", self())
+      PubSub.subscribe("news", self())
+
+      assert PubSub.numsub(["news"]) == ["news", 1]
+      assert PubSub.publish("news", "hello world") == 1
+
+      assert_receive {:pubsub_message, "news", "hello world"}, 1000
+      refute_receive {:pubsub_message, "news", "hello world"}, 100
+    end
+
     test "subscriber does not receive message on different channel" do
       PubSub.subscribe("news", self())
       PubSub.publish("sports", "goal!")
@@ -109,6 +139,17 @@ defmodule FerricstoreServer.PubSubTest do
       PubSub.publish("news.tech", "AI breakthrough")
 
       assert_receive {:pubsub_pmessage, "news.*", "news.tech", "AI breakthrough"}, 1000
+    end
+
+    test "duplicate pattern subscription is idempotent" do
+      PubSub.psubscribe("news.*", self())
+      PubSub.psubscribe("news.*", self())
+
+      assert PubSub.numpat() == 1
+      assert PubSub.publish("news.tech", "AI breakthrough") == 1
+
+      assert_receive {:pubsub_pmessage, "news.*", "news.tech", "AI breakthrough"}, 1000
+      refute_receive {:pubsub_pmessage, "news.*", "news.tech", "AI breakthrough"}, 100
     end
 
     test "pattern subscriber does not receive non-matching message" do
@@ -285,6 +326,34 @@ defmodule FerricstoreServer.PubSubTest do
       assert PubSub.channels() == []
       assert PubSub.numpat() == 0
       assert PubSub.publish("ch1", "missed") == 0
+    end
+
+    test "dead exact subscribers are removed without explicit cleanup" do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+
+      PubSub.subscribe("stale", pid)
+      assert PubSub.numsub(["stale"]) == ["stale", 1]
+
+      Process.exit(pid, :kill)
+
+      eventually(fn ->
+        assert PubSub.numsub(["stale"]) == ["stale", 0]
+        assert PubSub.publish("stale", "missed") == 0
+      end)
+    end
+
+    test "dead pattern subscribers are removed without explicit cleanup" do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+
+      PubSub.psubscribe("stale.*", pid)
+      assert PubSub.numpat() == 1
+
+      Process.exit(pid, :kill)
+
+      eventually(fn ->
+        assert PubSub.numpat() == 0
+        assert PubSub.publish("stale.channel", "missed") == 0
+      end)
     end
   end
 

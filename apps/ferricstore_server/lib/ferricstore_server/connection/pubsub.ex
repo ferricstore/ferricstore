@@ -16,7 +16,8 @@ defmodule FerricstoreServer.Connection.PubSub do
   @spec dispatch_subscribe([binary()], map()) ::
           {:continue, iodata(), map()} | {:quit, iodata(), map()}
   def dispatch_subscribe([], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'subscribe' command"}), state}
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'subscribe' command"}),
+     state}
   end
 
   def dispatch_subscribe(channels, state) do
@@ -25,13 +26,18 @@ defmodule FerricstoreServer.Connection.PubSub do
 
     current_count = MapSet.size(state.pubsub_channels) + MapSet.size(state.pubsub_patterns)
 
-    if current_count + length(channels) > @max_subscriptions do
+    new_channel_count =
+      channels |> MapSet.new() |> MapSet.difference(state.pubsub_channels) |> MapSet.size()
+
+    if current_count + new_channel_count > @max_subscriptions do
       {:continue,
-       Encoder.encode({:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}), state}
+       Encoder.encode(
+         {:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}
+       ), state}
     else
       {responses, new_state} =
         Enum.reduce(channels, {[], state}, fn ch, {acc, st} ->
-          PS.subscribe(ch, self())
+          unless MapSet.member?(st.pubsub_channels, ch), do: PS.subscribe(ch, self())
           new_channels = MapSet.put(st.pubsub_channels, ch)
           new_st = %{st | pubsub_channels: new_channels}
           count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
@@ -76,7 +82,8 @@ defmodule FerricstoreServer.Connection.PubSub do
   @spec dispatch_psubscribe([binary()], map()) ::
           {:continue, iodata(), map()} | {:quit, iodata(), map()}
   def dispatch_psubscribe([], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'psubscribe' command"}), state}
+    {:continue,
+     Encoder.encode({:error, "ERR wrong number of arguments for 'psubscribe' command"}), state}
   end
 
   def dispatch_psubscribe(patterns, state) do
@@ -84,13 +91,18 @@ defmodule FerricstoreServer.Connection.PubSub do
 
     current_count = MapSet.size(state.pubsub_channels) + MapSet.size(state.pubsub_patterns)
 
-    if current_count + length(patterns) > @max_subscriptions do
+    new_pattern_count =
+      patterns |> MapSet.new() |> MapSet.difference(state.pubsub_patterns) |> MapSet.size()
+
+    if current_count + new_pattern_count > @max_subscriptions do
       {:continue,
-       Encoder.encode({:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}), state}
+       Encoder.encode(
+         {:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}
+       ), state}
     else
       {responses, new_state} =
         Enum.reduce(patterns, {[], state}, fn pat, {acc, st} ->
-          PS.psubscribe(pat, self())
+          unless MapSet.member?(st.pubsub_patterns, pat), do: PS.psubscribe(pat, self())
           new_patterns = MapSet.put(st.pubsub_patterns, pat)
           new_st = %{st | pubsub_patterns: new_patterns}
           count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
@@ -135,5 +147,6 @@ defmodule FerricstoreServer.Connection.PubSub do
   defp ensure_pubsub_sets(%{pubsub_channels: nil} = state) do
     %{state | pubsub_channels: MapSet.new(), pubsub_patterns: MapSet.new()}
   end
+
   defp ensure_pubsub_sets(state), do: state
 end

@@ -11,14 +11,19 @@ defmodule Ferricstore.PubSub do
   Two ETS tables back the registry:
 
     * `:ferricstore_pubsub` — `{channel, pid}` entries for exact channel
-      subscriptions. Uses a `:duplicate_bag` so multiple pids can subscribe
-      to the same channel.
+      subscriptions. Uses a `:bag` so multiple pids can subscribe to the same
+      channel while duplicate subscriptions from the same pid remain collapsed.
 
     * `:ferricstore_pubsub_patterns` — `{pattern, pid, compiled_regex}` entries
-      for glob-pattern subscriptions (PSUBSCRIBE). Also a `:duplicate_bag`.
+      for glob-pattern subscriptions (PSUBSCRIBE). Also a `:bag`.
 
   Both tables are owned by a `GenServer` (`Ferricstore.PubSub`) so they survive
   the lifetime of the application and are cleaned up on shutdown.
+
+  Subscriber pids are monitored once by the owner process. If a connection dies
+  before running its normal cleanup path, the monitor removes its channel and
+  pattern entries so publish counts and PUBSUB introspection do not retain stale
+  subscribers.
 
   ## Message protocol
 
@@ -35,6 +40,7 @@ defmodule Ferricstore.PubSub do
 
   @channels_table :ferricstore_pubsub
   @patterns_table :ferricstore_pubsub_patterns
+  @monitors_table :ferricstore_pubsub_monitors
 
   @type channel :: binary()
   @type pattern :: binary()
@@ -59,8 +65,7 @@ defmodule Ferricstore.PubSub do
   Subscribes `pid` to the given `channel`.
 
   The subscription is idempotent — calling it twice with the same pid and
-  channel will create a duplicate ETS entry, so callers should track their
-  own subscriptions to avoid double-subscribing.
+  channel keeps a single registry entry.
 
   ## Parameters
 
@@ -74,6 +79,7 @@ defmodule Ferricstore.PubSub do
   @spec subscribe(channel(), pid()) :: :ok
   def subscribe(channel, pid) when is_binary(channel) and is_pid(pid) do
     :ets.insert(@channels_table, {channel, pid})
+    ensure_monitor(pid)
     :ok
   end
 
@@ -95,6 +101,7 @@ defmodule Ferricstore.PubSub do
   @spec unsubscribe(channel(), pid()) :: :ok
   def unsubscribe(channel, pid) when is_binary(channel) and is_pid(pid) do
     :ets.match_delete(@channels_table, {channel, pid})
+    maybe_demonitor(pid)
     :ok
   end
 
@@ -115,8 +122,12 @@ defmodule Ferricstore.PubSub do
   """
   @spec psubscribe(pattern(), pid()) :: :ok
   def psubscribe(pattern, pid) when is_binary(pattern) and is_pid(pid) do
-    regex = glob_to_regex(pattern)
-    :ets.insert(@patterns_table, {pattern, pid, regex})
+    if :ets.match(@patterns_table, {pattern, pid, :_}) == [] do
+      regex = glob_to_regex(pattern)
+      :ets.insert(@patterns_table, {pattern, pid, regex})
+      ensure_monitor(pid)
+    end
+
     :ok
   end
 
@@ -138,6 +149,7 @@ defmodule Ferricstore.PubSub do
   def punsubscribe(pattern, pid) when is_binary(pattern) and is_pid(pid) do
     # match_delete with a wildcard for the compiled regex
     :ets.match_delete(@patterns_table, {pattern, pid, :_})
+    maybe_demonitor(pid)
     :ok
   end
 
@@ -265,8 +277,8 @@ defmodule Ferricstore.PubSub do
   """
   @spec cleanup(pid()) :: :ok
   def cleanup(pid) when is_pid(pid) do
-    :ets.match_delete(@channels_table, {:_, pid})
-    :ets.match_delete(@patterns_table, {:_, pid, :_})
+    cleanup_pid(pid)
+    maybe_demonitor(pid)
     :ok
   end
 
@@ -276,14 +288,81 @@ defmodule Ferricstore.PubSub do
 
   @impl true
   def init(_opts) do
-    :ets.new(@channels_table, [:named_table, :duplicate_bag, :public, read_concurrency: true])
-    :ets.new(@patterns_table, [:named_table, :duplicate_bag, :public, read_concurrency: true])
+    :ets.new(@channels_table, [:named_table, :bag, :public, read_concurrency: true])
+    :ets.new(@patterns_table, [:named_table, :bag, :public, read_concurrency: true])
+    :ets.new(@monitors_table, [:named_table, :set, :protected, read_concurrency: true])
     {:ok, %{}}
+  end
+
+  @impl true
+  def handle_call({:ensure_monitor, pid}, _from, state) do
+    case :ets.lookup(@monitors_table, pid) do
+      [] ->
+        ref = Process.monitor(pid)
+        :ets.insert(@monitors_table, {pid, ref})
+        {:reply, :ok, state}
+
+      [_] ->
+        {:reply, :ok, state}
+    end
+  end
+
+  @impl true
+  def handle_call({:maybe_demonitor, pid}, _from, state) do
+    demonitor_if_unused(pid)
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
+    case :ets.lookup(@monitors_table, pid) do
+      [{^pid, ^ref}] ->
+        :ets.delete(@monitors_table, pid)
+        cleanup_pid(pid)
+
+      _ ->
+        :ok
+    end
+
+    {:noreply, state}
   end
 
   # ---------------------------------------------------------------------------
   # Private — glob-to-regex conversion
   # ---------------------------------------------------------------------------
+
+  defp ensure_monitor(pid) do
+    GenServer.call(__MODULE__, {:ensure_monitor, pid})
+  end
+
+  defp maybe_demonitor(pid) do
+    GenServer.call(__MODULE__, {:maybe_demonitor, pid})
+  end
+
+  defp demonitor_if_unused(pid) do
+    if subscribed?(pid) do
+      :ok
+    else
+      case :ets.lookup(@monitors_table, pid) do
+        [{^pid, ref}] ->
+          Process.demonitor(ref, [:flush])
+          :ets.delete(@monitors_table, pid)
+
+        [] ->
+          :ok
+      end
+    end
+  end
+
+  defp subscribed?(pid) do
+    :ets.match(@channels_table, {:_, pid}) != [] or
+      :ets.match(@patterns_table, {:_, pid, :_}) != []
+  end
+
+  defp cleanup_pid(pid) do
+    :ets.match_delete(@channels_table, {:_, pid})
+    :ets.match_delete(@patterns_table, {:_, pid, :_})
+  end
 
   @doc false
   @spec glob_to_regex(binary()) :: Regex.t()
