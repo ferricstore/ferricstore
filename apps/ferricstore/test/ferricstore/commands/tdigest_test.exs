@@ -325,6 +325,16 @@ defmodule Ferricstore.Commands.TDigestTest do
       assert msg =~ "does not exist"
     end
 
+    test "returns WRONGTYPE for corrupt persisted digest shape" do
+      store =
+        MockStore.make(%{
+          "mydigest" => {:erlang.term_to_binary({:tdigest, [], %{compression: 100}}), 0}
+        })
+
+      assert {:error, msg} = TDigestCmd.handle("TDIGEST.INFO", ["mydigest"], store)
+      assert msg =~ "WRONGTYPE"
+    end
+
     test "returns error with wrong number of arguments" do
       store = MockStore.make()
       assert {:error, _} = TDigestCmd.handle("TDIGEST.INFO", [], store)

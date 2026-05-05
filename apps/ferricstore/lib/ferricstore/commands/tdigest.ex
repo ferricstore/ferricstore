@@ -420,27 +420,30 @@ defmodule Ferricstore.Commands.TDigest do
           {:error, "ERR TDIGEST: key does not exist"}
         end
 
-      {:tdigest, centroids, metadata} ->
-        {:ok, deserialize(centroids, metadata)}
-
-      bin when is_binary(bin) ->
-        try do
-          case :erlang.binary_to_term(bin, [:safe]) do
-            {:tdigest, centroids, metadata} ->
-              {:ok, deserialize(centroids, metadata)}
-
-            _ ->
-              {:error, @wrongtype_msg}
-          end
-        rescue
-          ArgumentError ->
-            {:error, @wrongtype_msg}
+      raw ->
+        case decode_raw_digest(raw) do
+          {:ok, digest} -> {:ok, digest}
+          {:error, _wrongtype} -> {:error, @wrongtype_msg}
         end
-
-      _ ->
-        {:error, @wrongtype_msg}
     end
   end
+
+  defp decode_raw_digest({:tdigest, centroids, metadata}) do
+    safe_deserialize(centroids, metadata)
+  end
+
+  defp decode_raw_digest(bin) when is_binary(bin) do
+    try do
+      case :erlang.binary_to_term(bin, [:safe]) do
+        {:tdigest, centroids, metadata} -> safe_deserialize(centroids, metadata)
+        _ -> {:error, :wrongtype}
+      end
+    rescue
+      ArgumentError -> {:error, :wrongtype}
+    end
+  end
+
+  defp decode_raw_digest(_raw), do: {:error, :wrongtype}
 
   defp check_create_available(key, store) do
     case Ops.get(store, key) do
@@ -471,23 +474,6 @@ defmodule Ferricstore.Commands.TDigest do
     _ -> false
   end
 
-  defp decode_raw_digest({:tdigest, centroids, metadata}) do
-    {:ok, deserialize(centroids, metadata)}
-  end
-
-  defp decode_raw_digest(bin) when is_binary(bin) do
-    try do
-      case :erlang.binary_to_term(bin, [:safe]) do
-        {:tdigest, centroids, metadata} -> {:ok, deserialize(centroids, metadata)}
-        _ -> {:error, :wrongtype}
-      end
-    rescue
-      ArgumentError -> {:error, :wrongtype}
-    end
-  end
-
-  defp decode_raw_digest(_raw), do: {:error, :wrongtype}
-
   defp persist!(key, %Core{} = digest, store) do
     encoded = serialize(digest)
     Ops.put(store, key, :erlang.term_to_binary(encoded), 0)
@@ -505,6 +491,12 @@ defmodule Ferricstore.Commands.TDigest do
     }
 
     {:tdigest, digest.centroids, metadata}
+  end
+
+  defp safe_deserialize(centroids, metadata) do
+    {:ok, deserialize(centroids, metadata)}
+  rescue
+    _ -> {:error, :wrongtype}
   end
 
   defp deserialize(centroids, metadata) do
