@@ -1098,26 +1098,16 @@ fn v2_copy_records(
 
     let dest_file_id = parse_file_id(dst);
 
-    match log::LogReader::open(src) {
-        Ok(mut reader) => match log::LogWriter::open(dst, dest_file_id) {
+    match std::fs::File::open(src) {
+        Ok(file) => match log::LogWriter::open(dst, dest_file_id) {
             Ok(mut writer) => {
                 let mut results: Vec<(u64, u64)> = Vec::with_capacity(offsets.len());
 
                 for &offset in &offsets {
-                    match reader.read_at(offset) {
-                        Ok(Some(record)) => {
-                            if let Some(ref value) = record.value {
-                                let new_offset = writer
-                                    .write(&record.key, value, record.expire_at_ms)
-                                    .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
-                                let new_size =
-                                    (log::HEADER_SIZE + record.key.len() + value.len()) as u64;
-                                results.push((new_offset, new_size));
-                            }
-                            // Skip tombstones silently
-                        }
+                    match log::copy_record_raw_from_file(&file, &mut writer, offset, false) {
+                        Ok(Some(copied)) => results.push((copied.offset, copied.record_size)),
                         Ok(None) => {
-                            // Offset past EOF — skip
+                            // Offset past EOF or tombstone -- skip.
                         }
                         Err(e) => {
                             return Ok((atoms::error(), e.to_string()).encode(env));
@@ -1174,7 +1164,7 @@ fn copy_records_preserve_tombstones_impl(
     live_offsets: &[u64],
     tombstone_offsets: &[u64],
 ) -> std::result::Result<Vec<(u64, u64)>, String> {
-    let mut reader = log::LogReader::open(src).map_err(|e| e.to_string())?;
+    let file = std::fs::File::open(src).map_err(|e| e.to_string())?;
     let mut writer = log::LogWriter::open(dst, dest_file_id).map_err(|e| e.to_string())?;
 
     let live_set: std::collections::HashSet<u64> = live_offsets.iter().copied().collect();
@@ -1187,21 +1177,10 @@ fn copy_records_preserve_tombstones_impl(
         std::collections::HashMap::with_capacity(live_offsets.len());
 
     for offset in all_offsets {
-        match reader.read_at(offset) {
-            Ok(Some(record)) => {
-                if let Some(ref value) = record.value {
-                    let new_offset = writer
-                        .write(&record.key, value, record.expire_at_ms)
-                        .map_err(|e| e.to_string())?;
-
-                    if live_set.contains(&offset) {
-                        let new_size = (log::HEADER_SIZE + record.key.len() + value.len()) as u64;
-                        live_results.insert(offset, (new_offset, new_size));
-                    }
-                } else {
-                    writer
-                        .write_tombstone(&record.key)
-                        .map_err(|e| e.to_string())?;
+        match log::copy_record_raw_from_file(&file, &mut writer, offset, true) {
+            Ok(Some(copied)) => {
+                if live_set.contains(&offset) && !copied.is_tombstone {
+                    live_results.insert(offset, (copied.offset, copied.record_size));
                 }
             }
             Ok(None) => {}
@@ -1252,6 +1231,34 @@ mod copy_records_preserve_tombstones_tests {
         let second = reader.read_at(tombstone_new_offset).unwrap().unwrap();
         assert_eq!(b"a", second.key.as_slice());
         assert!(second.value.is_none());
+    }
+
+    #[test]
+    fn compaction_copy_paths_do_not_materialize_live_values() {
+        let source = include_str!("lib.rs");
+        let copy_records = source
+            .split("fn v2_copy_records(")
+            .nth(1)
+            .unwrap()
+            .split("/// Copy live records and tombstones")
+            .next()
+            .unwrap();
+        let preserve = source
+            .split("fn copy_records_preserve_tombstones_impl(")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+
+        assert!(
+            !copy_records.contains("read_at("),
+            "v2_copy_records must raw-copy records without materializing values"
+        );
+        assert!(
+            !preserve.contains("read_at("),
+            "copy_records_preserve_tombstones_impl must raw-copy records without materializing values"
+        );
     }
 }
 

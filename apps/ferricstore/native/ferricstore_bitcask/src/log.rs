@@ -75,6 +75,13 @@ pub struct RecordMetadata {
     pub record_size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawCopyResult {
+    pub offset: u64,
+    pub record_size: u64,
+    pub is_tombstone: bool,
+}
+
 /// Writes new records to a log file (always appends).
 ///
 /// Uses the best available I/O backend selected at startup:
@@ -688,6 +695,15 @@ pub fn pread_value_for_key_from_file(
     pread_value_for_key(file, offset, expected_key)
 }
 
+pub fn copy_record_raw_from_file(
+    file: &File,
+    writer: &mut LogWriter,
+    offset: u64,
+    copy_tombstone: bool,
+) -> Result<Option<RawCopyResult>> {
+    copy_record_raw(file, writer, offset, copy_tombstone)
+}
+
 #[cfg(unix)]
 fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
     // Step 1: pread the header
@@ -920,6 +936,113 @@ fn pread_value_for_key(
     } else {
         Ok(Some(Some(value)))
     }
+}
+
+#[cfg(unix)]
+fn copy_record_raw(
+    file: &File,
+    writer: &mut LogWriter,
+    offset: u64,
+    copy_tombstone: bool,
+) -> Result<Option<RawCopyResult>> {
+    let mut header = [0u8; HEADER_SIZE];
+    match read_exact_at_or_eof(file, &mut header, offset, "header")? {
+        false => return Ok(None),
+        true => {}
+    }
+
+    let stored_crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
+    let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
+    let is_tombstone = value_size_raw == TOMBSTONE;
+    let value_size = decoded_value_size(value_size_raw, is_tombstone)?;
+
+    if is_tombstone && !copy_tombstone {
+        return Ok(None);
+    }
+
+    let body_len = checked_record_body_len(key_size, value_size)?;
+    let record_size = HEADER_SIZE as u64 + body_len as u64;
+
+    if body_len > BODY_LEN_FILE_SIZE_CHECK_THRESHOLD {
+        let body_start = offset
+            .checked_add(HEADER_SIZE as u64)
+            .ok_or_else(|| LogError("raw copy body offset overflow".into()))?;
+        let body_end = body_start
+            .checked_add(body_len as u64)
+            .ok_or_else(|| LogError("raw copy body end overflow".into()))?;
+        let file_len = file.metadata()?.len();
+        if body_end > file_len {
+            return Err(LogError(format!(
+                "record body extends past end of file: end={body_end}, file_len={file_len}"
+            )));
+        }
+    }
+
+    let new_offset = writer.offset;
+    writer.write_raw(&header)?;
+
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&header[4..]);
+
+    let key_offset = offset
+        .checked_add(HEADER_SIZE as u64)
+        .ok_or_else(|| LogError("raw copy key offset overflow".into()))?;
+    copy_hashed_range(file, writer, key_offset, key_size, &mut hasher, "key")?;
+
+    if !is_tombstone {
+        let value_offset = key_offset
+            .checked_add(key_size as u64)
+            .ok_or_else(|| LogError("raw copy value offset overflow".into()))?;
+        copy_hashed_range(file, writer, value_offset, value_size, &mut hasher, "value")?;
+    }
+
+    let computed_crc = hasher.finalize();
+    if computed_crc != stored_crc {
+        return Err(LogError(format!(
+            "CRC mismatch: stored={stored_crc}, computed={computed_crc}"
+        )));
+    }
+
+    Ok(Some(RawCopyResult {
+        offset: new_offset,
+        record_size,
+        is_tombstone,
+    }))
+}
+
+#[cfg(unix)]
+fn copy_hashed_range(
+    file: &File,
+    writer: &mut LogWriter,
+    offset: u64,
+    len: usize,
+    hasher: &mut crc32fast::Hasher,
+    label: &str,
+) -> Result<()> {
+    let mut remaining = len;
+    let mut read_offset = offset;
+    let mut buf = vec![0u8; STREAM_READ_CHUNK_SIZE.min(len.max(1))];
+
+    while remaining > 0 {
+        let chunk_len = remaining.min(STREAM_READ_CHUNK_SIZE);
+        let chunk = &mut buf[..chunk_len];
+
+        if !read_exact_at_or_eof(file, chunk, read_offset, label)? {
+            return Err(LogError(format!(
+                "pread {label} short read: expected {chunk_len} B, got 0 B"
+            )));
+        }
+
+        hasher.update(chunk);
+        writer.write_raw(chunk)?;
+        remaining -= chunk_len;
+        read_offset = read_offset
+            .checked_add(chunk_len as u64)
+            .ok_or_else(|| LogError(format!("raw copy {label} offset overflow")))?;
+    }
+
+    Ok(())
 }
 
 fn iter_metadata_tolerant(
