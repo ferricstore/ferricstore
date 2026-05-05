@@ -101,7 +101,7 @@ defmodule FerricstoreServer.Connection.Store do
         store
 
       store when is_map(store) ->
-        if raw_store_complete?(store) do
+        if raw_store_complete?(store, ctx) do
           store
         else
           store = build_raw_store(ctx)
@@ -116,18 +116,33 @@ defmodule FerricstoreServer.Connection.Store do
     end
   end
 
-  defp raw_store_complete?(store) do
-    is_function(Map.get(store, :batch_get), 1) and
+  defp raw_store_complete?(store, ctx) do
+    Map.get(store, :__ctx_identity__) == raw_store_identity(ctx) and
+      is_function(Map.get(store, :batch_get), 1) and
       is_function(Map.get(store, :value_size), 1) and
       is_function(Map.get(store, :object_lfu), 1) and
       is_function(Map.get(store, :compound_batch_get), 2) and
       is_function(Map.get(store, :compound_batch_get_meta), 2)
   end
 
+  defp raw_store_identity(ctx) do
+    {
+      ctx.name,
+      ctx.data_dir_expanded,
+      ctx.shard_count,
+      ctx.shard_names,
+      ctx.keydir_refs,
+      ctx.checkpoint_flags,
+      ctx.write_version,
+      ctx.stats_counter
+    }
+  end
+
   @doc false
   @spec build_raw_store(FerricStore.Instance.t()) :: map()
   def build_raw_store(ctx) do
     %{
+      __ctx_identity__: raw_store_identity(ctx),
       get: fn key -> Router.get(ctx, key) end,
       get_meta: fn key -> Router.get_meta(ctx, key) end,
       batch_get: fn keys -> Router.batch_get(ctx, keys) end,

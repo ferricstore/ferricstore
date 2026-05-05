@@ -52,6 +52,35 @@ defmodule FerricstoreServer.Connection.StoreTest do
     end
   end
 
+  test "raw connection store rebuilds cached maps from a stale same-name context" do
+    ctx = FerricStore.Instance.get(:default)
+    cache_key = {:ferricstore_raw_store, ctx.name}
+    previous = :persistent_term.get(cache_key, :missing)
+
+    stale_ctx = %{
+      ctx
+      | keydir_refs: Tuple.duplicate(:stale_keydir_ref, tuple_size(ctx.keydir_refs))
+    }
+
+    stale = Store.build_raw_store(stale_ctx)
+
+    try do
+      :persistent_term.put(cache_key, stale)
+
+      store = Store.build_store(ctx, nil)
+
+      refute store == stale
+      assert is_function(store.get, 1)
+      assert is_function(store.batch_get, 1)
+      assert is_function(store.value_size, 1)
+    after
+      case previous do
+        :missing -> :persistent_term.erase(cache_key)
+        value -> :persistent_term.put(cache_key, value)
+      end
+    end
+  end
+
   test "sandbox connection store batches reads with namespace applied once" do
     ctx = FerricStore.Instance.get(:default)
     ns = "sandbox_batch_#{System.unique_integer([:positive])}:"
@@ -153,7 +182,7 @@ defmodule FerricstoreServer.Connection.StoreTest do
     key = {:ferricstore_raw_store, ctx.name}
     previous = :persistent_term.get(key, :missing)
     calls = self()
-    :persistent_term.put(key, fake_raw_store(calls))
+    :persistent_term.put(key, fake_raw_store(ctx, calls))
 
     try do
       fun.(calls)
@@ -165,8 +194,9 @@ defmodule FerricstoreServer.Connection.StoreTest do
     end
   end
 
-  defp fake_raw_store(calls) do
-    %{
+  defp fake_raw_store(ctx, calls) do
+    Store.build_raw_store(ctx)
+    |> Map.merge(%{
       get: fn key ->
         send(calls, {:raw_call, :get, [key]})
         nil
@@ -303,6 +333,6 @@ defmodule FerricstoreServer.Connection.StoreTest do
         send(calls, {:raw_call, :on_push, [msg]})
         :ok
       end
-    }
+    })
   end
 end
