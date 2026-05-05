@@ -129,6 +129,12 @@ defmodule Ferricstore.Commands.GenericTest do
       assert "v" == store.get.("k")
     end
 
+    test "RENAME same cold key to itself does not load source value" do
+      store = metadata_only_key_store(%{"cold" => 0})
+
+      assert :ok = Generic.handle("RENAME", ["cold", "cold"], store)
+    end
+
     test "RENAME with no args returns error" do
       assert {:error, _} = Generic.handle("RENAME", [], MockStore.make())
     end
@@ -160,6 +166,12 @@ defmodule Ferricstore.Commands.GenericTest do
       # Source should still exist, destination unchanged
       assert "v1" == store.get.("old")
       assert "v2" == store.get.("new")
+    end
+
+    test "RENAMENX existing destination does not load cold source value" do
+      store = metadata_only_key_store(%{"cold_src" => 0, "dst" => 0})
+
+      assert 0 == Generic.handle("RENAMENX", ["cold_src", "dst"], store)
     end
 
     test "RENAMENX treats a fully expired compound destination as missing before TYPE cleanup" do
@@ -223,6 +235,12 @@ defmodule Ferricstore.Commands.GenericTest do
       store = MockStore.make(%{"src" => {"v1", 0}, "dst" => {"v2", 0}})
       assert 0 == Generic.handle("COPY", ["src", "dst"], store)
       assert "v2" == store.get.("dst")
+    end
+
+    test "COPY without REPLACE existing destination does not load cold source value" do
+      store = metadata_only_key_store(%{"cold_src" => 0, "dst" => 0})
+
+      assert 0 == Generic.handle("COPY", ["cold_src", "dst"], store)
     end
 
     test "COPY destination existence check does not load destination value" do
@@ -924,6 +942,17 @@ defmodule Ferricstore.Commands.GenericTest do
     Hash.handle("HSET", [key, "field", "value"], store)
     store.compound_put.(key, CompoundKey.hash_field(key, "field"), "value", expired_at_ms())
     store
+  end
+
+  defp metadata_only_key_store(expiries) do
+    %{
+      get: fn key -> flunk("no-op generic command should not load value for #{inspect(key)}") end,
+      get_meta: fn key ->
+        flunk("no-op generic command should not load value metadata for #{inspect(key)}")
+      end,
+      expire_at_ms: fn key -> Map.get(expiries, key) end,
+      exists?: fn key -> Map.has_key?(expiries, key) end
+    }
   end
 
   defp expired_at_ms, do: System.os_time(:millisecond) - 1

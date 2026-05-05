@@ -248,13 +248,22 @@ defmodule Ferricstore.Commands.Generic do
     CrossShardOp.execute(
       [{key, :read_write}, {newkey, :write}],
       fn unified_store ->
-        case key_entry(unified_store, key) do
+        case key_meta(unified_store, key) do
           nil ->
             {:error, "ERR no such key"}
 
-          entry ->
-            rename_entry(key, newkey, entry, unified_store)
+          _expire_at_ms when key == newkey ->
             :ok
+
+          _expire_at_ms ->
+            case key_entry(unified_store, key) do
+              nil ->
+                {:error, "ERR no such key"}
+
+              entry ->
+                rename_entry(key, newkey, entry, unified_store)
+                :ok
+            end
         end
       end,
       intent: %{command: :rename, keys: %{source: key, dest: newkey}, value_hashes: %{}},
@@ -266,20 +275,26 @@ defmodule Ferricstore.Commands.Generic do
     CrossShardOp.execute(
       [{key, :read_write}, {newkey, :write}],
       fn unified_store ->
-        case key_entry(unified_store, key) do
+        case key_meta(unified_store, key) do
           nil ->
             {:error, "ERR no such key"}
 
-          _entry when key == newkey ->
+          _expire_at_ms when key == newkey ->
             # Same key -- always 0 since destination "exists"
             0
 
-          entry ->
+          _expire_at_ms ->
             if key_exists?(unified_store, newkey) do
               0
             else
-              rename_entry(key, newkey, entry, unified_store)
-              1
+              case key_entry(unified_store, key) do
+                nil ->
+                  {:error, "ERR no such key"}
+
+                entry ->
+                  rename_entry(key, newkey, entry, unified_store)
+                  1
+              end
             end
         end
       end,
@@ -482,20 +497,26 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_copy(source, destination, replace?, store) do
-    case key_entry(store, source) do
+    case key_meta(store, source) do
       nil ->
         {:error, "ERR no such key"}
 
-      entry ->
+      _expire_at_ms ->
         if not replace? and key_exists?(store, destination) do
           0
         else
-          if source != destination do
-            delete_key(destination, store)
-          end
+          case key_entry(store, source) do
+            nil ->
+              {:error, "ERR no such key"}
 
-          copy_entry(source, destination, entry, store)
-          1
+            entry ->
+              if source != destination do
+                delete_key(destination, store)
+              end
+
+              copy_entry(source, destination, entry, store)
+              1
+          end
         end
     end
   end
