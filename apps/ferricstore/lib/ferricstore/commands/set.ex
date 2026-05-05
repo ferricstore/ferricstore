@@ -922,23 +922,28 @@ defmodule Ferricstore.Commands.Set do
   # Clears any existing set at `destination`, writes `members` as a new set,
   # and returns the member count.
   defp store_set_at(destination, members, store) do
-    # STORE commands replace the destination regardless of its previous type.
-    Ops.delete(store, destination)
+    with :ok <- clear_set_store_destination(destination, store) do
+      members_list = MapSet.to_list(members)
 
-    # Clear existing destination data structure metadata and members.
-    prefix = CompoundKey.set_prefix(destination)
-    Ops.compound_delete_prefix(store, destination, prefix)
-    TypeRegistry.delete_type(destination, store)
-
-    members_list = MapSet.to_list(members)
-
-    if members_list == [] do
-      0
-    else
-      with :ok <- TypeRegistry.check_or_set(destination, :set, store),
-           :ok <- put_set_members(store, destination, members_list) do
-        length(members_list)
+      if members_list == [] do
+        0
+      else
+        with :ok <- TypeRegistry.check_or_set(destination, :set, store),
+             :ok <- put_set_members(store, destination, members_list) do
+          length(members_list)
+        end
       end
+    end
+  end
+
+  defp clear_set_store_destination(destination, store) do
+    # STORE commands replace the destination regardless of its previous type.
+    prefix = CompoundKey.set_prefix(destination)
+
+    with :ok <- Ops.delete(store, destination),
+         :ok <- Ops.compound_delete_prefix(store, destination, prefix),
+         :ok <- TypeRegistry.delete_type(destination, store) do
+      :ok
     end
   end
 

@@ -417,6 +417,38 @@ defmodule Ferricstore.Commands.SetTest do
 
       refute_received {:compound_batch_put, _}
     end
+
+    test "SUNIONSTORE returns destination clear errors before writing replacement set" do
+      s1_type = CompoundKey.type_key("s1")
+      s2_type = CompoundKey.type_key("s2")
+
+      store = %{
+        get: fn _key -> nil end,
+        delete: fn "dst" -> {:error, :disk_full} end,
+        compound_get: fn
+          "s1", ^s1_type -> "set"
+          "s2", ^s2_type -> "set"
+        end,
+        compound_scan: fn
+          "s1", _prefix -> [{"a", "1"}]
+          "s2", _prefix -> [{"b", "1"}]
+        end,
+        compound_delete_prefix: fn "dst", _prefix ->
+          flunk("SUNIONSTORE must not delete destination prefix after key delete failure")
+        end,
+        compound_delete: fn "dst", _type_key ->
+          flunk("SUNIONSTORE must not delete destination type after key delete failure")
+        end,
+        compound_put: fn "dst", _compound_key, _value, 0 ->
+          flunk("SUNIONSTORE must not write destination type after key delete failure")
+        end,
+        compound_batch_put: fn "dst", _entries ->
+          flunk("SUNIONSTORE must not write destination members after key delete failure")
+        end
+      }
+
+      assert {:error, :disk_full} == Set.handle("SUNIONSTORE", ["dst", "s1", "s2"], store)
+    end
   end
 
   # ---------------------------------------------------------------------------
