@@ -611,7 +611,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       assert Router.get(ctx(), key) == "1"
     end
 
-    test "async SET returns an error and emits telemetry when same-key latch wait times out" do
+    test "SET returns an error and emits telemetry when same-key latch wait times out" do
       original_timeout = Application.get_env(:ferricstore, :router_async_key_latch_timeout_ms)
       Application.put_env(:ferricstore, :router_async_key_latch_timeout_ms, 5)
 
@@ -636,7 +636,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
 
       try do
         assert {:ok, {:error, message}} = Task.yield(task, 500)
-        assert message =~ "async key latch timeout"
+        assert message =~ "write key latch timeout"
         assert Router.get(ctx(), key) == nil
 
         assert_receive {:async_key_latch_telemetry, [:ferricstore, :store, :async_key_latch],

@@ -250,7 +250,7 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     raising_store =
       ctx
       |> FerricstoreServer.Connection.Store.build_raw_store()
-      |> Map.put(:incr, fn _key, _delta -> raise "async key latch timeout after 5ms" end)
+      |> Map.put(:incr, fn _key, _delta -> raise "write key latch timeout after 5ms" end)
 
     :persistent_term.put(raw_store_key, raising_store)
 

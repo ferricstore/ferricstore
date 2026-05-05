@@ -137,7 +137,8 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
               ":durability",
               ":ferricstore_durability_mode",
               ":ferricstore_has_async_ns",
-              "async namespace"
+              "async namespace",
+              "ERR async key latch"
             ],
             String.contains?(source, token) do
           {Path.relative_to(path, repo_root), token}

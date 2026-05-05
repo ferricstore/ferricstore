@@ -130,7 +130,7 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
         ^key, ^meta_key -> :erlang.term_to_binary({1, 0, 0})
         _redis_key, _compound_key -> nil
       end)
-      |> Map.put(:compound_scan, fn ^key, _prefix -> raise "async key latch timeout after 5ms" end)
+      |> Map.put(:compound_scan, fn ^key, _prefix -> raise "write key latch timeout after 5ms" end)
     end)
 
     try do

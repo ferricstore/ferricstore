@@ -908,7 +908,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_key_latch_timeout_error_message(wait_ms),
-    do: "ERR async key latch timeout after #{wait_ms}ms"
+    do: "ERR write key latch timeout after #{wait_ms}ms"
 
   defp emit_async_key_latch_event(status, idx, key, wait_ms) do
     :telemetry.execute(
