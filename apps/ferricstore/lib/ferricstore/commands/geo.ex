@@ -434,25 +434,26 @@ defmodule Ferricstore.Commands.Geo do
       prefix = CompoundKey.zset_prefix(key)
       new_members = MapSet.new(Enum.map(zset, fn {_score, member} -> member end))
 
-      store
-      |> Ops.compound_scan(key, prefix)
-      |> Enum.each(fn {member, _score} ->
-        unless MapSet.member?(new_members, member) do
-          Ops.compound_delete(store, key, CompoundKey.zset_member(key, member))
-        end
-      end)
+      delete_keys =
+        store
+        |> Ops.compound_scan(key, prefix)
+        |> Enum.flat_map(fn {member, _score} ->
+          if MapSet.member?(new_members, member) do
+            []
+          else
+            [CompoundKey.zset_member(key, member)]
+          end
+        end)
 
-      Enum.each(zset, fn {score, member} ->
-        Ops.compound_put(
-          store,
-          key,
-          CompoundKey.zset_member(key, member),
-          Float.to_string(score),
-          0
-        )
-      end)
+      put_entries =
+        Enum.map(zset, fn {score, member} ->
+          {CompoundKey.zset_member(key, member), Float.to_string(score), 0}
+        end)
 
-      :ok
+      with :ok <- Ops.compound_batch_delete(store, key, delete_keys),
+           :ok <- Ops.compound_batch_put(store, key, put_entries) do
+        :ok
+      end
     end
   end
 

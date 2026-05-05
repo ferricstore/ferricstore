@@ -121,6 +121,53 @@ defmodule Ferricstore.Commands.GeoTest do
       assert result == 2
     end
 
+    test "batches member writes" do
+      parent = self()
+      type_key = CompoundKey.type_key("mygeo")
+
+      store = %{
+        exists?: fn "mygeo" -> false end,
+        compound_get: fn
+          "mygeo", ^type_key -> nil
+          "mygeo", _compound_key -> nil
+        end,
+        compound_scan: fn "mygeo", _prefix -> [] end,
+        compound_put: fn
+          "mygeo", ^type_key, "zset", 0 ->
+            :ok
+
+          "mygeo", compound_key, _score, 0 ->
+            flunk(
+              "GEOADD should use compound_batch_put, got per-member write #{inspect(compound_key)}"
+            )
+        end,
+        compound_batch_put: fn "mygeo", entries ->
+          send(parent, {:compound_batch_put, entries})
+          :ok
+        end
+      }
+
+      assert 2 ==
+               Geo.handle(
+                 "GEOADD",
+                 [
+                   "mygeo",
+                   "13.361389",
+                   "38.115556",
+                   "Palermo",
+                   "15.087269",
+                   "37.502669",
+                   "Catania"
+                 ],
+                 store
+               )
+
+      assert_received {:compound_batch_put, entries}
+      assert length(entries) == 2
+      assert Enum.all?(entries, fn {_compound_key, score, 0} -> is_binary(score) end)
+      refute_received {:compound_batch_put, _}
+    end
+
     test "adds a single member" do
       store = MockStore.make()
       assert 1 == Geo.handle("GEOADD", ["mygeo", "13.361389", "38.115556", "Palermo"], store)
