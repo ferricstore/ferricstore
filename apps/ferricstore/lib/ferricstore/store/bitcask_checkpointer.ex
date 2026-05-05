@@ -354,10 +354,19 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   defp checkpoint_decision(state) do
     now = monotonic_ms()
     current_version = write_version(state.instance_ctx, state.index)
-    new_dirty? = state.dirty_since_ms == nil
+    first_dirty_observation? = state.dirty_since_ms == nil
     dirty_since = state.dirty_since_ms || now
     write_moved? = current_version != state.last_write_version
-    last_write_seen = if write_moved?, do: now, else: state.last_write_seen_ms
+
+    last_write_seen =
+      cond do
+        write_moved? -> now
+        # The dirty flag can be observed before the router bumps write_version.
+        # Treat first observation as a fresh write so fsync does not race a hot append.
+        first_dirty_observation? -> now
+        true -> state.last_write_seen_ms
+      end
+
     dirty_age_ms = now - dirty_since
     idle_age_ms = now - last_write_seen
 
@@ -375,9 +384,6 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
       write_moved? ->
         {:defer, state, :active_writes,
          %{dirty_age_ms: dirty_age_ms, idle_ms: idle_age_ms, write_version: current_version}}
-
-      new_dirty? ->
-        {:fire, state}
 
       idle_age_ms < state.idle_ms ->
         {:defer, state, :idle_gap,

@@ -804,17 +804,24 @@ defmodule FerricStore do
   end
 
   defp flow_state_counts(type, partition_key) do
-    ["queued", "running", "completed", "failed", "cancelled"]
-    |> Enum.reduce_while({:ok, %{}}, fn state, {:ok, acc} ->
-      key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key)
+    with :ok <- flow_flush_terminal_lmdb_once() do
+      ["queued", "running", "completed", "failed", "cancelled"]
+      |> Enum.reduce_while({:ok, %{}}, fn state, {:ok, acc} ->
+        key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key)
 
-      with :ok <- flow_validate_key_size(key),
-           {:ok, count} <- flow_index_count(key, state) do
-        {:cont, {:ok, Map.put(acc, String.to_atom(state), count)}}
-      else
-        {:error, _} = error -> {:halt, error}
-      end
-    end)
+        with :ok <- flow_validate_key_size(key),
+             {:ok, count} <- flow_index_count_no_flush(key, state) do
+          {:cont, {:ok, Map.put(acc, String.to_atom(state), count)}}
+        else
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+    end
+  end
+
+  defp flow_flush_terminal_lmdb_once do
+    ctx = default_ctx()
+    Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
   end
 
   defp flow_index_ids(index_key, state, count) do
@@ -824,21 +831,12 @@ defmodule FerricStore do
     end
   end
 
-  defp flow_index_count(index_key, state) do
-    with :ok <- flow_maybe_flush_terminal_lmdb(state),
-         {:ok, ram_count} <- zcard(index_key),
+  defp flow_index_count_no_flush(index_key, state) do
+    with {:ok, ram_count} <- zcard(index_key),
          {:ok, lmdb_count} <- flow_terminal_lmdb_count(index_key, state) do
       {:ok, ram_count + lmdb_count}
     end
   end
-
-  defp flow_maybe_flush_terminal_lmdb(state)
-       when state in ["completed", "failed", "cancelled"] do
-    ctx = default_ctx()
-    Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
-  end
-
-  defp flow_maybe_flush_terminal_lmdb(_state), do: :ok
 
   defp flow_terminal_lmdb_ids(_index_key, state, _count)
        when state not in ["completed", "failed", "cancelled"],

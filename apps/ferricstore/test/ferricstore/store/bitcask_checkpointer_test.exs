@@ -161,6 +161,47 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     assert :atomics.get(ctx.checkpoint_in_flight, 1) == 0
   end
 
+  test "first dirty observation waits for idle gap before fsync", %{
+    ctx: ctx,
+    active_path: active_path
+  } do
+    parent = self()
+
+    ctx =
+      Map.put(ctx, :fsync_async, fn caller, corr_id, path ->
+        send(parent, {:fsync_async_called, caller, corr_id, path})
+        :ok
+      end)
+
+    {:ok, pid} =
+      BitcaskCheckpointer.start_link(
+        index: 0,
+        instance_ctx: ctx,
+        checkpoint_interval_ms: 10_000,
+        checkpoint_idle_ms: 50,
+        checkpoint_max_delay_ms: 30_000,
+        name: :"ck_first_dirty_idle_#{:erlang.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> safe_stop(pid) end)
+
+    :atomics.put(ctx.checkpoint_flags, 1, 1)
+
+    send(pid, :tick)
+
+    assert_receive {:checkpoint, _meas, %{status: :deferred, reason: :idle_gap}}, 2_000
+    refute_receive {:fsync_async_called, ^pid, 1, ^active_path}, 100
+    assert :atomics.get(ctx.checkpoint_flags, 1) == 1
+    assert :atomics.get(ctx.checkpoint_in_flight, 1) == 0
+
+    Process.sleep(60)
+    send(pid, :tick)
+
+    assert_receive {:fsync_async_called, ^pid, 1, ^active_path}, 2_000
+    assert :atomics.get(ctx.checkpoint_flags, 1) == 0
+    assert :atomics.get(ctx.checkpoint_in_flight, 1) == 1
+  end
+
   test "dirty tick forces fsync once max checkpoint delay is reached", %{
     ctx: ctx,
     active_path: active_path
@@ -214,6 +255,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
         index: 0,
         instance_ctx: ctx,
         checkpoint_interval_ms: 10_000,
+        checkpoint_idle_ms: 0,
         name: :"ck_submit_error_#{:erlang.unique_integer([:positive])}"
       )
 
@@ -243,6 +285,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
         index: 0,
         instance_ctx: ctx,
         checkpoint_interval_ms: 10_000,
+        checkpoint_idle_ms: 0,
         name: :"ck_missing_active_#{:erlang.unique_integer([:positive])}"
       )
 
@@ -399,6 +442,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
         index: 0,
         instance_ctx: ctx,
         checkpoint_interval_ms: 10_000,
+        checkpoint_idle_ms: 0,
         name: :"ck_shutdown_in_flight_#{:erlang.unique_integer([:positive])}"
       )
 
