@@ -3,14 +3,20 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.IsolatedInstance
+  alias FerricstoreServer.ClientTracking
   alias FerricstoreServer.Connection.Sendfile
   alias FerricstoreServer.Resp.Parser
 
   setup do
+    ClientTracking.init_tables()
+    :ets.delete_all_objects(:ferricstore_tracking)
+    :ets.delete_all_objects(:ferricstore_tracking_connections)
+
     ctx = IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1024)
 
     on_exit(fn ->
       IsolatedInstance.checkin(ctx)
+      ClientTracking.cleanup(self())
     end)
 
     {:ok, ctx: ctx}
@@ -40,5 +46,31 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
     assert {:continue, encoded, ^state} = Sendfile.dispatch_mget([key1, key2], state, fallback)
     assert {:ok, [[^value1, ^value2]], ""} = Parser.parse(IO.iodata_to_binary(encoded))
+  end
+
+  test "GET tracks client-visible sandbox key, not internal lookup key", %{ctx: ctx} do
+    sandbox = "sandbox:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"
+    key = "tracked-hot-get"
+    lookup_key = sandbox <> key
+
+    :ok = Router.put(ctx, lookup_key, "v1", 0)
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+
+    state = %{
+      instance_ctx: ctx,
+      sandbox_namespace: sandbox,
+      pubsub_channels: nil,
+      tracking: tracking
+    }
+
+    fallback = fn _cmd, _args, _state ->
+      flunk("GET fallback should not run for hot sandbox value")
+    end
+
+    assert {:continue, encoded, new_state} = Sendfile.dispatch_get([key], state, fallback)
+    assert IO.iodata_to_binary(encoded) == "$2\r\nv1\r\n"
+    assert new_state.tracking.enabled
+    assert :ets.lookup(:ferricstore_tracking, key) == [{key, self()}]
+    assert :ets.lookup(:ferricstore_tracking, lookup_key) == []
   end
 end

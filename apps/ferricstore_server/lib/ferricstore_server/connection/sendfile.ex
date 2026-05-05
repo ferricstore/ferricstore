@@ -85,7 +85,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
     case Router.get_with_file_ref(state.instance_ctx, lookup_key) do
       {:hot, value} ->
-        encode_get_result(value, lookup_key, state)
+        encode_get_result(value, key, state)
 
       {:cold_ref, path, offset, size} when size >= @sendfile_threshold_bytes ->
         stream_large_get_ref(key, path, offset, size, state, dispatch_normal_fn)
@@ -94,7 +94,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
         dispatch_normal_fn.("GET", [key], state)
 
       {:cold_value, value} ->
-        encode_get_result(value, lookup_key, state)
+        encode_get_result(value, key, state)
 
       :miss ->
         dispatch_normal_fn.("GET", [key], state)
@@ -126,10 +126,10 @@ defmodule FerricstoreServer.Connection.Sendfile do
     )
   end
 
-  defp encode_get_result(value, lookup_key, state) do
-    new_state = ConnTracking.maybe_track_read("GET", [lookup_key], value, state)
-    ConnTracking.maybe_notify_keyspace("GET", [lookup_key], value)
-    ConnTracking.maybe_notify_tracking("GET", [lookup_key], value, state)
+  defp encode_get_result(value, key, state) do
+    new_state = ConnTracking.maybe_track_read("GET", [key], value, state)
+    ConnTracking.maybe_notify_keyspace("GET", [key], value)
+    ConnTracking.maybe_notify_tracking("GET", [key], value, state)
     {:continue, Encoder.encode(value), new_state}
   end
 
