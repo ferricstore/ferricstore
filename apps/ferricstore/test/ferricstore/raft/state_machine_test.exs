@@ -3452,6 +3452,94 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert :atomics.get(last_released_cursor_index, shard_index + 1) == 0
     end
 
+    test "release cursor poke releases a pending durable marker without user write", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      marker_index = 88
+      poke_index = 89
+      atomics_size = shard_index + 1
+      checkpoint_flags = :atomics.new(atomics_size, signed: false)
+      checkpoint_in_flight = :atomics.new(atomics_size, signed: false)
+      last_applied_index = :atomics.new(atomics_size, signed: false)
+      last_released_cursor_index = :atomics.new(atomics_size, signed: false)
+      replay_safe_index = :atomics.new(atomics_size, signed: false)
+
+      :atomics.put(replay_safe_index, shard_index + 1, marker_index)
+
+      state = %{
+        state
+        | applied_count: 10,
+          release_cursor_interval: 1,
+          pending_release_cursor_index: marker_index,
+          pending_replay_safe_marker_index: marker_index,
+          pending_release_cursor_checkpoint_indices: MapSet.new(),
+          instance_ctx: %{
+            checkpoint_flags: checkpoint_flags,
+            checkpoint_in_flight: checkpoint_in_flight,
+            last_applied_index: last_applied_index,
+            last_released_cursor_index: last_released_cursor_index,
+            replay_safe_index: replay_safe_index
+          }
+      }
+
+      {new_state, {:applied_at, ^poke_index, :ok}, effects} =
+        StateMachine.apply(
+          %{index: poke_index, term: 1, system_time: System.os_time(:millisecond)},
+          {:async, node(), {:release_cursor_poke, marker_index}},
+          state
+        )
+
+      assert Enum.any?(effects, &match?({:release_cursor, ^marker_index}, &1))
+      assert new_state.applied_count == 10
+      assert :atomics.get(last_applied_index, shard_index + 1) == poke_index
+      assert :atomics.get(last_released_cursor_index, shard_index + 1) == marker_index
+    end
+
+    test "batched release cursor poke does not advance release interval", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      marker_index = 88
+      poke_index = 89
+      atomics_size = shard_index + 1
+      checkpoint_flags = :atomics.new(atomics_size, signed: false)
+      checkpoint_in_flight = :atomics.new(atomics_size, signed: false)
+      last_applied_index = :atomics.new(atomics_size, signed: false)
+      last_released_cursor_index = :atomics.new(atomics_size, signed: false)
+      replay_safe_index = :atomics.new(atomics_size, signed: false)
+
+      :atomics.put(replay_safe_index, shard_index + 1, marker_index)
+
+      state = %{
+        state
+        | applied_count: 10,
+          release_cursor_interval: 1,
+          pending_release_cursor_index: marker_index,
+          pending_replay_safe_marker_index: marker_index,
+          pending_release_cursor_checkpoint_indices: MapSet.new(),
+          instance_ctx: %{
+            checkpoint_flags: checkpoint_flags,
+            checkpoint_in_flight: checkpoint_in_flight,
+            last_applied_index: last_applied_index,
+            last_released_cursor_index: last_released_cursor_index,
+            replay_safe_index: replay_safe_index
+          }
+      }
+
+      {new_state, {:applied_at, ^poke_index, {:ok, [:ok]}}, effects} =
+        StateMachine.apply(
+          %{index: poke_index, term: 1, system_time: System.os_time(:millisecond)},
+          {:batch, [{:async, node(), {:release_cursor_poke, marker_index}}]},
+          state
+        )
+
+      assert Enum.any?(effects, &match?({:release_cursor, ^marker_index}, &1))
+      assert new_state.applied_count == 10
+      assert :atomics.get(last_applied_index, shard_index + 1) == poke_index
+      assert :atomics.get(last_released_cursor_index, shard_index + 1) == marker_index
+    end
+
     test "release cursor metrics resolve instance context by name like production Raft config", %{
       state: state,
       shard_index: shard_index

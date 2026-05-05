@@ -44,6 +44,15 @@ defmodule Ferricstore.Store.ShardSupervisor do
 
         [
           Supervisor.child_spec(
+            {Ferricstore.Raft.ReplaySafeIndexWriter,
+             [
+               shard_index: i,
+               shard_data_path: Ferricstore.DataDir.shard_data_path(data_dir, i),
+               instance_ctx: instance_ctx
+             ]},
+            id: :"replay_safe_index_writer_#{i}"
+          ),
+          Supervisor.child_spec(
             {Ferricstore.Store.Shard, shard_opts},
             id: :"shard_#{i}"
           ),

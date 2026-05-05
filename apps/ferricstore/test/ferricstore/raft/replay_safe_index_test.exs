@@ -2,7 +2,7 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
   use ExUnit.Case, async: true
   import ExUnit.CaptureLog
 
-  alias Ferricstore.Raft.ReplaySafeIndex
+  alias Ferricstore.Raft.{Batcher, ReplaySafeIndex, ReplaySafeIndexWriter}
 
   test "persists and reads replay-safe index" do
     dir = tmp_dir()
@@ -64,6 +64,34 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
     assert_receive {:cleanup_failed, [:ferricstore, :raft, :replay_safe_index, :cleanup_failed],
                     %{count: 1}, %{path: ^tmp_path, reason: {_kind, _message}}},
                    1_000
+  end
+
+  test "writer pokes raft apply path after marker becomes durable" do
+    shard_index = 100_000 + System.unique_integer([:positive])
+    batcher_name = Batcher.batcher_name(shard_index)
+    writer_name = ReplaySafeIndexWriter.process_name(shard_index, nil)
+    dir = tmp_dir()
+    parent = self()
+
+    Process.register(parent, batcher_name)
+
+    on_exit(fn ->
+      if Process.whereis(batcher_name) == parent, do: Process.unregister(batcher_name)
+      File.rm_rf(dir)
+    end)
+
+    {:ok, writer} =
+      ReplaySafeIndexWriter.start_link(
+        shard_index: shard_index,
+        shard_data_path: dir,
+        name: writer_name
+      )
+
+    assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 321)
+    assert_receive {:"$gen_cast", {:async_submit, {:release_cursor_poke, 321}}}, 1_000
+    assert ReplaySafeIndex.read(dir) == 321
+
+    GenServer.stop(writer)
   end
 
   defp tmp_dir do

@@ -217,6 +217,7 @@ defmodule Ferricstore.Raft.StateMachine do
       applied_count: 0,
       release_cursor_interval: interval,
       pending_release_cursor_index: nil,
+      pending_replay_safe_marker_index: nil,
       pending_release_cursor_checkpoint_indices: MapSet.new(),
       # When a node joins with pre-existing Bitcask data (from direct copy or
       # object storage snapshot), skip_below_index prevents re-applying entries
@@ -311,6 +312,24 @@ defmodule Ferricstore.Raft.StateMachine do
     __MODULE__.apply(meta, :erlang.binary_to_term(binary), state)
   end
 
+  @impl true
+  def apply(meta, {:async, _origin, {:release_cursor_poke, index}}, state)
+      when is_integer(index) and index >= 0 do
+    __MODULE__.apply(meta, {:release_cursor_poke, index}, state)
+  end
+
+  def apply(meta, {:async, {:release_cursor_poke, index}}, state)
+      when is_integer(index) and index >= 0 do
+    __MODULE__.apply(meta, {:release_cursor_poke, index}, state)
+  end
+
+  def apply(meta, {:release_cursor_poke, index}, state)
+      when is_integer(index) and index >= 0 do
+    with_apply_time(meta, fn ->
+      maybe_release_cursor(meta, state.applied_count, state, :ok)
+    end)
+  end
+
   # Async commands. Router on the origin node has already persisted the write
   # Async single-command path. Delegates to apply_single which handles
   # origin-skip via the embedded origin node tag.
@@ -388,6 +407,7 @@ defmodule Ferricstore.Raft.StateMachine do
   def apply(meta, {:batch, commands}, state) do
     with_apply_time(meta, fn ->
       old_count = state.applied_count
+      applied_increment = Enum.count(commands, &(not release_cursor_poke_command?(&1)))
 
       # All commands in a batch share one pending-writes buffer so they
       # are flushed in a single v2_append_batch_nosync NIF call.
@@ -395,13 +415,14 @@ defmodule Ferricstore.Raft.StateMachine do
         with_pending_writes(state, fn ->
           Enum.map_reduce(commands, old_count, fn cmd, count ->
             result = apply_single(state, cmd)
-            {result, count + 1}
+            increment = if release_cursor_poke_command?(cmd), do: 0, else: 1
+            {result, count + increment}
           end)
         end)
 
       case write_result do
         {:error, _reason} = error ->
-          new_state = %{state | applied_count: old_count + length(commands)}
+          new_state = %{state | applied_count: old_count + applied_increment}
           maybe_release_cursor(meta, old_count, new_state, error)
 
         {results, new_count} ->
@@ -1262,8 +1283,8 @@ defmodule Ferricstore.Raft.StateMachine do
        )
        when is_integer(release_index) and release_index > 0 do
     if release_index > cursor_metric(state, :last_released_cursor_index) do
-      case Ferricstore.Raft.ReplaySafeIndex.persist(state.shard_data_path, release_index) do
-        :ok ->
+      case ensure_replay_safe_index(state, release_index) do
+        {:ready, state} ->
           record_cursor_metric(state, :last_released_cursor_index, release_index)
 
           state =
@@ -1271,6 +1292,7 @@ defmodule Ferricstore.Raft.StateMachine do
               %{
                 state
                 | pending_release_cursor_index: nil,
+                  pending_replay_safe_marker_index: nil,
                   pending_release_cursor_checkpoint_indices: MapSet.new()
               }
             else
@@ -1288,7 +1310,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
           {state, Enum.reverse(checkpoint_effects) ++ [{:release_cursor, release_index}]}
 
-        {:error, _reason} ->
+        {:pending, state} ->
           {state, checkpoint_effects}
       end
     else
@@ -1304,6 +1326,46 @@ defmodule Ferricstore.Raft.StateMachine do
          checkpoint_effects
        ),
        do: {state, checkpoint_effects}
+
+  defp ensure_replay_safe_index(state, release_index) do
+    instance_ctx = checkpoint_ctx_for_state(state)
+
+    if Ferricstore.Raft.ReplaySafeIndexWriter.durable?(
+         instance_ctx,
+         state.shard_index,
+         state.shard_data_path,
+         release_index
+       ) do
+      {:ready, state}
+    else
+      case request_replay_safe_index(state, instance_ctx, release_index) do
+        {:ready, state} -> {:ready, state}
+        state -> {:pending, state}
+      end
+    end
+  end
+
+  defp request_replay_safe_index(state, instance_ctx, release_index) do
+    if Map.get(state, :pending_replay_safe_marker_index) == release_index do
+      state
+    else
+      case Ferricstore.Raft.ReplaySafeIndexWriter.request(
+             instance_ctx,
+             state.shard_index,
+             state.shard_data_path,
+             release_index
+           ) do
+        :durable ->
+          {:ready, %{state | pending_replay_safe_marker_index: nil}}
+
+        :requested ->
+          %{state | pending_replay_safe_marker_index: release_index}
+
+        {:error, _reason} ->
+          state
+      end
+    end
+  end
 
   defp block_release_cursor_for_apply do
     apply_state_put(:release_cursor_blocked, true)
@@ -2886,6 +2948,20 @@ defmodule Ferricstore.Raft.StateMachine do
   # Unknown inner command shape — conservative fallback: apply it (treat as replica).
   defp async_key_present?(_state, _other), do: false
 
+  defp release_cursor_poke_command?({:release_cursor_poke, index})
+       when is_integer(index) and index >= 0,
+       do: true
+
+  defp release_cursor_poke_command?({:async, _origin, {:release_cursor_poke, index}})
+       when is_integer(index) and index >= 0,
+       do: true
+
+  defp release_cursor_poke_command?({:async, {:release_cursor_poke, index}})
+       when is_integer(index) and index >= 0,
+       do: true
+
+  defp release_cursor_poke_command?(_command), do: false
+
   defp ets_has?(ets, key) do
     case :ets.lookup(ets, key) do
       [] -> false
@@ -3037,6 +3113,11 @@ defmodule Ferricstore.Raft.StateMachine do
     else
       apply_single(state, inner_cmd)
     end
+  end
+
+  defp apply_single(_state, {:release_cursor_poke, index})
+       when is_integer(index) and index >= 0 do
+    :ok
   end
 
   defp apply_single(state, {:put, key, value, expire_at_ms}) do

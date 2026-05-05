@@ -29,6 +29,7 @@ defmodule FerricStore.Instance do
           disk_pressure: reference(),
           checkpoint_flags: reference(),
           checkpoint_in_flight: reference(),
+          replay_safe_index: reference(),
           last_applied_index: reference(),
           last_released_cursor_index: reference(),
           pending_release_cursor_checkpoint_count: reference(),
@@ -69,6 +70,7 @@ defmodule FerricStore.Instance do
     :disk_pressure,
     :checkpoint_flags,
     :checkpoint_in_flight,
+    :replay_safe_index,
     :last_applied_index,
     :last_released_cursor_index,
     :pending_release_cursor_checkpoint_count,
@@ -169,6 +171,15 @@ defmodule FerricStore.Instance do
     checkpoint_in_flight =
       if name == :default do
         try_get_pt(:ferricstore_checkpoint_in_flight, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
+    replay_safe_index =
+      if name == :default do
+        try_get_pt(:ferricstore_replay_safe_index, fn ->
           :atomics.new(shard_count, signed: false)
         end)
       else
@@ -279,6 +290,7 @@ defmodule FerricStore.Instance do
       disk_pressure: disk_pressure,
       checkpoint_flags: checkpoint_flags,
       checkpoint_in_flight: checkpoint_in_flight,
+      replay_safe_index: replay_safe_index,
       last_applied_index: last_applied_index,
       last_released_cursor_index: last_released_cursor_index,
       pending_release_cursor_checkpoint_count: pending_release_cursor_checkpoint_count,
