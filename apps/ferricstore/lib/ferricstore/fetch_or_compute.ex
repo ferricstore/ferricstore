@@ -41,6 +41,7 @@ defmodule Ferricstore.FetchOrCompute do
   @table :ferricstore_compute_locks
   @default_compute_timeout_ms 30_000
   @poll_interval_ms 50
+  @not_initialized "instance not initialized"
 
   defp lock_key(key), do: "__foc_lock__:" <> key
 
@@ -83,7 +84,7 @@ defmodule Ferricstore.FetchOrCompute do
   @doc """
   Reports a compute error. Releases the lock, wakes local waiters with the error.
   """
-  @spec fetch_or_compute_error(binary(), binary()) :: :ok
+  @spec fetch_or_compute_error(binary(), binary()) :: :ok | {:error, binary()}
   def fetch_or_compute_error(key, error_msg) do
     GenServer.call(__MODULE__, {:fetch_or_compute_error, key, error_msg})
   end
@@ -102,45 +103,47 @@ defmodule Ferricstore.FetchOrCompute do
 
   @impl true
   def handle_call({:fetch_or_compute, key, _ttl_ms, hint, caller_pid}, from, state) do
-    ctx = FerricStore.Instance.get(:default)
+    with {:ok, ctx} <- default_instance() do
+      case Router.get(ctx, key) do
+        nil ->
+          # Cache miss. Determine if there is already a local computer on this
+          # node — if so, just park as a waiter and let the local computer wake
+          # us up when it publishes.
+          case :ets.lookup(@table, key) do
+            [{^key, computer_pid, waiters, started_at, lock_hint, compute_id}] ->
+              :ets.insert(
+                @table,
+                {key, computer_pid, add_waiter(waiters, {from, caller_pid}), started_at,
+                 lock_hint, compute_id}
+              )
 
-    case Router.get(ctx, key) do
-      nil ->
-        # Cache miss. Determine if there is already a local computer on this
-        # node — if so, just park as a waiter and let the local computer wake
-        # us up when it publishes.
-        case :ets.lookup(@table, key) do
-          [{^key, computer_pid, waiters, started_at, lock_hint, compute_id}] ->
-            :ets.insert(
-              @table,
-              {key, computer_pid, add_waiter(waiters, {from, caller_pid}), started_at, lock_hint,
-               compute_id}
-            )
+              {:noreply, state}
 
-            {:noreply, state}
+            [] ->
+              # No local computer. Try to acquire the cluster-wide Raft lock.
+              compute_id = generate_compute_id()
+              timeout_ms = state.compute_timeout_ms
 
-          [] ->
-            # No local computer. Try to acquire the cluster-wide Raft lock.
-            compute_id = generate_compute_id()
-            timeout_ms = state.compute_timeout_ms
+              case Router.lock(ctx, lock_key(key), compute_id, timeout_ms) do
+                :ok ->
+                  # We won the lock. Record locally and tell caller to compute.
+                  now = System.monotonic_time(:millisecond)
+                  :ets.insert(@table, {key, caller_pid, [], now, hint, compute_id})
+                  {:reply, {:compute, hint}, state}
 
-            case Router.lock(ctx, lock_key(key), compute_id, timeout_ms) do
-              :ok ->
-                # We won the lock. Record locally and tell caller to compute.
-                now = System.monotonic_time(:millisecond)
-                :ets.insert(@table, {key, caller_pid, [], now, hint, compute_id})
-                {:reply, {:compute, hint}, state}
+                {:error, _held_by_other} ->
+                  # Another node owns the lock. Spawn a poller that will reply
+                  # to this caller when the value appears (or on timeout).
+                  spawn_poller(from, key, timeout_ms)
+                  {:noreply, state}
+              end
+          end
 
-              {:error, _held_by_other} ->
-                # Another node owns the lock. Spawn a poller that will reply
-                # to this caller when the value appears (or on timeout).
-                spawn_poller(from, key, timeout_ms)
-                {:noreply, state}
-            end
-        end
-
-      value ->
-        {:reply, {:hit, value}, state}
+        value ->
+          {:reply, {:hit, value}, state}
+      end
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
@@ -152,47 +155,56 @@ defmodule Ferricstore.FetchOrCompute do
         0
       end
 
-    ctx = FerricStore.Instance.get(:default)
-    write_result = Router.put(ctx, key, value, expire_at_ms)
+    with {:ok, ctx} <- default_instance() do
+      write_result = Router.put(ctx, key, value, expire_at_ms)
 
-    # Wake local waiters and release the cluster-wide lock.
-    case :ets.lookup(@table, key) do
-      [{^key, _computer_pid, waiters, _started, _hint, compute_id}] ->
-        reply =
-          case write_result do
-            :ok -> {:ok, value}
-            {:error, _} = error -> error
-          end
+      # Wake local waiters and release the cluster-wide lock.
+      case :ets.lookup(@table, key) do
+        [{^key, _computer_pid, waiters, _started, _hint, compute_id}] ->
+          reply =
+            case write_result do
+              :ok -> {:ok, value}
+              {:error, _} = error -> error
+            end
 
-        reply_waiters(waiters, reply)
+          reply_waiters(waiters, reply)
 
-        _ = Router.unlock(ctx, lock_key(key), compute_id)
-        :ets.delete(@table, key)
+          _ = Router.unlock(ctx, lock_key(key), compute_id)
+          :ets.delete(@table, key)
 
-      [] ->
-        # No local lock — likely the computer is on another node and we are
-        # being called as a courtesy. Nothing local to clean up.
-        :ok
+        [] ->
+          # No local lock — likely the computer is on another node and we are
+          # being called as a courtesy. Nothing local to clean up.
+          :ok
+      end
+
+      {:reply, write_result, state}
+    else
+      {:error, reason} ->
+        reply_local_waiters_and_delete(key, {:error, reason})
+        {:reply, {:error, reason}, state}
     end
-
-    {:reply, write_result, state}
   end
 
   def handle_call({:fetch_or_compute_error, key, error_msg}, _from, state) do
-    ctx = FerricStore.Instance.get(:default)
+    with {:ok, ctx} <- default_instance() do
+      case :ets.lookup(@table, key) do
+        [{^key, _computer_pid, waiters, _started, _hint, compute_id}] ->
+          reply_waiters(waiters, {:error, error_msg})
 
-    case :ets.lookup(@table, key) do
-      [{^key, _computer_pid, waiters, _started, _hint, compute_id}] ->
-        reply_waiters(waiters, {:error, error_msg})
+          _ = Router.unlock(ctx, lock_key(key), compute_id)
+          :ets.delete(@table, key)
 
-        _ = Router.unlock(ctx, lock_key(key), compute_id)
-        :ets.delete(@table, key)
+        [] ->
+          :ok
+      end
 
-      [] ->
-        :ok
+      {:reply, :ok, state}
+    else
+      {:error, reason} ->
+        reply_local_waiters_and_delete(key, {:error, error_msg})
+        {:reply, {:error, reason}, state}
     end
-
-    {:reply, :ok, state}
   end
 
   # -------------------------------------------------------------------
@@ -223,6 +235,13 @@ defmodule Ferricstore.FetchOrCompute do
     "#{node()}:#{rand}"
   end
 
+  defp default_instance do
+    case :persistent_term.get({FerricStore.Instance, :default}, nil) do
+      nil -> {:error, @not_initialized}
+      ctx -> {:ok, ctx}
+    end
+  end
+
   # Poll Router.get/2 in a separate process so the GenServer is not blocked.
   # Replies to `from` with {:ok, value} when the value appears, or
   # {:error, :timeout} on expiry.
@@ -235,15 +254,17 @@ defmodule Ferricstore.FetchOrCompute do
   end
 
   defp poll_loop(from, key, remaining_ms) do
-    ctx = FerricStore.Instance.get(:default)
+    with {:ok, ctx} <- default_instance() do
+      case Router.get(ctx, key) do
+        nil ->
+          Process.sleep(@poll_interval_ms)
+          poll_loop(from, key, remaining_ms - @poll_interval_ms)
 
-    case Router.get(ctx, key) do
-      nil ->
-        Process.sleep(@poll_interval_ms)
-        poll_loop(from, key, remaining_ms - @poll_interval_ms)
-
-      value ->
-        GenServer.reply(from, {:ok, value})
+        value ->
+          GenServer.reply(from, {:ok, value})
+      end
+    else
+      {:error, reason} -> GenServer.reply(from, {:error, reason})
     end
   end
 
@@ -275,6 +296,17 @@ defmodule Ferricstore.FetchOrCompute do
     waiters
     |> waiters_fifo()
     |> Enum.each(fn {waiter_from, _pid} -> GenServer.reply(waiter_from, reply) end)
+  end
+
+  defp reply_local_waiters_and_delete(key, reply) do
+    case :ets.lookup(@table, key) do
+      [{^key, _computer_pid, waiters, _started, _hint, _compute_id}] ->
+        reply_waiters(waiters, reply)
+        :ets.delete(@table, key)
+
+      [] ->
+        :ok
+    end
   end
 
   defp waiters_fifo(waiters), do: Enum.reverse(waiters)
