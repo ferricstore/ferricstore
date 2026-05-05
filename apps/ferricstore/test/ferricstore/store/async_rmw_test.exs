@@ -6,8 +6,9 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   Target behavior:
   - Uncontended RMW runs inline in caller process under per-key ETS latch
     (:ets.insert_new). No GenServer hop, ~15μs p50.
-  - Contended RMW (another caller holds the latch) falls through to
-    Ferricstore.Store.RmwCoordinator, which serializes via its mailbox.
+  - Contended RMW (another caller holds the latch) waits on the per-key latch
+    in the caller path; the removed async durability worker is not part of the
+    design anymore.
   - Concurrent RMWs on the same key never lose updates; each caller gets
     a distinct, correctly-ordered result.
   - Router.async_submit replicates the DELTA command (e.g. {:incr, k, δ})
@@ -25,8 +26,6 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.BitcaskWriter
   alias Ferricstore.Store.Router
-  alias Ferricstore.Store.RmwCoordinator
-  alias Ferricstore.Test.IsolatedInstance
   alias Ferricstore.Test.ShardHelpers
 
   @ns "rmw_async"
@@ -74,10 +73,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
     test "contended RMW/list latch waiters do not yield-spin" do
       root = Path.expand("../../..", __DIR__)
 
-      paths = [
-        "lib/ferricstore/store/router.ex",
-        "lib/ferricstore/store/rmw_coordinator.ex"
-      ]
+      paths = ["lib/ferricstore/store/router.ex"]
 
       offenders =
         paths
@@ -113,108 +109,6 @@ defmodule Ferricstore.Store.AsyncRmwTest do
              APPEND/SETRANGE/etc. If crash recovery sees only the old cold value,
              a raw origin command can be skipped by ETS-presence detection.
              """
-    end
-  end
-
-  describe "instance context on fallback path" do
-    test "RmwCoordinator accepts the caller instance context" do
-      isolated = minimal_instance_context()
-
-      try do
-        key = ukey("isolated_missing_getdel")
-        idx = Router.shard_for(isolated, key)
-
-        assert nil == RmwCoordinator.execute(idx, isolated, {:getdel, key})
-        assert [] == :ets.lookup(elem(isolated.latch_refs, idx), key)
-      after
-        cleanup_minimal_instance_context(isolated)
-      end
-    end
-
-    test "RmwCoordinator sweeps stale latches for custom instance contexts it has seen" do
-      isolated = minimal_instance_context()
-
-      try do
-        idx = 0
-        latch_tab = elem(isolated.latch_refs, idx)
-        stale_key = ukey("custom_stale_latch")
-
-        dead_holder =
-          spawn(fn ->
-            :ok
-          end)
-
-        ref = Process.monitor(dead_holder)
-        assert_receive {:DOWN, ^ref, :process, ^dead_holder, :normal}, 500
-
-        :ets.insert(latch_tab, {stale_key, dead_holder})
-
-        assert nil ==
-                 RmwCoordinator.execute(idx, isolated, {:getdel, ukey("register_custom_ctx")})
-
-        assert :ok = RmwCoordinator.sweep_latches(idx)
-
-        assert [] == :ets.lookup(latch_tab, stale_key)
-      after
-        cleanup_minimal_instance_context(isolated)
-      end
-    end
-
-    test "RmwCoordinator prunes checked-in custom instance contexts after sweep" do
-      isolated = minimal_instance_context()
-      idx = 0
-      name = isolated.name
-
-      assert nil == RmwCoordinator.execute(idx, isolated, {:getdel, ukey("register_prune_ctx")})
-      assert Map.has_key?(:sys.get_state(RmwCoordinator.name(idx)).contexts, name)
-
-      cleanup_minimal_instance_context(isolated)
-
-      assert :ok = RmwCoordinator.sweep_latches(idx)
-      refute Map.has_key?(:sys.get_state(RmwCoordinator.name(idx)).contexts, name)
-    end
-
-    test "RmwCoordinator does not serialize same-key RMW across different instances" do
-      ctx_a = IsolatedInstance.checkout(shard_count: 1)
-      ctx_b = IsolatedInstance.checkout(shard_count: 1)
-      key = ukey("cross_instance_same_key")
-      idx = 0
-
-      holder_a = latch_holder()
-      holder_b = latch_holder()
-
-      try do
-        :ets.insert(elem(ctx_a.latch_refs, idx), {key, holder_a})
-        :ets.insert(elem(ctx_b.latch_refs, idx), {key, holder_b})
-
-        task_a = Task.async(fn -> RmwCoordinator.execute(idx, ctx_a, {:getdel, key}) end)
-        assert Task.yield(task_a, 50) == nil
-
-        task_b = Task.async(fn -> RmwCoordinator.execute(idx, ctx_b, {:getdel, key}) end)
-        assert Task.yield(task_b, 50) == nil
-
-        ref_b = Process.monitor(holder_b)
-        send(holder_b, :release)
-        assert_receive {:DOWN, ^ref_b, :process, ^holder_b, :normal}, 500
-
-        assert {:ok, nil} == Task.yield(task_b, 500)
-        assert Task.yield(task_a, 50) == nil
-      after
-        release_latch_holder(holder_a)
-        release_latch_holder(holder_b)
-
-        IsolatedInstance.checkin(ctx_a)
-        IsolatedInstance.checkin(ctx_b)
-      end
-    end
-
-    test "Router passes ctx when falling back to the RMW worker" do
-      # The worker is registered globally per shard, so the caller context must
-      # be part of the GenServer message. Otherwise contended async commands
-      # silently rehydrate the default instance inside RmwCoordinator.
-      path = Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__)
-
-      assert rmw_worker_calls_missing_ctx(path) == []
     end
   end
 
@@ -805,39 +699,6 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       assert Router.get(ctx(), key) == nil
     end
 
-    test "RmwCoordinator times out waiting for a stuck latch without later applying" do
-      original_timeout = Application.get_env(:ferricstore, :rmw_worker_latch_timeout_ms)
-      Application.put_env(:ferricstore, :rmw_worker_latch_timeout_ms, 5)
-
-      key = ukey("worker_latch_timeout")
-      idx = Router.shard_for(ctx(), key)
-      latch_tab = elem(ctx().latch_refs, idx)
-      holder = latch_holder()
-
-      assert :ets.insert_new(latch_tab, {key, holder})
-
-      task = Task.async(fn -> RmwCoordinator.execute(idx, ctx(), {:incr, key, 1}) end)
-
-      try do
-        assert {:ok, {:error, message}} = Task.yield(task, 500)
-        assert message =~ "RMW worker latch timeout"
-
-        release_latch_holder(holder)
-        Process.sleep(20)
-
-        assert Router.get(ctx(), key) == nil
-      after
-        Task.shutdown(task, :brutal_kill)
-        release_latch_holder(holder)
-        :ets.take(latch_tab, key)
-
-        case original_timeout do
-          nil -> Application.delete_env(:ferricstore, :rmw_worker_latch_timeout_ms)
-          value -> Application.put_env(:ferricstore, :rmw_worker_latch_timeout_ms, value)
-        end
-      end
-    end
-
     test "concurrent SETs and INCRs on same key never crash; final value is valid" do
       key = ukey("mixed")
       :ok = Router.put(ctx(), key, "0", 0)
@@ -970,46 +831,6 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Worker crash graceful handling
-  # ---------------------------------------------------------------------------
-
-  describe "worker crash" do
-    test "bad custom context returns worker error instead of timing out caller" do
-      bad_ctx = %FerricStore.Instance{
-        name: :"rmw_bad_ctx_#{System.unique_integer([:positive])}",
-        latch_refs: {}
-      }
-
-      assert {:error, "ERR RMW worker crashed"} ==
-               GenServer.call(
-                 RmwCoordinator.name(0),
-                 {:rmw, bad_ctx, {:getdel, ukey("bad_ctx")}},
-                 100
-               )
-    end
-
-    @tag timeout: 10_000
-    test "killing the RmwCoordinator returns an error then recovers" do
-      key = ukey("worker_crash")
-      :ok = Router.put(ctx(), key, "0", 0)
-
-      idx = Router.shard_for(ctx(), key)
-      pid = Process.whereis(Ferricstore.Store.RmwCoordinator.name(idx))
-      assert is_pid(pid)
-
-      ref = Process.monitor(pid)
-      Process.exit(pid, :kill)
-      assert_receive {:DOWN, ^ref, :process, ^pid, _}, 1_000
-
-      # Next RMW while worker is still restarting may return an error.
-      # The error must be graceful (not a raise). Eventually, a retry
-      # succeeds.
-      result = retry_rmw(fn -> Router.incr(ctx(), key, 1) end, 100)
-      assert match?({:ok, _}, result)
-    end
-  end
-
-  # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
 
@@ -1034,131 +855,6 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       other ->
         other
     end
-  end
-
-  defp retry_rmw(_fun, 0), do: {:error, :exhausted}
-
-  defp retry_rmw(fun, n) do
-    case fun.() do
-      {:ok, _} = ok ->
-        ok
-
-      _ ->
-        :timer.sleep(50)
-        retry_rmw(fun, n - 1)
-    end
-  end
-
-  defp latch_holder do
-    spawn(fn ->
-      receive do
-        :release -> :ok
-      end
-    end)
-  end
-
-  defp release_latch_holder(pid) when is_pid(pid) do
-    if Process.alive?(pid), do: send(pid, :release)
-    :ok
-  end
-
-  defp minimal_instance_context do
-    name = :"rmw_context_test_#{System.unique_integer([:positive])}"
-    dir = Path.join(System.tmp_dir!(), Atom.to_string(name))
-
-    ctx =
-      FerricStore.Instance.build(name,
-        data_dir: dir,
-        shard_count: 2,
-        max_memory_bytes: 256 * 1024 * 1024,
-        keydir_max_ram: 64 * 1024 * 1024
-      )
-
-    Enum.each(0..(ctx.shard_count - 1), fn i ->
-      :ets.new(elem(ctx.keydir_refs, i), [
-        :set,
-        :public,
-        :named_table,
-        {:read_concurrency, true},
-        {:write_concurrency, :auto}
-      ])
-    end)
-
-    ctx
-  end
-
-  defp cleanup_minimal_instance_context(ctx) do
-    Enum.each(0..(ctx.shard_count - 1), fn i ->
-      try do
-        :ets.delete(elem(ctx.keydir_refs, i))
-      rescue
-        _ -> :ok
-      end
-
-      try do
-        :ets.delete(elem(ctx.latch_refs, i))
-      rescue
-        _ -> :ok
-      end
-    end)
-
-    try do
-      :ets.delete(ctx.hotness_table)
-    rescue
-      _ -> :ok
-    end
-
-    try do
-      :ets.delete(ctx.config_table)
-    rescue
-      _ -> :ok
-    end
-
-    FerricStore.Instance.cleanup(ctx.name)
-    File.rm_rf!(ctx.data_dir)
-  end
-
-  defp rmw_worker_calls_missing_ctx(path) do
-    source = File.read!(path)
-    lines = String.split(source, "\n")
-    {:ok, ast} = Code.string_to_quoted(source, columns: true)
-
-    {_ast, violations} =
-      Macro.prewalk(ast, [], fn
-        {{:., meta, [{:__aliases__, _, [:GenServer]}, :call]}, _call_meta, args} = node, acc ->
-          case args do
-            [target, {:rmw, _cmd}, _timeout] ->
-              line_no = Keyword.get(meta, :line, 1)
-
-              if rmw_coordinator_target?(target) do
-                {node, [{line_no, line_at(lines, line_no)} | acc]}
-              else
-                {node, acc}
-              end
-
-            _ ->
-              {node, acc}
-          end
-
-        node, acc ->
-          {node, acc}
-      end)
-
-    Enum.reverse(violations)
-  end
-
-  defp rmw_coordinator_target?(
-         {{:., _, [:erlang, :binary_to_atom]}, _,
-          [{:<<>>, _, ["Ferricstore.Store.RmwCoordinator." | _]}, :utf8]}
-       ),
-       do: true
-
-  defp rmw_coordinator_target?(_target), do: false
-
-  defp line_at(lines, line_no) do
-    lines
-    |> Enum.at(line_no - 1, "")
-    |> String.trim()
   end
 
   defp tombstone_count(ctx, key) do

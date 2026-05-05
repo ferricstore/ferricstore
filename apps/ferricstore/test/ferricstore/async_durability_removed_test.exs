@@ -53,6 +53,28 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     refute function_exported?(FerricStore, :__async_batch_put_result_list__, 2)
   end
 
+  test "tests no longer keep removed RMW coordinator contract alive" do
+    repo_root = Path.expand("../../../..", __DIR__)
+
+    offenders =
+      Path.join(repo_root, "apps/ferricstore/test/ferricstore/**/*.exs")
+      |> Path.wildcard()
+      |> Enum.reject(&String.ends_with?(&1, "application_test.exs"))
+      |> Enum.reject(&(&1 == __ENV__.file))
+      |> Enum.flat_map(fn path ->
+        source = File.read!(path)
+
+        if String.contains?(source, "RmwCoordinator") or
+             String.contains?(source, "rmw_coordinator") do
+          [Path.relative_to(path, repo_root)]
+        else
+          []
+        end
+      end)
+
+    assert offenders == []
+  end
+
   test "batch_put API submits through quorum path" do
     id = {__MODULE__, self(), :quorum_submit}
     parent = self()

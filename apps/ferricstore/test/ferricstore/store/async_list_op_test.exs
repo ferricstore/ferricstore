@@ -5,13 +5,9 @@ defmodule Ferricstore.Store.AsyncListOpTest do
 
   Target behavior:
 
-  - Router.list_op dispatches on durability_for_key(list_key). Quorum
-    path unchanged. Async path tries :ets.insert_new on a per-list-key
-    latch; on win, executes ListOps.execute/3 inline against an origin-
-    local compound store; on lose, falls through to RmwCoordinator.
-
-  - RmwCoordinator accepts {:list_op, key, operation} and dispatches to
-    Router.execute_list_op_inline.
+  - The removed async durability path used to execute list ops under an
+    origin-local compound store. These historical tests remain skipped until
+    the suite is either deleted or converted to quorum-only list coverage.
 
   - State machine's `async_key_for/1` handles {:list_op, ...} so the
     origin-skip logic applies. Inner command is replicated as
@@ -20,8 +16,8 @@ defmodule Ferricstore.Store.AsyncListOpTest do
 
   - LMOVE cross-shard stays on quorum (single-shard LMOVE uses async).
 
-  These tests fail until Router.async_list_op + RmwCoordinator dispatch
-  extension + state_machine async_key_for extension are implemented.
+  These tests are intentionally skipped because async durability is no longer
+  a supported feature.
   """
   use ExUnit.Case, async: false
   @moduletag skip: "async durability feature removed; quorum is the only supported durability"
