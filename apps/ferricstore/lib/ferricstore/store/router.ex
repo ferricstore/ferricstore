@@ -2828,7 +2828,22 @@ defmodule Ferricstore.Store.Router do
 
         case validated_file_ref(path, offset, key, value_size) do
           {^path, value_offset, ^value_size} ->
-            read_validated_value_range(ctx, key, path, value_offset + relative_offset, count)
+            case read_validated_value_range(ctx, key, path, value_offset + relative_offset, count) do
+              {:ok, value} ->
+                value
+
+              :error ->
+                retry_getrange_after_ref_miss(
+                  ctx,
+                  idx,
+                  keydir,
+                  key,
+                  {file_id, offset, value_size},
+                  start_idx,
+                  end_idx,
+                  now
+                )
+            end
 
           nil ->
             retry_getrange_after_ref_miss(
@@ -2862,7 +2877,14 @@ defmodule Ferricstore.Store.Router do
             ""
 
           {relative_offset, count} ->
-            read_validated_value_range(ctx, key, path, value_offset + relative_offset, count)
+            case read_validated_value_range(ctx, key, path, value_offset + relative_offset, count) do
+              {:ok, value} ->
+                value
+
+              :error ->
+                Stats.incr_keyspace_misses(ctx)
+                nil
+            end
         end
 
       {:hot, value} ->
@@ -2875,14 +2897,22 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp read_validated_value_range(ctx, key, path, offset, count) do
+    maybe_run_cold_range_pread_miss_hook()
+
     case pread_file_range(path, offset, count) do
       {:ok, value} ->
         Stats.record_cold_read(ctx, key)
-        value
+        {:ok, value}
 
       :error ->
-        Stats.incr_keyspace_misses(ctx)
-        nil
+        :error
+    end
+  end
+
+  defp maybe_run_cold_range_pread_miss_hook do
+    case Process.get(:ferricstore_router_cold_range_pread_miss_hook) do
+      fun when is_function(fun, 0) -> fun.()
+      _ -> :ok
     end
   end
 

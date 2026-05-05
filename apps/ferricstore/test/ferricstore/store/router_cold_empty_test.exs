@@ -295,6 +295,41 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     end
   end
 
+  test "getrange retries when compaction removes file after value ref validation", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_getrange_pread_gap:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    old_value = "0123456789abcdef"
+    current_value = "ABCDEFGHIJKLMNOP"
+    value_size = byte_size(current_value)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    stale_path = Path.join(shard_path, "00001.log")
+    current_path = Path.join(shard_path, "00002.log")
+    test_pid = self()
+
+    {:ok, {stale_offset, _stale_record_size}} =
+      NIF.v2_append_record(stale_path, key, old_value, 0)
+
+    {:ok, {current_offset, _current_record_size}} =
+      NIF.v2_append_record(current_path, key, current_value, 0)
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 1, stale_offset, value_size})
+
+    Process.put(:ferricstore_router_cold_range_pread_miss_hook, fn ->
+      send(test_pid, :cold_range_pread_gap)
+      File.rm(stale_path)
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 2, current_offset, value_size})
+    end)
+
+    try do
+      assert "EFGH" == Router.getrange(ctx, key, 4, 7)
+      assert_receive :cold_range_pread_gap, 500
+    after
+      Process.delete(:ferricstore_router_cold_range_pread_miss_hook)
+    end
+  end
+
   test "direct cold read waits through a delayed compaction ETS update", %{
     ctx: ctx,
     keydir: keydir
