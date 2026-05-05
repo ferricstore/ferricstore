@@ -576,12 +576,10 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp bitcount_range_from_store(store, key, :byte, start_idx, end_idx) do
     with size when is_integer(size) <- metadata_value_size(store, key),
-         {:ok, start_byte, end_byte} <- resolve_range(start_idx, end_idx, size),
-         slice when is_binary(slice) <- Ops.getrange(store, key, start_byte, end_byte) do
-      {:ok, popcount(slice)}
+         {:ok, start_byte, end_byte} <- resolve_range(start_idx, end_idx, size) do
+      bitcount_byte_range_chunks(store, key, start_byte, end_byte, 0)
     else
       :empty -> {:ok, 0}
-      nil -> {:ok, 0}
       _ -> :unknown
     end
   end
@@ -608,6 +606,22 @@ defmodule Ferricstore.Commands.Bitmap do
     else
       :empty -> {:ok, 0}
       _ -> :unknown
+    end
+  end
+
+  defp bitcount_byte_range_chunks(_store, _key, offset, end_byte, acc) when offset > end_byte,
+    do: {:ok, acc}
+
+  defp bitcount_byte_range_chunks(store, key, offset, end_byte, acc) do
+    last = min(offset + @bitcount_chunk_bytes - 1, end_byte)
+    expected_size = last - offset + 1
+
+    case Ops.getrange(store, key, offset, last) do
+      slice when is_binary(slice) and byte_size(slice) == expected_size ->
+        bitcount_byte_range_chunks(store, key, last + 1, end_byte, acc + popcount(slice))
+
+      _missing_or_short ->
+        :unknown
     end
   end
 
