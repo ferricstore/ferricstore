@@ -89,7 +89,25 @@ defmodule Ferricstore.Raft.ClusterStartErrorTest do
       assert Cluster.wait_for_leader_on_start?(wait_for_leader: false) == false
     end
 
-    test "raft log snapshots are allowed at every released cursor" do
+    test "raft log snapshots are throttled separately from release cursor" do
+      args = Cluster.log_init_args_for_shard(0)
+
+      assert args.min_snapshot_interval == 65_536
+      assert args.min_checkpoint_interval == 16_384
+    end
+
+    test "raft snapshot throttle can be tuned for recovery tests" do
+      original_snapshot = Application.get_env(:ferricstore, :ra_min_snapshot_interval)
+      original_checkpoint = Application.get_env(:ferricstore, :ra_min_checkpoint_interval)
+
+      Application.put_env(:ferricstore, :ra_min_snapshot_interval, 1)
+      Application.put_env(:ferricstore, :ra_min_checkpoint_interval, 1)
+
+      on_exit(fn ->
+        restore_env(:ra_min_snapshot_interval, original_snapshot)
+        restore_env(:ra_min_checkpoint_interval, original_checkpoint)
+      end)
+
       args = Cluster.log_init_args_for_shard(0)
 
       assert args.min_snapshot_interval == 1
@@ -138,4 +156,7 @@ defmodule Ferricstore.Raft.ClusterStartErrorTest do
 
     found?
   end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

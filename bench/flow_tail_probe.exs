@@ -43,7 +43,9 @@ defmodule FlowTailProbe do
     [:ferricstore, :raft, :replay_safe_index, :persist],
     [:ferricstore, :bitcask, :append],
     [:ferricstore, :batcher, :slot_flush],
-    [:ferricstore, :batcher, :quorum_submit]
+    [:ferricstore, :batcher, :quorum_submit],
+    [:ferricstore, :batcher, :quorum_applied],
+    [:ferricstore, :batcher, :local_apply_gate]
   ]
 
   def run(backlog, iterations, partition_count, seed_concurrency, batch_size, top_count, data_dir) do

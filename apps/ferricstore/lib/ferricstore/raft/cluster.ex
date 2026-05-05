@@ -431,12 +431,20 @@ defmodule Ferricstore.Raft.Cluster do
   def log_init_args_for_shard(shard_index) do
     %{
       uid: shard_uid(shard_index),
-      # `release_cursor_interval` counts logical commands. A single Ra entry can
-      # contain thousands of batched writes, so Ra's default snapshot interval
-      # can prevent released cursors from materializing before an unclean crash.
-      min_snapshot_interval: 1,
-      min_checkpoint_interval: 1
+      # Release cursor is gated by Bitcask+LMDB durability; snapshots are only
+      # a recovery/log compaction aid. Keep snapshots throttled so hot writes do
+      # not pay for frequent Ra snapshot I/O.
+      min_snapshot_interval: ra_min_snapshot_interval(),
+      min_checkpoint_interval: ra_min_checkpoint_interval()
     }
+  end
+
+  defp ra_min_snapshot_interval do
+    Application.get_env(:ferricstore, :ra_min_snapshot_interval, 65_536)
+  end
+
+  defp ra_min_checkpoint_interval do
+    Application.get_env(:ferricstore, :ra_min_checkpoint_interval, 16_384)
   end
 
   @doc false

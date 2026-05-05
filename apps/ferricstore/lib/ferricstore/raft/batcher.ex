@@ -824,6 +824,8 @@ defmodule Ferricstore.Raft.Batcher do
   # node are consistent. The state machine wraps every result as
   # `{:applied_at, ra_index, real_result}` to give us the index here.
   def handle_info({:ra_event, _leader, {:applied, applied_list}}, state) do
+    now = System.monotonic_time()
+
     new_state =
       Enum.reduce(applied_list, state, fn {corr, raw_result}, acc ->
         {ra_index, result} = unwrap_applied(raw_result)
@@ -839,12 +841,14 @@ defmodule Ferricstore.Raft.Batcher do
           {{_froms, :origin_no_reply, _batch, _retry, _mono}, new_pending} ->
             track_origin_local_apply(%{acc | pending: new_pending}, ra_index)
 
-          {{froms, :single, _mono}, new_pending} ->
+          {{froms, :single, mono}, new_pending} ->
             acc2 = %{acc | pending: new_pending}
+            emit_quorum_applied_telemetry(acc2, mono, now, :single, froms, ra_index, result)
             gate_reply(acc2, ra_index, :single, froms, result)
 
-          {{froms, :batch, _mono}, new_pending} ->
+          {{froms, :batch, mono}, new_pending} ->
             acc2 = %{acc | pending: new_pending}
+            emit_quorum_applied_telemetry(acc2, mono, now, :batch, froms, ra_index, result)
             gate_reply(acc2, ra_index, :batch, froms, result)
         end
       end)
@@ -1037,10 +1041,14 @@ defmodule Ferricstore.Raft.Batcher do
   defp maybe_wrap_remote(_from, result, _ra_index), do: result
 
   defp drain_local_apply_waiters(%{last_local_applied: lla} = state) do
+    now = System.monotonic_time()
+
     {ready, still_waiting} =
       Enum.split_with(state.local_apply_waiters, fn waiter -> waiter_index(waiter) <= lla end)
 
     Enum.each(ready, fn waiter ->
+      emit_local_apply_gate_telemetry(state, waiter, now)
+
       do_reply(
         waiter_kind(waiter),
         waiter_froms(waiter),
@@ -1076,6 +1084,46 @@ defmodule Ferricstore.Raft.Batcher do
 
     state
   end
+
+  defp emit_quorum_applied_telemetry(state, submitted_mono, now, kind, froms, ra_index, result) do
+    :telemetry.execute(
+      [:ferricstore, :batcher, :quorum_applied],
+      %{
+        duration_us:
+          (now - submitted_mono)
+          |> max(0)
+          |> System.convert_time_unit(:native, :microsecond),
+        caller_count: length(froms)
+      },
+      %{
+        shard_index: state.shard_index,
+        kind: kind,
+        result: quorum_result_class(result),
+        ra_index: ra_index
+      }
+    )
+  end
+
+  defp emit_local_apply_gate_telemetry(state, waiter, now) do
+    :telemetry.execute(
+      [:ferricstore, :batcher, :local_apply_gate],
+      %{
+        duration_us:
+          (now - waiter_enqueued_at(waiter))
+          |> max(0)
+          |> System.convert_time_unit(:native, :microsecond),
+        caller_count: length(waiter_froms(waiter))
+      },
+      %{
+        shard_index: state.shard_index,
+        kind: waiter_kind(waiter),
+        ra_index: waiter_index(waiter)
+      }
+    )
+  end
+
+  defp quorum_result_class({:error, _}), do: :error
+  defp quorum_result_class(_), do: :ok
 
   defp oldest_local_apply_waiter_age_ms([], _now), do: 0
 

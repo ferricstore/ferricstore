@@ -259,9 +259,13 @@ defmodule Ferricstore.Raft.BatcherTest do
       handler_id = {:batcher_local_apply_waiters, self(), make_ref()}
       test_pid = self()
 
-      :telemetry.attach(
+      :telemetry.attach_many(
         handler_id,
-        [:ferricstore, :batcher, :local_apply_waiters],
+        [
+          [:ferricstore, :batcher, :quorum_applied],
+          [:ferricstore, :batcher, :local_apply_waiters],
+          [:ferricstore, :batcher, :local_apply_gate]
+        ],
         fn event, measurements, metadata, _config ->
           send(test_pid, {:batcher_telemetry, event, measurements, metadata})
         end,
@@ -285,6 +289,14 @@ defmodule Ferricstore.Raft.BatcherTest do
 
       send(batcher, {:ra_event, :leader, {:applied, [{corr, {:applied_at, ra_index, :ok}}]}})
 
+      assert_receive {:batcher_telemetry, [:ferricstore, :batcher, :quorum_applied],
+                      %{duration_us: applied_us, caller_count: 1},
+                      %{shard_index: ^shard_index, kind: :single, result: :ok}},
+                     1_000
+
+      assert is_integer(applied_us)
+      assert applied_us >= 0
+
       assert_receive {:batcher_telemetry, [:ferricstore, :batcher, :local_apply_waiters],
                       %{depth: 1, oldest_age_ms: oldest_age_ms}, %{shard_index: ^shard_index}},
                      1_000
@@ -295,6 +307,14 @@ defmodule Ferricstore.Raft.BatcherTest do
 
       send(batcher, {:locally_applied, ra_index})
       assert_receive {^reply_ref, :ok}, 1_000
+
+      assert_receive {:batcher_telemetry, [:ferricstore, :batcher, :local_apply_gate],
+                      %{duration_us: gate_us, caller_count: 1},
+                      %{shard_index: ^shard_index, kind: :single, ra_index: ^ra_index}},
+                     1_000
+
+      assert is_integer(gate_us)
+      assert gate_us >= 0
 
       assert_receive {:batcher_telemetry, [:ferricstore, :batcher, :local_apply_waiters],
                       %{depth: 0, oldest_age_ms: 0}, %{shard_index: ^shard_index}},

@@ -15,7 +15,9 @@ defmodule Ferricstore.QuorumMetrics do
   @events [
     [:ferricstore, :batcher, :slot_flush],
     [:ferricstore, :batcher, :quorum_submit],
+    [:ferricstore, :batcher, :quorum_applied],
     [:ferricstore, :batcher, :local_apply_waiters],
+    [:ferricstore, :batcher, :local_apply_gate],
     [:ferricstore, :batcher, :local_apply_timeout],
     [:ferricstore, :raft, :apply],
     [:ferricstore, :bitcask, :append]
@@ -48,12 +50,30 @@ defmodule Ferricstore.QuorumMetrics do
     submit_command_bytes_total:
       {"ferricstore_quorum_submit_command_bytes_total", :counter,
        "Total serialized command bytes submitted through the quorum path"},
+    applied_total:
+      {"ferricstore_quorum_applied_total", :counter,
+       "Total quorum submissions observed as Raft-applied by the batcher"},
+    applied_duration_us_total:
+      {"ferricstore_quorum_applied_duration_us_total", :counter,
+       "Total microseconds from quorum submission tracking to Raft applied event"},
+    applied_caller_count_total:
+      {"ferricstore_quorum_applied_caller_count_total", :counter,
+       "Total callers represented by Raft-applied quorum submissions"},
     local_apply_waiters:
       {"ferricstore_batcher_local_apply_waiters", :gauge,
        "Current number of quorum replies waiting for local Raft apply"},
     local_apply_waiter_oldest_age_ms:
       {"ferricstore_batcher_local_apply_waiter_oldest_age_ms", :gauge,
        "Age in milliseconds of the oldest quorum reply waiting for local Raft apply"},
+    local_apply_gate_total:
+      {"ferricstore_batcher_local_apply_gate_total", :counter,
+       "Total quorum replies released after waiting for local Raft apply"},
+    local_apply_gate_duration_us_total:
+      {"ferricstore_batcher_local_apply_gate_duration_us_total", :counter,
+       "Total microseconds quorum replies spent gated on local Raft apply"},
+    local_apply_gate_caller_count_total:
+      {"ferricstore_batcher_local_apply_gate_caller_count_total", :counter,
+       "Total callers represented by local Raft apply gate releases"},
     local_apply_timeout_total:
       {"ferricstore_batcher_local_apply_timeout_total", :counter,
        "Total timeouts while waiting for local Raft apply"},
@@ -145,6 +165,18 @@ defmodule Ferricstore.QuorumMetrics do
     increment(:submit_command_bytes_total, labels, measurement(measurements, :command_bytes))
   end
 
+  def handle_event([:ferricstore, :batcher, :quorum_applied], measurements, metadata, _config) do
+    labels = [
+      shard_index: shard_label(Map.get(metadata, :shard_index)),
+      kind: enum_label(Map.get(metadata, :kind), [:single, :batch]),
+      result: enum_label(Map.get(metadata, :result), [:ok, :error])
+    ]
+
+    increment(:applied_total, labels, 1)
+    increment(:applied_duration_us_total, labels, measurement(measurements, :duration_us))
+    increment(:applied_caller_count_total, labels, measurement(measurements, :caller_count))
+  end
+
   def handle_event(
         [:ferricstore, :batcher, :local_apply_waiters],
         measurements,
@@ -159,6 +191,32 @@ defmodule Ferricstore.QuorumMetrics do
       :local_apply_waiter_oldest_age_ms,
       labels,
       measurement(measurements, :oldest_age_ms)
+    )
+  end
+
+  def handle_event(
+        [:ferricstore, :batcher, :local_apply_gate],
+        measurements,
+        metadata,
+        _config
+      ) do
+    labels = [
+      shard_index: shard_label(Map.get(metadata, :shard_index)),
+      kind: enum_label(Map.get(metadata, :kind), [:single, :batch])
+    ]
+
+    increment(:local_apply_gate_total, labels, 1)
+
+    increment(
+      :local_apply_gate_duration_us_total,
+      labels,
+      measurement(measurements, :duration_us)
+    )
+
+    increment(
+      :local_apply_gate_caller_count_total,
+      labels,
+      measurement(measurements, :caller_count)
     )
   end
 

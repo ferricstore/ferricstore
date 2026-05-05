@@ -199,6 +199,12 @@ defmodule Ferricstore.MetricsTest do
       )
 
       :telemetry.execute(
+        [:ferricstore, :batcher, :quorum_applied],
+        %{duration_us: 19, caller_count: 2},
+        %{shard_index: 2, kind: :batch, result: :ok}
+      )
+
+      :telemetry.execute(
         [:ferricstore, :raft, :apply],
         %{duration_us: 11},
         %{shard_index: 2, result: :ok, disk: :ok}
@@ -214,6 +220,12 @@ defmodule Ferricstore.MetricsTest do
         [:ferricstore, :batcher, :local_apply_waiters],
         %{depth: 5, oldest_age_ms: 13},
         %{shard_index: 2}
+      )
+
+      :telemetry.execute(
+        [:ferricstore, :batcher, :local_apply_gate],
+        %{duration_us: 23, caller_count: 2},
+        %{shard_index: 2, kind: :batch}
       )
 
       :telemetry.execute(
@@ -248,6 +260,11 @@ defmodule Ferricstore.MetricsTest do
 
       assert String.contains?(
                text,
+               ~s(ferricstore_quorum_applied_duration_us_total{shard_index="2",kind="batch",result="ok"} 19)
+             )
+
+      assert String.contains?(
+               text,
                ~s(ferricstore_quorum_apply_total{shard_index="2",result="ok",disk="ok"} 1)
              )
 
@@ -264,6 +281,11 @@ defmodule Ferricstore.MetricsTest do
       assert String.contains?(
                text,
                ~s(ferricstore_batcher_local_apply_waiter_oldest_age_ms{shard_index="2"} 13)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_batcher_local_apply_gate_duration_us_total{shard_index="2",kind="batch"} 23)
              )
 
       assert String.contains?(
