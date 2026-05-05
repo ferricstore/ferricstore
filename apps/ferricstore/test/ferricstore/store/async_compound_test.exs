@@ -401,7 +401,7 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
         )
       end
 
-      assert {:error, "ERR async replication overloaded"} =
+      assert {:error, "ERR raft replication overloaded"} =
                Router.compound_put(ctx(), redis_key, ck, new, 0)
 
       Batcher.reset_pending(idx)

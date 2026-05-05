@@ -12,7 +12,7 @@ defmodule Ferricstore.Store.ActiveFile do
       # In Shard init and rotation:
       ActiveFile.publish(instance_ctx, shard_index, file_id, file_path, shard_data_path)
 
-      # In Router's async write path (hot path):
+      # In Router's local-origin write path (hot path):
       {file_id, file_path, shard_data_path} = ActiveFile.get(instance_ctx, shard_index)
   """
 

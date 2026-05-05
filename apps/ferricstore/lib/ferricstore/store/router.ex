@@ -110,7 +110,7 @@ defmodule Ferricstore.Store.Router do
   def effective_shard_count(ctx), do: ctx.shard_count
 
   # ---------------------------------------------------------------------------
-  # Write-path dispatch: quorum writes bypass Shard, async writes use Shard
+  # Write-path dispatch: all durable writes go through the quorum/Raft path.
   # ---------------------------------------------------------------------------
 
   @spec quorum_write(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
@@ -297,7 +297,7 @@ defmodule Ferricstore.Store.Router do
     under_pressure = idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
 
     if under_pressure do
-      {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
+      {:error, "ERR disk pressure on shard #{idx}, rejecting write"}
     else
       with :ok <- ensure_string_rmw_key(ctx, idx, cmd) do
         do_rmw_inline(ctx, idx, cmd)
@@ -1100,24 +1100,23 @@ defmodule Ferricstore.Store.Router do
   defp stored_value_size(value) when is_float(value), do: byte_size(Float.to_string(value))
   defp stored_value_size(value), do: value |> to_string() |> byte_size()
 
-  # Stronger async boundary for flows that need Ra submit before publishing a
-  # local effect. Plain async SET/DEL use async_enqueue_to_raft/2 below so
-  # their latency is not tied to the namespace batch window.
+  # Stronger Raft boundary for flows that need submission before publishing a
+  # local effect.
   defp async_submit_to_raft(idx, command) do
     case Ferricstore.Raft.Batcher.async_submit_ordered(idx, command) do
       :ok -> :ok
-      {:error, :overloaded} -> {:error, "ERR async replication overloaded"}
-      {:error, reason} -> {:error, "ERR async replication failed: #{inspect(reason)}"}
+      {:error, :overloaded} -> {:error, "ERR raft replication overloaded"}
+      {:error, reason} -> {:error, "ERR raft replication failed: #{inspect(reason)}"}
     end
   end
 
-  # Latency-critical async writes wait only for local Batcher acceptance. That
-  # preserves async semantics while still surfacing local overload/down errors.
+  # Latency-critical local-origin RMW flows wait only for local Batcher
+  # acceptance while still surfacing local overload/down errors.
   defp async_enqueue_to_raft(idx, command) do
     case Ferricstore.Raft.Batcher.async_enqueue_ordered(idx, command) do
       :ok -> :ok
-      {:error, :overloaded} -> {:error, "ERR async replication overloaded"}
-      {:error, reason} -> {:error, "ERR async replication failed: #{inspect(reason)}"}
+      {:error, :overloaded} -> {:error, "ERR raft replication overloaded"}
+      {:error, reason} -> {:error, "ERR raft replication failed: #{inspect(reason)}"}
     end
   end
 
@@ -1518,7 +1517,7 @@ defmodule Ferricstore.Store.Router do
         # Cold key — value evicted from ETS but disk location known.
         # Read directly from Bitcask via NIF, bypassing the Shard GenServer.
         # The ETS entry has valid file_id/offset from when the write committed,
-        # so pread works without flushing pending async writes.
+        # so pread works without flushing pending writes.
         path = cold_file_path(ctx, idx, file_id)
 
         case read_cold_async(path, offset, key) do
@@ -4213,8 +4212,8 @@ defmodule Ferricstore.Store.Router do
   The latch guarantees exclusive access to the list's compound keys.
 
   Reserves Batcher capacity before touching origin-local compound state.
-  That prevents overloaded async replication from exposing a local-only
-  list mutation as successful.
+  That prevents overloaded Raft replication from exposing a local-only list
+  mutation as successful.
   """
   @spec execute_list_op_inline(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
   def execute_list_op_inline(ctx, idx, {:list_op, key, operation} = cmd) do

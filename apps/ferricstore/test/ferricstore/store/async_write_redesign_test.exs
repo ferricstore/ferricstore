@@ -128,7 +128,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
         )
       end
 
-      assert {:error, "ERR async replication overloaded"} = Router.put(ctx(), key, "value", 0)
+      assert {:error, "ERR raft replication overloaded"} = Router.put(ctx(), key, "value", 0)
       assert Router.get(ctx(), key) == nil
     end
 
@@ -151,7 +151,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
         )
       end
 
-      assert {:error, "ERR async replication overloaded"} = Router.put(ctx(), key, large, 0)
+      assert {:error, "ERR raft replication overloaded"} = Router.put(ctx(), key, large, 0)
       assert Router.get(ctx(), key) == "old"
       assert recovered_value_from_bitcask(ctx(), key) == "old"
     end
@@ -172,7 +172,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
         )
       end
 
-      assert {:error, "ERR async replication overloaded"} = Router.put(ctx(), key, large, 0)
+      assert {:error, "ERR raft replication overloaded"} = Router.put(ctx(), key, large, 0)
       assert Router.get(ctx(), key) == nil
       assert recovered_value_from_bitcask(ctx(), key) == nil
     end
@@ -204,7 +204,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
         send(test_pid, :prewrite_dirty_flag_cleared)
       end)
 
-      assert {:error, "ERR async replication overloaded"} = Router.put(c, key, large, 0)
+      assert {:error, "ERR raft replication overloaded"} = Router.put(c, key, large, 0)
       assert_receive :prewrite_dirty_flag_cleared
 
       assert :atomics.get(c.checkpoint_flags, flag_idx) == 1,
@@ -228,7 +228,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
         )
       end
 
-      assert {:error, "ERR async replication overloaded"} =
+      assert {:error, "ERR raft replication overloaded"} =
                Router.batch_put(ctx(), [{key, "value"}])
 
       assert Router.get(ctx(), key) == nil

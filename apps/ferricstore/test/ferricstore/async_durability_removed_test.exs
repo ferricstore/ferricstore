@@ -173,6 +173,7 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
               ":ferricstore_durability_mode",
               ":ferricstore_has_async_ns",
               "async namespace",
+              "ERR async",
               "ERR async key latch"
             ],
             String.contains?(source, token) do

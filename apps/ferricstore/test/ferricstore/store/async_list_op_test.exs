@@ -93,7 +93,7 @@ defmodule Ferricstore.Store.AsyncListOpTest do
         )
       end
 
-      assert {:error, "ERR async replication overloaded"} =
+      assert {:error, "ERR raft replication overloaded"} =
                Router.list_op(ctx(), key, {:rpush, ["a"]})
 
       Batcher.reset_pending(idx)

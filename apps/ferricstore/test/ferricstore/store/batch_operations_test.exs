@@ -259,14 +259,14 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
     @tag skip:
            "async durability overload path removed; default instance writes now submit through quorum"
-    test "cross-shard async replication overload does not leave earlier shard writes visible" do
+    test "cross-shard raft replication overload does not leave earlier shard writes visible" do
       ok_key = key_for_shard(default_ctx(), "bap_cross_overload_ok", 0)
       overloaded_key = key_for_shard(default_ctx(), "bap_cross_overload_blocked", 1)
 
       on_exit(fn -> Batcher.reset_pending(1) end)
       fill_async_pending(1, overloaded_key)
 
-      assert {:error, "ERR async replication overloaded"} =
+      assert {:error, "ERR raft replication overloaded"} =
                Router.batch_put(default_ctx(), [{ok_key, "ok"}, {overloaded_key, "blocked"}])
 
       assert nil == Router.get(default_ctx(), ok_key)
@@ -296,7 +296,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
     @tag skip:
            "async durability overload recovery path removed; default instance writes now submit through quorum"
-    test "large batch does not recover unaccepted value when async replication is overloaded" do
+    test "large batch does not recover unaccepted value when raft replication is overloaded" do
       key = "#{@ns_async}:bap_overloaded_large_missing_#{System.unique_integer([:positive])}"
       idx = Router.shard_for(default_ctx(), key)
       large = :binary.copy("B", default_ctx().hot_cache_max_value_size + 1024)
@@ -304,7 +304,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       on_exit(fn -> Batcher.reset_pending(idx) end)
       fill_async_pending(idx, key)
 
-      assert {:error, "ERR async replication overloaded"} =
+      assert {:error, "ERR raft replication overloaded"} =
                Router.batch_put(default_ctx(), [{key, large}])
 
       assert nil == Router.get(default_ctx(), key)
@@ -313,7 +313,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
     @tag skip:
            "async durability overload rollback path removed; default instance writes now submit through quorum"
-    test "large batch restores previous cold value when async replication is overloaded" do
+    test "large batch restores previous cold value when raft replication is overloaded" do
       key = "#{@ns_async}:bap_overloaded_large_existing_#{System.unique_integer([:positive])}"
       idx = Router.shard_for(default_ctx(), key)
       old = :binary.copy("O", default_ctx().hot_cache_max_value_size + 1024)
@@ -325,7 +325,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       on_exit(fn -> Batcher.reset_pending(idx) end)
       fill_async_pending(idx, key)
 
-      assert {:error, "ERR async replication overloaded"} =
+      assert {:error, "ERR raft replication overloaded"} =
                Router.batch_put(default_ctx(), [{key, new}])
 
       assert old == Router.get(default_ctx(), key)

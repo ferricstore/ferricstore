@@ -408,8 +408,8 @@ defmodule Ferricstore.Raft.Batcher do
   Submits a list of async commands to the batcher in a single cast.
 
   Same semantics as calling `async_submit/2` for each command, but sends
-  one GenServer cast instead of N — reduces message passing overhead for
-  batch async writes.
+  one GenServer cast instead of N, reducing message passing overhead for
+  batched internal submissions.
   """
   @spec async_submit_batch(non_neg_integer(), [command()]) :: :ok
   def async_submit_batch(shard_index, commands) do

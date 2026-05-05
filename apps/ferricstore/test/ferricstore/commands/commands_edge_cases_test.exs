@@ -12,9 +12,9 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
     test "APPEND returns backend errors instead of raising" do
       store =
         MockStore.make()
-        |> Map.put(:append, fn _key, _suffix -> {:error, "ERR async replication overloaded"} end)
+        |> Map.put(:append, fn _key, _suffix -> {:error, "ERR raft replication overloaded"} end)
 
-      assert {:error, "ERR async replication overloaded"} =
+      assert {:error, "ERR raft replication overloaded"} =
                Strings.handle("APPEND", ["k", "suffix"], store)
     end
 
@@ -22,10 +22,10 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
       store =
         MockStore.make()
         |> Map.put(:setrange, fn _key, _offset, _value ->
-          {:error, "ERR disk pressure on shard 0, rejecting async write"}
+          {:error, "ERR disk pressure on shard 0, rejecting write"}
         end)
 
-      assert {:error, "ERR disk pressure on shard 0, rejecting async write"} =
+      assert {:error, "ERR disk pressure on shard 0, rejecting write"} =
                Strings.handle("SETRANGE", ["k", "0", "value"], store)
     end
   end

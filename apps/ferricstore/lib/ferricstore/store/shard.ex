@@ -1708,7 +1708,7 @@ defmodule Ferricstore.Store.Shard do
   # Periodic fragmentation re-evaluation for idle shards.
   # Catches shards that accumulated dead data then stopped receiving writes.
   # Disk pressure is intentionally not cleared here; only a successful append or
-  # fsync proves that the shard can accept async writes again.
+  # fsync proves that the shard can accept writes again.
   def handle_info(:frag_check, state) do
     state = maybe_notify_fragmentation(state)
     ShardLifecycle.schedule_frag_check()

@@ -196,7 +196,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
         )
       end
 
-      assert {:error, "ERR async replication overloaded"} = Router.incr(ctx(), k, 1)
+      assert {:error, "ERR raft replication overloaded"} = Router.incr(ctx(), k, 1)
       assert Router.get(ctx(), k) == nil
     end
 
@@ -217,7 +217,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
         )
       end
 
-      assert {:error, "ERR async replication overloaded"} = Router.delete(ctx(), k)
+      assert {:error, "ERR raft replication overloaded"} = Router.delete(ctx(), k)
       assert Router.get(ctx(), k) == "keep"
     end
 
