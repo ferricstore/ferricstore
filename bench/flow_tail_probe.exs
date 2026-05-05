@@ -61,9 +61,15 @@ defmodule FlowTailProbe do
       "backlog=#{backlog} iterations=#{iterations} partitions=#{partition_count} batch=#{batch_size}"
     )
 
+    memory_before = memory_snapshot()
+    print_memory("memory_before", memory_before)
+
     timed("seed active #{backlog}", fn ->
       seed_active(prefix, active_type, backlog, partition_count, seed_concurrency)
     end)
+
+    memory_after_active = memory_snapshot()
+    print_memory_delta("memory_after_active", memory_after_active, memory_before)
 
     warm_info(prefix, active_type, partition_count)
     clear_events()
@@ -77,6 +83,9 @@ defmodule FlowTailProbe do
       partition_count,
       seed_concurrency
     )
+
+    memory_after_claim_seed = memory_snapshot()
+    print_memory_delta("memory_after_claim_seed", memory_after_claim_seed, memory_before)
 
     probe("claim_due", iterations, top_count, fn i ->
       {:ok, claimed} =
@@ -240,6 +249,8 @@ defmodule FlowTailProbe do
     end)
 
     :telemetry.detach(__MODULE__)
+    memory_after_probes = memory_snapshot()
+    print_memory_delta("memory_after_probes", memory_after_probes, memory_before)
   after
     File.rm_rf(data_dir)
   end
@@ -354,6 +365,41 @@ defmodule FlowTailProbe do
     for i <- 1..partition_count do
       FerricStore.flow_info(active_type, partition_key: partition(prefix, i, partition_count))
     end
+  end
+
+  defp memory_snapshot do
+    %{
+      beam_total: :erlang.memory(:total),
+      beam_processes: :erlang.memory(:processes),
+      binary: :erlang.memory(:binary),
+      ets: :erlang.memory(:ets),
+      ets_tables: ets_table_memory(),
+      rss: Ferricstore.MemoryGuard.process_rss_bytes()
+    }
+  end
+
+  defp print_memory(label, snapshot) do
+    IO.puts(
+      "#{label}: beam_total=#{snapshot.beam_total} beam_processes=#{snapshot.beam_processes} binary=#{snapshot.binary} ets=#{snapshot.ets} ets_tables=#{snapshot.ets_tables} rss=#{snapshot.rss}"
+    )
+  end
+
+  defp print_memory_delta(label, snapshot, baseline) do
+    IO.puts(
+      "#{label}: beam_total=#{snapshot.beam_total} delta=#{snapshot.beam_total - baseline.beam_total} beam_processes=#{snapshot.beam_processes} binary=#{snapshot.binary} ets=#{snapshot.ets} ets_tables=#{snapshot.ets_tables} rss=#{snapshot.rss} rss_delta=#{snapshot.rss - baseline.rss}"
+    )
+  end
+
+  defp ets_table_memory do
+    word_size = :erlang.system_info(:wordsize)
+
+    :ets.all()
+    |> Enum.reduce(0, fn table, acc ->
+      case :ets.info(table, :memory) do
+        memory when is_integer(memory) -> acc + memory * word_size
+        _ -> acc
+      end
+    end)
   end
 
   defp seed_active(prefix, flow_type, backlog, partition_count, seed_concurrency) do
