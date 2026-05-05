@@ -4154,6 +4154,52 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc """
+  Returns a lightweight WATCH token for `key`.
+
+  Hot keys use the value hash. Cold keys use their live keydir location and
+  expiry, avoiding a large Bitcask read just to snapshot WATCH state.
+  """
+  @spec watch_token(FerricStore.Instance.t(), binary()) :: term()
+  def watch_token(ctx, key) do
+    idx = shard_for(ctx, key)
+    keydir = resolve_keydir(ctx, idx)
+    now = HLC.now_ms()
+
+    try do
+      case :ets.lookup(keydir, key) do
+        [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
+          {:value, :erlang.phash2(value)}
+
+        [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+          {:cold, fid, off, vsize, 0}
+
+        [{^key, nil, 0, _lfu, :pending, _off, _vsize}] ->
+          {:version, get_version(ctx, key)}
+
+        [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+          {:value, :erlang.phash2(value), exp}
+
+        [{^key, nil, exp, _lfu, fid, off, vsize}]
+        when exp > now and valid_cold_location(fid, off, vsize) ->
+          {:cold, fid, off, vsize, exp}
+
+        [{^key, nil, exp, _lfu, :pending, _off, _vsize}] when exp > now ->
+          {:version, get_version(ctx, key)}
+
+        [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
+          track_keydir_binary_delete(ctx, idx, keydir, key)
+          :ets.delete(keydir, key)
+          :missing
+
+        [] ->
+          :missing
+      end
+    rescue
+      ArgumentError -> {:version, get_version(ctx, key)}
+    end
+  end
+
+  @doc """
   Returns the keydir disk location for a key, or `:miss`.
 
   Reads the `{file_id, offset, value_size}` fields directly from the keydir

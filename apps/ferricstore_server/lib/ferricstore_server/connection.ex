@@ -134,7 +134,7 @@ defmodule FerricstoreServer.Connection do
           multi_state: multi_state(),
           multi_queue: [{binary(), [binary()]}],
           multi_queue_count: non_neg_integer(),
-          watched_keys: %{binary() => non_neg_integer()},
+          watched_keys: %{binary() => term()},
           require_auth: boolean(),
           tracking: ClientTracking.tracking_config() | nil,
           acl_cache: acl_cache()

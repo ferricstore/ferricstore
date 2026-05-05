@@ -110,6 +110,23 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     assert is_integer(value_offset)
   end
 
+  test "watch_token fingerprints cold rows without warming large values", %{
+    ctx: ctx,
+    shard: shard,
+    keydir: keydir
+  } do
+    key = "cold_watch_token:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    value = :binary.copy("w", 2048)
+    value_size = byte_size(value)
+
+    assert :ok = GenServer.call(shard, {:put, key, value, 0})
+    :ok = GenServer.call(shard, :flush)
+    assert [{^key, nil, 0, lfu, fid, off, ^value_size}] = :ets.lookup(keydir, key)
+
+    assert {:cold, ^fid, ^off, ^value_size, 0} = Router.watch_token(ctx, key)
+    assert [{^key, nil, 0, ^lfu, ^fid, ^off, ^value_size}] = :ets.lookup(keydir, key)
+  end
+
   test "batch_get_with_file_refs retries file refs after validation misses instead of materializing",
        %{
          ctx: ctx,

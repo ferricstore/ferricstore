@@ -10,18 +10,16 @@ defmodule Ferricstore.Transaction.Coordinator do
 
   ## WATCH conflict detection
 
-  WATCH uses per-key value hashes (`:erlang.phash2/1` of the value) rather
-  than per-shard write-version counters. At WATCH time the connection snapshots
-  `phash2(Router.get(key))` for each watched key. At EXEC time `watches_clean?/1`
-  re-reads each key and compares hashes. This eliminates false-positive aborts
-  caused by unrelated writes to the same shard (the old shard-version approach).
+  WATCH uses per-key tokens rather than per-shard write-version counters. Hot
+  keys hash the in-memory value; cold keys snapshot the live keydir location so
+  large values do not have to be materialized just to enter or check WATCH.
   """
 
   alias Ferricstore.Raft.CommandClock
   alias Ferricstore.Store.Router
   alias Ferricstore.Transaction.Ast, as: TxAst
 
-  @spec execute([TxAst.queue_entry()], %{binary() => non_neg_integer()}, binary() | nil) ::
+  @spec execute([TxAst.queue_entry()], %{binary() => term()}, binary() | nil) ::
           [term()] | nil | {:error, binary()}
   def execute([], _watched_keys, _sandbox_namespace), do: []
 
@@ -283,9 +281,9 @@ defmodule Ferricstore.Transaction.Coordinator do
   defp watches_clean?(watched) do
     ctx = FerricStore.Instance.get(:default)
 
-    Enum.all?(watched, fn {key, saved_hash} ->
+    Enum.all?(watched, fn {key, saved_token} ->
       try do
-        :erlang.phash2(Router.get(ctx, key)) == saved_hash
+        Router.watch_token(ctx, key) == saved_token
       catch
         :exit, _ -> false
       end
