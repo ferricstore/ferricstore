@@ -3,6 +3,7 @@ defmodule Ferricstore.Commands.ExpiryTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.Expiry
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -13,6 +14,61 @@ defmodule Ferricstore.Commands.ExpiryTest do
     test "EXPIRE existing key returns 1" do
       store = MockStore.make(%{"k" => {"v", 0}})
       assert 1 == Expiry.handle("EXPIRE", ["k", "10"], store)
+    end
+
+    test "EXPIRE returns plain write errors" do
+      store = %{
+        expire_at_ms: fn "k" -> 0 end,
+        get_meta: fn "k" -> {"v", 0} end,
+        put: fn "k", "v", expire_at_ms when is_integer(expire_at_ms) and expire_at_ms > 0 ->
+          {:error, :disk_full}
+        end,
+        compound_get_meta: fn _redis_key, _compound_key -> nil end
+      }
+
+      assert {:error, :disk_full} == Expiry.handle("EXPIRE", ["k", "10"], store)
+    end
+
+    test "EXPIRE batches compound member TTL writes and returns write errors" do
+      type_key = CompoundKey.type_key("hash")
+      field_a = CompoundKey.hash_field("hash", "a")
+      field_b = CompoundKey.hash_field("hash", "b")
+
+      store = %{
+        expire_at_ms: fn "hash" -> nil end,
+        get_meta: fn "hash" -> nil end,
+        compound_get: fn "hash", ^type_key -> "hash" end,
+        compound_get_meta: fn
+          "hash", ^type_key -> {"hash", 0}
+          "hash", _compound_key -> nil
+        end,
+        compound_put: fn "hash", compound_key, _value, _expire_at_ms ->
+          flunk(
+            "EXPIRE should batch the whole compound TTL rewrite, got #{inspect(compound_key)}"
+          )
+        end,
+        compound_scan: fn "hash", _prefix -> [{"a", "1"}, {"b", "2"}] end,
+        compound_batch_put: fn "hash", entries ->
+          entries_by_key =
+            Map.new(entries, fn {compound_key, value, expire_at_ms} ->
+              {compound_key, {value, expire_at_ms}}
+            end)
+
+          assert %{
+                   ^type_key => {"hash", exp_type},
+                   ^field_a => {"1", exp_a},
+                   ^field_b => {"2", exp_b}
+                 } = entries_by_key
+
+          assert map_size(entries_by_key) == 3
+          assert exp_type == exp_a
+          assert is_integer(exp_a) and exp_a > 0
+          assert exp_a == exp_b
+          {:error, :disk_full}
+        end
+      }
+
+      assert {:error, :disk_full} == Expiry.handle("EXPIRE", ["hash", "10"], store)
     end
 
     test "EXPIRE missing key returns 0" do
@@ -171,6 +227,19 @@ defmodule Ferricstore.Commands.ExpiryTest do
       store = MockStore.make(%{"k" => {"v", future}})
       assert 1 == Expiry.handle("PERSIST", ["k"], store)
       assert -1 == Expiry.handle("TTL", ["k"], store)
+    end
+
+    test "PERSIST returns plain write errors" do
+      future = System.os_time(:millisecond) + 60_000
+
+      store = %{
+        expire_at_ms: fn "k" -> future end,
+        get_meta: fn "k" -> {"v", future} end,
+        put: fn "k", "v", 0 -> {:error, :disk_full} end,
+        compound_get_meta: fn _redis_key, _compound_key -> nil end
+      }
+
+      assert {:error, :disk_full} == Expiry.handle("PERSIST", ["k"], store)
     end
 
     test "PERSIST key without TTL returns 0" do
