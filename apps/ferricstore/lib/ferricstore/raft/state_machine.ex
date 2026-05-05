@@ -754,7 +754,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   def apply(meta, {:clear_locks}, state) do
     apply_control_with_time(meta, state, fn ->
-      {%{state | cross_shard_locks: %{}, cross_shard_intents: %{}}, :ok}
+      {state |> Map.put(:cross_shard_locks, %{}) |> Map.put(:cross_shard_intents, %{}), :ok}
     end)
   end
 
@@ -8001,7 +8001,7 @@ defmodule Ferricstore.Raft.StateMachine do
           Map.put(acc, key, {owner_ref, expire_at_ms})
         end)
 
-      {%{state | cross_shard_locks: new_locks}, :ok}
+      {Map.put(state, :cross_shard_locks, new_locks), :ok}
     end
   end
 
@@ -8018,7 +8018,7 @@ defmodule Ferricstore.Raft.StateMachine do
         end
       end)
 
-    {%{state | cross_shard_locks: new_locks}, :ok}
+    {Map.put(state, :cross_shard_locks, new_locks), :ok}
   end
 
   # Checks whether a key is locked by someone other than owner_ref.
@@ -8037,13 +8037,13 @@ defmodule Ferricstore.Raft.StateMachine do
   # Writes an intent record. Returns {new_state, :ok}.
   defp do_write_intent(state, owner_ref, intent_map) do
     intents = Map.get(state, :cross_shard_intents, %{})
-    {%{state | cross_shard_intents: Map.put(intents, owner_ref, intent_map)}, :ok}
+    {Map.put(state, :cross_shard_intents, Map.put(intents, owner_ref, intent_map)), :ok}
   end
 
   # Deletes an intent record. Returns {new_state, :ok}.
   defp do_delete_intent(state, owner_ref) do
     intents = Map.get(state, :cross_shard_intents, %{})
-    {%{state | cross_shard_intents: Map.delete(intents, owner_ref)}, :ok}
+    {Map.put(state, :cross_shard_intents, Map.delete(intents, owner_ref)), :ok}
   end
 
   # Returns all intent records.

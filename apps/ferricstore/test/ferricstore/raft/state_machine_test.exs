@@ -1866,6 +1866,38 @@ defmodule Ferricstore.Raft.StateMachineTest do
                new_state.cross_shard_locks
     end
 
+    test "cross-shard control commands tolerate legacy state without lock maps", %{
+      state: state
+    } do
+      apply_now = Ferricstore.HLC.now_ms()
+      owner = make_ref()
+      legacy_state = Map.drop(state, [:cross_shard_locks, :cross_shard_intents])
+
+      {locked_state, :ok} =
+        StateMachine.apply(
+          %{system_time: apply_now},
+          {:lock_keys, ["legacy_lock"], owner, apply_now + 30_000},
+          legacy_state
+        )
+
+      assert %{"legacy_lock" => {^owner, _expires_at}} = locked_state.cross_shard_locks
+
+      {intent_state, :ok} =
+        StateMachine.apply(
+          %{system_time: apply_now},
+          {:cross_shard_intent, owner, %{0 => ["legacy_lock"]}},
+          Map.drop(locked_state, [:cross_shard_intents])
+        )
+
+      assert %{^owner => %{0 => ["legacy_lock"]}} = intent_state.cross_shard_intents
+
+      {cleared_state, :ok} =
+        StateMachine.apply(%{system_time: apply_now}, {:clear_locks}, legacy_state)
+
+      assert cleared_state.cross_shard_locks == %{}
+      assert cleared_state.cross_shard_intents == %{}
+    end
+
     test "uses raft meta system_time for standalone read-modify-write TTL checks", %{
       state: state,
       ets: ets
