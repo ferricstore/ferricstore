@@ -40,7 +40,7 @@ defmodule Ferricstore.Store.TypeRegistry do
     - `:ok` if the type matches or was newly set
     - `{:error, wrongtype_message}` if the type mismatches
   """
-  @spec check_or_set(binary(), CompoundKey.data_type(), map()) :: :ok | {:error, binary()}
+  @spec check_or_set(binary(), CompoundKey.data_type(), map()) :: :ok | {:error, term()}
   def check_or_set(redis_key, type, store) do
     type_key = CompoundKey.type_key(redis_key)
     expected = CompoundKey.encode_type(type)
@@ -51,8 +51,7 @@ defmodule Ferricstore.Store.TypeRegistry do
         if has_exists?(store) and Ops.exists?(store, redis_key) do
           {:error, @wrongtype_msg}
         else
-          Ops.compound_put(store, redis_key, type_key, expected, 0)
-          :ok
+          write_type_marker(redis_key, type_key, expected, store)
         end
 
       ^expected ->
@@ -61,8 +60,7 @@ defmodule Ferricstore.Store.TypeRegistry do
       _other_type ->
         case get_type(redis_key, store) do
           "none" ->
-            Ops.compound_put(store, redis_key, type_key, expected, 0)
-            :ok
+            write_type_marker(redis_key, type_key, expected, store)
 
           _live_type ->
             {:error, @wrongtype_msg}
@@ -194,4 +192,13 @@ defmodule Ferricstore.Store.TypeRegistry do
   defp has_exists?(%FerricStore.Instance{}), do: true
   defp has_exists?(%Ferricstore.Store.LocalTxStore{}), do: true
   defp has_exists?(store) when is_map(store), do: is_map_key(store, :exists?)
+
+  defp write_type_marker(redis_key, type_key, expected, store) do
+    case Ops.compound_put(store, redis_key, type_key, expected, 0) do
+      :ok -> :ok
+      true -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, other}
+    end
+  end
 end
