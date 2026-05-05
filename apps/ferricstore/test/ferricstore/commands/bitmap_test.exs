@@ -821,6 +821,34 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert <<0x00>> == store.get.("dest")
     end
 
+    test "AND with a missing source avoids reading large cold sources" do
+      parent = self()
+
+      store = %{
+        value_size: fn
+          "cold" -> 1_048_576
+          "missing" -> nil
+          "dest" -> nil
+        end,
+        batch_get: fn keys ->
+          send(parent, {:batch_loaded_sources, keys})
+          [<<1>>, nil]
+        end,
+        put: fn "dest", value, 0 ->
+          prefix_size = min(byte_size(value), 4)
+          send(parent, {:wrote_result, byte_size(value), binary_part(value, 0, prefix_size)})
+          :ok
+        end,
+        compound_get: fn _redis_key, _compound_key -> nil end,
+        compound_delete: fn _redis_key, _compound_key -> :ok end,
+        compound_delete_prefix: fn _redis_key, _prefix -> :ok end
+      }
+
+      assert 1_048_576 == Bitmap.handle("BITOP", ["AND", "dest", "cold", "missing"], store)
+      assert_received {:wrote_result, 1_048_576, <<0, 0, 0, 0>>}
+      refute_received {:batch_loaded_sources, ["cold", "missing"]}
+    end
+
     test "with all non-existent source keys" do
       store = MockStore.make()
       assert 0 == Bitmap.handle("BITOP", ["OR", "dest", "missing1", "missing2"], store)

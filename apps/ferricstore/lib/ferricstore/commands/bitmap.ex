@@ -1111,19 +1111,18 @@ defmodule Ferricstore.Commands.Bitmap do
     {:error, "ERR BITOP NOT requires one and only one key"}
   end
 
-  defp execute_bitop(op, source_keys, store) when op in ~w(AND OR XOR) do
+  defp execute_bitop("AND", source_keys, store) do
+    with :ok <- ensure_string_keys(source_keys, store) do
+      case and_zero_result_from_missing_source(source_keys, store) do
+        {:ok, result} -> {:ok, result}
+        :unknown -> read_sources_unchecked(source_keys, store, "AND")
+      end
+    end
+  end
+
+  defp execute_bitop(op, source_keys, store) when op in ~w(OR XOR) do
     with {:ok, values} <- read_sources(source_keys, store) do
-      max_len = values |> Enum.map(&byte_size/1) |> Enum.max()
-      padded = Enum.map(values, &pad_binary(&1, max_len))
-
-      result =
-        case op do
-          "AND" -> bitop_combine(padded, &Bitwise.band/2)
-          "OR" -> bitop_combine(padded, &Bitwise.bor/2)
-          "XOR" -> bitop_combine(padded, &Bitwise.bxor/2)
-        end
-
-      {:ok, result}
+      combine_bitop_sources(op, values)
     end
   end
 
@@ -1139,19 +1138,18 @@ defmodule Ferricstore.Commands.Bitmap do
     {:error, "ERR BITOP NOT requires one and only one key"}
   end
 
-  defp execute_bitop_ast(op, source_keys, store) when op in [:band, :bor, :bxor] do
+  defp execute_bitop_ast(:band, source_keys, store) do
+    with :ok <- ensure_string_keys(source_keys, store) do
+      case and_zero_result_from_missing_source(source_keys, store) do
+        {:ok, result} -> {:ok, result}
+        :unknown -> read_sources_unchecked(source_keys, store, "AND")
+      end
+    end
+  end
+
+  defp execute_bitop_ast(op, source_keys, store) when op in [:bor, :bxor] do
     with {:ok, values} <- read_sources(source_keys, store) do
-      max_len = values |> Enum.map(&byte_size/1) |> Enum.max()
-      padded = Enum.map(values, &pad_binary(&1, max_len))
-
-      result =
-        case op do
-          :band -> bitop_combine(padded, &Bitwise.band/2)
-          :bor -> bitop_combine(padded, &Bitwise.bor/2)
-          :bxor -> bitop_combine(padded, &Bitwise.bxor/2)
-        end
-
-      {:ok, result}
+      combine_bitop_sources(op, values)
     end
   end
 
@@ -1159,15 +1157,72 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp read_sources(source_keys, store) do
     with :ok <- ensure_string_keys(source_keys, store) do
-      values =
-        store
-        |> Ops.batch_get(source_keys)
-        |> Enum.map(fn
-          nil -> <<>>
-          value -> value
-        end)
+      values_from_batch_get(source_keys, store)
+    end
+  end
 
-      {:ok, values}
+  defp read_sources_unchecked(source_keys, store, op) do
+    {:ok, values} = values_from_batch_get(source_keys, store)
+    combine_bitop_sources(op, values)
+  end
+
+  defp values_from_batch_get(source_keys, store) do
+    values =
+      store
+      |> Ops.batch_get(source_keys)
+      |> Enum.map(fn
+        nil -> <<>>
+        value -> value
+      end)
+
+    {:ok, values}
+  end
+
+  defp combine_bitop_sources(op, values) do
+    max_len = values |> Enum.map(&byte_size/1) |> Enum.max()
+    padded = Enum.map(values, &pad_binary(&1, max_len))
+
+    result =
+      case op do
+        "AND" -> bitop_combine(padded, &Bitwise.band/2)
+        "OR" -> bitop_combine(padded, &Bitwise.bor/2)
+        "XOR" -> bitop_combine(padded, &Bitwise.bxor/2)
+        :bor -> bitop_combine(padded, &Bitwise.bor/2)
+        :bxor -> bitop_combine(padded, &Bitwise.bxor/2)
+      end
+
+    {:ok, result}
+  end
+
+  defp and_zero_result_from_missing_source(source_keys, store) do
+    case bitop_source_sizes(source_keys, store) do
+      :unknown ->
+        :unknown
+
+      sizes ->
+        if Enum.any?(sizes, &is_nil/1) do
+          max_size =
+            sizes
+            |> Enum.reject(&is_nil/1)
+            |> Enum.max(fn -> 0 end)
+
+          {:ok, :binary.copy(<<0>>, max_size)}
+        else
+          :unknown
+        end
+    end
+  end
+
+  defp bitop_source_sizes(source_keys, store) do
+    Enum.reduce_while(source_keys, [], fn key, acc ->
+      case metadata_value_size(store, key) do
+        :unknown -> {:halt, :unknown}
+        size when is_integer(size) or is_nil(size) -> {:cont, [size | acc]}
+      end
+    end)
+    |> case do
+      :unknown -> :unknown
+      sizes -> Enum.reverse(sizes)
     end
   end
 
