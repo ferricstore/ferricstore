@@ -655,10 +655,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
     store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
     prefetched_reads = prefetch_pure_tcp_reads(commands, state)
 
-    {action, responses} =
+    {action, responses, final_state} =
       commands
       |> Enum.with_index()
-      |> Enum.reduce_while({:continue, []}, fn {cmd, idx}, {:continue, acc} ->
+      |> Enum.reduce_while({:continue, [], state}, fn {cmd, idx}, {:continue, acc, acc_state} ->
         {name, args, ast, keys} = command_parts(cmd)
         Stats.incr_commands(state.stats_counter)
 
@@ -670,11 +670,6 @@ defmodule FerricstoreServer.Connection.Pipeline do
                   try do
                     result =
                       dispatch_pure_command(idx, name, args, ast, store, state, prefetched_reads)
-
-                    unless streaming_response?(result) do
-                      ConnTracking.maybe_notify_keyspace(name, args, result)
-                      ConnTracking.maybe_notify_tracking(name, args, result, state)
-                    end
 
                     result
                   catch
@@ -698,7 +693,9 @@ defmodule FerricstoreServer.Connection.Pipeline do
               err
           end
 
-        {:cont, {:continue, [response_entry(result) | acc]}}
+        new_state = track_pure_result(name, args, result, acc_state)
+
+        {:cont, {:continue, [response_entry(result) | acc], new_state}}
       end)
 
     responses = Enum.reverse(responses)
@@ -715,7 +712,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
           Enum.map(responses, fn {:encoded, encoded} -> encoded end)
         )
 
-        {action, state}
+        {action, final_state}
       end
 
     if state.transport == :ranch_tcp, do: TcpOpts.set_cork(state.socket, false)
@@ -910,6 +907,23 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp streaming_response?({:array, _keys, _elements}), do: true
   defp streaming_response?(_result), do: false
+
+  defp track_pure_result(name, args, result, state) when is_tuple(result) do
+    if streaming_response?(result) do
+      state
+    else
+      track_non_streaming_pure_result(name, args, result, state)
+    end
+  end
+
+  defp track_pure_result(name, args, result, state),
+    do: track_non_streaming_pure_result(name, args, result, state)
+
+  defp track_non_streaming_pure_result(name, args, result, state) do
+    ConnTracking.maybe_notify_keyspace(name, args, result)
+    ConnTracking.maybe_notify_tracking(name, args, result, state)
+    ConnTracking.maybe_track_read(name, args, result, state)
+  end
 
   defp stream_response_entries(entries, state, send_response_fn) do
     Enum.reduce_while(entries, {:continue, state}, fn

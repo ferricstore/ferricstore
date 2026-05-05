@@ -170,6 +170,29 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     assert :ets.lookup(:ferricstore_tracking, set_key) == []
   end
 
+  test "general pure pipeline records client tracking reads" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "#{@ns}:tracked_general_get:#{System.unique_integer([:positive])}"
+
+    :ok = Router.put(ctx, key, "v1", 0)
+
+    state = enabled_tracking_state(ctx)
+    send_response_fn = capture_response_fn()
+    handle_command_fn = flunking_handle_fn("tracked general pure pipeline")
+
+    commands = [
+      get_ast(key),
+      {:command, "PING", [], :ping, []}
+    ]
+
+    assert {:continue, new_state} =
+             Pipeline.pipeline_dispatch(commands, state, handle_command_fn, send_response_fn)
+
+    assert_receive {:pipeline_response, "$2\r\nv1\r\n+PONG\r\n"}
+    assert new_state.tracking.enabled
+    assert :ets.lookup(:ferricstore_tracking, key) == [{key, self()}]
+  end
+
   test "general pure pipeline converts command raises into Redis error replies" do
     ctx = FerricStore.Instance.get(:default)
     raw_store_key = {:ferricstore_raw_store, ctx.name}
