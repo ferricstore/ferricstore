@@ -237,6 +237,78 @@ defmodule FerricstoreServer.Integration.TlsTest do
       :ssl.close(sock)
     end
 
+    test "large cold GETRANGE streams bounded file chunks over TLS", %{tls_port: port} do
+      attach_file_stream_handler(self())
+
+      sock = connect_tls_and_hello(port)
+      k = ukey("large_getrange_stream")
+      prefix = :binary.copy("A", 128)
+      slice = :binary.copy("R", Sendfile.threshold_bytes() + 131_072)
+      value = IO.iodata_to_binary([prefix, slice, :binary.copy("Z", 128)])
+
+      send_cmd(sock, ["SET", k, value])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :ssl.close(sock)
+      sock = connect_tls_and_hello(port)
+
+      first = byte_size(prefix)
+      last = first + byte_size(slice) - 1
+
+      send_cmd(sock, ["GETRANGE", k, Integer.to_string(first), Integer.to_string(last)])
+      assert recv_response(sock) == slice
+
+      size = byte_size(slice)
+
+      assert_receive {:file_stream_event, [:ferricstore, :server, :file_stream],
+                      %{bytes: ^size, chunks: chunks}, %{result: :ok, transport: :ranch_ssl}},
+                     1000
+
+      assert chunks > 1
+
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock) == {:simple, "PONG"}
+
+      :ssl.close(sock)
+    end
+
+    test "large cold MGET streams bounded file chunks over TLS", %{tls_port: port} do
+      attach_file_stream_handler(self())
+
+      sock = connect_tls_and_hello(port)
+      key1 = ukey("large_mget_stream_a")
+      key2 = ukey("large_mget_stream_b")
+      value1 = :binary.copy("A", Sendfile.threshold_bytes() + 65_536)
+      value2 = :binary.copy("B", Sendfile.threshold_bytes() + 131_072)
+
+      send_cmd(sock, ["SET", key1, value1])
+      assert recv_response(sock) == {:simple, "OK"}
+      send_cmd(sock, ["SET", key2, value2])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :ssl.close(sock)
+      sock = connect_tls_and_hello(port)
+
+      send_cmd(sock, ["MGET", key1, ukey("missing"), key2])
+      assert recv_response(sock) == [value1, nil, value2]
+
+      size1 = byte_size(value1)
+      size2 = byte_size(value2)
+
+      assert_receive {:file_stream_event, [:ferricstore, :server, :file_stream],
+                      %{bytes: ^size1, chunks: chunks1}, %{result: :ok, transport: :ranch_ssl}},
+                     1000
+
+      assert_receive {:file_stream_event, [:ferricstore, :server, :file_stream],
+                      %{bytes: ^size2, chunks: chunks2}, %{result: :ok, transport: :ranch_ssl}},
+                     1000
+
+      assert chunks1 > 1
+      assert chunks2 > 1
+
+      :ssl.close(sock)
+    end
+
     test "DEL removes a key", %{tls_port: port} do
       sock = connect_tls_and_hello(port)
       k = ukey("del")
@@ -324,6 +396,85 @@ defmodule FerricstoreServer.Integration.TlsTest do
                      1000
 
       assert chunks > 1
+
+      :ssl.close(sock)
+    end
+
+    test "large cold GETRANGE in a TLS pipeline streams bounded chunks", %{tls_port: port} do
+      attach_file_stream_handler(self())
+
+      sock = connect_tls_and_hello(port)
+      k = ukey("pipe_large_getrange_stream")
+      prefix = :binary.copy("A", 128)
+      slice = :binary.copy("G", Sendfile.threshold_bytes() + 131_072)
+      value = IO.iodata_to_binary([prefix, slice, :binary.copy("Z", 128)])
+
+      send_cmd(sock, ["SET", k, value])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :ssl.close(sock)
+      sock = connect_tls_and_hello(port)
+
+      first = byte_size(prefix)
+      last = first + byte_size(slice) - 1
+
+      send_pipeline(sock, [
+        ["GETRANGE", k, Integer.to_string(first), Integer.to_string(last)],
+        ["PING"]
+      ])
+
+      assert recv_response(sock) == slice
+      assert recv_response(sock) == {:simple, "PONG"}
+
+      size = byte_size(slice)
+
+      assert_receive {:file_stream_event, [:ferricstore, :server, :file_stream],
+                      %{bytes: ^size, chunks: chunks}, %{result: :ok, transport: :ranch_ssl}},
+                     1000
+
+      assert chunks > 1
+
+      :ssl.close(sock)
+    end
+
+    test "large cold MGET in a TLS pipeline streams bounded chunks", %{tls_port: port} do
+      attach_file_stream_handler(self())
+
+      sock = connect_tls_and_hello(port)
+      key1 = ukey("pipe_large_mget_stream_a")
+      key2 = ukey("pipe_large_mget_stream_b")
+      value1 = :binary.copy("M", Sendfile.threshold_bytes() + 65_536)
+      value2 = :binary.copy("N", Sendfile.threshold_bytes() + 131_072)
+
+      send_cmd(sock, ["SET", key1, value1])
+      assert recv_response(sock) == {:simple, "OK"}
+      send_cmd(sock, ["SET", key2, value2])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :ssl.close(sock)
+      sock = connect_tls_and_hello(port)
+
+      send_pipeline(sock, [
+        ["MGET", key1, ukey("missing"), key2],
+        ["PING"]
+      ])
+
+      assert recv_response(sock) == [value1, nil, value2]
+      assert recv_response(sock) == {:simple, "PONG"}
+
+      size1 = byte_size(value1)
+      size2 = byte_size(value2)
+
+      assert_receive {:file_stream_event, [:ferricstore, :server, :file_stream],
+                      %{bytes: ^size1, chunks: chunks1}, %{result: :ok, transport: :ranch_ssl}},
+                     1000
+
+      assert_receive {:file_stream_event, [:ferricstore, :server, :file_stream],
+                      %{bytes: ^size2, chunks: chunks2}, %{result: :ok, transport: :ranch_ssl}},
+                     1000
+
+      assert chunks1 > 1
+      assert chunks2 > 1
 
       :ssl.close(sock)
     end

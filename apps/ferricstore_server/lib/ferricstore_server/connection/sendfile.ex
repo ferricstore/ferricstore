@@ -43,11 +43,12 @@ defmodule FerricstoreServer.Connection.Sendfile do
   end
 
   @doc """
-  Handles MGET over plain TCP without materializing large cold bulk elements.
+  Handles MGET without materializing large cold bulk elements.
 
-  RESP arrays still need an array header, so this streams the header first, then
-  sends normal encoded elements for nil/hot/small values and sendfile-backed
-  bulk elements for large cold refs.
+  RESP arrays still need an array header, so this streams the header first,
+  then sends normal encoded elements for nil/hot/small values and file-backed
+  bulk elements for large cold refs. Plain TCP uses sendfile for those file
+  refs; encrypted transports stream bounded chunks.
   """
   def dispatch_mget(keys, state, dispatch_normal_fn) when is_list(keys) and keys != [] do
     if in_pubsub_mode?(state) do
@@ -60,9 +61,9 @@ defmodule FerricstoreServer.Connection.Sendfile do
   def dispatch_mget(keys, state, dispatch_normal_fn), do: dispatch_normal_fn.("MGET", keys, state)
 
   @doc """
-  Handles GETRANGE over plain TCP without materializing the full cold value.
+  Handles GETRANGE without materializing the full cold value.
 
-  Large cold slices are streamed with sendfile. Smaller cold slices are read
+  Large cold slices are streamed from file refs. Smaller cold slices are read
   with a bounded pread of only the requested bytes.
   """
   def dispatch_getrange(args, key, start_idx, end_idx, state, dispatch_normal_fn)
@@ -167,7 +168,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
       {:file_range, ^args, ^key, ^start_idx, ^end_idx, path, offset, count} ->
         handle_getrange_send_result(
-          send_file_range(args, path, offset, count, state),
+          send_file_range_response(args, path, offset, count, state),
           state,
           dispatch_normal_fn
         )
@@ -246,6 +247,26 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
       other ->
         other
+    end
+  end
+
+  @doc false
+  def send_file_range_response(args, path, offset, size, %{transport: :ranch_tcp} = state),
+    do: send_file_range(args, path, offset, size, state)
+
+  def send_file_range_response(args, path, offset, size, state) do
+    result = do_stream_file_get(path, offset, size, state)
+    emit_file_stream_result(result, size, state)
+
+    case result do
+      {:sent, new_state, _chunks} ->
+        {:sent, ConnTracking.maybe_track_read("GETRANGE", args, :file_stream_ok, new_state)}
+
+      :fallback ->
+        :fallback
+
+      {:error_after_header, reason, _chunks} ->
+        {:error_after_header, reason}
     end
   end
 
@@ -347,7 +368,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
   defp handle_mget_sendfile_result(:fallback, keys, state, dispatch_normal_fn),
     do: dispatch_normal_fn.("MGET", keys, state)
 
-  defp send_mget_array(keys, lookup_keys, results, state) do
+  defp send_mget_array(keys, lookup_keys, results, %{transport: :ranch_tcp} = state) do
     socket = state.socket
     TcpOpts.set_cork(socket, true)
 
@@ -364,20 +385,37 @@ defmodule FerricstoreServer.Connection.Sendfile do
     end
   end
 
+  defp send_mget_array(keys, lookup_keys, results, state) do
+    case ConnSend.send(
+           state.socket,
+           state.transport,
+           ["*", Integer.to_string(length(keys)), "\r\n"],
+           :mget_stream_header,
+           %{client_id: state.client_id}
+         ) do
+      :ok ->
+        stream_mget_elements(keys, lookup_keys, results, state)
+
+      {:error, _reason} ->
+        :fallback
+    end
+  end
+
   defp stream_mget_elements(keys, lookup_keys, results, state) do
     keys
     |> Enum.zip(lookup_keys)
     |> Enum.zip(results)
     |> Enum.reduce_while({:sent, state}, fn
       {{key, lookup_key}, {:file_ref, path, offset, size}}, {:sent, acc_state} ->
-        case send_file_ref_element(key, path, offset, size, acc_state) do
+        case send_file_ref_element_response(key, path, offset, size, acc_state) do
           {:sent, new_state} ->
             {:cont, {:sent, new_state}}
 
           :fallback ->
-            case :gen_tcp.send(
-                   acc_state.socket,
-                   Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
+            case send_stream_response(
+                   acc_state,
+                   Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key)),
+                   :mget_stream_fallback
                  ) do
               :ok -> {:cont, {:sent, acc_state}}
               {:error, reason} -> {:halt, {:error_after_header, reason}}
@@ -388,7 +426,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
         end
 
       {{_key, _lookup_key}, value}, {:sent, acc_state} ->
-        case :gen_tcp.send(acc_state.socket, Encoder.encode(value)) do
+        case send_stream_response(acc_state, Encoder.encode(value), :mget_stream_element) do
           :ok -> {:cont, {:sent, acc_state}}
           {:error, reason} -> {:halt, {:error_after_header, reason}}
         end
@@ -401,6 +439,12 @@ defmodule FerricstoreServer.Connection.Sendfile do
         other
     end
   end
+
+  defp send_stream_response(%{transport: :ranch_tcp, socket: socket}, iodata, _phase),
+    do: :gen_tcp.send(socket, iodata)
+
+  defp send_stream_response(state, iodata, phase),
+    do: ConnSend.send(state.socket, state.transport, iodata, phase, %{client_id: state.client_id})
 
   defp handle_sendfile_result({:sent, new_state}, _key, _state, _fn),
     do: {:continue, "", new_state}
@@ -443,6 +487,21 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   def send_file_ref_response(key, path, offset, size, state),
     do: stream_file_ref(key, path, offset, size, state)
+
+  @doc false
+  def send_file_ref_element_response(key, path, offset, size, %{transport: :ranch_tcp} = state),
+    do: send_file_ref_element(key, path, offset, size, state)
+
+  def send_file_ref_element_response(_key, path, offset, size, state) do
+    result = do_stream_file_get(path, offset, size, state)
+    emit_file_stream_result(result, size, state)
+
+    case result do
+      {:sent, new_state, _chunks} -> {:sent, new_state}
+      :fallback -> :fallback
+      {:error_after_header, reason, _chunks} -> {:error_after_header, reason}
+    end
+  end
 
   defp do_stream_file_get(path, offset, size, state) do
     case :file.open(path, [:read, :raw, :binary]) do

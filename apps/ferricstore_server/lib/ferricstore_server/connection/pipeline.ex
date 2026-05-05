@@ -795,28 +795,44 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp prefetch_pure_tcp_reads(commands, %{transport: transport} = state)
        when transport in [:ranch_tcp, :ranch_ssl] do
-    tcp? = transport == :ranch_tcp
-
-    {gets, mgets, getranges} =
+    {gets, mgets, getranges, _written_keys} =
       commands
       |> Enum.with_index()
-      |> Enum.reduce({[], [], []}, fn {cmd, idx}, {get_acc, mget_acc, getrange_acc} ->
+      |> Enum.reduce({[], [], [], MapSet.new()}, fn {cmd, idx},
+                                                    {get_acc, mget_acc, getrange_acc,
+                                                     written_keys} ->
         case command_parts(cmd) do
           {"GET", [key], {:get, key}, [key]} when is_binary(key) ->
-            {[{idx, key, namespace_key(state.sandbox_namespace, key)} | get_acc], mget_acc,
-             getrange_acc}
+            if MapSet.member?(written_keys, key) do
+              {get_acc, mget_acc, getrange_acc, written_keys}
+            else
+              {[{idx, key, namespace_key(state.sandbox_namespace, key)} | get_acc], mget_acc,
+               getrange_acc, written_keys}
+            end
 
-          {"MGET", keys, {:mget, keys}, keys} when tcp? and is_list(keys) and keys != [] ->
-            lookup_keys = namespace_keys(state.sandbox_namespace, keys)
-            {get_acc, [{idx, keys, lookup_keys} | mget_acc], getrange_acc}
+          {"MGET", keys, {:mget, keys}, keys} when is_list(keys) and keys != [] ->
+            if any_written_key?(keys, written_keys) do
+              {get_acc, mget_acc, getrange_acc, written_keys}
+            else
+              lookup_keys = namespace_keys(state.sandbox_namespace, keys)
+              {get_acc, [{idx, keys, lookup_keys} | mget_acc], getrange_acc, written_keys}
+            end
 
           {"GETRANGE", [key, _start_arg, _end_arg] = args, {:getrange, key, start_idx, end_idx},
            [key]}
-          when tcp? and is_binary(key) and is_integer(start_idx) and is_integer(end_idx) ->
-            {get_acc, mget_acc, [{idx, args, key, start_idx, end_idx} | getrange_acc]}
+          when is_binary(key) and is_integer(start_idx) and is_integer(end_idx) ->
+            if MapSet.member?(written_keys, key) do
+              {get_acc, mget_acc, getrange_acc, written_keys}
+            else
+              {get_acc, mget_acc, [{idx, args, key, start_idx, end_idx} | getrange_acc],
+               written_keys}
+            end
+
+          {_name, _args, _ast, keys} when is_list(keys) and keys != [] ->
+            {get_acc, mget_acc, getrange_acc, mark_written_keys(written_keys, keys)}
 
           _ ->
-            {get_acc, mget_acc, getrange_acc}
+            {get_acc, mget_acc, getrange_acc, written_keys}
         end
       end)
 
@@ -828,6 +844,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp prefetch_pure_tcp_reads(_commands, _state), do: %{}
+
+  defp any_written_key?(keys, written_keys) do
+    Enum.any?(keys, &MapSet.member?(written_keys, &1))
+  end
+
+  defp mark_written_keys(written_keys, keys) do
+    Enum.reduce(keys, written_keys, fn key, acc -> MapSet.put(acc, key) end)
+  end
 
   defp prefetch_tcp_get_ops(gets, state) do
     case gets do
@@ -964,7 +988,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
         end
 
       {:file_range, args, key, start_idx, end_idx, path, offset, size}, {:continue, acc_state} ->
-        case ConnSendfile.send_file_range(args, path, offset, size, acc_state) do
+        case ConnSendfile.send_file_range_response(args, path, offset, size, acc_state) do
           {:sent, new_state} ->
             {:cont, {:continue, new_state}}
 
@@ -1017,7 +1041,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
     elements
     |> Enum.reduce_while({:sent, state}, fn
       {:file_ref, key, lookup_key, path, offset, size}, {:sent, acc_state} ->
-        case ConnSendfile.send_file_ref_element(key, path, offset, size, acc_state) do
+        case ConnSendfile.send_file_ref_element_response(key, path, offset, size, acc_state) do
           {:sent, new_state} ->
             {:cont, {:sent, new_state}}
 
