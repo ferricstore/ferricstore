@@ -27,7 +27,7 @@ defmodule Ferricstore.Store.ListOps do
   end
 
   @spec execute_lmove(binary(), binary(), map(), :left | :right, :left | :right) ::
-          binary() | nil | {:error, binary()}
+          binary() | nil | {:error, term()}
   def execute_lmove(src_key, dst_key, store, from_dir, to_dir) when is_map(store) do
     src_meta = read_meta(src_key, store)
 
@@ -50,53 +50,47 @@ defmodule Ferricstore.Store.ListOps do
               :right -> List.last(sorted)
             end
 
-          Ops.compound_delete(store, src_key, CompoundKey.list_element(src_key, pos))
           remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
 
-          if remaining == [] do
-            delete_meta(src_key, store)
-          else
-            update_meta_from_remaining(src_key, store, length(remaining), remaining)
+          with :ok <- delete_elements(src_key, store, [{pos, element}]),
+               :ok <- update_or_delete_meta(src_key, store, length(remaining), remaining),
+               :ok <-
+                 push_moved_element(dst_key, store, element, read_meta(dst_key, store), to_dir) do
+            element
           end
-
-          dst_meta = read_meta(dst_key, store)
-
-          case dst_meta do
-            nil ->
-              new_pos = @initial_position
-
-              Ops.compound_put(
-                store,
-                dst_key,
-                CompoundKey.list_element(dst_key, new_pos),
-                element,
-                0
-              )
-
-              write_meta(dst_key, store, {1, new_pos - @position_step, new_pos + @position_step})
-
-            {dst_len, dst_left, dst_right} ->
-              new_pos =
-                case to_dir do
-                  :left -> dst_left
-                  :right -> dst_right
-                end
-
-              Ops.compound_put(
-                store,
-                dst_key,
-                CompoundKey.list_element(dst_key, new_pos),
-                element,
-                0
-              )
-
-              new_left = if to_dir == :left, do: new_pos - @position_step, else: dst_left
-              new_right = if to_dir == :right, do: new_pos + @position_step, else: dst_right
-              write_meta(dst_key, store, {dst_len + 1, new_left, new_right})
-          end
-
-          element
         end
+    end
+  end
+
+  defp push_moved_element(dst_key, store, element, nil, _to_dir) do
+    new_pos = @initial_position
+
+    with :ok <-
+           store
+           |> Ops.compound_put(dst_key, CompoundKey.list_element(dst_key, new_pos), element, 0)
+           |> write_result(),
+         :ok <-
+           write_meta(dst_key, store, {1, new_pos - @position_step, new_pos + @position_step}) do
+      :ok
+    end
+  end
+
+  defp push_moved_element(dst_key, store, element, {dst_len, dst_left, dst_right}, to_dir) do
+    new_pos =
+      case to_dir do
+        :left -> dst_left
+        :right -> dst_right
+      end
+
+    new_left = if to_dir == :left, do: new_pos - @position_step, else: dst_left
+    new_right = if to_dir == :right, do: new_pos + @position_step, else: dst_right
+
+    with :ok <-
+           store
+           |> Ops.compound_put(dst_key, CompoundKey.list_element(dst_key, new_pos), element, 0)
+           |> write_result(),
+         :ok <- write_meta(dst_key, store, {dst_len + 1, new_left, new_right}) do
+      :ok
     end
   end
 

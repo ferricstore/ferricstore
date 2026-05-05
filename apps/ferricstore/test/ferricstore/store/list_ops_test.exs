@@ -89,6 +89,56 @@ defmodule Ferricstore.Store.ListOpsTest do
     refute_received {:compound_batch_delete, _}
   end
 
+  test "LMOVE returns error when source delete fails before touching destination" do
+    meta_key = CompoundKey.list_meta_key("src")
+    pos = 0
+    element_key = CompoundKey.list_element("src", pos)
+
+    store = %{
+      compound_get: fn
+        "src", ^meta_key -> :erlang.term_to_binary({1, -1_000_000_000, 1_000_000_000})
+        _redis_key, _compound_key -> nil
+      end,
+      compound_batch_delete: fn "src", [^element_key] -> {:error, "disk full"} end,
+      compound_delete: fn _redis_key, _compound_key -> {:error, "disk full"} end,
+      compound_put: fn redis_key, compound_key, _value, _expire_at_ms ->
+        flunk(
+          "LMOVE must not write #{inspect(redis_key)} #{inspect(compound_key)} after delete failure"
+        )
+      end,
+      compound_scan: fn "src", _prefix ->
+        [{CompoundKey.encode_position(pos), "a"}]
+      end
+    }
+
+    assert {:error, "disk full"} == ListOps.execute_lmove("src", "dst", store, :left, :right)
+  end
+
+  test "LMOVE returns error when destination element write fails" do
+    src_meta_key = CompoundKey.list_meta_key("src")
+
+    store = %{
+      compound_get: fn
+        "src", ^src_meta_key -> :erlang.term_to_binary({1, -1_000_000_000, 1_000_000_000})
+        _redis_key, _compound_key -> nil
+      end,
+      compound_batch_delete: fn "src", [_element_key] -> :ok end,
+      compound_delete: fn "src", ^src_meta_key -> :ok end,
+      compound_put: fn
+        "dst", <<"L:dst", _rest::binary>>, "a", 0 ->
+          {:error, "disk full"}
+
+        "dst", <<"LM:dst">>, _meta, 0 ->
+          flunk("LMOVE must not write destination metadata after element write failure")
+      end,
+      compound_scan: fn "src", _prefix ->
+        [{CompoundKey.encode_position(0), "a"}]
+      end
+    }
+
+    assert {:error, "disk full"} == ListOps.execute_lmove("src", "dst", store, :left, :right)
+  end
+
   test "read-only commands treat corrupt persisted metadata as missing list" do
     store = corrupt_meta_store(<<131, 100, 0, 12, "made_up_atom">>)
 
