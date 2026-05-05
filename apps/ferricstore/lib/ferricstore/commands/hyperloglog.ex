@@ -86,8 +86,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
       :ok ->
         case hll_size_state(key, store) do
           :missing ->
-            Ops.put(store, key, HLL.new(), 0)
-            1
+            write_sketch(store, key, HLL.new(), 1)
 
           :valid_size ->
             0
@@ -116,8 +115,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
           end)
 
         if modified? do
-          Ops.put(store, key, updated, 0)
-          1
+          write_sketch(store, key, updated, 1)
         else
           0
         end
@@ -134,8 +132,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
   defp pfadd_no_elements_from_value(key, store) do
     case Ops.get(store, key) do
       nil ->
-        Ops.put(store, key, HLL.new(), 0)
-        1
+        write_sketch(store, key, HLL.new(), 1)
 
       sketch ->
         case validate_sketch(sketch) do
@@ -168,8 +165,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
     case read_sketches([destkey | source_keys], store) do
       {:ok, sketches} ->
         merged = Enum.reduce(sketches, &HLL.merge/2)
-        Ops.put(store, destkey, merged, 0)
-        :ok
+        write_sketch(store, destkey, merged, :ok)
 
       {:error, _} = err ->
         err
@@ -178,6 +174,13 @@ defmodule Ferricstore.Commands.HyperLogLog do
 
   defp pfmerge_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'pfmerge' command"}
+  end
+
+  defp write_sketch(store, key, sketch, success_result) do
+    case Ops.put(store, key, sketch, 0) do
+      :ok -> success_result
+      {:error, _} = error -> error
+    end
   end
 
   # Returns the existing sketch for `key`, or a new empty sketch if the key

@@ -23,6 +23,16 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
       assert HLL.valid_sketch?(sketch)
     end
 
+    test "PFADD returns sketch write errors" do
+      store = %{
+        get: fn "mykey" -> nil end,
+        put: fn "mykey", sketch, 0 when is_binary(sketch) -> {:error, :disk_full} end,
+        compound_get: fn _redis_key, _compound_key -> nil end
+      }
+
+      assert {:error, :disk_full} == HLLCmd.handle("PFADD", ["mykey", "hello"], store)
+    end
+
     test "PFADD treats a fully expired hash as a missing HLL key before TYPE cleanup" do
       store = MockStore.make()
       Hash.handle("HSET", ["mykey", "field", "value"], store)
@@ -266,6 +276,19 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
 
       count = HLL.count(dest_sketch)
       assert_in_delta count, 4, 3
+    end
+
+    test "PFMERGE returns destination write errors" do
+      sketch = HLL.new()
+
+      store = %{
+        batch_get: fn ["dest", "src"] -> [nil, sketch] end,
+        get: fn _key -> flunk("PFMERGE should use batch_get") end,
+        put: fn "dest", merged, 0 when is_binary(merged) -> {:error, :disk_full} end,
+        compound_get: fn _redis_key, _compound_key -> nil end
+      }
+
+      assert {:error, :disk_full} == HLLCmd.handle("PFMERGE", ["dest", "src"], store)
     end
 
     test "PFMERGE with non-existent source — treated as empty" do
