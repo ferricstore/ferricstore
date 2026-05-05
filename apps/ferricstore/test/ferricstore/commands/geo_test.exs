@@ -850,6 +850,53 @@ defmodule Ferricstore.Commands.GeoTest do
       assert count == 0
     end
 
+    test "returns destination cleanup errors before writing replacement results" do
+      base =
+        store_with_geo("src", [
+          {@palermo_lng, @palermo_lat, "Palermo"},
+          {@catania_lng, @catania_lat, "Catania"}
+        ])
+
+      store =
+        base
+        |> Map.put(:delete, fn "dst" -> {:error, :disk_full} end)
+        |> Map.put(:compound_batch_put, fn "dst", _entries ->
+          flunk("GEOSEARCHSTORE must not write replacement members after cleanup failure")
+        end)
+
+      assert {:error, :disk_full} ==
+               Geo.handle(
+                 "GEOSEARCHSTORE",
+                 [
+                   "dst",
+                   "src",
+                   "FROMLONLAT",
+                   "13.361389",
+                   "38.115556",
+                   "BYRADIUS",
+                   "200",
+                   "KM"
+                 ],
+                 store
+               )
+    end
+
+    test "returns destination cleanup errors when no matches" do
+      base =
+        store_with_geo("src", [
+          {@palermo_lng, @palermo_lat, "Palermo"}
+        ])
+
+      store = Map.put(base, :delete, fn "dst" -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} ==
+               Geo.handle(
+                 "GEOSEARCHSTORE",
+                 ["dst", "src", "FROMLONLAT", "0.0", "0.0", "BYRADIUS", "1", "KM"],
+                 store
+               )
+    end
+
     test "no arguments returns error" do
       assert {:error, _} = Geo.handle("GEOSEARCHSTORE", [], MockStore.make())
     end

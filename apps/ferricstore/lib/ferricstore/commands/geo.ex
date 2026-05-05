@@ -112,20 +112,7 @@ defmodule Ferricstore.Commands.Geo do
       sorted = sort_matches(matches, opts)
       limited = apply_count(sorted, opts)
 
-      if limited == [] do
-        delete_key_data(store, destination)
-        0
-      else
-        new_zset =
-          limited
-          |> Enum.map(fn {score, member, _dist} -> {score, member} end)
-          |> Enum.sort()
-
-        case replace_zset(store, destination, new_zset) do
-          :ok -> length(limited)
-          {:error, _} = err -> err
-        end
-      end
+      store_geosearch_results(store, destination, limited)
     end
   end
 
@@ -243,20 +230,7 @@ defmodule Ferricstore.Commands.Geo do
       sorted = sort_matches(matches, opts)
       limited = apply_count(sorted, opts)
 
-      if limited == [] do
-        delete_key_data(store, destination)
-        0
-      else
-        new_zset =
-          limited
-          |> Enum.map(fn {score, member, _dist} -> {score, member} end)
-          |> Enum.sort()
-
-        case replace_zset(store, destination, new_zset) do
-          :ok -> length(limited)
-          {:error, _} = err -> err
-        end
-      end
+      store_geosearch_results(store, destination, limited)
     end
   end
 
@@ -457,26 +431,48 @@ defmodule Ferricstore.Commands.Geo do
     end
   end
 
+  defp store_geosearch_results(store, destination, []) do
+    case delete_key_data(store, destination) do
+      :ok -> 0
+      {:error, _} = err -> err
+    end
+  end
+
+  defp store_geosearch_results(store, destination, limited) do
+    new_zset =
+      limited
+      |> Enum.map(fn {score, member, _dist} -> {score, member} end)
+      |> Enum.sort()
+
+    case replace_zset(store, destination, new_zset) do
+      :ok -> length(limited)
+      {:error, _} = err -> err
+    end
+  end
+
   defp replace_zset(store, key, zset) do
-    delete_key_data(store, key)
-    write_zset(store, key, zset)
+    with :ok <- delete_key_data(store, key) do
+      write_zset(store, key, zset)
+    end
   end
 
   defp delete_key_data(store, key) do
-    Ops.delete(store, key)
-    TypeRegistry.delete_type(key, store)
-    Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))
-
-    for prefix <- [
-          CompoundKey.hash_prefix(key),
-          CompoundKey.list_prefix(key),
-          CompoundKey.set_prefix(key),
-          CompoundKey.zset_prefix(key)
-        ] do
-      Ops.compound_delete_prefix(store, key, prefix)
+    with :ok <- Ops.delete(store, key),
+         :ok <- TypeRegistry.delete_type(key, store),
+         :ok <- Ops.compound_delete(store, key, CompoundKey.list_meta_key(key)) do
+      [
+        CompoundKey.hash_prefix(key),
+        CompoundKey.list_prefix(key),
+        CompoundKey.set_prefix(key),
+        CompoundKey.zset_prefix(key)
+      ]
+      |> Enum.reduce_while(:ok, fn prefix, :ok ->
+        case Ops.compound_delete_prefix(store, key, prefix) do
+          :ok -> {:cont, :ok}
+          {:error, _} = err -> {:halt, err}
+        end
+      end)
     end
-
-    :ok
   end
 
   defp ensure_zset_type(store, key) do
