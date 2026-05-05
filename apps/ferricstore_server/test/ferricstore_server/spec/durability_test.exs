@@ -6,8 +6,8 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
     * Section 4.1 -- Quorum mode (default): writes through the Raft batcher
       are durable across shard restarts and provide linearizable read-after-write.
-    * Section 4.2 -- Removed async durability: namespace durability config is
-      rejected and prefixed keys use the same quorum write path.
+    * Section 4.2 -- Namespace config: durability fields are rejected and
+      prefixed keys use the same quorum write path.
     * Section 4.3 -- Group commit window: writes within a window are batched,
       different namespaces have independent windows, and explicit flush drains
       all pending slots.
@@ -260,10 +260,10 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
   end
 
   # ==========================================================================
-  # Section 4.2: Removed Async Durability
+  # Section 4.2: Namespace Durability Field Rejection
   # ==========================================================================
 
-  describe "4.2 Removed Async Durability" do
+  describe "4.2 Namespace durability field rejection" do
     @tag :durability
     test "DA-001: namespace durability config is rejected" do
       assert {:error, msg} = NamespaceConfig.set("fast", "durability", "async")
@@ -445,100 +445,6 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       assert :ok == Batcher.flush(1)
       assert :ok == Batcher.flush(2)
       assert :ok == Batcher.flush(3)
-    end
-  end
-
-  # ==========================================================================
-  # Cross-cutting durability scenarios
-  # ==========================================================================
-
-  describe "cross-cutting durability" do
-    @tag skip: "async durability feature removed; restart comparison no longer applies"
-    @tag :durability
-    test "quorum write survives shard restart, async write may not without flush" do
-      NamespaceConfig.set("ephemeral", "durability", "async")
-
-      k_quorum = ukey("crosscut_quorum")
-      k_async = pkey("ephemeral", "crosscut_async")
-
-      # Write through quorum path
-      assert :ok == batcher_put(k_quorum, "quorum_survives")
-
-      # Write through async path
-      shard_async = Router.shard_for(FerricStore.Instance.get(:default), k_async)
-      assert :ok == Batcher.write(shard_async, {:put, k_async, "async_data", 0})
-
-      # Wait for async worker to process
-      ShardHelpers.eventually(
-        fn ->
-          Router.get(FerricStore.Instance.get(:default), k_async) == "async_data"
-        end,
-        "async write should be readable before crash",
-        20,
-        20
-      )
-
-      # Verify both are readable before the crash
-      assert "quorum_survives" == Router.get(FerricStore.Instance.get(:default), k_quorum)
-      assert "async_data" == Router.get(FerricStore.Instance.get(:default), k_async)
-
-      # Flush all shards to disk before killing (for fair comparison)
-      ShardHelpers.flush_all_shards()
-
-      # Kill the shard that owns the quorum key
-      pid = shard_pid_for(k_quorum)
-      ref = Process.monitor(pid)
-      Process.exit(pid, :kill)
-      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 2_000
-
-      # Wait for restart
-      ShardHelpers.wait_shards_alive()
-
-      # Quorum write should survive
-      ShardHelpers.eventually(
-        fn -> "quorum_survives" == Router.get(FerricStore.Instance.get(:default), k_quorum) end,
-        "quorum write should survive shard restart"
-      )
-    end
-
-    @tag skip:
-           "async durability feature removed; overlapping async/quorum writer case no longer applies"
-    @tag :durability
-    test "concurrent quorum and async writers on overlapping keys" do
-      NamespaceConfig.set("mixed", "durability", "async")
-
-      # Historical removed-mode scenario: different key prefixes used to route
-      # to different durability modes.
-      quorum_keys =
-        for i <- 1..20 do
-          k = ukey("overlap_q_#{i}")
-          batcher_put(k, "q_#{i}")
-          k
-        end
-
-      async_keys =
-        for i <- 1..20 do
-          k = pkey("mixed", "overlap_a_#{i}")
-          shard = Router.shard_for(FerricStore.Instance.get(:default), k)
-          Batcher.write(shard, {:put, k, "a_#{i}", 0})
-          k
-        end
-
-      # All keys should be readable (async keys need time to process)
-      for {k, i} <- Enum.with_index(quorum_keys, 1) do
-        assert "q_#{i}" == Router.get(FerricStore.Instance.get(:default), k)
-      end
-
-      for {k, i} <- Enum.with_index(async_keys, 1) do
-        ShardHelpers.eventually(
-          fn ->
-            "a_#{i}" == Router.get(FerricStore.Instance.get(:default), k)
-          end,
-          "async key #{k} should be readable",
-          20,
-          20
-        )
-      end
     end
   end
 

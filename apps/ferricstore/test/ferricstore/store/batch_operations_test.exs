@@ -1,10 +1,7 @@
 defmodule Ferricstore.Store.BatchOperationsTest do
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Raft.Batcher
-  alias Ferricstore.Store.{CompoundKey, DiskPressure, Ops, Router}
-  alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
+  alias Ferricstore.Store.{CompoundKey, Router}
 
   @ns_batch "batch_test_batch"
   @ns_quorum "batch_test_quorum"
@@ -29,20 +26,6 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   # ---------------------------------------------------------------------------
 
   describe "batch_put" do
-    @tag skip: "async durability origin replay path removed; batch_put submits through quorum"
-    test "submits origin-checked PUT commands for stale replay safety" do
-      source =
-        Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__)
-        |> File.read!()
-
-      assert source =~
-               "origin_checked_command(key, {:put, key, value, 0}, previous, value, 0)",
-             """
-             batch_put must not submit raw {:put, key, value, 0} origin commands.
-             A delayed origin replay of the raw PUT can overwrite later local RMW writes.
-             """
-    end
-
     test "all-small batch: values readable immediately" do
       kvs = for i <- 1..20, do: {"#{@ns_batch}:bap_small_#{i}", "val_#{i}"}
       :ok = Router.batch_put(default_ctx(), kvs)
@@ -145,213 +128,6 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
       assert Router.get(default_ctx(), key) == "second"
     end
-
-    @tag skip:
-           "async durability local rollback path removed; quorum failures are covered by Ra apply tests"
-    test "mixed batch rolls back same-shard small keys when large disk write fails" do
-      {small_key, large_key} = same_shard_keys(default_ctx(), "bap_disk_fail")
-      idx = Router.shard_for(default_ctx(), small_key)
-      original = Ferricstore.Store.ActiveFile.get(default_ctx(), idx)
-
-      missing_dir =
-        Path.join(
-          System.tmp_dir!(),
-          "ferricstore_missing_active_#{System.unique_integer([:positive])}"
-        )
-
-      missing_path = Path.join(missing_dir, "00000.log")
-      Ferricstore.Store.ActiveFile.publish(default_ctx(), idx, 99_999, missing_path, missing_dir)
-
-      try do
-        large = :binary.copy("X", 100 * 1024)
-
-        assert {:error, "ERR disk write failed" <> _} =
-                 Router.batch_put(default_ctx(), [{small_key, "small"}, {large_key, large}])
-
-        assert nil == Router.get(default_ctx(), small_key)
-        assert nil == Router.get(default_ctx(), large_key)
-      after
-        {file_id, file_path, shard_data_path} = original
-
-        Ferricstore.Store.ActiveFile.publish(
-          default_ctx(),
-          idx,
-          file_id,
-          file_path,
-          shard_data_path
-        )
-      end
-    end
-
-    @tag skip:
-           "async durability local rollback path removed; quorum failures are covered by Ra apply tests"
-    test "failed mixed batch restores overwritten same-shard keys" do
-      {small_key, large_key} = same_shard_keys(default_ctx(), "bap_disk_fail_existing")
-      idx = Router.shard_for(default_ctx(), small_key)
-      :ok = Router.put(default_ctx(), small_key, "before", 0)
-      original = Ferricstore.Store.ActiveFile.get(default_ctx(), idx)
-
-      missing_dir =
-        Path.join(
-          System.tmp_dir!(),
-          "ferricstore_missing_active_#{System.unique_integer([:positive])}"
-        )
-
-      missing_path = Path.join(missing_dir, "00000.log")
-      Ferricstore.Store.ActiveFile.publish(default_ctx(), idx, 99_998, missing_path, missing_dir)
-
-      try do
-        large = :binary.copy("Y", 100 * 1024)
-
-        assert {:error, "ERR disk write failed" <> _} =
-                 Router.batch_put(default_ctx(), [{small_key, "after"}, {large_key, large}])
-
-        assert "before" == Router.get(default_ctx(), small_key)
-        assert nil == Router.get(default_ctx(), large_key)
-      after
-        {file_id, file_path, shard_data_path} = original
-
-        Ferricstore.Store.ActiveFile.publish(
-          default_ctx(),
-          idx,
-          file_id,
-          file_path,
-          shard_data_path
-        )
-      end
-    end
-
-    @tag skip: "async durability cross-shard compensation path removed from the public write path"
-    test "cross-shard failure does not leave earlier shard writes visible" do
-      small_key = key_for_shard(default_ctx(), "bap_cross_fail_small", 0)
-      large_key = key_for_shard(default_ctx(), "bap_cross_fail_large", 1)
-      original = Ferricstore.Store.ActiveFile.get(default_ctx(), 1)
-
-      missing_dir =
-        Path.join(
-          System.tmp_dir!(),
-          "ferricstore_missing_active_#{System.unique_integer([:positive])}"
-        )
-
-      missing_path = Path.join(missing_dir, "00000.log")
-      Ferricstore.Store.ActiveFile.publish(default_ctx(), 1, 99_997, missing_path, missing_dir)
-
-      try do
-        large = :binary.copy("Q", 100 * 1024)
-
-        assert {:error, "ERR disk write failed" <> _} =
-                 Router.batch_put(default_ctx(), [{small_key, "small"}, {large_key, large}])
-
-        assert nil == Router.get(default_ctx(), small_key)
-        assert nil == Router.get(default_ctx(), large_key)
-      after
-        {file_id, file_path, shard_data_path} = original
-
-        Ferricstore.Store.ActiveFile.publish(
-          default_ctx(),
-          1,
-          file_id,
-          file_path,
-          shard_data_path
-        )
-      end
-    end
-
-    @tag skip:
-           "async durability overload path removed; default instance writes now submit through quorum"
-    test "cross-shard raft replication overload does not leave earlier shard writes visible" do
-      ok_key = key_for_shard(default_ctx(), "bap_cross_overload_ok", 0)
-      overloaded_key = key_for_shard(default_ctx(), "bap_cross_overload_blocked", 1)
-
-      on_exit(fn -> Batcher.reset_pending(1) end)
-      fill_async_pending(1, overloaded_key)
-
-      assert {:error, "ERR raft replication overloaded"} =
-               Router.batch_put(default_ctx(), [{ok_key, "ok"}, {overloaded_key, "blocked"}])
-
-      assert nil == Router.get(default_ctx(), ok_key)
-      assert nil == Router.get(default_ctx(), overloaded_key)
-    end
-
-    @tag skip:
-           "async durability direct pressure preflight removed; quorum write pressure is exercised elsewhere"
-    test "direct batch_put rejects pressured shards before publishing writes" do
-      ctx = default_ctx()
-      pressured_key = "#{@ns_batch}:bap_pressure_#{System.unique_integer([:positive])}"
-      ok_key = different_shard_key(ctx, pressured_key, "#{@ns_batch}:bap_pressure_ok")
-      idx = Router.shard_for(ctx, pressured_key)
-
-      Ferricstore.Store.DiskPressure.set(ctx, idx)
-
-      try do
-        assert {:error, "ERR disk pressure on shard " <> _} =
-                 Router.batch_put(ctx, [{pressured_key, "blocked"}, {ok_key, "allowed"}])
-
-        assert nil == Router.get(ctx, pressured_key)
-        assert nil == Router.get(ctx, ok_key)
-      after
-        Ferricstore.Store.DiskPressure.clear(ctx, idx)
-      end
-    end
-
-    @tag skip:
-           "async durability overload recovery path removed; default instance writes now submit through quorum"
-    test "large batch does not recover unaccepted value when raft replication is overloaded" do
-      key = "#{@ns_batch}:bap_overloaded_large_missing_#{System.unique_integer([:positive])}"
-      idx = Router.shard_for(default_ctx(), key)
-      large = :binary.copy("B", default_ctx().hot_cache_max_value_size + 1024)
-
-      on_exit(fn -> Batcher.reset_pending(idx) end)
-      fill_async_pending(idx, key)
-
-      assert {:error, "ERR raft replication overloaded"} =
-               Router.batch_put(default_ctx(), [{key, large}])
-
-      assert nil == Router.get(default_ctx(), key)
-      assert nil == recovered_value_from_bitcask(default_ctx(), key)
-    end
-
-    @tag skip:
-           "async durability overload rollback path removed; default instance writes now submit through quorum"
-    test "large batch restores previous cold value when raft replication is overloaded" do
-      key = "#{@ns_batch}:bap_overloaded_large_existing_#{System.unique_integer([:positive])}"
-      idx = Router.shard_for(default_ctx(), key)
-      old = :binary.copy("O", default_ctx().hot_cache_max_value_size + 1024)
-      new = :binary.copy("N", default_ctx().hot_cache_max_value_size + 2048)
-
-      :ok = Router.put(default_ctx(), key, old, 0)
-      assert old == Router.get(default_ctx(), key)
-
-      on_exit(fn -> Batcher.reset_pending(idx) end)
-      fill_async_pending(idx, key)
-
-      assert {:error, "ERR raft replication overloaded"} =
-               Router.batch_put(default_ctx(), [{key, new}])
-
-      assert old == Router.get(default_ctx(), key)
-      assert old == recovered_value_from_bitcask(default_ctx(), key)
-    end
-  end
-
-  describe "flush" do
-    @tag skip:
-           "async durability delete pressure path removed; quorum delete failures need a Ra apply injection hook"
-    test "surfaces delete failures instead of reporting success" do
-      ctx = default_ctx()
-      key = "#{@ns_batch}:flush_pressure_#{System.unique_integer([:positive])}"
-      idx = Router.shard_for(ctx, key)
-
-      :ok = Router.put(ctx, key, "value", 0)
-      DiskPressure.set(ctx, idx)
-
-      try do
-        assert {:error, "ERR disk pressure on shard " <> _} = Ops.flush(ctx)
-        assert "value" == Router.get(ctx, key)
-      after
-        DiskPressure.clear(ctx, idx)
-        Router.delete(ctx, key)
-      end
-    end
   end
 
   # ---------------------------------------------------------------------------
@@ -359,17 +135,6 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   # ---------------------------------------------------------------------------
 
   describe "FerricStore.batch_set" do
-    @tag skip: "async durability namespace removed; quorum batch_set coverage remains below"
-    test "all-async namespace returns list of :ok" do
-      kvs = for i <- 1..10, do: {"#{@ns_batch}:bs_#{i}", "v#{i}"}
-      results = FerricStore.batch_set(kvs)
-      assert results == List.duplicate(:ok, 10)
-
-      for {key, value} <- kvs do
-        assert {:ok, value} == FerricStore.get(key)
-      end
-    end
-
     test "all-quorum namespace returns list of :ok" do
       kvs = for i <- 1..10, do: {"#{@ns_quorum}:bs_#{i}", "v#{i}"}
       results = FerricStore.batch_set(kvs)
@@ -384,12 +149,11 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert [] = Router.batch_quorum_put(default_ctx(), [])
     end
 
-    @tag skip: "mixed async/quorum namespace routing removed; all namespaces are quorum"
-    test "mixed async/quorum namespaces preserves result order" do
+    test "mixed prefixes preserve result order on quorum path" do
       kvs = [
-        {"#{@ns_batch}:mix_1", "async_val"},
+        {"#{@ns_batch}:mix_1", "batch_val"},
         {"#{@ns_quorum}:mix_2", "quorum_val"},
-        {"#{@ns_batch}:mix_3", "async_val2"},
+        {"#{@ns_batch}:mix_3", "batch_val2"},
         {"#{@ns_quorum}:mix_4", "quorum_val2"}
       ]
 
@@ -397,113 +161,14 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert length(results) == 4
       assert Enum.all?(results, &(&1 == :ok))
 
-      assert {:ok, "async_val"} == FerricStore.get("#{@ns_batch}:mix_1")
+      assert {:ok, "batch_val"} == FerricStore.get("#{@ns_batch}:mix_1")
       assert {:ok, "quorum_val"} == FerricStore.get("#{@ns_quorum}:mix_2")
-      assert {:ok, "async_val2"} == FerricStore.get("#{@ns_batch}:mix_3")
+      assert {:ok, "batch_val2"} == FerricStore.get("#{@ns_batch}:mix_3")
       assert {:ok, "quorum_val2"} == FerricStore.get("#{@ns_quorum}:mix_4")
     end
 
     test "empty list returns empty list" do
       assert FerricStore.batch_set([]) == []
-    end
-
-    @tag skip:
-           "async durability disk-write error fan-out removed; quorum path failure injection needs a separate hook"
-    test "async disk failure is returned to every async batch_set key" do
-      default_ctx = FerricStore.Instance.get(:default)
-      {small_key, large_key} = same_shard_keys(default_ctx, "bs_disk_fail")
-      idx = Router.shard_for(default_ctx, small_key)
-      original = Ferricstore.Store.ActiveFile.get(default_ctx, idx)
-
-      missing_dir =
-        Path.join(
-          System.tmp_dir!(),
-          "ferricstore_missing_active_#{System.unique_integer([:positive])}"
-        )
-
-      missing_path = Path.join(missing_dir, "00000.log")
-      Ferricstore.Store.ActiveFile.publish(default_ctx, idx, 98_998, missing_path, missing_dir)
-
-      try do
-        large = :binary.copy("Z", 100 * 1024)
-
-        assert [
-                 {:error, "ERR disk write failed" <> _},
-                 {:error, "ERR disk write failed" <> _}
-               ] = FerricStore.batch_set([{small_key, "small"}, {large_key, large}])
-
-        assert {:ok, nil} == FerricStore.get(small_key)
-        assert {:ok, nil} == FerricStore.get(large_key)
-      after
-        {file_id, file_path, shard_data_path} = original
-
-        Ferricstore.Store.ActiveFile.publish(
-          default_ctx,
-          idx,
-          file_id,
-          file_path,
-          shard_data_path
-        )
-      end
-    end
-
-    @tag skip:
-           "async durability per-shard pressure partial success removed; quorum batch_set is all quorum"
-    test "async disk pressure rejects only pressured async batch_set keys" do
-      default_ctx = FerricStore.Instance.get(:default)
-      pressured_key = "#{@ns_batch}:bs_pressure_#{System.unique_integer([:positive])}"
-      ok_key = different_shard_key(default_ctx, pressured_key, "#{@ns_batch}:bs_pressure_ok")
-      idx = Router.shard_for(default_ctx, pressured_key)
-
-      Ferricstore.Store.DiskPressure.set(default_ctx, idx)
-
-      try do
-        assert [
-                 {:error, "ERR disk pressure on shard " <> _},
-                 :ok
-               ] = FerricStore.batch_set([{pressured_key, "blocked"}, {ok_key, "allowed"}])
-
-        assert {:ok, nil} == FerricStore.get(pressured_key)
-        assert {:ok, "allowed"} == FerricStore.get(ok_key)
-      after
-        Ferricstore.Store.DiskPressure.clear(default_ctx, idx)
-      end
-    end
-
-    @tag skip:
-           "async durability keydir pressure semantics removed; quorum batch_set validation is covered elsewhere"
-    test "async keydir pressure rejects new batch_set keys but allows updates" do
-      existing_key = "#{@ns_batch}:bs_keydir_existing_#{System.unique_integer([:positive])}"
-      new_key = "#{@ns_batch}:bs_keydir_new_#{System.unique_integer([:positive])}"
-
-      assert [:ok] = FerricStore.batch_set([{existing_key, "old"}])
-
-      Ferricstore.MemoryGuard.set_keydir_full(true)
-
-      try do
-        assert [
-                 :ok,
-                 {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}
-               ] = FerricStore.batch_set([{existing_key, "updated"}, {new_key, "blocked"}])
-
-        assert {:ok, "updated"} == FerricStore.get(existing_key)
-        assert {:ok, nil} == FerricStore.get(new_key)
-      after
-        Ferricstore.MemoryGuard.set_keydir_full(false)
-      end
-    end
-
-    @tag skip:
-           "async durability preflight validation path removed; quorum command validation is covered elsewhere"
-    test "async batch_set rejects overlarge keys before writing" do
-      default_ctx = FerricStore.Instance.get(:default)
-      key = "#{@ns_batch}:" <> String.duplicate("k", 65_536)
-      keydir = elem(default_ctx.keydir_refs, Router.shard_for(default_ctx, key))
-
-      assert [{:error, "ERR key too large (max 65535 bytes)"}] =
-               FerricStore.batch_set([{key, "too-large"}])
-
-      assert :ets.lookup(keydir, key) == []
     end
   end
 
@@ -648,20 +313,6 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   # ---------------------------------------------------------------------------
 
   describe "Router.get_keydir_file_ref" do
-    @tag skip: "pending async ETS locations removed from default durability path"
-    test "does not return pending async locations as disk file refs" do
-      key = "#{@ns_batch}:pending_file_ref"
-      idx = Router.shard_for(default_ctx(), key)
-      keydir = elem(default_ctx().keydir_refs, idx)
-
-      :ok = Router.batch_put(default_ctx(), [{key, "small"}])
-      assert [{^key, "small", 0, _lfu, :pending, 0, _vsize}] = :ets.lookup(keydir, key)
-
-      assert Router.get_keydir_file_ref(default_ctx(), key) == :miss
-      assert [{^key, "small", 0, _lfu, :pending, 0, _vsize}] = :ets.lookup(keydir, key)
-      assert Router.get(default_ctx(), key) == "small"
-    end
-
     test "removes expired keys from ETS and byte accounting" do
       key = "#{@ns_quorum}:file_ref_expired_cleanup:#{String.duplicate("k", 80)}"
       value = String.duplicate("v", 128)
@@ -742,76 +393,6 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
-
-  defp same_shard_keys(ctx, base) do
-    prefix = "#{@ns_batch}:#{base}:#{System.unique_integer([:positive])}"
-    keys = for i <- 1..200, do: "#{prefix}:#{i}"
-
-    Enum.find_value(keys, fn left ->
-      Enum.find_value(keys, fn
-        ^left ->
-          nil
-
-        right ->
-          if Router.shard_for(ctx, left) == Router.shard_for(ctx, right), do: {left, right}
-      end)
-    end)
-  end
-
-  defp different_shard_key(ctx, key, base) do
-    shard_idx = Router.shard_for(ctx, key)
-    prefix = "#{base}:#{System.unique_integer([:positive])}"
-
-    1..500
-    |> Stream.map(fn i -> "#{prefix}:#{i}" end)
-    |> Enum.find(fn candidate -> Router.shard_for(ctx, candidate) != shard_idx end)
-  end
-
-  defp key_for_shard(ctx, base, shard_idx) do
-    prefix = "#{@ns_batch}:#{base}:#{System.unique_integer([:positive])}"
-
-    1..500
-    |> Stream.map(fn i -> "#{prefix}:#{i}" end)
-    |> Enum.find(fn key -> Router.shard_for(ctx, key) == shard_idx end)
-  end
-
-  defp fill_async_pending(idx, key) do
-    for _ <- 1..64 do
-      Batcher.__inject_async_pending__(
-        idx,
-        make_ref(),
-        [{:async, node(), {:put, key, "pending", 0}}],
-        0
-      )
-    end
-  end
-
-  defp recovered_value_from_bitcask(ctx, key) do
-    idx = Router.shard_for(ctx, key)
-    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
-    keydir = :ets.new(:batch_operations_recovery, [:set, :public])
-
-    try do
-      ShardLifecycle.recover_keydir(shard_path, keydir, idx)
-
-      case :ets.lookup(keydir, key) do
-        [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil ->
-          value
-
-        [{^key, nil, _exp, _lfu, fid, off, _vsize}] when is_integer(fid) ->
-          path =
-            Path.join(shard_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
-
-          {:ok, value} = NIF.v2_pread_at(path, off)
-          value
-
-        [] ->
-          nil
-      end
-    after
-      :ets.delete(keydir)
-    end
-  end
 
   defp pack_keys(keys) do
     count = length(keys)

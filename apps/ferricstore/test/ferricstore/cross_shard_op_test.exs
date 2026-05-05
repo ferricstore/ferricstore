@@ -120,29 +120,6 @@ defmodule Ferricstore.CrossShardOpTest do
   end
 
   # ---------------------------------------------------------------------------
-  # 3. Cross-shard SMOVE in async mode -- returns CROSSSLOT error
-  # ---------------------------------------------------------------------------
-
-  describe "cross-shard SMOVE in async mode" do
-    @tag skip: "async durability feature removed; cross-shard operations now use quorum"
-    test "returns CROSSSLOT error with helpful message" do
-      [src, dst] = ShardHelpers.keys_on_different_shards(2)
-
-      # Configure the namespace to async durability
-      NamespaceConfig.set("_root", "durability", "async")
-
-      # Call SMOVE directly -- should return CROSSSLOT because async mode
-      result = Set.handle("SMOVE", [src, dst, "member"], %{})
-
-      assert {:error, msg} = result
-      assert msg =~ "CROSSSLOT"
-      assert msg =~ "hash tags"
-      assert msg =~ "quorum"
-      assert msg =~ "CONFIG SET"
-    end
-  end
-
-  # ---------------------------------------------------------------------------
   # 4. Cross-shard RENAME in quorum mode -- locks both, renames atomically
   # ---------------------------------------------------------------------------
 
@@ -354,34 +331,6 @@ defmodule Ferricstore.CrossShardOpTest do
       # The intent should be cleaned up (it's older than stale threshold)
       {:ok, {:applied_at, _, intents_after}, _} = :ra.process_command(shard_id, {:get_intents})
       refute Map.has_key?(intents_after, owner_ref)
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # 10. CROSSSLOT error message -- includes suggestion for quorum and hash tags
-  # ---------------------------------------------------------------------------
-
-  describe "CROSSSLOT error message" do
-    @tag skip: "async durability feature removed; async-specific CROSSSLOT hint no longer exists"
-    test "error message includes hash tag suggestion and quorum config hint" do
-      [src, dst] = ShardHelpers.keys_on_different_shards(2)
-
-      NamespaceConfig.set("_root", "durability", "async")
-
-      {:error, msg} =
-        CrossShardOp.execute(
-          [{src, :read_write}, {dst, :write}],
-          fn _store -> :unreachable end,
-          namespace: "_root",
-          intent: %{command: :smove, keys: %{source: src, dest: dst}}
-        )
-
-      assert msg =~
-               "CROSSSLOT Keys in request don't hash to the same slot"
-
-      assert msg =~ "{tag}"
-      assert msg =~ "CONFIG SET namespace"
-      assert msg =~ "durability quorum"
     end
   end
 

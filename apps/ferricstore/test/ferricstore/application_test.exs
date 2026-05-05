@@ -77,7 +77,7 @@ defmodule Ferricstore.ApplicationTest do
       ids = Enum.map(children, fn {id, _pid, _type, _mods} -> id end)
 
       refute Enum.any?(ids, &(to_string(&1) =~ "rmw_coordinator")),
-             "RmwCoordinator belonged to removed async durability fallback and should not be supervised"
+             "RmwCoordinator belonged to the removed local-write fallback and should not be supervised"
     end
   end
 

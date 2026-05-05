@@ -22,8 +22,8 @@ defmodule Ferricstore.Store.RmwCommandsTest do
     - GEOADD (geo index)
 
   Some tests use a distinct key prefix to prove the same serialized quorum
-  path works for prefixed keys. The removed namespace async durability mode is
-  not part of this coverage.
+  path works for prefixed keys. The removed namespace durability switch is not
+  part of this coverage.
   """
   use ExUnit.Case, async: false
 

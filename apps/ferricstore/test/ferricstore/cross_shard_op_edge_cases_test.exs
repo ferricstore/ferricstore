@@ -44,7 +44,9 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       # Lock with 200ms TTL
       owner_ref = make_ref()
       expire_at = System.os_time(:millisecond) + 200
-      {:ok, {:applied_at, _, :ok}, _} = :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
+
+      {:ok, {:applied_at, _, :ok}, _} =
+        :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
 
       # Wait for expiry
       Process.sleep(300)
@@ -52,7 +54,10 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       # Another lock should succeed (old one expired)
       other_ref = make_ref()
       new_expire = System.os_time(:millisecond) + 5000
-      {:ok, {:applied_at, _, result}, _} = :ra.process_command(shard_id, {:lock_keys, [k1], other_ref, new_expire})
+
+      {:ok, {:applied_at, _, result}, _} =
+        :ra.process_command(shard_id, {:lock_keys, [k1], other_ref, new_expire})
+
       assert result == :ok
 
       # Cleanup
@@ -67,7 +72,9 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       # Lock with 200ms TTL
       owner_ref = make_ref()
       expire_at = System.os_time(:millisecond) + 200
-      {:ok, {:applied_at, _, :ok}, _} = :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
+
+      {:ok, {:applied_at, _, :ok}, _} =
+        :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
 
       # Wait for expiry
       Process.sleep(300)
@@ -87,7 +94,12 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       {src, dst} = cross_shard_keys()
 
       # Create source set
-      shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
+      shard =
+        Router.shard_name(
+          FerricStore.Instance.get(:default),
+          Router.shard_for(FerricStore.Instance.get(:default), src)
+        )
+
       GenServer.call(shard, {:tx_execute, [{"SADD", [src, "a", "b"]}], nil}, 10_000)
 
       # Two sequential SMOVE (concurrent is hard to guarantee without races)
@@ -102,7 +114,12 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       [src_members] = GenServer.call(shard, {:tx_execute, [{"SMEMBERS", [src]}], nil}, 10_000)
       assert src_members == [] or src_members == nil
 
-      dst_shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), dst))
+      dst_shard =
+        Router.shard_name(
+          FerricStore.Instance.get(:default),
+          Router.shard_for(FerricStore.Instance.get(:default), dst)
+        )
+
       [dst_members] = GenServer.call(dst_shard, {:tx_execute, [{"SMEMBERS", [dst]}], nil}, 10_000)
       assert "a" in dst_members
       assert "b" in dst_members
@@ -118,12 +135,16 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       shard_id = Cluster.shard_server_id(0)
       owner_ref = make_ref()
 
-      :ra.process_command(shard_id, {:cross_shard_intent, owner_ref, %{
-        command: :smove,
-        keys: %{source: "a", dest: "b"},
-        status: :executing,
-        created_at: System.os_time(:millisecond)
-      }})
+      :ra.process_command(
+        shard_id,
+        {:cross_shard_intent, owner_ref,
+         %{
+           command: :smove,
+           keys: %{source: "a", dest: "b"},
+           status: :executing,
+           created_at: System.os_time(:millisecond)
+         }}
+      )
 
       Ferricstore.CrossShardOp.IntentResolver.resolve_shard_intents(0)
 
@@ -138,66 +159,21 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       shard_id = Cluster.shard_server_id(0)
       owner_ref = make_ref()
 
-      :ra.process_command(shard_id, {:cross_shard_intent, owner_ref, %{
-        command: :smove,
-        keys: %{source: "a", dest: "b"},
-        status: :executing,
-        created_at: System.os_time(:millisecond) - 20_000
-      }})
+      :ra.process_command(
+        shard_id,
+        {:cross_shard_intent, owner_ref,
+         %{
+           command: :smove,
+           keys: %{source: "a", dest: "b"},
+           status: :executing,
+           created_at: System.os_time(:millisecond) - 20_000
+         }}
+      )
 
       Ferricstore.CrossShardOp.IntentResolver.resolve_shard_intents(0)
 
       {:ok, {:applied_at, _, intents}, _} = :ra.process_command(shard_id, {:get_intents})
       refute Map.has_key?(intents, owner_ref)
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # 4. Mixed namespace — any async key returns CROSSSLOT
-  # ---------------------------------------------------------------------------
-
-  describe "mixed namespace durability" do
-    @tag skip: "async durability feature removed; mixed async/quorum routing no longer exists"
-    test "CROSSSLOT when source is async, dest is quorum" do
-      src = "asyncns:src_#{:rand.uniform(9_999_999)}"
-      dst = "quorumns:dst_#{:rand.uniform(9_999_999)}"
-
-      # Ensure cross-shard
-      if Router.shard_for(FerricStore.Instance.get(:default), src) == Router.shard_for(FerricStore.Instance.get(:default), dst) do
-        # Skip if they happen to route to same shard
-        :ok
-      else
-        NamespaceConfig.set("asyncns", "durability", "async")
-        NamespaceConfig.set("quorumns", "durability", "quorum")
-
-        # Set up source
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
-        GenServer.call(shard, {:tx_execute, [{"SADD", [src, "member"]}], nil}, 10_000)
-
-        result = Set.handle("SMOVE", [src, dst, "member"], %{})
-        assert {:error, msg} = result
-        assert String.contains?(msg, "CROSSSLOT")
-      end
-    end
-
-    @tag skip: "async durability feature removed; mixed async/quorum routing no longer exists"
-    test "CROSSSLOT when dest is async, source is quorum" do
-      src = "quorumns:src2_#{:rand.uniform(9_999_999)}"
-      dst = "asyncns:dst2_#{:rand.uniform(9_999_999)}"
-
-      if Router.shard_for(FerricStore.Instance.get(:default), src) == Router.shard_for(FerricStore.Instance.get(:default), dst) do
-        :ok
-      else
-        NamespaceConfig.set("asyncns", "durability", "async")
-        NamespaceConfig.set("quorumns", "durability", "quorum")
-
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
-        GenServer.call(shard, {:tx_execute, [{"SADD", [src, "member"]}], nil}, 10_000)
-
-        result = Set.handle("SMOVE", [src, dst, "member"], %{})
-        assert {:error, msg} = result
-        assert String.contains?(msg, "CROSSSLOT")
-      end
     end
   end
 
@@ -217,7 +193,9 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       # Lock the key
       owner_ref = make_ref()
       expire_at = System.os_time(:millisecond) + 5000
-      {:ok, {:applied_at, _, :ok}, _} = :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
+
+      {:ok, {:applied_at, _, :ok}, _} =
+        :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
 
       # Read should still work
       assert "readable" == Router.get(FerricStore.Instance.get(:default), k1)
@@ -235,10 +213,13 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       # Lock the key
       owner_ref = make_ref()
       expire_at = System.os_time(:millisecond) + 5000
-      {:ok, {:applied_at, _, :ok}, _} = :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
+
+      {:ok, {:applied_at, _, :ok}, _} =
+        :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
 
       # Write should be rejected
       result = Router.put(FerricStore.Instance.get(:default), k1, "blocked", 0)
+
       assert result == {:error, :key_locked},
              "Expected write to locked key to be rejected, got: #{inspect(result)}"
 

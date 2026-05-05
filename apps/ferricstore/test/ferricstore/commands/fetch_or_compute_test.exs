@@ -11,7 +11,6 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
 
   alias Ferricstore.Commands.Native
   alias Ferricstore.FetchOrCompute
-  alias Ferricstore.Store.DiskPressure
   alias Ferricstore.Store.Router
 
   # Generates a unique key to prevent cross-test interference.
@@ -130,38 +129,6 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       # Now fetching the same key should return hit.
       result = Native.handle("FETCH_OR_COMPUTE", [key, "5000"], dummy_store())
       assert ["hit", "done"] = result
-    end
-
-    @tag skip:
-           "async durability pressure path removed; quorum write failure injection needs a new hook"
-    test "returns write error and wakes waiters with error when storing result fails" do
-      key = "foc:result_pressure_#{:erlang.unique_integer([:positive])}"
-      ctx = FerricStore.Instance.get(:default)
-      idx = Router.shard_for(ctx, key)
-
-      assert :ok = Ferricstore.NamespaceConfig.set("foc", "durability", "async")
-
-      try do
-        assert {:compute, "hint"} = FetchOrCompute.fetch_or_compute(key, 5_000, "hint")
-
-        waiter =
-          Task.async(fn ->
-            FetchOrCompute.fetch_or_compute(key, 5_000, "hint")
-          end)
-
-        Process.sleep(50)
-        DiskPressure.set(ctx, idx)
-
-        assert {:error, "ERR disk pressure" <> _} =
-                 FetchOrCompute.fetch_or_compute_result(key, "computed_value", 5_000)
-
-        assert {:error, "ERR disk pressure" <> _} = Task.await(waiter, 1_000)
-        assert nil == Router.get(ctx, key)
-      after
-        DiskPressure.clear(ctx, idx)
-        Ferricstore.NamespaceConfig.set("foc", "durability", "quorum")
-        FetchOrCompute.fetch_or_compute_error(key, "cleanup")
-      end
     end
   end
 

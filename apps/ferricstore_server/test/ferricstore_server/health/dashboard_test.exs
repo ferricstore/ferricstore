@@ -476,7 +476,7 @@ defmodule FerricstoreServer.Health.DashboardTest do
       NamespaceConfig.reset_all()
     end
 
-    test "does not render removed async durability state" do
+    test "does not render removed namespace durability state" do
       NamespaceConfig.reset_all()
       assert {:error, _} = NamespaceConfig.set("ephemeral", "durability", "async")
 

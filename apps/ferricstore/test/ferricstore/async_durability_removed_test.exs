@@ -141,6 +141,33 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     assert offenders == []
   end
 
+  test "tests do not keep skipped removed async durability contracts" do
+    repo_root = Path.expand("../../../..", __DIR__)
+
+    offenders =
+      [
+        Path.join(repo_root, "apps/ferricstore/test/**/*.exs"),
+        Path.join(repo_root, "apps/ferricstore_server/test/**/*.exs")
+      ]
+      |> Enum.flat_map(&Path.wildcard/1)
+      |> Enum.reject(&(&1 == __ENV__.file))
+      |> Enum.flat_map(fn path ->
+        source = File.read!(path)
+
+        for token <- [
+              "async durability",
+              "async durability feature removed",
+              "mixed async/quorum",
+              "async-specific CROSSSLOT"
+            ],
+            String.contains?(source, token) do
+          {Path.relative_to(path, repo_root), token}
+        end
+      end)
+
+    assert offenders == []
+  end
+
   test "tests no longer keep removed RMW coordinator contract alive" do
     repo_root = Path.expand("../../../..", __DIR__)
 
