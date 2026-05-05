@@ -440,7 +440,7 @@ defmodule Ferricstore.Raft.Cluster do
   end
 
   defp ra_min_snapshot_interval do
-    Application.get_env(:ferricstore, :ra_min_snapshot_interval, 65_536)
+    Application.get_env(:ferricstore, :ra_min_snapshot_interval, 200_000)
   end
 
   defp ra_min_checkpoint_interval do

@@ -114,7 +114,7 @@ if config_env() == :prod do
     release_cursor_interval:
       String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "10000")),
     ra_min_snapshot_interval:
-      String.to_integer(System.get_env("FERRICSTORE_RA_MIN_SNAPSHOT_INTERVAL", "65536")),
+      String.to_integer(System.get_env("FERRICSTORE_RA_MIN_SNAPSHOT_INTERVAL", "200000")),
     ra_min_checkpoint_interval:
       String.to_integer(System.get_env("FERRICSTORE_RA_MIN_CHECKPOINT_INTERVAL", "16384")),
     promotion_threshold:

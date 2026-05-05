@@ -92,7 +92,7 @@ defmodule Ferricstore.Raft.ClusterStartErrorTest do
     test "raft log snapshots are throttled separately from release cursor" do
       args = Cluster.log_init_args_for_shard(0)
 
-      assert args.min_snapshot_interval == 65_536
+      assert args.min_snapshot_interval == 200_000
       assert args.min_checkpoint_interval == 16_384
     end
 
