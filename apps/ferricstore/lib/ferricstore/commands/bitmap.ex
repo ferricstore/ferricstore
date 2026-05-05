@@ -330,8 +330,14 @@ defmodule Ferricstore.Commands.Bitmap do
 
   def handle_ast({:bitcount, key}, store) do
     with :ok <- ensure_string_key(key, store) do
-      current = Ops.get(store, key) || <<>>
-      popcount(current)
+      case bitcount_all_from_store(store, key) do
+        {:ok, count} ->
+          count
+
+        :unknown ->
+          current = Ops.get(store, key) || <<>>
+          popcount(current)
+      end
     end
   end
 
@@ -359,8 +365,14 @@ defmodule Ferricstore.Commands.Bitmap do
 
   def handle_ast({:bitpos, key, bit_val, :all}, store) when bit_val in [0, 1] do
     with :ok <- ensure_string_key(key, store) do
-      current = Ops.get(store, key) || <<>>
-      bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
+      case bitpos_all_from_store(store, key, bit_val) do
+        {:ok, pos} ->
+          pos
+
+        :unknown ->
+          current = Ops.get(store, key) || <<>>
+          bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
+      end
     end
   end
 
