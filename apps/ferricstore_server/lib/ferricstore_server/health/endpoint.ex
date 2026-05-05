@@ -49,6 +49,8 @@ defmodule FerricstoreServer.Health.Endpoint do
   alias FerricstoreServer.Connection.Send, as: ConnSend
 
   @listener_ref :"#{__MODULE__}"
+  @max_request_bytes 8_192
+  @request_recv_timeout_ms 5_000
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -131,12 +133,21 @@ defmodule FerricstoreServer.Health.Endpoint do
   # Reads the HTTP request line and consumes headers. Returns {method, path}.
   @spec read_request(:inet.socket(), module()) :: {:ok, String.t(), String.t()} | :error
   defp read_request(socket, transport) do
-    case transport.recv(socket, 0, 5_000) do
-      {:ok, data} ->
-        parse_request_line(data)
+    read_request(socket, transport, <<>>)
+  end
 
-      {:error, _reason} ->
-        :error
+  defp read_request(_socket, _transport, data) when byte_size(data) > @max_request_bytes do
+    :error
+  end
+
+  defp read_request(socket, transport, data) do
+    if :binary.match(data, "\r\n\r\n") != :nomatch do
+      parse_request_line(data)
+    else
+      case transport.recv(socket, 0, @request_recv_timeout_ms) do
+        {:ok, chunk} -> read_request(socket, transport, data <> chunk)
+        {:error, _reason} -> :error
+      end
     end
   end
 
@@ -217,7 +228,9 @@ defmodule FerricstoreServer.Health.Endpoint do
       send_html_response(socket, transport, 200, "OK", body)
     catch
       kind, reason ->
-        body = "<html><body style='background:#0d1117;color:#f85149;padding:20px;font-family:monospace;'><h2>Raft Page Error</h2><pre>#{inspect(kind)}: #{inspect(reason, pretty: true, limit: 10)}</pre><a href='/dashboard' style='color:#58a6ff;'>← Dashboard</a></body></html>"
+        body =
+          "<html><body style='background:#0d1117;color:#f85149;padding:20px;font-family:monospace;'><h2>Raft Page Error</h2><pre>#{inspect(kind)}: #{inspect(reason, pretty: true, limit: 10)}</pre><a href='/dashboard' style='color:#58a6ff;'>← Dashboard</a></body></html>"
+
         send_html_response(socket, transport, 200, "OK", body)
     end
   end
@@ -250,7 +263,13 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp handle_request(socket, transport, _method, _path) do
-    send_response(socket, transport, 405, "Method Not Allowed", ~s({"error":"method not allowed"}))
+    send_response(
+      socket,
+      transport,
+      405,
+      "Method Not Allowed",
+      ~s({"error":"method not allowed"})
+    )
   end
 
   # ---------------------------------------------------------------------------

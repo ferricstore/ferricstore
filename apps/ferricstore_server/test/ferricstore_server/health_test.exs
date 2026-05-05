@@ -237,6 +237,7 @@ defmodule FerricstoreServer.HealthTest do
       Process.sleep(50)
 
       after_count = Ferricstore.Stats.total_connections()
+
       assert after_count > before,
              "Expected total_connections to increase from #{before}, got #{after_count}"
 
@@ -257,6 +258,7 @@ defmodule FerricstoreServer.HealthTest do
       recv_response(sock)
 
       after_count = Ferricstore.Stats.total_commands()
+
       assert after_count >= before + 3,
              "Expected total_commands to increase by at least 3 from #{before}, got #{after_count}"
 
@@ -316,6 +318,23 @@ defmodule FerricstoreServer.HealthTest do
       assert decoded["shard_count"] == shard_count
       assert is_list(decoded["shards"])
       assert length(decoded["shards"]) == shard_count
+    end
+
+    test "accepts requests split across TCP packets" do
+      port = FerricstoreServer.Health.Endpoint.port()
+
+      {:ok, conn} =
+        :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+
+      :ok = :gen_tcp.send(conn, "GET /health/ready ")
+      Process.sleep(20)
+      :ok = :gen_tcp.send(conn, "HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      {:ok, response} = :gen_tcp.recv(conn, 0, 5_000)
+      :gen_tcp.close(conn)
+
+      assert response =~ "HTTP/1.1 200 OK"
+      assert response =~ "application/json"
+      assert response =~ ~s("status":"ok")
     end
 
     test "returns shard status for each shard" do
