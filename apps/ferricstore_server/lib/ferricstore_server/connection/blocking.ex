@@ -323,6 +323,7 @@ defmodule FerricstoreServer.Connection.Blocking do
     keys = Enum.map(stream_ids, fn {key, _id} -> key end)
     effective_timeout = if timeout_ms == 0, do: 300_000, else: timeout_ms
     deadline = System.monotonic_time(:millisecond) + effective_timeout
+    tracking_args = build_xread_args(stream_ids, count)
 
     # Register as waiter for all watched stream keys.
     Enum.each(stream_ids, fn {key, id_str} ->
@@ -362,10 +363,12 @@ defmodule FerricstoreServer.Connection.Blocking do
         {:quit, Encoder.encode(nil), state}
 
       {:ok, value} ->
-        {:continue, Encoder.encode(value), state}
+        new_state = ConnTracking.maybe_track_read("XREAD", tracking_args, value, state)
+        {:continue, Encoder.encode(value), new_state}
 
       nil ->
-        {:continue, Encoder.encode(nil), state}
+        new_state = ConnTracking.maybe_track_read("XREAD", tracking_args, nil, state)
+        {:continue, Encoder.encode(nil), new_state}
     end
   end
 
