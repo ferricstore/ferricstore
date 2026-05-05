@@ -171,6 +171,71 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert Ferricstore.Flow.LMDBReplaySafeIndex.read(shard_data_path) == 123
   end
 
+  test "mirror writer maintains terminal counts and TTL index atomically" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_terminal_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 7
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    state_index_key = Ferricstore.Flow.Keys.state_index_key("kind", "completed", "tenant")
+    terminal_key = Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, "flow-a", 10)
+    state_key = Ferricstore.Flow.Keys.state_key("flow-a", "tenant")
+    reverse_key = Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)
+    count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+    expire_at_ms = System.os_time(:millisecond) + 60_000
+    expire_key = Ferricstore.Flow.LMDB.terminal_expire_key(expire_at_ms, terminal_key)
+
+    value =
+      Ferricstore.Flow.LMDB.encode_terminal_index_value(
+        "flow-a",
+        10,
+        expire_at_ms,
+        state_key,
+        count_key
+      )
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(shard_data_path)
+    start_supervised!({Ferricstore.Flow.LMDBWriter, shard_index: shard_index, data_dir: data_dir})
+
+    path = Ferricstore.Flow.LMDB.path(shard_data_path)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(shard_index, [
+               {:terminal_put, terminal_key, value, state_key, count_key},
+               {:terminal_put, terminal_key, value, state_key, count_key}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(shard_index + 1)
+
+    assert {:ok, ^value} = Ferricstore.Flow.LMDB.get(path, terminal_key)
+    assert {:ok, ^terminal_key} = Ferricstore.Flow.LMDB.get(path, reverse_key)
+    assert {:ok, 1} = Ferricstore.Flow.LMDB.terminal_count(path, state_index_key)
+    assert {:ok, _expire_value} = Ferricstore.Flow.LMDB.get(path, expire_key)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(shard_index, [
+               {:terminal_delete, terminal_key, state_key, count_key}
+             ])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(shard_index + 1)
+
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, terminal_key)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, reverse_key)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, expire_key)
+    assert {:ok, 0} = Ferricstore.Flow.LMDB.terminal_count(path, state_index_key)
+  end
+
   test "mirror flow reads reject stale LMDB record and fall back to Bitcask truth" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_enabled = Application.get_env(:ferricstore, :flow_lmdb_enabled)
@@ -464,6 +529,88 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
     assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
     assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
+  end
+
+  test "mirror flow TTL sweep removes expired terminal index without flow get" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_enabled = Application.get_env(:ferricstore, :flow_lmdb_enabled)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_enabled, true)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_enabled, old_enabled)
+    end)
+
+    start_supervised!({Ferricstore.Flow.LMDBWriter, shard_index: 0, data_dir: ctx.data_dir})
+
+    partition_key = "tenant-ttl-sweep"
+    flow_type = "ttl-sweep"
+
+    assert {:ok, _} =
+             Ferricstore.Store.Router.flow_create(ctx, %{
+               id: "flow-ttl-sweep",
+               type: flow_type,
+               state: "queued",
+               run_at_ms: 1,
+               partition_key: partition_key,
+               now_ms: 1
+             })
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Store.Router.flow_claim_due(ctx, %{
+               type: flow_type,
+               state: "queued",
+               priority: nil,
+               worker: "worker-ttl-sweep",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 2,
+               partition_key: partition_key
+             })
+
+    assert {:ok, completed} =
+             Ferricstore.Store.Router.flow_complete(ctx, %{
+               id: claimed.id,
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               ttl_ms: 20,
+               now_ms: 3,
+               partition_key: partition_key
+             })
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(1)
+
+    lmdb_path =
+      ctx.data_dir |> Ferricstore.DataDir.shard_data_path(0) |> Ferricstore.Flow.LMDB.path()
+
+    completed_index_key =
+      Ferricstore.Flow.Keys.state_index_key(flow_type, "completed", partition_key)
+
+    terminal_prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(completed_index_key)
+    state_key = Ferricstore.Flow.Keys.state_key(completed.id, partition_key)
+    reverse_key = Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)
+
+    assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
+    assert {:ok, 1} = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, completed_index_key)
+
+    Process.sleep(40)
+
+    assert {:ok, 1} =
+             Ferricstore.Flow.LMDB.sweep_expired_terminal(
+               lmdb_path,
+               System.os_time(:millisecond),
+               100
+             )
+
+    assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
+    assert {:ok, 0} = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, completed_index_key)
+    assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+    assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)

@@ -755,12 +755,14 @@ defmodule FerricStore do
       ctx = default_ctx()
       prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
       now_ms = System.os_time(:millisecond)
+      sweep_limit = flow_terminal_lmdb_sweep_limit()
 
       ctx.data_dir
       |> flow_lmdb_shard_paths(ctx.shard_count)
       |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
-        with {:ok, total} <- Ferricstore.Flow.LMDB.prefix_count(path, prefix),
-             {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, total) do
+        with {:ok, _swept} <-
+               Ferricstore.Flow.LMDB.sweep_expired_terminal(path, now_ms, sweep_limit),
+             {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count) do
           {:cont, {:ok, flow_decode_terminal_index_entries(entries, path, now_ms) ++ acc}}
         else
           {:error, _reason} = error -> {:halt, error}
@@ -793,28 +795,17 @@ defmodule FerricStore do
       ctx = default_ctx()
       prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
       now_ms = System.os_time(:millisecond)
+      sweep_limit = flow_terminal_lmdb_sweep_limit()
 
       ctx.data_dir
       |> flow_lmdb_shard_paths(ctx.shard_count)
       |> Enum.reduce_while({:ok, 0}, fn path, {:ok, acc} ->
-        case Ferricstore.Flow.LMDB.prefix_count(path, prefix) do
-          {:ok, 0} ->
-            {:cont, {:ok, acc}}
-
-          {:ok, count} ->
-            case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count) do
-              {:ok, entries} ->
-                live_count =
-                  entries |> flow_decode_terminal_index_entries(path, now_ms) |> length()
-
-                {:cont, {:ok, acc + live_count}}
-
-              {:error, _reason} = error ->
-                {:halt, error}
-            end
-
-          {:error, _reason} = error ->
-            {:halt, error}
+        with {:ok, _swept} <-
+               Ferricstore.Flow.LMDB.sweep_expired_terminal(path, now_ms, sweep_limit),
+             {:ok, count} <- flow_terminal_lmdb_count_for_path(path, index_key, prefix, now_ms) do
+          {:cont, {:ok, acc + count}}
+        else
+          {:error, _reason} = error -> {:halt, error}
         end
       end)
     else
@@ -828,6 +819,38 @@ defmodule FerricStore do
       |> Ferricstore.DataDir.shard_data_path(shard_index)
       |> Ferricstore.Flow.LMDB.path()
     end)
+  end
+
+  defp flow_terminal_lmdb_count_for_path(path, index_key, prefix, now_ms) do
+    case Ferricstore.Flow.LMDB.terminal_count(path, index_key) do
+      {:ok, count} ->
+        {:ok, count}
+
+      :not_found ->
+        flow_terminal_lmdb_rebuild_count_for_path(path, index_key, prefix, now_ms)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp flow_terminal_lmdb_rebuild_count_for_path(path, index_key, prefix, now_ms) do
+    with {:ok, raw_count} <- Ferricstore.Flow.LMDB.prefix_count(path, prefix),
+         {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, raw_count) do
+      live_count =
+        entries
+        |> flow_decode_terminal_index_entries(path, now_ms)
+        |> length()
+
+      case Ferricstore.Flow.LMDB.put_terminal_count(path, index_key, live_count) do
+        :ok -> {:ok, live_count}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  defp flow_terminal_lmdb_sweep_limit do
+    Application.get_env(:ferricstore, :flow_lmdb_terminal_sweep_limit, 10_000)
   end
 
   defp flow_decode_terminal_index_entries(entries, path, now_ms) do

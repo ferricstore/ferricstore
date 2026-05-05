@@ -6802,12 +6802,6 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
-  defp queue_pending_lmdb_mirror_delete(key) do
-    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
-    Process.put(:sm_pending_lmdb_mirror_ops, [{:delete, key} | pending])
-    :ok
-  end
-
   defp maybe_queue_terminal_lmdb_index_put(state, state_key, encoded_record, expire_at_ms) do
     with {:ok, record} <- flow_decode_record_blob(encoded_record),
          true <- Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
@@ -6818,19 +6812,19 @@ defmodule Ferricstore.Raft.StateMachine do
       index_key =
         Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, record.id, updated_at_ms)
 
-      queue_pending_lmdb_mirror_raw_put(
+      count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+
+      queue_pending_lmdb_mirror_terminal_put(
         index_key,
         Ferricstore.Flow.LMDB.encode_terminal_index_value(
           record.id,
           updated_at_ms,
           expire_at_ms,
-          state_key
-        )
-      )
-
-      queue_pending_lmdb_mirror_raw_put(
-        Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key),
-        index_key
+          state_key,
+          count_key
+        ),
+        state_key,
+        count_key
       )
 
       queue_pending_lmdb_mirror_after_flush(
@@ -6852,20 +6846,26 @@ defmodule Ferricstore.Raft.StateMachine do
 
       state_index_key
       |> Ferricstore.Flow.LMDB.terminal_index_key(record.id, updated_at_ms)
-      |> queue_pending_lmdb_mirror_delete()
-
-      record.id
-      |> FlowKeys.state_key(Map.get(record, :partition_key))
-      |> Ferricstore.Flow.LMDB.terminal_by_state_key_key()
-      |> queue_pending_lmdb_mirror_delete()
+      |> queue_pending_lmdb_mirror_terminal_delete(
+        FlowKeys.state_key(record.id, Map.get(record, :partition_key)),
+        Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+      )
     end
 
     :ok
   end
 
-  defp queue_pending_lmdb_mirror_raw_put(key, value) do
+  defp queue_pending_lmdb_mirror_terminal_put(terminal_key, value, state_key, count_key) do
     pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
-    Process.put(:sm_pending_lmdb_mirror_ops, [{:put, key, value} | pending])
+    op = {:terminal_put, terminal_key, value, state_key, count_key}
+    Process.put(:sm_pending_lmdb_mirror_ops, [op | pending])
+    :ok
+  end
+
+  defp queue_pending_lmdb_mirror_terminal_delete(terminal_key, state_key, count_key) do
+    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
+    op = {:terminal_delete, terminal_key, state_key, count_key}
+    Process.put(:sm_pending_lmdb_mirror_ops, [op | pending])
     :ok
   end
 

@@ -202,7 +202,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp flush_ops_and_marker(state, ops, started_at) do
-    with :ok <- write_ops(state.path, ops),
+    with {:ok, ops} <- expand_ops(state.path, ops),
+         :ok <- write_ops(state.path, ops),
          {:ok, state} <- persist_requested(state, started_at) do
       {:ok, state}
     else
@@ -212,6 +213,147 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp write_ops(_path, []), do: :ok
   defp write_ops(path, ops), do: Ferricstore.Flow.LMDB.write_batch(path, ops)
+
+  defp expand_ops(_path, []), do: {:ok, []}
+
+  defp expand_ops(path, ops) do
+    initial = %{ops: [], counts: %{}, terminal_values: %{}}
+
+    Enum.reduce_while(ops, {:ok, initial}, fn op, {:ok, acc} ->
+      case expand_op(path, op, acc) do
+        {:ok, acc} -> {:cont, {:ok, acc}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, %{ops: expanded}} -> {:ok, Enum.reverse(expanded)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp expand_op(path, {:terminal_put, terminal_key, value, state_key, count_key}, acc)
+       when is_binary(terminal_key) and is_binary(value) and is_binary(state_key) and
+              is_binary(count_key) do
+    with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
+         {:ok, count, acc} <- terminal_count(path, count_key, acc) do
+      existed? = is_binary(old_value)
+      count = if existed?, do: count, else: count + 1
+      reverse_key = Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)
+
+      ops =
+        [
+          {:put, terminal_key, value},
+          {:put, reverse_key, terminal_key},
+          {:put, count_key, Ferricstore.Flow.LMDB.encode_count(count)}
+        ]
+        |> maybe_put_expire_key(terminal_key, value, state_key, count_key)
+        |> maybe_delete_old_expire_key(terminal_key, old_value)
+
+      acc =
+        acc
+        |> put_in([:counts, count_key], count)
+        |> put_in([:terminal_values, terminal_key], value)
+        |> prepend_ops(ops)
+
+      {:ok, acc}
+    end
+  end
+
+  defp expand_op(path, {:terminal_delete, terminal_key, state_key, count_key}, acc)
+       when is_binary(terminal_key) and is_binary(state_key) and is_binary(count_key) do
+    with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
+         {:ok, count, acc} <- terminal_count(path, count_key, acc) do
+      reverse_key = Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)
+
+      {count, count_ops} =
+        if is_binary(old_value) do
+          count = max(count - 1, 0)
+          {count, [{:put, count_key, Ferricstore.Flow.LMDB.encode_count(count)}]}
+        else
+          {count, []}
+        end
+
+      ops =
+        [{:delete, terminal_key}, {:delete, reverse_key} | count_ops]
+        |> maybe_delete_old_expire_key(terminal_key, old_value)
+
+      acc =
+        acc
+        |> put_in([:counts, count_key], count)
+        |> put_in([:terminal_values, terminal_key], nil)
+        |> prepend_ops(ops)
+
+      {:ok, acc}
+    end
+  end
+
+  defp expand_op(_path, op, acc), do: {:ok, prepend_ops(acc, [op])}
+
+  defp terminal_value(path, terminal_key, acc) do
+    case Map.fetch(acc.terminal_values, terminal_key) do
+      {:ok, value} ->
+        {:ok, value, acc}
+
+      :error ->
+        case Ferricstore.Flow.LMDB.get(path, terminal_key) do
+          {:ok, value} -> {:ok, value, put_in(acc, [:terminal_values, terminal_key], value)}
+          :not_found -> {:ok, nil, put_in(acc, [:terminal_values, terminal_key], nil)}
+          {:error, _reason} = error -> error
+        end
+    end
+  end
+
+  defp terminal_count(path, count_key, acc) do
+    case Map.fetch(acc.counts, count_key) do
+      {:ok, count} ->
+        {:ok, count, acc}
+
+      :error ->
+        case Ferricstore.Flow.LMDB.get(path, count_key) do
+          {:ok, value} ->
+            case Ferricstore.Flow.LMDB.decode_count(value) do
+              {:ok, count} -> {:ok, count, put_in(acc, [:counts, count_key], count)}
+              :error -> {:ok, 0, put_in(acc, [:counts, count_key], 0)}
+            end
+
+          :not_found ->
+            {:ok, 0, put_in(acc, [:counts, count_key], 0)}
+
+          {:error, _reason} = error ->
+            error
+        end
+    end
+  end
+
+  defp prepend_ops(acc, ops), do: %{acc | ops: Enum.reverse(ops) ++ acc.ops}
+
+  defp maybe_put_expire_key(ops, terminal_key, value, state_key, count_key) do
+    case Ferricstore.Flow.LMDB.decode_terminal_index_value(value) do
+      {:ok, {_id, _updated_at_ms, expire_at_ms, _state_key}} when expire_at_ms > 0 ->
+        expire_key = Ferricstore.Flow.LMDB.terminal_expire_key(expire_at_ms, terminal_key)
+
+        expire_value =
+          Ferricstore.Flow.LMDB.encode_terminal_expire_value(terminal_key, state_key, count_key)
+
+        [{:put, expire_key, expire_value} | ops]
+
+      _ ->
+        ops
+    end
+  end
+
+  defp maybe_delete_old_expire_key(ops, _terminal_key, nil), do: ops
+
+  defp maybe_delete_old_expire_key(ops, terminal_key, old_value) do
+    case Ferricstore.Flow.LMDB.decode_terminal_index_value(old_value) do
+      {:ok, {_id, _updated_at_ms, expire_at_ms, _state_key}} when expire_at_ms > 0 ->
+        expire_key = Ferricstore.Flow.LMDB.terminal_expire_key(expire_at_ms, terminal_key)
+        [{:delete, expire_key} | ops]
+
+      _ ->
+        ops
+    end
+  end
 
   defp persist_requested(
          %{requested_index: requested, durable_index: durable} = state,
