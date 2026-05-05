@@ -26,6 +26,32 @@ defmodule FerricstoreServer.Connection.StoreTest do
     assert is_function(store.compound_batch_get_meta, 2)
   end
 
+  test "raw connection store rebuilds stale cached maps missing metadata helpers" do
+    ctx = FerricStore.Instance.get(:default)
+    cache_key = {:ferricstore_raw_store, ctx.name}
+    previous = :persistent_term.get(cache_key, :missing)
+
+    stale =
+      ctx
+      |> Store.build_store(nil)
+      |> Map.drop([:value_size, :object_lfu])
+
+    try do
+      :persistent_term.put(cache_key, stale)
+
+      store = Store.build_store(ctx, nil)
+
+      assert is_function(store.value_size, 1)
+      assert is_function(store.object_lfu, 1)
+      refute store == stale
+    after
+      case previous do
+        :missing -> :persistent_term.erase(cache_key)
+        value -> :persistent_term.put(cache_key, value)
+      end
+    end
+  end
+
   test "sandbox connection store batches reads with namespace applied once" do
     ctx = FerricStore.Instance.get(:default)
     ns = "sandbox_batch_#{System.unique_integer([:positive])}:"

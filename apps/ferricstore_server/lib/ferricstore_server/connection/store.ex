@@ -100,9 +100,28 @@ defmodule FerricstoreServer.Connection.Store do
         :persistent_term.put({:ferricstore_raw_store, ctx.name}, store)
         store
 
-      store ->
+      store when is_map(store) ->
+        if raw_store_complete?(store) do
+          store
+        else
+          store = build_raw_store(ctx)
+          :persistent_term.put({:ferricstore_raw_store, ctx.name}, store)
+          store
+        end
+
+      _stale ->
+        store = build_raw_store(ctx)
+        :persistent_term.put({:ferricstore_raw_store, ctx.name}, store)
         store
     end
+  end
+
+  defp raw_store_complete?(store) do
+    is_function(Map.get(store, :batch_get), 1) and
+      is_function(Map.get(store, :value_size), 1) and
+      is_function(Map.get(store, :object_lfu), 1) and
+      is_function(Map.get(store, :compound_batch_get), 2) and
+      is_function(Map.get(store, :compound_batch_get_meta), 2)
   end
 
   @doc false
