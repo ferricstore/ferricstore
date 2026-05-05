@@ -33,8 +33,10 @@ defmodule FerricStore.BatchWorker do
 
   @impl true
   def init([]) do
-    ctx = FerricStore.Instance.get(:default)
-    {:ok, %{ctx: ctx}}
+    case :persistent_term.get({FerricStore.Instance, :default}, nil) do
+      nil -> {:stop, :instance_not_initialized}
+      ctx -> {:ok, %{ctx: ctx}}
+    end
   end
 
   @impl true
