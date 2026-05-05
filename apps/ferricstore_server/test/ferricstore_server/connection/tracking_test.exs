@@ -85,4 +85,35 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert :ets.lookup(:ferricstore_tracking, stream) == [{stream, self()}]
     assert :ets.lookup(:ferricstore_tracking, "STREAM") == []
   end
+
+  test "BITOP invalidates the destination key instead of the operation token" do
+    destination = "tracking:bitop:dst"
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+    ClientTracking.track_key(self(), destination, tracking)
+
+    Tracking.maybe_notify_tracking("BITOP", ["AND", destination, "a", "b"], 1, %{
+      tracking: tracking
+    })
+
+    assert_receive {:tracking_invalidation, _payload, [^destination]}
+    assert :ets.lookup(:ferricstore_tracking, destination) == []
+    assert :ets.lookup(:ferricstore_tracking, "AND") == []
+  end
+
+  test "SMOVE invalidates both source and destination sets" do
+    source = "tracking:smove:src"
+    destination = "tracking:smove:dst"
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+    ClientTracking.track_key(self(), source, tracking)
+    ClientTracking.track_key(self(), destination, tracking)
+
+    Tracking.maybe_notify_tracking("SMOVE", [source, destination, "member"], 1, %{
+      tracking: tracking
+    })
+
+    assert_receive {:tracking_invalidation, _payload, [^source]}
+    assert_receive {:tracking_invalidation, _payload, [^destination]}
+    assert :ets.lookup(:ferricstore_tracking, source) == []
+    assert :ets.lookup(:ferricstore_tracking, destination) == []
+  end
 end

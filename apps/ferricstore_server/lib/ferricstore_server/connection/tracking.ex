@@ -241,8 +241,14 @@ defmodule FerricstoreServer.Connection.Tracking do
       "LMOVE" ->
         notify_tracking_keys(args, :all, writer_pid, sender)
 
+      "SMOVE" ->
+        notify_tracking_keys(args, :all, writer_pid, sender)
+
       "COPY" ->
         notify_tracking_keys(args, :destination, writer_pid, sender)
+
+      "BITOP" ->
+        notify_tracking_keys(args, :second, writer_pid, sender)
 
       _ ->
         notify_tracking_keys(args, :first, writer_pid, sender)
@@ -255,6 +261,10 @@ defmodule FerricstoreServer.Connection.Tracking do
 
   defp notify_tracking_keys([_src, dst | _], :destination, writer_pid, sender) do
     ClientTracking.notify_key_modified(dst, writer_pid, sender)
+  end
+
+  defp notify_tracking_keys([_first, key | _], :second, writer_pid, sender) do
+    ClientTracking.notify_key_modified(key, writer_pid, sender)
   end
 
   defp notify_tracking_keys([key | _], :first, writer_pid, sender) do
