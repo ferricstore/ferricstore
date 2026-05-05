@@ -5911,7 +5911,7 @@ defmodule Ferricstore.Raft.StateMachine do
     compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
 
     with :ok <-
-           flow_put(state, compound_key, Flow.encode_history_fields(record, event, now_ms), 0) do
+           raw_put_cold(state, compound_key, Flow.encode_history_fields(record, event, now_ms), 0) do
       flow_history_index_put(history_key, event_id, compound_key)
     end
   end
