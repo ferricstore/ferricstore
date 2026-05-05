@@ -2032,7 +2032,7 @@ fn v2_append_batch_nosync<'a>(
     let p = std::path::Path::new(&path);
     let file_id = parse_file_id(p);
 
-    match log::LogWriter::open(p, file_id) {
+    match log::LogWriter::open_small(p, file_id) {
         Ok(mut writer) => {
             let entries: Vec<(&[u8], &[u8], u64)> = records
                 .iter()
@@ -2063,7 +2063,7 @@ fn v2_append_ops_batch_nosync<'a>(
     let p = std::path::Path::new(&path);
     let file_id = parse_file_id(p);
 
-    match log::LogWriter::open(p, file_id) {
+    match log::LogWriter::open_small(p, file_id) {
         Ok(mut writer) => {
             let entries: Vec<log::BatchWrite<'_>> = records
                 .iter()

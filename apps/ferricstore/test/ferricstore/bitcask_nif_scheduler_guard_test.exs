@@ -16,8 +16,9 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
         |> File.read!()
         |> String.split("\n")
         |> Enum.with_index(1)
-        |> Enum.filter(fn {line, _line_no} ->
-          line =~ ~r/^\s*#\[rustler::nif\(schedule = "Dirty(?:Io|Cpu)"\)\]/
+        |> Enum.filter(fn {line, line_no} ->
+          line =~ ~r/^\s*#\[rustler::nif\(schedule = "Dirty(?:Io|Cpu)"\)\]/ and
+            not lmdb_nif?(path, line_no)
         end)
         |> Enum.map(fn {line, line_no} -> "#{Path.relative_to_cwd(path)}:#{line_no}:#{line}" end)
       end)
@@ -91,6 +92,20 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     end
   end
 
+  test "hot nosync batch append NIFs use small short-lived writer buffers" do
+    source = File.read!(@source)
+
+    for function <- [
+          "v2_append_batch_nosync",
+          "v2_append_ops_batch_nosync"
+        ] do
+      body = function_body(source, function)
+
+      assert body =~ "log::LogWriter::open_small",
+             "#{function}/N must use open_small to avoid 256KB buffer churn per hot append"
+    end
+  end
+
   defp assert_nif_schedule(source, function, schedule) do
     pattern =
       ~r/#\[rustler::nif\(schedule = "#{schedule}"\)\]\s*(?:#\[allow\([^\]]+\)\]\s*)?fn #{function}\b/
@@ -103,5 +118,13 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     [_before, rest] = String.split(source, "fn #{function}", parts: 2)
     [body, _after] = String.split(rest, "\n}\n\n", parts: 2)
     body
+  end
+
+  defp lmdb_nif?(path, schedule_line_no) do
+    path
+    |> File.read!()
+    |> String.split("\n")
+    |> Enum.slice(schedule_line_no, 4)
+    |> Enum.any?(&String.match?(&1, ~r/^\s*fn lmdb_/))
   end
 end
