@@ -4,6 +4,7 @@ defmodule FerricstoreServer.Connection.Transaction do
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Store.Router
+  alias FerricstoreServer.Connection.Tracking, as: ConnTracking
 
   # Maximum commands queued inside a MULTI transaction (100K).
   @max_multi_queue_size 100_000
@@ -29,6 +30,7 @@ defmodule FerricstoreServer.Connection.Transaction do
 
   def dispatch_exec(_args, state) do
     result = execute_transaction(state)
+    state = apply_exec_tracking_effects(result, state)
 
     new_state = %{
       state
@@ -135,6 +137,20 @@ defmodule FerricstoreServer.Connection.Transaction do
     # queuing. Reverse here at EXEC time to restore command ordering.
     Ferricstore.Transaction.Coordinator.execute(Enum.reverse(queue), watched, ns)
   end
+
+  defp apply_exec_tracking_effects(results, state) when is_list(results) do
+    state.multi_queue
+    |> Enum.reverse()
+    |> Enum.zip(results)
+    |> Enum.reduce(state, fn {{cmd, args, _ast}, result}, acc_state ->
+      ConnTracking.maybe_notify_keyspace(cmd, args, result)
+      new_state = ConnTracking.maybe_track_read(cmd, args, result, acc_state)
+      ConnTracking.maybe_notify_tracking(cmd, args, result, new_state)
+      new_state
+    end)
+  end
+
+  defp apply_exec_tracking_effects(_aborted_or_error, state), do: state
 
   # ---------------------------------------------------------------------------
   # Command validation (for queue-time syntax checking)
