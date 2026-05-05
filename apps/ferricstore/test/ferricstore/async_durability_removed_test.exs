@@ -121,4 +121,35 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
 
     assert offenders == []
   end
+
+  test "user-facing docs and active benchmark scripts do not advertise async durability" do
+    repo_root = Path.expand("../../../..", __DIR__)
+
+    paths =
+      [Path.join(repo_root, "README.md")] ++
+        Path.wildcard(Path.join(repo_root, "docs/**/*.md")) ++
+        Path.wildcard(Path.join(repo_root, "bench/**/*.{exs,sh,md,cfg}"))
+
+    offenders =
+      paths
+      |> Enum.reject(&String.contains?(&1, "/bench/results/"))
+      |> Enum.flat_map(fn path ->
+        source = File.read!(path)
+
+        for token <- [
+              "async durability",
+              "durability mode",
+              "durability_for(",
+              "Quorum vs Async",
+              "read_async",
+              "write_async",
+              "submit_async"
+            ],
+            String.contains?(source, token) do
+          {Path.relative_to(path, repo_root), token}
+        end
+      end)
+
+    assert offenders == []
+  end
 end

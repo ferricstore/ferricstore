@@ -116,7 +116,7 @@ The Shard GenServer processes one message at a time. Even though `handle_put` re
 
 The shard's `handle_put` does:
 - `MemoryGuard.reject_writes?()` check
-- `Batcher.write_async` (GenServer.cast — fast)
+- Batcher enqueue via `GenServer.cast` (fast; the Batcher replies after Ra apply)
 - `write_version + 1`
 
 This is microseconds of work per message. The actual throughput should be much higher than 7.6K. The bottleneck is likely NOT the shard GenServer itself.
@@ -125,9 +125,15 @@ This is microseconds of work per message. The actual throughput should be much h
 
 1. **Batcher window_ms=1** — the batcher collects writes for 1ms, then flushes. For quorum, `ra:pipeline_command` goes to the ra server which does WAL fdatasync + Bitcask fsync. The ra server is also a GenServer — one batch at a time per shard. With 4 shards and 1ms windows, theoretical max = 4 × 1000 batches/sec. If each batch has ~2 commands (low because window is only 1ms), that's ~8,000 ops/sec. **This matches our 7,600 observation.**
 
-2. **For async**: the Batcher still uses the same 1ms timer window before calling `submit_async`. Even though the actual apply is non-blocking, the 1ms batching window + GenServer scheduling adds latency. Callers block in `GenServer.call` to the shard, which returned `{:noreply}`, so they're waiting for `GenServer.reply` from the Batcher. The Batcher only replies after the 1ms flush timer fires for async too.
+2. **Connection process blocking** — the connection waits for the Batcher reply
+   after Ra acceptance and local apply. Pipeline depth can fill the batcher
+   window, but it does not make a single connection execute multiple writes in
+   parallel.
 
-3. **Connection process blocking** — the connection process does `GenServer.call(shard, {:put, ...})` and waits for the reply. For quorum, the reply comes after Raft. For async, the reply comes after the Batcher's 1ms window + `submit_async` + `GenServer.reply`. The connection cannot process the next pipelined command until the reply arrives.
+3. **Connection process serialization** — each connection process waits for the
+   current write reply before dispatching the next write from that same
+   pipeline. More client connections increase concurrency; deeper pipelines on
+   one connection mostly increase queue depth.
 
 ### The real bottleneck: Batcher 1ms window × 4 shards
 

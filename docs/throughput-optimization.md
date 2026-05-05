@@ -31,15 +31,13 @@ durability). It's amortized: the Raft batcher groups N writes into one
 **Measured:** 20 writes batched = 4ms (1 fsync). 20 individual = 84ms
 (20 fsyncs). **20x speedup from batching.**
 
-### Quorum vs Async paths
+### Quorum-only write path
 
-| Path | Raft | Bitcask fsync | Durability |
-|------|------|---------------|------------|
-| Quorum | `process_command(reply_from: :local)` — waits for local apply | Yes (per batch) | Crash-safe |
-| Async | ETS + Bitcask first, then `pipeline_command` fire-and-forget | No | Page cache only |
-
-Async writes are ~10-50x faster but can lose data on crash (up to
-one fsync interval of writes). Use for caches, rate limiters, sessions.
+FerricStore no longer exposes a weaker namespace write mode. All client
+writes use the quorum path: the Batcher groups commands, submits them through
+Raft, waits for local apply, and only then replies to the caller. Bitcask data
+files are checkpointed in the background, while Ra WAL durability protects
+acknowledged commands until the state-machine cursor can be released.
 
 ---
 
