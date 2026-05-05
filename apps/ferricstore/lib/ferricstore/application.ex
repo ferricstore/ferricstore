@@ -20,7 +20,6 @@ defmodule Ferricstore.Application do
   ├── Ferricstore.HLC                     (Hybrid Logical Clock)
   ├── Ferricstore.Raft.Batcher (x N)     (group-commit batchers)
   ├── Ferricstore.Store.BitcaskWriter (x N) (background Bitcask flushers)
-  ├── Ferricstore.Store.RmwCoordinator (x N) (async RMW contention fallback)
   ├── Ferricstore.Store.ShardSupervisor   (one_for_one over N Shard GenServers)
   ├── Ferricstore.Merge.Supervisor        (Semaphore + N Scheduler GenServers)
   ├── Ferricstore.PubSub
@@ -197,16 +196,6 @@ defmodule Ferricstore.Application do
         )
       end)
 
-    # RMW fallback coordinator — one per shard. Handles contended inline RMW
-    # commands that lost the per-key latch.
-    rmw_coordinator_children =
-      Enum.map(0..(shard_count - 1), fn i ->
-        Supervisor.child_spec(
-          {Ferricstore.Store.RmwCoordinator, shard_index: i},
-          id: :"rmw_coordinator_#{i}"
-        )
-      end)
-
     # Optional libcluster node discovery (DNS, Kubernetes labels, or gossip).
     # When topologies are configured, Cluster.Supervisor is the first child so
     # that node discovery begins before the store is ready to serve traffic.
@@ -229,7 +218,6 @@ defmodule Ferricstore.Application do
         batcher_children ++
         bitcask_writer_children ++
         flow_lmdb_writer_children ++
-        rmw_coordinator_children ++
         [
           {Ferricstore.Store.ShardSupervisor,
            data_dir: data_dir, shard_count: shard_count, instance_ctx: default_ctx}

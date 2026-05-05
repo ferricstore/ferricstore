@@ -121,10 +121,9 @@ defmodule FerricStore.Instance do
     # Per-shard ETS tables (anonymous — no global name pollution)
     keydir_refs = build_keydir_tables(name, shard_count)
 
-    # Per-shard latch tables — one ETS per shard, used by async RMW
-    # (see docs/async-rmw-design.md). Each row is {key, holder_pid}.
-    # :ets.insert_new provides atomic per-key locking; callers who lose
-    # the CAS fall through to the RmwCoordinator worker.
+    # Per-shard latch tables — one ETS per shard, used by local direct RMW
+    # helpers. Default-instance RMW commands go through Raft; these latches
+    # are for embedded/custom contexts that mutate directly.
     latch_refs = build_latch_tables(name, shard_count)
 
     # Shard process names (via Registry or atoms)

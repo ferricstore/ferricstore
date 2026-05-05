@@ -284,9 +284,9 @@ defmodule Ferricstore.Store.Router do
   the delta to Raft via the ordered async submitter.
 
   **Called with the per-key latch held.** The latch guarantees exclusive
-  access to `key`'s ETS row among RMW paths. This remains for the
-  RmwCoordinator and test-only direct callers while namespace async durability
-  is retired.
+  access to `key`'s ETS row among local direct RMW paths. Namespace async
+  durability and its coordinator fallback are retired; default-instance RMW
+  goes through the Raft state machine.
 
   Returns the command's natural result shape (e.g. `{:ok, new_int}` for
   INCR, `old_value_or_nil` for GETSET/GETDEL).
@@ -4208,8 +4208,8 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc """
-  Executes a list_op inline under a held latch. Called from
-  local-origin helper paths and `RmwCoordinator.handle_call` (contended path).
+  Executes a list_op inline under a held latch. Called from local-origin
+  helper paths.
   The latch guarantees exclusive access to the list's compound keys.
 
   Reserves Batcher capacity before touching origin-local compound state.

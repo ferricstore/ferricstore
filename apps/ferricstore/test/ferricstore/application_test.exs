@@ -71,6 +71,14 @@ defmodule Ferricstore.ApplicationTest do
                "Child #{inspect(id)} is not alive (pid=#{inspect(pid)})"
       end
     end
+
+    test "does not start removed async RMW coordinators" do
+      children = Supervisor.which_children(Ferricstore.Supervisor)
+      ids = Enum.map(children, fn {id, _pid, _type, _mods} -> id end)
+
+      refute Enum.any?(ids, &(to_string(&1) =~ "rmw_coordinator")),
+             "RmwCoordinator belonged to removed async durability fallback and should not be supervised"
+    end
   end
 
   describe "graceful shutdown" do
