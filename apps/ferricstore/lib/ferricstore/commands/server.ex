@@ -498,8 +498,8 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp build_section("server", _store) do
-    ctx = FerricStore.Instance.get(:default)
-    info = if ctx.server_info_fn, do: ctx.server_info_fn.(), else: %{}
+    ctx = default_instance_ctx()
+    info = if ctx && ctx.server_info_fn, do: ctx.server_info_fn.(), else: %{}
     port = Map.get(info, :tcp_port, 0)
     redis_mode = Map.get(info, :redis_mode, "embedded")
 
@@ -530,8 +530,8 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp build_section("clients", _store) do
-    ctx = FerricStore.Instance.get(:default)
-    connected = if ctx.connected_clients_fn, do: ctx.connected_clients_fn.(), else: 0
+    ctx = default_instance_ctx()
+    connected = if ctx && ctx.connected_clients_fn, do: ctx.connected_clients_fn.(), else: 0
 
     blocked = safe_ets_size(:ferricstore_waiters)
 
