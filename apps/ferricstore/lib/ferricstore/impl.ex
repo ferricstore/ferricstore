@@ -803,6 +803,7 @@ defmodule FerricStore.Impl do
       exists?: fn key -> Router.exists?(ctx, key) end,
       keys: fn -> Router.keys(ctx) end,
       flush: fn -> flushdb(ctx) end,
+      persistence_barrier: fn -> Ferricstore.Commands.Server.handle("SAVE", [], ctx) end,
       dbsize: fn -> Router.dbsize(ctx) end,
       incr: fn key, delta -> Router.incr(ctx, key, delta) end,
       incr_float: fn key, delta -> Router.incr_float(ctx, key, delta) end,

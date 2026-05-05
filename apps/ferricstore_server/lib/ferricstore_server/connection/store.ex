@@ -122,6 +122,7 @@ defmodule FerricstoreServer.Connection.Store do
       is_function(Map.get(store, :batch_get), 1) and
       is_function(Map.get(store, :value_size), 1) and
       is_function(Map.get(store, :object_lfu), 1) and
+      is_function(Map.get(store, :persistence_barrier), 0) and
       is_function(Map.get(store, :compound_batch_get), 2) and
       is_function(Map.get(store, :compound_batch_get_meta), 2)
   end
@@ -177,6 +178,7 @@ defmodule FerricstoreServer.Connection.Store do
 
         :ok
       end,
+      persistence_barrier: fn -> Ferricstore.Commands.Server.handle("SAVE", [], ctx) end,
       dbsize: fn -> Router.dbsize(ctx) end,
       incr: fn key, delta -> Router.incr(ctx, key, delta) end,
       incr_float: fn key, delta -> Router.incr_float(ctx, key, delta) end,

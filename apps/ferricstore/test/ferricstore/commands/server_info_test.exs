@@ -246,9 +246,48 @@ defmodule Ferricstore.Commands.ServerInfoTest do
       assert result =~ "rdb_changes_since_last_save:0"
     end
 
-    test "contains rdb_last_save_time stub" do
+    test "contains rdb_last_save_time" do
       result = Server.handle("INFO", ["persistence"], MockStore.make())
-      assert result =~ "rdb_last_save_time:0"
+      [_header | fields] = String.split(result, "\r\n", trim: true)
+      line = Enum.find(fields, &String.starts_with?(&1, "rdb_last_save_time:"))
+      {timestamp, ""} = line |> String.trim_leading("rdb_last_save_time:") |> Integer.parse()
+      assert timestamp >= 0
+    end
+  end
+
+  describe "SAVE" do
+    test "calls the injected persistence barrier" do
+      parent = self()
+
+      store =
+        MockStore.make()
+        |> Map.put(:persistence_barrier, fn ->
+          send(parent, :save_barrier_called)
+          :ok
+        end)
+
+      assert :ok = Server.handle("SAVE", [], store)
+      assert_receive :save_barrier_called
+    end
+
+    test "updates LASTSAVE after the persistence barrier succeeds" do
+      before_save = Server.handle("LASTSAVE", [], MockStore.make())
+      assert is_integer(before_save)
+
+      store = Map.put(MockStore.make(), :persistence_barrier, fn -> :ok end)
+      assert :ok = Server.handle("SAVE", [], store)
+
+      assert Server.handle("LASTSAVE", [], store) >= before_save
+    end
+
+    test "returns an error when the persistence barrier fails" do
+      store =
+        MockStore.make()
+        |> Map.put(:persistence_barrier, fn -> {:error, :fsync_failed} end)
+
+      assert {:error, msg} = Server.handle("SAVE", [], store)
+      assert msg =~ "save failed"
+      assert msg =~ "fsync_failed"
     end
   end
 

@@ -423,13 +423,137 @@ defmodule Ferricstore.Commands.Server do
   # SAVE / BGSAVE / LASTSAVE
   # ---------------------------------------------------------------------------
 
-  def handle("SAVE", _args, _store), do: :ok
-  def handle("BGSAVE", _args, _store), do: {:simple, "Background saving started"}
-  def handle("LASTSAVE", _args, _store), do: System.os_time(:second)
+  @last_save_key {__MODULE__, :last_save_unix_seconds}
+
+  def handle("SAVE", [], store), do: save_now(store)
+
+  def handle("SAVE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'save' command"}
+  end
+
+  def handle("BGSAVE", [], store) do
+    _ = Task.start(fn -> save_now(store) end)
+    {:simple, "Background saving started"}
+  end
+
+  def handle("BGSAVE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'bgsave' command"}
+  end
+
+  def handle("LASTSAVE", [], _store), do: last_save_time()
+
+  def handle("LASTSAVE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'lastsave' command"}
+  end
 
   # ===========================================================================
   # Private helpers
   # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # SAVE helpers
+  # ---------------------------------------------------------------------------
+
+  defp save_now(store) do
+    case persistence_barrier(store) do
+      :ok ->
+        record_last_save()
+        :ok
+
+      {:error, msg} when is_binary(msg) ->
+        {:error, msg}
+
+      {:error, reason} ->
+        {:error, "ERR save failed: #{inspect(reason)}"}
+
+      other ->
+        {:error, "ERR save failed: #{inspect(other)}"}
+    end
+  end
+
+  defp persistence_barrier(%{persistence_barrier: barrier}) when is_function(barrier, 0) do
+    barrier.()
+  end
+
+  defp persistence_barrier(%FerricStore.Instance{} = ctx), do: persistence_barrier_for_ctx(ctx)
+
+  defp persistence_barrier(%{__instance_ctx__: %FerricStore.Instance{} = ctx}),
+    do: persistence_barrier_for_ctx(ctx)
+
+  defp persistence_barrier(_store), do: :ok
+
+  defp persistence_barrier_for_ctx(ctx) do
+    with :ok <- flush_raft_batchers(ctx),
+         :ok <- flush_bitcask_writers(ctx),
+         :ok <- sync_checkpointers(ctx) do
+      :ok
+    end
+  end
+
+  defp flush_raft_batchers(%{name: :default, shard_count: shard_count}) do
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
+      case Ferricstore.Raft.Batcher.flush(i, 30_000) do
+        :ok -> {:cont, :ok}
+        {:error, _} = err -> {:halt, err}
+        other -> {:halt, {:error, {:batcher_flush_failed, i, other}}}
+      end
+    end)
+  end
+
+  defp flush_raft_batchers(_ctx), do: :ok
+
+  defp flush_bitcask_writers(%{shard_count: shard_count} = ctx) do
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
+      case Ferricstore.Store.BitcaskWriter.flush(ctx, i, 30_000) do
+        :ok -> {:cont, :ok}
+        {:error, _} = err -> {:halt, err}
+        other -> {:halt, {:error, {:bitcask_writer_flush_failed, i, other}}}
+      end
+    end)
+  end
+
+  defp sync_checkpointers(%{shard_count: shard_count} = ctx) do
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
+      name = Ferricstore.Store.BitcaskCheckpointer.process_name(i, ctx)
+
+      case Process.whereis(name) do
+        pid when is_pid(pid) ->
+          case Ferricstore.Store.BitcaskCheckpointer.sync_now(pid) do
+            :ok -> {:cont, :ok}
+            {:error, _} = err -> {:halt, err}
+            other -> {:halt, {:error, {:checkpointer_sync_failed, i, other}}}
+          end
+
+        nil ->
+          case sync_active_file(ctx, i) do
+            :ok -> {:cont, :ok}
+            {:error, _} = err -> {:halt, err}
+            other -> {:halt, {:error, {:active_file_sync_failed, i, other}}}
+          end
+      end
+    end)
+  end
+
+  defp sync_active_file(ctx, shard_index) do
+    try do
+      {_file_id, path, _shard_path} = Ferricstore.Store.ActiveFile.get(ctx, shard_index)
+      Ferricstore.Bitcask.NIF.v2_fsync(path)
+    rescue
+      error -> {:error, {:active_file_sync_exception, shard_index, error}}
+    catch
+      kind, reason -> {:error, {:active_file_sync_throw, shard_index, kind, reason}}
+    end
+  end
+
+  defp record_last_save do
+    ts = System.os_time(:second)
+    :persistent_term.put(@last_save_key, ts)
+    ts
+  end
+
+  defp last_save_time do
+    :persistent_term.get(@last_save_key, 0)
+  end
 
   # ---------------------------------------------------------------------------
   # FLUSHDB helper
@@ -654,7 +778,7 @@ defmodule Ferricstore.Commands.Server do
     fields = [
       {"loading", "0"},
       {"rdb_changes_since_last_save", "0"},
-      {"rdb_last_save_time", "0"}
+      {"rdb_last_save_time", Integer.to_string(last_save_time())}
     ]
 
     format_section("Persistence", fields)
