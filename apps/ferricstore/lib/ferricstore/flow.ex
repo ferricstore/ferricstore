@@ -343,7 +343,7 @@ defmodule Ferricstore.Flow do
     observe_flow(:rewind, started, result, %{flow_id: id})
   end
 
-  def decode_record(value) when is_binary(value), do: :erlang.binary_to_term(value)
+  def decode_record(value) when is_binary(value), do: :erlang.binary_to_term(value, [:safe])
 
   defp flow_start_time, do: System.monotonic_time()
 

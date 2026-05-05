@@ -193,7 +193,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp decode_state_record(key, value, expire_at_ms) do
-    case :erlang.binary_to_term(value) do
+    case :erlang.binary_to_term(value, [:safe]) do
       %{id: id, type: type, state: state} = record
       when is_binary(id) and is_binary(type) and is_binary(state) ->
         [{key, value, expire_at_ms, record}]

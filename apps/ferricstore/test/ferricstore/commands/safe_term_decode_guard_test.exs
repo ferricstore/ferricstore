@@ -3,17 +3,9 @@ defmodule Ferricstore.Commands.SafeTermDecodeGuardTest do
 
   @root Path.expand("../../..", __DIR__)
 
-  @guarded_files [
-    "lib/ferricstore.ex",
-    "lib/ferricstore/commands/bloom.ex",
-    "lib/ferricstore/commands/prob_type.ex",
-    "lib/ferricstore/commands/stream.ex",
-    "lib/ferricstore/commands/strings.ex",
-    "lib/ferricstore/commands/tdigest.ex",
-    "lib/ferricstore/merge/manifest.ex",
-    "lib/ferricstore/raft/state_machine.ex",
-    "lib/ferricstore/store/list_ops.ex"
-  ]
+  @guarded_files Path.join(@root, "lib/**/*.ex")
+                 |> Path.wildcard()
+                 |> Enum.map(&Path.relative_to(&1, @root))
 
   test "command-facing persisted term decoders use binary_to_term safe mode" do
     violations =

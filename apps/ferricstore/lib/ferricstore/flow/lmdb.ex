@@ -41,7 +41,7 @@ defmodule Ferricstore.Flow.LMDB do
   def encode_value(value, expire_at_ms), do: :erlang.term_to_binary({expire_at_ms, value})
 
   def decode_value(blob, now_ms) when is_binary(blob) do
-    case :erlang.binary_to_term(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
       {expire_at_ms, value} when is_integer(expire_at_ms) and expire_at_ms > 0 ->
         if expire_at_ms <= now_ms, do: :expired, else: {:ok, value}
 
@@ -165,7 +165,7 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   def decode_terminal_expire_value(blob) when is_binary(blob) do
-    case :erlang.binary_to_term(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
       {terminal_key, state_key, count_key}
       when is_binary(terminal_key) and (is_binary(state_key) or is_nil(state_key)) and
              is_binary(count_key) ->
@@ -183,7 +183,7 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   def decode_count(blob) when is_binary(blob) do
-    case :erlang.binary_to_term(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
       count when is_integer(count) and count >= 0 -> {:ok, count}
       _ -> :error
     end
@@ -232,7 +232,7 @@ defmodule Ferricstore.Flow.LMDB do
   def sweep_expired_terminal(_path, _now_ms, _limit), do: {:ok, 0}
 
   def decode_terminal_index_value(blob) when is_binary(blob) do
-    case :erlang.binary_to_term(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
       {id, updated_at_ms, expire_at_ms, state_key, count_key}
       when is_binary(id) and is_integer(updated_at_ms) and is_integer(expire_at_ms) and
              (is_binary(state_key) or is_nil(state_key)) and is_binary(count_key) ->
@@ -258,7 +258,7 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   def terminal_index_count_key(blob) when is_binary(blob) do
-    case :erlang.binary_to_term(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
       {_id, _updated_at_ms, _expire_at_ms, _state_key, count_key} when is_binary(count_key) ->
         {:ok, count_key}
 
