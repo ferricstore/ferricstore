@@ -5833,17 +5833,6 @@ defmodule FerricStore do
     end
   end
 
-  @doc false
-  def __async_batch_put_result_list__(_ctx, []), do: []
-
-  def __async_batch_put_result_list__(ctx, kv_pairs) do
-    case Ferricstore.Store.Router.batch_async_put(ctx, kv_pairs) do
-      :ok -> List.duplicate(:ok, length(kv_pairs))
-      {:error, _reason} = error -> List.duplicate(error, length(kv_pairs))
-      results when is_list(results) -> results
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # Private — string store builder for bitmap/json/hyperloglog operations
   # ---------------------------------------------------------------------------

@@ -569,7 +569,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
     @tag timeout: 120_000
     test "batch async PUT origin replay does not overwrite later INCRs" do
       key = ukey("batch_origin_then_incr")
-      :ok = Router.batch_async_put(ctx(), [{key, "0"}])
+      :ok = Router.batch_put(ctx(), [{key, "0"}])
 
       tasks =
         for _ <- 1..25 do
@@ -770,7 +770,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       latch_tab = elem(ctx().latch_refs, idx)
 
       assert :ets.insert_new(latch_tab, {key, self()})
-      task = Task.async(fn -> Router.batch_async_put(ctx(), [{key, "1"}, {other_key, "2"}]) end)
+      task = Task.async(fn -> Router.batch_put(ctx(), [{key, "1"}, {other_key, "2"}]) end)
 
       try do
         assert Task.yield(task, 50) == nil

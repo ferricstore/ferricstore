@@ -48,7 +48,12 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     refute function_exported?(Router, :durability_for_key_public, 2)
   end
 
-  test "legacy batch_async_put API submits through quorum path" do
+  test "router no longer exposes async-named batch put API" do
+    refute function_exported?(Router, :batch_async_put, 2)
+    refute function_exported?(FerricStore, :__async_batch_put_result_list__, 2)
+  end
+
+  test "batch_put API submits through quorum path" do
     id = {__MODULE__, self(), :quorum_submit}
     parent = self()
 
@@ -64,7 +69,7 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     ctx = FerricStore.Instance.get(:default)
     key = "async_removed_batch:#{System.unique_integer([:positive])}"
 
-    assert :ok == Router.batch_async_put(ctx, [{key, "value"}])
+    assert :ok == Router.batch_put(ctx, [{key, "value"}])
     assert_receive {:quorum_submit, %{status: :ok}}, 1_000
     assert "value" == Router.get(FerricStore.Instance.get(:default), key)
   end

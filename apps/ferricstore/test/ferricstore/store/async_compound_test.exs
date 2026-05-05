@@ -599,7 +599,6 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
 
     test "plain SET without compound markers does not fetch active file" do
       key = ukey("plain_no_marker")
-      assert Router.durability_for_key_public(ctx(), key) == :async
       cache_key = active_file_cache_key(ctx(), key)
       Process.delete(cache_key)
 

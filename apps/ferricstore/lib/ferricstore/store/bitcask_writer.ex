@@ -143,9 +143,9 @@ defmodule Ferricstore.Store.BitcaskWriter do
   @doc """
   Queues a deferred Bitcask tombstone (delete) for background processing.
 
-  Called from `Router.async_delete/2` when raft is disabled. The tombstone
-  is written in the same ordered batch as value writes, so a tombstone
-  for key K will always appear after any preceding value write for K.
+  Called from local/direct delete paths when Raft is not involved. The
+  tombstone is written in the same ordered batch as value writes, so a
+  tombstone for key K will always appear after any preceding value write for K.
   The ETS entry has already been deleted by the caller before this cast.
   """
   @spec delete(non_neg_integer(), binary(), binary()) :: :ok

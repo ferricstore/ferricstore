@@ -50,7 +50,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     on_exit(fn -> Batcher.reset_pending(custom_idx) end)
     fill_default_async_pending(custom_idx, key)
 
-    assert :ok = Router.batch_async_put(ctx, [{key, "custom"}])
+    assert :ok = Router.batch_put(ctx, [{key, "custom"}])
     assert "custom" == Router.get(ctx, key)
   end
 

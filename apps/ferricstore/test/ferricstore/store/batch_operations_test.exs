@@ -25,12 +25,11 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   defp default_ctx, do: FerricStore.Instance.get(:default)
 
   # ---------------------------------------------------------------------------
-  # batch_async_put
+  # batch_put
   # ---------------------------------------------------------------------------
 
-  describe "batch_async_put" do
-    @tag skip:
-           "async durability origin replay path removed; batch_async_put is now a quorum compatibility wrapper"
+  describe "batch_put" do
+    @tag skip: "async durability origin replay path removed; batch_put submits through quorum"
     test "submits origin-checked PUT commands for stale replay safety" do
       source =
         Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__)
@@ -39,14 +38,14 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert source =~
                "origin_checked_command(key, {:put, key, value, 0}, previous, value, 0)",
              """
-             batch_async_put must not submit raw {:put, key, value, 0} origin commands.
+             batch_put must not submit raw {:put, key, value, 0} origin commands.
              A delayed origin replay of the raw PUT can overwrite later local RMW writes.
              """
     end
 
     test "all-small batch: values readable immediately" do
       kvs = for i <- 1..20, do: {"#{@ns_async}:bap_small_#{i}", "val_#{i}"}
-      :ok = Router.batch_async_put(default_ctx(), kvs)
+      :ok = Router.batch_put(default_ctx(), kvs)
 
       for {key, value} <- kvs do
         assert Router.get(default_ctx(), key) == value
@@ -78,7 +77,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     test "all-large batch: values > hot_cache_max written to disk" do
       big = :binary.copy("L", 100 * 1024)
       kvs = for i <- 1..5, do: {"#{@ns_async}:bap_large_#{i}", big}
-      :ok = Router.batch_async_put(default_ctx(), kvs)
+      :ok = Router.batch_put(default_ctx(), kvs)
 
       for {key, _} <- kvs do
         assert Router.get(default_ctx(), key) == big
@@ -97,7 +96,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         {"#{@ns_async}:bap_mix_s3", small}
       ]
 
-      :ok = Router.batch_async_put(default_ctx(), kvs)
+      :ok = Router.batch_put(default_ctx(), kvs)
 
       for {key, value} <- kvs do
         assert Router.get(default_ctx(), key) == value
@@ -105,12 +104,12 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     end
 
     test "empty batch is a no-op" do
-      assert :ok = Router.batch_async_put(default_ctx(), [])
+      assert :ok = Router.batch_put(default_ctx(), [])
     end
 
     test "single-element batch works" do
       kvs = [{"#{@ns_async}:bap_single", "one"}]
-      :ok = Router.batch_async_put(default_ctx(), kvs)
+      :ok = Router.batch_put(default_ctx(), kvs)
       assert Router.get(default_ctx(), "#{@ns_async}:bap_single") == "one"
     end
 
@@ -119,7 +118,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       :ok = Router.put(default_ctx(), key, "original", 0)
       assert Router.get(default_ctx(), key) == "original"
 
-      :ok = Router.batch_async_put(default_ctx(), [{key, "updated"}])
+      :ok = Router.batch_put(default_ctx(), [{key, "updated"}])
       assert Router.get(default_ctx(), key) == "updated"
     end
 
@@ -132,7 +131,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert "hash" == Router.compound_get(default_ctx(), key, CompoundKey.type_key(key))
       assert "hash_val" == Router.compound_get(default_ctx(), key, field_key)
 
-      :ok = Router.batch_async_put(default_ctx(), [{key, "string_val"}])
+      :ok = Router.batch_put(default_ctx(), [{key, "string_val"}])
 
       assert "string_val" == Router.get(default_ctx(), key)
       assert nil == Router.compound_get(default_ctx(), key, CompoundKey.type_key(key))
@@ -142,7 +141,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
     test "duplicate keys in one async batch use the last value" do
       key = "#{@ns_async}:bap_duplicate"
 
-      :ok = Router.batch_async_put(default_ctx(), [{key, "first"}, {key, "second"}])
+      :ok = Router.batch_put(default_ctx(), [{key, "first"}, {key, "second"}])
 
       assert Router.get(default_ctx(), key) == "second"
     end
@@ -167,7 +166,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         large = :binary.copy("X", 100 * 1024)
 
         assert {:error, "ERR disk write failed" <> _} =
-                 Router.batch_async_put(default_ctx(), [{small_key, "small"}, {large_key, large}])
+                 Router.batch_put(default_ctx(), [{small_key, "small"}, {large_key, large}])
 
         assert nil == Router.get(default_ctx(), small_key)
         assert nil == Router.get(default_ctx(), large_key)
@@ -205,7 +204,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         large = :binary.copy("Y", 100 * 1024)
 
         assert {:error, "ERR disk write failed" <> _} =
-                 Router.batch_async_put(default_ctx(), [{small_key, "after"}, {large_key, large}])
+                 Router.batch_put(default_ctx(), [{small_key, "after"}, {large_key, large}])
 
         assert "before" == Router.get(default_ctx(), small_key)
         assert nil == Router.get(default_ctx(), large_key)
@@ -241,7 +240,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
         large = :binary.copy("Q", 100 * 1024)
 
         assert {:error, "ERR disk write failed" <> _} =
-                 Router.batch_async_put(default_ctx(), [{small_key, "small"}, {large_key, large}])
+                 Router.batch_put(default_ctx(), [{small_key, "small"}, {large_key, large}])
 
         assert nil == Router.get(default_ctx(), small_key)
         assert nil == Router.get(default_ctx(), large_key)
@@ -268,7 +267,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       fill_async_pending(1, overloaded_key)
 
       assert {:error, "ERR async replication overloaded"} =
-               Router.batch_async_put(default_ctx(), [{ok_key, "ok"}, {overloaded_key, "blocked"}])
+               Router.batch_put(default_ctx(), [{ok_key, "ok"}, {overloaded_key, "blocked"}])
 
       assert nil == Router.get(default_ctx(), ok_key)
       assert nil == Router.get(default_ctx(), overloaded_key)
@@ -276,7 +275,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
     @tag skip:
            "async durability direct pressure preflight removed; quorum write pressure is exercised elsewhere"
-    test "direct batch_async_put rejects pressured shards before publishing writes" do
+    test "direct batch_put rejects pressured shards before publishing writes" do
       ctx = default_ctx()
       pressured_key = "#{@ns_async}:bap_pressure_#{System.unique_integer([:positive])}"
       ok_key = different_shard_key(ctx, pressured_key, "#{@ns_async}:bap_pressure_ok")
@@ -286,7 +285,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
       try do
         assert {:error, "ERR disk pressure on shard " <> _} =
-                 Router.batch_async_put(ctx, [{pressured_key, "blocked"}, {ok_key, "allowed"}])
+                 Router.batch_put(ctx, [{pressured_key, "blocked"}, {ok_key, "allowed"}])
 
         assert nil == Router.get(ctx, pressured_key)
         assert nil == Router.get(ctx, ok_key)
@@ -306,7 +305,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       fill_async_pending(idx, key)
 
       assert {:error, "ERR async replication overloaded"} =
-               Router.batch_async_put(default_ctx(), [{key, large}])
+               Router.batch_put(default_ctx(), [{key, large}])
 
       assert nil == Router.get(default_ctx(), key)
       assert nil == recovered_value_from_bitcask(default_ctx(), key)
@@ -327,7 +326,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       fill_async_pending(idx, key)
 
       assert {:error, "ERR async replication overloaded"} =
-               Router.batch_async_put(default_ctx(), [{key, new}])
+               Router.batch_put(default_ctx(), [{key, new}])
 
       assert old == Router.get(default_ctx(), key)
       assert old == recovered_value_from_bitcask(default_ctx(), key)
@@ -369,28 +368,6 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       for {key, value} <- kvs do
         assert {:ok, value} == FerricStore.get(key)
       end
-    end
-
-    @tag skip:
-           "async durability overload result fan-out removed; batch_set now submits through quorum"
-    test "all-async batch reports overload per shard instead of failing every key" do
-      ok_key = key_for_shard(default_ctx(), "bs_cross_overload_ok", 0)
-      overloaded_key = key_for_shard(default_ctx(), "bs_cross_overload_blocked", 1)
-
-      on_exit(fn -> Batcher.reset_pending(1) end)
-      fill_async_pending(1, overloaded_key)
-
-      assert [
-               :ok,
-               {:error, "ERR async replication overloaded"}
-             ] =
-               FerricStore.__async_batch_put_result_list__(
-                 default_ctx(),
-                 [{ok_key, "ok"}, {overloaded_key, "blocked"}]
-               )
-
-      assert "ok" == Router.get(default_ctx(), ok_key)
-      assert nil == Router.get(default_ctx(), overloaded_key)
     end
 
     test "all-quorum namespace returns list of :ok" do
@@ -677,7 +654,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       idx = Router.shard_for(default_ctx(), key)
       keydir = elem(default_ctx().keydir_refs, idx)
 
-      :ok = Router.batch_async_put(default_ctx(), [{key, "small"}])
+      :ok = Router.batch_put(default_ctx(), [{key, "small"}])
       assert [{^key, "small", 0, _lfu, :pending, 0, _vsize}] = :ets.lookup(keydir, key)
 
       assert Router.get_keydir_file_ref(default_ctx(), key) == :miss

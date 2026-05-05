@@ -41,7 +41,7 @@ defmodule Ferricstore.Commands.StringsColdRangeTest do
     key = "getrange-cold-slice:" <> Integer.to_string(:erlang.unique_integer([:positive]))
     value = :binary.copy("a", 4096) <> "target-slice" <> :binary.copy("z", 4096)
 
-    :ok = Router.batch_async_put(ctx, [{key, value}])
+    :ok = Router.batch_put(ctx, [{key, value}])
 
     ShardHelpers.eventually(fn ->
       match?({:cold_ref, _path, _offset, _size}, Router.get_with_file_ref(ctx, key))

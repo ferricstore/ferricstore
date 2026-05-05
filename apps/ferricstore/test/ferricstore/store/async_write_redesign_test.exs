@@ -80,7 +80,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
       key = "#{@ns}:ctx_probe"
 
       assert ctx().name == :default
-      assert Router.durability_for_key_public(ctx(), key) == :async
+      assert Router.shard_for(ctx(), key) in 0..(ctx().shard_count - 1)
     end
 
     test "async writes produce batched ra.pipeline_command submissions" do
@@ -229,7 +229,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
       end
 
       assert {:error, "ERR async replication overloaded"} =
-               Router.batch_async_put(ctx(), [{key, "value"}])
+               Router.batch_put(ctx(), [{key, "value"}])
 
       assert Router.get(ctx(), key) == nil
     end
@@ -269,7 +269,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
 
       try do
         default_ctx = ctx()
-        task = Task.async(fn -> Router.batch_async_put(default_ctx, kv_pairs) end)
+        task = Task.async(fn -> Router.batch_put(default_ctx, kv_pairs) end)
 
         assert_receive :later_shard_overloaded, 5_000
 
@@ -327,7 +327,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
         )
 
       try do
-        task = Task.async(fn -> Router.batch_async_put(c, kv_pairs) end)
+        task = Task.async(fn -> Router.batch_put(c, kv_pairs) end)
 
         assert_receive :later_shard_overloaded, 5_000
 

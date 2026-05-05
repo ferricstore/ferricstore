@@ -46,7 +46,6 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
     ctx = FerricStore.Instance.get(:default)
     keydir = elem(ctx.keydir_refs, Router.shard_for(ctx, key))
 
-    assert Router.durability_for_key_public(ctx, key) == :async
     assert [{^key, nil, _exp, _lfu, fid, off, value_size}] = :ets.lookup(keydir, key)
     assert is_integer(fid) and fid >= 0
     assert is_integer(off) and off >= 0
@@ -137,8 +136,6 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
       idx = Router.shard_for(ctx, key)
       keydir = elem(ctx.keydir_refs, idx)
       test_pid = self()
-
-      assert Router.durability_for_key_public(ctx, key) == :async
 
       :ok = Router.put(ctx, key, value, 0)
       assert_cold_key(key)
@@ -325,7 +322,7 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
       Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_data_path)
 
       try do
-        :ok = Router.batch_async_put(ctx, [{key, value}])
+        :ok = Router.batch_put(ctx, [{key, value}])
 
         assert {:cold_ref, path, offset, size} = Router.get_with_file_ref(ctx, key)
 
@@ -362,7 +359,7 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
       Ferricstore.Store.ActiveFile.publish(idx, file_id, file_path, shard_data_path)
 
       try do
-        :ok = Router.batch_async_put(ctx, [{key, value}])
+        :ok = Router.batch_put(ctx, [{key, value}])
 
         assert {:cold_ref, path, offset, size} = Router.get_with_file_ref(ctx, key)
 

@@ -2648,22 +2648,22 @@ defmodule Ferricstore.Store.Router do
   def max_value_size, do: @max_value_size
 
   @doc """
-  Legacy batch async PUT API.
+  Batch PUT API with `:ok | {:error, _}` result shape.
 
-  Async durability has been removed, so this compatibility wrapper now submits
-  the batch through the quorum path and preserves the old `:ok | {:error, _}`
-  return shape for callers that have not been renamed yet.
+  The default application instance submits through quorum. Embedded/custom
+  instances write locally because the Raft batchers are owned by the default
+  application instance.
   """
-  @spec batch_async_put(FerricStore.Instance.t(), [{binary(), binary()}]) ::
+  @spec batch_put(FerricStore.Instance.t(), [{binary(), binary()}]) ::
           :ok | {:error, binary()}
-  def batch_async_put(%{name: name} = ctx, kv_pairs) when name != :default do
+  def batch_put(%{name: name} = ctx, kv_pairs) when name != :default do
     case pressured_batch_shard(ctx, kv_pairs) do
       nil -> batch_local_put(ctx, kv_pairs)
-      idx -> {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
+      idx -> {:error, "ERR disk pressure on shard #{idx}, rejecting write"}
     end
   end
 
-  def batch_async_put(ctx, kv_pairs) do
+  def batch_put(ctx, kv_pairs) do
     case batch_quorum_put(ctx, kv_pairs) do
       results when is_list(results) ->
         Enum.find(results, &match?({:error, _}, &1)) || :ok
