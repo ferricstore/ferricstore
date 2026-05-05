@@ -230,6 +230,10 @@ defmodule FerricstoreServer.Connection.Tracking do
         new_tracking = ClientTracking.track_keys(conn_pid, args, state.tracking)
         %{state | tracking: new_tracking}
 
+      c when c in ~w(EXISTS PFCOUNT) ->
+        new_tracking = ClientTracking.track_keys(conn_pid, args, state.tracking)
+        %{state | tracking: new_tracking}
+
       "HMGET" ->
         # HMGET key field [field ...] -- track the top-level key
         case args do

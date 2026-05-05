@@ -100,6 +100,24 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert :ets.lookup(:ferricstore_tracking, "ENCODING") == []
   end
 
+  test "multi-key read commands track every read key" do
+    exists_a = "tracking:exists:a"
+    exists_b = "tracking:exists:b"
+    pf_a = "tracking:pfcount:a"
+    pf_b = "tracking:pfcount:b"
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+
+    state = %{tracking: tracking}
+
+    state = Tracking.maybe_track_read("EXISTS", [exists_a, exists_b], 2, state)
+    Tracking.maybe_track_read("PFCOUNT", [pf_a, pf_b], 10, state)
+
+    assert :ets.lookup(:ferricstore_tracking, exists_a) == [{exists_a, self()}]
+    assert :ets.lookup(:ferricstore_tracking, exists_b) == [{exists_b, self()}]
+    assert :ets.lookup(:ferricstore_tracking, pf_a) == [{pf_a, self()}]
+    assert :ets.lookup(:ferricstore_tracking, pf_b) == [{pf_b, self()}]
+  end
+
   test "BITOP invalidates the destination key instead of the operation token" do
     destination = "tracking:bitop:dst"
     {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
