@@ -18,37 +18,33 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         zset_score_index,
         zset_score_lookup
       ) do
-    if LMDB.mirror?() do
-      lmdb_path = LMDB.path(shard_path)
+    lmdb_path = LMDB.path(shard_path)
 
-      stats =
-        keydir
-        |> select_state_entries()
-        |> Enum.reduce(%{seen: 0, lmdb: 0, terminal: 0, active: 0, lmdb_errors: 0}, fn entries,
-                                                                                       acc ->
-          reconcile_batch(
-            entries,
-            shard_path,
-            lmdb_path,
-            keydir,
-            shard_index,
-            instance_ctx,
-            zset_score_index,
-            zset_score_lookup,
-            acc
-          )
-        end)
+    stats =
+      keydir
+      |> select_state_entries()
+      |> Enum.reduce(%{seen: 0, lmdb: 0, terminal: 0, active: 0, lmdb_errors: 0}, fn entries,
+                                                                                     acc ->
+        reconcile_batch(
+          entries,
+          shard_path,
+          lmdb_path,
+          keydir,
+          shard_index,
+          instance_ctx,
+          zset_score_index,
+          zset_score_lookup,
+          acc
+        )
+      end)
 
-      :telemetry.execute(
-        [:ferricstore, :flow, :lmdb_rebuild],
-        stats,
-        %{shard_index: shard_index}
-      )
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb_rebuild],
+      stats,
+      %{shard_index: shard_index}
+    )
 
-      :ok
-    else
-      :ok
-    end
+    :ok
   end
 
   defp reconcile_batch(
@@ -82,7 +78,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             LMDB.encode_terminal_index_value(record.id, updated_at_ms, expire_at_ms, key)
 
           reverse_key = LMDB.terminal_by_state_key_key(key)
-          metadata_ops = terminal_metadata_index_ops(record, updated_at_ms, expire_at_ms)
+          metadata_ops = query_metadata_index_ops(record, expire_at_ms)
 
           {
             [
@@ -94,7 +90,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             active
           }
         else
-          {cleanup_stale_terminal_ops(lmdb_path, key) ++ lmdb_ops, prunes,
+          {query_metadata_index_ops(record, expire_at_ms) ++
+             cleanup_stale_terminal_ops(lmdb_path, key) ++ lmdb_ops, prunes,
            [{key, record} | active]}
         end
       end)
@@ -225,7 +222,6 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
     maybe_rebuild_due_index(zset_score_index, zset_score_lookup, record)
     maybe_rebuild_running_indexes(zset_score_index, zset_score_lookup, record)
-    maybe_rebuild_metadata_indexes(zset_score_index, zset_score_lookup, record, updated_score)
   end
 
   defp maybe_rebuild_due_index(
@@ -266,11 +262,12 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
   defp maybe_rebuild_running_indexes(_zset_score_index, _zset_score_lookup, _record), do: :ok
 
-  defp maybe_rebuild_metadata_indexes(zset_score_index, zset_score_lookup, record, score) do
+  defp query_metadata_index_ops(record, expire_at_ms) do
     partition_key = Map.get(record, :partition_key)
+    score = Map.get(record, :updated_at_ms, 0)
 
     metadata_index_entries(record)
-    |> Enum.each(fn {kind, value} ->
+    |> Enum.map(fn {kind, value} ->
       key =
         case kind do
           :parent -> Flow.Keys.parent_index_key(value, partition_key)
@@ -278,7 +275,9 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           :correlation -> Flow.Keys.correlation_index_key(value, partition_key)
         end
 
-      ZSetIndex.put_member(zset_score_index, zset_score_lookup, key, record.id, score)
+      query_key = LMDB.query_index_key(key, record.id, score)
+      value = LMDB.encode_query_index_value(record.id, score, expire_at_ms)
+      {:put, query_key, value}
     end)
   end
 
@@ -289,27 +288,6 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       {:correlation, Map.get(record, :correlation_id)}
     ]
     |> Enum.filter(fn {_kind, value} -> is_binary(value) and value != "" end)
-  end
-
-  defp terminal_metadata_index_ops(record, updated_at_ms, expire_at_ms) do
-    partition_key = Map.get(record, :partition_key)
-
-    record
-    |> metadata_index_entries()
-    |> Enum.map(fn {kind, value} ->
-      index_key =
-        case kind do
-          :parent -> Flow.Keys.parent_index_key(value, partition_key)
-          :root -> Flow.Keys.root_index_key(value, partition_key)
-          :correlation -> Flow.Keys.correlation_index_key(value, partition_key)
-        end
-
-      count_key = LMDB.terminal_count_key(index_key)
-      terminal_key = LMDB.terminal_index_key(index_key, record.id, updated_at_ms)
-
-      {:put, terminal_key,
-       LMDB.encode_terminal_index_value(record.id, updated_at_ms, expire_at_ms, nil, count_key)}
-    end)
   end
 
   defp non_default_root_flow_id(record) do

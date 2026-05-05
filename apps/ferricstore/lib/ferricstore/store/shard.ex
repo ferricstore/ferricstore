@@ -1070,7 +1070,6 @@ defmodule Ferricstore.Store.Shard do
         instance_name: if(state.instance_ctx, do: state.instance_ctx.name, else: :default),
         zset_score_index_name: state.zset_score_index,
         zset_score_lookup_name: state.zset_score_lookup,
-        flow_lmdb_enabled: Ferricstore.Flow.LMDB.enabled?(),
         flow_lmdb_path: Ferricstore.Flow.LMDB.path(state.shard_data_path)
       }
 

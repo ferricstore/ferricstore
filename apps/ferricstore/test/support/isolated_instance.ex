@@ -49,6 +49,15 @@ defmodule Ferricstore.Test.IsolatedInstance do
     # Ensure data dir layout (ETS tables created by Shard.init)
     Ferricstore.DataDir.ensure_layout!(tmp_dir, shard_count)
 
+    for i <- 0..(shard_count - 1) do
+      {:ok, _pid} =
+        Ferricstore.Flow.LMDBWriter.start_link(
+          shard_index: i,
+          data_dir: tmp_dir,
+          instance_ctx: ctx
+        )
+    end
+
     # Custom instance shards are local/direct; only the default application
     # instance owns Raft.
     for i <- 0..(shard_count - 1) do
@@ -100,6 +109,22 @@ defmodule Ferricstore.Test.IsolatedInstance do
       name = elem(ctx.shard_names, i)
 
       case Process.whereis(name) do
+        nil ->
+          :ok
+
+        pid ->
+          try do
+            GenServer.stop(pid, :normal, 5000)
+          catch
+            :exit, _ -> :ok
+          end
+      end
+    end
+
+    Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+    for i <- 0..(ctx.shard_count - 1) do
+      case Process.whereis(Ferricstore.Flow.LMDBWriter.name(ctx.name, i)) do
         nil ->
           :ok
 

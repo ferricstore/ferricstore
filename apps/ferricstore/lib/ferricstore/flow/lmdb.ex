@@ -5,9 +5,7 @@ defmodule Ferricstore.Flow.LMDB do
 
   @default_map_size 64 * 1024 * 1024 * 1024
 
-  def enabled? do
-    mode() != :off
-  end
+  def enabled?, do: true
 
   def write_through? do
     mode() == :write_through
@@ -20,15 +18,10 @@ defmodule Ferricstore.Flow.LMDB do
   def mode do
     configured = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
-    cond do
-      configured != nil ->
-        normalize_mode(configured)
-
-      Application.get_env(:ferricstore, :flow_lmdb_enabled, false) in [true, "true", "1"] ->
-        :mirror
-
-      true ->
-        :off
+    if configured != nil do
+      normalize_mode(configured)
+    else
+      :mirror
     end
   end
 
@@ -108,6 +101,41 @@ defmodule Ferricstore.Flow.LMDB do
 
   def terminal_by_state_key_key(state_key) when is_binary(state_key) do
     "flow-terminal-by-state:" <> state_key
+  end
+
+  def query_index_prefix(index_key) when is_binary(index_key) do
+    "flow-query-index:" <> index_key <> <<0>>
+  end
+
+  def query_index_key(index_key, id, updated_at_ms)
+      when is_binary(index_key) and is_binary(id) and is_integer(updated_at_ms) do
+    query_index_prefix(index_key) <> pad_u64(updated_at_ms) <> <<0>> <> id
+  end
+
+  def query_index_key(index_key, id, updated_at_ms)
+      when is_binary(index_key) and is_binary(id) and is_float(updated_at_ms) do
+    query_index_key(index_key, id, trunc(updated_at_ms))
+  end
+
+  def query_index_key(index_key, id, updated_at_ms)
+      when is_binary(index_key) and is_binary(id) and is_binary(updated_at_ms) do
+    score =
+      case Integer.parse(updated_at_ms) do
+        {int, ""} ->
+          int
+
+        _ ->
+          case Float.parse(updated_at_ms) do
+            {float, _rest} -> trunc(float)
+            :error -> 0
+          end
+      end
+
+    query_index_key(index_key, id, score)
+  end
+
+  def encode_query_index_value(id, updated_at_ms, expire_at_ms \\ 0) do
+    :erlang.term_to_binary({id, normalize_ms(updated_at_ms), expire_at_ms})
   end
 
   def delete_state_artifacts(path, state_key) when is_binary(path) and is_binary(state_key) do
@@ -257,6 +285,23 @@ defmodule Ferricstore.Flow.LMDB do
     _ -> :error
   end
 
+  def decode_query_index_value(blob) when is_binary(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
+      {id, updated_at_ms, expire_at_ms}
+      when is_binary(id) and is_integer(updated_at_ms) and is_integer(expire_at_ms) ->
+        {:ok, {id, updated_at_ms, expire_at_ms}}
+
+      {id, updated_at_ms}
+      when is_binary(id) and is_integer(updated_at_ms) ->
+        {:ok, {id, updated_at_ms, 0}}
+
+      _ ->
+        :error
+    end
+  rescue
+    _ -> :error
+  end
+
   def terminal_index_count_key(blob) when is_binary(blob) do
     case :erlang.binary_to_term(blob, [:safe]) do
       {_id, _updated_at_ms, _expire_at_ms, _state_key, count_key} when is_binary(count_key) ->
@@ -269,11 +314,13 @@ defmodule Ferricstore.Flow.LMDB do
     _ -> :missing
   end
 
-  defp normalize_mode(value) when value in [:off, :mirror, :write_through], do: value
-  defp normalize_mode(value) when value in [false, "false", "0", "off"], do: :off
+  defp normalize_mode(:off), do: :mirror
+  defp normalize_mode(:write_through), do: :write_through
+  defp normalize_mode(:mirror), do: :mirror
+  defp normalize_mode(value) when value in [false, "false", "0", "off"], do: :mirror
   defp normalize_mode(value) when value in [true, "true", "1", "mirror"], do: :mirror
   defp normalize_mode(value) when value in ["write_through", "write-through"], do: :write_through
-  defp normalize_mode(_value), do: :off
+  defp normalize_mode(_value), do: :mirror
 
   defp expired_terminal_sweep_ops(path, entries, now_ms) do
     Enum.reduce_while(entries, {[], %{}, 0}, fn {expire_key, expire_value},
@@ -411,4 +458,22 @@ defmodule Ferricstore.Flow.LMDB do
     |> Integer.to_string()
     |> String.pad_leading(20, "0")
   end
+
+  defp normalize_ms(value) when is_integer(value), do: value
+  defp normalize_ms(value) when is_float(value), do: trunc(value)
+
+  defp normalize_ms(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} ->
+        int
+
+      _ ->
+        case Float.parse(value) do
+          {float, _rest} -> trunc(float)
+          :error -> 0
+        end
+    end
+  end
+
+  defp normalize_ms(_value), do: 0
 end

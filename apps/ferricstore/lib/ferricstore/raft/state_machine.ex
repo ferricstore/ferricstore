@@ -185,8 +185,6 @@ defmodule Ferricstore.Raft.StateMachine do
             ZSetIndex.table_names(Map.get(config, :instance_name, :default), config.shard_index),
             1
           ),
-      flow_lmdb_enabled:
-        Map.get_lazy(config, :flow_lmdb_enabled, fn -> Ferricstore.Flow.LMDB.enabled?() end),
       flow_lmdb_path:
         Map.get_lazy(config, :flow_lmdb_path, fn ->
           Ferricstore.Flow.LMDB.path(config.shard_data_path)
@@ -1356,13 +1354,12 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_lmdb_replay_safe?(state, instance_ctx, release_index) do
-    not flow_lmdb_enabled?(state) or
-      Ferricstore.Flow.LMDBWriter.durable?(
-        instance_ctx,
-        state.shard_index,
-        state.shard_data_path,
-        release_index
-      )
+    Ferricstore.Flow.LMDBWriter.durable?(
+      instance_ctx,
+      state.shard_index,
+      state.shard_data_path,
+      release_index
+    )
   end
 
   defp request_replay_safe_indexes(
@@ -5115,6 +5112,9 @@ defmodule Ferricstore.Raft.StateMachine do
       maybe_queue_terminal_lmdb_index_delete(state, record)
     end)
 
+    plans
+    |> Enum.each(fn {record, _next} -> queue_lmdb_metadata_index_deletes(state, record) end)
+
     state_deletes =
       Enum.map(plans, fn {record, _next} ->
         partition_key = Map.get(record, :partition_key)
@@ -5248,7 +5248,7 @@ defmodule Ferricstore.Raft.StateMachine do
           acc
         end
 
-      flow_add_metadata_index_entries(acc, record, updated_score)
+      acc
     end)
     |> Enum.each(fn {key, member_score_pairs} ->
       flow_zset_put_many(state, key, Enum.reverse(member_score_pairs))
@@ -5469,9 +5469,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_read_lmdb_record(state, key) do
     cond do
-      not flow_lmdb_enabled?(state) ->
-        :miss
-
       Map.has_key?(Process.get(:sm_pending_lmdb_values, %{}), key) ->
         flow_decode_pending_lmdb_record(Process.get(:sm_pending_lmdb_values, %{}), key)
 
@@ -5761,25 +5758,12 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_metadata_index_put(state, record, score) do
-    record
-    |> flow_metadata_index_entries(score)
-    |> Enum.each(fn {key, id, score} -> flow_zset_put(state, key, id, score) end)
+  defp flow_metadata_index_put(_state, _record, _score), do: :ok
 
-    :ok
-  end
-
-  defp flow_add_metadata_index_entries(acc, record, score) do
-    record
-    |> flow_metadata_index_entries(score)
-    |> Enum.reduce(acc, fn {key, id, score}, acc ->
-      flow_claim_add_zset_entry(acc, key, id, score)
-    end)
-  end
-
-  defp flow_metadata_index_entries(record, score) do
+  defp flow_metadata_index_entries(record) do
     partition_key = Map.get(record, :partition_key)
     id = Map.get(record, :id)
+    score = Map.get(record, :updated_at_ms, 0)
 
     []
     |> flow_metadata_index_entry(
@@ -5841,15 +5825,8 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_metadata_index_delete(state, record) do
-    record
-    |> flow_metadata_index_entries("0.0")
-    |> Enum.each(fn {key, id, _score} ->
-      flow_zset_delete(state, key, id)
-    end)
-
-    :ok
-  end
+  defp flow_metadata_index_delete(state, record),
+    do: queue_lmdb_metadata_index_deletes(state, record)
 
   defp flow_running_index_delete(state, %{state: "running", id: id, type: type} = record) do
     partition_key = Map.get(record, :partition_key)
@@ -6204,6 +6181,7 @@ defmodule Ferricstore.Raft.StateMachine do
         raw_put_cold(state, key, value, expire_at_ms)
         queue_pending_lmdb_mirror_put(key, value, expire_at_ms)
         maybe_queue_terminal_lmdb_index_put(state, key, value, expire_at_ms)
+        maybe_queue_active_lmdb_metadata_index_put(key, value, expire_at_ms)
 
       true ->
         flow_put(state, key, value, expire_at_ms)
@@ -6222,6 +6200,7 @@ defmodule Ferricstore.Raft.StateMachine do
         raw_put_cold(state, key, value, expire_at_ms)
         queue_pending_lmdb_mirror_put(key, value, expire_at_ms)
         maybe_queue_terminal_lmdb_index_put(state, key, value, expire_at_ms)
+        maybe_queue_active_lmdb_metadata_index_put(key, value, expire_at_ms)
 
       true ->
         flow_put(state, key, value, expire_at_ms)
@@ -6935,14 +6914,9 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_lmdb_enabled?(%{flow_lmdb_enabled: true}), do: true
-  defp flow_lmdb_enabled?(_state), do: false
+  defp flow_lmdb_write_through?(_state), do: Ferricstore.Flow.LMDB.write_through?()
 
-  defp flow_lmdb_write_through?(state),
-    do: flow_lmdb_enabled?(state) and Ferricstore.Flow.LMDB.write_through?()
-
-  defp flow_lmdb_mirror?(state),
-    do: flow_lmdb_enabled?(state) and Ferricstore.Flow.LMDB.mirror?()
+  defp flow_lmdb_mirror?(_state), do: Ferricstore.Flow.LMDB.mirror?()
 
   defp flow_lmdb_record_path(state), do: Map.fetch!(state, :flow_lmdb_path)
 
@@ -7010,39 +6984,37 @@ defmodule Ferricstore.Raft.StateMachine do
          Map.fetch!(record, :version)}
       )
 
-      queue_terminal_lmdb_metadata_index_puts(record, updated_at_ms, expire_at_ms)
+      queue_lmdb_metadata_index_puts(record, expire_at_ms)
     else
       _ -> :ok
     end
   end
 
-  defp queue_terminal_lmdb_metadata_index_puts(record, updated_at_ms, expire_at_ms) do
-    record
-    |> flow_metadata_index_entries(Float.to_string(updated_at_ms * 1.0))
-    |> Enum.each(fn {index_key, id, _score} ->
-      terminal_key = Ferricstore.Flow.LMDB.terminal_index_key(index_key, id, updated_at_ms)
-      count_key = Ferricstore.Flow.LMDB.terminal_count_key(index_key)
+  defp maybe_queue_active_lmdb_metadata_index_put(_state_key, encoded_record, expire_at_ms) do
+    with {:ok, record} <- flow_decode_record_blob(encoded_record),
+         false <- Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+      queue_lmdb_metadata_index_puts(record, expire_at_ms)
+    else
+      _ -> :ok
+    end
+  end
 
-      queue_pending_lmdb_mirror_terminal_put(
-        terminal_key,
-        Ferricstore.Flow.LMDB.encode_terminal_index_value(
-          id,
-          updated_at_ms,
-          expire_at_ms,
-          nil,
-          count_key
-        ),
-        nil,
-        count_key
+  defp queue_lmdb_metadata_index_puts(record, expire_at_ms) do
+    record
+    |> flow_metadata_index_entries()
+    |> Enum.each(fn {index_key, id, score} ->
+      index_key
+      |> Ferricstore.Flow.LMDB.query_index_key(id, score)
+      |> queue_pending_lmdb_mirror_query_put(
+        Ferricstore.Flow.LMDB.encode_query_index_value(id, score, expire_at_ms)
       )
     end)
 
     :ok
   end
 
-  defp maybe_queue_terminal_lmdb_index_delete(state, record) do
-    if flow_lmdb_mirror?(state) and
-         Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+  defp maybe_queue_terminal_lmdb_index_delete(_state, record) do
+    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
       partition_key = Map.get(record, :partition_key)
       state_index_key = FlowKeys.state_index_key(record.type, record.state, partition_key)
       updated_at_ms = Map.get(record, :updated_at_ms, 0)
@@ -7053,25 +7025,38 @@ defmodule Ferricstore.Raft.StateMachine do
         FlowKeys.state_key(record.id, Map.get(record, :partition_key)),
         Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
       )
-
-      queue_terminal_lmdb_metadata_index_deletes(record, updated_at_ms)
     end
 
     :ok
   end
 
-  defp queue_terminal_lmdb_metadata_index_deletes(record, updated_at_ms) do
+  defp queue_lmdb_metadata_index_deletes(_state, record) do
     record
-    |> flow_metadata_index_entries(Float.to_string(updated_at_ms * 1.0))
-    |> Enum.each(fn {index_key, id, _score} ->
+    |> flow_metadata_index_entries()
+    |> Enum.each(fn {index_key, id, score} ->
       index_key
-      |> Ferricstore.Flow.LMDB.terminal_index_key(id, updated_at_ms)
-      |> queue_pending_lmdb_mirror_terminal_delete(
-        nil,
-        Ferricstore.Flow.LMDB.terminal_count_key(index_key)
-      )
+      |> Ferricstore.Flow.LMDB.query_index_key(id, score)
+      |> queue_pending_lmdb_mirror_query_delete()
     end)
 
+    :ok
+  end
+
+  defp queue_pending_lmdb_mirror_query_put(query_key, value) do
+    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
+    Process.put(:sm_pending_lmdb_mirror_ops, [{:query_put, query_key, value} | pending])
+    :ok
+  end
+
+  defp queue_pending_lmdb_mirror_query_delete(query_key) do
+    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
+    Process.put(:sm_pending_lmdb_mirror_ops, [{:query_delete, query_key} | pending])
+    :ok
+  end
+
+  defp queue_pending_lmdb_mirror_delete(key) do
+    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
+    Process.put(:sm_pending_lmdb_mirror_ops, [{:delete, key} | pending])
     :ok
   end
 
@@ -7107,7 +7092,12 @@ defmodule Ferricstore.Raft.StateMachine do
         :ok
 
       pending when is_list(pending) ->
-        Ferricstore.Flow.LMDBWriter.enqueue(state.shard_index, Enum.reverse(pending), after_flush)
+        Ferricstore.Flow.LMDBWriter.enqueue(
+          state.instance_name,
+          state.shard_index,
+          Enum.reverse(pending),
+          after_flush
+        )
 
       _ ->
         :ok
@@ -7240,9 +7230,26 @@ defmodule Ferricstore.Raft.StateMachine do
           track_keydir_binary_remove(state, key)
           :ets.delete(state.ets, key)
           queue_pending_delete(key, prob_path)
+          maybe_queue_lmdb_state_delete(state, key)
           :ok
       end
     end
+  end
+
+  defp maybe_queue_lmdb_state_delete(state, key) when is_binary(key) do
+    if flow_state_key?(key) do
+      :ets.insert(state.ets, {key, nil, 0, :flow_state_deleted, :deleted, 0, 0})
+      queue_pending_lmdb_mirror_delete(key)
+      queue_pending_lmdb_mirror_after_flush({:delete_flow_tombstone, state.ets, key})
+    end
+
+    :ok
+  end
+
+  defp maybe_queue_lmdb_state_delete(_state, _key), do: :ok
+
+  defp flow_state_key?(key) when is_binary(key) do
+    String.starts_with?(key, "flow:{flow") and String.contains?(key, "}:state:")
   end
 
   # Flushes the BitcaskWriter if the key has a pending background write.

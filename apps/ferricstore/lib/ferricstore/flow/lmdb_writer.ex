@@ -12,13 +12,30 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   def start_link(opts) do
     shard_index = Keyword.fetch!(opts, :shard_index)
-    GenServer.start_link(__MODULE__, opts, name: name(shard_index))
+    instance_name = instance_name_from_opts(opts)
+    GenServer.start_link(__MODULE__, opts, name: name(instance_name, shard_index))
   end
 
-  def enqueue(shard_index, ops, after_flush \\ []) when is_list(ops) and is_list(after_flush) do
+  def enqueue(shard_index, ops) when is_integer(shard_index) and is_list(ops) do
+    enqueue(:default, shard_index, ops, [])
+  end
+
+  def enqueue(shard_index, ops, after_flush)
+      when is_integer(shard_index) and is_list(ops) and is_list(after_flush) do
+    enqueue(:default, shard_index, ops, after_flush)
+  end
+
+  def enqueue(instance_name, shard_index, ops)
+      when is_atom(instance_name) and is_integer(shard_index) and is_list(ops) do
+    enqueue(instance_name, shard_index, ops, [])
+  end
+
+  def enqueue(instance_name, shard_index, ops, after_flush)
+      when is_atom(instance_name) and is_integer(shard_index) and is_list(ops) and
+             is_list(after_flush) do
     try do
-      if Ferricstore.Flow.LMDB.mirror?() and ops != [] do
-        GenServer.cast(name(shard_index), {:enqueue, ops, after_flush})
+      if ops != [] do
+        GenServer.cast(name(instance_name, shard_index), {:enqueue, ops, after_flush})
       end
 
       :ok
@@ -52,13 +69,14 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   def request(instance_ctx, shard_index, shard_data_path, index)
       when is_integer(index) and index >= 0 do
+    instance_name = instance_name_from_ctx(instance_ctx)
     publish_requested(instance_ctx, shard_index, index)
 
     cond do
       durable?(instance_ctx, shard_index, shard_data_path, index) ->
         :durable
 
-      is_pid(writer_pid = Process.whereis(name(shard_index))) ->
+      is_pid(writer_pid = Process.whereis(name(instance_name, shard_index))) ->
         GenServer.cast(writer_pid, {:persist_replay_safe, index})
         :requested
 
@@ -72,11 +90,33 @@ defmodule Ferricstore.Flow.LMDBWriter do
     :exit, reason -> {:error, reason}
   end
 
-  def flush_all(shard_count, timeout \\ 30_000) do
-    0..(shard_count - 1)
-    |> Enum.reduce(:ok, fn shard_index, acc ->
+  def flush_all(shard_count) when is_integer(shard_count) and shard_count >= 0 do
+    flush_all(:default, shard_count, 30_000)
+  end
+
+  def flush_all(shard_count, timeout)
+      when is_integer(shard_count) and shard_count >= 0 and is_integer(timeout) do
+    flush_all(:default, shard_count, timeout)
+  end
+
+  def flush_all(instance_name, shard_count)
+      when is_atom(instance_name) and is_integer(shard_count) and shard_count >= 0 do
+    flush_all(instance_name, shard_count, 30_000)
+  end
+
+  def flush_all(instance_name, shard_count, timeout)
+      when is_atom(instance_name) and is_integer(shard_count) and shard_count >= 0 and
+             is_integer(timeout) do
+    shard_indexes =
+      if shard_count == 0 do
+        []
+      else
+        0..(shard_count - 1)
+      end
+
+    Enum.reduce(shard_indexes, :ok, fn shard_index, acc ->
       try do
-        case GenServer.call(name(shard_index), :flush, timeout) do
+        case GenServer.call(name(instance_name, shard_index), :flush, timeout) do
           :ok -> acc
           {:error, _reason} = error -> error
         end
@@ -88,12 +128,19 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   def name(shard_index), do: :"Ferricstore.Flow.LMDBWriter.#{shard_index}"
 
+  def name(:default, shard_index), do: name(shard_index)
+
+  def name(instance_name, shard_index) do
+    :"Ferricstore.Flow.LMDBWriter.#{instance_name}.#{shard_index}"
+  end
+
   @impl true
   def init(opts) do
     shard_index = Keyword.fetch!(opts, :shard_index)
     data_dir = Keyword.fetch!(opts, :data_dir)
 
     state = %{
+      instance_name: instance_name_from_opts(opts),
       shard_index: shard_index,
       shard_data_path: Ferricstore.DataDir.shard_data_path(data_dir, shard_index),
       path:
@@ -123,6 +170,17 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
     {:ok, state}
   end
+
+  defp instance_name_from_opts(opts) do
+    case {Keyword.get(opts, :instance_name), Keyword.get(opts, :instance_ctx)} do
+      {name, _ctx} when is_atom(name) and not is_nil(name) -> name
+      {_name, %{name: name}} when is_atom(name) and not is_nil(name) -> name
+      _ -> :default
+    end
+  end
+
+  defp instance_name_from_ctx(%{name: name}) when is_atom(name) and not is_nil(name), do: name
+  defp instance_name_from_ctx(_ctx), do: :default
 
   @impl true
   def handle_cast({:enqueue, ops, after_flush}, state) do
@@ -282,6 +340,15 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
       {:ok, acc}
     end
+  end
+
+  defp expand_op(_path, {:query_put, query_key, value}, acc)
+       when is_binary(query_key) and is_binary(value) do
+    {:ok, prepend_ops(acc, [{:put, query_key, value}])}
+  end
+
+  defp expand_op(_path, {:query_delete, query_key}, acc) when is_binary(query_key) do
+    {:ok, prepend_ops(acc, [{:delete, query_key}])}
   end
 
   defp expand_op(path, {:terminal_delete, terminal_key, state_key, count_key}, acc)
@@ -448,6 +515,15 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
 
     :ok
+  end
+
+  defp apply_after_flush({:delete_flow_tombstone, ets, key}) do
+    case :ets.lookup(ets, key) do
+      [{^key, nil, 0, :flow_state_deleted, :deleted, 0, 0}] -> :ets.delete(ets, key)
+      _ -> :ok
+    end
+  rescue
+    ArgumentError -> :ok
   end
 
   defp apply_after_flush(_action), do: :ok

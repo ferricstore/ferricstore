@@ -189,17 +189,13 @@ defmodule Ferricstore.Application do
       end)
 
     flow_lmdb_writer_children =
-      if Ferricstore.Flow.LMDB.mirror?() do
-        Enum.map(0..(shard_count - 1), fn i ->
-          Supervisor.child_spec(
-            {Ferricstore.Flow.LMDBWriter,
-             shard_index: i, data_dir: data_dir, instance_ctx: default_ctx},
-            id: :"flow_lmdb_writer_#{i}"
-          )
-        end)
-      else
-        []
-      end
+      Enum.map(0..(shard_count - 1), fn i ->
+        Supervisor.child_spec(
+          {Ferricstore.Flow.LMDBWriter,
+           shard_index: i, data_dir: data_dir, instance_ctx: default_ctx},
+          id: :"flow_lmdb_writer_#{i}"
+        )
+      end)
 
     # RMW fallback coordinator — one per shard. Handles contended inline RMW
     # commands that lost the per-key latch.
@@ -415,14 +411,12 @@ defmodule Ferricstore.Application do
   end
 
   defp shutdown_flush_flow_lmdb_writers(shard_count) do
-    if Ferricstore.Flow.LMDB.mirror?() do
-      case Ferricstore.Flow.LMDBWriter.flush_all(shard_count) do
-        :ok ->
-          Logger.info("Shutdown: Flow LMDB writers flushed")
+    case Ferricstore.Flow.LMDBWriter.flush_all(shard_count) do
+      :ok ->
+        Logger.info("Shutdown: Flow LMDB writers flushed")
 
-        {:error, reason} ->
-          Logger.warning("Shutdown: Flow LMDB writer flush incomplete: #{inspect(reason)}")
-      end
+      {:error, reason} ->
+        Logger.warning("Shutdown: Flow LMDB writer flush incomplete: #{inspect(reason)}")
     end
   catch
     :exit, reason ->

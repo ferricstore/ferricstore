@@ -24,10 +24,8 @@ create_many_batch = System.get_env("FLOW_100K_CREATE_MANY_BATCH", "100") |> Stri
 transition_many_batch =
   System.get_env("FLOW_100K_TRANSITION_MANY_BATCH", "100") |> String.to_integer()
 
-flow_lmdb_enabled = System.get_env("FLOW_LMDB", "0") in ["1", "true", "TRUE"]
-
-flow_lmdb_mode =
-  System.get_env("FLOW_LMDB_MODE", if(flow_lmdb_enabled, do: "mirror", else: "off"))
+flow_lmdb_enabled = true
+flow_lmdb_mode = System.get_env("FLOW_LMDB_MODE", "mirror")
 
 claim_limits =
   System.get_env("FLOW_100K_CLAIM_LIMITS", "10,100")
@@ -44,7 +42,6 @@ Application.put_env(:ferricstore, :port, 0)
 Application.put_env(:ferricstore, :health_port, 0)
 Application.put_env(:ferricstore, :shard_count, shard_count)
 Application.put_env(:ferricstore, :hot_cache_max_value_size, 512)
-Application.put_env(:ferricstore, :flow_lmdb_enabled, flow_lmdb_enabled)
 Application.put_env(:ferricstore, :flow_lmdb_mode, flow_lmdb_mode)
 
 {:ok, _} = Application.ensure_all_started(:ferricstore)

@@ -133,13 +133,22 @@ defmodule Ferricstore.FlowTest do
     assert flow.root_flow_id == root
     assert flow.correlation_id == correlation
 
-    assert {:ok, [^id]} =
+    assert {:ok, [%{id: ^id}]} =
+             FerricStore.flow_by_parent(parent, partition_key: partition, count: 10)
+
+    assert {:ok, []} =
              FerricStore.zrange(Ferricstore.Flow.Keys.parent_index_key(parent, partition), 0, 10)
 
-    assert {:ok, [^id]} =
+    assert {:ok, [%{id: ^id}]} =
+             FerricStore.flow_by_root(root, partition_key: partition, count: 10)
+
+    assert {:ok, []} =
              FerricStore.zrange(Ferricstore.Flow.Keys.root_index_key(root, partition), 0, 10)
 
-    assert {:ok, [^id]} =
+    assert {:ok, [%{id: ^id}]} =
+             FerricStore.flow_by_correlation(correlation, partition_key: partition, count: 10)
+
+    assert {:ok, []} =
              FerricStore.zrange(
                Ferricstore.Flow.Keys.correlation_index_key(correlation, partition),
                0,
@@ -225,11 +234,24 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, [%{id: ^child_a}, %{id: ^child_b}]} =
              FerricStore.flow_by_parent(root, partition_key: partition, count: 10)
 
+    assert {:ok, []} =
+             FerricStore.zrange(Ferricstore.Flow.Keys.parent_index_key(root, partition), 0, 10)
+
     assert {:ok, [%{id: ^root}, %{id: ^child_a}, %{id: ^child_b}, %{id: ^grandchild}]} =
              FerricStore.flow_by_root(root, partition_key: partition, count: 10)
 
+    assert {:ok, []} =
+             FerricStore.zrange(Ferricstore.Flow.Keys.root_index_key(root, partition), 0, 10)
+
     assert {:ok, [%{id: ^root}, %{id: ^child_a}]} =
              FerricStore.flow_by_correlation(correlation, partition_key: partition, count: 2)
+
+    assert {:ok, []} =
+             FerricStore.zrange(
+               Ferricstore.Flow.Keys.correlation_index_key(correlation, partition),
+               0,
+               10
+             )
   end
 
   test "flow_create_many creates one-partition batch atomically" do
