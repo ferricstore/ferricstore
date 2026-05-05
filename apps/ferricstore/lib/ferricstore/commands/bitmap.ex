@@ -590,22 +590,48 @@ defmodule Ferricstore.Commands.Bitmap do
          {:ok, start_bit, end_bit} <- resolve_range(start_idx, end_idx, total_bits) do
       start_byte = div(start_bit, 8)
       end_byte = div(end_bit, 8)
-
-      case Ops.getrange(store, key, start_byte, end_byte) do
-        slice when is_binary(slice) ->
-          local_start_bit = start_bit - start_byte * 8
-          local_end_bit = end_bit - start_byte * 8
-          {:ok, bitcount_bit_range(slice, local_start_bit, local_end_bit)}
-
-        nil ->
-          {:ok, 0}
-
-        _ ->
-          :unknown
-      end
+      bitcount_bit_range_chunks(store, key, start_byte, end_byte, start_bit, end_bit, 0)
     else
       :empty -> {:ok, 0}
       _ -> :unknown
+    end
+  end
+
+  defp bitcount_bit_range_chunks(
+         _store,
+         _key,
+         offset,
+         end_byte,
+         _start_bit,
+         _end_bit,
+         acc
+       )
+       when offset > end_byte,
+       do: {:ok, acc}
+
+  defp bitcount_bit_range_chunks(store, key, offset, end_byte, start_bit, end_bit, acc) do
+    last = min(offset + @bitcount_chunk_bytes - 1, end_byte)
+    expected_size = last - offset + 1
+
+    case Ops.getrange(store, key, offset, last) do
+      slice when is_binary(slice) and byte_size(slice) == expected_size ->
+        chunk_start_bit = offset * 8
+        local_start_bit = max(start_bit - chunk_start_bit, 0)
+        local_end_bit = min(end_bit - chunk_start_bit, byte_size(slice) * 8 - 1)
+        count = bitcount_bit_range(slice, local_start_bit, local_end_bit)
+
+        bitcount_bit_range_chunks(
+          store,
+          key,
+          last + 1,
+          end_byte,
+          start_bit,
+          end_bit,
+          acc + count
+        )
+
+      _missing_or_short ->
+        :unknown
     end
   end
 

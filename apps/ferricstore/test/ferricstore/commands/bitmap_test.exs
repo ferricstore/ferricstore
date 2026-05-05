@@ -393,6 +393,36 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert_received {:range_reader_called, 1, 2}
     end
 
+    test "large cold bit range counts in bounded chunks" do
+      test_pid = self()
+
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 70_000 end,
+        getrange: fn
+          "cold", 0, 65_535 ->
+            send(test_pid, {:range_reader_called, 0, 65_535})
+            :binary.copy(<<0x00>>, 65_536)
+
+          "cold", 65_536, 69_999 ->
+            send(test_pid, {:range_reader_called, 65_536, 69_999})
+            <<0b1111_0000, :binary.copy(<<0x00>>, 4_463)::binary>>
+
+          "cold", 0, 69_999 ->
+            flunk("BITCOUNT BIT should not read the full cold bit range in one slice")
+        end,
+        get: fn _key -> flunk("BITCOUNT BIT should not load the full cold value") end
+      }
+
+      last_bit = 70_000 * 8 - 1
+
+      assert 4 ==
+               Bitmap.handle("BITCOUNT", ["cold", "0", Integer.to_string(last_bit), "BIT"], store)
+
+      assert_received {:range_reader_called, 0, 65_535}
+      assert_received {:range_reader_called, 65_536, 69_999}
+    end
+
     test "reversed range (start > end) returns 0" do
       store = MockStore.make(%{"mykey" => {<<0xFF, 0xFF>>, 0}})
       assert 0 == Bitmap.handle("BITCOUNT", ["mykey", "1", "0"], store)
