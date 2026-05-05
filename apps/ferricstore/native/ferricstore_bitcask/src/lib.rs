@@ -687,7 +687,7 @@ fn read_value_into_crc<R: std::io::Read>(
 }
 
 fn scan_tombstones_from_path(path: &std::path::Path) -> Result<Vec<TombstoneScanRecord>, String> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Read;
 
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let file_len = file.metadata().map_err(|e| e.to_string())?.len();
@@ -744,11 +744,21 @@ fn scan_tombstones_from_path(path: &std::path::Path) -> Result<Vec<TombstoneScan
                 ));
             }
 
-            reader
-                .seek(SeekFrom::Current(i64::from(value_size_raw)))
-                .map_err(|e| {
-                    format!("tombstone scan {path:?}:{offset}: failed to skip value: {e}")
-                })?;
+            read_value_into_crc(
+                &mut reader,
+                &mut hasher,
+                u64::from(value_size_raw),
+                &format!("tombstone scan {path:?}:{offset}"),
+            )?;
+
+            let actual_crc = hasher.finalize();
+
+            if actual_crc != stored_crc {
+                return Err(format!(
+                    "tombstone scan {path:?}:{offset}: CRC mismatch stored={stored_crc} actual={actual_crc}"
+                ));
+            }
+
             offset = next_offset;
         }
     }
@@ -2946,15 +2956,15 @@ mod audit_fix_tests {
     }
 
     #[test]
-    fn tombstone_scan_skips_corrupt_live_payload_after_tombstone() {
+    fn tombstone_scan_errors_on_corrupt_live_payload_after_tombstone() {
         use std::os::unix::fs::FileExt;
 
         let dir = tmp();
         let path = dir.path().join("00000000000000000001.log");
 
         let mut writer = log::LogWriter::open(&path, 1).unwrap();
-        let tombstone_offset = writer.write_tombstone(b"deleted").unwrap();
         let corrupt = writer.write(b"live", b"value", 0).unwrap();
+        writer.write_tombstone(b"deleted").unwrap();
         writer.sync().unwrap();
 
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -2962,10 +2972,8 @@ mod audit_fix_tests {
         file.write_at(b"X", corrupt_value_byte).unwrap();
         file.sync_data().unwrap();
 
-        let tombstones = scan_tombstones_from_path(&path).unwrap();
-        assert_eq!(tombstones.len(), 1);
-        assert_eq!(tombstones[0].key, b"deleted");
-        assert_eq!(tombstones[0].offset, tombstone_offset);
+        let err = scan_tombstones_from_path(&path).unwrap_err();
+        assert!(err.contains("CRC mismatch"));
     }
 
     #[test]

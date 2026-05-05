@@ -1615,6 +1615,61 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       end
     end
 
+    test "emits telemetry when raw-copy compaction hits a CRC mismatch" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      shard_path = Ferricstore.DataDir.shard_data_path(dir, 0)
+      source = Path.join(shard_path, "00000.log")
+      parent = self()
+      handler_id = "compaction-crc-mismatch-#{:erlang.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :bitcask, :compaction_crc_mismatch],
+        fn _event, measurements, metadata, _config ->
+          send(parent, {:compaction_crc_mismatch, measurements, metadata})
+        end,
+        nil
+      )
+
+      try do
+        key = "crc_raw_copy_live"
+        value = "value-before-corruption"
+
+        assert :ok = GenServer.call(pid, {:put, key, value, 0})
+        assert :ok = GenServer.call(pid, :flush)
+
+        keydir = :sys.get_state(pid).keydir
+        [{^key, _cached_value, 0, _lfu, 0, offset, value_size}] = :ets.lookup(keydir, key)
+
+        assert :ok = force_rotate_active_file(pid)
+
+        value_pos = offset + @header_size + byte_size(key)
+        {:ok, file} = :file.open(source, [:read, :write, :binary])
+
+        try do
+          assert {:ok, <<byte>>} = :file.pread(file, value_pos, 1)
+          assert :ok = :file.pwrite(file, value_pos, <<Bitwise.bxor(byte, 0xFF)>>)
+        after
+          :ok = :file.close(file)
+        end
+
+        assert {:error, {:compaction_failed, [{0, {:copy_failed, reason}}]}} =
+                 GenServer.call(pid, {:run_compaction, [0]})
+
+        assert value_size == byte_size(value)
+        assert inspect(reason) =~ "CRC mismatch"
+
+        assert_receive {:compaction_crc_mismatch, %{count: 1},
+                        %{shard_index: 0, file_id: 0, path: ^source, reason: reason_text}},
+                       500
+
+        assert reason_text =~ "CRC mismatch"
+      after
+        :telemetry.detach(handler_id)
+        cleanup_shard(pid, ctx, dir)
+      end
+    end
+
     test "groups compaction live entries in one keydir pass before per-file work" do
       source =
         Path.expand("../../../lib/ferricstore/store/shard.ex", __DIR__)

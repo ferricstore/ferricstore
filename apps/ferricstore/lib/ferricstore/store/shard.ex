@@ -903,6 +903,8 @@ defmodule Ferricstore.Store.Shard do
                   {written, dropped, reclaimed, compacted, skipped, [failure | failures]}
 
                 {:error, reason} ->
+                  maybe_emit_compaction_crc_mismatch(state, fid, source, dest, reason)
+
                   Logger.error(
                     "Shard #{state.index}: compaction copy_records failed for #{source}: #{inspect(reason)}"
                   )
@@ -1086,6 +1088,29 @@ defmodule Ferricstore.Store.Shard do
           {:reply, result, apply_direct_sm_state(state, new_sm_state)}
       end
     end
+  end
+
+  defp maybe_emit_compaction_crc_mismatch(state, fid, source, dest, reason) do
+    if compaction_crc_mismatch?(reason) do
+      :telemetry.execute(
+        [:ferricstore, :bitcask, :compaction_crc_mismatch],
+        %{count: 1},
+        %{
+          shard_index: state.index,
+          file_id: fid,
+          path: source,
+          dest: dest,
+          reason: inspect(reason)
+        }
+      )
+    end
+  end
+
+  defp compaction_crc_mismatch?(reason) do
+    reason
+    |> inspect()
+    |> String.downcase()
+    |> String.contains?("crc mismatch")
   end
 
   defp apply_direct_sm_state(state, sm_state) do
