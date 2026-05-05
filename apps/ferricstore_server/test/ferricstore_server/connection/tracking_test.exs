@@ -185,6 +185,41 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert :ets.lookup(:ferricstore_tracking, destination) == []
   end
 
+  test "zero-result no-op writes do not invalidate tracked keys" do
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+
+    commands = [
+      {"SETNX", ["tracking:noop:setnx", "v"], "tracking:noop:setnx"},
+      {"EXPIRE", ["tracking:noop:expire", "10"], "tracking:noop:expire"},
+      {"PEXPIRE", ["tracking:noop:pexpire", "10"], "tracking:noop:pexpire"},
+      {"EXPIREAT", ["tracking:noop:expireat", "10"], "tracking:noop:expireat"},
+      {"PEXPIREAT", ["tracking:noop:pexpireat", "10"], "tracking:noop:pexpireat"},
+      {"PERSIST", ["tracking:noop:persist"], "tracking:noop:persist"},
+      {"DEL", ["tracking:noop:del"], "tracking:noop:del"},
+      {"UNLINK", ["tracking:noop:unlink"], "tracking:noop:unlink"},
+      {"HSETNX", ["tracking:noop:hsetnx", "field", "v"], "tracking:noop:hsetnx"},
+      {"HDEL", ["tracking:noop:hdel", "field"], "tracking:noop:hdel"},
+      {"SADD", ["tracking:noop:sadd", "member"], "tracking:noop:sadd"},
+      {"SREM", ["tracking:noop:srem", "member"], "tracking:noop:srem"},
+      {"ZREM", ["tracking:noop:zrem", "member"], "tracking:noop:zrem"},
+      {"LREM", ["tracking:noop:lrem", "1", "member"], "tracking:noop:lrem"},
+      {"PFADD", ["tracking:noop:pfadd", "member"], "tracking:noop:pfadd"},
+      {"XDEL", ["tracking:noop:xdel", "1-0"], "tracking:noop:xdel"},
+      {"XTRIM", ["tracking:noop:xtrim", "MAXLEN", "10"], "tracking:noop:xtrim"}
+    ]
+
+    Enum.each(commands, fn {_cmd, _args, key} ->
+      ClientTracking.track_key(self(), key, tracking)
+    end)
+
+    Enum.each(commands, fn {cmd, args, key} ->
+      Tracking.maybe_notify_tracking(cmd, args, 0, %{tracking: tracking})
+
+      refute_received {:tracking_invalidation, _, _}
+      assert :ets.lookup(:ferricstore_tracking, key) == [{key, self()}]
+    end)
+  end
+
   test "COPY keyspace notification fires for destination only on mutation" do
     source = "tracking:keyspace:copy:src"
     destination = "tracking:keyspace:copy:dst"
@@ -267,5 +302,29 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert_received {:pubsub_message, "__keyspace@0__:" <> ^destination, "rename"}
     assert_received {:pubsub_message, "__keyevent@0__:rename", ^source}
     assert_received {:pubsub_message, "__keyevent@0__:rename", ^destination}
+  end
+
+  test "zero-result no-op writes do not fire keyspace notifications" do
+    Config.set("notify-keyspace-events", "KEA")
+
+    commands = [
+      {"SETNX", ["tracking:keyspace:noop:setnx", "v"]},
+      {"EXPIRE", ["tracking:keyspace:noop:expire", "10"]},
+      {"PEXPIRE", ["tracking:keyspace:noop:pexpire", "10"]},
+      {"EXPIREAT", ["tracking:keyspace:noop:expireat", "10"]},
+      {"PEXPIREAT", ["tracking:keyspace:noop:pexpireat", "10"]},
+      {"PERSIST", ["tracking:keyspace:noop:persist"]},
+      {"SADD", ["tracking:keyspace:noop:sadd", "member"]},
+      {"SREM", ["tracking:keyspace:noop:srem", "member"]},
+      {"HDEL", ["tracking:keyspace:noop:hdel", "field"]},
+      {"ZREM", ["tracking:keyspace:noop:zrem", "member"]},
+      {"LREM", ["tracking:keyspace:noop:lrem", "1", "member"]},
+      {"PFADD", ["tracking:keyspace:noop:pfadd", "member"]}
+    ]
+
+    Enum.each(commands, fn {cmd, args} ->
+      Tracking.maybe_notify_keyspace(cmd, args, 0)
+      refute_received {:pubsub_message, _, _}
+    end)
   end
 end

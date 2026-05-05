@@ -37,6 +37,21 @@ defmodule FerricstoreServer.Connection.Tracking do
   # O(1) MapSet lookups for hot-path classification.
   @write_cmds_set MapSet.new(@write_cmds)
 
+  # Commands where integer 0 means "no key was mutated". Keep this narrow:
+  # some Redis commands return 0 while still changing data (for example SETBIT
+  # returns the old bit), so only commands with count/conditional semantics go
+  # here.
+  @zero_result_noop_cmds ~w(SETNX MSETNX
+    DEL UNLINK
+    EXPIRE PEXPIRE EXPIREAT PEXPIREAT PERSIST
+    RENAMENX COPY
+    HSETNX HDEL
+    SADD SREM
+    ZREM
+    LREM
+    PFADD
+    XDEL XTRIM)
+
   # Maps command names to their keyspace notification event names.
   # Only fires on successful results (not errors).
   @keyspace_events %{
@@ -88,6 +103,8 @@ defmodule FerricstoreServer.Connection.Tracking do
 
   @doc false
   @spec maybe_notify_keyspace(binary(), [binary()], term()) :: :ok
+  def maybe_notify_keyspace(cmd, _args, 0) when cmd in @zero_result_noop_cmds, do: :ok
+
   def maybe_notify_keyspace(cmd, args, result) do
     case Map.get(@keyspace_events, cmd) do
       nil -> :ok
@@ -237,7 +254,7 @@ defmodule FerricstoreServer.Connection.Tracking do
   @doc false
   @spec maybe_notify_tracking(binary(), [binary()], term(), map()) :: :ok
   def maybe_notify_tracking(_cmd, _args, {:error, _}, _state), do: :ok
-  def maybe_notify_tracking(cmd, _args, 0, _state) when cmd in ~w(COPY MSETNX RENAMENX), do: :ok
+  def maybe_notify_tracking(cmd, _args, 0, _state) when cmd in @zero_result_noop_cmds, do: :ok
 
   def maybe_notify_tracking(cmd, args, _result, _state) do
     if MapSet.member?(@write_cmds_set, cmd) do
