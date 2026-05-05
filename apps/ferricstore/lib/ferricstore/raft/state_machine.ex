@@ -5672,18 +5672,14 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_due_put(state, %{next_run_at_ms: nil}), do: flow_ensure_due_type(state, nil)
+  defp flow_due_put(_state, %{next_run_at_ms: nil}), do: :ok
 
   defp flow_due_put(state, %{type: type, state: flow_state, priority: priority, id: id} = record) do
     partition_key = Map.get(record, :partition_key)
     due_key = FlowKeys.due_key(type, flow_state, priority, partition_key)
     score_str = Float.to_string(Map.fetch!(record, :next_run_at_ms) * 1.0)
-    compound_key = CompoundKey.zset_member(due_key, id)
 
-    with :ok <- flow_ensure_due_type(state, due_key),
-         :ok <- flow_put(state, compound_key, score_str, 0) do
-      flow_zset_put(state, due_key, id, score_str)
-    end
+    flow_zset_put(state, due_key, id, score_str)
   end
 
   defp flow_due_delete(
@@ -5718,23 +5714,13 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_zset_delete_from_key(state, due_key, id) do
-    compound_key = CompoundKey.zset_member(due_key, id)
-
-    with :ok <- flow_delete(state, compound_key) do
-      flow_zset_delete(state, due_key, id)
-    end
+    flow_zset_delete(state, due_key, id)
   end
 
   defp flow_zset_delete_members_from_key(_state, _due_key, []), do: :ok
 
   defp flow_zset_delete_members_from_key(state, due_key, ids) do
-    ids = Enum.uniq(ids)
-
-    Enum.each(ids, fn id ->
-      flow_delete(state, CompoundKey.zset_member(due_key, id))
-    end)
-
-    flow_zset_delete_many(state, due_key, ids)
+    flow_zset_delete_many(state, due_key, Enum.uniq(ids))
   end
 
   defp flow_zset_index_delete_grouped(state, key_ids) do
@@ -5848,46 +5834,17 @@ defmodule Ferricstore.Raft.StateMachine do
       partition_key = Map.get(record, :partition_key)
       FlowKeys.due_key(record.type, record.state, record.priority, partition_key)
     end)
-    |> Enum.reduce_while(:ok, fn {due_key, due_records}, :ok ->
+    |> Enum.each(fn {due_key, due_records} ->
       member_score_pairs =
         Enum.map(due_records, fn record ->
           score_str = Float.to_string(Map.fetch!(record, :next_run_at_ms) * 1.0)
           {record.id, score_str}
         end)
 
-      result =
-        with :ok <- flow_ensure_due_type(state, due_key),
-             :ok <- flow_put_zset_member_scores(state, due_key, member_score_pairs) do
-          flow_zset_put_many(state, due_key, member_score_pairs)
-        end
-
-      case result do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp flow_put_zset_member_scores(state, due_key, member_score_pairs) do
-    Enum.each(member_score_pairs, fn {id, score_str} ->
-      flow_put(state, CompoundKey.zset_member(due_key, id), score_str, 0)
+      flow_zset_put_many(state, due_key, member_score_pairs)
     end)
 
     :ok
-  end
-
-  defp flow_ensure_due_type(_state, nil), do: :ok
-
-  defp flow_ensure_due_type(state, due_key) do
-    type_key = CompoundKey.type_key(due_key)
-
-    case ets_lookup(state, type_key) do
-      {:hit, _value, _expire_at_ms} ->
-        :ok
-
-      :miss ->
-        flow_put(state, type_key, CompoundKey.encode_type(:zset), 0)
-    end
   end
 
   defp flow_ensure_due_index_ready(

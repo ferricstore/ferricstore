@@ -1,7 +1,7 @@
-# Targeted Flow tail-latency probe for create_many/retry/info.
+# Targeted Flow tail-latency probe for Flow hot commands.
 #
 # Run:
-#   MIX_ENV=bench FERRICSTORE_BUILD=1 FLOW_LMDB=1 FLOW_LMDB_MODE=mirror \
+#   MIX_ENV=bench FERRICSTORE_BUILD=1 FLOW_LMDB_MODE=mirror \
 #     FLOW_TAIL_BACKLOG=100000 FLOW_TAIL_ITER=400 mix run --no-start bench/flow_tail_probe.exs
 
 backlog = System.get_env("FLOW_TAIL_BACKLOG", "100000") |> String.to_integer()
@@ -10,10 +10,8 @@ shard_count = System.get_env("FLOW_TAIL_SHARDS", "4") |> String.to_integer()
 partition_count = System.get_env("FLOW_TAIL_PARTITIONS", "4") |> String.to_integer()
 seed_concurrency = System.get_env("FLOW_TAIL_SEED_CONCURRENCY", "64") |> String.to_integer()
 batch_size = System.get_env("FLOW_TAIL_BATCH", "100") |> String.to_integer()
-flow_lmdb_enabled = System.get_env("FLOW_LMDB", "1") in ["1", "true", "TRUE"]
-
-flow_lmdb_mode =
-  System.get_env("FLOW_LMDB_MODE", if(flow_lmdb_enabled, do: "mirror", else: "off"))
+top_count = System.get_env("FLOW_TAIL_TOP", "8") |> String.to_integer()
+flow_lmdb_mode = System.get_env("FLOW_LMDB_MODE", "mirror")
 
 release_cursor_interval = System.get_env("FLOW_TAIL_RELEASE_CURSOR_INTERVAL")
 
@@ -27,7 +25,6 @@ Application.put_env(:ferricstore, :port, 0)
 Application.put_env(:ferricstore, :health_port, 0)
 Application.put_env(:ferricstore, :shard_count, shard_count)
 Application.put_env(:ferricstore, :hot_cache_max_value_size, 512)
-Application.put_env(:ferricstore, :flow_lmdb_enabled, flow_lmdb_enabled)
 Application.put_env(:ferricstore, :flow_lmdb_mode, flow_lmdb_mode)
 
 if release_cursor_interval not in [nil, ""] do
@@ -49,7 +46,7 @@ defmodule FlowTailProbe do
     [:ferricstore, :batcher, :quorum_submit]
   ]
 
-  def run(backlog, iterations, partition_count, seed_concurrency, batch_size, data_dir) do
+  def run(backlog, iterations, partition_count, seed_concurrency, batch_size, top_count, data_dir) do
     :ets.new(:flow_tail_events, [:named_table, :public, :ordered_set])
     :ets.new(:flow_tail_samples, [:named_table, :public, :ordered_set])
     attach_telemetry()
@@ -71,9 +68,50 @@ defmodule FlowTailProbe do
     warm_info(prefix, active_type, partition_count)
     clear_events()
 
+    claim_type = type(prefix, "claim")
+
+    seed_claim_flows(
+      prefix,
+      claim_type,
+      iterations * batch_size,
+      partition_count,
+      seed_concurrency
+    )
+
+    probe("claim_due", iterations, top_count, fn i ->
+      {:ok, claimed} =
+        FerricStore.flow_claim_due(claim_type,
+          worker: "worker-claim",
+          lease_ms: 30_000,
+          limit: batch_size,
+          now_ms: 1_000,
+          partition_key: partition(prefix, i, partition_count)
+        )
+
+      claimed
+    end)
+
+    create_type = type(prefix, "create")
+
+    probe("create", iterations, top_count, fn i ->
+      flow_id = id(prefix, "create", i)
+
+      {:ok, flow} =
+        FerricStore.flow_create(flow_id,
+          type: create_type,
+          state: "queued",
+          payload_ref: "payload:" <> flow_id,
+          run_at_ms: 1_000,
+          now_ms: 1_000,
+          partition_key: partition(prefix, i, partition_count)
+        )
+
+      flow
+    end)
+
     create_many_type = type(prefix, "create_many")
 
-    probe("create_many", iterations, fn i ->
+    probe("create_many", iterations, top_count, fn i ->
       partition_key = partition(prefix, i, partition_count)
 
       items =
@@ -92,9 +130,93 @@ defmodule FlowTailProbe do
       flows
     end)
 
+    transition_ids = seed_transition_flows(prefix, iterations, partition_count)
+
+    probe("transition", iterations, top_count, fn i ->
+      {flow_id, partition_key} = Map.fetch!(transition_ids, i)
+
+      {:ok, flow} =
+        FerricStore.flow_transition(flow_id, "queued", "waiting",
+          fencing_token: 0,
+          run_at_ms: 2_000,
+          now_ms: 2_000,
+          partition_key: partition_key
+        )
+
+      flow
+    end)
+
+    transition_many_ids =
+      seed_transition_many_flows(prefix, iterations, batch_size, partition_count)
+
+    probe("transition_many", iterations, top_count, fn i ->
+      partition_key = partition(prefix, i, partition_count)
+      ids = Map.fetch!(transition_many_ids, i)
+
+      items =
+        Enum.map(ids, fn flow_id ->
+          %{id: flow_id, partition_key: partition_key, fencing_token: 0}
+        end)
+
+      {:ok, flows} =
+        FerricStore.flow_transition_many(partition_key, "queued", "waiting", items,
+          run_at_ms: 2_000,
+          now_ms: 2_000
+        )
+
+      flows
+    end)
+
+    complete_ids = seed_claimed_flows(prefix, "complete", iterations, partition_count)
+
+    probe("complete", iterations, top_count, fn i ->
+      {flow_id, partition_key, lease_token, fencing_token} = Map.fetch!(complete_ids, i)
+
+      {:ok, flow} =
+        FerricStore.flow_complete(flow_id, lease_token,
+          fencing_token: fencing_token,
+          result_ref: "result:" <> flow_id,
+          now_ms: 2_000,
+          partition_key: partition_key
+        )
+
+      flow
+    end)
+
+    fail_ids = seed_claimed_flows(prefix, "fail", iterations, partition_count)
+
+    probe("fail", iterations, top_count, fn i ->
+      {flow_id, partition_key, lease_token, fencing_token} = Map.fetch!(fail_ids, i)
+
+      {:ok, flow} =
+        FerricStore.flow_fail(flow_id, lease_token,
+          fencing_token: fencing_token,
+          error_ref: "error:" <> flow_id,
+          now_ms: 2_000,
+          partition_key: partition_key
+        )
+
+      flow
+    end)
+
+    cancel_ids = seed_transition_flows(prefix, iterations, partition_count, "cancel")
+
+    probe("cancel", iterations, top_count, fn i ->
+      {flow_id, partition_key} = Map.fetch!(cancel_ids, i)
+
+      {:ok, flow} =
+        FerricStore.flow_cancel(flow_id,
+          fencing_token: 0,
+          now_ms: 2_000,
+          partition_key: partition_key
+        )
+
+      flow
+    end)
+
     retry_ids = seed_retry_flows(prefix, iterations, partition_count)
 
-    probe("retry", iterations, fn i ->
+    probe("retry", iterations, top_count, fn i ->
       {flow_id, partition_key, lease_token, fencing_token} = Map.fetch!(retry_ids, i)
 
       {:ok, flow} =
@@ -108,7 +230,7 @@ defmodule FlowTailProbe do
       flow
     end)
 
-    probe("info", iterations, fn i ->
+    probe("info", iterations, top_count, fn i ->
       {:ok, info} =
         FerricStore.flow_info(active_type,
           partition_key: partition(prefix, i, partition_count)
@@ -135,7 +257,7 @@ defmodule FlowTailProbe do
     )
   end
 
-  defp probe(name, iterations, fun) do
+  defp probe(name, iterations, top_count, fun) do
     clear_events()
 
     samples =
@@ -151,7 +273,7 @@ defmodule FlowTailProbe do
       end
 
     print_stats(name, samples)
-    print_top_samples(name, samples, 8)
+    if top_count > 0, do: print_top_samples(name, samples, top_count)
     print_events_summary(name)
   end
 
@@ -262,11 +384,45 @@ defmodule FlowTailProbe do
     end)
   end
 
+  defp seed_claim_flows(prefix, flow_type, total, partition_count, seed_concurrency) do
+    timed("seed claim_due #{total}", fn ->
+      progress = :atomics.new(1, signed: false)
+
+      1..total
+      |> Task.async_stream(
+        fn i ->
+          {:ok, _} =
+            FerricStore.flow_create(id(prefix, "claim", i),
+              type: flow_type,
+              payload_ref: "payload:" <> id(prefix, "claim", i),
+              run_at_ms: 1_000,
+              now_ms: 1_000,
+              partition_key: partition(prefix, i, partition_count)
+            )
+
+          count = :atomics.add_get(progress, 1, 1)
+          if rem(count, 10_000) == 0, do: IO.puts("seeded claim #{count}/#{total}")
+        end,
+        max_concurrency: seed_concurrency,
+        ordered: false,
+        timeout: :infinity
+      )
+      |> Enum.each(fn
+        {:ok, _} -> :ok
+        {:exit, reason} -> raise "seed claim task failed: #{inspect(reason)}"
+      end)
+    end)
+  end
+
   defp seed_retry_flows(prefix, iterations, partition_count) do
-    flow_type = type(prefix, "retry")
+    seed_claimed_flows(prefix, "retry", iterations, partition_count)
+  end
+
+  defp seed_claimed_flows(prefix, group, iterations, partition_count) do
+    flow_type = type(prefix, group)
 
     for i <- 1..iterations, into: %{} do
-      flow_id = id(prefix, "retry", i)
+      flow_id = id(prefix, group, i)
       partition_key = partition(prefix, i, partition_count)
 
       {:ok, _} =
@@ -280,7 +436,7 @@ defmodule FlowTailProbe do
 
       {:ok, [claimed]} =
         FerricStore.flow_claim_due(flow_type,
-          worker: "worker-retry",
+          worker: "worker-" <> group,
           lease_ms: 30_000,
           limit: 1,
           now_ms: 1_000,
@@ -288,6 +444,52 @@ defmodule FlowTailProbe do
         )
 
       {i, {flow_id, partition_key, claimed.lease_token, claimed.fencing_token}}
+    end
+  end
+
+  defp seed_transition_flows(prefix, iterations, partition_count, group \\ "transition") do
+    flow_type = type(prefix, group)
+
+    for i <- 1..iterations, into: %{} do
+      flow_id = id(prefix, group, i)
+      partition_key = partition(prefix, i, partition_count)
+
+      {:ok, _} =
+        FerricStore.flow_create(flow_id,
+          type: flow_type,
+          payload_ref: "payload:" <> flow_id,
+          run_at_ms: 1_000,
+          now_ms: 1_000,
+          partition_key: partition_key
+        )
+
+      {i, {flow_id, partition_key}}
+    end
+  end
+
+  defp seed_transition_many_flows(prefix, iterations, batch_size, partition_count) do
+    flow_type = type(prefix, "transition_many")
+
+    for i <- 1..iterations, into: %{} do
+      partition_key = partition(prefix, i, partition_count)
+
+      ids =
+        for j <- 1..batch_size do
+          flow_id = id(prefix, "transition_many", i, j)
+
+          {:ok, _} =
+            FerricStore.flow_create(flow_id,
+              type: flow_type,
+              payload_ref: "payload:" <> flow_id,
+              run_at_ms: 1_000,
+              now_ms: 1_000,
+              partition_key: partition_key
+            )
+
+          flow_id
+        end
+
+      {i, ids}
     end
   end
 
@@ -336,5 +538,6 @@ FlowTailProbe.run(
   partition_count,
   seed_concurrency,
   batch_size,
+  top_count,
   bench_data_dir
 )

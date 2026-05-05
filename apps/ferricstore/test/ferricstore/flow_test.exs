@@ -111,6 +111,34 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id, type: "checkout", state: "queued")
   end
 
+  test "flow due index stays derived and does not persist per-flow zset members" do
+    id = uid("flow-due-derived")
+    run_at_ms = 1_234
+
+    assert {:ok, _flow} =
+             FerricStore.flow_create(id,
+               type: "checkout",
+               state: "queued",
+               run_at_ms: run_at_ms
+             )
+
+    due_key = Ferricstore.Flow.Keys.due_key("checkout", "queued", 0, nil)
+    member_key = Ferricstore.Store.CompoundKey.zset_member(due_key, id)
+    type_key = Ferricstore.Store.CompoundKey.type_key(due_key)
+
+    assert {:ok, nil} = FerricStore.get(member_key)
+    assert {:ok, nil} = FerricStore.get(type_key)
+
+    assert {:ok, [%{id: ^id}]} =
+             FerricStore.flow_claim_due("checkout",
+               state: "queued",
+               worker: "worker-a",
+               now_ms: run_at_ms,
+               lease_ms: 1_000,
+               limit: 10
+             )
+  end
+
   test "flow_create stores debug lineage metadata and indexes it" do
     id = uid("flow-lineage-child")
     parent = uid("flow-lineage-parent")
