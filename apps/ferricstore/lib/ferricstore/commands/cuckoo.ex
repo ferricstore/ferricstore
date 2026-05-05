@@ -310,8 +310,8 @@ defmodule Ferricstore.Commands.Cuckoo do
 
     with :ok <- ensure_prob_dir(dir),
          {:ok, _resource} = result <- NIF.cuckoo_file_create(path, capacity, bucket_size),
-         :ok <- prob_fsync_dir(dir, :prob_file_dir) do
-      register_cuckoo_meta(result, store, key, capacity)
+         :ok <- prob_fsync_dir(dir, :prob_file_dir),
+         :ok <- register_cuckoo_meta(result, store, key, capacity) do
       result
     end
   end
@@ -350,8 +350,8 @@ defmodule Ferricstore.Commands.Cuckoo do
         %{capacity: cap, bucket_size: bs} = auto_params
 
         with {:ok, _resource} = result <- NIF.cuckoo_file_create(path, cap, bs),
-             :ok <- prob_fsync_dir(dir, :prob_file_dir) do
-          register_cuckoo_meta(result, store, key, cap)
+             :ok <- prob_fsync_dir(dir, :prob_file_dir),
+             :ok <- register_cuckoo_meta(result, store, key, cap) do
           :ok
         end
 

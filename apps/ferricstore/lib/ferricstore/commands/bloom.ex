@@ -402,8 +402,8 @@ defmodule Ferricstore.Commands.Bloom do
 
     with :ok <- ensure_prob_dir(dir),
          {:ok, _resource} = result <- NIF.bloom_file_create(path, num_bits, num_hashes),
-         :ok <- prob_fsync_dir(dir, :prob_file_dir) do
-      register_bloom_meta(result, store, key, meta)
+         :ok <- prob_fsync_dir(dir, :prob_file_dir),
+         :ok <- register_bloom_meta(result, store, key, meta) do
       result
     end
   end
@@ -437,14 +437,14 @@ defmodule Ferricstore.Commands.Bloom do
         %{num_bits: nb, num_hashes: nh} = auto_params
 
         with {:ok, _resource} = result <- NIF.bloom_file_create(path, nb, nh),
-             :ok <- prob_fsync_dir(dir, :prob_file_dir) do
-          register_bloom_meta(
-            result,
-            store,
-            key,
-            {:bloom_meta, Map.put(auto_params, :path, path)}
-          )
-
+             :ok <- prob_fsync_dir(dir, :prob_file_dir),
+             :ok <-
+               register_bloom_meta(
+                 result,
+                 store,
+                 key,
+                 {:bloom_meta, Map.put(auto_params, :path, path)}
+               ) do
           :ok
         end
 

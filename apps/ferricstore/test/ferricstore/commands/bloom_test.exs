@@ -108,6 +108,14 @@ defmodule Ferricstore.Commands.BloomTest do
       assert msg =~ "item exists"
     end
 
+    test "returns metadata write error when reserve registration fails" do
+      store =
+        make_store()
+        |> Map.put(:put, fn "mybloom", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = Bloom.handle("BF.RESERVE", ["mybloom", "0.01", "100"], store)
+    end
+
     test "returns error with invalid error rate (zero)" do
       store = make_store()
       assert {:error, msg} = Bloom.handle("BF.RESERVE", ["bf", "0", "100"], store)

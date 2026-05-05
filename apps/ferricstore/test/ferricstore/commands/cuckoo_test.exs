@@ -50,6 +50,14 @@ defmodule Ferricstore.Commands.CuckooTest do
       assert msg =~ "item exists"
     end
 
+    test "returns metadata write error when reserve registration fails" do
+      store =
+        ProbMockStore.make_cuckoo()
+        |> Map.put(:put, fn "mycf", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = Cuckoo.handle("CF.RESERVE", ["mycf", "1024"], store)
+    end
+
     test "returns error with invalid capacity (zero)" do
       store = ProbMockStore.make_cuckoo()
       assert {:error, _} = Cuckoo.handle("CF.RESERVE", ["cf", "0"], store)
@@ -452,17 +460,20 @@ defmodule Ferricstore.Commands.CuckooTest do
       Cuckoo.handle("CF.RESERVE", ["cf", "#{capacity}"], store)
 
       n_added = 1000
+
       for i <- 1..n_added do
         Cuckoo.handle("CF.ADD", ["cf", "added_#{i}"], store)
       end
 
       test_count = 5000
+
       false_positives =
         Enum.count(1..test_count, fn i ->
           Cuckoo.handle("CF.EXISTS", ["cf", "not_added_#{i}"], store) == 1
         end)
 
       observed_rate = false_positives / test_count
+
       assert observed_rate < 0.10,
              "False positive rate #{Float.round(observed_rate * 100, 2)}% exceeds 10%"
     end

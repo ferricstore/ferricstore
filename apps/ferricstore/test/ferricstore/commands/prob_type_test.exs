@@ -4,6 +4,16 @@ defmodule Ferricstore.Commands.ProbTypeTest do
 
   alias Ferricstore.Commands.ProbType
 
+  describe "register" do
+    test "returns write errors from map stores" do
+      store = %{
+        put: fn "bf", _raw, 0 -> {:error, :disk_full} end
+      }
+
+      assert {:error, :disk_full} = ProbType.register(store, "bf", {:bloom_meta, %{}})
+    end
+  end
+
   describe "large cold string classification" do
     test "check_expected returns WRONGTYPE without loading a large cold value" do
       store = large_cold_string_store(self(), "cold_string", 1_000_000)

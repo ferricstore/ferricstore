@@ -58,6 +58,14 @@ defmodule Ferricstore.Commands.CMSTest do
       assert msg =~ "already exists"
     end
 
+    test "returns metadata write error when init registration fails" do
+      store =
+        ProbMockStore.make_cms()
+        |> Map.put(:put, fn "mysketch", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
+    end
+
     test "returns error with zero width" do
       store = ProbMockStore.make_cms()
       assert {:error, msg} = CMS.handle("CMS.INITBYDIM", ["key", "0", "7"], store)
@@ -338,10 +346,12 @@ defmodule Ferricstore.Commands.CMSTest do
       :ok = CMS.handle("CMS.INITBYDIM", ["src2", "100", "7"], store)
 
       test_pid = self()
-      store = Map.put(store, :prob_write, fn command ->
-        send(test_pid, {:prob_write, command})
-        :ok
-      end)
+
+      store =
+        Map.put(store, :prob_write, fn command ->
+          send(test_pid, {:prob_write, command})
+          :ok
+        end)
 
       assert :ok = CMS.handle("CMS.MERGE", ["dst", "2", "src1", "src2"], store)
 

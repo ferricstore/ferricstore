@@ -62,6 +62,14 @@ defmodule Ferricstore.Commands.TopKTest do
       assert msg =~ "already exists"
     end
 
+    test "returns metadata write error when reserve registration fails" do
+      store =
+        MockStore.make()
+        |> Map.put(:put, fn "hot_keys", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = TopK.handle("TOPK.RESERVE", ["hot_keys", "10"], store)
+    end
+
     test "returns WRONGTYPE when key holds a string" do
       store = MockStore.make(%{"hot_keys" => {{"existing", 0}, 0}})
       assert {:error, msg} = TopK.handle("TOPK.RESERVE", ["hot_keys", "10"], store)

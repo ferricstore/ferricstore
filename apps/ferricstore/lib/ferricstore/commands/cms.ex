@@ -248,8 +248,8 @@ defmodule Ferricstore.Commands.CMS do
 
     with :ok <- ensure_prob_dir(dir),
          {:ok, _resource} = result <- NIF.cms_file_create(path, width, depth),
-         :ok <- prob_fsync_dir(dir, :prob_file_dir) do
-      register_cms_meta(result, store, key, width, depth)
+         :ok <- prob_fsync_dir(dir, :prob_file_dir),
+         :ok <- register_cms_meta(result, store, key, width, depth) do
       result
     end
   end
@@ -277,8 +277,8 @@ defmodule Ferricstore.Commands.CMS do
       %{width: w, depth: d} = create_params
 
       with {:ok, _resource} = result <- NIF.cms_file_create(dst_path, w, d),
-           :ok <- prob_fsync_dir(dir, :prob_file_dir) do
-        register_cms_meta(result, store, dst_key, w, d)
+           :ok <- prob_fsync_dir(dir, :prob_file_dir),
+           :ok <- register_cms_meta(result, store, dst_key, w, d) do
         :ok
       end
     end

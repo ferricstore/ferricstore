@@ -25,16 +25,16 @@ defmodule Ferricstore.Commands.ProbType do
     end
   end
 
-  @spec register(map(), binary(), {atom(), map()}) :: :ok
+  @spec register(map(), binary(), {atom(), map()}) :: :ok | {:error, term()}
   def register(%FerricStore.Instance{}, _key, _meta), do: :ok
   def register(%{prob_write: write_fn}, _key, _meta) when is_function(write_fn), do: :ok
 
   def register(store, key, meta) when is_map(store) do
     if Map.has_key?(store, :put) do
       Ops.put(store, key, :erlang.term_to_binary(meta), 0)
+    else
+      :ok
     end
-
-    :ok
   end
 
   def register(_store, _key, _meta), do: :ok

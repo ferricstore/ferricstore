@@ -324,9 +324,9 @@ defmodule Ferricstore.Commands.TopK do
     if is_nil(Map.get(store, :prob_write)) do
       path = prob_path(store, key, "topk")
       ProbType.register(store, key, {:topk_meta, %{path: path}})
+    else
+      :ok
     end
-
-    :ok
   end
 
   defp check_not_exists(key, store) do
