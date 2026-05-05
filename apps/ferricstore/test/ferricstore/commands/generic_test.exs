@@ -96,6 +96,22 @@ defmodule Ferricstore.Commands.GenericTest do
       assert "v" == store.get.("new")
     end
 
+    test "RENAME returns destination write errors and keeps source" do
+      source = "{rename}:old"
+      destination = "{rename}:new"
+      base = MockStore.make(%{source => {"v", 0}})
+
+      store =
+        Map.put(base, :put, fn
+          ^destination, "v", 0 -> {:error, :disk_full}
+          key, value, expire_at_ms -> base.put.(key, value, expire_at_ms)
+        end)
+
+      assert {:error, :disk_full} == Generic.handle("RENAME", [source, destination], store)
+      assert "v" == store.get.(source)
+      assert nil == store.get.(destination)
+    end
+
     test "RENAME preserves TTL" do
       future = System.os_time(:millisecond) + 60_000
       store = MockStore.make(%{"old" => {"v", future}})
@@ -220,6 +236,56 @@ defmodule Ferricstore.Commands.GenericTest do
       assert 1 == Generic.handle("COPY", ["src", "dst"], store)
       assert "v" == store.get.("src")
       assert "v" == store.get.("dst")
+    end
+
+    test "COPY returns destination write errors" do
+      base = MockStore.make(%{"src" => {"v", 0}})
+
+      store =
+        Map.put(base, :put, fn
+          "dst", "v", 0 -> {:error, :disk_full}
+          key, value, expire_at_ms -> base.put.(key, value, expire_at_ms)
+        end)
+
+      assert {:error, :disk_full} == Generic.handle("COPY", ["src", "dst"], store)
+      assert "v" == store.get.("src")
+      assert nil == store.get.("dst")
+    end
+
+    test "COPY batches compound writes" do
+      base = MockStore.make()
+      assert 2 == Hash.handle("HSET", ["hash", "a", "1", "b", "2"], base)
+
+      type_key = CompoundKey.type_key("copy")
+      field_a = CompoundKey.hash_field("copy", "a")
+      field_b = CompoundKey.hash_field("copy", "b")
+      parent = self()
+
+      store =
+        base
+        |> Map.put(:compound_put, fn _redis_key, compound_key, _value, _expire_at_ms ->
+          flunk("COPY should batch compound writes, got #{inspect(compound_key)}")
+        end)
+        |> Map.put(:compound_batch_put, fn "copy", entries ->
+          send(parent, {:compound_batch_put, entries})
+          :ok
+        end)
+
+      assert 1 == Generic.handle("COPY", ["hash", "copy"], store)
+
+      assert_receive {:compound_batch_put, entries}
+
+      entries_by_key =
+        Map.new(entries, fn {compound_key, value, exp} -> {compound_key, {value, exp}} end)
+
+      assert %{
+               ^type_key => {"hash", 0},
+               ^field_a => {"1", 0},
+               ^field_b => {"2", 0}
+             } = entries_by_key
+
+      assert map_size(entries_by_key) == 3
+      refute_receive {:compound_batch_put, _}
     end
 
     test "COPY preserves TTL" do

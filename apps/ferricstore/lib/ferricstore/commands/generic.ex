@@ -261,8 +261,10 @@ defmodule Ferricstore.Commands.Generic do
                 {:error, "ERR no such key"}
 
               entry ->
-                rename_entry(key, newkey, entry, unified_store)
-                :ok
+                case rename_entry(key, newkey, entry, unified_store) do
+                  :ok -> :ok
+                  {:error, _} = error -> error
+                end
             end
         end
       end,
@@ -292,8 +294,10 @@ defmodule Ferricstore.Commands.Generic do
                   {:error, "ERR no such key"}
 
                 entry ->
-                  rename_entry(key, newkey, entry, unified_store)
-                  1
+                  case rename_entry(key, newkey, entry, unified_store) do
+                    :ok -> 1
+                    {:error, _} = error -> error
+                  end
               end
             end
         end
@@ -511,11 +515,13 @@ defmodule Ferricstore.Commands.Generic do
 
             entry ->
               if source != destination do
-                delete_key(destination, store)
+                with :ok <- delete_key_result(destination, store),
+                     :ok <- copy_entry(source, destination, entry, store) do
+                  1
+                end
+              else
+                1
               end
-
-              copy_entry(source, destination, entry, store)
-              1
           end
         end
     end
@@ -558,9 +564,11 @@ defmodule Ferricstore.Commands.Generic do
   defp rename_entry(source, destination, _entry, _store) when source == destination, do: :ok
 
   defp rename_entry(source, destination, entry, store) do
-    delete_key(destination, store)
-    copy_entry(source, destination, entry, store)
-    delete_key(source, store)
+    with :ok <- delete_key_result(destination, store),
+         :ok <- copy_entry(source, destination, entry, store),
+         :ok <- delete_key_result(source, store) do
+      :ok
+    end
   end
 
   defp copy_entry(_source, destination, {:plain, value, expire_at_ms}, store) do
@@ -568,64 +576,90 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp copy_entry(source, destination, {:compound, type, _expire_at_ms}, store) do
-    copy_compound_meta(source, destination, type, store)
-    copy_compound_entries(source, destination, type, store)
+    entries = compound_copy_entries(source, destination, type, store)
+    Ops.compound_batch_put(store, destination, entries)
   end
 
   defp delete_key(key, store) do
     Ferricstore.Commands.Strings.handle_ast({:del, [key]}, store)
   end
 
-  defp copy_compound_meta(source, destination, type, store) do
-    copy_compound_key(
-      source,
-      destination,
-      CompoundKey.type_key(source),
-      CompoundKey.type_key(destination),
-      store,
-      type
-    )
-
-    if type == "list" do
-      copy_compound_key(
-        source,
-        destination,
-        CompoundKey.list_meta_key(source),
-        CompoundKey.list_meta_key(destination),
-        store
-      )
+  defp delete_key_result(key, store) do
+    case delete_key(key, store) do
+      count when is_integer(count) -> :ok
+      :ok -> :ok
+      {:error, _} = error -> error
     end
   end
 
-  defp copy_compound_entries(source, destination, type, store) do
+  defp compound_copy_entries(source, destination, type, store) do
+    compound_meta_copy_entries(source, destination, type, store) ++
+      compound_member_copy_entries(source, destination, type, store)
+  end
+
+  defp compound_meta_copy_entries(source, destination, type, store) do
+    type_entries =
+      copy_compound_key_entries(
+        source,
+        CompoundKey.type_key(source),
+        CompoundKey.type_key(destination),
+        store,
+        type
+      )
+
+    list_meta_entries =
+      if type == "list" do
+        copy_compound_key_entries(
+          source,
+          CompoundKey.list_meta_key(source),
+          CompoundKey.list_meta_key(destination),
+          store
+        )
+      else
+        []
+      end
+
+    type_entries ++ list_meta_entries
+  end
+
+  defp compound_member_copy_entries(source, destination, type, store) do
     source_prefix = compound_prefix(type, source)
     destination_prefix = compound_prefix(type, destination)
 
-    store
-    |> Ops.compound_scan(source, source_prefix)
-    |> Enum.each(fn {sub_key, _value} ->
-      source_key = scanned_compound_key(source_prefix, sub_key)
-      destination_key = scanned_compound_key(destination_prefix, sub_key)
-      copy_compound_key(source, destination, source_key, destination_key, store)
+    pairs =
+      store
+      |> Ops.compound_scan(source, source_prefix)
+      |> Enum.map(fn {sub_key, _value} ->
+        source_key = scanned_compound_key(source_prefix, sub_key)
+        destination_key = scanned_compound_key(destination_prefix, sub_key)
+        {source_key, destination_key}
+      end)
+
+    source_keys = Enum.map(pairs, fn {source_key, _destination_key} -> source_key end)
+    metas = Ops.compound_batch_get_meta(store, source, source_keys)
+
+    pairs
+    |> Enum.zip(metas)
+    |> Enum.flat_map(fn
+      {{_source_key, _destination_key}, nil} ->
+        []
+
+      {{_source_key, destination_key}, {value, expire_at_ms}} ->
+        [{destination_key, value, expire_at_ms}]
     end)
   end
 
-  defp copy_compound_key(
+  defp copy_compound_key_entries(
          source,
-         destination,
          source_key,
          destination_key,
          store,
          fallback_value \\ nil
        ) do
     case Ops.compound_get_meta(store, source, source_key) do
-      nil ->
-        if fallback_value != nil do
-          Ops.compound_put(store, destination, destination_key, fallback_value, 0)
-        end
-
-      {value, expire_at_ms} ->
-        Ops.compound_put(store, destination, destination_key, value, expire_at_ms)
+      nil when fallback_value != nil -> [{destination_key, fallback_value, 0}]
+      nil -> []
+      {value, expire_at_ms} -> [{destination_key, value, expire_at_ms}]
     end
   end
 
