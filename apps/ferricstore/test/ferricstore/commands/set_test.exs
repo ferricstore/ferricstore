@@ -158,6 +158,12 @@ defmodule Ferricstore.Commands.SetTest do
       assert nil == store.compound_get.("myset", "T:myset")
     end
 
+    test "SREM returns type cleanup errors after removing the last member" do
+      store = set_cleanup_failure_store()
+
+      assert {:error, :disk_full} == Set.handle("SREM", ["myset", "only"], store)
+    end
+
     test "SREM with no members returns error" do
       assert {:error, _} = Set.handle("SREM", ["myset"], MockStore.make())
     end
@@ -691,6 +697,12 @@ defmodule Ferricstore.Commands.SetTest do
       assert nil == store.compound_get.("myset", "T:myset")
     end
 
+    test "SPOP returns type cleanup errors after removing the last member" do
+      store = set_cleanup_failure_store()
+
+      assert {:error, :disk_full} == Set.handle("SPOP", ["myset"], store)
+    end
+
     test "SPOP on nonexistent key returns nil" do
       store = MockStore.make()
       result = Set.handle("SPOP", ["nonexistent"], store)
@@ -1050,5 +1062,19 @@ defmodule Ferricstore.Commands.SetTest do
     else
       collect_sscan_members(store, key, next_cursor, count, new_acc)
     end
+  end
+
+  defp set_cleanup_failure_store do
+    type_key = CompoundKey.type_key("myset")
+    member_key = CompoundKey.set_member("myset", "only")
+
+    %{
+      compound_get: fn "myset", ^type_key -> "set" end,
+      compound_batch_get: fn "myset", [^member_key] -> ["1"] end,
+      compound_batch_delete: fn "myset", [^member_key] -> :ok end,
+      compound_count: fn "myset", _prefix -> 0 end,
+      compound_delete: fn "myset", ^type_key -> {:error, :disk_full} end,
+      compound_scan: fn "myset", _prefix -> [{"only", "1"}] end
+    }
   end
 end

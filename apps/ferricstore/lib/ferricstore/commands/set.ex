@@ -92,8 +92,9 @@ defmodule Ferricstore.Commands.Set do
 
       case Ops.compound_batch_delete(store, key, removed_keys) do
         :ok ->
-          maybe_cleanup_empty_set(key, removed, store)
-          removed
+          with :ok <- maybe_cleanup_empty_set(key, removed, store) do
+            removed
+          end
 
         {:error, _} = err ->
           err
@@ -316,8 +317,9 @@ defmodule Ferricstore.Commands.Set do
 
           case Ops.compound_batch_delete(store, key, [compound_key]) do
             :ok ->
-              maybe_cleanup_empty_set(key, 1, store)
-              member
+              with :ok <- maybe_cleanup_empty_set(key, 1, store) do
+                member
+              end
 
             {:error, _} = err ->
               err
@@ -337,11 +339,9 @@ defmodule Ferricstore.Commands.Set do
 
           case Ops.compound_batch_delete(store, key, compound_keys) do
             :ok ->
-              if removed > 0 do
-                maybe_cleanup_empty_set(key, removed, store)
+              with :ok <- maybe_cleanup_empty_set(key, removed, store) do
+                selected
               end
-
-              selected
 
             {:error, _} = err ->
               err
@@ -614,8 +614,9 @@ defmodule Ferricstore.Commands.Set do
 
       case Ops.compound_batch_delete(store, key, removed_keys) do
         :ok ->
-          maybe_cleanup_empty_set(key, removed, store)
-          removed
+          with :ok <- maybe_cleanup_empty_set(key, removed, store) do
+            removed
+          end
 
         {:error, _} = err ->
           err
@@ -790,8 +791,9 @@ defmodule Ferricstore.Commands.Set do
 
           case Ops.compound_batch_delete(store, key, [compound_key]) do
             :ok ->
-              maybe_cleanup_empty_set(key, 1, store)
-              member
+              with :ok <- maybe_cleanup_empty_set(key, 1, store) do
+                member
+              end
 
             {:error, _} = err ->
               err
@@ -809,11 +811,9 @@ defmodule Ferricstore.Commands.Set do
 
       case Ops.compound_batch_delete(store, key, compound_keys) do
         :ok ->
-          if removed > 0 do
-            maybe_cleanup_empty_set(key, removed, store)
+          with :ok <- maybe_cleanup_empty_set(key, removed, store) do
+            selected
           end
-
-          selected
 
         {:error, _} = err ->
           err
@@ -883,8 +883,9 @@ defmodule Ferricstore.Commands.Set do
             :ok ->
               case Ops.compound_batch_delete(store, source, [compound_key]) do
                 :ok ->
-                  maybe_cleanup_empty_set(source, 1, store)
-                  1
+                  with :ok <- maybe_cleanup_empty_set(source, 1, store) do
+                    1
+                  end
 
                 {:error, _} = err ->
                   maybe_rollback_smove_destination(
@@ -1017,6 +1018,8 @@ defmodule Ferricstore.Commands.Set do
 
     if Ops.compound_count(store, key, prefix) == 0 do
       TypeRegistry.delete_type(key, store)
+    else
+      :ok
     end
   end
 
