@@ -197,6 +197,7 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
               ":durability",
               ":ferricstore_durability_mode",
               ":ferricstore_has_async_ns",
+              "namespace async durability",
               "async namespace",
               "Async cross-shard",
               "async cross-shard",
@@ -243,6 +244,7 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     paths =
       [Path.join(repo_root, "README.md")] ++
         Path.wildcard(Path.join(repo_root, "docs/**/*.md")) ++
+        Path.wildcard(Path.join(repo_root, "apps/ferricstore/lib/**/*.md")) ++
         Path.wildcard(Path.join(repo_root, "bench/**/*.{exs,sh,md,cfg}"))
 
     offenders =
@@ -253,6 +255,8 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
 
         for token <- [
               "async durability",
+              "async namespace",
+              "async cross-shard",
               "durability mode",
               "durability_for(",
               "Quorum vs Async",

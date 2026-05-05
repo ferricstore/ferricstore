@@ -112,7 +112,7 @@ CrossShardOp.execute(keys_with_roles, execute_fn, opts)
 
 # Returns:
 # - result of execute_fn (same-shard or quorum cross-shard)
-# - {:error, "CROSSSLOT ..."} (async cross-shard)
+# - {:error, "CROSSSLOT ..."} when the operation is not supported cross-shard
 ```
 
 ## Same-Shard Fast Path

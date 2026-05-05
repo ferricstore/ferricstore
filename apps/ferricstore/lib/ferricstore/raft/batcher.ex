@@ -4,8 +4,8 @@ defmodule Ferricstore.Raft.Batcher do
 
   Per spec sections 2C.5 and 2F.3, each shard has its own Batcher GenServer
   that accumulates write commands into per-namespace buffers, each with its
-  own commit window. Durability is quorum-only; the old namespace async
-  durability mode has been removed.
+  own commit window. Writes are quorum-only; the old namespace-local weaker
+  write mode has been removed.
 
   ## How it works
 
@@ -333,10 +333,9 @@ defmodule Ferricstore.Raft.Batcher do
   @doc """
   Submits an explicit internal local-origin replication command.
 
-  This is not the removed namespace async durability feature. Callers use this
-  only after they have already applied the local side effect and need to send a
-  best-effort replicated poke or delta through Raft without waiting for local
-  re-application.
+  This is not a public write mode. Callers use this only after they have already
+  applied the local side effect and need to send a best-effort replicated poke
+  or delta through Raft without waiting for local re-application.
 
   Commands are wrapped as `{:async, inner_cmd}` before submission so the
   state machine can distinguish them: on the origin node (which has the entry
@@ -369,7 +368,7 @@ defmodule Ferricstore.Raft.Batcher do
   This is intentionally weaker than `async_submit_ordered/2`: it preserves the
   low-latency local-origin helper path where waiting for
   `ra.pipeline_command/4` would dominate command latency. It must not be used
-  to reintroduce namespace async durability.
+  to reintroduce namespace-local weak writes.
   """
   @spec async_enqueue_ordered(non_neg_integer(), command()) ::
           :ok | {:error, :overloaded | {:ra_target_down, term()}}

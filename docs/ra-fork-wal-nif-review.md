@@ -477,7 +477,7 @@ The design in section 1 shows the `{ttb, _}` pass-through in `ra_log.erl`, and t
 |------|-------------------|
 | **ra smoke test** | Start a 3-node ra cluster with the NIF WAL, write 10K entries, read them back, kill a node, restart, verify consistency |
 | **Shard rollover under Raft load** | Write continuously to all shards, trigger WAL rollover, verify no Raft leadership elections or term bumps caused by WAL stalls |
-| **Mixed quorum + async** | Write to both quorum and async namespaces simultaneously, verify quorum writes are durable and async writes are not blocking quorum |
+| **Concurrent quorum writes** | Write continuously across multiple key prefixes, verify quorum writes are durable and no prefix blocks unrelated quorum batches |
 
 ### 12.7 Performance Benchmarks
 
