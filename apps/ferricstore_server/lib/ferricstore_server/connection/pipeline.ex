@@ -236,6 +236,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
         {:ok, kv_pairs} ->
           ctx = state.instance_ctx
           live_ctx = FerricStore.Instance.get(:default)
+          write_pairs = namespace_kv_pairs(state.sandbox_namespace, kv_pairs)
 
           acl_ok =
             state.acl_cache == :full_access or
@@ -256,18 +257,18 @@ defmodule FerricstoreServer.Connection.Pipeline do
             else
               case live_ctx.durability_mode do
                 :all_async ->
-                  {:ok, do_batch_set_async(kv_pairs, state, send_response_fn)}
+                  {:ok, do_batch_set_async(write_pairs, state, send_response_fn)}
 
                 :all_quorum ->
-                  {:ok, do_batch_set_quorum(kv_pairs, state, send_response_fn)}
+                  {:ok, do_batch_set_quorum(write_pairs, state, send_response_fn)}
 
                 :mixed ->
-                  case classify_batch_durability(ctx, kv_pairs) do
+                  case classify_batch_durability(ctx, write_pairs) do
                     :all_async ->
-                      {:ok, do_batch_set_async(kv_pairs, state, send_response_fn)}
+                      {:ok, do_batch_set_async(write_pairs, state, send_response_fn)}
 
                     :all_quorum ->
-                      {:ok, do_batch_set_quorum(kv_pairs, state, send_response_fn)}
+                      {:ok, do_batch_set_quorum(write_pairs, state, send_response_fn)}
 
                     :mixed ->
                       :fallback
@@ -418,7 +419,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
     Stats.incr_commands_by(state.stats_counter, count)
 
     get_ops = for {:get, idx, key} <- ops, do: {idx, key}
-    set_ops = for {:set, idx, key, value} <- ops, do: {idx, key, value}
+
+    set_ops =
+      state.sandbox_namespace
+      |> namespace_set_ops(for {:set, idx, key, value} <- ops, do: {idx, key, value})
 
     # Execute SETs first so subsequent GETs in the same pipeline see the new values.
     set_results =
@@ -1230,6 +1234,16 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp namespace_keys(namespace, keys) when is_binary(namespace),
     do: Enum.map(keys, &(namespace <> &1))
+
+  defp namespace_kv_pairs(nil, kv_pairs), do: kv_pairs
+
+  defp namespace_kv_pairs(namespace, kv_pairs) when is_binary(namespace),
+    do: Enum.map(kv_pairs, fn {key, value} -> {namespace <> key, value} end)
+
+  defp namespace_set_ops(nil, set_ops), do: set_ops
+
+  defp namespace_set_ops(namespace, set_ops) when is_binary(namespace),
+    do: Enum.map(set_ops, fn {idx, key, value} -> {idx, namespace <> key, value} end)
 
   defp safe_dispatch(fun) do
     {:ok, fun.()}

@@ -74,6 +74,56 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     assert response == "_\r\n-ERR async replication overloaded\r\n"
   end
 
+  test "SET pipeline fast path writes through sandbox namespace" do
+    ctx = FerricStore.Instance.get(:default)
+    sandbox = "sandbox_pipe:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"
+    key1 = "set1"
+    key2 = "set2"
+
+    state = connection_state(ctx) |> Map.put(:sandbox_namespace, sandbox)
+    send_response_fn = capture_response_fn()
+    handle_command_fn = flunking_handle_fn("sandbox SET pipeline fast path")
+
+    commands = [
+      set_ast(key1, "v1"),
+      set_ast(key2, "v2")
+    ]
+
+    assert {:continue, ^state} =
+             Pipeline.pipeline_dispatch(commands, state, handle_command_fn, send_response_fn)
+
+    assert_receive {:pipeline_response, "+OK\r\n+OK\r\n"}
+    assert Router.get(ctx, key1) == nil
+    assert Router.get(ctx, key2) == nil
+    assert Router.get(ctx, sandbox <> key1) == "v1"
+    assert Router.get(ctx, sandbox <> key2) == "v2"
+  end
+
+  test "mixed GET and SET fast path writes SETs through sandbox namespace" do
+    ctx = FerricStore.Instance.get(:default)
+    sandbox = "sandbox_mixed:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"
+    get_key = "existing"
+    set_key = "new"
+
+    :ok = Router.put(ctx, sandbox <> get_key, "inside", 0)
+
+    state = connection_state(ctx) |> Map.put(:sandbox_namespace, sandbox)
+    send_response_fn = capture_response_fn()
+    handle_command_fn = flunking_handle_fn("sandbox mixed GET/SET pipeline fast path")
+
+    commands = [
+      get_ast(get_key),
+      set_ast(set_key, "written")
+    ]
+
+    assert {:continue, ^state} =
+             Pipeline.pipeline_dispatch(commands, state, handle_command_fn, send_response_fn)
+
+    assert_receive {:pipeline_response, "$6\r\ninside\r\n+OK\r\n"}
+    assert Router.get(ctx, set_key) == nil
+    assert Router.get(ctx, sandbox <> set_key) == "written"
+  end
+
   test "general pure pipeline converts command raises into Redis error replies" do
     ctx = FerricStore.Instance.get(:default)
     raw_store_key = {:ferricstore_raw_store, ctx.name}
