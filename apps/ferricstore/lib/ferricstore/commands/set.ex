@@ -60,8 +60,7 @@ defmodule Ferricstore.Commands.Set do
           {_value, _compound_key} -> []
         end)
 
-      Enum.each(new_keys, &Ops.compound_put(store, key, &1, @presence_marker, 0))
-      length(new_keys)
+      put_new_members(store, key, new_keys)
     end
   end
 
@@ -569,12 +568,20 @@ defmodule Ferricstore.Commands.Set do
           {_value, _compound_key} -> []
         end)
 
-      Enum.each(new_keys, &Ops.compound_put(store, key, &1, @presence_marker, 0))
-      length(new_keys)
+      put_new_members(store, key, new_keys)
     end
   end
 
   defp sadd_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'sadd' command"}
+
+  defp put_new_members(store, key, new_keys) do
+    entries = Enum.map(new_keys, &{&1, @presence_marker, 0})
+
+    case Ops.compound_batch_put(store, key, entries) do
+      :ok -> length(new_keys)
+      {:error, _} = err -> err
+    end
+  end
 
   defp srem_args([key | members], store) when members != [] do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
@@ -868,16 +875,23 @@ defmodule Ferricstore.Commands.Set do
 
     members_list = MapSet.to_list(members)
 
-    if members_list != [] do
-      with :ok <- TypeRegistry.check_or_set(destination, :set, store) do
-        Enum.each(members_list, fn member ->
-          compound_key = CompoundKey.set_member(destination, member)
-          Ops.compound_put(store, destination, compound_key, @presence_marker, 0)
-        end)
+    if members_list == [] do
+      0
+    else
+      with :ok <- TypeRegistry.check_or_set(destination, :set, store),
+           :ok <- put_set_members(store, destination, members_list) do
+        length(members_list)
       end
     end
+  end
 
-    length(members_list)
+  defp put_set_members(store, key, members) do
+    entries =
+      Enum.map(members, fn member ->
+        {CompoundKey.set_member(key, member), @presence_marker, 0}
+      end)
+
+    Ops.compound_batch_put(store, key, entries)
   end
 
   defp parse_numkeys(str) do

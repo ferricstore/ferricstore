@@ -46,18 +46,28 @@ defmodule Ferricstore.Commands.SetTest do
           send(parent, {:compound_batch_get, member_keys})
           [nil, nil, "1"]
         end,
-        compound_put: fn "myset", compound_key, "1", 0 ->
-          send(parent, {:compound_put, compound_key})
+        compound_batch_put: fn "myset", entries ->
+          send(parent, {:compound_batch_put, entries})
           :ok
+        end,
+        compound_put: fn "myset", compound_key, "1", 0 ->
+          flunk(
+            "SADD should use compound_batch_put, got per-member write #{inspect(compound_key)}"
+          )
         end
       }
 
       assert 2 == Set.handle("SADD", ["myset", "a", "a", "b", "existing"], store)
       assert_received {:compound_batch_get, ^member_keys}
-      assert_received {:compound_put, added_a}
-      assert_received {:compound_put, added_b}
-      assert Enum.sort([added_a, added_b]) == Enum.sort(Enum.take(member_keys, 2))
-      refute_received {:compound_put, _}
+      assert_received {:compound_batch_put, entries}
+
+      assert Enum.sort(entries) ==
+               member_keys
+               |> Enum.take(2)
+               |> Enum.map(&{&1, "1", 0})
+               |> Enum.sort()
+
+      refute_received {:compound_batch_put, _}
     end
 
     test "SADD with all duplicates returns 0" do
@@ -340,6 +350,68 @@ defmodule Ferricstore.Commands.SetTest do
       store = MockStore.make()
       Set.handle("SADD", ["s1", "a", "b"], store)
       assert [] == Set.handle("SDIFF", ["s1", "s1"], store)
+    end
+  end
+
+  describe "set STORE commands" do
+    test "SUNIONSTORE writes destination members as one compound batch" do
+      parent = self()
+      s1_type = CompoundKey.type_key("s1")
+      s2_type = CompoundKey.type_key("s2")
+      dst_type = CompoundKey.type_key("dst")
+
+      store = %{
+        get: fn _key -> nil end,
+        delete: fn "dst" ->
+          send(parent, :delete_dst)
+          :ok
+        end,
+        compound_get: fn
+          "s1", ^s1_type -> "set"
+          "s2", ^s2_type -> "set"
+          "dst", ^dst_type -> nil
+        end,
+        compound_scan: fn
+          "s1", _prefix -> [{"a", "1"}, {"b", "1"}]
+          "s2", _prefix -> [{"b", "1"}, {"c", "1"}]
+        end,
+        compound_delete_prefix: fn "dst", _prefix ->
+          send(parent, :delete_dst_prefix)
+          :ok
+        end,
+        compound_delete: fn "dst", ^dst_type ->
+          send(parent, :delete_dst_type)
+          :ok
+        end,
+        compound_put: fn
+          "dst", ^dst_type, "set", 0 ->
+            send(parent, :put_dst_type)
+            :ok
+
+          "dst", compound_key, "1", 0 ->
+            flunk(
+              "SUNIONSTORE should use compound_batch_put, got per-member write #{inspect(compound_key)}"
+            )
+        end,
+        compound_batch_put: fn "dst", entries ->
+          send(parent, {:compound_batch_put, entries})
+          :ok
+        end
+      }
+
+      assert 3 == Set.handle("SUNIONSTORE", ["dst", "s1", "s2"], store)
+      assert_received :delete_dst
+      assert_received :delete_dst_prefix
+      assert_received :delete_dst_type
+      assert_received :put_dst_type
+      assert_received {:compound_batch_put, entries}
+
+      assert Enum.sort(entries) ==
+               ["a", "b", "c"]
+               |> Enum.map(&{CompoundKey.set_member("dst", &1), "1", 0})
+               |> Enum.sort()
+
+      refute_received {:compound_batch_put, _}
     end
   end
 

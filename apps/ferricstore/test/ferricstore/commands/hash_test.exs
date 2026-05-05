@@ -70,27 +70,43 @@ defmodule Ferricstore.Commands.HashTest do
             "hash"
 
           "hash", compound_key ->
-            flunk("HSET should use compound_batch_get, got per-field lookup #{inspect(compound_key)}")
+            flunk(
+              "HSET should use compound_batch_get, got per-field lookup #{inspect(compound_key)}"
+            )
         end,
         compound_batch_get: fn "hash", ^field_keys ->
           send(parent, {:compound_batch_get, field_keys})
           [nil, "old", nil]
         end,
-        compound_put: fn "hash", compound_key, value, 0 ->
-          send(parent, {:compound_put, compound_key, value})
+        compound_batch_put: fn "hash", entries ->
+          send(parent, {:compound_batch_put, entries})
           :ok
+        end,
+        compound_put: fn "hash", compound_key, _value, 0 ->
+          flunk(
+            "HSET should use compound_batch_put, got per-field write #{inspect(compound_key)}"
+          )
         end
       }
 
       assert 2 ==
-               Hash.handle("HSET", ["hash", "f1", "v1", "existing", "new", "f1", "v2", "f2", "v3"], store)
+               Hash.handle(
+                 "HSET",
+                 ["hash", "f1", "v1", "existing", "new", "f1", "v2", "f2", "v3"],
+                 store
+               )
 
       assert_received {:compound_batch_get, ^field_keys}
-      assert_received {:compound_put, f1_key, "v2"}
-      assert_received {:compound_put, existing_key, "new"}
-      assert_received {:compound_put, f2_key, "v3"}
-      assert Enum.sort([f1_key, existing_key, f2_key]) == Enum.sort(field_keys)
-      refute_received {:compound_put, _, _}
+      assert_received {:compound_batch_put, entries}
+
+      assert Enum.sort(entries) ==
+               Enum.sort([
+                 {Enum.at(field_keys, 0), "v2", 0},
+                 {Enum.at(field_keys, 1), "new", 0},
+                 {Enum.at(field_keys, 2), "v3", 0}
+               ])
+
+      refute_received {:compound_batch_put, _}
     end
   end
 
@@ -162,7 +178,9 @@ defmodule Ferricstore.Commands.HashTest do
             nil
 
           "hash", compound_key ->
-            flunk("HDEL should use compound_batch_get, got per-field lookup #{inspect(compound_key)}")
+            flunk(
+              "HDEL should use compound_batch_get, got per-field lookup #{inspect(compound_key)}"
+            )
         end,
         compound_batch_get: fn "hash", ^field_keys ->
           send(parent, {:compound_batch_get, field_keys})
@@ -541,9 +559,14 @@ defmodule Ferricstore.Commands.HashTest do
           send(parent, {:compound_batch_get_meta, field_keys})
           [{"v1", 0}, nil, {"v2", 123}]
         end,
-        compound_put: fn "hash", compound_key, value, expire_at_ms ->
-          send(parent, {:compound_put, compound_key, value, expire_at_ms})
+        compound_batch_put: fn "hash", entries ->
+          send(parent, {:compound_batch_put, entries})
           :ok
+        end,
+        compound_put: fn "hash", compound_key, _value, _expire_at_ms ->
+          flunk(
+            "HEXPIRE should use compound_batch_put, got per-field write #{inspect(compound_key)}"
+          )
         end
       }
 
@@ -555,11 +578,13 @@ defmodule Ferricstore.Commands.HashTest do
                )
 
       assert_received {:compound_batch_get_meta, ^field_keys}
-      assert_received {:compound_put, f1_key, "v1", expire_at_ms}
-      assert_received {:compound_put, f2_key, "v2", ^expire_at_ms}
-      assert Enum.sort([f1_key, f2_key]) == Enum.sort([hd(field_keys), Enum.at(field_keys, -1)])
+      assert_received {:compound_batch_put, entries}
+      assert [{first_key, "v1", expire_at_ms}, {second_key, "v2", same_expire_at_ms}] = entries
+      assert first_key == Enum.at(field_keys, 0)
+      assert second_key == Enum.at(field_keys, 2)
+      assert same_expire_at_ms == expire_at_ms
       assert expire_at_ms > 0
-      refute_received {:compound_put, _, _, _}
+      refute_received {:compound_batch_put, _}
     end
 
     test "HEXPIRE with wrong number of arguments returns error" do
@@ -668,7 +693,11 @@ defmodule Ferricstore.Commands.HashTest do
       }
 
       [ttl1, ttl2, persistent_ttl, missing_ttl] =
-        Hash.handle("HTTL", ["hash", "FIELDS", "4", "expiring", "expiring", "persistent", "missing"], store)
+        Hash.handle(
+          "HTTL",
+          ["hash", "FIELDS", "4", "expiring", "expiring", "persistent", "missing"],
+          store
+        )
 
       assert_received {:compound_batch_get_meta, ^field_keys}
       assert ttl1 >= 58 and ttl1 <= 60
@@ -760,9 +789,14 @@ defmodule Ferricstore.Commands.HashTest do
           send(parent, {:compound_batch_get_meta, field_keys})
           [{"v1", Ferricstore.CommandTime.now_ms() + 60_000}, {"v2", 0}, nil]
         end,
-        compound_put: fn "hash", compound_key, value, 0 ->
-          send(parent, {:compound_put, compound_key, value})
+        compound_batch_put: fn "hash", entries ->
+          send(parent, {:compound_batch_put, entries})
           :ok
+        end,
+        compound_put: fn "hash", compound_key, _value, 0 ->
+          flunk(
+            "HPERSIST should use compound_batch_put, got per-field write #{inspect(compound_key)}"
+          )
         end
       }
 
@@ -774,9 +808,9 @@ defmodule Ferricstore.Commands.HashTest do
                )
 
       assert_received {:compound_batch_get_meta, ^field_keys}
-      assert_received {:compound_put, expiring_key, "v1"}
+      assert_received {:compound_batch_put, [{expiring_key, "v1", 0}]}
       assert expiring_key == hd(field_keys)
-      refute_received {:compound_put, _, _}
+      refute_received {:compound_batch_put, _}
     end
 
     test "HPERSIST after removing expiry, HTTL returns -1" do

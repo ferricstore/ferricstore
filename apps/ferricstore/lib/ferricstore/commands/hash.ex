@@ -305,27 +305,24 @@ defmodule Ferricstore.Commands.Hash do
         {unique_fields, compound_keys, metas_by_field} =
           batch_hash_field_metas(fields, key, store)
 
-        unique_fields
-        |> Enum.zip(compound_keys)
-        |> Enum.each(fn {field, compound_key} ->
-          case Map.fetch!(metas_by_field, field) do
-            {value, _old_expire} ->
-              Ops.compound_put(store, key, compound_key, value, expire_at_ms)
+        entries =
+          existing_hash_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms)
 
-            nil ->
-              :ok
-          end
-        end)
+        case Ops.compound_batch_put(store, key, entries) do
+          :ok ->
+            Enum.map(fields, fn field ->
+              case Map.fetch!(metas_by_field, field) do
+                nil ->
+                  -2
 
-        Enum.map(fields, fn field ->
-          case Map.fetch!(metas_by_field, field) do
-            nil ->
-              -2
+                {_value, _old_expire} ->
+                  1
+              end
+            end)
 
-            {_value, _old_expire} ->
-              1
-          end
-        end)
+          {:error, _} = err ->
+            err
+        end
       end
     end
   end
@@ -383,30 +380,34 @@ defmodule Ferricstore.Commands.Hash do
         {unique_fields, compound_keys, metas_by_field} =
           batch_hash_field_metas(fields, key, store)
 
-        unique_fields
-        |> Enum.zip(compound_keys)
-        |> Enum.each(fn {field, compound_key} ->
-          case Map.fetch!(metas_by_field, field) do
-            {value, expire_at_ms} when expire_at_ms != 0 ->
-              Ops.compound_put(store, key, compound_key, value, 0)
+        entries =
+          unique_fields
+          |> Enum.zip(compound_keys)
+          |> Enum.flat_map(fn {field, compound_key} ->
+            case Map.fetch!(metas_by_field, field) do
+              {value, expire_at_ms} when expire_at_ms != 0 -> [{compound_key, value, 0}]
+              _nil_or_persistent -> []
+            end
+          end)
 
-            _nil_or_persistent ->
-              :ok
-          end
-        end)
+        case Ops.compound_batch_put(store, key, entries) do
+          :ok ->
+            Enum.map(fields, fn field ->
+              case Map.fetch!(metas_by_field, field) do
+                nil ->
+                  -2
 
-        Enum.map(fields, fn field ->
-          case Map.fetch!(metas_by_field, field) do
-            nil ->
-              -2
+                {_value, 0} ->
+                  -1
 
-            {_value, 0} ->
-              -1
+                {_value, _expire_at_ms} ->
+                  1
+              end
+            end)
 
-            {_value, _expire_at_ms} ->
-              1
-          end
-        end)
+          {:error, _} = err ->
+            err
+        end
       end
     end
   end
@@ -431,27 +432,24 @@ defmodule Ferricstore.Commands.Hash do
         {unique_fields, compound_keys, metas_by_field} =
           batch_hash_field_metas(fields, key, store)
 
-        unique_fields
-        |> Enum.zip(compound_keys)
-        |> Enum.each(fn {field, compound_key} ->
-          case Map.fetch!(metas_by_field, field) do
-            {value, _old_expire} ->
-              Ops.compound_put(store, key, compound_key, value, expire_at_ms)
+        entries =
+          existing_hash_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms)
 
-            nil ->
-              :ok
-          end
-        end)
+        case Ops.compound_batch_put(store, key, entries) do
+          :ok ->
+            Enum.map(fields, fn field ->
+              case Map.fetch!(metas_by_field, field) do
+                nil ->
+                  -2
 
-        Enum.map(fields, fn field ->
-          case Map.fetch!(metas_by_field, field) do
-            nil ->
-              -2
+                {_value, _old_expire} ->
+                  1
+              end
+            end)
 
-            {_value, _old_expire} ->
-              1
-          end
-        end)
+          {:error, _} = err ->
+            err
+        end
       end
     end
   end
@@ -1093,21 +1091,21 @@ defmodule Ferricstore.Commands.Hash do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       {unique_fields, compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
 
-      unique_fields
-      |> Enum.zip(compound_keys)
-      |> Enum.each(fn {field, compound_key} ->
-        case Map.fetch!(metas_by_field, field) do
-          {value, _old_expire} -> Ops.compound_put(store, key, compound_key, value, expire_at_ms)
-          nil -> :ok
-        end
-      end)
+      entries =
+        existing_hash_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms)
 
-      Enum.map(fields, fn field ->
-        case Map.fetch!(metas_by_field, field) do
-          nil -> -2
-          {_value, _old_expire} -> 1
-        end
-      end)
+      case Ops.compound_batch_put(store, key, entries) do
+        :ok ->
+          Enum.map(fields, fn field ->
+            case Map.fetch!(metas_by_field, field) do
+              nil -> -2
+              {_value, _old_expire} -> 1
+            end
+          end)
+
+        {:error, _} = err ->
+          err
+      end
     end
   end
 
@@ -1143,25 +1141,29 @@ defmodule Ferricstore.Commands.Hash do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       {unique_fields, compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
 
-      unique_fields
-      |> Enum.zip(compound_keys)
-      |> Enum.each(fn {field, compound_key} ->
-        case Map.fetch!(metas_by_field, field) do
-          {value, expire_at_ms} when expire_at_ms != 0 ->
-            Ops.compound_put(store, key, compound_key, value, 0)
+      entries =
+        unique_fields
+        |> Enum.zip(compound_keys)
+        |> Enum.flat_map(fn {field, compound_key} ->
+          case Map.fetch!(metas_by_field, field) do
+            {value, expire_at_ms} when expire_at_ms != 0 -> [{compound_key, value, 0}]
+            _nil_or_persistent -> []
+          end
+        end)
 
-          _nil_or_persistent ->
-            :ok
-        end
-      end)
+      case Ops.compound_batch_put(store, key, entries) do
+        :ok ->
+          Enum.map(fields, fn field ->
+            case Map.fetch!(metas_by_field, field) do
+              nil -> -2
+              {_value, 0} -> -1
+              {_value, _expire_at_ms} -> 1
+            end
+          end)
 
-      Enum.map(fields, fn field ->
-        case Map.fetch!(metas_by_field, field) do
-          nil -> -2
-          {_value, 0} -> -1
-          {_value, _expire_at_ms} -> 1
-        end
-      end)
+        {:error, _} = err ->
+          err
+      end
     end
   end
 
@@ -1242,13 +1244,17 @@ defmodule Ferricstore.Commands.Hash do
       |> Ops.compound_batch_get(key, compound_keys)
       |> Enum.count(&is_nil/1)
 
-    fields
-    |> Enum.zip(compound_keys)
-    |> Enum.each(fn {field, compound_key} ->
-      Ops.compound_put(store, key, compound_key, Map.fetch!(values_by_field, field), 0)
-    end)
+    entries =
+      fields
+      |> Enum.zip(compound_keys)
+      |> Enum.map(fn {field, compound_key} ->
+        {compound_key, Map.fetch!(values_by_field, field), 0}
+      end)
 
-    added
+    case Ops.compound_batch_put(store, key, entries) do
+      :ok -> added
+      {:error, _} = err -> err
+    end
   end
 
   defp collapse_field_values([], fields_rev, values_by_field) do
@@ -1269,24 +1275,21 @@ defmodule Ferricstore.Commands.Hash do
   defp hgetex_fields(fields, key, store, expire_at_ms) do
     {unique_fields, compound_keys, metas_by_field} = batch_hash_field_metas(fields, key, store)
 
-    unique_fields
-    |> Enum.zip(compound_keys)
-    |> Enum.each(fn {field, compound_key} ->
-      case Map.fetch!(metas_by_field, field) do
-        nil ->
-          :ok
+    entries =
+      existing_hash_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms)
 
-        {value, _old_expire} ->
-          Ops.compound_put(store, key, compound_key, value, expire_at_ms)
-      end
-    end)
+    case Ops.compound_batch_put(store, key, entries) do
+      :ok ->
+        Enum.map(fields, fn field ->
+          case Map.fetch!(metas_by_field, field) do
+            nil -> nil
+            {value, _old_expire} -> value
+          end
+        end)
 
-    Enum.map(fields, fn field ->
-      case Map.fetch!(metas_by_field, field) do
-        nil -> nil
-        {value, _old_expire} -> value
-      end
-    end)
+      {:error, _} = err ->
+        err
+    end
   end
 
   defp batch_hash_field_metas(fields, key, store) do
@@ -1312,13 +1315,28 @@ defmodule Ferricstore.Commands.Hash do
       |> Ops.compound_batch_get(key, compound_keys)
       |> Enum.count(&is_nil/1)
 
-    fields
-    |> Enum.zip(compound_keys)
-    |> Enum.each(fn {field, compound_key} ->
-      Ops.compound_put(store, key, compound_key, Map.fetch!(values_by_field, field), expire_at_ms)
-    end)
+    entries =
+      fields
+      |> Enum.zip(compound_keys)
+      |> Enum.map(fn {field, compound_key} ->
+        {compound_key, Map.fetch!(values_by_field, field), expire_at_ms}
+      end)
 
-    added
+    case Ops.compound_batch_put(store, key, entries) do
+      :ok -> added
+      {:error, _} = err -> err
+    end
+  end
+
+  defp existing_hash_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms) do
+    unique_fields
+    |> Enum.zip(compound_keys)
+    |> Enum.flat_map(fn {field, compound_key} ->
+      case Map.fetch!(metas_by_field, field) do
+        {value, _old_expire} -> [{compound_key, value, expire_at_ms}]
+        nil -> []
+      end
+    end)
   end
 
   # O(n/2) parity check without computing full length.

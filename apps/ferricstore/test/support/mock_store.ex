@@ -67,8 +67,44 @@ defmodule Ferricstore.Test.MockStore do
           end
         end)
       end,
+      compound_batch_get: fn _redis_key, compound_keys ->
+        Agent.get(pid, fn state ->
+          Enum.map(compound_keys, fn compound_key ->
+            case Map.get(state, compound_key) do
+              nil -> nil
+              {value, 0} -> value
+              {value, exp} -> if Ferricstore.Test.MockStore.alive?(exp), do: value, else: nil
+            end
+          end)
+        end)
+      end,
+      compound_batch_get_meta: fn _redis_key, compound_keys ->
+        Agent.get(pid, fn state ->
+          Enum.map(compound_keys, fn compound_key ->
+            case Map.get(state, compound_key) do
+              nil ->
+                nil
+
+              {value, 0} ->
+                {value, 0}
+
+              {value, exp} ->
+                if Ferricstore.Test.MockStore.alive?(exp), do: {value, exp}, else: nil
+            end
+          end)
+        end)
+      end,
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
         Agent.update(pid, &Map.put(&1, compound_key, {value, expire_at_ms}))
+        :ok
+      end,
+      compound_batch_put: fn _redis_key, entries ->
+        Agent.update(pid, fn state ->
+          Enum.reduce(entries, state, fn {compound_key, value, expire_at_ms}, acc ->
+            Map.put(acc, compound_key, {value, expire_at_ms})
+          end)
+        end)
+
         :ok
       end,
       compound_delete: fn _redis_key, compound_key ->
@@ -78,6 +114,7 @@ defmodule Ferricstore.Test.MockStore do
       compound_scan: fn _redis_key, prefix ->
         Agent.get(pid, fn state ->
           now = System.os_time(:millisecond)
+
           state
           |> Enum.filter(fn {k, {_, exp}} ->
             is_binary(k) and String.starts_with?(k, prefix) and (exp == 0 or exp > now)
@@ -95,6 +132,7 @@ defmodule Ferricstore.Test.MockStore do
       compound_count: fn _redis_key, prefix ->
         Agent.get(pid, fn state ->
           now = System.os_time(:millisecond)
+
           Enum.count(state, fn {k, {_, exp}} ->
             is_binary(k) and String.starts_with?(k, prefix) and (exp == 0 or exp > now)
           end)
@@ -106,6 +144,7 @@ defmodule Ferricstore.Test.MockStore do
             is_binary(k) and String.starts_with?(k, prefix)
           end)
         end)
+
         :ok
       end,
       incr: fn key, delta ->
@@ -279,7 +318,11 @@ defmodule Ferricstore.Test.MockStore do
             binary_part(padded, 0, offset) <>
               value <>
               if offset + byte_size(value) < byte_size(padded) do
-                binary_part(padded, offset + byte_size(value), byte_size(padded) - offset - byte_size(value))
+                binary_part(
+                  padded,
+                  offset + byte_size(value),
+                  byte_size(padded) - offset - byte_size(value)
+                )
               else
                 ""
               end
