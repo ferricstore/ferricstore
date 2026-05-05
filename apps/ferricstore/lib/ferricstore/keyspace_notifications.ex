@@ -15,7 +15,7 @@ defmodule Ferricstore.KeyspaceNotifications do
     * `K` -- enable `__keyspace@0__:<key>` channel
     * `E` -- enable `__keyevent@0__:<event>` channel
     * `g` -- generic commands: DEL, EXPIRE, RENAME, PERSIST, COPY
-    * `$` -- string commands: SET, INCR, APPEND, GETSET, SETRANGE
+    * `$` -- string commands: SET, INCR, APPEND, GETSET, SETRANGE, SETBIT, BITOP
     * `h` -- hash commands: HSET, HDEL, HINCRBY
     * `l` -- list commands: LPUSH, LPOP, LREM, LMOVE
     * `s` -- set commands: SADD, SREM, SPOP, SMOVE
@@ -56,6 +56,8 @@ defmodule Ferricstore.KeyspaceNotifications do
     "incrbyfloat" => "$",
     "decr" => "$",
     "decrby" => "$",
+    "setbit" => "$",
+    "bitop" => "$",
     "hset" => "h",
     "hdel" => "h",
     "hincrby" => "h",

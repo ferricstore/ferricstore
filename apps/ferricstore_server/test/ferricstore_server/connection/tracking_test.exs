@@ -382,4 +382,27 @@ defmodule FerricstoreServer.Connection.TrackingTest do
       assert_received {:pubsub_message, "__keyevent@0__:" <> ^event, ^key}
     end)
   end
+
+  test "bit writes fire string keyspace notifications on mutated keys" do
+    Config.set("notify-keyspace-events", "KE$")
+
+    bit_key = "tracking:keyspace:setbit"
+    bitop_source = "tracking:keyspace:bitop:src"
+    bitop_destination = "tracking:keyspace:bitop:dst"
+
+    PubSub.subscribe("__keyspace@0__:#{bit_key}", self())
+    PubSub.subscribe("__keyspace@0__:#{bitop_source}", self())
+    PubSub.subscribe("__keyspace@0__:#{bitop_destination}", self())
+    PubSub.subscribe("__keyevent@0__:setbit", self())
+    PubSub.subscribe("__keyevent@0__:bitop", self())
+
+    Tracking.maybe_notify_keyspace("SETBIT", [bit_key, "0", "1"], 0)
+    Tracking.maybe_notify_keyspace("BITOP", ["AND", bitop_destination, bitop_source], 1)
+
+    assert_received {:pubsub_message, "__keyspace@0__:" <> ^bit_key, "setbit"}
+    assert_received {:pubsub_message, "__keyevent@0__:setbit", ^bit_key}
+    assert_received {:pubsub_message, "__keyspace@0__:" <> ^bitop_destination, "bitop"}
+    assert_received {:pubsub_message, "__keyevent@0__:bitop", ^bitop_destination}
+    refute_received {:pubsub_message, "__keyspace@0__:" <> ^bitop_source, "bitop"}
+  end
 end

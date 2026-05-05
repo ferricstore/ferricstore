@@ -49,7 +49,7 @@ defmodule FerricstoreServer.KeyspaceNotificationsTest do
     end
 
     test "returns true for full string command family with $ flag" do
-      for event <- ~w(set setrange incrby decrby incrbyfloat getdel mset) do
+      for event <- ~w(set setrange incrby decrby incrbyfloat getdel mset setbit bitop) do
         assert KeyspaceNotifications.should_notify?(event, "K$")
       end
     end

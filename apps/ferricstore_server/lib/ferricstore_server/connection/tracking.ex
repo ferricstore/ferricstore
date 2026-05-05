@@ -73,6 +73,8 @@ defmodule FerricstoreServer.Connection.Tracking do
     "INCRBYFLOAT" => "incrbyfloat",
     "DEL" => "del",
     "UNLINK" => "del",
+    "SETBIT" => "setbit",
+    "BITOP" => "bitop",
     "EXPIRE" => "expire",
     "PEXPIRE" => "pexpire",
     "EXPIREAT" => "expireat",
@@ -161,6 +163,10 @@ defmodule FerricstoreServer.Connection.Tracking do
 
   def do_notify_keyspace("LMOVE", event, [source, destination | _], :ok) do
     KeyspaceNotifications.notify(source, event)
+    KeyspaceNotifications.notify(destination, event)
+  end
+
+  def do_notify_keyspace("BITOP", event, [_operation, destination | _], _result) do
     KeyspaceNotifications.notify(destination, event)
   end
 
