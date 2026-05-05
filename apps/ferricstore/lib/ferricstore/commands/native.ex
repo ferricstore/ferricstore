@@ -14,21 +14,18 @@ defmodule Ferricstore.Commands.Native do
   """
 
   alias Ferricstore.CommandTime
+  alias Ferricstore.Store.Ops
   alias Ferricstore.Store.Router
 
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
 
-  def handle("CAS", [key, expected, new_value], _store) do
-    ctx = FerricStore.Instance.get(:default)
-    Router.cas(ctx, key, expected, new_value, nil)
-  end
+  def handle("CAS", [key, expected, new_value], store),
+    do: Ops.cas(store, key, expected, new_value, nil)
 
-  def handle("CAS", [key, expected, new_value, "EX", secs_str], _store) do
-    ctx = FerricStore.Instance.get(:default)
-
+  def handle("CAS", [key, expected, new_value, "EX", secs_str], store) do
     case Integer.parse(secs_str) do
-      {secs, ""} when secs > 0 -> Router.cas(ctx, key, expected, new_value, secs * 1_000)
+      {secs, ""} when secs > 0 -> Ops.cas(store, key, expected, new_value, secs * 1_000)
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
@@ -36,11 +33,9 @@ defmodule Ferricstore.Commands.Native do
   def handle("CAS", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'cas' command"}
 
-  def handle("LOCK", [key, owner, ttl_ms_str], _store) do
-    ctx = FerricStore.Instance.get(:default)
-
+  def handle("LOCK", [key, owner, ttl_ms_str], store) do
     case Integer.parse(ttl_ms_str) do
-      {ttl_ms, ""} when ttl_ms > 0 -> Router.lock(ctx, key, owner, ttl_ms)
+      {ttl_ms, ""} when ttl_ms > 0 -> Ops.lock(store, key, owner, ttl_ms)
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
@@ -48,19 +43,14 @@ defmodule Ferricstore.Commands.Native do
   def handle("LOCK", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'lock' command"}
 
-  def handle("UNLOCK", [key, owner], _store) do
-    ctx = FerricStore.Instance.get(:default)
-    Router.unlock(ctx, key, owner)
-  end
+  def handle("UNLOCK", [key, owner], store), do: Ops.unlock(store, key, owner)
 
   def handle("UNLOCK", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'unlock' command"}
 
-  def handle("EXTEND", [key, owner, ttl_ms_str], _store) do
-    ctx = FerricStore.Instance.get(:default)
-
+  def handle("EXTEND", [key, owner, ttl_ms_str], store) do
     case Integer.parse(ttl_ms_str) do
-      {ttl_ms, ""} when ttl_ms > 0 -> Router.extend(ctx, key, owner, ttl_ms)
+      {ttl_ms, ""} when ttl_ms > 0 -> Ops.extend(store, key, owner, ttl_ms)
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
@@ -68,11 +58,11 @@ defmodule Ferricstore.Commands.Native do
   def handle("EXTEND", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'extend' command"}
 
-  def handle("RATELIMIT.ADD", [key, wms, max_str], _store),
-    do: do_ratelimit_add(key, wms, max_str, "1")
+  def handle("RATELIMIT.ADD", [key, wms, max_str], store),
+    do: do_ratelimit_add(store, key, wms, max_str, "1")
 
-  def handle("RATELIMIT.ADD", [key, wms, max_str, cnt], _store),
-    do: do_ratelimit_add(key, wms, max_str, cnt)
+  def handle("RATELIMIT.ADD", [key, wms, max_str, cnt], store),
+    do: do_ratelimit_add(store, key, wms, max_str, cnt)
 
   def handle("RATELIMIT.ADD", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'ratelimit.add' command"}
@@ -112,10 +102,8 @@ defmodule Ferricstore.Commands.Native do
   @spec handle_ast(term(), map()) :: term()
   def handle_ast({:cas, {:error, _} = err}, _store), do: err
 
-  def handle_ast({:cas, key, expected, new_value, ttl_ms}, _store) do
-    ctx = FerricStore.Instance.get(:default)
-    Router.cas(ctx, key, expected, new_value, ttl_ms)
-  end
+  def handle_ast({:cas, key, expected, new_value, ttl_ms}, store),
+    do: Ops.cas(store, key, expected, new_value, ttl_ms)
 
   def handle_ast({:cas, _args}, _store),
     do: {:error, "ERR wrong number of arguments for 'cas' command"}
@@ -123,32 +111,21 @@ defmodule Ferricstore.Commands.Native do
   def handle_ast({:lock, {:error, _} = err}, _store), do: err
   def handle_ast({:lock, _key, _owner, {:error, _} = err}, _store), do: err
 
-  def handle_ast({:lock, key, owner, ttl_ms}, _store) do
-    ctx = FerricStore.Instance.get(:default)
-    Router.lock(ctx, key, owner, ttl_ms)
-  end
+  def handle_ast({:lock, key, owner, ttl_ms}, store), do: Ops.lock(store, key, owner, ttl_ms)
 
   def handle_ast({:unlock, {:error, _} = err}, _store), do: err
 
-  def handle_ast({:unlock, key, owner}, _store) do
-    ctx = FerricStore.Instance.get(:default)
-    Router.unlock(ctx, key, owner)
-  end
+  def handle_ast({:unlock, key, owner}, store), do: Ops.unlock(store, key, owner)
 
   def handle_ast({:extend, {:error, _} = err}, _store), do: err
   def handle_ast({:extend, _key, _owner, {:error, _} = err}, _store), do: err
 
-  def handle_ast({:extend, key, owner, ttl_ms}, _store) do
-    ctx = FerricStore.Instance.get(:default)
-    Router.extend(ctx, key, owner, ttl_ms)
-  end
+  def handle_ast({:extend, key, owner, ttl_ms}, store), do: Ops.extend(store, key, owner, ttl_ms)
 
   def handle_ast({:ratelimit_add, {:error, _} = err}, _store), do: err
 
-  def handle_ast({:ratelimit_add, key, window_ms, max, count}, _store) do
-    ctx = FerricStore.Instance.get(:default)
-    Router.ratelimit_add(ctx, key, window_ms, max, count)
-  end
+  def handle_ast({:ratelimit_add, key, window_ms, max, count}, store),
+    do: Ops.ratelimit_add(store, key, window_ms, max, count)
 
   def handle_ast({:ferricstore_key_info, {:error, _} = err}, _store), do: err
   def handle_ast({:ferricstore_key_info, key}, _store), do: do_key_info(key)
@@ -172,15 +149,14 @@ defmodule Ferricstore.Commands.Native do
      "ERR wrong number of arguments for '#{String.replace(to_string(tag), "_", ".")}' command"}
   end
 
-  defp do_ratelimit_add(key, wms, max_str, cnt) do
+  defp do_ratelimit_add(store, key, wms, max_str, cnt) do
     with {w, ""} <- Integer.parse(wms),
          true <- w > 0,
          {m, ""} <- Integer.parse(max_str),
          true <- m > 0,
          {c, ""} <- Integer.parse(cnt),
          true <- c > 0 do
-      ctx = FerricStore.Instance.get(:default)
-      Router.ratelimit_add(ctx, key, w, m, c)
+      Ops.ratelimit_add(store, key, w, m, c)
     else
       _ -> {:error, "ERR value is not an integer or out of range"}
     end

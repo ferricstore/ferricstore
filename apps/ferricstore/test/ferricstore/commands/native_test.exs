@@ -19,8 +19,79 @@ defmodule Ferricstore.Commands.NativeTest do
   # Generates a unique key to prevent cross-test interference.
   defp ukey(base), do: "#{base}_#{:rand.uniform(9_999_999)}"
 
-  # Dummy store map — native commands ignore it and call Router directly.
-  defp dummy_store, do: %{}
+  defp dummy_store, do: FerricStore.Instance.get(:default)
+
+  defp observed_store(parent \\ self()) do
+    %{
+      cas: fn key, expected, new_value, ttl_ms ->
+        send(parent, {:native_store, :cas, key, expected, new_value, ttl_ms})
+        {:cas_result, ttl_ms}
+      end,
+      lock: fn key, owner, ttl_ms ->
+        send(parent, {:native_store, :lock, key, owner, ttl_ms})
+        :locked
+      end,
+      unlock: fn key, owner ->
+        send(parent, {:native_store, :unlock, key, owner})
+        7
+      end,
+      extend: fn key, owner, ttl_ms ->
+        send(parent, {:native_store, :extend, key, owner, ttl_ms})
+        8
+      end,
+      ratelimit_add: fn key, window_ms, max, count ->
+        send(parent, {:native_store, :ratelimit_add, key, window_ms, max, count})
+        ["observed", window_ms, max, count]
+      end
+    }
+  end
+
+  describe "store injection" do
+    test "string command handlers use the provided store" do
+      store = observed_store()
+
+      assert {:cas_result, nil} == Native.handle("CAS", ["k", "old", "new"], store)
+      assert_received {:native_store, :cas, "k", "old", "new", nil}
+
+      assert {:cas_result, 2_000} == Native.handle("CAS", ["k", "old", "new", "EX", "2"], store)
+      assert_received {:native_store, :cas, "k", "old", "new", 2_000}
+
+      assert :locked == Native.handle("LOCK", ["lk", "owner", "123"], store)
+      assert_received {:native_store, :lock, "lk", "owner", 123}
+
+      assert 7 == Native.handle("UNLOCK", ["lk", "owner"], store)
+      assert_received {:native_store, :unlock, "lk", "owner"}
+
+      assert 8 == Native.handle("EXTEND", ["lk", "owner", "456"], store)
+      assert_received {:native_store, :extend, "lk", "owner", 456}
+
+      assert ["observed", 1_000, 5, 2] ==
+               Native.handle("RATELIMIT.ADD", ["rl", "1000", "5", "2"], store)
+
+      assert_received {:native_store, :ratelimit_add, "rl", 1_000, 5, 2}
+    end
+
+    test "AST command handlers use the provided store" do
+      store = observed_store()
+
+      assert {:cas_result, 100} == Native.handle_ast({:cas, "k", "old", "new", 100}, store)
+      assert_received {:native_store, :cas, "k", "old", "new", 100}
+
+      assert :locked == Native.handle_ast({:lock, "lk", "owner", 123}, store)
+      assert_received {:native_store, :lock, "lk", "owner", 123}
+
+      assert 7 == Native.handle_ast({:unlock, "lk", "owner"}, store)
+      assert_received {:native_store, :unlock, "lk", "owner"}
+
+      assert 8 == Native.handle_ast({:extend, "lk", "owner", 456}, store)
+      assert_received {:native_store, :extend, "lk", "owner", 456}
+
+      assert ["observed", 1_000, 5, 2] ==
+               Native.handle_ast({:ratelimit_add, "rl", 1_000, 5, 2}, store)
+
+      assert_received {:native_store, :ratelimit_add, "rl", 1_000, 5, 2}
+    end
+  end
 
   # ===========================================================================
   # CAS — Compare-and-Swap
@@ -391,7 +462,14 @@ defmodule Ferricstore.Commands.NativeTest do
 
     test "EXTEND is routed through dispatcher" do
       key = ukey("disp_extend")
-      Router.put(FerricStore.Instance.get(:default), key, "owner1", System.os_time(:millisecond) + 5_000)
+
+      Router.put(
+        FerricStore.Instance.get(:default),
+        key,
+        "owner1",
+        System.os_time(:millisecond) + 5_000
+      )
+
       assert 1 == Dispatcher.dispatch("EXTEND", [key, "owner1", "10000"], dummy_store())
     end
 
