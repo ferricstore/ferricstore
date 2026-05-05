@@ -662,6 +662,45 @@ defmodule Ferricstore.Commands.ListTest do
       assert 0 == List.handle("LLEN", ["src"], store)
     end
 
+    test "does not drop source element when destination write fails" do
+      base = MockStore.make()
+      List.handle("RPUSH", ["src", "a", "b"], base)
+      List.handle("RPUSH", ["dst", "x"], base)
+
+      store =
+        Map.put(base, :compound_put, fn
+          "dst", "L:dst" <> <<0>> <> _pos, _value, 0 ->
+            {:error, :disk_full}
+
+          key, compound_key, value, expire_at_ms ->
+            base.compound_put.(key, compound_key, value, expire_at_ms)
+        end)
+
+      assert {:error, :disk_full} == List.handle("LMOVE", ["src", "dst", "LEFT", "RIGHT"], store)
+      assert ["a", "b"] == List.handle("LRANGE", ["src", "0", "-1"], base)
+      assert ["x"] == List.handle("LRANGE", ["dst", "0", "-1"], base)
+    end
+
+    test "does not drop source element when source metadata update fails" do
+      base = MockStore.make()
+      List.handle("RPUSH", ["src", "a", "b"], base)
+      List.handle("RPUSH", ["dst", "x"], base)
+      src_meta_key = CompoundKey.list_meta_key("src")
+
+      store =
+        Map.put(base, :compound_put, fn
+          "src", ^src_meta_key, _value, 0 ->
+            {:error, :disk_full}
+
+          key, compound_key, value, expire_at_ms ->
+            base.compound_put.(key, compound_key, value, expire_at_ms)
+        end)
+
+      assert {:error, :disk_full} == List.handle("LMOVE", ["src", "dst", "LEFT", "RIGHT"], store)
+      assert ["a", "b"] == List.handle("LRANGE", ["src", "0", "-1"], base)
+      assert ["x"] == List.handle("LRANGE", ["dst", "0", "-1"], base)
+    end
+
     test "returns error for invalid direction" do
       store = MockStore.make()
       assert {:error, _} = List.handle("LMOVE", ["src", "dst", "UP", "DOWN"], store)

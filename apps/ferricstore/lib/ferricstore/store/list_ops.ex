@@ -38,7 +38,7 @@ defmodule Ferricstore.Store.ListOps do
       {0, _, _} ->
         nil
 
-      {_len, _left, _right} ->
+      {_len, _left, _right} = src_meta ->
         sorted = sorted_elements(src_key, store)
 
         if sorted == [] do
@@ -52,14 +52,41 @@ defmodule Ferricstore.Store.ListOps do
 
           remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
 
-          with :ok <- delete_elements(src_key, store, [{pos, element}]),
-               :ok <- update_or_delete_meta(src_key, store, length(remaining), remaining),
-               :ok <-
-                 push_moved_element(dst_key, store, element, read_meta(dst_key, store), to_dir) do
-            element
+          with :ok <- delete_elements(src_key, store, [{pos, element}]) do
+            case update_or_delete_meta(src_key, store, length(remaining), remaining) do
+              :ok ->
+                case push_moved_element(
+                       dst_key,
+                       store,
+                       element,
+                       read_meta(dst_key, store),
+                       to_dir
+                     ) do
+                  :ok ->
+                    element
+
+                  {:error, _} = error ->
+                    rollback_lmove_source(src_key, store, pos, element, src_meta)
+                    error
+                end
+
+              {:error, _} = error ->
+                rollback_lmove_source(src_key, store, pos, element, src_meta)
+                error
+            end
           end
         end
     end
+  end
+
+  defp rollback_lmove_source(src_key, store, pos, element, src_meta) do
+    _ =
+      store
+      |> Ops.compound_put(src_key, CompoundKey.list_element(src_key, pos), element, 0)
+      |> write_result()
+
+    _ = write_meta(src_key, store, src_meta)
+    :ok
   end
 
   defp push_moved_element(dst_key, store, element, nil, _to_dir) do
