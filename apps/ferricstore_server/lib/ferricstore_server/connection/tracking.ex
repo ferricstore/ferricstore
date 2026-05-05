@@ -237,6 +237,7 @@ defmodule FerricstoreServer.Connection.Tracking do
   @doc false
   @spec maybe_notify_tracking(binary(), [binary()], term(), map()) :: :ok
   def maybe_notify_tracking(_cmd, _args, {:error, _}, _state), do: :ok
+  def maybe_notify_tracking(cmd, _args, 0, _state) when cmd in ~w(COPY MSETNX RENAMENX), do: :ok
 
   def maybe_notify_tracking(cmd, args, _result, _state) do
     if MapSet.member?(@write_cmds_set, cmd) do
@@ -262,7 +263,7 @@ defmodule FerricstoreServer.Connection.Tracking do
       c when c in ~w(DEL UNLINK) ->
         ClientTracking.notify_keys_modified(args, writer_pid, sender)
 
-      "RENAME" ->
+      c when c in ~w(RENAME RENAMENX) ->
         notify_tracking_keys(args, :all, writer_pid, sender)
 
       "LMOVE" ->

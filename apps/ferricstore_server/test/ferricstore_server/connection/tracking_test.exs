@@ -121,6 +121,70 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert :ets.lookup(:ferricstore_tracking, destination) == []
   end
 
+  test "COPY tracking invalidates destination only when mutation succeeds" do
+    source = "tracking:copy:src"
+    destination = "tracking:copy:dst"
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+    ClientTracking.track_key(self(), destination, tracking)
+
+    Tracking.maybe_notify_tracking("COPY", [source, destination], 0, %{tracking: tracking})
+
+    refute_received {:tracking_invalidation, _, _}
+    assert :ets.lookup(:ferricstore_tracking, destination) == [{destination, self()}]
+
+    Tracking.maybe_notify_tracking("COPY", [source, destination], 1, %{tracking: tracking})
+
+    assert_receive {:tracking_invalidation, _payload, [^destination]}
+    assert :ets.lookup(:ferricstore_tracking, destination) == []
+    assert :ets.lookup(:ferricstore_tracking, source) == []
+  end
+
+  test "MSETNX tracking invalidates all keys only when mutation succeeds" do
+    key_a = "tracking:msetnx:a"
+    key_b = "tracking:msetnx:b"
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+    ClientTracking.track_key(self(), key_a, tracking)
+    ClientTracking.track_key(self(), key_b, tracking)
+
+    Tracking.maybe_notify_tracking("MSETNX", [key_a, "1", key_b, "2"], 0, %{
+      tracking: tracking
+    })
+
+    refute_received {:tracking_invalidation, _, _}
+    assert :ets.lookup(:ferricstore_tracking, key_a) == [{key_a, self()}]
+    assert :ets.lookup(:ferricstore_tracking, key_b) == [{key_b, self()}]
+
+    Tracking.maybe_notify_tracking("MSETNX", [key_a, "1", key_b, "2"], 1, %{
+      tracking: tracking
+    })
+
+    assert_receive {:tracking_invalidation, _payload, [^key_a]}
+    assert_receive {:tracking_invalidation, _payload, [^key_b]}
+    assert :ets.lookup(:ferricstore_tracking, key_a) == []
+    assert :ets.lookup(:ferricstore_tracking, key_b) == []
+  end
+
+  test "RENAMENX tracking invalidates source and destination only when rename succeeds" do
+    source = "tracking:renamenx:src"
+    destination = "tracking:renamenx:dst"
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+    ClientTracking.track_key(self(), source, tracking)
+    ClientTracking.track_key(self(), destination, tracking)
+
+    Tracking.maybe_notify_tracking("RENAMENX", [source, destination], 0, %{tracking: tracking})
+
+    refute_received {:tracking_invalidation, _, _}
+    assert :ets.lookup(:ferricstore_tracking, source) == [{source, self()}]
+    assert :ets.lookup(:ferricstore_tracking, destination) == [{destination, self()}]
+
+    Tracking.maybe_notify_tracking("RENAMENX", [source, destination], 1, %{tracking: tracking})
+
+    assert_receive {:tracking_invalidation, _payload, [^source]}
+    assert_receive {:tracking_invalidation, _payload, [^destination]}
+    assert :ets.lookup(:ferricstore_tracking, source) == []
+    assert :ets.lookup(:ferricstore_tracking, destination) == []
+  end
+
   test "COPY keyspace notification fires for destination only on mutation" do
     source = "tracking:keyspace:copy:src"
     destination = "tracking:keyspace:copy:dst"
