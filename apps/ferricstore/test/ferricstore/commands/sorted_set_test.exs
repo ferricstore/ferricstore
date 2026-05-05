@@ -362,6 +362,12 @@ defmodule Ferricstore.Commands.SortedSetTest do
       SortedSet.handle("ZREM", ["zs", "a"], store)
       assert nil == store.compound_get.("zs", "T:zs")
     end
+
+    test "ZREM returns type cleanup errors after removing the last member" do
+      store = zset_cleanup_failure_store()
+
+      assert {:error, :disk_full} == SortedSet.handle("ZREM", ["zs", "only"], store)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -632,6 +638,12 @@ defmodule Ferricstore.Commands.SortedSetTest do
     test "ZPOPMIN on empty key returns empty list" do
       store = MockStore.make()
       assert [] == SortedSet.handle("ZPOPMIN", ["nonexistent"], store)
+    end
+
+    test "ZPOPMIN returns type cleanup errors after removing the last member" do
+      store = zset_cleanup_failure_store()
+
+      assert {:error, :disk_full} == SortedSet.handle("ZPOPMIN", ["zs"], store)
     end
   end
 
@@ -1280,5 +1292,19 @@ defmodule Ferricstore.Commands.SortedSetTest do
     else
       collect_zscan_members(store, key, next_cursor, count, new_acc)
     end
+  end
+
+  defp zset_cleanup_failure_store do
+    type_key = CompoundKey.type_key("zs")
+    member_key = CompoundKey.zset_member("zs", "only")
+
+    %{
+      compound_get: fn "zs", ^type_key -> "zset" end,
+      compound_batch_get: fn "zs", [^member_key] -> ["1.0"] end,
+      compound_batch_delete: fn "zs", [^member_key] -> :ok end,
+      compound_count: fn "zs", _prefix -> 0 end,
+      compound_delete: fn "zs", ^type_key -> {:error, :disk_full} end,
+      compound_scan: fn "zs", _prefix -> [{"only", "1.0"}] end
+    }
   end
 end

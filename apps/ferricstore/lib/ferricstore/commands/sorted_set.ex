@@ -310,15 +310,9 @@ defmodule Ferricstore.Commands.SortedSet do
 
           case Ops.compound_batch_delete(store, key, compound_keys) do
             :ok ->
-              if to_pop != [] do
-                prefix = CompoundKey.zset_prefix(key)
-
-                if Ops.compound_count(store, key, prefix) == 0 do
-                  TypeRegistry.delete_type(key, store)
-                end
+              with :ok <- maybe_cleanup_empty_zset(key, length(to_pop), store) do
+                result
               end
-
-              result
 
             {:error, _} = err ->
               err
@@ -359,15 +353,9 @@ defmodule Ferricstore.Commands.SortedSet do
 
           case Ops.compound_batch_delete(store, key, compound_keys) do
             :ok ->
-              if to_pop != [] do
-                prefix = CompoundKey.zset_prefix(key)
-
-                if Ops.compound_count(store, key, prefix) == 0 do
-                  TypeRegistry.delete_type(key, store)
-                end
+              with :ok <- maybe_cleanup_empty_zset(key, length(to_pop), store) do
+                result
               end
-
-              result
 
             {:error, _} = err ->
               err
@@ -701,6 +689,18 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
+  defp maybe_cleanup_empty_zset(_key, 0, _store), do: :ok
+
+  defp maybe_cleanup_empty_zset(key, _removed, store) do
+    prefix = CompoundKey.zset_prefix(key)
+
+    if Ops.compound_count(store, key, prefix) == 0 do
+      TypeRegistry.delete_type(key, store)
+    else
+      :ok
+    end
+  end
+
   defp zrem_args([key | members], store) when members != [] do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
       compound_keys =
@@ -721,15 +721,9 @@ defmodule Ferricstore.Commands.SortedSet do
 
       case Ops.compound_batch_delete(store, key, removed_keys) do
         :ok ->
-          if removed > 0 do
-            prefix = CompoundKey.zset_prefix(key)
-
-            if Ops.compound_count(store, key, prefix) == 0 do
-              TypeRegistry.delete_type(key, store)
-            end
+          with :ok <- maybe_cleanup_empty_zset(key, removed, store) do
+            removed
           end
-
-          removed
 
         {:error, _} = err ->
           err
@@ -973,15 +967,9 @@ defmodule Ferricstore.Commands.SortedSet do
 
       case Ops.compound_batch_delete(store, key, compound_keys) do
         :ok ->
-          if to_pop != [] do
-            prefix = CompoundKey.zset_prefix(key)
-
-            if Ops.compound_count(store, key, prefix) == 0 do
-              TypeRegistry.delete_type(key, store)
-            end
+          with :ok <- maybe_cleanup_empty_zset(key, length(to_pop), store) do
+            result
           end
-
-          result
 
         {:error, _} = err ->
           err
