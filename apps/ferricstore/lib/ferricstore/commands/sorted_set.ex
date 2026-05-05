@@ -215,8 +215,7 @@ defmodule Ferricstore.Commands.SortedSet do
             end
 
           new_score = current_score + increment
-          Ops.compound_put(store, key, compound_key, Float.to_string(new_score), 0)
-          format_score(new_score)
+          write_zscore(store, key, compound_key, new_score)
 
         :error ->
           # Try integer parse
@@ -238,8 +237,7 @@ defmodule Ferricstore.Commands.SortedSet do
                 end
 
               new_score = current_score + increment * 1.0
-              Ops.compound_put(store, key, compound_key, Float.to_string(new_score), 0)
-              format_score(new_score)
+              write_zscore(store, key, compound_key, new_score)
 
             _ ->
               {:error, "ERR value is not a valid float"}
@@ -872,8 +870,16 @@ defmodule Ferricstore.Commands.SortedSet do
         end
 
       new_score = current_score + increment
-      Ops.compound_put(store, key, compound_key, Float.to_string(new_score), 0)
-      format_score(new_score)
+      write_zscore(store, key, compound_key, new_score)
+    end
+  end
+
+  defp write_zscore(store, key, compound_key, new_score) do
+    case Ops.compound_put(store, key, compound_key, Float.to_string(new_score), 0) do
+      :ok -> format_score(new_score)
+      true -> format_score(new_score)
+      {:error, _reason} = error -> error
+      other -> {:error, other}
     end
   end
 

@@ -396,6 +396,21 @@ defmodule Ferricstore.Commands.SortedSetTest do
       store = MockStore.make()
       assert {:error, _} = SortedSet.handle("ZINCRBY", ["zs", "abc", "a"], store)
     end
+
+    test "ZINCRBY returns member write errors" do
+      type_key = CompoundKey.type_key("zs")
+      member_key = CompoundKey.zset_member("zs", "a")
+
+      store = %{
+        compound_get: fn
+          "zs", ^type_key -> "zset"
+          "zs", ^member_key -> nil
+        end,
+        compound_put: fn "zs", ^member_key, "5.0", 0 -> {:error, "disk full"} end
+      }
+
+      assert {:error, "disk full"} == SortedSet.handle("ZINCRBY", ["zs", "5.0", "a"], store)
+    end
   end
 
   # ---------------------------------------------------------------------------
