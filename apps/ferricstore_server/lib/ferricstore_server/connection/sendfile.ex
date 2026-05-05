@@ -146,7 +146,8 @@ defmodule FerricstoreServer.Connection.Sendfile do
             dispatch_normal_fn
           )
         else
-          dispatch_normal_fn.("MGET", keys, state)
+          new_state = ConnTracking.maybe_track_read("MGET", keys, results, state)
+          {:continue, Encoder.encode(results), new_state}
         end
 
       :error ->

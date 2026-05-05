@@ -413,6 +413,36 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       :gen_tcp.close(sock)
     end
 
+    test "read-only keyed command before pipelined GET does not disable sendfile", %{port: port} do
+      attach_sendfile_handler(self())
+
+      sock = connect_and_hello(port)
+      large_key = ukey("pipeline_exists_get_large")
+      large_value = :binary.copy("E", @sendfile_threshold + 4096)
+
+      send_cmd(sock, ["SET", large_key, large_value])
+      assert recv_response(sock) == {:simple, "OK"}
+
+      :gen_tcp.close(sock)
+      sock = connect_and_hello(port)
+
+      send_pipeline(sock, [
+        ["EXISTS", large_key],
+        ["GET", large_key]
+      ])
+
+      assert recv_response(sock) == 1
+      assert recv_response(sock) == large_value
+
+      size = byte_size(large_value)
+
+      assert_receive {:sendfile_event, [:ferricstore, :server, :sendfile], %{bytes: ^size},
+                      %{result: :ok}},
+                     1000
+
+      :gen_tcp.close(sock)
+    end
+
     test "MGET streams large cold bulk elements with sendfile", %{port: port} do
       attach_sendfile_handler(self())
 

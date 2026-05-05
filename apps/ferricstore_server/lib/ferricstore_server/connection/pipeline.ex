@@ -19,6 +19,16 @@ defmodule FerricstoreServer.Connection.Pipeline do
     BLPOP BRPOP BLMOVE BLMPOP
   ))
 
+  @prefetch_read_only_keyed_cmds MapSet.new(~w(
+    EXISTS STRLEN TTL PTTL TYPE
+    HGET HMGET HGETALL HEXISTS HLEN HKEYS HVALS
+    LRANGE LINDEX LLEN
+    SCARD SISMEMBER SMEMBERS SMISMEMBER
+    ZCARD ZSCORE ZMSCORE ZRANGE ZREVRANGE
+    JSON.GET JSON.MGET
+    BF.EXISTS BF.MEXISTS CF.EXISTS CMS.QUERY TOPK.QUERY TDIGEST.INFO
+  ))
+
   # Maximum commands in a single pipeline batch (100K).
   @max_pipeline_size 100_000
 
@@ -828,8 +838,12 @@ defmodule FerricstoreServer.Connection.Pipeline do
                written_keys}
             end
 
-          {_name, _args, _ast, keys} when is_list(keys) and keys != [] ->
-            {get_acc, mget_acc, getrange_acc, mark_written_keys(written_keys, keys)}
+          {name, _args, _ast, keys} when is_list(keys) and keys != [] ->
+            if read_only_keyed_command?(name) do
+              {get_acc, mget_acc, getrange_acc, written_keys}
+            else
+              {get_acc, mget_acc, getrange_acc, mark_written_keys(written_keys, keys)}
+            end
 
           _ ->
             {get_acc, mget_acc, getrange_acc, written_keys}
@@ -852,6 +866,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp mark_written_keys(written_keys, keys) do
     Enum.reduce(keys, written_keys, fn key, acc -> MapSet.put(acc, key) end)
   end
+
+  defp read_only_keyed_command?(name), do: MapSet.member?(@prefetch_read_only_keyed_cmds, name)
 
   defp prefetch_tcp_get_ops(gets, state) do
     case gets do
