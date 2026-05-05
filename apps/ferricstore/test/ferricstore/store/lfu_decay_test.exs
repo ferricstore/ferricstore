@@ -427,7 +427,8 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
       store = %{
         get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
-        exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end
+        exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
+        object_lfu: fn k -> Router.object_lfu(FerricStore.Instance.get(:default), k) end
       }
 
       result = Ferricstore.Commands.Generic.handle("OBJECT", ["FREQ", "freq_key"], store)
@@ -445,7 +446,8 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
       store = %{
         get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
-        exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end
+        exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
+        object_lfu: fn k -> Router.object_lfu(FerricStore.Instance.get(:default), k) end
       }
 
       result = Ferricstore.Commands.Generic.handle("OBJECT", ["FREQ", "freq_old_key"], store)

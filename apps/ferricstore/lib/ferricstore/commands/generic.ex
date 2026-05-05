@@ -389,12 +389,8 @@ defmodule Ferricstore.Commands.Generic do
 
   defp do_object("FREQ", [key], store) do
     if object_exists?(store, key) do
-      ctx = FerricStore.Instance.get(:default)
-      idx = Ferricstore.Store.Router.shard_for(ctx, key)
-      keydir = Ferricstore.Store.Router.resolve_keydir(ctx, idx)
-
-      case :ets.lookup(keydir, key) do
-        [{^key, _val, _exp, packed_lfu, _fid, _off, _vsize}] ->
+      case Ops.object_lfu(store, key) do
+        packed_lfu when is_integer(packed_lfu) ->
           Ferricstore.Store.LFU.effective_counter(packed_lfu)
 
         _ ->
@@ -407,12 +403,8 @@ defmodule Ferricstore.Commands.Generic do
 
   defp do_object("IDLETIME", [key], store) do
     if object_exists?(store, key) do
-      ctx = FerricStore.Instance.get(:default)
-      idx = Ferricstore.Store.Router.shard_for(ctx, key)
-      keydir = Ferricstore.Store.Router.resolve_keydir(ctx, idx)
-
-      case :ets.lookup(keydir, key) do
-        [{^key, _val, _exp, packed_lfu, _fid, _off, _vsize}] ->
+      case Ops.object_lfu(store, key) do
+        packed_lfu when is_integer(packed_lfu) ->
           {ldt, _counter} = Ferricstore.Store.LFU.unpack(packed_lfu)
           now_min = Ferricstore.Store.LFU.now_minutes()
           elapsed = Ferricstore.Store.LFU.elapsed_minutes(now_min, ldt)

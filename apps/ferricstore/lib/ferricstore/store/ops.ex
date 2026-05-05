@@ -146,6 +146,50 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
+  @spec object_lfu(store(), binary()) :: non_neg_integer() | nil
+  def object_lfu(%FerricStore.Instance{} = ctx, key), do: Router.object_lfu(ctx, key)
+
+  def object_lfu(%LocalTxStore{} = tx, key) do
+    cond do
+      not local?(tx, key) ->
+        Router.object_lfu(tx.instance_ctx, key)
+
+      tx_deleted?(key) ->
+        nil
+
+      tx_pending_meta(key) != nil ->
+        Ferricstore.Store.LFU.initial()
+
+      true ->
+        now = HLC.now_ms()
+
+        case :ets.lookup(tx.shard_state.keydir, key) do
+          [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
+            lfu
+
+          [{^key, nil, 0, lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+            lfu
+
+          [{^key, value, exp, lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+            lfu
+
+          [{^key, nil, exp, lfu, fid, off, vsize}]
+          when exp > now and valid_cold_location(fid, off, vsize) ->
+            lfu
+
+          _ ->
+            nil
+        end
+    end
+  end
+
+  def object_lfu(store, key) when is_map(store) do
+    case store do
+      %{object_lfu: object_lfu} when is_function(object_lfu, 1) -> object_lfu.(key)
+      _ -> nil
+    end
+  end
+
   @spec getrange(store(), binary(), integer(), integer()) :: binary() | nil
   def getrange(%FerricStore.Instance{} = ctx, key, start_idx, end_idx),
     do: Router.getrange(ctx, key, start_idx, end_idx)

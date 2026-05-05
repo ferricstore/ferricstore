@@ -2758,6 +2758,49 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @doc false
+  @spec object_lfu(FerricStore.Instance.t(), binary()) :: non_neg_integer() | nil
+  def object_lfu(ctx, key) do
+    idx = shard_for(ctx, key)
+    keydir = resolve_keydir(ctx, idx)
+    now = HLC.now_ms()
+
+    try do
+      case :ets.lookup(keydir, key) do
+        [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
+          lfu
+
+        [{^key, nil, 0, lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+          lfu
+
+        [{^key, nil, 0, lfu, :pending, _off, vsize}]
+        when valid_pending_value_size(vsize) ->
+          lfu
+
+        [{^key, value, exp, lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+          lfu
+
+        [{^key, nil, exp, lfu, fid, off, vsize}]
+        when exp > now and valid_cold_location(fid, off, vsize) ->
+          lfu
+
+        [{^key, nil, exp, lfu, :pending, _off, vsize}]
+        when exp > now and valid_pending_value_size(vsize) ->
+          lfu
+
+        [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
+          track_keydir_binary_delete(ctx, idx, keydir, key)
+          :ets.delete(keydir, key)
+          nil
+
+        [] ->
+          nil
+      end
+    rescue
+      ArgumentError -> keydir_unavailable(ctx, idx, :object_lfu, nil)
+    end
+  end
+
   @doc """
   Returns a byte range for a live plain key without reading the full cold value.
 

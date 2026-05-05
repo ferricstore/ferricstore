@@ -4,6 +4,7 @@ defmodule Ferricstore.Commands.GenericTest do
 
   alias Ferricstore.Commands.{Generic, Hash}
   alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.LFU
   alias Ferricstore.Test.MockStore
 
   # ---------------------------------------------------------------------------
@@ -664,6 +665,17 @@ defmodule Ferricstore.Commands.GenericTest do
       assert 0 == Generic.handle("OBJECT", ["FREQ", "k"], store)
     end
 
+    test "OBJECT FREQ uses injected LFU metadata instead of the default instance" do
+      store = %{
+        compound_get: fn _redis_key, _compound_key -> nil end,
+        exists?: fn "custom_cold" -> true end,
+        object_lfu: fn "custom_cold" -> LFU.pack(LFU.now_minutes(), 37) end,
+        get: fn _key -> flunk("OBJECT FREQ should not load the value") end
+      }
+
+      assert 37 == Generic.handle("OBJECT", ["FREQ", "custom_cold"], store)
+    end
+
     test "OBJECT FREQ returns error for missing key" do
       store = MockStore.make()
       assert {:error, "ERR no such key"} = Generic.handle("OBJECT", ["FREQ", "missing"], store)
@@ -678,6 +690,19 @@ defmodule Ferricstore.Commands.GenericTest do
     test "OBJECT IDLETIME returns 0 for existing key (stub)" do
       store = MockStore.make(%{"k" => {"v", 0}})
       assert 0 == Generic.handle("OBJECT", ["IDLETIME", "k"], store)
+    end
+
+    test "OBJECT IDLETIME uses injected LFU metadata instead of the default instance" do
+      ldt = Bitwise.band(LFU.now_minutes() - 2, 0xFFFF)
+
+      store = %{
+        compound_get: fn _redis_key, _compound_key -> nil end,
+        exists?: fn "custom_idle" -> true end,
+        object_lfu: fn "custom_idle" -> LFU.pack(ldt, 1) end,
+        get: fn _key -> flunk("OBJECT IDLETIME should not load the value") end
+      }
+
+      assert Generic.handle("OBJECT", ["IDLETIME", "custom_idle"], store) in 120..180
     end
 
     test "OBJECT IDLETIME returns error for missing key" do

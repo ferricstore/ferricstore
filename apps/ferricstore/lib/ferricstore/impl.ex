@@ -796,6 +796,7 @@ defmodule FerricStore.Impl do
       batch_get: fn keys -> Router.batch_get(ctx, keys) end,
       expire_at_ms: fn key -> Router.expire_at_ms(ctx, key) end,
       value_size: fn key -> Router.value_size(ctx, key) end,
+      object_lfu: fn key -> Router.object_lfu(ctx, key) end,
       put: fn key, value, exp -> Router.put(ctx, key, value, exp) end,
       delete: fn key -> Router.delete(ctx, key) end,
       exists?: fn key -> Router.exists?(ctx, key) end,
