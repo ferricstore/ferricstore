@@ -134,5 +134,25 @@ defmodule Ferricstore.Store.RouterTest do
       assert Router.get(ctx, key_a) == nil
       assert Router.get_with_file_ref(ctx, key_a) == :miss
     end
+
+    test "corrupted cold value bytes are rejected before sendfile", %{ctx: ctx} do
+      key = "sendfile_crc_" <> Integer.to_string(System.unique_integer([:positive]))
+      value = :binary.copy("c", ctx.hot_cache_max_value_size + 1024)
+
+      assert :ok = Router.put(ctx, key, value, 0)
+      assert {:cold_ref, path, value_offset, size} = Router.get_with_file_ref(ctx, key)
+      assert size == byte_size(value)
+
+      assert {:ok, file} = :file.open(path, [:read, :write, :raw, :binary])
+
+      try do
+        assert :ok = :file.pwrite(file, value_offset + 16, "X")
+      after
+        :file.close(file)
+      end
+
+      refute Router.get_with_file_ref(ctx, key) == {:cold_ref, path, value_offset, size}
+      refute Router.get(ctx, key) == value
+    end
   end
 end

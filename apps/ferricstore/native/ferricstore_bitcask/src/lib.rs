@@ -447,6 +447,7 @@ fn validate_value_ref_from_file(
         return Ok(None);
     }
 
+    let stored_crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
     let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
 
@@ -471,7 +472,54 @@ fn validate_value_ref_from_file(
         .and_then(|off| off.checked_add(key_size as u64))
         .ok_or_else(|| "file ref value offset overflow".to_string())?;
 
+    validate_file_ref_crc(
+        file,
+        value_offset,
+        expected_value_size,
+        &header,
+        &key,
+        stored_crc,
+    )?;
+
     Ok(Some((value_offset, expected_value_size)))
+}
+
+fn validate_file_ref_crc(
+    file: &std::fs::File,
+    value_offset: u64,
+    value_size: u64,
+    header: &[u8; log::HEADER_SIZE],
+    key: &[u8],
+    stored_crc: u32,
+) -> Result<(), String> {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&header[4..]);
+    hasher.update(key);
+
+    let mut remaining = value_size;
+    let mut read_offset = value_offset;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    while remaining > 0 {
+        let read_size = usize::try_from(remaining.min(buf.len() as u64))
+            .map_err(|_| "file ref value read size overflow".to_string())?;
+        let chunk = &mut buf[..read_size];
+        read_exact_at_for_ref(file, chunk, read_offset)?;
+        hasher.update(chunk);
+        read_offset = read_offset
+            .checked_add(read_size as u64)
+            .ok_or_else(|| "file ref value offset overflow".to_string())?;
+        remaining -= read_size as u64;
+    }
+
+    let computed_crc = hasher.finalize();
+    if computed_crc == stored_crc {
+        Ok(())
+    } else {
+        Err(format!(
+            "CRC mismatch: stored={stored_crc}, computed={computed_crc}"
+        ))
+    }
 }
 
 #[rustler::nif(schedule = "Normal")]
@@ -2620,6 +2668,32 @@ mod audit_fix_tests {
             result,
             Some((offset + log::HEADER_SIZE as u64 + b"key_a".len() as u64, 7))
         );
+    }
+
+    #[test]
+    fn value_ref_validation_rejects_value_crc_corruption() {
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+        let offset;
+
+        {
+            let mut writer = log::LogWriter::open_small(&path, 1).unwrap();
+            offset = writer.write(b"key_a", b"value_a", 0).unwrap();
+            writer.sync().unwrap();
+        }
+
+        let value_offset = offset + log::HEADER_SIZE as u64 + b"key_a".len() as u64;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.write_all_at(b"X", value_offset + 2).unwrap();
+        drop(file);
+
+        let file = std::fs::File::open(&path).unwrap();
+        let err = validate_value_ref_from_file(&file, offset, b"key_a", 7).unwrap_err();
+        assert!(err.contains("CRC mismatch"));
     }
 
     #[test]
