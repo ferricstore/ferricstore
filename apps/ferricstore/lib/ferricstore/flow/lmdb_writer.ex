@@ -505,14 +505,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
        ) do
     prune_terminal_state_key(ets, state_key, version)
 
-    if zset_index != nil and zset_lookup != nil do
-      Ferricstore.Store.Shard.ZSetIndex.delete_member(
-        zset_index,
-        zset_lookup,
-        state_index_key,
-        id
-      )
-    end
+    safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
 
     :ok
   end
@@ -527,6 +520,20 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp apply_after_flush(_action), do: :ok
+
+  defp safe_zset_delete_member(nil, _zset_lookup, _state_index_key, _id), do: :ok
+  defp safe_zset_delete_member(_zset_index, nil, _state_index_key, _id), do: :ok
+
+  defp safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id) do
+    Ferricstore.Store.Shard.ZSetIndex.delete_member(
+      zset_index,
+      zset_lookup,
+      state_index_key,
+      id
+    )
+  rescue
+    ArgumentError -> :ok
+  end
 
   defp prune_terminal_state_key(ets, state_key, version) do
     case :ets.lookup(ets, state_key) do

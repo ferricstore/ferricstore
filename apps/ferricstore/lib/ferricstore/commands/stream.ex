@@ -1496,12 +1496,10 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   defp decode_stream_fields(raw) when is_binary(raw) do
-    case :erlang.binary_to_term(raw, [:safe]) do
-      fields when is_list(fields) -> {:ok, fields}
+    case Ferricstore.Flow.decode_history_fields(raw) do
+      [_ | _] = fields -> {:ok, fields}
       _ -> :error
     end
-  rescue
-    _ -> :error
   end
 
   defp decode_stream_fields(_), do: :error

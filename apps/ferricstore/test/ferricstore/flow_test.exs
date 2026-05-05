@@ -102,6 +102,122 @@ defmodule Ferricstore.FlowTest do
     assert byte_size(state_key) < byte_size(old_state_key)
   end
 
+  test "flow state record encoding is compact and decodes old map records" do
+    record = %{
+      id: "flow-1",
+      type: "checkout",
+      state: "queued",
+      version: 3,
+      attempts: 2,
+      fencing_token: 9,
+      created_at_ms: 1_000,
+      updated_at_ms: 1_100,
+      next_run_at_ms: 1_200,
+      priority: 1,
+      ttl_ms: 60_000,
+      history_max_events: 100,
+      partition_key: "tenant-a",
+      payload_ref: "payload:1",
+      parent_flow_id: "parent-1",
+      root_flow_id: "root-1",
+      correlation_id: "order-1",
+      result_ref: "result:1",
+      error_ref: nil,
+      lease_owner: "worker-1",
+      lease_token: "lease-1",
+      lease_deadline_ms: 2_000,
+      rewound_to_event_id: "1000-1"
+    }
+
+    compact = Ferricstore.Flow.encode_record(record)
+    old_map = :erlang.term_to_binary(record)
+    normal_record = Map.delete(record, :rewound_to_event_id)
+
+    assert Ferricstore.Flow.decode_record(compact) == record
+    assert Ferricstore.Flow.decode_record(old_map) == record
+
+    assert Ferricstore.Flow.decode_record(Ferricstore.Flow.encode_record(normal_record)) ==
+             normal_record
+
+    assert byte_size(compact) < byte_size(old_map)
+  end
+
+  test "flow history encoding is compact and decodes old field lists" do
+    record = %{
+      id: "flow-1",
+      type: "checkout",
+      state: "queued",
+      version: 2,
+      attempts: 1,
+      fencing_token: 4,
+      created_at_ms: 1_000,
+      updated_at_ms: 1_100,
+      next_run_at_ms: 1_200,
+      priority: 1,
+      lease_deadline_ms: 2_000,
+      lease_owner: "worker-1",
+      payload_ref: "payload:1",
+      parent_flow_id: "parent-1",
+      root_flow_id: "root-1",
+      correlation_id: "order-1",
+      result_ref: nil,
+      error_ref: "error:1",
+      rewound_to_event_id: nil
+    }
+
+    old_fields = [
+      "event",
+      "retry",
+      "version",
+      "2",
+      "at",
+      "1100",
+      "id",
+      "flow-1",
+      "type",
+      "checkout",
+      "state",
+      "queued",
+      "priority",
+      "1",
+      "attempts",
+      "1",
+      "fencing_token",
+      "4",
+      "created_at_ms",
+      "1000",
+      "updated_at_ms",
+      "1100",
+      "next_run_at_ms",
+      "1200",
+      "lease_deadline_ms",
+      "2000",
+      "lease_owner",
+      "worker-1",
+      "payload_ref",
+      "payload:1",
+      "parent_flow_id",
+      "parent-1",
+      "root_flow_id",
+      "root-1",
+      "correlation_id",
+      "order-1",
+      "result_ref",
+      "",
+      "error_ref",
+      "error:1",
+      "rewound_to_event_id",
+      ""
+    ]
+
+    compact = Ferricstore.Flow.encode_history_fields(record, "retry", 1_100)
+    old = :erlang.term_to_binary(old_fields)
+
+    assert Ferricstore.Flow.decode_history_fields(compact) == old_fields
+    assert Ferricstore.Flow.decode_history_fields(old) == old_fields
+    assert byte_size(compact) < byte_size(old)
+  end
+
   test "flow_create stores state and prevents duplicate ids" do
     id = uid("flow-create")
 

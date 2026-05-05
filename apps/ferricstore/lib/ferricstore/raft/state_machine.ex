@@ -5567,16 +5567,7 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_decode_history_fields(value) when is_binary(value) do
-    try do
-      :erlang.binary_to_term(value, [:safe])
-    rescue
-      _ -> []
-    end
-  end
-
-  defp flow_decode_history_fields(value) when is_list(value), do: value
-  defp flow_decode_history_fields(_value), do: []
+  defp flow_decode_history_fields(value), do: Flow.decode_history_fields(value)
 
   defp flow_history_fields_to_map(fields) when is_list(fields) do
     fields
@@ -5917,54 +5908,10 @@ defmodule Ferricstore.Raft.StateMachine do
     history_key = FlowKeys.history_key(id, partition_key)
     event_id = flow_history_next_event_id(history_key, now_ms, version)
 
-    fields = [
-      "event",
-      event,
-      "version",
-      Integer.to_string(version),
-      "at",
-      Integer.to_string(now_ms),
-      "id",
-      id,
-      "type",
-      Map.get(record, :type, ""),
-      "state",
-      Map.get(record, :state, ""),
-      "priority",
-      record |> Map.get(:priority, 0) |> Integer.to_string(),
-      "attempts",
-      record |> Map.get(:attempts, 0) |> Integer.to_string(),
-      "fencing_token",
-      record |> Map.get(:fencing_token, 0) |> Integer.to_string(),
-      "created_at_ms",
-      record |> Map.get(:created_at_ms, now_ms) |> Integer.to_string(),
-      "updated_at_ms",
-      record |> Map.get(:updated_at_ms, now_ms) |> Integer.to_string(),
-      "next_run_at_ms",
-      flow_history_integer_or_empty(Map.get(record, :next_run_at_ms)),
-      "lease_deadline_ms",
-      flow_history_integer_or_empty(Map.get(record, :lease_deadline_ms)),
-      "lease_owner",
-      Map.get(record, :lease_owner) || "",
-      "payload_ref",
-      Map.get(record, :payload_ref) || "",
-      "parent_flow_id",
-      Map.get(record, :parent_flow_id) || "",
-      "root_flow_id",
-      Map.get(record, :root_flow_id) || "",
-      "correlation_id",
-      Map.get(record, :correlation_id) || "",
-      "result_ref",
-      Map.get(record, :result_ref) || "",
-      "error_ref",
-      Map.get(record, :error_ref) || "",
-      "rewound_to_event_id",
-      Map.get(record, :rewound_to_event_id) || ""
-    ]
-
     compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
 
-    with :ok <- flow_put(state, compound_key, :erlang.term_to_binary(fields), 0) do
+    with :ok <-
+           flow_put(state, compound_key, Flow.encode_history_fields(record, event, now_ms), 0) do
       flow_history_index_put(history_key, event_id, compound_key)
     end
   end
@@ -5982,9 +5929,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
     Integer.to_string(ms) <> "-" <> Integer.to_string(version)
   end
-
-  defp flow_history_integer_or_empty(value) when is_integer(value), do: Integer.to_string(value)
-  defp flow_history_integer_or_empty(_value), do: ""
 
   defp flow_history_index_put(history_key, event_id, compound_key) do
     {ms, seq} = flow_parse_event_id(event_id)
@@ -6115,7 +6059,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_record_expire_at(_record), do: 0
 
-  defp flow_encode(record), do: :erlang.term_to_binary(record)
+  defp flow_encode(record), do: Flow.encode_record(record)
 
   defp do_put(state, key, value, expire_at_ms) do
     maybe_clear_compound_data_structure_for_string_put(state, key)

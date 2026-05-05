@@ -9,6 +9,8 @@ defmodule Ferricstore.Flow do
   @default_lease_ms 30_000
   @default_limit 1
   @max_ref_size 4_096
+  @record_tag :flow_record_v1
+  @history_tag :flow_history_v1
 
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
     started = flow_start_time()
@@ -343,7 +345,225 @@ defmodule Ferricstore.Flow do
     observe_flow(:rewind, started, result, %{flow_id: id})
   end
 
-  def decode_record(value) when is_binary(value), do: :erlang.binary_to_term(value, [:safe])
+  @doc false
+  def encode_record(record) when is_map(record) do
+    :erlang.term_to_binary({
+      @record_tag,
+      Map.get(record, :id),
+      Map.get(record, :type),
+      Map.get(record, :state),
+      Map.get(record, :version),
+      Map.get(record, :attempts),
+      Map.get(record, :fencing_token),
+      Map.get(record, :created_at_ms),
+      Map.get(record, :updated_at_ms),
+      Map.get(record, :next_run_at_ms),
+      Map.get(record, :priority),
+      Map.get(record, :ttl_ms),
+      Map.get(record, :history_max_events),
+      Map.get(record, :partition_key),
+      Map.get(record, :payload_ref),
+      Map.get(record, :parent_flow_id),
+      Map.get(record, :root_flow_id),
+      Map.get(record, :correlation_id),
+      Map.get(record, :result_ref),
+      Map.get(record, :error_ref),
+      Map.get(record, :lease_owner),
+      Map.get(record, :lease_token),
+      Map.get(record, :lease_deadline_ms),
+      Map.get(record, :rewound_to_event_id)
+    })
+  end
+
+  @doc false
+  def decode_record(value) when is_binary(value) do
+    value
+    |> :erlang.binary_to_term([:safe])
+    |> decode_record_term()
+  end
+
+  defp decode_record_term({
+         @record_tag,
+         id,
+         type,
+         state,
+         version,
+         attempts,
+         fencing_token,
+         created_at_ms,
+         updated_at_ms,
+         next_run_at_ms,
+         priority,
+         ttl_ms,
+         history_max_events,
+         partition_key,
+         payload_ref,
+         parent_flow_id,
+         root_flow_id,
+         correlation_id,
+         result_ref,
+         error_ref,
+         lease_owner,
+         lease_token,
+         lease_deadline_ms,
+         rewound_to_event_id
+       }) do
+    record = %{
+      id: id,
+      type: type,
+      state: state,
+      version: version,
+      attempts: attempts,
+      fencing_token: fencing_token,
+      created_at_ms: created_at_ms,
+      updated_at_ms: updated_at_ms,
+      next_run_at_ms: next_run_at_ms,
+      priority: priority,
+      ttl_ms: ttl_ms,
+      history_max_events: history_max_events,
+      partition_key: partition_key,
+      payload_ref: payload_ref,
+      parent_flow_id: parent_flow_id,
+      root_flow_id: root_flow_id,
+      correlation_id: correlation_id,
+      result_ref: result_ref,
+      error_ref: error_ref,
+      lease_owner: lease_owner,
+      lease_token: lease_token,
+      lease_deadline_ms: lease_deadline_ms
+    }
+
+    if is_nil(rewound_to_event_id) do
+      record
+    else
+      Map.put(record, :rewound_to_event_id, rewound_to_event_id)
+    end
+  end
+
+  defp decode_record_term(record) when is_map(record), do: record
+
+  @doc false
+  def encode_history_fields(record, event, now_ms)
+      when is_map(record) and is_binary(event) and is_integer(now_ms) do
+    :erlang.term_to_binary({
+      @history_tag,
+      event,
+      Map.get(record, :version),
+      now_ms,
+      Map.get(record, :id),
+      Map.get(record, :type),
+      Map.get(record, :state),
+      Map.get(record, :priority, 0),
+      Map.get(record, :attempts, 0),
+      Map.get(record, :fencing_token, 0),
+      Map.get(record, :created_at_ms, now_ms),
+      Map.get(record, :updated_at_ms, now_ms),
+      Map.get(record, :next_run_at_ms),
+      Map.get(record, :lease_deadline_ms),
+      Map.get(record, :lease_owner),
+      Map.get(record, :payload_ref),
+      Map.get(record, :parent_flow_id),
+      Map.get(record, :root_flow_id),
+      Map.get(record, :correlation_id),
+      Map.get(record, :result_ref),
+      Map.get(record, :error_ref),
+      Map.get(record, :rewound_to_event_id)
+    })
+  end
+
+  @doc false
+  def decode_history_fields(value) when is_binary(value) do
+    value
+    |> :erlang.binary_to_term([:safe])
+    |> decode_history_fields_term()
+  rescue
+    _ -> []
+  end
+
+  def decode_history_fields(value) when is_list(value), do: value
+  def decode_history_fields(_value), do: []
+
+  defp decode_history_fields_term({
+         @history_tag,
+         event,
+         version,
+         at,
+         id,
+         type,
+         state,
+         priority,
+         attempts,
+         fencing_token,
+         created_at_ms,
+         updated_at_ms,
+         next_run_at_ms,
+         lease_deadline_ms,
+         lease_owner,
+         payload_ref,
+         parent_flow_id,
+         root_flow_id,
+         correlation_id,
+         result_ref,
+         error_ref,
+         rewound_to_event_id
+       }) do
+    [
+      "event",
+      event,
+      "version",
+      history_integer(version),
+      "at",
+      history_integer(at),
+      "id",
+      history_string(id),
+      "type",
+      history_string(type),
+      "state",
+      history_string(state),
+      "priority",
+      history_integer(priority),
+      "attempts",
+      history_integer(attempts),
+      "fencing_token",
+      history_integer(fencing_token),
+      "created_at_ms",
+      history_integer(created_at_ms),
+      "updated_at_ms",
+      history_integer(updated_at_ms),
+      "next_run_at_ms",
+      history_optional_integer(next_run_at_ms),
+      "lease_deadline_ms",
+      history_optional_integer(lease_deadline_ms),
+      "lease_owner",
+      history_string(lease_owner),
+      "payload_ref",
+      history_string(payload_ref),
+      "parent_flow_id",
+      history_string(parent_flow_id),
+      "root_flow_id",
+      history_string(root_flow_id),
+      "correlation_id",
+      history_string(correlation_id),
+      "result_ref",
+      history_string(result_ref),
+      "error_ref",
+      history_string(error_ref),
+      "rewound_to_event_id",
+      history_string(rewound_to_event_id)
+    ]
+  end
+
+  defp decode_history_fields_term(fields) when is_list(fields), do: fields
+  defp decode_history_fields_term(_value), do: []
+
+  defp history_integer(value) when is_integer(value), do: Integer.to_string(value)
+  defp history_integer(_value), do: "0"
+
+  defp history_optional_integer(value) when is_integer(value), do: Integer.to_string(value)
+  defp history_optional_integer(_value), do: ""
+
+  defp history_string(value) when is_binary(value), do: value
+  defp history_string(_value), do: ""
 
   defp flow_start_time, do: System.monotonic_time()
 
