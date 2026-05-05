@@ -720,7 +720,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
     result =
       if Enum.any?(responses, &streaming_response?/1) do
-        stream_response_entries(responses, state, send_response_fn)
+        stream_response_entries(responses, final_state, send_response_fn)
       else
         send_response_fn.(
           state.socket,
@@ -966,7 +966,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
               )
             )
 
-            {:cont, {:continue, acc_state}}
+            {:cont,
+             {:continue, ConnTracking.maybe_track_read("GETRANGE", args, :fallback_ok, acc_state)}}
 
           {:error_after_header, _reason} ->
             {:halt, {:quit, acc_state}}
@@ -984,7 +985,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
               Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
             )
 
-            {:cont, {:continue, acc_state}}
+            {:cont,
+             {:continue, ConnTracking.maybe_track_read("GET", [key], :fallback_ok, acc_state)}}
 
           {:error_after_header, _reason} ->
             {:halt, {:quit, acc_state}}
