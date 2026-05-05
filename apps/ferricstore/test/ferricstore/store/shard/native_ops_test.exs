@@ -1,6 +1,8 @@
 defmodule Ferricstore.Store.Shard.NativeOpsTest do
   use ExUnit.Case, async: true
 
+  @native_ops_path Path.expand("../../../../lib/ferricstore/store/shard/native_ops.ex", __DIR__)
+
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.CompoundKey
@@ -30,6 +32,18 @@ defmodule Ferricstore.Store.Shard.NativeOpsTest do
                {:remote_applied_at, last_local_applied, :ok},
                25
              )
+  end
+
+  test "raft LMOVE submits one atomic state-machine command" do
+    source = File.read!(@native_ops_path)
+    body = function_body(source, "handle_list_op_lmove_raft")
+
+    # LMOVE mutates source element, source metadata, destination element, and
+    # destination metadata. In raft mode it must be one replicated command so
+    # apply/replay sees one atomic pending-write batch instead of several
+    # independently committed compound writes.
+    assert body =~ "forced_quorum_call(state.index, {:list_op_lmove"
+    refute body =~ "checked_lmove("
   end
 
   test "direct list compound_put does not update ETS when Bitcask append fails" do
@@ -141,5 +155,11 @@ defmodule Ferricstore.Store.Shard.NativeOpsTest do
       :ets.delete(keydir)
       File.rm_rf!(dir)
     end
+  end
+
+  defp function_body(source, function) do
+    [_before, rest] = String.split(source, "defp #{function}", parts: 2)
+    [body, _after] = String.split(rest, "\n  end\n", parts: 2)
+    body
   end
 end

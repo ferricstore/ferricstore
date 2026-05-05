@@ -426,10 +426,8 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   end
 
   defp handle_list_op_lmove_raft(src_key, dst_key, from_dir, to_dir, state) do
-    store = build_list_compound_store_raft(src_key, state)
-
     result =
-      checked_lmove(src_key, dst_key, store, type_check_store(store, state), from_dir, to_dir)
+      forced_quorum_call(state.index, {:list_op_lmove, src_key, dst_key, from_dir, to_dir})
 
     case result do
       {:error, _} ->
