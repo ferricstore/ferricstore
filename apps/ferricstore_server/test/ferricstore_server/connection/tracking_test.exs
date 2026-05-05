@@ -209,6 +209,8 @@ defmodule FerricstoreServer.Connection.TrackingTest do
       {"UNLINK", ["tracking:noop:unlink"], "tracking:noop:unlink"},
       {"HSETNX", ["tracking:noop:hsetnx", "field", "v"], "tracking:noop:hsetnx"},
       {"HDEL", ["tracking:noop:hdel", "field"], "tracking:noop:hdel"},
+      {"LPUSHX", ["tracking:noop:lpushx", "member"], "tracking:noop:lpushx"},
+      {"RPUSHX", ["tracking:noop:rpushx", "member"], "tracking:noop:rpushx"},
       {"SADD", ["tracking:noop:sadd", "member"], "tracking:noop:sadd"},
       {"SREM", ["tracking:noop:srem", "member"], "tracking:noop:srem"},
       {"ZREM", ["tracking:noop:zrem", "member"], "tracking:noop:zrem"},
@@ -324,6 +326,9 @@ defmodule FerricstoreServer.Connection.TrackingTest do
       {"EXPIREAT", ["tracking:keyspace:noop:expireat", "10"]},
       {"PEXPIREAT", ["tracking:keyspace:noop:pexpireat", "10"]},
       {"PERSIST", ["tracking:keyspace:noop:persist"]},
+      {"HSETNX", ["tracking:keyspace:noop:hsetnx", "field", "v"]},
+      {"LPUSHX", ["tracking:keyspace:noop:lpushx", "member"]},
+      {"RPUSHX", ["tracking:keyspace:noop:rpushx", "member"]},
       {"SADD", ["tracking:keyspace:noop:sadd", "member"]},
       {"SREM", ["tracking:keyspace:noop:srem", "member"]},
       {"HDEL", ["tracking:keyspace:noop:hdel", "field"]},
@@ -335,6 +340,26 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     Enum.each(commands, fn {cmd, args} ->
       Tracking.maybe_notify_keyspace(cmd, args, 0)
       refute_received {:pubsub_message, _, _}
+    end)
+  end
+
+  test "conditional collection writes fire keyspace notifications when they mutate" do
+    Config.set("notify-keyspace-events", "KEA")
+
+    events = [
+      {"HSETNX", ["tracking:keyspace:hsetnx", "field", "v"], "hset"},
+      {"LPUSHX", ["tracking:keyspace:lpushx", "member"], "lpush"},
+      {"RPUSHX", ["tracking:keyspace:rpushx", "member"], "rpush"}
+    ]
+
+    Enum.each(events, fn {cmd, [key | _] = args, event} ->
+      PubSub.subscribe("__keyspace@0__:#{key}", self())
+      PubSub.subscribe("__keyevent@0__:#{event}", self())
+
+      Tracking.maybe_notify_keyspace(cmd, args, 1)
+
+      assert_received {:pubsub_message, "__keyspace@0__:" <> ^key, ^event}
+      assert_received {:pubsub_message, "__keyevent@0__:" <> ^event, ^key}
     end)
   end
 end

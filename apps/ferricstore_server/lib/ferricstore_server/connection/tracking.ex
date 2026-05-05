@@ -46,6 +46,7 @@ defmodule FerricstoreServer.Connection.Tracking do
     EXPIRE PEXPIRE EXPIREAT PEXPIREAT PERSIST
     RENAMENX COPY
     HSETNX HDEL
+    LPUSHX RPUSHX
     SADD SREM
     ZREM
     LREM
@@ -92,9 +93,12 @@ defmodule FerricstoreServer.Connection.Tracking do
     "SREM" => "srem",
     "SPOP" => "spop",
     "HSET" => "hset",
+    "HSETNX" => "hset",
     "HDEL" => "hdel",
     "HINCRBY" => "hincrby",
     "HINCRBYFLOAT" => "hincrbyfloat",
+    "LPUSHX" => "lpush",
+    "RPUSHX" => "rpush",
     "ZADD" => "zadd",
     "ZREM" => "zrem",
     "ZINCRBY" => "zincrby",
