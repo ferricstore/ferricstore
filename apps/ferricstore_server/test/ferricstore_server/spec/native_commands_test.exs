@@ -30,8 +30,10 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
   # Generates a unique key to prevent cross-test interference.
   defp ukey(base), do: "spec_#{base}_#{:rand.uniform(9_999_999)}"
 
-  # Dummy store map -- native commands ignore it and call Router directly.
-  defp dummy_store, do: %{}
+  # Native lock/rate-limit commands execute through the store capability layer.
+  # Use the real default instance here so this server-level spec exercises the
+  # same quorum path as a production connection store.
+  defp dummy_store, do: FerricStore.Instance.get(:default)
 
   # =========================================================================
   # Section 13: Distributed Lock Tests (single-node applicable)
@@ -88,9 +90,15 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       assert {:error, _} = Native.handle("LOCK", [key, "owner_b", "5000"], dummy_store())
 
       # Wait for TTL to expire
-      ShardHelpers.eventually(fn ->
-        :ok == Native.handle("LOCK", [key, "owner_b", "5000"], dummy_store())
-      end, "lock TTL should expire and allow new acquisition", 20, 20)
+      ShardHelpers.eventually(
+        fn ->
+          :ok == Native.handle("LOCK", [key, "owner_b", "5000"], dummy_store())
+        end,
+        "lock TTL should expire and allow new acquisition",
+        20,
+        20
+      )
+
       assert "owner_b" == Router.get(FerricStore.Instance.get(:default), key)
 
       # Cleanup
@@ -132,6 +140,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       assert 1 == Native.handle("EXTEND", [key, "owner1", "60000"], dummy_store())
 
       {_val, new_exp} = Router.get_meta(FerricStore.Instance.get(:default), key)
+
       assert new_exp > original_exp,
              "EXTEND must push the expiry forward: #{new_exp} > #{original_exp}"
 
@@ -225,7 +234,8 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
 
       # Fill the window
       for _ <- 1..5 do
-        assert ["allowed" | _] = Native.handle("RATELIMIT.ADD", [key, window_ms, max], dummy_store())
+        assert ["allowed" | _] =
+                 Native.handle("RATELIMIT.ADD", [key, window_ms, max], dummy_store())
       end
 
       # 6th request should be denied
@@ -235,9 +245,17 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       # rotation, the previous window's count still contributes weighted by
       # (1 - elapsed/window_ms). We need to wait >= 2 * window_ms so the
       # implementation fully clears both the current and previous windows.
-      ShardHelpers.eventually(fn ->
-        match?(["allowed" | _], Native.handle("RATELIMIT.ADD", [key, window_ms, max], dummy_store()))
-      end, "old requests should slide out of window", 30, 50)
+      ShardHelpers.eventually(
+        fn ->
+          match?(
+            ["allowed" | _],
+            Native.handle("RATELIMIT.ADD", [key, window_ms, max], dummy_store())
+          )
+        end,
+        "old requests should slide out of window",
+        30,
+        50
+      )
     end
   end
 
