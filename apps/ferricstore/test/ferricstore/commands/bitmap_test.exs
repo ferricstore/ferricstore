@@ -22,6 +22,26 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert <<1>> == store.get.("mykey")
     end
 
+    test "returns write errors instead of old bit" do
+      store = %{
+        compound_get: fn _redis_key, _compound_key -> nil end,
+        get_meta: fn "mykey" -> {<<0>>, 0} end,
+        put: fn "mykey", <<128>>, 0 -> {:error, :disk_full} end
+      }
+
+      assert {:error, :disk_full} == Bitmap.handle("SETBIT", ["mykey", "0", "1"], store)
+    end
+
+    test "AST returns write errors instead of old bit" do
+      store = %{
+        compound_get: fn _redis_key, _compound_key -> nil end,
+        get_meta: fn "mykey" -> {<<0>>, 0} end,
+        put: fn "mykey", <<128>>, 0 -> {:error, :disk_full} end
+      }
+
+      assert {:error, :disk_full} == Bitmap.handle_ast({:setbit, "mykey", 0, 1}, store)
+    end
+
     test "treats a fully expired hash as a missing bitmap key before TYPE cleanup" do
       store = MockStore.make()
       Hash.handle("HSET", ["mykey", "field", "value"], store)
@@ -889,6 +909,40 @@ defmodule Ferricstore.Commands.BitmapTest do
       store = MockStore.make()
       assert 0 == Bitmap.handle("BITOP", ["OR", "dest", "missing1", "missing2"], store)
       assert <<>> == store.get.("dest")
+    end
+
+    test "returns destination write errors" do
+      store = %{
+        batch_get: fn ["a", "b"] -> [<<0xF0>>, <<0x0F>>] end,
+        get: fn _key -> flunk("BITOP should use batch_get") end,
+        put: fn "dest", <<0xFF>>, 0 -> {:error, :disk_full} end,
+        compound_get: fn _redis_key, _compound_key -> nil end,
+        compound_delete: fn _redis_key, _compound_key -> :ok end,
+        compound_delete_prefix: fn _redis_key, _prefix -> :ok end
+      }
+
+      assert {:error, :disk_full} == Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
+    end
+
+    test "returns compound cleanup errors before overwriting destination" do
+      type_key = CompoundKey.type_key("dest")
+
+      store = %{
+        batch_get: fn ["a", "b"] -> [<<0xF0>>, <<0x0F>>] end,
+        get: fn _key -> flunk("BITOP should use batch_get") end,
+        put: fn "dest", _value, 0 -> flunk("BITOP should not write after cleanup failure") end,
+        compound_get: fn
+          "dest", ^type_key -> "set"
+          _redis_key, _compound_key -> nil
+        end,
+        compound_delete: fn
+          "dest", ^type_key -> {:error, :disk_full}
+          "dest", _compound_key -> :ok
+        end,
+        compound_delete_prefix: fn _redis_key, _prefix -> :ok end
+      }
+
+      assert {:error, :disk_full} == Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
     end
 
     test "returns result length" do

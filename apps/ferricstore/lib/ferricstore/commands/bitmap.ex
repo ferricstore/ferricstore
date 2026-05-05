@@ -257,9 +257,7 @@ defmodule Ferricstore.Commands.Bitmap do
     op = String.upcase(op_str)
 
     with {:ok, result} <- execute_bitop(op, source_keys, store) do
-      clear_compound_data_structure(destkey, store)
-      Ops.put(store, destkey, result, 0)
-      byte_size(result)
+      write_bitop_result(store, destkey, result)
     end
   end
 
@@ -303,8 +301,7 @@ defmodule Ferricstore.Commands.Bitmap do
       <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
       new_value = <<prefix::binary, new_byte::8, suffix::binary>>
 
-      Ops.put(store, key, new_value, expire_at_ms)
-      old_bit
+      write_setbit_result(store, key, new_value, expire_at_ms, old_bit)
     end
   end
 
@@ -447,9 +444,7 @@ defmodule Ferricstore.Commands.Bitmap do
   def handle_ast({:bitop, op, destkey, source_keys}, store)
       when op in [:band, :bor, :bxor, :bnot] and is_list(source_keys) and source_keys != [] do
     with {:ok, result} <- execute_bitop_ast(op, source_keys, store) do
-      clear_compound_data_structure(destkey, store)
-      Ops.put(store, destkey, result, 0)
-      byte_size(result)
+      write_bitop_result(store, destkey, result)
     end
   end
 
@@ -527,8 +522,21 @@ defmodule Ferricstore.Commands.Bitmap do
     <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
     new_value = <<prefix::binary, new_byte::8, suffix::binary>>
 
-    Ops.put(store, key, new_value, expire_at_ms)
-    old_bit
+    write_setbit_result(store, key, new_value, expire_at_ms, old_bit)
+  end
+
+  defp write_setbit_result(store, key, value, expire_at_ms, old_bit) do
+    case Ops.put(store, key, value, expire_at_ms) do
+      :ok -> old_bit
+      {:error, _} = error -> error
+    end
+  end
+
+  defp write_bitop_result(store, destkey, result) do
+    with :ok <- clear_compound_data_structure(destkey, store),
+         :ok <- Ops.put(store, destkey, result, 0) do
+      byte_size(result)
+    end
   end
 
   defp bitcount_range_empty_without_value?(_store, _key, _mode, start_idx, end_idx)
@@ -925,20 +933,24 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp clear_compound_data_structure(key, store) do
     if Ops.has_compound?(store) do
-      Ops.compound_delete(store, key, CompoundKey.type_key(key))
-      Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))
-
-      for prefix <- [
-            CompoundKey.hash_prefix(key),
-            CompoundKey.list_prefix(key),
-            CompoundKey.set_prefix(key),
-            CompoundKey.zset_prefix(key)
-          ] do
-        Ops.compound_delete_prefix(store, key, prefix)
+      with :ok <- Ops.compound_delete(store, key, CompoundKey.type_key(key)),
+           :ok <- Ops.compound_delete(store, key, CompoundKey.list_meta_key(key)) do
+        [
+          CompoundKey.hash_prefix(key),
+          CompoundKey.list_prefix(key),
+          CompoundKey.set_prefix(key),
+          CompoundKey.zset_prefix(key)
+        ]
+        |> Enum.reduce_while(:ok, fn prefix, :ok ->
+          case Ops.compound_delete_prefix(store, key, prefix) do
+            :ok -> {:cont, :ok}
+            {:error, _} = error -> {:halt, error}
+          end
+        end)
       end
+    else
+      :ok
     end
-
-    :ok
   end
 
   # --- Binary manipulation --------------------------------------------------
