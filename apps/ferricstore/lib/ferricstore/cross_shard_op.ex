@@ -12,8 +12,6 @@ defmodule Ferricstore.CrossShardOp do
       is called directly with zero overhead (no locking, no intent).
     * **Quorum cross-shard** -- keys span multiple shards. The protocol is:
       lock (ordered by shard index) -> write intent -> execute -> delete intent -> unlock.
-    * **Async cross-shard** -- returns a CROSSSLOT error with a helpful message
-      suggesting hash tags or quorum mode.
 
   ## Usage
 
@@ -65,8 +63,8 @@ defmodule Ferricstore.CrossShardOp do
 
   ## Returns
 
-  The result of `execute_fn`, or `{:error, "CROSSSLOT ..."}` for async
-  cross-shard operations.
+  The result of `execute_fn`, or `{:error, "CROSSSLOT ..."}` when the command
+  cannot be represented safely as a cross-shard transaction.
   """
   @spec execute([key_with_role()], (map() -> term()), keyword()) :: term()
   def execute(keys_with_roles, execute_fn, opts \\ []) do

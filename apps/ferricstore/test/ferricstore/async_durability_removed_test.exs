@@ -198,6 +198,8 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
               ":ferricstore_durability_mode",
               ":ferricstore_has_async_ns",
               "async namespace",
+              "Async cross-shard",
+              "async cross-shard",
               "ERR async",
               "ERR async key latch"
             ],
