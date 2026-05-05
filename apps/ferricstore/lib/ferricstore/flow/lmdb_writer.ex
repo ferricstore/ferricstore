@@ -259,6 +259,31 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
+  defp expand_op(path, {:terminal_put, terminal_key, value, nil, count_key}, acc)
+       when is_binary(terminal_key) and is_binary(value) and is_binary(count_key) do
+    with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
+         {:ok, count, acc} <- terminal_count(path, count_key, acc) do
+      existed? = is_binary(old_value)
+      count = if existed?, do: count, else: count + 1
+
+      ops =
+        [
+          {:put, terminal_key, value},
+          {:put, count_key, Ferricstore.Flow.LMDB.encode_count(count)}
+        ]
+        |> maybe_put_expire_key(terminal_key, value, nil, count_key)
+        |> maybe_delete_old_expire_key(terminal_key, old_value)
+
+      acc =
+        acc
+        |> put_in([:counts, count_key], count)
+        |> put_in([:terminal_values, terminal_key], value)
+        |> prepend_ops(ops)
+
+      {:ok, acc}
+    end
+  end
+
   defp expand_op(path, {:terminal_delete, terminal_key, state_key, count_key}, acc)
        when is_binary(terminal_key) and is_binary(state_key) and is_binary(count_key) do
     with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
@@ -275,6 +300,32 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
       ops =
         [{:delete, terminal_key}, {:delete, reverse_key} | count_ops]
+        |> maybe_delete_old_expire_key(terminal_key, old_value)
+
+      acc =
+        acc
+        |> put_in([:counts, count_key], count)
+        |> put_in([:terminal_values, terminal_key], nil)
+        |> prepend_ops(ops)
+
+      {:ok, acc}
+    end
+  end
+
+  defp expand_op(path, {:terminal_delete, terminal_key, nil, count_key}, acc)
+       when is_binary(terminal_key) and is_binary(count_key) do
+    with {:ok, old_value, acc} <- terminal_value(path, terminal_key, acc),
+         {:ok, count, acc} <- terminal_count(path, count_key, acc) do
+      {count, count_ops} =
+        if is_binary(old_value) do
+          count = max(count - 1, 0)
+          {count, [{:put, count_key, Ferricstore.Flow.LMDB.encode_count(count)}]}
+        else
+          {count, []}
+        end
+
+      ops =
+        [{:delete, terminal_key} | count_ops]
         |> maybe_delete_old_expire_key(terminal_key, old_value)
 
       acc =

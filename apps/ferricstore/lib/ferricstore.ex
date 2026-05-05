@@ -787,8 +787,15 @@ defmodule FerricStore do
   end
 
   defp flow_records_for_index(index_key, partition_key, count) do
-    with {:ok, ids} <- zrange(index_key, 0, count - 1) do
+    with {:ok, ids} <- flow_index_ids_with_lmdb(index_key, count) do
       flow_records_for_ids(ids, partition_key)
+    end
+  end
+
+  defp flow_index_ids_with_lmdb(index_key, count) do
+    with {:ok, ram_ids} <- zrange(index_key, 0, count - 1),
+         {:ok, lmdb_ids} <- flow_lmdb_index_ids(index_key, count) do
+      {:ok, (ram_ids ++ lmdb_ids) |> Enum.uniq() |> Enum.take(count)}
     end
   end
 
@@ -836,6 +843,16 @@ defmodule FerricStore do
   defp flow_terminal_lmdb_ids(_index_key, _state, count) when count <= 0, do: {:ok, []}
 
   defp flow_terminal_lmdb_ids(index_key, _state, count) do
+    if Ferricstore.Flow.LMDB.mirror?() do
+      flow_lmdb_index_ids(index_key, count)
+    else
+      {:ok, []}
+    end
+  end
+
+  defp flow_lmdb_index_ids(_index_key, count) when count <= 0, do: {:ok, []}
+
+  defp flow_lmdb_index_ids(index_key, count) do
     if Ferricstore.Flow.LMDB.mirror?() do
       ctx = default_ctx()
       prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)

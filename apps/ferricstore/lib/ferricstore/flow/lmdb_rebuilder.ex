@@ -82,9 +82,14 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             LMDB.encode_terminal_index_value(record.id, updated_at_ms, expire_at_ms, key)
 
           reverse_key = LMDB.terminal_by_state_key_key(key)
+          metadata_ops = terminal_metadata_index_ops(record, updated_at_ms, expire_at_ms)
 
           {
-            [{:put, reverse_key, terminal_key}, {:put, terminal_key, terminal_value} | lmdb_ops],
+            [
+              {:put, reverse_key, terminal_key},
+              {:put, terminal_key, terminal_value}
+              | metadata_ops ++ lmdb_ops
+            ],
             [{key, record} | prunes],
             active
           }
@@ -284,6 +289,27 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       {:correlation, Map.get(record, :correlation_id)}
     ]
     |> Enum.filter(fn {_kind, value} -> is_binary(value) and value != "" end)
+  end
+
+  defp terminal_metadata_index_ops(record, updated_at_ms, expire_at_ms) do
+    partition_key = Map.get(record, :partition_key)
+
+    record
+    |> metadata_index_entries()
+    |> Enum.map(fn {kind, value} ->
+      index_key =
+        case kind do
+          :parent -> Flow.Keys.parent_index_key(value, partition_key)
+          :root -> Flow.Keys.root_index_key(value, partition_key)
+          :correlation -> Flow.Keys.correlation_index_key(value, partition_key)
+        end
+
+      count_key = LMDB.terminal_count_key(index_key)
+      terminal_key = LMDB.terminal_index_key(index_key, record.id, updated_at_ms)
+
+      {:put, terminal_key,
+       LMDB.encode_terminal_index_value(record.id, updated_at_ms, expire_at_ms, nil, count_key)}
+    end)
   end
 
   defp non_default_root_flow_id(record) do

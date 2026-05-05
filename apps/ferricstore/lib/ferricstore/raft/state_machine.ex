@@ -7009,9 +7009,35 @@ defmodule Ferricstore.Raft.StateMachine do
          Map.get(state, :zset_score_lookup_name), state_key, state_index_key, record.id,
          Map.fetch!(record, :version)}
       )
+
+      queue_terminal_lmdb_metadata_index_puts(record, updated_at_ms, expire_at_ms)
     else
       _ -> :ok
     end
+  end
+
+  defp queue_terminal_lmdb_metadata_index_puts(record, updated_at_ms, expire_at_ms) do
+    record
+    |> flow_metadata_index_entries(Float.to_string(updated_at_ms * 1.0))
+    |> Enum.each(fn {index_key, id, _score} ->
+      terminal_key = Ferricstore.Flow.LMDB.terminal_index_key(index_key, id, updated_at_ms)
+      count_key = Ferricstore.Flow.LMDB.terminal_count_key(index_key)
+
+      queue_pending_lmdb_mirror_terminal_put(
+        terminal_key,
+        Ferricstore.Flow.LMDB.encode_terminal_index_value(
+          id,
+          updated_at_ms,
+          expire_at_ms,
+          nil,
+          count_key
+        ),
+        nil,
+        count_key
+      )
+    end)
+
+    :ok
   end
 
   defp maybe_queue_terminal_lmdb_index_delete(state, record) do
@@ -7027,7 +7053,24 @@ defmodule Ferricstore.Raft.StateMachine do
         FlowKeys.state_key(record.id, Map.get(record, :partition_key)),
         Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
       )
+
+      queue_terminal_lmdb_metadata_index_deletes(record, updated_at_ms)
     end
+
+    :ok
+  end
+
+  defp queue_terminal_lmdb_metadata_index_deletes(record, updated_at_ms) do
+    record
+    |> flow_metadata_index_entries(Float.to_string(updated_at_ms * 1.0))
+    |> Enum.each(fn {index_key, id, _score} ->
+      index_key
+      |> Ferricstore.Flow.LMDB.terminal_index_key(id, updated_at_ms)
+      |> queue_pending_lmdb_mirror_terminal_delete(
+        nil,
+        Ferricstore.Flow.LMDB.terminal_count_key(index_key)
+      )
+    end)
 
     :ok
   end
