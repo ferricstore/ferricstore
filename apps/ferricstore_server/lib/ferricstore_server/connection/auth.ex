@@ -98,24 +98,27 @@ defmodule FerricstoreServer.Connection.Auth do
 
   def dispatch_acl("SETUSER", [username | rules], state) do
     # Route through Raft so the mutation is replicated to all nodes.
-    ctx = FerricStore.Instance.get(:default)
-    result = Ferricstore.Store.Router.server_command(ctx, {:acl_setuser, username, rules})
+    with {:ok, ctx} <- default_instance_ctx() do
+      result = Ferricstore.Store.Router.server_command(ctx, {:acl_setuser, username, rules})
 
-    case result do
-      :ok ->
-        broadcast_acl_invalidation(username)
+      case result do
+        :ok ->
+          broadcast_acl_invalidation(username)
 
-        new_state =
-          if username == state.username do
-            %{state | acl_cache: build_acl_cache(username)}
-          else
-            state
-          end
+          new_state =
+            if username == state.username do
+              %{state | acl_cache: build_acl_cache(username)}
+            else
+              state
+            end
 
-        {:continue, Encoder.encode(:ok), new_state}
+          {:continue, Encoder.encode(:ok), new_state}
 
-      {:error, reason} ->
-        {:continue, Encoder.encode({:error, reason}), state}
+        {:error, reason} ->
+          {:continue, Encoder.encode({:error, reason}), state}
+      end
+    else
+      :error -> loading(state)
     end
   end
 
@@ -125,20 +128,22 @@ defmodule FerricstoreServer.Connection.Auth do
   end
 
   def dispatch_acl("DELUSER", usernames, state) do
-    ctx = FerricStore.Instance.get(:default)
+    with {:ok, ctx} <- default_instance_ctx() do
+      results =
+        Enum.map(usernames, fn username ->
+          Ferricstore.Store.Router.server_command(ctx, {:acl_deluser, username})
+        end)
 
-    results =
-      Enum.map(usernames, fn username ->
-        Ferricstore.Store.Router.server_command(ctx, {:acl_deluser, username})
-      end)
+      case Enum.find(results, fn r -> match?({:error, _}, r) end) do
+        nil ->
+          Enum.each(usernames, &broadcast_acl_invalidation/1)
+          {:continue, Encoder.encode(:ok), state}
 
-    case Enum.find(results, fn r -> match?({:error, _}, r) end) do
-      nil ->
-        Enum.each(usernames, &broadcast_acl_invalidation/1)
-        {:continue, Encoder.encode(:ok), state}
-
-      {:error, reason} ->
-        {:continue, Encoder.encode({:error, reason}), state}
+        {:error, reason} ->
+          {:continue, Encoder.encode({:error, reason}), state}
+      end
+    else
+      :error -> loading(state)
     end
   end
 
@@ -410,6 +415,16 @@ defmodule FerricstoreServer.Connection.Auth do
 
   defp do_dispatch_auth(false, true, username, password, _rp, client_ip, state) do
     do_acl_auth(username, password, client_ip, state)
+  end
+
+  defp default_instance_ctx do
+    {:ok, FerricStore.Instance.get(:default)}
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp loading(state) do
+    {:continue, Encoder.encode({:error, "LOADING FerricStore is initializing"}), state}
   end
 
   defp format_peer(nil), do: "unknown"
