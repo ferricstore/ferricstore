@@ -40,6 +40,21 @@ defmodule FerricstoreServer.Commands.ClientTest do
 
   defp store, do: MockStore.make()
 
+  describe "performance guards" do
+    test "CLIENT TRACKING prefix parsing does not append per prefix" do
+      source =
+        File.read!(
+          Path.expand(
+            "lib/ferricstore_server/commands/client.ex",
+            Path.join(__DIR__, "../../..")
+          )
+        )
+
+      refute source =~ "prefixes: acc.prefixes ++",
+             "CLIENT TRACKING PREFIX parsing must stay O(n); appending every prefix is O(n^2)"
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # CLIENT ID
   # ---------------------------------------------------------------------------

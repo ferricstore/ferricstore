@@ -286,7 +286,7 @@ defmodule FerricstoreServer.Commands.Client do
     })
   end
 
-  defp do_parse_opts([], acc), do: {:ok, acc}
+  defp do_parse_opts([], acc), do: {:ok, %{acc | prefixes: Enum.reverse(acc.prefixes)}}
 
   defp do_parse_opts([token | rest], acc) do
     case String.upcase(token) do
@@ -301,7 +301,7 @@ defmodule FerricstoreServer.Commands.Client do
   end
 
   defp parse_prefix([prefix | rest], acc) do
-    do_parse_opts(rest, %{acc | prefixes: acc.prefixes ++ [prefix]})
+    do_parse_opts(rest, %{acc | prefixes: [prefix | acc.prefixes]})
   end
 
   defp parse_prefix([], _acc) do
