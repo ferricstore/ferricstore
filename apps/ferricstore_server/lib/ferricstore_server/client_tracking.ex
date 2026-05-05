@@ -326,8 +326,8 @@ defmodule FerricstoreServer.ClientTracking do
 
     * `key` -- the key that was modified
     * `writer_pid` -- the pid of the connection that performed the write
-    * `socket_sender` -- a function `(pid, iodata) -> :ok` that sends raw
-      bytes to a connection. This indirection allows the caller to provide
+    * `socket_sender` -- a function `(pid, iodata, keys) -> :ok` that sends
+      raw bytes to a connection. This indirection allows the caller to provide
       the appropriate transport send mechanism.
 
   ## Returns
@@ -336,16 +336,7 @@ defmodule FerricstoreServer.ClientTracking do
   """
   @spec notify_key_modified(binary(), pid(), (pid(), iodata(), [binary()] -> :ok)) :: :ok
   def notify_key_modified(key, writer_pid, socket_sender) do
-    keys = [key]
-    invalidation_msg = encode_invalidation(keys)
-
-    # Default mode: exact key match
-    notify_default_mode(key, writer_pid, invalidation_msg, keys, socket_sender)
-
-    # BCAST mode: prefix match
-    notify_bcast_mode(key, writer_pid, invalidation_msg, keys, socket_sender)
-
-    :ok
+    notify_keys_modified([key], writer_pid, socket_sender)
   end
 
   @doc """
@@ -353,11 +344,16 @@ defmodule FerricstoreServer.ClientTracking do
 
   Convenience wrapper for bulk writes (MSET, etc.).
   """
-  @spec notify_keys_modified([binary()], pid(), (pid(), iodata() -> :ok)) :: :ok
+  @spec notify_keys_modified([binary()], pid(), (pid(), iodata(), [binary()] -> :ok)) :: :ok
+  def notify_keys_modified([], _writer_pid, _socket_sender), do: :ok
+
   def notify_keys_modified(keys, writer_pid, socket_sender) do
-    Enum.each(keys, fn key ->
-      notify_key_modified(key, writer_pid, socket_sender)
-    end)
+    keys = Enum.uniq(keys)
+
+    notify_default_mode_many(keys, writer_pid, socket_sender)
+    notify_bcast_mode_many(keys, writer_pid, socket_sender)
+
+    :ok
   end
 
   # ---------------------------------------------------------------------------
@@ -426,25 +422,32 @@ defmodule FerricstoreServer.ClientTracking do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp notify_default_mode(key, writer_pid, invalidation_msg, keys, socket_sender) do
-    tracked_pids = :ets.lookup(@tracking_table, key)
+  defp notify_default_mode_many(keys, writer_pid, socket_sender) do
+    keys
+    |> Enum.reduce(%{}, fn key, target_keys ->
+      tracked_pids = :ets.lookup(@tracking_table, key)
 
-    Enum.each(tracked_pids, fn {^key, tracked_pid} ->
-      if should_send_invalidation?(tracked_pid, writer_pid) do
-        target = resolve_target(tracked_pid)
-        safe_send(target, invalidation_msg, keys, socket_sender)
-      end
+      target_keys =
+        Enum.reduce(tracked_pids, target_keys, fn {^key, tracked_pid}, acc ->
+          if should_send_invalidation?(tracked_pid, writer_pid) do
+            target = resolve_target(tracked_pid)
+            Map.update(acc, target, [key], &[key | &1])
+          else
+            acc
+          end
+        end)
+
+      # Remove tracked entries even when NOLOOP suppresses the push. Redis
+      # invalidations are one-shot; the next read re-registers interest.
+      :ets.delete(@tracking_table, key)
+      target_keys
     end)
-
-    # Remove the tracked entries for this key -- invalidation is one-shot.
-    # After receiving the invalidation, the client must re-read the key to
-    # re-register tracking.
-    :ets.delete(@tracking_table, key)
+    |> send_grouped_invalidations(socket_sender)
   rescue
     ArgumentError -> :ok
   end
 
-  defp notify_bcast_mode(key, writer_pid, invalidation_msg, keys, socket_sender) do
+  defp notify_bcast_mode_many(keys, writer_pid, socket_sender) do
     # Use :ets.select with a match spec to filter only BCAST-enabled connections
     # directly in ETS, avoiding copying the entire connections table into a list.
     match_spec = [
@@ -459,14 +462,24 @@ defmodule FerricstoreServer.ClientTracking do
     bcast_connections = :ets.select(@connections_table, match_spec)
 
     Enum.each(bcast_connections, fn {conn_pid, config} ->
-      if prefix_matches?(key, config.prefixes) and
-           should_send_invalidation_config?(conn_pid, writer_pid, config) do
-        target = resolve_target_config(conn_pid, config)
-        safe_send(target, invalidation_msg, keys, socket_sender)
+      if should_send_invalidation_config?(conn_pid, writer_pid, config) do
+        matching_keys = Enum.filter(keys, &prefix_matches?(&1, config.prefixes))
+
+        if matching_keys != [] do
+          target = resolve_target_config(conn_pid, config)
+          safe_send(target, encode_invalidation(matching_keys), matching_keys, socket_sender)
+        end
       end
     end)
   rescue
     ArgumentError -> :ok
+  end
+
+  defp send_grouped_invalidations(target_keys, socket_sender) do
+    Enum.each(target_keys, fn {target, reversed_keys} ->
+      keys = Enum.reverse(reversed_keys)
+      safe_send(target, encode_invalidation(keys), keys, socket_sender)
+    end)
   end
 
   defp should_send_invalidation?(tracked_pid, writer_pid) when tracked_pid == writer_pid do

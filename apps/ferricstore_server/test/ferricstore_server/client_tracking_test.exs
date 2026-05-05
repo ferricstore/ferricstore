@@ -225,6 +225,39 @@ defmodule FerricstoreServer.ClientTrackingTest do
       assert :ets.lookup(:ferricstore_tracking, "k2") == [{"k2", self()}]
       assert :ets.lookup(:ferricstore_tracking, "k3") == [{"k3", self()}]
     end
+
+    test "notify_keys_modified/3 coalesces default-mode invalidations per connection" do
+      config = ClientTracking.new_config()
+      {:ok, enabled_config} = ClientTracking.enable(self(), config)
+
+      ClientTracking.track_keys(self(), ["bulk1", "bulk2"], enabled_config)
+
+      writer = spawn(fn -> :timer.sleep(1000) end)
+      sender = fn pid, _msg, keys -> send(self(), {:sent, pid, keys}) end
+
+      ClientTracking.notify_keys_modified(["bulk1", "bulk2"], writer, sender)
+
+      assert_receive {:sent, pid, ["bulk1", "bulk2"]}
+      assert pid == self()
+      refute_receive {:sent, _, _}
+      assert :ets.lookup(:ferricstore_tracking, "bulk1") == []
+      assert :ets.lookup(:ferricstore_tracking, "bulk2") == []
+    end
+
+    test "notify_keys_modified/3 honors NOLOOP while coalescing default-mode keys" do
+      config = ClientTracking.new_config()
+      {:ok, enabled_config} = ClientTracking.enable(self(), config, noloop: true)
+
+      ClientTracking.track_keys(self(), ["self_bulk1", "self_bulk2"], enabled_config)
+
+      sender = fn pid, _msg, keys -> send(self(), {:sent, pid, keys}) end
+
+      ClientTracking.notify_keys_modified(["self_bulk1", "self_bulk2"], self(), sender)
+
+      refute_receive {:sent, _, _}
+      assert :ets.lookup(:ferricstore_tracking, "self_bulk1") == []
+      assert :ets.lookup(:ferricstore_tracking, "self_bulk2") == []
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -345,6 +378,20 @@ defmodule FerricstoreServer.ClientTrackingTest do
       ClientTracking.notify_key_modified("anything:here", writer, sender)
 
       assert_receive {:bcast_invalidated}, 1000
+    end
+
+    test "notify_keys_modified/3 coalesces BCAST invalidations per connection" do
+      config = ClientTracking.new_config()
+      {:ok, _enabled} = ClientTracking.enable(self(), config, mode: :bcast, prefixes: ["user:"])
+
+      writer = spawn(fn -> :timer.sleep(1000) end)
+      sender = fn pid, _msg, keys -> send(self(), {:sent, pid, keys}) end
+
+      ClientTracking.notify_keys_modified(["user:1", "order:1", "user:2"], writer, sender)
+
+      assert_receive {:sent, pid, ["user:1", "user:2"]}
+      assert pid == self()
+      refute_receive {:sent, _, _}
     end
 
     test "BCAST mode does not track individual keys" do
