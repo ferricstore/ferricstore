@@ -122,13 +122,16 @@ defmodule Ferricstore.Health do
   """
   @spec check() :: health_result()
   def check do
-    ctx = FerricStore.Instance.get(:default)
-    shard_count = ctx.shard_count
-    shards = collect_shard_info(shard_count)
+    ctx = default_instance()
+
+    shard_count =
+      if ctx, do: ctx.shard_count, else: Application.get_env(:ferricstore, :shard_count, 4)
+
+    shards = collect_shard_info(shard_count, ctx)
 
     # Readiness requires: flag set + all shards alive + all Raft leaders elected
     all_shards_ok = Enum.all?(shards, fn s -> s.status == "ok" end)
-    raft_ready = check_raft_leaders(shard_count)
+    raft_ready = ctx != nil and check_raft_leaders(shard_count)
 
     status =
       cond do
@@ -150,6 +153,12 @@ defmodule Ferricstore.Health do
   # Private
   # ---------------------------------------------------------------------------
 
+  defp default_instance do
+    FerricStore.Instance.get(:default)
+  rescue
+    ArgumentError -> nil
+  end
+
   # Checks that every shard's Raft server has an elected leader.
   # Without a leader, writes will fail. Returns true if all leaders
   # are elected, false if any shard has no leader.
@@ -169,12 +178,13 @@ defmodule Ferricstore.Health do
     end)
   end
 
-  @spec collect_shard_info(non_neg_integer()) :: [shard_info()]
-  defp collect_shard_info(shard_count) do
+  @spec collect_shard_info(non_neg_integer(), FerricStore.Instance.t() | nil) :: [shard_info()]
+  defp collect_shard_info(0, _ctx), do: []
+
+  defp collect_shard_info(shard_count, ctx) do
     Enum.map(0..(shard_count - 1), fn index ->
       ets = :"keydir_#{index}"
-      ctx = FerricStore.Instance.get(:default)
-      name = Router.shard_name(ctx, index)
+      name = if ctx, do: Router.shard_name(ctx, index), else: nil
 
       {status, keys} =
         try do
