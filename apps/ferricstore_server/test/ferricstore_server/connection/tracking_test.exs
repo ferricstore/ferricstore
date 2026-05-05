@@ -90,6 +90,16 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert :ets.lookup(:ferricstore_tracking, "STREAM") == []
   end
 
+  test "OBJECT tracks the key instead of the subcommand token" do
+    key = "tracking:object:a"
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+
+    Tracking.maybe_track_read("OBJECT", ["ENCODING", key], "raw", %{tracking: tracking})
+
+    assert :ets.lookup(:ferricstore_tracking, key) == [{key, self()}]
+    assert :ets.lookup(:ferricstore_tracking, "ENCODING") == []
+  end
+
   test "BITOP invalidates the destination key instead of the operation token" do
     destination = "tracking:bitop:dst"
     {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])

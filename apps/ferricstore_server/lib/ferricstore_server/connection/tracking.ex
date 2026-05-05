@@ -224,6 +224,16 @@ defmodule FerricstoreServer.Connection.Tracking do
             state
         end
 
+      "OBJECT" ->
+        case args do
+          [_subcommand, key | _] ->
+            new_tracking = ClientTracking.track_key(conn_pid, key, state.tracking)
+            %{state | tracking: new_tracking}
+
+          _ ->
+            state
+        end
+
       _ ->
         # Single-key commands: first arg is the key
         case args do
