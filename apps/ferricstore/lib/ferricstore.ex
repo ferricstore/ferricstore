@@ -2429,7 +2429,7 @@ defmodule FerricStore do
           value when is_binary(value) ->
             detected =
               try do
-                case :erlang.binary_to_term(value) do
+                case :erlang.binary_to_term(value, [:safe]) do
                   {:list, _} -> "list"
                   _ -> nil
                 end
@@ -5805,7 +5805,7 @@ defmodule FerricStore do
 
           bin when is_binary(bin) ->
             try do
-              :erlang.binary_to_term(bin)
+              :erlang.binary_to_term(bin, [:safe])
             rescue
               ArgumentError -> bin
             end
@@ -5852,7 +5852,7 @@ defmodule FerricStore do
 
           bin when is_binary(bin) ->
             try do
-              case :erlang.binary_to_term(bin) do
+              case :erlang.binary_to_term(bin, [:safe]) do
                 {:tdigest, _, _} = tuple -> tuple
                 _ -> bin
               end

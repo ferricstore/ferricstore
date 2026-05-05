@@ -597,7 +597,7 @@ defmodule Ferricstore.Commands.Stream do
           |> maybe_take(count)
 
         Enum.map(selected_entries, fn {id_str, _id, raw} ->
-          fields = :erlang.binary_to_term(raw)
+          fields = :erlang.binary_to_term(raw, [:safe])
           [id_str | fields]
         end)
     end
@@ -909,7 +909,7 @@ defmodule Ferricstore.Commands.Stream do
   defp decode_stream_entry(_id, nil), do: nil
 
   defp decode_stream_entry(id, raw) do
-    fields = :erlang.binary_to_term(raw)
+    fields = :erlang.binary_to_term(raw, [:safe])
     [id | fields]
   end
 
@@ -1038,7 +1038,7 @@ defmodule Ferricstore.Commands.Stream do
                     raw = Ops.get(store, prefix <> id_str_inner)
 
                     if raw do
-                      fields = :erlang.binary_to_term(raw)
+                      fields = :erlang.binary_to_term(raw, [:safe])
                       [id_str_inner | fields]
                     end
                   end)
@@ -1481,7 +1481,7 @@ defmodule Ferricstore.Commands.Stream do
     |> Enum.zip(raw_values)
     |> Enum.flat_map(fn
       {{id_str, _compound_key}, raw} when is_binary(raw) ->
-        [[id_str | :erlang.binary_to_term(raw)]]
+        [[id_str | :erlang.binary_to_term(raw, [:safe])]]
 
       _missing ->
         []

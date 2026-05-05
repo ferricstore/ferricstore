@@ -106,7 +106,7 @@ defmodule Ferricstore.Store.ListOps do
 
     case Ops.compound_get(store, key, meta_key) do
       nil -> nil
-      binary -> :erlang.binary_to_term(binary)
+      binary -> :erlang.binary_to_term(binary, [:safe])
     end
   end
 

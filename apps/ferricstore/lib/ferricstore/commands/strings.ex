@@ -1186,7 +1186,7 @@ defmodule Ferricstore.Commands.Strings do
   defp decode_prob_meta(value) when is_binary(value) do
     try do
       value
-      |> :erlang.binary_to_term()
+      |> :erlang.binary_to_term([:safe])
       |> decode_prob_meta()
     rescue
       _ -> nil

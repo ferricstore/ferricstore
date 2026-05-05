@@ -87,7 +87,7 @@ defmodule Ferricstore.Commands.ProbType do
   defp decode_raw_type(value) when is_binary(value) do
     try do
       value
-      |> :erlang.binary_to_term()
+      |> :erlang.binary_to_term([:safe])
       |> decode_term_type()
     rescue
       _ -> :string

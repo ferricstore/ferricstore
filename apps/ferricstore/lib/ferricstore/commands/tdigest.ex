@@ -425,7 +425,7 @@ defmodule Ferricstore.Commands.TDigest do
 
       bin when is_binary(bin) ->
         try do
-          case :erlang.binary_to_term(bin) do
+          case :erlang.binary_to_term(bin, [:safe]) do
             {:tdigest, centroids, metadata} ->
               {:ok, deserialize(centroids, metadata)}
 
@@ -477,7 +477,7 @@ defmodule Ferricstore.Commands.TDigest do
 
   defp decode_raw_digest(bin) when is_binary(bin) do
     try do
-      case :erlang.binary_to_term(bin) do
+      case :erlang.binary_to_term(bin, [:safe]) do
         {:tdigest, centroids, metadata} -> {:ok, deserialize(centroids, metadata)}
         _ -> {:error, :wrongtype}
       end
