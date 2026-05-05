@@ -2,7 +2,6 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Commands.Namespace
-  alias Ferricstore.Commands.Server
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Store.Router
 
@@ -49,14 +48,6 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     refute function_exported?(Router, :durability_for_key_public, 2)
   end
 
-  test "debug command cannot set durability mode" do
-    assert {:error, msg} = Server.handle("DEBUG", ["SET-DURABILITY", "async"], nil)
-    assert msg =~ "removed"
-
-    assert {:error, msg} = Server.handle("DEBUG", ["SET-DURABILITY", "quorum"], nil)
-    assert msg =~ "removed"
-  end
-
   test "legacy batch_async_put API submits through quorum path" do
     id = {__MODULE__, self(), :quorum_submit}
     parent = self()
@@ -78,13 +69,12 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     assert "value" == Router.get(FerricStore.Instance.get(:default), key)
   end
 
-  test "production code has no durability mode plumbing" do
-    root = Path.expand("../../lib", __DIR__)
+  test "production code and runtime config have no durability mode plumbing" do
+    repo_root = Path.expand("../../../..", __DIR__)
 
     offenders =
-      root
-      |> Path.join("**/*.ex")
-      |> Path.wildcard()
+      [Path.join(repo_root, "apps/ferricstore/lib/**/*.ex"), Path.join(repo_root, "config/*.exs")]
+      |> Enum.flat_map(&Path.wildcard/1)
       |> Enum.flat_map(fn path ->
         source = File.read!(path)
 
@@ -99,7 +89,7 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
               ":ferricstore_has_async_ns"
             ],
             String.contains?(source, token) do
-          {Path.relative_to(path, root), token}
+          {Path.relative_to(path, repo_root), token}
         end
       end)
 

@@ -4,7 +4,7 @@
 # Erlang distribution (erpc). Compare against memtier_benchmark
 # results for Redis protocol to measure protocol overhead.
 #
-# Tests both QUORUM and ASYNC durability modes.
+# FerricStore is quorum-only: every write goes through Raft.
 #
 # Usage:
 #   # Single node (embedded — no network):
@@ -16,9 +16,6 @@
 #
 #   # Terminal 2: run benchmark
 #   elixir --sname bench_client --cookie bench -S mix run bench/erpc_throughput.exs --remote ferricstore@hostname
-#
-# To enable async namespace, configure before starting FerricStore:
-#   config :ferricstore, namespace_durability: %{"async:" => :async}
 #
 # Equivalent memtier command for comparison:
 #   bash bench/tcp_throughput.sh
@@ -50,9 +47,11 @@ end
 
 # Pre-populate keys for GET tests
 IO.puts("Pre-populating 10K keys...")
+
 for i <- 1..10_000 do
   call.(FerricStore, :set, ["bench:#{i}", payload])
 end
+
 IO.puts("Done.")
 
 mode = if remote_node, do: "erpc (#{remote_node})", else: "embedded (local)"
@@ -62,61 +61,30 @@ IO.puts("Key space: #{key_max}")
 IO.puts("Concurrency: 50 parallel processes\n")
 
 # ---------------------------------------------------------------------------
-# Quorum writes (default — waits for Raft consensus + fdatasync)
+# Quorum writes (waits for Raft consensus + fdatasync)
 # ---------------------------------------------------------------------------
 
-IO.puts("=== QUORUM MODE (durable) ===\n")
+IO.puts("=== QUORUM WRITES ===\n")
 
 Benchee.run(
   %{
-    "SET (quorum)" => fn ->
-      call.(FerricStore, :set, ["bench:q:#{:rand.uniform(key_max)}", payload])
+    "SET" => fn ->
+      call.(FerricStore, :set, ["bench:#{:rand.uniform(key_max)}", payload])
     end,
     "GET" => fn ->
       call.(FerricStore, :get, ["bench:#{:rand.uniform(10_000)}"])
     end,
-    "HSET (quorum)" => fn ->
-      call.(FerricStore, :hset, ["bench:q:hash:#{:rand.uniform(key_max)}", %{"field" => payload}])
+    "HSET" => fn ->
+      call.(FerricStore, :hset, ["bench:hash:#{:rand.uniform(key_max)}", %{"field" => payload}])
     end,
-    "LPUSH (quorum)" => fn ->
-      call.(FerricStore, :rpush, ["bench:q:list:#{:rand.uniform(key_max)}", [payload]])
+    "LPUSH" => fn ->
+      call.(FerricStore, :rpush, ["bench:list:#{:rand.uniform(key_max)}", [payload]])
     end,
-    "SADD (quorum)" => fn ->
-      call.(FerricStore, :sadd, ["bench:q:set:#{:rand.uniform(key_max)}", [payload]])
+    "SADD" => fn ->
+      call.(FerricStore, :sadd, ["bench:set:#{:rand.uniform(key_max)}", [payload]])
     end,
-    "INCR (quorum)" => fn ->
-      call.(FerricStore, :incr, ["bench:q:counter:#{:rand.uniform(key_max)}"])
-    end
-  },
-  time: 10,
-  warmup: 2,
-  parallel: 50,
-  formatters: [Benchee.Formatters.Console]
-)
-
-# ---------------------------------------------------------------------------
-# Async writes (if namespace configured — skips Raft wait, local fsync only)
-# ---------------------------------------------------------------------------
-
-IO.puts("\n=== ASYNC MODE (fast, local durability only) ===\n")
-IO.puts("Keys prefixed with 'async:' — requires namespace_durability config.\n")
-
-Benchee.run(
-  %{
-    "SET (async)" => fn ->
-      call.(FerricStore, :set, ["async:bench:#{:rand.uniform(key_max)}", payload])
-    end,
-    "HSET (async)" => fn ->
-      call.(FerricStore, :hset, ["async:bench:hash:#{:rand.uniform(key_max)}", %{"field" => payload}])
-    end,
-    "LPUSH (async)" => fn ->
-      call.(FerricStore, :rpush, ["async:bench:list:#{:rand.uniform(key_max)}", [payload]])
-    end,
-    "SADD (async)" => fn ->
-      call.(FerricStore, :sadd, ["async:bench:set:#{:rand.uniform(key_max)}", [payload]])
-    end,
-    "INCR (async)" => fn ->
-      call.(FerricStore, :incr, ["async:bench:counter:#{:rand.uniform(key_max)}"])
+    "INCR" => fn ->
+      call.(FerricStore, :incr, ["bench:counter:#{:rand.uniform(key_max)}"])
     end
   },
   time: 10,

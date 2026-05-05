@@ -557,27 +557,6 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
   end
 
   # ---------------------------------------------------------------------------
-  # DEBUG SET-DURABILITY command
-  # ---------------------------------------------------------------------------
-
-  describe "DEBUG SET-DURABILITY" do
-    test "rejects old durability modes" do
-      result = Ferricstore.Commands.Server.handle("DEBUG", ["SET-DURABILITY", "async"], nil)
-      assert {:error, msg} = result
-      assert String.contains?(msg, "durability mode has been removed")
-
-      result = Ferricstore.Commands.Server.handle("DEBUG", ["SET-DURABILITY", "quorum"], nil)
-      assert {:error, msg} = result
-      assert String.contains?(msg, "durability mode has been removed")
-    end
-
-    test "rejects invalid durability mode via catch-all" do
-      result = Ferricstore.Commands.Server.handle("DEBUG", ["SET-DURABILITY", "invalid"], nil)
-      assert {:error, _msg} = result
-    end
-  end
-
-  # ---------------------------------------------------------------------------
   # ns_config_changed invalidates cache and flushes slots
   # ---------------------------------------------------------------------------
 

@@ -90,13 +90,13 @@ Parsing is O(n) in value size but for 256B values this should be negligible.
 
 ## Pipeline Test Results
 
-| Pipeline | Write Quorum | Write Async | Read | Mixed |
-|----------|-------------|-------------|------|-------|
-| 1 | 7,604 | 7,664 | 96,821 | 26,124 |
-| 5 | 7,660 | 7,634 | 106,440 | 18,233 |
-| 10 | 7,597 | 7,663 | 113,044 | 17,912 |
-| 50 | 7,571 | 7,580 | 120,698 | 24,511 |
-| 100 | 7,570 | 7,490 | 112,202 | - |
+| Pipeline | Write | Read | Mixed |
+|----------|-------|------|-------|
+| 1 | 7,604 | 96,821 | 26,124 |
+| 5 | 7,660 | 106,440 | 18,233 |
+| 10 | 7,597 | 113,044 | 17,912 |
+| 50 | 7,571 | 120,698 | 24,511 |
+| 100 | 7,570 | 112,202 | - |
 
 **Pipeline does NOT increase write throughput.** Writes are flat at ~7,600 regardless of pipeline depth. Latency increases linearly (26ms → 2,674ms at pipeline=100) — requests are just queuing.
 
@@ -104,19 +104,14 @@ Parsing is O(n) in value size but for 256B values this should be negligible.
 
 ## Root Cause Analysis
 
-### Async namespace IS configured correctly
-Verified: `FERRICSTORE.CONFIG GET async:` returns `durability=async`. The config is applied.
-
 ### The write path (confirmed by code)
 1. Connection process sends `GenServer.call(shard, {:put, key, value, exp})`
-2. Shard `handle_call` → `ShardWrites.handle_put` → `Batcher.write_async/3` (cast, non-blocking)
-3. Shard returns `{:noreply, state}` immediately — does NOT block on Raft
-4. Batcher buffers the command in a per-namespace slot
+2. Shard `handle_call` → `ShardWrites.handle_put` → `Batcher.write/3`
+3. Batcher buffers the command in a Raft batch
 5. After `window_ms` (default 1ms), Batcher flushes:
-   - **Quorum**: `ra:pipeline_command` → waits for ra_event → replies to caller
-   - **Async**: `AsyncApplyWorker.apply_batch` (cast) → replies to caller immediately
+   - `ra:pipeline_command` → waits for Raft acceptance and local apply → replies to caller
 
-### Why async = quorum throughput
+### Why throughput is flat across pipeline depth
 The Shard GenServer processes one message at a time. Even though `handle_put` returns `{:noreply, ...}` quickly (~microseconds), the GenServer mailbox is the serialization point. With 200 connections sending to 4 shards, each shard processes ~50 connections sequentially.
 
 The shard's `handle_put` does:

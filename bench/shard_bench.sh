@@ -1,12 +1,11 @@
 #!/bin/bash
-# Benchmark: quorum write, async write, read — varying shard count (2, 3, 4)
+# Benchmark: quorum write, read — varying shard count (2, 3, 4)
 #
 # Run from the CLIENT VM:
 #   bash bench/shard_bench.sh <server_ip>
 #
 # Prerequisites:
 #   - Server VM has FerricStore built and systemd service configured
-#   - Server has async namespace: FERRICSTORE_NAMESPACE_DURABILITY="async:=async"
 #   - Client has memtier_benchmark installed
 #   - SSH key-based access to server as 'ferric'
 
@@ -40,11 +39,10 @@ restart_ferricstore() {
 
   ssh ${SSH_USER}@${SERVER} "sudo systemctl stop ferricstore || true; sleep 1; sudo rm -rf /data/ferricstore/*"
 
-  # Create systemd override for shard count and async namespace
+  # Create systemd override for shard count.
   ssh ${SSH_USER}@${SERVER} "sudo mkdir -p /etc/systemd/system/ferricstore.service.d && \
     echo '[Service]
 Environment=FERRICSTORE_SHARD_COUNT=${shards}
-Environment=FERRICSTORE_NAMESPACE_DURABILITY=async:=async
 Environment=FERRICSTORE_PROTECTED_MODE=false' | sudo tee /etc/systemd/system/ferricstore.service.d/bench.conf > /dev/null && \
     sudo systemctl daemon-reload && \
     sudo systemctl start ferricstore"
@@ -149,8 +147,7 @@ Pre-populated keys: $PREPOP_KEYS (for reads)
 Shard counts tested: 2, 3, 4
 
 === Workloads ===
-write_quorum  : SET bench:q:__key__ (Raft + fsync, durable)
-write_async   : SET async:bench:__key__ (ETS + nosync, fast)
+write         : SET bench:q:__key__ (Raft + fsync, durable)
 read          : GET bench:read:__key__ (ETS hot cache)
 mixed_80_20   : --ratio 1:4 = 20% SET + 80% GET (quorum writes)
 EOF
@@ -167,15 +164,10 @@ for SHARDS in 2 3 4; do
   restart_ferricstore $SHARDS
   prepopulate
 
-  # Write quorum
-  run_bench "quorum" $SHARDS "write_quorum" \
+  # Write
+  run_bench "write" $SHARDS "write" \
     --command="SET bench:q:__key__ __data__"
-  extract_to_csv $SHARDS "write_quorum"
-
-  # Write async
-  run_bench "async" $SHARDS "write_async" \
-    --command="SET async:bench:__key__ __data__"
-  extract_to_csv $SHARDS "write_async"
+  extract_to_csv $SHARDS "write"
 
   # Read (pre-populated keys)
   run_bench "read" $SHARDS "read" \

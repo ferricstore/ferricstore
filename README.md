@@ -24,17 +24,8 @@ Every write in FerricStore is:
 | **Isolated** | Single-threaded state machine per shard — commands never interleave |
 | **Durable** | WAL + fdatasync + Raft quorum — majority of nodes must persist before ack |
 
-Not every key needs the same guarantee. FerricStore lets you choose per namespace:
-
-```elixir
-# Session tokens: never lose them (quorum — majority must persist before ack)
-FERRICSTORE.CONFIG SET "session:" durability quorum
-
-# Cache entries: speed over safety (async — write to local WAL, replicate in background)
-FERRICSTORE.CONFIG SET "cache:" durability async
-```
-
-One cluster. Mixed workloads. The right tradeoff for each key prefix.
+FerricStore has one write contract today: quorum durability. Every write goes
+through Raft and disk-backed storage before success is reported.
 
 ## Beyond Cachex and Nebulex
 
@@ -46,7 +37,7 @@ If you're using Cachex or Nebulex today, FerricStore gives you:
 - **Redis protocol** — non-Elixir services can share the same store. Use any Redis client library.
 - **Data structures beyond key-value** — Hash, List, Set, SortedSet, Stream, Geo, JSON, Bitmap, HyperLogLog, Bloom, Cuckoo, Count-Min Sketch, TopK, TDigest.
 - **Automatic failover** — Raft consensus with leader election. No Sentinel, no manual intervention.
-- **Mixed durability** — quorum (crash-safe) or async (fast) per key prefix in the same cluster.
+- **Quorum-first writes** — every write uses Raft consensus and disk-backed durability.
 
 ## Quick Start
 
@@ -87,7 +78,7 @@ Drop-in Redis replacement. 250+ commands. Use your existing Redis client librari
 ## Guides
 
 - [Getting Started](guides/getting-started.md) — installation, configuration, first commands
-- [Best Practices](guides/best-practices.md) — hash tags, durability, pipelining, key design
+- [Best Practices](guides/best-practices.md) — hash tags, pipelining, key design
 - [Architecture](guides/architecture.md) — write path, read path, three-tier storage, Raft consensus
 - [Commands Reference](guides/commands.md) — all 250+ commands with syntax and compatibility notes
 - [Embedded Mode](guides/embedded-mode.md) — using FerricStore inside your Elixir app

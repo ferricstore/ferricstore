@@ -9,7 +9,6 @@ We already have:
 - Group commit via Batcher (1ms window, up to 1000 commands)
 - Pipeline commands (`ra:pipeline_command/4`) instead of blocking writes
 - ETS hot cache for reads (bypasses Raft entirely)
-- Async durability mode (per-namespace, bypasses Raft)
 - `segment_max_entries: 32_768`
 
 ## Architecture: Where Time Goes

@@ -17,23 +17,11 @@ Issues found while setting up the tuning benchmark suite on Azure VMs.
 
 ## Fixed During Session
 
-### 1. `String.to_existing_atom` crash in runtime.exs
-**Symptom:** `MIX_ENV=prod mix run --no-halt` crashes with `ArgumentError: not an already existing atom` on `String.to_existing_atom("quorum")`.
-**Cause:** `runtime.exs` uses `String.to_existing_atom/1` for `FERRICSTORE_DURABILITY` env var. In a release the atoms are pre-loaded, but with `mix run` they're not.
-**Fix:** Changed to `String.to_atom/1` on the server. Should be fixed in source for anyone running prod without a release.
-**File:** `config/runtime.exs:24`
-
 ### 2. NIF .so not compiled for prod
 **Symptom:** `UndefinedFunctionError: function Ferricstore.Bitcask.NIF.v2_scan_file/1 is undefined`
 **Cause:** `MIX_ENV=prod mix compile` doesn't trigger `cargo build` — the NIF compile hook only runs if `FERRICSTORE_BUILD_NIF=1` is set, and the output goes to `priv/native/` not the `_build/prod/` path.
 **Fix:** Manually ran `cargo build --release` and copied `.so` to `_build/prod/lib/ferricstore/priv/native/`.
 **Action needed:** The NIF compile hook should handle prod builds correctly, or the bench script should build and copy the NIF.
-
-### 3. No startup config for namespace durability
-**Symptom:** Async write workload needs `async:` prefix configured as async durability, but there's no env var or config option for namespace overrides at startup.
-**Cause:** `NamespaceConfig` initializes empty — all namespaces use the global default. Overrides are only possible via `FERRICSTORE.CONFIG SET` command at runtime.
-**Fix:** Script sends `FERRICSTORE.CONFIG SET async: durability async` via netcat after startup.
-**Action needed:** Consider adding `FERRICSTORE_NAMESPACE_OVERRIDES` env var to `runtime.exs` for configuring namespace durability at startup (e.g., `async:=async,cache:=async`).
 
 ## Azure / Cloud-Init Issues
 
@@ -80,18 +68,11 @@ Issues found while setting up the tuning benchmark suite on Azure VMs.
 
 ## Application Issues
 
-### 12. No startup config for per-namespace durability overrides
-**Symptom:** There's no env var to configure `async:` prefix as async durability at startup. Only the global default (`FERRICSTORE_DURABILITY=quorum`) is configurable via env.
-**Cause:** `NamespaceConfig` initializes empty — per-namespace overrides require runtime `FERRICSTORE.CONFIG SET` commands.
-**Workaround:** Script sends `FERRICSTORE.CONFIG SET async: durability async` via netcat after startup.
-**Action needed:** Add `FERRICSTORE_NAMESPACE_OVERRIDES` env var to `runtime.exs` (e.g., `async:=async,cache:=async`). Parse at startup in `NamespaceConfig.init/1`.
-**File:** `config/runtime.exs`, `apps/ferricstore/lib/ferricstore/namespace_config.ex`
-
 ### 13. Pre-population with quorum writes is very slow
 **Symptom:** Pre-populating 100K keys via memtier takes several minutes with quorum durability (Raft + fsync per batch).
 **Cause:** Each write goes through Raft consensus and Bitcask fsync. On 4 cores with 4 shards, throughput is limited by fsync latency.
 **Impact:** Benchmark cycle time is dominated by pre-population, not the actual benchmark workloads.
-**Action needed:** Consider pre-populating with async durability (the `async:` prefix) since the pre-populated data just needs to exist for read benchmarks — durability of the seed data doesn't matter. Or use a separate key prefix for reads that uses async durability.
+**Action needed:** Pre-populate through the fastest quorum path available: batched writes, larger pipelines, fixture import, or a reusable warmed data directory. Do not use a separate non-quorum durability path for benchmark setup.
 
 ### 17. release_cursor_interval too small for high throughput
 **Symptom:** Ra snapshots fire every ~1.3 seconds per shard at 7.6K ops/sec. Each snapshot + ETS delete takes 25-50ms.

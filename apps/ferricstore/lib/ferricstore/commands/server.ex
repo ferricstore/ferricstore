@@ -287,10 +287,6 @@ defmodule Ferricstore.Commands.Server do
     handle("FLUSHALL", [], store)
   end
 
-  def handle("DEBUG", ["SET-DURABILITY", _mode], _store) do
-    {:error, "ERR durability mode has been removed; writes always use quorum"}
-  end
-
   def handle("DEBUG", ["BATCHER-STATS"], _store) do
     ctx = FerricStore.Instance.get(:default)
     shard_count = ctx.shard_count

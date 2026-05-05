@@ -4,7 +4,6 @@
 # Tests the hypothesis that disabling Nagle (nodelay=false) improves
 # throughput by coalescing small responses into fewer send() syscalls.
 #
-# Requires FerricStore running with async namespace configured.
 # Run twice: once with FERRICSTORE_TCP_NODELAY=true, once with =false.
 #
 # Usage:
@@ -32,13 +31,13 @@ for PIPELINE in 1 50; do
   echo "####  PIPELINE=$PIPELINE  ####"
 
   echo ""
-  echo "--- SET async (pipeline=$PIPELINE) ---"
+  echo "--- SET (pipeline=$PIPELINE) ---"
   memtier_benchmark -s $HOST -p $PORT \
     --protocol=resp3 \
     --clients=$CLIENTS --threads=$THREADS \
     --requests=$REQUESTS \
     --pipeline=$PIPELINE \
-    --command="SET async:nd:__key__ __data__" \
+    --command="SET bench:nd:__key__ __data__" \
     --command-key-pattern=R --key-minimum=1 --key-maximum=$KEY_MAX \
     --data-size=$DATA_SIZE \
     --hide-histogram
@@ -50,21 +49,10 @@ for PIPELINE in 1 50; do
     --clients=$CLIENTS --threads=$THREADS \
     --requests=$REQUESTS \
     --pipeline=$PIPELINE \
-    --command="GET async:nd:__key__" \
+    --command="GET bench:nd:__key__" \
     --command-key-pattern=R --key-minimum=1 --key-maximum=$KEY_MAX \
     --hide-histogram
 
-  echo ""
-  echo "--- SET quorum (pipeline=$PIPELINE) ---"
-  memtier_benchmark -s $HOST -p $PORT \
-    --protocol=resp3 \
-    --clients=$CLIENTS --threads=$THREADS \
-    --requests=$REQUESTS \
-    --pipeline=$PIPELINE \
-    --command="SET bench:nd:__key__ __data__" \
-    --command-key-pattern=R --key-minimum=1 --key-maximum=$KEY_MAX \
-    --data-size=$DATA_SIZE \
-    --hide-histogram
 done
 
 echo ""
