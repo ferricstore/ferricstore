@@ -53,6 +53,19 @@ defmodule Ferricstore.Commands.StreamTest do
       assert entry == [id, "f1", "v1", "f2", "v2"]
     end
 
+    test "XADD returns entry write errors before updating metadata" do
+      key = ustream()
+
+      store =
+        MockStore.make()
+        |> Map.put(:compound_put, fn ^key, "X:" <> _rest, _encoded, 0 ->
+          {:error, :disk_full}
+        end)
+
+      assert {:error, :disk_full} = Stream.handle("XADD", [key, "1-0", "f", "v"], store)
+      assert 0 == Stream.handle("XLEN", [key], store)
+    end
+
     test "XRANGE skips corrupt persisted stream entries" do
       store = MockStore.make()
       key = ustream()
@@ -710,6 +723,19 @@ defmodule Ferricstore.Commands.StreamTest do
 
       deleted = Stream.handle("XDEL", [key, "99-0"], store)
       assert deleted == 0
+    end
+
+    test "XDEL returns entry delete errors before updating metadata" do
+      base = MockStore.make()
+      key = ustream()
+      Stream.handle("XADD", [key, "1-0", "a", "1"], base)
+
+      store =
+        Map.put(base, :compound_delete, fn ^key, "X:" <> _rest -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = Stream.handle("XDEL", [key, "1-0"], store)
+      assert 1 == Stream.handle("XLEN", [key], base)
+      assert [[_, "a", "1"]] = Stream.handle("XRANGE", [key, "-", "+"], base)
     end
 
     test "XDEL mixed existing and nonexistent entries" do

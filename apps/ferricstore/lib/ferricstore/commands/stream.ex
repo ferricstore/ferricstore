@@ -525,28 +525,30 @@ defmodule Ferricstore.Commands.Stream do
 
         # Serialize field-value pairs as Erlang binary term.
         encoded = :erlang.term_to_binary(fields)
-        put_stream_entry(store, key, compound_key, encoded)
-        maybe_index_stream_put(store, key, id_str, compound_key, meta_entries)
 
-        # Update metadata.
-        {new_len, new_first} =
-          case meta_entries do
-            [{^key, len, first, _last, _ms, _seq}] ->
-              {len + 1, first}
+        with :ok <- put_stream_entry(store, key, compound_key, encoded) do
+          maybe_index_stream_put(store, key, id_str, compound_key, meta_entries)
 
-            [] ->
-              {1, id_str}
-          end
+          # Update metadata.
+          {new_len, new_first} =
+            case meta_entries do
+              [{^key, len, first, _last, _ms, _seq}] ->
+                {len + 1, first}
 
-        :ets.insert(@meta_table, {key, new_len, new_first, id_str, ms, seq})
+              [] ->
+                {1, id_str}
+            end
 
-        # Apply trim if requested.
-        maybe_trim(key, trim_opts, store)
+          :ets.insert(@meta_table, {key, new_len, new_first, id_str, ms, seq})
 
-        # Notify any XREAD BLOCK waiters watching this stream.
-        notify_stream_waiters(key)
+          # Apply trim if requested.
+          maybe_trim(key, trim_opts, store)
 
-        id_str
+          # Notify any XREAD BLOCK waiters watching this stream.
+          notify_stream_waiters(key)
+
+          id_str
+        end
 
       {:error, _} = err ->
         err
@@ -833,23 +835,31 @@ defmodule Ferricstore.Commands.Stream do
 
     prefix = "X:#{key}" <> @sep
 
-    deleted =
-      Enum.reduce(ids, 0, fn id_str, acc ->
+    delete_result =
+      Enum.reduce_while(ids, 0, fn id_str, acc ->
         compound_key = prefix <> id_str
 
         if stream_entry_exists?(store, key, compound_key) do
-          delete_stream_entry(store, key, compound_key)
-          acc + 1
+          case delete_stream_entry(store, key, compound_key) do
+            :ok -> {:cont, acc + 1}
+            {:error, _} = error -> {:halt, error}
+          end
         else
-          acc
+          {:cont, acc}
         end
       end)
 
-    if deleted > 0 do
-      update_meta_after_xdel(key, deleted, store)
-    end
+    case delete_result do
+      {:error, _} = error ->
+        error
 
-    deleted
+      deleted ->
+        if deleted > 0 do
+          update_meta_after_xdel(key, deleted, store)
+        end
+
+        deleted
+    end
   end
 
   defp stream_entry_exists?(store, stream_key, compound_key) do
@@ -1213,8 +1223,10 @@ defmodule Ferricstore.Commands.Stream do
 
   defp delete_stream_entry(store, stream_key, compound_key) do
     if Ops.has_compound?(store) do
-      Ops.compound_delete(store, stream_key, compound_key)
-      delete_stream_index_entry(stream_key, compound_key)
+      with :ok <- Ops.compound_delete(store, stream_key, compound_key) do
+        delete_stream_index_entry(stream_key, compound_key)
+        :ok
+      end
     else
       Ops.delete(store, compound_key)
     end
