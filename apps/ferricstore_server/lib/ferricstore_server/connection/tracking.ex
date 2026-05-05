@@ -221,6 +221,10 @@ defmodule FerricstoreServer.Connection.Tracking do
   def maybe_track_read(_cmd, _args, _result, %{tracking: %{enabled: false}} = state), do: state
   def maybe_track_read(_cmd, _args, _result, %{tracking: nil} = state), do: state
   def maybe_track_read(_cmd, _args, {:error, _}, state), do: state
+  def maybe_track_read(cmd, _args, _result, state) when cmd in ~w(GETSET GETDEL), do: state
+
+  def maybe_track_read("GETEX", [_key, _option | _opts], result, state) when result != nil,
+    do: state
 
   def maybe_track_read(cmd, args, _result, state) when cmd in @read_cmds do
     conn_pid = self()
