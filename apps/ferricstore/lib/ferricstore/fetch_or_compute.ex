@@ -111,11 +111,10 @@ defmodule Ferricstore.FetchOrCompute do
         # us up when it publishes.
         case :ets.lookup(@table, key) do
           [{^key, computer_pid, waiters, started_at, lock_hint, compute_id}] ->
-            new_waiters = waiters ++ [{from, caller_pid}]
-
             :ets.insert(
               @table,
-              {key, computer_pid, new_waiters, started_at, lock_hint, compute_id}
+              {key, computer_pid, add_waiter(waiters, {from, caller_pid}), started_at, lock_hint,
+               compute_id}
             )
 
             {:noreply, state}
@@ -165,7 +164,7 @@ defmodule Ferricstore.FetchOrCompute do
             {:error, _} = error -> error
           end
 
-        Enum.each(waiters, fn {waiter_from, _pid} -> GenServer.reply(waiter_from, reply) end)
+        reply_waiters(waiters, reply)
 
         _ = Router.unlock(ctx, lock_key(key), compute_id)
         :ets.delete(@table, key)
@@ -184,9 +183,7 @@ defmodule Ferricstore.FetchOrCompute do
 
     case :ets.lookup(@table, key) do
       [{^key, _computer_pid, waiters, _started, _hint, compute_id}] ->
-        Enum.each(waiters, fn {waiter_from, _pid} ->
-          GenServer.reply(waiter_from, {:error, error_msg})
-        end)
+        reply_waiters(waiters, {:error, error_msg})
 
         _ = Router.unlock(ctx, lock_key(key), compute_id)
         :ets.delete(@table, key)
@@ -250,14 +247,37 @@ defmodule Ferricstore.FetchOrCompute do
     end
   end
 
-  defp promote_or_clear(key, [{next_from, next_pid} | rest_waiters], hint) do
+  defp promote_or_clear(key, waiters, hint) do
+    case waiters_fifo(waiters) do
+      [] ->
+        :ets.delete(@table, key)
+
+      [{next_from, next_pid} | rest_waiters] ->
+        promote_waiter(key, next_from, next_pid, rest_waiters, hint)
+    end
+  end
+
+  defp promote_waiter(key, next_from, next_pid, rest_waiters, hint) do
     new_started = System.monotonic_time(:millisecond)
     compute_id = generate_compute_id()
-    :ets.insert(@table, {key, next_pid, rest_waiters, new_started, hint, compute_id})
+
+    :ets.insert(
+      @table,
+      {key, next_pid, Enum.reverse(rest_waiters), new_started, hint, compute_id}
+    )
+
     GenServer.reply(next_from, {:compute, hint})
   end
 
-  defp promote_or_clear(key, [], _hint), do: :ets.delete(@table, key)
+  defp add_waiter(waiters, waiter), do: [waiter | waiters]
+
+  defp reply_waiters(waiters, reply) do
+    waiters
+    |> waiters_fifo()
+    |> Enum.each(fn {waiter_from, _pid} -> GenServer.reply(waiter_from, reply) end)
+  end
+
+  defp waiters_fifo(waiters), do: Enum.reverse(waiters)
 
   defp schedule_sweep(timeout_ms) do
     interval = max(div(timeout_ms, 2), 500)

@@ -20,6 +20,16 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
   # Dummy store map -- native commands ignore it.
   defp dummy_store, do: %{}
 
+  describe "performance guards" do
+    test "local waiter registration does not append to the waiter list" do
+      source =
+        File.read!(Path.expand("lib/ferricstore/fetch_or_compute.ex", File.cwd!()))
+
+      refute source =~ "waiters ++",
+             "fetch_or_compute waiter enqueue must stay O(1); append makes same-key stampedes O(n^2)"
+    end
+  end
+
   # ===========================================================================
   # FETCH_OR_COMPUTE on existing key
   # ===========================================================================
@@ -122,7 +132,8 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       assert ["hit", "done"] = result
     end
 
-    @tag skip: "async durability pressure path removed; quorum write failure injection needs a new hook"
+    @tag skip:
+           "async durability pressure path removed; quorum write failure injection needs a new hook"
     test "returns write error and wakes waiters with error when storing result fails" do
       key = "foc:result_pressure_#{:erlang.unique_integer([:positive])}"
       ctx = FerricStore.Instance.get(:default)

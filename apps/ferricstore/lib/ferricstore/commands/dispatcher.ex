@@ -481,7 +481,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
-      when tag in ~w(unlock ferricstore_key_info)a,
+      when tag in ~w(unlock ferricstore_key_info fetch_or_compute_error)a,
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
