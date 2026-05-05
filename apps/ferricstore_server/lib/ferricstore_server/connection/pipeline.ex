@@ -292,9 +292,15 @@ defmodule FerricstoreServer.Connection.Pipeline do
     response =
       case safe_dispatch(fn -> Router.batch_quorum_put(state.instance_ctx, kv_pairs) end) do
         {:ok, results} ->
-          Enum.map(results, fn
-            :ok -> Encoder.ok_response()
-            {:error, _} = err -> Encoder.encode(err)
+          kv_pairs
+          |> Enum.zip(results)
+          |> Enum.map(fn
+            {{key, value}, :ok} ->
+              notify_pipeline_set_success(key, value, state)
+              Encoder.ok_response()
+
+            {_kv_pair, {:error, _} = err} ->
+              Encoder.encode(err)
           end)
 
         {:error, err} ->
@@ -378,9 +384,9 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
     get_ops = for {:get, idx, key} <- ops, do: {idx, key}
 
-    set_ops =
-      state.sandbox_namespace
-      |> namespace_set_ops(for {:set, idx, key, value} <- ops, do: {idx, key, value})
+    raw_set_ops = for {:set, idx, key, value} <- ops, do: {idx, key, value}
+    set_notify_args = Map.new(raw_set_ops, fn {idx, key, value} -> {idx, {key, value}} end)
+    set_ops = namespace_set_ops(state.sandbox_namespace, raw_set_ops)
 
     # Execute SETs first so subsequent GETs in the same pipeline see the new values.
     set_results =
@@ -411,8 +417,13 @@ defmodule FerricstoreServer.Connection.Pipeline do
           |> Map.new(fn {{idx, _key, _value}, result} ->
             encoded =
               case result do
-                :ok -> Encoder.ok_response()
-                {:error, _} = err -> Encoder.encode(err)
+                :ok ->
+                  {key, value} = Map.fetch!(set_notify_args, idx)
+                  notify_pipeline_set_success(key, value, state)
+                  Encoder.ok_response()
+
+                {:error, _} = err ->
+                  Encoder.encode(err)
               end
 
             {idx, encoded}
@@ -528,6 +539,11 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp mixed_set_results(ctx, kv_pairs) do
     Router.batch_quorum_put(ctx, kv_pairs)
+  end
+
+  defp notify_pipeline_set_success(key, value, state) do
+    ConnTracking.maybe_notify_keyspace("SET", [key, value], :ok)
+    ConnTracking.maybe_notify_tracking("SET", [key, value], :ok, state)
   end
 
   # ---------------------------------------------------------------------------
