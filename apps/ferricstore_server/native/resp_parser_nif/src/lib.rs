@@ -1571,6 +1571,9 @@ enum CommandAstKind {
     FlowCancel,
     FlowRewind,
     FlowList,
+    FlowByParent,
+    FlowByRoot,
+    FlowByCorrelation,
     FlowInfo,
     FlowStuck,
     FlowHistory,
@@ -1806,6 +1809,9 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"FLOW.CANCEL" => CommandAstKind::FlowCancel,
         b"FLOW.REWIND" => CommandAstKind::FlowRewind,
         b"FLOW.LIST" => CommandAstKind::FlowList,
+        b"FLOW.BY_PARENT" => CommandAstKind::FlowByParent,
+        b"FLOW.BY_ROOT" => CommandAstKind::FlowByRoot,
+        b"FLOW.BY_CORRELATION" => CommandAstKind::FlowByCorrelation,
         b"FLOW.INFO" => CommandAstKind::FlowInfo,
         b"FLOW.STUCK" => CommandAstKind::FlowStuck,
         b"FLOW.HISTORY" => CommandAstKind::FlowHistory,
@@ -2240,6 +2246,23 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowCancel => make_flow_cancel_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowRewind => make_flow_rewind_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowList => make_flow_list_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowByParent => make_flow_index_query_command_ast(
+            env,
+            "flow_by_parent",
+            b"flow.by_parent",
+            args,
+            arg_bytes,
+        ),
+        CommandAstKind::FlowByRoot => {
+            make_flow_index_query_command_ast(env, "flow_by_root", b"flow.by_root", args, arg_bytes)
+        }
+        CommandAstKind::FlowByCorrelation => make_flow_index_query_command_ast(
+            env,
+            "flow_by_correlation",
+            b"flow.by_correlation",
+            args,
+            arg_bytes,
+        ),
         CommandAstKind::FlowInfo => make_flow_info_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowStuck => make_flow_stuck_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowHistory => make_flow_history_command_ast(env, args, arg_bytes),
@@ -5421,6 +5444,24 @@ fn make_flow_list_command_ast<'a>(
     }
 }
 
+fn make_flow_index_query_command_ast<'a>(
+    env: Env<'a>,
+    tag_name: &str,
+    command_name: &[u8],
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, tag_name);
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, command_name)).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_index_query_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
 fn make_flow_info_command_ast<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -5780,6 +5821,24 @@ fn flow_list_option<'a>(
         idx,
         &[
             (b"STATE", "state", FlowOptType::Binary),
+            (b"COUNT", "count", FlowOptType::Positive(b"count")),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_index_query_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
             (b"COUNT", "count", FlowOptType::Positive(b"count")),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -8016,6 +8075,18 @@ mod tests {
         assert_eq!(
             classify_command_ast(b"FLOW.CLAIM_DUE", 0),
             CommandAstKind::FlowClaimDue
+        );
+        assert_eq!(
+            classify_command_ast(b"FLOW.BY_PARENT", 0),
+            CommandAstKind::FlowByParent
+        );
+        assert_eq!(
+            classify_command_ast(b"FLOW.BY_ROOT", 0),
+            CommandAstKind::FlowByRoot
+        );
+        assert_eq!(
+            classify_command_ast(b"FLOW.BY_CORRELATION", 0),
+            CommandAstKind::FlowByCorrelation
         );
     }
 

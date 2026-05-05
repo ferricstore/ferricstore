@@ -76,6 +76,21 @@ defmodule Ferricstore.Commands.Flow do
     FerricStore.flow_list(type, opts) |> normalize_result()
   end
 
+  def handle_ast({:flow_by_parent, parent_flow_id, opts}, _store)
+      when is_binary(parent_flow_id) and is_list(opts) do
+    FerricStore.flow_by_parent(parent_flow_id, opts) |> normalize_result()
+  end
+
+  def handle_ast({:flow_by_root, root_flow_id, opts}, _store)
+      when is_binary(root_flow_id) and is_list(opts) do
+    FerricStore.flow_by_root(root_flow_id, opts) |> normalize_result()
+  end
+
+  def handle_ast({:flow_by_correlation, correlation_id, opts}, _store)
+      when is_binary(correlation_id) and is_list(opts) do
+    FerricStore.flow_by_correlation(correlation_id, opts) |> normalize_result()
+  end
+
   def handle_ast({:flow_info, type, opts}, _store) when is_binary(type) and is_list(opts) do
     FerricStore.flow_info(type, opts) |> normalize_result()
   end

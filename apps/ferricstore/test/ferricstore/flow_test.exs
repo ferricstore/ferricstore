@@ -172,6 +172,66 @@ defmodule Ferricstore.FlowTest do
              FerricStore.zrange(Ferricstore.Flow.Keys.root_index_key(id, partition), 0, 10)
   end
 
+  test "flow_by_parent root and correlation query lineage indexes" do
+    partition = uid("tenant")
+    root = uid("flow-root")
+    child_a = uid("flow-child-a")
+    child_b = uid("flow-child-b")
+    grandchild = uid("flow-grandchild")
+    correlation = uid("order")
+
+    assert {:ok, %{id: ^root}} =
+             FerricStore.flow_create(root,
+               type: "lineage",
+               partition_key: partition,
+               correlation_id: correlation,
+               now_ms: 1_000,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, %{id: ^child_a}} =
+             FerricStore.flow_create(child_a,
+               type: "lineage",
+               partition_key: partition,
+               parent_flow_id: root,
+               root_flow_id: root,
+               correlation_id: correlation,
+               now_ms: 2_000,
+               run_at_ms: 2_000
+             )
+
+    assert {:ok, %{id: ^child_b}} =
+             FerricStore.flow_create(child_b,
+               type: "lineage",
+               partition_key: partition,
+               parent_flow_id: root,
+               root_flow_id: root,
+               correlation_id: correlation,
+               now_ms: 3_000,
+               run_at_ms: 3_000
+             )
+
+    assert {:ok, %{id: ^grandchild}} =
+             FerricStore.flow_create(grandchild,
+               type: "lineage",
+               partition_key: partition,
+               parent_flow_id: child_a,
+               root_flow_id: root,
+               correlation_id: correlation,
+               now_ms: 4_000,
+               run_at_ms: 4_000
+             )
+
+    assert {:ok, [%{id: ^child_a}, %{id: ^child_b}]} =
+             FerricStore.flow_by_parent(root, partition_key: partition, count: 10)
+
+    assert {:ok, [%{id: ^root}, %{id: ^child_a}, %{id: ^child_b}, %{id: ^grandchild}]} =
+             FerricStore.flow_by_root(root, partition_key: partition, count: 10)
+
+    assert {:ok, [%{id: ^root}, %{id: ^child_a}]} =
+             FerricStore.flow_by_correlation(correlation, partition_key: partition, count: 2)
+  end
+
   test "flow_create_many creates one-partition batch atomically" do
     partition = uid("tenant")
     type = uid("bulk-create")

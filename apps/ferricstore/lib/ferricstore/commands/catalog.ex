@@ -430,6 +430,33 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Lists workflow records by type and optional state."
     },
     %{
+      name: "flow.by_parent",
+      arity: -2,
+      flags: ["readonly"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Lists workflow records by parent flow id."
+    },
+    %{
+      name: "flow.by_root",
+      arity: -2,
+      flags: ["readonly"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Lists workflow records by root flow id."
+    },
+    %{
+      name: "flow.by_correlation",
+      arity: -2,
+      flags: ["readonly"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Lists workflow records by correlation id."
+    },
+    %{
       name: "flow.info",
       arity: -2,
       flags: ["readonly", "fast"],

@@ -569,6 +569,76 @@ defmodule FerricStore do
 
   def flow_list(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc "Lists Flow records by parent flow id."
+  @spec flow_by_parent(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_by_parent(parent_flow_id, opts \\ [])
+
+  def flow_by_parent(parent_flow_id, opts) when is_binary(parent_flow_id) and is_list(opts) do
+    with :ok <- flow_validate_opts(opts),
+         :ok <- flow_validate_id(parent_flow_id),
+         {:ok, partition_key} <- flow_partition_key(opts),
+         {:ok, count} <- flow_history_count(opts),
+         index_key = Ferricstore.Flow.Keys.parent_index_key(parent_flow_id, partition_key),
+         :ok <- flow_validate_key_size(index_key) do
+      flow_records_for_index(index_key, partition_key, count)
+    end
+  end
+
+  def flow_by_parent(parent_flow_id, _opts) when not is_binary(parent_flow_id),
+    do: {:error, "ERR flow parent_flow_id must be a non-empty string"}
+
+  def flow_by_parent(_parent_flow_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Lists Flow records by root flow id, including the root record when present."
+  @spec flow_by_root(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_by_root(root_flow_id, opts \\ [])
+
+  def flow_by_root(root_flow_id, opts) when is_binary(root_flow_id) and is_list(opts) do
+    with :ok <- flow_validate_opts(opts),
+         :ok <- flow_validate_id(root_flow_id),
+         {:ok, partition_key} <- flow_partition_key(opts),
+         {:ok, count} <- flow_history_count(opts),
+         index_key = Ferricstore.Flow.Keys.root_index_key(root_flow_id, partition_key),
+         :ok <- flow_validate_key_size(index_key),
+         {:ok, indexed_records} <- flow_records_for_index(index_key, partition_key, count),
+         {:ok, root_record} <- flow_root_record(root_flow_id, partition_key) do
+      records =
+        [root_record | indexed_records]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq_by(&Map.get(&1, :id))
+        |> Enum.take(count)
+
+      {:ok, records}
+    end
+  end
+
+  def flow_by_root(root_flow_id, _opts) when not is_binary(root_flow_id),
+    do: {:error, "ERR flow root_flow_id must be a non-empty string"}
+
+  def flow_by_root(_root_flow_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Lists Flow records by correlation id."
+  @spec flow_by_correlation(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_by_correlation(correlation_id, opts \\ [])
+
+  def flow_by_correlation(correlation_id, opts)
+      when is_binary(correlation_id) and is_list(opts) do
+    with :ok <- flow_validate_opts(opts),
+         :ok <- flow_validate_id(correlation_id),
+         {:ok, partition_key} <- flow_partition_key(opts),
+         {:ok, count} <- flow_history_count(opts),
+         index_key = Ferricstore.Flow.Keys.correlation_index_key(correlation_id, partition_key),
+         :ok <- flow_validate_key_size(index_key) do
+      flow_records_for_index(index_key, partition_key, count)
+    end
+  end
+
+  def flow_by_correlation(correlation_id, _opts) when not is_binary(correlation_id),
+    do: {:error, "ERR flow correlation_id must be a non-empty string"}
+
+  def flow_by_correlation(_correlation_id, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Returns Flow index counters for `type`."
   @spec flow_info(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_info(type, opts \\ [])
@@ -713,6 +783,21 @@ defmodule FerricStore do
     |> case do
       {:ok, records} -> {:ok, Enum.reverse(records)}
       {:error, _} = error -> error
+    end
+  end
+
+  defp flow_records_for_index(index_key, partition_key, count) do
+    with {:ok, ids} <- zrange(index_key, 0, count - 1) do
+      flow_records_for_ids(ids, partition_key)
+    end
+  end
+
+  defp flow_root_record(root_flow_id, partition_key) do
+    case flow_get(root_flow_id, partition_key: partition_key) do
+      {:ok, %{root_flow_id: ^root_flow_id} = record} -> {:ok, record}
+      {:ok, nil} -> {:ok, nil}
+      {:ok, _record} -> {:ok, nil}
+      {:error, _reason} = error -> error
     end
   end
 

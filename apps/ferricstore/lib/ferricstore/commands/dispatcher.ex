@@ -485,7 +485,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
-      when tag in ~w(flow_create flow_get flow_claim_due flow_cancel flow_rewind flow_list flow_info flow_stuck flow_history)a,
+      when tag in ~w(flow_create flow_get flow_claim_due flow_cancel flow_rewind flow_list flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)

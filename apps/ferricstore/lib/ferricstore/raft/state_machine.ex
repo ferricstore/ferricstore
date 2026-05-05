@@ -5835,9 +5835,20 @@ defmodule Ferricstore.Raft.StateMachine do
     state_index_key = FlowKeys.state_index_key(type, flow_state, partition_key)
     maybe_queue_terminal_lmdb_index_delete(state, record)
 
-    with :ok <- flow_zset_delete(state, state_index_key, id) do
+    with :ok <- flow_zset_delete(state, state_index_key, id),
+         :ok <- flow_metadata_index_delete(state, record) do
       flow_running_index_delete(state, record)
     end
+  end
+
+  defp flow_metadata_index_delete(state, record) do
+    record
+    |> flow_metadata_index_entries("0.0")
+    |> Enum.each(fn {key, id, _score} ->
+      flow_zset_delete(state, key, id)
+    end)
+
+    :ok
   end
 
   defp flow_running_index_delete(state, %{state: "running", id: id, type: type} = record) do

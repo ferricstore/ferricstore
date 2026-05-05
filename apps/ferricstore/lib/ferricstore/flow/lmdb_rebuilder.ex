@@ -220,6 +220,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
     maybe_rebuild_due_index(zset_score_index, zset_score_lookup, record)
     maybe_rebuild_running_indexes(zset_score_index, zset_score_lookup, record)
+    maybe_rebuild_metadata_indexes(zset_score_index, zset_score_lookup, record, updated_score)
   end
 
   defp maybe_rebuild_due_index(
@@ -259,6 +260,40 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp maybe_rebuild_running_indexes(_zset_score_index, _zset_score_lookup, _record), do: :ok
+
+  defp maybe_rebuild_metadata_indexes(zset_score_index, zset_score_lookup, record, score) do
+    partition_key = Map.get(record, :partition_key)
+
+    metadata_index_entries(record)
+    |> Enum.each(fn {kind, value} ->
+      key =
+        case kind do
+          :parent -> Flow.Keys.parent_index_key(value, partition_key)
+          :root -> Flow.Keys.root_index_key(value, partition_key)
+          :correlation -> Flow.Keys.correlation_index_key(value, partition_key)
+        end
+
+      ZSetIndex.put_member(zset_score_index, zset_score_lookup, key, record.id, score)
+    end)
+  end
+
+  defp metadata_index_entries(record) do
+    [
+      {:parent, Map.get(record, :parent_flow_id)},
+      {:root, non_default_root_flow_id(record)},
+      {:correlation, Map.get(record, :correlation_id)}
+    ]
+    |> Enum.filter(fn {_kind, value} -> is_binary(value) and value != "" end)
+  end
+
+  defp non_default_root_flow_id(record) do
+    id = Map.get(record, :id)
+
+    case Map.get(record, :root_flow_id) do
+      root_flow_id when root_flow_id in [nil, "", id] -> nil
+      root_flow_id -> root_flow_id
+    end
+  end
 
   defp score_string(value) when is_integer(value), do: Float.to_string(value * 1.0)
   defp score_string(value) when is_float(value), do: Float.to_string(value)

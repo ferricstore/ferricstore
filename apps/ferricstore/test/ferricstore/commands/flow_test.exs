@@ -55,6 +55,72 @@ defmodule Ferricstore.Commands.FlowTest do
              Dispatcher.dispatch("FLOW.HISTORY", [id, "COUNT", "10"], MockStore.make())
   end
 
+  test "dispatches Flow lineage query commands through Rust AST" do
+    partition = uid("tenant")
+    root = uid("flow-command-root")
+    child = uid("flow-command-child")
+    correlation = uid("order")
+
+    assert %{"id" => ^root} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [
+                 root,
+                 "TYPE",
+                 "lineage",
+                 "PARTITION",
+                 partition,
+                 "CORRELATION_ID",
+                 correlation,
+                 "NOW",
+                 "1000"
+               ],
+               MockStore.make()
+             )
+
+    assert %{"id" => ^child} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [
+                 child,
+                 "TYPE",
+                 "lineage",
+                 "PARTITION",
+                 partition,
+                 "PARENT_FLOW_ID",
+                 root,
+                 "ROOT_FLOW_ID",
+                 root,
+                 "CORRELATION_ID",
+                 correlation,
+                 "NOW",
+                 "2000"
+               ],
+               MockStore.make()
+             )
+
+    assert [%{"id" => ^child}] =
+             Dispatcher.dispatch(
+               "FLOW.BY_PARENT",
+               [root, "PARTITION", partition, "COUNT", "10"],
+               MockStore.make()
+             )
+
+    assert [%{"id" => ^root}, %{"id" => ^child}] =
+             Dispatcher.dispatch(
+               "FLOW.BY_ROOT",
+               [root, "PARTITION", partition, "COUNT", "10"],
+               MockStore.make()
+             )
+
+    assert [%{"id" => ^root}, %{"id" => ^child}] =
+             Dispatcher.dispatch(
+               "FLOW.BY_CORRELATION",
+               [correlation, "PARTITION", partition, "COUNT", "10"],
+               MockStore.make()
+             )
+  end
+
   test "dispatches Flow create_many through Rust AST" do
     partition = uid("tenant")
     type = uid("flow-command-bulk")
