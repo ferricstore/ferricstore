@@ -216,6 +216,12 @@ defmodule Ferricstore.Commands.HashTest do
       # After deleting all fields, the type metadata should be gone
       assert nil == store.compound_get.("hash", "T:hash")
     end
+
+    test "HDEL returns type cleanup errors after removing the last field" do
+      store = hash_cleanup_failure_store()
+
+      assert {:error, :disk_full} == Hash.handle("HDEL", ["hash", "f1"], store)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -1466,5 +1472,18 @@ defmodule Ferricstore.Commands.HashTest do
     else
       collect_hscan_fields(store, key, next_cursor, count, new_acc)
     end
+  end
+
+  defp hash_cleanup_failure_store do
+    type_key = CompoundKey.type_key("hash")
+    field_key = CompoundKey.hash_field("hash", "f1")
+
+    %{
+      compound_get: fn "hash", ^type_key -> "hash" end,
+      compound_batch_get: fn "hash", [^field_key] -> ["v1"] end,
+      compound_batch_delete: fn "hash", [^field_key] -> :ok end,
+      compound_count: fn "hash", _prefix -> 0 end,
+      compound_delete: fn "hash", ^type_key -> {:error, :disk_full} end
+    }
   end
 end

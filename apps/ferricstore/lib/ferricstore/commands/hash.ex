@@ -109,8 +109,9 @@ defmodule Ferricstore.Commands.Hash do
 
       case Ops.compound_batch_delete(store, key, deleted_keys) do
         :ok ->
-          maybe_cleanup_empty_hash(key, deleted, store)
-          deleted
+          with :ok <- maybe_cleanup_empty_hash(key, deleted, store) do
+            deleted
+          end
 
         {:error, _} = err ->
           err
@@ -573,8 +574,9 @@ defmodule Ferricstore.Commands.Hash do
 
         case Ops.compound_batch_delete(store, key, MapSet.to_list(deleted_keys)) do
           :ok ->
-            maybe_cleanup_empty_hash(key, deleted_count, store)
-            results
+            with :ok <- maybe_cleanup_empty_hash(key, deleted_count, store) do
+              results
+            end
 
           {:error, _} = err ->
             err
@@ -918,8 +920,9 @@ defmodule Ferricstore.Commands.Hash do
 
       case Ops.compound_batch_delete(store, key, deleted_keys) do
         :ok ->
-          maybe_cleanup_empty_hash(key, deleted, store)
-          deleted
+          with :ok <- maybe_cleanup_empty_hash(key, deleted, store) do
+            deleted
+          end
 
         {:error, _} = err ->
           err
@@ -1233,8 +1236,9 @@ defmodule Ferricstore.Commands.Hash do
 
       case Ops.compound_batch_delete(store, key, MapSet.to_list(deleted_keys)) do
         :ok ->
-          maybe_cleanup_empty_hash(key, deleted_count, store)
-          results
+          with :ok <- maybe_cleanup_empty_hash(key, deleted_count, store) do
+            results
+          end
 
         {:error, _} = err ->
           err
@@ -1255,6 +1259,8 @@ defmodule Ferricstore.Commands.Hash do
 
     if Ops.compound_count(store, key, prefix) == 0 do
       TypeRegistry.delete_type(key, store)
+    else
+      :ok
     end
   end
 
