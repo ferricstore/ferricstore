@@ -152,7 +152,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
           stream_get_results(keys, lookup_keys, results, state, send_response_fn)
         else
           send_response_fn.(state.socket, state.transport, Enum.map(results, &Encoder.encode/1))
-          {:continue, state}
+          {:continue, ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)}
         end
 
       {:error, err} ->
@@ -166,15 +166,21 @@ defmodule FerricstoreServer.Connection.Pipeline do
     end
   end
 
-  defp dispatch_batch_get_results(_keys, lookup_keys, state, send_response_fn) do
-    response =
-      case safe_dispatch(fn -> Router.batch_get(state.instance_ctx, lookup_keys) end) do
-        {:ok, values} -> Enum.map(values, &Encoder.encode/1)
-        {:error, err} -> List.duplicate(Encoder.encode(err), length(lookup_keys))
-      end
+  defp dispatch_batch_get_results(keys, lookup_keys, state, send_response_fn) do
+    case safe_dispatch(fn -> Router.batch_get(state.instance_ctx, lookup_keys) end) do
+      {:ok, values} ->
+        send_response_fn.(state.socket, state.transport, Enum.map(values, &Encoder.encode/1))
+        {:continue, ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)}
 
-    send_response_fn.(state.socket, state.transport, response)
-    {:continue, state}
+      {:error, err} ->
+        send_response_fn.(
+          state.socket,
+          state.transport,
+          List.duplicate(Encoder.encode(err), length(lookup_keys))
+        )
+
+        {:continue, state}
+    end
   end
 
   defp stream_get_results(keys, lookup_keys, results, state, send_response_fn) do
@@ -191,26 +197,28 @@ defmodule FerricstoreServer.Connection.Pipeline do
               {:cont, {:continue, new_state}}
 
             :fallback ->
+              value =
+                Router.get(
+                  acc_state.instance_ctx,
+                  namespace_key(acc_state.sandbox_namespace, key)
+                )
+
               send_response_fn.(
                 acc_state.socket,
                 acc_state.transport,
-                Encoder.encode(
-                  Router.get(
-                    acc_state.instance_ctx,
-                    namespace_key(acc_state.sandbox_namespace, key)
-                  )
-                )
+                Encoder.encode(value)
               )
 
-              {:cont, {:continue, acc_state}}
+              {:cont, {:continue, ConnTracking.maybe_track_read("GET", [key], value, acc_state)}}
 
             {:error_after_header, _reason} ->
               {:halt, {:quit, acc_state}}
           end
 
-        {{_key, _lookup_key}, value}, {:continue, acc_state} ->
+        {{key, _lookup_key}, value}, {:continue, acc_state} ->
           send_response_fn.(acc_state.socket, acc_state.transport, Encoder.encode(value))
-          {:cont, {:continue, acc_state}}
+
+          {:cont, {:continue, ConnTracking.maybe_track_read("GET", [key], value, acc_state)}}
       end)
 
     TcpOpts.set_cork(state.socket, false)
@@ -438,8 +446,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
                 {{{idx, key}, lookup_key}, {:file_ref, path, offset, size}} ->
                   {idx, {:file_ref, key, lookup_key, path, offset, size}}
 
-                {{{idx, _key}, _lookup_key}, value} ->
-                  {idx, Encoder.encode(value)}
+                {{{idx, key}, _lookup_key}, value} ->
+                  {idx, {:get_encoded, key, Encoder.encode(value), value}}
               end)
 
             {:error, err} ->
@@ -450,15 +458,31 @@ defmodule FerricstoreServer.Connection.Pipeline do
     if map_has_file_ref?(get_results) do
       stream_indexed_results(count, get_results, set_results, state, send_response_fn)
     else
-      response = for i <- 0..(count - 1), do: Map.get(get_results, i) || Map.get(set_results, i)
+      response =
+        for i <- 0..(count - 1),
+            do: response_iodata(Map.get(get_results, i) || Map.get(set_results, i))
+
       send_response_fn.(state.socket, state.transport, response)
-      {:continue, state}
+      {:continue, track_mixed_get_results(get_results, state)}
     end
   end
 
   defp map_has_file_ref?(results) do
     Enum.any?(results, fn {_idx, result} ->
       match?({:file_ref, _key, _lookup_key, _path, _offset, _size}, result)
+    end)
+  end
+
+  defp response_iodata({:get_encoded, _key, encoded, _value}), do: encoded
+  defp response_iodata(encoded), do: encoded
+
+  defp track_mixed_get_results(results, state) do
+    Enum.reduce(results, state, fn
+      {_idx, {:get_encoded, key, _encoded, value}}, acc_state ->
+        ConnTracking.maybe_track_read("GET", [key], value, acc_state)
+
+      _other, acc_state ->
+        acc_state
     end)
   end
 
@@ -480,11 +504,17 @@ defmodule FerricstoreServer.Connection.Pipeline do
                   Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
                 )
 
-                {:cont, {:continue, acc_state}}
+                {:cont,
+                 {:continue, ConnTracking.maybe_track_read("GET", [key], :fallback_ok, acc_state)}}
 
               {:error_after_header, _reason} ->
                 {:halt, {:quit, acc_state}}
             end
+
+          {:get_encoded, key, encoded, value} ->
+            send_response_fn.(acc_state.socket, acc_state.transport, encoded)
+
+            {:cont, {:continue, ConnTracking.maybe_track_read("GET", [key], value, acc_state)}}
 
           encoded ->
             send_response_fn.(acc_state.socket, acc_state.transport, encoded)

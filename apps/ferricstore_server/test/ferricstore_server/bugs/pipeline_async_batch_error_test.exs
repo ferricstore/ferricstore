@@ -4,18 +4,24 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
+  alias FerricstoreServer.ClientTracking
   alias FerricstoreServer.Connection
   alias FerricstoreServer.Connection.Pipeline
 
   @ns "pipeline_quorum_fast_path"
 
   setup do
+    ClientTracking.init_tables()
+    :ets.delete_all_objects(:ferricstore_tracking)
+    :ets.delete_all_objects(:ferricstore_tracking_connections)
+
     ShardHelpers.flush_all_keys()
     NamespaceConfig.reset_all()
 
     on_exit(fn ->
       NamespaceConfig.reset_all()
       ShardHelpers.flush_all_keys()
+      ClientTracking.cleanup(self())
     end)
 
     :ok
@@ -113,6 +119,57 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     assert Router.get(ctx, sandbox <> set_key) == "written"
   end
 
+  test "GET pipeline fast path records client tracking reads" do
+    ctx = FerricStore.Instance.get(:default)
+    key1 = "#{@ns}:tracked_get_1:#{System.unique_integer([:positive])}"
+    key2 = "#{@ns}:tracked_get_2:#{System.unique_integer([:positive])}"
+
+    :ok = Router.put(ctx, key1, "v1", 0)
+    :ok = Router.put(ctx, key2, "v2", 0)
+
+    state = enabled_tracking_state(ctx)
+    send_response_fn = capture_response_fn()
+    handle_command_fn = flunking_handle_fn("tracked GET pipeline fast path")
+
+    commands = [
+      get_ast(key1),
+      get_ast(key2)
+    ]
+
+    assert {:continue, new_state} =
+             Pipeline.pipeline_dispatch(commands, state, handle_command_fn, send_response_fn)
+
+    assert_receive {:pipeline_response, "$2\r\nv1\r\n$2\r\nv2\r\n"}
+    assert new_state.tracking.enabled
+    assert :ets.lookup(:ferricstore_tracking, key1) == [{key1, self()}]
+    assert :ets.lookup(:ferricstore_tracking, key2) == [{key2, self()}]
+  end
+
+  test "mixed GET and SET fast path records only GET reads for client tracking" do
+    ctx = FerricStore.Instance.get(:default)
+    get_key = "#{@ns}:tracked_mixed_get:#{System.unique_integer([:positive])}"
+    set_key = "#{@ns}:tracked_mixed_set:#{System.unique_integer([:positive])}"
+
+    :ok = Router.put(ctx, get_key, "v1", 0)
+
+    state = enabled_tracking_state(ctx)
+    send_response_fn = capture_response_fn()
+    handle_command_fn = flunking_handle_fn("tracked mixed GET/SET pipeline fast path")
+
+    commands = [
+      get_ast(get_key),
+      set_ast(set_key, "written")
+    ]
+
+    assert {:continue, new_state} =
+             Pipeline.pipeline_dispatch(commands, state, handle_command_fn, send_response_fn)
+
+    assert_receive {:pipeline_response, "$2\r\nv1\r\n+OK\r\n"}
+    assert new_state.tracking.enabled
+    assert :ets.lookup(:ferricstore_tracking, get_key) == [{get_key, self()}]
+    assert :ets.lookup(:ferricstore_tracking, set_key) == []
+  end
+
   test "general pure pipeline converts command raises into Redis error replies" do
     ctx = FerricStore.Instance.get(:default)
     raw_store_key = {:ferricstore_raw_store, ctx.name}
@@ -159,6 +216,11 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
       require_auth: false,
       acl_cache: :full_access
     }
+  end
+
+  defp enabled_tracking_state(ctx) do
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+    connection_state(ctx) |> Map.put(:tracking, tracking)
   end
 
   defp capture_response_fn do
