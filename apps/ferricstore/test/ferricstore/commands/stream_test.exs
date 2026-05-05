@@ -628,6 +628,22 @@ defmodule Ferricstore.Commands.StreamTest do
       assert Enum.map(entries, &hd/1) == ["3-0", "4-0", "5-0"]
     end
 
+    test "XTRIM MAXLEN returns delete errors before updating metadata" do
+      base = MockStore.make()
+      key = ustream()
+
+      for i <- 1..5, do: Stream.handle("XADD", [key, "#{i}-0", "f", "#{i}"], base)
+
+      store =
+        Map.put(base, :compound_delete, fn ^key, "X:" <> _rest -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = Stream.handle("XTRIM", [key, "MAXLEN", "3"], store)
+      assert 5 == Stream.handle("XLEN", [key], base)
+
+      entries = Stream.handle("XRANGE", [key, "-", "+"], base)
+      assert Enum.map(entries, &hd/1) == ["1-0", "2-0", "3-0", "4-0", "5-0"]
+    end
+
     test "XTRIM MAXLEN 0 removes all entries" do
       store = MockStore.make()
       key = ustream()
@@ -660,6 +676,22 @@ defmodule Ferricstore.Commands.StreamTest do
 
       entries = Stream.handle("XRANGE", [key, "-", "+"], store)
       assert Enum.map(entries, &hd/1) == ["3-0", "4-0", "5-0"]
+    end
+
+    test "XTRIM MINID returns delete errors before updating metadata" do
+      base = MockStore.make()
+      key = ustream()
+
+      for i <- 1..5, do: Stream.handle("XADD", [key, "#{i}-0", "f", "#{i}"], base)
+
+      store =
+        Map.put(base, :compound_delete, fn ^key, "X:" <> _rest -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = Stream.handle("XTRIM", [key, "MINID", "3-0"], store)
+      assert 5 == Stream.handle("XLEN", [key], base)
+
+      entries = Stream.handle("XRANGE", [key, "-", "+"], base)
+      assert Enum.map(entries, &hd/1) == ["1-0", "2-0", "3-0", "4-0", "5-0"]
     end
 
     test "XTRIM on nonexistent stream returns 0" do

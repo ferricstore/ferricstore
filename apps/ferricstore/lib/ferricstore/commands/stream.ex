@@ -698,8 +698,6 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   defp apply_trim_maxlen_scanned(key, max_len, store) do
-    prefix = "X:#{key}" <> @sep
-
     all_ids =
       store
       |> stream_ids_for(key)
@@ -710,17 +708,22 @@ defmodule Ferricstore.Commands.Stream do
     if current_len > max_len do
       to_remove = Enum.take(all_ids, current_len - max_len)
 
-      Enum.each(to_remove, fn id_str ->
-        delete_stream_entry(store, key, prefix <> id_str)
-      end)
+      case delete_stream_ids(key, to_remove, store) do
+        {:ok, deleted_count} ->
+          # Update metadata.
+          remaining = Enum.drop(all_ids, deleted_count)
+          update_meta_after_trim(key, remaining)
 
-      deleted_count = length(to_remove)
+          deleted_count
 
-      # Update metadata.
-      remaining = Enum.drop(all_ids, deleted_count)
-      update_meta_after_trim(key, remaining)
+        {:error, reason, deleted_count} ->
+          if deleted_count > 0 do
+            remaining = Enum.drop(all_ids, deleted_count)
+            update_meta_after_trim(key, remaining)
+          end
 
-      deleted_count
+          {:error, reason}
+      end
     else
       0
     end
@@ -734,7 +737,7 @@ defmodule Ferricstore.Commands.Stream do
     end
   end
 
-  defp do_apply_trim_minid_scanned(key, prefix, min_id, store) do
+  defp do_apply_trim_minid_scanned(key, _prefix, min_id, store) do
     all_ids =
       store
       |> stream_ids_for(key)
@@ -745,18 +748,24 @@ defmodule Ferricstore.Commands.Stream do
         id_cmp(parse_id!(id_str), min_id) == :lt
       end)
 
-    Enum.each(to_remove, fn id_str ->
-      delete_stream_entry(store, key, prefix <> id_str)
-    end)
+    case delete_stream_ids(key, to_remove, store) do
+      {:ok, deleted_count} ->
+        if deleted_count > 0 do
+          remaining = all_ids -- to_remove
+          update_meta_after_trim(key, remaining)
+        end
 
-    deleted_count = length(to_remove)
+        deleted_count
 
-    if deleted_count > 0 do
-      remaining = all_ids -- to_remove
-      update_meta_after_trim(key, remaining)
+      {:error, reason, deleted_count} ->
+        if deleted_count > 0 do
+          deleted_ids = Enum.take(to_remove, deleted_count)
+          remaining = all_ids -- deleted_ids
+          update_meta_after_trim(key, remaining)
+        end
+
+        {:error, reason}
     end
-
-    deleted_count
   end
 
   defp apply_trim_maxlen_indexed(key, max_len, store) do
@@ -766,14 +775,20 @@ defmodule Ferricstore.Commands.Stream do
       [{^key, len, _first, last, ms, seq}] when len > max_len ->
         delete_count = len - max_len
 
-        key
-        |> stream_index_ids(delete_count)
-        |> Enum.each(fn id_str ->
-          delete_stream_entry(store, key, stream_entry_key(key, id_str))
-        end)
+        ids_to_remove = stream_index_ids(key, delete_count)
 
-        update_meta_after_index_mutation(key, max_len, last, ms, seq, store)
-        delete_count
+        case delete_stream_ids(key, ids_to_remove, store) do
+          {:ok, ^delete_count} ->
+            update_meta_after_index_mutation(key, max_len, last, ms, seq, store)
+            delete_count
+
+          {:error, reason, deleted_count} ->
+            if deleted_count > 0 do
+              update_meta_after_index_mutation(key, len - deleted_count, last, ms, seq, store)
+            end
+
+            {:error, reason}
+        end
 
       _ ->
         0
@@ -790,21 +805,34 @@ defmodule Ferricstore.Commands.Stream do
           |> stream_index_slice(:min, exclusive_upper_bound(min_id), :infinity, false)
           |> Enum.map(fn {id_str, _compound_key} -> id_str end)
 
-        Enum.each(to_remove, fn id_str ->
-          delete_stream_entry(store, key, stream_entry_key(key, id_str))
-        end)
+        case delete_stream_ids(key, to_remove, store) do
+          {:ok, deleted_count} ->
+            if deleted_count > 0 do
+              update_meta_after_index_mutation(key, len - deleted_count, last, ms, seq, store)
+            end
 
-        deleted_count = length(to_remove)
+            deleted_count
 
-        if deleted_count > 0 do
-          update_meta_after_index_mutation(key, len - deleted_count, last, ms, seq, store)
+          {:error, reason, deleted_count} ->
+            if deleted_count > 0 do
+              update_meta_after_index_mutation(key, len - deleted_count, last, ms, seq, store)
+            end
+
+            {:error, reason}
         end
-
-        deleted_count
 
       [] ->
         0
     end
+  end
+
+  defp delete_stream_ids(key, ids, store) do
+    Enum.reduce_while(ids, {:ok, 0}, fn id_str, {:ok, deleted_count} ->
+      case delete_stream_entry(store, key, stream_entry_key(key, id_str)) do
+        :ok -> {:cont, {:ok, deleted_count + 1}}
+        {:error, reason} -> {:halt, {:error, reason, deleted_count}}
+      end
+    end)
   end
 
   defp update_meta_after_trim(key, []) do
