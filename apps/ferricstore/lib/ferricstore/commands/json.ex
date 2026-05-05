@@ -347,8 +347,7 @@ defmodule Ferricstore.Commands.Json do
         err
 
       {:ok, root} ->
-        write_json(key, clear_value(root), store)
-        1
+        write_json_result(key, clear_value(root), store, 1)
     end
   end
 
@@ -417,8 +416,10 @@ defmodule Ferricstore.Commands.Json do
         err
 
       {:ok, _root} ->
-        Ops.delete(store, key)
-        1
+        case Ops.delete(store, key) do
+          :ok -> 1
+          {:error, _} = err -> err
+        end
     end
   end
 
@@ -434,8 +435,7 @@ defmodule Ferricstore.Commands.Json do
   defp do_delete_path(root, key, path, store) do
     case delete_at_path(root, parse_path(path)) do
       {:ok, new_root} ->
-        write_json(key, new_root, store)
-        1
+        write_json_result(key, new_root, store, 1)
 
       :not_found ->
         0
@@ -453,8 +453,7 @@ defmodule Ferricstore.Commands.Json do
       {:ok, current} when is_number(current) ->
         new_val = current + incr
         {:ok, new_root} = set_at_path(root, segments, new_val)
-        write_json(key, new_root, store)
-        Jason.encode!(new_val)
+        write_json_result(key, new_root, store, Jason.encode!(new_val))
 
       {:ok, _} ->
         {:error, "ERR value at path is not a number"}
@@ -475,8 +474,7 @@ defmodule Ferricstore.Commands.Json do
       {:ok, arr} when is_list(arr) ->
         new_arr = arr ++ new_values
         {:ok, new_root} = set_at_path(root, segments, new_arr)
-        write_json(key, new_root, store)
-        length(new_arr)
+        write_json_result(key, new_root, store, length(new_arr))
 
       {:ok, _} ->
         {:error, "ERR value at path is not an array"}
@@ -497,8 +495,7 @@ defmodule Ferricstore.Commands.Json do
       {:ok, val} when is_boolean(val) ->
         new_val = not val
         {:ok, new_root} = set_at_path(root, segments, new_val)
-        write_json(key, new_root, store)
-        Jason.encode!(new_val)
+        write_json_result(key, new_root, store, Jason.encode!(new_val))
 
       {:ok, _} ->
         {:error, "ERR value at path is not a boolean"}
@@ -526,8 +523,7 @@ defmodule Ferricstore.Commands.Json do
     case get_at_path(root, segments) do
       {:ok, val} ->
         {:ok, new_root} = set_at_path(root, segments, clear_value(val))
-        write_json(key, new_root, store)
-        1
+        write_json_result(key, new_root, store, 1)
 
       :not_found ->
         0
@@ -754,11 +750,18 @@ defmodule Ferricstore.Commands.Json do
   end
 
   # Writes a JSON value to the store, wrapping it with the type tag.
-  @spec write_json(binary(), term(), map()) :: :ok
+  @spec write_json(binary(), term(), map()) :: :ok | {:error, term()}
   defp write_json(key, value, store) do
     json_str = Jason.encode!(value)
     raw = :erlang.term_to_binary({:json, json_str})
     Ops.put(store, key, raw, 0)
+  end
+
+  defp write_json_result(key, value, store, success) do
+    case write_json(key, value, store) do
+      :ok -> success
+      {:error, _} = err -> err
+    end
   end
 
   # Decodes a stored binary. JSON values are stored as `:erlang.term_to_binary({:json, str})`.

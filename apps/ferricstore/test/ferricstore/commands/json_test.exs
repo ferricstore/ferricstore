@@ -185,6 +185,15 @@ defmodule Ferricstore.Commands.JsonTest do
       result = Jason.decode!(Json.handle("JSON.GET", ["doc"], store))
       assert result["a"]["b"] == "deep"
     end
+
+    test "returns write error when root write fails" do
+      store =
+        MockStore.make()
+        |> Map.put(:put, fn "doc", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} =
+               Json.handle("JSON.SET", ["doc", "$", ~s({"name":"Alice"})], store)
+    end
   end
 
   # ===========================================================================
@@ -343,6 +352,24 @@ defmodule Ferricstore.Commands.JsonTest do
       assert msg =~ "WRONGTYPE"
       assert "value" == Hash.handle("HGET", ["doc", "field"], store)
     end
+
+    test "returns delete error when root delete fails" do
+      store =
+        store_with_json(%{"a" => 1})
+        |> Map.put(:delete, fn "doc" -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = Json.handle("JSON.DEL", ["doc"], store)
+      assert ~s({"a":1}) == Json.handle("JSON.GET", ["doc"], store)
+    end
+
+    test "returns write error when nested delete rewrite fails" do
+      store =
+        store_with_json(%{"a" => 1, "b" => 2})
+        |> Map.put(:put, fn "doc", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = Json.handle("JSON.DEL", ["doc", "$.b"], store)
+      assert ~s({"a":1,"b":2}) == Json.handle("JSON.GET", ["doc"], store)
+    end
   end
 
   # ===========================================================================
@@ -407,6 +434,17 @@ defmodule Ferricstore.Commands.JsonTest do
     test "wrong number of arguments returns error" do
       assert {:error, _} = Json.handle("JSON.NUMINCRBY", [], MockStore.make())
       assert {:error, _} = Json.handle("JSON.NUMINCRBY", ["key"], MockStore.make())
+    end
+
+    test "returns write error when increment rewrite fails" do
+      store =
+        store_with_json(%{"count" => 10})
+        |> Map.put(:put, fn "doc", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} =
+               Json.handle("JSON.NUMINCRBY", ["doc", "$.count", "5"], store)
+
+      assert "10" == Json.handle("JSON.GET", ["doc", "$.count"], store)
     end
   end
 
@@ -689,6 +727,17 @@ defmodule Ferricstore.Commands.JsonTest do
       assert {:error, _} = Json.handle("JSON.ARRAPPEND", ["key"], MockStore.make())
       assert {:error, _} = Json.handle("JSON.ARRAPPEND", ["key", "$.arr"], MockStore.make())
     end
+
+    test "returns write error when append rewrite fails" do
+      store =
+        store_with_json(%{"arr" => [1, 2]})
+        |> Map.put(:put, fn "doc", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} =
+               Json.handle("JSON.ARRAPPEND", ["doc", "$.arr", "3"], store)
+
+      assert [1, 2] == Jason.decode!(Json.handle("JSON.GET", ["doc", "$.arr"], store))
+    end
   end
 
   # ===========================================================================
@@ -779,6 +828,15 @@ defmodule Ferricstore.Commands.JsonTest do
       assert {:error, _} = Json.handle("JSON.TOGGLE", [], MockStore.make())
       assert {:error, _} = Json.handle("JSON.TOGGLE", ["key"], MockStore.make())
     end
+
+    test "returns write error when toggle rewrite fails" do
+      store =
+        store_with_json(%{"active" => true})
+        |> Map.put(:put, fn "doc", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = Json.handle("JSON.TOGGLE", ["doc", "$.active"], store)
+      assert "true" == Json.handle("JSON.GET", ["doc", "$.active"], store)
+    end
   end
 
   # ===========================================================================
@@ -843,6 +901,24 @@ defmodule Ferricstore.Commands.JsonTest do
 
     test "wrong number of arguments returns error" do
       assert {:error, _} = Json.handle("JSON.CLEAR", [], MockStore.make())
+    end
+
+    test "returns write error when root clear rewrite fails" do
+      store =
+        store_with_json(%{"a" => 1})
+        |> Map.put(:put, fn "doc", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = Json.handle("JSON.CLEAR", ["doc"], store)
+      assert ~s({"a":1}) == Json.handle("JSON.GET", ["doc"], store)
+    end
+
+    test "returns write error when nested clear rewrite fails" do
+      store =
+        store_with_json(%{"nested" => %{"a" => 1}})
+        |> Map.put(:put, fn "doc", _raw, 0 -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} = Json.handle("JSON.CLEAR", ["doc", "$.nested"], store)
+      assert %{"a" => 1} == Jason.decode!(Json.handle("JSON.GET", ["doc", "$.nested"], store))
     end
   end
 
