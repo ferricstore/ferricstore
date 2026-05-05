@@ -251,25 +251,31 @@ defmodule Ferricstore.Commands.Expiry do
   end
 
   defp apply_expiry(key, expire_at_ms, flag, store) do
+    case ttl_expire_at_ms(key, store) do
+      nil ->
+        0
+
+      old_exp ->
+        if flag_allows?(flag, old_exp, expire_at_ms) do
+          apply_expiry_after_flag_check(key, expire_at_ms, store)
+        else
+          0
+        end
+    end
+  end
+
+  defp apply_expiry_after_flag_check(key, expire_at_ms, store) do
     case key_meta(key, store) do
       nil ->
         0
 
-      {:plain, value, old_exp} ->
-        if flag_allows?(flag, old_exp, expire_at_ms) do
-          Ops.put(store, key, value, expire_at_ms)
-          1
-        else
-          0
-        end
+      {:plain, value, _old_exp} ->
+        Ops.put(store, key, value, expire_at_ms)
+        1
 
-      {:compound, type, old_exp} ->
-        if flag_allows?(flag, old_exp, expire_at_ms) do
-          expire_compound_key(key, type, expire_at_ms, store)
-          1
-        else
-          0
-        end
+      {:compound, type, _old_exp} ->
+        expire_compound_key(key, type, expire_at_ms, store)
+        1
     end
   end
 
@@ -320,6 +326,19 @@ defmodule Ferricstore.Commands.Expiry do
   # ---------------------------------------------------------------------------
 
   defp do_persist(key, store) do
+    case ttl_expire_at_ms(key, store) do
+      nil ->
+        0
+
+      0 ->
+        0
+
+      _exp ->
+        persist_after_ttl_check(key, store)
+    end
+  end
+
+  defp persist_after_ttl_check(key, store) do
     case key_meta(key, store) do
       nil ->
         0

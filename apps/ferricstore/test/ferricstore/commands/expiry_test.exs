@@ -37,6 +37,19 @@ defmodule Ferricstore.Commands.ExpiryTest do
       assert {:error, _} = Expiry.handle("EXPIRE", ["k", "abc"], store)
     end
 
+    test "EXPIRE NX rejected by existing TTL does not load a cold plain value" do
+      future = System.os_time(:millisecond) + 60_000
+      store = metadata_only_expiry_store("cold_plain", future)
+
+      assert 0 == Expiry.handle("EXPIRE", ["cold_plain", "10", "NX"], store)
+    end
+
+    test "EXPIRE XX rejected by persistent key does not load a cold plain value" do
+      store = metadata_only_expiry_store("cold_plain", 0)
+
+      assert 0 == Expiry.handle("EXPIRE", ["cold_plain", "10", "XX"], store)
+    end
+
     test "EXPIRE no args returns error" do
       assert {:error, _} = Expiry.handle("EXPIRE", [], MockStore.make())
     end
@@ -165,6 +178,12 @@ defmodule Ferricstore.Commands.ExpiryTest do
       assert 0 == Expiry.handle("PERSIST", ["k"], store)
     end
 
+    test "PERSIST persistent cold plain key does not load the value" do
+      store = metadata_only_expiry_store("cold_plain", 0)
+
+      assert 0 == Expiry.handle("PERSIST", ["cold_plain"], store)
+    end
+
     test "PERSIST missing key returns 0" do
       assert 0 == Expiry.handle("PERSIST", ["missing"], MockStore.make())
     end
@@ -238,6 +257,20 @@ defmodule Ferricstore.Commands.ExpiryTest do
       store = MockStore.make(%{"k" => {"v", 0}})
       assert 1 == Expiry.handle("EXPIRE", ["k", "10"], store)
       assert "v" == store.get.("k")
+    end
+
+    test "EXPIRE GT rejected by older TTL does not load a cold plain value" do
+      old_future = System.os_time(:millisecond) + 120_000
+      store = metadata_only_expiry_store("cold_plain", old_future)
+
+      assert 0 == Expiry.handle("EXPIRE", ["cold_plain", "10", "GT"], store)
+    end
+
+    test "EXPIRE LT rejected by newer TTL does not load a cold plain value" do
+      old_future = System.os_time(:millisecond) + 10_000
+      store = metadata_only_expiry_store("cold_plain", old_future)
+
+      assert 0 == Expiry.handle("EXPIRE", ["cold_plain", "120", "LT"], store)
     end
   end
 
@@ -341,4 +374,12 @@ defmodule Ferricstore.Commands.ExpiryTest do
   end
 
   defp metadata_delete_seen?(%{pid: pid}), do: Agent.get(pid, & &1)
+
+  defp metadata_only_expiry_store(key, expire_at_ms) do
+    %{
+      expire_at_ms: fn ^key -> expire_at_ms end,
+      get_meta: fn ^key -> flunk("no-op expiry command should not load the value") end,
+      compound_get_meta: fn _redis_key, _compound_key -> nil end
+    }
+  end
 end
