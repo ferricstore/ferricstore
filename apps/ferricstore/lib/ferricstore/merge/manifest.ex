@@ -110,7 +110,7 @@ defmodule Ferricstore.Merge.Manifest do
       case File.read(path) do
         {:ok, binary} ->
           try do
-            {:ok, :erlang.binary_to_term(binary)}
+            {:ok, :erlang.binary_to_term(binary, [:safe])}
           rescue
             ArgumentError -> {:error, :corrupt_manifest}
           end

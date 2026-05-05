@@ -58,7 +58,8 @@ defmodule Ferricstore.Commands.BloomTest do
   end
 
   defp make_temp_dir do
-    dir = Path.join(System.tmp_dir!(), "bloom_test_#{:rand.uniform(1_000_000)}")
+    suffix = "#{System.os_time(:nanosecond)}_#{System.unique_integer([:positive, :monotonic])}"
+    dir = Path.join(System.tmp_dir!(), "bloom_test_#{suffix}")
     File.mkdir_p!(dir)
     dir
   end
@@ -550,6 +551,7 @@ defmodule Ferricstore.Commands.BloomTest do
 
       # Check elements that were NOT added -- count false positives.
       test_count = 10_000
+
       false_positives =
         Enum.count(1..test_count, fn i ->
           Bloom.handle("BF.EXISTS", ["bf", "not_added_#{i}"], store) == 1

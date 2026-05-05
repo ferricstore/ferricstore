@@ -309,7 +309,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # the original command tuple before dispatch.
   @impl true
   def apply(meta, {:ttb, binary}, state) when is_binary(binary) do
-    __MODULE__.apply(meta, :erlang.binary_to_term(binary), state)
+    __MODULE__.apply(meta, :erlang.binary_to_term(binary, [:safe]), state)
   end
 
   @impl true
@@ -5573,7 +5573,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_decode_history_fields(value) when is_binary(value) do
     try do
-      :erlang.binary_to_term(value)
+      :erlang.binary_to_term(value, [:safe])
     rescue
       _ -> []
     end
@@ -9038,7 +9038,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
       value when is_binary(value) ->
         try do
-          case :erlang.binary_to_term(value) do
+          case :erlang.binary_to_term(value, [:safe]) do
             {:bloom_meta, %{path: path}} -> path
             {:cms_meta, _} -> prob_path(state, key, "cms")
             {:cuckoo_meta, _} -> prob_path(state, key, "cuckoo")

@@ -10,6 +10,8 @@ defmodule Ferricstore.Commands.SafeTermDecodeGuardTest do
     "lib/ferricstore/commands/stream.ex",
     "lib/ferricstore/commands/strings.ex",
     "lib/ferricstore/commands/tdigest.ex",
+    "lib/ferricstore/merge/manifest.ex",
+    "lib/ferricstore/raft/state_machine.ex",
     "lib/ferricstore/store/list_ops.ex"
   ]
 
