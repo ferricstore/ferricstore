@@ -171,8 +171,7 @@ defmodule Ferricstore.MemoryGuard do
   """
   @spec reject_writes?() :: boolean()
   def reject_writes? do
-    ref = FerricStore.Instance.get(:default).pressure_flags
-    :atomics.get(ref, 2) == 1
+    pressure_flag?(2)
   end
 
   @doc """
@@ -187,8 +186,7 @@ defmodule Ferricstore.MemoryGuard do
   """
   @spec keydir_full?() :: boolean()
   def keydir_full? do
-    ref = FerricStore.Instance.get(:default).pressure_flags
-    :atomics.get(ref, 1) == 1
+    pressure_flag?(1)
   end
 
   @doc """
@@ -220,8 +218,7 @@ defmodule Ferricstore.MemoryGuard do
   """
   @spec skip_promotion?() :: boolean()
   def skip_promotion? do
-    ref = FerricStore.Instance.get(:default).pressure_flags
-    :atomics.get(ref, 3) == 1
+    pressure_flag?(3)
   end
 
   @doc """
@@ -818,6 +815,13 @@ defmodule Ferricstore.MemoryGuard do
       :erlang.memory(:total)
     rescue _ -> nil
     catch _, _ -> nil
+    end
+  end
+
+  defp pressure_flag?(slot) do
+    case :persistent_term.get({FerricStore.Instance, :default}, nil) do
+      %{pressure_flags: ref} -> :atomics.get(ref, slot) == 1
+      _missing_or_stale -> false
     end
   end
 

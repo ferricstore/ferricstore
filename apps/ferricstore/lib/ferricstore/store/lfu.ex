@@ -65,7 +65,7 @@ defmodule Ferricstore.Store.LFU do
   @spec initial() :: non_neg_integer()
   def initial do
     current_min = now_minutes()
-    ref = :persistent_term.get(:ferricstore_lfu_initial_ref)
+    ref = initial_ref()
 
     case :atomics.get(ref, 1) do
       ^current_min ->
@@ -100,6 +100,18 @@ defmodule Ferricstore.Store.LFU do
   @doc "Returns the initial counter value (5)."
   @spec initial_counter() :: non_neg_integer()
   def initial_counter, do: @initial_counter
+
+  defp initial_ref do
+    case :persistent_term.get(:ferricstore_lfu_initial_ref, nil) do
+      nil ->
+        ref = :atomics.new(2, signed: false)
+        :persistent_term.put(:ferricstore_lfu_initial_ref, ref)
+        ref
+
+      ref ->
+        ref
+    end
+  end
 
   @doc "Packs ldt (16-bit minutes) and counter (8-bit) into a single integer."
   @spec pack(non_neg_integer(), non_neg_integer()) :: non_neg_integer()
