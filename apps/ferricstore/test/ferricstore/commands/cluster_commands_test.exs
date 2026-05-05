@@ -173,6 +173,17 @@ defmodule Ferricstore.Commands.ClusterCommandsTest do
       end)
     end
 
+    test "reported slot owners match the instance routing table", %{store: store} do
+      result = Cluster.handle("CLUSTER.SLOTS", [], store)
+      ctx = FerricStore.Instance.get(:default)
+
+      for [start_slot, end_slot, shard_index] <- result,
+          slot <- start_slot..end_slot do
+        assert elem(ctx.slot_map, slot) == shard_index,
+               "slot #{slot} reports shard #{shard_index}, but Router routes it to shard #{elem(ctx.slot_map, slot)}"
+      end
+    end
+
     test "with extra args returns error", %{store: store} do
       result = Cluster.handle("CLUSTER.SLOTS", ["extra"], store)
       assert {:error, msg} = result

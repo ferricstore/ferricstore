@@ -114,7 +114,8 @@ defmodule FerricStore.Instance do
     data_dir = Keyword.get(opts, :data_dir, "data")
     data_dir_expanded = Path.expand(data_dir)
 
-    # Slot map: 1024 slots → shard indices
+    # Slot map: 1024 slots -> shard indices. Use the shared builder so
+    # Router.shard_for/2 and CLUSTER.SLOTS expose the same ownership.
     slot_map = build_slot_map(shard_count)
 
     # Per-shard ETS tables (anonymous — no global name pollution)
@@ -428,9 +429,7 @@ defmodule FerricStore.Instance do
   defp delete_ets_table(_table), do: :ok
 
   defp build_slot_map(shard_count) do
-    0..1023
-    |> Enum.map(fn slot -> rem(slot, shard_count) end)
-    |> List.to_tuple()
+    Ferricstore.Store.SlotMap.build_uniform(shard_count)
   end
 
   defp build_keydir_tables(name, shard_count) do
