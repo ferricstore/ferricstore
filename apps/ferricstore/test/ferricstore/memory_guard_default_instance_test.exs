@@ -22,4 +22,27 @@ defmodule Ferricstore.MemoryGuardDefaultInstanceTest do
       end
     end
   end
+
+  test "stats omit RSS pressure instead of crashing when the default instance is not registered" do
+    original = :persistent_term.get(@default_instance_key, :missing)
+
+    if original != :missing do
+      :persistent_term.erase(@default_instance_key)
+    end
+
+    if Process.whereis(MemoryGuard) == nil do
+      start_supervised!({MemoryGuard, interval_ms: 60_000})
+    end
+
+    try do
+      stats = MemoryGuard.stats()
+
+      assert stats.rss_bytes == 0
+      assert stats.rss_pressure_level == :ok
+    after
+      if original != :missing do
+        :persistent_term.put(@default_instance_key, original)
+      end
+    end
+  end
 end

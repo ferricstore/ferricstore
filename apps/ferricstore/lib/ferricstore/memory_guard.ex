@@ -581,7 +581,7 @@ defmodule Ferricstore.MemoryGuard do
     # In embedded mode, RSS includes the host app's memory — not meaningful
     # for our pressure decisions.
     {rss_bytes, rss_ratio, rss_pressure_level} =
-      case FerricStore.Instance.get(:default).process_rss_fn do
+      case default_process_rss_fn() do
         nil -> {0, 0.0, :ok}
         rss_fn ->
           rss = rss_fn.() || 0
@@ -822,6 +822,13 @@ defmodule Ferricstore.MemoryGuard do
     case :persistent_term.get({FerricStore.Instance, :default}, nil) do
       %{pressure_flags: ref} -> :atomics.get(ref, slot) == 1
       _missing_or_stale -> false
+    end
+  end
+
+  defp default_process_rss_fn do
+    case :persistent_term.get({FerricStore.Instance, :default}, nil) do
+      %{process_rss_fn: fun} -> fun
+      _missing_or_stale -> nil
     end
   end
 

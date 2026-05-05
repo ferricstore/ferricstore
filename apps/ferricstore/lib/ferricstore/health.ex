@@ -188,7 +188,11 @@ defmodule Ferricstore.Health do
 
       {status, keys} =
         try do
-          keys = :ets.info(ets, :size)
+          keys =
+            case :ets.info(ets, :size) do
+              n when is_integer(n) -> n
+              _ -> 0
+            end
 
           shard_status =
             case Process.whereis(name) do
