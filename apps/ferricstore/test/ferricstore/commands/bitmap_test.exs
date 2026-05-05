@@ -414,6 +414,23 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert 16 == Bitmap.handle("BITPOS", ["mykey", "1", "0", "2"], store)
     end
 
+    test "in-range cold byte range scans only the requested byte slice" do
+      test_pid = self()
+
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 4 end,
+        getrange: fn "cold", 1, 2 ->
+          send(test_pid, {:range_reader_called, 1, 2})
+          <<0x00, 0x08>>
+        end,
+        get: fn _key -> flunk("BITPOS should read only the requested cold byte range") end
+      }
+
+      assert 20 == Bitmap.handle("BITPOS", ["cold", "1", "1", "2"], store)
+      assert_received {:range_reader_called, 1, 2}
+    end
+
     test "with BIT mode range" do
       # 0xF0 = 11110000
       store = MockStore.make(%{"mykey" => {<<0xF0>>, 0}})
@@ -423,6 +440,23 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert -1 == Bitmap.handle("BITPOS", ["mykey", "1", "4", "7", "BIT"], store)
       # Find first 1 in bit range 0-3 => bit 0
       assert 0 == Bitmap.handle("BITPOS", ["mykey", "1", "0", "3", "BIT"], store)
+    end
+
+    test "in-range cold bit range scans only covering bytes" do
+      test_pid = self()
+
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 4 end,
+        getrange: fn "cold", 1, 2 ->
+          send(test_pid, {:range_reader_called, 1, 2})
+          <<0b0000_0000, 0b0001_0000>>
+        end,
+        get: fn _key -> flunk("BITPOS BIT should read only the covering cold bytes") end
+      }
+
+      assert 19 == Bitmap.handle("BITPOS", ["cold", "1", "12", "20", "BIT"], store)
+      assert_received {:range_reader_called, 1, 2}
     end
 
     test "on non-existent key looking for 1 returns -1" do
