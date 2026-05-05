@@ -40,25 +40,48 @@ defmodule FerricstoreServer.Connection.Tracking do
   # Maps command names to their keyspace notification event names.
   # Only fires on successful results (not errors).
   @keyspace_events %{
-    "SET" => "set", "SETNX" => "set", "SETEX" => "set", "PSETEX" => "set",
-    "MSET" => "mset", "MSETNX" => "mset",
-    "APPEND" => "append", "GETSET" => "getset", "GETDEL" => "getdel",
+    "SET" => "set",
+    "SETNX" => "set",
+    "SETEX" => "set",
+    "PSETEX" => "set",
+    "MSET" => "mset",
+    "MSETNX" => "mset",
+    "APPEND" => "append",
+    "GETSET" => "getset",
+    "GETDEL" => "getdel",
     "SETRANGE" => "setrange",
-    "INCR" => "incr", "DECR" => "decr", "INCRBY" => "incrby",
-    "DECRBY" => "decrby", "INCRBYFLOAT" => "incrbyfloat",
-    "DEL" => "del", "UNLINK" => "del",
-    "EXPIRE" => "expire", "PEXPIRE" => "pexpire",
-    "EXPIREAT" => "expireat", "PEXPIREAT" => "pexpireat",
+    "INCR" => "incr",
+    "DECR" => "decr",
+    "INCRBY" => "incrby",
+    "DECRBY" => "decrby",
+    "INCRBYFLOAT" => "incrbyfloat",
+    "DEL" => "del",
+    "UNLINK" => "del",
+    "EXPIRE" => "expire",
+    "PEXPIRE" => "pexpire",
+    "EXPIREAT" => "expireat",
+    "PEXPIREAT" => "pexpireat",
     "PERSIST" => "persist",
     "RENAME" => "rename",
-    "LPUSH" => "lpush", "RPUSH" => "rpush",
-    "LPOP" => "lpop", "RPOP" => "rpop",
-    "LSET" => "lset", "LINSERT" => "linsert", "LTRIM" => "ltrim",
-    "LREM" => "lrem", "LMOVE" => "lmove",
-    "SADD" => "sadd", "SREM" => "srem", "SPOP" => "spop",
-    "HSET" => "hset", "HDEL" => "hdel", "HINCRBY" => "hincrby",
+    "LPUSH" => "lpush",
+    "RPUSH" => "rpush",
+    "LPOP" => "lpop",
+    "RPOP" => "rpop",
+    "LSET" => "lset",
+    "LINSERT" => "linsert",
+    "LTRIM" => "ltrim",
+    "LREM" => "lrem",
+    "LMOVE" => "lmove",
+    "SADD" => "sadd",
+    "SREM" => "srem",
+    "SPOP" => "spop",
+    "HSET" => "hset",
+    "HDEL" => "hdel",
+    "HINCRBY" => "hincrby",
     "HINCRBYFLOAT" => "hincrbyfloat",
-    "ZADD" => "zadd", "ZREM" => "zrem", "ZINCRBY" => "zincrby",
+    "ZADD" => "zadd",
+    "ZREM" => "zrem",
+    "ZINCRBY" => "zincrby",
     "COPY" => "copy"
   }
 
@@ -83,6 +106,11 @@ defmodule FerricstoreServer.Connection.Tracking do
     args
     |> Enum.chunk_every(2)
     |> Enum.each(fn [key, _val] -> KeyspaceNotifications.notify(key, event) end)
+  end
+
+  def do_notify_keyspace("LMOVE", event, [source, destination | _], :ok) do
+    KeyspaceNotifications.notify(source, event)
+    KeyspaceNotifications.notify(destination, event)
   end
 
   # Single-key commands: first arg is the key. Skip errors.
@@ -182,6 +210,9 @@ defmodule FerricstoreServer.Connection.Tracking do
         ClientTracking.notify_keys_modified(args, writer_pid, sender)
 
       "RENAME" ->
+        notify_tracking_keys(args, :all, writer_pid, sender)
+
+      "LMOVE" ->
         notify_tracking_keys(args, :all, writer_pid, sender)
 
       "COPY" ->

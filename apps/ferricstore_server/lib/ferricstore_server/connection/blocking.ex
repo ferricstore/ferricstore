@@ -6,6 +6,7 @@ defmodule FerricstoreServer.Connection.Blocking do
   alias Ferricstore.Commands.Stream, as: StreamCmd
   alias Ferricstore.Waiters
   alias FerricstoreServer.Connection.Store, as: ConnStore
+  alias FerricstoreServer.Connection.Tracking, as: ConnTracking
 
   @type conn_result :: {:continue, iodata(), map()} | {:block, map()} | {:close, iodata(), map()}
 
@@ -60,6 +61,7 @@ defmodule FerricstoreServer.Connection.Blocking do
         {:continue, Encoder.encode(err), state}
 
       {:ok, value} ->
+        notify_blmove_success(source, destination, value, state)
         {:continue, Encoder.encode(value), state}
 
       {:error, err} ->
@@ -87,6 +89,7 @@ defmodule FerricstoreServer.Connection.Blocking do
       {:ok, {key, value}} ->
         # Wrap single value into a list for consistent BLMPOP format
         elements = if is_list(value), do: value, else: [value]
+        notify_blocking_pop_success(pop_cmd, [key, elements], state)
         {:continue, Encoder.encode([key, elements]), state}
 
       nil ->
@@ -148,6 +151,7 @@ defmodule FerricstoreServer.Connection.Blocking do
 
     case immediate do
       {:ok, value} ->
+        notify_blocking_pop_success(pop_cmd, value, state)
         {:continue, Encoder.encode(value), state}
 
       nil ->
@@ -178,6 +182,7 @@ defmodule FerricstoreServer.Connection.Blocking do
         {:quit, Encoder.encode(nil), state}
 
       {:ok, value} ->
+        notify_blocking_pop_success(pop_cmd, value, state)
         {:continue, Encoder.encode(value), state}
 
       {:error, err} ->
@@ -260,6 +265,7 @@ defmodule FerricstoreServer.Connection.Blocking do
         {:quit, Encoder.encode(nil), state}
 
       {:ok, value} ->
+        notify_blmove_success(source, destination, value, state)
         {:continue, Encoder.encode(value), state}
 
       {:error, err} ->
@@ -302,6 +308,7 @@ defmodule FerricstoreServer.Connection.Blocking do
         {:quit, Encoder.encode(nil), state}
 
       {:ok, value} ->
+        notify_blocking_pop_success(pop_cmd, value, state)
         {:continue, Encoder.encode(value), state}
 
       {:error, err} ->
@@ -413,6 +420,21 @@ defmodule FerricstoreServer.Connection.Blocking do
         {:error, err} -> {:halt, {:error, err}}
       end
     end)
+  end
+
+  defp notify_blocking_pop_success(pop_cmd, [key, _value], state) when pop_cmd in ~w(LPOP RPOP) do
+    ConnTracking.maybe_notify_keyspace(pop_cmd, [key], :ok)
+    ConnTracking.maybe_notify_tracking(pop_cmd, [key], :ok, state)
+  end
+
+  defp notify_blocking_pop_success(_pop_cmd, _result, _state), do: :ok
+
+  defp notify_blmove_success(_source, _destination, nil, _state), do: :ok
+  defp notify_blmove_success(_source, _destination, {:error, _}, _state), do: :ok
+
+  defp notify_blmove_success(source, destination, _value, state) do
+    ConnTracking.maybe_notify_keyspace("LMOVE", [source, destination], :ok)
+    ConnTracking.maybe_notify_tracking("LMOVE", [source, destination], :ok, state)
   end
 
   defp immediate_blmpop(keys, pop_cmd, pop_args_fn, store) do
