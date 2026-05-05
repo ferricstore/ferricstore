@@ -61,7 +61,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       try do
         :ets.insert(keydir, {key, "value", 0, 0, 7, 123, byte_size("value")})
 
-        Router.__install_batch_async_entries_for_test__(
+        Router.__install_batch_entries_for_test__(
           ctx,
           idx,
           [{key, "value", "value"}],

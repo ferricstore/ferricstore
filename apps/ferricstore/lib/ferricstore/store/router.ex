@@ -2674,12 +2674,12 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc false
-  def __install_batch_async_entries_for_test__(ctx, idx, entries, shard_locations) do
+  def __install_batch_entries_for_test__(ctx, idx, entries, shard_locations) do
     keydir = elem(ctx.keydir_refs, idx)
-    install_batch_async_entries(ctx, idx, keydir, entries, shard_locations, LFU.initial())
+    install_batch_entries(ctx, idx, keydir, entries, shard_locations, LFU.initial())
   end
 
-  defp install_batch_async_entries(ctx, idx, keydir, entries, shard_locations, lfu_val) do
+  defp install_batch_entries(ctx, idx, keydir, entries, shard_locations, lfu_val) do
     Enum.each(entries, fn {key, value, value_for_ets} ->
       clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
 
@@ -2689,12 +2689,12 @@ defmodule Ferricstore.Store.Router do
           :ets.insert(keydir, {key, value_for_ets, 0, lfu_val, file_id, offset, value_size})
 
         nil ->
-          install_batch_async_pending_entry(ctx, idx, keydir, key, value, value_for_ets, lfu_val)
+          install_batch_pending_entry(ctx, idx, keydir, key, value, value_for_ets, lfu_val)
       end
     end)
   end
 
-  defp install_batch_async_pending_entry(ctx, idx, keydir, key, value, value_for_ets, lfu_val) do
+  defp install_batch_pending_entry(ctx, idx, keydir, key, value, value_for_ets, lfu_val) do
     case :ets.lookup(keydir, key) do
       [{^key, ^value_for_ets, 0, _lfu, fid, off, value_size}]
       when fid != :pending and valid_cold_location(fid, off, value_size) ->

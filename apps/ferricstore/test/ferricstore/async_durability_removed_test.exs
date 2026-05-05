@@ -51,6 +51,7 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
   test "router no longer exposes async-named batch put API" do
     refute function_exported?(Router, :batch_async_put, 2)
     refute function_exported?(FerricStore, :__async_batch_put_result_list__, 2)
+    refute function_exported?(Router, :__install_batch_async_entries_for_test__, 4)
   end
 
   test "active tests do not call removed async batch APIs" do
