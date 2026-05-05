@@ -275,6 +275,23 @@ defmodule Ferricstore.Commands.ListTest do
       assert ["a", "b", "c"] == List.handle("LRANGE", ["mylist", "0", "-1"], store)
     end
 
+    test "scans list elements once for a single LRANGE" do
+      base = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a", "b", "c"], base)
+      parent = self()
+
+      store =
+        Map.put(base, :compound_scan, fn key, prefix ->
+          send(parent, {:compound_scan, key, prefix})
+          base.compound_scan.(key, prefix)
+        end)
+
+      assert ["a", "b", "c"] == List.handle("LRANGE", ["mylist", "0", "-1"], store)
+
+      assert_received {:compound_scan, "mylist", "L:mylist" <> <<0>>}
+      refute_received {:compound_scan, "mylist", "L:mylist" <> <<0>>}
+    end
+
     test "returns empty list for out-of-range start" do
       store = MockStore.make()
       List.handle("RPUSH", ["mylist", "a", "b"], store)
