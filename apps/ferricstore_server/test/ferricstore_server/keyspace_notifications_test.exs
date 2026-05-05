@@ -49,8 +49,21 @@ defmodule FerricstoreServer.KeyspaceNotificationsTest do
     end
 
     test "returns true for full string command family with $ flag" do
-      for event <- ~w(set setrange incrby decrby incrbyfloat getdel getex mset setbit bitop) do
+      for event <-
+            ~w(set setrange incrby decrby incrbyfloat getdel getex mset setbit bitop pfadd pfmerge) do
         assert KeyspaceNotifications.should_notify?(event, "K$")
+      end
+    end
+
+    test "returns true for full set command family with s flag" do
+      for event <- ~w(sadd srem spop smove sdiffstore sinterstore sunionstore) do
+        assert KeyspaceNotifications.should_notify?(event, "Ks")
+      end
+    end
+
+    test "returns true for full sorted set and geo command family with z flag" do
+      for event <- ~w(zadd zrem zincrby zpopmin zpopmax geoadd geosearchstore) do
+        assert KeyspaceNotifications.should_notify?(event, "Kz")
       end
     end
 

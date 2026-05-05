@@ -47,7 +47,7 @@ defmodule FerricstoreServer.Connection.Tracking do
     RENAMENX COPY
     HSETNX HDEL
     LPUSHX RPUSHX
-    SADD SREM
+    SADD SREM SMOVE
     ZREM
     LREM
     PFADD
@@ -98,6 +98,10 @@ defmodule FerricstoreServer.Connection.Tracking do
     "SADD" => "sadd",
     "SREM" => "srem",
     "SPOP" => "spop",
+    "SMOVE" => "smove",
+    "SDIFFSTORE" => "sdiffstore",
+    "SINTERSTORE" => "sinterstore",
+    "SUNIONSTORE" => "sunionstore",
     "HSET" => "hset",
     "HSETNX" => "hset",
     "HDEL" => "hdel",
@@ -108,6 +112,12 @@ defmodule FerricstoreServer.Connection.Tracking do
     "ZADD" => "zadd",
     "ZREM" => "zrem",
     "ZINCRBY" => "zincrby",
+    "ZPOPMIN" => "zpopmin",
+    "ZPOPMAX" => "zpopmax",
+    "PFADD" => "pfadd",
+    "PFMERGE" => "pfmerge",
+    "GEOADD" => "geoadd",
+    "GEOSEARCHSTORE" => "geosearchstore",
     "COPY" => "copy",
     "XADD" => "xadd",
     "XDEL" => "xdel",
@@ -173,6 +183,14 @@ defmodule FerricstoreServer.Connection.Tracking do
     KeyspaceNotifications.notify(source, event)
     KeyspaceNotifications.notify(destination, event)
   end
+
+  def do_notify_keyspace("SMOVE", event, [source, destination | _], result)
+      when result not in [0, nil] do
+    KeyspaceNotifications.notify(source, event)
+    KeyspaceNotifications.notify(destination, event)
+  end
+
+  def do_notify_keyspace("SMOVE", _event, _args, _result), do: :ok
 
   def do_notify_keyspace("BITOP", event, [_operation, destination | _], _result) do
     KeyspaceNotifications.notify(destination, event)

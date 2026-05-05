@@ -274,6 +274,8 @@ defmodule FerricstoreServer.Connection.TrackingTest do
       {"RPUSHX", ["tracking:noop:rpushx", "member"], "tracking:noop:rpushx"},
       {"SADD", ["tracking:noop:sadd", "member"], "tracking:noop:sadd"},
       {"SREM", ["tracking:noop:srem", "member"], "tracking:noop:srem"},
+      {"SMOVE", ["tracking:noop:smove:src", "tracking:noop:smove:dst", "member"],
+       "tracking:noop:smove:src"},
       {"ZREM", ["tracking:noop:zrem", "member"], "tracking:noop:zrem"},
       {"LREM", ["tracking:noop:lrem", "1", "member"], "tracking:noop:lrem"},
       {"PFADD", ["tracking:noop:pfadd", "member"], "tracking:noop:pfadd"},
@@ -438,6 +440,8 @@ defmodule FerricstoreServer.Connection.TrackingTest do
       {"RPUSHX", ["tracking:keyspace:noop:rpushx", "member"]},
       {"SADD", ["tracking:keyspace:noop:sadd", "member"]},
       {"SREM", ["tracking:keyspace:noop:srem", "member"]},
+      {"SMOVE",
+       ["tracking:keyspace:noop:smove:src", "tracking:keyspace:noop:smove:dst", "member"]},
       {"HDEL", ["tracking:keyspace:noop:hdel", "field"]},
       {"ZREM", ["tracking:keyspace:noop:zrem", "member"]},
       {"LREM", ["tracking:keyspace:noop:lrem", "1", "member"]},
@@ -511,5 +515,101 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert_received {:pubsub_message, "__keyspace@0__:" <> ^bitop_destination, "bitop"}
     assert_received {:pubsub_message, "__keyevent@0__:bitop", ^bitop_destination}
     refute_received {:pubsub_message, "__keyspace@0__:" <> ^bitop_source, "bitop"}
+  end
+
+  test "set store writes fire keyspace notifications on destination keys" do
+    Config.set("notify-keyspace-events", "KEs")
+
+    events = [
+      {"SDIFFSTORE", ["tracking:keyspace:sdiffstore:dst", "tracking:keyspace:sdiffstore:src"],
+       "sdiffstore"},
+      {"SINTERSTORE", ["tracking:keyspace:sinterstore:dst", "tracking:keyspace:sinterstore:src"],
+       "sinterstore"},
+      {"SUNIONSTORE", ["tracking:keyspace:sunionstore:dst", "tracking:keyspace:sunionstore:src"],
+       "sunionstore"}
+    ]
+
+    Enum.each(events, fn {cmd, [destination, source] = args, event} ->
+      PubSub.subscribe("__keyspace@0__:#{destination}", self())
+      PubSub.subscribe("__keyspace@0__:#{source}", self())
+      PubSub.subscribe("__keyevent@0__:#{event}", self())
+
+      Tracking.maybe_notify_keyspace(cmd, args, 1)
+
+      assert_received {:pubsub_message, "__keyspace@0__:" <> ^destination, ^event}
+      assert_received {:pubsub_message, "__keyevent@0__:" <> ^event, ^destination}
+      refute_received {:pubsub_message, "__keyspace@0__:" <> ^source, ^event}
+    end)
+  end
+
+  test "SMOVE keyspace notification fires for source and destination" do
+    Config.set("notify-keyspace-events", "KEs")
+    source = "tracking:keyspace:smove:src"
+    destination = "tracking:keyspace:smove:dst"
+    PubSub.subscribe("__keyspace@0__:#{source}", self())
+    PubSub.subscribe("__keyspace@0__:#{destination}", self())
+    PubSub.subscribe("__keyevent@0__:smove", self())
+
+    Tracking.maybe_notify_keyspace("SMOVE", [source, destination, "member"], 1)
+
+    assert_received {:pubsub_message, "__keyspace@0__:" <> ^source, "smove"}
+    assert_received {:pubsub_message, "__keyspace@0__:" <> ^destination, "smove"}
+    assert_received {:pubsub_message, "__keyevent@0__:smove", ^source}
+    assert_received {:pubsub_message, "__keyevent@0__:smove", ^destination}
+  end
+
+  test "zpop and geo writes fire sorted-set keyspace notifications" do
+    Config.set("notify-keyspace-events", "KEz")
+
+    events = [
+      {"ZPOPMIN", ["tracking:keyspace:zpopmin"], "zpopmin", ["a", "1"]},
+      {"ZPOPMAX", ["tracking:keyspace:zpopmax"], "zpopmax", ["a", "1"]},
+      {"GEOADD", ["tracking:keyspace:geoadd", "1", "2", "member"], "geoadd", 1},
+      {
+        "GEOSEARCHSTORE",
+        [
+          "tracking:keyspace:geostore:dst",
+          "tracking:keyspace:geostore:src",
+          "FROMLONLAT",
+          "1",
+          "2",
+          "BYRADIUS",
+          "1",
+          "km"
+        ],
+        "geosearchstore",
+        1
+      }
+    ]
+
+    Enum.each(events, fn {cmd, [key | _] = args, event, result} ->
+      PubSub.subscribe("__keyspace@0__:#{key}", self())
+      PubSub.subscribe("__keyevent@0__:#{event}", self())
+
+      Tracking.maybe_notify_keyspace(cmd, args, result)
+
+      assert_received {:pubsub_message, "__keyspace@0__:" <> ^key, ^event}
+      assert_received {:pubsub_message, "__keyevent@0__:" <> ^event, ^key}
+    end)
+  end
+
+  test "hyperloglog writes fire string keyspace notifications" do
+    Config.set("notify-keyspace-events", "KE$")
+
+    events = [
+      {"PFADD", ["tracking:keyspace:pfadd", "member"], "pfadd", 1},
+      {"PFMERGE", ["tracking:keyspace:pfmerge:dst", "tracking:keyspace:pfmerge:src"], "pfmerge",
+       :ok}
+    ]
+
+    Enum.each(events, fn {cmd, [key | _] = args, event, result} ->
+      PubSub.subscribe("__keyspace@0__:#{key}", self())
+      PubSub.subscribe("__keyevent@0__:#{event}", self())
+
+      Tracking.maybe_notify_keyspace(cmd, args, result)
+
+      assert_received {:pubsub_message, "__keyspace@0__:" <> ^key, ^event}
+      assert_received {:pubsub_message, "__keyevent@0__:" <> ^event, ^key}
+    end)
   end
 end
