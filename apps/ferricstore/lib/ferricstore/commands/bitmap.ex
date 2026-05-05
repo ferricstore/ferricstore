@@ -106,14 +106,13 @@ defmodule Ferricstore.Commands.Bitmap do
       if byte_index_outside_value?(store, key, byte_index) do
         0
       else
-        current = Ops.get(store, key) || <<>>
+        case byte_at(store, key, byte_index) do
+          nil ->
+            0
 
-        if byte_index >= byte_size(current) do
-          0
-        else
-          byte = :binary.at(current, byte_index)
-          bit_position = 7 - rem(offset, 8)
-          byte >>> bit_position &&& 1
+          byte ->
+            bit_position = 7 - rem(offset, 8)
+            byte >>> bit_position &&& 1
         end
       end
     end
@@ -304,14 +303,13 @@ defmodule Ferricstore.Commands.Bitmap do
       if byte_index_outside_value?(store, key, byte_index) do
         0
       else
-        current = Ops.get(store, key) || <<>>
+        case byte_at(store, key, byte_index) do
+          nil ->
+            0
 
-        if byte_index >= byte_size(current) do
-          0
-        else
-          byte = :binary.at(current, byte_index)
-          bit_position = 7 - rem(offset, 8)
-          byte >>> bit_position &&& 1
+          byte ->
+            bit_position = 7 - rem(offset, 8)
+            byte >>> bit_position &&& 1
         end
       end
     end
@@ -416,6 +414,13 @@ defmodule Ferricstore.Commands.Bitmap do
     case metadata_value_size(store, key) do
       size when is_integer(size) -> byte_index >= size
       _ -> false
+    end
+  end
+
+  defp byte_at(store, key, byte_index) do
+    case Ops.getrange(store, key, byte_index, byte_index) do
+      <<byte>> -> byte
+      _ -> nil
     end
   end
 

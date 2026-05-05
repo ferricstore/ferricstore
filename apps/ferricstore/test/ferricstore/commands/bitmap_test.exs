@@ -152,6 +152,40 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert 0 == Bitmap.handle("GETBIT", ["cold", "8"], store)
     end
 
+    test "in-range known cold value reads only the target byte" do
+      test_pid = self()
+
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 2 end,
+        getrange: fn "cold", 1, 1 ->
+          send(test_pid, :range_reader_called)
+          <<0b0100_0000>>
+        end,
+        get: fn _key -> flunk("GETBIT should read only the target byte") end
+      }
+
+      assert 1 == Bitmap.handle("GETBIT", ["cold", "9"], store)
+      assert_received :range_reader_called
+    end
+
+    test "AST in-range known cold value reads only the target byte" do
+      test_pid = self()
+
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 2 end,
+        getrange: fn "cold", 1, 1 ->
+          send(test_pid, :range_reader_called)
+          <<0b0100_0000>>
+        end,
+        get: fn _key -> flunk("GETBIT AST should read only the target byte") end
+      }
+
+      assert 1 == Bitmap.handle_ast({:getbit, "cold", 9}, store)
+      assert_received :range_reader_called
+    end
+
     test "returns correct bit at offset 0 (MSB)" do
       store = MockStore.make(%{"mykey" => {<<128>>, 0}})
       assert 1 == Bitmap.handle("GETBIT", ["mykey", "0"], store)
