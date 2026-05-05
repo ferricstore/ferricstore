@@ -561,14 +561,14 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
   # ---------------------------------------------------------------------------
 
   describe "DEBUG SET-DURABILITY" do
-    test "rejects async and accepts quorum" do
+    test "rejects old durability modes" do
       result = Ferricstore.Commands.Server.handle("DEBUG", ["SET-DURABILITY", "async"], nil)
       assert {:error, msg} = result
-      assert String.contains?(msg, "async durability has been removed")
+      assert String.contains?(msg, "durability mode has been removed")
 
       result = Ferricstore.Commands.Server.handle("DEBUG", ["SET-DURABILITY", "quorum"], nil)
-      assert {:simple, msg} = result
-      assert String.contains?(msg, "all_quorum")
+      assert {:error, msg} = result
+      assert String.contains?(msg, "durability mode has been removed")
     end
 
     test "rejects invalid durability mode via catch-all" do

@@ -122,7 +122,7 @@ defmodule Ferricstore.QuorumMetrics do
   def handle_event([:ferricstore, :batcher, :slot_flush], measurements, metadata, _config) do
     labels = [
       shard_index: shard_label(Map.get(metadata, :shard_index)),
-      durability: enum_label(Map.get(metadata, :durability), [:quorum, :async, :async_origin])
+      write_path: enum_label(Map.get(metadata, :write_path), [:quorum, :async_origin])
     ]
 
     increment(:slot_flush_total, labels, 1)

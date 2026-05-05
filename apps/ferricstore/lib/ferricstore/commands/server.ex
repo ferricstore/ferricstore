@@ -287,13 +287,8 @@ defmodule Ferricstore.Commands.Server do
     handle("FLUSHALL", [], store)
   end
 
-  def handle("DEBUG", ["SET-DURABILITY", "quorum"], _store) do
-    FerricStore.Instance.update_durability_mode(:default, :all_quorum)
-    {:simple, "OK durability_mode=all_quorum"}
-  end
-
-  def handle("DEBUG", ["SET-DURABILITY", "async"], _store) do
-    {:error, "ERR async durability has been removed; only quorum durability is supported"}
+  def handle("DEBUG", ["SET-DURABILITY", _mode], _store) do
+    {:error, "ERR durability mode has been removed; writes always use quorum"}
   end
 
   def handle("DEBUG", ["BATCHER-STATS"], _store) do
@@ -704,19 +699,17 @@ defmodule Ferricstore.Commands.Server do
     default_fields = [
       {"namespace_config_count", Integer.to_string(count)},
       {"namespace_config_all_default", all_default},
-      {"default_window_ms", Integer.to_string(NamespaceConfig.default_window_ms())},
-      {"default_durability", Atom.to_string(NamespaceConfig.default_durability())}
+      {"default_window_ms", Integer.to_string(NamespaceConfig.default_window_ms())}
     ]
 
     entry_fields =
       Enum.flat_map(entries, fn entry ->
-        %{prefix: prefix, window_ms: w, durability: d} = entry
+        %{prefix: prefix, window_ms: w} = entry
         changed_at = Map.get(entry, :changed_at, 0)
         changed_by = Map.get(entry, :changed_by, "")
 
         [
           {"ns_#{prefix}_window_ms", Integer.to_string(w)},
-          {"ns_#{prefix}_durability", Atom.to_string(d)},
           {"ns_#{prefix}_changed_at", Integer.to_string(changed_at)},
           {"ns_#{prefix}_changed_by", changed_by}
         ]

@@ -3,7 +3,7 @@ defmodule Mix.Tasks.Ferricstore.Config do
   Manages FerricStore namespace configuration from the command line.
 
   Provides `get` and `set` subcommands for reading and writing per-namespace
-  configuration (commit window timing and durability mode).
+  configuration (commit window timing).
 
   ## Usage
 
@@ -20,7 +20,6 @@ defmodule Mix.Tasks.Ferricstore.Config do
       mix ferricstore.config get rate
       # prefix: rate
       # window_ms: 1
-      # durability: quorum
 
   ### set
 
@@ -29,12 +28,10 @@ defmodule Mix.Tasks.Ferricstore.Config do
   Valid fields:
 
     * `window_ms` -- commit window in milliseconds (positive integer)
-    * `durability` -- `"quorum"`
 
   Examples:
 
       mix ferricstore.config set rate window_ms 10
-      mix ferricstore.config set session durability quorum
 
   """
 
@@ -60,7 +57,6 @@ defmodule Mix.Tasks.Ferricstore.Config do
       {:ok, entry} ->
         Mix.shell().info("prefix: #{entry.prefix}")
         Mix.shell().info("window_ms: #{entry.window_ms}")
-        Mix.shell().info("durability: #{entry.durability}")
         Mix.shell().info("changed_at: #{entry.changed_at}")
         Mix.shell().info("changed_by: #{entry.changed_by}")
     end
@@ -88,8 +84,8 @@ defmodule Mix.Tasks.Ferricstore.Config do
       mix ferricstore.config get <prefix>
       mix ferricstore.config set <prefix> <field> <value>
 
-    Fields: window_ms, durability
-    Values: window_ms takes a positive integer, durability only supports "quorum"
+    Fields: window_ms
+    Values: window_ms takes a positive integer
     """)
 
     :ok

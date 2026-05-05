@@ -225,12 +225,8 @@ defmodule Ferricstore.Store.Router do
 
   defp barrier_forwarded_result(_idx, other, _timeout_ms), do: other
 
-  @doc "Public wrapper retained for callers that used namespace durability."
-  @spec durability_for_key_public(FerricStore.Instance.t(), binary()) :: :quorum
-  def durability_for_key_public(_ctx, _key), do: :quorum
-
-  # Dispatches default-instance writes through quorum. Async durability was a
-  # product feature; internal async IO/WAL/read machinery remains separate.
+  # Dispatches default-instance writes through quorum. Internal async
+  # IO/WAL/read machinery remains separate from client acknowledgement policy.
   @spec raft_write(FerricStore.Instance.t(), non_neg_integer(), binary(), tuple()) :: term()
   defp raft_write(ctx, idx, _key, command) do
     if ctx.name == :default do
@@ -241,59 +237,6 @@ defmodule Ferricstore.Store.Router do
       GenServer.call(elem(ctx.shard_names, idx), command)
     end
   end
-
-  # Linearizable primitives — must NEVER take the async path even if the
-  # namespace is configured `:async`. Adding a new coordination primitive?
-  # Add it here.
-  @doc false
-  def always_quorum?({:set, _, _, _, _}), do: true
-  def always_quorum?({:cas, _, _, _, _}), do: true
-  def always_quorum?({:lock, _, _, _}), do: true
-  def always_quorum?({:unlock, _, _}), do: true
-  def always_quorum?({:extend, _, _, _}), do: true
-  def always_quorum?({:ratelimit_add, _, _, _, _}), do: true
-  def always_quorum?({:ratelimit_add, _, _, _, _, _}), do: true
-  def always_quorum?({:spop, _, _}), do: true
-  def always_quorum?({:zpop, _, _, _}), do: true
-  def always_quorum?({:pfadd, _, _}), do: true
-  def always_quorum?({:pfmerge, _, _}), do: true
-  def always_quorum?({:json_set, _, _, _, _}), do: true
-  def always_quorum?({:json_del, _, _}), do: true
-  def always_quorum?({:json_numincrby, _, _, _}), do: true
-  def always_quorum?({:json_arrappend, _, _, _}), do: true
-  def always_quorum?({:json_toggle, _, _}), do: true
-  def always_quorum?({:json_clear, _, _}), do: true
-
-  # Probabilistic structures: results (e.g., Bloom "was it new?", TopK
-  # evicted member, CMS post-increment count) are computed by the state
-  # machine. The async fast path early-replies before that result is
-  # available, so prob commands must run through quorum_write to return
-  # the materialized value. Tuple shapes match those in
-  # `state_machine.ex` apply/3 clauses.
-  def always_quorum?({:bloom_create, _, _, _, _}), do: true
-  def always_quorum?({:bloom_add, _, _, _}), do: true
-  def always_quorum?({:bloom_madd, _, _, _}), do: true
-  def always_quorum?({:cuckoo_create, _, _, _}), do: true
-  def always_quorum?({:cuckoo_add, _, _, _}), do: true
-  def always_quorum?({:cuckoo_addnx, _, _, _}), do: true
-  def always_quorum?({:cuckoo_del, _, _}), do: true
-  def always_quorum?({:cms_create, _, _, _}), do: true
-  def always_quorum?({:cms_incrby, _, _}), do: true
-  def always_quorum?({:cms_merge, _, _, _, _}), do: true
-  def always_quorum?({:topk_create, _, _, _, _, _}), do: true
-  def always_quorum?({:topk_add, _, _}), do: true
-  def always_quorum?({:topk_incrby, _, _}), do: true
-  def always_quorum?({:flow_create, _, _}), do: true
-  def always_quorum?({:flow_create_many, _, _}), do: true
-  def always_quorum?({:flow_claim_due, _, _}), do: true
-  def always_quorum?({:flow_complete, _, _}), do: true
-  def always_quorum?({:flow_transition, _, _}), do: true
-  def always_quorum?({:flow_transition_many, _, _}), do: true
-  def always_quorum?({:flow_retry, _, _}), do: true
-  def always_quorum?({:flow_fail, _, _}), do: true
-  def always_quorum?({:flow_cancel, _, _}), do: true
-  def always_quorum?({:flow_rewind, _, _}), do: true
-  def always_quorum?(_), do: false
 
   defp shard_under_disk_pressure?(ctx, idx) do
     size = :atomics.info(ctx.disk_pressure).size

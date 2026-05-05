@@ -412,7 +412,6 @@ defmodule FerricstoreServer.Health.DashboardTest do
     test "returns configured namespaces after set" do
       NamespaceConfig.reset_all()
       :ok = NamespaceConfig.set("rate", "window_ms", "10")
-      :ok = NamespaceConfig.set("rate", "durability", "quorum")
 
       data = Dashboard.collect()
 
@@ -420,7 +419,6 @@ defmodule FerricstoreServer.Health.DashboardTest do
       [entry] = data.namespace_config
       assert entry.prefix == "rate"
       assert entry.window_ms == 10
-      assert entry.durability == :quorum
       assert is_integer(entry.changed_at)
       assert is_binary(entry.changed_by)
 
@@ -455,24 +453,23 @@ defmodule FerricstoreServer.Health.DashboardTest do
       data = Dashboard.collect_config_page()
       html = Dashboard.render_config_page(data)
 
-      assert String.contains?(html, "All namespaces using built-in defaults (1ms, quorum)")
+      assert String.contains?(html, "All namespaces using built-in default window (1ms)")
     end
 
-    test "shows table with prefix, window, durability when namespaces configured" do
+    test "shows table with prefix and window when namespaces configured" do
       NamespaceConfig.reset_all()
       :ok = NamespaceConfig.set("session", "window_ms", "5")
-      :ok = NamespaceConfig.set("session", "durability", "quorum")
 
       data = Dashboard.collect_config_page()
       html = Dashboard.render_config_page(data)
 
       assert String.contains?(html, "session")
       assert String.contains?(html, "5")
-      assert String.contains?(html, "quorum")
+      refute String.contains?(html, "quorum")
       # Table headers
       assert String.contains?(html, "Prefix")
       assert String.contains?(html, "Window (ms)")
-      assert String.contains?(html, "Durability")
+      refute String.contains?(html, "Durability")
       assert String.contains?(html, "Changed At")
       assert String.contains?(html, "Changed By")
 
@@ -500,15 +497,13 @@ defmodule FerricstoreServer.Health.DashboardTest do
       NamespaceConfig.reset_all()
     end
 
-    test "does not apply warning color to quorum durability" do
+    test "does not render removed durability column state" do
       NamespaceConfig.reset_all()
       :ok = NamespaceConfig.set("safe", "window_ms", "2")
 
       data = Dashboard.collect_config_page()
       html = Dashboard.render_config_page(data)
 
-      # The durability cell for "safe" should not have warning class
-      assert String.contains?(html, "quorum")
       # Extract the config table area to check
       [_before, ns_section] = String.split(html, "Namespace Config", parts: 2)
       # Take until the next section or end of body
@@ -518,6 +513,8 @@ defmodule FerricstoreServer.Health.DashboardTest do
           [section] -> section
         end
 
+      refute String.contains?(ns_html, "Durability")
+      refute String.contains?(ns_html, "quorum")
       refute String.contains?(ns_html, "c-yellow")
 
       NamespaceConfig.reset_all()
@@ -599,7 +596,7 @@ defmodule FerricstoreServer.Health.DashboardTest do
       response = http_get(port, "/dashboard/config")
       body = extract_body(response)
 
-      assert String.contains?(body, "built-in defaults")
+      assert String.contains?(body, "built-in default window")
     end
   end
 end

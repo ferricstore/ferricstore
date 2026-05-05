@@ -72,7 +72,7 @@ defmodule Ferricstore.WritePathSetOptionsTest do
         assert :ok = Ferricstore.Commands.Strings.handle("SET", [key, "v", "NX"], store)
 
         assert_receive {:quorum_telemetry, [:ferricstore, :batcher, :slot_flush], flush_meas,
-                        %{durability: :quorum}},
+                        %{write_path: :quorum}},
                        1_000
 
         assert flush_meas.batch_size >= 1
@@ -98,7 +98,11 @@ defmodule Ferricstore.WritePathSetOptionsTest do
       future_ts = div(System.os_time(:millisecond), 1000) + 60
 
       result =
-        Ferricstore.Commands.Strings.handle("SET", ["exat:test", "val", "EXAT", "#{future_ts}"], store)
+        Ferricstore.Commands.Strings.handle(
+          "SET",
+          ["exat:test", "val", "EXAT", "#{future_ts}"],
+          store
+        )
 
       assert result == :ok
       assert "val" == store.get.("exat:test")
@@ -108,7 +112,11 @@ defmodule Ferricstore.WritePathSetOptionsTest do
       store = real_store()
       past_ts = div(System.os_time(:millisecond), 1000) - 60
 
-      Ferricstore.Commands.Strings.handle("SET", ["exat:past", "val", "EXAT", "#{past_ts}"], store)
+      Ferricstore.Commands.Strings.handle(
+        "SET",
+        ["exat:past", "val", "EXAT", "#{past_ts}"],
+        store
+      )
 
       # Key should be expired immediately
       Process.sleep(10)
@@ -120,7 +128,11 @@ defmodule Ferricstore.WritePathSetOptionsTest do
       future_ms = System.os_time(:millisecond) + 60_000
 
       result =
-        Ferricstore.Commands.Strings.handle("SET", ["pxat:test", "val", "PXAT", "#{future_ms}"], store)
+        Ferricstore.Commands.Strings.handle(
+          "SET",
+          ["pxat:test", "val", "PXAT", "#{future_ms}"],
+          store
+        )
 
       assert result == :ok
       assert "val" == store.get.("pxat:test")
@@ -130,7 +142,11 @@ defmodule Ferricstore.WritePathSetOptionsTest do
       store = real_store()
       past_ms = System.os_time(:millisecond) - 60_000
 
-      Ferricstore.Commands.Strings.handle("SET", ["pxat:past", "val", "PXAT", "#{past_ms}"], store)
+      Ferricstore.Commands.Strings.handle(
+        "SET",
+        ["pxat:past", "val", "PXAT", "#{past_ms}"],
+        store
+      )
 
       Process.sleep(10)
       assert nil == store.get.("pxat:past")
@@ -195,7 +211,11 @@ defmodule Ferricstore.WritePathSetOptionsTest do
       key = ukey("conflict")
 
       result =
-        Ferricstore.Commands.Strings.handle("SET", [key, "val", "EX", "10", "EXAT", "9999999"], store)
+        Ferricstore.Commands.Strings.handle(
+          "SET",
+          [key, "val", "EX", "10", "EXAT", "9999999"],
+          store
+        )
 
       assert {:error, "ERR syntax error"} = result
     end

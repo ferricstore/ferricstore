@@ -1383,14 +1383,11 @@ defmodule FerricstoreServer.Health.Dashboard do
     body =
       case entries do
         [] ->
-          ~s[<p style="color:#8b949e; margin: 8px 0; font-size:0.82rem;">All namespaces using built-in defaults (1ms, quorum)</p>]
+          ~s[<p style="color:#8b949e; margin: 8px 0; font-size:0.82rem;">All namespaces using built-in default window (1ms)</p>]
 
         _ ->
           rows =
             Enum.map_join(entries, "\n", fn entry ->
-              durability_str = Atom.to_string(entry.durability)
-              durability_class = ""
-
               changed_at_str =
                 if entry.changed_at == 0 do
                   "default"
@@ -1404,7 +1401,6 @@ defmodule FerricstoreServer.Health.Dashboard do
               <tr>
                 <td class="mono">#{escape(entry.prefix)}</td>
                 <td>#{entry.window_ms}</td>
-                <td class="#{durability_class}">#{escape(durability_str)}</td>
                 <td>#{changed_at_str}</td>
                 <td>#{escape(entry.changed_by)}</td>
               </tr>
@@ -1414,7 +1410,7 @@ defmodule FerricstoreServer.Health.Dashboard do
           """
           <table>
             <thead>
-              <tr><th>Prefix</th><th>Window (ms)</th><th>Durability</th><th>Changed At</th><th>Changed By</th></tr>
+              <tr><th>Prefix</th><th>Window (ms)</th><th>Changed At</th><th>Changed By</th></tr>
             </thead>
             <tbody>
               #{rows}

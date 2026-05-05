@@ -50,7 +50,6 @@ defmodule FerricStore.Instance do
           keydir_max_ram: non_neg_integer(),
           memory_limit: non_neg_integer(),
           keydir_binary_bytes: reference(),
-          durability_mode: atom(),
           hotness_table: atom() | reference(),
           config_table: atom() | reference(),
           connected_clients_fn: (-> non_neg_integer()),
@@ -92,7 +91,6 @@ defmodule FerricStore.Instance do
     :max_memory_bytes,
     :keydir_max_ram,
     :memory_limit,
-    :durability_mode,
     :hotness_table,
     :config_table,
     :keydir_binary_bytes,
@@ -338,7 +336,6 @@ defmodule FerricStore.Instance do
       keydir_max_ram: keydir_max_ram,
       memory_limit: memory_limit,
       keydir_binary_bytes: keydir_binary_bytes,
-      durability_mode: :all_quorum,
       hotness_table: hotness_table,
       config_table: config_table,
       connected_clients_fn: Keyword.get(opts, :connected_clients_fn, fn -> 0 end),
@@ -374,18 +371,6 @@ defmodule FerricStore.Instance do
     updated = struct!(ctx, callbacks)
     :persistent_term.put({FerricStore.Instance, name}, updated)
     updated
-  end
-
-  @spec update_durability_mode(atom(), atom()) :: t()
-  def update_durability_mode(name, :all_quorum) do
-    ctx = get(name)
-    updated = %{ctx | durability_mode: :all_quorum}
-    :persistent_term.put({FerricStore.Instance, name}, updated)
-    updated
-  end
-
-  def update_durability_mode(name, mode) when mode in [:all_async, :mixed] do
-    update_durability_mode(name, :all_quorum)
   end
 
   @doc """

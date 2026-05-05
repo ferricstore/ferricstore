@@ -11,7 +11,6 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
   setup do
     ctx = Ferricstore.Test.IsolatedInstance.checkout()
-    Ferricstore.NamespaceConfig.set(@ns_async, "durability", "quorum")
 
     on_exit(fn ->
       Ferricstore.NamespaceConfig.reset(@ns_async)

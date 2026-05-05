@@ -9,7 +9,6 @@ defmodule Ferricstore.AuditFixesLowTest do
   alias Ferricstore.GlobMatcher
   alias Ferricstore.Commands.Generic
 
-
   # ---------------------------------------------------------------------------
   # Helper: build a mock store map from a key-value map
   # ---------------------------------------------------------------------------
@@ -26,7 +25,9 @@ defmodule Ferricstore.AuditFixesLowTest do
       put: fn _key, _val, _exp -> :ok end,
       delete: fn _key -> :ok end,
       exists?: fn key -> Map.has_key?(data, key) end,
-      keys: fn -> Map.keys(data) |> Enum.reject(&Ferricstore.Store.CompoundKey.internal_key?/1) end,
+      keys: fn ->
+        Map.keys(data) |> Enum.reject(&Ferricstore.Store.CompoundKey.internal_key?/1)
+      end,
       flush: fn -> :ok end,
       dbsize: fn -> map_size(data) end,
       incr: fn _key, _delta -> {:ok, 1} end,
@@ -60,22 +61,20 @@ defmodule Ferricstore.AuditFixesLowTest do
       # Get should reflect the change
       assert {:ok, entry} = Ferricstore.NamespaceConfig.get(prefix)
       assert entry.window_ms == 42
-      assert entry.durability == :quorum
 
       # Cleanup
       Ferricstore.NamespaceConfig.reset(prefix)
     end
 
-    test "set durability keeps quorum with single lookup" do
+    test "removed durability field is rejected and preserves window" do
       prefix = "audit_dur_#{:rand.uniform(100_000)}"
 
-      # Set window_ms first, then durability
       assert :ok = Ferricstore.NamespaceConfig.set(prefix, "window_ms", "10")
-      assert :ok = Ferricstore.NamespaceConfig.set(prefix, "durability", "quorum")
+      assert {:error, msg} = Ferricstore.NamespaceConfig.set(prefix, "durability", "quorum")
+      assert msg =~ "unknown namespace config field 'durability'"
 
       assert {:ok, entry} = Ferricstore.NamespaceConfig.get(prefix)
       assert entry.window_ms == 10
-      assert entry.durability == :quorum
 
       # Cleanup
       Ferricstore.NamespaceConfig.reset(prefix)

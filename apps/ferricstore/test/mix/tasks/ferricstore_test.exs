@@ -127,7 +127,7 @@ defmodule Mix.Tasks.FerricstoreTest do
 
       assert output =~ "prefix: myns"
       assert output =~ "window_ms: 1"
-      assert output =~ "durability: quorum"
+      refute output =~ "durability:"
     end
 
     test "set updates a namespace config field" do
@@ -141,17 +141,17 @@ defmodule Mix.Tasks.FerricstoreTest do
       assert verify_output =~ "window_ms: 50"
     end
 
-    test "rejects async durability" do
+    test "rejects removed durability field" do
       output =
         capture_io(fn ->
           Mix.Tasks.Ferricstore.Config.run(["set", "fast_ns", "durability", "async"])
         end)
 
       assert output =~ "ERROR"
-      assert output =~ "async durability has been removed"
+      assert output =~ "unknown namespace config field 'durability'"
 
       verify = capture_io(fn -> Mix.Tasks.Ferricstore.Config.run(["get", "fast_ns"]) end)
-      assert verify =~ "durability: quorum"
+      refute verify =~ "durability:"
     end
 
     test "set with invalid field returns error" do

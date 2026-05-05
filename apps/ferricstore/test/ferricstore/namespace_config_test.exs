@@ -29,37 +29,32 @@ defmodule Ferricstore.NamespaceConfigTest do
       assert :ok = NamespaceConfig.set("rate", "window_ms", "10")
       {:ok, entry} = NamespaceConfig.get("rate")
       assert entry.window_ms == 10
-      assert entry.durability == :quorum
     end
 
-    test "rejects async durability for a prefix" do
+    test "rejects removed durability field for a prefix" do
       assert {:error, msg} = NamespaceConfig.set("ts", "durability", "async")
-      assert msg =~ "async durability has been removed"
+      assert msg =~ "unknown namespace config field 'durability'"
 
       {:ok, entry} = NamespaceConfig.get("ts")
-      assert entry.durability == :quorum
       assert entry.window_ms == 1
     end
 
-    test "sets durability to quorum for a prefix" do
-      assert :ok = NamespaceConfig.set("ts", "durability", "quorum")
-      {:ok, entry} = NamespaceConfig.get("ts")
-      assert entry.durability == :quorum
+    test "rejects old quorum durability setting" do
+      assert {:error, msg} = NamespaceConfig.set("ts", "durability", "quorum")
+      assert msg =~ "unknown namespace config field 'durability'"
     end
 
-    test "updates window_ms while preserving durability" do
+    test "updates window_ms without durability metadata" do
       NamespaceConfig.set("rate", "window_ms", "50")
       {:ok, entry} = NamespaceConfig.get("rate")
       assert entry.window_ms == 50
-      assert entry.durability == :quorum
     end
 
-    test "updates durability while preserving window_ms" do
+    test "rejects removed durability field while preserving window_ms" do
       NamespaceConfig.set("rate", "window_ms", "42")
-      NamespaceConfig.set("rate", "durability", "quorum")
+      assert {:error, _} = NamespaceConfig.set("rate", "durability", "quorum")
       {:ok, entry} = NamespaceConfig.get("rate")
       assert entry.window_ms == 42
-      assert entry.durability == :quorum
     end
 
     test "sets changed_at to a recent timestamp" do
@@ -90,10 +85,9 @@ defmodule Ferricstore.NamespaceConfigTest do
       assert msg =~ "positive integer"
     end
 
-    test "rejects invalid durability value" do
+    test "rejects durability field regardless of value" do
       assert {:error, msg} = NamespaceConfig.set("rate", "durability", "sync")
-      assert msg =~ "quorum"
-      refute msg =~ "or 'async'"
+      assert msg =~ "unknown namespace config field 'durability'"
     end
 
     test "rejects unknown field name" do
@@ -107,7 +101,6 @@ defmodule Ferricstore.NamespaceConfigTest do
       {:ok, entry} = NamespaceConfig.get("unknown_prefix")
       assert entry.prefix == "unknown_prefix"
       assert entry.window_ms == 1
-      assert entry.durability == :quorum
       assert entry.changed_at == 0
       assert entry.changed_by == ""
     end
@@ -127,7 +120,7 @@ defmodule Ferricstore.NamespaceConfigTest do
 
     test "returns all configured prefixes sorted alphabetically" do
       NamespaceConfig.set("zebra", "window_ms", "100")
-      NamespaceConfig.set("alpha", "durability", "quorum")
+      NamespaceConfig.set("alpha", "window_ms", "2")
       NamespaceConfig.set("middle", "window_ms", "50")
 
       entries = NamespaceConfig.get_all()
@@ -144,9 +137,7 @@ defmodule Ferricstore.NamespaceConfigTest do
       session = Enum.find(entries, &(&1.prefix == "session"))
 
       assert rate.window_ms == 10
-      assert rate.durability == :quorum
       assert session.window_ms == 1
-      assert session.durability == :quorum
     end
   end
 
@@ -156,7 +147,6 @@ defmodule Ferricstore.NamespaceConfigTest do
       assert :ok = NamespaceConfig.reset("rate")
       {:ok, entry} = NamespaceConfig.get("rate")
       assert entry.window_ms == 1
-      assert entry.durability == :quorum
       assert entry.changed_at == 0
     end
 
@@ -177,7 +167,7 @@ defmodule Ferricstore.NamespaceConfigTest do
   describe "NamespaceConfig.reset_all/0" do
     test "removes all overrides" do
       NamespaceConfig.set("rate", "window_ms", "10")
-      NamespaceConfig.set("session", "durability", "quorum")
+      NamespaceConfig.set("session", "window_ms", "5")
       assert :ok = NamespaceConfig.reset_all()
       assert NamespaceConfig.get_all() == []
     end
@@ -198,24 +188,9 @@ defmodule Ferricstore.NamespaceConfigTest do
     end
   end
 
-  describe "NamespaceConfig.durability_for/1" do
-    test "returns quorum for configured durability" do
-      NamespaceConfig.set("rate", "durability", "quorum")
-      assert NamespaceConfig.durability_for("rate") == :quorum
-    end
-
-    test "returns default for unconfigured prefix" do
-      assert NamespaceConfig.durability_for("unknown") == :quorum
-    end
-  end
-
-  describe "NamespaceConfig.default_window_ms/0 and default_durability/0" do
+  describe "NamespaceConfig.default_window_ms/0" do
     test "returns default window_ms" do
       assert NamespaceConfig.default_window_ms() == 1
-    end
-
-    test "returns default durability" do
-      assert NamespaceConfig.default_durability() == :quorum
     end
   end
 
@@ -238,7 +213,7 @@ defmodule Ferricstore.NamespaceConfigTest do
       assert entry.window_ms == 10
     end
 
-    test "SET prefix durability async via command handler is rejected" do
+    test "SET prefix durability via command handler is rejected as removed field" do
       result =
         Namespace.handle(
           "FERRICSTORE.CONFIG",
@@ -247,10 +222,10 @@ defmodule Ferricstore.NamespaceConfigTest do
         )
 
       assert {:error, msg} = result
-      assert msg =~ "async durability has been removed"
+      assert msg =~ "unknown namespace config field 'durability'"
 
       {:ok, entry} = NamespaceConfig.get("ts")
-      assert entry.durability == :quorum
+      assert entry.window_ms == 1
     end
 
     test "SET is case-insensitive on field name" do
@@ -322,8 +297,7 @@ defmodule Ferricstore.NamespaceConfigTest do
       assert "rate" in result
       assert "window_ms" in result
       assert "10" in result
-      assert "durability" in result
-      assert "quorum" in result
+      refute "durability" in result
     end
 
     test "GET unconfigured prefix returns defaults" do
@@ -334,8 +308,6 @@ defmodule Ferricstore.NamespaceConfigTest do
                "unknown",
                "window_ms",
                "1",
-               "durability",
-               "quorum",
                "changed_at",
                "0",
                "changed_by",
@@ -345,7 +317,7 @@ defmodule Ferricstore.NamespaceConfigTest do
 
     test "GET with no prefix returns all configured prefixes" do
       NamespaceConfig.set("rate", "window_ms", "10")
-      NamespaceConfig.set("session", "durability", "quorum")
+      NamespaceConfig.set("session", "window_ms", "5")
       result = Namespace.handle("FERRICSTORE.CONFIG", ["GET"], MockStore.make())
       assert is_list(result)
       # Should contain entries for both rate and session
@@ -369,7 +341,7 @@ defmodule Ferricstore.NamespaceConfigTest do
 
     test "RESET with no prefix resets all namespaces" do
       NamespaceConfig.set("rate", "window_ms", "10")
-      NamespaceConfig.set("session", "durability", "quorum")
+      NamespaceConfig.set("session", "window_ms", "5")
       result = Namespace.handle("FERRICSTORE.CONFIG", ["RESET"], MockStore.make())
       assert result == :ok
       assert NamespaceConfig.get_all() == []
@@ -442,7 +414,7 @@ defmodule Ferricstore.NamespaceConfigTest do
       assert result =~ "# Namespace_Config"
       assert result =~ "namespace_config_count:0"
       assert result =~ "default_window_ms:1"
-      assert result =~ "default_durability:quorum"
+      refute result =~ "default_durability"
     end
 
     test "INFO namespace_config includes configured prefixes" do
@@ -453,9 +425,8 @@ defmodule Ferricstore.NamespaceConfigTest do
       result = Server.handle("INFO", ["namespace_config"], store)
       assert result =~ "namespace_config_count:2"
       assert result =~ "ns_rate_window_ms:10"
-      assert result =~ "ns_rate_durability:quorum"
       assert result =~ "ns_session_window_ms:5"
-      assert result =~ "ns_session_durability:quorum"
+      refute result =~ "_durability"
     end
 
     test "INFO all includes namespace_config section" do
@@ -595,28 +566,28 @@ defmodule Ferricstore.NamespaceConfigTest do
                  store
                )
 
-      assert :ok =
+      assert {:error, msg} =
                Dispatcher.dispatch(
                  "FERRICSTORE.CONFIG",
                  ["set", "rate", "durability", "quorum"],
                  store
                )
 
+      assert msg =~ "unknown namespace config field 'durability'"
+
       # Verify via GET
       result = Dispatcher.dispatch("FERRICSTORE.CONFIG", ["get", "rate"], store)
       assert "10" in result
-      assert "quorum" in result
+      refute "durability" in result
 
       # Verify via convenience accessors
       assert NamespaceConfig.window_for("rate") == 10
-      assert NamespaceConfig.durability_for("rate") == :quorum
 
       # Reset
       assert :ok = Dispatcher.dispatch("FERRICSTORE.CONFIG", ["reset", "rate"], store)
 
       # Verify defaults restored
       assert NamespaceConfig.window_for("rate") == 1
-      assert NamespaceConfig.durability_for("rate") == :quorum
     end
 
     test "multiple prefixes can be configured independently" do
@@ -625,11 +596,8 @@ defmodule Ferricstore.NamespaceConfigTest do
       NamespaceConfig.set("ts", "window_ms", "25")
 
       assert NamespaceConfig.window_for("rate") == 10
-      assert NamespaceConfig.durability_for("rate") == :quorum
       assert NamespaceConfig.window_for("session") == 1
-      assert NamespaceConfig.durability_for("session") == :quorum
       assert NamespaceConfig.window_for("ts") == 25
-      assert NamespaceConfig.durability_for("ts") == :quorum
 
       entries = NamespaceConfig.get_all()
       assert length(entries) == 3

@@ -78,12 +78,11 @@ For each intent, read current state of involved keys. Compare value hashes:
 Lock shards in ascending shard index order. Two concurrent operations always
 try lower shard first — no circular wait.
 
-## CROSSSLOT Error (Async Mode)
+## CROSSSLOT Error
 
 ```
 CROSSSLOT Keys in request don't hash to the same slot. Use hash tags {tag}
-to colocate keys, or switch namespace to quorum durability:
-CONFIG SET namespace myns durability quorum
+to colocate keys.
 ```
 
 ## Affected Commands

@@ -406,7 +406,6 @@ defmodule FerricstoreServer.ShutdownTest do
       memory_limit: 1_073_741_824,
       keydir_binary_bytes: :atomics.new(n, signed: true),
       latch_refs: nil_tuple,
-      durability_mode: :quorum,
       hotness_table: :ets.new(:test_hotness, [:set, :public]),
       config_table: :ets.new(:test_config, [:set, :public]),
       connected_clients_fn: fn -> 0 end,

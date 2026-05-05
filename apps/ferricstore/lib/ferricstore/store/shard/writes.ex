@@ -158,9 +158,8 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_incr_raft(key, delta, from, state) do
-    # RMW: force quorum regardless of namespace durability. The state machine's
-    # serial apply/3 guarantees atomicity; routing through the async slot
-    # would make the caller see :ok without the actual computed value.
+    # RMW must return the state-machine result. The serial apply/3 guarantees
+    # atomicity and materializes the computed value.
     Ferricstore.Raft.Batcher.write_async_quorum(state.index, {:incr, key, delta}, from)
     {:noreply, %{state | write_version: state.write_version + 1}}
   end

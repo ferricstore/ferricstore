@@ -1281,15 +1281,8 @@ defmodule Ferricstore.Raft.Batcher do
 
   defp enqueue_write_under_capacity(command, from, state) do
     prefix = extract_prefix(command)
-    {{window_ms, ns_durability}, state} = lookup_ns_config(prefix, state)
-
-    # Linearizable primitives (CAS/LOCK/UNLOCK/EXTEND/RATELIMIT, prob structures)
-    # must take the quorum path even on async-configured namespaces — the caller
-    # needs the actual state machine result, not a premature :ok.
-    durability =
-      if Ferricstore.Store.Router.always_quorum?(command), do: :quorum, else: ns_durability
-
-    slot_key = {prefix, durability}
+    {window_ms, state} = lookup_ns_config(prefix, state)
+    slot_key = {prefix, :quorum}
 
     slot = Map.get(state.slots, slot_key, new_slot(window_ms))
 
@@ -1349,11 +1342,11 @@ defmodule Ferricstore.Raft.Batcher do
         batch = Enum.reverse(slot.cmds)
         froms = Enum.reverse(slot.froms)
 
-        {_prefix, durability} = slot_key
-        emit_slot_flush_telemetry(state, slot, durability, batch, froms)
+        {_prefix, write_path} = slot_key
+        emit_slot_flush_telemetry(state, slot, write_path, batch, froms)
 
         new_state =
-          case durability do
+          case write_path do
             :async_origin ->
               # Explicit internal local-origin helper. Wrap each command as
               # {:async, origin, inner} so state machine can origin-skip
@@ -1515,9 +1508,8 @@ defmodule Ferricstore.Raft.Batcher do
   defp normalize_pipeline_error({:error, _reason} = error), do: error
   defp normalize_pipeline_error(other), do: {:error, other}
 
-  # Enqueue a write that MUST go through quorum (RMW ops where the caller
-  # needs atomicity). Bypasses namespace-config durability lookup and uses
-  # the quorum slot regardless of how the namespace is configured.
+  # Enqueue a write that enters through a non-blocking call but must use the
+  # quorum slot like every other user-visible write.
   defp enqueue_write_forced_quorum(command, from, state) do
     if pending_full?(state) do
       reply_from(from, {:error, :overloaded})
@@ -1529,8 +1521,7 @@ defmodule Ferricstore.Raft.Batcher do
 
   defp enqueue_write_forced_quorum_under_capacity(command, from, state) do
     prefix = extract_prefix(command)
-    # Still need window_ms from config, but force durability to quorum.
-    {{window_ms, _durability}, state} = lookup_ns_config(prefix, state)
+    {window_ms, state} = lookup_ns_config(prefix, state)
     slot_key = {prefix, :quorum}
 
     slot = Map.get(state.slots, slot_key, new_slot(window_ms))
@@ -1596,7 +1587,7 @@ defmodule Ferricstore.Raft.Batcher do
 
   defp enqueue_async_submit_under_capacity(command, state, from \\ nil) do
     prefix = extract_prefix(command)
-    {{window_ms, _durability}, state} = lookup_ns_config(prefix, state)
+    {window_ms, state} = lookup_ns_config(prefix, state)
     # Dedicated internal slot: commands here will be wrapped as
     # {:async, origin, inner} during flush so the state machine can origin-skip
     # effects that were already applied locally. This is not namespace async
@@ -1725,15 +1716,13 @@ defmodule Ferricstore.Raft.Batcher do
   # Private: namespace config lookup
   # ---------------------------------------------------------------------------
 
-  @spec lookup_ns_config(binary(), %__MODULE__{}) ::
-          {{pos_integer(), :quorum | :async}, %__MODULE__{}}
+  @spec lookup_ns_config(binary(), %__MODULE__{}) :: {pos_integer(), %__MODULE__{}}
   defp lookup_ns_config(prefix, state) do
     case Map.get(state.ns_cache, prefix) do
       nil ->
         window = NamespaceConfig.window_for(prefix)
-        durability = NamespaceConfig.durability_for(prefix)
-        new_cache = Map.put(state.ns_cache, prefix, {window, durability})
-        {{window, durability}, %{state | ns_cache: new_cache}}
+        new_cache = Map.put(state.ns_cache, prefix, window)
+        {window, %{state | ns_cache: new_cache}}
 
       cached ->
         {cached, state}
@@ -1756,7 +1745,7 @@ defmodule Ferricstore.Raft.Batcher do
     }
   end
 
-  defp emit_slot_flush_telemetry(state, slot, durability, batch, froms) do
+  defp emit_slot_flush_telemetry(state, slot, write_path, batch, froms) do
     :telemetry.execute(
       [:ferricstore, :batcher, :slot_flush],
       %{
@@ -1764,7 +1753,7 @@ defmodule Ferricstore.Raft.Batcher do
         caller_count: length(froms),
         queue_wait_us: duration_us(Map.get(slot, :created_mono, System.monotonic_time()))
       },
-      %{shard_index: state.shard_index, durability: durability}
+      %{shard_index: state.shard_index, write_path: write_path}
     )
   end
 

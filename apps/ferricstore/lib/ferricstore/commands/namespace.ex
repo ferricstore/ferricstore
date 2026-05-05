@@ -2,8 +2,7 @@ defmodule Ferricstore.Commands.Namespace do
   @moduledoc """
   Handles the `FERRICSTORE.CONFIG` command for namespace-aware configuration.
 
-  Provides three subcommands for managing per-namespace (prefix) settings
-  such as commit window timing and durability mode:
+  Provides three subcommands for managing per-namespace commit window timing:
 
   ## Supported commands
 
@@ -14,12 +13,11 @@ defmodule Ferricstore.Commands.Namespace do
   ## Fields
 
     * `window_ms` -- commit window in milliseconds (positive integer)
-    * `durability` -- durability mode: `"quorum"`
+  Durability is not configurable; writes always use quorum.
 
   ## Examples
 
       FERRICSTORE.CONFIG SET rate window_ms 10
-      FERRICSTORE.CONFIG SET ts durability quorum
       FERRICSTORE.CONFIG GET rate
       FERRICSTORE.CONFIG GET
       FERRICSTORE.CONFIG RESET rate
@@ -130,7 +128,7 @@ defmodule Ferricstore.Commands.Namespace do
   # Private -- formatting
   # ---------------------------------------------------------------------------
 
-  defp format_entry(%{prefix: prefix, window_ms: window_ms, durability: durability} = entry) do
+  defp format_entry(%{prefix: prefix, window_ms: window_ms} = entry) do
     changed_at = Map.get(entry, :changed_at, 0)
     changed_by = Map.get(entry, :changed_by, "")
 
@@ -139,8 +137,6 @@ defmodule Ferricstore.Commands.Namespace do
       prefix,
       "window_ms",
       Integer.to_string(window_ms),
-      "durability",
-      Atom.to_string(durability),
       "changed_at",
       Integer.to_string(changed_at),
       "changed_by",

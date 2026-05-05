@@ -21,12 +21,11 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     :ok
   end
 
-  test "SET fast path ignores stale async durability mode and writes through quorum" do
+  test "SET fast path writes through quorum" do
     ctx = FerricStore.Instance.get(:default)
-    stale_ctx = %{ctx | durability_mode: :all_async}
     key = "#{@ns}:stale_async:#{System.unique_integer([:positive])}"
 
-    state = connection_state(stale_ctx)
+    state = connection_state(ctx)
     send_response_fn = capture_response_fn()
     handle_command_fn = flunking_handle_fn("SET pipeline fast path")
 
@@ -43,12 +42,11 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     assert Router.get(ctx, key) == "v1"
   end
 
-  test "mixed GET and SET fast path ignores stale async durability mode" do
+  test "mixed GET and SET fast path writes through quorum" do
     ctx = FerricStore.Instance.get(:default)
-    stale_ctx = %{ctx | durability_mode: :all_async}
     set_key = "#{@ns}:mixed_stale_async:#{System.unique_integer([:positive])}"
 
-    state = connection_state(stale_ctx)
+    state = connection_state(ctx)
     send_response_fn = capture_response_fn()
     handle_command_fn = flunking_handle_fn("mixed GET/SET pipeline fast path")
 

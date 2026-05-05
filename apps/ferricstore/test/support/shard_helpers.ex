@@ -200,12 +200,8 @@ defmodule Ferricstore.Test.ShardHelpers do
       Ferricstore.Store.DiskPressure.clear(ctx, i)
     end)
 
-    # Fully reset namespace config overrides. Tests that set a namespace
-    # to :async and on_exit it back to :quorum leave a lingering entry,
-    # which flips the :ferricstore_durability_mode persistent_term from
-    # :all_quorum to :mixed. :mixed mode takes a different (slower) code
-    # path in Router.durability_for_key, which can make subsequent tests
-    # flaky by altering relative timings.
+    # Fully reset namespace config overrides so per-prefix commit windows
+    # cannot leak across tests and alter batching timings.
     Ferricstore.NamespaceConfig.reset_all()
   end
 

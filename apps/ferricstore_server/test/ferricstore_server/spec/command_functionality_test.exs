@@ -46,7 +46,10 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
       exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
       keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
       flush: fn ->
-        Enum.each(Router.keys(FerricStore.Instance.get(:default)), fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
+        Enum.each(Router.keys(FerricStore.Instance.get(:default)), fn k ->
+          Router.delete(FerricStore.Instance.get(:default), k)
+        end)
+
         :ok
       end,
       dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,
@@ -59,31 +62,66 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
       setrange: fn k, o, v -> Router.setrange(FerricStore.Instance.get(:default), k, o, v) end,
       list_op: fn k, op -> Router.list_op(FerricStore.Instance.get(:default), k, op) end,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_scan, redis_key, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_count, redis_key, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard =
+          Router.shard_name(
+            FerricStore.Instance.get(:default),
+            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
+          )
+
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
     }
@@ -118,6 +156,7 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
 
       # After sweep, the key should not appear in KEYS.
       all_keys = Router.keys(FerricStore.Instance.get(:default))
+
       refute key in all_keys,
              "Expired key #{key} should not appear in keys after sweep"
     end
@@ -239,7 +278,7 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
   # 2.15.4  FERRICSTORE.CONFIG
   # ===========================================================================
 
-  describe "2.15.4 FERRICSTORE.CONFIG — CFG-009: invalid durability value via command" do
+  describe "2.15.4 FERRICSTORE.CONFIG — CFG-009: removed durability field via command" do
     setup do
       NamespaceConfig.reset_all()
       on_exit(fn -> NamespaceConfig.reset_all() end)
@@ -247,7 +286,7 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
     end
 
     @tag :spec_cfg_009
-    test "FERRICSTORE.CONFIG SET with invalid durability returns error" do
+    test "FERRICSTORE.CONFIG SET durability returns unknown field error" do
       result =
         Namespace.handle(
           "FERRICSTORE.CONFIG",
@@ -256,11 +295,11 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
         )
 
       assert {:error, msg} = result
-      assert msg =~ "quorum" or msg =~ "async" or msg =~ "invalid"
+      assert msg =~ "unknown namespace config field 'durability'"
     end
 
     @tag :spec_cfg_009
-    test "FERRICSTORE.CONFIG SET durability 'sync' returns error (only quorum|async)" do
+    test "FERRICSTORE.CONFIG SET durability 'sync' returns unknown field error" do
       result =
         Namespace.handle(
           "FERRICSTORE.CONFIG",
@@ -268,7 +307,8 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
           MockStore.make()
         )
 
-      assert {:error, _msg} = result
+      assert {:error, msg} = result
+      assert msg =~ "unknown namespace config field 'durability'"
     end
   end
 
@@ -340,8 +380,7 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
       assert "newprefix" in result
       assert "window_ms" in result
       assert "1" in result
-      assert "durability" in result
-      assert "quorum" in result
+      refute "durability" in result
     end
   end
 
@@ -356,7 +395,7 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
     test "FERRICSTORE.CONFIG GET after SET returns new values" do
       store = MockStore.make()
 
-      # Set window_ms and durability for the "sensor" prefix.
+      # Set window_ms for the "sensor" prefix.
       assert :ok =
                Namespace.handle(
                  "FERRICSTORE.CONFIG",
@@ -371,13 +410,13 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
                  store
                )
 
-      assert msg =~ "async durability has been removed"
+      assert msg =~ "unknown namespace config field 'durability'"
 
       # GET should reflect the supported change only.
       result = Namespace.handle("FERRICSTORE.CONFIG", ["GET", "sensor"], store)
       assert is_list(result)
       assert "50" in result
-      assert "quorum" in result
+      refute "durability" in result
     end
   end
 
@@ -436,7 +475,7 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
       # Verify defaults are restored.
       result_after = Namespace.handle("FERRICSTORE.CONFIG", ["GET", "sensor"], store)
       assert "1" in result_after
-      assert "quorum" in result_after
+      refute "durability" in result_after
     end
   end
 end

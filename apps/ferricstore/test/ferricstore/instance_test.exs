@@ -401,8 +401,8 @@ defmodule Ferricstore.InstanceTest do
       assert {:ok, nil} = FerricStore.Impl.get(ctx, "impl_flush")
     end
 
-    test "flushdb surfaces key deletion failures before probabilistic cleanup" do
-      ctx = %{FerricStore.Instance.get(:default) | durability_mode: :all_async}
+    test "flushdb uses quorum deletes after async pressure path removal" do
+      ctx = FerricStore.Instance.get(:default)
       key = "impl_flush_pressure_#{System.unique_integer([:positive])}"
       shard_index = Ferricstore.Store.Router.shard_for(ctx, key)
 
@@ -410,8 +410,8 @@ defmodule Ferricstore.InstanceTest do
       Ferricstore.Store.DiskPressure.set(ctx, shard_index)
 
       try do
-        assert {:error, "ERR disk pressure on shard " <> _} = FerricStore.Impl.flushdb(ctx)
-        assert {:ok, "value"} = FerricStore.Impl.get(ctx, key)
+        assert :ok = FerricStore.Impl.flushdb(ctx)
+        assert {:ok, nil} = FerricStore.Impl.get(ctx, key)
       after
         Ferricstore.Store.DiskPressure.clear(ctx, shard_index)
         Ferricstore.Store.Router.delete(ctx, key)

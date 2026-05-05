@@ -9,12 +9,11 @@ defmodule Ferricstore.FetchOrCompute do
   ## Cluster-wide stampede protection
 
   Stampede protection uses a Raft-replicated distributed lock keyed on
-  `"__foc_lock__:" <> key`. Because `Router.lock/4` is forced through the
-  quorum path (see `Router.always_quorum?/1`), exactly one caller across the
-  whole cluster wins the lock and receives `{:compute, hint}`. All other
-  callers — local or remote — fall into a poll-wait loop on `Router.get/2`
-  until the computer publishes the value (also Raft-replicated) or the
-  compute_timeout expires.
+  `"__foc_lock__:" <> key`. Locks use the quorum write path, so exactly one
+  caller across the whole cluster wins the lock and receives
+  `{:compute, hint}`. All other callers — local or remote — fall into a
+  poll-wait loop on `Router.get/2` until the computer publishes the value
+  (also Raft-replicated) or the compute_timeout expires.
 
   ## Local fast-path waiter coordination
 

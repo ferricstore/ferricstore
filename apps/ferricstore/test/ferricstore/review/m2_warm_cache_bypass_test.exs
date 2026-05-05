@@ -18,15 +18,6 @@ defmodule Ferricstore.Review.M2WarmCacheBypassTest do
 
   setup do
     ShardHelpers.flush_all_shards()
-
-    # Use async durability so Router.put writes directly via NIF (not Raft).
-    original_mode = :persistent_term.get(:ferricstore_durability_mode, :all_quorum)
-    :persistent_term.put(:ferricstore_durability_mode, :all_async)
-
-    on_exit(fn ->
-      :persistent_term.put(:ferricstore_durability_mode, original_mode)
-    end)
-
     :ok
   end
 

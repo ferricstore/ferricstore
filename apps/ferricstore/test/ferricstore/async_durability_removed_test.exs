@@ -16,18 +16,18 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
     send(pid, {:quorum_submit, metadata})
   end
 
-  test "namespace config rejects async durability" do
+  test "namespace config no longer accepts any durability field" do
     assert {:error, msg} = NamespaceConfig.set("fast", "durability", "async")
-    assert msg =~ "durability"
-    assert msg =~ "quorum"
-    refute msg =~ "or 'async'"
+    assert msg =~ "unknown namespace config field"
 
     assert {:ok, entry} = NamespaceConfig.get("fast")
-    assert entry.durability == :quorum
-    assert NamespaceConfig.durability_for("fast") == :quorum
+    refute Map.has_key?(entry, :durability)
+
+    assert {:error, msg} = NamespaceConfig.set("fast", "durability", "quorum")
+    assert msg =~ "unknown namespace config field"
   end
 
-  test "config command rejects async durability" do
+  test "config command treats durability as removed field" do
     assert {:error, msg} =
              Namespace.handle(
                "FERRICSTORE.CONFIG",
@@ -35,40 +35,26 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
                FerricStore.Instance.get(:default)
              )
 
-    assert msg =~ "durability"
+    assert msg =~ "unknown namespace config field"
     assert {:ok, entry} = NamespaceConfig.get("fast")
-    assert entry.durability == :quorum
+    refute Map.has_key?(entry, :durability)
   end
 
-  test "router treats even stale async durability modes as quorum" do
+  test "instance context has no durability mode field" do
     ctx = FerricStore.Instance.get(:default)
-
-    for mode <- [:all_quorum, :all_async, :mixed] do
-      assert :quorum ==
-               Router.durability_for_key_public(%{ctx | durability_mode: mode}, "fast:key")
-    end
+    refute Map.has_key?(ctx, :durability_mode)
   end
 
-  test "instance durability mode cannot be switched back to async" do
-    assert %{durability_mode: :all_quorum} =
-             FerricStore.Instance.update_durability_mode(:default, :all_async)
-
-    assert %{durability_mode: :all_quorum} = FerricStore.Instance.get(:default)
-
-    assert %{durability_mode: :all_quorum} =
-             FerricStore.Instance.update_durability_mode(:default, :mixed)
-
-    assert %{durability_mode: :all_quorum} = FerricStore.Instance.get(:default)
+  test "router no longer exposes per-key durability lookup" do
+    refute function_exported?(Router, :durability_for_key_public, 2)
   end
 
-  test "debug command cannot switch the default instance to async durability" do
+  test "debug command cannot set durability mode" do
     assert {:error, msg} = Server.handle("DEBUG", ["SET-DURABILITY", "async"], nil)
-    assert msg =~ "async durability"
+    assert msg =~ "removed"
 
-    assert {:simple, "OK durability_mode=all_quorum"} =
-             Server.handle("DEBUG", ["SET-DURABILITY", "quorum"], nil)
-
-    assert FerricStore.Instance.get(:default).durability_mode == :all_quorum
+    assert {:error, msg} = Server.handle("DEBUG", ["SET-DURABILITY", "quorum"], nil)
+    assert msg =~ "removed"
   end
 
   test "legacy batch_async_put API submits through quorum path" do
@@ -84,11 +70,39 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
 
     on_exit(fn -> :telemetry.detach(id) end)
 
-    ctx = %{FerricStore.Instance.get(:default) | durability_mode: :all_async}
+    ctx = FerricStore.Instance.get(:default)
     key = "async_removed_batch:#{System.unique_integer([:positive])}"
 
     assert :ok == Router.batch_async_put(ctx, [{key, "value"}])
     assert_receive {:quorum_submit, %{status: :ok}}, 1_000
     assert "value" == Router.get(FerricStore.Instance.get(:default), key)
+  end
+
+  test "production code has no durability mode plumbing" do
+    root = Path.expand("../../lib", __DIR__)
+
+    offenders =
+      root
+      |> Path.join("**/*.ex")
+      |> Path.wildcard()
+      |> Enum.flat_map(fn path ->
+        source = File.read!(path)
+
+        for token <- [
+              "durability_mode",
+              "durability_for",
+              "default_durability",
+              "durability_weakened",
+              "namespace_durability",
+              ":durability",
+              ":ferricstore_durability_mode",
+              ":ferricstore_has_async_ns"
+            ],
+            String.contains?(source, token) do
+          {Path.relative_to(path, root), token}
+        end
+      end)
+
+    assert offenders == []
   end
 end

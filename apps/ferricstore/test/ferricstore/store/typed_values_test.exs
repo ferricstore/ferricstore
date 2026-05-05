@@ -90,7 +90,6 @@ defmodule Ferricstore.Store.TypedValuesTest do
 
       on_exit(fn -> NamespaceConfig.reset_all() end)
 
-      assert :ok = NamespaceConfig.set(ns, "durability", "quorum")
       assert :ok = Router.put(FerricStore.Instance.get(:default), key, "10.5abc", 0)
 
       assert {:error, "ERR value is not a valid float"} =

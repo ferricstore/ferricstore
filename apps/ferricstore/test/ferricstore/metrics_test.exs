@@ -189,7 +189,7 @@ defmodule Ferricstore.MetricsTest do
       :telemetry.execute(
         [:ferricstore, :batcher, :slot_flush],
         %{batch_size: 3, caller_count: 2, queue_wait_us: 17},
-        %{shard_index: 2, durability: :quorum}
+        %{shard_index: 2, write_path: :quorum}
       )
 
       :telemetry.execute(
@@ -228,12 +228,12 @@ defmodule Ferricstore.MetricsTest do
 
       assert String.contains?(
                text,
-               ~s(ferricstore_quorum_slot_flush_total{shard_index="2",durability="quorum"} 1)
+               ~s(ferricstore_quorum_slot_flush_total{shard_index="2",write_path="quorum"} 1)
              )
 
       assert String.contains?(
                text,
-               ~s(ferricstore_quorum_slot_flush_queue_wait_us_total{shard_index="2",durability="quorum"} 17)
+               ~s(ferricstore_quorum_slot_flush_queue_wait_us_total{shard_index="2",write_path="quorum"} 17)
              )
 
       assert String.contains?(

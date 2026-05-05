@@ -54,32 +54,30 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert "custom" == Router.get(ctx, key)
   end
 
-  test "custom async compound put does not use the default Raft batcher", %{ctx: ctx} do
+  test "custom compound put does not use the default Raft batcher", %{ctx: ctx} do
     key = "router:instance:async-compound:#{System.unique_integer([:positive])}"
     field_key = CompoundKey.hash_field(key, "field")
     custom_idx = Router.shard_for(ctx, key)
-    async_ctx = %{ctx | durability_mode: :all_async}
 
     on_exit(fn -> Batcher.reset_pending(custom_idx) end)
     fill_default_async_pending(custom_idx, field_key)
 
-    assert :ok = Router.compound_put(async_ctx, key, field_key, "custom", 0)
-    assert "custom" == Router.compound_get(async_ctx, key, field_key)
+    assert :ok = Router.compound_put(ctx, key, field_key, "custom", 0)
+    assert "custom" == Router.compound_get(ctx, key, field_key)
   end
 
-  test "custom async compound delete does not use the default Raft batcher", %{ctx: ctx} do
+  test "custom compound delete does not use the default Raft batcher", %{ctx: ctx} do
     key = "router:instance:async-compound-del:#{System.unique_integer([:positive])}"
     field_key = CompoundKey.hash_field(key, "field")
     custom_idx = Router.shard_for(ctx, key)
-    async_ctx = %{ctx | durability_mode: :all_async}
 
     assert :ok = Router.compound_put(ctx, key, field_key, "before", 0)
 
     on_exit(fn -> Batcher.reset_pending(custom_idx) end)
     fill_default_async_pending(custom_idx, field_key)
 
-    assert :ok = Router.compound_delete(async_ctx, key, field_key)
-    assert nil == Router.compound_get(async_ctx, key, field_key)
+    assert :ok = Router.compound_delete(ctx, key, field_key)
+    assert nil == Router.compound_get(ctx, key, field_key)
   end
 
   test "custom write version survives shard process restart", %{ctx: ctx} do
@@ -108,7 +106,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert Router.get_version(ctx, key) > version_before
   end
 
-  test "promoted async routing uses stamped command time", %{ctx: ctx} do
+  test "promoted routing uses stamped command time", %{ctx: ctx} do
     key = "router:instance:promoted-time:#{System.unique_integer([:positive])}"
     idx = Router.shard_for(ctx, key)
     marker = Promotion.marker_key(key)
@@ -120,7 +118,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     :ets.insert(elem(ctx.keydir_refs, idx), {marker, "hash", marker_expire_at, 1, 0, 0, 0})
     :atomics.put(ctx.disk_pressure, idx + 1, 1)
 
-    routed_ctx = %{ctx | name: :default, durability_mode: :all_async}
+    routed_ctx = %{ctx | name: :default}
     field_key = CompoundKey.hash_field(key, "field")
 
     assert :ok =

@@ -60,8 +60,8 @@ defmodule Ferricstore.CrossShardOp do
       shard based on key. Must return the command result.
     * `opts` -- keyword options:
       * `:intent` -- intent map for crash recovery (required for cross-shard)
-      * `:namespace` -- namespace prefix for durability lookup (optional,
-        defaults to extracting from first key)
+      * `:namespace` -- namespace prefix (optional, defaults to extracting
+        from first key)
 
   ## Returns
 

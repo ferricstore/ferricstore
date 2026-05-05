@@ -132,40 +132,29 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       :ok = NamespaceConfig.set("sensor", "window_ms", "50")
 
       # Verify directly in ETS
-      assert [{
-        "sensor",
-        50,
-        :quorum,
-        _changed_at,
-        _changed_by
-      }] = :ets.lookup(:ferricstore_ns_config, "sensor")
+      assert [{"sensor", 50, _changed_at, _changed_by}] =
+               :ets.lookup(:ferricstore_ns_config, "sensor")
     end
 
-    test "CONFIG SET rejects removed async durability" do
+    test "CONFIG SET rejects removed durability field" do
       assert {:error, msg} = NamespaceConfig.set("sensor", "durability", "async")
-      assert msg =~ "async durability has been removed"
+      assert msg =~ "unknown namespace config field 'durability'"
 
       assert [] = :ets.lookup(:ferricstore_ns_config, "sensor")
     end
 
-    test "CONFIG SET updates both fields independently" do
+    test "CONFIG SET updates window without durability metadata" do
       :ok = NamespaceConfig.set("sensor", "window_ms", "50")
-      :ok = NamespaceConfig.set("sensor", "durability", "quorum")
 
-      [{prefix, window_ms, durability, _at, _by}] =
-        :ets.lookup(:ferricstore_ns_config, "sensor")
+      [{prefix, window_ms, _at, _by}] = :ets.lookup(:ferricstore_ns_config, "sensor")
 
       assert prefix == "sensor"
       assert window_ms == 50
-      assert durability == :quorum
     end
 
-    test "CONFIG SET is immediately visible to window_for/1 and durability_for/1" do
+    test "CONFIG SET is immediately visible to window_for/1" do
       :ok = NamespaceConfig.set("sensor", "window_ms", "50")
       assert 50 == NamespaceConfig.window_for("sensor")
-
-      :ok = NamespaceConfig.set("sensor", "durability", "quorum")
-      assert :quorum == NamespaceConfig.durability_for("sensor")
     end
 
     test "CONFIG SET for multiple namespaces stores each independently" do
@@ -178,21 +167,20 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       assert 10 == NamespaceConfig.window_for("rate")
 
       # Each entry exists independently in ETS
-      assert [{_p1, 50, _, _, _}] = :ets.lookup(:ferricstore_ns_config, "sensor")
-      assert [{_p2, 1, _, _, _}] = :ets.lookup(:ferricstore_ns_config, "session")
-      assert [{_p3, 10, _, _, _}] = :ets.lookup(:ferricstore_ns_config, "rate")
+      assert [{_p1, 50, _, _}] = :ets.lookup(:ferricstore_ns_config, "sensor")
+      assert [{_p2, 1, _, _}] = :ets.lookup(:ferricstore_ns_config, "session")
+      assert [{_p3, 10, _, _}] = :ets.lookup(:ferricstore_ns_config, "rate")
     end
 
     test "CONFIG RESET removes entry from ETS, falls back to defaults" do
       :ok = NamespaceConfig.set("sensor", "window_ms", "50")
-      assert [{_, 50, _, _, _}] = :ets.lookup(:ferricstore_ns_config, "sensor")
+      assert [{_, 50, _, _}] = :ets.lookup(:ferricstore_ns_config, "sensor")
 
       :ok = NamespaceConfig.reset("sensor")
       assert [] = :ets.lookup(:ferricstore_ns_config, "sensor")
 
       # Falls back to default
       assert 1 == NamespaceConfig.window_for("sensor")
-      assert :quorum == NamespaceConfig.durability_for("sensor")
     end
   end
 
@@ -331,11 +319,12 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       # fast (self-quorum), so total time for sequential writes should be
       # well under 5 seconds.
       assert elapsed < 5_000,
-        "Expected narrow window writes to complete quickly, took #{elapsed}ms"
+             "Expected narrow window writes to complete quickly, took #{elapsed}ms"
 
       # Verify all keys are readable
       for key <- keys do
-        assert Router.get(FerricStore.Instance.get(:default), key) != nil, "Key #{key} should be readable after write"
+        assert Router.get(FerricStore.Instance.get(:default), key) != nil,
+               "Key #{key} should be readable after write"
       end
     end
 
@@ -352,7 +341,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       # time: window_ms (1) + ra commit time (fast on single node).
       # Allow up to 500ms for slow CI environments.
       assert latency < 500,
-        "Expected single write latency < 500ms with 1ms window, got #{latency}ms"
+             "Expected single write latency < 500ms with 1ms window, got #{latency}ms"
 
       assert "latency_check" == Router.get(FerricStore.Instance.get(:default), key)
     end
@@ -379,7 +368,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       num_writes = 20
 
       keys =
-        for _ <- 1..num_writes * 3 do
+        for _ <- 1..(num_writes * 3) do
           key_on_shard("sensor", shard_idx)
         end
         |> Enum.uniq()
@@ -407,8 +396,8 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       # (~50ms) plus ra commit overhead, not 20 * 50ms.
       # Allow generous headroom for CI: total should be under 2 seconds.
       assert elapsed < 2_000,
-        "Expected batched writes to complete in roughly one window period, " <>
-          "took #{elapsed}ms for #{num_writes} writes (unbatched would be ~#{num_writes * 50}ms)"
+             "Expected batched writes to complete in roughly one window period, " <>
+               "took #{elapsed}ms for #{num_writes} writes (unbatched would be ~#{num_writes * 50}ms)"
 
       # All keys readable
       for key <- keys do
@@ -456,8 +445,8 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       # The spread should be small (same batch commit); allow up to 200ms
       # for scheduling jitter on loaded CI.
       assert spread_ms < 200,
-        "Expected concurrent write reply times to be close (same batch), " <>
-          "spread was #{Float.round(spread_ms, 1)}ms"
+             "Expected concurrent write reply times to be close (same batch), " <>
+               "spread was #{Float.round(spread_ms, 1)}ms"
     end
   end
 
@@ -521,7 +510,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       # On a loaded CI, allow generous tolerance. The key invariant is
       # that session is not delayed to the sensor's 50ms window.
       assert session_latency_ms < 500,
-        "Expected session (1ms window) to complete quickly, took #{Float.round(session_latency_ms, 1)}ms"
+             "Expected session (1ms window) to complete quickly, took #{Float.round(session_latency_ms, 1)}ms"
 
       # Verify both values are readable
       assert "fast" == Router.get(FerricStore.Instance.get(:default), session_key)
@@ -566,8 +555,8 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       # Even sequential, 5 writes with 1ms window should complete in well
       # under 1 second.
       assert fast_elapsed < 2_000,
-        "Expected fast_ns (1ms window) writes to not be blocked by slow_ns (100ms), " <>
-          "took #{fast_elapsed}ms"
+             "Expected fast_ns (1ms window) writes to not be blocked by slow_ns (100ms), " <>
+               "took #{fast_elapsed}ms"
 
       # Wait for slow write
       slow_result = Task.await(slow_task, 10_000)
@@ -636,7 +625,6 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           active_file_id: ctx.active_file_id,
           active_file_path: ctx.active_file_path,
           ets: ctx.keydir,
-
           release_cursor_interval: interval
         })
 
@@ -647,6 +635,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       state_before =
         Enum.reduce(1..(interval - 1), state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
+
           {new_state, {:applied_at, _, :ok}, effects} =
             StateMachine.apply(meta, {:put, "sn001_#{i}", "v#{i}", 0}, acc)
 
@@ -681,7 +670,6 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           active_file_id: ctx.active_file_id,
           active_file_path: ctx.active_file_path,
           ets: ctx.keydir,
-
           release_cursor_interval: interval
         })
 
@@ -692,10 +680,11 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
           case StateMachine.apply(meta, {:put, "sn001m_#{i}", "v#{i}", 0}, acc) do
             {new_state, {:applied_at, _, :ok}, effects} ->
-              cursor_idx = Enum.find_value(effects, fn
-                {:release_cursor, idx, _snap} -> idx
-                _ -> nil
-              end)
+              cursor_idx =
+                Enum.find_value(effects, fn
+                  {:release_cursor, idx, _snap} -> idx
+                  _ -> nil
+                end)
 
               if cursor_idx, do: {new_state, cursors ++ [cursor_idx]}, else: {new_state, cursors}
           end
@@ -714,7 +703,6 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           active_file_id: ctx.active_file_id,
           active_file_path: ctx.active_file_path,
           ets: ctx.keydir,
-
           release_cursor_interval: interval
         })
 
@@ -745,7 +733,6 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           active_file_id: ctx.active_file_id,
           active_file_path: ctx.active_file_path,
           ets: ctx.keydir,
-
           release_cursor_interval: interval
         })
 
@@ -753,7 +740,10 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       state_before =
         Enum.reduce(1..3, state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
-          {new_state, {:applied_at, _, :ok}, _effects} = StateMachine.apply(meta, {:put, "sn_batch_#{i}", "v#{i}", 0}, acc)
+
+          {new_state, {:applied_at, _, :ok}, _effects} =
+            StateMachine.apply(meta, {:put, "sn_batch_#{i}", "v#{i}", 0}, acc)
+
           new_state
         end)
 
