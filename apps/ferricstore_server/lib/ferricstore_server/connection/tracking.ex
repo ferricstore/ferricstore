@@ -53,6 +53,9 @@ defmodule FerricstoreServer.Connection.Tracking do
     PFADD
     XDEL XTRIM)
 
+  @nil_result_noop_cmds ~w(GETDEL LPOP RPOP SPOP)
+  @empty_list_result_noop_cmds ~w(LPOP RPOP SPOP ZPOPMIN ZPOPMAX)
+
   # Maps command names to their keyspace notification event names.
   # Only fires on successful results (not errors).
   @keyspace_events %{
@@ -114,6 +117,8 @@ defmodule FerricstoreServer.Connection.Tracking do
   @doc false
   @spec maybe_notify_keyspace(binary(), [binary()], term()) :: :ok
   def maybe_notify_keyspace(cmd, _args, 0) when cmd in @zero_result_noop_cmds, do: :ok
+  def maybe_notify_keyspace(cmd, _args, nil) when cmd in @nil_result_noop_cmds, do: :ok
+  def maybe_notify_keyspace(cmd, _args, []) when cmd in @empty_list_result_noop_cmds, do: :ok
   def maybe_notify_keyspace("GETEX", [_key], _result), do: :ok
   def maybe_notify_keyspace("GETEX", _args, nil), do: :ok
 
@@ -281,6 +286,11 @@ defmodule FerricstoreServer.Connection.Tracking do
   @spec maybe_notify_tracking(binary(), [binary()], term(), map()) :: :ok
   def maybe_notify_tracking(_cmd, _args, {:error, _}, _state), do: :ok
   def maybe_notify_tracking(cmd, _args, 0, _state) when cmd in @zero_result_noop_cmds, do: :ok
+  def maybe_notify_tracking(cmd, _args, nil, _state) when cmd in @nil_result_noop_cmds, do: :ok
+
+  def maybe_notify_tracking(cmd, _args, [], _state) when cmd in @empty_list_result_noop_cmds,
+    do: :ok
+
   def maybe_notify_tracking("GETEX", [_key], _result, _state), do: :ok
   def maybe_notify_tracking("GETEX", _args, nil, _state), do: :ok
 

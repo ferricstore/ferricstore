@@ -213,6 +213,49 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert :ets.lookup(:ferricstore_tracking, key) == []
   end
 
+  test "nil-result removal commands do not invalidate tracked keys" do
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+
+    commands = [
+      {"GETDEL", ["tracking:nil_noop:getdel"], "tracking:nil_noop:getdel"},
+      {"LPOP", ["tracking:nil_noop:lpop"], "tracking:nil_noop:lpop"},
+      {"RPOP", ["tracking:nil_noop:rpop"], "tracking:nil_noop:rpop"},
+      {"SPOP", ["tracking:nil_noop:spop"], "tracking:nil_noop:spop"}
+    ]
+
+    Enum.each(commands, fn {_cmd, _args, key} ->
+      ClientTracking.track_key(self(), key, tracking)
+    end)
+
+    Enum.each(commands, fn {cmd, args, key} ->
+      Tracking.maybe_notify_tracking(cmd, args, nil, %{tracking: tracking})
+      refute_received {:tracking_invalidation, _, _}
+      assert :ets.lookup(:ferricstore_tracking, key) == [{key, self()}]
+    end)
+  end
+
+  test "empty-result pop commands do not invalidate tracked keys" do
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+
+    commands = [
+      {"LPOP", ["tracking:empty_noop:lpop", "10"], "tracking:empty_noop:lpop"},
+      {"RPOP", ["tracking:empty_noop:rpop", "10"], "tracking:empty_noop:rpop"},
+      {"SPOP", ["tracking:empty_noop:spop", "10"], "tracking:empty_noop:spop"},
+      {"ZPOPMIN", ["tracking:empty_noop:zpopmin"], "tracking:empty_noop:zpopmin"},
+      {"ZPOPMAX", ["tracking:empty_noop:zpopmax"], "tracking:empty_noop:zpopmax"}
+    ]
+
+    Enum.each(commands, fn {_cmd, _args, key} ->
+      ClientTracking.track_key(self(), key, tracking)
+    end)
+
+    Enum.each(commands, fn {cmd, args, key} ->
+      Tracking.maybe_notify_tracking(cmd, args, [], %{tracking: tracking})
+      refute_received {:tracking_invalidation, _, _}
+      assert :ets.lookup(:ferricstore_tracking, key) == [{key, self()}]
+    end)
+  end
+
   test "zero-result no-op writes do not invalidate tracked keys" do
     {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
 
@@ -347,6 +390,37 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     Tracking.maybe_notify_keyspace("GETEX", [key, "EX", "10"], "value")
     assert_received {:pubsub_message, "__keyspace@0__:" <> ^key, "getex"}
     assert_received {:pubsub_message, "__keyevent@0__:getex", ^key}
+  end
+
+  test "nil-result removal commands do not fire keyspace notifications" do
+    Config.set("notify-keyspace-events", "KEA")
+
+    commands = [
+      {"GETDEL", ["tracking:keyspace:nil_noop:getdel"]},
+      {"LPOP", ["tracking:keyspace:nil_noop:lpop"]},
+      {"RPOP", ["tracking:keyspace:nil_noop:rpop"]},
+      {"SPOP", ["tracking:keyspace:nil_noop:spop"]}
+    ]
+
+    Enum.each(commands, fn {cmd, args} ->
+      Tracking.maybe_notify_keyspace(cmd, args, nil)
+      refute_received {:pubsub_message, _, _}
+    end)
+  end
+
+  test "empty-result pop commands do not fire keyspace notifications" do
+    Config.set("notify-keyspace-events", "KEA")
+
+    commands = [
+      {"LPOP", ["tracking:keyspace:empty_noop:lpop", "10"]},
+      {"RPOP", ["tracking:keyspace:empty_noop:rpop", "10"]},
+      {"SPOP", ["tracking:keyspace:empty_noop:spop", "10"]}
+    ]
+
+    Enum.each(commands, fn {cmd, args} ->
+      Tracking.maybe_notify_keyspace(cmd, args, [])
+      refute_received {:pubsub_message, _, _}
+    end)
   end
 
   test "zero-result no-op writes do not fire keyspace notifications" do
