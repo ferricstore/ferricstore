@@ -20,6 +20,8 @@ defmodule FerricstoreServer.Connection.StoreTest do
     store = Store.build_store(ctx, nil)
 
     assert is_function(store.batch_get, 1)
+    assert is_function(store.value_size, 1)
+    assert is_function(store.object_lfu, 1)
     assert is_function(store.compound_batch_get, 2)
     assert is_function(store.compound_batch_get_meta, 2)
   end
@@ -33,6 +35,24 @@ defmodule FerricstoreServer.Connection.StoreTest do
     assert :ok = Router.put(ctx, "a", "outside-a", 0)
 
     assert store.batch_get.(["a", "missing"]) == ["sandbox-a", nil]
+  end
+
+  test "sandbox connection store namespaces metadata helpers without reading values" do
+    ctx = FerricStore.Instance.get(:default)
+    ns = "sandbox_meta_#{System.unique_integer([:positive])}:"
+
+    store =
+      with_fake_raw_store(ctx, fn _calls ->
+        Store.build_store(ctx, ns)
+      end)
+
+    assert 123 = store.value_size.("large")
+    assert_receive {:raw_call, :value_size, [^ns <> "large"]}
+
+    assert 7 = store.object_lfu.("large")
+    assert_receive {:raw_call, :object_lfu, [^ns <> "large"]}
+
+    refute_receive {:raw_call, :get, _}
   end
 
   test "sandbox connection store namespaces key-first mutation helpers" do
@@ -132,6 +152,14 @@ defmodule FerricstoreServer.Connection.StoreTest do
       batch_get: fn keys ->
         send(calls, {:raw_call, :batch_get, [keys]})
         []
+      end,
+      value_size: fn key ->
+        send(calls, {:raw_call, :value_size, [key]})
+        123
+      end,
+      object_lfu: fn key ->
+        send(calls, {:raw_call, :object_lfu, [key]})
+        7
       end,
       put: fn key, value, exp ->
         send(calls, {:raw_call, :put, [key, value, exp]})
