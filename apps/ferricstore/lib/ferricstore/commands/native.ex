@@ -67,7 +67,7 @@ defmodule Ferricstore.Commands.Native do
   def handle("RATELIMIT.ADD", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'ratelimit.add' command"}
 
-  def handle("KEY_INFO", [key], _store), do: do_key_info(key)
+  def handle("KEY_INFO", [key], store), do: do_key_info(key, store)
 
   def handle("KEY_INFO", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'key_info' command"}
@@ -128,7 +128,7 @@ defmodule Ferricstore.Commands.Native do
     do: Ops.ratelimit_add(store, key, window_ms, max, count)
 
   def handle_ast({:ferricstore_key_info, {:error, _} = err}, _store), do: err
-  def handle_ast({:ferricstore_key_info, key}, _store), do: do_key_info(key)
+  def handle_ast({:ferricstore_key_info, key}, store), do: do_key_info(key, store)
 
   def handle_ast({:fetch_or_compute, _key, {:error, _} = err}, _store), do: err
 
@@ -162,27 +162,13 @@ defmodule Ferricstore.Commands.Native do
     end
   end
 
-  defp do_key_info(key) do
-    ctx = FerricStore.Instance.get(:default)
+  defp do_key_info(key, store) do
+    ctx = key_info_ctx(store)
     idx = Router.shard_for(ctx, key)
     keydir = Router.resolve_keydir(ctx, idx)
     now = CommandTime.now_ms()
 
-    store = %{
-      get: fn k -> Router.get(ctx, k) end,
-      exists?: fn k -> Router.exists?(ctx, k) end,
-      compound_get: fn redis_key, compound_key ->
-        Router.compound_get(ctx, redis_key, compound_key)
-      end,
-      compound_count: fn redis_key, prefix ->
-        Router.compound_count(ctx, redis_key, prefix)
-      end,
-      compound_delete: fn redis_key, compound_key ->
-        Router.compound_delete(ctx, redis_key, compound_key)
-      end
-    }
-
-    type = Ferricstore.Store.TypeRegistry.get_type(key, store)
+    type = Ferricstore.Store.TypeRegistry.get_type(key, ctx)
     alive? = type != "none"
 
     {value_size, expire_at_ms, hot_status} = resolve_key_info(alive?, keydir, key, now)
@@ -201,6 +187,9 @@ defmodule Ferricstore.Commands.Native do
       Integer.to_string(idx)
     ]
   end
+
+  defp key_info_ctx(%{__instance_ctx__: %FerricStore.Instance{} = ctx}), do: ctx
+  defp key_info_ctx(_store), do: FerricStore.Instance.get(:default)
 
   defp resolve_key_info(false, _keydir, _key, _now), do: {0, 0, "cold"}
   defp resolve_key_info(true, keydir, key, now), do: ets_key_info(keydir, key, now)

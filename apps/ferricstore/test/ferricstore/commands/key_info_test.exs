@@ -16,6 +16,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
 
   alias Ferricstore.Commands.{Dispatcher, Native}
   alias Ferricstore.Store.Router
+  alias Ferricstore.Test.IsolatedInstance
   alias Ferricstore.Test.ShardHelpers
 
   setup_all do
@@ -337,6 +338,21 @@ defmodule Ferricstore.Commands.KeyInfoTest do
                         shard_index: 0
                       }}
     end
+
+    test "KEY_INFO uses the injected custom instance instead of default" do
+      ctx = IsolatedInstance.checkout(shard_count: 1)
+      on_exit(fn -> IsolatedInstance.checkin(ctx) end)
+
+      key = ukey("ki_custom_instance")
+      Router.put(FerricStore.Instance.get(:default), key, "default-value", 0)
+      Router.put(ctx, key, "custom", 0)
+
+      result = Native.handle("KEY_INFO", [key], custom_store(ctx))
+      info = parse_info(result)
+
+      assert info["type"] == "string"
+      assert info["value_size"] == Integer.to_string(byte_size("custom"))
+    end
   end
 
   # ===========================================================================
@@ -513,6 +529,23 @@ defmodule Ferricstore.Commands.KeyInfoTest do
       write_version: :counters.new(1, []),
       hot_cache_max_value_size: 1024,
       read_sample_rate: 0
+    }
+  end
+
+  defp custom_store(ctx) do
+    %{
+      __instance_ctx__: ctx,
+      get: fn key -> Router.get(ctx, key) end,
+      exists?: fn key -> Router.exists?(ctx, key) end,
+      compound_get: fn redis_key, compound_key ->
+        Router.compound_get(ctx, redis_key, compound_key)
+      end,
+      compound_count: fn redis_key, prefix ->
+        Router.compound_count(ctx, redis_key, prefix)
+      end,
+      compound_delete: fn redis_key, compound_key ->
+        Router.compound_delete(ctx, redis_key, compound_key)
+      end
     }
   end
 end

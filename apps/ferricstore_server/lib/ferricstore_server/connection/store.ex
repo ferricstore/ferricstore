@@ -118,6 +118,7 @@ defmodule FerricstoreServer.Connection.Store do
 
   defp raw_store_complete?(store, ctx) do
     Map.get(store, :__ctx_identity__) == raw_store_identity(ctx) and
+      Map.get(store, :__instance_ctx__) == ctx and
       is_function(Map.get(store, :batch_get), 1) and
       is_function(Map.get(store, :value_size), 1) and
       is_function(Map.get(store, :object_lfu), 1) and
@@ -143,6 +144,7 @@ defmodule FerricstoreServer.Connection.Store do
   def build_raw_store(ctx) do
     %{
       __ctx_identity__: raw_store_identity(ctx),
+      __instance_ctx__: ctx,
       get: fn key -> Router.get(ctx, key) end,
       get_meta: fn key -> Router.get_meta(ctx, key) end,
       batch_get: fn keys -> Router.batch_get(ctx, keys) end,
