@@ -2758,6 +2758,204 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @doc """
+  Returns a byte range for a live plain key without reading the full cold value.
+
+  Hot entries slice the in-memory value. Cold entries validate the Bitcask
+  location once, then read only the requested value bytes from the data file.
+  Missing or expired keys return `nil`, matching `get/2`.
+  """
+  @spec getrange(FerricStore.Instance.t(), binary(), integer(), integer()) :: binary() | nil
+  def getrange(ctx, key, start_idx, end_idx) do
+    idx = shard_for(ctx, key)
+    keydir = resolve_keydir(ctx, idx)
+    now = HLC.now_ms()
+
+    case ets_get_full(ctx, idx, keydir, key, now) do
+      {:hit, value, lfu} ->
+        sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
+        range_from_value(value, start_idx, end_idx)
+
+      {:cold, file_id, offset, value_size}
+      when valid_cold_location(file_id, offset, value_size) ->
+        cold_range_from_location(
+          ctx,
+          idx,
+          keydir,
+          key,
+          file_id,
+          offset,
+          value_size,
+          start_idx,
+          end_idx,
+          now
+        )
+
+      {:cold, _file_id, _offset, _value_size} ->
+        fallback_getrange(ctx, idx, key, start_idx, end_idx)
+
+      :expired ->
+        Stats.incr_keyspace_misses(ctx)
+        nil
+
+      :miss ->
+        Stats.incr_keyspace_misses(ctx)
+        nil
+
+      :no_table ->
+        fallback_getrange(ctx, idx, key, start_idx, end_idx)
+    end
+  end
+
+  defp cold_range_from_location(
+         ctx,
+         idx,
+         keydir,
+         key,
+         file_id,
+         offset,
+         value_size,
+         start_idx,
+         end_idx,
+         now
+       ) do
+    case normalize_byte_range(value_size, start_idx, end_idx) do
+      :empty ->
+        ""
+
+      {relative_offset, count} ->
+        path = cold_file_path(ctx, idx, file_id)
+
+        case validated_file_ref(path, offset, key, value_size) do
+          {^path, value_offset, ^value_size} ->
+            read_validated_value_range(ctx, key, path, value_offset + relative_offset, count)
+
+          nil ->
+            retry_getrange_after_ref_miss(
+              ctx,
+              idx,
+              keydir,
+              key,
+              {file_id, offset, value_size},
+              start_idx,
+              end_idx,
+              now
+            )
+        end
+    end
+  end
+
+  defp retry_getrange_after_ref_miss(
+         ctx,
+         idx,
+         keydir,
+         key,
+         original_location,
+         start_idx,
+         end_idx,
+         now
+       ) do
+    case retry_changed_file_ref(ctx, idx, keydir, key, original_location, now) do
+      {:cold_ref, path, value_offset, value_size} ->
+        case normalize_byte_range(value_size, start_idx, end_idx) do
+          :empty ->
+            ""
+
+          {relative_offset, count} ->
+            read_validated_value_range(ctx, key, path, value_offset + relative_offset, count)
+        end
+
+      {:hot, value} ->
+        range_from_value(value, start_idx, end_idx)
+
+      :miss ->
+        Stats.incr_keyspace_misses(ctx)
+        nil
+    end
+  end
+
+  defp read_validated_value_range(ctx, key, path, offset, count) do
+    case pread_file_range(path, offset, count) do
+      {:ok, value} ->
+        Stats.record_cold_read(ctx, key)
+        value
+
+      :error ->
+        Stats.incr_keyspace_misses(ctx)
+        nil
+    end
+  end
+
+  defp fallback_getrange(ctx, idx, key, start_idx, end_idx) do
+    result =
+      case safe_read_call(ctx, idx, {:get, key}) do
+        {:ok, value} -> value
+        :unavailable -> nil
+      end
+
+    if result != nil do
+      Stats.record_cold_read(ctx, key)
+      range_from_value(result, start_idx, end_idx)
+    else
+      Stats.incr_keyspace_misses(ctx)
+      nil
+    end
+  end
+
+  defp pread_file_range(_path, _offset, 0), do: {:ok, ""}
+
+  defp pread_file_range(path, offset, count) do
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          case :file.pread(fd, offset, count) do
+            {:ok, value} when is_binary(value) and byte_size(value) == count -> {:ok, value}
+            _ -> :error
+          end
+        after
+          :file.close(fd)
+        end
+
+      {:error, _reason} ->
+        :error
+    end
+  end
+
+  defp range_from_value(value, start_idx, end_idx) when is_binary(value),
+    do: slice_binary_range(value, start_idx, end_idx)
+
+  defp range_from_value(value, start_idx, end_idx) when is_integer(value),
+    do: value |> Integer.to_string() |> slice_binary_range(start_idx, end_idx)
+
+  defp range_from_value(value, start_idx, end_idx) when is_float(value),
+    do: value |> Float.to_string() |> slice_binary_range(start_idx, end_idx)
+
+  defp range_from_value(value, start_idx, end_idx),
+    do: value |> to_string() |> slice_binary_range(start_idx, end_idx)
+
+  defp slice_binary_range(value, start_idx, end_idx) do
+    case normalize_byte_range(byte_size(value), start_idx, end_idx) do
+      :empty -> ""
+      {offset, count} -> binary_part(value, offset, count)
+    end
+  end
+
+  defp normalize_byte_range(0, _start_idx, _end_idx), do: :empty
+
+  defp normalize_byte_range(size, start_idx, end_idx) when size > 0 do
+    start_norm = if start_idx < 0, do: max(size + start_idx, 0), else: start_idx
+    end_norm = if end_idx < 0, do: size + end_idx, else: end_idx
+
+    start_clamped = min(start_norm, size)
+    end_clamped = min(end_norm, size - 1)
+
+    if start_clamped > end_clamped do
+      :empty
+    else
+      {start_clamped, end_clamped - start_clamped + 1}
+    end
+  end
+
   # Sampling rate for read-side bookkeeping (LFU touch + hot/cold stats).
   # 1 in N reads performs the ETS writes. Reduces write contention at high
   # concurrency with negligible impact on LFU accuracy (logarithmic counter)

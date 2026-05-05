@@ -726,12 +726,12 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   defp read_getrange_value(key, start_idx, end_idx, store) do
-    case read_string_value(key, store) do
-      :missing -> ""
-      @wrongtype_error -> @wrongtype_error
-      {:value, v} when is_integer(v) -> do_getrange(Integer.to_string(v), start_idx, end_idx)
-      {:value, v} when is_float(v) -> do_getrange(Float.to_string(v), start_idx, end_idx)
-      {:value, value} -> do_getrange(value, start_idx, end_idx)
+    case Ops.getrange(store, key, start_idx, end_idx) do
+      nil ->
+        if compound_data_structure_key?(key, store), do: @wrongtype_error, else: ""
+
+      value ->
+        value
     end
   end
 
@@ -743,25 +743,6 @@ defmodule Ferricstore.Commands.Strings do
     end_clamped = min(end_norm, size - 1)
 
     start_clamped > end_clamped
-  end
-
-  defp do_getrange(value, start_idx, end_idx) do
-    len = byte_size(value)
-
-    # Normalise negative indices
-    start_norm = if start_idx < 0, do: max(len + start_idx, 0), else: start_idx
-    end_norm = if end_idx < 0, do: len + end_idx, else: end_idx
-
-    # Clamp to bounds
-    start_clamped = min(start_norm, len)
-    end_clamped = min(end_norm, len - 1)
-
-    if start_clamped > end_clamped do
-      ""
-    else
-      count = end_clamped - start_clamped + 1
-      binary_part(value, start_clamped, count)
-    end
   end
 
   # ---------------------------------------------------------------------------

@@ -146,6 +146,51 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
+  @spec getrange(store(), binary(), integer(), integer()) :: binary() | nil
+  def getrange(%FerricStore.Instance{} = ctx, key, start_idx, end_idx),
+    do: Router.getrange(ctx, key, start_idx, end_idx)
+
+  def getrange(%LocalTxStore{} = tx, key, start_idx, end_idx) do
+    cond do
+      not local?(tx, key) ->
+        Router.getrange(tx.instance_ctx, key, start_idx, end_idx)
+
+      tx_deleted?(key) ->
+        nil
+
+      true ->
+        case tx_pending_meta(key) do
+          {value, _exp} ->
+            range_from_value(value, start_idx, end_idx)
+
+          nil ->
+            case ShardETS.ets_lookup(tx.shard_state, key) do
+              {:hit, value, _exp} ->
+                range_from_value(value, start_idx, end_idx)
+
+              {:cold, _fid, _off, _vsize, _exp} ->
+                Router.getrange(tx.instance_ctx, key, start_idx, end_idx)
+
+              _ ->
+                nil
+            end
+        end
+    end
+  end
+
+  def getrange(store, key, start_idx, end_idx) when is_map(store) do
+    case store do
+      %{getrange: getrange_fun} when is_function(getrange_fun, 3) ->
+        getrange_fun.(key, start_idx, end_idx)
+
+      _ ->
+        case get(store, key) do
+          nil -> nil
+          value -> range_from_value(value, start_idx, end_idx)
+        end
+    end
+  end
+
   @spec put(store(), binary(), binary(), non_neg_integer()) :: :ok | {:error, binary()}
   def put(%FerricStore.Instance{} = ctx, key, value, exp), do: Router.put(ctx, key, value, exp)
 
@@ -1121,6 +1166,33 @@ defmodule Ferricstore.Store.Ops do
   defp stored_value_size(value) when is_integer(value), do: byte_size(Integer.to_string(value))
   defp stored_value_size(value) when is_float(value), do: byte_size(Float.to_string(value))
   defp stored_value_size(value), do: value |> to_string() |> byte_size()
+
+  defp range_from_value(value, start_idx, end_idx) when is_binary(value),
+    do: slice_binary_range(value, start_idx, end_idx)
+
+  defp range_from_value(value, start_idx, end_idx) when is_integer(value),
+    do: value |> Integer.to_string() |> slice_binary_range(start_idx, end_idx)
+
+  defp range_from_value(value, start_idx, end_idx) when is_float(value),
+    do: value |> Float.to_string() |> slice_binary_range(start_idx, end_idx)
+
+  defp range_from_value(value, start_idx, end_idx),
+    do: value |> to_string() |> slice_binary_range(start_idx, end_idx)
+
+  defp slice_binary_range(value, start_idx, end_idx) do
+    size = byte_size(value)
+    start_norm = if start_idx < 0, do: max(size + start_idx, 0), else: start_idx
+    end_norm = if end_idx < 0, do: size + end_idx, else: end_idx
+
+    start_clamped = min(start_norm, size)
+    end_clamped = min(end_norm, size - 1)
+
+    if start_clamped > end_clamped do
+      ""
+    else
+      binary_part(value, start_clamped, end_clamped - start_clamped + 1)
+    end
+  end
 
   defp tx_deleted?(key) do
     deleted = Process.get(:tx_deleted_keys, MapSet.new())
