@@ -143,11 +143,17 @@ defmodule Ferricstore.Commands.Bitmap do
       if bitcount_range_empty_without_value?(store, key, mode, start_idx, end_idx) do
         0
       else
-        current = Ops.get(store, key) || <<>>
+        case bitcount_range_from_store(store, key, mode, start_idx, end_idx) do
+          {:ok, count} ->
+            count
 
-        case mode do
-          :byte -> bitcount_byte_range(current, start_idx, end_idx)
-          :bit -> bitcount_bit_range(current, start_idx, end_idx)
+          :unknown ->
+            current = Ops.get(store, key) || <<>>
+
+            case mode do
+              :byte -> bitcount_byte_range(current, start_idx, end_idx)
+              :bit -> bitcount_bit_range(current, start_idx, end_idx)
+            end
         end
       end
     end
@@ -328,11 +334,17 @@ defmodule Ferricstore.Commands.Bitmap do
       if bitcount_range_empty_without_value?(store, key, mode, start_idx, end_idx) do
         0
       else
-        current = Ops.get(store, key) || <<>>
+        case bitcount_range_from_store(store, key, mode, start_idx, end_idx) do
+          {:ok, count} ->
+            count
 
-        case mode do
-          :byte -> bitcount_byte_range(current, start_idx, end_idx)
-          :bit -> bitcount_bit_range(current, start_idx, end_idx)
+          :unknown ->
+            current = Ops.get(store, key) || <<>>
+
+            case mode do
+              :byte -> bitcount_byte_range(current, start_idx, end_idx)
+              :bit -> bitcount_bit_range(current, start_idx, end_idx)
+            end
         end
       end
     end
@@ -445,6 +457,56 @@ defmodule Ferricstore.Commands.Bitmap do
   end
 
   defp bitcount_range_empty_without_value?(_store, _key, _mode, _start_idx, _end_idx), do: false
+
+  defp bitcount_range_from_store(store, key, :byte, start_idx, end_idx) do
+    with size when is_integer(size) <- metadata_value_size(store, key),
+         {:ok, start_byte, end_byte} <- resolve_range(start_idx, end_idx, size),
+         slice when is_binary(slice) <- Ops.getrange(store, key, start_byte, end_byte) do
+      {:ok, popcount(slice)}
+    else
+      :empty -> {:ok, 0}
+      nil -> {:ok, 0}
+      _ -> :unknown
+    end
+  end
+
+  defp bitcount_range_from_store(store, key, :bit, start_idx, end_idx) do
+    with size when is_integer(size) <- metadata_value_size(store, key),
+         total_bits = size * 8,
+         {:ok, start_bit, end_bit} <- resolve_range(start_idx, end_idx, total_bits) do
+      start_byte = div(start_bit, 8)
+      end_byte = div(end_bit, 8)
+
+      case Ops.getrange(store, key, start_byte, end_byte) do
+        slice when is_binary(slice) ->
+          local_start_bit = start_bit - start_byte * 8
+          local_end_bit = end_bit - start_byte * 8
+          {:ok, bitcount_bit_range(slice, local_start_bit, local_end_bit)}
+
+        nil ->
+          {:ok, 0}
+
+        _ ->
+          :unknown
+      end
+    else
+      :empty -> {:ok, 0}
+      _ -> :unknown
+    end
+  end
+
+  defp resolve_range(_start_idx, _end_idx, len) when len <= 0, do: :empty
+
+  defp resolve_range(start_idx, end_idx, len) do
+    start_resolved = resolve_index(start_idx, len)
+    end_resolved = resolve_index(end_idx, len)
+
+    if start_resolved > end_resolved or start_resolved >= len or end_resolved < 0 do
+      :empty
+    else
+      {:ok, max(start_resolved, 0), min(end_resolved, len - 1)}
+    end
+  end
 
   defp bitpos_byte_range_from_size(store, key, bit_val, start_idx, end_idx, explicit_end) do
     case metadata_value_size(store, key) do
