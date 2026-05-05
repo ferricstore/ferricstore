@@ -7206,7 +7206,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp maybe_queue_lmdb_state_delete(_state, _key), do: :ok
 
   defp flow_state_key?(key) when is_binary(key) do
-    String.starts_with?(key, "flow:{flow") and String.contains?(key, "}:state:")
+    FlowKeys.state_key?(key)
   end
 
   # Flushes the BitcaskWriter if the key has a pending background write.

@@ -352,7 +352,6 @@ defmodule Ferricstore.Flow do
     metadata = flow_metadata(result, fallback_metadata)
 
     :telemetry.execute([:ferricstore, :flow, command, :stop], measurements, metadata)
-    publish_flow_notifications(command, result)
 
     result
   end
@@ -369,7 +368,6 @@ defmodule Ferricstore.Flow do
     metadata = flow_metadata({:ok, records}, %{flow_id: nil})
 
     :telemetry.execute([:ferricstore, :flow, command, :stop], measurements, metadata)
-    publish_flow_notifications(command, {:ok, records})
     :ok
   end
 
@@ -438,71 +436,6 @@ defmodule Ferricstore.Flow do
       String.contains?(reason, "already exists") -> :exists
       true -> :error
     end
-  end
-
-  defp publish_flow_notifications(command, {:ok, records}) when is_list(records) do
-    Enum.each(records, &publish_flow_record(command, &1))
-  end
-
-  defp publish_flow_notifications(command, {:ok, record}) when is_map(record) do
-    publish_flow_record(command, record)
-  end
-
-  defp publish_flow_notifications(_command, _result), do: :ok
-
-  defp publish_flow_record(command, %{id: id, type: type} = record)
-       when is_binary(id) and is_binary(type) do
-    message = flow_pubsub_message(command, record)
-
-    safe_publish("flow_changed:" <> id, message)
-    safe_publish("flow_type_changed:" <> type, message)
-
-    if publish_due_wakeup?(command, record) do
-      safe_publish("flow_due:" <> type, message)
-    end
-
-    :ok
-  end
-
-  defp publish_flow_record(_command, _record), do: :ok
-
-  defp publish_due_wakeup?(command, record)
-       when command in [:create, :transition, :retry] do
-    is_integer(Map.get(record, :next_run_at_ms)) and Map.get(record, :state) != "running"
-  end
-
-  defp publish_due_wakeup?(_command, _record), do: false
-
-  defp flow_pubsub_message(command, record) do
-    [
-      "event=",
-      flow_event_name(command),
-      ";id=",
-      Map.get(record, :id, ""),
-      ";type=",
-      Map.get(record, :type, ""),
-      ";state=",
-      Map.get(record, :state, ""),
-      ";version=",
-      record |> Map.get(:version, 0) |> Integer.to_string()
-    ]
-    |> IO.iodata_to_binary()
-  end
-
-  defp flow_event_name(:create), do: "created"
-  defp flow_event_name(:claim_due), do: "claimed"
-  defp flow_event_name(:transition), do: "transitioned"
-  defp flow_event_name(:retry), do: "retry"
-  defp flow_event_name(:fail), do: "failed"
-  defp flow_event_name(:cancel), do: "cancelled"
-  defp flow_event_name(:complete), do: "completed"
-  defp flow_event_name(:rewind), do: "rewound"
-  defp flow_event_name(command), do: Atom.to_string(command)
-
-  defp safe_publish(channel, message) do
-    Ferricstore.PubSub.publish(channel, message)
-  rescue
-    _ -> 0
   end
 
   defp validate_opts(opts) do
@@ -958,57 +891,63 @@ defmodule Ferricstore.Flow do
   defmodule Keys do
     @moduledoc false
 
-    @global_tag "{flow}"
-    @partition_tag_prefix "{flow:"
+    @global_tag "{f}"
+    @partition_tag_prefix "{f:"
 
     def state_key(id, partition_key \\ nil) do
-      "flow:" <> tag(partition_key) <> ":state:" <> id
+      "f:" <> tag(partition_key) <> ":s:" <> id
     end
 
     def history_key(id, partition_key \\ nil) do
-      "flow:" <> tag(partition_key) <> ":history:" <> id
+      "f:" <> tag(partition_key) <> ":h:" <> id
     end
 
     def due_key(type, state, priority, partition_key \\ nil) do
-      "flow:" <>
+      "f:" <>
         tag(partition_key) <>
-        ":due:" <> type <> ":" <> state <> ":p" <> Integer.to_string(priority)
+        ":d:" <> type <> ":" <> state <> ":p" <> Integer.to_string(priority)
     end
 
     def state_index_key(type, state, partition_key \\ nil) do
-      "flow:" <> tag(partition_key) <> ":idx:state:" <> type <> ":" <> state
+      "f:" <> tag(partition_key) <> ":i:s:" <> type <> ":" <> state
     end
 
     def inflight_index_key(type, partition_key \\ nil) do
-      "flow:" <> tag(partition_key) <> ":idx:inflight:" <> type
+      "f:" <> tag(partition_key) <> ":i:r:" <> type
     end
 
     def worker_index_key(worker, partition_key \\ nil) do
-      "flow:" <> tag(partition_key) <> ":idx:worker:" <> worker
+      "f:" <> tag(partition_key) <> ":i:w:" <> worker
     end
 
     def parent_index_key(parent_flow_id, partition_key \\ nil) do
-      "flow:" <> tag(partition_key) <> ":idx:parent:" <> parent_flow_id
+      "f:" <> tag(partition_key) <> ":i:p:" <> parent_flow_id
     end
 
     def root_index_key(root_flow_id, partition_key \\ nil) do
-      "flow:" <> tag(partition_key) <> ":idx:root:" <> root_flow_id
+      "f:" <> tag(partition_key) <> ":i:o:" <> root_flow_id
     end
 
     def correlation_index_key(correlation_id, partition_key \\ nil) do
-      "flow:" <> tag(partition_key) <> ":idx:correlation:" <> correlation_id
+      "f:" <> tag(partition_key) <> ":i:c:" <> correlation_id
     end
 
     def stream_entry_key(id, event_id, partition_key \\ nil) do
       "X:" <> history_key(id, partition_key) <> <<0>> <> event_id
     end
 
+    def state_key?(key) when is_binary(key) do
+      String.starts_with?(key, "f:{f") and String.contains?(key, "}:s:")
+    end
+
+    def state_key?(_key), do: false
+
     def tag(nil), do: @global_tag
     def tag(:global), do: @global_tag
 
     def tag(partition_key) when is_binary(partition_key) do
       @partition_tag_prefix <>
-        Base.encode16(:crypto.hash(:sha256, partition_key), case: :lower) <> "}"
+        Base.url_encode64(:crypto.hash(:sha256, partition_key), padding: false) <> "}"
     end
   end
 end

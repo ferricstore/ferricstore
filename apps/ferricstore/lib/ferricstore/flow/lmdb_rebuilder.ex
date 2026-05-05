@@ -341,7 +341,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
   defp flow_state_entry?({key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize})
        when is_binary(key) do
-    String.starts_with?(key, "flow:{flow") and String.contains?(key, "}:state:")
+    Flow.Keys.state_key?(key)
   end
 
   defp flow_state_entry?(_entry), do: false

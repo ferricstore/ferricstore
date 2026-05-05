@@ -85,6 +85,23 @@ defmodule Ferricstore.FlowTest do
     {same_a, same_b, other}
   end
 
+  test "flow internal keys use compact partition tags" do
+    partition_key = "tenant:device:" <> String.duplicate("abcdef0123456789", 4)
+
+    state_key = Ferricstore.Flow.Keys.state_key("flow-a", partition_key)
+    history_key = Ferricstore.Flow.Keys.history_key("flow-a", partition_key)
+    due_key = Ferricstore.Flow.Keys.due_key("checkout", "queued", 0, partition_key)
+
+    assert state_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{43}\}:s:flow-a$/
+    assert history_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{43}\}:h:flow-a$/
+    assert due_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{43}\}:d:checkout:queued:p0$/
+    assert Ferricstore.Flow.Keys.state_key?(state_key)
+    refute Ferricstore.Flow.Keys.state_key?(history_key)
+
+    old_state_key = "flow:{flow:" <> String.duplicate("0", 64) <> "}:state:flow-a"
+    assert byte_size(state_key) < byte_size(old_state_key)
+  end
+
   test "flow_create stores state and prevents duplicate ids" do
     id = uid("flow-create")
 
@@ -388,7 +405,7 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, %{id: ^other_new_id}} = FerricStore.flow_get(other_new_id, partition_key: other)
   end
 
-  test "flow_create emits telemetry and wakeup pubsub notifications" do
+  test "flow_create emits telemetry without automatic worker pubsub wakeups" do
     id = uid("flow-observe")
     attach_flow_telemetry([[:ferricstore, :flow, :create, :stop]])
 
@@ -418,13 +435,8 @@ defmodule Ferricstore.FlowTest do
     assert is_integer(duration_ms) and duration_ms >= 0
     assert %{flow_id: ^id, flow_type: "observability", result: :ok, reason: nil} = metadata
 
-    assert_receive {:pubsub_message, ^changed_channel, changed_message}
-    assert changed_message =~ "event=created"
-    assert changed_message =~ "state=queued"
-
-    assert_receive {:pubsub_message, ^due_channel, due_message}
-    assert due_message =~ "event=created"
-    assert due_message =~ "id=#{id}"
+    refute_receive {:pubsub_message, ^changed_channel, _message}, 50
+    refute_receive {:pubsub_message, ^due_channel, _message}, 50
   end
 
   test "flow APIs reject malformed inputs before raft apply" do
