@@ -6,10 +6,10 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
   status `:executing`. For each stale intent:
 
     * Checks if the intent is old enough to be considered stale (>10s)
-    * Reads current state of involved keys
-    * Compares value hashes with `:erlang.phash2/1`
-    * If hash matches: data unchanged, safe to clean up the intent
-    * If hash doesn't match: someone wrote new data, clean up intent (don't re-execute)
+    * Reads current lightweight watch tokens for involved keys
+    * Compares tokens with the intent snapshot
+    * If token matches: data unchanged, safe to clean up the intent
+    * If token doesn't match: someone wrote new data, clean up intent (don't re-execute)
     * If key doesn't exist: already completed or expired, clean up intent
 
   Intent records are self-describing: they contain the command type, involved
@@ -81,7 +81,7 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
           # Clean up based on age alone.
           true
         else
-          # Check each key's current value against the stored hash.
+          # Check each key's current token against the stored token.
           check_value_hashes(value_hashes, keys_map)
         end
 
@@ -97,7 +97,7 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
     :ok
   end
 
-  # Checks current values of involved keys against stored hashes.
+  # Checks current values of involved keys against stored tokens.
   # Returns true if the intent should be cleaned up (always true — whether
   # data matches or not, the intent is stale and should be removed).
   #
@@ -105,16 +105,15 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
   # same: stale intents are always cleaned up. Re-execution is not safe
   # because we can't guarantee idempotency of arbitrary commands.
   defp check_value_hashes(value_hashes, _keys_map) do
-    Enum.all?(value_hashes, fn {key, stored_hash} ->
-      current_value = read_current_value(key)
-      current_hash = :erlang.phash2(current_value)
+    Enum.all?(value_hashes, fn {key, stored_token} ->
+      current_token = read_current_token(key)
 
-      # Whether the hash matches or not, the intent is stale.
-      # Hash match means data is unchanged (operation may not have executed).
-      # Hash mismatch means someone wrote new data (don't re-execute).
-      # nil value means key was deleted or expired (already completed or cleaned up).
+      # Whether the token matches or not, the intent is stale.
+      # Token match means data is unchanged (operation may not have executed).
+      # Token mismatch means someone wrote new data (don't re-execute).
+      # Missing token means key was deleted or expired (already completed or cleaned up).
       # In all cases, cleaning up the intent is the correct action.
-      _matches = current_hash == stored_hash
+      _matches = current_token == stored_token
       true
     end)
   end
@@ -132,10 +131,9 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
     end)
   end
 
-  # Reads the current value of a key through the Router.
-  # Returns nil if the key doesn't exist.
-  defp read_current_value(key) do
+  # Reads the current watch token of a key through the Router.
+  defp read_current_token(key) do
     ctx = FerricStore.Instance.get(:default)
-    Router.get(ctx, key)
+    Router.watch_token(ctx, key)
   end
 end

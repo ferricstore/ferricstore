@@ -608,9 +608,9 @@ defmodule Ferricstore.CrossShardOp do
     }
   end
 
-  # Computes value hashes for all keys involved in a cross-shard operation.
-  # Reads the current value of each key and hashes it with `:erlang.phash2/1`.
-  # These hashes are stored in the intent record for crash recovery validation.
+  # Computes watch tokens for all keys involved in a cross-shard operation.
+  # Cold keys use keydir metadata so large values are not materialized only to
+  # write the crash-recovery intent.
   @doc false
   @spec compute_value_hashes([key_with_role()], map()) :: map()
   def compute_value_hashes(keys_with_roles, per_shard_stores) do
@@ -619,19 +619,9 @@ defmodule Ferricstore.CrossShardOp do
 
   @doc false
   @spec compute_value_hashes(FerricStore.Instance.t(), [key_with_role()], map()) :: map()
-  def compute_value_hashes(ctx, keys_with_roles, per_shard_stores) do
+  def compute_value_hashes(ctx, keys_with_roles, _per_shard_stores) do
     Map.new(keys_with_roles, fn {key, _role} ->
-      idx = Router.shard_for(ctx, key)
-      store = Map.get(per_shard_stores, idx)
-
-      value =
-        if store do
-          store.get.(key)
-        else
-          nil
-        end
-
-      {key, :erlang.phash2(value)}
+      {key, Router.watch_token(ctx, key)}
     end)
   end
 
