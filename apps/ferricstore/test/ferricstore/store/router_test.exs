@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.RouterTest do
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Store.{LFU, Router}
+  alias Ferricstore.Store.{LFU, Router, SlotMap}
   alias Ferricstore.Test.IsolatedInstance
 
   describe "shard_for/1" do
@@ -45,6 +45,13 @@ defmodule Ferricstore.Store.RouterTest do
     test "hash tags co-locate keys on the same slot" do
       assert Router.slot_for(FerricStore.Instance.get(:default), "{tag}:a") ==
                Router.slot_for(FerricStore.Instance.get(:default), "{tag}:b")
+    end
+
+    test "uses the shared slot map hash implementation" do
+      for key <- ["plain", "{user:42}:session", "{}empty", String.duplicate("x", 1024)] do
+        assert Router.slot_for(FerricStore.Instance.get(:default), key) ==
+                 SlotMap.slot_for_key(key)
+      end
     end
   end
 

@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.Router do
   @moduledoc """
-  Routes keys to shard GenServers using consistent hashing via `:erlang.phash2/2`.
+  Routes keys to shard GenServers using the shared `Ferricstore.Store.SlotMap`
+  hashing implementation.
 
   This is a pure module with no process state. It provides two categories of
   functions:
@@ -23,11 +24,8 @@ defmodule Ferricstore.Store.Router do
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Stats
-  alias Ferricstore.Store.{CompoundKey, LFU, ListOps, TypeRegistry, ValueCodec}
+  alias Ferricstore.Store.{CompoundKey, LFU, ListOps, SlotMap, TypeRegistry, ValueCodec}
 
-  import Bitwise, only: [band: 2]
-
-  @slot_mask 1023
   @cold_batch_read_timeout_ms 10_000
   @cold_location_retry_attempts 8
   @cold_location_retry_sleep_ms 1
@@ -1132,15 +1130,14 @@ defmodule Ferricstore.Store.Router do
   """
   @spec slot_for(FerricStore.Instance.t(), binary()) :: non_neg_integer()
   def slot_for(_ctx, key) do
-    hash_input = extract_hash_tag(key) || key
-    :erlang.phash2(hash_input) |> band(@slot_mask)
+    SlotMap.slot_for_key(key)
   end
 
   @doc """
   Returns the shard index (0-based) that owns `key`.
 
   Routes through the 1,024-slot indirection layer:
-  `key -> phash2(key) & 0x3FF -> slot -> slot_map[slot] -> shard_index`
+  `key -> SlotMap.slot_for_key/1 -> slot_map[slot] -> shard_index`
 
   Supports Redis hash tags: if the key contains `{tag}` (non-empty content
   between the first `{` and the next `}`), the tag is used for hashing
