@@ -245,6 +245,43 @@ defmodule Ferricstore.Commands.StringsTest do
       assert 0 == Stream.handle("XLEN", ["s"], store)
       assert [] == store.compound_scan.("s", "X:s" <> <<0>>)
     end
+
+    test "DEL returns compound prefix delete errors before removing type metadata" do
+      base = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["h", "f", "v"], base)
+      type_key = CompoundKey.type_key("h")
+
+      store =
+        base
+        |> Map.put(:compound_delete_prefix, fn "h", _prefix -> {:error, :disk_full} end)
+        |> Map.put(:compound_delete, fn
+          "h", ^type_key ->
+            flunk("DEL must not remove type metadata after compound prefix delete failure")
+
+          key, compound_key ->
+            base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == Strings.handle("DEL", ["h"], store)
+      assert "hash" == base.compound_get.("h", type_key)
+      assert "v" == Hash.handle("HGET", ["h", "f"], base)
+    end
+
+    test "DEL returns stream entry delete errors before cleaning stream metadata" do
+      Stream.ensure_meta_table()
+      base = MockStore.make()
+
+      id = Stream.handle("XADD", ["s", "*", "f", "v"], base)
+      assert is_binary(id)
+      assert 1 == Stream.handle("XLEN", ["s"], base)
+
+      store =
+        Map.put(base, :compound_delete_prefix, fn "s", "X:s" <> <<0>> -> {:error, :disk_full} end)
+
+      assert {:error, :disk_full} == Strings.handle("DEL", ["s"], store)
+      assert 1 == Stream.handle("XLEN", ["s"], base)
+      assert [_] = base.compound_scan.("s", "X:s" <> <<0>>)
+    end
   end
 
   # ---------------------------------------------------------------------------

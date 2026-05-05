@@ -1103,23 +1103,10 @@ defmodule Ferricstore.Commands.Strings do
         nil ->
           # No type metadata -- plain string key, or a stream that only has
           # X:<key>\0 compound entries plus local ETS metadata.
-          if maybe_delete_stream_key(key, store) do
-            true
-          else
-            if Ops.exists?(store, key) do
-              case maybe_delete_prob_file(key, store) do
-                :ok ->
-                  case Ops.delete(store, key) do
-                    :ok -> true
-                    {:error, _reason} = error -> error
-                  end
-
-                {:error, _reason} = error ->
-                  error
-              end
-            else
-              false
-            end
+          case maybe_delete_stream_key(key, store) do
+            true -> true
+            false -> delete_plain_key_if_exists(key, store)
+            {:error, _reason} = error -> error
           end
 
         type_str ->
@@ -1136,21 +1123,10 @@ defmodule Ferricstore.Commands.Strings do
               _unknown -> nil
             end
 
-          if prefix != nil do
-            Ops.compound_delete_prefix(store, key, prefix)
+          case delete_compound_key_data(key, type_str, prefix, store) do
+            :ok -> true
+            {:error, _reason} = error -> error
           end
-
-          if type_str == "list" do
-            meta_key = CompoundKey.list_meta_key(key)
-            Ops.compound_delete(store, key, meta_key)
-          end
-
-          if type_str == "stream" do
-            cleanup_stream_metadata(key)
-          end
-
-          TypeRegistry.delete_type(key, store)
-          true
       end
     else
       if Ops.exists?(store, key) do
@@ -1163,6 +1139,51 @@ defmodule Ferricstore.Commands.Strings do
       end
     end
   end
+
+  defp delete_plain_key_if_exists(key, store) do
+    if Ops.exists?(store, key) do
+      case maybe_delete_prob_file(key, store) do
+        :ok ->
+          case Ops.delete(store, key) do
+            :ok -> true
+            {:error, _reason} = error -> error
+          end
+
+        {:error, _reason} = error ->
+          error
+      end
+    else
+      false
+    end
+  end
+
+  defp delete_compound_key_data(key, type_str, prefix, store) do
+    with :ok <- delete_compound_prefix_if_present(key, prefix, store),
+         :ok <- delete_list_meta_if_needed(key, type_str, store),
+         :ok <- delete_stream_metadata_if_needed(key, type_str),
+         :ok <- TypeRegistry.delete_type(key, store) do
+      :ok
+    end
+  end
+
+  defp delete_compound_prefix_if_present(_key, nil, _store), do: :ok
+
+  defp delete_compound_prefix_if_present(key, prefix, store) do
+    Ops.compound_delete_prefix(store, key, prefix)
+  end
+
+  defp delete_list_meta_if_needed(key, "list", store) do
+    Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))
+  end
+
+  defp delete_list_meta_if_needed(_key, _type_str, _store), do: :ok
+
+  defp delete_stream_metadata_if_needed(key, "stream") do
+    cleanup_stream_metadata(key)
+    :ok
+  end
+
+  defp delete_stream_metadata_if_needed(_key, _type_str), do: :ok
 
   defp maybe_delete_prob_file(_key, %FerricStore.Instance{}), do: :ok
   defp maybe_delete_prob_file(_key, %Ferricstore.Store.LocalTxStore{}), do: :ok
@@ -1209,9 +1230,14 @@ defmodule Ferricstore.Commands.Strings do
     prefix = stream_prefix(key)
 
     if Ops.compound_scan(store, key, prefix) != [] or stream_metadata_exists?(key) do
-      Ops.compound_delete_prefix(store, key, prefix)
-      cleanup_stream_metadata(key)
-      true
+      case Ops.compound_delete_prefix(store, key, prefix) do
+        :ok ->
+          cleanup_stream_metadata(key)
+          true
+
+        {:error, _reason} = error ->
+          error
+      end
     else
       false
     end
