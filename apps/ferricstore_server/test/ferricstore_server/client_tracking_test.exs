@@ -392,6 +392,19 @@ defmodule FerricstoreServer.ClientTrackingTest do
       assert result.caching == false
     end
 
+    test "track_keys/3 tracks every key for one CLIENT CACHING yes command" do
+      config = ClientTracking.new_config()
+      {:ok, optin_config} = ClientTracking.enable(self(), config, optin: true)
+      {:ok, caching_config} = ClientTracking.set_caching(optin_config, true)
+
+      result = ClientTracking.track_keys(self(), ["multi1", "multi2", "multi3"], caching_config)
+
+      assert :ets.lookup(:ferricstore_tracking, "multi1") == [{"multi1", self()}]
+      assert :ets.lookup(:ferricstore_tracking, "multi2") == [{"multi2", self()}]
+      assert :ets.lookup(:ferricstore_tracking, "multi3") == [{"multi3", self()}]
+      assert result.caching == false
+    end
+
     test "CLIENT CACHING fails when tracking is disabled" do
       config = ClientTracking.new_config()
       {:error, msg} = ClientTracking.set_caching(config, true)
@@ -436,6 +449,19 @@ defmodule FerricstoreServer.ClientTrackingTest do
       # Next track should work normally
       ClientTracking.track_key(self(), "next_key", result)
       assert :ets.lookup(:ferricstore_tracking, "next_key") == [{"next_key", self()}]
+    end
+
+    test "track_keys/3 skips every key for one CLIENT CACHING no command" do
+      config = ClientTracking.new_config()
+      {:ok, optout_config} = ClientTracking.enable(self(), config, optout: true)
+      {:ok, skip_config} = ClientTracking.set_caching(optout_config, false)
+
+      result = ClientTracking.track_keys(self(), ["skip1", "skip2", "skip3"], skip_config)
+
+      assert :ets.lookup(:ferricstore_tracking, "skip1") == []
+      assert :ets.lookup(:ferricstore_tracking, "skip2") == []
+      assert :ets.lookup(:ferricstore_tracking, "skip3") == []
+      assert result.caching == true
     end
   end
 

@@ -97,11 +97,25 @@ defmodule FerricstoreServer.ClientTracking do
   @spec init_tables() :: :ok
   def init_tables do
     if :ets.whereis(@tracking_table) == :undefined do
-      :ets.new(@tracking_table, [:bag, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
+      :ets.new(@tracking_table, [
+        :bag,
+        :public,
+        :named_table,
+        {:read_concurrency, true},
+        {:write_concurrency, :auto},
+        {:decentralized_counters, true}
+      ])
     end
 
     if :ets.whereis(@connections_table) == :undefined do
-      :ets.new(@connections_table, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
+      :ets.new(@connections_table, [
+        :set,
+        :public,
+        :named_table,
+        {:read_concurrency, true},
+        {:write_concurrency, :auto},
+        {:decentralized_counters, true}
+      ])
     end
 
     :ok
@@ -267,9 +281,27 @@ defmodule FerricstoreServer.ClientTracking do
   """
   @spec track_keys(pid(), [binary()], tracking_config()) :: tracking_config()
   def track_keys(_conn_pid, _keys, %{enabled: false} = config), do: config
+  def track_keys(_conn_pid, _keys, %{mode: :bcast} = config), do: config
+
+  def track_keys(conn_pid, keys, %{optin: true, caching: true} = config) do
+    insert_tracked_keys(conn_pid, keys)
+    %{config | caching: false}
+  end
+
+  def track_keys(_conn_pid, _keys, %{optin: true, caching: false} = config), do: config
+
+  def track_keys(_conn_pid, _keys, %{optout: true, caching: false} = config),
+    do: %{config | caching: true}
 
   def track_keys(conn_pid, keys, config) do
-    Enum.reduce(keys, config, fn key, acc -> track_key(conn_pid, key, acc) end)
+    insert_tracked_keys(conn_pid, keys)
+    config
+  end
+
+  defp insert_tracked_keys(_conn_pid, []), do: :ok
+
+  defp insert_tracked_keys(conn_pid, keys) do
+    :ets.insert(@tracking_table, Enum.map(keys, fn key -> {key, conn_pid} end))
   end
 
   # ---------------------------------------------------------------------------
@@ -349,8 +381,7 @@ defmodule FerricstoreServer.ClientTracking do
   end
 
   def set_caching(%{optin: false, optout: false}, _value) do
-    {:error,
-     "ERR CLIENT CACHING can be called only when OPTIN or OPTOUT mode is active"}
+    {:error, "ERR CLIENT CACHING can be called only when OPTIN or OPTOUT mode is active"}
   end
 
   def set_caching(config, value) when is_boolean(value) do
@@ -418,12 +449,11 @@ defmodule FerricstoreServer.ClientTracking do
     # directly in ETS, avoiding copying the entire connections table into a list.
     match_spec = [
       {{:"$1", :"$2"},
-       [{:andalso,
-         {:is_map, :"$2"},
-         {:andalso,
-           {:==, {:map_get, :enabled, :"$2"}, true},
-           {:==, {:map_get, :mode, :"$2"}, :bcast}}}],
-       [{{:"$1", :"$2"}}]}
+       [
+         {:andalso, {:is_map, :"$2"},
+          {:andalso, {:==, {:map_get, :enabled, :"$2"}, true},
+           {:==, {:map_get, :mode, :"$2"}, :bcast}}}
+       ], [{{:"$1", :"$2"}}]}
     ]
 
     bcast_connections = :ets.select(@connections_table, match_spec)
