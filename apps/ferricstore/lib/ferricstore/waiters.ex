@@ -32,7 +32,15 @@ defmodule Ferricstore.Waiters do
   """
   @spec init() :: :ok
   def init do
-    :ets.new(@table, [:duplicate_bag, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
+    :ets.new(@table, [
+      :duplicate_bag,
+      :public,
+      :named_table,
+      {:read_concurrency, true},
+      {:write_concurrency, :auto},
+      {:decentralized_counters, true}
+    ])
+
     :ok
   end
 
@@ -89,16 +97,9 @@ defmodule Ferricstore.Waiters do
         nil
 
       entries ->
-        # FIFO: pick the entry with the smallest registered_at timestamp
-        {_key, pid, _deadline, _reg_at} =
-          Enum.min_by(entries, fn {_k, _p, _d, reg_at} -> reg_at end)
-
-        # Remove this waiter before notifying (prevent double-wake)
-        :ets.match_delete(@table, {key, pid, :_, :_})
-
-        # Send notification to the waiting process
-        send(pid, {:waiter_notify, key})
-        pid
+        entries
+        |> Enum.sort_by(fn {_k, _p, _d, reg_at} -> reg_at end)
+        |> notify_oldest_live(key)
     end
   end
 
@@ -135,5 +136,19 @@ defmodule Ferricstore.Waiters do
   @spec total_count() :: non_neg_integer()
   def total_count do
     :ets.info(@table, :size)
+  end
+
+  defp notify_oldest_live([], _key), do: nil
+
+  defp notify_oldest_live([{key, pid, _deadline, _reg_at} | rest], key) do
+    if Process.alive?(pid) do
+      # Remove this waiter before notifying (prevent double-wake).
+      :ets.match_delete(@table, {key, pid, :_, :_})
+      send(pid, {:waiter_notify, key})
+      pid
+    else
+      cleanup(pid)
+      notify_oldest_live(rest, key)
+    end
   end
 end

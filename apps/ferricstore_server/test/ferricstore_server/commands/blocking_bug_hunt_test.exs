@@ -610,6 +610,33 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
       refute_receive {:woken, 2}, 200
     end
 
+    test "notify_push skips dead stale waiters and wakes the oldest live waiter" do
+      key = ukey("dead_waiter_fifo")
+      me = self()
+
+      dead_waiter = spawn(fn -> Process.sleep(:infinity) end)
+      Waiters.register(key, dead_waiter, 0)
+      Process.exit(dead_waiter, :kill)
+
+      live_waiter =
+        spawn(fn ->
+          Waiters.register(key, self(), 0)
+
+          receive do
+            {:waiter_notify, ^key} -> send(me, {:woken, self()})
+          after
+            1000 -> send(me, {:timeout, self()})
+          end
+        end)
+
+      Process.sleep(20)
+
+      assert Waiters.notify_push(key) == live_waiter
+      assert_receive {:woken, ^live_waiter}, 500
+      refute_receive {:timeout, ^live_waiter}, 100
+      assert Waiters.count(key) == 0
+    end
+
     test "single RPUSH wakes exactly one blocked client (FIFO) over TCP", context do
       require_tcp!(context)
       key = ukey("two_clients")
