@@ -296,6 +296,10 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
               "durability mode",
               "durability_for(",
               "Quorum vs Async",
+              "Write async",
+              "async writes",
+              "For async writes",
+              "Quorum and async writes",
               "read_async",
               "write_async",
               "submit_async"

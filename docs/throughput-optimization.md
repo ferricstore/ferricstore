@@ -277,7 +277,6 @@ Based on the architecture, expected single-node throughput on NVMe:
 | Read-only (cold, pread) | 4 | 100-200K | NVMe IOPS |
 | Write quorum (batched) | 4 | 30-50K | fsync latency |
 | Write quorum (batched) | 16 | 80-120K | fsync parallelism |
-| Write async | 4 | 200-500K | CPU/ETS |
 | Mixed 80/20 read/write | 8 | 100-200K | balanced |
 
 Redis 7 single-threaded: ~100-160K SET/sec. Dragonfly multi-threaded:

@@ -527,7 +527,7 @@ Ordering, enforced by `Ferricstore.Store.ShardSupervisor` via
 
 1. Stop the Batcher (drain pending Raft submissions).
 2. Stop the state machine (ra.stop_server) — no more applies.
-3. Flush BitcaskWriter (drain async writes).
+3. Flush BitcaskWriter (drain queued writer work).
 4. Checkpointer performs a **synchronous** `v2_fsync` of the active
    file (not `v2_fsync_async` — we need it to complete before
    termination).
