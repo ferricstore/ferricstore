@@ -2184,7 +2184,8 @@ defmodule Ferricstore.Store.Router do
               value_size,
               min_file_ref_size,
               cold_entries,
-              cold_count
+              cold_count,
+              now
             )
 
           {:cold, _file_id, _offset, _value_size} ->
@@ -2251,7 +2252,8 @@ defmodule Ferricstore.Store.Router do
          value_size,
          min_file_ref_size,
          cold_entries,
-         cold_count
+         cold_count,
+         now
        )
        when value_size >= min_file_ref_size do
     case validated_file_ref(path, offset, key, value_size) do
@@ -2260,8 +2262,18 @@ defmodule Ferricstore.Store.Router do
         {{:file_ref, path, value_offset, value_size}, {cold_entries, cold_count}}
 
       nil ->
-        entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
-        {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
+        case retry_changed_file_ref(ctx, idx, keydir, key, {file_id, offset, value_size}, now) do
+          {:cold_ref, retry_path, value_offset, retry_size} ->
+            Stats.record_cold_read(ctx, key)
+            {{:file_ref, retry_path, value_offset, retry_size}, {cold_entries, cold_count}}
+
+          {:hot, value} ->
+            {{:value, value}, {cold_entries, cold_count}}
+
+          :miss ->
+            Stats.incr_keyspace_misses(ctx)
+            {{:value, nil}, {cold_entries, cold_count}}
+        end
     end
   end
 
@@ -2276,7 +2288,8 @@ defmodule Ferricstore.Store.Router do
          value_size,
          _min_file_ref_size,
          cold_entries,
-         cold_count
+         cold_count,
+         _now
        ) do
     entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
     {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}

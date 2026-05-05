@@ -83,6 +83,43 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     end
   end
 
+  test "batch_get_with_file_refs retries file refs after validation misses instead of materializing",
+       %{
+         ctx: ctx,
+         keydir: keydir
+       } do
+    key =
+      "cold_batch_sendfile_compacted:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+
+    other_key = key <> ":other"
+    value = "compacted-batch-file-ref"
+    value_size = byte_size(value)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    stale_path = Path.join(shard_path, "00000.log")
+    current_path = Path.join(shard_path, "00001.log")
+
+    {:ok, {stale_offset, _stale_record_size}} =
+      NIF.v2_append_record(stale_path, other_key, "wrong", 0)
+
+    {:ok, {current_offset, _current_record_size}} =
+      NIF.v2_append_record(current_path, key, value, 0)
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, stale_offset, value_size})
+
+    Process.put(:ferricstore_router_validate_file_ref_miss_hook, fn ->
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 1, current_offset, value_size})
+    end)
+
+    try do
+      assert [{:file_ref, ^current_path, value_offset, ^value_size}] =
+               Router.batch_get_with_file_refs(ctx, [key], 1)
+
+      assert is_integer(value_offset)
+    after
+      Process.delete(:ferricstore_router_validate_file_ref_miss_hook)
+    end
+  end
+
   test "direct cold reads do not crash on cold rows with invalid offsets", %{
     ctx: ctx,
     keydir: keydir
