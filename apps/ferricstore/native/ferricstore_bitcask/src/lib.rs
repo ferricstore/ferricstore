@@ -1362,14 +1362,15 @@ fn v2_pread_at_key_async<'a>(
                 .map_err(|e| log::LogError(e.to_string()))
                 .and_then(|file| {
                     fadvise_random(&file);
-                    let record = log::pread_record_from_file(&file, offset);
-                    if let Ok(Some(ref r)) = record {
-                        let size =
-                            (log::HEADER_SIZE + r.key.len() + r.value.as_ref().map_or(0, Vec::len))
-                                as i64;
+                    let value = log::pread_value_for_key_from_file(&file, offset, &expected_key);
+                    if let Ok(Some(ref value)) = value {
+                        let size = (log::HEADER_SIZE
+                            + expected_key.len()
+                            + value.as_ref().map_or(0, Vec::len))
+                            as i64;
                         fadvise_dontneed(&file, offset as i64, size);
                     }
-                    record
+                    value
                 })
         })
         .await
@@ -1377,7 +1378,7 @@ fn v2_pread_at_key_async<'a>(
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
-            Ok(Some(record)) if record.key == expected_key => match record.value {
+            Ok(Some(value)) => match value {
                 Some(value) => {
                     let resource = ResourceArc::new(ValueBuffer { data: value });
                     let binary = resource.make_binary(env, |vb| &vb.data);
@@ -1391,7 +1392,7 @@ fn v2_pread_at_key_async<'a>(
                 )
                     .encode(env),
             },
-            Ok(Some(_)) | Ok(None) => (
+            Ok(None) => (
                 atoms::tokio_complete(),
                 correlation_id,
                 atoms::ok(),
@@ -1576,21 +1577,16 @@ fn pread_batch_for_path_keyed(
     let mut results = Vec::with_capacity(read_count);
 
     for (index, offset, expected_key) in sort_keyed_reads_by_offset(reads) {
-        let value = match log::pread_record_from_file(&file, offset) {
-            Ok(Some(record)) => {
+        let value = match log::pread_value_for_key_from_file(&file, offset, &expected_key) {
+            Ok(Some(value)) => {
                 let size = (log::HEADER_SIZE
-                    + record.key.len()
-                    + record.value.as_ref().map_or(0, Vec::len)) as i64;
+                    + expected_key.len()
+                    + value.as_ref().map_or(0, Vec::len)) as i64;
                 fadvise_dontneed(&file, offset as i64, size);
 
-                if record.key == expected_key {
-                    record
-                        .value
-                        .map(BatchReadValue::Value)
-                        .unwrap_or(BatchReadValue::Nil)
-                } else {
-                    BatchReadValue::Nil
-                }
+                value
+                    .map(BatchReadValue::Value)
+                    .unwrap_or(BatchReadValue::Nil)
             }
             Ok(None) => BatchReadValue::Nil,
             Err(e) => BatchReadValue::Error(e.to_string()),
@@ -2739,6 +2735,32 @@ mod audit_fix_tests {
         assert_eq!(values[0].as_deref(), Some(&b"value_before"[..]));
         assert_eq!(values[1].as_deref(), Some(&b"value"[..]));
         assert!(matches!(values[2], BatchReadValue::Error(_)));
+    }
+
+    #[test]
+    fn keyed_batch_pread_mismatched_key_does_not_decode_huge_value() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        let offset = writer.write(b"actual", b"small", 0).unwrap();
+        writer.sync().unwrap();
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_at(&(u32::MAX - 1).to_le_bytes(), offset + 22)
+            .unwrap();
+        file.sync_data().unwrap();
+
+        let values = pread_batch_grouped_keyed(vec![(
+            path.to_string_lossy().into_owned(),
+            offset,
+            b"expected".to_vec(),
+        )])
+        .unwrap();
+
+        assert_eq!(values, vec![BatchReadValue::Nil]);
     }
 
     #[test]

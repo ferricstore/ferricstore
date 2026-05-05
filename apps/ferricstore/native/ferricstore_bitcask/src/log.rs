@@ -680,6 +680,14 @@ pub fn pread_record_from_file(file: &File, offset: u64) -> Result<Option<Record>
     pread_record(file, offset)
 }
 
+pub fn pread_value_for_key_from_file(
+    file: &File,
+    offset: u64,
+    expected_key: &[u8],
+) -> Result<Option<Option<Vec<u8>>>> {
+    pread_value_for_key(file, offset, expected_key)
+}
+
 #[cfg(unix)]
 fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
     // Step 1: pread the header
@@ -830,6 +838,88 @@ fn read_next_record(reader: &mut impl Read) -> Result<Option<Record>> {
     };
 
     Ok(Some(record))
+}
+
+#[cfg(unix)]
+fn pread_value_for_key(
+    file: &File,
+    offset: u64,
+    expected_key: &[u8],
+) -> Result<Option<Option<Vec<u8>>>> {
+    let mut header = [0u8; HEADER_SIZE];
+    match read_exact_at_or_eof(file, &mut header, offset, "header")? {
+        false => return Ok(None),
+        true => {}
+    }
+
+    let stored_crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
+    let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
+
+    let mut key = vec![0u8; key_size];
+    if key_size > 0 {
+        let key_offset = offset
+            .checked_add(HEADER_SIZE as u64)
+            .ok_or_else(|| LogError("keyed pread key offset overflow".into()))?;
+        read_exact_at_or_eof(file, &mut key, key_offset, "key")?;
+    }
+
+    if key != expected_key {
+        return Ok(None);
+    }
+
+    let is_tombstone = value_size_raw == TOMBSTONE;
+    let value_size = decoded_value_size(value_size_raw, is_tombstone)?;
+
+    if !is_tombstone && value_size > BODY_LEN_FILE_SIZE_CHECK_THRESHOLD {
+        let value_start = offset
+            .checked_add(HEADER_SIZE as u64)
+            .and_then(|off| off.checked_add(key_size as u64))
+            .ok_or_else(|| LogError("keyed pread value offset overflow".into()))?;
+        let value_end = value_start
+            .checked_add(value_size as u64)
+            .ok_or_else(|| LogError("keyed pread value end overflow".into()))?;
+        let file_len = file.metadata()?.len();
+        if value_end > file_len {
+            return Err(LogError(format!(
+                "record value extends past end of file: end={value_end}, file_len={file_len}"
+            )));
+        }
+    }
+
+    let value = if is_tombstone {
+        Vec::new()
+    } else {
+        let mut value = vec![0u8; value_size];
+        if value_size > 0 {
+            let value_offset = offset
+                .checked_add(HEADER_SIZE as u64)
+                .and_then(|off| off.checked_add(key_size as u64))
+                .ok_or_else(|| LogError("keyed pread value offset overflow".into()))?;
+            read_exact_at_or_eof(file, &mut value, value_offset, "value")?;
+        }
+        value
+    };
+
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&header[4..]);
+    hasher.update(&key);
+    if !is_tombstone {
+        hasher.update(&value);
+    }
+    let computed_crc = hasher.finalize();
+
+    if computed_crc != stored_crc {
+        return Err(LogError(format!(
+            "CRC mismatch: stored={stored_crc}, computed={computed_crc}"
+        )));
+    }
+
+    if is_tombstone {
+        Ok(Some(None))
+    } else {
+        Ok(Some(Some(value)))
+    }
 }
 
 fn iter_metadata_tolerant(
@@ -2716,6 +2806,28 @@ mod tests {
         assert!(
             err.to_string().contains("short read"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn keyed_pread_mismatch_ignores_corrupt_huge_value_size() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = temp_dir();
+        let path = dir.path().join("wrong_key_huge_value.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let offset = w.write(b"actual", b"small", 0).unwrap();
+        w.sync().unwrap();
+
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_at(&(u32::MAX - 1).to_le_bytes(), offset + 22)
+            .unwrap();
+        file.sync_data().unwrap();
+
+        let file = File::open(&path).unwrap();
+        assert_eq!(
+            pread_value_for_key_from_file(&file, offset, b"expected").unwrap(),
+            None
         );
     }
 
