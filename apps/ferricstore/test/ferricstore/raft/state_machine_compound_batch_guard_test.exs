@@ -18,6 +18,20 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
            "state-machine command store must provide compound_batch_get_meta"
   end
 
+  test "state-machine command stores expose compound batch writes" do
+    source = File.read!(@state_machine_path)
+
+    # List push/pop and similar data-primitive mutations can touch many
+    # compound keys. During Raft apply those writes already share one pending
+    # NIF flush, so the command store must keep the batch callback explicit
+    # and avoid regressing to per-element Ops fallback calls.
+    assert source =~ "compound_batch_put:",
+           "state-machine command store must provide compound_batch_put"
+
+    assert source =~ "compound_batch_delete:",
+           "state-machine command store must provide compound_batch_delete"
+  end
+
   test "state-machine command stores expose plain batch reads" do
     source = File.read!(@state_machine_path)
 
@@ -25,7 +39,9 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
     # During Raft apply the store is a map, so missing batch_get callbacks
     # make Ops fall back to one closure call and one possible cold-read waiter
     # per key. Keep this explicit to preserve batched cold reads in apply.
-    assert source =~ ~r/batch_get: fn keys -> cross_shard_batch_read\(ctx, keys\) end/,
+    assert source =~ "batch_get: fn keys ->" and
+             (source =~ "cross_shard_batch_read(ctx, keys)" or
+                source =~ "cross_shard_routed_batch_read(keys, ctx_for_key)"),
            "state-machine command store must provide batch_get for plain multi-key reads"
   end
 

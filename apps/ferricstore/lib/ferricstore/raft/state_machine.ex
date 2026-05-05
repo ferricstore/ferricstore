@@ -8332,8 +8332,23 @@ defmodule Ferricstore.Raft.StateMachine do
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
         do_put(state, compound_key, value, expire_at_ms)
       end,
+      compound_batch_put: fn _redis_key, entries ->
+        Enum.each(entries, fn {compound_key, value, expire_at_ms} ->
+          :ok = do_put(state, compound_key, value, expire_at_ms)
+        end)
+
+        :ok
+      end,
       compound_delete: fn _redis_key, compound_key ->
         do_delete(state, compound_key)
+      end,
+      compound_batch_delete: fn _redis_key, compound_keys ->
+        Enum.reduce_while(compound_keys, :ok, fn compound_key, :ok ->
+          case do_delete(state, compound_key) do
+            :ok -> {:cont, :ok}
+            {:error, _} = error -> {:halt, error}
+          end
+        end)
       end,
       compound_scan: fn _redis_key, prefix ->
         Ferricstore.Store.Shard.ETS.prefix_scan_entries(

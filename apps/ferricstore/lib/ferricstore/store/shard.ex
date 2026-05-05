@@ -1236,6 +1236,10 @@ defmodule Ferricstore.Store.Shard do
     ShardWrites.handle_delete(key, from, state)
   end
 
+  defp handle_forwarded_quorum({:batch, commands}, _from, state) when is_list(commands) do
+    {:reply, Ferricstore.Raft.Batcher.write(state.index, {:batch, commands}), state}
+  end
+
   defp handle_forwarded_quorum({:incr, key, delta}, from, state) do
     ShardWrites.handle_incr(key, delta, from, state)
   end

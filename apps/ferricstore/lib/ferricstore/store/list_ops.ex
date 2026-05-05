@@ -539,31 +539,25 @@ defmodule Ferricstore.Store.ListOps do
   end
 
   defp put_elements(key, store, writes) do
-    Enum.reduce_while(writes, :ok, fn {pos, elem}, :ok ->
-      result =
-        store
-        |> Ops.compound_put(key, CompoundKey.list_element(key, pos), elem, 0)
-        |> write_result()
+    entries =
+      Enum.map(writes, fn {pos, elem} ->
+        {CompoundKey.list_element(key, pos), elem, 0}
+      end)
 
-      case result do
-        :ok -> {:cont, :ok}
-        {:error, _} = error -> {:halt, error}
-      end
-    end)
+    store
+    |> Ops.compound_batch_put(key, entries)
+    |> write_result()
   end
 
   defp delete_elements(key, store, elements) do
-    Enum.reduce_while(elements, :ok, fn {pos, _value}, :ok ->
-      result =
-        store
-        |> Ops.compound_delete(key, CompoundKey.list_element(key, pos))
-        |> write_result()
+    compound_keys =
+      Enum.map(elements, fn {pos, _value} ->
+        CompoundKey.list_element(key, pos)
+      end)
 
-      case result do
-        :ok -> {:cont, :ok}
-        {:error, _} = error -> {:halt, error}
-      end
-    end)
+    store
+    |> Ops.compound_batch_delete(key, compound_keys)
+    |> write_result()
   end
 
   defp update_or_delete_meta(key, store, _new_len, []), do: delete_meta(key, store)

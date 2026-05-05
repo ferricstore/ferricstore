@@ -498,8 +498,33 @@ defmodule Ferricstore.Store.Shard.NativeOps do
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
         cluster_safe_compound_write(state, {:put, compound_key, value, expire_at_ms})
       end,
+      compound_batch_put: fn
+        _redis_key, [] ->
+          :ok
+
+        _redis_key, entries ->
+          commands =
+            Enum.map(entries, fn {compound_key, value, expire_at_ms} ->
+              {:put, compound_key, value, expire_at_ms}
+            end)
+
+          state
+          |> cluster_safe_compound_write({:batch, commands})
+          |> normalize_batch_write_result()
+      end,
       compound_delete: fn _redis_key, compound_key ->
         cluster_safe_compound_write(state, {:delete, compound_key})
+      end,
+      compound_batch_delete: fn
+        _redis_key, [] ->
+          :ok
+
+        _redis_key, compound_keys ->
+          commands = Enum.map(compound_keys, &{:delete, &1})
+
+          state
+          |> cluster_safe_compound_write({:batch, commands})
+          |> normalize_batch_write_result()
       end,
       compound_scan: fn _redis_key, prefix ->
         results = ShardETS.prefix_scan_entries(state, prefix, state.shard_data_path)
@@ -595,6 +620,48 @@ defmodule Ferricstore.Store.Shard.NativeOps do
             {:error, reason}
         end
       end,
+      compound_batch_put: fn
+        _redis_key, [] ->
+          :ok
+
+        _redis_key, entries ->
+          case NIF.v2_append_batch(state.active_file_path, entries) do
+            {:ok, locations} when length(locations) == length(entries) ->
+              entries
+              |> Enum.zip(locations)
+              |> Enum.each(fn {{compound_key, value, expire_at_ms}, {offset, _value_size}} ->
+                record_direct_dead_bytes(state, compound_key)
+
+                ShardETS.ets_insert_with_location(
+                  state,
+                  compound_key,
+                  value,
+                  expire_at_ms,
+                  state.active_file_id,
+                  offset,
+                  byte_size(value)
+                )
+              end)
+
+              :ok
+
+            {:ok, locations} ->
+              reason = {:location_count_mismatch, length(entries), length(locations)}
+
+              Logger.error(
+                "Shard #{state.index}: append failed for list compound_batch_put: #{inspect(reason)}"
+              )
+
+              {:error, reason}
+
+            {:error, reason} ->
+              Logger.error(
+                "Shard #{state.index}: append failed for list compound_batch_put: #{inspect(reason)}"
+              )
+
+              {:error, reason}
+          end
+      end,
       compound_delete: fn _redis_key, compound_key ->
         case NIF.v2_append_tombstone(state.active_file_path, compound_key) do
           {:ok, _} ->
@@ -610,12 +677,41 @@ defmodule Ferricstore.Store.Shard.NativeOps do
             {:error, reason}
         end
       end,
+      compound_batch_delete: fn _redis_key, compound_keys ->
+        Enum.reduce_while(compound_keys, :ok, fn compound_key, :ok ->
+          case NIF.v2_append_tombstone(state.active_file_path, compound_key) do
+            {:ok, _} ->
+              record_direct_dead_bytes(state, compound_key)
+              ShardETS.ets_delete_key(state, compound_key)
+              {:cont, :ok}
+
+            {:error, reason} ->
+              Logger.error(
+                "Shard #{state.index}: tombstone write failed for list compound_batch_delete: #{inspect(reason)}"
+              )
+
+              {:halt, {:error, reason}}
+          end
+        end)
+      end,
       compound_scan: fn _redis_key, prefix ->
         results = ShardETS.prefix_scan_entries(state, prefix, state.shard_data_path)
         Enum.sort_by(results, fn {field, _} -> field end)
       end
     }
   end
+
+  defp normalize_batch_write_result(:ok), do: :ok
+  defp normalize_batch_write_result({:error, _} = error), do: error
+
+  defp normalize_batch_write_result({:ok, results}) when is_list(results) do
+    case Enum.find(results, &match?({:error, _}, &1)) do
+      nil -> :ok
+      {:error, _} = error -> error
+    end
+  end
+
+  defp normalize_batch_write_result(other), do: {:error, other}
 
   # -------------------------------------------------------------------
   # Helpers
