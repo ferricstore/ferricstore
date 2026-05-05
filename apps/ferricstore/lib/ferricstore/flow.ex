@@ -1,6 +1,8 @@
 defmodule Ferricstore.Flow do
   @moduledoc false
 
+  import Bitwise
+
   alias Ferricstore.Store.Router
 
   @default_state "queued"
@@ -11,6 +13,8 @@ defmodule Ferricstore.Flow do
   @max_ref_size 4_096
   @record_tag :flow_record_v1
   @history_tag :flow_history_v1
+  @record_bin_magic "FSF1"
+  @history_bin_magic "FSH1"
 
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
     started = flow_start_time()
@@ -347,35 +351,38 @@ defmodule Ferricstore.Flow do
 
   @doc false
   def encode_record(record) when is_map(record) do
-    :erlang.term_to_binary({
-      @record_tag,
-      Map.get(record, :id),
-      Map.get(record, :type),
-      Map.get(record, :state),
-      Map.get(record, :version),
-      Map.get(record, :attempts),
-      Map.get(record, :fencing_token),
-      Map.get(record, :created_at_ms),
-      Map.get(record, :updated_at_ms),
-      Map.get(record, :next_run_at_ms),
-      Map.get(record, :priority),
-      Map.get(record, :ttl_ms),
-      Map.get(record, :history_max_events),
-      Map.get(record, :partition_key),
-      Map.get(record, :payload_ref),
-      Map.get(record, :parent_flow_id),
-      Map.get(record, :root_flow_id),
-      Map.get(record, :correlation_id),
-      Map.get(record, :result_ref),
-      Map.get(record, :error_ref),
-      Map.get(record, :lease_owner),
-      Map.get(record, :lease_token),
-      Map.get(record, :lease_deadline_ms),
-      Map.get(record, :rewound_to_event_id)
-    })
+    [
+      @record_bin_magic,
+      encode_bin(Map.get(record, :id)),
+      encode_bin(Map.get(record, :type)),
+      encode_bin(Map.get(record, :state)),
+      encode_int(Map.get(record, :version)),
+      encode_int(Map.get(record, :attempts)),
+      encode_int(Map.get(record, :fencing_token)),
+      encode_int(Map.get(record, :created_at_ms)),
+      encode_int(Map.get(record, :updated_at_ms)),
+      encode_int(Map.get(record, :next_run_at_ms)),
+      encode_int(Map.get(record, :priority)),
+      encode_int(Map.get(record, :ttl_ms)),
+      encode_int(Map.get(record, :history_max_events)),
+      encode_bin(Map.get(record, :partition_key)),
+      encode_bin(Map.get(record, :payload_ref)),
+      encode_bin(Map.get(record, :parent_flow_id)),
+      encode_bin(Map.get(record, :root_flow_id)),
+      encode_bin(Map.get(record, :correlation_id)),
+      encode_bin(Map.get(record, :result_ref)),
+      encode_bin(Map.get(record, :error_ref)),
+      encode_bin(Map.get(record, :lease_owner)),
+      encode_bin(Map.get(record, :lease_token)),
+      encode_int(Map.get(record, :lease_deadline_ms)),
+      encode_bin(Map.get(record, :rewound_to_event_id))
+    ]
+    |> IO.iodata_to_binary()
   end
 
   @doc false
+  def decode_record(@record_bin_magic <> rest), do: decode_record_bin(rest)
+
   def decode_record(value) when is_binary(value) do
     value
     |> :erlang.binary_to_term([:safe])
@@ -445,33 +452,36 @@ defmodule Ferricstore.Flow do
   @doc false
   def encode_history_fields(record, event, now_ms)
       when is_map(record) and is_binary(event) and is_integer(now_ms) do
-    :erlang.term_to_binary({
-      @history_tag,
-      event,
-      Map.get(record, :version),
-      now_ms,
-      Map.get(record, :id),
-      Map.get(record, :type),
-      Map.get(record, :state),
-      Map.get(record, :priority, 0),
-      Map.get(record, :attempts, 0),
-      Map.get(record, :fencing_token, 0),
-      Map.get(record, :created_at_ms, now_ms),
-      Map.get(record, :updated_at_ms, now_ms),
-      Map.get(record, :next_run_at_ms),
-      Map.get(record, :lease_deadline_ms),
-      Map.get(record, :lease_owner),
-      Map.get(record, :payload_ref),
-      Map.get(record, :parent_flow_id),
-      Map.get(record, :root_flow_id),
-      Map.get(record, :correlation_id),
-      Map.get(record, :result_ref),
-      Map.get(record, :error_ref),
-      Map.get(record, :rewound_to_event_id)
-    })
+    [
+      @history_bin_magic,
+      encode_bin(event),
+      encode_int(Map.get(record, :version)),
+      encode_int(now_ms),
+      encode_bin(Map.get(record, :id)),
+      encode_bin(Map.get(record, :type)),
+      encode_bin(Map.get(record, :state)),
+      encode_int(Map.get(record, :priority, 0)),
+      encode_int(Map.get(record, :attempts, 0)),
+      encode_int(Map.get(record, :fencing_token, 0)),
+      encode_int(Map.get(record, :created_at_ms, now_ms)),
+      encode_int(Map.get(record, :updated_at_ms, now_ms)),
+      encode_int(Map.get(record, :next_run_at_ms)),
+      encode_int(Map.get(record, :lease_deadline_ms)),
+      encode_bin(Map.get(record, :lease_owner)),
+      encode_bin(Map.get(record, :payload_ref)),
+      encode_bin(Map.get(record, :parent_flow_id)),
+      encode_bin(Map.get(record, :root_flow_id)),
+      encode_bin(Map.get(record, :correlation_id)),
+      encode_bin(Map.get(record, :result_ref)),
+      encode_bin(Map.get(record, :error_ref)),
+      encode_bin(Map.get(record, :rewound_to_event_id))
+    ]
+    |> IO.iodata_to_binary()
   end
 
   @doc false
+  def decode_history_fields(@history_bin_magic <> rest), do: decode_history_fields_bin(rest)
+
   def decode_history_fields(value) when is_binary(value) do
     value
     |> :erlang.binary_to_term([:safe])
@@ -555,6 +565,170 @@ defmodule Ferricstore.Flow do
 
   defp decode_history_fields_term(fields) when is_list(fields), do: fields
   defp decode_history_fields_term(_value), do: []
+
+  defp decode_record_bin(rest) do
+    with {:ok, id, rest} <- decode_bin(rest),
+         {:ok, type, rest} <- decode_bin(rest),
+         {:ok, state, rest} <- decode_bin(rest),
+         {:ok, version, rest} <- decode_int(rest),
+         {:ok, attempts, rest} <- decode_int(rest),
+         {:ok, fencing_token, rest} <- decode_int(rest),
+         {:ok, created_at_ms, rest} <- decode_int(rest),
+         {:ok, updated_at_ms, rest} <- decode_int(rest),
+         {:ok, next_run_at_ms, rest} <- decode_int(rest),
+         {:ok, priority, rest} <- decode_int(rest),
+         {:ok, ttl_ms, rest} <- decode_int(rest),
+         {:ok, history_max_events, rest} <- decode_int(rest),
+         {:ok, partition_key, rest} <- decode_bin(rest),
+         {:ok, payload_ref, rest} <- decode_bin(rest),
+         {:ok, parent_flow_id, rest} <- decode_bin(rest),
+         {:ok, root_flow_id, rest} <- decode_bin(rest),
+         {:ok, correlation_id, rest} <- decode_bin(rest),
+         {:ok, result_ref, rest} <- decode_bin(rest),
+         {:ok, error_ref, rest} <- decode_bin(rest),
+         {:ok, lease_owner, rest} <- decode_bin(rest),
+         {:ok, lease_token, rest} <- decode_bin(rest),
+         {:ok, lease_deadline_ms, rest} <- decode_int(rest),
+         {:ok, rewound_to_event_id, ""} <- decode_bin(rest) do
+      record = %{
+        id: id,
+        type: type,
+        state: state,
+        version: version,
+        attempts: attempts,
+        fencing_token: fencing_token,
+        created_at_ms: created_at_ms,
+        updated_at_ms: updated_at_ms,
+        next_run_at_ms: next_run_at_ms,
+        priority: priority,
+        ttl_ms: ttl_ms,
+        history_max_events: history_max_events,
+        partition_key: partition_key,
+        payload_ref: payload_ref,
+        parent_flow_id: parent_flow_id,
+        root_flow_id: root_flow_id,
+        correlation_id: correlation_id,
+        result_ref: result_ref,
+        error_ref: error_ref,
+        lease_owner: lease_owner,
+        lease_token: lease_token,
+        lease_deadline_ms: lease_deadline_ms
+      }
+
+      if is_nil(rewound_to_event_id) do
+        record
+      else
+        Map.put(record, :rewound_to_event_id, rewound_to_event_id)
+      end
+    else
+      _ -> raise ArgumentError, "invalid flow record"
+    end
+  end
+
+  defp decode_history_fields_bin(rest) do
+    with {:ok, event, rest} <- decode_bin(rest),
+         {:ok, version, rest} <- decode_int(rest),
+         {:ok, at, rest} <- decode_int(rest),
+         {:ok, id, rest} <- decode_bin(rest),
+         {:ok, type, rest} <- decode_bin(rest),
+         {:ok, state, rest} <- decode_bin(rest),
+         {:ok, priority, rest} <- decode_int(rest),
+         {:ok, attempts, rest} <- decode_int(rest),
+         {:ok, fencing_token, rest} <- decode_int(rest),
+         {:ok, created_at_ms, rest} <- decode_int(rest),
+         {:ok, updated_at_ms, rest} <- decode_int(rest),
+         {:ok, next_run_at_ms, rest} <- decode_int(rest),
+         {:ok, lease_deadline_ms, rest} <- decode_int(rest),
+         {:ok, lease_owner, rest} <- decode_bin(rest),
+         {:ok, payload_ref, rest} <- decode_bin(rest),
+         {:ok, parent_flow_id, rest} <- decode_bin(rest),
+         {:ok, root_flow_id, rest} <- decode_bin(rest),
+         {:ok, correlation_id, rest} <- decode_bin(rest),
+         {:ok, result_ref, rest} <- decode_bin(rest),
+         {:ok, error_ref, rest} <- decode_bin(rest),
+         {:ok, rewound_to_event_id, ""} <- decode_bin(rest) do
+      decode_history_fields_term({
+        @history_tag,
+        event,
+        version,
+        at,
+        id,
+        type,
+        state,
+        priority,
+        attempts,
+        fencing_token,
+        created_at_ms,
+        updated_at_ms,
+        next_run_at_ms,
+        lease_deadline_ms,
+        lease_owner,
+        payload_ref,
+        parent_flow_id,
+        root_flow_id,
+        correlation_id,
+        result_ref,
+        error_ref,
+        rewound_to_event_id
+      })
+    else
+      _ -> []
+    end
+  end
+
+  defp encode_int(value) when is_integer(value) and value >= 0, do: encode_varint(value + 1)
+  defp encode_int(_value), do: <<0>>
+
+  defp decode_int(binary) do
+    with {:ok, encoded, rest} <- decode_varint(binary) do
+      case encoded do
+        0 -> {:ok, nil, rest}
+        value -> {:ok, value - 1, rest}
+      end
+    end
+  end
+
+  defp encode_bin(value) when is_binary(value),
+    do: [encode_varint(byte_size(value) + 1), value]
+
+  defp encode_bin(_value), do: <<0>>
+
+  defp decode_bin(binary) do
+    with {:ok, encoded, rest} <- decode_varint(binary) do
+      case encoded do
+        0 ->
+          {:ok, nil, rest}
+
+        size when size > 0 ->
+          len = size - 1
+
+          case rest do
+            <<value::binary-size(len), tail::binary>> -> {:ok, value, tail}
+            _ -> :error
+          end
+      end
+    end
+  end
+
+  defp encode_varint(value) when value < 128, do: <<value>>
+
+  defp encode_varint(value) when value >= 128 do
+    <<(value &&& 0x7F) ||| 0x80>> <> encode_varint(value >>> 7)
+  end
+
+  defp decode_varint(binary), do: decode_varint(binary, 0, 0)
+
+  defp decode_varint(<<byte, rest::binary>>, acc, shift) when shift < 70 do
+    value = acc ||| (byte &&& 0x7F) <<< shift
+
+    if (byte &&& 0x80) == 0 do
+      {:ok, value, rest}
+    else
+      decode_varint(rest, value, shift + 7)
+    end
+  end
+
+  defp decode_varint(_binary, _acc, _shift), do: :error
 
   defp history_integer(value) when is_integer(value), do: Integer.to_string(value)
   defp history_integer(_value), do: "0"

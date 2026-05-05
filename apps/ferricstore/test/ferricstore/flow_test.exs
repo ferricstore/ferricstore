@@ -133,6 +133,7 @@ defmodule Ferricstore.FlowTest do
     old_map = :erlang.term_to_binary(record)
     normal_record = Map.delete(record, :rewound_to_event_id)
 
+    assert "FSF1" <> _ = compact
     assert Ferricstore.Flow.decode_record(compact) == record
     assert Ferricstore.Flow.decode_record(old_map) == record
 
@@ -213,6 +214,7 @@ defmodule Ferricstore.FlowTest do
     compact = Ferricstore.Flow.encode_history_fields(record, "retry", 1_100)
     old = :erlang.term_to_binary(old_fields)
 
+    assert "FSH1" <> _ = compact
     assert Ferricstore.Flow.decode_history_fields(compact) == old_fields
     assert Ferricstore.Flow.decode_history_fields(old) == old_fields
     assert byte_size(compact) < byte_size(old)
