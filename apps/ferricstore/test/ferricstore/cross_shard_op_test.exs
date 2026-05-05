@@ -512,6 +512,52 @@ defmodule Ferricstore.CrossShardOpTest do
 
   # 14. Value hash in intent
   describe "value hash in intent" do
+    test "cross-shard stores expose compound batch callbacks" do
+      ctx = FerricStore.Instance.get(:default)
+      [k1, k2] = ShardHelpers.keys_on_different_shards(2)
+      idx1 = Router.shard_for(ctx, k1)
+      idx2 = Router.shard_for(ctx, k2)
+
+      shard_store = CrossShardOp.build_store_for_shard(ctx, idx1)
+
+      for callback <- [
+            :compound_batch_get,
+            :compound_batch_get_meta,
+            :compound_batch_put,
+            :compound_batch_delete
+          ] do
+        assert is_function(Map.fetch!(shard_store, callback), 2),
+               "build_store_for_shard/2 must expose #{callback} so data primitives do not fall back to per-member operations"
+      end
+
+      routing_store =
+        CrossShardOp.build_routing_store(ctx, %{
+          idx1 => shard_store,
+          idx2 => CrossShardOp.build_store_for_shard(ctx, idx2)
+        })
+
+      locked_store =
+        CrossShardOp.build_locked_routing_store(
+          ctx,
+          %{
+            idx1 => shard_store,
+            idx2 => CrossShardOp.build_store_for_shard(ctx, idx2)
+          },
+          make_ref()
+        )
+
+      for store <- [routing_store, locked_store],
+          callback <- [
+            :compound_batch_get,
+            :compound_batch_get_meta,
+            :compound_batch_put,
+            :compound_batch_delete
+          ] do
+        assert is_function(Map.fetch!(store, callback), 2),
+               "CrossShardOp routing stores must expose #{callback} so command handlers keep batched primitive behavior"
+      end
+    end
+
     test "intent includes value hashes computed from current key values" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 

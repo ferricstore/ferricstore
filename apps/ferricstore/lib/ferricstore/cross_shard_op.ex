@@ -412,11 +412,23 @@ defmodule Ferricstore.CrossShardOp do
           :exit, _ -> nil
         end
       end,
+      compound_batch_get: fn redis_key, compound_keys ->
+        Router.compound_batch_get(ctx, redis_key, compound_keys)
+      end,
+      compound_batch_get_meta: fn redis_key, compound_keys ->
+        Router.compound_batch_get_meta(ctx, redis_key, compound_keys)
+      end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
       end,
+      compound_batch_put: fn redis_key, entries ->
+        Router.compound_batch_put(ctx, redis_key, entries)
+      end,
       compound_delete: fn redis_key, compound_key ->
         Router.compound_delete(ctx, redis_key, compound_key)
+      end,
+      compound_batch_delete: fn redis_key, compound_keys ->
+        Router.compound_batch_delete(ctx, redis_key, compound_keys)
       end,
       compound_scan: fn redis_key, prefix ->
         try do
@@ -472,10 +484,22 @@ defmodule Ferricstore.CrossShardOp do
       compound_get_meta: fn redis_key, ck ->
         route.(redis_key).compound_get_meta.(redis_key, ck)
       end,
+      compound_batch_get: fn redis_key, compound_keys ->
+        route.(redis_key).compound_batch_get.(redis_key, compound_keys)
+      end,
+      compound_batch_get_meta: fn redis_key, compound_keys ->
+        route.(redis_key).compound_batch_get_meta.(redis_key, compound_keys)
+      end,
       compound_put: fn redis_key, ck, v, exp ->
         route.(redis_key).compound_put.(redis_key, ck, v, exp)
       end,
+      compound_batch_put: fn redis_key, entries ->
+        route.(redis_key).compound_batch_put.(redis_key, entries)
+      end,
       compound_delete: fn redis_key, ck -> route.(redis_key).compound_delete.(redis_key, ck) end,
+      compound_batch_delete: fn redis_key, compound_keys ->
+        route.(redis_key).compound_batch_delete.(redis_key, compound_keys)
+      end,
       compound_scan: fn redis_key, prefix ->
         route.(redis_key).compound_scan.(redis_key, prefix)
       end,
@@ -506,6 +530,33 @@ defmodule Ferricstore.CrossShardOp do
       Map.get(per_shard_stores, idx) || Map.get(per_shard_stores, hd(Map.keys(per_shard_stores)))
     end
 
+    locked_compound_put = fn redis_key, compound_key, value, expire_at_ms ->
+      shard_idx = Router.shard_for(ctx, redis_key)
+      shard_id = Cluster.shard_server_id(shard_idx)
+
+      case unwrap_ra_reply(
+             CommandClock.process_command(
+               shard_id,
+               {:locked_put, compound_key, value, expire_at_ms, owner_ref}
+             )
+           ) do
+        {:ok, result, _} -> result
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    locked_compound_delete = fn redis_key, compound_key ->
+      shard_idx = Router.shard_for(ctx, redis_key)
+      shard_id = Cluster.shard_server_id(shard_idx)
+
+      case unwrap_ra_reply(
+             CommandClock.process_command(shard_id, {:locked_delete, compound_key, owner_ref})
+           ) do
+        {:ok, result, _} -> result
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
     %{
       # Reads: use the regular per-shard stores (reads pass through locks)
       get: fn key -> route.(key).get.(key) end,
@@ -517,6 +568,12 @@ defmodule Ferricstore.CrossShardOp do
       compound_get: fn redis_key, ck -> route.(redis_key).compound_get.(redis_key, ck) end,
       compound_get_meta: fn redis_key, ck ->
         route.(redis_key).compound_get_meta.(redis_key, ck)
+      end,
+      compound_batch_get: fn redis_key, compound_keys ->
+        route.(redis_key).compound_batch_get.(redis_key, compound_keys)
+      end,
+      compound_batch_get_meta: fn redis_key, compound_keys ->
+        route.(redis_key).compound_batch_get_meta.(redis_key, compound_keys)
       end,
       compound_scan: fn redis_key, prefix ->
         route.(redis_key).compound_scan.(redis_key, prefix)
@@ -552,29 +609,28 @@ defmodule Ferricstore.CrossShardOp do
         end
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard_idx = Router.shard_for(ctx, redis_key)
-        shard_id = Cluster.shard_server_id(shard_idx)
-
-        case unwrap_ra_reply(
-               CommandClock.process_command(
-                 shard_id,
-                 {:locked_put, compound_key, value, expire_at_ms, owner_ref}
-               )
-             ) do
-          {:ok, result, _} -> result
-          {:error, reason} -> {:error, reason}
-        end
+        locked_compound_put.(redis_key, compound_key, value, expire_at_ms)
+      end,
+      compound_batch_put: fn redis_key, entries ->
+        Enum.reduce_while(entries, :ok, fn {compound_key, value, expire_at_ms}, :ok ->
+          case locked_compound_put.(redis_key, compound_key, value, expire_at_ms) do
+            :ok -> {:cont, :ok}
+            {:error, _} = err -> {:halt, err}
+            other -> {:halt, {:error, other}}
+          end
+        end)
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard_idx = Router.shard_for(ctx, redis_key)
-        shard_id = Cluster.shard_server_id(shard_idx)
-
-        case unwrap_ra_reply(
-               CommandClock.process_command(shard_id, {:locked_delete, compound_key, owner_ref})
-             ) do
-          {:ok, result, _} -> result
-          {:error, reason} -> {:error, reason}
-        end
+        locked_compound_delete.(redis_key, compound_key)
+      end,
+      compound_batch_delete: fn redis_key, compound_keys ->
+        Enum.reduce_while(compound_keys, :ok, fn compound_key, :ok ->
+          case locked_compound_delete.(redis_key, compound_key) do
+            :ok -> {:cont, :ok}
+            {:error, _} = err -> {:halt, err}
+            other -> {:halt, {:error, other}}
+          end
+        end)
       end,
       compound_delete_prefix: fn redis_key, prefix ->
         shard_idx = Router.shard_for(ctx, redis_key)
