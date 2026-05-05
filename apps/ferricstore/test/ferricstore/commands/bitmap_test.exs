@@ -251,6 +251,24 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert 12 == Bitmap.handle("BITCOUNT", ["mykey"], store)
     end
 
+    test "known cold value counts all bits in bounded range chunks" do
+      test_pid = self()
+
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 4 end,
+        getrange: fn
+          "cold", 0, 3 ->
+            send(test_pid, {:range_reader_called, 0, 3})
+            <<0xFF, 0x00, 0x0F, 0xF0>>
+        end,
+        get: fn _key -> flunk("BITCOUNT should not load the full cold value") end
+      }
+
+      assert 16 == Bitmap.handle("BITCOUNT", ["cold"], store)
+      assert_received {:range_reader_called, 0, 3}
+    end
+
     test "with byte range" do
       # Three bytes: 0xFF (8 bits), 0x00 (0 bits), 0xFF (8 bits)
       store = MockStore.make(%{"mykey" => {<<0xFF, 0x00, 0xFF>>, 0}})

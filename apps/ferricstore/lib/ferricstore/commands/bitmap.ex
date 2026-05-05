@@ -32,6 +32,7 @@ defmodule Ferricstore.Commands.Bitmap do
   # Redis limits bit offset to 2^32 - 1 (512MB value max)
   @max_bit_offset 4_294_967_295
   @wrongtype_error {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+  @bitcount_chunk_bytes 64 * 1024
 
   @doc """
   Handles a bitmap command.
@@ -128,8 +129,14 @@ defmodule Ferricstore.Commands.Bitmap do
 
   def handle("BITCOUNT", [key], store) do
     with :ok <- ensure_string_key(key, store) do
-      current = Ops.get(store, key) || <<>>
-      popcount(current)
+      case bitcount_all_from_store(store, key) do
+        {:ok, count} ->
+          count
+
+        :unknown ->
+          current = Ops.get(store, key) || <<>>
+          popcount(current)
+      end
     end
   end
 
@@ -493,6 +500,35 @@ defmodule Ferricstore.Commands.Bitmap do
   end
 
   defp bitcount_range_empty_without_value?(_store, _key, _mode, _start_idx, _end_idx), do: false
+
+  defp bitcount_all_from_store(store, key) do
+    case metadata_value_size(store, key) do
+      0 ->
+        {:ok, 0}
+
+      size when is_integer(size) and size > 0 ->
+        bitcount_all_chunks(store, key, size, 0, 0)
+
+      _unknown_or_missing ->
+        :unknown
+    end
+  end
+
+  defp bitcount_all_chunks(_store, _key, size, offset, acc) when offset >= size,
+    do: {:ok, acc}
+
+  defp bitcount_all_chunks(store, key, size, offset, acc) do
+    last = min(offset + @bitcount_chunk_bytes - 1, size - 1)
+    expected_size = last - offset + 1
+
+    case Ops.getrange(store, key, offset, last) do
+      slice when is_binary(slice) and byte_size(slice) == expected_size ->
+        bitcount_all_chunks(store, key, size, last + 1, acc + popcount(slice))
+
+      _missing_or_short ->
+        :unknown
+    end
+  end
 
   defp bitcount_range_from_store(store, key, :byte, start_idx, end_idx) do
     with size when is_integer(size) <- metadata_value_size(store, key),
