@@ -106,9 +106,24 @@ defmodule Ferricstore.Store.ListOps do
 
     case Ops.compound_get(store, key, meta_key) do
       nil -> nil
-      binary -> :erlang.binary_to_term(binary, [:safe])
+      binary -> decode_meta(binary)
     end
   end
+
+  defp decode_meta(binary) when is_binary(binary) do
+    case :erlang.binary_to_term(binary, [:safe]) do
+      {len, left_pos, right_pos}
+      when is_integer(len) and len >= 0 and is_integer(left_pos) and is_integer(right_pos) ->
+        {len, left_pos, right_pos}
+
+      _ ->
+        nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp decode_meta(_), do: nil
 
   defp write_meta(key, store, {_len, _left, _right} = meta) do
     Ops.compound_put(store, key, CompoundKey.list_meta_key(key), :erlang.term_to_binary(meta), 0)

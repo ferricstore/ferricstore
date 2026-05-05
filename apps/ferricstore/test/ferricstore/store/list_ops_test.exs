@@ -16,6 +16,18 @@ defmodule Ferricstore.Store.ListOpsTest do
     assert {:error, "disk full"} = ListOps.execute("list", store, {:lpop, 1})
   end
 
+  test "read-only commands treat corrupt persisted metadata as missing list" do
+    store = corrupt_meta_store(<<131, 100, 0, 12, "made_up_atom">>)
+
+    assert 0 = ListOps.execute("list", store, :llen)
+  end
+
+  test "read-only commands treat wrong-shape persisted metadata as missing list" do
+    store = corrupt_meta_store(:erlang.term_to_binary({:not_a_list_meta, "x"}))
+
+    assert [] = ListOps.execute("list", store, {:lrange, 0, -1})
+  end
+
   defp failing_put_store do
     %{
       compound_get: fn _redis_key, _compound_key -> nil end,
@@ -44,6 +56,17 @@ defmodule Ferricstore.Store.ListOpsTest do
       compound_put: fn _redis_key, _compound_key, _value, _expire_at_ms -> :ok end,
       compound_delete: fn _redis_key, _compound_key -> {:error, "disk full"} end,
       compound_scan: fn ^key, _prefix -> elements end
+    }
+  end
+
+  defp corrupt_meta_store(meta_binary) do
+    %{
+      compound_get: fn "list", compound_key ->
+        if compound_key == CompoundKey.list_meta_key("list"), do: meta_binary
+      end,
+      compound_put: fn _redis_key, _compound_key, _value, _expire_at_ms -> :ok end,
+      compound_delete: fn _redis_key, _compound_key -> :ok end,
+      compound_scan: fn _redis_key, _prefix -> [] end
     }
   end
 end
