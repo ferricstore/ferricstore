@@ -3413,6 +3413,40 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert :atomics.get(last_released_cursor_index, shard_index + 1) == 42
     end
 
+    test "release_cursor tolerates legacy recovered state without pending cursor fields", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      last_applied_index = :atomics.new(shard_index + 1, signed: false)
+      last_released_cursor_index = :atomics.new(shard_index + 1, signed: false)
+
+      state =
+        state
+        |> Map.merge(%{
+          release_cursor_interval: 1,
+          instance_ctx: %{
+            checkpoint_flags: :atomics.new(shard_index + 1, signed: false),
+            checkpoint_in_flight: :atomics.new(shard_index + 1, signed: false),
+            last_applied_index: last_applied_index,
+            last_released_cursor_index: last_released_cursor_index
+          }
+        })
+        |> Map.drop([
+          :pending_release_cursor_index,
+          :pending_replay_safe_marker_index,
+          :pending_release_cursor_checkpoint_indices
+        ])
+
+      meta = %{index: 44, term: 1, system_time: System.os_time(:millisecond)}
+
+      {_new_state, {:applied_at, 44, nil}, effects} =
+        StateMachine.apply(meta, {:getdel, "legacy_release_cursor_missing"}, state)
+
+      assert Enum.any?(effects, &match?({:release_cursor, 44}, &1))
+      assert :atomics.get(last_applied_index, shard_index + 1) == 44
+      assert :atomics.get(last_released_cursor_index, shard_index + 1) == 44
+    end
+
     test "release_cursor is not emitted when replay-safe marker cannot persist", %{
       state: state,
       shard_index: shard_index

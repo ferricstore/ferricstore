@@ -1210,12 +1210,13 @@ defmodule Ferricstore.Raft.StateMachine do
 
     {state, checkpoint_effects} =
       if crossed_interval? do
-        checkpoint_state = %{
+        checkpoint_state =
           state
-          | pending_release_cursor_index: ra_index,
-            pending_release_cursor_checkpoint_indices:
-              MapSet.union(previous_pending_checkpoint_indices, dirty_checkpoint_indices)
-        }
+          |> Map.put(:pending_release_cursor_index, ra_index)
+          |> Map.put(
+            :pending_release_cursor_checkpoint_indices,
+            MapSet.union(previous_pending_checkpoint_indices, dirty_checkpoint_indices)
+          )
 
         if checkpoint_clean_now? do
           {checkpoint_state, []}
@@ -1289,12 +1290,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
           state =
             if Map.get(state, :pending_release_cursor_index) == release_index do
-              %{
-                state
-                | pending_release_cursor_index: nil,
-                  pending_replay_safe_marker_index: nil,
-                  pending_release_cursor_checkpoint_indices: MapSet.new()
-              }
+              state
+              |> Map.put(:pending_release_cursor_index, nil)
+              |> Map.put(:pending_replay_safe_marker_index, nil)
+              |> Map.put(:pending_release_cursor_checkpoint_indices, MapSet.new())
             else
               state
             end
@@ -1405,9 +1404,9 @@ defmodule Ferricstore.Raft.StateMachine do
       end
 
     if bitcask_status == :durable and lmdb_status == :durable do
-      {:ready, %{state | pending_replay_safe_marker_index: nil}}
+      {:ready, Map.put(state, :pending_replay_safe_marker_index, nil)}
     else
-      %{state | pending_replay_safe_marker_index: release_index}
+      Map.put(state, :pending_replay_safe_marker_index, release_index)
     end
   end
 
