@@ -181,8 +181,14 @@ defmodule Ferricstore.Commands.Bitmap do
   def handle("BITPOS", [key, bit_str], store) do
     with :ok <- ensure_string_key(key, store),
          {:ok, bit_val} <- parse_bit_value(bit_str) do
-      current = Ops.get(store, key) || <<>>
-      bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
+      case bitpos_all_from_store(store, key, bit_val) do
+        {:ok, pos} ->
+          pos
+
+        :unknown ->
+          current = Ops.get(store, key) || <<>>
+          bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
+      end
     end
   end
 
@@ -524,6 +530,44 @@ defmodule Ferricstore.Commands.Bitmap do
     case Ops.getrange(store, key, offset, last) do
       slice when is_binary(slice) and byte_size(slice) == expected_size ->
         bitcount_all_chunks(store, key, size, last + 1, acc + popcount(slice))
+
+      _missing_or_short ->
+        :unknown
+    end
+  end
+
+  defp bitpos_all_from_store(store, key, bit_val) do
+    case metadata_value_size(store, key) do
+      0 when bit_val == 0 ->
+        {:ok, 0}
+
+      0 ->
+        {:ok, -1}
+
+      size when is_integer(size) and size > 0 ->
+        bitpos_all_chunks(store, key, bit_val, size, 0)
+
+      _unknown_or_missing ->
+        :unknown
+    end
+  end
+
+  defp bitpos_all_chunks(_store, _key, 0, size, offset) when offset >= size,
+    do: {:ok, size * 8}
+
+  defp bitpos_all_chunks(_store, _key, 1, size, offset) when offset >= size,
+    do: {:ok, -1}
+
+  defp bitpos_all_chunks(store, key, bit_val, size, offset) do
+    last = min(offset + @bitcount_chunk_bytes - 1, size - 1)
+    expected_size = last - offset + 1
+
+    case Ops.getrange(store, key, offset, last) do
+      slice when is_binary(slice) and byte_size(slice) == expected_size ->
+        case scan_bytes_for_bit(slice, bit_val, 0, byte_size(slice) - 1) do
+          pos when pos >= 0 -> {:ok, offset * 8 + pos}
+          -1 -> bitpos_all_chunks(store, key, bit_val, size, last + 1)
+        end
 
       _missing_or_short ->
         :unknown

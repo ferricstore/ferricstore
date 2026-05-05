@@ -405,10 +405,46 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert -1 == Bitmap.handle("BITPOS", ["mykey", "1"], store)
     end
 
+    test "known cold value finds first 1 bit with bounded range chunks" do
+      test_pid = self()
+
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 4 end,
+        getrange: fn
+          "cold", 0, 3 ->
+            send(test_pid, {:range_reader_called, 0, 3})
+            <<0x00, 0x00, 0x08, 0xFF>>
+        end,
+        get: fn _key -> flunk("BITPOS should not load the full cold value") end
+      }
+
+      assert 20 == Bitmap.handle("BITPOS", ["cold", "1"], store)
+      assert_received {:range_reader_called, 0, 3}
+    end
+
     test "find first 0 bit in all-ones string returns position past end" do
       # Redis returns position just past the end when looking for 0 in all-1s
       store = MockStore.make(%{"mykey" => {<<0xFF, 0xFF>>, 0}})
       assert 16 == Bitmap.handle("BITPOS", ["mykey", "0"], store)
+    end
+
+    test "known all-ones cold value finds virtual zero without loading full value" do
+      test_pid = self()
+
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 2 end,
+        getrange: fn
+          "cold", 0, 1 ->
+            send(test_pid, {:range_reader_called, 0, 1})
+            <<0xFF, 0xFF>>
+        end,
+        get: fn _key -> flunk("BITPOS 0 should not load the full cold value") end
+      }
+
+      assert 16 == Bitmap.handle("BITPOS", ["cold", "0"], store)
+      assert_received {:range_reader_called, 0, 1}
     end
 
     test "find first 1 bit at offset 0" do
