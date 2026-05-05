@@ -3,6 +3,10 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   use GenServer
 
+  alias Ferricstore.Flow.LMDBReplaySafeIndex
+
+  require Logger
+
   @default_flush_interval_ms 10
   @default_max_ops 1_000
 
@@ -21,6 +25,51 @@ defmodule Ferricstore.Flow.LMDBWriter do
     catch
       :exit, _ -> :ok
     end
+  end
+
+  def durable?(instance_ctx, shard_index, shard_data_path, index) do
+    durable_index(instance_ctx, shard_index, shard_data_path) >= index
+  end
+
+  def durable_index(
+        %{flow_lmdb_replay_safe_index: replay_safe_index},
+        shard_index,
+        _shard_data_path
+      )
+      when is_reference(replay_safe_index) do
+    if shard_index < :atomics.info(replay_safe_index).size do
+      :atomics.get(replay_safe_index, shard_index + 1)
+    else
+      0
+    end
+  rescue
+    _ -> 0
+  end
+
+  def durable_index(_instance_ctx, _shard_index, shard_data_path) do
+    LMDBReplaySafeIndex.read(shard_data_path)
+  end
+
+  def request(instance_ctx, shard_index, shard_data_path, index)
+      when is_integer(index) and index >= 0 do
+    publish_requested(instance_ctx, shard_index, index)
+
+    cond do
+      durable?(instance_ctx, shard_index, shard_data_path, index) ->
+        :durable
+
+      is_pid(writer_pid = Process.whereis(name(shard_index))) ->
+        GenServer.cast(writer_pid, {:persist_replay_safe, index})
+        :requested
+
+      Ferricstore.Flow.LMDB.write_through?() ->
+        sync_persist(instance_ctx, shard_index, shard_data_path, index)
+
+      true ->
+        {:error, :writer_not_started}
+    end
+  catch
+    :exit, reason -> {:error, reason}
   end
 
   def flush_all(shard_count, timeout \\ 30_000) do
@@ -46,14 +95,18 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
     state = %{
       shard_index: shard_index,
+      shard_data_path: Ferricstore.DataDir.shard_data_path(data_dir, shard_index),
       path:
         data_dir
         |> Ferricstore.DataDir.shard_data_path(shard_index)
         |> Ferricstore.Flow.LMDB.path(),
+      instance_ctx: Keyword.get(opts, :instance_ctx),
       pending: [],
       pending_after_flush: [],
       count: 0,
       timer_ref: nil,
+      durable_index: 0,
+      requested_index: 0,
       flush_interval_ms:
         Application.get_env(
           :ferricstore,
@@ -62,6 +115,11 @@ defmodule Ferricstore.Flow.LMDBWriter do
         ),
       max_ops: Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops, @default_max_ops)
     }
+
+    durable_index = LMDBReplaySafeIndex.read(state.shard_data_path)
+    publish_durable(state.instance_ctx, shard_index, durable_index)
+
+    state = %{state | durable_index: durable_index, requested_index: durable_index}
 
     {:ok, state}
   end
@@ -84,8 +142,18 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
+  def handle_cast({:persist_replay_safe, index}, state) when is_integer(index) and index >= 0 do
+    requested_index = max(state.requested_index, index)
+    publish_requested(state.instance_ctx, state.shard_index, requested_index)
+
+    {:noreply, flush_pending(%{state | requested_index: requested_index})}
+  end
+
   @impl true
-  def handle_call(:flush, _from, state), do: {:reply, :ok, flush_pending(state)}
+  def handle_call(:flush, _from, state) do
+    {state, reply} = flush_pending_with_reply(state)
+    {:reply, reply, state}
+  end
 
   @impl true
   def handle_info(:flush, state), do: {:noreply, flush_pending(%{state | timer_ref: nil})}
@@ -96,20 +164,76 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp ensure_timer(state), do: state
 
-  defp flush_pending(%{pending: []} = state), do: %{state | count: 0, pending_after_flush: []}
-
   defp flush_pending(state) do
+    {state, _reply} = flush_pending_with_reply(state)
+    state
+  end
+
+  defp flush_pending_with_reply(
+         %{pending: [], requested_index: requested, durable_index: durable} = state
+       )
+       when requested <= durable do
+    {%{state | count: 0, pending_after_flush: [], timer_ref: nil}, :ok}
+  end
+
+  defp flush_pending_with_reply(state) do
     if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
 
     ops = Enum.reverse(state.pending)
     after_flush = Enum.reverse(state.pending_after_flush)
+    started_at = System.monotonic_time()
 
-    case Ferricstore.Flow.LMDB.write_batch(state.path, ops) do
-      :ok -> Enum.each(after_flush, &apply_after_flush/1)
-      {:error, _reason} -> :ok
+    case flush_ops_and_marker(state, ops, started_at) do
+      {:ok, state} ->
+        Enum.each(after_flush, &apply_after_flush/1)
+
+        {%{state | pending: [], pending_after_flush: [], count: 0, timer_ref: nil}, :ok}
+
+      {:error, reason, state} ->
+        record_persist_failure(state.instance_ctx, state.shard_index)
+        emit_persist({:error, reason}, state, state.requested_index, started_at)
+
+        Logger.warning(
+          "Flow LMDB writer shard #{state.shard_index} flush failed: #{inspect(reason)}"
+        )
+
+        {ensure_timer(%{state | timer_ref: nil}), {:error, reason}}
     end
+  end
 
-    %{state | pending: [], pending_after_flush: [], count: 0, timer_ref: nil}
+  defp flush_ops_and_marker(state, ops, started_at) do
+    with :ok <- write_ops(state.path, ops),
+         {:ok, state} <- persist_requested(state, started_at) do
+      {:ok, state}
+    else
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp write_ops(_path, []), do: :ok
+  defp write_ops(path, ops), do: Ferricstore.Flow.LMDB.write_batch(path, ops)
+
+  defp persist_requested(
+         %{requested_index: requested, durable_index: durable} = state,
+         _started_at
+       )
+       when requested <= durable do
+    {:ok, state}
+  end
+
+  defp persist_requested(state, started_at) do
+    index = state.requested_index
+
+    case LMDBReplaySafeIndex.persist(state.shard_data_path, index) do
+      :ok ->
+        publish_durable(state.instance_ctx, state.shard_index, index)
+        emit_persist(:ok, state, index, started_at)
+        poke_release_cursor(state, index)
+        {:ok, %{state | durable_index: index}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp prepend_reverse([], acc), do: acc
@@ -148,5 +272,110 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   rescue
     ArgumentError -> :ok
+  end
+
+  defp sync_persist(instance_ctx, shard_index, shard_data_path, index) do
+    publish_requested(instance_ctx, shard_index, index)
+
+    case LMDBReplaySafeIndex.persist(shard_data_path, index) do
+      :ok ->
+        publish_durable(instance_ctx, shard_index, index)
+        :durable
+
+      {:error, _reason} = error ->
+        record_persist_failure(instance_ctx, shard_index)
+        error
+    end
+  end
+
+  defp poke_release_cursor(state, index) do
+    Ferricstore.Raft.Batcher.async_submit(state.shard_index, {:release_cursor_poke, index})
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp publish_durable(%{flow_lmdb_replay_safe_index: replay_safe_index}, shard_index, index)
+       when is_reference(replay_safe_index) do
+    if shard_index < :atomics.info(replay_safe_index).size do
+      :atomics.put(replay_safe_index, shard_index + 1, index)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp publish_durable(_instance_ctx, _shard_index, _index), do: :ok
+
+  defp publish_requested(
+         %{flow_lmdb_replay_safe_requested_index: requested_index},
+         shard_index,
+         index
+       )
+       when is_reference(requested_index) do
+    put_atomic_max(requested_index, shard_index, index)
+  rescue
+    _ -> :ok
+  end
+
+  defp publish_requested(_instance_ctx, _shard_index, _index), do: :ok
+
+  defp record_persist_failure(%{flow_lmdb_replay_safe_persist_failures: failures}, shard_index)
+       when is_reference(failures) do
+    if shard_index < :atomics.info(failures).size do
+      :atomics.add(failures, shard_index + 1, 1)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp record_persist_failure(_instance_ctx, _shard_index), do: :ok
+
+  defp put_atomic_max(ref, shard_index, value) do
+    if shard_index < :atomics.info(ref).size do
+      position = shard_index + 1
+      current = :atomics.get(ref, position)
+
+      if value > current do
+        :atomics.put(ref, position, value)
+      end
+    end
+
+    :ok
+  end
+
+  defp emit_persist(status, state, index, started_at) do
+    requested_index = max(state.requested_index, index)
+    durable_index = if status == :ok, do: index, else: state.durable_index
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb_replay_safe_index, :persist],
+      %{
+        duration_us: duration_us(started_at),
+        index: index,
+        requested_index: requested_index,
+        durable_index: durable_index,
+        lag: max(requested_index - durable_index, 0)
+      },
+      %{
+        status: persist_status(status),
+        shard_index: state.shard_index,
+        reason: persist_reason(status)
+      }
+    )
+  end
+
+  defp persist_status(:ok), do: :ok
+  defp persist_status({:error, _}), do: :error
+
+  defp persist_reason(:ok), do: :none
+  defp persist_reason({:error, reason}), do: reason
+
+  defp duration_us(started_at) do
+    System.monotonic_time()
+    |> Kernel.-(started_at)
+    |> System.convert_time_unit(:native, :microsecond)
   end
 end

@@ -34,16 +34,18 @@ defmodule Ferricstore.Cluster.DataSync do
       # Open the DETS file read-only
       dets_name = :"ferricstore_meta_read_#{shard_index}_#{System.unique_integer([:positive])}"
 
-      case :dets.open_file(dets_name, [file: String.to_charlist(meta_path), access: :read]) do
+      case :dets.open_file(dets_name, file: String.to_charlist(meta_path), access: :read) do
         {:ok, ref} ->
           uid = "ferricstore_shard_#{shard_index}"
 
-          result = case :dets.lookup(ref, uid) do
-            [{^uid, _term, _voted_for, last_applied}] when is_integer(last_applied) ->
-              last_applied
-            _ ->
-              0
-          end
+          result =
+            case :dets.lookup(ref, uid) do
+              [{^uid, _term, _voted_for, last_applied}] when is_integer(last_applied) ->
+                last_applied
+
+              _ ->
+                0
+            end
 
           :dets.close(ref)
           result
@@ -86,6 +88,7 @@ defmodule Ferricstore.Cluster.DataSync do
 
             Enum.any?(log_files, fn f ->
               path = Path.join(target_shard_path, f)
+
               case :erpc.call(target_node, File, :stat, [path]) do
                 {:ok, %{size: size}} -> size > 0
                 _ -> false
@@ -120,10 +123,16 @@ defmodule Ferricstore.Cluster.DataSync do
           first_index = Map.get(overview, :first_index, 0)
 
           if target_index >= first_index do
-            Logger.info("Shard #{shard_index}: WAL bridgeable (target=#{target_index} >= first=#{first_index})")
+            Logger.info(
+              "Shard #{shard_index}: WAL bridgeable (target=#{target_index} >= first=#{first_index})"
+            )
+
             :wal_bridgeable
           else
-            Logger.info("Shard #{shard_index}: WAL gap (target=#{target_index} < first=#{first_index}), needs resync")
+            Logger.info(
+              "Shard #{shard_index}: WAL gap (target=#{target_index} < first=#{first_index}), needs resync"
+            )
+
             :needs_resync
           end
 
@@ -248,7 +257,6 @@ defmodule Ferricstore.Cluster.DataSync do
     end
   end
 
-
   @doc false
   def rebuild_keydirs_on_target(target_node, shard_count) do
     Logger.info("DataSync: rebuilding keydirs on #{target_node}")
@@ -266,14 +274,23 @@ defmodule Ferricstore.Cluster.DataSync do
 
         # Clear existing entries and re-recover from copied Bitcask files
         :erpc.call(target_node, :ets, :delete_all_objects, [keydir])
-        :erpc.call(target_node, Ferricstore.Store.Shard.Lifecycle, :recover_keydir,
-          [shard_data_path, keydir, shard_idx])
+
+        :erpc.call(target_node, Ferricstore.Store.Shard.Lifecycle, :recover_keydir, [
+          shard_data_path,
+          keydir,
+          shard_idx
+        ])
 
         ets_size = :erpc.call(target_node, :ets, :info, [keydir, :size])
-        Logger.info("DataSync: shard #{shard_idx} keydir rebuilt on #{target_node} (#{ets_size} keys)")
+
+        Logger.info(
+          "DataSync: shard #{shard_idx} keydir rebuilt on #{target_node} (#{ets_size} keys)"
+        )
       catch
         kind, reason ->
-          Logger.error("DataSync: failed to rebuild keydir for shard #{shard_idx} on #{target_node}: #{inspect({kind, reason})}")
+          Logger.error(
+            "DataSync: failed to rebuild keydir for shard #{shard_idx} on #{target_node}: #{inspect({kind, reason})}"
+          )
       end
     end
   end
@@ -304,7 +321,9 @@ defmodule Ferricstore.Cluster.DataSync do
     leader_shard_data = Ferricstore.DataDir.shard_data_path(leader_data_dir, shard_index)
     target_shard_data = Ferricstore.DataDir.shard_data_path(target_data_dir, shard_index)
 
-    Logger.info("Shard #{shard_index}: syncing #{leader_node}:#{leader_shard_data} → #{target_node}:#{target_shard_data}")
+    Logger.info(
+      "Shard #{shard_index}: syncing #{leader_node}:#{leader_shard_data} → #{target_node}:#{target_shard_data}"
+    )
 
     # 1. Pause writes on the LEADER's shard (not local)
     pause_shard(leader_node, shard_name)
@@ -318,10 +337,14 @@ defmodule Ferricstore.Cluster.DataSync do
       leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
       {raft_index, overview_info} = get_raft_index_with_detail(leader_node, leader_server_id)
 
-      # 3. Copy shard data directory from leader to target
+      # 3. Copy the whole shard data directory from leader to target. This
+      # includes Bitcask files, replay-safe markers, and the Flow LMDB dir.
       copy_directory_from(leader_node, leader_shard_data, target_node, target_shard_data)
 
-      Logger.info("Shard #{shard_index}: sync complete at raft last_applied=#{raft_index} #{overview_info}")
+      Logger.info(
+        "Shard #{shard_index}: sync complete at raft last_applied=#{raft_index} #{overview_info}"
+      )
+
       {:ok, raft_index}
     rescue
       e -> {:error, Exception.message(e)}
@@ -411,8 +434,9 @@ defmodule Ferricstore.Cluster.DataSync do
 
   # Reads files from `source_node` and writes them to `target_node`.
   # When source_node == node(), reads are local.
+  @doc false
   @spec copy_directory_from(node(), binary(), node(), binary()) :: :ok
-  defp copy_directory_from(source_node, source_path, target_node, target_path) do
+  def copy_directory_from(source_node, source_path, target_node, target_path) do
     Logger.info("DataSync: copying #{source_node}:#{source_path} → #{target_node}:#{target_path}")
     :erpc.call(target_node, File, :mkdir_p!, [target_path])
 
@@ -450,5 +474,4 @@ defmodule Ferricstore.Cluster.DataSync do
       end
     end)
   end
-
 end

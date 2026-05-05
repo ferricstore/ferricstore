@@ -192,7 +192,8 @@ defmodule Ferricstore.Application do
       if Ferricstore.Flow.LMDB.mirror?() do
         Enum.map(0..(shard_count - 1), fn i ->
           Supervisor.child_spec(
-            {Ferricstore.Flow.LMDBWriter, shard_index: i, data_dir: data_dir},
+            {Ferricstore.Flow.LMDBWriter,
+             shard_index: i, data_dir: data_dir, instance_ctx: default_ctx},
             id: :"flow_lmdb_writer_#{i}"
           )
         end)

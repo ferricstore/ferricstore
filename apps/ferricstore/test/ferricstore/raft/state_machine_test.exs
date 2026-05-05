@@ -3496,6 +3496,50 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert :atomics.get(last_released_cursor_index, shard_index + 1) == marker_index
     end
 
+    test "release cursor waits for LMDB replay-safe marker when Flow LMDB is enabled", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      marker_index = 91
+      atomics_size = shard_index + 1
+      checkpoint_flags = :atomics.new(atomics_size, signed: false)
+      checkpoint_in_flight = :atomics.new(atomics_size, signed: false)
+      last_applied_index = :atomics.new(atomics_size, signed: false)
+      last_released_cursor_index = :atomics.new(atomics_size, signed: false)
+      replay_safe_index = :atomics.new(atomics_size, signed: false)
+      flow_lmdb_replay_safe_index = :atomics.new(atomics_size, signed: false)
+
+      :atomics.put(replay_safe_index, shard_index + 1, marker_index)
+
+      state = %{
+        state
+        | applied_count: 10,
+          flow_lmdb_enabled: true,
+          release_cursor_interval: 1,
+          pending_release_cursor_index: marker_index,
+          pending_replay_safe_marker_index: marker_index,
+          pending_release_cursor_checkpoint_indices: MapSet.new(),
+          instance_ctx: %{
+            checkpoint_flags: checkpoint_flags,
+            checkpoint_in_flight: checkpoint_in_flight,
+            last_applied_index: last_applied_index,
+            last_released_cursor_index: last_released_cursor_index,
+            replay_safe_index: replay_safe_index,
+            flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index
+          }
+      }
+
+      {_new_state, {:applied_at, 92, :ok}, effects} =
+        StateMachine.apply(
+          %{index: 92, term: 1, system_time: System.os_time(:millisecond)},
+          {:async, node(), {:release_cursor_poke, marker_index}},
+          state
+        )
+
+      refute Enum.any?(effects, &match?({:release_cursor, ^marker_index}, &1))
+      assert :atomics.get(last_released_cursor_index, shard_index + 1) == 0
+    end
+
     test "batched release cursor poke does not advance release interval", %{
       state: state,
       shard_index: shard_index

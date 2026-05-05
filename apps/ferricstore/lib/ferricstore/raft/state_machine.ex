@@ -1330,40 +1330,84 @@ defmodule Ferricstore.Raft.StateMachine do
   defp ensure_replay_safe_index(state, release_index) do
     instance_ctx = checkpoint_ctx_for_state(state)
 
-    if Ferricstore.Raft.ReplaySafeIndexWriter.durable?(
-         instance_ctx,
-         state.shard_index,
-         state.shard_data_path,
-         release_index
-       ) do
+    bitcask_ready? =
+      Ferricstore.Raft.ReplaySafeIndexWriter.durable?(
+        instance_ctx,
+        state.shard_index,
+        state.shard_data_path,
+        release_index
+      )
+
+    lmdb_ready? = flow_lmdb_replay_safe?(state, instance_ctx, release_index)
+
+    if bitcask_ready? and lmdb_ready? do
       {:ready, state}
     else
-      case request_replay_safe_index(state, instance_ctx, release_index) do
+      case request_replay_safe_indexes(
+             state,
+             instance_ctx,
+             release_index,
+             bitcask_ready?,
+             lmdb_ready?
+           ) do
         {:ready, state} -> {:ready, state}
         state -> {:pending, state}
       end
     end
   end
 
-  defp request_replay_safe_index(state, instance_ctx, release_index) do
-    if Map.get(state, :pending_replay_safe_marker_index) == release_index do
-      state
-    else
-      case Ferricstore.Raft.ReplaySafeIndexWriter.request(
-             instance_ctx,
-             state.shard_index,
-             state.shard_data_path,
-             release_index
-           ) do
-        :durable ->
-          {:ready, %{state | pending_replay_safe_marker_index: nil}}
+  defp flow_lmdb_replay_safe?(state, instance_ctx, release_index) do
+    not flow_lmdb_enabled?(state) or
+      Ferricstore.Flow.LMDBWriter.durable?(
+        instance_ctx,
+        state.shard_index,
+        state.shard_data_path,
+        release_index
+      )
+  end
 
-        :requested ->
-          %{state | pending_replay_safe_marker_index: release_index}
+  defp request_replay_safe_indexes(
+         state,
+         instance_ctx,
+         release_index,
+         bitcask_ready?,
+         lmdb_ready?
+       ) do
+    bitcask_status =
+      cond do
+        bitcask_ready? ->
+          :durable
 
-        {:error, _reason} ->
-          state
+        Map.get(state, :pending_replay_safe_marker_index) == release_index ->
+          :requested
+
+        true ->
+          Ferricstore.Raft.ReplaySafeIndexWriter.request(
+            instance_ctx,
+            state.shard_index,
+            state.shard_data_path,
+            release_index
+          )
       end
+
+    lmdb_status =
+      cond do
+        lmdb_ready? ->
+          :durable
+
+        true ->
+          Ferricstore.Flow.LMDBWriter.request(
+            instance_ctx,
+            state.shard_index,
+            state.shard_data_path,
+            release_index
+          )
+      end
+
+    if bitcask_status == :durable and lmdb_status == :durable do
+      {:ready, %{state | pending_replay_safe_marker_index: nil}}
+    else
+      %{state | pending_replay_safe_marker_index: release_index}
     end
   end
 

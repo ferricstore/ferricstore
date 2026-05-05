@@ -118,6 +118,59 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, "v2"} = Ferricstore.Flow.LMDB.get(path, key)
   end
 
+  test "mirror writer persists replay-safe marker only after pending ops flush" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_marker_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 42
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    key = "flow:{flow:test}:state:marker"
+    atomics_size = shard_index + 1
+    durable = :atomics.new(atomics_size, signed: false)
+    requested = :atomics.new(atomics_size, signed: false)
+    failures = :atomics.new(atomics_size, signed: false)
+
+    instance_ctx = %{
+      flow_lmdb_replay_safe_index: durable,
+      flow_lmdb_replay_safe_requested_index: requested,
+      flow_lmdb_replay_safe_persist_failures: failures
+    }
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(shard_data_path)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_ctx: instance_ctx}
+    )
+
+    path = Ferricstore.Flow.LMDB.path(shard_data_path)
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.enqueue(shard_index, [{:put, key, "v1"}])
+
+    assert :requested =
+             Ferricstore.Flow.LMDBWriter.request(instance_ctx, shard_index, shard_data_path, 123)
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(shard_index + 1)
+
+    assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
+    assert :atomics.get(durable, shard_index + 1) == 123
+    assert Ferricstore.Flow.LMDBReplaySafeIndex.read(shard_data_path) == 123
+  end
+
   test "mirror flow reads reject stale LMDB record and fall back to Bitcask truth" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_enabled = Application.get_env(:ferricstore, :flow_lmdb_enabled)
