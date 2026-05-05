@@ -1,15 +1,19 @@
 defmodule FerricstoreServer.Connection.TrackingTest do
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Config
+  alias Ferricstore.PubSub
   alias FerricstoreServer.ClientTracking
   alias FerricstoreServer.Connection.Tracking
 
   setup do
+    Config.set("notify-keyspace-events", "")
     ClientTracking.init_tables()
     :ets.delete_all_objects(:ferricstore_tracking)
     :ets.delete_all_objects(:ferricstore_tracking_connections)
 
     on_exit(fn ->
+      Config.set("notify-keyspace-events", "")
       ClientTracking.cleanup(self())
     end)
 
@@ -115,5 +119,53 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert_receive {:tracking_invalidation, _payload, [^destination]}
     assert :ets.lookup(:ferricstore_tracking, source) == []
     assert :ets.lookup(:ferricstore_tracking, destination) == []
+  end
+
+  test "COPY keyspace notification fires for destination only on mutation" do
+    source = "tracking:keyspace:copy:src"
+    destination = "tracking:keyspace:copy:dst"
+    Config.set("notify-keyspace-events", "KEg")
+    PubSub.subscribe("__keyspace@0__:#{source}", self())
+    PubSub.subscribe("__keyspace@0__:#{destination}", self())
+    PubSub.subscribe("__keyevent@0__:copy", self())
+
+    Tracking.maybe_notify_keyspace("COPY", [source, destination], 1)
+
+    refute_received {:pubsub_message, "__keyspace@0__:" <> ^source, "copy"}
+    assert_received {:pubsub_message, "__keyspace@0__:" <> ^destination, "copy"}
+    assert_received {:pubsub_message, "__keyevent@0__:copy", ^destination}
+  end
+
+  test "COPY keyspace notification is silent when destination was not modified" do
+    source = "tracking:keyspace:copy_noop:src"
+    destination = "tracking:keyspace:copy_noop:dst"
+    Config.set("notify-keyspace-events", "KEg")
+    PubSub.subscribe("__keyspace@0__:#{source}", self())
+    PubSub.subscribe("__keyspace@0__:#{destination}", self())
+    PubSub.subscribe("__keyevent@0__:copy", self())
+
+    Tracking.maybe_notify_keyspace("COPY", [source, destination], 0)
+
+    refute_received {:pubsub_message, _, _}
+  end
+
+  test "MSETNX keyspace notification fires for all keys only when mutation succeeds" do
+    key_a = "tracking:keyspace:msetnx:a"
+    key_b = "tracking:keyspace:msetnx:b"
+    Config.set("notify-keyspace-events", "KE$")
+    PubSub.subscribe("__keyspace@0__:#{key_a}", self())
+    PubSub.subscribe("__keyspace@0__:#{key_b}", self())
+    PubSub.subscribe("__keyevent@0__:mset", self())
+
+    Tracking.maybe_notify_keyspace("MSETNX", [key_a, "1", key_b, "2"], 0)
+
+    refute_received {:pubsub_message, _, _}
+
+    Tracking.maybe_notify_keyspace("MSETNX", [key_a, "1", key_b, "2"], 1)
+
+    assert_received {:pubsub_message, "__keyspace@0__:" <> ^key_a, "mset"}
+    assert_received {:pubsub_message, "__keyspace@0__:" <> ^key_b, "mset"}
+    assert_received {:pubsub_message, "__keyevent@0__:mset", ^key_a}
+    assert_received {:pubsub_message, "__keyevent@0__:mset", ^key_b}
   end
 end

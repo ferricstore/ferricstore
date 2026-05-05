@@ -108,6 +108,20 @@ defmodule FerricstoreServer.Connection.Tracking do
     |> Enum.each(fn [key, _val] -> KeyspaceNotifications.notify(key, event) end)
   end
 
+  def do_notify_keyspace("MSETNX", event, args, 1) do
+    args
+    |> Enum.chunk_every(2)
+    |> Enum.each(fn [key, _val] -> KeyspaceNotifications.notify(key, event) end)
+  end
+
+  def do_notify_keyspace("MSETNX", _event, _args, _result), do: :ok
+
+  def do_notify_keyspace("COPY", event, [_source, destination | _], 1) do
+    KeyspaceNotifications.notify(destination, event)
+  end
+
+  def do_notify_keyspace("COPY", _event, _args, _result), do: :ok
+
   def do_notify_keyspace("LMOVE", event, [source, destination | _], :ok) do
     KeyspaceNotifications.notify(source, event)
     KeyspaceNotifications.notify(destination, event)
