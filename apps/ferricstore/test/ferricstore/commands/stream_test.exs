@@ -8,6 +8,11 @@ defmodule Ferricstore.Commands.StreamTest do
   # Each test gets a unique stream key to avoid interference.
   defp ustream, do: "stream_#{:rand.uniform(999_999)}"
   defp ids(entries), do: Enum.map(entries, &hd/1)
+  defp stream_entry_key(key, id), do: "X:#{key}" <> <<0>> <> id
+
+  defp corrupt_stream_entry(store, key, id) do
+    store.compound_put.(key, stream_entry_key(key, id), <<131, 100, 0, 12, "made_up_atom">>, 0)
+  end
 
   # Clean up ETS tables between tests to prevent state leaking.
   setup do
@@ -46,6 +51,30 @@ defmodule Ferricstore.Commands.StreamTest do
       assert length(entries) == 1
       [entry] = entries
       assert entry == [id, "f1", "v1", "f2", "v2"]
+    end
+
+    test "XRANGE skips corrupt persisted stream entries" do
+      store = MockStore.make()
+      key = ustream()
+
+      bad_id = Stream.handle("XADD", [key, "1-0", "bad", "value"], store)
+      good_id = Stream.handle("XADD", [key, "2-0", "good", "value"], store)
+      corrupt_stream_entry(store, key, bad_id)
+
+      assert [[^good_id, "good", "value"]] = Stream.handle("XRANGE", [key, "-", "+"], store)
+    end
+
+    test "XINFO STREAM treats corrupt first/last entries as missing entries" do
+      store = MockStore.make()
+      key = ustream()
+
+      id = Stream.handle("XADD", [key, "1-0", "bad", "value"], store)
+      corrupt_stream_entry(store, key, id)
+
+      info = Stream.handle("XINFO", ["STREAM", key], store)
+
+      assert info["first-entry"] == nil
+      assert info["last-entry"] == nil
     end
 
     test "XADD auto-IDs are monotonically increasing" do

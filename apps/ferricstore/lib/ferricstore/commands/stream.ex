@@ -596,9 +596,11 @@ defmodule Ferricstore.Commands.Stream do
           |> Enum.sort_by(fn {_id_str, id, _raw} -> id end)
           |> maybe_take(count)
 
-        Enum.map(selected_entries, fn {id_str, _id, raw} ->
-          fields = :erlang.binary_to_term(raw, [:safe])
-          [id_str | fields]
+        Enum.flat_map(selected_entries, fn {id_str, _id, raw} ->
+          case decode_stream_fields(raw) do
+            {:ok, fields} -> [[id_str | fields]]
+            :error -> []
+          end
         end)
     end
   end
@@ -909,8 +911,10 @@ defmodule Ferricstore.Commands.Stream do
   defp decode_stream_entry(_id, nil), do: nil
 
   defp decode_stream_entry(id, raw) do
-    fields = :erlang.binary_to_term(raw, [:safe])
-    [id | fields]
+    case decode_stream_fields(raw) do
+      {:ok, fields} -> [id | fields]
+      :error -> nil
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -1037,9 +1041,9 @@ defmodule Ferricstore.Commands.Stream do
                     prefix = "X:#{key}" <> @sep
                     raw = Ops.get(store, prefix <> id_str_inner)
 
-                    if raw do
-                      fields = :erlang.binary_to_term(raw, [:safe])
-                      [id_str_inner | fields]
+                    case decode_stream_fields(raw) do
+                      {:ok, fields} -> [id_str_inner | fields]
+                      :error -> nil
                     end
                   end)
                   |> Enum.reject(&is_nil/1)
@@ -1481,12 +1485,26 @@ defmodule Ferricstore.Commands.Stream do
     |> Enum.zip(raw_values)
     |> Enum.flat_map(fn
       {{id_str, _compound_key}, raw} when is_binary(raw) ->
-        [[id_str | :erlang.binary_to_term(raw, [:safe])]]
+        case decode_stream_fields(raw) do
+          {:ok, fields} -> [[id_str | fields]]
+          :error -> []
+        end
 
       _missing ->
         []
     end)
   end
+
+  defp decode_stream_fields(raw) when is_binary(raw) do
+    case :erlang.binary_to_term(raw, [:safe]) do
+      fields when is_list(fields) -> {:ok, fields}
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp decode_stream_fields(_), do: :error
 
   # ---------------------------------------------------------------------------
   # Private: argument parsing
