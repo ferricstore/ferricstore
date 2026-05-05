@@ -4273,8 +4273,7 @@ defmodule Ferricstore.Raft.StateMachine do
                flow_put_new_state_record(
                  state,
                  state_key,
-                 flow_encode(record),
-                 flow_record_expire_at(record)
+                 record
                ),
              :ok <- flow_due_put(state, record),
              :ok <- flow_index_put(state, record),
@@ -4405,8 +4404,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_create_many_apply(state, records) do
     with :ok <- flow_create_put_state_records(state, records),
-         :ok <- flow_due_put_many(state, records),
-         :ok <- flow_index_put_many(state, records),
+         :ok <- flow_due_put_many_new(state, records),
+         :ok <- flow_index_put_many_new(state, records),
          :ok <- flow_create_put_history(state, records) do
       :ok
     end
@@ -4732,8 +4731,7 @@ defmodule Ferricstore.Raft.StateMachine do
              flow_put_state_record(
                state,
                FlowKeys.state_key(id, partition_key),
-               flow_encode(next),
-               flow_record_expire_at(next)
+               next
              ),
            :ok <- flow_index_put(state, next),
            :ok <- flow_history_put(state, next, "completed", now_ms),
@@ -4821,8 +4819,7 @@ defmodule Ferricstore.Raft.StateMachine do
            flow_put_state_record(
              state,
              FlowKeys.state_key(next.id, partition_key),
-             flow_encode(next),
-             flow_record_expire_at(next)
+             next
            ),
          :ok <- flow_due_put(state, next),
          :ok <- flow_index_put(state, next),
@@ -4917,8 +4914,7 @@ defmodule Ferricstore.Raft.StateMachine do
              flow_put_state_record(
                state,
                FlowKeys.state_key(id, partition_key),
-               flow_encode(next),
-               flow_record_expire_at(next)
+               next
              ),
            :ok <- flow_due_put(state, next),
            :ok <- flow_index_put(state, next),
@@ -4959,8 +4955,7 @@ defmodule Ferricstore.Raft.StateMachine do
              flow_put_state_record(
                state,
                FlowKeys.state_key(id, partition_key),
-               flow_encode(next),
-               flow_record_expire_at(next)
+               next
              ),
            :ok <- flow_index_put(state, next),
            :ok <- flow_history_put(state, next, "failed", now_ms),
@@ -5000,8 +4995,7 @@ defmodule Ferricstore.Raft.StateMachine do
              flow_put_state_record(
                state,
                FlowKeys.state_key(id, partition_key),
-               flow_encode(next),
-               flow_record_expire_at(next)
+               next
              ),
            :ok <- flow_index_put(state, next),
            :ok <- flow_history_put(state, next, "cancelled", now_ms),
@@ -5030,8 +5024,7 @@ defmodule Ferricstore.Raft.StateMachine do
              flow_put_state_record(
                state,
                FlowKeys.state_key(id, partition_key),
-               flow_encode(next),
-               flow_record_expire_at(next)
+               next
              ),
            :ok <- flow_due_put(state, next),
            :ok <- flow_index_put(state, next),
@@ -5100,7 +5093,7 @@ defmodule Ferricstore.Raft.StateMachine do
     with :ok <- flow_zset_delete_members_from_key(state, due_key, all_due_delete_ids),
          :ok <- flow_claim_delete_old_indexes(state, plans),
          :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_due_put_many(state, Enum.map(plans, fn {_record, next} -> next end)),
+         :ok <- flow_due_put_many_new(state, Enum.map(plans, fn {_record, next} -> next end)),
          :ok <- flow_claim_put_running_indexes(state, plans),
          :ok <- flow_claim_put_history(state, plans, now_ms) do
       :ok
@@ -5161,8 +5154,7 @@ defmodule Ferricstore.Raft.StateMachine do
       flow_put_state_record(
         state,
         FlowKeys.state_key(next.id, partition_key),
-        flow_encode(next),
-        flow_record_expire_at(next)
+        next
       )
     end)
 
@@ -5176,8 +5168,7 @@ defmodule Ferricstore.Raft.StateMachine do
       flow_put_new_state_record(
         state,
         FlowKeys.state_key(record.id, partition_key),
-        flow_encode(record),
-        flow_record_expire_at(record)
+        record
       )
     end)
 
@@ -5188,8 +5179,8 @@ defmodule Ferricstore.Raft.StateMachine do
     plans
     |> Enum.reduce(%{}, fn {_record, next}, acc ->
       partition_key = Map.get(next, :partition_key)
-      updated_score = Float.to_string(Map.get(next, :updated_at_ms, 0) * 1.0)
-      lease_score = Float.to_string(Map.get(next, :lease_deadline_ms, 0) * 1.0)
+      updated_score = Map.get(next, :updated_at_ms, 0)
+      lease_score = Map.get(next, :lease_deadline_ms, 0)
 
       acc
       |> flow_claim_add_zset_entry(
@@ -5209,7 +5200,17 @@ defmodule Ferricstore.Raft.StateMachine do
       )
     end)
     |> Enum.each(fn {key, member_score_pairs} ->
-      flow_zset_put_many(state, key, Enum.reverse(member_score_pairs))
+      flow_zset_put_many_new(state, key, Enum.reverse(member_score_pairs))
+    end)
+
+    :ok
+  end
+
+  defp flow_index_put_many_new(state, records) do
+    records
+    |> flow_index_grouped_entries()
+    |> Enum.each(fn {key, member_score_pairs} ->
+      flow_zset_put_many_new(state, key, Enum.reverse(member_score_pairs))
     end)
 
     :ok
@@ -5217,9 +5218,19 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_index_put_many(state, records) do
     records
+    |> flow_index_grouped_entries()
+    |> Enum.each(fn {key, member_score_pairs} ->
+      flow_zset_put_many(state, key, Enum.reverse(member_score_pairs))
+    end)
+
+    :ok
+  end
+
+  defp flow_index_grouped_entries(records) do
+    records
     |> Enum.reduce(%{}, fn record, acc ->
       partition_key = Map.get(record, :partition_key)
-      updated_score = Float.to_string(Map.get(record, :updated_at_ms, 0) * 1.0)
+      updated_score = Map.get(record, :updated_at_ms, 0)
 
       acc =
         flow_claim_add_zset_entry(
@@ -5231,7 +5242,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
       acc =
         if Map.get(record, :state) == "running" do
-          lease_score = Float.to_string(Map.get(record, :lease_deadline_ms, 0) * 1.0)
+          lease_score = Map.get(record, :lease_deadline_ms, 0)
 
           acc
           |> flow_claim_add_zset_entry(
@@ -5250,11 +5261,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
       acc
     end)
-    |> Enum.each(fn {key, member_score_pairs} ->
-      flow_zset_put_many(state, key, Enum.reverse(member_score_pairs))
-    end)
-
-    :ok
   end
 
   defp flow_claim_add_zset_entry(acc, key, member, score) do
@@ -5668,9 +5674,9 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_due_put(state, %{type: type, state: flow_state, priority: priority, id: id} = record) do
     partition_key = Map.get(record, :partition_key)
     due_key = FlowKeys.due_key(type, flow_state, priority, partition_key)
-    score_str = Float.to_string(Map.fetch!(record, :next_run_at_ms) * 1.0)
+    score = Map.fetch!(record, :next_run_at_ms)
 
-    flow_zset_put(state, due_key, id, score_str)
+    flow_zset_put_new(state, due_key, id, score)
   end
 
   defp flow_due_delete(
@@ -5727,9 +5733,9 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_index_put(state, %{id: id, type: type, state: flow_state} = record) do
     partition_key = Map.get(record, :partition_key)
     state_index_key = FlowKeys.state_index_key(type, flow_state, partition_key)
-    updated_score = Float.to_string(Map.get(record, :updated_at_ms, 0) * 1.0)
+    updated_score = Map.get(record, :updated_at_ms, 0)
 
-    with :ok <- flow_zset_put(state, state_index_key, id, updated_score),
+    with :ok <- flow_zset_put_new(state, state_index_key, id, updated_score),
          :ok <- flow_metadata_index_put(state, record, updated_score) do
       flow_running_index_put(state, record)
     end
@@ -5780,12 +5786,12 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_running_index_put(state, %{state: "running", id: id, type: type} = record) do
     partition_key = Map.get(record, :partition_key)
-    lease_score = Float.to_string(Map.get(record, :lease_deadline_ms, 0) * 1.0)
+    lease_score = Map.get(record, :lease_deadline_ms, 0)
     inflight_index_key = FlowKeys.inflight_index_key(type, partition_key)
     worker_index_key = FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key)
 
-    with :ok <- flow_zset_put(state, inflight_index_key, id, lease_score) do
-      flow_zset_put(state, worker_index_key, id, lease_score)
+    with :ok <- flow_zset_put_new(state, inflight_index_key, id, lease_score) do
+      flow_zset_put_new(state, worker_index_key, id, lease_score)
     end
   end
 
@@ -5820,6 +5826,16 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_due_put_many(_state, []), do: :ok
 
   defp flow_due_put_many(state, records) do
+    flow_due_put_many_with(state, records, &flow_zset_put_many/3)
+  end
+
+  defp flow_due_put_many_new(_state, []), do: :ok
+
+  defp flow_due_put_many_new(state, records) do
+    flow_due_put_many_with(state, records, &flow_zset_put_many_new/3)
+  end
+
+  defp flow_due_put_many_with(state, records, put_fun) do
     records
     |> Enum.group_by(fn record ->
       partition_key = Map.get(record, :partition_key)
@@ -5828,11 +5844,10 @@ defmodule Ferricstore.Raft.StateMachine do
     |> Enum.each(fn {due_key, due_records} ->
       member_score_pairs =
         Enum.map(due_records, fn record ->
-          score_str = Float.to_string(Map.fetch!(record, :next_run_at_ms) * 1.0)
-          {record.id, score_str}
+          {record.id, Map.fetch!(record, :next_run_at_ms)}
         end)
 
-      flow_zset_put_many(state, due_key, member_score_pairs)
+      put_fun.(state, due_key, member_score_pairs)
     end)
 
     :ok
@@ -5851,11 +5866,11 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
-  defp flow_zset_put(
+  defp flow_zset_put_new(
          %{zset_score_lookup_name: lookup, zset_score_index_name: index},
          due_key,
          id,
-         score_str
+         score
        )
        when lookup != nil and index != nil do
     flow_ensure_due_index_ready(
@@ -5863,7 +5878,7 @@ defmodule Ferricstore.Raft.StateMachine do
       due_key
     )
 
-    ZSetIndex.put_member(index, lookup, due_key, id, score_str)
+    ZSetIndex.put_new_member(index, lookup, due_key, id, score)
   end
 
   defp flow_zset_put_many(
@@ -5878,6 +5893,20 @@ defmodule Ferricstore.Raft.StateMachine do
     )
 
     ZSetIndex.put_members(index, lookup, due_key, member_score_pairs)
+  end
+
+  defp flow_zset_put_many_new(
+         %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+         due_key,
+         member_score_pairs
+       )
+       when lookup != nil and index != nil do
+    flow_ensure_due_index_ready(
+      %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+      due_key
+    )
+
+    ZSetIndex.put_new_members(index, lookup, due_key, member_score_pairs)
   end
 
   defp flow_zset_delete(
@@ -6070,41 +6099,55 @@ defmodule Ferricstore.Raft.StateMachine do
     raw_put(state, key, value, expire_at_ms)
   end
 
-  defp flow_put_state_record(state, key, value, expire_at_ms) do
+  defp flow_put_state_record(state, key, record) when is_map(record) do
+    flow_put_state_record_encoded(
+      state,
+      key,
+      flow_encode(record),
+      flow_record_expire_at(record),
+      record,
+      :put
+    )
+  end
+
+  defp flow_put_new_state_record(state, key, record) when is_map(record) do
+    flow_put_state_record_encoded(
+      state,
+      key,
+      flow_encode(record),
+      flow_record_expire_at(record),
+      record,
+      :put_new
+    )
+  end
+
+  defp flow_put_state_record_encoded(state, key, value, expire_at_ms, record, put_mode) do
     cond do
       flow_lmdb_write_through?(state) ->
         record_pending_original(state, key)
         track_keydir_binary_remove(state, key)
         :ets.delete(state.ets, key)
-        queue_pending_lmdb_put(state, key, value, expire_at_ms)
+
+        case put_mode do
+          :put_new -> queue_pending_lmdb_put_new(state, key, value, expire_at_ms)
+          :put -> queue_pending_lmdb_put(state, key, value, expire_at_ms)
+        end
 
       flow_lmdb_mirror?(state) ->
-        raw_put_cold(state, key, value, expire_at_ms)
+        flow_mirror_put_state_record(state, key, value, expire_at_ms, record)
         queue_pending_lmdb_mirror_put(key, value, expire_at_ms)
-        maybe_queue_terminal_lmdb_index_put(state, key, value, expire_at_ms)
-        maybe_queue_active_lmdb_metadata_index_put(key, value, expire_at_ms)
+        maybe_queue_lmdb_indexes_for_state_record(state, key, expire_at_ms, record)
 
       true ->
         flow_put(state, key, value, expire_at_ms)
     end
   end
 
-  defp flow_put_new_state_record(state, key, value, expire_at_ms) do
-    cond do
-      flow_lmdb_write_through?(state) ->
-        record_pending_original(state, key)
-        track_keydir_binary_remove(state, key)
-        :ets.delete(state.ets, key)
-        queue_pending_lmdb_put_new(state, key, value, expire_at_ms)
-
-      flow_lmdb_mirror?(state) ->
-        raw_put_cold(state, key, value, expire_at_ms)
-        queue_pending_lmdb_mirror_put(key, value, expire_at_ms)
-        maybe_queue_terminal_lmdb_index_put(state, key, value, expire_at_ms)
-        maybe_queue_active_lmdb_metadata_index_put(key, value, expire_at_ms)
-
-      true ->
-        flow_put(state, key, value, expire_at_ms)
+  defp flow_mirror_put_state_record(state, key, value, expire_at_ms, record) do
+    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+      raw_put_cold(state, key, value, expire_at_ms)
+    else
+      raw_put(state, key, value, expire_at_ms)
     end
   end
 
@@ -6854,50 +6897,45 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
-  defp maybe_queue_terminal_lmdb_index_put(state, state_key, encoded_record, expire_at_ms) do
-    with {:ok, record} <- flow_decode_record_blob(encoded_record),
-         true <- Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-      partition_key = Map.get(record, :partition_key)
-      state_index_key = FlowKeys.state_index_key(record.type, record.state, partition_key)
-      updated_at_ms = Map.get(record, :updated_at_ms, 0)
-
-      index_key =
-        Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, record.id, updated_at_ms)
-
-      count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
-
-      queue_pending_lmdb_mirror_terminal_put(
-        index_key,
-        Ferricstore.Flow.LMDB.encode_terminal_index_value(
-          record.id,
-          updated_at_ms,
-          expire_at_ms,
-          state_key,
-          count_key
-        ),
-        state_key,
-        count_key
-      )
-
-      queue_pending_lmdb_mirror_after_flush(
-        {:prune_terminal_flow, state.ets, Map.get(state, :zset_score_index_name),
-         Map.get(state, :zset_score_lookup_name), state_key, state_index_key, record.id,
-         Map.fetch!(record, :version)}
-      )
-
-      queue_lmdb_metadata_index_puts(record, expire_at_ms)
+  defp maybe_queue_lmdb_indexes_for_state_record(state, state_key, expire_at_ms, record)
+       when is_map(record) do
+    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+      queue_terminal_lmdb_index_put(state, state_key, record, expire_at_ms)
     else
-      _ -> :ok
+      queue_lmdb_metadata_index_puts(record, expire_at_ms)
     end
   end
 
-  defp maybe_queue_active_lmdb_metadata_index_put(_state_key, encoded_record, expire_at_ms) do
-    with {:ok, record} <- flow_decode_record_blob(encoded_record),
-         false <- Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-      queue_lmdb_metadata_index_puts(record, expire_at_ms)
-    else
-      _ -> :ok
-    end
+  defp queue_terminal_lmdb_index_put(state, state_key, record, expire_at_ms) do
+    partition_key = Map.get(record, :partition_key)
+    state_index_key = FlowKeys.state_index_key(record.type, record.state, partition_key)
+    updated_at_ms = Map.get(record, :updated_at_ms, 0)
+
+    index_key =
+      Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, record.id, updated_at_ms)
+
+    count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+
+    queue_pending_lmdb_mirror_terminal_put(
+      index_key,
+      Ferricstore.Flow.LMDB.encode_terminal_index_value(
+        record.id,
+        updated_at_ms,
+        expire_at_ms,
+        state_key,
+        count_key
+      ),
+      state_key,
+      count_key
+    )
+
+    queue_pending_lmdb_mirror_after_flush(
+      {:prune_terminal_flow, state.ets, Map.get(state, :zset_score_index_name),
+       Map.get(state, :zset_score_lookup_name), state_key, state_index_key, record.id,
+       Map.fetch!(record, :version)}
+    )
+
+    queue_lmdb_metadata_index_puts(record, expire_at_ms)
   end
 
   defp queue_lmdb_metadata_index_puts(record, expire_at_ms) do

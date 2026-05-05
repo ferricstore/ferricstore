@@ -257,7 +257,23 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     end
   end
 
-  @spec put_members(:ets.tid(), :ets.tid(), binary(), [{binary(), binary()}]) :: :ok
+  @spec put_new_member(:ets.tid(), :ets.tid(), binary(), binary(), score_input()) :: :ok
+  def put_new_member(index_table, lookup_table, redis_key, member, score_input) do
+    case parse_score(score_input) do
+      {:ok, score} ->
+        :ets.insert(index_table, {{redis_key, @index_tag, score, member}, true})
+        :ets.insert(lookup_table, {{redis_key, member}, score})
+        increment_count(lookup_table, redis_key, 1)
+        :ok
+
+      :error ->
+        :ok
+    end
+  end
+
+  @type score_input :: binary() | integer() | float()
+
+  @spec put_members(:ets.tid(), :ets.tid(), binary(), [{binary(), score_input()}]) :: :ok
   def put_members(index_table, lookup_table, redis_key, member_score_pairs) do
     delta =
       Enum.reduce(member_score_pairs, 0, fn {member, score_str}, acc ->
@@ -285,6 +301,33 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
     if delta != 0 do
       increment_count(lookup_table, redis_key, delta)
+    end
+
+    :ok
+  end
+
+  @spec put_new_members(:ets.tid(), :ets.tid(), binary(), [{binary(), score_input()}]) :: :ok
+  def put_new_members(index_table, lookup_table, redis_key, member_score_pairs) do
+    {index_entries, lookup_entries, count} =
+      Enum.reduce(member_score_pairs, {[], [], 0}, fn {member, score_input},
+                                                      {index_acc, lookup_acc, count} ->
+        case parse_score(score_input) do
+          {:ok, score} ->
+            {
+              [{{redis_key, @index_tag, score, member}, true} | index_acc],
+              [{{redis_key, member}, score} | lookup_acc],
+              count + 1
+            }
+
+          :error ->
+            {index_acc, lookup_acc, count}
+        end
+      end)
+
+    if count > 0 do
+      :ets.insert(index_table, index_entries)
+      :ets.insert(lookup_table, lookup_entries)
+      increment_count(lookup_table, redis_key, count)
     end
 
     :ok
@@ -584,6 +627,7 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
   defp score_lte_bound?(score, {:inclusive, bound}), do: score <= bound
 
   defp parse_score(score) when is_float(score), do: {:ok, score}
+  defp parse_score(score) when is_integer(score), do: {:ok, score * 1.0}
 
   defp parse_score(score_str) when is_binary(score_str) do
     case Float.parse(score_str) do
