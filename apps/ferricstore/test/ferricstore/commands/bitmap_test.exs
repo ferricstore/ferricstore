@@ -459,6 +459,32 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert 8 == Bitmap.handle("BITPOS", ["mykey", "1", "1"], store)
     end
 
+    test "known cold byte range start scans large tail in bounded chunks" do
+      test_pid = self()
+
+      store = %{
+        compound_get: fn "cold", _compound_key -> nil end,
+        value_size: fn "cold" -> 70_000 end,
+        getrange: fn
+          "cold", 0, 65_535 ->
+            send(test_pid, {:range_reader_called, 0, 65_535})
+            :binary.copy(<<0x00>>, 65_536)
+
+          "cold", 65_536, 69_999 ->
+            send(test_pid, {:range_reader_called, 65_536, 69_999})
+            <<0x40, :binary.copy(<<0x00>>, 4_463)::binary>>
+
+          "cold", 0, 69_999 ->
+            flunk("BITPOS should not read the full cold tail in one range")
+        end,
+        get: fn _key -> flunk("BITPOS should not load the full cold value") end
+      }
+
+      assert 524_289 == Bitmap.handle("BITPOS", ["cold", "1", "0"], store)
+      assert_received {:range_reader_called, 0, 65_535}
+      assert_received {:range_reader_called, 65_536, 69_999}
+    end
+
     test "with byte range start and end" do
       # Byte 0 = 0x00, Byte 1 = 0x00, Byte 2 = 0xFF
       store = MockStore.make(%{"mykey" => {<<0x00, 0x00, 0xFF>>, 0}})

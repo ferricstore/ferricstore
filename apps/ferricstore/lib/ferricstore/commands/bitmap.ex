@@ -672,19 +672,7 @@ defmodule Ferricstore.Commands.Bitmap do
     with size when is_integer(size) <- metadata_value_size(store, key),
          end_idx <- if(end_idx == nil, do: size - 1, else: end_idx),
          {:ok, start_byte, end_byte} <- resolve_range(start_idx, end_idx, size) do
-      case Ops.getrange(store, key, start_byte, end_byte) do
-        slice when is_binary(slice) ->
-          case bitpos_byte_range(slice, bit_val, 0, byte_size(slice) - 1, explicit_end) do
-            pos when pos >= 0 -> {:ok, start_byte * 8 + pos}
-            -1 -> {:ok, -1}
-          end
-
-        nil ->
-          :unknown
-
-        _ ->
-          :unknown
-      end
+      bitpos_byte_range_chunks(store, key, bit_val, start_byte, end_byte, size, explicit_end)
     else
       :empty ->
         case metadata_value_size(store, key) do
@@ -696,6 +684,38 @@ defmodule Ferricstore.Commands.Bitmap do
         end
 
       _ ->
+        :unknown
+    end
+  end
+
+  defp bitpos_byte_range_chunks(_store, _key, bit_val, offset, end_byte, size, explicit_end)
+       when offset > end_byte do
+    {:ok, bitpos_empty_byte_range_result(bit_val, size, explicit_end)}
+  end
+
+  defp bitpos_byte_range_chunks(store, key, bit_val, offset, end_byte, size, explicit_end) do
+    last = min(offset + @bitcount_chunk_bytes - 1, end_byte)
+    expected_size = last - offset + 1
+
+    case Ops.getrange(store, key, offset, last) do
+      slice when is_binary(slice) and byte_size(slice) == expected_size ->
+        case scan_bytes_for_bit(slice, bit_val, 0, byte_size(slice) - 1) do
+          pos when pos >= 0 ->
+            {:ok, offset * 8 + pos}
+
+          -1 ->
+            bitpos_byte_range_chunks(
+              store,
+              key,
+              bit_val,
+              last + 1,
+              end_byte,
+              size,
+              explicit_end
+            )
+        end
+
+      _missing_or_short ->
         :unknown
     end
   end
