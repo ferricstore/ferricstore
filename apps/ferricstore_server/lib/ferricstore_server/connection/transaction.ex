@@ -74,7 +74,8 @@ defmodule FerricstoreServer.Connection.Transaction do
     try do
       new_watched =
         Enum.reduce(keys, state.watched_keys, fn key, acc ->
-          Map.put(acc, key, Router.watch_token(state.instance_ctx, key))
+          watched_key = namespace_key(state.sandbox_namespace, key)
+          Map.put(acc, watched_key, Router.watch_token(state.instance_ctx, watched_key))
         end)
 
       {:continue, Encoder.encode(:ok), %{state | watched_keys: new_watched}}
@@ -185,4 +186,7 @@ defmodule FerricstoreServer.Connection.Transaction do
       list_op: fn _key, _op -> nil end
     }
   end
+
+  defp namespace_key(nil, key), do: key
+  defp namespace_key(namespace, key) when is_binary(namespace), do: namespace <> key
 end
