@@ -95,4 +95,30 @@ defmodule Ferricstore.AsyncDurabilityRemovedTest do
 
     assert offenders == []
   end
+
+  test "benchmarks do not reference removed async durability mode" do
+    app_root = Path.expand("../..", __DIR__)
+
+    offenders =
+      Path.join(app_root, "test/ferricstore/bench/**/*.exs")
+      |> Path.wildcard()
+      |> Enum.flat_map(fn path ->
+        source = File.read!(path)
+
+        for token <- [
+              ~s("durability", "async"),
+              ~s("durability", "quorum"),
+              "durability_for(",
+              "durability_for check",
+              "async durability",
+              "Quorum vs Async",
+              "Write async"
+            ],
+            String.contains?(source, token) do
+          {Path.relative_to(path, app_root), token}
+        end
+      end)
+
+    assert offenders == []
+  end
 end
