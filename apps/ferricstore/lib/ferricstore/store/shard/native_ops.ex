@@ -31,8 +31,8 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   defp handle_cas_raft(key, expected, new_value, expire_at_ms, state) do
     # expire_at_ms is already absolute (converted by Router.cas).
     # Use the forced-quorum path so the result is the state machine's
-    # actual reply (1/0/nil) — Batcher.write would early-reply :ok in an
-    # :async namespace, breaking CAS's linearizability contract.
+    # actual reply (1/0/nil). CAS must not use fire-and-forget submission
+    # because callers need the state machine's linearizable decision.
     result = forced_quorum_call(state.index, {:cas, key, expected, new_value, expire_at_ms})
 
     case result do
@@ -258,8 +258,8 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   end
 
   defp handle_ratelimit_add_raft(key, window_ms, max, count, state) do
-    # Force-quorum path — Batcher.write would early-reply :ok on an :async
-    # namespace, breaking ratelimit's contract.
+    # Force-quorum path: callers need ratelimit's state-machine reply, not an
+    # enqueue acknowledgement.
     result = forced_quorum_call(state.index, {:ratelimit_add, key, window_ms, max, count})
 
     case result do
