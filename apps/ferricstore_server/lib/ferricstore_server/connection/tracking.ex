@@ -14,7 +14,7 @@ defmodule FerricstoreServer.Connection.Tracking do
     GETBIT BITCOUNT BITPOS PFCOUNT
     OBJECT SUBSTR
     GEOHASH GEOPOS GEODIST GEOSEARCH
-    XLEN XRANGE XREVRANGE XREAD XINFO
+    XLEN XRANGE XREVRANGE XREAD XREADGROUP XINFO
     JSON.GET JSON.TYPE JSON.STRLEN JSON.OBJKEYS JSON.OBJLEN JSON.ARRLEN JSON.MGET)
 
   # Commands that write keys and should trigger client tracking invalidation.
@@ -164,7 +164,7 @@ defmodule FerricstoreServer.Connection.Tracking do
         new_tracking = ClientTracking.track_keys(conn_pid, keys, state.tracking)
         %{state | tracking: new_tracking}
 
-      "XREAD" ->
+      c when c in ~w(XREAD XREADGROUP) ->
         new_tracking =
           ClientTracking.track_keys(conn_pid, xread_stream_keys(args), state.tracking)
 

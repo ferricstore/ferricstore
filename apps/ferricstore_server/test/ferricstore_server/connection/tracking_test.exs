@@ -58,4 +58,21 @@ defmodule FerricstoreServer.Connection.TrackingTest do
     assert :ets.lookup(:ferricstore_tracking, "COUNT") == []
     assert :ets.lookup(:ferricstore_tracking, "2") == []
   end
+
+  test "XREADGROUP tracks stream keys instead of group option tokens" do
+    stream = "tracking:xreadgroup:a"
+    {:ok, tracking} = ClientTracking.enable(self(), ClientTracking.new_config(), [])
+
+    Tracking.maybe_track_read(
+      "XREADGROUP",
+      ["GROUP", "g1", "c1", "COUNT", "1", "STREAMS", stream, ">"],
+      [[stream, []]],
+      %{tracking: tracking}
+    )
+
+    assert :ets.lookup(:ferricstore_tracking, stream) == [{stream, self()}]
+    assert :ets.lookup(:ferricstore_tracking, "GROUP") == []
+    assert :ets.lookup(:ferricstore_tracking, "g1") == []
+    assert :ets.lookup(:ferricstore_tracking, "STREAMS") == []
+  end
 end
