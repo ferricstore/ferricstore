@@ -2,9 +2,9 @@ defmodule Ferricstore.Store.SlotMap do
   @moduledoc """
   Manages the 1,024-slot to shard-index mapping.
 
-  Provides the indirection layer between hash output and shard assignment:
+  Provides the indirection layer between stable hash output and shard assignment:
 
-      key -> phash2(key) & 0x3FF -> slot -> slot_map[slot] -> shard_index
+      key -> crc32(key) & 0x3FF -> slot -> slot_map[slot] -> shard_index
 
   The slot map is a 1,024-element tuple stored in `:persistent_term` for
   ~10ns read access. Updates via `put/1` are atomic -- all processes see
@@ -41,7 +41,7 @@ defmodule Ferricstore.Store.SlotMap do
   @spec slot_for_key(binary()) :: non_neg_integer()
   def slot_for_key(key) do
     hash_input = Ferricstore.Store.Router.extract_hash_tag(key) || key
-    :erlang.phash2(hash_input) |> band(@slot_mask)
+    :erlang.crc32(hash_input) |> band(@slot_mask)
   end
 
   @spec shard_for_slot(tuple(), non_neg_integer()) :: non_neg_integer()
@@ -63,8 +63,10 @@ defmodule Ferricstore.Store.SlotMap do
   def slot_ranges(map) do
     # Walk slots 0..1023, group contiguous runs with the same shard.
     {ranges, start, prev_shard} =
-      Enum.reduce(1..(@num_slots - 1), {[], 0, elem(map, 0)}, fn slot, {acc, run_start, run_shard} ->
+      Enum.reduce(1..(@num_slots - 1), {[], 0, elem(map, 0)}, fn slot,
+                                                                 {acc, run_start, run_shard} ->
         shard = elem(map, slot)
+
         if shard == run_shard do
           {acc, run_start, run_shard}
         else

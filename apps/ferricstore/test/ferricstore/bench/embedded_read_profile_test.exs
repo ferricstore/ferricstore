@@ -89,7 +89,7 @@ defmodule Ferricstore.Bench.EmbeddedReadProfileTest do
 
     layers = [
       {"Direct ETS lookup", ets_ns},
-      {"shard_for (phash2)", hash_ns},
+      {"shard_for (crc32)", hash_ns},
       {"sandbox_key", sandbox_ns},
       {"LFU touch", lfu_ns},
       {"Stats.incr_keyspace_hits", stats_ns},

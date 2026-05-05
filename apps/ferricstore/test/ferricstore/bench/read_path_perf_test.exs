@@ -114,7 +114,7 @@ defmodule Ferricstore.Bench.ReadPathPerfTest do
 
     layers = [
       {"Direct ETS lookup", ets_ns},
-      {"shard_for (phash2 + slot_map)", hash_ns},
+      {"shard_for (crc32 + slot_map)", hash_ns},
       {"Stats.incr_keyspace_hits", hits_ns},
       {"maybe_record_hot_read (sampled)", hot_read_ns},
       {"maybe_lfu_touch (sampled)", lfu_ns},

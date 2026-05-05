@@ -144,7 +144,7 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
   end
 
   # ---------------------------------------------------------------------------
-  # 4. Shard routing: phash2 + slot map lookup
+  # 4. Shard routing: crc32 + slot map lookup
   # ---------------------------------------------------------------------------
 
   test "benchmark: shard routing cost (shard_for + shard_name)" do
@@ -165,7 +165,7 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
       Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 0)
     end
 
-    # Measure shard_for (phash2 + slot map lookup)
+    # Measure shard_for (crc32 + slot map lookup)
     {time_shard_for, _} = :timer.tc(fn ->
       for _ <- 1..n, do: Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), key)
     end)
@@ -183,12 +183,12 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
       end
     end)
 
-    # Measure raw phash2 for baseline
-    {time_phash2, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: :erlang.phash2(key) |> Bitwise.band(1023)
+    # Measure raw crc32 for baseline
+    {time_crc32, _} = :timer.tc(fn ->
+      for _ <- 1..n, do: :erlang.crc32(key) |> Bitwise.band(1023)
     end)
 
-    IO.puts("  Raw phash2:     #{round(n / (time_phash2 / 1_000_000))} ops/sec (#{time_phash2}us)")
+    IO.puts("  Raw crc32:      #{round(n / (time_crc32 / 1_000_000))} ops/sec (#{time_crc32}us)")
     IO.puts("  shard_for:      #{round(n / (time_shard_for / 1_000_000))} ops/sec (#{time_shard_for}us)")
     IO.puts("  shard_name:     #{round(n / (time_shard_name / 1_000_000))} ops/sec (#{time_shard_name}us)")
     IO.puts("  Combined:       #{round(n / (time_combined / 1_000_000))} ops/sec (#{time_combined}us)")

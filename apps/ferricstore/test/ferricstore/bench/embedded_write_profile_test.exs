@@ -52,7 +52,7 @@ defmodule Ferricstore.Bench.EmbeddedWriteProfileTest do
 
     layers = [
       {"Direct ETS insert", ets_ns},
-      {"shard_for (phash2)", hash_ns},
+      {"shard_for (crc32)", hash_ns},
       {"sandbox_key", sandbox_ns},
       {"--- Router.put total ---", router_ns},
       {"=== FerricStore.set total ===", full_ns},

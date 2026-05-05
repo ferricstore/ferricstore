@@ -20,6 +20,7 @@ defmodule Ferricstore.Store.SlotMapTest do
     test "distributes slots evenly across 8 shards" do
       map = SlotMap.build_uniform(8)
       counts = count_per_shard(map, 8)
+
       for shard <- 0..7 do
         assert counts[shard] == 128
       end
@@ -27,6 +28,7 @@ defmodule Ferricstore.Store.SlotMapTest do
 
     test "single shard gets all 1024 slots" do
       map = SlotMap.build_uniform(1)
+
       for slot <- 0..(@num_slots - 1) do
         assert elem(map, slot) == 0
       end
@@ -35,6 +37,7 @@ defmodule Ferricstore.Store.SlotMapTest do
     test "128 shards gets 8 slots each" do
       map = SlotMap.build_uniform(128)
       counts = count_per_shard(map, 128)
+
       for shard <- 0..127 do
         assert counts[shard] == 8
       end
@@ -51,6 +54,7 @@ defmodule Ferricstore.Store.SlotMapTest do
 
     test "all values are valid shard indices" do
       map = SlotMap.build_uniform(4)
+
       for slot <- 0..(@num_slots - 1) do
         assert elem(map, slot) in 0..3
       end
@@ -61,9 +65,10 @@ defmodule Ferricstore.Store.SlotMapTest do
         map = SlotMap.build_uniform(shard_count)
         average = @num_slots / shard_count
         counts = count_per_shard(map, shard_count)
+
         for {_shard, count} <- counts do
           assert count <= ceil(average) + 1,
-            "shard_count=#{shard_count}: shard got #{count} slots, average=#{average}"
+                 "shard_count=#{shard_count}: shard got #{count} slots, average=#{average}"
         end
       end
     end
@@ -81,7 +86,9 @@ defmodule Ferricstore.Store.SlotMapTest do
 
     test "hash tags co-locate keys" do
       assert SlotMap.slot_for_key("{tag}:a") == SlotMap.slot_for_key("{tag}:b")
-      assert SlotMap.slot_for_key("{user:42}:session") == SlotMap.slot_for_key("{user:42}:profile")
+
+      assert SlotMap.slot_for_key("{user:42}:session") ==
+               SlotMap.slot_for_key("{user:42}:profile")
     end
 
     test "empty key returns valid slot" do
@@ -95,32 +102,34 @@ defmodule Ferricstore.Store.SlotMapTest do
       assert slot >= 0 and slot <= 1023
     end
 
-    test "band(phash2(key), 0x3FF) is equivalent to rem(phash2(key), 1024)" do
-      for i <- 1..1000 do
-        key = "test_key_#{i}"
-        hash = :erlang.phash2(key)
-        assert Bitwise.band(hash, 0x3FF) == rem(hash, 1024)
-      end
+    test "uses stable crc32 slots clients can compute outside BEAM" do
+      assert SlotMap.slot_for_key("123456789") == 294
+      assert SlotMap.slot_for_key("plain") == 719
+      assert SlotMap.slot_for_key("{user:42}:session") == 390
+      assert SlotMap.slot_for_key("{}empty") == 873
     end
 
     test "key distribution across 1024 slots is roughly uniform" do
       n = 100_000
-      slot_counts = Enum.reduce(1..n, %{}, fn i, acc ->
-        slot = SlotMap.slot_for_key("uniform_test_key_#{i}")
-        Map.update(acc, slot, 1, &(&1 + 1))
-      end)
+
+      slot_counts =
+        Enum.reduce(1..n, %{}, fn i, acc ->
+          slot = SlotMap.slot_for_key("uniform_test_key_#{i}")
+          Map.update(acc, slot, 1, &(&1 + 1))
+        end)
 
       expected = n / @num_slots
       # Allow 3x deviation (generous for statistical test)
       for {_slot, count} <- slot_counts do
         assert count < expected * 3,
-          "slot got #{count} keys, expected ~#{expected}"
+               "slot got #{count} keys, expected ~#{expected}"
       end
 
       # At least 90% of slots should be used
       used_slots = map_size(slot_counts)
+
       assert used_slots > @num_slots * 0.9,
-        "only #{used_slots}/#{@num_slots} slots used"
+             "only #{used_slots}/#{@num_slots} slots used"
     end
   end
 
@@ -136,6 +145,7 @@ defmodule Ferricstore.Store.SlotMapTest do
     test "does not affect other slots" do
       map = SlotMap.build_uniform(4)
       new_map = SlotMap.reassign_slot(map, 500, 3)
+
       for slot <- 0..(@num_slots - 1), slot != 500 do
         assert elem(new_map, slot) == elem(map, slot)
       end
