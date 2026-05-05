@@ -21,6 +21,69 @@ defmodule FerricstoreServer.Connection.Store do
         keys: fn -> sandbox_keys(raw, ns) end,
         flush: fn -> sandbox_flush(raw, ns) end,
         dbsize: fn -> length(sandbox_keys(raw, ns)) end,
+        incr: fn key, delta -> raw.incr.(ns <> key, delta) end,
+        incr_float: fn key, delta -> raw.incr_float.(ns <> key, delta) end,
+        append: fn key, suffix -> raw.append.(ns <> key, suffix) end,
+        getset: fn key, value -> raw.getset.(ns <> key, value) end,
+        getdel: fn key -> raw.getdel.(ns <> key) end,
+        getex: fn key, exp -> raw.getex.(ns <> key, exp) end,
+        setrange: fn key, offset, value -> raw.setrange.(ns <> key, offset, value) end,
+        cas: fn key, exp, new_val, ttl -> raw.cas.(ns <> key, exp, new_val, ttl) end,
+        lock: fn key, owner, ttl -> raw.lock.(ns <> key, owner, ttl) end,
+        unlock: fn key, owner -> raw.unlock.(ns <> key, owner) end,
+        extend: fn key, owner, ttl -> raw.extend.(ns <> key, owner, ttl) end,
+        ratelimit_add: fn key, window, max, count ->
+          raw.ratelimit_add.(ns <> key, window, max, count)
+        end,
+        list_op: fn key, op -> raw.list_op.(ns <> key, op) end,
+        compound_get: fn redis_key, compound_key ->
+          raw.compound_get.(ns <> redis_key, namespace_compound_key(ns, redis_key, compound_key))
+        end,
+        compound_get_meta: fn redis_key, compound_key ->
+          raw.compound_get_meta.(
+            ns <> redis_key,
+            namespace_compound_key(ns, redis_key, compound_key)
+          )
+        end,
+        compound_batch_get: fn redis_key, compound_keys ->
+          raw.compound_batch_get.(
+            ns <> redis_key,
+            namespace_compound_keys(ns, redis_key, compound_keys)
+          )
+        end,
+        compound_batch_get_meta: fn redis_key, compound_keys ->
+          raw.compound_batch_get_meta.(
+            ns <> redis_key,
+            namespace_compound_keys(ns, redis_key, compound_keys)
+          )
+        end,
+        compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+          raw.compound_put.(
+            ns <> redis_key,
+            namespace_compound_key(ns, redis_key, compound_key),
+            value,
+            expire_at_ms
+          )
+        end,
+        compound_delete: fn redis_key, compound_key ->
+          raw.compound_delete.(
+            ns <> redis_key,
+            namespace_compound_key(ns, redis_key, compound_key)
+          )
+        end,
+        compound_scan: fn redis_key, prefix ->
+          raw.compound_scan.(ns <> redis_key, namespace_compound_key(ns, redis_key, prefix))
+        end,
+        compound_count: fn redis_key, prefix ->
+          raw.compound_count.(ns <> redis_key, namespace_compound_key(ns, redis_key, prefix))
+        end,
+        compound_delete_prefix: fn redis_key, prefix ->
+          raw.compound_delete_prefix.(
+            ns <> redis_key,
+            namespace_compound_key(ns, redis_key, prefix)
+          )
+        end,
+        prob_write: fn command -> raw.prob_write.(namespace_prob_command(ns, command)) end,
         prob_dir_for_key: fn key -> raw.prob_dir_for_key.(ns <> key) end,
         flush_prob_dirs: fn -> :ok end
     }
@@ -156,4 +219,65 @@ defmodule FerricstoreServer.Connection.Store do
   end
 
   defp namespace_keys(ns, keys), do: Enum.map(keys, &(ns <> &1))
+
+  defp namespace_compound_keys(ns, redis_key, compound_keys),
+    do: Enum.map(compound_keys, &namespace_compound_key(ns, redis_key, &1))
+
+  defp namespace_compound_key(ns, redis_key, compound_key) when is_binary(compound_key) do
+    Enum.find_value(["LM:", "T:", "H:", "L:", "S:", "Z:"], compound_key, fn prefix ->
+      raw_prefix = prefix <> redis_key
+
+      if String.starts_with?(compound_key, raw_prefix) do
+        rest =
+          binary_part(
+            compound_key,
+            byte_size(prefix),
+            byte_size(compound_key) - byte_size(prefix)
+          )
+
+        prefix <> ns <> rest
+      end
+    end)
+  end
+
+  defp namespace_prob_command(ns, {:bloom_create, key, bits, hashes, meta}),
+    do: {:bloom_create, ns <> key, bits, hashes, meta}
+
+  defp namespace_prob_command(ns, {:bloom_add, key, element, auto_params}),
+    do: {:bloom_add, ns <> key, element, auto_params}
+
+  defp namespace_prob_command(ns, {:bloom_madd, key, elements, auto_params}),
+    do: {:bloom_madd, ns <> key, elements, auto_params}
+
+  defp namespace_prob_command(ns, {:cms_create, key, width, depth}),
+    do: {:cms_create, ns <> key, width, depth}
+
+  defp namespace_prob_command(ns, {:cms_incrby, key, pairs}),
+    do: {:cms_incrby, ns <> key, pairs}
+
+  defp namespace_prob_command(ns, {:cms_merge, dst_key, src_keys, weights, create_params}),
+    do: {:cms_merge, ns <> dst_key, namespace_keys(ns, src_keys), weights, create_params}
+
+  defp namespace_prob_command(ns, {:cuckoo_create, key, capacity, bucket_size}),
+    do: {:cuckoo_create, ns <> key, capacity, bucket_size}
+
+  defp namespace_prob_command(ns, {:cuckoo_add, key, element, auto_params}),
+    do: {:cuckoo_add, ns <> key, element, auto_params}
+
+  defp namespace_prob_command(ns, {:cuckoo_addnx, key, element, auto_params}),
+    do: {:cuckoo_addnx, ns <> key, element, auto_params}
+
+  defp namespace_prob_command(ns, {:cuckoo_del, key, element}),
+    do: {:cuckoo_del, ns <> key, element}
+
+  defp namespace_prob_command(ns, {:topk_create, key, k, width, depth, decay}),
+    do: {:topk_create, ns <> key, k, width, depth, decay}
+
+  defp namespace_prob_command(ns, {:topk_add, key, elements}),
+    do: {:topk_add, ns <> key, elements}
+
+  defp namespace_prob_command(ns, {:topk_incrby, key, pairs}),
+    do: {:topk_incrby, ns <> key, pairs}
+
+  defp namespace_prob_command(_ns, command), do: command
 end
