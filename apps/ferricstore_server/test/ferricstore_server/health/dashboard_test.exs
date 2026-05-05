@@ -33,7 +33,9 @@ defmodule FerricstoreServer.Health.DashboardTest do
     {:ok, conn} =
       :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
 
-    :ok = :gen_tcp.send(conn, "GET #{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    :ok =
+      :gen_tcp.send(conn, "GET #{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+
     response = recv_all(conn, "")
     :gen_tcp.close(conn)
     response
@@ -410,7 +412,7 @@ defmodule FerricstoreServer.Health.DashboardTest do
     test "returns configured namespaces after set" do
       NamespaceConfig.reset_all()
       :ok = NamespaceConfig.set("rate", "window_ms", "10")
-      :ok = NamespaceConfig.set("rate", "durability", "async")
+      :ok = NamespaceConfig.set("rate", "durability", "quorum")
 
       data = Dashboard.collect()
 
@@ -418,7 +420,7 @@ defmodule FerricstoreServer.Health.DashboardTest do
       [entry] = data.namespace_config
       assert entry.prefix == "rate"
       assert entry.window_ms == 10
-      assert entry.durability == :async
+      assert entry.durability == :quorum
       assert is_integer(entry.changed_at)
       assert is_binary(entry.changed_by)
 
@@ -477,15 +479,23 @@ defmodule FerricstoreServer.Health.DashboardTest do
       NamespaceConfig.reset_all()
     end
 
-    test "highlights async durability with yellow color" do
+    test "does not render removed async durability state" do
       NamespaceConfig.reset_all()
-      :ok = NamespaceConfig.set("ephemeral", "durability", "async")
+      assert {:error, _} = NamespaceConfig.set("ephemeral", "durability", "async")
 
       data = Dashboard.collect_config_page()
       html = Dashboard.render_config_page(data)
 
-      assert String.contains?(html, "c-yellow")
-      assert String.contains?(html, "async")
+      [_before, ns_section] = String.split(html, "Namespace Config", parts: 2)
+
+      ns_html =
+        case String.split(ns_section, "section-title", parts: 2) do
+          [section, _rest] -> section
+          [section] -> section
+        end
+
+      refute String.contains?(ns_html, "ephemeral")
+      refute String.contains?(ns_html, ">async<")
 
       NamespaceConfig.reset_all()
     end

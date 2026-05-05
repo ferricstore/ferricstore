@@ -18,13 +18,12 @@ defmodule Ferricstore.Store.Router do
   argument, replacing all persistent_term lookups with instance-local state.
   """
 
-  alias Ferricstore.{CommandTime, HLC}
+  alias Ferricstore.HLC
   alias Ferricstore.HyperLogLog, as: HLL
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Stats
-  alias Ferricstore.Store.{CompoundKey, LFU, ListOps, Promotion, TypeRegistry, ValueCodec}
-  alias Ferricstore.Store.Shard.ZSetIndex
+  alias Ferricstore.Store.{CompoundKey, LFU, ListOps, TypeRegistry, ValueCodec}
 
   import Bitwise, only: [band: 2]
 
@@ -226,50 +225,16 @@ defmodule Ferricstore.Store.Router do
 
   defp barrier_forwarded_result(_idx, other, _timeout_ms), do: other
 
-  @doc "Public wrapper for durability_for_key, used by batch SET fast path."
-  @spec durability_for_key_public(FerricStore.Instance.t(), binary()) :: :quorum | :async
-  def durability_for_key_public(ctx, key), do: durability_for_key(ctx, key)
+  @doc "Public wrapper retained for callers that used namespace durability."
+  @spec durability_for_key_public(FerricStore.Instance.t(), binary()) :: :quorum
+  def durability_for_key_public(_ctx, _key), do: :quorum
 
-  @spec durability_for_key(FerricStore.Instance.t(), binary()) :: :quorum | :async
-  defp durability_for_key(ctx, key) do
-    case ctx.durability_mode do
-      :all_quorum ->
-        :quorum
-
-      :all_async ->
-        :async
-
-      :mixed ->
-        prefix =
-          case :binary.split(key, ":") do
-            [^key] -> "_root"
-            [p | _] -> p
-          end
-
-        Ferricstore.NamespaceConfig.durability_for(prefix)
-    end
-  end
-
-  # Dispatches writes based on namespace durability mode.
-  #
-  # Quorum: submit to Raft, wait for quorum apply. Strongest guarantee.
-  # Async:  write ETS immediately, submit to Raft non-blocking (fire-and-forget).
-  #         Like Redis Cluster — client sees the write before replication completes.
-  #         Leader crash before replication = data loss (documented trade-off).
-  #
-  # Linearizable commands (CAS, LOCK, UNLOCK, EXTEND, RATELIMIT) always go
-  # through `quorum_write`, regardless of the namespace's durability setting.
-  # Their contract is linearizability — running them through the async path
-  # makes their result observable on origin before replication, breaking the
-  # primitive. Whitelisting at this seam keeps the rule local and obvious.
+  # Dispatches default-instance writes through quorum. Async durability was a
+  # product feature; internal async IO/WAL/read machinery remains separate.
   @spec raft_write(FerricStore.Instance.t(), non_neg_integer(), binary(), tuple()) :: term()
-  defp raft_write(ctx, idx, key, command) do
+  defp raft_write(ctx, idx, _key, command) do
     if ctx.name == :default do
-      cond do
-        always_quorum?(command) -> quorum_write(ctx, idx, command)
-        durability_for_key(ctx, key) == :quorum -> quorum_write(ctx, idx, command)
-        true -> async_write(ctx, idx, command)
-      end
+      quorum_write(ctx, idx, command)
     else
       # Custom embedded instances are local/direct. The default application
       # instance owns Raft; there is no public switch that can disable it.
@@ -330,115 +295,9 @@ defmodule Ferricstore.Store.Router do
   def always_quorum?({:flow_rewind, _, _}), do: true
   def always_quorum?(_), do: false
 
-  # NOTE: json/bitmap/geo/hll/tdigest ops route through async_write →
-  # Batcher.write_async_quorum, which goes directly to the Batcher (bypassing
-  # the Shard GenServer that has no handler for these tuples). The
-  # forced-quorum slot returns the actual state machine result, so RMW
-  # semantics are preserved without quorum_write deadlocking.
-
-  # Async write path (like Redis Cluster — async replication):
-  # 1. Execute locally: direct ETS write + BitcaskWriter (no GenServer)
-  # 2. Submit to Raft fire-and-forget (replication to followers)
-  #
-  # All writes bypass the Shard GenServer entirely — ETS is :public with
-  # write_concurrency so any process can write. BitcaskWriter is a cast.
-  # This eliminates the GenServer serialization bottleneck.
-  #
-  # For read-modify-write (INCR etc.), concurrent same-key mutations are
-  # serialized via the per-key latch + RmwCoordinator worker. No lost updates.
-
   defp shard_under_disk_pressure?(ctx, idx) do
     size = :atomics.info(ctx.disk_pressure).size
     idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
-  end
-
-  defp async_write(ctx, idx, {:put, key, value, expire_at_ms}) do
-    size = :atomics.info(ctx.disk_pressure).size
-    under_pressure = if idx < size, do: :atomics.get(ctx.disk_pressure, idx + 1) == 1, else: false
-
-    if under_pressure do
-      {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
-    else
-      async_write_put(ctx, idx, key, value, expire_at_ms)
-    end
-  end
-
-  defp async_write(ctx, idx, {:delete, key}) do
-    size = :atomics.info(ctx.disk_pressure).size
-    under_pressure = if idx < size, do: :atomics.get(ctx.disk_pressure, idx + 1) == 1, else: false
-
-    if under_pressure do
-      {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
-    else
-      with_async_key_latch(ctx, idx, key, fn ->
-        previous = snapshot_live_value(ctx, idx, key)
-        raft_cmd = origin_checked_command(key, {:delete, key}, previous, nil, 0)
-
-        case async_enqueue_to_raft(idx, raft_cmd) do
-          :ok ->
-            keydir = elem(ctx.keydir_refs, idx)
-            flush_pending_writer_for_key(ctx, idx, keydir, key)
-            track_keydir_binary_delete(ctx, idx, keydir, key)
-            :ets.delete(keydir, key)
-
-            wv_size = :counters.info(ctx.write_version).size
-            if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
-            :ok
-
-          {:error, _} = error ->
-            error
-        end
-      end)
-    end
-  end
-
-  # Read-modify-write async paths. Latch-first, worker fallback. See
-  # docs/async-rmw-design.md. Caller tries `:ets.insert_new` on the per-shard
-  # latch table; if it wins, runs the RMW inline in its own process. If it
-  # loses (someone else already holds the latch), falls through to the
-  # per-shard RmwCoordinator GenServer which serializes via its mailbox.
-  defp async_write(ctx, idx, {:incr, key, _delta} = cmd), do: async_rmw(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:incr_float, key, _delta} = cmd), do: async_rmw(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:append, key, _suffix} = cmd), do: async_rmw(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:getset, key, _new_value} = cmd), do: async_rmw(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:getdel, key} = cmd), do: async_rmw(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:getex, key, _exp} = cmd), do: async_rmw(ctx, idx, key, cmd)
-
-  defp async_write(ctx, idx, {:setrange, key, _off, _value} = cmd),
-    do: async_rmw(ctx, idx, key, cmd)
-
-  # List ops are RMW at the structural level (LPUSH reads head pointer,
-  # writes new element + new head). Same latch+worker pattern as plain RMW.
-  # The latch is on the user-facing list key, serializing all list_ops on
-  # that list.
-  defp async_write(ctx, idx, {:list_op, key, _op} = cmd), do: async_list_op(ctx, idx, key, cmd)
-
-  defp async_write(ctx, idx, {:list_op_lmove, src_key, dst_key, _from, _to} = cmd) do
-    # Single-shard LMOVE goes async under both source and destination latches.
-    # Cross-shard LMOVE never reaches here (Router.list_op for lmove already splits
-    # across shards via quorum_write before calling async_write).
-    async_list_lmove(ctx, idx, src_key, dst_key, cmd)
-  end
-
-  # Any other command in an async namespace — CAS, LOCK, UNLOCK, EXTEND,
-  # RATELIMIT, and all prob commands (bloom/cuckoo/cms/topk) — needs its
-  # computed result returned to the caller and must serialize via Raft
-  # for correctness:
-  #
-  #   * CAS/LOCK/EXTEND/RATELIMIT are distributed-coordination primitives
-  #     — their whole contract is linearizability.
-  #   * Prob commands return values (count of bits newly set, list of
-  #     evicted items, per-element counter deltas) computed by the state
-  #     machine; they can't be fire-and-forget.
-  #
-  # We could not use `quorum_write` directly because it routes through
-  # Shard → Batcher, and Batcher.enqueue_write replies `:ok` prematurely
-  # when the namespace's durability is `:async` (correct for put/delete,
-  # wrong for everything else). Use the Batcher's forced-quorum path
-  # (`write_async_quorum`) which ignores namespace durability and puts
-  # the command in the quorum slot regardless.
-  defp async_write(ctx, idx, command) do
-    forced_quorum_write(ctx, idx, command, node())
   end
 
   defp forced_quorum_write(ctx, idx, command, origin_node) do
@@ -479,56 +338,14 @@ defmodule Ferricstore.Store.Router do
 
   defp bump_write_version(_ctx, _idx), do: :ok
 
-  # ---------------------------------------------------------------------------
-  # Async RMW: latch-first, worker fallback
-  # ---------------------------------------------------------------------------
-
-  # Latch-first dispatch for async RMW. Wins → run in caller process.
-  # Loses → fall through to the shard's RmwCoordinator.
-  #
-  # See docs/async-rmw-design.md. All 7 RMW commands flow through here
-  # (INCR, INCR_FLOAT, APPEND, GETSET, GETDEL, GETEX, SETRANGE).
-  defp async_rmw(ctx, idx, key, cmd) do
-    latch_tab = elem(ctx.latch_refs, idx)
-
-    case :ets.insert_new(latch_tab, {key, self()}) do
-      true ->
-        try do
-          :telemetry.execute([:ferricstore, :rmw, :latch], %{}, %{shard_index: idx})
-          execute_rmw_inline(ctx, idx, cmd)
-        after
-          :ets.take(latch_tab, key)
-        end
-
-      false ->
-        # Fall through to the shard's RmwCoordinator. Use a direct
-        # GenServer.call with the registered name rather than
-        # `RmwCoordinator.execute/2`: RmwCoordinator calls back into
-        # Router.execute_rmw_inline, and referencing it here would create
-        # a compile-time dependency cycle (RmwCoordinator → Router →
-        # RmwCoordinator). A runtime GenServer.call breaks the cycle.
-        try do
-          GenServer.call(
-            :"Ferricstore.Store.RmwCoordinator.#{idx}",
-            {:rmw, ctx, cmd},
-            10_000
-          )
-        catch
-          :exit, {:timeout, _} -> ErrorReasons.write_timeout_unknown()
-          :exit, {:noproc, _} -> {:error, "ERR RMW worker unavailable"}
-          :exit, _ -> {:error, "ERR RMW worker crashed"}
-        end
-    end
-  end
-
   @doc """
-  Executes an RMW command inline against local ETS + BitcaskWriter and
-  submits the delta to Raft via `Batcher.async_submit`.
+  Executes an RMW command inline against local ETS + BitcaskWriter and submits
+  the delta to Raft via the ordered async submitter.
 
   **Called with the per-key latch held.** The latch guarantees exclusive
-  access to `key`'s ETS row among RMW paths. `Router.async_rmw/4` (latch
-  path) and `Ferricstore.Store.RmwCoordinator` (worker path) both call
-  this after winning the latch.
+  access to `key`'s ETS row among RMW paths. This remains for the
+  RmwCoordinator and test-only direct callers while namespace async durability
+  is retired.
 
   Returns the command's natural result shape (e.g. `{:ok, new_int}` for
   INCR, `old_value_or_nil` for GETSET/GETDEL).
@@ -896,7 +713,8 @@ defmodule Ferricstore.Store.Router do
   end
 
   # Write the new RMW value into ETS, cast BitcaskWriter for disk, bump
-  # write_version. Matches the shape of async_write_put for small values.
+  # write_version. Matches the direct local-update shape used by the retired
+  # async SET path.
   defp install_rmw_value(ctx, idx, key, value, expire_at_ms) do
     keydir = elem(ctx.keydir_refs, idx)
 
@@ -1012,78 +830,6 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp async_write_put(ctx, idx, key, value, expire_at_ms) do
-    with_async_key_latch(ctx, idx, key, fn ->
-      do_async_write_put(ctx, idx, key, value, expire_at_ms)
-    end)
-  end
-
-  defp do_async_write_put(ctx, idx, key, value, expire_at_ms) do
-    keydir = elem(ctx.keydir_refs, idx)
-    previous = snapshot_live_value(ctx, idx, key)
-
-    raft_cmd =
-      origin_checked_command(key, {:put, key, value, expire_at_ms}, previous, value, expire_at_ms)
-
-    value_for_ets =
-      case value do
-        v when is_integer(v) ->
-          Integer.to_string(v)
-
-        v when is_float(v) ->
-          Float.to_string(v)
-
-        v when is_binary(v) ->
-          if byte_size(v) > ctx.hot_cache_max_value_size, do: nil, else: v
-      end
-
-    disk_value = to_disk_binary(value)
-
-    if value_for_ets == nil do
-      # Large value: sync NIF write to get offset, then ETS with real location.
-      # Cannot use async BitcaskWriter because ETS value is nil (too large for
-      # hot cache) and readers would see nil until the async write completes.
-      case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
-        {:ok, file_id, [{offset, _record_size}]} ->
-          maybe_after_large_async_prewrite_hook(ctx, idx, key)
-
-          case async_enqueue_to_raft(idx, raft_cmd) do
-            :ok ->
-              clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
-              track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
-
-              :ets.insert(
-                keydir,
-                {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
-              )
-
-              size = :counters.info(ctx.write_version).size
-              if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
-
-              :ok
-
-            {:error, _} = err ->
-              rollback_unaccepted_large_put(ctx, idx, key, previous)
-              err
-          end
-
-        {:error, reason} ->
-          {:error, "ERR disk write failed: #{inspect(reason)}"}
-      end
-    else
-      # Small value: ETS insert only. Bitcask write deferred to state machine
-      # apply (flush_pending_writes) — avoids per-key NIF overhead in Router.
-      with :ok <- async_enqueue_to_raft(idx, raft_cmd) do
-        clear_compound_data_structure_for_string_put(ctx, idx, keydir, key)
-        track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
-        :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
-        size = :counters.info(ctx.write_version).size
-        if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
-        :ok
-      end
-    end
-  end
-
   defp snapshot_live_value(ctx, idx, key) do
     case read_live(ctx, idx, key) do
       {:hit, value, expire_at_ms} -> {:value, value, expire_at_ms}
@@ -1111,115 +857,6 @@ defmodule Ferricstore.Store.Router do
   defp rollback_unaccepted_large_put(ctx, idx, key, :missing) do
     _ = append_delete_tombstone_nosync(ctx, idx, key)
     :ok
-  end
-
-  defp rollback_installed_async_value(ctx, idx, key, {:value, previous_value, expire_at_ms}) do
-    keydir = elem(ctx.keydir_refs, idx)
-    disk_value = to_disk_binary(previous_value)
-
-    case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
-      {:ok, file_id, [{offset, _record_size}]} ->
-        ets_value =
-          case previous_value do
-            v when is_integer(v) ->
-              Integer.to_string(v)
-
-            v when is_float(v) ->
-              Float.to_string(v)
-
-            v when is_binary(v) ->
-              if byte_size(v) > ctx.hot_cache_max_value_size, do: nil, else: v
-          end
-
-        track_keydir_binary_insert(ctx, idx, keydir, key, ets_value)
-
-        :ets.insert(
-          keydir,
-          {key, ets_value, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
-        )
-
-        maybe_apply_async_zset_put(ctx, idx, key, disk_value)
-
-      {:error, _reason} ->
-        :ok
-    end
-  end
-
-  defp rollback_installed_async_value(ctx, idx, key, :missing) do
-    keydir = elem(ctx.keydir_refs, idx)
-    _ = append_delete_tombstone_nosync(ctx, idx, key)
-    Ferricstore.Store.BitcaskWriter.discard_pending(ctx, idx, key)
-    track_keydir_binary_delete(ctx, idx, keydir, key)
-    :ets.delete(keydir, key)
-    maybe_apply_async_zset_delete(ctx, idx, key)
-    :ok
-  end
-
-  defp install_async_put_value(ctx, idx, key, value, expire_at_ms) do
-    keydir = elem(ctx.keydir_refs, idx)
-    value_for_ets = value_for_hot_cache(ctx, value)
-    disk_value = to_disk_binary(value)
-
-    if value_for_ets == nil do
-      case nif_append_batch_with_file(ctx, idx, [{key, disk_value, expire_at_ms}]) do
-        {:ok, file_id, [{offset, _record_size}]} ->
-          track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
-
-          :ets.insert(
-            keydir,
-            {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)}
-          )
-
-          maybe_apply_async_zset_put(ctx, idx, key, disk_value)
-          :ok
-
-        {:error, reason} ->
-          {:error, "ERR disk write failed: #{inspect(reason)}"}
-      end
-    else
-      track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
-      :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
-      maybe_apply_async_zset_put(ctx, idx, key, disk_value)
-      :ok
-    end
-  end
-
-  defp maybe_apply_async_zset_put(ctx, idx, compound_key, score_str) do
-    with {:ok, redis_key} <- zset_redis_key(compound_key),
-         {:ok, index, lookup} <- zset_index_tables(ctx, idx) do
-      ZSetIndex.apply_put_to_tables(index, lookup, redis_key, compound_key, score_str)
-    end
-
-    :ok
-  end
-
-  defp maybe_apply_async_zset_delete(ctx, idx, compound_key) do
-    with {:ok, redis_key} <- zset_redis_key(compound_key),
-         {:ok, index, lookup} <- zset_index_tables(ctx, idx) do
-      ZSetIndex.apply_delete_to_tables(index, lookup, redis_key, compound_key)
-    end
-
-    :ok
-  end
-
-  defp zset_redis_key(compound_key) do
-    redis_key = CompoundKey.extract_redis_key(compound_key)
-
-    if String.starts_with?(compound_key, CompoundKey.zset_prefix(redis_key)) do
-      {:ok, redis_key}
-    else
-      :error
-    end
-  end
-
-  defp zset_index_tables(ctx, idx) do
-    {index, lookup} = ZSetIndex.table_names(ctx.name, idx)
-
-    if :ets.info(index) != :undefined and :ets.info(lookup) != :undefined do
-      {:ok, index, lookup}
-    else
-      :error
-    end
   end
 
   defp with_async_key_latch(ctx, idx, key, fun) do
@@ -1257,27 +894,6 @@ defmodule Ferricstore.Store.Router do
     case result do
       {:error, _reason} = error -> error
       held -> {:ok, Enum.reverse(held)}
-    end
-  end
-
-  defp try_acquire_async_key_latches(ctx, locks) do
-    locks = locks |> Enum.uniq() |> Enum.sort()
-
-    case Enum.reduce_while(locks, [], fn {idx, key}, held ->
-           latch_tab = elem(ctx.latch_refs, idx)
-
-           if :ets.insert_new(latch_tab, {key, self()}) do
-             {:cont, [{latch_tab, key} | held]}
-           else
-             {:halt, {:error, held}}
-           end
-         end) do
-      {:error, held} ->
-        release_async_key_latches(held)
-        :error
-
-      held ->
-        {:ok, Enum.reverse(held)}
     end
   end
 
@@ -1371,13 +987,6 @@ defmodule Ferricstore.Store.Router do
   defp to_disk_binary(v) when is_integer(v), do: Integer.to_string(v)
   defp to_disk_binary(v) when is_float(v), do: Float.to_string(v)
   defp to_disk_binary(v) when is_binary(v), do: v
-
-  defp value_for_hot_cache(_ctx, value) when is_integer(value), do: Integer.to_string(value)
-  defp value_for_hot_cache(_ctx, value) when is_float(value), do: Float.to_string(value)
-
-  defp value_for_hot_cache(ctx, value) when is_binary(value) do
-    if byte_size(value) > ctx.hot_cache_max_value_size, do: nil, else: value
-  end
 
   defp clear_compound_data_structure_for_string_put(ctx, idx, keydir, key) do
     if CompoundKey.internal_key?(key) do
@@ -1510,13 +1119,6 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp maybe_after_large_async_prewrite_hook(ctx, idx, key) do
-    case Process.get(:ferricstore_router_after_large_async_prewrite_hook) do
-      fun when is_function(fun, 3) -> fun.(ctx, idx, key)
-      _ -> :ok
-    end
-  end
-
   # -- Keydir binary memory tracking --
   # Only counts binaries > 64 bytes (refc binaries, off-heap).
   # Smaller binaries are inlined in the ETS tuple and counted by :ets.info(:memory).
@@ -1572,16 +1174,6 @@ defmodule Ferricstore.Store.Router do
   # preserves async semantics while still surfacing local overload/down errors.
   defp async_enqueue_to_raft(idx, command) do
     case Ferricstore.Raft.Batcher.async_enqueue_ordered(idx, command) do
-      :ok -> :ok
-      {:error, :overloaded} -> {:error, "ERR async replication overloaded"}
-      {:error, reason} -> {:error, "ERR async replication failed: #{inspect(reason)}"}
-    end
-  end
-
-  defp async_submit_batch_to_raft(_idx, []), do: :ok
-
-  defp async_submit_batch_to_raft(idx, commands) do
-    case Ferricstore.Raft.Batcher.async_submit_batch_ordered(idx, commands) do
       :ok -> :ok
       {:error, :overloaded} -> {:error, "ERR async replication overloaded"}
       {:error, reason} -> {:error, "ERR async replication failed: #{inspect(reason)}"}
@@ -3116,16 +2708,11 @@ defmodule Ferricstore.Store.Router do
   def max_value_size, do: @max_value_size
 
   @doc """
-  Batch async PUT for pipelined SET commands without options.
+  Legacy batch async PUT API.
 
-  Takes a list of `{key, value}` tuples. All keys must target async
-  durability namespaces. Groups by shard, does batch ETS inserts per
-  shard, fires BitcaskWriter casts and Raft submissions individually
-  (they batch internally). Returns `:ok` or `{:error, reason}`.
-
-  Caller must validate key/value sizes before calling. This skips per-key
-  validation for speed, but still rejects pressured shards before publishing
-  any writes so a mixed batch cannot partially bypass disk-pressure backoff.
+  Async durability has been removed, so this compatibility wrapper now submits
+  the batch through the quorum path and preserves the old `:ok | {:error, _}`
+  return shape for callers that have not been renamed yet.
   """
   @spec batch_async_put(FerricStore.Instance.t(), [{binary(), binary()}]) ::
           :ok | {:error, binary()}
@@ -3137,132 +2724,13 @@ defmodule Ferricstore.Store.Router do
   end
 
   def batch_async_put(ctx, kv_pairs) do
-    lfu_val = LFU.initial()
-    hot_max = ctx.hot_cache_max_value_size
-    wv_size = :counters.info(ctx.write_version).size
+    case batch_quorum_put(ctx, kv_pairs) do
+      results when is_list(results) ->
+        Enum.find(results, &match?({:error, _}, &1)) || :ok
 
-    shard_batches =
-      kv_pairs
-      |> Enum.group_by(fn {key, _value} -> shard_for(ctx, key) end)
-      |> Enum.map(fn {idx, shard_kvs} ->
-        keydir = elem(ctx.keydir_refs, idx)
-        effective_kvs = dedupe_last_kvs(shard_kvs)
-
-        {entries, large_disk_batch} =
-          Enum.reduce(effective_kvs, {[], []}, fn {key, value}, {entry_acc, disk_acc} ->
-            value_for_ets = if byte_size(value) > hot_max, do: nil, else: value
-
-            disk_acc =
-              if value_for_ets == nil do
-                [{key, value, 0} | disk_acc]
-              else
-                disk_acc
-              end
-
-            {[{key, value, value_for_ets} | entry_acc], disk_acc}
-          end)
-
-        {idx, keydir, shard_kvs, Enum.reverse(entries), large_disk_batch}
-      end)
-
-    pressured_idx =
-      Enum.find_value(shard_batches, fn {idx, _keydir, _shard_kvs, _entries, _large_disk_batch} ->
-        if shard_under_disk_pressure?(ctx, idx), do: idx, else: nil
-      end)
-
-    if pressured_idx do
-      {:error, "ERR disk pressure on shard #{pressured_idx}, rejecting async write"}
-    else
-      locks =
-        for {idx, _keydir, _shard_kvs, entries, _large_disk_batch} <- shard_batches,
-            {key, _value, _value_for_ets} <- entries do
-          {idx, key}
-        end
-
-      case acquire_async_key_latches(ctx, locks) do
-        {:ok, held_latches} ->
-          try do
-            overloaded? =
-              Enum.any?(shard_batches, fn {idx, _keydir, _shard_kvs, _entries, _large_disk_batch} ->
-                not Ferricstore.Raft.Batcher.async_accepting?(idx)
-              end)
-
-            if overloaded?, do: throw({:async_error, "ERR async replication overloaded"})
-
-            large_previous = snapshot_batch_large_values(ctx, shard_batches)
-
-            disk_locations =
-              Enum.reduce(
-                shard_batches,
-                %{},
-                fn {idx, _keydir, _shard_kvs, _entries, large_disk_batch}, acc ->
-                  if large_disk_batch == [] do
-                    acc
-                  else
-                    reversed = Enum.reverse(large_disk_batch)
-
-                    case nif_append_batch_with_file(ctx, idx, reversed) do
-                      {:ok, file_id, locations} ->
-                        shard_locations =
-                          Enum.zip(reversed, locations)
-                          |> Map.new(fn {{key, value, _exp}, {offset, _rec_size}} ->
-                            {key, {file_id, offset, byte_size(value)}}
-                          end)
-
-                        Map.put(acc, idx, shard_locations)
-
-                      {:error, reason} ->
-                        throw({:disk_error, reason})
-                    end
-                  end
-                end
-              )
-
-            Enum.reduce(shard_batches, MapSet.new(), fn {idx, _keydir, _shard_kvs, entries,
-                                                         _large_disk_batch},
-                                                        accepted_idxs ->
-              raft_cmds = build_origin_checked_batch_put_commands(ctx, idx, entries)
-
-              case async_submit_batch_to_raft(idx, raft_cmds) do
-                :ok ->
-                  MapSet.put(accepted_idxs, idx)
-
-                {:error, reason} ->
-                  rollback_batch_large_puts(ctx, large_previous, accepted_idxs)
-
-                  if MapSet.size(accepted_idxs) > 0 do
-                    throw({:partial_async_error, reason})
-                  else
-                    throw({:async_error, reason})
-                  end
-              end
-            end)
-
-            Enum.each(shard_batches, fn {idx, keydir, shard_kvs, entries, _large_disk_batch} ->
-              shard_locations = Map.get(disk_locations, idx, %{})
-              install_batch_async_entries(ctx, idx, keydir, entries, shard_locations, lfu_val)
-
-              if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, length(shard_kvs))
-            end)
-          after
-            release_async_key_latches(held_latches)
-          end
-
-        {:error, {:timeout, wait_ms}} ->
-          throw({:async_error, async_key_latch_timeout_error_message(wait_ms)})
-      end
-
-      :ok
+      other ->
+        other
     end
-  catch
-    :throw, {:disk_error, reason} ->
-      {:error, "ERR disk write failed: #{inspect(reason)}"}
-
-    :throw, {:async_error, reason} ->
-      {:error, reason}
-
-    :throw, {:partial_async_error, reason} ->
-      {:error, "ERR async replication partial outcome unknown: #{reason}"}
   end
 
   @doc false
@@ -3315,42 +2783,6 @@ defmodule Ferricstore.Store.Router do
     Enum.find_value(kv_pairs, fn {key, _value} ->
       idx = shard_for(ctx, key)
       if shard_under_disk_pressure?(ctx, idx), do: idx, else: nil
-    end)
-  end
-
-  defp dedupe_last_kvs(kv_pairs) do
-    last_index_by_key =
-      kv_pairs
-      |> Enum.with_index()
-      |> Map.new(fn {{key, _value}, index} -> {key, index} end)
-
-    kv_pairs
-    |> Enum.with_index()
-    |> Enum.filter(fn {{key, _value}, index} -> Map.fetch!(last_index_by_key, key) == index end)
-    |> Enum.map(fn {kv, _index} -> kv end)
-  end
-
-  defp snapshot_batch_large_values(ctx, shard_batches) do
-    Enum.reduce(shard_batches, %{}, fn {idx, _keydir, _shard_kvs, _entries, large_disk_batch},
-                                       acc ->
-      Enum.reduce(large_disk_batch, acc, fn {key, _value, _expire_at_ms}, snapshot_acc ->
-        Map.put(snapshot_acc, {idx, key}, snapshot_live_value(ctx, idx, key))
-      end)
-    end)
-  end
-
-  defp build_origin_checked_batch_put_commands(ctx, idx, entries) do
-    Enum.map(entries, fn {key, value, _value_for_ets} ->
-      previous = snapshot_live_value(ctx, idx, key)
-      origin_checked_command(key, {:put, key, value, 0}, previous, value, 0)
-    end)
-  end
-
-  defp rollback_batch_large_puts(ctx, large_previous, accepted_idxs) do
-    Enum.each(large_previous, fn {{idx, key}, previous} ->
-      unless MapSet.member?(accepted_idxs, idx) do
-        rollback_unaccepted_large_put(ctx, idx, key, previous)
-      end
     end)
   end
 
@@ -4801,17 +4233,7 @@ defmodule Ferricstore.Store.Router do
     idx = shard_for(ctx, redis_key)
 
     if ctx.name == :default do
-      case durability_for_key(ctx, redis_key) do
-        :quorum ->
-          quorum_write(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
-
-        :async ->
-          if promoted_parent?(ctx, idx, redis_key) do
-            quorum_write(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
-          else
-            async_compound_put(ctx, idx, redis_key, compound_key, value, expire_at_ms)
-          end
-      end
+      quorum_write(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
     else
       safe_write_call(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
     end
@@ -4828,17 +4250,7 @@ defmodule Ferricstore.Store.Router do
     idx = shard_for(ctx, redis_key)
 
     if ctx.name == :default do
-      case durability_for_key(ctx, redis_key) do
-        :quorum ->
-          quorum_write(ctx, idx, {:compound_batch_put, redis_key, entries})
-
-        :async ->
-          if promoted_parent?(ctx, idx, redis_key) do
-            quorum_write(ctx, idx, {:compound_batch_put, redis_key, entries})
-          else
-            async_compound_batch_put(ctx, idx, entries)
-          end
-      end
+      quorum_write(ctx, idx, {:compound_batch_put, redis_key, entries})
     else
       safe_write_call(ctx, idx, {:compound_batch_put, redis_key, entries})
     end
@@ -4849,108 +4261,16 @@ defmodule Ferricstore.Store.Router do
     idx = shard_for(ctx, redis_key)
 
     if ctx.name == :default do
-      case durability_for_key(ctx, redis_key) do
-        :quorum ->
-          quorum_write(ctx, idx, {:compound_delete, redis_key, compound_key})
-
-        :async ->
-          if promoted_parent?(ctx, idx, redis_key) do
-            quorum_write(ctx, idx, {:compound_delete, redis_key, compound_key})
-          else
-            async_compound_delete(ctx, idx, compound_key)
-          end
-      end
+      quorum_write(ctx, idx, {:compound_delete, redis_key, compound_key})
     else
       safe_write_call(ctx, idx, {:compound_delete, redis_key, compound_key})
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Async compound implementations (Group A in async-compound-list-prob-design.md)
-  #
-  # Structurally identical to async_write_put/delete — the only difference is
-  # that the key is a compound_key (e.g. "H:user:1:name") built from a
-  # redis_key + field. Durability was already decided by the caller (compound_put/
-  # compound_delete) based on the PARENT redis_key's namespace, so the user-
-  # facing abstraction "HSET is in the `user` namespace" holds.
-  #
-  # Promotion growth is intentionally skipped on the async path. Hashes that
-  # grow large in an async namespace stay in the shared Bitcask log instead
-  # of being promoted to a dedicated file. Already-promoted parents are the
-  # exception: their mutations must route through the quorum/promoted path so
-  # ETS file locations keep pointing at the dedicated Bitcask directory.
-  # ---------------------------------------------------------------------------
-
-  defp promoted_parent?(ctx, idx, redis_key) do
-    keydir = elem(ctx.keydir_refs, idx)
-    marker = Promotion.marker_key(redis_key)
-
-    case :ets.lookup(keydir, marker) do
-      [{^marker, type, expire_at_ms, _lfu, _fid, _off, _value_size}]
-      when type in ["hash", "set", "zset"] ->
-        expire_at_ms == 0 or expire_at_ms > CommandTime.now_ms()
-
-      _ ->
-        false
-    end
-  end
-
-  # Async list_op latch-first dispatch. On CAS win: execute inline under
-  # the per-key latch. On loss: bounce to RmwCoordinator via direct
-  # GenServer.call (avoids the compile-time cycle
-  # RmwCoordinator → Router → RmwCoordinator that a direct call to
-  # `RmwCoordinator.execute/2` would otherwise create).
-  defp async_list_op(ctx, idx, key, cmd) do
-    latch_tab = elem(ctx.latch_refs, idx)
-
-    case :ets.insert_new(latch_tab, {key, self()}) do
-      true ->
-        try do
-          :telemetry.execute([:ferricstore, :list_op, :latch], %{}, %{shard_index: idx})
-          execute_list_op_inline(ctx, idx, cmd)
-        after
-          :ets.take(latch_tab, key)
-        end
-
-      false ->
-        async_list_op_worker_call(ctx, idx, cmd)
-    end
-  end
-
-  defp async_list_lmove(ctx, idx, src_key, dst_key, cmd) do
-    case try_acquire_async_key_latches(ctx, [{idx, src_key}, {idx, dst_key}]) do
-      {:ok, held_latches} ->
-        try do
-          :telemetry.execute([:ferricstore, :list_op, :latch], %{}, %{shard_index: idx})
-          execute_list_op_inline(ctx, idx, cmd)
-        after
-          release_async_key_latches(held_latches)
-        end
-
-      :error ->
-        async_list_op_worker_call(ctx, idx, cmd)
-    end
-  end
-
-  defp async_list_op_worker_call(ctx, idx, cmd) do
-    try do
-      GenServer.call(
-        :"Ferricstore.Store.RmwCoordinator.#{idx}",
-        {:rmw, ctx, cmd},
-        10_000
-      )
-    catch
-      :exit, {:timeout, _} -> ErrorReasons.write_timeout_unknown()
-      :exit, {:noproc, _} -> {:error, "ERR RMW worker unavailable"}
-      :exit, _ -> {:error, "ERR RMW worker crashed"}
-    end
-  end
-
   @doc """
   Executes a list_op inline under a held latch. Called from
-  `Router.async_list_op` (fast path) and `RmwCoordinator.handle_call`
-  (contended path). The latch guarantees exclusive access to the list's
-  compound keys.
+  local-origin helper paths and `RmwCoordinator.handle_call` (contended path).
+  The latch guarantees exclusive access to the list's compound keys.
 
   Reserves Batcher capacity before touching origin-local compound state.
   That prevents overloaded async replication from exposing a local-only
@@ -5202,147 +4522,6 @@ defmodule Ferricstore.Store.Router do
 
       _ ->
         false
-    end
-  end
-
-  defp async_compound_put(ctx, idx, _redis_key, compound_key, value, expire_at_ms) do
-    with_async_key_latch(ctx, idx, compound_key, fn ->
-      do_async_compound_put(ctx, idx, compound_key, value, expire_at_ms)
-    end)
-  end
-
-  defp do_async_compound_put(ctx, idx, compound_key, value, expire_at_ms) do
-    size = :atomics.info(ctx.disk_pressure).size
-    under_pressure = idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
-
-    if under_pressure do
-      {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
-    else
-      previous = snapshot_live_value(ctx, idx, compound_key)
-
-      raft_cmd =
-        origin_checked_command(
-          compound_key,
-          {:put, compound_key, value, expire_at_ms},
-          previous,
-          value,
-          expire_at_ms
-        )
-
-      if large_value_for_hot_cache?(ctx, value) do
-        # Large cold values need a durable local file location before ETS can
-        # point readers at them. Keep disk-first, then roll back if Raft rejects.
-        with :ok <- install_async_put_value(ctx, idx, compound_key, value, expire_at_ms) do
-          case async_enqueue_to_raft(idx, raft_cmd) do
-            :ok ->
-              bump_write_version(ctx, idx)
-              :ok
-
-            {:error, _} = error ->
-              rollback_installed_async_value(ctx, idx, compound_key, previous)
-              error
-          end
-        end
-      else
-        # Small values do not need a disk location before publication, so match
-        # plain async SET: do not expose a value until Raft accepts the command.
-        with :ok <- async_enqueue_to_raft(idx, raft_cmd),
-             :ok <- install_async_put_value(ctx, idx, compound_key, value, expire_at_ms) do
-          bump_write_version(ctx, idx)
-          :ok
-        end
-      end
-    end
-  end
-
-  defp async_compound_batch_put(ctx, idx, entries) do
-    locks = Enum.map(entries, fn {compound_key, _value, _expire_at_ms} -> {idx, compound_key} end)
-
-    case acquire_async_key_latches(ctx, locks) do
-      {:ok, held_latches} ->
-        try do
-          do_async_compound_batch_put(ctx, idx, entries)
-        after
-          release_async_key_latches(held_latches)
-        end
-
-      {:error, {:timeout, wait_ms}} ->
-        async_key_latch_timeout_error(wait_ms)
-    end
-  end
-
-  defp do_async_compound_batch_put(ctx, idx, entries) do
-    size = :atomics.info(ctx.disk_pressure).size
-    under_pressure = idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
-
-    cond do
-      under_pressure ->
-        {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
-
-      Enum.any?(entries, fn {_compound_key, value, _expire_at_ms} ->
-        large_value_for_hot_cache?(ctx, value)
-      end) ->
-        Enum.reduce_while(entries, :ok, fn {compound_key, value, expire_at_ms}, :ok ->
-          case do_async_compound_put(ctx, idx, compound_key, value, expire_at_ms) do
-            :ok -> {:cont, :ok}
-            {:error, _} = err -> {:halt, err}
-            other -> {:halt, {:error, inspect(other)}}
-          end
-        end)
-
-      true ->
-        commands =
-          Enum.map(entries, fn {compound_key, value, expire_at_ms} ->
-            previous = snapshot_live_value(ctx, idx, compound_key)
-
-            origin_checked_command(
-              compound_key,
-              {:put, compound_key, value, expire_at_ms},
-              previous,
-              value,
-              expire_at_ms
-            )
-          end)
-
-        with :ok <- async_submit_batch_to_raft(idx, commands) do
-          Enum.each(entries, fn {compound_key, value, expire_at_ms} ->
-            :ok = install_async_put_value(ctx, idx, compound_key, value, expire_at_ms)
-          end)
-
-          size = :counters.info(ctx.write_version).size
-          if idx < size, do: :counters.add(ctx.write_version, idx + 1, length(entries))
-          :ok
-        end
-    end
-  end
-
-  defp async_compound_delete(ctx, idx, compound_key) do
-    with_async_key_latch(ctx, idx, compound_key, fn ->
-      do_async_compound_delete(ctx, idx, compound_key)
-    end)
-  end
-
-  defp do_async_compound_delete(ctx, idx, compound_key) do
-    size = :atomics.info(ctx.disk_pressure).size
-    under_pressure = idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
-
-    if under_pressure do
-      {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
-    else
-      previous = snapshot_live_value(ctx, idx, compound_key)
-      raft_cmd = origin_checked_command(compound_key, {:delete, compound_key}, previous, nil, 0)
-
-      with :ok <- async_enqueue_to_raft(idx, raft_cmd) do
-        keydir = elem(ctx.keydir_refs, idx)
-        track_keydir_binary_delete(ctx, idx, keydir, compound_key)
-        :ets.delete(keydir, compound_key)
-        maybe_apply_async_zset_delete(ctx, idx, compound_key)
-
-        wv_size = :counters.info(ctx.write_version).size
-        if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
-
-        :ok
-      end
     end
   end
 

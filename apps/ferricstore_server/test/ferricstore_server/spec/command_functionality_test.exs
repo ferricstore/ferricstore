@@ -364,18 +364,20 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
                  store
                )
 
-      assert :ok =
+      assert {:error, msg} =
                Namespace.handle(
                  "FERRICSTORE.CONFIG",
                  ["SET", "sensor", "durability", "async"],
                  store
                )
 
-      # GET should reflect the changes.
+      assert msg =~ "async durability has been removed"
+
+      # GET should reflect the supported change only.
       result = Namespace.handle("FERRICSTORE.CONFIG", ["GET", "sensor"], store)
       assert is_list(result)
       assert "50" in result
-      assert "async" in result
+      assert "quorum" in result
     end
   end
 
@@ -391,7 +393,7 @@ defmodule FerricstoreServer.Spec.CommandFunctionalityTest do
       store = MockStore.make()
 
       Namespace.handle("FERRICSTORE.CONFIG", ["SET", "rate", "window_ms", "10"], store)
-      Namespace.handle("FERRICSTORE.CONFIG", ["SET", "session", "durability", "async"], store)
+      Namespace.handle("FERRICSTORE.CONFIG", ["SET", "session", "window_ms", "5"], store)
 
       result = Namespace.handle("FERRICSTORE.CONFIG", ["GET"], store)
       assert is_list(result)

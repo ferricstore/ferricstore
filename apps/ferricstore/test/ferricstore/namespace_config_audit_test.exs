@@ -70,9 +70,9 @@ defmodule Ferricstore.NamespaceConfigAuditTest do
       assert entry.changed_at == 0
     end
 
-    test "changed_at is set when changing durability" do
+    test "changed_at is set when explicitly setting quorum durability" do
       before = System.os_time(:second)
-      :ok = NamespaceConfig.set("audit", "durability", "async")
+      :ok = NamespaceConfig.set("audit", "durability", "quorum")
       {:ok, entry} = NamespaceConfig.get("audit")
       assert entry.changed_at >= before
     end
@@ -105,7 +105,7 @@ defmodule Ferricstore.NamespaceConfigAuditTest do
       {:ok, first} = NamespaceConfig.get("audit")
       assert first.changed_by == "client:1"
 
-      :ok = NamespaceConfig.set("audit", "durability", "async", "client:99")
+      :ok = NamespaceConfig.set("audit", "durability", "quorum", "client:99")
       {:ok, second} = NamespaceConfig.get("audit")
       assert second.changed_by == "client:99"
     end
@@ -141,6 +141,7 @@ defmodule Ferricstore.NamespaceConfigAuditTest do
   # ===========================================================================
 
   describe "durability weakening telemetry" do
+    @tag skip: "async durability removed; durability can no longer be weakened"
     test "emits [:ferricstore, :config, :durability_weakened] on quorum -> async" do
       attach_handler([:ferricstore, :config, :durability_weakened])
 
@@ -158,6 +159,7 @@ defmodule Ferricstore.NamespaceConfigAuditTest do
       assert is_integer(measurements.system_time)
     end
 
+    @tag skip: "async durability removed; durability can no longer be weakened"
     test "emits telemetry when explicit quorum entry weakened to async" do
       attach_handler([:ferricstore, :config, :durability_weakened])
 
@@ -176,6 +178,7 @@ defmodule Ferricstore.NamespaceConfigAuditTest do
       assert metadata.new_durability == :async
     end
 
+    @tag skip: "async durability removed; async -> quorum transition no longer exists"
     test "no telemetry on async -> quorum (strengthening)" do
       attach_handler([:ferricstore, :config, :durability_weakened])
 
@@ -195,6 +198,7 @@ defmodule Ferricstore.NamespaceConfigAuditTest do
       refute_receive {:telemetry, [:ferricstore, :config, :durability_weakened], _, _}, 200
     end
 
+    @tag skip: "async durability removed; async -> async transition no longer exists"
     test "no telemetry on async -> async (no change)" do
       attach_handler([:ferricstore, :config, :durability_weakened])
 
@@ -261,7 +265,7 @@ defmodule Ferricstore.NamespaceConfigAuditTest do
     end
 
     test "INFO namespace_config shows empty changed_by when no caller specified" do
-      :ok = NamespaceConfig.set("info_ns", "durability", "async")
+      :ok = NamespaceConfig.set("info_ns", "durability", "quorum")
 
       store = MockStore.make()
       result = Server.handle("INFO", ["namespace_config"], store)
@@ -288,7 +292,7 @@ defmodule Ferricstore.NamespaceConfigAuditTest do
 
     test "GET all includes changed_at and changed_by for each entry" do
       :ok = NamespaceConfig.set("ns_a", "window_ms", "10", "client:1")
-      :ok = NamespaceConfig.set("ns_b", "durability", "async", "client:2")
+      :ok = NamespaceConfig.set("ns_b", "durability", "quorum", "client:2")
 
       store = MockStore.make()
       result = Namespace.handle("FERRICSTORE.CONFIG", ["GET"], store)
@@ -326,6 +330,7 @@ defmodule Ferricstore.NamespaceConfigAuditTest do
       assert entry.changed_at > 0
     end
 
+    @tag skip: "async durability removed; durability weakening telemetry no longer fires"
     test "rapid durability toggles emit correct telemetry count" do
       attach_handler([:ferricstore, :config, :durability_weakened])
 

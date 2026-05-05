@@ -377,11 +377,15 @@ defmodule FerricStore.Instance do
   end
 
   @spec update_durability_mode(atom(), atom()) :: t()
-  def update_durability_mode(name, mode) when mode in [:all_quorum, :all_async, :mixed] do
+  def update_durability_mode(name, :all_quorum) do
     ctx = get(name)
-    updated = %{ctx | durability_mode: mode}
+    updated = %{ctx | durability_mode: :all_quorum}
     :persistent_term.put({FerricStore.Instance, name}, updated)
     updated
+  end
+
+  def update_durability_mode(name, mode) when mode in [:all_async, :mixed] do
+    update_durability_mode(name, :all_quorum)
   end
 
   @doc """
@@ -470,10 +474,10 @@ defmodule FerricStore.Instance do
     |> List.to_tuple()
   end
 
-  # Per-shard latch tables used by async RMW (see docs/async-rmw-design.md).
+  # Per-shard latch tables used by inline RMW local-origin helpers.
   # Created here so they're ready before any RMW can be issued. :named_table
   # so other processes can look them up directly via the name; :public so
-  # Router.async_rmw can :ets.insert_new without a GenServer hop.
+  # callers can :ets.insert_new without a GenServer hop.
   defp build_latch_tables(name, shard_count) do
     0..(shard_count - 1)
     |> Enum.map(fn i ->

@@ -29,12 +29,12 @@ defmodule Mix.Tasks.Ferricstore.Config do
   Valid fields:
 
     * `window_ms` -- commit window in milliseconds (positive integer)
-    * `durability` -- `"quorum"` or `"async"`
+    * `durability` -- `"quorum"`
 
   Examples:
 
       mix ferricstore.config set rate window_ms 10
-      mix ferricstore.config set session durability async
+      mix ferricstore.config set session durability quorum
 
   """
 
@@ -89,7 +89,7 @@ defmodule Mix.Tasks.Ferricstore.Config do
       mix ferricstore.config set <prefix> <field> <value>
 
     Fields: window_ms, durability
-    Values: window_ms takes a positive integer, durability takes "quorum" or "async"
+    Values: window_ms takes a positive integer, durability only supports "quorum"
     """)
 
     :ok

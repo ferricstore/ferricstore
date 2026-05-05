@@ -1,20 +1,19 @@
 defmodule Ferricstore.Store.RmwCoordinator do
   @moduledoc """
-  Per-shard fallback for async read-modify-write (RMW) commands under
+  Per-shard fallback for inline read-modify-write (RMW) commands under
   contention.
 
-  See `docs/async-rmw-design.md` for the full design. In short:
+  The old namespace async durability feature has been removed, but this
+  coordinator still owns the same-key serialization machinery used by inline
+  local-origin helpers and tests. In short:
 
-  - `Router.async_rmw/4` tries `:ets.insert_new(latch_tab, {key, self()})`.
-    If it wins the latch, it runs the RMW inline in the caller's process
-    (~15μs p50). Fast path.
-  - If the latch is already held, `async_rmw` falls through here and
-    sends `{:rmw, ctx, cmd}` to the shard worker. The caller context is
-    part of the message because the coordinator name is global per shard;
-    without it the worker would silently operate on the default instance.
-    The worker processes RMW commands serially from its mailbox (FIFO).
-    This is the slow path under heavy same-key contention, but it never
-    loses updates and callers sleep on `receive` while queued (zero CPU).
+  - A caller that wins `:ets.insert_new(latch_tab, {key, self()})` can run the
+    RMW inline in its own process.
+  - If the latch is already held, callers can fall through here and send
+    `{:rmw, ctx, cmd}` to the shard worker. The caller context is part of the
+    message because the coordinator name is global per shard; without it the
+    worker would silently operate on the default instance. The worker
+    processes RMW commands serially from its mailbox (FIFO).
 
   The coordinator keeps a FIFO queue per key and starts at most one waiter
   task per key. That keeps same-key RMW serialized without letting a latch

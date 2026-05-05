@@ -24,6 +24,7 @@ defmodule Ferricstore.Store.AsyncListOpTest do
   extension + state_machine async_key_for extension are implemented.
   """
   use ExUnit.Case, async: false
+  @moduletag skip: "async durability feature removed; quorum is the only supported durability"
 
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router

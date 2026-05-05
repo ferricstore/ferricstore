@@ -124,6 +124,7 @@ defmodule Ferricstore.CrossShardOpTest do
   # ---------------------------------------------------------------------------
 
   describe "cross-shard SMOVE in async mode" do
+    @tag skip: "async durability feature removed; cross-shard operations now use quorum"
     test "returns CROSSSLOT error with helpful message" do
       [src, dst] = ShardHelpers.keys_on_different_shards(2)
 
@@ -361,6 +362,7 @@ defmodule Ferricstore.CrossShardOpTest do
   # ---------------------------------------------------------------------------
 
   describe "CROSSSLOT error message" do
+    @tag skip: "async durability feature removed; async-specific CROSSSLOT hint no longer exists"
     test "error message includes hash tag suggestion and quorum config hint" do
       [src, dst] = ShardHelpers.keys_on_different_shards(2)
 

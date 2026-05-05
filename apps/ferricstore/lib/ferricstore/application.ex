@@ -200,9 +200,8 @@ defmodule Ferricstore.Application do
         []
       end
 
-    # Async RMW fallback coordinator — one per shard. Handles contended RMW
-    # commands that lost the per-key latch in Router.async_rmw. See
-    # docs/async-rmw-design.md.
+    # RMW fallback coordinator — one per shard. Handles contended inline RMW
+    # commands that lost the per-key latch.
     rmw_coordinator_children =
       Enum.map(0..(shard_count - 1), fn i ->
         Supervisor.child_spec(

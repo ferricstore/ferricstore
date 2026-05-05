@@ -5520,55 +5520,12 @@ defmodule FerricStore do
   @doc """
   Batch SET: takes a list of `{key, value}` pairs, returns a list of results.
 
-  Routes through `Router.batch_quorum_put` or `batch_async_put` based on
-  namespace durability. Designed for erpc callers.
+  Routes through `Router.batch_quorum_put`. Designed for erpc callers.
   """
   @spec batch_set([{binary(), binary()}]) :: [:ok | write_error()]
   def batch_set(kv_pairs) when is_list(kv_pairs) do
     ctx = FerricStore.Instance.get(:default)
-
-    case ctx.durability_mode do
-      :all_async ->
-        batch_async_put_result_list(ctx, kv_pairs)
-
-      :all_quorum ->
-        Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
-
-      :mixed ->
-        indexed = Enum.with_index(kv_pairs)
-
-        {async_kvs, quorum_kvs} =
-          Enum.split_with(indexed, fn {{k, _v}, _i} ->
-            Ferricstore.Store.Router.durability_for_key_public(ctx, k) == :async
-          end)
-
-        async_results =
-          if async_kvs != [] do
-            async_values =
-              batch_async_put_result_list(ctx, Enum.map(async_kvs, fn {{k, v}, _} -> {k, v} end))
-
-            Enum.zip(Enum.map(async_kvs, fn {_, i} -> i end), async_values)
-          else
-            []
-          end
-
-        quorum_results =
-          if quorum_kvs != [] do
-            results =
-              Ferricstore.Store.Router.batch_quorum_put(
-                ctx,
-                Enum.map(quorum_kvs, fn {{k, v}, _} -> {k, v} end)
-              )
-
-            Enum.zip(Enum.map(quorum_kvs, fn {_, i} -> i end), results)
-          else
-            []
-          end
-
-        (async_results ++ quorum_results)
-        |> Enum.sort_by(&elem(&1, 0))
-        |> Enum.map(&elem(&1, 1))
-    end
+    Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
   end
 
   # ---------------------------------------------------------------------------
@@ -5703,159 +5660,15 @@ defmodule FerricStore do
     end
   end
 
-  defp batch_async_put_result_list(ctx, kv_pairs) do
-    __async_batch_put_result_list__(ctx, kv_pairs)
-  end
-
   @doc false
   def __async_batch_put_result_list__(_ctx, []), do: []
 
   def __async_batch_put_result_list__(ctx, kv_pairs) do
-    {valid_indexed, errors} = split_async_batch_by_size(kv_pairs)
-    pressure? = async_disk_pressure?(ctx)
-    keydir_pressure? = async_keydir_pressure?(ctx)
-
-    cond do
-      valid_indexed == [] ->
-        ordered_async_batch_results(length(kv_pairs), errors)
-
-      errors == %{} and not pressure? and not keydir_pressure? ->
-        valid_indexed
-        |> then(&run_async_batch_put(ctx, &1))
-        |> then(&ordered_async_batch_results(length(kv_pairs), &1))
-
-      pressure? or keydir_pressure? ->
-        {keydir_accepted_indexed, keydir_errors} =
-          split_async_batch_by_keydir_pressure(ctx, valid_indexed, keydir_pressure?)
-
-        {accepted_indexed, pressure_errors} =
-          split_async_batch_by_pressure(ctx, keydir_accepted_indexed, pressure?)
-
-        results =
-          errors
-          |> Map.merge(keydir_errors)
-          |> Map.merge(pressure_errors)
-          |> Map.merge(run_async_batch_put(ctx, accepted_indexed))
-
-        ordered_async_batch_results(length(kv_pairs), results)
-
-      true ->
-        results = Map.merge(errors, run_async_batch_put(ctx, valid_indexed))
-        ordered_async_batch_results(length(kv_pairs), results)
-    end
-  end
-
-  defp split_async_batch_by_size(kv_pairs) do
-    {valid_reversed, errors} =
-      kv_pairs
-      |> Enum.with_index()
-      |> Enum.reduce({[], %{}}, fn {{key, value} = kv, index}, {valid, errors} ->
-        case async_batch_size_error(key, value) do
-          nil -> {[{index, kv} | valid], errors}
-          {:error, _} = error -> {valid, Map.put(errors, index, error)}
-        end
-      end)
-
-    {Enum.reverse(valid_reversed), errors}
-  end
-
-  defp async_batch_size_error(key, value) do
-    cond do
-      byte_size(key) > Router.max_key_size() ->
-        {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
-
-      is_binary(value) and byte_size(value) >= Router.max_value_size() ->
-        {:error, "ERR value too large (max #{Router.max_value_size()} bytes)"}
-
-      true ->
-        nil
-    end
-  end
-
-  defp async_disk_pressure?(ctx) do
-    size = :atomics.info(ctx.disk_pressure).size
-    Enum.any?(1..size, fn pos -> :atomics.get(ctx.disk_pressure, pos) == 1 end)
-  end
-
-  defp async_keydir_pressure?(ctx) do
-    :atomics.get(ctx.pressure_flags, 1) == 1 or :atomics.get(ctx.pressure_flags, 2) == 1
-  end
-
-  defp split_async_batch_by_keydir_pressure(_ctx, indexed_kvs, false), do: {indexed_kvs, %{}}
-
-  defp split_async_batch_by_keydir_pressure(ctx, indexed_kvs, true) do
-    {accepted_reversed, errors} =
-      Enum.reduce(indexed_kvs, {[], %{}}, fn {index, {key, _value} = kv}, {accepted, errors} ->
-        if Router.exists?(ctx, key) do
-          {[{index, kv} | accepted], errors}
-        else
-          error = {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}
-          {accepted, Map.put(errors, index, error)}
-        end
-      end)
-
-    if map_size(errors) > 0, do: Ferricstore.MemoryGuard.nudge()
-
-    {Enum.reverse(accepted_reversed), errors}
-  end
-
-  defp split_async_batch_by_pressure(_ctx, indexed_kvs, false), do: {indexed_kvs, %{}}
-
-  defp split_async_batch_by_pressure(ctx, indexed_kvs, true) do
-    {accepted_reversed, errors, _pressure_by_shard} =
-      Enum.reduce(indexed_kvs, {[], %{}, %{}}, fn {index, {key, _value} = kv},
-                                                  {accepted, errors, pressure_by_shard} ->
-        idx = Router.shard_for(ctx, key)
-        {under_pressure?, pressure_by_shard} = pressure_for_shard(ctx, idx, pressure_by_shard)
-
-        if under_pressure? do
-          error = {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
-          {accepted, Map.put(errors, index, error), pressure_by_shard}
-        else
-          {[{index, kv} | accepted], errors, pressure_by_shard}
-        end
-      end)
-
-    {Enum.reverse(accepted_reversed), errors}
-  end
-
-  defp run_async_batch_put(_ctx, []), do: %{}
-
-  defp run_async_batch_put(ctx, indexed_kvs) do
-    indexed_kvs
-    |> Enum.group_by(fn {_index, {key, _value}} -> Router.shard_for(ctx, key) end)
-    |> Enum.flat_map(fn {_idx, shard_indexed_kvs} ->
-      kv_pairs = Enum.map(shard_indexed_kvs, fn {_index, kv} -> kv end)
-      results = run_async_batch_put_result_list(ctx, kv_pairs)
-
-      shard_indexed_kvs
-      |> Enum.map(fn {index, _kv} -> index end)
-      |> Enum.zip(results)
-    end)
-    |> Map.new()
-  end
-
-  defp run_async_batch_put_result_list(ctx, kv_pairs) do
     case Ferricstore.Store.Router.batch_async_put(ctx, kv_pairs) do
       :ok -> List.duplicate(:ok, length(kv_pairs))
       {:error, _reason} = error -> List.duplicate(error, length(kv_pairs))
+      results when is_list(results) -> results
     end
-  end
-
-  defp pressure_for_shard(ctx, idx, pressure_by_shard) do
-    case Map.fetch(pressure_by_shard, idx) do
-      {:ok, under_pressure?} ->
-        {under_pressure?, pressure_by_shard}
-
-      :error ->
-        under_pressure? = Ferricstore.Store.DiskPressure.under_pressure?(ctx, idx)
-        {under_pressure?, Map.put(pressure_by_shard, idx, under_pressure?)}
-    end
-  end
-
-  defp ordered_async_batch_results(count, results) do
-    0..(count - 1)
-    |> Enum.map(fn index -> Map.fetch!(results, index) end)
   end
 
   # ---------------------------------------------------------------------------
@@ -6325,53 +6138,8 @@ defmodule FerricStore.Pipe do
 
   defp classify_batch(_, _, _, _), do: :complex
 
-  defp batch_async_put_result_list(ctx, kv_pairs) do
-    FerricStore.__async_batch_put_result_list__(ctx, kv_pairs)
-  end
-
   defp execute_batch_sets(ctx, _ordered, kv_pairs) do
-    case ctx.durability_mode do
-      :all_async ->
-        batch_async_put_result_list(ctx, kv_pairs)
-
-      :all_quorum ->
-        Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
-
-      :mixed ->
-        indexed = Enum.with_index(kv_pairs)
-
-        {async_kvs, quorum_kvs} =
-          Enum.split_with(indexed, fn {{k, _v}, _i} ->
-            Ferricstore.Store.Router.durability_for_key_public(ctx, k) == :async
-          end)
-
-        async_results =
-          if async_kvs != [] do
-            async_values =
-              batch_async_put_result_list(ctx, Enum.map(async_kvs, fn {{k, v}, _} -> {k, v} end))
-
-            Enum.zip(Enum.map(async_kvs, fn {_, i} -> i end), async_values)
-          else
-            []
-          end
-
-        quorum_results =
-          if quorum_kvs != [] do
-            results =
-              Ferricstore.Store.Router.batch_quorum_put(
-                ctx,
-                Enum.map(quorum_kvs, fn {{k, v}, _} -> {k, v} end)
-              )
-
-            Enum.zip(Enum.map(quorum_kvs, fn {_, i} -> i end), results)
-          else
-            []
-          end
-
-        (async_results ++ quorum_results)
-        |> Enum.sort_by(&elem(&1, 0))
-        |> Enum.map(&elem(&1, 1))
-    end
+    Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
   end
 
   defp execute_mixed_get_set(ctx, ordered) do
@@ -6384,41 +6152,7 @@ defmodule FerricStore.Pipe do
         kv_pairs = Enum.map(set_ops, fn {_i, k, v} -> {k, v} end)
 
         results =
-          case ctx.durability_mode do
-            :all_async ->
-              batch_async_put_result_list(ctx, kv_pairs)
-
-            :all_quorum ->
-              Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
-
-            :mixed ->
-              {async_ops, quorum_ops} =
-                Enum.split_with(set_ops, fn {_i, k, _v} ->
-                  Ferricstore.Store.Router.durability_for_key_public(ctx, k) == :async
-                end)
-
-              async_r =
-                if async_ops != [] do
-                  batch_async_put_result_list(
-                    ctx,
-                    Enum.map(async_ops, fn {_, k, v} -> {k, v} end)
-                  )
-                else
-                  []
-                end
-
-              quorum_r =
-                if quorum_ops != [] do
-                  Ferricstore.Store.Router.batch_quorum_put(
-                    ctx,
-                    Enum.map(quorum_ops, fn {_, k, v} -> {k, v} end)
-                  )
-                else
-                  []
-                end
-
-              recombine_results(async_ops, async_r, quorum_ops, quorum_r)
-          end
+          Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
 
         set_ops
         |> Enum.zip(results)
@@ -6445,19 +6179,6 @@ defmodule FerricStore.Pipe do
     for i <- 0..(count - 1) do
       Map.get(get_results, i) || Map.get(set_results, i)
     end
-  end
-
-  defp recombine_results(async_ops, async_results, quorum_ops, quorum_results) do
-    async_map = async_ops |> Enum.zip(async_results) |> Map.new(fn {{i, _, _}, r} -> {i, r} end)
-
-    quorum_map =
-      quorum_ops |> Enum.zip(quorum_results) |> Map.new(fn {{i, _, _}, r} -> {i, r} end)
-
-    combined = Map.merge(async_map, quorum_map)
-
-    (async_ops ++ quorum_ops)
-    |> Enum.sort_by(fn {i, _, _} -> i end)
-    |> Enum.map(fn {i, _, _} -> Map.fetch!(combined, i) end)
   end
 
   defp pipeline_get_results(ctx, keys, values) do

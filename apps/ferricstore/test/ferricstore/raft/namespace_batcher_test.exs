@@ -360,6 +360,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       assert :quorum == NamespaceConfig.durability_for("noconfig")
     end
 
+    @tag skip: "async durability feature removed; Batcher.write now uses quorum durability"
     test "async durability commands complete successfully" do
       NamespaceConfig.set("ephemeral", "durability", "async")
 
@@ -381,6 +382,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       )
     end
 
+    @tag skip: "async durability feature removed; async namespace target path no longer applies"
     test "async namespace write reports missing local Ra target instead of early success" do
       prefix = "async_missing_target"
       NamespaceConfig.set(prefix, "durability", "async")
@@ -466,7 +468,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
     end
 
     test "scrape includes namespace durability gauge when config exists" do
-      NamespaceConfig.set("metrics_dur", "durability", "async")
+      NamespaceConfig.set("metrics_dur", "durability", "quorum")
 
       text = Ferricstore.Metrics.scrape()
 
@@ -475,7 +477,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
       assert String.contains?(
                text,
-               "ferricstore_namespace_durability{prefix=\"metrics_dur\",mode=\"async\"} 1"
+               "ferricstore_namespace_durability{prefix=\"metrics_dur\",mode=\"quorum\"} 1"
              )
     end
 
@@ -483,7 +485,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       NamespaceConfig.set("ns_a", "window_ms", "2")
       NamespaceConfig.set("ns_a", "durability", "quorum")
       NamespaceConfig.set("ns_b", "window_ms", "10")
-      NamespaceConfig.set("ns_b", "durability", "async")
+      NamespaceConfig.set("ns_b", "durability", "quorum")
 
       text = Ferricstore.Metrics.scrape()
 
@@ -497,7 +499,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
       assert String.contains?(
                text,
-               "ferricstore_namespace_durability{prefix=\"ns_b\",mode=\"async\"} 1"
+               "ferricstore_namespace_durability{prefix=\"ns_b\",mode=\"quorum\"} 1"
              )
     end
 
@@ -806,7 +808,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
     test "writing with different prefixes creates separate cache entries" do
       NamespaceConfig.set("indep_x", "window_ms", "3")
       NamespaceConfig.set("indep_y", "window_ms", "8")
-      NamespaceConfig.set("indep_y", "durability", "async")
+      NamespaceConfig.set("indep_y", "durability", "quorum")
 
       ShardHelpers.eventually(
         fn ->
@@ -833,14 +835,13 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
         |> then(fn i -> "indep_y:ic_#{i}" end)
 
       assert :ok == Batcher.write(shard, {:put, k_x, "vx", 0})
-      # Async needs a small wait for the Raft state machine to apply
       assert :ok == Batcher.write(shard, {:put, k_y, "vy", 0})
 
       ShardHelpers.eventually(
         fn ->
           Router.get(FerricStore.Instance.get(:default), k_y) == "vy"
         end,
-        "async write not visible",
+        "quorum write not visible",
         30,
         20
       )
@@ -849,7 +850,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       state = :sys.get_state(batcher_pid)
 
       assert {3, :quorum} == Map.get(state.ns_cache, "indep_x")
-      assert {8, :async} == Map.get(state.ns_cache, "indep_y")
+      assert {8, :quorum} == Map.get(state.ns_cache, "indep_y")
 
       # Verify they don't interfere with each other
       assert "vx" == Router.get(FerricStore.Instance.get(:default), k_x)

@@ -55,51 +55,6 @@ defmodule FerricStore.BatchWorker do
   end
 
   defp do_batch_set(ctx, kv_pairs) do
-    case ctx.durability_mode do
-      :all_async ->
-        async_batch_put_result_list(ctx, kv_pairs)
-
-      :all_quorum ->
-        Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
-
-      :mixed ->
-        indexed = Enum.with_index(kv_pairs)
-
-        {async_kvs, quorum_kvs} =
-          Enum.split_with(indexed, fn {{k, _v}, _i} ->
-            Ferricstore.Store.Router.durability_for_key_public(ctx, k) == :async
-          end)
-
-        async_results =
-          if async_kvs != [] do
-            async_values =
-              async_batch_put_result_list(ctx, Enum.map(async_kvs, fn {{k, v}, _} -> {k, v} end))
-
-            Enum.zip(Enum.map(async_kvs, fn {_, i} -> i end), async_values)
-          else
-            []
-          end
-
-        quorum_results =
-          if quorum_kvs != [] do
-            results =
-              Ferricstore.Store.Router.batch_quorum_put(
-                ctx,
-                Enum.map(quorum_kvs, fn {{k, v}, _} -> {k, v} end)
-              )
-
-            Enum.zip(Enum.map(quorum_kvs, fn {_, i} -> i end), results)
-          else
-            []
-          end
-
-        (async_results ++ quorum_results)
-        |> Enum.sort_by(&elem(&1, 0))
-        |> Enum.map(&elem(&1, 1))
-    end
-  end
-
-  defp async_batch_put_result_list(ctx, kv_pairs) do
-    FerricStore.__async_batch_put_result_list__(ctx, kv_pairs)
+    Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
   end
 end

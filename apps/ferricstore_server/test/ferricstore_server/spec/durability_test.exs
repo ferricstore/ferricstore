@@ -253,6 +253,8 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
   # ==========================================================================
 
   describe "4.2 Async Mode" do
+    @describetag skip: "async durability feature removed; quorum is the only supported durability"
+
     @tag :durability
     test "DA-001: async write returns :ok quickly" do
       NamespaceConfig.set("fast", "durability", "async")
@@ -568,6 +570,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
   # ==========================================================================
 
   describe "cross-cutting durability" do
+    @tag skip: "async durability feature removed; restart comparison no longer applies"
     @tag :durability
     test "quorum write survives shard restart, async write may not without flush" do
       NamespaceConfig.set("ephemeral", "durability", "async")
@@ -608,6 +611,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
         "quorum write should survive shard restart")
     end
 
+    @tag skip: "async durability feature removed; overlapping async/quorum writer case no longer applies"
     @tag :durability
     test "concurrent quorum and async writers on overlapping keys" do
       NamespaceConfig.set("mixed", "durability", "async")

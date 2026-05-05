@@ -28,6 +28,7 @@ defmodule Ferricstore.Jepsen.AsyncDurabilityTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag skip: "async durability feature removed; quorum is the only supported durability"
 
   alias Ferricstore.Test.ClusterHelper
 

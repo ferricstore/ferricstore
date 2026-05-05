@@ -1,5 +1,6 @@
 defmodule Ferricstore.Bench.EmbeddedAsyncProfileTest do
   use ExUnit.Case, async: false
+  @moduletag skip: "async durability feature removed; quorum is the only supported durability"
   @moduletag :bench
   @moduletag timeout: 120_000
 

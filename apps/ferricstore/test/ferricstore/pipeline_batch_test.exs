@@ -104,6 +104,7 @@ defmodule Ferricstore.PipelineBatchTest do
       assert {:ok, "c"} = FerricStore.get("pb:cross_gamma")
     end
 
+    @tag skip: "async durability pressure split removed; all pipeline SETs use quorum"
     test "async all-set pipeline rejects only pressured shard writes" do
       ns = "pb_async"
       Ferricstore.NamespaceConfig.set(ns, "durability", "async")

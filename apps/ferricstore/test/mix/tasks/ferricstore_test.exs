@@ -131,7 +131,8 @@ defmodule Mix.Tasks.FerricstoreTest do
     end
 
     test "set updates a namespace config field" do
-      output = capture_io(fn -> Mix.Tasks.Ferricstore.Config.run(["set", "myns", "window_ms", "50"]) end)
+      output =
+        capture_io(fn -> Mix.Tasks.Ferricstore.Config.run(["set", "myns", "window_ms", "50"]) end)
 
       assert output =~ "OK"
 
@@ -140,23 +141,29 @@ defmodule Mix.Tasks.FerricstoreTest do
       assert verify_output =~ "window_ms: 50"
     end
 
-    test "set durability to async" do
-      output = capture_io(fn -> Mix.Tasks.Ferricstore.Config.run(["set", "fast_ns", "durability", "async"]) end)
+    test "rejects async durability" do
+      output =
+        capture_io(fn ->
+          Mix.Tasks.Ferricstore.Config.run(["set", "fast_ns", "durability", "async"])
+        end)
 
-      assert output =~ "OK"
+      assert output =~ "ERROR"
+      assert output =~ "async durability has been removed"
 
       verify = capture_io(fn -> Mix.Tasks.Ferricstore.Config.run(["get", "fast_ns"]) end)
-      assert verify =~ "durability: async"
+      assert verify =~ "durability: quorum"
     end
 
     test "set with invalid field returns error" do
-      output = capture_io(fn -> Mix.Tasks.Ferricstore.Config.run(["set", "ns", "bogus_field", "1"]) end)
+      output =
+        capture_io(fn -> Mix.Tasks.Ferricstore.Config.run(["set", "ns", "bogus_field", "1"]) end)
 
       assert output =~ "ERROR"
     end
 
     test "set with invalid value returns error" do
-      output = capture_io(fn -> Mix.Tasks.Ferricstore.Config.run(["set", "ns", "window_ms", "-5"]) end)
+      output =
+        capture_io(fn -> Mix.Tasks.Ferricstore.Config.run(["set", "ns", "window_ms", "-5"]) end)
 
       assert output =~ "ERROR"
     end

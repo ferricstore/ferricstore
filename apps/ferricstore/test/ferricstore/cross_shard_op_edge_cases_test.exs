@@ -157,6 +157,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
   # ---------------------------------------------------------------------------
 
   describe "mixed namespace durability" do
+    @tag skip: "async durability feature removed; mixed async/quorum routing no longer exists"
     test "CROSSSLOT when source is async, dest is quorum" do
       src = "asyncns:src_#{:rand.uniform(9_999_999)}"
       dst = "quorumns:dst_#{:rand.uniform(9_999_999)}"
@@ -179,6 +180,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       end
     end
 
+    @tag skip: "async durability feature removed; mixed async/quorum routing no longer exists"
     test "CROSSSLOT when dest is async, source is quorum" do
       src = "quorumns:src2_#{:rand.uniform(9_999_999)}"
       dst = "asyncns:dst2_#{:rand.uniform(9_999_999)}"

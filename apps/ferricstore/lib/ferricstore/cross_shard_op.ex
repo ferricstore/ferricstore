@@ -29,7 +29,6 @@ defmodule Ferricstore.CrossShardOp do
   """
 
   alias Ferricstore.HLC
-  alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.Cluster
   alias Ferricstore.Raft.CommandClock
   alias Ferricstore.Store.Router
@@ -39,10 +38,6 @@ defmodule Ferricstore.CrossShardOp do
   @lock_ttl_ms 5_000
   @max_retries 3
   @max_cross_shard_keys 20
-
-  @crossslot_error "CROSSSLOT Keys in request don't hash to the same slot. " <>
-                     "Use hash tags {tag} to colocate keys, or switch namespace to quorum durability: " <>
-                     "CONFIG SET namespace myns durability quorum"
 
   @too_many_keys_error "ERR cross-shard operation exceeds max key limit (#{@max_cross_shard_keys}). " <>
                          "Use hash tags {tag} to colocate keys on the same shard."
@@ -102,18 +97,7 @@ defmodule Ferricstore.CrossShardOp do
         # Use the caller's shard-local store if provided, otherwise build one.
         execute_same_shard(ctx, shard_map, execute_fn, caller_store)
       else
-        # Cross-shard: check durability mode for ALL involved keys.
-        # If any key is in an async namespace, return CROSSSLOT.
-        has_async =
-          Enum.any?(keys, fn key ->
-            ns = Keyword.get(opts, :namespace) || extract_namespace(key)
-            NamespaceConfig.durability_for(ns) == :async
-          end)
-
         cond do
-          has_async ->
-            {:error, @crossslot_error}
-
           length(keys) > @max_cross_shard_keys ->
             {:error, @too_many_keys_error}
 
@@ -647,14 +631,6 @@ defmodule Ferricstore.CrossShardOp do
       fn {key, _role} -> Router.shard_for(ctx, key) end,
       fn {key, _role} -> key end
     )
-  end
-
-  # Extracts namespace prefix from a key (portion before first colon).
-  defp extract_namespace(key) do
-    case :binary.split(key, ":") do
-      [^key] -> "_root"
-      [prefix | _] -> prefix
-    end
   end
 
   # The ferricstore state machine wraps every reply as `{:applied_at, ra_index, real}`

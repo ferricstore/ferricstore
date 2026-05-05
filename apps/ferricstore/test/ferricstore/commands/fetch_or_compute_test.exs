@@ -122,6 +122,7 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       assert ["hit", "done"] = result
     end
 
+    @tag skip: "async durability pressure path removed; quorum write failure injection needs a new hook"
     test "returns write error and wakes waiters with error when storing result fails" do
       key = "foc:result_pressure_#{:erlang.unique_integer([:positive])}"
       ctx = FerricStore.Instance.get(:default)

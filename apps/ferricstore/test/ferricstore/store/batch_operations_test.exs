@@ -11,10 +11,10 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
   setup do
     ctx = Ferricstore.Test.IsolatedInstance.checkout()
-    Ferricstore.NamespaceConfig.set(@ns_async, "durability", "async")
+    Ferricstore.NamespaceConfig.set(@ns_async, "durability", "quorum")
 
     on_exit(fn ->
-      Ferricstore.NamespaceConfig.set(@ns_async, "durability", "quorum")
+      Ferricstore.NamespaceConfig.reset(@ns_async)
       Ferricstore.Test.IsolatedInstance.checkin(ctx)
     end)
 
@@ -30,6 +30,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   # ---------------------------------------------------------------------------
 
   describe "batch_async_put" do
+    @tag skip:
+           "async durability origin replay path removed; batch_async_put is now a quorum compatibility wrapper"
     test "submits origin-checked PUT commands for stale replay safety" do
       source =
         Path.expand("../../../lib/ferricstore/store/router.ex", __DIR__)
@@ -146,6 +148,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert Router.get(default_ctx(), key) == "second"
     end
 
+    @tag skip:
+           "async durability local rollback path removed; quorum failures are covered by Ra apply tests"
     test "mixed batch rolls back same-shard small keys when large disk write fails" do
       {small_key, large_key} = same_shard_keys(default_ctx(), "bap_disk_fail")
       idx = Router.shard_for(default_ctx(), small_key)
@@ -181,6 +185,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       end
     end
 
+    @tag skip:
+           "async durability local rollback path removed; quorum failures are covered by Ra apply tests"
     test "failed mixed batch restores overwritten same-shard keys" do
       {small_key, large_key} = same_shard_keys(default_ctx(), "bap_disk_fail_existing")
       idx = Router.shard_for(default_ctx(), small_key)
@@ -217,6 +223,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       end
     end
 
+    @tag skip: "async durability cross-shard compensation path removed from the public write path"
     test "cross-shard failure does not leave earlier shard writes visible" do
       small_key = key_for_shard(default_ctx(), "bap_cross_fail_small", 0)
       large_key = key_for_shard(default_ctx(), "bap_cross_fail_large", 1)
@@ -252,6 +259,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       end
     end
 
+    @tag skip:
+           "async durability overload path removed; default instance writes now submit through quorum"
     test "cross-shard async replication overload does not leave earlier shard writes visible" do
       ok_key = key_for_shard(default_ctx(), "bap_cross_overload_ok", 0)
       overloaded_key = key_for_shard(default_ctx(), "bap_cross_overload_blocked", 1)
@@ -266,6 +275,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert nil == Router.get(default_ctx(), overloaded_key)
     end
 
+    @tag skip:
+           "async durability direct pressure preflight removed; quorum write pressure is exercised elsewhere"
     test "direct batch_async_put rejects pressured shards before publishing writes" do
       ctx = default_ctx()
       pressured_key = "#{@ns_async}:bap_pressure_#{System.unique_integer([:positive])}"
@@ -285,6 +296,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       end
     end
 
+    @tag skip:
+           "async durability overload recovery path removed; default instance writes now submit through quorum"
     test "large batch does not recover unaccepted value when async replication is overloaded" do
       key = "#{@ns_async}:bap_overloaded_large_missing_#{System.unique_integer([:positive])}"
       idx = Router.shard_for(default_ctx(), key)
@@ -300,6 +313,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert nil == recovered_value_from_bitcask(default_ctx(), key)
     end
 
+    @tag skip:
+           "async durability overload rollback path removed; default instance writes now submit through quorum"
     test "large batch restores previous cold value when async replication is overloaded" do
       key = "#{@ns_async}:bap_overloaded_large_existing_#{System.unique_integer([:positive])}"
       idx = Router.shard_for(default_ctx(), key)
@@ -321,6 +336,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   end
 
   describe "flush" do
+    @tag skip:
+           "async durability delete pressure path removed; quorum delete failures need a Ra apply injection hook"
     test "surfaces delete failures instead of reporting success" do
       ctx = default_ctx()
       key = "#{@ns_async}:flush_pressure_#{System.unique_integer([:positive])}"
@@ -344,6 +361,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   # ---------------------------------------------------------------------------
 
   describe "FerricStore.batch_set" do
+    @tag skip: "async durability namespace removed; quorum batch_set coverage remains below"
     test "all-async namespace returns list of :ok" do
       kvs = for i <- 1..10, do: {"#{@ns_async}:bs_#{i}", "v#{i}"}
       results = FerricStore.batch_set(kvs)
@@ -354,6 +372,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       end
     end
 
+    @tag skip:
+           "async durability overload result fan-out removed; batch_set now submits through quorum"
     test "all-async batch reports overload per shard instead of failing every key" do
       ok_key = key_for_shard(default_ctx(), "bs_cross_overload_ok", 0)
       overloaded_key = key_for_shard(default_ctx(), "bs_cross_overload_blocked", 1)
@@ -388,6 +408,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert [] = Router.batch_quorum_put(default_ctx(), [])
     end
 
+    @tag skip: "mixed async/quorum namespace routing removed; all namespaces are quorum"
     test "mixed async/quorum namespaces preserves result order" do
       kvs = [
         {"#{@ns_async}:mix_1", "async_val"},
@@ -410,6 +431,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       assert FerricStore.batch_set([]) == []
     end
 
+    @tag skip:
+           "async durability disk-write error fan-out removed; quorum path failure injection needs a separate hook"
     test "async disk failure is returned to every async batch_set key" do
       default_ctx = FerricStore.Instance.get(:default)
       {small_key, large_key} = same_shard_keys(default_ctx, "bs_disk_fail")
@@ -448,6 +471,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       end
     end
 
+    @tag skip:
+           "async durability per-shard pressure partial success removed; quorum batch_set is all quorum"
     test "async disk pressure rejects only pressured async batch_set keys" do
       default_ctx = FerricStore.Instance.get(:default)
       pressured_key = "#{@ns_async}:bs_pressure_#{System.unique_integer([:positive])}"
@@ -469,6 +494,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       end
     end
 
+    @tag skip:
+           "async durability keydir pressure semantics removed; quorum batch_set validation is covered elsewhere"
     test "async keydir pressure rejects new batch_set keys but allows updates" do
       existing_key = "#{@ns_async}:bs_keydir_existing_#{System.unique_integer([:positive])}"
       new_key = "#{@ns_async}:bs_keydir_new_#{System.unique_integer([:positive])}"
@@ -490,6 +517,8 @@ defmodule Ferricstore.Store.BatchOperationsTest do
       end
     end
 
+    @tag skip:
+           "async durability preflight validation path removed; quorum command validation is covered elsewhere"
     test "async batch_set rejects overlarge keys before writing" do
       default_ctx = FerricStore.Instance.get(:default)
       key = "#{@ns_async}:" <> String.duplicate("k", 65_536)
@@ -643,6 +672,7 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   # ---------------------------------------------------------------------------
 
   describe "Router.get_keydir_file_ref" do
+    @tag skip: "pending async ETS locations removed from default durability path"
     test "does not return pending async locations as disk file refs" do
       key = "#{@ns_async}:pending_file_ref"
       idx = Router.shard_for(default_ctx(), key)

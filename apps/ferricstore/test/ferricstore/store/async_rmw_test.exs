@@ -19,6 +19,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
   (commit 88ff185). They pass once the latch+worker design is in place.
   """
   use ExUnit.Case, async: false
+  @moduletag skip: "async durability feature removed; quorum is the only supported durability"
 
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Bitcask.NIF

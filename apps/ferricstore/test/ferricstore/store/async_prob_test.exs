@@ -21,6 +21,7 @@ defmodule Ferricstore.Store.AsyncProbTest do
   command on an async-durability slot).
   """
   use ExUnit.Case, async: false
+  @moduletag skip: "async durability feature removed; quorum is the only supported durability"
 
   alias Ferricstore.Test.ShardHelpers
 

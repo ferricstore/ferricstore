@@ -34,7 +34,7 @@ defmodule Ferricstore.Store.RmwCommandsTest do
 
   setup do
     ShardHelpers.flush_all_keys()
-    Ferricstore.NamespaceConfig.set(@async_ns, "durability", "async")
+    Ferricstore.NamespaceConfig.reset(@async_ns)
 
     on_exit(fn ->
       ShardHelpers.flush_all_keys()

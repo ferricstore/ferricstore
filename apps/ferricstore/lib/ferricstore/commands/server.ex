@@ -287,10 +287,13 @@ defmodule Ferricstore.Commands.Server do
     handle("FLUSHALL", [], store)
   end
 
-  def handle("DEBUG", ["SET-DURABILITY", mode], _store) when mode in ["quorum", "async"] do
-    atom_mode = if mode == "quorum", do: :all_quorum, else: :all_async
-    FerricStore.Instance.update_durability_mode(:default, atom_mode)
-    {:simple, "OK durability_mode=#{atom_mode}"}
+  def handle("DEBUG", ["SET-DURABILITY", "quorum"], _store) do
+    FerricStore.Instance.update_durability_mode(:default, :all_quorum)
+    {:simple, "OK durability_mode=all_quorum"}
+  end
+
+  def handle("DEBUG", ["SET-DURABILITY", "async"], _store) do
+    {:error, "ERR async durability has been removed; only quorum durability is supported"}
   end
 
   def handle("DEBUG", ["BATCHER-STATS"], _store) do

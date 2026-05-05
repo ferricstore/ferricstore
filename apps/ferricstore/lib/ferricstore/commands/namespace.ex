@@ -14,12 +14,12 @@ defmodule Ferricstore.Commands.Namespace do
   ## Fields
 
     * `window_ms` -- commit window in milliseconds (positive integer)
-    * `durability` -- durability mode: `"quorum"` or `"async"`
+    * `durability` -- durability mode: `"quorum"`
 
   ## Examples
 
       FERRICSTORE.CONFIG SET rate window_ms 10
-      FERRICSTORE.CONFIG SET ts durability async
+      FERRICSTORE.CONFIG SET ts durability quorum
       FERRICSTORE.CONFIG GET rate
       FERRICSTORE.CONFIG GET
       FERRICSTORE.CONFIG RESET rate

@@ -4,8 +4,8 @@ defmodule Ferricstore.Raft.Batcher do
 
   Per spec sections 2C.5 and 2F.3, each shard has its own Batcher GenServer
   that accumulates write commands into per-namespace buffers, each with its
-  own commit window and durability mode. When a namespace's timer fires, only
-  that namespace's buffer is flushed.
+  own commit window. Durability is quorum-only; the old namespace async
+  durability mode has been removed.
 
   ## How it works
 
@@ -13,9 +13,8 @@ defmodule Ferricstore.Raft.Batcher do
   2. The batcher extracts the key's namespace prefix (e.g. `"session"` from
      `"session:abc123"`, `"_root"` for keys without a colon).
   3. The namespace config is looked up from the `:ferricstore_ns_config` ETS
-     table to determine `window_ms` and `durability` for this prefix.
-  4. The command and caller are appended to the namespace's buffer slot,
-     identified by `{prefix, durability}`.
+     table to determine `window_ms` for this prefix.
+  4. The command and caller are appended to the namespace's quorum buffer slot.
   5. On the first write to an empty slot, a timer is started using the
      namespace's `window_ms`.
   6. When the timer fires (`:flush_slot`), only that slot's commands are
@@ -57,27 +56,18 @@ defmodule Ferricstore.Raft.Batcher do
   which clears their caches. The next write for any prefix then re-reads
   from ETS.
 
-  If no configuration exists for a prefix, the defaults are used:
-  `window_ms = 1`, `durability = :quorum`.
+  If no configuration exists for a prefix, the default window is used:
+  `window_ms = 1`.
 
-  For `:quorum` durability, commands are submitted to ra via
-  `:ra.pipeline_command/3` with a correlation reference. Callers are replied to
-  when the `ra_event` notification arrives confirming the command was applied.
+  Quorum commands are submitted to ra via `:ra.pipeline_command/3` with a
+  correlation reference. Callers are replied to when the `ra_event`
+  notification arrives confirming the command was applied.
 
-  For `:async` durability (spec 2F.3), there are two entry points:
-
-  - `Batcher.async_submit/2` (preferred) is called by `Router.async_write_*`
-    after Router has already persisted locally (ETS + Bitcask for big values).
-    Commands accumulate in a dedicated `{prefix, :async_origin}` slot and
-    flush as one `ra.pipeline_command({:batch, [{:async, cmd}, ...]})` for
-    replication. The state machine's `{:async, inner}` clause origin-skips
-    on the node that already has the ETS entry. Ordered callers are replied
-    after the pipeline submission; fire-and-forget callers have no reply.
-
-  - `Batcher.write/2` on an async namespace (legacy callers) is the blocking
-    entry; the caller is replied after Ra accepts the slot submission, commands
-    go to Raft as a regular `{:batch, [cmds]}` (no `{:async, ...}` wrapper)
-    and the state machine applies them normally on every node.
+  The module still has an internal `{prefix, :async_origin}` slot for
+  low-level local-origin replication helpers such as release-cursor pokes.
+  That path is not namespace durability: it is explicit, internal, and wraps
+  commands as `{:async, origin, cmd}` so the state machine can origin-skip
+  effects that were already applied locally.
 
   ## Why a separate GenServer?
 
@@ -171,11 +161,10 @@ defmodule Ferricstore.Raft.Batcher do
 
   @typedoc """
   A slot key identifies a unique batching bucket by namespace prefix and
-  durability mode. Commands with the same prefix but different durability
-  modes (which can happen if config changes mid-flight) are batched
-  separately.
+  submission mode. Normal writes always use `:quorum`; `:async_origin` is
+  reserved for explicit internal local-origin replication helpers.
   """
-  @type slot_key :: {binary(), :quorum | :async | :async_origin}
+  @type slot_key :: {binary(), :quorum | :async_origin}
 
   @typedoc """
   A slot holds the accumulated commands and callers for a single namespace
@@ -242,10 +231,7 @@ defmodule Ferricstore.Raft.Batcher do
   submitted when the namespace's commit window expires or the buffer
   reaches `max_batch_size`.
 
-  For `:quorum` durability, this call blocks until the ra command is
-  committed and applied. For `:async` durability, the call returns as
-  soon as the slot is flushed (state machine application continues in
-  the background on the origin and on replicas).
+  This call blocks until the ra command is committed and applied.
 
   ## Parameters
 
@@ -295,9 +281,9 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc """
-  Like `write_async/3` but forces quorum durability regardless of namespace
-  config. Used by RMW operations (INCR, APPEND, GETSET, etc.) that need
-  consensus for atomicity even when the namespace is configured async.
+  Like `write_async/3` but routes through the explicit quorum slot. Used by
+  operations that need the quorum write path even when the caller enters via
+  a non-blocking GenServer cast.
   """
   @spec write_async_quorum(non_neg_integer(), command(), GenServer.from()) :: :ok
   def write_async_quorum(shard_index, command, reply_to) do
@@ -345,12 +331,12 @@ defmodule Ferricstore.Raft.Batcher do
   def remote_origin_from(origin_node, from), do: {:remote_origin, origin_node, from}
 
   @doc """
-  Submits an async-durability write. Fire-and-forget.
+  Submits an explicit internal local-origin replication command.
 
-  Called by Router on the origin node AFTER it has already written the value
-  locally to ETS (and Bitcask for large values). The Batcher accumulates async
-  commands in a slot and flushes them as a single batched `ra.pipeline_command`
-  for replication. The caller already has `:ok` from Router — no reply needed.
+  This is not the removed namespace async durability feature. Callers use this
+  only after they have already applied the local side effect and need to send a
+  best-effort replicated poke or delta through Raft without waiting for local
+  re-application.
 
   Commands are wrapped as `{:async, inner_cmd}` before submission so the
   state machine can distinguish them: on the origin node (which has the entry
@@ -367,10 +353,8 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc """
-  Enqueues an async-durability write and waits until the Batcher has submitted
-  its local slot to Raft. State-machine application is still asynchronous, but
-  callers do not observe success while the command only lives in a local timer
-  slot.
+  Enqueues an explicit internal local-origin replication command and waits
+  until the Batcher has submitted its local slot to Raft.
   """
   @spec async_submit_ordered(non_neg_integer(), command()) ::
           :ok | {:error, :overloaded | {:ra_target_down, term()}}
@@ -379,13 +363,13 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc """
-  Enqueues an async-durability write and returns after the local Batcher has
-  accepted it into a slot.
+  Enqueues an explicit internal local-origin replication command and returns
+  after the local Batcher has accepted it into a slot.
 
   This is intentionally weaker than `async_submit_ordered/2`: it preserves the
-  low-latency async RMW path where waiting for `ra.pipeline_command/4` would
-  dominate command latency. Use it only for commands whose caller explicitly
-  accepts async durability.
+  low-latency local-origin helper path where waiting for
+  `ra.pipeline_command/4` would dominate command latency. It must not be used
+  to reintroduce namespace async durability.
   """
   @spec async_enqueue_ordered(non_neg_integer(), command()) ::
           :ok | {:error, :overloaded | {:ra_target_down, term()}}
@@ -394,7 +378,8 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc """
-  Submits multiple async-durability writes as one Raft pipeline batch.
+  Submits multiple explicit internal local-origin replication commands as one
+  Raft pipeline batch.
   """
   @spec async_submit_batch_ordered(non_neg_integer(), [command()]) :: :ok | {:error, :overloaded}
   def async_submit_batch_ordered(_shard_index, []), do: :ok
@@ -1370,18 +1355,10 @@ defmodule Ferricstore.Raft.Batcher do
         new_state =
           case durability do
             :async_origin ->
-              # Commands came via Batcher.async_submit (Router wrote locally).
-              # Wrap each command as {:async, inner} so state machine can
-              # origin-skip on the node that already has the ETS entry.
+              # Explicit internal local-origin helper. Wrap each command as
+              # {:async, origin, inner} so state machine can origin-skip
+              # effects that were already applied locally.
               submit_async_origin(state, batch, froms)
-
-            :async ->
-              # Commands came via Batcher.write on an :async namespace
-              # (blocking callers, e.g. RMW ops via Shard). Router did NOT
-              # write locally — state machine must apply the inner command.
-              # Reply after Ra accepts the regular batch (no {:async, ...}
-              # wrapper), so target-down/submit errors are visible.
-              submit_async_ns(state, batch, froms)
 
             :quorum ->
               pipeline_submit(state, batch, froms)
@@ -1465,21 +1442,6 @@ defmodule Ferricstore.Raft.Batcher do
     origin = node()
     wrapped = Enum.map(batch, fn cmd -> {:async, origin, cmd} end)
     submit_async_with_retry(state, wrapped, state.shard_id, 0, submit_froms)
-  end
-
-  # Flush path for commands accumulated via Batcher.write (blocking) on an
-  # :async-durability namespace. Router did NOT write locally — the state
-  # machine must apply the inner command. Reply to blocked callers after Ra
-  # accepts the submission, then track the correlation in `pending` so flush
-  # waiters observe completion.
-  defp submit_async_ns(state, batch, froms) do
-    :telemetry.execute(
-      [:ferricstore, :batcher, :async_flush],
-      %{batch_size: length(batch)},
-      %{shard_index: state.shard_index, origin: false}
-    )
-
-    submit_async_with_retry(state, batch, state.shard_id, 0, froms)
   end
 
   # Shared helper for initial async submission and retries after :rejected.
@@ -1635,13 +1597,10 @@ defmodule Ferricstore.Raft.Batcher do
   defp enqueue_async_submit_under_capacity(command, state, from \\ nil) do
     prefix = extract_prefix(command)
     {{window_ms, _durability}, state} = lookup_ns_config(prefix, state)
-    # Dedicated slot: commands here will be wrapped as {:async, inner} during
-    # flush so the state machine knows Router has already persisted locally
-    # on the origin (origin-skip optimization in state_machine.ex). This
-    # differs from {prefix, :async} slots where commands came through
-    # Batcher.write on an :async namespace — those go to the state machine
-    # unwrapped because Router did NOT write locally (it was a blocking call
-    # through Shard, e.g. for RMW ops routed to quorum).
+    # Dedicated internal slot: commands here will be wrapped as
+    # {:async, origin, inner} during flush so the state machine can origin-skip
+    # effects that were already applied locally. This is not namespace async
+    # durability.
     slot_key = {prefix, :async_origin}
 
     slot = Map.get(state.slots, slot_key, new_slot(window_ms))

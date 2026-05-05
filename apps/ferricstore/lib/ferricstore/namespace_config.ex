@@ -2,10 +2,9 @@ defmodule Ferricstore.NamespaceConfig do
   @moduledoc """
   GenServer managing per-namespace (prefix) runtime configuration.
 
-  Stores namespace-specific overrides for commit window timing and durability
-  mode in an ETS table (`:ferricstore_ns_config`). Prefixes that have no
-  explicit override fall back to sensible defaults (1 ms window, `:quorum`
-  durability).
+  Stores namespace-specific overrides for commit window timing in an ETS table
+  (`:ferricstore_ns_config`). Prefixes that have no explicit override fall back
+  to sensible defaults (1 ms window, `:quorum` durability).
 
   ## ETS schema
 
@@ -17,7 +16,7 @@ defmodule Ferricstore.NamespaceConfig do
 
     * `prefix` -- binary namespace prefix (e.g. `"rate"`, `"session"`)
     * `window_ms` -- commit window in milliseconds (positive integer)
-    * `durability` -- `:quorum` or `:async`
+    * `durability` -- always `:quorum`; async durability is no longer supported
     * `changed_at` -- Unix timestamp (seconds) of the last change, or `0` for defaults
     * `changed_by` -- identifier of the client that made the change (empty string for defaults)
 
@@ -51,9 +50,7 @@ defmodule Ferricstore.NamespaceConfig do
   @table :ferricstore_ns_config
   @default_window_ms 1
 
-  defp get_default_durability do
-    Application.get_env(:ferricstore, :default_durability, :quorum)
-  end
+  defp get_default_durability, do: :quorum
 
   # ---------------------------------------------------------------------------
   # Types
@@ -63,7 +60,7 @@ defmodule Ferricstore.NamespaceConfig do
   @type ns_entry :: %{
           prefix: binary(),
           window_ms: non_neg_integer(),
-          durability: :quorum | :async,
+          durability: :quorum,
           changed_at: non_neg_integer(),
           changed_by: binary()
         }
@@ -91,7 +88,7 @@ defmodule Ferricstore.NamespaceConfig do
     * `prefix` -- namespace prefix string (e.g. `"rate"`)
     * `field` -- field name string: `"window_ms"` or `"durability"`
     * `value` -- field value string: a positive integer for `window_ms`,
-      or `"quorum"` / `"async"` for `durability`
+      or `"quorum"` for `durability`
 
   ## Returns
 
@@ -104,10 +101,11 @@ defmodule Ferricstore.NamespaceConfig do
       :ok
 
       iex> Ferricstore.NamespaceConfig.set("ts", "durability", "async")
-      :ok
+      {:error, "ERR durability only supports 'quorum'; async durability has been removed"}
   """
   @spec set(binary(), binary(), binary()) :: :ok | {:error, binary()}
-  def set(prefix, field, value) when is_binary(prefix) and is_binary(field) and is_binary(value) do
+  def set(prefix, field, value)
+      when is_binary(prefix) and is_binary(field) and is_binary(value) do
     set(prefix, field, value, "")
   end
 
@@ -133,6 +131,7 @@ defmodule Ferricstore.NamespaceConfig do
   def set(prefix, field, value, changed_by)
       when is_binary(prefix) and is_binary(field) and is_binary(value) and is_binary(changed_by) do
     normalized = String.trim_trailing(prefix, ":")
+
     case validate_field_value(field, value) do
       {:ok, parsed_field, parsed_value} ->
         do_set(normalized, parsed_field, parsed_value, changed_by)
@@ -272,15 +271,10 @@ defmodule Ferricstore.NamespaceConfig do
 
   ## Returns
 
-  `:quorum` or `:async`.
+  `:quorum`.
   """
-  @spec durability_for(binary()) :: :quorum | :async
-  def durability_for(prefix) when is_binary(prefix) do
-    case lookup(prefix) do
-      nil -> get_default_durability()
-      %{durability: d} -> d
-    end
-  end
+  @spec durability_for(binary()) :: :quorum
+  def durability_for(prefix) when is_binary(prefix), do: :quorum
 
   @doc """
   Returns the default window_ms value.
@@ -291,7 +285,7 @@ defmodule Ferricstore.NamespaceConfig do
   @doc """
   Returns the default durability mode.
   """
-  @spec get_default_durability() :: :quorum | :async
+  @spec get_default_durability() :: :quorum
   def default_durability, do: get_default_durability()
 
   # ---------------------------------------------------------------------------
@@ -314,12 +308,11 @@ defmodule Ferricstore.NamespaceConfig do
         :ets.delete_all_objects(@table)
     end
 
-    # Initialize the fast-path flags for Router.durability_for_key/1.
-    # No namespaces configured at startup — use the global default.
-    default = get_default_durability()
-    init_mode = if(default == :async, do: :all_async, else: :all_quorum)
+    # Async durability has been removed. Keep the persistent terms stable for
+    # older call sites while forcing the only supported write mode.
+    init_mode = :all_quorum
     :persistent_term.put(:ferricstore_durability_mode, init_mode)
-    :persistent_term.put(:ferricstore_has_async_ns, default == :async)
+    :persistent_term.put(:ferricstore_has_async_ns, false)
 
     try do
       FerricStore.Instance.update_durability_mode(:default, init_mode)
@@ -334,13 +327,17 @@ defmodule Ferricstore.NamespaceConfig do
 
   # ---------------------------------------------------------------------------
   # Env var: FERRICSTORE_NAMESPACE_DURABILITY
-  # Format: "prefix1=mode1,prefix2=mode2" e.g. "async:=async,cache:=async"
+  # Format: "prefix1=mode1,prefix2=mode2". Only "quorum" is supported.
   # ---------------------------------------------------------------------------
 
   defp apply_env_namespace_overrides do
     case System.get_env("FERRICSTORE_NAMESPACE_DURABILITY") do
-      nil -> :ok
-      "" -> :ok
+      nil ->
+        :ok
+
+      "" ->
+        :ok
+
       raw ->
         raw
         |> String.split(",", trim: true)
@@ -349,12 +346,19 @@ defmodule Ferricstore.NamespaceConfig do
             [prefix, mode] ->
               prefix = String.trim(prefix)
               mode = String.trim(mode)
+
               case set(prefix, "durability", mode, "env") do
-                :ok -> :ok
+                :ok ->
+                  :ok
+
                 {:error, reason} ->
                   require Logger
-                  Logger.warning("FERRICSTORE_NAMESPACE_DURABILITY: failed to set #{prefix}=#{mode}: #{reason}")
+
+                  Logger.warning(
+                    "FERRICSTORE_NAMESPACE_DURABILITY: failed to set #{prefix}=#{mode}: #{reason}"
+                  )
               end
+
             _ ->
               require Logger
               Logger.warning("FERRICSTORE_NAMESPACE_DURABILITY: invalid entry #{inspect(pair)}")
@@ -389,7 +393,17 @@ defmodule Ferricstore.NamespaceConfig do
         {durability, entry}
 
       [] ->
-        entry = build_entry_tuple(prefix, field, value, @default_window_ms, get_default_durability(), now, changed_by)
+        entry =
+          build_entry_tuple(
+            prefix,
+            field,
+            value,
+            @default_window_ms,
+            get_default_durability(),
+            now,
+            changed_by
+          )
+
         {get_default_durability(), entry}
     end
   end
@@ -400,20 +414,6 @@ defmodule Ferricstore.NamespaceConfig do
 
   defp build_entry_tuple(prefix, :durability, value, window_ms, _durability, now, changed_by) do
     {prefix, window_ms, value, now, changed_by}
-  end
-
-  defp maybe_emit_durability_telemetry(:durability, :quorum, :async, prefix, changed_by, now) do
-    :telemetry.execute(
-      [:ferricstore, :config, :durability_weakened],
-      %{system_time: System.system_time(:millisecond)},
-      %{
-        prefix: prefix,
-        old_durability: :quorum,
-        new_durability: :async,
-        changed_by: changed_by,
-        changed_at: now
-      }
-    )
   end
 
   defp maybe_emit_durability_telemetry(_field, _old, _new, _prefix, _by, _now), do: :ok
@@ -476,12 +476,11 @@ defmodule Ferricstore.NamespaceConfig do
     {:ok, :durability, :quorum}
   end
 
-  defp validate_field_value("durability", "async") do
-    {:ok, :durability, :async}
-  end
+  defp validate_field_value("durability", "async"),
+    do: {:error, "ERR durability only supports 'quorum'; async durability has been removed"}
 
   defp validate_field_value("durability", value) do
-    {:error, "ERR durability must be 'quorum' or 'async', got '#{value}'"}
+    {:error, "ERR durability must be 'quorum', got '#{value}'"}
   end
 
   defp validate_field_value(field, _value) do
@@ -498,11 +497,10 @@ defmodule Ferricstore.NamespaceConfig do
   # when raft is disabled).
   @spec broadcast_ns_config_changed() :: :ok
   defp broadcast_ns_config_changed do
-    {has_async, has_quorum} = scan_durability_flags()
-    durability_mode = compute_durability_mode(has_async, has_quorum)
+    durability_mode = :all_quorum
 
     :persistent_term.put(:ferricstore_durability_mode, durability_mode)
-    :persistent_term.put(:ferricstore_has_async_ns, has_async)
+    :persistent_term.put(:ferricstore_has_async_ns, false)
 
     try do
       FerricStore.Instance.update_durability_mode(:default, durability_mode)
@@ -513,34 +511,6 @@ defmodule Ferricstore.NamespaceConfig do
     notify_batchers()
 
     :ok
-  end
-
-  defp scan_durability_flags do
-    try do
-      :ets.foldl(
-        fn {_prefix, _window, :async, _at, _by}, {_a, q} -> {true, q}
-           {_prefix, _window, :quorum, _at, _by}, {a, _q} -> {a, true}
-           _, acc -> acc
-        end,
-        {false, false},
-        @table
-      )
-    rescue
-      ArgumentError -> {false, false}
-    end
-  end
-
-  defp compute_durability_mode(has_async, has_quorum) do
-    default = get_default_durability()
-    effective_async = has_async or default == :async
-    effective_quorum = has_quorum or default == :quorum
-
-    case {effective_async, effective_quorum} do
-      {true, true} -> :mixed
-      {true, false} -> :all_async
-      {false, true} -> :all_quorum
-      {false, false} -> :all_quorum
-    end
   end
 
   defp notify_batchers do

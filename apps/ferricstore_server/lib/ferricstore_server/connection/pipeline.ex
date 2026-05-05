@@ -223,10 +223,9 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # When ALL commands in a pipeline batch are plain `SET key value` (no options),
   # bypass the normal sliding_window_dispatch which serializes each SET.
   #
-  # Async: batch ETS inserts, reply OK immediately.
-  # Quorum: submit all to Batcher(s) concurrently, wait for all Ra commits,
-  #         then send all responses. This lets all SETs share the same Batcher
-  #         batch + WAL fdatasync instead of serializing through it.
+  # Submit all SETs to Batcher(s) concurrently, wait for Ra commits, then send
+  # all responses. This lets all SETs share the same Batcher batch + WAL
+  # fdatasync instead of serializing through it.
 
   defp try_batch_set_fast_path(commands, state, send_response_fn) do
     if requires_auth?(state) or state.multi_state == :queuing do
@@ -235,7 +234,6 @@ defmodule FerricstoreServer.Connection.Pipeline do
       case extract_plain_sets(commands) do
         {:ok, kv_pairs} ->
           ctx = state.instance_ctx
-          live_ctx = FerricStore.Instance.get(:default)
           write_pairs = namespace_kv_pairs(state.sandbox_namespace, kv_pairs)
 
           acl_ok =
@@ -255,25 +253,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
             if not pressure_ok do
               :fallback
             else
-              case live_ctx.durability_mode do
-                :all_async ->
-                  {:ok, do_batch_set_async(write_pairs, state, send_response_fn)}
-
-                :all_quorum ->
-                  {:ok, do_batch_set_quorum(write_pairs, state, send_response_fn)}
-
-                :mixed ->
-                  case classify_batch_durability(ctx, write_pairs) do
-                    :all_async ->
-                      {:ok, do_batch_set_async(write_pairs, state, send_response_fn)}
-
-                    :all_quorum ->
-                      {:ok, do_batch_set_quorum(write_pairs, state, send_response_fn)}
-
-                    :mixed ->
-                      :fallback
-                  end
-              end
+              {:ok, do_batch_set_quorum(write_pairs, state, send_response_fn)}
             end
           end
 
@@ -297,36 +277,6 @@ defmodule FerricstoreServer.Connection.Pipeline do
        do: extract_plain_sets(rest, [{key, value} | acc])
 
   defp extract_plain_sets(_, _acc), do: :fallback
-
-  defp classify_batch_durability(_ctx, []), do: :all_quorum
-
-  defp classify_batch_durability(ctx, [{first_key, _} | rest]) do
-    first = Router.durability_for_key_public(ctx, first_key)
-    if all_same_durability?(ctx, rest, first), do: durability_to_class(first), else: :mixed
-  end
-
-  defp all_same_durability?(_ctx, [], _expected), do: true
-
-  defp all_same_durability?(ctx, [{key, _} | rest], expected) do
-    Router.durability_for_key_public(ctx, key) == expected and
-      all_same_durability?(ctx, rest, expected)
-  end
-
-  defp durability_to_class(:async), do: :all_async
-  defp durability_to_class(:quorum), do: :all_quorum
-
-  defp do_batch_set_async(kv_pairs, state, send_response_fn) do
-    Stats.incr_commands_by(state.stats_counter, length(kv_pairs))
-
-    response =
-      case safe_dispatch(fn -> Router.batch_async_put(state.instance_ctx, kv_pairs) end) do
-        {:ok, result} -> encode_async_batch_result(result, length(kv_pairs))
-        {:error, err} -> List.duplicate(Encoder.encode(err), length(kv_pairs))
-      end
-
-    send_response_fn.(state.socket, state.transport, response)
-    {:continue, state}
-  end
 
   defp do_batch_set_quorum(kv_pairs, state, send_response_fn) do
     Stats.incr_commands_by(state.stats_counter, length(kv_pairs))
@@ -432,7 +382,6 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
         _ ->
           kv_pairs = Enum.map(set_ops, fn {_idx, key, value} -> {key, value} end)
-          live_ctx = FerricStore.Instance.get(:default)
 
           pressure_ok =
             :atomics.get(ctx.pressure_flags, 1) == 0 and
@@ -443,7 +392,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
             if not pressure_ok do
               List.duplicate({:error, "ERR server under pressure"}, length(kv_pairs))
             else
-              case safe_dispatch(fn -> mixed_set_results(live_ctx, ctx, set_ops, kv_pairs) end) do
+              case safe_dispatch(fn -> mixed_set_results(ctx, kv_pairs) end) do
                 {:ok, results} -> results
                 {:error, err} -> List.duplicate(err, length(kv_pairs))
               end
@@ -547,59 +496,9 @@ defmodule FerricstoreServer.Connection.Pipeline do
     result
   end
 
-  defp mixed_set_results(%{durability_mode: :all_async}, ctx, _set_ops, kv_pairs) do
-    ctx
-    |> Router.batch_async_put(kv_pairs)
-    |> expand_async_batch_result(length(kv_pairs))
-  end
-
-  defp mixed_set_results(%{durability_mode: :all_quorum}, ctx, _set_ops, kv_pairs) do
+  defp mixed_set_results(ctx, kv_pairs) do
     Router.batch_quorum_put(ctx, kv_pairs)
   end
-
-  defp mixed_set_results(%{durability_mode: :mixed}, ctx, set_ops, _kv_pairs) do
-    {async_pairs, quorum_pairs, _} = split_by_durability(ctx, set_ops)
-
-    async_results =
-      if async_pairs != [] do
-        kv_pairs = Enum.map(async_pairs, fn {_idx, k, v} -> {k, v} end)
-
-        ctx
-        |> Router.batch_async_put(kv_pairs)
-        |> expand_async_batch_result(length(async_pairs))
-      else
-        []
-      end
-
-    quorum_results =
-      if quorum_pairs != [] do
-        Router.batch_quorum_put(
-          ctx,
-          Enum.map(quorum_pairs, fn {_idx, k, v} -> {k, v} end)
-        )
-      else
-        []
-      end
-
-    recombine_set_results(async_pairs, async_results, quorum_pairs, quorum_results)
-  end
-
-  defp split_by_durability(ctx, set_ops) do
-    {async_ops, quorum_ops} =
-      Enum.split_with(set_ops, fn {_idx, key, _value} ->
-        Router.durability_for_key_public(ctx, key) == :async
-      end)
-
-    {async_ops, quorum_ops, nil}
-  end
-
-  defp expand_async_batch_result(:ok, count), do: List.duplicate(:ok, count)
-  defp expand_async_batch_result({:error, _} = err, count), do: List.duplicate(err, count)
-
-  defp encode_async_batch_result(:ok, count), do: List.duplicate(Encoder.ok_response(), count)
-
-  defp encode_async_batch_result({:error, _} = err, count),
-    do: List.duplicate(Encoder.encode(err), count)
 
   # ---------------------------------------------------------------------------
   # Batch FLOW.CREATE fast path
@@ -656,20 +555,6 @@ defmodule FerricstoreServer.Connection.Pipeline do
     result
     |> FlowCommand.normalize_result()
     |> Encoder.encode()
-  end
-
-  defp recombine_set_results(async_ops, async_results, quorum_ops, quorum_results) do
-    async_map =
-      async_ops |> Enum.zip(async_results) |> Map.new(fn {{idx, _, _}, r} -> {idx, r} end)
-
-    quorum_map =
-      quorum_ops |> Enum.zip(quorum_results) |> Map.new(fn {{idx, _, _}, r} -> {idx, r} end)
-
-    combined = Map.merge(async_map, quorum_map)
-
-    (async_ops ++ quorum_ops)
-    |> Enum.sort_by(fn {idx, _, _} -> idx end)
-    |> Enum.map(fn {idx, _, _} -> Map.fetch!(combined, idx) end)
   end
 
   # ---------------------------------------------------------------------------

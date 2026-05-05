@@ -11,6 +11,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag skip: "async durability feature removed; quorum is the only supported durability"
 
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.Batcher

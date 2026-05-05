@@ -20,6 +20,7 @@ defmodule Ferricstore.Raft.BatcherAsyncRetryTest do
   with the expected metadata.
   """
   use ExUnit.Case, async: false
+  @moduletag skip: "async durability feature removed; quorum is the only supported durability"
 
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router

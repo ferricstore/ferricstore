@@ -323,7 +323,8 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Renders the client list sub-page.
   """
-  @spec render_clients_page(%{clients: [client_data()], connections: connections_data()}) :: binary()
+  @spec render_clients_page(%{clients: [client_data()], connections: connections_data()}) ::
+          binary()
   def render_clients_page(data) do
     page_head("Client List - FerricStore", 5) <>
       ~s(<body>\n) <>
@@ -344,7 +345,11 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Collects data for the storage sub-page.
   """
-  @spec collect_storage_page() :: %{shards: [map()], total_disk_bytes: non_neg_integer(), total_files: non_neg_integer()}
+  @spec collect_storage_page() :: %{
+          shards: [map()],
+          total_disk_bytes: non_neg_integer(),
+          total_files: non_neg_integer()
+        }
   def collect_storage_page do
     data_dir = Application.get_env(:ferricstore, :data_dir, "/tmp/ferricstore")
 
@@ -362,7 +367,9 @@ defmodule FerricstoreServer.Health.Dashboard do
       end)
 
     total_disk = Enum.reduce(shard_storage, 0, fn s, acc -> acc + s.disk_bytes end)
-    total_files = Enum.reduce(shard_storage, 0, fn s, acc -> acc + s.data_file_count + s.hint_file_count end)
+
+    total_files =
+      Enum.reduce(shard_storage, 0, fn s, acc -> acc + s.data_file_count + s.hint_file_count end)
 
     %{shards: shard_storage, total_disk_bytes: total_disk, total_files: total_files}
   end
@@ -500,7 +507,13 @@ defmodule FerricstoreServer.Health.Dashboard do
       shard_dir = DataDir.shard_data_path(data_dir, index)
       {disk_bytes, _, _} = scan_shard_dir(shard_dir)
 
-      %{index: index, status: status, keys: keys, ets_memory_bytes: ets_mem, disk_bytes: disk_bytes}
+      %{
+        index: index,
+        status: status,
+        keys: keys,
+        ets_memory_bytes: ets_mem,
+        disk_bytes: disk_bytes
+      }
     end)
   end
 
@@ -514,7 +527,8 @@ defmodule FerricstoreServer.Health.Dashboard do
 
     # hot_reads and keyspace_hits are sampled; cold_reads and misses are exact
     hot_est = hot_sampled * rate
-    cold_exact = cold_sampled  # NOT sampled -- called on every cold read
+    # NOT sampled -- called on every cold read
+    cold_exact = cold_sampled
     total_hits = hot_est + cold_exact
     total_lookups = total_hits + misses
 
@@ -528,9 +542,11 @@ defmodule FerricstoreServer.Health.Dashboard do
       total_hits: total_hits,
       total_misses: misses,
       total_lookups: total_lookups,
-      hit_ratio: if(total_lookups > 0, do: Float.round(total_hits / total_lookups * 100, 1), else: 0.0),
+      hit_ratio:
+        if(total_lookups > 0, do: Float.round(total_hits / total_lookups * 100, 1), else: 0.0),
       ram_ratio: if(total_hits > 0, do: Float.round(hot_est / total_hits * 100, 1), else: 0.0),
-      disk_ratio: if(total_hits > 0, do: Float.round(cold_exact / total_hits * 100, 1), else: 0.0),
+      disk_ratio:
+        if(total_hits > 0, do: Float.round(cold_exact / total_hits * 100, 1), else: 0.0),
       sample_rate: rate,
       hits_per_sec: Float.round(total_hits / uptime, 1),
       misses_per_sec: Float.round(misses / uptime, 1),
@@ -767,17 +783,41 @@ defmodule FerricstoreServer.Health.Dashboard do
             extract_raft_overview(i, server_id, overview)
 
           {:error, _} ->
-            %{shard: i, status: :unavailable, leader: nil, current_term: 0,
-              commit_index: 0, last_applied: 0, log_size: 0, members: []}
+            %{
+              shard: i,
+              status: :unavailable,
+              leader: nil,
+              current_term: 0,
+              commit_index: 0,
+              last_applied: 0,
+              log_size: 0,
+              members: []
+            }
 
           {:timeout, _} ->
-            %{shard: i, status: :unavailable, leader: nil, current_term: 0,
-              commit_index: 0, last_applied: 0, log_size: 0, members: []}
+            %{
+              shard: i,
+              status: :unavailable,
+              leader: nil,
+              current_term: 0,
+              commit_index: 0,
+              last_applied: 0,
+              log_size: 0,
+              members: []
+            }
         end
       catch
         :exit, _ ->
-          %{shard: i, status: :unavailable, leader: nil, current_term: 0,
-            commit_index: 0, last_applied: 0, log_size: 0, members: []}
+          %{
+            shard: i,
+            status: :unavailable,
+            leader: nil,
+            current_term: 0,
+            commit_index: 0,
+            last_applied: 0,
+            log_size: 0,
+            members: []
+          }
       end
     end)
   end
@@ -818,6 +858,7 @@ defmodule FerricstoreServer.Health.Dashboard do
                   %{peer: {ip, port}} ->
                     ip_str = :inet.ntoa(ip) |> to_string()
                     "#{ip_str}:#{port}"
+
                   _ ->
                     "unknown:0"
                 end
@@ -832,9 +873,17 @@ defmodule FerricstoreServer.Health.Dashboard do
 
               flag_list =
                 []
-                |> then(fn f -> if state && Map.get(state, :multi_state) == :queuing, do: ["M" | f], else: f end)
-                |> then(fn f -> if state && Map.get(state, :pubsub_channels), do: ["S" | f], else: f end)
-                |> then(fn f -> if state && Map.get(state, :tracking) && Map.get(state.tracking, :enabled), do: ["T" | f], else: f end)
+                |> then(fn f ->
+                  if state && Map.get(state, :multi_state) == :queuing, do: ["M" | f], else: f
+                end)
+                |> then(fn f ->
+                  if state && Map.get(state, :pubsub_channels), do: ["S" | f], else: f
+                end)
+                |> then(fn f ->
+                  if state && Map.get(state, :tracking) && Map.get(state.tracking, :enabled),
+                    do: ["T" | f],
+                    else: f
+                end)
 
               {peer_str, age_s, Enum.join(flag_list)}
           end
@@ -987,7 +1036,9 @@ defmodule FerricstoreServer.Health.Dashboard do
       end
 
     # Keydir capacity bar color and percentage
-    keydir_pct = if data.keydir_max_ram > 0, do: Float.round(data.keydir_ratio * 100, 1), else: 0.0
+    keydir_pct =
+      if data.keydir_max_ram > 0, do: Float.round(data.keydir_ratio * 100, 1), else: 0.0
+
     keydir_bar_width = min(keydir_pct, 100)
 
     keydir_bar_color =
@@ -1137,10 +1188,17 @@ defmodule FerricstoreServer.Health.Dashboard do
 
       action_text =
         case data.pressure_level do
-          :warning -> "Consider increasing max_memory or reviewing eviction policy."
-          :pressure -> "Eviction active. Keys are being removed under #{escape(Atom.to_string(data.eviction_policy))} policy."
-          :reject -> "Writes are being rejected. Increase max_memory immediately."
-          _ -> ""
+          :warning ->
+            "Consider increasing max_memory or reviewing eviction policy."
+
+          :pressure ->
+            "Eviction active. Keys are being removed under #{escape(Atom.to_string(data.eviction_policy))} policy."
+
+          :reject ->
+            "Writes are being rejected. Increase max_memory immediately."
+
+          _ ->
+            ""
         end
 
       shard_rows =
@@ -1331,9 +1389,7 @@ defmodule FerricstoreServer.Health.Dashboard do
           rows =
             Enum.map_join(entries, "\n", fn entry ->
               durability_str = Atom.to_string(entry.durability)
-
-              durability_class =
-                if entry.durability == :async, do: "c-yellow", else: ""
+              durability_class = ""
 
               changed_at_str =
                 if entry.changed_at == 0 do
@@ -1381,6 +1437,7 @@ defmodule FerricstoreServer.Health.Dashboard do
       case cluster.cluster_mode do
         :standalone ->
           ~s(<span class="badge badge-idle">standalone</span>)
+
         :cluster ->
           ~s(<span class="badge badge-ok">#{cluster.cluster_size}-node cluster</span>)
       end
@@ -1392,6 +1449,7 @@ defmodule FerricstoreServer.Health.Dashboard do
             is_self = n == cluster.node_name
             class = if is_self, do: "c-green", else: ""
             label = if is_self, do: " (this node)", else: ""
+
             ~s(<span class="#{class}" style="margin-right:16px;">#{escape(Atom.to_string(n))}#{label}</span>)
           end)
 
@@ -1438,7 +1496,9 @@ defmodule FerricstoreServer.Health.Dashboard do
 
         leader_html =
           case rs.leader do
-            nil -> ~s(<span class="c-muted">none</span>)
+            nil ->
+              ~s(<span class="c-muted">none</span>)
+
             {name, leader_node} ->
               is_local = leader_node == node()
               class = if is_local, do: "c-green", else: ""
@@ -1448,17 +1508,21 @@ defmodule FerricstoreServer.Health.Dashboard do
 
         members_str =
           case rs.members do
-            [] -> "-"
+            [] ->
+              "-"
+
             members ->
               Enum.map_join(members, ", ", fn {name, n} -> "#{name}@#{n}" end)
           end
 
         lag = rs.commit_index - rs.last_applied
-        lag_class = cond do
-          lag > 1000 -> "c-red"
-          lag > 100 -> "c-yellow"
-          true -> ""
-        end
+
+        lag_class =
+          cond do
+            lag > 1000 -> "c-red"
+            lag > 100 -> "c-yellow"
+            true -> ""
+          end
 
         """
         <tr>
@@ -1831,7 +1895,13 @@ defmodule FerricstoreServer.Health.Dashboard do
   # Sidebar without live data (used on sub-pages to avoid expensive data collection)
   @spec render_sidebar_static(String.t()) :: binary()
   defp render_sidebar_static(active) do
-    sidebar_html(active, %{"slowlog" => "", "merge" => "", "config" => "", "clients" => "", "storage" => ""})
+    sidebar_html(active, %{
+      "slowlog" => "",
+      "merge" => "",
+      "config" => "",
+      "clients" => "",
+      "storage" => ""
+    })
   end
 
   defp sidebar_html(active, badges) do
@@ -1875,7 +1945,9 @@ defmodule FerricstoreServer.Health.Dashboard do
   # Renders a small "~1:N" tag indicating a value is estimated from sampling.
   # Shows the actual configured sample rate so the user knows the precision.
   @spec sampled_tag(pos_integer()) :: binary()
-  defp sampled_tag(1), do: ""  # 1:1 = every request, no sampling
+  # 1:1 = every request, no sampling
+  defp sampled_tag(1), do: ""
+
   defp sampled_tag(rate) do
     ~s(<span class="sampled-tag" title="Estimated from 1:#{rate} sampling">~1:#{rate}</span>)
   end

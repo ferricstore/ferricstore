@@ -329,8 +329,8 @@ defmodule Ferricstore.Metrics do
   # ferricstore_namespace_durability.
   #
   # Each configured namespace prefix emits one sample line per metric family
-  # with a `prefix` label. The durability gauge encodes the mode as an integer:
-  # 1 for :quorum, 0 for :async.
+  # with a `prefix` label. Async durability is no longer selectable, so the
+  # durability gauge is always 1 for :quorum.
   @spec namespace_metrics_text() :: binary()
   defp namespace_metrics_text do
     entries = namespace_entries()

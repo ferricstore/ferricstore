@@ -1,5 +1,6 @@
 defmodule Ferricstore.Bench.StressAllPathsTest do
   use ExUnit.Case, async: false
+  @moduletag skip: "async durability feature removed; quorum is the only supported durability"
   @moduletag :bench
   @moduletag timeout: 300_000
 

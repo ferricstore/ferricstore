@@ -141,36 +141,31 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       }] = :ets.lookup(:ferricstore_ns_config, "sensor")
     end
 
-    test "CONFIG SET stores durability in :ferricstore_ns_config ETS" do
-      :ok = NamespaceConfig.set("sensor", "durability", "async")
+    test "CONFIG SET rejects removed async durability" do
+      assert {:error, msg} = NamespaceConfig.set("sensor", "durability", "async")
+      assert msg =~ "async durability has been removed"
 
-      assert [{
-        "sensor",
-        _window_ms,
-        :async,
-        _changed_at,
-        _changed_by
-      }] = :ets.lookup(:ferricstore_ns_config, "sensor")
+      assert [] = :ets.lookup(:ferricstore_ns_config, "sensor")
     end
 
     test "CONFIG SET updates both fields independently" do
       :ok = NamespaceConfig.set("sensor", "window_ms", "50")
-      :ok = NamespaceConfig.set("sensor", "durability", "async")
+      :ok = NamespaceConfig.set("sensor", "durability", "quorum")
 
       [{prefix, window_ms, durability, _at, _by}] =
         :ets.lookup(:ferricstore_ns_config, "sensor")
 
       assert prefix == "sensor"
       assert window_ms == 50
-      assert durability == :async
+      assert durability == :quorum
     end
 
     test "CONFIG SET is immediately visible to window_for/1 and durability_for/1" do
       :ok = NamespaceConfig.set("sensor", "window_ms", "50")
       assert 50 == NamespaceConfig.window_for("sensor")
 
-      :ok = NamespaceConfig.set("sensor", "durability", "async")
-      assert :async == NamespaceConfig.durability_for("sensor")
+      :ok = NamespaceConfig.set("sensor", "durability", "quorum")
+      assert :quorum == NamespaceConfig.durability_for("sensor")
     end
 
     test "CONFIG SET for multiple namespaces stores each independently" do

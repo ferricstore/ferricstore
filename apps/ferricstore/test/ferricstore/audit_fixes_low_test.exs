@@ -66,16 +66,16 @@ defmodule Ferricstore.AuditFixesLowTest do
       Ferricstore.NamespaceConfig.reset(prefix)
     end
 
-    test "set durability works with single lookup" do
+    test "set durability keeps quorum with single lookup" do
       prefix = "audit_dur_#{:rand.uniform(100_000)}"
 
       # Set window_ms first, then durability
       assert :ok = Ferricstore.NamespaceConfig.set(prefix, "window_ms", "10")
-      assert :ok = Ferricstore.NamespaceConfig.set(prefix, "durability", "async")
+      assert :ok = Ferricstore.NamespaceConfig.set(prefix, "durability", "quorum")
 
       assert {:ok, entry} = Ferricstore.NamespaceConfig.get(prefix)
       assert entry.window_ms == 10
-      assert entry.durability == :async
+      assert entry.durability == :quorum
 
       # Cleanup
       Ferricstore.NamespaceConfig.reset(prefix)

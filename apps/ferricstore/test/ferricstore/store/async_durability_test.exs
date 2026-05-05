@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.AsyncDurabilityTest do
   and are functionally correct — values are readable after write.
   """
   use ExUnit.Case, async: false
+  @moduletag skip: "async durability feature removed; quorum is the only supported durability"
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers

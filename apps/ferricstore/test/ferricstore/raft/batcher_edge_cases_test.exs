@@ -458,19 +458,19 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
   end
 
   # ---------------------------------------------------------------------------
-  # async_submit (fire-and-forget from Router)
+  # quorum submit through Router
   # ---------------------------------------------------------------------------
 
-  describe "async_submit" do
+  describe "router submit" do
     setup do
-      Ferricstore.NamespaceConfig.set("edgeasync", "durability", "async")
+      Ferricstore.NamespaceConfig.reset("edgeasync")
 
       on_exit(fn ->
-        Ferricstore.NamespaceConfig.set("edgeasync", "durability", "quorum")
+        Ferricstore.NamespaceConfig.reset("edgeasync")
       end)
     end
 
-    test "async_submit writes are readable after flush" do
+    test "quorum writes are readable after flush" do
       k = "edgeasync:submit_#{:rand.uniform(9_999_999)}"
       shard_index = Router.shard_for(ctx(), k)
 
@@ -481,7 +481,7 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
       assert Router.get(ctx(), k) == "async_val"
     end
 
-    test "multiple async_submit commands batch together" do
+    test "multiple quorum commands batch together" do
       keys = for i <- 1..10, do: "edgeasync:batch_#{i}_#{:rand.uniform(9_999_999)}"
 
       for k <- keys do
@@ -504,14 +504,14 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
 
   describe "write_async_quorum" do
     setup do
-      Ferricstore.NamespaceConfig.set("edgermw", "durability", "async")
+      Ferricstore.NamespaceConfig.reset("edgermw")
 
       on_exit(fn ->
-        Ferricstore.NamespaceConfig.set("edgermw", "durability", "quorum")
+        Ferricstore.NamespaceConfig.reset("edgermw")
       end)
     end
 
-    test "write_async_quorum forces quorum even on async namespace" do
+    test "write_async_quorum submits through quorum slot" do
       k = "edgermw:forced_#{:rand.uniform(9_999_999)}"
       shard_index = Router.shard_for(ctx(), k)
 
@@ -561,10 +561,10 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
   # ---------------------------------------------------------------------------
 
   describe "DEBUG SET-DURABILITY" do
-    test "set to async and back to quorum" do
+    test "rejects async and accepts quorum" do
       result = Ferricstore.Commands.Server.handle("DEBUG", ["SET-DURABILITY", "async"], nil)
-      assert {:simple, msg} = result
-      assert String.contains?(msg, "all_async")
+      assert {:error, msg} = result
+      assert String.contains?(msg, "async durability has been removed")
 
       result = Ferricstore.Commands.Server.handle("DEBUG", ["SET-DURABILITY", "quorum"], nil)
       assert {:simple, msg} = result

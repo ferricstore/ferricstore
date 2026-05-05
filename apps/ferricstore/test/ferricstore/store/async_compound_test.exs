@@ -29,6 +29,7 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
   duplicate origin writes, and cold large-value read regressions.
   """
   use ExUnit.Case, async: false
+  @moduletag skip: "async durability feature removed; quorum is the only supported durability"
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.Batcher
