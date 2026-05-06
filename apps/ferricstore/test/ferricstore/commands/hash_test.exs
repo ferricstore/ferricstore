@@ -1400,6 +1400,32 @@ defmodule Ferricstore.Commands.HashTest do
       assert result == []
     end
 
+    test "HRANDFIELD with count 0 does not scan hash fields" do
+      type_key = CompoundKey.type_key("hash")
+
+      store = %{
+        compound_get: fn "hash", ^type_key -> "hash" end,
+        compound_scan: fn "hash", _prefix ->
+          flunk("HRANDFIELD count 0 should not scan fields")
+        end
+      }
+
+      assert [] == Hash.handle("HRANDFIELD", ["hash", "0"], store)
+    end
+
+    test "HRANDFIELD with count 0 WITHVALUES does not scan hash fields" do
+      type_key = CompoundKey.type_key("hash")
+
+      store = %{
+        compound_get: fn "hash", ^type_key -> "hash" end,
+        compound_scan: fn "hash", _prefix ->
+          flunk("HRANDFIELD count 0 WITHVALUES should not scan fields")
+        end
+      }
+
+      assert [] == Hash.handle("HRANDFIELD", ["hash", "0", "WITHVALUES"], store)
+    end
+
     test "HRANDFIELD with WITHVALUES returns field-value pairs" do
       store = MockStore.make()
       Hash.handle("HSET", ["hash", "a", "1", "b", "2", "c", "3"], store)

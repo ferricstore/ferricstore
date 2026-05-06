@@ -698,9 +698,7 @@ defmodule Ferricstore.Commands.Hash do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       case Integer.parse(count_str) do
         {count, ""} ->
-          prefix = CompoundKey.hash_prefix(key)
-          pairs = Ops.compound_scan(store, key, prefix)
-          select_random_fields(pairs, count, false)
+          select_random_hash_fields(key, count, false, store)
 
         _ ->
           {:error, "ERR value is not an integer or out of range"}
@@ -715,9 +713,7 @@ defmodule Ferricstore.Commands.Hash do
       with :ok <- TypeRegistry.check_type(key, :hash, store) do
         case Integer.parse(count_str) do
           {count, ""} ->
-            prefix = CompoundKey.hash_prefix(key)
-            pairs = Ops.compound_scan(store, key, prefix)
-            select_random_fields(pairs, count, true)
+            select_random_hash_fields(key, count, true, store)
 
           _ ->
             {:error, "ERR value is not an integer or out of range"}
@@ -1026,6 +1022,14 @@ defmodule Ferricstore.Commands.Hash do
 
   defp hscan_typed(_key, _cursor, _opts, _store), do: {:error, "ERR invalid cursor"}
 
+  defp select_random_hash_fields(_key, 0, _with_values, _store), do: []
+
+  defp select_random_hash_fields(key, count, with_values, store) do
+    prefix = CompoundKey.hash_prefix(key)
+    pairs = Ops.compound_scan(store, key, prefix)
+    select_random_fields(pairs, count, with_values)
+  end
+
   defp typed_scan_opts(opts), do: typed_scan_opts(opts, nil, 10)
 
   defp typed_scan_opts([], match_pattern, count), do: {:ok, match_pattern, count}
@@ -1111,9 +1115,7 @@ defmodule Ferricstore.Commands.Hash do
 
   defp hrandfield_parsed(key, count, with_values, store) do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      prefix = CompoundKey.hash_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
-      select_random_fields(pairs, count, with_values)
+      select_random_hash_fields(key, count, with_values, store)
     end
   end
 
