@@ -720,6 +720,19 @@ defmodule Ferricstore.Commands.SetTest do
       assert result == []
     end
 
+    test "SRANDMEMBER with count 0 does not scan members" do
+      type_key = CompoundKey.type_key("myset")
+
+      store = %{
+        compound_get: fn "myset", ^type_key -> "set" end,
+        compound_scan: fn "myset", _prefix ->
+          flunk("SRANDMEMBER count 0 should not scan members")
+        end
+      }
+
+      assert [] == Set.handle("SRANDMEMBER", ["myset", "0"], store)
+    end
+
     test "SRANDMEMBER does not remove members" do
       store = MockStore.make()
       Set.handle("SADD", ["myset", "a", "b", "c"], store)
@@ -832,6 +845,22 @@ defmodule Ferricstore.Commands.SetTest do
       result = Set.handle("SPOP", ["myset", "0"], store)
       assert result == []
       assert 1 == Set.handle("SCARD", ["myset"], store)
+    end
+
+    test "SPOP with count 0 does not scan or write" do
+      type_key = CompoundKey.type_key("myset")
+
+      store = %{
+        compound_get: fn "myset", ^type_key -> "set" end,
+        compound_scan: fn "myset", _prefix ->
+          flunk("SPOP count 0 should not scan members")
+        end,
+        compound_batch_delete: fn "myset", _compound_keys ->
+          flunk("SPOP count 0 should not write tombstones")
+        end
+      }
+
+      assert [] == Set.handle("SPOP", ["myset", "0"], store)
     end
 
     test "SPOP cleans up type metadata when set becomes empty" do

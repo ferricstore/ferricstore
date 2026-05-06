@@ -372,6 +372,9 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle("ZRANDMEMBER", [key, count_str], store) do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
       case Integer.parse(count_str) do
+        {0, ""} ->
+          []
+
         {count, ""} ->
           prefix = CompoundKey.zset_prefix(key)
           pairs = Ops.compound_scan(store, key, prefix)
@@ -389,6 +392,9 @@ defmodule Ferricstore.Commands.SortedSet do
     else
       with :ok <- TypeRegistry.check_type(key, :zset, store) do
         case Integer.parse(count_str) do
+          {0, ""} ->
+            []
+
           {count, ""} ->
             prefix = CompoundKey.zset_prefix(key)
             pairs = Ops.compound_scan(store, key, prefix)
@@ -969,9 +975,13 @@ defmodule Ferricstore.Commands.SortedSet do
 
   defp zrandmember_parsed(key, count, with_scores, store) do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      prefix = CompoundKey.zset_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
-      select_random_zset_members(pairs, count, with_scores)
+      if count == 0 do
+        []
+      else
+        prefix = CompoundKey.zset_prefix(key)
+        pairs = Ops.compound_scan(store, key, prefix)
+        select_random_zset_members(pairs, count, with_scores)
+      end
     end
   end
 

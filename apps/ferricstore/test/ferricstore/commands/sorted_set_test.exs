@@ -1011,6 +1011,32 @@ defmodule Ferricstore.Commands.SortedSetTest do
       assert result == []
     end
 
+    test "ZRANDMEMBER with count 0 does not scan members" do
+      type_key = CompoundKey.type_key("zs")
+
+      store = %{
+        compound_get: fn "zs", ^type_key -> "zset" end,
+        compound_scan: fn "zs", _prefix ->
+          flunk("ZRANDMEMBER count 0 should not scan members")
+        end
+      }
+
+      assert [] == SortedSet.handle("ZRANDMEMBER", ["zs", "0"], store)
+    end
+
+    test "ZRANDMEMBER with count 0 WITHSCORES does not scan members" do
+      type_key = CompoundKey.type_key("zs")
+
+      store = %{
+        compound_get: fn "zs", ^type_key -> "zset" end,
+        compound_scan: fn "zs", _prefix ->
+          flunk("ZRANDMEMBER count 0 WITHSCORES should not scan members")
+        end
+      }
+
+      assert [] == SortedSet.handle("ZRANDMEMBER", ["zs", "0", "WITHSCORES"], store)
+    end
+
     test "ZRANDMEMBER with WITHSCORES returns member-score pairs" do
       store = MockStore.make()
       SortedSet.handle("ZADD", ["zs", "1.0", "a", "2.0", "b", "3.0", "c"], store)

@@ -263,6 +263,9 @@ defmodule Ferricstore.Commands.Set do
   def handle("SRANDMEMBER", [key, count_str], store) do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
       case Integer.parse(count_str) do
+        {0, ""} ->
+          []
+
         {count, ""} ->
           members = get_members_list(key, store)
           select_random_members(members, count)
@@ -309,6 +312,9 @@ defmodule Ferricstore.Commands.Set do
   def handle("SPOP", [key, count_str], store) do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
       case Integer.parse(count_str) do
+        {0, ""} ->
+          []
+
         {count, ""} when count >= 0 ->
           members = get_members_list(key, store)
           selected = Enum.take_random(members, count)
@@ -498,9 +504,13 @@ defmodule Ferricstore.Commands.Set do
 
   def handle_ast({:srandmember, key, count}, store) when is_integer(count) do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
-      key
-      |> get_members_list(store)
-      |> select_random_members(count)
+      if count == 0 do
+        []
+      else
+        key
+        |> get_members_list(store)
+        |> select_random_members(count)
+      end
     end
   end
 
@@ -774,19 +784,23 @@ defmodule Ferricstore.Commands.Set do
 
   defp spop_count(key, count, store) do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
-      members = get_members_list(key, store)
-      selected = Enum.take_random(members, count)
-      compound_keys = Enum.map(selected, &CompoundKey.set_member(key, &1))
-      removed = length(compound_keys)
+      if count == 0 do
+        []
+      else
+        members = get_members_list(key, store)
+        selected = Enum.take_random(members, count)
+        compound_keys = Enum.map(selected, &CompoundKey.set_member(key, &1))
+        removed = length(compound_keys)
 
-      case Ops.compound_batch_delete(store, key, compound_keys) do
-        :ok ->
-          with :ok <- maybe_cleanup_empty_set(key, removed, store) do
-            selected
-          end
+        case Ops.compound_batch_delete(store, key, compound_keys) do
+          :ok ->
+            with :ok <- maybe_cleanup_empty_set(key, removed, store) do
+              selected
+            end
 
-        {:error, _} = err ->
-          err
+          {:error, _} = err ->
+            err
+        end
       end
     end
   end
