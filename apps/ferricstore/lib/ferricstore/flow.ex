@@ -287,32 +287,29 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with :ok <- validate_opts(opts),
-           :ok <- validate_id(id),
-           :ok <- validate_lease_token(lease_token),
-           {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
-           {:ok, partition_key} <- optional_partition_key(opts),
-           :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-           {:ok, now} <- optional_now_ms(opts),
-           {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
-           {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil),
-           :ok <- validate_ref_size(:error_ref, error_ref) do
-        attrs =
-          %{
-            id: id,
-            lease_token: lease_token,
-            fencing_token: fencing_token,
-            error_ref: error_ref,
-            partition_key: partition_key
-          }
-          |> maybe_put_attr(:now_ms, now)
-          |> maybe_put_attr(:run_at_ms, run_at_ms)
-
+      with {:ok, attrs} <- retry_attrs(id, lease_token, opts) do
         Router.flow_retry(ctx, attrs)
       end
 
     observe_flow(:retry, started, result, %{flow_id: id})
   end
+
+  def retry_many(ctx, partition_key, items, opts) when is_list(items) and is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
+           :ok <- validate_retry_many_items(items),
+           {:ok, attrs_list} <- retry_many_attrs(items, opts, partition_key),
+           :ok <- validate_unique_transition_ids(attrs_list) do
+        Router.flow_retry_many(ctx, partition_key, attrs_list)
+      end
+
+    observe_flow(:retry, started, result, %{flow_id: nil})
+  end
+
+  def retry_many(_ctx, _partition_key, _items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
 
   def fail(ctx, id, lease_token, opts \\ [])
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
@@ -1973,6 +1970,32 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp retry_attrs(id, lease_token, opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         :ok <- validate_lease_token(lease_token),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+         {:ok, now} <- optional_now_ms(opts),
+         {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
+         {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil),
+         :ok <- validate_ref_size(:error_ref, error_ref) do
+      attrs =
+        %{
+          id: id,
+          lease_token: lease_token,
+          fencing_token: fencing_token,
+          error_ref: error_ref,
+          partition_key: partition_key
+        }
+        |> maybe_put_attr(:now_ms, now)
+        |> maybe_put_attr(:run_at_ms, run_at_ms)
+
+      {:ok, attrs}
+    end
+  end
+
   defp complete_attrs(id, lease_token, opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
@@ -2071,6 +2094,29 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp retry_many_attrs(items, opts, partition_key) do
+    base_opts = Keyword.delete(opts, :partition_key)
+
+    Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
+      with {:ok, id, lease_token, item_opts} <- retry_many_item_opts(item),
+           {:ok, item_partition_key} <- many_item_partition_key(partition_key, item_opts),
+           {:ok, attrs} <-
+             retry_attrs(
+               id,
+               lease_token,
+               merge_many_item_opts(base_opts, item_opts, item_partition_key)
+             ) do
+        {:cont, {:ok, [attrs | acc]}}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, attrs_list} -> {:ok, Enum.reverse(attrs_list)}
+      {:error, _reason} = error -> error
+    end
+  end
+
   defp complete_many_item_opts(
          %{id: id, lease_token: lease_token, fencing_token: fencing_token} = item
        )
@@ -2127,6 +2173,61 @@ defmodule Ferricstore.Flow do
   end
 
   defp complete_many_item_opts(_item), do: {:error, "ERR flow id must be a non-empty string"}
+
+  defp retry_many_item_opts(
+         %{id: id, lease_token: lease_token, fencing_token: fencing_token} = item
+       )
+       when is_binary(id) do
+    {:ok, id, lease_token,
+     [fencing_token: fencing_token] ++
+       retry_many_item_error_ref(item) ++ retry_many_item_partition_key(item)}
+  end
+
+  defp retry_many_item_opts(
+         %{"id" => id, "lease_token" => lease_token, "fencing_token" => fencing_token} = item
+       )
+       when is_binary(id) do
+    {:ok, id, lease_token,
+     [fencing_token: fencing_token] ++
+       retry_many_item_error_ref(item) ++ retry_many_item_partition_key(item)}
+  end
+
+  defp retry_many_item_opts({id, lease_token, item_opts})
+       when is_binary(id) and is_binary(lease_token) and is_list(item_opts) do
+    if Keyword.keyword?(item_opts) do
+      {:ok, id, lease_token, item_opts}
+    else
+      {:error, "ERR flow opts must be a keyword list"}
+    end
+  end
+
+  defp retry_many_item_opts({id, item_opts}) when is_binary(id) and is_list(item_opts) do
+    cond do
+      not Keyword.keyword?(item_opts) ->
+        {:error, "ERR flow opts must be a keyword list"}
+
+      not is_binary(Keyword.get(item_opts, :lease_token)) ->
+        {:error, "ERR flow lease_token must be a non-empty string"}
+
+      true ->
+        {:ok, id, Keyword.fetch!(item_opts, :lease_token), item_opts}
+    end
+  end
+
+  defp retry_many_item_opts({:id, id, :lease_token, lease_token, :fencing_token, fencing_token})
+       when is_binary(id) do
+    {:ok, id, lease_token, [fencing_token: fencing_token]}
+  end
+
+  defp retry_many_item_opts(
+         {:id, id, :partition_key, partition_key, :lease_token, lease_token, :fencing_token,
+          fencing_token}
+       )
+       when is_binary(id) do
+    {:ok, id, lease_token, [partition_key: partition_key, fencing_token: fencing_token]}
+  end
+
+  defp retry_many_item_opts(_item), do: {:error, "ERR flow id must be a non-empty string"}
 
   defp fail_many_item_opts(
          %{id: id, lease_token: lease_token, fencing_token: fencing_token} = item
@@ -2293,6 +2394,16 @@ defmodule Ferricstore.Flow do
     |> maybe_put_item_opt(:partition_key, item, :partition_key, "partition_key")
   end
 
+  defp retry_many_item_error_ref(item) do
+    []
+    |> maybe_put_item_opt(:error_ref, item, :error_ref, "error_ref")
+  end
+
+  defp retry_many_item_partition_key(item) do
+    []
+    |> maybe_put_item_opt(:partition_key, item, :partition_key, "partition_key")
+  end
+
   defp fail_many_item_error_ref(item) do
     []
     |> maybe_put_item_opt(:error_ref, item, :error_ref, "error_ref")
@@ -2342,6 +2453,11 @@ defmodule Ferricstore.Flow do
   defp validate_complete_many_items([_ | _] = items), do: validate_many_item_count(items)
 
   defp validate_complete_many_items(_items),
+    do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp validate_retry_many_items([_ | _] = items), do: validate_many_item_count(items)
+
+  defp validate_retry_many_items(_items),
     do: {:error, "ERR flow items must be a non-empty list"}
 
   defp validate_fail_many_items([_ | _] = items), do: validate_many_item_count(items)

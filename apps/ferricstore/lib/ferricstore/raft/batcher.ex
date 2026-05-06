@@ -154,6 +154,7 @@ defmodule Ferricstore.Raft.Batcher do
           | {:flow_transition, binary(), map()}
           | {:flow_transition_many, binary(), map()}
           | {:flow_retry, binary(), map()}
+          | {:flow_retry_many, binary(), map()}
           | {:flow_fail, binary(), map()}
           | {:flow_fail_many, binary(), map()}
           | {:flow_cancel, binary(), map()}

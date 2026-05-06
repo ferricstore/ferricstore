@@ -385,6 +385,15 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Completes leased workflow records, atomic per partition/shard group."
     },
     %{
+      name: "flow.retry_many",
+      arity: -6,
+      flags: ["write"],
+      first_key: 1,
+      last_key: 1,
+      step: 1,
+      summary: "Retries leased workflow records, atomic per partition/shard group."
+    },
+    %{
       name: "flow.fail_many",
       arity: -6,
       flags: ["write"],

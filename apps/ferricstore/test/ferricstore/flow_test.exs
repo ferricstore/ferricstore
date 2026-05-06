@@ -1532,6 +1532,103 @@ defmodule Ferricstore.FlowTest do
     assert reclaimed.lease_owner == "worker-b"
   end
 
+  test "flow_retry_many atomically reschedules one-partition batch" do
+    partition = uid("tenant-retry-many")
+    type = uid("bulk-retry-many")
+    id_a = uid("retry-many-a")
+    id_b = uid("retry-many-b")
+
+    assert {:ok, _} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: id_a}, %{id: id_b}],
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-retry",
+               limit: 2,
+               now_ms: 1_000
+             )
+
+    items =
+      claimed
+      |> Enum.sort_by(& &1.id)
+      |> Enum.map(fn record ->
+        %{id: record.id, lease_token: record.lease_token, fencing_token: record.fencing_token}
+      end)
+
+    assert {:ok, retried} =
+             FerricStore.flow_retry_many(partition, items,
+               error_ref: "retry-error",
+               run_at_ms: 2_000,
+               now_ms: 2_000
+             )
+
+    assert Enum.map(retried, & &1.id) == Enum.map(items, & &1.id)
+    assert Enum.all?(retried, &(&1.state == "queued"))
+    assert Enum.all?(retried, &(&1.attempts == 1))
+    assert Enum.all?(retried, &(&1.error_ref == "retry-error"))
+
+    assert {:ok, reclaimed} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-retry-b",
+               limit: 2,
+               now_ms: 2_000
+             )
+
+    assert reclaimed |> Enum.map(& &1.id) |> Enum.sort() == [id_a, id_b] |> Enum.sort()
+  end
+
+  test "flow_retry_many rolls back when any item fails guard" do
+    partition = uid("tenant-retry-many-rollback")
+    type = uid("bulk-retry-many-rollback")
+    id_a = uid("retry-many-good")
+    id_b = uid("retry-many-bad")
+
+    assert {:ok, _} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: id_a}, %{id: id_b}],
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-retry",
+               limit: 2,
+               now_ms: 1_000
+             )
+
+    items =
+      claimed
+      |> Enum.sort_by(& &1.id)
+      |> Enum.map(fn record ->
+        fencing_token =
+          if record.id == id_b, do: record.fencing_token + 1, else: record.fencing_token
+
+        %{id: record.id, lease_token: record.lease_token, fencing_token: fencing_token}
+      end)
+
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_retry_many(partition, items, now_ms: 2_000, run_at_ms: 2_000)
+
+    assert {:ok, fetched_a} = FerricStore.flow_get(id_a, partition_key: partition)
+    assert {:ok, fetched_b} = FerricStore.flow_get(id_b, partition_key: partition)
+    assert fetched_a.state == "running"
+    assert fetched_b.state == "running"
+    assert fetched_a.version == 2
+    assert fetched_b.version == 2
+  end
+
   test "expired running lease can be reclaimed" do
     id = uid("flow-reclaim")
 

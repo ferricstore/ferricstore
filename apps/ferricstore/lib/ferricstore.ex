@@ -541,6 +541,24 @@ defmodule FerricStore do
 
   def flow_retry(_id, _lease_token, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc """
+  Clears claims and reschedules a batch of Flow records.
+
+  When `partition_key` is set, the batch is all-or-nothing because every item
+  routes to the same shard. When `partition_key` is `nil`, each item must carry
+  `:partition_key`; items are grouped by shard and each shard group is atomic.
+  Each item must provide `:id`, `:lease_token`, and `:fencing_token`.
+  """
+  @spec flow_retry_many(binary() | nil, list(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_retry_many(partition_key, items, opts \\ [])
+
+  def flow_retry_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.retry_many(default_ctx(), partition_key, items, opts)
+  end
+
+  def flow_retry_many(_partition_key, _items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Fails a running Flow record when `lease_token` matches."
   @spec flow_fail(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_fail(id, lease_token, opts \\ [])

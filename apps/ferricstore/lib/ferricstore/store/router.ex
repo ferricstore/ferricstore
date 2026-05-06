@@ -2662,6 +2662,7 @@ defmodule Ferricstore.Store.Router do
               :flow_create_many,
               :flow_complete_many,
               :flow_fail_many,
+              :flow_retry_many,
               :flow_transition_many
             ] do
     indexed =
@@ -2859,6 +2860,23 @@ defmodule Ferricstore.Store.Router do
       idx = shard_for(ctx, key)
       raft_write(ctx, idx, key, {:flow_retry, key, attrs})
     end
+  end
+
+  @doc false
+  def flow_retry_many(ctx, partition_key, attrs_list)
+      when is_binary(partition_key) and is_list(attrs_list) do
+    key = Ferricstore.Flow.Keys.state_key("__retry_batch__", partition_key)
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_retry_many, key, %{records: attrs_list}})
+    end
+  end
+
+  def flow_retry_many(ctx, nil, attrs_list) when is_list(attrs_list) do
+    flow_many_by_shard(ctx, attrs_list, :flow_retry_many, "__retry_batch__")
   end
 
   @doc false
