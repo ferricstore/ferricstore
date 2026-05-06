@@ -8,8 +8,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   require Logger
 
-  @default_flush_interval_ms 10
-  @default_max_ops 1_000
+  @default_flush_interval_ms 100
+  @default_max_ops 10_000
   @terminal_states ["completed", "failed", "cancelled"]
 
   def start_link(opts) do

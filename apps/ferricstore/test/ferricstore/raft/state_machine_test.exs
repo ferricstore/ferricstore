@@ -486,7 +486,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       end
     end
 
-    test "claim_due stages state, history, and trim tombstones into one append batch", %{
+    test "claim_due stages state and history into one append batch", %{
       state: state,
       shard_index: shard_index
     } do
@@ -564,8 +564,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
                         %{shard_index: ^shard_index, status: :ok}},
                        500
 
-        assert measurements.batch_size == 9
-        assert measurements.delete_count == 3
+        assert measurements.batch_size == 6
+        assert measurements.delete_count == 0
         assert measurements.batch_bytes > 0
 
         refute_receive {:flow_bitcask_append, _measurements, _metadata}, 100
@@ -676,6 +676,123 @@ defmodule Ferricstore.Raft.StateMachineTest do
       after
         :telemetry.detach(handler_id)
       end
+    end
+
+    test "active Flow writes do not enqueue cold LMDB projection", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+      old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+      old_max_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+      Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+      Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+      Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
+
+      :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
+      :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+
+      {:ok, writer_pid} =
+        Ferricstore.Flow.LMDBWriter.start_link(
+          instance_name: state.instance_name,
+          shard_index: shard_index,
+          data_dir: state.data_dir
+        )
+
+      handler_id = {:active_flow_lmdb_projection, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :flow, :lmdb_writer, :backlog],
+          fn _event, measurements, metadata, test_pid ->
+            send(test_pid, {:flow_lmdb_backlog, measurements, metadata})
+          end,
+          self()
+        )
+
+      on_exit(fn ->
+        :telemetry.detach(handler_id)
+
+        try do
+          if Process.alive?(writer_pid), do: GenServer.stop(writer_pid, :normal, 5_000)
+        catch
+          :exit, _ -> :ok
+        end
+
+        safe_delete_ets(state.zset_score_index_name)
+        safe_delete_ets(state.zset_score_lookup_name)
+        safe_delete_ets(state.flow_index_name)
+        safe_delete_ets(state.flow_lookup_name)
+        restore_env(:flow_lmdb_mode, old_mode)
+        restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+        restore_env(:flow_lmdb_max_batch_ops, old_max_ops)
+      end)
+
+      partition_key = "tenant-active-lmdb-projection"
+      type = "active-lmdb-projection"
+      id = "flow-active-lmdb-projection"
+      state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+      {state, {:ok, _created}} =
+        StateMachine.apply(
+          %{system_time: 1_000},
+          {:flow_create, state_key,
+           %{
+             id: id,
+             type: type,
+             state: "queued",
+             partition_key: partition_key,
+             parent_flow_id: "parent-active-lmdb-projection",
+             correlation_id: "correlation-active-lmdb-projection",
+             now_ms: 1_000,
+             run_at_ms: 1_000
+           }},
+          state
+        )
+
+      refute_receive {:flow_lmdb_backlog, _measurements, _metadata}, 100
+
+      due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
+
+      {state, {:ok, [claimed]}} =
+        StateMachine.apply(
+          %{system_time: 2_000},
+          {:flow_claim_due, due_key,
+           %{
+             type: type,
+             state: "queued",
+             worker: "worker-active-lmdb-projection",
+             lease_ms: 30_000,
+             limit: 1,
+             priority: nil,
+             partition_key: partition_key
+           }},
+          state
+        )
+
+      refute_receive {:flow_lmdb_backlog, _measurements, _metadata}, 100
+
+      {_state, {:ok, completed}} =
+        StateMachine.apply(
+          %{system_time: 3_000},
+          {:flow_complete, state_key,
+           %{
+             id: claimed.id,
+             lease_token: claimed.lease_token,
+             fencing_token: claimed.fencing_token,
+             partition_key: partition_key,
+             now_ms: 3_000
+           }},
+          state
+        )
+
+      assert completed.state == "completed"
+      assert_receive {:flow_lmdb_backlog, measurements, %{shard_index: ^shard_index}}, 500
+      assert measurements.pending_ops > 0
     end
   end
 

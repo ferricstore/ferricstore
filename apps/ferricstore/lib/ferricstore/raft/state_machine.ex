@@ -4869,7 +4869,8 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "completed", now_ms),
-         :ok <- flow_history_trim(state, next) do
+         :ok <- flow_history_trim(state, next),
+         :ok <- maybe_queue_terminal_lmdb_history_indexes(state, next) do
       :ok
     end
   end
@@ -5032,7 +5033,8 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "transitioned", now_ms),
-         :ok <- flow_history_trim(state, next) do
+         :ok <- flow_history_trim(state, next),
+         :ok <- maybe_queue_terminal_lmdb_history_indexes(state, next) do
       :ok
     end
   end
@@ -5152,7 +5154,8 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "retry", now_ms),
-         :ok <- flow_history_trim(state, next) do
+         :ok <- flow_history_trim(state, next),
+         :ok <- maybe_queue_terminal_lmdb_history_indexes(state, next) do
       :ok
     end
   end
@@ -5255,7 +5258,8 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "failed", now_ms),
-         :ok <- flow_history_trim(state, next) do
+         :ok <- flow_history_trim(state, next),
+         :ok <- maybe_queue_terminal_lmdb_history_indexes(state, next) do
       :ok
     end
   end
@@ -5356,7 +5360,8 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "cancelled", now_ms),
-         :ok <- flow_history_trim(state, next) do
+         :ok <- flow_history_trim(state, next),
+         :ok <- maybe_queue_terminal_lmdb_history_indexes(state, next) do
       :ok
     end
   end
@@ -5419,7 +5424,8 @@ defmodule Ferricstore.Raft.StateMachine do
                next
              ),
            :ok <- flow_history_put_planned(state, record, next, "rewound", now_ms),
-           :ok <- flow_history_trim(state, next) do
+           :ok <- flow_history_trim(state, next),
+           :ok <- maybe_queue_terminal_lmdb_history_indexes(state, next) do
         {:ok, Map.delete(next, :rewound_to_event_id)}
       end
     end
@@ -5595,7 +5601,11 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
 
     plans
-    |> Enum.each(fn {record, _next} -> queue_lmdb_metadata_index_deletes(state, record) end)
+    |> Enum.each(fn {record, _next} ->
+      if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+        queue_lmdb_metadata_index_deletes(state, record)
+      end
+    end)
 
     running_deletes =
       plans
@@ -5741,7 +5751,11 @@ defmodule Ferricstore.Raft.StateMachine do
       end)
 
     flow_history_index_put_entries(state, history_entries)
-    Enum.each(plans, fn {_record, next} -> flow_history_trim(state, next) end)
+
+    Enum.each(plans, fn {_record, next} ->
+      flow_history_trim(state, next)
+      maybe_queue_terminal_lmdb_history_indexes(state, next)
+    end)
 
     :ok
   end
@@ -5763,7 +5777,11 @@ defmodule Ferricstore.Raft.StateMachine do
       end)
 
     flow_history_index_put_entries(state, history_entries)
-    Enum.each(plans, fn {_record, next} -> flow_history_trim(state, next) end)
+
+    Enum.each(plans, fn {_record, next} ->
+      flow_history_trim(state, next)
+      maybe_queue_terminal_lmdb_history_indexes(state, next)
+    end)
 
     :ok
   end
@@ -5808,7 +5826,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
     compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
     raw_put_cold(state, compound_key, Flow.encode_history_fields(record, event, now_ms), 0)
-    queue_lmdb_history_index_put(record, history_key, event_id, event_ms, compound_key)
 
     {history_key, event_id, event_ms}
   end
@@ -6670,7 +6687,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
     with :ok <-
            raw_put_cold(state, compound_key, Flow.encode_history_fields(record, event, now_ms), 0) do
-      queue_lmdb_history_index_put(record, history_key, event_id, event_ms, compound_key)
       flow_history_index_put(state, history_key, event_id, event_ms, version)
     end
   end
@@ -6736,7 +6752,7 @@ defmodule Ferricstore.Raft.StateMachine do
     case flow_index_count_all(state, history_key) do
       len when len > max ->
         delete_count = len - max
-        flow_history_trim_oldest(state, id, partition_key, history_key, delete_count)
+        flow_history_trim_oldest(state, record, id, partition_key, history_key, delete_count)
 
       _ ->
         :ok
@@ -6747,11 +6763,44 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_history_trim(_state, _record), do: :ok
 
-  defp flow_history_trim_oldest(state, _id, _partition_key, history_key, delete_count) do
+  defp flow_history_trim_oldest(state, record, id, partition_key, history_key, delete_count) do
     events = flow_index_rank_range(state, history_key, 0, delete_count - 1, false)
-    event_ids = Enum.map(events, fn {event_id, _score} -> event_id end)
+
+    event_ids =
+      Enum.map(events, fn {event_id, event_ms} ->
+        compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
+        queue_lmdb_history_index_put(record, history_key, event_id, trunc(event_ms), compound_key)
+        event_id
+      end)
 
     flow_index_delete_members(state, history_key, event_ids)
+
+    :ok
+  end
+
+  defp maybe_queue_terminal_lmdb_history_indexes(state, record) do
+    if flow_lmdb_mirror?(state) and Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+      id = Map.fetch!(record, :id)
+      partition_key = Map.get(record, :partition_key)
+      history_key = FlowKeys.history_key(id, partition_key)
+      count = flow_index_count_all(state, history_key)
+
+      if count > 0 do
+        state
+        |> flow_index_rank_range(history_key, 0, count - 1, false)
+        |> Enum.each(fn {event_id, event_ms} ->
+          compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
+
+          queue_lmdb_history_index_put(
+            record,
+            history_key,
+            event_id,
+            trunc(event_ms),
+            compound_key
+          )
+        end)
+      end
+    end
 
     :ok
   end
@@ -7531,9 +7580,9 @@ defmodule Ferricstore.Raft.StateMachine do
     if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
       queue_pending_lmdb_mirror_put(state_key, value, expire_at_ms)
       queue_terminal_lmdb_index_put(state, state_key, record, expire_at_ms)
-    else
-      queue_lmdb_metadata_index_puts(record, expire_at_ms)
     end
+
+    :ok
   end
 
   defp queue_terminal_lmdb_index_put(state, state_key, record, expire_at_ms) do
