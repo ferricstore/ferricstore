@@ -176,6 +176,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
       pending: [],
       pending_after_flush: [],
       count: 0,
+      first_pending_at: nil,
       timer_ref: nil,
       durable_index: 0,
       requested_index: 0,
@@ -212,14 +213,19 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   @impl true
   def handle_cast({:enqueue, ops, after_flush}, state) do
+    now = System.monotonic_time()
+
     state =
       %{
         state
         | pending: prepend_reverse(ops, state.pending),
           pending_after_flush: prepend_reverse(after_flush, state.pending_after_flush),
-          count: state.count + length(ops)
+          count: state.count + length(ops),
+          first_pending_at: state.first_pending_at || now
       }
       |> ensure_timer()
+
+    emit_backlog(state, now)
 
     if state.count >= state.max_ops do
       {:noreply, flush_pending(state)}
@@ -259,7 +265,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
          %{pending: [], requested_index: requested, durable_index: durable} = state
        )
        when requested <= durable do
-    {%{state | count: 0, pending_after_flush: [], timer_ref: nil}, :ok}
+    {%{state | count: 0, pending_after_flush: [], first_pending_at: nil, timer_ref: nil}, :ok}
   end
 
   defp flush_pending_with_reply(state) do
@@ -268,16 +274,30 @@ defmodule Ferricstore.Flow.LMDBWriter do
     ops = Enum.reverse(state.pending)
     after_flush = Enum.reverse(state.pending_after_flush)
     started_at = System.monotonic_time()
+    op_count = length(ops)
+    pending_age_us = pending_age_us(state, started_at)
 
     case flush_ops_and_marker(state, ops, started_at) do
-      {:ok, state} ->
+      {:ok, state, expanded_op_count} ->
         Enum.each(after_flush, &apply_after_flush/1)
+        emit_flush(:ok, state, started_at, op_count, expanded_op_count, pending_age_us)
 
-        {%{state | pending: [], pending_after_flush: [], count: 0, timer_ref: nil}, :ok}
+        {
+          %{
+            state
+            | pending: [],
+              pending_after_flush: [],
+              count: 0,
+              first_pending_at: nil,
+              timer_ref: nil
+          },
+          :ok
+        }
 
       {:error, reason, state} ->
         record_persist_failure(state.instance_ctx, state.shard_index)
         emit_persist({:error, reason}, state, state.requested_index, started_at)
+        emit_flush({:error, reason}, state, started_at, op_count, 0, pending_age_us)
 
         Logger.warning(
           "Flow LMDB writer shard #{state.shard_index} flush failed: #{inspect(reason)}"
@@ -292,7 +312,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
          :ok <- write_ops(state.path, ops),
          :ok <- cache_terminal_counts(state.path, state.terminal_count_cache),
          {:ok, state} <- persist_requested(state, started_at) do
-      {:ok, state}
+      {:ok, state, length(ops)}
     else
       {:error, reason} -> {:error, reason, state}
     end
@@ -765,6 +785,40 @@ defmodule Ferricstore.Flow.LMDBWriter do
     :ok
   end
 
+  defp emit_backlog(state, now) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb_writer, :backlog],
+      %{
+        pending_ops: state.count,
+        pending_after_flush: length(state.pending_after_flush),
+        oldest_pending_age_us: pending_age_us(state, now),
+        requested_index: state.requested_index,
+        durable_index: state.durable_index,
+        replay_safe_lag: replay_safe_lag(state)
+      },
+      writer_metadata(state)
+    )
+  end
+
+  defp emit_flush(status, state, started_at, op_count, expanded_op_count, pending_age_us) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb_writer, :flush],
+      %{
+        duration_us: duration_us(started_at),
+        op_count: op_count,
+        expanded_op_count: expanded_op_count,
+        pending_age_us: pending_age_us,
+        requested_index: state.requested_index,
+        durable_index: state.durable_index,
+        replay_safe_lag: replay_safe_lag(state)
+      },
+      state
+      |> writer_metadata()
+      |> Map.put(:status, persist_status(status))
+      |> Map.put(:reason, persist_reason(status))
+    )
+  end
+
   defp emit_persist(status, state, index, started_at) do
     requested_index = max(state.requested_index, index)
     durable_index = if status == :ok, do: index, else: state.durable_index
@@ -791,6 +845,24 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp persist_reason(:ok), do: :none
   defp persist_reason({:error, reason}), do: reason
+
+  defp replay_safe_lag(state), do: max(state.requested_index - state.durable_index, 0)
+
+  defp writer_metadata(state) do
+    %{
+      shard_index: state.shard_index,
+      instance_name: state.instance_name
+    }
+  end
+
+  defp pending_age_us(%{first_pending_at: nil}, _now), do: 0
+
+  defp pending_age_us(%{first_pending_at: first_pending_at}, now) do
+    now
+    |> Kernel.-(first_pending_at)
+    |> System.convert_time_unit(:native, :microsecond)
+    |> max(0)
+  end
 
   defp duration_us(started_at) do
     System.monotonic_time()

@@ -286,6 +286,85 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, "v0"} = Ferricstore.Flow.LMDB.get(path0, key0)
   end
 
+  test "mirror writer emits backlog and flush telemetry" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+    Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 1_000_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_telemetry_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :"flow_lmdb_writer_telemetry_#{System.unique_integer([:positive])}"
+    shard_index = 0
+    key = "flow:{flow:telemetry}:state:a"
+    test_pid = self()
+    handler_id = {:flow_lmdb_writer_telemetry, self(), make_ref()}
+
+    :telemetry.attach_many(
+      handler_id,
+      [
+        [:ferricstore, :flow, :lmdb_writer, :backlog],
+        [:ferricstore, :flow, :lmdb_writer, :flush]
+      ],
+      fn event, measurements, metadata, _config ->
+        send(test_pid, {:flow_lmdb_writer_telemetry, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:flow_lmdb_max_batch_ops, old_max_batch_ops)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+    )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
+               {:put, key, "v1"},
+               {:put, key, "v2"}
+             ])
+
+    assert_receive {:flow_lmdb_writer_telemetry, [:ferricstore, :flow, :lmdb_writer, :backlog],
+                    backlog, backlog_meta}
+
+    assert backlog.pending_ops == 2
+    assert backlog.pending_after_flush == 0
+    assert backlog.oldest_pending_age_us >= 0
+    assert backlog.replay_safe_lag == 0
+    assert backlog_meta.shard_index == shard_index
+    assert backlog_meta.instance_name == instance_name
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+
+    assert_receive {:flow_lmdb_writer_telemetry, [:ferricstore, :flow, :lmdb_writer, :flush],
+                    flush, flush_meta}
+
+    assert flush.op_count == 2
+    assert flush.expanded_op_count >= 2
+    assert flush.duration_us >= 0
+    assert flush.pending_age_us >= 0
+    assert flush.replay_safe_lag == 0
+    assert flush_meta.status == :ok
+    assert flush_meta.shard_index == shard_index
+    assert flush_meta.instance_name == instance_name
+  end
+
   test "mirror writer persists replay-safe marker only after pending ops flush" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
