@@ -280,28 +280,10 @@ defmodule Ferricstore.Commands.Bitmap do
       when is_integer(offset) and offset >= 0 and bit_val in [0, 1] do
     with :ok <- ensure_string_key(key, store),
          :ok <- check_bit_offset(offset) do
-      {current, expire_at_ms} =
-        case Ops.get_meta(store, key) do
-          nil -> {<<>>, 0}
-          {value, exp} -> {value, exp}
-        end
-
-      byte_index = div(offset, 8)
-      extended = extend_binary(current, byte_index + 1)
-      old_byte = :binary.at(extended, byte_index)
-      bit_position = 7 - rem(offset, 8)
-      old_bit = old_byte >>> bit_position &&& 1
-
-      new_byte =
-        case bit_val do
-          1 -> old_byte ||| 1 <<< bit_position
-          0 -> old_byte &&& Bitwise.bnot(1 <<< bit_position)
-        end
-
-      <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
-      new_value = <<prefix::binary, new_byte::8, suffix::binary>>
-
-      write_setbit_result(store, key, new_value, expire_at_ms, old_bit)
+      case setbit_noop_from_store(store, key, offset, bit_val) do
+        {:ok, old_bit} -> old_bit
+        :unknown -> setbit_rewrite(key, offset, bit_val, store)
+      end
     end
   end
 
