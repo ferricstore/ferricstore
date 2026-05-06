@@ -2217,6 +2217,34 @@ defmodule Ferricstore.FlowTest do
              )
   end
 
+  test "flow create_many and transition_many reject oversized batches" do
+    original = Application.get_env(:ferricstore, :flow_max_batch_items)
+    Application.put_env(:ferricstore, :flow_max_batch_items, 2)
+
+    on_exit(fn ->
+      if is_nil(original) do
+        Application.delete_env(:ferricstore, :flow_max_batch_items)
+      else
+        Application.put_env(:ferricstore, :flow_max_batch_items, original)
+      end
+    end)
+
+    assert {:error, "ERR flow batch item count exceeds maximum 2"} =
+             FerricStore.flow_create_many("tenant-batch-cap", ["a", "b", "c"], type: "batch-cap")
+
+    assert {:error, "ERR flow batch item count exceeds maximum 2"} =
+             FerricStore.flow_transition_many(
+               "tenant-batch-cap",
+               "queued",
+               "waiting",
+               [
+                 %{id: "a", fencing_token: 0},
+                 %{id: "b", fencing_token: 0},
+                 %{id: "c", fencing_token: 0}
+               ]
+             )
+  end
+
   test "flow_rewind rejects trimmed target event with stale stream index" do
     id = uid("flow-rewind-trimmed")
 

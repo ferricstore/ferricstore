@@ -13,6 +13,7 @@ defmodule Ferricstore.Flow do
   @default_limit 1
   @default_history_max_events 1_024
   @max_history_max_events 10_000
+  @default_max_batch_items 1_000
   @max_ref_size 4_096
   @default_max_count 10_000
   @default_lmdb_query_scan_limit 10_000
@@ -2074,13 +2075,30 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp validate_create_many_items([_ | _]), do: :ok
+  defp validate_create_many_items([_ | _] = items), do: validate_many_item_count(items)
   defp validate_create_many_items(_items), do: {:error, "ERR flow items must be a non-empty list"}
 
-  defp validate_transition_many_items([_ | _]), do: :ok
+  defp validate_transition_many_items([_ | _] = items), do: validate_many_item_count(items)
 
   defp validate_transition_many_items(_items),
     do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp validate_many_item_count(items) do
+    max = flow_max_batch_items()
+
+    if length(items) <= max do
+      :ok
+    else
+      {:error, "ERR flow batch item count exceeds maximum #{max}"}
+    end
+  end
+
+  defp flow_max_batch_items do
+    case Application.get_env(:ferricstore, :flow_max_batch_items, @default_max_batch_items) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> @default_max_batch_items
+    end
+  end
 
   defp validate_unique_create_ids(attrs_list) do
     {_seen, result} =
