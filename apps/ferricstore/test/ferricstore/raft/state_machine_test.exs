@@ -369,6 +369,83 @@ defmodule Ferricstore.Raft.StateMachineTest do
         :telemetry.detach(handler_id)
       end
     end
+
+    test "Ra-batched Flow commands share append batch but keep per-command semantic results", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
+      :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+
+      on_exit(fn ->
+        safe_delete_ets(state.zset_score_index_name)
+        safe_delete_ets(state.zset_score_lookup_name)
+        safe_delete_ets(state.flow_index_name)
+        safe_delete_ets(state.flow_lookup_name)
+      end)
+
+      handler_id = {:flow_batch_append_per_command_results, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :bitcask, :append],
+          fn _event, measurements, metadata, test_pid ->
+            send(test_pid, {:flow_bitcask_append, measurements, metadata})
+          end,
+          self()
+        )
+
+      partition_key = "tenant-ra-batched-flow"
+
+      create_a = %{
+        id: "flow-ra-batch-a",
+        type: "ra-batch",
+        state: "queued",
+        partition_key: partition_key,
+        now_ms: 1_000
+      }
+
+      create_b = %{
+        id: "flow-ra-batch-b",
+        type: "ra-batch",
+        state: "queued",
+        partition_key: partition_key,
+        now_ms: 1_000
+      }
+
+      try do
+        {_state, {:ok, [result_a, duplicate_result, result_b]}} =
+          StateMachine.apply(
+            %{system_time: 1_000},
+            {:batch,
+             [
+               {:flow_create, nil, create_a},
+               {:flow_create, nil, create_a},
+               {:flow_create, nil, create_b}
+             ]},
+            state
+          )
+
+        assert {:ok, %{id: "flow-ra-batch-a"}} = result_a
+        assert {:error, "ERR flow already exists"} = duplicate_result
+        assert {:ok, %{id: "flow-ra-batch-b"}} = result_b
+
+        assert_receive {:flow_bitcask_append, measurements,
+                        %{shard_index: ^shard_index, status: :ok}},
+                       500
+
+        assert measurements.batch_size == 4
+        assert measurements.delete_count == 0
+        assert measurements.batch_bytes > 0
+
+        refute_receive {:flow_bitcask_append, _measurements, _metadata}, 100
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
   end
 
   describe "Flow index rollback" do
