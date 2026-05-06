@@ -160,7 +160,7 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- transition_attrs(id, from_state, to_state, opts) do
+      with {:ok, attrs} <- transition_attrs(id, from_state, to_state, opts, now_ms()) do
         Router.flow_transition(ctx, attrs)
       end
 
@@ -174,12 +174,13 @@ defmodule Ferricstore.Flow do
   def transition_many(ctx, partition_key, from_state, to_state, items, opts)
       when is_binary(from_state) and is_binary(to_state) and is_list(items) and is_list(opts) do
     started = flow_start_time()
+    now = now_ms()
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
            :ok <- validate_transition_many_items(items),
            {:ok, attrs_list} <-
-             transition_many_attrs(items, opts, partition_key, from_state, to_state),
+             transition_many_attrs(items, opts, partition_key, from_state, to_state, now),
            :ok <- validate_unique_transition_ids(attrs_list) do
         Router.flow_transition_many(ctx, partition_key, attrs_list)
       end
@@ -199,6 +200,7 @@ defmodule Ferricstore.Flow do
 
   def transition_batch_independent(ctx, transitions) when is_list(transitions) do
     started = flow_start_time()
+    now = now_ms()
 
     {valid, indexed_results} =
       transitions
@@ -206,7 +208,7 @@ defmodule Ferricstore.Flow do
       |> Enum.reduce({[], %{}}, fn
         {{id, from_state, to_state, opts}, idx}, {valid_acc, result_acc}
         when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts) ->
-          case transition_attrs(id, from_state, to_state, opts) do
+          case transition_attrs(id, from_state, to_state, opts, now) do
             {:ok, attrs} -> {[{idx, attrs} | valid_acc], result_acc}
             {:error, _reason} = error -> {valid_acc, Map.put(result_acc, idx, error)}
           end
@@ -985,7 +987,7 @@ defmodule Ferricstore.Flow do
     |> maybe_put_item_opt(:correlation_id, item, :correlation_id, "correlation_id")
   end
 
-  defp transition_attrs(id, from_state, to_state, opts) do
+  defp transition_attrs(id, from_state, to_state, opts, default_now) do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
          :ok <- validate_state(:from, from_state),
@@ -994,7 +996,7 @@ defmodule Ferricstore.Flow do
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, default_now),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
          {:ok, priority} <- optional_priority_or_nil(opts) do
       {:ok,
@@ -1012,7 +1014,7 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp transition_many_attrs(items, opts, partition_key, from_state, to_state) do
+  defp transition_many_attrs(items, opts, partition_key, from_state, to_state, default_now) do
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, item_opts} <- transition_many_item_opts(item),
            {:ok, item_partition_key} <- many_item_partition_key(partition_key, item_opts),
@@ -1023,7 +1025,8 @@ defmodule Ferricstore.Flow do
                to_state,
                opts
                |> Keyword.merge(Keyword.delete(item_opts, :partition_key))
-               |> Keyword.put(:partition_key, item_partition_key)
+               |> Keyword.put(:partition_key, item_partition_key),
+               default_now
              ) do
         {:cont, {:ok, [attrs | acc]}}
       else
