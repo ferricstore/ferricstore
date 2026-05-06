@@ -36,11 +36,7 @@ jobs:
         run: |
           VERSION=$(sed -n 's/.*@version "\(.*\)"/\1/p' apps/ferricstore/mix.exs)
           echo "PROJECT_VERSION=${VERSION}" >> $GITHUB_ENV
-          if [ "${{ matrix.crate }}" = "resp_parser_nif" ]; then
-            echo "NIF_DIRECTORY=apps/ferricstore_server/native/${{ matrix.crate }}" >> $GITHUB_ENV
-          else
-            echo "NIF_DIRECTORY=apps/ferricstore/native/${{ matrix.crate }}" >> $GITHUB_ENV
-          fi
+          echo "NIF_DIRECTORY=apps/ferricstore/native/${{ matrix.crate }}" >> $GITHUB_ENV
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -107,11 +103,7 @@ jobs:
         run: |
           VERSION=$(sed -n 's/.*@version "\(.*\)"/\1/p' apps/ferricstore/mix.exs)
           echo "PROJECT_VERSION=${VERSION}" >> $GITHUB_ENV
-          if [ "${{ matrix.crate }}" = "resp_parser_nif" ]; then
-            echo "NIF_DIRECTORY=apps/ferricstore_server/native/${{ matrix.crate }}" >> $GITHUB_ENV
-          else
-            echo "NIF_DIRECTORY=apps/ferricstore/native/${{ matrix.crate }}" >> $GITHUB_ENV
-          fi
+          echo "NIF_DIRECTORY=apps/ferricstore/native/${{ matrix.crate }}" >> $GITHUB_ENV
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

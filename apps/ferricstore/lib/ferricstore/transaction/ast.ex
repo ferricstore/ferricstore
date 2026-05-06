@@ -17,7 +17,7 @@ defmodule Ferricstore.Transaction.Ast do
   # node upgraded after the AST migration can fail while replaying old entries.
   def normalize_entry({cmd, args}) when is_binary(cmd) and is_list(args) do
     frame = encode_legacy_command(cmd, args)
-    parser = Module.concat([FerricstoreServer, Resp, Parser])
+    parser = Ferricstore.Resp.Parser
 
     case Code.ensure_loaded(parser) do
       {:module, ^parser} ->
