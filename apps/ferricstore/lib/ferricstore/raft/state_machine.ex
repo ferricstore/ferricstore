@@ -6405,6 +6405,10 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_history_trim(_state, %{history_max_events: nil}), do: :ok
   defp flow_history_trim(_state, %{history_max_events: max}) when not is_integer(max), do: :ok
 
+  defp flow_history_trim(_state, %{history_max_events: max, version: version})
+       when is_integer(version) and version <= max,
+       do: :ok
+
   defp flow_history_trim(state, %{id: id, history_max_events: max} = record) when max > 0 do
     partition_key = Map.get(record, :partition_key)
     history_key = FlowKeys.history_key(id, partition_key)
