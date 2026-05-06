@@ -446,6 +446,94 @@ defmodule Ferricstore.Raft.StateMachineTest do
         :telemetry.detach(handler_id)
       end
     end
+
+    test "claim_due stages state, history, and trim tombstones into one append batch", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
+      :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+
+      on_exit(fn ->
+        safe_delete_ets(state.zset_score_index_name)
+        safe_delete_ets(state.zset_score_lookup_name)
+        safe_delete_ets(state.flow_index_name)
+        safe_delete_ets(state.flow_lookup_name)
+      end)
+
+      partition_key = "tenant-claim-append"
+      type = "claim-append"
+
+      records =
+        for id <- ["flow-claim-a", "flow-claim-b", "flow-claim-c"] do
+          %{
+            id: id,
+            type: type,
+            state: "queued",
+            partition_key: partition_key,
+            now_ms: 1_000,
+            run_at_ms: 1_000,
+            history_max_events: 1
+          }
+        end
+
+      {state, {:ok, created}} =
+        StateMachine.apply(
+          %{system_time: 1_000},
+          {:flow_create_many, nil, %{records: records}},
+          state
+        )
+
+      assert length(created) == 3
+
+      handler_id = {:flow_claim_due_append_batch, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :bitcask, :append],
+          fn _event, measurements, metadata, test_pid ->
+            send(test_pid, {:flow_bitcask_append, measurements, metadata})
+          end,
+          self()
+        )
+
+      due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
+
+      try do
+        {_state, {:ok, claimed}} =
+          StateMachine.apply(
+            %{system_time: 2_000},
+            {:flow_claim_due, due_key,
+             %{
+               type: type,
+               state: "queued",
+               worker: "worker-claim-append",
+               lease_ms: 30_000,
+               limit: 3,
+               priority: nil,
+               partition_key: partition_key
+             }},
+            state
+          )
+
+        assert Enum.map(claimed, & &1.id) == ["flow-claim-a", "flow-claim-b", "flow-claim-c"]
+
+        assert_receive {:flow_bitcask_append, measurements,
+                        %{shard_index: ^shard_index, status: :ok}},
+                       500
+
+        assert measurements.batch_size == 9
+        assert measurements.delete_count == 3
+        assert measurements.batch_bytes > 0
+
+        refute_receive {:flow_bitcask_append, _measurements, _metadata}, 100
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
   end
 
   describe "Flow index rollback" do
