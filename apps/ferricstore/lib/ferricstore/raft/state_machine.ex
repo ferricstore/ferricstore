@@ -5930,86 +5930,52 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_read_mirror_records(state, keys) do
-    pending = Process.get(:sm_pending_lmdb_values, %{})
-    now = apply_now_ms()
+    ets_results = Enum.map(keys, &flow_read_ets_record(state, &1))
 
-    {results, lmdb_reads} =
+    lmdb_reads =
       keys
+      |> Enum.zip(ets_results)
       |> Enum.with_index()
-      |> Enum.reduce({%{}, []}, fn {key, idx}, {result_acc, read_acc} ->
-        if Map.has_key?(pending, key) do
-          case flow_decode_pending_lmdb_record(pending, key) do
-            {:ok, record} -> {Map.put(result_acc, idx, record), read_acc}
-            :miss -> {Map.put(result_acc, idx, nil), read_acc}
-          end
-        else
-          case flow_read_mirror_ets_candidate(state, key, now) do
-            {:ok, record} ->
-              {Map.put(result_acc, idx, record), read_acc}
-
-            :miss ->
-              {Map.put(result_acc, idx, nil), read_acc}
-
-            {:lmdb, lfu} ->
-              {result_acc, [{idx, key, lfu} | read_acc]}
-          end
-        end
+      |> Enum.flat_map(fn
+        {{key, nil}, idx} -> [{idx, key}]
+        {_present, _idx} -> []
       end)
 
-    lmdb_results =
-      flow_read_lmdb_records(
-        state,
-        lmdb_reads
-        |> Enum.reverse()
-        |> Enum.map(fn {_idx, key, _lfu} -> key end)
-      )
+    lmdb_results = flow_read_lmdb_records(state, Enum.map(lmdb_reads, fn {_idx, key} -> key end))
 
     results =
       lmdb_reads
-      |> Enum.reverse()
       |> Enum.zip(lmdb_results)
-      |> Enum.reduce(results, fn
-        {{idx, _key, {:flow_state_version, version, _lfu}},
-         {:ok, %{version: record_version} = record}},
-        acc
-        when record_version == version ->
-          Map.put(acc, idx, record)
-
-        {{idx, _key, lfu}, {:ok, record}}, acc when not is_tuple(lfu) ->
-          Map.put(acc, idx, record)
-
-        {{idx, _key, _lfu}, _result}, acc ->
-          Map.put(acc, idx, nil)
+      |> Enum.reduce(%{}, fn
+        {{idx, _key}, {:ok, record}}, acc -> Map.put(acc, idx, record)
+        {{idx, _key}, _result}, acc -> Map.put(acc, idx, nil)
       end)
 
-    for idx <- 0..(length(keys) - 1)//1, do: Map.get(results, idx)
+    results =
+      ets_results
+      |> Enum.with_index()
+      |> Enum.reduce(results, fn
+        {nil, _idx}, acc ->
+          acc
+
+        {record, idx}, acc ->
+          Map.put(acc, idx, record)
+      end)
+
+    keys
+    |> Enum.with_index()
+    |> Enum.map(fn {_key, idx} -> Map.get(results, idx) end)
   end
 
-  defp flow_read_mirror_ets_candidate(state, key, now) do
-    case :ets.lookup(state.ets, key) do
-      [{^key, value, 0, _lfu, _fid, _off, _vsize}] when is_binary(value) ->
-        value |> flow_decode_record_blob() |> flow_read_result_to_candidate()
+  defp flow_read_mirror_record(state, key) do
+    case flow_read_ets_record(state, key) do
+      nil ->
+        flow_read_lmdb_record(state, key)
 
-      [{^key, nil, 0, lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-        {:lmdb, lfu}
-
-      [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and is_binary(value) ->
-        value |> flow_decode_record_blob() |> flow_read_result_to_candidate()
-
-      [{^key, nil, exp, lfu, fid, off, vsize}]
-      when exp > now and valid_cold_location(fid, off, vsize) ->
-        {:lmdb, lfu}
-
-      [] ->
-        {:lmdb, nil}
-
-      _ ->
-        :miss
+      record ->
+        {:ok, record}
     end
   end
-
-  defp flow_read_result_to_candidate({:ok, record}), do: {:ok, record}
-  defp flow_read_result_to_candidate(:miss), do: :miss
 
   defp flow_read_lmdb_records(_state, []), do: []
 
@@ -6064,38 +6030,6 @@ defmodule Ferricstore.Raft.StateMachine do
             {:error, _reason} -> :miss
           end
         end)
-    end
-  end
-
-  defp flow_read_mirror_record(state, key) do
-    case flow_decode_pending_lmdb_record(Process.get(:sm_pending_lmdb_values, %{}), key) do
-      {:ok, record} -> {:ok, record}
-      :miss -> flow_read_mirror_committed_record(state, key)
-    end
-  end
-
-  defp flow_read_mirror_committed_record(state, key) do
-    now = apply_now_ms()
-
-    case :ets.lookup(state.ets, key) do
-      [{^key, value, 0, _lfu, _fid, _off, _vsize}] when is_binary(value) ->
-        flow_decode_record_blob(value)
-
-      [{^key, nil, 0, lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-        flow_read_lmdb_fresh_record(state, key, lfu)
-
-      [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and is_binary(value) ->
-        flow_decode_record_blob(value)
-
-      [{^key, nil, exp, lfu, fid, off, vsize}]
-      when exp > now and valid_cold_location(fid, off, vsize) ->
-        flow_read_lmdb_fresh_record(state, key, lfu)
-
-      [] ->
-        flow_read_lmdb_record(state, key)
-
-      _ ->
-        :miss
     end
   end
 
@@ -6157,16 +6091,6 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_decode_record_blob(_value), do: :miss
-
-  defp flow_read_lmdb_fresh_record(state, key, {:flow_state_version, version, _lfu})
-       when is_integer(version) do
-    case flow_read_lmdb_record(state, key) do
-      {:ok, %{version: ^version} = record} -> {:ok, record}
-      _ -> :miss
-    end
-  end
-
-  defp flow_read_lmdb_fresh_record(_state, _key, _lfu), do: :miss
 
   defp flow_history_event_fields(state, id, event_id, partition_key) do
     history_key = FlowKeys.history_key(id, partition_key)
@@ -6958,8 +6882,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
       flow_lmdb_mirror?(state) ->
         flow_mirror_put_state_record(state, key, value, expire_at_ms, record)
-        queue_pending_lmdb_mirror_put(key, value, expire_at_ms)
-        maybe_queue_lmdb_indexes_for_state_record(state, key, expire_at_ms, record)
+        maybe_queue_lmdb_indexes_for_state_record(state, key, value, expire_at_ms, record)
 
       true ->
         flow_put(state, key, value, expire_at_ms)
@@ -7746,9 +7669,10 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
-  defp maybe_queue_lmdb_indexes_for_state_record(state, state_key, expire_at_ms, record)
+  defp maybe_queue_lmdb_indexes_for_state_record(state, state_key, value, expire_at_ms, record)
        when is_map(record) do
     if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+      queue_pending_lmdb_mirror_put(state_key, value, expire_at_ms)
       queue_terminal_lmdb_index_put(state, state_key, record, expire_at_ms)
     else
       queue_lmdb_metadata_index_puts(record, expire_at_ms)

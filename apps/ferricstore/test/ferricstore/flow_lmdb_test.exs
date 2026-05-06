@@ -252,7 +252,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, "v2"} = Ferricstore.Flow.LMDB.get(path, key)
   end
 
-  test "mirror writer initializes zero terminal counters for active flow types" do
+  test "active mirror writes do not initialize terminal counters" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
 
@@ -285,7 +285,7 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     for terminal_state <- ["completed", "failed", "cancelled"] do
       state_index_key = Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
-      assert {:ok, 0} = Ferricstore.Flow.LMDB.terminal_count(path, state_index_key)
+      assert :not_found = Ferricstore.Flow.LMDB.terminal_count(path, state_index_key)
     end
   end
 
@@ -505,7 +505,8 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, %{id: "mirror-enqueue-degraded"}} =
              Ferricstore.Flow.create(ctx, "mirror-enqueue-degraded",
                type: "mirror-enqueue-degraded",
-               partition_key: "tenant-mirror-enqueue-degraded"
+               partition_key: "tenant-mirror-enqueue-degraded",
+               correlation_id: "correlation-mirror-enqueue-degraded"
              )
 
     assert :atomics.get(ctx.flow_lmdb_mirror_enqueue_failures, 1) == 1

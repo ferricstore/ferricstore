@@ -538,7 +538,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       end
     end
 
-    test "claim_due mirror queues one LMDB writer message per apply", %{
+    test "claim_due mirror does not enqueue full active state blobs", %{
       state: state,
       shard_index: shard_index
     } do
@@ -635,14 +635,6 @@ defmodule Ferricstore.Raft.StateMachineTest do
           )
 
         assert length(claimed) == 10
-
-        assert_receive {:flow_lmdb_backlog, measurements,
-                        %{instance_name: :default, shard_index: ^shard_index}},
-                       500
-
-        assert measurements.pending_ops == 10
-        assert measurements.pending_after_flush == 0
-        assert measurements.oldest_pending_age_us >= 0
 
         refute_receive {:flow_lmdb_backlog, _measurements, _metadata}, 100
       after
