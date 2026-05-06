@@ -1207,6 +1207,55 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.by_correlation(ctx, correlation_id, partition_key: partition_key)
   end
 
+  test "lineage queries overfetch past stale LMDB index rows before post-filtering" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    partition_key = "tenant-stale-lineage-overfetch"
+    correlation_id = "correlation-stale-lineage-overfetch"
+    stale_id = "flow-stale-lineage-overfetch"
+    live_id = "flow-live-lineage-overfetch"
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.create(ctx, live_id,
+               type: "stale-lineage-overfetch",
+               partition_key: partition_key,
+               correlation_id: correlation_id,
+               run_at_ms: 20,
+               now_ms: 20
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    stale_index_key = Ferricstore.Flow.Keys.correlation_index_key(correlation_id, partition_key)
+    stale_query_key = Ferricstore.Flow.LMDB.query_index_key(stale_index_key, stale_id, 10)
+    stale_query_value = Ferricstore.Flow.LMDB.encode_query_index_value(stale_id, 10, 0)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+               {:put, stale_query_key, stale_query_value}
+             ])
+
+    assert {:ok, [%{id: ^live_id}]} =
+             Ferricstore.Flow.by_correlation(ctx, correlation_id,
+               partition_key: partition_key,
+               count: 1
+             )
+  end
+
   test "mirror startup rebuilds flow working indexes and prunes terminal state to LMDB" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 

@@ -12,6 +12,7 @@ defmodule Ferricstore.Flow do
   @default_lease_ms 30_000
   @default_limit 1
   @max_ref_size 4_096
+  @default_lmdb_query_scan_limit 10_000
   @terminal_states ["completed", "failed", "cancelled"]
   @record_tag :flow_record_v1
   @history_tag :flow_history_v1
@@ -1261,11 +1262,12 @@ defmodule Ferricstore.Flow do
     with :ok <- flow_flush_lmdb_for_index(ctx, index_key, partition_key) do
       prefix = Ferricstore.Flow.LMDB.query_index_prefix(index_key)
       now_ms = now_ms()
+      scan_count = flow_lmdb_query_scan_count(count)
 
       ctx
       |> flow_lmdb_paths_for_index(index_key, partition_key)
       |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
-        with {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count) do
+        with {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, scan_count) do
           {:cont, {:ok, flow_decode_query_index_entries(entries, path, now_ms) ++ acc}}
         else
           {:error, _reason} = error -> {:halt, error}
@@ -1277,7 +1279,6 @@ defmodule Ferricstore.Flow do
             entries
             |> Enum.sort_by(fn {id, updated_at_ms} -> {updated_at_ms, id} end)
             |> Enum.map(fn {id, _updated_at_ms} -> id end)
-            |> Enum.take(count)
 
           {:ok, ids}
 
@@ -1285,6 +1286,27 @@ defmodule Ferricstore.Flow do
           error
       end
     end
+  end
+
+  defp flow_lmdb_query_scan_count(count) when is_integer(count) and count > 0 do
+    max_scan =
+      Application.get_env(
+        :ferricstore,
+        :flow_lmdb_query_scan_limit,
+        @default_lmdb_query_scan_limit
+      )
+
+    max_scan =
+      case max_scan do
+        value when is_integer(value) and value > 0 -> value
+        _ -> @default_lmdb_query_scan_limit
+      end
+
+    count
+    |> Kernel.+(64)
+    |> max(count * 4)
+    |> min(max_scan)
+    |> max(count)
   end
 
   defp flow_terminal_lmdb_count(_ctx, _index_key, state, _partition_key)
