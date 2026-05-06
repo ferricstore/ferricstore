@@ -1654,7 +1654,9 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "TTL",
                    "5000",
                    "HISTORY_MAX_EVENTS",
-                   "10"
+                   "10",
+                   "IDEMPOTENT",
+                   "true"
                  ],
                  {:flow_create, "flow-1",
                   [
@@ -1664,7 +1666,8 @@ defmodule FerricstoreServer.Resp.ParserTest do
                     priority: 2,
                     partition_key: "tenant-a",
                     ttl_ms: 5000,
-                    history_max_events: 10
+                    history_max_events: 10,
+                    idempotent: true
                   ]}, ["flow-1"]},
                 {:command, "FLOW.CLAIM_DUE",
                  [
@@ -1741,7 +1744,7 @@ defmodule FerricstoreServer.Resp.ParserTest do
                   ]}, ["flow-1"]}
               ], ""} =
                Parser.parse_commands(
-                 "flow.create flow-1 TYPE checkout STATE queued RUN_AT 1000 PRIORITY 2 PARTITION tenant-a TTL 5000 HISTORY_MAX_EVENTS 10\r\n" <>
+                 "flow.create flow-1 TYPE checkout STATE queued RUN_AT 1000 PRIORITY 2 PARTITION tenant-a TTL 5000 HISTORY_MAX_EVENTS 10 IDEMPOTENT true\r\n" <>
                    "flow.claim_due checkout WORKER worker-a LEASE_MS 30000 LIMIT 100 NOW 1000\r\n" <>
                    "flow.complete flow-1 lease-1 FENCING 1 RESULT_REF result-1\r\n" <>
                    "flow.transition flow-1 queued running FENCING 1 LEASE_TOKEN lease-1\r\n" <>

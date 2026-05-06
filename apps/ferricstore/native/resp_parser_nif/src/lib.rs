@@ -5583,6 +5583,7 @@ fn flow_has_option(arg_bytes: &[&[u8]], start: usize, name: &[u8]) -> bool {
 #[derive(Clone, Copy)]
 enum FlowOptType<'a> {
     Binary,
+    Boolean,
     Ref(&'a [u8]),
     NonNegative,
     Positive(&'a [u8]),
@@ -5633,6 +5634,7 @@ fn flow_create_option<'a>(
                 "history_max_events",
                 FlowOptType::Positive(b"history_max_events"),
             ),
+            (b"IDEMPOTENT", "idempotent", FlowOptType::Boolean),
         ],
     )
 }
@@ -5924,6 +5926,13 @@ fn flow_option_value<'a>(
 
     match opt_type {
         FlowOptType::Binary => Ok(Some((key_atom, value_term).encode(env))),
+        FlowOptType::Boolean => match parse_bool_bytes(value_bytes) {
+            Some(value) => Ok(Some((key_atom, value).encode(env))),
+            None => Err(generic_ast_error(
+                env,
+                b"ERR flow idempotent must be a boolean",
+            )),
+        },
         FlowOptType::Ref(_label) if value_bytes.len() <= FLOW_MAX_REF_SIZE => {
             Ok(Some((key_atom, value_term).encode(env)))
         }
@@ -7052,6 +7061,16 @@ fn parse_int_bytes(data: &[u8]) -> Option<i64> {
     Some(result)
 }
 
+fn parse_bool_bytes(data: &[u8]) -> Option<bool> {
+    if ascii_eq_ignore_case(data, b"TRUE") || data == b"1" {
+        Some(true)
+    } else if ascii_eq_ignore_case(data, b"FALSE") || data == b"0" {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn make_binary_term<'a>(env: Env<'a>, data: &[u8]) -> Term<'a> {
     let mut bin = NewBinary::new(env, data.len());
     bin.as_mut_slice().copy_from_slice(data);
@@ -7071,7 +7090,7 @@ fn lossy_str(data: &[u8]) -> String {
     String::from_utf8_lossy(data).into_owned()
 }
 
-rustler::init!("Elixir.FerricstoreServer.Resp.ParserNif");
+rustler::init!("Elixir.Ferricstore.Resp.ParserNif");
 
 #[cfg(test)]
 mod tests {

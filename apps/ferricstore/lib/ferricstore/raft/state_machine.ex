@@ -4317,8 +4317,8 @@ defmodule Ferricstore.Raft.StateMachine do
           {:ok, record}
         end
 
-      _existing ->
-        {:error, "ERR flow already exists"}
+      existing ->
+        flow_create_duplicate_result(existing, attrs)
     end
   end
 
@@ -4363,6 +4363,36 @@ defmodule Ferricstore.Raft.StateMachine do
       lease_token: nil,
       lease_deadline_ms: 0
     }
+  end
+
+  defp flow_create_duplicate_result(existing, %{idempotent: true} = attrs) do
+    if flow_create_idempotent_match?(existing, attrs) do
+      {:ok, existing}
+    else
+      {:error, "ERR flow idempotency conflict"}
+    end
+  end
+
+  defp flow_create_duplicate_result(_existing, _attrs), do: {:error, "ERR flow already exists"}
+
+  defp flow_create_idempotent_match?(existing, attrs) do
+    id = Map.fetch!(attrs, :id)
+
+    comparable_attrs = %{
+      id: id,
+      type: Map.get(attrs, :type),
+      state: Map.get(attrs, :state),
+      partition_key: Map.get(attrs, :partition_key),
+      payload_ref: Map.get(attrs, :payload_ref),
+      parent_flow_id: Map.get(attrs, :parent_flow_id),
+      root_flow_id: Map.get(attrs, :root_flow_id) || id,
+      correlation_id: Map.get(attrs, :correlation_id),
+      priority: Map.get(attrs, :priority, 0),
+      ttl_ms: Map.get(attrs, :ttl_ms),
+      history_max_events: Map.get(attrs, :history_max_events)
+    }
+
+    Enum.all?(comparable_attrs, fn {key, value} -> Map.get(existing, key) == value end)
   end
 
   defp flow_many_partitions_valid?(state, attrs_list) do

@@ -1563,6 +1563,7 @@ defmodule Ferricstore.Flow do
          root_flow_id = root_flow_id || id,
          {:ok, correlation_id} <- optional_binary_or_nil(opts, :correlation_id, nil),
          :ok <- validate_ref_size(:correlation_id, correlation_id),
+         {:ok, idempotent} <- optional_boolean(opts, :idempotent, false),
          {:ok, now} <- optional_non_neg_integer(opts, :now_ms, default_now),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
          {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
@@ -1579,6 +1580,7 @@ defmodule Ferricstore.Flow do
          parent_flow_id: parent_flow_id,
          root_flow_id: root_flow_id,
          correlation_id: correlation_id,
+         idempotent: idempotent,
          run_at_ms: run_at_ms,
          ttl_ms: ttl_ms,
          history_max_events: history_max_events,
@@ -1648,6 +1650,7 @@ defmodule Ferricstore.Flow do
     |> maybe_put_item_opt(:parent_flow_id, item, :parent_flow_id, "parent_flow_id")
     |> maybe_put_item_opt(:root_flow_id, item, :root_flow_id, "root_flow_id")
     |> maybe_put_item_opt(:correlation_id, item, :correlation_id, "correlation_id")
+    |> maybe_put_item_opt(:idempotent, item, :idempotent, "idempotent")
   end
 
   defp transition_attrs(id, from_state, to_state, opts, default_now) do
@@ -1860,6 +1863,13 @@ defmodule Ferricstore.Flow do
       :ok
     else
       {:error, "ERR flow #{key} too large (max #{@max_ref_size} bytes)"}
+    end
+  end
+
+  defp optional_boolean(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      value when is_boolean(value) -> {:ok, value}
+      _ -> {:error, "ERR flow #{key} must be a boolean"}
     end
   end
 

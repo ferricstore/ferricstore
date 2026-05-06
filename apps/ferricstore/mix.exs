@@ -66,6 +66,9 @@ defmodule Ferricstore.MixProject do
         "native/ferricstore_wal_nif/.cargo",
         "native/ferricstore_wal_nif/src",
         "native/ferricstore_wal_nif/Cargo*",
+        "native/resp_parser_nif/.cargo",
+        "native/resp_parser_nif/src",
+        "native/resp_parser_nif/Cargo*",
         "checksum-*.exs",
         "mix.exs"
       ],

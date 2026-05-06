@@ -1,15 +1,14 @@
-defmodule FerricstoreServer.Resp.ParserNif do
+defmodule Ferricstore.Resp.ParserNif do
   @moduledoc """
   Rust NIF binding for RESP3 protocol parsing.
 
-  Parses raw RESP3 wire bytes into Elixir terms. This is required by the server;
-  there is no Elixir fallback parser.
+  Parses raw RESP3 wire bytes into Elixir terms. There is no Elixir fallback parser.
   """
 
   version = Mix.Project.config()[:version]
 
   use RustlerPrecompiled,
-    otp_app: :ferricstore_server,
+    otp_app: :ferricstore,
     crate: "resp_parser_nif",
     base_url: "https://github.com/yoavgeva/ferricstore/releases/download/v#{version}",
     version: version,

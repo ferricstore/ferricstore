@@ -261,6 +261,46 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id, type: "checkout", state: "queued")
   end
 
+  test "flow_create idempotent retry returns matching existing record and rejects conflicts" do
+    id = uid("flow-create-idempotent")
+
+    assert {:ok, created} =
+             FerricStore.flow_create(id,
+               type: "checkout",
+               state: "queued",
+               payload_ref: "payload:" <> id,
+               run_at_ms: 1_000,
+               now_ms: 10,
+               idempotent: true
+             )
+
+    assert {:ok, retried} =
+             FerricStore.flow_create(id,
+               type: "checkout",
+               state: "queued",
+               payload_ref: "payload:" <> id,
+               run_at_ms: 1_000,
+               now_ms: 20,
+               idempotent: true
+             )
+
+    assert retried.id == created.id
+    assert retried.version == created.version
+    assert retried.created_at_ms == created.created_at_ms
+
+    assert {:ok, history} = FerricStore.flow_history(id)
+    assert Enum.map(history, fn {_event_id, fields} -> fields["event"] end) == ["created"]
+
+    assert {:error, "ERR flow idempotency conflict"} =
+             FerricStore.flow_create(id,
+               type: "checkout",
+               state: "queued",
+               payload_ref: "different:" <> id,
+               run_at_ms: 1_000,
+               idempotent: true
+             )
+  end
+
   test "flow due index stays derived and does not persist per-flow zset members" do
     id = uid("flow-due-derived")
     run_at_ms = 1_234
