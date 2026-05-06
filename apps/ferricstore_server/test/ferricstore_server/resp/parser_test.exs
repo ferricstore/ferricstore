@@ -1804,6 +1804,8 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "iot",
                    "RUN_AT",
                    "1000",
+                   "IDEMPOTENT",
+                   "true",
                    "ITEMS",
                    "flow-1",
                    "device-a",
@@ -1816,7 +1818,7 @@ defmodule FerricstoreServer.Resp.ParserTest do
                   [
                     {"flow-1", [partition_key: "device-a", payload_ref: "payload-1"]},
                     {"flow-2", [partition_key: "device-b", payload_ref: "payload-2"]}
-                  ], [type: "iot", run_at_ms: 1000]}, ["device-a", "device-b"]},
+                  ], [type: "iot", run_at_ms: 1000, idempotent: true]}, ["device-a", "device-b"]},
                 {:command, "FLOW.TRANSITION_MANY",
                  [
                    "MIXED",
@@ -1842,7 +1844,7 @@ defmodule FerricstoreServer.Resp.ParserTest do
                   ], [run_at_ms: 2000]}, ["device-a", "device-b"]}
               ], ""} =
                Parser.parse_commands(
-                 "flow.create_many MIXED TYPE iot RUN_AT 1000 ITEMS flow-1 device-a payload-1 flow-2 device-b payload-2\r\n" <>
+                 "flow.create_many MIXED TYPE iot RUN_AT 1000 IDEMPOTENT true ITEMS flow-1 device-a payload-1 flow-2 device-b payload-2\r\n" <>
                    "flow.transition_many MIXED queued ready RUN_AT 2000 ITEMS flow-1 device-a 1 - flow-2 device-b 2 lease-2\r\n"
                )
     end

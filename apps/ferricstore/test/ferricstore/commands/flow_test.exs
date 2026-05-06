@@ -190,6 +190,36 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches idempotent Flow create_many retry through Rust AST" do
+    partition = uid("tenant")
+    type = uid("flow-command-bulk-idempotent")
+    id_a = uid("flow-command-bulk-a")
+    id_b = uid("flow-command-bulk-b")
+
+    args = [
+      partition,
+      "TYPE",
+      type,
+      "RUN_AT",
+      "1000",
+      "NOW",
+      "1000",
+      "IDEMPOTENT",
+      "true",
+      "ITEMS",
+      id_a,
+      "payload:" <> id_a,
+      id_b,
+      "payload:" <> id_b
+    ]
+
+    assert [%{"id" => ^id_a}, %{"id" => ^id_b}] =
+             Dispatcher.dispatch("FLOW.CREATE_MANY", args, MockStore.make())
+
+    assert [%{"id" => ^id_a}, %{"id" => ^id_b}] =
+             Dispatcher.dispatch("FLOW.CREATE_MANY", args, MockStore.make())
+  end
+
   test "dispatches mixed-partition Flow create_many through Rust AST" do
     type = uid("flow-command-mixed")
     partition_a = uid("device-a")

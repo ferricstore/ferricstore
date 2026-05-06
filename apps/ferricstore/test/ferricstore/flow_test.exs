@@ -543,6 +543,76 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, []} = FerricStore.flow_history(new_id, partition_key: partition)
   end
 
+  test "flow_create_many idempotent retry returns existing records without duplicate writes" do
+    partition = uid("tenant")
+    type = uid("bulk-idempotent")
+    existing_id = uid("bulk-existing")
+    new_id = uid("bulk-new")
+
+    assert {:ok, %{id: ^existing_id}} =
+             FerricStore.flow_create(existing_id,
+               type: type,
+               partition_key: partition,
+               payload_ref: "payload:" <> existing_id,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, records} =
+             FerricStore.flow_create_many(
+               partition,
+               [
+                 %{id: existing_id, payload_ref: "payload:" <> existing_id},
+                 %{id: new_id, payload_ref: "payload:" <> new_id}
+               ],
+               type: type,
+               run_at_ms: 1_000,
+               now_ms: 1_000,
+               idempotent: true
+             )
+
+    assert Enum.map(records, & &1.id) == [existing_id, new_id]
+
+    assert {:ok, existing_history} =
+             FerricStore.flow_history(existing_id, partition_key: partition)
+
+    assert Enum.map(existing_history, fn {_event_id, fields} -> fields["event"] end) == [
+             "created"
+           ]
+
+    assert {:ok, %{id: ^new_id}} = FerricStore.flow_get(new_id, partition_key: partition)
+  end
+
+  test "flow_create_many idempotency conflict rolls back same shard group" do
+    partition = uid("tenant")
+    type = uid("bulk-idempotency-conflict")
+    existing_id = uid("bulk-existing")
+    new_id = uid("bulk-new")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(existing_id,
+               type: type,
+               partition_key: partition,
+               payload_ref: "payload:old",
+               run_at_ms: 1_000
+             )
+
+    assert {:error, "ERR flow idempotency conflict"} =
+             FerricStore.flow_create_many(
+               partition,
+               [
+                 %{id: existing_id, payload_ref: "payload:new"},
+                 %{id: new_id, payload_ref: "payload:" <> new_id}
+               ],
+               type: type,
+               run_at_ms: 1_000,
+               idempotent: true
+             )
+
+    assert {:ok, nil} = FerricStore.flow_get(new_id, partition_key: partition)
+    assert {:ok, []} = FerricStore.flow_history(new_id, partition_key: partition)
+  end
+
   test "flow_create_many spans shards and rolls back failing shard group" do
     {same_a, same_b, other} = mixed_partition_keys()
     type = uid("bulk-mixed-create")

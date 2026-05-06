@@ -4325,8 +4325,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_flow_create_many(state, %{records: [_ | _] = attrs_list}) do
     with :ok <- flow_many_partitions_valid?(state, attrs_list),
          :ok <- flow_create_many_unique?(attrs_list),
-         {:ok, records} <- flow_create_many_prepare(state, attrs_list),
-         :ok <- flow_create_many_apply(state, records) do
+         {:ok, records, new_records} <- flow_create_many_prepare(state, attrs_list),
+         :ok <- flow_create_many_apply(state, new_records) do
       {:ok, records}
     end
   end
@@ -4445,7 +4445,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_create_many_prepare(state, attrs_list) do
-    Enum.reduce_while(attrs_list, {:ok, []}, fn %{id: id} = attrs, {:ok, acc} ->
+    Enum.reduce_while(attrs_list, {:ok, [], []}, fn %{id: id} = attrs, {:ok, acc, new_acc} ->
       partition_key = Map.get(attrs, :partition_key)
 
       case flow_read_record(state, id, partition_key) do
@@ -4453,16 +4453,19 @@ defmodule Ferricstore.Raft.StateMachine do
           record = flow_create_record(attrs)
 
           case flow_validate_record_keys(record) do
-            :ok -> {:cont, {:ok, [record | acc]}}
+            :ok -> {:cont, {:ok, [record | acc], [record | new_acc]}}
             {:error, _reason} = error -> {:halt, error}
           end
 
-        _existing ->
-          {:halt, {:error, "ERR flow already exists"}}
+        existing ->
+          case flow_create_duplicate_result(existing, attrs) do
+            {:ok, existing} -> {:cont, {:ok, [existing | acc], new_acc}}
+            {:error, _reason} = error -> {:halt, error}
+          end
       end
     end)
     |> case do
-      {:ok, records} -> {:ok, Enum.reverse(records)}
+      {:ok, records, new_records} -> {:ok, Enum.reverse(records), Enum.reverse(new_records)}
       {:error, _reason} = error -> error
     end
   end
