@@ -111,6 +111,15 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
     assert nil == ZSetIndex.member_rank(index, lookup, "zs", "a", false)
   end
 
+  test "bulk delete handles duplicate delete requests once", %{index: index, lookup: lookup} do
+    insert_members(index, lookup, "zs", [{"a", "1"}, {"b", "2"}])
+
+    assert :ok == ZSetIndex.delete_members(index, lookup, "zs", ["a", "a", "missing"])
+
+    assert 1 == ZSetIndex.count(index, lookup, "zs", :neg_inf, :inf)
+    assert [{"b", 2.0}] == ZSetIndex.rank_range(index, "zs", 0, 10, false)
+  end
+
   defp insert_members(index, lookup, redis_key, members) do
     Enum.each(members, fn {member, score} ->
       ZSetIndex.put_member(index, lookup, redis_key, member, score)

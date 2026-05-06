@@ -335,10 +335,9 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
   @spec delete_member(:ets.tid(), :ets.tid(), binary(), binary()) :: :ok
   def delete_member(index_table, lookup_table, redis_key, member) do
-    case :ets.lookup(lookup_table, {redis_key, member}) do
+    case :ets.take(lookup_table, {redis_key, member}) do
       [{{^redis_key, ^member}, score}] ->
         :ets.delete(index_table, {redis_key, @index_tag, score, member})
-        :ets.delete(lookup_table, {redis_key, member})
         increment_count(lookup_table, redis_key, -1)
 
       [] ->
@@ -350,10 +349,9 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
   def delete_members(index_table, lookup_table, redis_key, members) do
     deleted =
       Enum.reduce(members, 0, fn member, acc ->
-        case :ets.lookup(lookup_table, {redis_key, member}) do
+        case :ets.take(lookup_table, {redis_key, member}) do
           [{{^redis_key, ^member}, score}] ->
             :ets.delete(index_table, {redis_key, @index_tag, score, member})
-            :ets.delete(lookup_table, {redis_key, member})
             acc + 1
 
           [] ->
