@@ -18,6 +18,10 @@ defmodule Ferricstore.InstanceTest do
     use FerricStore, shard_count: 1
   end
 
+  defmodule EmbeddedFlow do
+    use FerricStore, shard_count: 1
+  end
+
   # Use the :default instance (created at app boot)
   # In future: test with a custom isolated instance
 
@@ -129,6 +133,69 @@ defmodule Ferricstore.InstanceTest do
       assert eventually(fn ->
                Ferricstore.Merge.Scheduler.status(custom_scheduler).file_count >= 2
              end)
+    end
+
+    test "custom instances expose the Flow embedded API" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_embedded_flow_#{System.unique_integer([:positive])}"
+        )
+
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        EmbeddedFlow.stop()
+        File.rm_rf(root)
+      end)
+
+      assert {:ok, _pid} = EmbeddedFlow.start_link(data_dir: root, shard_count: 1)
+
+      id = "embedded-flow-1"
+      type = "embedded-flow"
+      partition = "tenant-a"
+
+      assert {:ok, %{id: ^id, state: "queued"}} =
+               EmbeddedFlow.flow_create(id,
+                 type: type,
+                 run_at_ms: 1_000,
+                 partition_key: partition,
+                 parent_flow_id: "parent-1",
+                 root_flow_id: "root-1",
+                 correlation_id: "corr-1",
+                 now_ms: 1_000
+               )
+
+      assert {:ok, %{id: ^id}} = EmbeddedFlow.flow_get(id, partition_key: partition)
+      assert {:ok, [%{id: ^id}]} = EmbeddedFlow.flow_list(type, partition_key: partition)
+
+      assert {:ok, [%{id: ^id}]} =
+               EmbeddedFlow.flow_by_parent("parent-1", partition_key: partition)
+
+      assert {:ok, [%{id: ^id}]} = EmbeddedFlow.flow_by_root("root-1", partition_key: partition)
+
+      assert {:ok, [%{id: ^id}]} =
+               EmbeddedFlow.flow_by_correlation("corr-1", partition_key: partition)
+
+      assert {:ok, [claimed]} =
+               EmbeddedFlow.flow_claim_due(type,
+                 worker: "worker-1",
+                 partition_key: partition,
+                 now_ms: 1_000
+               )
+
+      assert {:ok, %{id: ^id, state: "completed"}} =
+               EmbeddedFlow.flow_complete(id, claimed.lease_token,
+                 fencing_token: claimed.fencing_token,
+                 partition_key: partition,
+                 now_ms: 2_000
+               )
+
+      assert {:ok, %{completed: 1, inflight: 0}} =
+               EmbeddedFlow.flow_info(type, partition_key: partition)
+
+      assert {:ok, history} = EmbeddedFlow.flow_history(id, partition_key: partition)
+      assert Enum.any?(history, fn {_event_id, fields} -> fields["event"] == "completed" end)
     end
   end
 

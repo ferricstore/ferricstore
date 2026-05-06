@@ -242,6 +242,15 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
     } do
       interval = 3
       shard_path = Ferricstore.DataDir.shard_data_path(dir, 0)
+      instance_name = :"hlc_release_cursor_#{System.unique_integer([:positive])}"
+      instance_ctx = FerricStore.Instance.build(instance_name, shard_count: 1, data_dir: dir)
+
+      :atomics.put(instance_ctx.replay_safe_index, 1, 3)
+      :atomics.put(instance_ctx.flow_lmdb_replay_safe_index, 1, 3)
+
+      on_exit({:hlc_release_cursor_instance, instance_name}, fn ->
+        FerricStore.Instance.cleanup(instance_name)
+      end)
 
       state =
         StateMachine.init(%{
@@ -251,7 +260,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
           active_file_id: 0,
           active_file_path: Path.join(shard_path, "00000.log"),
           ets: ets,
-          release_cursor_interval: interval
+          release_cursor_interval: interval,
+          instance_ctx: instance_ctx
         })
 
       # Apply 2 wrapped commands (below interval)
@@ -259,8 +269,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
         Enum.reduce(1..2, state, fn i, acc ->
           hlc_ts = HLC.now()
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
-          wrapped = {{:put, "rc_hlc_#{i}", "v#{i}", 0}, %{hlc_ts: hlc_ts}}
-          {new_state, {:applied_at, _, :ok}, _effects} = StateMachine.apply(meta, wrapped, acc)
+          wrapped = {{:getdel, "rc_hlc_#{i}"}, %{hlc_ts: hlc_ts}}
+          {new_state, {:applied_at, _, nil}, _effects} = StateMachine.apply(meta, wrapped, acc)
           new_state
         end)
 
@@ -269,9 +279,9 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       # The 3rd apply should emit release_cursor
       hlc_ts = HLC.now()
       meta = %{index: 3, term: 1, system_time: System.os_time(:millisecond)}
-      wrapped = {{:put, "rc_hlc_3", "v3", 0}, %{hlc_ts: hlc_ts}}
+      wrapped = {{:getdel, "rc_hlc_3"}, %{hlc_ts: hlc_ts}}
 
-      {new_state, {:applied_at, _, :ok}, effects} =
+      {new_state, {:applied_at, _, nil}, effects} =
         StateMachine.apply(meta, wrapped, state_before)
 
       assert new_state.applied_count == 3
