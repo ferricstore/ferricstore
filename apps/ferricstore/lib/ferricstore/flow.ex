@@ -1869,15 +1869,15 @@ defmodule Ferricstore.Flow do
   end
 
   defp create_many_attrs(items, opts, partition_key) do
+    base_opts = Keyword.delete(opts, :partition_key)
+
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, item_opts} <- create_many_item_opts(item),
            {:ok, item_partition_key} <- many_item_partition_key(partition_key, item_opts),
            {:ok, attrs} <-
              create_attrs(
                id,
-               opts
-               |> Keyword.merge(Keyword.delete(item_opts, :partition_key))
-               |> Keyword.put(:partition_key, item_partition_key)
+               merge_many_item_opts(base_opts, item_opts, item_partition_key)
              ) do
         {:cont, {:ok, [attrs | acc]}}
       else
@@ -1959,6 +1959,8 @@ defmodule Ferricstore.Flow do
   end
 
   defp transition_many_attrs(items, opts, partition_key, from_state, to_state) do
+    base_opts = Keyword.delete(opts, :partition_key)
+
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, item_opts} <- transition_many_item_opts(item),
            {:ok, item_partition_key} <- many_item_partition_key(partition_key, item_opts),
@@ -1967,9 +1969,7 @@ defmodule Ferricstore.Flow do
                id,
                from_state,
                to_state,
-               opts
-               |> Keyword.merge(Keyword.delete(item_opts, :partition_key))
-               |> Keyword.put(:partition_key, item_partition_key)
+               merge_many_item_opts(base_opts, item_opts, item_partition_key)
              ) do
         {:cont, {:ok, [attrs | acc]}}
       else
@@ -2034,6 +2034,16 @@ defmodule Ferricstore.Flow do
   end
 
   defp transition_many_item_opts(_item), do: {:error, "ERR flow id must be a non-empty string"}
+
+  defp merge_many_item_opts(base_opts, [], partition_key) do
+    Keyword.put(base_opts, :partition_key, partition_key)
+  end
+
+  defp merge_many_item_opts(base_opts, item_opts, partition_key) do
+    base_opts
+    |> Keyword.merge(Keyword.delete(item_opts, :partition_key))
+    |> Keyword.put(:partition_key, partition_key)
+  end
 
   defp transition_many_item_lease_token(item) do
     cond do

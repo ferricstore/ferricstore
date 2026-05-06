@@ -504,6 +504,32 @@ defmodule Ferricstore.FlowTest do
     assert claimed |> Enum.map(& &1.id) |> MapSet.new() == MapSet.new([id_a, id_b])
   end
 
+  test "flow_create_many lets item attrs override common attrs" do
+    partition = uid("tenant")
+    type = uid("bulk-create-override")
+    id_a = uid("bulk-override-a")
+    id_b = uid("bulk-override-b")
+
+    assert {:ok, [flow_a, flow_b]} =
+             FerricStore.flow_create_many(
+               partition,
+               [
+                 %{id: id_a},
+                 %{id: id_b, payload_ref: "payload:item", correlation_id: "corr:item"}
+               ],
+               type: type,
+               payload_ref: "payload:common",
+               correlation_id: "corr:common",
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert flow_a.payload_ref == "payload:common"
+    assert flow_a.correlation_id == "corr:common"
+    assert flow_b.payload_ref == "payload:item"
+    assert flow_b.correlation_id == "corr:item"
+  end
+
   test "flow_create_many rejects missing partition and rolls back duplicate batches" do
     partition = uid("tenant")
     type = uid("bulk-atomic")
