@@ -70,6 +70,17 @@ defmodule Ferricstore.CrossShardOp do
   def execute(keys_with_roles, execute_fn, opts \\ []) do
     caller_store = Keyword.get(opts, :store)
 
+    # Direct stores already know how to execute every operation locally. Check
+    # this before touching the default instance so embedded/test callers can use
+    # command handlers without starting the Raft-backed application.
+    if direct_store?(caller_store) do
+      execute_fn.(caller_store)
+    else
+      execute_with_instance(keys_with_roles, execute_fn, opts, caller_store)
+    end
+  end
+
+  defp execute_with_instance(keys_with_roles, execute_fn, opts, caller_store) do
     ctx =
       Keyword.get(opts, :instance) ||
         if match?(%FerricStore.Instance{}, caller_store) do
@@ -78,35 +89,33 @@ defmodule Ferricstore.CrossShardOp do
           FerricStore.Instance.get(:default)
         end
 
-    # If the caller provided a store that is NOT shard-local (no :shard_idx
-    # field) AND has actual store functions (e.g. :get, :put), it can handle
-    # all keys directly -- use it as-is. This covers mock stores in tests
-    # and pre-built routing stores. An empty map or nil means "no store
-    # provided -- let CrossShardOp build its own."
-    if is_map(caller_store) and not is_map_key(caller_store, :shard_idx) and
-         is_map_key(caller_store, :get) do
-      execute_fn.(caller_store)
+    keys = Enum.map(keys_with_roles, fn {key, _role} -> key end)
+    shard_map = group_keys_by_shard(ctx, keys_with_roles)
+
+    if map_size(shard_map) == 1 do
+      # Same-shard fast path: zero overhead.
+      # Use the caller's shard-local store if provided, otherwise build one.
+      execute_same_shard(ctx, shard_map, execute_fn, caller_store)
     else
-      keys = Enum.map(keys_with_roles, fn {key, _role} -> key end)
-      shard_map = group_keys_by_shard(ctx, keys_with_roles)
+      cond do
+        length(keys) > @max_cross_shard_keys ->
+          {:error, @too_many_keys_error}
 
-      if map_size(shard_map) == 1 do
-        # Same-shard fast path: zero overhead.
-        # Use the caller's shard-local store if provided, otherwise build one.
-        execute_same_shard(ctx, shard_map, execute_fn, caller_store)
-      else
-        cond do
-          length(keys) > @max_cross_shard_keys ->
-            {:error, @too_many_keys_error}
+        ctx.name != :default ->
+          execute_direct_cross_shard(ctx, shard_map, execute_fn)
 
-          ctx.name != :default ->
-            execute_direct_cross_shard(ctx, shard_map, execute_fn)
-
-          true ->
-            execute_cross_shard(ctx, keys_with_roles, shard_map, execute_fn, opts)
-        end
+        true ->
+          execute_cross_shard(ctx, keys_with_roles, shard_map, execute_fn, opts)
       end
     end
+  end
+
+  defp direct_store?(caller_store) do
+    # Fully-capable map stores (mock stores and pre-built routing stores) should
+    # bypass Raft context discovery. Shard-local stores still need instance
+    # routing for cross-shard operations.
+    is_map(caller_store) and not is_map_key(caller_store, :shard_idx) and
+      is_map_key(caller_store, :get)
   end
 
   # ---------------------------------------------------------------------------
@@ -164,24 +173,36 @@ defmodule Ferricstore.CrossShardOp do
         value_hashes = compute_value_hashes(ctx, keys_with_roles, per_shard_stores)
         full_intent = Map.put(intent_map, :value_hashes, value_hashes)
 
-        write_intent(coordinator_shard, owner_ref, full_intent)
-
         try do
-          # Execute phase: build a unified routing store that uses locked
-          # write variants with owner_ref, so writes pass through the lock
-          # check in the state machine.
-          unified_store = build_locked_routing_store(ctx, per_shard_stores, owner_ref)
+          case write_intent(coordinator_shard, owner_ref, full_intent) do
+            {:ok, :ok, _leader} ->
+              # Execute phase: build a unified routing store that uses locked
+              # write variants with owner_ref, so writes pass through the lock
+              # check in the state machine.
+              unified_store = build_locked_routing_store(ctx, per_shard_stores, owner_ref)
 
-          result = execute_fn.(unified_store)
+              result = execute_fn.(unified_store)
 
-          # Clean up: delete intent, unlock
-          delete_intent(coordinator_shard, owner_ref)
-          unlock_all(sorted_shards, lock_map, owner_ref)
+              # Clean up: delete intent, unlock
+              delete_intent(coordinator_shard, owner_ref)
+              unlock_all(sorted_shards, lock_map, owner_ref)
 
-          result
+              result
+
+            {:ok, {:error, reason}, _leader} ->
+              unlock_all(sorted_shards, lock_map, owner_ref)
+              cross_shard_intent_error(reason)
+
+            {:error, reason} ->
+              unlock_all(sorted_shards, lock_map, owner_ref)
+              cross_shard_intent_error(reason)
+
+            other ->
+              unlock_all(sorted_shards, lock_map, owner_ref)
+              cross_shard_intent_error(other)
+          end
         rescue
           e ->
-            # On crash: unlock and re-raise. Intent remains for resolver.
             unlock_all(sorted_shards, lock_map, owner_ref)
             reraise e, __STACKTRACE__
         end
@@ -343,6 +364,11 @@ defmodule Ferricstore.CrossShardOp do
   defp delete_intent(coordinator_shard, owner_ref) do
     shard_id = Cluster.shard_server_id(coordinator_shard)
     unwrap_ra_reply(CommandClock.process_command(shard_id, {:delete_intent, owner_ref}))
+  end
+
+  defp cross_shard_intent_error(reason) do
+    Logger.warning("CrossShardOp: intent write failed: #{inspect(reason)}")
+    {:error, "ERR cross-shard operation failed: intent write failed"}
   end
 
   # ---------------------------------------------------------------------------

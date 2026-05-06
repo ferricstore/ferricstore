@@ -570,26 +570,33 @@ defmodule Ferricstore.Commands.Strings do
 
   defp msetnx_args(args, store) do
     if even_length?(args) do
-      keys = extract_keys(args)
-
-      CrossShardOp.execute(
-        Enum.map(keys, &{&1, :write}),
-        fn unified_store ->
-          if msetnx_any_exists?(args, unified_store) do
-            0
-          else
-            case mset_exec(args, unified_store) do
-              :ok -> 1
-              {:error, _} = err -> err
-            end
-          end
-        end,
-        intent: %{command: :msetnx, keys: %{targets: keys}},
-        store: store
-      )
+      case mset_validate(args) do
+        :ok -> msetnx_validated_args(args, store)
+        {:error, _} = err -> err
+      end
     else
       {:error, "ERR wrong number of arguments for 'msetnx' command"}
     end
+  end
+
+  defp msetnx_validated_args(args, store) do
+    keys = extract_keys(args)
+
+    CrossShardOp.execute(
+      Enum.map(keys, &{&1, :write}),
+      fn unified_store ->
+        if msetnx_any_exists?(args, unified_store) do
+          0
+        else
+          case mset_exec(args, unified_store) do
+            :ok -> 1
+            {:error, _} = err -> err
+          end
+        end
+      end,
+      intent: %{command: :msetnx, keys: %{targets: keys}},
+      store: store
+    )
   end
 
   # ---------------------------------------------------------------------------
@@ -991,14 +998,145 @@ defmodule Ferricstore.Commands.Strings do
 
   # Fallback path preserves per-key compound cleanup for stores that cannot
   # provide string-batch replacement semantics themselves.
-  defp mset_exec_sequential([], _store), do: :ok
+  defp mset_exec_sequential(args, store) do
+    backups =
+      args
+      |> backup_mset_originals(store)
+      |> Map.new(fn {key, _plain, _compound} = backup -> {key, backup} end)
 
-  defp mset_exec_sequential([k, v | rest], store) do
-    case replace_string_key(k, v, 0, store) do
-      :ok -> mset_exec_sequential(rest, store)
-      {:error, _} = err -> err
+    case mset_exec_sequential_replace(args, store, []) do
+      :ok ->
+        :ok
+
+      {{:error, _} = err, replaced_keys} ->
+        case restore_mset_originals(replaced_keys, backups, store) do
+          :ok -> err
+          {:error, _} = rollback_error -> {:error, {:mset_rollback_failed, err, rollback_error}}
+        end
     end
   end
+
+  defp mset_exec_sequential_replace([], _store, _replaced_keys), do: :ok
+
+  defp mset_exec_sequential_replace([k, v | rest], store, replaced_keys) do
+    case replace_string_key(k, v, 0, store) do
+      :ok -> mset_exec_sequential_replace(rest, store, [k | replaced_keys])
+      {:error, _} = err -> {err, replaced_keys}
+    end
+  end
+
+  defp backup_mset_originals(args, store) do
+    args
+    |> extract_keys()
+    |> Enum.uniq()
+    |> Enum.map(&backup_string_key(&1, store))
+  end
+
+  defp backup_string_key(key, store) do
+    {key, Ops.get_meta(store, key), backup_compound_data_structure(key, store)}
+  end
+
+  defp backup_compound_data_structure(key, store) do
+    if Ops.has_compound?(store) do
+      type_key = CompoundKey.type_key(key)
+
+      case Ops.compound_get_meta(store, key, type_key) do
+        nil ->
+          nil
+
+        {type, type_expire_at_ms} ->
+          %{
+            type: {type_key, type, type_expire_at_ms},
+            entries: backup_compound_entries(key, type, store)
+          }
+      end
+    end
+  end
+
+  defp backup_compound_entries(key, type, store) do
+    key
+    |> compound_prefix_for_type(type)
+    |> case do
+      nil ->
+        []
+
+      prefix ->
+        prefix
+        |> scan_compound_entries(key, store)
+        |> maybe_add_list_meta_entry(key, type, store)
+    end
+  end
+
+  defp scan_compound_entries(prefix, key, store) do
+    store
+    |> Ops.compound_scan(key, prefix)
+    |> Enum.flat_map(fn {field, _value} ->
+      compound_key = prefix <> field
+
+      case Ops.compound_get_meta(store, key, compound_key) do
+        nil -> []
+        {value, expire_at_ms} -> [{compound_key, value, expire_at_ms}]
+      end
+    end)
+  end
+
+  defp maybe_add_list_meta_entry(entries, key, "list", store) do
+    meta_key = CompoundKey.list_meta_key(key)
+
+    case Ops.compound_get_meta(store, key, meta_key) do
+      nil -> entries
+      {value, expire_at_ms} -> [{meta_key, value, expire_at_ms} | entries]
+    end
+  end
+
+  defp maybe_add_list_meta_entry(entries, _key, _type, _store), do: entries
+
+  defp restore_mset_originals(replaced_keys, backups, store) do
+    replaced_keys
+    |> Enum.uniq()
+    |> Enum.reduce_while(:ok, fn key, :ok ->
+      backup = Map.fetch!(backups, key)
+
+      case restore_string_key_backup(backup, store) do
+        :ok -> {:cont, :ok}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+  end
+
+  defp restore_string_key_backup({key, plain_meta, compound_backup}, store) do
+    with :ok <- clear_compound_data_structure(key, store),
+         :ok <- restore_plain_string_backup(key, plain_meta, store),
+         :ok <- restore_compound_backup(key, compound_backup, store) do
+      :ok
+    end
+  end
+
+  defp restore_plain_string_backup(key, nil, store), do: Ops.delete(store, key)
+
+  defp restore_plain_string_backup(key, {value, expire_at_ms}, store) do
+    Ops.put(store, key, value, expire_at_ms)
+  end
+
+  defp restore_compound_backup(_key, nil, _store), do: :ok
+
+  defp restore_compound_backup(
+         key,
+         %{type: {type_key, type, type_expire_at_ms}, entries: entries},
+         store
+       ) do
+    with :ok <- Ops.compound_put(store, key, type_key, type, type_expire_at_ms),
+         :ok <- Ops.compound_batch_put(store, key, entries) do
+      :ok
+    end
+  end
+
+  defp compound_prefix_for_type(key, "hash"), do: CompoundKey.hash_prefix(key)
+  defp compound_prefix_for_type(key, "list"), do: CompoundKey.list_prefix(key)
+  defp compound_prefix_for_type(key, "set"), do: CompoundKey.set_prefix(key)
+  defp compound_prefix_for_type(key, "zset"), do: CompoundKey.zset_prefix(key)
+  defp compound_prefix_for_type(key, "stream"), do: CompoundKey.stream_prefix(key)
+  defp compound_prefix_for_type(_key, _type), do: nil
 
   # Checks if any key in a flat [k, v, k, v, ...] list already exists.
   defp msetnx_any_exists?([], _store), do: false
@@ -1101,6 +1239,17 @@ defmodule Ferricstore.Commands.Strings do
 
   defp clear_compound_prefix(key, "zset", store),
     do: Ops.compound_delete_prefix(store, key, CompoundKey.zset_prefix(key))
+
+  defp clear_compound_prefix(key, "stream", store) do
+    case Ops.compound_delete_prefix(store, key, CompoundKey.stream_prefix(key)) do
+      :ok ->
+        cleanup_stream_metadata(key)
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
 
   defp clear_compound_prefix(_key, _type, _store), do: :ok
 

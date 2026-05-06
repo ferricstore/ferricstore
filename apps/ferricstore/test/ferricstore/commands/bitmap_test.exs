@@ -953,6 +953,20 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert {:error, :disk_full} == Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
     end
 
+    test "preserves compound destination when result write fails" do
+      base = MockStore.make(%{"a" => {<<0xF0>>, 0}, "b" => {<<0x0F>>, 0}})
+      assert 1 == Hash.handle("HSET", ["dest", "field", "old"], base)
+
+      store =
+        Map.put(base, :put, fn
+          "dest", <<0xFF>>, 0 -> {:error, :disk_full}
+          key, value, expire_at_ms -> base.put.(key, value, expire_at_ms)
+        end)
+
+      assert {:error, :disk_full} == Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
+      assert "old" == Hash.handle("HGET", ["dest", "field"], base)
+    end
+
     test "returns compound cleanup errors before overwriting destination" do
       type_key = CompoundKey.type_key("dest")
 

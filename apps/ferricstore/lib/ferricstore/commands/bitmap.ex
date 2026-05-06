@@ -515,10 +515,27 @@ defmodule Ferricstore.Commands.Bitmap do
   end
 
   defp write_bitop_result(store, destkey, result) do
-    with :ok <- clear_compound_data_structure(destkey, store),
-         :ok <- Ops.put(store, destkey, result, 0) do
-      byte_size(result)
+    case bitop_compound_destination_type(destkey, store) do
+      nil ->
+        case Ops.put(store, destkey, result, 0) do
+          :ok -> byte_size(result)
+          {:error, _} = error -> error
+        end
+
+      type ->
+        backup = compound_destination_backup(destkey, type, store)
+
+        with :ok <- clear_compound_data_structure(destkey, store) do
+          case Ops.put(store, destkey, result, 0) do
+            :ok -> byte_size(result)
+            {:error, _} = error -> restore_bitop_destination(store, destkey, backup, error)
+          end
+        end
     end
+  end
+
+  defp bitop_compound_destination_type(key, store) do
+    if Ops.has_compound?(store), do: Ops.compound_get(store, key, CompoundKey.type_key(key))
   end
 
   defp bitcount_range_empty_without_value?(_store, _key, _mode, start_idx, end_idx)
@@ -934,6 +951,91 @@ defmodule Ferricstore.Commands.Bitmap do
       :ok
     end
   end
+
+  defp compound_destination_backup(key, type, store) do
+    if compound_backup_supported?(store) do
+      {:compound,
+       compound_backup_meta_entries(key, type, store) ++
+         compound_backup_member_entries(key, type, store)}
+    else
+      :unrestorable
+    end
+  end
+
+  defp compound_backup_supported?(%FerricStore.Instance{}), do: true
+  defp compound_backup_supported?(%Ferricstore.Store.LocalTxStore{}), do: true
+
+  defp compound_backup_supported?(store) when is_map(store) do
+    is_function(Map.get(store, :compound_scan), 2)
+  end
+
+  defp restore_bitop_destination(_store, _key, :unrestorable, original_error), do: original_error
+
+  defp restore_bitop_destination(store, key, {:compound, entries}, original_error) do
+    case Ops.delete(store, key) do
+      :ok ->
+        case Ops.compound_batch_put(store, key, entries) do
+          :ok -> original_error
+          {:error, _} = restore_error -> restore_error
+        end
+
+      {:error, _} = restore_error ->
+        restore_error
+    end
+  end
+
+  defp compound_backup_meta_entries(key, type, store) do
+    type_key = CompoundKey.type_key(key)
+
+    type_entries =
+      case Ops.compound_get_meta(store, key, type_key) do
+        nil -> [{type_key, type, 0}]
+        {value, expire_at_ms} -> [{type_key, value, expire_at_ms}]
+      end
+
+    list_meta_entries =
+      if type == "list" do
+        list_meta_key = CompoundKey.list_meta_key(key)
+
+        case Ops.compound_get_meta(store, key, list_meta_key) do
+          nil -> []
+          {value, expire_at_ms} -> [{list_meta_key, value, expire_at_ms}]
+        end
+      else
+        []
+      end
+
+    type_entries ++ list_meta_entries
+  end
+
+  defp compound_backup_member_entries(key, type, store) do
+    prefix = compound_backup_prefix(key, type)
+
+    compound_keys =
+      store
+      |> Ops.compound_scan(key, prefix)
+      |> Enum.map(fn {member_or_key, _value} ->
+        if String.starts_with?(member_or_key, prefix) do
+          member_or_key
+        else
+          prefix <> member_or_key
+        end
+      end)
+
+    store
+    |> Ops.compound_batch_get_meta(key, compound_keys)
+    |> Enum.zip(compound_keys)
+    |> Enum.flat_map(fn
+      {nil, _compound_key} -> []
+      {{value, expire_at_ms}, compound_key} -> [{compound_key, value, expire_at_ms}]
+    end)
+  end
+
+  defp compound_backup_prefix(key, "hash"), do: CompoundKey.hash_prefix(key)
+  defp compound_backup_prefix(key, "list"), do: CompoundKey.list_prefix(key)
+  defp compound_backup_prefix(key, "set"), do: CompoundKey.set_prefix(key)
+  defp compound_backup_prefix(key, "zset"), do: CompoundKey.zset_prefix(key)
+  defp compound_backup_prefix(key, "stream"), do: CompoundKey.stream_prefix(key)
 
   # --- Binary manipulation --------------------------------------------------
 

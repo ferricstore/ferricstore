@@ -1023,6 +1023,49 @@ defmodule Ferricstore.Commands.GeoTest do
                )
     end
 
+    test "preserves existing destination when replacement member write fails" do
+      base =
+        store_with_geo("src", [
+          {@palermo_lng, @palermo_lat, "Palermo"},
+          {@catania_lng, @catania_lat, "Catania"}
+        ])
+
+      assert 1 == Geo.handle("GEOADD", ["dst", "12.0", "42.0", "Old"], base)
+
+      store =
+        Map.put(base, :compound_batch_put, fn
+          "dst", entries ->
+            if Enum.any?(entries, fn {compound_key, _value, _expire_at_ms} ->
+                 compound_key == CompoundKey.zset_member("dst", "Palermo")
+               end) do
+              {:error, :disk_full}
+            else
+              base.compound_batch_put.("dst", entries)
+            end
+
+          key, entries ->
+            base.compound_batch_put.(key, entries)
+        end)
+
+      assert {:error, :disk_full} ==
+               Geo.handle(
+                 "GEOSEARCHSTORE",
+                 [
+                   "dst",
+                   "src",
+                   "FROMLONLAT",
+                   "13.361389",
+                   "38.115556",
+                   "BYRADIUS",
+                   "200",
+                   "KM"
+                 ],
+                 store
+               )
+
+      assert ["Old"] == SortedSet.handle("ZRANGE", ["dst", "0", "-1"], base)
+    end
+
     test "returns destination cleanup errors when no matches" do
       base =
         store_with_geo("src", [

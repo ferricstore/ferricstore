@@ -444,6 +444,27 @@ defmodule Ferricstore.Commands.StringsTest do
       assert "value" == Hash.handle("HGET", ["k1", "field"], base)
     end
 
+    test "MSET preserves earlier compound keys when a later replacement fails" do
+      base = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["k1", "field", "old1"], base)
+      assert 1 == Hash.handle("HSET", ["k2", "field", "old2"], base)
+
+      store =
+        base
+        |> Map.put(:batch_put, fn kv_pairs ->
+          flunk("MSET must not use blind batch_put for compound cleanup: #{inspect(kv_pairs)}")
+        end)
+        |> Map.put(:compound_delete_prefix, fn
+          "k2", _prefix -> {:error, :disk_full}
+          key, prefix -> base.compound_delete_prefix.(key, prefix)
+        end)
+
+      assert {:error, :disk_full} == Strings.handle("MSET", ["k1", "v1", "k2", "v2"], store)
+      assert nil == base.get.("k1")
+      assert "old1" == Hash.handle("HGET", ["k1", "field"], base)
+      assert "old2" == Hash.handle("HGET", ["k2", "field"], base)
+    end
+
     test "MSET with single pair stores the pair" do
       store = MockStore.make()
       assert :ok = Strings.handle("MSET", ["k", "v"], store)
@@ -687,6 +708,26 @@ defmodule Ferricstore.Commands.StringsTest do
       store = MockStore.make()
       assert {:error, msg} = Strings.handle("MSETNX", ["k"], store)
       assert msg =~ "wrong number of arguments"
+    end
+
+    test "MSETNX rejects empty keys before writing" do
+      store = MockStore.make()
+
+      assert {:error, "ERR key too large or empty"} =
+               Strings.handle("MSETNX", ["", "v", "k", "v2"], store)
+
+      assert nil == store.get.("")
+      assert nil == store.get.("k")
+    end
+
+    test "MSETNX rejects oversized keys before writing" do
+      store = MockStore.make()
+      oversized_key = String.duplicate("k", 65_536)
+
+      assert {:error, "ERR key too large or empty"} =
+               Strings.handle("MSETNX", [oversized_key, "v"], store)
+
+      assert nil == store.get.(oversized_key)
     end
   end
 

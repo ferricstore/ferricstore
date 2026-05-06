@@ -464,11 +464,26 @@ defmodule Ferricstore.Commands.SetTest do
   end
 
   describe "set STORE commands" do
+    test "STORE commands remove old compound destination members from other types" do
+      store = MockStore.make()
+
+      Hash.handle("HSET", ["dst", "old", "hash-value"], store)
+      Set.handle("SADD", ["src", "set-value"], store)
+
+      assert 1 == Set.handle("SUNIONSTORE", ["dst", "src"], store)
+      assert 1 == Set.handle("SREM", ["dst", "set-value"], store)
+
+      Hash.handle("HSET", ["dst", "new", "hash-value"], store)
+      assert nil == Hash.handle("HGET", ["dst", "old"], store)
+      assert "hash-value" == Hash.handle("HGET", ["dst", "new"], store)
+    end
+
     test "SUNIONSTORE writes destination members as one compound batch" do
       parent = self()
       s1_type = CompoundKey.type_key("s1")
       s2_type = CompoundKey.type_key("s2")
       dst_type = CompoundKey.type_key("dst")
+      dst_list_meta = CompoundKey.list_meta_key("dst")
 
       store = %{
         get: fn _key -> nil end,
@@ -489,9 +504,13 @@ defmodule Ferricstore.Commands.SetTest do
           send(parent, :delete_dst_prefix)
           :ok
         end,
-        compound_delete: fn "dst", ^dst_type ->
-          send(parent, :delete_dst_type)
-          :ok
+        compound_delete: fn
+          "dst", ^dst_list_meta ->
+            :ok
+
+          "dst", ^dst_type ->
+            send(parent, :delete_dst_type)
+            :ok
         end,
         compound_put: fn
           "dst", ^dst_type, "set", 0 ->
@@ -534,6 +553,7 @@ defmodule Ferricstore.Commands.SetTest do
         compound_get: fn
           "s1", ^s1_type -> "set"
           "s2", ^s2_type -> "set"
+          "dst", _compound_key -> nil
         end,
         compound_scan: fn
           "s1", _prefix -> [{"a", "1"}]
@@ -561,6 +581,7 @@ defmodule Ferricstore.Commands.SetTest do
       s1_type = CompoundKey.type_key("s1")
       s2_type = CompoundKey.type_key("s2")
       dst_type = CompoundKey.type_key("dst")
+      dst_list_meta = CompoundKey.list_meta_key("dst")
 
       store = %{
         get: fn _key -> nil end,
@@ -575,14 +596,18 @@ defmodule Ferricstore.Commands.SetTest do
           "s2", _prefix -> [{"b", "1"}]
         end,
         compound_delete_prefix: fn "dst", _prefix -> :ok end,
-        compound_delete: fn "dst", ^dst_type ->
-          if Process.get(:dst_type_written?) do
-            send(parent, :type_rolled_back)
-          else
-            send(parent, :type_cleared)
-          end
+        compound_delete: fn
+          "dst", ^dst_list_meta ->
+            :ok
 
-          :ok
+          "dst", ^dst_type ->
+            if Process.get(:dst_type_written?) do
+              send(parent, :type_rolled_back)
+            else
+              send(parent, :type_cleared)
+            end
+
+            :ok
         end,
         compound_put: fn "dst", ^dst_type, "set", 0 ->
           Process.put(:dst_type_written?, true)
@@ -598,6 +623,30 @@ defmodule Ferricstore.Commands.SetTest do
       assert_received :type_cleared
       assert_received :type_written
       assert_received :type_rolled_back
+    end
+
+    test "SUNIONSTORE preserves existing destination when member batch write fails" do
+      base = MockStore.make()
+      assert 1 == Set.handle("SADD", ["src", "new"], base)
+      assert 1 == Set.handle("SADD", ["dst", "old"], base)
+
+      store =
+        Map.put(base, :compound_batch_put, fn
+          "dst", entries ->
+            if Enum.any?(entries, fn {compound_key, _value, _expire_at_ms} ->
+                 compound_key == CompoundKey.set_member("dst", "new")
+               end) do
+              {:error, :disk_full}
+            else
+              base.compound_batch_put.("dst", entries)
+            end
+
+          key, entries ->
+            base.compound_batch_put.(key, entries)
+        end)
+
+      assert {:error, :disk_full} == Set.handle("SUNIONSTORE", ["dst", "src"], store)
+      assert ["old"] == Set.handle("SMEMBERS", ["dst"], base)
     end
   end
 
@@ -936,6 +985,15 @@ defmodule Ferricstore.Commands.SetTest do
       Set.handle("SADD", ["src", "a"], store)
       Set.handle("SADD", ["dst", "x"], store)
       assert 0 == Set.handle("SMOVE", ["src", "dst", "missing"], store)
+    end
+
+    test "SMOVE missing source member ignores wrong-type destination" do
+      store = MockStore.make()
+      Set.handle("SADD", ["src", "a"], store)
+      Hash.handle("HSET", ["dst", "field", "value"], store)
+
+      assert 0 == Set.handle("SMOVE", ["src", "dst", "missing"], store)
+      assert "value" == Hash.handle("HGET", ["dst", "field"], store)
     end
 
     test "SMOVE to nonexistent destination creates it" do

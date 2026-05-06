@@ -390,6 +390,29 @@ defmodule Ferricstore.Commands.GenericTest do
       assert "v2" == base.get.("dst")
     end
 
+    test "COPY with REPLACE preserves compound destination when compound write fails" do
+      base = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["src", "field", "new"], base)
+      assert 1 == Hash.handle("HSET", ["dst", "field", "old"], base)
+
+      store =
+        Map.put(base, :compound_batch_put, fn
+          "dst", entries ->
+            if Enum.any?(entries, fn {_compound_key, value, _expire_at_ms} -> value == "new" end) do
+              {:error, :disk_full}
+            else
+              base.compound_batch_put.("dst", entries)
+            end
+
+          key, entries ->
+            base.compound_batch_put.(key, entries)
+        end)
+
+      assert {:error, :disk_full} == Generic.handle("COPY", ["src", "dst", "REPLACE"], store)
+      assert "new" == Hash.handle("HGET", ["src", "field"], base)
+      assert "old" == Hash.handle("HGET", ["dst", "field"], base)
+    end
+
     test "COPY with REPLACE overwrites plain destination without loading destination value" do
       {:ok, deleted} = Agent.start_link(fn -> false end)
       {:ok, put_value} = Agent.start_link(fn -> nil end)
@@ -428,15 +451,15 @@ defmodule Ferricstore.Commands.GenericTest do
       assert "v1" == store.get.("dst")
     end
 
-    test "COPY errors when source doesn't exist" do
+    test "COPY returns 0 when source doesn't exist" do
       store = MockStore.make()
-      assert {:error, "ERR no such key"} = Generic.handle("COPY", ["missing", "dst"], store)
+      assert 0 == Generic.handle("COPY", ["missing", "dst"], store)
     end
 
     test "COPY treats a fully expired compound source as missing before TYPE cleanup" do
       store = stale_hash_store("hash")
 
-      assert {:error, "ERR no such key"} = Generic.handle("COPY", ["hash", "dst"], store)
+      assert 0 == Generic.handle("COPY", ["hash", "dst"], store)
       assert nil == store.compound_get.("dst", CompoundKey.type_key("dst"))
     end
 
@@ -943,10 +966,10 @@ defmodule Ferricstore.Commands.GenericTest do
       assert {:error, "ERR no such key"} = Generic.handle("RENAME", ["old", "new"], store)
     end
 
-    test "COPY expired source returns error" do
+    test "COPY expired source returns 0" do
       past = System.os_time(:millisecond) - 1000
       store = MockStore.make(%{"src" => {"v", past}})
-      assert {:error, "ERR no such key"} = Generic.handle("COPY", ["src", "dst"], store)
+      assert 0 == Generic.handle("COPY", ["src", "dst"], store)
     end
   end
 

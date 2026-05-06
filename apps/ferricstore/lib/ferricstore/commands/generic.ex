@@ -503,7 +503,7 @@ defmodule Ferricstore.Commands.Generic do
   defp do_copy(source, destination, replace?, store) do
     case key_meta(store, source) do
       nil ->
-        {:error, "ERR no such key"}
+        0
 
       _expire_at_ms ->
         if not replace? and key_exists?(store, destination) do
@@ -511,7 +511,7 @@ defmodule Ferricstore.Commands.Generic do
         else
           case key_entry(store, source) do
             nil ->
-              {:error, "ERR no such key"}
+              0
 
             entry ->
               if source != destination do
@@ -561,40 +561,52 @@ defmodule Ferricstore.Commands.Generic do
   defp rename_entry(source, destination, _entry, _store) when source == destination, do: :ok
 
   defp rename_entry(source, destination, {:plain, value, expire_at_ms}, store) do
-    with :ok <- clear_compound_destination_if_present(destination, store),
-         :ok <- Ops.put(store, destination, value, expire_at_ms),
-         :ok <- delete_key_result(source, store) do
-      :ok
-    end
+    replace_entry_preserving_destination(
+      source,
+      destination,
+      {:plain, value, expire_at_ms},
+      store,
+      fn -> delete_key_result(source, store) end
+    )
   end
 
   defp rename_entry(source, destination, entry, store) do
-    with :ok <- delete_key_result(destination, store),
-         :ok <- copy_entry(source, destination, entry, store),
-         :ok <- delete_key_result(source, store) do
-      :ok
-    end
+    replace_entry_preserving_destination(source, destination, entry, store, fn ->
+      delete_key_result(source, store)
+    end)
   end
 
   defp copy_entry_for_copy(_source, destination, {:plain, value, expire_at_ms}, true, store) do
-    with :ok <- clear_compound_destination_if_present(destination, store),
-         :ok <- Ops.put(store, destination, value, expire_at_ms) do
-      1
+    result =
+      if compound_destination_exists?(destination, store) do
+        replace_entry_preserving_destination(
+          destination,
+          destination,
+          {:plain, value, expire_at_ms},
+          store,
+          fn -> :ok end
+        )
+      else
+        Ops.put(store, destination, value, expire_at_ms)
+      end
+
+    case result do
+      :ok -> 1
+      {:error, _} = error -> error
     end
   end
 
-  defp copy_entry_for_copy(source, destination, entry, _replace?, store) do
-    with :ok <- delete_key_result(destination, store),
-         :ok <- copy_entry(source, destination, entry, store) do
-      1
+  defp copy_entry_for_copy(source, destination, entry, true, store) do
+    case replace_entry_preserving_destination(source, destination, entry, store, fn -> :ok end) do
+      :ok -> 1
+      {:error, _} = error -> error
     end
   end
 
-  defp clear_compound_destination_if_present(destination, store) do
-    if compound_destination_exists?(destination, store) do
-      delete_key_result(destination, store)
-    else
-      :ok
+  defp copy_entry_for_copy(source, destination, entry, false, store) do
+    case copy_entry(source, destination, entry, store) do
+      :ok -> 1
+      {:error, _} = error -> error
     end
   end
 
@@ -611,6 +623,96 @@ defmodule Ferricstore.Commands.Generic do
   defp copy_entry(source, destination, {:compound, type, _expire_at_ms}, store) do
     entries = compound_copy_entries(source, destination, type, store)
     Ops.compound_batch_put(store, destination, entries)
+  end
+
+  defp replace_entry_preserving_destination(source, destination, entry, store, after_write_fun) do
+    backup = key_backup(store, destination)
+
+    case write_replacement(source, destination, entry, backup, store) do
+      :ok ->
+        case after_write_fun.() do
+          :ok ->
+            :ok
+
+          {:error, _} = error ->
+            restore_backup_or_error(destination, backup, store, error)
+        end
+
+      {:error, _} = error ->
+        restore_backup_or_error(destination, backup, store, error)
+
+      {{:error, _} = error, :no_restore} ->
+        error
+    end
+  end
+
+  defp write_replacement(_source, destination, {:plain, value, expire_at_ms}, backup, store) do
+    case backup do
+      {:compound, _entries} ->
+        with :ok <- delete_key_result(destination, store) do
+          Ops.put(store, destination, value, expire_at_ms)
+        end
+
+      _missing_or_plain ->
+        case Ops.put(store, destination, value, expire_at_ms) do
+          :ok -> :ok
+          {:error, _} = error -> {error, :no_restore}
+        end
+    end
+  end
+
+  defp write_replacement(
+         source,
+         destination,
+         {:compound, _type, _expire_at_ms} = entry,
+         backup,
+         store
+       ) do
+    case backup do
+      :missing ->
+        copy_entry(source, destination, entry, store)
+
+      _existing ->
+        with :ok <- delete_key_result(destination, store) do
+          copy_entry(source, destination, entry, store)
+        end
+    end
+  end
+
+  defp key_backup(store, key) do
+    case key_entry(store, key) do
+      nil ->
+        :missing
+
+      {:plain, value, expire_at_ms} ->
+        {:plain, value, expire_at_ms}
+
+      {:compound, type, _expire_at_ms} ->
+        {:compound, compound_copy_entries(key, key, type, store)}
+    end
+  end
+
+  defp restore_backup_or_error(destination, backup, store, original_error) do
+    case restore_key_backup(destination, backup, store) do
+      :ok -> original_error
+      {:error, _} = restore_error -> restore_error
+    end
+  end
+
+  defp restore_key_backup(destination, :missing, store) do
+    delete_key_result(destination, store)
+  end
+
+  defp restore_key_backup(destination, {:plain, value, expire_at_ms}, store) do
+    with :ok <- delete_key_result(destination, store) do
+      Ops.put(store, destination, value, expire_at_ms)
+    end
+  end
+
+  defp restore_key_backup(destination, {:compound, entries}, store) do
+    with :ok <- delete_key_result(destination, store) do
+      Ops.compound_batch_put(store, destination, entries)
+    end
   end
 
   defp delete_key(key, store) do

@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.StreamTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Commands.Stream
+  alias Ferricstore.Commands.{Stream, Strings}
   alias Ferricstore.Test.MockStore
 
   # Each test gets a unique stream key to avoid interference.
@@ -37,6 +37,19 @@ defmodule Ferricstore.Commands.StreamTest do
       id = Stream.handle("XADD", [key, "*", "field1", "val1"], store)
       assert is_binary(id)
       assert id =~ ~r/^\d+-\d+$/
+    end
+
+    test "SET overwrites a stream and removes stale stream entries" do
+      store = MockStore.make()
+      key = ustream()
+
+      id = Stream.handle("XADD", [key, "1-0", "field", "value"], store)
+      assert [[^id, "field", "value"]] = Stream.handle("XRANGE", [key, "-", "+"], store)
+
+      assert :ok == Strings.handle("SET", [key, "string"], store)
+      assert "string" == Strings.handle("GET", [key], store)
+      assert {:error, "WRONGTYPE" <> _} = Stream.handle("XRANGE", [key, "-", "+"], store)
+      assert [] == store.compound_scan.(key, "X:" <> key <> <<0>>)
     end
 
     test "XADD with multiple field-value pairs" do

@@ -474,8 +474,50 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp replace_zset(store, key, zset) do
-    with :ok <- delete_key_data(store, key) do
-      write_zset(store, key, zset)
+    backup = zset_destination_backup(store, key)
+
+    case delete_key_data(store, key) do
+      :ok ->
+        case write_zset(store, key, zset) do
+          :ok -> :ok
+          {:error, _} = err -> restore_zset_destination(store, key, backup, err)
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp zset_destination_backup(store, key) do
+    case TypeRegistry.get_type(key, store) do
+      "zset" ->
+        case read_zset(store, key) do
+          {:ok, zset} -> {:zset, zset}
+          {:error, _} -> :missing
+        end
+
+      _other ->
+        :missing
+    end
+  end
+
+  defp restore_zset_destination(store, key, :missing, original_error) do
+    case delete_key_data(store, key) do
+      :ok -> original_error
+      {:error, _} = restore_error -> restore_error
+    end
+  end
+
+  defp restore_zset_destination(store, key, {:zset, zset}, original_error) do
+    case delete_key_data(store, key) do
+      :ok ->
+        case write_zset(store, key, zset) do
+          :ok -> original_error
+          {:error, _} = restore_error -> restore_error
+        end
+
+      {:error, _} = restore_error ->
+        restore_error
     end
   end
 

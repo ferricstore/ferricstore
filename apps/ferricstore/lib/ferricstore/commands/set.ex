@@ -837,8 +837,7 @@ defmodule Ferricstore.Commands.Set do
 
   # Core SMOVE logic, extracted for use inside CrossShardOp.execute.
   defp do_smove(source, destination, member, store) do
-    with :ok <- TypeRegistry.check_type(source, :set, store),
-         :ok <- TypeRegistry.check_type(destination, :set, store) do
+    with :ok <- TypeRegistry.check_type(source, :set, store) do
       compound_key = CompoundKey.set_member(source, member)
 
       cond do
@@ -849,34 +848,36 @@ defmodule Ferricstore.Commands.Set do
           1
 
         true ->
-          dst_key = CompoundKey.set_member(destination, member)
-          destination_had_member? = Ops.compound_get(store, destination, dst_key) != nil
+          with :ok <- TypeRegistry.check_type(destination, :set, store) do
+            dst_key = CompoundKey.set_member(destination, member)
+            destination_had_member? = Ops.compound_get(store, destination, dst_key) != nil
 
-          case maybe_put_smove_destination(destination_had_member?, destination, dst_key, store) do
-            :ok ->
-              case Ops.compound_batch_delete(store, source, [compound_key]) do
-                :ok ->
-                  with :ok <- maybe_cleanup_empty_set(source, 1, store) do
-                    1
-                  end
+            case maybe_put_smove_destination(destination_had_member?, destination, dst_key, store) do
+              :ok ->
+                case Ops.compound_batch_delete(store, source, [compound_key]) do
+                  :ok ->
+                    with :ok <- maybe_cleanup_empty_set(source, 1, store) do
+                      1
+                    end
 
-                {:error, _} = err ->
-                  case maybe_rollback_smove_destination(
-                         destination_had_member?,
-                         destination,
-                         dst_key,
-                         store
-                       ) do
-                    :ok ->
-                      err
+                  {:error, _} = err ->
+                    case maybe_rollback_smove_destination(
+                           destination_had_member?,
+                           destination,
+                           dst_key,
+                           store
+                         ) do
+                      :ok ->
+                        err
 
-                    {:error, _} = rollback_err ->
-                      {:error, {:smove_rollback_failed, err, rollback_err}}
-                  end
-              end
+                      {:error, _} = rollback_err ->
+                        {:error, {:smove_rollback_failed, err, rollback_err}}
+                    end
+                end
 
-            {:error, _} = err ->
-              err
+              {:error, _} = err ->
+                err
+            end
           end
       end
     end
@@ -905,6 +906,8 @@ defmodule Ferricstore.Commands.Set do
   # Clears any existing set at `destination`, writes `members` as a new set,
   # and returns the member count.
   defp store_set_at(destination, members, store) do
+    backup = destination_backup(destination, store)
+
     with :ok <- clear_set_store_destination(destination, store) do
       members_list = MapSet.to_list(members)
 
@@ -918,23 +921,139 @@ defmodule Ferricstore.Commands.Set do
               length(members_list)
 
             {:error, _} = err ->
-              rollback_new_set_type_marker(destination, store, type_status, err)
+              destination
+              |> rollback_new_set_type_marker(store, type_status, err)
+              |> restore_set_store_destination(destination, backup, store)
           end
         end
       end
     end
   end
 
+  defp restore_set_store_destination({:error, _} = original_error, destination, backup, store) do
+    case restore_destination_backup(destination, backup, store) do
+      :ok -> original_error
+      {:error, _} = restore_error -> restore_error
+    end
+  end
+
+  defp restore_set_store_destination(result, _destination, _backup, _store), do: result
+
   defp clear_set_store_destination(destination, store) do
     # STORE commands replace the destination regardless of its previous type.
-    prefix = CompoundKey.set_prefix(destination)
-
     with :ok <- Ops.delete(store, destination),
-         :ok <- Ops.compound_delete_prefix(store, destination, prefix),
+         :ok <- clear_all_compound_destination_prefixes(destination, store),
+         :ok <- Ops.compound_delete(store, destination, CompoundKey.list_meta_key(destination)),
          :ok <- TypeRegistry.delete_type(destination, store) do
       :ok
     end
   end
+
+  defp clear_all_compound_destination_prefixes(destination, store) do
+    [
+      CompoundKey.hash_prefix(destination),
+      CompoundKey.list_prefix(destination),
+      CompoundKey.set_prefix(destination),
+      CompoundKey.zset_prefix(destination),
+      CompoundKey.stream_prefix(destination)
+    ]
+    |> Enum.reduce_while(:ok, fn prefix, :ok ->
+      case Ops.compound_delete_prefix(store, destination, prefix) do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp destination_backup(destination, store) do
+    case TypeRegistry.get_type(destination, store) do
+      "none" ->
+        :missing
+
+      "string" ->
+        case Ops.get_meta(store, destination) do
+          nil -> :missing
+          {value, expire_at_ms} -> {:plain, value, expire_at_ms}
+        end
+
+      type when type in ["hash", "list", "set", "zset", "stream"] ->
+        {:compound, compound_backup_entries(destination, type, store)}
+    end
+  end
+
+  defp restore_destination_backup(destination, :missing, store) do
+    clear_set_store_destination(destination, store)
+  end
+
+  defp restore_destination_backup(destination, {:plain, value, expire_at_ms}, store) do
+    with :ok <- clear_set_store_destination(destination, store) do
+      Ops.put(store, destination, value, expire_at_ms)
+    end
+  end
+
+  defp restore_destination_backup(destination, {:compound, entries}, store) do
+    with :ok <- clear_set_store_destination(destination, store) do
+      Ops.compound_batch_put(store, destination, entries)
+    end
+  end
+
+  defp compound_backup_entries(destination, type, store) do
+    compound_backup_meta_entries(destination, type, store) ++
+      compound_backup_member_entries(destination, type, store)
+  end
+
+  defp compound_backup_meta_entries(destination, type, store) do
+    type_key = CompoundKey.type_key(destination)
+
+    type_entries =
+      case Ops.compound_get_meta(store, destination, type_key) do
+        nil -> [{type_key, type, 0}]
+        {value, expire_at_ms} -> [{type_key, value, expire_at_ms}]
+      end
+
+    list_meta_entries =
+      if type == "list" do
+        list_meta_key = CompoundKey.list_meta_key(destination)
+
+        case Ops.compound_get_meta(store, destination, list_meta_key) do
+          nil -> []
+          {value, expire_at_ms} -> [{list_meta_key, value, expire_at_ms}]
+        end
+      else
+        []
+      end
+
+    type_entries ++ list_meta_entries
+  end
+
+  defp compound_backup_member_entries(destination, type, store) do
+    prefix = destination_prefix(destination, type)
+
+    compound_keys =
+      store
+      |> Ops.compound_scan(destination, prefix)
+      |> Enum.map(fn {member_or_key, _value} ->
+        if String.starts_with?(member_or_key, prefix) do
+          member_or_key
+        else
+          prefix <> member_or_key
+        end
+      end)
+
+    store
+    |> Ops.compound_batch_get_meta(destination, compound_keys)
+    |> Enum.zip(compound_keys)
+    |> Enum.flat_map(fn
+      {nil, _compound_key} -> []
+      {{value, expire_at_ms}, compound_key} -> [{compound_key, value, expire_at_ms}]
+    end)
+  end
+
+  defp destination_prefix(destination, "hash"), do: CompoundKey.hash_prefix(destination)
+  defp destination_prefix(destination, "list"), do: CompoundKey.list_prefix(destination)
+  defp destination_prefix(destination, "set"), do: CompoundKey.set_prefix(destination)
+  defp destination_prefix(destination, "zset"), do: CompoundKey.zset_prefix(destination)
+  defp destination_prefix(destination, "stream"), do: CompoundKey.stream_prefix(destination)
 
   defp put_set_members(store, key, members) do
     entries =
