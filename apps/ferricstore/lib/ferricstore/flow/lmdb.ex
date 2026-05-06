@@ -6,6 +6,8 @@ defmodule Ferricstore.Flow.LMDB do
   @default_map_size 64 * 1024 * 1024 * 1024
   @terminal_count_cache :ferricstore_flow_lmdb_terminal_count_cache
 
+  # Flow LMDB is part of the Flow storage contract now. Legacy "off" values are
+  # normalized to mirror mode so queries and cold terminal reads stay available.
   def enabled?, do: true
 
   def write_through? do
