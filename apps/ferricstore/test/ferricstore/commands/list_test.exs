@@ -75,6 +75,48 @@ defmodule Ferricstore.Commands.ListTest do
       assert 1 == List.handle("LPUSH", ["mylist", "a"], store)
     end
 
+    test "rolls back new list elements when metadata write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("mylist")
+      meta_key = CompoundKey.list_meta_key("mylist")
+
+      store = %{
+        compound_get: fn
+          "mylist", ^type_key -> nil
+          "mylist", ^meta_key -> nil
+        end,
+        compound_put: fn
+          "mylist", ^type_key, "list", 0 ->
+            :ok
+
+          "mylist", ^meta_key, _meta, 0 ->
+            {:error, :disk_full}
+        end,
+        compound_batch_put: fn "mylist", entries ->
+          send(parent, {:element_writes, entries})
+          :ok
+        end,
+        compound_batch_delete: fn "mylist", element_keys ->
+          send(parent, {:element_rollback, element_keys})
+          :ok
+        end,
+        compound_delete: fn
+          "mylist", ^type_key ->
+            send(parent, :type_rollback)
+            :ok
+        end
+      }
+
+      assert {:error, :disk_full} == List.handle("LPUSH", ["mylist", "a", "b"], store)
+      assert_received {:element_writes, entries}
+      assert_received {:element_rollback, rollback_keys}
+
+      assert Enum.sort(rollback_keys) ==
+               Enum.sort(Enum.map(entries, fn {compound_key, _, _} -> compound_key end))
+
+      assert_received :type_rollback
+    end
+
     test "prepends to existing list and returns new length" do
       store = MockStore.make()
       assert 1 == List.handle("LPUSH", ["mylist", "a"], store)

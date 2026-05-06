@@ -92,14 +92,13 @@ defmodule Ferricstore.Store.ListOps do
   defp push_moved_element(dst_key, store, element, nil, _to_dir) do
     new_pos = @initial_position
 
-    with :ok <-
-           store
-           |> Ops.compound_put(dst_key, CompoundKey.list_element(dst_key, new_pos), element, 0)
-           |> write_result(),
-         :ok <-
-           write_meta(dst_key, store, {1, new_pos - @position_step, new_pos + @position_step}) do
+    put_one_element_and_write_meta(
+      dst_key,
+      store,
+      {new_pos, element},
+      {1, new_pos - @position_step, new_pos + @position_step},
       :ok
-    end
+    )
   end
 
   defp push_moved_element(dst_key, store, element, {dst_len, dst_left, dst_right}, to_dir) do
@@ -112,13 +111,13 @@ defmodule Ferricstore.Store.ListOps do
     new_left = if to_dir == :left, do: new_pos - @position_step, else: dst_left
     new_right = if to_dir == :right, do: new_pos + @position_step, else: dst_right
 
-    with :ok <-
-           store
-           |> Ops.compound_put(dst_key, CompoundKey.list_element(dst_key, new_pos), element, 0)
-           |> write_result(),
-         :ok <- write_meta(dst_key, store, {dst_len + 1, new_left, new_right}) do
+    put_one_element_and_write_meta(
+      dst_key,
+      store,
+      {new_pos, element},
+      {dst_len + 1, new_left, new_right},
       :ok
-    end
+    )
   end
 
   @doc false
@@ -222,10 +221,7 @@ defmodule Ferricstore.Store.ListOps do
         {pos, elem}
       end)
 
-    with :ok <- put_elements(key, store, writes),
-         :ok <- write_meta(key, store, {new_len, new_left, right_pos}) do
-      new_len
-    end
+    put_elements_and_write_meta(key, store, writes, {new_len, new_left, right_pos}, new_len)
   end
 
   # RPUSH
@@ -242,10 +238,7 @@ defmodule Ferricstore.Store.ListOps do
 
     new_len = len + length(new_elements)
 
-    with :ok <- put_elements(key, store, writes),
-         :ok <- write_meta(key, store, {new_len, left_pos, new_right}) do
-      new_len
-    end
+    put_elements_and_write_meta(key, store, writes, {new_len, left_pos, new_right}, new_len)
   end
 
   # LPOP
@@ -405,19 +398,15 @@ defmodule Ferricstore.Store.ListOps do
         -1
 
       idx ->
-        with {:ok, new_pos} <- linsert_position(key, store, sorted, direction, idx),
-             :ok <-
-               store
-               |> Ops.compound_put(key, CompoundKey.list_element(key, new_pos), element, 0)
-               |> write_result(),
-             :ok <-
-               write_meta(
-                 key,
-                 store,
-                 {len + 1, min(left_pos, new_pos - @position_step),
-                  max(right_pos, new_pos + @position_step)}
-               ) do
-          len + 1
+        with {:ok, new_pos} <- linsert_position(key, store, sorted, direction, idx) do
+          put_one_element_and_write_meta(
+            key,
+            store,
+            {new_pos, element},
+            {len + 1, min(left_pos, new_pos - @position_step),
+             max(right_pos, new_pos + @position_step)},
+            len + 1
+          )
         end
     end
   end
@@ -578,15 +567,13 @@ defmodule Ferricstore.Store.ListOps do
 
     min_a = @initial_position - (count - 1) * @position_step
 
-    with :ok <- put_elements(key, store, writes),
-         :ok <-
-           write_meta(
-             key,
-             store,
-             {count, min_a - @position_step, @initial_position + @position_step}
-           ) do
+    put_elements_and_write_meta(
+      key,
+      store,
+      writes,
+      {count, min_a - @position_step, @initial_position + @position_step},
       count
-    end
+    )
   end
 
   defp do_rpush_new(key, store, elements) do
@@ -599,14 +586,43 @@ defmodule Ferricstore.Store.ListOps do
 
     max_a = @initial_position + (count - 1) * @position_step
 
-    with :ok <- put_elements(key, store, writes),
-         :ok <-
-           write_meta(
-             key,
-             store,
-             {count, @initial_position - @position_step, max_a + @position_step}
-           ) do
+    put_elements_and_write_meta(
+      key,
+      store,
+      writes,
+      {count, @initial_position - @position_step, max_a + @position_step},
       count
+    )
+  end
+
+  defp put_elements_and_write_meta(key, store, writes, meta, success) do
+    with :ok <- put_elements(key, store, writes) do
+      case write_meta(key, store, meta) do
+        :ok -> success
+        {:error, _} = error -> rollback_written_elements(key, store, writes, error)
+      end
+    end
+  end
+
+  defp put_one_element_and_write_meta(key, store, {pos, element}, meta, success) do
+    with :ok <-
+           store
+           |> Ops.compound_put(key, CompoundKey.list_element(key, pos), element, 0)
+           |> write_result() do
+      case write_meta(key, store, meta) do
+        :ok -> success
+        {:error, _} = error -> rollback_written_elements(key, store, [{pos, element}], error)
+      end
+    end
+  end
+
+  defp rollback_written_elements(key, store, writes, write_error) do
+    case delete_elements(key, store, writes) do
+      :ok ->
+        write_error
+
+      {:error, _} = rollback_error ->
+        {:error, {:list_element_rollback_failed, write_error, rollback_error}}
     end
   end
 
