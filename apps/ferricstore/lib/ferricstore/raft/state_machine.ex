@@ -6214,12 +6214,12 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_history_trim(_state, _record), do: :ok
 
   defp flow_history_trim_oldest(state, id, partition_key, history_key, delete_count) do
-    state
-    |> flow_index_rank_range(history_key, 0, delete_count - 1, false)
-    |> Enum.each(fn {event_id, _score} ->
-      flow_delete(state, FlowKeys.stream_entry_key(id, event_id, partition_key))
-      flow_index_delete_member(state, history_key, event_id)
-    end)
+    events = flow_index_rank_range(state, history_key, 0, delete_count - 1, false)
+    event_ids = Enum.map(events, fn {event_id, _score} -> event_id end)
+    compound_keys = Enum.map(event_ids, &FlowKeys.stream_entry_key(id, &1, partition_key))
+
+    flow_delete_many(state, compound_keys)
+    flow_index_delete_members(state, history_key, event_ids)
 
     :ok
   end
@@ -6353,11 +6353,16 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
-  defp flow_delete(state, key) do
-    record_pending_original(state, key)
-    track_keydir_binary_remove(state, key)
-    :ets.delete(state.ets, key)
-    queue_pending_delete(key, nil)
+  defp flow_delete_many(_state, []), do: :ok
+
+  defp flow_delete_many(state, keys) do
+    Enum.each(keys, fn key ->
+      record_pending_original(state, key)
+      track_keydir_binary_remove(state, key)
+      :ets.delete(state.ets, key)
+    end)
+
+    queue_pending_deletes(keys, nil)
     :ok
   end
 
@@ -6847,6 +6852,22 @@ defmodule Ferricstore.Raft.StateMachine do
     Process.put(:sm_pending_writes, [{:delete, key, prob_path} | pending])
     pending_values = Process.get(:sm_pending_values, %{})
     Process.put(:sm_pending_values, Map.delete(pending_values, key))
+  end
+
+  defp queue_pending_deletes([], _prob_path), do: :ok
+
+  defp queue_pending_deletes(keys, prob_path) do
+    pending = Process.get(:sm_pending_writes, [])
+
+    pending =
+      Enum.reduce(keys, pending, fn key, acc ->
+        [{:delete, key, prob_path} | acc]
+      end)
+
+    pending_values = Process.get(:sm_pending_values, %{})
+
+    Process.put(:sm_pending_writes, pending)
+    Process.put(:sm_pending_values, Map.drop(pending_values, keys))
   end
 
   defp emit_raft_apply_telemetry(state, started_at, result, flush_result) do
