@@ -5935,17 +5935,17 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_history_put_ready(state, %{id: id, version: version} = record, event, now_ms) do
     partition_key = Map.get(record, :partition_key)
     history_key = FlowKeys.history_key(id, partition_key)
-    event_id = flow_history_next_event_id(history_key, now_ms, version)
+    {event_id, event_ms, event_seq} = flow_history_next_event(history_key, now_ms, version)
 
     compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
 
     with :ok <-
            raw_put_cold(state, compound_key, Flow.encode_history_fields(record, event, now_ms), 0) do
-      flow_history_index_put(history_key, event_id, compound_key)
+      flow_history_index_put(history_key, event_id, event_ms, event_seq, compound_key)
     end
   end
 
-  defp flow_history_next_event_id(history_key, now_ms, version) do
+  defp flow_history_next_event(history_key, now_ms, version) do
     ms =
       case :ets.lookup(Ferricstore.Stream.Meta, history_key) do
         [{^history_key, _len, _first, _last, last_ms, _last_seq}]
@@ -5956,11 +5956,10 @@ defmodule Ferricstore.Raft.StateMachine do
           now_ms
       end
 
-    Integer.to_string(ms) <> "-" <> Integer.to_string(version)
+    {Integer.to_string(ms) <> "-" <> Integer.to_string(version), ms, version}
   end
 
-  defp flow_history_index_put(history_key, event_id, compound_key) do
-    {ms, seq} = flow_parse_event_id(event_id)
+  defp flow_history_index_put(history_key, event_id, ms, seq, compound_key) do
     meta_table = Ferricstore.Stream.Meta
     index_table = Ferricstore.Stream.Index
 
