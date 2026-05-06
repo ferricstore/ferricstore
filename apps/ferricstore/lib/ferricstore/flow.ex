@@ -99,7 +99,7 @@ defmodule Ferricstore.Flow do
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)) do
       case Router.flow_get(ctx, id, partition_key) do
         nil -> {:ok, nil}
-        value when is_binary(value) -> {:ok, decode_record(value)}
+        value when is_binary(value) -> safe_decode_record(value)
       end
     end
   end
@@ -993,7 +993,7 @@ defmodule Ferricstore.Flow do
           |> Router.flow_batch_get(ids, partition_key)
           |> Enum.reduce([], fn
             nil, acc -> acc
-            value, acc when is_binary(value) -> [decode_record(value) | acc]
+            value, acc when is_binary(value) -> prepend_decoded_record(value, acc)
           end)
           |> Enum.reverse()
 
@@ -1001,6 +1001,19 @@ defmodule Ferricstore.Flow do
 
       _too_large ->
         {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+    end
+  end
+
+  defp safe_decode_record(value) when is_binary(value) do
+    {:ok, decode_record(value)}
+  rescue
+    _ -> {:ok, nil}
+  end
+
+  defp prepend_decoded_record(value, acc) when is_binary(value) do
+    case safe_decode_record(value) do
+      {:ok, nil} -> acc
+      {:ok, record} -> [record | acc]
     end
   end
 

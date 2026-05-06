@@ -1142,6 +1142,71 @@ defmodule Ferricstore.Flow.LMDBTest do
              end)
   end
 
+  test "flow get treats malformed LMDB mirror records as missing" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    id = "flow-malformed-lmdb"
+    partition_key = "tenant-malformed-lmdb"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    wrapped = Ferricstore.Flow.LMDB.encode_value("FSF2bad", 0)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, state_key, wrapped}])
+
+    assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+  end
+
+  test "lineage queries skip malformed LMDB mirror records" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    id = "flow-malformed-lineage"
+    partition_key = "tenant-malformed-lineage"
+    correlation_id = "correlation-malformed-lineage"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    index_key = Ferricstore.Flow.Keys.correlation_index_key(correlation_id, partition_key)
+    query_key = Ferricstore.Flow.LMDB.query_index_key(index_key, id, 10)
+
+    wrapped = Ferricstore.Flow.LMDB.encode_value("FSF2bad", 0)
+    query_value = Ferricstore.Flow.LMDB.encode_query_index_value(id, 10, 0)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+               {:put, state_key, wrapped},
+               {:put, query_key, query_value}
+             ])
+
+    assert {:ok, []} =
+             Ferricstore.Flow.by_correlation(ctx, correlation_id, partition_key: partition_key)
+  end
+
   test "mirror startup rebuilds flow working indexes and prunes terminal state to LMDB" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
