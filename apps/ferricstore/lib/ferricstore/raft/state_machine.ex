@@ -5507,17 +5507,27 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_apply_claim_batch(_state, _due_key, [], [], _now_ms), do: :ok
 
   defp flow_apply_claim_batch(state, due_key, plans, stale_due_ids, now_ms) do
-    claimed_ids = Enum.map(plans, fn {_record, next} -> next.id end)
-    all_due_delete_ids = stale_due_ids ++ claimed_ids
-
-    with :ok <- flow_zset_delete_members_from_key(state, due_key, all_due_delete_ids),
+    with :ok <- flow_zset_delete_members_from_key(state, due_key, stale_due_ids),
+         :ok <- flow_claim_move_due_index(state, due_key, plans),
          :ok <- flow_claim_delete_old_indexes(state, plans),
          :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_due_put_many_new(state, Enum.map(plans, fn {_record, next} -> next end)),
          :ok <- flow_claim_put_running_indexes(state, plans),
          :ok <- flow_claim_put_history(state, plans, now_ms) do
       :ok
     end
+  end
+
+  defp flow_claim_move_due_index(_state, _due_key, []), do: :ok
+
+  defp flow_claim_move_due_index(state, due_key, plans) do
+    moves =
+      Enum.map(plans, fn {_record, next} ->
+        partition_key = Map.get(next, :partition_key)
+        next_due_key = FlowKeys.due_key(next.type, next.state, next.priority, partition_key)
+        {due_key, next_due_key, next.id, Map.fetch!(next, :next_run_at_ms)}
+      end)
+
+    flow_index_move_entries(state, moves)
   end
 
   defp flow_claim_delete_old_indexes(state, plans) do
@@ -6671,6 +6681,27 @@ defmodule Ferricstore.Raft.StateMachine do
         state.flow_index_name,
         state.flow_lookup_name,
         key_member_score_triples
+      )
+    end
+
+    :ok
+  end
+
+  defp flow_index_move_entries(state, key_key_member_score_quads) do
+    if flow_index_tables?(state) do
+      key_key_member_score_quads
+      |> Enum.flat_map(fn {from_key, to_key, member, _score} ->
+        [{from_key, member}, {to_key, member}]
+      end)
+      |> Enum.group_by(fn {key, _member} -> key end, fn {_key, member} -> member end)
+      |> Enum.each(fn {key, members} ->
+        track_flow_index_originals(state, key, Enum.uniq(members))
+      end)
+
+      FlowIndex.move_entries(
+        state.flow_index_name,
+        state.flow_lookup_name,
+        key_key_member_score_quads
       )
     end
 

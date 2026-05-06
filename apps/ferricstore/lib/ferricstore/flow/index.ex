@@ -23,6 +23,9 @@ defmodule Ferricstore.Flow.Index do
   defdelegate put_new_entries(index_table, lookup_table, key_member_score_triples),
     to: Ferricstore.Flow.OrderedIndex
 
+  defdelegate move_entries(index_table, lookup_table, key_key_member_score_quads),
+    to: Ferricstore.Flow.OrderedIndex
+
   defdelegate delete_member(index_table, lookup_table, key, member),
     to: Ferricstore.Flow.OrderedIndex
 

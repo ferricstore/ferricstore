@@ -160,6 +160,52 @@ defmodule Ferricstore.Flow.OrderedIndex do
     increment_count(lookup_table, key, count)
   end
 
+  @spec move_entries(:ets.tid() | atom(), :ets.tid() | atom(), [
+          {binary(), binary(), binary(), score_input()}
+        ]) :: :ok
+  def move_entries(index_table, lookup_table, key_key_member_score_quads) do
+    {index_entries, lookup_entries, count_deltas} =
+      Enum.reduce(key_key_member_score_quads, {[], [], %{}}, fn
+        {from_key, to_key, member, score_input}, {index_acc, lookup_acc, count_acc} ->
+          case parse_score(score_input) do
+            {:ok, score} ->
+              {source_exists?, count_acc} =
+                remove_move_source(index_table, lookup_table, from_key, to_key, member, count_acc)
+
+              {existing_destination?, count_acc} =
+                remove_move_destination(
+                  index_table,
+                  lookup_table,
+                  from_key,
+                  to_key,
+                  member,
+                  source_exists?,
+                  count_acc
+                )
+
+              count_acc =
+                if existing_destination? do
+                  count_acc
+                else
+                  Map.update(count_acc, to_key, 1, &(&1 + 1))
+                end
+
+              {[{{to_key, score, member}, true} | index_acc],
+               [{{to_key, member}, score} | lookup_acc], count_acc}
+
+            :error ->
+              {index_acc, lookup_acc, count_acc}
+          end
+      end)
+
+    if index_entries != [], do: :ets.insert(index_table, index_entries)
+    if lookup_entries != [], do: :ets.insert(lookup_table, lookup_entries)
+
+    Enum.each(count_deltas, fn {key, delta} -> increment_count(lookup_table, key, delta) end)
+
+    :ok
+  end
+
   @spec delete_member(:ets.tid() | atom(), :ets.tid() | atom(), binary(), binary()) :: :ok
   def delete_member(index_table, lookup_table, key, member) do
     delete_members(index_table, lookup_table, key, [member])
@@ -256,6 +302,59 @@ defmodule Ferricstore.Flow.OrderedIndex do
   defp increment_count(lookup_table, key, delta) do
     :ets.update_counter(lookup_table, {:count, key}, {2, delta}, {{:count, key}, 0})
     :ok
+  end
+
+  defp remove_move_source(index_table, lookup_table, key, key, member, count_acc) do
+    case :ets.lookup(lookup_table, {key, member}) do
+      [{{^key, ^member}, old_score}] ->
+        :ets.delete(index_table, {key, old_score, member})
+        {true, count_acc}
+
+      [] ->
+        {false, count_acc}
+    end
+  end
+
+  defp remove_move_source(index_table, lookup_table, from_key, _to_key, member, count_acc) do
+    case :ets.take(lookup_table, {from_key, member}) do
+      [{{^from_key, ^member}, old_score}] ->
+        :ets.delete(index_table, {from_key, old_score, member})
+        {true, Map.update(count_acc, from_key, -1, &(&1 - 1))}
+
+      [] ->
+        {false, count_acc}
+    end
+  end
+
+  defp remove_move_destination(
+         _index_table,
+         _lookup_table,
+         key,
+         key,
+         _member,
+         source_exists?,
+         count_acc
+       ) do
+    {source_exists?, count_acc}
+  end
+
+  defp remove_move_destination(
+         index_table,
+         lookup_table,
+         _from_key,
+         to_key,
+         member,
+         _source_exists?,
+         count_acc
+       ) do
+    case :ets.lookup(lookup_table, {to_key, member}) do
+      [{{^to_key, ^member}, old_score}] ->
+        :ets.delete(index_table, {to_key, old_score, member})
+        {true, count_acc}
+
+      [] ->
+        {false, count_acc}
+    end
   end
 
   defp collect_score_slice(
