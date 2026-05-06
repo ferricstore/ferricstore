@@ -1080,6 +1080,68 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert Ferricstore.Flow.decode_record(terminal_blob).id == terminal.id
   end
 
+  test "mirror batch flow get decodes LMDB expiry with command time" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    id = "flow-command-time-lmdb"
+    partition_key = "tenant-command-time-lmdb"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    record = %{
+      id: id,
+      type: "command-time-lmdb",
+      state: "completed",
+      version: 1,
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: 1_000,
+      updated_at_ms: 1_000,
+      next_run_at_ms: nil,
+      priority: 0,
+      ttl_ms: nil,
+      history_max_events: nil,
+      partition_key: partition_key,
+      payload_ref: nil,
+      parent_flow_id: nil,
+      root_flow_id: id,
+      correlation_id: nil,
+      result_ref: nil,
+      error_ref: nil,
+      lease_owner: nil,
+      lease_token: nil,
+      lease_deadline_ms: 0
+    }
+
+    encoded = Ferricstore.Flow.encode_record(record)
+    wrapped = Ferricstore.Flow.LMDB.encode_value(encoded, 2_000)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, state_key, wrapped}])
+
+    assert [^encoded] =
+             Ferricstore.CommandTime.with_now_ms(1_500, fn ->
+               Ferricstore.Store.Router.flow_batch_get(ctx, [id], partition_key)
+             end)
+
+    assert [nil] =
+             Ferricstore.CommandTime.with_now_ms(2_500, fn ->
+               Ferricstore.Store.Router.flow_batch_get(ctx, [id], partition_key)
+             end)
+  end
+
   test "mirror startup rebuilds flow working indexes and prunes terminal state to LMDB" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 

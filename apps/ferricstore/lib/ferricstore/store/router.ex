@@ -19,6 +19,7 @@ defmodule Ferricstore.Store.Router do
   argument, replacing all persistent_term lookups with instance-local state.
   """
 
+  alias Ferricstore.CommandTime
   alias Ferricstore.HLC
   alias Ferricstore.HyperLogLog, as: HLL
   alias Ferricstore.ErrorReasons
@@ -2482,7 +2483,7 @@ defmodule Ferricstore.Store.Router do
   defp flow_batch_get_lmdb(_ctx, []), do: []
 
   defp flow_batch_get_lmdb(ctx, keys) do
-    now_ms = System.os_time(:millisecond)
+    now_ms = CommandTime.now_ms()
 
     values_by_index =
       keys
@@ -2507,7 +2508,7 @@ defmodule Ferricstore.Store.Router do
 
     path
     |> Ferricstore.Flow.LMDB.get(key)
-    |> flow_decode_lmdb_get_result(path, key, System.os_time(:millisecond))
+    |> flow_decode_lmdb_get_result(path, key, CommandTime.now_ms())
   end
 
   defp flow_lmdb_path(ctx, key) do
