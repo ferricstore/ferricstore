@@ -387,7 +387,15 @@ defmodule FerricStore do
   def flow_create_many(_partition_key, _items, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
-  @doc "Returns the latest Flow state record for `id`."
+  @doc """
+  Returns the latest Flow state record for `id`.
+
+  If the record has a `:payload_ref`, Flow fetches that key and returns
+  `:payload` inline by default up to `:payload_max_bytes`
+  (default `:flow_payload_return_max_bytes`, 64 KiB). Larger payloads return
+  `:payload_omitted` and `:payload_size`; pass `payload: false` to return only
+  metadata and the payload reference.
+  """
   @spec flow_get(binary(), keyword()) :: {:ok, map() | nil} | {:error, binary()}
   def flow_get(id, opts \\ [])
 
@@ -405,6 +413,9 @@ defmodule FerricStore do
 
   Required option: `:worker`.
   Common options: `:state`, `:lease_ms`, `:limit`, `:priority`, `:now_ms`.
+  Claimed records include payloads by default using the same `:payload` /
+  `:payload_max_bytes` options as `flow_get/2`; payload fetch failures or
+  missing payload refs do not roll back the claim.
   """
   @spec flow_claim_due(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
   def flow_claim_due(type, opts) when is_binary(type) and is_list(opts) do

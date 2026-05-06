@@ -1776,8 +1776,16 @@ defmodule FerricstoreServer.Resp.ParserTest do
               [
                 {:command, "FLOW.GET", ["flow-1", "PARTITION", "GLOBAL"],
                  {:flow_get, "flow-1", []}, ["flow-1"]},
+                {:command, "FLOW.GET", ["flow-1", "NOPAYLOAD"],
+                 {:flow_get, "flow-1", [payload: false]}, ["flow-1"]},
+                {:command, "FLOW.GET", ["flow-1", "PAYLOAD", "MAXBYTES", "4096"],
+                 {:flow_get, "flow-1", [payload: true, payload_max_bytes: 4096]}, ["flow-1"]},
                 {:command, "FLOW.LIST", ["checkout", "STATE", "queued", "COUNT", "25"],
                  {:flow_list, "checkout", [state: "queued", count: 25]}, []},
+                {:command, "FLOW.CLAIM_DUE",
+                 ["checkout", "WORKER", "worker-a", "LIMIT", "10", "PAYLOAD", "MAXBYTES", "2048"],
+                 {:flow_claim_due, "checkout",
+                  [worker: "worker-a", limit: 10, payload: true, payload_max_bytes: 2048]}, []},
                 {:command, "FLOW.INFO", ["checkout", "PARTITION", "tenant-a"],
                  {:flow_info, "checkout", [partition_key: "tenant-a"]}, []},
                 {:command, "FLOW.STUCK", ["checkout", "OLDER_THAN", "1000", "COUNT", "10"],
@@ -1787,7 +1795,10 @@ defmodule FerricstoreServer.Resp.ParserTest do
               ], ""} =
                Parser.parse_commands(
                  "flow.get flow-1 PARTITION GLOBAL\r\n" <>
+                   "flow.get flow-1 NOPAYLOAD\r\n" <>
+                   "flow.get flow-1 PAYLOAD MAXBYTES 4096\r\n" <>
                    "flow.list checkout STATE queued COUNT 25\r\n" <>
+                   "flow.claim_due checkout WORKER worker-a LIMIT 10 PAYLOAD MAXBYTES 2048\r\n" <>
                    "flow.info checkout PARTITION tenant-a\r\n" <>
                    "flow.stuck checkout OLDER_THAN 1000 COUNT 10\r\n" <>
                    "flow.history flow-1 COUNT 10\r\n"

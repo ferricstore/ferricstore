@@ -281,6 +281,88 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id, type: "checkout", state: "queued")
   end
 
+  test "flow_get hydrates small payload refs by default and supports opt-out/caps" do
+    id = uid("flow-get-payload")
+    payload_key = "payload:" <> id
+    payload = "payload-body"
+
+    assert :ok = FerricStore.set(payload_key, payload)
+
+    assert {:ok, _flow} =
+             FerricStore.flow_create(id,
+               type: "checkout",
+               state: "queued",
+               payload_ref: payload_key,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, fetched} = FerricStore.flow_get(id)
+    assert fetched.payload == payload
+    assert fetched.payload_size == byte_size(payload)
+    refute Map.has_key?(fetched, :payload_omitted)
+
+    assert {:ok, no_payload} = FerricStore.flow_get(id, payload: false)
+    refute Map.has_key?(no_payload, :payload)
+    refute Map.has_key?(no_payload, :payload_omitted)
+
+    assert {:ok, capped} = FerricStore.flow_get(id, payload_max_bytes: 4)
+    assert capped.payload_omitted == true
+    assert capped.payload_size == byte_size(payload)
+    refute Map.has_key?(capped, :payload)
+  end
+
+  test "flow_claim_due returns payload inline up to cap without rolling back missing payloads" do
+    type = uid("claim-payload")
+    id = uid("claim-payload-flow")
+    payload_key = "payload:" <> id
+    payload = "worker-input"
+
+    assert :ok = FerricStore.set(payload_key, payload)
+
+    assert {:ok, _flow} =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "queued",
+               payload_ref: payload_key,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-a",
+               limit: 1,
+               now_ms: 1_000,
+               payload_max_bytes: 64
+             )
+
+    assert claimed.id == id
+    assert claimed.payload == payload
+    assert claimed.payload_size == byte_size(payload)
+
+    missing_id = uid("claim-missing-payload-flow")
+    missing_payload_key = "payload:" <> missing_id
+
+    assert {:ok, _flow} =
+             FerricStore.flow_create(missing_id,
+               type: type,
+               state: "queued",
+               payload_ref: missing_payload_key,
+               run_at_ms: 2_000
+             )
+
+    assert {:ok, [missing]} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-b",
+               limit: 1,
+               now_ms: 2_000
+             )
+
+    assert missing.id == missing_id
+    assert missing.payload == nil
+    assert missing.payload_missing == true
+    assert {:ok, %{state: "running"}} = FerricStore.flow_get(missing_id)
+  end
+
   test "pipeline_read_batch preserves order across get, missing, and history reads" do
     ctx = FerricStore.Instance.get(:default)
     {partition_a, partition_b} = different_partition_keys()
@@ -322,6 +404,45 @@ defmodule Ferricstore.FlowTest do
 
     assert_receive {:flow_telemetry, [:ferricstore, :flow, :pipeline_read_batch],
                     %{count: 4, gets: 3, histories: 1}, %{source: :pipeline}}
+  end
+
+  test "pipeline_read_batch hydrates Flow GET payloads with per-command caps" do
+    ctx = FerricStore.Instance.get(:default)
+    id_a = uid("flow-pipeline-payload-a")
+    id_b = uid("flow-pipeline-payload-b")
+    payload_a = "payload-a"
+    payload_b = "payload-b"
+
+    assert :ok = FerricStore.set("payload:" <> id_a, payload_a)
+    assert :ok = FerricStore.set("payload:" <> id_b, payload_b)
+
+    assert {:ok, _flow} =
+             FerricStore.flow_create(id_a,
+               type: "pipeline-payload",
+               payload_ref: "payload:" <> id_a,
+               run_at_ms: 1
+             )
+
+    assert {:ok, _flow} =
+             FerricStore.flow_create(id_b,
+               type: "pipeline-payload",
+               payload_ref: "payload:" <> id_b,
+               run_at_ms: 1
+             )
+
+    assert [
+             {:ok, %{id: ^id_a, payload: ^payload_a, payload_size: 9}},
+             {:ok, %{id: ^id_b, payload_omitted: true, payload_size: 9}},
+             {:ok, no_payload}
+           ] =
+             Ferricstore.Flow.pipeline_read_batch(ctx, [
+               {:get, id_a, []},
+               {:get, id_b, [payload_max_bytes: 4]},
+               {:get, id_a, [payload: false]}
+             ])
+
+    refute Map.has_key?(no_payload, :payload)
+    refute Map.has_key?(no_payload, :payload_omitted)
   end
 
   test "flow_create idempotent retry returns matching existing record and rejects conflicts" do

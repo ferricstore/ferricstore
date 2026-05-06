@@ -15,6 +15,7 @@ defmodule Ferricstore.Flow do
   @max_history_max_events 10_000
   @default_max_batch_items 1_000
   @default_max_claim_limit 1_000
+  @default_payload_return_max_bytes 64 * 1024
   @max_ref_size 4_096
   @default_max_count 10_000
   @default_lmdb_query_scan_limit 10_000
@@ -101,12 +102,18 @@ defmodule Ferricstore.Flow do
   def get(ctx, id, opts \\ []) when is_binary(id) and is_list(opts) do
     with :ok <- validate_id(id),
          :ok <- validate_opts(opts),
+         {:ok, payload_return} <- payload_return_opts(opts),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)) do
       case Router.flow_get(ctx, id, partition_key) do
-        nil -> {:ok, nil}
-        value when is_binary(value) -> safe_decode_record(value)
-        {:error, _reason} = error -> error
+        nil ->
+          {:ok, nil}
+
+        value when is_binary(value) ->
+          hydrate_payload_result(ctx, safe_decode_record(value), payload_return)
+
+        {:error, _reason} = error ->
+          error
       end
     end
   end
@@ -135,6 +142,7 @@ defmodule Ferricstore.Flow do
          {:ok, limit} <- optional_claim_limit(opts),
          {:ok, priority} <- optional_priority_or_nil(opts),
          {:ok, now} <- optional_now_ms(opts),
+         {:ok, payload_return} <- payload_return_opts(opts),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_claim_due_keys(type, state, priority, partition_key) do
       attrs =
@@ -149,7 +157,13 @@ defmodule Ferricstore.Flow do
         }
         |> maybe_put_attr(:now_ms, now)
 
-      Router.flow_claim_due(ctx, attrs)
+      case Router.flow_claim_due(ctx, attrs) do
+        {:ok, records} when is_list(records) ->
+          {:ok, hydrate_payload_records(ctx, records, payload_return)}
+
+        other ->
+          other
+      end
     end
   end
 
@@ -331,8 +345,9 @@ defmodule Ferricstore.Flow do
       |> Enum.reduce({[], [], [], %{}}, fn {op, idx},
                                            {get_acc, history_acc, other_acc, result_acc} ->
         case pipeline_read_command(ctx, op) do
-          {:get, id, partition_key} ->
-            {[{idx, id, partition_key} | get_acc], history_acc, other_acc, result_acc}
+          {:get, id, partition_key, payload_return} ->
+            {[{idx, id, partition_key, payload_return} | get_acc], history_acc, other_acc,
+             result_acc}
 
           {:history, id, partition_key, history_key, count} ->
             {get_acc, [{idx, id, partition_key, history_key, count} | history_acc], other_acc,
@@ -2257,9 +2272,10 @@ defmodule Ferricstore.Flow do
   defp pipeline_read_command(_ctx, {:get, id, opts}) when is_binary(id) and is_list(opts) do
     with :ok <- validate_id(id),
          :ok <- validate_opts(opts),
+         {:ok, payload_return} <- payload_return_opts(opts),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)) do
-      {:get, id, partition_key}
+      {:get, id, partition_key, payload_return}
     end
   end
 
@@ -2298,25 +2314,144 @@ defmodule Ferricstore.Flow do
   defp pipeline_read_get_results([], _ctx), do: %{}
 
   defp pipeline_read_get_results(get_ops, ctx) do
-    get_ops
-    |> Enum.group_by(fn {_idx, _id, partition_key} -> partition_key end)
-    |> Enum.flat_map(fn {partition_key, group} ->
-      ids = Enum.map(group, fn {_idx, id, _partition_key} -> id end)
-      values = Router.flow_batch_get(ctx, ids, partition_key)
+    decoded =
+      get_ops
+      |> Enum.group_by(fn {_idx, _id, partition_key, _payload_return} -> partition_key end)
+      |> Enum.flat_map(fn {partition_key, group} ->
+        ids = Enum.map(group, fn {_idx, id, _partition_key, _payload_return} -> id end)
+        values = Router.flow_batch_get(ctx, ids, partition_key)
 
-      group
-      |> Enum.zip(values)
-      |> Enum.map(fn {{idx, _id, _partition_key}, value} ->
-        {idx, pipeline_read_decode_get(value)}
+        group
+        |> Enum.zip(values)
+        |> Enum.map(fn {{idx, _id, _partition_key, payload_return}, value} ->
+          {idx, pipeline_read_decode_get(value), payload_return}
+        end)
       end)
-    end)
+
+    decoded
+    |> hydrate_pipeline_get_results(ctx)
     |> Map.new()
+  end
+
+  defp hydrate_pipeline_get_results(decoded, ctx) do
+    {records, pass_through} =
+      Enum.reduce(decoded, {[], []}, fn
+        {idx, {:ok, record}, payload_return}, {records_acc, pass_acc} when is_map(record) ->
+          {[{idx, record, payload_return} | records_acc], pass_acc}
+
+        {idx, result, _payload_return}, {records_acc, pass_acc} ->
+          {records_acc, [{idx, result} | pass_acc]}
+      end)
+
+    hydrated =
+      records
+      |> Enum.reverse()
+      |> Enum.group_by(fn {_idx, _record, payload_return} ->
+        {Map.fetch!(payload_return, :enabled?), Map.fetch!(payload_return, :max_bytes)}
+      end)
+      |> Enum.flat_map(fn
+        {{false, _max_bytes}, entries} ->
+          Enum.map(entries, fn {idx, record, _payload_return} -> {idx, {:ok, record}} end)
+
+        {{true, max_bytes}, entries} ->
+          hydrated_records =
+            hydrate_payload_records(
+              ctx,
+              Enum.map(entries, fn {_idx, record, _payload_return} -> record end),
+              %{enabled?: true, max_bytes: max_bytes}
+            )
+
+          entries
+          |> Enum.map(fn {idx, _record, _payload_return} -> idx end)
+          |> Enum.zip(hydrated_records)
+          |> Enum.map(fn {idx, record} -> {idx, {:ok, record}} end)
+      end)
+
+    pass_through ++ hydrated
   end
 
   defp pipeline_read_decode_get(nil), do: {:ok, nil}
   defp pipeline_read_decode_get(value) when is_binary(value), do: safe_decode_record(value)
   defp pipeline_read_decode_get({:error, _reason} = error), do: error
   defp pipeline_read_decode_get(_other), do: {:ok, nil}
+
+  defp hydrate_payload_result(_ctx, {:ok, nil}, _payload_return), do: {:ok, nil}
+
+  defp hydrate_payload_result(ctx, {:ok, record}, payload_return) when is_map(record) do
+    {:ok, hd(hydrate_payload_records(ctx, [record], payload_return))}
+  end
+
+  defp hydrate_payload_result(_ctx, other, _payload_return), do: other
+
+  defp hydrate_payload_records(_ctx, records, %{enabled?: false}), do: records
+  defp hydrate_payload_records(_ctx, [], _payload_return), do: []
+
+  defp hydrate_payload_records(ctx, records, %{enabled?: true, max_bytes: max_bytes}) do
+    refs =
+      records
+      |> Enum.map(fn record -> Map.get(record, :payload_ref) end)
+
+    fetchable_refs =
+      Enum.filter(refs, fn ref ->
+        is_binary(ref) and ref != "" and byte_size(ref) <= Router.max_key_size()
+      end)
+
+    payloads =
+      ctx
+      |> Router.batch_get_with_file_refs(fetchable_refs, file_ref_payload_threshold(max_bytes))
+      |> Enum.zip(fetchable_refs)
+      |> Map.new(fn {payload, ref} -> {ref, payload} end)
+
+    Enum.zip(records, refs)
+    |> Enum.map(fn
+      {record, nil} ->
+        record
+
+      {record, ""} ->
+        record
+
+      {record, ref} ->
+        if byte_size(ref) > Router.max_key_size() do
+          record
+          |> Map.put(:payload_error, "ERR payload_ref key too large")
+        else
+          apply_payload_result(record, Map.get(payloads, ref), max_bytes)
+        end
+    end)
+  end
+
+  defp apply_payload_result(record, nil, _max_bytes) do
+    record
+    |> Map.put(:payload, nil)
+    |> Map.put(:payload_missing, true)
+  end
+
+  defp apply_payload_result(record, {:file_ref, _path, _offset, size}, _max_bytes) do
+    record
+    |> Map.put(:payload_omitted, true)
+    |> Map.put(:payload_size, size)
+  end
+
+  defp apply_payload_result(record, payload, max_bytes) when is_binary(payload) do
+    size = byte_size(payload)
+
+    if size <= max_bytes do
+      record
+      |> Map.put(:payload, payload)
+      |> Map.put(:payload_size, size)
+    else
+      record
+      |> Map.put(:payload_omitted, true)
+      |> Map.put(:payload_size, size)
+    end
+  end
+
+  defp apply_payload_result(record, _other, _max_bytes) do
+    record
+  end
+
+  defp file_ref_payload_threshold(max_bytes) when max_bytes < 1, do: 1
+  defp file_ref_payload_threshold(max_bytes), do: max_bytes + 1
 
   defp pipeline_read_history_results([], _ctx), do: %{}
 
@@ -2950,6 +3085,29 @@ defmodule Ferricstore.Flow do
     case Application.get_env(:ferricstore, :flow_max_claim_limit, @default_max_claim_limit) do
       value when is_integer(value) and value > 0 -> value
       _ -> @default_max_claim_limit
+    end
+  end
+
+  defp payload_return_opts(opts) do
+    with {:ok, enabled?} <- optional_boolean(opts, :payload, true),
+         {:ok, max_bytes} <-
+           optional_non_neg_integer(
+             opts,
+             :payload_max_bytes,
+             flow_payload_return_max_bytes()
+           ) do
+      {:ok, %{enabled?: enabled?, max_bytes: max_bytes}}
+    end
+  end
+
+  defp flow_payload_return_max_bytes do
+    case Application.get_env(
+           :ferricstore,
+           :flow_payload_return_max_bytes,
+           @default_payload_return_max_bytes
+         ) do
+      value when is_integer(value) and value >= 0 -> value
+      _ -> @default_payload_return_max_bytes
     end
   end
 

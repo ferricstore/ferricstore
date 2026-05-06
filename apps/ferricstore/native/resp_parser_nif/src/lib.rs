@@ -5209,7 +5209,7 @@ fn make_flow_get_command_ast<'a>(env: Env<'a>, args: &[Term<'a>], arg_bytes: &[&
         return (tag, wrong_number_error(env, b"flow.get")).encode(env);
     }
 
-    match parse_flow_options(env, args, arg_bytes, 1, flow_partition_option) {
+    match parse_flow_read_options(env, args, arg_bytes, 1, flow_partition_option) {
         Ok(opts) => (tag, args[0], opts).encode(env),
         Err(err) => (tag, args[0], err).encode(env),
     }
@@ -5225,7 +5225,7 @@ fn make_flow_claim_due_command_ast<'a>(
         return (tag, wrong_number_error(env, b"flow.claim_due")).encode(env);
     }
 
-    match parse_flow_options(env, args, arg_bytes, 1, flow_claim_due_option) {
+    match parse_flow_read_options(env, args, arg_bytes, 1, flow_claim_due_option) {
         Ok(opts) => (tag, args[0], opts).encode(env),
         Err(err) => (tag, args[0], err).encode(env),
     }
@@ -5241,7 +5241,7 @@ fn make_flow_reclaim_command_ast<'a>(
         return (tag, wrong_number_error(env, b"flow.reclaim")).encode(env);
     }
 
-    match parse_flow_options(env, args, arg_bytes, 1, flow_claim_due_option) {
+    match parse_flow_read_options(env, args, arg_bytes, 1, flow_claim_due_option) {
         Ok(opts) => (tag, args[0], opts).encode(env),
         Err(err) => (tag, args[0], err).encode(env),
     }
@@ -5908,6 +5908,62 @@ fn parse_flow_options<'a>(
         }
         idx += 2;
     }
+    Ok(opts)
+}
+
+fn parse_flow_read_options<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    start: usize,
+    parser: FlowOptionParser<'a>,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    let mut opts = Vec::with_capacity((args.len().saturating_sub(start)) / 2 + 2);
+    let mut idx = start;
+
+    while idx < args.len() {
+        if ascii_eq_ignore_case(arg_bytes[idx], b"NOPAYLOAD") {
+            opts.push((atom(env, "payload"), false).encode(env));
+            idx += 1;
+            continue;
+        }
+
+        if ascii_eq_ignore_case(arg_bytes[idx], b"PAYLOAD") {
+            opts.push((atom(env, "payload"), true).encode(env));
+
+            if idx + 1 < args.len() && ascii_eq_ignore_case(arg_bytes[idx + 1], b"MAXBYTES") {
+                if idx + 2 >= args.len() {
+                    return Err(generic_ast_error(env, b"ERR syntax error"));
+                }
+
+                if let Some(opt) = flow_option_value(
+                    env,
+                    "payload_max_bytes",
+                    FlowOptType::NonNegative,
+                    args[idx + 2],
+                    arg_bytes[idx + 2],
+                )? {
+                    opts.push(opt);
+                }
+
+                idx += 3;
+            } else {
+                idx += 1;
+            }
+
+            continue;
+        }
+
+        if idx + 1 >= args.len() {
+            return Err(generic_ast_error(env, b"ERR syntax error"));
+        }
+
+        if let Some(opt) = parser(env, args, arg_bytes, idx)? {
+            opts.push(opt);
+        }
+        idx += 2;
+    }
+
     Ok(opts)
 }
 
