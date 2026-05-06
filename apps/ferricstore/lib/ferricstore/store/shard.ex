@@ -47,6 +47,7 @@ defmodule Ferricstore.Store.Shard do
   use GenServer
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Flow.Index, as: FlowIndex
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.Router
@@ -119,6 +120,8 @@ defmodule Ferricstore.Store.Shard do
     writes_paused: false,
     zset_score_index: nil,
     zset_score_lookup: nil,
+    flow_index: nil,
+    flow_lookup: nil,
     zset_index_ready: MapSet.new()
   ]
 
@@ -205,6 +208,9 @@ defmodule Ferricstore.Store.Shard do
       {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, index)
       ensure_zset_index_table!(zset_score_index, :ordered_set)
       ensure_zset_index_table!(zset_score_lookup, :set)
+      {flow_index, flow_lookup} = Ferricstore.Flow.Index.table_names(instance_name, index)
+      ensure_zset_index_table!(flow_index, :ordered_set)
+      ensure_zset_index_table!(flow_lookup, :set)
 
       # v2: recover ETS keydir from hint files or by scanning log files BEFORE
       # starting Raft. This ensures cold entries ({key, nil, ..., fid, off, vsize})
@@ -224,7 +230,9 @@ defmodule Ferricstore.Store.Shard do
           index,
           ctx,
           zset_score_index,
-          zset_score_lookup
+          zset_score_lookup,
+          flow_index,
+          flow_lookup
         )
       end)
 
@@ -244,7 +252,9 @@ defmodule Ferricstore.Store.Shard do
               # elections in parallel before marking the node ready.
               wait_for_leader: false,
               zset_score_index_name: zset_score_index,
-              zset_score_lookup_name: zset_score_lookup
+              zset_score_lookup_name: zset_score_lookup,
+              flow_index_name: flow_index,
+              flow_lookup_name: flow_lookup
             )
           end)
         else
@@ -312,6 +322,8 @@ defmodule Ferricstore.Store.Shard do
          max_active_file_size: max_file_size,
          zset_score_index: zset_score_index,
          zset_score_lookup: zset_score_lookup,
+         flow_index: flow_index,
+         flow_lookup: flow_lookup,
          zset_index_ready: MapSet.new()
        }, {:continue, {:flush_interval, flush_ms}}}
     catch
@@ -655,6 +667,38 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call({:zset_member_rank, redis_key, member, reverse?}, _from, state) do
     ShardCompound.handle_zset_member_rank(redis_key, member, reverse?, state)
+  end
+
+  def handle_call(
+        {:flow_index_score_range_slice, key, min_bound, max_bound, reverse?, offset, count},
+        _from,
+        state
+      ) do
+    {:reply,
+     {:ok,
+      FlowIndex.range_slice(
+        state.flow_index,
+        key,
+        min_bound,
+        max_bound,
+        reverse?,
+        offset,
+        count
+      )}, state}
+  end
+
+  def handle_call({:flow_index_rank_range, key, start_idx, stop_idx, reverse?}, _from, state) do
+    {:reply, {:ok, FlowIndex.rank_range(state.flow_index, key, start_idx, stop_idx, reverse?)},
+     state}
+  end
+
+  def handle_call({:flow_index_count_all, key}, _from, state) do
+    {:reply, {:ok, FlowIndex.count_all(state.flow_lookup, key)}, state}
+  end
+
+  def handle_call({:flow_index_count_all_many, keys}, _from, state) do
+    counts = Enum.map(keys, &FlowIndex.count_all(state.flow_lookup, &1))
+    {:reply, {:ok, counts}, state}
   end
 
   def handle_call({:compound_delete_prefix, redis_key, prefix}, _from, state) do
@@ -1092,6 +1136,8 @@ defmodule Ferricstore.Store.Shard do
         instance_name: if(state.instance_ctx, do: state.instance_ctx.name, else: :default),
         zset_score_index_name: state.zset_score_index,
         zset_score_lookup_name: state.zset_score_lookup,
+        flow_index_name: state.flow_index,
+        flow_lookup_name: state.flow_lookup,
         flow_lmdb_path: Ferricstore.Flow.LMDB.path(state.shard_data_path)
       }
 

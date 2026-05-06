@@ -75,6 +75,7 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.Commands.HyperLogLog
   alias Ferricstore.Commands.Json
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.Index, as: FlowIndex
   alias Ferricstore.Flow.Keys, as: FlowKeys
   alias Ferricstore.HLC
 
@@ -183,6 +184,18 @@ defmodule Ferricstore.Raft.StateMachine do
         Map.get(config, :zset_score_lookup_name) ||
           elem(
             ZSetIndex.table_names(Map.get(config, :instance_name, :default), config.shard_index),
+            1
+          ),
+      flow_index_name:
+        Map.get(config, :flow_index_name) ||
+          elem(
+            FlowIndex.table_names(Map.get(config, :instance_name, :default), config.shard_index),
+            0
+          ),
+      flow_lookup_name:
+        Map.get(config, :flow_lookup_name) ||
+          elem(
+            FlowIndex.table_names(Map.get(config, :instance_name, :default), config.shard_index),
             1
           ),
       flow_lmdb_path:
@@ -2210,7 +2223,9 @@ defmodule Ferricstore.Raft.StateMachine do
         active_file_path: anchor_state.active_file_path,
         active_file_id: anchor_state.active_file_id,
         zset_score_index_name: anchor_state.zset_score_index_name,
-        zset_score_lookup_name: anchor_state.zset_score_lookup_name
+        zset_score_lookup_name: anchor_state.zset_score_lookup_name,
+        flow_index_name: Map.get(anchor_state, :flow_index_name),
+        flow_lookup_name: Map.get(anchor_state, :flow_lookup_name)
       }
     else
       {file_id, file_path, shard_data_path} =
@@ -2228,6 +2243,8 @@ defmodule Ferricstore.Raft.StateMachine do
       {zset_score_index_name, zset_score_lookup_name} =
         ZSetIndex.table_names(instance_name, shard_idx)
 
+      {flow_index_name, flow_lookup_name} = FlowIndex.table_names(instance_name, shard_idx)
+
       %{
         instance_ctx: instance_ctx,
         keydir: keydir,
@@ -2237,7 +2254,9 @@ defmodule Ferricstore.Raft.StateMachine do
         active_file_path: file_path,
         active_file_id: file_id,
         zset_score_index_name: zset_score_index_name,
-        zset_score_lookup_name: zset_score_lookup_name
+        zset_score_lookup_name: zset_score_lookup_name,
+        flow_index_name: flow_index_name,
+        flow_lookup_name: flow_lookup_name
       }
     end
   end
@@ -4578,8 +4597,8 @@ defmodule Ferricstore.Raft.StateMachine do
     batch_size = min(max(remaining * 2, 32), max_scan - scanned)
 
     candidates =
-      ZSetIndex.range_slice(
-        state.zset_score_index_name,
+      flow_index_range_slice(
+        state,
         due_key,
         :neg_inf,
         {:inclusive, now_ms * 1.0},
@@ -5869,65 +5888,138 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
+  defp flow_index_tables?(%{flow_lookup_name: lookup, flow_index_name: index})
+       when lookup != nil and index != nil do
+    :ets.whereis(lookup) != :undefined and :ets.whereis(index) != :undefined
+  end
+
+  defp flow_index_tables?(_state), do: false
+
+  defp flow_index_range_slice(
+         %{flow_index_name: index} = state,
+         key,
+         min_bound,
+         max_bound,
+         reverse?,
+         offset,
+         count
+       ) do
+    if flow_index_tables?(state) do
+      FlowIndex.range_slice(index, key, min_bound, max_bound, reverse?, offset, count)
+    else
+      ZSetIndex.range_slice(
+        state.zset_score_index_name,
+        key,
+        min_bound,
+        max_bound,
+        reverse?,
+        offset,
+        count
+      )
+    end
+  end
+
+  defp flow_index_range_slice(state, key, min_bound, max_bound, reverse?, offset, count) do
+    ZSetIndex.range_slice(
+      state.zset_score_index_name,
+      key,
+      min_bound,
+      max_bound,
+      reverse?,
+      offset,
+      count
+    )
+  end
+
   defp flow_zset_put_new(
-         %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+         state,
          due_key,
          id,
          score
-       )
-       when lookup != nil and index != nil do
-    flow_ensure_due_index_ready(
-      %{zset_score_lookup_name: lookup, zset_score_index_name: index},
-      due_key
-    )
-
-    ZSetIndex.put_new_member(index, lookup, due_key, id, score)
+       ) do
+    flow_index_put_new_member(state, due_key, id, score)
   end
 
   defp flow_zset_put_many(
-         %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+         state,
          due_key,
          member_score_pairs
-       )
-       when lookup != nil and index != nil do
-    flow_ensure_due_index_ready(
-      %{zset_score_lookup_name: lookup, zset_score_index_name: index},
-      due_key
-    )
-
-    ZSetIndex.put_members(index, lookup, due_key, member_score_pairs)
+       ) do
+    flow_index_put_members(state, due_key, member_score_pairs)
   end
 
   defp flow_zset_put_many_new(
-         %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+         state,
          due_key,
          member_score_pairs
-       )
-       when lookup != nil and index != nil do
-    flow_ensure_due_index_ready(
-      %{zset_score_lookup_name: lookup, zset_score_index_name: index},
-      due_key
-    )
-
-    ZSetIndex.put_new_members(index, lookup, due_key, member_score_pairs)
+       ) do
+    flow_index_put_new_members(state, due_key, member_score_pairs)
   end
 
   defp flow_zset_delete(
-         %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+         state,
          due_key,
          id
-       )
-       when lookup != nil and index != nil do
-    ZSetIndex.delete_member(index, lookup, due_key, id)
+       ) do
+    flow_index_delete_member(state, due_key, id)
   end
 
   defp flow_zset_delete_many(
-         %{zset_score_lookup_name: lookup, zset_score_index_name: index},
+         state,
          due_key,
          ids
-       )
-       when lookup != nil and index != nil do
-    ZSetIndex.delete_members(index, lookup, due_key, ids)
+       ) do
+    flow_index_delete_members(state, due_key, ids)
+  end
+
+  defp flow_index_put_new_member(state, key, member, score) do
+    if flow_index_tables?(state) do
+      FlowIndex.put_new_member(state.flow_index_name, state.flow_lookup_name, key, member, score)
+    end
+
+    :ok
+  end
+
+  defp flow_index_put_members(state, key, member_score_pairs) do
+    if flow_index_tables?(state) do
+      FlowIndex.put_members(
+        state.flow_index_name,
+        state.flow_lookup_name,
+        key,
+        member_score_pairs
+      )
+    end
+
+    :ok
+  end
+
+  defp flow_index_put_new_members(state, key, member_score_pairs) do
+    if flow_index_tables?(state) do
+      FlowIndex.put_new_members(
+        state.flow_index_name,
+        state.flow_lookup_name,
+        key,
+        member_score_pairs
+      )
+    end
+
+    :ok
+  end
+
+  defp flow_index_delete_member(state, key, member) do
+    if flow_index_tables?(state) do
+      FlowIndex.delete_member(state.flow_index_name, state.flow_lookup_name, key, member)
+    end
+
+    :ok
+  end
+
+  defp flow_index_delete_members(state, key, members) do
+    if flow_index_tables?(state) do
+      FlowIndex.delete_members(state.flow_index_name, state.flow_lookup_name, key, members)
+    end
+
+    :ok
   end
 
   defp flow_history_put(state, record, event, now_ms) do
@@ -6943,7 +7035,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
     queue_pending_lmdb_mirror_after_flush(
       {:prune_terminal_flow, state.ets, Map.get(state, :zset_score_index_name),
-       Map.get(state, :zset_score_lookup_name), state_key, state_index_key, record.id,
+       Map.get(state, :zset_score_lookup_name), Map.get(state, :flow_index_name),
+       Map.get(state, :flow_lookup_name), state_key, state_index_key, record.id,
        Map.fetch!(record, :version)}
     )
 
@@ -7255,7 +7348,9 @@ defmodule Ferricstore.Raft.StateMachine do
   defp value_for_ets(value, _threshold), do: :erlang.term_to_binary(value)
 
   @compile {:inline, hot_cache_threshold: 1}
-  defp hot_cache_threshold(%{instance_ctx: ctx}) when ctx != nil, do: ctx.hot_cache_max_value_size
+  defp hot_cache_threshold(%{instance_ctx: ctx}) when ctx != nil,
+    do: Map.get(ctx, :hot_cache_max_value_size, 65_536)
+
   defp hot_cache_threshold(_state), do: 65_536
 
   defp to_disk_binary(v) when is_integer(v), do: Integer.to_string(v)

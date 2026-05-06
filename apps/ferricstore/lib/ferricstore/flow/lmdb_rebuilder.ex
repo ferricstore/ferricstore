@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   @moduledoc false
 
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.Index, as: FlowIndex
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -16,7 +17,9 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         shard_index,
         instance_ctx,
         zset_score_index,
-        zset_score_lookup
+        zset_score_lookup,
+        flow_index \\ nil,
+        flow_lookup \\ nil
       ) do
     lmdb_path = LMDB.path(shard_path)
 
@@ -34,6 +37,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           instance_ctx,
           zset_score_index,
           zset_score_lookup,
+          flow_index,
+          flow_lookup,
           acc
         )
       end)
@@ -56,6 +61,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          instance_ctx,
          zset_score_index,
          zset_score_lookup,
+         flow_index,
+         flow_lookup,
          acc
        ) do
     decoded = read_and_decode(entries, shard_path)
@@ -100,6 +107,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       :ok ->
         Enum.each(Enum.reverse(active_records), fn {_key, record} ->
           rebuild_active_indexes(zset_score_index, zset_score_lookup, record)
+          rebuild_active_flow_indexes(flow_index, flow_lookup, record)
         end)
 
         Enum.each(Enum.reverse(terminal_prunes), fn {key, _record} ->
@@ -117,6 +125,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       {:error, _reason} ->
         Enum.each(Enum.reverse(active_records), fn {_key, record} ->
           rebuild_active_indexes(zset_score_index, zset_score_lookup, record)
+          rebuild_active_flow_indexes(flow_index, flow_lookup, record)
         end)
 
         %{
@@ -261,6 +270,50 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp maybe_rebuild_running_indexes(_zset_score_index, _zset_score_lookup, _record), do: :ok
+
+  defp rebuild_active_flow_indexes(nil, _flow_lookup, _record), do: :ok
+  defp rebuild_active_flow_indexes(_flow_index, nil, _record), do: :ok
+
+  defp rebuild_active_flow_indexes(flow_index, flow_lookup, record) do
+    partition_key = Map.get(record, :partition_key)
+    updated_score = Map.get(record, :updated_at_ms, 0)
+    state_index_key = Flow.Keys.state_index_key(record.type, record.state, partition_key)
+
+    FlowIndex.put_member(flow_index, flow_lookup, state_index_key, record.id, updated_score)
+    maybe_rebuild_flow_due_index(flow_index, flow_lookup, record)
+    maybe_rebuild_flow_running_indexes(flow_index, flow_lookup, record)
+  end
+
+  defp maybe_rebuild_flow_due_index(
+         flow_index,
+         flow_lookup,
+         %{next_run_at_ms: next_run_at_ms} = record
+       )
+       when is_integer(next_run_at_ms) do
+    partition_key = Map.get(record, :partition_key)
+    priority = Map.get(record, :priority, 0)
+    due_key = Flow.Keys.due_key(record.type, record.state, priority, partition_key)
+
+    FlowIndex.put_member(flow_index, flow_lookup, due_key, record.id, next_run_at_ms)
+  end
+
+  defp maybe_rebuild_flow_due_index(_flow_index, _flow_lookup, _record), do: :ok
+
+  defp maybe_rebuild_flow_running_indexes(
+         flow_index,
+         flow_lookup,
+         %{state: "running", lease_deadline_ms: lease_deadline_ms} = record
+       )
+       when is_integer(lease_deadline_ms) do
+    partition_key = Map.get(record, :partition_key)
+    inflight_key = Flow.Keys.inflight_index_key(record.type, partition_key)
+    worker_key = Flow.Keys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key)
+
+    FlowIndex.put_member(flow_index, flow_lookup, inflight_key, record.id, lease_deadline_ms)
+    FlowIndex.put_member(flow_index, flow_lookup, worker_key, record.id, lease_deadline_ms)
+  end
+
+  defp maybe_rebuild_flow_running_indexes(_flow_index, _flow_lookup, _record), do: :ok
 
   defp query_metadata_index_ops(record, expire_at_ms) do
     partition_key = Map.get(record, :partition_key)

@@ -632,6 +632,18 @@ defmodule Ferricstore.Flow.LMDBWriter do
     :ok
   end
 
+  defp apply_after_flush(
+         {:prune_terminal_flow, ets, zset_index, zset_lookup, flow_index, flow_lookup, state_key,
+          state_index_key, id, version}
+       ) do
+    prune_terminal_state_key(ets, state_key, version)
+
+    safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
+    safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id)
+
+    :ok
+  end
+
   defp apply_after_flush({:delete_flow_tombstone, ets, key}) do
     case :ets.lookup(ets, key) do
       [{^key, nil, 0, :flow_state_deleted, :deleted, 0, 0}] -> :ets.delete(ets, key)
@@ -653,6 +665,15 @@ defmodule Ferricstore.Flow.LMDBWriter do
       state_index_key,
       id
     )
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp safe_flow_index_delete_member(nil, _flow_lookup, _state_index_key, _id), do: :ok
+  defp safe_flow_index_delete_member(_flow_index, nil, _state_index_key, _id), do: :ok
+
+  defp safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id) do
+    Ferricstore.Flow.Index.delete_member(flow_index, flow_lookup, state_index_key, id)
   rescue
     ArgumentError -> :ok
   end

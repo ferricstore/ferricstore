@@ -3794,6 +3794,80 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @spec flow_index_score_range_slice(
+          FerricStore.Instance.t(),
+          binary(),
+          term(),
+          term(),
+          boolean(),
+          non_neg_integer(),
+          non_neg_integer() | :all
+        ) :: {:ok, [{binary(), float()}]} | :unavailable
+  def flow_index_score_range_slice(ctx, key, min_bound, max_bound, reverse?, offset, count) do
+    idx = shard_for(ctx, key)
+
+    ctx
+    |> safe_read_call(
+      idx,
+      {:flow_index_score_range_slice, key, min_bound, max_bound, reverse?, offset, count}
+    )
+    |> unwrap_zset_index_reply()
+  end
+
+  @spec flow_index_rank_range(
+          FerricStore.Instance.t(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          boolean()
+        ) :: {:ok, [{binary(), float()}]} | :unavailable
+  def flow_index_rank_range(ctx, key, start_idx, stop_idx, reverse?) do
+    idx = shard_for(ctx, key)
+
+    ctx
+    |> safe_read_call(idx, {:flow_index_rank_range, key, start_idx, stop_idx, reverse?})
+    |> unwrap_zset_index_reply()
+  end
+
+  @spec flow_index_count_all(FerricStore.Instance.t(), binary()) ::
+          {:ok, non_neg_integer()} | :unavailable
+  def flow_index_count_all(ctx, key) do
+    idx = shard_for(ctx, key)
+
+    ctx
+    |> safe_read_call(idx, {:flow_index_count_all, key})
+    |> unwrap_zset_index_reply()
+  end
+
+  @spec flow_index_count_all_many(FerricStore.Instance.t(), [binary()]) ::
+          {:ok, [non_neg_integer()]} | :unavailable
+  def flow_index_count_all_many(_ctx, []), do: {:ok, []}
+
+  def flow_index_count_all_many(ctx, [first_key | _] = keys) do
+    idx = shard_for(ctx, first_key)
+
+    if Enum.all?(keys, fn key -> shard_for(ctx, key) == idx end) do
+      ctx
+      |> safe_read_call(idx, {:flow_index_count_all_many, keys})
+      |> unwrap_zset_index_reply()
+    else
+      flow_index_count_all_many_cross_shard(ctx, keys)
+    end
+  end
+
+  defp flow_index_count_all_many_cross_shard(ctx, keys) do
+    Enum.reduce_while(keys, {:ok, []}, fn key, {:ok, acc} ->
+      case flow_index_count_all(ctx, key) do
+        {:ok, count} -> {:cont, {:ok, [count | acc]}}
+        :unavailable -> {:halt, :unavailable}
+      end
+    end)
+    |> case do
+      {:ok, counts} -> {:ok, Enum.reverse(counts)}
+      :unavailable -> :unavailable
+    end
+  end
+
   @spec zset_rank_range(
           FerricStore.Instance.t(),
           binary(),

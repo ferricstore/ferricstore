@@ -11,6 +11,7 @@ defmodule Ferricstore.Flow do
   @default_lease_ms 30_000
   @default_limit 1
   @max_ref_size 4_096
+  @terminal_states ["completed", "failed", "cancelled"]
   @record_tag :flow_record_v1
   @history_tag :flow_history_v1
 
@@ -358,6 +359,161 @@ defmodule Ferricstore.Flow do
 
     observe_flow(:rewind, started, result, %{flow_id: id})
   end
+
+  def list(ctx, type, opts \\ [])
+
+  def list(ctx, type, opts) when is_binary(type) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_type(type),
+         {:ok, state} <- flow_state(opts),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, count} <- flow_count(opts),
+         index_key = __MODULE__.Keys.state_index_key(type, state, partition_key),
+         :ok <- validate_key_size(index_key),
+         {:ok, ids} <- flow_index_ids(ctx, index_key, state, partition_key, count) do
+      flow_records_for_ids(ctx, ids, partition_key)
+    end
+  end
+
+  def list(_ctx, type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def list(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  def by_parent(ctx, parent_flow_id, opts \\ [])
+
+  def by_parent(ctx, parent_flow_id, opts)
+      when is_binary(parent_flow_id) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(parent_flow_id),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, count} <- flow_count(opts),
+         index_key = __MODULE__.Keys.parent_index_key(parent_flow_id, partition_key),
+         :ok <- validate_key_size(index_key) do
+      flow_records_for_index(ctx, index_key, partition_key, count)
+    end
+  end
+
+  def by_parent(_ctx, parent_flow_id, _opts) when not is_binary(parent_flow_id),
+    do: {:error, "ERR flow parent_flow_id must be a non-empty string"}
+
+  def by_parent(_ctx, _parent_flow_id, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  def by_root(ctx, root_flow_id, opts \\ [])
+
+  def by_root(ctx, root_flow_id, opts) when is_binary(root_flow_id) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(root_flow_id),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, count} <- flow_count(opts),
+         index_key = __MODULE__.Keys.root_index_key(root_flow_id, partition_key),
+         :ok <- validate_key_size(index_key),
+         {:ok, indexed_records} <- flow_records_for_index(ctx, index_key, partition_key, count),
+         {:ok, root_record} <- flow_root_record(ctx, root_flow_id, partition_key) do
+      records =
+        [root_record | indexed_records]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq_by(&Map.get(&1, :id))
+        |> Enum.take(count)
+
+      {:ok, records}
+    end
+  end
+
+  def by_root(_ctx, root_flow_id, _opts) when not is_binary(root_flow_id),
+    do: {:error, "ERR flow root_flow_id must be a non-empty string"}
+
+  def by_root(_ctx, _root_flow_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  def by_correlation(ctx, correlation_id, opts \\ [])
+
+  def by_correlation(ctx, correlation_id, opts)
+      when is_binary(correlation_id) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(correlation_id),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, count} <- flow_count(opts),
+         index_key = __MODULE__.Keys.correlation_index_key(correlation_id, partition_key),
+         :ok <- validate_key_size(index_key) do
+      flow_records_for_index(ctx, index_key, partition_key, count)
+    end
+  end
+
+  def by_correlation(_ctx, correlation_id, _opts) when not is_binary(correlation_id),
+    do: {:error, "ERR flow correlation_id must be a non-empty string"}
+
+  def by_correlation(_ctx, _correlation_id, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  def info(ctx, type, opts \\ [])
+
+  def info(ctx, type, opts) when is_binary(type) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_type(type),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, counts, inflight} <- flow_info_counts(ctx, type, partition_key) do
+      {:ok,
+       counts
+       |> Map.put(:type, type)
+       |> Map.put(:partition_key, partition_key)
+       |> Map.put(:inflight, inflight)}
+    end
+  end
+
+  def info(_ctx, type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def info(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  def stuck(ctx, type, opts \\ [])
+
+  def stuck(ctx, type, opts) when is_binary(type) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_type(type),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, count} <- flow_count(opts),
+         {:ok, older_than_ms} <- optional_non_neg_integer(opts, :older_than_ms, 0),
+         {:ok, now_ms} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+         index_key = __MODULE__.Keys.inflight_index_key(type, partition_key),
+         :ok <- validate_key_size(index_key),
+         cutoff = now_ms - older_than_ms,
+         {:ok, ids} <- flow_zrangebyscore(ctx, index_key, "-inf", Integer.to_string(cutoff)) do
+      flow_records_for_ids(ctx, Enum.take(ids, count), partition_key)
+    end
+  end
+
+  def stuck(_ctx, type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def stuck(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  def history(ctx, id, opts \\ [])
+
+  def history(ctx, id, opts) when is_binary(id) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         history_key = __MODULE__.Keys.history_key(id, partition_key),
+         :ok <- validate_key_size(history_key),
+         {:ok, count} <- flow_count(opts) do
+      result =
+        Ferricstore.Commands.Stream.handle_ast(
+          {:xrange, history_key, :min, :max, count},
+          flow_command_store(ctx)
+        )
+
+      case wrap_command_result(result) do
+        {:ok, entries} -> {:ok, Enum.map(entries, &flow_history_entry_to_tuple/1)}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  def history(_ctx, id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def history(_ctx, _id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc false
   # Encodes the current Flow metadata schema. User payload bytes are not encoded
@@ -769,6 +925,542 @@ defmodule Ferricstore.Flow do
 
   defp history_string(value) when is_binary(value), do: value
   defp history_string(_value), do: ""
+
+  defp flow_count(opts) do
+    case Keyword.get(opts, :count, 100) do
+      value when is_integer(value) and value > 0 -> {:ok, value}
+      _ -> {:error, "ERR flow count must be a positive integer"}
+    end
+  end
+
+  defp flow_state(opts) do
+    case Keyword.get(opts, :state, @default_state) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, "ERR flow state must be a non-empty string"}
+    end
+  end
+
+  defp flow_records_for_ids(ctx, ids, partition_key) do
+    keys = Enum.map(ids, &__MODULE__.Keys.state_key(&1, partition_key))
+
+    case Enum.find(keys, &(byte_size(&1) > Router.max_key_size())) do
+      nil ->
+        records =
+          ctx
+          |> Router.flow_batch_get(ids, partition_key)
+          |> Enum.reduce([], fn
+            nil, acc -> acc
+            value, acc when is_binary(value) -> [decode_record(value) | acc]
+          end)
+          |> Enum.reverse()
+
+        {:ok, records}
+
+      _too_large ->
+        {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+    end
+  end
+
+  defp flow_records_for_index(ctx, index_key, partition_key, count) do
+    with {:ok, ids} <- flow_lmdb_query_index_ids(ctx, index_key, partition_key, count) do
+      flow_records_for_ids(ctx, ids, partition_key)
+    end
+  end
+
+  defp flow_root_record(ctx, root_flow_id, partition_key) do
+    case get(ctx, root_flow_id, partition_key: partition_key) do
+      {:ok, %{root_flow_id: ^root_flow_id} = record} -> {:ok, record}
+      {:ok, nil} -> {:ok, nil}
+      {:ok, _record} -> {:ok, nil}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_info_counts(ctx, type, partition_key) do
+    state_keys =
+      Enum.map([@default_state, "running" | @terminal_states], fn state ->
+        {state, __MODULE__.Keys.state_index_key(type, state, partition_key)}
+      end)
+
+    inflight_key = {"inflight", __MODULE__.Keys.inflight_index_key(type, partition_key)}
+    all_keys = state_keys ++ [inflight_key]
+
+    with :ok <- flow_validate_index_keys(all_keys),
+         {:ok, ram_counts} <-
+           flow_zset_count_many(ctx, Enum.map(all_keys, fn {_state, key} -> key end)),
+         {:ok, lmdb_counts} <- flow_terminal_lmdb_counts(ctx, state_keys, partition_key) do
+      {state_ram_counts, [inflight]} = Enum.split(ram_counts, length(state_keys))
+
+      state_keys
+      |> Enum.zip(state_ram_counts)
+      |> Enum.reduce_while({:ok, %{}}, fn {{state, key}, ram_count}, {:ok, acc} ->
+        with {:ok, count} <-
+               flow_maybe_recount_overlapping_terminal(
+                 ctx,
+                 key,
+                 state,
+                 partition_key,
+                 ram_count,
+                 Map.get(lmdb_counts, key, 0)
+               ) do
+          {:cont, {:ok, Map.put(acc, String.to_atom(state), count)}}
+        else
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, counts} -> {:ok, counts, inflight}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  defp flow_terminal_lmdb_counts(ctx, state_keys, partition_key) do
+    terminal_keys =
+      state_keys
+      |> Enum.filter(fn {state, _key} -> state in @terminal_states end)
+      |> Enum.map(fn {_state, key} -> key end)
+
+    case terminal_keys do
+      [] ->
+        {:ok, %{}}
+
+      [first_key | _] ->
+        now_ms = System.os_time(:millisecond)
+        sweep_limit = flow_terminal_lmdb_sweep_limit()
+
+        ctx
+        |> flow_lmdb_paths_for_index(first_key, partition_key)
+        |> Enum.reduce_while({:ok, Map.new(terminal_keys, &{&1, 0})}, fn path, {:ok, acc} ->
+          with {:ok, counts} <- Ferricstore.Flow.LMDB.terminal_counts(path, terminal_keys),
+               {:ok, counts} <-
+                 flow_maybe_sweep_terminal_lmdb_counts(
+                   path,
+                   terminal_keys,
+                   counts,
+                   now_ms,
+                   sweep_limit
+                 ) do
+            merged =
+              terminal_keys
+              |> Enum.zip(counts)
+              |> Enum.reduce(acc, fn {key, count}, count_acc ->
+                Map.update!(count_acc, key, &(&1 + count))
+              end)
+
+            {:cont, {:ok, merged}}
+          else
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+    end
+  end
+
+  defp flow_maybe_sweep_terminal_lmdb_counts(path, terminal_keys, counts, now_ms, sweep_limit) do
+    if Enum.any?(counts, &(&1 > 0)) do
+      with {:ok, _swept} <-
+             Ferricstore.Flow.LMDB.sweep_expired_terminal(path, now_ms, sweep_limit) do
+        Ferricstore.Flow.LMDB.terminal_counts(path, terminal_keys)
+      end
+    else
+      {:ok, counts}
+    end
+  end
+
+  defp flow_validate_index_keys(state_keys) do
+    Enum.reduce_while(state_keys, :ok, fn {_state, key}, :ok ->
+      case validate_key_size(key) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_zset_count_many(_ctx, []), do: {:ok, []}
+
+  defp flow_zset_count_many(ctx, keys) do
+    case Router.flow_index_count_all_many(ctx, keys) do
+      {:ok, counts} -> {:ok, counts}
+      :unavailable -> flow_zcard_many_fallback(ctx, keys)
+    end
+  end
+
+  defp flow_zcard_many_fallback(ctx, keys) do
+    Enum.reduce_while(keys, {:ok, []}, fn key, {:ok, acc} ->
+      case flow_zcard(ctx, key) do
+        {:ok, count} -> {:cont, {:ok, [count | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, counts} -> {:ok, Enum.reverse(counts)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_flush_lmdb_for_index(ctx, index_key, partition_key) do
+    case partition_key do
+      nil ->
+        Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+      partition_key when is_binary(partition_key) ->
+        shard_index = Router.shard_for(ctx, index_key)
+        Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index)
+    end
+  end
+
+  defp flow_index_ids(ctx, index_key, state, partition_key, count) do
+    with {:ok, ram_ids} <- flow_zrange(ctx, index_key, 0, count - 1),
+         {:ok, lmdb_ids} <- flow_terminal_lmdb_ids(ctx, index_key, state, partition_key, count) do
+      {:ok, (ram_ids ++ lmdb_ids) |> Enum.uniq() |> Enum.take(count)}
+    end
+  end
+
+  defp flow_maybe_recount_overlapping_terminal(
+         ctx,
+         index_key,
+         state,
+         partition_key,
+         _ram_count,
+         lmdb_count
+       )
+       when state in @terminal_states and lmdb_count > 0 do
+    with :ok <- flow_flush_lmdb_for_index(ctx, index_key, partition_key),
+         {:ok, ram_count} <- flow_zcard(ctx, index_key),
+         {:ok, lmdb_count} <- flow_terminal_lmdb_count(ctx, index_key, state, partition_key) do
+      {:ok, ram_count + lmdb_count}
+    end
+  end
+
+  defp flow_maybe_recount_overlapping_terminal(
+         _ctx,
+         _index_key,
+         _state,
+         _partition_key,
+         ram_count,
+         lmdb_count
+       ) do
+    {:ok, ram_count + lmdb_count}
+  end
+
+  defp flow_terminal_lmdb_ids(_ctx, _index_key, state, _partition_key, _count)
+       when state not in @terminal_states,
+       do: {:ok, []}
+
+  defp flow_terminal_lmdb_ids(_ctx, _index_key, _state, _partition_key, count) when count <= 0,
+    do: {:ok, []}
+
+  defp flow_terminal_lmdb_ids(ctx, index_key, _state, partition_key, count) do
+    if Ferricstore.Flow.LMDB.mirror?() do
+      flow_lmdb_index_ids(ctx, index_key, partition_key, count)
+    else
+      {:ok, []}
+    end
+  end
+
+  defp flow_lmdb_index_ids(_ctx, _index_key, _partition_key, count) when count <= 0,
+    do: {:ok, []}
+
+  defp flow_lmdb_index_ids(ctx, index_key, partition_key, count) do
+    prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
+    now_ms = System.os_time(:millisecond)
+    sweep_limit = flow_terminal_lmdb_sweep_limit()
+
+    ctx
+    |> flow_lmdb_paths_for_index(index_key, partition_key)
+    |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
+      with {:ok, _swept} <-
+             Ferricstore.Flow.LMDB.sweep_expired_terminal(path, now_ms, sweep_limit),
+           {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count) do
+        {:cont, {:ok, flow_decode_terminal_index_entries(entries, path, now_ms) ++ acc}}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, entries} ->
+        ids =
+          entries
+          |> Enum.sort_by(fn {id, updated_at_ms} -> {updated_at_ms, id} end)
+          |> Enum.map(fn {id, _updated_at_ms} -> id end)
+          |> Enum.take(count)
+
+        {:ok, ids}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp flow_lmdb_query_index_ids(_ctx, _index_key, _partition_key, count) when count <= 0,
+    do: {:ok, []}
+
+  defp flow_lmdb_query_index_ids(ctx, index_key, partition_key, count) do
+    with :ok <- flow_flush_lmdb_for_index(ctx, index_key, partition_key) do
+      prefix = Ferricstore.Flow.LMDB.query_index_prefix(index_key)
+      now_ms = System.os_time(:millisecond)
+
+      ctx
+      |> flow_lmdb_paths_for_index(index_key, partition_key)
+      |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
+        with {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count) do
+          {:cont, {:ok, flow_decode_query_index_entries(entries, path, now_ms) ++ acc}}
+        else
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, entries} ->
+          ids =
+            entries
+            |> Enum.sort_by(fn {id, updated_at_ms} -> {updated_at_ms, id} end)
+            |> Enum.map(fn {id, _updated_at_ms} -> id end)
+            |> Enum.take(count)
+
+          {:ok, ids}
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+  end
+
+  defp flow_terminal_lmdb_count(_ctx, _index_key, state, _partition_key)
+       when state not in @terminal_states,
+       do: {:ok, 0}
+
+  defp flow_terminal_lmdb_count(ctx, index_key, _state, partition_key) do
+    prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
+    now_ms = System.os_time(:millisecond)
+    sweep_limit = flow_terminal_lmdb_sweep_limit()
+
+    ctx
+    |> flow_lmdb_paths_for_index(index_key, partition_key)
+    |> Enum.reduce_while({:ok, 0}, fn path, {:ok, acc} ->
+      with {:ok, count} <-
+             flow_terminal_lmdb_count_for_path(path, index_key, prefix, now_ms, sweep_limit) do
+        {:cont, {:ok, acc + count}}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_lmdb_shard_paths(data_dir, shard_count) do
+    Enum.map(0..(shard_count - 1), fn shard_index ->
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+    end)
+  end
+
+  defp flow_lmdb_paths_for_index(ctx, _index_key, nil) do
+    flow_lmdb_shard_paths(ctx.data_dir, ctx.shard_count)
+  end
+
+  defp flow_lmdb_paths_for_index(ctx, index_key, partition_key) when is_binary(partition_key) do
+    shard_index = Router.shard_for(ctx, index_key)
+
+    [
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+    ]
+  end
+
+  defp flow_terminal_lmdb_count_for_path(path, index_key, _prefix, now_ms, sweep_limit) do
+    case Ferricstore.Flow.LMDB.terminal_count(path, index_key) do
+      {:ok, 0} -> {:ok, 0}
+      {:ok, _count} -> flow_terminal_lmdb_sweep_then_count(path, index_key, now_ms, sweep_limit)
+      :not_found -> {:ok, 0}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_terminal_lmdb_sweep_then_count(path, index_key, now_ms, sweep_limit) do
+    with {:ok, _swept} <- Ferricstore.Flow.LMDB.sweep_expired_terminal(path, now_ms, sweep_limit) do
+      case Ferricstore.Flow.LMDB.terminal_count(path, index_key) do
+        {:ok, count} -> {:ok, count}
+        :not_found -> {:ok, 0}
+        {:error, _reason} = error -> error
+      end
+    else
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_terminal_lmdb_sweep_limit do
+    Application.get_env(:ferricstore, :flow_lmdb_terminal_sweep_limit, 10_000)
+  end
+
+  defp flow_decode_terminal_index_entries(entries, path, now_ms) do
+    entries
+    |> Enum.flat_map(fn {key, value} ->
+      case Ferricstore.Flow.LMDB.decode_terminal_index_value(value) do
+        {:ok, {id, updated_at_ms, expire_at_ms, _state_key}}
+        when expire_at_ms <= 0 or expire_at_ms > now_ms ->
+          [{id, updated_at_ms}]
+
+        {:ok, {_id, _updated_at_ms, _expire_at_ms, state_key}} ->
+          Ferricstore.Flow.LMDB.delete_terminal_index_entry(path, key, state_key)
+          []
+
+        :error ->
+          []
+      end
+    end)
+  end
+
+  defp flow_decode_query_index_entries(entries, path, now_ms) do
+    entries
+    |> Enum.flat_map(fn {key, value} ->
+      case Ferricstore.Flow.LMDB.decode_query_index_value(value) do
+        {:ok, {id, updated_at_ms, expire_at_ms}}
+        when expire_at_ms <= 0 or expire_at_ms > now_ms ->
+          [{id, updated_at_ms}]
+
+        {:ok, {_id, _updated_at_ms, _expire_at_ms}} ->
+          Ferricstore.Flow.LMDB.write_batch(path, [{:delete, key}])
+          []
+
+        :error ->
+          []
+      end
+    end)
+  end
+
+  defp flow_history_entry_to_tuple({event_id, fields}) when is_list(fields) do
+    {event_id, flow_fields_to_map(fields)}
+  end
+
+  defp flow_history_entry_to_tuple([event_id | fields]) when is_list(fields) do
+    {event_id, flow_fields_to_map(fields)}
+  end
+
+  defp flow_fields_to_map(fields) when is_list(fields) do
+    fields
+    |> Enum.chunk_every(2)
+    |> Map.new(fn [key, value] -> {key, value} end)
+  end
+
+  defp flow_zcard(ctx, key) do
+    case Router.flow_index_count_all(ctx, key) do
+      {:ok, count} -> {:ok, count}
+      :unavailable -> {:error, "ERR flow index unavailable"}
+    end
+  end
+
+  defp flow_zrange(ctx, key, start, stop) do
+    case Router.flow_index_rank_range(ctx, key, start, stop, false) do
+      {:ok, members} -> {:ok, Enum.map(members, fn {member, _score} -> member end)}
+      :unavailable -> {:error, "ERR flow index unavailable"}
+    end
+  end
+
+  defp flow_zrangebyscore(ctx, key, min, max) do
+    case Router.flow_index_score_range_slice(
+           ctx,
+           key,
+           parse_zbound(min),
+           parse_zbound(max),
+           false,
+           0,
+           :all
+         ) do
+      {:ok, members} -> {:ok, Enum.map(members, fn {member, _score} -> member end)}
+      :unavailable -> {:error, "ERR flow index unavailable"}
+    end
+  end
+
+  defp parse_zbound("-inf"), do: :neg_inf
+  defp parse_zbound("+inf"), do: :pos_inf
+
+  defp parse_zbound("(" <> rest) do
+    case Float.parse(rest) do
+      {score, ""} -> {:exclusive, score}
+      _ -> {:error, "ERR min or max is not a float"}
+    end
+  end
+
+  defp parse_zbound(value) when is_binary(value) do
+    case Float.parse(value) do
+      {score, ""} -> {:inclusive, score}
+      _ -> {:error, "ERR min or max is not a float"}
+    end
+  end
+
+  defp wrap_command_result({:error, _reason} = error), do: error
+  defp wrap_command_result(result), do: {:ok, result}
+
+  defp flow_command_store(ctx) do
+    %{
+      __instance_ctx__: ctx,
+      get: fn key -> Router.get(ctx, key) end,
+      get_meta: fn key -> Router.get_meta(ctx, key) end,
+      batch_get: fn keys -> Router.batch_get(ctx, keys) end,
+      expire_at_ms: fn key -> Router.expire_at_ms(ctx, key) end,
+      value_size: fn key -> Router.value_size(ctx, key) end,
+      object_lfu: fn key -> Router.object_lfu(ctx, key) end,
+      put: fn key, value, exp -> Router.put(ctx, key, value, exp) end,
+      delete: fn key -> Router.delete(ctx, key) end,
+      exists?: fn key -> Router.exists?(ctx, key) end,
+      keys: fn -> Router.keys(ctx) end,
+      dbsize: fn -> Router.dbsize(ctx) end,
+      compound_get: fn redis_key, compound_key ->
+        Router.compound_get(ctx, redis_key, compound_key)
+      end,
+      compound_get_meta: fn redis_key, compound_key ->
+        Router.compound_get_meta(ctx, redis_key, compound_key)
+      end,
+      compound_batch_get: fn redis_key, compound_keys ->
+        Router.compound_batch_get(ctx, redis_key, compound_keys)
+      end,
+      compound_batch_get_meta: fn redis_key, compound_keys ->
+        Router.compound_batch_get_meta(ctx, redis_key, compound_keys)
+      end,
+      compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+        Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
+      end,
+      compound_batch_put: fn redis_key, entries ->
+        Router.compound_batch_put(ctx, redis_key, entries)
+      end,
+      compound_delete: fn redis_key, compound_key ->
+        Router.compound_delete(ctx, redis_key, compound_key)
+      end,
+      compound_scan: fn redis_key, prefix ->
+        Router.compound_scan(ctx, redis_key, prefix)
+      end,
+      compound_count: fn redis_key, prefix ->
+        Router.compound_count(ctx, redis_key, prefix)
+      end,
+      compound_delete_prefix: fn redis_key, prefix ->
+        Router.compound_delete_prefix(ctx, redis_key, prefix)
+      end,
+      zset_score_range: fn redis_key, min_bound, max_bound, reverse? ->
+        Router.zset_score_range(ctx, redis_key, min_bound, max_bound, reverse?)
+      end,
+      zset_score_range_slice: fn redis_key, min_bound, max_bound, reverse?, offset, count ->
+        Router.zset_score_range_slice(
+          ctx,
+          redis_key,
+          min_bound,
+          max_bound,
+          reverse?,
+          offset,
+          count
+        )
+      end,
+      zset_score_count: fn redis_key, min_bound, max_bound ->
+        Router.zset_score_count(ctx, redis_key, min_bound, max_bound)
+      end,
+      zset_rank_range: fn redis_key, start_idx, stop_idx, reverse? ->
+        Router.zset_rank_range(ctx, redis_key, start_idx, stop_idx, reverse?)
+      end,
+      zset_member_rank: fn redis_key, member, reverse? ->
+        Router.zset_member_rank(ctx, redis_key, member, reverse?)
+      end
+    }
+  end
 
   defp flow_start_time, do: System.monotonic_time()
 

@@ -783,9 +783,19 @@ defmodule Ferricstore.FlowTest do
     completed_index = Ferricstore.Flow.Keys.state_index_key(type, "completed")
     inflight_index = Ferricstore.Flow.Keys.inflight_index_key(type)
     worker_index = Ferricstore.Flow.Keys.worker_index_key(worker)
+    ctx = FerricStore.Instance.get(:default)
+
+    range_ids = fn index_key ->
+      shard_index = Ferricstore.Store.Router.shard_for(ctx, index_key)
+      {flow_index, _flow_lookup} = Ferricstore.Flow.Index.table_names(ctx.name, shard_index)
+
+      flow_index
+      |> Ferricstore.Flow.Index.range_slice(index_key, :neg_inf, :inf, false, 0, :all)
+      |> Enum.map(fn {member, _score} -> member end)
+    end
 
     assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_000)
-    assert {:ok, [^id]} = FerricStore.zrange(queued_index, 0, -1)
+    assert [^id] = range_ids.(queued_index)
 
     assert {:ok, [first_claim]} =
              FerricStore.flow_claim_due(type,
@@ -795,10 +805,10 @@ defmodule Ferricstore.FlowTest do
                now_ms: 1_000
              )
 
-    assert {:ok, []} = FerricStore.zrange(queued_index, 0, -1)
-    assert {:ok, [^id]} = FerricStore.zrange(running_index, 0, -1)
-    assert {:ok, [^id]} = FerricStore.zrange(inflight_index, 0, -1)
-    assert {:ok, [^id]} = FerricStore.zrange(worker_index, 0, -1)
+    assert [] = range_ids.(queued_index)
+    assert [^id] = range_ids.(running_index)
+    assert [^id] = range_ids.(inflight_index)
+    assert [^id] = range_ids.(worker_index)
 
     assert {:ok, _retried} =
              FerricStore.flow_retry(id, first_claim.lease_token,
@@ -806,10 +816,10 @@ defmodule Ferricstore.FlowTest do
                run_at_ms: 2_000
              )
 
-    assert {:ok, [^id]} = FerricStore.zrange(queued_index, 0, -1)
-    assert {:ok, []} = FerricStore.zrange(running_index, 0, -1)
-    assert {:ok, []} = FerricStore.zrange(inflight_index, 0, -1)
-    assert {:ok, []} = FerricStore.zrange(worker_index, 0, -1)
+    assert [^id] = range_ids.(queued_index)
+    assert [] = range_ids.(running_index)
+    assert [] = range_ids.(inflight_index)
+    assert [] = range_ids.(worker_index)
 
     assert {:ok, [second_claim]} =
              FerricStore.flow_claim_due(type,
@@ -824,10 +834,10 @@ defmodule Ferricstore.FlowTest do
                fencing_token: second_claim.fencing_token
              )
 
-    assert {:ok, []} = FerricStore.zrange(running_index, 0, -1)
-    assert {:ok, []} = FerricStore.zrange(inflight_index, 0, -1)
-    assert {:ok, []} = FerricStore.zrange(worker_index, 0, -1)
-    assert {:ok, [^id]} = FerricStore.zrange(completed_index, 0, -1)
+    assert [] = range_ids.(running_index)
+    assert [] = range_ids.(inflight_index)
+    assert [] = range_ids.(worker_index)
+    assert [^id] = range_ids.(completed_index)
   end
 
   test "flow_list, flow_info, and flow_stuck read lifecycle indexes" do
@@ -990,6 +1000,71 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, info} = FerricStore.flow_info(type, partition_key: partition)
     assert info.completed == 0
     refute :ets.member(lookup_table, {:ready, completed_index_key})
+  end
+
+  test "Flow native due index mirrors create and claim_due" do
+    ctx = FerricStore.Instance.get(:default)
+    partition = uid("tenant-native-index")
+    type = uid("native-index")
+    id = uid("flow-native-index")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: type,
+               partition_key: partition,
+               run_at_ms: 1_000,
+               now_ms: 900
+             )
+
+    due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, due_key)
+    {flow_index, flow_lookup} = Ferricstore.Flow.Index.table_names(ctx.name, shard_index)
+
+    {zset_index, zset_lookup} =
+      Ferricstore.Store.Shard.ZSetIndex.table_names(ctx.name, shard_index)
+
+    assert [{^id, 1000.0}] =
+             Ferricstore.Flow.Index.range_slice(
+               flow_index,
+               due_key,
+               :neg_inf,
+               {:inclusive, 1_000.0},
+               false,
+               0,
+               10
+             )
+
+    assert 0 =
+             Ferricstore.Store.Shard.ZSetIndex.count(
+               zset_index,
+               zset_lookup,
+               due_key,
+               :neg_inf,
+               :inf
+             )
+
+    assert {:ok, [%{id: ^id, state: "running"}]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-native-index",
+               limit: 1,
+               now_ms: 1_000,
+               lease_ms: 30_000
+             )
+
+    assert [] =
+             Ferricstore.Flow.Index.range_slice(
+               flow_index,
+               due_key,
+               :neg_inf,
+               {:inclusive, 1_000.0},
+               false,
+               0,
+               10
+             )
+
+    inflight_key = Ferricstore.Flow.Keys.inflight_index_key(type, partition)
+    assert 1 = Ferricstore.Flow.Index.count_all(flow_lookup, inflight_key)
   end
 
   test "partition_key scopes claim, complete, retry, get, and history" do
