@@ -11,6 +11,8 @@ defmodule Ferricstore.Flow do
   @max_priority 2
   @default_lease_ms 30_000
   @default_limit 1
+  @default_history_max_events 1_024
+  @max_history_max_events 10_000
   @max_ref_size 4_096
   @default_max_count 10_000
   @default_lmdb_query_scan_limit 10_000
@@ -1838,7 +1840,7 @@ defmodule Ferricstore.Flow do
          {:ok, now} <- optional_now_ms(opts),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
          {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-         {:ok, history_max_events} <- optional_pos_integer_or_nil(opts, :history_max_events),
+         {:ok, history_max_events} <- optional_history_max_events(opts),
          {:ok, priority} <- optional_priority(opts, @default_priority),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_flow_keys(id, type, state, priority, partition_key) do
@@ -2185,11 +2187,43 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp optional_pos_integer_or_nil(opts, key) do
-    case Keyword.get(opts, key, nil) do
-      nil -> {:ok, nil}
-      value when is_integer(value) and value > 0 -> {:ok, value}
-      _ -> {:error, "ERR flow #{key} must be a positive integer"}
+  defp optional_history_max_events(opts) do
+    case Keyword.get(opts, :history_max_events, flow_default_history_max_events()) do
+      nil ->
+        {:ok, nil}
+
+      value when is_integer(value) and value > 0 ->
+        max = flow_max_history_max_events()
+
+        if value <= max do
+          {:ok, value}
+        else
+          {:error, "ERR flow history_max_events exceeds maximum #{max}"}
+        end
+
+      _ ->
+        {:error, "ERR flow history_max_events must be a positive integer"}
+    end
+  end
+
+  defp flow_default_history_max_events do
+    max = flow_max_history_max_events()
+
+    case Application.get_env(
+           :ferricstore,
+           :flow_default_history_max_events,
+           @default_history_max_events
+         ) do
+      nil -> nil
+      value when is_integer(value) and value > 0 -> min(value, max)
+      _ -> min(@default_history_max_events, max)
+    end
+  end
+
+  defp flow_max_history_max_events do
+    case Application.get_env(:ferricstore, :flow_max_history_max_events, @max_history_max_events) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> @max_history_max_events
     end
   end
 

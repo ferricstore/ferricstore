@@ -2157,6 +2157,66 @@ defmodule Ferricstore.FlowTest do
              |> Enum.filter(fn {event_id, _score} -> event_id == created_event_id end)
   end
 
+  test "flow history uses configured default retention when omitted" do
+    original = Application.get_env(:ferricstore, :flow_default_history_max_events)
+    Application.put_env(:ferricstore, :flow_default_history_max_events, 2)
+
+    on_exit(fn ->
+      if is_nil(original) do
+        Application.delete_env(:ferricstore, :flow_default_history_max_events)
+      else
+        Application.put_env(:ferricstore, :flow_default_history_max_events, original)
+      end
+    end)
+
+    id = uid("flow-history-default-retention")
+
+    assert {:ok, created} =
+             FerricStore.flow_create(id,
+               type: "audit-default-retention",
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert created.history_max_events == 2
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("audit-default-retention",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_100
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 1_200
+             )
+
+    assert {:ok, events} = FerricStore.flow_history(id, count: 10)
+    assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == ["claimed", "completed"]
+  end
+
+  test "flow history retention rejects values above configured maximum" do
+    original = Application.get_env(:ferricstore, :flow_max_history_max_events)
+    Application.put_env(:ferricstore, :flow_max_history_max_events, 2)
+
+    on_exit(fn ->
+      if is_nil(original) do
+        Application.delete_env(:ferricstore, :flow_max_history_max_events)
+      else
+        Application.put_env(:ferricstore, :flow_max_history_max_events, original)
+      end
+    end)
+
+    assert {:error, "ERR flow history_max_events exceeds maximum 2"} =
+             FerricStore.flow_create(uid("flow-history-max"),
+               type: "audit-history-max",
+               history_max_events: 3
+             )
+  end
+
   test "flow_rewind rejects trimmed target event with stale stream index" do
     id = uid("flow-rewind-trimmed")
 
