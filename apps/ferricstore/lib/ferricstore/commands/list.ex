@@ -10,21 +10,13 @@ defmodule Ferricstore.Commands.List do
   def handle(cmd, args, store)
 
   def handle("LPUSH", [key | elements], store) when elements != [] do
-    with :ok <- TypeRegistry.check_or_set(key, :list, store) do
-      result = ListOps.execute(key, store, {:lpush, elements})
-      if is_integer(result) and result > 0, do: Ops.on_push(store, key)
-      result
-    end
+    push_list(key, elements, store, :lpush)
   end
 
   def handle("LPUSH", _, _), do: {:error, "ERR wrong number of arguments for 'lpush' command"}
 
   def handle("RPUSH", [key | elements], store) when elements != [] do
-    with :ok <- TypeRegistry.check_or_set(key, :list, store) do
-      result = ListOps.execute(key, store, {:rpush, elements})
-      if is_integer(result) and result > 0, do: Ops.on_push(store, key)
-      result
-    end
+    push_list(key, elements, store, :rpush)
   end
 
   def handle("RPUSH", _, _), do: {:error, "ERR wrong number of arguments for 'rpush' command"}
@@ -316,11 +308,7 @@ defmodule Ferricstore.Commands.List do
   def handle_ast(_ast, _store), do: {:error, "ERR unsupported list command AST"}
 
   defp push_args([key | elements], store, direction) when elements != [] do
-    with :ok <- TypeRegistry.check_or_set(key, :list, store) do
-      result = ListOps.execute(key, store, {direction, elements})
-      if is_integer(result) and result > 0, do: Ops.on_push(store, key)
-      result
-    end
+    push_list(key, elements, store, direction)
   end
 
   defp push_args(_args, _store, :lpush),
@@ -328,6 +316,37 @@ defmodule Ferricstore.Commands.List do
 
   defp push_args(_args, _store, :rpush),
     do: {:error, "ERR wrong number of arguments for 'rpush' command"}
+
+  defp push_list(key, elements, store, direction) when direction in [:lpush, :rpush] do
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :list, store) do
+      result = ListOps.execute(key, store, {direction, elements})
+
+      case result do
+        count when is_integer(count) and count > 0 ->
+          Ops.on_push(store, key)
+          count
+
+        {:error, _} = error ->
+          rollback_new_list_type_marker(key, store, type_status, error)
+
+        other ->
+          other
+      end
+    end
+  end
+
+  defp rollback_new_list_type_marker(key, store, {:ok, :created}, write_error) do
+    case TypeRegistry.delete_type(key, store) do
+      :ok ->
+        write_error
+
+      {:error, _} = rollback_error ->
+        {:error, {:list_type_marker_rollback_failed, write_error, rollback_error}}
+    end
+  end
+
+  defp rollback_new_list_type_marker(_key, _store, :ok, write_error), do: write_error
 
   defp pushx_args([key | elements], store, direction) when elements != [] do
     with :ok <- TypeRegistry.check_type(key, :list, store),

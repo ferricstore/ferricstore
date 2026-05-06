@@ -113,6 +113,34 @@ defmodule Ferricstore.Commands.ListTest do
       assert 1 == List.handle("LPUSH", ["mykey", "a"], store)
       assert ["a"] == List.handle("LRANGE", ["mykey", "0", "-1"], store)
     end
+
+    test "rolls back new type metadata when element write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("mylist")
+      meta_key = CompoundKey.list_meta_key("mylist")
+
+      store = %{
+        compound_get: fn
+          "mylist", ^type_key -> nil
+          "mylist", ^meta_key -> nil
+        end,
+        compound_put: fn "mylist", ^type_key, "list", 0 ->
+          send(parent, :type_written)
+          :ok
+        end,
+        compound_batch_put: fn "mylist", entries when length(entries) == 1 ->
+          {:error, :disk_full}
+        end,
+        compound_delete: fn "mylist", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, :disk_full} == List.handle("LPUSH", ["mylist", "a"], store)
+      assert_received :type_written
+      assert_received :type_deleted
+    end
   end
 
   # ===========================================================================
