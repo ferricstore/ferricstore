@@ -1061,8 +1061,14 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp zcard_count(key, store) do
-    prefix = CompoundKey.zset_prefix(key)
-    Ops.compound_count(store, key, prefix)
+    case Ops.zset_score_count(store, key, :neg_inf, :inf) do
+      {:ok, count} ->
+        count
+
+      :unavailable ->
+        prefix = CompoundKey.zset_prefix(key)
+        Ops.compound_count(store, key, prefix)
+    end
   end
 
   defp load_members(key, store) do

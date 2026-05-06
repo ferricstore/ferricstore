@@ -259,6 +259,31 @@ defmodule Ferricstore.Commands.SortedSetTest do
 
       assert_receive {:zset_rank_range, "zs", 1, 2, false}
     end
+
+    test "ZRANGE negative bounds use score-index cardinality when available" do
+      parent = self()
+      base_store = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1.0", "a", "2.0", "b", "3.0", "c"], base_store)
+
+      store =
+        base_store
+        |> Map.put(:zset_score_count, fn redis_key, min_bound, max_bound ->
+          send(parent, {:zset_score_count, redis_key, min_bound, max_bound})
+          {:ok, 3}
+        end)
+        |> Map.put(:zset_rank_range, fn redis_key, start_idx, stop_idx, reverse? ->
+          send(parent, {:zset_rank_range, redis_key, start_idx, stop_idx, reverse?})
+          {:ok, [{"a", 1.0}, {"b", 2.0}, {"c", 3.0}]}
+        end)
+        |> Map.put(:compound_count, fn _redis_key, _prefix ->
+          flunk("ZRANGE should not scan/count zset members when score-index cardinality exists")
+        end)
+
+      assert ["a", "b", "c"] == SortedSet.handle("ZRANGE", ["zs", "0", "-1"], store)
+
+      assert_receive {:zset_score_count, "zs", :neg_inf, :inf}
+      assert_receive {:zset_rank_range, "zs", 0, 2, false}
+    end
   end
 
   # ---------------------------------------------------------------------------
