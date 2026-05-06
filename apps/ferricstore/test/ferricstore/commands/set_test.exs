@@ -76,6 +76,59 @@ defmodule Ferricstore.Commands.SetTest do
       assert 0 == Set.handle("SADD", ["myset", "a"], store)
     end
 
+    test "SADD rolls back new type metadata when member write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("myset")
+      member_key = CompoundKey.set_member("myset", "a")
+
+      store = %{
+        compound_get: fn
+          "myset", ^type_key -> nil
+          "myset", ^member_key -> nil
+        end,
+        compound_put: fn "myset", ^type_key, "set", 0 ->
+          send(parent, :type_written)
+          :ok
+        end,
+        compound_batch_get: fn "myset", [^member_key] -> [nil] end,
+        compound_batch_put: fn "myset", [{^member_key, "1", 0}] ->
+          {:error, :disk_full}
+        end,
+        compound_delete: fn "myset", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, :disk_full} == Set.handle("SADD", ["myset", "a"], store)
+      assert_received :type_written
+      assert_received :type_deleted
+    end
+
+    test "SADD preserves existing type metadata when later member write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("myset")
+      member_key = CompoundKey.set_member("myset", "a")
+
+      store = %{
+        compound_get: fn
+          "myset", ^type_key -> "set"
+          "myset", ^member_key -> nil
+        end,
+        compound_batch_get: fn "myset", [^member_key] -> [nil] end,
+        compound_batch_put: fn "myset", [{^member_key, "1", 0}] ->
+          {:error, :disk_full}
+        end,
+        compound_delete: fn "myset", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, :disk_full} == Set.handle("SADD", ["myset", "a"], store)
+      refute_received :type_deleted
+    end
+
     test "SADD with no members returns error" do
       assert {:error, _} = Set.handle("SADD", ["myset"], MockStore.make())
     end

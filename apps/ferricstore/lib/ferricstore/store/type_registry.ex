@@ -42,6 +42,16 @@ defmodule Ferricstore.Store.TypeRegistry do
   """
   @spec check_or_set(binary(), CompoundKey.data_type(), map()) :: :ok | {:error, term()}
   def check_or_set(redis_key, type, store) do
+    case check_or_set_status(redis_key, type, store) do
+      {:ok, :created} -> :ok
+      other -> other
+    end
+  end
+
+  @doc false
+  @spec check_or_set_status(binary(), CompoundKey.data_type(), map()) ::
+          :ok | {:ok, :created} | {:error, term()}
+  def check_or_set_status(redis_key, type, store) do
     type_key = CompoundKey.type_key(redis_key)
     expected = CompoundKey.encode_type(type)
 
@@ -51,7 +61,7 @@ defmodule Ferricstore.Store.TypeRegistry do
         if has_exists?(store) and Ops.exists?(store, redis_key) do
           {:error, @wrongtype_msg}
         else
-          write_type_marker(redis_key, type_key, expected, store)
+          write_type_marker_created(redis_key, type_key, expected, store)
         end
 
       ^expected ->
@@ -60,7 +70,7 @@ defmodule Ferricstore.Store.TypeRegistry do
       _other_type ->
         case get_type(redis_key, store) do
           "none" ->
-            write_type_marker(redis_key, type_key, expected, store)
+            write_type_marker_created(redis_key, type_key, expected, store)
 
           _live_type ->
             {:error, @wrongtype_msg}
@@ -199,6 +209,13 @@ defmodule Ferricstore.Store.TypeRegistry do
       true -> :ok
       {:error, _reason} = error -> error
       other -> {:error, other}
+    end
+  end
+
+  defp write_type_marker_created(redis_key, type_key, expected, store) do
+    case write_type_marker(redis_key, type_key, expected, store) do
+      :ok -> {:ok, :created}
+      {:error, _} = error -> error
     end
   end
 end

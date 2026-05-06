@@ -45,23 +45,7 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SADD", [key | members], store) when members != [] do
-    with :ok <- TypeRegistry.check_or_set(key, :set, store) do
-      compound_keys =
-        members
-        |> Enum.uniq()
-        |> Enum.map(&CompoundKey.set_member(key, &1))
-
-      new_keys =
-        store
-        |> Ops.compound_batch_get(key, compound_keys)
-        |> Enum.zip(compound_keys)
-        |> Enum.flat_map(fn
-          {nil, compound_key} -> [compound_key]
-          {_value, _compound_key} -> []
-        end)
-
-      put_new_members(store, key, new_keys)
-    end
+    sadd_members(key, members, store)
   end
 
   def handle("SADD", _args, _store) do
@@ -564,7 +548,14 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   defp sadd_args([key | members], store) when members != [] do
-    with :ok <- TypeRegistry.check_or_set(key, :set, store) do
+    sadd_members(key, members, store)
+  end
+
+  defp sadd_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'sadd' command"}
+
+  defp sadd_members(key, members, store) do
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :set, store) do
       compound_keys =
         members
         |> Enum.uniq()
@@ -579,20 +570,30 @@ defmodule Ferricstore.Commands.Set do
           {_value, _compound_key} -> []
         end)
 
-      put_new_members(store, key, new_keys)
+      put_new_members(store, key, new_keys, type_status)
     end
   end
 
-  defp sadd_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'sadd' command"}
-
-  defp put_new_members(store, key, new_keys) do
+  defp put_new_members(store, key, new_keys, type_status) do
     entries = Enum.map(new_keys, &{&1, @presence_marker, 0})
 
     case Ops.compound_batch_put(store, key, entries) do
       :ok -> length(new_keys)
-      {:error, _} = err -> err
+      {:error, _} = err -> rollback_new_set_type_marker(key, store, type_status, err)
     end
   end
+
+  defp rollback_new_set_type_marker(key, store, {:ok, :created}, write_error) do
+    case TypeRegistry.delete_type(key, store) do
+      :ok ->
+        write_error
+
+      {:error, _} = rollback_error ->
+        {:error, {:sadd_type_marker_rollback_failed, write_error, rollback_error}}
+    end
+  end
+
+  defp rollback_new_set_type_marker(_key, _store, :ok, write_error), do: write_error
 
   defp srem_args([key | members], store) when members != [] do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
