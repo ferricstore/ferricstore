@@ -356,19 +356,56 @@ defmodule FlowTailProbe do
     :ets.tab2list(:flow_tail_events)
     |> Enum.group_by(fn {_id, _ts, event, _measurements, _metadata} -> event end)
     |> Enum.each(fn {event, rows} ->
-      durations =
+      {metric, durations} =
         rows
         |> Enum.map(fn {_id, _ts, _event, measurements, _metadata} ->
-          Map.get(measurements, :duration_us, 0)
+          event_metric(measurements)
         end)
-        |> Enum.sort()
+        |> Enum.reject(&is_nil/1)
+        |> metric_values()
 
       if durations != [] do
         IO.puts(
-          "- #{inspect(event)} count=#{length(durations)} p99=#{percentile(durations, 0.99)}us max=#{List.last(durations)}us"
+          "- #{inspect(event)} count=#{length(durations)} #{metric}_p99=#{percentile(durations, 0.99)}us #{metric}_max=#{List.last(durations)}us"
         )
       end
     end)
+  end
+
+  defp event_metric(measurements) do
+    cond do
+      is_integer(Map.get(measurements, :duration_us)) ->
+        {:duration_us, measurements.duration_us}
+
+      is_integer(Map.get(measurements, :queue_wait_us)) ->
+        {:queue_wait_us, measurements.queue_wait_us}
+
+      is_integer(Map.get(measurements, :dirty_age_ms)) ->
+        {:dirty_age_ms, measurements.dirty_age_ms * 1_000}
+
+      is_integer(Map.get(measurements, :idle_ms)) ->
+        {:idle_ms, measurements.idle_ms * 1_000}
+
+      true ->
+        nil
+    end
+  end
+
+  defp metric_values([]), do: {:value, []}
+
+  defp metric_values(metrics) do
+    {metric, _value} =
+      Enum.find(metrics, fn {metric, _value} -> metric == :duration_us end) ||
+        Enum.find(metrics, fn {metric, _value} -> metric == :queue_wait_us end) ||
+        hd(metrics)
+
+    values =
+      metrics
+      |> Enum.filter(fn {candidate, _value} -> candidate == metric end)
+      |> Enum.map(fn {_candidate, value} -> value end)
+      |> Enum.sort()
+
+    {metric, values}
   end
 
   defp clear_events do
