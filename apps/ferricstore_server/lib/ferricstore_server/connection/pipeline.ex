@@ -646,6 +646,41 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp extract_flow_writes(_commands, _acc), do: :fallback
 
+  defp flow_write_op({:command, "FLOW.CREATE", _args, {:flow_create, id, opts}, _keys})
+       when is_binary(id) and is_list(opts),
+       do: {:ok, {:create, id, opts}}
+
+  defp flow_write_op(
+         {:command, "FLOW.TRANSITION", _args, {:flow_transition, id, from_state, to_state, opts},
+          _keys}
+       )
+       when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts),
+       do: {:ok, {:transition, id, from_state, to_state, opts}}
+
+  defp flow_write_op(
+         {:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts}, _keys}
+       )
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: {:ok, {:complete, id, lease_token, opts}}
+
+  defp flow_write_op({:command, "FLOW.RETRY", _args, {:flow_retry, id, lease_token, opts}, _keys})
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: {:ok, {:retry, id, lease_token, opts}}
+
+  defp flow_write_op({:command, "FLOW.FAIL", _args, {:flow_fail, id, lease_token, opts}, _keys})
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: {:ok, {:fail, id, lease_token, opts}}
+
+  defp flow_write_op({:command, "FLOW.CANCEL", _args, {:flow_cancel, id, opts}, _keys})
+       when is_binary(id) and is_list(opts),
+       do: {:ok, {:cancel, id, opts}}
+
+  defp flow_write_op({:command, "FLOW.REWIND", _args, {:flow_rewind, id, opts}, _keys})
+       when is_binary(id) and is_list(opts),
+       do: {:ok, {:rewind, id, opts}}
+
+  defp flow_write_op(_command), do: :fallback
+
   defp encode_flow_result(result) do
     result
     |> FlowCommand.normalize_result()
@@ -718,50 +753,18 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp do_batch_pure(commands, state, send_response_fn) do
     store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
-    prefetched_reads = prefetch_pure_tcp_reads(commands, state)
+
+    prefetched_reads =
+      if has_flow_write?(commands) do
+        %{}
+      else
+        prefetch_pure_tcp_reads(commands, state)
+      end
 
     {action, responses, final_state} =
       commands
       |> Enum.with_index()
-      |> Enum.reduce_while({:continue, [], state}, fn {cmd, idx}, {:continue, acc, acc_state} ->
-        {name, args, ast, keys} = command_parts(cmd)
-        Stats.incr_commands(state.stats_counter)
-
-        result =
-          case ConnAuth.check_command_cached(state.acl_cache, name) do
-            :ok ->
-              case ConnAuth.check_keys_cached(state.acl_cache, name, keys) do
-                :ok ->
-                  try do
-                    result =
-                      dispatch_pure_command(idx, name, args, ast, store, state, prefetched_reads)
-
-                    result
-                  catch
-                    :exit, {:noproc, _} ->
-                      {:error, "ERR server not ready, shard process unavailable"}
-
-                    :exit, {reason, _} ->
-                      {:error, "ERR internal error: #{inspect(reason)}"}
-
-                    kind, reason ->
-                      internal_error(kind, reason)
-                  end
-
-                {:error, _} = err ->
-                  log_acl_denied(state, name)
-                  err
-              end
-
-            {:error, _} = err ->
-              log_acl_denied(state, name)
-              err
-          end
-
-        new_state = track_pure_result(name, args, result, acc_state)
-
-        {:cont, {:continue, [response_entry(result) | acc], new_state}}
-      end)
+      |> dispatch_pure_segments(state, store, prefetched_reads, [])
 
     responses = Enum.reverse(responses)
 
@@ -782,6 +785,91 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
     if state.transport == :ranch_tcp, do: TcpOpts.set_cork(state.socket, false)
     result
+  end
+
+  defp dispatch_pure_segments([], state, _store, _prefetched_reads, acc) do
+    {:continue, acc, state}
+  end
+
+  defp dispatch_pure_segments([{cmd, idx} | rest], state, store, prefetched_reads, acc) do
+    case flow_write_op(cmd) do
+      {:ok, op} ->
+        {ops, rest} = take_flow_write_segment(rest, [op])
+        entries = dispatch_flow_write_segment(Enum.reverse(ops), state)
+        dispatch_pure_segments(rest, state, store, prefetched_reads, Enum.reverse(entries) ++ acc)
+
+      :fallback ->
+        {name, args, _ast, _keys} = command_parts(cmd)
+
+        {entry, new_state} =
+          dispatch_pure_single(idx, cmd, name, args, store, state, prefetched_reads)
+
+        dispatch_pure_segments(rest, new_state, store, prefetched_reads, [entry | acc])
+    end
+  end
+
+  defp take_flow_write_segment([{cmd, idx} | rest], acc) do
+    case flow_write_op(cmd) do
+      {:ok, op} -> take_flow_write_segment(rest, [op | acc])
+      :fallback -> {acc, [{cmd, idx} | rest]}
+    end
+  end
+
+  defp take_flow_write_segment([], acc), do: {acc, []}
+
+  defp dispatch_flow_write_segment(ops, state) do
+    Stats.incr_commands_by(state.stats_counter, length(ops))
+
+    case safe_dispatch(fn ->
+           Ferricstore.Flow.pipeline_write_batch_independent(state.instance_ctx, ops)
+         end) do
+      {:ok, results} ->
+        Enum.map(results, fn result -> {:encoded, encode_flow_result(result)} end)
+
+      {:error, err} ->
+        List.duplicate({:encoded, Encoder.encode(err)}, length(ops))
+    end
+  end
+
+  defp has_flow_write?(commands) do
+    Enum.any?(commands, fn command ->
+      match?({:ok, _op}, flow_write_op(command))
+    end)
+  end
+
+  defp dispatch_pure_single(idx, cmd, name, args, store, state, prefetched_reads) do
+    {_name, _args, ast, keys} = command_parts(cmd)
+    Stats.incr_commands(state.stats_counter)
+
+    result =
+      case ConnAuth.check_command_cached(state.acl_cache, name) do
+        :ok ->
+          case ConnAuth.check_keys_cached(state.acl_cache, name, keys) do
+            :ok ->
+              try do
+                dispatch_pure_command(idx, name, args, ast, store, state, prefetched_reads)
+              catch
+                :exit, {:noproc, _} ->
+                  {:error, "ERR server not ready, shard process unavailable"}
+
+                :exit, {reason, _} ->
+                  {:error, "ERR internal error: #{inspect(reason)}"}
+
+                kind, reason ->
+                  internal_error(kind, reason)
+              end
+
+            {:error, _} = err ->
+              log_acl_denied(state, name)
+              err
+          end
+
+        {:error, _} = err ->
+          log_acl_denied(state, name)
+          err
+      end
+
+    {response_entry(result), track_pure_result(name, args, result, state)}
   end
 
   defp prefetch_pure_tcp_reads(commands, %{transport: transport} = state)

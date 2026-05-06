@@ -126,6 +126,58 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     end
   end
 
+  test "mixed pipeline batches only consecutive FLOW write segments" do
+    ctx = FerricStore.Instance.get(:default)
+    id = "pipe_flow_mixed_#{System.unique_integer([:positive])}"
+    partition_key = "tenant-pipe-flow-mixed"
+    key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    shard = Router.shard_for(ctx, key)
+    handler_id = {:pipeline_flow_mixed_write_batch, self(), make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :batcher, :slot_flush],
+        fn _event, measurements, metadata, test_pid ->
+          if metadata.shard_index == shard and metadata.prefix == "f" do
+            send(test_pid, {:slot_flush, measurements, metadata})
+          end
+        end,
+        self()
+      )
+
+    state = connection_state(ctx)
+    send_response_fn = capture_response_fn()
+    handle_command_fn = flunking_handle_fn("mixed FLOW segment pipeline fast path")
+
+    commands = [
+      {:command, "PING", [], :ping, []},
+      flow_create_ast(id, partition_key, now_ms: 1, run_at_ms: 1),
+      flow_transition_ast(id, partition_key, "queued", "ready", now_ms: 2, run_at_ms: 2),
+      {:command, "FLOW.GET", [], {:flow_get, id, [partition_key: partition_key]}, []},
+      {:command, "PING", [], :ping, []}
+    ]
+
+    try do
+      assert {:continue, ^state} =
+               Pipeline.pipeline_dispatch(commands, state, handle_command_fn, send_response_fn)
+
+      assert_receive {:pipeline_response, response}
+      refute response =~ "-ERR"
+      assert response =~ "+PONG\r\n"
+      assert response =~ "$5\r\nready\r\n"
+
+      assert {:ok, %{state: "ready", version: 2}} =
+               FerricStore.flow_get(id, partition_key: partition_key)
+
+      assert Enum.any?(drain_slot_flushes(), fn {measurements, _metadata} ->
+               measurements.batch_size >= 2
+             end)
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
   test "SET pipeline fast path writes through sandbox namespace" do
     ctx = FerricStore.Instance.get(:default)
     sandbox = "sandbox_pipe:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"
@@ -373,6 +425,21 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
 
   defp get_ast(key), do: {:command, "GET", [key], {:get, key}, [key]}
   defp set_ast(key, value), do: {:command, "SET", [key, value], {:set, key, value}, [key]}
+
+  defp flow_create_ast(id, partition_key, opts) do
+    {:command, "FLOW.CREATE", [],
+     {:flow_create, id,
+      Keyword.merge(
+        [type: "pipeline-flow", state: "queued", partition_key: partition_key],
+        opts
+      )}, []}
+  end
+
+  defp flow_transition_ast(id, partition_key, from_state, to_state, opts) do
+    {:command, "FLOW.TRANSITION", [],
+     {:flow_transition, id, from_state, to_state,
+      Keyword.merge([partition_key: partition_key, fencing_token: 0], opts)}, []}
+  end
 
   defp drain_slot_flushes(acc \\ []) do
     receive do
