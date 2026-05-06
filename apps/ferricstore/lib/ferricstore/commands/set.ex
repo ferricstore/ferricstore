@@ -525,6 +525,9 @@ defmodule Ferricstore.Commands.Set do
   def handle_ast({:sscan, key, cursor, opts}, store) when is_integer(cursor) and cursor >= 0,
     do: sscan_typed(key, cursor, opts, store)
 
+  def handle_ast({:sscan, _key, cursor, _opts}, _store) when is_integer(cursor) and cursor < 0,
+    do: {:error, "ERR invalid cursor"}
+
   def handle_ast({:sintercard, {:error, reason}}, _store), do: {:error, reason}
 
   def handle_ast({:sintercard, keys, limit}, store)

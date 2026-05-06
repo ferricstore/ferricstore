@@ -1251,6 +1251,12 @@ defmodule Ferricstore.Commands.SetTest do
       assert {:error, "ERR invalid cursor"} = Set.handle("SSCAN", ["myset", "-1"], store)
     end
 
+    test "AST SSCAN with negative cursor returns invalid cursor" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+      assert {:error, "ERR invalid cursor"} = Set.handle_ast({:sscan, "myset", -1, []}, store)
+    end
+
     test "SSCAN with very large cursor returns cursor 0 and empty list" do
       store = MockStore.make()
       Set.handle("SADD", ["myset", "a"], store)

@@ -985,7 +985,11 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
-  defp zscan_parsed(key, cursor, opts, store) do
+  defp zscan_parsed(_key, cursor, _opts, _store) when is_integer(cursor) and cursor < 0 do
+    {:error, "ERR invalid cursor"}
+  end
+
+  defp zscan_parsed(key, cursor, opts, store) when is_integer(cursor) and cursor >= 0 do
     with :ok <- TypeRegistry.check_type(key, :zset, store),
          {:ok, match_pattern, count} <- typed_scan_opts(opts) do
       prefix = CompoundKey.zset_prefix(key)
@@ -1007,6 +1011,8 @@ defmodule Ferricstore.Commands.SortedSet do
       [next_cursor, elements]
     end
   end
+
+  defp zscan_parsed(_key, _cursor, _opts, _store), do: {:error, "ERR invalid cursor"}
 
   defp zrangebyscore_parsed(key, min_bound, max_bound, opts, reverse?, store) do
     with :ok <- TypeRegistry.check_type(key, :zset, store),

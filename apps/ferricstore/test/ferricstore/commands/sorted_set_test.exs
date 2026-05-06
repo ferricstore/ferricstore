@@ -1407,6 +1407,14 @@ defmodule Ferricstore.Commands.SortedSetTest do
       assert {:error, "ERR invalid cursor"} = SortedSet.handle("ZSCAN", ["zs", "-1"], store)
     end
 
+    test "AST ZSCAN with negative cursor returns invalid cursor" do
+      store = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
+
+      assert {:error, "ERR invalid cursor"} =
+               SortedSet.handle_ast({:zscan, "zs", -1, []}, store)
+    end
+
     test "ZSCAN with very large cursor returns cursor 0 and empty list" do
       store = MockStore.make()
       SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
