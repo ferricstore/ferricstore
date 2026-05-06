@@ -185,6 +185,24 @@ defmodule Ferricstore.Flow do
     observe_flow(:complete, started, result, %{flow_id: id})
   end
 
+  def complete_many(ctx, partition_key, items, opts)
+      when is_list(items) and is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
+           :ok <- validate_complete_many_items(items),
+           {:ok, attrs_list} <- complete_many_attrs(items, opts, partition_key),
+           :ok <- validate_unique_transition_ids(attrs_list) do
+        Router.flow_complete_many(ctx, partition_key, attrs_list)
+      end
+
+    observe_flow(:complete, started, result, %{flow_id: nil})
+  end
+
+  def complete_many(_ctx, _partition_key, _items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   def transition(ctx, id, from_state, to_state, opts \\ [])
       when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts) do
     started = flow_start_time()
@@ -1958,6 +1976,112 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp complete_attrs(id, lease_token, opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         :ok <- validate_lease_token(lease_token),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+         {:ok, now} <- optional_now_ms(opts),
+         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
+         {:ok, result_ref} <- optional_binary_or_nil(opts, :result_ref, nil),
+         :ok <- validate_ref_size(:result_ref, result_ref) do
+      attrs =
+        %{
+          id: id,
+          lease_token: lease_token,
+          fencing_token: fencing_token,
+          ttl_ms: ttl_ms,
+          result_ref: result_ref,
+          partition_key: partition_key
+        }
+        |> maybe_put_attr(:now_ms, now)
+
+      {:ok, attrs}
+    end
+  end
+
+  defp complete_many_attrs(items, opts, partition_key) do
+    base_opts = Keyword.delete(opts, :partition_key)
+
+    Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
+      with {:ok, id, lease_token, item_opts} <- complete_many_item_opts(item),
+           {:ok, item_partition_key} <- many_item_partition_key(partition_key, item_opts),
+           {:ok, attrs} <-
+             complete_attrs(
+               id,
+               lease_token,
+               merge_many_item_opts(base_opts, item_opts, item_partition_key)
+             ) do
+        {:cont, {:ok, [attrs | acc]}}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, attrs_list} -> {:ok, Enum.reverse(attrs_list)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp complete_many_item_opts(
+         %{id: id, lease_token: lease_token, fencing_token: fencing_token} = item
+       )
+       when is_binary(id) do
+    {:ok, id, lease_token,
+     [fencing_token: fencing_token] ++
+       complete_many_item_result_ref(item) ++ complete_many_item_partition_key(item)}
+  end
+
+  defp complete_many_item_opts(
+         %{"id" => id, "lease_token" => lease_token, "fencing_token" => fencing_token} = item
+       )
+       when is_binary(id) do
+    {:ok, id, lease_token,
+     [fencing_token: fencing_token] ++
+       complete_many_item_result_ref(item) ++ complete_many_item_partition_key(item)}
+  end
+
+  defp complete_many_item_opts({id, lease_token, item_opts})
+       when is_binary(id) and is_binary(lease_token) and is_list(item_opts) do
+    if Keyword.keyword?(item_opts) do
+      {:ok, id, lease_token, item_opts}
+    else
+      {:error, "ERR flow opts must be a keyword list"}
+    end
+  end
+
+  defp complete_many_item_opts({id, item_opts}) when is_binary(id) and is_list(item_opts) do
+    cond do
+      not Keyword.keyword?(item_opts) ->
+        {:error, "ERR flow opts must be a keyword list"}
+
+      not is_binary(Keyword.get(item_opts, :lease_token)) ->
+        {:error, "ERR flow lease_token must be a non-empty string"}
+
+      true ->
+        {:ok, id, Keyword.fetch!(item_opts, :lease_token), item_opts}
+    end
+  end
+
+  defp complete_many_item_opts(
+         {:id, id, :lease_token, lease_token, :fencing_token, fencing_token}
+       )
+       when is_binary(id) do
+    {:ok, id, lease_token, [fencing_token: fencing_token]}
+  end
+
+  defp complete_many_item_opts(
+         {:id, id, :partition_key, partition_key, :lease_token, lease_token, :fencing_token,
+          fencing_token}
+       )
+       when is_binary(id) do
+    {:ok, id, lease_token, [partition_key: partition_key, fencing_token: fencing_token]}
+  end
+
+  defp complete_many_item_opts(_item), do: {:error, "ERR flow id must be a non-empty string"}
+
   defp transition_many_attrs(items, opts, partition_key, from_state, to_state) do
     base_opts = Keyword.delete(opts, :partition_key)
 
@@ -2058,6 +2182,16 @@ defmodule Ferricstore.Flow do
     |> maybe_put_item_opt(:partition_key, item, :partition_key, "partition_key")
   end
 
+  defp complete_many_item_result_ref(item) do
+    []
+    |> maybe_put_item_opt(:result_ref, item, :result_ref, "result_ref")
+  end
+
+  defp complete_many_item_partition_key(item) do
+    []
+    |> maybe_put_item_opt(:partition_key, item, :partition_key, "partition_key")
+  end
+
   defp maybe_put_item_opt(opts, opt_key, item, atom_key, string_key) do
     cond do
       Map.has_key?(item, atom_key) -> Keyword.put(opts, opt_key, Map.get(item, atom_key))
@@ -2092,6 +2226,11 @@ defmodule Ferricstore.Flow do
   defp validate_transition_many_items([_ | _] = items), do: validate_many_item_count(items)
 
   defp validate_transition_many_items(_items),
+    do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp validate_complete_many_items([_ | _] = items), do: validate_many_item_count(items)
+
+  defp validate_complete_many_items(_items),
     do: {:error, "ERR flow items must be a non-empty list"}
 
   defp validate_many_item_count(items) do

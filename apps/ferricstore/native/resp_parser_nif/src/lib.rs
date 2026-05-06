@@ -1565,6 +1565,7 @@ enum CommandAstKind {
     FlowClaimDue,
     FlowReclaim,
     FlowComplete,
+    FlowCompleteMany,
     FlowTransition,
     FlowTransitionMany,
     FlowRetry,
@@ -1804,6 +1805,7 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"FLOW.CLAIM_DUE" => CommandAstKind::FlowClaimDue,
         b"FLOW.RECLAIM" => CommandAstKind::FlowReclaim,
         b"FLOW.COMPLETE" => CommandAstKind::FlowComplete,
+        b"FLOW.COMPLETE_MANY" => CommandAstKind::FlowCompleteMany,
         b"FLOW.TRANSITION" => CommandAstKind::FlowTransition,
         b"FLOW.TRANSITION_MANY" => CommandAstKind::FlowTransitionMany,
         b"FLOW.RETRY" => CommandAstKind::FlowRetry,
@@ -2240,6 +2242,9 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowClaimDue => make_flow_claim_due_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowReclaim => make_flow_reclaim_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowComplete => make_flow_complete_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowCompleteMany => {
+            make_flow_complete_many_command_ast(env, args, arg_bytes)
+        }
         CommandAstKind::FlowTransition => make_flow_transition_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowTransitionMany => {
             make_flow_transition_many_command_ast(env, args, arg_bytes)
@@ -5249,6 +5254,94 @@ fn make_flow_complete_command_ast<'a>(
     }
 }
 
+fn make_flow_complete_many_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_complete_many");
+    if args.len() < 5 {
+        return (tag, wrong_number_error(env, b"flow.complete_many")).encode(env);
+    }
+
+    let mixed = ascii_eq_ignore_case(arg_bytes[0], b"MIXED");
+
+    let Some(items_idx) = flow_find_option(arg_bytes, 1, b"ITEMS") else {
+        return (
+            tag,
+            args[0],
+            generic_ast_error(env, b"ERR flow items are required"),
+        )
+            .encode(env);
+    };
+
+    let item_width = if mixed { 4 } else { 3 };
+    if items_idx == args.len() - 1 || (args.len() - items_idx - 1) % item_width != 0 {
+        return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
+    }
+
+    let opts = match parse_flow_options_until(
+        env,
+        args,
+        arg_bytes,
+        1,
+        items_idx,
+        flow_complete_many_option,
+    ) {
+        Ok(opts) => opts,
+        Err(err) => return (tag, args[0], err).encode(env),
+    };
+
+    let mut items = Vec::with_capacity((args.len() - items_idx - 1) / item_width);
+    let mut idx = items_idx + 1;
+    while idx < args.len() {
+        let lease_idx = if mixed { idx + 2 } else { idx + 1 };
+        let fencing_idx = if mixed { idx + 3 } else { idx + 2 };
+
+        let fencing_token = match parse_int_bytes(arg_bytes[fencing_idx]) {
+            Some(value) if value >= 0 => value,
+            _ => {
+                return (
+                    tag,
+                    args[0],
+                    generic_ast_error(env, b"ERR value is not an integer or out of range"),
+                )
+                    .encode(env)
+            }
+        };
+
+        if mixed {
+            let item_opts = vec![
+                (atom(env, "partition_key"), args[idx + 1]).encode(env),
+                (atom(env, "lease_token"), args[lease_idx]).encode(env),
+                (atom(env, "fencing_token"), fencing_token).encode(env),
+            ];
+            items.push((args[idx], item_opts).encode(env));
+        } else {
+            items.push(
+                (
+                    atom(env, "id"),
+                    args[idx],
+                    atom(env, "lease_token"),
+                    args[lease_idx],
+                    atom(env, "fencing_token"),
+                    fencing_token,
+                )
+                    .encode(env),
+            );
+        }
+        idx += item_width;
+    }
+
+    let partition = if mixed {
+        atoms::nil().encode(env)
+    } else {
+        args[0]
+    };
+
+    (tag, partition, items, opts).encode(env)
+}
+
 fn make_flow_transition_command_ast<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -5698,6 +5791,25 @@ fn flow_terminal_option<'a>(
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_complete_many_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"RESULT_REF", "result_ref", FlowOptType::Ref(b"result_ref")),
+            (b"TTL", "ttl_ms", FlowOptType::NonNegative),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
         ],
     )
 }
@@ -6345,6 +6457,7 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"TDIGEST.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"RATELIMIT.ADD" => vec![0],
         b"FLOW.CREATE_MANY" => flow_create_many_key_indices(arg_bytes),
+        b"FLOW.COMPLETE_MANY" => flow_complete_many_key_indices(arg_bytes),
         b"FLOW.TRANSITION_MANY" => flow_transition_many_key_indices(arg_bytes),
         b"FLOW.CREATE" | b"FLOW.GET" | b"FLOW.COMPLETE" | b"FLOW.TRANSITION" | b"FLOW.RETRY"
         | b"FLOW.FAIL" | b"FLOW.CANCEL" | b"FLOW.REWIND" | b"FLOW.HISTORY" => {
@@ -6558,6 +6671,24 @@ fn flow_transition_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
     }
 
     let Some(items_idx) = option_index(arg_bytes, 3, b"ITEMS") else {
+        return vec![0];
+    };
+
+    let mut keys = Vec::new();
+    let mut idx = items_idx + 1;
+    while idx + 3 < arg_bytes.len() {
+        keys.push(idx + 1);
+        idx += 4;
+    }
+    keys
+}
+
+fn flow_complete_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
+    if arg_bytes.is_empty() || !ascii_eq_ignore_case(arg_bytes[0], b"MIXED") {
+        return vec![0];
+    }
+
+    let Some(items_idx) = option_index(arg_bytes, 1, b"ITEMS") else {
         return vec![0];
     };
 
@@ -8109,6 +8240,10 @@ mod tests {
         assert_eq!(
             classify_command_ast(b"FLOW.CREATE_MANY", 0),
             CommandAstKind::FlowCreateMany
+        );
+        assert_eq!(
+            classify_command_ast(b"FLOW.COMPLETE_MANY", 0),
+            CommandAstKind::FlowCompleteMany
         );
         assert_eq!(
             classify_command_ast(b"FLOW.CLAIM_DUE", 0),

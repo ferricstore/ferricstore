@@ -450,6 +450,25 @@ defmodule FerricStore do
   def flow_complete(_id, _lease_token, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc """
+  Completes a batch of claimed Flow records.
+
+  When `partition_key` is set, the batch is all-or-nothing because every item
+  routes to the same shard. When `partition_key` is `nil`, each item must carry
+  `:partition_key`; items are grouped by shard and each shard group is atomic.
+  Each item must provide `:id`, `:lease_token`, and `:fencing_token`.
+  """
+  @spec flow_complete_many(binary() | nil, list(), keyword()) ::
+          {:ok, [map()]} | {:error, binary()}
+  def flow_complete_many(partition_key, items, opts \\ [])
+
+  def flow_complete_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.complete_many(default_ctx(), partition_key, items, opts)
+  end
+
+  def flow_complete_many(_partition_key, _items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Moves a Flow record from one state to another, optionally guarded by a lease token."
   @spec flow_transition(binary(), binary(), binary(), keyword()) ::
           {:ok, map()} | {:error, binary()}

@@ -496,7 +496,9 @@ defmodule Ferricstore.Commands.Dispatcher do
       when tag in ~w(flow_complete flow_retry flow_fail)a,
       do: Flow.handle_ast(ast, store)
 
-  def dispatch_ast({:flow_create_many, _, _, _} = ast, store), do: Flow.handle_ast(ast, store)
+  def dispatch_ast({tag, _, _, _} = ast, store)
+      when tag in ~w(flow_create_many flow_complete_many)a,
+      do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _, _} = ast, store)
       when tag in ~w(cas ratelimit_add)a,

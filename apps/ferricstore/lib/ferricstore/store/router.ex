@@ -2658,7 +2658,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp flow_many_by_shard(ctx, attrs_list, command, batch_id)
-       when command in [:flow_create_many, :flow_transition_many] do
+       when command in [:flow_create_many, :flow_complete_many, :flow_transition_many] do
     indexed =
       attrs_list
       |> Enum.with_index()
@@ -2751,6 +2751,23 @@ defmodule Ferricstore.Store.Router do
       idx = shard_for(ctx, key)
       raft_write(ctx, idx, key, {:flow_complete, key, attrs})
     end
+  end
+
+  @doc false
+  def flow_complete_many(ctx, partition_key, attrs_list)
+      when is_binary(partition_key) and is_list(attrs_list) do
+    key = Ferricstore.Flow.Keys.state_key("__complete_batch__", partition_key)
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_complete_many, key, %{records: attrs_list}})
+    end
+  end
+
+  def flow_complete_many(ctx, nil, attrs_list) when is_list(attrs_list) do
+    flow_many_by_shard(ctx, attrs_list, :flow_complete_many, "__complete_batch__")
   end
 
   @doc false
