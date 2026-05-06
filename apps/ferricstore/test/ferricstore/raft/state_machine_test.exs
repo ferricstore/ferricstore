@@ -234,6 +234,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
     ArgumentError -> :ok
   end
 
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
   describe "Flow command time" do
     test "uses stamped apply time when Flow attrs omit now_ms", %{state: state} do
       :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
@@ -530,6 +533,118 @@ defmodule Ferricstore.Raft.StateMachineTest do
         assert measurements.batch_bytes > 0
 
         refute_receive {:flow_bitcask_append, _measurements, _metadata}, 100
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
+    test "claim_due mirror queues one LMDB writer message per apply", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+      old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+      old_max_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+      Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+      Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+      Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
+
+      :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
+      :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+
+      {:ok, writer_pid} =
+        Ferricstore.Flow.LMDBWriter.start_link(
+          instance_name: state.instance_name,
+          shard_index: shard_index,
+          data_dir: state.data_dir
+        )
+
+      on_exit(fn ->
+        try do
+          if Process.alive?(writer_pid), do: GenServer.stop(writer_pid, :normal, 5_000)
+        catch
+          :exit, _ -> :ok
+        end
+
+        safe_delete_ets(state.zset_score_index_name)
+        safe_delete_ets(state.zset_score_lookup_name)
+        safe_delete_ets(state.flow_index_name)
+        safe_delete_ets(state.flow_lookup_name)
+        restore_env(:flow_lmdb_mode, old_mode)
+        restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+        restore_env(:flow_lmdb_max_batch_ops, old_max_ops)
+      end)
+
+      partition_key = "tenant-claim-lmdb-enqueue"
+      type = "claim-lmdb-enqueue"
+
+      records =
+        for idx <- 1..10 do
+          %{
+            id: "flow-lmdb-claim-#{idx}",
+            type: type,
+            state: "queued",
+            partition_key: partition_key,
+            now_ms: 1_000,
+            run_at_ms: 1_000
+          }
+        end
+
+      {state, {:ok, created}} =
+        StateMachine.apply(
+          %{system_time: 1_000},
+          {:flow_create_many, nil, %{records: records}},
+          state
+        )
+
+      assert length(created) == 10
+      assert :ok = Ferricstore.Flow.LMDBWriter.flush(state.instance_name, shard_index)
+
+      handler_id = {:flow_claim_due_lmdb_enqueue, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :flow, :lmdb_writer, :backlog],
+          fn _event, measurements, metadata, test_pid ->
+            send(test_pid, {:flow_lmdb_backlog, measurements, metadata})
+          end,
+          self()
+        )
+
+      due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
+
+      try do
+        {_state, {:ok, claimed}} =
+          StateMachine.apply(
+            %{system_time: 2_000},
+            {:flow_claim_due, due_key,
+             %{
+               type: type,
+               state: "queued",
+               worker: "worker-claim-lmdb",
+               lease_ms: 30_000,
+               limit: 10,
+               priority: nil,
+               partition_key: partition_key
+             }},
+            state
+          )
+
+        assert length(claimed) == 10
+
+        assert_receive {:flow_lmdb_backlog, measurements,
+                        %{instance_name: :default, shard_index: ^shard_index}},
+                       500
+
+        assert measurements.pending_ops == 10
+        assert measurements.pending_after_flush == 0
+        assert measurements.oldest_pending_age_us >= 0
+
+        refute_receive {:flow_lmdb_backlog, _measurements, _metadata}, 100
       after
         :telemetry.detach(handler_id)
       end
