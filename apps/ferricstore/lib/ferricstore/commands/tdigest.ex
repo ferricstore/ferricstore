@@ -152,10 +152,16 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
-  def handle("TDIGEST.CREATE", [key, "COMPRESSION", comp_str], store) do
-    with {:ok, compression} <- parse_pos_integer(comp_str, "compression"),
-         :ok <- check_create_available(key, store) do
-      create_digest(key, compression, store)
+  def handle("TDIGEST.CREATE", [key, option, comp_str], store) do
+    case String.upcase(option) do
+      "COMPRESSION" ->
+        with {:ok, compression} <- parse_pos_integer(comp_str, "compression"),
+             :ok <- check_create_available(key, store) do
+          create_digest(key, compression, store)
+        end
+
+      _ ->
+        {:error, "ERR wrong number of arguments for 'tdigest.create' command"}
     end
   end
 
@@ -577,19 +583,26 @@ defmodule Ferricstore.Commands.TDigest do
     {:ok, src_keys, opts}
   end
 
-  defp parse_merge_opts(src_keys, ["COMPRESSION", comp_str | rest], opts) do
-    case parse_pos_integer(comp_str, "compression") do
-      {:ok, comp} -> parse_merge_opts(src_keys, rest, [{:compression, comp} | opts])
-      error -> error
+  defp parse_merge_opts(src_keys, [opt | rest], opts) do
+    case String.upcase(opt) do
+      "COMPRESSION" ->
+        case rest do
+          [comp_str | rest] ->
+            case parse_pos_integer(comp_str, "compression") do
+              {:ok, comp} -> parse_merge_opts(src_keys, rest, [{:compression, comp} | opts])
+              error -> error
+            end
+
+          _ ->
+            {:error, "ERR syntax error in 'tdigest.merge' command"}
+        end
+
+      "OVERRIDE" ->
+        parse_merge_opts(src_keys, rest, [{:override, true} | opts])
+
+      _ ->
+        {:error, "ERR syntax error in 'tdigest.merge' command"}
     end
-  end
-
-  defp parse_merge_opts(src_keys, ["OVERRIDE" | rest], opts) do
-    parse_merge_opts(src_keys, rest, [{:override, true} | opts])
-  end
-
-  defp parse_merge_opts(_src_keys, _remaining, _opts) do
-    {:error, "ERR syntax error in 'tdigest.merge' command"}
   end
 
   # ===========================================================================

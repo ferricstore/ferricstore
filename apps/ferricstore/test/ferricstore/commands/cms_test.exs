@@ -385,6 +385,23 @@ defmodule Ferricstore.Commands.CMSTest do
       assert [26] = CMS.handle("CMS.QUERY", ["dst", "a"], store)
     end
 
+    test "WEIGHTS option is case-insensitive" do
+      store = ProbMockStore.make_cms()
+      :ok = CMS.handle("CMS.INITBYDIM", ["src1", "100", "7"], store)
+      :ok = CMS.handle("CMS.INITBYDIM", ["src2", "100", "7"], store)
+      CMS.handle("CMS.INCRBY", ["src1", "a", "4"], store)
+      CMS.handle("CMS.INCRBY", ["src2", "a", "6"], store)
+
+      assert :ok =
+               CMS.handle(
+                 "CMS.MERGE",
+                 ["dst", "2", "src1", "src2", "weights", "2", "3"],
+                 store
+               )
+
+      assert [26] = CMS.handle("CMS.QUERY", ["dst", "a"], store)
+    end
+
     test "merges into existing destination (additive)" do
       store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["dst", "100", "7"], store)

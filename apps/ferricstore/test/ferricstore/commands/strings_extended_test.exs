@@ -248,6 +248,14 @@ defmodule Ferricstore.Commands.StringsExtendedTest do
       assert exp == 0
     end
 
+    test "GETEX options are case-insensitive" do
+      future = System.os_time(:millisecond) + 60_000
+      store = MockStore.make(%{"k" => {"val", future}})
+      assert "val" = Strings.handle("GETEX", ["k", "persist"], store)
+      {_, exp} = store.get_meta.("k")
+      assert exp == 0
+    end
+
     test "GETEX on non-existent key returns nil" do
       store = MockStore.make()
       assert nil == Strings.handle("GETEX", ["missing", "EX", "10"], store)

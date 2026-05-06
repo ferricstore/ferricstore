@@ -323,10 +323,14 @@ defmodule Ferricstore.Commands.Cluster do
 
   defp parse_top_n([], default), do: default
 
-  defp parse_top_n(["TOP", n_str | _], default) do
-    case Integer.parse(n_str) do
-      {n, ""} when n > 0 -> n
-      _ -> default
+  defp parse_top_n([opt, n_str | rest], default) do
+    if String.upcase(opt) == "TOP" do
+      case Integer.parse(n_str) do
+        {n, ""} when n > 0 -> n
+        _ -> default
+      end
+    else
+      parse_top_n([n_str | rest], default)
     end
   end
 
@@ -334,10 +338,14 @@ defmodule Ferricstore.Commands.Cluster do
 
   defp parse_window([], default), do: default
 
-  defp parse_window(["WINDOW", s_str | _], default) do
-    case Integer.parse(s_str) do
-      {s, ""} when s > 0 -> s
-      _ -> default
+  defp parse_window([opt, s_str | rest], default) do
+    if String.upcase(opt) == "WINDOW" do
+      case Integer.parse(s_str) do
+        {s, ""} when s > 0 -> s
+        _ -> default
+      end
+    else
+      parse_window([s_str | rest], default)
     end
   end
 

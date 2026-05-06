@@ -271,6 +271,51 @@ defmodule Ferricstore.Commands.ListTest do
       assert {:error, :disk_full} == List.handle("LPOP", ["mylist"], store)
     end
 
+    test "preserves last element when type cleanup fails after pop" do
+      base = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a"], base)
+      type_key = CompoundKey.type_key("mylist")
+
+      store =
+        Map.put(base, :compound_delete, fn
+          "mylist", ^type_key -> {:error, :disk_full}
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == List.handle("LPOP", ["mylist"], store)
+      assert ["a"] == List.handle("LRANGE", ["mylist", "0", "-1"], base)
+    end
+
+    test "preserves all elements when type cleanup fails after counted pop" do
+      base = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a", "b"], base)
+      type_key = CompoundKey.type_key("mylist")
+
+      store =
+        Map.put(base, :compound_delete, fn
+          "mylist", ^type_key -> {:error, :disk_full}
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == List.handle("LPOP", ["mylist", "2"], store)
+      assert ["a", "b"] == List.handle("LRANGE", ["mylist", "0", "-1"], base)
+    end
+
+    test "preserves element when metadata delete fails after last pop" do
+      base = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a"], base)
+      meta_key = CompoundKey.list_meta_key("mylist")
+
+      store =
+        Map.put(base, :compound_delete, fn
+          "mylist", ^meta_key -> {:error, :disk_full}
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == List.handle("LPOP", ["mylist"], store)
+      assert ["a"] == List.handle("LRANGE", ["mylist", "0", "-1"], base)
+    end
+
     test "returns nil on non-existent key" do
       store = MockStore.make()
       assert nil == List.handle("LPOP", ["nokey"], store)
@@ -310,6 +355,21 @@ defmodule Ferricstore.Commands.ListTest do
       store = MockStore.make()
       List.handle("RPUSH", ["mylist", "a", "b", "c", "d"], store)
       assert ["d", "c"] == List.handle("RPOP", ["mylist", "2"], store)
+    end
+
+    test "preserves order when type cleanup fails after counted right pop" do
+      base = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a", "b"], base)
+      type_key = CompoundKey.type_key("mylist")
+
+      store =
+        Map.put(base, :compound_delete, fn
+          "mylist", ^type_key -> {:error, :disk_full}
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == List.handle("RPOP", ["mylist", "2"], store)
+      assert ["a", "b"] == List.handle("LRANGE", ["mylist", "0", "-1"], base)
     end
 
     test "returns nil on non-existent key" do
@@ -638,6 +698,18 @@ defmodule Ferricstore.Commands.ListTest do
       assert 0 == List.handle("LPOS", ["mylist", "a", "MAXLEN", "2"], store)
     end
 
+    test "options are case-insensitive" do
+      store = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a", "b", "a", "b", "a"], store)
+
+      assert [2, 4] ==
+               List.handle(
+                 "LPOS",
+                 ["mylist", "a", "rank", "2", "count", "2", "maxlen", "5"],
+                 store
+               )
+    end
+
     test "returns nil for non-existent key" do
       store = MockStore.make()
       assert nil == List.handle("LPOS", ["nokey", "a"], store)
@@ -666,6 +738,33 @@ defmodule Ferricstore.Commands.ListTest do
       List.handle("RPUSH", ["mylist", "a", "c"], store)
       assert 3 == List.handle("LINSERT", ["mylist", "BEFORE", "c", "b"], store)
       assert ["a", "b", "c"] == List.handle("LRANGE", ["mylist", "0", "-1"], store)
+    end
+
+    test "preserves list when rebalance element rewrite fails" do
+      base = MockStore.make()
+      type_key = CompoundKey.type_key("mylist")
+      meta_key = CompoundKey.list_meta_key("mylist")
+
+      base.compound_put.("mylist", type_key, "list", 0)
+      base.compound_put.("mylist", meta_key, :erlang.term_to_binary({2, -1, 2}), 0)
+      base.compound_put.("mylist", CompoundKey.list_element("mylist", 0), "a", 0)
+      base.compound_put.("mylist", CompoundKey.list_element("mylist", 1), "b", 0)
+
+      store =
+        Map.put(base, :compound_batch_put, fn "mylist", entries ->
+          if Enum.any?(entries, fn {compound_key, _value, _expire_at_ms} ->
+               compound_key == CompoundKey.list_element("mylist", 1_000_000_000)
+             end) do
+            {:error, :disk_full}
+          else
+            base.compound_batch_put.("mylist", entries)
+          end
+        end)
+
+      assert {:error, :disk_full} ==
+               List.handle("LINSERT", ["mylist", "BEFORE", "b", "x"], store)
+
+      assert ["a", "b"] == List.handle("LRANGE", ["mylist", "0", "-1"], base)
     end
 
     test "AFTER inserts element after pivot" do

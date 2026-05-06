@@ -30,6 +30,14 @@ defmodule Ferricstore.Commands.SortedSetTest do
       assert "1.0" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
     end
 
+    test "ZADD options are case-insensitive" do
+      store = MockStore.make()
+      assert 1 == SortedSet.handle("ZADD", ["zs", "nx", "1.0", "a"], store)
+      assert 0 == SortedSet.handle("ZADD", ["zs", "xx", "2.0", "b"], store)
+      assert "1.0" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
+      assert nil == SortedSet.handle("ZSCORE", ["zs", "b"], store)
+    end
+
     test "ZADD with XX only updates existing members" do
       store = MockStore.make()
       SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
@@ -466,6 +474,21 @@ defmodule Ferricstore.Commands.SortedSetTest do
 
       assert {:error, :disk_full} == SortedSet.handle("ZREM", ["zs", "only"], store)
     end
+
+    test "ZREM preserves the last member when type cleanup fails" do
+      base = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1", "only"], base)
+      type_key = CompoundKey.type_key("zs")
+
+      store =
+        Map.put(base, :compound_delete, fn
+          "zs", ^type_key -> {:error, :disk_full}
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == SortedSet.handle("ZREM", ["zs", "only"], store)
+      assert "1.0" == SortedSet.handle("ZSCORE", ["zs", "only"], base)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -808,6 +831,21 @@ defmodule Ferricstore.Commands.SortedSetTest do
       store = zset_cleanup_failure_store()
 
       assert {:error, :disk_full} == SortedSet.handle("ZPOPMIN", ["zs"], store)
+    end
+
+    test "ZPOPMIN preserves the last member when type cleanup fails" do
+      base = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1", "only"], base)
+      type_key = CompoundKey.type_key("zs")
+
+      store =
+        Map.put(base, :compound_delete, fn
+          "zs", ^type_key -> {:error, :disk_full}
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == SortedSet.handle("ZPOPMIN", ["zs"], store)
+      assert "1.0" == SortedSet.handle("ZSCORE", ["zs", "only"], base)
     end
   end
 
@@ -1519,6 +1557,7 @@ defmodule Ferricstore.Commands.SortedSetTest do
       compound_get: fn "zs", ^type_key -> "zset" end,
       compound_batch_get: fn "zs", [^member_key] -> ["1.0"] end,
       compound_batch_delete: fn "zs", [^member_key] -> :ok end,
+      compound_batch_put: fn "zs", [{^member_key, "1.0", 0}] -> :ok end,
       compound_count: fn "zs", _prefix -> 0 end,
       compound_delete: fn "zs", ^type_key -> {:error, :disk_full} end,
       compound_scan: fn "zs", _prefix -> [{"only", "1.0"}] end

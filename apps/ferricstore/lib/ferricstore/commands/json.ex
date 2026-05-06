@@ -1105,6 +1105,13 @@ defmodule Ferricstore.Commands.Json do
   defp parse_set_flags(["NX"]), do: {:ok, true, false}
   defp parse_set_flags(["XX"]), do: {:ok, false, true}
 
+  defp parse_set_flags([opt]) when is_binary(opt) do
+    case String.upcase(opt) do
+      ^opt -> {:error, "ERR syntax error, option '#{opt}' not recognized"}
+      normalized -> parse_set_flags([normalized])
+    end
+  end
+
   defp parse_set_flags([other]) do
     {:error, "ERR syntax error, option '#{other}' not recognized"}
   end

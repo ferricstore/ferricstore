@@ -9,6 +9,7 @@ defmodule Ferricstore.GlobMatcher do
     * `*` -- matches zero or more bytes
     * `?` -- matches exactly one byte
     * `[abc]` -- character class (matches any single listed byte)
+    * `[a-z]` -- character range
     * `[^abc]` / `[!abc]` -- negated character class
     * `\\` -- escape next character (treat literally)
     * All other bytes match literally
@@ -109,14 +110,17 @@ defmodule Ferricstore.GlobMatcher do
     pc = :binary.at(pattern, pi)
 
     cond do
-      pc == ?\\ and pi + 1 < byte_size(pattern) -> 2
+      pc == ?\\ and pi + 1 < byte_size(pattern) ->
+        2
+
       pc == ?[ ->
         case parse_char_class_at(pattern, pi + 1) do
           {:ok, _chars, _neg, end_pi} -> end_pi - pi
           :error -> 1
         end
 
-      true -> 1
+      true ->
+        1
     end
   end
 
@@ -138,10 +142,40 @@ defmodule Ferricstore.GlobMatcher do
   defp collect_class_chars_at(pattern, pos, plen, acc, negated) do
     c = :binary.at(pattern, pos)
 
-    if c == ?] do
-      {:ok, acc, negated, pos + 1}
-    else
-      collect_class_chars_at(pattern, pos + 1, plen, [c | acc], negated)
+    cond do
+      c == ?] ->
+        {:ok, expand_class_tokens(Enum.reverse(acc)), negated, pos + 1}
+
+      c == ?\\ and pos + 1 < plen ->
+        collect_class_chars_at(
+          pattern,
+          pos + 2,
+          plen,
+          [{:escaped, :binary.at(pattern, pos + 1)} | acc],
+          negated
+        )
+
+      true ->
+        collect_class_chars_at(pattern, pos + 1, plen, [{:lit, c} | acc], negated)
     end
   end
+
+  defp expand_class_tokens(tokens), do: do_expand_class_tokens(tokens, [])
+
+  defp do_expand_class_tokens([{:lit, first}, {:lit, ?-}, {:lit, last} | rest], acc)
+       when first <= last do
+    do_expand_class_tokens(rest, add_class_range(first, last, acc))
+  end
+
+  defp do_expand_class_tokens([{:lit, c} | rest], acc),
+    do: do_expand_class_tokens(rest, [c | acc])
+
+  defp do_expand_class_tokens([{:escaped, c} | rest], acc),
+    do: do_expand_class_tokens(rest, [c | acc])
+
+  defp do_expand_class_tokens([], acc), do: acc
+
+  defp add_class_range(first, last, acc) when first > last, do: acc
+
+  defp add_class_range(first, last, acc), do: add_class_range(first + 1, last, [first | acc])
 end

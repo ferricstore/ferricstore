@@ -213,6 +213,20 @@ defmodule Ferricstore.NamespaceConfigTest do
       assert entry.window_ms == 10
     end
 
+    test "subcommand is case-insensitive in direct handler" do
+      result =
+        Namespace.handle(
+          "FERRICSTORE.CONFIG",
+          ["set", "rate", "window_ms", "10"],
+          MockStore.make()
+        )
+
+      assert result == :ok
+
+      {:ok, entry} = NamespaceConfig.get("rate")
+      assert entry.window_ms == 10
+    end
+
     test "SET prefix durability via command handler is rejected as removed field" do
       result =
         Namespace.handle(

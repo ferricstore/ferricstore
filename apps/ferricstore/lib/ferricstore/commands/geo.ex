@@ -484,7 +484,7 @@ defmodule Ferricstore.Commands.Geo do
         end
 
       {:error, _} = err ->
-        err
+        restore_zset_destination(store, key, backup, err)
     end
   end
 
@@ -509,15 +509,9 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp restore_zset_destination(store, key, {:zset, zset}, original_error) do
-    case delete_key_data(store, key) do
-      :ok ->
-        case write_zset(store, key, zset) do
-          :ok -> original_error
-          {:error, _} = restore_error -> restore_error
-        end
-
-      {:error, _} = restore_error ->
-        restore_error
+    case write_zset(store, key, zset) do
+      :ok -> original_error
+      {:error, _} = restore_error -> restore_error
     end
   end
 
@@ -739,6 +733,16 @@ defmodule Ferricstore.Commands.Geo do
   defp take_geoadd_flags(["NX" | rest], acc), do: take_geoadd_flags(rest, [:nx | acc])
   defp take_geoadd_flags(["XX" | rest], acc), do: take_geoadd_flags(rest, [:xx | acc])
   defp take_geoadd_flags(["CH" | rest], acc), do: take_geoadd_flags(rest, [:ch | acc])
+
+  defp take_geoadd_flags([opt | rest] = args, acc) when is_binary(opt) do
+    case String.upcase(opt) do
+      "NX" -> take_geoadd_flags(rest, [:nx | acc])
+      "XX" -> take_geoadd_flags(rest, [:xx | acc])
+      "CH" -> take_geoadd_flags(rest, [:ch | acc])
+      _not_option -> {acc, args}
+    end
+  end
+
   defp take_geoadd_flags(rest, acc), do: {acc, rest}
 
   defp parse_lng_lat_members(args), do: parse_lng_lat_members(args, [])
@@ -793,26 +797,85 @@ defmodule Ferricstore.Commands.Geo do
     end
   end
 
-  defp parse_geosearch_opts(["FROMLONLAT", lng_str, lat_str | rest], opts) do
-    if Map.has_key?(opts, :center) do
-      {:error, "ERR exactly one of FROMMEMBER or FROMLONLAT must be provided"}
-    else
-      with {:ok, lng} <- parse_float(lng_str),
-           {:ok, lat} <- parse_float(lat_str) do
-        parse_geosearch_opts(rest, Map.put(opts, :center, {:lonlat, lng, lat}))
-      end
+  defp parse_geosearch_opts([opt | rest], opts) do
+    case String.upcase(opt) do
+      "FROMLONLAT" ->
+        case rest do
+          [lng_str, lat_str | rest] ->
+            if Map.has_key?(opts, :center) do
+              {:error, "ERR exactly one of FROMMEMBER or FROMLONLAT must be provided"}
+            else
+              with {:ok, lng} <- parse_float(lng_str),
+                   {:ok, lat} <- parse_float(lat_str) do
+                parse_geosearch_opts(rest, Map.put(opts, :center, {:lonlat, lng, lat}))
+              end
+            end
+
+          _ ->
+            {:error, "ERR syntax error"}
+        end
+
+      "FROMMEMBER" ->
+        case rest do
+          [member | rest] ->
+            if Map.has_key?(opts, :center) do
+              {:error, "ERR exactly one of FROMMEMBER or FROMLONLAT must be provided"}
+            else
+              parse_geosearch_opts(rest, Map.put(opts, :center, {:member, member}))
+            end
+
+          _ ->
+            {:error, "ERR syntax error"}
+        end
+
+      "BYRADIUS" ->
+        case rest do
+          [radius_str, unit_str | rest] ->
+            parse_geosearch_radius(radius_str, unit_str, rest, opts)
+
+          _ ->
+            {:error, "ERR syntax error"}
+        end
+
+      "BYBOX" ->
+        case rest do
+          [width_str, height_str, unit_str | rest] ->
+            parse_geosearch_box(width_str, height_str, unit_str, rest, opts)
+
+          _ ->
+            {:error, "ERR syntax error"}
+        end
+
+      "ASC" ->
+        parse_geosearch_opts(rest, Map.put(opts, :sort, :asc))
+
+      "DESC" ->
+        parse_geosearch_opts(rest, Map.put(opts, :sort, :desc))
+
+      "COUNT" ->
+        case rest do
+          [count_str | rest] ->
+            parse_geosearch_count(count_str, rest, opts)
+
+          _ ->
+            {:error, "ERR syntax error"}
+        end
+
+      "WITHCOORD" ->
+        parse_geosearch_opts(rest, Map.put(opts, :withcoord, true))
+
+      "WITHDIST" ->
+        parse_geosearch_opts(rest, Map.put(opts, :withdist, true))
+
+      "WITHHASH" ->
+        parse_geosearch_opts(rest, Map.put(opts, :withhash, true))
+
+      _unknown ->
+        {:error, "ERR syntax error, unexpected '#{opt}'"}
     end
   end
 
-  defp parse_geosearch_opts(["FROMMEMBER", member | rest], opts) do
-    if Map.has_key?(opts, :center) do
-      {:error, "ERR exactly one of FROMMEMBER or FROMLONLAT must be provided"}
-    else
-      parse_geosearch_opts(rest, Map.put(opts, :center, {:member, member}))
-    end
-  end
-
-  defp parse_geosearch_opts(["BYRADIUS", radius_str, unit_str | rest], opts) do
+  defp parse_geosearch_radius(radius_str, unit_str, rest, opts) do
     if Map.has_key?(opts, :shape) do
       {:error, "ERR exactly one of BYRADIUS or BYBOX must be provided"}
     else
@@ -822,10 +885,10 @@ defmodule Ferricstore.Commands.Geo do
            true <- unit in Map.keys(@unit_conversions) do
         radius_m = radius * @unit_conversions[unit]
 
-        new_opts =
+        opts =
           Map.merge(opts, %{shape: {:radius, radius_m}, unit: unit, raw_radius: radius})
 
-        parse_geosearch_opts(rest, new_opts)
+        parse_geosearch_opts(rest, opts)
       else
         false -> {:error, "ERR unsupported unit provided. please use M, KM, FT, MI"}
         err -> err
@@ -833,7 +896,7 @@ defmodule Ferricstore.Commands.Geo do
     end
   end
 
-  defp parse_geosearch_opts(["BYBOX", width_str, height_str, unit_str | rest], opts) do
+  defp parse_geosearch_box(width_str, height_str, unit_str, rest, opts) do
     if Map.has_key?(opts, :shape) do
       {:error, "ERR exactly one of BYRADIUS or BYBOX must be provided"}
     else
@@ -845,10 +908,10 @@ defmodule Ferricstore.Commands.Geo do
         width_m = width * @unit_conversions[unit]
         height_m = height * @unit_conversions[unit]
 
-        new_opts =
+        opts =
           Map.merge(opts, %{shape: {:box, width_m, height_m}, unit: unit})
 
-        parse_geosearch_opts(rest, new_opts)
+        parse_geosearch_opts(rest, opts)
       else
         false -> {:error, "ERR unsupported unit provided. please use M, KM, FT, MI"}
         err -> err
@@ -856,20 +919,16 @@ defmodule Ferricstore.Commands.Geo do
     end
   end
 
-  defp parse_geosearch_opts(["ASC" | rest], opts) do
-    parse_geosearch_opts(rest, Map.put(opts, :sort, :asc))
-  end
-
-  defp parse_geosearch_opts(["DESC" | rest], opts) do
-    parse_geosearch_opts(rest, Map.put(opts, :sort, :desc))
-  end
-
-  defp parse_geosearch_opts(["COUNT", count_str | rest], opts) do
+  defp parse_geosearch_count(count_str, rest, opts) do
     case Integer.parse(count_str) do
       {count, ""} when count > 0 ->
         case rest do
-          ["ANY" | rest2] ->
-            parse_geosearch_opts(rest2, Map.merge(opts, %{count: count, any: true}))
+          [any | rest] when is_binary(any) ->
+            if String.upcase(any) == "ANY" do
+              parse_geosearch_opts(rest, Map.merge(opts, %{count: count, any: true}))
+            else
+              parse_geosearch_opts([any | rest], Map.merge(opts, %{count: count, any: false}))
+            end
 
           _ ->
             parse_geosearch_opts(rest, Map.merge(opts, %{count: count, any: false}))
@@ -878,22 +937,6 @@ defmodule Ferricstore.Commands.Geo do
       _ ->
         {:error, "ERR value is not an integer or out of range"}
     end
-  end
-
-  defp parse_geosearch_opts(["WITHCOORD" | rest], opts) do
-    parse_geosearch_opts(rest, Map.put(opts, :withcoord, true))
-  end
-
-  defp parse_geosearch_opts(["WITHDIST" | rest], opts) do
-    parse_geosearch_opts(rest, Map.put(opts, :withdist, true))
-  end
-
-  defp parse_geosearch_opts(["WITHHASH" | rest], opts) do
-    parse_geosearch_opts(rest, Map.put(opts, :withhash, true))
-  end
-
-  defp parse_geosearch_opts([unknown | _rest], _opts) do
-    {:error, "ERR syntax error, unexpected '#{unknown}'"}
   end
 
   # ===========================================================================

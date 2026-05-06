@@ -10,6 +10,10 @@ defmodule Ferricstore.Commands.PubSubTest do
   alias Ferricstore.PubSub
 
   setup do
+    if :ets.whereis(:ferricstore_pubsub) == :undefined do
+      start_supervised!(PubSub)
+    end
+
     # Clean ETS tables between tests
     :ets.delete_all_objects(:ferricstore_pubsub)
     :ets.delete_all_objects(:ferricstore_pubsub_patterns)
@@ -83,6 +87,15 @@ defmodule Ferricstore.Commands.PubSubTest do
       assert Enum.sort(result) == ["news.sports", "news.tech"]
     end
 
+    test "filters channels with Redis glob character classes" do
+      PubSub.subscribe("news.a", self())
+      PubSub.subscribe("news.b", self())
+      PubSub.subscribe("news.c", self())
+
+      result = PubSubCmd.handle("PUBSUB", ["CHANNELS", "news.[ab]"])
+      assert Enum.sort(result) == ["news.a", "news.b"]
+    end
+
     test "pattern filter with no matches returns empty list" do
       PubSub.subscribe("alpha", self())
 
@@ -136,6 +149,16 @@ defmodule Ferricstore.Commands.PubSubTest do
       PubSub.psubscribe("b.*", self())
 
       assert PubSubCmd.handle("PUBSUB", ["NUMPAT"]) == 2
+    end
+
+    test "PUBLISH matches pattern subscriptions with Redis glob character classes" do
+      PubSub.psubscribe("news.[ab]", self())
+
+      assert PubSubCmd.handle("PUBLISH", ["news.a", "payload"]) == 1
+      assert_receive {:pubsub_pmessage, "news.[ab]", "news.a", "payload"}
+
+      assert PubSubCmd.handle("PUBLISH", ["news.c", "payload"]) == 0
+      refute_receive {:pubsub_pmessage, "news.[ab]", "news.c", "payload"}
     end
 
     test "with extra arguments returns error" do

@@ -43,6 +43,11 @@ defmodule Ferricstore.Commands.CommandTest do
       assert result > 0
     end
 
+    test "subcommand is case-insensitive" do
+      assert Server.handle("COMMAND", ["count"], MockStore.make()) ==
+               Server.handle("COMMAND", ["COUNT"], MockStore.make())
+    end
+
     test "count matches number of entries from COMMAND" do
       all = Server.handle("COMMAND", [], MockStore.make())
       count = Server.handle("COMMAND", ["COUNT"], MockStore.make())
@@ -73,6 +78,11 @@ defmodule Ferricstore.Commands.CommandTest do
       assert "info" in result
       assert "client" in result
       assert "command" in result
+    end
+
+    test "LIST subcommand is case-insensitive" do
+      assert Server.handle("COMMAND", ["list"], MockStore.make()) ==
+               Server.handle("COMMAND", ["LIST"], MockStore.make())
     end
 
     test "all names are lowercase" do
@@ -187,7 +197,9 @@ defmodule Ferricstore.Commands.CommandTest do
     end
 
     test "returns keys at step=2 for MSET command" do
-      result = Server.handle("COMMAND", ["GETKEYS", "MSET", "k1", "v1", "k2", "v2"], MockStore.make())
+      result =
+        Server.handle("COMMAND", ["GETKEYS", "MSET", "k1", "v1", "k2", "v2"], MockStore.make())
+
       assert result == ["k1", "k2"]
     end
 
@@ -197,7 +209,8 @@ defmodule Ferricstore.Commands.CommandTest do
     end
 
     test "returns error for unknown command" do
-      assert {:error, _} = Server.handle("COMMAND", ["GETKEYS", "NONEXISTENT", "arg"], MockStore.make())
+      assert {:error, _} =
+               Server.handle("COMMAND", ["GETKEYS", "NONEXISTENT", "arg"], MockStore.make())
     end
 
     test "with no command name returns error" do
@@ -247,6 +260,12 @@ defmodule Ferricstore.Commands.CommandTest do
       assert result =~ "v0.1.0"
     end
 
+    test "VERSION option is case-insensitive" do
+      result = Server.handle("LOLWUT", ["version", "1"], MockStore.make())
+      assert is_binary(result)
+      assert result =~ "v0.1.0"
+    end
+
     test "with VERSION 99 returns art (all versions show same art)" do
       result = Server.handle("LOLWUT", ["VERSION", "99"], MockStore.make())
       assert is_binary(result)
@@ -266,6 +285,10 @@ defmodule Ferricstore.Commands.CommandTest do
 
       assert result == :ok
       assert elapsed < 500
+    end
+
+    test "DEBUG subcommand is case-insensitive" do
+      assert :ok == Server.handle("DEBUG", ["sleep", "0"], MockStore.make())
     end
 
     test "DEBUG SLEEP with invalid number returns error" do

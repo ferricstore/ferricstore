@@ -9,7 +9,6 @@ defmodule Ferricstore.AuditFixesCriticalTest do
   alias Ferricstore.GlobMatcher
   alias Ferricstore.Commands.Server
 
-
   # ---------------------------------------------------------------------------
   # Helper: build a mock store map from a key-value map
   # ---------------------------------------------------------------------------
@@ -26,7 +25,9 @@ defmodule Ferricstore.AuditFixesCriticalTest do
       put: fn _key, _val, _exp -> :ok end,
       delete: fn _key -> :ok end,
       exists?: fn key -> Map.has_key?(data, key) end,
-      keys: fn -> Map.keys(data) |> Enum.reject(&Ferricstore.Store.CompoundKey.internal_key?/1) end,
+      keys: fn ->
+        Map.keys(data) |> Enum.reject(&Ferricstore.Store.CompoundKey.internal_key?/1)
+      end,
       flush: fn -> :ok end,
       dbsize: fn -> map_size(data) end,
       incr: fn _key, _delta -> {:ok, 1} end,
@@ -81,6 +82,21 @@ defmodule Ferricstore.AuditFixesCriticalTest do
       refute GlobMatcher.match?("d", "[abc]")
     end
 
+    test "[a-c] character class range" do
+      assert GlobMatcher.match?("a", "[a-c]")
+      assert GlobMatcher.match?("b", "[a-c]")
+      assert GlobMatcher.match?("c", "[a-c]")
+      refute GlobMatcher.match?("d", "[a-c]")
+      refute GlobMatcher.match?("-", "[a-c]")
+    end
+
+    test "[^a-c] negated character class range" do
+      refute GlobMatcher.match?("a", "[^a-c]")
+      refute GlobMatcher.match?("b", "[^a-c]")
+      refute GlobMatcher.match?("c", "[^a-c]")
+      assert GlobMatcher.match?("d", "[^a-c]")
+    end
+
     test "[^abc] negated character class" do
       refute GlobMatcher.match?("a", "[^abc]")
       assert GlobMatcher.match?("d", "[^abc]")
@@ -122,7 +138,9 @@ defmodule Ferricstore.AuditFixesCriticalTest do
     describe "C2: inline parser uses :binary.split" do
       test "splits on spaces" do
         assert {:ok, [{:inline, ["PING"]}], ""} = FerricstoreServer.Resp.Parser.parse("PING\r\n")
-        assert {:ok, [{:inline, ["GET", "key"]}], ""} = FerricstoreServer.Resp.Parser.parse("GET key\r\n")
+
+        assert {:ok, [{:inline, ["GET", "key"]}], ""} =
+                 FerricstoreServer.Resp.Parser.parse("GET key\r\n")
       end
 
       test "handles multiple spaces" do
@@ -131,7 +149,8 @@ defmodule Ferricstore.AuditFixesCriticalTest do
       end
 
       test "handles tabs as whitespace" do
-        assert {:ok, [{:inline, ["GET", "key"]}], ""} = FerricstoreServer.Resp.Parser.parse("GET\tkey\r\n")
+        assert {:ok, [{:inline, ["GET", "key"]}], ""} =
+                 FerricstoreServer.Resp.Parser.parse("GET\tkey\r\n")
       end
 
       test "handles mixed whitespace" do
@@ -140,7 +159,8 @@ defmodule Ferricstore.AuditFixesCriticalTest do
       end
 
       test "trailing whitespace trimmed" do
-        assert {:ok, [{:inline, ["PING"]}], ""} = FerricstoreServer.Resp.Parser.parse("PING \t \r\n")
+        assert {:ok, [{:inline, ["PING"]}], ""} =
+                 FerricstoreServer.Resp.Parser.parse("PING \t \r\n")
       end
     end
   end
@@ -172,7 +192,6 @@ defmodule Ferricstore.AuditFixesCriticalTest do
       end
     end
   end
-
 
   # ---------------------------------------------------------------------------
   # C4: parse_float_value uses :binary.match

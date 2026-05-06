@@ -1215,11 +1215,7 @@ defmodule Ferricstore.Store.Ops do
   end
 
   defp clear_stream_tables do
-    Enum.each([Ferricstore.Stream.Meta, Ferricstore.Stream.Groups], fn table ->
-      if :ets.whereis(table) != :undefined do
-        :ets.delete_all_objects(table)
-      end
-    end)
+    Ferricstore.Commands.Stream.clear_local_state()
   end
 
   # --- On push callback (for Waiters notification) ---

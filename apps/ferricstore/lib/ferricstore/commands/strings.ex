@@ -700,6 +700,13 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
+  defp parse_getex_opts([opt | rest]) when is_binary(opt) do
+    case String.upcase(opt) do
+      ^opt -> {:error, "ERR syntax error"}
+      normalized -> parse_getex_opts([normalized | rest])
+    end
+  end
+
   defp parse_getex_opts(_) do
     {:error, "ERR syntax error"}
   end
@@ -920,8 +927,11 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
-  defp parse_set_opts([unknown | _rest], _acc) do
-    {:error, "ERR syntax error, option '#{unknown}' not recognized"}
+  defp parse_set_opts([unknown | rest], acc) when is_binary(unknown) do
+    case String.upcase(unknown) do
+      ^unknown -> {:error, "ERR syntax error, option '#{unknown}' not recognized"}
+      normalized -> parse_set_opts([normalized | rest], acc)
+    end
   end
 
   defp set_opts_from_ast(opts), do: set_opts_from_ast(opts, @set_opts_default)
@@ -1214,12 +1224,22 @@ defmodule Ferricstore.Commands.Strings do
           :ok
 
         type ->
-          with :ok <- clear_compound_prefix(key, type, store),
-               :ok <- Ops.compound_delete(store, key, type_key) do
-            :ok
+          backup = compound_clear_backup(key, type, store)
+
+          case delete_compound_data_for_replacement(key, type, type_key, store) do
+            :ok -> :ok
+            {:error, _} = error -> restore_compound_clear_backup(key, backup, store, error)
           end
       end
     else
+      :ok
+    end
+  end
+
+  defp delete_compound_data_for_replacement(key, type, type_key, store) do
+    with :ok <- clear_compound_prefix(key, type, store),
+         :ok <- Ops.compound_delete(store, key, type_key) do
+      if type == "stream", do: cleanup_stream_metadata(key)
       :ok
     end
   end
@@ -1243,7 +1263,6 @@ defmodule Ferricstore.Commands.Strings do
   defp clear_compound_prefix(key, "stream", store) do
     case Ops.compound_delete_prefix(store, key, CompoundKey.stream_prefix(key)) do
       :ok ->
-        cleanup_stream_metadata(key)
         :ok
 
       {:error, _reason} = error ->
@@ -1252,6 +1271,92 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   defp clear_compound_prefix(_key, _type, _store), do: :ok
+
+  defp compound_clear_backup(key, type, store) do
+    if compound_backup_supported?(store) do
+      compound_clear_meta_entries(key, type, store) ++
+        compound_clear_member_entries(key, type, store)
+    else
+      :unsupported
+    end
+  end
+
+  defp compound_backup_supported?(%FerricStore.Instance{}), do: true
+  defp compound_backup_supported?(%Ferricstore.Store.LocalTxStore{}), do: true
+
+  defp compound_backup_supported?(store) when is_map(store) do
+    is_function(Map.get(store, :compound_scan), 2)
+  end
+
+  defp compound_clear_meta_entries(key, type, store) do
+    type_entries = compound_key_backup_entry(key, CompoundKey.type_key(key), store, type)
+
+    list_meta_entries =
+      if type == "list" do
+        compound_key_backup_entry(key, CompoundKey.list_meta_key(key), store)
+      else
+        []
+      end
+
+    type_entries ++ list_meta_entries
+  end
+
+  defp compound_clear_member_entries(key, type, store) do
+    prefix = compound_prefix_for_type(key, type)
+
+    if prefix == nil do
+      []
+    else
+      compound_clear_member_entries_for_prefix(key, prefix, store)
+    end
+  end
+
+  defp compound_clear_member_entries_for_prefix(key, prefix, store) do
+    pairs =
+      store
+      |> Ops.compound_scan(key, prefix)
+      |> Enum.map(fn {sub_key, _value} ->
+        compound_key = scanned_compound_key(prefix, sub_key)
+        {compound_key, compound_key}
+      end)
+
+    source_keys = Enum.map(pairs, fn {source_key, _destination_key} -> source_key end)
+    metas = Ops.compound_batch_get_meta(store, key, source_keys)
+
+    pairs
+    |> Enum.zip(metas)
+    |> Enum.flat_map(fn
+      {{_source_key, _destination_key}, nil} ->
+        []
+
+      {{_source_key, destination_key}, {value, expire_at_ms}} ->
+        [{destination_key, value, expire_at_ms}]
+    end)
+  end
+
+  defp compound_key_backup_entry(key, compound_key, store, fallback_value \\ nil) do
+    case Ops.compound_get_meta(store, key, compound_key) do
+      nil when fallback_value != nil -> [{compound_key, fallback_value, 0}]
+      nil -> []
+      {value, expire_at_ms} -> [{compound_key, value, expire_at_ms}]
+    end
+  end
+
+  defp restore_compound_clear_backup(_key, :unsupported, _store, error), do: error
+
+  defp restore_compound_clear_backup(key, backup, store, error) do
+    case Ops.compound_batch_put(store, key, backup) do
+      :ok ->
+        error
+
+      {:error, _} = restore_error ->
+        {:error, {:compound_clear_rollback_failed, error, restore_error}}
+    end
+  end
+
+  defp scanned_compound_key(prefix, key) do
+    if String.starts_with?(key, prefix), do: key, else: prefix <> key
+  end
 
   # ---------------------------------------------------------------------------
   # Private — DEL key deletion (plain + compound)

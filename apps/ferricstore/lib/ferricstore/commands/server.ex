@@ -116,6 +116,8 @@ defmodule Ferricstore.Commands.Server do
     AuditLog.log(:dangerous_command, %{command: "FLUSHDB", args: args})
 
     with :ok <- Ops.flush(store) do
+      Ferricstore.Commands.Stream.clear_local_state()
+
       # Wipe prob files (bloom, CMS, cuckoo, TopK) across all shards.
       # store.flush deletes keys via Raft which should clean up files via
       # maybe_delete_prob_file, but as a safety net we also wipe the prob
@@ -136,6 +138,7 @@ defmodule Ferricstore.Commands.Server do
     AuditLog.log(:dangerous_command, %{command: "FLUSHALL", args: args})
 
     with :ok <- Ops.flush(store) do
+      Ferricstore.Commands.Stream.clear_local_state()
       flush_store_prob_dirs(store)
     end
   end
@@ -183,76 +186,70 @@ defmodule Ferricstore.Commands.Server do
   # COMMAND subcommands
   # ---------------------------------------------------------------------------
 
-  def handle("COMMAND", ["COUNT"], _store), do: Catalog.count()
+  def handle("COMMAND", [subcmd | rest], _store) do
+    case String.upcase(subcmd) do
+      "COUNT" when rest == [] ->
+        Catalog.count()
 
-  def handle("COMMAND", ["LIST"], _store), do: Catalog.names()
+      "LIST" when rest == [] ->
+        Catalog.names()
 
-  def handle("COMMAND", ["INFO" | names], _store) when names != [] do
-    Enum.map(names, fn name ->
-      case Catalog.lookup(name) do
-        {:ok, cmd} -> Catalog.info_tuple(cmd)
-        :error -> nil
-      end
-    end)
-  end
+      "INFO" ->
+        case rest do
+          [] ->
+            {:error, "ERR wrong number of arguments for 'command|info' command"}
 
-  def handle("COMMAND", ["INFO"], _store) do
-    {:error, "ERR wrong number of arguments for 'command|info' command"}
-  end
-
-  def handle("COMMAND", ["DOCS" | names], _store) when names != [] do
-    result =
-      Enum.flat_map(names, fn name ->
-        case Catalog.lookup(name) do
-          {:ok, cmd} ->
-            [cmd.name, [cmd.summary]]
-
-          :error ->
-            []
+          names ->
+            Enum.map(names, fn name ->
+              case Catalog.lookup(name) do
+                {:ok, cmd} -> Catalog.info_tuple(cmd)
+                :error -> nil
+              end
+            end)
         end
-      end)
 
-    result
-  end
+      "DOCS" ->
+        case rest do
+          [] ->
+            {:error, "ERR wrong number of arguments for 'command|docs' command"}
 
-  def handle("COMMAND", ["DOCS"], _store) do
-    {:error, "ERR wrong number of arguments for 'command|docs' command"}
-  end
+          names ->
+            Enum.flat_map(names, fn name ->
+              case Catalog.lookup(name) do
+                {:ok, cmd} -> [cmd.name, [cmd.summary]]
+                :error -> []
+              end
+            end)
+        end
 
-  def handle("COMMAND", ["GETKEYS", cmd_name | cmd_args], _store) do
-    case Catalog.get_keys(cmd_name, cmd_args) do
-      {:ok, keys} -> keys
-      {:error, msg} -> {:error, msg}
+      "GETKEYS" ->
+        case rest do
+          [] ->
+            {:error, "ERR wrong number of arguments for 'command|getkeys' command"}
+
+          [cmd_name | cmd_args] ->
+            case Catalog.get_keys(cmd_name, cmd_args) do
+              {:ok, keys} -> keys
+              {:error, msg} -> {:error, msg}
+            end
+        end
+
+      _ ->
+        {:error, "ERR unknown subcommand '#{subcmd}'. Try COMMAND HELP."}
     end
-  end
-
-  def handle("COMMAND", ["GETKEYS"], _store) do
-    {:error, "ERR wrong number of arguments for 'command|getkeys' command"}
-  end
-
-  def handle("COMMAND", [subcmd | _rest], _store) do
-    {:error, "ERR unknown subcommand '#{subcmd}'. Try COMMAND HELP."}
   end
 
   # ---------------------------------------------------------------------------
   # LOLWUT [VERSION version]
   # ---------------------------------------------------------------------------
 
-  def handle("LOLWUT", args, _store) when args in [[], ["VERSION", "1"]] do
-    art = """
-     _____              _      ____  _
-    |  ___|__ _ __ _ __(_) ___/ ___|| |_ ___  _ __ ___
-    | |_ / _ \\ '__| '__| |/ __\\___ \\| __/ _ \\| '__/ _ \\
-    |  _|  __/ |  | |  | | (__ ___) | || (_) | | |  __/
-    |_|  \\___|_|  |_|  |_|\\___|____/ \\__\\___/|_|  \\___|
-                                          v0.1.0
-    """
+  def handle("LOLWUT", [], _store), do: lolwut_art()
 
-    String.trim_trailing(art)
-  end
-
-  def handle("LOLWUT", ["VERSION", _version], _store) do
-    handle("LOLWUT", [], nil)
+  def handle("LOLWUT", [version_opt, _version], _store) do
+    case String.upcase(version_opt) do
+      "VERSION" -> lolwut_art()
+      _ -> {:error, "ERR syntax error"}
+    end
   end
 
   def handle("LOLWUT", _args, _store) do
@@ -263,86 +260,98 @@ defmodule Ferricstore.Commands.Server do
   # DEBUG SLEEP seconds
   # ---------------------------------------------------------------------------
 
-  def handle("DEBUG", ["SLEEP", seconds_str], _store) do
-    AuditLog.log(:dangerous_command, %{command: "DEBUG", args: ["SLEEP", seconds_str]})
+  def handle("DEBUG", [subcmd | rest], store) do
+    case String.upcase(subcmd) do
+      "SLEEP" ->
+        case rest do
+          [seconds_str] ->
+            AuditLog.log(:dangerous_command, %{command: "DEBUG", args: ["SLEEP", seconds_str]})
 
-    case Integer.parse(seconds_str) do
-      {secs, ""} when secs >= 0 ->
-        Process.sleep(secs * 1000)
+            case Integer.parse(seconds_str) do
+              {secs, ""} when secs >= 0 ->
+                Process.sleep(secs * 1000)
+                :ok
+
+              _ ->
+                {:error, "ERR invalid argument for DEBUG SLEEP"}
+            end
+
+          _ ->
+            {:error, "ERR wrong number of arguments for 'debug' command"}
+        end
+
+      "RELOAD" when rest == [] ->
         :ok
 
+      "FLUSHALL" ->
+        AuditLog.log(:dangerous_command, %{command: "DEBUG", args: ["FLUSHALL"]})
+        handle("FLUSHALL", [], store)
+
+      "BATCHER-STATS" when rest == [] ->
+        ctx = FerricStore.Instance.get(:default)
+        shard_count = ctx.shard_count
+
+        batcher_parts =
+          for i <- 0..(shard_count - 1) do
+            name = :"Ferricstore.Raft.Batcher.#{i}"
+
+            case Process.whereis(name) do
+              nil ->
+                "B#{i}=down"
+
+              pid ->
+                info = Process.info(pid, [:message_queue_len, :reductions])
+                "B#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
+            end
+          end
+
+        wal_name = :ra_ferricstore_raft_log_wal
+
+        wal_part =
+          case Process.whereis(wal_name) do
+            nil ->
+              "WAL=down"
+
+            pid ->
+              info = Process.info(pid, [:message_queue_len, :reductions])
+              "WAL:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
+          end
+
+        ra_parts =
+          for i <- 0..(shard_count - 1) do
+            name = :"ferricstore_shard_#{i}"
+
+            case Process.whereis(name) do
+              nil ->
+                "R#{i}=down"
+
+              pid ->
+                info = Process.info(pid, [:message_queue_len, :reductions])
+                "R#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
+            end
+          end
+
+        all = batcher_parts ++ [wal_part] ++ ra_parts
+        {:simple, Enum.join(all, " | ")}
+
+      "SET-ACTIVE-EXPIRE" when length(rest) == 1 ->
+        :ok
+
+      "CHANGE-REPL-ID" when rest == [] ->
+        :ok
+
+      "QUICKLIST-PACKED-THRESHOLD" ->
+        :ok
+
+      "AOFSTAT" when rest == [] ->
+        %{}
+
+      "SFLAGS" when rest == [] ->
+        %{}
+
       _ ->
-        {:error, "ERR invalid argument for DEBUG SLEEP"}
+        {:error, "ERR unknown subcommand '#{subcmd}'. Try DEBUG HELP."}
     end
-  end
-
-  def handle("DEBUG", ["SLEEP"], _store) do
-    {:error, "ERR wrong number of arguments for 'debug' command"}
-  end
-
-  def handle("DEBUG", ["RELOAD"], _store), do: :ok
-
-  def handle("DEBUG", ["FLUSHALL" | _], store) do
-    AuditLog.log(:dangerous_command, %{command: "DEBUG", args: ["FLUSHALL"]})
-    handle("FLUSHALL", [], store)
-  end
-
-  def handle("DEBUG", ["BATCHER-STATS"], _store) do
-    ctx = FerricStore.Instance.get(:default)
-    shard_count = ctx.shard_count
-
-    batcher_parts =
-      for i <- 0..(shard_count - 1) do
-        name = :"Ferricstore.Raft.Batcher.#{i}"
-
-        case Process.whereis(name) do
-          nil ->
-            "B#{i}=down"
-
-          pid ->
-            info = Process.info(pid, [:message_queue_len, :reductions])
-            "B#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
-        end
-      end
-
-    wal_name = :ra_ferricstore_raft_log_wal
-
-    wal_part =
-      case Process.whereis(wal_name) do
-        nil ->
-          "WAL=down"
-
-        pid ->
-          info = Process.info(pid, [:message_queue_len, :reductions])
-          "WAL:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
-      end
-
-    ra_parts =
-      for i <- 0..(shard_count - 1) do
-        name = :"ferricstore_shard_#{i}"
-
-        case Process.whereis(name) do
-          nil ->
-            "R#{i}=down"
-
-          pid ->
-            info = Process.info(pid, [:message_queue_len, :reductions])
-            "R#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
-        end
-      end
-
-    all = batcher_parts ++ [wal_part] ++ ra_parts
-    {:simple, Enum.join(all, " | ")}
-  end
-
-  def handle("DEBUG", ["SET-ACTIVE-EXPIRE", _flag], _store), do: :ok
-  def handle("DEBUG", ["CHANGE-REPL-ID"], _store), do: :ok
-  def handle("DEBUG", ["QUICKLIST-PACKED-THRESHOLD" | _], _store), do: :ok
-  def handle("DEBUG", ["AOFSTAT"], _store), do: %{}
-  def handle("DEBUG", ["SFLAGS"], _store), do: %{}
-
-  def handle("DEBUG", [subcmd | _rest], _store) do
-    {:error, "ERR unknown subcommand '#{subcmd}'. Try DEBUG HELP."}
   end
 
   def handle("DEBUG", [], _store) do
@@ -365,13 +374,14 @@ defmodule Ferricstore.Commands.Server do
   # MODULE stubs
   # ---------------------------------------------------------------------------
 
-  def handle("MODULE", ["LIST" | _], _store), do: []
-
-  def handle("MODULE", ["LOAD" | _], _store),
-    do: {:error, "ERR FerricStore does not support modules"}
-
-  def handle("MODULE", ["UNLOAD" | _], _store),
-    do: {:error, "ERR FerricStore does not support modules"}
+  def handle("MODULE", [subcmd | _rest], _store) do
+    case String.upcase(subcmd) do
+      "LIST" -> []
+      "LOAD" -> {:error, "ERR FerricStore does not support modules"}
+      "UNLOAD" -> {:error, "ERR FerricStore does not support modules"}
+      _ -> {:error, "ERR unknown subcommand for 'module' command"}
+    end
+  end
 
   def handle("MODULE", _, _store), do: {:error, "ERR unknown subcommand for 'module' command"}
 
@@ -388,34 +398,46 @@ defmodule Ferricstore.Commands.Server do
   # SLOWLOG
   # ---------------------------------------------------------------------------
 
-  def handle("SLOWLOG", ["GET"], _store), do: format_slowlog_entries(Ferricstore.SlowLog.get())
+  def handle("SLOWLOG", [subcmd | rest], _store) do
+    case String.upcase(subcmd) do
+      "GET" ->
+        case rest do
+          [] ->
+            format_slowlog_entries(Ferricstore.SlowLog.get())
 
-  def handle("SLOWLOG", ["GET", count_str], _store) do
-    case Integer.parse(count_str) do
-      {count, ""} when count >= 0 ->
-        format_slowlog_entries(Ferricstore.SlowLog.get(count))
+          [count_str] ->
+            case Integer.parse(count_str) do
+              {count, ""} when count >= 0 ->
+                format_slowlog_entries(Ferricstore.SlowLog.get(count))
+
+              _ ->
+                {:error, "ERR value is not an integer or out of range"}
+            end
+
+          _ ->
+            {:error, "ERR unknown subcommand or wrong number of arguments for 'slowlog' command"}
+        end
+
+      "LEN" when rest == [] ->
+        Ferricstore.SlowLog.len()
+
+      "RESET" when rest == [] ->
+        Ferricstore.SlowLog.reset()
+        :ok
+
+      "HELP" when rest == [] ->
+        [
+          "SLOWLOG GET [<count>] -- Return top entries from the slowlog.",
+          "SLOWLOG LEN -- Return the number of entries in the slowlog.",
+          "SLOWLOG RESET -- Reset the slowlog."
+        ]
 
       _ ->
-        {:error, "ERR value is not an integer or out of range"}
+        {:error, "ERR unknown subcommand or wrong number of arguments for 'slowlog' command"}
     end
   end
 
-  def handle("SLOWLOG", ["LEN"], _store), do: Ferricstore.SlowLog.len()
-
-  def handle("SLOWLOG", ["RESET"], _store) do
-    Ferricstore.SlowLog.reset()
-    :ok
-  end
-
-  def handle("SLOWLOG", ["HELP"], _store) do
-    [
-      "SLOWLOG GET [<count>] -- Return top entries from the slowlog.",
-      "SLOWLOG LEN -- Return the number of entries in the slowlog.",
-      "SLOWLOG RESET -- Reset the slowlog."
-    ]
-  end
-
-  def handle("SLOWLOG", _args, _store) do
+  def handle("SLOWLOG", [], _store) do
     {:error, "ERR unknown subcommand or wrong number of arguments for 'slowlog' command"}
   end
 
@@ -1292,6 +1314,19 @@ defmodule Ferricstore.Commands.Server do
 
   defp handle_config(subcmd, _) do
     {:error, "ERR unknown subcommand '#{String.downcase(subcmd)}' for 'config' command"}
+  end
+
+  defp lolwut_art do
+    art = """
+     _____              _      ____  _
+    |  ___|__ _ __ _ __(_) ___/ ___|| |_ ___  _ __ ___
+    | |_ / _ \\ '__| '__| |/ __\\___ \\| __/ _ \\| '__/ _ \\
+    |  _|  __/ |  | |  | | (__ ___) | || (_) | | |  __/
+    |_|  \\___|_|  |_|  |_|\\___|____/ \\__\\___/|_|  \\___|
+                                          v0.1.0
+    """
+
+    String.trim_trailing(art)
   end
 
   # -- CONFIG SET LOCAL key value -------------------------------------------------

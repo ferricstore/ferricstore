@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.ExpiryTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.Expiry
+  alias Ferricstore.Commands.{Expiry, Stream}
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
@@ -328,11 +328,35 @@ defmodule Ferricstore.Commands.ExpiryTest do
       assert "v" == store.get.("k")
     end
 
+    test "EXPIRE applies TTL to stream entries" do
+      store = MockStore.make()
+      key = "stream-expire"
+
+      id = Stream.handle("XADD", [key, "1-0", "field", "value"], store)
+
+      assert 1 == Expiry.handle("EXPIRE", [key, "10"], store)
+      assert ttl = Expiry.handle("TTL", [key], store)
+      assert ttl > 0 and ttl <= 10
+
+      stream_key = CompoundKey.stream_prefix(key) <> id
+      type_key = CompoundKey.type_key(key)
+      assert {_encoded, stream_expire_at_ms} = store.compound_get_meta.(key, stream_key)
+      assert {"stream", type_expire_at_ms} = store.compound_get_meta.(key, type_key)
+      assert stream_expire_at_ms == type_expire_at_ms
+    end
+
     test "EXPIRE GT rejected by older TTL does not load a cold plain value" do
       old_future = System.os_time(:millisecond) + 120_000
       store = metadata_only_expiry_store("cold_plain", old_future)
 
       assert 0 == Expiry.handle("EXPIRE", ["cold_plain", "10", "GT"], store)
+    end
+
+    test "EXPIRE GT rejects persistent keys because their TTL is treated as infinite" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+
+      assert 0 == Expiry.handle("EXPIRE", ["k", "10", "GT"], store)
+      assert -1 == Expiry.handle("TTL", ["k"], store)
     end
 
     test "EXPIRE LT rejected by newer TTL does not load a cold plain value" do

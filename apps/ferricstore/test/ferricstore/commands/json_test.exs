@@ -95,6 +95,13 @@ defmodule Ferricstore.Commands.JsonTest do
       assert ~s({"x":1}) == Json.handle("JSON.GET", ["doc"], store)
     end
 
+    test "JSON.SET options are case-insensitive" do
+      store = MockStore.make()
+      assert :ok = Json.handle("JSON.SET", ["doc", "$", ~s({"x":1}), "nx"], store)
+      assert nil == Json.handle("JSON.SET", ["missing", "$", ~s({"x":2}), "xx"], store)
+      assert ~s({"x":1}) == Json.handle("JSON.GET", ["doc"], store)
+    end
+
     test "NX flag: does not overwrite when key exists" do
       store = store_with_json(%{"x" => 1})
       assert nil == Json.handle("JSON.SET", ["doc", "$", ~s({"x":2}), "NX"], store)

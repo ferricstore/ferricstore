@@ -434,16 +434,17 @@ defmodule Ferricstore.Commands.CMS do
   defp parse_merge_weights(src_keys, [], numkeys),
     do: {:ok, src_keys, List.duplicate(1, numkeys)}
 
-  defp parse_merge_weights(src_keys, ["WEIGHTS" | weight_strs], numkeys) do
-    if length(weight_strs) != numkeys do
-      {:error, "ERR wrong number of weights for 'cms.merge' command"}
+  defp parse_merge_weights(src_keys, [opt | weight_strs], numkeys) do
+    if String.upcase(opt) == "WEIGHTS" do
+      if length(weight_strs) != numkeys do
+        {:error, "ERR wrong number of weights for 'cms.merge' command"}
+      else
+        parse_weight_values(src_keys, weight_strs)
+      end
     else
-      parse_weight_values(src_keys, weight_strs)
+      {:error, "ERR syntax error in 'cms.merge' command"}
     end
   end
-
-  defp parse_merge_weights(_src_keys, _remaining, _numkeys),
-    do: {:error, "ERR syntax error in 'cms.merge' command"}
 
   defp parse_weight_values(src_keys, weight_strs) do
     weights =

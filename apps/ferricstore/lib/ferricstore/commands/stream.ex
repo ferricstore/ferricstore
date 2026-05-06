@@ -345,10 +345,27 @@ defmodule Ferricstore.Commands.Stream do
   defp ensure_stream_read_type(key, store) do
     case :ets.lookup(@meta_table, key) do
       [_entry] ->
-        :ok
+        ensure_live_stream_metadata(key, store)
 
       [] ->
         if Ops.has_compound?(store), do: TypeRegistry.check_type(key, :stream, store), else: :ok
+    end
+  end
+
+  defp ensure_live_stream_metadata(key, store) do
+    cond do
+      not Ops.has_compound?(store) ->
+        :ok
+
+      stream_type_marker?(key, store) ->
+        :ok
+
+      TypeRegistry.get_type(key, store) == "none" ->
+        cleanup_local_stream_metadata(key)
+        :ok
+
+      true ->
+        TypeRegistry.check_type(key, :stream, store)
     end
   end
 
@@ -412,6 +429,24 @@ defmodule Ferricstore.Commands.Stream do
   @spec init_tables() :: :ok
   def init_tables do
     ensure_meta_table()
+  end
+
+  @doc """
+  Clears all local, non-durable stream state.
+
+  Stream entries live in the store through compound keys. These ETS tables are
+  acceleration/waiter state and must not survive FLUSHDB/FLUSHALL, otherwise a
+  recreated stream can retain stale range-index rows or blocked readers.
+  """
+  @spec clear_local_state() :: :ok
+  def clear_local_state do
+    Enum.each([@meta_table, @groups_table, @index_table, @stream_waiters_table], fn table ->
+      if :ets.whereis(table) != :undefined do
+        :ets.delete_all_objects(table)
+      end
+    end)
+
+    :ok
   end
 
   @doc """
@@ -1420,6 +1455,12 @@ defmodule Ferricstore.Commands.Stream do
   defp clear_stream_index(stream_key) do
     :ets.select_delete(@index_table, [{{{stream_key, :_, :_}, :_, :_}, [], [true]}])
     :ets.delete(@index_table, {:ready, stream_key})
+  end
+
+  defp cleanup_local_stream_metadata(stream_key) do
+    :ets.delete(@meta_table, stream_key)
+    :ets.match_delete(@groups_table, {{stream_key, :_}, :_, :_, :_})
+    clear_stream_index(stream_key)
   end
 
   defp insert_stream_index_entry(stream_key, id_str, compound_key) do

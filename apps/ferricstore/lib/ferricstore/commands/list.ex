@@ -366,15 +366,19 @@ defmodule Ferricstore.Commands.List do
   defp do_pop(key, store, direction, count) do
     key
     |> ListOps.execute(store, {direction, count})
-    |> return_after_list_pop(key, store)
+    |> return_after_list_pop(key, store, direction)
   end
 
-  defp return_after_list_pop({:error, _} = error, _key, _store), do: error
-  defp return_after_list_pop(nil, _key, _store), do: nil
-  defp return_after_list_pop([], _key, _store), do: []
+  defp return_after_list_pop({:error, _} = error, _key, _store, _direction), do: error
+  defp return_after_list_pop(nil, _key, _store, _direction), do: nil
+  defp return_after_list_pop([], _key, _store, _direction), do: []
 
-  defp return_after_list_pop(result, key, store) when is_binary(result) or is_list(result) do
-    with :ok <- maybe_cleanup_empty_list(key, store), do: result
+  defp return_after_list_pop(result, key, store, direction)
+       when is_binary(result) or is_list(result) do
+    case maybe_cleanup_empty_list(key, store) do
+      :ok -> result
+      {:error, _} = error -> rollback_popped_list_values(key, store, direction, result, error)
+    end
   end
 
   defp return_after_list_delete_count({:error, _} = error, _key, _store), do: error
@@ -397,6 +401,27 @@ defmodule Ferricstore.Commands.List do
     end
   end
 
+  defp rollback_popped_list_values(key, store, direction, result, cleanup_error) do
+    values = if is_list(result), do: result, else: [result]
+
+    restore_values =
+      case direction do
+        direction when direction in [:left, :lpop] -> values
+        direction when direction in [:right, :rpop] -> Enum.reverse(values)
+      end
+
+    case ListOps.execute(key, store, {:rpush, restore_values}) do
+      count when is_integer(count) ->
+        cleanup_error
+
+      {:error, _} = rollback_error ->
+        {:error, {:list_pop_rollback_failed, cleanup_error, rollback_error}}
+
+      rollback_error ->
+        {:error, {:list_pop_rollback_failed, cleanup_error, rollback_error}}
+    end
+  end
+
   defp pop_parsed(key, store, direction, count) when count >= 0 do
     with :ok <- TypeRegistry.check_type(key, :list, store),
          do: do_pop(key, store, direction, count)
@@ -408,31 +433,35 @@ defmodule Ferricstore.Commands.List do
   defp parse_lpos_opts(opts), do: parse_lpos_opts(opts, 1, nil, 0)
   defp parse_lpos_opts([], rank, count, maxlen), do: {:ok, rank, count, maxlen}
 
-  defp parse_lpos_opts(["RANK", val | rest], _, count, maxlen) do
-    case Integer.parse(val) do
-      {0, ""} ->
-        {:error,
-         "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use NEGATIVE to start from the end of the list"}
+  defp parse_lpos_opts([opt, val | rest], rank, count, maxlen) do
+    case String.upcase(opt) do
+      "RANK" ->
+        case Integer.parse(val) do
+          {0, ""} ->
+            {:error,
+             "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use NEGATIVE to start from the end of the list"}
 
-      {r, ""} ->
-        parse_lpos_opts(rest, r, count, maxlen)
+          {r, ""} ->
+            parse_lpos_opts(rest, r, count, maxlen)
+
+          _ ->
+            {:error, "ERR value is not an integer or out of range"}
+        end
+
+      "COUNT" ->
+        case Integer.parse(val) do
+          {c, ""} when c >= 0 -> parse_lpos_opts(rest, rank, c, maxlen)
+          _ -> {:error, "ERR value is not an integer or out of range"}
+        end
+
+      "MAXLEN" ->
+        case Integer.parse(val) do
+          {m, ""} when m >= 0 -> parse_lpos_opts(rest, rank, count, m)
+          _ -> {:error, "ERR value is not an integer or out of range"}
+        end
 
       _ ->
-        {:error, "ERR value is not an integer or out of range"}
-    end
-  end
-
-  defp parse_lpos_opts(["COUNT", val | rest], rank, _, maxlen) do
-    case Integer.parse(val) do
-      {c, ""} when c >= 0 -> parse_lpos_opts(rest, rank, c, maxlen)
-      _ -> {:error, "ERR value is not an integer or out of range"}
-    end
-  end
-
-  defp parse_lpos_opts(["MAXLEN", val | rest], rank, count, _) do
-    case Integer.parse(val) do
-      {m, ""} when m >= 0 -> parse_lpos_opts(rest, rank, count, m)
-      _ -> {:error, "ERR value is not an integer or out of range"}
+        {:error, "ERR syntax error, option '#{opt}' not recognized"}
     end
   end
 

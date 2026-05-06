@@ -49,55 +49,7 @@ defmodule Ferricstore.Commands.Namespace do
   # FERRICSTORE.CONFIG SET prefix field value
   # ---------------------------------------------------------------------------
 
-  def handle("FERRICSTORE.CONFIG", ["SET", prefix, field, value], _store) do
-    NamespaceConfig.set(prefix, String.downcase(field), value)
-  end
-
-  def handle("FERRICSTORE.CONFIG", ["SET" | _rest], _store) do
-    {:error, "ERR wrong number of arguments for 'ferricstore.config set' command"}
-  end
-
-  # ---------------------------------------------------------------------------
-  # FERRICSTORE.CONFIG GET [prefix]
-  # ---------------------------------------------------------------------------
-
-  def handle("FERRICSTORE.CONFIG", ["GET", prefix], _store) do
-    {:ok, entry} = NamespaceConfig.get(prefix)
-    format_entry(entry)
-  end
-
-  def handle("FERRICSTORE.CONFIG", ["GET"], _store) do
-    entries = NamespaceConfig.get_all()
-    Enum.flat_map(entries, &format_entry/1)
-  end
-
-  # ---------------------------------------------------------------------------
-  # FERRICSTORE.CONFIG RESET [prefix]
-  # ---------------------------------------------------------------------------
-
-  def handle("FERRICSTORE.CONFIG", ["RESET", prefix], _store) do
-    NamespaceConfig.reset(prefix)
-    :ok
-  end
-
-  def handle("FERRICSTORE.CONFIG", ["RESET"], _store) do
-    NamespaceConfig.reset_all()
-    :ok
-  end
-
-  # ---------------------------------------------------------------------------
-  # Unknown subcommand / wrong args
-  # ---------------------------------------------------------------------------
-
-  def handle("FERRICSTORE.CONFIG", [subcmd | _rest], _store) do
-    {:error,
-     "ERR unknown subcommand '#{String.downcase(subcmd)}' for 'ferricstore.config' command. " <>
-       "Try SET, GET, or RESET."}
-  end
-
-  def handle("FERRICSTORE.CONFIG", [], _store) do
-    {:error, "ERR wrong number of arguments for 'ferricstore.config' command"}
-  end
+  def handle("FERRICSTORE.CONFIG", args, _store), do: handle_config(args, "")
 
   # ---------------------------------------------------------------------------
   # 4-arity variant: accepts conn_state for audit trail (changed_by)
@@ -110,14 +62,14 @@ defmodule Ferricstore.Commands.Namespace do
   in the audit trail.
   """
   @spec handle(binary(), [binary()], map(), map()) :: term()
-  def handle("FERRICSTORE.CONFIG", ["SET", prefix, field, value], _store, conn_state) do
+  def handle("FERRICSTORE.CONFIG", args, _store, conn_state) do
     changed_by =
       case Map.get(conn_state, :client_id) do
         nil -> ""
         id -> "client:#{id}"
       end
 
-    NamespaceConfig.set(prefix, String.downcase(field), value, changed_by)
+    handle_config(args, changed_by)
   end
 
   def handle(cmd, args, store, _conn_state) do
@@ -142,5 +94,55 @@ defmodule Ferricstore.Commands.Namespace do
       "changed_by",
       changed_by
     ]
+  end
+
+  defp handle_config([], _changed_by) do
+    {:error, "ERR wrong number of arguments for 'ferricstore.config' command"}
+  end
+
+  defp handle_config([subcmd | rest], changed_by) do
+    case String.upcase(subcmd) do
+      "SET" ->
+        case rest do
+          [prefix, field, value] ->
+            NamespaceConfig.set(prefix, String.downcase(field), value, changed_by)
+
+          _ ->
+            {:error, "ERR wrong number of arguments for 'ferricstore.config set' command"}
+        end
+
+      "GET" ->
+        case rest do
+          [prefix] ->
+            {:ok, entry} = NamespaceConfig.get(prefix)
+            format_entry(entry)
+
+          [] ->
+            NamespaceConfig.get_all()
+            |> Enum.flat_map(&format_entry/1)
+
+          _ ->
+            {:error, "ERR wrong number of arguments for 'ferricstore.config get' command"}
+        end
+
+      "RESET" ->
+        case rest do
+          [prefix] ->
+            NamespaceConfig.reset(prefix)
+            :ok
+
+          [] ->
+            NamespaceConfig.reset_all()
+            :ok
+
+          _ ->
+            {:error, "ERR wrong number of arguments for 'ferricstore.config reset' command"}
+        end
+
+      _ ->
+        {:error,
+         "ERR unknown subcommand '#{String.downcase(subcmd)}' for 'ferricstore.config' command. " <>
+           "Try SET, GET, or RESET."}
+    end
   end
 end

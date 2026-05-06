@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.StreamTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Commands.{Stream, Strings}
+  alias Ferricstore.Commands.{Expiry, Stream, Strings}
   alias Ferricstore.Test.MockStore
 
   # Each test gets a unique stream key to avoid interference.
@@ -264,6 +264,20 @@ defmodule Ferricstore.Commands.StreamTest do
 
       Stream.handle("XADD", [key, "*", "h", "x"], store)
       assert 3 == Stream.handle("XLEN", [key], store)
+    end
+
+    test "XLEN treats an expired stream as missing even when local metadata exists" do
+      store = MockStore.make()
+      key = ustream()
+
+      Stream.handle("XADD", [key, "1-0", "f", "v"], store)
+      assert 1 == Stream.handle("XLEN", [key], store)
+
+      assert 1 == Expiry.handle("PEXPIRE", [key, "1"], store)
+      Process.sleep(5)
+
+      assert 0 == Stream.handle("XLEN", [key], store)
+      assert [] == Stream.handle("XRANGE", [key, "-", "+"], store)
     end
 
     test "XLEN wrong number of arguments" do

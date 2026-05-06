@@ -252,32 +252,9 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   def handle("ZPOPMIN", [key, count_str], store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      case Integer.parse(count_str) do
-        {count, ""} when count >= 0 ->
-          to_pop = zpop_members(key, count, false, store)
-
-          result =
-            Enum.flat_map(to_pop, fn {member, score} ->
-              [member, format_score(score)]
-            end)
-
-          compound_keys =
-            Enum.map(to_pop, fn {member, _score} -> CompoundKey.zset_member(key, member) end)
-
-          case Ops.compound_batch_delete(store, key, compound_keys) do
-            :ok ->
-              with :ok <- maybe_cleanup_empty_zset(key, length(to_pop), store) do
-                result
-              end
-
-            {:error, _} = err ->
-              err
-          end
-
-        _ ->
-          {:error, "ERR value is not an integer or out of range"}
-      end
+    case Integer.parse(count_str) do
+      {count, ""} when count >= 0 -> zpop_parsed(key, count, false, store)
+      _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
 
@@ -294,32 +271,9 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   def handle("ZPOPMAX", [key, count_str], store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      case Integer.parse(count_str) do
-        {count, ""} when count >= 0 ->
-          to_pop = zpop_members(key, count, true, store)
-
-          result =
-            Enum.flat_map(to_pop, fn {member, score} ->
-              [member, format_score(score)]
-            end)
-
-          compound_keys =
-            Enum.map(to_pop, fn {member, _score} -> CompoundKey.zset_member(key, member) end)
-
-          case Ops.compound_batch_delete(store, key, compound_keys) do
-            :ok ->
-              with :ok <- maybe_cleanup_empty_zset(key, length(to_pop), store) do
-                result
-              end
-
-            {:error, _} = err ->
-              err
-          end
-
-        _ ->
-          {:error, "ERR value is not an integer or out of range"}
-      end
+    case Integer.parse(count_str) do
+      {count, ""} when count >= 0 -> zpop_parsed(key, count, true, store)
+      _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
 
@@ -654,6 +608,34 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
+  defp delete_zset_members_and_cleanup(key, removed_entries, removed_count, store) do
+    removed_keys =
+      Enum.map(removed_entries, fn {compound_key, _value, _expire_at_ms} -> compound_key end)
+
+    case Ops.compound_batch_delete(store, key, removed_keys) do
+      :ok ->
+        case maybe_cleanup_empty_zset(key, removed_count, store) do
+          :ok -> :ok
+          {:error, _} = error -> rollback_deleted_zset_members(key, removed_entries, store, error)
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp rollback_deleted_zset_members(_key, [], _store, write_error), do: write_error
+
+  defp rollback_deleted_zset_members(key, removed_entries, store, write_error) do
+    case Ops.compound_batch_put(store, key, removed_entries) do
+      :ok ->
+        write_error
+
+      {:error, _} = rollback_error ->
+        {:error, {:zset_delete_rollback_failed, write_error, rollback_error}}
+    end
+  end
+
   defp zrem_args([key | members], store) when members != [] do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
       compound_keys =
@@ -661,25 +643,24 @@ defmodule Ferricstore.Commands.SortedSet do
         |> Enum.uniq()
         |> Enum.map(&CompoundKey.zset_member(key, &1))
 
-      removed_keys =
+      scores_by_key =
         store
         |> Ops.compound_batch_get(key, compound_keys)
         |> Enum.zip(compound_keys)
-        |> Enum.flat_map(fn
-          {nil, _compound_key} -> []
-          {_value, compound_key} -> [compound_key]
+        |> Map.new(fn {score_str, compound_key} -> {compound_key, score_str} end)
+
+      removed_entries =
+        Enum.flat_map(compound_keys, fn compound_key ->
+          case Map.fetch!(scores_by_key, compound_key) do
+            nil -> []
+            score_str -> [{compound_key, score_str, 0}]
+          end
         end)
 
-      removed = length(removed_keys)
+      removed = length(removed_entries)
 
-      case Ops.compound_batch_delete(store, key, removed_keys) do
-        :ok ->
-          with :ok <- maybe_cleanup_empty_zset(key, removed, store) do
-            removed
-          end
-
-        {:error, _} = err ->
-          err
+      with :ok <- delete_zset_members_and_cleanup(key, removed_entries, removed, store) do
+        removed
       end
     end
   end
@@ -942,14 +923,14 @@ defmodule Ferricstore.Commands.SortedSet do
       compound_keys =
         Enum.map(to_pop, fn {member, _score} -> CompoundKey.zset_member(key, member) end)
 
-      case Ops.compound_batch_delete(store, key, compound_keys) do
-        :ok ->
-          with :ok <- maybe_cleanup_empty_zset(key, length(to_pop), store) do
-            result
-          end
+      removed_entries =
+        Enum.zip(compound_keys, to_pop)
+        |> Enum.map(fn {compound_key, {_member, score}} ->
+          {compound_key, format_score(score), 0}
+        end)
 
-        {:error, _} = err ->
-          err
+      with :ok <- delete_zset_members_and_cleanup(key, removed_entries, length(to_pop), store) do
+        result
       end
     end
   end
@@ -1136,7 +1117,21 @@ defmodule Ferricstore.Commands.SortedSet do
   defp parse_zadd_opts(["LT" | rest], opts), do: parse_zadd_opts(rest, %{opts | lt: true})
   defp parse_zadd_opts(["CH" | rest], opts), do: parse_zadd_opts(rest, %{opts | ch: true})
 
+  defp parse_zadd_opts([opt | rest], opts) when is_binary(opt) do
+    case String.upcase(opt) do
+      normalized when normalized in ["NX", "XX", "GT", "LT", "CH"] ->
+        parse_zadd_opts([normalized | rest], opts)
+
+      _not_option ->
+        parse_zadd_score_members([opt | rest], opts)
+    end
+  end
+
   defp parse_zadd_opts(score_member_args, opts) do
+    parse_zadd_score_members(score_member_args, opts)
+  end
+
+  defp parse_zadd_score_members(score_member_args, opts) do
     # Validate mutually exclusive flag combinations (Redis compat)
     cond do
       opts.nx and opts.xx ->

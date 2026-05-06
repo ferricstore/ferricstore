@@ -170,6 +170,16 @@ defmodule Ferricstore.Commands.ClusterTest do
       assert Enum.at(result, idx + 1) == "2"
     end
 
+    test "TOP and WINDOW arguments are case-insensitive" do
+      store = MockStore.make()
+      result = Dispatcher.dispatch("FERRICSTORE.HOTNESS", ["top", "2", "window", "30"], store)
+
+      assert is_list(result)
+      idx = Enum.find_index(result, &(&1 == "top_n"))
+      assert Enum.at(result, idx + 1) == "2"
+      assert "hot_reads" in result
+    end
+
     test "accepts WINDOW argument" do
       store = MockStore.make()
       result = Dispatcher.dispatch("FERRICSTORE.HOTNESS", ["WINDOW", "30"], store)

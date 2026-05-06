@@ -290,7 +290,8 @@ defmodule Ferricstore.Commands.Expiry do
   defp flag_allows?(:nx, _old, _new), do: false
   defp flag_allows?(:xx, 0, _new), do: false
   defp flag_allows?(:xx, _old, _new), do: true
-  defp flag_allows?(:gt, 0, _new), do: true
+  # Redis treats persistent keys as having infinite TTL for GT/LT comparisons.
+  defp flag_allows?(:gt, 0, _new), do: false
   defp flag_allows?(:gt, old, new), do: new > old
   defp flag_allows?(:lt, 0, _new), do: true
   defp flag_allows?(:lt, old, new), do: new < old
@@ -429,6 +430,7 @@ defmodule Ferricstore.Commands.Expiry do
   defp compound_prefix("list", key), do: CompoundKey.list_prefix(key)
   defp compound_prefix("set", key), do: CompoundKey.set_prefix(key)
   defp compound_prefix("zset", key), do: CompoundKey.zset_prefix(key)
+  defp compound_prefix("stream", key), do: CompoundKey.stream_prefix(key)
 
   defp compound_member_ttl_entries(prefix, key, expire_at_ms, store) do
     store

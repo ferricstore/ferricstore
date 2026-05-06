@@ -56,6 +56,12 @@ defmodule Ferricstore.Commands.StringsTest do
       assert "val" == store.get.("newkey")
     end
 
+    test "SET options are case-insensitive" do
+      store = MockStore.make()
+      assert :ok = Strings.handle("SET", ["newkey", "val", "ex", "10", "nx"], store)
+      assert "val" == store.get.("newkey")
+    end
+
     test "SET with NX returns nil when key already present" do
       store = MockStore.make(%{"key" => {"existing", 0}})
       assert nil == Strings.handle("SET", ["key", "new_val", "NX"], store)
@@ -139,6 +145,7 @@ defmodule Ferricstore.Commands.StringsTest do
 
       assert {:error, :disk_full} = Strings.handle("SET", ["key", "string"], store)
       assert "hash" == base.compound_get.("key", type_key)
+      assert "value" == Hash.handle("HGET", ["key", "field"], base)
     end
 
     test "SET with EX and NX combined works when key absent" do

@@ -16,11 +16,17 @@ defmodule Ferricstore.Commands.ServerStubsTest do
     test "returns empty list" do
       assert [] == Server.handle("MODULE", ["LIST"], MockStore.make())
     end
+
+    test "subcommand is case-insensitive" do
+      assert [] == Server.handle("MODULE", ["list"], MockStore.make())
+    end
   end
 
   describe "MODULE LOAD" do
     test "returns error about unsupported modules" do
-      assert {:error, msg} = Server.handle("MODULE", ["LOAD", "/path/to/module.so"], MockStore.make())
+      assert {:error, msg} =
+               Server.handle("MODULE", ["LOAD", "/path/to/module.so"], MockStore.make())
+
       assert msg =~ "does not support modules"
     end
 
@@ -116,7 +122,8 @@ defmodule Ferricstore.Commands.ServerStubsTest do
 
   describe "DEBUG QUICKLIST-PACKED-THRESHOLD" do
     test "returns OK" do
-      assert :ok = Server.handle("DEBUG", ["QUICKLIST-PACKED-THRESHOLD", "1024"], MockStore.make())
+      assert :ok =
+               Server.handle("DEBUG", ["QUICKLIST-PACKED-THRESHOLD", "1024"], MockStore.make())
     end
 
     test "returns OK with no value arg" do

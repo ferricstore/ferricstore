@@ -299,6 +299,14 @@ defmodule Ferricstore.Commands.GeoTest do
       assert_in_delta String.to_float(plat), @palermo_lat, 0.01
     end
 
+    test "GEOADD options are case-insensitive" do
+      store = MockStore.make()
+
+      assert 1 == Geo.handle("GEOADD", ["mygeo", "nx", "13.0", "38.0", "Palermo"], store)
+      assert 0 == Geo.handle("GEOADD", ["mygeo", "xx", "15.0", "37.5", "Catania"], store)
+      [nil] = Geo.handle("GEOPOS", ["mygeo", "Catania"], store)
+    end
+
     test "XX flag only updates existing, does not add new" do
       store =
         store_with_geo("mygeo", [
@@ -679,6 +687,31 @@ defmodule Ferricstore.Commands.GeoTest do
       refute "Rome" in result
     end
 
+    test "options are case-insensitive", %{store: store} do
+      result =
+        Geo.handle(
+          "GEOSEARCH",
+          [
+            "mygeo",
+            "fromlonlat",
+            "13.361389",
+            "38.115556",
+            "byradius",
+            "500",
+            "km",
+            "asc",
+            "count",
+            "1",
+            "any",
+            "withdist"
+          ],
+          store
+        )
+
+      assert [[member, _distance]] = result
+      assert member in ["Palermo", "Catania", "Rome"]
+    end
+
     test "FROMLONLAT BYRADIUS with larger radius finds all", %{store: store} do
       result =
         Geo.handle(
@@ -1002,8 +1035,14 @@ defmodule Ferricstore.Commands.GeoTest do
       store =
         base
         |> Map.put(:delete, fn "dst" -> {:error, :disk_full} end)
-        |> Map.put(:compound_batch_put, fn "dst", _entries ->
-          flunk("GEOSEARCHSTORE must not write replacement members after cleanup failure")
+        |> Map.put(:compound_batch_put, fn "dst", entries ->
+          if Enum.any?(entries, fn {compound_key, _value, _expire_at_ms} ->
+               compound_key == CompoundKey.zset_member("dst", "Palermo")
+             end) do
+            flunk("GEOSEARCHSTORE must not write replacement members after cleanup failure")
+          else
+            base.compound_batch_put.("dst", entries)
+          end
         end)
 
       assert {:error, :disk_full} ==
@@ -1021,6 +1060,59 @@ defmodule Ferricstore.Commands.GeoTest do
                  ],
                  store
                )
+    end
+
+    test "preserves existing destination when cleanup fails after metadata delete" do
+      base =
+        store_with_geo("src", [
+          {@palermo_lng, @palermo_lat, "Palermo"},
+          {@catania_lng, @catania_lat, "Catania"}
+        ])
+
+      assert 1 == Geo.handle("GEOADD", ["dst", "12.0", "42.0", "Old"], base)
+      type_key = CompoundKey.type_key("dst")
+
+      store =
+        base
+        |> Map.put(:compound_delete, fn
+          "dst", ^type_key -> base.compound_delete.("dst", type_key)
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+        |> Map.put(:compound_delete_prefix, fn "dst", prefix ->
+          if prefix == CompoundKey.zset_prefix("dst") do
+            {:error, :disk_full}
+          else
+            base.compound_delete_prefix.("dst", prefix)
+          end
+        end)
+        |> Map.put(:compound_batch_put, fn "dst", entries ->
+          if Enum.any?(entries, fn {compound_key, _value, _expire_at_ms} ->
+               compound_key == CompoundKey.zset_member("dst", "Palermo")
+             end) do
+            flunk("GEOSEARCHSTORE must not write replacement members after cleanup failure")
+          else
+            base.compound_batch_put.("dst", entries)
+          end
+        end)
+
+      assert {:error, :disk_full} ==
+               Geo.handle(
+                 "GEOSEARCHSTORE",
+                 [
+                   "dst",
+                   "src",
+                   "FROMLONLAT",
+                   "13.361389",
+                   "38.115556",
+                   "BYRADIUS",
+                   "200",
+                   "KM"
+                 ],
+                 store
+               )
+
+      assert "zset" == base.compound_get.("dst", type_key)
+      assert ["Old"] == SortedSet.handle("ZRANGE", ["dst", "0", "-1"], base)
     end
 
     test "preserves existing destination when replacement member write fails" do

@@ -46,6 +46,14 @@ defmodule Ferricstore.Commands.TDigestTest do
       ["Compression", 200 | _] = info
     end
 
+    test "COMPRESSION option is case-insensitive" do
+      store = MockStore.make()
+      assert :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest", "compression", "200"], store)
+
+      info = TDigestCmd.handle("TDIGEST.INFO", ["mydigest"], store)
+      ["Compression", 200 | _] = info
+    end
+
     test "returns error when key already exists" do
       store = MockStore.make()
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
@@ -1024,6 +1032,26 @@ defmodule Ferricstore.Commands.TDigestTest do
       max_val = parse_float_str(TDigestCmd.handle("TDIGEST.MAX", ["dst"], store))
       # Should not contain 1000.0
       assert max_val <= 3.1
+    end
+
+    test "merge options are case-insensitive" do
+      store = MockStore.make()
+      :ok = TDigestCmd.handle("TDIGEST.CREATE", ["dst"], store)
+      :ok = TDigestCmd.handle("TDIGEST.ADD", ["dst", "1000.0"], store)
+
+      :ok = TDigestCmd.handle("TDIGEST.CREATE", ["src1"], store)
+      :ok = TDigestCmd.handle("TDIGEST.ADD", ["src1", "1.0", "2.0", "3.0"], store)
+
+      assert :ok =
+               TDigestCmd.handle(
+                 "TDIGEST.MERGE",
+                 ["dst", "1", "src1", "compression", "300", "override"],
+                 store
+               )
+
+      info = TDigestCmd.handle("TDIGEST.INFO", ["dst"], store)
+      assert find_info_field(info, "Compression") == 300
+      assert parse_float_str(TDigestCmd.handle("TDIGEST.MAX", ["dst"], store)) <= 3.1
     end
 
     test "merged quantiles close to combined reference" do

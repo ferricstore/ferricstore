@@ -14,8 +14,8 @@ defmodule Ferricstore.PubSub do
       subscriptions. Uses a `:bag` so multiple pids can subscribe to the same
       channel while duplicate subscriptions from the same pid remain collapsed.
 
-    * `:ferricstore_pubsub_patterns` — `{pattern, pid, compiled_regex}` entries
-      for glob-pattern subscriptions (PSUBSCRIBE). Also a `:bag`.
+    * `:ferricstore_pubsub_patterns` — `{pattern, pid, matcher}` entries for
+      glob-pattern subscriptions (PSUBSCRIBE). Also a `:bag`.
 
   Both tables are owned by a `GenServer` (`Ferricstore.PubSub`) so they survive
   the lifetime of the application and are cleaned up on shutdown.
@@ -108,8 +108,8 @@ defmodule Ferricstore.PubSub do
   @doc """
   Subscribes `pid` to all channels matching `pattern` (glob syntax).
 
-  The glob pattern is compiled to a regex and stored alongside the entry
-  for efficient matching at publish time.
+  The raw glob pattern is stored and evaluated with `Ferricstore.GlobMatcher`
+  at publish time, so PubSub uses the same Redis pattern semantics as SCAN.
 
   ## Parameters
 
@@ -123,8 +123,7 @@ defmodule Ferricstore.PubSub do
   @spec psubscribe(pattern(), pid()) :: :ok
   def psubscribe(pattern, pid) when is_binary(pattern) and is_pid(pid) do
     if :ets.match(@patterns_table, {pattern, pid, :_}) == [] do
-      regex = glob_to_regex(pattern)
-      :ets.insert(@patterns_table, {pattern, pid, regex})
+      :ets.insert(@patterns_table, {pattern, pid, :glob_matcher})
       ensure_monitor(pid)
     end
 
@@ -147,7 +146,7 @@ defmodule Ferricstore.PubSub do
   """
   @spec punsubscribe(pattern(), pid()) :: :ok
   def punsubscribe(pattern, pid) when is_binary(pattern) and is_pid(pid) do
-    # match_delete with a wildcard for the compiled regex
+    # match_delete with a wildcard for the matcher marker
     :ets.match_delete(@patterns_table, {pattern, pid, :_})
     maybe_demonitor(pid)
     :ok
@@ -156,8 +155,8 @@ defmodule Ferricstore.PubSub do
   @doc """
   Publishes `message` to all subscribers of `channel`.
 
-  Looks up exact channel subscribers and pattern subscribers whose compiled
-  regex matches the channel name. Sends a BEAM message to each matching pid.
+  Looks up exact channel subscribers and pattern subscribers whose glob pattern
+  matches the channel name. Sends a BEAM message to each matching pid.
 
   ## Parameters
 
@@ -183,8 +182,8 @@ defmodule Ferricstore.PubSub do
     pattern_count =
       @patterns_table
       |> :ets.tab2list()
-      |> Enum.reduce(0, fn {pattern, pid, regex}, count ->
-        if Regex.match?(regex, channel) do
+      |> Enum.reduce(0, fn {pattern, pid, _matcher}, count ->
+        if Ferricstore.GlobMatcher.match?(channel, pattern) do
           send(pid, {:pubsub_pmessage, pattern, channel, message})
           count + 1
         else
@@ -222,8 +221,7 @@ defmodule Ferricstore.PubSub do
         all_channels
 
       pat when is_binary(pat) ->
-        regex = glob_to_regex(pat)
-        Enum.filter(all_channels, &Regex.match?(regex, &1))
+        Enum.filter(all_channels, &Ferricstore.GlobMatcher.match?(&1, pat))
     end
   end
 
@@ -327,10 +325,6 @@ defmodule Ferricstore.PubSub do
     {:noreply, state}
   end
 
-  # ---------------------------------------------------------------------------
-  # Private — glob-to-regex conversion
-  # ---------------------------------------------------------------------------
-
   defp ensure_monitor(pid) do
     GenServer.call(__MODULE__, {:ensure_monitor, pid})
   end
@@ -363,19 +357,4 @@ defmodule Ferricstore.PubSub do
     :ets.match_delete(@channels_table, {:_, pid})
     :ets.match_delete(@patterns_table, {:_, pid, :_})
   end
-
-  @doc false
-  @spec glob_to_regex(binary()) :: Regex.t()
-  def glob_to_regex(pattern) do
-    regex_str =
-      pattern
-      |> String.graphemes()
-      |> Enum.map_join(&escape_glob_char/1)
-
-    Regex.compile!("^#{regex_str}$")
-  end
-
-  defp escape_glob_char("*"), do: ".*"
-  defp escape_glob_char("?"), do: "."
-  defp escape_glob_char(char), do: Regex.escape(char)
 end
