@@ -607,10 +607,8 @@ defmodule Ferricstore.Commands.Hash do
 
     with {:ok, seconds} <- parse_positive_integer(seconds_str, "seconds") do
       if even_length?(field_value_pairs) do
-        with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
-          expire_at_ms = CommandTime.now_ms() + seconds * 1000
-          hset_pairs_with_ttl(field_value_pairs, key, store, expire_at_ms, 0)
-        end
+        expire_at_ms = CommandTime.now_ms() + seconds * 1000
+        hset_fields_with_ttl(key, field_value_pairs, store, expire_at_ms)
       else
         {:error, "ERR wrong number of arguments for 'hsetex' command"}
       end
@@ -839,10 +837,8 @@ defmodule Ferricstore.Commands.Hash do
   def handle_ast({:hsetex, key, seconds, field_value_pairs}, store)
       when is_integer(seconds) and is_list(field_value_pairs) do
     if even_length?(field_value_pairs) do
-      with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
-        expire_at_ms = CommandTime.now_ms() + seconds * 1000
-        hset_pairs_with_ttl(field_value_pairs, key, store, expire_at_ms, 0)
-      end
+      expire_at_ms = CommandTime.now_ms() + seconds * 1000
+      hset_fields_with_ttl(key, field_value_pairs, store, expire_at_ms)
     else
       {:error, "ERR wrong number of arguments for 'hsetex' command"}
     end
@@ -870,6 +866,13 @@ defmodule Ferricstore.Commands.Hash do
     with type_status when type_status in [:ok, {:ok, :created}] <-
            TypeRegistry.check_or_set_status(key, :hash, store) do
       hset_pairs(field_value_pairs, key, store, type_status)
+    end
+  end
+
+  defp hset_fields_with_ttl(key, field_value_pairs, store, expire_at_ms) do
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :hash, store) do
+      hset_pairs_with_ttl(field_value_pairs, key, store, expire_at_ms, type_status)
     end
   end
 
@@ -1355,7 +1358,7 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   # Same as hset_pairs but with per-field TTL.
-  defp hset_pairs_with_ttl(field_value_pairs, key, store, expire_at_ms, _acc) do
+  defp hset_pairs_with_ttl(field_value_pairs, key, store, expire_at_ms, type_status) do
     {fields, values_by_field} = collapse_field_values(field_value_pairs, [], %{})
     compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
 
@@ -1373,7 +1376,7 @@ defmodule Ferricstore.Commands.Hash do
 
     case Ops.compound_batch_put(store, key, entries) do
       :ok -> added
-      {:error, _} = err -> err
+      {:error, _} = err -> rollback_new_hash_type_marker(key, store, type_status, err)
     end
   end
 

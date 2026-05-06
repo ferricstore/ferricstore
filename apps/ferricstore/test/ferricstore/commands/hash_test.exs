@@ -752,6 +752,42 @@ defmodule Ferricstore.Commands.HashTest do
   end
 
   # ---------------------------------------------------------------------------
+  # HSETEX
+  # ---------------------------------------------------------------------------
+
+  describe "HSETEX" do
+    test "HSETEX rolls back new type metadata when field write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+      field_key = CompoundKey.hash_field("hash", "f1")
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key -> nil
+          "hash", ^field_key -> nil
+        end,
+        compound_put: fn "hash", ^type_key, "hash", 0 ->
+          send(parent, :type_written)
+          :ok
+        end,
+        compound_batch_get: fn "hash", [^field_key] -> [nil] end,
+        compound_batch_put: fn "hash", [{^field_key, "v1", expire_at_ms}]
+                               when is_integer(expire_at_ms) ->
+          {:error, :disk_full}
+        end,
+        compound_delete: fn "hash", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, :disk_full} == Hash.handle("HSETEX", ["hash", "60", "f1", "v1"], store)
+      assert_received :type_written
+      assert_received :type_deleted
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # HEXPIRE
   # ---------------------------------------------------------------------------
 
