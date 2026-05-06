@@ -404,7 +404,8 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp write_zset(store, key, zset) do
-    with :ok <- ensure_zset_type(store, key) do
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           ensure_zset_type(store, key) do
       prefix = CompoundKey.zset_prefix(key)
       new_members = MapSet.new(Enum.map(zset, fn {_score, member} -> member end))
 
@@ -427,6 +428,8 @@ defmodule Ferricstore.Commands.Geo do
       with :ok <- Ops.compound_batch_delete(store, key, delete_keys),
            :ok <- Ops.compound_batch_put(store, key, put_entries) do
         :ok
+      else
+        {:error, _} = err -> rollback_new_zset_type_marker(key, store, type_status, err)
       end
     end
   end
@@ -476,8 +479,20 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp ensure_zset_type(store, key) do
-    TypeRegistry.check_or_set(key, :zset, store)
+    TypeRegistry.check_or_set_status(key, :zset, store)
   end
+
+  defp rollback_new_zset_type_marker(key, store, {:ok, :created}, write_error) do
+    case TypeRegistry.delete_type(key, store) do
+      :ok ->
+        write_error
+
+      {:error, _} = rollback_error ->
+        {:error, {:geo_zset_type_marker_rollback_failed, write_error, rollback_error}}
+    end
+  end
+
+  defp rollback_new_zset_type_marker(_key, _store, :ok, write_error), do: write_error
 
   defp zset_to_member_map(zset) do
     Map.new(zset, fn {score, member} -> {member, score} end)

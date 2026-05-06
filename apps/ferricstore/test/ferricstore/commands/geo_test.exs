@@ -168,6 +168,38 @@ defmodule Ferricstore.Commands.GeoTest do
       refute_received {:compound_batch_put, _}
     end
 
+    test "rolls back new zset type metadata when member batch write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("mygeo")
+
+      store = %{
+        exists?: fn "mygeo" -> false end,
+        compound_get: fn
+          "mygeo", ^type_key -> nil
+          "mygeo", _compound_key -> nil
+        end,
+        compound_scan: fn "mygeo", _prefix -> [] end,
+        compound_put: fn "mygeo", ^type_key, "zset", 0 ->
+          send(parent, :type_written)
+          :ok
+        end,
+        compound_batch_delete: fn "mygeo", [] -> :ok end,
+        compound_batch_put: fn "mygeo", entries when length(entries) == 1 ->
+          {:error, :disk_full}
+        end,
+        compound_delete: fn "mygeo", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, :disk_full} ==
+               Geo.handle("GEOADD", ["mygeo", "13.361389", "38.115556", "Palermo"], store)
+
+      assert_received :type_written
+      assert_received :type_deleted
+    end
+
     test "adds a single member" do
       store = MockStore.make()
       assert 1 == Geo.handle("GEOADD", ["mygeo", "13.361389", "38.115556", "Palermo"], store)
