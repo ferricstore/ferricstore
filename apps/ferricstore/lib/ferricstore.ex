@@ -772,17 +772,24 @@ defmodule FerricStore do
   end
 
   defp flow_records_for_ids(ids, partition_key) do
-    ids
-    |> Enum.reduce_while({:ok, []}, fn id, {:ok, acc} ->
-      case flow_get(id, partition_key: partition_key) do
-        {:ok, nil} -> {:cont, {:ok, acc}}
-        {:ok, record} -> {:cont, {:ok, [record | acc]}}
-        {:error, _} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, records} -> {:ok, Enum.reverse(records)}
-      {:error, _} = error -> error
+    ctx = default_ctx()
+    keys = Enum.map(ids, &Ferricstore.Flow.Keys.state_key(&1, partition_key))
+
+    case Enum.find(keys, &(byte_size(&1) > Router.max_key_size())) do
+      nil ->
+        records =
+          ctx
+          |> Router.flow_batch_get(ids, partition_key)
+          |> Enum.reduce([], fn
+            nil, acc -> acc
+            value, acc when is_binary(value) -> [Ferricstore.Flow.decode_record(value) | acc]
+          end)
+          |> Enum.reverse()
+
+        {:ok, records}
+
+      _too_large ->
+        {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
     end
   end
 

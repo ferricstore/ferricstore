@@ -2451,6 +2451,33 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @doc false
+  def flow_batch_get(ctx, ids, partition_key) when is_list(ids) do
+    keys = Enum.map(ids, &Ferricstore.Flow.Keys.state_key(&1, partition_key))
+
+    cond do
+      Ferricstore.Flow.LMDB.write_through?() ->
+        flow_batch_get_lmdb(ctx, keys)
+
+      Ferricstore.Flow.LMDB.mirror?() ->
+        values = batch_get(ctx, keys)
+
+        keys
+        |> Enum.zip(values)
+        |> Enum.map(fn
+          {_key, value} when is_binary(value) -> value
+          {key, nil} -> flow_get_lmdb(ctx, key)
+        end)
+
+      true ->
+        batch_get(ctx, keys)
+    end
+  end
+
+  defp flow_batch_get_lmdb(ctx, keys) do
+    Enum.map(keys, &flow_get_lmdb(ctx, &1))
+  end
+
   defp flow_get_lmdb(ctx, key) do
     idx = shard_for(ctx, key)
 

@@ -495,6 +495,79 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(path, correlation_prefix)
   end
 
+  test "mirror batch flow get preserves order across hot, LMDB, and missing records" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    partition_key = "tenant-batch-get"
+    flow_type = "batch-get"
+
+    assert {:ok, active} =
+             Ferricstore.Store.Router.flow_create(ctx, %{
+               id: "flow-active",
+               type: flow_type,
+               state: "queued",
+               run_at_ms: 10_000,
+               partition_key: partition_key,
+               now_ms: 1
+             })
+
+    assert {:ok, _terminal_start} =
+             Ferricstore.Store.Router.flow_create(ctx, %{
+               id: "flow-terminal",
+               type: flow_type,
+               state: "queued",
+               run_at_ms: 1,
+               partition_key: partition_key,
+               now_ms: 2
+             })
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Store.Router.flow_claim_due(ctx, %{
+               type: flow_type,
+               state: "queued",
+               priority: nil,
+               worker: "worker-batch-get",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 3,
+               partition_key: partition_key
+             })
+
+    assert {:ok, terminal} =
+             Ferricstore.Store.Router.flow_complete(ctx, %{
+               id: claimed.id,
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 4,
+               partition_key: partition_key
+             })
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    assert [active_blob, terminal_blob, nil] =
+             Ferricstore.Store.Router.flow_batch_get(
+               ctx,
+               [
+                 active.id,
+                 terminal.id,
+                 "flow-missing"
+               ],
+               partition_key
+             )
+
+    assert Ferricstore.Flow.decode_record(active_blob).id == active.id
+    assert Ferricstore.Flow.decode_record(terminal_blob).id == terminal.id
+  end
+
   test "mirror startup rebuilds flow working indexes and prunes terminal state to LMDB" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
