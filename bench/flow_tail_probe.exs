@@ -41,8 +41,10 @@ end
 defmodule FlowTailProbe do
   @events [
     [:ferricstore, :raft, :apply],
+    [:ferricstore, :raft, :release_cursor, :blocked],
     [:ferricstore, :raft, :replay_safe_index, :persist],
     [:ferricstore, :bitcask, :append],
+    [:ferricstore, :bitcask, :checkpoint],
     [:ferricstore, :batcher, :slot_flush],
     [:ferricstore, :batcher, :quorum_submit],
     [:ferricstore, :batcher, :quorum_applied],

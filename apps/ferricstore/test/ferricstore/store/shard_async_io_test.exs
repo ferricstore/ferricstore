@@ -810,7 +810,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
       # The checkpointer tick should see the raised flag and emit a
       # :ok telemetry event within a few ticks.
-      assert_receive {:ck_event, _meas, %{status: :ok}}, 500
+      assert_receive {:ck_event, meas, %{status: :ok}}, 500
+      assert is_integer(meas.duration_us)
 
       # Flag must have been cleared by the checkpointer before firing fsync.
       assert :atomics.get(ctx.checkpoint_flags, 1) == 0

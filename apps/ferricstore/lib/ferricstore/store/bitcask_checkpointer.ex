@@ -115,6 +115,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
       in_flight?: false,
       next_corr_id: 1,
       current_corr_id: nil,
+      current_started_at: nil,
       dirty_since_ms: nil,
       last_write_seen_ms: monotonic_ms(),
       last_write_version: write_version(ctx, index)
@@ -206,11 +207,11 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
 
     :telemetry.execute(
       [:ferricstore, :bitcask, :checkpoint],
-      %{shard_index: state.index},
+      %{shard_index: state.index, duration_us: checkpoint_duration_us(state)},
       %{status: :ok}
     )
 
-    {:noreply, %{state | in_flight?: false, current_corr_id: nil}}
+    {:noreply, %{state | in_flight?: false, current_corr_id: nil, current_started_at: nil}}
   end
 
   def handle_info({:tokio_complete, corr_id, :error, reason}, %{current_corr_id: corr_id} = state) do
@@ -231,14 +232,14 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
 
       :telemetry.execute(
         [:ferricstore, :bitcask, :checkpoint],
-        %{shard_index: state.index},
+        %{shard_index: state.index, duration_us: checkpoint_duration_us(state)},
         %{status: :error, reason: reason}
       )
 
       Logger.error("BitcaskCheckpointer shard=#{state.index}: fsync failed: #{inspect(reason)}")
     end
 
-    {:noreply, %{state | in_flight?: false, current_corr_id: nil}}
+    {:noreply, %{state | in_flight?: false, current_corr_id: nil, current_started_at: nil}}
   end
 
   # Ignore tokio_complete messages for stale correlation ids (e.g. from a
@@ -322,6 +323,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
                     | in_flight?: true,
                       next_corr_id: corr_id + 1,
                       current_corr_id: corr_id,
+                      current_started_at: System.monotonic_time(),
                       dirty_since_ms: nil
                   }
 
@@ -406,6 +408,12 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   defp monotonic_ms do
     System.monotonic_time(:millisecond)
   end
+
+  defp checkpoint_duration_us(%{current_started_at: started_at}) when is_integer(started_at) do
+    System.convert_time_unit(System.monotonic_time() - started_at, :native, :microsecond)
+  end
+
+  defp checkpoint_duration_us(_state), do: 0
 
   defp emit_checkpoint_deferred(state, reason, measurements) do
     :telemetry.execute(
