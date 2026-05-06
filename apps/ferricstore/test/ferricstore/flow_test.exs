@@ -1419,6 +1419,86 @@ defmodule Ferricstore.FlowTest do
     assert second.lease_token != first.lease_token
   end
 
+  test "expired running lease reclaim is partition scoped" do
+    partition_a = uid("tenant-reclaim-a")
+    partition_b = uid("tenant-reclaim-b")
+    type = uid("lease-partition")
+    id_a = uid("flow-reclaim-a")
+    id_b = uid("flow-reclaim-b")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id_a,
+               type: type,
+               state: "queued",
+               partition_key: partition_a,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id_b,
+               type: type,
+               state: "queued",
+               partition_key: partition_b,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [first_a]} =
+             FerricStore.flow_claim_due(type,
+               state: "queued",
+               partition_key: partition_a,
+               worker: "worker-a",
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [first_b]} =
+             FerricStore.flow_claim_due(type,
+               state: "queued",
+               partition_key: partition_b,
+               worker: "worker-a",
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [second_a]} =
+             FerricStore.flow_claim_due(type,
+               state: "running",
+               partition_key: partition_a,
+               worker: "worker-b",
+               lease_ms: 50,
+               limit: 10,
+               now_ms: 1_050
+             )
+
+    assert second_a.id == id_a
+    assert second_a.lease_owner == "worker-b"
+    assert second_a.lease_token != first_a.lease_token
+
+    assert {:ok, fetched_b} = FerricStore.flow_get(id_b, partition_key: partition_b)
+    assert fetched_b.lease_owner == "worker-a"
+    assert fetched_b.lease_token == first_b.lease_token
+
+    assert {:ok, []} =
+             FerricStore.flow_stuck(type,
+               partition_key: partition_a,
+               older_than_ms: 0,
+               count: 10,
+               now_ms: 1_050
+             )
+
+    assert {:ok, [stuck_b]} =
+             FerricStore.flow_stuck(type,
+               partition_key: partition_b,
+               older_than_ms: 0,
+               count: 10,
+               now_ms: 1_050
+             )
+
+    assert stuck_b.id == id_b
+  end
+
   test "flow_transition atomically moves state, due index, and history" do
     id = uid("flow-transition")
 
