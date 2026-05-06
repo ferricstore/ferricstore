@@ -422,6 +422,33 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     end
   end
 
+  test "batch cold read no-such-file errors emit missing_file telemetry", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold_batch_no_such_file:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 9, 0, 5})
+
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00009.log")
+
+    attach_pread_corrupt_handler()
+
+    Process.put(
+      :ferricstore_router_pread_batch_keyed_result,
+      {:error, "No such file or directory"}
+    )
+
+    try do
+      assert [nil] == Router.batch_get(ctx, [key])
+
+      assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
+                      %{path: ^path, reason: :missing_file}}
+    after
+      Process.delete(:ferricstore_router_pread_batch_keyed_result)
+    end
+  end
+
   test "direct cold reads do not return a value from a mismatched key offset", %{
     ctx: ctx,
     keydir: keydir

@@ -11,8 +11,9 @@ defmodule Ferricstore.Transaction.Coordinator do
   ## WATCH conflict detection
 
   WATCH uses per-key tokens rather than per-shard write-version counters. Hot
-  keys hash the in-memory value; cold keys snapshot the live keydir location so
-  large values do not have to be materialized just to enter or check WATCH.
+  keys include the in-memory value hash plus the live Bitcask location; cold
+  keys snapshot the live keydir location, so large values do not have to be
+  materialized just to enter or check WATCH.
   """
 
   alias Ferricstore.Raft.CommandClock

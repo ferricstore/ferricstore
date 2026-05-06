@@ -40,14 +40,22 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
 
   describe "test infrastructure" do
     test "keys route to different shards", %{cross_keys: keys} do
-      shards = Enum.map(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end) |> Enum.uniq()
+      shards =
+        Enum.map(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
+        |> Enum.uniq()
+
       assert length(shards) == length(keys)
     end
 
     test "cross-shard key pairs are on different shards", %{k0: k0, k1: k1, k2: k2, k3: k3} do
-      assert Router.shard_for(FerricStore.Instance.get(:default), k0) != Router.shard_for(FerricStore.Instance.get(:default), k1)
-      assert Router.shard_for(FerricStore.Instance.get(:default), k0) != Router.shard_for(FerricStore.Instance.get(:default), k2)
-      assert Router.shard_for(FerricStore.Instance.get(:default), k0) != Router.shard_for(FerricStore.Instance.get(:default), k3)
+      assert Router.shard_for(FerricStore.Instance.get(:default), k0) !=
+               Router.shard_for(FerricStore.Instance.get(:default), k1)
+
+      assert Router.shard_for(FerricStore.Instance.get(:default), k0) !=
+               Router.shard_for(FerricStore.Instance.get(:default), k2)
+
+      assert Router.shard_for(FerricStore.Instance.get(:default), k0) !=
+               Router.shard_for(FerricStore.Instance.get(:default), k3)
     end
   end
 
@@ -219,8 +227,7 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       Router.put(FerricStore.Instance.get(:default), k0, "original_k0", 0)
       Router.put(FerricStore.Instance.get(:default), k1, "original_k1", 0)
 
-      # watches_clean? uses phash2(Router.get(FerricStore.Instance.get(:default), key)) to detect changes
-      watched = %{k0 => :erlang.phash2(Router.get(FerricStore.Instance.get(:default), k0))}
+      watched = %{k0 => Router.watch_token(FerricStore.Instance.get(:default), k0)}
 
       # Simulate another client modifying the watched key
       Router.put(FerricStore.Instance.get(:default), k0, "modified_by_other", 0)
@@ -244,8 +251,7 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
     test "WATCH key, no modification, cross-shard EXEC succeeds", %{k0: k0, k1: k1} do
       Router.put(FerricStore.Instance.get(:default), k0, "original_k0", 0)
 
-      # watches_clean? uses phash2(Router.get(FerricStore.Instance.get(:default), key)) to detect changes
-      watched = %{k0 => :erlang.phash2(Router.get(FerricStore.Instance.get(:default), k0))}
+      watched = %{k0 => Router.watch_token(FerricStore.Instance.get(:default), k0)}
 
       # Cross-shard transaction with unmodified watched key
       queue = [
@@ -362,7 +368,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       # Find two keys that route to different shards under this namespace
       {ns_key_a, ns_key_b} = ShardHelpers.cross_shard_keys_for_namespace(ns)
 
-      assert Router.shard_for(FerricStore.Instance.get(:default), ns <> ns_key_a) != Router.shard_for(FerricStore.Instance.get(:default), ns <> ns_key_b)
+      assert Router.shard_for(FerricStore.Instance.get(:default), ns <> ns_key_a) !=
+               Router.shard_for(FerricStore.Instance.get(:default), ns <> ns_key_b)
 
       queue = [
         {"SET", [ns_key_a, "ns_val_a"]},

@@ -289,8 +289,7 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     test "aborts when a watched key was modified before EXEC", %{same1: s1} do
       Router.put(FerricStore.Instance.get(:default), s1, "original", 0)
 
-      # watches_clean? uses phash2(Router.get(FerricStore.Instance.get(:default), key)) to detect changes
-      watched = %{s1 => :erlang.phash2(Router.get(FerricStore.Instance.get(:default), s1))}
+      watched = %{s1 => Router.watch_token(FerricStore.Instance.get(:default), s1)}
 
       # Simulate another client modifying the key
       Router.put(FerricStore.Instance.get(:default), s1, "modified_by_other", 0)
@@ -303,11 +302,23 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       assert Router.get(FerricStore.Instance.get(:default), s1) == "modified_by_other"
     end
 
+    test "aborts when a watched hot key is rewritten to the same value", %{same1: s1} do
+      Router.put(FerricStore.Instance.get(:default), s1, "same", 0)
+      watched = %{s1 => Router.watch_token(FerricStore.Instance.get(:default), s1)}
+
+      # Redis WATCH invalidates on writes, not only visible value changes.
+      Router.put(FerricStore.Instance.get(:default), s1, "same", 0)
+
+      queue = [{"SET", [s1, "should_not_apply"]}]
+
+      assert Coordinator.execute(queue, watched, nil) == nil
+      assert Router.get(FerricStore.Instance.get(:default), s1) == "same"
+    end
+
     test "proceeds when watched keys are unmodified", %{same1: s1} do
       Router.put(FerricStore.Instance.get(:default), s1, "original", 0)
 
-      # watches_clean? uses phash2(Router.get(FerricStore.Instance.get(:default), key)) to detect changes
-      watched = %{s1 => :erlang.phash2(Router.get(FerricStore.Instance.get(:default), s1))}
+      watched = %{s1 => Router.watch_token(FerricStore.Instance.get(:default), s1)}
 
       queue = [{"SET", [s1, "updated"]}]
 
@@ -320,8 +331,7 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     test "cross-shard WATCH succeeds when watches pass", %{k0: k0, k1: k1} do
       Router.put(FerricStore.Instance.get(:default), k0, "orig_k0", 0)
 
-      # watches_clean? uses phash2(Router.get(FerricStore.Instance.get(:default), key)) to detect changes
-      watched = %{k0 => :erlang.phash2(Router.get(FerricStore.Instance.get(:default), k0))}
+      watched = %{k0 => Router.watch_token(FerricStore.Instance.get(:default), k0)}
 
       queue = [
         {"SET", [k0, "new_k0"]},
@@ -338,8 +348,7 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     test "cross-shard WATCH conflict returns nil", %{k0: k0, k1: k1} do
       Router.put(FerricStore.Instance.get(:default), k0, "orig_k0", 0)
 
-      # watches_clean? uses phash2(Router.get(FerricStore.Instance.get(:default), key)) to detect changes
-      watched = %{k0 => :erlang.phash2(Router.get(FerricStore.Instance.get(:default), k0))}
+      watched = %{k0 => Router.watch_token(FerricStore.Instance.get(:default), k0)}
 
       # Modify watched key
       Router.put(FerricStore.Instance.get(:default), k0, "changed", 0)

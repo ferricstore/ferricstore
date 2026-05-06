@@ -44,7 +44,8 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       expire_at = now + 30_000
 
       # Lock the key via Raft
-      {:ok, {:applied_at, _, :ok}, _} = :ra.process_command(shard_id, {:lock_keys, [key], owner_ref, expire_at})
+      {:ok, {:applied_at, _, :ok}, _} =
+        :ra.process_command(shard_id, {:lock_keys, [key], owner_ref, expire_at})
 
       # Confirm lock is active: another owner should fail
       other_ref = make_ref()
@@ -61,7 +62,7 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       new_other_ref = make_ref()
       new_expire = System.os_time(:millisecond) + 30_000
 
-      {:ok, result, _} =
+      {:ok, {:applied_at, _, result}, _} =
         :ra.process_command(new_shard_id, {:lock_keys, [key], new_other_ref, new_expire})
 
       # Lock survives restart -- another owner cannot acquire it
@@ -75,7 +76,13 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
     @tag :shard_kill
     test "intent record disappears after shard kill" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
-      coordinator_shard_idx = min(Router.shard_for(FerricStore.Instance.get(:default), k1), Router.shard_for(FerricStore.Instance.get(:default), k2))
+
+      coordinator_shard_idx =
+        min(
+          Router.shard_for(FerricStore.Instance.get(:default), k1),
+          Router.shard_for(FerricStore.Instance.get(:default), k2)
+        )
+
       shard_id = Cluster.shard_server_id(coordinator_shard_idx)
 
       owner_ref = make_ref()
@@ -102,7 +109,9 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
 
       # FIX (c22271c): Intents are now persisted in Raft state and survive restarts.
       new_shard_id = Cluster.shard_server_id(coordinator_shard_idx)
-      {:ok, {:applied_at, _, intents_after}, _} = :ra.process_command(new_shard_id, {:get_intents})
+
+      {:ok, {:applied_at, _, intents_after}, _} =
+        :ra.process_command(new_shard_id, {:get_intents})
 
       # Intent survives restart -- crash recovery can find it
       assert Map.has_key?(intents_after, owner_ref),
@@ -158,9 +167,9 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
   # ---------------------------------------------------------------------------
   # R2-H1: Intent write failure not detected
   #
-  # In CrossShardOp.execute_cross_shard/4, write_intent/3 is called but its
-  # return value is not checked. If the Raft command fails, execution proceeds
-  # without an intent record, so crash recovery is impossible.
+  # In CrossShardOp.execute_cross_shard/4, write_intent/3 used to be called
+  # without checking its return value. If the Raft command failed, execution
+  # proceeded without an intent record, so crash recovery was impossible.
   #
   # This is a regression guard: verify normal operation works correctly.
   # ---------------------------------------------------------------------------
@@ -177,18 +186,17 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       assert Router.get(FerricStore.Instance.get(:default), k2) == "r2h1_value"
     end
 
-    test "write_intent return value is ignored in source code" do
-      # Static analysis: the write_intent call on line 148 of cross_shard_op.ex
-      # does not pattern-match its return value. This test documents the issue.
-      #
-      # CrossShardOp.execute_cross_shard does:
-      #   write_intent(coordinator_shard, owner_ref, full_intent)
-      # instead of:
-      #   {:ok, {:applied_at, _, :ok}, _} = write_intent(coordinator_shard, owner_ref, full_intent)
-      #
-      # Verify the function exists and can be called (regression guard).
+    test "write_intent returns an observable result" do
+      # Verify the Ra command returns a value that CrossShardOp must inspect
+      # before running locked writes.
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
-      coordinator_shard_idx = min(Router.shard_for(FerricStore.Instance.get(:default), k1), Router.shard_for(FerricStore.Instance.get(:default), k2))
+
+      coordinator_shard_idx =
+        min(
+          Router.shard_for(FerricStore.Instance.get(:default), k1),
+          Router.shard_for(FerricStore.Instance.get(:default), k2)
+        )
+
       shard_id = Cluster.shard_server_id(coordinator_shard_idx)
 
       owner_ref = make_ref()
@@ -213,12 +221,9 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
   # ---------------------------------------------------------------------------
   # R2-H2: Write intent outside try block
   #
-  # In execute_cross_shard/4, write_intent is called BEFORE the try block.
-  # If write_intent itself raises, the locks acquired in lock_phase are never
-  # released (no rescue path covers that case).
-  #
-  # The try block only covers the execute phase. If execution fails, locks ARE
-  # released (correct). But the write_intent gap exists.
+  # In execute_cross_shard/4, write_intent used to run before the cleanup
+  # rescue scope. If write_intent itself raised, the locks acquired in
+  # lock_phase were never released.
   # ---------------------------------------------------------------------------
 
   describe "R2-H2: write intent outside try block" do
@@ -237,14 +242,20 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       end
 
       # After the exception, locks should be released (the try/rescue handles this)
-      shard1_id = Cluster.shard_server_id(Router.shard_for(FerricStore.Instance.get(:default), k1))
-      shard2_id = Cluster.shard_server_id(Router.shard_for(FerricStore.Instance.get(:default), k2))
+      shard1_id =
+        Cluster.shard_server_id(Router.shard_for(FerricStore.Instance.get(:default), k1))
+
+      shard2_id =
+        Cluster.shard_server_id(Router.shard_for(FerricStore.Instance.get(:default), k2))
 
       new_ref = make_ref()
       expire = System.os_time(:millisecond) + 30_000
 
-      {:ok, {:applied_at, _, r1}, _} = :ra.process_command(shard1_id, {:lock_keys, [k1], new_ref, expire})
-      {:ok, {:applied_at, _, r2}, _} = :ra.process_command(shard2_id, {:lock_keys, [k2], new_ref, expire})
+      {:ok, {:applied_at, _, r1}, _} =
+        :ra.process_command(shard1_id, {:lock_keys, [k1], new_ref, expire})
+
+      {:ok, {:applied_at, _, r2}, _} =
+        :ra.process_command(shard2_id, {:lock_keys, [k2], new_ref, expire})
 
       assert r1 == :ok, "Lock on k1 should be released after execute_fn exception"
       assert r2 == :ok, "Lock on k2 should be released after execute_fn exception"
@@ -254,25 +265,9 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       :ra.process_command(shard2_id, {:unlock_keys, [k2], new_ref})
     end
 
-    test "regression guard: write_intent is before try block in source" do
-      # This test documents the structural issue.
-      #
-      # In cross_shard_op.ex execute_cross_shard/4:
-      #
-      #   write_intent(coordinator_shard, owner_ref, full_intent)  # line 148 - OUTSIDE try
-      #
-      #   try do                                                    # line 150
-      #     ...execute...
-      #     delete_intent(...)
-      #     unlock_all(...)
-      #   rescue
-      #     e ->
-      #       unlock_all(...)                                       # locks released on exec error
-      #       reraise e, __STACKTRACE__
-      #   end
-      #
-      # If write_intent raises (e.g., Raft timeout), the rescue is NOT entered
-      # and locks leak. This test just confirms the happy path works.
+    test "regression guard: intent write and execute phase stay in cleanup scope" do
+      # This confirms the fixed path still completes normally; the structural
+      # source guard lives in cross_shard_op_intent_guard_test.exs.
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
       Router.put(FerricStore.Instance.get(:default), k1, "h2_guard", 0)
 
@@ -294,7 +289,13 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
       shard_id = Cluster.shard_server_id(shard_idx)
-      coordinator_shard_idx = min(Router.shard_for(FerricStore.Instance.get(:default), k1), Router.shard_for(FerricStore.Instance.get(:default), k2))
+
+      coordinator_shard_idx =
+        min(
+          Router.shard_for(FerricStore.Instance.get(:default), k1),
+          Router.shard_for(FerricStore.Instance.get(:default), k2)
+        )
+
       coordinator_id = Cluster.shard_server_id(coordinator_shard_idx)
 
       owner_ref = make_ref()
@@ -303,6 +304,7 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       # Simulate a crashed coordinator: lock acquired + intent written, but
       # never cleaned up. Use a long TTL so the lock doesn't expire during test.
       expire_at = now + 60_000
+
       {:ok, {:applied_at, _, :ok}, _} =
         :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
 
@@ -331,7 +333,9 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       CrossShardOp.IntentResolver.resolve_stale_intents()
 
       # Intent should be cleaned up
-      {:ok, {:applied_at, _, intents_after}, _} = :ra.process_command(coordinator_id, {:get_intents})
+      {:ok, {:applied_at, _, intents_after}, _} =
+        :ra.process_command(coordinator_id, {:get_intents})
+
       refute Map.has_key?(intents_after, owner_ref), "Intent should be cleaned up"
 
       # FIX: Lock should be cleaned up along with the intent.
@@ -438,14 +442,20 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       assert result == :ok
 
       # Verify keys are not still locked: we can lock them ourselves
-      shard1_id = Cluster.shard_server_id(Router.shard_for(FerricStore.Instance.get(:default), k1))
-      shard2_id = Cluster.shard_server_id(Router.shard_for(FerricStore.Instance.get(:default), k2))
+      shard1_id =
+        Cluster.shard_server_id(Router.shard_for(FerricStore.Instance.get(:default), k1))
+
+      shard2_id =
+        Cluster.shard_server_id(Router.shard_for(FerricStore.Instance.get(:default), k2))
 
       ref = make_ref()
       expire = System.os_time(:millisecond) + 30_000
 
-      {:ok, {:applied_at, _, r1}, _} = :ra.process_command(shard1_id, {:lock_keys, [k1], ref, expire})
-      {:ok, {:applied_at, _, r2}, _} = :ra.process_command(shard2_id, {:lock_keys, [k2], ref, expire})
+      {:ok, {:applied_at, _, r1}, _} =
+        :ra.process_command(shard1_id, {:lock_keys, [k1], ref, expire})
+
+      {:ok, {:applied_at, _, r2}, _} =
+        :ra.process_command(shard2_id, {:lock_keys, [k2], ref, expire})
 
       assert r1 == :ok, "k1 should be unlockable after RENAME completes"
       assert r2 == :ok, "k2 should be unlockable after RENAME completes"

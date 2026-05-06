@@ -1338,7 +1338,14 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp cold_batch_read_error_reason({:error, reason}) when is_binary(reason) do
-    if String.contains?(reason, "missing_file"), do: :missing_file, else: :corrupt_record
+    downcased = String.downcase(reason)
+
+    if String.contains?(downcased, "missing_file") or
+         String.contains?(downcased, "no such file") do
+      :missing_file
+    else
+      :corrupt_record
+    end
   end
 
   defp cold_batch_read_error_reason({:error, reason}) when reason in [:missing_file, :enoent],
@@ -3478,8 +3485,9 @@ defmodule Ferricstore.Store.Router do
   @doc """
   Returns a lightweight WATCH token for `key`.
 
-  Hot keys use the value hash. Cold keys use their live keydir location and
-  expiry, avoiding a large Bitcask read just to snapshot WATCH state.
+  Hot keys use the value hash plus their live Bitcask location. Cold keys use
+  their live keydir location and expiry, avoiding a large Bitcask read just to
+  snapshot WATCH state. Pending entries fall back to the shard write version.
   """
   @spec watch_token(FerricStore.Instance.t(), binary()) :: term()
   def watch_token(ctx, key) do
@@ -3489,8 +3497,12 @@ defmodule Ferricstore.Store.Router do
 
     try do
       case :ets.lookup(keydir, key) do
-        [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-          {:value, :erlang.phash2(value)}
+        [{^key, value, 0, _lfu, fid, off, vsize}]
+        when value != nil and valid_cold_location(fid, off, vsize) ->
+          {:hot, :erlang.phash2(value), fid, off, vsize, 0}
+
+        [{^key, value, 0, _lfu, :pending, _off, _vsize}] when value != nil ->
+          {:version, get_version(ctx, key)}
 
         [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           {:cold, fid, off, vsize, 0}
@@ -3498,8 +3510,12 @@ defmodule Ferricstore.Store.Router do
         [{^key, nil, 0, _lfu, :pending, _off, _vsize}] ->
           {:version, get_version(ctx, key)}
 
-        [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-          {:value, :erlang.phash2(value), exp}
+        [{^key, value, exp, _lfu, fid, off, vsize}]
+        when exp > now and value != nil and valid_cold_location(fid, off, vsize) ->
+          {:hot, :erlang.phash2(value), fid, off, vsize, exp}
+
+        [{^key, value, exp, _lfu, :pending, _off, _vsize}] when exp > now and value != nil ->
+          {:version, get_version(ctx, key)}
 
         [{^key, nil, exp, _lfu, fid, off, vsize}]
         when exp > now and valid_cold_location(fid, off, vsize) ->

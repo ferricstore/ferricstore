@@ -84,7 +84,7 @@ defmodule Ferricstore.HLC do
     * **Cross-node reads** after quorum write: guaranteed by Raft consensus —
       all quorum nodes applied the command before the write returns.
     * **TTL expiry**: second-granularity TTLs are unaffected by 150ms drift.
-    * **Cross-shard WATCH**: uses value hashing, not timestamps.
+    * **Cross-shard WATCH**: uses keydir/version tokens, not timestamps.
 
   ### Per-command HLC stamping
 
