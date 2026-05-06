@@ -4863,15 +4863,15 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_apply_complete(state, record, next, partition_key, now_ms) do
-    with :ok <- flow_due_delete(state, record),
-         :ok <- flow_index_delete(state, record),
+    plans = [{record, next}]
+
+    with :ok <- flow_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
              state,
              FlowKeys.state_key(next.id, partition_key),
              next
            ),
-         :ok <- flow_index_put(state, next),
          :ok <- flow_history_put_planned(state, record, next, "completed", now_ms),
          :ok <- flow_history_trim(state, next) do
       :ok
@@ -4908,12 +4908,8 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_complete_many_apply(state, plans) do
-    next_records = Enum.map(plans, fn {_record, next} -> next end)
-
-    with :ok <- flow_transition_delete_old_due(state, plans),
-         :ok <- flow_claim_delete_old_indexes(state, plans),
+    with :ok <- flow_transition_move_indexes(state, plans),
          :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_index_put_many(state, next_records),
          :ok <- flow_many_put_history(state, plans, "completed") do
       :ok
     end
@@ -5030,16 +5026,15 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_apply_transition(state, record, next, partition_key, now_ms) do
-    with :ok <- flow_due_delete(state, record),
-         :ok <- flow_index_delete(state, record),
+    plans = [{record, next}]
+
+    with :ok <- flow_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
              state,
              FlowKeys.state_key(next.id, partition_key),
              next
            ),
-         :ok <- flow_due_put(state, next),
-         :ok <- flow_index_put(state, next),
          :ok <- flow_history_put_planned(state, record, next, "transitioned", now_ms),
          :ok <- flow_history_trim(state, next) do
       :ok
@@ -5092,13 +5087,8 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_transition_many_apply(state, plans) do
-    next_records = Enum.map(plans, fn {_record, next} -> next end)
-
-    with :ok <- flow_transition_delete_old_due(state, plans),
-         :ok <- flow_claim_delete_old_indexes(state, plans),
+    with :ok <- flow_transition_move_indexes(state, plans),
          :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_due_put_many(state, next_records),
-         :ok <- flow_index_put_many(state, next_records),
          :ok <- flow_transition_put_history(state, plans) do
       :ok
     end
@@ -5156,16 +5146,15 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_apply_retry(state, record, next, partition_key, now_ms) do
-    with :ok <- flow_due_delete(state, record),
-         :ok <- flow_index_delete(state, record),
+    plans = [{record, next}]
+
+    with :ok <- flow_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
              state,
              FlowKeys.state_key(next.id, partition_key),
              next
            ),
-         :ok <- flow_due_put(state, next),
-         :ok <- flow_index_put(state, next),
          :ok <- flow_history_put_planned(state, record, next, "retry", now_ms),
          :ok <- flow_history_trim(state, next) do
       :ok
@@ -5203,13 +5192,8 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_retry_many_apply(state, plans) do
-    next_records = Enum.map(plans, fn {_record, next} -> next end)
-
-    with :ok <- flow_transition_delete_old_due(state, plans),
-         :ok <- flow_claim_delete_old_indexes(state, plans),
+    with :ok <- flow_transition_move_indexes(state, plans),
          :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_due_put_many(state, next_records),
-         :ok <- flow_index_put_many(state, next_records),
          :ok <- flow_many_put_history(state, plans, "retry") do
       :ok
     end
@@ -5265,15 +5249,15 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_apply_fail(state, record, next, partition_key, now_ms) do
-    with :ok <- flow_due_delete(state, record),
-         :ok <- flow_index_delete(state, record),
+    plans = [{record, next}]
+
+    with :ok <- flow_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
              state,
              FlowKeys.state_key(next.id, partition_key),
              next
            ),
-         :ok <- flow_index_put(state, next),
          :ok <- flow_history_put_planned(state, record, next, "failed", now_ms),
          :ok <- flow_history_trim(state, next) do
       :ok
@@ -5310,12 +5294,8 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_fail_many_apply(state, plans) do
-    next_records = Enum.map(plans, fn {_record, next} -> next end)
-
-    with :ok <- flow_transition_delete_old_due(state, plans),
-         :ok <- flow_claim_delete_old_indexes(state, plans),
+    with :ok <- flow_transition_move_indexes(state, plans),
          :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_index_put_many(state, next_records),
          :ok <- flow_many_put_history(state, plans, "failed") do
       :ok
     end
@@ -5370,15 +5350,15 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_apply_cancel(state, record, next, partition_key, now_ms) do
-    with :ok <- flow_due_delete(state, record),
-         :ok <- flow_index_delete(state, record),
+    plans = [{record, next}]
+
+    with :ok <- flow_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
              state,
              FlowKeys.state_key(next.id, partition_key),
              next
            ),
-         :ok <- flow_index_put(state, next),
          :ok <- flow_history_put_planned(state, record, next, "cancelled", now_ms),
          :ok <- flow_history_trim(state, next) do
       :ok
@@ -5415,12 +5395,8 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_cancel_many_apply(state, plans) do
-    next_records = Enum.map(plans, fn {_record, next} -> next end)
-
-    with :ok <- flow_transition_delete_old_due(state, plans),
-         :ok <- flow_claim_delete_old_indexes(state, plans),
+    with :ok <- flow_transition_move_indexes(state, plans),
          :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_index_put_many(state, next_records),
          :ok <- flow_many_put_history(state, plans, "cancelled") do
       :ok
     end
@@ -5439,16 +5415,13 @@ defmodule Ferricstore.Raft.StateMachine do
 
       with :ok <- flow_validate_record_keys(record),
            :ok <- flow_validate_record_keys(next),
-           :ok <- flow_due_delete(state, record),
-           :ok <- flow_index_delete(state, record),
+           :ok <- flow_transition_move_indexes(state, [{record, next}]),
            :ok <-
              flow_put_state_record(
                state,
                FlowKeys.state_key(id, partition_key),
                next
              ),
-           :ok <- flow_due_put(state, next),
-           :ok <- flow_index_put(state, next),
            :ok <- flow_history_put_planned(state, record, next, "rewound", now_ms),
            :ok <- flow_history_trim(state, next) do
         {:ok, Map.delete(next, :rewound_to_event_id)}
@@ -5508,41 +5481,85 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_apply_claim_batch(state, due_key, plans, stale_due_ids, now_ms) do
     with :ok <- flow_zset_delete_members_from_key(state, due_key, stale_due_ids),
-         :ok <- flow_claim_move_due_index(state, due_key, plans),
-         :ok <- flow_claim_delete_old_indexes(state, plans),
+         :ok <- flow_transition_move_indexes(state, plans),
          :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_claim_put_running_indexes(state, plans),
          :ok <- flow_claim_put_history(state, plans, now_ms) do
       :ok
     end
   end
 
-  defp flow_claim_move_due_index(_state, _due_key, []), do: :ok
+  defp flow_transition_move_indexes(_state, []), do: :ok
 
-  defp flow_claim_move_due_index(state, due_key, plans) do
+  defp flow_transition_move_indexes(state, plans) do
+    with :ok <- flow_transition_move_due_indexes(state, plans),
+         :ok <- flow_transition_move_state_indexes(state, plans),
+         :ok <- flow_transition_delete_old_secondary_indexes(state, plans) do
+      flow_transition_put_new_running_indexes(state, plans)
+    end
+  end
+
+  defp flow_transition_move_due_indexes(state, plans) do
+    {moves, deletes, puts} =
+      Enum.reduce(plans, {[], [], %{}}, fn {record, next}, {moves, deletes, puts} ->
+        from_key = flow_due_index_key(record)
+        to_key = flow_due_index_key(next)
+
+        cond do
+          is_binary(from_key) and is_binary(to_key) ->
+            {[{from_key, to_key, next.id, Map.fetch!(next, :next_run_at_ms)} | moves], deletes,
+             puts}
+
+          is_binary(from_key) ->
+            {moves, [{from_key, record.id} | deletes], puts}
+
+          is_binary(to_key) ->
+            puts =
+              flow_claim_add_zset_entry(puts, to_key, next.id, Map.fetch!(next, :next_run_at_ms))
+
+            {moves, deletes, puts}
+
+          true ->
+            {moves, deletes, puts}
+        end
+      end)
+
+    with :ok <- flow_index_move_entries(state, Enum.reverse(moves)),
+         :ok <- flow_zset_index_delete_grouped(state, deletes) do
+      puts
+      |> Enum.each(fn {key, member_score_pairs} ->
+        flow_zset_put_many_new(state, key, Enum.reverse(member_score_pairs))
+      end)
+
+      :ok
+    end
+  end
+
+  defp flow_due_index_key(%{next_run_at_ms: nil}), do: nil
+
+  defp flow_due_index_key(%{type: type, state: flow_state, priority: priority} = record) do
+    FlowKeys.due_key(type, flow_state, priority, Map.get(record, :partition_key))
+  end
+
+  defp flow_transition_move_state_indexes(state, plans) do
     moves =
-      Enum.map(plans, fn {_record, next} ->
-        partition_key = Map.get(next, :partition_key)
-        next_due_key = FlowKeys.due_key(next.type, next.state, next.priority, partition_key)
-        {due_key, next_due_key, next.id, Map.fetch!(next, :next_run_at_ms)}
+      Enum.map(plans, fn {record, next} ->
+        from_key =
+          FlowKeys.state_index_key(record.type, record.state, Map.get(record, :partition_key))
+
+        to_key = FlowKeys.state_index_key(next.type, next.state, Map.get(next, :partition_key))
+        {from_key, to_key, next.id, Map.get(next, :updated_at_ms, 0)}
       end)
 
     flow_index_move_entries(state, moves)
   end
 
-  defp flow_claim_delete_old_indexes(state, plans) do
+  defp flow_transition_delete_old_secondary_indexes(state, plans) do
     Enum.each(plans, fn {record, _next} ->
       maybe_queue_terminal_lmdb_index_delete(state, record)
     end)
 
     plans
     |> Enum.each(fn {record, _next} -> queue_lmdb_metadata_index_deletes(state, record) end)
-
-    state_deletes =
-      Enum.map(plans, fn {record, _next} ->
-        partition_key = Map.get(record, :partition_key)
-        {FlowKeys.state_index_key(record.type, record.state, partition_key), record.id}
-      end)
 
     running_deletes =
       plans
@@ -5560,21 +5577,13 @@ defmodule Ferricstore.Raft.StateMachine do
           []
       end)
 
-    flow_zset_index_delete_grouped(state, state_deletes ++ running_deletes)
+    flow_zset_index_delete_grouped(state, running_deletes)
   end
 
-  defp flow_transition_delete_old_due(state, plans) do
+  defp flow_transition_put_new_running_indexes(state, plans) do
     plans
-    |> Enum.group_by(fn {record, _next} ->
-      partition_key = Map.get(record, :partition_key)
-      FlowKeys.due_key(record.type, record.state, record.priority, partition_key)
-    end)
-    |> Enum.each(fn {due_key, due_plans} ->
-      ids = Enum.map(due_plans, fn {record, _next} -> record.id end)
-      flow_zset_delete_members_from_key(state, due_key, ids)
-    end)
-
-    :ok
+    |> Enum.filter(fn {_record, next} -> Map.get(next, :state) == "running" end)
+    |> then(&flow_claim_put_running_indexes(state, &1))
   end
 
   defp flow_claim_put_state_records(state, plans) do
@@ -5609,15 +5618,9 @@ defmodule Ferricstore.Raft.StateMachine do
     plans
     |> Enum.reduce(%{}, fn {_record, next}, acc ->
       partition_key = Map.get(next, :partition_key)
-      updated_score = Map.get(next, :updated_at_ms, 0)
       lease_score = Map.get(next, :lease_deadline_ms, 0)
 
       acc
-      |> flow_claim_add_zset_entry(
-        FlowKeys.state_index_key(next.type, next.state, partition_key),
-        next.id,
-        updated_score
-      )
       |> flow_claim_add_zset_entry(
         FlowKeys.inflight_index_key(next.type, partition_key),
         next.id,
@@ -5641,16 +5644,6 @@ defmodule Ferricstore.Raft.StateMachine do
     |> flow_index_grouped_entries()
     |> Enum.each(fn {key, member_score_pairs} ->
       flow_zset_put_many_new(state, key, Enum.reverse(member_score_pairs))
-    end)
-
-    :ok
-  end
-
-  defp flow_index_put_many(state, records) do
-    records
-    |> flow_index_grouped_entries()
-    |> Enum.each(fn {key, member_score_pairs} ->
-      flow_zset_put_many(state, key, Enum.reverse(member_score_pairs))
     end)
 
     :ok
@@ -6242,41 +6235,6 @@ defmodule Ferricstore.Raft.StateMachine do
     flow_zset_put_new(state, due_key, id, score)
   end
 
-  defp flow_due_delete(
-         %{} = state,
-         %{
-           type: type,
-           state: flow_state,
-           priority: priority,
-           id: id
-         } = record
-       ) do
-    flow_due_delete_by_values(
-      state,
-      id,
-      type,
-      flow_state,
-      priority,
-      Map.get(record, :partition_key)
-    )
-  end
-
-  defp flow_due_delete_by_values(_state, _id, nil, _flow_state, _priority, _partition_key),
-    do: :ok
-
-  defp flow_due_delete_by_values(state, id, type, flow_state, priority, partition_key) do
-    due_key = FlowKeys.due_key(type, flow_state, priority, partition_key)
-    flow_due_delete_from_key(state, due_key, id)
-  end
-
-  defp flow_due_delete_from_key(state, due_key, id) do
-    flow_zset_delete_from_key(state, due_key, id)
-  end
-
-  defp flow_zset_delete_from_key(state, due_key, id) do
-    flow_zset_delete(state, due_key, id)
-  end
-
   defp flow_zset_delete_members_from_key(_state, _due_key, []), do: :ok
 
   defp flow_zset_delete_members_from_key(state, due_key, ids) do
@@ -6362,38 +6320,6 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_running_index_put(_state, _record), do: :ok
-
-  defp flow_index_delete(state, %{id: id, type: type, state: flow_state} = record) do
-    partition_key = Map.get(record, :partition_key)
-    state_index_key = FlowKeys.state_index_key(type, flow_state, partition_key)
-    maybe_queue_terminal_lmdb_index_delete(state, record)
-
-    with :ok <- flow_zset_delete(state, state_index_key, id),
-         :ok <- flow_metadata_index_delete(state, record) do
-      flow_running_index_delete(state, record)
-    end
-  end
-
-  defp flow_metadata_index_delete(state, record),
-    do: queue_lmdb_metadata_index_deletes(state, record)
-
-  defp flow_running_index_delete(state, %{state: "running", id: id, type: type} = record) do
-    partition_key = Map.get(record, :partition_key)
-    inflight_index_key = FlowKeys.inflight_index_key(type, partition_key)
-    worker_index_key = FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key)
-
-    with :ok <- flow_zset_delete(state, inflight_index_key, id) do
-      flow_zset_delete(state, worker_index_key, id)
-    end
-  end
-
-  defp flow_running_index_delete(_state, _record), do: :ok
-
-  defp flow_due_put_many(_state, []), do: :ok
-
-  defp flow_due_put_many(state, records) do
-    flow_due_put_many_with(state, records, &flow_zset_put_many/3)
-  end
 
   defp flow_due_put_many_new(_state, []), do: :ok
 
@@ -6512,28 +6438,12 @@ defmodule Ferricstore.Raft.StateMachine do
     flow_index_put_new_member(state, due_key, id, score)
   end
 
-  defp flow_zset_put_many(
-         state,
-         due_key,
-         member_score_pairs
-       ) do
-    flow_index_put_members(state, due_key, member_score_pairs)
-  end
-
   defp flow_zset_put_many_new(
          state,
          due_key,
          member_score_pairs
        ) do
     flow_index_put_new_members(state, due_key, member_score_pairs)
-  end
-
-  defp flow_zset_delete(
-         state,
-         due_key,
-         id
-       ) do
-    flow_index_delete_member(state, due_key, id)
   end
 
   defp flow_zset_delete_many(
@@ -6627,15 +6537,6 @@ defmodule Ferricstore.Raft.StateMachine do
         state.flow_lookup_name,
         key_key_member_score_quads
       )
-    end
-
-    :ok
-  end
-
-  defp flow_index_delete_member(state, key, member) do
-    if flow_index_tables?(state) do
-      track_flow_index_originals(state, key, [member])
-      FlowIndex.delete_member(state.flow_index_name, state.flow_lookup_name, key, member)
     end
 
     :ok

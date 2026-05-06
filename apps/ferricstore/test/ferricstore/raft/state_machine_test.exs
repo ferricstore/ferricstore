@@ -289,6 +289,18 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert claimed.updated_at_ms == 1_250
       assert claimed.lease_deadline_ms == 1_750
 
+      running_due_key = Ferricstore.Flow.Keys.due_key(type, "running", 0, partition_key)
+
+      running_state_index_key =
+        Ferricstore.Flow.Keys.state_index_key(type, "running", partition_key)
+
+      waiting_due_key = Ferricstore.Flow.Keys.due_key(type, "waiting", 0, partition_key)
+
+      waiting_state_index_key =
+        Ferricstore.Flow.Keys.state_index_key(type, "waiting", partition_key)
+
+      inflight_index_key = Ferricstore.Flow.Keys.inflight_index_key(type, partition_key)
+
       {_, {:ok, transitioned}} =
         StateMachine.apply(
           %{system_time: 2_000},
@@ -306,6 +318,30 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert transitioned.updated_at_ms == 2_000
       assert transitioned.next_run_at_ms == 2_000
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, running_due_key, id) ==
+               :miss
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(
+               state.flow_lookup_name,
+               running_state_index_key,
+               id
+             ) == :miss
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(
+               state.flow_lookup_name,
+               inflight_index_key,
+               id
+             ) == :miss
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, waiting_due_key, id) ==
+               {:ok, 2_000.0}
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(
+               state.flow_lookup_name,
+               waiting_state_index_key,
+               id
+             ) == {:ok, 2_000.0}
     end
 
     test "create_many stages all Flow Bitcask writes into one append batch", %{
