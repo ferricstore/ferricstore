@@ -495,6 +495,66 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(path, correlation_prefix)
   end
 
+  test "mirror terminal writes keep version metadata without warming terminal record" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+    end)
+
+    partition_key = "tenant-terminal-version"
+    state_key = Ferricstore.Flow.Keys.state_key("flow-terminal-version", partition_key)
+
+    assert {:ok, _} =
+             Ferricstore.Store.Router.flow_create(ctx, %{
+               id: "flow-terminal-version",
+               type: "terminal-version",
+               state: "queued",
+               run_at_ms: 1,
+               partition_key: partition_key,
+               now_ms: 1
+             })
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Store.Router.flow_claim_due(ctx, %{
+               type: "terminal-version",
+               state: "queued",
+               priority: nil,
+               worker: "worker-terminal-version",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 2,
+               partition_key: partition_key
+             })
+
+    assert {:ok, completed} =
+             Ferricstore.Store.Router.flow_complete(ctx, %{
+               id: claimed.id,
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               result_ref: "result-terminal-version",
+               now_ms: 3,
+               partition_key: partition_key
+             })
+
+    assert completed.version == 3
+
+    assert [{^state_key, nil, 0, {:flow_state_version, 3, _lfu}, fid, off, vsize}] =
+             :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
+
+    assert is_integer(fid)
+    assert is_integer(off)
+    assert is_integer(vsize)
+  end
+
   test "mirror batch flow get preserves order across hot, LMDB, and missing records" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 

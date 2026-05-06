@@ -5744,27 +5744,30 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_metadata_index_put(_state, _record, _score), do: :ok
 
   defp flow_metadata_index_entries(record) do
-    partition_key = Map.get(record, :partition_key)
     id = Map.get(record, :id)
-    score = Map.get(record, :updated_at_ms, 0)
+    parent_flow_id = Map.get(record, :parent_flow_id)
+    root_flow_id = Map.get(record, :root_flow_id)
+    correlation_id = Map.get(record, :correlation_id)
 
-    []
-    |> flow_metadata_index_entry(
-      :parent,
-      Map.get(record, :parent_flow_id),
-      partition_key,
-      id,
-      score
-    )
-    |> flow_metadata_index_entry(:root, Map.get(record, :root_flow_id), partition_key, id, score)
-    |> flow_metadata_index_entry(
-      :correlation,
-      Map.get(record, :correlation_id),
-      partition_key,
-      id,
-      score
-    )
+    if flow_metadata_index_empty?(parent_flow_id, root_flow_id, correlation_id, id) do
+      []
+    else
+      partition_key = Map.get(record, :partition_key)
+      score = Map.get(record, :updated_at_ms, 0)
+
+      []
+      |> flow_metadata_index_entry(:parent, parent_flow_id, partition_key, id, score)
+      |> flow_metadata_index_entry(:root, root_flow_id, partition_key, id, score)
+      |> flow_metadata_index_entry(:correlation, correlation_id, partition_key, id, score)
+    end
   end
+
+  defp flow_metadata_index_empty?(parent_flow_id, root_flow_id, correlation_id, id) do
+    flow_blank_metadata?(parent_flow_id) and flow_blank_metadata?(correlation_id) and
+      root_flow_id in [nil, "", id]
+  end
+
+  defp flow_blank_metadata?(value), do: value in [nil, ""]
 
   defp flow_metadata_index_entry(entries, :root, value, _partition_key, id, _score)
        when value in [nil, "", id],
@@ -6144,25 +6147,35 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_mirror_put_state_record(state, key, value, expire_at_ms, record) do
     if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-      raw_put_cold(state, key, value, expire_at_ms)
+      raw_put_cold(state, key, value, expire_at_ms, flow_record_lfu(record, value))
     else
       raw_put(state, key, value, expire_at_ms)
     end
   end
 
   defp raw_put_cold(state, key, value, expire_at_ms) do
+    raw_put_cold(state, key, value, expire_at_ms, flow_cold_lfu(value))
+  end
+
+  defp raw_put_cold(state, key, value, expire_at_ms, lfu) do
     disk_val = to_disk_binary(value)
     track_keydir_binary_delta(state, key, nil)
     record_pending_original(state, key)
 
     :ets.insert(
       state.ets,
-      {key, nil, expire_at_ms, flow_cold_lfu(value), :pending, 0, byte_size(disk_val)}
+      {key, nil, expire_at_ms, lfu, :pending, 0, byte_size(disk_val)}
     )
 
     queue_pending_put_cold(key, disk_val, expire_at_ms)
     :ok
   end
+
+  defp flow_record_lfu(%{version: version}, _value) when is_integer(version) do
+    {:flow_state_version, version, LFU.initial()}
+  end
+
+  defp flow_record_lfu(_record, value), do: flow_cold_lfu(value)
 
   defp flow_cold_lfu(value) when is_binary(value) do
     case flow_decode_record_blob(value) do
