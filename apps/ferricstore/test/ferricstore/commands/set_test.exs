@@ -508,6 +508,50 @@ defmodule Ferricstore.Commands.SetTest do
 
       assert {:error, :disk_full} == Set.handle("SUNIONSTORE", ["dst", "s1", "s2"], store)
     end
+
+    test "SUNIONSTORE rolls back destination type metadata when member batch write fails" do
+      parent = self()
+      s1_type = CompoundKey.type_key("s1")
+      s2_type = CompoundKey.type_key("s2")
+      dst_type = CompoundKey.type_key("dst")
+
+      store = %{
+        get: fn _key -> nil end,
+        delete: fn "dst" -> :ok end,
+        compound_get: fn
+          "s1", ^s1_type -> "set"
+          "s2", ^s2_type -> "set"
+          "dst", ^dst_type -> nil
+        end,
+        compound_scan: fn
+          "s1", _prefix -> [{"a", "1"}]
+          "s2", _prefix -> [{"b", "1"}]
+        end,
+        compound_delete_prefix: fn "dst", _prefix -> :ok end,
+        compound_delete: fn "dst", ^dst_type ->
+          if Process.get(:dst_type_written?) do
+            send(parent, :type_rolled_back)
+          else
+            send(parent, :type_cleared)
+          end
+
+          :ok
+        end,
+        compound_put: fn "dst", ^dst_type, "set", 0 ->
+          Process.put(:dst_type_written?, true)
+          send(parent, :type_written)
+          :ok
+        end,
+        compound_batch_put: fn "dst", entries when length(entries) == 2 ->
+          {:error, :disk_full}
+        end
+      }
+
+      assert {:error, :disk_full} == Set.handle("SUNIONSTORE", ["dst", "s1", "s2"], store)
+      assert_received :type_cleared
+      assert_received :type_written
+      assert_received :type_rolled_back
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -880,6 +924,47 @@ defmodule Ferricstore.Commands.SetTest do
       }
 
       assert {:error, :disk_full} == Set.handle("SMOVE", ["src", "dst", "a"], store)
+      refute_received {:source_deleted, _}
+    end
+
+    test "SMOVE rolls back new destination type metadata when destination write fails" do
+      parent = self()
+      src_type_key = CompoundKey.type_key("src")
+      dst_type_key = CompoundKey.type_key("dst")
+      src_member_key = CompoundKey.set_member("src", "a")
+      dst_member_key = CompoundKey.set_member("dst", "a")
+
+      store = %{
+        get: fn _key -> nil end,
+        compound_get: fn
+          "src", ^src_type_key -> "set"
+          "dst", ^dst_type_key -> nil
+          "src", ^src_member_key -> "1"
+          "dst", ^dst_member_key -> nil
+          _redis_key, _compound_key -> nil
+        end,
+        compound_put: fn
+          "dst", ^dst_type_key, "set", 0 ->
+            send(parent, :type_written)
+            :ok
+
+          "dst", ^dst_member_key, "1", 0 ->
+            {:error, :disk_full}
+        end,
+        compound_delete: fn "dst", ^dst_type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end,
+        compound_batch_delete: fn "src", compound_keys ->
+          send(parent, {:source_deleted, compound_keys})
+          :ok
+        end,
+        compound_count: fn "src", _prefix -> 1 end
+      }
+
+      assert {:error, :disk_full} == Set.handle("SMOVE", ["src", "dst", "a"], store)
+      assert_received :type_written
+      assert_received :type_deleted
       refute_received {:source_deleted, _}
     end
 

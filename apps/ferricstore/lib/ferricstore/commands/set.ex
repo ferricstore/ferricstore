@@ -589,7 +589,7 @@ defmodule Ferricstore.Commands.Set do
         write_error
 
       {:error, _} = rollback_error ->
-        {:error, {:sadd_type_marker_rollback_failed, write_error, rollback_error}}
+        {:error, {:set_type_marker_rollback_failed, write_error, rollback_error}}
     end
   end
 
@@ -913,8 +913,14 @@ defmodule Ferricstore.Commands.Set do
   defp maybe_put_smove_destination(true, _destination, _dst_key, _store), do: :ok
 
   defp maybe_put_smove_destination(false, destination, dst_key, store) do
-    with :ok <- TypeRegistry.check_or_set(destination, :set, store) do
-      Ops.compound_put(store, destination, dst_key, @presence_marker, 0)
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(destination, :set, store) do
+      case Ops.compound_put(store, destination, dst_key, @presence_marker, 0) do
+        :ok -> :ok
+        true -> :ok
+        {:error, _} = err -> rollback_new_set_type_marker(destination, store, type_status, err)
+        other -> rollback_new_set_type_marker(destination, store, type_status, {:error, other})
+      end
     end
   end
 
@@ -933,9 +939,15 @@ defmodule Ferricstore.Commands.Set do
       if members_list == [] do
         0
       else
-        with :ok <- TypeRegistry.check_or_set(destination, :set, store),
-             :ok <- put_set_members(store, destination, members_list) do
-          length(members_list)
+        with type_status when type_status in [:ok, {:ok, :created}] <-
+               TypeRegistry.check_or_set_status(destination, :set, store) do
+          case put_set_members(store, destination, members_list) do
+            :ok ->
+              length(members_list)
+
+            {:error, _} = err ->
+              rollback_new_set_type_marker(destination, store, type_status, err)
+          end
         end
       end
     end
