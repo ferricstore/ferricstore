@@ -111,7 +111,8 @@ defmodule Ferricstore.Raft.StateMachine do
     :sm_pending_lmdb_originals,
     :sm_pending_lmdb_values,
     :sm_pending_lmdb_mirror_ops,
-    :sm_pending_lmdb_mirror_after_flush
+    :sm_pending_lmdb_mirror_after_flush,
+    :sm_pending_flow_index_originals
   ]
   @sm_pending_write_initial_values [
     sm_pending_writes: [],
@@ -121,7 +122,8 @@ defmodule Ferricstore.Raft.StateMachine do
     sm_pending_lmdb_originals: %{},
     sm_pending_lmdb_values: %{},
     sm_pending_lmdb_mirror_ops: [],
-    sm_pending_lmdb_mirror_after_flush: []
+    sm_pending_lmdb_mirror_after_flush: [],
+    sm_pending_flow_index_originals: %{}
   ]
 
   defguardp valid_cold_location(file_id, offset, value_size)
@@ -4487,10 +4489,10 @@ defmodule Ferricstore.Raft.StateMachine do
            worker: worker,
            lease_ms: lease_ms,
            limit: limit,
-           priority: priority,
-           now_ms: now_ms
+           priority: priority
          } = attrs
        ) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
     partition_key = Map.get(attrs, :partition_key)
 
     claimed =
@@ -4811,9 +4813,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp do_flow_transition(
          state,
-         %{id: id, from_state: from_state, to_state: to_state, run_at_ms: run_at_ms} = attrs
+         %{id: id, from_state: from_state, to_state: to_state} = attrs
        ) do
     now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record, next} <-
@@ -4912,9 +4915,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_transition_many_prepare(state, attrs_list) do
     Enum.reduce_while(attrs_list, {:ok, []}, fn
-      %{id: id, from_state: from_state, to_state: to_state, run_at_ms: run_at_ms} = attrs,
-      {:ok, acc} ->
+      %{id: id, from_state: from_state, to_state: to_state} = attrs, {:ok, acc} ->
         now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+        run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
 
         case flow_prepare_transition_record(
                state,
@@ -4951,8 +4954,9 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp do_flow_retry(state, %{id: id, lease_token: lease_token, run_at_ms: run_at_ms} = attrs) do
+  defp do_flow_retry(state, %{id: id, lease_token: lease_token} = attrs) do
     now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
@@ -6044,6 +6048,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_index_put_new_member(state, key, member, score) do
     if flow_index_tables?(state) do
+      track_flow_index_originals(state, key, [member])
       FlowIndex.put_new_member(state.flow_index_name, state.flow_lookup_name, key, member, score)
     end
 
@@ -6052,6 +6057,12 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_index_put_members(state, key, member_score_pairs) do
     if flow_index_tables?(state) do
+      track_flow_index_originals(
+        state,
+        key,
+        Enum.map(member_score_pairs, fn {member, _score} -> member end)
+      )
+
       FlowIndex.put_members(
         state.flow_index_name,
         state.flow_lookup_name,
@@ -6065,6 +6076,12 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_index_put_new_members(state, key, member_score_pairs) do
     if flow_index_tables?(state) do
+      track_flow_index_originals(
+        state,
+        key,
+        Enum.map(member_score_pairs, fn {member, _score} -> member end)
+      )
+
       FlowIndex.put_new_members(
         state.flow_index_name,
         state.flow_lookup_name,
@@ -6078,6 +6095,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_index_delete_member(state, key, member) do
     if flow_index_tables?(state) do
+      track_flow_index_originals(state, key, [member])
       FlowIndex.delete_member(state.flow_index_name, state.flow_lookup_name, key, member)
     end
 
@@ -6086,8 +6104,55 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_index_delete_members(state, key, members) do
     if flow_index_tables?(state) do
+      track_flow_index_originals(state, key, members)
       FlowIndex.delete_members(state.flow_index_name, state.flow_lookup_name, key, members)
     end
+
+    :ok
+  end
+
+  defp track_flow_index_originals(state, key, members) do
+    case Process.get(:sm_pending_flow_index_originals, :undefined) do
+      originals when is_map(originals) ->
+        originals =
+          Enum.reduce(members, originals, fn member, acc ->
+            original_key = {state.flow_index_name, state.flow_lookup_name, key, member}
+
+            if Map.has_key?(acc, original_key) do
+              acc
+            else
+              original =
+                case FlowIndex.score_of(state.flow_lookup_name, key, member) do
+                  {:ok, score} -> {:score, score}
+                  :miss -> :missing
+                end
+
+              Map.put(acc, original_key, original)
+            end
+          end)
+
+        Process.put(:sm_pending_flow_index_originals, originals)
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
+  defp rollback_pending_flow_indexes do
+    Process.get(:sm_pending_flow_index_originals, %{})
+    |> Enum.each(fn
+      {{index_table, lookup_table, key, member}, {:score, score}} ->
+        if :ets.whereis(index_table) != :undefined and :ets.whereis(lookup_table) != :undefined do
+          FlowIndex.put_member(index_table, lookup_table, key, member, score)
+        end
+
+      {{index_table, lookup_table, key, member}, :missing} ->
+        if :ets.whereis(index_table) != :undefined and :ets.whereis(lookup_table) != :undefined do
+          FlowIndex.delete_member(index_table, lookup_table, key, member)
+        end
+    end)
 
     :ok
   end
@@ -7171,6 +7236,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp rollback_pending_writes(state) do
     rollback_pending_lmdb(state)
+    rollback_pending_flow_indexes()
 
     Process.get(:sm_pending_originals, %{})
     |> Enum.each(fn

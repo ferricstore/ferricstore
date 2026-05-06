@@ -35,14 +35,21 @@ defmodule Ferricstore.Flow.LMDBWriter do
   def enqueue(instance_name, shard_index, ops, after_flush)
       when is_atom(instance_name) and is_integer(shard_index) and is_list(ops) and
              is_list(after_flush) do
-    try do
-      if ops != [] do
-        GenServer.cast(name(instance_name, shard_index), {:enqueue, ops, after_flush})
-      end
+    cond do
+      ops == [] ->
+        :ok
 
-      :ok
-    catch
-      :exit, _ -> :ok
+      is_pid(pid = Process.whereis(name(instance_name, shard_index))) ->
+        try do
+          GenServer.cast(pid, {:enqueue, ops, after_flush})
+          :ok
+        catch
+          :exit, reason ->
+            writer_unavailable(:enqueue, instance_name, shard_index, reason, length(ops))
+        end
+
+      true ->
+        writer_unavailable(:enqueue, instance_name, shard_index, :writer_not_started, length(ops))
     end
   end
 
@@ -141,13 +148,20 @@ defmodule Ferricstore.Flow.LMDBWriter do
   def flush(instance_name, shard_index, timeout)
       when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 and
              is_integer(timeout) do
-    try do
-      case GenServer.call(name(instance_name, shard_index), :flush, timeout) do
-        :ok -> :ok
-        {:error, _reason} = error -> error
-      end
-    catch
-      :exit, _ -> :ok
+    case Process.whereis(name(instance_name, shard_index)) do
+      pid when is_pid(pid) ->
+        try do
+          case GenServer.call(pid, :flush, timeout) do
+            :ok -> :ok
+            {:error, _reason} = error -> error
+          end
+        catch
+          :exit, reason ->
+            writer_unavailable(:flush, instance_name, shard_index, reason, 0)
+        end
+
+      nil ->
+        writer_unavailable(:flush, instance_name, shard_index, :writer_not_started, 0)
     end
   end
 
@@ -838,6 +852,21 @@ defmodule Ferricstore.Flow.LMDBWriter do
         reason: persist_reason(status)
       }
     )
+  end
+
+  defp writer_unavailable(operation, instance_name, shard_index, reason, op_count) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb_writer, :unavailable],
+      %{op_count: op_count},
+      %{
+        operation: operation,
+        instance_name: instance_name,
+        shard_index: shard_index,
+        reason: reason
+      }
+    )
+
+    {:error, reason}
   end
 
   defp persist_status(:ok), do: :ok

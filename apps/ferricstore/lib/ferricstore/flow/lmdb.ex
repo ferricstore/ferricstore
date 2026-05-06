@@ -106,7 +106,7 @@ defmodule Ferricstore.Flow.LMDB do
   def terminal_index_key(state_index_key, id, updated_at_ms)
       when is_binary(state_index_key) and is_binary(id) and is_integer(updated_at_ms) do
     terminal_index_prefix(state_index_key) <>
-      Integer.to_string(updated_at_ms) <> <<0>> <> id
+      pad_u64(updated_at_ms) <> <<0>> <> id
   end
 
   def terminal_count_key(state_index_key) when is_binary(state_index_key) do

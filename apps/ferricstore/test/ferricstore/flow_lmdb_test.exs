@@ -71,6 +71,34 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.LMDB.terminal_counts(path, [completed_key, failed_key])
   end
 
+  test "terminal index keys preserve numeric timestamp order in bounded prefix reads" do
+    path =
+      Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
+
+    state_index_key = "flow:{flow:test}:idx:completed"
+    prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(state_index_key)
+    older_key = Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, "older", 999)
+    newer_key = Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, "newer", 1_000)
+    count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+
+    older_value =
+      Ferricstore.Flow.LMDB.encode_terminal_index_value("older", 999, 0, nil, count_key)
+
+    newer_value =
+      Ferricstore.Flow.LMDB.encode_terminal_index_value("newer", 1_000, 0, nil, count_key)
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(path, [
+               {:put, newer_key, newer_value},
+               {:put, older_key, older_value}
+             ])
+
+    assert {:ok, [{^older_key, ^older_value}]} =
+             Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1)
+  end
+
   test "flow LMDB mode defaults to mirror and legacy off cannot disable it" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
@@ -195,13 +223,13 @@ defmodule Ferricstore.Flow.LMDBTest do
                {:put, key, "v2"}
              ])
 
-    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(instance_name, shard_index + 1)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
     assert {:ok, "v2"} = Ferricstore.Flow.LMDB.get(path, key)
 
     assert :ok =
              Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key, "v2"}])
 
-    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(instance_name, shard_index + 1)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
     assert {:ok, "v2"} = Ferricstore.Flow.LMDB.get(path, key)
   end
 
@@ -382,6 +410,49 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert flush_meta.instance_name == instance_name
   end
 
+  test "mirror writer enqueue and flush failures are visible" do
+    instance_name = :"flow_lmdb_missing_writer_#{System.unique_integer([:positive])}"
+    shard_index = 19
+    key = "flow:{flow:missing}:state:a"
+    test_pid = self()
+    handler_id = {:flow_lmdb_writer_unavailable, self(), make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :flow, :lmdb_writer, :unavailable],
+      fn event, measurements, metadata, _config ->
+        send(test_pid, {:flow_lmdb_writer_unavailable, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert {:error, :writer_not_started} =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key, "v1"}])
+
+    assert_receive {:flow_lmdb_writer_unavailable,
+                    [:ferricstore, :flow, :lmdb_writer, :unavailable], %{op_count: 1},
+                    %{
+                      operation: :enqueue,
+                      instance_name: ^instance_name,
+                      shard_index: ^shard_index,
+                      reason: :writer_not_started
+                    }}
+
+    assert {:error, :writer_not_started} =
+             Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index, 10)
+
+    assert_receive {:flow_lmdb_writer_unavailable,
+                    [:ferricstore, :flow, :lmdb_writer, :unavailable], %{op_count: 0},
+                    %{
+                      operation: :flush,
+                      instance_name: ^instance_name,
+                      shard_index: ^shard_index,
+                      reason: :writer_not_started
+                    }}
+  end
+
   test "mirror writer persists replay-safe marker only after pending ops flush" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
@@ -434,7 +505,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :requested =
              Ferricstore.Flow.LMDBWriter.request(instance_ctx, shard_index, shard_data_path, 123)
 
-    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(instance_name, shard_index + 1)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
 
     assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
     assert :atomics.get(durable, shard_index + 1) == 123
@@ -544,7 +615,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                {:terminal_put, terminal_key, value, state_key, count_key}
              ])
 
-    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(instance_name, shard_index + 1)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
 
     assert {:ok, ^value} = Ferricstore.Flow.LMDB.get(path, terminal_key)
     assert {:ok, ^terminal_key} = Ferricstore.Flow.LMDB.get(path, reverse_key)
@@ -556,7 +627,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                {:terminal_delete, terminal_key, state_key, count_key}
              ])
 
-    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(instance_name, shard_index + 1)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
 
     assert :not_found = Ferricstore.Flow.LMDB.get(path, terminal_key)
     assert :not_found = Ferricstore.Flow.LMDB.get(path, reverse_key)
@@ -612,7 +683,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                {:terminal_put, terminal_key, value, nil, count_key}
              ])
 
-    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(instance_name, shard_index + 1)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
 
     assert {:ok, ^value} = Ferricstore.Flow.LMDB.get(path, terminal_key)
     assert {:ok, _expire_value} = Ferricstore.Flow.LMDB.get(path, expire_key)
@@ -623,7 +694,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                {:terminal_delete, terminal_key, nil, count_key}
              ])
 
-    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(instance_name, shard_index + 1)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
 
     assert :not_found = Ferricstore.Flow.LMDB.get(path, terminal_key)
     assert :not_found = Ferricstore.Flow.LMDB.get(path, expire_key)
@@ -743,6 +814,67 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
     assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(path, root_prefix)
     assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(path, correlation_prefix)
+  end
+
+  test "lineage queries post-filter stale LMDB secondary index entries" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    partition_key = "tenant-lineage-filter"
+    id = "flow-lineage-filter"
+
+    assert {:ok, _created} =
+             Ferricstore.Store.Router.flow_create(ctx, %{
+               id: id,
+               type: "lineage-filter",
+               state: "queued",
+               run_at_ms: 10_000,
+               parent_flow_id: "real-parent",
+               root_flow_id: "real-root",
+               correlation_id: "real-correlation",
+               partition_key: partition_key,
+               now_ms: 1
+             })
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    stale_indexes = [
+      Ferricstore.Flow.Keys.parent_index_key("wrong-parent", partition_key),
+      Ferricstore.Flow.Keys.root_index_key("wrong-root", partition_key),
+      Ferricstore.Flow.Keys.correlation_index_key("wrong-correlation", partition_key)
+    ]
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(
+               path,
+               Enum.map(stale_indexes, fn index_key ->
+                 key = Ferricstore.Flow.LMDB.query_index_key(index_key, id, 1)
+                 value = Ferricstore.Flow.LMDB.encode_query_index_value(id, 1, 0)
+                 {:put, key, value}
+               end)
+             )
+
+    assert {:ok, []} =
+             Ferricstore.Flow.by_parent(ctx, "wrong-parent", partition_key: partition_key)
+
+    assert {:ok, []} = Ferricstore.Flow.by_root(ctx, "wrong-root", partition_key: partition_key)
+
+    assert {:ok, []} =
+             Ferricstore.Flow.by_correlation(ctx, "wrong-correlation",
+               partition_key: partition_key
+             )
   end
 
   test "mirror terminal writes keep version metadata without warming terminal record" do
@@ -1381,6 +1513,15 @@ defmodule Ferricstore.Flow.LMDBTest do
     shard_name = elem(ctx.shard_names, shard_index)
     :ok = GenServer.call(shard_name, :flush, 5_000)
     :ok = GenServer.stop(Process.whereis(shard_name), :normal, 5_000)
+
+    unless Process.whereis(Ferricstore.Flow.LMDBWriter.name(ctx.name, shard_index)) do
+      {:ok, _pid} =
+        Ferricstore.Flow.LMDBWriter.start_link(
+          shard_index: shard_index,
+          data_dir: ctx.data_dir,
+          instance_ctx: ctx
+        )
+    end
 
     {:ok, _pid} =
       Ferricstore.Store.Shard.start_link(

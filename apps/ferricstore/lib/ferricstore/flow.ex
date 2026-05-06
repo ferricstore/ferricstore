@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow do
 
   import Bitwise
 
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.Router
 
   @default_state "queued"
@@ -29,7 +30,7 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- create_attrs(id, opts, now_ms()) do
+      with {:ok, attrs} <- create_attrs(id, opts) do
         Router.flow_create(ctx, attrs)
       end
 
@@ -47,7 +48,7 @@ defmodule Ferricstore.Flow do
       |> Enum.with_index()
       |> Enum.reduce({[], %{}}, fn
         {{id, opts}, idx}, {valid_acc, result_acc} when is_binary(id) and is_list(opts) ->
-          case create_attrs(id, opts, now_ms()) do
+          case create_attrs(id, opts) do
             {:ok, attrs} -> {[{idx, attrs} | valid_acc], result_acc}
             {:error, _reason} = error -> {valid_acc, Map.put(result_acc, idx, error)}
           end
@@ -76,12 +77,11 @@ defmodule Ferricstore.Flow do
   def create_many(ctx, partition_key, items, opts)
       when is_list(items) and is_list(opts) do
     started = flow_start_time()
-    now = now_ms()
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
            :ok <- validate_create_many_items(items),
-           {:ok, attrs_list} <- create_many_attrs(items, opts, partition_key, now),
+           {:ok, attrs_list} <- create_many_attrs(items, opts, partition_key),
            :ok <- validate_unique_create_ids(attrs_list) do
         Router.flow_create_many(ctx, partition_key, attrs_list)
       end
@@ -127,19 +127,22 @@ defmodule Ferricstore.Flow do
          {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
          {:ok, limit} <- optional_pos_integer(opts, :limit, @default_limit),
          {:ok, priority} <- optional_priority_or_nil(opts),
-         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+         {:ok, now} <- optional_now_ms(opts),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_claim_due_keys(type, state, priority, partition_key) do
-      Router.flow_claim_due(ctx, %{
-        type: type,
-        state: state,
-        worker: worker,
-        lease_ms: lease_ms,
-        limit: limit,
-        priority: priority,
-        now_ms: now,
-        partition_key: partition_key
-      })
+      attrs =
+        %{
+          type: type,
+          state: state,
+          worker: worker,
+          lease_ms: lease_ms,
+          limit: limit,
+          priority: priority,
+          partition_key: partition_key
+        }
+        |> maybe_put_attr(:now_ms, now)
+
+      Router.flow_claim_due(ctx, attrs)
     end
   end
 
@@ -154,19 +157,22 @@ defmodule Ferricstore.Flow do
            {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
            {:ok, partition_key} <- optional_partition_key(opts),
            :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, now} <- optional_now_ms(opts),
            {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
            {:ok, result_ref} <- optional_binary_or_nil(opts, :result_ref, nil),
            :ok <- validate_ref_size(:result_ref, result_ref) do
-        Router.flow_complete(ctx, %{
-          id: id,
-          lease_token: lease_token,
-          fencing_token: fencing_token,
-          ttl_ms: ttl_ms,
-          result_ref: result_ref,
-          now_ms: now,
-          partition_key: partition_key
-        })
+        attrs =
+          %{
+            id: id,
+            lease_token: lease_token,
+            fencing_token: fencing_token,
+            ttl_ms: ttl_ms,
+            result_ref: result_ref,
+            partition_key: partition_key
+          }
+          |> maybe_put_attr(:now_ms, now)
+
+        Router.flow_complete(ctx, attrs)
       end
 
     observe_flow(:complete, started, result, %{flow_id: id})
@@ -177,7 +183,7 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- transition_attrs(id, from_state, to_state, opts, now_ms()) do
+      with {:ok, attrs} <- transition_attrs(id, from_state, to_state, opts) do
         Router.flow_transition(ctx, attrs)
       end
 
@@ -191,13 +197,12 @@ defmodule Ferricstore.Flow do
   def transition_many(ctx, partition_key, from_state, to_state, items, opts)
       when is_binary(from_state) and is_binary(to_state) and is_list(items) and is_list(opts) do
     started = flow_start_time()
-    now = now_ms()
 
     result =
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
            :ok <- validate_transition_many_items(items),
            {:ok, attrs_list} <-
-             transition_many_attrs(items, opts, partition_key, from_state, to_state, now),
+             transition_many_attrs(items, opts, partition_key, from_state, to_state),
            :ok <- validate_unique_transition_ids(attrs_list) do
         Router.flow_transition_many(ctx, partition_key, attrs_list)
       end
@@ -217,7 +222,6 @@ defmodule Ferricstore.Flow do
 
   def transition_batch_independent(ctx, transitions) when is_list(transitions) do
     started = flow_start_time()
-    now = now_ms()
 
     {valid, indexed_results} =
       transitions
@@ -225,7 +229,7 @@ defmodule Ferricstore.Flow do
       |> Enum.reduce({[], %{}}, fn
         {{id, from_state, to_state, opts}, idx}, {valid_acc, result_acc}
         when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts) ->
-          case transition_attrs(id, from_state, to_state, opts, now) do
+          case transition_attrs(id, from_state, to_state, opts) do
             {:ok, attrs} -> {[{idx, attrs} | valid_acc], result_acc}
             {:error, _reason} = error -> {valid_acc, Map.put(result_acc, idx, error)}
           end
@@ -264,19 +268,22 @@ defmodule Ferricstore.Flow do
            {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
            {:ok, partition_key} <- optional_partition_key(opts),
            :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, now} <- optional_now_ms(opts),
            {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
            {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil),
            :ok <- validate_ref_size(:error_ref, error_ref) do
-        Router.flow_retry(ctx, %{
-          id: id,
-          lease_token: lease_token,
-          fencing_token: fencing_token,
-          run_at_ms: run_at_ms,
-          error_ref: error_ref,
-          now_ms: now,
-          partition_key: partition_key
-        })
+        attrs =
+          %{
+            id: id,
+            lease_token: lease_token,
+            fencing_token: fencing_token,
+            error_ref: error_ref,
+            partition_key: partition_key
+          }
+          |> maybe_put_attr(:now_ms, now)
+          |> maybe_put_attr(:run_at_ms, run_at_ms)
+
+        Router.flow_retry(ctx, attrs)
       end
 
     observe_flow(:retry, started, result, %{flow_id: id})
@@ -293,19 +300,22 @@ defmodule Ferricstore.Flow do
            {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
            {:ok, partition_key} <- optional_partition_key(opts),
            :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, now} <- optional_now_ms(opts),
            {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
            {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil),
            :ok <- validate_ref_size(:error_ref, error_ref) do
-        Router.flow_fail(ctx, %{
-          id: id,
-          lease_token: lease_token,
-          fencing_token: fencing_token,
-          ttl_ms: ttl_ms,
-          error_ref: error_ref,
-          now_ms: now,
-          partition_key: partition_key
-        })
+        attrs =
+          %{
+            id: id,
+            lease_token: lease_token,
+            fencing_token: fencing_token,
+            ttl_ms: ttl_ms,
+            error_ref: error_ref,
+            partition_key: partition_key
+          }
+          |> maybe_put_attr(:now_ms, now)
+
+        Router.flow_fail(ctx, attrs)
       end
 
     observe_flow(:fail, started, result, %{flow_id: id})
@@ -321,19 +331,22 @@ defmodule Ferricstore.Flow do
            {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
            {:ok, partition_key} <- optional_partition_key(opts),
            :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, now} <- optional_now_ms(opts),
            {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
            {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
            :ok <- validate_ref_size(:reason_ref, reason_ref) do
-        Router.flow_cancel(ctx, %{
-          id: id,
-          lease_token: lease_token,
-          fencing_token: fencing_token,
-          ttl_ms: ttl_ms,
-          reason_ref: reason_ref,
-          now_ms: now,
-          partition_key: partition_key
-        })
+        attrs =
+          %{
+            id: id,
+            lease_token: lease_token,
+            fencing_token: fencing_token,
+            ttl_ms: ttl_ms,
+            reason_ref: reason_ref,
+            partition_key: partition_key
+          }
+          |> maybe_put_attr(:now_ms, now)
+
+        Router.flow_cancel(ctx, attrs)
       end
 
     observe_flow(:cancel, started, result, %{flow_id: id})
@@ -348,21 +361,24 @@ defmodule Ferricstore.Flow do
            {:ok, to_event} <- required_binary(opts, :to_event),
            {:ok, expect_state} <- optional_binary_or_nil(opts, :expect_state, nil),
            {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms),
-           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+           {:ok, now} <- optional_now_ms(opts),
            {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
            :ok <- validate_ref_size(:reason_ref, reason_ref),
            {:ok, partition_key} <- optional_partition_key(opts),
            :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
            :ok <- validate_key_size(__MODULE__.Keys.history_key(id, partition_key)) do
-        Router.flow_rewind(ctx, %{
-          id: id,
-          to_event: to_event,
-          expect_state: expect_state,
-          run_at_ms: run_at_ms,
-          reason_ref: reason_ref,
-          now_ms: now,
-          partition_key: partition_key
-        })
+        attrs =
+          %{
+            id: id,
+            to_event: to_event,
+            expect_state: expect_state,
+            run_at_ms: run_at_ms,
+            reason_ref: reason_ref,
+            partition_key: partition_key
+          }
+          |> maybe_put_attr(:now_ms, now)
+
+        Router.flow_rewind(ctx, attrs)
       end
 
     observe_flow(:rewind, started, result, %{flow_id: id})
@@ -397,8 +413,9 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key} <- optional_partition_key(opts),
          {:ok, count} <- flow_count(opts),
          index_key = __MODULE__.Keys.parent_index_key(parent_flow_id, partition_key),
-         :ok <- validate_key_size(index_key) do
-      flow_records_for_index(ctx, index_key, partition_key, count)
+         :ok <- validate_key_size(index_key),
+         {:ok, records} <- flow_records_for_index(ctx, index_key, partition_key, count) do
+      {:ok, filter_flow_records(records, :parent_flow_id, parent_flow_id, count)}
     end
   end
 
@@ -419,6 +436,8 @@ defmodule Ferricstore.Flow do
          :ok <- validate_key_size(index_key),
          {:ok, indexed_records} <- flow_records_for_index(ctx, index_key, partition_key, count),
          {:ok, root_record} <- flow_root_record(ctx, root_flow_id, partition_key) do
+      indexed_records = filter_flow_records(indexed_records, :root_flow_id, root_flow_id, count)
+
       records =
         [root_record | indexed_records]
         |> Enum.reject(&is_nil/1)
@@ -443,8 +462,9 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key} <- optional_partition_key(opts),
          {:ok, count} <- flow_count(opts),
          index_key = __MODULE__.Keys.correlation_index_key(correlation_id, partition_key),
-         :ok <- validate_key_size(index_key) do
-      flow_records_for_index(ctx, index_key, partition_key, count)
+         :ok <- validate_key_size(index_key),
+         {:ok, records} <- flow_records_for_index(ctx, index_key, partition_key, count) do
+      {:ok, filter_flow_records(records, :correlation_id, correlation_id, count)}
     end
   end
 
@@ -990,6 +1010,12 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp filter_flow_records(records, field, value, count) do
+    records
+    |> Enum.filter(&(Map.get(&1, field) == value))
+    |> Enum.take(count)
+  end
+
   defp flow_root_record(ctx, root_flow_id, partition_key) do
     case get(ctx, root_flow_id, partition_key: partition_key) do
       {:ok, %{root_flow_id: ^root_flow_id} = record} -> {:ok, record}
@@ -1049,7 +1075,7 @@ defmodule Ferricstore.Flow do
         {:ok, %{}}
 
       [first_key | _] ->
-        now_ms = System.os_time(:millisecond)
+        now_ms = now_ms()
         sweep_limit = flow_terminal_lmdb_sweep_limit()
 
         ctx
@@ -1186,7 +1212,7 @@ defmodule Ferricstore.Flow do
 
   defp flow_lmdb_index_ids(ctx, index_key, partition_key, count) do
     prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
-    now_ms = System.os_time(:millisecond)
+    now_ms = now_ms()
     sweep_limit = flow_terminal_lmdb_sweep_limit()
 
     ctx
@@ -1221,7 +1247,7 @@ defmodule Ferricstore.Flow do
   defp flow_lmdb_query_index_ids(ctx, index_key, partition_key, count) do
     with :ok <- flow_flush_lmdb_for_index(ctx, index_key, partition_key) do
       prefix = Ferricstore.Flow.LMDB.query_index_prefix(index_key)
-      now_ms = System.os_time(:millisecond)
+      now_ms = now_ms()
 
       ctx
       |> flow_lmdb_paths_for_index(index_key, partition_key)
@@ -1254,7 +1280,7 @@ defmodule Ferricstore.Flow do
 
   defp flow_terminal_lmdb_count(ctx, index_key, _state, partition_key) do
     prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
-    now_ms = System.os_time(:millisecond)
+    now_ms = now_ms()
     sweep_limit = flow_terminal_lmdb_sweep_limit()
 
     ctx
@@ -1557,7 +1583,7 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp create_attrs(id, opts, default_now) do
+  defp create_attrs(id, opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
          {:ok, type} <- required_binary(opts, :type),
@@ -1572,34 +1598,36 @@ defmodule Ferricstore.Flow do
          {:ok, correlation_id} <- optional_binary_or_nil(opts, :correlation_id, nil),
          :ok <- validate_ref_size(:correlation_id, correlation_id),
          {:ok, idempotent} <- optional_boolean(opts, :idempotent, false),
-         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, default_now),
+         {:ok, now} <- optional_now_ms(opts),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
          {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
          {:ok, history_max_events} <- optional_pos_integer_or_nil(opts, :history_max_events),
          {:ok, priority} <- optional_priority(opts, @default_priority),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_flow_keys(id, type, state, priority, partition_key) do
-      {:ok,
-       %{
-         id: id,
-         type: type,
-         state: state,
-         payload_ref: payload_ref,
-         parent_flow_id: parent_flow_id,
-         root_flow_id: root_flow_id,
-         correlation_id: correlation_id,
-         idempotent: idempotent,
-         run_at_ms: run_at_ms,
-         ttl_ms: ttl_ms,
-         history_max_events: history_max_events,
-         priority: priority,
-         now_ms: now,
-         partition_key: partition_key
-       }}
+      attrs =
+        %{
+          id: id,
+          type: type,
+          state: state,
+          payload_ref: payload_ref,
+          parent_flow_id: parent_flow_id,
+          root_flow_id: root_flow_id,
+          correlation_id: correlation_id,
+          idempotent: idempotent,
+          ttl_ms: ttl_ms,
+          history_max_events: history_max_events,
+          priority: priority,
+          partition_key: partition_key
+        }
+        |> maybe_put_attr(:now_ms, now)
+        |> maybe_put_attr(:run_at_ms, run_at_ms)
+
+      {:ok, attrs}
     end
   end
 
-  defp create_many_attrs(items, opts, partition_key, default_now) do
+  defp create_many_attrs(items, opts, partition_key) do
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, item_opts} <- create_many_item_opts(item),
            {:ok, item_partition_key} <- many_item_partition_key(partition_key, item_opts),
@@ -1608,8 +1636,7 @@ defmodule Ferricstore.Flow do
                id,
                opts
                |> Keyword.merge(Keyword.delete(item_opts, :partition_key))
-               |> Keyword.put(:partition_key, item_partition_key),
-               default_now
+               |> Keyword.put(:partition_key, item_partition_key)
              ) do
         {:cont, {:ok, [attrs | acc]}}
       else
@@ -1661,7 +1688,7 @@ defmodule Ferricstore.Flow do
     |> maybe_put_item_opt(:idempotent, item, :idempotent, "idempotent")
   end
 
-  defp transition_attrs(id, from_state, to_state, opts, default_now) do
+  defp transition_attrs(id, from_state, to_state, opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_id(id),
          :ok <- validate_state(:from, from_state),
@@ -1670,25 +1697,27 @@ defmodule Ferricstore.Flow do
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, default_now),
+         {:ok, now} <- optional_now_ms(opts),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
          {:ok, priority} <- optional_priority_or_nil(opts) do
-      {:ok,
-       %{
-         id: id,
-         from_state: from_state,
-         to_state: to_state,
-         lease_token: lease_token,
-         fencing_token: fencing_token,
-         run_at_ms: run_at_ms,
-         priority: priority,
-         now_ms: now,
-         partition_key: partition_key
-       }}
+      attrs =
+        %{
+          id: id,
+          from_state: from_state,
+          to_state: to_state,
+          lease_token: lease_token,
+          fencing_token: fencing_token,
+          priority: priority,
+          partition_key: partition_key
+        }
+        |> maybe_put_attr(:now_ms, now)
+        |> maybe_put_attr(:run_at_ms, run_at_ms)
+
+      {:ok, attrs}
     end
   end
 
-  defp transition_many_attrs(items, opts, partition_key, from_state, to_state, default_now) do
+  defp transition_many_attrs(items, opts, partition_key, from_state, to_state) do
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, item_opts} <- transition_many_item_opts(item),
            {:ok, item_partition_key} <- many_item_partition_key(partition_key, item_opts),
@@ -1699,8 +1728,7 @@ defmodule Ferricstore.Flow do
                to_state,
                opts
                |> Keyword.merge(Keyword.delete(item_opts, :partition_key))
-               |> Keyword.put(:partition_key, item_partition_key),
-               default_now
+               |> Keyword.put(:partition_key, item_partition_key)
              ) do
         {:cont, {:ok, [attrs | acc]}}
       else
@@ -1890,9 +1918,25 @@ defmodule Ferricstore.Flow do
   end
 
   defp optional_non_neg_integer(opts, key, default) do
-    case Keyword.get(opts, key, default) do
-      value when is_integer(value) and value >= 0 -> {:ok, value}
-      _ -> {:error, "ERR flow #{key} must be a non-negative integer"}
+    case Keyword.fetch(opts, key) do
+      {:ok, value} when is_integer(value) and value >= 0 -> {:ok, value}
+      {:ok, _} -> {:error, "ERR flow #{key} must be a non-negative integer"}
+      :error when is_integer(default) and default >= 0 -> {:ok, default}
+      :error when is_nil(default) -> {:ok, nil}
+      :error -> {:error, "ERR flow #{key} must be a non-negative integer"}
+    end
+  end
+
+  defp optional_now_ms(opts) do
+    case Keyword.fetch(opts, :now_ms) do
+      {:ok, value} when is_integer(value) and value >= 0 ->
+        {:ok, value}
+
+      {:ok, _value} ->
+        {:error, "ERR flow now_ms must be a non-negative integer"}
+
+      :error ->
+        {:ok, nil}
     end
   end
 
@@ -1964,7 +2008,10 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp now_ms, do: System.os_time(:millisecond)
+  defp maybe_put_attr(attrs, _key, nil), do: attrs
+  defp maybe_put_attr(attrs, key, value), do: Map.put(attrs, key, value)
+
+  defp now_ms, do: CommandTime.now_ms()
 
   defmodule Keys do
     @moduledoc false

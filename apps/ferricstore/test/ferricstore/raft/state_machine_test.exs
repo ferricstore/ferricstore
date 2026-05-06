@@ -234,6 +234,116 @@ defmodule Ferricstore.Raft.StateMachineTest do
     ArgumentError -> :ok
   end
 
+  describe "Flow command time" do
+    test "uses stamped apply time when Flow attrs omit now_ms", %{state: state} do
+      :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
+      :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+
+      on_exit(fn ->
+        safe_delete_ets(state.zset_score_index_name)
+        safe_delete_ets(state.zset_score_lookup_name)
+        safe_delete_ets(state.flow_index_name)
+        safe_delete_ets(state.flow_lookup_name)
+      end)
+
+      id = "flow-command-time"
+      type = "command-time"
+      partition_key = "tenant-command-time"
+      state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+      {state, {:ok, created}} =
+        StateMachine.apply(
+          %{system_time: 1_000},
+          {:flow_create, state_key,
+           %{id: id, type: type, state: "queued", partition_key: partition_key}},
+          state
+        )
+
+      assert created.created_at_ms == 1_000
+      assert created.updated_at_ms == 1_000
+      assert created.next_run_at_ms == 1_000
+
+      due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
+
+      {state, {:ok, [claimed]}} =
+        StateMachine.apply(
+          %{system_time: 1_250},
+          {:flow_claim_due, due_key,
+           %{
+             type: type,
+             state: "queued",
+             worker: "worker-command-time",
+             lease_ms: 500,
+             limit: 1,
+             priority: nil,
+             partition_key: partition_key
+           }},
+          state
+        )
+
+      assert claimed.updated_at_ms == 1_250
+      assert claimed.lease_deadline_ms == 1_750
+
+      {_, {:ok, transitioned}} =
+        StateMachine.apply(
+          %{system_time: 2_000},
+          {:flow_transition, state_key,
+           %{
+             id: id,
+             from_state: "running",
+             to_state: "waiting",
+             lease_token: claimed.lease_token,
+             fencing_token: claimed.fencing_token,
+             partition_key: partition_key
+           }},
+          state
+        )
+
+      assert transitioned.updated_at_ms == 2_000
+      assert transitioned.next_run_at_ms == 2_000
+    end
+  end
+
+  describe "Flow index rollback" do
+    test "rolls back Flow.Index mutations when apply append fails", %{state: state, dir: dir} do
+      :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
+      :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+
+      on_exit(fn ->
+        safe_delete_ets(state.zset_score_index_name)
+        safe_delete_ets(state.zset_score_lookup_name)
+        safe_delete_ets(state.flow_index_name)
+        safe_delete_ets(state.flow_lookup_name)
+      end)
+
+      id = "flow-index-rollback"
+      type = "index-rollback"
+      partition_key = "tenant-index-rollback"
+      due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
+      state_index_key = Ferricstore.Flow.Keys.state_index_key(type, "queued", partition_key)
+      state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+      bad_state = %{state | active_file_path: Path.join(dir, "missing.log")}
+
+      {_state, {:error, :active_file_unavailable}} =
+        StateMachine.apply(
+          %{system_time: 1_000},
+          {:flow_create, state_key,
+           %{id: id, type: type, state: "queued", partition_key: partition_key}},
+          bad_state
+        )
+
+      assert Ferricstore.Flow.Index.score_of(state.flow_lookup_name, due_key, id) == :miss
+      assert Ferricstore.Flow.Index.score_of(state.flow_lookup_name, state_index_key, id) == :miss
+      assert Ferricstore.Flow.Index.count_all(state.flow_lookup_name, due_key) == 0
+      assert Ferricstore.Flow.Index.count_all(state.flow_lookup_name, state_index_key) == 0
+    end
+  end
+
   describe "promoted compound prefix delete" do
     test "waits for promoted compaction latch before cleanup", %{
       state: state,
