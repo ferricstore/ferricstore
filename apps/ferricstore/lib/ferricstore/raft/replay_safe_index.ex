@@ -37,7 +37,7 @@ defmodule Ferricstore.Raft.ReplaySafeIndex do
     contents = Integer.to_string(index) <> "\n"
 
     result =
-      with :ok <- File.mkdir_p(shard_data_path),
+      with :ok <- ensure_marker_dir(shard_data_path),
            :ok <- File.write(tmp_path, contents),
            :ok <- fsync(NIF.v2_fsync(tmp_path), tmp_path),
            :ok <- Ferricstore.FS.rename(tmp_path, marker_path),
@@ -57,6 +57,9 @@ defmodule Ferricstore.Raft.ReplaySafeIndex do
           {:error, {:not_found, _}} ->
             :ok
 
+          {:error, {:not_a_directory, _}} ->
+            :ok
+
           {:error, cleanup_reason} ->
             :telemetry.execute(
               [:ferricstore, :raft, :replay_safe_index, :cleanup_failed],
@@ -71,6 +74,22 @@ defmodule Ferricstore.Raft.ReplaySafeIndex do
 
         Logger.warning("failed to persist raft replay-safe index #{index}: #{inspect(error)}")
         error
+    end
+  end
+
+  defp ensure_marker_dir(path) do
+    case Ferricstore.FS.mkdir_p(path) do
+      :ok ->
+        :ok
+
+      {:error, {:already_exists, _}} ->
+        if File.dir?(path), do: :ok, else: {:error, :enotdir}
+
+      {:error, {:not_a_directory, _}} ->
+        {:error, :enotdir}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

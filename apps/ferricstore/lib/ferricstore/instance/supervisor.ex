@@ -86,10 +86,24 @@ defmodule FerricStore.Instance.Supervisor do
         end)
       end
 
+    flow_lmdb_writer_children =
+      if name == :default do
+        []
+      else
+        Enum.map(0..(ctx.shard_count - 1), fn i ->
+          Supervisor.child_spec(
+            {Ferricstore.Flow.LMDBWriter,
+             shard_index: i, data_dir: ctx.data_dir, instance_ctx: ctx},
+            id: :"#{name}.FlowLMDBWriter.#{i}"
+          )
+        end)
+      end
+
     children =
       cleanup_children ++
         merge_children ++
         bitcask_writer_children ++
+        flow_lmdb_writer_children ++
         [
           # Stats and MemoryGuard are global application processes today. The
           # instance context owns isolated counters/flags, but these GenServers are

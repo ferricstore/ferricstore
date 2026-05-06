@@ -66,6 +66,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
   def writer_name(nil, shard_index), do: writer_name(shard_index)
   def writer_name(%{name: :default}, shard_index), do: writer_name(shard_index)
   def writer_name(%{name: name}, shard_index), do: :"#{name}.Store.BitcaskWriter.#{shard_index}"
+  def writer_name(%{}, shard_index), do: writer_name(shard_index)
 
   @doc """
   Queues a deferred Bitcask write for background processing.

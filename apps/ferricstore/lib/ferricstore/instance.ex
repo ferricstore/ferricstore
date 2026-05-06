@@ -32,6 +32,9 @@ defmodule FerricStore.Instance do
           replay_safe_index: reference(),
           replay_safe_requested_index: reference(),
           replay_safe_persist_failures: reference(),
+          flow_lmdb_replay_safe_index: reference(),
+          flow_lmdb_replay_safe_requested_index: reference(),
+          flow_lmdb_replay_safe_persist_failures: reference(),
           last_applied_index: reference(),
           last_released_cursor_index: reference(),
           pending_release_cursor_checkpoint_count: reference(),
@@ -74,6 +77,9 @@ defmodule FerricStore.Instance do
     :replay_safe_index,
     :replay_safe_requested_index,
     :replay_safe_persist_failures,
+    :flow_lmdb_replay_safe_index,
+    :flow_lmdb_replay_safe_requested_index,
+    :flow_lmdb_replay_safe_persist_failures,
     :last_applied_index,
     :last_released_cursor_index,
     :pending_release_cursor_checkpoint_count,
@@ -206,6 +212,33 @@ defmodule FerricStore.Instance do
         :atomics.new(shard_count, signed: false)
       end
 
+    flow_lmdb_replay_safe_index =
+      if name == :default do
+        try_get_pt(:ferricstore_flow_lmdb_replay_safe_index, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
+    flow_lmdb_replay_safe_requested_index =
+      if name == :default do
+        try_get_pt(:ferricstore_flow_lmdb_replay_safe_requested_index, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
+    flow_lmdb_replay_safe_persist_failures =
+      if name == :default do
+        try_get_pt(:ferricstore_flow_lmdb_replay_safe_persist_failures, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
     # Per-shard Ra index observability for the current coarse WAL/Bitcask gate.
     # These atomics do not affect release_cursor correctness; they let INFO show
     # how far Ra apply has advanced beyond the last emitted release cursor.
@@ -313,6 +346,9 @@ defmodule FerricStore.Instance do
       replay_safe_index: replay_safe_index,
       replay_safe_requested_index: replay_safe_requested_index,
       replay_safe_persist_failures: replay_safe_persist_failures,
+      flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index,
+      flow_lmdb_replay_safe_requested_index: flow_lmdb_replay_safe_requested_index,
+      flow_lmdb_replay_safe_persist_failures: flow_lmdb_replay_safe_persist_failures,
       last_applied_index: last_applied_index,
       last_released_cursor_index: last_released_cursor_index,
       pending_release_cursor_checkpoint_count: pending_release_cursor_checkpoint_count,

@@ -280,7 +280,11 @@ defmodule Ferricstore.WritePathNosyncTest do
       {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
 
       on_exit(fn ->
-        if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        try do
+          if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        catch
+          :exit, _ -> :ok
+        end
 
         try do
           :ets.delete(keydir)
@@ -314,7 +318,12 @@ defmodule Ferricstore.WritePathNosyncTest do
       {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
 
       on_exit(fn ->
-        if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        try do
+          if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        catch
+          :exit, _ -> :ok
+        end
+
         File.rm_rf(dir)
       end)
 
@@ -338,17 +347,26 @@ defmodule Ferricstore.WritePathNosyncTest do
 
       keydir = elem(ctx.keydir_refs, 0)
       key = "writer_pressure:#{System.unique_integer([:positive])}"
+      {:ok, writer} = BitcaskWriter.start_link(shard_index: 0, instance_ctx: ctx)
 
       missing_dir =
         Path.join(System.tmp_dir!(), "missing_writer_dir_#{System.unique_integer([:positive])}")
 
       missing_path = Path.join(missing_dir, "00000.log")
 
+      on_exit(fn ->
+        try do
+          if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
+
       Ferricstore.Store.DiskPressure.clear(ctx, 0)
       Ferricstore.Store.DiskPressure.clear(0)
 
       BitcaskWriter.write(ctx, 0, missing_path, 0, keydir, key, "value", 0)
-      BitcaskWriter.flush(0)
+      BitcaskWriter.flush(ctx, 0)
 
       assert Ferricstore.Store.DiskPressure.under_pressure?(ctx, 0)
     end

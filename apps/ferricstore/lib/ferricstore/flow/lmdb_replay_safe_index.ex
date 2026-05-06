@@ -37,7 +37,7 @@ defmodule Ferricstore.Flow.LMDBReplaySafeIndex do
     contents = Integer.to_string(index) <> "\n"
 
     result =
-      with :ok <- File.mkdir_p(shard_data_path),
+      with :ok <- Ferricstore.FS.mkdir_p(shard_data_path),
            :ok <- File.write(tmp_path, contents),
            :ok <- fsync(NIF.v2_fsync(tmp_path), tmp_path),
            :ok <- Ferricstore.FS.rename(tmp_path, marker_path),

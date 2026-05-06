@@ -2997,7 +2997,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert result.applied_count == 4
     end
 
-    test "release_cursor emitted exactly at interval boundary for put", %{store: _store, ets: ets} do
+    test "release_cursor emitted exactly at interval boundary for read-only command", %{
+      store: _store,
+      ets: ets
+    } do
       interval = 5
 
       state =
@@ -3008,8 +3011,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
         Enum.reduce(1..(interval - 1), state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
 
-          {new_state, {:applied_at, _, :ok}, _effects} =
-            StateMachine.apply(meta, {:put, "rc_#{i}", "v#{i}", 0}, acc)
+          {new_state, {:applied_at, _, nil}, _effects} =
+            StateMachine.apply(meta, {:getdel, "rc_#{i}"}, acc)
 
           new_state
         end)
@@ -3019,8 +3022,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
       # The N-th apply (index = interval) should emit release_cursor
       meta = %{index: interval, term: 1, system_time: System.os_time(:millisecond)}
 
-      {new_state, {:applied_at, _, :ok}, effects} =
-        StateMachine.apply(meta, {:put, "rc_#{interval}", "v#{interval}", 0}, state_before)
+      {new_state, {:applied_at, _, nil}, effects} =
+        StateMachine.apply(meta, {:getdel, "rc_#{interval}"}, state_before)
 
       assert new_state.applied_count == interval
 
@@ -3033,7 +3036,13 @@ defmodule Ferricstore.Raft.StateMachineTest do
       cursor_effect = Enum.find(effects, &match?({:release_cursor, _}, &1))
       assert {:release_cursor, ra_index} = cursor_effect
       assert ra_index == interval
-      assert Ferricstore.Raft.ReplaySafeIndex.read(new_state.shard_data_path) == interval
+
+      assert Ferricstore.Raft.ReplaySafeIndexWriter.durable?(
+               new_state.instance_ctx,
+               new_state.shard_index,
+               new_state.shard_data_path,
+               interval
+             )
     end
 
     test "release_cursor waits while the shard has uncheckpointed bitcask data", %{
@@ -3223,6 +3232,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
       last_applied_index = :atomics.new(2, signed: false)
       last_released_cursor_index = :atomics.new(2, signed: false)
       pending_release_cursor_checkpoint_count = :atomics.new(2, signed: false)
+      replay_safe_index = :atomics.new(2, signed: false)
+      flow_lmdb_replay_safe_index = :atomics.new(2, signed: false)
+
+      :atomics.put(replay_safe_index, shard0 + 1, 2)
+      :atomics.put(flow_lmdb_replay_safe_index, shard0 + 1, 2)
 
       state =
         init_state_for_release_cursor(ets,
@@ -3242,6 +3256,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
         last_applied_index: last_applied_index,
         last_released_cursor_index: last_released_cursor_index,
         pending_release_cursor_checkpoint_count: pending_release_cursor_checkpoint_count,
+        replay_safe_index: replay_safe_index,
+        flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index,
         hot_cache_max_value_size: 64
       }
 
@@ -3374,14 +3390,13 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state = %{
         state
         | release_cursor_interval: 2,
-          instance_ctx: %{
-            checkpoint_flags: checkpoint_flags,
-            checkpoint_in_flight: checkpoint_in_flight,
-            last_applied_index: last_applied_index,
-            last_released_cursor_index: last_released_cursor_index,
-            disk_pressure: :atomics.new(shard_index + 1, signed: false),
-            hot_cache_max_value_size: 64
-          }
+          instance_ctx:
+            release_cursor_instance_ctx(shard_index, 2,
+              checkpoint_flags: checkpoint_flags,
+              checkpoint_in_flight: checkpoint_in_flight,
+              last_applied_index: last_applied_index,
+              last_released_cursor_index: last_released_cursor_index
+            )
       }
 
       {state, {:applied_at, 1, :ok}, effects1} =
@@ -3427,12 +3442,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state = %{
         state
         | release_cursor_interval: 1,
-          instance_ctx: %{
-            checkpoint_flags: :atomics.new(shard_index + 1, signed: false),
-            checkpoint_in_flight: :atomics.new(shard_index + 1, signed: false),
-            last_applied_index: last_applied_index,
-            last_released_cursor_index: last_released_cursor_index
-          }
+          instance_ctx:
+            release_cursor_instance_ctx(shard_index, 42,
+              last_applied_index: last_applied_index,
+              last_released_cursor_index: last_released_cursor_index
+            )
       }
 
       meta = %{index: 42, term: 1, system_time: System.os_time(:millisecond)}
@@ -3456,12 +3470,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
         state
         |> Map.merge(%{
           release_cursor_interval: 1,
-          instance_ctx: %{
-            checkpoint_flags: :atomics.new(shard_index + 1, signed: false),
-            checkpoint_in_flight: :atomics.new(shard_index + 1, signed: false),
-            last_applied_index: last_applied_index,
-            last_released_cursor_index: last_released_cursor_index
-          }
+          instance_ctx:
+            release_cursor_instance_ctx(shard_index, 44,
+              last_applied_index: last_applied_index,
+              last_released_cursor_index: last_released_cursor_index
+            )
         })
         |> Map.drop([
           :pending_release_cursor_index,
@@ -3530,8 +3543,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
       last_applied_index = :atomics.new(atomics_size, signed: false)
       last_released_cursor_index = :atomics.new(atomics_size, signed: false)
       replay_safe_index = :atomics.new(atomics_size, signed: false)
+      flow_lmdb_replay_safe_index = :atomics.new(atomics_size, signed: false)
 
       :atomics.put(replay_safe_index, shard_index + 1, marker_index)
+      :atomics.put(flow_lmdb_replay_safe_index, shard_index + 1, marker_index)
 
       state = %{
         state
@@ -3545,7 +3560,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
             checkpoint_in_flight: checkpoint_in_flight,
             last_applied_index: last_applied_index,
             last_released_cursor_index: last_released_cursor_index,
-            replay_safe_index: replay_safe_index
+            replay_safe_index: replay_safe_index,
+            flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index
           }
       }
 
@@ -3580,7 +3596,6 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state = %{
         state
         | applied_count: 10,
-          flow_lmdb_enabled: true,
           release_cursor_interval: 1,
           pending_release_cursor_index: marker_index,
           pending_replay_safe_marker_index: marker_index,
@@ -3618,8 +3633,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
       last_applied_index = :atomics.new(atomics_size, signed: false)
       last_released_cursor_index = :atomics.new(atomics_size, signed: false)
       replay_safe_index = :atomics.new(atomics_size, signed: false)
+      flow_lmdb_replay_safe_index = :atomics.new(atomics_size, signed: false)
 
       :atomics.put(replay_safe_index, shard_index + 1, marker_index)
+      :atomics.put(flow_lmdb_replay_safe_index, shard_index + 1, marker_index)
 
       state = %{
         state
@@ -3633,7 +3650,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
             checkpoint_in_flight: checkpoint_in_flight,
             last_applied_index: last_applied_index,
             last_released_cursor_index: last_released_cursor_index,
-            replay_safe_index: replay_safe_index
+            replay_safe_index: replay_safe_index,
+            flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index
           }
       }
 
@@ -3661,6 +3679,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       instance_ctx =
         FerricStore.Instance.build(instance_name, shard_count: shard_index + 1, data_dir: root)
+
+      :atomics.put(instance_ctx.replay_safe_index, shard_index + 1, 77)
+      :atomics.put(instance_ctx.flow_lmdb_replay_safe_index, shard_index + 1, 77)
 
       on_exit({:cursor_metric_instance, instance_name}, fn ->
         FerricStore.Instance.cleanup(instance_name)
@@ -3781,8 +3802,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
         Enum.reduce(1..9, {state, []}, fn i, {acc, cursors} ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
 
-          {new_state, {:applied_at, _, :ok}, effects} =
-            StateMachine.apply(meta, {:put, "mc_#{i}", "v#{i}", 0}, acc)
+          {new_state, {:applied_at, _, nil}, effects} =
+            StateMachine.apply(meta, {:getdel, "mc_#{i}"}, acc)
 
           cursor_idx =
             Enum.find_value(effects, fn
@@ -3796,26 +3817,29 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert cursor_indices == [3, 6, 9]
     end
 
-    test "release_cursor emitted for delete at interval boundary", %{store: _store, ets: ets} do
+    test "release_cursor emitted for read-only delete miss at interval boundary", %{
+      store: _store,
+      ets: ets
+    } do
       interval = 3
 
       state =
         init_state_for_release_cursor(ets, release_cursor_interval: interval)
 
-      # Put two keys (applied_count = 2), then delete at the 3rd apply
+      # Apply two read-only misses (applied_count = 2), then another at the 3rd apply.
       meta1 = %{index: 10, term: 1, system_time: System.os_time(:millisecond)}
 
-      {s1, {:applied_at, _, :ok}, _e1} =
-        StateMachine.apply(meta1, {:put, "del_rc_a", "va", 0}, state)
+      {s1, {:applied_at, _, nil}, _e1} =
+        StateMachine.apply(meta1, {:getdel, "del_rc_a"}, state)
 
       meta2 = %{index: 11, term: 1, system_time: System.os_time(:millisecond)}
 
-      {s2, {:applied_at, _, :ok}, _e2} =
-        StateMachine.apply(meta2, {:put, "del_rc_b", "vb", 0}, s1)
+      {s2, {:applied_at, _, nil}, _e2} =
+        StateMachine.apply(meta2, {:getdel, "del_rc_b"}, s1)
 
-      # 3rd command is a delete -- should trigger release_cursor
+      # 3rd read-only delete miss should trigger release_cursor.
       meta3 = %{index: 12, term: 1, system_time: System.os_time(:millisecond)}
-      {_s3, {:applied_at, _, :ok}, effects} = StateMachine.apply(meta3, {:delete, "del_rc_a"}, s2)
+      {_s3, {:applied_at, _, nil}, effects} = StateMachine.apply(meta3, {:getdel, "del_rc_a"}, s2)
 
       cursor_effect = Enum.find(effects, &match?({:release_cursor, _}, &1))
       assert {:release_cursor, 12} = cursor_effect
@@ -3835,8 +3859,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
         Enum.reduce(1..3, state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
 
-          {new_state, {:applied_at, _, :ok}, _e} =
-            StateMachine.apply(meta, {:put, "pre_#{i}", "v#{i}", 0}, acc)
+          {new_state, {:applied_at, _, nil}, _e} =
+            StateMachine.apply(meta, {:getdel, "pre_#{i}"}, acc)
 
           new_state
         end)
@@ -3845,9 +3869,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       # Batch of 3 commands takes applied_count from 3 to 6 -- crosses interval at 5
       batch = [
-        {:put, "batch_1", "bv1", 0},
-        {:put, "batch_2", "bv2", 0},
-        {:put, "batch_3", "bv3", 0}
+        {:getdel, "batch_1"},
+        {:getdel, "batch_2"},
+        {:getdel, "batch_3"}
       ]
 
       meta = %{index: 4, term: 1, system_time: System.os_time(:millisecond)}
@@ -3855,7 +3879,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {new_state, {:applied_at, _, {:ok, results}}, effects} =
         StateMachine.apply(meta, {:batch, batch}, state_before)
 
-      assert results == [:ok, :ok, :ok]
+      assert results == [nil, nil, nil]
       assert new_state.applied_count == 6
       cursor_effect = Enum.find(effects, &match?({:release_cursor, _}, &1))
       assert {:release_cursor, 4} = cursor_effect
@@ -3949,11 +3973,34 @@ defmodule Ferricstore.Raft.StateMachineTest do
         shard_data_path: shard_path,
         active_file_id: 0,
         active_file_path: active_file_path,
-        ets: ets
+        ets: ets,
+        instance_ctx: release_cursor_instance_ctx(shard_index)
       }
       |> Map.merge(Map.new(opts))
 
     StateMachine.init(config)
+  end
+
+  defp release_cursor_instance_ctx(shard_index, durable_index \\ 1_000_000, overrides \\ []) do
+    atomics_size = shard_index + 1
+    replay_safe_index = :atomics.new(atomics_size, signed: false)
+    flow_lmdb_replay_safe_index = :atomics.new(atomics_size, signed: false)
+
+    :atomics.put(replay_safe_index, shard_index + 1, durable_index)
+    :atomics.put(flow_lmdb_replay_safe_index, shard_index + 1, durable_index)
+
+    [
+      checkpoint_flags: :atomics.new(atomics_size, signed: false),
+      checkpoint_in_flight: :atomics.new(atomics_size, signed: false),
+      disk_pressure: :atomics.new(atomics_size, signed: false),
+      last_applied_index: :atomics.new(atomics_size, signed: false),
+      last_released_cursor_index: :atomics.new(atomics_size, signed: false),
+      replay_safe_index: replay_safe_index,
+      flow_lmdb_replay_safe_index: flow_lmdb_replay_safe_index,
+      hot_cache_max_value_size: 65_536
+    ]
+    |> Keyword.merge(overrides)
+    |> Map.new()
   end
 
   defp set_opts(overrides) do
