@@ -4776,19 +4776,27 @@ defmodule Ferricstore.Raft.StateMachine do
          candidates,
          remaining
        ) do
+    records =
+      flow_read_records(
+        state,
+        Enum.map(candidates, fn {id, _score} -> %{id: id, partition_key: partition_key} end)
+      )
+
     {plans, stale_due_ids, _count} =
-      Enum.reduce_while(candidates, {[], [], 0}, fn {id, _score}, {plans, stale_due_ids, count} ->
+      candidates
+      |> Enum.zip(records)
+      |> Enum.reduce_while({[], [], 0}, fn {{id, _score}, record},
+                                           {plans, stale_due_ids, count} ->
         if count >= remaining do
           {:halt, {plans, stale_due_ids, count}}
         else
-          case flow_prepare_claim_candidate(
-                 state,
+          case flow_prepare_claim_candidate_record(
+                 record,
                  id,
                  expected_state,
                  worker,
                  lease_ms,
-                 now_ms,
-                 partition_key
+                 now_ms
                ) do
             {:ok, record, next} ->
               {:cont, {[{record, next} | plans], stale_due_ids, count + 1}}
@@ -5448,16 +5456,15 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_prepare_claim_candidate(
-         state,
-         id,
+  defp flow_prepare_claim_candidate_record(
+         record,
+         _id,
          expected_state,
          worker,
          lease_ms,
-         now_ms,
-         partition_key
+         now_ms
        ) do
-    case flow_read_record(state, id, partition_key) do
+    case record do
       nil ->
         :delete_due
 
