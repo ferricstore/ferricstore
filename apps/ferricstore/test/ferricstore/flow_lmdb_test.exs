@@ -329,6 +329,59 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert Ferricstore.Flow.LMDBReplaySafeIndex.read(shard_data_path) == 123
   end
 
+  test "mirror writer persists replay-safe marker with no pending ops" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_empty_marker_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 3
+    instance_name = :"flow_lmdb_writer_empty_marker_#{System.unique_integer([:positive])}"
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    atomics_size = shard_index + 1
+    durable = :atomics.new(atomics_size, signed: false)
+    requested = :atomics.new(atomics_size, signed: false)
+    failures = :atomics.new(atomics_size, signed: false)
+
+    instance_ctx = %{
+      name: instance_name,
+      flow_lmdb_replay_safe_index: durable,
+      flow_lmdb_replay_safe_requested_index: requested,
+      flow_lmdb_replay_safe_persist_failures: failures
+    }
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(shard_data_path)
+
+    pid =
+      start_supervised!(
+        {Ferricstore.Flow.LMDBWriter,
+         shard_index: shard_index,
+         data_dir: data_dir,
+         instance_ctx: instance_ctx,
+         instance_name: instance_name}
+      )
+
+    assert :requested =
+             Ferricstore.Flow.LMDBWriter.request(instance_ctx, shard_index, shard_data_path, 321)
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+    assert Process.alive?(pid)
+    assert :atomics.get(durable, shard_index + 1) == 321
+    assert Ferricstore.Flow.LMDBReplaySafeIndex.read(shard_data_path) == 321
+  end
+
   test "mirror writer maintains terminal counts and TTL index atomically" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)

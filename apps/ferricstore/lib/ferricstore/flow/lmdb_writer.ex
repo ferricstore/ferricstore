@@ -301,7 +301,9 @@ defmodule Ferricstore.Flow.LMDBWriter do
   defp write_ops(_path, []), do: :ok
   defp write_ops(path, ops), do: Ferricstore.Flow.LMDB.write_batch(path, ops)
 
-  defp expand_ops(state, []), do: {:ok, [], state}
+  defp expand_ops(state, []) do
+    {:ok, [], Map.put(state, :terminal_count_cache, empty_terminal_count_cache())}
+  end
 
   defp expand_ops(state, ops) do
     initial = %{
@@ -309,7 +311,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
       counts: %{},
       terminal_values: %{},
       terminal_count_inits: state.terminal_count_inits,
-      terminal_count_cache: %{puts: %{}, refresh: MapSet.new()}
+      terminal_count_cache: empty_terminal_count_cache()
     }
 
     Enum.reduce_while(ops, {:ok, initial}, fn op, {:ok, acc} ->
@@ -336,6 +338,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
         error
     end
   end
+
+  defp empty_terminal_count_cache, do: %{puts: %{}, refresh: MapSet.new()}
 
   defp expand_op(path, {:terminal_put, terminal_key, value, state_key, count_key}, acc)
        when is_binary(terminal_key) and is_binary(value) and is_binary(state_key) and
