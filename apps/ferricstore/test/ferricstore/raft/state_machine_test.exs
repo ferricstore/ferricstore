@@ -2697,6 +2697,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
         assert_receive {:bitcask_append, measurements, %{status: :ok}}, 500
         assert measurements.batch_size == 3
         assert measurements.delete_count == 1
+
+        assert measurements.batch_bytes ==
+                 byte_size("batched_delete_put_a") + 1 + byte_size("batched_delete_seed") +
+                   byte_size("batched_delete_put_b") + 1
       after
         :telemetry.detach(handler_id)
       end

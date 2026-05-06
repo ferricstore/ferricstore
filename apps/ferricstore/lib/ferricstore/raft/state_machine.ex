@@ -6670,9 +6670,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
       {:ok, pending} when is_list(pending) ->
         batch = Enum.reverse(pending)
-        batch_bytes = bitcask_batch_bytes(batch)
-        record_bytes = bitcask_record_bytes(batch)
-        delete_count = Enum.count(batch, &match?({:delete, _, _}, &1))
+        {batch_bytes, record_bytes, delete_count} = bitcask_batch_stats(batch)
 
         case resolve_active_file(state) do
           :stale ->
@@ -6724,30 +6722,27 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp bitcask_batch_bytes(batch) do
-    Enum.reduce(batch, 0, fn
-      {:put, key, value, _expire_at_ms}, acc ->
-        acc + byte_size(key) + byte_size(value)
+  defp bitcask_batch_stats(batch) do
+    Enum.reduce(batch, {0, 0, 0}, fn
+      {:put, key, value, _expire_at_ms}, {batch_bytes, record_bytes, delete_count} ->
+        bytes = byte_size(key) + byte_size(value)
+        {batch_bytes + bytes, record_bytes + @bitcask_record_header_size + bytes, delete_count}
 
-      {:put_cold, key, value, _expire_at_ms}, acc ->
-        acc + byte_size(key) + byte_size(value)
+      {:put_cold, key, value, _expire_at_ms}, {batch_bytes, record_bytes, delete_count} ->
+        bytes = byte_size(key) + byte_size(value)
+        {batch_bytes + bytes, record_bytes + @bitcask_record_header_size + bytes, delete_count}
 
-      {:delete, key, _prob_path}, acc ->
-        acc + byte_size(key)
+      {:delete, key, _prob_path}, {batch_bytes, record_bytes, delete_count} ->
+        bytes = byte_size(key)
+
+        {batch_bytes + bytes, record_bytes + @bitcask_record_header_size + bytes,
+         delete_count + 1}
     end)
   end
 
   defp bitcask_record_bytes(batch) do
-    Enum.reduce(batch, 0, fn
-      {:put, key, value, _expire_at_ms}, acc ->
-        acc + @bitcask_record_header_size + byte_size(key) + byte_size(value)
-
-      {:put_cold, key, value, _expire_at_ms}, acc ->
-        acc + @bitcask_record_header_size + byte_size(key) + byte_size(value)
-
-      {:delete, key, _prob_path}, acc ->
-        acc + @bitcask_record_header_size + byte_size(key)
-    end)
+    {_batch_bytes, record_bytes, _delete_count} = bitcask_batch_stats(batch)
+    record_bytes
   end
 
   defp track_bitcask_append_bytes(state, file_path, file_id, written_bytes)
