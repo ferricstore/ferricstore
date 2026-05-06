@@ -929,6 +929,43 @@ defmodule Ferricstore.FlowTest do
     assert info.completed == 1
   end
 
+  test "flow_info does not write zero LMDB terminal counters for active-only types" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = FerricStore.Instance.get(:default)
+    partition = uid("tenant-info-zero")
+    type = uid("info-zero")
+    id = uid("flow-info-zero")
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: type,
+               partition_key: partition,
+               run_at_ms: 1,
+               now_ms: 1
+             )
+
+    completed_index_key = Ferricstore.Flow.Keys.state_index_key(type, "completed", partition)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, completed_index_key)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+
+    count_key = Ferricstore.Flow.LMDB.terminal_count_key(completed_index_key)
+
+    assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, count_key)
+    assert {:ok, info} = FerricStore.flow_info(type, partition_key: partition)
+    assert info.completed == 0
+    assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, count_key)
+  end
+
   test "partition_key scopes claim, complete, retry, get, and history" do
     partition = uid("tenant")
     id = uid("flow-partition")

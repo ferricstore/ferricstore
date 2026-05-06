@@ -1026,16 +1026,21 @@ defmodule FerricStore do
   end
 
   defp flow_terminal_lmdb_rebuild_count_for_path(path, index_key, prefix, now_ms) do
-    with {:ok, raw_count} <- Ferricstore.Flow.LMDB.prefix_count(path, prefix),
-         {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, raw_count) do
-      live_count =
-        entries
-        |> flow_decode_terminal_index_entries(path, now_ms)
-        |> length()
+    with {:ok, raw_count} <- Ferricstore.Flow.LMDB.prefix_count(path, prefix) do
+      if raw_count == 0 do
+        {:ok, 0}
+      else
+        with {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, raw_count) do
+          live_count =
+            entries
+            |> flow_decode_terminal_index_entries(path, now_ms)
+            |> length()
 
-      case Ferricstore.Flow.LMDB.put_terminal_count(path, index_key, live_count) do
-        :ok -> {:ok, live_count}
-        {:error, _reason} = error -> error
+          case Ferricstore.Flow.LMDB.put_terminal_count(path, index_key, live_count) do
+            :ok -> {:ok, live_count}
+            {:error, _reason} = error -> error
+          end
+        end
       end
     end
   end
