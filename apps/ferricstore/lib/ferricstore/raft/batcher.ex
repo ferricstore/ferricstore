@@ -1333,7 +1333,7 @@ defmodule Ferricstore.Raft.Batcher do
 
   defp enqueue_write_under_capacity(command, from, state) do
     prefix = extract_prefix(command)
-    {window_ms, state} = command_window_ms(command, prefix, state)
+    {window_ms, state} = lookup_ns_config(prefix, state)
     slot_key = {prefix, :quorum}
 
     slot = Map.get(state.slots, slot_key, new_slot(window_ms))
@@ -1359,7 +1359,6 @@ defmodule Ferricstore.Raft.Batcher do
     # Flush immediately if slot is full (O(1) count check instead of O(n) length)
     cond do
       updated_slot.count >= state.max_batch_size -> do_flush_slot(new_state, slot_key)
-      window_ms == 0 -> do_flush_slot(new_state, slot_key)
       true -> {:noreply, new_state}
     end
   end
@@ -1767,9 +1766,6 @@ defmodule Ferricstore.Raft.Batcher do
   # ---------------------------------------------------------------------------
   # Private: namespace config lookup
   # ---------------------------------------------------------------------------
-
-  defp command_window_ms({:flow_create, _key, _attrs}, _prefix, state), do: {0, state}
-  defp command_window_ms(_command, prefix, state), do: lookup_ns_config(prefix, state)
 
   @spec lookup_ns_config(binary(), %__MODULE__{}) :: {non_neg_integer(), %__MODULE__{}}
   defp lookup_ns_config(prefix, state) do

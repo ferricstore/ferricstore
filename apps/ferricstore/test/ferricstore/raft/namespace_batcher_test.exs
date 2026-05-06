@@ -108,42 +108,69 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
   end
 
   describe "Flow create latency policy" do
-    test "single flow_create flushes with a zero commit window" do
-      id = "nsbatcher_flow_create_#{System.unique_integer([:positive])}"
-      partition_key = "tenant-nsbatcher-flow-create"
-      key = Ferricstore.Flow.Keys.state_key(id, partition_key)
-      shard = Router.shard_for(FerricStore.Instance.get(:default), key)
-      handler_id = {:flow_create_zero_window, self(), make_ref()}
+    test "flow_create uses the namespace commit window for pipeline coalescing" do
+      partition_key = "tenant-nsbatcher-flow-pipeline"
+      first_id = "nsbatcher_flow_pipeline_0_#{System.unique_integer([:positive])}"
+      first_key = Ferricstore.Flow.Keys.state_key(first_id, partition_key)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), first_key)
+      handler_id = {:flow_create_pipeline_window, self(), make_ref()}
 
       :ok =
         :telemetry.attach(
           handler_id,
           [:ferricstore, :batcher, :slot_flush],
           fn _event, measurements, metadata, test_pid ->
-            send(test_pid, {:slot_flush, measurements, metadata})
+            if metadata.shard_index == shard and metadata.prefix == "f" do
+              send(test_pid, {:slot_flush, measurements, metadata})
+            end
           end,
           self()
         )
 
       try do
-        assert {:ok, %{id: ^id}} =
-                 Batcher.write(
-                   shard,
-                   {:flow_create, key,
-                    %{
-                      id: id,
-                      type: "nsbatcher-flow-create",
-                      state: "queued",
-                      partition_key: partition_key
-                    }}
-                 )
+        refs =
+          for i <- 1..20 do
+            id = "nsbatcher_flow_pipeline_#{i}_#{System.unique_integer([:positive])}"
+            key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+            ref = make_ref()
 
-        assert_receive {:slot_flush, %{batch_size: 1},
-                        %{shard_index: ^shard, prefix: "f", window_ms: 0}},
-                       500
+            :ok =
+              Batcher.write_async_quorum(
+                shard,
+                {:flow_create, key,
+                 %{
+                   id: id,
+                   type: "nsbatcher-flow-pipeline",
+                   state: "queued",
+                   partition_key: partition_key
+                 }},
+                {self(), ref}
+              )
+
+            ref
+          end
+
+        for ref <- refs do
+          assert_receive {^ref, {:ok, %{type: "nsbatcher-flow-pipeline"}}}, 5_000
+        end
+
+        flushes = drain_slot_flushes()
+
+        assert Enum.any?(flushes, fn {measurements, metadata} ->
+                 metadata.window_ms == 1 and measurements.batch_size > 1
+               end)
       after
         :telemetry.detach(handler_id)
       end
+    end
+  end
+
+  defp drain_slot_flushes(acc \\ []) do
+    receive do
+      {:slot_flush, measurements, metadata} ->
+        drain_slot_flushes([{measurements, metadata} | acc])
+    after
+      100 -> Enum.reverse(acc)
     end
   end
 
