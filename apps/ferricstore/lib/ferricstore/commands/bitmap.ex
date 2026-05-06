@@ -525,11 +525,15 @@ defmodule Ferricstore.Commands.Bitmap do
       type ->
         backup = compound_destination_backup(destkey, type, store)
 
-        with :ok <- clear_compound_data_structure(destkey, store) do
-          case Ops.put(store, destkey, result, 0) do
-            :ok -> byte_size(result)
-            {:error, _} = error -> restore_bitop_destination(store, destkey, backup, error)
-          end
+        case clear_compound_data_structure(destkey, store) do
+          :ok ->
+            case Ops.put(store, destkey, result, 0) do
+              :ok -> byte_size(result)
+              {:error, _} = error -> restore_bitop_destination(store, destkey, backup, error)
+            end
+
+          {:error, _} = error ->
+            restore_bitop_destination(store, destkey, backup, error)
         end
     end
   end

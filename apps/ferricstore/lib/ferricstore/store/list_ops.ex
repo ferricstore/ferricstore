@@ -184,10 +184,20 @@ defmodule Ferricstore.Store.ListOps do
         {new_pos, val}
       end)
 
-    with :ok <- delete_elements(key, store, sorted),
-         :ok <- put_elements(key, store, new_sorted),
-         :ok <- write_rebalanced_meta(key, store, count, new_sorted) do
-      {:ok, new_sorted}
+    with :ok <- delete_elements(key, store, sorted) do
+      case put_elements(key, store, new_sorted) do
+        :ok ->
+          case write_rebalanced_meta(key, store, count, new_sorted) do
+            :ok ->
+              {:ok, new_sorted}
+
+            {:error, _} = error ->
+              rollback_rebalanced_elements(key, store, new_sorted, sorted, error)
+          end
+
+        {:error, _} = error ->
+          rollback_deleted_elements(key, store, sorted, error)
+      end
     end
   end
 
@@ -333,14 +343,18 @@ defmodule Ferricstore.Store.ListOps do
         0
 
       remaining == [] ->
-        with :ok <- delete_elements(key, store, to_remove),
-             :ok <- delete_meta(key, store) do
+        with :ok <-
+               delete_elements_and_update_meta(key, store, to_remove, fn ->
+                 delete_meta(key, store)
+               end) do
           removed_count
         end
 
       true ->
-        with :ok <- delete_elements(key, store, to_remove),
-             :ok <- update_meta_from_remaining(key, store, len - removed_count, remaining) do
+        with :ok <-
+               delete_elements_and_update_meta(key, store, to_remove, fn ->
+                 update_meta_from_remaining(key, store, len - removed_count, remaining)
+               end) do
           removed_count
         end
     end
@@ -368,7 +382,7 @@ defmodule Ferricstore.Store.ListOps do
           {kept, Enum.reject(sorted, fn {p, _} -> MapSet.member?(ks, p) end)}
       end
 
-    with :ok <- delete_elements(key, store, to_delete) do
+    delete_elements_and_update_meta(key, store, to_delete, fn ->
       if to_keep == [] do
         delete_meta(key, store)
       else
@@ -376,7 +390,7 @@ defmodule Ferricstore.Store.ListOps do
         {xp, _} = List.last(to_keep)
         write_meta(key, store, {length(to_keep), mp - @position_step, xp + @position_step})
       end
-    end
+    end)
   end
 
   # LPOS
@@ -432,8 +446,10 @@ defmodule Ferricstore.Store.ListOps do
 
       remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
 
-      with :ok <- delete_elements(key, store, [{pos, element}]),
-           :ok <- update_or_delete_meta(key, store, len - 1, remaining) do
+      with :ok <-
+             delete_elements_and_update_meta(key, store, [{pos, element}], fn ->
+               update_or_delete_meta(key, store, len - 1, remaining)
+             end) do
         element
       end
     end
@@ -461,8 +477,10 @@ defmodule Ferricstore.Store.ListOps do
         end
 
       value ->
-        with :ok <- delete_elements(key, store, [{pos, value}]),
-             :ok <- update_single_pop_meta(key, store, len, pos, direction, {left_pos, right_pos}) do
+        with :ok <-
+               delete_elements_and_update_meta(key, store, [{pos, value}], fn ->
+                 update_single_pop_meta(key, store, len, pos, direction, {left_pos, right_pos})
+               end) do
           value
         end
     end
@@ -490,8 +508,10 @@ defmodule Ferricstore.Store.ListOps do
 
       popped_values = Enum.map(to_pop, fn {_, val} -> val end)
 
-      with :ok <- delete_elements(key, store, to_pop),
-           :ok <- update_or_delete_meta(key, store, len - actual_count, remaining) do
+      with :ok <-
+             delete_elements_and_update_meta(key, store, to_pop, fn ->
+               update_or_delete_meta(key, store, len - actual_count, remaining)
+             end) do
         case count do
           1 -> List.first(popped_values)
           _ -> popped_values
@@ -512,8 +532,10 @@ defmodule Ferricstore.Store.ListOps do
 
       popped_values = to_pop |> Enum.map(fn {_, val} -> val end) |> Enum.reverse()
 
-      with :ok <- delete_elements(key, store, to_pop),
-           :ok <- update_or_delete_meta(key, store, len - actual_count, remaining) do
+      with :ok <-
+             delete_elements_and_update_meta(key, store, to_pop, fn ->
+               update_or_delete_meta(key, store, len - actual_count, remaining)
+             end) do
         case count do
           1 -> List.first(popped_values)
           _ -> popped_values
@@ -646,6 +668,35 @@ defmodule Ferricstore.Store.ListOps do
     store
     |> Ops.compound_batch_delete(key, compound_keys)
     |> write_result()
+  end
+
+  defp delete_elements_and_update_meta(key, store, elements, update_fun) do
+    with :ok <- delete_elements(key, store, elements) do
+      case update_fun.() do
+        :ok -> :ok
+        {:error, _} = error -> rollback_deleted_elements(key, store, elements, error)
+      end
+    end
+  end
+
+  defp rollback_deleted_elements(key, store, elements, write_error) do
+    case put_elements(key, store, elements) do
+      :ok ->
+        write_error
+
+      {:error, _} = rollback_error ->
+        {:error, {:list_delete_rollback_failed, write_error, rollback_error}}
+    end
+  end
+
+  defp rollback_rebalanced_elements(key, store, new_elements, old_elements, write_error) do
+    case delete_elements(key, store, new_elements) do
+      :ok ->
+        rollback_deleted_elements(key, store, old_elements, write_error)
+
+      {:error, _} = rollback_error ->
+        {:error, {:list_rebalance_rollback_failed, write_error, rollback_error}}
+    end
   end
 
   defp update_or_delete_meta(key, store, _new_len, []), do: delete_meta(key, store)

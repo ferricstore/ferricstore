@@ -235,9 +235,14 @@ defmodule Ferricstore.Commands.HashTest do
               "HDEL should use compound_batch_get, got per-field lookup #{inspect(compound_key)}"
             )
         end,
-        compound_batch_get: fn "hash", ^field_keys ->
-          send(parent, {:compound_batch_get, field_keys})
-          ["v1", "v2", nil]
+        compound_batch_get_meta: fn "hash", ^field_keys ->
+          send(parent, {:compound_batch_get_meta, field_keys})
+          [{"v1", 0}, {"v2", 0}, nil]
+        end,
+        compound_batch_get: fn "hash", compound_keys ->
+          flunk(
+            "HDEL should use compound_batch_get_meta, got value-only lookup #{inspect(compound_keys)}"
+          )
         end,
         compound_batch_delete: fn "hash", compound_keys ->
           send(parent, {:compound_batch_delete, compound_keys})
@@ -252,7 +257,7 @@ defmodule Ferricstore.Commands.HashTest do
       }
 
       assert 2 == Hash.handle("HDEL", ["hash", "f1", "f1", "f2", "missing"], store)
-      assert_received {:compound_batch_get, ^field_keys}
+      assert_received {:compound_batch_get_meta, ^field_keys}
       assert_received {:compound_batch_delete, deleted_keys}
       assert Enum.sort(deleted_keys) == Enum.sort(Enum.take(field_keys, 2))
       refute_received {:compound_batch_delete, _}
@@ -274,6 +279,42 @@ defmodule Ferricstore.Commands.HashTest do
       store = hash_cleanup_failure_store()
 
       assert {:error, :disk_full} == Hash.handle("HDEL", ["hash", "f1"], store)
+    end
+
+    test "HDEL preserves the last field when type cleanup fails" do
+      base = MockStore.make()
+      Hash.handle("HSET", ["hash", "f1", "v1"], base)
+      type_key = CompoundKey.type_key("hash")
+
+      store =
+        Map.put(base, :compound_delete, fn
+          "hash", ^type_key -> {:error, :disk_full}
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == Hash.handle("HDEL", ["hash", "f1"], store)
+      assert "v1" == Hash.handle("HGET", ["hash", "f1"], base)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # HGETDEL
+  # ---------------------------------------------------------------------------
+
+  describe "HGETDEL" do
+    test "HGETDEL preserves the last field when type cleanup fails" do
+      base = MockStore.make()
+      Hash.handle("HSET", ["hash", "f1", "v1"], base)
+      type_key = CompoundKey.type_key("hash")
+
+      store =
+        Map.put(base, :compound_delete, fn
+          "hash", ^type_key -> {:error, :disk_full}
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == Hash.handle("HGETDEL", ["hash", "FIELDS", "1", "f1"], store)
+      assert "v1" == Hash.handle("HGET", ["hash", "f1"], base)
     end
   end
 
@@ -1248,6 +1289,7 @@ defmodule Ferricstore.Commands.HashTest do
 
       assert cursor == "0"
       assert length(elements) == 6
+
       assert elements |> Enum.chunk_every(2) |> Map.new(fn [k, v] -> {k, v} end) == %{
                "a" => "1",
                "b" => "2",
@@ -1754,7 +1796,9 @@ defmodule Ferricstore.Commands.HashTest do
     %{
       compound_get: fn "hash", ^type_key -> "hash" end,
       compound_batch_get: fn "hash", [^field_key] -> ["v1"] end,
+      compound_batch_get_meta: fn "hash", [^field_key] -> [{"v1", 0}] end,
       compound_batch_delete: fn "hash", [^field_key] -> :ok end,
+      compound_batch_put: fn "hash", [{^field_key, "v1", 0}] -> :ok end,
       compound_count: fn "hash", _prefix -> 0 end,
       compound_delete: fn "hash", ^type_key -> {:error, :disk_full} end
     }

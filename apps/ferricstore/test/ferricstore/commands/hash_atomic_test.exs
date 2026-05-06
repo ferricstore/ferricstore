@@ -72,13 +72,16 @@ defmodule Ferricstore.Commands.HashAtomicTest do
               "HGETDEL should use compound_batch_get, got per-field lookup #{inspect(compound_key)}"
             )
         end,
-        compound_batch_get: fn "hash", ^field_keys ->
-          send(parent, {:compound_batch_get, field_keys})
-          ["v1", "v2", nil]
+        compound_batch_get_meta: fn "hash", ^field_keys ->
+          send(parent, {:compound_batch_get_meta, field_keys})
+          [{"v1", 0}, {"v2", 0}, nil]
         end,
-        compound_delete: fn "hash", compound_key ->
-          send(parent, {:compound_delete, compound_key})
+        compound_batch_delete: fn "hash", compound_keys ->
+          send(parent, {:compound_batch_delete, compound_keys})
           :ok
+        end,
+        compound_batch_put: fn "hash", _entries ->
+          flunk("HGETDEL should not roll back on success")
         end,
         compound_count: fn "hash", _prefix -> 1 end
       }
@@ -86,11 +89,10 @@ defmodule Ferricstore.Commands.HashAtomicTest do
       assert ["v1", nil, "v2", nil] ==
                Hash.handle("HGETDEL", ["hash", "FIELDS", "4", "f1", "f1", "f2", "missing"], store)
 
-      assert_received {:compound_batch_get, ^field_keys}
-      assert_received {:compound_delete, deleted_f1}
-      assert_received {:compound_delete, deleted_f2}
-      assert Enum.sort([deleted_f1, deleted_f2]) == Enum.sort(Enum.take(field_keys, 2))
-      refute_received {:compound_delete, _}
+      assert_received {:compound_batch_get_meta, ^field_keys}
+      assert_received {:compound_batch_delete, deleted_keys}
+      assert Enum.sort(deleted_keys) == Enum.sort(Enum.take(field_keys, 2))
+      refute_received {:compound_batch_delete, _}
     end
 
     test "on empty/nonexistent hash returns all nils" do
@@ -122,7 +124,9 @@ defmodule Ferricstore.Commands.HashAtomicTest do
     test "on wrong type returns WRONGTYPE" do
       store = MockStore.make()
       put_live_compound_key(store, "mykey", "set")
-      assert {:error, "WRONGTYPE" <> _} = Hash.handle("HGETDEL", ["mykey", "FIELDS", "1", "f1"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               Hash.handle("HGETDEL", ["mykey", "FIELDS", "1", "f1"], store)
     end
   end
 
@@ -160,7 +164,14 @@ defmodule Ferricstore.Commands.HashAtomicTest do
       Hash.handle("HSET", ["hash", "f1", "v1"], store)
 
       future_ts = div(System.os_time(:millisecond), 1000) + 120
-      result = Hash.handle("HGETEX", ["hash", "EXAT", Integer.to_string(future_ts), "FIELDS", "1", "f1"], store)
+
+      result =
+        Hash.handle(
+          "HGETEX",
+          ["hash", "EXAT", Integer.to_string(future_ts), "FIELDS", "1", "f1"],
+          store
+        )
+
       assert result == ["v1"]
 
       [ttl] = Hash.handle("HTTL", ["hash", "FIELDS", "1", "f1"], store)
@@ -172,7 +183,14 @@ defmodule Ferricstore.Commands.HashAtomicTest do
       Hash.handle("HSET", ["hash", "f1", "v1"], store)
 
       future_ts_ms = System.os_time(:millisecond) + 120_000
-      result = Hash.handle("HGETEX", ["hash", "PXAT", Integer.to_string(future_ts_ms), "FIELDS", "1", "f1"], store)
+
+      result =
+        Hash.handle(
+          "HGETEX",
+          ["hash", "PXAT", Integer.to_string(future_ts_ms), "FIELDS", "1", "f1"],
+          store
+        )
+
       assert result == ["v1"]
 
       [ttl] = Hash.handle("HTTL", ["hash", "FIELDS", "1", "f1"], store)
@@ -218,7 +236,9 @@ defmodule Ferricstore.Commands.HashAtomicTest do
     test "on wrong type returns WRONGTYPE" do
       store = MockStore.make()
       put_live_compound_key(store, "mykey", "set")
-      assert {:error, "WRONGTYPE" <> _} = Hash.handle("HGETEX", ["mykey", "EX", "60", "FIELDS", "1", "f1"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               Hash.handle("HGETEX", ["mykey", "EX", "60", "FIELDS", "1", "f1"], store)
     end
 
     test "with mismatched field count returns error" do
@@ -230,7 +250,9 @@ defmodule Ferricstore.Commands.HashAtomicTest do
     test "with invalid EX value returns error" do
       store = MockStore.make()
       Hash.handle("HSET", ["hash", "f1", "v1"], store)
-      assert {:error, _} = Hash.handle("HGETEX", ["hash", "EX", "abc", "FIELDS", "1", "f1"], store)
+
+      assert {:error, _} =
+               Hash.handle("HGETEX", ["hash", "EX", "abc", "FIELDS", "1", "f1"], store)
     end
 
     test "batches field meta reads and writes each existing duplicate field once" do
@@ -355,7 +377,8 @@ defmodule Ferricstore.Commands.HashAtomicTest do
       Hash.handle("HSET", ["hash", "f1", "old"], store)
 
       result = Hash.handle("HSETEX", ["hash", "120", "f1", "new"], store)
-      assert result == 0  # existing field update, not new
+      # existing field update, not new
+      assert result == 0
 
       assert "new" == Hash.handle("HGET", ["hash", "f1"], store)
       [ttl] = Hash.handle("HTTL", ["hash", "FIELDS", "1", "f1"], store)
@@ -392,7 +415,9 @@ defmodule Ferricstore.Commands.HashAtomicTest do
     test "on wrong type returns WRONGTYPE" do
       store = MockStore.make()
       put_live_compound_key(store, "mykey", "set")
-      assert {:error, "WRONGTYPE" <> _} = Hash.handle("HSETEX", ["mykey", "60", "f1", "v1"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               Hash.handle("HSETEX", ["mykey", "60", "f1", "v1"], store)
     end
   end
 
@@ -512,7 +537,9 @@ defmodule Ferricstore.Commands.HashAtomicTest do
     test "on wrong type returns WRONGTYPE" do
       store = MockStore.make()
       put_live_compound_key(store, "mykey", "set")
-      assert {:error, "WRONGTYPE" <> _} = Hash.handle("HPEXPIRE", ["mykey", "60000", "FIELDS", "1", "f1"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               Hash.handle("HPEXPIRE", ["mykey", "60000", "FIELDS", "1", "f1"], store)
     end
   end
 
@@ -612,7 +639,9 @@ defmodule Ferricstore.Commands.HashAtomicTest do
     test "on wrong type returns WRONGTYPE" do
       store = MockStore.make()
       put_live_compound_key(store, "mykey", "set")
-      assert {:error, "WRONGTYPE" <> _} = Hash.handle("HPTTL", ["mykey", "FIELDS", "1", "f1"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               Hash.handle("HPTTL", ["mykey", "FIELDS", "1", "f1"], store)
     end
   end
 
@@ -642,7 +671,9 @@ defmodule Ferricstore.Commands.HashAtomicTest do
     test "returns -2 for non-existent fields" do
       store = MockStore.make()
       Hash.handle("HSET", ["hash", "f1", "v1"], store)
-      assert [-1, -2] == Hash.handle("HEXPIRETIME", ["hash", "FIELDS", "2", "f1", "missing"], store)
+
+      assert [-1, -2] ==
+               Hash.handle("HEXPIRETIME", ["hash", "FIELDS", "2", "f1", "missing"], store)
     end
 
     test "returns all -2 for non-existent key" do
@@ -678,7 +709,9 @@ defmodule Ferricstore.Commands.HashAtomicTest do
             "hash"
 
           "hash", compound_key ->
-            flunk("HEXPIRETIME should only use compound_get for type, got #{inspect(compound_key)}")
+            flunk(
+              "HEXPIRETIME should only use compound_get for type, got #{inspect(compound_key)}"
+            )
         end,
         compound_get_meta: fn "hash", compound_key ->
           flunk("HEXPIRETIME should use compound_batch_get_meta, got #{inspect(compound_key)}")
@@ -713,7 +746,9 @@ defmodule Ferricstore.Commands.HashAtomicTest do
     test "on wrong type returns WRONGTYPE" do
       store = MockStore.make()
       put_live_compound_key(store, "mykey", "set")
-      assert {:error, "WRONGTYPE" <> _} = Hash.handle("HEXPIRETIME", ["mykey", "FIELDS", "1", "f1"], store)
+
+      assert {:error, "WRONGTYPE" <> _} =
+               Hash.handle("HEXPIRETIME", ["mykey", "FIELDS", "1", "f1"], store)
     end
   end
 

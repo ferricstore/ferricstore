@@ -87,35 +87,8 @@ defmodule Ferricstore.Commands.Hash do
   # HDEL key field [field ...]
   # ---------------------------------------------------------------------------
 
-  def handle("HDEL", [key | fields], store) when fields != [] do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      compound_keys =
-        fields
-        |> Enum.uniq()
-        |> Enum.map(&CompoundKey.hash_field(key, &1))
-
-      deleted_keys =
-        store
-        |> Ops.compound_batch_get(key, compound_keys)
-        |> Enum.zip(compound_keys)
-        |> Enum.flat_map(fn
-          {nil, _compound_key} -> []
-          {_value, compound_key} -> [compound_key]
-        end)
-
-      deleted = length(deleted_keys)
-
-      case Ops.compound_batch_delete(store, key, deleted_keys) do
-        :ok ->
-          with :ok <- maybe_cleanup_empty_hash(key, deleted, store) do
-            deleted
-          end
-
-        {:error, _} = err ->
-          err
-      end
-    end
-  end
+  def handle("HDEL", [key | fields], store) when fields != [],
+    do: hdel_args([key | fields], store)
 
   def handle("HDEL", _args, _store) do
     {:error, "ERR wrong number of arguments for 'hdel' command"}
@@ -512,49 +485,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HGETDEL", [key, "FIELDS", count_str | fields], store) do
     with {:ok, count} <- parse_positive_integer(count_str, "count"),
          :ok <- validate_field_count(count, fields) do
-      with :ok <- TypeRegistry.check_type(key, :hash, store) do
-        compound_keys =
-          fields
-          |> Enum.uniq()
-          |> Enum.map(&CompoundKey.hash_field(key, &1))
-
-        values_by_key =
-          store
-          |> Ops.compound_batch_get(key, compound_keys)
-          |> then(&Enum.zip(compound_keys, &1))
-          |> Map.new()
-
-        {results, deleted_keys} =
-          Enum.reduce(fields, {[], MapSet.new()}, fn field, {acc, deleted} ->
-            compound_key = CompoundKey.hash_field(key, field)
-
-            cond do
-              MapSet.member?(deleted, compound_key) ->
-                {[nil | acc], deleted}
-
-              is_nil(Map.get(values_by_key, compound_key)) ->
-                {[nil | acc], deleted}
-
-              true ->
-                value = Map.fetch!(values_by_key, compound_key)
-                {[value | acc], MapSet.put(deleted, compound_key)}
-            end
-          end)
-
-        results = Enum.reverse(results)
-        # Clean up type metadata if hash is now empty
-        deleted_count = MapSet.size(deleted_keys)
-
-        case Ops.compound_batch_delete(store, key, MapSet.to_list(deleted_keys)) do
-          :ok ->
-            with :ok <- maybe_cleanup_empty_hash(key, deleted_count, store) do
-              results
-            end
-
-          {:error, _} = err ->
-            err
-        end
-      end
+      hgetdel_fields(key, fields, store)
     end
   end
 
@@ -886,25 +817,25 @@ defmodule Ferricstore.Commands.Hash do
         |> Enum.uniq()
         |> Enum.map(&CompoundKey.hash_field(key, &1))
 
-      deleted_keys =
+      metas_by_key =
         store
-        |> Ops.compound_batch_get(key, compound_keys)
+        |> Ops.compound_batch_get_meta(key, compound_keys)
         |> Enum.zip(compound_keys)
-        |> Enum.flat_map(fn
-          {nil, _compound_key} -> []
-          {_value, compound_key} -> [compound_key]
+        |> Map.new(fn {meta, compound_key} -> {compound_key, meta} end)
+
+      deleted_entries =
+        compound_keys
+        |> Enum.flat_map(fn compound_key ->
+          case Map.fetch!(metas_by_key, compound_key) do
+            nil -> []
+            {value, expire_at_ms} -> [{compound_key, value, expire_at_ms}]
+          end
         end)
 
-      deleted = length(deleted_keys)
+      deleted = length(deleted_entries)
 
-      case Ops.compound_batch_delete(store, key, deleted_keys) do
-        :ok ->
-          with :ok <- maybe_cleanup_empty_hash(key, deleted, store) do
-            deleted
-          end
-
-        {:error, _} = err ->
-          err
+      with :ok <- delete_hash_fields_and_cleanup(key, deleted_entries, deleted, store) do
+        deleted
       end
     end
   end
@@ -1223,40 +1154,40 @@ defmodule Ferricstore.Commands.Hash do
         |> Enum.uniq()
         |> Enum.map(&CompoundKey.hash_field(key, &1))
 
-      values_by_key =
+      metas_by_key =
         store
-        |> Ops.compound_batch_get(key, compound_keys)
+        |> Ops.compound_batch_get_meta(key, compound_keys)
         |> then(&Enum.zip(compound_keys, &1))
-        |> Map.new()
+        |> Map.new(fn {compound_key, meta} -> {compound_key, meta} end)
 
-      {results, deleted_keys} =
-        Enum.reduce(fields, {[], MapSet.new()}, fn field, {acc, deleted} ->
+      {results, deleted_entries_by_key} =
+        Enum.reduce(fields, {[], %{}}, fn field, {acc, deleted} ->
           compound_key = CompoundKey.hash_field(key, field)
 
           cond do
-            MapSet.member?(deleted, compound_key) ->
+            Map.has_key?(deleted, compound_key) ->
               {[nil | acc], deleted}
 
-            is_nil(Map.get(values_by_key, compound_key)) ->
+            is_nil(Map.get(metas_by_key, compound_key)) ->
               {[nil | acc], deleted}
 
             true ->
-              value = Map.fetch!(values_by_key, compound_key)
-              {[value | acc], MapSet.put(deleted, compound_key)}
+              {value, expire_at_ms} = Map.fetch!(metas_by_key, compound_key)
+              {[value | acc], Map.put(deleted, compound_key, {value, expire_at_ms})}
           end
         end)
 
       results = Enum.reverse(results)
-      deleted_count = MapSet.size(deleted_keys)
 
-      case Ops.compound_batch_delete(store, key, MapSet.to_list(deleted_keys)) do
-        :ok ->
-          with :ok <- maybe_cleanup_empty_hash(key, deleted_count, store) do
-            results
-          end
+      deleted_entries =
+        Enum.map(deleted_entries_by_key, fn {compound_key, {value, expire_at_ms}} ->
+          {compound_key, value, expire_at_ms}
+        end)
 
-        {:error, _} = err ->
-          err
+      deleted_count = length(deleted_entries)
+
+      with :ok <- delete_hash_fields_and_cleanup(key, deleted_entries, deleted_count, store) do
+        results
       end
     end
   end
@@ -1276,6 +1207,34 @@ defmodule Ferricstore.Commands.Hash do
       TypeRegistry.delete_type(key, store)
     else
       :ok
+    end
+  end
+
+  defp delete_hash_fields_and_cleanup(key, deleted_entries, deleted_count, store) do
+    deleted_keys =
+      Enum.map(deleted_entries, fn {compound_key, _value, _expire_at_ms} -> compound_key end)
+
+    case Ops.compound_batch_delete(store, key, deleted_keys) do
+      :ok ->
+        case maybe_cleanup_empty_hash(key, deleted_count, store) do
+          :ok -> :ok
+          {:error, _} = error -> rollback_deleted_hash_fields(key, deleted_entries, store, error)
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp rollback_deleted_hash_fields(_key, [], _store, write_error), do: write_error
+
+  defp rollback_deleted_hash_fields(key, deleted_entries, store, write_error) do
+    case Ops.compound_batch_put(store, key, deleted_entries) do
+      :ok ->
+        write_error
+
+      {:error, _} = rollback_error ->
+        {:error, {:hash_delete_rollback_failed, write_error, rollback_error}}
     end
   end
 

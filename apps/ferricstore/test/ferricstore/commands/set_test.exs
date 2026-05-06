@@ -217,6 +217,21 @@ defmodule Ferricstore.Commands.SetTest do
       assert {:error, :disk_full} == Set.handle("SREM", ["myset", "only"], store)
     end
 
+    test "SREM preserves the last member when type cleanup fails" do
+      base = MockStore.make()
+      Set.handle("SADD", ["myset", "only"], base)
+      type_key = CompoundKey.type_key("myset")
+
+      store =
+        Map.put(base, :compound_delete, fn
+          "myset", ^type_key -> {:error, :disk_full}
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == Set.handle("SREM", ["myset", "only"], store)
+      assert ["only"] == Set.handle("SMEMBERS", ["myset"], base)
+    end
+
     test "SREM with no members returns error" do
       assert {:error, _} = Set.handle("SREM", ["myset"], MockStore.make())
     end
@@ -925,6 +940,21 @@ defmodule Ferricstore.Commands.SetTest do
       assert {:error, :disk_full} == Set.handle("SPOP", ["myset"], store)
     end
 
+    test "SPOP preserves the last member when type cleanup fails" do
+      base = MockStore.make()
+      Set.handle("SADD", ["myset", "only"], base)
+      type_key = CompoundKey.type_key("myset")
+
+      store =
+        Map.put(base, :compound_delete, fn
+          "myset", ^type_key -> {:error, :disk_full}
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == Set.handle("SPOP", ["myset"], store)
+      assert ["only"] == Set.handle("SMEMBERS", ["myset"], base)
+    end
+
     test "SPOP on nonexistent key returns nil" do
       store = MockStore.make()
       result = Set.handle("SPOP", ["nonexistent"], store)
@@ -1137,6 +1167,25 @@ defmodule Ferricstore.Commands.SetTest do
                Set.handle("SMOVE", ["src", "dst", "a"], store)
 
       assert_received :destination_written
+    end
+
+    test "SMOVE preserves source and destination when source cleanup fails" do
+      base = MockStore.make()
+      assert 1 == Set.handle("SADD", ["src", "a"], base)
+      assert 1 == Set.handle("SADD", ["dst", "x"], base)
+
+      src_type_key = CompoundKey.type_key("src")
+
+      store =
+        Map.put(base, :compound_delete, fn
+          "src", ^src_type_key -> {:error, :disk_full}
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == Set.handle("SMOVE", ["src", "dst", "a"], store)
+      assert 1 == Set.handle("SISMEMBER", ["src", "a"], base)
+      assert 0 == Set.handle("SISMEMBER", ["dst", "a"], base)
+      assert 1 == Set.handle("SISMEMBER", ["dst", "x"], base)
     end
 
     test "SMOVE with wrong number of arguments returns error" do
@@ -1387,6 +1436,7 @@ defmodule Ferricstore.Commands.SetTest do
       compound_get: fn "myset", ^type_key -> "set" end,
       compound_batch_get: fn "myset", [^member_key] -> ["1"] end,
       compound_batch_delete: fn "myset", [^member_key] -> :ok end,
+      compound_batch_put: fn "myset", [{^member_key, "1", 0}] -> :ok end,
       compound_count: fn "myset", _prefix -> 0 end,
       compound_delete: fn "myset", ^type_key -> {:error, :disk_full} end,
       compound_scan: fn "myset", _prefix -> [{"only", "1"}] end

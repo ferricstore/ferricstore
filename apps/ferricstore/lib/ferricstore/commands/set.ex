@@ -56,35 +56,8 @@ defmodule Ferricstore.Commands.Set do
   # SREM key member [member ...]
   # ---------------------------------------------------------------------------
 
-  def handle("SREM", [key | members], store) when members != [] do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
-      compound_keys =
-        members
-        |> Enum.uniq()
-        |> Enum.map(&CompoundKey.set_member(key, &1))
-
-      removed_keys =
-        store
-        |> Ops.compound_batch_get(key, compound_keys)
-        |> Enum.zip(compound_keys)
-        |> Enum.flat_map(fn
-          {nil, _compound_key} -> []
-          {_value, compound_key} -> [compound_key]
-        end)
-
-      removed = length(removed_keys)
-
-      case Ops.compound_batch_delete(store, key, removed_keys) do
-        :ok ->
-          with :ok <- maybe_cleanup_empty_set(key, removed, store) do
-            removed
-          end
-
-        {:error, _} = err ->
-          err
-      end
-    end
-  end
+  def handle("SREM", [key | members], store) when members != [],
+    do: srem_args([key | members], store)
 
   def handle("SREM", _args, _store) do
     {:error, "ERR wrong number of arguments for 'srem' command"}
@@ -284,30 +257,7 @@ defmodule Ferricstore.Commands.Set do
   # SPOP key [count]
   # ---------------------------------------------------------------------------
 
-  def handle("SPOP", [key], store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
-      members = get_members_list(key, store)
-
-      case members do
-        [] ->
-          nil
-
-        _ ->
-          member = Enum.random(members)
-          compound_key = CompoundKey.set_member(key, member)
-
-          case Ops.compound_batch_delete(store, key, [compound_key]) do
-            :ok ->
-              with :ok <- maybe_cleanup_empty_set(key, 1, store) do
-                member
-              end
-
-            {:error, _} = err ->
-              err
-          end
-      end
-    end
-  end
+  def handle("SPOP", [key], store), do: spop_one(key, store)
 
   def handle("SPOP", [key, count_str], store) do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
@@ -316,20 +266,7 @@ defmodule Ferricstore.Commands.Set do
           []
 
         {count, ""} when count >= 0 ->
-          members = get_members_list(key, store)
-          selected = Enum.take_random(members, count)
-          compound_keys = Enum.map(selected, &CompoundKey.set_member(key, &1))
-          removed = length(compound_keys)
-
-          case Ops.compound_batch_delete(store, key, compound_keys) do
-            :ok ->
-              with :ok <- maybe_cleanup_empty_set(key, removed, store) do
-                selected
-              end
-
-            {:error, _} = err ->
-              err
-          end
+          spop_count(key, count, store)
 
         {_count, ""} ->
           {:error, "ERR value is not an integer or out of range"}
@@ -605,15 +542,10 @@ defmodule Ferricstore.Commands.Set do
         end)
 
       removed = length(removed_keys)
+      removed_entries = Enum.map(removed_keys, &{&1, "1", 0})
 
-      case Ops.compound_batch_delete(store, key, removed_keys) do
-        :ok ->
-          with :ok <- maybe_cleanup_empty_set(key, removed, store) do
-            removed
-          end
-
-        {:error, _} = err ->
-          err
+      with :ok <- delete_set_members_and_cleanup(key, removed_entries, removed, store) do
+        removed
       end
     end
   end
@@ -772,14 +704,8 @@ defmodule Ferricstore.Commands.Set do
           member = Enum.random(members)
           compound_key = CompoundKey.set_member(key, member)
 
-          case Ops.compound_batch_delete(store, key, [compound_key]) do
-            :ok ->
-              with :ok <- maybe_cleanup_empty_set(key, 1, store) do
-                member
-              end
-
-            {:error, _} = err ->
-              err
+          with :ok <- delete_set_members_and_cleanup(key, [{compound_key, "1", 0}], 1, store) do
+            member
           end
       end
     end
@@ -794,15 +720,10 @@ defmodule Ferricstore.Commands.Set do
         selected = Enum.take_random(members, count)
         compound_keys = Enum.map(selected, &CompoundKey.set_member(key, &1))
         removed = length(compound_keys)
+        removed_entries = Enum.map(compound_keys, &{&1, "1", 0})
 
-        case Ops.compound_batch_delete(store, key, compound_keys) do
-          :ok ->
-            with :ok <- maybe_cleanup_empty_set(key, removed, store) do
-              selected
-            end
-
-          {:error, _} = err ->
-            err
+        with :ok <- delete_set_members_and_cleanup(key, removed_entries, removed, store) do
+          selected
         end
       end
     end
@@ -856,9 +777,14 @@ defmodule Ferricstore.Commands.Set do
               :ok ->
                 case Ops.compound_batch_delete(store, source, [compound_key]) do
                   :ok ->
-                    with :ok <- maybe_cleanup_empty_set(source, 1, store) do
-                      1
-                    end
+                    finish_smove_source_delete(
+                      source,
+                      destination,
+                      compound_key,
+                      dst_key,
+                      destination_had_member?,
+                      store
+                    )
 
                   {:error, _} = err ->
                     case maybe_rollback_smove_destination(
@@ -901,6 +827,61 @@ defmodule Ferricstore.Commands.Set do
 
   defp maybe_rollback_smove_destination(false, destination, dst_key, store) do
     Ops.compound_batch_delete(store, destination, [dst_key])
+  end
+
+  defp finish_smove_source_delete(
+         source,
+         destination,
+         source_key,
+         dst_key,
+         destination_had_member?,
+         store
+       ) do
+    case maybe_cleanup_empty_set(source, 1, store) do
+      :ok ->
+        1
+
+      {:error, _} = cleanup_err ->
+        rollback_smove_cleanup_failure(
+          source,
+          destination,
+          source_key,
+          dst_key,
+          destination_had_member?,
+          store,
+          cleanup_err
+        )
+    end
+  end
+
+  defp rollback_smove_cleanup_failure(
+         source,
+         destination,
+         source_key,
+         dst_key,
+         destination_had_member?,
+         store,
+         cleanup_err
+       ) do
+    source_result =
+      Ops.compound_batch_put(store, source, [{source_key, @presence_marker, 0}])
+
+    destination_result =
+      maybe_rollback_smove_destination(destination_had_member?, destination, dst_key, store)
+
+    case {source_result, destination_result} do
+      {:ok, :ok} ->
+        cleanup_err
+
+      {{:error, _} = source_err, :ok} ->
+        {:error, {:smove_cleanup_rollback_failed, cleanup_err, source_err, :ok}}
+
+      {:ok, {:error, _} = destination_err} ->
+        {:error, {:smove_cleanup_rollback_failed, cleanup_err, :ok, destination_err}}
+
+      {{:error, _} = source_err, {:error, _} = destination_err} ->
+        {:error, {:smove_cleanup_rollback_failed, cleanup_err, source_err, destination_err}}
+    end
   end
 
   # Clears any existing set at `destination`, writes `members` as a new set,
@@ -1205,6 +1186,34 @@ defmodule Ferricstore.Commands.Set do
       TypeRegistry.delete_type(key, store)
     else
       :ok
+    end
+  end
+
+  defp delete_set_members_and_cleanup(key, removed_entries, removed_count, store) do
+    removed_keys =
+      Enum.map(removed_entries, fn {compound_key, _value, _expire_at_ms} -> compound_key end)
+
+    case Ops.compound_batch_delete(store, key, removed_keys) do
+      :ok ->
+        case maybe_cleanup_empty_set(key, removed_count, store) do
+          :ok -> :ok
+          {:error, _} = error -> rollback_deleted_set_members(key, removed_entries, store, error)
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp rollback_deleted_set_members(_key, [], _store, write_error), do: write_error
+
+  defp rollback_deleted_set_members(key, removed_entries, store, write_error) do
+    case Ops.compound_batch_put(store, key, removed_entries) do
+      :ok ->
+        write_error
+
+      {:error, _} = rollback_error ->
+        {:error, {:set_delete_rollback_failed, write_error, rollback_error}}
     end
   end
 

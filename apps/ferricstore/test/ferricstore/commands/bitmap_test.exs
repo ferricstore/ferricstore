@@ -988,6 +988,27 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert {:error, :disk_full} == Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
     end
 
+    test "preserves compound destination when cleanup fails after metadata delete" do
+      base = MockStore.make(%{"a" => {<<0xF0>>, 0}, "b" => {<<0x0F>>, 0}})
+      assert 1 == Hash.handle("HSET", ["dest", "field", "old"], base)
+      type_key = CompoundKey.type_key("dest")
+
+      store =
+        base
+        |> Map.put(:compound_delete, fn
+          "dest", ^type_key -> base.compound_delete.("dest", type_key)
+          key, compound_key -> base.compound_delete.(key, compound_key)
+        end)
+        |> Map.put(:compound_delete_prefix, fn "dest", _prefix -> {:error, :disk_full} end)
+        |> Map.put(:put, fn "dest", _value, 0 ->
+          flunk("BITOP should not write after cleanup failure")
+        end)
+
+      assert {:error, :disk_full} == Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
+      assert "hash" == base.compound_get.("dest", type_key)
+      assert "old" == Hash.handle("HGET", ["dest", "field"], base)
+    end
+
     test "returns result length" do
       store =
         MockStore.make(%{
