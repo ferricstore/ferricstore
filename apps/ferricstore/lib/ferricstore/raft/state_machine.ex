@@ -5688,10 +5688,19 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_claim_put_history(state, plans, now_ms) do
-    Enum.each(plans, fn {record, next} ->
-      flow_history_put_ready(state, next, "claimed", now_ms, flow_previous_history_ms(record))
-      flow_history_trim(state, next)
-    end)
+    history_entries =
+      Enum.map(plans, fn {record, next} ->
+        flow_history_put_ready_entry(
+          state,
+          next,
+          "claimed",
+          now_ms,
+          flow_previous_history_ms(record)
+        )
+      end)
+
+    flow_history_index_put_entries(state, history_entries)
+    Enum.each(plans, fn {_record, next} -> flow_history_trim(state, next) end)
 
     :ok
   end
@@ -5701,26 +5710,37 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_many_put_history(state, plans, event) do
-    Enum.each(plans, fn {record, next} ->
-      flow_history_put_ready(
-        state,
-        next,
-        event,
-        Map.get(next, :updated_at_ms),
-        flow_previous_history_ms(record)
-      )
+    history_entries =
+      Enum.map(plans, fn {record, next} ->
+        flow_history_put_ready_entry(
+          state,
+          next,
+          event,
+          Map.get(next, :updated_at_ms),
+          flow_previous_history_ms(record)
+        )
+      end)
 
-      flow_history_trim(state, next)
-    end)
+    flow_history_index_put_entries(state, history_entries)
+    Enum.each(plans, fn {_record, next} -> flow_history_trim(state, next) end)
 
     :ok
   end
 
   defp flow_create_put_history(state, records) do
-    Enum.each(records, fn record ->
-      flow_history_put_ready(state, record, "created", Map.get(record, :created_at_ms))
-      flow_history_trim(state, record)
-    end)
+    history_entries =
+      Enum.map(records, fn record ->
+        flow_history_put_ready_entry(
+          state,
+          record,
+          "created",
+          Map.get(record, :created_at_ms),
+          nil
+        )
+      end)
+
+    flow_history_index_put_entries(state, history_entries)
+    Enum.each(records, &flow_history_trim(state, &1))
 
     :ok
   end
@@ -5730,6 +5750,25 @@ defmodule Ferricstore.Raft.StateMachine do
       nil -> {:error, "ERR flow not found"}
       record -> {:ok, record}
     end
+  end
+
+  defp flow_history_put_ready_entry(
+         state,
+         %{id: id, version: version} = record,
+         event,
+         now_ms,
+         previous_history_ms
+       ) do
+    partition_key = Map.get(record, :partition_key)
+    history_key = FlowKeys.history_key(id, partition_key)
+
+    {event_id, event_ms} =
+      flow_history_next_event(state, history_key, now_ms, version, previous_history_ms)
+
+    compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
+    raw_put_cold(state, compound_key, Flow.encode_history_fields(record, event, now_ms), 0)
+
+    {history_key, event_id, event_ms}
   end
 
   defp flow_require_expected_state(_record, nil), do: :ok
@@ -6618,6 +6657,24 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
+  defp flow_index_put_entries(state, key_member_score_triples) do
+    if flow_index_tables?(state) do
+      key_member_score_triples
+      |> Enum.group_by(fn {key, _member, _score} -> key end, fn {_key, member, _score} ->
+        member
+      end)
+      |> Enum.each(fn {key, members} -> track_flow_index_originals(state, key, members) end)
+
+      FlowIndex.put_entries(
+        state.flow_index_name,
+        state.flow_lookup_name,
+        key_member_score_triples
+      )
+    end
+
+    :ok
+  end
+
   defp flow_index_delete_member(state, key, member) do
     if flow_index_tables?(state) do
       track_flow_index_originals(state, key, [member])
@@ -6772,6 +6829,12 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_history_index_put(state, history_key, event_id, ms, _version) do
     flow_index_put_members(state, history_key, [{event_id, ms}])
     :ok
+  end
+
+  defp flow_history_index_put_entries(_state, []), do: :ok
+
+  defp flow_history_index_put_entries(state, entries) do
+    flow_index_put_entries(state, entries)
   end
 
   defp flow_history_trim(_state, %{history_max_events: nil}), do: :ok

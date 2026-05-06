@@ -59,6 +59,44 @@ defmodule Ferricstore.Flow.Index do
     increment_count(lookup_table, key, delta)
   end
 
+  @spec put_entries(:ets.tid() | atom(), :ets.tid() | atom(), [
+          {binary(), binary(), score_input()}
+        ]) :: :ok
+  def put_entries(index_table, lookup_table, key_member_score_triples) do
+    {index_entries, lookup_entries, count_deltas} =
+      Enum.reduce(key_member_score_triples, {[], [], %{}}, fn {key, member, score_input},
+                                                              {index_acc, lookup_acc, count_acc} ->
+        case parse_score(score_input) do
+          {:ok, score} ->
+            existing? =
+              case :ets.lookup(lookup_table, {key, member}) do
+                [{{^key, ^member}, old_score}] ->
+                  :ets.delete(index_table, {key, old_score, member})
+                  true
+
+                [] ->
+                  false
+              end
+
+            count_acc =
+              if existing?, do: count_acc, else: Map.update(count_acc, key, 1, &(&1 + 1))
+
+            {[{{key, score, member}, true} | index_acc], [{{key, member}, score} | lookup_acc],
+             count_acc}
+
+          :error ->
+            {index_acc, lookup_acc, count_acc}
+        end
+      end)
+
+    if index_entries != [], do: :ets.insert(index_table, index_entries)
+    if lookup_entries != [], do: :ets.insert(lookup_table, lookup_entries)
+
+    Enum.each(count_deltas, fn {key, delta} -> increment_count(lookup_table, key, delta) end)
+
+    :ok
+  end
+
   @spec put_new_members(:ets.tid() | atom(), :ets.tid() | atom(), binary(), [
           {binary(), score_input()}
         ]) :: :ok
