@@ -115,15 +115,38 @@ defmodule Ferricstore.Flow.LMDBWriter do
       end
 
     Enum.reduce(shard_indexes, :ok, fn shard_index, acc ->
-      try do
-        case GenServer.call(name(instance_name, shard_index), :flush, timeout) do
-          :ok -> acc
-          {:error, _reason} = error -> error
-        end
-      catch
-        :exit, _ -> acc
+      case flush(instance_name, shard_index, timeout) do
+        :ok -> acc
+        {:error, _reason} = error -> error
       end
     end)
+  end
+
+  def flush(shard_index) when is_integer(shard_index) and shard_index >= 0 do
+    flush(:default, shard_index, 30_000)
+  end
+
+  def flush(shard_index, timeout)
+      when is_integer(shard_index) and shard_index >= 0 and is_integer(timeout) do
+    flush(:default, shard_index, timeout)
+  end
+
+  def flush(instance_name, shard_index)
+      when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 do
+    flush(instance_name, shard_index, 30_000)
+  end
+
+  def flush(instance_name, shard_index, timeout)
+      when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 and
+             is_integer(timeout) do
+    try do
+      case GenServer.call(name(instance_name, shard_index), :flush, timeout) do
+        :ok -> :ok
+        {:error, _reason} = error -> error
+      end
+    catch
+      :exit, _ -> :ok
+    end
   end
 
   def name(shard_index), do: :"Ferricstore.Flow.LMDBWriter.#{shard_index}"

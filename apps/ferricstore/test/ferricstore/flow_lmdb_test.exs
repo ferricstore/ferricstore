@@ -124,6 +124,67 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, "v2"} = Ferricstore.Flow.LMDB.get(path, key)
   end
 
+  test "mirror writer can flush a single shard without draining others" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+    Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 1_000_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_single_flush_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :"flow_lmdb_single_flush_#{System.unique_integer([:positive])}"
+    key0 = "flow:{flow:zero}:state:a"
+    key1 = "flow:{flow:one}:state:b"
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:flow_lmdb_max_batch_ops, old_max_batch_ops)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 2)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: 0, data_dir: data_dir, instance_name: instance_name},
+      id: {Ferricstore.Flow.LMDBWriter, instance_name, 0}
+    )
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: 1, data_dir: data_dir, instance_name: instance_name},
+      id: {Ferricstore.Flow.LMDBWriter, instance_name, 1}
+    )
+
+    path0 =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    path1 =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(1)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.enqueue(instance_name, 0, [{:put, key0, "v0"}])
+    assert :ok = Ferricstore.Flow.LMDBWriter.enqueue(instance_name, 1, [{:put, key1, "v1"}])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, 1)
+    assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path1, key1)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path0, key0)
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, 0)
+    assert {:ok, "v0"} = Ferricstore.Flow.LMDB.get(path0, key0)
+  end
+
   test "mirror writer persists replay-safe marker only after pending ops flush" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)

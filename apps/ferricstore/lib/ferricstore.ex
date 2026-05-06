@@ -805,7 +805,9 @@ defmodule FerricStore do
   end
 
   defp flow_state_counts(type, partition_key) do
-    with :ok <- flow_flush_terminal_lmdb_once() do
+    flush_key = Ferricstore.Flow.Keys.state_index_key(type, "queued", partition_key)
+
+    with :ok <- flow_flush_lmdb_for_index(flush_key, partition_key) do
       ["queued", "running", "completed", "failed", "cancelled"]
       |> Enum.reduce_while({:ok, %{}}, fn state, {:ok, acc} ->
         key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key)
@@ -820,9 +822,17 @@ defmodule FerricStore do
     end
   end
 
-  defp flow_flush_terminal_lmdb_once do
+  defp flow_flush_lmdb_for_index(index_key, partition_key) do
     ctx = default_ctx()
-    Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+    case partition_key do
+      nil ->
+        Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+      partition_key when is_binary(partition_key) ->
+        shard_index = Ferricstore.Store.Router.shard_for(ctx, index_key)
+        Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index)
+    end
   end
 
   defp flow_index_ids(index_key, state, partition_key, count) do
@@ -894,7 +904,7 @@ defmodule FerricStore do
   defp flow_lmdb_query_index_ids(index_key, partition_key, count) do
     ctx = default_ctx()
 
-    with :ok <- Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count) do
+    with :ok <- flow_flush_lmdb_for_index(index_key, partition_key) do
       prefix = Ferricstore.Flow.LMDB.query_index_prefix(index_key)
       now_ms = System.os_time(:millisecond)
 
