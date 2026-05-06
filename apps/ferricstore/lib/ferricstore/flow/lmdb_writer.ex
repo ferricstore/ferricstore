@@ -3,12 +3,14 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   use GenServer
 
+  alias Ferricstore.Flow
   alias Ferricstore.Flow.LMDBReplaySafeIndex
 
   require Logger
 
   @default_flush_interval_ms 10
   @default_max_ops 1_000
+  @terminal_states ["completed", "failed", "cancelled"]
 
   def start_link(opts) do
     shard_index = Keyword.fetch!(opts, :shard_index)
@@ -177,6 +179,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
       timer_ref: nil,
       durable_index: 0,
       requested_index: 0,
+      terminal_count_inits: MapSet.new(),
       flush_interval_ms:
         Application.get_env(
           :ferricstore,
@@ -185,6 +188,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
         ),
       max_ops: Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops, @default_max_ops)
     }
+
+    :ok = Ferricstore.Flow.LMDB.warm(state.path)
 
     durable_index = LMDBReplaySafeIndex.read(state.shard_data_path)
     publish_durable(state.instance_ctx, shard_index, durable_index)
@@ -283,8 +288,9 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp flush_ops_and_marker(state, ops, started_at) do
-    with {:ok, ops} <- expand_ops(state.path, ops),
+    with {:ok, ops, state} <- expand_ops(state, ops),
          :ok <- write_ops(state.path, ops),
+         :ok <- cache_terminal_counts(state.path, state.terminal_count_cache),
          {:ok, state} <- persist_requested(state, started_at) do
       {:ok, state}
     else
@@ -295,20 +301,39 @@ defmodule Ferricstore.Flow.LMDBWriter do
   defp write_ops(_path, []), do: :ok
   defp write_ops(path, ops), do: Ferricstore.Flow.LMDB.write_batch(path, ops)
 
-  defp expand_ops(_path, []), do: {:ok, []}
+  defp expand_ops(state, []), do: {:ok, [], state}
 
-  defp expand_ops(path, ops) do
-    initial = %{ops: [], counts: %{}, terminal_values: %{}}
+  defp expand_ops(state, ops) do
+    initial = %{
+      ops: [],
+      counts: %{},
+      terminal_values: %{},
+      terminal_count_inits: state.terminal_count_inits,
+      terminal_count_cache: %{puts: %{}, refresh: MapSet.new()}
+    }
 
     Enum.reduce_while(ops, {:ok, initial}, fn op, {:ok, acc} ->
-      case expand_op(path, op, acc) do
+      case expand_op(state.path, op, acc) do
         {:ok, acc} -> {:cont, {:ok, acc}}
         {:error, _reason} = error -> {:halt, error}
       end
     end)
     |> case do
-      {:ok, %{ops: expanded}} -> {:ok, Enum.reverse(expanded)}
-      {:error, _reason} = error -> error
+      {:ok,
+       %{
+         ops: expanded,
+         terminal_count_inits: terminal_count_inits,
+         terminal_count_cache: terminal_count_cache
+       }} ->
+        state =
+          state
+          |> Map.put(:terminal_count_inits, terminal_count_inits)
+          |> Map.put(:terminal_count_cache, terminal_count_cache)
+
+        {:ok, Enum.reverse(expanded), state}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -334,6 +359,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
         acc
         |> put_in([:counts, count_key], count)
         |> put_in([:terminal_values, terminal_key], value)
+        |> put_in([:terminal_count_cache, :puts, count_key], count)
         |> prepend_ops(ops)
 
       {:ok, acc}
@@ -359,6 +385,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
         acc
         |> put_in([:counts, count_key], count)
         |> put_in([:terminal_values, terminal_key], value)
+        |> put_in([:terminal_count_cache, :puts, count_key], count)
         |> prepend_ops(ops)
 
       {:ok, acc}
@@ -372,6 +399,12 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp expand_op(_path, {:query_delete, query_key}, acc) when is_binary(query_key) do
     {:ok, prepend_ops(acc, [{:delete, query_key}])}
+  end
+
+  defp expand_op(_path, {put_mode, key, value} = op, acc)
+       when put_mode in [:put, :put_new] and is_binary(key) and is_binary(value) do
+    acc = maybe_init_terminal_counts_for_active_record(value, acc)
+    {:ok, prepend_ops(acc, [op])}
   end
 
   defp expand_op(path, {:terminal_delete, terminal_key, state_key, count_key}, acc)
@@ -396,6 +429,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
         acc
         |> put_in([:counts, count_key], count)
         |> put_in([:terminal_values, terminal_key], nil)
+        |> put_in([:terminal_count_cache, :puts, count_key], count)
         |> prepend_ops(ops)
 
       {:ok, acc}
@@ -422,6 +456,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
         acc
         |> put_in([:counts, count_key], count)
         |> put_in([:terminal_values, terminal_key], nil)
+        |> put_in([:terminal_count_cache, :puts, count_key], count)
         |> prepend_ops(ops)
 
       {:ok, acc}
@@ -429,6 +464,51 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp expand_op(_path, op, acc), do: {:ok, prepend_ops(acc, [op])}
+
+  defp maybe_init_terminal_counts_for_active_record(value, acc) do
+    with {:ok, record} <- decode_flow_record_value(value),
+         state when is_binary(state) <- Map.get(record, :state),
+         false <- Ferricstore.Flow.LMDB.terminal_state?(state),
+         type when is_binary(type) <- Map.get(record, :type) do
+      partition_key = Map.get(record, :partition_key)
+      init_key = {type, partition_key}
+
+      if MapSet.member?(acc.terminal_count_inits, init_key) do
+        acc
+      else
+        count_ops =
+          Enum.map(@terminal_states, fn terminal_state ->
+            state_index_key = Flow.Keys.state_index_key(type, terminal_state, partition_key)
+            count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+
+            {:put_new, count_key, Ferricstore.Flow.LMDB.encode_count(0)}
+          end)
+
+        acc
+        |> Map.update!(:terminal_count_inits, &MapSet.put(&1, init_key))
+        |> update_in([:terminal_count_cache, :refresh], fn refresh ->
+          Enum.reduce(count_ops, refresh, fn {:put_new, count_key, _value}, refresh ->
+            MapSet.put(refresh, count_key)
+          end)
+        end)
+        |> prepend_ops(count_ops)
+      end
+    else
+      _ -> acc
+    end
+  end
+
+  defp decode_flow_record_value(value) do
+    case :erlang.binary_to_term(value, [:safe]) do
+      {_expire_at_ms, encoded_record} when is_binary(encoded_record) ->
+        {:ok, Flow.decode_record(encoded_record)}
+
+      _ ->
+        :error
+    end
+  rescue
+    _ -> :error
+  end
 
   defp terminal_value(path, terminal_key, acc) do
     case Map.fetch(acc.terminal_values, terminal_key) do
@@ -464,6 +544,21 @@ defmodule Ferricstore.Flow.LMDBWriter do
             error
         end
     end
+  end
+
+  defp cache_terminal_counts(path, %{puts: puts, refresh: refresh}) do
+    Enum.each(puts, fn {count_key, count} ->
+      Ferricstore.Flow.LMDB.put_cached_terminal_count_key(path, count_key, count)
+    end)
+
+    Enum.each(refresh, fn count_key ->
+      case Map.has_key?(puts, count_key) do
+        true -> :ok
+        false -> Ferricstore.Flow.LMDB.refresh_terminal_count_key(path, count_key)
+      end
+    end)
+
+    :ok
   end
 
   defp prepend_ops(acc, ops), do: %{acc | ops: Enum.reverse(ops) ++ acc.ops}

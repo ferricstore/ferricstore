@@ -966,6 +966,32 @@ defmodule Ferricstore.FlowTest do
     assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, count_key)
   end
 
+  test "flow_info does not build empty terminal score indexes for active-only types" do
+    ctx = FerricStore.Instance.get(:default)
+    partition = uid("tenant-info-empty-index")
+    type = uid("info-empty-index")
+    id = uid("flow-info-empty-index")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: type,
+               partition_key: partition,
+               run_at_ms: 1,
+               now_ms: 1
+             )
+
+    completed_index_key = Ferricstore.Flow.Keys.state_index_key(type, "completed", partition)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, completed_index_key)
+
+    {_index_table, lookup_table} =
+      Ferricstore.Store.Shard.ZSetIndex.table_names(ctx.name, shard_index)
+
+    refute :ets.member(lookup_table, {:ready, completed_index_key})
+    assert {:ok, info} = FerricStore.flow_info(type, partition_key: partition)
+    assert info.completed == 0
+    refute :ets.member(lookup_table, {:ready, completed_index_key})
+  end
+
   test "partition_key scopes claim, complete, retry, get, and history" do
     partition = uid("tenant")
     id = uid("flow-partition")

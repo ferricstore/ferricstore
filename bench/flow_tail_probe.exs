@@ -12,6 +12,7 @@ seed_concurrency = System.get_env("FLOW_TAIL_SEED_CONCURRENCY", "64") |> String.
 batch_size = System.get_env("FLOW_TAIL_BATCH", "100") |> String.to_integer()
 top_count = System.get_env("FLOW_TAIL_TOP", "8") |> String.to_integer()
 flow_lmdb_mode = System.get_env("FLOW_LMDB_MODE", "mirror")
+warm_info? = System.get_env("FLOW_TAIL_WARM_INFO", "true") != "false"
 
 release_cursor_interval = System.get_env("FLOW_TAIL_RELEASE_CURSOR_INTERVAL")
 
@@ -48,7 +49,16 @@ defmodule FlowTailProbe do
     [:ferricstore, :batcher, :local_apply_gate]
   ]
 
-  def run(backlog, iterations, partition_count, seed_concurrency, batch_size, top_count, data_dir) do
+  def run(
+        backlog,
+        iterations,
+        partition_count,
+        seed_concurrency,
+        batch_size,
+        top_count,
+        warm_info?,
+        data_dir
+      ) do
     :ets.new(:flow_tail_events, [:named_table, :public, :ordered_set])
     :ets.new(:flow_tail_samples, [:named_table, :public, :ordered_set])
     attach_telemetry()
@@ -73,7 +83,7 @@ defmodule FlowTailProbe do
     memory_after_active = memory_snapshot()
     print_memory_delta("memory_after_active", memory_after_active, memory_before)
 
-    warm_info(prefix, active_type, partition_count)
+    if warm_info?, do: warm_info(prefix, active_type, partition_count)
     clear_events()
 
     claim_type = type(prefix, "claim")
@@ -587,5 +597,6 @@ FlowTailProbe.run(
   seed_concurrency,
   batch_size,
   top_count,
+  warm_info?,
   bench_data_dir
 )

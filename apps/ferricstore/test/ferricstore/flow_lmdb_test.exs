@@ -1,6 +1,18 @@
 defmodule Ferricstore.Flow.LMDBTest do
   use ExUnit.Case, async: false
 
+  test "warm opens an empty shard env before first user read" do
+    path =
+      Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    refute File.exists?(path)
+    assert :ok = Ferricstore.Flow.LMDB.warm(path)
+    assert File.dir?(path)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, "missing")
+  end
+
   test "stores, reads, overwrites, and deletes raw flow state blobs" do
     path =
       Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
@@ -25,6 +37,24 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :not_found = Ferricstore.Flow.LMDB.get(path, key)
   end
 
+  test "terminal_counts batches count reads and caches missing counts as zero" do
+    path =
+      Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
+
+    completed_key = "flow:{flow:test}:idx:completed"
+    failed_key = "flow:{flow:test}:idx:failed"
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert {:ok, [0, 0]} =
+             Ferricstore.Flow.LMDB.terminal_counts(path, [completed_key, failed_key])
+
+    assert :ok = Ferricstore.Flow.LMDB.put_terminal_count(path, completed_key, 7)
+
+    assert {:ok, [7, 0]} =
+             Ferricstore.Flow.LMDB.terminal_counts(path, [completed_key, failed_key])
+  end
+
   test "batch write can return pre-batch originals for rollback" do
     path =
       Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
@@ -45,6 +75,24 @@ defmodule Ferricstore.Flow.LMDBTest do
              ])
 
     assert {:ok, "v3"} = Ferricstore.Flow.LMDB.get(path, key)
+  end
+
+  test "put_new preserves existing LMDB values" do
+    path =
+      Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
+
+    key = "flow:{flow:test}:state:existing"
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, key, "v1"}])
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put_new, key, "v2"}])
+    assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
+
+    assert {:ok, [{^key, {:value, "v1"}}]} =
+             Ferricstore.Flow.LMDB.write_batch_with_originals(path, [{:put_new, key, "v3"}])
+
+    assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
   end
 
   test "batch write keeps duplicate key order but may sort unique keys internally" do
@@ -122,6 +170,43 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(instance_name, shard_index + 1)
     assert {:ok, "v2"} = Ferricstore.Flow.LMDB.get(path, key)
+  end
+
+  test "mirror writer initializes zero terminal counters for active flow types" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    type = "writer-zero-counts"
+    partition_key = "tenant-zero-counts"
+
+    assert {:ok, _flow} =
+             Ferricstore.Store.Router.flow_create(ctx, %{
+               id: "flow-zero-counts",
+               type: type,
+               state: "queued",
+               run_at_ms: 1,
+               partition_key: partition_key,
+               now_ms: 1
+             })
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    for terminal_state <- ["completed", "failed", "cancelled"] do
+      state_index_key = Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
+      assert {:ok, 0} = Ferricstore.Flow.LMDB.terminal_count(path, state_index_key)
+    end
   end
 
   test "mirror writer can flush a single shard without draining others" do

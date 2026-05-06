@@ -659,6 +659,41 @@ defmodule Ferricstore.Store.Shard.Compound do
       )}, state}
   end
 
+  @spec handle_zset_score_count_many([{binary(), term(), term()}], map()) ::
+          {:reply, {:ok, [non_neg_integer()]}, map()}
+  @doc false
+  def handle_zset_score_count_many(queries, state) when is_list(queries) do
+    {counts, state} =
+      Enum.map_reduce(queries, state, fn {redis_key, min_bound, max_bound}, acc_state ->
+        acc_state = ensure_zset_score_index(acc_state, redis_key)
+
+        count =
+          ZSetIndex.count(
+            acc_state.zset_score_index,
+            acc_state.zset_score_lookup,
+            redis_key,
+            min_bound,
+            max_bound
+          )
+
+        {count, acc_state}
+      end)
+
+    {:reply, {:ok, counts}, state}
+  end
+
+  @spec handle_zset_score_count_all_many_no_build([binary()], map()) ::
+          {:reply, {:ok, [non_neg_integer()]}, map()}
+  @doc false
+  def handle_zset_score_count_all_many_no_build(keys, state) when is_list(keys) do
+    counts =
+      Enum.map(keys, fn key ->
+        ZSetIndex.count(state.zset_score_index, state.zset_score_lookup, key, :neg_inf, :inf)
+      end)
+
+    {:reply, {:ok, counts}, state}
+  end
+
   @spec handle_zset_rank_range(binary(), non_neg_integer(), non_neg_integer(), boolean(), map()) ::
           {:reply, {:ok, [{binary(), float()}]}, map()}
   @doc false

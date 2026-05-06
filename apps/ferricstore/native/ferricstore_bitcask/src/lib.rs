@@ -2169,6 +2169,43 @@ fn lmdb_get<'a>(env: Env<'a>, path: String, key: Binary<'a>, map_size: u64) -> N
 
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
+fn lmdb_get_many<'a>(
+    env: Env<'a>,
+    path: String,
+    keys: Vec<Binary<'a>>,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let rtxn = match store.env.read_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let mut results = Vec::with_capacity(keys.len());
+
+            for key in keys {
+                match store.db.get(&rtxn, key.as_slice()) {
+                    Ok(Some(value)) => {
+                        let mut binary = OwnedBinary::new(value.len()).ok_or_else(|| {
+                            rustler::Error::Term(Box::new("failed to allocate binary"))
+                        })?;
+                        binary.as_mut_slice().copy_from_slice(value);
+                        results.push((atoms::ok(), binary.release(env)).encode(env));
+                    }
+                    Ok(None) => results.push(atoms::not_found().encode(env)),
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                }
+            }
+
+            Ok((atoms::ok(), results).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
 fn lmdb_put<'a>(
     env: Env<'a>,
     path: String,
@@ -2330,23 +2367,25 @@ fn lmdb_write_batch_impl<'a>(
                 };
 
                 if return_originals && seen.insert(key.to_vec()) {
-                    if matches!(record, LmdbBatchWrite::PutNew(_, _)) {
-                        originals.push((key.to_vec(), None));
-                    } else {
-                        match store.db.get(&wtxn, key) {
-                            Ok(Some(value)) => {
-                                originals.push((key.to_vec(), Some(value.to_vec())));
-                            }
-                            Ok(None) => originals.push((key.to_vec(), None)),
-                            Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                    match store.db.get(&wtxn, key) {
+                        Ok(Some(value)) => {
+                            originals.push((key.to_vec(), Some(value.to_vec())));
                         }
+                        Ok(None) => originals.push((key.to_vec(), None)),
+                        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
                     }
                 }
 
                 let result = match record {
-                    LmdbBatchWrite::Put(key, value) | LmdbBatchWrite::PutNew(key, value) => {
+                    LmdbBatchWrite::Put(key, value) => {
                         store.db.put(&mut wtxn, key.as_slice(), value.as_slice())
                     }
+                    LmdbBatchWrite::PutNew(key, value) => match store.db.get(&wtxn, key.as_slice())
+                    {
+                        Ok(Some(_)) => Ok(()),
+                        Ok(None) => store.db.put(&mut wtxn, key.as_slice(), value.as_slice()),
+                        Err(e) => Err(e),
+                    },
                     LmdbBatchWrite::Delete(key) => {
                         store.db.delete(&mut wtxn, key.as_slice()).map(|_| ())
                     }

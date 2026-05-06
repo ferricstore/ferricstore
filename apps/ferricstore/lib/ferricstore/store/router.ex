@@ -3734,6 +3734,66 @@ defmodule Ferricstore.Store.Router do
     |> unwrap_zset_index_reply()
   end
 
+  @spec zset_score_count_many(FerricStore.Instance.t(), [{binary(), term(), term()}]) ::
+          {:ok, [non_neg_integer()]} | :unavailable
+  def zset_score_count_many(_ctx, []), do: {:ok, []}
+
+  def zset_score_count_many(ctx, [{first_key, _min, _max} | _] = queries) do
+    idx = shard_for(ctx, first_key)
+
+    if Enum.all?(queries, fn {key, _min_bound, _max_bound} -> shard_for(ctx, key) == idx end) do
+      ctx
+      |> safe_read_call(idx, {:zset_score_count_many, queries})
+      |> unwrap_zset_index_reply()
+    else
+      zset_score_count_many_cross_shard(ctx, queries)
+    end
+  end
+
+  defp zset_score_count_many_cross_shard(ctx, queries) do
+    Enum.reduce_while(queries, {:ok, []}, fn {key, min_bound, max_bound}, {:ok, acc} ->
+      case zset_score_count(ctx, key, min_bound, max_bound) do
+        {:ok, count} -> {:cont, {:ok, [count | acc]}}
+        :unavailable -> {:halt, :unavailable}
+      end
+    end)
+    |> case do
+      {:ok, counts} -> {:ok, Enum.reverse(counts)}
+      :unavailable -> :unavailable
+    end
+  end
+
+  @spec zset_score_count_all_many_no_build(FerricStore.Instance.t(), [binary()]) ::
+          {:ok, [non_neg_integer()]} | :unavailable
+  def zset_score_count_all_many_no_build(_ctx, []), do: {:ok, []}
+
+  def zset_score_count_all_many_no_build(ctx, [first_key | _] = keys) do
+    idx = shard_for(ctx, first_key)
+
+    if Enum.all?(keys, fn key -> shard_for(ctx, key) == idx end) do
+      ctx
+      |> safe_read_call(idx, {:zset_score_count_all_many_no_build, keys})
+      |> unwrap_zset_index_reply()
+    else
+      zset_score_count_all_many_no_build_cross_shard(ctx, keys)
+    end
+  end
+
+  defp zset_score_count_all_many_no_build_cross_shard(ctx, keys) do
+    Enum.reduce_while(keys, {:ok, []}, fn key, {:ok, acc} ->
+      idx = shard_for(ctx, key)
+
+      case safe_read_call(ctx, idx, {:zset_score_count_all_many_no_build, [key]}) do
+        {:ok, [count]} -> {:cont, {:ok, [count | acc]}}
+        :unavailable -> {:halt, :unavailable}
+      end
+    end)
+    |> case do
+      {:ok, counts} -> {:ok, Enum.reverse(counts)}
+      :unavailable -> :unavailable
+    end
+  end
+
   @spec zset_rank_range(
           FerricStore.Instance.t(),
           binary(),

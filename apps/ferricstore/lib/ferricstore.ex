@@ -647,10 +647,7 @@ defmodule FerricStore do
     with :ok <- flow_validate_opts(opts),
          :ok <- flow_validate_type(type),
          {:ok, partition_key} <- flow_partition_key(opts),
-         {:ok, counts} <- flow_state_counts(type, partition_key),
-         inflight_key = Ferricstore.Flow.Keys.inflight_index_key(type, partition_key),
-         :ok <- flow_validate_key_size(inflight_key),
-         {:ok, inflight} <- zcard(inflight_key) do
+         {:ok, counts, inflight} <- flow_info_counts(type, partition_key) do
       {:ok,
        counts
        |> Map.put(:type, type)
@@ -811,18 +808,128 @@ defmodule FerricStore do
     end
   end
 
-  defp flow_state_counts(type, partition_key) do
-    ["queued", "running", "completed", "failed", "cancelled"]
-    |> Enum.reduce_while({:ok, %{}}, fn state, {:ok, acc} ->
-      key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key)
+  defp flow_info_counts(type, partition_key) do
+    state_keys =
+      Enum.map(["queued", "running", "completed", "failed", "cancelled"], fn state ->
+        {state, Ferricstore.Flow.Keys.state_index_key(type, state, partition_key)}
+      end)
 
-      with :ok <- flow_validate_key_size(key),
-           {:ok, count} <- flow_index_count_no_flush(key, state, partition_key) do
-        {:cont, {:ok, Map.put(acc, String.to_atom(state), count)}}
-      else
-        {:error, _} = error -> {:halt, error}
+    inflight_key = {"inflight", Ferricstore.Flow.Keys.inflight_index_key(type, partition_key)}
+    all_keys = state_keys ++ [inflight_key]
+
+    with :ok <- flow_validate_index_keys(all_keys),
+         {:ok, ram_counts} <-
+           flow_zset_count_many(Enum.map(all_keys, fn {_state, key} -> key end)),
+         {:ok, lmdb_counts} <- flow_terminal_lmdb_counts(state_keys, partition_key) do
+      {state_ram_counts, [inflight]} = Enum.split(ram_counts, length(state_keys))
+
+      state_keys
+      |> Enum.zip(state_ram_counts)
+      |> Enum.reduce_while({:ok, %{}}, fn {{state, key}, ram_count}, {:ok, acc} ->
+        with {:ok, count} <-
+               flow_maybe_recount_overlapping_terminal(
+                 key,
+                 state,
+                 partition_key,
+                 ram_count,
+                 Map.get(lmdb_counts, key, 0)
+               ) do
+          {:cont, {:ok, Map.put(acc, String.to_atom(state), count)}}
+        else
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, counts} -> {:ok, counts, inflight}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  defp flow_terminal_lmdb_counts(state_keys, partition_key) do
+    terminal_keys =
+      state_keys
+      |> Enum.filter(fn {state, _key} -> state in ["completed", "failed", "cancelled"] end)
+      |> Enum.map(fn {_state, key} -> key end)
+
+    case terminal_keys do
+      [] ->
+        {:ok, %{}}
+
+      [first_key | _] ->
+        ctx = default_ctx()
+        now_ms = System.os_time(:millisecond)
+        sweep_limit = flow_terminal_lmdb_sweep_limit()
+
+        ctx
+        |> flow_lmdb_paths_for_index(first_key, partition_key)
+        |> Enum.reduce_while({:ok, Map.new(terminal_keys, &{&1, 0})}, fn path, {:ok, acc} ->
+          with {:ok, counts} <- Ferricstore.Flow.LMDB.terminal_counts(path, terminal_keys),
+               {:ok, counts} <-
+                 flow_maybe_sweep_terminal_lmdb_counts(
+                   path,
+                   terminal_keys,
+                   counts,
+                   now_ms,
+                   sweep_limit
+                 ) do
+            merged =
+              terminal_keys
+              |> Enum.zip(counts)
+              |> Enum.reduce(acc, fn {key, count}, count_acc ->
+                Map.update!(count_acc, key, &(&1 + count))
+              end)
+
+            {:cont, {:ok, merged}}
+          else
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+    end
+  end
+
+  defp flow_maybe_sweep_terminal_lmdb_counts(path, terminal_keys, counts, now_ms, sweep_limit) do
+    if Enum.any?(counts, &(&1 > 0)) do
+      with {:ok, _swept} <-
+             Ferricstore.Flow.LMDB.sweep_expired_terminal(path, now_ms, sweep_limit) do
+        Ferricstore.Flow.LMDB.terminal_counts(path, terminal_keys)
+      end
+    else
+      {:ok, counts}
+    end
+  end
+
+  defp flow_validate_index_keys(state_keys) do
+    Enum.reduce_while(state_keys, :ok, fn {_state, key}, :ok ->
+      case flow_validate_key_size(key) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
       end
     end)
+  end
+
+  defp flow_zset_count_many([]), do: {:ok, []}
+
+  defp flow_zset_count_many(keys) do
+    ctx = default_ctx()
+
+    case Router.zset_score_count_all_many_no_build(ctx, keys) do
+      {:ok, counts} -> {:ok, counts}
+      :unavailable -> flow_zcard_many_fallback(keys)
+    end
+  end
+
+  defp flow_zcard_many_fallback(keys) do
+    Enum.reduce_while(keys, {:ok, []}, fn key, {:ok, acc} ->
+      case zcard(key) do
+        {:ok, count} -> {:cont, {:ok, [count | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, counts} -> {:ok, Enum.reverse(counts)}
+      {:error, _reason} = error -> error
+    end
   end
 
   defp flow_flush_lmdb_for_index(index_key, partition_key) do
@@ -842,19 +949,6 @@ defmodule FerricStore do
     with {:ok, ram_ids} <- zrange(index_key, 0, count - 1),
          {:ok, lmdb_ids} <- flow_terminal_lmdb_ids(index_key, state, partition_key, count) do
       {:ok, (ram_ids ++ lmdb_ids) |> Enum.uniq() |> Enum.take(count)}
-    end
-  end
-
-  defp flow_index_count_no_flush(index_key, state, partition_key) do
-    with {:ok, ram_count} <- zcard(index_key),
-         {:ok, lmdb_count} <- flow_terminal_lmdb_count(index_key, state, partition_key) do
-      flow_maybe_recount_overlapping_terminal(
-        index_key,
-        state,
-        partition_key,
-        ram_count,
-        lmdb_count
-      )
     end
   end
 
@@ -980,9 +1074,8 @@ defmodule FerricStore do
     ctx
     |> flow_lmdb_paths_for_index(index_key, partition_key)
     |> Enum.reduce_while({:ok, 0}, fn path, {:ok, acc} ->
-      with {:ok, _swept} <-
-             Ferricstore.Flow.LMDB.sweep_expired_terminal(path, now_ms, sweep_limit),
-           {:ok, count} <- flow_terminal_lmdb_count_for_path(path, index_key, prefix, now_ms) do
+      with {:ok, count} <-
+             flow_terminal_lmdb_count_for_path(path, index_key, prefix, now_ms, sweep_limit) do
         {:cont, {:ok, acc + count}}
       else
         {:error, _reason} = error -> {:halt, error}
@@ -1012,36 +1105,37 @@ defmodule FerricStore do
     ]
   end
 
-  defp flow_terminal_lmdb_count_for_path(path, index_key, prefix, now_ms) do
+  defp flow_terminal_lmdb_count_for_path(path, index_key, prefix, now_ms, sweep_limit) do
     case Ferricstore.Flow.LMDB.terminal_count(path, index_key) do
-      {:ok, count} ->
-        {:ok, count}
+      {:ok, 0} ->
+        {:ok, 0}
+
+      {:ok, _count} ->
+        flow_terminal_lmdb_sweep_then_count(
+          path,
+          index_key,
+          prefix,
+          now_ms,
+          sweep_limit
+        )
 
       :not_found ->
-        flow_terminal_lmdb_rebuild_count_for_path(path, index_key, prefix, now_ms)
+        {:ok, 0}
 
       {:error, _reason} = error ->
         error
     end
   end
 
-  defp flow_terminal_lmdb_rebuild_count_for_path(path, index_key, prefix, now_ms) do
-    with {:ok, raw_count} <- Ferricstore.Flow.LMDB.prefix_count(path, prefix) do
-      if raw_count == 0 do
-        {:ok, 0}
-      else
-        with {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, raw_count) do
-          live_count =
-            entries
-            |> flow_decode_terminal_index_entries(path, now_ms)
-            |> length()
-
-          case Ferricstore.Flow.LMDB.put_terminal_count(path, index_key, live_count) do
-            :ok -> {:ok, live_count}
-            {:error, _reason} = error -> error
-          end
-        end
+  defp flow_terminal_lmdb_sweep_then_count(path, index_key, _prefix, now_ms, sweep_limit) do
+    with {:ok, _swept} <- Ferricstore.Flow.LMDB.sweep_expired_terminal(path, now_ms, sweep_limit) do
+      case Ferricstore.Flow.LMDB.terminal_count(path, index_key) do
+        {:ok, count} -> {:ok, count}
+        :not_found -> {:ok, 0}
+        {:error, _reason} = error -> error
       end
+    else
+      {:error, _reason} = error -> error
     end
   end
 

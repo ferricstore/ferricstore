@@ -143,6 +143,10 @@ defmodule Ferricstore.Bitcask.NIF do
           {:ok, binary()} | :not_found | {:error, term()}
   def lmdb_get(_path, _key, _map_size), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_get_many(binary(), [binary()], non_neg_integer()) ::
+          {:ok, [{:ok, binary()} | :not_found]} | {:error, term()}
+  def lmdb_get_many(_path, _keys, _map_size), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec lmdb_put(binary(), binary(), binary(), non_neg_integer()) :: :ok | {:error, term()}
   def lmdb_put(_path, _key, _value, _map_size), do: :erlang.nif_error(:nif_not_loaded)
 
