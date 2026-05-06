@@ -6566,7 +6566,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_index_put_new_member(state, key, member, score) do
     if flow_index_tables?(state) do
-      track_flow_index_originals(state, key, [member])
+      track_flow_index_missing_originals(state, key, [member])
       FlowIndex.put_new_member(state.flow_index_name, state.flow_lookup_name, key, member, score)
     end
 
@@ -6594,7 +6594,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_index_put_new_members(state, key, member_score_pairs) do
     if flow_index_tables?(state) do
-      track_flow_index_originals(
+      track_flow_index_missing_originals(
         state,
         key,
         Enum.map(member_score_pairs, fn {member, _score} -> member end)
@@ -6624,6 +6624,24 @@ defmodule Ferricstore.Raft.StateMachine do
     if flow_index_tables?(state) do
       track_flow_index_originals(state, key, members)
       FlowIndex.delete_members(state.flow_index_name, state.flow_lookup_name, key, members)
+    end
+
+    :ok
+  end
+
+  defp track_flow_index_missing_originals(state, key, members) do
+    case Process.get(:sm_pending_flow_index_originals, :undefined) do
+      originals when is_map(originals) ->
+        originals =
+          Enum.reduce(members, originals, fn member, acc ->
+            original_key = {state.flow_index_name, state.flow_lookup_name, key, member}
+            Map.put_new(acc, original_key, :missing)
+          end)
+
+        Process.put(:sm_pending_flow_index_originals, originals)
+
+      _ ->
+        :ok
     end
 
     :ok
