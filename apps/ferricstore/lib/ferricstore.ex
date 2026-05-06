@@ -559,7 +559,7 @@ defmodule FerricStore do
          {:ok, count} <- flow_history_count(opts),
          index_key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key),
          :ok <- flow_validate_key_size(index_key),
-         {:ok, ids} <- flow_index_ids(index_key, state, count) do
+         {:ok, ids} <- flow_index_ids(index_key, state, partition_key, count) do
       flow_records_for_ids(ids, partition_key)
     end
   end
@@ -787,12 +787,13 @@ defmodule FerricStore do
   end
 
   defp flow_records_for_index(index_key, partition_key, count) do
-    with {:ok, ids} <- flow_query_index_ids(index_key, count) do
+    with {:ok, ids} <- flow_query_index_ids(index_key, partition_key, count) do
       flow_records_for_ids(ids, partition_key)
     end
   end
 
-  defp flow_query_index_ids(index_key, count), do: flow_lmdb_query_index_ids(index_key, count)
+  defp flow_query_index_ids(index_key, partition_key, count),
+    do: flow_lmdb_query_index_ids(index_key, partition_key, count)
 
   defp flow_root_record(root_flow_id, partition_key) do
     case flow_get(root_flow_id, partition_key: partition_key) do
@@ -810,7 +811,7 @@ defmodule FerricStore do
         key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key)
 
         with :ok <- flow_validate_key_size(key),
-             {:ok, count} <- flow_index_count_no_flush(key, state) do
+             {:ok, count} <- flow_index_count_no_flush(key, state, partition_key) do
           {:cont, {:ok, Map.put(acc, String.to_atom(state), count)}}
         else
           {:error, _} = error -> {:halt, error}
@@ -824,44 +825,45 @@ defmodule FerricStore do
     Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
   end
 
-  defp flow_index_ids(index_key, state, count) do
+  defp flow_index_ids(index_key, state, partition_key, count) do
     with {:ok, ram_ids} <- zrange(index_key, 0, count - 1),
-         {:ok, lmdb_ids} <- flow_terminal_lmdb_ids(index_key, state, count) do
+         {:ok, lmdb_ids} <- flow_terminal_lmdb_ids(index_key, state, partition_key, count) do
       {:ok, (ram_ids ++ lmdb_ids) |> Enum.uniq() |> Enum.take(count)}
     end
   end
 
-  defp flow_index_count_no_flush(index_key, state) do
+  defp flow_index_count_no_flush(index_key, state, partition_key) do
     with {:ok, ram_count} <- zcard(index_key),
-         {:ok, lmdb_count} <- flow_terminal_lmdb_count(index_key, state) do
+         {:ok, lmdb_count} <- flow_terminal_lmdb_count(index_key, state, partition_key) do
       {:ok, ram_count + lmdb_count}
     end
   end
 
-  defp flow_terminal_lmdb_ids(_index_key, state, _count)
+  defp flow_terminal_lmdb_ids(_index_key, state, _partition_key, _count)
        when state not in ["completed", "failed", "cancelled"],
        do: {:ok, []}
 
-  defp flow_terminal_lmdb_ids(_index_key, _state, count) when count <= 0, do: {:ok, []}
+  defp flow_terminal_lmdb_ids(_index_key, _state, _partition_key, count) when count <= 0,
+    do: {:ok, []}
 
-  defp flow_terminal_lmdb_ids(index_key, _state, count) do
+  defp flow_terminal_lmdb_ids(index_key, _state, partition_key, count) do
     if Ferricstore.Flow.LMDB.mirror?() do
-      flow_lmdb_index_ids(index_key, count)
+      flow_lmdb_index_ids(index_key, partition_key, count)
     else
       {:ok, []}
     end
   end
 
-  defp flow_lmdb_index_ids(_index_key, count) when count <= 0, do: {:ok, []}
+  defp flow_lmdb_index_ids(_index_key, _partition_key, count) when count <= 0, do: {:ok, []}
 
-  defp flow_lmdb_index_ids(index_key, count) do
+  defp flow_lmdb_index_ids(index_key, partition_key, count) do
     ctx = default_ctx()
     prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
     now_ms = System.os_time(:millisecond)
     sweep_limit = flow_terminal_lmdb_sweep_limit()
 
-    ctx.data_dir
-    |> flow_lmdb_shard_paths(ctx.shard_count)
+    ctx
+    |> flow_lmdb_paths_for_index(index_key, partition_key)
     |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
       with {:ok, _swept} <-
              Ferricstore.Flow.LMDB.sweep_expired_terminal(path, now_ms, sweep_limit),
@@ -886,17 +888,18 @@ defmodule FerricStore do
     end
   end
 
-  defp flow_lmdb_query_index_ids(_index_key, count) when count <= 0, do: {:ok, []}
+  defp flow_lmdb_query_index_ids(_index_key, _partition_key, count) when count <= 0,
+    do: {:ok, []}
 
-  defp flow_lmdb_query_index_ids(index_key, count) do
+  defp flow_lmdb_query_index_ids(index_key, partition_key, count) do
     ctx = default_ctx()
 
     with :ok <- Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count) do
       prefix = Ferricstore.Flow.LMDB.query_index_prefix(index_key)
       now_ms = System.os_time(:millisecond)
 
-      ctx.data_dir
-      |> flow_lmdb_shard_paths(ctx.shard_count)
+      ctx
+      |> flow_lmdb_paths_for_index(index_key, partition_key)
       |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
         with {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count) do
           {:cont, {:ok, flow_decode_query_index_entries(entries, path, now_ms) ++ acc}}
@@ -920,18 +923,18 @@ defmodule FerricStore do
     end
   end
 
-  defp flow_terminal_lmdb_count(_index_key, state)
+  defp flow_terminal_lmdb_count(_index_key, state, _partition_key)
        when state not in ["completed", "failed", "cancelled"],
        do: {:ok, 0}
 
-  defp flow_terminal_lmdb_count(index_key, _state) do
+  defp flow_terminal_lmdb_count(index_key, _state, partition_key) do
     ctx = default_ctx()
     prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
     now_ms = System.os_time(:millisecond)
     sweep_limit = flow_terminal_lmdb_sweep_limit()
 
-    ctx.data_dir
-    |> flow_lmdb_shard_paths(ctx.shard_count)
+    ctx
+    |> flow_lmdb_paths_for_index(index_key, partition_key)
     |> Enum.reduce_while({:ok, 0}, fn path, {:ok, acc} ->
       with {:ok, _swept} <-
              Ferricstore.Flow.LMDB.sweep_expired_terminal(path, now_ms, sweep_limit),
@@ -949,6 +952,20 @@ defmodule FerricStore do
       |> Ferricstore.DataDir.shard_data_path(shard_index)
       |> Ferricstore.Flow.LMDB.path()
     end)
+  end
+
+  defp flow_lmdb_paths_for_index(ctx, _index_key, nil) do
+    flow_lmdb_shard_paths(ctx.data_dir, ctx.shard_count)
+  end
+
+  defp flow_lmdb_paths_for_index(ctx, index_key, partition_key) when is_binary(partition_key) do
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, index_key)
+
+    [
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+    ]
   end
 
   defp flow_terminal_lmdb_count_for_path(path, index_key, prefix, now_ms) do
