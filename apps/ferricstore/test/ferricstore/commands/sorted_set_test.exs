@@ -388,6 +388,26 @@ defmodule Ferricstore.Commands.SortedSetTest do
       assert nil == store.compound_get.("zs", "T:zs")
     end
 
+    test "ZREM cleanup uses score-index cardinality when available" do
+      parent = self()
+      base_store = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1.0", "a"], base_store)
+
+      store =
+        base_store
+        |> Map.put(:zset_score_count, fn redis_key, min_bound, max_bound ->
+          send(parent, {:zset_score_count, redis_key, min_bound, max_bound})
+          {:ok, 0}
+        end)
+        |> Map.put(:compound_count, fn _redis_key, _prefix ->
+          flunk("ZREM cleanup should not scan/count members when score-index cardinality exists")
+        end)
+
+      assert 1 == SortedSet.handle("ZREM", ["zs", "a"], store)
+      assert_receive {:zset_score_count, "zs", :neg_inf, :inf}
+      assert nil == base_store.compound_get.("zs", "T:zs")
+    end
+
     test "ZREM returns type cleanup errors after removing the last member" do
       store = zset_cleanup_failure_store()
 

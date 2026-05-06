@@ -676,23 +676,14 @@ defmodule Ferricstore.Commands.SortedSet do
 
   defp zcard_key(key, store) do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      case Ops.zset_score_count(store, key, :neg_inf, :inf) do
-        {:ok, count} ->
-          count
-
-        :unavailable ->
-          prefix = CompoundKey.zset_prefix(key)
-          Ops.compound_count(store, key, prefix)
-      end
+      zset_member_count(key, store)
     end
   end
 
   defp maybe_cleanup_empty_zset(_key, 0, _store), do: :ok
 
   defp maybe_cleanup_empty_zset(key, _removed, store) do
-    prefix = CompoundKey.zset_prefix(key)
-
-    if Ops.compound_count(store, key, prefix) == 0 do
+    if zset_member_count(key, store) == 0 do
       TypeRegistry.delete_type(key, store)
     else
       :ok
@@ -1071,6 +1062,10 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp zcard_count(key, store) do
+    zset_member_count(key, store)
+  end
+
+  defp zset_member_count(key, store) do
     case Ops.zset_score_count(store, key, :neg_inf, :inf) do
       {:ok, count} ->
         count
