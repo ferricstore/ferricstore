@@ -69,17 +69,15 @@ defmodule Ferricstore.Commands.Geo do
     do: {:error, msg}
 
   def handle_ast({:geodist, key, member1, member2, unit}, store) do
-    with {:ok, zset} <- read_zset(store, key) do
-      map = zset_to_member_map(zset)
-
-      case {Map.get(map, member1), Map.get(map, member2)} do
+    with {:ok, [score1, score2]} <- read_zset_member_scores(store, key, [member1, member2]) do
+      case {score1, score2} do
         {nil, _} ->
           nil
 
         {_, nil} ->
           nil
 
-        {score1, score2} ->
+        {score1, score2} when is_float(score1) and is_float(score2) ->
           {lng1, lat1} = geohash_decode(score1)
           {lng2, lat2} = geohash_decode(score2)
           dist_m = haversine(lat1, lng1, lat2, lng2)
@@ -169,17 +167,15 @@ defmodule Ferricstore.Commands.Geo do
     if unit == nil or unit not in Map.keys(@unit_conversions) do
       {:error, "ERR unsupported unit provided. please use M, KM, FT, MI"}
     else
-      with {:ok, zset} <- read_zset(store, key) do
-        map = zset_to_member_map(zset)
-
-        case {Map.get(map, member1), Map.get(map, member2)} do
+      with {:ok, [score1, score2]} <- read_zset_member_scores(store, key, [member1, member2]) do
+        case {score1, score2} do
           {nil, _} ->
             nil
 
           {_, nil} ->
             nil
 
-          {score1, score2} ->
+          {score1, score2} when is_float(score1) and is_float(score2) ->
             {lng1, lat1} = geohash_decode(score1)
             {lng2, lat2} = geohash_decode(score2)
             dist_m = haversine(lat1, lng1, lat2, lng2)
@@ -239,18 +235,14 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp geopos_args([key | members], store) when members != [] do
-    with {:ok, zset} <- read_zset(store, key) do
-      map = zset_to_member_map(zset)
+    with {:ok, scores} <- read_zset_member_scores(store, key, members) do
+      Enum.map(scores, fn
+        nil ->
+          nil
 
-      Enum.map(members, fn member ->
-        case Map.get(map, member) do
-          nil ->
-            nil
-
-          score ->
-            {lng, lat} = geohash_decode(score)
-            [format_coord(lng), format_coord(lat)]
-        end
+        score when is_float(score) ->
+          {lng, lat} = geohash_decode(score)
+          [format_coord(lng), format_coord(lat)]
       end)
     end
   end
@@ -260,14 +252,10 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp geohash_args([key | members], store) when members != [] do
-    with {:ok, zset} <- read_zset(store, key) do
-      map = zset_to_member_map(zset)
-
-      Enum.map(members, fn member ->
-        case Map.get(map, member) do
-          nil -> nil
-          score -> encode_geohash_string(score)
-        end
+    with {:ok, scores} <- read_zset_member_scores(store, key, members) do
+      Enum.map(scores, fn
+        nil -> nil
+        score when is_float(score) -> encode_geohash_string(score)
       end)
     end
   end
@@ -275,6 +263,41 @@ defmodule Ferricstore.Commands.Geo do
   defp geohash_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'geohash' command"}
   end
+
+  defp read_zset_member_scores(store, key, members) do
+    type_key = CompoundKey.type_key(key)
+
+    case Ops.compound_get(store, key, type_key) do
+      "zset" ->
+        compound_keys = Enum.map(members, &CompoundKey.zset_member(key, &1))
+
+        scores =
+          store
+          |> Ops.compound_batch_get(key, compound_keys)
+          |> Enum.map(&parse_geo_score/1)
+
+        {:ok, scores}
+
+      nil ->
+        if Ops.exists?(store, key),
+          do: {:error, @wrongtype_msg},
+          else: {:ok, missing_scores(members)}
+
+      _other ->
+        {:error, @wrongtype_msg}
+    end
+  end
+
+  defp parse_geo_score(nil), do: nil
+
+  defp parse_geo_score(score_str) when is_binary(score_str) do
+    case Float.parse(score_str) do
+      {score, ""} -> score
+      _ -> 0.0
+    end
+  end
+
+  defp missing_scores(members), do: Enum.map(members, fn _member -> nil end)
 
   # ===========================================================================
   # Geohash Encoding/Decoding (public for testing)
@@ -784,12 +807,12 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp resolve_center(%{center: {:member, member}}, store, key) do
-    with {:ok, zset} <- read_zset(store, key) do
-      case Enum.find(zset, fn {_s, m} -> m == member end) do
+    with {:ok, [score]} <- read_zset_member_scores(store, key, [member]) do
+      case score do
         nil ->
           {:error, "ERR could not decode requested zset member"}
 
-        {score, _member} ->
+        score when is_float(score) ->
           {lng, lat} = geohash_decode(score)
           {:ok, lng, lat}
       end

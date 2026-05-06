@@ -408,6 +408,34 @@ defmodule Ferricstore.Commands.GeoTest do
       assert nil_val == nil
     end
 
+    test "batches requested member reads without scanning the whole zset" do
+      parent = self()
+      type_key = CompoundKey.type_key("mygeo")
+
+      palermo_key = CompoundKey.zset_member("mygeo", "Palermo")
+      catania_key = CompoundKey.zset_member("mygeo", "Catania")
+      palermo_score = @palermo_lng |> Geo.geohash_encode(@palermo_lat) |> Float.to_string()
+      catania_score = @catania_lng |> Geo.geohash_encode(@catania_lat) |> Float.to_string()
+
+      store = %{
+        compound_get: fn "mygeo", ^type_key -> "zset" end,
+        compound_batch_get: fn "mygeo", [^palermo_key, ^catania_key] ->
+          send(parent, {:compound_batch_get, [palermo_key, catania_key]})
+          [palermo_score, catania_score]
+        end,
+        compound_scan: fn "mygeo", _prefix ->
+          flunk("GEOPOS should not scan every geo member")
+        end
+      }
+
+      [[plng, _plat], [clng, _clat]] =
+        Geo.handle("GEOPOS", ["mygeo", "Palermo", "Catania"], store)
+
+      assert_received {:compound_batch_get, [^palermo_key, ^catania_key]}
+      assert_in_delta String.to_float(plng), @palermo_lng, 0.01
+      assert_in_delta String.to_float(clng), @catania_lng, 0.01
+    end
+
     test "returns all nils for non-existent key" do
       store = MockStore.make()
       result = Geo.handle("GEOPOS", ["nosuch", "a", "b"], store)
@@ -461,6 +489,32 @@ defmodule Ferricstore.Commands.GeoTest do
       dist = String.to_float(result)
       # ~166274 meters * 3.28084 ft/m
       assert dist > 500_000.0
+    end
+
+    test "reads only the two requested members" do
+      parent = self()
+      type_key = CompoundKey.type_key("mygeo")
+
+      palermo_key = CompoundKey.zset_member("mygeo", "Palermo")
+      catania_key = CompoundKey.zset_member("mygeo", "Catania")
+      palermo_score = @palermo_lng |> Geo.geohash_encode(@palermo_lat) |> Float.to_string()
+      catania_score = @catania_lng |> Geo.geohash_encode(@catania_lat) |> Float.to_string()
+
+      store = %{
+        compound_get: fn "mygeo", ^type_key -> "zset" end,
+        compound_batch_get: fn "mygeo", [^palermo_key, ^catania_key] ->
+          send(parent, {:compound_batch_get, [palermo_key, catania_key]})
+          [palermo_score, catania_score]
+        end,
+        compound_scan: fn "mygeo", _prefix ->
+          flunk("GEODIST should not scan every geo member")
+        end
+      }
+
+      result = Geo.handle("GEODIST", ["mygeo", "Palermo", "Catania"], store)
+
+      assert_received {:compound_batch_get, [^palermo_key, ^catania_key]}
+      assert_in_delta String.to_float(result), 166_274.0, 2000.0
     end
 
     test "returns nil if member1 is missing", %{store: store} do
@@ -526,6 +580,33 @@ defmodule Ferricstore.Commands.GeoTest do
 
       [_p_hash, nil_hash] = Geo.handle("GEOHASH", ["mygeo", "Palermo", "NoPlace"], store)
       assert nil_hash == nil
+    end
+
+    test "batches requested member reads without scanning the whole zset" do
+      parent = self()
+      type_key = CompoundKey.type_key("mygeo")
+
+      palermo_key = CompoundKey.zset_member("mygeo", "Palermo")
+      catania_key = CompoundKey.zset_member("mygeo", "Catania")
+      palermo_score = @palermo_lng |> Geo.geohash_encode(@palermo_lat) |> Float.to_string()
+      catania_score = @catania_lng |> Geo.geohash_encode(@catania_lat) |> Float.to_string()
+
+      store = %{
+        compound_get: fn "mygeo", ^type_key -> "zset" end,
+        compound_batch_get: fn "mygeo", [^palermo_key, ^catania_key] ->
+          send(parent, {:compound_batch_get, [palermo_key, catania_key]})
+          [palermo_score, catania_score]
+        end,
+        compound_scan: fn "mygeo", _prefix ->
+          flunk("GEOHASH should not scan every geo member")
+        end
+      }
+
+      [p_hash, c_hash] = Geo.handle("GEOHASH", ["mygeo", "Palermo", "Catania"], store)
+
+      assert_received {:compound_batch_get, [^palermo_key, ^catania_key]}
+      assert byte_size(p_hash) == 11
+      assert byte_size(c_hash) == 11
     end
 
     test "returns all nils for non-existent key" do
