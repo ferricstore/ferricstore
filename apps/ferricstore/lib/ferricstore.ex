@@ -812,21 +812,17 @@ defmodule FerricStore do
   end
 
   defp flow_state_counts(type, partition_key) do
-    flush_key = Ferricstore.Flow.Keys.state_index_key(type, "queued", partition_key)
+    ["queued", "running", "completed", "failed", "cancelled"]
+    |> Enum.reduce_while({:ok, %{}}, fn state, {:ok, acc} ->
+      key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key)
 
-    with :ok <- flow_flush_lmdb_for_index(flush_key, partition_key) do
-      ["queued", "running", "completed", "failed", "cancelled"]
-      |> Enum.reduce_while({:ok, %{}}, fn state, {:ok, acc} ->
-        key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key)
-
-        with :ok <- flow_validate_key_size(key),
-             {:ok, count} <- flow_index_count_no_flush(key, state, partition_key) do
-          {:cont, {:ok, Map.put(acc, String.to_atom(state), count)}}
-        else
-          {:error, _} = error -> {:halt, error}
-        end
-      end)
-    end
+      with :ok <- flow_validate_key_size(key),
+           {:ok, count} <- flow_index_count_no_flush(key, state, partition_key) do
+        {:cont, {:ok, Map.put(acc, String.to_atom(state), count)}}
+      else
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp flow_flush_lmdb_for_index(index_key, partition_key) do
@@ -852,8 +848,39 @@ defmodule FerricStore do
   defp flow_index_count_no_flush(index_key, state, partition_key) do
     with {:ok, ram_count} <- zcard(index_key),
          {:ok, lmdb_count} <- flow_terminal_lmdb_count(index_key, state, partition_key) do
+      flow_maybe_recount_overlapping_terminal(
+        index_key,
+        state,
+        partition_key,
+        ram_count,
+        lmdb_count
+      )
+    end
+  end
+
+  defp flow_maybe_recount_overlapping_terminal(
+         index_key,
+         state,
+         partition_key,
+         _ram_count,
+         lmdb_count
+       )
+       when state in ["completed", "failed", "cancelled"] and lmdb_count > 0 do
+    with :ok <- flow_flush_lmdb_for_index(index_key, partition_key),
+         {:ok, ram_count} <- zcard(index_key),
+         {:ok, lmdb_count} <- flow_terminal_lmdb_count(index_key, state, partition_key) do
       {:ok, ram_count + lmdb_count}
     end
+  end
+
+  defp flow_maybe_recount_overlapping_terminal(
+         _index_key,
+         _state,
+         _partition_key,
+         ram_count,
+         lmdb_count
+       ) do
+    {:ok, ram_count + lmdb_count}
   end
 
   defp flow_terminal_lmdb_ids(_index_key, state, _partition_key, _count)

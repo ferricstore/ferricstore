@@ -878,6 +878,57 @@ defmodule Ferricstore.FlowTest do
     assert Enum.map(stuck, & &1.id) == [claimed_running.id]
   end
 
+  test "flow_info counts pending terminal records before LMDB writer flush" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+    Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 1_000_000)
+
+    ctx = FerricStore.Instance.get(:default)
+    partition = uid("tenant-info-pending")
+    type = uid("info-pending")
+    id = uid("flow-info-pending")
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      restore_env(:flow_lmdb_max_batch_ops, old_max_batch_ops)
+      Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+    end)
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: type,
+               partition_key: partition,
+               run_at_ms: 1,
+               now_ms: 1
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-info-pending",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 2,
+               partition_key: partition
+             )
+
+    assert {:ok, _completed} =
+             FerricStore.flow_complete(claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 3,
+               partition_key: partition
+             )
+
+    assert {:ok, info} = FerricStore.flow_info(type, partition_key: partition)
+    assert info.completed == 1
+  end
+
   test "partition_key scopes claim, complete, retry, get, and history" do
     partition = uid("tenant")
     id = uid("flow-partition")
@@ -1799,4 +1850,7 @@ defmodule Ferricstore.FlowTest do
     [ms, seq] = String.split(event_id, "-", parts: 2)
     {String.to_integer(ms), String.to_integer(seq)}
   end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end
