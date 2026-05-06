@@ -4872,7 +4872,7 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_index_put(state, next),
-         :ok <- flow_history_put(state, next, "completed", now_ms),
+         :ok <- flow_history_put_planned(state, record, next, "completed", now_ms),
          :ok <- flow_history_trim(state, next) do
       :ok
     end
@@ -5040,7 +5040,7 @@ defmodule Ferricstore.Raft.StateMachine do
            ),
          :ok <- flow_due_put(state, next),
          :ok <- flow_index_put(state, next),
-         :ok <- flow_history_put(state, next, "transitioned", now_ms),
+         :ok <- flow_history_put_planned(state, record, next, "transitioned", now_ms),
          :ok <- flow_history_trim(state, next) do
       :ok
     end
@@ -5166,7 +5166,7 @@ defmodule Ferricstore.Raft.StateMachine do
            ),
          :ok <- flow_due_put(state, next),
          :ok <- flow_index_put(state, next),
-         :ok <- flow_history_put(state, next, "retry", now_ms),
+         :ok <- flow_history_put_planned(state, record, next, "retry", now_ms),
          :ok <- flow_history_trim(state, next) do
       :ok
     end
@@ -5274,7 +5274,7 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_index_put(state, next),
-         :ok <- flow_history_put(state, next, "failed", now_ms),
+         :ok <- flow_history_put_planned(state, record, next, "failed", now_ms),
          :ok <- flow_history_trim(state, next) do
       :ok
     end
@@ -5379,7 +5379,7 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_index_put(state, next),
-         :ok <- flow_history_put(state, next, "cancelled", now_ms),
+         :ok <- flow_history_put_planned(state, record, next, "cancelled", now_ms),
          :ok <- flow_history_trim(state, next) do
       :ok
     end
@@ -5449,7 +5449,7 @@ defmodule Ferricstore.Raft.StateMachine do
              ),
            :ok <- flow_due_put(state, next),
            :ok <- flow_index_put(state, next),
-           :ok <- flow_history_put(state, next, "rewound", now_ms),
+           :ok <- flow_history_put_planned(state, record, next, "rewound", now_ms),
            :ok <- flow_history_trim(state, next) do
         {:ok, Map.delete(next, :rewound_to_event_id)}
       end
@@ -5688,8 +5688,8 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_claim_put_history(state, plans, now_ms) do
-    Enum.each(plans, fn {_record, next} ->
-      flow_history_put_ready(state, next, "claimed", now_ms)
+    Enum.each(plans, fn {record, next} ->
+      flow_history_put_ready(state, next, "claimed", now_ms, flow_previous_history_ms(record))
       flow_history_trim(state, next)
     end)
 
@@ -5701,8 +5701,15 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_many_put_history(state, plans, event) do
-    Enum.each(plans, fn {_record, next} ->
-      flow_history_put_ready(state, next, event, Map.get(next, :updated_at_ms))
+    Enum.each(plans, fn {record, next} ->
+      flow_history_put_ready(
+        state,
+        next,
+        event,
+        Map.get(next, :updated_at_ms),
+        flow_previous_history_ms(record)
+      )
+
       flow_history_trim(state, next)
     end)
 
@@ -6697,10 +6704,26 @@ defmodule Ferricstore.Raft.StateMachine do
     flow_history_put_ready(state, record, event, now_ms)
   end
 
-  defp flow_history_put_ready(state, %{id: id, version: version} = record, event, now_ms) do
+  defp flow_history_put_planned(state, previous, record, event, now_ms) do
+    flow_history_put_ready(state, record, event, now_ms, flow_previous_history_ms(previous))
+  end
+
+  defp flow_history_put_ready(state, record, event, now_ms) do
+    flow_history_put_ready(state, record, event, now_ms, nil)
+  end
+
+  defp flow_history_put_ready(
+         state,
+         %{id: id, version: version} = record,
+         event,
+         now_ms,
+         previous_history_ms
+       ) do
     partition_key = Map.get(record, :partition_key)
     history_key = FlowKeys.history_key(id, partition_key)
-    {event_id, event_ms} = flow_history_next_event(state, history_key, now_ms, version)
+
+    {event_id, event_ms} =
+      flow_history_next_event(state, history_key, now_ms, version, previous_history_ms)
 
     compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
 
@@ -6710,11 +6733,17 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_history_next_event(_state, _history_key, now_ms, 1) do
+  defp flow_history_next_event(_state, _history_key, now_ms, 1, _previous_history_ms) do
     {Integer.to_string(trunc(now_ms)) <> "-1", trunc(now_ms)}
   end
 
-  defp flow_history_next_event(state, history_key, now_ms, version) do
+  defp flow_history_next_event(_state, _history_key, now_ms, version, previous_history_ms)
+       when is_integer(previous_history_ms) do
+    ms = max(trunc(now_ms), previous_history_ms)
+    {Integer.to_string(ms) <> "-" <> Integer.to_string(version), ms}
+  end
+
+  defp flow_history_next_event(state, history_key, now_ms, version, _previous_history_ms) do
     ms =
       case flow_index_rank_range(state, history_key, 0, 0, true) do
         [{_event_id, last_ms}] when is_number(last_ms) and last_ms > now_ms ->
@@ -6726,6 +6755,14 @@ defmodule Ferricstore.Raft.StateMachine do
 
     {Integer.to_string(trunc(ms)) <> "-" <> Integer.to_string(version), trunc(ms)}
   end
+
+  defp flow_previous_history_ms(%{updated_at_ms: updated_at_ms}) when is_integer(updated_at_ms),
+    do: updated_at_ms
+
+  defp flow_previous_history_ms(%{created_at_ms: created_at_ms}) when is_integer(created_at_ms),
+    do: created_at_ms
+
+  defp flow_previous_history_ms(_record), do: nil
 
   defp flow_history_index_put(state, history_key, event_id, ms, 1) do
     flow_index_put_new_members(state, history_key, [{event_id, ms}])

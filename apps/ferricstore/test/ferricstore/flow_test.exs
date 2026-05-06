@@ -2796,6 +2796,36 @@ defmodule Ferricstore.FlowTest do
     assert [] = :ets.lookup(Ferricstore.Stream.Meta, history_key)
   end
 
+  test "flow_history event ids stay monotonic when claim time is behind record time" do
+    id = uid("flow-history-monotonic")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: "audit-monotonic",
+               state: "queued",
+               run_at_ms: 1_000,
+               now_ms: 10_000
+             )
+
+    assert {:ok, [_claimed]} =
+             FerricStore.flow_claim_due("audit-monotonic",
+               state: "queued",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 2_000
+             )
+
+    assert {:ok, events} = FerricStore.flow_history(id, count: 10)
+
+    assert Enum.map(events, fn {event_id, _fields} -> event_id end) == ["10000-1", "10000-2"]
+
+    assert Enum.map(events, fn {_event_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed"
+           ]
+  end
+
   test "flow_history falls back to bounded history key scan when Flow index is unavailable" do
     ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
 
