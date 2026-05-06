@@ -6384,6 +6384,10 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flow_history_next_event(_state, _history_key, now_ms, 1) do
+    {Integer.to_string(trunc(now_ms)) <> "-1", trunc(now_ms)}
+  end
+
   defp flow_history_next_event(state, history_key, now_ms, version) do
     ms =
       case flow_index_rank_range(state, history_key, 0, 0, true) do
