@@ -57,9 +57,7 @@ defmodule Ferricstore.Commands.Geo do
   def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
 
   def handle_ast({:geoadd, key, flags, pairs}, store) do
-    with {:ok, zset} <- read_zset(store, key) do
-      do_geoadd(store, key, zset, pairs, flags)
-    end
+    do_geoadd(store, key, pairs, flags)
   end
 
   def handle_ast({:geopos, args}, store), do: geopos_args(args, store)
@@ -136,9 +134,8 @@ defmodule Ferricstore.Commands.Geo do
 
   def handle("GEOADD", [key | rest], store) when rest != [] do
     with {:ok, flags, coord_args} <- parse_geoadd_flags(rest),
-         {:ok, pairs} <- parse_lng_lat_members(coord_args),
-         {:ok, zset} <- read_zset(store, key) do
-      do_geoadd(store, key, zset, pairs, flags)
+         {:ok, pairs} <- parse_lng_lat_members(coord_args) do
+      do_geoadd(store, key, pairs, flags)
     end
   end
 
@@ -517,47 +514,106 @@ defmodule Ferricstore.Commands.Geo do
 
   defp rollback_new_zset_type_marker(_key, _store, :ok, write_error), do: write_error
 
-  defp zset_to_member_map(zset) do
-    Map.new(zset, fn {score, member} -> {member, score} end)
-  end
-
   # ===========================================================================
   # Private -- GEOADD implementation
   # ===========================================================================
 
-  defp do_geoadd(store, key, zset, pairs, flags) do
-    old_map = zset_to_member_map(zset)
+  defp do_geoadd(store, key, pairs, flags) do
+    members = unique_geoadd_members(pairs)
 
-    {added, changed, new_map} =
-      Enum.reduce(pairs, {0, 0, old_map}, fn {lng, lat, member}, {add_acc, ch_acc, map_acc} ->
-        score = geohash_encode(lng, lat)
+    with {:ok, type_status, scores} <- read_geoadd_existing_scores(store, key, members) do
+      old_map =
+        members
+        |> Enum.zip(scores)
+        |> Map.new()
 
-        case Map.get(map_acc, member) do
-          nil ->
-            if :xx in flags do
-              {add_acc, ch_acc, map_acc}
-            else
-              {add_acc + 1, ch_acc, Map.put(map_acc, member, score)}
-            end
+      {added, changed, new_map} =
+        Enum.reduce(pairs, {0, 0, old_map}, fn {lng, lat, member}, {add_acc, ch_acc, map_acc} ->
+          score = geohash_encode(lng, lat)
 
-          old_score ->
-            if :nx in flags do
-              {add_acc, ch_acc, map_acc}
-            else
-              ch = if score != old_score, do: 1, else: 0
-              {add_acc, ch_acc + ch, Map.put(map_acc, member, score)}
-            end
-        end
-      end)
+          case Map.get(map_acc, member) do
+            nil ->
+              if :xx in flags do
+                {add_acc, ch_acc, map_acc}
+              else
+                {add_acc + 1, ch_acc, Map.put(map_acc, member, score)}
+              end
 
-    new_zset =
-      new_map
-      |> Enum.map(fn {member, score} -> {score, member} end)
-      |> Enum.sort()
+            old_score ->
+              if :nx in flags do
+                {add_acc, ch_acc, map_acc}
+              else
+                ch = if score != old_score, do: 1, else: 0
+                {add_acc, ch_acc + ch, Map.put(map_acc, member, score)}
+              end
+          end
+        end)
 
-    case write_zset(store, key, new_zset) do
-      :ok -> if :ch in flags, do: added + changed, else: added
-      {:error, _} = err -> err
+      write_entries =
+        members
+        |> Enum.flat_map(fn member ->
+          old_score = Map.get(old_map, member)
+          new_score = Map.get(new_map, member)
+
+          if new_score != nil and new_score != old_score do
+            [{CompoundKey.zset_member(key, member), Float.to_string(new_score), 0}]
+          else
+            []
+          end
+        end)
+
+      case write_geoadd_entries(store, key, write_entries, type_status) do
+        :ok -> if :ch in flags, do: added + changed, else: added
+        {:error, _} = err -> err
+      end
+    end
+  end
+
+  defp unique_geoadd_members(pairs) do
+    pairs
+    |> Enum.map(fn {_lng, _lat, member} -> member end)
+    |> Enum.uniq()
+  end
+
+  defp read_geoadd_existing_scores(store, key, members) do
+    type_key = CompoundKey.type_key(key)
+
+    case Ops.compound_get(store, key, type_key) do
+      "zset" ->
+        compound_keys = Enum.map(members, &CompoundKey.zset_member(key, &1))
+
+        scores =
+          store
+          |> Ops.compound_batch_get(key, compound_keys)
+          |> Enum.map(&parse_geo_score/1)
+
+        {:ok, :ok, scores}
+
+      nil ->
+        if Ops.exists?(store, key),
+          do: {:error, @wrongtype_msg},
+          else: {:ok, :missing, missing_scores(members)}
+
+      _other ->
+        {:error, @wrongtype_msg}
+    end
+  end
+
+  defp write_geoadd_entries(_store, _key, [], _type_status), do: :ok
+
+  defp write_geoadd_entries(store, key, entries, :ok) do
+    case Ops.compound_batch_put(store, key, entries) do
+      :ok -> :ok
+      {:error, _} = err -> rollback_new_zset_type_marker(key, store, :ok, err)
+    end
+  end
+
+  defp write_geoadd_entries(store, key, entries, :missing) do
+    with type_status when type_status in [:ok, {:ok, :created}] <- ensure_zset_type(store, key) do
+      case Ops.compound_batch_put(store, key, entries) do
+        :ok -> :ok
+        {:error, _} = err -> rollback_new_zset_type_marker(key, store, type_status, err)
+      end
     end
   end
 

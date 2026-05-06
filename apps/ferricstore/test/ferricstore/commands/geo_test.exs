@@ -168,6 +168,35 @@ defmodule Ferricstore.Commands.GeoTest do
       refute_received {:compound_batch_put, _}
     end
 
+    test "updates requested members without scanning or rewriting the whole zset" do
+      parent = self()
+      type_key = CompoundKey.type_key("mygeo")
+      palermo_key = CompoundKey.zset_member("mygeo", "Palermo")
+      old_score = @palermo_lng |> Geo.geohash_encode(@palermo_lat) |> Float.to_string()
+
+      store = %{
+        compound_get: fn "mygeo", ^type_key -> "zset" end,
+        compound_batch_get: fn "mygeo", [^palermo_key] ->
+          send(parent, {:compound_batch_get, [palermo_key]})
+          [old_score]
+        end,
+        compound_scan: fn "mygeo", _prefix ->
+          flunk("GEOADD should not scan every member when updating targeted members")
+        end,
+        compound_batch_delete: fn "mygeo", _compound_keys ->
+          flunk("GEOADD should not delete unrelated members")
+        end,
+        compound_batch_put: fn "mygeo", [{^palermo_key, new_score, 0}] ->
+          send(parent, {:compound_batch_put, new_score})
+          :ok
+        end
+      }
+
+      assert 0 == Geo.handle("GEOADD", ["mygeo", "13.5", "38.2", "Palermo"], store)
+      assert_received {:compound_batch_get, [^palermo_key]}
+      assert_received {:compound_batch_put, _new_score}
+    end
+
     test "rolls back new zset type metadata when member batch write fails" do
       parent = self()
       type_key = CompoundKey.type_key("mygeo")
