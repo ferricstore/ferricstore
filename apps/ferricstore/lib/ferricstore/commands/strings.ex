@@ -966,12 +966,36 @@ defmodule Ferricstore.Commands.Strings do
     end
   end
 
-  # Executes MSET by walking the flat [k, v, k, v, ...] list directly.
   defp mset_exec([], _store), do: :ok
 
-  defp mset_exec([k, v | rest], store) do
+  defp mset_exec(args, %FerricStore.Instance{} = store) do
+    Ops.batch_put(store, mset_pairs(args))
+  end
+
+  defp mset_exec(args, store) do
+    if mset_needs_compound_cleanup?(args, store) do
+      mset_exec_sequential(args, store)
+    else
+      Ops.batch_put(store, mset_pairs(args))
+    end
+  end
+
+  defp mset_needs_compound_cleanup?([], _store), do: false
+
+  defp mset_needs_compound_cleanup?([k, _v | rest], store) do
+    compound_data_structure_key?(k, store) or mset_needs_compound_cleanup?(rest, store)
+  end
+
+  defp mset_pairs([]), do: []
+  defp mset_pairs([k, v | rest]), do: [{k, v} | mset_pairs(rest)]
+
+  # Fallback path preserves per-key compound cleanup for stores that cannot
+  # provide string-batch replacement semantics themselves.
+  defp mset_exec_sequential([], _store), do: :ok
+
+  defp mset_exec_sequential([k, v | rest], store) do
     case replace_string_key(k, v, 0, store) do
-      :ok -> mset_exec(rest, store)
+      :ok -> mset_exec_sequential(rest, store)
       {:error, _} = err -> err
     end
   end

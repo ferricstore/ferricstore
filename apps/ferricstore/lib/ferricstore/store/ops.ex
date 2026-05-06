@@ -60,6 +60,38 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
+  @spec batch_put(store(), [{binary(), binary()}]) :: :ok | {:error, term()}
+  def batch_put(_store, []), do: :ok
+
+  def batch_put(%FerricStore.Instance{} = ctx, kv_pairs),
+    do: Router.batch_put(ctx, kv_pairs)
+
+  def batch_put(%LocalTxStore{} = tx, kv_pairs) do
+    Enum.reduce_while(kv_pairs, :ok, fn {key, value}, :ok ->
+      case put(tx, key, value, 0) do
+        :ok -> {:cont, :ok}
+        {:error, _} = err -> {:halt, err}
+        other -> {:halt, {:error, inspect(other)}}
+      end
+    end)
+  end
+
+  def batch_put(store, kv_pairs) when is_map(store) do
+    case store do
+      %{batch_put: batch_put_fun} when is_function(batch_put_fun, 1) ->
+        batch_put_fun.(kv_pairs)
+
+      _ ->
+        Enum.reduce_while(kv_pairs, :ok, fn {key, value}, :ok ->
+          case put(store, key, value, 0) do
+            :ok -> {:cont, :ok}
+            {:error, _} = err -> {:halt, err}
+            other -> {:halt, {:error, inspect(other)}}
+          end
+        end)
+    end
+  end
+
   @spec get_meta(store(), binary()) :: {binary(), non_neg_integer()} | nil
   def get_meta(%FerricStore.Instance{} = ctx, key), do: Router.get_meta(ctx, key)
 

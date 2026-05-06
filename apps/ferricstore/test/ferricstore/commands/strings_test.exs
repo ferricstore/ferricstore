@@ -377,6 +377,55 @@ defmodule Ferricstore.Commands.StringsTest do
                Strings.handle("MSET", ["k1", "v1", "k2", "v2"], store)
     end
 
+    test "MSET uses batch_put when the store provides it" do
+      parent = self()
+
+      store = %{
+        batch_put: fn kv_pairs ->
+          send(parent, {:batch_put, kv_pairs})
+          :ok
+        end,
+        put: fn key, _value, _expire_at_ms ->
+          flunk("MSET should use batch_put, got per-key PUT for #{inspect(key)}")
+        end,
+        compound_get: fn _redis_key, _compound_key -> nil end
+      }
+
+      assert :ok == Strings.handle("MSET", ["k1", "v1", "k2", "v2"], store)
+      assert_received {:batch_put, [{"k1", "v1"}, {"k2", "v2"}]}
+    end
+
+    test "MSET propagates batch_put errors without per-key fallback" do
+      store = %{
+        batch_put: fn [{"k1", "v1"}, {"k2", "v2"}] -> {:error, "ERR disk write failed"} end,
+        put: fn key, _value, _expire_at_ms ->
+          flunk("MSET should not retry per-key after batch_put failure for #{inspect(key)}")
+        end,
+        compound_get: fn _redis_key, _compound_key -> nil end
+      }
+
+      assert {:error, "ERR disk write failed"} ==
+               Strings.handle("MSET", ["k1", "v1", "k2", "v2"], store)
+    end
+
+    test "MSET falls back to cleanup path when replacing compound data" do
+      base = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["k1", "field", "value"], base)
+
+      store =
+        base
+        |> Map.put(:batch_put, fn kv_pairs ->
+          flunk("MSET must not use blind batch_put for compound cleanup: #{inspect(kv_pairs)}")
+        end)
+        |> Map.put(:compound_delete_prefix, fn "k1", _prefix -> {:error, :disk_full} end)
+        |> Map.put(:put, fn "k1", _value, _expire_at_ms ->
+          flunk("MSET should not write string when compound cleanup fails")
+        end)
+
+      assert {:error, :disk_full} == Strings.handle("MSET", ["k1", "v1"], store)
+      assert "value" == Hash.handle("HGET", ["k1", "field"], base)
+    end
+
     test "MSET with single pair stores the pair" do
       store = MockStore.make()
       assert :ok = Strings.handle("MSET", ["k", "v"], store)
