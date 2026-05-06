@@ -344,32 +344,29 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with :ok <- validate_opts(opts),
-           :ok <- validate_id(id),
-           {:ok, lease_token} <- optional_lease_token(opts),
-           {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
-           {:ok, partition_key} <- optional_partition_key(opts),
-           :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-           {:ok, now} <- optional_now_ms(opts),
-           {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-           {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
-           :ok <- validate_ref_size(:reason_ref, reason_ref) do
-        attrs =
-          %{
-            id: id,
-            lease_token: lease_token,
-            fencing_token: fencing_token,
-            ttl_ms: ttl_ms,
-            reason_ref: reason_ref,
-            partition_key: partition_key
-          }
-          |> maybe_put_attr(:now_ms, now)
-
+      with {:ok, attrs} <- cancel_attrs(id, opts) do
         Router.flow_cancel(ctx, attrs)
       end
 
     observe_flow(:cancel, started, result, %{flow_id: id})
   end
+
+  def cancel_many(ctx, partition_key, items, opts) when is_list(items) and is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
+           :ok <- validate_cancel_many_items(items),
+           {:ok, attrs_list} <- cancel_many_attrs(items, opts, partition_key),
+           :ok <- validate_unique_transition_ids(attrs_list) do
+        Router.flow_cancel_many(ctx, partition_key, attrs_list)
+      end
+
+    observe_flow(:cancel, started, result, %{flow_id: nil})
+  end
+
+  def cancel_many(_ctx, _partition_key, _items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
 
   def rewind(ctx, id, opts) when is_binary(id) and is_list(opts) do
     started = flow_start_time()
@@ -2071,6 +2068,32 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp cancel_attrs(id, opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         {:ok, lease_token} <- optional_lease_token(opts),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+         {:ok, now} <- optional_now_ms(opts),
+         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
+         {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
+         :ok <- validate_ref_size(:reason_ref, reason_ref) do
+      attrs =
+        %{
+          id: id,
+          lease_token: lease_token,
+          fencing_token: fencing_token,
+          ttl_ms: ttl_ms,
+          reason_ref: reason_ref,
+          partition_key: partition_key
+        }
+        |> maybe_put_attr(:now_ms, now)
+
+      {:ok, attrs}
+    end
+  end
+
   defp fail_many_attrs(items, opts, partition_key) do
     base_opts = Keyword.delete(opts, :partition_key)
 
@@ -2083,6 +2106,25 @@ defmodule Ferricstore.Flow do
                lease_token,
                merge_many_item_opts(base_opts, item_opts, item_partition_key)
              ) do
+        {:cont, {:ok, [attrs | acc]}}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, attrs_list} -> {:ok, Enum.reverse(attrs_list)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp cancel_many_attrs(items, opts, partition_key) do
+    base_opts = Keyword.delete(opts, :partition_key)
+
+    Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
+      with {:ok, id, item_opts} <- cancel_many_item_opts(item),
+           {:ok, item_partition_key} <- many_item_partition_key(partition_key, item_opts),
+           {:ok, attrs} <-
+             cancel_attrs(id, merge_many_item_opts(base_opts, item_opts, item_partition_key)) do
         {:cont, {:ok, [attrs | acc]}}
       else
         {:error, _reason} = error -> {:halt, error}
@@ -2284,6 +2326,43 @@ defmodule Ferricstore.Flow do
 
   defp fail_many_item_opts(_item), do: {:error, "ERR flow id must be a non-empty string"}
 
+  defp cancel_many_item_opts(%{id: id, fencing_token: fencing_token} = item)
+       when is_binary(id) do
+    {:ok, id,
+     [fencing_token: fencing_token] ++
+       cancel_many_item_lease_token(item) ++
+       cancel_many_item_reason_ref(item) ++ cancel_many_item_partition_key(item)}
+  end
+
+  defp cancel_many_item_opts(%{"id" => id, "fencing_token" => fencing_token} = item)
+       when is_binary(id) do
+    {:ok, id,
+     [fencing_token: fencing_token] ++
+       cancel_many_item_lease_token(item) ++
+       cancel_many_item_reason_ref(item) ++ cancel_many_item_partition_key(item)}
+  end
+
+  defp cancel_many_item_opts({id, item_opts}) when is_binary(id) and is_list(item_opts) do
+    if Keyword.keyword?(item_opts) do
+      {:ok, id, item_opts}
+    else
+      {:error, "ERR flow opts must be a keyword list"}
+    end
+  end
+
+  defp cancel_many_item_opts({:id, id, :fencing_token, fencing_token}) when is_binary(id) do
+    {:ok, id, [fencing_token: fencing_token]}
+  end
+
+  defp cancel_many_item_opts(
+         {:id, id, :partition_key, partition_key, :fencing_token, fencing_token}
+       )
+       when is_binary(id) do
+    {:ok, id, [partition_key: partition_key, fencing_token: fencing_token]}
+  end
+
+  defp cancel_many_item_opts(_item), do: {:error, "ERR flow id must be a non-empty string"}
+
   defp transition_many_attrs(items, opts, partition_key, from_state, to_state) do
     base_opts = Keyword.delete(opts, :partition_key)
 
@@ -2414,6 +2493,24 @@ defmodule Ferricstore.Flow do
     |> maybe_put_item_opt(:partition_key, item, :partition_key, "partition_key")
   end
 
+  defp cancel_many_item_lease_token(item) do
+    cond do
+      Map.has_key?(item, :lease_token) -> [lease_token: Map.get(item, :lease_token)]
+      Map.has_key?(item, "lease_token") -> [lease_token: Map.get(item, "lease_token")]
+      true -> []
+    end
+  end
+
+  defp cancel_many_item_reason_ref(item) do
+    []
+    |> maybe_put_item_opt(:reason_ref, item, :reason_ref, "reason_ref")
+  end
+
+  defp cancel_many_item_partition_key(item) do
+    []
+    |> maybe_put_item_opt(:partition_key, item, :partition_key, "partition_key")
+  end
+
   defp maybe_put_item_opt(opts, opt_key, item, atom_key, string_key) do
     cond do
       Map.has_key?(item, atom_key) -> Keyword.put(opts, opt_key, Map.get(item, atom_key))
@@ -2463,6 +2560,11 @@ defmodule Ferricstore.Flow do
   defp validate_fail_many_items([_ | _] = items), do: validate_many_item_count(items)
 
   defp validate_fail_many_items(_items),
+    do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp validate_cancel_many_items([_ | _] = items), do: validate_many_item_count(items)
+
+  defp validate_cancel_many_items(_items),
     do: {:error, "ERR flow items must be a non-empty list"}
 
   defp validate_many_item_count(items) do

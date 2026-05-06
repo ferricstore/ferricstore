@@ -474,6 +474,54 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches Flow cancel_many through Rust AST" do
+    partition = uid("flow-command-cancel-many-tenant")
+    type = uid("flow-command-cancel-many")
+    id_a = uid("flow-command-cancel-many-a")
+    id_b = uid("flow-command-cancel-many-b")
+
+    assert [_a, _b] =
+             Dispatcher.dispatch(
+               "FLOW.CREATE_MANY",
+               [
+                 partition,
+                 "TYPE",
+                 type,
+                 "RUN_AT",
+                 "1000",
+                 "NOW",
+                 "1000",
+                 "ITEMS",
+                 id_a,
+                 "payload:" <> id_a,
+                 id_b,
+                 "payload:" <> id_b
+               ],
+               MockStore.make()
+             )
+
+    assert [
+             %{"id" => ^id_a, "state" => "cancelled", "error_ref" => "cancel:batch"},
+             %{"id" => ^id_b, "state" => "cancelled", "error_ref" => "cancel:batch"}
+           ] =
+             Dispatcher.dispatch(
+               "FLOW.CANCEL_MANY",
+               [
+                 partition,
+                 "REASON_REF",
+                 "cancel:batch",
+                 "NOW",
+                 "2000",
+                 "ITEMS",
+                 id_a,
+                 "0",
+                 id_b,
+                 "0"
+               ],
+               MockStore.make()
+             )
+  end
+
   test "dispatches Flow rewind through Rust AST" do
     id = uid("flow-command-rewind")
 

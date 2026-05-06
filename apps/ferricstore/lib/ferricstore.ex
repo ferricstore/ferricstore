@@ -607,6 +607,24 @@ defmodule FerricStore do
 
   def flow_cancel(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc """
+  Cancels a batch of Flow records.
+
+  When `partition_key` is set, the batch is all-or-nothing because every item
+  routes to the same shard. When `partition_key` is `nil`, each item must carry
+  `:partition_key`; items are grouped by shard and each shard group is atomic.
+  Each item must provide `:id` and `:fencing_token`; `:lease_token` is optional.
+  """
+  @spec flow_cancel_many(binary() | nil, list(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_cancel_many(partition_key, items, opts \\ [])
+
+  def flow_cancel_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.cancel_many(default_ctx(), partition_key, items, opts)
+  end
+
+  def flow_cancel_many(_partition_key, _items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Rewinds a Flow record to a previous history event without rewriting history."
   @spec flow_rewind(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_rewind(id, opts) when is_binary(id) and is_list(opts) do

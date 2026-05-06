@@ -2177,6 +2177,71 @@ defmodule Ferricstore.FlowTest do
     assert fetched_b.version == 2
   end
 
+  test "flow_cancel_many atomically cancels one-partition queued batch" do
+    partition = uid("tenant-cancel-many")
+    type = uid("bulk-cancel-many")
+    id_a = uid("cancel-many-a")
+    id_b = uid("cancel-many-b")
+
+    assert {:ok, _} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: id_a}, %{id: id_b}],
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000
+             )
+
+    items = [
+      %{id: id_a, fencing_token: 0},
+      %{id: id_b, fencing_token: 0}
+    ]
+
+    assert {:ok, cancelled} =
+             FerricStore.flow_cancel_many(partition, items,
+               reason_ref: "cancel-batch",
+               now_ms: 2_000
+             )
+
+    assert Enum.map(cancelled, & &1.id) == [id_a, id_b]
+    assert Enum.all?(cancelled, &(&1.state == "cancelled"))
+    assert Enum.all?(cancelled, &(&1.error_ref == "cancel-batch"))
+
+    assert {:ok, info} = FerricStore.flow_info(type, partition_key: partition)
+    assert info.cancelled == 2
+  end
+
+  test "flow_cancel_many rolls back when any item fails guard" do
+    partition = uid("tenant-cancel-many-rollback")
+    type = uid("bulk-cancel-many-rollback")
+    id_a = uid("cancel-many-good")
+    id_b = uid("cancel-many-bad")
+
+    assert {:ok, _} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: id_a}, %{id: id_b}],
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000
+             )
+
+    items = [
+      %{id: id_a, fencing_token: 0},
+      %{id: id_b, fencing_token: 1}
+    ]
+
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_cancel_many(partition, items, now_ms: 2_000)
+
+    assert {:ok, fetched_a} = FerricStore.flow_get(id_a, partition_key: partition)
+    assert {:ok, fetched_b} = FerricStore.flow_get(id_b, partition_key: partition)
+    assert fetched_a.state == "queued"
+    assert fetched_b.state == "queued"
+    assert fetched_a.version == 1
+    assert fetched_b.version == 1
+  end
+
   test "flow_transition enforces expected state and running lease guard" do
     id = uid("flow-transition-guard")
 

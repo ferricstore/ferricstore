@@ -403,6 +403,15 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Fails leased workflow records, atomic per partition/shard group."
     },
     %{
+      name: "flow.cancel_many",
+      arity: -6,
+      flags: ["write"],
+      first_key: 1,
+      last_key: 1,
+      step: 1,
+      summary: "Cancels workflow records, atomic per partition/shard group."
+    },
+    %{
       name: "flow.transition",
       arity: -6,
       flags: ["write"],

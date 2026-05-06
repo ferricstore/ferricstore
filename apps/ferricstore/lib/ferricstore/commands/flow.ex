@@ -55,6 +55,12 @@ defmodule Ferricstore.Commands.Flow do
     FerricStore.flow_fail_many(partition_key, items, opts) |> normalize_result()
   end
 
+  def handle_ast({:flow_cancel_many, partition_key, items, opts}, _store)
+      when (is_binary(partition_key) or is_nil(partition_key)) and is_list(items) and
+             is_list(opts) do
+    FerricStore.flow_cancel_many(partition_key, items, opts) |> normalize_result()
+  end
+
   def handle_ast({:flow_transition, id, from_state, to_state, opts}, _store)
       when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts) do
     FerricStore.flow_transition(id, from_state, to_state, opts) |> normalize_result()
