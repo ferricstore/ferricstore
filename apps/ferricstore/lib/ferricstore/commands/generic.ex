@@ -515,10 +515,7 @@ defmodule Ferricstore.Commands.Generic do
 
             entry ->
               if source != destination do
-                with :ok <- delete_key_result(destination, store),
-                     :ok <- copy_entry(source, destination, entry, store) do
-                  1
-                end
+                copy_entry_for_copy(source, destination, entry, replace?, store)
               else
                 1
               end
@@ -569,6 +566,34 @@ defmodule Ferricstore.Commands.Generic do
          :ok <- delete_key_result(source, store) do
       :ok
     end
+  end
+
+  defp copy_entry_for_copy(_source, destination, {:plain, value, expire_at_ms}, true, store) do
+    with :ok <- clear_compound_destination_if_present(destination, store),
+         :ok <- Ops.put(store, destination, value, expire_at_ms) do
+      1
+    end
+  end
+
+  defp copy_entry_for_copy(source, destination, entry, _replace?, store) do
+    with :ok <- delete_key_result(destination, store),
+         :ok <- copy_entry(source, destination, entry, store) do
+      1
+    end
+  end
+
+  defp clear_compound_destination_if_present(destination, store) do
+    if compound_destination_exists?(destination, store) do
+      delete_key_result(destination, store)
+    else
+      :ok
+    end
+  end
+
+  defp compound_destination_exists?(destination, store) do
+    Ops.has_compound?(store) and
+      (Ops.compound_get(store, destination, CompoundKey.type_key(destination)) != nil or
+         Ops.compound_get(store, destination, CompoundKey.list_meta_key(destination)) != nil)
   end
 
   defp copy_entry(_source, destination, {:plain, value, expire_at_ms}, store) do

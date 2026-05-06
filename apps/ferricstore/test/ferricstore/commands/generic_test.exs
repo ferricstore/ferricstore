@@ -332,7 +332,25 @@ defmodule Ferricstore.Commands.GenericTest do
       assert "v1" == store.get.("dst")
     end
 
-    test "COPY with REPLACE deletes destination without loading destination value" do
+    test "COPY with REPLACE preserves plain destination when plain write fails" do
+      base = MockStore.make(%{"src" => {"v1", 0}, "dst" => {"v2", 0}})
+
+      store =
+        base
+        |> Map.put(:delete, fn "dst" ->
+          flunk("COPY REPLACE should not delete a plain destination before a plain overwrite")
+        end)
+        |> Map.put(:put, fn
+          "dst", "v1", 0 -> {:error, :disk_full}
+          key, value, expire_at_ms -> base.put.(key, value, expire_at_ms)
+        end)
+
+      assert {:error, :disk_full} == Generic.handle("COPY", ["src", "dst", "REPLACE"], store)
+      assert "v1" == base.get.("src")
+      assert "v2" == base.get.("dst")
+    end
+
+    test "COPY with REPLACE overwrites plain destination without loading destination value" do
       {:ok, deleted} = Agent.start_link(fn -> false end)
       {:ok, put_value} = Agent.start_link(fn -> nil end)
 
@@ -360,7 +378,7 @@ defmodule Ferricstore.Commands.GenericTest do
       }
 
       assert 1 == Generic.handle("COPY", ["src", "dst", "REPLACE"], store)
-      assert Agent.get(deleted, & &1)
+      refute Agent.get(deleted, & &1)
       assert "value" == Agent.get(put_value, & &1)
     end
 
