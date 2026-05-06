@@ -55,11 +55,15 @@ defmodule Ferricstore.Commands.StreamTest do
 
     test "XADD returns entry write errors before updating metadata" do
       key = ustream()
+      base = MockStore.make()
 
       store =
-        MockStore.make()
-        |> Map.put(:compound_put, fn ^key, "X:" <> _rest, _encoded, 0 ->
-          {:error, :disk_full}
+        Map.put(base, :compound_put, fn
+          ^key, "X:" <> _rest, _encoded, 0 ->
+            {:error, :disk_full}
+
+          redis_key, compound_key, value, expire_at_ms ->
+            base.compound_put.(redis_key, compound_key, value, expire_at_ms)
         end)
 
       assert {:error, :disk_full} = Stream.handle("XADD", [key, "1-0", "f", "v"], store)

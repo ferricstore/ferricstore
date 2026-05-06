@@ -35,14 +35,14 @@ defmodule Ferricstore.Store.CompoundKey do
   ## Type Metadata
 
   A type index entry `T:keyname` stores the type as a simple string value
-  (`"hash"`, `"list"`, `"set"`, `"zset"`). This is used by the TYPE command
+  (`"hash"`, `"list"`, `"set"`, `"zset"`, `"stream"`). This is used by the TYPE command
   and for WRONGTYPE enforcement -- attempting to use hash commands on a set
   key returns an error.
   """
 
   @separator <<0>>
 
-  @type data_type :: :hash | :list | :set | :zset
+  @type data_type :: :hash | :list | :set | :zset | :stream
 
   # -------------------------------------------------------------------
   # Type metadata keys
@@ -74,6 +74,7 @@ defmodule Ferricstore.Store.CompoundKey do
   def encode_type(:list), do: "list"
   def encode_type(:set), do: "set"
   def encode_type(:zset), do: "zset"
+  def encode_type(:stream), do: "stream"
 
   @doc """
   Decodes a stored type string back to the data type atom.
@@ -89,6 +90,7 @@ defmodule Ferricstore.Store.CompoundKey do
   def decode_type("list"), do: :list
   def decode_type("set"), do: :set
   def decode_type("zset"), do: :zset
+  def decode_type("stream"), do: :stream
 
   # -------------------------------------------------------------------
   # Hash compound keys
@@ -321,6 +323,14 @@ defmodule Ferricstore.Store.CompoundKey do
     "Z:" <> redis_key <> @separator
   end
 
+  @doc """
+  Returns the scan prefix for all entries of a stream.
+  """
+  @spec stream_prefix(binary()) :: binary()
+  def stream_prefix(redis_key) do
+    "X:" <> redis_key <> @separator
+  end
+
   # -------------------------------------------------------------------
   # Extraction helpers
   # -------------------------------------------------------------------
@@ -362,6 +372,7 @@ defmodule Ferricstore.Store.CompoundKey do
   def internal_key?(<<"L:", _rest::binary>>), do: true
   def internal_key?(<<"S:", _rest::binary>>), do: true
   def internal_key?(<<"Z:", _rest::binary>>), do: true
+  def internal_key?(<<"X:", _rest::binary>>), do: true
   def internal_key?(<<"T:", _rest::binary>>), do: true
   def internal_key?(<<"V:", _rest::binary>>), do: true
   def internal_key?(<<"VM:", _rest::binary>>), do: true

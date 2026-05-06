@@ -1143,7 +1143,7 @@ defmodule Ferricstore.Commands.Strings do
               "list" -> CompoundKey.list_prefix(key)
               "set" -> CompoundKey.set_prefix(key)
               "zset" -> CompoundKey.zset_prefix(key)
-              "stream" -> stream_prefix(key)
+              "stream" -> CompoundKey.stream_prefix(key)
               _unknown -> nil
             end
 
@@ -1251,7 +1251,7 @@ defmodule Ferricstore.Commands.Strings do
   defp decode_prob_meta(_), do: nil
 
   defp maybe_delete_stream_key(key, store) do
-    prefix = stream_prefix(key)
+    prefix = CompoundKey.stream_prefix(key)
 
     if Ops.compound_scan(store, key, prefix) != [] or stream_metadata_exists?(key) do
       case Ops.compound_delete_prefix(store, key, prefix) do
@@ -1266,8 +1266,6 @@ defmodule Ferricstore.Commands.Strings do
       false
     end
   end
-
-  defp stream_prefix(key), do: "X:" <> key <> <<0>>
 
   defp stream_metadata_exists?(key) do
     table = Ferricstore.Stream.Meta

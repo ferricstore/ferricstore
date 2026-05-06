@@ -144,6 +144,9 @@ defmodule Ferricstore.Store.TypeRegistry do
   defp live_compound_type?(redis_key, "zset", store),
     do: Ops.compound_count(store, redis_key, CompoundKey.zset_prefix(redis_key)) > 0
 
+  defp live_compound_type?(redis_key, "stream", store),
+    do: Ops.compound_count(store, redis_key, CompoundKey.stream_prefix(redis_key)) > 0
+
   defp live_compound_type?(_redis_key, _type_str, _store), do: true
 
   @doc """

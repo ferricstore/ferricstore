@@ -704,6 +704,7 @@ defmodule Ferricstore.Commands.Generic do
   defp compound_prefix("list", key), do: CompoundKey.list_prefix(key)
   defp compound_prefix("set", key), do: CompoundKey.set_prefix(key)
   defp compound_prefix("zset", key), do: CompoundKey.zset_prefix(key)
+  defp compound_prefix("stream", key), do: CompoundKey.stream_prefix(key)
 
   # ---------------------------------------------------------------------------
   # Private -- SCAN option parsing and execution

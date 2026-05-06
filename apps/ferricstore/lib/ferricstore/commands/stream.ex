@@ -36,7 +36,9 @@ defmodule Ferricstore.Commands.Stream do
   # ---------------------------------------------------------------------------
 
   alias Ferricstore.CommandTime
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.TypeRegistry
 
   @typedoc "A parsed stream ID as `{milliseconds, sequence}`."
   @type stream_id :: {non_neg_integer(), non_neg_integer()}
@@ -332,9 +334,54 @@ defmodule Ferricstore.Commands.Stream do
     # when populated; followers and post-migration always count via prefix.
     ensure_meta_table()
 
-    case :ets.lookup(@meta_table, key) do
+    case stream_meta_entries(key, store) do
       [{^key, len, _first, _last, _ms, _seq}] -> len
       [] -> count_stream_entries(store, key)
+    end
+  end
+
+  defp stream_meta_entries(key, store) do
+    case :ets.lookup(@meta_table, key) do
+      [] -> rebuild_stream_meta_entries(key, store)
+      entries -> entries
+    end
+  end
+
+  defp xadd_meta_entries(key, store) do
+    case :ets.lookup(@meta_table, key) do
+      [] ->
+        if stream_type_marker?(key, store), do: rebuild_stream_meta_entries(key, store), else: []
+
+      entries ->
+        entries
+    end
+  end
+
+  defp stream_type_marker?(key, store) do
+    Ops.has_compound?(store) and
+      Ops.compound_get(store, key, CompoundKey.type_key(key)) == "stream"
+  end
+
+  defp rebuild_stream_meta_entries(key, store) do
+    if Ops.has_compound?(store) do
+      ids =
+        store
+        |> stream_ids_for(key)
+        |> Enum.sort_by(&parse_id!/1)
+
+      case ids do
+        [] ->
+          []
+
+        _ ->
+          first = List.first(ids)
+          last = List.last(ids)
+          {last_ms, last_seq} = parse_id!(last)
+          :ets.insert(@meta_table, {key, length(ids), first, last, last_ms, last_seq})
+          :ets.lookup(@meta_table, key)
+      end
+    else
+      []
     end
   end
 
@@ -503,55 +550,84 @@ defmodule Ferricstore.Commands.Stream do
 
   defp do_xadd(key, id_spec, fields, trim_opts, nomkstream, store) do
     ensure_meta_table()
+    meta_entries = xadd_meta_entries(key, store)
 
     # Check if stream exists when NOMKSTREAM is set
-    case :ets.lookup(@meta_table, key) do
+    case meta_entries do
       [] when nomkstream -> nil
       meta_entries -> do_xadd_insert(key, id_spec, fields, trim_opts, meta_entries, store)
     end
   end
 
   defp do_xadd_insert(key, id_spec, fields, trim_opts, meta_entries, store) do
-    {last_ms, last_seq} =
-      case meta_entries do
-        [{^key, _len, _first, _last, ms, seq}] -> {ms, seq}
-        [] -> {0, 0}
-      end
-
-    case resolve_id(id_spec, last_ms, last_seq) do
-      {:ok, {ms, seq}} ->
-        id_str = "#{ms}-#{seq}"
-        compound_key = stream_entry_key(key, id_str)
-
-        # Serialize field-value pairs as Erlang binary term.
-        encoded = :erlang.term_to_binary(fields)
-
-        with :ok <- put_stream_entry(store, key, compound_key, encoded) do
-          maybe_index_stream_put(store, key, id_str, compound_key, meta_entries)
-
-          # Update metadata.
-          {new_len, new_first} =
-            case meta_entries do
-              [{^key, len, first, _last, _ms, _seq}] ->
-                {len + 1, first}
-
-              [] ->
-                {1, id_str}
-            end
-
-          :ets.insert(@meta_table, {key, new_len, new_first, id_str, ms, seq})
-
-          # Apply trim if requested.
-          maybe_trim(key, trim_opts, store)
-
-          # Notify any XREAD BLOCK waiters watching this stream.
-          notify_stream_waiters(key)
-
-          id_str
+    with type_status when type_status in [:ok, {:ok, :created}, :no_marker] <-
+           stream_type_status(key, store) do
+      {last_ms, last_seq} =
+        case meta_entries do
+          [{^key, _len, _first, _last, ms, seq}] -> {ms, seq}
+          [] -> {0, 0}
         end
 
-      {:error, _} = err ->
-        err
+      case resolve_id(id_spec, last_ms, last_seq) do
+        {:ok, {ms, seq}} ->
+          id_str = "#{ms}-#{seq}"
+          compound_key = stream_entry_key(key, id_str)
+
+          # Serialize field-value pairs as Erlang binary term.
+          encoded = :erlang.term_to_binary(fields)
+
+          case put_stream_entry(store, key, compound_key, encoded) do
+            :ok ->
+              maybe_index_stream_put(store, key, id_str, compound_key, meta_entries)
+
+              # Update metadata.
+              {new_len, new_first} =
+                case meta_entries do
+                  [{^key, len, first, _last, _ms, _seq}] ->
+                    {len + 1, first}
+
+                  [] ->
+                    {1, id_str}
+                end
+
+              :ets.insert(@meta_table, {key, new_len, new_first, id_str, ms, seq})
+
+              # Apply trim if requested.
+              maybe_trim(key, trim_opts, store)
+
+              # Notify any XREAD BLOCK waiters watching this stream.
+              notify_stream_waiters(key)
+
+              id_str
+
+            {:error, _} = error ->
+              rollback_new_stream_type_marker(key, store, type_status, error)
+          end
+
+        {:error, _} = err ->
+          rollback_new_stream_type_marker(key, store, type_status, err)
+      end
+    end
+  end
+
+  defp rollback_new_stream_type_marker(key, store, {:ok, :created}, write_error) do
+    case TypeRegistry.delete_type(key, store) do
+      :ok ->
+        write_error
+
+      {:error, _} = rollback_error ->
+        {:error, {:stream_type_marker_rollback_failed, write_error, rollback_error}}
+    end
+  end
+
+  defp rollback_new_stream_type_marker(_key, _store, :ok, write_error), do: write_error
+  defp rollback_new_stream_type_marker(_key, _store, :no_marker, write_error), do: write_error
+
+  defp stream_type_status(key, store) do
+    if Ops.has_compound?(store) do
+      TypeRegistry.check_or_set_status(key, :stream, store)
+    else
+      :no_marker
     end
   end
 
@@ -627,7 +703,7 @@ defmodule Ferricstore.Commands.Stream do
         # Handle "$" -- resolve to current last ID of the stream.
         resolved_id =
           if id_str == "$" do
-            case :ets.lookup(@meta_table, key) do
+            case stream_meta_entries(key, store) do
               [{^key, _len, _first, last, _ms, _seq}] -> last
               [] -> "0-0"
             end
@@ -771,7 +847,7 @@ defmodule Ferricstore.Commands.Stream do
   defp apply_trim_maxlen_indexed(key, max_len, store) do
     ensure_stream_index(key, store)
 
-    case :ets.lookup(@meta_table, key) do
+    case stream_meta_entries(key, store) do
       [{^key, len, _first, last, ms, seq}] when len > max_len ->
         delete_count = len - max_len
 
@@ -798,7 +874,7 @@ defmodule Ferricstore.Commands.Stream do
   defp do_apply_trim_minid_indexed(key, min_id, store) do
     ensure_stream_index(key, store)
 
-    case :ets.lookup(@meta_table, key) do
+    case stream_meta_entries(key, store) do
       [{^key, len, _first, last, ms, seq}] ->
         to_remove =
           key
@@ -905,7 +981,7 @@ defmodule Ferricstore.Commands.Stream do
   defp do_xinfo_stream(key, store) do
     ensure_meta_table()
 
-    case :ets.lookup(@meta_table, key) do
+    case stream_meta_entries(key, store) do
       [] ->
         {:error, "ERR no such key"}
 
@@ -1278,7 +1354,7 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   defp stream_entry_prefix(stream_key) do
-    "X:#{stream_key}" <> @sep
+    CompoundKey.stream_prefix(stream_key)
   end
 
   defp maybe_index_stream_put(store, stream_key, id_str, compound_key, meta_entries) do

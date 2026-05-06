@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.GenericTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Generic, Hash}
+  alias Ferricstore.Commands.{Generic, Hash, Stream}
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.LFU
   alias Ferricstore.Test.MockStore
@@ -171,6 +171,24 @@ defmodule Ferricstore.Commands.GenericTest do
       store = metadata_only_key_store(%{"cold" => 0})
 
       assert :ok = Generic.handle("RENAME", ["cold", "cold"], store)
+    end
+
+    test "RENAME preserves stream metadata for ID monotonicity" do
+      Stream.ensure_meta_table()
+      store = MockStore.make()
+      source = "stream_src_#{System.unique_integer([:positive])}"
+      destination = "stream_dst_#{System.unique_integer([:positive])}"
+
+      assert "5-0" == Stream.handle("XADD", [source, "5-0", "f", "v"], store)
+      assert :ok = Generic.handle("RENAME", [source, destination], store)
+
+      assert {:error, msg} = Stream.handle("XADD", [destination, "4-0", "f", "stale"], store)
+      assert msg =~ "equal or smaller"
+
+      assert "6-0" == Stream.handle("XADD", [destination, "6-0", "f", "new"], store)
+
+      assert [["5-0", "f", "v"], ["6-0", "f", "new"]] ==
+               Stream.handle("XRANGE", [destination, "-", "+"], store)
     end
 
     test "RENAME with no args returns error" do
