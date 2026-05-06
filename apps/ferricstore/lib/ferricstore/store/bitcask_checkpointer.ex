@@ -48,7 +48,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
     * `:checkpoint_idle_ms` (default 250ms) — if writes are still moving
       when a tick fires, defer the active-file fsync until the shard has
       been idle for this long.
-    * `:checkpoint_max_delay_ms` (default 60_000ms) — force fsync after
+    * `:checkpoint_max_delay_ms` (default 180_000ms) — force fsync after
       this much dirty time even under continuous writes, bounding replay.
   """
   use GenServer
@@ -61,7 +61,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
 
   @default_interval_ms 10_000
   @default_idle_ms 250
-  @default_max_delay_ms 60_000
+  @default_max_delay_ms 180_000
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do

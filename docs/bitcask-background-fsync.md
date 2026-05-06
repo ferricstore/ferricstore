@@ -542,10 +542,14 @@ recovery time.
 ```elixir
 config :ferricstore,
   checkpoint_interval_ms: 10_000   # default 10s
-  # Set to 0 to disable the checkpointer and fall back to per-apply
-  # fsync in the state machine (legacy behavior). Useful during the
-  # initial rollout; default in future releases stays at 60_000.
+  checkpoint_idle_ms: 250          # wait for a short idle gap before fsync
+  checkpoint_max_delay_ms: 180_000 # force fsync after about 3 minutes
 ```
+
+`checkpoint_max_delay_ms` bounds kernel-panic replay work. Ra WAL remains
+the acknowledged durability boundary; Bitcask fsync is a replay-time
+checkpoint. Keeping the forced checkpoint window near 3 minutes avoids
+injecting periodic active-file fsync stalls into continuous hot write paths.
 
 Note: the **call-site fsync coverage** (rotation handoff, dir fsyncs,
 prob-file fixes) is NOT gated on this flag. Those fixes are pure
@@ -626,12 +630,12 @@ explicitly rather than relying on kernel-side behavior.
 
 ## Migration / rollout
 
-1. Land the checkpointer code behind `bitcask_checkpoint_interval_ms: 0`
-   (default preserves existing per-apply fsync behavior).
-2. Enable in dev/staging with `60_000`. Observe telemetry.
+1. Land the checkpointer with `checkpoint_max_delay_ms` high enough that hot
+   paths normally fsync on idle gaps, not during continuous writes.
+2. Enable in dev/staging with `180_000`. Observe telemetry.
 3. Benchmark production-like workloads.
-4. Flip the default to `60_000` for production once verified.
-5. Post-rollout: lower to 30s or 10s if recovery time targets allow
+4. Keep the default at `180_000` for production once verified.
+5. Post-rollout: lower to 60s, 30s, or 10s if recovery time targets require it
    (shorter interval → shorter replay window).
 
 The **call-site fsync fixes** (rotation handoff, dir fsyncs, prob-file
