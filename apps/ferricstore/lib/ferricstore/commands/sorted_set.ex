@@ -44,7 +44,8 @@ defmodule Ferricstore.Commands.SortedSet do
 
   def handle("ZADD", [key | rest], store) when rest != [] do
     with {:ok, opts, score_member_pairs} <- parse_zadd_opts(rest),
-         :ok <- TypeRegistry.check_or_set(key, :zset, store) do
+         type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :zset, store) do
       unique_members =
         score_member_pairs |> Enum.map(fn {_score, member} -> member end) |> Enum.uniq()
 
@@ -110,7 +111,7 @@ defmodule Ferricstore.Commands.SortedSet do
 
       case Ops.compound_batch_put(store, key, write_entries) do
         :ok -> if opts.ch, do: added + changed, else: added
-        {:error, _} = err -> err
+        {:error, _} = err -> rollback_new_zset_type_marker(key, store, type_status, err)
       end
     end
   end
@@ -196,53 +197,10 @@ defmodule Ferricstore.Commands.SortedSet do
   # ---------------------------------------------------------------------------
 
   def handle("ZINCRBY", [key, increment_str, member], store) do
-    with :ok <- TypeRegistry.check_or_set(key, :zset, store) do
-      case Float.parse(increment_str) do
-        {increment, ""} ->
-          compound_key = CompoundKey.zset_member(key, member)
-          existing = Ops.compound_get(store, key, compound_key)
-
-          current_score =
-            case existing do
-              nil ->
-                0.0
-
-              score_str ->
-                case Float.parse(score_str) do
-                  {score, ""} -> score
-                  _ -> 0.0
-                end
-            end
-
-          new_score = current_score + increment
-          write_zscore(store, key, compound_key, new_score)
-
-        :error ->
-          # Try integer parse
-          case Integer.parse(increment_str) do
-            {increment, ""} ->
-              compound_key = CompoundKey.zset_member(key, member)
-              existing = Ops.compound_get(store, key, compound_key)
-
-              current_score =
-                case existing do
-                  nil ->
-                    0.0
-
-                  score_str ->
-                    case Float.parse(score_str) do
-                      {score, ""} -> score
-                      _ -> 0.0
-                    end
-                end
-
-              new_score = current_score + increment * 1.0
-              write_zscore(store, key, compound_key, new_score)
-
-            _ ->
-              {:error, "ERR value is not a valid float"}
-          end
-      end
+    with {:ok, increment} <- parse_zincrby_increment(increment_str),
+         type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :zset, store) do
+      zincrby_member(key, increment, member, store, type_status)
     end
   end
 
@@ -766,7 +724,8 @@ defmodule Ferricstore.Commands.SortedSet do
       ch: :ch in opts
     }
 
-    with :ok <- TypeRegistry.check_or_set(key, :zset, store) do
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :zset, store) do
       unique_members =
         score_member_pairs |> Enum.map(fn {_score, member} -> member end) |> Enum.uniq()
 
@@ -830,38 +789,68 @@ defmodule Ferricstore.Commands.SortedSet do
 
       case Ops.compound_batch_put(store, key, write_entries) do
         :ok -> if opts.ch, do: added + changed, else: added
-        {:error, _} = err -> err
+        {:error, _} = err -> rollback_new_zset_type_marker(key, store, type_status, err)
       end
     end
   end
 
-  defp zincrby_parsed(key, increment, member, store) do
-    with :ok <- TypeRegistry.check_or_set(key, :zset, store) do
-      compound_key = CompoundKey.zset_member(key, member)
-      existing = Ops.compound_get(store, key, compound_key)
+  defp rollback_new_zset_type_marker(key, store, {:ok, :created}, write_error) do
+    case TypeRegistry.delete_type(key, store) do
+      :ok ->
+        write_error
 
-      current_score =
-        case existing do
-          nil ->
-            0.0
-
-          score_str ->
-            case Float.parse(score_str) do
-              {score, ""} -> score
-              _ -> 0.0
-            end
-        end
-
-      new_score = current_score + increment
-      write_zscore(store, key, compound_key, new_score)
+      {:error, _} = rollback_error ->
+        {:error, {:zset_type_marker_rollback_failed, write_error, rollback_error}}
     end
   end
 
-  defp write_zscore(store, key, compound_key, new_score) do
+  defp rollback_new_zset_type_marker(_key, _store, :ok, write_error), do: write_error
+
+  defp zincrby_parsed(key, increment, member, store) do
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :zset, store) do
+      zincrby_member(key, increment, member, store, type_status)
+    end
+  end
+
+  defp parse_zincrby_increment(increment_str) do
+    case Float.parse(increment_str) do
+      {increment, ""} ->
+        {:ok, increment}
+
+      :error ->
+        case Integer.parse(increment_str) do
+          {increment, ""} -> {:ok, increment * 1.0}
+          _ -> {:error, "ERR value is not a valid float"}
+        end
+    end
+  end
+
+  defp zincrby_member(key, increment, member, store, type_status) do
+    compound_key = CompoundKey.zset_member(key, member)
+    existing = Ops.compound_get(store, key, compound_key)
+
+    current_score =
+      case existing do
+        nil ->
+          0.0
+
+        score_str ->
+          case Float.parse(score_str) do
+            {score, ""} -> score
+            _ -> 0.0
+          end
+      end
+
+    new_score = current_score + increment
+    write_zscore(store, key, compound_key, new_score, type_status)
+  end
+
+  defp write_zscore(store, key, compound_key, new_score, type_status) do
     case Ops.compound_put(store, key, compound_key, Float.to_string(new_score), 0) do
       :ok -> format_score(new_score)
       true -> format_score(new_score)
-      {:error, _reason} = error -> error
+      {:error, _reason} = error -> rollback_new_zset_type_marker(key, store, type_status, error)
       other -> {:error, other}
     end
   end

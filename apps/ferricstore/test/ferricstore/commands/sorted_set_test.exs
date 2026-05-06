@@ -147,6 +147,59 @@ defmodule Ferricstore.Commands.SortedSetTest do
       assert Enum.all?(entries, fn {compound_key, _value, 0} -> is_binary(compound_key) end)
       refute_receive {:compound_batch_put, _, _}
     end
+
+    test "ZADD rolls back new type metadata when member write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("zs")
+      member_key = CompoundKey.zset_member("zs", "a")
+
+      store = %{
+        compound_get: fn
+          "zs", ^type_key -> nil
+          "zs", ^member_key -> nil
+        end,
+        compound_put: fn "zs", ^type_key, "zset", 0 ->
+          send(parent, :type_written)
+          :ok
+        end,
+        compound_batch_get: fn "zs", [^member_key] -> [nil] end,
+        compound_batch_put: fn "zs", [{^member_key, "1.0", 0}] ->
+          {:error, :disk_full}
+        end,
+        compound_delete: fn "zs", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, :disk_full} == SortedSet.handle("ZADD", ["zs", "1", "a"], store)
+      assert_received :type_written
+      assert_received :type_deleted
+    end
+
+    test "ZADD preserves existing type metadata when member write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("zs")
+      member_key = CompoundKey.zset_member("zs", "a")
+
+      store = %{
+        compound_get: fn
+          "zs", ^type_key -> "zset"
+          "zs", ^member_key -> nil
+        end,
+        compound_batch_get: fn "zs", [^member_key] -> [nil] end,
+        compound_batch_put: fn "zs", [{^member_key, "1.0", 0}] ->
+          {:error, :disk_full}
+        end,
+        compound_delete: fn "zs", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, :disk_full} == SortedSet.handle("ZADD", ["zs", "1", "a"], store)
+      refute_received :type_deleted
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -448,6 +501,24 @@ defmodule Ferricstore.Commands.SortedSetTest do
       assert {:error, _} = SortedSet.handle("ZINCRBY", ["zs", "abc", "a"], store)
     end
 
+    test "ZINCRBY with invalid increment does not create type metadata" do
+      parent = self()
+      type_key = CompoundKey.type_key("zs")
+
+      store = %{
+        compound_get: fn "zs", ^type_key -> nil end,
+        compound_put: fn "zs", ^type_key, "zset", 0 ->
+          send(parent, :type_written)
+          :ok
+        end
+      }
+
+      assert {:error, "ERR value is not a valid float"} ==
+               SortedSet.handle("ZINCRBY", ["zs", "abc", "a"], store)
+
+      refute_received :type_written
+    end
+
     test "ZINCRBY returns member write errors" do
       type_key = CompoundKey.type_key("zs")
       member_key = CompoundKey.zset_member("zs", "a")
@@ -461,6 +532,35 @@ defmodule Ferricstore.Commands.SortedSetTest do
       }
 
       assert {:error, "disk full"} == SortedSet.handle("ZINCRBY", ["zs", "5.0", "a"], store)
+    end
+
+    test "ZINCRBY rolls back new type metadata when member write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("zs")
+      member_key = CompoundKey.zset_member("zs", "a")
+
+      store = %{
+        compound_get: fn
+          "zs", ^type_key -> nil
+          "zs", ^member_key -> nil
+        end,
+        compound_put: fn
+          "zs", ^type_key, "zset", 0 ->
+            send(parent, :type_written)
+            :ok
+
+          "zs", ^member_key, "5.0", 0 ->
+            {:error, "disk full"}
+        end,
+        compound_delete: fn "zs", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, "disk full"} == SortedSet.handle("ZINCRBY", ["zs", "5.0", "a"], store)
+      assert_received :type_written
+      assert_received :type_deleted
     end
   end
 
