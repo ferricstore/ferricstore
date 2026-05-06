@@ -366,6 +366,53 @@ defmodule Ferricstore.Commands.SetTest do
       result = Set.handle("SINTER", ["s1"], store)
       assert Enum.sort(result) == ["a", "b"]
     end
+
+    test "SINTER scans only the smallest set and probes larger sets by member" do
+      type_s1 = CompoundKey.type_key("s1")
+      type_s2 = CompoundKey.type_key("s2")
+      s1_member = CompoundKey.set_member("s1", "b")
+
+      store = %{
+        compound_get: fn
+          "s1", ^type_s1 -> "set"
+          "s2", ^type_s2 -> "set"
+          "s1", ^s1_member -> "1"
+        end,
+        compound_count: fn
+          "s1", _prefix -> 10_000
+          "s2", _prefix -> 1
+        end,
+        compound_scan: fn
+          "s1", _prefix ->
+            flunk("SINTER should not scan the larger set")
+
+          "s2", _prefix ->
+            [{"b", "1"}]
+        end
+      }
+
+      assert ["b"] == Set.handle("SINTER", ["s1", "s2"], store)
+    end
+
+    test "SINTER returns empty without member scans when any set is empty" do
+      type_s1 = CompoundKey.type_key("s1")
+
+      store = %{
+        compound_get: fn
+          "s1", ^type_s1 -> "set"
+          "missing", _type_key -> nil
+        end,
+        compound_count: fn
+          "s1", _prefix -> 10_000
+          "missing", _prefix -> 0
+        end,
+        compound_scan: fn key, _prefix ->
+          flunk("SINTER should not scan #{inspect(key)} after finding an empty set")
+        end
+      }
+
+      assert [] == Set.handle("SINTER", ["s1", "missing"], store)
+    end
   end
 
   # ---------------------------------------------------------------------------

@@ -168,15 +168,9 @@ defmodule Ferricstore.Commands.Set do
 
   def handle("SINTER", [_ | _] = keys, store) do
     with :ok <- check_all_types(keys, store) do
-      sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
-
-      result =
-        case sets do
-          [first | rest] -> Enum.reduce(rest, first, &MapSet.intersection(&2, &1))
-          [] -> MapSet.new()
-        end
-
-      MapSet.to_list(result)
+      keys
+      |> sinter_set(store)
+      |> MapSet.to_list()
     end
   end
 
@@ -470,21 +464,7 @@ defmodule Ferricstore.Commands.Set do
     with {:ok, numkeys} <- parse_numkeys(numkeys_str),
          {:ok, keys, limit} <- parse_sintercard_args(rest, numkeys) do
       with :ok <- check_all_types(keys, store) do
-        sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
-
-        intersection =
-          case sets do
-            [first | others] -> Enum.reduce(others, first, &MapSet.intersection(&2, &1))
-            [] -> MapSet.new()
-          end
-
-        count = MapSet.size(intersection)
-
-        if limit > 0 and count > limit do
-          limit
-        else
-          count
-        end
+        sinter_count(keys, limit, store)
       end
     end
   end
@@ -666,15 +646,9 @@ defmodule Ferricstore.Commands.Set do
 
   defp sinter_keys([_ | _] = keys, store) do
     with :ok <- check_all_types(keys, store) do
-      sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
-
-      result =
-        case sets do
-          [first | rest] -> Enum.reduce(rest, first, &MapSet.intersection(&2, &1))
-          [] -> MapSet.new()
-        end
-
-      MapSet.to_list(result)
+      keys
+      |> sinter_set(store)
+      |> MapSet.to_list()
     end
   end
 
@@ -728,12 +702,7 @@ defmodule Ferricstore.Commands.Set do
 
   defp sinterstore_args([destination | [_ | _] = keys], store) do
     store_result_at(destination, keys, :sinterstore, store, fn source_keys, unified_store ->
-      sets = Enum.map(source_keys, fn key -> get_members_set(key, unified_store) end)
-
-      case sets do
-        [first | rest] -> Enum.reduce(rest, first, &MapSet.intersection(&2, &1))
-        [] -> MapSet.new()
-      end
+      sinter_set(source_keys, unified_store)
     end)
   end
 
@@ -845,21 +814,7 @@ defmodule Ferricstore.Commands.Set do
 
   defp sintercard_typed(keys, limit, store) do
     with :ok <- check_all_types(keys, store) do
-      sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
-
-      intersection =
-        case sets do
-          [first | others] -> Enum.reduce(others, first, &MapSet.intersection(&2, &1))
-          [] -> MapSet.new()
-        end
-
-      count = MapSet.size(intersection)
-
-      if limit > 0 and count > limit do
-        limit
-      else
-        count
-      end
+      sinter_count(keys, limit, store)
     end
   end
 
@@ -1010,6 +965,84 @@ defmodule Ferricstore.Commands.Set do
     prefix = CompoundKey.set_prefix(key)
     pairs = Ops.compound_scan(store, key, prefix)
     MapSet.new(pairs, fn {member, _} -> member end)
+  end
+
+  defp sinter_set(keys, store) do
+    keys
+    |> count_sets(store)
+    |> intersection_from_counted_keys(store)
+  end
+
+  defp sinter_count(keys, limit, store) do
+    counted = count_sets(keys, store)
+
+    if Enum.any?(counted, fn {_key, count} -> count == 0 end) do
+      0
+    else
+      counted
+      |> pop_smallest_set()
+      |> count_intersection_candidates(limit, store)
+    end
+  end
+
+  defp count_sets(keys, store) do
+    Enum.map(keys, fn key ->
+      {key, Ops.compound_count(store, key, CompoundKey.set_prefix(key))}
+    end)
+  end
+
+  defp intersection_from_counted_keys([], _store), do: MapSet.new()
+
+  defp intersection_from_counted_keys(counted, store) do
+    if Enum.any?(counted, fn {_key, count} -> count == 0 end) do
+      MapSet.new()
+    else
+      {{base_key, _count}, rest} = pop_smallest_set(counted)
+
+      base_key
+      |> get_members_list(store)
+      |> Enum.reduce(MapSet.new(), fn member, acc ->
+        if member_in_all_sets?(member, rest, store) do
+          MapSet.put(acc, member)
+        else
+          acc
+        end
+      end)
+    end
+  end
+
+  defp pop_smallest_set([{_key, _count} | _] = counted) do
+    smallest_index =
+      counted
+      |> Enum.with_index()
+      |> Enum.min_by(fn {{_key, count}, _index} -> count end)
+      |> elem(1)
+
+    List.pop_at(counted, smallest_index)
+  end
+
+  defp count_intersection_candidates({{base_key, _count}, rest}, limit, store) do
+    base_key
+    |> get_members_list(store)
+    |> Enum.reduce_while(0, fn member, count ->
+      if member_in_all_sets?(member, rest, store) do
+        next_count = count + 1
+
+        if limit > 0 and next_count >= limit do
+          {:halt, limit}
+        else
+          {:cont, next_count}
+        end
+      else
+        {:cont, count}
+      end
+    end)
+  end
+
+  defp member_in_all_sets?(member, counted_keys, store) do
+    Enum.all?(counted_keys, fn {key, _count} ->
+      Ops.compound_get(store, key, CompoundKey.set_member(key, member)) != nil
+    end)
   end
 
   defp get_members_list(key, store) do
