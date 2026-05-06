@@ -6492,7 +6492,7 @@ defmodule Ferricstore.Raft.StateMachine do
               {:ok, locations} ->
                 clear_disk_pressure(state)
                 apply_pending_locations(state, file_id, batch, locations)
-                enqueue_pending_lmdb_mirror(state)
+                observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
                 state = track_bitcask_append_bytes(state, file_path, file_id, record_bytes)
                 apply_state_put(:pending_state, state)
                 :ok
@@ -7194,6 +7194,56 @@ defmodule Ferricstore.Raft.StateMachine do
         :ok
     end
   end
+
+  defp observe_pending_lmdb_mirror_enqueue(_state, :ok), do: :ok
+
+  defp observe_pending_lmdb_mirror_enqueue(state, {:error, reason}) do
+    mark_flow_lmdb_mirror_degraded(state, reason)
+    :ok
+  end
+
+  defp observe_pending_lmdb_mirror_enqueue(_state, _other), do: :ok
+
+  defp mark_flow_lmdb_mirror_degraded(state, reason) do
+    ctx = Map.get(state, :instance_ctx)
+    shard_index = Map.get(state, :shard_index, 0)
+    flag_idx = shard_index + 1
+
+    flow_lmdb_safe_atomic_update(
+      Map.get(ctx || %{}, :flow_lmdb_mirror_enqueue_failures),
+      flag_idx,
+      fn ref, idx -> :atomics.add(ref, idx, 1) end
+    )
+
+    flow_lmdb_safe_atomic_update(
+      Map.get(ctx || %{}, :flow_lmdb_mirror_degraded),
+      flag_idx,
+      fn ref, idx -> :atomics.put(ref, idx, 1) end
+    )
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb_mirror, :degraded],
+      %{count: 1},
+      %{
+        instance_name: Map.get(state, :instance_name, :default),
+        shard_index: shard_index,
+        reason: reason
+      }
+    )
+  end
+
+  defp flow_lmdb_safe_atomic_update(ref, flag_idx, fun)
+       when is_reference(ref) and is_integer(flag_idx) and flag_idx > 0 and is_function(fun, 2) do
+    if flag_idx <= :atomics.info(ref).size do
+      fun.(ref, flag_idx)
+    else
+      :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp flow_lmdb_safe_atomic_update(_ref, _flag_idx, _fun), do: :ok
 
   defp flush_pending_lmdb(state) do
     case Process.put(:sm_pending_lmdb_ops, []) do

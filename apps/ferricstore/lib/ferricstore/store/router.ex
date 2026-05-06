@@ -2439,11 +2439,11 @@ defmodule Ferricstore.Store.Router do
 
     cond do
       Ferricstore.Flow.LMDB.write_through?() ->
-        flow_get_lmdb(ctx, key)
+        flow_get_lmdb(ctx, key, :write_through)
 
       Ferricstore.Flow.LMDB.mirror?() ->
         case get(ctx, key) do
-          nil -> flow_get_lmdb(ctx, key)
+          nil -> flow_get_lmdb(ctx, key, :mirror)
           value -> value
         end
 
@@ -2458,12 +2458,12 @@ defmodule Ferricstore.Store.Router do
 
     cond do
       Ferricstore.Flow.LMDB.write_through?() ->
-        flow_batch_get_lmdb(ctx, keys)
+        flow_batch_get_lmdb(ctx, keys, :write_through)
 
       Ferricstore.Flow.LMDB.mirror?() ->
         values = batch_get(ctx, keys)
         missing_keys = for {key, nil} <- Enum.zip(keys, values), do: key
-        missing_values = flow_batch_get_lmdb(ctx, missing_keys)
+        missing_values = flow_batch_get_lmdb(ctx, missing_keys, :mirror)
 
         {merged, []} =
           Enum.map_reduce(values, missing_values, fn
@@ -2480,9 +2480,9 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp flow_batch_get_lmdb(_ctx, []), do: []
+  defp flow_batch_get_lmdb(_ctx, [], _mode), do: []
 
-  defp flow_batch_get_lmdb(ctx, keys) do
+  defp flow_batch_get_lmdb(ctx, keys, mode) do
     now_ms = CommandTime.now_ms()
 
     values_by_index =
@@ -2491,7 +2491,7 @@ defmodule Ferricstore.Store.Router do
       |> Enum.group_by(fn {key, _index} -> flow_lmdb_path(ctx, key) end)
       |> Enum.reduce(%{}, fn {path, indexed_keys}, acc ->
         group_keys = Enum.map(indexed_keys, fn {key, _index} -> key end)
-        values = flow_lmdb_get_many(path, group_keys, now_ms)
+        values = flow_lmdb_get_many(path, group_keys, now_ms, mode)
 
         indexed_keys
         |> Enum.zip(values)
@@ -2503,12 +2503,12 @@ defmodule Ferricstore.Store.Router do
     Enum.map(0..(length(keys) - 1)//1, &Map.get(values_by_index, &1))
   end
 
-  defp flow_get_lmdb(ctx, key) do
+  defp flow_get_lmdb(ctx, key, mode) do
     path = flow_lmdb_path(ctx, key)
 
     path
     |> Ferricstore.Flow.LMDB.get(key)
-    |> flow_decode_lmdb_get_result(path, key, CommandTime.now_ms())
+    |> flow_decode_lmdb_get_result(path, key, CommandTime.now_ms(), mode)
   end
 
   defp flow_lmdb_path(ctx, key) do
@@ -2516,27 +2516,29 @@ defmodule Ferricstore.Store.Router do
     ctx.data_dir |> Ferricstore.DataDir.shard_data_path(idx) |> Ferricstore.Flow.LMDB.path()
   end
 
-  defp flow_lmdb_get_many(_path, [], _now_ms), do: []
+  defp flow_lmdb_get_many(_path, [], _now_ms, _mode), do: []
 
-  defp flow_lmdb_get_many(path, keys, now_ms) do
+  defp flow_lmdb_get_many(path, keys, now_ms, mode) do
     case Ferricstore.Flow.LMDB.get_many(path, keys) do
       {:ok, results} ->
         keys
         |> Enum.zip(results)
         |> Enum.map(fn {key, result} ->
-          flow_decode_lmdb_get_result(result, path, key, now_ms)
+          flow_decode_lmdb_get_result(result, path, key, now_ms, mode)
         end)
 
-      {:error, _reason} ->
+      {:error, reason} ->
+        flow_observe_lmdb_read_error(mode, reason)
+
         Enum.map(keys, fn key ->
           path
           |> Ferricstore.Flow.LMDB.get(key)
-          |> flow_decode_lmdb_get_result(path, key, now_ms)
+          |> flow_decode_lmdb_get_result(path, key, now_ms, mode)
         end)
     end
   end
 
-  defp flow_decode_lmdb_get_result({:ok, blob}, path, key, now_ms) when is_binary(blob) do
+  defp flow_decode_lmdb_get_result({:ok, blob}, path, key, now_ms, mode) when is_binary(blob) do
     case Ferricstore.Flow.LMDB.decode_value(blob, now_ms) do
       {:ok, value} ->
         value
@@ -2546,15 +2548,35 @@ defmodule Ferricstore.Store.Router do
         nil
 
       :error ->
-        nil
+        flow_lmdb_read_error_result(mode, :decode_error)
     end
   end
 
-  defp flow_decode_lmdb_get_result(:not_found, _path, _key, _now_ms), do: nil
+  defp flow_decode_lmdb_get_result(:not_found, _path, _key, _now_ms, _mode), do: nil
 
-  defp flow_decode_lmdb_get_result({:error, _reason}, _path, _key, _now_ms), do: nil
+  defp flow_decode_lmdb_get_result({:error, reason}, _path, _key, _now_ms, mode),
+    do: flow_lmdb_read_error_result(mode, reason)
 
-  defp flow_decode_lmdb_get_result(_other, _path, _key, _now_ms), do: nil
+  defp flow_decode_lmdb_get_result(_other, _path, _key, _now_ms, mode),
+    do: flow_lmdb_read_error_result(mode, :unexpected_result)
+
+  defp flow_lmdb_read_error_result(mode, reason) do
+    flow_observe_lmdb_read_error(mode, reason)
+
+    case mode do
+      :write_through -> {:error, "ERR flow LMDB read failed"}
+      :mirror -> nil
+      _other -> nil
+    end
+  end
+
+  defp flow_observe_lmdb_read_error(mode, reason) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb, :read_error],
+      %{count: 1},
+      %{mode: mode, reason: reason}
+    )
+  end
 
   @doc false
   def flow_create(ctx, %{id: id} = attrs) when is_binary(id) do

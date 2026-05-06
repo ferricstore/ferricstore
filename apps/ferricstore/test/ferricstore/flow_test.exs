@@ -746,6 +746,9 @@ defmodule Ferricstore.FlowTest do
     assert {:error, "ERR flow count must be a positive integer"} =
              FerricStore.flow_history("flow", count: 0)
 
+    assert {:error, "ERR flow count exceeds maximum 10000"} =
+             FerricStore.flow_history("flow", count: 10_001)
+
     assert {:error, "ERR flow id must be a non-empty string"} =
              FerricStore.flow_transition("", "queued", "done")
 
@@ -2060,6 +2063,50 @@ defmodule Ferricstore.FlowTest do
              3
 
     assert [] = :ets.lookup(Ferricstore.Stream.Meta, history_key)
+  end
+
+  test "flow_history falls back to bounded history key scan when Flow index is unavailable" do
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
+
+    on_exit(fn -> Ferricstore.Test.IsolatedInstance.checkin(ctx) end)
+
+    id = uid("flow-history-fallback")
+    partition = "tenant-history-fallback"
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.create(ctx, id,
+               type: "history-fallback",
+               partition_key: partition,
+               run_at_ms: 1,
+               now_ms: 1
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, "history-fallback",
+               partition_key: partition,
+               worker: "worker-history-fallback",
+               limit: 1,
+               now_ms: 2
+             )
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition,
+               fencing_token: claimed.fencing_token,
+               now_ms: 3
+             )
+
+    {flow_index, flow_lookup} = Ferricstore.Flow.Index.table_names(ctx.name, 0)
+    :ets.delete_all_objects(flow_index)
+    :ets.delete_all_objects(flow_lookup)
+
+    assert {:ok, events} = Ferricstore.Flow.history(ctx, id, partition_key: partition, count: 10)
+
+    assert Enum.map(events, fn {_event_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed",
+             "completed"
+           ]
   end
 
   test "flow history retention keeps only latest configured events" do

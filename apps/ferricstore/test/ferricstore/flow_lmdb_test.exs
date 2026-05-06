@@ -453,6 +453,49 @@ defmodule Ferricstore.Flow.LMDBTest do
                     }}
   end
 
+  test "state-machine mirror enqueue failure marks shard degraded" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_trap = Process.flag(:trap_exit, true)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
+    writer_name = Ferricstore.Flow.LMDBWriter.name(ctx.name, 0)
+    writer_pid = Process.whereis(writer_name)
+    test_pid = self()
+    handler_id = {:flow_lmdb_mirror_degraded, self(), make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :flow, :lmdb_mirror, :degraded],
+      fn event, measurements, metadata, _config ->
+        send(test_pid, {:flow_lmdb_mirror_degraded, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      Process.flag(:trap_exit, old_trap)
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    Process.exit(writer_pid, :kill)
+    assert_receive {:EXIT, ^writer_pid, :killed}
+
+    assert {:ok, %{id: "mirror-enqueue-degraded"}} =
+             Ferricstore.Flow.create(ctx, "mirror-enqueue-degraded",
+               type: "mirror-enqueue-degraded",
+               partition_key: "tenant-mirror-enqueue-degraded"
+             )
+
+    assert :atomics.get(ctx.flow_lmdb_mirror_enqueue_failures, 1) == 1
+    assert :atomics.get(ctx.flow_lmdb_mirror_degraded, 1) == 1
+
+    assert_receive {:flow_lmdb_mirror_degraded, [:ferricstore, :flow, :lmdb_mirror, :degraded],
+                    %{count: 1}, %{shard_index: 0, reason: :writer_not_started}}
+  end
+
   test "mirror writer persists replay-safe marker only after pending ops flush" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
@@ -1170,6 +1213,75 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
   end
 
+  test "write-through flow get returns visible error for corrupt LMDB wrapper" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :write_through)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    id = "flow-corrupt-lmdb-wrapper"
+    partition_key = "tenant-corrupt-lmdb-wrapper"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, state_key, "not-a-term"}])
+
+    assert {:error, "ERR flow LMDB read failed"} =
+             Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+  end
+
+  test "mirror flow get emits telemetry for corrupt LMDB wrapper" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+    test_pid = self()
+    handler_id = {:flow_lmdb_read_error, self(), make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :flow, :lmdb, :read_error],
+        fn event, measurements, metadata, _config ->
+          send(test_pid, {:flow_lmdb_read_error, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    id = "flow-corrupt-lmdb-mirror"
+    partition_key = "tenant-corrupt-lmdb-mirror"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, state_key, "not-a-term"}])
+
+    assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+
+    assert_receive {:flow_lmdb_read_error, [:ferricstore, :flow, :lmdb, :read_error], %{count: 1},
+                    %{mode: :mirror, reason: :decode_error}}
+  end
+
   test "lineage queries skip malformed LMDB mirror records" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
@@ -1254,6 +1366,158 @@ defmodule Ferricstore.Flow.LMDBTest do
                partition_key: partition_key,
                count: 1
              )
+  end
+
+  test "terminal list merges RAM and LMDB rows by score during mirror overlap" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+    end)
+
+    partition_key = "tenant-terminal-overlap"
+    flow_type = "terminal-overlap"
+    old_id = "flow-terminal-overlap-old"
+    new_id = "flow-terminal-overlap-new"
+
+    assert {:ok, _} =
+             Ferricstore.Flow.create(ctx, old_id,
+               type: flow_type,
+               partition_key: partition_key,
+               run_at_ms: 1,
+               now_ms: 1
+             )
+
+    assert {:ok, [old_claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               partition_key: partition_key,
+               worker: "worker-terminal-overlap-old",
+               limit: 1,
+               now_ms: 2
+             )
+
+    assert {:ok, %{id: ^old_id, state: "completed"}} =
+             Ferricstore.Flow.complete(ctx, old_id, old_claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: old_claimed.fencing_token,
+               now_ms: 3
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    assert {:ok, _} =
+             Ferricstore.Flow.create(ctx, new_id,
+               type: flow_type,
+               partition_key: partition_key,
+               run_at_ms: 10,
+               now_ms: 10
+             )
+
+    assert {:ok, [new_claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               partition_key: partition_key,
+               worker: "worker-terminal-overlap-new",
+               limit: 1,
+               now_ms: 11
+             )
+
+    assert {:ok, %{id: ^new_id, state: "completed"}} =
+             Ferricstore.Flow.complete(ctx, new_id, new_claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: new_claimed.fencing_token,
+               now_ms: 12
+             )
+
+    assert {:ok, [%{id: ^old_id}]} =
+             Ferricstore.Flow.list(ctx, flow_type,
+               state: "completed",
+               partition_key: partition_key,
+               count: 1
+             )
+  end
+
+  test "terminal LMDB reads fail visible when mirror is degraded" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    :atomics.put(ctx.flow_lmdb_mirror_degraded, 1, 1)
+
+    assert {:error, "ERR flow LMDB mirror degraded"} =
+             Ferricstore.Flow.list(ctx, "degraded-terminal",
+               state: "completed",
+               partition_key: "tenant-degraded-terminal"
+             )
+  end
+
+  test "LMDB rebuild counts cold-read failures and marks mirror degraded" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_rebuild_cold_read_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    File.mkdir_p!(shard_path)
+    keydir = :ets.new(:flow_lmdb_rebuild_cold_read_keydir, [:set])
+    degraded = :atomics.new(1, signed: false)
+    state_key = Ferricstore.Flow.Keys.state_key("cold-read-missing", "tenant-cold-read")
+    test_pid = self()
+    handler_id = {:flow_lmdb_rebuild_cold_read, self(), make_ref()}
+
+    :telemetry.attach_many(
+      handler_id,
+      [
+        [:ferricstore, :flow, :lmdb_rebuild, :cold_read_error],
+        [:ferricstore, :flow, :lmdb_rebuild]
+      ],
+      fn event, measurements, metadata, _config ->
+        send(test_pid, {:flow_lmdb_rebuild_cold_read, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      File.rm_rf!(data_dir)
+    end)
+
+    :ets.insert(keydir, {state_key, nil, 0, 0, 99, 0, 16})
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               0,
+               %{flow_lmdb_mirror_degraded: degraded},
+               nil,
+               nil,
+               nil,
+               nil
+             )
+
+    assert :atomics.get(degraded, 1) == 1
+
+    assert_receive {:flow_lmdb_rebuild_cold_read,
+                    [:ferricstore, :flow, :lmdb_rebuild, :cold_read_error], %{count: 1},
+                    %{reason: _reason}}
+
+    assert_receive {:flow_lmdb_rebuild_cold_read, [:ferricstore, :flow, :lmdb_rebuild],
+                    %{cold_read_errors: 1}, %{shard_index: 0}}
   end
 
   test "mirror startup rebuilds flow working indexes and prunes terminal state to LMDB" do

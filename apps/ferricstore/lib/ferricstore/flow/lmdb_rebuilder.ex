@@ -22,12 +22,21 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         flow_lookup \\ nil
       ) do
     lmdb_path = LMDB.path(shard_path)
+    Process.put(:flow_lmdb_rebuild_cold_read_errors, 0)
 
     stats =
       keydir
       |> select_state_entries()
       |> Enum.reduce(
-        %{seen: 0, lmdb: 0, terminal: 0, active: 0, lmdb_errors: 0, terminal_counts: %{}},
+        %{
+          seen: 0,
+          lmdb: 0,
+          terminal: 0,
+          active: 0,
+          lmdb_errors: 0,
+          cold_read_errors: 0,
+          terminal_counts: %{}
+        },
         fn entries, acc ->
           reconcile_batch(
             entries,
@@ -45,7 +54,11 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         end
       )
       |> persist_terminal_counts(lmdb_path)
+      |> Map.put(:cold_read_errors, Process.get(:flow_lmdb_rebuild_cold_read_errors, 0))
       |> Map.put(:history, rebuild_flow_history_indexes(keydir, flow_index, flow_lookup))
+
+    Process.delete(:flow_lmdb_rebuild_cold_read_errors)
+    publish_mirror_health(instance_ctx, shard_index, stats)
 
     telemetry_stats =
       stats
@@ -258,12 +271,42 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             decode_state_record(key, value, expire_at_ms)
 
           _ ->
+            observe_cold_read_error(1, :missing_value)
             []
         end)
 
-      {:error, _reason} ->
+      {:error, reason} ->
+        observe_cold_read_error(length(locations), reason)
         []
     end
+  end
+
+  defp observe_cold_read_error(count, reason) do
+    previous = Process.get(:flow_lmdb_rebuild_cold_read_errors, 0)
+    Process.put(:flow_lmdb_rebuild_cold_read_errors, previous + count)
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb_rebuild, :cold_read_error],
+      %{count: count},
+      %{reason: reason}
+    )
+  end
+
+  defp publish_mirror_health(instance_ctx, shard_index, stats) do
+    degraded? = stats.lmdb_errors > 0 or Map.get(stats, :cold_read_errors, 0) > 0
+    flag_idx = shard_index + 1
+
+    case Map.get(instance_ctx || %{}, :flow_lmdb_mirror_degraded) do
+      ref when is_reference(ref) ->
+        if flag_idx <= :atomics.info(ref).size do
+          :atomics.put(ref, flag_idx, if(degraded?, do: 1, else: 0))
+        end
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
   end
 
   defp decode_state_record(key, value, expire_at_ms) do
