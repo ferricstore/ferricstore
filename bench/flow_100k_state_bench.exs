@@ -143,7 +143,7 @@ defmodule Flow100kStateBench do
           info
         end)
       )
-      |> add(bench_history(prefix, backlog, iterations, partition_count))
+      |> add_many(bench_history(prefix, backlog, iterations, partition_count, shard_count))
       |> add(bench_stuck(prefix, backlog, iterations, partition_count))
       |> add_many(bench_claim_due(prefix, backlog, iterations, partition_count, claim_limits))
       |> add(bench_transition(prefix, backlog, iterations, partition_count))
@@ -237,7 +237,7 @@ defmodule Flow100kStateBench do
     end)
   end
 
-  defp bench_history(prefix, backlog, iterations, partition_count) do
+  defp bench_history(prefix, backlog, iterations, partition_count, shard_count) do
     flow_type = type(prefix, "history")
 
     timed("seed history #{iterations}", fn ->
@@ -247,15 +247,40 @@ defmodule Flow100kStateBench do
       end
     end)
 
-    result("flow.history count=10 under #{backlog}", iterations, fn i ->
-      {:ok, events} =
-        FerricStore.flow_history(id(prefix, "history", i),
-          count: 10,
-          partition_key: partition(prefix, i, partition_count)
-        )
+    :ok = Ferricstore.Flow.LMDBWriter.flush_all(shard_count)
 
-      events
-    end)
+    [
+      result("flow.history count=10 under #{backlog}", iterations, fn i ->
+        {:ok, events} =
+          FerricStore.flow_history(id(prefix, "history", i),
+            count: 10,
+            partition_key: partition(prefix, i, partition_count)
+          )
+
+        events
+      end),
+      result("flow.history include_cold count=10 under #{backlog}", iterations, fn i ->
+        {:ok, events} =
+          FerricStore.flow_history(id(prefix, "history", i),
+            count: 10,
+            include_cold: true,
+            partition_key: partition(prefix, i, partition_count)
+          )
+
+        events
+      end),
+      result("flow.history cold_consistent count=10 under #{backlog}", iterations, fn i ->
+        {:ok, events} =
+          FerricStore.flow_history(id(prefix, "history", i),
+            count: 10,
+            include_cold: true,
+            consistent_projection: true,
+            partition_key: partition(prefix, i, partition_count)
+          )
+
+        events
+      end)
+    ]
   end
 
   defp bench_stuck(prefix, backlog, iterations, partition_count) do

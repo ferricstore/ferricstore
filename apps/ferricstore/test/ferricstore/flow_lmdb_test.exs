@@ -141,6 +141,71 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1)
   end
 
+  test "history expire sweep removes expired history index entries" do
+    path =
+      Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
+
+    history_key = Ferricstore.Flow.Keys.history_key("history-expire", "tenant-history-expire")
+    history_index_key = Ferricstore.Flow.LMDB.history_index_key(history_key, "1000-1", 1_000)
+    expire_key = Ferricstore.Flow.LMDB.history_expire_key(10, history_index_key)
+
+    history_value =
+      Ferricstore.Flow.LMDB.encode_history_index_value("1000-1", 1_000, "X:history", 10)
+
+    expire_value = Ferricstore.Flow.LMDB.encode_history_expire_value(history_index_key)
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(path, [
+               {:put, history_index_key, history_value},
+               {:put, expire_key, expire_value}
+             ])
+
+    assert {:ok, 1} = Ferricstore.Flow.LMDB.sweep_expired_history(path, 11, 100)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, history_index_key)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, expire_key)
+  end
+
+  test "history flow expire sweep removes all projection entries for the flow" do
+    path =
+      Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
+
+    history_key =
+      Ferricstore.Flow.Keys.history_key("history-flow-expire", "tenant-history-flow-expire")
+
+    prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+    older_key = Ferricstore.Flow.LMDB.history_index_key(history_key, "1000-1", 1_000)
+    newer_key = Ferricstore.Flow.LMDB.history_index_key(history_key, "1001-2", 1_001)
+    reused_key = Ferricstore.Flow.LMDB.history_index_key(history_key, "3000-1", 3_000)
+    flow_expire_key = Ferricstore.Flow.LMDB.history_flow_expire_key(2_000, history_key)
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(path, [
+               {:put, older_key,
+                Ferricstore.Flow.LMDB.encode_history_index_value("1000-1", 1_000, "X:older")},
+               {:put, newer_key,
+                Ferricstore.Flow.LMDB.encode_history_index_value(
+                  "1001-2",
+                  1_001,
+                  "X:newer",
+                  2_000
+                )},
+               {:put, reused_key,
+                Ferricstore.Flow.LMDB.encode_history_index_value("3000-1", 3_000, "X:reused")},
+               {:put, flow_expire_key,
+                Ferricstore.Flow.LMDB.encode_history_flow_expire_value(history_key, 2_000)}
+             ])
+
+    assert {:ok, 3} = Ferricstore.Flow.LMDB.prefix_count(path, prefix)
+    assert {:ok, 2} = Ferricstore.Flow.LMDB.sweep_expired_history(path, 2_001, 100)
+    assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(path, prefix)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, flow_expire_key)
+    assert {:ok, _} = Ferricstore.Flow.LMDB.get(path, reused_key)
+  end
+
   test "flow LMDB mode defaults to mirror and legacy off cannot disable it" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
@@ -2295,9 +2360,16 @@ defmodule Ferricstore.Flow.LMDBTest do
     terminal_prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(completed_index_key)
     state_key = Ferricstore.Flow.Keys.state_key(completed.id, partition_key)
     reverse_key = Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)
+    history_key = Ferricstore.Flow.Keys.history_key(completed.id, partition_key)
+    history_prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
 
     assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
     assert {:ok, 1} = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, completed_index_key)
+
+    assert {:ok, history_count_before} =
+             Ferricstore.Flow.LMDB.prefix_count(lmdb_path, history_prefix)
+
+    assert history_count_before >= 3
 
     Process.sleep(40)
 
@@ -2310,6 +2382,15 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
     assert {:ok, 0} = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, completed_index_key)
+
+    assert {:ok, _history_swept} =
+             Ferricstore.Flow.LMDB.sweep_expired_history(
+               lmdb_path,
+               System.os_time(:millisecond),
+               100
+             )
+
+    assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, history_prefix)
     assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
     assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
   end

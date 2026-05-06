@@ -7645,9 +7645,10 @@ defmodule Ferricstore.Raft.StateMachine do
   defp queue_lmdb_history_index_put(record, history_key, event_id, event_ms, compound_key) do
     expire_at_ms = flow_record_expire_at(record)
 
-    history_key
-    |> Ferricstore.Flow.LMDB.history_index_key(event_id, event_ms)
-    |> queue_pending_lmdb_mirror_query_put(
+    history_index_key = Ferricstore.Flow.LMDB.history_index_key(history_key, event_id, event_ms)
+
+    queue_pending_lmdb_mirror_query_put(
+      history_index_key,
       Ferricstore.Flow.LMDB.encode_history_index_value(
         event_id,
         event_ms,
@@ -7655,6 +7656,28 @@ defmodule Ferricstore.Raft.StateMachine do
         expire_at_ms
       )
     )
+
+    case Ferricstore.Flow.LMDB.history_expire_key(expire_at_ms, history_index_key) do
+      nil ->
+        :ok
+
+      expire_key ->
+        queue_pending_lmdb_mirror_query_put(
+          expire_key,
+          Ferricstore.Flow.LMDB.encode_history_expire_value(history_index_key)
+        )
+    end
+
+    case Ferricstore.Flow.LMDB.history_flow_expire_key(expire_at_ms, history_key) do
+      nil ->
+        :ok
+
+      expire_key ->
+        queue_pending_lmdb_mirror_query_put(
+          expire_key,
+          Ferricstore.Flow.LMDB.encode_history_flow_expire_value(history_key, expire_at_ms)
+        )
+    end
   end
 
   defp queue_pending_lmdb_mirror_query_put(query_key, value) do

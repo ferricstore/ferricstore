@@ -164,10 +164,61 @@ defmodule Ferricstore.Flow.LMDB do
     history_index_prefix(history_key) <> pad_u64(event_ms) <> <<0>> <> event_id
   end
 
+  def history_expire_prefix, do: "flow-history-expire:"
+
+  def history_flow_expire_prefix, do: "flow-history-flow-expire:"
+
+  def history_expire_key(expire_at_ms, history_index_key)
+      when is_integer(expire_at_ms) and expire_at_ms > 0 and is_binary(history_index_key) do
+    history_expire_prefix() <> pad_u64(expire_at_ms) <> <<0>> <> history_index_key
+  end
+
+  def history_expire_key(_expire_at_ms, _history_index_key), do: nil
+
+  def history_flow_expire_key(expire_at_ms, history_key)
+      when is_integer(expire_at_ms) and expire_at_ms > 0 and is_binary(history_key) do
+    history_flow_expire_prefix() <> pad_u64(expire_at_ms) <> <<0>> <> history_key
+  end
+
+  def history_flow_expire_key(_expire_at_ms, _history_key), do: nil
+
   def encode_history_index_value(event_id, event_ms, compound_key, expire_at_ms \\ 0)
       when is_binary(event_id) and is_integer(event_ms) and is_integer(expire_at_ms) and
              is_binary(compound_key) do
     :erlang.term_to_binary({event_id, event_ms, expire_at_ms, compound_key})
+  end
+
+  def encode_history_expire_value(history_index_key) when is_binary(history_index_key) do
+    :erlang.term_to_binary(history_index_key)
+  end
+
+  def encode_history_flow_expire_value(history_key, expire_at_ms)
+      when is_binary(history_key) and is_integer(expire_at_ms) do
+    :erlang.term_to_binary({history_key, expire_at_ms})
+  end
+
+  def decode_history_expire_value(blob) when is_binary(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
+      history_index_key when is_binary(history_index_key) -> {:ok, history_index_key}
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  def decode_history_flow_expire_value(blob) when is_binary(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
+      {history_key, expire_at_ms} when is_binary(history_key) and is_integer(expire_at_ms) ->
+        {:ok, {history_key, expire_at_ms}}
+
+      history_key when is_binary(history_key) ->
+        {:ok, {history_key, :infinity}}
+
+      _ ->
+        :error
+    end
+  rescue
+    _ -> :error
   end
 
   def encode_query_index_value(id, updated_at_ms, expire_at_ms \\ 0, state_key \\ nil) do
@@ -189,6 +240,12 @@ defmodule Ferricstore.Flow.LMDB do
   def delete_terminal_index_entry(path, terminal_key, state_key)
       when is_binary(path) and is_binary(terminal_key) do
     ops = terminal_index_delete_ops(path, terminal_key, state_key)
+    write_batch(path, ops)
+  end
+
+  def delete_history_index_entry(path, history_index_key)
+      when is_binary(path) and is_binary(history_index_key) do
+    ops = history_index_delete_ops(path, history_index_key)
     write_batch(path, ops)
   end
 
@@ -434,6 +491,22 @@ defmodule Ferricstore.Flow.LMDB do
 
   def sweep_expired_terminal(_path, _now_ms, _limit), do: {:ok, 0}
 
+  def sweep_expired_history(path, now_ms, limit)
+      when is_binary(path) and is_integer(now_ms) and is_integer(limit) and limit > 0 do
+    with {:ok, entries} <- prefix_entries(path, history_expire_prefix(), limit),
+         {:ok, flow_entries} <- prefix_entries(path, history_flow_expire_prefix(), limit) do
+      {ops, swept} = expired_history_sweep_ops(path, entries, now_ms)
+      {flow_ops, flow_swept} = expired_history_flow_sweep_ops(path, flow_entries, now_ms, limit)
+
+      case write_batch(path, flow_ops ++ ops) do
+        :ok -> {:ok, swept + flow_swept}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  def sweep_expired_history(_path, _now_ms, _limit), do: {:ok, 0}
+
   def decode_terminal_index_value(blob) when is_binary(blob) do
     case :erlang.binary_to_term(blob, [:safe]) do
       {id, updated_at_ms, expire_at_ms, state_key, count_key}
@@ -539,6 +612,140 @@ defmodule Ferricstore.Flow.LMDB do
     end)
   end
 
+  defp expired_history_sweep_ops(path, entries, now_ms) do
+    Enum.reduce_while(entries, {[], 0}, fn {expire_key, expire_value}, {ops, swept} ->
+      case expire_key_time(expire_key, history_expire_prefix()) do
+        {:ok, expire_at_ms} when expire_at_ms > now_ms ->
+          {:halt, {ops, swept}}
+
+        {:ok, _expire_at_ms} ->
+          {entry_ops, entry_swept} =
+            expired_history_entry_ops(path, expire_key, expire_value, now_ms)
+
+          {:cont, {entry_ops ++ ops, swept + entry_swept}}
+
+        :error ->
+          {:cont, {[{:delete, expire_key} | ops], swept}}
+      end
+    end)
+  end
+
+  defp expired_history_flow_sweep_ops(path, entries, now_ms, limit) do
+    Enum.reduce_while(entries, {[], 0}, fn {expire_key, expire_value}, {ops, swept} ->
+      case expire_key_time(expire_key, history_flow_expire_prefix()) do
+        {:ok, expire_at_ms} when expire_at_ms > now_ms ->
+          {:halt, {ops, swept}}
+
+        {:ok, _expire_at_ms} ->
+          {entry_ops, entry_swept} =
+            expired_history_flow_entry_ops(path, expire_key, expire_value, now_ms, limit)
+
+          {:cont, {entry_ops ++ ops, swept + entry_swept}}
+
+        :error ->
+          {:cont, {[{:delete, expire_key} | ops], swept}}
+      end
+    end)
+  end
+
+  defp expired_history_flow_entry_ops(path, expire_key, expire_value, now_ms, limit) do
+    case decode_history_flow_expire_value(expire_value) do
+      {:ok, {history_key, history_cutoff_ms}} ->
+        prefix = history_index_prefix(history_key)
+        read_limit = max(limit, 1) + 1
+
+        case prefix_entries(path, prefix, read_limit) do
+          {:ok, entries} ->
+            {entries, keep_marker?} =
+              if length(entries) > limit do
+                {Enum.take(entries, limit), true}
+              else
+                {entries, false}
+              end
+
+            base_ops = if keep_marker?, do: [], else: [{:delete, expire_key}]
+
+            {ops, swept} =
+              Enum.reduce(entries, {base_ops, 0}, fn {history_index_key, history_value},
+                                                     {ops_acc, swept_acc} ->
+                case decode_history_index_value(history_value) do
+                  {:ok, {_event_id, event_ms, expire_at_ms, _compound_key}}
+                  when expire_at_ms <= 0 or expire_at_ms <= now_ms ->
+                    if history_event_before_cutoff?(event_ms, history_cutoff_ms) do
+                      {history_index_delete_ops_from_value(
+                         [{:delete, history_index_key} | ops_acc],
+                         history_index_key,
+                         history_value
+                       ), swept_acc + 1}
+                    else
+                      {ops_acc, swept_acc}
+                    end
+
+                  {:ok, {_event_id, event_ms, _expire_at_ms, _compound_key}} ->
+                    if history_event_before_cutoff?(event_ms, history_cutoff_ms) do
+                      {history_index_delete_ops_from_value(
+                         [{:delete, history_index_key} | ops_acc],
+                         history_index_key,
+                         history_value
+                       ), swept_acc + 1}
+                    else
+                      {ops_acc, swept_acc}
+                    end
+
+                  _ ->
+                    {ops_acc, swept_acc}
+                end
+              end)
+
+            {ops, swept}
+
+          {:error, _reason} ->
+            {[], 0}
+        end
+
+      :error ->
+        {[{:delete, expire_key}], 0}
+    end
+  end
+
+  defp history_event_before_cutoff?(event_ms, :infinity) when is_integer(event_ms), do: true
+
+  defp history_event_before_cutoff?(event_ms, cutoff_ms)
+       when is_integer(event_ms) and is_integer(cutoff_ms),
+       do: event_ms <= cutoff_ms
+
+  defp history_event_before_cutoff?(_event_ms, _cutoff_ms), do: false
+
+  defp expired_history_entry_ops(path, expire_key, expire_value, now_ms) do
+    case decode_history_expire_value(expire_value) do
+      {:ok, history_index_key} ->
+        case get(path, history_index_key) do
+          {:ok, history_value} ->
+            expired_live_history_ops(expire_key, history_index_key, history_value, now_ms)
+
+          :not_found ->
+            {[{:delete, expire_key}], 0}
+
+          {:error, _reason} ->
+            {[], 0}
+        end
+
+      :error ->
+        {[{:delete, expire_key}], 0}
+    end
+  end
+
+  defp expired_live_history_ops(expire_key, history_index_key, history_value, now_ms) do
+    case decode_history_index_value(history_value) do
+      {:ok, {_event_id, _event_ms, expire_at_ms, _compound_key}}
+      when expire_at_ms > 0 and expire_at_ms <= now_ms ->
+        {[{:delete, expire_key}, {:delete, history_index_key}], 1}
+
+      _ ->
+        {[{:delete, expire_key}], 0}
+    end
+  end
+
   defp expired_terminal_entry_ops(path, expire_key, expire_value, counts, now_ms) do
     case decode_terminal_expire_value(expire_value) do
       {:ok, {terminal_key, state_key, count_key}} ->
@@ -598,7 +805,10 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   defp terminal_expire_key_time(key) do
-    prefix = terminal_expire_prefix()
+    expire_key_time(key, terminal_expire_prefix())
+  end
+
+  defp expire_key_time(key, prefix) do
     size = byte_size(prefix)
 
     if byte_size(key) > size + 21 and binary_part(key, 0, size) == prefix do
@@ -632,6 +842,32 @@ defmodule Ferricstore.Flow.LMDB do
       {:ok, {_id, _updated_at_ms, expire_at_ms, _state_key}} when expire_at_ms > 0 ->
         expire_key = terminal_expire_key(expire_at_ms, terminal_key)
         [{:delete, expire_key} | ops]
+
+      _ ->
+        ops
+    end
+  end
+
+  defp history_index_delete_ops(path, history_index_key) do
+    ops = [{:delete, history_index_key}]
+
+    case get(path, history_index_key) do
+      {:ok, history_value} ->
+        history_index_delete_ops_from_value(ops, history_index_key, history_value)
+
+      _ ->
+        ops
+    end
+  end
+
+  defp history_index_delete_ops_from_value(ops, history_index_key, history_value) do
+    maybe_delete_history_expire_key(ops, history_index_key, history_value)
+  end
+
+  defp maybe_delete_history_expire_key(ops, history_index_key, history_value) do
+    case decode_history_index_value(history_value) do
+      {:ok, {_event_id, _event_ms, expire_at_ms, _compound_key}} when expire_at_ms > 0 ->
+        [{:delete, history_expire_key(expire_at_ms, history_index_key)} | ops]
 
       _ ->
         ops

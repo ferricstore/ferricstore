@@ -776,8 +776,11 @@ defmodule Ferricstore.Flow do
 
         prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
         now_ms = now_ms()
+        sweep_limit = flow_history_lmdb_sweep_limit()
 
-        with {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count) do
+        with {:ok, _swept} <-
+               Ferricstore.Flow.LMDB.sweep_expired_history(path, now_ms, sweep_limit),
+             {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count) do
           {:ok, flow_decode_history_index_entries(entries, path, now_ms)}
         end
       end
@@ -1851,6 +1854,10 @@ defmodule Ferricstore.Flow do
     Application.get_env(:ferricstore, :flow_lmdb_terminal_sweep_limit, 10_000)
   end
 
+  defp flow_history_lmdb_sweep_limit do
+    Application.get_env(:ferricstore, :flow_lmdb_history_sweep_limit, 10_000)
+  end
+
   defp flow_decode_terminal_index_entries(entries, path, now_ms) do
     entries
     |> Enum.flat_map(fn {key, value} ->
@@ -1896,7 +1903,7 @@ defmodule Ferricstore.Flow do
           [{event_id, event_ms}]
 
         {:ok, {_event_id, _event_ms, _expire_at_ms, _compound_key}} ->
-          Ferricstore.Flow.LMDB.write_batch(path, [{:delete, key}])
+          Ferricstore.Flow.LMDB.delete_history_index_entry(path, key)
           []
 
         :error ->
