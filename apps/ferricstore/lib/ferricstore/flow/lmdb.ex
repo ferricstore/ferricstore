@@ -111,6 +111,8 @@ defmodule Ferricstore.Flow.LMDB do
     "flow-terminal-count:" <> state_index_key
   end
 
+  def terminal_count_prefix, do: "flow-terminal-count:"
+
   def terminal_expire_prefix, do: "flow-terminal-expire:"
 
   def terminal_expire_key(expire_at_ms, terminal_key)

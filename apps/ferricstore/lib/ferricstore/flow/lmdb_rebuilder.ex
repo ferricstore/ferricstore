@@ -26,31 +26,72 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     stats =
       keydir
       |> select_state_entries()
-      |> Enum.reduce(%{seen: 0, lmdb: 0, terminal: 0, active: 0, lmdb_errors: 0}, fn entries,
-                                                                                     acc ->
-        reconcile_batch(
-          entries,
-          shard_path,
-          lmdb_path,
-          keydir,
-          shard_index,
-          instance_ctx,
-          zset_score_index,
-          zset_score_lookup,
-          flow_index,
-          flow_lookup,
-          acc
-        )
-      end)
+      |> Enum.reduce(
+        %{seen: 0, lmdb: 0, terminal: 0, active: 0, lmdb_errors: 0, terminal_counts: %{}},
+        fn entries, acc ->
+          reconcile_batch(
+            entries,
+            shard_path,
+            lmdb_path,
+            keydir,
+            shard_index,
+            instance_ctx,
+            zset_score_index,
+            zset_score_lookup,
+            flow_index,
+            flow_lookup,
+            acc
+          )
+        end
+      )
+      |> persist_terminal_counts(lmdb_path)
       |> Map.put(:history, rebuild_flow_history_indexes(keydir, flow_index, flow_lookup))
+
+    telemetry_stats =
+      stats
+      |> Map.put(:terminal_count_keys, map_size(stats.terminal_counts))
+      |> Map.delete(:terminal_counts)
 
     :telemetry.execute(
       [:ferricstore, :flow, :lmdb_rebuild],
-      stats,
+      telemetry_stats,
       %{shard_index: shard_index}
     )
 
     :ok
+  end
+
+  defp persist_terminal_counts(%{terminal_counts: counts} = stats, lmdb_path) do
+    count_keys =
+      lmdb_path
+      |> existing_terminal_count_keys()
+      |> MapSet.union(MapSet.new(Map.keys(counts)))
+
+    ops =
+      Enum.map(count_keys, fn count_key ->
+        {:put, count_key, LMDB.encode_count(Map.get(counts, count_key, 0))}
+      end)
+
+    case LMDB.write_batch(lmdb_path, ops) do
+      :ok ->
+        Enum.each(count_keys, fn count_key ->
+          LMDB.put_cached_terminal_count_key(lmdb_path, count_key, Map.get(counts, count_key, 0))
+        end)
+
+        stats
+
+      {:error, _reason} ->
+        %{stats | lmdb_errors: stats.lmdb_errors + 1}
+    end
+  end
+
+  defp existing_terminal_count_keys(lmdb_path) do
+    limit = Application.get_env(:ferricstore, :flow_lmdb_rebuild_count_key_scan_limit, 1_000_000)
+
+    case LMDB.prefix_entries(lmdb_path, LMDB.terminal_count_prefix(), limit) do
+      {:ok, entries} -> MapSet.new(entries, fn {key, _value} -> key end)
+      {:error, _reason} -> MapSet.new()
+    end
   end
 
   defp reconcile_batch(
@@ -68,22 +109,40 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
        ) do
     decoded = read_and_decode(entries, shard_path)
 
-    {ops, terminal_prunes, active_records} =
-      Enum.reduce(decoded, {[], [], []}, fn {key, value, expire_at_ms, record},
-                                            {ops, prunes, active} ->
+    {ops, terminal_prunes, active_records, terminal_counts} =
+      Enum.reduce(decoded, {[], [], [], acc.terminal_counts}, fn {key, value, expire_at_ms,
+                                                                  record},
+                                                                 {ops, prunes, active, counts} ->
         lmdb_ops = [{:put, key, LMDB.encode_value(value, expire_at_ms)} | ops]
 
         if LMDB.terminal_state?(Map.get(record, :state)) do
           index_key =
             Flow.Keys.state_index_key(record.type, record.state, Map.get(record, :partition_key))
 
+          count_key = LMDB.terminal_count_key(index_key)
           updated_at_ms = Map.get(record, :updated_at_ms, 0)
 
           terminal_key =
             LMDB.terminal_index_key(index_key, record.id, updated_at_ms)
 
           terminal_value =
-            LMDB.encode_terminal_index_value(record.id, updated_at_ms, expire_at_ms, key)
+            LMDB.encode_terminal_index_value(
+              record.id,
+              updated_at_ms,
+              expire_at_ms,
+              key,
+              count_key
+            )
+
+          terminal_expire_key = LMDB.terminal_expire_key(expire_at_ms, terminal_key)
+          terminal_expire_value = LMDB.encode_terminal_expire_value(terminal_key, key, count_key)
+
+          terminal_expire_ops =
+            if is_binary(terminal_expire_key) do
+              [{:put, terminal_expire_key, terminal_expire_value}]
+            else
+              []
+            end
 
           reverse_key = LMDB.terminal_by_state_key_key(key)
           metadata_ops = query_metadata_index_ops(record, expire_at_ms)
@@ -92,15 +151,16 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             [
               {:put, reverse_key, terminal_key},
               {:put, terminal_key, terminal_value}
-              | metadata_ops ++ lmdb_ops
+              | terminal_expire_ops ++ metadata_ops ++ lmdb_ops
             ],
             [{key, record} | prunes],
-            active
+            active,
+            Map.update(counts, count_key, 1, &(&1 + 1))
           }
         else
           {query_metadata_index_ops(record, expire_at_ms) ++
              cleanup_stale_terminal_ops(lmdb_path, key) ++ lmdb_ops, prunes,
-           [{key, record} | active]}
+           [{key, record} | active], counts}
         end
       end)
 
@@ -120,7 +180,9 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           seen: acc.seen + length(entries),
           lmdb: acc.lmdb + length(decoded),
           terminal: acc.terminal + length(terminal_prunes),
-          active: acc.active + length(active_records)
+          active: acc.active + length(active_records),
+          lmdb_errors: acc.lmdb_errors,
+          terminal_counts: terminal_counts
         }
 
       {:error, _reason} ->
