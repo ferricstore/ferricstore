@@ -282,6 +282,43 @@ defmodule Ferricstore.Flow do
   def transition_batch_independent(_ctx, _transitions),
     do: [{:error, "ERR flow opts must be a keyword list"}]
 
+  @doc false
+  def pipeline_write_batch_independent(_ctx, []), do: []
+
+  def pipeline_write_batch_independent(ctx, ops) when is_list(ops) do
+    started = flow_start_time()
+
+    {valid, indexed_results} =
+      ops
+      |> Enum.with_index()
+      |> Enum.reduce({[], %{}}, fn {op, idx}, {valid_acc, result_acc} ->
+        case pipeline_write_command(op) do
+          {:ok, keyed_command} -> {[{idx, keyed_command} | valid_acc], result_acc}
+          {:error, _reason} = error -> {valid_acc, Map.put(result_acc, idx, error)}
+        end
+      end)
+
+    valid = Enum.reverse(valid)
+
+    valid_results =
+      valid
+      |> Enum.map(fn {_idx, keyed_command} -> keyed_command end)
+      |> then(&Router.flow_command_batch(ctx, &1))
+
+    indexed_results =
+      valid
+      |> Enum.map(fn {idx, _keyed_command} -> idx end)
+      |> Enum.zip(valid_results)
+      |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+
+    results = for idx <- 0..(length(ops) - 1), do: Map.fetch!(indexed_results, idx)
+    observe_flow_batch(:pipeline_write, started, results)
+    results
+  end
+
+  def pipeline_write_batch_independent(_ctx, _ops),
+    do: [{:error, "ERR flow opts must be a keyword list"}]
+
   def retry(ctx, id, lease_token, opts)
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
     started = flow_start_time()
@@ -372,28 +409,7 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with :ok <- validate_opts(opts),
-           :ok <- validate_id(id),
-           {:ok, to_event} <- required_binary(opts, :to_event),
-           {:ok, expect_state} <- optional_binary_or_nil(opts, :expect_state, nil),
-           {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms),
-           {:ok, now} <- optional_now_ms(opts),
-           {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
-           :ok <- validate_ref_size(:reason_ref, reason_ref),
-           {:ok, partition_key} <- optional_partition_key(opts),
-           :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-           :ok <- validate_key_size(__MODULE__.Keys.history_key(id, partition_key)) do
-        attrs =
-          %{
-            id: id,
-            to_event: to_event,
-            expect_state: expect_state,
-            run_at_ms: run_at_ms,
-            reason_ref: reason_ref,
-            partition_key: partition_key
-          }
-          |> maybe_put_attr(:now_ms, now)
-
+      with {:ok, attrs} <- rewind_attrs(id, opts) do
         Router.flow_rewind(ctx, attrs)
       end
 
@@ -2092,6 +2108,82 @@ defmodule Ferricstore.Flow do
 
       {:ok, attrs}
     end
+  end
+
+  defp rewind_attrs(id, opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         {:ok, to_event} <- required_binary(opts, :to_event),
+         {:ok, expect_state} <- optional_binary_or_nil(opts, :expect_state, nil),
+         {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms),
+         {:ok, now} <- optional_now_ms(opts),
+         {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
+         :ok <- validate_ref_size(:reason_ref, reason_ref),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+         :ok <- validate_key_size(__MODULE__.Keys.history_key(id, partition_key)) do
+      attrs =
+        %{
+          id: id,
+          to_event: to_event,
+          expect_state: expect_state,
+          run_at_ms: run_at_ms,
+          reason_ref: reason_ref,
+          partition_key: partition_key
+        }
+        |> maybe_put_attr(:now_ms, now)
+
+      {:ok, attrs}
+    end
+  end
+
+  defp pipeline_write_command({:create, id, opts}) do
+    with {:ok, attrs} <- create_attrs(id, opts) do
+      pipeline_state_command(:flow_create, attrs)
+    end
+  end
+
+  defp pipeline_write_command({:transition, id, from_state, to_state, opts}) do
+    with {:ok, attrs} <- transition_attrs(id, from_state, to_state, opts) do
+      pipeline_state_command(:flow_transition, attrs)
+    end
+  end
+
+  defp pipeline_write_command({:complete, id, lease_token, opts}) do
+    with {:ok, attrs} <- complete_attrs(id, lease_token, opts) do
+      pipeline_state_command(:flow_complete, attrs)
+    end
+  end
+
+  defp pipeline_write_command({:retry, id, lease_token, opts}) do
+    with {:ok, attrs} <- retry_attrs(id, lease_token, opts) do
+      pipeline_state_command(:flow_retry, attrs)
+    end
+  end
+
+  defp pipeline_write_command({:fail, id, lease_token, opts}) do
+    with {:ok, attrs} <- fail_attrs(id, lease_token, opts) do
+      pipeline_state_command(:flow_fail, attrs)
+    end
+  end
+
+  defp pipeline_write_command({:cancel, id, opts}) do
+    with {:ok, attrs} <- cancel_attrs(id, opts) do
+      pipeline_state_command(:flow_cancel, attrs)
+    end
+  end
+
+  defp pipeline_write_command({:rewind, id, opts}) do
+    with {:ok, attrs} <- rewind_attrs(id, opts) do
+      pipeline_state_command(:flow_rewind, attrs)
+    end
+  end
+
+  defp pipeline_write_command(_op), do: {:error, "ERR unsupported flow pipeline command"}
+
+  defp pipeline_state_command(command, %{id: id, partition_key: partition_key} = attrs) do
+    key = __MODULE__.Keys.state_key(id, partition_key)
+    {:ok, {key, {command, key, attrs}}}
   end
 
   defp fail_many_attrs(items, opts, partition_key) do

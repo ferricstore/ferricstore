@@ -81,7 +81,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
             result
 
           :fallback ->
-            case try_batch_flow_create_fast_path(commands, state, send_response_fn) do
+            case try_batch_flow_write_fast_path(commands, state, send_response_fn) do
               {:ok, result} ->
                 result
 
@@ -547,13 +547,13 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   # ---------------------------------------------------------------------------
-  # Batch FLOW.CREATE fast path
+  # Batch FLOW write fast path
   # ---------------------------------------------------------------------------
-  # Pipelined one-by-one creates keep per-command semantics, but can still share
-  # one Raft batch. This is intentionally not FLOW.CREATE_MANY: one duplicate
-  # fails only that command, while surrounding creates still commit.
+  # Pipelined one-by-one Flow writes keep per-command semantics, but can still
+  # share one Raft batch per shard. This is intentionally not FLOW.*_MANY: one
+  # bad command fails only that command, while surrounding writes still commit.
 
-  defp try_batch_flow_create_fast_path(commands, state, send_response_fn) do
+  defp try_batch_flow_write_fast_path(commands, state, send_response_fn) do
     if requires_auth?(state) or state.multi_state == :queuing do
       :fallback
     else
@@ -563,13 +563,13 @@ defmodule FerricstoreServer.Connection.Pipeline do
              state.acl_cache.keys == :all)
 
       if acl_ok do
-        case extract_flow_creates(commands) do
-          {:ok, creates} ->
-            Stats.incr_commands_by(state.stats_counter, length(creates))
+        case extract_flow_writes(commands) do
+          {:ok, writes} ->
+            Stats.incr_commands_by(state.stats_counter, length(writes))
 
             response =
               state.instance_ctx
-              |> Ferricstore.Flow.create_batch_independent(creates)
+              |> Ferricstore.Flow.pipeline_write_batch_independent(writes)
               |> Enum.map(&encode_flow_result/1)
 
             send_response_fn.(state.socket, state.transport, response)
@@ -584,18 +584,67 @@ defmodule FerricstoreServer.Connection.Pipeline do
     end
   end
 
-  defp extract_flow_creates(commands), do: extract_flow_creates(commands, [])
+  defp extract_flow_writes(commands), do: extract_flow_writes(commands, [])
 
-  defp extract_flow_creates([], acc), do: {:ok, Enum.reverse(acc)}
+  defp extract_flow_writes([], acc), do: {:ok, Enum.reverse(acc)}
 
-  defp extract_flow_creates(
+  defp extract_flow_writes(
          [{:command, "FLOW.CREATE", _args, {:flow_create, id, opts}, _keys} | rest],
          acc
        )
        when is_binary(id) and is_list(opts),
-       do: extract_flow_creates(rest, [{id, opts} | acc])
+       do: extract_flow_writes(rest, [{:create, id, opts} | acc])
 
-  defp extract_flow_creates(_commands, _acc), do: :fallback
+  defp extract_flow_writes(
+         [
+           {:command, "FLOW.TRANSITION", _args,
+            {:flow_transition, id, from_state, to_state, opts}, _keys}
+           | rest
+         ],
+         acc
+       )
+       when is_binary(id) and is_binary(from_state) and is_binary(to_state) and is_list(opts),
+       do: extract_flow_writes(rest, [{:transition, id, from_state, to_state, opts} | acc])
+
+  defp extract_flow_writes(
+         [
+           {:command, "FLOW.COMPLETE", _args, {:flow_complete, id, lease_token, opts}, _keys}
+           | rest
+         ],
+         acc
+       )
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: extract_flow_writes(rest, [{:complete, id, lease_token, opts} | acc])
+
+  defp extract_flow_writes(
+         [{:command, "FLOW.RETRY", _args, {:flow_retry, id, lease_token, opts}, _keys} | rest],
+         acc
+       )
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: extract_flow_writes(rest, [{:retry, id, lease_token, opts} | acc])
+
+  defp extract_flow_writes(
+         [{:command, "FLOW.FAIL", _args, {:flow_fail, id, lease_token, opts}, _keys} | rest],
+         acc
+       )
+       when is_binary(id) and is_binary(lease_token) and is_list(opts),
+       do: extract_flow_writes(rest, [{:fail, id, lease_token, opts} | acc])
+
+  defp extract_flow_writes(
+         [{:command, "FLOW.CANCEL", _args, {:flow_cancel, id, opts}, _keys} | rest],
+         acc
+       )
+       when is_binary(id) and is_list(opts),
+       do: extract_flow_writes(rest, [{:cancel, id, opts} | acc])
+
+  defp extract_flow_writes(
+         [{:command, "FLOW.REWIND", _args, {:flow_rewind, id, opts}, _keys} | rest],
+         acc
+       )
+       when is_binary(id) and is_list(opts),
+       do: extract_flow_writes(rest, [{:rewind, id, opts} | acc])
+
+  defp extract_flow_writes(_commands, _acc), do: :fallback
 
   defp encode_flow_result(result) do
     result

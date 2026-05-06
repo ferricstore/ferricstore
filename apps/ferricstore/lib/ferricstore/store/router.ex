@@ -2147,6 +2147,20 @@ defmodule Ferricstore.Store.Router do
     batch_quorum_commands(ctx, keyed_commands, nil)
   end
 
+  @doc false
+  def flow_command_batch(_ctx, []), do: []
+
+  def flow_command_batch(ctx, keyed_commands) when is_list(keyed_commands) do
+    if ctx.name == :default do
+      batch_quorum_commands(ctx, keyed_commands)
+    else
+      Enum.map(keyed_commands, fn {key, command} ->
+        idx = shard_for(ctx, key)
+        raft_write(ctx, idx, key, command)
+      end)
+    end
+  end
+
   defp batch_quorum_commands(_ctx, [], _origin_node), do: []
 
   defp batch_quorum_commands(ctx, keyed_commands, origin_node) do
