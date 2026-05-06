@@ -14,7 +14,7 @@ packages:
   - libssl-dev
   - automake
   - autoconf
-  - libncurses5-dev
+  - libncurses-dev
   - cpufrequtils
   - nvme-cli
 

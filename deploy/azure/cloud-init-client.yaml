@@ -13,7 +13,7 @@ packages:
   - libssl-dev
   - automake
   - autoconf
-  - libncurses5-dev
+  - libncurses-dev
   - libevent-dev
   - pkg-config
 
