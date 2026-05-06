@@ -261,6 +261,11 @@ defmodule Ferricstore.Flow.LMDBWriter do
   @impl true
   def handle_info(:flush, state), do: {:noreply, flush_pending(%{state | timer_ref: nil})}
 
+  def handle_info({:apply_after_flush, action}, state) do
+    apply_after_flush(action)
+    {:noreply, state}
+  end
+
   defp ensure_timer(%{timer_ref: nil, flush_interval_ms: interval} = state) do
     %{state | timer_ref: Process.send_after(self(), :flush, interval)}
   end
@@ -675,6 +680,33 @@ defmodule Ferricstore.Flow.LMDBWriter do
     :ok
   end
 
+  defp apply_after_flush(
+         {:prune_terminal_flow, ets, zset_index, zset_lookup, flow_index, flow_lookup, state_key,
+          state_index_key, metadata_index_keys, id, version}
+       ) do
+    prune_terminal_state_key(ets, state_key, version)
+
+    safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
+    safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id)
+
+    Enum.each(metadata_index_keys, fn index_key ->
+      safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id)
+    end)
+
+    :ok
+  end
+
+  defp apply_after_flush({:defer_after_flush, delay_ms, action}) do
+    delay_ms = normalize_delay_ms(delay_ms)
+
+    if delay_ms > 0 do
+      Process.send_after(self(), {:apply_after_flush, action}, delay_ms)
+      :ok
+    else
+      apply_after_flush(action)
+    end
+  end
+
   defp apply_after_flush({:delete_flow_tombstone, ets, key}) do
     case :ets.lookup(ets, key) do
       [{^key, nil, 0, :flow_state_deleted, :deleted, 0, 0}] -> :ets.delete(ets, key)
@@ -685,6 +717,9 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp apply_after_flush(_action), do: :ok
+
+  defp normalize_delay_ms(delay_ms) when is_integer(delay_ms) and delay_ms >= 0, do: delay_ms
+  defp normalize_delay_ms(_delay_ms), do: 0
 
   defp safe_zset_delete_member(nil, _zset_lookup, _state_index_key, _id), do: :ok
   defp safe_zset_delete_member(_zset_index, nil, _state_index_key, _id), do: :ok

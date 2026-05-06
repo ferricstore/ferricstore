@@ -768,10 +768,12 @@ defmodule Ferricstore.Flow.LMDBTest do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
     old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+    old_hot_ttl = Application.get_env(:ferricstore, :flow_terminal_hot_ttl_ms)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
     Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
     Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 1_000_000)
+    Application.put_env(:ferricstore, :flow_terminal_hot_ttl_ms, 0)
 
     ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
 
@@ -780,6 +782,7 @@ defmodule Ferricstore.Flow.LMDBTest do
       restore_env(:flow_lmdb_mode, old_mode)
       restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
       restore_env(:flow_lmdb_max_batch_ops, old_max_batch_ops)
+      restore_env(:flow_terminal_hot_ttl_ms, old_hot_ttl)
     end)
 
     partition_key = "tenant-a"
@@ -1587,6 +1590,86 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert {:ok, %{completed: 1}} =
              Ferricstore.Flow.info(ctx, "degraded-hot", partition_key: partition_key)
+  end
+
+  test "terminal records stay in hot index until terminal hot ttl after LMDB flush" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_hot_ttl = Application.get_env(:ferricstore, :flow_terminal_hot_ttl_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_terminal_hot_ttl_ms, 30)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_terminal_hot_ttl_ms, old_hot_ttl)
+    end)
+
+    partition_key = "tenant-hot-terminal-retention"
+    flow_type = "hot-terminal-retention"
+    id = "flow-hot-terminal-retention"
+    parent = "parent-hot-terminal-retention"
+    correlation = "correlation-hot-terminal-retention"
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               parent_flow_id: parent,
+               correlation_id: correlation,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-hot-terminal-retention",
+               partition_key: partition_key,
+               now_ms: 1_000
+             )
+
+    assert {:ok, %{state: "completed"}} =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    assert {:ok, [%{id: ^id}]} =
+             Ferricstore.Flow.list(ctx, flow_type,
+               state: "completed",
+               partition_key: partition_key
+             )
+
+    assert {:ok, [%{id: ^id}]} =
+             Ferricstore.Flow.by_parent(ctx, parent, partition_key: partition_key)
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn ->
+        match?(
+          {:ok, []},
+          Ferricstore.Flow.list(ctx, flow_type,
+            state: "completed",
+            partition_key: partition_key
+          )
+        )
+      end,
+      "terminal hot index was not pruned after retention ttl",
+      100,
+      10
+    )
+
+    assert {:ok, []} = Ferricstore.Flow.by_parent(ctx, parent, partition_key: partition_key)
+
+    assert {:ok, [%{id: ^id}]} =
+             Ferricstore.Flow.by_correlation(ctx, correlation,
+               partition_key: partition_key,
+               include_cold: true
+             )
   end
 
   test "LMDB rebuild counts cold-read failures and marks mirror degraded" do

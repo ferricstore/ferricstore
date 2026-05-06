@@ -1471,13 +1471,20 @@ defmodule Ferricstore.Flow do
          index_key,
          state,
          partition_key,
-         _ram_count,
+         ram_count,
          lmdb_count
        )
        when state in @terminal_states and lmdb_count > 0 do
-    with {:ok, ram_count} <- flow_zcard(ctx, index_key),
-         {:ok, lmdb_count} <- flow_terminal_lmdb_count(ctx, index_key, state, partition_key) do
-      {:ok, ram_count + lmdb_count}
+    with {:ok, ram_ids} <- flow_maybe_zrange_all(ctx, index_key, ram_count),
+         {:ok, lmdb_ids} <-
+           flow_terminal_lmdb_ids(ctx, index_key, state, partition_key, lmdb_count, true, false) do
+      count =
+        ram_ids
+        |> MapSet.new()
+        |> MapSet.union(MapSet.new(lmdb_ids))
+        |> MapSet.size()
+
+      {:ok, count}
     end
   end
 
@@ -1491,6 +1498,9 @@ defmodule Ferricstore.Flow do
        ) do
     {:ok, ram_count + lmdb_count}
   end
+
+  defp flow_maybe_zrange_all(_ctx, _index_key, count) when count <= 0, do: {:ok, []}
+  defp flow_maybe_zrange_all(ctx, index_key, count), do: flow_zrange(ctx, index_key, 0, count - 1)
 
   defp flow_terminal_lmdb_ids(
          _ctx,
@@ -1672,29 +1682,6 @@ defmodule Ferricstore.Flow do
     |> max(count)
   end
 
-  defp flow_terminal_lmdb_count(_ctx, _index_key, state, _partition_key)
-       when state not in @terminal_states,
-       do: {:ok, 0}
-
-  defp flow_terminal_lmdb_count(ctx, index_key, _state, partition_key) do
-    with :ok <- flow_require_lmdb_mirror_healthy(ctx, index_key, partition_key) do
-      prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
-      now_ms = now_ms()
-      sweep_limit = flow_terminal_lmdb_sweep_limit()
-
-      ctx
-      |> flow_lmdb_paths_for_index(index_key, partition_key)
-      |> Enum.reduce_while({:ok, 0}, fn path, {:ok, acc} ->
-        with {:ok, count} <-
-               flow_terminal_lmdb_count_for_path(path, index_key, prefix, now_ms, sweep_limit) do
-          {:cont, {:ok, acc + count}}
-        else
-          {:error, _reason} = error -> {:halt, error}
-        end
-      end)
-    end
-  end
-
   defp flow_require_lmdb_mirror_healthy(ctx, index_key, partition_key) do
     if Ferricstore.Flow.LMDB.mirror?() and
          flow_lmdb_mirror_degraded?(ctx, index_key, partition_key) do
@@ -1755,27 +1742,6 @@ defmodule Ferricstore.Flow do
       |> Ferricstore.DataDir.shard_data_path(shard_index)
       |> Ferricstore.Flow.LMDB.path()
     ]
-  end
-
-  defp flow_terminal_lmdb_count_for_path(path, index_key, _prefix, now_ms, sweep_limit) do
-    case Ferricstore.Flow.LMDB.terminal_count(path, index_key) do
-      {:ok, 0} -> {:ok, 0}
-      {:ok, _count} -> flow_terminal_lmdb_sweep_then_count(path, index_key, now_ms, sweep_limit)
-      :not_found -> {:ok, 0}
-      {:error, _reason} = error -> error
-    end
-  end
-
-  defp flow_terminal_lmdb_sweep_then_count(path, index_key, now_ms, sweep_limit) do
-    with {:ok, _swept} <- Ferricstore.Flow.LMDB.sweep_expired_terminal(path, now_ms, sweep_limit) do
-      case Ferricstore.Flow.LMDB.terminal_count(path, index_key) do
-        {:ok, count} -> {:ok, count}
-        :not_found -> {:ok, 0}
-        {:error, _reason} = error -> error
-      end
-    else
-      {:error, _reason} = error -> error
-    end
   end
 
   defp flow_terminal_lmdb_sweep_limit do

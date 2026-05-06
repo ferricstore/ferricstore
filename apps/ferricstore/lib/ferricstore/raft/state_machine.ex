@@ -7570,6 +7570,7 @@ defmodule Ferricstore.Raft.StateMachine do
       Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, record.id, updated_at_ms)
 
     count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+    metadata_index_keys = flow_metadata_index_keys(record)
 
     queue_pending_lmdb_mirror_terminal_put(
       index_key,
@@ -7585,14 +7586,41 @@ defmodule Ferricstore.Raft.StateMachine do
     )
 
     queue_pending_lmdb_mirror_after_flush(
-      {:prune_terminal_flow, state.ets, Map.get(state, :zset_score_index_name),
-       Map.get(state, :zset_score_lookup_name), Map.get(state, :flow_index_name),
-       Map.get(state, :flow_lookup_name), state_key, state_index_key, record.id,
-       Map.fetch!(record, :version)}
+      {:defer_after_flush, flow_terminal_hot_ttl_ms(),
+       {:prune_terminal_flow, state.ets, Map.get(state, :zset_score_index_name),
+        Map.get(state, :zset_score_lookup_name), Map.get(state, :flow_index_name),
+        Map.get(state, :flow_lookup_name), state_key, state_index_key, metadata_index_keys,
+        record.id, Map.fetch!(record, :version)}}
     )
 
     queue_lmdb_metadata_index_puts(record, expire_at_ms)
   end
+
+  defp flow_metadata_index_keys(record) do
+    record
+    |> flow_metadata_index_entries()
+    |> Enum.map(fn {index_key, _id, _score} -> index_key end)
+    |> Enum.uniq()
+  end
+
+  defp flow_terminal_hot_ttl_ms do
+    :ferricstore
+    |> Application.get_env(:flow_terminal_hot_ttl_ms, 3_600_000)
+    |> normalize_non_negative_integer(3_600_000)
+  end
+
+  defp normalize_non_negative_integer(value, _default)
+       when is_integer(value) and value >= 0,
+       do: value
+
+  defp normalize_non_negative_integer(value, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, ""} when parsed >= 0 -> parsed
+      _other -> default
+    end
+  end
+
+  defp normalize_non_negative_integer(_value, default), do: default
 
   defp queue_lmdb_metadata_index_puts(record, expire_at_ms) do
     state_key = FlowKeys.state_key(record.id, Map.get(record, :partition_key))
