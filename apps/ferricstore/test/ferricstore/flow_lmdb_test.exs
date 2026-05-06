@@ -594,7 +594,23 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.create(ctx, "mirror-enqueue-degraded",
                type: "mirror-enqueue-degraded",
                partition_key: "tenant-mirror-enqueue-degraded",
-               correlation_id: "correlation-mirror-enqueue-degraded"
+               correlation_id: "correlation-mirror-enqueue-degraded",
+               run_at_ms: 1,
+               now_ms: 1
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, "mirror-enqueue-degraded",
+               partition_key: "tenant-mirror-enqueue-degraded",
+               worker: "worker-mirror-enqueue-degraded",
+               now_ms: 2
+             )
+
+    assert {:ok, %{state: "completed"}} =
+             Ferricstore.Flow.complete(ctx, claimed.id, claimed.lease_token,
+               partition_key: "tenant-mirror-enqueue-degraded",
+               fencing_token: claimed.fencing_token,
+               now_ms: 3
              )
 
     assert :atomics.get(ctx.flow_lmdb_mirror_enqueue_failures, 1) == 1
@@ -966,8 +982,11 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert rewound.state == "queued"
     assert rewound.version == 4
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
-    assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(path, root_prefix)
-    assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(path, correlation_prefix)
+    assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(path, root_prefix)
+    assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(path, correlation_prefix)
+
+    assert {:ok, [%{id: "flow-a", state: "queued"}]} =
+             Ferricstore.Flow.by_correlation(ctx, correlation_id, partition_key: partition_key)
   end
 
   test "lineage queries post-filter stale LMDB secondary index entries" do
@@ -2129,6 +2148,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
     old_max_batch_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+    old_trap = Process.flag(:trap_exit, true)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
     Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
@@ -2137,6 +2157,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
 
     on_exit(fn ->
+      Process.flag(:trap_exit, old_trap)
       Ferricstore.Test.IsolatedInstance.checkin(ctx)
       restore_env(:flow_lmdb_mode, old_mode)
       restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
@@ -2178,8 +2199,8 @@ defmodule Ferricstore.Flow.LMDBTest do
     writer_pid = Process.whereis(writer_name)
     assert is_pid(writer_pid)
     ref = Process.monitor(writer_pid)
-    :ok = GenServer.stop(writer_pid, :normal, 5_000)
-    assert_receive {:DOWN, ^ref, :process, ^writer_pid, :normal}
+    Process.exit(writer_pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^writer_pid, :killed}
 
     lmdb_path =
       ctx.data_dir |> Ferricstore.DataDir.shard_data_path(0) |> Ferricstore.Flow.LMDB.path()
