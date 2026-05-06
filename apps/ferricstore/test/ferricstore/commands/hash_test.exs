@@ -108,6 +108,59 @@ defmodule Ferricstore.Commands.HashTest do
 
       refute_received {:compound_batch_put, _}
     end
+
+    test "HSET rolls back new type metadata when field write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+      field_key = CompoundKey.hash_field("hash", "f1")
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key -> nil
+          "hash", ^field_key -> nil
+        end,
+        compound_put: fn "hash", ^type_key, "hash", 0 ->
+          send(parent, :type_written)
+          :ok
+        end,
+        compound_batch_get: fn "hash", [^field_key] -> [nil] end,
+        compound_batch_put: fn "hash", [{^field_key, "v1", 0}] ->
+          {:error, :disk_full}
+        end,
+        compound_delete: fn "hash", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, :disk_full} == Hash.handle("HSET", ["hash", "f1", "v1"], store)
+      assert_received :type_written
+      assert_received :type_deleted
+    end
+
+    test "HSET preserves existing type metadata when later field write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+      field_key = CompoundKey.hash_field("hash", "f1")
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key -> "hash"
+          "hash", ^field_key -> nil
+        end,
+        compound_batch_get: fn "hash", [^field_key] -> [nil] end,
+        compound_batch_put: fn "hash", [{^field_key, "v1", 0}] ->
+          {:error, :disk_full}
+        end,
+        compound_delete: fn "hash", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, :disk_full} == Hash.handle("HSET", ["hash", "f1", "v1"], store)
+      refute_received :type_deleted
+    end
   end
 
   # ---------------------------------------------------------------------------

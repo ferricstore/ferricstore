@@ -58,9 +58,7 @@ defmodule Ferricstore.Commands.Hash do
     [_ | field_value_pairs] = args
 
     if even_length?(field_value_pairs) do
-      with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
-        hset_pairs(field_value_pairs, key, store, 0)
-      end
+      hset_fields(key, field_value_pairs, store)
     else
       {:error, "ERR wrong number of arguments for 'hset' command"}
     end
@@ -883,15 +881,20 @@ defmodule Ferricstore.Commands.Hash do
     [_ | field_value_pairs] = args
 
     if even_length?(field_value_pairs) do
-      with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
-        hset_pairs(field_value_pairs, key, store, 0)
-      end
+      hset_fields(key, field_value_pairs, store)
     else
       {:error, "ERR wrong number of arguments for 'hset' command"}
     end
   end
 
   defp hset_args(_args, _store), do: {:error, "ERR wrong number of arguments for 'hset' command"}
+
+  defp hset_fields(key, field_value_pairs, store) do
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :hash, store) do
+      hset_pairs(field_value_pairs, key, store, type_status)
+    end
+  end
 
   defp hget_field(key, field, store) do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
@@ -1264,7 +1267,7 @@ defmodule Ferricstore.Commands.Hash do
     end
   end
 
-  defp hset_pairs(field_value_pairs, key, store, _acc) do
+  defp hset_pairs(field_value_pairs, key, store, type_status) do
     {fields, values_by_field} = collapse_field_values(field_value_pairs, [], %{})
     compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
 
@@ -1282,9 +1285,21 @@ defmodule Ferricstore.Commands.Hash do
 
     case Ops.compound_batch_put(store, key, entries) do
       :ok -> added
-      {:error, _} = err -> err
+      {:error, _} = err -> rollback_new_hash_type_marker(key, store, type_status, err)
     end
   end
+
+  defp rollback_new_hash_type_marker(key, store, {:ok, :created}, write_error) do
+    case TypeRegistry.delete_type(key, store) do
+      :ok ->
+        write_error
+
+      {:error, _} = rollback_error ->
+        {:error, {:hset_type_marker_rollback_failed, write_error, rollback_error}}
+    end
+  end
+
+  defp rollback_new_hash_type_marker(_key, _store, :ok, write_error), do: write_error
 
   defp collapse_field_values([], fields_rev, values_by_field) do
     {Enum.reverse(fields_rev), values_by_field}
