@@ -13,6 +13,14 @@ defmodule Ferricstore.Flow do
   @max_ref_size 4_096
   @record_tag :flow_record_v1
   @history_tag :flow_history_v1
+
+  # Flow records and history are durable bytes. These magic values are the
+  # on-disk wire versions, not cosmetic prefixes. If the binary field order,
+  # field type, or required semantics change incompatibly, add a new magic
+  # value (for example FSF2/FSH2) and keep the old decoder path. Do not silently
+  # reinterpret FSF1/FSH1 bytes with a new layout. Rolling upgrades must either
+  # keep writing the lowest cluster-supported format or explicitly block mixed
+  # versions before writing a newer format.
   @record_bin_magic "FSF1"
   @history_bin_magic "FSH1"
 
@@ -352,6 +360,17 @@ defmodule Ferricstore.Flow do
   end
 
   @doc false
+  # Encodes the current Flow metadata schema. User payload bytes are not encoded
+  # here; only payload_ref/result_ref/error_ref metadata is stored. Adding fields
+  # to this binary requires a decoder compatibility decision:
+  #
+  #   * compatible append with old defaults: old decoder must reject or never see
+  #     the new magic during rolling upgrade;
+  #   * incompatible layout/type change: introduce a new magic and decode both;
+  #   * removing/renaming a field: keep decoding old bytes into the current map.
+  #
+  # Tests should keep golden FSF1 fixtures so future changes prove old data can
+  # still boot, query, transition, and compact.
   def encode_record(record) when is_map(record) do
     [
       @record_bin_magic,
@@ -383,6 +402,11 @@ defmodule Ferricstore.Flow do
   end
 
   @doc false
+  # Decodes all supported durable Flow record formats into the current runtime
+  # map shape. This function is on the recovery path for Bitcask, LMDB mirror,
+  # Ra replay, and query hydration, so unknown or corrupt bytes must fail
+  # cleanly. Never remove an old magic decoder until there is a deliberate
+  # offline migration that rewrites every stored record and blocks downgrade.
   def decode_record(@record_bin_magic <> rest), do: decode_record_bin(rest)
 
   def decode_record(value) when is_binary(value) do
@@ -452,6 +476,9 @@ defmodule Ferricstore.Flow do
   defp decode_record_term(record) when is_map(record), do: record
 
   @doc false
+  # History entries have their own durable schema because they are retained for
+  # audit/debug and rewind. Version history separately from Flow records: a new
+  # record encoding does not automatically permit changing FSH1 layout.
   def encode_history_fields(record, event, now_ms)
       when is_map(record) and is_binary(event) and is_integer(now_ms) do
     [
@@ -482,6 +509,8 @@ defmodule Ferricstore.Flow do
   end
 
   @doc false
+  # Decode history into the current RESP-facing field list. Keep old history
+  # decoders even if rewind/debug output gains new fields later.
   def decode_history_fields(@history_bin_magic <> rest), do: decode_history_fields_bin(rest)
 
   def decode_history_fields(value) when is_binary(value) do

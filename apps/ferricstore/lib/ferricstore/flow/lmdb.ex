@@ -32,8 +32,16 @@ defmodule Ferricstore.Flow.LMDB do
 
   def path(shard_data_path), do: Path.join(shard_data_path, "flow_lmdb")
 
+  # LMDB stores Flow state as a wrapper around the already-versioned Flow record
+  # bytes: {expire_at_ms, encoded_record}. The wrapper owns TTL semantics only.
+  # Do not version Flow metadata here or decode user payload here. If the wrapper
+  # itself changes, add a wrapper version and keep decoding this tuple form so
+  # old LMDB mirrors can survive restart/rebuild after upgrade.
   def encode_value(value, expire_at_ms), do: :erlang.term_to_binary({expire_at_ms, value})
 
+  # Returns the wrapped encoded Flow record when it is still live. Callers must
+  # pass the returned value through Ferricstore.Flow.decode_record/1 so the Flow
+  # schema version gate stays centralized in one place.
   def decode_value(blob, now_ms) when is_binary(blob) do
     case :erlang.binary_to_term(blob, [:safe]) do
       {expire_at_ms, value} when is_integer(expire_at_ms) and expire_at_ms > 0 ->
