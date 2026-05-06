@@ -141,6 +141,14 @@ defmodule Ferricstore.FlowTest do
              normal_record
 
     assert byte_size(compact) < byte_size(old_map)
+
+    assert_raise ArgumentError, fn ->
+      Ferricstore.Flow.decode_record("FSF2" <> binary_part(compact, 4, byte_size(compact) - 4))
+    end
+
+    assert_raise ArgumentError, fn ->
+      Ferricstore.Flow.decode_record(binary_part(compact, 0, byte_size(compact) - 1))
+    end
   end
 
   test "flow history encoding is compact and decodes old field lists" do
@@ -218,6 +226,13 @@ defmodule Ferricstore.FlowTest do
     assert Ferricstore.Flow.decode_history_fields(compact) == old_fields
     assert Ferricstore.Flow.decode_history_fields(old) == old_fields
     assert byte_size(compact) < byte_size(old)
+
+    assert Ferricstore.Flow.decode_history_fields(
+             "FSH2" <> binary_part(compact, 4, byte_size(compact) - 4)
+           ) == []
+
+    assert Ferricstore.Flow.decode_history_fields(binary_part(compact, 0, byte_size(compact) - 1)) ==
+             []
   end
 
   test "flow_create stores state and prevents duplicate ids" do
