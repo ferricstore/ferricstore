@@ -10,7 +10,7 @@ defmodule Mix.Tasks.FerricstoreRecoveryKill9Test do
       assert opts.writes == 2_000
       assert opts.batch_size == 1_000
       assert opts.timeout_ms == 120_000
-      assert opts.release_cursor_interval == 20_000
+      assert opts.release_cursor_interval == 200_000
       assert opts.prefix =~ "kill9_"
       assert opts.data_dir =~ "ferricstore_kill9_"
     end

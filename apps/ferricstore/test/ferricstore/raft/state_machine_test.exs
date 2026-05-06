@@ -2881,11 +2881,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "release_cursor log compaction" do
-    test "init/1 stores release_cursor_interval from config", %{store: _store, ets: ets} do
+    test "init/1 stores release_cursor_interval from app env", %{store: _store, ets: ets} do
       state = init_state_for_release_cursor(ets)
 
-      assert is_integer(state.release_cursor_interval)
-      assert state.release_cursor_interval > 0
+      assert state.release_cursor_interval ==
+               Application.fetch_env!(:ferricstore, :release_cursor_interval)
     end
 
     test "init/1 accepts custom release_cursor_interval", %{store: _store, ets: ets} do

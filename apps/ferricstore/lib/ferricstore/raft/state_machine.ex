@@ -52,7 +52,7 @@ defmodule Ferricstore.Raft.StateMachine do
   ## Log compaction (spec 2E.5)
 
   The Raft log grows unbounded unless compacted. Every
-  `:release_cursor_interval` applied commands (default: 20_000), `apply/3`
+  `:release_cursor_interval` applied commands (default: 200_000), `apply/3`
   emits `{:checkpoint, ra_index, state}` and `{:release_cursor, ra_index}`
   effects. This tells ra that all log entries up to `ra_index` are fully
   reflected in the given state checkpoint and can be safely truncated after
@@ -93,7 +93,7 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Transaction.Ast, as: TxAst
 
-  @default_release_cursor_interval 20_000
+  @default_release_cursor_interval 200_000
   @default_max_active_file_size 256 * 1024 * 1024
   @default_fragmentation_threshold 0.5
   @default_dead_bytes_threshold 134_217_728

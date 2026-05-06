@@ -1076,7 +1076,8 @@ defmodule Ferricstore.Store.Shard do
         max_active_file_size: state.max_active_file_size,
         ets: state.ets,
         applied_count: 0,
-        release_cursor_interval: 20_000,
+        release_cursor_interval:
+          Application.get_env(:ferricstore, :release_cursor_interval, 200_000),
         cross_shard_locks: %{},
         cross_shard_intents: %{},
         instance_ctx: state.instance_ctx,
