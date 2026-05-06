@@ -1683,6 +1683,20 @@ defmodule FerricstoreServer.Resp.ParserTest do
                  ],
                  {:flow_claim_due, "checkout",
                   [worker: "worker-a", lease_ms: 30000, limit: 100, now_ms: 1000]}, []},
+                {:command, "FLOW.RECLAIM",
+                 [
+                   "checkout",
+                   "WORKER",
+                   "worker-b",
+                   "LEASE_MS",
+                   "30000",
+                   "LIMIT",
+                   "10",
+                   "NOW",
+                   "2000"
+                 ],
+                 {:flow_reclaim, "checkout",
+                  [worker: "worker-b", lease_ms: 30000, limit: 10, now_ms: 2000]}, []},
                 {:command, "FLOW.COMPLETE",
                  ["flow-1", "lease-1", "FENCING", "1", "RESULT_REF", "result-1"],
                  {:flow_complete, "flow-1", "lease-1",
@@ -1746,6 +1760,7 @@ defmodule FerricstoreServer.Resp.ParserTest do
                Parser.parse_commands(
                  "flow.create flow-1 TYPE checkout STATE queued RUN_AT 1000 PRIORITY 2 PARTITION tenant-a TTL 5000 HISTORY_MAX_EVENTS 10 IDEMPOTENT true\r\n" <>
                    "flow.claim_due checkout WORKER worker-a LEASE_MS 30000 LIMIT 100 NOW 1000\r\n" <>
+                   "flow.reclaim checkout WORKER worker-b LEASE_MS 30000 LIMIT 10 NOW 2000\r\n" <>
                    "flow.complete flow-1 lease-1 FENCING 1 RESULT_REF result-1\r\n" <>
                    "flow.transition flow-1 queued running FENCING 1 LEASE_TOKEN lease-1\r\n" <>
                    "flow.transition_many tenant-a queued running RUN_AT 2000 NOW 1000 ITEMS flow-1 1 - flow-2 2 lease-2\r\n" <>

@@ -438,6 +438,51 @@ defmodule FerricStore.Impl do
   end
 
   # ---------------------------------------------------------------
+  # Flow
+  # ---------------------------------------------------------------
+
+  def flow_create(ctx, id, opts), do: Ferricstore.Flow.create(ctx, id, opts)
+
+  def flow_create_many(ctx, partition_key, items, opts),
+    do: Ferricstore.Flow.create_many(ctx, partition_key, items, opts)
+
+  def flow_get(ctx, id, opts \\ []), do: Ferricstore.Flow.get(ctx, id, opts)
+  def flow_claim_due(ctx, type, opts), do: Ferricstore.Flow.claim_due(ctx, type, opts)
+  def flow_reclaim(ctx, type, opts), do: Ferricstore.Flow.reclaim(ctx, type, opts)
+
+  def flow_complete(ctx, id, lease_token, opts \\ []),
+    do: Ferricstore.Flow.complete(ctx, id, lease_token, opts)
+
+  def flow_transition(ctx, id, from_state, to_state, opts \\ []),
+    do: Ferricstore.Flow.transition(ctx, id, from_state, to_state, opts)
+
+  def flow_transition_many(ctx, partition_key, from_state, to_state, items, opts \\ []),
+    do: Ferricstore.Flow.transition_many(ctx, partition_key, from_state, to_state, items, opts)
+
+  def flow_retry(ctx, id, lease_token, opts),
+    do: Ferricstore.Flow.retry(ctx, id, lease_token, opts)
+
+  def flow_fail(ctx, id, lease_token, opts \\ []),
+    do: Ferricstore.Flow.fail(ctx, id, lease_token, opts)
+
+  def flow_cancel(ctx, id, opts \\ []), do: Ferricstore.Flow.cancel(ctx, id, opts)
+  def flow_rewind(ctx, id, opts), do: Ferricstore.Flow.rewind(ctx, id, opts)
+  def flow_list(ctx, type, opts \\ []), do: Ferricstore.Flow.list(ctx, type, opts)
+
+  def flow_by_parent(ctx, parent_flow_id, opts \\ []),
+    do: Ferricstore.Flow.by_parent(ctx, parent_flow_id, opts)
+
+  def flow_by_root(ctx, root_flow_id, opts \\ []),
+    do: Ferricstore.Flow.by_root(ctx, root_flow_id, opts)
+
+  def flow_by_correlation(ctx, correlation_id, opts \\ []),
+    do: Ferricstore.Flow.by_correlation(ctx, correlation_id, opts)
+
+  def flow_info(ctx, type, opts \\ []), do: Ferricstore.Flow.info(ctx, type, opts)
+  def flow_stuck(ctx, type, opts \\ []), do: Ferricstore.Flow.stuck(ctx, type, opts)
+  def flow_history(ctx, id, opts \\ []), do: Ferricstore.Flow.history(ctx, id, opts)
+
+  # ---------------------------------------------------------------
   # Sorted Set
   # ---------------------------------------------------------------
 
@@ -803,7 +848,9 @@ defmodule FerricStore.Impl do
       exists?: fn key -> Router.exists?(ctx, key) end,
       keys: fn -> Router.keys(ctx) end,
       flush: fn -> flushdb(ctx) end,
-      persistence_barrier: fn -> Ferricstore.Commands.Server.handle("SAVE", [], ctx) end,
+      persistence_barrier: fn ->
+        Ferricstore.Commands.Dispatcher.dispatch_ast({:save, []}, ctx)
+      end,
       dbsize: fn -> Router.dbsize(ctx) end,
       incr: fn key, delta -> Router.incr(ctx, key, delta) end,
       incr_float: fn key, delta -> Router.incr_float(ctx, key, delta) end,

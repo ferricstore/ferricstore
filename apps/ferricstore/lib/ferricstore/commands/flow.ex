@@ -34,6 +34,10 @@ defmodule Ferricstore.Commands.Flow do
     FerricStore.flow_claim_due(type, opts) |> normalize_result()
   end
 
+  def handle_ast({:flow_reclaim, type, opts}, _store) when is_binary(type) and is_list(opts) do
+    FerricStore.flow_reclaim(type, opts) |> normalize_result()
+  end
+
   def handle_ast({:flow_complete, id, lease_token, opts}, _store)
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
     FerricStore.flow_complete(id, lease_token, opts) |> normalize_result()

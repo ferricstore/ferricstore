@@ -106,33 +106,41 @@ defmodule Ferricstore.Flow do
 
   def claim_due(ctx, type, opts) when is_binary(type) and is_list(opts) do
     started = flow_start_time()
-
-    result =
-      with :ok <- validate_opts(opts),
-           :ok <- validate_type(type),
-           {:ok, state} <- optional_binary(opts, :state, @default_state),
-           {:ok, worker} <- required_binary(opts, :worker),
-           {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
-           {:ok, limit} <- optional_pos_integer(opts, :limit, @default_limit),
-           {:ok, priority} <- optional_priority_or_nil(opts),
-           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
-           {:ok, partition_key} <- optional_partition_key(opts),
-           :ok <- validate_claim_due_keys(type, state, priority, partition_key) do
-        attrs = %{
-          type: type,
-          state: state,
-          worker: worker,
-          lease_ms: lease_ms,
-          limit: limit,
-          priority: priority,
-          now_ms: now,
-          partition_key: partition_key
-        }
-
-        Router.flow_claim_due(ctx, attrs)
-      end
+    result = claim_due_result(ctx, type, opts)
 
     observe_flow(:claim_due, started, result, %{flow_type: type})
+  end
+
+  def reclaim(ctx, type, opts) when is_binary(type) and is_list(opts) do
+    started = flow_start_time()
+
+    result = claim_due_result(ctx, type, Keyword.put(opts, :state, "running"))
+
+    observe_flow(:reclaim, started, result, %{flow_type: type})
+  end
+
+  defp claim_due_result(ctx, type, opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_type(type),
+         {:ok, state} <- optional_binary(opts, :state, @default_state),
+         {:ok, worker} <- required_binary(opts, :worker),
+         {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
+         {:ok, limit} <- optional_pos_integer(opts, :limit, @default_limit),
+         {:ok, priority} <- optional_priority_or_nil(opts),
+         {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_claim_due_keys(type, state, priority, partition_key) do
+      Router.flow_claim_due(ctx, %{
+        type: type,
+        state: state,
+        worker: worker,
+        lease_ms: lease_ms,
+        limit: limit,
+        priority: priority,
+        now_ms: now,
+        partition_key: partition_key
+      })
+    end
   end
 
   def complete(ctx, id, lease_token, opts \\ [])

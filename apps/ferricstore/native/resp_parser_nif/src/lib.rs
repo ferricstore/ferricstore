@@ -1563,6 +1563,7 @@ enum CommandAstKind {
     FlowCreateMany,
     FlowGet,
     FlowClaimDue,
+    FlowReclaim,
     FlowComplete,
     FlowTransition,
     FlowTransitionMany,
@@ -1801,6 +1802,7 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"FLOW.CREATE_MANY" => CommandAstKind::FlowCreateMany,
         b"FLOW.GET" => CommandAstKind::FlowGet,
         b"FLOW.CLAIM_DUE" => CommandAstKind::FlowClaimDue,
+        b"FLOW.RECLAIM" => CommandAstKind::FlowReclaim,
         b"FLOW.COMPLETE" => CommandAstKind::FlowComplete,
         b"FLOW.TRANSITION" => CommandAstKind::FlowTransition,
         b"FLOW.TRANSITION_MANY" => CommandAstKind::FlowTransitionMany,
@@ -2236,6 +2238,7 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowCreateMany => make_flow_create_many_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowGet => make_flow_get_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowClaimDue => make_flow_claim_due_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowReclaim => make_flow_reclaim_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowComplete => make_flow_complete_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowTransition => make_flow_transition_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowTransitionMany => {
@@ -5214,6 +5217,22 @@ fn make_flow_claim_due_command_ast<'a>(
     }
 }
 
+fn make_flow_reclaim_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_reclaim");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.reclaim")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_claim_due_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
 fn make_flow_complete_command_ast<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -8094,6 +8113,10 @@ mod tests {
         assert_eq!(
             classify_command_ast(b"FLOW.CLAIM_DUE", 0),
             CommandAstKind::FlowClaimDue
+        );
+        assert_eq!(
+            classify_command_ast(b"FLOW.RECLAIM", 0),
+            CommandAstKind::FlowReclaim
         );
         assert_eq!(
             classify_command_ast(b"FLOW.BY_PARENT", 0),

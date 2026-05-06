@@ -121,6 +121,38 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches Flow reclaim through Rust AST" do
+    id = uid("flow-command-reclaim")
+
+    assert %{"id" => ^id} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [id, "TYPE", "reclaim-command", "RUN_AT", "1000"],
+               MockStore.make()
+             )
+
+    assert [%{"lease_owner" => "worker-a"}] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               ["reclaim-command", "WORKER", "worker-a", "LEASE_MS", "50", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert [] =
+             Dispatcher.dispatch(
+               "FLOW.RECLAIM",
+               ["reclaim-command", "WORKER", "worker-b", "LEASE_MS", "50", "NOW", "1049"],
+               MockStore.make()
+             )
+
+    assert [%{"id" => ^id, "lease_owner" => "worker-b"}] =
+             Dispatcher.dispatch(
+               "FLOW.RECLAIM",
+               ["reclaim-command", "WORKER", "worker-b", "LEASE_MS", "50", "NOW", "1050"],
+               MockStore.make()
+             )
+  end
+
   test "dispatches Flow create_many through Rust AST" do
     partition = uid("tenant")
     type = uid("flow-command-bulk")

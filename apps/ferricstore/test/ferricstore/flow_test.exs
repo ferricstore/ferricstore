@@ -1474,6 +1474,41 @@ defmodule Ferricstore.FlowTest do
     assert second.lease_token != first.lease_token
   end
 
+  test "flow_reclaim exposes expired running lease reclaim" do
+    id = uid("flow-reclaim-api")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id, type: "lease-api", state: "queued", run_at_ms: 1_000)
+
+    assert {:ok, [first]} =
+             FerricStore.flow_claim_due("lease-api",
+               worker: "worker-a",
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, []} =
+             FerricStore.flow_reclaim("lease-api",
+               worker: "worker-b",
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_049
+             )
+
+    assert {:ok, [second]} =
+             FerricStore.flow_reclaim("lease-api",
+               worker: "worker-b",
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_050
+             )
+
+    assert second.id == id
+    assert second.lease_owner == "worker-b"
+    assert second.lease_token != first.lease_token
+  end
+
   test "expired running lease reclaim is partition scoped" do
     partition_a = uid("tenant-reclaim-a")
     partition_b = uid("tenant-reclaim-b")

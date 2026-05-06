@@ -477,7 +477,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _args} = ast, store)
-      when tag in ~w(flow_create flow_get flow_claim_due flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_info flow_stuck flow_history)a,
+      when tag in ~w(flow_create flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_info flow_stuck flow_history)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
@@ -485,7 +485,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
-      when tag in ~w(flow_create flow_get flow_claim_due flow_cancel flow_rewind flow_list flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history)a,
+      when tag in ~w(flow_create flow_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_list flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)
@@ -640,7 +640,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     def dispatch(name, args, store) do
       start = System.monotonic_time(:microsecond)
       frame = encode_test_command(name, args)
-      parser = Module.concat([FerricstoreServer, Resp, Parser])
+      parser = Ferricstore.Resp.Parser
 
       result =
         case apply(parser, :parse_commands, [frame]) do

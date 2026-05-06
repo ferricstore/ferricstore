@@ -430,6 +430,93 @@ defmodule FerricStore.Macro do
       def tdigest_reset(key), do: FerricStore.Impl.tdigest_reset(__instance__(), key)
 
       # ---------------------------------------------------------------
+      # Flow
+      # ---------------------------------------------------------------
+
+      def flow_create(id, opts) do
+        FerricStore.Impl.flow_create(__instance__(), id, opts)
+      end
+
+      def flow_create_many(partition_key, items, opts \\ []) do
+        FerricStore.Impl.flow_create_many(__instance__(), partition_key, items, opts)
+      end
+
+      def flow_get(id, opts \\ []) do
+        FerricStore.Impl.flow_get(__instance__(), id, opts)
+      end
+
+      def flow_claim_due(type, opts) do
+        FerricStore.Impl.flow_claim_due(__instance__(), type, opts)
+      end
+
+      def flow_reclaim(type, opts) do
+        FerricStore.Impl.flow_reclaim(__instance__(), type, opts)
+      end
+
+      def flow_complete(id, lease_token, opts \\ []) do
+        FerricStore.Impl.flow_complete(__instance__(), id, lease_token, opts)
+      end
+
+      def flow_transition(id, from_state, to_state, opts \\ []) do
+        FerricStore.Impl.flow_transition(__instance__(), id, from_state, to_state, opts)
+      end
+
+      def flow_transition_many(partition_key, from_state, to_state, items, opts \\ []) do
+        FerricStore.Impl.flow_transition_many(
+          __instance__(),
+          partition_key,
+          from_state,
+          to_state,
+          items,
+          opts
+        )
+      end
+
+      def flow_retry(id, lease_token, opts) do
+        FerricStore.Impl.flow_retry(__instance__(), id, lease_token, opts)
+      end
+
+      def flow_fail(id, lease_token, opts \\ []) do
+        FerricStore.Impl.flow_fail(__instance__(), id, lease_token, opts)
+      end
+
+      def flow_cancel(id, opts \\ []) do
+        FerricStore.Impl.flow_cancel(__instance__(), id, opts)
+      end
+
+      def flow_rewind(id, opts) do
+        FerricStore.Impl.flow_rewind(__instance__(), id, opts)
+      end
+
+      def flow_list(type, opts \\ []) do
+        FerricStore.Impl.flow_list(__instance__(), type, opts)
+      end
+
+      def flow_by_parent(parent_flow_id, opts \\ []) do
+        FerricStore.Impl.flow_by_parent(__instance__(), parent_flow_id, opts)
+      end
+
+      def flow_by_root(root_flow_id, opts \\ []) do
+        FerricStore.Impl.flow_by_root(__instance__(), root_flow_id, opts)
+      end
+
+      def flow_by_correlation(correlation_id, opts \\ []) do
+        FerricStore.Impl.flow_by_correlation(__instance__(), correlation_id, opts)
+      end
+
+      def flow_info(type, opts \\ []) do
+        FerricStore.Impl.flow_info(__instance__(), type, opts)
+      end
+
+      def flow_stuck(type, opts \\ []) do
+        FerricStore.Impl.flow_stuck(__instance__(), type, opts)
+      end
+
+      def flow_history(id, opts \\ []) do
+        FerricStore.Impl.flow_history(__instance__(), id, opts)
+      end
+
+      # ---------------------------------------------------------------
       # Server / utility
       # ---------------------------------------------------------------
 

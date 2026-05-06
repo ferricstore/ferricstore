@@ -358,6 +358,15 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Claims due workflow records for a worker."
     },
     %{
+      name: "flow.reclaim",
+      arity: -4,
+      flags: ["write"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Reclaims expired running workflow leases for a worker."
+    },
+    %{
       name: "flow.complete",
       arity: -5,
       flags: ["write"],
