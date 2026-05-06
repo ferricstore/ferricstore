@@ -103,6 +103,26 @@ defmodule Ferricstore.Raft.StateMachine do
   @cold_location_retry_attempts 8
   @cold_location_retry_sleep_ms 1
   @sm_apply_state_key :sm_apply_state
+  @sm_pending_write_keys [
+    :sm_pending_writes,
+    :sm_pending_originals,
+    :sm_pending_values,
+    :sm_pending_lmdb_ops,
+    :sm_pending_lmdb_originals,
+    :sm_pending_lmdb_values,
+    :sm_pending_lmdb_mirror_ops,
+    :sm_pending_lmdb_mirror_after_flush
+  ]
+  @sm_pending_write_initial_values [
+    sm_pending_writes: [],
+    sm_pending_originals: %{},
+    sm_pending_values: %{},
+    sm_pending_lmdb_ops: [],
+    sm_pending_lmdb_originals: %{},
+    sm_pending_lmdb_values: %{},
+    sm_pending_lmdb_mirror_ops: [],
+    sm_pending_lmdb_mirror_after_flush: []
+  ]
 
   defguardp valid_cold_location(file_id, offset, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
@@ -4229,14 +4249,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # :pending locations and returns the disk error instead of acknowledging
   # success to the caller.
   defp with_pending_writes(state, fun) do
-    Process.put(:sm_pending_writes, [])
-    Process.put(:sm_pending_originals, %{})
-    Process.put(:sm_pending_values, %{})
-    Process.put(:sm_pending_lmdb_ops, [])
-    Process.put(:sm_pending_lmdb_originals, %{})
-    Process.put(:sm_pending_lmdb_values, %{})
-    Process.put(:sm_pending_lmdb_mirror_ops, [])
-    Process.put(:sm_pending_lmdb_mirror_after_flush, [])
+    init_pending_write_process_state()
     started_at = System.monotonic_time()
 
     try do
@@ -4264,15 +4277,18 @@ defmodule Ferricstore.Raft.StateMachine do
         rollback_pending_writes(state)
         :erlang.raise(kind, reason, __STACKTRACE__)
     after
-      Process.delete(:sm_pending_writes)
-      Process.delete(:sm_pending_originals)
-      Process.delete(:sm_pending_values)
-      Process.delete(:sm_pending_lmdb_ops)
-      Process.delete(:sm_pending_lmdb_originals)
-      Process.delete(:sm_pending_lmdb_values)
-      Process.delete(:sm_pending_lmdb_mirror_ops)
-      Process.delete(:sm_pending_lmdb_mirror_after_flush)
+      clear_pending_write_process_state()
     end
+  end
+
+  defp init_pending_write_process_state do
+    Enum.each(@sm_pending_write_initial_values, fn {key, value} ->
+      Process.put(key, value)
+    end)
+  end
+
+  defp clear_pending_write_process_state do
+    Enum.each(@sm_pending_write_keys, &Process.delete/1)
   end
 
   defp pending_write_error_result?({:error, _reason}), do: true

@@ -31,6 +31,33 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
     assert source =~ "@sm_apply_state_key :sm_apply_state"
   end
 
+  test "pending write apply state declares and clears one key set" do
+    source = File.read!(@state_machine_path)
+
+    [_match, with_pending_body] =
+      Regex.run(
+        ~r/(defp with_pending_writes\(state, fun\) do.*?)(?=\n  defp pending_write_error_result\?)/s,
+        source
+      )
+
+    assert source =~ "@sm_pending_write_keys"
+    assert with_pending_body =~ "init_pending_write_process_state()"
+    assert with_pending_body =~ "clear_pending_write_process_state()"
+
+    for key <- [
+          ":sm_pending_writes",
+          ":sm_pending_originals",
+          ":sm_pending_values",
+          ":sm_pending_lmdb_ops",
+          ":sm_pending_lmdb_originals",
+          ":sm_pending_lmdb_values",
+          ":sm_pending_lmdb_mirror_ops",
+          ":sm_pending_lmdb_mirror_after_flush"
+        ] do
+      assert source =~ key
+    end
+  end
+
   test "no-meta apply path clears consolidated apply process state" do
     source = File.read!(@state_machine_path)
 
