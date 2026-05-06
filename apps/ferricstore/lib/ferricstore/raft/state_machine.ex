@@ -5808,6 +5808,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
     raw_put_cold(state, compound_key, Flow.encode_history_fields(record, event, now_ms), 0)
+    queue_lmdb_history_index_put(record, history_key, event_id, event_ms, compound_key)
 
     {history_key, event_id, event_ms}
   end
@@ -6109,6 +6110,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     case flow_history_indexed_event_fields(state, id, partition_key, history_key, event_id) do
       {:ok, _fields} = ok -> ok
+      :trimmed -> {:error, "ERR flow rewind target event not found"}
       :miss -> flow_history_scanned_event_fields(state, history_key, event_id)
     end
   end
@@ -6126,7 +6128,10 @@ defmodule Ferricstore.Raft.StateMachine do
             :miss
         end
 
-      _ ->
+      :miss ->
+        if flow_index_tables?(state), do: :trimmed, else: :miss
+
+      _other ->
         :miss
     end
   end
@@ -6665,6 +6670,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     with :ok <-
            raw_put_cold(state, compound_key, Flow.encode_history_fields(record, event, now_ms), 0) do
+      queue_lmdb_history_index_put(record, history_key, event_id, event_ms, compound_key)
       flow_history_index_put(state, history_key, event_id, event_ms, version)
     end
   end
@@ -6741,12 +6747,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_history_trim(_state, _record), do: :ok
 
-  defp flow_history_trim_oldest(state, id, partition_key, history_key, delete_count) do
+  defp flow_history_trim_oldest(state, _id, _partition_key, history_key, delete_count) do
     events = flow_index_rank_range(state, history_key, 0, delete_count - 1, false)
     event_ids = Enum.map(events, fn {event_id, _score} -> event_id end)
-    compound_keys = Enum.map(event_ids, &FlowKeys.stream_entry_key(id, &1, partition_key))
 
-    flow_delete_many(state, compound_keys)
     flow_index_delete_members(state, history_key, event_ids)
 
     :ok
@@ -6865,19 +6869,6 @@ defmodule Ferricstore.Raft.StateMachine do
     # at the end of apply/3 before returning to ra.
     queue_pending_put(key, disk_val, expire_at_ms)
 
-    :ok
-  end
-
-  defp flow_delete_many(_state, []), do: :ok
-
-  defp flow_delete_many(state, keys) do
-    Enum.each(keys, fn key ->
-      record_pending_original(state, key)
-      track_keydir_binary_remove(state, key)
-      :ets.delete(state.ets, key)
-    end)
-
-    queue_pending_deletes(keys, nil)
     :ok
   end
 
@@ -7360,22 +7351,6 @@ defmodule Ferricstore.Raft.StateMachine do
     Process.put(:sm_pending_values, Map.delete(pending_values, key))
   end
 
-  defp queue_pending_deletes([], _prob_path), do: :ok
-
-  defp queue_pending_deletes(keys, prob_path) do
-    pending = Process.get(:sm_pending_writes, [])
-
-    pending =
-      Enum.reduce(keys, pending, fn key, acc ->
-        [{:delete, key, prob_path} | acc]
-      end)
-
-    pending_values = Process.get(:sm_pending_values, %{})
-
-    Process.put(:sm_pending_writes, pending)
-    Process.put(:sm_pending_values, Map.drop(pending_values, keys))
-  end
-
   defp emit_raft_apply_telemetry(state, started_at, result, flush_result) do
     :telemetry.execute(
       [:ferricstore, :raft, :apply],
@@ -7665,6 +7640,21 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
 
     :ok
+  end
+
+  defp queue_lmdb_history_index_put(record, history_key, event_id, event_ms, compound_key) do
+    expire_at_ms = flow_record_expire_at(record)
+
+    history_key
+    |> Ferricstore.Flow.LMDB.history_index_key(event_id, event_ms)
+    |> queue_pending_lmdb_mirror_query_put(
+      Ferricstore.Flow.LMDB.encode_history_index_value(
+        event_id,
+        event_ms,
+        compound_key,
+        expire_at_ms
+      )
+    )
   end
 
   defp queue_pending_lmdb_mirror_query_put(query_key, value) do

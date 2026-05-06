@@ -53,6 +53,13 @@ defmodule Ferricstore.Commands.FlowTest do
 
     assert [[_event_id, %{"event" => "created", "version" => "1"}]] =
              Dispatcher.dispatch("FLOW.HISTORY", [id, "COUNT", "10"], MockStore.make())
+
+    assert [[_event_id, %{"event" => "created", "version" => "1"}]] =
+             Dispatcher.dispatch(
+               "FLOW.HISTORY",
+               [id, "COUNT", "10", "INCLUDE_COLD", "true", "CONSISTENT_PROJECTION", "false"],
+               MockStore.make()
+             )
   end
 
   test "dispatches Flow lineage query commands through Rust AST" do

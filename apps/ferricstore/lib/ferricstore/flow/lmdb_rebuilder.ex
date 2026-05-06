@@ -55,7 +55,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       )
       |> persist_terminal_counts(lmdb_path)
       |> Map.put(:cold_read_errors, Process.get(:flow_lmdb_rebuild_cold_read_errors, 0))
-      |> Map.put(:history, rebuild_flow_history_indexes(keydir, flow_index, flow_lookup))
+      |> Map.put(
+        :history,
+        rebuild_flow_history_indexes(keydir, shard_path, flow_index, flow_lookup)
+      )
 
     Process.delete(:flow_lmdb_rebuild_cold_read_errors)
     publish_mirror_health(instance_ctx, shard_index, stats)
@@ -421,28 +424,113 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
   defp maybe_rebuild_flow_running_indexes(_flow_index, _flow_lookup, _record), do: :ok
 
-  defp rebuild_flow_history_indexes(_keydir, nil, _flow_lookup), do: 0
-  defp rebuild_flow_history_indexes(_keydir, _flow_index, nil), do: 0
+  defp rebuild_flow_history_indexes(_keydir, _shard_path, nil, _flow_lookup), do: 0
+  defp rebuild_flow_history_indexes(_keydir, _shard_path, _flow_index, nil), do: 0
 
-  defp rebuild_flow_history_indexes(keydir, flow_index, flow_lookup) do
-    :ets.foldl(
-      fn
-        {key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}, count when is_binary(key) ->
-          case parse_flow_history_entry_key(key) do
-            {:ok, history_key, event_id, event_ms} ->
-              FlowIndex.put_member(flow_index, flow_lookup, history_key, event_id, event_ms)
-              count + 1
+  defp rebuild_flow_history_indexes(keydir, shard_path, flow_index, flow_lookup) do
+    {count, history_keys} =
+      :ets.foldl(
+        fn
+          {key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}, {count, history_keys}
+          when is_binary(key) ->
+            case parse_flow_history_entry_key(key) do
+              {:ok, history_key, event_id, event_ms} ->
+                FlowIndex.put_member(flow_index, flow_lookup, history_key, event_id, event_ms)
+                {count + 1, MapSet.put(history_keys, history_key)}
 
-            :skip ->
-              count
+              :skip ->
+                {count, history_keys}
+            end
+
+          _entry, acc ->
+            acc
+        end,
+        {0, MapSet.new()},
+        keydir
+      )
+
+    trim_rebuilt_flow_history_indexes(keydir, shard_path, flow_index, flow_lookup, history_keys)
+    count
+  end
+
+  defp trim_rebuilt_flow_history_indexes(
+         keydir,
+         shard_path,
+         flow_index,
+         flow_lookup,
+         history_keys
+       ) do
+    Enum.each(history_keys, fn history_key ->
+      case history_max_events_for_key(keydir, shard_path, history_key) do
+        max when is_integer(max) and max > 0 ->
+          case FlowIndex.count_all(flow_lookup, history_key) do
+            count when count > max ->
+              delete_count = count - max
+
+              event_ids =
+                flow_index
+                |> FlowIndex.rank_range(history_key, 0, delete_count - 1, false)
+                |> Enum.map(fn {event_id, _score} -> event_id end)
+
+              FlowIndex.delete_members(flow_index, flow_lookup, history_key, event_ids)
+
+            _ ->
+              :ok
           end
 
-        _entry, count ->
-          count
-      end,
-      0,
-      keydir
-    )
+        _ ->
+          :ok
+      end
+    end)
+
+    :ok
+  end
+
+  defp history_max_events_for_key(keydir, shard_path, history_key) do
+    with {:ok, state_key} <- state_key_from_history_key(history_key),
+         {:ok, record} <- read_rebuild_state_record(keydir, shard_path, state_key) do
+      Map.get(record, :history_max_events)
+    else
+      _ -> nil
+    end
+  end
+
+  defp state_key_from_history_key(history_key) when is_binary(history_key) do
+    case :binary.split(history_key, "}:h:") do
+      [prefix, id] -> {:ok, prefix <> "}:s:" <> id}
+      _ -> :error
+    end
+  end
+
+  defp state_key_from_history_key(_history_key), do: :error
+
+  defp read_rebuild_state_record(keydir, shard_path, state_key) do
+    case :ets.lookup(keydir, state_key) do
+      [{^state_key, value, expire_at_ms, _lfu, _fid, _off, _vsize}] when is_binary(value) ->
+        case decode_state_record(state_key, value, expire_at_ms) do
+          [{_key, _value, _expire_at_ms, record}] -> {:ok, record}
+          _ -> :error
+        end
+
+      [
+        {^state_key, nil, expire_at_ms, _lfu, fid, off, vsize}
+      ]
+      when is_integer(fid) and is_integer(off) and is_integer(vsize) and off >= 0 and vsize >= 0 ->
+        shard_path
+        |> cold_locations_for_state(state_key, expire_at_ms, fid, off, vsize)
+        |> read_cold_locations()
+        |> case do
+          [{_key, _value, _expire_at_ms, record}] -> {:ok, record}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp cold_locations_for_state(shard_path, state_key, expire_at_ms, fid, off, vsize) do
+    cold_locations([{state_key, nil, expire_at_ms, nil, fid, off, vsize}], shard_path)
   end
 
   defp parse_flow_history_entry_key("X:" <> rest) do

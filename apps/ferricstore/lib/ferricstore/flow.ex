@@ -349,9 +349,12 @@ defmodule Ferricstore.Flow do
             {[{idx, id, partition_key, payload_return} | get_acc], history_acc, other_acc,
              result_acc}
 
-          {:history, id, partition_key, history_key, count} ->
-            {get_acc, [{idx, id, partition_key, history_key, count} | history_acc], other_acc,
-             result_acc}
+          {:history, id, partition_key, history_key, count, include_cold?, consistent?} ->
+            {get_acc,
+             [
+               {idx, id, partition_key, history_key, count, include_cold?, consistent?}
+               | history_acc
+             ], other_acc, result_acc}
 
           {:other, fun} ->
             {get_acc, history_acc, [{idx, fun} | other_acc], result_acc}
@@ -676,18 +679,18 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key} <- optional_partition_key(opts),
          history_key = __MODULE__.Keys.history_key(id, partition_key),
          :ok <- validate_key_size(history_key),
-         {:ok, count} <- flow_count(opts) do
-      case Router.flow_index_rank_range(ctx, history_key, 0, count - 1, false) do
-        {:ok, []} ->
-          flow_history_fallback_scan(ctx, history_key, count)
-
-        {:ok, event_refs} ->
-          event_ids = Enum.map(event_refs, fn {event_id, _score} -> event_id end)
-          flow_history_from_event_ids(ctx, id, partition_key, history_key, event_ids)
-
-        :unavailable ->
-          flow_history_fallback_scan(ctx, history_key, count)
-      end
+         {:ok, count} <- flow_count(opts),
+         {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
+         {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false) do
+      flow_history_read(
+        ctx,
+        id,
+        partition_key,
+        history_key,
+        count,
+        include_cold? or consistent_projection?,
+        consistent_projection?
+      )
     end
   end
 
@@ -695,6 +698,106 @@ defmodule Ferricstore.Flow do
     do: {:error, "ERR flow id must be a non-empty string"}
 
   def history(_ctx, _id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  defp flow_history_read(ctx, id, partition_key, history_key, count, false, _consistent?) do
+    case flow_history_hot_refs(ctx, id, partition_key, history_key, count) do
+      {:ok, []} ->
+        flow_history_fallback_scan(ctx, history_key, count)
+
+      {:ok, event_refs} ->
+        event_ids = Enum.map(event_refs, fn {event_id, _score} -> event_id end)
+        flow_history_from_event_ids(ctx, id, partition_key, history_key, event_ids)
+    end
+  end
+
+  defp flow_history_read(ctx, id, partition_key, history_key, count, true, consistent?) do
+    with {:ok, hot_refs} <- flow_history_hot_refs(ctx, id, partition_key, history_key, count),
+         {:ok, cold_refs} <- flow_history_lmdb_refs(ctx, history_key, count, consistent?) do
+      event_ids =
+        (hot_refs ++ cold_refs)
+        |> Enum.sort_by(fn {event_id, score} -> {score, event_id} end)
+        |> Enum.uniq_by(fn {event_id, _score} -> event_id end)
+        |> Enum.take(count)
+        |> Enum.map(fn {event_id, _score} -> event_id end)
+
+      case event_ids do
+        [] -> flow_history_fallback_scan(ctx, history_key, count)
+        _ -> flow_history_from_event_ids(ctx, id, partition_key, history_key, event_ids)
+      end
+    end
+  end
+
+  defp flow_history_hot_refs(ctx, id, partition_key, history_key, count) do
+    {start_idx, stop_idx} = flow_history_hot_range(ctx, id, partition_key, history_key, count)
+
+    case Router.flow_index_rank_range(ctx, history_key, start_idx, stop_idx, false) do
+      {:ok, event_refs} -> {:ok, event_refs}
+      :unavailable -> {:ok, []}
+    end
+  end
+
+  defp flow_history_hot_range(ctx, id, partition_key, history_key, count) do
+    with {:ok, max} <- flow_history_hot_max(ctx, id, partition_key),
+         true <- is_integer(max) and max > 0,
+         {:ok, total} <- flow_zcard(ctx, history_key) do
+      start_idx = max(total - max, 0)
+      {start_idx, start_idx + count - 1}
+    else
+      _ -> {0, count - 1}
+    end
+  end
+
+  defp flow_history_hot_max(ctx, id, partition_key) do
+    case Router.flow_get(ctx, id, partition_key) do
+      value when is_binary(value) ->
+        case safe_decode_record(value) do
+          {:ok, %{history_max_events: max}} -> {:ok, max}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp flow_history_lmdb_refs(_ctx, _history_key, count, _consistent?) when count <= 0,
+    do: {:ok, []}
+
+  defp flow_history_lmdb_refs(ctx, history_key, count, consistent?) do
+    if Ferricstore.Flow.LMDB.mirror?() do
+      shard_index = Router.shard_for(ctx, history_key)
+
+      with :ok <- flow_maybe_flush_lmdb_shard(ctx, shard_index, consistent?),
+           :ok <- flow_require_lmdb_mirror_healthy_shard(ctx, history_key, shard_index) do
+        path =
+          ctx.data_dir
+          |> Ferricstore.DataDir.shard_data_path(shard_index)
+          |> Ferricstore.Flow.LMDB.path()
+
+        prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+        now_ms = now_ms()
+
+        with {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count) do
+          {:ok, flow_decode_history_index_entries(entries, path, now_ms)}
+        end
+      end
+    else
+      {:ok, []}
+    end
+  end
+
+  defp flow_maybe_flush_lmdb_shard(_ctx, _shard_index, false), do: :ok
+
+  defp flow_maybe_flush_lmdb_shard(ctx, shard_index, true),
+    do: Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index)
+
+  defp flow_require_lmdb_mirror_healthy_shard(ctx, index_key, shard_index) do
+    if Ferricstore.Flow.LMDB.mirror?() and flow_lmdb_mirror_degraded_shard?(ctx, shard_index) do
+      {:error, "ERR flow LMDB projection unavailable for #{index_key}"}
+    else
+      :ok
+    end
+  end
 
   defp flow_history_from_event_ids(ctx, id, partition_key, history_key, event_ids) do
     compound_keys =
@@ -1784,6 +1887,24 @@ defmodule Ferricstore.Flow do
     end)
   end
 
+  defp flow_decode_history_index_entries(entries, path, now_ms) do
+    entries
+    |> Enum.flat_map(fn {key, value} ->
+      case Ferricstore.Flow.LMDB.decode_history_index_value(value) do
+        {:ok, {event_id, event_ms, expire_at_ms, _compound_key}}
+        when expire_at_ms <= 0 or expire_at_ms > now_ms ->
+          [{event_id, event_ms}]
+
+        {:ok, {_event_id, _event_ms, _expire_at_ms, _compound_key}} ->
+          Ferricstore.Flow.LMDB.write_batch(path, [{:delete, key}])
+          []
+
+        :error ->
+          []
+      end
+    end)
+  end
+
   defp flow_history_entry_to_tuple({event_id, fields}) when is_list(fields) do
     {event_id, flow_fields_to_map(fields)}
   end
@@ -2350,8 +2471,9 @@ defmodule Ferricstore.Flow do
   end
 
   defp pipeline_read_command(_ctx, {:history, id, opts}) when is_binary(id) and is_list(opts) do
-    with {:ok, {partition_key, history_key, count}} <- history_query_attrs(id, opts) do
-      {:history, id, partition_key, history_key, count}
+    with {:ok, {partition_key, history_key, count, include_cold?, consistent?}} <-
+           history_query_attrs(id, opts) do
+      {:history, id, partition_key, history_key, count, include_cold?, consistent?}
     end
   end
 
@@ -2526,21 +2648,63 @@ defmodule Ferricstore.Flow do
   defp pipeline_read_history_results([], _ctx), do: %{}
 
   defp pipeline_read_history_results(history_ops, ctx) do
-    requests =
-      Enum.map(history_ops, fn {_idx, _id, _partition_key, history_key, count} ->
-        {history_key, 0, count - 1, false}
+    hot_ops =
+      Enum.filter(history_ops, fn
+        {_idx, _id, _partition_key, _history_key, _count, false, false} -> true
+        _cold_or_consistent -> false
       end)
 
-    case Router.flow_index_rank_range_many(ctx, requests) do
+    cold_ops = history_ops -- hot_ops
+
+    cold_results =
+      Map.new(cold_ops, fn {idx, id, partition_key, history_key, count, include_cold?,
+                            consistent?} ->
+        {idx,
+         flow_history_read(
+           ctx,
+           id,
+           partition_key,
+           history_key,
+           count,
+           include_cold? or consistent?,
+           consistent?
+         )}
+      end)
+
+    hot_results =
+      if hot_ops == [] do
+        %{}
+      else
+        pipeline_read_hot_history_results(hot_ops, ctx)
+      end
+
+    Map.merge(hot_results, cold_results)
+  end
+
+  defp pipeline_read_hot_history_results(history_ops, ctx) do
+    requests =
+      Enum.map(history_ops, fn {idx, id, partition_key, history_key, count, false, false} ->
+        {start_idx, stop_idx} = flow_history_hot_range(ctx, id, partition_key, history_key, count)
+        {idx, history_key, start_idx, stop_idx, false}
+      end)
+
+    router_requests =
+      Enum.map(requests, fn {_idx, history_key, start_idx, stop_idx, reverse?} ->
+        {history_key, start_idx, stop_idx, reverse?}
+      end)
+
+    case Router.flow_index_rank_range_many(ctx, router_requests) do
       {:ok, rank_results} ->
         history_ops
         |> Enum.zip(rank_results)
-        |> Map.new(fn {{idx, id, partition_key, history_key, count}, rank_result} ->
+        |> Map.new(fn {{idx, id, partition_key, history_key, count, _include_cold?, _consistent?},
+                       rank_result} ->
           {idx, history_result_from_rank(ctx, id, partition_key, history_key, count, rank_result)}
         end)
 
       :unavailable ->
-        Map.new(history_ops, fn {idx, _id, _partition_key, history_key, count} ->
+        Map.new(history_ops, fn {idx, _id, _partition_key, history_key, count, _include_cold?,
+                                 _consistent?} ->
           {idx, flow_history_fallback_scan(ctx, history_key, count)}
         end)
     end
@@ -2560,8 +2724,10 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key} <- optional_partition_key(opts),
          history_key = __MODULE__.Keys.history_key(id, partition_key),
          :ok <- validate_key_size(history_key),
-         {:ok, count} <- flow_count(opts) do
-      {:ok, {partition_key, history_key, count}}
+         {:ok, count} <- flow_count(opts),
+         {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
+         {:ok, consistent?} <- optional_boolean(opts, :consistent_projection, false) do
+      {:ok, {partition_key, history_key, count, include_cold?, consistent?}}
     end
   end
 

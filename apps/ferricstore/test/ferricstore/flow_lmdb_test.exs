@@ -118,6 +118,29 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1)
   end
 
+  test "history index keys preserve numeric timestamp order in bounded prefix reads" do
+    path =
+      Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
+
+    history_key = Ferricstore.Flow.Keys.history_key("history-order", "tenant-history-order")
+    prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+    older_key = Ferricstore.Flow.LMDB.history_index_key(history_key, "999-1", 999)
+    newer_key = Ferricstore.Flow.LMDB.history_index_key(history_key, "1000-2", 1_000)
+    older_value = Ferricstore.Flow.LMDB.encode_history_index_value("999-1", 999, "X:older")
+    newer_value = Ferricstore.Flow.LMDB.encode_history_index_value("1000-2", 1_000, "X:newer")
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(path, [
+               {:put, newer_key, newer_value},
+               {:put, older_key, older_value}
+             ])
+
+    assert {:ok, [{^older_key, ^older_value}]} =
+             Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1)
+  end
+
   test "flow LMDB mode defaults to mirror and legacy off cannot disable it" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
@@ -1670,6 +1693,138 @@ defmodule Ferricstore.Flow.LMDBTest do
                partition_key: partition_key,
                include_cold: true
              )
+  end
+
+  test "history include_cold returns LMDB-projected events trimmed from hot index" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+    end)
+
+    id = "history-cold-projection"
+    partition_key = "tenant-history-cold-projection"
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.create(ctx, id,
+               type: "history-cold-projection",
+               partition_key: partition_key,
+               history_max_events: 2,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, "history-cold-projection",
+               worker: "worker-history-cold-projection",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    assert {:ok, hot_events} =
+             Ferricstore.Flow.history(ctx, id, partition_key: partition_key, count: 10)
+
+    assert Enum.map(hot_events, fn {_event_id, fields} -> fields["event"] end) == [
+             "claimed",
+             "completed"
+           ]
+
+    assert {:ok, cold_events} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               count: 10,
+               include_cold: true
+             )
+
+    assert Enum.map(cold_events, fn {_event_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed",
+             "completed"
+           ]
+  end
+
+  test "history hot trim survives restart while include_cold reads projected events" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    id = "history-cold-projection-restart"
+    partition_key = "tenant-history-cold-projection-restart"
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.create(ctx, id,
+               type: "history-cold-projection-restart",
+               partition_key: partition_key,
+               history_max_events: 2,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, "history-cold-projection-restart",
+               worker: "worker-history-cold-projection-restart",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+    restart_isolated_shard!(ctx, 0)
+
+    assert {:ok, hot_events} =
+             Ferricstore.Flow.history(ctx, id, partition_key: partition_key, count: 10)
+
+    assert Enum.map(hot_events, fn {_event_id, fields} -> fields["event"] end) == [
+             "claimed",
+             "completed"
+           ]
+
+    assert {:ok, cold_events} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               count: 10,
+               include_cold: true
+             )
+
+    assert Enum.map(cold_events, fn {_event_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed",
+             "completed"
+           ]
   end
 
   test "LMDB rebuild counts cold-read failures and marks mirror degraded" do

@@ -155,6 +155,21 @@ defmodule Ferricstore.Flow.LMDB do
     query_index_key(index_key, id, score)
   end
 
+  def history_index_prefix(history_key) when is_binary(history_key) do
+    "flow-history-index:" <> history_key <> <<0>>
+  end
+
+  def history_index_key(history_key, event_id, event_ms)
+      when is_binary(history_key) and is_binary(event_id) and is_integer(event_ms) do
+    history_index_prefix(history_key) <> pad_u64(event_ms) <> <<0>> <> event_id
+  end
+
+  def encode_history_index_value(event_id, event_ms, compound_key, expire_at_ms \\ 0)
+      when is_binary(event_id) and is_integer(event_ms) and is_integer(expire_at_ms) and
+             is_binary(compound_key) do
+    :erlang.term_to_binary({event_id, event_ms, expire_at_ms, compound_key})
+  end
+
   def encode_query_index_value(id, updated_at_ms, expire_at_ms \\ 0, state_key \\ nil) do
     :erlang.term_to_binary({id, normalize_ms(updated_at_ms), expire_at_ms, state_key})
   end
@@ -459,6 +474,24 @@ defmodule Ferricstore.Flow.LMDB do
       {id, updated_at_ms}
       when is_binary(id) and is_integer(updated_at_ms) ->
         {:ok, {id, updated_at_ms, 0, nil}}
+
+      _ ->
+        :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  def decode_history_index_value(blob) when is_binary(blob) do
+    case :erlang.binary_to_term(blob, [:safe]) do
+      {event_id, event_ms, expire_at_ms, compound_key}
+      when is_binary(event_id) and is_integer(event_ms) and is_integer(expire_at_ms) and
+             is_binary(compound_key) ->
+        {:ok, {event_id, event_ms, expire_at_ms, compound_key}}
+
+      {event_id, event_ms, compound_key}
+      when is_binary(event_id) and is_integer(event_ms) and is_binary(compound_key) ->
+        {:ok, {event_id, event_ms, 0, compound_key}}
 
       _ ->
         :error

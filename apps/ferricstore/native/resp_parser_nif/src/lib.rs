@@ -6404,6 +6404,12 @@ fn flow_history_option<'a>(
         &[
             (b"COUNT", "count", FlowOptType::Positive(b"count")),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"INCLUDE_COLD", "include_cold", FlowOptType::Boolean),
+            (
+                b"CONSISTENT_PROJECTION",
+                "consistent_projection",
+                FlowOptType::Boolean,
+            ),
         ],
     )
 }
