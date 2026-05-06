@@ -660,6 +660,25 @@ defmodule Ferricstore.Commands.SortedSetTest do
       refute_received {:compound_batch_delete, _}
     end
 
+    test "ZPOPMIN uses score-index rank range when available" do
+      parent = self()
+      base_store = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1.0", "a", "2.0", "b", "3.0", "c"], base_store)
+
+      store =
+        base_store
+        |> Map.put(:zset_rank_range, fn redis_key, start_idx, stop_idx, reverse? ->
+          send(parent, {:zset_rank_range, redis_key, start_idx, stop_idx, reverse?})
+          {:ok, [{"a", 1.0}, {"b", 2.0}]}
+        end)
+        |> Map.put(:compound_scan, fn _redis_key, _prefix ->
+          flunk("ZPOPMIN should not scan the full zset when rank index exists")
+        end)
+
+      assert ["a", "1.0", "b", "2.0"] == SortedSet.handle("ZPOPMIN", ["zs", "2"], store)
+      assert_receive {:zset_rank_range, "zs", 0, 1, false}
+    end
+
     test "ZPOPMIN on empty key returns empty list" do
       store = MockStore.make()
       assert [] == SortedSet.handle("ZPOPMIN", ["nonexistent"], store)
@@ -719,6 +738,25 @@ defmodule Ferricstore.Commands.SortedSetTest do
       assert ["c", "3.0", "b", "2.0"] == SortedSet.handle("ZPOPMAX", ["zs", "2"], store)
       assert_received {:compound_batch_delete, ^member_keys}
       refute_received {:compound_batch_delete, _}
+    end
+
+    test "ZPOPMAX uses score-index rank range when available" do
+      parent = self()
+      base_store = MockStore.make()
+      SortedSet.handle("ZADD", ["zs", "1.0", "a", "2.0", "b", "3.0", "c"], base_store)
+
+      store =
+        base_store
+        |> Map.put(:zset_rank_range, fn redis_key, start_idx, stop_idx, reverse? ->
+          send(parent, {:zset_rank_range, redis_key, start_idx, stop_idx, reverse?})
+          {:ok, [{"c", 3.0}, {"b", 2.0}]}
+        end)
+        |> Map.put(:compound_scan, fn _redis_key, _prefix ->
+          flunk("ZPOPMAX should not scan the full zset when rank index exists")
+        end)
+
+      assert ["c", "3.0", "b", "2.0"] == SortedSet.handle("ZPOPMAX", ["zs", "2"], store)
+      assert_receive {:zset_rank_range, "zs", 0, 1, true}
     end
   end
 

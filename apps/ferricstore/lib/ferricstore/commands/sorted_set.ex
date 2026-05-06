@@ -297,8 +297,7 @@ defmodule Ferricstore.Commands.SortedSet do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
       case Integer.parse(count_str) do
         {count, ""} when count >= 0 ->
-          sorted = load_sorted_members(key, store)
-          to_pop = Enum.take(sorted, count)
+          to_pop = zpop_members(key, count, false, store)
 
           result =
             Enum.flat_map(to_pop, fn {member, score} ->
@@ -340,8 +339,7 @@ defmodule Ferricstore.Commands.SortedSet do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
       case Integer.parse(count_str) do
         {count, ""} when count >= 0 ->
-          sorted = load_sorted_members(key, store) |> Enum.reverse()
-          to_pop = Enum.take(sorted, count)
+          to_pop = zpop_members(key, count, true, store)
 
           result =
             Enum.flat_map(to_pop, fn {member, score} ->
@@ -948,14 +946,7 @@ defmodule Ferricstore.Commands.SortedSet do
 
   defp zpop_parsed(key, count, reverse?, store) do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      sorted =
-        if reverse? do
-          load_sorted_members(key, store) |> Enum.reverse()
-        else
-          load_sorted_members(key, store)
-        end
-
-      to_pop = Enum.take(sorted, count)
+      to_pop = zpop_members(key, count, reverse?, store)
 
       result =
         Enum.flat_map(to_pop, fn {member, score} ->
@@ -974,6 +965,25 @@ defmodule Ferricstore.Commands.SortedSet do
         {:error, _} = err ->
           err
       end
+    end
+  end
+
+  defp zpop_members(_key, 0, _reverse?, _store), do: []
+
+  defp zpop_members(key, count, reverse?, store) do
+    case Ops.zset_rank_range(store, key, 0, count - 1, reverse?) do
+      {:ok, members} ->
+        members
+
+      :unavailable ->
+        sorted =
+          if reverse? do
+            load_sorted_members(key, store) |> Enum.reverse()
+          else
+            load_sorted_members(key, store)
+          end
+
+        Enum.take(sorted, count)
     end
   end
 
