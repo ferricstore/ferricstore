@@ -13,6 +13,7 @@
 #   FLOW_100K_SEED_CONCURRENCY=32
 #   FLOW_100K_CLAIM_LIMITS=10,100
 #   FLOW_100K_CREATE_MANY_BATCH=100
+#   FLOW_100K_TERMINAL_MANY_BATCH=100
 
 backlog = System.get_env("FLOW_100K_BACKLOG", "100000") |> String.to_integer()
 iterations = System.get_env("FLOW_100K_ITER", "200") |> String.to_integer()
@@ -23,6 +24,9 @@ create_many_batch = System.get_env("FLOW_100K_CREATE_MANY_BATCH", "100") |> Stri
 
 transition_many_batch =
   System.get_env("FLOW_100K_TRANSITION_MANY_BATCH", "100") |> String.to_integer()
+
+terminal_many_batch =
+  System.get_env("FLOW_100K_TERMINAL_MANY_BATCH", "100") |> String.to_integer()
 
 flow_lmdb_enabled = true
 flow_lmdb_mode = System.get_env("FLOW_LMDB_MODE", "mirror")
@@ -55,6 +59,7 @@ defmodule Flow100kStateBench do
         seed_concurrency,
         create_many_batch,
         transition_many_batch,
+        terminal_many_batch,
         flow_lmdb_enabled,
         flow_lmdb_mode,
         claim_limits,
@@ -72,7 +77,7 @@ defmodule Flow100kStateBench do
     )
 
     IO.puts(
-      "seed_concurrency=#{seed_concurrency} create_many_batch=#{create_many_batch} transition_many_batch=#{transition_many_batch} flow_lmdb=#{flow_lmdb_enabled} flow_lmdb_mode=#{flow_lmdb_mode}"
+      "seed_concurrency=#{seed_concurrency} create_many_batch=#{create_many_batch} transition_many_batch=#{transition_many_batch} terminal_many_batch=#{terminal_many_batch} flow_lmdb=#{flow_lmdb_enabled} flow_lmdb_mode=#{flow_lmdb_mode}"
     )
 
     memory_before = :erlang.memory(:total)
@@ -146,9 +151,15 @@ defmodule Flow100kStateBench do
         bench_transition_many(prefix, backlog, iterations, partition_count, transition_many_batch)
       )
       |> add(bench_complete(prefix, backlog, iterations, partition_count))
+      |> add(
+        bench_complete_many(prefix, backlog, iterations, partition_count, terminal_many_batch)
+      )
       |> add(bench_retry(prefix, backlog, iterations, partition_count))
+      |> add(bench_retry_many(prefix, backlog, iterations, partition_count, terminal_many_batch))
       |> add(bench_fail(prefix, backlog, iterations, partition_count))
+      |> add(bench_fail_many(prefix, backlog, iterations, partition_count, terminal_many_batch))
       |> add(bench_cancel(prefix, backlog, iterations, partition_count))
+      |> add(bench_cancel_many(prefix, backlog, iterations, partition_count, terminal_many_batch))
       |> add(bench_rewind(prefix, backlog, iterations, partition_count))
       |> Enum.reverse()
 
@@ -162,6 +173,7 @@ defmodule Flow100kStateBench do
       seed_concurrency: seed_concurrency,
       create_many_batch: create_many_batch,
       transition_many_batch: transition_many_batch,
+      terminal_many_batch: terminal_many_batch,
       flow_lmdb_enabled: flow_lmdb_enabled,
       flow_lmdb_mode: flow_lmdb_mode,
       claim_limits: claim_limits,
@@ -397,6 +409,29 @@ defmodule Flow100kStateBench do
     end)
   end
 
+  defp bench_complete_many(prefix, backlog, iterations, partition_count, batch_size) do
+    claimed = preclaim_many(prefix, "complete_many", iterations, partition_count, batch_size)
+
+    result("flow.complete_many batch=#{batch_size} under #{backlog}", iterations, fn i ->
+      partition_key = partition(prefix, i, partition_count)
+
+      items =
+        claimed
+        |> Enum.fetch!(i - 1)
+        |> Enum.map(fn flow ->
+          %{id: flow.id, lease_token: flow.lease_token, fencing_token: flow.fencing_token}
+        end)
+
+      {:ok, completed} =
+        FerricStore.flow_complete_many(partition_key, items,
+          result_ref: "result:complete_many:#{i}",
+          now_ms: 2_000
+        )
+
+      completed
+    end)
+  end
+
   defp bench_retry(prefix, backlog, iterations, partition_count) do
     claimed = preclaim(prefix, "retry", iterations, partition_count)
 
@@ -410,6 +445,30 @@ defmodule Flow100kStateBench do
           run_at_ms: 3_000,
           now_ms: 2_000,
           partition_key: partition(prefix, i, partition_count)
+        )
+
+      retried
+    end)
+  end
+
+  defp bench_retry_many(prefix, backlog, iterations, partition_count, batch_size) do
+    claimed = preclaim_many(prefix, "retry_many", iterations, partition_count, batch_size)
+
+    result("flow.retry_many batch=#{batch_size} under #{backlog}", iterations, fn i ->
+      partition_key = partition(prefix, i, partition_count)
+
+      items =
+        claimed
+        |> Enum.fetch!(i - 1)
+        |> Enum.map(fn flow ->
+          %{id: flow.id, lease_token: flow.lease_token, fencing_token: flow.fencing_token}
+        end)
+
+      {:ok, retried} =
+        FerricStore.flow_retry_many(partition_key, items,
+          error_ref: "error:retry_many:#{i}",
+          run_at_ms: 3_000,
+          now_ms: 2_000
         )
 
       retried
@@ -434,6 +493,29 @@ defmodule Flow100kStateBench do
     end)
   end
 
+  defp bench_fail_many(prefix, backlog, iterations, partition_count, batch_size) do
+    claimed = preclaim_many(prefix, "fail_many", iterations, partition_count, batch_size)
+
+    result("flow.fail_many batch=#{batch_size} under #{backlog}", iterations, fn i ->
+      partition_key = partition(prefix, i, partition_count)
+
+      items =
+        claimed
+        |> Enum.fetch!(i - 1)
+        |> Enum.map(fn flow ->
+          %{id: flow.id, lease_token: flow.lease_token, fencing_token: flow.fencing_token}
+        end)
+
+      {:ok, failed} =
+        FerricStore.flow_fail_many(partition_key, items,
+          error_ref: "error:fail_many:#{i}",
+          now_ms: 2_000
+        )
+
+      failed
+    end)
+  end
+
   defp bench_cancel(prefix, backlog, iterations, partition_count) do
     flow_type = type(prefix, "cancel")
 
@@ -450,6 +532,46 @@ defmodule Flow100kStateBench do
           reason_ref: "cancel:" <> id(prefix, "cancel", i),
           now_ms: 2_000,
           partition_key: partition(prefix, i, partition_count)
+        )
+
+      cancelled
+    end)
+  end
+
+  defp bench_cancel_many(prefix, backlog, iterations, partition_count, batch_size) do
+    flow_type = type(prefix, "cancel_many")
+
+    timed("seed cancel_many #{iterations}x#{batch_size}", fn ->
+      for i <- 1..iterations do
+        partition_key = partition(prefix, i, partition_count)
+
+        items =
+          for j <- 1..batch_size do
+            %{id: id(prefix, "cancel_many", i, j)}
+          end
+
+        {:ok, _flows} =
+          FerricStore.flow_create_many(partition_key, items,
+            type: flow_type,
+            state: "queued",
+            run_at_ms: 1_000,
+            now_ms: 1_000
+          )
+      end
+    end)
+
+    result("flow.cancel_many batch=#{batch_size} under #{backlog}", iterations, fn i ->
+      partition_key = partition(prefix, i, partition_count)
+
+      items =
+        for j <- 1..batch_size do
+          %{id: id(prefix, "cancel_many", i, j), fencing_token: 0}
+        end
+
+      {:ok, cancelled} =
+        FerricStore.flow_cancel_many(partition_key, items,
+          reason_ref: "cancel:cancel_many:#{i}",
+          now_ms: 2_000
         )
 
       cancelled
@@ -560,6 +682,43 @@ defmodule Flow100kStateBench do
     end)
   end
 
+  defp preclaim_many(prefix, group, iterations, partition_count, batch_size) do
+    flow_type = type(prefix, group)
+
+    timed("seed #{group} claimed #{iterations}x#{batch_size}", fn ->
+      for i <- 1..iterations do
+        partition_key = partition(prefix, i, partition_count)
+
+        items =
+          for j <- 1..batch_size do
+            %{id: id(prefix, group, i, j), payload_ref: "payload:" <> id(prefix, group, i, j)}
+          end
+
+        {:ok, _flows} =
+          FerricStore.flow_create_many(partition_key, items,
+            type: flow_type,
+            state: "queued",
+            run_at_ms: 1_000,
+            now_ms: 1_000
+          )
+      end
+
+      for i <- 1..iterations do
+        {:ok, claimed} =
+          FerricStore.flow_claim_due(flow_type,
+            worker: "worker-" <> group,
+            lease_ms: 30_000,
+            limit: batch_size,
+            now_ms: 1_000,
+            partition_key: partition(prefix, i, partition_count)
+          )
+
+        true = length(claimed) == batch_size
+        claimed
+      end
+    end)
+  end
+
   defp result(name, iterations, fun) do
     latencies =
       for i <- 1..iterations do
@@ -633,6 +792,7 @@ defmodule Flow100kStateBench do
       "- seed_concurrency: #{config.seed_concurrency}",
       "- create_many_batch: #{config.create_many_batch}",
       "- transition_many_batch: #{config.transition_many_batch}",
+      "- terminal_many_batch: #{config.terminal_many_batch}",
       "- flow_lmdb_enabled: #{config.flow_lmdb_enabled}",
       "- flow_lmdb_mode: #{config.flow_lmdb_mode}",
       "- claim_limits: #{Enum.join(config.claim_limits, ",")}",
@@ -686,6 +846,7 @@ try do
     seed_concurrency,
     create_many_batch,
     transition_many_batch,
+    terminal_many_batch,
     flow_lmdb_enabled,
     flow_lmdb_mode,
     claim_limits,
