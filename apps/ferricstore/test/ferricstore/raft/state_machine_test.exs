@@ -304,6 +304,71 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert transitioned.updated_at_ms == 2_000
       assert transitioned.next_run_at_ms == 2_000
     end
+
+    test "create_many stages all Flow Bitcask writes into one append batch", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
+      :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+
+      on_exit(fn ->
+        safe_delete_ets(state.zset_score_index_name)
+        safe_delete_ets(state.zset_score_lookup_name)
+        safe_delete_ets(state.flow_index_name)
+        safe_delete_ets(state.flow_lookup_name)
+      end)
+
+      handler_id = {:flow_create_many_append_batch, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :bitcask, :append],
+          fn _event, measurements, metadata, test_pid ->
+            send(test_pid, {:flow_bitcask_append, measurements, metadata})
+          end,
+          self()
+        )
+
+      partition_key = "tenant-batched-append"
+
+      records =
+        for id <- ["flow-batch-a", "flow-batch-b", "flow-batch-c"] do
+          %{
+            id: id,
+            type: "append-batch",
+            state: "queued",
+            partition_key: partition_key,
+            now_ms: 1_000
+          }
+        end
+
+      try do
+        {_state, {:ok, created}} =
+          StateMachine.apply(
+            %{system_time: 1_000},
+            {:flow_create_many, nil, %{records: records}},
+            state
+          )
+
+        assert length(created) == 3
+
+        assert_receive {:flow_bitcask_append, measurements,
+                        %{shard_index: ^shard_index, status: :ok}},
+                       500
+
+        assert measurements.batch_size == 6
+        assert measurements.delete_count == 0
+        assert measurements.batch_bytes > 0
+
+        refute_receive {:flow_bitcask_append, _measurements, _metadata}, 100
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
   end
 
   describe "Flow index rollback" do
