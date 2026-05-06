@@ -497,7 +497,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)
-      when tag in ~w(flow_create_many flow_complete_many)a,
+      when tag in ~w(flow_create_many flow_complete_many flow_fail_many)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _, _} = ast, store)

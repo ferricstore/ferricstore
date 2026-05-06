@@ -1021,6 +1021,10 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_with_time(meta, state, fn -> do_flow_fail(state, attrs) end)
   end
 
+  def apply(meta, {:flow_fail_many, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_fail_many(state, attrs) end)
+  end
+
   def apply(meta, {:flow_cancel, _key, attrs}, state) when is_map(attrs) do
     apply_pending_with_time(meta, state, fn -> do_flow_cancel(state, attrs) end)
   end
@@ -3414,6 +3418,10 @@ defmodule Ferricstore.Raft.StateMachine do
     do_flow_fail(state, attrs)
   end
 
+  defp apply_single(state, {:flow_fail_many, _key, attrs}) do
+    do_flow_fail_many(state, attrs)
+  end
+
   defp apply_single(state, {:flow_cancel, _key, attrs}) do
     do_flow_cancel(state, attrs)
   end
@@ -5120,7 +5128,27 @@ defmodule Ferricstore.Raft.StateMachine do
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
-         :ok <- flow_require_running_lease(record, lease_token),
+         {:ok, record, next} <-
+           flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms),
+         :ok <- flow_apply_fail(state, record, next, partition_key, now_ms) do
+      {:ok, next}
+    end
+  end
+
+  defp do_flow_fail_many(state, %{records: [_ | _] = attrs_list}) do
+    with :ok <- flow_many_partitions_valid?(state, attrs_list),
+         :ok <- flow_transition_many_unique?(attrs_list),
+         {:ok, plans} <- flow_fail_many_prepare(state, attrs_list),
+         :ok <- flow_fail_many_apply(state, plans) do
+      {:ok, Enum.map(plans, fn {_record, next} -> next end)}
+    end
+  end
+
+  defp do_flow_fail_many(_state, _attrs),
+    do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms) do
+    with :ok <- flow_require_running_lease(record, lease_token),
          :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
       next =
         record
@@ -5138,20 +5166,66 @@ defmodule Ferricstore.Raft.StateMachine do
         })
 
       with :ok <- flow_validate_record_keys(record),
-           :ok <- flow_validate_record_keys(next),
-           :ok <- flow_due_delete(state, record),
-           :ok <- flow_index_delete(state, record),
-           :ok <-
-             flow_put_state_record(
-               state,
-               FlowKeys.state_key(id, partition_key),
-               next
-             ),
-           :ok <- flow_index_put(state, next),
-           :ok <- flow_history_put(state, next, "failed", now_ms),
-           :ok <- flow_history_trim(state, next) do
-        {:ok, next}
+           :ok <- flow_validate_record_keys(next) do
+        {:ok, record, next}
       end
+    end
+  end
+
+  defp flow_apply_fail(state, record, next, partition_key, now_ms) do
+    with :ok <- flow_due_delete(state, record),
+         :ok <- flow_index_delete(state, record),
+         :ok <-
+           flow_put_state_record(
+             state,
+             FlowKeys.state_key(next.id, partition_key),
+             next
+           ),
+         :ok <- flow_index_put(state, next),
+         :ok <- flow_history_put(state, next, "failed", now_ms),
+         :ok <- flow_history_trim(state, next) do
+      :ok
+    end
+  end
+
+  defp flow_fail_many_prepare(state, attrs_list) do
+    existing_records = flow_read_records(state, attrs_list)
+
+    attrs_list
+    |> Enum.zip(existing_records)
+    |> Enum.reduce_while({:ok, []}, fn
+      {%{id: _id, lease_token: lease_token} = attrs, existing}, {:ok, acc} ->
+        now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+
+        case existing do
+          nil ->
+            {:halt, {:error, "ERR flow not found"}}
+
+          record ->
+            case flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms) do
+              {:ok, record, next} -> {:cont, {:ok, [{record, next} | acc]}}
+              {:error, _reason} = error -> {:halt, error}
+            end
+        end
+
+      {_bad, _existing}, {:ok, _acc} ->
+        {:halt, {:error, "ERR flow id must be a non-empty string"}}
+    end)
+    |> case do
+      {:ok, plans} -> {:ok, Enum.reverse(plans)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_fail_many_apply(state, plans) do
+    next_records = Enum.map(plans, fn {_record, next} -> next end)
+
+    with :ok <- flow_transition_delete_old_due(state, plans),
+         :ok <- flow_claim_delete_old_indexes(state, plans),
+         :ok <- flow_claim_put_state_records(state, plans),
+         :ok <- flow_index_put_many(state, next_records),
+         :ok <- flow_many_put_history(state, plans, "failed") do
+      :ok
     end
   end
 

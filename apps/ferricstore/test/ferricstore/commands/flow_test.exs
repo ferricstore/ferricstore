@@ -352,6 +352,66 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches Flow fail_many through Rust AST" do
+    partition = uid("flow-command-fail-many-tenant")
+    type = uid("flow-command-fail-many")
+    id_a = uid("flow-command-fail-many-a")
+    id_b = uid("flow-command-fail-many-b")
+
+    assert [_a, _b] =
+             Dispatcher.dispatch(
+               "FLOW.CREATE_MANY",
+               [
+                 partition,
+                 "TYPE",
+                 type,
+                 "RUN_AT",
+                 "1000",
+                 "NOW",
+                 "1000",
+                 "ITEMS",
+                 id_a,
+                 "payload:" <> id_a,
+                 id_b,
+                 "payload:" <> id_b
+               ],
+               MockStore.make()
+             )
+
+    assert [
+             %{"id" => ^id_a, "lease_token" => lease_a, "fencing_token" => fencing_a},
+             %{"id" => ^id_b, "lease_token" => lease_b, "fencing_token" => fencing_b}
+           ] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [type, "WORKER", "worker-a", "LIMIT", "2", "NOW", "1000", "PARTITION", partition],
+               MockStore.make()
+             )
+
+    assert [
+             %{"id" => ^id_a, "state" => "failed", "error_ref" => "error:batch"},
+             %{"id" => ^id_b, "state" => "failed", "error_ref" => "error:batch"}
+           ] =
+             Dispatcher.dispatch(
+               "FLOW.FAIL_MANY",
+               [
+                 partition,
+                 "ERROR_REF",
+                 "error:batch",
+                 "NOW",
+                 "2000",
+                 "ITEMS",
+                 id_a,
+                 lease_a,
+                 Integer.to_string(fencing_a),
+                 id_b,
+                 lease_b,
+                 Integer.to_string(fencing_b)
+               ],
+               MockStore.make()
+             )
+  end
+
   test "dispatches Flow rewind through Rust AST" do
     id = uid("flow-command-rewind")
 

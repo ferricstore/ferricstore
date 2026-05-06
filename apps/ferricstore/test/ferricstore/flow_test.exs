@@ -1992,6 +1992,94 @@ defmodule Ferricstore.FlowTest do
     assert Enum.map(history_b, fn {_id, fields} -> fields["event"] end) == ["created", "claimed"]
   end
 
+  test "flow_fail_many atomically fails one-partition batch" do
+    partition = uid("tenant-fail-many")
+    type = uid("bulk-fail-many")
+    id_a = uid("fail-many-a")
+    id_b = uid("fail-many-b")
+
+    assert {:ok, _} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: id_a}, %{id: id_b}],
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-fail",
+               limit: 2,
+               now_ms: 1_000
+             )
+
+    items =
+      claimed
+      |> Enum.sort_by(& &1.id)
+      |> Enum.map(fn record ->
+        %{id: record.id, lease_token: record.lease_token, fencing_token: record.fencing_token}
+      end)
+
+    assert {:ok, failed} =
+             FerricStore.flow_fail_many(partition, items,
+               error_ref: "error-batch",
+               now_ms: 2_000
+             )
+
+    assert Enum.map(failed, & &1.id) == Enum.map(items, & &1.id)
+    assert Enum.all?(failed, &(&1.state == "failed"))
+    assert Enum.all?(failed, &(&1.error_ref == "error-batch"))
+
+    assert {:ok, info} = FerricStore.flow_info(type, partition_key: partition)
+    assert info.failed == 2
+  end
+
+  test "flow_fail_many rolls back when any item fails guard" do
+    partition = uid("tenant-fail-many-rollback")
+    type = uid("bulk-fail-many-rollback")
+    id_a = uid("fail-many-good")
+    id_b = uid("fail-many-bad")
+
+    assert {:ok, _} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: id_a}, %{id: id_b}],
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-fail",
+               limit: 2,
+               now_ms: 1_000
+             )
+
+    items =
+      claimed
+      |> Enum.sort_by(& &1.id)
+      |> Enum.map(fn record ->
+        fencing_token =
+          if record.id == id_b, do: record.fencing_token + 1, else: record.fencing_token
+
+        %{id: record.id, lease_token: record.lease_token, fencing_token: fencing_token}
+      end)
+
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_fail_many(partition, items, now_ms: 2_000)
+
+    assert {:ok, fetched_a} = FerricStore.flow_get(id_a, partition_key: partition)
+    assert {:ok, fetched_b} = FerricStore.flow_get(id_b, partition_key: partition)
+    assert fetched_a.state == "running"
+    assert fetched_b.state == "running"
+    assert fetched_a.version == 2
+    assert fetched_b.version == 2
+  end
+
   test "flow_transition enforces expected state and running lease guard" do
     id = uid("flow-transition-guard")
 

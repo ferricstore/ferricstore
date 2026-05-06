@@ -558,6 +558,24 @@ defmodule FerricStore do
 
   def flow_fail(_id, _lease_token, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc """
+  Fails a batch of running Flow records.
+
+  When `partition_key` is set, the batch is all-or-nothing because every item
+  routes to the same shard. When `partition_key` is `nil`, each item must carry
+  `:partition_key`; items are grouped by shard and each shard group is atomic.
+  Each item must provide `:id`, `:lease_token`, and `:fencing_token`.
+  """
+  @spec flow_fail_many(binary() | nil, list(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_fail_many(partition_key, items, opts \\ [])
+
+  def flow_fail_many(partition_key, items, opts) when is_list(items) and is_list(opts) do
+    Ferricstore.Flow.fail_many(default_ctx(), partition_key, items, opts)
+  end
+
+  def flow_fail_many(_partition_key, _items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Cancels a Flow record, optionally guarded by a lease token."
   @spec flow_cancel(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_cancel(id, opts \\ [])
