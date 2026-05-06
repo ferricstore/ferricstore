@@ -726,6 +726,41 @@ defmodule Ferricstore.Commands.ListTest do
       assert ["x"] == List.handle("LRANGE", ["dst", "0", "-1"], base)
     end
 
+    test "rolls back new destination type metadata when destination write fails" do
+      parent = self()
+      base = MockStore.make()
+      List.handle("RPUSH", ["src", "a", "b"], base)
+      dst_type_key = CompoundKey.type_key("dst")
+
+      store =
+        base
+        |> Map.put(:compound_put, fn
+          "dst", ^dst_type_key, "list", 0 ->
+            send(parent, :type_written)
+            base.compound_put.("dst", dst_type_key, "list", 0)
+
+          "dst", "L:dst" <> <<0>> <> _pos, _value, 0 ->
+            {:error, :disk_full}
+
+          key, compound_key, value, expire_at_ms ->
+            base.compound_put.(key, compound_key, value, expire_at_ms)
+        end)
+        |> Map.put(:compound_delete, fn
+          "dst", ^dst_type_key ->
+            send(parent, :type_deleted)
+            base.compound_delete.("dst", dst_type_key)
+
+          key, compound_key ->
+            base.compound_delete.(key, compound_key)
+        end)
+
+      assert {:error, :disk_full} == List.handle("LMOVE", ["src", "dst", "LEFT", "RIGHT"], store)
+      assert_received :type_written
+      assert_received :type_deleted
+      assert nil == base.compound_get.("dst", dst_type_key)
+      assert ["a", "b"] == List.handle("LRANGE", ["src", "0", "-1"], base)
+    end
+
     test "does not drop source element when source metadata update fails" do
       base = MockStore.make()
       List.handle("RPUSH", ["src", "a", "b"], base)

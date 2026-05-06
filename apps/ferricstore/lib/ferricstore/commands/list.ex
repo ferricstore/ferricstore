@@ -465,10 +465,17 @@ defmodule Ferricstore.Commands.List do
           nil
 
         _meta ->
-          with :ok <- TypeRegistry.check_or_set(destination, :list, store) do
+          with type_status when type_status in [:ok, {:ok, :created}] <-
+                 TypeRegistry.check_or_set_status(destination, :list, store) do
             case ListOps.execute_lmove(source, destination, store, from_dir, to_dir) do
               result when is_binary(result) ->
                 with :ok <- maybe_cleanup_empty_list(source, store), do: result
+
+              {:error, _} = error ->
+                rollback_new_list_type_marker(destination, store, type_status, error)
+
+              nil ->
+                rollback_new_list_type_marker(destination, store, type_status, nil)
 
               other ->
                 other
