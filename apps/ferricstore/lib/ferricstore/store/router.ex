@@ -3995,6 +3995,49 @@ defmodule Ferricstore.Store.Router do
     |> unwrap_zset_index_reply()
   end
 
+  @spec flow_index_rank_range_many(
+          FerricStore.Instance.t(),
+          [{binary(), non_neg_integer(), non_neg_integer(), boolean()}]
+        ) :: {:ok, [[{binary(), float()}]]} | :unavailable
+  def flow_index_rank_range_many(_ctx, []), do: {:ok, []}
+
+  def flow_index_rank_range_many(ctx, requests) when is_list(requests) do
+    requests
+    |> Enum.with_index()
+    |> Enum.group_by(fn {{key, _start_idx, _stop_idx, _reverse?}, _index} ->
+      shard_for(ctx, key)
+    end)
+    |> Enum.reduce_while({:ok, %{}}, fn {idx, indexed_requests}, {:ok, acc} ->
+      shard_requests = Enum.map(indexed_requests, fn {request, _index} -> request end)
+
+      case safe_read_call(ctx, idx, {:flow_index_rank_range_many, shard_requests})
+           |> unwrap_zset_index_reply() do
+        {:ok, results} when is_list(results) ->
+          indexed =
+            indexed_requests
+            |> Enum.zip(results)
+            |> Enum.reduce(acc, fn {{_request, original_index}, result}, next_acc ->
+              Map.put(next_acc, original_index, result)
+            end)
+
+          {:cont, {:ok, indexed}}
+
+        :unavailable ->
+          {:halt, :unavailable}
+
+        _other ->
+          {:halt, :unavailable}
+      end
+    end)
+    |> case do
+      {:ok, indexed} ->
+        {:ok, Enum.map(0..(length(requests) - 1)//1, &Map.fetch!(indexed, &1))}
+
+      :unavailable ->
+        :unavailable
+    end
+  end
+
   @spec flow_index_count_all(FerricStore.Instance.t(), binary()) ::
           {:ok, non_neg_integer()} | :unavailable
   def flow_index_count_all(ctx, key) do

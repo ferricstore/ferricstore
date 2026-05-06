@@ -692,6 +692,15 @@ defmodule Ferricstore.Store.Shard do
      state}
   end
 
+  def handle_call({:flow_index_rank_range_many, requests}, _from, state) do
+    results =
+      Enum.map(requests, fn {key, start_idx, stop_idx, reverse?} ->
+        FlowIndex.rank_range(state.flow_index, key, start_idx, stop_idx, reverse?)
+      end)
+
+    {:reply, {:ok, results}, state}
+  end
+
   def handle_call({:flow_index_count_all, key}, _from, state) do
     {:reply, {:ok, FlowIndex.count_all(state.flow_lookup, key)}, state}
   end

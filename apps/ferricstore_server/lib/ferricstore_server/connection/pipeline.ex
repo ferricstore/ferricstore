@@ -681,6 +681,42 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp flow_write_op(_command), do: :fallback
 
+  defp flow_read_op({:command, "FLOW.GET", _args, {:flow_get, id, opts}, _keys})
+       when is_binary(id) and is_list(opts),
+       do: {:ok, {:get, id, opts}}
+
+  defp flow_read_op({:command, "FLOW.HISTORY", _args, {:flow_history, id, opts}, _keys})
+       when is_binary(id) and is_list(opts),
+       do: {:ok, {:history, id, opts}}
+
+  defp flow_read_op({:command, "FLOW.LIST", _args, {:flow_list, type, opts}, _keys})
+       when is_binary(type) and is_list(opts),
+       do: {:ok, {:list, type, opts}}
+
+  defp flow_read_op({:command, "FLOW.BY_PARENT", _args, {:flow_by_parent, id, opts}, _keys})
+       when is_binary(id) and is_list(opts),
+       do: {:ok, {:by_parent, id, opts}}
+
+  defp flow_read_op({:command, "FLOW.BY_ROOT", _args, {:flow_by_root, id, opts}, _keys})
+       when is_binary(id) and is_list(opts),
+       do: {:ok, {:by_root, id, opts}}
+
+  defp flow_read_op(
+         {:command, "FLOW.BY_CORRELATION", _args, {:flow_by_correlation, id, opts}, _keys}
+       )
+       when is_binary(id) and is_list(opts),
+       do: {:ok, {:by_correlation, id, opts}}
+
+  defp flow_read_op({:command, "FLOW.INFO", _args, {:flow_info, type, opts}, _keys})
+       when is_binary(type) and is_list(opts),
+       do: {:ok, {:info, type, opts}}
+
+  defp flow_read_op({:command, "FLOW.STUCK", _args, {:flow_stuck, type, opts}, _keys})
+       when is_binary(type) and is_list(opts),
+       do: {:ok, {:stuck, type, opts}}
+
+  defp flow_read_op(_command), do: :fallback
+
   defp encode_flow_result(result) do
     result
     |> FlowCommand.normalize_result()
@@ -799,12 +835,27 @@ defmodule FerricstoreServer.Connection.Pipeline do
         dispatch_pure_segments(rest, state, store, prefetched_reads, Enum.reverse(entries) ++ acc)
 
       :fallback ->
-        {name, args, _ast, _keys} = command_parts(cmd)
+        case flow_read_op(cmd) do
+          {:ok, op} ->
+            {ops, rest} = take_flow_read_segment(rest, [op])
+            entries = dispatch_flow_read_segment(Enum.reverse(ops), state)
 
-        {entry, new_state} =
-          dispatch_pure_single(idx, cmd, name, args, store, state, prefetched_reads)
+            dispatch_pure_segments(
+              rest,
+              state,
+              store,
+              prefetched_reads,
+              Enum.reverse(entries) ++ acc
+            )
 
-        dispatch_pure_segments(rest, new_state, store, prefetched_reads, [entry | acc])
+          :fallback ->
+            {name, args, _ast, _keys} = command_parts(cmd)
+
+            {entry, new_state} =
+              dispatch_pure_single(idx, cmd, name, args, store, state, prefetched_reads)
+
+            dispatch_pure_segments(rest, new_state, store, prefetched_reads, [entry | acc])
+        end
     end
   end
 
@@ -817,11 +868,34 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp take_flow_write_segment([], acc), do: {acc, []}
 
+  defp take_flow_read_segment([{cmd, idx} | rest], acc) do
+    case flow_read_op(cmd) do
+      {:ok, op} -> take_flow_read_segment(rest, [op | acc])
+      :fallback -> {acc, [{cmd, idx} | rest]}
+    end
+  end
+
+  defp take_flow_read_segment([], acc), do: {acc, []}
+
   defp dispatch_flow_write_segment(ops, state) do
     Stats.incr_commands_by(state.stats_counter, length(ops))
 
     case safe_dispatch(fn ->
            Ferricstore.Flow.pipeline_write_batch_independent(state.instance_ctx, ops)
+         end) do
+      {:ok, results} ->
+        Enum.map(results, fn result -> {:encoded, encode_flow_result(result)} end)
+
+      {:error, err} ->
+        List.duplicate({:encoded, Encoder.encode(err)}, length(ops))
+    end
+  end
+
+  defp dispatch_flow_read_segment(ops, state) do
+    Stats.incr_commands_by(state.stats_counter, length(ops))
+
+    case safe_dispatch(fn ->
+           Ferricstore.Flow.pipeline_read_batch(state.instance_ctx, ops)
          end) do
       {:ok, results} ->
         Enum.map(results, fn result -> {:encoded, encode_flow_result(result)} end)

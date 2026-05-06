@@ -281,6 +281,49 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id, type: "checkout", state: "queued")
   end
 
+  test "pipeline_read_batch preserves order across get, missing, and history reads" do
+    ctx = FerricStore.Instance.get(:default)
+    {partition_a, partition_b} = different_partition_keys()
+    id_a = uid("flow-pipeline-read-a")
+    id_b = uid("flow-pipeline-read-b")
+
+    attach_flow_telemetry([[:ferricstore, :flow, :pipeline_read_batch]])
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id_a,
+               type: "pipeline-read",
+               state: "queued",
+               partition_key: partition_a,
+               now_ms: 1,
+               run_at_ms: 1
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id_b,
+               type: "pipeline-read",
+               state: "queued",
+               partition_key: partition_b,
+               now_ms: 2,
+               run_at_ms: 2
+             )
+
+    assert [
+             {:ok, %{id: ^id_a, partition_key: ^partition_a}},
+             {:ok, nil},
+             {:ok, %{id: ^id_b, partition_key: ^partition_b}},
+             {:ok, [{_event_id, %{"event" => "created", "state" => "queued"}}]}
+           ] =
+             Ferricstore.Flow.pipeline_read_batch(ctx, [
+               {:get, id_a, [partition_key: partition_a]},
+               {:get, "missing-pipeline-read", [partition_key: partition_a]},
+               {:get, id_b, [partition_key: partition_b]},
+               {:history, id_a, [partition_key: partition_a, count: 10]}
+             ])
+
+    assert_receive {:flow_telemetry, [:ferricstore, :flow, :pipeline_read_batch],
+                    %{count: 4, gets: 3, histories: 1}, %{source: :pipeline}}
+  end
+
   test "flow_create idempotent retry returns matching existing record and rejects conflicts" do
     id = uid("flow-create-idempotent")
 

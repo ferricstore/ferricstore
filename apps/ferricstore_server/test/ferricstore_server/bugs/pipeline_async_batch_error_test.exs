@@ -178,6 +178,71 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     end
   end
 
+  test "mixed pipeline batches consecutive FLOW read segments" do
+    ctx = FerricStore.Instance.get(:default)
+    partition_key = "tenant-pipe-flow-read-mixed"
+    id_a = "pipe_flow_read_a_#{System.unique_integer([:positive])}"
+    id_b = "pipe_flow_read_b_#{System.unique_integer([:positive])}"
+    handler_id = {:pipeline_flow_read_batch, self(), make_ref()}
+
+    assert {:ok, _created_a} =
+             FerricStore.flow_create(id_a,
+               type: "pipeline-flow-read",
+               state: "queued",
+               partition_key: partition_key,
+               now_ms: 1,
+               run_at_ms: 1
+             )
+
+    assert {:ok, _created_b} =
+             FerricStore.flow_create(id_b,
+               type: "pipeline-flow-read",
+               state: "queued",
+               partition_key: partition_key,
+               now_ms: 2,
+               run_at_ms: 2
+             )
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :flow, :pipeline_read_batch],
+        fn _event, measurements, metadata, test_pid ->
+          send(test_pid, {:flow_read_batch, measurements, metadata})
+        end,
+        self()
+      )
+
+    state = connection_state(ctx)
+    send_response_fn = capture_response_fn()
+    handle_command_fn = flunking_handle_fn("mixed FLOW read segment pipeline fast path")
+
+    commands = [
+      {:command, "PING", [], :ping, []},
+      {:command, "FLOW.GET", [], {:flow_get, id_a, [partition_key: partition_key]}, []},
+      {:command, "FLOW.GET", [], {:flow_get, id_b, [partition_key: partition_key]}, []},
+      {:command, "FLOW.HISTORY", [],
+       {:flow_history, id_a, [partition_key: partition_key, count: 10]}, []},
+      {:command, "PING", [], :ping, []}
+    ]
+
+    try do
+      assert {:continue, ^state} =
+               Pipeline.pipeline_dispatch(commands, state, handle_command_fn, send_response_fn)
+
+      assert_receive {:pipeline_response, response}
+      refute response =~ "-ERR"
+      assert response =~ "+PONG\r\n"
+      assert response =~ id_a
+      assert response =~ id_b
+      assert response =~ "created"
+
+      assert_receive {:flow_read_batch, %{count: 3, gets: 2, histories: 1}, %{source: :pipeline}}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
   test "SET pipeline fast path writes through sandbox namespace" do
     ctx = FerricStore.Instance.get(:default)
     sandbox = "sandbox_pipe:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"

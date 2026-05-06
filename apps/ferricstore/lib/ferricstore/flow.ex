@@ -319,6 +319,61 @@ defmodule Ferricstore.Flow do
   def pipeline_write_batch_independent(_ctx, _ops),
     do: [{:error, "ERR flow opts must be a keyword list"}]
 
+  @doc false
+  def pipeline_read_batch(_ctx, []), do: []
+
+  def pipeline_read_batch(ctx, ops) when is_list(ops) do
+    started = flow_start_time()
+
+    {get_ops, history_ops, other_ops, indexed_results} =
+      ops
+      |> Enum.with_index()
+      |> Enum.reduce({[], [], [], %{}}, fn {op, idx},
+                                           {get_acc, history_acc, other_acc, result_acc} ->
+        case pipeline_read_command(ctx, op) do
+          {:get, id, partition_key} ->
+            {[{idx, id, partition_key} | get_acc], history_acc, other_acc, result_acc}
+
+          {:history, id, partition_key, history_key, count} ->
+            {get_acc, [{idx, id, partition_key, history_key, count} | history_acc], other_acc,
+             result_acc}
+
+          {:other, fun} ->
+            {get_acc, history_acc, [{idx, fun} | other_acc], result_acc}
+
+          {:error, _reason} = error ->
+            {get_acc, history_acc, other_acc, Map.put(result_acc, idx, error)}
+        end
+      end)
+
+    indexed_results =
+      get_ops
+      |> Enum.reverse()
+      |> pipeline_read_get_results(ctx)
+      |> Map.merge(indexed_results)
+
+    indexed_results =
+      history_ops
+      |> Enum.reverse()
+      |> pipeline_read_history_results(ctx)
+      |> Map.merge(indexed_results)
+
+    indexed_results =
+      other_ops
+      |> Enum.reverse()
+      |> Enum.reduce(indexed_results, fn {idx, fun}, acc ->
+        Map.put(acc, idx, fun.())
+      end)
+
+    results = for idx <- 0..(length(ops) - 1), do: Map.fetch!(indexed_results, idx)
+
+    observe_pipeline_read_batch(started, ops)
+    results
+  end
+
+  def pipeline_read_batch(_ctx, _ops),
+    do: [{:error, "ERR flow opts must be a keyword list"}]
+
   def retry(ctx, id, lease_token, opts)
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
     started = flow_start_time()
@@ -1730,6 +1785,19 @@ defmodule Ferricstore.Flow do
     :ok
   end
 
+  defp observe_pipeline_read_batch(started, ops) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :pipeline_read_batch],
+      %{
+        count: length(ops),
+        gets: Enum.count(ops, &match?({:get, _id, _opts}, &1)),
+        histories: Enum.count(ops, &match?({:history, _id, _opts}, &1)),
+        duration: System.monotonic_time() - started
+      },
+      %{source: :pipeline}
+    )
+  end
+
   defp flow_measurements(started, command, result) do
     count = result_count(result)
 
@@ -2184,6 +2252,112 @@ defmodule Ferricstore.Flow do
   defp pipeline_state_command(command, %{id: id, partition_key: partition_key} = attrs) do
     key = __MODULE__.Keys.state_key(id, partition_key)
     {:ok, {key, {command, key, attrs}}}
+  end
+
+  defp pipeline_read_command(_ctx, {:get, id, opts}) when is_binary(id) and is_list(opts) do
+    with :ok <- validate_id(id),
+         :ok <- validate_opts(opts),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)) do
+      {:get, id, partition_key}
+    end
+  end
+
+  defp pipeline_read_command(_ctx, {:history, id, opts}) when is_binary(id) and is_list(opts) do
+    with {:ok, {partition_key, history_key, count}} <- history_query_attrs(id, opts) do
+      {:history, id, partition_key, history_key, count}
+    end
+  end
+
+  defp pipeline_read_command(ctx, {:list, type, opts}) when is_binary(type) and is_list(opts),
+    do: pipeline_read_result(fn -> list(ctx, type, opts) end)
+
+  defp pipeline_read_command(ctx, {:by_parent, parent_flow_id, opts})
+       when is_binary(parent_flow_id) and is_list(opts),
+       do: pipeline_read_result(fn -> by_parent(ctx, parent_flow_id, opts) end)
+
+  defp pipeline_read_command(ctx, {:by_root, root_flow_id, opts})
+       when is_binary(root_flow_id) and is_list(opts),
+       do: pipeline_read_result(fn -> by_root(ctx, root_flow_id, opts) end)
+
+  defp pipeline_read_command(ctx, {:by_correlation, correlation_id, opts})
+       when is_binary(correlation_id) and is_list(opts),
+       do: pipeline_read_result(fn -> by_correlation(ctx, correlation_id, opts) end)
+
+  defp pipeline_read_command(ctx, {:info, type, opts}) when is_binary(type) and is_list(opts),
+    do: pipeline_read_result(fn -> info(ctx, type, opts) end)
+
+  defp pipeline_read_command(ctx, {:stuck, type, opts}) when is_binary(type) and is_list(opts),
+    do: pipeline_read_result(fn -> stuck(ctx, type, opts) end)
+
+  defp pipeline_read_command(_ctx, _op),
+    do: {:error, "ERR unsupported flow pipeline read command"}
+
+  defp pipeline_read_result(read_fun), do: {:other, read_fun}
+
+  defp pipeline_read_get_results([], _ctx), do: %{}
+
+  defp pipeline_read_get_results(get_ops, ctx) do
+    get_ops
+    |> Enum.group_by(fn {_idx, _id, partition_key} -> partition_key end)
+    |> Enum.flat_map(fn {partition_key, group} ->
+      ids = Enum.map(group, fn {_idx, id, _partition_key} -> id end)
+      values = Router.flow_batch_get(ctx, ids, partition_key)
+
+      group
+      |> Enum.zip(values)
+      |> Enum.map(fn {{idx, _id, _partition_key}, value} ->
+        {idx, pipeline_read_decode_get(value)}
+      end)
+    end)
+    |> Map.new()
+  end
+
+  defp pipeline_read_decode_get(nil), do: {:ok, nil}
+  defp pipeline_read_decode_get(value) when is_binary(value), do: safe_decode_record(value)
+  defp pipeline_read_decode_get({:error, _reason} = error), do: error
+  defp pipeline_read_decode_get(_other), do: {:ok, nil}
+
+  defp pipeline_read_history_results([], _ctx), do: %{}
+
+  defp pipeline_read_history_results(history_ops, ctx) do
+    requests =
+      Enum.map(history_ops, fn {_idx, _id, _partition_key, history_key, count} ->
+        {history_key, 0, count - 1, false}
+      end)
+
+    case Router.flow_index_rank_range_many(ctx, requests) do
+      {:ok, rank_results} ->
+        history_ops
+        |> Enum.zip(rank_results)
+        |> Map.new(fn {{idx, id, partition_key, history_key, count}, rank_result} ->
+          {idx, history_result_from_rank(ctx, id, partition_key, history_key, count, rank_result)}
+        end)
+
+      :unavailable ->
+        Map.new(history_ops, fn {idx, _id, _partition_key, history_key, count} ->
+          {idx, flow_history_fallback_scan(ctx, history_key, count)}
+        end)
+    end
+  end
+
+  defp history_result_from_rank(ctx, _id, _partition_key, history_key, count, []),
+    do: flow_history_fallback_scan(ctx, history_key, count)
+
+  defp history_result_from_rank(ctx, id, partition_key, history_key, _count, event_refs) do
+    event_ids = Enum.map(event_refs, fn {event_id, _score} -> event_id end)
+    flow_history_from_event_ids(ctx, id, partition_key, history_key, event_ids)
+  end
+
+  defp history_query_attrs(id, opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         history_key = __MODULE__.Keys.history_key(id, partition_key),
+         :ok <- validate_key_size(history_key),
+         {:ok, count} <- flow_count(opts) do
+      {:ok, {partition_key, history_key, count}}
+    end
   end
 
   defp fail_many_attrs(items, opts, partition_key) do
