@@ -37,6 +37,22 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :not_found = Ferricstore.Flow.LMDB.get(path, key)
   end
 
+  test "get_many returns ordered values and misses" do
+    path =
+      Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(path, [
+               {:put, "a", "1"},
+               {:put, "c", "3"}
+             ])
+
+    assert {:ok, [{:ok, "1"}, :not_found, {:ok, "3"}]} =
+             Ferricstore.Flow.LMDB.get_many(path, ["a", "b", "c"])
+  end
+
   test "terminal_counts batches count reads and caches missing counts as zero" do
     path =
       Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")

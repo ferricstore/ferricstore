@@ -2461,50 +2461,99 @@ defmodule Ferricstore.Store.Router do
 
       Ferricstore.Flow.LMDB.mirror?() ->
         values = batch_get(ctx, keys)
+        missing_keys = for {key, nil} <- Enum.zip(keys, values), do: key
+        missing_values = flow_batch_get_lmdb(ctx, missing_keys)
 
-        keys
-        |> Enum.zip(values)
-        |> Enum.map(fn
-          {_key, value} when is_binary(value) -> value
-          {key, nil} -> flow_get_lmdb(ctx, key)
-        end)
+        {merged, []} =
+          Enum.map_reduce(values, missing_values, fn
+            value, remaining when is_binary(value) -> {value, remaining}
+            nil, [value | remaining] -> {value, remaining}
+            nil, [] -> {nil, []}
+            _other, remaining -> {nil, remaining}
+          end)
+
+        merged
 
       true ->
         batch_get(ctx, keys)
     end
   end
 
+  defp flow_batch_get_lmdb(_ctx, []), do: []
+
   defp flow_batch_get_lmdb(ctx, keys) do
-    Enum.map(keys, &flow_get_lmdb(ctx, &1))
+    now_ms = System.os_time(:millisecond)
+
+    values_by_index =
+      keys
+      |> Enum.with_index()
+      |> Enum.group_by(fn {key, _index} -> flow_lmdb_path(ctx, key) end)
+      |> Enum.reduce(%{}, fn {path, indexed_keys}, acc ->
+        group_keys = Enum.map(indexed_keys, fn {key, _index} -> key end)
+        values = flow_lmdb_get_many(path, group_keys, now_ms)
+
+        indexed_keys
+        |> Enum.zip(values)
+        |> Enum.reduce(acc, fn {{_key, index}, value}, value_acc ->
+          Map.put(value_acc, index, value)
+        end)
+      end)
+
+    Enum.map(0..(length(keys) - 1)//1, &Map.get(values_by_index, &1))
   end
 
   defp flow_get_lmdb(ctx, key) do
+    path = flow_lmdb_path(ctx, key)
+
+    path
+    |> Ferricstore.Flow.LMDB.get(key)
+    |> flow_decode_lmdb_get_result(path, key, System.os_time(:millisecond))
+  end
+
+  defp flow_lmdb_path(ctx, key) do
     idx = shard_for(ctx, key)
+    ctx.data_dir |> Ferricstore.DataDir.shard_data_path(idx) |> Ferricstore.Flow.LMDB.path()
+  end
 
-    path =
-      ctx.data_dir |> Ferricstore.DataDir.shard_data_path(idx) |> Ferricstore.Flow.LMDB.path()
+  defp flow_lmdb_get_many(_path, [], _now_ms), do: []
 
-    case Ferricstore.Flow.LMDB.get(path, key) do
-      {:ok, blob} ->
-        case Ferricstore.Flow.LMDB.decode_value(blob, System.os_time(:millisecond)) do
-          {:ok, value} ->
-            value
-
-          :expired ->
-            Ferricstore.Flow.LMDB.delete_state_artifacts(path, key)
-            nil
-
-          :error ->
-            nil
-        end
-
-      :not_found ->
-        nil
+  defp flow_lmdb_get_many(path, keys, now_ms) do
+    case Ferricstore.Flow.LMDB.get_many(path, keys) do
+      {:ok, results} ->
+        keys
+        |> Enum.zip(results)
+        |> Enum.map(fn {key, result} ->
+          flow_decode_lmdb_get_result(result, path, key, now_ms)
+        end)
 
       {:error, _reason} ->
+        Enum.map(keys, fn key ->
+          path
+          |> Ferricstore.Flow.LMDB.get(key)
+          |> flow_decode_lmdb_get_result(path, key, now_ms)
+        end)
+    end
+  end
+
+  defp flow_decode_lmdb_get_result({:ok, blob}, path, key, now_ms) when is_binary(blob) do
+    case Ferricstore.Flow.LMDB.decode_value(blob, now_ms) do
+      {:ok, value} ->
+        value
+
+      :expired ->
+        Ferricstore.Flow.LMDB.delete_state_artifacts(path, key)
+        nil
+
+      :error ->
         nil
     end
   end
+
+  defp flow_decode_lmdb_get_result(:not_found, _path, _key, _now_ms), do: nil
+
+  defp flow_decode_lmdb_get_result({:error, _reason}, _path, _key, _now_ms), do: nil
+
+  defp flow_decode_lmdb_get_result(_other, _path, _key, _now_ms), do: nil
 
   @doc false
   def flow_create(ctx, %{id: id} = attrs) when is_binary(id) do
