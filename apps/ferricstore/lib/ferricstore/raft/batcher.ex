@@ -1333,7 +1333,7 @@ defmodule Ferricstore.Raft.Batcher do
 
   defp enqueue_write_under_capacity(command, from, state) do
     prefix = extract_prefix(command)
-    {window_ms, state} = lookup_ns_config(prefix, state)
+    {window_ms, state} = command_window_ms(command, prefix, state)
     slot_key = {prefix, :quorum}
 
     slot = Map.get(state.slots, slot_key, new_slot(window_ms))
@@ -1357,10 +1357,10 @@ defmodule Ferricstore.Raft.Batcher do
     new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
 
     # Flush immediately if slot is full (O(1) count check instead of O(n) length)
-    if updated_slot.count >= state.max_batch_size do
-      do_flush_slot(new_state, slot_key)
-    else
-      {:noreply, new_state}
+    cond do
+      updated_slot.count >= state.max_batch_size -> do_flush_slot(new_state, slot_key)
+      window_ms == 0 -> do_flush_slot(new_state, slot_key)
+      true -> {:noreply, new_state}
     end
   end
 
@@ -1394,8 +1394,8 @@ defmodule Ferricstore.Raft.Batcher do
         batch = Enum.reverse(slot.cmds)
         froms = Enum.reverse(slot.froms)
 
-        {_prefix, write_path} = slot_key
-        emit_slot_flush_telemetry(state, slot, write_path, batch, froms)
+        {prefix, write_path} = slot_key
+        emit_slot_flush_telemetry(state, slot, prefix, write_path, batch, froms)
 
         new_state =
           case write_path do
@@ -1768,7 +1768,10 @@ defmodule Ferricstore.Raft.Batcher do
   # Private: namespace config lookup
   # ---------------------------------------------------------------------------
 
-  @spec lookup_ns_config(binary(), %__MODULE__{}) :: {pos_integer(), %__MODULE__{}}
+  defp command_window_ms({:flow_create, _key, _attrs}, _prefix, state), do: {0, state}
+  defp command_window_ms(_command, prefix, state), do: lookup_ns_config(prefix, state)
+
+  @spec lookup_ns_config(binary(), %__MODULE__{}) :: {non_neg_integer(), %__MODULE__{}}
   defp lookup_ns_config(prefix, state) do
     case Map.get(state.ns_cache, prefix) do
       nil ->
@@ -1785,7 +1788,7 @@ defmodule Ferricstore.Raft.Batcher do
   # Private: slot helpers
   # ---------------------------------------------------------------------------
 
-  @spec new_slot(pos_integer()) :: slot()
+  @spec new_slot(non_neg_integer()) :: slot()
   defp new_slot(window_ms) do
     %{
       cmds: [],
@@ -1797,7 +1800,7 @@ defmodule Ferricstore.Raft.Batcher do
     }
   end
 
-  defp emit_slot_flush_telemetry(state, slot, write_path, batch, froms) do
+  defp emit_slot_flush_telemetry(state, slot, prefix, write_path, batch, froms) do
     :telemetry.execute(
       [:ferricstore, :batcher, :slot_flush],
       %{
@@ -1805,7 +1808,12 @@ defmodule Ferricstore.Raft.Batcher do
         caller_count: length(froms),
         queue_wait_us: duration_us(Map.get(slot, :created_mono, System.monotonic_time()))
       },
-      %{shard_index: state.shard_index, write_path: write_path}
+      %{
+        shard_index: state.shard_index,
+        prefix: prefix,
+        window_ms: Map.get(slot, :window_ms, 0),
+        write_path: write_path
+      }
     )
   end
 

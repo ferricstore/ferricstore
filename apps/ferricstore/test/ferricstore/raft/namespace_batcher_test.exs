@@ -107,6 +107,46 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
     end
   end
 
+  describe "Flow create latency policy" do
+    test "single flow_create flushes with a zero commit window" do
+      id = "nsbatcher_flow_create_#{System.unique_integer([:positive])}"
+      partition_key = "tenant-nsbatcher-flow-create"
+      key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), key)
+      handler_id = {:flow_create_zero_window, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :batcher, :slot_flush],
+          fn _event, measurements, metadata, test_pid ->
+            send(test_pid, {:slot_flush, measurements, metadata})
+          end,
+          self()
+        )
+
+      try do
+        assert {:ok, %{id: ^id}} =
+                 Batcher.write(
+                   shard,
+                   {:flow_create, key,
+                    %{
+                      id: id,
+                      type: "nsbatcher-flow-create",
+                      state: "queued",
+                      partition_key: partition_key
+                    }}
+                 )
+
+        assert_receive {:slot_flush, %{batch_size: 1},
+                        %{shard_index: ^shard, prefix: "f", window_ms: 0}},
+                       500
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Independent namespace batching
   # ---------------------------------------------------------------------------

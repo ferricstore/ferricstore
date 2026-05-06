@@ -6706,7 +6706,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     with :ok <-
            raw_put_cold(state, compound_key, Flow.encode_history_fields(record, event, now_ms), 0) do
-      flow_history_index_put(state, history_key, event_id, event_ms)
+      flow_history_index_put(state, history_key, event_id, event_ms, version)
     end
   end
 
@@ -6727,7 +6727,12 @@ defmodule Ferricstore.Raft.StateMachine do
     {Integer.to_string(trunc(ms)) <> "-" <> Integer.to_string(version), trunc(ms)}
   end
 
-  defp flow_history_index_put(state, history_key, event_id, ms) do
+  defp flow_history_index_put(state, history_key, event_id, ms, 1) do
+    flow_index_put_new_members(state, history_key, [{event_id, ms}])
+    :ok
+  end
+
+  defp flow_history_index_put(state, history_key, event_id, ms, _version) do
     flow_index_put_members(state, history_key, [{event_id, ms}])
     :ok
   end

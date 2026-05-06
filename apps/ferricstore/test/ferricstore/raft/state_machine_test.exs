@@ -467,6 +467,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       partition_key = "tenant-index-rollback"
       due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
       state_index_key = Ferricstore.Flow.Keys.state_index_key(type, "queued", partition_key)
+      history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
       state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
       bad_state = %{state | active_file_path: Path.join(dir, "missing.log")}
@@ -481,6 +482,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert Ferricstore.Flow.Index.score_of(state.flow_lookup_name, due_key, id) == :miss
       assert Ferricstore.Flow.Index.score_of(state.flow_lookup_name, state_index_key, id) == :miss
+      assert Ferricstore.Flow.Index.count_all(state.flow_lookup_name, history_key) == 0
       assert Ferricstore.Flow.Index.count_all(state.flow_lookup_name, due_key) == 0
       assert Ferricstore.Flow.Index.count_all(state.flow_lookup_name, state_index_key) == 0
     end
