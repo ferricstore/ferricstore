@@ -1004,19 +1004,21 @@ defmodule Ferricstore.Commands.Hash do
          {:ok, match_pattern, count} <- typed_scan_opts(opts) do
       prefix = CompoundKey.hash_prefix(key)
       pairs = Ops.compound_scan(store, key, prefix)
-      fields = Enum.map(pairs, fn {field, _value} -> field end)
 
       filtered =
         case match_pattern do
           nil ->
-            fields
+            pairs
 
           pattern ->
-            Enum.filter(fields, fn field -> Ferricstore.GlobMatcher.match?(field, pattern) end)
+            Enum.filter(pairs, fn {field, _value} ->
+              Ferricstore.GlobMatcher.match?(field, pattern)
+            end)
         end
 
       {next_cursor, batch} = paginate(filtered, cursor, count)
-      [next_cursor, batch]
+      elements = Enum.flat_map(batch, fn {field, value} -> [field, value] end)
+      [next_cursor, elements]
     end
   end
 

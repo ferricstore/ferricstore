@@ -1240,6 +1240,21 @@ defmodule Ferricstore.Commands.HashTest do
       assert pairs["c"] == "3"
     end
 
+    test "AST HSCAN returns field-value pairs like text HSCAN" do
+      store = MockStore.make()
+      Hash.handle("HSET", ["hash", "a", "1", "b", "2", "c", "3"], store)
+
+      [cursor, elements] = Hash.handle_ast({:hscan, "hash", 0, []}, store)
+
+      assert cursor == "0"
+      assert length(elements) == 6
+      assert elements |> Enum.chunk_every(2) |> Map.new(fn [k, v] -> {k, v} end) == %{
+               "a" => "1",
+               "b" => "2",
+               "c" => "3"
+             }
+    end
+
     test "HSCAN with COUNT limits batch size and returns continuation cursor" do
       store = MockStore.make()
 
