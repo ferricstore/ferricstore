@@ -474,6 +474,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, nil} = FerricStore.flow_get(new_id, partition_key: partition)
+    assert {:ok, []} = FerricStore.flow_history(new_id, partition_key: partition)
 
     assert {:error, "ERR flow duplicate id in batch"} =
              FerricStore.flow_create_many(
@@ -484,6 +485,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, nil} = FerricStore.flow_get(new_id, partition_key: partition)
+    assert {:ok, []} = FerricStore.flow_history(new_id, partition_key: partition)
   end
 
   test "flow_create_many spans shards and rolls back failing shard group" do
@@ -521,6 +523,10 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, nil} = FerricStore.flow_get(same_new_id, partition_key: same_b)
     assert {:ok, %{id: ^other_new_id}} = FerricStore.flow_get(other_new_id, partition_key: other)
+    assert {:ok, []} = FerricStore.flow_history(same_new_id, partition_key: same_b)
+
+    assert {:ok, other_history} = FerricStore.flow_history(other_new_id, partition_key: other)
+    assert Enum.map(other_history, fn {_id, fields} -> fields["event"] end) == ["created"]
   end
 
   test "flow_create emits telemetry without automatic worker pubsub wakeups" do
@@ -1552,6 +1558,11 @@ defmodule Ferricstore.FlowTest do
     assert fetched_a.version == 1
     assert fetched_b.version == 1
 
+    assert {:ok, history_a} = FerricStore.flow_history(id_a, partition_key: partition)
+    assert {:ok, history_b} = FerricStore.flow_history(id_b, partition_key: partition)
+    assert Enum.map(history_a, fn {_id, fields} -> fields["event"] end) == ["created"]
+    assert Enum.map(history_b, fn {_id, fields} -> fields["event"] end) == ["created"]
+
     assert {:ok, claimed} =
              FerricStore.flow_claim_due(type,
                partition_key: partition,
@@ -1604,6 +1615,18 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, %{state: "queued"}} = FerricStore.flow_get(bad_id, partition_key: same_a)
     assert {:ok, %{state: "queued"}} = FerricStore.flow_get(same_id, partition_key: same_b)
     assert {:ok, %{state: "ready"}} = FerricStore.flow_get(other_id, partition_key: other)
+
+    assert {:ok, bad_history} = FerricStore.flow_history(bad_id, partition_key: same_a)
+    assert {:ok, same_history} = FerricStore.flow_history(same_id, partition_key: same_b)
+    assert {:ok, other_history} = FerricStore.flow_history(other_id, partition_key: other)
+
+    assert Enum.map(bad_history, fn {_id, fields} -> fields["event"] end) == ["created"]
+    assert Enum.map(same_history, fn {_id, fields} -> fields["event"] end) == ["created"]
+
+    assert Enum.map(other_history, fn {_id, fields} -> fields["event"] end) == [
+             "created",
+             "transitioned"
+           ]
   end
 
   test "flow_transition enforces expected state and running lease guard" do
