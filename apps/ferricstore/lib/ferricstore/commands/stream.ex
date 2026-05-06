@@ -334,9 +334,21 @@ defmodule Ferricstore.Commands.Stream do
     # when populated; followers and post-migration always count via prefix.
     ensure_meta_table()
 
-    case stream_meta_entries(key, store) do
-      [{^key, len, _first, _last, _ms, _seq}] -> len
-      [] -> count_stream_entries(store, key)
+    with :ok <- ensure_stream_read_type(key, store) do
+      case stream_meta_entries(key, store) do
+        [{^key, len, _first, _last, _ms, _seq}] -> len
+        [] -> count_stream_entries(store, key)
+      end
+    end
+  end
+
+  defp ensure_stream_read_type(key, store) do
+    case :ets.lookup(@meta_table, key) do
+      [_entry] ->
+        :ok
+
+      [] ->
+        if Ops.has_compound?(store), do: TypeRegistry.check_type(key, :stream, store), else: :ok
     end
   end
 
@@ -638,23 +650,27 @@ defmodule Ferricstore.Commands.Stream do
   defp do_xrange(key, range_start, range_end, count, store) do
     ensure_meta_table()
 
-    if Ops.has_compound?(store) do
-      indexed_stream_range(key, range_start, range_end, count, false, store)
-    else
-      scanned_stream_range(key, range_start, range_end, count, store)
+    with :ok <- ensure_stream_read_type(key, store) do
+      if Ops.has_compound?(store) do
+        indexed_stream_range(key, range_start, range_end, count, false, store)
+      else
+        scanned_stream_range(key, range_start, range_end, count, store)
+      end
     end
   end
 
   defp do_xrevrange(key, range_start, range_end, count, store) do
     ensure_meta_table()
 
-    if Ops.has_compound?(store) do
-      indexed_stream_range(key, range_start, range_end, count, true, store)
-    else
-      key
-      |> scanned_stream_range(range_start, range_end, :infinity, store)
-      |> Enum.reverse()
-      |> maybe_take(count)
+    with :ok <- ensure_stream_read_type(key, store) do
+      if Ops.has_compound?(store) do
+        indexed_stream_range(key, range_start, range_end, count, true, store)
+      else
+        key
+        |> scanned_stream_range(range_start, range_end, :infinity, store)
+        |> Enum.reverse()
+        |> maybe_take(count)
+      end
     end
   end
 
@@ -981,44 +997,46 @@ defmodule Ferricstore.Commands.Stream do
   defp do_xinfo_stream(key, store) do
     ensure_meta_table()
 
-    case stream_meta_entries(key, store) do
-      [] ->
-        {:error, "ERR no such key"}
+    with :ok <- ensure_stream_read_type(key, store) do
+      case stream_meta_entries(key, store) do
+        [] ->
+          {:error, "ERR no such key"}
 
-      [{^key, len, first, last, _ms, _seq}] ->
-        prefix = "X:#{key}" <> @sep
+        [{^key, len, first, last, _ms, _seq}] ->
+          prefix = "X:#{key}" <> @sep
 
-        {first_entry, last_entry} =
-          if len > 0 do
-            last_key = prefix <> last
+          {first_entry, last_entry} =
+            if len > 0 do
+              last_key = prefix <> last
 
-            {first_raw, last_raw} =
-              if first != "0-0" do
-                [first_raw, last_raw] = Ops.batch_get(store, [prefix <> first, last_key])
-                {first_raw, last_raw}
-              else
-                [last_raw] = Ops.batch_get(store, [last_key])
-                {nil, last_raw}
-              end
+              {first_raw, last_raw} =
+                if first != "0-0" do
+                  [first_raw, last_raw] = Ops.batch_get(store, [prefix <> first, last_key])
+                  {first_raw, last_raw}
+                else
+                  [last_raw] = Ops.batch_get(store, [last_key])
+                  {nil, last_raw}
+                end
 
-            {
-              decode_stream_entry(first, first_raw),
-              decode_stream_entry(last, last_raw)
-            }
-          else
-            {nil, nil}
-          end
+              {
+                decode_stream_entry(first, first_raw),
+                decode_stream_entry(last, last_raw)
+              }
+            else
+              {nil, nil}
+            end
 
-        # Count consumer groups.
-        groups = count_groups(key)
+          # Count consumer groups.
+          groups = count_groups(key)
 
-        %{
-          "length" => len,
-          "first-entry" => first_entry,
-          "last-entry" => last_entry,
-          "last-generated-id" => last,
-          "groups" => groups
-        }
+          %{
+            "length" => len,
+            "first-entry" => first_entry,
+            "last-entry" => last_entry,
+            "last-generated-id" => last,
+            "groups" => groups
+          }
+      end
     end
   end
 

@@ -232,6 +232,13 @@ defmodule Ferricstore.Commands.StreamTest do
       assert 0 == Stream.handle("XLEN", ["nonexistent"], store)
     end
 
+    test "XLEN returns WRONGTYPE for a string key" do
+      store = MockStore.make(%{"plain" => {"value", 0}})
+
+      assert {:error, msg} = Stream.handle("XLEN", ["plain"], store)
+      assert msg =~ "WRONGTYPE"
+    end
+
     test "XLEN returns correct count after adding entries" do
       store = MockStore.make()
       key = ustream()
@@ -450,6 +457,13 @@ defmodule Ferricstore.Commands.StreamTest do
     test "XRANGE on nonexistent stream returns empty list" do
       store = MockStore.make()
       assert [] == Stream.handle("XRANGE", ["nonexistent", "-", "+"], store)
+    end
+
+    test "XRANGE returns WRONGTYPE for a string key" do
+      store = MockStore.make(%{"plain" => {"value", 0}})
+
+      assert {:error, msg} = Stream.handle("XRANGE", ["plain", "-", "+"], store)
+      assert msg =~ "WRONGTYPE"
     end
 
     test "XRANGE entries contain correct field-value pairs" do
@@ -874,6 +888,13 @@ defmodule Ferricstore.Commands.StreamTest do
       store = MockStore.make()
       result = Stream.handle("XINFO", ["STREAM", "nonexistent"], store)
       assert {:error, "ERR no such key"} = result
+    end
+
+    test "XINFO STREAM returns WRONGTYPE for a string key" do
+      store = MockStore.make(%{"plain" => {"value", 0}})
+
+      assert {:error, msg} = Stream.handle("XINFO", ["STREAM", "plain"], store)
+      assert msg =~ "WRONGTYPE"
     end
 
     test "XINFO STREAM with consumer groups shows group count" do
