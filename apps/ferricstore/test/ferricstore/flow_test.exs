@@ -85,6 +85,26 @@ defmodule Ferricstore.FlowTest do
     {same_a, same_b, other}
   end
 
+  defp create_claimed_flow(id, partition_key, flow_type, worker) do
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: flow_type,
+               partition_key: partition_key,
+               state: "queued",
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(flow_type,
+               partition_key: partition_key,
+               worker: worker,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    claimed
+  end
+
   test "flow internal keys use compact partition tags" do
     partition_key = "tenant:device:" <> String.duplicate("abcdef0123456789", 4)
 
@@ -2089,6 +2109,53 @@ defmodule Ferricstore.FlowTest do
     assert Enum.map(history_b, fn {_id, fields} -> fields["event"] end) == ["created", "claimed"]
   end
 
+  test "flow_complete_many spans shards and rolls back failing shard group" do
+    {same_a, same_b, other} = mixed_partition_keys()
+    type = uid("bulk-mixed-complete")
+    bad = create_claimed_flow(uid("complete-mixed-bad"), same_a, type, "worker-complete")
+    same = create_claimed_flow(uid("complete-mixed-same"), same_b, type, "worker-complete")
+    other_flow = create_claimed_flow(uid("complete-mixed-other"), other, type, "worker-complete")
+
+    assert {:ok, results} =
+             FerricStore.flow_complete_many(
+               nil,
+               [
+                 %{
+                   id: bad.id,
+                   partition_key: same_a,
+                   lease_token: bad.lease_token,
+                   fencing_token: bad.fencing_token + 1
+                 },
+                 %{
+                   id: same.id,
+                   partition_key: same_b,
+                   lease_token: same.lease_token,
+                   fencing_token: same.fencing_token
+                 },
+                 %{
+                   id: other_flow.id,
+                   partition_key: other,
+                   lease_token: other_flow.lease_token,
+                   fencing_token: other_flow.fencing_token
+                 }
+               ],
+               now_ms: 2_000
+             )
+
+    assert [
+             {:error, "ERR stale flow lease"},
+             {:error, "ERR stale flow lease"},
+             %{id: other_id, partition_key: ^other, state: "completed"}
+           ] = results
+
+    assert other_id == other_flow.id
+    assert {:ok, %{state: "running"}} = FerricStore.flow_get(bad.id, partition_key: same_a)
+    assert {:ok, %{state: "running"}} = FerricStore.flow_get(same.id, partition_key: same_b)
+
+    assert {:ok, %{state: "completed"}} =
+             FerricStore.flow_get(other_flow.id, partition_key: other)
+  end
+
   test "flow_fail_many atomically fails one-partition batch" do
     partition = uid("tenant-fail-many")
     type = uid("bulk-fail-many")
@@ -2177,6 +2244,97 @@ defmodule Ferricstore.FlowTest do
     assert fetched_b.version == 2
   end
 
+  test "flow_retry_many spans shards and rolls back failing shard group" do
+    {same_a, same_b, other} = mixed_partition_keys()
+    type = uid("bulk-mixed-retry")
+    bad = create_claimed_flow(uid("retry-mixed-bad"), same_a, type, "worker-retry")
+    same = create_claimed_flow(uid("retry-mixed-same"), same_b, type, "worker-retry")
+    other_flow = create_claimed_flow(uid("retry-mixed-other"), other, type, "worker-retry")
+
+    assert {:ok, results} =
+             FerricStore.flow_retry_many(
+               nil,
+               [
+                 %{
+                   id: bad.id,
+                   partition_key: same_a,
+                   lease_token: bad.lease_token,
+                   fencing_token: bad.fencing_token + 1
+                 },
+                 %{
+                   id: same.id,
+                   partition_key: same_b,
+                   lease_token: same.lease_token,
+                   fencing_token: same.fencing_token
+                 },
+                 %{
+                   id: other_flow.id,
+                   partition_key: other,
+                   lease_token: other_flow.lease_token,
+                   fencing_token: other_flow.fencing_token
+                 }
+               ],
+               run_at_ms: 2_000,
+               now_ms: 2_000
+             )
+
+    assert [
+             {:error, "ERR stale flow lease"},
+             {:error, "ERR stale flow lease"},
+             %{id: other_id, partition_key: ^other, state: "queued"}
+           ] = results
+
+    assert other_id == other_flow.id
+    assert {:ok, %{state: "running"}} = FerricStore.flow_get(bad.id, partition_key: same_a)
+    assert {:ok, %{state: "running"}} = FerricStore.flow_get(same.id, partition_key: same_b)
+    assert {:ok, %{state: "queued"}} = FerricStore.flow_get(other_flow.id, partition_key: other)
+  end
+
+  test "flow_fail_many spans shards and rolls back failing shard group" do
+    {same_a, same_b, other} = mixed_partition_keys()
+    type = uid("bulk-mixed-fail")
+    bad = create_claimed_flow(uid("fail-mixed-bad"), same_a, type, "worker-fail")
+    same = create_claimed_flow(uid("fail-mixed-same"), same_b, type, "worker-fail")
+    other_flow = create_claimed_flow(uid("fail-mixed-other"), other, type, "worker-fail")
+
+    assert {:ok, results} =
+             FerricStore.flow_fail_many(
+               nil,
+               [
+                 %{
+                   id: bad.id,
+                   partition_key: same_a,
+                   lease_token: bad.lease_token,
+                   fencing_token: bad.fencing_token + 1
+                 },
+                 %{
+                   id: same.id,
+                   partition_key: same_b,
+                   lease_token: same.lease_token,
+                   fencing_token: same.fencing_token
+                 },
+                 %{
+                   id: other_flow.id,
+                   partition_key: other,
+                   lease_token: other_flow.lease_token,
+                   fencing_token: other_flow.fencing_token
+                 }
+               ],
+               now_ms: 2_000
+             )
+
+    assert [
+             {:error, "ERR stale flow lease"},
+             {:error, "ERR stale flow lease"},
+             %{id: other_id, partition_key: ^other, state: "failed"}
+           ] = results
+
+    assert other_id == other_flow.id
+    assert {:ok, %{state: "running"}} = FerricStore.flow_get(bad.id, partition_key: same_a)
+    assert {:ok, %{state: "running"}} = FerricStore.flow_get(same.id, partition_key: same_b)
+    assert {:ok, %{state: "failed"}} = FerricStore.flow_get(other_flow.id, partition_key: other)
+  end
+
   test "flow_cancel_many atomically cancels one-partition queued batch" do
     partition = uid("tenant-cancel-many")
     type = uid("bulk-cancel-many")
@@ -2240,6 +2398,45 @@ defmodule Ferricstore.FlowTest do
     assert fetched_b.state == "queued"
     assert fetched_a.version == 1
     assert fetched_b.version == 1
+  end
+
+  test "flow_cancel_many spans shards and rolls back failing shard group" do
+    {same_a, same_b, other} = mixed_partition_keys()
+    type = uid("bulk-mixed-cancel")
+    bad_id = uid("cancel-mixed-bad")
+    same_id = uid("cancel-mixed-same")
+    other_id = uid("cancel-mixed-other")
+
+    for {id, partition} <- [{bad_id, same_a}, {same_id, same_b}, {other_id, other}] do
+      assert {:ok, _} =
+               FerricStore.flow_create(id,
+                 type: type,
+                 partition_key: partition,
+                 state: "queued",
+                 run_at_ms: 1_000
+               )
+    end
+
+    assert {:ok, results} =
+             FerricStore.flow_cancel_many(
+               nil,
+               [
+                 %{id: bad_id, partition_key: same_a, fencing_token: 1},
+                 %{id: same_id, partition_key: same_b, fencing_token: 0},
+                 %{id: other_id, partition_key: other, fencing_token: 0}
+               ],
+               now_ms: 2_000
+             )
+
+    assert [
+             {:error, "ERR stale flow lease"},
+             {:error, "ERR stale flow lease"},
+             %{id: ^other_id, partition_key: ^other, state: "cancelled"}
+           ] = results
+
+    assert {:ok, %{state: "queued"}} = FerricStore.flow_get(bad_id, partition_key: same_a)
+    assert {:ok, %{state: "queued"}} = FerricStore.flow_get(same_id, partition_key: same_b)
+    assert {:ok, %{state: "cancelled"}} = FerricStore.flow_get(other_id, partition_key: other)
   end
 
   test "flow_transition enforces expected state and running lease guard" do
