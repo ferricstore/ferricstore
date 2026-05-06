@@ -89,6 +89,95 @@ defmodule Ferricstore.Store.ListOpsTest do
     refute_received {:compound_batch_delete, _}
   end
 
+  test "single LPOP uses metadata boundary without scanning the list" do
+    parent = self()
+    meta_key = CompoundKey.list_meta_key("list")
+    left_key = CompoundKey.list_element("list", 0)
+
+    store = %{
+      compound_get: fn
+        "list", ^meta_key -> :erlang.term_to_binary({3, -1_000_000_000, 3_000_000_000})
+        "list", ^left_key -> "a"
+      end,
+      compound_batch_delete: fn "list", [^left_key] ->
+        send(parent, :deleted_left)
+        :ok
+      end,
+      compound_delete: fn "list", compound_key ->
+        flunk("single LPOP should batch-delete element, got #{inspect(compound_key)}")
+      end,
+      compound_put: fn "list", ^meta_key, meta_binary, 0 when is_binary(meta_binary) ->
+        send(parent, {:meta, :erlang.binary_to_term(meta_binary)})
+        :ok
+      end,
+      compound_scan: fn "list", _prefix ->
+        flunk("single LPOP should not scan the full list")
+      end
+    }
+
+    assert "a" == ListOps.execute("list", store, {:lpop, 1})
+    assert_received :deleted_left
+    assert_received {:meta, {2, 0, 3_000_000_000}}
+  end
+
+  test "single RPOP uses metadata boundary without scanning the list" do
+    parent = self()
+    meta_key = CompoundKey.list_meta_key("list")
+    right_key = CompoundKey.list_element("list", 2_000_000_000)
+
+    store = %{
+      compound_get: fn
+        "list", ^meta_key -> :erlang.term_to_binary({3, -1_000_000_000, 3_000_000_000})
+        "list", ^right_key -> "c"
+      end,
+      compound_batch_delete: fn "list", [^right_key] ->
+        send(parent, :deleted_right)
+        :ok
+      end,
+      compound_delete: fn "list", compound_key ->
+        flunk("single RPOP should batch-delete element, got #{inspect(compound_key)}")
+      end,
+      compound_put: fn "list", ^meta_key, meta_binary, 0 when is_binary(meta_binary) ->
+        send(parent, {:meta, :erlang.binary_to_term(meta_binary)})
+        :ok
+      end,
+      compound_scan: fn "list", _prefix ->
+        flunk("single RPOP should not scan the full list")
+      end
+    }
+
+    assert "c" == ListOps.execute("list", store, {:rpop, 1})
+    assert_received :deleted_right
+    assert_received {:meta, {2, -1_000_000_000, 2_000_000_000}}
+  end
+
+  test "single LPOP of the last element deletes metadata without scanning" do
+    parent = self()
+    meta_key = CompoundKey.list_meta_key("list")
+    left_key = CompoundKey.list_element("list", 0)
+
+    store = %{
+      compound_get: fn
+        "list", ^meta_key -> :erlang.term_to_binary({1, -1_000_000_000, 1_000_000_000})
+        "list", ^left_key -> "a"
+      end,
+      compound_batch_delete: fn "list", [^left_key] -> :ok end,
+      compound_delete: fn "list", ^meta_key ->
+        send(parent, :deleted_meta)
+        :ok
+      end,
+      compound_put: fn "list", compound_key, _value, 0 ->
+        flunk("single LPOP last element should delete metadata, got #{inspect(compound_key)}")
+      end,
+      compound_scan: fn "list", _prefix ->
+        flunk("single LPOP last element should not scan the full list")
+      end
+    }
+
+    assert "a" == ListOps.execute("list", store, {:lpop, 1})
+    assert_received :deleted_meta
+  end
+
   test "LMOVE returns error when source delete fails before touching destination" do
     meta_key = CompoundKey.list_meta_key("src")
     pos = 0
@@ -125,6 +214,12 @@ defmodule Ferricstore.Store.ListOpsTest do
       compound_batch_delete: fn "src", [_element_key] -> :ok end,
       compound_delete: fn "src", ^src_meta_key -> :ok end,
       compound_put: fn
+        "src", <<"L:src", _rest::binary>>, "a", 0 ->
+          :ok
+
+        "src", ^src_meta_key, _meta, 0 ->
+          :ok
+
         "dst", <<"L:dst", _rest::binary>>, "a", 0 ->
           {:error, "disk full"}
 

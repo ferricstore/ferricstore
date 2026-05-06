@@ -47,6 +47,9 @@ defmodule Ferricstore.Commands.ListTest do
           unless Agent.get(meta_deleted, & &1) do
             :erlang.term_to_binary({1, -1_000_000_000, 1_000_000_000})
           end
+
+        "mylist", ^element_key ->
+          "a"
       end,
       compound_batch_delete: fn "mylist", [^element_key] -> :ok end,
       compound_delete: fn

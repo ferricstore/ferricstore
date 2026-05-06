@@ -251,52 +251,34 @@ defmodule Ferricstore.Store.ListOps do
   # LPOP
   defp do_execute(_key, _store, nil, {:lpop, _count}), do: nil
   defp do_execute(_key, _store, {0, _, _}, {:lpop, _count}), do: nil
+  defp do_execute(_key, _store, {_len, _left, _right}, {:lpop, 0}), do: []
+
+  defp do_execute(key, store, {len, left_pos, right_pos}, {:lpop, 1}) do
+    pop_single_boundary(key, store, len, left_pos + @position_step, :left, {left_pos, right_pos})
+  end
 
   defp do_execute(key, store, {len, _, _}, {:lpop, count}) do
-    sorted = sorted_elements(key, store)
-
-    if sorted == [] do
-      nil
-    else
-      actual_count = min(count, length(sorted))
-      {to_pop, remaining} = Enum.split(sorted, actual_count)
-
-      popped_values = Enum.map(to_pop, fn {_, val} -> val end)
-
-      with :ok <- delete_elements(key, store, to_pop),
-           :ok <- update_or_delete_meta(key, store, len - actual_count, remaining) do
-        case count do
-          1 -> List.first(popped_values)
-          _ -> popped_values
-        end
-      end
-    end
+    pop_left_by_scan(key, store, len, count)
   end
 
   # RPOP
   defp do_execute(_key, _store, nil, {:rpop, _count}), do: nil
   defp do_execute(_key, _store, {0, _, _}, {:rpop, _count}), do: nil
+  defp do_execute(_key, _store, {_len, _left, _right}, {:rpop, 0}), do: []
+
+  defp do_execute(key, store, {len, left_pos, right_pos}, {:rpop, 1}) do
+    pop_single_boundary(
+      key,
+      store,
+      len,
+      right_pos - @position_step,
+      :right,
+      {left_pos, right_pos}
+    )
+  end
 
   defp do_execute(key, store, {len, _, _}, {:rpop, count}) do
-    sorted = sorted_elements(key, store)
-
-    if sorted == [] do
-      nil
-    else
-      total = length(sorted)
-      actual_count = min(count, total)
-      {remaining, to_pop} = Enum.split(sorted, total - actual_count)
-
-      popped_values = to_pop |> Enum.map(fn {_, val} -> val end) |> Enum.reverse()
-
-      with :ok <- delete_elements(key, store, to_pop),
-           :ok <- update_or_delete_meta(key, store, len - actual_count, remaining) do
-        case count do
-          1 -> List.first(popped_values)
-          _ -> popped_values
-        end
-      end
-    end
+    pop_right_by_scan(key, store, len, count)
   end
 
   # LRANGE
@@ -478,6 +460,78 @@ defmodule Ferricstore.Store.ListOps do
 
   defp do_execute(key, store, meta, {:rpushx, elems}),
     do: do_execute(key, store, meta, {:rpush, elems})
+
+  defp pop_single_boundary(key, store, len, pos, direction, {left_pos, right_pos}) do
+    compound_key = CompoundKey.list_element(key, pos)
+
+    case Ops.compound_get(store, key, compound_key) do
+      nil ->
+        case direction do
+          :left -> pop_left_by_scan(key, store, len, 1)
+          :right -> pop_right_by_scan(key, store, len, 1)
+        end
+
+      value ->
+        with :ok <- delete_elements(key, store, [{pos, value}]),
+             :ok <- update_single_pop_meta(key, store, len, pos, direction, {left_pos, right_pos}) do
+          value
+        end
+    end
+  end
+
+  defp update_single_pop_meta(key, store, 1, _pos, _direction, _bounds),
+    do: delete_meta(key, store)
+
+  defp update_single_pop_meta(key, store, len, pos, :left, {_left_pos, right_pos}) do
+    write_meta(key, store, {len - 1, pos, right_pos})
+  end
+
+  defp update_single_pop_meta(key, store, len, pos, :right, {left_pos, _right_pos}) do
+    write_meta(key, store, {len - 1, left_pos, pos})
+  end
+
+  defp pop_left_by_scan(key, store, len, count) do
+    sorted = sorted_elements(key, store)
+
+    if sorted == [] do
+      nil
+    else
+      actual_count = min(count, length(sorted))
+      {to_pop, remaining} = Enum.split(sorted, actual_count)
+
+      popped_values = Enum.map(to_pop, fn {_, val} -> val end)
+
+      with :ok <- delete_elements(key, store, to_pop),
+           :ok <- update_or_delete_meta(key, store, len - actual_count, remaining) do
+        case count do
+          1 -> List.first(popped_values)
+          _ -> popped_values
+        end
+      end
+    end
+  end
+
+  defp pop_right_by_scan(key, store, len, count) do
+    sorted = sorted_elements(key, store)
+
+    if sorted == [] do
+      nil
+    else
+      total = length(sorted)
+      actual_count = min(count, total)
+      {remaining, to_pop} = Enum.split(sorted, total - actual_count)
+
+      popped_values = to_pop |> Enum.map(fn {_, val} -> val end) |> Enum.reverse()
+
+      with :ok <- delete_elements(key, store, to_pop),
+           :ok <- update_or_delete_meta(key, store, len - actual_count, remaining) do
+        case count do
+          1 -> List.first(popped_values)
+          _ -> popped_values
+        end
+      end
+    end
+  end
 
   defp linsert_position(_key, _store, sorted, :before, 0) do
     {:ok, pos_to_int(elem(hd(sorted), 0)) - @position_step}
