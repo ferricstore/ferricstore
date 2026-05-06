@@ -14,8 +14,7 @@ defmodule FerricstoreServer.Spec.InputValidationTest do
   alias Ferricstore.Test.ShardHelpers
 
   setup_all do
-    :persistent_term.put(:ferricstore_keydir_full, false)
-    :persistent_term.put(:ferricstore_reject_writes, false)
+    Ferricstore.MemoryGuard.reset_pressure_flags()
     ShardHelpers.wait_shards_alive(30_000)
     %{port: Listener.port()}
   end
@@ -69,7 +68,7 @@ defmodule FerricstoreServer.Spec.InputValidationTest do
   end
 
   # Normalize OK responses (RESP3 returns {:simple, "OK"})
-  defp assert_ok(resp), do: assert resp in ["OK", {:simple, "OK"}]
+  defp assert_ok(resp), do: assert(resp in ["OK", {:simple, "OK"}])
 
   # Extract error message from various error formats
   defp assert_error_contains(resp, substring) do

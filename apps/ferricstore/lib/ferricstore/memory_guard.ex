@@ -232,6 +232,22 @@ defmodule Ferricstore.MemoryGuard do
   end
 
   @doc """
+  Clears all lock-free memory-pressure flags.
+
+  This is intentionally small and synchronous because write-path guards read
+  these atomics directly. Tests and recovery code can use it after artificial
+  pressure without relying on stale compatibility keys in `:persistent_term`.
+  """
+  @spec reset_pressure_flags() :: :ok
+  def reset_pressure_flags do
+    ref = FerricStore.Instance.get(:default).pressure_flags
+    :atomics.put(ref, 1, 0)
+    :atomics.put(ref, 2, 0)
+    :atomics.put(ref, 3, 0)
+    :ok
+  end
+
+  @doc """
   Reconfigures MemoryGuard with new budget parameters.
 
   Accepts a map with optional keys:
@@ -303,6 +319,7 @@ defmodule Ferricstore.MemoryGuard do
   @impl true
   def handle_call(:stats, _from, state), do: {:reply, compute_stats(state), state}
   def handle_call(:eviction_policy, _from, state), do: {:reply, state.eviction_policy, state}
+
   def handle_call(:reject_writes?, _from, state) do
     {:reply, state.last_pressure_level == :reject and state.eviction_policy == :noeviction, state}
   end
@@ -321,9 +338,14 @@ defmodule Ferricstore.MemoryGuard do
 
     new_state =
       case Map.get(params, :hot_cache_max_ram) do
-        nil -> %{new_state | hot_cache_max_ram: new_state.max_memory_bytes - new_state.keydir_max_ram}
-        :auto -> %{new_state | hot_cache_max_ram: new_state.max_memory_bytes - new_state.keydir_max_ram}
-        val -> %{new_state | hot_cache_max_ram: val}
+        nil ->
+          %{new_state | hot_cache_max_ram: new_state.max_memory_bytes - new_state.keydir_max_ram}
+
+        :auto ->
+          %{new_state | hot_cache_max_ram: new_state.max_memory_bytes - new_state.keydir_max_ram}
+
+        val ->
+          %{new_state | hot_cache_max_ram: val}
       end
 
     {:reply, :ok, new_state}
@@ -355,9 +377,14 @@ defmodule Ferricstore.MemoryGuard do
     :telemetry.execute(
       [:ferricstore, :memory, :check],
       %{total_bytes: stats.total_bytes, rss_bytes: stats.rss_bytes},
-      %{pressure_level: stats.pressure_level, ratio: stats.ratio, max_bytes: stats.max_bytes,
-        rss_ratio: stats.rss_ratio, rss_pressure_level: stats.rss_pressure_level,
-        memory_limit: stats.memory_limit}
+      %{
+        pressure_level: stats.pressure_level,
+        ratio: stats.ratio,
+        max_bytes: stats.max_bytes,
+        rss_ratio: stats.rss_ratio,
+        rss_pressure_level: stats.rss_pressure_level,
+        memory_limit: stats.memory_limit
+      }
     )
 
     emit_spec_pressure_level(stats, level)
@@ -381,6 +408,7 @@ defmodule Ferricstore.MemoryGuard do
       :ok ->
         if state.last_pressure_level in [:pressure, :reject] do
           Logger.info("MemoryGuard: memory pressure resolved")
+
           :telemetry.execute(
             [:ferricstore, :memory, :recovered],
             %{total_bytes: stats.total_bytes, max_bytes: stats.max_bytes, ratio: stats.ratio},
@@ -392,6 +420,7 @@ defmodule Ferricstore.MemoryGuard do
         if state.last_pressure_level not in [:warning, :pressure, :reject] do
           Logger.warning("MemoryGuard: memory warning (#{Float.round(stats.ratio * 100, 1)}%)")
         end
+
         # Gentle eviction: evict down to 65% target
         target_evict(state, stats, 0.65, 50)
 
@@ -410,7 +439,11 @@ defmodule Ferricstore.MemoryGuard do
 
     publish_pressure_flags(stats, state)
 
-    %{state | last_pressure_level: stats.pressure_level, keydir_pressure_level: stats.keydir_pressure_level}
+    %{
+      state
+      | last_pressure_level: stats.pressure_level,
+        keydir_pressure_level: stats.keydir_pressure_level
+    }
   end
 
   # Target-based eviction: evict hot values until memory drops to target_ratio.
@@ -418,7 +451,12 @@ defmodule Ferricstore.MemoryGuard do
   # Eviction order is determined by the configured policy (LFU/LRU/TTL).
   defp target_evict(%{eviction_policy: :noeviction}, _stats, _target_ratio, _sample_size), do: :ok
 
-  defp target_evict(%{eviction_policy: policy, shard_count: shard_count} = _state, stats, target_ratio, sample_size)
+  defp target_evict(
+         %{eviction_policy: policy, shard_count: shard_count} = _state,
+         stats,
+         target_ratio,
+         sample_size
+       )
        when policy in [:volatile_lfu, :allkeys_lfu, :volatile_lru, :allkeys_lru, :volatile_ttl] do
     target_bytes = trunc(stats.max_bytes * target_ratio)
     bytes_to_free = max(0, stats.total_bytes - target_bytes)
@@ -466,8 +504,8 @@ defmodule Ferricstore.MemoryGuard do
       guards =
         case policy do
           p when p in [:volatile_lfu, :volatile_lru, :volatile_ttl] ->
-            [{:"/=", :"$2", nil}, {:"/=", :"$5", :pending},
-             {:>, :"$3", 0}, {:>, :"$3", now}]
+            [{:"/=", :"$2", nil}, {:"/=", :"$5", :pending}, {:>, :"$3", 0}, {:>, :"$3", now}]
+
           _ ->
             [{:"/=", :"$2", nil}, {:"/=", :"$5", :pending}]
         end
@@ -494,10 +532,12 @@ defmodule Ferricstore.MemoryGuard do
           case policy do
             :volatile_ttl ->
               Enum.sort_by(eligible, fn {_k, exp, _lfu, _vs} -> exp end)
+
             p when p in [:volatile_lfu, :allkeys_lfu] ->
               Enum.sort_by(eligible, fn {_k, _exp, lfu, _vs} ->
                 Ferricstore.Store.LFU.effective_counter(lfu)
               end)
+
             p when p in [:volatile_lru, :allkeys_lru] ->
               Enum.sort_by(eligible, fn {_k, _exp, lfu, _vs} ->
                 Ferricstore.Store.LFU.unpack(lfu) |> elem(0)
@@ -518,9 +558,12 @@ defmodule Ferricstore.MemoryGuard do
                   [{^key, val, _, _, _, _, _}] when val != nil ->
                     val_bytes = evict_offheap_size(val)
                     if val_bytes > 0, do: :atomics.sub(binary_ref, shard_index + 1, val_bytes)
-                  _ -> :ok
+
+                  _ ->
+                    :ok
                 end
               end
+
               :ets.update_element(keydir, key, {2, nil})
               {:cont, {cnt + 1, freed + vsize}}
             end
@@ -545,12 +588,14 @@ defmodule Ferricstore.MemoryGuard do
         bin_bytes = safe_atomics_get(binary_bytes_ref, i + 1)
         kd_bytes = ets_bytes + bin_bytes
         per_shard_max = div(state.max_memory_bytes, max(state.shard_count, 1))
+
         ratio =
           cond do
             per_shard_max > 0 -> kd_bytes / per_shard_max
             kd_bytes > 0 -> 1.0
             true -> 0.0
           end
+
         {kd_acc + kd_bytes, Map.put(shards_acc, i, %{bytes: kd_bytes, ratio: ratio})}
       end)
 
@@ -577,7 +622,9 @@ defmodule Ferricstore.MemoryGuard do
     # for our pressure decisions.
     {rss_bytes, rss_ratio, rss_pressure_level} =
       case default_process_rss_fn() do
-        nil -> {0, 0.0, :ok}
+        nil ->
+          {0, 0.0, :ok}
+
         rss_fn ->
           rss = rss_fn.() || 0
           limit = state.memory_limit
@@ -589,9 +636,12 @@ defmodule Ferricstore.MemoryGuard do
     overall_pressure = worse_pressure(pressure_level, rss_pressure_level)
 
     %{
-      total_bytes: total_bytes, max_bytes: state.max_memory_bytes,
-      ratio: ratio, pressure_level: overall_pressure,
-      shards: shard_stats, eviction_policy: state.eviction_policy,
+      total_bytes: total_bytes,
+      max_bytes: state.max_memory_bytes,
+      ratio: ratio,
+      pressure_level: overall_pressure,
+      shards: shard_stats,
+      eviction_policy: state.eviction_policy,
       keydir_bytes: keydir_bytes,
       hot_cache_bytes: 0,
       keydir_max_ram: state.keydir_max_ram,
@@ -619,8 +669,10 @@ defmodule Ferricstore.MemoryGuard do
       memory when is_integer(memory) -> memory * :erlang.system_info(:wordsize)
       _ -> 0
     end
-  rescue _ -> 0
-  catch _, _ -> 0
+  rescue
+    _ -> 0
+  catch
+    _, _ -> 0
   end
 
   defp shard_indexes(count) when is_integer(count) and count > 0, do: 0..(count - 1)
@@ -637,6 +689,7 @@ defmodule Ferricstore.MemoryGuard do
   defp evict_offheap_size(_), do: 0
 
   defp safe_atomics_get(nil, _slot), do: 0
+
   defp safe_atomics_get(ref, slot) do
     val = :atomics.get(ref, slot)
     max(val, 0)
@@ -668,6 +721,7 @@ defmodule Ferricstore.MemoryGuard do
           %{new_budget_bytes: new_budget, old_budget_bytes: old_budget},
           %{level: level, shard_count: state.shard_count}
         )
+
         %{state | last_hot_cache_budget: new_budget}
 
       old_budget != nil and new_budget > old_budget ->
@@ -676,6 +730,7 @@ defmodule Ferricstore.MemoryGuard do
           %{new_budget_bytes: new_budget, old_budget_bytes: old_budget},
           %{level: level, shard_count: state.shard_count}
         )
+
         %{state | last_hot_cache_budget: new_budget}
 
       true ->
@@ -687,9 +742,15 @@ defmodule Ferricstore.MemoryGuard do
     Enum.each(stats.shards, fn {index, shard_stat} ->
       if shard_stat.ratio >= @pressure_threshold do
         per_shard_max = div(stats.max_bytes, max(map_size(stats.shards), 1))
+
         :telemetry.execute(
           [:ferricstore, :memory, :pressure],
-          %{shard_index: index, bytes: shard_stat.bytes, max_bytes: per_shard_max, ratio: shard_stat.ratio},
+          %{
+            shard_index: index,
+            bytes: shard_stat.bytes,
+            max_bytes: per_shard_max,
+            ratio: shard_stat.ratio
+          },
           %{pressure_level: stats.pressure_level, eviction_policy: stats.eviction_policy}
         )
       end
@@ -707,8 +768,12 @@ defmodule Ferricstore.MemoryGuard do
   defp hot_cache_budget(max_memory_bytes, :full), do: div(max_memory_bytes * 5, 100)
 
   defp schedule_check(interval_ms), do: Process.send_after(self(), :check, interval_ms)
-  defp default_interval, do: Application.get_env(:ferricstore, :memory_guard_interval_ms, @check_interval_ms)
-  defp default_max_memory, do: Application.get_env(:ferricstore, :max_memory_bytes, default_system_memory())
+
+  defp default_interval,
+    do: Application.get_env(:ferricstore, :memory_guard_interval_ms, @check_interval_ms)
+
+  defp default_max_memory,
+    do: Application.get_env(:ferricstore, :max_memory_bytes, default_system_memory())
 
   defp default_system_memory do
     limit = detect_memory_limit()
@@ -721,22 +786,26 @@ defmodule Ferricstore.MemoryGuard do
   # which is the correct ceiling (not the host's total RAM).
   @doc false
   def detect_memory_limit do
-    cgroup_v2_limit()
-    || cgroup_v1_limit()
-    || host_total_memory()
-    || proc_meminfo_total()
-    || 1_073_741_824
+    cgroup_v2_limit() ||
+      cgroup_v1_limit() ||
+      host_total_memory() ||
+      proc_meminfo_total() ||
+      1_073_741_824
   end
 
   defp cgroup_v2_limit do
     case File.read("/sys/fs/cgroup/memory.max") do
-      {:ok, "max\n"} -> nil
+      {:ok, "max\n"} ->
+        nil
+
       {:ok, data} ->
         case Integer.parse(String.trim(data)) do
           {bytes, _} when bytes > 0 -> bytes
           _ -> nil
         end
-      _ -> nil
+
+      _ ->
+        nil
     end
   end
 
@@ -748,19 +817,24 @@ defmodule Ferricstore.MemoryGuard do
           {bytes, _} when bytes > 0 and bytes < 4_611_686_018_427_387_904 -> bytes
           _ -> nil
         end
-      _ -> nil
+
+      _ ->
+        nil
     end
   end
 
   defp host_total_memory do
     try do
       data = apply(:memsup, :get_system_memory_data, [])
+
       case data do
         list when is_list(list) -> Keyword.get(list, :total_memory)
         _ -> nil
       end
-    rescue _ -> nil
-    catch _, _ -> nil
+    rescue
+      _ -> nil
+    catch
+      _, _ -> nil
     end
   end
 
@@ -773,9 +847,13 @@ defmodule Ferricstore.MemoryGuard do
               {kb, _} -> kb * 1024
               _ -> nil
             end
-          _ -> nil
+
+          _ ->
+            nil
         end
-      _ -> nil
+
+      _ ->
+        nil
     end
   end
 
@@ -785,8 +863,8 @@ defmodule Ferricstore.MemoryGuard do
   # Falls back to :erlang.memory(:total) which only covers BEAM-managed memory.
   @doc false
   def process_rss_bytes do
-    read_proc_self_rss()
-    || erlang_total_memory()
+    read_proc_self_rss() ||
+      erlang_total_memory()
   end
 
   # Linux: parse VmRSS from /proc/self/status (in kB)
@@ -799,17 +877,23 @@ defmodule Ferricstore.MemoryGuard do
               {kb, _} -> kb * 1024
               _ -> nil
             end
-          _ -> nil
+
+          _ ->
+            nil
         end
-      _ -> nil
+
+      _ ->
+        nil
     end
   end
 
   defp erlang_total_memory do
     try do
       :erlang.memory(:total)
-    rescue _ -> nil
-    catch _, _ -> nil
+    rescue
+      _ -> nil
+    catch
+      _, _ -> nil
     end
   end
 
@@ -855,11 +939,14 @@ defmodule Ferricstore.MemoryGuard do
     end
   end
 
-  defp default_eviction_policy, do: Application.get_env(:ferricstore, :eviction_policy, :volatile_lru)
+  defp default_eviction_policy,
+    do: Application.get_env(:ferricstore, :eviction_policy, :volatile_lru)
+
   defp default_shard_count, do: Application.get_env(:ferricstore, :shard_count, 4)
-  defp default_keydir_max_ram, do: Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024)
+
+  defp default_keydir_max_ram,
+    do: Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024)
 
   defp maybe_update(state, _key, nil), do: state
   defp maybe_update(state, key, value), do: Map.put(state, key, value)
-
 end

@@ -37,13 +37,14 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
     handler_id
   end
 
-  # Reset persistent_term flags after each test so that tiny-budget
+  # Reset atomics flags after each test so that tiny-budget
   # MemoryGuard checks don't leak KEYDIR_FULL into other tests.
   setup do
     on_exit(fn ->
-      :persistent_term.put(:ferricstore_keydir_full, false)
-      :persistent_term.put(:ferricstore_reject_writes, false)
+      MemoryGuard.reset_pressure_flags()
     end)
+
+    MemoryGuard.reset_pressure_flags()
   end
 
   defp start_guard(opts) do
@@ -66,8 +67,7 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
     trigger_check(pid)
 
     receive do
-      {:telemetry, [:ferricstore, :memory, :pressure], measurements,
-       %{level: ^expected_level}} ->
+      {:telemetry, [:ferricstore, :memory, :pressure], measurements, %{level: ^expected_level}} ->
         measurements
     after
       500 ->

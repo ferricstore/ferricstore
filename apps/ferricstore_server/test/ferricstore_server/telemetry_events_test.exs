@@ -24,8 +24,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
     ShardHelpers.flush_all_keys()
 
     on_exit(fn ->
-      :persistent_term.put(:ferricstore_reject_writes, false)
-      :persistent_term.put(:ferricstore_keydir_full, false)
+      MemoryGuard.reset_pressure_flags()
     end)
 
     :ok
@@ -60,11 +59,11 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       handler_id = attach_handler([:ferricstore, :memory, :pressure])
 
       {:ok, pid} =
-        GenServer.start_link(MemoryGuard, [
+        GenServer.start_link(MemoryGuard,
           interval_ms: 50,
           max_memory_bytes: 1,
           shard_count: 4
-        ])
+        )
 
       # Match specifically on per-shard events (contain pressure_level in metadata)
       assert_receive {:telemetry, [:ferricstore, :memory, :pressure], measurements,
@@ -80,8 +79,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       :telemetry.detach(handler_id)
 
       # Reset global persistent_term keys contaminated by the dedicated instance.
-      :persistent_term.put(:ferricstore_reject_writes, false)
-      :persistent_term.put(:ferricstore_keydir_full, false)
+      MemoryGuard.reset_pressure_flags()
     end
   end
 
@@ -95,18 +93,23 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
       # Start with a tiny budget to force pressure/reject.
       {:ok, pid} =
-        GenServer.start_link(MemoryGuard, [
+        GenServer.start_link(MemoryGuard,
           interval_ms: 50,
           max_memory_bytes: 1,
           shard_count: 4
-        ])
+        )
 
       # Wait for at least one pressure check cycle to set last_pressure_level.
-      ShardHelpers.eventually(fn ->
-        # Check that the MemoryGuard has processed at least one check cycle
-        state = :sys.get_state(pid)
-        state.last_pressure_level in [:pressure, :reject]
-      end, "MemoryGuard did not enter pressure state", 30, 10)
+      ShardHelpers.eventually(
+        fn ->
+          # Check that the MemoryGuard has processed at least one check cycle
+          state = :sys.get_state(pid)
+          state.last_pressure_level in [:pressure, :reject]
+        end,
+        "MemoryGuard did not enter pressure state",
+        30,
+        10
+      )
 
       # Now increase the budget to a large value so next check goes to :ok.
       :sys.replace_state(pid, fn state ->
@@ -128,8 +131,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       :telemetry.detach(handler_id)
 
       # Reset global persistent_term keys contaminated by the dedicated instance.
-      :persistent_term.put(:ferricstore_reject_writes, false)
-      :persistent_term.put(:ferricstore_keydir_full, false)
+      MemoryGuard.reset_pressure_flags()
     end
 
     test "not emitted when transitioning from :warning to :ok" do
@@ -138,11 +140,11 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       # Start with a normal budget. The app-wide guard already runs at :ok.
       # Force a state where last_pressure_level = :warning, then trigger :ok.
       {:ok, pid} =
-        GenServer.start_link(MemoryGuard, [
+        GenServer.start_link(MemoryGuard,
           interval_ms: 60_000,
           max_memory_bytes: 1_073_741_824,
           shard_count: 4
-        ])
+        )
 
       :sys.replace_state(pid, fn state ->
         %{state | last_pressure_level: :warning}
@@ -150,11 +152,16 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
       send(pid, :check)
 
-      ShardHelpers.eventually(fn ->
-        # Wait for the check to be processed by verifying state changed
-        state = :sys.get_state(pid)
-        state.last_pressure_level != :warning
-      end, "check not processed", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          # Wait for the check to be processed by verifying state changed
+          state = :sys.get_state(pid)
+          state.last_pressure_level != :warning
+        end,
+        "check not processed",
+        20,
+        10
+      )
 
       refute_received {:telemetry, [:ferricstore, :memory, :recovered], _, _}
 
@@ -307,6 +314,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
         for _ <- 1..5 do
           {:ok, sock} =
             :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 2_000)
+
           sock
         end
 
@@ -373,14 +381,19 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       result = Ferricstore.Config.set("maxmemory", "999")
       assert {:error, _} = result
 
-      ShardHelpers.eventually(fn ->
-        # Verify no telemetry event was received
-        receive do
-          {:telemetry, [:ferricstore, :config, :changed], _, _} -> false
-        after
-          0 -> true
-        end
-      end, "should not receive config changed event", 10, 10)
+      ShardHelpers.eventually(
+        fn ->
+          # Verify no telemetry event was received
+          receive do
+            {:telemetry, [:ferricstore, :config, :changed], _, _} -> false
+          after
+            0 -> true
+          end
+        end,
+        "should not receive config changed event",
+        10,
+        10
+      )
     end
   end
 
@@ -474,12 +487,16 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       end
 
       # Allow the async casts to be processed.
-      ShardHelpers.eventually(fn ->
-        Ferricstore.SlowLog.len() >= 9
-      end, "slowlog entries not recorded", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Ferricstore.SlowLog.len() >= 9
+        end,
+        "slowlog entries not recorded",
+        20,
+        10
+      )
 
-      assert_receive {:telemetry, [:ferricstore, :slow_log, :near_full], measurements,
-                      _metadata},
+      assert_receive {:telemetry, [:ferricstore, :slow_log, :near_full], measurements, _metadata},
                      2000
 
       assert is_integer(measurements.size)
@@ -512,9 +529,14 @@ defmodule FerricstoreServer.TelemetryEventsTest do
         Ferricstore.SlowLog.maybe_log(["SET", "key#{i}", "val"], 1, nil)
       end
 
-      ShardHelpers.eventually(fn ->
-        Ferricstore.SlowLog.len() == 5
-      end, "slowlog entries not recorded", 20, 10)
+      ShardHelpers.eventually(
+        fn ->
+          Ferricstore.SlowLog.len() == 5
+        end,
+        "slowlog entries not recorded",
+        20,
+        10
+      )
 
       refute_received {:telemetry, [:ferricstore, :slow_log, :near_full], _, _}
     end
@@ -536,9 +558,14 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       Router.put(ctx, key, "value", 0)
 
       # Wait until key is readable
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        Router.get(ctx, key) == "value"
-      end, "key not readable after put", 10, 10)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          Router.get(ctx, key) == "value"
+        end,
+        "key not readable after put",
+        10,
+        10
+      )
 
       before_hot = Ferricstore.Stats.total_hot_reads()
 
@@ -557,11 +584,16 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       shard_idx = Router.shard_for(ctx, key)
       Ferricstore.Test.ShardHelpers.flush_all_shards()
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        assert Router.get(ctx, key) == "cold_value"
-        [{^key, _, _, _, fid, _, _}] = :ets.lookup(:"keydir_#{shard_idx}", key)
-        assert is_integer(fid) and fid >= 0, "file_id should be real, got #{inspect(fid)}"
-      end, "key should be readable with real file_id", 50, 200)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          assert Router.get(ctx, key) == "cold_value"
+          [{^key, _, _, _, fid, _, _}] = :ets.lookup(:"keydir_#{shard_idx}", key)
+          assert is_integer(fid) and fid >= 0, "file_id should be real, got #{inspect(fid)}"
+        end,
+        "key should be readable with real file_id",
+        50,
+        200
+      )
 
       # Evict the value from the hot cache (set value to nil) to force a
       # cold read. This mirrors the MemoryGuard eviction mechanism: the keydir
