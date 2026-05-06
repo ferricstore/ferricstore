@@ -14,6 +14,7 @@ defmodule Ferricstore.Flow do
   @default_history_max_events 1_024
   @max_history_max_events 10_000
   @default_max_batch_items 1_000
+  @default_max_claim_limit 1_000
   @max_ref_size 4_096
   @default_max_count 10_000
   @default_lmdb_query_scan_limit 10_000
@@ -131,7 +132,7 @@ defmodule Ferricstore.Flow do
          {:ok, state} <- optional_binary(opts, :state, @default_state),
          {:ok, worker} <- required_binary(opts, :worker),
          {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
-         {:ok, limit} <- optional_pos_integer(opts, :limit, @default_limit),
+         {:ok, limit} <- optional_claim_limit(opts),
          {:ok, priority} <- optional_priority_or_nil(opts),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, partition_key} <- optional_partition_key(opts),
@@ -2181,6 +2182,25 @@ defmodule Ferricstore.Flow do
       :error when is_integer(default) and default >= 0 -> {:ok, default}
       :error when is_nil(default) -> {:ok, nil}
       :error -> {:error, "ERR flow #{key} must be a non-negative integer"}
+    end
+  end
+
+  defp optional_claim_limit(opts) do
+    with {:ok, limit} <- optional_pos_integer(opts, :limit, @default_limit) do
+      max = flow_max_claim_limit()
+
+      if limit <= max do
+        {:ok, limit}
+      else
+        {:error, "ERR flow limit exceeds maximum #{max}"}
+      end
+    end
+  end
+
+  defp flow_max_claim_limit do
+    case Application.get_env(:ferricstore, :flow_max_claim_limit, @default_max_claim_limit) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> @default_max_claim_limit
     end
   end
 

@@ -2245,6 +2245,31 @@ defmodule Ferricstore.FlowTest do
              )
   end
 
+  test "flow claim_due rejects oversized limit" do
+    original = Application.get_env(:ferricstore, :flow_max_claim_limit)
+    Application.put_env(:ferricstore, :flow_max_claim_limit, 2)
+
+    on_exit(fn ->
+      if is_nil(original) do
+        Application.delete_env(:ferricstore, :flow_max_claim_limit)
+      else
+        Application.put_env(:ferricstore, :flow_max_claim_limit, original)
+      end
+    end)
+
+    assert {:error, "ERR flow limit exceeds maximum 2"} =
+             FerricStore.flow_claim_due("claim-limit-cap",
+               worker: "worker-a",
+               limit: 3
+             )
+
+    assert {:error, "ERR flow limit exceeds maximum 2"} =
+             FerricStore.flow_reclaim("claim-limit-cap",
+               worker: "worker-a",
+               limit: 3
+             )
+  end
+
   test "flow_rewind rejects trimmed target event with stale stream index" do
     id = uid("flow-rewind-trimmed")
 
