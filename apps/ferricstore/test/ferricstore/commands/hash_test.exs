@@ -465,6 +465,35 @@ defmodule Ferricstore.Commands.HashTest do
 
       assert {:error, "disk full"} == Hash.handle("HSETNX", ["hash", "f1", "v1"], store)
     end
+
+    test "HSETNX rolls back new type metadata when field write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+      field_key = CompoundKey.hash_field("hash", "f1")
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key -> nil
+          "hash", ^field_key -> nil
+        end,
+        compound_put: fn
+          "hash", ^type_key, "hash", 0 ->
+            send(parent, :type_written)
+            :ok
+
+          "hash", ^field_key, "v1", 0 ->
+            {:error, "disk full"}
+        end,
+        compound_delete: fn "hash", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, "disk full"} == Hash.handle("HSETNX", ["hash", "f1", "v1"], store)
+      assert_received :type_written
+      assert_received :type_deleted
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -542,6 +571,42 @@ defmodule Ferricstore.Commands.HashTest do
       assert {:error, _} = Hash.handle("HINCRBY", ["hash", "f1", "abc"], store)
     end
 
+    test "HINCRBY with invalid increment does not create type metadata" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+
+      store = %{
+        compound_get: fn "hash", ^type_key -> nil end,
+        compound_put: fn "hash", ^type_key, "hash", 0 ->
+          send(parent, :type_written)
+          :ok
+        end
+      }
+
+      assert {:error, "ERR value is not an integer or out of range"} ==
+               Hash.handle("HINCRBY", ["hash", "counter", "abc"], store)
+
+      refute_received :type_written
+    end
+
+    test "HINCRBY with out-of-range increment does not create type metadata" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+
+      store = %{
+        compound_get: fn "hash", ^type_key -> nil end,
+        compound_put: fn "hash", ^type_key, "hash", 0 ->
+          send(parent, :type_written)
+          :ok
+        end
+      }
+
+      assert {:error, "ERR increment or decrement would overflow"} ==
+               Hash.handle("HINCRBY", ["hash", "counter", "9223372036854775808"], store)
+
+      refute_received :type_written
+    end
+
     test "HINCRBY returns field write errors" do
       type_key = CompoundKey.type_key("hash")
       field_key = CompoundKey.hash_field("hash", "counter")
@@ -555,6 +620,35 @@ defmodule Ferricstore.Commands.HashTest do
       }
 
       assert {:error, "disk full"} == Hash.handle("HINCRBY", ["hash", "counter", "5"], store)
+    end
+
+    test "HINCRBY rolls back new type metadata when field write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+      field_key = CompoundKey.hash_field("hash", "counter")
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key -> nil
+          "hash", ^field_key -> nil
+        end,
+        compound_put: fn
+          "hash", ^type_key, "hash", 0 ->
+            send(parent, :type_written)
+            :ok
+
+          "hash", ^field_key, "5", 0 ->
+            {:error, "disk full"}
+        end,
+        compound_delete: fn "hash", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, "disk full"} == Hash.handle("HINCRBY", ["hash", "counter", "5"], store)
+      assert_received :type_written
+      assert_received :type_deleted
     end
   end
 
@@ -589,6 +683,24 @@ defmodule Ferricstore.Commands.HashTest do
       assert {:error, _} = Hash.handle("HINCRBYFLOAT", ["hash", "f1", "abc"], store)
     end
 
+    test "HINCRBYFLOAT with invalid increment does not create type metadata" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+
+      store = %{
+        compound_get: fn "hash", ^type_key -> nil end,
+        compound_put: fn "hash", ^type_key, "hash", 0 ->
+          send(parent, :type_written)
+          :ok
+        end
+      }
+
+      assert {:error, "ERR value is not a valid float"} ==
+               Hash.handle("HINCRBYFLOAT", ["hash", "price", "abc"], store)
+
+      refute_received :type_written
+    end
+
     test "HINCRBYFLOAT returns field write errors" do
       type_key = CompoundKey.type_key("hash")
       field_key = CompoundKey.hash_field("hash", "price")
@@ -605,6 +717,37 @@ defmodule Ferricstore.Commands.HashTest do
 
       assert {:error, "disk full"} ==
                Hash.handle("HINCRBYFLOAT", ["hash", "price", "3.14"], store)
+    end
+
+    test "HINCRBYFLOAT rolls back new type metadata when field write fails" do
+      parent = self()
+      type_key = CompoundKey.type_key("hash")
+      field_key = CompoundKey.hash_field("hash", "price")
+
+      store = %{
+        compound_get: fn
+          "hash", ^type_key -> nil
+          "hash", ^field_key -> nil
+        end,
+        compound_put: fn
+          "hash", ^type_key, "hash", 0 ->
+            send(parent, :type_written)
+            :ok
+
+          "hash", ^field_key, value, 0 when is_binary(value) ->
+            {:error, "disk full"}
+        end,
+        compound_delete: fn "hash", ^type_key ->
+          send(parent, :type_deleted)
+          :ok
+        end
+      }
+
+      assert {:error, "disk full"} ==
+               Hash.handle("HINCRBYFLOAT", ["hash", "price", "3.14"], store)
+
+      assert_received :type_written
+      assert_received :type_deleted
     end
   end
 

@@ -226,15 +226,7 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HSETNX", [key, field, value], store) do
-    with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
-      compound_key = CompoundKey.hash_field(key, field)
-
-      if Ops.compound_get(store, key, compound_key) != nil do
-        0
-      else
-        write_hash_field(store, key, compound_key, value, 1)
-      end
-    end
+    hsetnx_field(key, field, value, store)
   end
 
   def handle("HSETNX", _args, _store) do
@@ -246,12 +238,10 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HINCRBY", [key, field, increment_str], store) do
-    with :ok <- TypeRegistry.check_or_set(key, :hash, store),
-         {increment, ""} <- Integer.parse(increment_str) do
-      do_hincrby(key, field, increment, store)
-    else
-      {:error, _} = err -> err
-      _ -> {:error, "ERR value is not an integer or out of range"}
+    with {:ok, increment} <- parse_hincrby_increment(increment_str),
+         type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :hash, store) do
+      do_hincrby(key, field, increment, store, type_status)
     end
   end
 
@@ -264,25 +254,10 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HINCRBYFLOAT", [key, field, increment_str], store) do
-    with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
-      case Float.parse(increment_str) do
-        {increment, ""} ->
-          compound_key = CompoundKey.hash_field(key, field)
-          current = Ops.compound_get(store, key, compound_key)
-
-          case parse_float_value(current) do
-            {:ok, current_float} ->
-              new_val = current_float + increment
-              result_str = format_float(new_val)
-              write_hash_field(store, key, compound_key, result_str, result_str)
-
-            :error ->
-              {:error, "ERR hash value is not a valid float"}
-          end
-
-        :error ->
-          {:error, "ERR value is not a valid float"}
-      end
+    with {:ok, increment} <- parse_hincrbyfloat_increment(increment_str),
+         type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :hash, store) do
+      hincrbyfloat_field(key, field, increment, store, type_status)
     end
   end
 
@@ -781,16 +756,18 @@ defmodule Ferricstore.Commands.Hash do
   def handle_ast({:hincrby, _key, _field, {:error, reason}}, _store), do: {:error, reason}
 
   def handle_ast({:hincrby, key, field, increment}, store) when is_integer(increment) do
-    with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
-      do_hincrby(key, field, increment, store)
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :hash, store) do
+      do_hincrby(key, field, increment, store, type_status)
     end
   end
 
   def handle_ast({:hincrbyfloat, _key, _field, {:error, reason}}, _store), do: {:error, reason}
 
   def handle_ast({:hincrbyfloat, key, field, increment}, store) when is_float(increment) do
-    with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
-      hincrbyfloat_parsed(key, field, increment, store)
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :hash, store) do
+      hincrbyfloat_field(key, field, increment, store, type_status)
     end
   end
 
@@ -984,13 +961,14 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   defp hsetnx_field(key, field, value, store) do
-    with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           TypeRegistry.check_or_set_status(key, :hash, store) do
       compound_key = CompoundKey.hash_field(key, field)
 
       if Ops.compound_get(store, key, compound_key) != nil do
         0
       else
-        write_hash_field(store, key, compound_key, value, 1)
+        write_hash_field(store, key, compound_key, value, 1, type_status)
       end
     end
   end
@@ -1058,7 +1036,27 @@ defmodule Ferricstore.Commands.Hash do
 
   defp typed_scan_opts(_opts, _match_pattern, _count), do: {:error, "ERR syntax error"}
 
-  defp do_hincrby(key, field, increment, store) do
+  defp parse_hincrby_increment(increment_str) do
+    case Integer.parse(increment_str) do
+      {increment, ""} when increment >= @min_int64 and increment <= @max_int64 ->
+        {:ok, increment}
+
+      {_increment, ""} ->
+        {:error, @overflow_error}
+
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
+    end
+  end
+
+  defp parse_hincrbyfloat_increment(increment_str) do
+    case Float.parse(increment_str) do
+      {increment, ""} -> {:ok, increment}
+      :error -> {:error, "ERR value is not a valid float"}
+    end
+  end
+
+  defp do_hincrby(key, field, increment, store, type_status) do
     compound_key = CompoundKey.hash_field(key, field)
     current = Ops.compound_get(store, key, compound_key)
 
@@ -1066,7 +1064,14 @@ defmodule Ferricstore.Commands.Hash do
       {:ok, current_int} ->
         case checked_integer_add(current_int, increment) do
           {:ok, new_val} ->
-            write_hash_field(store, key, compound_key, Integer.to_string(new_val), new_val)
+            write_hash_field(
+              store,
+              key,
+              compound_key,
+              Integer.to_string(new_val),
+              new_val,
+              type_status
+            )
 
           :overflow ->
             {:error, @overflow_error}
@@ -1077,7 +1082,7 @@ defmodule Ferricstore.Commands.Hash do
     end
   end
 
-  defp hincrbyfloat_parsed(key, field, increment, store) do
+  defp hincrbyfloat_field(key, field, increment, store, type_status) do
     compound_key = CompoundKey.hash_field(key, field)
     current = Ops.compound_get(store, key, compound_key)
 
@@ -1085,18 +1090,18 @@ defmodule Ferricstore.Commands.Hash do
       {:ok, current_float} ->
         new_val = current_float + increment
         result_str = format_float(new_val)
-        write_hash_field(store, key, compound_key, result_str, result_str)
+        write_hash_field(store, key, compound_key, result_str, result_str, type_status)
 
       :error ->
         {:error, "ERR hash value is not a valid float"}
     end
   end
 
-  defp write_hash_field(store, key, compound_key, value, success) do
+  defp write_hash_field(store, key, compound_key, value, success, type_status) do
     case Ops.compound_put(store, key, compound_key, value, 0) do
       :ok -> success
       true -> success
-      {:error, _reason} = error -> error
+      {:error, _reason} = error -> rollback_new_hash_type_marker(key, store, type_status, error)
       other -> {:error, other}
     end
   end
@@ -1295,7 +1300,7 @@ defmodule Ferricstore.Commands.Hash do
         write_error
 
       {:error, _} = rollback_error ->
-        {:error, {:hset_type_marker_rollback_failed, write_error, rollback_error}}
+        {:error, {:hash_type_marker_rollback_failed, write_error, rollback_error}}
     end
   end
 
