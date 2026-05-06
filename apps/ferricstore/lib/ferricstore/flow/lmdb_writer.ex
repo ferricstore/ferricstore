@@ -707,7 +707,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
   defp safe_flow_index_delete_member(_flow_index, nil, _state_index_key, _id), do: :ok
 
   defp safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id) do
-    Ferricstore.Flow.Index.delete_member(flow_index, flow_lookup, state_index_key, id)
+    Ferricstore.Flow.OrderedIndex.delete_member(flow_index, flow_lookup, state_index_key, id)
   rescue
     ArgumentError -> :ok
   end

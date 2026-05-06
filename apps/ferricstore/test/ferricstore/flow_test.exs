@@ -1131,10 +1131,12 @@ defmodule Ferricstore.FlowTest do
 
     range_ids = fn index_key ->
       shard_index = Ferricstore.Store.Router.shard_for(ctx, index_key)
-      {flow_index, _flow_lookup} = Ferricstore.Flow.Index.table_names(ctx.name, shard_index)
+
+      {flow_index, _flow_lookup} =
+        Ferricstore.Flow.OrderedIndex.table_names(ctx.name, shard_index)
 
       flow_index
-      |> Ferricstore.Flow.Index.range_slice(index_key, :neg_inf, :inf, false, 0, :all)
+      |> Ferricstore.Flow.OrderedIndex.range_slice(index_key, :neg_inf, :inf, false, 0, :all)
       |> Enum.map(fn {member, _score} -> member end)
     end
 
@@ -1362,13 +1364,13 @@ defmodule Ferricstore.FlowTest do
 
     due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition)
     shard_index = Ferricstore.Store.Router.shard_for(ctx, due_key)
-    {flow_index, flow_lookup} = Ferricstore.Flow.Index.table_names(ctx.name, shard_index)
+    {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, shard_index)
 
     {zset_index, zset_lookup} =
       Ferricstore.Store.Shard.ZSetIndex.table_names(ctx.name, shard_index)
 
     assert [{^id, 1000.0}] =
-             Ferricstore.Flow.Index.range_slice(
+             Ferricstore.Flow.OrderedIndex.range_slice(
                flow_index,
                due_key,
                :neg_inf,
@@ -1397,7 +1399,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert [] =
-             Ferricstore.Flow.Index.range_slice(
+             Ferricstore.Flow.OrderedIndex.range_slice(
                flow_index,
                due_key,
                :neg_inf,
@@ -1408,7 +1410,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     inflight_key = Ferricstore.Flow.Keys.inflight_index_key(type, partition)
-    assert 1 = Ferricstore.Flow.Index.count_all(flow_lookup, inflight_key)
+    assert 1 = Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, inflight_key)
   end
 
   test "partition_key scopes claim, complete, retry, get, and history" do
@@ -2786,11 +2788,12 @@ defmodule Ferricstore.FlowTest do
 
     history_key = Ferricstore.Flow.Keys.history_key(id)
     shard = shard_for(history_key)
-    {flow_index, flow_lookup} = Ferricstore.Flow.Index.table_names(:default, shard)
+    {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(:default, shard)
 
-    assert Ferricstore.Flow.Index.count_all(flow_lookup, history_key) == 3
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 3
 
-    assert Ferricstore.Flow.Index.rank_range(flow_index, history_key, 0, 2, false) |> length() ==
+    assert Ferricstore.Flow.OrderedIndex.rank_range(flow_index, history_key, 0, 2, false)
+           |> length() ==
              3
 
     assert [] = :ets.lookup(Ferricstore.Stream.Meta, history_key)
@@ -2857,7 +2860,7 @@ defmodule Ferricstore.FlowTest do
                now_ms: 3
              )
 
-    {flow_index, flow_lookup} = Ferricstore.Flow.Index.table_names(ctx.name, 0)
+    {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, 0)
     :ets.delete_all_objects(flow_index)
     :ets.delete_all_objects(flow_lookup)
 
@@ -2903,18 +2906,18 @@ defmodule Ferricstore.FlowTest do
 
     history_key = Ferricstore.Flow.Keys.history_key(id)
     shard = shard_for(history_key)
-    {flow_index, flow_lookup} = Ferricstore.Flow.Index.table_names(:default, shard)
+    {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(:default, shard)
 
-    assert Ferricstore.Flow.Index.count_all(flow_lookup, history_key) == 2
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 2
 
-    assert Ferricstore.Flow.Index.rank_range(flow_index, history_key, 0, 10, false)
+    assert Ferricstore.Flow.OrderedIndex.rank_range(flow_index, history_key, 0, 10, false)
            |> Enum.map(&elem(&1, 0)) ==
              event_ids
 
     assert [] = :ets.lookup(Ferricstore.Stream.Meta, history_key)
 
     assert [] =
-             Ferricstore.Flow.Index.rank_range(flow_index, history_key, 0, 10, false)
+             Ferricstore.Flow.OrderedIndex.rank_range(flow_index, history_key, 0, 10, false)
              |> Enum.filter(fn {event_id, _score} -> event_id == created_event_id end)
   end
 

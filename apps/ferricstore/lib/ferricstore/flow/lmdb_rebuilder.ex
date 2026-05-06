@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   @moduledoc false
 
   alias Ferricstore.Flow
-  alias Ferricstore.Flow.Index, as: FlowIndex
+  alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.Shard.ETS, as: ShardETS

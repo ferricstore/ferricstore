@@ -75,7 +75,7 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.Commands.HyperLogLog
   alias Ferricstore.Commands.Json
   alias Ferricstore.Flow
-  alias Ferricstore.Flow.Index, as: FlowIndex
+  alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
   alias Ferricstore.Flow.Keys, as: FlowKeys
   alias Ferricstore.HLC
 

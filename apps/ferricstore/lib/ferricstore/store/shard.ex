@@ -47,7 +47,7 @@ defmodule Ferricstore.Store.Shard do
   use GenServer
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Flow.Index, as: FlowIndex
+  alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.Router
@@ -208,7 +208,7 @@ defmodule Ferricstore.Store.Shard do
       {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, index)
       ensure_zset_index_table!(zset_score_index, :ordered_set)
       ensure_zset_index_table!(zset_score_lookup, :set)
-      {flow_index, flow_lookup} = Ferricstore.Flow.Index.table_names(instance_name, index)
+      {flow_index, flow_lookup} = FlowIndex.table_names(instance_name, index)
       ensure_zset_index_table!(flow_index, :ordered_set)
       ensure_zset_index_table!(flow_lookup, :set)
 

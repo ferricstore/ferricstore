@@ -652,7 +652,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
   end
 
   describe "Flow index rollback" do
-    test "rolls back Flow.Index mutations when apply append fails", %{state: state, dir: dir} do
+    test "rolls back Flow.OrderedIndex mutations when apply append fails", %{
+      state: state,
+      dir: dir
+    } do
       :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
       :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
       :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
@@ -683,11 +686,14 @@ defmodule Ferricstore.Raft.StateMachineTest do
           bad_state
         )
 
-      assert Ferricstore.Flow.Index.score_of(state.flow_lookup_name, due_key, id) == :miss
-      assert Ferricstore.Flow.Index.score_of(state.flow_lookup_name, state_index_key, id) == :miss
-      assert Ferricstore.Flow.Index.count_all(state.flow_lookup_name, history_key) == 0
-      assert Ferricstore.Flow.Index.count_all(state.flow_lookup_name, due_key) == 0
-      assert Ferricstore.Flow.Index.count_all(state.flow_lookup_name, state_index_key) == 0
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, due_key, id) == :miss
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, state_index_key, id) ==
+               :miss
+
+      assert Ferricstore.Flow.OrderedIndex.count_all(state.flow_lookup_name, history_key) == 0
+      assert Ferricstore.Flow.OrderedIndex.count_all(state.flow_lookup_name, due_key) == 0
+      assert Ferricstore.Flow.OrderedIndex.count_all(state.flow_lookup_name, state_index_key) == 0
     end
   end
 
