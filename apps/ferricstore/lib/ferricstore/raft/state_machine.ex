@@ -6657,15 +6657,17 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
-  defp flow_index_put_entries(state, key_member_score_triples) do
+  defp flow_index_put_new_entries(state, key_member_score_triples) do
     if flow_index_tables?(state) do
       key_member_score_triples
       |> Enum.group_by(fn {key, _member, _score} -> key end, fn {_key, member, _score} ->
         member
       end)
-      |> Enum.each(fn {key, members} -> track_flow_index_originals(state, key, members) end)
+      |> Enum.each(fn {key, members} ->
+        track_flow_index_missing_originals(state, key, members)
+      end)
 
-      FlowIndex.put_entries(
+      FlowIndex.put_new_entries(
         state.flow_index_name,
         state.flow_lookup_name,
         key_member_score_triples
@@ -6834,7 +6836,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_history_index_put_entries(_state, []), do: :ok
 
   defp flow_history_index_put_entries(state, entries) do
-    flow_index_put_entries(state, entries)
+    flow_index_put_new_entries(state, entries)
   end
 
   defp flow_history_trim(_state, %{history_max_events: nil}), do: :ok

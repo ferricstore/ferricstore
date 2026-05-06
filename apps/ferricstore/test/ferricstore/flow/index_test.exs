@@ -69,6 +69,24 @@ defmodule Ferricstore.Flow.IndexTest do
              Index.rank_range(index, "history:a", 0, 10, false)
   end
 
+  test "put_new_entries batches append-only entries across multiple keys", %{
+    index: index,
+    lookup: lookup
+  } do
+    assert :ok =
+             Index.put_new_entries(index, lookup, [
+               {"history:a", "1000-1", 1_000},
+               {"history:b", "1000-1", 1_000},
+               {"history:a", "2000-2", 2_000}
+             ])
+
+    assert 2 = Index.count_all(lookup, "history:a")
+    assert 1 = Index.count_all(lookup, "history:b")
+
+    assert [{"1000-1", 1000.0}, {"2000-2", 2000.0}] =
+             Index.rank_range(index, "history:a", 0, 10, false)
+  end
+
   test "delete_members removes lookup, ordered index, and count", %{index: index, lookup: lookup} do
     assert :ok = Index.put_members(index, lookup, "worker:a", [{"flow-1", 3}, {"flow-2", 4}])
     assert :ok = Index.delete_members(index, lookup, "worker:a", ["flow-1", "missing"])
