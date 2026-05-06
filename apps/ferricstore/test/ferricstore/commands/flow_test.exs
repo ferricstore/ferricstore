@@ -109,7 +109,17 @@ defmodule Ferricstore.Commands.FlowTest do
     assert [%{"id" => ^root}, %{"id" => ^child}] =
              Dispatcher.dispatch(
                "FLOW.BY_ROOT",
-               [root, "PARTITION", partition, "COUNT", "10"],
+               [
+                 root,
+                 "PARTITION",
+                 partition,
+                 "COUNT",
+                 "10",
+                 "INCLUDE_COLD",
+                 "true",
+                 "CONSISTENT_PROJECTION",
+                 "false"
+               ],
                MockStore.make()
              )
 
@@ -117,6 +127,13 @@ defmodule Ferricstore.Commands.FlowTest do
              Dispatcher.dispatch(
                "FLOW.BY_CORRELATION",
                [correlation, "PARTITION", partition, "COUNT", "10"],
+               MockStore.make()
+             )
+
+    assert %{"queued" => 2} =
+             Dispatcher.dispatch(
+               "FLOW.INFO",
+               ["lineage", "PARTITION", partition, "INCLUDE_COLD", "true"],
                MockStore.make()
              )
   end

@@ -6336,6 +6336,12 @@ fn flow_list_option<'a>(
             (b"STATE", "state", FlowOptType::Binary),
             (b"COUNT", "count", FlowOptType::Positive(b"count")),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"INCLUDE_COLD", "include_cold", FlowOptType::Boolean),
+            (
+                b"CONSISTENT_PROJECTION",
+                "consistent_projection",
+                FlowOptType::Boolean,
+            ),
         ],
     )
 }
@@ -6354,6 +6360,12 @@ fn flow_index_query_option<'a>(
         &[
             (b"COUNT", "count", FlowOptType::Positive(b"count")),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"INCLUDE_COLD", "include_cold", FlowOptType::Boolean),
+            (
+                b"CONSISTENT_PROJECTION",
+                "consistent_projection",
+                FlowOptType::Boolean,
+            ),
         ],
     )
 }
@@ -6407,7 +6419,15 @@ fn flow_partition_option<'a>(
         args,
         arg_bytes,
         idx,
-        &[(b"PARTITION", "partition_key", FlowOptType::Partition)],
+        &[
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"INCLUDE_COLD", "include_cold", FlowOptType::Boolean),
+            (
+                b"CONSISTENT_PROJECTION",
+                "consistent_projection",
+                FlowOptType::Boolean,
+            ),
+        ],
     )
 }
 

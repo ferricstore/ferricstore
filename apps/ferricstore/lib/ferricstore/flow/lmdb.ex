@@ -10,10 +10,6 @@ defmodule Ferricstore.Flow.LMDB do
   # normalized to mirror mode so queries and cold terminal reads stay available.
   def enabled?, do: true
 
-  def write_through? do
-    mode() == :write_through
-  end
-
   def mirror? do
     mode() == :mirror
   end
@@ -484,11 +480,11 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   defp normalize_mode(:off), do: :mirror
-  defp normalize_mode(:write_through), do: :write_through
+  defp normalize_mode(:write_through), do: :mirror
   defp normalize_mode(:mirror), do: :mirror
   defp normalize_mode(value) when value in [false, "false", "0", "off"], do: :mirror
   defp normalize_mode(value) when value in [true, "true", "1", "mirror"], do: :mirror
-  defp normalize_mode(value) when value in ["write_through", "write-through"], do: :write_through
+  defp normalize_mode(value) when value in ["write_through", "write-through"], do: :mirror
   defp normalize_mode(_value), do: :mirror
 
   defp expired_terminal_sweep_ops(path, entries, now_ms) do

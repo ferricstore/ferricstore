@@ -89,9 +89,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
         GenServer.cast(writer_pid, {:persist_replay_safe, index})
         :requested
 
-      Ferricstore.Flow.LMDB.write_through?() ->
-        sync_persist(instance_ctx, shard_index, shard_data_path, index)
-
       true ->
         {:error, :writer_not_started}
     end
@@ -725,20 +722,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   rescue
     ArgumentError -> :ok
-  end
-
-  defp sync_persist(instance_ctx, shard_index, shard_data_path, index) do
-    publish_requested(instance_ctx, shard_index, index)
-
-    case LMDBReplaySafeIndex.persist(shard_data_path, index) do
-      :ok ->
-        publish_durable(instance_ctx, shard_index, index)
-        :durable
-
-      {:error, _reason} = error ->
-        record_persist_failure(instance_ctx, shard_index)
-        error
-    end
   end
 
   defp poke_release_cursor(state, index) do

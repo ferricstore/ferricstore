@@ -1067,7 +1067,10 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
 
     assert {:ok, %{queued: 0, running: 0, completed: 1}} =
-             Ferricstore.Flow.info(ctx, flow_type, partition_key: partition_key)
+             Ferricstore.Flow.info(ctx, flow_type,
+               partition_key: partition_key,
+               include_cold: true
+             )
   end
 
   test "mirror batch flow get preserves order across hot, LMDB, and missing records" do
@@ -1233,31 +1236,16 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
   end
 
-  test "write-through flow get returns visible error for corrupt LMDB wrapper" do
+  test "legacy write-through Flow LMDB mode aliases to mirror" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :write_through)
 
-    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
-
     on_exit(fn ->
-      Ferricstore.Test.IsolatedInstance.checkin(ctx)
       restore_env(:flow_lmdb_mode, old_mode)
     end)
 
-    id = "flow-corrupt-lmdb-wrapper"
-    partition_key = "tenant-corrupt-lmdb-wrapper"
-    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
-
-    lmdb_path =
-      ctx.data_dir
-      |> Ferricstore.DataDir.shard_data_path(0)
-      |> Ferricstore.Flow.LMDB.path()
-
-    assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, state_key, "not-a-term"}])
-
-    assert {:error, "ERR flow LMDB read failed"} =
-             Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+    assert Ferricstore.Flow.LMDB.mode() == :mirror
   end
 
   test "mirror flow get emits telemetry for corrupt LMDB wrapper" do
@@ -1406,7 +1394,10 @@ defmodule Ferricstore.Flow.LMDBTest do
              ])
 
     assert {:ok, [%{id: ^id, correlation_id: ^correlation_id, partition_key: ^partition_key}]} =
-             Ferricstore.Flow.by_correlation(ctx, correlation_id, partition_key: partition_key)
+             Ferricstore.Flow.by_correlation(ctx, correlation_id,
+               partition_key: partition_key,
+               include_cold: true
+             )
   end
 
   test "lineage queries overfetch past stale LMDB index rows before post-filtering" do
@@ -1530,11 +1521,12 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.list(ctx, flow_type,
                state: "completed",
                partition_key: partition_key,
-               count: 1
+               count: 1,
+               include_cold: true
              )
   end
 
-  test "terminal LMDB reads fail visible when mirror is degraded" do
+  test "default hot Flow reads ignore degraded LMDB mirror" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
 
@@ -1547,11 +1539,54 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     :atomics.put(ctx.flow_lmdb_mirror_degraded, 1, 1)
 
-    assert {:error, "ERR flow LMDB mirror degraded"} =
-             Ferricstore.Flow.list(ctx, "degraded-terminal",
-               state: "completed",
-               partition_key: "tenant-degraded-terminal"
+    partition_key = "tenant-degraded-hot"
+    parent = "parent-degraded-hot"
+    correlation = "correlation-degraded-hot"
+    id = "flow-degraded-hot"
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.create(ctx, id,
+               type: "degraded-hot",
+               partition_key: partition_key,
+               parent_flow_id: parent,
+               correlation_id: correlation,
+               now_ms: 1_000,
+               run_at_ms: 1_000
              )
+
+    assert {:ok, [%{id: ^id}]} =
+             Ferricstore.Flow.by_parent(ctx, parent, partition_key: partition_key)
+
+    assert {:ok, [%{id: ^id}]} =
+             Ferricstore.Flow.by_correlation(ctx, correlation, partition_key: partition_key)
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, "degraded-hot",
+               worker: "worker-degraded-hot",
+               partition_key: partition_key,
+               now_ms: 1_000
+             )
+
+    assert {:ok, completed} =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert completed.state == "completed"
+
+    assert {:ok, [%{id: ^id}]} =
+             Ferricstore.Flow.list(ctx, "degraded-hot",
+               state: "completed",
+               partition_key: partition_key
+             )
+
+    assert {:ok, [%{id: ^id, state: "completed"}]} =
+             Ferricstore.Flow.by_correlation(ctx, correlation, partition_key: partition_key)
+
+    assert {:ok, %{completed: 1}} =
+             Ferricstore.Flow.info(ctx, "degraded-hot", partition_key: partition_key)
   end
 
   test "LMDB rebuild counts cold-read failures and marks mirror degraded" do
@@ -1882,7 +1917,12 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, root_prefix)
     assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, correlation_prefix)
 
-    assert {:ok, info} = Ferricstore.Flow.info(ctx, flow_type, partition_key: partition_key)
+    assert {:ok, info} =
+             Ferricstore.Flow.info(ctx, flow_type,
+               partition_key: partition_key,
+               include_cold: true
+             )
+
     assert info.completed == 1
     assert completed.version == 3
   end

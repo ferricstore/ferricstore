@@ -2452,9 +2452,6 @@ defmodule Ferricstore.Store.Router do
     key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
     cond do
-      Ferricstore.Flow.LMDB.write_through?() ->
-        flow_get_lmdb(ctx, key, :write_through)
-
       Ferricstore.Flow.LMDB.mirror?() ->
         case get(ctx, key) do
           nil -> flow_get_lmdb(ctx, key, :mirror)
@@ -2471,9 +2468,6 @@ defmodule Ferricstore.Store.Router do
     keys = Enum.map(ids, &Ferricstore.Flow.Keys.state_key(&1, partition_key))
 
     cond do
-      Ferricstore.Flow.LMDB.write_through?() ->
-        flow_batch_get_lmdb(ctx, keys, :write_through)
-
       Ferricstore.Flow.LMDB.mirror?() ->
         values = batch_get(ctx, keys)
         missing_keys = for {key, nil} <- Enum.zip(keys, values), do: key
@@ -2583,7 +2577,6 @@ defmodule Ferricstore.Store.Router do
     flow_observe_lmdb_read_error(mode, reason)
 
     case mode do
-      :write_through -> {:error, "ERR flow LMDB read failed"}
       :mirror -> nil
       _other -> nil
     end

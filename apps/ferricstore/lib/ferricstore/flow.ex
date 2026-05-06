@@ -494,9 +494,20 @@ defmodule Ferricstore.Flow do
          {:ok, state} <- flow_state(opts),
          {:ok, partition_key} <- optional_partition_key(opts),
          {:ok, count} <- flow_count(opts),
+         {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
+         {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
          index_key = __MODULE__.Keys.state_index_key(type, state, partition_key),
          :ok <- validate_key_size(index_key),
-         {:ok, ids} <- flow_index_ids(ctx, index_key, state, partition_key, count) do
+         {:ok, ids} <-
+           flow_index_ids(
+             ctx,
+             index_key,
+             state,
+             partition_key,
+             count,
+             include_cold? or consistent_projection?,
+             consistent_projection?
+           ) do
       flow_records_for_ids(ctx, ids, partition_key)
     end
   end
@@ -514,9 +525,19 @@ defmodule Ferricstore.Flow do
          :ok <- validate_id(parent_flow_id),
          {:ok, partition_key} <- optional_partition_key(opts),
          {:ok, count} <- flow_count(opts),
+         {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
+         {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
          index_key = __MODULE__.Keys.parent_index_key(parent_flow_id, partition_key),
          :ok <- validate_key_size(index_key),
-         {:ok, records} <- flow_records_for_index(ctx, index_key, partition_key, count) do
+         {:ok, records} <-
+           flow_records_for_index(
+             ctx,
+             index_key,
+             partition_key,
+             count,
+             include_cold? or consistent_projection?,
+             consistent_projection?
+           ) do
       {:ok, filter_flow_records(records, :parent_flow_id, parent_flow_id, count)}
     end
   end
@@ -534,9 +555,19 @@ defmodule Ferricstore.Flow do
          :ok <- validate_id(root_flow_id),
          {:ok, partition_key} <- optional_partition_key(opts),
          {:ok, count} <- flow_count(opts),
+         {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
+         {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
          index_key = __MODULE__.Keys.root_index_key(root_flow_id, partition_key),
          :ok <- validate_key_size(index_key),
-         {:ok, indexed_records} <- flow_records_for_index(ctx, index_key, partition_key, count),
+         {:ok, indexed_records} <-
+           flow_records_for_index(
+             ctx,
+             index_key,
+             partition_key,
+             count,
+             include_cold? or consistent_projection?,
+             consistent_projection?
+           ),
          {:ok, root_record} <- flow_root_record(ctx, root_flow_id, partition_key) do
       indexed_records = filter_flow_records(indexed_records, :root_flow_id, root_flow_id, count)
 
@@ -563,9 +594,19 @@ defmodule Ferricstore.Flow do
          :ok <- validate_id(correlation_id),
          {:ok, partition_key} <- optional_partition_key(opts),
          {:ok, count} <- flow_count(opts),
+         {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
+         {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
          index_key = __MODULE__.Keys.correlation_index_key(correlation_id, partition_key),
          :ok <- validate_key_size(index_key),
-         {:ok, records} <- flow_records_for_index(ctx, index_key, partition_key, count) do
+         {:ok, records} <-
+           flow_records_for_index(
+             ctx,
+             index_key,
+             partition_key,
+             count,
+             include_cold? or consistent_projection?,
+             consistent_projection?
+           ) do
       {:ok, filter_flow_records(records, :correlation_id, correlation_id, count)}
     end
   end
@@ -582,7 +623,16 @@ defmodule Ferricstore.Flow do
     with :ok <- validate_opts(opts),
          :ok <- validate_type(type),
          {:ok, partition_key} <- optional_partition_key(opts),
-         {:ok, counts, inflight} <- flow_info_counts(ctx, type, partition_key) do
+         {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
+         {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, counts, inflight} <-
+           flow_info_counts(
+             ctx,
+             type,
+             partition_key,
+             include_cold? or consistent_projection?,
+             consistent_projection?
+           ) do
       {:ok,
        counts
        |> Map.put(:type, type)
@@ -1182,52 +1232,27 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_records_for_index(ctx, index_key, partition_key, count) do
-    with {:ok, entries} <- flow_lmdb_query_index_entries(ctx, index_key, partition_key, count) do
-      if Enum.all?(entries, fn {_id, _updated_at_ms, state_key} -> is_binary(state_key) end) do
-        flow_records_for_lmdb_state_keys(ctx, entries, partition_key, count)
+  defp flow_records_for_index(ctx, index_key, partition_key, count, include_cold?, consistent?) do
+    with {:ok, ram_entries} <- flow_ram_index_entries(ctx, index_key, count) do
+      if include_cold? do
+        with {:ok, lmdb_entries} <-
+               flow_lmdb_query_index_entries(ctx, index_key, partition_key, count, consistent?) do
+          ids =
+            (Enum.map(ram_entries, fn {id, score} -> {id, score} end) ++
+               Enum.map(lmdb_entries, fn {id, updated_at_ms, _state_key} ->
+                 {id, updated_at_ms}
+               end))
+            |> Enum.sort_by(fn {id, score} -> {score, id} end)
+            |> Enum.uniq_by(fn {id, _score} -> id end)
+            |> Enum.map(fn {id, _score} -> id end)
+            |> Enum.take(count)
+
+          flow_records_for_ids(ctx, ids, partition_key)
+        end
       else
-        ids = Enum.map(entries, fn {id, _updated_at_ms, _state_key} -> id end)
+        ids = Enum.map(ram_entries, fn {id, _score} -> id end)
         flow_records_for_ids(ctx, ids, partition_key)
       end
-    end
-  end
-
-  defp flow_records_for_lmdb_state_keys(ctx, entries, partition_key, count) do
-    state_keys = Enum.map(entries, fn {_id, _updated_at_ms, state_key} -> state_key end)
-    values = Router.flow_lmdb_batch_get_state_keys(ctx, state_keys)
-
-    case Enum.find(values, &match?({:error, _reason}, &1)) do
-      nil ->
-        case decode_lmdb_records(values) do
-          {:ok, records} ->
-            {:ok, Enum.take(records, count)}
-
-          :stale ->
-            ids = Enum.map(entries, fn {id, _updated_at_ms, _state_key} -> id end)
-            flow_records_for_ids(ctx, ids, partition_key)
-        end
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  defp decode_lmdb_records(values) do
-    values
-    |> Enum.reduce_while([], fn
-      nil, _acc ->
-        {:halt, :stale}
-
-      value, acc when is_binary(value) ->
-        case safe_decode_record(value) do
-          {:ok, nil} -> {:halt, :stale}
-          {:ok, record} -> {:cont, [record | acc]}
-        end
-    end)
-    |> case do
-      :stale -> :stale
-      records -> {:ok, Enum.reverse(records)}
     end
   end
 
@@ -1246,7 +1271,7 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_info_counts(ctx, type, partition_key) do
+  defp flow_info_counts(ctx, type, partition_key, include_cold?, consistent?) do
     state_keys =
       Enum.map([@default_state, "running" | @terminal_states], fn state ->
         {state, __MODULE__.Keys.state_index_key(type, state, partition_key)}
@@ -1258,7 +1283,8 @@ defmodule Ferricstore.Flow do
     with :ok <- flow_validate_index_keys(all_keys),
          {:ok, ram_counts} <-
            flow_zset_count_many(ctx, Enum.map(all_keys, fn {_state, key} -> key end)),
-         {:ok, lmdb_counts} <- flow_terminal_lmdb_counts(ctx, state_keys, partition_key) do
+         {:ok, lmdb_counts} <-
+           flow_terminal_lmdb_counts(ctx, state_keys, partition_key, include_cold?, consistent?) do
       {state_ram_counts, [inflight]} = Enum.split(ram_counts, length(state_keys))
 
       state_keys
@@ -1285,7 +1311,10 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_terminal_lmdb_counts(ctx, state_keys, partition_key) do
+  defp flow_terminal_lmdb_counts(_ctx, _state_keys, _partition_key, false, _consistent?),
+    do: {:ok, %{}}
+
+  defp flow_terminal_lmdb_counts(ctx, state_keys, partition_key, true, consistent?) do
     terminal_keys =
       state_keys
       |> Enum.filter(fn {state, _key} -> state in @terminal_states end)
@@ -1296,7 +1325,8 @@ defmodule Ferricstore.Flow do
         {:ok, %{}}
 
       [first_key | _] ->
-        with :ok <- flow_require_lmdb_mirror_healthy(ctx, first_key, partition_key) do
+        with :ok <- flow_maybe_flush_lmdb_for_index(ctx, first_key, partition_key, consistent?),
+             :ok <- flow_require_lmdb_mirror_healthy(ctx, first_key, partition_key) do
           now_ms = now_ms()
           sweep_limit = flow_terminal_lmdb_sweep_limit()
 
@@ -1370,6 +1400,12 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp flow_maybe_flush_lmdb_for_index(_ctx, _index_key, _partition_key, false), do: :ok
+
+  defp flow_maybe_flush_lmdb_for_index(ctx, index_key, partition_key, true) do
+    flow_flush_lmdb_for_index(ctx, index_key, partition_key)
+  end
+
   defp flow_flush_lmdb_for_index(ctx, index_key, partition_key) do
     case partition_key do
       nil ->
@@ -1381,11 +1417,19 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_index_ids(ctx, index_key, state, partition_key, count)
+  defp flow_index_ids(ctx, index_key, state, partition_key, count, include_cold?, consistent?)
        when state in @terminal_states do
     with {:ok, ram_entries} <- flow_ram_index_entries(ctx, index_key, count),
          {:ok, lmdb_entries} <-
-           flow_terminal_lmdb_entries(ctx, index_key, state, partition_key, count) do
+           flow_terminal_lmdb_entries(
+             ctx,
+             index_key,
+             state,
+             partition_key,
+             count,
+             include_cold?,
+             consistent?
+           ) do
       ids =
         (ram_entries ++ lmdb_entries)
         |> Enum.sort_by(fn {id, score} -> {score, id} end)
@@ -1397,10 +1441,18 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_index_ids(ctx, index_key, state, partition_key, count) do
+  defp flow_index_ids(ctx, index_key, state, partition_key, count, include_cold?, consistent?) do
     with {:ok, ram_ids} <- flow_zrange(ctx, index_key, 0, count - 1),
          {:ok, lmdb_ids} <-
-           flow_terminal_lmdb_ids(ctx, index_key, state, partition_key, count) do
+           flow_terminal_lmdb_ids(
+             ctx,
+             index_key,
+             state,
+             partition_key,
+             count,
+             include_cold?,
+             consistent?
+           ) do
       {:ok, (ram_ids ++ lmdb_ids) |> Enum.uniq() |> Enum.take(count)}
     end
   end
@@ -1423,8 +1475,7 @@ defmodule Ferricstore.Flow do
          lmdb_count
        )
        when state in @terminal_states and lmdb_count > 0 do
-    with :ok <- flow_flush_lmdb_for_index(ctx, index_key, partition_key),
-         {:ok, ram_count} <- flow_zcard(ctx, index_key),
+    with {:ok, ram_count} <- flow_zcard(ctx, index_key),
          {:ok, lmdb_count} <- flow_terminal_lmdb_count(ctx, index_key, state, partition_key) do
       {:ok, ram_count + lmdb_count}
     end
@@ -1441,16 +1492,42 @@ defmodule Ferricstore.Flow do
     {:ok, ram_count + lmdb_count}
   end
 
-  defp flow_terminal_lmdb_ids(_ctx, _index_key, state, _partition_key, _count)
+  defp flow_terminal_lmdb_ids(
+         _ctx,
+         _index_key,
+         state,
+         _partition_key,
+         _count,
+         _include_cold?,
+         _consistent?
+       )
        when state not in @terminal_states,
        do: {:ok, []}
 
-  defp flow_terminal_lmdb_ids(_ctx, _index_key, _state, _partition_key, count) when count <= 0,
-    do: {:ok, []}
+  defp flow_terminal_lmdb_ids(
+         _ctx,
+         _index_key,
+         _state,
+         _partition_key,
+         count,
+         _include_cold?,
+         _consistent?
+       )
+       when count <= 0,
+       do: {:ok, []}
 
-  defp flow_terminal_lmdb_ids(ctx, index_key, _state, partition_key, count) do
-    if Ferricstore.Flow.LMDB.mirror?() do
-      with {:ok, entries} <- flow_lmdb_index_entries(ctx, index_key, partition_key, count) do
+  defp flow_terminal_lmdb_ids(
+         ctx,
+         index_key,
+         _state,
+         partition_key,
+         count,
+         include_cold?,
+         consistent?
+       ) do
+    if include_cold? and Ferricstore.Flow.LMDB.mirror?() do
+      with {:ok, entries} <-
+             flow_lmdb_index_entries(ctx, index_key, partition_key, count, consistent?) do
         ids =
           entries
           |> Enum.map(fn {id, _updated_at_ms} -> id end)
@@ -1463,27 +1540,53 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_terminal_lmdb_entries(_ctx, _index_key, state, _partition_key, _count)
+  defp flow_terminal_lmdb_entries(
+         _ctx,
+         _index_key,
+         state,
+         _partition_key,
+         _count,
+         _include_cold?,
+         _consistent?
+       )
        when state not in @terminal_states,
        do: {:ok, []}
 
-  defp flow_terminal_lmdb_entries(_ctx, _index_key, _state, _partition_key, count)
+  defp flow_terminal_lmdb_entries(
+         _ctx,
+         _index_key,
+         _state,
+         _partition_key,
+         count,
+         _include_cold?,
+         _consistent?
+       )
        when count <= 0,
        do: {:ok, []}
 
-  defp flow_terminal_lmdb_entries(ctx, index_key, _state, partition_key, count) do
-    if Ferricstore.Flow.LMDB.mirror?() do
-      flow_lmdb_index_entries(ctx, index_key, partition_key, count)
+  defp flow_terminal_lmdb_entries(
+         ctx,
+         index_key,
+         _state,
+         partition_key,
+         count,
+         include_cold?,
+         consistent?
+       ) do
+    if include_cold? and Ferricstore.Flow.LMDB.mirror?() do
+      flow_lmdb_index_entries(ctx, index_key, partition_key, count, consistent?)
     else
       {:ok, []}
     end
   end
 
-  defp flow_lmdb_index_entries(_ctx, _index_key, _partition_key, count) when count <= 0,
-    do: {:ok, []}
+  defp flow_lmdb_index_entries(_ctx, _index_key, _partition_key, count, _consistent?)
+       when count <= 0,
+       do: {:ok, []}
 
-  defp flow_lmdb_index_entries(ctx, index_key, partition_key, count) do
-    with :ok <- flow_require_lmdb_mirror_healthy(ctx, index_key, partition_key) do
+  defp flow_lmdb_index_entries(ctx, index_key, partition_key, count, consistent?) do
+    with :ok <- flow_maybe_flush_lmdb_for_index(ctx, index_key, partition_key, consistent?),
+         :ok <- flow_require_lmdb_mirror_healthy(ctx, index_key, partition_key) do
       prefix = Ferricstore.Flow.LMDB.terminal_index_prefix(index_key)
       now_ms = now_ms()
       sweep_limit = flow_terminal_lmdb_sweep_limit()
@@ -1514,12 +1617,13 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_lmdb_query_index_entries(_ctx, _index_key, _partition_key, count) when count <= 0,
-    do: {:ok, []}
+  defp flow_lmdb_query_index_entries(_ctx, _index_key, _partition_key, count, _consistent?)
+       when count <= 0,
+       do: {:ok, []}
 
-  defp flow_lmdb_query_index_entries(ctx, index_key, partition_key, count) do
-    with :ok <- flow_require_lmdb_mirror_healthy(ctx, index_key, partition_key),
-         :ok <- flow_flush_lmdb_for_index(ctx, index_key, partition_key) do
+  defp flow_lmdb_query_index_entries(ctx, index_key, partition_key, count, consistent?) do
+    with :ok <- flow_maybe_flush_lmdb_for_index(ctx, index_key, partition_key, consistent?),
+         :ok <- flow_require_lmdb_mirror_healthy(ctx, index_key, partition_key) do
       prefix = Ferricstore.Flow.LMDB.query_index_prefix(index_key)
       now_ms = now_ms()
       scan_count = flow_lmdb_query_scan_count(count)

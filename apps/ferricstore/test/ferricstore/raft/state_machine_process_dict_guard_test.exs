@@ -48,8 +48,6 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
           ":sm_pending_writes",
           ":sm_pending_originals",
           ":sm_pending_values",
-          ":sm_pending_lmdb_ops",
-          ":sm_pending_lmdb_originals",
           ":sm_pending_lmdb_values",
           ":sm_pending_lmdb_mirror_ops",
           ":sm_pending_lmdb_mirror_after_flush"
