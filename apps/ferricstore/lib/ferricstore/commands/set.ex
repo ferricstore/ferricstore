@@ -888,14 +888,18 @@ defmodule Ferricstore.Commands.Set do
                   end
 
                 {:error, _} = err ->
-                  maybe_rollback_smove_destination(
-                    destination_had_member?,
-                    destination,
-                    dst_key,
-                    store
-                  )
+                  case maybe_rollback_smove_destination(
+                         destination_had_member?,
+                         destination,
+                         dst_key,
+                         store
+                       ) do
+                    :ok ->
+                      err
 
-                  err
+                    {:error, _} = rollback_err ->
+                      {:error, {:smove_rollback_failed, err, rollback_err}}
+                  end
               end
 
             {:error, _} = err ->
@@ -916,8 +920,7 @@ defmodule Ferricstore.Commands.Set do
   defp maybe_rollback_smove_destination(true, _destination, _dst_key, _store), do: :ok
 
   defp maybe_rollback_smove_destination(false, destination, dst_key, store) do
-    _ = Ops.compound_batch_delete(store, destination, [dst_key])
-    :ok
+    Ops.compound_batch_delete(store, destination, [dst_key])
   end
 
   # Clears any existing set at `destination`, writes `members` as a new set,

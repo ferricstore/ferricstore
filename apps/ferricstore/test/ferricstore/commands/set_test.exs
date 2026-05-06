@@ -830,6 +830,43 @@ defmodule Ferricstore.Commands.SetTest do
       refute_received {:source_deleted, _}
     end
 
+    test "SMOVE returns rollback failure when source delete and destination rollback both fail" do
+      parent = self()
+      src_type_key = CompoundKey.type_key("src")
+      dst_type_key = CompoundKey.type_key("dst")
+      src_member_key = CompoundKey.set_member("src", "a")
+      dst_member_key = CompoundKey.set_member("dst", "a")
+
+      store = %{
+        get: fn _key -> nil end,
+        compound_get: fn
+          "src", ^src_type_key -> "set"
+          "dst", ^dst_type_key -> "set"
+          "src", ^src_member_key -> "1"
+          "dst", ^dst_member_key -> nil
+          _redis_key, _compound_key -> nil
+        end,
+        compound_put: fn "dst", ^dst_member_key, "1", 0 ->
+          send(parent, :destination_written)
+          :ok
+        end,
+        compound_batch_delete: fn
+          "src", [^src_member_key] ->
+            {:error, :source_disk_full}
+
+          "dst", [^dst_member_key] ->
+            {:error, :rollback_disk_full}
+        end,
+        compound_count: fn _redis_key, _prefix -> 1 end
+      }
+
+      assert {:error,
+              {:smove_rollback_failed, {:error, :source_disk_full}, {:error, :rollback_disk_full}}} ==
+               Set.handle("SMOVE", ["src", "dst", "a"], store)
+
+      assert_received :destination_written
+    end
+
     test "SMOVE with wrong number of arguments returns error" do
       store = MockStore.make()
       assert {:error, _} = Set.handle("SMOVE", ["src", "dst"], store)
