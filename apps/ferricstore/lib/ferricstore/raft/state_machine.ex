@@ -7091,13 +7091,15 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp queue_lmdb_metadata_index_puts(record, expire_at_ms) do
+    state_key = FlowKeys.state_key(record.id, Map.get(record, :partition_key))
+
     record
     |> flow_metadata_index_entries()
     |> Enum.each(fn {index_key, id, score} ->
       index_key
       |> Ferricstore.Flow.LMDB.query_index_key(id, score)
       |> queue_pending_lmdb_mirror_query_put(
-        Ferricstore.Flow.LMDB.encode_query_index_value(id, score, expire_at_ms)
+        Ferricstore.Flow.LMDB.encode_query_index_value(id, score, expire_at_ms, state_key)
       )
     end)
 

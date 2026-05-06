@@ -159,8 +159,8 @@ defmodule Ferricstore.Flow.LMDB do
     query_index_key(index_key, id, score)
   end
 
-  def encode_query_index_value(id, updated_at_ms, expire_at_ms \\ 0) do
-    :erlang.term_to_binary({id, normalize_ms(updated_at_ms), expire_at_ms})
+  def encode_query_index_value(id, updated_at_ms, expire_at_ms \\ 0, state_key \\ nil) do
+    :erlang.term_to_binary({id, normalize_ms(updated_at_ms), expire_at_ms, state_key})
   end
 
   def delete_state_artifacts(path, state_key) when is_binary(path) and is_binary(state_key) do
@@ -451,13 +451,18 @@ defmodule Ferricstore.Flow.LMDB do
 
   def decode_query_index_value(blob) when is_binary(blob) do
     case :erlang.binary_to_term(blob, [:safe]) do
+      {id, updated_at_ms, expire_at_ms, state_key}
+      when is_binary(id) and is_integer(updated_at_ms) and is_integer(expire_at_ms) and
+             (is_binary(state_key) or is_nil(state_key)) ->
+        {:ok, {id, updated_at_ms, expire_at_ms, state_key}}
+
       {id, updated_at_ms, expire_at_ms}
       when is_binary(id) and is_integer(updated_at_ms) and is_integer(expire_at_ms) ->
-        {:ok, {id, updated_at_ms, expire_at_ms}}
+        {:ok, {id, updated_at_ms, expire_at_ms, nil}}
 
       {id, updated_at_ms}
       when is_binary(id) and is_integer(updated_at_ms) ->
-        {:ok, {id, updated_at_ms, 0}}
+        {:ok, {id, updated_at_ms, 0, nil}}
 
       _ ->
         :error

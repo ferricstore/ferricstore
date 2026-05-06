@@ -1084,8 +1084,51 @@ defmodule Ferricstore.Flow do
   end
 
   defp flow_records_for_index(ctx, index_key, partition_key, count) do
-    with {:ok, ids} <- flow_lmdb_query_index_ids(ctx, index_key, partition_key, count) do
-      flow_records_for_ids(ctx, ids, partition_key)
+    with {:ok, entries} <- flow_lmdb_query_index_entries(ctx, index_key, partition_key, count) do
+      if Enum.all?(entries, fn {_id, _updated_at_ms, state_key} -> is_binary(state_key) end) do
+        flow_records_for_lmdb_state_keys(ctx, entries, partition_key, count)
+      else
+        ids = Enum.map(entries, fn {id, _updated_at_ms, _state_key} -> id end)
+        flow_records_for_ids(ctx, ids, partition_key)
+      end
+    end
+  end
+
+  defp flow_records_for_lmdb_state_keys(ctx, entries, partition_key, count) do
+    state_keys = Enum.map(entries, fn {_id, _updated_at_ms, state_key} -> state_key end)
+    values = Router.flow_lmdb_batch_get_state_keys(ctx, state_keys)
+
+    case Enum.find(values, &match?({:error, _reason}, &1)) do
+      nil ->
+        case decode_lmdb_records(values) do
+          {:ok, records} ->
+            {:ok, Enum.take(records, count)}
+
+          :stale ->
+            ids = Enum.map(entries, fn {id, _updated_at_ms, _state_key} -> id end)
+            flow_records_for_ids(ctx, ids, partition_key)
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp decode_lmdb_records(values) do
+    values
+    |> Enum.reduce_while([], fn
+      nil, _acc ->
+        {:halt, :stale}
+
+      value, acc when is_binary(value) ->
+        case safe_decode_record(value) do
+          {:ok, nil} -> {:halt, :stale}
+          {:ok, record} -> {:cont, [record | acc]}
+        end
+    end)
+    |> case do
+      :stale -> :stale
+      records -> {:ok, Enum.reverse(records)}
     end
   end
 
@@ -1372,10 +1415,10 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_lmdb_query_index_ids(_ctx, _index_key, _partition_key, count) when count <= 0,
+  defp flow_lmdb_query_index_entries(_ctx, _index_key, _partition_key, count) when count <= 0,
     do: {:ok, []}
 
-  defp flow_lmdb_query_index_ids(ctx, index_key, partition_key, count) do
+  defp flow_lmdb_query_index_entries(ctx, index_key, partition_key, count) do
     with :ok <- flow_require_lmdb_mirror_healthy(ctx, index_key, partition_key),
          :ok <- flow_flush_lmdb_for_index(ctx, index_key, partition_key) do
       prefix = Ferricstore.Flow.LMDB.query_index_prefix(index_key)
@@ -1393,12 +1436,11 @@ defmodule Ferricstore.Flow do
       end)
       |> case do
         {:ok, entries} ->
-          ids =
+          entries =
             entries
-            |> Enum.sort_by(fn {id, updated_at_ms} -> {updated_at_ms, id} end)
-            |> Enum.map(fn {id, _updated_at_ms} -> id end)
+            |> Enum.sort_by(fn {id, updated_at_ms, _state_key} -> {updated_at_ms, id} end)
 
-          {:ok, ids}
+          {:ok, entries}
 
         {:error, _reason} = error ->
           error
@@ -1559,11 +1601,11 @@ defmodule Ferricstore.Flow do
     entries
     |> Enum.flat_map(fn {key, value} ->
       case Ferricstore.Flow.LMDB.decode_query_index_value(value) do
-        {:ok, {id, updated_at_ms, expire_at_ms}}
+        {:ok, {id, updated_at_ms, expire_at_ms, state_key}}
         when expire_at_ms <= 0 or expire_at_ms > now_ms ->
-          [{id, updated_at_ms}]
+          [{id, updated_at_ms, state_key}]
 
-        {:ok, {_id, _updated_at_ms, _expire_at_ms}} ->
+        {:ok, {_id, _updated_at_ms, _expire_at_ms, _state_key}} ->
           Ferricstore.Flow.LMDB.write_batch(path, [{:delete, key}])
           []
 

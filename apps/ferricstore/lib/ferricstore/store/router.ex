@@ -2480,6 +2480,11 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @doc false
+  def flow_lmdb_batch_get_state_keys(ctx, state_keys) when is_list(state_keys) do
+    flow_batch_get_lmdb(ctx, state_keys, Ferricstore.Flow.LMDB.mode())
+  end
+
   defp flow_batch_get_lmdb(_ctx, [], _mode), do: []
 
   defp flow_batch_get_lmdb(ctx, keys, mode) do

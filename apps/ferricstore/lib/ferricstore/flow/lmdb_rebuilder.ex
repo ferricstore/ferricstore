@@ -490,7 +490,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         end
 
       query_key = LMDB.query_index_key(key, record.id, score)
-      value = LMDB.encode_query_index_value(record.id, score, expire_at_ms)
+      state_key = Flow.Keys.state_key(record.id, partition_key)
+      value = LMDB.encode_query_index_value(record.id, score, expire_at_ms, state_key)
       {:put, query_key, value}
     end)
   end

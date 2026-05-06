@@ -53,6 +53,25 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.LMDB.get_many(path, ["a", "b", "c"])
   end
 
+  test "query index values carry state keys and decode legacy values" do
+    state_key = Ferricstore.Flow.Keys.state_key("flow-query-value", "tenant-query-value")
+
+    value =
+      Ferricstore.Flow.LMDB.encode_query_index_value("flow-query-value", 42, 1_000, state_key)
+
+    assert {:ok, {"flow-query-value", 42, 1_000, ^state_key}} =
+             Ferricstore.Flow.LMDB.decode_query_index_value(value)
+
+    legacy_expiring = :erlang.term_to_binary({"flow-query-value", 43, 2_000})
+    legacy_permanent = :erlang.term_to_binary({"flow-query-value", 44})
+
+    assert {:ok, {"flow-query-value", 43, 2_000, nil}} =
+             Ferricstore.Flow.LMDB.decode_query_index_value(legacy_expiring)
+
+    assert {:ok, {"flow-query-value", 44, 0, nil}} =
+             Ferricstore.Flow.LMDB.decode_query_index_value(legacy_permanent)
+  end
+
   test "terminal_counts batches count reads and caches missing counts as zero" do
     path =
       Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")
@@ -1316,6 +1335,76 @@ defmodule Ferricstore.Flow.LMDBTest do
              ])
 
     assert {:ok, []} =
+             Ferricstore.Flow.by_correlation(ctx, correlation_id, partition_key: partition_key)
+  end
+
+  test "lineage queries hydrate directly from LMDB state keys" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    id = "flow-direct-lineage"
+    partition_key = "tenant-direct-lineage"
+    parent_flow_id = "parent-direct-lineage"
+    root_flow_id = "root-direct-lineage"
+    correlation_id = "correlation-direct-lineage"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    updated_at_ms = 12_345
+
+    record = %{
+      id: id,
+      type: "direct-lineage",
+      state: "queued",
+      version: 1,
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: 1,
+      updated_at_ms: updated_at_ms,
+      next_run_at_ms: 20_000,
+      priority: 0,
+      ttl_ms: nil,
+      history_max_events: nil,
+      partition_key: partition_key,
+      payload_ref: nil,
+      parent_flow_id: parent_flow_id,
+      root_flow_id: root_flow_id,
+      correlation_id: correlation_id,
+      result_ref: nil,
+      error_ref: nil,
+      lease_owner: nil,
+      lease_token: nil,
+      lease_deadline_ms: 0,
+      rewound_to_event_id: nil
+    }
+
+    state_value =
+      record
+      |> Ferricstore.Flow.encode_record()
+      |> Ferricstore.Flow.LMDB.encode_value(0)
+
+    query_index_key = Ferricstore.Flow.Keys.correlation_index_key(correlation_id, partition_key)
+    query_key = Ferricstore.Flow.LMDB.query_index_key(query_index_key, id, updated_at_ms)
+    query_value = Ferricstore.Flow.LMDB.encode_query_index_value(id, updated_at_ms, 0, state_key)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    assert :ok =
+             Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+               {:put, state_key, state_value},
+               {:put, query_key, query_value}
+             ])
+
+    assert {:ok, [%{id: ^id, correlation_id: ^correlation_id, partition_key: ^partition_key}]} =
              Ferricstore.Flow.by_correlation(ctx, correlation_id, partition_key: partition_key)
   end
 
