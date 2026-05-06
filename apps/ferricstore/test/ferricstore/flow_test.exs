@@ -1786,6 +1786,17 @@ defmodule Ferricstore.FlowTest do
              "claimed",
              "completed"
            ]
+
+    history_key = Ferricstore.Flow.Keys.history_key(id)
+    shard = shard_for(history_key)
+    {flow_index, flow_lookup} = Ferricstore.Flow.Index.table_names(:default, shard)
+
+    assert Ferricstore.Flow.Index.count_all(flow_lookup, history_key) == 3
+
+    assert Ferricstore.Flow.Index.rank_range(flow_index, history_key, 0, 2, false) |> length() ==
+             3
+
+    assert [] = :ets.lookup(Ferricstore.Stream.Meta, history_key)
   end
 
   test "flow history retention keeps only latest configured events" do
@@ -1820,14 +1831,20 @@ defmodule Ferricstore.FlowTest do
     refute created_event_id in event_ids
 
     history_key = Ferricstore.Flow.Keys.history_key(id)
-    {created_ms, created_seq} = flow_history_test_parse_id(created_event_id)
+    shard = shard_for(history_key)
+    {flow_index, flow_lookup} = Ferricstore.Flow.Index.table_names(:default, shard)
 
-    assert [{^history_key, 2, first_id, last_id, _last_ms, _last_seq}] =
-             :ets.lookup(Ferricstore.Stream.Meta, history_key)
+    assert Ferricstore.Flow.Index.count_all(flow_lookup, history_key) == 2
 
-    assert first_id == List.first(event_ids)
-    assert last_id == List.last(event_ids)
-    assert [] = :ets.lookup(Ferricstore.Stream.Index, {history_key, created_ms, created_seq})
+    assert Ferricstore.Flow.Index.rank_range(flow_index, history_key, 0, 10, false)
+           |> Enum.map(&elem(&1, 0)) ==
+             event_ids
+
+    assert [] = :ets.lookup(Ferricstore.Stream.Meta, history_key)
+
+    assert [] =
+             Ferricstore.Flow.Index.rank_range(flow_index, history_key, 0, 10, false)
+             |> Enum.filter(fn {event_id, _score} -> event_id == created_event_id end)
   end
 
   test "flow_rewind rejects trimmed target event with stale stream index" do
@@ -1982,11 +1999,6 @@ defmodule Ferricstore.FlowTest do
     Process.sleep(40)
 
     assert {:ok, nil} = FerricStore.flow_get(id)
-  end
-
-  defp flow_history_test_parse_id(event_id) do
-    [ms, seq] = String.split(event_id, "-", parts: 2)
-    {String.to_integer(ms), String.to_integer(seq)}
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)

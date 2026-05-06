@@ -5287,8 +5287,6 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_claim_put_history(state, plans, now_ms) do
-    Ferricstore.Commands.Stream.ensure_meta_table()
-
     Enum.each(plans, fn {_record, next} ->
       flow_history_put_ready(state, next, "claimed", now_ms)
       flow_history_trim(state, next)
@@ -5298,8 +5296,6 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_transition_put_history(state, plans) do
-    Ferricstore.Commands.Stream.ensure_meta_table()
-
     Enum.each(plans, fn {_record, next} ->
       flow_history_put_ready(state, next, "transitioned", Map.get(next, :updated_at_ms))
       flow_history_trim(state, next)
@@ -5309,8 +5305,6 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_create_put_history(state, records) do
-    Ferricstore.Commands.Stream.ensure_meta_table()
-
     Enum.each(records, fn record ->
       flow_history_put_ready(state, record, "created", Map.get(record, :created_at_ms))
       flow_history_trim(state, record)
@@ -5550,18 +5544,17 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_history_event_fields(state, id, event_id, partition_key) do
     history_key = FlowKeys.history_key(id, partition_key)
 
-    case flow_history_indexed_event_fields(state, history_key, event_id) do
+    case flow_history_indexed_event_fields(state, id, partition_key, history_key, event_id) do
       {:ok, _fields} = ok -> ok
       :miss -> flow_history_scanned_event_fields(state, history_key, event_id)
     end
   end
 
-  defp flow_history_indexed_event_fields(state, history_key, event_id) do
-    {ms, seq} = flow_parse_event_id(event_id)
-    index_key = {history_key, ms, seq}
+  defp flow_history_indexed_event_fields(state, id, partition_key, history_key, event_id) do
+    compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
 
-    case :ets.lookup(Ferricstore.Stream.Index, index_key) do
-      [{^index_key, ^event_id, compound_key}] ->
+    case flow_index_score_of(state, history_key, event_id) do
+      {:ok, _score} ->
         case ets_lookup(state, compound_key) do
           {:hit, value, _expire_at_ms} ->
             {:ok, value |> flow_decode_history_fields() |> flow_history_fields_to_map()}
@@ -5931,6 +5924,34 @@ defmodule Ferricstore.Raft.StateMachine do
     )
   end
 
+  defp flow_index_rank_range(
+         %{flow_index_name: index} = state,
+         key,
+         start_idx,
+         stop_idx,
+         reverse?
+       ) do
+    if flow_index_tables?(state) do
+      FlowIndex.rank_range(index, key, start_idx, stop_idx, reverse?)
+    else
+      []
+    end
+  end
+
+  defp flow_index_rank_range(_state, _key, _start_idx, _stop_idx, _reverse?), do: []
+
+  defp flow_index_count_all(%{flow_lookup_name: lookup} = state, key) do
+    if flow_index_tables?(state), do: FlowIndex.count_all(lookup, key), else: 0
+  end
+
+  defp flow_index_count_all(_state, _key), do: 0
+
+  defp flow_index_score_of(%{flow_lookup_name: lookup} = state, key, member) do
+    if flow_index_tables?(state), do: FlowIndex.score_of(lookup, key, member), else: :miss
+  end
+
+  defp flow_index_score_of(_state, _key, _member), do: :miss
+
   defp flow_zset_put_new(
          state,
          due_key,
@@ -6023,59 +6044,38 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_history_put(state, record, event, now_ms) do
-    Ferricstore.Commands.Stream.ensure_meta_table()
     flow_history_put_ready(state, record, event, now_ms)
   end
 
   defp flow_history_put_ready(state, %{id: id, version: version} = record, event, now_ms) do
     partition_key = Map.get(record, :partition_key)
     history_key = FlowKeys.history_key(id, partition_key)
-    {event_id, event_ms, event_seq} = flow_history_next_event(history_key, now_ms, version)
+    {event_id, event_ms} = flow_history_next_event(state, history_key, now_ms, version)
 
     compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
 
     with :ok <-
            raw_put_cold(state, compound_key, Flow.encode_history_fields(record, event, now_ms), 0) do
-      flow_history_index_put(history_key, event_id, event_ms, event_seq, compound_key)
+      flow_history_index_put(state, history_key, event_id, event_ms)
     end
   end
 
-  defp flow_history_next_event(history_key, now_ms, version) do
+  defp flow_history_next_event(state, history_key, now_ms, version) do
     ms =
-      case :ets.lookup(Ferricstore.Stream.Meta, history_key) do
-        [{^history_key, _len, _first, _last, last_ms, _last_seq}]
-        when is_integer(last_ms) and last_ms > now_ms ->
+      case flow_index_rank_range(state, history_key, 0, 0, true) do
+        [{_event_id, last_ms}] when is_number(last_ms) and last_ms > now_ms ->
           last_ms
 
         _ ->
           now_ms
       end
 
-    {Integer.to_string(ms) <> "-" <> Integer.to_string(version), ms, version}
+    {Integer.to_string(trunc(ms)) <> "-" <> Integer.to_string(version), trunc(ms)}
   end
 
-  defp flow_history_index_put(history_key, event_id, ms, seq, compound_key) do
-    meta_table = Ferricstore.Stream.Meta
-    index_table = Ferricstore.Stream.Index
-
-    case :ets.lookup(meta_table, history_key) do
-      [] ->
-        :ets.insert(meta_table, {history_key, 1, event_id, event_id, ms, seq})
-
-      [{^history_key, len, first, _last, _last_ms, _last_seq}] ->
-        :ets.insert(meta_table, {history_key, len + 1, first, event_id, ms, seq})
-    end
-
-    :ets.insert(index_table, {{history_key, ms, seq}, event_id, compound_key})
-    :ets.insert(index_table, {{:ready, history_key}, true})
+  defp flow_history_index_put(state, history_key, event_id, ms) do
+    flow_index_put_members(state, history_key, [{event_id, ms}])
     :ok
-  end
-
-  defp flow_parse_event_id(event_id) do
-    case String.split(event_id, "-", parts: 2) do
-      [ms, seq] -> {flow_parse_integer(ms), flow_parse_integer(seq)}
-      _ -> {0, 0}
-    end
   end
 
   defp flow_history_trim(_state, %{history_max_events: nil}), do: :ok
@@ -6085,12 +6085,10 @@ defmodule Ferricstore.Raft.StateMachine do
     partition_key = Map.get(record, :partition_key)
     history_key = FlowKeys.history_key(id, partition_key)
 
-    case :ets.lookup(Ferricstore.Stream.Meta, history_key) do
-      [{^history_key, len, _first, last, last_ms, last_seq}] when len > max ->
+    case flow_index_count_all(state, history_key) do
+      len when len > max ->
         delete_count = len - max
-        deleted = flow_history_trim_oldest(state, history_key, delete_count, 0)
-        remaining = max(len - deleted, 0)
-        flow_history_update_meta_after_trim(history_key, remaining, last, last_ms, last_seq)
+        flow_history_trim_oldest(state, id, partition_key, history_key, delete_count)
 
       _ ->
         :ok
@@ -6101,80 +6099,15 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_history_trim(_state, _record), do: :ok
 
-  defp flow_history_trim_oldest(_state, _history_key, 0, deleted), do: deleted
-
-  defp flow_history_trim_oldest(state, history_key, remaining, deleted) do
-    case :ets.next(Ferricstore.Stream.Index, {history_key, -1, -1}) do
-      {^history_key, _ms, _seq} = index_key ->
-        case :ets.lookup(Ferricstore.Stream.Index, index_key) do
-          [{^index_key, _event_id, compound_key}] ->
-            flow_delete(state, compound_key)
-            :ets.delete(Ferricstore.Stream.Index, index_key)
-            flow_history_trim_oldest(state, history_key, remaining - 1, deleted + 1)
-
-          [] ->
-            flow_history_trim_oldest(state, history_key, remaining - 1, deleted)
-        end
-
-      _ ->
-        deleted
-    end
-  end
-
-  defp flow_history_update_meta_after_trim(
-         history_key,
-         remaining,
-         old_last,
-         old_last_ms,
-         old_last_seq
-       )
-       when remaining <= 0 do
-    :ets.insert(
-      Ferricstore.Stream.Meta,
-      {history_key, 0, "0-0", old_last, old_last_ms, old_last_seq}
-    )
+  defp flow_history_trim_oldest(state, id, partition_key, history_key, delete_count) do
+    state
+    |> flow_index_rank_range(history_key, 0, delete_count - 1, false)
+    |> Enum.each(fn {event_id, _score} ->
+      flow_delete(state, FlowKeys.stream_entry_key(id, event_id, partition_key))
+      flow_index_delete_member(state, history_key, event_id)
+    end)
 
     :ok
-  end
-
-  defp flow_history_update_meta_after_trim(
-         history_key,
-         remaining,
-         old_last,
-         old_last_ms,
-         old_last_seq
-       ) do
-    case :ets.next(Ferricstore.Stream.Index, {history_key, -1, -1}) do
-      {^history_key, _ms, _seq} = first_key ->
-        case :ets.lookup(Ferricstore.Stream.Index, first_key) do
-          [{^first_key, first_id, _compound_key}] ->
-            :ets.insert(
-              Ferricstore.Stream.Meta,
-              {history_key, remaining, first_id, old_last, old_last_ms, old_last_seq}
-            )
-
-          [] ->
-            flow_history_update_meta_after_trim(
-              history_key,
-              0,
-              old_last,
-              old_last_ms,
-              old_last_seq
-            )
-        end
-
-      _ ->
-        flow_history_update_meta_after_trim(history_key, 0, old_last, old_last_ms, old_last_seq)
-    end
-
-    :ok
-  end
-
-  defp flow_parse_integer(value) do
-    case Integer.parse(value) do
-      {int, ""} -> int
-      _ -> 0
-    end
   end
 
   defp flow_record_expire_at(%{ttl_ms: ttl_ms}) when is_integer(ttl_ms) and ttl_ms > 0,

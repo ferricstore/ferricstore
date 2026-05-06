@@ -109,6 +109,14 @@ defmodule Ferricstore.Flow.Index do
     increment_count(lookup_table, key, -deleted)
   end
 
+  @spec score_of(:ets.tid() | atom(), binary(), binary()) :: {:ok, float()} | :miss
+  def score_of(lookup_table, key, member) do
+    case :ets.lookup(lookup_table, {key, member}) do
+      [{{^key, ^member}, score}] -> {:ok, score}
+      [] -> :miss
+    end
+  end
+
   @spec range_slice(
           :ets.tid() | atom(),
           binary(),

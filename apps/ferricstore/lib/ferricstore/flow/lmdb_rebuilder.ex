@@ -42,6 +42,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           acc
         )
       end)
+      |> Map.put(:history, rebuild_flow_history_indexes(keydir, flow_index, flow_lookup))
 
     :telemetry.execute(
       [:ferricstore, :flow, :lmdb_rebuild],
@@ -314,6 +315,61 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp maybe_rebuild_flow_running_indexes(_flow_index, _flow_lookup, _record), do: :ok
+
+  defp rebuild_flow_history_indexes(_keydir, nil, _flow_lookup), do: 0
+  defp rebuild_flow_history_indexes(_keydir, _flow_index, nil), do: 0
+
+  defp rebuild_flow_history_indexes(keydir, flow_index, flow_lookup) do
+    :ets.foldl(
+      fn
+        {key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}, count when is_binary(key) ->
+          case parse_flow_history_entry_key(key) do
+            {:ok, history_key, event_id, event_ms} ->
+              FlowIndex.put_member(flow_index, flow_lookup, history_key, event_id, event_ms)
+              count + 1
+
+            :skip ->
+              count
+          end
+
+        _entry, count ->
+          count
+      end,
+      0,
+      keydir
+    )
+  end
+
+  defp parse_flow_history_entry_key("X:" <> rest) do
+    case :binary.split(rest, <<0>>) do
+      [history_key, event_id] ->
+        with true <- String.starts_with?(history_key, "f:{f"),
+             true <- String.contains?(history_key, "}:h:"),
+             {:ok, event_ms} <- parse_history_event_ms(event_id) do
+          {:ok, history_key, event_id, event_ms}
+        else
+          _ -> :skip
+        end
+
+      _ ->
+        :skip
+    end
+  end
+
+  defp parse_flow_history_entry_key(_key), do: :skip
+
+  defp parse_history_event_ms(event_id) do
+    case String.split(event_id, "-", parts: 2) do
+      [ms, _seq] ->
+        case Integer.parse(ms) do
+          {value, ""} when value >= 0 -> {:ok, value}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
 
   defp query_metadata_index_ops(record, expire_at_ms) do
     partition_key = Map.get(record, :partition_key)

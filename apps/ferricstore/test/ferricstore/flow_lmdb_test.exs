@@ -885,6 +885,64 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert claimed_after_restart.id == queued.id
   end
 
+  test "startup rebuilds native flow history index from durable history entries" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    id = "history-restart"
+    partition_key = "tenant-history"
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.create(ctx, id,
+               type: "history-restart",
+               run_at_ms: 1,
+               partition_key: partition_key,
+               now_ms: 1
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, "history-restart",
+               worker: "worker-history",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1,
+               partition_key: partition_key
+             )
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               partition_key: partition_key,
+               now_ms: 2
+             )
+
+    assert {:ok, before_restart} = Ferricstore.Flow.history(ctx, id, partition_key: partition_key)
+
+    assert Enum.map(before_restart, fn {_event_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed",
+             "completed"
+           ]
+
+    restart_isolated_shard!(ctx, 0)
+
+    assert {:ok, after_restart} = Ferricstore.Flow.history(ctx, id, partition_key: partition_key)
+
+    assert Enum.map(after_restart, fn {_event_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed",
+             "completed"
+           ]
+  end
+
   test "mirror flow TTL removes expired LMDB state and terminal index on read" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 

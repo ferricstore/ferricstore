@@ -497,15 +497,30 @@ defmodule Ferricstore.Flow do
          history_key = __MODULE__.Keys.history_key(id, partition_key),
          :ok <- validate_key_size(history_key),
          {:ok, count} <- flow_count(opts) do
-      result =
-        Ferricstore.Commands.Stream.handle_ast(
-          {:xrange, history_key, :min, :max, count},
-          flow_command_store(ctx)
-        )
+      case Router.flow_index_rank_range(ctx, history_key, 0, count - 1, false) do
+        {:ok, event_refs} ->
+          event_ids = Enum.map(event_refs, fn {event_id, _score} -> event_id end)
 
-      case wrap_command_result(result) do
-        {:ok, entries} -> {:ok, Enum.map(entries, &flow_history_entry_to_tuple/1)}
-        {:error, _reason} = error -> error
+          compound_keys =
+            Enum.map(event_ids, &__MODULE__.Keys.stream_entry_key(id, &1, partition_key))
+
+          values = Router.compound_batch_get(ctx, history_key, compound_keys)
+
+          entries =
+            event_ids
+            |> Enum.zip(values)
+            |> Enum.flat_map(fn
+              {event_id, value} when is_binary(value) ->
+                [{event_id, decode_history_fields(value)}]
+
+              _missing ->
+                []
+            end)
+
+          {:ok, Enum.map(entries, &flow_history_entry_to_tuple/1)}
+
+        :unavailable ->
+          {:error, "ERR flow history unavailable"}
       end
     end
   end
@@ -1387,79 +1402,6 @@ defmodule Ferricstore.Flow do
       {score, ""} -> {:inclusive, score}
       _ -> {:error, "ERR min or max is not a float"}
     end
-  end
-
-  defp wrap_command_result({:error, _reason} = error), do: error
-  defp wrap_command_result(result), do: {:ok, result}
-
-  defp flow_command_store(ctx) do
-    %{
-      __instance_ctx__: ctx,
-      get: fn key -> Router.get(ctx, key) end,
-      get_meta: fn key -> Router.get_meta(ctx, key) end,
-      batch_get: fn keys -> Router.batch_get(ctx, keys) end,
-      expire_at_ms: fn key -> Router.expire_at_ms(ctx, key) end,
-      value_size: fn key -> Router.value_size(ctx, key) end,
-      object_lfu: fn key -> Router.object_lfu(ctx, key) end,
-      put: fn key, value, exp -> Router.put(ctx, key, value, exp) end,
-      delete: fn key -> Router.delete(ctx, key) end,
-      exists?: fn key -> Router.exists?(ctx, key) end,
-      keys: fn -> Router.keys(ctx) end,
-      dbsize: fn -> Router.dbsize(ctx) end,
-      compound_get: fn redis_key, compound_key ->
-        Router.compound_get(ctx, redis_key, compound_key)
-      end,
-      compound_get_meta: fn redis_key, compound_key ->
-        Router.compound_get_meta(ctx, redis_key, compound_key)
-      end,
-      compound_batch_get: fn redis_key, compound_keys ->
-        Router.compound_batch_get(ctx, redis_key, compound_keys)
-      end,
-      compound_batch_get_meta: fn redis_key, compound_keys ->
-        Router.compound_batch_get_meta(ctx, redis_key, compound_keys)
-      end,
-      compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
-      end,
-      compound_batch_put: fn redis_key, entries ->
-        Router.compound_batch_put(ctx, redis_key, entries)
-      end,
-      compound_delete: fn redis_key, compound_key ->
-        Router.compound_delete(ctx, redis_key, compound_key)
-      end,
-      compound_scan: fn redis_key, prefix ->
-        Router.compound_scan(ctx, redis_key, prefix)
-      end,
-      compound_count: fn redis_key, prefix ->
-        Router.compound_count(ctx, redis_key, prefix)
-      end,
-      compound_delete_prefix: fn redis_key, prefix ->
-        Router.compound_delete_prefix(ctx, redis_key, prefix)
-      end,
-      zset_score_range: fn redis_key, min_bound, max_bound, reverse? ->
-        Router.zset_score_range(ctx, redis_key, min_bound, max_bound, reverse?)
-      end,
-      zset_score_range_slice: fn redis_key, min_bound, max_bound, reverse?, offset, count ->
-        Router.zset_score_range_slice(
-          ctx,
-          redis_key,
-          min_bound,
-          max_bound,
-          reverse?,
-          offset,
-          count
-        )
-      end,
-      zset_score_count: fn redis_key, min_bound, max_bound ->
-        Router.zset_score_count(ctx, redis_key, min_bound, max_bound)
-      end,
-      zset_rank_range: fn redis_key, start_idx, stop_idx, reverse? ->
-        Router.zset_rank_range(ctx, redis_key, start_idx, stop_idx, reverse?)
-      end,
-      zset_member_rank: fn redis_key, member, reverse? ->
-        Router.zset_member_rank(ctx, redis_key, member, reverse?)
-      end
-    }
   end
 
   defp flow_start_time, do: System.monotonic_time()
