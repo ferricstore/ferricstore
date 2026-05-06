@@ -236,14 +236,32 @@ defmodule Ferricstore.Commands.StringsTest do
     test "DEL removes stream entries and metadata" do
       Stream.ensure_meta_table()
       store = MockStore.make()
+      key = "stream_del_#{System.unique_integer([:positive])}"
 
-      id = Stream.handle("XADD", ["s", "*", "f", "v"], store)
+      id = Stream.handle("XADD", [key, "*", "f", "v"], store)
       assert is_binary(id)
-      assert 1 == Stream.handle("XLEN", ["s"], store)
+      assert 1 == Stream.handle("XLEN", [key], store)
 
-      assert 1 == Strings.handle("DEL", ["s"], store)
-      assert 0 == Stream.handle("XLEN", ["s"], store)
-      assert [] == store.compound_scan.("s", "X:s" <> <<0>>)
+      assert 1 == Strings.handle("DEL", [key], store)
+      assert 0 == Stream.handle("XLEN", [key], store)
+      assert [] == store.compound_scan.(key, "X:#{key}" <> <<0>>)
+    end
+
+    test "DEL clears stream index so stale entries do not consume range count" do
+      Stream.ensure_meta_table()
+      store = MockStore.make()
+      key = "stream_del_#{System.unique_integer([:positive])}"
+
+      assert "1-0" == Stream.handle("XADD", [key, "1-0", "f", "old"], store)
+
+      assert [["1-0", "f", "old"]] ==
+               Stream.handle("XRANGE", [key, "-", "+", "COUNT", "1"], store)
+
+      assert 1 == Strings.handle("DEL", [key], store)
+      assert "2-0" == Stream.handle("XADD", [key, "2-0", "f", "new"], store)
+
+      assert [["2-0", "f", "new"]] ==
+               Stream.handle("XRANGE", [key, "-", "+", "COUNT", "1"], store)
     end
 
     test "DEL returns compound prefix delete errors before removing type metadata" do

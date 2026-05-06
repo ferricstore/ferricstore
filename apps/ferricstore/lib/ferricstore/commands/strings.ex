@@ -1277,6 +1277,7 @@ defmodule Ferricstore.Commands.Strings do
   defp cleanup_stream_metadata(key) do
     meta_table = Ferricstore.Stream.Meta
     groups_table = Ferricstore.Stream.Groups
+    index_table = Ferricstore.Stream.Index
     waiters_table = :ferricstore_stream_waiters
 
     if :ets.whereis(meta_table) != :undefined do
@@ -1285,6 +1286,11 @@ defmodule Ferricstore.Commands.Strings do
 
     if :ets.whereis(groups_table) != :undefined do
       :ets.match_delete(groups_table, {{key, :_}, :_, :_, :_})
+    end
+
+    if :ets.whereis(index_table) != :undefined do
+      :ets.select_delete(index_table, [{{{key, :_, :_}, :_, :_}, [], [true]}])
+      :ets.delete(index_table, {:ready, key})
     end
 
     if :ets.whereis(waiters_table) != :undefined do
