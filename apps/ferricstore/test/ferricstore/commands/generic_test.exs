@@ -139,6 +139,28 @@ defmodule Ferricstore.Commands.GenericTest do
       assert "new_val" == store.get.("dst")
     end
 
+    test "RENAME preserves plain destination when plain write fails" do
+      base = MockStore.make(%{"src" => {"new_val", 0}, "dst" => {"old_val", 0}})
+
+      store =
+        base
+        |> Map.put(:delete, fn
+          "dst" ->
+            flunk("RENAME should not delete a plain destination before a plain overwrite")
+
+          key ->
+            base.delete.(key)
+        end)
+        |> Map.put(:put, fn
+          "dst", "new_val", 0 -> {:error, :disk_full}
+          key, value, expire_at_ms -> base.put.(key, value, expire_at_ms)
+        end)
+
+      assert {:error, :disk_full} == Generic.handle("RENAME", ["src", "dst"], store)
+      assert "new_val" == base.get.("src")
+      assert "old_val" == base.get.("dst")
+    end
+
     test "RENAME same key to itself is a no-op" do
       store = MockStore.make(%{"k" => {"v", 0}})
       assert :ok = Generic.handle("RENAME", ["k", "k"], store)

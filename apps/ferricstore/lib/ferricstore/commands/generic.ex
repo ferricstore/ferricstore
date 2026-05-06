@@ -560,6 +560,14 @@ defmodule Ferricstore.Commands.Generic do
 
   defp rename_entry(source, destination, _entry, _store) when source == destination, do: :ok
 
+  defp rename_entry(source, destination, {:plain, value, expire_at_ms}, store) do
+    with :ok <- clear_compound_destination_if_present(destination, store),
+         :ok <- Ops.put(store, destination, value, expire_at_ms),
+         :ok <- delete_key_result(source, store) do
+      :ok
+    end
+  end
+
   defp rename_entry(source, destination, entry, store) do
     with :ok <- delete_key_result(destination, store),
          :ok <- copy_entry(source, destination, entry, store),
