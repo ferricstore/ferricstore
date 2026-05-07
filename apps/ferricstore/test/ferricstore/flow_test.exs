@@ -146,6 +146,7 @@ defmodule Ferricstore.FlowTest do
       lease_owner: "worker-1",
       lease_token: "lease-1",
       lease_deadline_ms: 2_000,
+      run_state: "charge_card",
       rewound_to_event_id: "1000-1"
     }
 
@@ -159,6 +160,14 @@ defmodule Ferricstore.FlowTest do
 
     assert Ferricstore.Flow.decode_record(Ferricstore.Flow.encode_record(normal_record)) ==
              normal_record
+
+    old_compact_without_run_state =
+      record
+      |> Map.drop([:run_state, :rewound_to_event_id])
+      |> Ferricstore.Flow.encode_record()
+      |> then(fn encoded -> binary_part(encoded, 0, byte_size(encoded) - 1) end)
+
+    assert Ferricstore.Flow.decode_record(old_compact_without_run_state).run_state == nil
 
     assert byte_size(compact) < byte_size(old_map)
 
@@ -1718,6 +1727,152 @@ defmodule Ferricstore.FlowTest do
     assert reclaimed.lease_owner == "worker-b"
   end
 
+  test "flow_retry returns to claimed run_state with computed backoff" do
+    id = uid("flow-retry-run-state")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: "payment",
+               state: "charge_card",
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("payment",
+               state: "charge_card",
+               worker: "worker-charge",
+               limit: 1,
+               lease_ms: 30_000,
+               now_ms: 1_000
+             )
+
+    assert claimed.state == "running"
+    assert claimed.run_state == "charge_card"
+
+    assert {:ok, retried} =
+             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000,
+               retry: [
+                 max_attempts: 3,
+                 backoff: [kind: :exponential, base_ms: 1_000, max_ms: 30_000, jitter_pct: 0],
+                 exhausted_to: "payment_failed"
+               ]
+             )
+
+    assert retried.state == "charge_card"
+    assert retried.attempts == 1
+    assert retried.next_run_at_ms == 3_000
+    assert retried.lease_token == nil
+
+    assert {:ok, []} =
+             FerricStore.flow_claim_due("payment",
+               state: "charge_card",
+               worker: "worker-charge-b",
+               limit: 1,
+               now_ms: 2_999
+             )
+
+    assert {:ok, [reclaimed]} =
+             FerricStore.flow_claim_due("payment",
+               state: "charge_card",
+               worker: "worker-charge-b",
+               limit: 1,
+               now_ms: 3_000
+             )
+
+    assert reclaimed.id == id
+    assert reclaimed.run_state == "charge_card"
+  end
+
+  test "flow_retry exhausts to configured active state" do
+    id = uid("flow-retry-exhaust")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: "payment-exhaust",
+               state: "charge_card",
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("payment-exhaust",
+               state: "charge_card",
+               worker: "worker-charge",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, exhausted} =
+             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000,
+               retry: [
+                 max_attempts: 0,
+                 backoff: [kind: :fixed, base_ms: 10_000, max_ms: 10_000, jitter_pct: 0],
+                 exhausted_to: "payment_failed"
+               ]
+             )
+
+    assert exhausted.state == "payment_failed"
+    assert exhausted.attempts == 1
+    assert exhausted.next_run_at_ms == 2_000
+    assert exhausted.lease_token == nil
+
+    assert {:ok, [manual]} =
+             FerricStore.flow_claim_due("payment-exhaust",
+               state: "payment_failed",
+               worker: "worker-manual",
+               limit: 1,
+               now_ms: 2_000
+             )
+
+    assert manual.id == id
+  end
+
+  test "flow_retry rejects invalid retry policy" do
+    id = uid("flow-retry-policy-invalid")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id, type: "retry-policy-invalid", run_at_ms: 1_000)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("retry-policy-invalid",
+               worker: "worker-invalid",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:error, "ERR flow retry max_attempts must be between 0 and 1000"} =
+             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               retry: [max_attempts: 1001]
+             )
+
+    assert {:error, "ERR flow retry exhausted_to cannot be running"} =
+             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               retry: [exhausted_to: "running"]
+             )
+  end
+
+  test "flow retry policy accepts thirty day backoff cap" do
+    assert {:ok, policy} =
+             Ferricstore.Flow.RetryPolicy.normalize(
+               max_attempts: 1000,
+               backoff: [
+                 kind: :exponential,
+                 base_ms: 2_592_000_000,
+                 max_ms: 2_592_000_000,
+                 jitter_pct: 100
+               ],
+               exhausted_to: "needs_review"
+             )
+
+    assert policy.backoff.base_ms == 2_592_000_000
+    assert policy.backoff.max_ms == 2_592_000_000
+  end
+
   test "flow_retry_many atomically reschedules one-partition batch" do
     partition = uid("tenant-retry-many")
     type = uid("bulk-retry-many")
@@ -1813,6 +1968,48 @@ defmodule Ferricstore.FlowTest do
     assert fetched_b.state == "running"
     assert fetched_a.version == 2
     assert fetched_b.version == 2
+  end
+
+  test "flow_retry_many rejects invalid retry policy before mutating records" do
+    partition = uid("tenant-retry-many-policy")
+    type = uid("bulk-retry-many-policy")
+    id_a = uid("retry-many-policy-a")
+    id_b = uid("retry-many-policy-b")
+
+    assert {:ok, _} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: id_a}, %{id: id_b}],
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               worker: "worker-retry-policy",
+               limit: 2,
+               now_ms: 1_000
+             )
+
+    items =
+      Enum.map(claimed, fn record ->
+        %{id: record.id, lease_token: record.lease_token, fencing_token: record.fencing_token}
+      end)
+
+    assert {:error, "ERR flow retry max_attempts must be between 0 and 1000"} =
+             FerricStore.flow_retry_many(partition, items,
+               retry: [max_attempts: 1001],
+               now_ms: 2_000
+             )
+
+    assert {:ok, fetched_a} = FerricStore.flow_get(id_a, partition_key: partition)
+    assert {:ok, fetched_b} = FerricStore.flow_get(id_b, partition_key: partition)
+    assert fetched_a.state == "running"
+    assert fetched_b.state == "running"
+    assert fetched_a.attempts == 0
+    assert fetched_b.attempts == 0
   end
 
   test "expired running lease can be reclaimed" do

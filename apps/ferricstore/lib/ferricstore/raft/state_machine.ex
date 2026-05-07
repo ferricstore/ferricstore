@@ -77,6 +77,7 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.Flow
   alias Ferricstore.Flow.OrderedIndex, as: FlowIndex
   alias Ferricstore.Flow.Keys, as: FlowKeys
+  alias Ferricstore.Flow.RetryPolicy
   alias Ferricstore.HLC
 
   alias Ferricstore.Store.{
@@ -4391,7 +4392,8 @@ defmodule Ferricstore.Raft.StateMachine do
       error_ref: nil,
       lease_owner: nil,
       lease_token: nil,
-      lease_deadline_ms: 0
+      lease_deadline_ms: 0,
+      run_state: nil
     }
   end
 
@@ -5094,12 +5096,11 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp do_flow_retry(state, %{id: id, lease_token: lease_token} = attrs) do
     now_ms = Map.get(attrs, :now_ms, apply_now_ms())
-    run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
     partition_key = Map.get(attrs, :partition_key)
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
          {:ok, record, next} <-
-           flow_prepare_retry_existing_record(record, attrs, lease_token, run_at_ms, now_ms),
+           flow_prepare_retry_existing_record(record, attrs, lease_token, now_ms),
          :ok <- flow_apply_retry(state, record, next, partition_key, now_ms) do
       {:ok, next}
     end
@@ -5117,29 +5118,60 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_flow_retry_many(_state, _attrs),
     do: {:error, "ERR flow items must be a non-empty list"}
 
-  defp flow_prepare_retry_existing_record(record, attrs, lease_token, run_at_ms, now_ms) do
+  defp flow_prepare_retry_existing_record(record, attrs, lease_token, now_ms) do
     with :ok <- flow_require_running_lease(record, lease_token),
          :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
+      retry_policy = Map.get(attrs, :retry_policy, RetryPolicy.default())
+      next_attempts = Map.get(record, :attempts, 0) + 1
+
+      {next_state, next_run_at_ms} =
+        flow_retry_next_state(record, attrs, retry_policy, next_attempts, now_ms)
+
       next =
         record
         |> Map.merge(%{
-          state: "queued",
+          state: next_state,
           version: Map.fetch!(record, :version) + 1,
-          attempts: Map.get(record, :attempts, 0) + 1,
+          attempts: next_attempts,
           updated_at_ms: now_ms,
-          next_run_at_ms: run_at_ms,
+          next_run_at_ms: next_run_at_ms,
           error_ref: Map.get(attrs, :error_ref),
           ttl_ms: Map.get(record, :ttl_ms),
           history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
           lease_token: nil,
-          lease_deadline_ms: 0
+          lease_deadline_ms: 0,
+          run_state: nil
         })
 
       with :ok <- flow_validate_record_keys(record),
            :ok <- flow_validate_record_keys(next) do
         {:ok, record, next}
       end
+    end
+  end
+
+  defp flow_retry_next_state(record, attrs, retry_policy, next_attempts, now_ms) do
+    if RetryPolicy.attempt_allowed?(retry_policy, next_attempts) do
+      run_at_ms =
+        Map.get(attrs, :run_at_ms) ||
+          RetryPolicy.next_run_at_ms(retry_policy, Map.fetch!(record, :id), next_attempts, now_ms)
+
+      {flow_retry_run_state(record), run_at_ms}
+    else
+      exhausted_to = Map.fetch!(retry_policy, :exhausted_to)
+
+      next_run_at_ms =
+        if Ferricstore.Flow.LMDB.terminal_state?(exhausted_to), do: nil, else: now_ms
+
+      {exhausted_to, next_run_at_ms}
+    end
+  end
+
+  defp flow_retry_run_state(record) do
+    case Map.get(record, :run_state) do
+      state when is_binary(state) and state != "" -> state
+      _ -> "queued"
     end
   end
 
@@ -5168,14 +5200,13 @@ defmodule Ferricstore.Raft.StateMachine do
     |> Enum.reduce_while({:ok, []}, fn
       {%{id: _id, lease_token: lease_token} = attrs, existing}, {:ok, acc} ->
         now_ms = Map.get(attrs, :now_ms, apply_now_ms())
-        run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
 
         case existing do
           nil ->
             {:halt, {:error, "ERR flow not found"}}
 
           record ->
-            case flow_prepare_retry_existing_record(record, attrs, lease_token, run_at_ms, now_ms) do
+            case flow_prepare_retry_existing_record(record, attrs, lease_token, now_ms) do
               {:ok, record, next} -> {:cont, {:ok, [{record, next} | acc]}}
               {:error, _reason} = error -> {:halt, error}
             end
@@ -5464,7 +5495,8 @@ defmodule Ferricstore.Raft.StateMachine do
             lease_owner: worker,
             lease_token: token,
             lease_deadline_ms: deadline_ms,
-            next_run_at_ms: deadline_ms
+            next_run_at_ms: deadline_ms,
+            run_state: flow_claim_run_state(record)
           })
 
         with :ok <- flow_validate_record_keys(record),
@@ -5478,6 +5510,11 @@ defmodule Ferricstore.Raft.StateMachine do
         :delete_due
     end
   end
+
+  defp flow_claim_run_state(%{state: "running"} = record),
+    do: Map.get(record, :run_state) || "queued"
+
+  defp flow_claim_run_state(%{state: flow_state}), do: flow_state
 
   defp flow_apply_claim_batch(_state, _due_key, [], [], _now_ms), do: :ok
 

@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow do
   import Bitwise
 
   alias Ferricstore.CommandTime
+  alias Ferricstore.Flow.RetryPolicy
   alias Ferricstore.Store.Router
 
   @default_state "queued"
@@ -893,6 +894,7 @@ defmodule Ferricstore.Flow do
       encode_bin(Map.get(record, :lease_owner)),
       encode_bin(Map.get(record, :lease_token)),
       encode_int(Map.get(record, :lease_deadline_ms)),
+      encode_bin(Map.get(record, :run_state)),
       encode_bin(Map.get(record, :rewound_to_event_id))
     ]
     |> IO.iodata_to_binary()
@@ -936,6 +938,7 @@ defmodule Ferricstore.Flow do
          lease_owner,
          lease_token,
          lease_deadline_ms,
+         run_state,
          rewound_to_event_id
        }) do
     record = %{
@@ -960,7 +963,8 @@ defmodule Ferricstore.Flow do
       error_ref: error_ref,
       lease_owner: lease_owner,
       lease_token: lease_token,
-      lease_deadline_ms: lease_deadline_ms
+      lease_deadline_ms: lease_deadline_ms,
+      run_state: run_state
     }
 
     if is_nil(rewound_to_event_id) do
@@ -968,6 +972,61 @@ defmodule Ferricstore.Flow do
     else
       Map.put(record, :rewound_to_event_id, rewound_to_event_id)
     end
+  end
+
+  defp decode_record_term({
+         @record_tag,
+         id,
+         type,
+         state,
+         version,
+         attempts,
+         fencing_token,
+         created_at_ms,
+         updated_at_ms,
+         next_run_at_ms,
+         priority,
+         ttl_ms,
+         history_max_events,
+         partition_key,
+         payload_ref,
+         parent_flow_id,
+         root_flow_id,
+         correlation_id,
+         result_ref,
+         error_ref,
+         lease_owner,
+         lease_token,
+         lease_deadline_ms,
+         rewound_to_event_id
+       }) do
+    decode_record_term({
+      @record_tag,
+      id,
+      type,
+      state,
+      version,
+      attempts,
+      fencing_token,
+      created_at_ms,
+      updated_at_ms,
+      next_run_at_ms,
+      priority,
+      ttl_ms,
+      history_max_events,
+      partition_key,
+      payload_ref,
+      parent_flow_id,
+      root_flow_id,
+      correlation_id,
+      result_ref,
+      error_ref,
+      lease_owner,
+      lease_token,
+      lease_deadline_ms,
+      nil,
+      rewound_to_event_id
+    })
   end
 
   defp decode_record_term(record) when is_map(record), do: record
@@ -1117,7 +1176,7 @@ defmodule Ferricstore.Flow do
          {:ok, lease_owner, rest} <- decode_bin(rest),
          {:ok, lease_token, rest} <- decode_bin(rest),
          {:ok, lease_deadline_ms, rest} <- decode_int(rest),
-         {:ok, rewound_to_event_id, ""} <- decode_bin(rest) do
+         {:ok, run_state, rewound_to_event_id} <- decode_record_run_state_and_rewind(rest) do
       record = %{
         id: id,
         type: type,
@@ -1140,7 +1199,8 @@ defmodule Ferricstore.Flow do
         error_ref: error_ref,
         lease_owner: lease_owner,
         lease_token: lease_token,
-        lease_deadline_ms: lease_deadline_ms
+        lease_deadline_ms: lease_deadline_ms,
+        run_state: run_state
       }
 
       if is_nil(rewound_to_event_id) do
@@ -1150,6 +1210,21 @@ defmodule Ferricstore.Flow do
       end
     else
       _ -> raise ArgumentError, "invalid flow record"
+    end
+  end
+
+  defp decode_record_run_state_and_rewind(rest) do
+    case decode_bin(rest) do
+      {:ok, rewound_to_event_id, ""} ->
+        {:ok, nil, rewound_to_event_id}
+
+      {:ok, run_state, next} ->
+        with {:ok, rewound_to_event_id, ""} <- decode_bin(next) do
+          {:ok, run_state, rewound_to_event_id}
+        end
+
+      :error ->
+        :error
     end
   end
 
@@ -2272,15 +2347,17 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
-         {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
+         {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms),
          {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil),
-         :ok <- validate_ref_size(:error_ref, error_ref) do
+         :ok <- validate_ref_size(:error_ref, error_ref),
+         {:ok, retry_policy} <- RetryPolicy.normalize(Keyword.get(opts, :retry)) do
       attrs =
         %{
           id: id,
           lease_token: lease_token,
           fencing_token: fencing_token,
           error_ref: error_ref,
+          retry_policy: retry_policy,
           partition_key: partition_key
         }
         |> maybe_put_attr(:now_ms, now)
@@ -2866,7 +2943,8 @@ defmodule Ferricstore.Flow do
        when is_binary(id) do
     {:ok, id, lease_token,
      [fencing_token: fencing_token] ++
-       retry_many_item_error_ref(item) ++ retry_many_item_partition_key(item)}
+       retry_many_item_error_ref(item) ++
+       retry_many_item_retry_policy(item) ++ retry_many_item_partition_key(item)}
   end
 
   defp retry_many_item_opts(
@@ -2875,7 +2953,8 @@ defmodule Ferricstore.Flow do
        when is_binary(id) do
     {:ok, id, lease_token,
      [fencing_token: fencing_token] ++
-       retry_many_item_error_ref(item) ++ retry_many_item_partition_key(item)}
+       retry_many_item_error_ref(item) ++
+       retry_many_item_retry_policy(item) ++ retry_many_item_partition_key(item)}
   end
 
   defp retry_many_item_opts({id, lease_token, item_opts})
@@ -3120,6 +3199,11 @@ defmodule Ferricstore.Flow do
   defp retry_many_item_error_ref(item) do
     []
     |> maybe_put_item_opt(:error_ref, item, :error_ref, "error_ref")
+  end
+
+  defp retry_many_item_retry_policy(item) do
+    []
+    |> maybe_put_item_opt(:retry, item, :retry, "retry")
   end
 
   defp retry_many_item_partition_key(item) do
