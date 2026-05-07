@@ -357,7 +357,7 @@ defmodule FerricStore do
   Creates a durable Flow record.
 
   Required option: `:type`.
-  Common options: `:state`, `:payload`, `:payload_ref`, `:run_at_ms`, `:priority`.
+  Common options: `:state`, `:payload`, `:run_at_ms`, `:priority`.
   When `:payload` is provided, Flow stores the value internally and returns a
   generated `:payload_ref`.
   """

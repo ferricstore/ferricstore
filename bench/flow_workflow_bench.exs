@@ -64,7 +64,7 @@ defmodule FlowWorkflowBench do
       state: state,
       attempts: attempts,
       next_run_at_ms: 1_000,
-      payload_ref: "payload:" <> id
+      payload: "payload:" <> id
     })
   end
 

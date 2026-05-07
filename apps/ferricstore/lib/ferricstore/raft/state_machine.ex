@@ -4369,7 +4369,7 @@ defmodule Ferricstore.Raft.StateMachine do
         end
 
       existing ->
-        flow_create_duplicate_result(existing, attrs)
+        flow_create_duplicate_result(state, existing, attrs)
     end
   end
 
@@ -4417,15 +4417,16 @@ defmodule Ferricstore.Raft.StateMachine do
     }
   end
 
-  defp flow_create_duplicate_result(existing, %{idempotent: true} = attrs) do
-    if flow_create_idempotent_match?(existing, attrs) do
+  defp flow_create_duplicate_result(state, existing, %{idempotent: true} = attrs) do
+    if flow_create_idempotent_match?(state, existing, attrs) do
       {:ok, existing}
     else
       {:error, "ERR flow idempotency conflict"}
     end
   end
 
-  defp flow_create_duplicate_result(_existing, _attrs), do: {:error, "ERR flow already exists"}
+  defp flow_create_duplicate_result(_state, _existing, _attrs),
+    do: {:error, "ERR flow already exists"}
 
   defp flow_value_ref(attrs, kind, id, version, partition_key, existing_ref \\ nil) do
     cond do
@@ -4444,7 +4445,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_value_ref_field(:result), do: :result_ref
   defp flow_value_ref_field(:error), do: :error_ref
 
-  defp flow_create_idempotent_match?(existing, attrs) do
+  defp flow_create_idempotent_match?(state, existing, attrs) do
     id = Map.fetch!(attrs, :id)
     partition_key = Map.get(attrs, :partition_key)
 
@@ -4462,8 +4463,24 @@ defmodule Ferricstore.Raft.StateMachine do
       history_max_events: Map.get(attrs, :history_max_events)
     }
 
-    Enum.all?(comparable_attrs, fn {key, value} -> Map.get(existing, key) == value end)
+    Enum.all?(comparable_attrs, fn {key, value} -> Map.get(existing, key) == value end) and
+      flow_create_idempotent_payload_match?(state, existing, attrs)
   end
+
+  defp flow_create_idempotent_payload_match?(state, existing, %{payload: payload}) do
+    case Map.get(existing, :payload_ref) do
+      ref when is_binary(ref) and ref != "" ->
+        case sm_store_batch_get(state, [ref], &sm_file_path/2) do
+          [stored] when is_binary(stored) -> stored == Flow.encode_value(payload)
+          _ -> false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp flow_create_idempotent_payload_match?(_state, _existing, _attrs), do: true
 
   defp flow_many_partitions_valid?(state, attrs_list) do
     with :ok <- flow_many_partition_keys_present?(attrs_list) do
@@ -4530,7 +4547,7 @@ defmodule Ferricstore.Raft.StateMachine do
           end
 
         existing ->
-          case flow_create_duplicate_result(existing, attrs) do
+          case flow_create_duplicate_result(state, existing, attrs) do
             {:ok, existing} -> {:cont, {:ok, [existing | acc], new_acc}}
             {:error, _reason} = error -> {:halt, error}
           end

@@ -6157,11 +6157,6 @@ fn flow_create_option<'a>(
         &[
             (b"TYPE", "type", FlowOptType::Binary),
             (b"STATE", "state", FlowOptType::Binary),
-            (
-                b"PAYLOAD_REF",
-                "payload_ref",
-                FlowOptType::Ref(b"payload_ref"),
-            ),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
             (
                 b"PARENT_FLOW_ID",
@@ -6415,7 +6410,6 @@ fn flow_terminal_option<'a>(
         idx,
         &[
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
-            (b"RESULT_REF", "result_ref", FlowOptType::Ref(b"result_ref")),
             (b"RESULT", "result", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),
@@ -6437,7 +6431,6 @@ fn flow_complete_many_option<'a>(
         arg_bytes,
         idx,
         &[
-            (b"RESULT_REF", "result_ref", FlowOptType::Ref(b"result_ref")),
             (b"RESULT", "result", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),
@@ -6481,7 +6474,6 @@ fn flow_retry_many_option<'a>(
         arg_bytes,
         idx,
         &[
-            (b"ERROR_REF", "error_ref", FlowOptType::Ref(b"error_ref")),
             (b"ERROR", "error", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
@@ -6503,7 +6495,6 @@ fn flow_fail_many_option<'a>(
         arg_bytes,
         idx,
         &[
-            (b"ERROR_REF", "error_ref", FlowOptType::Ref(b"error_ref")),
             (b"ERROR", "error", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),
@@ -6567,7 +6558,6 @@ fn flow_retry_option<'a>(
         &[
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
-            (b"ERROR_REF", "error_ref", FlowOptType::Ref(b"error_ref")),
             (b"ERROR", "error", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
@@ -6589,7 +6579,6 @@ fn flow_fail_option<'a>(
         idx,
         &[
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
-            (b"ERROR_REF", "error_ref", FlowOptType::Ref(b"error_ref")),
             (b"ERROR", "error", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),

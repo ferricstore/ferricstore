@@ -72,7 +72,7 @@ defmodule FlowApiBench do
             [
               type: type,
               state: "queued",
-              payload_ref: "payload:" <> id,
+              payload: "payload:" <> id,
               run_at_ms: 1_000,
               now_ms: 1_000
             ],
@@ -97,7 +97,7 @@ defmodule FlowApiBench do
           [
             type: type,
             state: "queued",
-            payload_ref: "payload:" <> id,
+            payload: "payload:" <> id,
             run_at_ms: 1_000,
             now_ms: 1_000
           ],
@@ -191,7 +191,7 @@ defmodule FlowApiBench do
         claimed.lease_token,
         maybe_partition(
           [
-            error_ref: "error:" <> claimed.id,
+            error: "error:" <> claimed.id,
             run_at_ms: 2_000,
             now_ms: 1_500
           ],

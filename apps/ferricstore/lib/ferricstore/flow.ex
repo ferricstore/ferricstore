@@ -2344,6 +2344,14 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp reject_public_value_ref_input(opts, ref_key, value_key) do
+    if Keyword.has_key?(opts, ref_key) do
+      {:error, "ERR flow #{ref_key} input is not supported; use #{value_key}"}
+    else
+      :ok
+    end
+  end
+
   defp validate_id(id) when is_binary(id) and id != "", do: :ok
   defp validate_id(_id), do: {:error, "ERR flow id must be a non-empty string"}
 
@@ -2390,11 +2398,10 @@ defmodule Ferricstore.Flow do
 
   defp create_attrs(id, opts) do
     with :ok <- validate_opts(opts),
+         :ok <- reject_public_value_ref_input(opts, :payload_ref, :payload),
          :ok <- validate_id(id),
          {:ok, type} <- required_binary(opts, :type),
          {:ok, state} <- optional_binary(opts, :state, @default_state),
-         {:ok, payload_ref} <- optional_binary_or_nil(opts, :payload_ref, nil),
-         :ok <- validate_ref_size(:payload_ref, payload_ref),
          {:ok, parent_flow_id} <- optional_binary_or_nil(opts, :parent_flow_id, nil),
          :ok <- validate_ref_size(:parent_flow_id, parent_flow_id),
          {:ok, root_flow_id} <- optional_binary_or_nil(opts, :root_flow_id, nil),
@@ -2415,7 +2422,7 @@ defmodule Ferricstore.Flow do
           id: id,
           type: type,
           state: state,
-          payload_ref: payload_ref,
+          payload_ref: nil,
           parent_flow_id: parent_flow_id,
           root_flow_id: root_flow_id,
           correlation_id: correlation_id,
@@ -2473,17 +2480,19 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp create_many_item_opts({:id, id, :payload_ref, payload_ref}) when is_binary(id) do
-    {:ok, id, [payload_ref: payload_ref]}
+  defp create_many_item_opts({:id, id, :payload_ref, _payload_ref}) when is_binary(id) do
+    {:error, "ERR flow payload_ref input is not supported; use payload"}
   end
 
   defp create_many_item_opts({:id, id, :payload, payload}) when is_binary(id) do
     {:ok, id, [payload: payload]}
   end
 
-  defp create_many_item_opts({:id, id, :partition_key, partition_key, :payload_ref, payload_ref})
+  defp create_many_item_opts(
+         {:id, id, :partition_key, _partition_key, :payload_ref, _payload_ref}
+       )
        when is_binary(id) do
-    {:ok, id, [partition_key: partition_key, payload_ref: payload_ref]}
+    {:error, "ERR flow payload_ref input is not supported; use payload"}
   end
 
   defp create_many_item_opts(_item), do: {:error, "ERR flow id must be a non-empty string"}
@@ -2531,6 +2540,7 @@ defmodule Ferricstore.Flow do
 
   defp retry_attrs(id, lease_token, opts) do
     with :ok <- validate_opts(opts),
+         :ok <- reject_public_value_ref_input(opts, :error_ref, :error),
          :ok <- validate_id(id),
          :ok <- validate_lease_token(lease_token),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
@@ -2538,15 +2548,13 @@ defmodule Ferricstore.Flow do
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms),
-         {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil),
-         :ok <- validate_ref_size(:error_ref, error_ref),
          {:ok, retry_policy} <- optional_retry_policy(opts) do
       attrs =
         %{
           id: id,
           lease_token: lease_token,
           fencing_token: fencing_token,
-          error_ref: error_ref,
+          error_ref: nil,
           partition_key: partition_key
         }
         |> maybe_put_flow_value(opts, :payload)
@@ -2561,22 +2569,21 @@ defmodule Ferricstore.Flow do
 
   defp complete_attrs(id, lease_token, opts) do
     with :ok <- validate_opts(opts),
+         :ok <- reject_public_value_ref_input(opts, :result_ref, :result),
          :ok <- validate_id(id),
          :ok <- validate_lease_token(lease_token),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
-         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-         {:ok, result_ref} <- optional_binary_or_nil(opts, :result_ref, nil),
-         :ok <- validate_ref_size(:result_ref, result_ref) do
+         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms) do
       attrs =
         %{
           id: id,
           lease_token: lease_token,
           fencing_token: fencing_token,
           ttl_ms: ttl_ms,
-          result_ref: result_ref,
+          result_ref: nil,
           partition_key: partition_key
         }
         |> maybe_put_flow_value(opts, :payload)
@@ -2612,22 +2619,21 @@ defmodule Ferricstore.Flow do
 
   defp fail_attrs(id, lease_token, opts) do
     with :ok <- validate_opts(opts),
+         :ok <- reject_public_value_ref_input(opts, :error_ref, :error),
          :ok <- validate_id(id),
          :ok <- validate_lease_token(lease_token),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
-         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-         {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil),
-         :ok <- validate_ref_size(:error_ref, error_ref) do
+         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms) do
       attrs =
         %{
           id: id,
           lease_token: lease_token,
           fencing_token: fencing_token,
           ttl_ms: ttl_ms,
-          error_ref: error_ref,
+          error_ref: nil,
           partition_key: partition_key
         }
         |> maybe_put_flow_value(opts, :payload)

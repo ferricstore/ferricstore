@@ -16,6 +16,36 @@ defmodule Ferricstore.Commands.FlowTest do
 
   defp uid(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"
 
+  test "rejects public Flow value ref inputs through Rust AST" do
+    assert {:error, "ERR syntax error"} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               ["ref-create", "TYPE", "checkout", "PAYLOAD_REF", "payload:external"],
+               MockStore.make()
+             )
+
+    assert {:error, "ERR syntax error"} =
+             Dispatcher.dispatch(
+               "FLOW.COMPLETE",
+               ["ref-complete", "lease", "FENCING", "1", "RESULT_REF", "result:external"],
+               MockStore.make()
+             )
+
+    assert {:error, "ERR syntax error"} =
+             Dispatcher.dispatch(
+               "FLOW.RETRY",
+               ["ref-retry", "lease", "FENCING", "1", "ERROR_REF", "error:external"],
+               MockStore.make()
+             )
+
+    assert {:error, "ERR syntax error"} =
+             Dispatcher.dispatch(
+               "FLOW.FAIL",
+               ["ref-fail", "lease", "FENCING", "1", "ERROR_REF", "error:external"],
+               MockStore.make()
+             )
+  end
+
   test "dispatches Flow create/get/list/history through Rust AST" do
     id = uid("flow-command")
 
@@ -529,7 +559,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert %{"id" => ^id, "state" => "completed", "result_ref" => "result:1"} =
+    assert %{"id" => ^id, "state" => "completed", "result_ref" => result_ref} =
              Dispatcher.dispatch(
                "FLOW.COMPLETE",
                [
@@ -537,11 +567,14 @@ defmodule Ferricstore.Commands.FlowTest do
                  lease_token,
                  "FENCING",
                  Integer.to_string(fencing_token),
-                 "RESULT_REF",
+                 "RESULT",
                  "result:1"
                ],
                MockStore.make()
              )
+
+    assert is_binary(result_ref)
+    assert result_ref != "result:1"
   end
 
   test "dispatches Flow complete_many through Rust AST" do
@@ -581,14 +614,14 @@ defmodule Ferricstore.Commands.FlowTest do
              )
 
     assert [
-             %{"id" => ^id_a, "state" => "completed", "result_ref" => "result:batch"},
-             %{"id" => ^id_b, "state" => "completed", "result_ref" => "result:batch"}
+             %{"id" => ^id_a, "state" => "completed", "result_ref" => result_ref_a},
+             %{"id" => ^id_b, "state" => "completed", "result_ref" => result_ref_b}
            ] =
              Dispatcher.dispatch(
                "FLOW.COMPLETE_MANY",
                [
                  partition,
-                 "RESULT_REF",
+                 "RESULT",
                  "result:batch",
                  "NOW",
                  "2000",
@@ -602,6 +635,11 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
+
+    assert is_binary(result_ref_a)
+    assert is_binary(result_ref_b)
+    assert result_ref_a != "result:batch"
+    assert result_ref_b != "result:batch"
   end
 
   test "dispatches Flow fail_many through Rust AST" do
@@ -641,14 +679,14 @@ defmodule Ferricstore.Commands.FlowTest do
              )
 
     assert [
-             %{"id" => ^id_a, "state" => "failed", "error_ref" => "error:batch"},
-             %{"id" => ^id_b, "state" => "failed", "error_ref" => "error:batch"}
+             %{"id" => ^id_a, "state" => "failed", "error_ref" => error_ref_a},
+             %{"id" => ^id_b, "state" => "failed", "error_ref" => error_ref_b}
            ] =
              Dispatcher.dispatch(
                "FLOW.FAIL_MANY",
                [
                  partition,
-                 "ERROR_REF",
+                 "ERROR",
                  "error:batch",
                  "NOW",
                  "2000",
@@ -662,6 +700,11 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
+
+    assert is_binary(error_ref_a)
+    assert is_binary(error_ref_b)
+    assert error_ref_a != "error:batch"
+    assert error_ref_b != "error:batch"
   end
 
   test "dispatches Flow retry_many through Rust AST" do
@@ -701,14 +744,14 @@ defmodule Ferricstore.Commands.FlowTest do
              )
 
     assert [
-             %{"id" => ^id_a, "state" => "queued", "error_ref" => "retry:batch"},
-             %{"id" => ^id_b, "state" => "queued", "error_ref" => "retry:batch"}
+             %{"id" => ^id_a, "state" => "queued", "error_ref" => error_ref_a},
+             %{"id" => ^id_b, "state" => "queued", "error_ref" => error_ref_b}
            ] =
              Dispatcher.dispatch(
                "FLOW.RETRY_MANY",
                [
                  partition,
-                 "ERROR_REF",
+                 "ERROR",
                  "retry:batch",
                  "RUN_AT",
                  "2000",
@@ -728,6 +771,11 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
+
+    assert is_binary(error_ref_a)
+    assert is_binary(error_ref_b)
+    assert error_ref_a != "retry:batch"
+    assert error_ref_b != "retry:batch"
   end
 
   test "dispatches Flow retry policy override through Rust AST" do

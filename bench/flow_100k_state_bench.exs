@@ -99,7 +99,7 @@ defmodule Flow100kStateBench do
           {:ok, flow} =
             FerricStore.flow_create(id(prefix, "create", i),
               type: type(prefix, "create"),
-              payload_ref: "payload:" <> id(prefix, "create", i),
+              payload: "payload:" <> id(prefix, "create", i),
               run_at_ms: 1_000,
               now_ms: 1_000,
               partition_key: partition(prefix, i, partition_count)
@@ -192,7 +192,7 @@ defmodule Flow100kStateBench do
         {:ok, _} =
           FerricStore.flow_create(id(prefix, "active", i),
             type: flow_type,
-            payload_ref: "payload:" <> id(prefix, "active", i),
+            payload: "payload:" <> id(prefix, "active", i),
             run_at_ms: 1_000,
             now_ms: 1_000,
             partition_key: partition(prefix, i, partition_count)
@@ -291,7 +291,7 @@ defmodule Flow100kStateBench do
         {:ok, _} =
           FerricStore.flow_create(id(prefix, "stuck", i),
             type: flow_type,
-            payload_ref: "payload:" <> id(prefix, "stuck", i),
+            payload: "payload:" <> id(prefix, "stuck", i),
             run_at_ms: 1_000,
             now_ms: 1_000,
             partition_key: partition(prefix, i, partition_count)
@@ -331,7 +331,7 @@ defmodule Flow100kStateBench do
           {:ok, _} =
             FerricStore.flow_create(id(prefix, "claim#{limit}", i),
               type: flow_type,
-              payload_ref: "payload:" <> id(prefix, "claim#{limit}", i),
+              payload: "payload:" <> id(prefix, "claim#{limit}", i),
               run_at_ms: 1_000,
               now_ms: 1_000,
               partition_key: partition(prefix, i, partition_count)
@@ -425,7 +425,7 @@ defmodule Flow100kStateBench do
       {:ok, completed} =
         FerricStore.flow_complete(flow.id, flow.lease_token,
           fencing_token: flow.fencing_token,
-          result_ref: "result:" <> flow.id,
+          result: "result:" <> flow.id,
           now_ms: 2_000,
           partition_key: partition(prefix, i, partition_count)
         )
@@ -449,7 +449,7 @@ defmodule Flow100kStateBench do
 
       {:ok, completed} =
         FerricStore.flow_complete_many(partition_key, items,
-          result_ref: "result:complete_many:#{i}",
+          result: "result:complete_many:#{i}",
           now_ms: 2_000
         )
 
@@ -466,7 +466,7 @@ defmodule Flow100kStateBench do
       {:ok, retried} =
         FerricStore.flow_retry(flow.id, flow.lease_token,
           fencing_token: flow.fencing_token,
-          error_ref: "error:" <> flow.id,
+          error: "error:" <> flow.id,
           run_at_ms: 3_000,
           now_ms: 2_000,
           partition_key: partition(prefix, i, partition_count)
@@ -491,7 +491,7 @@ defmodule Flow100kStateBench do
 
       {:ok, retried} =
         FerricStore.flow_retry_many(partition_key, items,
-          error_ref: "error:retry_many:#{i}",
+          error: "error:retry_many:#{i}",
           run_at_ms: 3_000,
           now_ms: 2_000
         )
@@ -509,7 +509,7 @@ defmodule Flow100kStateBench do
       {:ok, failed} =
         FerricStore.flow_fail(flow.id, flow.lease_token,
           fencing_token: flow.fencing_token,
-          error_ref: "error:" <> flow.id,
+          error: "error:" <> flow.id,
           now_ms: 2_000,
           partition_key: partition(prefix, i, partition_count)
         )
@@ -533,7 +533,7 @@ defmodule Flow100kStateBench do
 
       {:ok, failed} =
         FerricStore.flow_fail_many(partition_key, items,
-          error_ref: "error:fail_many:#{i}",
+          error: "error:fail_many:#{i}",
           now_ms: 2_000
         )
 
@@ -638,7 +638,7 @@ defmodule Flow100kStateBench do
     {:ok, flow} =
       FerricStore.flow_create(id(prefix, group, i),
         type: flow_type,
-        payload_ref: "payload:" <> id(prefix, group, i),
+        payload: "payload:" <> id(prefix, group, i),
         run_at_ms: 1_000,
         now_ms: 1_000,
         partition_key: partition(prefix, i, partition_count)
@@ -669,7 +669,7 @@ defmodule Flow100kStateBench do
     {:ok, completed} =
       FerricStore.flow_complete(claimed.id, claimed.lease_token,
         fencing_token: claimed.fencing_token,
-        result_ref: "result:" <> claimed.id,
+        result: "result:" <> claimed.id,
         now_ms: 2_000,
         partition_key: partition(prefix, i, partition_count)
       )
@@ -685,7 +685,7 @@ defmodule Flow100kStateBench do
         {:ok, _} =
           FerricStore.flow_create(id(prefix, group, i),
             type: flow_type,
-            payload_ref: "payload:" <> id(prefix, group, i),
+            payload: "payload:" <> id(prefix, group, i),
             run_at_ms: 1_000,
             now_ms: 1_000,
             partition_key: partition(prefix, i, partition_count)
@@ -716,7 +716,7 @@ defmodule Flow100kStateBench do
 
         items =
           for j <- 1..batch_size do
-            %{id: id(prefix, group, i, j), payload_ref: "payload:" <> id(prefix, group, i, j)}
+            %{id: id(prefix, group, i, j), payload: "payload:" <> id(prefix, group, i, j)}
           end
 
         {:ok, _flows} =

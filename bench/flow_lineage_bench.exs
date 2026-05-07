@@ -257,7 +257,7 @@ defmodule FlowLineageBench do
       {:ok, completed} =
         FerricStore.flow_complete(claimed.id, claimed.lease_token,
           fencing_token: claimed.fencing_token,
-          result_ref: "result:" <> claimed.id,
+          result: "result:" <> claimed.id,
           now_ms: 3_000,
           partition_key: flow.partition_key
         )
@@ -279,7 +279,7 @@ defmodule FlowLineageBench do
     {:ok, flow} =
       FerricStore.flow_create(id,
         type: type,
-        payload_ref: "payload:" <> id,
+        payload: "payload:" <> id,
         parent_flow_id: root,
         root_flow_id: root,
         correlation_id: correlation_id(prefix, namespace, root_index),

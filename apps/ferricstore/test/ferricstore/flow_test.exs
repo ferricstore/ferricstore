@@ -42,6 +42,12 @@ defmodule Ferricstore.FlowTest do
 
   defp uid(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"
 
+  defp encoded_value_size(value) do
+    value
+    |> Ferricstore.Flow.encode_value()
+    |> byte_size()
+  end
+
   defp shard_for(key) do
     Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), key)
   end
@@ -282,7 +288,7 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id,
                type: "checkout",
                state: "queued",
-               payload_ref: "payload:" <> id,
+               payload: "payload:" <> id,
                run_at_ms: 1_000
              )
 
@@ -291,7 +297,8 @@ defmodule Ferricstore.FlowTest do
     assert flow.state == "queued"
     assert flow.version == 1
     assert flow.fencing_token == 0
-    assert flow.payload_ref == "payload:" <> id
+    assert is_binary(flow.payload_ref)
+    assert flow.payload_ref != "payload:" <> id
 
     assert {:ok, fetched} = FerricStore.flow_get(id)
     assert fetched.id == id
@@ -303,16 +310,13 @@ defmodule Ferricstore.FlowTest do
 
   test "flow_get hydrates payload refs only when full or payload is requested" do
     id = uid("flow-get-payload")
-    payload_key = "payload:" <> id
     payload = "payload-body"
-
-    assert :ok = FerricStore.set(payload_key, payload)
 
     assert {:ok, _flow} =
              FerricStore.flow_create(id,
                type: "checkout",
                state: "queued",
-               payload_ref: payload_key,
+               payload: payload,
                run_at_ms: 1_000
              )
 
@@ -322,7 +326,7 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, fetched} = FerricStore.flow_get(id, full: true)
     assert fetched.payload == payload
-    assert fetched.payload_size == byte_size(payload)
+    assert fetched.payload_size == encoded_value_size(payload)
     refute Map.has_key?(fetched, :payload_omitted)
 
     assert {:ok, no_payload} = FerricStore.flow_get(id, payload: false)
@@ -331,23 +335,20 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, capped} = FerricStore.flow_get(id, full: true, payload_max_bytes: 4)
     assert capped.payload_omitted == true
-    assert capped.payload_size == byte_size(payload)
+    assert capped.payload_size == encoded_value_size(payload)
     refute Map.has_key?(capped, :payload)
   end
 
   test "flow_claim_due returns payload inline up to cap without rolling back missing payloads" do
     type = uid("claim-payload")
     id = uid("claim-payload-flow")
-    payload_key = "payload:" <> id
     payload = "worker-input"
-
-    assert :ok = FerricStore.set(payload_key, payload)
 
     assert {:ok, _flow} =
              FerricStore.flow_create(id,
                type: type,
                state: "queued",
-               payload_ref: payload_key,
+               payload: payload,
                run_at_ms: 1_000
              )
 
@@ -361,18 +362,19 @@ defmodule Ferricstore.FlowTest do
 
     assert claimed.id == id
     assert claimed.payload == payload
-    assert claimed.payload_size == byte_size(payload)
+    assert claimed.payload_size == encoded_value_size(payload)
 
     missing_id = uid("claim-missing-payload-flow")
-    missing_payload_key = "payload:" <> missing_id
 
-    assert {:ok, _flow} =
+    assert {:ok, missing_flow} =
              FerricStore.flow_create(missing_id,
                type: type,
                state: "queued",
-               payload_ref: missing_payload_key,
+               payload: "missing-worker-input",
                run_at_ms: 2_000
              )
+
+    assert {:ok, 1} = FerricStore.del(missing_flow.payload_ref)
 
     assert {:ok, [missing]} =
              FerricStore.flow_claim_due(type,
@@ -436,27 +438,26 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("flow-pipeline-payload-b")
     payload_a = "payload-a"
     payload_b = "payload-b"
-
-    assert :ok = FerricStore.set("payload:" <> id_a, payload_a)
-    assert :ok = FerricStore.set("payload:" <> id_b, payload_b)
+    payload_a_size = encoded_value_size(payload_a)
+    payload_b_size = encoded_value_size(payload_b)
 
     assert {:ok, _flow} =
              FerricStore.flow_create(id_a,
                type: "pipeline-payload",
-               payload_ref: "payload:" <> id_a,
+               payload: payload_a,
                run_at_ms: 1
              )
 
     assert {:ok, _flow} =
              FerricStore.flow_create(id_b,
                type: "pipeline-payload",
-               payload_ref: "payload:" <> id_b,
+               payload: payload_b,
                run_at_ms: 1
              )
 
     assert [
-             {:ok, %{id: ^id_a, payload: ^payload_a, payload_size: 9}},
-             {:ok, %{id: ^id_b, payload_omitted: true, payload_size: 9}},
+             {:ok, %{id: ^id_a, payload: ^payload_a, payload_size: ^payload_a_size}},
+             {:ok, %{id: ^id_b, payload_omitted: true, payload_size: ^payload_b_size}},
              {:ok, no_payload}
            ] =
              Ferricstore.Flow.pipeline_read_batch(ctx, [
@@ -476,7 +477,7 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id,
                type: "checkout",
                state: "queued",
-               payload_ref: "payload:" <> id,
+               payload: "payload:" <> id,
                run_at_ms: 1_000,
                now_ms: 10,
                idempotent: true
@@ -486,7 +487,7 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id,
                type: "checkout",
                state: "queued",
-               payload_ref: "payload:" <> id,
+               payload: "payload:" <> id,
                run_at_ms: 1_000,
                now_ms: 20,
                idempotent: true
@@ -503,7 +504,7 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id,
                type: "checkout",
                state: "queued",
-               payload_ref: "different:" <> id,
+               payload: "different:" <> id,
                run_at_ms: 1_000,
                idempotent: true
              )
@@ -690,8 +691,8 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create_many(
                partition,
                [
-                 %{id: id_a, payload_ref: "payload:" <> id_a},
-                 %{id: id_b, payload_ref: "payload:" <> id_b}
+                 %{id: id_a, payload: "payload:" <> id_a},
+                 %{id: id_b, payload: "payload:" <> id_b}
                ],
                type: type,
                run_at_ms: 1_000,
@@ -723,18 +724,21 @@ defmodule Ferricstore.FlowTest do
                partition,
                [
                  %{id: id_a},
-                 %{id: id_b, payload_ref: "payload:item", correlation_id: "corr:item"}
+                 %{id: id_b, payload: "payload:item", correlation_id: "corr:item"}
                ],
                type: type,
-               payload_ref: "payload:common",
+               payload: "payload:common",
                correlation_id: "corr:common",
                run_at_ms: 1_000,
                now_ms: 1_000
              )
 
-    assert flow_a.payload_ref == "payload:common"
+    assert is_binary(flow_a.payload_ref)
+    assert flow_a.payload_ref != "payload:common"
     assert flow_a.correlation_id == "corr:common"
-    assert flow_b.payload_ref == "payload:item"
+    assert is_binary(flow_b.payload_ref)
+    assert flow_b.payload_ref != "payload:item"
+    assert flow_b.payload_ref != flow_a.payload_ref
     assert flow_b.correlation_id == "corr:item"
   end
 
@@ -787,7 +791,7 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(existing_id,
                type: type,
                partition_key: partition,
-               payload_ref: "payload:" <> existing_id,
+               payload: "payload:" <> existing_id,
                run_at_ms: 1_000,
                now_ms: 1_000
              )
@@ -796,8 +800,8 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create_many(
                partition,
                [
-                 %{id: existing_id, payload_ref: "payload:" <> existing_id},
-                 %{id: new_id, payload_ref: "payload:" <> new_id}
+                 %{id: existing_id, payload: "payload:" <> existing_id},
+                 %{id: new_id, payload: "payload:" <> new_id}
                ],
                type: type,
                run_at_ms: 1_000,
@@ -827,7 +831,7 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(existing_id,
                type: type,
                partition_key: partition,
-               payload_ref: "payload:old",
+               payload: "payload:old",
                run_at_ms: 1_000
              )
 
@@ -835,8 +839,8 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create_many(
                partition,
                [
-                 %{id: existing_id, payload_ref: "payload:new"},
-                 %{id: new_id, payload_ref: "payload:" <> new_id}
+                 %{id: existing_id, payload: "payload:new"},
+                 %{id: new_id, payload: "payload:" <> new_id}
                ],
                type: type,
                run_at_ms: 1_000,
@@ -1027,16 +1031,19 @@ defmodule Ferricstore.FlowTest do
     assert {:error, "ERR key too large" <> _} =
              FerricStore.flow_create(large_id, type: "checkout")
 
+    assert {:error, "ERR flow payload_ref input is not supported; use payload"} =
+             FerricStore.flow_create("payload-ref-input", type: "checkout", payload_ref: "p")
+
+    assert {:error, "ERR flow result_ref input is not supported; use result"} =
+             FerricStore.flow_complete("flow", "token", fencing_token: 0, result_ref: "r")
+
+    assert {:error, "ERR flow error_ref input is not supported; use error"} =
+             FerricStore.flow_retry("flow", "token", fencing_token: 0, error_ref: "e")
+
+    assert {:error, "ERR flow error_ref input is not supported; use error"} =
+             FerricStore.flow_fail("flow", "token", fencing_token: 0, error_ref: "e")
+
     huge_ref = String.duplicate("p", 4_097)
-
-    assert {:error, "ERR flow payload_ref too large" <> _} =
-             FerricStore.flow_create("huge-payload-ref", type: "checkout", payload_ref: huge_ref)
-
-    assert {:error, "ERR flow result_ref too large" <> _} =
-             FerricStore.flow_complete("flow", "token", fencing_token: 0, result_ref: huge_ref)
-
-    assert {:error, "ERR flow error_ref too large" <> _} =
-             FerricStore.flow_retry("flow", "token", fencing_token: 0, error_ref: huge_ref)
 
     assert {:error, "ERR flow reason_ref too large" <> _} =
              FerricStore.flow_cancel("flow", fencing_token: 0, reason_ref: huge_ref)
@@ -1052,7 +1059,7 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id,
                type: "email",
                state: "queued",
-               payload_ref: "payload:" <> id,
+               payload: "payload:" <> id,
                run_at_ms: 1_000
              )
 
@@ -1091,7 +1098,7 @@ defmodule Ferricstore.FlowTest do
                FerricStore.flow_create(id,
                  type: type,
                  state: "queued",
-                 payload_ref: "payload:" <> id,
+                 payload: "payload:" <> id,
                  run_at_ms: 1_000,
                  now_ms: 1_000
                )
@@ -1674,23 +1681,24 @@ defmodule Ferricstore.FlowTest do
     assert {:error, "ERR stale flow lease"} =
              FerricStore.flow_complete(id, "wrong-token",
                fencing_token: claimed.fencing_token,
-               result_ref: "result:" <> id
+               result: "result:" <> id
              )
 
     assert {:error, "ERR stale flow lease"} =
              FerricStore.flow_complete(id, claimed.lease_token,
                fencing_token: claimed.fencing_token + 1,
-               result_ref: "result:" <> id
+               result: "result:" <> id
              )
 
     assert {:ok, completed} =
              FerricStore.flow_complete(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
-               result_ref: "result:" <> id
+               result: "result:" <> id
              )
 
     assert completed.state == "completed"
-    assert completed.result_ref == "result:" <> id
+    assert is_binary(completed.result_ref)
+    assert completed.result_ref != "result:" <> id
     assert completed.lease_token == nil
     assert completed.version == 3
   end
@@ -1713,20 +1721,21 @@ defmodule Ferricstore.FlowTest do
     assert {:error, "ERR stale flow lease"} =
              FerricStore.flow_retry(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token + 1,
-               error_ref: "error:" <> id,
+               error: "error:" <> id,
                run_at_ms: 2_000
              )
 
     assert {:ok, retried} =
              FerricStore.flow_retry(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
-               error_ref: "error:" <> id,
+               error: "error:" <> id,
                run_at_ms: 2_000
              )
 
     assert retried.state == "queued"
     assert retried.attempts == 1
-    assert retried.error_ref == "error:" <> id
+    assert is_binary(retried.error_ref)
+    assert retried.error_ref != "error:" <> id
     assert retried.lease_token == nil
 
     assert {:ok, [reclaimed]} =
@@ -2300,7 +2309,7 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, retried} =
              FerricStore.flow_retry_many(partition, items,
-               error_ref: "retry-error",
+               error: "retry-error",
                run_at_ms: 2_000,
                now_ms: 2_000
              )
@@ -2308,7 +2317,7 @@ defmodule Ferricstore.FlowTest do
     assert Enum.map(retried, & &1.id) == Enum.map(items, & &1.id)
     assert Enum.all?(retried, &(&1.state == "queued"))
     assert Enum.all?(retried, &(&1.attempts == 1))
-    assert Enum.all?(retried, &(&1.error_ref == "retry-error"))
+    assert Enum.all?(retried, &(is_binary(&1.error_ref) and &1.error_ref != "retry-error"))
 
     assert {:ok, reclaimed} =
              FerricStore.flow_claim_due(type,
@@ -2806,13 +2815,13 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, completed} =
              FerricStore.flow_complete_many(partition, items,
-               result_ref: "result-batch",
+               result: "result-batch",
                now_ms: 2_000
              )
 
     assert Enum.map(completed, & &1.id) == Enum.map(items, & &1.id)
     assert Enum.all?(completed, &(&1.state == "completed"))
-    assert Enum.all?(completed, &(&1.result_ref == "result-batch"))
+    assert Enum.all?(completed, &(is_binary(&1.result_ref) and &1.result_ref != "result-batch"))
 
     assert {:ok, info} = FerricStore.flow_info(type, partition_key: partition)
     assert info.completed == 2
@@ -2946,13 +2955,13 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, failed} =
              FerricStore.flow_fail_many(partition, items,
-               error_ref: "error-batch",
+               error: "error-batch",
                now_ms: 2_000
              )
 
     assert Enum.map(failed, & &1.id) == Enum.map(items, & &1.id)
     assert Enum.all?(failed, &(&1.state == "failed"))
-    assert Enum.all?(failed, &(&1.error_ref == "error-batch"))
+    assert Enum.all?(failed, &(is_binary(&1.error_ref) and &1.error_ref != "error-batch"))
 
     assert {:ok, info} = FerricStore.flow_info(type, partition_key: partition)
     assert info.failed == 2
@@ -3299,19 +3308,20 @@ defmodule Ferricstore.FlowTest do
     assert {:error, "ERR stale flow lease"} =
              FerricStore.flow_fail(fail_id, claimed.lease_token,
                fencing_token: claimed.fencing_token + 1,
-               error_ref: "error:" <> fail_id,
+               error: "error:" <> fail_id,
                now_ms: 1_500
              )
 
     assert {:ok, failed} =
              FerricStore.flow_fail(fail_id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
-               error_ref: "error:" <> fail_id,
+               error: "error:" <> fail_id,
                now_ms: 1_500
              )
 
     assert failed.state == "failed"
-    assert failed.error_ref == "error:" <> fail_id
+    assert is_binary(failed.error_ref)
+    assert failed.error_ref != "error:" <> fail_id
     assert failed.lease_token == nil
     assert failed.next_run_at_ms == nil
 

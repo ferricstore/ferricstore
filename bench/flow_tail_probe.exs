@@ -123,7 +123,7 @@ defmodule FlowTailProbe do
         FerricStore.flow_create(flow_id,
           type: create_type,
           state: "queued",
-          payload_ref: "payload:" <> flow_id,
+          payload: "payload:" <> flow_id,
           run_at_ms: 1_000,
           now_ms: 1_000,
           partition_key: partition(prefix, i, partition_count)
@@ -198,7 +198,7 @@ defmodule FlowTailProbe do
       {:ok, flow} =
         FerricStore.flow_complete(flow_id, lease_token,
           fencing_token: fencing_token,
-          result_ref: "result:" <> flow_id,
+          result: "result:" <> flow_id,
           now_ms: 2_000,
           partition_key: partition_key
         )
@@ -214,7 +214,7 @@ defmodule FlowTailProbe do
       {:ok, flow} =
         FerricStore.flow_fail(flow_id, lease_token,
           fencing_token: fencing_token,
-          error_ref: "error:" <> flow_id,
+          error: "error:" <> flow_id,
           now_ms: 2_000,
           partition_key: partition_key
         )
@@ -462,7 +462,7 @@ defmodule FlowTailProbe do
         {:ok, _} =
           FerricStore.flow_create(id(prefix, "active", i),
             type: flow_type,
-            payload_ref: "payload:" <> id(prefix, "active", i),
+            payload: "payload:" <> id(prefix, "active", i),
             run_at_ms: 1_000,
             now_ms: 1_000,
             partition_key: partition(prefix, i, partition_count)
@@ -491,7 +491,7 @@ defmodule FlowTailProbe do
           {:ok, _} =
             FerricStore.flow_create(id(prefix, "claim", i),
               type: flow_type,
-              payload_ref: "payload:" <> id(prefix, "claim", i),
+              payload: "payload:" <> id(prefix, "claim", i),
               run_at_ms: 1_000,
               now_ms: 1_000,
               partition_key: partition(prefix, i, partition_count)
@@ -525,7 +525,7 @@ defmodule FlowTailProbe do
       {:ok, _} =
         FerricStore.flow_create(flow_id,
           type: flow_type,
-          payload_ref: "payload:" <> flow_id,
+          payload: "payload:" <> flow_id,
           run_at_ms: 1_000,
           now_ms: 1_000,
           partition_key: partition_key
@@ -554,7 +554,7 @@ defmodule FlowTailProbe do
       {:ok, _} =
         FerricStore.flow_create(flow_id,
           type: flow_type,
-          payload_ref: "payload:" <> flow_id,
+          payload: "payload:" <> flow_id,
           run_at_ms: 1_000,
           now_ms: 1_000,
           partition_key: partition_key
@@ -577,7 +577,7 @@ defmodule FlowTailProbe do
           {:ok, _} =
             FerricStore.flow_create(flow_id,
               type: flow_type,
-              payload_ref: "payload:" <> flow_id,
+              payload: "payload:" <> flow_id,
               run_at_ms: 1_000,
               now_ms: 1_000,
               partition_key: partition_key
