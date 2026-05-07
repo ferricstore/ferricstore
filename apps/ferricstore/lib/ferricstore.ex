@@ -409,6 +409,36 @@ defmodule FerricStore do
   def flow_get(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
+  Stores retry/backpressure policy defaults for a Flow type.
+
+  Command-local retry policy still wins over these defaults.
+  """
+  @spec flow_policy_set(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_policy_set(type, opts) when is_binary(type) and is_list(opts) do
+    Ferricstore.Flow.policy_set(default_ctx(), type, opts)
+  end
+
+  def flow_policy_set(type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def flow_policy_set(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc """
+  Returns effective retry/backpressure policy for a Flow type or state.
+  """
+  @spec flow_policy_get(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_policy_get(type, opts \\ [])
+
+  def flow_policy_get(type, opts) when is_binary(type) and is_list(opts) do
+    Ferricstore.Flow.policy_get(default_ctx(), type, opts)
+  end
+
+  def flow_policy_get(type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def flow_policy_get(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc """
   Claims due Flow records for a type.
 
   Required option: `:worker`.

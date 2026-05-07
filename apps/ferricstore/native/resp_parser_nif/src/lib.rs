@@ -1562,6 +1562,8 @@ enum CommandAstKind {
     FlowCreate,
     FlowCreateMany,
     FlowGet,
+    FlowPolicySet,
+    FlowPolicyGet,
     FlowClaimDue,
     FlowReclaim,
     FlowComplete,
@@ -1805,6 +1807,8 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"FLOW.CREATE" => CommandAstKind::FlowCreate,
         b"FLOW.CREATE_MANY" => CommandAstKind::FlowCreateMany,
         b"FLOW.GET" => CommandAstKind::FlowGet,
+        b"FLOW.POLICY.SET" => CommandAstKind::FlowPolicySet,
+        b"FLOW.POLICY.GET" => CommandAstKind::FlowPolicyGet,
         b"FLOW.CLAIM_DUE" => CommandAstKind::FlowClaimDue,
         b"FLOW.RECLAIM" => CommandAstKind::FlowReclaim,
         b"FLOW.COMPLETE" => CommandAstKind::FlowComplete,
@@ -2245,6 +2249,8 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowCreate => make_flow_create_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCreateMany => make_flow_create_many_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowGet => make_flow_get_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowPolicySet => make_flow_policy_set_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowPolicyGet => make_flow_policy_get_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowClaimDue => make_flow_claim_due_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowReclaim => make_flow_reclaim_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowComplete => make_flow_complete_command_ast(env, args, arg_bytes),
@@ -5215,6 +5221,38 @@ fn make_flow_get_command_ast<'a>(env: Env<'a>, args: &[Term<'a>], arg_bytes: &[&
     }
 }
 
+fn make_flow_policy_set_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_policy_set");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.policy.set")).encode(env);
+    }
+
+    match parse_flow_policy_set_options(env, args, arg_bytes, 1) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
+fn make_flow_policy_get_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_policy_get");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.policy.get")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_policy_get_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
 fn make_flow_claim_due_command_ast<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -6068,6 +6106,194 @@ fn flow_create_option<'a>(
             ),
             (b"IDEMPOTENT", "idempotent", FlowOptType::Boolean),
         ],
+    )
+}
+
+fn parse_flow_policy_set_options<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    start: usize,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    let mut opts = Vec::new();
+    let mut retry_opts = Vec::new();
+    let mut backoff_opts = Vec::new();
+    let mut states = Vec::new();
+    let mut idx = start;
+
+    while idx < args.len() {
+        if ascii_eq_ignore_case(arg_bytes[idx], b"STATE") {
+            if idx + 1 >= args.len() {
+                return Err(generic_ast_error(env, b"ERR syntax error"));
+            }
+
+            let mut end = idx + 2;
+            while end < args.len() {
+                if ascii_eq_ignore_case(arg_bytes[end], b"STATE") {
+                    break;
+                }
+                if end + 1 >= args.len() {
+                    return Err(generic_ast_error(env, b"ERR syntax error"));
+                }
+                end += 2;
+            }
+
+            let state_retry = parse_flow_policy_retry_options(env, args, arg_bytes, idx + 2, end)?;
+            states.push(
+                (
+                    args[idx + 1],
+                    vec![(atom(env, "retry"), state_retry).encode(env)],
+                )
+                    .encode(env),
+            );
+            idx = end;
+            continue;
+        }
+
+        let (term, is_backoff) = flow_policy_retry_option(env, args, arg_bytes, idx)?;
+        if is_backoff {
+            backoff_opts.push(term);
+        } else {
+            retry_opts.push(term);
+        }
+        idx += 2;
+    }
+
+    if !backoff_opts.is_empty() {
+        retry_opts.push((atom(env, "backoff"), backoff_opts).encode(env));
+    }
+
+    if !retry_opts.is_empty() {
+        opts.push((atom(env, "retry"), retry_opts).encode(env));
+    }
+
+    if !states.is_empty() {
+        opts.push((atom(env, "states"), states).encode(env));
+    }
+
+    Ok(opts)
+}
+
+fn parse_flow_policy_retry_options<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    start: usize,
+    end: usize,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    if (end - start) % 2 != 0 {
+        return Err(generic_ast_error(env, b"ERR syntax error"));
+    }
+
+    let mut retry_opts = Vec::new();
+    let mut backoff_opts = Vec::new();
+    let mut idx = start;
+
+    while idx < end {
+        let (term, is_backoff) = flow_policy_retry_option(env, args, arg_bytes, idx)?;
+        if is_backoff {
+            backoff_opts.push(term);
+        } else {
+            retry_opts.push(term);
+        }
+        idx += 2;
+    }
+
+    if !backoff_opts.is_empty() {
+        retry_opts.push((atom(env, "backoff"), backoff_opts).encode(env));
+    }
+
+    Ok(retry_opts)
+}
+
+fn flow_policy_retry_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<(Term<'a>, bool), Term<'a>> {
+    if idx + 1 >= args.len() {
+        return Err(generic_ast_error(env, b"ERR syntax error"));
+    }
+
+    if ascii_eq_ignore_case(arg_bytes[idx], b"MAX_ATTEMPTS") {
+        match parse_int_bytes(arg_bytes[idx + 1]) {
+            Some(value) if value >= 0 => {
+                Ok(((atom(env, "max_attempts"), value).encode(env), false))
+            }
+            _ => Err(generic_ast_error(
+                env,
+                b"ERR value is not an integer or out of range",
+            )),
+        }
+    } else if ascii_eq_ignore_case(arg_bytes[idx], b"BACKOFF") {
+        match parse_flow_policy_backoff_kind(env, arg_bytes[idx + 1]) {
+            Ok(kind) => Ok(((atom(env, "kind"), kind).encode(env), true)),
+            Err(err) => Err(err),
+        }
+    } else if ascii_eq_ignore_case(arg_bytes[idx], b"BASE_MS") {
+        match parse_int_bytes(arg_bytes[idx + 1]) {
+            Some(value) if value >= 0 => Ok(((atom(env, "base_ms"), value).encode(env), true)),
+            _ => Err(generic_ast_error(
+                env,
+                b"ERR value is not an integer or out of range",
+            )),
+        }
+    } else if ascii_eq_ignore_case(arg_bytes[idx], b"MAX_MS") {
+        match parse_int_bytes(arg_bytes[idx + 1]) {
+            Some(value) if value >= 0 => Ok(((atom(env, "max_ms"), value).encode(env), true)),
+            _ => Err(generic_ast_error(
+                env,
+                b"ERR value is not an integer or out of range",
+            )),
+        }
+    } else if ascii_eq_ignore_case(arg_bytes[idx], b"JITTER_PCT") {
+        match parse_int_bytes(arg_bytes[idx + 1]) {
+            Some(value) if value >= 0 => Ok(((atom(env, "jitter_pct"), value).encode(env), true)),
+            _ => Err(generic_ast_error(
+                env,
+                b"ERR value is not an integer or out of range",
+            )),
+        }
+    } else if ascii_eq_ignore_case(arg_bytes[idx], b"EXHAUSTED_TO") {
+        Ok((
+            (atom(env, "exhausted_to"), args[idx + 1]).encode(env),
+            false,
+        ))
+    } else {
+        Err(generic_ast_error(env, b"ERR syntax error"))
+    }
+}
+
+fn parse_flow_policy_backoff_kind<'a>(env: Env<'a>, value: &[u8]) -> Result<Atom, Term<'a>> {
+    if ascii_eq_ignore_case(value, b"NONE") {
+        Ok(atom(env, "none"))
+    } else if ascii_eq_ignore_case(value, b"FIXED") {
+        Ok(atom(env, "fixed"))
+    } else if ascii_eq_ignore_case(value, b"LINEAR") {
+        Ok(atom(env, "linear"))
+    } else if ascii_eq_ignore_case(value, b"EXPONENTIAL") {
+        Ok(atom(env, "exponential"))
+    } else {
+        Err(generic_ast_error(
+            env,
+            b"ERR flow retry backoff kind must be none, fixed, linear, or exponential",
+        ))
+    }
+}
+
+fn flow_policy_get_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[(b"STATE", "state", FlowOptType::Binary)],
     )
 }
 

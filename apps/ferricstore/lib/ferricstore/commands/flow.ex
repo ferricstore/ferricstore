@@ -30,6 +30,16 @@ defmodule Ferricstore.Commands.Flow do
     FerricStore.flow_get(id, opts) |> normalize_result()
   end
 
+  def handle_ast({:flow_policy_set, type, opts}, _store)
+      when is_binary(type) and is_list(opts) do
+    FerricStore.flow_policy_set(type, opts) |> normalize_result()
+  end
+
+  def handle_ast({:flow_policy_get, type, opts}, _store)
+      when is_binary(type) and is_list(opts) do
+    FerricStore.flow_policy_get(type, opts) |> normalize_result()
+  end
+
   def handle_ast({:flow_claim_due, type, opts}, _store) when is_binary(type) and is_list(opts) do
     FerricStore.flow_claim_due(type, opts) |> normalize_result()
   end

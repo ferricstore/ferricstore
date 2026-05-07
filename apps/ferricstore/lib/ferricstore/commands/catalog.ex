@@ -349,6 +349,24 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Returns a workflow record."
     },
     %{
+      name: "flow.policy_set",
+      arity: -2,
+      flags: ["write"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Configures default and state retry policies for a workflow type."
+    },
+    %{
+      name: "flow.policy_get",
+      arity: -2,
+      flags: ["readonly", "fast"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Returns effective retry policy for a workflow type or state."
+    },
+    %{
       name: "flow.claim_due",
       arity: -4,
       flags: ["write"],

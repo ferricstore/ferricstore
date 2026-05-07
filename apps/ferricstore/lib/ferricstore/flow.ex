@@ -119,6 +119,39 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  def policy_set(ctx, type, opts) when is_binary(type) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_type(type),
+         :ok <- validate_key_size(__MODULE__.Keys.policy_key(type)),
+         {:ok, policy} <- RetryPolicy.normalize_flow_policy(type, opts) do
+      case Router.put(
+             ctx,
+             __MODULE__.Keys.policy_key(type),
+             RetryPolicy.encode_flow_policy(policy),
+             0
+           ) do
+        :ok -> {:ok, policy_response(type, policy, Keyword.get(opts, :state))}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  def policy_set(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  def policy_get(ctx, type, opts \\ [])
+
+  def policy_get(ctx, type, opts) when is_binary(type) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_type(type),
+         {:ok, state} <- optional_binary_or_nil(opts, :state, nil),
+         :ok <- validate_key_size(__MODULE__.Keys.policy_key(type)),
+         {:ok, policy} <- flow_policy_read(ctx, type) do
+      {:ok, policy_response(type, policy, state)}
+    end
+  end
+
+  def policy_get(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
   def claim_due(ctx, type, opts) when is_binary(type) and is_list(opts) do
     started = flow_start_time()
     result = claim_due_result(ctx, type, opts)
@@ -2350,18 +2383,18 @@ defmodule Ferricstore.Flow do
          {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms),
          {:ok, error_ref} <- optional_binary_or_nil(opts, :error_ref, nil),
          :ok <- validate_ref_size(:error_ref, error_ref),
-         {:ok, retry_policy} <- RetryPolicy.normalize(Keyword.get(opts, :retry)) do
+         {:ok, retry_policy} <- optional_retry_policy(opts) do
       attrs =
         %{
           id: id,
           lease_token: lease_token,
           fencing_token: fencing_token,
           error_ref: error_ref,
-          retry_policy: retry_policy,
           partition_key: partition_key
         }
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:run_at_ms, run_at_ms)
+        |> maybe_put_attr(:retry_policy, retry_policy)
 
       {:ok, attrs}
     end
@@ -3459,6 +3492,16 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp optional_retry_policy(opts) do
+    if Keyword.has_key?(opts, :retry) do
+      opts
+      |> Keyword.get(:retry)
+      |> RetryPolicy.normalize_override()
+    else
+      {:ok, nil}
+    end
+  end
+
   defp optional_history_max_events(opts) do
     case Keyword.get(opts, :history_max_events, flow_default_history_max_events()) do
       nil ->
@@ -3554,6 +3597,39 @@ defmodule Ferricstore.Flow do
   defp maybe_put_attr(attrs, _key, nil), do: attrs
   defp maybe_put_attr(attrs, key, value), do: Map.put(attrs, key, value)
 
+  defp flow_policy_read(ctx, type) do
+    case Router.get(ctx, __MODULE__.Keys.policy_key(type)) do
+      nil ->
+        {:ok, nil}
+
+      value when is_binary(value) ->
+        case RetryPolicy.decode_flow_policy(value) do
+          {:ok, policy} -> {:ok, policy}
+          :error -> {:error, "ERR flow policy is corrupt"}
+        end
+
+      _other ->
+        {:error, "ERR flow policy is corrupt"}
+    end
+  end
+
+  defp policy_response(type, policy, nil) do
+    states = Map.get(policy || %{}, :states, %{})
+
+    %{
+      type: type,
+      retry: RetryPolicy.resolve(policy, nil, nil),
+      states:
+        Map.new(states, fn {state, _state_policy} ->
+          {state, %{retry: RetryPolicy.resolve(policy, state, nil)}}
+        end)
+    }
+  end
+
+  defp policy_response(type, policy, state) when is_binary(state) do
+    %{type: type, state: state, retry: RetryPolicy.resolve(policy, state, nil)}
+  end
+
   defp now_ms, do: CommandTime.now_ms()
 
   defmodule Keys do
@@ -3568,6 +3644,10 @@ defmodule Ferricstore.Flow do
 
     def history_key(id, partition_key \\ nil) do
       "f:" <> tag(partition_key) <> ":h:" <> id
+    end
+
+    def policy_key(type) do
+      "f:" <> @global_tag <> ":policy:" <> type
     end
 
     def due_key(type, state, priority, partition_key \\ nil) do

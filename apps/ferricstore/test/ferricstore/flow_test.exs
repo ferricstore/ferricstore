@@ -1856,6 +1856,107 @@ defmodule Ferricstore.FlowTest do
              )
   end
 
+  test "flow policy exposes type and state retry defaults" do
+    type = uid("flow-policy")
+
+    assert {:ok, policy} =
+             FerricStore.flow_policy_set(type,
+               retry: [
+                 max_attempts: 5,
+                 backoff: [kind: :fixed, base_ms: 10_000, max_ms: 30_000, jitter_pct: 0],
+                 exhausted_to: "failed"
+               ],
+               states: %{
+                 "charge_card" => [
+                   retry: [
+                     max_attempts: 2,
+                     exhausted_to: "payment_failed"
+                   ]
+                 ]
+               }
+             )
+
+    assert policy.retry.max_attempts == 5
+    assert policy.states["charge_card"].retry.max_attempts == 2
+    assert policy.states["charge_card"].retry.backoff.kind == :fixed
+    assert policy.states["charge_card"].retry.exhausted_to == "payment_failed"
+
+    assert {:ok, state_policy} = FerricStore.flow_policy_get(type, state: "charge_card")
+    assert state_policy.retry.max_attempts == 2
+    assert state_policy.retry.backoff.base_ms == 10_000
+    assert state_policy.retry.exhausted_to == "payment_failed"
+  end
+
+  test "stored state retry policy drives retry exhaustion without command override" do
+    type = uid("flow-policy-state-exhaust")
+    id = uid("flow-policy-state-exhaust-id")
+
+    assert {:ok, _policy} =
+             FerricStore.flow_policy_set(type,
+               retry: [max_attempts: 10, exhausted_to: "failed"],
+               states: %{
+                 "charge_card" => [retry: [max_attempts: 0, exhausted_to: "payment_failed"]]
+               }
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id, type: type, state: "charge_card", run_at_ms: 1_000)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               state: "charge_card",
+               worker: "worker-policy",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, exhausted} =
+             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert exhausted.state == "payment_failed"
+    assert exhausted.next_run_at_ms == 2_000
+  end
+
+  test "command retry policy overrides stored state policy" do
+    type = uid("flow-policy-command-override")
+    id = uid("flow-policy-command-override-id")
+
+    assert {:ok, _policy} =
+             FerricStore.flow_policy_set(type,
+               states: %{
+                 "charge_card" => [retry: [max_attempts: 0, exhausted_to: "payment_failed"]]
+               }
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id, type: type, state: "charge_card", run_at_ms: 1_000)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               state: "charge_card",
+               worker: "worker-policy-override",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, retried} =
+             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000,
+               retry: [
+                 max_attempts: 3,
+                 backoff: [kind: :fixed, base_ms: 5_000, max_ms: 5_000, jitter_pct: 0],
+                 exhausted_to: "needs_review"
+               ]
+             )
+
+    assert retried.state == "charge_card"
+    assert retried.next_run_at_ms == 7_000
+  end
+
   test "flow retry policy accepts thirty day backoff cap" do
     assert {:ok, policy} =
              Ferricstore.Flow.RetryPolicy.normalize(

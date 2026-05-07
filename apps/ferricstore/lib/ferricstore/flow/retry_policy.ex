@@ -24,6 +24,82 @@ defmodule Ferricstore.Flow.RetryPolicy do
   @spec default() :: t()
   def default, do: @default
 
+  @spec normalize_flow_policy(binary(), term()) :: {:ok, map()} | {:error, binary()}
+  def normalize_flow_policy(type, opts) when is_binary(type) and is_list(opts) do
+    if Keyword.keyword?(opts) do
+      normalize_flow_policy(type, Map.new(opts))
+    else
+      {:error, "ERR flow opts must be a keyword list"}
+    end
+  end
+
+  def normalize_flow_policy(type, attrs) when is_binary(type) and is_map(attrs) do
+    with {:ok, retry} <- optional_retry_override(attrs),
+         {:ok, states} <- normalize_state_policies(fetch_policy(attrs, :states, "states", %{})) do
+      policy =
+        %{type: type, retry: retry, states: states}
+        |> drop_nil_retry()
+
+      {:ok, policy}
+    end
+  end
+
+  def normalize_flow_policy(_type, _attrs),
+    do: {:error, "ERR flow policy must be a map or keyword list"}
+
+  @spec normalize_override(term()) :: {:ok, map() | nil} | {:error, binary()}
+  def normalize_override(nil), do: {:ok, nil}
+
+  def normalize_override(policy) when is_list(policy) do
+    if Keyword.keyword?(policy) do
+      policy |> Map.new() |> normalize_override()
+    else
+      {:error, "ERR flow retry policy must be a map or keyword list"}
+    end
+  end
+
+  def normalize_override(policy) when is_map(policy) do
+    with {:ok, max_attempts} <- optional_max_attempts(policy),
+         {:ok, backoff} <- optional_backoff(policy),
+         {:ok, exhausted_to} <- optional_exhausted_to(policy) do
+      override =
+        %{}
+        |> maybe_put(:max_attempts, max_attempts)
+        |> maybe_put(:backoff, backoff)
+        |> maybe_put(:exhausted_to, exhausted_to)
+
+      {:ok, override}
+    end
+  end
+
+  def normalize_override(_policy),
+    do: {:error, "ERR flow retry policy must be a map or keyword list"}
+
+  @spec resolve(map() | nil, binary(), map() | nil) :: t()
+  def resolve(flow_policy, state, command_override) do
+    default()
+    |> merge_retry(policy_retry(flow_policy))
+    |> merge_retry(state_retry(flow_policy, state))
+    |> merge_retry(command_override)
+  end
+
+  @spec encode_flow_policy(map()) :: binary()
+  def encode_flow_policy(policy) when is_map(policy) do
+    :erlang.term_to_binary({:flow_policy_v1, policy})
+  end
+
+  @spec decode_flow_policy(binary()) :: {:ok, map()} | :error
+  def decode_flow_policy(value) when is_binary(value) do
+    case :erlang.binary_to_term(value, [:safe]) do
+      {:flow_policy_v1, policy} when is_map(policy) -> {:ok, policy}
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  def decode_flow_policy(_value), do: :error
+
   @spec normalize(term()) :: {:ok, t()} | {:error, binary()}
   def normalize(nil), do: {:ok, default()}
 
@@ -64,10 +140,32 @@ defmodule Ferricstore.Flow.RetryPolicy do
   defp normalize_max_attempts(policy) do
     value = fetch_policy(policy, :max_attempts, "max_attempts", @default.max_attempts)
 
+    validate_max_attempts(value)
+  end
+
+  defp optional_max_attempts(policy) do
+    if has_policy_key?(policy, :max_attempts, "max_attempts") do
+      policy
+      |> fetch_policy(:max_attempts, "max_attempts", nil)
+      |> validate_max_attempts()
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp validate_max_attempts(value) do
     if is_integer(value) and value >= 0 and value <= @max_attempts do
       {:ok, value}
     else
       {:error, "ERR flow retry max_attempts must be between 0 and #{@max_attempts}"}
+    end
+  end
+
+  defp optional_backoff(policy) do
+    if has_policy_key?(policy, :backoff, "backoff") do
+      normalize_backoff(policy)
+    else
+      {:ok, nil}
     end
   end
 
@@ -141,6 +239,107 @@ defmodule Ferricstore.Flow.RetryPolicy do
     end
   end
 
+  defp optional_exhausted_to(policy) do
+    if has_policy_key?(policy, :exhausted_to, "exhausted_to") do
+      normalize_exhausted_to(policy)
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp optional_retry_override(attrs) do
+    if has_policy_key?(attrs, :retry, "retry") do
+      attrs
+      |> fetch_policy(:retry, "retry", nil)
+      |> normalize_override()
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp normalize_state_policies(states) when is_map(states) do
+    Enum.reduce_while(states, {:ok, %{}}, fn {state, policy}, {:ok, acc} ->
+      with {:ok, state} <- normalize_state_name(state),
+           {:ok, retry} <- optional_retry_override(policy_map(policy)) do
+        {:cont, {:ok, Map.put(acc, state, drop_nil_retry(%{retry: retry}))}}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp normalize_state_policies(states) when is_list(states) do
+    cond do
+      Keyword.keyword?(states) ->
+        states |> Map.new() |> normalize_state_policies()
+
+      Enum.all?(states, &state_policy_pair?/1) ->
+        states |> Map.new() |> normalize_state_policies()
+
+      true ->
+        {:error, "ERR flow policy states must be a map, keyword list, or state-policy pair list"}
+    end
+  end
+
+  defp normalize_state_policies(_states),
+    do: {:error, "ERR flow policy states must be a map or keyword list"}
+
+  defp normalize_state_name(state) when is_binary(state) and state != "running" and state != "",
+    do: {:ok, state}
+
+  defp normalize_state_name("running"), do: {:error, "ERR flow policy state cannot be running"}
+
+  defp normalize_state_name(_state),
+    do: {:error, "ERR flow policy state must be a non-empty string"}
+
+  defp state_policy_pair?({state, policy})
+       when is_binary(state) and (is_map(policy) or is_list(policy)),
+       do: true
+
+  defp state_policy_pair?(_entry), do: false
+
+  defp policy_map(policy) when is_map(policy), do: policy
+
+  defp policy_map(policy) when is_list(policy) do
+    if Keyword.keyword?(policy), do: Map.new(policy), else: %{}
+  end
+
+  defp policy_map(_policy), do: %{}
+
+  defp merge_retry(policy, nil), do: policy
+  defp merge_retry(policy, override) when override == %{}, do: policy
+
+  defp merge_retry(policy, override) when is_map(override) do
+    Enum.reduce(override, policy, fn
+      {:backoff, backoff}, acc when is_map(backoff) ->
+        Map.update!(acc, :backoff, &Map.merge(&1, backoff))
+
+      {key, value}, acc when key in [:max_attempts, :exhausted_to] ->
+        Map.put(acc, key, value)
+
+      _entry, acc ->
+        acc
+    end)
+  end
+
+  defp policy_retry(%{retry: retry}) when is_map(retry), do: retry
+  defp policy_retry(_policy), do: nil
+
+  defp state_retry(%{states: states}, state) when is_map(states) and is_binary(state) do
+    case Map.get(states, state) do
+      %{retry: retry} when is_map(retry) -> retry
+      _ -> nil
+    end
+  end
+
+  defp state_retry(_policy, _state), do: nil
+
+  defp drop_nil_retry(%{retry: nil} = policy), do: Map.delete(policy, :retry)
+  defp drop_nil_retry(policy), do: policy
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
   defp delay_ms(%{kind: :none}, _attempt), do: 0
   defp delay_ms(%{kind: :fixed, base_ms: base_ms}, _attempt), do: base_ms
 
@@ -184,5 +383,9 @@ defmodule Ferricstore.Flow.RetryPolicy do
       is_map(policy) and Map.has_key?(policy, string_key) -> Map.fetch!(policy, string_key)
       true -> default
     end
+  end
+
+  defp has_policy_key?(policy, atom_key, string_key) do
+    is_map(policy) and (Map.has_key?(policy, atom_key) or Map.has_key?(policy, string_key))
   end
 end

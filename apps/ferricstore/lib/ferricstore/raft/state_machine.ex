@@ -5100,7 +5100,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
          {:ok, record, next} <-
-           flow_prepare_retry_existing_record(record, attrs, lease_token, now_ms),
+           flow_prepare_retry_existing_record(state, record, attrs, lease_token, now_ms),
          :ok <- flow_apply_retry(state, record, next, partition_key, now_ms) do
       {:ok, next}
     end
@@ -5118,10 +5118,10 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_flow_retry_many(_state, _attrs),
     do: {:error, "ERR flow items must be a non-empty list"}
 
-  defp flow_prepare_retry_existing_record(record, attrs, lease_token, now_ms) do
+  defp flow_prepare_retry_existing_record(state, record, attrs, lease_token, now_ms) do
     with :ok <- flow_require_running_lease(record, lease_token),
          :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
-      retry_policy = Map.get(attrs, :retry_policy, RetryPolicy.default())
+      retry_policy = flow_retry_policy_for_record(state, record, attrs)
       next_attempts = Map.get(record, :attempts, 0) + 1
 
       {next_state, next_run_at_ms} =
@@ -5168,6 +5168,12 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flow_retry_policy_for_record(state, record, attrs) do
+    run_state = flow_retry_run_state(record)
+    flow_policy = flow_read_policy(state, Map.get(record, :type))
+    RetryPolicy.resolve(flow_policy, run_state, Map.get(attrs, :retry_policy))
+  end
+
   defp flow_retry_run_state(record) do
     case Map.get(record, :run_state) do
       state when is_binary(state) and state != "" -> state
@@ -5206,7 +5212,7 @@ defmodule Ferricstore.Raft.StateMachine do
             {:halt, {:error, "ERR flow not found"}}
 
           record ->
-            case flow_prepare_retry_existing_record(record, attrs, lease_token, now_ms) do
+            case flow_prepare_retry_existing_record(state, record, attrs, lease_token, now_ms) do
               {:ok, record, next} -> {:cont, {:ok, [{record, next} | acc]}}
               {:error, _reason} = error -> {:halt, error}
             end
@@ -5978,6 +5984,21 @@ defmodule Ferricstore.Raft.StateMachine do
 
       true ->
         flow_read_ets_record(state, key)
+    end
+  end
+
+  defp flow_read_policy(_state, type) when not is_binary(type), do: nil
+
+  defp flow_read_policy(state, type) do
+    case ets_lookup(state, FlowKeys.policy_key(type)) do
+      {:hit, value, _expire_at_ms} when is_binary(value) ->
+        case RetryPolicy.decode_flow_policy(value) do
+          {:ok, policy} -> policy
+          :error -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 

@@ -447,6 +447,8 @@ defmodule FerricStore.Impl do
     do: Ferricstore.Flow.create_many(ctx, partition_key, items, opts)
 
   def flow_get(ctx, id, opts \\ []), do: Ferricstore.Flow.get(ctx, id, opts)
+  def flow_policy_set(ctx, type, opts), do: Ferricstore.Flow.policy_set(ctx, type, opts)
+  def flow_policy_get(ctx, type, opts \\ []), do: Ferricstore.Flow.policy_get(ctx, type, opts)
   def flow_claim_due(ctx, type, opts), do: Ferricstore.Flow.claim_due(ctx, type, opts)
   def flow_reclaim(ctx, type, opts), do: Ferricstore.Flow.reclaim(ctx, type, opts)
 
