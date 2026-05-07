@@ -357,7 +357,9 @@ defmodule FerricStore do
   Creates a durable Flow record.
 
   Required option: `:type`.
-  Common options: `:state`, `:payload_ref`, `:run_at_ms`, `:priority`.
+  Common options: `:state`, `:payload`, `:payload_ref`, `:run_at_ms`, `:priority`.
+  When `:payload` is provided, Flow stores the value internally and returns a
+  generated `:payload_ref`.
   """
   @spec flow_create(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_create(id, opts) when is_binary(id) and is_list(opts) do
@@ -390,11 +392,11 @@ defmodule FerricStore do
   @doc """
   Returns the latest Flow state record for `id`.
 
-  If the record has a `:payload_ref`, Flow fetches that key and returns
-  `:payload` inline by default up to `:payload_max_bytes`
-  (default `:flow_payload_return_max_bytes`, 64 KiB). Larger payloads return
-  `:payload_omitted` and `:payload_size`; pass `payload: false` to return only
-  metadata and the payload reference.
+  By default this returns metadata and value references only. Pass `full: true`
+  or `payload: true` to hydrate the current payload/result/error values from
+  internal storage up to `:payload_max_bytes` (default
+  `:flow_payload_return_max_bytes`, 64 KiB). Larger values return
+  `:payload_omitted`/`:result_omitted`/`:error_omitted` with the stored size.
   """
   @spec flow_get(binary(), keyword()) :: {:ok, map() | nil} | {:error, binary()}
   def flow_get(id, opts \\ [])
@@ -443,9 +445,10 @@ defmodule FerricStore do
 
   Required option: `:worker`.
   Common options: `:state`, `:lease_ms`, `:limit`, `:priority`, `:now_ms`.
-  Claimed records include payloads by default using the same `:payload` /
-  `:payload_max_bytes` options as `flow_get/2`; payload fetch failures or
-  missing payload refs do not roll back the claim.
+  Claimed records include payload values by default using the same
+  `:payload_max_bytes` cap as `flow_get/2`; pass `payload: false` to return only
+  metadata and references. Payload fetch failures or missing payload refs do not
+  roll back the claim.
   """
   @spec flow_claim_due(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
   def flow_claim_due(type, opts) when is_binary(type) and is_list(opts) do
@@ -567,7 +570,13 @@ defmodule FerricStore do
   def flow_transition_many(_partition_key, _from_state, _to_state, _items, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
-  @doc "Clears a claim and reschedules a Flow record when `lease_token` matches."
+  @doc """
+  Clears a claim and reschedules a Flow record when `lease_token` matches.
+
+  `:error` stores a retry error value. Optional `:payload` replaces the current
+  payload; omitting `:payload` preserves the payload currently stored on the
+  Flow record.
+  """
   @spec flow_retry(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_retry(id, lease_token, opts)
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
