@@ -54,6 +54,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   use GenServer
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.ReplicationMode
   alias Ferricstore.Store.ActiveFile
   alias Ferricstore.Store.DiskPressure
 
@@ -304,33 +305,43 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
     flag_idx = state.index + 1
 
     if :atomics.get(state.instance_ctx.checkpoint_flags, flag_idx) == 1 do
-      case checkpoint_decision(state) do
-        {:defer, state, reason, measurements} ->
-          emit_checkpoint_deferred(state, reason, measurements)
-          state
+      if promotion_in_progress?() do
+        emit_checkpoint_deferred(state, :promotion_in_progress, %{
+          dirty_age_ms: dirty_age_ms(state),
+          idle_ms: 0,
+          write_version: write_version(state.instance_ctx, state.index)
+        })
 
-        {:fire, state} ->
-          case ActiveFile.get(state.instance_ctx, state.index) do
-            {_fid, active_path, _sp} ->
-              corr_id = state.next_corr_id
-              mark_checkpoint_in_flight(state.instance_ctx, state.index, 1)
-              :atomics.put(state.instance_ctx.checkpoint_flags, flag_idx, 0)
+        state
+      else
+        case checkpoint_decision(state) do
+          {:defer, state, reason, measurements} ->
+            emit_checkpoint_deferred(state, reason, measurements)
+            state
 
-              case fsync_async(state.instance_ctx, self(), corr_id, active_path) do
-                :ok ->
-                  %{
-                    state
-                    | in_flight?: true,
-                      next_corr_id: corr_id + 1,
-                      current_corr_id: corr_id,
-                      current_started_at: System.monotonic_time(),
-                      dirty_since_ms: nil
-                  }
+          {:fire, state} ->
+            case ActiveFile.get(state.instance_ctx, state.index) do
+              {_fid, active_path, _sp} ->
+                corr_id = state.next_corr_id
+                mark_checkpoint_in_flight(state.instance_ctx, state.index, 1)
+                :atomics.put(state.instance_ctx.checkpoint_flags, flag_idx, 0)
 
-                {:error, reason} ->
-                  checkpoint_submit_failed(state, reason)
-              end
-          end
+                case fsync_async(state.instance_ctx, self(), corr_id, active_path) do
+                  :ok ->
+                    %{
+                      state
+                      | in_flight?: true,
+                        next_corr_id: corr_id + 1,
+                        current_corr_id: corr_id,
+                        current_started_at: System.monotonic_time(),
+                        dirty_since_ms: nil
+                    }
+
+                  {:error, reason} ->
+                    checkpoint_submit_failed(state, reason)
+                end
+            end
+        end
       end
     else
       %{
@@ -396,6 +407,8 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
     end
   end
 
+  defp promotion_in_progress?, do: ReplicationMode.current() == :enabling
+
   defp write_version(%{write_version: ref}, index) do
     size = :counters.info(ref).size
     if index < size, do: :counters.get(ref, index + 1), else: 0
@@ -408,6 +421,11 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   defp monotonic_ms do
     System.monotonic_time(:millisecond)
   end
+
+  defp dirty_age_ms(%{dirty_since_ms: nil}), do: 0
+
+  defp dirty_age_ms(%{dirty_since_ms: dirty_since_ms}),
+    do: max(monotonic_ms() - dirty_since_ms, 0)
 
   defp checkpoint_duration_us(%{current_started_at: started_at}) when is_integer(started_at) do
     System.convert_time_unit(System.monotonic_time() - started_at, :native, :microsecond)

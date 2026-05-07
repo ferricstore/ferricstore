@@ -1411,6 +1411,22 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   end
 
   describe "shared log compaction" do
+    test "manual compaction is rejected while writes are paused for promotion" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+      try do
+        assert :ok = GenServer.call(pid, {:pause_writes})
+
+        assert {:error, "ERR shard writes paused for sync"} =
+                 GenServer.call(pid, {:run_compaction, [0]})
+
+        assert :ok = GenServer.call(pid, {:resume_writes})
+        assert {:ok, {0, 0, 0}} = GenServer.call(pid, {:run_compaction, [0]})
+      after
+        cleanup_shard(pid, ctx, dir)
+      end
+    end
+
     test "manual compaction skips the active log file" do
       {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
 

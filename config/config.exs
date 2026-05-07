@@ -19,6 +19,11 @@ config :ferricstore, :data_dir, "data"
 # Number of shards (0 = auto-detect from CPU cores)
 config :ferricstore, :shard_count, 0
 
+# Raft startup policy:
+#   :always - current behavior, start Raft even for a single node
+#   :manual - start as Bitcask-durable standalone until CLUSTER.ENABLE
+config :ferricstore, :raft_mode, :always
+
 # LFU decay: minutes per decay step (0 = no decay). Matches Redis lfu-decay-time.
 config :ferricstore, :lfu_decay_time, 1
 # LFU log factor: controls probabilistic increment curve. Matches Redis lfu-log-factor.

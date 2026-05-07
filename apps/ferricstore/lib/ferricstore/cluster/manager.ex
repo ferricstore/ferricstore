@@ -17,6 +17,8 @@ defmodule Ferricstore.Cluster.Manager do
   require Logger
 
   alias Ferricstore.Cluster.DataSync
+  alias Ferricstore.Cluster.JoinIdentity
+  alias Ferricstore.Cluster.TargetMarker
   alias Ferricstore.Raft.Cluster, as: RaftCluster
 
   @default_remove_delay_ms 60_000
@@ -53,9 +55,9 @@ defmodule Ferricstore.Cluster.Manager do
 
   The node must be reachable via Erlang distribution (Node.connect or libcluster).
   """
-  @spec add_node(node(), atom()) :: :ok | {:error, term()}
-  def add_node(node, role \\ :voter) do
-    GenServer.call(__MODULE__, {:add_node, node, role}, 120_000)
+  @spec add_node(node(), atom(), keyword()) :: :ok | {:error, term()}
+  def add_node(node, role \\ :voter, opts \\ []) do
+    GenServer.call(__MODULE__, {:add_node, node, role, opts}, 120_000)
   end
 
   @doc """
@@ -72,6 +74,12 @@ defmodule Ferricstore.Cluster.Manager do
   @spec leave() :: :ok | {:error, term()}
   def leave do
     GenServer.call(__MODULE__, :leave, 30_000)
+  end
+
+  @doc "Promotes a manual standalone node into a one-node Raft cluster."
+  @spec enable_cluster(keyword()) :: :ok | {:error, term()}
+  def enable_cluster(opts \\ []) do
+    GenServer.call(__MODULE__, {:enable_cluster, opts}, 120_000)
   end
 
   # ---------------------------------------------------------------------------
@@ -118,7 +126,11 @@ defmodule Ferricstore.Cluster.Manager do
       shard_count: Application.get_env(:ferricstore, :shard_count, 4)
     }
 
-    {:ok, state}
+    if Ferricstore.ReplicationMode.current() == :enabling do
+      {:ok, state, {:continue, :recover_enable}}
+    else
+      {:ok, state}
+    end
   end
 
   @impl true
@@ -155,15 +167,56 @@ defmodule Ferricstore.Cluster.Manager do
      }, state}
   end
 
-  def handle_call({:add_node, target_node, role}, _from, state) do
+  def handle_call({:enable_cluster, opts}, _from, state) do
+    dryrun? = Keyword.get(opts, :dryrun, false)
+
+    case enable_cluster_dryrun(state) do
+      :ok when dryrun? ->
+        {:reply, :ok, state}
+
+      :ok ->
+        case do_enable_cluster(state) do
+          :ok ->
+            {:reply, :ok, %{state | mode: :cluster, sync_status: :synced}}
+
+          {:error, reason} = error ->
+            {:reply, error, Map.put(state, :last_enable_error, reason)}
+        end
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:add_node, target_node, role}, from, state) do
+    handle_call({:add_node, target_node, role, []}, from, state)
+  end
+
+  def handle_call({:add_node, target_node, role, opts}, _from, state) do
     if MapSet.member?(state.known_nodes, target_node) do
       Logger.info("ClusterManager: #{target_node} already known, skipping join")
       {:reply, :ok, state}
     else
-      new_known = MapSet.put(state.known_nodes, target_node)
-      state = %{state | known_nodes: new_known}
       membership = role_to_membership(role)
-      result = do_join_node(target_node, membership, state)
+
+      result =
+        try do
+          do_join_node(target_node, membership, state, opts)
+        catch
+          kind, reason ->
+            Logger.error(
+              "ClusterManager: join failed for #{target_node}: #{inspect(kind)} #{inspect(reason)}"
+            )
+
+            {:error, {kind, reason}}
+        end
+
+      state =
+        case result do
+          :ok -> %{state | known_nodes: MapSet.put(state.known_nodes, target_node)}
+          _ -> state
+        end
+
       {:reply, result, state}
     end
   end
@@ -177,6 +230,19 @@ defmodule Ferricstore.Cluster.Manager do
   def handle_call(:leave, _from, state) do
     result = do_leave(state)
     {:reply, result, %{state | mode: :standalone}}
+  end
+
+  @impl true
+  def handle_continue(:recover_enable, state) do
+    Logger.warning("ClusterManager: recovering interrupted CLUSTER.ENABLE promotion")
+
+    case do_recover_enable_cluster(state) do
+      :ok ->
+        {:noreply, %{state | mode: :cluster, sync_status: :synced}}
+
+      {:error, reason} ->
+        {:noreply, Map.put(state, :last_enable_error, reason)}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -263,7 +329,9 @@ defmodule Ferricstore.Cluster.Manager do
                   "ClusterManager: #{node} wants to join us as #{remote_role}, initiating auto-join (coordinator: #{node()})"
                 )
 
-                result = GenServer.call(__MODULE__, {:add_node, node, remote_role}, 120_000)
+                result =
+                  GenServer.call(__MODULE__, {:add_node, node, remote_role, []}, 120_000)
+
                 Logger.info("ClusterManager: auto-join result for #{node}: #{inspect(result)}")
               else
                 Logger.debug(
@@ -315,6 +383,249 @@ defmodule Ferricstore.Cluster.Manager do
     {:noreply, state}
   end
 
+  defp enable_cluster_dryrun(state) do
+    cond do
+      Ferricstore.ReplicationMode.raft?() ->
+        :ok
+
+      Ferricstore.ReplicationMode.current() not in [:standalone, :enabling] ->
+        {:error, {:invalid_replication_mode, Ferricstore.ReplicationMode.current()}}
+
+      not Node.alive?() ->
+        {:error, :node_not_alive}
+
+      state.shard_count < 1 ->
+        {:error, :invalid_shard_count}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp do_enable_cluster(_state) do
+    case Ferricstore.ReplicationMode.current() do
+      :raft -> :ok
+      :enabling -> do_recover_enable_cluster()
+      :standalone -> do_fresh_enable_cluster()
+    end
+  end
+
+  defp do_fresh_enable_cluster do
+    ctx = FerricStore.Instance.get(:default)
+    epoch = System.unique_integer([:positive, :monotonic])
+
+    with :ok <- Ferricstore.ReplicationMode.mark_enabling!(ctx.data_dir, ctx.shard_count, epoch),
+         :ok <- complete_enable_cluster(ctx, epoch) do
+      :ok
+    else
+      {:error, reason} = error ->
+        Logger.error("ClusterManager: CLUSTER.ENABLE failed: #{inspect(reason)}")
+        fail_closed_enable_failure(ctx)
+        error
+
+      other ->
+        Logger.error("ClusterManager: CLUSTER.ENABLE failed: #{inspect(other)}")
+        fail_closed_enable_failure(ctx)
+        {:error, other}
+    end
+  end
+
+  defp do_recover_enable_cluster(_state \\ nil) do
+    ctx = FerricStore.Instance.get(:default)
+    epoch = existing_promotion_epoch(ctx)
+
+    if Node.alive?() do
+      case complete_enable_cluster(ctx, epoch) do
+        :ok ->
+          Logger.info("ClusterManager: interrupted CLUSTER.ENABLE promotion recovered")
+          :ok
+
+        {:error, reason} = error ->
+          Logger.error("ClusterManager: CLUSTER.ENABLE recovery failed: #{inspect(reason)}")
+          fail_closed_enable_failure(ctx)
+          error
+
+        other ->
+          Logger.error("ClusterManager: CLUSTER.ENABLE recovery failed: #{inspect(other)}")
+          fail_closed_enable_failure(ctx)
+          {:error, other}
+      end
+    else
+      Logger.error(
+        "ClusterManager: CLUSTER.ENABLE recovery refused because node has no stable distributed name"
+      )
+
+      fail_closed_enable_failure(ctx)
+      {:error, :node_not_alive}
+    end
+  end
+
+  defp complete_enable_cluster(ctx, epoch) do
+    with :ok <- set_readiness(false),
+         :ok <- pause_all_shards(ctx),
+         :ok <- flush_all_shards(ctx),
+         :ok <- start_local_raft(ctx),
+         :ok <- trigger_elections(ctx.shard_count),
+         {:ok, barrier_indices} <- commit_barriers(ctx.shard_count),
+         :ok <-
+           Ferricstore.ReplicationMode.mark_raft!(
+             ctx.data_dir,
+             ctx.shard_count,
+             epoch,
+             barrier_indices
+           ),
+         :ok <- resume_all_shards(ctx),
+         :ok <- set_readiness(true) do
+      Logger.info("ClusterManager: standalone node promoted to Raft cluster")
+      :ok
+    end
+  end
+
+  defp existing_promotion_epoch(ctx) do
+    case Ferricstore.ReplicationMode.read(ctx.data_dir) do
+      {:ok, %{promotion_epoch: epoch}} when is_integer(epoch) ->
+        epoch
+
+      _ ->
+        System.unique_integer([:positive, :monotonic])
+    end
+  end
+
+  defp fail_closed_enable_failure(ctx) do
+    _ = pause_all_shards_best_effort(ctx)
+    _ = set_readiness(false)
+
+    Logger.error(
+      "ClusterManager: CLUSTER.ENABLE left node fail-closed with writes paused and readiness=false; durable marker remains :enabling"
+    )
+
+    :ok
+  end
+
+  defp set_readiness(value) do
+    Ferricstore.Health.set_ready(value)
+    :ok
+  end
+
+  defp pause_all_shards(%{shard_count: shard_count} = ctx) do
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
+      case GenServer.call(elem(ctx.shard_names, i), {:pause_writes}, 30_000) do
+        :ok -> {:cont, :ok}
+        other -> {:halt, {:error, {:pause_shard_failed, i, other}}}
+      end
+    end)
+  end
+
+  defp resume_all_shards(%{shard_count: shard_count} = ctx) do
+    Enum.each(0..(shard_count - 1), fn i ->
+      try do
+        GenServer.call(elem(ctx.shard_names, i), {:resume_writes}, 5_000)
+      catch
+        _, _ -> :ok
+      end
+    end)
+
+    :ok
+  end
+
+  defp pause_all_shards_best_effort(%{shard_count: shard_count} = ctx) do
+    Enum.each(0..(shard_count - 1), fn i ->
+      try do
+        GenServer.call(elem(ctx.shard_names, i), {:pause_writes}, 5_000)
+      catch
+        _, _ -> :ok
+      end
+    end)
+
+    :ok
+  end
+
+  defp flush_all_shards(%{shard_count: shard_count} = ctx) do
+    with :ok <- flush_bitcask_writers(ctx),
+         :ok <- sync_shards(ctx, shard_count) do
+      :ok
+    end
+  end
+
+  defp flush_bitcask_writers(%{shard_count: shard_count} = ctx) do
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
+      case Ferricstore.Store.BitcaskWriter.flush(ctx, i, 30_000) do
+        :ok -> {:cont, :ok}
+        other -> {:halt, {:error, {:bitcask_writer_flush_failed, i, other}}}
+      end
+    end)
+  end
+
+  defp sync_shards(ctx, shard_count) do
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
+      case GenServer.call(elem(ctx.shard_names, i), :flush, 30_000) do
+        :ok -> {:cont, :ok}
+        other -> {:halt, {:error, {:shard_sync_failed, i, other}}}
+      end
+    end)
+  end
+
+  defp start_local_raft(%{data_dir: data_dir, shard_count: shard_count} = ctx) do
+    with :ok <- Ferricstore.Raft.Cluster.start_system(data_dir),
+         :ok <- start_batchers(shard_count),
+         :ok <- start_shard_raft(ctx) do
+      :ok
+    end
+  end
+
+  defp start_batchers(shard_count) do
+    Enum.reduce_while(Ferricstore.Application.raft_batcher_children(shard_count), :ok, fn spec,
+                                                                                          :ok ->
+      case Supervisor.start_child(Ferricstore.Supervisor, spec) do
+        {:ok, _pid} -> {:cont, :ok}
+        {:ok, _pid, _info} -> {:cont, :ok}
+        {:error, {:already_started, _pid}} -> {:cont, :ok}
+        {:error, :already_present} -> {:cont, :ok}
+        other -> {:halt, {:error, {:batcher_start_failed, spec.id, other}}}
+      end
+    end)
+  end
+
+  defp start_shard_raft(%{shard_count: shard_count} = ctx) do
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
+      case GenServer.call(elem(ctx.shard_names, i), :start_raft, 30_000) do
+        :ok -> {:cont, :ok}
+        other -> {:halt, {:error, {:shard_raft_start_failed, i, other}}}
+      end
+    end)
+  end
+
+  defp trigger_elections(shard_count) do
+    case Ferricstore.Raft.Cluster.trigger_shard_elections_parallel(shard_count) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:raft_election_failed, reason}}
+    end
+  end
+
+  defp commit_barriers(shard_count) do
+    Enum.reduce_while(0..(shard_count - 1), {:ok, %{}}, fn i, {:ok, acc} ->
+      case Ferricstore.Raft.Batcher.write(i, {:batch, []}) do
+        {:ok, []} ->
+          case raft_last_applied(i) do
+            {:ok, index} -> {:cont, {:ok, Map.put(acc, i, index)}}
+            {:error, reason} -> {:halt, {:error, {:barrier_index_failed, i, reason}}}
+          end
+
+        other ->
+          {:halt, {:error, {:barrier_failed, i, other}}}
+      end
+    end)
+  end
+
+  defp raft_last_applied(shard_index) do
+    server_id = Ferricstore.Raft.Cluster.shard_server_id(shard_index)
+
+    case :ra.member_overview(server_id) do
+      {:ok, overview, _} -> {:ok, Map.get(overview, :last_applied, 0)}
+      other -> {:error, other}
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Private: join flow (add to Raft + data sync — used by both auto and manual)
   # ---------------------------------------------------------------------------
@@ -326,17 +637,18 @@ defmodule Ferricstore.Cluster.Manager do
   # Then when added to Raft, ra can start replicating from the sync point.
   #
   # This is the single code path for both :nodeup auto-join and CLUSTER.JOIN.
-  defp do_join_node(target_node, membership, state) do
+  defp do_join_node(target_node, membership, state, opts) do
     if target_node == node() do
       Logger.info("ClusterManager: ignoring self-join for #{target_node}")
       :ok
     else
-      do_join_node_remote(target_node, membership, state)
+      do_join_node_remote(target_node, membership, state, opts)
     end
   end
 
-  defp do_join_node_remote(target_node, membership, state) do
+  defp do_join_node_remote(target_node, membership, state, opts) do
     Logger.info("ClusterManager: joining #{target_node} (#{membership})")
+    replace? = Keyword.get(opts, :replace, false)
 
     # Stop ra on target if it's running (standalone node)
     try do
@@ -347,30 +659,36 @@ defmodule Ferricstore.Cluster.Manager do
 
     ctx = FerricStore.Instance.get(:default)
 
-    # Check if the target already has data (disk clone / EBS snapshot scenario).
-    # If it does, skip the data sync — just add to Raft groups.
-    target_has_data = target_has_data?(target_node, state.shard_count)
+    with {:ok, target_has_data} <- target_has_data?(target_node, state.shard_count),
+         :ok <- validate_target_data_identity(target_node, ctx, target_has_data, replace?) do
+      if target_has_data and not replace? do
+        # Disk clone / rejoin path: target already has Bitcask data.
+        Logger.info("ClusterManager: #{target_node} has pre-existing data, skipping data sync")
+        stop_raft_on_target(target_node, state.shard_count)
 
-    if target_has_data do
-      # Disk clone / rejoin path: target already has Bitcask data.
-      Logger.info("ClusterManager: #{target_node} has pre-existing data, skipping data sync")
-      stop_raft_on_target(target_node, state.shard_count)
+        sync_indices = read_target_indices(target_node, state.shard_count)
 
-      sync_indices = read_target_indices(target_node, state.shard_count)
-      start_raft_on_target(target_node, state.shard_count, sync_indices)
-      {raft_result, _} = do_add_node(target_node, membership, state)
-
-      case raft_result do
-        :ok ->
-          kickstart_replication(target_node, state.shard_count)
-          Logger.info("ClusterManager: #{target_node} added to Raft groups (disk clone)")
-          :ok
-
-        {:error, _} = err ->
-          Logger.error("ClusterManager: Raft add failed for #{target_node}: #{inspect(err)}")
-          err
+        start_target_raft_and_finish_join(
+          target_node,
+          membership,
+          state,
+          ctx,
+          sync_indices,
+          "added to Raft groups (disk clone)",
+          false
+        )
+      else
+        join_node_with_data_sync(target_node, membership, state, ctx, replace?, target_has_data)
       end
     else
+      {:error, reason} = error ->
+        Logger.error("ClusterManager: refusing join for #{target_node}: #{inspect(reason)}")
+        error
+    end
+  end
+
+  defp join_node_with_data_sync(target_node, membership, state, ctx, replace?, target_has_data) do
+    with :ok <- maybe_cleanup_replace_target(target_node, state, replace?, target_has_data) do
       # Empty node path: needs data sync.
       # Order: sync data → start ra server → add_member → kickstart.
       # The ra server must be running BEFORE add_member so it can receive
@@ -379,59 +697,419 @@ defmodule Ferricstore.Cluster.Manager do
       # and quorum requires votes from nodes that don't know it yet.
       stop_raft_on_target(target_node, state.shard_count)
 
-      sync_result = direct_sync(target_node, ctx)
-
-      case sync_result do
+      case direct_sync(target_node, ctx) do
         {:ok, sync_indices} ->
-          start_raft_on_target(target_node, state.shard_count, sync_indices)
-          {raft_result, _} = do_add_node(target_node, membership, state)
-
-          case raft_result do
-            :ok ->
-              kickstart_replication(target_node, state.shard_count)
-              Logger.info("ClusterManager: #{target_node} fully joined and synced")
-              :ok
-
-            {:error, _} = err ->
-              Logger.error("ClusterManager: Raft add failed for #{target_node}: #{inspect(err)}")
-              err
-          end
+          start_target_raft_and_finish_join(
+            target_node,
+            membership,
+            state,
+            ctx,
+            sync_indices,
+            "fully joined and synced",
+            true
+          )
 
         {:error, reason} ->
           Logger.error("ClusterManager: data sync failed for #{target_node}: #{inspect(reason)}")
           {:error, {:sync_failed, reason}}
       end
+    else
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp maybe_cleanup_replace_target(_target_node, _state, false, _target_has_data), do: :ok
+  defp maybe_cleanup_replace_target(_target_node, _state, true, false), do: :ok
+
+  defp maybe_cleanup_replace_target(target_node, state, true, true) do
+    Logger.warning("ClusterManager: replacing pre-existing data on #{target_node}")
+
+    case cleanup_target_data(target_node, state.shard_count) do
+      :ok ->
+        :ok
+
+      {:error, _reason} = error ->
+        Logger.error(
+          "ClusterManager: refusing REPLACE join after cleanup failure: #{inspect(error)}"
+        )
+
+        error
+    end
+  end
+
+  defp start_target_raft_and_finish_join(
+         target_node,
+         membership,
+         state,
+         ctx,
+         sync_indices,
+         success_message,
+         cleanup_data_on_failure?
+       ) do
+    case start_raft_on_target(target_node, state.shard_count, sync_indices) do
+      :ok ->
+        add_node_and_persist_target_marker(
+          target_node,
+          membership,
+          state,
+          ctx,
+          sync_indices,
+          success_message,
+          cleanup_data_on_failure?
+        )
+
+      {:error, _reason} = error ->
+        rollback_target_state_after_start_failure(
+          target_node,
+          state,
+          cleanup_data_on_failure?,
+          error
+        )
+    end
+  end
+
+  defp add_node_and_persist_target_marker(
+         target_node,
+         membership,
+         state,
+         ctx,
+         sync_indices,
+         success_message,
+         cleanup_data_on_failure?
+       ) do
+    preexisting_membership = target_membership_by_shard(target_node, state)
+    {raft_result, _} = do_add_node(target_node, membership, state)
+
+    case raft_result do
+      :ok ->
+        case write_target_cluster_marker(target_node, ctx, sync_indices) do
+          :ok ->
+            kickstart_replication(target_node, state.shard_count)
+            Logger.info("ClusterManager: #{target_node} #{success_message}")
+            :ok
+
+          {:error, _reason} = err ->
+            rollback_join_membership_after_marker_failure(
+              target_node,
+              state,
+              err,
+              preexisting_membership,
+              cleanup_data_on_failure?
+            )
+        end
+
+      {:error, _} = err ->
+        Logger.error("ClusterManager: Raft add failed for #{target_node}: #{inspect(err)}")
+        err
+    end
+  end
+
+  defp rollback_join_membership_after_marker_failure(
+         target_node,
+         state,
+         marker_error,
+         preexisting_membership,
+         cleanup_data_on_failure?
+       ) do
+    Logger.error(
+      "ClusterManager: target marker write failed for #{target_node}: #{inspect(marker_error)}; rolling back Raft membership"
+    )
+
+    membership_rollback = remove_join_added_members(target_node, state, preexisting_membership)
+    target_rollback = cleanup_target_join_state(target_node, state, cleanup_data_on_failure?)
+
+    case {membership_rollback, target_rollback} do
+      {:ok, :ok} ->
+        marker_error
+
+      {membership_error, target_error} ->
+        Logger.error(
+          "ClusterManager: rollback after target marker failure failed for #{target_node}: #{inspect({membership_error, target_error})}"
+        )
+
+        {:error,
+         {:target_marker_failed_rollback_failed, marker_error, membership_error, target_error}}
+    end
+  end
+
+  defp rollback_target_state_after_start_failure(
+         target_node,
+         state,
+         cleanup_data_on_failure?,
+         start_error
+       ) do
+    Logger.error(
+      "ClusterManager: target Raft start failed for #{target_node}: #{inspect(start_error)}; rolling back target state"
+    )
+
+    case cleanup_target_join_state(target_node, state, cleanup_data_on_failure?) do
+      :ok ->
+        start_error
+
+      rollback_error ->
+        {:error, {:target_raft_start_failed_rollback_failed, start_error, rollback_error}}
+    end
+  end
+
+  defp cleanup_target_join_state(target_node, state, cleanup_data?) do
+    stop_result = stop_raft_on_target(target_node, state.shard_count)
+
+    cleanup_result =
+      if cleanup_data?, do: cleanup_target_data(target_node, state.shard_count), else: :ok
+
+    case {stop_result, cleanup_result} do
+      {:ok, :ok} -> :ok
+      other -> {:error, {:target_join_state_cleanup_failed, other}}
+    end
+  end
+
+  defp target_membership_by_shard(target_node, state) do
+    case Process.get(:ferricstore_cluster_manager_target_membership_hook) do
+      hook when is_function(hook, 2) ->
+        hook.(target_node, state)
+
+      _ ->
+        for shard_idx <- 0..(state.shard_count - 1), into: %{} do
+          status =
+            case target_member?(target_node, shard_idx) do
+              {:ok, member?} -> member?
+              {:error, _reason} -> :unknown
+            end
+
+          {shard_idx, status}
+        end
+    end
+  end
+
+  defp target_member?(target_node, shard_idx) do
+    case RaftCluster.members(shard_idx) do
+      {:ok, members, _leader} ->
+        {:ok, Enum.any?(members, &(member_node(&1) == target_node))}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      other ->
+        {:error, {:unexpected_members_result, other}}
+    end
+  rescue
+    error -> {:error, error}
+  end
+
+  defp member_node({_name, node}), do: node
+  defp member_node(%{id: {_name, node}}), do: node
+  defp member_node(_member), do: nil
+
+  defp remove_join_added_members(target_node, state, preexisting_membership) do
+    rollback_results =
+      for shard_idx <- 0..(state.shard_count - 1),
+          preexisting_member_status(preexisting_membership, shard_idx) == false,
+          into: %{} do
+        {shard_idx, remove_join_added_member(target_node, shard_idx)}
+      end
+
+    failed = Enum.filter(rollback_results, fn {_shard_idx, result} -> result != :ok end)
+
+    if failed == [] do
+      :ok
+    else
+      {:error, {:partial_join_rollback, rollback_results}}
+    end
+  end
+
+  defp preexisting_member_status(preexisting_membership, shard_idx)
+       when is_map(preexisting_membership) do
+    Map.get(preexisting_membership, shard_idx, :unknown)
+  end
+
+  defp preexisting_member_status(_preexisting_membership, _shard_idx), do: :unknown
+
+  defp remove_join_added_member(target_node, shard_idx) do
+    case Process.get(:ferricstore_cluster_manager_remove_added_member_hook) do
+      hook when is_function(hook, 2) ->
+        hook.(target_node, shard_idx)
+
+      _ ->
+        RaftCluster.remove_member(shard_idx, target_node)
     end
   end
 
   # Checks if the target node has pre-existing Bitcask data (disk clone scenario).
   defp target_has_data?(target_node, shard_count) do
+    case Process.get(:ferricstore_cluster_manager_target_has_data_hook) do
+      hook when is_function(hook, 2) ->
+        normalize_target_has_data_result(hook.(target_node, shard_count), target_node)
+
+      _ ->
+        do_target_has_data?(target_node, shard_count)
+    end
+  end
+
+  defp normalize_target_has_data_result(value, _target_node) when is_boolean(value),
+    do: {:ok, value}
+
+  defp normalize_target_has_data_result({:ok, value}, _target_node) when is_boolean(value),
+    do: {:ok, value}
+
+  defp normalize_target_has_data_result({:error, _reason} = error, _target_node), do: error
+
+  defp normalize_target_has_data_result(other, target_node),
+    do: {:error, {:target_data_probe_failed, target_node, {:unexpected_result, other}}}
+
+  defp do_target_has_data?(target_node, shard_count) do
     try do
       target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default], 5_000)
 
-      Enum.any?(0..(shard_count - 1), fn i ->
-        shard_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, i)
+      unless is_map(target_ctx) and is_binary(Map.get(target_ctx, :data_dir)) do
+        throw({:target_data_probe_failed, target_node, {:invalid_target_context, target_ctx}})
+      end
 
-        case :erpc.call(target_node, File, :ls, [shard_path]) do
-          {:ok, files} ->
-            Enum.any?(files, fn f ->
-              String.ends_with?(f, ".log") and
-                case :erpc.call(target_node, File, :stat, [Path.join(shard_path, f)]) do
-                  {:ok, %{size: size}} -> size > 0
-                  _ -> false
-                end
-            end)
-
-          _ ->
-            false
-        end
+      Enum.reduce_while(0..(shard_count - 1), {:ok, false}, fn i, {:ok, false} ->
+        probe_target_shard_data(target_node, target_ctx.data_dir, i)
       end)
     catch
-      _, _ -> false
+      {:target_data_probe_failed, ^target_node, reason} ->
+        {:error, {:target_data_probe_failed, target_node, reason}}
+
+      kind, reason ->
+        {:error, {:target_data_probe_failed, target_node, {kind, reason}}}
+    end
+  end
+
+  defp probe_target_shard_data(target_node, data_dir, shard_idx) do
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_idx)
+
+    case :erpc.call(target_node, File, :ls, [shard_path], 5_000) do
+      {:ok, files} ->
+        case probe_target_log_files(target_node, shard_path, files) do
+          {:ok, true} -> {:halt, {:ok, true}}
+          {:ok, false} -> {:cont, {:ok, false}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+
+      {:error, :enoent} ->
+        {:cont, {:ok, false}}
+
+      {:error, reason} ->
+        {:halt, {:error, {:target_data_probe_failed, target_node, {:ls, shard_path, reason}}}}
+
+      other ->
+        {:halt, {:error, {:target_data_probe_failed, target_node, {:ls, shard_path, other}}}}
+    end
+  end
+
+  defp probe_target_log_files(target_node, shard_path, files) do
+    Enum.reduce_while(files, {:ok, false}, fn file, {:ok, false} ->
+      if String.ends_with?(file, ".log") do
+        case :erpc.call(target_node, File, :stat, [Path.join(shard_path, file)], 5_000) do
+          {:ok, %{size: size}} when size > 0 ->
+            {:halt, {:ok, true}}
+
+          {:ok, %{size: _size}} ->
+            {:cont, {:ok, false}}
+
+          {:error, reason} ->
+            {:halt,
+             {:error, {:target_data_probe_failed, target_node, {:stat, shard_path, reason}}}}
+
+          other ->
+            {:halt,
+             {:error, {:target_data_probe_failed, target_node, {:stat, shard_path, other}}}}
+        end
+      else
+        {:cont, {:ok, false}}
+      end
+    end)
+  end
+
+  defp validate_target_data_identity(_target_node, _ctx, false, _replace?), do: :ok
+  defp validate_target_data_identity(_target_node, _ctx, true, true), do: :ok
+
+  defp validate_target_data_identity(target_node, ctx, true, false) do
+    local_state = Ferricstore.ReplicationMode.read(ctx.data_dir)
+    target_state = read_target_cluster_state(target_node)
+
+    case JoinIdentity.validate(local_state, target_state, target_node) do
+      :ok ->
+        if match?({:error, :enoent}, local_state) do
+          Logger.warning(
+            "ClusterManager: local cluster_state marker missing; allowing legacy pre-marker join for #{target_node}"
+          )
+        end
+
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp read_target_cluster_state(target_node) do
+    try do
+      target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default], 5_000)
+
+      :erpc.call(
+        target_node,
+        Ferricstore.ReplicationMode,
+        :read,
+        [target_ctx.data_dir],
+        5_000
+      )
+    catch
+      kind, reason -> {:error, {kind, reason}}
+    end
+  end
+
+  defp write_target_cluster_marker(target_node, ctx, barrier_indices) do
+    case Process.get(:ferricstore_cluster_manager_write_target_marker_hook) do
+      hook when is_function(hook, 3) -> hook.(target_node, ctx, barrier_indices)
+      _ -> TargetMarker.write(target_node, ctx, barrier_indices)
+    end
+  end
+
+  defp cleanup_target_data(target_node, shard_count) do
+    case Process.get(:ferricstore_cluster_manager_cleanup_target_data_hook) do
+      hook when is_function(hook, 2) -> hook.(target_node, shard_count)
+      _ -> do_cleanup_target_data(target_node, shard_count)
+    end
+  end
+
+  defp do_cleanup_target_data(target_node, shard_count) do
+    try do
+      target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default], 5_000)
+
+      Enum.each(0..(shard_count - 1), fn i ->
+        shard_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, i)
+        :erpc.call(target_node, File, :rm_rf!, [shard_path], 30_000)
+      end)
+
+      :erpc.call(
+        target_node,
+        File,
+        :rm_rf!,
+        [Path.join(target_ctx.data_dir, "dedicated")],
+        30_000
+      )
+
+      :ok
+    catch
+      kind, reason ->
+        Logger.warning(
+          "ClusterManager: failed while cleaning target data on #{target_node}: #{inspect({kind, reason})}"
+        )
+
+        {:error, {:target_cleanup_failed, target_node, {kind, reason}}}
     end
   end
 
   defp direct_sync(target_node, ctx) do
+    case Process.get(:ferricstore_cluster_manager_direct_sync_hook) do
+      hook when is_function(hook, 2) -> hook.(target_node, ctx)
+      _ -> do_direct_sync(target_node, ctx)
+    end
+  end
+
+  defp do_direct_sync(target_node, ctx) do
     case Ferricstore.Cluster.DataSync.sync_all_shards(target_node, ctx) do
       {:ok, sync_results} ->
         Logger.info("ClusterManager: data synced to #{target_node}: #{inspect(sync_results)}")
@@ -514,6 +1192,16 @@ defmodule Ferricstore.Cluster.Manager do
   # ---------------------------------------------------------------------------
 
   defp do_add_node(target_node, membership, state) do
+    case Process.get(:ferricstore_cluster_manager_do_add_node_hook) do
+      hook when is_function(hook, 3) ->
+        hook.(target_node, membership, state)
+
+      _ ->
+        do_add_node_real(target_node, membership, state)
+    end
+  end
+
+  defp do_add_node_real(target_node, membership, state) do
     Logger.info(
       "ClusterManager: adding #{target_node} as #{membership} to all #{state.shard_count} shards"
     )
@@ -544,6 +1232,16 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   defp do_remove_node(target_node, state) do
+    case Process.get(:ferricstore_cluster_manager_do_remove_node_hook) do
+      hook when is_function(hook, 2) ->
+        hook.(target_node, state)
+
+      _ ->
+        do_remove_node_real(target_node, state)
+    end
+  end
+
+  defp do_remove_node_real(target_node, state) do
     Logger.info("ClusterManager: removing #{target_node} from all #{state.shard_count} shards")
 
     for shard_idx <- 0..(state.shard_count - 1) do
@@ -617,6 +1315,13 @@ defmodule Ferricstore.Cluster.Manager do
   # Stop and clean up ra servers on the target so they don't conflict
   # with the cluster's Raft groups when we add the target as a member.
   defp stop_raft_on_target(target_node, shard_count) do
+    case Process.get(:ferricstore_cluster_manager_stop_raft_on_target_hook) do
+      hook when is_function(hook, 2) -> hook.(target_node, shard_count)
+      _ -> do_stop_raft_on_target(target_node, shard_count)
+    end
+  end
+
+  defp do_stop_raft_on_target(target_node, shard_count) do
     Logger.info("ClusterManager: stopping Raft on #{target_node} before join")
 
     ra_sys = Ferricstore.Raft.Cluster.system_name()
@@ -638,66 +1343,148 @@ defmodule Ferricstore.Cluster.Manager do
     end
 
     Process.sleep(50)
+    :ok
   end
 
   defp start_raft_on_target(target_node, shard_count, sync_indices) do
+    case Process.get(:ferricstore_cluster_manager_start_raft_on_target_hook) do
+      hook when is_function(hook, 3) -> hook.(target_node, shard_count, sync_indices)
+      _ -> do_start_raft_on_target(target_node, shard_count, sync_indices)
+    end
+  end
+
+  defp do_start_raft_on_target(target_node, shard_count, sync_indices) do
     Logger.info("ClusterManager: starting Raft on #{target_node}")
 
-    # Build cluster members from known Raft participants only.
-    # Use shard 0's current membership as the authoritative source —
-    # don't use Node.list() which includes non-cluster nodes (test runner, etc).
-    cluster_members =
-      case RaftCluster.members(0) do
-        {:ok, members, _leader} ->
-          nodes = Enum.map(members, fn {_name, n} -> n end) |> Enum.uniq()
-          if target_node in nodes, do: nodes, else: [target_node | nodes]
+    with {:ok, cluster_members} <- cluster_member_nodes_for_join(target_node),
+         :ok <- start_target_raft_servers(target_node, shard_count, sync_indices, cluster_members),
+         :ok <- enable_target_shard_raft(target_node, shard_count) do
+      :ok
+    else
+      {:error, {:cluster_members_unavailable, reason}} ->
+        {:error, {:target_raft_start_failed, :cluster_members, reason}}
 
-        _ ->
-          nodes = [node() | Node.list()] |> Enum.uniq()
-          if target_node in nodes, do: nodes, else: [target_node | nodes]
-      end
-
-    for shard_idx <- 0..(shard_count - 1) do
-      try do
-        target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default])
-        shard_data_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, shard_idx)
-        keydir = elem(target_ctx.keydir_refs, shard_idx)
-
-        skip_idx = Map.get(sync_indices, shard_idx, 0)
-
-        result =
-          :erpc.call(target_node, Ferricstore.Raft.Cluster, :join_shard_server, [
-            shard_idx,
-            shard_data_path,
-            0,
-            Path.join(shard_data_path, "00000.log"),
-            keydir,
-            cluster_members,
-            [skip_below_index: skip_idx]
-          ])
-
-        Logger.info(
-          "ClusterManager: shard #{shard_idx} Raft joined on #{target_node} (skip_below=#{skip_idx}): #{inspect(result)}"
-        )
-      catch
-        kind, reason ->
-          Logger.warning(
-            "ClusterManager: shard #{shard_idx} Raft join failed on #{target_node}: #{inspect({kind, reason})}"
-          )
-      end
+      {:error, _reason} = error ->
+        error
     end
+  end
 
-    for shard_idx <- 0..(shard_count - 1) do
+  defp cluster_member_nodes_for_join(target_node) do
+    case Process.get(:ferricstore_cluster_manager_cluster_members_hook) do
+      hook when is_function(hook, 1) ->
+        normalize_cluster_member_nodes(hook.(target_node), target_node)
+
+      _ ->
+        do_cluster_member_nodes_for_join(target_node)
+    end
+  end
+
+  defp do_cluster_member_nodes_for_join(target_node) do
+    # Shard 0 Raft membership is the authoritative cluster membership source.
+    # Unknown membership must abort join rather than seeding target Raft with
+    # arbitrary connected Erlang nodes.
+    case RaftCluster.members(0) do
+      {:ok, members, _leader} ->
+        nodes = Enum.map(members, &member_node/1) |> Enum.reject(&is_nil/1) |> Enum.uniq()
+        {:ok, if(target_node in nodes, do: nodes, else: [target_node | nodes])}
+
+      {:error, reason} ->
+        {:error, {:cluster_members_unavailable, reason}}
+
+      other ->
+        {:error, {:cluster_members_unavailable, {:unexpected_members_result, other}}}
+    end
+  rescue
+    error ->
+      {:error, {:cluster_members_unavailable, error}}
+  end
+
+  defp normalize_cluster_member_nodes({:ok, nodes}, target_node) when is_list(nodes) do
+    nodes = Enum.uniq(nodes)
+    {:ok, if(target_node in nodes, do: nodes, else: [target_node | nodes])}
+  end
+
+  defp normalize_cluster_member_nodes({:error, reason}, _target_node),
+    do: {:error, {:cluster_members_unavailable, reason}}
+
+  defp normalize_cluster_member_nodes(other, _target_node),
+    do: {:error, {:cluster_members_unavailable, {:unexpected_result, other}}}
+
+  defp start_target_raft_servers(target_node, shard_count, sync_indices, cluster_members) do
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn shard_idx, :ok ->
+      case start_target_raft_server(target_node, shard_idx, sync_indices, cluster_members) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:target_raft_start_failed, shard_idx, reason}}}
+      end
+    end)
+  end
+
+  defp start_target_raft_server(target_node, shard_idx, sync_indices, cluster_members) do
+    target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default])
+    shard_data_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, shard_idx)
+    keydir = elem(target_ctx.keydir_refs, shard_idx)
+    skip_idx = Map.get(sync_indices, shard_idx, 0)
+
+    result =
+      :erpc.call(target_node, Ferricstore.Raft.Cluster, :join_shard_server, [
+        shard_idx,
+        shard_data_path,
+        0,
+        Path.join(shard_data_path, "00000.log"),
+        keydir,
+        cluster_members,
+        [skip_below_index: skip_idx]
+      ])
+
+    case result do
+      :ok ->
+        Logger.info(
+          "ClusterManager: shard #{shard_idx} Raft joined on #{target_node} (skip_below=#{skip_idx})"
+        )
+
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "ClusterManager: shard #{shard_idx} Raft join failed on #{target_node}: #{inspect(reason)}"
+        )
+
+        {:error, reason}
+
+      other ->
+        Logger.warning(
+          "ClusterManager: shard #{shard_idx} Raft join returned unexpected result on #{target_node}: #{inspect(other)}"
+        )
+
+        {:error, {:unexpected_result, other}}
+    end
+  catch
+    kind, reason ->
+      Logger.warning(
+        "ClusterManager: shard #{shard_idx} Raft join failed on #{target_node}: #{inspect({kind, reason})}"
+      )
+
+      {:error, {kind, reason}}
+  end
+
+  defp enable_target_shard_raft(target_node, shard_count) do
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn shard_idx, :ok ->
       shard_name = :"Ferricstore.Store.Shard.#{shard_idx}"
 
       try do
-        :erpc.call(target_node, GenServer, :call, [shard_name, :enable_raft, 5_000])
-      catch
-        _, _ -> :ok
-      end
-    end
+        case :erpc.call(target_node, GenServer, :call, [shard_name, :enable_raft, 5_000]) do
+          :ok ->
+            {:cont, :ok}
 
-    :ok
+          other ->
+            {:halt, {:error, {:target_raft_start_failed, shard_idx, {:enable_raft, other}}}}
+        end
+      catch
+        kind, reason ->
+          {:halt,
+           {:error, {:target_raft_start_failed, shard_idx, {:enable_raft, {kind, reason}}}}}
+      end
+    end)
   end
 
   defp kickstart_replication(_target_node, shard_count) do

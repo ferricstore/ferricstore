@@ -7456,6 +7456,7 @@ fn command_tag_name(cmd: &[u8]) -> Option<&'static str> {
         b"CLUSTER.SLOTS" => Some("cluster_slots"),
         b"CLUSTER.STATUS" => Some("cluster_status"),
         b"CLUSTER.JOIN" => Some("cluster_join"),
+        b"CLUSTER.ENABLE" => Some("cluster_enable"),
         b"CLUSTER.LEAVE" => Some("cluster_leave"),
         b"CLUSTER.FAILOVER" => Some("cluster_failover"),
         b"CLUSTER.PROMOTE" => Some("cluster_promote"),
@@ -8526,6 +8527,7 @@ mod tests {
         assert_eq!(command_tag_name(b"BF.ADD"), Some("bf_add"));
         assert_eq!(command_tag_name(b"TDIGEST.MERGE"), Some("tdigest_merge"));
         assert_eq!(command_tag_name(b"CLUSTER.HEALTH"), Some("cluster_health"));
+        assert_eq!(command_tag_name(b"CLUSTER.ENABLE"), Some("cluster_enable"));
         assert_eq!(command_tag_name(b"NO_SUCH_COMMAND"), None);
     }
 

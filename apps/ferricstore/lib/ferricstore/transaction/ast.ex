@@ -4,7 +4,7 @@ defmodule Ferricstore.Transaction.Ast do
   @type queue_entry :: {binary(), [term()], term()} | {binary(), [term()]}
 
   @non_key_list_tags ~w(
-    acl auth client cluster_demote cluster_failover cluster_join cluster_leave cluster_promote
+    acl auth client cluster_demote cluster_enable cluster_failover cluster_join cluster_leave cluster_promote
     command config debug hello module sandbox select slowlog
   )a
 

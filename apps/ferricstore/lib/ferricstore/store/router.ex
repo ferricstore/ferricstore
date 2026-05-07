@@ -115,6 +115,14 @@ defmodule Ferricstore.Store.Router do
 
   @spec quorum_write(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
   defp quorum_write(ctx, idx, command) do
+    if ctx.name == :default && !Ferricstore.ReplicationMode.raft?() do
+      standalone_write(ctx, idx, command)
+    else
+      do_quorum_write(ctx, idx, command)
+    end
+  end
+
+  defp do_quorum_write(ctx, idx, command) do
     result =
       try do
         GenServer.call(elem(ctx.shard_names, idx), command, 10_000)
@@ -227,13 +235,133 @@ defmodule Ferricstore.Store.Router do
   # IO/WAL/read machinery remains separate from client acknowledgement policy.
   @spec raft_write(FerricStore.Instance.t(), non_neg_integer(), binary(), tuple()) :: term()
   defp raft_write(ctx, idx, _key, command) do
-    if ctx.name == :default do
-      quorum_write(ctx, idx, command)
-    else
-      # Custom embedded instances are local/direct. The default application
-      # instance owns Raft; there is no public switch that can disable it.
-      GenServer.call(elem(ctx.shard_names, idx), command)
+    cond do
+      ctx.name == :default && Ferricstore.ReplicationMode.raft?() ->
+        quorum_write(ctx, idx, command)
+
+      ctx.name == :default ->
+        standalone_write(ctx, idx, command)
+
+      true ->
+        # Custom embedded instances are local/direct. The default application
+        # instance owns Raft or the standalone fsync boundary.
+        GenServer.call(elem(ctx.shard_names, idx), command)
     end
+  end
+
+  defp standalone_write(ctx, idx, command) do
+    shard = elem(ctx.shard_names, idx)
+
+    if Ferricstore.ReplicationMode.current() == :enabling do
+      {:error, "ERR cluster promotion in progress"}
+    else
+      case GenServer.call(shard, command) do
+        {:error, _reason} = error ->
+          error
+
+        result ->
+          case flush_standalone_write(ctx, idx, shard) do
+            :ok ->
+              bump_standalone_write_version(ctx, idx, command)
+              result
+
+            {:error, reason} ->
+              fail_closed_standalone_write(ctx, idx, reason)
+
+            other ->
+              fail_closed_standalone_write(ctx, idx, other)
+          end
+      end
+    end
+  end
+
+  defp fail_closed_standalone_write(ctx, _idx, reason) do
+    Ferricstore.Health.set_ready(false)
+    pause_all_standalone_shards(ctx)
+    mark_all_shards_under_disk_pressure(ctx)
+
+    {:error,
+     "ERR standalone durability failure: outcome unknown, node paused for repair: #{inspect(reason)}"}
+  end
+
+  defp pause_all_standalone_shards(%{shard_count: shard_count, shard_names: shard_names}) do
+    Enum.each(0..(shard_count - 1), fn shard_idx ->
+      try do
+        GenServer.call(elem(shard_names, shard_idx), {:pause_writes}, 5_000)
+      catch
+        _, _ -> :ok
+      end
+    end)
+
+    :ok
+  end
+
+  defp mark_all_shards_under_disk_pressure(%{shard_count: shard_count} = ctx) do
+    Enum.each(0..(shard_count - 1), fn shard_idx ->
+      Ferricstore.Store.DiskPressure.set(ctx, shard_idx)
+    end)
+
+    :ok
+  end
+
+  defp flush_standalone_write(ctx, idx, shard) do
+    case Process.get(:ferricstore_standalone_flush_hook) do
+      hook when is_function(hook, 3) ->
+        hook.(ctx, idx, shard)
+
+      _ ->
+        with :ok <- GenServer.call(shard, :flush, 30_000),
+             :ok <- Ferricstore.Store.BitcaskWriter.flush(ctx, idx, 30_000),
+             :ok <- GenServer.call(shard, :flush, 30_000) do
+          :ok
+        end
+    end
+  end
+
+  defp bump_standalone_write_version(ctx, idx, {:batch, commands}) when is_list(commands) do
+    bump_standalone_write_version(ctx, idx, max(length(commands), 1))
+  end
+
+  defp bump_standalone_write_version(ctx, idx, amount) when is_integer(amount) do
+    size = :counters.info(ctx.write_version).size
+    if idx < size, do: :counters.add(ctx.write_version, idx + 1, amount)
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp bump_standalone_write_version(ctx, idx, _command) do
+    bump_standalone_write_version(ctx, idx, 1)
+  end
+
+  defp standalone_batch_commands(_ctx, []), do: []
+
+  defp standalone_batch_commands(ctx, keyed_commands) do
+    {by_shard, count} =
+      keyed_commands
+      |> Enum.reduce({%{}, 0}, fn {key, command}, {shards, i} ->
+        idx = shard_for(ctx, key)
+        {cmds, indices} = Map.get(shards, idx, {[], []})
+        {Map.put(shards, idx, {[command | cmds], [i | indices]}), i + 1}
+      end)
+
+    results =
+      Enum.reduce(by_shard, %{}, fn {shard_idx, {cmds, indices}}, acc ->
+        shard_results =
+          case standalone_write(ctx, shard_idx, {:batch, Enum.reverse(cmds)}) do
+            {:ok, results} when is_list(results) -> results
+            {:error, _reason} = error -> List.duplicate(error, length(indices))
+            other -> List.duplicate(other, length(indices))
+          end
+
+        indices
+        |> Enum.reverse()
+        |> Enum.zip(shard_results)
+        |> Enum.reduce(acc, fn {i, result}, next -> Map.put(next, i, result) end)
+      end)
+
+    0..(count - 1)
+    |> Enum.map(fn i -> Map.get(results, i, ErrorReasons.write_timeout_unknown()) end)
   end
 
   defp shard_under_disk_pressure?(ctx, idx) do
@@ -242,6 +370,14 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp forced_quorum_write(ctx, idx, command, origin_node) do
+    if ctx.name == :default && !Ferricstore.ReplicationMode.raft?() do
+      standalone_write(ctx, idx, command)
+    else
+      do_forced_quorum_write(ctx, idx, command, origin_node)
+    end
+  end
+
+  defp do_forced_quorum_write(ctx, idx, command, origin_node) do
     {from, token} = ReplyAwaiter.new()
 
     if origin_node == node() do
@@ -2171,6 +2307,14 @@ defmodule Ferricstore.Store.Router do
   defp batch_quorum_commands(_ctx, [], _origin_node), do: []
 
   defp batch_quorum_commands(ctx, keyed_commands, origin_node) do
+    if ctx.name == :default && !Ferricstore.ReplicationMode.raft?() do
+      standalone_batch_commands(ctx, keyed_commands)
+    else
+      do_batch_quorum_commands(ctx, keyed_commands, origin_node)
+    end
+  end
+
+  defp do_batch_quorum_commands(ctx, keyed_commands, origin_node) do
     wv_size = :counters.info(ctx.write_version).size
 
     {by_shard, count, by_shard_commands} =
@@ -2227,6 +2371,15 @@ defmodule Ferricstore.Store.Router do
   defp batch_quorum_put(_ctx, [], _origin_node), do: []
 
   defp batch_quorum_put(ctx, kv_pairs, origin_node) do
+    if ctx.name == :default && !Ferricstore.ReplicationMode.raft?() do
+      keyed_commands = Enum.map(kv_pairs, fn {key, value} -> {key, {:put, key, value, 0}} end)
+      standalone_batch_commands(ctx, keyed_commands)
+    else
+      do_batch_quorum_put(ctx, kv_pairs, origin_node)
+    end
+  end
+
+  defp do_batch_quorum_put(ctx, kv_pairs, origin_node) do
     wv_size = :counters.info(ctx.write_version).size
 
     # Single pass: group by shard, build cmds + indices lists simultaneously,
@@ -3469,11 +3622,23 @@ defmodule Ferricstore.Store.Router do
   def get_version(ctx, key) do
     idx = shard_for(ctx, key)
 
-    case safe_read_call(ctx, idx, {:get_version, key}) do
-      {:ok, version} -> version
-      :unavailable -> shared_write_version(ctx, idx)
+    if default_standalone_instance?(ctx) do
+      shared_write_version(ctx, idx)
+    else
+      case safe_read_call(ctx, idx, {:get_version, key}) do
+        {:ok, version} -> version
+        :unavailable -> shared_write_version(ctx, idx)
+      end
     end
   end
+
+  defp default_standalone_instance?(%{name: :default}) do
+    not Ferricstore.ReplicationMode.raft?()
+  rescue
+    _ -> false
+  end
+
+  defp default_standalone_instance?(_ctx), do: false
 
   defp shared_write_version(%{write_version: write_version}, idx) do
     size = :counters.info(write_version).size

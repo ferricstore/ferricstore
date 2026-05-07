@@ -512,7 +512,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _args} = ast, store)
-      when tag in ~w(cluster_health cluster_stats cluster_keyslot cluster_slots cluster_status cluster_join cluster_leave cluster_failover cluster_promote cluster_demote cluster_role ferricstore_hotness)a,
+      when tag in ~w(cluster_health cluster_stats cluster_keyslot cluster_slots cluster_status cluster_join cluster_enable cluster_leave cluster_failover cluster_promote cluster_demote cluster_role ferricstore_hotness)a,
       do: Cluster.handle(ast_command_name(tag), ast_args(ast), store)
 
   def dispatch_ast({:ferricstore_config, args}, store),
@@ -624,6 +624,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   defp ast_command_name(:cluster_slots), do: "CLUSTER.SLOTS"
   defp ast_command_name(:cluster_status), do: "CLUSTER.STATUS"
   defp ast_command_name(:cluster_join), do: "CLUSTER.JOIN"
+  defp ast_command_name(:cluster_enable), do: "CLUSTER.ENABLE"
   defp ast_command_name(:cluster_leave), do: "CLUSTER.LEAVE"
   defp ast_command_name(:cluster_failover), do: "CLUSTER.FAILOVER"
   defp ast_command_name(:cluster_promote), do: "CLUSTER.PROMOTE"

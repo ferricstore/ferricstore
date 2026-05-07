@@ -137,7 +137,18 @@ defmodule FerricstoreServer.Resp.ParserFuzzTest do
   test "generated command frames keep command tuple shape stable" do
     seed_rand()
 
-    command_names = ["GET", "SET", "MGET", "MSET", "DEL", "EXISTS", "JSON.GET", "PFADD", ""]
+    command_names = [
+      "GET",
+      "SET",
+      "MGET",
+      "MSET",
+      "DEL",
+      "EXISTS",
+      "JSON.GET",
+      "PFADD",
+      "CLUSTER.ENABLE",
+      ""
+    ]
 
     for _ <- 1..@iterations do
       command = Enum.random(command_names)

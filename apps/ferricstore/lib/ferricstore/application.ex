@@ -61,6 +61,21 @@ defmodule Ferricstore.Application do
     # tries to open shard directories or Raft WALs.
     Ferricstore.DataDir.ensure_layout!(data_dir, shard_count)
 
+    replication_mode = Ferricstore.ReplicationMode.resolve!(data_dir, shard_count)
+
+    Ferricstore.ReplicationMode.put_current(replication_mode)
+
+    case {replication_mode, Ferricstore.ReplicationMode.read(data_dir)} do
+      {:standalone, {:error, :enoent}} ->
+        :ok = Ferricstore.ReplicationMode.mark_standalone!(data_dir, shard_count)
+
+      {:raft, {:error, :enoent}} ->
+        :ok = Ferricstore.ReplicationMode.mark_raft!(data_dir, shard_count, 0, %{})
+
+      _ ->
+        :ok
+    end
+
     # Cache LFU config in persistent_term for hot-path reads (~5ns vs ~250ns).
     # Must run before any shard starts touching keys.
     Ferricstore.Store.LFU.init_config_cache()
@@ -142,7 +157,10 @@ defmodule Ferricstore.Application do
     maybe_start_distribution()
 
     # Start the ra system before shards so that Shard.init can start ra servers.
-    :ok = Ferricstore.Raft.Cluster.start_system(data_dir)
+    # In manual standalone mode it is started later by CLUSTER.ENABLE.
+    if replication_mode == :raft do
+      :ok = Ferricstore.Raft.Cluster.start_system(data_dir)
+    end
 
     # Build the default instance context. This creates the Instance struct
     # with all refs (atomics, counters, ETS tables) and caches it in
@@ -167,14 +185,11 @@ defmodule Ferricstore.Application do
       )
 
     batcher_children =
-      Enum.map(0..(shard_count - 1), fn i ->
-        shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
-
-        Supervisor.child_spec(
-          {Ferricstore.Raft.Batcher, shard_index: i, shard_id: shard_id},
-          id: :"batcher_#{i}"
-        )
-      end)
+      if replication_mode == :raft do
+        raft_batcher_children(shard_count)
+      else
+        []
+      end
 
     # Background Bitcask writers — one per shard. Must start BEFORE the
     # ShardSupervisor because StateMachine.apply sends casts to these
@@ -241,15 +256,26 @@ defmodule Ferricstore.Application do
 
     case Supervisor.start_link(children, opts) do
       {:ok, pid} = result ->
-        case Ferricstore.Raft.Cluster.trigger_shard_elections_parallel(shard_count) do
-          :ok ->
-            mark_started(shard_count)
+        case replication_mode do
+          :raft ->
+            case Ferricstore.Raft.Cluster.trigger_shard_elections_parallel(shard_count) do
+              :ok ->
+                mark_started(shard_count)
+                result
+
+              {:error, reason} ->
+                stop_started_supervisor(pid)
+                cleanup_failed_start()
+                {:error, {:raft_election_failed, reason}}
+            end
+
+          :enabling ->
+            mark_started(shard_count, false)
             result
 
-          {:error, reason} ->
-            stop_started_supervisor(pid)
-            cleanup_failed_start()
-            {:error, {:raft_election_failed, reason}}
+          :standalone ->
+            mark_started(shard_count)
+            result
         end
 
       result ->
@@ -258,11 +284,11 @@ defmodule Ferricstore.Application do
     end
   end
 
-  defp mark_started(shard_count) do
+  defp mark_started(shard_count, ready? \\ true) do
     # Mark the node as ready for Kubernetes readiness probes (spec 2C.1).
     # In embedded mode, set_ready(true) is still called so that
     # Health.ready?() returns true for any code that checks it.
-    Ferricstore.Health.set_ready(true)
+    Ferricstore.Health.set_ready(ready?)
 
     :telemetry.execute(
       [:ferricstore, :node, :startup_complete],
@@ -276,6 +302,18 @@ defmodule Ferricstore.Application do
     # Non-blocking: fires before any traffic is served so operator sees the
     # warning immediately.
     check_large_values(shard_count)
+  end
+
+  @doc false
+  def raft_batcher_children(shard_count) do
+    Enum.map(0..(shard_count - 1), fn i ->
+      shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
+
+      Supervisor.child_spec(
+        {Ferricstore.Raft.Batcher, shard_index: i, shard_id: shard_id},
+        id: :"batcher_#{i}"
+      )
+    end)
   end
 
   defp stop_started_supervisor(pid) do

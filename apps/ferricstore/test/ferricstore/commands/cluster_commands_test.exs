@@ -190,4 +190,38 @@ defmodule Ferricstore.Commands.ClusterCommandsTest do
       assert msg =~ "wrong number of arguments"
     end
   end
+
+  describe "CLUSTER.JOIN" do
+    test "accepts REPLACE option for self-join", %{store: store} do
+      node = Atom.to_string(node())
+      assert :ok = Cluster.handle("CLUSTER.JOIN", [node, "REPLACE"], store)
+    end
+
+    test "rejects unknown CLUSTER.JOIN option", %{store: store} do
+      assert {:error, "ERR syntax error"} =
+               Cluster.handle("CLUSTER.JOIN", [Atom.to_string(node()), "UNKNOWN"], store)
+    end
+  end
+
+  describe "CLUSTER.ENABLE" do
+    test "dryrun is accepted when already in raft mode", %{store: store} do
+      assert :ok = Cluster.handle("CLUSTER.ENABLE", ["DRYRUN"], store)
+    end
+
+    test "rejects unknown CLUSTER.ENABLE option", %{store: store} do
+      assert {:error, "ERR syntax error"} = Cluster.handle("CLUSTER.ENABLE", ["NOW"], store)
+    end
+  end
+
+  describe "CLUSTER.STATUS" do
+    test "includes replication marker details", %{store: store} do
+      result = Cluster.handle("CLUSTER.STATUS", [], store)
+
+      assert is_binary(result)
+      assert result =~ "replication_mode:"
+      assert result =~ "cluster_state:"
+      assert result =~ "promotion_epoch="
+      assert result =~ "barrier_indices="
+    end
+  end
 end

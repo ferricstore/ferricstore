@@ -1,6 +1,13 @@
 import Config
 
 if config_env() == :prod do
+  raft_mode =
+    case System.get_env("FERRICSTORE_RAFT_MODE", "always") do
+      "always" -> :always
+      "manual" -> :manual
+      other -> raise "invalid FERRICSTORE_RAFT_MODE=#{inspect(other)}; expected always or manual"
+    end
+
   # ---------------------------------------------------------------------------
   # Core
   # ---------------------------------------------------------------------------
@@ -9,6 +16,7 @@ if config_env() == :prod do
     port: String.to_integer(System.get_env("FERRICSTORE_PORT", "6379")),
     health_port: String.to_integer(System.get_env("FERRICSTORE_HEALTH_PORT", "6380")),
     data_dir: System.get_env("FERRICSTORE_DATA_DIR", "/data"),
+    raft_mode: raft_mode,
     shard_count:
       (
         count = System.get_env("FERRICSTORE_SHARD_COUNT", "0")

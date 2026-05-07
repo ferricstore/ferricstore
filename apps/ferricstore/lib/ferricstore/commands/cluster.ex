@@ -20,7 +20,8 @@ defmodule Ferricstore.Commands.Cluster do
 
   ### Membership management
 
-    * `CLUSTER.JOIN <node>` -- adds a node to the cluster
+    * `CLUSTER.JOIN <node> [REPLACE]` -- adds a node to the cluster
+    * `CLUSTER.ENABLE [DRYRUN]` -- promotes a manual standalone node to Raft
     * `CLUSTER.LEAVE` -- gracefully removes this node from the cluster
     * `CLUSTER.FAILOVER <shard_index> <target_node>` -- transfers shard
       leadership to a specific node
@@ -128,6 +129,8 @@ defmodule Ferricstore.Commands.Cluster do
 
     header = [
       "mode: #{status.mode}",
+      "replication_mode: #{Ferricstore.ReplicationMode.current()}",
+      "cluster_state: #{cluster_state_summary()}",
       "role: #{status.role}",
       "node: #{status.node}",
       "sync_status: #{status.sync_status}",
@@ -179,8 +182,49 @@ defmodule Ferricstore.Commands.Cluster do
     end
   end
 
+  def handle("CLUSTER.JOIN", [node_str, arg], _store) when is_binary(arg) do
+    case String.upcase(arg) do
+      "REPLACE" ->
+        node = String.to_atom(node_str)
+
+        case ClusterManager.add_node(node, :voter, replace: true) do
+          :ok -> :ok
+          {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+        end
+
+      _ ->
+        {:error, "ERR syntax error"}
+    end
+  end
+
   def handle("CLUSTER.JOIN", _args, _store) do
     {:error, "ERR wrong number of arguments for 'cluster.join' command"}
+  end
+
+  # -- CLUSTER.ENABLE ---------------------------------------------------------
+
+  def handle("CLUSTER.ENABLE", [], _store) do
+    case ClusterManager.enable_cluster() do
+      :ok -> :ok
+      {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+    end
+  end
+
+  def handle("CLUSTER.ENABLE", [arg], _store) when is_binary(arg) do
+    case String.upcase(arg) do
+      "DRYRUN" ->
+        case ClusterManager.enable_cluster(dryrun: true) do
+          :ok -> :ok
+          {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+        end
+
+      _ ->
+        {:error, "ERR syntax error"}
+    end
+  end
+
+  def handle("CLUSTER.ENABLE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.enable' command"}
   end
 
   # -- CLUSTER.LEAVE ----------------------------------------------------------
@@ -358,6 +402,29 @@ defmodule Ferricstore.Commands.Cluster do
   # -------------------------------------------------------------------
   # Private
   # -------------------------------------------------------------------
+
+  defp cluster_state_summary do
+    data_dir = FerricStore.Instance.get(:default).data_dir
+
+    case Ferricstore.ReplicationMode.read(data_dir) do
+      {:ok, state} ->
+        mode = Map.get(state, :replication_mode, :unknown)
+        cluster_id = Map.get(state, :cluster_id, "unknown")
+        epoch = Map.get(state, :promotion_epoch, "none")
+        barriers = Map.get(state, :barrier_indices, %{})
+
+        "mode=#{mode} cluster_id=#{cluster_id} promotion_epoch=#{epoch} barrier_indices=#{inspect(barriers)}"
+
+      {:error, :enoent} ->
+        "missing promotion_epoch=none barrier_indices=%{}"
+
+      {:error, reason} ->
+        "unreadable #{inspect(reason)} promotion_epoch=unknown barrier_indices=unknown"
+    end
+  rescue
+    error ->
+      "unavailable #{Exception.message(error)} promotion_epoch=unknown barrier_indices=unknown"
+  end
 
   defp collect_shard_info do
     ctx = default_instance()

@@ -93,6 +93,7 @@ defmodule Ferricstore.Store.Shard do
     :active_file_id,
     :active_file_path,
     :active_file_size,
+    :active_file_preallocated_to,
     pending: [],
     pending_count: 0,
     last_flush_error: nil,
@@ -239,7 +240,7 @@ defmodule Ferricstore.Store.Shard do
       # Only the default application instance owns Raft. Custom embedded shards
       # run local/direct, and direct shard tests pass non-default instance_ctx.
       raft? =
-        if ctx && ctx.name == :default do
+        if ctx && ctx.name == :default && Ferricstore.ReplicationMode.raft?() do
           profile_startup_phase(index, :start_raft, fn ->
             ShardLifecycle.start_raft_if_available(
               index,
@@ -491,6 +492,11 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call({:put, _key, _value, _expire_at_ms}, _from, %{writes_paused: true} = state) do
+    {:reply, {:error, "ERR shard writes paused for sync"}, state}
+  end
+
+  def handle_call(command, _from, %{writes_paused: true} = state)
+      when is_tuple(command) and command != {:pause_writes} and command != {:resume_writes} do
     {:reply, {:error, "ERR shard writes paused for sync"}, state}
   end
 
@@ -808,6 +814,37 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call(:enable_raft, _from, state) do
     {:reply, :ok, %{state | raft?: true}}
+  end
+
+  def handle_call(:start_raft, _from, %{raft?: true} = state) do
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:start_raft, _from, state) do
+    result =
+      ShardLifecycle.start_raft_if_available(
+        state.index,
+        state.shard_data_path,
+        state.active_file_id,
+        state.active_file_path,
+        state.ets,
+        if(state.instance_ctx, do: state.instance_ctx.name, else: :default),
+        wait_for_leader: false,
+        active_file_preallocated_to: state.active_file_preallocated_to,
+        zset_score_index_name: state.zset_score_index,
+        zset_score_lookup_name: state.zset_score_lookup,
+        flow_index_name: state.flow_index,
+        flow_lookup_name: state.flow_lookup
+      )
+
+    if result do
+      {:reply, :ok, %{state | raft?: true}}
+    else
+      {:reply, {:error, :batcher_not_started}, state}
+    end
+  catch
+    kind, reason ->
+      {:reply, {:error, {kind, reason}}, state}
   end
 
   # -------------------------------------------------------------------
@@ -1222,6 +1259,13 @@ defmodule Ferricstore.Store.Shard do
 
   # Custom/direct shards do not go through Router's quorum bump, so mirror
   # their local WATCH token into the instance counter that survives shard restart.
+  defp mirror_direct_write_version(
+         %{instance_ctx: %{name: :default}, raft?: false} = new_state,
+         _old_state
+       ) do
+    new_state
+  end
+
   defp mirror_direct_write_version(
          %{write_version: new_version} = new_state,
          %{raft?: false, write_version: old_version}

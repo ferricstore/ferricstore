@@ -1890,6 +1890,17 @@ defmodule FerricstoreServer.Resp.ParserTest do
     end
   end
 
+  describe "cluster command AST parsing" do
+    test "parses CLUSTER.ENABLE through the Rust command catalog" do
+      assert {:ok,
+              [
+                {:command, "CLUSTER.ENABLE", [], {:cluster_enable, []}, []},
+                {:command, "CLUSTER.ENABLE", ["dryrun"], {:cluster_enable, ["dryrun"]}, []}
+              ], ""} =
+               Parser.parse_commands("cluster.enable\r\ncluster.enable dryrun\r\n")
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Boolean — additional edge cases (already one test, adding invalid)
   # ---------------------------------------------------------------------------
