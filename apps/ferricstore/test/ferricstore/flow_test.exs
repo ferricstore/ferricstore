@@ -1860,6 +1860,48 @@ defmodule Ferricstore.FlowTest do
     assert manual.id == id
   end
 
+  test "flow_retry terminal exhaustion keeps stable audit metadata" do
+    id = uid("flow-retry-terminal-exhaust")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: "payment-terminal-exhaust",
+               state: "charge_card",
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("payment-terminal-exhaust",
+               state: "charge_card",
+               worker: "worker-charge",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, exhausted} =
+             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000,
+               retry: [
+                 max_retries: 0,
+                 backoff: [kind: :fixed, base_ms: 10_000, max_ms: 10_000, jitter_pct: 0],
+                 exhausted_to: "failed"
+               ]
+             )
+
+    assert exhausted.state == "failed"
+    assert exhausted.next_run_at_ms == nil
+
+    assert {:ok, history} = FerricStore.flow_history(id, count: 10)
+
+    {_event_id, retry_fields} =
+      Enum.find(history, fn {_event_id, fields} -> fields["event"] == "retry" end)
+
+    assert retry_fields["retry_decision"] == "exhausted"
+    assert retry_fields["retry_next_run_at_ms"] == ""
+    assert retry_fields["retry_exhausted_to"] == "failed"
+  end
+
   test "flow_retry rejects invalid retry policy" do
     id = uid("flow-retry-policy-invalid")
 
@@ -2156,6 +2198,53 @@ defmodule Ferricstore.FlowTest do
     assert next_run <= 1_250
   end
 
+  test "flow retry policy keeps generated backoff values bounded and deterministic" do
+    now_ms = 123_456
+    attempts = [0, 1, 2, 3, 10, 1_000]
+    base_values = [0, 1, 100, 60_000, 2_592_000_000]
+    max_values = [0, 1, 50, 1_000, 2_592_000_000]
+
+    for kind <- [:none, :fixed, :linear, :exponential],
+        base_ms <- base_values,
+        max_ms <- max_values,
+        jitter_pct <- [0, 25, 100],
+        attempt <- attempts do
+      assert {:ok, policy} =
+               Ferricstore.Flow.RetryPolicy.normalize(
+                 max_retries: 1_000,
+                 backoff: [
+                   kind: kind,
+                   base_ms: base_ms,
+                   max_ms: max_ms,
+                   jitter_pct: jitter_pct
+                 ],
+                 exhausted_to: "failed"
+               )
+
+      first = Ferricstore.Flow.RetryPolicy.next_run_at_ms(policy, "flow-prop", attempt, now_ms)
+      second = Ferricstore.Flow.RetryPolicy.next_run_at_ms(policy, "flow-prop", attempt, now_ms)
+
+      assert first == second
+      assert first >= now_ms
+      assert first <= now_ms + max_ms
+    end
+
+    assert Ferricstore.Flow.RetryPolicy.attempt_allowed?(
+             Ferricstore.Flow.RetryPolicy.default(),
+             3
+           )
+
+    refute Ferricstore.Flow.RetryPolicy.attempt_allowed?(
+             Ferricstore.Flow.RetryPolicy.default(),
+             4
+           )
+
+    assert {:ok, no_retries} =
+             Ferricstore.Flow.RetryPolicy.normalize(max_retries: 0, exhausted_to: "failed")
+
+    refute Ferricstore.Flow.RetryPolicy.attempt_allowed?(no_retries, 1)
+  end
+
   test "flow retry policy rejects old max_attempts name" do
     assert {:error, "ERR flow retry max_attempts was renamed to max_retries"} =
              Ferricstore.Flow.RetryPolicy.normalize(
@@ -2165,7 +2254,7 @@ defmodule Ferricstore.FlowTest do
              )
   end
 
-  test "flow retry policy decoder migrates old stored max_attempts key" do
+  test "flow retry policy decoder rejects old stored max_attempts key" do
     blob =
       :erlang.term_to_binary(
         {:flow_policy_v1,
@@ -2176,10 +2265,7 @@ defmodule Ferricstore.FlowTest do
          }}
       )
 
-    assert {:ok, policy} = Ferricstore.Flow.RetryPolicy.decode_flow_policy(blob)
-    assert policy.retry.max_retries == 5
-    assert policy.states["charge_card"].retry.max_retries == 2
-    refute Map.has_key?(policy.retry, :max_attempts)
+    assert :error = Ferricstore.Flow.RetryPolicy.decode_flow_policy(blob)
   end
 
   test "flow_retry_many atomically reschedules one-partition batch" do

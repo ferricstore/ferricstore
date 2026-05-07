@@ -68,6 +68,22 @@ Command-local override:
 FLOW.RETRY flow-1 lease-token FENCING 7 MAX_RETRIES 1 EXHAUSTED_TO payment_failed
 ```
 
+Exhaust immediately on the first failed run and move to the terminal `failed`
+state:
+
+```text
+FLOW.RETRY flow-1 lease-token FENCING 7 MAX_RETRIES 0 EXHAUSTED_TO failed
+```
+
+Exhaust immediately into an active/manual state that can be claimed again:
+
+```text
+FLOW.RETRY flow-1 lease-token FENCING 7 MAX_RETRIES 0 EXHAUSTED_TO payment_failed
+```
+
+Terminal exhaustion clears `next_run_at_ms`; active-state exhaustion sets
+`next_run_at_ms` to the retry command time so workers can claim it immediately.
+
 ## Embedded API
 
 ```elixir
@@ -85,6 +101,11 @@ FerricStore.flow_policy_set("checkout",
 )
 
 FerricStore.flow_policy_get("checkout", state: "charge_card")
+
+FerricStore.flow_retry(flow_id, lease_token,
+  fencing_token: fencing_token,
+  retry: [max_retries: 0, exhausted_to: "failed"]
+)
 ```
 
 ## History Metadata

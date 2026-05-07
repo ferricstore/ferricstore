@@ -92,8 +92,11 @@ defmodule Ferricstore.Flow.RetryPolicy do
   @spec decode_flow_policy(binary()) :: {:ok, map()} | :error
   def decode_flow_policy(value) when is_binary(value) do
     case :erlang.binary_to_term(value, [:safe]) do
-      {:flow_policy_v1, policy} when is_map(policy) -> {:ok, migrate_policy(policy)}
-      _ -> :error
+      {:flow_policy_v1, policy} when is_map(policy) ->
+        if old_max_attempts_policy?(policy), do: :error, else: {:ok, policy}
+
+      _ ->
+        :error
     end
   rescue
     _ -> :error
@@ -382,7 +385,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
     if spread <= 0 do
       delay
     else
-      offset = :erlang.phash2({id, attempt, now_ms}, spread * 2 + 1) - spread
+      offset = rem(:erlang.phash2({id, attempt, now_ms}), spread * 2 + 1) - spread
       max(delay + offset, 0)
     end
   end
@@ -399,41 +402,25 @@ defmodule Ferricstore.Flow.RetryPolicy do
     is_map(policy) and (Map.has_key?(policy, atom_key) or Map.has_key?(policy, string_key))
   end
 
-  defp migrate_policy(policy) when is_map(policy) do
-    policy
-    |> migrate_policy_retry()
-    |> migrate_policy_states()
+  defp old_max_attempts_policy?(policy) when is_map(policy) do
+    old_max_attempts_retry?(fetch_policy(policy, :retry, "retry", nil)) or
+      old_max_attempts_states?(fetch_policy(policy, :states, "states", nil))
   end
 
-  defp migrate_policy(policy), do: policy
+  defp old_max_attempts_policy?(_policy), do: false
 
-  defp migrate_policy_retry(%{retry: retry} = policy),
-    do: Map.put(policy, :retry, migrate_retry(retry))
-
-  defp migrate_policy_retry(policy), do: policy
-
-  defp migrate_policy_states(%{states: states} = policy) when is_map(states) do
-    states =
-      Map.new(states, fn
-        {state, %{retry: retry} = state_policy} ->
-          {state, Map.put(state_policy, :retry, migrate_retry(retry))}
-
-        entry ->
-          entry
-      end)
-
-    Map.put(policy, :states, states)
+  defp old_max_attempts_states?(states) when is_map(states) do
+    Enum.any?(states, fn
+      {_state, %{retry: retry}} when is_map(retry) -> old_max_attempts_retry?(retry)
+      {_state, %{"retry" => retry}} when is_map(retry) -> old_max_attempts_retry?(retry)
+      _entry -> false
+    end)
   end
 
-  defp migrate_policy_states(policy), do: policy
+  defp old_max_attempts_states?(_states), do: false
 
-  defp migrate_retry(%{max_retries: _} = retry), do: retry
+  defp old_max_attempts_retry?(retry) when is_map(retry),
+    do: has_policy_key?(retry, :max_attempts, "max_attempts")
 
-  defp migrate_retry(%{max_attempts: value} = retry),
-    do: retry |> Map.delete(:max_attempts) |> Map.put(:max_retries, value)
-
-  defp migrate_retry(%{"max_attempts" => value} = retry),
-    do: retry |> Map.delete("max_attempts") |> Map.put(:max_retries, value)
-
-  defp migrate_retry(retry), do: retry
+  defp old_max_attempts_retry?(_retry), do: false
 end
