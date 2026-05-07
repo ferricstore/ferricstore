@@ -515,6 +515,16 @@ defmodule Ferricstore.Store.Shard do
     {:noreply, state}
   end
 
+  def handle_call(:standalone_commit_debug, _from, state) do
+    {:reply,
+     %{
+       batch_count: length(state.standalone_batch),
+       waiting_count: length(state.standalone_waiting),
+       inflight_count: length(state.standalone_flush_entries),
+       inflight_keys: MapSet.to_list(state.standalone_inflight_keys)
+     }, state}
+  end
+
   def handle_call({:forwarded_quorum, origin_node, command}, from, state) do
     forwarded_from = Ferricstore.Raft.Batcher.remote_origin_from(origin_node, from)
     previous_origin = Process.get(:ferricstore_forward_origin)
@@ -1321,7 +1331,7 @@ defmodule Ferricstore.Store.Shard do
     parent = self()
 
     _pid =
-      spawn(fn ->
+      spawn_link(fn ->
         send(parent, {:standalone_commit_flushed, ref, run_standalone_batch(entries, sm_state)})
       end)
 
@@ -1451,17 +1461,87 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp standalone_command_keys({:list_op_lmove, source, destination, _from_dir, _to_dir}) do
-    MapSet.new([source, destination])
+    MapSet.new([standalone_lock_key(source), standalone_lock_key(destination)])
+  end
+
+  defp standalone_command_keys({:pfmerge, destination, sources}) when is_list(sources) do
+    standalone_lock_keys([destination | sources])
+  end
+
+  defp standalone_command_keys({:cms_merge, destination, sources, _weights, _create_params})
+       when is_list(sources) do
+    standalone_lock_keys([destination | sources])
+  end
+
+  defp standalone_command_keys({:lock_keys, keys, _owner_ref, _expire_at_ms})
+       when is_list(keys) do
+    standalone_lock_keys(keys)
+  end
+
+  defp standalone_command_keys({:unlock_keys, keys, _owner_ref}) when is_list(keys) do
+    standalone_lock_keys(keys)
+  end
+
+  defp standalone_command_keys({:locked_put, key, _value, _expire_at_ms, _owner_ref}) do
+    MapSet.new([standalone_lock_key(key)])
+  end
+
+  defp standalone_command_keys({:locked_delete, key, _owner_ref}) do
+    MapSet.new([standalone_lock_key(key)])
+  end
+
+  defp standalone_command_keys({:locked_delete_prefix, prefix, _owner_ref}) do
+    MapSet.new([standalone_lock_key(prefix)])
+  end
+
+  defp standalone_command_keys({:compound_put, redis_key, _compound_key, _value, _expire_at_ms}) do
+    MapSet.new([standalone_lock_key(redis_key)])
+  end
+
+  defp standalone_command_keys({:compound_delete, redis_key, _compound_key}) do
+    MapSet.new([standalone_lock_key(redis_key)])
+  end
+
+  defp standalone_command_keys({:compound_delete_prefix, redis_key, _prefix}) do
+    MapSet.new([standalone_lock_key(redis_key)])
+  end
+
+  defp standalone_command_keys({:compound_put, compound_key, _value, _expire_at_ms}) do
+    MapSet.new([standalone_lock_key(compound_key)])
+  end
+
+  defp standalone_command_keys({:compound_delete, compound_key}) do
+    MapSet.new([standalone_lock_key(compound_key)])
+  end
+
+  defp standalone_command_keys({:compound_delete_prefix, prefix}) do
+    MapSet.new([standalone_lock_key(prefix)])
   end
 
   defp standalone_command_keys(command) when is_tuple(command) and tuple_size(command) > 1 do
     case elem(command, 1) do
-      key when is_binary(key) -> MapSet.new([key])
+      key when is_binary(key) -> MapSet.new([standalone_lock_key(key)])
       _other -> MapSet.new(["__standalone_global__"])
     end
   end
 
   defp standalone_command_keys(_command), do: MapSet.new(["__standalone_global__"])
+
+  defp standalone_lock_keys(keys) do
+    keys
+    |> Enum.reduce(MapSet.new(), fn key, acc ->
+      if is_binary(key) do
+        MapSet.put(acc, standalone_lock_key(key))
+      else
+        MapSet.put(acc, "__standalone_global__")
+      end
+    end)
+    |> standalone_nonempty_keys()
+  end
+
+  defp standalone_lock_key(key) when is_binary(key) do
+    Ferricstore.Store.CompoundKey.extract_redis_key(key)
+  end
 
   defp standalone_nonempty_keys(keys) do
     if MapSet.size(keys) == 0 do
@@ -1486,6 +1566,14 @@ defmodule Ferricstore.Store.Shard do
 
   defp reply_standalone_error(entries, reason) do
     Enum.each(entries, fn {from, _command, _keys} -> GenServer.reply(from, {:error, reason}) end)
+  end
+
+  @doc false
+  def __standalone_command_keys_for_test__(command) do
+    command
+    |> standalone_command_keys()
+    |> MapSet.to_list()
+    |> Enum.sort()
   end
 
   defp shared_write_version(%{instance_ctx: %{write_version: write_version}, index: index}) do

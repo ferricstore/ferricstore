@@ -714,6 +714,91 @@ defmodule Ferricstore.Cluster.ManagerTest do
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
+    test "replace join cleans target data then syncs starts raft adds member and writes marker" do
+      target = :"replace_success_target@127.0.0.1"
+      parent = self()
+
+      Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 ->
+        {:ok, true}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 1 ->
+        send(parent, :target_data_cleanup)
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_target_membership_hook, fn ^target, _state ->
+        %{0 => false}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 1 ->
+        send(parent, :target_raft_stop)
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
+        send(parent, :direct_sync)
+        {:ok, %{0 => 11}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_start_raft_on_target_hook, fn ^target,
+                                                                             1,
+                                                                             %{0 => 11} ->
+        send(parent, :target_raft_start)
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
+        send(parent, :raft_add)
+        {:ok, %{0 => :ok}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_write_target_marker_hook, fn ^target,
+                                                                            _ctx,
+                                                                            %{0 => 11} ->
+        send(parent, :marker_write)
+        :ok
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
+        Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
+        Process.delete(:ferricstore_cluster_manager_target_membership_hook)
+        Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
+        Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
+        Process.delete(:ferricstore_cluster_manager_start_raft_on_target_hook)
+        Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
+        Process.delete(:ferricstore_cluster_manager_write_target_marker_hook)
+      end)
+
+      state = %{
+        mode: :cluster,
+        role: :voter,
+        cluster_nodes: [],
+        remove_delay_ms: 60_000,
+        known_nodes: MapSet.new(),
+        remove_timers: %{},
+        sync_status: :synced,
+        shard_sync_status: %{},
+        shard_count: 1
+      }
+
+      assert {:reply, :ok, new_state} =
+               Manager.handle_call(
+                 {:add_node, target, :voter, [replace: true]},
+                 {self(), make_ref()},
+                 state
+               )
+
+      assert_received :target_data_cleanup
+      assert_received :target_raft_stop
+      assert_received :direct_sync
+      assert_received :target_raft_start
+      assert_received :raft_add
+      assert_received :marker_write
+      assert MapSet.member?(new_state.known_nodes, target)
+    end
+
     test "promotion flush path does not wait on Flow LMDB projection durability" do
       source =
         File.read!(Path.expand("../../../lib/ferricstore/cluster/manager.ex", __DIR__))

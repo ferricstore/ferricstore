@@ -289,6 +289,183 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     Application.delete_env(:ferricstore, :standalone_durability_hook)
   end
 
+  test "standalone command key audit covers multi-key writes" do
+    compound_key = Ferricstore.Store.CompoundKey.zset_member("zset-key", "member")
+    owner_ref = make_ref()
+
+    assert standalone_keys({:list_op_lmove, "source", "destination", :left, :right}) ==
+             ["destination", "source"]
+
+    assert standalone_keys({:pfmerge, "destination", ["source-a", "source-b"]}) ==
+             ["destination", "source-a", "source-b"]
+
+    assert standalone_keys({:cms_merge, "destination", ["source-a", "source-b"], [1, 1], nil}) ==
+             ["destination", "source-a", "source-b"]
+
+    assert standalone_keys({:lock_keys, ["source", "destination"], owner_ref, 1_000}) ==
+             ["destination", "source"]
+
+    assert standalone_keys({:unlock_keys, ["source", "destination"], owner_ref}) ==
+             ["destination", "source"]
+
+    assert standalone_keys({:compound_put, compound_key, "1.0", 0}) == ["zset-key"]
+    assert standalone_keys({:locked_delete_prefix, compound_key, owner_ref}) == ["zset-key"]
+  end
+
+  test "standalone blocked fsync does not let same-key write publish early" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:same-key-fsync-order"
+    parent = self()
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      if Enum.any?(batch, &match?({:put, ^key, "one", 0}, &1)) do
+        send(parent, {:durability_hook_blocked, self()})
+
+        receive do
+          :release_durability_hook -> :passthrough
+        after
+          5_000 -> {:error, :durability_hook_timeout}
+        end
+      else
+        :passthrough
+      end
+    end)
+
+    first = Task.async(fn -> Router.put(ctx, key, "one", 0) end)
+    assert_receive {:durability_hook_blocked, hook_pid}, 5_000
+
+    second = Task.async(fn -> Router.put(ctx, key, "two", 0) end)
+    refute Task.yield(second, 100)
+    assert Router.get(ctx, key) == nil
+
+    send(hook_pid, :release_durability_hook)
+    assert :ok = Task.await(first, 5_000)
+    assert :ok = Task.await(second, 5_000)
+    assert Router.get(ctx, key) == "two"
+  after
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
+  test "standalone different-key write is accepted while fsync is blocked" do
+    ctx = FerricStore.Instance.get(:default)
+    first_key = "standalone:different-key-fsync:first"
+    shard_idx = Router.shard_for(ctx, first_key)
+    second_key = key_on_same_shard(ctx, shard_idx)
+    shard = elem(ctx.shard_names, shard_idx)
+    parent = self()
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      if Enum.any?(batch, &match?({:put, ^first_key, "one", 0}, &1)) do
+        send(parent, {:durability_hook_blocked, self()})
+
+        receive do
+          :release_durability_hook -> :passthrough
+        after
+          5_000 -> {:error, :durability_hook_timeout}
+        end
+      else
+        :passthrough
+      end
+    end)
+
+    first = Task.async(fn -> Router.put(ctx, first_key, "one", 0) end)
+    assert_receive {:durability_hook_blocked, hook_pid}, 5_000
+
+    second = Task.async(fn -> Router.put(ctx, second_key, "two", 0) end)
+
+    assert eventually(fn ->
+             debug = GenServer.call(shard, :standalone_commit_debug, 100)
+             debug.batch_count == 1 and debug.waiting_count == 0
+           end)
+
+    send(hook_pid, :release_durability_hook)
+    assert :ok = Task.await(first, 5_000)
+    assert :ok = Task.await(second, 5_000)
+    assert Router.get(ctx, first_key) == "one"
+    assert Router.get(ctx, second_key) == "two"
+  after
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
+  test "standalone shard crash kills blocked fsync worker before publish" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:blocked-fsync-shard-crash"
+    shard_idx = Router.shard_for(ctx, key)
+    shard = elem(ctx.shard_names, shard_idx)
+    parent = self()
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      assert Enum.any?(batch, &match?({:put, ^key, "value", 0}, &1))
+      send(parent, {:durability_hook_blocked, self()})
+
+      receive do
+        :release_durability_hook -> :passthrough
+      after
+        30_000 -> {:error, :durability_hook_timeout}
+      end
+    end)
+
+    write_pid =
+      spawn(fn ->
+        result =
+          try do
+            Router.put(ctx, key, "value", 0)
+          catch
+            :exit, reason -> {:exit, reason}
+          end
+
+        send(parent, {:write_result, result})
+      end)
+
+    assert_receive {:durability_hook_blocked, hook_pid}, 5_000
+    hook_ref = Process.monitor(hook_pid)
+    Process.exit(Process.whereis(shard), :kill)
+
+    assert_receive {:DOWN, ^hook_ref, :process, ^hook_pid, _reason}, 5_000
+    assert_receive {:write_result, {:exit, _reason}}, 5_000
+    refute Process.alive?(write_pid)
+
+    wait_local_shards_alive()
+    assert Router.get(ctx, key) == nil
+  after
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
+  test "standalone explicit flush waits for blocked fsync batch" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:flush-waits-for-fsync"
+    shard = elem(ctx.shard_names, Router.shard_for(ctx, key))
+    parent = self()
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      assert Enum.any?(batch, &match?({:put, ^key, "value", 0}, &1))
+      send(parent, {:durability_hook_blocked, self()})
+
+      receive do
+        :release_durability_hook -> :passthrough
+      after
+        5_000 -> {:error, :durability_hook_timeout}
+      end
+    end)
+
+    write = Task.async(fn -> Router.put(ctx, key, "value", 0) end)
+    assert_receive {:durability_hook_blocked, hook_pid}, 5_000
+
+    flush =
+      Task.async(fn ->
+        GenServer.call(shard, :flush, 30_000)
+      end)
+
+    refute Task.yield(flush, 100)
+    send(hook_pid, :release_durability_hook)
+
+    assert :ok = Task.await(write, 5_000)
+    assert :ok = Task.await(flush, 5_000)
+    assert Router.get(ctx, key) == "value"
+  after
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
   test "standalone write ack does not depend on Flow LMDB writer availability" do
     ctx = FerricStore.Instance.get(:default)
     key = "standalone:flow-lmdb-unavailable"
@@ -354,6 +531,27 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     ctx.data_dir
     |> Ferricstore.DataDir.shard_data_path(shard_idx)
     |> Ferricstore.Flow.LMDB.path()
+  end
+
+  defp standalone_keys(command) do
+    Ferricstore.Store.Shard.__standalone_command_keys_for_test__(command)
+  end
+
+  defp eventually(fun, timeout_ms \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    Stream.repeatedly(fn -> Process.sleep(20) end)
+    |> Enum.reduce_while(false, fn _, _ ->
+      if fun.() do
+        {:halt, true}
+      else
+        if System.monotonic_time(:millisecond) > deadline do
+          {:halt, false}
+        else
+          {:cont, false}
+        end
+      end
+    end)
   end
 
   test "enabling marker stays fail-closed on restart without stable node name", %{
