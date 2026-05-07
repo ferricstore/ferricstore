@@ -238,6 +238,23 @@ defmodule Ferricstore.Commands.ClusterCommandsTest do
     end
   end
 
+  describe "CLUSTER.DURABILITY" do
+    test "status reports standalone repair fields", %{store: store} do
+      result = Cluster.handle("CLUSTER.DURABILITY", ["STATUS"], store)
+
+      assert is_binary(result)
+      assert result =~ "replication_mode:"
+      assert result =~ "repair_required:"
+      assert result =~ "paused_shards:"
+      assert result =~ "disk_pressure_shards:"
+      assert result =~ "error_shards:"
+    end
+
+    test "rejects unknown CLUSTER.DURABILITY option", %{store: store} do
+      assert {:error, "ERR syntax error"} = Cluster.handle("CLUSTER.DURABILITY", ["NOW"], store)
+    end
+  end
+
   describe "CLUSTER.STATUS" do
     test "includes replication marker details", %{store: store} do
       result = Cluster.handle("CLUSTER.STATUS", [], store)

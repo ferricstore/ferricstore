@@ -137,6 +137,43 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     assert version_after_old == version_before + 1
   end
 
+  test "cluster durability status reports fail-closed state and resume clears it" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:durability-repair"
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      assert Enum.any?(batch, &match?({:put, ^key, "broken", 0}, &1))
+      {:error, :simulated_eio}
+    end)
+
+    assert {:error, message} = Router.put(ctx, key, "broken", 0)
+    assert message =~ "ERR standalone durability failure"
+
+    status = Ferricstore.Commands.Cluster.handle("CLUSTER.DURABILITY", ["STATUS"], %{})
+    assert status =~ "repair_required: true"
+    assert status =~ "paused_shards: #{ctx.shard_count}"
+    assert status =~ "disk_pressure_shards: #{ctx.shard_count}"
+
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+
+    assert :ok = Ferricstore.Commands.Cluster.handle("CLUSTER.DURABILITY", ["RESUME"], %{})
+    assert Ferricstore.Health.ready?()
+
+    for shard_idx <- 0..(ctx.shard_count - 1) do
+      assert :atomics.get(ctx.disk_pressure, shard_idx + 1) == 0
+    end
+
+    assert :ok = Router.put(ctx, key, "repaired", 0)
+    assert Router.get(ctx, key) == "repaired"
+
+    status = Ferricstore.Commands.Cluster.handle("CLUSTER.DURABILITY", ["STATUS"], %{})
+    assert status =~ "repair_required: false"
+    assert status =~ "paused_shards: 0"
+    assert status =~ "disk_pressure_shards: 0"
+  after
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
   test "standalone group commit batches writes that arrive before fsync starts" do
     ctx = FerricStore.Instance.get(:default)
     key1 = "standalone:group-commit:1"

@@ -23,6 +23,8 @@ defmodule Ferricstore.Commands.Cluster do
     * `CLUSTER.JOIN <node> [REPLACE]` -- adds a node to the cluster
     * `CLUSTER.ENABLE [DRYRUN|RESUME|STATUS]` -- promotes or inspects a manual
       standalone node to Raft
+    * `CLUSTER.DURABILITY [STATUS|RESUME]` -- inspects or resumes standalone
+      durability fail-closed state
     * `CLUSTER.LEAVE` -- gracefully removes this node from the cluster
     * `CLUSTER.FAILOVER <shard_index> <target_node>` -- transfers shard
       leadership to a specific node
@@ -235,6 +237,32 @@ defmodule Ferricstore.Commands.Cluster do
 
   def handle("CLUSTER.ENABLE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'cluster.enable' command"}
+  end
+
+  # -- CLUSTER.DURABILITY -----------------------------------------------------
+
+  def handle("CLUSTER.DURABILITY", [], _store) do
+    format_durability_status(ClusterManager.durability_status())
+  end
+
+  def handle("CLUSTER.DURABILITY", [arg], _store) when is_binary(arg) do
+    case String.upcase(arg) do
+      "STATUS" ->
+        format_durability_status(ClusterManager.durability_status())
+
+      "RESUME" ->
+        case ClusterManager.resume_standalone_durability() do
+          :ok -> :ok
+          {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+        end
+
+      _ ->
+        {:error, "ERR syntax error"}
+    end
+  end
+
+  def handle("CLUSTER.DURABILITY", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.durability' command"}
   end
 
   # -- CLUSTER.LEAVE ----------------------------------------------------------
@@ -471,6 +499,35 @@ defmodule Ferricstore.Commands.Cluster do
 
   defp format_enable_marker(other) do
     {"unknown", ["marker_error: #{inspect(other)}"]}
+  end
+
+  defp format_durability_status(status) when is_map(status) do
+    header = [
+      "replication_mode: #{Map.get(status, :replication_mode)}",
+      "manager_mode: #{Map.get(status, :manager_mode)}",
+      "ready: #{Map.get(status, :ready)}",
+      "repair_required: #{Map.get(status, :repair_required)}",
+      "paused_shards: #{Map.get(status, :paused_shards)}",
+      "disk_pressure_shards: #{Map.get(status, :disk_pressure_shards)}",
+      "error_shards: #{Map.get(status, :error_shards)}"
+    ]
+
+    shard_lines =
+      status
+      |> Map.get(:shards, %{})
+      |> Enum.sort_by(fn {idx, _info} -> idx end)
+      |> Enum.flat_map(fn {idx, info} ->
+        [
+          "shard_#{idx}:",
+          "  writes_paused: #{Map.get(info, :writes_paused)}",
+          "  disk_pressure: #{Map.get(info, :disk_pressure)}",
+          "  last_flush_error: #{inspect(Map.get(info, :last_flush_error))}",
+          "  pending_count: #{Map.get(info, :pending_count)}",
+          "  standalone_flush_inflight: #{Map.get(info, :standalone_flush_inflight)}"
+        ]
+      end)
+
+    Enum.join(header ++ shard_lines, "\r\n")
   end
 
   defp collect_shard_info do

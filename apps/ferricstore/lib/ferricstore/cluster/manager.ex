@@ -88,6 +88,18 @@ defmodule Ferricstore.Cluster.Manager do
     GenServer.call(__MODULE__, :enable_status)
   end
 
+  @doc "Returns standalone durability repair status."
+  @spec durability_status() :: map()
+  def durability_status do
+    GenServer.call(__MODULE__, :durability_status)
+  end
+
+  @doc "Attempts to resume standalone writes after a fail-closed durability error."
+  @spec resume_standalone_durability() :: :ok | {:error, term()}
+  def resume_standalone_durability do
+    GenServer.call(__MODULE__, :resume_standalone_durability, 120_000)
+  end
+
   # ---------------------------------------------------------------------------
   # GenServer callbacks
   # ---------------------------------------------------------------------------
@@ -175,6 +187,15 @@ defmodule Ferricstore.Cluster.Manager do
 
   def handle_call(:enable_status, _from, state) do
     {:reply, enable_status_snapshot(state), state}
+  end
+
+  def handle_call(:durability_status, _from, state) do
+    {:reply, durability_status_snapshot(state), state}
+  end
+
+  def handle_call(:resume_standalone_durability, _from, state) do
+    result = do_resume_standalone_durability()
+    {:reply, result, state}
   end
 
   def handle_call({:enable_cluster, opts}, _from, state) do
@@ -547,6 +568,74 @@ defmodule Ferricstore.Cluster.Manager do
     FerricStore.Instance.get(:default)
   rescue
     _ -> nil
+  end
+
+  defp durability_status_snapshot(state) do
+    ctx = default_instance()
+    mode = Ferricstore.ReplicationMode.current()
+    shards = if ctx, do: durability_shard_statuses(ctx), else: %{}
+
+    paused_count =
+      Enum.count(shards, fn {_idx, info} -> Map.get(info, :writes_paused) == true end)
+
+    pressure_count =
+      Enum.count(shards, fn {_idx, info} -> Map.get(info, :disk_pressure) == true end)
+
+    error_count =
+      Enum.count(shards, fn {_idx, info} -> Map.get(info, :last_flush_error) != nil end)
+
+    %{
+      manager_mode: state.mode,
+      replication_mode: mode,
+      ready: Ferricstore.Health.ready?(),
+      repair_required: paused_count > 0 or pressure_count > 0 or error_count > 0,
+      paused_shards: paused_count,
+      disk_pressure_shards: pressure_count,
+      error_shards: error_count,
+      shards: shards
+    }
+  end
+
+  defp durability_shard_statuses(%{shard_count: shard_count, shard_names: shard_names} = ctx) do
+    for shard_idx <- 0..(shard_count - 1), into: %{} do
+      shard_status =
+        try do
+          GenServer.call(elem(shard_names, shard_idx), :write_status, 5_000)
+        catch
+          kind, reason -> %{error: {kind, reason}}
+        end
+
+      disk_pressure = Ferricstore.Store.DiskPressure.under_pressure?(ctx, shard_idx)
+
+      {shard_idx, Map.put(shard_status, :disk_pressure, disk_pressure)}
+    end
+  end
+
+  defp do_resume_standalone_durability do
+    case {Ferricstore.ReplicationMode.current(), default_instance()} do
+      {:standalone, ctx} when is_map(ctx) ->
+        with :ok <- flush_all_shards(ctx),
+             :ok <- resume_standalone_shards_after_repair(ctx) do
+          Ferricstore.Health.set_ready(true)
+          :ok
+        end
+
+      {mode, _ctx} ->
+        {:error, {:invalid_replication_mode, mode}}
+    end
+  end
+
+  defp resume_standalone_shards_after_repair(
+         %{shard_count: shard_count, shard_names: shard_names} = ctx
+       ) do
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn shard_idx, :ok ->
+      Ferricstore.Store.DiskPressure.clear(ctx, shard_idx)
+
+      case GenServer.call(elem(shard_names, shard_idx), {:resume_writes}, 5_000) do
+        :ok -> {:cont, :ok}
+        other -> {:halt, {:error, {:resume_shard_failed, shard_idx, other}}}
+      end
+    end)
   end
 
   defp pause_all_shards(%{shard_count: shard_count} = ctx) do

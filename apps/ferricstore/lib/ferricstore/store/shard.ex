@@ -525,6 +525,18 @@ defmodule Ferricstore.Store.Shard do
      }, state}
   end
 
+  def handle_call(:write_status, _from, state) do
+    {:reply,
+     %{
+       writes_paused: state.writes_paused,
+       last_flush_error: state.last_flush_error,
+       pending_count: state.pending_count,
+       standalone_batch_count: length(state.standalone_batch),
+       standalone_waiting_count: length(state.standalone_waiting),
+       standalone_flush_inflight: state.standalone_flush_ref != nil
+     }, state}
+  end
+
   def handle_call({:forwarded_quorum, origin_node, command}, from, state) do
     forwarded_from = Ferricstore.Raft.Batcher.remote_origin_from(origin_node, from)
     previous_origin = Process.get(:ferricstore_forward_origin)

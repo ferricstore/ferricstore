@@ -189,6 +189,7 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     - `opts` -- keyword options:
       - `:shards` -- number of shards (default: 4)
+      - `:raft_mode` -- FerricStore raft mode (default: configured app default)
 
   ## Returns
 
@@ -227,6 +228,10 @@ defmodule Ferricstore.Test.ClusterHelper do
     :ets.insert(:ferricstore_solo_peers, {node_name, peer_pid, data_dir})
 
     configure_remote_node(node_name, data_dir, shards)
+
+    if raft_mode = Keyword.get(opts, :raft_mode) do
+      :ok = :rpc.call(node_name, Application, :put_env, [:ferricstore, :raft_mode, raft_mode])
+    end
 
     cluster_nodes = Keyword.get(opts, :cluster_nodes, [])
 
