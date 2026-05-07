@@ -123,7 +123,9 @@ defmodule Ferricstore.Store.Shard do
     zset_score_lookup: nil,
     flow_index: nil,
     flow_lookup: nil,
-    zset_index_ready: MapSet.new()
+    zset_index_ready: MapSet.new(),
+    standalone_batch: [],
+    standalone_batch_timer: nil
   ]
 
   # -------------------------------------------------------------------
@@ -498,6 +500,15 @@ defmodule Ferricstore.Store.Shard do
   def handle_call(command, _from, %{writes_paused: true} = state)
       when is_tuple(command) and command != {:pause_writes} and command != {:resume_writes} do
     {:reply, {:error, "ERR shard writes paused for sync"}, state}
+  end
+
+  def handle_call({:standalone_commit, command}, from, state) do
+    state =
+      state
+      |> enqueue_standalone_commit(from, command)
+      |> maybe_flush_full_standalone_batch()
+
+    {:noreply, state}
   end
 
   def handle_call({:forwarded_quorum, origin_node, command}, from, state) do
@@ -1160,32 +1171,7 @@ defmodule Ferricstore.Store.Shard do
       {:noreply, state}
     else
       # No Raft — apply directly via state machine.
-      sm_state = %{
-        shard_index: state.index,
-        data_dir: state.data_dir,
-        data_dir_expanded: Path.expand(state.data_dir),
-        shard_data_path: state.shard_data_path,
-        shard_data_path_expanded: Path.expand(state.shard_data_path),
-        active_file_id: state.active_file_id,
-        active_file_path: state.active_file_path,
-        active_file_size: state.active_file_size,
-        file_stats: state.file_stats,
-        merge_config: state.merge_config,
-        max_active_file_size: state.max_active_file_size,
-        ets: state.ets,
-        applied_count: 0,
-        release_cursor_interval:
-          Application.get_env(:ferricstore, :release_cursor_interval, 200_000),
-        cross_shard_locks: %{},
-        cross_shard_intents: %{},
-        instance_ctx: state.instance_ctx,
-        instance_name: if(state.instance_ctx, do: state.instance_ctx.name, else: :default),
-        zset_score_index_name: state.zset_score_index,
-        zset_score_lookup_name: state.zset_score_lookup,
-        flow_index_name: state.flow_index,
-        flow_lookup_name: state.flow_lookup,
-        flow_lmdb_path: Ferricstore.Flow.LMDB.path(state.shard_data_path)
-      }
+      sm_state = direct_sm_state(state)
 
       case Ferricstore.Raft.StateMachine.apply(%{}, command, sm_state) do
         {new_sm_state, result} ->
@@ -1228,6 +1214,135 @@ defmodule Ferricstore.Store.Shard do
         active_file_size: Map.get(sm_state, :active_file_size, state.active_file_size),
         file_stats: Map.get(sm_state, :file_stats, state.file_stats)
     }
+  end
+
+  defp direct_sm_state(state) do
+    %{
+      shard_index: state.index,
+      data_dir: state.data_dir,
+      data_dir_expanded: Path.expand(state.data_dir),
+      shard_data_path: state.shard_data_path,
+      shard_data_path_expanded: Path.expand(state.shard_data_path),
+      active_file_id: state.active_file_id,
+      active_file_path: state.active_file_path,
+      active_file_size: state.active_file_size,
+      file_stats: state.file_stats,
+      merge_config: state.merge_config,
+      max_active_file_size: state.max_active_file_size,
+      ets: state.ets,
+      applied_count: 0,
+      release_cursor_interval:
+        Application.get_env(:ferricstore, :release_cursor_interval, 200_000),
+      cross_shard_locks: %{},
+      cross_shard_intents: %{},
+      instance_ctx: state.instance_ctx,
+      instance_name: if(state.instance_ctx, do: state.instance_ctx.name, else: :default),
+      zset_score_index_name: state.zset_score_index,
+      zset_score_lookup_name: state.zset_score_lookup,
+      flow_index_name: state.flow_index,
+      flow_lookup_name: state.flow_lookup,
+      flow_lmdb_path: Ferricstore.Flow.LMDB.path(state.shard_data_path)
+    }
+  end
+
+  defp enqueue_standalone_commit(state, from, command) do
+    timer =
+      if state.standalone_batch_timer == nil do
+        Process.send_after(self(), :standalone_commit_flush, standalone_commit_delay_ms())
+      else
+        state.standalone_batch_timer
+      end
+
+    %{
+      state
+      | standalone_batch: [{from, command} | state.standalone_batch],
+        standalone_batch_timer: timer
+    }
+  end
+
+  defp maybe_flush_full_standalone_batch(state) do
+    if length(state.standalone_batch) >= standalone_commit_max_ops() do
+      flush_standalone_batch(state)
+    else
+      state
+    end
+  end
+
+  defp standalone_commit_delay_ms do
+    :ferricstore
+    |> Application.get_env(:standalone_fsync_max_delay_ms, @flush_interval_ms)
+    |> normalize_positive_integer(@flush_interval_ms)
+  end
+
+  defp standalone_commit_max_ops do
+    :ferricstore
+    |> Application.get_env(:standalone_fsync_max_ops, 1024)
+    |> normalize_positive_integer(1024)
+  end
+
+  defp normalize_positive_integer(value, _default) when is_integer(value) and value > 0, do: value
+  defp normalize_positive_integer(_value, default), do: default
+
+  defp flush_standalone_batch(%{standalone_batch: []} = state) do
+    %{state | standalone_batch_timer: nil}
+  end
+
+  defp flush_standalone_batch(state) do
+    if timer = state.standalone_batch_timer do
+      Process.cancel_timer(timer)
+    end
+
+    entries = Enum.reverse(state.standalone_batch)
+    commands = Enum.map(entries, fn {_from, command} -> command end)
+    sm_state = direct_sm_state(state)
+
+    {new_state, reply} =
+      try do
+        case Ferricstore.Raft.StateMachine.apply_standalone_batch(commands, sm_state) do
+          {new_sm_state, {:ok, results}} when is_list(results) ->
+            state = apply_direct_sm_state(state, new_sm_state)
+            reply_standalone_results(entries, results)
+            {state, :ok}
+
+          {new_sm_state, {:error, reason}} ->
+            state = apply_direct_sm_state(state, new_sm_state)
+            reply_standalone_error(entries, {:standalone_durability_failed, reason})
+            {state, :error}
+
+          {new_sm_state, result} ->
+            state = apply_direct_sm_state(state, new_sm_state)
+            reply_standalone_results(entries, List.wrap(result))
+            {state, :ok}
+        end
+      rescue
+        error ->
+          reply_standalone_error(entries, {:standalone_durability_failed, {:exception, error}})
+          {state, :error}
+      catch
+        kind, reason ->
+          reply_standalone_error(entries, {:standalone_durability_failed, {kind, reason}})
+          {state, :error}
+      end
+
+    _ = reply
+    %{new_state | standalone_batch: [], standalone_batch_timer: nil}
+  end
+
+  defp reply_standalone_results(entries, results) when length(entries) == length(results) do
+    Enum.zip(entries, results)
+    |> Enum.each(fn {{from, _command}, result} -> GenServer.reply(from, result) end)
+  end
+
+  defp reply_standalone_results(entries, [result]) do
+    Enum.each(entries, fn {from, _command} -> GenServer.reply(from, result) end)
+  end
+
+  defp reply_standalone_results(entries, results) do
+    reply_standalone_error(entries, {:standalone_result_mismatch, length(results)})
+  end
+
+  defp reply_standalone_error(entries, reason) do
+    Enum.each(entries, fn {from, _command} -> GenServer.reply(from, {:error, reason}) end)
   end
 
   defp shared_write_version(%{instance_ctx: %{write_version: write_version}, index: index}) do
@@ -1825,6 +1940,10 @@ defmodule Ferricstore.Store.Shard do
     state = flush_pending(state)
     schedule_drain_pending(Process.get(:flush_interval_ms, @flush_interval_ms))
     {:noreply, state}
+  end
+
+  def handle_info(:standalone_commit_flush, state) do
+    {:noreply, flush_standalone_batch(state)}
   end
 
   # Periodic fragmentation re-evaluation for idle shards.

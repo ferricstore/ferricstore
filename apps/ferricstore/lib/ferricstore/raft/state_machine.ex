@@ -65,6 +65,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   @behaviour :ra_machine
 
+  import Kernel, except: [apply: 3]
   import Bitwise
 
   require Logger
@@ -104,6 +105,7 @@ defmodule Ferricstore.Raft.StateMachine do
   @cold_location_retry_attempts 8
   @cold_location_retry_sleep_ms 1
   @sm_apply_state_key :sm_apply_state
+  @sm_standalone_staged_key :sm_standalone_staged_apply
   @sm_pending_write_keys [
     :sm_pending_writes,
     :sm_pending_originals,
@@ -1189,6 +1191,21 @@ defmodule Ferricstore.Raft.StateMachine do
   @doc false
   def __apply_pending_locations_for_test__(state, file_id, batch, locations) do
     apply_pending_locations(state, file_id, batch, locations)
+  end
+
+  @doc false
+  def apply_standalone_batch(commands, state) when is_list(commands) do
+    previous = Process.get(@sm_standalone_staged_key, :undefined)
+    Process.put(@sm_standalone_staged_key, true)
+
+    try do
+      apply(%{}, {:batch, commands}, state)
+    after
+      case previous do
+        :undefined -> Process.delete(@sm_standalone_staged_key)
+        value -> Process.put(@sm_standalone_staged_key, value)
+      end
+    end
   end
 
   @doc false
@@ -7130,13 +7147,16 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp raw_put_cold(state, key, value, expire_at_ms, lfu) do
     disk_val = to_disk_binary(value)
-    track_keydir_binary_delta(state, key, nil)
     record_pending_original(state, key)
 
-    :ets.insert(
-      state.ets,
-      {key, nil, expire_at_ms, lfu, :pending, 0, byte_size(disk_val)}
-    )
+    unless standalone_staged_apply?() do
+      track_keydir_binary_delta(state, key, nil)
+
+      :ets.insert(
+        state.ets,
+        {key, nil, expire_at_ms, lfu, :pending, 0, byte_size(disk_val)}
+      )
+    end
 
     queue_pending_put_cold(key, disk_val, expire_at_ms)
     :ok
@@ -7164,19 +7184,22 @@ defmodule Ferricstore.Raft.StateMachine do
     ets_val = value_for_ets(value, hot_cache_threshold(state))
     disk_val = to_disk_binary(value)
 
-    # Track binary memory: subtract old entry's bytes, add new entry's bytes.
-    # This gives MemoryGuard accurate off-heap binary accounting.
-    track_keydir_binary_delta(state, key, ets_val)
     record_pending_original(state, key)
 
-    # Insert into ETS immediately so subsequent read-modify-write commands
-    # (INCR, APPEND, etc.) in the same batch see the correct value.
-    # The file_id is :pending — flush_pending_writes will update it with
-    # the real offset after the batch NIF call.
-    :ets.insert(
-      state.ets,
-      {key, ets_val, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
-    )
+    unless standalone_staged_apply?() do
+      # Track binary memory: subtract old entry's bytes, add new entry's bytes.
+      # This gives MemoryGuard accurate off-heap binary accounting.
+      track_keydir_binary_delta(state, key, ets_val)
+
+      # Insert into ETS immediately so subsequent read-modify-write commands
+      # (INCR, APPEND, etc.) in the same batch see the correct value.
+      # The file_id is :pending — flush_pending_writes will update it with
+      # the real offset after the batch NIF call.
+      :ets.insert(
+        state.ets,
+        {key, ets_val, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
+      )
+    end
 
     # Accumulate for batch disk write — flushed by flush_pending_writes
     # at the end of apply/3 before returning to ra.
@@ -7475,6 +7498,71 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp append_pending_batch(file_path, batch) do
+    if standalone_staged_apply?() do
+      append_pending_batch_sync(file_path, batch)
+    else
+      append_pending_batch_nosync(file_path, batch)
+    end
+  end
+
+  defp append_pending_batch_sync(file_path, batch) do
+    case standalone_durability_hook(file_path, batch) do
+      :passthrough ->
+        do_append_pending_batch_sync(file_path, batch)
+
+      {:error, _reason} = error ->
+        error
+
+      {:ok, _locations} = ok ->
+        ok
+
+      other ->
+        other
+    end
+  end
+
+  defp do_append_pending_batch_sync(file_path, batch) do
+    if Enum.any?(batch, &match?({:delete, _, _}, &1)) do
+      ops =
+        Enum.map(batch, fn
+          {:put, key, value, expire_at_ms} -> {:put, key, value, expire_at_ms}
+          {:put_cold, key, value, expire_at_ms} -> {:put, key, value, expire_at_ms}
+          {:delete, key, _prob_path} -> {:delete, key}
+        end)
+
+      case NIF.v2_append_ops_batch_nosync(file_path, ops) do
+        {:ok, locations} ->
+          case NIF.v2_fsync(file_path) do
+            :ok -> {:ok, locations}
+            {:error, reason} -> {:error, reason}
+          end
+
+        {:error, _reason} = error ->
+          error
+      end
+    else
+      puts =
+        Enum.map(batch, fn
+          {:put, key, value, expire_at_ms} -> {key, value, expire_at_ms}
+          {:put_cold, key, value, expire_at_ms} -> {key, value, expire_at_ms}
+        end)
+
+      case NIF.v2_append_batch(file_path, puts) do
+        {:ok, locations} ->
+          tagged_locations =
+            Enum.map(locations, fn {offset, value_size} ->
+              {:put, offset, value_size}
+            end)
+
+          {:ok, tagged_locations}
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+  end
+
+  defp append_pending_batch_nosync(file_path, batch) do
     if Enum.any?(batch, &match?({:delete, _, _}, &1)) do
       ops =
         Enum.map(batch, fn
@@ -7503,6 +7591,13 @@ defmodule Ferricstore.Raft.StateMachine do
         {:error, _reason} = error ->
           error
       end
+    end
+  end
+
+  defp standalone_durability_hook(file_path, batch) do
+    case Application.get_env(:ferricstore, :standalone_durability_hook) do
+      hook when is_function(hook, 2) -> hook.(file_path, batch)
+      _ -> :passthrough
     end
   end
 
@@ -7554,10 +7649,18 @@ defmodule Ferricstore.Raft.StateMachine do
       {{:put_cold, key, val, exp}, {:put, offset, value_size}} ->
         apply_put_cold_pending_location(state, key, val, exp, file_id, offset, value_size)
 
-      {{:delete, _key, nil}, {:delete, _offset, _record_size}} ->
-        :ok
+      {{:delete, key, nil}, {:delete, _offset, _record_size}} ->
+        if standalone_staged_apply?() do
+          track_keydir_binary_remove(state, key)
+          :ets.delete(state.ets, key)
+        end
 
-      {{:delete, _key, prob_path}, {:delete, _offset, _record_size}} ->
+      {{:delete, key, prob_path}, {:delete, _offset, _record_size}} ->
+        if standalone_staged_apply?() do
+          track_keydir_binary_remove(state, key)
+          :ets.delete(state.ets, key)
+        end
+
         maybe_delete_prob_file_path(state, prob_path)
     end)
   end
@@ -7571,18 +7674,23 @@ defmodule Ferricstore.Raft.StateMachine do
          offset,
          value_size
        ) do
-    expected_staged_size = byte_size(to_disk_binary(value))
+    if standalone_staged_apply?() do
+      track_keydir_binary_delta(state, key, nil)
+      :ets.insert(state.ets, {key, nil, expire_at_ms, LFU.initial(), file_id, offset, value_size})
+    else
+      expected_staged_size = byte_size(to_disk_binary(value))
 
-    replace_pending_location(
-      state,
-      key,
-      nil,
-      expire_at_ms,
-      expected_staged_size,
-      file_id,
-      offset,
-      value_size
-    )
+      replace_pending_location(
+        state,
+        key,
+        nil,
+        expire_at_ms,
+        expected_staged_size,
+        file_id,
+        offset,
+        value_size
+      )
+    end
 
     :ok
   end
@@ -7591,31 +7699,40 @@ defmodule Ferricstore.Raft.StateMachine do
     expected_value = value_for_ets(value, hot_cache_threshold(state))
     expected_staged_size = byte_size(to_disk_binary(value))
 
-    replaced =
-      replace_pending_location(
-        state,
-        key,
-        expected_value,
-        expire_at_ms,
-        expected_staged_size,
-        file_id,
-        offset,
-        value_size
-      )
+    if standalone_staged_apply?() do
+      track_keydir_binary_delta(state, key, expected_value)
 
-    if replaced == 0 and expected_staged_size != 0 do
-      # Router-originated async writes stage small values with vsize=0; Ra apply
-      # must still CAS on value/expiry so stale append results cannot publish.
-      replace_pending_location(
-        state,
-        key,
-        expected_value,
-        expire_at_ms,
-        0,
-        file_id,
-        offset,
-        value_size
+      :ets.insert(
+        state.ets,
+        {key, expected_value, expire_at_ms, LFU.initial(), file_id, offset, value_size}
       )
+    else
+      replaced =
+        replace_pending_location(
+          state,
+          key,
+          expected_value,
+          expire_at_ms,
+          expected_staged_size,
+          file_id,
+          offset,
+          value_size
+        )
+
+      if replaced == 0 and expected_staged_size != 0 do
+        # Router-originated async writes stage small values with vsize=0; Ra apply
+        # must still CAS on value/expiry so stale append results cannot publish.
+        replace_pending_location(
+          state,
+          key,
+          expected_value,
+          expire_at_ms,
+          0,
+          file_id,
+          offset,
+          value_size
+        )
+      end
     end
 
     :ok
@@ -7662,8 +7779,10 @@ defmodule Ferricstore.Raft.StateMachine do
     pending = Process.get(:sm_pending_writes, [])
     Process.put(:sm_pending_writes, [{:delete, key, prob_path} | pending])
     pending_values = Process.get(:sm_pending_values, %{})
-    Process.put(:sm_pending_values, Map.delete(pending_values, key))
+    Process.put(:sm_pending_values, Map.put(pending_values, key, :deleted))
   end
+
+  defp standalone_staged_apply?, do: Process.get(@sm_standalone_staged_key) == true
 
   defp emit_raft_apply_telemetry(state, started_at, result, flush_result) do
     :telemetry.execute(
@@ -8195,10 +8314,14 @@ defmodule Ferricstore.Raft.StateMachine do
 
         {_file_path, _file_id} ->
           record_pending_original(state, key)
-          track_keydir_binary_remove(state, key)
-          :ets.delete(state.ets, key)
           queue_pending_delete(key, prob_path)
-          maybe_queue_lmdb_state_delete(state, key)
+
+          unless standalone_staged_apply?() do
+            track_keydir_binary_remove(state, key)
+            :ets.delete(state.ets, key)
+            maybe_queue_lmdb_state_delete(state, key)
+          end
+
           :ok
       end
     end
@@ -9156,6 +9279,9 @@ defmodule Ferricstore.Raft.StateMachine do
     pending = Process.get(:sm_pending_values)
 
     case pending && Map.get(pending, key) do
+      :deleted ->
+        :miss
+
       {value, 0} ->
         {:hit, value, 0}
 

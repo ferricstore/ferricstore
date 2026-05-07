@@ -6,6 +6,16 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
   setup do
     old_data_dir = Application.get_env(:ferricstore, :data_dir)
     old_raft_mode = Application.get_env(:ferricstore, :raft_mode)
+
+    old_standalone_durability_hook =
+      Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    old_standalone_fsync_max_delay_ms =
+      Application.get_env(:ferricstore, :standalone_fsync_max_delay_ms)
+
+    old_standalone_fsync_max_ops =
+      Application.get_env(:ferricstore, :standalone_fsync_max_ops)
+
     server_started? = application_started?(:ferricstore_server)
 
     tmp_dir =
@@ -32,6 +42,9 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
 
       restore_env(:data_dir, old_data_dir)
       restore_env(:raft_mode, old_raft_mode)
+      restore_env(:standalone_durability_hook, old_standalone_durability_hook)
+      restore_env(:standalone_fsync_max_delay_ms, old_standalone_fsync_max_delay_ms)
+      restore_env(:standalone_fsync_max_ops, old_standalone_fsync_max_ops)
       Ferricstore.ReplicationMode.put_current(:raft)
 
       {:ok, _} = Application.ensure_all_started(:ferricstore)
@@ -87,33 +100,105 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     Ferricstore.ReplicationMode.put_current(:standalone)
   end
 
-  test "standalone durability failure fails closed and pauses all shards" do
+  test "standalone durability failure does not publish ETS and pauses all shards" do
     ctx = FerricStore.Instance.get(:default)
     key = "standalone:fsync-failure"
     shard_idx = Router.shard_for(ctx, key)
     other_key = key_on_different_shard(ctx, shard_idx)
     version_before = Router.get_version(ctx, key)
 
-    Process.put(:ferricstore_standalone_flush_hook, fn ^ctx, ^shard_idx, _shard ->
+    assert :ok = Router.put(ctx, key, "old", 0)
+    assert Router.get(ctx, key) == "old"
+    version_after_old = Router.get_version(ctx, key)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      assert Enum.any?(batch, &match?({:put, ^key, "new", 0}, &1))
       {:error, :simulated_eio}
     end)
 
-    assert {:error, message} = Router.put(ctx, key, "value", 0)
+    assert {:error, message} = Router.put(ctx, key, "new", 0)
     assert message =~ "ERR standalone durability failure"
-    assert message =~ "outcome unknown"
+    assert message =~ "write not applied"
 
     assert Ferricstore.ReplicationMode.current() == :standalone
     refute Ferricstore.Health.ready?()
     assert :atomics.get(ctx.disk_pressure, shard_idx + 1) == 1
-    assert Router.get_version(ctx, key) == version_before
+    assert Router.get(ctx, key) == "old"
+    assert Router.get_version(ctx, key) == version_after_old
 
-    Process.delete(:ferricstore_standalone_flush_hook)
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
 
     assert {:error, "ERR shard writes paused for sync"} =
              Router.put(ctx, key, "second-value", 0)
 
     assert {:error, "ERR shard writes paused for sync"} =
              Router.put(ctx, other_key, "other-value", 0)
+
+    assert version_after_old == version_before + 1
+  end
+
+  test "standalone group commit publishes only after the 1ms durable batch succeeds" do
+    ctx = FerricStore.Instance.get(:default)
+    key1 = "standalone:group-commit:1"
+    key2 = key_on_same_shard(ctx, Router.shard_for(ctx, key1))
+
+    Application.put_env(:ferricstore, :standalone_fsync_max_delay_ms, 1)
+
+    parent = self()
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      send(
+        parent,
+        {:standalone_batch, Enum.map(batch, fn {:put, key, value, _exp} -> {key, value} end)}
+      )
+
+      :passthrough
+    end)
+
+    task1 = Task.async(fn -> Router.put(ctx, key1, "one", 0) end)
+    task2 = Task.async(fn -> Router.put(ctx, key2, "two", 0) end)
+
+    assert :ok = Task.await(task1, 30_000)
+    assert :ok = Task.await(task2, 30_000)
+
+    assert_receive {:standalone_batch, batch}, 5_000
+    assert {key1, "one"} in batch
+    assert {key2, "two"} in batch
+    assert Router.get(ctx, key1) == "one"
+    assert Router.get(ctx, key2) == "two"
+  after
+    Application.delete_env(:ferricstore, :standalone_fsync_max_delay_ms)
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
+  test "standalone batch read-modify-write commands see staged values before publish" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:group-commit:incr"
+
+    Application.put_env(:ferricstore, :standalone_fsync_max_delay_ms, 50)
+    Application.put_env(:ferricstore, :standalone_fsync_max_ops, 2)
+
+    parent = self()
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      send(parent, {:standalone_incr_batch, batch})
+      :passthrough
+    end)
+
+    task1 = Task.async(fn -> Router.incr(ctx, key, 1) end)
+    task2 = Task.async(fn -> Router.incr(ctx, key, 2) end)
+
+    assert {:ok, 1} = Task.await(task1, 30_000)
+    assert {:ok, 3} = Task.await(task2, 30_000)
+
+    assert_receive {:standalone_incr_batch, [{:put, ^key, "1", 0}, {:put, ^key, "3", 0}]},
+                   5_000
+
+    assert Router.get(ctx, key) == "3"
+  after
+    Application.delete_env(:ferricstore, :standalone_fsync_max_delay_ms)
+    Application.delete_env(:ferricstore, :standalone_fsync_max_ops)
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
   end
 
   test "standalone write ack does not depend on Flow LMDB writer availability" do
@@ -170,6 +255,13 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     Enum.find_value(1..10_000, fn i ->
       key = "standalone:other-shard:#{i}"
       if Router.shard_for(ctx, key) != shard_idx, do: key
+    end)
+  end
+
+  defp key_on_same_shard(ctx, shard_idx) do
+    Enum.find_value(1..10_000, fn i ->
+      key = "standalone:same-shard:#{i}"
+      if Router.shard_for(ctx, key) == shard_idx, do: key
     end)
   end
 

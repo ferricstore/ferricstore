@@ -255,22 +255,16 @@ defmodule Ferricstore.Store.Router do
     if Ferricstore.ReplicationMode.current() == :enabling do
       {:error, "ERR cluster promotion in progress"}
     else
-      case GenServer.call(shard, command) do
+      case GenServer.call(shard, {:standalone_commit, command}, 30_000) do
+        {:error, {:standalone_durability_failed, reason}} ->
+          fail_closed_standalone_write(ctx, idx, reason)
+
         {:error, _reason} = error ->
           error
 
         result ->
-          case flush_standalone_write(ctx, idx, shard) do
-            :ok ->
-              bump_standalone_write_version(ctx, idx, command)
-              result
-
-            {:error, reason} ->
-              fail_closed_standalone_write(ctx, idx, reason)
-
-            other ->
-              fail_closed_standalone_write(ctx, idx, other)
-          end
+          bump_standalone_write_version(ctx, idx, command)
+          result
       end
     end
   end
@@ -281,7 +275,7 @@ defmodule Ferricstore.Store.Router do
     mark_all_shards_under_disk_pressure(ctx)
 
     {:error,
-     "ERR standalone durability failure: outcome unknown, node paused for repair: #{inspect(reason)}"}
+     "ERR standalone durability failure: write not applied, node paused for repair: #{inspect(reason)}"}
   end
 
   defp pause_all_standalone_shards(%{shard_count: shard_count, shard_names: shard_names}) do
@@ -302,20 +296,6 @@ defmodule Ferricstore.Store.Router do
     end)
 
     :ok
-  end
-
-  defp flush_standalone_write(ctx, idx, shard) do
-    case Process.get(:ferricstore_standalone_flush_hook) do
-      hook when is_function(hook, 3) ->
-        hook.(ctx, idx, shard)
-
-      _ ->
-        with :ok <- GenServer.call(shard, :flush, 30_000),
-             :ok <- Ferricstore.Store.BitcaskWriter.flush(ctx, idx, 30_000),
-             :ok <- GenServer.call(shard, :flush, 30_000) do
-          :ok
-        end
-    end
   end
 
   defp bump_standalone_write_version(ctx, idx, {:batch, commands}) when is_list(commands) do
