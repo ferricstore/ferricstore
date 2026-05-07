@@ -486,7 +486,7 @@ defmodule Ferricstore.Commands.FlowTest do
                  "2000",
                  "NOW",
                  "2000",
-                 "MAX_ATTEMPTS",
+                 "MAX_RETRIES",
                  "5",
                  "EXHAUSTED_TO",
                  "failed",
@@ -497,6 +497,43 @@ defmodule Ferricstore.Commands.FlowTest do
                  id_b,
                  lease_b,
                  Integer.to_string(fencing_b)
+               ],
+               MockStore.make()
+             )
+  end
+
+  test "dispatches Flow retry policy override through Rust AST" do
+    type = uid("flow-command-retry-policy")
+    id = uid("flow-command-retry-policy-id")
+
+    assert %{"id" => ^id} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [id, "TYPE", type, "STATE", "charge_card", "RUN_AT", "1000", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert [%{"lease_token" => lease_token, "fencing_token" => fencing_token}] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [type, "STATE", "charge_card", "WORKER", "worker-a", "LIMIT", "1", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert %{"id" => ^id, "state" => "payment_failed"} =
+             Dispatcher.dispatch(
+               "FLOW.RETRY",
+               [
+                 id,
+                 lease_token,
+                 "FENCING",
+                 Integer.to_string(fencing_token),
+                 "NOW",
+                 "2000",
+                 "MAX_RETRIES",
+                 "0",
+                 "EXHAUSTED_TO",
+                 "payment_failed"
                ],
                MockStore.make()
              )
@@ -620,18 +657,18 @@ defmodule Ferricstore.Commands.FlowTest do
   test "dispatches Flow policy AST through embedded API" do
     type = uid("flow-policy-ast")
 
-    assert %{"type" => ^type, "retry" => %{"max_attempts" => 5}} =
+    assert %{"type" => ^type, "retry" => %{"max_retries" => 5}} =
              Dispatcher.dispatch_ast(
                {:flow_policy_set, type,
                 [
                   retry: [
-                    max_attempts: 5,
+                    max_retries: 5,
                     backoff: [kind: :fixed, base_ms: 1_000, max_ms: 5_000, jitter_pct: 0],
                     exhausted_to: "failed"
                   ],
                   states: %{
                     "charge_card" => [
-                      retry: [max_attempts: 1, exhausted_to: "payment_failed"]
+                      retry: [max_retries: 1, exhausted_to: "payment_failed"]
                     ]
                   }
                 ]},
@@ -641,7 +678,7 @@ defmodule Ferricstore.Commands.FlowTest do
     assert %{
              "type" => ^type,
              "state" => "charge_card",
-             "retry" => %{"max_attempts" => 1, "exhausted_to" => "payment_failed"}
+             "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"}
            } =
              Dispatcher.dispatch_ast(
                {:flow_policy_get, type, [state: "charge_card"]},
@@ -655,7 +692,7 @@ defmodule Ferricstore.Commands.FlowTest do
     assert %{
              "type" => ^type,
              "retry" => %{
-               "max_attempts" => 5,
+               "max_retries" => 5,
                "backoff" => %{
                  "kind" => :fixed,
                  "base_ms" => 1000,
@@ -669,7 +706,7 @@ defmodule Ferricstore.Commands.FlowTest do
                "FLOW.POLICY.SET",
                [
                  type,
-                 "MAX_ATTEMPTS",
+                 "MAX_RETRIES",
                  "5",
                  "BACKOFF",
                  "FIXED",
@@ -683,7 +720,7 @@ defmodule Ferricstore.Commands.FlowTest do
                  "failed",
                  "STATE",
                  "charge_card",
-                 "MAX_ATTEMPTS",
+                 "MAX_RETRIES",
                  "1",
                  "EXHAUSTED_TO",
                  "payment_failed"
@@ -694,7 +731,7 @@ defmodule Ferricstore.Commands.FlowTest do
     assert %{
              "type" => ^type,
              "state" => "charge_card",
-             "retry" => %{"max_attempts" => 1, "exhausted_to" => "payment_failed"}
+             "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"}
            } =
              Dispatcher.dispatch(
                "FLOW.POLICY.GET",
@@ -705,7 +742,7 @@ defmodule Ferricstore.Commands.FlowTest do
     assert {:error, "ERR syntax error"} =
              Dispatcher.dispatch(
                "FLOW.POLICY.SET",
-               [type, "STATE", "queued", "MAX_ATTEMPTS"],
+               [type, "STATE", "queued", "MAX_RETRIES"],
                MockStore.make()
              )
   end

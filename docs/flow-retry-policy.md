@@ -20,7 +20,7 @@ wait for LMDB.
 Default retry policy:
 
 ```text
-MAX_ATTEMPTS 3
+MAX_RETRIES 3
 BACKOFF EXPONENTIAL
 BASE_MS 1000
 MAX_MS 30000
@@ -30,7 +30,9 @@ EXHAUSTED_TO failed
 
 Guards:
 
-- `MAX_ATTEMPTS` must be `0..1000`.
+- `MAX_RETRIES` must be `0..1000`.
+- `MAX_RETRIES` counts scheduled retries after the first failed run. `0` means
+  the first `FLOW.RETRY` exhausts immediately.
 - `BASE_MS` and `MAX_MS` must be `0..2592000000` (30 days).
 - `JITTER_PCT` must be `0..100`.
 - `BACKOFF` must be `NONE`, `FIXED`, `LINEAR`, or `EXPONENTIAL`.
@@ -42,15 +44,15 @@ Guards:
 Set a type default:
 
 ```text
-FLOW.POLICY.SET checkout MAX_ATTEMPTS 5 BACKOFF EXPONENTIAL BASE_MS 1000 MAX_MS 60000 JITTER_PCT 10 EXHAUSTED_TO failed
+FLOW.POLICY.SET checkout MAX_RETRIES 5 BACKOFF EXPONENTIAL BASE_MS 1000 MAX_MS 60000 JITTER_PCT 10 EXHAUSTED_TO failed
 ```
 
 Set per-state overrides in the same command:
 
 ```text
 FLOW.POLICY.SET checkout \
-  MAX_ATTEMPTS 5 EXHAUSTED_TO failed \
-  STATE charge_card MAX_ATTEMPTS 2 BACKOFF FIXED BASE_MS 10000 MAX_MS 10000 JITTER_PCT 0 EXHAUSTED_TO payment_failed
+  MAX_RETRIES 5 EXHAUSTED_TO failed \
+  STATE charge_card MAX_RETRIES 2 BACKOFF FIXED BASE_MS 10000 MAX_MS 10000 JITTER_PCT 0 EXHAUSTED_TO payment_failed
 ```
 
 Read effective policy:
@@ -63,7 +65,7 @@ FLOW.POLICY.GET checkout STATE charge_card
 Command-local override:
 
 ```text
-FLOW.RETRY flow-1 lease-token FENCING 7 MAX_ATTEMPTS 1 EXHAUSTED_TO payment_failed
+FLOW.RETRY flow-1 lease-token FENCING 7 MAX_RETRIES 1 EXHAUSTED_TO payment_failed
 ```
 
 ## Embedded API
@@ -71,13 +73,13 @@ FLOW.RETRY flow-1 lease-token FENCING 7 MAX_ATTEMPTS 1 EXHAUSTED_TO payment_fail
 ```elixir
 FerricStore.flow_policy_set("checkout",
   retry: [
-    max_attempts: 5,
+    max_retries: 5,
     backoff: [kind: :exponential, base_ms: 1_000, max_ms: 60_000, jitter_pct: 10],
     exhausted_to: "failed"
   ],
   states: %{
     "charge_card" => [
-      retry: [max_attempts: 2, exhausted_to: "payment_failed"]
+      retry: [max_retries: 2, exhausted_to: "payment_failed"]
     ]
   }
 )
@@ -92,7 +94,7 @@ Retry history events include the effective retry decision and policy values used
 - `retry_decision`: `scheduled` or `exhausted`.
 - `retry_run_state`: state to return to after retry.
 - `retry_next_run_at_ms`: computed or explicit next run time.
-- `retry_max_attempts`.
+- `retry_max_retries`.
 - `retry_backoff_kind`.
 - `retry_backoff_base_ms`.
 - `retry_backoff_max_ms`.

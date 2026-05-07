@@ -1,17 +1,17 @@
 defmodule Ferricstore.Flow.RetryPolicy do
   @moduledoc false
 
-  @max_attempts 1_000
+  @max_retries 1_000
   @max_delay_ms 2_592_000_000
 
   @default %{
-    max_attempts: 3,
+    max_retries: 3,
     backoff: %{kind: :exponential, base_ms: 1_000, max_ms: 30_000, jitter_pct: 20},
     exhausted_to: "failed"
   }
 
   @type t :: %{
-          required(:max_attempts) => non_neg_integer(),
+          required(:max_retries) => non_neg_integer(),
           required(:backoff) => %{
             required(:kind) => :none | :fixed | :linear | :exponential,
             required(:base_ms) => non_neg_integer(),
@@ -59,12 +59,13 @@ defmodule Ferricstore.Flow.RetryPolicy do
   end
 
   def normalize_override(policy) when is_map(policy) do
-    with {:ok, max_attempts} <- optional_max_attempts(policy),
+    with :ok <- reject_old_max_attempts(policy),
+         {:ok, max_retries} <- optional_max_retries(policy),
          {:ok, backoff} <- optional_backoff(policy),
          {:ok, exhausted_to} <- optional_exhausted_to(policy) do
       override =
         %{}
-        |> maybe_put(:max_attempts, max_attempts)
+        |> maybe_put(:max_retries, max_retries)
         |> maybe_put(:backoff, backoff)
         |> maybe_put(:exhausted_to, exhausted_to)
 
@@ -91,7 +92,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
   @spec decode_flow_policy(binary()) :: {:ok, map()} | :error
   def decode_flow_policy(value) when is_binary(value) do
     case :erlang.binary_to_term(value, [:safe]) do
-      {:flow_policy_v1, policy} when is_map(policy) -> {:ok, policy}
+      {:flow_policy_v1, policy} when is_map(policy) -> {:ok, migrate_policy(policy)}
       _ -> :error
     end
   rescue
@@ -112,18 +113,19 @@ defmodule Ferricstore.Flow.RetryPolicy do
   end
 
   def normalize(policy) when is_map(policy) do
-    with {:ok, max_attempts} <- normalize_max_attempts(policy),
+    with :ok <- reject_old_max_attempts(policy),
+         {:ok, max_retries} <- normalize_max_retries(policy),
          {:ok, backoff} <- normalize_backoff(policy),
          {:ok, exhausted_to} <- normalize_exhausted_to(policy) do
-      {:ok, %{max_attempts: max_attempts, backoff: backoff, exhausted_to: exhausted_to}}
+      {:ok, %{max_retries: max_retries, backoff: backoff, exhausted_to: exhausted_to}}
     end
   end
 
   def normalize(_policy), do: {:error, "ERR flow retry policy must be a map or keyword list"}
 
   @spec attempt_allowed?(t(), non_neg_integer()) :: boolean()
-  def attempt_allowed?(%{max_attempts: max_attempts}, attempts) when is_integer(attempts),
-    do: attempts <= max_attempts
+  def attempt_allowed?(%{max_retries: max_retries}, attempts) when is_integer(attempts),
+    do: attempts <= max_retries
 
   @spec next_run_at_ms(t(), binary(), non_neg_integer(), non_neg_integer()) :: non_neg_integer()
   def next_run_at_ms(%{backoff: backoff}, id, attempt, now_ms)
@@ -137,27 +139,27 @@ defmodule Ferricstore.Flow.RetryPolicy do
     now_ms + delay
   end
 
-  defp normalize_max_attempts(policy) do
-    value = fetch_policy(policy, :max_attempts, "max_attempts", @default.max_attempts)
+  defp normalize_max_retries(policy) do
+    value = fetch_policy(policy, :max_retries, "max_retries", @default.max_retries)
 
-    validate_max_attempts(value)
+    validate_max_retries(value)
   end
 
-  defp optional_max_attempts(policy) do
-    if has_policy_key?(policy, :max_attempts, "max_attempts") do
+  defp optional_max_retries(policy) do
+    if has_policy_key?(policy, :max_retries, "max_retries") do
       policy
-      |> fetch_policy(:max_attempts, "max_attempts", nil)
-      |> validate_max_attempts()
+      |> fetch_policy(:max_retries, "max_retries", nil)
+      |> validate_max_retries()
     else
       {:ok, nil}
     end
   end
 
-  defp validate_max_attempts(value) do
-    if is_integer(value) and value >= 0 and value <= @max_attempts do
+  defp validate_max_retries(value) do
+    if is_integer(value) and value >= 0 and value <= @max_retries do
       {:ok, value}
     else
-      {:error, "ERR flow retry max_attempts must be between 0 and #{@max_attempts}"}
+      {:error, "ERR flow retry max_retries must be between 0 and #{@max_retries}"}
     end
   end
 
@@ -166,6 +168,14 @@ defmodule Ferricstore.Flow.RetryPolicy do
       normalize_backoff(policy)
     else
       {:ok, nil}
+    end
+  end
+
+  defp reject_old_max_attempts(policy) do
+    if has_policy_key?(policy, :max_attempts, "max_attempts") do
+      {:error, "ERR flow retry max_attempts was renamed to max_retries"}
+    else
+      :ok
     end
   end
 
@@ -314,7 +324,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
       {:backoff, backoff}, acc when is_map(backoff) ->
         Map.update!(acc, :backoff, &Map.merge(&1, backoff))
 
-      {key, value}, acc when key in [:max_attempts, :exhausted_to] ->
+      {key, value}, acc when key in [:max_retries, :exhausted_to] ->
         Map.put(acc, key, value)
 
       _entry, acc ->
@@ -388,4 +398,42 @@ defmodule Ferricstore.Flow.RetryPolicy do
   defp has_policy_key?(policy, atom_key, string_key) do
     is_map(policy) and (Map.has_key?(policy, atom_key) or Map.has_key?(policy, string_key))
   end
+
+  defp migrate_policy(policy) when is_map(policy) do
+    policy
+    |> migrate_policy_retry()
+    |> migrate_policy_states()
+  end
+
+  defp migrate_policy(policy), do: policy
+
+  defp migrate_policy_retry(%{retry: retry} = policy),
+    do: Map.put(policy, :retry, migrate_retry(retry))
+
+  defp migrate_policy_retry(policy), do: policy
+
+  defp migrate_policy_states(%{states: states} = policy) when is_map(states) do
+    states =
+      Map.new(states, fn
+        {state, %{retry: retry} = state_policy} ->
+          {state, Map.put(state_policy, :retry, migrate_retry(retry))}
+
+        entry ->
+          entry
+      end)
+
+    Map.put(policy, :states, states)
+  end
+
+  defp migrate_policy_states(policy), do: policy
+
+  defp migrate_retry(%{max_retries: _} = retry), do: retry
+
+  defp migrate_retry(%{max_attempts: value} = retry),
+    do: retry |> Map.delete(:max_attempts) |> Map.put(:max_retries, value)
+
+  defp migrate_retry(%{"max_attempts" => value} = retry),
+    do: retry |> Map.delete("max_attempts") |> Map.put(:max_retries, value)
+
+  defp migrate_retry(retry), do: retry
 end

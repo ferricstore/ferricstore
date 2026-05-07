@@ -6082,7 +6082,7 @@ fn parse_flow_options_until_with_retry_policy<'a>(
 }
 
 fn flow_retry_policy_option_name(value: &[u8]) -> bool {
-    ascii_eq_ignore_case(value, b"MAX_ATTEMPTS")
+    ascii_eq_ignore_case(value, b"MAX_RETRIES")
         || ascii_eq_ignore_case(value, b"BACKOFF")
         || ascii_eq_ignore_case(value, b"BASE_MS")
         || ascii_eq_ignore_case(value, b"MAX_MS")
@@ -6278,11 +6278,9 @@ fn flow_policy_retry_option<'a>(
         return Err(generic_ast_error(env, b"ERR syntax error"));
     }
 
-    if ascii_eq_ignore_case(arg_bytes[idx], b"MAX_ATTEMPTS") {
+    if ascii_eq_ignore_case(arg_bytes[idx], b"MAX_RETRIES") {
         match parse_int_bytes(arg_bytes[idx + 1]) {
-            Some(value) if value >= 0 => {
-                Ok(((atom(env, "max_attempts"), value).encode(env), false))
-            }
+            Some(value) if value >= 0 => Ok(((atom(env, "max_retries"), value).encode(env), false)),
             _ => Err(generic_ast_error(
                 env,
                 b"ERR value is not an integer or out of range",
