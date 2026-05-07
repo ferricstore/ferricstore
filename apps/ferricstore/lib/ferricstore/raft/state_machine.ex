@@ -113,7 +113,8 @@ defmodule Ferricstore.Raft.StateMachine do
     :sm_pending_lmdb_values,
     :sm_pending_lmdb_mirror_ops,
     :sm_pending_lmdb_mirror_after_flush,
-    :sm_pending_flow_index_originals
+    :sm_pending_flow_index_originals,
+    :sm_pending_zset_index_ops
   ]
   @sm_pending_write_initial_values [
     sm_pending_writes: [],
@@ -122,7 +123,8 @@ defmodule Ferricstore.Raft.StateMachine do
     sm_pending_lmdb_values: %{},
     sm_pending_lmdb_mirror_ops: [],
     sm_pending_lmdb_mirror_after_flush: [],
-    sm_pending_flow_index_originals: %{}
+    sm_pending_flow_index_originals: %{},
+    sm_pending_zset_index_ops: []
   ]
 
   defguardp valid_cold_location(file_id, offset, value_size)
@@ -7158,7 +7160,7 @@ defmodule Ferricstore.Raft.StateMachine do
       )
     end
 
-    queue_pending_put_cold(key, disk_val, expire_at_ms)
+    queue_pending_put_cold(key, disk_val, expire_at_ms, lfu)
     :ok
   end
 
@@ -7334,6 +7336,7 @@ defmodule Ferricstore.Raft.StateMachine do
               {:ok, locations} ->
                 clear_disk_pressure(state)
                 apply_pending_locations(state, file_id, batch, locations)
+                flush_pending_zset_indexes(state)
                 observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
                 state = track_bitcask_append_bytes(state, file_path, file_id, record_bytes)
                 apply_state_put(:pending_state, state)
@@ -7357,7 +7360,7 @@ defmodule Ferricstore.Raft.StateMachine do
         bytes = byte_size(key) + byte_size(value)
         {batch_bytes + bytes, record_bytes + @bitcask_record_header_size + bytes, delete_count}
 
-      {:put_cold, key, value, _expire_at_ms}, {batch_bytes, record_bytes, delete_count} ->
+      {:put_cold, key, value, _expire_at_ms, _lfu}, {batch_bytes, record_bytes, delete_count} ->
         bytes = byte_size(key) + byte_size(value)
         {batch_bytes + bytes, record_bytes + @bitcask_record_header_size + bytes, delete_count}
 
@@ -7526,7 +7529,7 @@ defmodule Ferricstore.Raft.StateMachine do
       ops =
         Enum.map(batch, fn
           {:put, key, value, expire_at_ms} -> {:put, key, value, expire_at_ms}
-          {:put_cold, key, value, expire_at_ms} -> {:put, key, value, expire_at_ms}
+          {:put_cold, key, value, expire_at_ms, _lfu} -> {:put, key, value, expire_at_ms}
           {:delete, key, _prob_path} -> {:delete, key}
         end)
 
@@ -7544,7 +7547,7 @@ defmodule Ferricstore.Raft.StateMachine do
       puts =
         Enum.map(batch, fn
           {:put, key, value, expire_at_ms} -> {key, value, expire_at_ms}
-          {:put_cold, key, value, expire_at_ms} -> {key, value, expire_at_ms}
+          {:put_cold, key, value, expire_at_ms, _lfu} -> {key, value, expire_at_ms}
         end)
 
       case NIF.v2_append_batch(file_path, puts) do
@@ -7567,7 +7570,7 @@ defmodule Ferricstore.Raft.StateMachine do
       ops =
         Enum.map(batch, fn
           {:put, key, value, expire_at_ms} -> {:put, key, value, expire_at_ms}
-          {:put_cold, key, value, expire_at_ms} -> {:put, key, value, expire_at_ms}
+          {:put_cold, key, value, expire_at_ms, _lfu} -> {:put, key, value, expire_at_ms}
           {:delete, key, _prob_path} -> {:delete, key}
         end)
 
@@ -7576,7 +7579,7 @@ defmodule Ferricstore.Raft.StateMachine do
       puts =
         Enum.map(batch, fn
           {:put, key, value, expire_at_ms} -> {key, value, expire_at_ms}
-          {:put_cold, key, value, expire_at_ms} -> {key, value, expire_at_ms}
+          {:put_cold, key, value, expire_at_ms, _lfu} -> {key, value, expire_at_ms}
         end)
 
       case NIF.v2_append_batch_nosync(file_path, puts) do
@@ -7633,7 +7636,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp pending_entry_op({:put, _key, _value, _expire_at_ms}), do: :put
-  defp pending_entry_op({:put_cold, _key, _value, _expire_at_ms}), do: :put
+  defp pending_entry_op({:put_cold, _key, _value, _expire_at_ms, _lfu}), do: :put
   defp pending_entry_op({:delete, _key, _prob_path}), do: :delete
 
   defp pending_location_op({:put, _offset, _value_size}), do: :put
@@ -7646,19 +7649,21 @@ defmodule Ferricstore.Raft.StateMachine do
       {{:put, key, val, exp}, {:put, offset, value_size}} ->
         apply_put_pending_location(state, key, val, exp, file_id, offset, value_size)
 
-      {{:put_cold, key, val, exp}, {:put, offset, value_size}} ->
-        apply_put_cold_pending_location(state, key, val, exp, file_id, offset, value_size)
+      {{:put_cold, key, val, exp, lfu}, {:put, offset, value_size}} ->
+        apply_put_cold_pending_location(state, key, val, exp, lfu, file_id, offset, value_size)
 
       {{:delete, key, nil}, {:delete, _offset, _record_size}} ->
         if standalone_staged_apply?() do
           track_keydir_binary_remove(state, key)
           :ets.delete(state.ets, key)
+          maybe_queue_lmdb_state_delete_after_publish(state, key)
         end
 
       {{:delete, key, prob_path}, {:delete, _offset, _record_size}} ->
         if standalone_staged_apply?() do
           track_keydir_binary_remove(state, key)
           :ets.delete(state.ets, key)
+          maybe_queue_lmdb_state_delete_after_publish(state, key)
         end
 
         maybe_delete_prob_file_path(state, prob_path)
@@ -7670,13 +7675,14 @@ defmodule Ferricstore.Raft.StateMachine do
          key,
          value,
          expire_at_ms,
+         lfu,
          file_id,
          offset,
          value_size
        ) do
     if standalone_staged_apply?() do
       track_keydir_binary_delta(state, key, nil)
-      :ets.insert(state.ets, {key, nil, expire_at_ms, LFU.initial(), file_id, offset, value_size})
+      :ets.insert(state.ets, {key, nil, expire_at_ms, lfu, file_id, offset, value_size})
     else
       expected_staged_size = byte_size(to_disk_binary(value))
 
@@ -7768,9 +7774,9 @@ defmodule Ferricstore.Raft.StateMachine do
     Process.put(:sm_pending_values, Map.put(pending_values, key, {value, expire_at_ms}))
   end
 
-  defp queue_pending_put_cold(key, value, expire_at_ms) do
+  defp queue_pending_put_cold(key, value, expire_at_ms, lfu) do
     pending = Process.get(:sm_pending_writes, [])
-    Process.put(:sm_pending_writes, [{:put_cold, key, value, expire_at_ms} | pending])
+    Process.put(:sm_pending_writes, [{:put_cold, key, value, expire_at_ms, lfu} | pending])
     pending_values = Process.get(:sm_pending_values, %{})
     Process.put(:sm_pending_values, Map.put(pending_values, key, {value, expire_at_ms}))
   end
@@ -8330,14 +8336,28 @@ defmodule Ferricstore.Raft.StateMachine do
   defp maybe_queue_lmdb_state_delete(state, key) when is_binary(key) do
     if flow_state_key?(key) do
       :ets.insert(state.ets, {key, nil, 0, :flow_state_deleted, :deleted, 0, 0})
-      queue_pending_lmdb_mirror_delete(key)
-      queue_pending_lmdb_mirror_after_flush({:delete_flow_tombstone, state.ets, key})
+      queue_lmdb_state_delete_projection(state, key)
     end
 
     :ok
   end
 
   defp maybe_queue_lmdb_state_delete(_state, _key), do: :ok
+
+  defp maybe_queue_lmdb_state_delete_after_publish(state, key) when is_binary(key) do
+    if flow_state_key?(key) do
+      queue_lmdb_state_delete_projection(state, key)
+    end
+
+    :ok
+  end
+
+  defp maybe_queue_lmdb_state_delete_after_publish(_state, _key), do: :ok
+
+  defp queue_lmdb_state_delete_projection(state, key) do
+    queue_pending_lmdb_mirror_delete(key)
+    queue_pending_lmdb_mirror_after_flush({:delete_flow_tombstone, state.ets, key})
+  end
 
   defp maybe_queue_lmdb_policy_put(key, value, expire_at_ms) do
     if flow_lmdb_mirror?(nil) and FlowKeys.policy_key?(key) do
@@ -9748,8 +9768,10 @@ defmodule Ferricstore.Raft.StateMachine do
          value
        )
        when index != nil and lookup != nil do
-    if zset_index_tables?(%{zset_score_index_name: index, zset_score_lookup_name: lookup}) do
-      ZSetIndex.apply_put_to_tables(index, lookup, redis_key, key, to_disk_binary(value))
+    if standalone_staged_apply?() do
+      queue_pending_zset_index_op({:put, index, lookup, redis_key, key, to_disk_binary(value)})
+    else
+      apply_zset_index_put(index, lookup, redis_key, key, to_disk_binary(value))
     end
 
     :ok
@@ -9763,8 +9785,10 @@ defmodule Ferricstore.Raft.StateMachine do
          key
        )
        when index != nil and lookup != nil do
-    if zset_index_tables?(%{zset_score_index_name: index, zset_score_lookup_name: lookup}) do
-      ZSetIndex.apply_delete_to_tables(index, lookup, redis_key, key)
+    if standalone_staged_apply?() do
+      queue_pending_zset_index_op({:delete, index, lookup, redis_key, key})
+    else
+      apply_zset_index_delete(index, lookup, redis_key, key)
     end
 
     :ok
@@ -9777,14 +9801,65 @@ defmodule Ferricstore.Raft.StateMachine do
          redis_key
        )
        when index != nil and lookup != nil do
-    if zset_index_tables?(%{zset_score_index_name: index, zset_score_lookup_name: lookup}) do
-      ZSetIndex.clear_key(index, lookup, redis_key)
+    if standalone_staged_apply?() do
+      queue_pending_zset_index_op({:clear, index, lookup, redis_key})
+    else
+      apply_zset_index_clear(index, lookup, redis_key)
     end
 
     :ok
   end
 
   defp zset_index_clear(_state, _redis_key), do: :ok
+
+  defp queue_pending_zset_index_op(op) do
+    pending = Process.get(:sm_pending_zset_index_ops, [])
+    Process.put(:sm_pending_zset_index_ops, [op | pending])
+  end
+
+  defp flush_pending_zset_indexes(_state) do
+    case Process.put(:sm_pending_zset_index_ops, []) do
+      [] ->
+        :ok
+
+      pending when is_list(pending) ->
+        pending
+        |> Enum.reverse()
+        |> Enum.each(&apply_pending_zset_index_op/1)
+
+        :ok
+    end
+  end
+
+  defp apply_pending_zset_index_op({:put, index, lookup, redis_key, key, value}) do
+    apply_zset_index_put(index, lookup, redis_key, key, value)
+  end
+
+  defp apply_pending_zset_index_op({:delete, index, lookup, redis_key, key}) do
+    apply_zset_index_delete(index, lookup, redis_key, key)
+  end
+
+  defp apply_pending_zset_index_op({:clear, index, lookup, redis_key}) do
+    apply_zset_index_clear(index, lookup, redis_key)
+  end
+
+  defp apply_zset_index_put(index, lookup, redis_key, key, value) do
+    if zset_index_tables?(%{zset_score_index_name: index, zset_score_lookup_name: lookup}) do
+      ZSetIndex.apply_put_to_tables(index, lookup, redis_key, key, value)
+    end
+  end
+
+  defp apply_zset_index_delete(index, lookup, redis_key, key) do
+    if zset_index_tables?(%{zset_score_index_name: index, zset_score_lookup_name: lookup}) do
+      ZSetIndex.apply_delete_to_tables(index, lookup, redis_key, key)
+    end
+  end
+
+  defp apply_zset_index_clear(index, lookup, redis_key) do
+    if zset_index_tables?(%{zset_score_index_name: index, zset_score_lookup_name: lookup}) do
+      ZSetIndex.clear_key(index, lookup, redis_key)
+    end
+  end
 
   defp delete_compound_prefix_from_ets(state, prefix) do
     prefix_len = byte_size(prefix)

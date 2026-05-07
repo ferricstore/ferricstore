@@ -201,6 +201,63 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     Application.delete_env(:ferricstore, :standalone_durability_hook)
   end
 
+  test "standalone zset fsync failure does not leak score index" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:zset-fsync-failure"
+    member = "ghost"
+    member_key = Ferricstore.Store.CompoundKey.zset_member(key, member)
+    shard_idx = Router.shard_for(ctx, key)
+    keydir = elem(ctx.keydir_refs, shard_idx)
+    {zset_index, zset_lookup} = Ferricstore.Store.Shard.ZSetIndex.table_names(ctx.name, shard_idx)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      assert Enum.any?(batch, &match?({:put, ^member_key, "5.0", 0}, &1))
+      {:error, :simulated_eio}
+    end)
+
+    assert {:error, message} = FerricStore.zincrby(key, 5.0, member)
+    assert message =~ "ERR standalone durability failure"
+    assert message =~ "write not applied"
+
+    assert [] = :ets.lookup(keydir, Ferricstore.Store.CompoundKey.type_key(key))
+    assert [] = :ets.lookup(keydir, member_key)
+    refute Router.exists?(ctx, key)
+    assert [] = Ferricstore.Store.Shard.ZSetIndex.range(zset_index, key, :neg_inf, :inf, false)
+
+    assert 0 =
+             Ferricstore.Store.Shard.ZSetIndex.count(zset_index, zset_lookup, key, :neg_inf, :inf)
+  after
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
+  test "standalone reads do not see staged writes while fsync is blocked" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:blocked-fsync-visibility"
+    parent = self()
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      assert Enum.any?(batch, &match?({:put, ^key, "visible-after-fsync", 0}, &1))
+      send(parent, {:durability_hook_blocked, self()})
+
+      receive do
+        :release_durability_hook -> :passthrough
+      after
+        5_000 -> {:error, :durability_hook_timeout}
+      end
+    end)
+
+    task = Task.async(fn -> Router.put(ctx, key, "visible-after-fsync", 0) end)
+    assert_receive {:durability_hook_blocked, hook_pid}, 5_000
+
+    assert Router.get(ctx, key) == nil
+
+    send(hook_pid, :release_durability_hook)
+    assert :ok = Task.await(task, 5_000)
+    assert Router.get(ctx, key) == "visible-after-fsync"
+  after
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
   test "standalone write ack does not depend on Flow LMDB writer availability" do
     ctx = FerricStore.Instance.get(:default)
     key = "standalone:flow-lmdb-unavailable"
@@ -210,6 +267,42 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     assert :ok = Router.put(ctx, key, "value", 0)
     assert Router.get(ctx, key) == "value"
     assert Ferricstore.Health.ready?()
+  end
+
+  test "standalone staged Flow state delete enqueues LMDB projection delete" do
+    ctx = FerricStore.Instance.get(:default)
+    id = "standalone-flow-delete-projection:#{System.unique_integer([:positive])}"
+    state_key = Ferricstore.Flow.Keys.state_key(id, nil)
+    shard_idx = Router.shard_for(ctx, state_key)
+    lmdb_path = flow_lmdb_path(ctx, shard_idx)
+
+    assert {:ok, %{id: ^id, state: "completed"}} =
+             FerricStore.flow_create(id, type: "projection-delete", state: "completed")
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_idx, 30_000)
+    assert {:ok, _} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+    assert :ok = Router.delete(ctx, state_key)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_idx, 30_000)
+    assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+  end
+
+  test "standalone staged cold Flow state preserves terminal version metadata" do
+    ctx = FerricStore.Instance.get(:default)
+    id = "standalone-flow-terminal-lfu:#{System.unique_integer([:positive])}"
+    state_key = Ferricstore.Flow.Keys.state_key(id, nil)
+    shard_idx = Router.shard_for(ctx, state_key)
+    keydir = elem(ctx.keydir_refs, shard_idx)
+
+    assert {:ok, %{id: ^id, state: "completed", version: version}} =
+             FerricStore.flow_create(id, type: "terminal-lfu", state: "completed")
+
+    assert [{^state_key, nil, 0, {:flow_state_version, ^version, _lfu}, fid, off, vsize}] =
+             :ets.lookup(keydir, state_key)
+
+    assert is_integer(fid)
+    assert is_integer(off)
+    assert is_integer(vsize)
   end
 
   test "standalone Flow command ack does not depend on Flow LMDB writer availability" do
@@ -224,6 +317,12 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
 
     assert {:ok, %{id: ^id, state: "queued"}} = FerricStore.flow_get(id)
     assert Ferricstore.Health.ready?()
+  end
+
+  defp flow_lmdb_path(ctx, shard_idx) do
+    ctx.data_dir
+    |> Ferricstore.DataDir.shard_data_path(shard_idx)
+    |> Ferricstore.Flow.LMDB.path()
   end
 
   test "enabling marker stays fail-closed on restart without stable node name", %{
