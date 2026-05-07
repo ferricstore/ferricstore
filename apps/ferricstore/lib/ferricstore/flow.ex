@@ -23,6 +23,7 @@ defmodule Ferricstore.Flow do
   @terminal_states ["completed", "failed", "cancelled"]
   @record_tag :flow_record_v1
   @history_tag :flow_history_v1
+  @value_bin_magic "FSV1"
 
   # Flow records and history are durable bytes. These magic values are the
   # on-disk wire versions, not cosmetic prefixes. If the binary field order,
@@ -207,27 +208,7 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with :ok <- validate_opts(opts),
-           :ok <- validate_id(id),
-           :ok <- validate_lease_token(lease_token),
-           {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
-           {:ok, partition_key} <- optional_partition_key(opts),
-           :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
-           {:ok, now} <- optional_now_ms(opts),
-           {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-           {:ok, result_ref} <- optional_binary_or_nil(opts, :result_ref, nil),
-           :ok <- validate_ref_size(:result_ref, result_ref) do
-        attrs =
-          %{
-            id: id,
-            lease_token: lease_token,
-            fencing_token: fencing_token,
-            ttl_ms: ttl_ms,
-            result_ref: result_ref,
-            partition_key: partition_key
-          }
-          |> maybe_put_attr(:now_ms, now)
-
+      with {:ok, attrs} <- complete_attrs(id, lease_token, opts) do
         Router.flow_complete(ctx, attrs)
       end
 
@@ -933,6 +914,18 @@ defmodule Ferricstore.Flow do
     ]
     |> IO.iodata_to_binary()
   end
+
+  @doc false
+  def encode_value(value), do: @value_bin_magic <> :erlang.term_to_binary(value)
+
+  @doc false
+  def decode_value(@value_bin_magic <> encoded) do
+    :erlang.binary_to_term(encoded)
+  rescue
+    _ -> @value_bin_magic <> encoded
+  end
+
+  def decode_value(value), do: value
 
   @doc false
   # Decodes all supported durable Flow record formats into the current runtime
@@ -2440,6 +2433,7 @@ defmodule Ferricstore.Flow do
           priority: priority,
           partition_key: partition_key
         }
+        |> maybe_put_flow_value(opts, :payload)
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:run_at_ms, run_at_ms)
 
@@ -2491,6 +2485,10 @@ defmodule Ferricstore.Flow do
     {:ok, id, [payload_ref: payload_ref]}
   end
 
+  defp create_many_item_opts({:id, id, :payload, payload}) when is_binary(id) do
+    {:ok, id, [payload: payload]}
+  end
+
   defp create_many_item_opts({:id, id, :partition_key, partition_key, :payload_ref, payload_ref})
        when is_binary(id) do
     {:ok, id, [partition_key: partition_key, payload_ref: payload_ref]}
@@ -2500,6 +2498,7 @@ defmodule Ferricstore.Flow do
 
   defp create_many_item_opts_from_map(item) do
     []
+    |> maybe_put_item_opt(:payload, item, :payload, "payload")
     |> maybe_put_item_opt(:payload_ref, item, :payload_ref, "payload_ref")
     |> maybe_put_item_opt(:partition_key, item, :partition_key, "partition_key")
     |> maybe_put_item_opt(:parent_flow_id, item, :parent_flow_id, "parent_flow_id")
@@ -2530,6 +2529,7 @@ defmodule Ferricstore.Flow do
           priority: priority,
           partition_key: partition_key
         }
+        |> maybe_put_flow_value(opts, :payload)
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:run_at_ms, run_at_ms)
 
@@ -2557,6 +2557,8 @@ defmodule Ferricstore.Flow do
           error_ref: error_ref,
           partition_key: partition_key
         }
+        |> maybe_put_flow_value(opts, :payload)
+        |> maybe_put_flow_value(opts, :error)
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:run_at_ms, run_at_ms)
         |> maybe_put_attr(:retry_policy, retry_policy)
@@ -2585,6 +2587,8 @@ defmodule Ferricstore.Flow do
           result_ref: result_ref,
           partition_key: partition_key
         }
+        |> maybe_put_flow_value(opts, :payload)
+        |> maybe_put_flow_value(opts, :result)
         |> maybe_put_attr(:now_ms, now)
 
       {:ok, attrs}
@@ -2634,6 +2638,8 @@ defmodule Ferricstore.Flow do
           error_ref: error_ref,
           partition_key: partition_key
         }
+        |> maybe_put_flow_value(opts, :payload)
+        |> maybe_put_flow_value(opts, :error)
         |> maybe_put_attr(:now_ms, now)
 
       {:ok, attrs}
@@ -2861,68 +2867,106 @@ defmodule Ferricstore.Flow do
   defp hydrate_payload_records(_ctx, [], _payload_return), do: []
 
   defp hydrate_payload_records(ctx, records, %{enabled?: true, max_bytes: max_bytes}) do
-    refs =
+    ref_entries =
       records
-      |> Enum.map(fn record -> Map.get(record, :payload_ref) end)
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {record, idx} ->
+        [
+          {idx, :payload, Map.get(record, :payload_ref)},
+          {idx, :result, Map.get(record, :result_ref)},
+          {idx, :error, Map.get(record, :error_ref)}
+        ]
+      end)
 
     fetchable_refs =
-      Enum.filter(refs, fn ref ->
+      ref_entries
+      |> Enum.map(fn {_idx, _kind, ref} -> ref end)
+      |> Enum.uniq()
+      |> Enum.filter(fn ref ->
         is_binary(ref) and ref != "" and byte_size(ref) <= Router.max_key_size()
       end)
 
-    payloads =
+    values =
       ctx
       |> Router.batch_get_with_file_refs(fetchable_refs, file_ref_payload_threshold(max_bytes))
       |> Enum.zip(fetchable_refs)
-      |> Map.new(fn {payload, ref} -> {ref, payload} end)
+      |> Map.new(fn {value, ref} -> {ref, value} end)
 
-    Enum.zip(records, refs)
-    |> Enum.map(fn
-      {record, nil} ->
-        record
-
-      {record, ""} ->
-        record
-
-      {record, ref} ->
-        if byte_size(ref) > Router.max_key_size() do
-          record
-          |> Map.put(:payload_error, "ERR payload_ref key too large")
-        else
-          apply_payload_result(record, Map.get(payloads, ref), max_bytes)
-        end
+    Enum.map(records, fn record ->
+      Enum.reduce([:payload, :result, :error], record, fn kind, acc ->
+        ref = Map.get(acc, flow_value_ref_field(kind))
+        apply_flow_value_result(acc, kind, ref, Map.get(values, ref), max_bytes)
+      end)
     end)
   end
 
-  defp apply_payload_result(record, nil, _max_bytes) do
-    record
-    |> Map.put(:payload, nil)
-    |> Map.put(:payload_missing, true)
-  end
+  defp apply_flow_value_result(record, _kind, nil, _value, _max_bytes), do: record
+  defp apply_flow_value_result(record, _kind, "", _value, _max_bytes), do: record
 
-  defp apply_payload_result(record, {:file_ref, _path, _offset, size}, _max_bytes) do
-    record
-    |> Map.put(:payload_omitted, true)
-    |> Map.put(:payload_size, size)
-  end
-
-  defp apply_payload_result(record, payload, max_bytes) when is_binary(payload) do
-    size = byte_size(payload)
-
-    if size <= max_bytes do
-      record
-      |> Map.put(:payload, payload)
-      |> Map.put(:payload_size, size)
+  defp apply_flow_value_result(record, kind, ref, value, max_bytes) when is_binary(ref) do
+    if byte_size(ref) > Router.max_key_size() do
+      Map.put(record, flow_value_error_field(kind), "ERR #{kind}_ref key too large")
     else
-      record
-      |> Map.put(:payload_omitted, true)
-      |> Map.put(:payload_size, size)
+      apply_flow_value_result_for_valid_ref(record, kind, ref, value, max_bytes)
     end
   end
 
-  defp apply_payload_result(record, _other, _max_bytes) do
+  defp apply_flow_value_result(record, _kind, _ref, _other, _max_bytes), do: record
+
+  defp apply_flow_value_result_for_valid_ref(record, kind, _ref, nil, _max_bytes) do
     record
+    |> Map.put(kind, nil)
+    |> Map.put(flow_value_missing_field(kind), true)
   end
+
+  defp apply_flow_value_result_for_valid_ref(
+         record,
+         kind,
+         _ref,
+         {:file_ref, _path, _offset, size},
+         _max_bytes
+       ) do
+    record
+    |> Map.put(flow_value_omitted_field(kind), true)
+    |> Map.put(flow_value_size_field(kind), size)
+  end
+
+  defp apply_flow_value_result_for_valid_ref(record, kind, _ref, encoded_value, max_bytes)
+       when is_binary(encoded_value) do
+    size = byte_size(encoded_value)
+
+    if size <= max_bytes do
+      record
+      |> Map.put(kind, decode_value(encoded_value))
+      |> Map.put(flow_value_size_field(kind), size)
+    else
+      record
+      |> Map.put(flow_value_omitted_field(kind), true)
+      |> Map.put(flow_value_size_field(kind), size)
+    end
+  end
+
+  defp apply_flow_value_result_for_valid_ref(record, _kind, _ref, _other, _max_bytes), do: record
+
+  defp flow_value_ref_field(:payload), do: :payload_ref
+  defp flow_value_ref_field(:result), do: :result_ref
+  defp flow_value_ref_field(:error), do: :error_ref
+
+  defp flow_value_error_field(:payload), do: :payload_error
+  defp flow_value_error_field(:result), do: :result_error
+  defp flow_value_error_field(:error), do: :error_error
+
+  defp flow_value_missing_field(:payload), do: :payload_missing
+  defp flow_value_missing_field(:result), do: :result_missing
+  defp flow_value_missing_field(:error), do: :error_missing
+
+  defp flow_value_omitted_field(:payload), do: :payload_omitted
+  defp flow_value_omitted_field(:result), do: :result_omitted
+  defp flow_value_omitted_field(:error), do: :error_omitted
+
+  defp flow_value_size_field(:payload), do: :payload_size
+  defp flow_value_size_field(:result), do: :result_size
+  defp flow_value_size_field(:error), do: :error_size
 
   defp file_ref_payload_threshold(max_bytes) when max_bytes < 1, do: 1
   defp file_ref_payload_threshold(max_bytes), do: max_bytes + 1
@@ -3084,7 +3128,9 @@ defmodule Ferricstore.Flow do
        when is_binary(id) do
     {:ok, id, lease_token,
      [fencing_token: fencing_token] ++
-       complete_many_item_result_ref(item) ++ complete_many_item_partition_key(item)}
+       complete_many_item_result_ref(item) ++
+       complete_many_item_result(item) ++
+       complete_many_item_payload(item) ++ complete_many_item_partition_key(item)}
   end
 
   defp complete_many_item_opts(
@@ -3093,7 +3139,9 @@ defmodule Ferricstore.Flow do
        when is_binary(id) do
     {:ok, id, lease_token,
      [fencing_token: fencing_token] ++
-       complete_many_item_result_ref(item) ++ complete_many_item_partition_key(item)}
+       complete_many_item_result_ref(item) ++
+       complete_many_item_result(item) ++
+       complete_many_item_payload(item) ++ complete_many_item_partition_key(item)}
   end
 
   defp complete_many_item_opts({id, lease_token, item_opts})
@@ -3142,6 +3190,8 @@ defmodule Ferricstore.Flow do
     {:ok, id, lease_token,
      [fencing_token: fencing_token] ++
        retry_many_item_error_ref(item) ++
+       retry_many_item_error(item) ++
+       retry_many_item_payload(item) ++
        retry_many_item_retry_policy(item) ++ retry_many_item_partition_key(item)}
   end
 
@@ -3152,6 +3202,8 @@ defmodule Ferricstore.Flow do
     {:ok, id, lease_token,
      [fencing_token: fencing_token] ++
        retry_many_item_error_ref(item) ++
+       retry_many_item_error(item) ++
+       retry_many_item_payload(item) ++
        retry_many_item_retry_policy(item) ++ retry_many_item_partition_key(item)}
   end
 
@@ -3198,7 +3250,9 @@ defmodule Ferricstore.Flow do
        when is_binary(id) do
     {:ok, id, lease_token,
      [fencing_token: fencing_token] ++
-       fail_many_item_error_ref(item) ++ fail_many_item_partition_key(item)}
+       fail_many_item_error_ref(item) ++
+       fail_many_item_error(item) ++
+       fail_many_item_payload(item) ++ fail_many_item_partition_key(item)}
   end
 
   defp fail_many_item_opts(
@@ -3207,7 +3261,9 @@ defmodule Ferricstore.Flow do
        when is_binary(id) do
     {:ok, id, lease_token,
      [fencing_token: fencing_token] ++
-       fail_many_item_error_ref(item) ++ fail_many_item_partition_key(item)}
+       fail_many_item_error_ref(item) ++
+       fail_many_item_error(item) ++
+       fail_many_item_payload(item) ++ fail_many_item_partition_key(item)}
   end
 
   defp fail_many_item_opts({id, lease_token, item_opts})
@@ -3312,6 +3368,7 @@ defmodule Ferricstore.Flow do
        when is_binary(id) do
     {:ok, id,
      [fencing_token: fencing_token] ++
+       transition_many_item_payload(item) ++
        transition_many_item_lease_token(item) ++ transition_many_item_partition_key(item)}
   end
 
@@ -3319,6 +3376,7 @@ defmodule Ferricstore.Flow do
        when is_binary(id) do
     {:ok, id,
      [fencing_token: fencing_token] ++
+       transition_many_item_payload(item) ++
        transition_many_item_lease_token(item) ++ transition_many_item_partition_key(item)}
   end
 
@@ -3384,9 +3442,24 @@ defmodule Ferricstore.Flow do
     |> maybe_put_item_opt(:partition_key, item, :partition_key, "partition_key")
   end
 
+  defp transition_many_item_payload(item) do
+    []
+    |> maybe_put_item_opt(:payload, item, :payload, "payload")
+  end
+
   defp complete_many_item_result_ref(item) do
     []
     |> maybe_put_item_opt(:result_ref, item, :result_ref, "result_ref")
+  end
+
+  defp complete_many_item_result(item) do
+    []
+    |> maybe_put_item_opt(:result, item, :result, "result")
+  end
+
+  defp complete_many_item_payload(item) do
+    []
+    |> maybe_put_item_opt(:payload, item, :payload, "payload")
   end
 
   defp complete_many_item_partition_key(item) do
@@ -3397,6 +3470,16 @@ defmodule Ferricstore.Flow do
   defp retry_many_item_error_ref(item) do
     []
     |> maybe_put_item_opt(:error_ref, item, :error_ref, "error_ref")
+  end
+
+  defp retry_many_item_error(item) do
+    []
+    |> maybe_put_item_opt(:error, item, :error, "error")
+  end
+
+  defp retry_many_item_payload(item) do
+    []
+    |> maybe_put_item_opt(:payload, item, :payload, "payload")
   end
 
   defp retry_many_item_retry_policy(item) do
@@ -3412,6 +3495,16 @@ defmodule Ferricstore.Flow do
   defp fail_many_item_error_ref(item) do
     []
     |> maybe_put_item_opt(:error_ref, item, :error_ref, "error_ref")
+  end
+
+  defp fail_many_item_error(item) do
+    []
+    |> maybe_put_item_opt(:error, item, :error, "error")
+  end
+
+  defp fail_many_item_payload(item) do
+    []
+    |> maybe_put_item_opt(:payload, item, :payload, "payload")
   end
 
   defp fail_many_item_partition_key(item) do
@@ -3762,6 +3855,14 @@ defmodule Ferricstore.Flow do
   defp maybe_put_attr(attrs, _key, nil), do: attrs
   defp maybe_put_attr(attrs, key, value), do: Map.put(attrs, key, value)
 
+  defp maybe_put_flow_value(attrs, opts, key) do
+    if Keyword.has_key?(opts, key) do
+      Map.put(attrs, key, Keyword.fetch!(opts, key))
+    else
+      attrs
+    end
+  end
+
   defp flow_policy_read(ctx, type) do
     case Router.get(ctx, __MODULE__.Keys.policy_key(type)) do
       nil ->
@@ -3809,6 +3910,13 @@ defmodule Ferricstore.Flow do
 
     def history_key(id, partition_key \\ nil) do
       "f:" <> tag(partition_key) <> ":h:" <> id
+    end
+
+    def value_key(id, kind, version, partition_key \\ nil)
+        when kind in [:payload, :result, :error] and is_integer(version) do
+      "f:" <>
+        tag(partition_key) <>
+        ":v:" <> flow_value_kind(kind) <> ":" <> id <> ":" <> Integer.to_string(version)
     end
 
     def policy_key(type) do
@@ -3867,5 +3975,9 @@ defmodule Ferricstore.Flow do
       @partition_tag_prefix <>
         Base.url_encode64(:crypto.hash(:sha256, partition_key), padding: false) <> "}"
     end
+
+    defp flow_value_kind(:payload), do: "p"
+    defp flow_value_kind(:result), do: "r"
+    defp flow_value_kind(:error), do: "e"
   end
 end

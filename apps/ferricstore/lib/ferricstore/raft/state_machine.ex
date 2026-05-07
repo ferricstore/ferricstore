@@ -4335,6 +4335,7 @@ defmodule Ferricstore.Raft.StateMachine do
         record = flow_create_record(attrs)
 
         with :ok <- flow_validate_record_keys(record),
+             :ok <- flow_put_record_values(state, record, attrs),
              :ok <-
                flow_put_new_state_record(
                  state,
@@ -4356,8 +4357,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_flow_create_many(state, %{records: [_ | _] = attrs_list}) do
     with :ok <- flow_many_partitions_valid?(state, attrs_list),
          :ok <- flow_create_many_unique?(attrs_list),
-         {:ok, records, new_records} <- flow_create_many_prepare(state, attrs_list),
-         :ok <- flow_create_many_apply(state, new_records) do
+         {:ok, records, new_plans} <- flow_create_many_prepare(state, attrs_list),
+         :ok <- flow_create_many_apply(state, new_plans) do
       {:ok, records}
     end
   end
@@ -4384,7 +4385,7 @@ defmodule Ferricstore.Raft.StateMachine do
       ttl_ms: Map.get(attrs, :ttl_ms),
       history_max_events: Map.get(attrs, :history_max_events),
       partition_key: Map.get(attrs, :partition_key),
-      payload_ref: Map.get(attrs, :payload_ref),
+      payload_ref: flow_value_ref(attrs, :payload, id, 1, Map.get(attrs, :partition_key)),
       parent_flow_id: Map.get(attrs, :parent_flow_id),
       root_flow_id: Map.get(attrs, :root_flow_id) || id,
       correlation_id: Map.get(attrs, :correlation_id),
@@ -4407,15 +4408,33 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_create_duplicate_result(_existing, _attrs), do: {:error, "ERR flow already exists"}
 
+  defp flow_value_ref(attrs, kind, id, version, partition_key, existing_ref \\ nil) do
+    cond do
+      Map.has_key?(attrs, kind) ->
+        FlowKeys.value_key(id, kind, version, partition_key)
+
+      ref = Map.get(attrs, flow_value_ref_field(kind)) ->
+        ref
+
+      true ->
+        existing_ref
+    end
+  end
+
+  defp flow_value_ref_field(:payload), do: :payload_ref
+  defp flow_value_ref_field(:result), do: :result_ref
+  defp flow_value_ref_field(:error), do: :error_ref
+
   defp flow_create_idempotent_match?(existing, attrs) do
     id = Map.fetch!(attrs, :id)
+    partition_key = Map.get(attrs, :partition_key)
 
     comparable_attrs = %{
       id: id,
       type: Map.get(attrs, :type),
       state: Map.get(attrs, :state),
-      partition_key: Map.get(attrs, :partition_key),
-      payload_ref: Map.get(attrs, :payload_ref),
+      partition_key: partition_key,
+      payload_ref: flow_value_ref(attrs, :payload, id, 1, partition_key),
       parent_flow_id: Map.get(attrs, :parent_flow_id),
       root_flow_id: Map.get(attrs, :root_flow_id) || id,
       correlation_id: Map.get(attrs, :correlation_id),
@@ -4487,7 +4506,7 @@ defmodule Ferricstore.Raft.StateMachine do
           record = flow_create_record(attrs)
 
           case flow_validate_record_keys(record) do
-            :ok -> {:cont, {:ok, [record | acc], [record | new_acc]}}
+            :ok -> {:cont, {:ok, [record | acc], [{record, attrs} | new_acc]}}
             {:error, _reason} = error -> {:halt, error}
           end
 
@@ -4504,8 +4523,11 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_create_many_apply(state, records) do
-    with :ok <- flow_create_put_state_records(state, records),
+  defp flow_create_many_apply(state, plans) do
+    records = Enum.map(plans, fn {record, _attrs} -> record end)
+
+    with :ok <- flow_create_put_record_values(state, plans),
+         :ok <- flow_create_put_state_records(state, records),
          :ok <- flow_due_put_many_new(state, records),
          :ok <- flow_index_put_many_new(state, records),
          :ok <- flow_create_put_history(state, records) do
@@ -4818,7 +4840,7 @@ defmodule Ferricstore.Raft.StateMachine do
     with {:ok, record} <- flow_require_record(state, id, partition_key),
          {:ok, record, next} <-
            flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms),
-         :ok <- flow_apply_complete(state, record, next, partition_key, now_ms) do
+         :ok <- flow_apply_complete(state, record, next, partition_key, now_ms, attrs) do
       {:ok, next}
     end
   end
@@ -4828,7 +4850,7 @@ defmodule Ferricstore.Raft.StateMachine do
          :ok <- flow_transition_many_unique?(attrs_list),
          {:ok, plans} <- flow_complete_many_prepare(state, attrs_list),
          :ok <- flow_complete_many_apply(state, plans) do
-      {:ok, Enum.map(plans, fn {_record, next} -> next end)}
+      {:ok, Enum.map(plans, fn {_record, next, _attrs} -> next end)}
     end
   end
 
@@ -4838,13 +4860,26 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
     with :ok <- flow_require_running_lease(record, lease_token),
          :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
+      version = Map.fetch!(record, :version) + 1
+      id = Map.fetch!(record, :id)
+      partition_key = Map.get(record, :partition_key)
+
       next =
         record
         |> Map.merge(%{
           state: "completed",
-          version: Map.fetch!(record, :version) + 1,
+          version: version,
           updated_at_ms: now_ms,
-          result_ref: Map.get(attrs, :result_ref),
+          payload_ref:
+            flow_value_ref(
+              attrs,
+              :payload,
+              id,
+              version,
+              partition_key,
+              Map.get(record, :payload_ref)
+            ),
+          result_ref: flow_value_ref(attrs, :result, id, version, partition_key),
           ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :ttl_ms),
           history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
@@ -4860,10 +4895,11 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_apply_complete(state, record, next, partition_key, now_ms) do
+  defp flow_apply_complete(state, record, next, partition_key, now_ms, attrs) do
     plans = [{record, next}]
 
-    with :ok <- flow_transition_move_indexes(state, plans),
+    with :ok <- flow_put_record_values(state, next, attrs),
+         :ok <- flow_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
              state,
@@ -4892,7 +4928,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
           record ->
             case flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
-              {:ok, record, next} -> {:cont, {:ok, [{record, next} | acc]}}
+              {:ok, record, next} -> {:cont, {:ok, [{record, next, attrs} | acc]}}
               {:error, _reason} = error -> {:halt, error}
             end
         end
@@ -4907,9 +4943,12 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_complete_many_apply(state, plans) do
-    with :ok <- flow_transition_move_indexes(state, plans),
-         :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_many_put_history(state, plans, "completed") do
+    pair_plans = Enum.map(plans, fn {record, next, _attrs} -> {record, next} end)
+
+    with :ok <- flow_many_put_record_values(state, plans),
+         :ok <- flow_transition_move_indexes(state, pair_plans),
+         :ok <- flow_claim_put_state_records(state, pair_plans),
+         :ok <- flow_many_put_history(state, pair_plans, "completed") do
       :ok
     end
   end
@@ -4932,7 +4971,7 @@ defmodule Ferricstore.Raft.StateMachine do
              run_at_ms,
              now_ms
            ),
-         :ok <- flow_apply_transition(state, record, next, partition_key, now_ms) do
+         :ok <- flow_apply_transition(state, record, next, partition_key, now_ms, attrs) do
       {:ok, next}
     end
   end
@@ -4942,7 +4981,7 @@ defmodule Ferricstore.Raft.StateMachine do
          :ok <- flow_transition_many_unique?(attrs_list),
          {:ok, plans} <- flow_transition_many_prepare(state, attrs_list),
          :ok <- flow_transition_many_apply(state, plans) do
-      {:ok, Enum.map(plans, fn {_record, next} -> next end)}
+      {:ok, Enum.map(plans, fn {_record, next, _attrs} -> next end)}
     end
   end
 
@@ -4999,14 +5038,26 @@ defmodule Ferricstore.Raft.StateMachine do
          :ok <- flow_require_expected_state(record, from_state),
          :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
          :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)) do
+      version = Map.fetch!(record, :version) + 1
+      partition_key = Map.get(record, :partition_key)
+
       next =
         record
         |> Map.merge(%{
           state: to_state,
-          version: Map.fetch!(record, :version) + 1,
+          version: version,
           updated_at_ms: now_ms,
           next_run_at_ms: run_at_ms,
           priority: Map.get(attrs, :priority) || Map.get(record, :priority, 0),
+          payload_ref:
+            flow_value_ref(
+              attrs,
+              :payload,
+              id,
+              version,
+              partition_key,
+              Map.get(record, :payload_ref)
+            ),
           ttl_ms: Map.get(record, :ttl_ms),
           history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
@@ -5024,10 +5075,11 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_apply_transition(state, record, next, partition_key, now_ms) do
+  defp flow_apply_transition(state, record, next, partition_key, now_ms, attrs) do
     plans = [{record, next}]
 
-    with :ok <- flow_transition_move_indexes(state, plans),
+    with :ok <- flow_put_record_values(state, next, attrs),
+         :ok <- flow_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
              state,
@@ -5073,7 +5125,7 @@ defmodule Ferricstore.Raft.StateMachine do
                run_at_ms,
                now_ms
              ) do
-          {:ok, record, next} -> {:cont, {:ok, [{record, next} | acc]}}
+          {:ok, record, next} -> {:cont, {:ok, [{record, next, attrs} | acc]}}
           {:error, _reason} = error -> {:halt, error}
         end
 
@@ -5087,9 +5139,12 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_transition_many_apply(state, plans) do
-    with :ok <- flow_transition_move_indexes(state, plans),
-         :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_transition_put_history(state, plans) do
+    pair_plans = Enum.map(plans, fn {record, next, _attrs} -> {record, next} end)
+
+    with :ok <- flow_many_put_record_values(state, plans),
+         :ok <- flow_transition_move_indexes(state, pair_plans),
+         :ok <- flow_claim_put_state_records(state, pair_plans),
+         :ok <- flow_transition_put_history(state, pair_plans) do
       :ok
     end
   end
@@ -5101,7 +5156,7 @@ defmodule Ferricstore.Raft.StateMachine do
     with {:ok, record} <- flow_require_record(state, id, partition_key),
          {:ok, record, next, history_meta} <-
            flow_prepare_retry_existing_record(state, record, attrs, lease_token, now_ms),
-         :ok <- flow_apply_retry(state, record, next, partition_key, now_ms, history_meta) do
+         :ok <- flow_apply_retry(state, record, next, partition_key, now_ms, history_meta, attrs) do
       {:ok, next}
     end
   end
@@ -5111,7 +5166,7 @@ defmodule Ferricstore.Raft.StateMachine do
          :ok <- flow_transition_many_unique?(attrs_list),
          {:ok, plans} <- flow_retry_many_prepare(state, attrs_list),
          :ok <- flow_retry_many_apply(state, plans) do
-      {:ok, Enum.map(plans, fn {_record, next, _history_meta} -> next end)}
+      {:ok, Enum.map(plans, fn {_record, next, _history_meta, _attrs} -> next end)}
     end
   end
 
@@ -5123,6 +5178,9 @@ defmodule Ferricstore.Raft.StateMachine do
          :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
       retry_policy = flow_retry_policy_for_record(state, record, attrs)
       next_attempts = Map.get(record, :attempts, 0) + 1
+      version = Map.fetch!(record, :version) + 1
+      id = Map.fetch!(record, :id)
+      partition_key = Map.get(record, :partition_key)
 
       {next_state, next_run_at_ms, retry_decision} =
         flow_retry_next_state(record, attrs, retry_policy, next_attempts, now_ms)
@@ -5131,11 +5189,20 @@ defmodule Ferricstore.Raft.StateMachine do
         record
         |> Map.merge(%{
           state: next_state,
-          version: Map.fetch!(record, :version) + 1,
+          version: version,
           attempts: next_attempts,
           updated_at_ms: now_ms,
           next_run_at_ms: next_run_at_ms,
-          error_ref: Map.get(attrs, :error_ref),
+          payload_ref:
+            flow_value_ref(
+              attrs,
+              :payload,
+              id,
+              version,
+              partition_key,
+              Map.get(record, :payload_ref)
+            ),
+          error_ref: flow_value_ref(attrs, :error, id, version, partition_key),
           ttl_ms: Map.get(record, :ttl_ms),
           history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
@@ -5175,7 +5242,7 @@ defmodule Ferricstore.Raft.StateMachine do
       "retry_decision" => retry_decision,
       "retry_run_state" => flow_retry_run_state(record),
       "retry_next_run_at_ms" => Map.get(next, :next_run_at_ms),
-      "retry_max_attempts" => Map.get(retry_policy, :max_attempts),
+      "retry_max_retries" => Map.get(retry_policy, :max_retries),
       "retry_backoff_kind" => Map.get(backoff, :kind),
       "retry_backoff_base_ms" => Map.get(backoff, :base_ms),
       "retry_backoff_max_ms" => Map.get(backoff, :max_ms),
@@ -5197,10 +5264,11 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_apply_retry(state, record, next, partition_key, now_ms, history_meta) do
+  defp flow_apply_retry(state, record, next, partition_key, now_ms, history_meta, attrs) do
     plans = [{record, next}]
 
-    with :ok <- flow_transition_move_indexes(state, plans),
+    with :ok <- flow_put_record_values(state, next, attrs),
+         :ok <- flow_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
              state,
@@ -5230,7 +5298,7 @@ defmodule Ferricstore.Raft.StateMachine do
           record ->
             case flow_prepare_retry_existing_record(state, record, attrs, lease_token, now_ms) do
               {:ok, record, next, history_meta} ->
-                {:cont, {:ok, [{record, next, history_meta} | acc]}}
+                {:cont, {:ok, [{record, next, history_meta, attrs} | acc]}}
 
               {:error, _reason} = error ->
                 {:halt, error}
@@ -5247,11 +5315,15 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_retry_many_apply(state, plans) do
-    pair_plans = Enum.map(plans, fn {record, next, _history_meta} -> {record, next} end)
+    pair_plans = Enum.map(plans, fn {record, next, _history_meta, _attrs} -> {record, next} end)
 
-    with :ok <- flow_transition_move_indexes(state, pair_plans),
+    history_plans =
+      Enum.map(plans, fn {record, next, history_meta, _attrs} -> {record, next, history_meta} end)
+
+    with :ok <- flow_many_put_record_values(state, plans),
+         :ok <- flow_transition_move_indexes(state, pair_plans),
          :ok <- flow_claim_put_state_records(state, pair_plans),
-         :ok <- flow_retry_many_put_history(state, plans) do
+         :ok <- flow_retry_many_put_history(state, history_plans) do
       :ok
     end
   end
@@ -5263,7 +5335,7 @@ defmodule Ferricstore.Raft.StateMachine do
     with {:ok, record} <- flow_require_record(state, id, partition_key),
          {:ok, record, next} <-
            flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms),
-         :ok <- flow_apply_fail(state, record, next, partition_key, now_ms) do
+         :ok <- flow_apply_fail(state, record, next, partition_key, now_ms, attrs) do
       {:ok, next}
     end
   end
@@ -5273,7 +5345,7 @@ defmodule Ferricstore.Raft.StateMachine do
          :ok <- flow_transition_many_unique?(attrs_list),
          {:ok, plans} <- flow_fail_many_prepare(state, attrs_list),
          :ok <- flow_fail_many_apply(state, plans) do
-      {:ok, Enum.map(plans, fn {_record, next} -> next end)}
+      {:ok, Enum.map(plans, fn {_record, next, _attrs} -> next end)}
     end
   end
 
@@ -5283,13 +5355,26 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms) do
     with :ok <- flow_require_running_lease(record, lease_token),
          :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
+      version = Map.fetch!(record, :version) + 1
+      id = Map.fetch!(record, :id)
+      partition_key = Map.get(record, :partition_key)
+
       next =
         record
         |> Map.merge(%{
           state: "failed",
-          version: Map.fetch!(record, :version) + 1,
+          version: version,
           updated_at_ms: now_ms,
-          error_ref: Map.get(attrs, :error_ref),
+          payload_ref:
+            flow_value_ref(
+              attrs,
+              :payload,
+              id,
+              version,
+              partition_key,
+              Map.get(record, :payload_ref)
+            ),
+          error_ref: flow_value_ref(attrs, :error, id, version, partition_key),
           ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :ttl_ms),
           history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
@@ -5305,10 +5390,11 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_apply_fail(state, record, next, partition_key, now_ms) do
+  defp flow_apply_fail(state, record, next, partition_key, now_ms, attrs) do
     plans = [{record, next}]
 
-    with :ok <- flow_transition_move_indexes(state, plans),
+    with :ok <- flow_put_record_values(state, next, attrs),
+         :ok <- flow_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
              state,
@@ -5337,7 +5423,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
           record ->
             case flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms) do
-              {:ok, record, next} -> {:cont, {:ok, [{record, next} | acc]}}
+              {:ok, record, next} -> {:cont, {:ok, [{record, next, attrs} | acc]}}
               {:error, _reason} = error -> {:halt, error}
             end
         end
@@ -5352,9 +5438,12 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_fail_many_apply(state, plans) do
-    with :ok <- flow_transition_move_indexes(state, plans),
-         :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_many_put_history(state, plans, "failed") do
+    pair_plans = Enum.map(plans, fn {record, next, _attrs} -> {record, next} end)
+
+    with :ok <- flow_many_put_record_values(state, plans),
+         :ok <- flow_transition_move_indexes(state, pair_plans),
+         :ok <- flow_claim_put_state_records(state, pair_plans),
+         :ok <- flow_many_put_history(state, pair_plans, "failed") do
       :ok
     end
   end
@@ -6946,6 +7035,54 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_put(state, key, value, expire_at_ms) do
     raw_put(state, key, value, expire_at_ms)
+  end
+
+  defp flow_put_record_values(state, record, attrs) do
+    Enum.reduce_while([:payload, :result, :error], :ok, fn kind, :ok ->
+      if Map.has_key?(attrs, kind) do
+        key = Map.fetch!(record, flow_value_ref_field(kind))
+
+        with :ok <- flow_validate_key_size(key),
+             :ok <-
+               raw_put_cold(
+                 state,
+                 key,
+                 Flow.encode_value(Map.fetch!(attrs, kind)),
+                 flow_record_expire_at(record)
+               ) do
+          {:cont, :ok}
+        else
+          {:error, _reason} = error -> {:halt, error}
+        end
+      else
+        {:cont, :ok}
+      end
+    end)
+  end
+
+  defp flow_create_put_record_values(state, plans) do
+    Enum.reduce_while(plans, :ok, fn {record, attrs}, :ok ->
+      case flow_put_record_values(state, record, attrs) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_many_put_record_values(state, plans) do
+    Enum.reduce_while(plans, :ok, fn
+      {_record, next, attrs}, :ok ->
+        case flow_put_record_values(state, next, attrs) do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+
+      {_record, next, _history_meta, attrs}, :ok ->
+        case flow_put_record_values(state, next, attrs) do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+    end)
   end
 
   defp flow_put_state_record(state, key, record) when is_map(record) do
