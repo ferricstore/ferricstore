@@ -137,12 +137,12 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     assert version_after_old == version_before + 1
   end
 
-  test "standalone group commit publishes only after the 1ms durable batch succeeds" do
+  test "standalone group commit batches writes that arrive before fsync starts" do
     ctx = FerricStore.Instance.get(:default)
     key1 = "standalone:group-commit:1"
     key2 = key_on_same_shard(ctx, Router.shard_for(ctx, key1))
 
-    Application.put_env(:ferricstore, :standalone_fsync_max_delay_ms, 1)
+    Application.put_env(:ferricstore, :standalone_fsync_max_delay_ms, 100)
 
     parent = self()
 
@@ -162,8 +162,7 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     assert :ok = Task.await(task2, 30_000)
 
     assert_receive {:standalone_batch, batch}, 5_000
-    assert {key1, "one"} in batch
-    assert {key2, "two"} in batch
+    assert Enum.sort(batch) == Enum.sort([{key1, "one"}, {key2, "two"}])
     assert Router.get(ctx, key1) == "one"
     assert Router.get(ctx, key2) == "two"
   after
