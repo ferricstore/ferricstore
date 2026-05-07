@@ -5497,7 +5497,7 @@ fn make_flow_retry_many_command_ast<'a>(
         return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
     }
 
-    let opts = match parse_flow_options_until(
+    let opts = match parse_flow_options_until_with_retry_policy(
         env,
         args,
         arg_bytes,
@@ -5777,7 +5777,7 @@ fn make_flow_retry_command_ast<'a>(
         return (tag, wrong_number_error(env, b"flow.retry")).encode(env);
     }
 
-    match parse_flow_options(env, args, arg_bytes, 2, flow_retry_option) {
+    match parse_flow_options_with_retry_policy(env, args, arg_bytes, 2, flow_retry_option) {
         Ok(opts) => (tag, args[0], args[1], opts).encode(env),
         Err(err) => (tag, args[0], args[1], err).encode(env),
     }
@@ -6026,6 +6026,68 @@ fn parse_flow_options_until<'a>(
         idx += 2;
     }
     Ok(opts)
+}
+
+fn parse_flow_options_with_retry_policy<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    start: usize,
+    parser: FlowOptionParser<'a>,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    parse_flow_options_until_with_retry_policy(env, args, arg_bytes, start, args.len(), parser)
+}
+
+fn parse_flow_options_until_with_retry_policy<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    start: usize,
+    end: usize,
+    parser: FlowOptionParser<'a>,
+) -> Result<Vec<Term<'a>>, Term<'a>> {
+    if (end - start) % 2 != 0 {
+        return Err(generic_ast_error(env, b"ERR syntax error"));
+    }
+
+    let mut opts = Vec::with_capacity((end - start) / 2);
+    let mut retry_opts = Vec::new();
+    let mut backoff_opts = Vec::new();
+    let mut idx = start;
+
+    while idx < end {
+        if flow_retry_policy_option_name(arg_bytes[idx]) {
+            let (term, is_backoff) = flow_policy_retry_option(env, args, arg_bytes, idx)?;
+            if is_backoff {
+                backoff_opts.push(term);
+            } else {
+                retry_opts.push(term);
+            }
+        } else if let Some(opt) = parser(env, args, arg_bytes, idx)? {
+            opts.push(opt);
+        }
+
+        idx += 2;
+    }
+
+    if !backoff_opts.is_empty() {
+        retry_opts.push((atom(env, "backoff"), backoff_opts).encode(env));
+    }
+
+    if !retry_opts.is_empty() {
+        opts.push((atom(env, "retry"), retry_opts).encode(env));
+    }
+
+    Ok(opts)
+}
+
+fn flow_retry_policy_option_name(value: &[u8]) -> bool {
+    ascii_eq_ignore_case(value, b"MAX_ATTEMPTS")
+        || ascii_eq_ignore_case(value, b"BACKOFF")
+        || ascii_eq_ignore_case(value, b"BASE_MS")
+        || ascii_eq_ignore_case(value, b"MAX_MS")
+        || ascii_eq_ignore_case(value, b"JITTER_PCT")
+        || ascii_eq_ignore_case(value, b"EXHAUSTED_TO")
 }
 
 fn flow_find_option(arg_bytes: &[&[u8]], start: usize, name: &[u8]) -> Option<usize> {

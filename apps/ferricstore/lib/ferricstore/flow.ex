@@ -33,6 +33,7 @@ defmodule Ferricstore.Flow do
   # versions before writing a newer format.
   @record_bin_magic "FSF1"
   @history_bin_magic "FSH1"
+  @history_bin_magic_v2 "FSH2"
 
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
     started = flow_start_time()
@@ -1068,10 +1069,16 @@ defmodule Ferricstore.Flow do
   # History entries have their own durable schema because they are retained for
   # audit/debug and rewind. Version history separately from Flow records: a new
   # record encoding does not automatically permit changing FSH1 layout.
-  def encode_history_fields(record, event, now_ms)
+  def encode_history_fields(record, event, now_ms, meta \\ %{})
       when is_map(record) and is_binary(event) and is_integer(now_ms) do
+    {magic, meta_fields} =
+      case normalize_history_meta(meta) do
+        [] -> {@history_bin_magic, []}
+        fields -> {@history_bin_magic_v2, [encode_history_meta(fields)]}
+      end
+
     [
-      @history_bin_magic,
+      magic,
       encode_bin(event),
       encode_int(Map.get(record, :version)),
       encode_int(now_ms),
@@ -1092,7 +1099,8 @@ defmodule Ferricstore.Flow do
       encode_bin(Map.get(record, :correlation_id)),
       encode_bin(Map.get(record, :result_ref)),
       encode_bin(Map.get(record, :error_ref)),
-      encode_bin(Map.get(record, :rewound_to_event_id))
+      encode_bin(Map.get(record, :rewound_to_event_id)),
+      meta_fields
     ]
     |> IO.iodata_to_binary()
   end
@@ -1100,6 +1108,7 @@ defmodule Ferricstore.Flow do
   @doc false
   # Decode history into the current RESP-facing field list. Keep old history
   # decoders even if rewind/debug output gains new fields later.
+  def decode_history_fields(@history_bin_magic_v2 <> rest), do: decode_history_fields_bin_v2(rest)
   def decode_history_fields(@history_bin_magic <> rest), do: decode_history_fields_bin(rest)
 
   def decode_history_fields(value) when is_binary(value) do
@@ -1137,7 +1146,59 @@ defmodule Ferricstore.Flow do
          error_ref,
          rewound_to_event_id
        }) do
-    [
+    decode_history_fields_term({
+      @history_tag,
+      event,
+      version,
+      at,
+      id,
+      type,
+      state,
+      priority,
+      attempts,
+      fencing_token,
+      created_at_ms,
+      updated_at_ms,
+      next_run_at_ms,
+      lease_deadline_ms,
+      lease_owner,
+      payload_ref,
+      parent_flow_id,
+      root_flow_id,
+      correlation_id,
+      result_ref,
+      error_ref,
+      rewound_to_event_id,
+      []
+    })
+  end
+
+  defp decode_history_fields_term({
+         @history_tag,
+         event,
+         version,
+         at,
+         id,
+         type,
+         state,
+         priority,
+         attempts,
+         fencing_token,
+         created_at_ms,
+         updated_at_ms,
+         next_run_at_ms,
+         lease_deadline_ms,
+         lease_owner,
+         payload_ref,
+         parent_flow_id,
+         root_flow_id,
+         correlation_id,
+         result_ref,
+         error_ref,
+         rewound_to_event_id,
+         meta_fields
+       }) do
+    base_fields = [
       "event",
       event,
       "version",
@@ -1181,6 +1242,8 @@ defmodule Ferricstore.Flow do
       "rewound_to_event_id",
       history_string(rewound_to_event_id)
     ]
+
+    base_fields ++ normalize_history_decoded_meta(meta_fields)
   end
 
   defp decode_history_fields_term(fields) when is_list(fields), do: fields
@@ -1311,6 +1374,108 @@ defmodule Ferricstore.Flow do
       _ -> []
     end
   end
+
+  defp decode_history_fields_bin_v2(rest) do
+    with {:ok, event, rest} <- decode_bin(rest),
+         {:ok, version, rest} <- decode_int(rest),
+         {:ok, at, rest} <- decode_int(rest),
+         {:ok, id, rest} <- decode_bin(rest),
+         {:ok, type, rest} <- decode_bin(rest),
+         {:ok, state, rest} <- decode_bin(rest),
+         {:ok, priority, rest} <- decode_int(rest),
+         {:ok, attempts, rest} <- decode_int(rest),
+         {:ok, fencing_token, rest} <- decode_int(rest),
+         {:ok, created_at_ms, rest} <- decode_int(rest),
+         {:ok, updated_at_ms, rest} <- decode_int(rest),
+         {:ok, next_run_at_ms, rest} <- decode_int(rest),
+         {:ok, lease_deadline_ms, rest} <- decode_int(rest),
+         {:ok, lease_owner, rest} <- decode_bin(rest),
+         {:ok, payload_ref, rest} <- decode_bin(rest),
+         {:ok, parent_flow_id, rest} <- decode_bin(rest),
+         {:ok, root_flow_id, rest} <- decode_bin(rest),
+         {:ok, correlation_id, rest} <- decode_bin(rest),
+         {:ok, result_ref, rest} <- decode_bin(rest),
+         {:ok, error_ref, rest} <- decode_bin(rest),
+         {:ok, rewound_to_event_id, rest} <- decode_bin(rest),
+         {:ok, meta_fields, ""} <- decode_history_meta(rest) do
+      decode_history_fields_term({
+        @history_tag,
+        event,
+        version,
+        at,
+        id,
+        type,
+        state,
+        priority,
+        attempts,
+        fencing_token,
+        created_at_ms,
+        updated_at_ms,
+        next_run_at_ms,
+        lease_deadline_ms,
+        lease_owner,
+        payload_ref,
+        parent_flow_id,
+        root_flow_id,
+        correlation_id,
+        result_ref,
+        error_ref,
+        rewound_to_event_id,
+        meta_fields
+      })
+    else
+      _ -> []
+    end
+  end
+
+  defp normalize_history_meta(meta) when is_map(meta) do
+    meta
+    |> Enum.flat_map(fn
+      {key, value} when is_atom(key) -> history_meta_pair(Atom.to_string(key), value)
+      {key, value} when is_binary(key) -> history_meta_pair(key, value)
+      _other -> []
+    end)
+  end
+
+  defp normalize_history_meta(_meta), do: []
+
+  defp history_meta_pair(_key, nil), do: []
+  defp history_meta_pair(key, value) when is_binary(value), do: [{key, value}]
+  defp history_meta_pair(key, value) when is_atom(value), do: [{key, Atom.to_string(value)}]
+  defp history_meta_pair(key, value) when is_integer(value), do: [{key, Integer.to_string(value)}]
+  defp history_meta_pair(key, value), do: [{key, to_string(value)}]
+
+  defp encode_history_meta(fields) do
+    [encode_int(length(fields)), Enum.map(fields, &encode_history_meta_pair/1)]
+  end
+
+  defp encode_history_meta_pair({key, value}), do: [encode_bin(key), encode_bin(value)]
+
+  defp decode_history_meta(rest) do
+    with {:ok, count, rest} <- decode_int(rest) do
+      decode_history_meta_pairs(count, rest, [])
+    end
+  end
+
+  defp decode_history_meta_pairs(0, rest, acc), do: {:ok, Enum.reverse(acc), rest}
+
+  defp decode_history_meta_pairs(count, rest, acc) when is_integer(count) and count > 0 do
+    with {:ok, key, rest} <- decode_bin(rest),
+         {:ok, value, rest} <- decode_bin(rest) do
+      decode_history_meta_pairs(count - 1, rest, [{key, value} | acc])
+    end
+  end
+
+  defp decode_history_meta_pairs(_count, _rest, _acc), do: :error
+
+  defp normalize_history_decoded_meta(fields) when is_list(fields) do
+    Enum.flat_map(fields, fn
+      {key, value} when is_binary(key) and is_binary(value) -> [key, value]
+      _other -> []
+    end)
+  end
+
+  defp normalize_history_decoded_meta(_fields), do: []
 
   defp encode_int(value) when is_integer(value) and value >= 0, do: encode_varint(value + 1)
   defp encode_int(_value), do: <<0>>
@@ -3649,6 +3814,11 @@ defmodule Ferricstore.Flow do
     def policy_key(type) do
       "f:" <> @global_tag <> ":policy:" <> type
     end
+
+    def policy_key?(key) when is_binary(key),
+      do: String.starts_with?(key, "f:" <> @global_tag <> ":policy:")
+
+    def policy_key?(_key), do: false
 
     def due_key(type, state, priority, partition_key \\ nil) do
       "f:" <>

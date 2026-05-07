@@ -1765,6 +1765,21 @@ defmodule Ferricstore.FlowTest do
     assert retried.next_run_at_ms == 3_000
     assert retried.lease_token == nil
 
+    assert {:ok, history} = FerricStore.flow_history(id, count: 10)
+
+    {_event_id, retry_fields} =
+      Enum.find(history, fn {_event_id, fields} -> fields["event"] == "retry" end)
+
+    assert retry_fields["retry_decision"] == "scheduled"
+    assert retry_fields["retry_run_state"] == "charge_card"
+    assert retry_fields["retry_next_run_at_ms"] == "3000"
+    assert retry_fields["retry_max_attempts"] == "3"
+    assert retry_fields["retry_backoff_kind"] == "exponential"
+    assert retry_fields["retry_backoff_base_ms"] == "1000"
+    assert retry_fields["retry_backoff_max_ms"] == "30000"
+    assert retry_fields["retry_jitter_pct"] == "0"
+    assert retry_fields["retry_exhausted_to"] == "payment_failed"
+
     assert {:ok, []} =
              FerricStore.flow_claim_due("payment",
                state: "charge_card",
@@ -1885,6 +1900,108 @@ defmodule Ferricstore.FlowTest do
     assert state_policy.retry.max_attempts == 2
     assert state_policy.retry.backoff.base_ms == 10_000
     assert state_policy.retry.exhausted_to == "payment_failed"
+  end
+
+  test "flow policy is mirrored to LMDB asynchronously" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = FerricStore.Instance.get(:default)
+    type = uid("policy-lmdb")
+    policy_key = Ferricstore.Flow.Keys.policy_key(type)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, policy_key)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+    end)
+
+    assert {:ok, _policy} =
+             FerricStore.flow_policy_set(type,
+               retry: [max_attempts: 7, exhausted_to: "failed"]
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index)
+    assert {:ok, blob} = Ferricstore.Flow.LMDB.get(lmdb_path, policy_key)
+
+    assert {:ok, encoded_policy} =
+             Ferricstore.Flow.LMDB.decode_value(blob, System.system_time(:millisecond))
+
+    assert {:ok, policy} = Ferricstore.Flow.RetryPolicy.decode_flow_policy(encoded_policy)
+    assert policy.retry.max_attempts == 7
+  end
+
+  test "standalone restart rebuilds stored policy and retry uses it" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    name = :"flow_policy_restart_#{System.unique_integer([:positive])}"
+    data_dir = Path.join(System.tmp_dir!(), "ferricstore_#{name}")
+    ctx = start_flow_restart_instance(name, data_dir)
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+
+      current_ctx =
+        try do
+          FerricStore.Instance.get(name)
+        rescue
+          _ -> ctx
+        end
+
+      stop_flow_restart_instance(current_ctx, delete?: true)
+    end)
+
+    type = uid("policy-restart")
+    id = uid("flow-policy-restart")
+
+    assert {:ok, _policy} =
+             FerricStore.Impl.flow_policy_set(ctx, type,
+               states: %{
+                 "charge_card" => [retry: [max_attempts: 0, exhausted_to: "payment_failed"]]
+               }
+             )
+
+    assert {:ok, _flow} =
+             FerricStore.Impl.flow_create(ctx, id,
+               type: type,
+               state: "charge_card",
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+    stop_flow_restart_instance(ctx, delete?: false)
+
+    restarted = start_flow_restart_instance(name, data_dir)
+
+    assert {:ok, state_policy} =
+             FerricStore.Impl.flow_policy_get(restarted, type, state: "charge_card")
+
+    assert state_policy.retry.max_attempts == 0
+
+    assert {:ok, [claimed]} =
+             FerricStore.Impl.flow_claim_due(restarted, type,
+               state: "charge_card",
+               worker: "worker-restart",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, retried} =
+             FerricStore.Impl.flow_retry(restarted, claimed.id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert retried.state == "payment_failed"
+    assert retried.next_run_at_ms == 2_000
   end
 
   test "stored state retry policy drives retry exhaustion without command override" do
@@ -3488,4 +3605,90 @@ defmodule Ferricstore.FlowTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
+  defp start_flow_restart_instance(name, data_dir) do
+    ctx =
+      FerricStore.Instance.build(name,
+        data_dir: data_dir,
+        shard_count: 1,
+        max_memory_bytes: 256 * 1024 * 1024,
+        keydir_max_ram: 64 * 1024 * 1024
+      )
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    {:ok, _writer} =
+      Ferricstore.Flow.LMDBWriter.start_link(
+        shard_index: 0,
+        data_dir: data_dir,
+        instance_ctx: ctx
+      )
+
+    {:ok, _shard} =
+      Ferricstore.Store.Shard.start_link(
+        index: 0,
+        data_dir: data_dir,
+        instance_ctx: ctx
+      )
+
+    ShardHelpers.eventually(
+      fn ->
+        pid = Process.whereis(elem(ctx.shard_names, 0))
+
+        is_pid(pid) and Process.alive?(pid) and
+          match?(
+            {:ok, _},
+            try do
+              {:ok, GenServer.call(elem(ctx.shard_names, 0), :shard_stats, 500)}
+            catch
+              :exit, _ -> :error
+            end
+          )
+      end,
+      "restart flow shard not ready",
+      50,
+      20
+    )
+
+    ctx
+  end
+
+  defp stop_flow_restart_instance(nil, _opts), do: :ok
+
+  defp stop_flow_restart_instance(ctx, opts) do
+    Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+    stop_registered_process(elem(ctx.shard_names, 0))
+    stop_registered_process(Ferricstore.Flow.LMDBWriter.name(ctx.name, 0))
+
+    for table <- [elem(ctx.keydir_refs, 0), ctx.hotness_table, ctx.config_table] do
+      try do
+        :ets.delete(table)
+      rescue
+        _ -> :ok
+      end
+    end
+
+    FerricStore.Instance.cleanup(ctx.name)
+
+    if Keyword.get(opts, :delete?, false) do
+      File.rm_rf!(ctx.data_dir)
+    end
+
+    :ok
+  end
+
+  defp stop_registered_process(name) do
+    case Process.whereis(name) do
+      nil ->
+        :ok
+
+      pid ->
+        try do
+          GenServer.stop(pid, :normal, 5_000)
+        catch
+          :exit, _ -> :ok
+        end
+    end
+  end
 end
