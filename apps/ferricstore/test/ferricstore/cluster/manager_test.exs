@@ -106,6 +106,35 @@ defmodule Ferricstore.Cluster.ManagerTest do
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
+    test "direct sync index extraction fails closed for wal-bridgeable unreadable target" do
+      target = :"missing_index_target@127.0.0.1"
+
+      assert {:error, {:target_index_read_failed, ^target, :context, _reason}} =
+               Manager.__extract_direct_sync_indices_for_test__(target, %{
+                 0 => {:synced, :wal_bridgeable}
+               })
+    end
+
+    test "direct sync index extraction rejects unknown sync details instead of using zero" do
+      target = :"unknown_sync_detail_target@127.0.0.1"
+
+      assert {:error,
+              {:target_index_read_failed, ^target, 0, {:unknown_sync_detail, :unknown_detail}}} =
+               Manager.__extract_direct_sync_indices_for_test__(target, %{
+                 0 => {:synced, :unknown_detail}
+               })
+    end
+
+    test "direct sync index extraction accepts explicit raft indices" do
+      target = :"explicit_index_target@127.0.0.1"
+
+      assert {:ok, %{0 => 12, 1 => 13}} =
+               Manager.__extract_direct_sync_indices_for_test__(target, %{
+                 0 => {:synced, 12},
+                 1 => {:synced, 13}
+               })
+    end
+
     test "unknown target data state aborts join before identity bypass or sync" do
       target = :"unknown_target_data@127.0.0.1"
       parent = self()

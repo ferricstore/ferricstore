@@ -82,6 +82,12 @@ defmodule Ferricstore.Cluster.Manager do
     GenServer.call(__MODULE__, {:enable_cluster, opts}, 120_000)
   end
 
+  @doc "Returns promotion/recovery status for CLUSTER.ENABLE."
+  @spec enable_status() :: map()
+  def enable_status do
+    GenServer.call(__MODULE__, :enable_status)
+  end
+
   # ---------------------------------------------------------------------------
   # GenServer callbacks
   # ---------------------------------------------------------------------------
@@ -167,24 +173,36 @@ defmodule Ferricstore.Cluster.Manager do
      }, state}
   end
 
+  def handle_call(:enable_status, _from, state) do
+    {:reply, enable_status_snapshot(state), state}
+  end
+
   def handle_call({:enable_cluster, opts}, _from, state) do
     dryrun? = Keyword.get(opts, :dryrun, false)
+    resume? = Keyword.get(opts, :resume, false)
 
-    case enable_cluster_dryrun(state) do
-      :ok when dryrun? ->
-        {:reply, :ok, state}
+    cond do
+      dryrun? ->
+        {:reply, enable_cluster_dryrun(state), state}
 
-      :ok ->
-        case do_enable_cluster(state) do
+      resume? and Ferricstore.ReplicationMode.current() != :enabling ->
+        mode = Ferricstore.ReplicationMode.current()
+        {:reply, {:error, {:no_enable_recovery_needed, mode}}, state}
+
+      true ->
+        case enable_cluster_dryrun(state) do
           :ok ->
-            {:reply, :ok, %{state | mode: :cluster, sync_status: :synced}}
+            case do_enable_cluster(state) do
+              :ok ->
+                {:reply, :ok, %{state | mode: :cluster, sync_status: :synced}}
 
-          {:error, reason} = error ->
-            {:reply, error, Map.put(state, :last_enable_error, reason)}
+              {:error, reason} = error ->
+                {:reply, error, Map.put(state, :last_enable_error, reason)}
+            end
+
+          {:error, _reason} = error ->
+            {:reply, error, state}
         end
-
-      {:error, _reason} = error ->
-        {:reply, error, state}
     end
   end
 
@@ -505,6 +523,30 @@ defmodule Ferricstore.Cluster.Manager do
   defp set_readiness(value) do
     Ferricstore.Health.set_ready(value)
     :ok
+  end
+
+  defp enable_status_snapshot(state) do
+    ctx = default_instance()
+
+    marker =
+      if ctx, do: Ferricstore.ReplicationMode.read(ctx.data_dir), else: {:error, :no_instance}
+
+    %{
+      manager_mode: state.mode,
+      sync_status: state.sync_status,
+      replication_mode: Ferricstore.ReplicationMode.current(),
+      marker: marker,
+      node: node(),
+      node_alive: Node.alive?(),
+      ready: Ferricstore.Health.ready?(),
+      last_enable_error: Map.get(state, :last_enable_error)
+    }
+  end
+
+  defp default_instance do
+    FerricStore.Instance.get(:default)
+  rescue
+    _ -> nil
   end
 
   defp pause_all_shards(%{shard_count: shard_count} = ctx) do
@@ -1154,45 +1196,55 @@ defmodule Ferricstore.Cluster.Manager do
       {:ok, sync_results} ->
         Logger.info("ClusterManager: data synced to #{target_node}: #{inspect(sync_results)}")
 
-        # Extract raft indices from sync results.
-        # For :wal_bridgeable shards (already had data), read the actual
-        # last_applied index from the target's ra DETS file — this tells us
-        # what the pre-existing data covers (e.g., disk clone scenario).
-        sync_indices =
-          for {shard_idx, {:synced, detail}} <- sync_results, into: %{} do
-            case detail do
-              :wal_bridgeable ->
-                # Target had data — read the index from its ra state on disk
-                idx =
-                  try do
-                    target_data_dir =
-                      :erpc.call(target_node, FerricStore.Instance, :get, [:default]).data_dir
-
-                    :erpc.call(
-                      target_node,
-                      Ferricstore.Cluster.DataSync,
-                      :read_last_applied_from_disk,
-                      [target_data_dir, shard_idx],
-                      5_000
-                    )
-                  catch
-                    _, _ -> 0
-                  end
-
-                {shard_idx, idx}
-
-              raft_idx when is_integer(raft_idx) ->
-                {shard_idx, raft_idx}
-
-              _ ->
-                {shard_idx, 0}
-            end
-          end
-
-        {:ok, sync_indices}
+        extract_direct_sync_indices(target_node, sync_results)
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  @doc false
+  def __extract_direct_sync_indices_for_test__(target_node, sync_results) do
+    extract_direct_sync_indices(target_node, sync_results)
+  end
+
+  defp extract_direct_sync_indices(target_node, sync_results) when is_map(sync_results) do
+    with {:ok, target_data_dir} <-
+           maybe_target_data_dir_for_wal_bridgeable(target_node, sync_results) do
+      Enum.reduce_while(sync_results, {:ok, %{}}, fn
+        {shard_idx, {:synced, :wal_bridgeable}}, {:ok, acc} ->
+          case read_target_shard_index(target_node, target_data_dir, shard_idx) do
+            {:ok, idx} -> {:cont, {:ok, Map.put(acc, shard_idx, idx)}}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+
+        {shard_idx, {:synced, raft_idx}}, {:ok, acc}
+        when is_integer(raft_idx) and raft_idx >= 0 ->
+          {:cont, {:ok, Map.put(acc, shard_idx, raft_idx)}}
+
+        {shard_idx, {:synced, detail}}, {:ok, _acc} ->
+          {:halt,
+           {:error,
+            {:target_index_read_failed, target_node, shard_idx, {:unknown_sync_detail, detail}}}}
+
+        {shard_idx, other}, {:ok, _acc} ->
+          {:halt,
+           {:error,
+            {:target_index_read_failed, target_node, shard_idx, {:unexpected_sync_result, other}}}}
+      end)
+    end
+  end
+
+  defp extract_direct_sync_indices(target_node, sync_results) do
+    {:error,
+     {:target_index_read_failed, target_node, :sync_results, {:unexpected_result, sync_results}}}
+  end
+
+  defp maybe_target_data_dir_for_wal_bridgeable(target_node, sync_results) do
+    if Enum.any?(sync_results, fn {_shard_idx, result} -> result == {:synced, :wal_bridgeable} end) do
+      target_data_dir(target_node)
+    else
+      {:ok, nil}
     end
   end
 

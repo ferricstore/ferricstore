@@ -208,6 +208,31 @@ defmodule Ferricstore.Commands.ClusterCommandsTest do
       assert :ok = Cluster.handle("CLUSTER.ENABLE", ["DRYRUN"], store)
     end
 
+    test "status reports promotion recovery fields", %{store: store} do
+      result = Cluster.handle("CLUSTER.ENABLE", ["STATUS"], store)
+
+      assert is_binary(result)
+      assert result =~ "replication_mode:"
+      assert result =~ "manager_mode:"
+      assert result =~ "node_alive:"
+      assert result =~ "ready:"
+      assert result =~ "last_enable_error:"
+      assert result =~ "marker_status:"
+    end
+
+    test "resume reports when no enabling recovery is pending", %{store: store} do
+      old_mode = Ferricstore.ReplicationMode.current()
+
+      try do
+        Ferricstore.ReplicationMode.put_current(:raft)
+
+        assert {:error, message} = Cluster.handle("CLUSTER.ENABLE", ["RESUME"], store)
+        assert message =~ "no_enable_recovery_needed"
+      after
+        Ferricstore.ReplicationMode.put_current(old_mode)
+      end
+    end
+
     test "rejects unknown CLUSTER.ENABLE option", %{store: store} do
       assert {:error, "ERR syntax error"} = Cluster.handle("CLUSTER.ENABLE", ["NOW"], store)
     end

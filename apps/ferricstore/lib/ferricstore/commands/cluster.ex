@@ -21,7 +21,8 @@ defmodule Ferricstore.Commands.Cluster do
   ### Membership management
 
     * `CLUSTER.JOIN <node> [REPLACE]` -- adds a node to the cluster
-    * `CLUSTER.ENABLE [DRYRUN]` -- promotes a manual standalone node to Raft
+    * `CLUSTER.ENABLE [DRYRUN|RESUME|STATUS]` -- promotes or inspects a manual
+      standalone node to Raft
     * `CLUSTER.LEAVE` -- gracefully removes this node from the cluster
     * `CLUSTER.FAILOVER <shard_index> <target_node>` -- transfers shard
       leadership to a specific node
@@ -217,6 +218,15 @@ defmodule Ferricstore.Commands.Cluster do
           :ok -> :ok
           {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
         end
+
+      "RESUME" ->
+        case ClusterManager.enable_cluster(resume: true) do
+          :ok -> :ok
+          {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+        end
+
+      "STATUS" ->
+        format_enable_status(ClusterManager.enable_status())
 
       _ ->
         {:error, "ERR syntax error"}
@@ -424,6 +434,43 @@ defmodule Ferricstore.Commands.Cluster do
   rescue
     error ->
       "unavailable #{Exception.message(error)} promotion_epoch=unknown barrier_indices=unknown"
+  end
+
+  defp format_enable_status(status) when is_map(status) do
+    marker = Map.get(status, :marker)
+    {marker_status, marker_lines} = format_enable_marker(marker)
+
+    [
+      "replication_mode: #{Map.get(status, :replication_mode)}",
+      "manager_mode: #{Map.get(status, :manager_mode)}",
+      "sync_status: #{Map.get(status, :sync_status)}",
+      "node: #{Map.get(status, :node)}",
+      "node_alive: #{Map.get(status, :node_alive)}",
+      "ready: #{Map.get(status, :ready)}",
+      "last_enable_error: #{inspect(Map.get(status, :last_enable_error))}",
+      "marker_status: #{marker_status}"
+      | marker_lines
+    ]
+    |> Enum.join("\r\n")
+  end
+
+  defp format_enable_marker({:ok, marker}) when is_map(marker) do
+    lines = [
+      "marker_mode: #{Map.get(marker, :replication_mode, :unknown)}",
+      "cluster_id: #{Map.get(marker, :cluster_id, "unknown")}",
+      "promotion_epoch: #{Map.get(marker, :promotion_epoch, "none")}",
+      "barrier_indices: #{inspect(Map.get(marker, :barrier_indices, %{}))}"
+    ]
+
+    {"ok", lines}
+  end
+
+  defp format_enable_marker({:error, reason}) do
+    {"error", ["marker_error: #{inspect(reason)}"]}
+  end
+
+  defp format_enable_marker(other) do
+    {"unknown", ["marker_error: #{inspect(other)}"]}
   end
 
   defp collect_shard_info do
