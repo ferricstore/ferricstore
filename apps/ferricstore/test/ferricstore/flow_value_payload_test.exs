@@ -29,7 +29,11 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert is_binary(created.payload_ref)
     assert created.payload_ref != ""
 
-    assert {:ok, fetched} = FerricStore.flow_get(id, partition_key: "tenant-a")
+    assert {:ok, fetched_ref_only} = FerricStore.flow_get(id, partition_key: "tenant-a")
+    refute Map.has_key?(fetched_ref_only, :payload)
+    assert fetched_ref_only.payload_ref == created.payload_ref
+
+    assert {:ok, fetched} = FerricStore.flow_get(id, partition_key: "tenant-a", full: true)
     assert fetched.payload == payload
 
     assert {:ok, [claimed]} =
@@ -99,7 +103,11 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert retried.payload_ref == reclaimed.payload_ref
     assert is_binary(retried.error_ref)
 
-    assert {:ok, fetched} = FerricStore.flow_get(id, partition_key: "tenant-a")
+    assert {:ok, fetched_ref_only} = FerricStore.flow_get(id, partition_key: "tenant-a")
+    refute Map.has_key?(fetched_ref_only, :payload)
+    refute Map.has_key?(fetched_ref_only, :error)
+
+    assert {:ok, fetched} = FerricStore.flow_get(id, partition_key: "tenant-a", full: true)
     assert fetched.payload == %{step: "waiting"}
     assert fetched.error == %{reason: "temporary"}
   end
@@ -150,9 +158,10 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert is_binary(failed.error_ref)
 
     assert {:ok, fetched_completed} =
-             FerricStore.flow_get(complete_claim.id, partition_key: "tenant-a")
+             FerricStore.flow_get(complete_claim.id, partition_key: "tenant-a", full: true)
 
-    assert {:ok, fetched_failed} = FerricStore.flow_get(fail_claim.id, partition_key: "tenant-a")
+    assert {:ok, fetched_failed} =
+             FerricStore.flow_get(fail_claim.id, partition_key: "tenant-a", full: true)
 
     assert fetched_completed.result == %{status: "sent"}
     assert fetched_failed.error == %{code: "bad_input"}
@@ -243,15 +252,66 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert retried.payload_ref != retry_claim.payload_ref
     assert is_binary(failed.error_ref)
 
-    assert {:ok, fetched_completed} = FerricStore.flow_get(complete_id, partition_key: partition)
-    assert {:ok, fetched_retried} = FerricStore.flow_get(retry_id, partition_key: partition)
-    assert {:ok, fetched_failed} = FerricStore.flow_get(fail_id, partition_key: partition)
+    assert {:ok, fetched_completed} =
+             FerricStore.flow_get(complete_id, partition_key: partition, full: true)
+
+    assert {:ok, fetched_retried} =
+             FerricStore.flow_get(retry_id, partition_key: partition, full: true)
+
+    assert {:ok, fetched_failed} =
+             FerricStore.flow_get(fail_id, partition_key: partition, full: true)
 
     assert fetched_completed.result == ["done"]
     assert fetched_retried.payload == %{kind: "retry-updated"}
     assert fetched_retried.error == %{retry: true}
     assert fetched_failed.payload == %{kind: "fail"}
     assert fetched_failed.error == {:bad, :input}
+  end
+
+  test "history only hydrates stored values when values option is requested" do
+    id = unique_id("flow-value-history")
+    partition = "tenant-a"
+
+    assert {:ok, _created} =
+             FerricStore.flow_create(id,
+               type: "value-history",
+               partition_key: partition,
+               payload: %{input: 1},
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("value-history",
+               partition_key: partition,
+               worker: "worker-1",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, _completed} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               partition_key: partition,
+               fencing_token: claimed.fencing_token,
+               result: %{output: 2},
+               now_ms: 1_100
+             )
+
+    assert {:ok, ref_history} = FerricStore.flow_history(id, partition_key: partition, count: 10)
+
+    refute Enum.any?(ref_history, fn {_event_id, fields} ->
+             Map.has_key?(fields, "payload") or Map.has_key?(fields, "result")
+           end)
+
+    assert {:ok, value_history} =
+             FerricStore.flow_history(id, partition_key: partition, count: 10, values: true)
+
+    value_events = Map.new(value_history, fn {_event_id, fields} -> {fields["event"], fields} end)
+
+    assert value_events["created"]["payload"] == %{input: 1}
+    assert value_events["claimed"]["payload"] == %{input: 1}
+    assert value_events["completed"]["payload"] == %{input: 1}
+    assert value_events["completed"]["result"] == %{output: 2}
   end
 
   defp unique_id(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"

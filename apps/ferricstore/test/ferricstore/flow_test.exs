@@ -180,7 +180,7 @@ defmodule Ferricstore.FlowTest do
     end
   end
 
-  test "flow history encoding is compact and decodes old field lists" do
+  test "flow history encoding is compact and includes metadata" do
     record = %{
       id: "flow-1",
       type: "checkout",
@@ -203,7 +203,7 @@ defmodule Ferricstore.FlowTest do
       rewound_to_event_id: nil
     }
 
-    old_fields = [
+    fields = [
       "event",
       "retry",
       "version",
@@ -248,17 +248,28 @@ defmodule Ferricstore.FlowTest do
       ""
     ]
 
-    compact = Ferricstore.Flow.encode_history_fields(record, "retry", 1_100)
-    old = :erlang.term_to_binary(old_fields)
+    compact =
+      Ferricstore.Flow.encode_history_fields(record, "retry", 1_100, %{
+        "retry_decision" => "scheduled",
+        "retry_next_run_at_ms" => nil
+      })
 
     assert "FSH1" <> _ = compact
-    assert Ferricstore.Flow.decode_history_fields(compact) == old_fields
-    assert Ferricstore.Flow.decode_history_fields(old) == old_fields
-    assert byte_size(compact) < byte_size(old)
+
+    assert Ferricstore.Flow.decode_history_fields(compact) ==
+             fields ++
+               [
+                 "retry_decision",
+                 "scheduled",
+                 "retry_next_run_at_ms",
+                 ""
+               ]
 
     assert Ferricstore.Flow.decode_history_fields(
-             "FSH2" <> binary_part(compact, 4, byte_size(compact) - 4)
+             "BAD!" <> binary_part(compact, 4, byte_size(compact) - 4)
            ) == []
+
+    assert Ferricstore.Flow.decode_history_fields(:erlang.term_to_binary(fields)) == []
 
     assert Ferricstore.Flow.decode_history_fields(binary_part(compact, 0, byte_size(compact) - 1)) ==
              []
@@ -290,7 +301,7 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id, type: "checkout", state: "queued")
   end
 
-  test "flow_get hydrates small payload refs by default and supports opt-out/caps" do
+  test "flow_get hydrates payload refs only when full or payload is requested" do
     id = uid("flow-get-payload")
     payload_key = "payload:" <> id
     payload = "payload-body"
@@ -305,7 +316,11 @@ defmodule Ferricstore.FlowTest do
                run_at_ms: 1_000
              )
 
-    assert {:ok, fetched} = FerricStore.flow_get(id)
+    assert {:ok, ref_only} = FerricStore.flow_get(id)
+    refute Map.has_key?(ref_only, :payload)
+    refute Map.has_key?(ref_only, :payload_omitted)
+
+    assert {:ok, fetched} = FerricStore.flow_get(id, full: true)
     assert fetched.payload == payload
     assert fetched.payload_size == byte_size(payload)
     refute Map.has_key?(fetched, :payload_omitted)
@@ -314,7 +329,7 @@ defmodule Ferricstore.FlowTest do
     refute Map.has_key?(no_payload, :payload)
     refute Map.has_key?(no_payload, :payload_omitted)
 
-    assert {:ok, capped} = FerricStore.flow_get(id, payload_max_bytes: 4)
+    assert {:ok, capped} = FerricStore.flow_get(id, full: true, payload_max_bytes: 4)
     assert capped.payload_omitted == true
     assert capped.payload_size == byte_size(payload)
     refute Map.has_key?(capped, :payload)
@@ -445,8 +460,8 @@ defmodule Ferricstore.FlowTest do
              {:ok, no_payload}
            ] =
              Ferricstore.Flow.pipeline_read_batch(ctx, [
-               {:get, id_a, []},
-               {:get, id_b, [payload_max_bytes: 4]},
+               {:get, id_a, [full: true]},
+               {:get, id_b, [full: true, payload_max_bytes: 4]},
                {:get, id_a, [payload: false]}
              ])
 
