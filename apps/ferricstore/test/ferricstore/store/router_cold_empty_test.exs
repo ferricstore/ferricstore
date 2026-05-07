@@ -365,6 +365,81 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
     end
   end
 
+  test "batch cold read waits through a delayed compaction ETS update", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key =
+      "cold_batch_compaction_delayed:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+
+    value = "delayed-batch-compacted-value"
+    value_size = byte_size(value)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00000.log")
+
+    {:ok, {_dead_offset, _dead_record_size}} = NIF.v2_append_record(path, "dead", "old", 0)
+    {:ok, {old_offset, _old_record_size}} = NIF.v2_append_record(path, key, value, 0)
+
+    File.rm!(path)
+    {:ok, {new_offset, _new_record_size}} = NIF.v2_append_record(path, key, value, 0)
+
+    :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, old_offset, value_size})
+
+    Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+      misses = Process.get(:delayed_batch_compaction_misses, 0) + 1
+      Process.put(:delayed_batch_compaction_misses, misses)
+
+      if misses == 2 do
+        :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, new_offset, value_size})
+      end
+    end)
+
+    try do
+      assert [^value] = Router.batch_get(ctx, [key])
+    after
+      Process.delete(:ferricstore_router_cold_location_miss_hook)
+      Process.delete(:delayed_batch_compaction_misses)
+    end
+  end
+
+  test "get_meta waits through a delayed compaction ETS update", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key =
+      "cold_meta_compaction_delayed:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+
+    value = "delayed-meta-compacted-value"
+    value_size = byte_size(value)
+    expire_at_ms = 0
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    path = Path.join(shard_path, "00000.log")
+
+    {:ok, {_dead_offset, _dead_record_size}} = NIF.v2_append_record(path, "dead", "old", 0)
+    {:ok, {old_offset, _old_record_size}} = NIF.v2_append_record(path, key, value, 0)
+
+    File.rm!(path)
+    {:ok, {new_offset, _new_record_size}} = NIF.v2_append_record(path, key, value, 0)
+
+    :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), 0, old_offset, value_size})
+
+    Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+      misses = Process.get(:delayed_meta_compaction_misses, 0) + 1
+      Process.put(:delayed_meta_compaction_misses, misses)
+
+      if misses == 2 do
+        :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), 0, new_offset, value_size})
+      end
+    end)
+
+    try do
+      assert {^value, ^expire_at_ms} = Router.get_meta(ctx, key)
+    after
+      Process.delete(:ferricstore_router_cold_location_miss_hook)
+      Process.delete(:delayed_meta_compaction_misses)
+    end
+  end
+
   test "batch cold reads do not crash on cold rows with invalid offsets", %{
     ctx: ctx,
     keydir: keydir

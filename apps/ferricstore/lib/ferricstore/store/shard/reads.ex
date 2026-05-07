@@ -3,6 +3,7 @@ defmodule Ferricstore.Store.Shard.Reads do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
+  alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
@@ -316,7 +317,8 @@ defmodule Ferricstore.Store.Shard.Reads do
                Map.put(state.pending_reads, corr_id, {:pending_read, pending_entry, timer_ref})
          }}
 
-      {:error, _reason} ->
+      {:error, reason} ->
+        ColdRead.emit_pread_error(path, reason)
         {:reply, nil, state}
     end
   end

@@ -108,4 +108,23 @@ defmodule Ferricstore.Bitcask.AsyncTest do
     refute Process.alive?(proxy),
            "timed-out async waits must not keep one proxy process alive for another full timeout"
   end
+
+  test "timed-out await shuts down proxy promptly when completion never arrives" do
+    test_pid = self()
+
+    assert {:error, :timeout} =
+             Async.await(
+               fn proxy, corr_id ->
+                 send(test_pid, {:proxy_started, proxy, corr_id})
+                 :ok
+               end,
+               10
+             )
+
+    assert_receive {:proxy_started, proxy, _corr_id}
+    Process.sleep(5)
+
+    refute Process.alive?(proxy),
+           "a submitted async wait with no completion must not keep its proxy alive for a second full timeout"
+  end
 end

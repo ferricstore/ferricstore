@@ -58,6 +58,19 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
     assert path == Path.join(shard_data_path, "00001.log")
   end
 
+  test "async cold read submit errors emit pread telemetry before replying nil" do
+    source =
+      __DIR__
+      |> Path.join("../../../lib/ferricstore/store/shard/reads.ex")
+      |> Path.expand()
+      |> File.read!()
+
+    [_before, branch] = String.split(source, "{:error, reason} ->", parts: 2)
+
+    assert branch =~ "ColdRead.emit_pread_error(path, reason)",
+           "immediate async pread submit failures must use the same telemetry event as timeout and completion errors"
+  end
+
   test "cold read timeout ignores stale correlation ids" do
     state = %{flush_in_flight: nil, pending_reads: %{}}
 
