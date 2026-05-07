@@ -28,6 +28,7 @@ defmodule Ferricstore.Metrics do
   | `ferricstore_bitcask_*`                  | gauge   | per-shard checkpoint atomics  |
   | `ferricstore_prefix_*`                   | mixed   | `PrefixMetricsCache`          |
   | `ferricstore_quorum_*`                   | counter | `QuorumMetrics` telemetry     |
+  | `ferricstore_flow_lmdb_*`                | gauge   | per-shard projection atomics  |
 
   ## Usage
 
@@ -259,6 +260,41 @@ defmodule Ferricstore.Metrics do
         "ferricstore_bitcask_replay_safe_persist_failures_total",
         "Total replay-safe marker persist failures per shard",
         fn shard -> atomic_metric(ctx, :replay_safe_persist_failures, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_lmdb_replay_safe_index",
+        "Last Flow LMDB projection replay-safe Raft index durably persisted per shard",
+        fn shard -> atomic_metric(ctx, :flow_lmdb_replay_safe_index, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_lmdb_replay_safe_requested_index",
+        "Highest Flow LMDB projection replay-safe Raft index requested per shard",
+        fn shard -> atomic_metric(ctx, :flow_lmdb_replay_safe_requested_index, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_lmdb_replay_safe_lag",
+        "Difference between requested and durable Flow LMDB projection replay-safe index per shard",
+        fn shard ->
+          requested = atomic_metric(ctx, :flow_lmdb_replay_safe_requested_index, shard)
+          durable = atomic_metric(ctx, :flow_lmdb_replay_safe_index, shard)
+
+          max(requested - durable, 0)
+        end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_lmdb_replay_safe_persist_failures_total",
+        "Total Flow LMDB replay-safe marker persist failures per shard",
+        fn shard -> atomic_metric(ctx, :flow_lmdb_replay_safe_persist_failures, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_lmdb_mirror_enqueue_failures_total",
+        "Total Flow LMDB mirror enqueue failures per shard",
+        fn shard -> atomic_metric(ctx, :flow_lmdb_mirror_enqueue_failures, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_lmdb_mirror_degraded",
+        "Whether Flow LMDB cold projection is degraded for this shard",
+        fn shard -> atomic_metric(ctx, :flow_lmdb_mirror_degraded, shard) end
       ),
       checkpoint_metric_family(
         "ferricstore_bitcask_release_cursor_gap",

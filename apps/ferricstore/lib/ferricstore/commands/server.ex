@@ -996,6 +996,23 @@ defmodule Ferricstore.Commands.Server do
         replay_safe_persist_failures =
           atomic_metric(instance_ctx, :replay_safe_persist_failures, i)
 
+        flow_lmdb_replay_safe = atomic_metric(instance_ctx, :flow_lmdb_replay_safe_index, i)
+
+        flow_lmdb_replay_safe_requested =
+          atomic_metric(instance_ctx, :flow_lmdb_replay_safe_requested_index, i)
+
+        flow_lmdb_replay_safe_lag =
+          max(flow_lmdb_replay_safe_requested - flow_lmdb_replay_safe, 0)
+
+        flow_lmdb_replay_safe_persist_failures =
+          atomic_metric(instance_ctx, :flow_lmdb_replay_safe_persist_failures, i)
+
+        flow_lmdb_mirror_enqueue_failures =
+          atomic_metric(instance_ctx, :flow_lmdb_mirror_enqueue_failures, i)
+
+        flow_lmdb_mirror_degraded =
+          atomic_metric(instance_ctx, :flow_lmdb_mirror_degraded, i)
+
         release_gap = max(last_applied - last_released, 0)
 
         release_cursor_blocked_apply_count =
@@ -1016,6 +1033,15 @@ defmodule Ferricstore.Commands.Server do
           {"shard_#{i}_replay_safe_lag", Integer.to_string(replay_safe_lag)},
           {"shard_#{i}_replay_safe_persist_failures",
            Integer.to_string(replay_safe_persist_failures)},
+          {"shard_#{i}_flow_lmdb_replay_safe_index", Integer.to_string(flow_lmdb_replay_safe)},
+          {"shard_#{i}_flow_lmdb_replay_safe_requested_index",
+           Integer.to_string(flow_lmdb_replay_safe_requested)},
+          {"shard_#{i}_flow_lmdb_replay_safe_lag", Integer.to_string(flow_lmdb_replay_safe_lag)},
+          {"shard_#{i}_flow_lmdb_replay_safe_persist_failures",
+           Integer.to_string(flow_lmdb_replay_safe_persist_failures)},
+          {"shard_#{i}_flow_lmdb_mirror_enqueue_failures",
+           Integer.to_string(flow_lmdb_mirror_enqueue_failures)},
+          {"shard_#{i}_flow_lmdb_mirror_degraded", Integer.to_string(flow_lmdb_mirror_degraded)},
           {"shard_#{i}_release_cursor_gap", Integer.to_string(release_gap)},
           {"shard_#{i}_release_cursor_blocked_apply_count",
            Integer.to_string(release_cursor_blocked_apply_count)},
