@@ -125,7 +125,11 @@ defmodule Ferricstore.Store.Shard do
     flow_lookup: nil,
     zset_index_ready: MapSet.new(),
     standalone_batch: [],
-    standalone_batch_timer: nil
+    standalone_batch_timer: nil,
+    standalone_flush_ref: nil,
+    standalone_flush_entries: [],
+    standalone_inflight_keys: MapSet.new(),
+    standalone_waiting: []
   ]
 
   # -------------------------------------------------------------------
@@ -1139,7 +1143,12 @@ defmodule Ferricstore.Store.Shard do
 
   # Synchronous flush — used by tests and by delete to ensure durability.
   def handle_call(:flush, _from, state) do
-    state = await_in_flight(state)
+    state =
+      state
+      |> flush_standalone_batch()
+      |> await_standalone_flush()
+      |> await_in_flight()
+
     state = flush_pending_sync(state)
 
     case Map.get(state, :last_flush_error) do
@@ -1246,8 +1255,18 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp enqueue_standalone_commit(state, from, command) do
+    entry = {from, command, standalone_command_keys(command)}
+
+    if standalone_entry_conflicts?(entry, state.standalone_inflight_keys) do
+      %{state | standalone_waiting: state.standalone_waiting ++ [entry]}
+    else
+      enqueue_ready_standalone_commit(state, entry)
+    end
+  end
+
+  defp enqueue_ready_standalone_commit(state, entry) do
     timer =
-      if state.standalone_batch_timer == nil do
+      if state.standalone_batch_timer == nil and state.standalone_flush_ref == nil do
         Process.send_after(self(), :standalone_commit_flush, standalone_commit_delay_ms())
       else
         state.standalone_batch_timer
@@ -1255,7 +1274,7 @@ defmodule Ferricstore.Store.Shard do
 
     %{
       state
-      | standalone_batch: [{from, command} | state.standalone_batch],
+      | standalone_batch: [entry | state.standalone_batch],
         standalone_batch_timer: timer
     }
   end
@@ -1287,54 +1306,178 @@ defmodule Ferricstore.Store.Shard do
     %{state | standalone_batch_timer: nil}
   end
 
+  defp flush_standalone_batch(%{standalone_flush_ref: ref} = state) when ref != nil do
+    %{state | standalone_batch_timer: nil}
+  end
+
   defp flush_standalone_batch(state) do
     if timer = state.standalone_batch_timer do
       Process.cancel_timer(timer)
     end
 
     entries = Enum.reverse(state.standalone_batch)
-    commands = Enum.map(entries, fn {_from, command} -> command end)
     sm_state = direct_sm_state(state)
+    ref = make_ref()
+    parent = self()
 
-    {new_state, reply} =
-      try do
-        case Ferricstore.Raft.StateMachine.apply_standalone_batch(commands, sm_state) do
-          {new_sm_state, {:ok, results}} when is_list(results) ->
-            state = apply_direct_sm_state(state, new_sm_state)
-            reply_standalone_results(entries, results)
-            {state, :ok}
+    _pid =
+      spawn(fn ->
+        send(parent, {:standalone_commit_flushed, ref, run_standalone_batch(entries, sm_state)})
+      end)
 
-          {new_sm_state, {:error, reason}} ->
-            state = apply_direct_sm_state(state, new_sm_state)
-            reply_standalone_error(entries, {:standalone_durability_failed, reason})
-            {state, :error}
+    %{
+      state
+      | standalone_batch: [],
+        standalone_batch_timer: nil,
+        standalone_flush_ref: ref,
+        standalone_flush_entries: entries,
+        standalone_inflight_keys: standalone_entries_keys(entries)
+    }
+  end
 
-          {new_sm_state, result} ->
-            state = apply_direct_sm_state(state, new_sm_state)
-            reply_standalone_results(entries, List.wrap(result))
-            {state, :ok}
-        end
-      rescue
-        error ->
-          reply_standalone_error(entries, {:standalone_durability_failed, {:exception, error}})
-          {state, :error}
-      catch
-        kind, reason ->
-          reply_standalone_error(entries, {:standalone_durability_failed, {kind, reason}})
-          {state, :error}
+  defp run_standalone_batch(entries, sm_state) do
+    commands = Enum.map(entries, fn {_from, command, _keys} -> command end)
+
+    try do
+      case Ferricstore.Raft.StateMachine.apply_standalone_batch(commands, sm_state) do
+        {new_sm_state, {:ok, results}} when is_list(results) ->
+          {:ok, new_sm_state, results}
+
+        {new_sm_state, {:error, reason}} ->
+          {:error, new_sm_state, reason}
+
+        {new_sm_state, result} ->
+          {:ok, new_sm_state, List.wrap(result)}
       end
+    rescue
+      error ->
+        {:error, nil, {:exception, error}}
+    catch
+      kind, reason ->
+        {:error, nil, {kind, reason}}
+    end
+  end
 
-    _ = reply
-    %{new_state | standalone_batch: [], standalone_batch_timer: nil}
+  defp handle_standalone_flush_result(ref, result, %{standalone_flush_ref: ref} = state) do
+    entries = state.standalone_flush_entries
+
+    state =
+      %{
+        state
+        | standalone_flush_ref: nil,
+          standalone_flush_entries: [],
+          standalone_inflight_keys: MapSet.new()
+      }
+
+    case result do
+      {:ok, new_sm_state, results} ->
+        state = apply_direct_sm_state(state, new_sm_state)
+        reply_standalone_results(entries, results)
+
+        state
+        |> drain_standalone_waiting()
+        |> flush_ready_standalone_batch()
+
+      {:error, new_sm_state, reason} ->
+        state =
+          if new_sm_state do
+            apply_direct_sm_state(state, new_sm_state)
+          else
+            state
+          end
+
+        reply_standalone_error(entries, {:standalone_durability_failed, reason})
+        reply_standalone_error(state.standalone_batch, {:standalone_durability_failed, reason})
+        reply_standalone_error(state.standalone_waiting, {:standalone_durability_failed, reason})
+
+        %{
+          state
+          | writes_paused: true,
+            standalone_batch: [],
+            standalone_batch_timer: nil,
+            standalone_waiting: []
+        }
+    end
+  end
+
+  defp handle_standalone_flush_result(_ref, _result, state), do: state
+
+  defp flush_ready_standalone_batch(%{standalone_batch: []} = state), do: state
+  defp flush_ready_standalone_batch(state), do: flush_standalone_batch(state)
+
+  defp await_standalone_flush(%{standalone_flush_ref: nil} = state), do: state
+
+  defp await_standalone_flush(%{standalone_flush_ref: ref} = state) do
+    receive do
+      {:standalone_commit_flushed, ^ref, result} ->
+        ref
+        |> handle_standalone_flush_result(result, state)
+        |> await_standalone_flush()
+    after
+      30_000 ->
+        %{state | last_flush_error: {:standalone_commit_flush_timeout, ref}}
+    end
+  end
+
+  defp drain_standalone_waiting(state) do
+    {ready, waiting} =
+      Enum.split_with(state.standalone_waiting, fn entry ->
+        not standalone_entry_conflicts?(entry, state.standalone_inflight_keys)
+      end)
+
+    %{
+      state
+      | standalone_batch: Enum.reverse(ready) ++ state.standalone_batch,
+        standalone_waiting: waiting
+    }
+  end
+
+  defp standalone_entry_conflicts?({_from, _command, keys}, inflight_keys) do
+    not MapSet.disjoint?(keys, inflight_keys)
+  end
+
+  defp standalone_entries_keys(entries) do
+    Enum.reduce(entries, MapSet.new(), fn {_from, _command, keys}, acc ->
+      MapSet.union(acc, keys)
+    end)
+  end
+
+  defp standalone_command_keys({:batch, commands}) when is_list(commands) do
+    commands
+    |> Enum.reduce(MapSet.new(), fn command, acc ->
+      MapSet.union(acc, standalone_command_keys(command))
+    end)
+    |> standalone_nonempty_keys()
+  end
+
+  defp standalone_command_keys({:list_op_lmove, source, destination, _from_dir, _to_dir}) do
+    MapSet.new([source, destination])
+  end
+
+  defp standalone_command_keys(command) when is_tuple(command) and tuple_size(command) > 1 do
+    case elem(command, 1) do
+      key when is_binary(key) -> MapSet.new([key])
+      _other -> MapSet.new(["__standalone_global__"])
+    end
+  end
+
+  defp standalone_command_keys(_command), do: MapSet.new(["__standalone_global__"])
+
+  defp standalone_nonempty_keys(keys) do
+    if MapSet.size(keys) == 0 do
+      MapSet.new(["__standalone_global__"])
+    else
+      keys
+    end
   end
 
   defp reply_standalone_results(entries, results) when length(entries) == length(results) do
     Enum.zip(entries, results)
-    |> Enum.each(fn {{from, _command}, result} -> GenServer.reply(from, result) end)
+    |> Enum.each(fn {{from, _command, _keys}, result} -> GenServer.reply(from, result) end)
   end
 
   defp reply_standalone_results(entries, [result]) do
-    Enum.each(entries, fn {from, _command} -> GenServer.reply(from, result) end)
+    Enum.each(entries, fn {from, _command, _keys} -> GenServer.reply(from, result) end)
   end
 
   defp reply_standalone_results(entries, results) do
@@ -1342,7 +1485,7 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp reply_standalone_error(entries, reason) do
-    Enum.each(entries, fn {from, _command} -> GenServer.reply(from, {:error, reason}) end)
+    Enum.each(entries, fn {from, _command, _keys} -> GenServer.reply(from, {:error, reason}) end)
   end
 
   defp shared_write_version(%{instance_ctx: %{write_version: write_version}, index: index}) do
@@ -1944,6 +2087,10 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_info(:standalone_commit_flush, state) do
     {:noreply, flush_standalone_batch(state)}
+  end
+
+  def handle_info({:standalone_commit_flushed, ref, result}, state) do
+    {:noreply, handle_standalone_flush_result(ref, result, state)}
   end
 
   # Periodic fragmentation re-evaluation for idle shards.

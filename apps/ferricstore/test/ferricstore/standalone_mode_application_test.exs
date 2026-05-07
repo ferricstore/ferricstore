@@ -258,6 +258,37 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     Application.delete_env(:ferricstore, :standalone_durability_hook)
   end
 
+  test "standalone fsync wait does not block the shard mailbox" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:blocked-fsync-mailbox"
+    shard_idx = Router.shard_for(ctx, key)
+    shard = elem(ctx.shard_names, shard_idx)
+    parent = self()
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      assert Enum.any?(batch, &match?({:put, ^key, "value", 0}, &1))
+      send(parent, {:durability_hook_blocked, self()})
+
+      receive do
+        :release_durability_hook -> :passthrough
+      after
+        5_000 -> {:error, :durability_hook_timeout}
+      end
+    end)
+
+    task = Task.async(fn -> Router.put(ctx, key, "value", 0) end)
+    assert_receive {:durability_hook_blocked, hook_pid}, 5_000
+
+    assert {file_id, file_path} = GenServer.call(shard, :get_active_file, 100)
+    assert is_integer(file_id)
+    assert is_binary(file_path)
+
+    send(hook_pid, :release_durability_hook)
+    assert :ok = Task.await(task, 5_000)
+  after
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
   test "standalone write ack does not depend on Flow LMDB writer availability" do
     ctx = FerricStore.Instance.get(:default)
     key = "standalone:flow-lmdb-unavailable"
