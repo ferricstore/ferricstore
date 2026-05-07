@@ -5183,7 +5183,7 @@ fn make_flow_create_many_command_ast<'a>(
         if mixed {
             let item_opts = vec![
                 (atom(env, "partition_key"), args[idx + 1]).encode(env),
-                (atom(env, "payload_ref"), args[idx + 2]).encode(env),
+                (atom(env, "payload"), args[idx + 2]).encode(env),
             ];
             items.push((args[idx], item_opts).encode(env));
         } else {
@@ -5191,7 +5191,7 @@ fn make_flow_create_many_command_ast<'a>(
                 (
                     atom(env, "id"),
                     args[idx],
-                    atom(env, "payload_ref"),
+                    atom(env, "payload"),
                     args[idx + 1],
                 )
                     .encode(env),
@@ -5960,6 +5960,27 @@ fn parse_flow_read_options<'a>(
     let mut idx = start;
 
     while idx < args.len() {
+        if ascii_eq_ignore_case(arg_bytes[idx], b"FULL") {
+            let full = if idx + 1 < args.len() {
+                match parse_bool_bytes(arg_bytes[idx + 1]) {
+                    Some(value) => {
+                        idx += 2;
+                        value
+                    }
+                    None => {
+                        idx += 1;
+                        true
+                    }
+                }
+            } else {
+                idx += 1;
+                true
+            };
+
+            opts.push((atom(env, "full"), full).encode(env));
+            continue;
+        }
+
         if ascii_eq_ignore_case(arg_bytes[idx], b"NOPAYLOAD") {
             opts.push((atom(env, "payload"), false).encode(env));
             idx += 1;
@@ -6141,6 +6162,7 @@ fn flow_create_option<'a>(
                 "payload_ref",
                 FlowOptType::Ref(b"payload_ref"),
             ),
+            (b"PAYLOAD", "payload", FlowOptType::Binary),
             (
                 b"PARENT_FLOW_ID",
                 "parent_flow_id",
@@ -6394,6 +6416,8 @@ fn flow_terminal_option<'a>(
         &[
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
             (b"RESULT_REF", "result_ref", FlowOptType::Ref(b"result_ref")),
+            (b"RESULT", "result", FlowOptType::Binary),
+            (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
@@ -6414,6 +6438,8 @@ fn flow_complete_many_option<'a>(
         idx,
         &[
             (b"RESULT_REF", "result_ref", FlowOptType::Ref(b"result_ref")),
+            (b"RESULT", "result", FlowOptType::Binary),
+            (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
         ],
@@ -6436,6 +6462,7 @@ fn flow_transition_option<'a>(
             (b"LEASE_TOKEN", "lease_token", FlowOptType::Binary),
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
+            (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -6455,6 +6482,8 @@ fn flow_retry_many_option<'a>(
         idx,
         &[
             (b"ERROR_REF", "error_ref", FlowOptType::Ref(b"error_ref")),
+            (b"ERROR", "error", FlowOptType::Binary),
+            (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
@@ -6475,6 +6504,8 @@ fn flow_fail_many_option<'a>(
         idx,
         &[
             (b"ERROR_REF", "error_ref", FlowOptType::Ref(b"error_ref")),
+            (b"ERROR", "error", FlowOptType::Binary),
+            (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
@@ -6516,6 +6547,7 @@ fn flow_transition_many_option<'a>(
         &[
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
+            (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
         ],
     )
@@ -6536,6 +6568,8 @@ fn flow_retry_option<'a>(
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"ERROR_REF", "error_ref", FlowOptType::Ref(b"error_ref")),
+            (b"ERROR", "error", FlowOptType::Binary),
+            (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -6556,6 +6590,8 @@ fn flow_fail_option<'a>(
         &[
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
             (b"ERROR_REF", "error_ref", FlowOptType::Ref(b"error_ref")),
+            (b"ERROR", "error", FlowOptType::Binary),
+            (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"TTL", "ttl_ms", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
@@ -6696,6 +6732,7 @@ fn flow_history_option<'a>(
                 "consistent_projection",
                 FlowOptType::Boolean,
             ),
+            (b"VALUES", "values", FlowOptType::Boolean),
         ],
     )
 }

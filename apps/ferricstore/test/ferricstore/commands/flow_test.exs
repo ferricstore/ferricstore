@@ -62,6 +62,231 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches Flow full values through Rust AST" do
+    id = uid("flow-command-values")
+
+    assert %{"id" => ^id, "payload_ref" => payload_ref} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [
+                 id,
+                 "TYPE",
+                 "value-command",
+                 "STATE",
+                 "queued",
+                 "PAYLOAD",
+                 "create-payload",
+                 "RUN_AT",
+                 "1000",
+                 "NOW",
+                 "1000"
+               ],
+               MockStore.make()
+             )
+
+    assert is_binary(payload_ref)
+    assert payload_ref != "create-payload"
+
+    assert %{"payload" => "create-payload", "payload_ref" => ^payload_ref} =
+             Dispatcher.dispatch("FLOW.GET", [id, "FULL", "true"], MockStore.make())
+
+    assert [[_event_id, %{"event" => "created", "payload" => "create-payload"}]] =
+             Dispatcher.dispatch(
+               "FLOW.HISTORY",
+               [id, "COUNT", "10", "VALUES", "true"],
+               MockStore.make()
+             )
+
+    assert [%{"lease_token" => lease_token, "fencing_token" => fencing_token}] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               ["value-command", "WORKER", "worker-a", "LEASE_MS", "30000", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert %{"state" => "completed", "result_ref" => result_ref} =
+             Dispatcher.dispatch(
+               "FLOW.COMPLETE",
+               [
+                 id,
+                 lease_token,
+                 "FENCING",
+                 Integer.to_string(fencing_token),
+                 "RESULT",
+                 "complete-result",
+                 "NOW",
+                 "2000"
+               ],
+               MockStore.make()
+             )
+
+    assert is_binary(result_ref)
+    assert result_ref != "complete-result"
+
+    assert %{"payload" => "create-payload", "result" => "complete-result"} =
+             Dispatcher.dispatch("FLOW.GET", [id, "FULL"], MockStore.make())
+
+    assert [
+             _created,
+             _claimed,
+             [_event_id, %{"event" => "completed", "result" => "complete-result"}]
+           ] =
+             Dispatcher.dispatch(
+               "FLOW.HISTORY",
+               [id, "COUNT", "10", "VALUES", "true"],
+               MockStore.make()
+             )
+  end
+
+  test "dispatches Flow mutation values through Rust AST" do
+    transition_id = uid("flow-command-transition-value")
+    fail_id = uid("flow-command-fail-value")
+
+    assert %{"id" => ^transition_id} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [
+                 transition_id,
+                 "TYPE",
+                 "mutation-values",
+                 "STATE",
+                 "queued",
+                 "PAYLOAD",
+                 "initial-payload",
+                 "RUN_AT",
+                 "1000",
+                 "NOW",
+                 "1000"
+               ],
+               MockStore.make()
+             )
+
+    assert [%{"lease_token" => lease_token, "fencing_token" => fencing_token}] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               ["mutation-values", "WORKER", "worker-a", "LEASE_MS", "30000", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert %{"state" => "waiting", "payload_ref" => transition_payload_ref} =
+             Dispatcher.dispatch(
+               "FLOW.TRANSITION",
+               [
+                 transition_id,
+                 "running",
+                 "waiting",
+                 "FENCING",
+                 Integer.to_string(fencing_token),
+                 "LEASE_TOKEN",
+                 lease_token,
+                 "PAYLOAD",
+                 "transition-payload",
+                 "RUN_AT",
+                 "2000",
+                 "NOW",
+                 "1100"
+               ],
+               MockStore.make()
+             )
+
+    assert transition_payload_ref != "transition-payload"
+
+    assert %{"state" => "waiting", "payload" => "transition-payload"} =
+             Dispatcher.dispatch("FLOW.GET", [transition_id, "FULL"], MockStore.make())
+
+    assert [%{"lease_token" => retry_lease, "fencing_token" => retry_fencing}] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [
+                 "mutation-values",
+                 "STATE",
+                 "waiting",
+                 "WORKER",
+                 "worker-b",
+                 "LEASE_MS",
+                 "30000",
+                 "NOW",
+                 "2000"
+               ],
+               MockStore.make()
+             )
+
+    assert %{
+             "state" => "waiting",
+             "error_ref" => retry_error_ref,
+             "payload_ref" => retry_payload_ref
+           } =
+             Dispatcher.dispatch(
+               "FLOW.RETRY",
+               [
+                 transition_id,
+                 retry_lease,
+                 "FENCING",
+                 Integer.to_string(retry_fencing),
+                 "ERROR",
+                 "retry-error",
+                 "PAYLOAD",
+                 "retry-payload",
+                 "RUN_AT",
+                 "3000",
+                 "NOW",
+                 "2100"
+               ],
+               MockStore.make()
+             )
+
+    assert retry_error_ref != "retry-error"
+    assert retry_payload_ref != "retry-payload"
+
+    assert %{"error" => "retry-error", "payload" => "retry-payload"} =
+             Dispatcher.dispatch("FLOW.GET", [transition_id, "FULL"], MockStore.make())
+
+    assert %{"id" => ^fail_id} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [
+                 fail_id,
+                 "TYPE",
+                 "mutation-values",
+                 "PAYLOAD",
+                 "fail-payload",
+                 "RUN_AT",
+                 "4000",
+                 "NOW",
+                 "4000"
+               ],
+               MockStore.make()
+             )
+
+    assert [%{"lease_token" => fail_lease, "fencing_token" => fail_fencing}] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               ["mutation-values", "WORKER", "worker-c", "LEASE_MS", "30000", "NOW", "4000"],
+               MockStore.make()
+             )
+
+    assert %{"state" => "failed", "error_ref" => fail_error_ref} =
+             Dispatcher.dispatch(
+               "FLOW.FAIL",
+               [
+                 fail_id,
+                 fail_lease,
+                 "FENCING",
+                 Integer.to_string(fail_fencing),
+                 "ERROR",
+                 "fail-error",
+                 "NOW",
+                 "4100"
+               ],
+               MockStore.make()
+             )
+
+    assert fail_error_ref != "fail-error"
+
+    assert %{"payload" => "fail-payload", "error" => "fail-error"} =
+             Dispatcher.dispatch("FLOW.GET", [fail_id, "FULL"], MockStore.make())
+  end
+
   test "dispatches Flow lineage query commands through Rust AST" do
     partition = uid("tenant")
     root = uid("flow-command-root")
@@ -206,7 +431,10 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
-    assert [%{"id" => ^id_a}, %{"id" => ^id_b}] =
+    assert [
+             %{"id" => ^id_a, "payload" => "payload:" <> _},
+             %{"id" => ^id_b, "payload" => "payload:" <> _}
+           ] =
              Dispatcher.dispatch(
                "FLOW.CLAIM_DUE",
                [type, "WORKER", "worker-a", "LIMIT", "10", "NOW", "1000", "PARTITION", partition],
