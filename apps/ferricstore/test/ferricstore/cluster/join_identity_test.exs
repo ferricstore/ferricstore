@@ -32,6 +32,15 @@ defmodule Ferricstore.Cluster.JoinIdentityTest do
              )
   end
 
+  test "rejects copied target data when local marker is missing" do
+    assert {:error, {:local_cluster_state_missing, @target}} =
+             JoinIdentity.validate(
+               {:error, :enoent},
+               {:ok, %{cluster_id: "foreign", replication_mode: :raft}},
+               @target
+             )
+  end
+
   test "rejects copied target data without a marker when local has a marker" do
     assert {:error, {:target_cluster_state_missing, @target}} =
              JoinIdentity.validate(

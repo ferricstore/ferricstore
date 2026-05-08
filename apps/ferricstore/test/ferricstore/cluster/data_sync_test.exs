@@ -26,4 +26,52 @@ defmodule Ferricstore.Cluster.DataSyncTest do
     assert File.read!(Path.join([target, "flow_lmdb", "data.mdb"])) == "lmdb-data"
     assert File.read!(Path.join([target, "flow_lmdb", "lock.mdb"])) == "lmdb-lock"
   end
+
+  test "shard storage copy includes promoted dedicated data" do
+    root =
+      Path.join(System.tmp_dir!(), "ferricstore_data_sync_#{System.unique_integer([:positive])}")
+
+    source = Path.join(root, "source")
+    target = Path.join(root, "target")
+    source_data = Ferricstore.DataDir.shard_data_path(source, 0)
+    source_dedicated = Path.join([source, "dedicated", "shard_0", "hash:abc"])
+
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    File.mkdir_p!(source_data)
+    File.mkdir_p!(source_dedicated)
+    File.write!(Path.join(source_data, "00000.log"), "shared")
+    File.write!(Path.join(source_dedicated, "00000.log"), "promoted")
+
+    assert :ok = DataSync.copy_shard_storage_from(node(), source, node(), target, 0)
+
+    assert File.read!(Path.join([target, "data", "shard_0", "00000.log"])) == "shared"
+
+    assert File.read!(Path.join([target, "dedicated", "shard_0", "hash:abc", "00000.log"])) ==
+             "promoted"
+  end
+
+  test "partial cleanup removes target shard data and dedicated data from target data dir" do
+    root =
+      Path.join(System.tmp_dir!(), "ferricstore_data_sync_#{System.unique_integer([:positive])}")
+
+    source = Path.join(root, "source")
+    target = Path.join(root, "target")
+
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    File.mkdir_p!(Ferricstore.DataDir.shard_data_path(source, 0))
+    File.mkdir_p!(Path.join([target, "data", "shard_0"]))
+    File.mkdir_p!(Path.join([target, "dedicated", "shard_0", "hash:abc"]))
+    File.write!(Path.join([target, "data", "shard_0", "00000.log"]), "partial")
+    File.write!(Path.join([target, "dedicated", "shard_0", "hash:abc", "00000.log"]), "partial")
+
+    ctx = %FerricStore.Instance{data_dir: source}
+
+    assert :ok = DataSync.cleanup_partial_sync(0, node(), ctx, target)
+
+    refute File.exists?(Path.join([target, "data", "shard_0"]))
+    refute File.exists?(Path.join([target, "dedicated", "shard_0"]))
+    assert File.exists?(source)
+  end
 end

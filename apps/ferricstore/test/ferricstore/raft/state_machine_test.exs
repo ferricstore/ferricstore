@@ -4712,4 +4712,19 @@ defmodule Ferricstore.Raft.StateMachineTest do
                     %{count: 1},
                     %{request: ^request, reason: :keydir_unavailable, source: :raft_apply}}
   end
+
+  test "standalone sync append reports NIF errors instead of raising case clauses" do
+    missing_path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-missing-#{System.unique_integer([:positive])}/00000.log"
+      )
+
+    assert {:error, reason} =
+             StateMachine.__append_pending_batch_sync_for_test__(missing_path, [
+               {:put, "key", "value", 0}
+             ])
+
+    assert reason != %CaseClauseError{}
+  end
 end

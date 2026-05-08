@@ -1261,6 +1261,11 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   @doc false
+  def __append_pending_batch_sync_for_test__(file_path, batch) do
+    append_pending_batch_sync(file_path, batch)
+  end
+
+  @doc false
   def __compensate_cross_shard_partial_writes_for_test__(
         state,
         successful_groups,
@@ -9664,6 +9669,9 @@ defmodule Ferricstore.Raft.StateMachine do
             end)
 
           {:ok, tagged_locations}
+
+        {:error, _reason} = error ->
+          error
       end
     end
   end

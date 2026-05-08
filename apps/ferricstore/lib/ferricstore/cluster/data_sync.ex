@@ -337,9 +337,15 @@ defmodule Ferricstore.Cluster.DataSync do
       leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
       {raft_index, overview_info} = get_raft_index_with_detail(leader_node, leader_server_id)
 
-      # 3. Copy the whole shard data directory from leader to target. This
-      # includes Bitcask files, replay-safe markers, and the Flow LMDB dir.
-      copy_directory_from(leader_node, leader_shard_data, target_node, target_shard_data)
+      # 3. Copy shard storage from leader to target. This includes the shared
+      # Bitcask shard directory and promoted dedicated collection files.
+      copy_shard_storage_from(
+        leader_node,
+        leader_data_dir,
+        target_node,
+        target_data_dir,
+        shard_index
+      )
 
       Logger.info(
         "Shard #{shard_index}: sync complete at raft last_applied=#{raft_index} #{overview_info}"
@@ -415,17 +421,72 @@ defmodule Ferricstore.Cluster.DataSync do
   # Private: partial cleanup
   # ---------------------------------------------------------------------------
 
+  @doc false
   @spec cleanup_partial_sync(non_neg_integer(), node(), FerricStore.Instance.t()) :: :ok
-  defp cleanup_partial_sync(shard_index, target_node, ctx) do
-    shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_index)
+  def cleanup_partial_sync(shard_index, target_node, ctx) do
+    target_data_dir = get_target_data_dir(target_node)
+    cleanup_partial_sync(shard_index, target_node, ctx, target_data_dir)
+  end
 
-    try do
-      :erpc.call(target_node, File, :rm_rf!, [shard_data_path])
-    catch
-      _, _ -> :ok
+  @doc false
+  @spec cleanup_partial_sync(non_neg_integer(), node(), FerricStore.Instance.t(), binary()) :: :ok
+  def cleanup_partial_sync(shard_index, target_node, _ctx, target_data_dir) do
+    shard_paths = [
+      Ferricstore.DataDir.shard_data_path(target_data_dir, shard_index),
+      dedicated_shard_path(target_data_dir, shard_index)
+    ]
+
+    Enum.each(shard_paths, fn path ->
+      try do
+        :erpc.call(target_node, File, :rm_rf!, [path])
+      catch
+        _, _ -> :ok
+      end
+    end)
+
+    :ok
+  end
+
+  @doc false
+  @spec copy_shard_storage_from(node(), binary(), node(), binary(), non_neg_integer()) :: :ok
+  def copy_shard_storage_from(
+        source_node,
+        source_data_dir,
+        target_node,
+        target_data_dir,
+        shard_index
+      ) do
+    source_shard_data = Ferricstore.DataDir.shard_data_path(source_data_dir, shard_index)
+    target_shard_data = Ferricstore.DataDir.shard_data_path(target_data_dir, shard_index)
+
+    :ok = copy_directory_from(source_node, source_shard_data, target_node, target_shard_data)
+
+    source_dedicated = dedicated_shard_path(source_data_dir, shard_index)
+    target_dedicated = dedicated_shard_path(target_data_dir, shard_index)
+
+    if remote_dir?(source_node, source_dedicated) do
+      copy_directory_from(source_node, source_dedicated, target_node, target_dedicated)
+    else
+      :ok
     end
 
     :ok
+  end
+
+  defp dedicated_shard_path(data_dir, shard_index) do
+    Path.join([data_dir, "dedicated", "shard_#{shard_index}"])
+  end
+
+  defp remote_dir?(node, path) do
+    if node == node() do
+      Ferricstore.FS.dir?(path)
+    else
+      try do
+        :erpc.call(node, File, :dir?, [path])
+      catch
+        _, _ -> false
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
