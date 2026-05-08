@@ -5225,6 +5225,31 @@ defmodule Ferricstore.FlowTest do
              )
   end
 
+  test "flow history hard default is clamped by configured maximum" do
+    original_hot = Application.get_env(:ferricstore, :flow_default_history_hot_max_events)
+    original_hard = Application.get_env(:ferricstore, :flow_default_history_max_events)
+    original_max = Application.get_env(:ferricstore, :flow_max_history_max_events)
+
+    Application.put_env(:ferricstore, :flow_default_history_hot_max_events, 10)
+    Application.put_env(:ferricstore, :flow_default_history_max_events, 100)
+    Application.put_env(:ferricstore, :flow_max_history_max_events, 5)
+
+    on_exit(fn ->
+      restore_env(:flow_default_history_hot_max_events, original_hot)
+      restore_env(:flow_default_history_max_events, original_hard)
+      restore_env(:flow_max_history_max_events, original_max)
+    end)
+
+    assert {:ok, created} =
+             FerricStore.flow_create(uid("flow-history-default-hard-clamp"),
+               type: "audit-default-hard-clamp",
+               run_at_ms: 1_000
+             )
+
+    assert created.history_max_events == 5
+    assert created.history_hot_max_events == 5
+  end
+
   test "flow history uses configured default hot max when omitted" do
     original = Application.get_env(:ferricstore, :flow_default_history_hot_max_events)
     Application.put_env(:ferricstore, :flow_default_history_hot_max_events, 2)

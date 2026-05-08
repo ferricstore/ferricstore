@@ -2278,6 +2278,7 @@ defmodule Ferricstore.Flow.LMDBTest do
                partition_key: partition_key,
                root_flow_id: "root-rebuild-terminal",
                correlation_id: "corr-rebuild-terminal",
+               history_hot_max_events: 1,
                now_ms: 1
              )
 
@@ -2343,6 +2344,19 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, 0} = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, failed_index_key)
     assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, root_prefix)
     assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, correlation_prefix)
+
+    assert {:ok, cold_history} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               include_cold: true,
+               count: 10
+             )
+
+    assert Enum.map(cold_history, fn {_event_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed",
+             "completed"
+           ]
 
     assert {:ok, info} =
              Ferricstore.Flow.info(ctx, flow_type,

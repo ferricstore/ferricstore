@@ -57,7 +57,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       |> Map.put(:cold_read_errors, Process.get(:flow_lmdb_rebuild_cold_read_errors, 0))
       |> Map.put(
         :history,
-        rebuild_flow_history_indexes(keydir, shard_path, flow_index, flow_lookup)
+        rebuild_flow_history_indexes(keydir, shard_path, lmdb_path, flow_index, flow_lookup)
       )
 
     Process.delete(:flow_lmdb_rebuild_cold_read_errors)
@@ -424,44 +424,61 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
   defp maybe_rebuild_flow_running_indexes(_flow_index, _flow_lookup, _record), do: :ok
 
-  defp rebuild_flow_history_indexes(_keydir, _shard_path, nil, _flow_lookup), do: 0
-  defp rebuild_flow_history_indexes(_keydir, _shard_path, _flow_index, nil), do: 0
+  defp rebuild_flow_history_indexes(_keydir, _shard_path, _lmdb_path, nil, _flow_lookup), do: 0
+  defp rebuild_flow_history_indexes(_keydir, _shard_path, _lmdb_path, _flow_index, nil), do: 0
 
-  defp rebuild_flow_history_indexes(keydir, shard_path, flow_index, flow_lookup) do
-    {count, history_keys} =
+  defp rebuild_flow_history_indexes(keydir, shard_path, lmdb_path, flow_index, flow_lookup) do
+    {count, history_entries_by_key} =
       :ets.foldl(
         fn
-          {key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}, {count, history_keys}
+          {key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}, {count, history_entries_by_key}
           when is_binary(key) ->
             case parse_flow_history_entry_key(key) do
               {:ok, history_key, event_id, event_ms} ->
                 FlowIndex.put_member(flow_index, flow_lookup, history_key, event_id, event_ms)
-                {count + 1, MapSet.put(history_keys, history_key)}
+
+                entry = {event_id, event_ms, key}
+
+                {count + 1,
+                 Map.update(history_entries_by_key, history_key, [entry], &[entry | &1])}
 
               :skip ->
-                {count, history_keys}
+                {count, history_entries_by_key}
             end
 
           _entry, acc ->
             acc
         end,
-        {0, MapSet.new()},
+        {0, %{}},
         keydir
       )
 
-    trim_rebuilt_flow_history_indexes(keydir, shard_path, flow_index, flow_lookup, history_keys)
+    history_keys = Map.keys(history_entries_by_key)
+
+    trim_rebuilt_flow_history_indexes(
+      keydir,
+      shard_path,
+      lmdb_path,
+      flow_index,
+      flow_lookup,
+      history_keys
+    )
+
+    rebuild_lmdb_history_projections(keydir, shard_path, lmdb_path, history_entries_by_key)
+
     count
   end
 
   defp trim_rebuilt_flow_history_indexes(
          keydir,
          shard_path,
+         lmdb_path,
          flow_index,
          flow_lookup,
          history_keys
        ) do
     Enum.each(history_keys, fn history_key ->
-      case history_max_events_for_key(keydir, shard_path, history_key) do
+      case history_max_events_for_key(keydir, shard_path, lmdb_path, history_key) do
         max when is_integer(max) and max > 0 ->
           case FlowIndex.count_all(flow_lookup, history_key) do
             count when count > max ->
@@ -486,9 +503,93 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     :ok
   end
 
-  defp history_max_events_for_key(keydir, shard_path, history_key) do
+  defp rebuild_lmdb_history_projections(keydir, shard_path, lmdb_path, history_entries_by_key) do
+    Enum.each(history_entries_by_key, fn {history_key, entries} ->
+      with {:ok, state_key} <- state_key_from_history_key(history_key),
+           {:ok, record} <- read_rebuild_state_record(keydir, shard_path, lmdb_path, state_key),
+           true <- LMDB.terminal_state?(Map.get(record, :state)) do
+        rebuild_lmdb_history_projection(lmdb_path, history_key, record, entries)
+      else
+        _ -> :ok
+      end
+    end)
+  end
+
+  defp rebuild_lmdb_history_projection(lmdb_path, history_key, record, entries) do
+    expire_at_ms = flow_record_expire_at(record)
+
+    delete_ops =
+      lmdb_path
+      |> LMDB.prefix_entries(
+        history_key |> LMDB.history_index_prefix(),
+        history_projection_scan_limit()
+      )
+      |> case do
+        {:ok, existing} ->
+          Enum.flat_map(existing, fn {history_index_key, _value} ->
+            LMDB.history_index_delete_ops(lmdb_path, history_index_key)
+          end)
+
+        {:error, _reason} ->
+          []
+      end
+
+    put_ops =
+      entries
+      |> Enum.sort_by(fn {event_id, event_ms, _compound_key} -> {event_ms, event_id} end)
+      |> take_latest_history_events(Map.get(record, :history_max_events))
+      |> Enum.flat_map(fn {event_id, event_ms, compound_key} ->
+        history_index_key = LMDB.history_index_key(history_key, event_id, event_ms)
+
+        ops = [
+          {:put, history_index_key,
+           LMDB.encode_history_index_value(event_id, event_ms, compound_key, expire_at_ms)}
+        ]
+
+        ops =
+          case LMDB.history_expire_key(expire_at_ms, history_index_key) do
+            nil ->
+              ops
+
+            expire_key ->
+              [{:put, expire_key, LMDB.encode_history_expire_value(history_index_key)} | ops]
+          end
+
+        case LMDB.history_flow_expire_key(expire_at_ms, history_key) do
+          nil ->
+            ops
+
+          expire_key ->
+            [
+              {:put, expire_key, LMDB.encode_history_flow_expire_value(history_key, expire_at_ms)}
+              | ops
+            ]
+        end
+      end)
+
+    (delete_ops ++ put_ops)
+    |> Enum.chunk_every(@batch_size)
+    |> Enum.each(fn ops -> LMDB.write_batch(lmdb_path, ops) end)
+  end
+
+  defp take_latest_history_events(entries, max) when is_integer(max) and max > 0,
+    do: Enum.take(entries, -max)
+
+  defp take_latest_history_events(entries, _max), do: entries
+
+  defp history_projection_scan_limit do
+    Application.get_env(:ferricstore, :flow_lmdb_history_rebuild_scan_limit, 1_000_000)
+  end
+
+  defp flow_record_expire_at(%{terminal_retention_until_ms: expire_at_ms})
+       when is_integer(expire_at_ms),
+       do: expire_at_ms
+
+  defp flow_record_expire_at(_record), do: 0
+
+  defp history_max_events_for_key(keydir, shard_path, lmdb_path, history_key) do
     with {:ok, state_key} <- state_key_from_history_key(history_key),
-         {:ok, record} <- read_rebuild_state_record(keydir, shard_path, state_key) do
+         {:ok, record} <- read_rebuild_state_record(keydir, shard_path, lmdb_path, state_key) do
       Map.get(record, :history_max_events)
     else
       _ -> nil
@@ -504,7 +605,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
   defp state_key_from_history_key(_history_key), do: :error
 
-  defp read_rebuild_state_record(keydir, shard_path, state_key) do
+  defp read_rebuild_state_record(keydir, shard_path, lmdb_path, state_key) do
     case :ets.lookup(keydir, state_key) do
       [{^state_key, value, expire_at_ms, _lfu, _fid, _off, _vsize}] when is_binary(value) ->
         case decode_state_record(state_key, value, expire_at_ms) do
@@ -525,8 +626,21 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         end
 
       _ ->
-        :error
+        read_lmdb_rebuild_state_record(lmdb_path, state_key)
     end
+  end
+
+  defp read_lmdb_rebuild_state_record(lmdb_path, state_key) do
+    with {:ok, blob} <- LMDB.get(lmdb_path, state_key),
+         {:ok, value} <- LMDB.decode_value(blob, System.system_time(:millisecond)),
+         %{id: id} = record <- Flow.decode_record(value),
+         true <- is_binary(id) do
+      {:ok, record}
+    else
+      _ -> :error
+    end
+  rescue
+    _ -> :error
   end
 
   defp cold_locations_for_state(shard_path, state_key, expire_at_ms, fid, off, vsize) do

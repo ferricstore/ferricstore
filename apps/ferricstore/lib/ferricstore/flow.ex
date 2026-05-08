@@ -875,11 +875,13 @@ defmodule Ferricstore.Flow do
     if flow_history_state_exists?(ctx, id, partition_key) do
       with {:ok, hot_refs} <- flow_history_hot_refs(ctx, id, partition_key, history_key, count),
            {:ok, cold_refs} <- flow_history_lmdb_refs(ctx, history_key, count, consistent?) do
+        scan_count = flow_lmdb_query_scan_count(count)
+
         event_ids =
           (hot_refs ++ cold_refs)
           |> Enum.sort_by(fn {event_id, score} -> {score, event_id} end)
           |> Enum.uniq_by(fn {event_id, _score} -> event_id end)
-          |> Enum.take(count)
+          |> Enum.take(-scan_count)
           |> Enum.map(fn {event_id, _score} -> event_id end)
 
         case event_ids do
@@ -887,14 +889,17 @@ defmodule Ferricstore.Flow do
             flow_history_fallback_scan(ctx, history_key, count, value_return)
 
           _ ->
-            flow_history_from_event_ids(
-              ctx,
-              id,
-              partition_key,
-              history_key,
-              event_ids,
-              value_return
-            )
+            with {:ok, events} <-
+                   flow_history_from_event_ids(
+                     ctx,
+                     id,
+                     partition_key,
+                     history_key,
+                     event_ids,
+                     value_return
+                   ) do
+              {:ok, Enum.take(events, -count)}
+            end
         end
       end
     else
@@ -962,7 +967,12 @@ defmodule Ferricstore.Flow do
 
         with {:ok, _swept} <-
                Ferricstore.Flow.LMDB.sweep_expired_history(path, now_ms, sweep_limit),
-             {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count) do
+             {:ok, entries} <-
+               Ferricstore.Flow.LMDB.prefix_entries(
+                 path,
+                 prefix,
+                 flow_lmdb_query_scan_count(count)
+               ) do
           {:ok, flow_decode_history_index_entries(entries, path, now_ms)}
         end
       end
@@ -1026,7 +1036,7 @@ defmodule Ferricstore.Flow do
           []
       end)
       |> Enum.sort_by(fn {event_id, _fields} -> {flow_history_event_ms(event_id), event_id} end)
-      |> Enum.take(count)
+      |> Enum.take(-count)
 
     {:ok,
      entries

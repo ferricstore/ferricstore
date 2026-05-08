@@ -577,7 +577,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
         _ -> min(@default_retention.history_max_events, max)
       end
 
-    max(default, hot_max)
+    min(max(default, hot_max), max)
   end
 
   defp max_history_max_events do

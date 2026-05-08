@@ -6317,6 +6317,26 @@ fn flow_spawn_children_option<'a>(
             (b"WAIT_STATE", "wait_state", FlowOptType::Binary),
             (b"LEASE_TOKEN", "lease_token", FlowOptType::Binary),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (
+                b"RETENTION_TTL",
+                "retention_ttl_ms",
+                FlowOptType::Positive(b"retention_ttl_ms"),
+            ),
+            (
+                b"RETENTION_TTL_MS",
+                "retention_ttl_ms",
+                FlowOptType::Positive(b"retention_ttl_ms"),
+            ),
+            (
+                b"HISTORY_HOT_MAX_EVENTS",
+                "history_hot_max_events",
+                FlowOptType::Positive(b"history_hot_max_events"),
+            ),
+            (
+                b"HISTORY_MAX_EVENTS",
+                "history_max_events",
+                FlowOptType::Positive(b"history_max_events"),
+            ),
         ],
     )
 }

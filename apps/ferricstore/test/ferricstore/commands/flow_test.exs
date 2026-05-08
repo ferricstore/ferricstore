@@ -242,6 +242,12 @@ defmodule Ferricstore.Commands.FlowTest do
                  "waiting_children",
                  "NOW",
                  "1010",
+                 "RETENTION_TTL",
+                 "60000",
+                 "HISTORY_HOT_MAX_EVENTS",
+                 "2",
+                 "HISTORY_MAX_EVENTS",
+                 "5",
                  "ITEMS",
                  child_a,
                  "child",
@@ -269,6 +275,13 @@ defmodule Ferricstore.Commands.FlowTest do
              Dispatcher.dispatch(
                "FLOW.GET",
                [child_a, "PARTITION", partition, "FULL"],
+               MockStore.make()
+             )
+
+    assert %{"history_hot_max_events" => 2, "history_max_events" => 5} =
+             Dispatcher.dispatch(
+               "FLOW.GET",
+               [child_a, "PARTITION", partition],
                MockStore.make()
              )
   end
