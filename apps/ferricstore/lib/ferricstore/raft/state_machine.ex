@@ -115,7 +115,8 @@ defmodule Ferricstore.Raft.StateMachine do
     :sm_pending_lmdb_mirror_ops,
     :sm_pending_lmdb_mirror_after_flush,
     :sm_pending_flow_index_originals,
-    :sm_pending_zset_index_ops
+    :sm_pending_zset_index_ops,
+    :sm_pending_prob_creates
   ]
   @sm_pending_write_initial_values [
     sm_pending_writes: [],
@@ -125,7 +126,8 @@ defmodule Ferricstore.Raft.StateMachine do
     sm_pending_lmdb_mirror_ops: [],
     sm_pending_lmdb_mirror_after_flush: [],
     sm_pending_flow_index_originals: %{},
-    sm_pending_zset_index_ops: []
+    sm_pending_zset_index_ops: [],
+    sm_pending_prob_creates: []
   ]
 
   defguardp valid_cold_location(file_id, offset, value_size)
@@ -8725,6 +8727,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp rollback_pending_writes(state) do
     rollback_pending_lmdb(state)
     rollback_pending_flow_indexes()
+    rollback_pending_prob_creates(state)
 
     Process.get(:sm_pending_originals, %{})
     |> Enum.each(fn
@@ -8735,6 +8738,15 @@ defmodule Ferricstore.Raft.StateMachine do
       {key, :missing} ->
         track_keydir_binary_restore(state, key, nil)
         :ets.delete(state.ets, key)
+    end)
+  end
+
+  defp rollback_pending_prob_creates(state) do
+    :sm_pending_prob_creates
+    |> Process.get([])
+    |> Enum.uniq()
+    |> Enum.each(fn path ->
+      cleanup_created_prob_file(state, path)
     end)
   end
 
@@ -10656,17 +10668,24 @@ defmodule Ferricstore.Raft.StateMachine do
     path = prob_path(state, key, "bloom")
 
     with :ok <- ensure_prob_dir(state),
-         :ok <- prob_create_and_fsync(state, NIF.bloom_file_create(path, num_bits, num_hashes)) do
-      do_put(state, key, :erlang.term_to_binary(prob_meta), 0)
+         :ok <-
+           prob_create_and_fsync(state, path, NIF.bloom_file_create(path, num_bits, num_hashes)) do
+      do_put(state, key, :erlang.term_to_binary(bloom_meta_with_path(prob_meta, path)), 0)
       :ok
     end
   end
+
+  defp bloom_meta_with_path({:bloom_meta, meta}, path) when is_map(meta) do
+    {:bloom_meta, Map.put(meta, :path, path)}
+  end
+
+  defp bloom_meta_with_path(_prob_meta, path), do: {:bloom_meta, %{path: path}}
 
   defp create_cms_metadata(state, key, width, depth) do
     path = prob_path(state, key, "cms")
 
     with :ok <- ensure_prob_dir(state),
-         :ok <- prob_create_and_fsync(state, NIF.cms_file_create(path, width, depth)) do
+         :ok <- prob_create_and_fsync(state, path, NIF.cms_file_create(path, width, depth)) do
       meta_val = {:cms_meta, %{width: width, depth: depth}}
       do_put(state, key, :erlang.term_to_binary(meta_val), 0)
       :ok
@@ -10679,7 +10698,8 @@ defmodule Ferricstore.Raft.StateMachine do
     else
       %{width: width, depth: depth} = create_params
 
-      with :ok <- prob_create_and_fsync(state, NIF.cms_file_create(dst_path, width, depth)) do
+      with :ok <-
+             prob_create_and_fsync(state, dst_path, NIF.cms_file_create(dst_path, width, depth)) do
         meta_val = {:cms_meta, %{width: width, depth: depth}}
         do_put(state, dst_key, :erlang.term_to_binary(meta_val), 0)
         :ok
@@ -10691,7 +10711,12 @@ defmodule Ferricstore.Raft.StateMachine do
     path = prob_path(state, key, "cuckoo")
 
     with :ok <- ensure_prob_dir(state),
-         :ok <- prob_create_and_fsync(state, NIF.cuckoo_file_create(path, capacity, bucket_size)) do
+         :ok <-
+           prob_create_and_fsync(
+             state,
+             path,
+             NIF.cuckoo_file_create(path, capacity, bucket_size)
+           ) do
       meta_val = {:cuckoo_meta, %{capacity: capacity}}
       do_put(state, key, :erlang.term_to_binary(meta_val), 0)
       :ok
@@ -10703,17 +10728,67 @@ defmodule Ferricstore.Raft.StateMachine do
 
     with :ok <- ensure_prob_dir(state),
          :ok <-
-           prob_create_and_fsync(state, NIF.topk_file_create_v2(path, k, width, depth, decay)) do
+           prob_create_and_fsync(
+             state,
+             path,
+             NIF.topk_file_create_v2(path, k, width, depth, decay)
+           ) do
       meta_val = {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
       do_put(state, key, :erlang.term_to_binary(meta_val), 0)
       :ok
     end
   end
 
-  defp prob_create_and_fsync(state, create_result) do
-    with :ok <- normalize_prob_create_result(create_result),
-         :ok <- normalize_prob_create_result(prob_fsync_dir(state)) do
-      :ok
+  defp prob_create_and_fsync(state, path, create_result) do
+    case normalize_prob_create_result(create_result) do
+      :ok ->
+        case normalize_prob_create_result(prob_fsync_dir(state)) do
+          :ok ->
+            record_pending_prob_create(path)
+            :ok
+
+          {:error, _reason} = error ->
+            cleanup_created_prob_file(state, path)
+            error
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp record_pending_prob_create(path) when is_binary(path) do
+    pending = Process.get(:sm_pending_prob_creates, [])
+    Process.put(:sm_pending_prob_creates, [path | pending])
+  end
+
+  defp cleanup_created_prob_file(state, path) when is_binary(path) do
+    try do
+      case Ferricstore.FS.rm(path) do
+        :ok ->
+          _ = prob_fsync_dir(Path.dirname(path), :rollback_prob_file_create)
+          :ok
+
+        {:error, {:not_found, _}} ->
+          :ok
+
+        {:error, _reason} = error ->
+          error
+      end
+    catch
+      kind, reason -> {:error, {kind, reason}}
+    end
+    |> case do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "StateMachine probabilistic sidecar rollback failed for #{path}: #{inspect(reason)}"
+        )
+
+        emit_prob_sidecar_delete_failed(state, path, {:rollback_prob_file_create, reason})
+        :ok
     end
   end
 
@@ -10731,7 +10806,7 @@ defmodule Ferricstore.Raft.StateMachine do
       auto_create_params ->
         %{num_bits: nb, num_hashes: nh} = auto_create_params
 
-        with :ok <- prob_create_and_fsync(state, NIF.bloom_file_create(path, nb, nh)) do
+        with :ok <- prob_create_and_fsync(state, path, NIF.bloom_file_create(path, nb, nh)) do
           meta_val = {:bloom_meta, Map.merge(auto_create_params, %{path: path})}
           do_put(state, key, :erlang.term_to_binary(meta_val), 0)
           :ok
@@ -10759,7 +10834,7 @@ defmodule Ferricstore.Raft.StateMachine do
       auto_create_params ->
         %{capacity: cap, bucket_size: bs} = auto_create_params
 
-        with :ok <- prob_create_and_fsync(state, NIF.cuckoo_file_create(path, cap, bs)) do
+        with :ok <- prob_create_and_fsync(state, path, NIF.cuckoo_file_create(path, cap, bs)) do
           meta_val = {:cuckoo_meta, %{capacity: cap}}
           do_put(state, key, :erlang.term_to_binary(meta_val), 0)
           :ok

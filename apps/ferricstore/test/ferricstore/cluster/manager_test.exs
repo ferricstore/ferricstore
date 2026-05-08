@@ -561,6 +561,70 @@ defmodule Ferricstore.Cluster.ManagerTest do
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
+    test "join aborts before target raft start when a sync index is missing" do
+      target = :"missing_sync_index_target@127.0.0.1"
+      parent = self()
+
+      Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 2 ->
+        {:ok, false}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_target_membership_hook, fn ^target, _state ->
+        %{0 => false, 1 => false}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 2 ->
+        send(parent, :target_raft_stop)
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
+        send(parent, :direct_sync)
+        {:ok, %{0 => 9}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_start_raft_on_target_hook, fn ^target, 2, _idx ->
+        send(parent, :target_raft_start)
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
+        send(parent, :raft_add)
+        {:ok, %{0 => :ok, 1 => :ok}}
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
+        Process.delete(:ferricstore_cluster_manager_target_membership_hook)
+        Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
+        Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
+        Process.delete(:ferricstore_cluster_manager_start_raft_on_target_hook)
+        Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
+      end)
+
+      state = %{
+        mode: :cluster,
+        role: :voter,
+        cluster_nodes: [],
+        remove_delay_ms: 60_000,
+        known_nodes: MapSet.new(),
+        remove_timers: %{},
+        sync_status: :synced,
+        shard_sync_status: %{},
+        shard_count: 2
+      }
+
+      assert {:reply, {:error, {:target_index_read_failed, ^target, 1, :missing_index}},
+              new_state} =
+               Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
+
+      assert_received :target_raft_stop
+      assert_received :direct_sync
+      refute_received :target_raft_start
+      refute_received :raft_add
+      refute MapSet.member?(new_state.known_nodes, target)
+    end
+
     test "target raft start aborts when cluster membership cannot be read" do
       target = :"cluster_members_unavailable_target@127.0.0.1"
       parent = self()

@@ -893,6 +893,34 @@ defmodule Ferricstore.Cluster.Manager do
          cleanup_data_on_failure?,
          preexisting_membership
        ) do
+    case validate_join_sync_indices(target_node, state.shard_count, sync_indices) do
+      :ok ->
+        do_start_target_raft_and_finish_join(
+          target_node,
+          membership,
+          state,
+          ctx,
+          sync_indices,
+          success_message,
+          cleanup_data_on_failure?,
+          preexisting_membership
+        )
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp do_start_target_raft_and_finish_join(
+         target_node,
+         membership,
+         state,
+         ctx,
+         sync_indices,
+         success_message,
+         cleanup_data_on_failure?,
+         preexisting_membership
+       ) do
     case start_raft_on_target(target_node, state.shard_count, sync_indices) do
       :ok ->
         add_node_and_persist_target_marker(
@@ -914,6 +942,28 @@ defmodule Ferricstore.Cluster.Manager do
           error
         )
     end
+  end
+
+  defp validate_join_sync_indices(target_node, shard_count, sync_indices)
+       when is_map(sync_indices) do
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn shard_idx, :ok ->
+      case Map.fetch(sync_indices, shard_idx) do
+        {:ok, idx} when is_integer(idx) and idx >= 0 ->
+          {:cont, :ok}
+
+        {:ok, idx} ->
+          {:halt,
+           {:error, {:target_index_read_failed, target_node, shard_idx, {:invalid_index, idx}}}}
+
+        :error ->
+          {:halt, {:error, {:target_index_read_failed, target_node, shard_idx, :missing_index}}}
+      end
+    end)
+  end
+
+  defp validate_join_sync_indices(target_node, _shard_count, sync_indices) do
+    {:error,
+     {:target_index_read_failed, target_node, :sync_indices, {:unexpected_result, sync_indices}}}
   end
 
   defp add_node_and_persist_target_marker(
@@ -1647,7 +1697,7 @@ defmodule Ferricstore.Cluster.Manager do
     target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default])
     shard_data_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, shard_idx)
     keydir = elem(target_ctx.keydir_refs, shard_idx)
-    skip_idx = Map.get(sync_indices, shard_idx, 0)
+    skip_idx = Map.fetch!(sync_indices, shard_idx)
 
     result =
       :erpc.call(target_node, Ferricstore.Raft.Cluster, :join_shard_server, [

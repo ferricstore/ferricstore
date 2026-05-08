@@ -19,6 +19,9 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     old_standalone_cross_shard_tx_hook =
       Application.get_env(:ferricstore, :standalone_cross_shard_tx_hook)
 
+    old_standalone_tx_log_fsync_dir_hook =
+      Application.get_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
+
     server_started? = application_started?(:ferricstore_server)
 
     tmp_dir =
@@ -49,6 +52,7 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
       restore_env(:standalone_fsync_max_delay_ms, old_standalone_fsync_max_delay_ms)
       restore_env(:standalone_fsync_max_ops, old_standalone_fsync_max_ops)
       restore_env(:standalone_cross_shard_tx_hook, old_standalone_cross_shard_tx_hook)
+      restore_env(:standalone_tx_log_fsync_dir_hook, old_standalone_tx_log_fsync_dir_hook)
       Ferricstore.ReplicationMode.put_current(:raft)
 
       {:ok, _} = Application.ensure_all_started(:ferricstore)
@@ -268,6 +272,25 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     refute File.exists?(tx_log_path)
   end
 
+  test "standalone cross-shard tx log fsyncs parent directory", %{tmp_dir: tmp_dir} do
+    parent = self()
+
+    Application.put_env(:ferricstore, :standalone_tx_log_fsync_dir_hook, fn path ->
+      send(parent, {:tx_log_fsync_dir, path})
+      :ok
+    end)
+
+    assert {:ok, txid} =
+             Ferricstore.Store.StandaloneTxLog.prepare(tmp_dir, [
+               {Path.join(tmp_dir, "00000.log"), [{:put, "key", "value", 0}]}
+             ])
+
+    assert :ok = Ferricstore.Store.StandaloneTxLog.commit(tmp_dir, txid)
+    assert_receive {:tx_log_fsync_dir, ^tmp_dir}, 5_000
+  after
+    Application.delete_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
+  end
+
   test "standalone cross-shard tx waits for earlier pending standalone writes" do
     ctx = FerricStore.Instance.get(:default)
     key_a = "standalone:cross-shard:pending-source"
@@ -392,6 +415,55 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     refute Router.exists?(ctx, key)
   after
     Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
+  test "standalone probabilistic create cleans sidecar if metadata fsync fails" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:prob-create-fsync-failure"
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      assert Enum.any?(batch, &match?({:put, ^key, _value, 0}, &1))
+      {:error, :simulated_eio}
+    end)
+
+    assert {:error, _reason} = FerricStore.bf_reserve(key, 0.01, 100)
+    refute Enum.any?(prob_file_paths(ctx, key, "bloom"), &File.exists?/1)
+    refute Router.exists?(ctx, key)
+  after
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
+  test "standalone probabilistic delete keeps sidecar until tombstone is durable" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:prob-delete-fsync-failure"
+
+    assert :ok = FerricStore.bf_reserve(key, 0.01, 100)
+    path = prob_meta_path(ctx, key)
+    assert File.exists?(path)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      assert Enum.any?(batch, &match?({:delete, ^key, ^path}, &1))
+      {:error, :simulated_eio}
+    end)
+
+    assert {:error, _reason} = FerricStore.del(key)
+    assert File.exists?(path)
+    assert Router.exists?(ctx, key)
+  after
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
+  test "standalone probabilistic delete removes sidecar after durable tombstone" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:prob-delete-success"
+
+    assert :ok = FerricStore.bf_reserve(key, 0.01, 100)
+    path = prob_meta_path(ctx, key)
+    assert File.exists?(path)
+
+    assert {:ok, 1} = FerricStore.del(key)
+    refute File.exists?(path)
+    refute Router.exists?(ctx, key)
   end
 
   test "standalone Flow fsync failure does not leak ordered indexes" do
@@ -538,6 +610,28 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
            ]
 
     assert standalone_keys({:server_command, {:opaque, :write}}) == ["__standalone_global__"]
+
+    assert standalone_keys(
+             {:cross_shard_tx,
+              [
+                {0,
+                 [
+                   {0, {"MSETNX", ["a", "1", "b", "2"], {:msetnx, ["a", "1", "b", "2"]}}}
+                 ], nil}
+              ]}
+           ) == ["a", "b"]
+
+    assert standalone_keys(
+             {:cross_shard_tx,
+              [
+                {0,
+                 [
+                   {0,
+                    {"LMOVE", ["src", "dst", "left", "right"],
+                     {:lmove, "src", "dst", :left, :right}}}
+                 ], nil}
+              ]}
+           ) == ["dst", "src"]
 
     assert standalone_keys({:cross_shard_tx, %{0 => [{:put, "k", "v", 0}]}}) == [
              "__standalone_global__"
@@ -881,6 +975,22 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
 
   defp standalone_conflict?(left, right) do
     Ferricstore.Store.Shard.__standalone_command_keys_conflict_for_test__(left, right)
+  end
+
+  defp prob_meta_path(ctx, key) do
+    value = Router.get(ctx, key)
+    {:bloom_meta, %{path: path}} = :erlang.binary_to_term(value, [:safe])
+    path
+  end
+
+  defp prob_file_paths(ctx, key, ext) do
+    safe = Base.url_encode64(key, padding: false)
+
+    0..(tuple_size(ctx.keydir_refs) - 1)
+    |> Enum.map(fn shard_idx ->
+      shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_idx)
+      Path.join([shard_path, "prob", "#{safe}.#{ext}"])
+    end)
   end
 
   defp eventually(fun, timeout_ms \\ 2_000) do

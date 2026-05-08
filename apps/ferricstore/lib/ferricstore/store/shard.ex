@@ -1581,6 +1581,20 @@ defmodule Ferricstore.Store.Shard do
     standalone_command_keys(command)
   end
 
+  defp standalone_command_keys({:cross_shard_tx, shard_batches}) when is_list(shard_batches) do
+    shard_batches
+    |> Enum.reduce(MapSet.new(), fn
+      {_shard_idx, entries, _namespace}, acc when is_list(entries) ->
+        Enum.reduce(entries, acc, fn entry, acc ->
+          MapSet.union(acc, standalone_cross_shard_entry_keys(entry))
+        end)
+
+      _other, acc ->
+        MapSet.put(acc, @standalone_global_key)
+    end)
+    |> standalone_nonempty_keys()
+  end
+
   defp standalone_command_keys({:cross_shard_tx, _shard_batches}) do
     standalone_global_keys()
   end
@@ -1697,6 +1711,58 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp standalone_global_keys, do: MapSet.new([@standalone_global_key])
+
+  defp standalone_cross_shard_entry_keys({_pos, tx_entry}),
+    do: standalone_tx_entry_keys(tx_entry)
+
+  defp standalone_cross_shard_entry_keys(_entry), do: standalone_global_keys()
+
+  defp standalone_tx_entry_keys({_name, args, command}) do
+    command
+    |> standalone_tx_command_keys(args)
+    |> standalone_lock_keys()
+  end
+
+  defp standalone_tx_entry_keys(_entry), do: standalone_global_keys()
+
+  defp standalone_tx_command_keys({:msetnx, args}, _args), do: every_other_arg(args)
+
+  defp standalone_tx_command_keys({:copy, source, destination, _replace?}, _args),
+    do: [source, destination]
+
+  defp standalone_tx_command_keys({:rename, source, destination}, _args),
+    do: [source, destination]
+
+  defp standalone_tx_command_keys({:renamenx, source, destination}, _args),
+    do: [source, destination]
+
+  defp standalone_tx_command_keys({:lmove, source, destination, _from_dir, _to_dir}, _args),
+    do: [source, destination]
+
+  defp standalone_tx_command_keys({:smove, source, destination, _member}, _args),
+    do: [source, destination]
+
+  defp standalone_tx_command_keys({command, [destination | sources]}, _args)
+       when command in [:sdiffstore, :sinterstore, :sunionstore] and is_list(sources),
+       do: [destination | sources]
+
+  defp standalone_tx_command_keys(_command, args) when is_list(args),
+    do: standalone_tx_args_keys(args)
+
+  defp standalone_tx_command_keys(_command, _args), do: [@standalone_global_key]
+
+  defp standalone_tx_args_keys(["MSETNX" | args]), do: every_other_arg(args)
+  defp standalone_tx_args_keys([source, destination | _rest]), do: [source, destination]
+  defp standalone_tx_args_keys(_args), do: [@standalone_global_key]
+
+  defp every_other_arg(args) when is_list(args) do
+    args
+    |> Enum.with_index()
+    |> Enum.filter(fn {_arg, index} -> rem(index, 2) == 0 end)
+    |> Enum.map(fn {arg, _index} -> arg end)
+  end
+
+  defp every_other_arg(_args), do: [@standalone_global_key]
 
   defp standalone_flow_record_keys(route_key, records) do
     records

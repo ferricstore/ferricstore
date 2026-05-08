@@ -169,13 +169,15 @@ defmodule Ferricstore.Store.StandaloneTxLog do
 
   defp append_entry(data_dir, entry) do
     path = path(data_dir)
+    dir = Path.dirname(path)
     line = encode_entry(entry) <> "\n"
 
-    with :ok <- File.mkdir_p(Path.dirname(path)),
+    with :ok <- File.mkdir_p(dir),
          {:ok, io} <- File.open(path, [:append, :binary]),
          :ok <- IO.binwrite(io, line),
          :ok <- :file.sync(io),
-         :ok <- File.close(io) do
+         :ok <- File.close(io),
+         :ok <- fsync_dir(dir) do
       :ok
     else
       {:error, _reason} = error -> error
@@ -184,8 +186,11 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   end
 
   defp rewrite_entries(data_dir, []) do
-    case File.rm(path(data_dir)) do
-      :ok -> :ok
+    path = path(data_dir)
+    dir = Path.dirname(path)
+
+    case File.rm(path) do
+      :ok -> fsync_dir(dir)
       {:error, :enoent} -> :ok
       {:error, _reason} = error -> error
     end
@@ -193,15 +198,18 @@ defmodule Ferricstore.Store.StandaloneTxLog do
 
   defp rewrite_entries(data_dir, entries) do
     path = path(data_dir)
+    dir = Path.dirname(path)
     tmp_path = path <> ".compact"
     data = Enum.map_join(entries, "", fn entry -> encode_entry(entry) <> "\n" end)
 
-    with :ok <- File.mkdir_p(Path.dirname(path)),
+    with :ok <- File.mkdir_p(dir),
          {:ok, io} <- File.open(tmp_path, [:write, :binary]),
          :ok <- IO.binwrite(io, data),
          :ok <- :file.sync(io),
          :ok <- File.close(io),
-         :ok <- File.rename(tmp_path, path) do
+         :ok <- fsync_dir(dir),
+         :ok <- File.rename(tmp_path, path),
+         :ok <- fsync_dir(dir) do
       :ok
     else
       {:error, _reason} = error -> error
@@ -250,6 +258,13 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   defp valid_entry?(_other), do: false
 
   defp path(data_dir), do: Path.join(data_dir, @file_name)
+
+  defp fsync_dir(path) do
+    case Application.get_env(:ferricstore, :standalone_tx_log_fsync_dir_hook) do
+      hook when is_function(hook, 1) -> hook.(path)
+      _ -> NIF.v2_fsync_dir(path)
+    end
+  end
 
   defp recover_once_key(data_dir), do: {__MODULE__, Path.expand(data_dir)}
 
