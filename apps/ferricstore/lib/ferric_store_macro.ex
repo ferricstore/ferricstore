@@ -457,6 +457,10 @@ defmodule FerricStore.Macro do
         FerricStore.Impl.flow_reclaim(__instance__(), type, opts)
       end
 
+      def flow_extend_lease(id, lease_token, opts \\ []) do
+        FerricStore.Impl.flow_extend_lease(__instance__(), id, lease_token, opts)
+      end
+
       def flow_complete(id, lease_token, opts \\ []) do
         FerricStore.Impl.flow_complete(__instance__(), id, lease_token, opts)
       end

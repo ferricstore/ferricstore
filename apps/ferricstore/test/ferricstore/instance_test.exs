@@ -184,6 +184,14 @@ defmodule Ferricstore.InstanceTest do
                  now_ms: 1_000
                )
 
+      assert {:ok, %{id: ^id, state: "running", lease_deadline_ms: 6_000}} =
+               EmbeddedFlow.flow_extend_lease(id, claimed.lease_token,
+                 fencing_token: claimed.fencing_token,
+                 lease_ms: 5_000,
+                 partition_key: partition,
+                 now_ms: 1_000
+               )
+
       assert {:ok, %{id: ^id, state: "completed"}} =
                EmbeddedFlow.flow_complete(id, claimed.lease_token,
                  fencing_token: claimed.fencing_token,
