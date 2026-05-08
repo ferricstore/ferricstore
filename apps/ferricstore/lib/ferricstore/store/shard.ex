@@ -2717,7 +2717,12 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   @impl true
-  def terminate(reason, state), do: ShardLifecycle.do_terminate(reason, state)
+  def terminate(reason, state) do
+    state
+    |> flush_standalone_batch()
+    |> await_standalone_flush()
+    |> then(&ShardLifecycle.do_terminate(reason, &1))
+  end
 
   # -------------------------------------------------------------------
   # Private: flush
