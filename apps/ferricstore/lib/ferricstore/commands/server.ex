@@ -1013,6 +1013,15 @@ defmodule Ferricstore.Commands.Server do
         flow_lmdb_mirror_degraded =
           atomic_metric(instance_ctx, :flow_lmdb_mirror_degraded, i)
 
+        flow_lmdb_writer_pending_ops =
+          atomic_metric(instance_ctx, :flow_lmdb_writer_pending_ops, i)
+
+        flow_lmdb_writer_oldest_pending_age_us =
+          atomic_metric(instance_ctx, :flow_lmdb_writer_oldest_pending_age_us, i)
+
+        flow_lmdb_writer_flush_failures =
+          atomic_metric(instance_ctx, :flow_lmdb_writer_flush_failures, i)
+
         release_gap = max(last_applied - last_released, 0)
 
         release_cursor_blocked_apply_count =
@@ -1042,6 +1051,12 @@ defmodule Ferricstore.Commands.Server do
           {"shard_#{i}_flow_lmdb_mirror_enqueue_failures",
            Integer.to_string(flow_lmdb_mirror_enqueue_failures)},
           {"shard_#{i}_flow_lmdb_mirror_degraded", Integer.to_string(flow_lmdb_mirror_degraded)},
+          {"shard_#{i}_flow_lmdb_writer_pending_ops",
+           Integer.to_string(flow_lmdb_writer_pending_ops)},
+          {"shard_#{i}_flow_lmdb_writer_oldest_pending_age_us",
+           Integer.to_string(flow_lmdb_writer_oldest_pending_age_us)},
+          {"shard_#{i}_flow_lmdb_writer_flush_failures",
+           Integer.to_string(flow_lmdb_writer_flush_failures)},
           {"shard_#{i}_release_cursor_gap", Integer.to_string(release_gap)},
           {"shard_#{i}_release_cursor_blocked_apply_count",
            Integer.to_string(release_cursor_blocked_apply_count)},

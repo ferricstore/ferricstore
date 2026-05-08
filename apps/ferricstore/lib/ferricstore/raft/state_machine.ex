@@ -481,30 +481,40 @@ defmodule Ferricstore.Raft.StateMachine do
           Process.put(:tx_pending_values, %{})
 
           try do
-            {results_by_position, _stores} =
-              Enum.reduce(ordered_entries, {%{}, %{}}, fn
-                {_orig_idx, shard_idx, pos, entry, sandbox_namespace}, {results, stores} ->
-                  {store, stores} =
-                    case Map.fetch(stores, shard_idx) do
-                      {:ok, cached} ->
-                        {cached, stores}
+            case Enum.reduce_while(ordered_entries, {:ok, %{}, %{}}, fn
+                   {_orig_idx, shard_idx, pos, entry, sandbox_namespace},
+                   {:ok, results, stores} ->
+                     {store, stores} =
+                       case Map.fetch(stores, shard_idx) do
+                         {:ok, cached} ->
+                           {cached, stores}
 
-                      :error ->
-                        store = build_cross_shard_store(shard_idx, state)
-                        {store, Map.put(stores, shard_idx, store)}
-                    end
+                         :error ->
+                           store = build_cross_shard_store(shard_idx, state)
+                           {store, Map.put(stores, shard_idx, store)}
+                       end
 
-                  result = dispatch_cross_shard_entry(entry, sandbox_namespace, store, state)
+                     result = dispatch_cross_shard_entry(entry, sandbox_namespace, store, state)
 
-                  results =
-                    Map.update(results, shard_idx, %{pos => result}, fn shard_results ->
-                      Map.put(shard_results, pos, result)
-                    end)
+                     case cross_shard_fatal_entry_error(entry, result) do
+                       {:error, _reason} = error ->
+                         {:halt, error}
 
-                  {results, stores}
-              end)
+                       nil ->
+                         results =
+                           Map.update(results, shard_idx, %{pos => result}, fn shard_results ->
+                             Map.put(shard_results, pos, result)
+                           end)
 
-            cross_shard_results_by_batch_position(shard_batches, results_by_position)
+                         {:cont, {:ok, results, stores}}
+                     end
+                 end) do
+              {:ok, results_by_position, _stores} ->
+                cross_shard_results_by_batch_position(shard_batches, results_by_position)
+
+              {:error, _reason} = error ->
+                error
+            end
           after
             Process.delete(:tx_deleted_keys)
             Process.delete(:tx_pending_values)
@@ -1011,6 +1021,10 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_with_time(meta, state, fn -> do_flow_claim_due(state, attrs) end)
   end
 
+  def apply(meta, {:flow_extend_lease, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_extend_lease(state, attrs) end)
+  end
+
   def apply(meta, {:flow_complete, _key, attrs}, state) when is_map(attrs) do
     apply_pending_with_time(meta, state, fn -> do_flow_complete(state, attrs) end)
   end
@@ -1244,6 +1258,22 @@ defmodule Ferricstore.Raft.StateMachine do
   @doc false
   def __compensate_cross_shard_partial_writes_for_test__(state, successful_groups, originals) do
     compensate_cross_shard_partial_writes(state, successful_groups, originals)
+  end
+
+  @doc false
+  def __compensate_cross_shard_partial_writes_for_test__(
+        state,
+        successful_groups,
+        originals,
+        opts
+      ) do
+    if Keyword.get(opts, :standalone_staged?, false) do
+      apply_standalone(fn ->
+        compensate_cross_shard_partial_writes(state, successful_groups, originals)
+      end)
+    else
+      compensate_cross_shard_partial_writes(state, successful_groups, originals)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -1874,6 +1904,31 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp cross_shard_fatal_entry_error({orig_idx, entry}, result)
+       when is_integer(orig_idx) and is_tuple(entry) do
+    cross_shard_fatal_entry_error(entry, result)
+  end
+
+  defp cross_shard_fatal_entry_error(
+         {:flow_cross_spawn_children, _attrs},
+         {:error, _reason} = error
+       ),
+       do: error
+
+  defp cross_shard_fatal_entry_error(
+         {:flow_cross_terminal, _op, _attrs},
+         {:error, _reason} = error
+       ),
+       do: error
+
+  defp cross_shard_fatal_entry_error(
+         {:flow_cross_terminal_many, _op, _attrs_list},
+         {:error, _reason} = error
+       ),
+       do: error
+
+  defp cross_shard_fatal_entry_error(_entry, _result), do: nil
+
   defp cross_shard_results_by_batch_position(shard_batches, results_by_position) do
     Map.new(shard_batches, fn {shard_idx, queue, _sandbox_namespace} ->
       shard_positions = Map.get(results_by_position, shard_idx, %{})
@@ -2192,6 +2247,117 @@ defmodule Ferricstore.Raft.StateMachine do
       end
     end
 
+    promoted_put_batch = fn redis_key, entries, dedicated_path ->
+      ctx = ctx_for_key.(redis_key)
+      Promotion.await_compaction_latch(anchor_state, redis_key)
+
+      active = Promotion.find_active(dedicated_path)
+      fid = parse_fid_from_path(active)
+
+      prepared =
+        Enum.map(entries, fn {compound_key, value, expire_at_ms} ->
+          value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
+          disk_val = to_disk_binary(value)
+          {compound_key, value, value_for, disk_val, expire_at_ms}
+        end)
+
+      batch =
+        Enum.map(prepared, fn {compound_key, _value, _value_for, disk_val, expire_at_ms} ->
+          {compound_key, disk_val, expire_at_ms}
+        end)
+
+      case NIF.v2_append_batch(active, batch) do
+        {:ok, locations} when length(locations) == length(prepared) ->
+          deleted =
+            Enum.zip(prepared, locations)
+            |> Enum.reduce(Process.get(:tx_deleted_keys, MapSet.new()), fn
+              {{compound_key, value, value_for, disk_val, expire_at_ms}, {offset, _value_size}},
+              deleted_acc ->
+                if tx_binary_ref do
+                  new_bytes = binary_byte_size(compound_key) + binary_byte_size(value_for)
+
+                  old_bytes =
+                    case :ets.lookup(ctx.keydir, compound_key) do
+                      [{^compound_key, old_val, _, _, _, _, _}] ->
+                        binary_byte_size(compound_key) + binary_byte_size(old_val)
+
+                      _ ->
+                        0
+                    end
+
+                  delta = new_bytes - old_bytes
+                  if delta != 0, do: :atomics.add(tx_binary_ref, ctx.index + 1, delta)
+                end
+
+                :ets.insert(
+                  ctx.keydir,
+                  {
+                    compound_key,
+                    value_for,
+                    expire_at_ms,
+                    LFU.initial(),
+                    fid,
+                    offset,
+                    byte_size(disk_val)
+                  }
+                )
+
+                sm_tx_put_pending(compound_key, value, expire_at_ms)
+                MapSet.delete(deleted_acc, compound_key)
+            end)
+
+          Process.put(:tx_deleted_keys, deleted)
+          :ok
+
+        {:ok, locations} ->
+          {:error, {:batch_result_mismatch, length(prepared), locations}}
+
+        {:error, _reason} = err ->
+          err
+      end
+    end
+
+    promoted_delete_batch = fn redis_key, compound_keys, dedicated_path ->
+      ctx = ctx_for_key.(redis_key)
+      Promotion.await_compaction_latch(anchor_state, redis_key)
+
+      active = Promotion.find_active(dedicated_path)
+      ops = Enum.map(compound_keys, &{:delete, &1})
+
+      case NIF.v2_append_ops_batch_nosync(active, ops) do
+        {:ok, locations} ->
+          with :ok <- validate_promoted_tombstone_batch(locations, length(compound_keys)),
+               :ok <- NIF.v2_fsync(active) do
+            deleted =
+              Enum.reduce(compound_keys, Process.get(:tx_deleted_keys, MapSet.new()), fn
+                compound_key, acc ->
+                  if tx_binary_ref do
+                    bytes =
+                      case :ets.lookup(ctx.keydir, compound_key) do
+                        [{^compound_key, val, _, _, _, _, _}] ->
+                          binary_byte_size(compound_key) + binary_byte_size(val)
+
+                        _ ->
+                          0
+                      end
+
+                    if bytes > 0, do: :atomics.sub(tx_binary_ref, ctx.index + 1, bytes)
+                  end
+
+                  :ets.delete(ctx.keydir, compound_key)
+                  sm_tx_drop_pending(compound_key)
+                  MapSet.put(acc, compound_key)
+              end)
+
+            Process.put(:tx_deleted_keys, deleted)
+            :ok
+          end
+
+        {:error, _reason} = err ->
+          err
+      end
+    end
+
     %{
       get: local_get,
       get_meta: local_get_meta,
@@ -2249,6 +2415,33 @@ defmodule Ferricstore.Raft.StateMachine do
             promoted_put.(redis_key, compound_key, value, expire_at_ms, dedicated_path)
         end
       end,
+      compound_batch_put: fn redis_key, entries ->
+        ctx = ctx_for_key.(redis_key)
+
+        entries
+        |> Enum.chunk_by(fn {compound_key, _value, _expire_at_ms} ->
+          promoted_compound_path(ctx, redis_key, compound_key)
+        end)
+        |> Enum.reduce_while(:ok, fn entries, :ok ->
+          result =
+            case promoted_compound_path(ctx, redis_key, elem(hd(entries), 0)) do
+              nil ->
+                Enum.each(entries, fn {compound_key, value, expire_at_ms} ->
+                  put_in_ctx.(ctx, compound_key, value, expire_at_ms)
+                end)
+
+                :ok
+
+              dedicated_path ->
+                promoted_put_batch.(redis_key, entries, dedicated_path)
+            end
+
+          case result do
+            :ok -> {:cont, :ok}
+            {:error, _} = error -> {:halt, error}
+          end
+        end)
+      end,
       compound_delete: fn redis_key, compound_key ->
         ctx = ctx_for_key.(redis_key)
 
@@ -2256,6 +2449,33 @@ defmodule Ferricstore.Raft.StateMachine do
           nil -> delete_in_ctx.(ctx, compound_key)
           dedicated_path -> promoted_delete.(redis_key, compound_key, dedicated_path)
         end
+      end,
+      compound_batch_delete: fn redis_key, compound_keys ->
+        ctx = ctx_for_key.(redis_key)
+
+        compound_keys
+        |> Enum.chunk_by(fn compound_key ->
+          promoted_compound_path(ctx, redis_key, compound_key)
+        end)
+        |> Enum.reduce_while(:ok, fn compound_keys, :ok ->
+          result =
+            case promoted_compound_path(ctx, redis_key, hd(compound_keys)) do
+              nil ->
+                Enum.each(compound_keys, fn compound_key ->
+                  delete_in_ctx.(ctx, compound_key)
+                end)
+
+                :ok
+
+              dedicated_path ->
+                promoted_delete_batch.(redis_key, compound_keys, dedicated_path)
+            end
+
+          case result do
+            :ok -> {:cont, :ok}
+            {:error, _} = error -> {:halt, error}
+          end
+        end)
       end,
       compound_scan: fn redis_key, prefix ->
         ctx = ctx_for_key.(redis_key)
@@ -3526,6 +3746,10 @@ defmodule Ferricstore.Raft.StateMachine do
     do_flow_claim_due(state, attrs)
   end
 
+  defp apply_single(state, {:flow_extend_lease, _key, attrs}) do
+    do_flow_extend_lease(state, attrs)
+  end
+
   defp apply_single(state, {:flow_complete, _key, attrs}) do
     do_flow_complete(state, attrs)
   end
@@ -4130,35 +4354,62 @@ defmodule Ferricstore.Raft.StateMachine do
     try do
       result = fun.()
 
-      case flush_cross_shard_pending_writes(state) do
-        {:ok, flushed_state} ->
-          observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
-          {result, flushed_state}
+      case cross_shard_pending_error_result(result) do
+        {:error, _reason} = error ->
+          rollback_cross_shard_pending_writes(state)
+          rollback_pending_writes(state)
+          error
 
-        {:error, reason, partial_state, successful_groups} ->
-          case compensate_cross_shard_partial_writes(
-                 partial_state,
-                 successful_groups,
-                 Process.get(:sm_cross_shard_pending_originals, %{})
-               ) do
-            {:ok, compensated_state} ->
-              rollback_cross_shard_pending_writes(state)
-              rollback_pending_writes(state)
-              {:error, reason, compensated_state}
+        nil ->
+          case flush_cross_shard_pending_writes(state) do
+            {:ok, flushed_state} ->
+              observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
+              {result, flushed_state}
 
-            {:error, compensation_reason, compensated_state} ->
-              rollback_cross_shard_pending_writes(state)
-              rollback_pending_writes(state)
-              block_release_cursor_for_apply()
-              {:error, {:cross_shard_compensation_failed, compensation_reason}, compensated_state}
+            {:commit_error, reason, flushed_state} ->
+              {:error, reason, flushed_state}
+
+            {:error, reason, partial_state, successful_groups} ->
+              case compensate_cross_shard_partial_writes(
+                     partial_state,
+                     successful_groups,
+                     Process.get(:sm_cross_shard_pending_originals, %{})
+                   ) do
+                {:ok, compensated_state} ->
+                  rollback_cross_shard_pending_writes(state)
+                  rollback_pending_writes(state)
+                  {:error, reason, compensated_state}
+
+                {:error, compensation_reason, compensated_state} ->
+                  rollback_cross_shard_pending_writes(state)
+                  rollback_pending_writes(state)
+                  block_release_cursor_for_apply()
+
+                  {:error, {:cross_shard_compensation_failed, compensation_reason},
+                   compensated_state}
+              end
           end
       end
+    rescue
+      error ->
+        rollback_cross_shard_pending_writes(state)
+        rollback_pending_writes(state)
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        rollback_cross_shard_pending_writes(state)
+        rollback_pending_writes(state)
+        :erlang.raise(kind, reason, __STACKTRACE__)
     after
       Process.delete(:sm_cross_shard_pending_writes)
       Process.delete(:sm_cross_shard_pending_originals)
       clear_pending_write_process_state()
     end
   end
+
+  defp cross_shard_pending_error_result({:error, _reason} = error), do: error
+  defp cross_shard_pending_error_result({:error, reason, _state}), do: {:error, reason}
+  defp cross_shard_pending_error_result(_result), do: nil
 
   defp flush_cross_shard_pending_writes(state) do
     pending =
@@ -4207,8 +4458,13 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
     |> case do
       {:ok, flushed_state, _successful_groups} ->
-        commit_standalone_cross_shard_tx(flushed_state, txid)
-        {:ok, flushed_state}
+        case commit_standalone_cross_shard_tx(flushed_state, txid) do
+          :ok ->
+            {:ok, flushed_state}
+
+          {:error, reason} ->
+            {:commit_error, {:standalone_cross_shard_tx_commit_failed, reason}, flushed_state}
+        end
 
       {:error, _reason, _partial_state, _successful_groups} = error ->
         error
@@ -4253,7 +4509,7 @@ defmodule Ferricstore.Raft.StateMachine do
           "standalone cross-shard tx commit marker failed for #{inspect(txid)}: #{inspect(reason)}"
         )
 
-        :ok
+        {:error, reason}
     end
   end
 
@@ -4339,7 +4595,12 @@ defmodule Ferricstore.Raft.StateMachine do
           {:cont, {:ok, acc_state}}
 
         {:ok, compensation_batch} ->
-          case append_pending_batch(file_path, compensation_batch) do
+          append_result =
+            file_path
+            |> append_pending_batch(compensation_batch)
+            |> then(&validate_append_result(compensation_batch, &1))
+
+          case append_result do
             {:ok, _locations} ->
               compensated_state =
                 acc_state
@@ -4757,9 +5018,13 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_require_spawn_wait_state(%{state: "running"}, %{wait: wait, wait_state: nil})
+  defp flow_require_spawn_wait_state(_parent, %{wait: wait, wait_state: wait_state})
        when wait in [:all, :any] do
-    {:error, "ERR flow wait_state is required for running parent"}
+    if is_binary(wait_state) and wait_state != "" do
+      :ok
+    else
+      {:error, "ERR flow wait_state is required when waiting for children"}
+    end
   end
 
   defp flow_require_spawn_wait_state(_parent, _attrs), do: :ok
@@ -5645,6 +5910,45 @@ defmodule Ferricstore.Raft.StateMachine do
       state,
       Enum.map(candidates, fn {id, _score} -> %{id: id, partition_key: partition_key} end)
     )
+  end
+
+  defp do_flow_extend_lease(state, %{id: id, lease_token: lease_token} = attrs) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    lease_ms = Map.fetch!(attrs, :lease_ms)
+    partition_key = Map.get(attrs, :partition_key)
+
+    with {:ok, record} <- flow_require_record(state, id, partition_key),
+         :ok <- flow_require_running_lease(record, lease_token),
+         :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)) do
+      version = Map.fetch!(record, :version) + 1
+      deadline_ms = now_ms + lease_ms
+
+      next =
+        record
+        |> Map.merge(%{
+          version: version,
+          updated_at_ms: now_ms,
+          ttl_ms: nil,
+          retention_ttl_ms: Map.get(record, :retention_ttl_ms),
+          history_hot_max_events: Map.get(record, :history_hot_max_events),
+          lease_deadline_ms: deadline_ms,
+          next_run_at_ms: deadline_ms
+        })
+
+      with :ok <- flow_validate_record_keys(record),
+           :ok <- flow_validate_record_keys(next),
+           :ok <- flow_transition_move_indexes(state, [{record, next}]),
+           :ok <-
+             flow_put_state_record(
+               state,
+               FlowKeys.state_key(next.id, Map.get(next, :partition_key)),
+               next
+             ),
+           :ok <- flow_history_put_planned(state, record, next, "lease_extended", now_ms),
+           :ok <- flow_after_history_put(state, next) do
+        {:ok, next}
+      end
+    end
   end
 
   defp do_flow_complete(state, %{id: id, lease_token: lease_token} = attrs) do
@@ -6881,6 +7185,15 @@ defmodule Ferricstore.Raft.StateMachine do
     Map.put(group, "resolved", "success")
   end
 
+  defp flow_child_group_resolve(%{"wait" => "any"} = group, status)
+       when status in ["failed", "cancelled"] do
+    if Map.get(group, "on_child_failed") == "fail_parent" do
+      Map.put(group, "resolved", "failure")
+    else
+      flow_child_group_resolve_any_terminal(group)
+    end
+  end
+
   defp flow_child_group_resolve(group, status) when status in ["failed", "cancelled"] do
     if Map.get(group, "on_child_failed") == "fail_parent" do
       Map.put(group, "resolved", "failure")
@@ -6890,6 +7203,21 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_child_group_resolve(group, _status), do: flow_child_group_resolve_all_terminal(group)
+
+  defp flow_child_group_resolve_any_terminal(group) do
+    summary = Map.get(group, "summary", %{})
+    total = Map.get(summary, "total", 0)
+    completed = Map.get(summary, "completed", 0)
+
+    terminal_count =
+      completed + Map.get(summary, "failed", 0) + Map.get(summary, "cancelled", 0)
+
+    cond do
+      completed > 0 -> Map.put(group, "resolved", "success")
+      terminal_count >= total -> Map.put(group, "resolved", "failure")
+      true -> group
+    end
+  end
 
   defp flow_child_group_resolve_all_terminal(group) do
     summary = Map.get(group, "summary", %{})
@@ -9368,11 +9696,17 @@ defmodule Ferricstore.Raft.StateMachine do
       expected = pending_entry_op(entry)
       actual = pending_location_op(location)
 
-      if expected == actual do
-        {:cont, :ok}
-      else
-        {:halt,
-         {:error, {:bitcask_append_result_mismatch, {:op_mismatch, index, expected, actual}}}}
+      cond do
+        expected != actual ->
+          {:halt,
+           {:error, {:bitcask_append_result_mismatch, {:op_mismatch, index, expected, actual}}}}
+
+        not valid_pending_location?(location) ->
+          {:halt,
+           {:error, {:bitcask_append_result_mismatch, {:invalid_location, index, location}}}}
+
+        true ->
+          {:cont, :ok}
       end
     end)
   end
@@ -9384,6 +9718,16 @@ defmodule Ferricstore.Raft.StateMachine do
   defp pending_location_op({:put, _offset, _value_size}), do: :put
   defp pending_location_op({:delete, _offset, _record_size}), do: :delete
   defp pending_location_op(_location), do: :unknown
+
+  defp valid_pending_location?({:put, offset, value_size}),
+    do: non_negative_integer?(offset) and non_negative_integer?(value_size)
+
+  defp valid_pending_location?({:delete, offset, record_size}),
+    do: non_negative_integer?(offset) and non_negative_integer?(record_size)
+
+  defp valid_pending_location?(_location), do: false
+
+  defp non_negative_integer?(value), do: is_integer(value) and value >= 0
 
   defp apply_pending_locations(state, file_id, batch, locations) do
     Enum.zip(batch, locations)
@@ -10501,19 +10845,12 @@ defmodule Ferricstore.Raft.StateMachine do
       # Ra index as the selection seed instead of caller-side randomness.
       selected = deterministic_take(members, pop_count, {redis_key, seed})
 
-      Enum.each(selected, fn member ->
-        do_compound_delete(state, redis_key, CompoundKey.set_member(redis_key, member))
-      end)
+      selected_delete_keys = Enum.map(selected, &CompoundKey.set_member(redis_key, &1))
 
-      if selected != [] and
-           Ferricstore.Store.Shard.ETS.prefix_count_entries(
-             shard_ets_state(state),
-             prefix
-           ) == 0 do
-        do_compound_delete(state, redis_key, CompoundKey.type_key(redis_key))
+      with :ok <- do_compound_batch_delete(state, redis_key, selected_delete_keys),
+           :ok <- maybe_delete_empty_compound_type_key(state, redis_key, prefix, selected) do
+        if is_nil(count), do: List.first(selected), else: selected
       end
-
-      if is_nil(count), do: List.first(selected), else: selected
     end
   end
 
@@ -10539,21 +10876,13 @@ defmodule Ferricstore.Raft.StateMachine do
       sorted = if direction == :max, do: Enum.reverse(sorted), else: sorted
       selected = Enum.take(sorted, count)
 
-      result =
-        Enum.flat_map(selected, fn {member, score} ->
-          do_compound_delete(state, redis_key, CompoundKey.zset_member(redis_key, member))
-          [member, format_zset_score(score)]
-        end)
+      selected_delete_keys =
+        Enum.map(selected, fn {member, _score} -> CompoundKey.zset_member(redis_key, member) end)
 
-      if selected != [] and
-           Ferricstore.Store.Shard.ETS.prefix_count_entries(
-             shard_ets_state(state),
-             prefix
-           ) == 0 do
-        do_compound_delete(state, redis_key, CompoundKey.type_key(redis_key))
+      with :ok <- do_compound_batch_delete(state, redis_key, selected_delete_keys),
+           :ok <- maybe_delete_empty_compound_type_key(state, redis_key, prefix, selected) do
+        Enum.flat_map(selected, fn {member, score} -> [member, format_zset_score(score)] end)
       end
-
-      result
     end
   end
 
@@ -11425,6 +11754,98 @@ defmodule Ferricstore.Raft.StateMachine do
     end
 
     result
+  end
+
+  defp do_compound_batch_delete(_state, _redis_key, []), do: :ok
+
+  defp do_compound_batch_delete(state, redis_key, compound_keys) do
+    compound_keys
+    |> Enum.chunk_by(&promoted_compound_path(state, redis_key, &1))
+    |> Enum.reduce_while(:ok, fn keys, :ok ->
+      result =
+        case promoted_compound_path(state, redis_key, hd(keys)) do
+          nil ->
+            do_shared_compound_batch_delete(state, redis_key, keys)
+
+          dedicated_path ->
+            do_promoted_compound_batch_delete(state, redis_key, keys, dedicated_path)
+        end
+
+      case result do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp do_shared_compound_batch_delete(state, redis_key, compound_keys) do
+    Enum.reduce_while(compound_keys, :ok, fn compound_key, :ok ->
+      case do_delete(state, compound_key) do
+        :ok ->
+          zset_index_delete(state, redis_key, compound_key)
+          {:cont, :ok}
+
+        {:error, _} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp do_promoted_compound_batch_delete(state, redis_key, compound_keys, dedicated_path) do
+    Promotion.await_compaction_latch(state, redis_key)
+
+    active = Promotion.find_active(dedicated_path)
+    ops = Enum.map(compound_keys, &{:delete, &1})
+
+    case NIF.v2_append_ops_batch_nosync(active, ops) do
+      {:ok, locations} ->
+        with :ok <- validate_promoted_tombstone_batch(locations, length(compound_keys)),
+             :ok <- NIF.v2_fsync(active) do
+          deleted =
+            Enum.reduce(compound_keys, Process.get(:tx_deleted_keys, MapSet.new()), fn
+              compound_key, acc ->
+                track_keydir_binary_remove(state, compound_key)
+                :ets.delete(state.ets, compound_key)
+                sm_tx_drop_pending(compound_key)
+                zset_index_delete(state, redis_key, compound_key)
+                MapSet.put(acc, compound_key)
+            end)
+
+          Process.put(:tx_deleted_keys, deleted)
+          :ok
+        end
+
+      {:error, _reason} = err ->
+        err
+    end
+  end
+
+  defp validate_promoted_tombstone_batch(locations, expected_count)
+       when length(locations) == expected_count do
+    if Enum.all?(locations, &valid_promoted_tombstone_location?/1) do
+      :ok
+    else
+      {:error, {:tombstone_batch_result_mismatch, expected_count, locations}}
+    end
+  end
+
+  defp validate_promoted_tombstone_batch(locations, expected_count),
+    do: {:error, {:tombstone_batch_result_mismatch, expected_count, locations}}
+
+  defp valid_promoted_tombstone_location?({:delete, offset, record_size})
+       when is_integer(offset) and offset >= 0 and is_integer(record_size) and record_size >= 0,
+       do: true
+
+  defp valid_promoted_tombstone_location?(_location), do: false
+
+  defp maybe_delete_empty_compound_type_key(_state, _redis_key, _prefix, []), do: :ok
+
+  defp maybe_delete_empty_compound_type_key(state, redis_key, prefix, _selected) do
+    if Ferricstore.Store.Shard.ETS.prefix_count_entries(shard_ets_state(state), prefix) == 0 do
+      do_compound_delete(state, redis_key, CompoundKey.type_key(redis_key))
+    else
+      :ok
+    end
   end
 
   defp do_compound_delete_prefix(state, redis_key, prefix) do

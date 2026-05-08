@@ -6,6 +6,7 @@ defmodule Ferricstore.MetricsTest do
   alias Ferricstore.Metrics
   alias Ferricstore.PrefixMetricsCache
   alias Ferricstore.QuorumMetrics
+  alias Ferricstore.StandaloneTxMetrics
 
   # ---------------------------------------------------------------------------
   # scrape/0 — Prometheus text format validity
@@ -294,6 +295,76 @@ defmodule Ferricstore.MetricsTest do
              )
     end
 
+    test "includes standalone tx-log recovery telemetry counters" do
+      StandaloneTxMetrics.reset()
+
+      on_exit(fn ->
+        StandaloneTxMetrics.reset()
+      end)
+
+      :telemetry.execute(
+        [:ferricstore, :standalone_tx_log, :prepare],
+        %{groups: 4, ops: 12},
+        %{status: :ok}
+      )
+
+      :telemetry.execute(
+        [:ferricstore, :standalone_tx_log, :commit],
+        %{count: 1},
+        %{status: :ok}
+      )
+
+      :telemetry.execute(
+        [:ferricstore, :standalone_tx_log, :recover],
+        %{pending: 2, replayed: 1, groups: 4, ops: 12},
+        %{status: :ok}
+      )
+
+      :telemetry.execute(
+        [:ferricstore, :standalone_tx_log, :recover],
+        %{pending: 0, replayed: 0, groups: 0, ops: 0},
+        %{status: :error}
+      )
+
+      :telemetry.execute(
+        [:ferricstore, :standalone_tx_log, :corrupt_entry],
+        %{count: 3},
+        %{}
+      )
+
+      text = Metrics.handle("FERRICSTORE.METRICS", [])
+
+      assert String.contains?(text, "# TYPE ferricstore_standalone_tx_recover_total counter")
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_standalone_tx_prepare_total{status="ok"} 1)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_standalone_tx_prepare_ops_total{status="ok"} 12)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_standalone_tx_commit_total{status="ok"} 1)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_standalone_tx_recover_total{status="ok"} 1)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_standalone_tx_recover_total{status="error"} 1)
+             )
+
+      assert String.contains?(text, "ferricstore_standalone_tx_recover_replayed_total")
+      assert String.contains?(text, "ferricstore_standalone_tx_corrupt_entries_skipped_total 3")
+    end
+
     test "includes per-shard checkpoint and release cursor gauges" do
       text = Metrics.handle("FERRICSTORE.METRICS", [])
 
@@ -310,6 +381,9 @@ defmodule Ferricstore.MetricsTest do
         "ferricstore_flow_lmdb_replay_safe_persist_failures_total",
         "ferricstore_flow_lmdb_mirror_enqueue_failures_total",
         "ferricstore_flow_lmdb_mirror_degraded",
+        "ferricstore_flow_lmdb_writer_pending_ops",
+        "ferricstore_flow_lmdb_writer_oldest_pending_age_us",
+        "ferricstore_flow_lmdb_writer_flush_failures_total",
         "ferricstore_bitcask_release_cursor_gap",
         "ferricstore_bitcask_pending_release_cursor_checkpoint_count",
         "ferricstore_bitcask_release_cursor_blocked_apply_count",

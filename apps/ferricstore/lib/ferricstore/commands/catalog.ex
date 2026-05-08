@@ -385,6 +385,15 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Reclaims expired running workflow leases for a worker."
     },
     %{
+      name: "flow.extend_lease",
+      arity: -5,
+      flags: ["write"],
+      first_key: 1,
+      last_key: 1,
+      step: 1,
+      summary: "Extends a running workflow lease."
+    },
+    %{
       name: "flow.complete",
       arity: -5,
       flags: ["write"],

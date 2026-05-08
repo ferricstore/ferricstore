@@ -298,20 +298,23 @@ defmodule Ferricstore.Flow.LMDBWriter do
         Enum.each(after_flush, &apply_after_flush/1)
         emit_flush(:ok, state, started_at, op_count, expanded_op_count, pending_age_us)
 
-        {
-          %{
-            state
-            | pending: [],
-              pending_after_flush: [],
-              count: 0,
-              first_pending_at: nil,
-              timer_ref: nil
-          },
-          :ok
+        state = %{
+          state
+          | pending: [],
+            pending_after_flush: [],
+            count: 0,
+            first_pending_at: nil,
+            timer_ref: nil
         }
+
+        publish_backlog(state, 0)
+
+        {state, :ok}
 
       {:error, reason, state} ->
         record_persist_failure(state.instance_ctx, state.shard_index)
+        record_flush_failure(state.instance_ctx, state.shard_index)
+        publish_backlog(state, pending_age_us)
         emit_persist({:error, reason}, state, state.requested_index, started_at)
         emit_flush({:error, reason}, state, started_at, op_count, 0, pending_age_us)
 
@@ -804,6 +807,19 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp record_persist_failure(_instance_ctx, _shard_index), do: :ok
 
+  defp record_flush_failure(%{flow_lmdb_writer_flush_failures: failures}, shard_index)
+       when is_reference(failures) do
+    if shard_index < :atomics.info(failures).size do
+      :atomics.add(failures, shard_index + 1, 1)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp record_flush_failure(_instance_ctx, _shard_index), do: :ok
+
   defp put_atomic_max(ref, shard_index, value) do
     if shard_index < :atomics.info(ref).size do
       position = shard_index + 1
@@ -818,12 +834,15 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp emit_backlog(state, now) do
+    pending_age_us = pending_age_us(state, now)
+    publish_backlog(state, pending_age_us)
+
     :telemetry.execute(
       [:ferricstore, :flow, :lmdb_writer, :backlog],
       %{
         pending_ops: state.count,
         pending_after_flush: length(state.pending_after_flush),
-        oldest_pending_age_us: pending_age_us(state, now),
+        oldest_pending_age_us: pending_age_us,
         requested_index: state.requested_index,
         durable_index: state.durable_index,
         replay_safe_lag: replay_safe_lag(state)
@@ -831,6 +850,40 @@ defmodule Ferricstore.Flow.LMDBWriter do
       writer_metadata(state)
     )
   end
+
+  defp publish_backlog(state, pending_age_us) do
+    publish_atomic(
+      state.instance_ctx,
+      :flow_lmdb_writer_pending_ops,
+      state.shard_index,
+      state.count
+    )
+
+    publish_atomic(
+      state.instance_ctx,
+      :flow_lmdb_writer_oldest_pending_age_us,
+      state.shard_index,
+      pending_age_us
+    )
+  end
+
+  defp publish_atomic(ctx, field, shard_index, value) when is_map(ctx) do
+    case Map.get(ctx, field) do
+      ref when is_reference(ref) ->
+        if shard_index < :atomics.info(ref).size do
+          :atomics.put(ref, shard_index + 1, max(value, 0))
+        end
+
+        :ok
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp publish_atomic(_ctx, _field, _shard_index, _value), do: :ok
 
   defp emit_flush(status, state, started_at, op_count, expanded_op_count, pending_age_us) do
     :telemetry.execute(

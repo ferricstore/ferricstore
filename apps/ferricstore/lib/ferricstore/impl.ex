@@ -455,6 +455,9 @@ defmodule FerricStore.Impl do
   def flow_claim_due(ctx, type, opts), do: Ferricstore.Flow.claim_due(ctx, type, opts)
   def flow_reclaim(ctx, type, opts), do: Ferricstore.Flow.reclaim(ctx, type, opts)
 
+  def flow_extend_lease(ctx, id, lease_token, opts \\ []),
+    do: Ferricstore.Flow.extend_lease(ctx, id, lease_token, opts)
+
   def flow_complete(ctx, id, lease_token, opts \\ []),
     do: Ferricstore.Flow.complete(ctx, id, lease_token, opts)
 

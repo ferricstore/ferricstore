@@ -89,14 +89,17 @@ queries, plus BEAM memory delta and LMDB replay-safe lag.
 
 Before public release, Flow uses one compact current schema:
 
-- Flow record magic: `FSF1`
+- Flow record magic: `FSF4`
 - Flow history magic: `FSH1`
 - Flow value magic: `FSV1`
 
 User payload/result/error bytes are raw refs and are not decoded by FerricStore.
 Only Flow metadata is schema-owned by FerricStore.
 
-After public release, incompatible metadata field-order or type changes must add
-a new magic version and keep old decoders until all persisted data can migrate.
-LMDB stores wrapped Flow record bytes only; schema migration belongs in
-`Ferricstore.Flow.encode_record/1` and `decode_record/1`, not in LMDB.
+Before public release, old Flow record magic may be rejected cleanly because no
+external user data depends on it yet. After public release, incompatible
+metadata field-order or type changes must add a new magic version and keep old
+decoders until all persisted data can migrate. LMDB stores wrapped Flow record
+bytes only; schema migration belongs in `Ferricstore.Flow.encode_record/1` and
+`decode_record/1`, not in LMDB. User payload/result/error bytes stay raw and
+are not part of the Flow metadata schema.

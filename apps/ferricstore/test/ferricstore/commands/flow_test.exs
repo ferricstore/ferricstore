@@ -577,6 +577,40 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches Flow extend_lease through Rust AST" do
+    id = uid("flow-command-extend-lease")
+
+    assert %{"id" => ^id} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [id, "TYPE", "extend-command", "RUN_AT", "1000"],
+               MockStore.make()
+             )
+
+    assert [%{"lease_token" => lease_token, "fencing_token" => fencing_token}] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               ["extend-command", "WORKER", "worker-a", "LEASE_MS", "50", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert %{"id" => ^id, "lease_deadline_ms" => 1520} =
+             Dispatcher.dispatch(
+               "FLOW.EXTEND_LEASE",
+               [
+                 id,
+                 lease_token,
+                 "FENCING",
+                 Integer.to_string(fencing_token),
+                 "LEASE_MS",
+                 "500",
+                 "NOW",
+                 "1020"
+               ],
+               MockStore.make()
+             )
+  end
+
   test "dispatches Flow create_many through Rust AST" do
     partition = uid("tenant")
     type = uid("flow-command-bulk")

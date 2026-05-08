@@ -91,8 +91,9 @@ defmodule Ferricstore.Metrics do
     checkpoint = checkpoint_metrics_text()
     prefix = prefix_metrics_text()
     quorum = Ferricstore.QuorumMetrics.prometheus_text()
+    standalone_tx = Ferricstore.StandaloneTxMetrics.prometheus_text()
 
-    [base, ns, checkpoint, prefix, quorum]
+    [base, ns, checkpoint, prefix, quorum, standalone_tx]
     |> Enum.reject(&(&1 == ""))
     |> Enum.join("\n")
     |> Kernel.<>("\n")
@@ -295,6 +296,21 @@ defmodule Ferricstore.Metrics do
         "ferricstore_flow_lmdb_mirror_degraded",
         "Whether Flow LMDB cold projection is degraded for this shard",
         fn shard -> atomic_metric(ctx, :flow_lmdb_mirror_degraded, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_lmdb_writer_pending_ops",
+        "Current pending Flow LMDB projection operations per shard",
+        fn shard -> atomic_metric(ctx, :flow_lmdb_writer_pending_ops, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_lmdb_writer_oldest_pending_age_us",
+        "Oldest pending Flow LMDB projection operation age in microseconds per shard",
+        fn shard -> atomic_metric(ctx, :flow_lmdb_writer_oldest_pending_age_us, shard) end
+      ),
+      checkpoint_metric_family(
+        "ferricstore_flow_lmdb_writer_flush_failures_total",
+        "Total Flow LMDB writer flush failures per shard",
+        fn shard -> atomic_metric(ctx, :flow_lmdb_writer_flush_failures, shard) end
       ),
       checkpoint_metric_family(
         "ferricstore_bitcask_release_cursor_gap",

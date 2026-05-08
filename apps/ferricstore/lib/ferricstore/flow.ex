@@ -284,6 +284,18 @@ defmodule Ferricstore.Flow do
 
   defp claim_normal_state_filter(state), do: state
 
+  def extend_lease(ctx, id, lease_token, opts \\ [])
+      when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with {:ok, attrs} <- extend_lease_attrs(id, lease_token, opts) do
+        Router.flow_extend_lease(ctx, attrs)
+      end
+
+    observe_flow(:extend_lease, started, result, %{flow_id: id})
+  end
+
   def complete(ctx, id, lease_token, opts \\ [])
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
     started = flow_start_time()
@@ -2724,6 +2736,29 @@ defmodule Ferricstore.Flow do
         }
         |> maybe_put_flow_value(opts, :payload)
         |> maybe_put_flow_value(opts, :result)
+        |> maybe_put_attr(:now_ms, now)
+
+      {:ok, attrs}
+    end
+  end
+
+  defp extend_lease_attrs(id, lease_token, opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
+         :ok <- validate_lease_token(lease_token),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
+         {:ok, now} <- optional_now_ms(opts),
+         {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms) do
+      attrs =
+        %{
+          id: id,
+          lease_token: lease_token,
+          fencing_token: fencing_token,
+          lease_ms: lease_ms,
+          partition_key: partition_key
+        }
         |> maybe_put_attr(:now_ms, now)
 
       {:ok, attrs}

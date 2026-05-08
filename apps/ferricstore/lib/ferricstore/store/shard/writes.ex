@@ -652,20 +652,56 @@ defmodule Ferricstore.Store.Shard.Writes do
   # Helpers
   # -------------------------------------------------------------------
 
+  defp tombstone_and_delete_keys(state, []), do: {:ok, state}
+
   defp tombstone_and_delete_keys(state, keys) do
-    Enum.reduce_while(keys, {:ok, state}, fn key, {:ok, acc_state} ->
-      next_state = ShardFlush.track_delete_dead_bytes(acc_state, key)
+    next_state =
+      Enum.reduce(keys, state, fn key, acc_state ->
+        ShardFlush.track_delete_dead_bytes(acc_state, key)
+      end)
 
-      case NIF.v2_append_tombstone(next_state.active_file_path, key) do
-        {:ok, _} ->
-          ShardETS.ets_delete_key(next_state, key)
-          {:cont, {:ok, next_state}}
+    case append_tombstone_batch_sync(next_state.active_file_path, keys) do
+      {:ok, _locations} ->
+        Enum.each(keys, fn key -> ShardETS.ets_delete_key(next_state, key) end)
+        {:ok, next_state}
 
-        {:error, reason} ->
-          {:halt, {{:error, reason}, next_state}}
-      end
-    end)
+      {:error, reason} ->
+        {{:error, reason}, next_state}
+    end
   end
+
+  defp append_tombstone_batch_sync(path, keys) do
+    ops = Enum.map(keys, &{:delete, &1})
+
+    case NIF.v2_append_ops_batch_nosync(path, ops) do
+      {:ok, locations} ->
+        with :ok <- validate_tombstone_locations(locations, length(keys)),
+             :ok <- NIF.v2_fsync(path) do
+          {:ok, locations}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp validate_tombstone_locations(locations, expected_count)
+       when length(locations) == expected_count do
+    if Enum.all?(locations, &valid_tombstone_location?/1) do
+      :ok
+    else
+      {:error, {:tombstone_batch_result_mismatch, expected_count, locations}}
+    end
+  end
+
+  defp validate_tombstone_locations(locations, expected_count),
+    do: {:error, {:tombstone_batch_result_mismatch, expected_count, locations}}
+
+  defp valid_tombstone_location?({:delete, offset, record_size})
+       when is_integer(offset) and offset >= 0 and is_integer(record_size) and record_size >= 0,
+       do: true
+
+  defp valid_tombstone_location?(_location), do: false
 
   @spec apply_setrange(binary(), non_neg_integer(), binary()) :: binary()
   @doc false

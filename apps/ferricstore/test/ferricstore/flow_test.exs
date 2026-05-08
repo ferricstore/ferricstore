@@ -968,6 +968,69 @@ defmodule Ferricstore.FlowTest do
     assert done_parent.child_groups["fanout-1"]["summary"]["completed"] == 2
   end
 
+  test "flow_spawn_children rejects missing wait_state when waiting for children" do
+    parent = uid("flow-parent-missing-wait")
+    child = uid("flow-child-missing-wait")
+    partition = uid("tenant")
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    assert {:error, "ERR flow wait_state is required when waiting for children"} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child, type: "child"}],
+               group_id: "fanout-1",
+               wait: :all,
+               on_child_failed: :fail_parent,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "children_done", failure: "failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    assert {:ok, nil} = FerricStore.flow_get(child, partition_key: partition)
+
+    assert {:ok, unchanged_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert unchanged_parent.state == "dispatch"
+    assert unchanged_parent.child_groups == %{}
+  end
+
+  test "flow_spawn_children rejects empty wait_state for running parent" do
+    parent = uid("flow-parent-running-empty-wait")
+    child = uid("flow-child-running-empty-wait")
+    partition = uid("tenant")
+
+    claimed_parent =
+      create_claimed_flow(parent, partition, "parent-running-empty-wait", "parent-worker")
+
+    assert {:error, "ERR flow wait_state is required when waiting for children"} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child, type: "child"}],
+               group_id: "fanout-1",
+               wait: :all,
+               wait_state: "",
+               on_child_failed: :fail_parent,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "children_done", failure: "failed"},
+               partition_key: partition,
+               lease_token: claimed_parent.lease_token,
+               fencing_token: claimed_parent.fencing_token
+             )
+
+    assert {:ok, nil} = FerricStore.flow_get(child, partition_key: partition)
+
+    assert {:ok, still_running} = FerricStore.flow_get(parent, partition_key: partition)
+    assert still_running.state == "running"
+    assert still_running.lease_token == claimed_parent.lease_token
+  end
+
   test "stale child terminal command does not double count parent child group" do
     parent = uid("flow-parent-stale-child")
     child_a = uid("flow-child-stale-a")
@@ -1466,6 +1529,59 @@ defmodule Ferricstore.FlowTest do
     assert done_parent.child_groups["fanout"]["children"][child] == "completed"
   end
 
+  test "cross-shard child completion survives Ra shard restart without duplicate parent summary" do
+    parent = uid("flow-parent-ra-replay")
+    child = uid("flow-child-ra-replay")
+    {partition, _same_partition, other_partition} = mixed_partition_keys()
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    assert {:ok, _waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child, type: "child", partition_key: other_partition}],
+               group_id: "fanout",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :ignore,
+               on_parent_closed: :abandon_children,
+               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    claimed = create_claimed_flow_child(child, other_partition, "worker-ra-replay")
+
+    assert {:ok, _completed_child} =
+             FerricStore.flow_complete(child, claimed.lease_token,
+               partition_key: other_partition,
+               fencing_token: claimed.fencing_token,
+               result: "ok"
+             )
+
+    assert {:ok, resolved_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert resolved_parent.state == "children_done"
+    assert resolved_parent.child_groups["fanout"]["summary"]["completed"] == 1
+
+    ShardHelpers.compact_wal()
+    ShardHelpers.kill_shard_for_key("f:{flow-cross-shard}:tx", timeout: 30_000)
+
+    assert {:ok, replayed_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert replayed_parent.state == "children_done"
+    assert replayed_parent.child_groups["fanout"]["children"][child] == "completed"
+    assert replayed_parent.child_groups["fanout"]["summary"]["completed"] == 1
+
+    assert {:ok, parent_history} = FerricStore.flow_history(parent, partition_key: partition)
+    parent_events = Enum.map(parent_history, fn {_event_id, fields} -> fields["event"] end)
+    assert Enum.count(parent_events, &(&1 == "child_completed")) == 1
+  end
+
   test "terminal parent cancellation cancels cross-shard children" do
     parent = uid("flow-parent-cross-cancel")
     child = uid("flow-child-cross-cancel")
@@ -1727,6 +1843,70 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, cancelled_sibling} = FerricStore.flow_get(child_a, partition_key: same_partition)
     assert cancelled_sibling.state == "cancelled"
+  end
+
+  test "flow_spawn_children wait any resolves failure when every child fails" do
+    parent = uid("flow-parent-any-all-failed")
+    child_a = uid("flow-child-any-all-failed-a")
+    child_b = uid("flow-child-any-all-failed-b")
+    {partition, same_partition, other_partition} = mixed_partition_keys()
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    assert {:ok, waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [
+                 %{id: child_a, type: "child", partition_key: same_partition},
+                 %{id: child_b, type: "child", partition_key: other_partition}
+               ],
+               group_id: "fanout",
+               wait: :any,
+               wait_state: "waiting_children",
+               on_child_failed: :ignore,
+               on_parent_closed: :abandon_children,
+               exhaust_to: %{success: "completed", failure: "children_failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    assert waiting.state == "waiting_children"
+
+    claimed_a = create_claimed_flow_child(child_a, same_partition, "worker-cross-any-fail-a")
+    claimed_b = create_claimed_flow_child(child_b, other_partition, "worker-cross-any-fail-b")
+
+    assert {:ok, failed_children} =
+             FerricStore.flow_fail_many(
+               nil,
+               [
+                 %{
+                   id: child_a,
+                   partition_key: same_partition,
+                   lease_token: claimed_a.lease_token,
+                   fencing_token: claimed_a.fencing_token
+                 },
+                 %{
+                   id: child_b,
+                   partition_key: other_partition,
+                   lease_token: claimed_b.lease_token,
+                   fencing_token: claimed_b.fencing_token
+                 }
+               ],
+               error: "all failed"
+             )
+
+    assert Enum.map(failed_children, & &1.state) == ["failed", "failed"]
+
+    assert {:ok, failed_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert failed_parent.state == "children_failed"
+    assert failed_parent.child_groups["fanout"]["resolved"] == "failure"
+    assert failed_parent.child_groups["fanout"]["summary"]["failed"] == 2
   end
 
   test "flow_fail_many fail_parent policy closes parent and cancels cross-shard siblings" do
@@ -2677,6 +2857,56 @@ defmodule Ferricstore.FlowTest do
 
     assert second.partition_key in [partition_0, partition_1]
     assert second.partition_key != first.partition_key
+  end
+
+  test "flow_claim_due any partition spreads small limits across shards under skew" do
+    type = uid("claim-any-skew")
+
+    case :ets.whereis(:ferricstore_flow_claim_due_any_cursor) do
+      :undefined -> :ok
+      table -> :ets.delete_all_objects(table)
+    end
+
+    partitions_by_shard =
+      1..512
+      |> Enum.map(&"#{type}:partition:#{&1}")
+      |> Enum.group_by(fn partition ->
+        shard_for(Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition))
+      end)
+
+    [hot_partition | _] = Map.fetch!(partitions_by_shard, 0)
+    [other_partition | _] = Map.fetch!(partitions_by_shard, 1)
+
+    for suffix <- ["hot-a", "hot-b"] do
+      assert {:ok, _} =
+               FerricStore.flow_create(uid("flow-claim-any-skew-#{suffix}"),
+                 type: type,
+                 partition_key: hot_partition,
+                 run_at_ms: 1_000
+               )
+    end
+
+    assert {:ok, _} =
+             FerricStore.flow_create(uid("flow-claim-any-skew-other"),
+               type: type,
+               partition_key: other_partition,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               partition_key: :any,
+               state: :any,
+               worker: "worker-any-skew",
+               lease_ms: 30_000,
+               limit: 2,
+               now_ms: 1_000
+             )
+
+    assert length(claimed) == 2
+
+    assert MapSet.new(Enum.map(claimed, & &1.partition_key)) ==
+             MapSet.new([hot_partition, other_partition])
   end
 
   test "flow_claim_due skips stale due index members without starving live work" do
@@ -3680,6 +3910,128 @@ defmodule Ferricstore.FlowTest do
     assert second.id == id
     assert second.lease_owner == "worker-b"
     assert second.lease_token != first.lease_token
+  end
+
+  test "flow_extend_lease extends running lease with fencing guards" do
+    type = uid("lease-extend")
+    id = uid("flow-lease-extend")
+
+    assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_000)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-a",
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, extended} =
+             FerricStore.flow_extend_lease(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               lease_ms: 500,
+               now_ms: 1_020
+             )
+
+    assert extended.state == "running"
+    assert extended.version == claimed.version + 1
+    assert extended.lease_token == claimed.lease_token
+    assert extended.fencing_token == claimed.fencing_token
+    assert extended.lease_deadline_ms == 1_520
+
+    assert {:ok, []} =
+             FerricStore.flow_reclaim(type,
+               worker: "worker-b",
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_100
+             )
+
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_extend_lease(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token + 1,
+               lease_ms: 500,
+               now_ms: 1_030
+             )
+  end
+
+  test "expired lease reclaim fences old worker and records takeover history" do
+    type = uid("lease-reclaim-fence")
+    id = uid("flow-reclaim-fence")
+
+    assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_000)
+
+    assert {:ok, [first]} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-a",
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [second]} =
+             FerricStore.flow_reclaim(type,
+               worker: "worker-b",
+               lease_ms: 500,
+               limit: 1,
+               now_ms: 1_050
+             )
+
+    assert second.id == id
+    assert second.lease_owner == "worker-b"
+    assert second.fencing_token == first.fencing_token + 1
+    assert second.lease_token != first.lease_token
+
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_complete(id, first.lease_token,
+               fencing_token: first.fencing_token,
+               now_ms: 1_060
+             )
+
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_extend_lease(id, first.lease_token,
+               fencing_token: first.fencing_token,
+               lease_ms: 500,
+               now_ms: 1_060
+             )
+
+    assert {:ok, history} = FerricStore.flow_history(id, count: 10)
+
+    assert history
+           |> Enum.map(fn {_event_id, fields} -> fields["event"] end)
+           |> Enum.frequencies() == %{"created" => 1, "claimed" => 2}
+
+    assert Enum.any?(history, fn {_event_id, fields} ->
+             fields["event"] == "claimed" and fields["lease_owner"] == "worker-b"
+           end)
+  end
+
+  test "flow_extend_lease rejects terminal flow" do
+    type = uid("lease-extend-terminal")
+    id = uid("flow-lease-extend-terminal")
+
+    assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_000)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-a",
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, _completed} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 1_010
+             )
+
+    assert {:error, "ERR stale flow lease"} =
+             FerricStore.flow_extend_lease(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               lease_ms: 500,
+               now_ms: 1_020
+             )
   end
 
   test "flow_claim_due automatically reclaims expired leases by ratio" do

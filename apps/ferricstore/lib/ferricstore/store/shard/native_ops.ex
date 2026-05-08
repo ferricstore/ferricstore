@@ -676,21 +676,22 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         end
       end,
       compound_batch_delete: fn _redis_key, compound_keys ->
-        Enum.reduce_while(compound_keys, :ok, fn compound_key, :ok ->
-          case NIF.v2_append_tombstone(state.active_file_path, compound_key) do
-            {:ok, _} ->
+        case append_tombstone_batch_sync(state.active_file_path, compound_keys) do
+          {:ok, _locations} ->
+            Enum.each(compound_keys, fn compound_key ->
               record_direct_dead_bytes(state, compound_key)
               ShardETS.ets_delete_key(state, compound_key)
-              {:cont, :ok}
+            end)
 
-            {:error, reason} ->
-              Logger.error(
-                "Shard #{state.index}: tombstone write failed for list compound_batch_delete: #{inspect(reason)}"
-              )
+            :ok
 
-              {:halt, {:error, reason}}
-          end
-        end)
+          {:error, reason} ->
+            Logger.error(
+              "Shard #{state.index}: tombstone write failed for list compound_batch_delete: #{inspect(reason)}"
+            )
+
+            {:error, reason}
+        end
       end,
       compound_scan: fn _redis_key, prefix ->
         results = ShardETS.prefix_scan_entries(state, prefix, state.shard_data_path)
@@ -710,6 +711,41 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   end
 
   defp normalize_batch_write_result(other), do: {:error, other}
+
+  defp append_tombstone_batch_sync(_path, []), do: {:ok, []}
+
+  defp append_tombstone_batch_sync(path, compound_keys) do
+    ops = Enum.map(compound_keys, &{:delete, &1})
+
+    case NIF.v2_append_ops_batch_nosync(path, ops) do
+      {:ok, locations} ->
+        with :ok <- validate_tombstone_locations(locations, length(compound_keys)),
+             :ok <- NIF.v2_fsync(path) do
+          {:ok, locations}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp validate_tombstone_locations(locations, expected_count)
+       when length(locations) == expected_count do
+    if Enum.all?(locations, &valid_tombstone_location?/1) do
+      :ok
+    else
+      {:error, {:tombstone_batch_result_mismatch, expected_count, locations}}
+    end
+  end
+
+  defp validate_tombstone_locations(locations, expected_count),
+    do: {:error, {:tombstone_batch_result_mismatch, expected_count, locations}}
+
+  defp valid_tombstone_location?({:delete, offset, record_size})
+       when is_integer(offset) and offset >= 0 and is_integer(record_size) and record_size >= 0,
+       do: true
+
+  defp valid_tombstone_location?(_location), do: false
 
   # -------------------------------------------------------------------
   # Helpers

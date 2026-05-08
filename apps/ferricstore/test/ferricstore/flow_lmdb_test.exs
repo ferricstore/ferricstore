@@ -456,6 +456,17 @@ defmodule Ferricstore.Flow.LMDBTest do
     instance_name = :"flow_lmdb_writer_telemetry_#{System.unique_integer([:positive])}"
     shard_index = 0
     key = "flow:{flow:telemetry}:state:a"
+    pending_ops = :atomics.new(1, signed: false)
+    oldest_pending_age_us = :atomics.new(1, signed: false)
+    flush_failures = :atomics.new(1, signed: false)
+
+    instance_ctx = %{
+      name: instance_name,
+      flow_lmdb_writer_pending_ops: pending_ops,
+      flow_lmdb_writer_oldest_pending_age_us: oldest_pending_age_us,
+      flow_lmdb_writer_flush_failures: flush_failures
+    }
+
     test_pid = self()
     handler_id = {:flow_lmdb_writer_telemetry, self(), make_ref()}
 
@@ -483,7 +494,7 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     start_supervised!(
       {Ferricstore.Flow.LMDBWriter,
-       shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+       shard_index: shard_index, data_dir: data_dir, instance_ctx: instance_ctx}
     )
 
     assert :ok =
@@ -501,6 +512,8 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert backlog.replay_safe_lag == 0
     assert backlog_meta.shard_index == shard_index
     assert backlog_meta.instance_name == instance_name
+    assert :atomics.get(pending_ops, 1) == 2
+    assert :atomics.get(oldest_pending_age_us, 1) >= 0
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
 
@@ -515,6 +528,9 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert flush_meta.status == :ok
     assert flush_meta.shard_index == shard_index
     assert flush_meta.instance_name == instance_name
+    assert :atomics.get(pending_ops, 1) == 0
+    assert :atomics.get(oldest_pending_age_us, 1) == 0
+    assert :atomics.get(flush_failures, 1) == 0
   end
 
   test "mirror writer enqueue and flush failures are visible" do
@@ -1840,6 +1856,9 @@ defmodule Ferricstore.Flow.LMDBTest do
     )
 
     assert {:ok, []} = Ferricstore.Flow.by_parent(ctx, parent, partition_key: partition_key)
+
+    assert {:ok, %{id: ^id, state: "completed"}} =
+             Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
 
     assert {:ok, [%{id: ^id}]} =
              Ferricstore.Flow.by_correlation(ctx, correlation,

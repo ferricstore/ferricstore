@@ -20,6 +20,7 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
 
   test "state-machine command stores expose compound batch writes" do
     source = File.read!(@state_machine_path)
+    cross_shard_store = function_body(source, "build_cross_shard_store")
 
     # List push/pop and similar data-primitive mutations can touch many
     # compound keys. During Raft apply those writes already share one pending
@@ -30,6 +31,12 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
 
     assert source =~ "compound_batch_delete:",
            "state-machine command store must provide compound_batch_delete"
+
+    assert cross_shard_store =~ "compound_batch_put:",
+           "cross-shard state-machine store must provide compound_batch_put"
+
+    assert cross_shard_store =~ "compound_batch_delete:",
+           "cross-shard state-machine store must provide compound_batch_delete"
   end
 
   test "state-machine command stores expose plain batch reads" do
@@ -54,6 +61,33 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
     # one waiter per cold member. Keep the promoted-aware batched reader.
     assert body =~ "ColdRead.pread_batch_keyed",
            "state-machine compound batch metadata reads must use the keyed batched cold reader"
+  end
+
+  test "state-machine pop commands batch compound deletes inside Raft apply" do
+    source = File.read!(@state_machine_path)
+
+    # SPOP/ZPOP bypass the public command store and run as deterministic
+    # single-key Raft commands. Keep their member removals on the same batching
+    # path so promoted sets/zsets do not append one tombstone per popped member.
+    assert source =~ "defp do_compound_batch_delete"
+    assert source =~ "do_compound_batch_delete(state, redis_key, selected_delete_keys)"
+
+    refute source =~
+             "Enum.each(selected, fn member ->\n        do_compound_delete(state, redis_key, CompoundKey.set_member(redis_key, member))"
+
+    refute source =~
+             "do_compound_delete(state, redis_key, CompoundKey.zset_member(redis_key, member))"
+  end
+
+  test "state-machine promoted compound batch tombstones keep sync durability" do
+    source = File.read!(@state_machine_path)
+    body = function_body(source, "do_promoted_compound_batch_delete")
+
+    # The old single promoted tombstone path used v2_append_tombstone/2, which
+    # fsyncs. The batched replacement must keep that ack boundary because
+    # promoted files bypass the shared pending-write checkpointer.
+    assert body =~ "NIF.v2_append_ops_batch_nosync(active, ops)"
+    assert body =~ "NIF.v2_fsync(active)"
   end
 
   defp function_body(source, function) do

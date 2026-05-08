@@ -844,50 +844,105 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   end
 
   defp expire_keys(state, expired_keys) do
-    Enum.reduce(expired_keys, state, fn key, acc_state ->
-      expire_key(acc_state, key)
-    end)
+    {shared_keys, promoted_keys} =
+      Enum.split_with(expired_keys, fn key -> promoted_expiry_target(state, key) == nil end)
+
+    state
+    |> expire_shared_keys(shared_keys)
+    |> expire_promoted_keys(promoted_keys)
   end
 
-  defp expire_key(state, key) do
-    case promoted_expiry_target(state, key) do
-      {redis_key, dedicated_path} ->
-        tracked_state = ShardCompound.track_promoted_delete_bytes(state, redis_key, key)
+  defp expire_shared_keys(state, []), do: state
 
-        case ShardCompound.promoted_tombstone(dedicated_path, key) do
-          {:ok, _} ->
-            ShardETS.ets_delete_key(tracked_state, key)
-            ShardCompound.bump_promoted_writes(tracked_state, redis_key)
+  defp expire_shared_keys(state, keys) do
+    tracked_state =
+      Enum.reduce(keys, state, fn key, acc_state ->
+        ShardFlush.track_delete_dead_bytes(acc_state, key)
+      end)
 
-          {:error, reason} ->
-            Logger.warning(
-              "Shard #{state.index}: promoted tombstone write failed during expiry sweep for #{inspect(key)}: #{inspect(reason)}"
-            )
-
-            state
-        end
-
-      nil ->
-        expire_shared_key(state, key)
-    end
-  end
-
-  defp expire_shared_key(state, key) do
-    tracked_state = ShardFlush.track_delete_dead_bytes(state, key)
-
-    case NIF.v2_append_tombstone(state.active_file_path, key) do
-      {:ok, _} ->
-        ShardETS.ets_delete_key(tracked_state, key)
+    case append_tombstone_batch_sync(state.active_file_path, keys) do
+      {:ok, _locations} ->
+        Enum.each(keys, fn key -> ShardETS.ets_delete_key(tracked_state, key) end)
         tracked_state
 
       {:error, reason} ->
         Logger.warning(
-          "Shard #{state.index}: tombstone write failed during expiry sweep for #{inspect(key)}: #{inspect(reason)}"
+          "Shard #{state.index}: tombstone batch failed during expiry sweep for #{length(keys)} keys: #{inspect(reason)}"
         )
 
         state
     end
   end
+
+  defp expire_promoted_keys(state, []), do: state
+
+  defp expire_promoted_keys(state, promoted_keys) do
+    promoted_keys
+    |> Enum.group_by(&promoted_expiry_target(state, &1))
+    |> Enum.reduce(state, fn
+      {{redis_key, dedicated_path}, keys}, acc_state ->
+        expire_promoted_key_group(acc_state, redis_key, dedicated_path, keys)
+
+      {nil, keys}, acc_state ->
+        expire_shared_keys(acc_state, keys)
+    end)
+  end
+
+  defp expire_promoted_key_group(state, redis_key, dedicated_path, keys) do
+    tracked_state =
+      Enum.reduce(keys, state, fn key, acc_state ->
+        ShardCompound.track_promoted_delete_bytes(acc_state, redis_key, key)
+      end)
+
+    case ShardCompound.promoted_tombstone_batch(dedicated_path, keys) do
+      {:ok, _locations} ->
+        Enum.each(keys, fn key -> ShardETS.ets_delete_key(tracked_state, key) end)
+
+        Enum.reduce(keys, tracked_state, fn _key, acc_state ->
+          ShardCompound.bump_promoted_writes(acc_state, redis_key)
+        end)
+
+      {:error, reason} ->
+        Logger.warning(
+          "Shard #{state.index}: promoted tombstone batch failed during expiry sweep for #{length(keys)} keys: #{inspect(reason)}"
+        )
+
+        state
+    end
+  end
+
+  defp append_tombstone_batch_sync(path, keys) do
+    ops = Enum.map(keys, &{:delete, &1})
+
+    case NIF.v2_append_ops_batch_nosync(path, ops) do
+      {:ok, locations} ->
+        with :ok <- validate_tombstone_locations(locations, length(keys)),
+             :ok <- NIF.v2_fsync(path) do
+          {:ok, locations}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp validate_tombstone_locations(locations, expected_count)
+       when length(locations) == expected_count do
+    if Enum.all?(locations, &valid_tombstone_location?/1) do
+      :ok
+    else
+      {:error, {:tombstone_batch_result_mismatch, expected_count, locations}}
+    end
+  end
+
+  defp validate_tombstone_locations(locations, expected_count),
+    do: {:error, {:tombstone_batch_result_mismatch, expected_count, locations}}
+
+  defp valid_tombstone_location?({:delete, offset, record_size})
+       when is_integer(offset) and offset >= 0 and is_integer(record_size) and record_size >= 0,
+       do: true
+
+  defp valid_tombstone_location?(_location), do: false
 
   defp promoted_expiry_target(%{promoted_instances: promoted}, key) when is_binary(key) do
     if promoted_member_key?(key) do

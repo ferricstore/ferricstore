@@ -3263,6 +3263,32 @@ mod tests {
         assert_eq!(records[1].key, b"second");
     }
 
+    #[test]
+    fn concurrent_open_small_writers_return_distinct_offsets() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+
+        let mut w1 = LogWriter::open_small(&path, 1).unwrap();
+        let mut w2 = LogWriter::open_small(&path, 1).unwrap();
+
+        let off1 = w1.write(b"first", b"v1", 0).unwrap();
+        w1.sync().unwrap();
+
+        let off2 = w2.write(b"second", b"v2", 0).unwrap();
+        w2.sync().unwrap();
+
+        assert_ne!(
+            off1, off2,
+            "concurrently opened append handles must not publish duplicate offsets"
+        );
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let first = reader.read_at(off1).unwrap().unwrap();
+        let second = reader.read_at(off2).unwrap().unwrap();
+        assert_eq!(first.key, b"first");
+        assert_eq!(second.key, b"second");
+    }
+
     // ------------------------------------------------------------------
     // CRC validation through file-level write + corrupt + read_at
     // ------------------------------------------------------------------

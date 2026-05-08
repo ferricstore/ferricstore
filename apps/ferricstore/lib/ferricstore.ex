@@ -501,6 +501,24 @@ defmodule FerricStore do
 
   def flow_reclaim(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc "Extends a running Flow lease when `lease_token` and `fencing_token` match."
+  @spec flow_extend_lease(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_extend_lease(id, lease_token, opts \\ [])
+
+  def flow_extend_lease(id, lease_token, opts)
+      when is_binary(id) and is_binary(lease_token) and is_list(opts) do
+    Ferricstore.Flow.extend_lease(default_ctx(), id, lease_token, opts)
+  end
+
+  def flow_extend_lease(id, _lease_token, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_extend_lease(_id, lease_token, _opts) when not is_binary(lease_token),
+    do: {:error, "ERR flow lease_token must be a string"}
+
+  def flow_extend_lease(_id, _lease_token, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Completes a claimed Flow record when `lease_token` matches."
   @spec flow_complete(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_complete(id, lease_token, opts \\ [])

@@ -1567,6 +1567,7 @@ enum CommandAstKind {
     FlowPolicyGet,
     FlowClaimDue,
     FlowReclaim,
+    FlowExtendLease,
     FlowComplete,
     FlowCompleteMany,
     FlowTransition,
@@ -1814,6 +1815,7 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"FLOW.POLICY.GET" => CommandAstKind::FlowPolicyGet,
         b"FLOW.CLAIM_DUE" => CommandAstKind::FlowClaimDue,
         b"FLOW.RECLAIM" => CommandAstKind::FlowReclaim,
+        b"FLOW.EXTEND_LEASE" => CommandAstKind::FlowExtendLease,
         b"FLOW.COMPLETE" => CommandAstKind::FlowComplete,
         b"FLOW.COMPLETE_MANY" => CommandAstKind::FlowCompleteMany,
         b"FLOW.TRANSITION" => CommandAstKind::FlowTransition,
@@ -2260,6 +2262,9 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowPolicyGet => make_flow_policy_get_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowClaimDue => make_flow_claim_due_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowReclaim => make_flow_reclaim_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowExtendLease => {
+            make_flow_extend_lease_command_ast(env, args, arg_bytes)
+        }
         CommandAstKind::FlowComplete => make_flow_complete_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCompleteMany => {
             make_flow_complete_many_command_ast(env, args, arg_bytes)
@@ -5344,6 +5349,22 @@ fn make_flow_reclaim_command_ast<'a>(
     }
 }
 
+fn make_flow_extend_lease_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_extend_lease");
+    if args.len() < 4 {
+        return (tag, wrong_number_error(env, b"flow.extend_lease")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 2, flow_extend_lease_option) {
+        Ok(opts) => (tag, args[0], args[1], opts).encode(env),
+        Err(err) => (tag, args[0], args[1], err).encode(env),
+    }
+}
+
 fn make_flow_complete_command_ast<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -6578,6 +6599,26 @@ fn flow_terminal_option<'a>(
             (b"RESULT", "result", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
             (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+        ],
+    )
+}
+
+fn flow_extend_lease_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"FENCING", "fencing_token", FlowOptType::NonNegative),
+            (b"LEASE_MS", "lease_ms", FlowOptType::Positive(b"lease_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -9212,6 +9253,10 @@ mod tests {
         assert_eq!(
             classify_command_ast(b"FLOW.RECLAIM", 0),
             CommandAstKind::FlowReclaim
+        );
+        assert_eq!(
+            classify_command_ast(b"FLOW.EXTEND_LEASE", 0),
+            CommandAstKind::FlowExtendLease
         );
         assert_eq!(
             classify_command_ast(b"FLOW.BY_PARENT", 0),

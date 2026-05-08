@@ -893,14 +893,88 @@ defmodule Ferricstore.Store.Shard.Compound do
   end
 
   defp handle_compound_batch_put_direct(redis_key, entries, state) do
-    Enum.reduce_while(entries, {:reply, :ok, state}, fn {compound_key, value, expire_at_ms},
-                                                        {:reply, :ok, acc_state} ->
-      case handle_compound_put_direct(redis_key, compound_key, value, expire_at_ms, acc_state) do
+    entries
+    |> Enum.chunk_by(fn {compound_key, _value, _expire_at_ms} ->
+      compound_io_target(state, redis_key, compound_key)
+    end)
+    |> Enum.reduce_while({:reply, :ok, state}, fn group, {:reply, :ok, acc_state} ->
+      {compound_key, _value, _expire_at_ms} = hd(group)
+      target = compound_io_target(acc_state, redis_key, compound_key)
+
+      case put_compound_key_group_direct(redis_key, group, target, acc_state) do
         {:reply, :ok, new_state} -> {:cont, {:reply, :ok, new_state}}
         {:reply, {:error, _} = err, new_state} -> {:halt, {:reply, err, new_state}}
         {:reply, other, new_state} -> {:halt, {:reply, other, new_state}}
       end
     end)
+  end
+
+  defp put_compound_key_group_direct(redis_key, entries, :shared, state) do
+    Enum.each(entries, fn {compound_key, value, expire_at_ms} ->
+      true = ShardETS.ets_insert(state, compound_key, value, expire_at_ms)
+    end)
+
+    new_pending =
+      Enum.reduce(entries, state.pending, fn {compound_key, value, expire_at_ms}, pending ->
+        [{compound_key, value, expire_at_ms} | pending]
+      end)
+
+    new_state = %{
+      state
+      | pending: new_pending,
+        write_version: state.write_version + length(entries)
+    }
+
+    new_state =
+      if state.flush_in_flight == nil,
+        do: ShardFlush.flush_pending(new_state),
+        else: new_state
+
+    {last_compound_key, _value, _expire_at_ms} = List.last(entries)
+
+    new_state =
+      new_state
+      |> maybe_promote(redis_key, last_compound_key)
+      |> ZSetIndex.apply_puts(redis_key, entries)
+
+    {:reply, :ok, new_state}
+  end
+
+  defp put_compound_key_group_direct(
+         redis_key,
+         entries,
+         {:promoted, dedicated_path},
+         state
+       ) do
+    case promoted_write_batch(dedicated_path, entries) do
+      {:ok, locations} ->
+        new_state =
+          entries
+          |> Enum.zip(locations)
+          |> Enum.reduce(state, fn
+            {{compound_key, value, expire_at_ms}, {fid, offset, value_size, record_size}}, acc ->
+              acc = track_promoted_dead_bytes(acc, redis_key, compound_key, record_size)
+
+              ShardETS.ets_insert_with_location(
+                acc,
+                compound_key,
+                value,
+                expire_at_ms,
+                fid,
+                offset,
+                value_size
+              )
+
+              bump_promoted_writes(acc, redis_key)
+          end)
+          |> ZSetIndex.apply_puts(redis_key, entries)
+
+        {:reply, :ok, new_state}
+
+      {:error, reason} ->
+        Logger.error("Shard #{state.index}: promoted batch write failed: #{inspect(reason)}")
+        {:reply, {:error, reason}, state}
+    end
   end
 
   defp handle_compound_delete_raft(redis_key, compound_key, state) do
@@ -1023,14 +1097,93 @@ defmodule Ferricstore.Store.Shard.Compound do
   end
 
   defp handle_compound_batch_delete_direct(redis_key, compound_keys, state) do
-    Enum.reduce_while(compound_keys, {:reply, :ok, state}, fn compound_key,
-                                                              {:reply, :ok, acc_state} ->
-      case handle_compound_delete_direct(redis_key, compound_key, acc_state) do
+    compound_keys
+    |> Enum.chunk_by(&compound_delete_target(state, redis_key, &1))
+    |> Enum.reduce_while({:reply, :ok, state}, fn keys, {:reply, :ok, acc_state} ->
+      target = compound_delete_target(acc_state, redis_key, hd(keys))
+
+      case delete_compound_key_group_direct(redis_key, keys, target, acc_state) do
         {:reply, :ok, new_state} -> {:cont, {:reply, :ok, new_state}}
         {:reply, {:error, _} = err, new_state} -> {:halt, {:reply, err, new_state}}
         {:reply, other, new_state} -> {:halt, {:reply, other, new_state}}
       end
     end)
+  end
+
+  defp compound_delete_target(state, redis_key, compound_key) do
+    compound_io_target(state, redis_key, compound_key)
+  end
+
+  defp compound_io_target(state, redis_key, compound_key) do
+    case promoted_store_for_compound(state, redis_key, compound_key) do
+      nil -> :shared
+      dedicated_path -> {:promoted, dedicated_path}
+    end
+  end
+
+  defp delete_compound_key_group_direct(redis_key, compound_keys, :shared, state) do
+    state = ShardFlush.await_in_flight(state)
+    state = ShardFlush.flush_pending_sync(state)
+
+    case tombstone_and_delete_keys(state, compound_keys) do
+      {:ok, new_state} ->
+        compound_key_set = MapSet.new(compound_keys)
+
+        new_pending =
+          case new_state.pending do
+            [] ->
+              []
+
+            pending ->
+              Enum.reject(pending, fn {k, _, _} -> MapSet.member?(compound_key_set, k) end)
+          end
+
+        new_state =
+          compound_keys
+          |> Enum.reduce(%{new_state | pending: new_pending}, fn compound_key, acc ->
+            ZSetIndex.apply_delete(acc, redis_key, compound_key)
+          end)
+          |> Map.update!(:write_version, &(&1 + length(compound_keys)))
+
+        {:reply, :ok, new_state}
+
+      {{:error, reason}, new_state} ->
+        Logger.error("Shard #{state.index}: compound batch tombstone failed: #{inspect(reason)}")
+
+        {:reply, {:error, reason}, new_state}
+    end
+  end
+
+  defp delete_compound_key_group_direct(
+         redis_key,
+         compound_keys,
+         {:promoted, dedicated_path},
+         state
+       ) do
+    state =
+      Enum.reduce(compound_keys, state, fn compound_key, acc ->
+        track_promoted_delete_bytes(acc, redis_key, compound_key)
+      end)
+
+    case promoted_tombstone_batch(dedicated_path, compound_keys) do
+      {:ok, _locations} ->
+        Enum.each(compound_keys, fn compound_key ->
+          ShardETS.ets_delete_key(state, compound_key)
+        end)
+
+        new_state =
+          Enum.reduce(compound_keys, state, fn compound_key, acc ->
+            acc
+            |> bump_promoted_writes(redis_key)
+            |> ZSetIndex.apply_delete(redis_key, compound_key)
+          end)
+
+        {:reply, :ok, new_state}
+
+      {:error, reason} ->
+        Logger.error("Shard #{state.index}: promoted tombstone batch failed: #{inspect(reason)}")
+        {:reply, {:error, reason}, state}
+    end
   end
 
   defp handle_compound_delete_prefix_raft(redis_key, prefix, state) do
@@ -1135,19 +1288,22 @@ defmodule Ferricstore.Store.Shard.Compound do
   defp shared_log_compound_key?(<<"PM:", _rest::binary>>), do: true
   defp shared_log_compound_key?(_key), do: false
 
+  defp tombstone_and_delete_keys(state, []), do: {:ok, state}
+
   defp tombstone_and_delete_keys(state, keys) do
-    Enum.reduce_while(keys, {:ok, state}, fn key, {:ok, acc_state} ->
-      next_state = ShardFlush.track_delete_dead_bytes(acc_state, key)
+    next_state =
+      Enum.reduce(keys, state, fn key, acc_state ->
+        ShardFlush.track_delete_dead_bytes(acc_state, key)
+      end)
 
-      case NIF.v2_append_tombstone(next_state.active_file_path, key) do
-        {:ok, _} ->
-          ShardETS.ets_delete_key(next_state, key)
-          {:cont, {:ok, next_state}}
+    case append_tombstone_batch_sync(next_state.active_file_path, keys) do
+      {:ok, _locations} ->
+        Enum.each(keys, fn key -> ShardETS.ets_delete_key(next_state, key) end)
+        {:ok, next_state}
 
-        {:error, reason} ->
-          {:halt, {{:error, reason}, next_state}}
-      end
-    end)
+      {:error, reason} ->
+        {{:error, reason}, next_state}
+    end
   end
 
   @spec promoted_read(binary(), binary(), map()) ::
@@ -1197,12 +1353,79 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  defp promoted_write_batch(_dedicated_path, []), do: {:ok, []}
+
+  defp promoted_write_batch(dedicated_path, entries) do
+    active = Promotion.find_active(dedicated_path)
+    fid = parse_fid_from_path(active)
+
+    case NIF.v2_append_batch(active, entries) do
+      {:ok, locations} when length(locations) == length(entries) ->
+        results =
+          entries
+          |> Enum.zip(locations)
+          |> Enum.map(fn {{compound_key, value, _expire_at_ms}, {offset, value_size}} ->
+            {fid, offset, value_size, promoted_record_size(compound_key, value)}
+          end)
+
+        {:ok, results}
+
+      {:ok, locations} ->
+        {:error, {:batch_result_mismatch, length(entries), locations}}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
   @spec promoted_tombstone(binary(), binary()) :: {:ok, non_neg_integer()} | {:error, term()}
   @doc false
   def promoted_tombstone(dedicated_path, compound_key) do
     active = Promotion.find_active(dedicated_path)
     NIF.v2_append_tombstone(active, compound_key)
   end
+
+  @spec promoted_tombstone_batch(binary(), [binary()]) :: {:ok, list()} | {:error, term()}
+  @doc false
+  def promoted_tombstone_batch(_dedicated_path, []), do: {:ok, []}
+
+  def promoted_tombstone_batch(dedicated_path, compound_keys) do
+    active = Promotion.find_active(dedicated_path)
+    append_tombstone_batch_sync(active, compound_keys)
+  end
+
+  defp append_tombstone_batch_sync(path, keys) do
+    ops = Enum.map(keys, &{:delete, &1})
+
+    case NIF.v2_append_ops_batch_nosync(path, ops) do
+      {:ok, locations} ->
+        with :ok <- validate_tombstone_locations(locations, length(keys)),
+             :ok <- NIF.v2_fsync(path) do
+          {:ok, locations}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp validate_tombstone_locations(locations, expected_count)
+       when length(locations) == expected_count do
+    if Enum.all?(locations, &valid_tombstone_location?/1) do
+      :ok
+    else
+      {:error, {:tombstone_batch_result_mismatch, expected_count, locations}}
+    end
+  end
+
+  defp validate_tombstone_locations(locations, expected_count),
+    do: {:error, {:tombstone_batch_result_mismatch, expected_count, locations}}
+
+  defp valid_tombstone_location?({:delete, offset, record_size})
+       when is_integer(offset) and offset >= 0 and is_integer(record_size) and record_size >= 0,
+       do: true
+
+  defp valid_tombstone_location?(_location), do: false
 
   @spec parse_fid_from_path(binary()) :: non_neg_integer()
   @doc false

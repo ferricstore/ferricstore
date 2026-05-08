@@ -11,13 +11,16 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   @spec prepare(binary(), [group()]) :: {:ok, binary()} | {:error, term()}
   def prepare(data_dir, groups) when is_binary(data_dir) and is_list(groups) do
     txid = new_txid()
+    stats = group_stats(groups)
 
     case append_entry(data_dir, {@magic, :prepare, txid, groups}) do
       :ok ->
+        observe(:prepare, stats, %{status: :ok})
         forget_recover_once(data_dir)
         {:ok, txid}
 
       {:error, _reason} = error ->
+        observe(:prepare, stats, %{status: :error})
         error
     end
   end
@@ -26,10 +29,12 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   def commit(data_dir, txid) when is_binary(data_dir) and is_binary(txid) do
     case append_entry(data_dir, {@magic, :commit, txid}) do
       :ok ->
+        observe(:commit, %{count: 1}, %{status: :ok})
         _ = compact_committed(data_dir)
         :ok
 
       {:error, _reason} = error ->
+        observe(:commit, %{count: 1}, %{status: :error})
         error
     end
   end
@@ -56,10 +61,25 @@ defmodule Ferricstore.Store.StandaloneTxLog do
 
   @spec recover(binary()) :: :ok | {:error, term()}
   def recover(data_dir) when is_binary(data_dir) do
-    with {:ok, entries} <- read_entries(data_dir),
-         :ok <- recover_entries(data_dir, entries) do
-      _ = compact_committed(data_dir)
-      :ok
+    result =
+      with {:ok, entries} <- read_entries(data_dir),
+           {:ok, stats} <- recover_entries(data_dir, entries) do
+        _ = compact_committed(data_dir)
+        {:ok, stats}
+      end
+
+    case result do
+      {:ok, stats} ->
+        observe(:recover, stats, %{status: :ok})
+        :ok
+
+      {:error, reason} = error ->
+        observe(:recover, %{pending: 0, replayed: 0, groups: 0, ops: 0}, %{
+          status: :error,
+          reason: inspect(reason)
+        })
+
+        error
     end
   end
 
@@ -88,14 +108,31 @@ defmodule Ferricstore.Store.StandaloneTxLog do
           acc
       end)
 
-    prepares
-    |> Enum.reject(fn {txid, _groups} -> MapSet.member?(commits, txid) end)
-    |> Enum.reduce_while(:ok, fn {txid, groups}, :ok ->
+    pending =
+      prepares
+      |> Enum.reject(fn {txid, _groups} -> MapSet.member?(commits, txid) end)
+
+    initial_stats = %{pending: length(pending), replayed: 0, groups: 0, ops: 0}
+
+    pending
+    |> Enum.reduce_while({:ok, initial_stats}, fn {txid, groups}, {:ok, stats} ->
+      group_stats = group_stats(groups)
+
       case apply_groups(groups) do
         :ok ->
           case commit(data_dir, txid) do
-            :ok -> {:cont, :ok}
-            {:error, reason} -> {:halt, {:error, {:commit_after_recover_failed, txid, reason}}}
+            :ok ->
+              next_stats = %{
+                stats
+                | replayed: stats.replayed + 1,
+                  groups: stats.groups + group_stats.groups,
+                  ops: stats.ops + group_stats.ops
+              }
+
+              {:cont, {:ok, next_stats}}
+
+            {:error, reason} ->
+              {:halt, {:error, {:commit_after_recover_failed, txid, reason}}}
           end
 
         {:error, reason} ->
@@ -222,12 +259,21 @@ defmodule Ferricstore.Store.StandaloneTxLog do
 
     case File.read(path) do
       {:ok, data} ->
-        entries =
+        {entries, skipped} =
           data
           |> String.split("\n", trim: true)
-          |> Enum.flat_map(&decode_line/1)
+          |> Enum.reduce({[], 0}, fn line, {entries, skipped} ->
+            case decode_line(line) do
+              {:ok, entry} -> {[entry | entries], skipped}
+              :error -> {entries, skipped + 1}
+            end
+          end)
 
-        {:ok, entries}
+        if skipped > 0 do
+          observe(:corrupt_entry, %{count: skipped}, %{data_dir_hash: :erlang.phash2(data_dir)})
+        end
+
+        {:ok, Enum.reverse(entries)}
 
       {:error, :enoent} ->
         {:ok, []}
@@ -243,12 +289,12 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     with {:ok, binary} <- Base.decode64(line),
          term <- :erlang.binary_to_term(binary, [:safe]),
          true <- valid_entry?(term) do
-      [term]
+      {:ok, term}
     else
-      _ -> []
+      _ -> :error
     end
   rescue
-    _ -> []
+    _ -> :error
   end
 
   defp valid_entry?({@magic, :prepare, txid, groups}) when is_binary(txid) and is_list(groups),
@@ -258,6 +304,21 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   defp valid_entry?(_other), do: false
 
   defp path(data_dir), do: Path.join(data_dir, @file_name)
+
+  defp group_stats(groups) do
+    %{
+      groups: length(groups),
+      ops:
+        Enum.reduce(groups, 0, fn
+          {_file_path, batch}, acc when is_list(batch) -> acc + length(batch)
+          _other, acc -> acc
+        end)
+    }
+  end
+
+  defp observe(event, measurements, metadata) do
+    :telemetry.execute([:ferricstore, :standalone_tx_log, event], measurements, metadata)
+  end
 
   defp fsync_dir(path) do
     case Application.get_env(:ferricstore, :standalone_tx_log_fsync_dir_hook) do

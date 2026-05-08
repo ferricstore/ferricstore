@@ -1612,7 +1612,8 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp standalone_entry_conflicts?({_from, _command, keys}, inflight_keys) do
-    standalone_global_keys?(keys) or standalone_global_keys?(inflight_keys) or
+    (standalone_global_keys?(keys) and MapSet.size(inflight_keys) > 0) or
+      standalone_global_keys?(inflight_keys) or
       not MapSet.disjoint?(keys, inflight_keys)
   end
 

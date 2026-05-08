@@ -1851,6 +1851,61 @@ defmodule Ferricstore.Raft.StateMachineTest do
                :ets.lookup(ets, "cross_durable")
     end
 
+    test "cross-shard transaction rolls back staged writes when a later entry errors", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path,
+      shard_index: shard_index,
+      writer_pid: writer_pid
+    } do
+      GenServer.stop(writer_pid, :normal, 5_000)
+
+      {_new_state, {:error, "ERR invalid flow cross-shard terminal op"}} =
+        StateMachine.apply(
+          %{system_time: Ferricstore.HLC.now_ms()},
+          {:cross_shard_tx,
+           [
+             {shard_index,
+              [
+                {"SET", ["cross_error_rollback", "must-not-persist"]},
+                {:flow_cross_terminal, :bogus, %{}}
+              ], nil}
+           ]},
+          state
+        )
+
+      assert [] = :ets.lookup(ets, "cross_error_rollback")
+      assert {:ok, []} = NIF.v2_scan_file(active_file_path)
+    end
+
+    test "cross-shard transaction rolls back staged writes when a later entry raises", %{
+      state: state,
+      ets: ets,
+      active_file_path: active_file_path,
+      shard_index: shard_index,
+      writer_pid: writer_pid
+    } do
+      GenServer.stop(writer_pid, :normal, 5_000)
+
+      assert_raise FunctionClauseError, fn ->
+        StateMachine.apply(
+          %{system_time: Ferricstore.HLC.now_ms()},
+          {:cross_shard_tx,
+           [
+             {shard_index,
+              [
+                {"SET", ["cross_raise_rollback", "must-not-persist"]},
+                {:flow_cross_terminal, :complete, %{id: "missing-lease-token"}}
+              ], nil}
+           ]},
+          state
+        )
+      end
+
+      assert [] = :ets.lookup(ets, "cross_raise_rollback")
+      assert {:ok, []} = NIF.v2_scan_file(active_file_path)
+    end
+
     test "failed cross-shard multi-target append does not leave replayable partial records", %{
       state: state,
       ets: ets,
@@ -3248,6 +3303,20 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert {:error, {:bitcask_append_result_mismatch, {:op_mismatch, 0, :put, :delete}}} =
                StateMachine.__validate_pending_locations__(batch, locations)
+    end
+
+    test "rejects invalid put and delete offsets from append results" do
+      assert {:error, {:bitcask_append_result_mismatch, {:invalid_location, 0, {:put, -1, 2}}}} =
+               StateMachine.__validate_pending_locations__(
+                 [{:put, "k1", "v1", 0}],
+                 [{:put, -1, 2}]
+               )
+
+      assert {:error, {:bitcask_append_result_mismatch, {:invalid_location, 0, {:delete, 0, -1}}}} =
+               StateMachine.__validate_pending_locations__(
+                 [{:delete, "k2", nil}],
+                 [{:delete, 0, -1}]
+               )
     end
 
     test "accepts matching put and delete result tags in order" do

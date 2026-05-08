@@ -3064,40 +3064,108 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp flow_claim_due_any_partition(ctx, _attrs, _start_idx, offset, _limit, acc)
-       when offset >= ctx.shard_count,
-       do: {:ok, Enum.reverse(acc)}
+  defp flow_claim_due_any_partition(ctx, attrs, start_idx, _offset, limit, _acc) do
+    flow_claim_due_any_partition_rounds(ctx, attrs, start_idx, limit, [])
+  end
 
-  defp flow_claim_due_any_partition(ctx, attrs, start_idx, offset, limit, acc) do
-    idx = rem(start_idx + offset, ctx.shard_count)
+  defp flow_claim_due_any_partition_rounds(_ctx, _attrs, _start_idx, limit, acc)
+       when length(acc) >= limit,
+       do: {:ok, Enum.take(acc, limit)}
+
+  defp flow_claim_due_any_partition_rounds(ctx, attrs, start_idx, limit, acc) do
     remaining = limit - length(acc)
+    per_shard_limit = max(1, div(remaining + ctx.shard_count - 1, ctx.shard_count))
 
-    if remaining <= 0 do
-      {:ok, Enum.reverse(acc)}
-    else
-      key = "f:{flow-claim-any-" <> Integer.to_string(idx) <> "}:d"
-      shard_attrs = Map.put(attrs, :limit, remaining)
+    case flow_claim_due_any_partition_round(
+           ctx,
+           attrs,
+           start_idx,
+           0,
+           remaining,
+           per_shard_limit,
+           [],
+           false
+         ) do
+      {:ok, [], _progressed?} ->
+        {:ok, acc}
 
-      case raft_write(ctx, idx, key, {:flow_claim_due, key, shard_attrs}) do
-        {:ok, records} when is_list(records) ->
-          flow_claim_due_any_partition(
-            ctx,
-            attrs,
-            start_idx,
-            offset + 1,
-            limit,
-            Enum.reverse(records) ++ acc
-          )
+      {:ok, records, true} ->
+        flow_claim_due_any_partition_rounds(ctx, attrs, start_idx, limit, acc ++ records)
 
-        {:error, _reason} = error when acc == [] ->
-          error
+      {:error, _reason} = error when acc == [] ->
+        error
 
-        {:error, _reason} ->
-          {:ok, Enum.reverse(acc)}
+      {:error, _reason} ->
+        {:ok, acc}
 
-        other ->
-          other
-      end
+      other ->
+        other
+    end
+  end
+
+  defp flow_claim_due_any_partition_round(
+         ctx,
+         _attrs,
+         _start_idx,
+         offset,
+         _remaining,
+         _per_shard_limit,
+         acc,
+         progressed?
+       )
+       when offset >= ctx.shard_count,
+       do: {:ok, acc, progressed?}
+
+  defp flow_claim_due_any_partition_round(
+         _ctx,
+         _attrs,
+         _start_idx,
+         _offset,
+         remaining,
+         _per_shard_limit,
+         acc,
+         progressed?
+       )
+       when length(acc) >= remaining,
+       do: {:ok, Enum.take(acc, remaining), progressed?}
+
+  defp flow_claim_due_any_partition_round(
+         ctx,
+         attrs,
+         start_idx,
+         offset,
+         remaining,
+         per_shard_limit,
+         acc,
+         progressed?
+       ) do
+    idx = rem(start_idx + offset, ctx.shard_count)
+    shard_remaining = remaining - length(acc)
+    shard_limit = min(per_shard_limit, shard_remaining)
+    key = "f:{flow-claim-any-" <> Integer.to_string(idx) <> "}:d"
+    shard_attrs = Map.put(attrs, :limit, shard_limit)
+
+    case raft_write(ctx, idx, key, {:flow_claim_due, key, shard_attrs}) do
+      {:ok, records} when is_list(records) ->
+        flow_claim_due_any_partition_round(
+          ctx,
+          attrs,
+          start_idx,
+          offset + 1,
+          remaining,
+          per_shard_limit,
+          acc ++ records,
+          progressed? or records != []
+        )
+
+      {:error, _reason} = error when acc == [] ->
+        error
+
+      {:error, _reason} ->
+        {:ok, acc, progressed?}
+
+      other ->
+        other
     end
   end
 
@@ -3174,6 +3242,18 @@ defmodule Ferricstore.Store.Router do
   defp flow_claim_route_state([state | _]) when is_binary(state), do: state
   defp flow_claim_route_state(state) when is_binary(state), do: state
   defp flow_claim_route_state(_state), do: "queued"
+
+  @doc false
+  def flow_extend_lease(ctx, %{id: id} = attrs) when is_binary(id) do
+    key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_extend_lease, key, attrs})
+    end
+  end
 
   @doc false
   def flow_complete(ctx, %{id: id} = attrs) when is_binary(id) do

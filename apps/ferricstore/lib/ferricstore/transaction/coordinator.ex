@@ -70,26 +70,48 @@ defmodule Ferricstore.Transaction.Coordinator do
         {shard_idx, cmds_with_indices, sandbox_namespace}
       end)
 
-    command = {:cross_shard_tx, shard_batches}
-    shard_id = Ferricstore.Raft.Cluster.shard_server_id(anchor_idx)
-    corr = make_ref()
+    if default_standalone?() do
+      execute_cross_shard_standalone(shard_batches, shard_groups, index_map, total)
+    else
+      command = {:cross_shard_tx, shard_batches}
+      shard_id = Ferricstore.Raft.Cluster.shard_server_id(anchor_idx)
+      corr = make_ref()
 
-    try do
-      case CommandClock.pipeline_command(shard_id, command, corr, :normal) do
-        :ok ->
-          case wait_for_ra_result(corr, shard_id, anchor_idx, command) do
-            {:ok, shard_results} ->
-              Enum.each(Map.keys(shard_groups), fn idx ->
-                Ferricstore.Store.WriteVersion.increment(idx)
-              end)
+      try do
+        case CommandClock.pipeline_command(shard_id, command, corr, :normal) do
+          :ok ->
+            case wait_for_ra_result(corr, shard_id, anchor_idx, command) do
+              {:ok, shard_results} ->
+                Enum.each(Map.keys(shard_groups), fn idx ->
+                  Ferricstore.Store.WriteVersion.increment(idx)
+                end)
 
-              reassemble_results(shard_results, index_map, total)
+                reassemble_results(shard_results, index_map, total)
 
-            {:error, _} = err ->
-              err
-          end
+              {:error, _} = err ->
+                err
+            end
 
-        {:error, :noproc} ->
+          {:error, :noproc} ->
+            maybe_execute_cross_shard_sequential(
+              shard_groups,
+              index_map,
+              total,
+              sandbox_namespace,
+              :noproc
+            )
+
+          {:error, _reason} ->
+            maybe_execute_cross_shard_sequential(
+              shard_groups,
+              index_map,
+              total,
+              sandbox_namespace,
+              :pipeline_rejected
+            )
+        end
+      catch
+        :exit, {:noproc, _} ->
           maybe_execute_cross_shard_sequential(
             shard_groups,
             index_map,
@@ -97,26 +119,28 @@ defmodule Ferricstore.Transaction.Coordinator do
             sandbox_namespace,
             :noproc
           )
-
-        {:error, _reason} ->
-          maybe_execute_cross_shard_sequential(
-            shard_groups,
-            index_map,
-            total,
-            sandbox_namespace,
-            :pipeline_rejected
-          )
       end
-    catch
-      :exit, {:noproc, _} ->
-        maybe_execute_cross_shard_sequential(
-          shard_groups,
-          index_map,
-          total,
-          sandbox_namespace,
-          :noproc
-        )
     end
+  end
+
+  defp execute_cross_shard_standalone(shard_batches, shard_groups, index_map, total) do
+    ctx = FerricStore.Instance.get(:default)
+
+    case Router.standalone_cross_shard_tx(ctx, shard_batches) do
+      {:error, _reason} = error ->
+        error
+
+      shard_results when is_map(shard_results) ->
+        Enum.each(Map.keys(shard_groups), fn idx ->
+          Ferricstore.Store.WriteVersion.increment(idx)
+        end)
+
+        reassemble_results(shard_results, index_map, total)
+    end
+  end
+
+  defp default_standalone? do
+    Ferricstore.ReplicationMode.current() == :standalone
   end
 
   # The default application instance owns Raft, so transaction submit failures

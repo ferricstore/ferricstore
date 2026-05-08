@@ -429,7 +429,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
   # Flushes all pending entries (writes and tombstones), grouped by file path
   # (handles file rotation mid-batch). For writes, uses v2_append_batch_nosync
   # and updates ETS entries with the real file_id and offset. For tombstones,
-  # uses v2_append_tombstone. Entries within each path group are processed in
+  # uses a batched tombstone append. Entries within each path group are processed in
   # insertion order, preserving the write-then-delete invariant.
   defp do_flush(pending, shard_index) do
     # Reverse to preserve insertion order, then group by file path.
@@ -482,7 +482,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
 
   # Processes a group of entries for a single file path. Consecutive writes
   # are batched into a single v2_append_batch_nosync call for efficiency.
-  # Tombstones are written individually via v2_append_tombstone.
+  # Tombstones are written as a single ops batch for the contiguous run.
   defp flush_path_group(path, group, shard_index) do
     # Split into contiguous runs of writes vs tombstones to maximize batching.
     group

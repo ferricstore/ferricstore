@@ -493,7 +493,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)
-      when tag in ~w(flow_complete flow_retry flow_fail)a,
+      when tag in ~w(flow_extend_lease flow_complete flow_retry flow_fail)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)

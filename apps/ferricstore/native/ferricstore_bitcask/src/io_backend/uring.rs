@@ -26,10 +26,11 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use io_uring::{opcode, types, IoUring};
 
-use super::IoBackend;
+use super::{append_lock_for_path, IoBackend};
 
 /// Ring capacity in submission-queue entries. Must be a power of two.
 ///
@@ -56,6 +57,7 @@ pub struct UringBackend {
     ring: IoUring,
     file: File,
     offset: u64,
+    append_lock: Arc<Mutex<()>>,
 }
 
 impl UringBackend {
@@ -85,7 +87,12 @@ impl UringBackend {
             .build(RING_SIZE)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        Ok(Self { ring, file, offset })
+        Ok(Self {
+            ring,
+            file,
+            offset,
+            append_lock: append_lock_for_path(path),
+        })
     }
 
     /// Submit a single positioned write SQE and wait for one completion.
@@ -180,9 +187,12 @@ impl UringBackend {
 
 impl IoBackend for UringBackend {
     fn append(&mut self, data: &[u8]) -> io::Result<u64> {
-        let start = self.offset;
-        self.submit_write_at(data, self.offset)?;
-        self.offset += data.len() as u64;
+        let append_lock = Arc::clone(&self.append_lock);
+        let _guard = append_lock.lock().expect("append lock poisoned");
+
+        let start = self.file.metadata()?.len();
+        self.submit_write_at(data, start)?;
+        self.offset = start + data.len() as u64;
         Ok(start)
     }
 
@@ -221,12 +231,16 @@ impl IoBackend for UringBackend {
     /// validated (no error, no short write). This ensures that a partial
     /// failure never leaves `self.offset` pointing past un-confirmed bytes.
     fn append_batch_and_sync(&mut self, buffers: &[&[u8]]) -> io::Result<Vec<u64>> {
+        let append_lock = Arc::clone(&self.append_lock);
+        let _guard = append_lock.lock().expect("append lock poisoned");
+
         if buffers.is_empty() {
             return Ok(Vec::new());
         }
 
         let fd = types::Fd(self.file.as_raw_fd());
         let mut all_offsets = Vec::with_capacity(buffers.len());
+        self.offset = self.file.metadata()?.len();
 
         // Split into chunks that fit in the ring.
         for chunk in buffers.chunks(RING_SIZE as usize) {

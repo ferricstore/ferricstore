@@ -13,9 +13,11 @@
 //! the BEAM dirty-scheduler contract: the NIF occupies a dirty thread for
 //! the full duration of the write, but never blocks a normal scheduler.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // On Linux, bring in the uring backend modules.
 #[cfg(target_os = "linux")]
@@ -98,6 +100,17 @@ pub trait IoBackend: Send {
     }
 }
 
+type AppendLock = Arc<Mutex<()>>;
+
+static APPEND_LOCKS: OnceLock<Mutex<HashMap<PathBuf, AppendLock>>> = OnceLock::new();
+
+pub(crate) fn append_lock_for_path(path: &Path) -> AppendLock {
+    let key = path.to_path_buf();
+    let locks = APPEND_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().expect("append lock registry poisoned");
+    Arc::clone(locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
+}
+
 // ---------------------------------------------------------------------------
 // SyncBackend — standard BufWriter<File>, always available
 // ---------------------------------------------------------------------------
@@ -109,6 +122,7 @@ pub trait IoBackend: Send {
 pub struct SyncBackend {
     writer: BufWriter<File>,
     offset: u64,
+    append_lock: AppendLock,
 }
 
 impl SyncBackend {
@@ -124,6 +138,7 @@ impl SyncBackend {
         Ok(Self {
             writer: BufWriter::with_capacity(256 * 1024, file), // H-1: 256KB buffer for batch writes
             offset,
+            append_lock: append_lock_for_path(path),
         })
     }
 
@@ -145,15 +160,21 @@ impl SyncBackend {
         Ok(Self {
             writer: BufWriter::with_capacity(8 * 1024, file),
             offset,
+            append_lock: append_lock_for_path(path),
         })
     }
 }
 
 impl IoBackend for SyncBackend {
     fn append(&mut self, data: &[u8]) -> io::Result<u64> {
-        let start = self.offset;
+        let append_lock = Arc::clone(&self.append_lock);
+        let _guard = append_lock.lock().expect("append lock poisoned");
+
+        self.writer.flush()?;
+        let start = self.writer.get_ref().metadata()?.len();
         self.writer.write_all(data)?;
-        self.offset += data.len() as u64;
+        self.writer.flush()?;
+        self.offset = start + data.len() as u64;
         Ok(start)
     }
 
@@ -179,6 +200,26 @@ impl IoBackend for SyncBackend {
 
     fn advance_offset(&mut self, bytes: u64) {
         self.offset += bytes;
+    }
+
+    fn append_batch_and_sync(&mut self, buffers: &[&[u8]]) -> io::Result<Vec<u64>> {
+        let append_lock = Arc::clone(&self.append_lock);
+        let _guard = append_lock.lock().expect("append lock poisoned");
+
+        self.writer.flush()?;
+        let mut running = self.writer.get_ref().metadata()?.len();
+        let mut offsets = Vec::with_capacity(buffers.len());
+
+        for buf in buffers {
+            offsets.push(running);
+            self.writer.write_all(buf)?;
+            running += buf.len() as u64;
+        }
+
+        self.writer.flush()?;
+        self.writer.get_ref().sync_data()?;
+        self.offset = running;
+        Ok(offsets)
     }
 }
 
