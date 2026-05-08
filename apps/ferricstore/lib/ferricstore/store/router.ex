@@ -277,14 +277,63 @@ defmodule Ferricstore.Store.Router do
       |> Enum.map(fn {shard_idx, _queue, _sandbox_namespace} -> shard_idx end)
       |> Enum.uniq()
 
-    case standalone_write(ctx, 0, {:cross_shard_tx, shard_batches}, :sync_no_version) do
-      {:error, _reason} = error ->
-        error
+    case acquire_standalone_cross_shard_barriers(ctx, touched) do
+      :ok ->
+        try do
+          case standalone_write(ctx, 0, {:cross_shard_tx, shard_batches}, :sync_no_version) do
+            {:error, _reason} = error ->
+              error
 
-      result ->
-        Enum.each(touched, fn idx -> bump_standalone_write_version(ctx, idx, 1) end)
-        result
+            result ->
+              Enum.each(touched, fn idx -> bump_standalone_write_version(ctx, idx, 1) end)
+              result
+          end
+        after
+          release_standalone_cross_shard_barriers(ctx, touched)
+        end
+
+      {:error, {_idx, :standalone_cross_shard_barrier_busy}} ->
+        {:error, "ERR standalone cross-shard operation busy"}
+
+      {:error, reason} ->
+        fail_closed_standalone_write(ctx, 0, {:standalone_cross_shard_barrier_failed, reason})
     end
+  end
+
+  defp acquire_standalone_cross_shard_barriers(ctx, touched) do
+    touched
+    |> Enum.sort()
+    |> Enum.reduce_while([], fn idx, acquired ->
+      shard = elem(ctx.shard_names, idx)
+
+      case standalone_barrier_call(shard, :standalone_cross_shard_barrier_acquire) do
+        :ok ->
+          {:cont, [idx | acquired]}
+
+        {:error, reason} ->
+          release_standalone_cross_shard_barriers(ctx, acquired)
+          {:halt, {:error, {idx, reason}}}
+      end
+    end)
+    |> case do
+      acquired when is_list(acquired) -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp release_standalone_cross_shard_barriers(ctx, touched) do
+    Enum.each(touched, fn idx ->
+      shard = elem(ctx.shard_names, idx)
+      _ = standalone_barrier_call(shard, :standalone_cross_shard_barrier_release)
+    end)
+
+    :ok
+  end
+
+  defp standalone_barrier_call(shard, message) do
+    GenServer.call(shard, message, 30_000)
+  catch
+    :exit, reason -> {:error, reason}
   end
 
   defp standalone_write(ctx, idx, command, :sync_no_version) do

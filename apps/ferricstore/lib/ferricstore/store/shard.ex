@@ -138,7 +138,8 @@ defmodule Ferricstore.Store.Shard do
     standalone_flush_ref: nil,
     standalone_flush_entries: [],
     standalone_inflight_keys: MapSet.new(),
-    standalone_waiting: []
+    standalone_waiting: [],
+    standalone_write_barrier: false
   ]
 
   # -------------------------------------------------------------------
@@ -526,6 +527,33 @@ defmodule Ferricstore.Store.Shard do
       |> maybe_flush_full_standalone_batch()
 
     {:noreply, state}
+  end
+
+  def handle_call(:standalone_cross_shard_barrier_acquire, _from, state) do
+    state = drain_standalone_commits_for_sync(state)
+
+    cond do
+      state.standalone_write_barrier ->
+        {:reply, {:error, :standalone_cross_shard_barrier_busy}, state}
+
+      state.writes_paused ->
+        {:reply, {:error, :prior_standalone_write_failed}, state}
+
+      state.last_flush_error != nil ->
+        {:reply, {:error, state.last_flush_error}, %{state | writes_paused: true}}
+
+      true ->
+        {:reply, :ok, %{state | standalone_write_barrier: true}}
+    end
+  end
+
+  def handle_call(:standalone_cross_shard_barrier_release, _from, state) do
+    state =
+      %{state | standalone_write_barrier: false}
+      |> drain_standalone_waiting()
+      |> flush_ready_standalone_batch()
+
+    {:reply, :ok, state}
   end
 
   def handle_call(
@@ -1328,7 +1356,8 @@ defmodule Ferricstore.Store.Shard do
   defp enqueue_standalone_commit(state, from, command) do
     entry = {from, command, standalone_command_keys(command)}
 
-    if standalone_entry_conflicts?(entry, state.standalone_inflight_keys) do
+    if state.standalone_write_barrier or
+         standalone_entry_conflicts?(entry, state.standalone_inflight_keys) do
       %{state | standalone_waiting: state.standalone_waiting ++ [entry]}
     else
       enqueue_ready_standalone_commit(state, entry)
@@ -1534,6 +1563,8 @@ defmodule Ferricstore.Store.Shard do
     |> flush_ready_standalone_batch()
     |> await_standalone_flush()
   end
+
+  defp drain_standalone_waiting(%{standalone_write_barrier: true} = state), do: state
 
   defp drain_standalone_waiting(state) do
     {ready, waiting} =

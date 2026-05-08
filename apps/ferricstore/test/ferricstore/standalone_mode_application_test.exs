@@ -293,7 +293,7 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
 
   test "standalone cross-shard tx waits for earlier pending standalone writes" do
     ctx = FerricStore.Instance.get(:default)
-    key_a = "standalone:cross-shard:pending-source"
+    key_a = key_on_different_shard(ctx, 0)
     key_b = key_on_different_shard(ctx, Router.shard_for(ctx, key_a))
     parent = self()
 
@@ -331,6 +331,33 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
   after
     Application.delete_env(:ferricstore, :standalone_fsync_max_delay_ms)
     Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
+  test "standalone cross-shard barrier holds newer writes during sync drain" do
+    ctx = FerricStore.Instance.get(:default)
+    key = key_on_same_shard(ctx, 0)
+    shard = elem(ctx.shard_names, 0)
+
+    assert :ok = GenServer.call(shard, :standalone_cross_shard_barrier_acquire, 5_000)
+
+    put_task = Task.async(fn -> Router.put(ctx, key, "younger", 0) end)
+
+    assert eventually(fn ->
+             %{waiting_count: waiting} =
+               GenServer.call(shard, :standalone_commit_debug, 5_000)
+
+             waiting == 1
+           end)
+
+    assert %{} = GenServer.call(shard, {:standalone_commit_sync, {:cross_shard_tx, []}}, 5_000)
+    refute Task.yield(put_task, 100)
+
+    assert :ok = GenServer.call(shard, :standalone_cross_shard_barrier_release, 5_000)
+    assert :ok = Task.await(put_task, 5_000)
+    assert Router.get(ctx, key) == "younger"
+  after
+    ctx = FerricStore.Instance.get(:default)
+    _ = GenServer.call(elem(ctx.shard_names, 0), :standalone_cross_shard_barrier_release, 5_000)
   end
 
   test "standalone batch read-modify-write commands see staged values before publish" do
