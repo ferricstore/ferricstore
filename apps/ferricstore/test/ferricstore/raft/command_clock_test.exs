@@ -39,7 +39,7 @@ defmodule Ferricstore.Raft.CommandClockTest do
       source = File.read!(app_path("lib/ferricstore/raft/batcher.ex"))
 
       assert source =~ "CommandClock.to_ttb(single_cmd)"
-      assert source =~ "CommandClock.to_ttb({:batch, batch})"
+      assert source =~ "CommandClock.to_ttb(command)"
       assert source =~ "CommandClock.to_ttb({:batch, wrapped_batch})"
     end
 

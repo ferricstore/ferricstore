@@ -82,6 +82,9 @@ defmodule Ferricstore.Flow.LMDBWriter do
     publish_requested(instance_ctx, shard_index, index)
 
     cond do
+      mirror_degraded?(instance_ctx, shard_index) ->
+        {:error, :mirror_degraded}
+
       durable?(instance_ctx, shard_index, shard_data_path, index) ->
         :durable
 
@@ -95,6 +98,16 @@ defmodule Ferricstore.Flow.LMDBWriter do
   catch
     :exit, reason -> {:error, reason}
   end
+
+  defp mirror_degraded?(%{flow_lmdb_mirror_degraded: degraded}, shard_index)
+       when is_reference(degraded) do
+    shard_index < :atomics.info(degraded).size and
+      :atomics.get(degraded, shard_index + 1) > 0
+  rescue
+    _ -> false
+  end
+
+  defp mirror_degraded?(_instance_ctx, _shard_index), do: false
 
   def flush_all(shard_count) when is_integer(shard_count) and shard_count >= 0 do
     flush_all(:default, shard_count, 30_000)

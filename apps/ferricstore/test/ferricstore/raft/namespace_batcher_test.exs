@@ -107,6 +107,30 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
     end
   end
 
+  describe "hot batch compaction" do
+    test "compacts all-put batches into one put_batch raft command" do
+      commands = [
+        {:put, "hotbatch:a", "va", 0},
+        {:put, "hotbatch:b", "vb", 12_345}
+      ]
+
+      assert Batcher.compact_hot_batch(commands) ==
+               {{:put_batch, [{"hotbatch:a", "va", 0}, {"hotbatch:b", "vb", 12_345}]}, 2}
+    end
+
+    test "compacts all-delete batches into one delete_batch raft command" do
+      commands = [{:delete, "hotdel:a"}, {:delete, "hotdel:b"}]
+
+      assert Batcher.compact_hot_batch(commands) == {{:delete_batch, ["hotdel:a", "hotdel:b"]}, 2}
+    end
+
+    test "keeps mixed command batches in generic batch form" do
+      commands = [{:put, "mixed:a", "va", 0}, {:append, "mixed:a", "!"}]
+
+      assert Batcher.compact_hot_batch(commands) == {{:batch, commands}, 2}
+    end
+  end
+
   describe "Flow create latency policy" do
     test "flow_create uses the namespace commit window for pipeline coalescing" do
       partition_key = "tenant-nsbatcher-flow-pipeline"
@@ -272,9 +296,9 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
         assert Enum.any?(submits, fn {measurements, metadata} ->
                  metadata.kind == :batch and measurements.batch_size == 2 and
-                   measurements.caller_count == 2
+                   measurements.caller_count == 2 and metadata.command_shape == :put_batch
                end),
-               "expected the two caller-backed writes to submit as one batch, got: #{inspect(submits)}"
+               "expected the two caller-backed writes to submit as one compact put_batch, got: #{inspect(submits)}"
 
         assert "v1" == Router.get(FerricStore.Instance.get(:default), k1)
         assert "v2" == Router.get(FerricStore.Instance.get(:default), k2)

@@ -277,8 +277,11 @@ defmodule Ferricstore.Raft.StateMachine do
 
     * `{:put, key, value, expire_at_ms}` -- Write a key-value pair with optional
       expiry. Writes to Bitcask (sync NIF) and updates ETS.
+    * `{:put_batch, entries}` -- Hot-path SET batch where entries are
+      `{key, value, expire_at_ms}` tuples. Returns `{:ok, results}`.
     * `{:delete, key}` -- Delete a key. Writes a tombstone to Bitcask, removes
       from ETS.
+    * `{:delete_batch, keys}` -- Hot-path DEL batch. Returns `{:ok, results}`.
     * `{:batch, commands}` -- Apply a list of commands atomically. Each command
       in the batch is a tuple matching one of the above forms. Returns
       `{:ok, results}` where results is a list of individual command results.
@@ -440,6 +443,32 @@ defmodule Ferricstore.Raft.StateMachine do
       old_count = state.applied_count
       new_state = %{state | applied_count: old_count + 1}
       maybe_release_cursor(meta, old_count, new_state, result)
+    end)
+  end
+
+  def apply(meta, {:put_batch, entries}, state) when is_list(entries) do
+    with_apply_time(meta, fn ->
+      old_count = state.applied_count
+
+      write_result =
+        with_pending_writes(state, fn ->
+          apply_put_batch_entries(state, entries)
+        end)
+
+      finish_hot_batch_apply(meta, old_count, state, length(entries), write_result)
+    end)
+  end
+
+  def apply(meta, {:delete_batch, keys}, state) when is_list(keys) do
+    with_apply_time(meta, fn ->
+      old_count = state.applied_count
+
+      write_result =
+        with_pending_writes(state, fn ->
+          apply_delete_batch_keys(state, keys)
+        end)
+
+      finish_hot_batch_apply(meta, old_count, state, length(keys), write_result)
     end)
   end
 
@@ -1113,6 +1142,22 @@ defmodule Ferricstore.Raft.StateMachine do
     require Logger
     Logger.error("StateMachine: unrecognized command: #{inspect(unknown_command)}")
     {state, {:error, {:unknown_command, unknown_command}}}
+  end
+
+  defp finish_hot_batch_apply(
+         meta,
+         old_count,
+         state,
+         applied_increment,
+         {:error, _reason} = error
+       ) do
+    new_state = %{state | applied_count: old_count + applied_increment}
+    maybe_release_cursor(meta, old_count, new_state, error)
+  end
+
+  defp finish_hot_batch_apply(meta, old_count, state, applied_increment, results) do
+    new_state = %{state | applied_count: old_count + applied_increment}
+    maybe_release_cursor(meta, old_count, new_state, {:ok, results})
   end
 
   @doc """
@@ -3933,6 +3978,28 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
+  defp apply_put_batch_entries(state, entries) do
+    Enum.map(entries, fn {key, value, expire_at_ms} ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+      case check_key_lock(state, redis_key, nil) do
+        :ok -> do_put(state, key, value, expire_at_ms)
+        {:error, :key_locked} -> {:error, :key_locked}
+      end
+    end)
+  end
+
+  defp apply_delete_batch_keys(state, keys) do
+    Enum.map(keys, fn key ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+      case check_key_lock(state, redis_key, nil) do
+        :ok -> do_delete(state, key)
+        {:error, :key_locked} -> {:error, :key_locked}
+      end
+    end)
+  end
+
   defp maybe_queue_origin_pending_put(state, key, value, expire_at_ms) do
     expected_value = value_for_ets(value, hot_cache_threshold(state))
 
@@ -6259,7 +6326,8 @@ defmodule Ferricstore.Raft.StateMachine do
     with id when is_binary(id) <- Map.get(record, :id),
          :ok <- flow_require_expected_state(record, from_state),
          :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
-         :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)) do
+         :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)),
+         :ok <- flow_reject_terminal_transition(to_state) do
       version = Map.fetch!(record, :version) + 1
       partition_key = Map.get(record, :partition_key)
 
@@ -6297,6 +6365,14 @@ defmodule Ferricstore.Raft.StateMachine do
     else
       {:error, _reason} = error -> error
       _ -> {:error, "ERR flow not found"}
+    end
+  end
+
+  defp flow_reject_terminal_transition(to_state) do
+    if Ferricstore.Flow.LMDB.terminal_state?(to_state) do
+      {:error, "ERR terminal flow state requires FLOW.COMPLETE, FLOW.FAIL, or FLOW.CANCEL"}
+    else
+      :ok
     end
   end
 

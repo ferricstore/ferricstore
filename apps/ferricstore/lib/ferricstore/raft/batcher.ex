@@ -115,7 +115,9 @@ defmodule Ferricstore.Raft.Batcher do
 
   @type command ::
           {:put, binary(), binary(), non_neg_integer()}
+          | {:put_batch, [{binary(), binary(), non_neg_integer()}]}
           | {:delete, binary()}
+          | {:delete_batch, [binary()]}
           | {:incr, binary(), integer()}
           | {:incr_float, binary(), float()}
           | {:append, binary(), binary()}
@@ -1434,6 +1436,7 @@ defmodule Ferricstore.Raft.Batcher do
       1,
       length(froms),
       byte_size(bin),
+      command_shape(single_cmd),
       submit_result
     )
 
@@ -1443,16 +1446,18 @@ defmodule Ferricstore.Raft.Batcher do
   defp pipeline_submit(state, batch, froms) do
     corr = make_ref()
     started_at = System.monotonic_time()
-    {:ttb, bin} = serialized = CommandClock.to_ttb({:batch, batch})
+    {command, logical_count} = compact_hot_batch(batch)
+    {:ttb, bin} = serialized = CommandClock.to_ttb(command)
     submit_result = pipeline_command(state.shard_id, serialized, corr, :normal)
 
     emit_quorum_submit_telemetry(
       state,
       started_at,
       :batch,
-      length(batch),
+      logical_count,
       length(froms),
       byte_size(bin),
+      command_shape(command),
       submit_result
     )
 
@@ -1560,6 +1565,39 @@ defmodule Ferricstore.Raft.Batcher do
 
   defp normalize_pipeline_error({:error, _reason} = error), do: error
   defp normalize_pipeline_error(other), do: {:error, other}
+
+  @doc false
+  @spec compact_hot_batch([command()]) :: {command(), non_neg_integer()}
+  def compact_hot_batch(commands) when is_list(commands) do
+    case compact_all_puts(commands, [], 0) do
+      {:ok, entries, count} ->
+        {{:put_batch, entries}, count}
+
+      :error ->
+        case compact_all_deletes(commands, [], 0) do
+          {:ok, keys, count} -> {{:delete_batch, keys}, count}
+          :error -> {{:batch, commands}, length(commands)}
+        end
+    end
+  end
+
+  defp compact_all_puts([], [], _count), do: :error
+  defp compact_all_puts([], acc, count), do: {:ok, Enum.reverse(acc), count}
+
+  defp compact_all_puts([{:put, key, value, expire_at_ms} | rest], acc, count) do
+    compact_all_puts(rest, [{key, value, expire_at_ms} | acc], count + 1)
+  end
+
+  defp compact_all_puts(_commands, _acc, _count), do: :error
+
+  defp compact_all_deletes([], [], _count), do: :error
+  defp compact_all_deletes([], acc, count), do: {:ok, Enum.reverse(acc), count}
+
+  defp compact_all_deletes([{:delete, key} | rest], acc, count) do
+    compact_all_deletes(rest, [key | acc], count + 1)
+  end
+
+  defp compact_all_deletes(_commands, _acc, _count), do: :error
 
   # Enqueue a write that enters through a non-blocking call but must use the
   # quorum slot like every other user-visible write.
@@ -1822,6 +1860,7 @@ defmodule Ferricstore.Raft.Batcher do
          batch_size,
          caller_count,
          command_bytes,
+         command_shape,
          submit_result
        ) do
     :telemetry.execute(
@@ -1832,9 +1871,20 @@ defmodule Ferricstore.Raft.Batcher do
         caller_count: caller_count,
         command_bytes: command_bytes
       },
-      %{shard_index: state.shard_index, kind: kind, status: pipeline_submit_status(submit_result)}
+      %{
+        shard_index: state.shard_index,
+        kind: kind,
+        command_shape: command_shape,
+        status: pipeline_submit_status(submit_result)
+      }
     )
   end
+
+  defp command_shape({:put_batch, _entries}), do: :put_batch
+  defp command_shape({:delete_batch, _keys}), do: :delete_batch
+  defp command_shape({:batch, _commands}), do: :batch
+  defp command_shape(command) when is_tuple(command), do: elem(command, 0)
+  defp command_shape(_command), do: :unknown
 
   defp pipeline_submit_status(:ok), do: :ok
   defp pipeline_submit_status({:ok, _}), do: :ok

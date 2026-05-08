@@ -1445,6 +1445,13 @@ defmodule Ferricstore.Commands.FlowTest do
 
     assert "write" in flags
     assert {:ok, ["flow-id"]} = Ferricstore.Commands.Catalog.get_keys("flow.create", ["flow-id"])
-    assert {:ok, []} = Ferricstore.Commands.Catalog.get_keys("flow.policy.set", ["checkout"])
+
+    assert {:ok, ["checkout"]} =
+             Ferricstore.Commands.Catalog.get_keys("flow.policy.set", ["checkout"])
+
+    assert [["flow.retention_cleanup", _arity, cleanup_flags, 0, 0, 0]] =
+             Dispatcher.dispatch("COMMAND", ["INFO", "flow.retention_cleanup"], MockStore.make())
+
+    assert "admin" in cleanup_flags
   end
 end

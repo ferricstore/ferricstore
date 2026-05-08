@@ -3481,14 +3481,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp flow_cross_terminal_many_keys(ctx, attrs_list) do
-    entries =
-      Enum.map(attrs_list, fn
-        %{id: id} = attrs when is_binary(id) and id != "" ->
-          flow_terminal_keys(ctx, id, Map.get(attrs, :partition_key))
-
-        _attrs ->
-          :missing
-      end)
+    entries = flow_terminal_many_key_entries(ctx, attrs_list)
 
     if Enum.any?(entries, &flow_terminal_key_entry_cross_shard?(ctx, &1)) do
       keys =
@@ -3502,6 +3495,71 @@ defmodule Ferricstore.Store.Router do
       {:ok, keys}
     else
       :same_or_none
+    end
+  end
+
+  defp flow_terminal_many_key_entries(ctx, attrs_list) do
+    keyed_attrs =
+      Enum.map(attrs_list, fn
+        %{id: id} = attrs when is_binary(id) and id != "" ->
+          partition_key = Map.get(attrs, :partition_key)
+          {Ferricstore.Flow.Keys.state_key(id, partition_key), id, partition_key}
+
+        _attrs ->
+          :missing
+      end)
+
+    keys =
+      keyed_attrs
+      |> Enum.flat_map(fn
+        {key, _id, _partition_key} -> [key]
+        :missing -> []
+      end)
+
+    values = flow_terminal_many_values(ctx, keys)
+    value_by_key = Map.new(Enum.zip(keys, values))
+
+    Enum.map(keyed_attrs, fn
+      {child_key, _id, _partition_key} ->
+        case Map.get(value_by_key, child_key) do
+          value when is_binary(value) ->
+            record = Ferricstore.Flow.decode_record(value)
+
+            {:ok,
+             [child_key]
+             |> flow_maybe_add_parent_key(record)
+             |> flow_add_child_group_keys(record)
+             |> Enum.uniq()}
+
+          _other ->
+            :missing
+        end
+
+      :missing ->
+        :missing
+    end)
+  end
+
+  defp flow_terminal_many_values(_ctx, []), do: []
+
+  defp flow_terminal_many_values(ctx, keys) do
+    values = batch_get(ctx, keys)
+
+    if Ferricstore.Flow.LMDB.mirror?() do
+      missing_keys = for {key, nil} <- Enum.zip(keys, values), do: key
+      missing_values = flow_batch_get_lmdb(ctx, missing_keys, :mirror)
+
+      {merged, []} =
+        Enum.map_reduce(values, missing_values, fn
+          value, remaining when is_binary(value) -> {value, remaining}
+          nil, [value | remaining] -> {value, remaining}
+          nil, [] -> {nil, []}
+          _other, remaining -> {nil, remaining}
+        end)
+
+      merged
+    else
+      values
     end
   end
 

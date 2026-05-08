@@ -756,6 +756,57 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert Ferricstore.Flow.LMDBReplaySafeIndex.read(shard_data_path) == 123
   end
 
+  test "mirror writer refuses replay-safe marker while shard is degraded" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_degraded_marker_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 7
+    instance_name = :"flow_lmdb_writer_degraded_marker_#{System.unique_integer([:positive])}"
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    atomics_size = shard_index + 1
+    durable = :atomics.new(atomics_size, signed: false)
+    requested = :atomics.new(atomics_size, signed: false)
+    failures = :atomics.new(atomics_size, signed: false)
+    degraded = :atomics.new(atomics_size, signed: false)
+
+    instance_ctx = %{
+      name: instance_name,
+      flow_lmdb_replay_safe_index: durable,
+      flow_lmdb_replay_safe_requested_index: requested,
+      flow_lmdb_replay_safe_persist_failures: failures,
+      flow_lmdb_mirror_degraded: degraded
+    }
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(shard_data_path)
+    :atomics.put(degraded, shard_index + 1, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index,
+       data_dir: data_dir,
+       instance_ctx: instance_ctx,
+       instance_name: instance_name}
+    )
+
+    assert {:error, :mirror_degraded} =
+             Ferricstore.Flow.LMDBWriter.request(instance_ctx, shard_index, shard_data_path, 789)
+
+    assert :atomics.get(requested, shard_index + 1) == 789
+    assert :atomics.get(durable, shard_index + 1) == 0
+    assert Ferricstore.Flow.LMDBReplaySafeIndex.read(shard_data_path) == 0
+  end
+
   test "mirror writer crash before marker flush does not publish replay-safe index" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
     old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)

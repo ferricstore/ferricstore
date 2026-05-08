@@ -243,6 +243,66 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     end
   end
 
+  test "FLOW terminal commands in pipeline use cross-shard router path" do
+    parent = "pipe_flow_parent_#{System.unique_integer([:positive])}"
+    child = "pipe_flow_child_#{System.unique_integer([:positive])}"
+    {parent_partition, child_partition} = different_flow_partitions()
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "pipeline-parent",
+               state: "dispatch",
+               partition_key: parent_partition
+             )
+
+    assert {:ok, waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child, type: "pipeline-child", partition_key: child_partition}],
+               group_id: "fanout",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :ignore,
+               on_parent_closed: :abandon_children,
+               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               partition_key: parent_partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    assert waiting.state == "waiting_children"
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("pipeline-child",
+               partition_key: child_partition,
+               worker: "pipeline-worker",
+               limit: 1,
+               now_ms: 9_000_000_000_000
+             )
+
+    state = connection_state(FerricStore.Instance.get(:default))
+    send_response_fn = capture_response_fn()
+    handle_command_fn = flunking_handle_fn("FLOW terminal pipeline router path")
+
+    commands = [
+      {:command, "FLOW.COMPLETE", [],
+       {:flow_complete, child, claimed.lease_token,
+        [partition_key: child_partition, fencing_token: claimed.fencing_token]}, []},
+      {:command, "PING", [], :ping, []}
+    ]
+
+    assert {:continue, ^state} =
+             Pipeline.pipeline_dispatch(commands, state, handle_command_fn, send_response_fn)
+
+    assert_receive {:pipeline_response, response}
+    refute response =~ "-ERR"
+    assert response =~ "+PONG\r\n"
+
+    assert {:ok, done_parent} = FerricStore.flow_get(parent, partition_key: parent_partition)
+    assert done_parent.state == "children_done"
+    assert done_parent.child_groups["fanout"]["children"][child] == "completed"
+  end
+
   test "SET pipeline fast path writes through sandbox namespace" do
     ctx = FerricStore.Instance.get(:default)
     sandbox = "sandbox_pipe:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"
@@ -504,6 +564,27 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     {:command, "FLOW.TRANSITION", [],
      {:flow_transition, id, from_state, to_state,
       Keyword.merge([partition_key: partition_key, fencing_token: 0], opts)}, []}
+  end
+
+  defp different_flow_partitions do
+    base = "pipeline-flow-tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+    ctx = FerricStore.Instance.get(:default)
+
+    first = "#{base}:parent"
+    first_shard = flow_partition_shard(ctx, first)
+
+    second =
+      1..256
+      |> Enum.map(&"#{base}:child:#{&1}")
+      |> Enum.find(fn candidate -> flow_partition_shard(ctx, candidate) != first_shard end)
+
+    assert is_binary(second)
+    {first, second}
+  end
+
+  defp flow_partition_shard(ctx, partition_key) do
+    key = Ferricstore.Flow.Keys.state_key("probe", partition_key)
+    Router.shard_for(ctx, key)
   end
 
   defp drain_slot_flushes(acc \\ []) do

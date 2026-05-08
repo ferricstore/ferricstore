@@ -52,6 +52,49 @@ Expired running leases are reclaimed through `FLOW.RECLAIM` or
 `:partition_key` is provided. It creates a new lease/fencing token and keeps the
 same Flow atomicity rules as `FLOW.CLAIM_DUE`.
 
+`FLOW.CLAIM_DUE` includes expired lease reclaim by default:
+
+- `reclaim_expired`: default `true`
+- `reclaim_ratio`: default `25`, valid `0..100`
+- claim order: reclaim a small expired-running slice, claim normal due work, then
+  reclaim more expired-running flows if the response is still below `LIMIT`
+
+Use `STATE running` or `FLOW.RECLAIM` when a worker only wants expired running
+leases. Use `reclaim_expired: false` when a worker must claim only fresh due
+work. Reclaimed work is still at-least-once; handlers must be idempotent.
+
+## Retry And Terminal Policy
+
+Retry policy can be set once per Flow type and overridden per state with
+`FLOW.POLICY.SET` / `FerricStore.flow_policy_set/2`. Command-level retry policy
+still wins for the single command that carries it.
+
+Defaults and guards:
+
+- `max_retries`: default `3`, hard max `1000`
+- backoff: default exponential, `base_ms: 1000`, `max_ms: 30000`,
+  `jitter_pct: 20`
+- `max_ms` accepts long schedules up to the configured duration cap, currently
+  one month
+- `exhausted_to`: any state, but only `completed`, `failed`, and `cancelled` are
+  terminal states
+
+Terminal state changes are centralized through `FLOW.COMPLETE`, `FLOW.FAIL`, and
+`FLOW.CANCEL`. `FLOW.TRANSITION` rejects transitions into terminal states so
+parent/child hooks, summaries, cross-shard updates, and retention stamping stay
+on one path.
+
+## History Caps
+
+History has two separate caps:
+
+- `history_hot_max_events`: default `1024`, hard max `10000`
+- `history_max_events`: default `100000`, hard max `1000000`
+
+The hot cap bounds the recent history kept in memory/indexed for quick reads.
+The total cap bounds durable history growth for one Flow. `history_max_events`
+must be greater than or equal to `history_hot_max_events`.
+
 ## Fairness
 
 Flow fairness is explicit, not global magic:

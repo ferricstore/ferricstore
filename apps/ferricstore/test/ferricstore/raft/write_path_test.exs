@@ -977,6 +977,45 @@ defmodule Ferricstore.Raft.WritePathTest do
   # ---------------------------------------------------------------------------
 
   describe "batch containing new command types" do
+    test "put_batch applies many string writes with one batched result" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      entries = [
+        {"hotbatch:a", "va", 0},
+        {"hotbatch:b", "vb", 12_345},
+        {"hotbatch:c", "vc", 0}
+      ]
+
+      {new_state, {:ok, results}} = SM.apply(%{}, {:put_batch, entries}, state)
+
+      assert results == [:ok, :ok, :ok]
+      assert new_state.applied_count == 3
+      assert [{_, "va", 0, _, _, _, _}] = :ets.lookup(ets, "hotbatch:a")
+      assert [{_, "vb", 12_345, _, _, _, _}] = :ets.lookup(ets, "hotbatch:b")
+      assert [{_, "vc", 0, _, _, _, _}] = :ets.lookup(ets, "hotbatch:c")
+
+      cleanup_sm(ctx)
+    end
+
+    test "delete_batch removes many keys and preserves per-key results" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      {state, {:ok, [:ok, :ok]}} =
+        SM.apply(%{}, {:put_batch, [{"hotdel:a", "va", 0}, {"hotdel:b", "vb", 0}]}, state)
+
+      {new_state, {:ok, results}} =
+        SM.apply(%{}, {:delete_batch, ["hotdel:a", "hotdel:b"]}, state)
+
+      assert results == [:ok, :ok]
+      assert new_state.applied_count == 4
+      assert [] == :ets.lookup(ets, "hotdel:a")
+      assert [] == :ets.lookup(ets, "hotdel:b")
+
+      cleanup_sm(ctx)
+    end
+
     test "batch with list_op, compound_put, and compound_delete" do
       ctx = fresh_sm_state()
       {state, ets, _store, _dir} = ctx

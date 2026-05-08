@@ -213,6 +213,87 @@ defmodule Ferricstore.Commands.CommandTest do
                Server.handle("COMMAND", ["GETKEYS", "NONEXISTENT", "arg"], MockStore.make())
     end
 
+    test "returns dynamic keys for Flow partitioned commands" do
+      assert ["tenant-a"] =
+               Server.handle(
+                 "COMMAND",
+                 ["GETKEYS", "FLOW.GET", "flow-1", "PARTITION", "tenant-a"],
+                 MockStore.make()
+               )
+
+      assert ["flow-1"] =
+               Server.handle("COMMAND", ["GETKEYS", "FLOW.GET", "flow-1"], MockStore.make())
+
+      assert ["tenant-a"] =
+               Server.handle(
+                 "COMMAND",
+                 [
+                   "GETKEYS",
+                   "FLOW.CLAIM_DUE",
+                   "checkout",
+                   "WORKER",
+                   "w",
+                   "PARTITION",
+                   "tenant-a"
+                 ],
+                 MockStore.make()
+               )
+
+      assert ["checkout"] =
+               Server.handle(
+                 "COMMAND",
+                 ["GETKEYS", "FLOW.POLICY.SET", "checkout", "MAX_RETRIES", "3"],
+                 MockStore.make()
+               )
+    end
+
+    test "returns dynamic keys for Flow mixed batch commands" do
+      assert ["tenant-a", "tenant-b"] =
+               Server.handle(
+                 "COMMAND",
+                 [
+                   "GETKEYS",
+                   "FLOW.CREATE_MANY",
+                   "MIXED",
+                   "TYPE",
+                   "checkout",
+                   "ITEMS",
+                   "flow-a",
+                   "tenant-a",
+                   "payload-a",
+                   "flow-b",
+                   "tenant-b",
+                   "payload-b"
+                 ],
+                 MockStore.make()
+               )
+
+      assert ["parent-partition", "device-a", "device-b"] =
+               Server.handle(
+                 "COMMAND",
+                 [
+                   "GETKEYS",
+                   "FLOW.SPAWN_CHILDREN",
+                   "parent",
+                   "GROUP",
+                   "fanout",
+                   "PARTITION",
+                   "parent-partition",
+                   "ITEMS",
+                   "MIXED",
+                   "child-a",
+                   "device-a",
+                   "child",
+                   "payload-a",
+                   "child-b",
+                   "device-b",
+                   "child",
+                   "payload-b"
+                 ],
+                 MockStore.make()
+               )
+    end
+
     test "with no command name returns error" do
       assert {:error, _} = Server.handle("COMMAND", ["GETKEYS"], MockStore.make())
     end

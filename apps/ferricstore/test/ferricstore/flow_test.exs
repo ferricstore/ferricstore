@@ -4876,6 +4876,49 @@ defmodule Ferricstore.FlowTest do
     assert transitioned.lease_token == nil
   end
 
+  test "flow_transition rejects terminal states so terminal hooks stay centralized" do
+    parent = uid("flow-terminal-transition-parent")
+    child = uid("flow-terminal-transition-child")
+    {partition, _same_partition, other_partition} = mixed_partition_keys()
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    assert {:ok, waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child, type: "child", partition_key: other_partition}],
+               group_id: "fanout",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :ignore,
+               on_parent_closed: :abandon_children,
+               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    assert waiting.state == "waiting_children"
+    claimed = create_claimed_flow_child(child, other_partition, "worker-terminal-transition")
+
+    assert {:error, "ERR terminal flow state requires FLOW.COMPLETE, FLOW.FAIL, or FLOW.CANCEL"} =
+             FerricStore.flow_transition(child, "running", "completed",
+               partition_key: other_partition,
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               run_at_ms: 2_000
+             )
+
+    assert {:ok, unchanged_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert unchanged_parent.state == "waiting_children"
+    assert unchanged_parent.child_groups["fanout"]["children"][child] == "running"
+  end
+
   test "flow_transition rolls back index changes when derived keys are invalid" do
     id = uid("flow-transition-rollback")
     huge_state = String.duplicate("x", 65_536)
