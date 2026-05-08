@@ -241,6 +241,7 @@ defmodule Ferricstore.Application do
           {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
           Ferricstore.PubSub,
           Ferricstore.FetchOrCompute,
+          Ferricstore.Flow.RetentionSweeper,
           {Ferricstore.MemoryGuard, memory_guard_opts()},
           Ferricstore.Cluster.Manager
         ]

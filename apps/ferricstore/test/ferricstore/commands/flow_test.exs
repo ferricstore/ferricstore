@@ -94,6 +94,22 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches Flow retention cleanup through Rust AST" do
+    assert %{"flows" => 0, "history" => 0, "values" => 0} =
+             Dispatcher.dispatch(
+               "FLOW.RETENTION_CLEANUP",
+               ["LIMIT", "10", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert {:error, "ERR syntax error"} =
+             Dispatcher.dispatch(
+               "FLOW.RETENTION_CLEANUP",
+               ["LIMIT"],
+               MockStore.make()
+             )
+  end
+
   test "dispatches Flow full values through Rust AST" do
     id = uid("flow-command-values")
 

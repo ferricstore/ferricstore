@@ -320,6 +320,17 @@ defmodule Ferricstore.FlowValuePayloadTest do
                now_ms: 1_100
              )
 
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.flush_all(FerricStore.Instance.get(:default).shard_count)
+
+    assert {:ok, [_ | _]} =
+             FerricStore.flow_history(id,
+               partition_key: "tenant-retention",
+               include_cold: true,
+               consistent_projection: false,
+               count: 10
+             )
+
     Process.sleep(150)
 
     assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10)
@@ -327,6 +338,77 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert cleaned.history >= 1
     assert cleaned.values >= 2
 
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.flush_all(FerricStore.Instance.get(:default).shard_count)
+
+    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
+
+    assert {:ok, []} =
+             FerricStore.flow_history(id,
+               partition_key: "tenant-retention",
+               include_cold: true,
+               consistent_projection: false,
+               count: 10
+             )
+
+    assert {:ok, nil} = FerricStore.get(created.payload_ref)
+    assert {:ok, nil} = FerricStore.get(completed.result_ref)
+  end
+
+  test "retention sweeper runs cleanup through Flow command path" do
+    id = unique_id("flow-value-retention-sweeper")
+    parent = self()
+    handler_id = "flow-retention-sweeper-test-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :flow, :retention_sweeper, :sweep],
+      fn event, measurements, metadata, test_pid ->
+        send(test_pid, {:retention_sweeper_event, event, measurements, metadata})
+      end,
+      parent
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert {:ok, created} =
+             FerricStore.flow_create(id,
+               type: "value-retention-sweeper",
+               partition_key: "tenant-retention",
+               payload: %{large: String.duplicate("s", 256)},
+               retention_ttl_ms: 100,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("value-retention-sweeper",
+               partition_key: "tenant-retention",
+               worker: "worker-retention-sweeper",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, completed} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               partition_key: "tenant-retention",
+               fencing_token: claimed.fencing_token,
+               result: %{ok: true},
+               now_ms: 1_100
+             )
+
+    Process.sleep(150)
+
+    assert pid = Process.whereis(Ferricstore.Flow.RetentionSweeper)
+    send(pid, :sweep)
+
+    assert_receive {:retention_sweeper_event, [:ferricstore, :flow, :retention_sweeper, :sweep],
+                    %{flows: flows, history: history, values: values}, %{status: :ok}},
+                   5_000
+
+    assert flows >= 1
+    assert history >= 1
+    assert values >= 2
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
     assert {:ok, nil} = FerricStore.get(created.payload_ref)
     assert {:ok, nil} = FerricStore.get(completed.result_ref)

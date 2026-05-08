@@ -1585,6 +1585,7 @@ enum CommandAstKind {
     FlowInfo,
     FlowStuck,
     FlowHistory,
+    FlowRetentionCleanup,
     Blpop,
     Brpop,
     Blmove,
@@ -1831,6 +1832,7 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"FLOW.INFO" => CommandAstKind::FlowInfo,
         b"FLOW.STUCK" => CommandAstKind::FlowStuck,
         b"FLOW.HISTORY" => CommandAstKind::FlowHistory,
+        b"FLOW.RETENTION_CLEANUP" => CommandAstKind::FlowRetentionCleanup,
         b"BLPOP" => CommandAstKind::Blpop,
         b"BRPOP" => CommandAstKind::Brpop,
         b"BLMOVE" => CommandAstKind::Blmove,
@@ -2294,6 +2296,9 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowInfo => make_flow_info_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowStuck => make_flow_stuck_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowHistory => make_flow_history_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowRetentionCleanup => {
+            make_flow_retention_cleanup_command_ast(env, args, arg_bytes)
+        }
         CommandAstKind::Blpop => make_blocking_pop_command_ast(
             env,
             atoms::blpop(),
@@ -5978,6 +5983,19 @@ fn make_flow_history_command_ast<'a>(
     }
 }
 
+fn make_flow_retention_cleanup_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_retention_cleanup");
+
+    match parse_flow_options(env, args, arg_bytes, 0, flow_retention_cleanup_option) {
+        Ok(opts) => (tag, opts).encode(env),
+        Err(err) => (tag, err).encode(env),
+    }
+}
+
 type FlowOptionParser<'a> =
     fn(Env<'a>, &[Term<'a>], &[&[u8]], usize) -> Result<Option<Term<'a>>, Term<'a>>;
 
@@ -6871,6 +6889,24 @@ fn flow_history_option<'a>(
                 FlowOptType::Boolean,
             ),
             (b"VALUES", "values", FlowOptType::Boolean),
+        ],
+    )
+}
+
+fn flow_retention_cleanup_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"LIMIT", "limit", FlowOptType::Positive(b"limit")),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
         ],
     )
 }
@@ -9188,6 +9224,10 @@ mod tests {
         assert_eq!(
             classify_command_ast(b"FLOW.BY_CORRELATION", 0),
             CommandAstKind::FlowByCorrelation
+        );
+        assert_eq!(
+            classify_command_ast(b"FLOW.RETENTION_CLEANUP", 0),
+            CommandAstKind::FlowRetentionCleanup
         );
     }
 

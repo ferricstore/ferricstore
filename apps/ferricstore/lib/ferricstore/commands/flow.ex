@@ -146,6 +146,10 @@ defmodule Ferricstore.Commands.Flow do
     FerricStore.flow_history(id, opts) |> normalize_result()
   end
 
+  def handle_ast({:flow_retention_cleanup, opts}, _store) when is_list(opts) do
+    FerricStore.flow_retention_cleanup(opts) |> normalize_result()
+  end
+
   def handle_ast({tag, _args}, _store) when is_atom(tag),
     do: {:error, "ERR wrong number of arguments for '#{command_name(tag)}' command"}
 
