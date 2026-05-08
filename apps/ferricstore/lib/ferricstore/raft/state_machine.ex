@@ -1991,23 +1991,28 @@ defmodule Ferricstore.Raft.StateMachine do
 
       record_cross_shard_pending_original(ctx, key)
 
-      if tx_binary_ref do
-        new_bytes = binary_byte_size(key) + binary_byte_size(value_for)
+      unless standalone_staged_apply?() do
+        if tx_binary_ref do
+          new_bytes = binary_byte_size(key) + binary_byte_size(value_for)
 
-        old_bytes =
-          case :ets.lookup(ctx.keydir, key) do
-            [{^key, old_val, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(old_val)
-            _ -> 0
-          end
+          old_bytes =
+            case :ets.lookup(ctx.keydir, key) do
+              [{^key, old_val, _, _, _, _, _}] ->
+                binary_byte_size(key) + binary_byte_size(old_val)
 
-        delta = new_bytes - old_bytes
-        if delta != 0, do: :atomics.add(tx_binary_ref, ctx.index + 1, delta)
+              _ ->
+                0
+            end
+
+          delta = new_bytes - old_bytes
+          if delta != 0, do: :atomics.add(tx_binary_ref, ctx.index + 1, delta)
+        end
+
+        :ets.insert(
+          ctx.keydir,
+          {key, value_for, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
+        )
       end
-
-      :ets.insert(
-        ctx.keydir,
-        {key, value_for, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
-      )
 
       sm_tx_put_pending(key, value, expire_at_ms)
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
@@ -2028,17 +2033,20 @@ defmodule Ferricstore.Raft.StateMachine do
     delete_in_ctx = fn ctx, key ->
       record_cross_shard_pending_original(ctx, key)
 
-      if tx_binary_ref do
-        bytes =
-          case :ets.lookup(ctx.keydir, key) do
-            [{^key, val, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(val)
-            _ -> 0
-          end
+      unless standalone_staged_apply?() do
+        if tx_binary_ref do
+          bytes =
+            case :ets.lookup(ctx.keydir, key) do
+              [{^key, val, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(val)
+              _ -> 0
+            end
 
-        if bytes > 0, do: :atomics.sub(tx_binary_ref, ctx.index + 1, bytes)
+          if bytes > 0, do: :atomics.sub(tx_binary_ref, ctx.index + 1, bytes)
+        end
+
+        :ets.delete(ctx.keydir, key)
       end
 
-      :ets.delete(ctx.keydir, key)
       sm_tx_drop_pending(key)
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
       Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
@@ -4434,6 +4442,8 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flush_cross_shard_pending_writes(state, pending, txid) do
+    staged_publish? = standalone_staged_apply?()
+
     pending
     |> Enum.group_by(&cross_shard_pending_target/1)
     |> Enum.reduce_while({:ok, state, []}, fn {{idx, file_path, file_id, keydir}, entries},
@@ -4444,7 +4454,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
       case validated_append_result do
         {:ok, locations} ->
-          apply_cross_shard_pending_locations(keydir, file_id, entries, locations)
+          unless staged_publish? do
+            apply_cross_shard_pending_locations(keydir, file_id, entries, locations)
+          end
 
           acc_state =
             acc_state
@@ -4456,7 +4468,7 @@ defmodule Ferricstore.Raft.StateMachine do
             )
             |> mark_cross_shard_checkpoint_dirty(idx)
 
-          group = {idx, file_path, file_id, keydir, entries}
+          group = {idx, file_path, file_id, keydir, entries, locations}
           {:cont, {:ok, acc_state, [group | successful_groups]}}
 
         {:error, reason} ->
@@ -4464,9 +4476,13 @@ defmodule Ferricstore.Raft.StateMachine do
       end
     end)
     |> case do
-      {:ok, flushed_state, _successful_groups} ->
+      {:ok, flushed_state, successful_groups} ->
         case commit_standalone_cross_shard_tx(flushed_state, txid) do
           :ok ->
+            if staged_publish? do
+              publish_cross_shard_pending_groups(flushed_state, successful_groups)
+            end
+
             {:ok, flushed_state}
 
           {:error, reason} ->
@@ -4566,6 +4582,50 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
+  defp publish_cross_shard_pending_groups(state, successful_groups) do
+    ref = keydir_binary_ref(state)
+
+    Enum.each(successful_groups, fn {_idx, _file_path, file_id, keydir, entries, locations} ->
+      publish_cross_shard_pending_locations(ref, keydir, file_id, entries, locations)
+    end)
+  end
+
+  defp publish_cross_shard_pending_locations(ref, keydir, file_id, entries, locations) do
+    Enum.zip(entries, locations)
+    |> only_latest_cross_shard_entries()
+    |> Enum.each(fn
+      {{:put, idx, ^keydir, _file_path, ^file_id, key, ets_value, _disk_value, exp},
+       {:put, offset, value_size}} ->
+        track_cross_shard_keydir_binary_publish(ref, keydir, idx, key, ets_value)
+        :ets.insert(keydir, {key, ets_value, exp, LFU.initial(), file_id, offset, value_size})
+
+      {{:delete, idx, ^keydir, _file_path, ^file_id, key}, {:delete, _offset, _record_size}} ->
+        track_cross_shard_keydir_binary_publish(ref, keydir, idx, key, nil)
+        :ets.delete(keydir, key)
+    end)
+  end
+
+  defp track_cross_shard_keydir_binary_publish(nil, _keydir, _shard_index, _key, _new_value),
+    do: :ok
+
+  defp track_cross_shard_keydir_binary_publish(ref, keydir, shard_index, key, new_value) do
+    current_bytes =
+      case :ets.lookup(keydir, key) do
+        [{^key, value, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(value)
+        _ -> 0
+      end
+
+    new_bytes =
+      if is_nil(new_value) do
+        0
+      else
+        binary_byte_size(key) + binary_byte_size(new_value)
+      end
+
+    delta = new_bytes - current_bytes
+    if delta != 0, do: :atomics.add(ref, shard_index + 1, delta)
+  end
+
   defp only_latest_cross_shard_entries(entry_locations) do
     latest =
       entry_locations
@@ -4594,9 +4654,9 @@ defmodule Ferricstore.Raft.StateMachine do
     do: {keydir, key}
 
   defp compensate_cross_shard_partial_writes(state, successful_groups, originals) do
-    Enum.reduce_while(successful_groups, {:ok, state}, fn {idx, file_path, file_id, keydir,
-                                                           entries},
-                                                          {:ok, acc_state} ->
+    Enum.reduce_while(successful_groups, {:ok, state}, fn group, {:ok, acc_state} ->
+      {idx, file_path, file_id, keydir, entries} = cross_shard_successful_group_parts(group)
+
       case cross_shard_compensation_batch(idx, keydir, file_path, entries, originals) do
         {:ok, []} ->
           {:cont, {:ok, acc_state}}
@@ -4632,6 +4692,12 @@ defmodule Ferricstore.Raft.StateMachine do
       end
     end)
   end
+
+  defp cross_shard_successful_group_parts({idx, file_path, file_id, keydir, entries}),
+    do: {idx, file_path, file_id, keydir, entries}
+
+  defp cross_shard_successful_group_parts({idx, file_path, file_id, keydir, entries, _locations}),
+    do: {idx, file_path, file_id, keydir, entries}
 
   defp cross_shard_compensation_batch(idx, keydir, file_path, entries, originals) do
     entries

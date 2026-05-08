@@ -314,6 +314,8 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     assert message =~ "simulated_commit_marker_fsync_failure"
     assert_receive {:tx_log_fsync_dir, 0, _path}, 5_000
     assert_receive {:tx_log_fsync_dir, 1, _path}, 5_000
+    assert Router.get(ctx, key_a) == nil
+    assert Router.get(ctx, key_b) == nil
   after
     Application.delete_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
   end
@@ -339,6 +341,53 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     assert Router.get(ctx, key_a) == "value-a"
     assert Router.get(ctx, key_b) == "value-b"
     refute File.exists?(tx_log_path)
+  end
+
+  test "standalone cross-shard tx does not publish values before commit marker" do
+    parent = self()
+    ctx = FerricStore.Instance.get(:default)
+    key_a = "standalone:cross-shard:visibility:a"
+    key_b = key_on_different_shard(ctx, Router.shard_for(ctx, key_a))
+
+    assert :ok = Router.put(ctx, key_a, "old-a", 0)
+    assert :ok = Router.put(ctx, key_b, "old-b", 0)
+
+    Application.put_env(:ferricstore, :standalone_cross_shard_tx_hook, fn
+      {:prepared, _txid, _groups} ->
+        send(parent, {:standalone_cross_shard_tx_prepared, self()})
+
+        receive do
+          :release_standalone_cross_shard_tx -> :ok
+        after
+          5_000 -> {:error, :standalone_cross_shard_tx_hook_timeout}
+        end
+    end)
+
+    tx =
+      Task.async(fn ->
+        Ferricstore.Transaction.Coordinator.execute(
+          [
+            {"SET", [key_a, "new-a"]},
+            {"SET", [key_b, "new-b"]},
+            {"GET", [key_a]},
+            {"GET", [key_b]}
+          ],
+          %{},
+          nil
+        )
+      end)
+
+    assert_receive {:standalone_cross_shard_tx_prepared, hook_pid}, 5_000
+    assert Router.get(ctx, key_a) == "old-a"
+    assert Router.get(ctx, key_b) == "old-b"
+    refute Task.yield(tx, 50)
+
+    send(hook_pid, :release_standalone_cross_shard_tx)
+    assert [:ok, :ok, "new-a", "new-b"] = Task.await(tx, 5_000)
+    assert Router.get(ctx, key_a) == "new-a"
+    assert Router.get(ctx, key_b) == "new-b"
+  after
+    Application.delete_env(:ferricstore, :standalone_cross_shard_tx_hook)
   end
 
   test "standalone prepared cross-shard tx rolls forward on restart", %{tmp_dir: tmp_dir} do
