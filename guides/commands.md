@@ -29,6 +29,24 @@ SLOWLOG GET/LEN/RESET, COMMAND/COMMAND COUNT/COMMAND LIST/COMMAND INFO/COMMAND D
 MULTI, EXEC, DISCARD, WATCH, UNWATCH, SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH,
 CLIENT ID/SETNAME/GETNAME/INFO/LIST/TRACKING/CACHING/TRACKINGINFO/GETREDIR, HELLO, AUTH, QUIT, RESET
 
+### FerricStore-Native Flow Commands
+
+Flow commands are FerricStore-native workflow primitives, not Redis
+compatibility commands. They are exposed through RESP3 and the embedded API:
+
+`FLOW.CREATE`, `FLOW.CREATE_MANY`, `FLOW.SPAWN_CHILDREN`, `FLOW.GET`,
+`FLOW.CLAIM_DUE`, `FLOW.RECLAIM`, `FLOW.EXTEND_LEASE`, `FLOW.COMPLETE`,
+`FLOW.COMPLETE_MANY`, `FLOW.RETRY`, `FLOW.RETRY_MANY`, `FLOW.FAIL`,
+`FLOW.FAIL_MANY`, `FLOW.CANCEL`, `FLOW.CANCEL_MANY`, `FLOW.TRANSITION`,
+`FLOW.TRANSITION_MANY`, `FLOW.REWIND`, `FLOW.LIST`, `FLOW.BY_PARENT`,
+`FLOW.BY_ROOT`, `FLOW.BY_CORRELATION`, `FLOW.INFO`, `FLOW.STUCK`,
+`FLOW.HISTORY`, `FLOW.POLICY.SET`, `FLOW.POLICY.GET`, and
+`FLOW.RETENTION_CLEANUP`.
+
+Production semantics, retry policy, history caps, LMDB cold projection, and
+operator metrics are documented in `docs/flow-production-readiness.md` and
+`docs/flow-retry-policy.md`.
+
 ### Commands with Minor Differences
 
 | Command | Difference |

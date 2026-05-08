@@ -830,6 +830,10 @@ defmodule FerricStore do
   Default reads use the hot history index, bounded by `:history_hot_max_events`.
   Pass `include_cold: true` to include older history projected into LMDB.
   Pass `consistent_projection: true` to flush the async projection first.
+
+  History caps are set when the Flow is created. Defaults are
+  `history_hot_max_events: 1024` and `history_max_events: 100000`; hard caps are
+  `10000` hot events and `1000000` total durable events.
   """
   @spec flow_history(binary(), keyword()) :: {:ok, [{binary(), map()}]} | {:error, binary()}
   def flow_history(id, opts \\ [])

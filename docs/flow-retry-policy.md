@@ -83,6 +83,9 @@ FLOW.RETRY flow-1 lease-token FENCING 7 MAX_RETRIES 0 EXHAUSTED_TO payment_faile
 
 Terminal exhaustion clears `next_run_at_ms`; active-state exhaustion sets
 `next_run_at_ms` to the retry command time so workers can claim it immediately.
+Terminal exhaustion also runs normal terminal Flow hooks: parent child-group
+summaries, cross-shard parent updates, retention stamping, and child-close
+policy handling.
 
 ## Embedded API
 

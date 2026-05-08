@@ -3261,6 +3261,52 @@ defmodule Ferricstore.FlowTest do
     assert retry_fields["retry_exhausted_to"] == "failed"
   end
 
+  test "flow_retry terminal exhaustion updates cross-shard parent child group" do
+    parent = uid("flow-retry-parent-cross")
+    child = uid("flow-retry-child-cross")
+    {partition, _same_partition, other_partition} = mixed_partition_keys()
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    assert {:ok, waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child, type: "child", partition_key: other_partition}],
+               group_id: "retry-fanout",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :fail_parent,
+               on_parent_closed: :abandon_children,
+               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    assert waiting.state == "waiting_children"
+    claimed = create_claimed_flow_child(child, other_partition, "worker-retry-cross")
+
+    assert {:ok, exhausted_child} =
+             FerricStore.flow_retry(child, claimed.lease_token,
+               partition_key: other_partition,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000,
+               retry: [max_retries: 0, exhausted_to: "failed"]
+             )
+
+    assert exhausted_child.state == "failed"
+
+    assert {:ok, failed_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert failed_parent.state == "children_failed"
+    assert failed_parent.child_groups["retry-fanout"]["children"][child] == "failed"
+    assert failed_parent.child_groups["retry-fanout"]["summary"]["failed"] == 1
+  end
+
   test "flow_retry rejects invalid retry policy" do
     id = uid("flow-retry-policy-invalid")
 
@@ -4678,6 +4724,59 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, %{state: "queued"}} = FerricStore.flow_get(other_flow.id, partition_key: other)
   end
 
+  test "flow_retry_many terminal exhaustion updates cross-shard parent child group" do
+    parent = uid("flow-retry-many-parent-cross")
+    child = uid("flow-retry-many-child-cross")
+    {partition, _same_partition, other_partition} = mixed_partition_keys()
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    assert {:ok, waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child, type: "child", partition_key: other_partition}],
+               group_id: "retry-many-fanout",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :fail_parent,
+               on_parent_closed: :abandon_children,
+               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    assert waiting.state == "waiting_children"
+    claimed = create_claimed_flow_child(child, other_partition, "worker-retry-many-cross")
+
+    assert {:ok, [exhausted_child]} =
+             FerricStore.flow_retry_many(
+               nil,
+               [
+                 %{
+                   id: child,
+                   partition_key: other_partition,
+                   lease_token: claimed.lease_token,
+                   fencing_token: claimed.fencing_token
+                 }
+               ],
+               now_ms: 2_000,
+               retry: [max_retries: 0, exhausted_to: "failed"]
+             )
+
+    assert exhausted_child.state == "failed"
+
+    assert {:ok, failed_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert failed_parent.state == "children_failed"
+    assert failed_parent.child_groups["retry-many-fanout"]["children"][child] == "failed"
+    assert failed_parent.child_groups["retry-many-fanout"]["summary"]["failed"] == 1
+  end
+
   test "flow_fail_many spans shards and rolls back failing shard group" do
     {same_a, same_b, other} = mixed_partition_keys()
     type = uid("bulk-mixed-fail")
@@ -5548,6 +5647,58 @@ defmodule Ferricstore.FlowTest do
 
     assert {:error, "ERR flow rewind target event not found"} =
              FerricStore.flow_rewind(id, to_event: "999999-0")
+  end
+
+  test "flow_rewind rejects parent and child flows" do
+    parent = uid("flow-rewind-parent")
+    child = uid("flow-rewind-child")
+    {partition, _same_partition, other_partition} = mixed_partition_keys()
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [{parent_created_event_id, _fields} | _]} =
+             FerricStore.flow_history(parent, partition_key: partition, count: 10)
+
+    assert {:ok, _waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child, type: "child", partition_key: other_partition}],
+               group_id: "rewind-fanout",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :ignore,
+               on_parent_closed: :abandon_children,
+               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert {:ok, [{child_created_event_id, _fields} | _]} =
+             FerricStore.flow_history(child, partition_key: other_partition, count: 10)
+
+    assert {:error, "ERR flow cannot rewind parent or child flow"} =
+             FerricStore.flow_rewind(parent,
+               partition_key: partition,
+               to_event: parent_created_event_id,
+               expect_state: "waiting_children",
+               now_ms: 3_000
+             )
+
+    assert {:error, "ERR flow cannot rewind parent or child flow"} =
+             FerricStore.flow_rewind(child,
+               partition_key: other_partition,
+               to_event: child_created_event_id,
+               expect_state: "running",
+               now_ms: 3_000
+             )
   end
 
   test "terminal retention from create expires flow state record" do

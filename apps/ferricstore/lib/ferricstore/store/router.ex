@@ -3383,8 +3383,14 @@ defmodule Ferricstore.Store.Router do
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
     else
-      idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_retry, key, attrs})
+      case flow_cross_terminal_keys(ctx, id, Map.get(attrs, :partition_key)) do
+        {:ok, keys} ->
+          flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal, :retry, attrs})
+
+        :same_or_none ->
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_retry, key, attrs})
+      end
     end
   end
 
@@ -3396,13 +3402,25 @@ defmodule Ferricstore.Store.Router do
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
     else
-      idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_retry_many, key, %{records: attrs_list}})
+      case flow_cross_terminal_many_keys(ctx, attrs_list) do
+        {:ok, keys} ->
+          flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :retry, attrs_list})
+
+        :same_or_none ->
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_retry_many, key, %{records: attrs_list}})
+      end
     end
   end
 
   def flow_retry_many(ctx, nil, attrs_list) when is_list(attrs_list) do
-    flow_many_by_shard(ctx, attrs_list, :flow_retry_many, "__retry_batch__")
+    case flow_cross_terminal_many_keys(ctx, attrs_list) do
+      {:ok, keys} ->
+        flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :retry, attrs_list})
+
+      :same_or_none ->
+        flow_many_by_shard(ctx, attrs_list, :flow_retry_many, "__retry_batch__")
+    end
   end
 
   @doc false

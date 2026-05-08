@@ -1919,7 +1919,7 @@ defmodule Ferricstore.Raft.StateMachine do
          _store,
          state
        ) do
-    if op in [:complete, :fail, :cancel] do
+    if op in [:complete, :retry, :fail, :cancel] do
       do_flow_cross_terminal(state, op, attrs)
     else
       {:error, "ERR invalid flow cross-shard terminal op"}
@@ -1932,7 +1932,7 @@ defmodule Ferricstore.Raft.StateMachine do
          _store,
          state
        ) do
-    if op in [:complete, :fail, :cancel] do
+    if op in [:complete, :retry, :fail, :cancel] do
       do_flow_cross_terminal_many(state, op, attrs_list)
     else
       {:error, "ERR invalid flow cross-shard terminal op"}
@@ -6579,7 +6579,8 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "retry", now_ms, history_meta),
-         :ok <- flow_after_history_put(state, next) do
+         :ok <- flow_after_history_put(state, next),
+         :ok <- flow_maybe_after_retry_terminal(state, next, now_ms) do
       :ok
     end
   end
@@ -6625,9 +6626,33 @@ defmodule Ferricstore.Raft.StateMachine do
     with :ok <- flow_many_put_record_values(state, plans),
          :ok <- flow_transition_move_indexes(state, pair_plans),
          :ok <- flow_claim_put_state_records(state, pair_plans),
-         :ok <- flow_retry_many_put_history(state, history_plans) do
+         :ok <- flow_retry_many_put_history(state, history_plans),
+         :ok <- flow_many_after_retry_terminal(state, pair_plans) do
       :ok
     end
+  end
+
+  defp flow_maybe_after_retry_terminal(state, next, now_ms) do
+    status = Map.get(next, :state)
+
+    if Ferricstore.Flow.LMDB.terminal_state?(status) do
+      with :ok <- flow_maybe_cancel_children_on_parent_closed(state, next, now_ms) do
+        flow_maybe_apply_child_terminal(state, next, status, now_ms)
+      end
+    else
+      :ok
+    end
+  end
+
+  defp flow_many_after_retry_terminal(state, plans) do
+    Enum.reduce_while(plans, :ok, fn {_record, next}, :ok ->
+      now_ms = Map.get(next, :updated_at_ms, apply_now_ms())
+
+      case flow_maybe_after_retry_terminal(state, next, now_ms) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp do_flow_fail(state, %{id: id, lease_token: lease_token} = attrs) do
@@ -6866,6 +6891,29 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp do_flow_cross_terminal(state, :retry, %{id: id, lease_token: lease_token} = attrs) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
+    child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
+
+    with {:ok, record} <- flow_require_record(child_state, id, partition_key),
+         {:ok, record, next, history_meta} <-
+           flow_prepare_retry_existing_record(child_state, record, attrs, lease_token, now_ms),
+         :ok <-
+           flow_apply_retry_local(
+             child_state,
+             record,
+             next,
+             partition_key,
+             now_ms,
+             history_meta,
+             attrs
+           ),
+         :ok <- flow_maybe_apply_cross_terminal_chain(state, next, now_ms) do
+      {:ok, next}
+    end
+  end
+
   defp do_flow_cross_terminal(state, :cancel, %{id: id} = attrs) do
     now_ms = Map.get(attrs, :now_ms, apply_now_ms())
     partition_key = Map.get(attrs, :partition_key)
@@ -6880,19 +6928,26 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_flow_cross_terminal_many(state, op, [_ | _] = attrs_list)
-       when op in [:complete, :fail, :cancel] do
+       when op in [:complete, :retry, :fail, :cancel] do
     with :ok <- flow_transition_many_unique?(attrs_list),
          {:ok, plans} <- flow_cross_terminal_many_prepare(state, op, attrs_list),
          :ok <- flow_cross_terminal_many_apply(state, op, plans) do
-      {:ok,
-       Enum.map(plans, fn {_child_state, _record, next, _attrs, _partition_key, _now_ms} ->
-         next
-       end)}
+      {:ok, Enum.map(plans, &flow_cross_terminal_plan_next/1)}
     end
   end
 
   defp do_flow_cross_terminal_many(_state, _op, _attrs),
     do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp flow_cross_terminal_plan_next(
+         {_child_state, _record, next, _attrs, _partition_key, _now_ms}
+       ),
+       do: next
+
+  defp flow_cross_terminal_plan_next(
+         {_child_state, _record, next, _attrs, _partition_key, _now_ms, _history_meta}
+       ),
+       do: next
 
   defp flow_cross_terminal_many_prepare(state, op, attrs_list) do
     attrs_list
@@ -6931,6 +6986,19 @@ defmodule Ferricstore.Raft.StateMachine do
          {:ok, record, next} <-
            flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms) do
       {:ok, {child_state, record, next, attrs, partition_key, now_ms}}
+    end
+  end
+
+  defp flow_cross_terminal_prepare(state, :retry, %{id: id, lease_token: lease_token} = attrs)
+       when is_binary(id) and id != "" do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
+    child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
+
+    with {:ok, record} <- flow_require_record(child_state, id, partition_key),
+         {:ok, record, next, history_meta} <-
+           flow_prepare_retry_existing_record(child_state, record, attrs, lease_token, now_ms) do
+      {:ok, {child_state, record, next, attrs, partition_key, now_ms, history_meta}}
     end
   end
 
@@ -6980,6 +7048,25 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_cross_terminal_apply_plan(
          state,
+         :retry,
+         {child_state, record, next, attrs, partition_key, now_ms, history_meta}
+       ) do
+    with :ok <-
+           flow_apply_retry_local(
+             child_state,
+             record,
+             next,
+             partition_key,
+             now_ms,
+             history_meta,
+             attrs
+           ) do
+      flow_maybe_apply_cross_terminal_chain(state, next, now_ms)
+    end
+  end
+
+  defp flow_cross_terminal_apply_plan(
+         state,
          :cancel,
          {child_state, record, next, attrs, partition_key, now_ms}
        ) do
@@ -7023,6 +7110,29 @@ defmodule Ferricstore.Raft.StateMachine do
          :ok <- flow_history_put_planned(state, record, next, "cancelled", now_ms),
          :ok <- flow_after_history_put(state, next) do
       flow_maybe_cancel_children_on_parent_closed(state, next, now_ms)
+    end
+  end
+
+  defp flow_apply_retry_local(state, record, next, partition_key, now_ms, history_meta, attrs) do
+    plans = [{record, next}]
+
+    with :ok <- flow_put_record_values(state, next, attrs),
+         :ok <- flow_transition_move_indexes(state, plans),
+         :ok <- flow_put_state_record(state, FlowKeys.state_key(next.id, partition_key), next),
+         :ok <- flow_history_put_planned(state, record, next, "retry", now_ms, history_meta) do
+      flow_after_history_put(state, next)
+    end
+  end
+
+  defp flow_maybe_apply_cross_terminal_chain(state, next, now_ms) do
+    status = Map.get(next, :state)
+
+    if Ferricstore.Flow.LMDB.terminal_state?(status) do
+      with :ok <- flow_maybe_cancel_children_on_parent_closed(state, next, now_ms) do
+        flow_apply_child_terminal_chain(state, next, status, now_ms)
+      end
+    else
+      :ok
     end
   end
 
@@ -8310,6 +8420,14 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_require_rewindable(%{lease_token: token}) when is_binary(token),
     do: {:error, "ERR flow cannot rewind leased flow"}
+
+  defp flow_require_rewindable(%{parent_flow_id: parent_id})
+       when is_binary(parent_id) and parent_id != "",
+       do: {:error, "ERR flow cannot rewind parent or child flow"}
+
+  defp flow_require_rewindable(%{child_groups: groups})
+       when is_map(groups) and map_size(groups) > 0,
+       do: {:error, "ERR flow cannot rewind parent or child flow"}
 
   defp flow_require_rewindable(_record), do: :ok
 

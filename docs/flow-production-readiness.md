@@ -82,7 +82,8 @@ Defaults and guards:
 Terminal state changes are centralized through `FLOW.COMPLETE`, `FLOW.FAIL`, and
 `FLOW.CANCEL`. `FLOW.TRANSITION` rejects transitions into terminal states so
 parent/child hooks, summaries, cross-shard updates, and retention stamping stay
-on one path.
+on one path. `FLOW.RETRY` and `FLOW.RETRY_MANY` use the same terminal hook path
+when retry exhaustion moves a Flow into `completed`, `failed`, or `cancelled`.
 
 ## History Caps
 
@@ -104,9 +105,14 @@ Flow fairness is explicit, not global magic:
 - `priority` splits due queues into fixed priority bands.
 - `FLOW.CLAIM_DUE ... PARTITION ...` gives FIFO inside the selected partition and
   priority band.
+- `PARTITION ANY` / no partition uses a per-type rotating shard cursor for
+  wildcard claims so small limits do not always start from the same shard.
+- `STATE ANY` scans due states for the selected type; use explicit states when a
+  worker owns a narrow step.
 
-Under skew, run workers per hot partition or per partition group. Do not rely on
-one unpartitioned worker loop to provide cross-tenant fairness.
+Under skew, run workers per hot partition or partition group when strict tenant
+fairness matters. The wildcard cursor is bounded and fair enough for general
+workers, but it is not a replacement for explicit tenant/device worker pools.
 
 ## Query Scalability Bench
 

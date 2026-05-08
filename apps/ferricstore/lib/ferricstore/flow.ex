@@ -2933,28 +2933,20 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp pipeline_write_command({:complete, id, lease_token, opts}) do
-    with {:ok, attrs} <- complete_attrs(id, lease_token, opts) do
-      pipeline_state_command(:flow_complete, attrs)
-    end
+  defp pipeline_write_command({:complete, _id, _lease_token, _opts}) do
+    {:error, "ERR unsupported flow pipeline command"}
   end
 
-  defp pipeline_write_command({:retry, id, lease_token, opts}) do
-    with {:ok, attrs} <- retry_attrs(id, lease_token, opts) do
-      pipeline_state_command(:flow_retry, attrs)
-    end
+  defp pipeline_write_command({:retry, _id, _lease_token, _opts}) do
+    {:error, "ERR unsupported flow pipeline command"}
   end
 
-  defp pipeline_write_command({:fail, id, lease_token, opts}) do
-    with {:ok, attrs} <- fail_attrs(id, lease_token, opts) do
-      pipeline_state_command(:flow_fail, attrs)
-    end
+  defp pipeline_write_command({:fail, _id, _lease_token, _opts}) do
+    {:error, "ERR unsupported flow pipeline command"}
   end
 
-  defp pipeline_write_command({:cancel, id, opts}) do
-    with {:ok, attrs} <- cancel_attrs(id, opts) do
-      pipeline_state_command(:flow_cancel, attrs)
-    end
+  defp pipeline_write_command({:cancel, _id, _opts}) do
+    {:error, "ERR unsupported flow pipeline command"}
   end
 
   defp pipeline_write_command({:rewind, id, opts}) do
