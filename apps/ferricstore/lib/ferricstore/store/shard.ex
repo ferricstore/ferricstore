@@ -549,9 +549,28 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call(:standalone_cross_shard_barrier_release, _from, state) do
     state =
-      %{state | standalone_write_barrier: false}
-      |> drain_standalone_waiting()
-      |> flush_ready_standalone_batch()
+      cond do
+        state.writes_paused ->
+          state
+          |> clear_standalone_write_barrier()
+          |> reject_queued_standalone_commits(
+            {:standalone_durability_failed, :prior_standalone_write_failed}
+          )
+
+        state.last_flush_error != nil ->
+          state
+          |> clear_standalone_write_barrier()
+          |> reject_queued_standalone_commits(
+            {:standalone_durability_failed, state.last_flush_error}
+          )
+          |> Map.put(:writes_paused, true)
+
+        true ->
+          state
+          |> clear_standalone_write_barrier()
+          |> drain_standalone_waiting()
+          |> flush_ready_standalone_batch()
+      end
 
     {:reply, :ok, state}
   end
@@ -1542,6 +1561,19 @@ defmodule Ferricstore.Store.Shard do
 
   defp flush_ready_standalone_batch(%{standalone_batch: []} = state), do: state
   defp flush_ready_standalone_batch(state), do: flush_standalone_batch(state)
+
+  defp clear_standalone_write_barrier(state), do: %{state | standalone_write_barrier: false}
+
+  defp reject_queued_standalone_commits(state, reason) do
+    if timer = state.standalone_batch_timer do
+      Process.cancel_timer(timer)
+    end
+
+    reply_standalone_error(state.standalone_batch, reason)
+    reply_standalone_error(state.standalone_waiting, reason)
+
+    %{state | standalone_batch: [], standalone_batch_timer: nil, standalone_waiting: []}
+  end
 
   defp await_standalone_flush(%{standalone_flush_ref: nil} = state), do: state
 

@@ -360,6 +360,33 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     _ = GenServer.call(elem(ctx.shard_names, 0), :standalone_cross_shard_barrier_release, 5_000)
   end
 
+  test "standalone cross-shard barrier release rejects queued writes after fail-closed pause" do
+    ctx = FerricStore.Instance.get(:default)
+    key = key_on_same_shard(ctx, 0)
+    shard = elem(ctx.shard_names, 0)
+
+    assert :ok = GenServer.call(shard, :standalone_cross_shard_barrier_acquire, 5_000)
+
+    put_task = Task.async(fn -> Router.put(ctx, key, "must-not-apply", 0) end)
+
+    assert eventually(fn ->
+             %{waiting_count: waiting} =
+               GenServer.call(shard, :standalone_commit_debug, 5_000)
+
+             waiting == 1
+           end)
+
+    assert :ok = GenServer.call(shard, {:pause_writes}, 5_000)
+    assert :ok = GenServer.call(shard, :standalone_cross_shard_barrier_release, 5_000)
+
+    assert {:error, message} = Task.await(put_task, 5_000)
+    assert message =~ "ERR standalone durability failure"
+    assert Router.get(ctx, key) == nil
+  after
+    ctx = FerricStore.Instance.get(:default)
+    _ = GenServer.call(elem(ctx.shard_names, 0), :standalone_cross_shard_barrier_release, 5_000)
+  end
+
   test "standalone batch read-modify-write commands see staged values before publish" do
     ctx = FerricStore.Instance.get(:default)
     key = "standalone:group-commit:incr"
