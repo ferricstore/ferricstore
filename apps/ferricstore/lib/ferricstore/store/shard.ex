@@ -195,35 +195,13 @@ defmodule Ferricstore.Store.Shard do
       keydir_name =
         if ctx, do: elem(ctx.keydir_refs, index), else: :"keydir_#{index}"
 
-      keydir =
-        case :ets.whereis(keydir_name) do
-          :undefined ->
-            :ets.new(keydir_name, [
-              :set,
-              :public,
-              :named_table,
-              {:read_concurrency, true},
-              {:write_concurrency, :auto},
-              {:decentralized_counters, true}
-            ])
-
-          _ref ->
-            :ets.delete_all_objects(keydir_name)
-            # Reset off-heap binary byte counter for this shard
-            if ctx != nil and ctx.keydir_binary_bytes != nil do
-              :atomics.put(ctx.keydir_binary_bytes, index + 1, 0)
-            end
-
-            keydir_name
-        end
+      keydir = prepare_rebuilding_keydir(keydir_name, ctx, index)
 
       # Remove any leftover hot_cache table from a previous run.
       case :ets.whereis(:"hot_cache_#{index}") do
         :undefined -> :ok
         _ref -> :ets.delete(:"hot_cache_#{index}")
       end
-
-      ets = keydir
 
       instance_name = if ctx, do: ctx.name, else: :default
       {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, index)
@@ -256,6 +234,9 @@ defmodule Ferricstore.Store.Shard do
           flow_lookup
         )
       end)
+
+      keydir = publish_rebuilt_keydir(keydir, keydir_name)
+      ets = keydir
 
       # Only the default application instance owns Raft. Custom embedded shards
       # run local/direct, and direct shard tests pass non-default instance_ctx.
@@ -422,6 +403,52 @@ defmodule Ferricstore.Store.Shard do
 
         throw({:shard_init_failed, {:fsync_dir_failed, phase, reason}})
     end
+  end
+
+  defp prepare_rebuilding_keydir(keydir_name, ctx, index) do
+    # Do not expose an empty/partial final keydir during startup recovery.
+    # Router reads treat an existing table miss as authoritative, so rebuild
+    # into a private startup table and publish it only after recovery finishes.
+    delete_keydir_table(keydir_name)
+    reset_keydir_binary_counter(ctx, index)
+
+    temp_name = rebuilding_keydir_name(keydir_name)
+    delete_keydir_table(temp_name)
+
+    :ets.new(temp_name, keydir_table_options())
+  end
+
+  defp publish_rebuilt_keydir(temp_name, keydir_name) do
+    delete_keydir_table(keydir_name)
+    :ets.rename(temp_name, keydir_name)
+    keydir_name
+  end
+
+  defp rebuilding_keydir_name(keydir_name), do: :"#{keydir_name}.__rebuilding__"
+
+  defp keydir_table_options do
+    [
+      :set,
+      :public,
+      :named_table,
+      {:read_concurrency, true},
+      {:write_concurrency, :auto},
+      {:decentralized_counters, true}
+    ]
+  end
+
+  defp delete_keydir_table(name) do
+    case :ets.whereis(name) do
+      :undefined -> :ok
+      _ref -> :ets.delete(name)
+    end
+  end
+
+  defp reset_keydir_binary_counter(nil, _index), do: :ok
+  defp reset_keydir_binary_counter(%{keydir_binary_bytes: nil}, _index), do: :ok
+
+  defp reset_keydir_binary_counter(%{keydir_binary_bytes: keydir_binary_bytes}, index) do
+    :atomics.put(keydir_binary_bytes, index + 1, 0)
   end
 
   defp profile_startup_phase(index, phase, fun) when is_function(fun, 0) do

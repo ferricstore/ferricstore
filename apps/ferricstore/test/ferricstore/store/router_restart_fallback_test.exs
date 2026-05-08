@@ -1,6 +1,10 @@
 defmodule Ferricstore.Store.RouterRestartFallbackTest do
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.DataDir
+  alias Ferricstore.Store.Shard
+  alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Router
 
   test "get returns nil instead of exiting when ETS and shard are temporarily unavailable" do
@@ -127,6 +131,74 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
     assert_unavailable_event(:get_meta)
   end
 
+  test "get does not treat rebuilding keydir as an authoritative miss" do
+    name = :"router_recover_keydir_#{System.unique_integer([:positive])}"
+    tmp_dir = Path.join(System.tmp_dir!(), Atom.to_string(name))
+    DataDir.ensure_layout!(tmp_dir, 1)
+
+    ctx =
+      FerricStore.Instance.build(name,
+        data_dir: tmp_dir,
+        shard_count: 1,
+        hot_cache_max_value_size: 0,
+        read_sample_rate: 0
+      )
+
+    shard_path = DataDir.shard_data_path(tmp_dir, 0)
+    log_path = ShardETS.file_path(shard_path, 0)
+    key = "restart:recover:last-key"
+
+    value = :binary.copy("x", 64 * 1024)
+
+    records =
+      for(i <- 1..511, do: {"restart:recover:filler:#{i}", value, 0}) ++
+        [{key, "value", 0}]
+
+    assert {:ok, _locations} = NIF.v2_append_batch(log_path, records)
+
+    handler_id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :store, :shard_unavailable],
+        &__MODULE__.handle_telemetry/4,
+        self()
+      )
+
+    start_task =
+      Task.async(fn ->
+        case Shard.start_link(
+               index: 0,
+               data_dir: tmp_dir,
+               instance_ctx: ctx,
+               flush_interval_ms: 60_000
+             ) do
+          {:ok, pid} = result ->
+            Process.unlink(pid)
+            result
+
+          other ->
+            other
+        end
+      end)
+
+    try do
+      refute observe_authoritative_miss_while_rebuilding(ctx, key, start_task)
+      assert {:ok, _pid} = Task.await(start_task, 10_000)
+      assert "value" == Router.get(ctx, key)
+    after
+      case Process.whereis(Router.resolve_shard(ctx, 0)) do
+        nil -> :ok
+        pid -> GenServer.stop(pid)
+      end
+
+      :telemetry.detach(handler_id)
+      FerricStore.Instance.cleanup(name)
+      File.rm_rf(tmp_dir)
+    end
+  end
+
   test "compound reads fallback and report unavailable shards" do
     ctx = unavailable_ctx()
     redis_key = "restart:compound"
@@ -216,5 +288,57 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
   defp assert_keydir_unavailable_event(request) do
     assert_receive {:telemetry_event, [:ferricstore, :store, :shard_unavailable], %{count: 1},
                     %{request: ^request, reason: :keydir_unavailable, shard_index: 0}}
+  end
+
+  defp observe_authoritative_miss_while_rebuilding(ctx, key, start_task) do
+    keydir = elem(ctx.keydir_refs, 0)
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    observe_authoritative_miss_while_rebuilding(ctx, key, keydir, start_task, deadline)
+  end
+
+  defp observe_authoritative_miss_while_rebuilding(ctx, key, keydir, start_task, deadline) do
+    if System.monotonic_time(:millisecond) > deadline do
+      false
+    else
+      if Process.alive?(start_task.pid) do
+        if final_keydir_missing_key?(keydir, key) do
+          drain_unavailable_events()
+          _ = Router.get(ctx, key)
+          !received_unavailable_event?()
+        else
+          Process.sleep(1)
+          observe_authoritative_miss_while_rebuilding(ctx, key, keydir, start_task, deadline)
+        end
+      else
+        false
+      end
+    end
+  end
+
+  defp final_keydir_missing_key?(keydir, key) do
+    case :ets.whereis(keydir) do
+      :undefined -> false
+      _tid -> :ets.lookup(keydir, key) == []
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  defp drain_unavailable_events do
+    receive do
+      {:telemetry_event, [:ferricstore, :store, :shard_unavailable], _measurements, _metadata} ->
+        drain_unavailable_events()
+    after
+      0 -> :ok
+    end
+  end
+
+  defp received_unavailable_event? do
+    receive do
+      {:telemetry_event, [:ferricstore, :store, :shard_unavailable], _measurements, _metadata} ->
+        true
+    after
+      20 -> false
+    end
   end
 end
