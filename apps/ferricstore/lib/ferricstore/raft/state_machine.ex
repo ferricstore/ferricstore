@@ -5291,12 +5291,13 @@ defmodule Ferricstore.Raft.StateMachine do
   defp maybe_put_retention_override(map, _key, nil), do: map
   defp maybe_put_retention_override(map, key, value), do: Map.put(map, key, value)
 
-  defp flow_stamp_terminal_retention(record, _now_ms) do
+  defp flow_stamp_terminal_retention(record, now_ms) do
     if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
       retention_ttl_ms = Map.get(record, :retention_ttl_ms)
 
       if is_integer(retention_ttl_ms) and retention_ttl_ms > 0 do
-        Map.put(record, :terminal_retention_until_ms, apply_now_ms() + retention_ttl_ms)
+        retention_start_ms = max(now_ms, apply_now_ms())
+        Map.put(record, :terminal_retention_until_ms, retention_start_ms + retention_ttl_ms)
       else
         Map.put(record, :terminal_retention_until_ms, nil)
       end

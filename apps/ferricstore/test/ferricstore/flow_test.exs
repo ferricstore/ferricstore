@@ -5539,6 +5539,36 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, nil} = FerricStore.flow_get(id)
   end
 
+  test "terminal retention uses wall-valid command time" do
+    id = uid("flow-terminal-command-time-ttl")
+    create_now = System.system_time(:millisecond) + 60_000
+    complete_now = create_now + 10_000
+
+    assert {:ok, _created} =
+             FerricStore.flow_create(id,
+               type: "ttl-command-time",
+               run_at_ms: create_now,
+               retention_ttl_ms: 5_000,
+               now_ms: create_now
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("ttl-command-time",
+               worker: "worker-command-time",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: create_now
+             )
+
+    assert {:ok, completed} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: complete_now
+             )
+
+    assert completed.terminal_retention_until_ms == complete_now + 5_000
+  end
+
   test "terminal retention expires queryable flow history" do
     id = uid("flow-terminal-history-ttl")
 
