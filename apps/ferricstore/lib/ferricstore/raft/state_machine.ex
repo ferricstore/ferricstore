@@ -7437,15 +7437,83 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_flow_retention_cleanup(state, attrs) do
     now_ms = Map.get(attrs, :now_ms, apply_now_ms())
     limit = Map.get(attrs, :limit, 100)
+    ets_entries = flow_retention_expired_state_entries(state, now_ms, limit)
 
-    state
-    |> flow_retention_expired_state_entries(now_ms, limit)
-    |> Enum.reduce_while({:ok, %{flows: 0, history: 0, values: 0}}, fn entry, {:ok, acc} ->
-      case flow_retention_cleanup_entry(state, entry) do
-        {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
-        {:error, _reason} = error -> {:halt, error}
+    ets_result =
+      Enum.reduce_while(ets_entries, {:ok, %{flows: 0, history: 0, values: 0}}, fn entry,
+                                                                                   {:ok, acc} ->
+        case flow_retention_cleanup_entry(state, entry) do
+          {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+
+    with {:ok, acc} <- ets_result do
+      seen =
+        ets_entries
+        |> Enum.map(fn {state_key, _value, _expire_at_ms, _fid, _offset, _value_size} ->
+          state_key
+        end)
+        |> MapSet.new()
+
+      state
+      |> flow_retention_expired_lmdb_state_keys(now_ms, max(limit - MapSet.size(seen), 0), seen)
+      |> Enum.reduce_while({:ok, acc}, fn state_key, {:ok, acc} ->
+        case flow_retention_cleanup_lmdb_state_key(state, state_key) do
+          {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+    end
+  end
+
+  defp flow_retention_expired_lmdb_state_keys(_state, _now_ms, remaining, _seen)
+       when remaining <= 0,
+       do: []
+
+  defp flow_retention_expired_lmdb_state_keys(state, now_ms, remaining, seen) do
+    if flow_lmdb_mirror?(state) do
+      case Ferricstore.Flow.LMDB.expired_terminal_state_keys(
+             flow_lmdb_record_path(state),
+             now_ms,
+             remaining
+           ) do
+        {:ok, state_keys} ->
+          Enum.reject(state_keys, &MapSet.member?(seen, &1))
+
+        {:error, _reason} ->
+          []
       end
-    end)
+    else
+      []
+    end
+  end
+
+  defp flow_retention_cleanup_lmdb_state_key(state, state_key) do
+    case flow_retention_decode_lmdb_state_record(state, state_key) do
+      {:ok, record} ->
+        if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+          flow_retention_cleanup_record(state, state_key, record)
+        else
+          {:ok, %{flows: 0, history: 0, values: 0}}
+        end
+
+      :miss ->
+        {:ok, %{flows: 0, history: 0, values: 0}}
+    end
+  end
+
+  defp flow_retention_decode_lmdb_state_record(state, state_key) do
+    case Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), state_key) do
+      {:ok, blob} ->
+        case Ferricstore.Flow.LMDB.decode_value(blob, 0) do
+          {:ok, value} -> flow_decode_record_blob(value)
+          _ -> :miss
+        end
+
+      _ ->
+        :miss
+    end
   end
 
   defp flow_retention_expired_state_entries(state, now_ms, limit) do
@@ -7536,17 +7604,77 @@ defmodule Ferricstore.Raft.StateMachine do
        ], [:"$1"]}
     ]
 
-    state.ets
-    |> :ets.select(match_spec)
-    |> Enum.map(fn key -> {key, binary_part(key, prefix_len, byte_size(key) - prefix_len)} end)
+    ets_entries =
+      state.ets
+      |> :ets.select(match_spec)
+      |> Enum.map(fn key -> {key, binary_part(key, prefix_len, byte_size(key) - prefix_len)} end)
+
+    lmdb_entries =
+      if flow_lmdb_mirror?(state) do
+        case Ferricstore.Flow.LMDB.history_compound_entries(
+               flow_lmdb_record_path(state),
+               history_key,
+               flow_retention_history_lmdb_scan_limit()
+             ) do
+          {:ok, entries} -> entries
+          {:error, _reason} -> []
+        end
+      else
+        []
+      end
+
+    (ets_entries ++ lmdb_entries)
+    |> Enum.uniq_by(fn {key, _event_id} -> key end)
   end
 
   defp flow_retention_delete_history_index(_state, _history_key, []), do: :ok
 
   defp flow_retention_delete_history_index(state, history_key, entries) do
     event_ids = Enum.map(entries, fn {_key, event_id} -> event_id end)
-    flow_index_delete_members(state, history_key, event_ids)
+
+    with :ok <- flow_index_delete_members(state, history_key, event_ids) do
+      if flow_lmdb_mirror?(state) do
+        with_lmdb_mirror_shard(state, fn ->
+          Enum.each(entries, fn {_key, event_id} ->
+            queue_lmdb_history_index_delete(nil, history_key, event_id, flow_event_ms(event_id))
+          end)
+        end)
+      end
+
+      :ok
+    end
   end
+
+  defp flow_retention_history_lmdb_scan_limit do
+    :ferricstore
+    |> Application.get_env(:flow_lmdb_history_cleanup_scan_limit, 100_000)
+    |> flow_retention_positive_integer(100_000)
+  end
+
+  defp flow_retention_positive_integer(value, _default) when is_integer(value) and value > 0,
+    do: value
+
+  defp flow_retention_positive_integer(value, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, ""} when parsed > 0 -> parsed
+      _ -> default
+    end
+  end
+
+  defp flow_retention_positive_integer(_value, default), do: default
+
+  defp flow_event_ms(event_id) when is_binary(event_id) do
+    event_id
+    |> String.split("-", parts: 2)
+    |> case do
+      [ms, _seq] -> String.to_integer(ms)
+      _ -> 0
+    end
+  rescue
+    _ -> 0
+  end
+
+  defp flow_event_ms(_event_id), do: 0
 
   defp flow_retention_record_value_refs(record) do
     [:payload_ref, :result_ref, :error_ref]

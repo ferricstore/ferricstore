@@ -500,6 +500,32 @@ defmodule Ferricstore.Flow.LMDB do
 
   def sweep_expired_terminal(_path, _now_ms, _limit), do: {:ok, 0}
 
+  def expired_terminal_state_keys(path, now_ms, limit)
+      when is_binary(path) and is_integer(now_ms) and is_integer(limit) and limit > 0 do
+    with {:ok, entries} <- prefix_entries(path, terminal_expire_prefix(), limit) do
+      keys =
+        Enum.reduce_while(entries, [], fn {expire_key, expire_value}, acc ->
+          case terminal_expire_key_time(expire_key) do
+            {:ok, expire_at_ms} when expire_at_ms > now_ms ->
+              {:halt, acc}
+
+            {:ok, _expire_at_ms} ->
+              case expired_terminal_state_key(path, expire_value, now_ms) do
+                state_key when is_binary(state_key) -> {:cont, [state_key | acc]}
+                _ -> {:cont, acc}
+              end
+
+            :error ->
+              {:cont, acc}
+          end
+        end)
+
+      {:ok, keys |> Enum.reverse() |> Enum.uniq()}
+    end
+  end
+
+  def expired_terminal_state_keys(_path, _now_ms, _limit), do: {:ok, []}
+
   def sweep_expired_history(path, now_ms, limit)
       when is_binary(path) and is_integer(now_ms) and is_integer(limit) and limit > 0 do
     with {:ok, entries} <- prefix_entries(path, history_expire_prefix(), limit),
@@ -515,6 +541,28 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   def sweep_expired_history(_path, _now_ms, _limit), do: {:ok, 0}
+
+  def history_compound_entries(path, history_key, limit)
+      when is_binary(path) and is_binary(history_key) and is_integer(limit) and limit > 0 do
+    with {:ok, entries} <- prefix_entries(path, history_index_prefix(history_key), limit) do
+      decoded =
+        entries
+        |> Enum.flat_map(fn {_history_index_key, value} ->
+          case decode_history_index_value(value) do
+            {:ok, {event_id, _event_ms, _expire_at_ms, compound_key}} ->
+              [{compound_key, event_id}]
+
+            :error ->
+              []
+          end
+        end)
+        |> Enum.uniq()
+
+      {:ok, decoded}
+    end
+  end
+
+  def history_compound_entries(_path, _history_key, _limit), do: {:ok, []}
 
   def decode_terminal_index_value(blob) when is_binary(blob) do
     case :erlang.binary_to_term(blob, [:safe]) do
@@ -797,6 +845,26 @@ defmodule Ferricstore.Flow.LMDB do
 
       :error ->
         {[{:delete, expire_key}], counts, 0}
+    end
+  end
+
+  defp expired_terminal_state_key(path, expire_value, now_ms) do
+    with {:ok, {terminal_key, state_key, _count_key}} <-
+           decode_terminal_expire_value(expire_value),
+         {:ok, terminal_value} <- get(path, terminal_key),
+         {:ok, {_id, _updated_at_ms, expire_at_ms, decoded_state_key}} <-
+           decode_terminal_index_value(terminal_value),
+         true <- expire_at_ms > 0 and expire_at_ms <= now_ms do
+      decoded_state_key || state_key
+    else
+      :not_found ->
+        case decode_terminal_expire_value(expire_value) do
+          {:ok, {_terminal_key, state_key, _count_key}} -> state_key
+          :error -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 

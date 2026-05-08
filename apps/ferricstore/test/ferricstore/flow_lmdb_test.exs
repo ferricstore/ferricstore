@@ -533,6 +533,67 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :atomics.get(flush_failures, 1) == 0
   end
 
+  test "mirror writer flush failure marks shard degraded" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_writer_flush_failure_#{System.unique_integer([:positive])}"
+      )
+
+    instance_name = :"flow_lmdb_writer_flush_failure_#{System.unique_integer([:positive])}"
+    shard_index = 0
+    flush_failures = :atomics.new(1, signed: false)
+    degraded = :atomics.new(1, signed: false)
+
+    instance_ctx = %{
+      name: instance_name,
+      flow_lmdb_writer_flush_failures: flush_failures,
+      flow_lmdb_mirror_degraded: degraded
+    }
+
+    test_pid = self()
+    handler_id = {:flow_lmdb_writer_flush_degraded, self(), make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :flow, :lmdb_mirror, :degraded],
+      fn event, measurements, metadata, _config ->
+        send(test_pid, {:flow_lmdb_writer_flush_degraded, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler_id)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_ctx: instance_ctx}
+    )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:bad_op}])
+    assert {:error, _reason} = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+
+    assert :atomics.get(flush_failures, 1) == 1
+    assert :atomics.get(degraded, 1) == 1
+
+    assert_receive {:flow_lmdb_writer_flush_degraded,
+                    [:ferricstore, :flow, :lmdb_mirror, :degraded], %{count: 1},
+                    %{shard_index: ^shard_index, source: :flush}}
+  end
+
   test "mirror writer enqueue and flush failures are visible" do
     instance_name = :"flow_lmdb_missing_writer_#{System.unique_integer([:positive])}"
     shard_index = 19
@@ -1768,6 +1829,7 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
                partition_key: partition_key,
                fencing_token: claimed.fencing_token,
+               ttl_ms: 40,
                now_ms: 2_000
              )
 
@@ -1867,6 +1929,73 @@ defmodule Ferricstore.Flow.LMDBTest do
                partition_key: partition_key,
                include_cold: true
              )
+  end
+
+  test "retention cleanup removes terminal source rows after hot prune" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_hot_ttl = Application.get_env(:ferricstore, :flow_terminal_hot_ttl_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_terminal_hot_ttl_ms, 10)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_terminal_hot_ttl_ms, old_hot_ttl)
+    end)
+
+    partition_key = "tenant-hot-pruned-retention"
+    flow_type = "hot-pruned-retention"
+    id = "flow-hot-pruned-retention"
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               run_at_ms: 1_000,
+               retention_ttl_ms: 40,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-hot-pruned-retention",
+               partition_key: partition_key,
+               now_ms: 1_000
+             )
+
+    assert {:ok, %{state: "completed"}} =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> [] == :ets.lookup(elem(ctx.keydir_refs, 0), state_key) end,
+      "terminal state key was not hot-pruned",
+      200,
+      10
+    )
+
+    Process.sleep(60)
+
+    assert {:ok, cleaned} = Ferricstore.Flow.retention_cleanup(ctx, limit: 10)
+    assert cleaned.flows == 1
+    assert cleaned.history >= 1
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    restart_isolated_shard!(ctx, 0)
+
+    assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+    assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
   end
 
   test "history include_cold returns LMDB-projected events trimmed from hot index" do

@@ -314,6 +314,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
       {:error, reason, state} ->
         record_persist_failure(state.instance_ctx, state.shard_index)
         record_flush_failure(state.instance_ctx, state.shard_index)
+        mark_mirror_degraded(state.instance_ctx, state.shard_index, reason)
         publish_backlog(state, pending_age_us)
         emit_persist({:error, reason}, state, state.requested_index, started_at)
         emit_flush({:error, reason}, state, started_at, op_count, 0, pending_age_us)
@@ -327,13 +328,17 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp flush_ops_and_marker(state, ops, started_at) do
-    with {:ok, ops, state} <- expand_ops(state, ops),
-         :ok <- write_ops(state.path, ops),
-         :ok <- cache_terminal_counts(state.path, state.terminal_count_cache),
-         {:ok, state} <- persist_requested(state, started_at) do
-      {:ok, state, length(ops)}
-    else
-      {:error, reason} -> {:error, reason, state}
+    try do
+      with {:ok, ops, state} <- expand_ops(state, ops),
+           :ok <- write_ops(state.path, ops),
+           :ok <- cache_terminal_counts(state.path, state.terminal_count_cache),
+           {:ok, state} <- persist_requested(state, started_at) do
+        {:ok, state, length(ops)}
+      else
+        {:error, reason} -> {:error, reason, state}
+      end
+    catch
+      kind, reason -> {:error, {kind, reason}, state}
     end
   end
 
@@ -825,6 +830,29 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp record_flush_failure(_instance_ctx, _shard_index), do: :ok
+
+  defp mark_mirror_degraded(
+         %{flow_lmdb_mirror_degraded: degraded},
+         shard_index,
+         reason
+       )
+       when is_reference(degraded) do
+    if shard_index < :atomics.info(degraded).size do
+      :atomics.put(degraded, shard_index + 1, 1)
+    end
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb_mirror, :degraded],
+      %{count: 1},
+      %{shard_index: shard_index, reason: reason, source: :flush}
+    )
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp mark_mirror_degraded(_instance_ctx, _shard_index, _reason), do: :ok
 
   defp put_atomic_max(ref, shard_index, value) do
     if shard_index < :atomics.info(ref).size do
