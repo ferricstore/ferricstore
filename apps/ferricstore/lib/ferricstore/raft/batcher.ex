@@ -1569,35 +1569,34 @@ defmodule Ferricstore.Raft.Batcher do
   @doc false
   @spec compact_hot_batch([command()]) :: {command(), non_neg_integer()}
   def compact_hot_batch(commands) when is_list(commands) do
-    case compact_all_puts(commands, [], 0) do
-      {:ok, entries, count} ->
-        {{:put_batch, entries}, count}
-
-      :error ->
-        case compact_all_deletes(commands, [], 0) do
-          {:ok, keys, count} -> {{:delete_batch, keys}, count}
-          :error -> {{:batch, commands}, length(commands)}
-        end
-    end
+    compact_hot_batch(commands, commands, :unknown, [], 0)
   end
 
-  defp compact_all_puts([], [], _count), do: :error
-  defp compact_all_puts([], acc, count), do: {:ok, Enum.reverse(acc), count}
+  defp compact_hot_batch(_original, [], :put, entries, count),
+    do: {{:put_batch, Enum.reverse(entries)}, count}
 
-  defp compact_all_puts([{:put, key, value, expire_at_ms} | rest], acc, count) do
-    compact_all_puts(rest, [{key, value, expire_at_ms} | acc], count + 1)
-  end
+  defp compact_hot_batch(_original, [], :delete, keys, count),
+    do: {{:delete_batch, Enum.reverse(keys)}, count}
 
-  defp compact_all_puts(_commands, _acc, _count), do: :error
+  defp compact_hot_batch(original, [], _mode, _acc, count), do: {{:batch, original}, count}
 
-  defp compact_all_deletes([], [], _count), do: :error
-  defp compact_all_deletes([], acc, count), do: {:ok, Enum.reverse(acc), count}
+  defp compact_hot_batch(original, [{:put, key, value, expire_at_ms} | rest], :unknown, [], 0),
+    do: compact_hot_batch(original, rest, :put, [{key, value, expire_at_ms}], 1)
 
-  defp compact_all_deletes([{:delete, key} | rest], acc, count) do
-    compact_all_deletes(rest, [key | acc], count + 1)
-  end
+  defp compact_hot_batch(original, [{:put, key, value, expire_at_ms} | rest], :put, acc, count),
+    do: compact_hot_batch(original, rest, :put, [{key, value, expire_at_ms} | acc], count + 1)
 
-  defp compact_all_deletes(_commands, _acc, _count), do: :error
+  defp compact_hot_batch(original, [{:delete, key} | rest], :unknown, [], 0),
+    do: compact_hot_batch(original, rest, :delete, [key], 1)
+
+  defp compact_hot_batch(original, [{:delete, key} | rest], :delete, acc, count),
+    do: compact_hot_batch(original, rest, :delete, [key | acc], count + 1)
+
+  defp compact_hot_batch(original, [_other | rest], _mode, _acc, count),
+    do: {{:batch, original}, count_remaining(rest, count + 1)}
+
+  defp count_remaining([], count), do: count
+  defp count_remaining([_ | rest], count), do: count_remaining(rest, count + 1)
 
   # Enqueue a write that enters through a non-blocking call but must use the
   # quorum slot like every other user-visible write.

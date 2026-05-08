@@ -442,6 +442,46 @@ defmodule Ferricstore.FlowTest do
                     %{count: 4, gets: 3, histories: 1}, %{source: :pipeline}}
   end
 
+  test "pipeline_write_batch_independent works in standalone mode" do
+    previous_mode = Ferricstore.ReplicationMode.current()
+    Ferricstore.ReplicationMode.put_current(:standalone)
+
+    on_exit(fn ->
+      Ferricstore.ReplicationMode.put_current(previous_mode)
+    end)
+
+    ctx = FerricStore.Instance.get(:default)
+    partition_key = uid("flow-pipeline-write-standalone-partition")
+    id_a = uid("flow-pipeline-write-standalone-a")
+    id_b = uid("flow-pipeline-write-standalone-b")
+
+    assert [
+             {:ok, %{id: ^id_a, state: "queued"}},
+             {:ok, %{id: ^id_b, state: "queued"}}
+           ] =
+             Ferricstore.Flow.pipeline_write_batch_independent(ctx, [
+               {:create, id_a,
+                [
+                  type: "pipeline-write-standalone",
+                  state: "queued",
+                  run_at_ms: 1,
+                  now_ms: 1,
+                  partition_key: partition_key
+                ]},
+               {:create, id_b,
+                [
+                  type: "pipeline-write-standalone",
+                  state: "queued",
+                  run_at_ms: 1,
+                  now_ms: 1,
+                  partition_key: partition_key
+                ]}
+             ])
+
+    assert {:ok, %{id: ^id_a}} = FerricStore.flow_get(id_a, partition_key: partition_key)
+    assert {:ok, %{id: ^id_b}} = FerricStore.flow_get(id_b, partition_key: partition_key)
+  end
+
   test "pipeline_read_batch hydrates Flow GET payloads with per-command caps" do
     ctx = FerricStore.Instance.get(:default)
     id_a = uid("flow-pipeline-payload-a")

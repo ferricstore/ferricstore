@@ -1275,11 +1275,20 @@ defmodule Ferricstore.Raft.StateMachine do
 
   @doc false
   def apply_standalone_batch(commands, state) when is_list(commands) do
+    commands = flatten_standalone_batch_commands(commands)
+
     apply_standalone(fn ->
       case commands do
         [{:cross_shard_tx, _shard_batches} = command] -> apply(%{}, command, state)
         _other -> apply(%{}, {:batch, commands}, state)
       end
+    end)
+  end
+
+  defp flatten_standalone_batch_commands(commands) do
+    Enum.flat_map(commands, fn
+      {:batch, inner_commands} when is_list(inner_commands) -> inner_commands
+      command -> [command]
     end)
   end
 

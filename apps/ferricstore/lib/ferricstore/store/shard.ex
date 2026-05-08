@@ -1882,6 +1882,10 @@ defmodule Ferricstore.Store.Shard do
     |> Enum.each(fn {{from, _command, _keys}, result} -> GenServer.reply(from, result) end)
   end
 
+  defp reply_standalone_results([{from, {:batch, _commands}, _keys}], results) do
+    GenServer.reply(from, {:ok, results})
+  end
+
   defp reply_standalone_results(entries, [result]) do
     Enum.each(entries, fn {from, _command, _keys} -> GenServer.reply(from, result) end)
   end
