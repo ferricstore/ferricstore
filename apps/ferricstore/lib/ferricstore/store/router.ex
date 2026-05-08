@@ -270,6 +270,42 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @doc false
+  def standalone_cross_shard_tx(ctx, shard_batches) when is_list(shard_batches) do
+    touched =
+      shard_batches
+      |> Enum.map(fn {shard_idx, _queue, _sandbox_namespace} -> shard_idx end)
+      |> Enum.uniq()
+
+    case standalone_write(ctx, 0, {:cross_shard_tx, shard_batches}, :sync_no_version) do
+      {:error, _reason} = error ->
+        error
+
+      result ->
+        Enum.each(touched, fn idx -> bump_standalone_write_version(ctx, idx, 1) end)
+        result
+    end
+  end
+
+  defp standalone_write(ctx, idx, command, :sync_no_version) do
+    shard = elem(ctx.shard_names, idx)
+
+    if Ferricstore.ReplicationMode.current() == :enabling do
+      {:error, "ERR cluster promotion in progress"}
+    else
+      case GenServer.call(shard, {:standalone_commit_sync, command}, 30_000) do
+        {:error, {:standalone_durability_failed, reason}} ->
+          fail_closed_standalone_write(ctx, idx, reason)
+
+        {:error, _reason} = error ->
+          error
+
+        result ->
+          result
+      end
+    end
+  end
+
   defp fail_closed_standalone_write(ctx, _idx, reason) do
     Ferricstore.Health.set_ready(false)
     pause_all_standalone_shards(ctx)
@@ -4411,6 +4447,9 @@ defmodule Ferricstore.Store.Router do
           checked_lmove(key, destination, unified_store, from_dir, to_dir)
         end,
         intent: %{command: :lmove, keys: %{source: key, dest: destination}},
+        tx_entry:
+          {"LMOVE", [key, destination, Atom.to_string(from_dir), Atom.to_string(to_dir)],
+           {:lmove, key, destination, from_dir, to_dir}},
         instance: ctx
       )
     end

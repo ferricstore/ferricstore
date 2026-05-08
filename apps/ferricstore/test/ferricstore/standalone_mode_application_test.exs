@@ -16,6 +16,9 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     old_standalone_fsync_max_ops =
       Application.get_env(:ferricstore, :standalone_fsync_max_ops)
 
+    old_standalone_cross_shard_tx_hook =
+      Application.get_env(:ferricstore, :standalone_cross_shard_tx_hook)
+
     server_started? = application_started?(:ferricstore_server)
 
     tmp_dir =
@@ -45,6 +48,7 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
       restore_env(:standalone_durability_hook, old_standalone_durability_hook)
       restore_env(:standalone_fsync_max_delay_ms, old_standalone_fsync_max_delay_ms)
       restore_env(:standalone_fsync_max_ops, old_standalone_fsync_max_ops)
+      restore_env(:standalone_cross_shard_tx_hook, old_standalone_cross_shard_tx_hook)
       Ferricstore.ReplicationMode.put_current(:raft)
 
       {:ok, _} = Application.ensure_all_started(:ferricstore)
@@ -207,6 +211,63 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     Application.delete_env(:ferricstore, :standalone_durability_hook)
   end
 
+  test "standalone cross-shard command commits through durable tx path", %{tmp_dir: tmp_dir} do
+    ctx = FerricStore.Instance.get(:default)
+    key_a = "standalone:cross-shard:msetnx:a"
+    key_b = key_on_different_shard(ctx, Router.shard_for(ctx, key_a))
+    tx_log_path = Path.join(tmp_dir, "standalone_cross_shard_tx.log")
+
+    assert 1 =
+             Ferricstore.Commands.Strings.handle(
+               "MSETNX",
+               [key_a, "value-a", key_b, "value-b"],
+               %{}
+             )
+
+    assert Router.get(ctx, key_a) == "value-a"
+    assert Router.get(ctx, key_b) == "value-b"
+    refute File.exists?(tx_log_path)
+  end
+
+  test "standalone prepared cross-shard tx rolls forward on restart", %{tmp_dir: tmp_dir} do
+    parent = self()
+    ctx = FerricStore.Instance.get(:default)
+    key_a = "standalone:cross-shard:recover:a"
+    key_b = key_on_different_shard(ctx, Router.shard_for(ctx, key_a))
+    tx_log_path = Path.join(tmp_dir, "standalone_cross_shard_tx.log")
+
+    Application.put_env(:ferricstore, :standalone_cross_shard_tx_hook, fn
+      {:prepared, _txid, _groups} ->
+        send(parent, :standalone_cross_shard_tx_prepared)
+        {:error, :simulated_crash_after_prepare}
+    end)
+
+    assert {:error, message} =
+             Ferricstore.Commands.Strings.handle(
+               "MSETNX",
+               [key_a, "value-a", key_b, "value-b"],
+               %{}
+             )
+
+    assert message =~ "ERR standalone durability failure"
+    assert_receive :standalone_cross_shard_tx_prepared, 5_000
+    assert Router.get(ctx, key_a) == nil
+    assert Router.get(ctx, key_b) == nil
+    assert File.exists?(tx_log_path)
+
+    Application.delete_env(:ferricstore, :standalone_cross_shard_tx_hook)
+
+    assert :ok = Application.stop(:ferricstore)
+    stop_ra_system()
+    {:ok, _} = Application.ensure_all_started(:ferricstore)
+    wait_local_shards_alive()
+
+    ctx = FerricStore.Instance.get(:default)
+    assert Router.get(ctx, key_a) == "value-a"
+    assert Router.get(ctx, key_b) == "value-b"
+    refute File.exists?(tx_log_path)
+  end
+
   test "standalone batch read-modify-write commands see staged values before publish" do
     ctx = FerricStore.Instance.get(:default)
     key = "standalone:group-commit:incr"
@@ -262,6 +323,70 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
 
     assert 0 =
              Ferricstore.Store.Shard.ZSetIndex.count(zset_index, zset_lookup, key, :neg_inf, :inf)
+  after
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
+  test "standalone compound batch fsync failure does not publish hash state" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:hash-fsync-failure"
+    field = "field"
+    field_key = Ferricstore.Store.CompoundKey.hash_field(key, field)
+    type_key = Ferricstore.Store.CompoundKey.type_key(key)
+    shard_idx = Router.shard_for(ctx, key)
+    keydir = elem(ctx.keydir_refs, shard_idx)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      assert Enum.any?(batch, &match?({:put, ^field_key, "value", 0}, &1))
+      {:error, :simulated_eio}
+    end)
+
+    assert {:error, message} = FerricStore.hset(key, %{field => "value"})
+    assert message =~ "ERR standalone durability failure"
+    assert message =~ "write not applied"
+
+    assert [] = :ets.lookup(keydir, type_key)
+    assert [] = :ets.lookup(keydir, field_key)
+    refute Router.exists?(ctx, key)
+  after
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
+  test "standalone Flow fsync failure does not leak ordered indexes" do
+    ctx = FerricStore.Instance.get(:default)
+    id = "standalone-flow-fsync-failure"
+    type = "standalone-flow-index-failure"
+    partition_key = "tenant-flow-index-failure"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
+    state_index_key = Ferricstore.Flow.Keys.state_index_key(type, "queued", partition_key)
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    shard_idx = Router.shard_for(ctx, state_key)
+    keydir = elem(ctx.keydir_refs, shard_idx)
+    {_flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, shard_idx)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      assert Enum.any?(batch, &match?({:put, ^state_key, _value, 0}, &1))
+      {:error, :simulated_eio}
+    end)
+
+    assert {:error, message} =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "queued",
+               partition_key: partition_key
+             )
+
+    assert message =~ "ERR standalone durability failure"
+    assert message =~ "write not applied"
+
+    assert [] = :ets.lookup(keydir, state_key)
+    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: partition_key)
+    assert :miss = Ferricstore.Flow.OrderedIndex.score_of(flow_lookup, due_key, id)
+    assert :miss = Ferricstore.Flow.OrderedIndex.score_of(flow_lookup, state_index_key, id)
+    assert 0 = Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key)
+    assert 0 = Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, due_key)
+    assert 0 = Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, state_index_key)
   after
     Application.delete_env(:ferricstore, :standalone_durability_hook)
   end
@@ -676,9 +801,13 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     assert {:ok, %{id: ^id, state: "completed", version: version}} =
              FerricStore.flow_create(id, type: "terminal-lfu", state: "completed")
 
-    assert [{^state_key, nil, 0, {:flow_state_version, ^version, _lfu}, fid, off, vsize}] =
+    assert [
+             {^state_key, nil, expire_at_ms, {:flow_state_version, ^version, _lfu}, fid, off,
+              vsize}
+           ] =
              :ets.lookup(keydir, state_key)
 
+    assert is_integer(expire_at_ms)
     assert is_integer(fid)
     assert is_integer(off)
     assert is_integer(vsize)

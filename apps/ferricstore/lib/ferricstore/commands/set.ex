@@ -292,6 +292,7 @@ defmodule Ferricstore.Commands.Set do
         do_smove(source, destination, member, unified_store)
       end,
       intent: %{command: :smove, keys: %{source: source, dest: destination}, value_hashes: %{}},
+      tx_entry: {"SMOVE", [source, destination, member], {:smove, source, destination, member}},
       store: store
     )
   end
@@ -324,6 +325,7 @@ defmodule Ferricstore.Commands.Set do
         keys: %{dest: destination, sources: keys},
         value_hashes: %{}
       },
+      tx_entry: {"SDIFFSTORE", [destination | keys], {:sdiffstore, [destination | keys]}},
       store: store
     )
   end
@@ -360,6 +362,7 @@ defmodule Ferricstore.Commands.Set do
         keys: %{dest: destination, sources: keys},
         value_hashes: %{}
       },
+      tx_entry: {"SINTERSTORE", [destination | keys], {:sinterstore, [destination | keys]}},
       store: store
     )
   end
@@ -391,6 +394,7 @@ defmodule Ferricstore.Commands.Set do
         keys: %{dest: destination, sources: keys},
         value_hashes: %{}
       },
+      tx_entry: {"SUNIONSTORE", [destination | keys], {:sunionstore, [destination | keys]}},
       store: store
     )
   end
@@ -630,6 +634,7 @@ defmodule Ferricstore.Commands.Set do
         do_smove(source, destination, member, unified_store)
       end,
       intent: %{command: :smove, keys: %{source: source, dest: destination}, value_hashes: %{}},
+      tx_entry: {"SMOVE", [source, destination, member], {:smove, source, destination, member}},
       store: store
     )
   end
@@ -681,8 +686,14 @@ defmodule Ferricstore.Commands.Set do
         keys: %{dest: destination, sources: keys},
         value_hashes: %{}
       },
+      tx_entry: store_result_tx_entry(command, destination, keys),
       store: store
     )
+  end
+
+  defp store_result_tx_entry(command, destination, keys) do
+    name = command |> Atom.to_string() |> String.upcase()
+    {name, [destination | keys], {command, [destination | keys]}}
   end
 
   defp srandmember_one(key, store) do

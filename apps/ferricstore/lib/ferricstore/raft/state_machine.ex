@@ -89,6 +89,7 @@ defmodule Ferricstore.Raft.StateMachine do
     ListOps,
     Promotion,
     Router,
+    StandaloneTxLog,
     ValueCodec
   }
 
@@ -1203,11 +1204,25 @@ defmodule Ferricstore.Raft.StateMachine do
 
   @doc false
   def apply_standalone_batch(commands, state) when is_list(commands) do
+    apply_standalone(fn ->
+      case commands do
+        [{:cross_shard_tx, _shard_batches} = command] -> apply(%{}, command, state)
+        _other -> apply(%{}, {:batch, commands}, state)
+      end
+    end)
+  end
+
+  @doc false
+  def apply_standalone_command(command, state) do
+    apply_standalone(fn -> apply(%{}, command, state) end)
+  end
+
+  defp apply_standalone(fun) when is_function(fun, 0) do
     previous = Process.get(@sm_standalone_staged_key, :undefined)
     Process.put(@sm_standalone_staged_key, true)
 
     try do
-      apply(%{}, {:batch, commands}, state)
+      fun.()
     after
       case previous do
         :undefined -> Process.delete(@sm_standalone_staged_key)
@@ -4059,6 +4074,16 @@ defmodule Ferricstore.Raft.StateMachine do
       |> Process.put([])
       |> Enum.reverse()
 
+    case prepare_standalone_cross_shard_tx(state, pending) do
+      {:ok, txid} ->
+        flush_cross_shard_pending_writes(state, pending, txid)
+
+      {:error, reason} ->
+        {:error, {:standalone_cross_shard_tx_prepare_failed, reason}, state, []}
+    end
+  end
+
+  defp flush_cross_shard_pending_writes(state, pending, txid) do
     pending
     |> Enum.group_by(&cross_shard_pending_target/1)
     |> Enum.reduce_while({:ok, state, []}, fn {{idx, file_path, file_id, keydir}, entries},
@@ -4089,8 +4114,61 @@ defmodule Ferricstore.Raft.StateMachine do
       end
     end)
     |> case do
-      {:ok, flushed_state, _successful_groups} -> {:ok, flushed_state}
-      {:error, _reason, _partial_state, _successful_groups} = error -> error
+      {:ok, flushed_state, _successful_groups} ->
+        commit_standalone_cross_shard_tx(flushed_state, txid)
+        {:ok, flushed_state}
+
+      {:error, _reason, _partial_state, _successful_groups} = error ->
+        error
+    end
+  end
+
+  defp prepare_standalone_cross_shard_tx(state, pending) do
+    if standalone_staged_apply?() and cross_shard_tx_log_needed?(pending) do
+      groups =
+        pending
+        |> Enum.group_by(&cross_shard_pending_target/1)
+        |> Enum.map(fn {{_idx, file_path, _file_id, _keydir}, entries} ->
+          {file_path, Enum.map(entries, &cross_shard_pending_to_batch_entry/1)}
+        end)
+
+      with {:ok, txid} <- StandaloneTxLog.prepare(state.data_dir, groups),
+           :ok <- standalone_cross_shard_tx_hook({:prepared, txid, groups}) do
+        {:ok, txid}
+      end
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp cross_shard_tx_log_needed?(pending) do
+    pending
+    |> Enum.map(&cross_shard_pending_target/1)
+    |> Enum.uniq()
+    |> length()
+    |> Kernel.>(1)
+  end
+
+  defp commit_standalone_cross_shard_tx(_state, nil), do: :ok
+
+  defp commit_standalone_cross_shard_tx(state, txid) do
+    case StandaloneTxLog.commit(state.data_dir, txid) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "standalone cross-shard tx commit marker failed for #{inspect(txid)}: #{inspect(reason)}"
+        )
+
+        :ok
+    end
+  end
+
+  defp standalone_cross_shard_tx_hook(event) do
+    case Application.get_env(:ferricstore, :standalone_cross_shard_tx_hook) do
+      hook when is_function(hook, 1) -> hook.(event)
+      _other -> :ok
     end
   end
 

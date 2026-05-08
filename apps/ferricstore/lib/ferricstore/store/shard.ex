@@ -180,6 +180,10 @@ defmodule Ferricstore.Store.Shard do
       ctx = Keyword.get(opts, :instance_ctx)
       fsync_dir_fun = Keyword.get(opts, :fsync_dir_fun, &NIF.v2_fsync_dir/1)
 
+      if ctx && !Ferricstore.ReplicationMode.raft?() do
+        :ok = Ferricstore.Store.StandaloneTxLog.recover_once(data_dir)
+      end
+
       path = Ferricstore.DataDir.shard_data_path(data_dir, index)
 
       {active_file_id, active_file_size, active_file_path} =
@@ -522,6 +526,30 @@ defmodule Ferricstore.Store.Shard do
       |> maybe_flush_full_standalone_batch()
 
     {:noreply, state}
+  end
+
+  def handle_call(
+        {:standalone_commit_sync, {:cross_shard_tx, _shard_batches} = command},
+        _from,
+        state
+      ) do
+    sm_state = direct_sm_state(state)
+
+    case run_standalone_command(command, sm_state) do
+      {:ok, new_sm_state, result} ->
+        {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+
+      {:error, new_sm_state, reason} ->
+        state =
+          if new_sm_state do
+            apply_direct_sm_state(state, new_sm_state)
+          else
+            state
+          end
+
+        {:reply, {:error, {:standalone_durability_failed, reason}},
+         %{state | writes_paused: true}}
+    end
   end
 
   def handle_call(:standalone_commit_debug, _from, state) do
@@ -1370,15 +1398,19 @@ defmodule Ferricstore.Store.Shard do
     commands = Enum.map(entries, fn {_from, command, _keys} -> command end)
 
     try do
-      case Ferricstore.Raft.StateMachine.apply_standalone_batch(commands, sm_state) do
-        {new_sm_state, {:ok, results}} when is_list(results) ->
-          {:ok, new_sm_state, results}
+      if Enum.any?(commands, &match?({:cross_shard_tx, _}, &1)) do
+        run_standalone_commands_sequential(commands, sm_state)
+      else
+        case Ferricstore.Raft.StateMachine.apply_standalone_batch(commands, sm_state) do
+          {new_sm_state, {:ok, results}} when is_list(results) ->
+            {:ok, new_sm_state, results}
 
-        {new_sm_state, {:error, reason}} ->
-          {:error, new_sm_state, reason}
+          {new_sm_state, {:error, reason}} ->
+            {:error, new_sm_state, reason}
 
-        {new_sm_state, result} ->
-          {:ok, new_sm_state, List.wrap(result)}
+          {new_sm_state, result} ->
+            {:ok, new_sm_state, List.wrap(result)}
+        end
       end
     rescue
       error ->
@@ -1386,6 +1418,40 @@ defmodule Ferricstore.Store.Shard do
     catch
       kind, reason ->
         {:error, nil, {kind, reason}}
+    end
+  end
+
+  defp run_standalone_commands_sequential(commands, sm_state) do
+    Enum.reduce_while(commands, {:ok, sm_state, []}, fn command, {:ok, acc_state, results} ->
+      case run_standalone_command(command, acc_state) do
+        {:ok, new_state, result} ->
+          {:cont, {:ok, new_state, [result | results]}}
+
+        {:error, new_state, reason} ->
+          {:halt, {:error, new_state, reason}}
+      end
+    end)
+    |> case do
+      {:ok, new_state, results} -> {:ok, new_state, Enum.reverse(results)}
+      {:error, new_state, reason} -> {:error, new_state, reason}
+    end
+  end
+
+  defp run_standalone_command({:cross_shard_tx, _shard_batches} = command, sm_state) do
+    case Ferricstore.Raft.StateMachine.apply_standalone_command(command, sm_state) do
+      {new_sm_state, {:error, reason}} -> {:error, new_sm_state, reason}
+      {new_sm_state, result} -> {:ok, new_sm_state, result}
+      {new_sm_state, {:error, reason}, _effects} -> {:error, new_sm_state, reason}
+      {new_sm_state, result, _effects} -> {:ok, new_sm_state, result}
+    end
+  end
+
+  defp run_standalone_command(command, sm_state) do
+    case Ferricstore.Raft.StateMachine.apply_standalone_batch([command], sm_state) do
+      {new_sm_state, {:ok, [result]}} -> {:ok, new_sm_state, result}
+      {new_sm_state, {:ok, results}} when is_list(results) -> {:ok, new_sm_state, results}
+      {new_sm_state, {:error, reason}} -> {:error, new_sm_state, reason}
+      {new_sm_state, result} -> {:ok, new_sm_state, result}
     end
   end
 

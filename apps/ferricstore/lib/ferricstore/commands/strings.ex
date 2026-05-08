@@ -595,6 +595,7 @@ defmodule Ferricstore.Commands.Strings do
         end
       end,
       intent: %{command: :msetnx, keys: %{targets: keys}},
+      tx_entry: {"MSETNX", args, {:msetnx, args}},
       store: store
     )
   end

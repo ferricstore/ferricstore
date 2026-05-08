@@ -117,6 +117,8 @@ defmodule Ferricstore.Commands.Generic do
             do_copy(source, destination, replace?, unified_store)
           end,
           intent: %{command: :copy, keys: %{source: source, dest: destination}, value_hashes: %{}},
+          tx_entry:
+            {"COPY", [source, destination | opts], {:copy, source, destination, replace?}},
           store: store
         )
 
@@ -218,6 +220,7 @@ defmodule Ferricstore.Commands.Generic do
         do_copy(source, destination, replace?, unified_store)
       end,
       intent: %{command: :copy, keys: %{source: source, dest: destination}, value_hashes: %{}},
+      tx_entry: {"COPY", [source, destination], {:copy, source, destination, replace?}},
       store: store
     )
   end
@@ -269,6 +272,7 @@ defmodule Ferricstore.Commands.Generic do
         end
       end,
       intent: %{command: :rename, keys: %{source: key, dest: newkey}, value_hashes: %{}},
+      tx_entry: {"RENAME", [key, newkey], {:rename, key, newkey}},
       store: store
     )
   end
@@ -303,6 +307,7 @@ defmodule Ferricstore.Commands.Generic do
         end
       end,
       intent: %{command: :renamenx, keys: %{source: key, dest: newkey}, value_hashes: %{}},
+      tx_entry: {"RENAMENX", [key, newkey], {:renamenx, key, newkey}},
       store: store
     )
   end
