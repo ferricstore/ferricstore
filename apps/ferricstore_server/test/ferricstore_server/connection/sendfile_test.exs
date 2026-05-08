@@ -4,6 +4,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.ActiveFile
   alias Ferricstore.Test.IsolatedInstance
+  alias Ferricstore.Bitcask.NIF
   alias FerricstoreServer.ClientTracking
   alias FerricstoreServer.Connection
   alias FerricstoreServer.Connection.Pipeline
@@ -35,8 +36,9 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
   test "encrypted file ref response streams bounded chunks instead of one large binary" do
     chunk_bytes = Sendfile.file_stream_chunk_bytes()
+    key = "k"
     value = IO.iodata_to_binary([:binary.copy("a", chunk_bytes), :binary.copy("b", 17)])
-    path = write_tmp_file!(value)
+    {path, value_offset} = write_tmp_bitcask_record!(key, value)
 
     state = %{
       socket: self(),
@@ -46,7 +48,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     }
 
     assert {:sent, ^state} =
-             Sendfile.send_file_ref_response("k", path, 0, byte_size(value), state)
+             Sendfile.send_file_ref_response(key, path, value_offset, byte_size(value), state)
 
     sends = collect_fake_tls_sends()
 
@@ -59,6 +61,29 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     assert length(chunks) == 2
     assert Enum.all?(chunks, &(byte_size(&1) <= chunk_bytes))
     assert IO.iodata_to_binary(chunks) == value
+  end
+
+  test "file ref response rejects an opened file whose record key does not match" do
+    value = :binary.copy("s", Sendfile.threshold_bytes())
+    {path, value_offset} = write_tmp_bitcask_record!("other-key", value)
+
+    state = %{
+      socket: self(),
+      transport: FakeTlsTransport,
+      client_id: :test_client,
+      tracking: nil
+    }
+
+    assert :fallback =
+             Sendfile.send_file_ref_response(
+               "expected-key",
+               path,
+               value_offset,
+               byte_size(value),
+               state
+             )
+
+    assert collect_fake_tls_sends() == []
   end
 
   test "encrypted file range response streams only the requested range in bounded chunks" do
@@ -149,6 +174,36 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     assert :ets.lookup(:ferricstore_tracking, lookup_key) == []
   end
 
+  test "sandboxed cold GET validates file ref with internal lookup key", %{ctx: ctx} do
+    sandbox = "sandbox:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"
+    key = "cold-sandbox-sendfile"
+    lookup_key = sandbox <> key
+    value = :binary.copy("c", Sendfile.threshold_bytes() + 512)
+
+    assert :ok = Router.put(ctx, lookup_key, value, 0)
+
+    state = %{
+      socket: self(),
+      transport: FakeTlsTransport,
+      client_id: :test_client,
+      instance_ctx: ctx,
+      sandbox_namespace: sandbox,
+      pubsub_channels: nil,
+      tracking: nil
+    }
+
+    fallback = fn _cmd, _args, _state ->
+      flunk("sandbox cold GET should stream with the internal lookup key")
+    end
+
+    assert {:continue, "", ^state} = Sendfile.dispatch_get([key], state, fallback)
+
+    sends = collect_fake_tls_sends()
+    assert List.first(sends) == "$#{byte_size(value)}\r\n"
+    assert List.last(sends) == "\r\n"
+    assert IO.iodata_to_binary(sends |> Enum.drop(1) |> Enum.drop(-1)) == value
+  end
+
   test "general pipeline keeps tracking from non-streaming reads when later cold reads stream",
        %{ctx: ctx} do
     hot_key = "pipeline-hot-tracked"
@@ -215,6 +270,12 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     File.write!(path, value)
     on_exit(fn -> File.rm(path) end)
     path
+  end
+
+  defp write_tmp_bitcask_record!(key, value) do
+    path = write_tmp_file!("")
+    assert {:ok, {record_offset, _record_size}} = NIF.v2_append_record(path, key, value, 0)
+    {path, record_offset + 26 + byte_size(key)}
   end
 
   defp collect_fake_tls_sends(acc \\ []) do

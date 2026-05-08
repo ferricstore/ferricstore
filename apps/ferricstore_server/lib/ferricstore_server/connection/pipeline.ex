@@ -1161,7 +1161,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
         end
 
       {:file_ref, key, lookup_key, path, offset, size}, {:continue, acc_state} ->
-        case ConnSendfile.send_file_ref_response(key, path, offset, size, acc_state) do
+        case ConnSendfile.send_file_ref_response(key, lookup_key, path, offset, size, acc_state) do
           {:sent, new_state} ->
             {:cont, {:continue, new_state}}
 
@@ -1195,7 +1195,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
     elements
     |> Enum.reduce_while({:sent, state}, fn
       {:file_ref, key, lookup_key, path, offset, size}, {:sent, acc_state} ->
-        case ConnSendfile.send_file_ref_element_response(key, path, offset, size, acc_state) do
+        case ConnSendfile.send_file_ref_element_response(
+               key,
+               lookup_key,
+               path,
+               offset,
+               size,
+               acc_state
+             ) do
           {:sent, new_state} ->
             {:cont, {:sent, new_state}}
 

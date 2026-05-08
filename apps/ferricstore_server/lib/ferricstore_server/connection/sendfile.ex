@@ -19,6 +19,9 @@ defmodule FerricstoreServer.Connection.Sendfile do
                              65_536
                            )
 
+  @bitcask_header_size 26
+  @bitcask_tombstone_value_size 4_294_967_295
+
   @spec threshold_bytes() :: pos_integer()
   def threshold_bytes, do: @sendfile_threshold_bytes
 
@@ -91,7 +94,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
         encode_get_result(value, key, state)
 
       {:cold_ref, path, offset, size} when size >= @sendfile_threshold_bytes ->
-        stream_large_get_ref(key, path, offset, size, state, dispatch_normal_fn)
+        stream_large_get_ref(key, lookup_key, path, offset, size, state, dispatch_normal_fn)
 
       {:cold_ref, _path, _offset, _size} ->
         dispatch_normal_fn.("GET", [key], state)
@@ -105,7 +108,8 @@ defmodule FerricstoreServer.Connection.Sendfile do
   end
 
   defp stream_large_get_ref(
-         key,
+         client_key,
+         lookup_key,
          path,
          offset,
          size,
@@ -113,17 +117,17 @@ defmodule FerricstoreServer.Connection.Sendfile do
          dispatch_normal_fn
        ) do
     handle_sendfile_result(
-      send_file_ref(key, path, offset, size, state),
-      key,
+      send_file_ref(client_key, lookup_key, path, offset, size, state),
+      client_key,
       state,
       dispatch_normal_fn
     )
   end
 
-  defp stream_large_get_ref(key, path, offset, size, state, dispatch_normal_fn) do
+  defp stream_large_get_ref(client_key, lookup_key, path, offset, size, state, dispatch_normal_fn) do
     handle_file_stream_result(
-      stream_file_ref(key, path, offset, size, state),
-      key,
+      stream_file_ref(client_key, lookup_key, path, offset, size, state),
+      client_key,
       state,
       dispatch_normal_fn
     )
@@ -411,7 +415,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
     |> Enum.zip(results)
     |> Enum.reduce_while({:sent, state}, fn
       {{key, lookup_key}, {:file_ref, path, offset, size}}, {:sent, acc_state} ->
-        case send_file_ref_element_response(key, path, offset, size, acc_state) do
+        case send_file_ref_element_response(key, lookup_key, path, offset, size, acc_state) do
           {:sent, new_state} ->
             {:cont, {:sent, new_state}}
 
@@ -470,7 +474,11 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   @doc false
   def stream_file_ref(key, path, offset, size, state) do
-    result = do_stream_file_get(path, offset, size, state)
+    stream_file_ref(key, key, path, offset, size, state)
+  end
+
+  defp stream_file_ref(key, validate_key, path, offset, size, state) do
+    result = do_stream_file_ref_get(validate_key, path, offset, size, state)
     emit_file_stream_result(result, size, state)
 
     case result do
@@ -487,17 +495,51 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   @doc false
   def send_file_ref_response(key, path, offset, size, %{transport: :ranch_tcp} = state),
-    do: send_file_ref(key, path, offset, size, state)
+    do: send_file_ref(key, key, path, offset, size, state)
 
   def send_file_ref_response(key, path, offset, size, state),
-    do: stream_file_ref(key, path, offset, size, state)
+    do: stream_file_ref(key, key, path, offset, size, state)
+
+  def send_file_ref_response(
+        key,
+        validate_key,
+        path,
+        offset,
+        size,
+        %{transport: :ranch_tcp} = state
+      ),
+      do: send_file_ref(key, validate_key, path, offset, size, state)
+
+  def send_file_ref_response(key, validate_key, path, offset, size, state),
+    do: stream_file_ref(key, validate_key, path, offset, size, state)
 
   @doc false
   def send_file_ref_element_response(key, path, offset, size, %{transport: :ranch_tcp} = state),
-    do: send_file_ref_element(key, path, offset, size, state)
+    do: send_file_ref_element(key, key, path, offset, size, state)
 
-  def send_file_ref_element_response(_key, path, offset, size, state) do
-    result = do_stream_file_get(path, offset, size, state)
+  def send_file_ref_element_response(key, path, offset, size, state) do
+    result = do_stream_file_ref_get(key, path, offset, size, state)
+    emit_file_stream_result(result, size, state)
+
+    case result do
+      {:sent, new_state, _chunks} -> {:sent, new_state}
+      :fallback -> :fallback
+      {:error_after_header, reason, _chunks} -> {:error_after_header, reason}
+    end
+  end
+
+  def send_file_ref_element_response(
+        key,
+        validate_key,
+        path,
+        offset,
+        size,
+        %{transport: :ranch_tcp} = state
+      ),
+      do: send_file_ref_element(key, validate_key, path, offset, size, state)
+
+  def send_file_ref_element_response(_key, validate_key, path, offset, size, state) do
+    result = do_stream_file_ref_get(validate_key, path, offset, size, state)
     emit_file_stream_result(result, size, state)
 
     case result do
@@ -512,6 +554,23 @@ defmodule FerricstoreServer.Connection.Sendfile do
       {:ok, fd} ->
         try do
           stream_file_get_open(fd, offset, size, state)
+        after
+          :file.close(fd)
+        end
+
+      {:error, _reason} ->
+        :fallback
+    end
+  end
+
+  defp do_stream_file_ref_get(key, path, offset, size, state) do
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          case validate_open_value_ref(fd, key, offset, size) do
+            :ok -> stream_file_get_open(fd, offset, size, state)
+            :mismatch -> :fallback
+          end
         after
           :file.close(fd)
         end
@@ -575,25 +634,36 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   @doc false
   def send_file_ref(key, path, offset, size, state) do
-    result = do_sendfile_get(key, path, offset, size, state, true)
+    send_file_ref(key, key, path, offset, size, state)
+  end
+
+  defp send_file_ref(key, validate_key, path, offset, size, state) do
+    result = do_sendfile_get(key, validate_key, path, offset, size, state, true)
     emit_sendfile_result(result, size, state)
     result
   end
 
   @doc false
   def send_file_ref_element(key, path, offset, size, state) do
-    result = do_sendfile_get(key, path, offset, size, state, false)
+    send_file_ref_element(key, key, path, offset, size, state)
+  end
+
+  defp send_file_ref_element(key, validate_key, path, offset, size, state) do
+    result = do_sendfile_get(key, validate_key, path, offset, size, state, false)
     emit_sendfile_result(result, size, state)
     result
   end
 
-  defp do_sendfile_get(key, path, offset, size, state, track_read?) do
+  defp do_sendfile_get(key, validate_key, path, offset, size, state, track_read?) do
     socket = state.socket
 
     case :file.open(path, [:read, :raw, :binary]) do
       {:ok, fd} ->
         try do
-          send_with_cork(socket, fd, offset, size, key, state, track_read?)
+          case validate_open_value_ref(fd, validate_key, offset, size) do
+            :ok -> send_with_cork(socket, fd, offset, size, key, state, track_read?)
+            :mismatch -> :fallback
+          end
         after
           :file.close(fd)
         end
@@ -643,6 +713,32 @@ defmodule FerricstoreServer.Connection.Sendfile do
       {:error, reason} ->
         {:error_after_header, reason}
     end
+  end
+
+  defp validate_open_value_ref(fd, key, value_offset, value_size)
+       when is_binary(key) and is_integer(value_offset) and is_integer(value_size) do
+    key_size = byte_size(key)
+
+    with true <- value_size <= @bitcask_tombstone_value_size,
+         record_offset when record_offset >= 0 <-
+           value_offset - @bitcask_header_size - key_size,
+         {:ok, header} when byte_size(header) == @bitcask_header_size <-
+           :file.pread(fd, record_offset, @bitcask_header_size),
+         ^key_size <- decode_le_unsigned(header, 20, 2),
+         ^value_size <- decode_le_unsigned(header, 22, 4),
+         {:ok, ^key} <- :file.pread(fd, record_offset + @bitcask_header_size, key_size) do
+      :ok
+    else
+      _ -> :mismatch
+    end
+  end
+
+  defp validate_open_value_ref(_fd, _key, _value_offset, _value_size), do: :mismatch
+
+  defp decode_le_unsigned(binary, offset, size) do
+    binary
+    |> binary_part(offset, size)
+    |> :binary.decode_unsigned(:little)
   end
 
   defp emit_sendfile_result({:sent, _state}, size, state) do
