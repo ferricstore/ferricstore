@@ -925,7 +925,7 @@ defmodule Ferricstore.FlowTest do
                wait_state: "waiting_children",
                on_child_failed: :fail_parent,
                on_parent_closed: :cancel_children,
-               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               exhaust_to: %{success: "children_done", failure: "failed"},
                partition_key: partition,
                from_state: "dispatch",
                fencing_token: created_parent.fencing_token,
@@ -965,6 +965,133 @@ defmodule Ferricstore.FlowTest do
     assert done_parent.state == "children_done"
     assert done_parent.child_groups["fanout-1"]["resolved"] == "success"
     assert done_parent.child_groups["fanout-1"]["summary"]["completed"] == 2
+  end
+
+  test "stale child terminal command does not double count parent child group" do
+    parent = uid("flow-parent-stale-child")
+    child_a = uid("flow-child-stale-a")
+    child_b = uid("flow-child-stale-b")
+    partition = uid("tenant")
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition,
+               now_ms: 3_000
+             )
+
+    assert {:ok, _waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child_a, type: "child"}, %{id: child_b, type: "child"}],
+               group_id: "fanout-1",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :fail_parent,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "children_done", failure: "failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token,
+               now_ms: 3_010
+             )
+
+    claimed_a = create_claimed_flow_child(child_a, partition, "worker-a")
+
+    assert {:ok, _child_done_a} =
+             FerricStore.flow_complete(child_a, claimed_a.lease_token,
+               partition_key: partition,
+               fencing_token: claimed_a.fencing_token,
+               now_ms: 3_020
+             )
+
+    assert {:ok, after_first} = FerricStore.flow_get(parent, partition_key: partition)
+    assert after_first.child_groups["fanout-1"]["summary"]["completed"] == 1
+    parent_version = after_first.version
+
+    assert {:error, _reason} =
+             FerricStore.flow_complete(child_a, claimed_a.lease_token,
+               partition_key: partition,
+               fencing_token: claimed_a.fencing_token,
+               now_ms: 3_030
+             )
+
+    assert {:ok, after_stale} = FerricStore.flow_get(parent, partition_key: partition)
+    assert after_stale.version == parent_version
+    assert after_stale.child_groups["fanout-1"]["summary"]["completed"] == 1
+    assert after_stale.child_groups["fanout-1"]["children"][child_a] == "completed"
+    assert after_stale.child_groups["fanout-1"]["children"][child_b] == "running"
+  end
+
+  test "nested child completion resolves parent and propagates to grandparent" do
+    grandparent = uid("flow-grandparent")
+    middle = uid("flow-middle-parent")
+    leaf = uid("flow-leaf-child")
+    partition = uid("tenant")
+
+    assert {:ok, created_grandparent} =
+             FerricStore.flow_create(grandparent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition,
+               now_ms: 4_000
+             )
+
+    assert {:ok, _waiting_grandparent} =
+             FerricStore.flow_spawn_children(
+               grandparent,
+               [%{id: middle, type: "child", state: "dispatch"}],
+               group_id: "outer",
+               wait: :all,
+               wait_state: "waiting_middle",
+               on_child_failed: :fail_parent,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "completed", failure: "failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_grandparent.fencing_token,
+               now_ms: 4_010
+             )
+
+    assert {:ok, middle_record} = FerricStore.flow_get(middle, partition_key: partition)
+
+    assert {:ok, _waiting_middle} =
+             FerricStore.flow_spawn_children(
+               middle,
+               [%{id: leaf, type: "child"}],
+               group_id: "inner",
+               wait: :all,
+               wait_state: "waiting_leaf",
+               on_child_failed: :fail_parent,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "completed", failure: "failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: middle_record.fencing_token,
+               now_ms: 4_020
+             )
+
+    claimed_leaf = create_claimed_flow_child(leaf, partition, "worker-leaf")
+
+    assert {:ok, _leaf_done} =
+             FerricStore.flow_complete(leaf, claimed_leaf.lease_token,
+               partition_key: partition,
+               fencing_token: claimed_leaf.fencing_token,
+               now_ms: 4_030
+             )
+
+    assert {:ok, resolved_middle} = FerricStore.flow_get(middle, partition_key: partition)
+    assert resolved_middle.state == "completed"
+    assert resolved_middle.child_groups["inner"]["resolved"] == "success"
+
+    assert {:ok, resolved_grandparent} =
+             FerricStore.flow_get(grandparent, partition_key: partition)
+
+    assert resolved_grandparent.state == "completed"
+    assert resolved_grandparent.child_groups["outer"]["resolved"] == "success"
+    assert resolved_grandparent.child_groups["outer"]["children"][middle] == "completed"
+    assert resolved_grandparent.child_groups["outer"]["summary"]["completed"] == 1
   end
 
   test "flow_spawn_children can fail parent on child failure or ignore terminal failures" do
@@ -1071,7 +1198,7 @@ defmodule Ferricstore.FlowTest do
                wait_state: "waiting_children",
                on_child_failed: :fail_parent,
                on_parent_closed: :cancel_children,
-               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               exhaust_to: %{success: "children_done", failure: "failed"},
                partition_key: partition,
                from_state: "dispatch",
                fencing_token: created_parent.fencing_token
@@ -1136,6 +1263,158 @@ defmodule Ferricstore.FlowTest do
                [%{id: other_child, type: "child"}],
                opts
              )
+  end
+
+  test "flow_spawn_children remains idempotent after child progress" do
+    parent = uid("flow-parent-idempotent-progress")
+    child_a = uid("flow-child-idempotent-progress-a")
+    child_b = uid("flow-child-idempotent-progress-b")
+    partition = uid("tenant")
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    opts = [
+      group_id: "fanout",
+      wait: :all,
+      wait_state: "waiting_children",
+      on_child_failed: :ignore,
+      on_parent_closed: :abandon_children,
+      exhaust_to: %{success: "children_done", failure: "children_failed"},
+      partition_key: partition,
+      from_state: "dispatch",
+      fencing_token: created_parent.fencing_token
+    ]
+
+    assert {:ok, waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child_a, type: "child"}, %{id: child_b, type: "child"}],
+               opts
+             )
+
+    claimed_a = create_claimed_flow_child(child_a, partition, "worker-a")
+
+    assert {:ok, _child_done_a} =
+             FerricStore.flow_complete(child_a, claimed_a.lease_token,
+               partition_key: partition,
+               fencing_token: claimed_a.fencing_token
+             )
+
+    assert {:ok, same} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child_a, type: "child"}, %{id: child_b, type: "child"}],
+               opts
+             )
+
+    assert same.id == waiting.id
+    assert same.child_groups["fanout"]["summary"]["completed"] == 1
+    assert same.child_groups["fanout"]["children"][child_a] == "completed"
+  end
+
+  test "flow_spawn_children rejects new groups on terminal parents" do
+    parent = uid("flow-parent-terminal-spawn")
+    child = uid("flow-child-terminal-spawn")
+    partition = uid("tenant")
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    assert {:ok, cancelled_parent} =
+             FerricStore.flow_cancel(parent,
+               partition_key: partition,
+               fencing_token: created_parent.fencing_token
+             )
+
+    assert cancelled_parent.state == "cancelled"
+
+    assert {:error, "ERR flow parent is terminal"} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child, type: "child"}],
+               group_id: "fanout",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :ignore,
+               on_parent_closed: :abandon_children,
+               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               partition_key: partition,
+               from_state: "cancelled",
+               fencing_token: cancelled_parent.fencing_token
+             )
+  end
+
+  test "child group resolution cancels other open child groups when parent closes" do
+    parent = uid("flow-parent-close-cancels-groups")
+    failing_child = uid("flow-child-close-failing")
+    sibling_child = uid("flow-child-close-sibling")
+    partition = uid("tenant")
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    assert {:ok, waiting_first} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: failing_child, type: "child"}],
+               group_id: "fanout-a",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :fail_parent,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "children_done", failure: "failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    assert {:ok, _waiting_second} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: sibling_child, type: "child"}],
+               group_id: "fanout-b",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :ignore,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "children_done", failure: "failed"},
+               partition_key: partition,
+               from_state: "waiting_children",
+               fencing_token: waiting_first.fencing_token
+             )
+
+    failed_claim = create_claimed_flow_child(failing_child, partition, "worker-fail")
+
+    assert {:ok, _failed_child} =
+             FerricStore.flow_fail(failing_child, failed_claim.lease_token,
+               partition_key: partition,
+               fencing_token: failed_claim.fencing_token,
+               error: "boom"
+             )
+
+    assert {:ok, closed_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert closed_parent.state == "failed"
+    assert closed_parent.child_groups["fanout-a"]["resolved"] == "failure"
+    assert closed_parent.child_groups["fanout-b"]["children"][sibling_child] == "cancelled"
+    assert closed_parent.child_groups["fanout-b"]["resolved"] == "failure"
+
+    assert {:ok, cancelled_sibling} =
+             FerricStore.flow_get(sibling_child, partition_key: partition)
+
+    assert cancelled_sibling.state == "cancelled"
   end
 
   test "flow_spawn_children rejects child partition overrides" do

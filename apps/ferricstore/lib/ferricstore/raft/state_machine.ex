@@ -4511,13 +4511,14 @@ defmodule Ferricstore.Raft.StateMachine do
           with :ok <- flow_require_expected_state(parent, Map.get(attrs, :from_state)),
                :ok <- flow_require_fencing_token(parent, Map.fetch!(attrs, :fencing_token)),
                :ok <- flow_require_transition_lease(parent, Map.get(attrs, :lease_token)),
+               :ok <- flow_require_active_parent(parent),
                :ok <- flow_require_spawn_wait_state(parent, attrs),
                {:ok, _child_records, child_plans} <- flow_create_many_prepare(state, child_attrs),
                {:ok, next_parent} <- flow_prepare_spawn_parent(parent, attrs, child_attrs, now_ms),
                :ok <- flow_validate_record_keys(next_parent),
-               :ok <- flow_create_many_apply(state, child_plans),
                :ok <-
-                 flow_apply_parent_update(state, parent, next_parent, "children_spawned", now_ms) do
+                 flow_apply_parent_update(state, parent, next_parent, "children_spawned", now_ms),
+               :ok <- flow_create_many_apply(state, child_plans) do
             {:ok, next_parent}
           end
       end
@@ -4572,6 +4573,14 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp flow_require_active_parent(%{state: state}) do
+    if Ferricstore.Flow.LMDB.terminal_state?(state) do
+      {:error, "ERR flow parent is terminal"}
+    else
+      :ok
+    end
+  end
+
   defp flow_require_spawn_wait_state(%{state: "running"}, %{wait: :all, wait_state: nil}) do
     {:error, "ERR flow wait_state is required for running parent"}
   end
@@ -4580,13 +4589,13 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_child_group_spawn_state(parent, attrs, child_attrs) do
     group_id = Map.fetch!(attrs, :group_id)
-    requested = flow_new_child_group(attrs, child_attrs)
+    requested_hash = flow_child_group_request_hash(attrs, child_attrs)
 
     case Map.get(flow_child_groups(parent), group_id) do
       nil ->
         {:ok, :new}
 
-      ^requested ->
+      %{"request_hash" => ^requested_hash} ->
         {:ok, :idempotent}
 
       _existing ->
@@ -4656,6 +4665,7 @@ defmodule Ferricstore.Raft.StateMachine do
       "on_child_failed" => Atom.to_string(Map.fetch!(attrs, :on_child_failed)),
       "on_parent_closed" => Atom.to_string(Map.fetch!(attrs, :on_parent_closed)),
       "exhaust_to" => Map.fetch!(attrs, :exhaust_to),
+      "request_hash" => flow_child_group_request_hash(attrs, child_attrs),
       "children" => children,
       "summary" => %{
         "total" => map_size(children),
@@ -4666,6 +4676,50 @@ defmodule Ferricstore.Raft.StateMachine do
       "results" => %{},
       "resolved" => resolved
     }
+  end
+
+  defp flow_child_group_request_hash(attrs, child_attrs) do
+    request = %{
+      wait: Map.fetch!(attrs, :wait),
+      wait_state: Map.get(attrs, :wait_state),
+      on_child_failed: Map.fetch!(attrs, :on_child_failed),
+      on_parent_closed: Map.fetch!(attrs, :on_parent_closed),
+      exhaust_to: Map.fetch!(attrs, :exhaust_to),
+      children:
+        child_attrs
+        |> Enum.map(&flow_child_group_request_child/1)
+        |> Enum.sort_by(fn child ->
+          {Map.fetch!(child, :id), Map.fetch!(child, :partition_key)}
+        end)
+    }
+
+    :crypto.hash(:sha256, :erlang.term_to_binary(request))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp flow_child_group_request_child(attrs) do
+    attrs
+    |> Map.take([
+      :id,
+      :type,
+      :state,
+      :partition_key,
+      :run_at_ms,
+      :priority,
+      :retention_ttl_ms,
+      :history_hot_max_events,
+      :correlation_id,
+      :payload
+    ])
+    |> Map.put(:payload_hash, flow_child_group_payload_hash(Map.get(attrs, :payload)))
+    |> Map.delete(:payload)
+  end
+
+  defp flow_child_group_payload_hash(nil), do: nil
+
+  defp flow_child_group_payload_hash(payload) do
+    :crypto.hash(:sha256, :erlang.term_to_binary(payload))
+    |> Base.encode16(case: :lower)
   end
 
   defp flow_child_groups(record) do
@@ -6277,7 +6331,8 @@ defmodule Ferricstore.Raft.StateMachine do
                      next_parent,
                      "child_#{status}",
                      now_ms
-                   ) do
+                   ),
+                 :ok <- flow_maybe_cancel_children_on_parent_closed(state, next_parent, now_ms) do
               flow_maybe_apply_resolved_parent_terminal(state, next_parent, now_ms)
             end
         end
