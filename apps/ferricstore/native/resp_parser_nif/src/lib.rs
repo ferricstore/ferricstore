@@ -5164,7 +5164,7 @@ fn make_flow_create_many_command_ast<'a>(
     arg_bytes: &[&[u8]],
 ) -> Term<'a> {
     let tag = atom(env, "flow_create_many");
-    if args.len() < 6 {
+    if args.len() < 4 {
         return (tag, wrong_number_error(env, b"flow.create_many")).encode(env);
     }
 
@@ -5228,7 +5228,7 @@ fn make_flow_spawn_children_command_ast<'a>(
     arg_bytes: &[&[u8]],
 ) -> Term<'a> {
     let tag = atom(env, "flow_spawn_children");
-    if args.len() < 15 {
+    if args.len() < 5 {
         return (tag, wrong_number_error(env, b"flow.spawn_children")).encode(env);
     }
 
@@ -5241,7 +5241,12 @@ fn make_flow_spawn_children_command_ast<'a>(
             .encode(env);
     };
 
-    if items_idx == args.len() - 1 || (args.len() - items_idx - 1) % 3 != 0 {
+    let mixed =
+        items_idx + 1 < args.len() && ascii_eq_ignore_case(arg_bytes[items_idx + 1], b"MIXED");
+    let item_start = if mixed { items_idx + 2 } else { items_idx + 1 };
+    let item_width = if mixed { 4 } else { 3 };
+
+    if item_start >= args.len() || (args.len() - item_start) % item_width != 0 {
         return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
     }
 
@@ -5257,15 +5262,23 @@ fn make_flow_spawn_children_command_ast<'a>(
         Err(err) => return (tag, args[0], err).encode(env),
     };
 
-    let mut items = Vec::with_capacity((args.len() - items_idx - 1) / 3);
-    let mut idx = items_idx + 1;
+    let mut items = Vec::with_capacity((args.len() - item_start) / item_width);
+    let mut idx = item_start;
     while idx < args.len() {
-        let item_opts = vec![
-            (atom(env, "type"), args[idx + 1]).encode(env),
-            (atom(env, "payload"), args[idx + 2]).encode(env),
-        ];
+        let item_opts = if mixed {
+            vec![
+                (atom(env, "partition_key"), args[idx + 1]).encode(env),
+                (atom(env, "type"), args[idx + 2]).encode(env),
+                (atom(env, "payload"), args[idx + 3]).encode(env),
+            ]
+        } else {
+            vec![
+                (atom(env, "type"), args[idx + 1]).encode(env),
+                (atom(env, "payload"), args[idx + 2]).encode(env),
+            ]
+        };
         items.push((args[idx], item_opts).encode(env));
-        idx += 3;
+        idx += item_width;
     }
 
     (tag, args[0], items, opts).encode(env)
@@ -7449,19 +7462,20 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"FLOW.CANCEL_MANY" => flow_cancel_many_key_indices(arg_bytes),
         b"FLOW.TRANSITION_MANY" => flow_transition_many_key_indices(arg_bytes),
         b"FLOW.CREATE" | b"FLOW.GET" | b"FLOW.HISTORY" => {
-            flow_single_key_with_partition_indices(arg_bytes, 1)
+            flow_partition_or_first_key_indices(arg_bytes, 1)
         }
         b"FLOW.COMPLETE" | b"FLOW.RETRY" | b"FLOW.FAIL" | b"FLOW.EXTEND_LEASE" => {
-            flow_single_key_with_partition_indices(arg_bytes, 2)
+            flow_partition_or_first_key_indices(arg_bytes, 2)
         }
-        b"FLOW.TRANSITION" => flow_single_key_with_partition_indices(arg_bytes, 3),
-        b"FLOW.CANCEL" | b"FLOW.REWIND" => flow_single_key_with_partition_indices(arg_bytes, 1),
+        b"FLOW.TRANSITION" => flow_partition_or_first_key_indices(arg_bytes, 3),
+        b"FLOW.CANCEL" | b"FLOW.REWIND" => flow_partition_or_first_key_indices(arg_bytes, 1),
         b"FLOW.BY_PARENT" | b"FLOW.BY_ROOT" | b"FLOW.BY_CORRELATION" => {
-            flow_single_key_with_partition_indices(arg_bytes, 1)
+            flow_partition_or_first_key_indices(arg_bytes, 1)
         }
         b"FLOW.CLAIM_DUE" | b"FLOW.RECLAIM" | b"FLOW.LIST" | b"FLOW.INFO" | b"FLOW.STUCK" => {
-            flow_partition_key_indices(arg_bytes, 1)
+            flow_partition_or_first_key_indices(arg_bytes, 1)
         }
+        b"FLOW.POLICY.SET" | b"FLOW.POLICY.GET" => first_n_indices(arg_bytes.len(), 1),
         b"MEMORY" => {
             if argc > 1 && ascii_eq_ignore_case(arg_bytes[0], b"USAGE") {
                 vec![1]
@@ -7646,14 +7660,17 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
     }
 }
 
-fn flow_single_key_with_partition_indices(arg_bytes: &[&[u8]], option_start: usize) -> Vec<usize> {
+fn flow_partition_or_first_key_indices(arg_bytes: &[&[u8]], option_start: usize) -> Vec<usize> {
     if arg_bytes.is_empty() {
         return Vec::new();
     }
 
-    let mut keys = vec![0];
-    keys.extend(flow_partition_key_indices(arg_bytes, option_start));
-    dedup_indices(keys)
+    let partition_keys = flow_partition_key_indices(arg_bytes, option_start);
+    if partition_keys.is_empty() {
+        vec![0]
+    } else {
+        dedup_indices(partition_keys)
+    }
 }
 
 fn flow_partition_key_indices(arg_bytes: &[&[u8]], option_start: usize) -> Vec<usize> {
@@ -7673,7 +7690,7 @@ fn flow_partition_key_indices_until(
         if ascii_eq_ignore_case(arg_bytes[idx], b"PARTITION") {
             keys.push(idx + 1);
         }
-        idx += 2;
+        idx += 1;
     }
 
     keys
@@ -7708,15 +7725,23 @@ fn flow_create_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
 }
 
 fn flow_spawn_children_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
-    let mut keys = if arg_bytes.is_empty() {
-        Vec::new()
-    } else {
-        vec![0]
-    };
-
     let option_end = option_index(arg_bytes, 1, b"ITEMS").unwrap_or(arg_bytes.len());
-    keys.extend(flow_partition_key_indices_until(arg_bytes, 1, option_end));
-    dedup_indices(keys)
+    let mut partition_keys = flow_partition_key_indices_until(arg_bytes, 1, option_end);
+
+    if option_end + 1 < arg_bytes.len() && ascii_eq_ignore_case(arg_bytes[option_end + 1], b"MIXED")
+    {
+        let mut idx = option_end + 2;
+        while idx + 3 < arg_bytes.len() {
+            partition_keys.push(idx + 1);
+            idx += 4;
+        }
+    }
+
+    if partition_keys.is_empty() {
+        first_n_indices(arg_bytes.len(), 1)
+    } else {
+        dedup_indices(partition_keys)
+    }
 }
 
 fn flow_transition_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
@@ -9699,6 +9724,62 @@ mod tests {
         assert_eq!(
             command_key_indices(b"SINTERCARD", &[b"2", b"s1", b"s2", b"LIMIT", b"1"]),
             vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn ast_extracts_acl_keys_for_flow_partition_shapes() {
+        assert_eq!(
+            command_key_indices(
+                b"FLOW.GET",
+                &[b"flow-1", b"FULL", b"PARTITION", b"tenant-a"]
+            ),
+            vec![3]
+        );
+        assert_eq!(
+            command_key_indices(
+                b"FLOW.CLAIM_DUE",
+                &[
+                    b"checkout",
+                    b"WORKER",
+                    b"w",
+                    b"PAYLOAD",
+                    b"MAXBYTES",
+                    b"4096",
+                    b"PARTITION",
+                    b"tenant-a",
+                ]
+            ),
+            vec![7]
+        );
+        assert_eq!(
+            command_key_indices(b"FLOW.POLICY.SET", &[b"checkout", b"MAX_RETRIES", b"3"]),
+            vec![0]
+        );
+        assert_eq!(
+            command_key_indices(
+                b"FLOW.SPAWN_CHILDREN",
+                &[
+                    b"parent",
+                    b"GROUP",
+                    b"g",
+                    b"PARTITION",
+                    b"parent-p",
+                    b"FENCING",
+                    b"1",
+                    b"ITEMS",
+                    b"MIXED",
+                    b"child-a",
+                    b"device-a",
+                    b"child",
+                    b"payload-a",
+                    b"child-b",
+                    b"device-b",
+                    b"child",
+                    b"payload-b",
+                ]
+            ),
+            vec![4, 10, 14]
         );
     }
 }

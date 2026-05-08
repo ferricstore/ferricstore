@@ -2,12 +2,11 @@ defmodule FerricstoreServer.ConnectionAclIssuesTest do
   @moduledoc """
   Regression tests for issues found in code review R2.
 
-  These tests prove specific bugs exist in the current codebase. When the bugs
-  are fixed, the assertions documenting the buggy behavior should be updated to
-  assert correct behavior instead.
+  These tests cover issues found in code review R2. Fixed issues stay here as
+  regression guards.
 
   Covers:
-    - R2-C1: Deleted user ACL cache becomes nil, granting full access
+    - R2-C1: Deleted user ACL cache must fail closed
     - R2-C5: Embedded API bypasses ACL (expected, documented here)
     - R2-H11: SUBSCRIBE max_subscriptions returns unhandled {:error_reply, ...} tuple
     - R2-H12: Sendfile do_sendfile_get returns :fallback which fast_get doesn't handle
@@ -18,20 +17,12 @@ defmodule FerricstoreServer.ConnectionAclIssuesTest do
   alias FerricstoreServer.Acl
 
   # ---------------------------------------------------------------------------
-  # R2-C1: Deleted user ACL cache becomes nil, granting full access
+  # R2-C1: Deleted user ACL cache must fail closed
   #
-  # `check_command_cached/2` is a private function in FerricstoreServer.Connection.
-  # We cannot call it directly. Instead, we prove the bug through the public API
-  # contrast: `Acl.check_command/2` correctly denies deleted users, but
-  # `build_acl_cache/1` returns nil for deleted users, and
-  # `check_command_cached(nil, _cmd)` returns :ok (grants access).
-  #
-  # The bug: when a user is deleted, any connection that cached that user's ACL
-  # will have acl_cache = nil (from build_acl_cache returning nil), and
-  # check_command_cached(nil, _cmd) returns :ok — full access with no restrictions.
+  # Deleted users should not regain access through cached connection state.
   # ---------------------------------------------------------------------------
 
-  describe "R2-C1: deleted user ACL cache grants full access" do
+  describe "R2-C1: deleted user ACL cache fails closed" do
     setup do
       Acl.reset!()
       :ok
@@ -48,18 +39,12 @@ defmodule FerricstoreServer.ConnectionAclIssuesTest do
       assert {:error, "NOPERM" <> _} = Acl.check_command("ephemeral", "GET")
     end
 
-    test "Acl.get_user returns nil for deleted user (build_acl_cache would return nil)" do
+    test "Acl.get_user returns nil for deleted user" do
       :ok = Acl.set_user("temp_user", ["on", ">pass", "+SET", "~*"])
       assert Acl.get_user("temp_user") != nil
 
       :ok = Acl.del_user("temp_user")
 
-      # After deletion, get_user returns nil.
-      # In Connection, build_acl_cache calls get_user and returns nil for this case.
-      # check_command_cached(nil, _cmd) then returns :ok — THIS IS THE BUG.
-      #
-      # The fix should make check_command_cached(nil, _cmd) return an error,
-      # or build_acl_cache should return a deny-all cache instead of nil.
       assert Acl.get_user("temp_user") == nil
     end
 

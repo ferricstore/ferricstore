@@ -981,7 +981,7 @@ defmodule FerricstoreServer.Connection do
        do: true
 
   defp ast_store_command?({tag, _, _, _})
-       when tag in ~w(set setex psetex getrange setrange expire pexpire expireat pexpireat lrange lset lrem ltrim hincrby hincrbyfloat hsetnx hrandfield hexpire hpexpire hgetex hsetex smove sscan zadd zincrby zcount zrange zrevrange zrandmember zscan zrangebyscore zrevrangebyscore setbit bitpos bitop copy object xadd xread xreadgroup xack json_numincrby json_arrappend geoadd geosearchstore bf_reserve cms_initbydim cms_initbyprob cms_merge tdigest_trimmed_mean tdigest_merge lock unlock extend fetch_or_compute fetch_or_compute_result fetch_or_compute_error flow_create_many flow_complete flow_retry flow_fail)a,
+       when tag in ~w(set setex psetex getrange setrange expire pexpire expireat pexpireat lrange lset lrem ltrim hincrby hincrbyfloat hsetnx hrandfield hexpire hpexpire hgetex hsetex smove sscan zadd zincrby zcount zrange zrevrange zrandmember zscan zrangebyscore zrevrangebyscore setbit bitpos bitop copy object xadd xread xreadgroup xack json_numincrby json_arrappend geoadd geosearchstore bf_reserve cms_initbydim cms_initbyprob cms_merge tdigest_trimmed_mean tdigest_merge lock unlock extend fetch_or_compute fetch_or_compute_result fetch_or_compute_error flow_create_many flow_spawn_children flow_extend_lease flow_complete flow_complete_many flow_retry flow_retry_many flow_fail flow_fail_many flow_cancel_many)a,
        do: true
 
   defp ast_store_command?({tag, _, _, _, _})

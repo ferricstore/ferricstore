@@ -6,38 +6,8 @@ defmodule FerricstoreServer.Connection.Auth do
   """
 
   alias Ferricstore.AuditLog
+  alias FerricstoreServer.Acl.CommandCategories
   alias FerricstoreServer.Resp.Encoder
-
-  # O(1) MapSet lookups for hot-path classification.
-  @read_cmds_set MapSet.new(~w(GET MGET GETRANGE STRLEN GETEX GETDEL GETSET
-    HGET HMGET HGETALL HKEYS HVALS HLEN HEXISTS HRANDFIELD HSCAN HSTRLEN
-    LRANGE LLEN LINDEX LPOS
-    SMEMBERS SISMEMBER SMISMEMBER SCARD SRANDMEMBER
-    ZSCORE ZRANK ZREVRANK ZRANGE ZCARD ZCOUNT ZRANDMEMBER ZMSCORE
-    TYPE EXISTS TTL PTTL EXPIRETIME PEXPIRETIME
-    GETBIT BITCOUNT BITPOS PFCOUNT
-    OBJECT SUBSTR
-    GEOHASH GEOPOS GEODIST GEOSEARCH
-    XLEN XRANGE XREVRANGE XREAD XINFO
-    JSON.GET JSON.TYPE JSON.STRLEN JSON.OBJKEYS JSON.OBJLEN JSON.ARRLEN JSON.MGET))
-
-  @write_cmds_set MapSet.new(~w(SET SETNX SETEX PSETEX MSET MSETNX APPEND SETRANGE
-    INCR DECR INCRBY DECRBY INCRBYFLOAT
-    DEL UNLINK
-    EXPIRE PEXPIRE EXPIREAT PEXPIREAT PERSIST
-    RENAME RENAMENX COPY
-    HSET HDEL HINCRBY HINCRBYFLOAT HSETNX
-    LPUSH RPUSH LPOP RPOP LSET LINSERT LTRIM LREM LMOVE LPUSHX RPUSHX
-    SADD SREM SPOP SMOVE SDIFFSTORE SINTERSTORE SUNIONSTORE
-    ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX
-    SETBIT BITOP PFADD PFMERGE
-    GEOADD GEOSEARCHSTORE
-    XADD XTRIM XDEL
-    JSON.SET JSON.DEL JSON.NUMINCRBY JSON.TOGGLE JSON.CLEAR JSON.ARRAPPEND
-    GETSET GETDEL
-    CAS LOCK UNLOCK EXTEND))
-
-  @read_write_cmds_set MapSet.new(~w(GETSET GETDEL GETEX CAS))
 
   # ── AUTH dispatch ──────────────────────────────────────────────────────
 
@@ -137,6 +107,7 @@ defmodule FerricstoreServer.Connection.Auth do
       case Enum.find(results, fn r -> match?({:error, _}, r) end) do
         nil ->
           Enum.each(usernames, &broadcast_acl_invalidation/1)
+          state = Enum.reduce(usernames, state, &maybe_refresh_acl_cache(&2, &1))
           {:continue, Encoder.encode(:ok), state}
 
         {:error, reason} ->
@@ -147,11 +118,28 @@ defmodule FerricstoreServer.Connection.Auth do
     end
   end
 
-  def dispatch_acl("CAT", _, state) do
-    cats =
-      ~w(keyspace read write set sortedset list hash string bitmap hyperloglog geo stream pubsub admin fast slow blocking dangerous connection transaction server generic)
+  def dispatch_acl("CAT", [], state) do
+    {:continue, Encoder.encode(CommandCategories.category_names_lower()), state}
+  end
 
-    {:continue, Encoder.encode(cats), state}
+  def dispatch_acl("CAT", [category | _], state) do
+    case CommandCategories.category_commands(category) do
+      {:ok, commands} ->
+        commands =
+          commands
+          |> MapSet.to_list()
+          |> Enum.map(&String.downcase/1)
+          |> Enum.sort()
+
+        {:continue, Encoder.encode(commands), state}
+
+      :error ->
+        {:continue,
+         Encoder.encode(
+           {:error,
+            "ERR Unknown category '#{category}'. Try ACL CAT without arguments for a list."}
+         ), state}
+    end
   end
 
   def dispatch_acl("LOG", ["RESET" | _], state) do
@@ -205,7 +193,7 @@ defmodule FerricstoreServer.Connection.Auth do
 
   # ── ACL cache ──────────────────────────────────────────────────────────
 
-  @spec build_acl_cache(binary()) :: map() | :full_access | :denied | nil
+  @spec build_acl_cache(binary()) :: map() | :full_access | :denied
   def build_acl_cache(username) do
     case FerricstoreServer.Acl.get_user(username) do
       nil ->
@@ -233,8 +221,11 @@ defmodule FerricstoreServer.Connection.Auth do
   @spec check_command_cached(map() | :full_access | :denied | nil, binary()) ::
           :ok | {:error, binary()}
 
-  # Deleted user or unknown user — deny all commands.
+  # Deleted user, unknown user, or missing cache -- deny all commands.
   def check_command_cached(:denied, _cmd),
+    do: {:error, "NOPERM user session expired or user was deleted"}
+
+  def check_command_cached(nil, _cmd),
     do: {:error, "NOPERM user session expired or user was deleted"}
 
   # Fast path: unrestricted user — single atom comparison, zero MapSet/map ops.
@@ -274,9 +265,14 @@ defmodule FerricstoreServer.Connection.Auth do
 
   # ── Key pattern checks ─────────────────────────────────────────────────
 
-  @spec check_keys_cached(map() | :full_access | nil, binary(), [binary()]) ::
+  @spec check_keys_cached(map() | :full_access | :denied | nil, binary(), [binary()]) ::
           :ok | {:error, binary()}
-  def check_keys_cached(nil, _cmd, _keys), do: :ok
+  def check_keys_cached(:denied, _cmd, _keys),
+    do: {:error, "NOPERM user session expired or user was deleted"}
+
+  def check_keys_cached(nil, _cmd, _keys),
+    do: {:error, "NOPERM user session expired or user was deleted"}
+
   def check_keys_cached(:full_access, _cmd, _keys), do: :ok
   def check_keys_cached(%{keys: :all}, _cmd, _keys), do: :ok
 
@@ -319,15 +315,7 @@ defmodule FerricstoreServer.Connection.Auth do
   end
 
   @spec command_access_type(binary()) :: :read | :write | :rw
-  def command_access_type(cmd) do
-    cond do
-      MapSet.member?(@read_write_cmds_set, cmd) -> :rw
-      MapSet.member?(@read_cmds_set, cmd) -> :read
-      MapSet.member?(@write_cmds_set, cmd) -> :write
-      # Default to :rw for unknown commands — most conservative.
-      true -> :rw
-    end
-  end
+  def command_access_type(cmd), do: CommandCategories.command_access_type(cmd)
 
   # ── ACL invalidation broadcasting ──────────────────────────────────────
 

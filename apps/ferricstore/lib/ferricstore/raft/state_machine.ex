@@ -9071,7 +9071,9 @@ defmodule Ferricstore.Raft.StateMachine do
       compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
 
       if flow_lmdb_mirror?(state) do
-        queue_lmdb_history_index_delete(record, history_key, event_id, trunc(event_ms))
+        with_lmdb_mirror_shard(state, fn ->
+          queue_lmdb_history_index_delete(record, history_key, event_id, trunc(event_ms))
+        end)
       end
 
       case do_delete(state, compound_key) do
@@ -9089,18 +9091,20 @@ defmodule Ferricstore.Raft.StateMachine do
       count = flow_index_count_all(state, history_key)
 
       if count > 0 do
-        state
-        |> flow_index_rank_range(history_key, 0, count - 1, false)
-        |> Enum.each(fn {event_id, event_ms} ->
-          compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
+        with_lmdb_mirror_shard(state, fn ->
+          state
+          |> flow_index_rank_range(history_key, 0, count - 1, false)
+          |> Enum.each(fn {event_id, event_ms} ->
+            compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
 
-          queue_lmdb_history_index_put(
-            record,
-            history_key,
-            event_id,
-            trunc(event_ms),
-            compound_key
-          )
+            queue_lmdb_history_index_put(
+              record,
+              history_key,
+              event_id,
+              trunc(event_ms),
+              compound_key
+            )
+          end)
         end)
       end
     end
@@ -10144,8 +10148,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp queue_pending_lmdb_mirror_put(key, value, expire_at_ms) do
     blob = Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)
 
-    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
-    Process.put(:sm_pending_lmdb_mirror_ops, [{:put, key, blob} | pending])
+    queue_pending_lmdb_mirror_op({:put, key, blob})
 
     pending_values = Process.get(:sm_pending_lmdb_values, %{})
     Process.put(:sm_pending_lmdb_values, Map.put(pending_values, key, {:put, blob}))
@@ -10154,10 +10157,12 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp maybe_queue_lmdb_indexes_for_state_record(state, state_key, value, expire_at_ms, record)
        when is_map(record) do
-    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-      queue_pending_lmdb_mirror_put(state_key, value, expire_at_ms)
-      queue_terminal_lmdb_index_put(state, state_key, record, expire_at_ms)
-    end
+    with_lmdb_mirror_shard(state, fn ->
+      if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+        queue_pending_lmdb_mirror_put(state_key, value, expire_at_ms)
+        queue_terminal_lmdb_index_put(state, state_key, record, expire_at_ms)
+      end
+    end)
 
     :ok
   end
@@ -10239,30 +10244,34 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
-  defp maybe_queue_terminal_lmdb_index_delete(_state, record) do
-    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-      partition_key = Map.get(record, :partition_key)
-      state_index_key = FlowKeys.state_index_key(record.type, record.state, partition_key)
-      updated_at_ms = Map.get(record, :updated_at_ms, 0)
+  defp maybe_queue_terminal_lmdb_index_delete(state, record) do
+    with_lmdb_mirror_shard(state, fn ->
+      if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+        partition_key = Map.get(record, :partition_key)
+        state_index_key = FlowKeys.state_index_key(record.type, record.state, partition_key)
+        updated_at_ms = Map.get(record, :updated_at_ms, 0)
 
-      state_index_key
-      |> Ferricstore.Flow.LMDB.terminal_index_key(record.id, updated_at_ms)
-      |> queue_pending_lmdb_mirror_terminal_delete(
-        FlowKeys.state_key(record.id, Map.get(record, :partition_key)),
-        Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
-      )
-    end
+        state_index_key
+        |> Ferricstore.Flow.LMDB.terminal_index_key(record.id, updated_at_ms)
+        |> queue_pending_lmdb_mirror_terminal_delete(
+          FlowKeys.state_key(record.id, Map.get(record, :partition_key)),
+          Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+        )
+      end
+    end)
 
     :ok
   end
 
-  defp queue_lmdb_metadata_index_deletes(_state, record) do
-    record
-    |> flow_metadata_index_entries()
-    |> Enum.each(fn {index_key, id, score} ->
-      index_key
-      |> Ferricstore.Flow.LMDB.query_index_key(id, score)
-      |> queue_pending_lmdb_mirror_query_delete()
+  defp queue_lmdb_metadata_index_deletes(state, record) do
+    with_lmdb_mirror_shard(state, fn ->
+      record
+      |> flow_metadata_index_entries()
+      |> Enum.each(fn {index_key, id, score} ->
+        index_key
+        |> Ferricstore.Flow.LMDB.query_index_key(id, score)
+        |> queue_pending_lmdb_mirror_query_delete()
+      end)
     end)
 
     :ok
@@ -10313,47 +10322,70 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp queue_pending_lmdb_mirror_query_put(query_key, value) do
-    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
-    Process.put(:sm_pending_lmdb_mirror_ops, [{:query_put, query_key, value} | pending])
+    queue_pending_lmdb_mirror_op({:query_put, query_key, value})
     :ok
   end
 
   defp queue_pending_lmdb_mirror_history_delete(history_index_key) do
-    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
-    Process.put(:sm_pending_lmdb_mirror_ops, [{:history_delete, history_index_key} | pending])
+    queue_pending_lmdb_mirror_op({:history_delete, history_index_key})
     :ok
   end
 
   defp queue_pending_lmdb_mirror_query_delete(query_key) do
-    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
-    Process.put(:sm_pending_lmdb_mirror_ops, [{:query_delete, query_key} | pending])
+    queue_pending_lmdb_mirror_op({:query_delete, query_key})
     :ok
   end
 
   defp queue_pending_lmdb_mirror_delete(key) do
-    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
-    Process.put(:sm_pending_lmdb_mirror_ops, [{:delete, key} | pending])
+    queue_pending_lmdb_mirror_op({:delete, key})
     :ok
   end
 
   defp queue_pending_lmdb_mirror_terminal_put(terminal_key, value, state_key, count_key) do
-    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
     op = {:terminal_put, terminal_key, value, state_key, count_key}
-    Process.put(:sm_pending_lmdb_mirror_ops, [op | pending])
+    queue_pending_lmdb_mirror_op(op)
     :ok
   end
 
   defp queue_pending_lmdb_mirror_terminal_delete(terminal_key, state_key, count_key) do
-    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
     op = {:terminal_delete, terminal_key, state_key, count_key}
-    Process.put(:sm_pending_lmdb_mirror_ops, [op | pending])
+    queue_pending_lmdb_mirror_op(op)
     :ok
   end
 
   defp queue_pending_lmdb_mirror_after_flush(action) do
     pending = Process.get(:sm_pending_lmdb_mirror_after_flush, [])
-    Process.put(:sm_pending_lmdb_mirror_after_flush, [action | pending])
+    Process.put(:sm_pending_lmdb_mirror_after_flush, [tag_lmdb_mirror_shard(action) | pending])
     :ok
+  end
+
+  defp queue_pending_lmdb_mirror_op(op) do
+    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
+    Process.put(:sm_pending_lmdb_mirror_ops, [tag_lmdb_mirror_shard(op) | pending])
+  end
+
+  defp tag_lmdb_mirror_shard(op) do
+    case Process.get(:sm_pending_lmdb_mirror_shard) do
+      shard_index when is_integer(shard_index) and shard_index >= 0 ->
+        {:lmdb_shard, shard_index, op}
+
+      _other ->
+        op
+    end
+  end
+
+  defp with_lmdb_mirror_shard(state, fun) when is_function(fun, 0) do
+    previous = Process.get(:sm_pending_lmdb_mirror_shard, :undefined)
+    Process.put(:sm_pending_lmdb_mirror_shard, Map.get(state, :shard_index, 0))
+
+    try do
+      fun.()
+    after
+      case previous do
+        :undefined -> Process.delete(:sm_pending_lmdb_mirror_shard)
+        value -> Process.put(:sm_pending_lmdb_mirror_shard, value)
+      end
+    end
   end
 
   defp enqueue_pending_lmdb_mirror(state) do
@@ -10368,16 +10400,46 @@ defmodule Ferricstore.Raft.StateMachine do
         :ok
 
       pending when is_list(pending) ->
-        Ferricstore.Flow.LMDBWriter.enqueue(
-          state.instance_name,
-          state.shard_index,
-          Enum.reverse(pending),
-          after_flush
-        )
+        enqueue_lmdb_mirror_groups(state, Enum.reverse(pending), after_flush)
 
       _ ->
         :ok
     end
+  end
+
+  defp enqueue_lmdb_mirror_groups(state, ops, after_flush) do
+    op_groups = group_lmdb_mirror_items(ops, state.shard_index)
+    after_flush_groups = group_lmdb_mirror_items(after_flush, state.shard_index)
+
+    (Map.keys(op_groups) ++ Map.keys(after_flush_groups))
+    |> Enum.uniq()
+    |> Enum.reduce_while(:ok, fn shard_index, :ok ->
+      shard_ops = Map.get(op_groups, shard_index, [])
+      shard_after_flush = Map.get(after_flush_groups, shard_index, [])
+
+      case Ferricstore.Flow.LMDBWriter.enqueue(
+             state.instance_name,
+             shard_index,
+             shard_ops,
+             shard_after_flush
+           ) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+        other -> {:halt, {:error, other}}
+      end
+    end)
+  end
+
+  defp group_lmdb_mirror_items(items, default_shard) do
+    items
+    |> Enum.reduce(%{}, fn
+      {:lmdb_shard, shard_index, item}, acc when is_integer(shard_index) and shard_index >= 0 ->
+        Map.update(acc, shard_index, [item], &[item | &1])
+
+      item, acc ->
+        Map.update(acc, default_shard, [item], &[item | &1])
+    end)
+    |> Map.new(fn {shard_index, shard_items} -> {shard_index, Enum.reverse(shard_items)} end)
   end
 
   defp observe_pending_lmdb_mirror_enqueue(_state, :ok), do: :ok
@@ -10564,8 +10626,10 @@ defmodule Ferricstore.Raft.StateMachine do
   defp maybe_queue_lmdb_state_delete_after_publish(_state, _key), do: :ok
 
   defp queue_lmdb_state_delete_projection(state, key) do
-    queue_pending_lmdb_mirror_delete(key)
-    queue_pending_lmdb_mirror_after_flush({:delete_flow_tombstone, state.ets, key})
+    with_lmdb_mirror_shard(state, fn ->
+      queue_pending_lmdb_mirror_delete(key)
+      queue_pending_lmdb_mirror_after_flush({:delete_flow_tombstone, state.ets, key})
+    end)
   end
 
   defp maybe_queue_lmdb_policy_put(key, value, expire_at_ms) do

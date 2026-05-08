@@ -45,6 +45,8 @@ defmodule FerricstoreServer.Acl do
     - `@write`     -- mutation commands (SET, DEL, HSET, LPUSH, INCR, etc.)
     - `@admin`     -- server administration (CONFIG, ACL, DEBUG, FLUSHDB, etc.)
     - `@dangerous` -- potentially destructive (FLUSHDB, FLUSHALL, DEBUG, KEYS, SHUTDOWN, etc.)
+    - command-family categories such as `@string`, `@hash`, `@flow`, `@stream`,
+      `@probabilistic`, `@pubsub`, `@connection`, and `@transaction`
 
   ## ETS schema
 
@@ -79,66 +81,9 @@ defmodule FerricstoreServer.Acl do
   require Logger
 
   alias Ferricstore.AuditLog
+  alias FerricstoreServer.Acl.CommandCategories
 
   @table :ferricstore_acl
-
-  # ---------------------------------------------------------------------------
-  # Command categories
-  # ---------------------------------------------------------------------------
-
-  @read_commands MapSet.new(~w(
-    GET MGET GETRANGE STRLEN GETEX GETDEL GETSET
-    HGET HMGET HGETALL HKEYS HVALS HLEN HEXISTS HRANDFIELD HSCAN HSTRLEN
-    LRANGE LLEN LINDEX LPOS
-    SMEMBERS SISMEMBER SMISMEMBER SCARD SRANDMEMBER SSCAN
-    ZSCORE ZRANK ZREVRANK ZRANGE ZCARD ZCOUNT ZRANDMEMBER ZMSCORE ZSCAN
-    TYPE EXISTS TTL PTTL EXPIRETIME PEXPIRETIME
-    GETBIT BITCOUNT BITPOS PFCOUNT
-    OBJECT SUBSTR
-    GEOHASH GEOPOS GEODIST GEOSEARCH
-    XLEN XRANGE XREVRANGE XREAD XINFO
-    DBSIZE RANDOMKEY SCAN KEYS
-    JSON.GET JSON.TYPE JSON.STRLEN JSON.OBJKEYS JSON.OBJLEN JSON.ARRLEN JSON.MGET
-  ))
-
-  @write_commands MapSet.new(~w(
-    SET SETNX SETEX PSETEX MSET MSETNX APPEND SETRANGE
-    INCR DECR INCRBY DECRBY INCRBYFLOAT
-    DEL UNLINK
-    EXPIRE PEXPIRE EXPIREAT PEXPIREAT PERSIST
-    RENAME RENAMENX COPY
-    HSET HDEL HINCRBY HINCRBYFLOAT HSETNX
-    LPUSH RPUSH LPOP RPOP LSET LINSERT LTRIM LREM LMOVE LPUSHX RPUSHX
-    SADD SREM SPOP SMOVE SDIFFSTORE SINTERSTORE SUNIONSTORE
-    ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX
-    SETBIT BITOP PFADD PFMERGE
-    GEOADD GEOSEARCHSTORE
-    XADD XTRIM XDEL
-    GETSET GETDEL
-    JSON.SET JSON.DEL JSON.NUMINCRBY JSON.TOGGLE JSON.CLEAR JSON.ARRAPPEND
-    CAS LOCK UNLOCK EXTEND
-  ))
-
-  @admin_commands MapSet.new(~w(
-    CONFIG ACL DEBUG SLOWLOG SAVE BGSAVE LASTSAVE
-    FLUSHDB FLUSHALL
-    INFO COMMAND MODULE MEMORY
-    CLUSTER.HEALTH CLUSTER.STATS CLUSTER.ENABLE
-    WAITAOF WAIT SELECT
-    FERRICSTORE.HOTNESS FERRICSTORE.METRICS
-  ))
-
-  @dangerous_commands MapSet.new(~w(
-    FLUSHDB FLUSHALL DEBUG CONFIG KEYS SHUTDOWN
-    SORT MIGRATE RESTORE DUMP
-  ))
-
-  @category_map %{
-    "READ" => @read_commands,
-    "WRITE" => @write_commands,
-    "ADMIN" => @admin_commands,
-    "DANGEROUS" => @dangerous_commands
-  }
 
   # ---------------------------------------------------------------------------
   # Types
@@ -606,7 +551,7 @@ defmodule FerricstoreServer.Acl do
   Returns the map of command categories.
 
   Each key is an uppercase category name (e.g. `"READ"`, `"WRITE"`, `"ADMIN"`,
-  `"DANGEROUS"`) and the value is a `MapSet` of uppercase command names.
+  `"FLOW"`, `"PROBABILISTIC"`) and the value is a `MapSet` of uppercase command names.
 
   ## Examples
 
@@ -614,7 +559,7 @@ defmodule FerricstoreServer.Acl do
       #=> %{"READ" => MapSet.new(["GET", "MGET", ...]), ...}
   """
   @spec categories() :: %{binary() => MapSet.t(binary())}
-  def categories, do: @category_map
+  def categories, do: CommandCategories.categories()
 
   @doc """
   Resets the ACL to its initial state (only the default user).
@@ -1065,7 +1010,7 @@ defmodule FerricstoreServer.Acl do
   defp parse_rule(user, "+@" <> category) do
     cat = String.upcase(category)
 
-    case Map.fetch(@category_map, cat) do
+    case CommandCategories.category_commands(cat) do
       {:ok, cat_cmds} ->
         case user.commands do
           :all ->
@@ -1088,7 +1033,7 @@ defmodule FerricstoreServer.Acl do
   defp parse_rule(user, "-@" <> category) do
     cat = String.upcase(category)
 
-    case Map.fetch(@category_map, cat) do
+    case CommandCategories.category_commands(cat) do
       {:ok, cat_cmds} ->
         case user.commands do
           :all ->
@@ -1646,7 +1591,7 @@ defmodule FerricstoreServer.Acl do
   defp parse_file_token(user, "+@" <> category) do
     cat = String.upcase(category)
 
-    case Map.fetch(@category_map, cat) do
+    case CommandCategories.category_commands(cat) do
       {:ok, cat_cmds} ->
         case user.commands do
           :all ->
@@ -1665,7 +1610,7 @@ defmodule FerricstoreServer.Acl do
   defp parse_file_token(user, "-@" <> category) do
     cat = String.upcase(category)
 
-    case Map.fetch(@category_map, cat) do
+    case CommandCategories.category_commands(cat) do
       {:ok, cat_cmds} ->
         case user.commands do
           :all ->

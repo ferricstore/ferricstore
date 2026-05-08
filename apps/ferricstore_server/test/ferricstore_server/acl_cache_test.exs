@@ -19,6 +19,7 @@ defmodule FerricstoreServer.AclCacheTest do
   use ExUnit.Case, async: false
 
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Connection.Auth
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
@@ -407,6 +408,19 @@ defmodule FerricstoreServer.AclCacheTest do
   # ---------------------------------------------------------------------------
 
   describe "ACL DELUSER triggers cache invalidation" do
+    test "rebuilt cache for deleted users fails closed" do
+      :ok = Acl.set_user("doomed", ["on", ">pass", "~*", "+@all"])
+      assert Auth.build_acl_cache("doomed") != :denied
+
+      :ok = Acl.del_user("doomed")
+      assert Auth.build_acl_cache("doomed") == :denied
+
+      assert {:error, "NOPERM" <> _} = Auth.check_command_cached(:denied, "PING")
+      assert {:error, "NOPERM" <> _} = Auth.check_keys_cached(:denied, "GET", ["k"])
+      assert {:error, "NOPERM" <> _} = Auth.check_command_cached(nil, "PING")
+      assert {:error, "NOPERM" <> _} = Auth.check_keys_cached(nil, "GET", ["k"])
+    end
+
     test "deleted user's connections get cache invalidated", %{port: port} do
       enable_requirepass()
       :ok = Acl.set_user("doomed", ["on", ">pass", "~*", "+@all"])
@@ -427,14 +441,11 @@ defmodule FerricstoreServer.AclCacheTest do
 
       Process.sleep(100)
 
-      # After invalidation, cache becomes nil (user deleted).
-      # check_command_cached(nil, _) returns :ok per current semantics,
-      # meaning deleted users effectively become unrestricted until the
-      # connection is reset. This verifies the invalidation message was
-      # delivered and the cache was rebuilt.
+      # After invalidation, the rebuilt cache fails closed. The connection
+      # should keep running and return either PONG if the invalidation races
+      # this request or NOPERM once the denied cache is installed.
       send_cmd(sock, ["PING"])
       resp = recv_response(sock)
-      # The connection should still respond (not crash)
       assert resp == {:simple, "PONG"} or match?({:error, _}, resp)
 
       :gen_tcp.close(sock)

@@ -102,13 +102,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
     else
       case extract_plain_gets(commands) do
         {:ok, keys} ->
-          acl_ok =
-            state.acl_cache == :full_access or
-              (is_map(state.acl_cache) and state.acl_cache.commands == :all and
-                 state.acl_cache.keys == :all)
-
           # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
-          if not acl_ok do
+          if not full_acl_fast_path?(state.acl_cache) do
             :fallback
           else
             Stats.incr_commands_by(state.stats_counter, length(keys))
@@ -244,13 +239,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
           ctx = state.instance_ctx
           write_pairs = namespace_kv_pairs(state.sandbox_namespace, kv_pairs)
 
-          acl_ok =
-            state.acl_cache == :full_access or
-              (is_map(state.acl_cache) and state.acl_cache.commands == :all and
-                 state.acl_cache.keys == :all)
-
           # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
-          if not acl_ok do
+          if not full_acl_fast_path?(state.acl_cache) do
             :fallback
           else
             pressure_ok =
@@ -321,13 +311,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
     if requires_auth?(state) or state.multi_state == :queuing do
       general_batch_dispatch(commands, state, handle_command_fn, send_response_fn)
     else
-      acl_ok =
-        state.acl_cache == :full_access or
-          (is_map(state.acl_cache) and state.acl_cache.commands == :all and
-             state.acl_cache.keys == :all)
-
       # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
-      if not acl_ok do
+      if not full_acl_fast_path?(state.acl_cache) do
         general_batch_dispatch(commands, state, handle_command_fn, send_response_fn)
       else
         case classify_mixed_pipeline(commands) do
@@ -557,12 +542,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
     if requires_auth?(state) or state.multi_state == :queuing do
       :fallback
     else
-      acl_ok =
-        state.acl_cache == :full_access or
-          (is_map(state.acl_cache) and state.acl_cache.commands == :all and
-             state.acl_cache.keys == :all)
-
-      if acl_ok do
+      if full_acl_fast_path?(state.acl_cache) do
         case extract_flow_writes(commands) do
           {:ok, writes} ->
             Stats.incr_commands_by(state.stats_counter, length(writes))
@@ -731,12 +711,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # (MULTI, AUTH, SUBSCRIBE, etc.) force a flush-and-sequential boundary.
 
   defp general_batch_dispatch(commands, state, handle_command_fn, send_response_fn) do
-    acl_ok =
-      state.acl_cache == :full_access or
-        (is_map(state.acl_cache) and state.acl_cache.commands == :all and
-           state.acl_cache.keys == :all)
-
-    if requires_auth?(state) or state.multi_state == :queuing or not acl_ok do
+    if requires_auth?(state) or state.multi_state == :queuing or
+         not full_acl_fast_path?(state.acl_cache) do
       sequential_dispatch(commands, state, handle_command_fn, send_response_fn)
     else
       case split_at_stateful(commands, state) do
@@ -1421,6 +1397,19 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp extract_command_name({:command, name, _args, _ast, _keys}) when is_binary(name), do: name
   defp extract_command_name(_), do: "UNKNOWN"
+
+  defp full_acl_fast_path?(:full_access), do: true
+
+  defp full_acl_fast_path?(%{
+         commands: :all,
+         keys: :all,
+         enabled: true,
+         denied_commands: %MapSet{map: denied}
+       })
+       when map_size(denied) == 0,
+       do: true
+
+  defp full_acl_fast_path?(_cache), do: false
 
   defp requires_auth?(state) do
     not state.authenticated and state.require_auth

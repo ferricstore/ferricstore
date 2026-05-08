@@ -21,6 +21,7 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
   use ExUnit.Case, async: false
 
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
@@ -62,6 +63,11 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
     send_cmd(sock, ["AUTH", username, password])
     resp = recv_response(sock)
     {sock, resp}
+  end
+
+  defp parsed_command_keys(wire) do
+    assert {:ok, [{:command, cmd, _args, _ast, keys}], ""} = Parser.parse_commands(wire)
+    {cmd, keys}
   end
 
   # Sets requirepass for tests that need AUTH. Registers on_exit cleanup.
@@ -292,7 +298,18 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
     end
 
     test "user with +get +set can SET and GET over TCP", %{port: port} do
-      :ok = Acl.set_user("limited", ["on", ">limitpass", "-@all", "+get", "+set", "+auth", "+hello", "+ping", "+command"])
+      :ok =
+        Acl.set_user("limited", [
+          "on",
+          ">limitpass",
+          "-@all",
+          "+get",
+          "+set",
+          "+auth",
+          "+hello",
+          "+ping",
+          "+command"
+        ])
 
       {sock, resp} = connect_and_auth(port, "limited", "limitpass")
       assert resp == {:simple, "OK"}
@@ -307,7 +324,18 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
     end
 
     test "user with +get +set gets NOPERM on DEL over TCP", %{port: port} do
-      :ok = Acl.set_user("limited", ["on", ">limitpass", "-@all", "+get", "+set", "+auth", "+hello", "+ping", "+command"])
+      :ok =
+        Acl.set_user("limited", [
+          "on",
+          ">limitpass",
+          "-@all",
+          "+get",
+          "+set",
+          "+auth",
+          "+hello",
+          "+ping",
+          "+command"
+        ])
 
       {sock, _} = connect_and_auth(port, "limited", "limitpass")
 
@@ -361,6 +389,47 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
     end
   end
 
+  describe "Flow partition ACL key extraction" do
+    test "explicit partition keys are enforced for single-flow commands" do
+      :ok = Acl.set_user("flow_tenant_a", ["on", ">pass", "+@all", "~tenant-a"])
+      cache = ConnAuth.build_acl_cache("flow_tenant_a")
+
+      assert {"FLOW.GET", ["tenant-a"]} =
+               parsed_command_keys("flow.get flow-1 PARTITION tenant-a\r\n")
+
+      assert :ok = ConnAuth.check_keys_cached(cache, "FLOW.GET", ["tenant-a"])
+
+      assert {"FLOW.GET", ["tenant-b"]} =
+               parsed_command_keys("flow.get flow-1 PARTITION tenant-b\r\n")
+
+      assert {:error, "NOPERM" <> _} =
+               ConnAuth.check_keys_cached(cache, "FLOW.GET", ["tenant-b"])
+    end
+
+    test "unpartitioned Flow commands fall back to their visible id or type" do
+      assert {"FLOW.GET", ["flow-1"]} = parsed_command_keys("flow.get flow-1\r\n")
+      assert {"FLOW.LIST", ["checkout"]} = parsed_command_keys("flow.list checkout\r\n")
+    end
+
+    test "explicit partition keys are enforced for Flow index commands" do
+      :ok = Acl.set_user("flow_tenant_a", ["on", ">pass", "+@all", "~tenant-a"])
+      cache = ConnAuth.build_acl_cache("flow_tenant_a")
+
+      assert {"FLOW.CLAIM_DUE", ["tenant-a"]} =
+               parsed_command_keys(
+                 "flow.claim_due checkout WORKER worker-a PARTITION tenant-a\r\n"
+               )
+
+      assert :ok = ConnAuth.check_keys_cached(cache, "FLOW.CLAIM_DUE", ["tenant-a"])
+
+      assert {"FLOW.INFO", ["tenant-b"]} =
+               parsed_command_keys("flow.info checkout PARTITION tenant-b\r\n")
+
+      assert {:error, "NOPERM" <> _} =
+               ConnAuth.check_keys_cached(cache, "FLOW.INFO", ["tenant-b"])
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Edge case: AUTH changes permissions mid-connection
   # ---------------------------------------------------------------------------
@@ -372,8 +441,19 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
     end
 
     test "switching user via AUTH changes command permissions", %{port: port} do
-      :ok = Acl.set_user("reader", ["on", ">readpass", "-@all", "+get", "+auth", "+hello", "+command"])
-      :ok = Acl.set_user("writer", ["on", ">writepass", "-@all", "+set", "+auth", "+hello", "+command"])
+      :ok =
+        Acl.set_user("reader", ["on", ">readpass", "-@all", "+get", "+auth", "+hello", "+command"])
+
+      :ok =
+        Acl.set_user("writer", [
+          "on",
+          ">writepass",
+          "-@all",
+          "+set",
+          "+auth",
+          "+hello",
+          "+command"
+        ])
 
       {sock, _} = connect_and_auth(port, "reader", "readpass")
 
@@ -407,7 +487,18 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
     end
 
     test "1000 sequential commands with permission check do not degrade", %{port: port} do
-      :ok = Acl.set_user("stressuser", ["on", ">stresspass", "-@all", "+get", "+set", "+auth", "+hello", "+del", "+command"])
+      :ok =
+        Acl.set_user("stressuser", [
+          "on",
+          ">stresspass",
+          "-@all",
+          "+get",
+          "+set",
+          "+auth",
+          "+hello",
+          "+del",
+          "+command"
+        ])
 
       {sock, _} = connect_and_auth(port, "stressuser", "stresspass")
 
@@ -452,6 +543,85 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
   # ---------------------------------------------------------------------------
 
   describe "category membership" do
+    test "ACL categories cover every RESP command known by the parser" do
+      parser_path =
+        Path.expand(
+          "../../../../ferricstore/native/resp_parser_nif/src/lib.rs",
+          __DIR__
+        )
+
+      parser_source = File.read!(parser_path)
+
+      [_all, command_tag_block] =
+        Regex.run(
+          ~r/fn command_tag_name\(cmd: &\[u8\]\).*?match cmd \{(.*?)\n\s*}\n}/s,
+          parser_source
+        )
+
+      parser_commands =
+        ~r/b"([A-Z0-9_.]+)"\s*=>\s*Some/
+        |> Regex.scan(command_tag_block, capture: :all_but_first)
+        |> List.flatten()
+        |> MapSet.new()
+
+      acl_commands = FerricstoreServer.Acl.CommandCategories.acl_supported_commands()
+
+      assert MapSet.difference(parser_commands, acl_commands) == MapSet.new()
+    end
+
+    test "-@write denies every mutating command family, including newer modules" do
+      :ok = Acl.set_user("no_writes", ["on", ">pass", "+@all", "-@write"])
+
+      denied =
+        ~w(
+          SET GETSET GETDEL GETEX HSET HGETDEL HGETEX LPUSH BLPOP SADD ZADD XGROUP XACK
+          JSON.SET BF.ADD CF.ADD CMS.INCRBY TOPK.ADD TDIGEST.ADD FLOW.CREATE
+          FLOW.SPAWN_CHILDREN RATELIMIT.ADD FETCH_OR_COMPUTE
+        )
+
+      for cmd <- denied do
+        assert {:error, _} = Acl.check_command("no_writes", cmd),
+               "-@write should deny #{cmd}"
+      end
+    end
+
+    test "-@dangerous denies broad destructive maintenance commands" do
+      :ok = Acl.set_user("no_danger", ["on", ">pass", "+@all", "-@dangerous"])
+
+      for cmd <- ~w(FLUSHDB CLUSTER.ENABLE CLUSTER.JOIN FLOW.RETENTION_CLEANUP) do
+        assert {:error, _} = Acl.check_command("no_danger", cmd),
+               "-@dangerous should deny #{cmd}"
+      end
+    end
+
+    test "key access classification covers newer read and write command families" do
+      read_cmds =
+        ~w(
+          BF.EXISTS CF.EXISTS CMS.QUERY TOPK.QUERY TDIGEST.INFO FLOW.GET FLOW.HISTORY
+          ZRANGEBYSCORE ZREVRANGE ZREVRANGEBYSCORE HTTL HPTTL HEXPIRETIME
+        )
+
+      write_cmds =
+        ~w(
+          BF.ADD CF.DEL CMS.MERGE TOPK.INCRBY TDIGEST.MERGE FLOW.COMPLETE
+          FLOW.TRANSITION_MANY HEXPIRE HSETEX XREADGROUP
+        )
+
+      read_write_cmds = ~w(GETEX GETDEL GETSET HGETEX HGETDEL CAS)
+
+      for cmd <- read_cmds do
+        assert FerricstoreServer.Connection.Auth.command_access_type(cmd) == :read
+      end
+
+      for cmd <- write_cmds do
+        assert FerricstoreServer.Connection.Auth.command_access_type(cmd) == :write
+      end
+
+      for cmd <- read_write_cmds do
+        assert FerricstoreServer.Connection.Auth.command_access_type(cmd) == :rw
+      end
+    end
+
     test "@read category includes standard read commands" do
       :ok = Acl.set_user("cat_reader", ["on", ">pass", "-@all", "+@read"])
 
