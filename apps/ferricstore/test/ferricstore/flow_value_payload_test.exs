@@ -167,6 +167,41 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert fetched_failed.error == %{code: "bad_input"}
   end
 
+  test "terminal retention expires generated payload value refs" do
+    id = unique_id("flow-value-retention")
+
+    assert {:ok, created} =
+             FerricStore.flow_create(id,
+               type: "value-retention",
+               partition_key: "tenant-retention",
+               payload: %{large: String.duplicate("x", 256)},
+               retention_ttl_ms: 20,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, value_blob} = FerricStore.get(created.payload_ref)
+    assert is_binary(value_blob)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("value-retention",
+               partition_key: "tenant-retention",
+               worker: "worker-retention",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, _completed} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               partition_key: "tenant-retention",
+               fencing_token: claimed.fencing_token
+             )
+
+    Process.sleep(40)
+
+    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
+    assert {:ok, nil} = FerricStore.get(created.payload_ref)
+  end
+
   test "batch APIs also persist full value fields" do
     partition = "tenant-b"
     type = "value-batch"

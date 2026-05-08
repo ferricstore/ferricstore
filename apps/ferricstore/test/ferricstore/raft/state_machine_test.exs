@@ -514,7 +514,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
             partition_key: partition_key,
             now_ms: 1_000,
             run_at_ms: 1_000,
-            history_max_events: 1
+            history_hot_max_events: 1
           }
         end
 

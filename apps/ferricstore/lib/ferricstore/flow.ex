@@ -12,8 +12,7 @@ defmodule Ferricstore.Flow do
   @max_priority 2
   @default_lease_ms 30_000
   @default_limit 1
-  @default_history_max_events 1_024
-  @max_history_max_events 10_000
+  @max_history_hot_max_events 10_000
   @default_max_batch_items 1_000
   @default_max_claim_limit 1_000
   @default_payload_return_max_bytes 64 * 1024
@@ -28,7 +27,8 @@ defmodule Ferricstore.Flow do
   # Flow records and history are durable bytes. Before Flow is public, keep one
   # current compact schema and change it directly. Once users can have persisted
   # Flow data, incompatible field-order/type changes need explicit migration.
-  @record_bin_magic "FSF1"
+  @record_bin_magic_v1 "FSF1"
+  @record_bin_magic "FSF2"
   @history_bin_magic "FSH1"
 
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
@@ -861,7 +861,7 @@ defmodule Ferricstore.Flow do
     case Router.flow_get(ctx, id, partition_key) do
       value when is_binary(value) ->
         case safe_decode_record(value) do
-          {:ok, %{history_max_events: max}} -> {:ok, max}
+          {:ok, %{history_hot_max_events: max}} -> {:ok, max}
           _ -> :error
         end
 
@@ -998,7 +998,9 @@ defmodule Ferricstore.Flow do
       encode_int(Map.get(record, :next_run_at_ms)),
       encode_int(Map.get(record, :priority)),
       encode_int(Map.get(record, :ttl_ms)),
-      encode_int(Map.get(record, :history_max_events)),
+      encode_int(Map.get(record, :history_hot_max_events)),
+      encode_int(Map.get(record, :retention_ttl_ms)),
+      encode_int(Map.get(record, :terminal_retention_until_ms)),
       encode_bin(Map.get(record, :partition_key)),
       encode_bin(Map.get(record, :payload_ref)),
       encode_bin(Map.get(record, :parent_flow_id)),
@@ -1034,6 +1036,7 @@ defmodule Ferricstore.Flow do
   # cleanly. Never remove an old magic decoder until there is a deliberate
   # offline migration that rewrites every stored record and blocks downgrade.
   def decode_record(@record_bin_magic <> rest), do: decode_record_bin(rest)
+  def decode_record(@record_bin_magic_v1 <> rest), do: decode_record_bin_v1(rest)
 
   def decode_record(value) when is_binary(value) do
     value
@@ -1080,7 +1083,9 @@ defmodule Ferricstore.Flow do
       next_run_at_ms: next_run_at_ms,
       priority: priority,
       ttl_ms: ttl_ms,
-      history_max_events: history_max_events,
+      history_hot_max_events: history_max_events,
+      retention_ttl_ms: ttl_ms,
+      terminal_retention_until_ms: nil,
       partition_key: partition_key,
       payload_ref: payload_ref,
       parent_flow_id: parent_flow_id,
@@ -1156,7 +1161,7 @@ defmodule Ferricstore.Flow do
     })
   end
 
-  defp decode_record_term(record) when is_map(record), do: record
+  defp decode_record_term(record) when is_map(record), do: normalize_record_map(record)
 
   @doc false
   # History entries have their own durable schema because they are retained for
@@ -1285,7 +1290,9 @@ defmodule Ferricstore.Flow do
          {:ok, next_run_at_ms, rest} <- decode_int(rest),
          {:ok, priority, rest} <- decode_int(rest),
          {:ok, ttl_ms, rest} <- decode_int(rest),
-         {:ok, history_max_events, rest} <- decode_int(rest),
+         {:ok, history_hot_max_events, rest} <- decode_int(rest),
+         {:ok, retention_ttl_ms, rest} <- decode_int(rest),
+         {:ok, terminal_retention_until_ms, rest} <- decode_int(rest),
          {:ok, partition_key, rest} <- decode_bin(rest),
          {:ok, payload_ref, rest} <- decode_bin(rest),
          {:ok, parent_flow_id, rest} <- decode_bin(rest),
@@ -1309,7 +1316,9 @@ defmodule Ferricstore.Flow do
         next_run_at_ms: next_run_at_ms,
         priority: priority,
         ttl_ms: ttl_ms,
-        history_max_events: history_max_events,
+        history_hot_max_events: history_hot_max_events,
+        retention_ttl_ms: retention_ttl_ms,
+        terminal_retention_until_ms: terminal_retention_until_ms,
         partition_key: partition_key,
         payload_ref: payload_ref,
         parent_flow_id: parent_flow_id,
@@ -1332,6 +1341,76 @@ defmodule Ferricstore.Flow do
       _ -> raise ArgumentError, "invalid flow record"
     end
   end
+
+  defp decode_record_bin_v1(rest) do
+    with {:ok, id, rest} <- decode_bin(rest),
+         {:ok, type, rest} <- decode_bin(rest),
+         {:ok, state, rest} <- decode_bin(rest),
+         {:ok, version, rest} <- decode_int(rest),
+         {:ok, attempts, rest} <- decode_int(rest),
+         {:ok, fencing_token, rest} <- decode_int(rest),
+         {:ok, created_at_ms, rest} <- decode_int(rest),
+         {:ok, updated_at_ms, rest} <- decode_int(rest),
+         {:ok, next_run_at_ms, rest} <- decode_int(rest),
+         {:ok, priority, rest} <- decode_int(rest),
+         {:ok, ttl_ms, rest} <- decode_int(rest),
+         {:ok, history_max_events, rest} <- decode_int(rest),
+         {:ok, partition_key, rest} <- decode_bin(rest),
+         {:ok, payload_ref, rest} <- decode_bin(rest),
+         {:ok, parent_flow_id, rest} <- decode_bin(rest),
+         {:ok, root_flow_id, rest} <- decode_bin(rest),
+         {:ok, correlation_id, rest} <- decode_bin(rest),
+         {:ok, result_ref, rest} <- decode_bin(rest),
+         {:ok, error_ref, rest} <- decode_bin(rest),
+         {:ok, lease_owner, rest} <- decode_bin(rest),
+         {:ok, lease_token, rest} <- decode_bin(rest),
+         {:ok, lease_deadline_ms, rest} <- decode_int(rest),
+         {:ok, run_state, rewound_to_event_id} <- decode_record_run_state_and_rewind(rest) do
+      %{
+        id: id,
+        type: type,
+        state: state,
+        version: version,
+        attempts: attempts,
+        fencing_token: fencing_token,
+        created_at_ms: created_at_ms,
+        updated_at_ms: updated_at_ms,
+        next_run_at_ms: next_run_at_ms,
+        priority: priority,
+        ttl_ms: ttl_ms,
+        history_hot_max_events: history_max_events,
+        retention_ttl_ms: ttl_ms,
+        terminal_retention_until_ms: nil,
+        partition_key: partition_key,
+        payload_ref: payload_ref,
+        parent_flow_id: parent_flow_id,
+        root_flow_id: root_flow_id,
+        correlation_id: correlation_id,
+        result_ref: result_ref,
+        error_ref: error_ref,
+        lease_owner: lease_owner,
+        lease_token: lease_token,
+        lease_deadline_ms: lease_deadline_ms,
+        run_state: run_state
+      }
+      |> maybe_put_decoded_rewind(rewound_to_event_id)
+    else
+      _ -> raise ArgumentError, "invalid flow record"
+    end
+  end
+
+  defp normalize_record_map(record) when is_map(record) do
+    record
+    |> Map.put_new(:history_hot_max_events, Map.get(record, :history_max_events))
+    |> Map.put_new(:retention_ttl_ms, Map.get(record, :ttl_ms))
+    |> Map.put_new(:terminal_retention_until_ms, nil)
+    |> Map.delete(:history_max_events)
+  end
+
+  defp maybe_put_decoded_rewind(record, nil), do: record
+
+  defp maybe_put_decoded_rewind(record, rewound_to_event_id),
+    do: Map.put(record, :rewound_to_event_id, rewound_to_event_id)
 
   defp decode_record_run_state_and_rewind(rest) do
     case decode_bin(rest) do
@@ -2479,8 +2558,8 @@ defmodule Ferricstore.Flow do
          {:ok, idempotent} <- optional_boolean(opts, :idempotent, false),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
-         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
-         {:ok, history_max_events} <- optional_history_max_events(opts),
+         {:ok, retention_ttl_ms} <- optional_retention_ttl_ms(opts),
+         {:ok, history_hot_max_events} <- optional_history_hot_max_events(opts),
          {:ok, priority} <- optional_priority(opts, @default_priority),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_flow_keys(id, type, state, priority, partition_key) do
@@ -2494,8 +2573,8 @@ defmodule Ferricstore.Flow do
           root_flow_id: root_flow_id,
           correlation_id: correlation_id,
           idempotent: idempotent,
-          ttl_ms: ttl_ms,
-          history_max_events: history_max_events,
+          retention_ttl_ms: retention_ttl_ms,
+          history_hot_max_events: history_hot_max_events,
           priority: priority,
           partition_key: partition_key
         }
@@ -2573,6 +2652,13 @@ defmodule Ferricstore.Flow do
     |> maybe_put_item_opt(:root_flow_id, item, :root_flow_id, "root_flow_id")
     |> maybe_put_item_opt(:correlation_id, item, :correlation_id, "correlation_id")
     |> maybe_put_item_opt(:idempotent, item, :idempotent, "idempotent")
+    |> maybe_put_item_opt(:retention_ttl_ms, item, :retention_ttl_ms, "retention_ttl_ms")
+    |> maybe_put_item_opt(
+      :history_hot_max_events,
+      item,
+      :history_hot_max_events,
+      "history_hot_max_events"
+    )
   end
 
   defp transition_attrs(id, from_state, to_state, opts) do
@@ -3869,43 +3955,58 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp optional_history_max_events(opts) do
-    case Keyword.get(opts, :history_max_events, flow_default_history_max_events()) do
-      nil ->
-        {:ok, nil}
+  defp optional_retention_ttl_ms(opts) do
+    cond do
+      Keyword.has_key?(opts, :ttl_ms) ->
+        {:error, "ERR flow ttl_ms was renamed to retention_ttl_ms"}
 
-      value when is_integer(value) and value > 0 ->
-        max = flow_max_history_max_events()
+      Keyword.has_key?(opts, :retention_ttl_ms) ->
+        case Keyword.get(opts, :retention_ttl_ms) do
+          value when is_integer(value) and value > 0 ->
+            {:ok, value}
 
-        if value <= max do
-          {:ok, value}
-        else
-          {:error, "ERR flow history_max_events exceeds maximum #{max}"}
+          _ ->
+            {:error, "ERR flow retention_ttl_ms must be a positive integer"}
         end
 
-      _ ->
-        {:error, "ERR flow history_max_events must be a positive integer"}
+      true ->
+        {:ok, nil}
     end
   end
 
-  defp flow_default_history_max_events do
-    max = flow_max_history_max_events()
+  defp optional_history_hot_max_events(opts) do
+    cond do
+      Keyword.has_key?(opts, :history_max_events) ->
+        {:error, "ERR flow history_max_events was renamed to history_hot_max_events"}
 
+      Keyword.has_key?(opts, :history_hot_max_events) ->
+        case Keyword.get(opts, :history_hot_max_events) do
+          value when is_integer(value) and value > 0 ->
+            max = flow_max_history_hot_max_events()
+
+            if value <= max do
+              {:ok, value}
+            else
+              {:error, "ERR flow history_hot_max_events exceeds maximum #{max}"}
+            end
+
+          _ ->
+            {:error, "ERR flow history_hot_max_events must be a positive integer"}
+        end
+
+      true ->
+        {:ok, nil}
+    end
+  end
+
+  defp flow_max_history_hot_max_events do
     case Application.get_env(
            :ferricstore,
-           :flow_default_history_max_events,
-           @default_history_max_events
+           :flow_max_history_hot_max_events,
+           @max_history_hot_max_events
          ) do
-      nil -> nil
-      value when is_integer(value) and value > 0 -> min(value, max)
-      _ -> min(@default_history_max_events, max)
-    end
-  end
-
-  defp flow_max_history_max_events do
-    case Application.get_env(:ferricstore, :flow_max_history_max_events, @max_history_max_events) do
       value when is_integer(value) and value > 0 -> value
-      _ -> @max_history_max_events
+      _ -> @max_history_hot_max_events
     end
   end
 
@@ -4090,15 +4191,25 @@ defmodule Ferricstore.Flow do
     %{
       type: type,
       retry: RetryPolicy.resolve(policy, nil, nil),
+      retention: RetryPolicy.resolve_retention(policy, nil, nil),
       states:
         Map.new(states, fn {state, _state_policy} ->
-          {state, %{retry: RetryPolicy.resolve(policy, state, nil)}}
+          {state,
+           %{
+             retry: RetryPolicy.resolve(policy, state, nil),
+             retention: RetryPolicy.resolve_retention(policy, state, nil)
+           }}
         end)
     }
   end
 
   defp policy_response(type, policy, state) when is_binary(state) do
-    %{type: type, state: state, retry: RetryPolicy.resolve(policy, state, nil)}
+    %{
+      type: type,
+      state: state,
+      retry: RetryPolicy.resolve(policy, state, nil),
+      retention: RetryPolicy.resolve_retention(policy, state, nil)
+    }
   end
 
   defp now_ms, do: CommandTime.now_ms()

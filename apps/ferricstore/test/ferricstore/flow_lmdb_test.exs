@@ -1102,9 +1102,10 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert completed.version == 3
 
-    assert [{^state_key, nil, 0, {:flow_state_version, 3, _lfu}, fid, off, vsize}] =
+    assert [{^state_key, nil, expire_at_ms, {:flow_state_version, 3, _lfu}, fid, off, vsize}] =
              :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
 
+    assert expire_at_ms > System.system_time(:millisecond)
     assert is_integer(fid)
     assert is_integer(off)
     assert is_integer(vsize)
@@ -1284,7 +1285,7 @@ defmodule Ferricstore.Flow.LMDBTest do
       next_run_at_ms: nil,
       priority: 0,
       ttl_ms: nil,
-      history_max_events: nil,
+      history_hot_max_events: nil,
       partition_key: partition_key,
       payload_ref: nil,
       parent_flow_id: nil,
@@ -1469,7 +1470,7 @@ defmodule Ferricstore.Flow.LMDBTest do
       next_run_at_ms: 20_000,
       priority: 0,
       ttl_ms: nil,
-      history_max_events: nil,
+      history_hot_max_events: nil,
       partition_key: partition_key,
       payload_ref: nil,
       parent_flow_id: parent_flow_id,
@@ -1801,7 +1802,7 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.create(ctx, id,
                type: "history-cold-projection",
                partition_key: partition_key,
-               history_max_events: 2,
+               history_hot_max_events: 2,
                run_at_ms: 1_000,
                now_ms: 1_000
              )
@@ -1865,7 +1866,7 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.create(ctx, id,
                type: "history-cold-projection-restart",
                partition_key: partition_key,
-               history_max_events: 2,
+               history_hot_max_events: 2,
                run_at_ms: 1_000,
                now_ms: 1_000
              )

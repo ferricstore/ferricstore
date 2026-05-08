@@ -6177,11 +6177,20 @@ fn flow_create_option<'a>(
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
-            (b"TTL", "ttl_ms", FlowOptType::NonNegative),
             (
-                b"HISTORY_MAX_EVENTS",
-                "history_max_events",
-                FlowOptType::Positive(b"history_max_events"),
+                b"RETENTION_TTL",
+                "retention_ttl_ms",
+                FlowOptType::Positive(b"retention_ttl_ms"),
+            ),
+            (
+                b"RETENTION_TTL_MS",
+                "retention_ttl_ms",
+                FlowOptType::Positive(b"retention_ttl_ms"),
+            ),
+            (
+                b"HISTORY_HOT_MAX_EVENTS",
+                "history_hot_max_events",
+                FlowOptType::Positive(b"history_hot_max_events"),
             ),
             (b"IDEMPOTENT", "idempotent", FlowOptType::Boolean),
         ],
@@ -6197,6 +6206,7 @@ fn parse_flow_policy_set_options<'a>(
     let mut opts = Vec::new();
     let mut retry_opts = Vec::new();
     let mut backoff_opts = Vec::new();
+    let mut retention_opts = Vec::new();
     let mut states = Vec::new();
     let mut idx = start;
 
@@ -6217,23 +6227,24 @@ fn parse_flow_policy_set_options<'a>(
                 end += 2;
             }
 
-            let state_retry = parse_flow_policy_retry_options(env, args, arg_bytes, idx + 2, end)?;
-            states.push(
-                (
-                    args[idx + 1],
-                    vec![(atom(env, "retry"), state_retry).encode(env)],
-                )
-                    .encode(env),
-            );
+            let (state_retry, state_retention) =
+                parse_flow_policy_options(env, args, arg_bytes, idx + 2, end)?;
+            let mut state_policy = Vec::new();
+            if !state_retry.is_empty() {
+                state_policy.push((atom(env, "retry"), state_retry).encode(env));
+            }
+            if !state_retention.is_empty() {
+                state_policy.push((atom(env, "retention"), state_retention).encode(env));
+            }
+            states.push((args[idx + 1], state_policy).encode(env));
             idx = end;
             continue;
         }
 
-        let (term, is_backoff) = flow_policy_retry_option(env, args, arg_bytes, idx)?;
-        if is_backoff {
-            backoff_opts.push(term);
-        } else {
-            retry_opts.push(term);
+        match flow_policy_option(env, args, arg_bytes, idx)? {
+            FlowPolicyOpt::Retry(term) => retry_opts.push(term),
+            FlowPolicyOpt::Backoff(term) => backoff_opts.push(term),
+            FlowPolicyOpt::Retention(term) => retention_opts.push(term),
         }
         idx += 2;
     }
@@ -6246,6 +6257,10 @@ fn parse_flow_policy_set_options<'a>(
         opts.push((atom(env, "retry"), retry_opts).encode(env));
     }
 
+    if !retention_opts.is_empty() {
+        opts.push((atom(env, "retention"), retention_opts).encode(env));
+    }
+
     if !states.is_empty() {
         opts.push((atom(env, "states"), states).encode(env));
     }
@@ -6253,27 +6268,33 @@ fn parse_flow_policy_set_options<'a>(
     Ok(opts)
 }
 
-fn parse_flow_policy_retry_options<'a>(
+enum FlowPolicyOpt<'a> {
+    Retry(Term<'a>),
+    Backoff(Term<'a>),
+    Retention(Term<'a>),
+}
+
+fn parse_flow_policy_options<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
     arg_bytes: &[&[u8]],
     start: usize,
     end: usize,
-) -> Result<Vec<Term<'a>>, Term<'a>> {
+) -> Result<(Vec<Term<'a>>, Vec<Term<'a>>), Term<'a>> {
     if (end - start) % 2 != 0 {
         return Err(generic_ast_error(env, b"ERR syntax error"));
     }
 
     let mut retry_opts = Vec::new();
     let mut backoff_opts = Vec::new();
+    let mut retention_opts = Vec::new();
     let mut idx = start;
 
     while idx < end {
-        let (term, is_backoff) = flow_policy_retry_option(env, args, arg_bytes, idx)?;
-        if is_backoff {
-            backoff_opts.push(term);
-        } else {
-            retry_opts.push(term);
+        match flow_policy_option(env, args, arg_bytes, idx)? {
+            FlowPolicyOpt::Retry(term) => retry_opts.push(term),
+            FlowPolicyOpt::Backoff(term) => backoff_opts.push(term),
+            FlowPolicyOpt::Retention(term) => retention_opts.push(term),
         }
         idx += 2;
     }
@@ -6282,7 +6303,49 @@ fn parse_flow_policy_retry_options<'a>(
         retry_opts.push((atom(env, "backoff"), backoff_opts).encode(env));
     }
 
-    Ok(retry_opts)
+    Ok((retry_opts, retention_opts))
+}
+
+fn flow_policy_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<FlowPolicyOpt<'a>, Term<'a>> {
+    if idx + 1 >= args.len() {
+        return Err(generic_ast_error(env, b"ERR syntax error"));
+    }
+
+    if ascii_eq_ignore_case(arg_bytes[idx], b"RETENTION_TTL")
+        || ascii_eq_ignore_case(arg_bytes[idx], b"RETENTION_TTL_MS")
+    {
+        match parse_int_bytes(arg_bytes[idx + 1]) {
+            Some(value) if value > 0 => Ok(FlowPolicyOpt::Retention(
+                (atom(env, "ttl_ms"), value).encode(env),
+            )),
+            _ => Err(generic_ast_error(
+                env,
+                b"ERR value is not an integer or out of range",
+            )),
+        }
+    } else if ascii_eq_ignore_case(arg_bytes[idx], b"HISTORY_HOT_MAX_EVENTS") {
+        match parse_int_bytes(arg_bytes[idx + 1]) {
+            Some(value) if value > 0 => Ok(FlowPolicyOpt::Retention(
+                (atom(env, "history_hot_max_events"), value).encode(env),
+            )),
+            _ => Err(generic_ast_error(
+                env,
+                b"ERR value is not an integer or out of range",
+            )),
+        }
+    } else {
+        let (term, is_backoff) = flow_policy_retry_option(env, args, arg_bytes, idx)?;
+        if is_backoff {
+            Ok(FlowPolicyOpt::Backoff(term))
+        } else {
+            Ok(FlowPolicyOpt::Retry(term))
+        }
+    }
 }
 
 fn flow_policy_retry_option<'a>(

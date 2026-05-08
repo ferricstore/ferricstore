@@ -3,11 +3,18 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   @max_retries 1_000
   @max_delay_ms 2_592_000_000
+  @max_retention_ttl_ms 31_536_000_000
+  @max_history_hot_max_events 10_000
 
   @default %{
     max_retries: 3,
     backoff: %{kind: :exponential, base_ms: 1_000, max_ms: 30_000, jitter_pct: 20},
     exhausted_to: "failed"
+  }
+
+  @default_retention %{
+    ttl_ms: 604_800_000,
+    history_hot_max_events: 1_024
   }
 
   @type t :: %{
@@ -24,6 +31,13 @@ defmodule Ferricstore.Flow.RetryPolicy do
   @spec default() :: t()
   def default, do: @default
 
+  def default_retention do
+    %{
+      ttl_ms: default_retention_ttl_ms(),
+      history_hot_max_events: default_history_hot_max_events()
+    }
+  end
+
   @spec normalize_flow_policy(binary(), term()) :: {:ok, map()} | {:error, binary()}
   def normalize_flow_policy(type, opts) when is_binary(type) and is_list(opts) do
     if Keyword.keyword?(opts) do
@@ -35,10 +49,11 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   def normalize_flow_policy(type, attrs) when is_binary(type) and is_map(attrs) do
     with {:ok, retry} <- optional_retry_override(attrs),
+         {:ok, retention} <- optional_retention_override(attrs),
          {:ok, states} <- normalize_state_policies(fetch_policy(attrs, :states, "states", %{})) do
       policy =
-        %{type: type, retry: retry, states: states}
-        |> drop_nil_retry()
+        %{type: type, retry: retry, retention: retention, states: states}
+        |> drop_nil_policy_fields()
 
       {:ok, policy}
     end
@@ -83,6 +98,39 @@ defmodule Ferricstore.Flow.RetryPolicy do
     |> merge_retry(state_retry(flow_policy, state))
     |> merge_retry(command_override)
   end
+
+  def resolve_retention(flow_policy, state, command_override) do
+    default_retention()
+    |> merge_retention(policy_retention(flow_policy))
+    |> merge_retention(state_retention(flow_policy, state))
+    |> merge_retention(command_override)
+  end
+
+  def normalize_retention_override(nil), do: {:ok, nil}
+
+  def normalize_retention_override(retention) when is_list(retention) do
+    if Keyword.keyword?(retention) do
+      retention |> Map.new() |> normalize_retention_override()
+    else
+      {:error, "ERR flow retention policy must be a map or keyword list"}
+    end
+  end
+
+  def normalize_retention_override(retention) when is_map(retention) do
+    with :ok <- reject_old_history_max_events(retention),
+         {:ok, ttl_ms} <- optional_retention_ttl_ms(retention),
+         {:ok, history_hot_max_events} <- optional_history_hot_max_events(retention) do
+      override =
+        %{}
+        |> maybe_put(:ttl_ms, ttl_ms)
+        |> maybe_put(:history_hot_max_events, history_hot_max_events)
+
+      {:ok, override}
+    end
+  end
+
+  def normalize_retention_override(_retention),
+    do: {:error, "ERR flow retention policy must be a map or keyword list"}
 
   @spec encode_flow_policy(map()) :: binary()
   def encode_flow_policy(policy) when is_map(policy) do
@@ -270,11 +318,24 @@ defmodule Ferricstore.Flow.RetryPolicy do
     end
   end
 
+  defp optional_retention_override(attrs) do
+    if has_policy_key?(attrs, :retention, "retention") do
+      attrs
+      |> fetch_policy(:retention, "retention", nil)
+      |> normalize_retention_override()
+    else
+      {:ok, nil}
+    end
+  end
+
   defp normalize_state_policies(states) when is_map(states) do
     Enum.reduce_while(states, {:ok, %{}}, fn {state, policy}, {:ok, acc} ->
       with {:ok, state} <- normalize_state_name(state),
-           {:ok, retry} <- optional_retry_override(policy_map(policy)) do
-        {:cont, {:ok, Map.put(acc, state, drop_nil_retry(%{retry: retry}))}}
+           policy = policy_map(policy),
+           {:ok, retry} <- optional_retry_override(policy),
+           {:ok, retention} <- optional_retention_override(policy) do
+        {:cont,
+         {:ok, Map.put(acc, state, drop_nil_policy_fields(%{retry: retry, retention: retention}))}}
       else
         {:error, _reason} = error -> {:halt, error}
       end
@@ -347,8 +408,119 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   defp state_retry(_policy, _state), do: nil
 
-  defp drop_nil_retry(%{retry: nil} = policy), do: Map.delete(policy, :retry)
-  defp drop_nil_retry(policy), do: policy
+  defp policy_retention(%{retention: retention}) when is_map(retention), do: retention
+  defp policy_retention(_policy), do: nil
+
+  defp state_retention(%{states: states}, state) when is_map(states) and is_binary(state) do
+    case Map.get(states, state) do
+      %{retention: retention} when is_map(retention) -> retention
+      _ -> nil
+    end
+  end
+
+  defp state_retention(_policy, _state), do: nil
+
+  defp merge_retention(policy, nil), do: policy
+  defp merge_retention(policy, override) when override == %{}, do: policy
+
+  defp merge_retention(policy, override) when is_map(override) do
+    Enum.reduce(override, policy, fn
+      {key, value}, acc when key in [:ttl_ms, :history_hot_max_events] ->
+        Map.put(acc, key, value)
+
+      _entry, acc ->
+        acc
+    end)
+  end
+
+  defp reject_old_history_max_events(policy) do
+    if has_policy_key?(policy, :history_max_events, "history_max_events") do
+      {:error, "ERR flow retention history_max_events was renamed to history_hot_max_events"}
+    else
+      :ok
+    end
+  end
+
+  defp optional_retention_ttl_ms(policy) do
+    if has_policy_key?(policy, :ttl_ms, "ttl_ms") do
+      policy
+      |> fetch_policy(:ttl_ms, "ttl_ms", nil)
+      |> validate_retention_ttl_ms()
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp validate_retention_ttl_ms(value)
+       when is_integer(value) and value > 0 and value <= @max_retention_ttl_ms,
+       do: {:ok, value}
+
+  defp validate_retention_ttl_ms(_value),
+    do: {:error, "ERR flow retention ttl_ms must be between 1 and #{@max_retention_ttl_ms}"}
+
+  defp optional_history_hot_max_events(policy) do
+    if has_policy_key?(policy, :history_hot_max_events, "history_hot_max_events") do
+      policy
+      |> fetch_policy(:history_hot_max_events, "history_hot_max_events", nil)
+      |> validate_history_hot_max_events()
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp validate_history_hot_max_events(value)
+       when is_integer(value) and value > 0 and value <= @max_history_hot_max_events,
+       do: {:ok, value}
+
+  defp validate_history_hot_max_events(_value),
+    do:
+      {:error,
+       "ERR flow retention history_hot_max_events must be between 1 and #{@max_history_hot_max_events}"}
+
+  defp default_retention_ttl_ms do
+    case Application.get_env(
+           :ferricstore,
+           :flow_default_retention_ttl_ms,
+           @default_retention.ttl_ms
+         ) do
+      value when is_integer(value) and value > 0 and value <= @max_retention_ttl_ms -> value
+      _ -> @default_retention.ttl_ms
+    end
+  end
+
+  defp default_history_hot_max_events do
+    max = max_history_hot_max_events()
+
+    case Application.get_env(
+           :ferricstore,
+           :flow_default_history_hot_max_events,
+           @default_retention.history_hot_max_events
+         ) do
+      value when is_integer(value) and value > 0 -> min(value, max)
+      _ -> min(@default_retention.history_hot_max_events, max)
+    end
+  end
+
+  defp max_history_hot_max_events do
+    case Application.get_env(
+           :ferricstore,
+           :flow_max_history_hot_max_events,
+           @max_history_hot_max_events
+         ) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> @max_history_hot_max_events
+    end
+  end
+
+  defp drop_nil_policy_fields(policy) do
+    policy
+    |> drop_nil_field(:retry)
+    |> drop_nil_field(:retention)
+  end
+
+  defp drop_nil_field(policy, key) do
+    if Map.get(policy, key) == nil, do: Map.delete(policy, key), else: policy
+  end
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)

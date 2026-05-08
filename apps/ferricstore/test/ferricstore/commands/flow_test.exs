@@ -66,7 +66,9 @@ defmodule Ferricstore.Commands.FlowTest do
                  "checkout-root",
                  "CORRELATION_ID",
                  "order-123",
-                 "HISTORY_MAX_EVENTS",
+                 "RETENTION_TTL",
+                 "60000",
+                 "HISTORY_HOT_MAX_EVENTS",
                  "5"
                ],
                MockStore.make()
@@ -1059,6 +1061,7 @@ defmodule Ferricstore.Commands.FlowTest do
              Dispatcher.dispatch_ast(
                {:flow_policy_set, type,
                 [
+                  retention: [ttl_ms: 60_000, history_hot_max_events: 32],
                   retry: [
                     max_retries: 5,
                     backoff: [kind: :fixed, base_ms: 1_000, max_ms: 5_000, jitter_pct: 0],
@@ -1066,17 +1069,22 @@ defmodule Ferricstore.Commands.FlowTest do
                   ],
                   states: %{
                     "charge_card" => [
-                      retry: [max_retries: 1, exhausted_to: "payment_failed"]
+                      retry: [max_retries: 1, exhausted_to: "payment_failed"],
+                      retention: [ttl_ms: 30_000, history_hot_max_events: 16]
                     ]
                   }
                 ]},
                MockStore.make()
              )
 
+    assert %{"retention" => %{"ttl_ms" => 60_000, "history_hot_max_events" => 32}} =
+             Dispatcher.dispatch_ast({:flow_policy_get, type, []}, MockStore.make())
+
     assert %{
              "type" => ^type,
              "state" => "charge_card",
-             "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"}
+             "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"},
+             "retention" => %{"ttl_ms" => 30_000, "history_hot_max_events" => 16}
            } =
              Dispatcher.dispatch_ast(
                {:flow_policy_get, type, [state: "charge_card"]},
@@ -1114,6 +1122,10 @@ defmodule Ferricstore.Commands.FlowTest do
                  "5000",
                  "JITTER_PCT",
                  "0",
+                 "RETENTION_TTL",
+                 "60000",
+                 "HISTORY_HOT_MAX_EVENTS",
+                 "32",
                  "EXHAUSTED_TO",
                  "failed",
                  "STATE",
@@ -1121,15 +1133,23 @@ defmodule Ferricstore.Commands.FlowTest do
                  "MAX_RETRIES",
                  "1",
                  "EXHAUSTED_TO",
-                 "payment_failed"
+                 "payment_failed",
+                 "RETENTION_TTL",
+                 "30000",
+                 "HISTORY_HOT_MAX_EVENTS",
+                 "16"
                ],
                MockStore.make()
              )
 
+    assert %{"retention" => %{"ttl_ms" => 60_000, "history_hot_max_events" => 32}} =
+             Dispatcher.dispatch("FLOW.POLICY.GET", [type], MockStore.make())
+
     assert %{
              "type" => ^type,
              "state" => "charge_card",
-             "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"}
+             "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"},
+             "retention" => %{"ttl_ms" => 30_000, "history_hot_max_events" => 16}
            } =
              Dispatcher.dispatch(
                "FLOW.POLICY.GET",

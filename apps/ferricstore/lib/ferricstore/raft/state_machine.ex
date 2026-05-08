@@ -4361,7 +4361,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     case flow_read_record(state, id, partition_key) do
       nil ->
-        record = flow_create_record(attrs)
+        record = flow_create_record(state, attrs)
 
         with :ok <- flow_validate_record_keys(record),
              :ok <- flow_put_record_values(state, record, attrs),
@@ -4395,10 +4395,11 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_flow_create_many(_state, _attrs),
     do: {:error, "ERR flow items must be a non-empty list"}
 
-  defp flow_create_record(%{id: id, type: type, state: flow_state} = attrs) do
+  defp flow_create_record(state, %{id: id, type: type, state: flow_state} = attrs) do
     now_ms = Map.get(attrs, :now_ms, apply_now_ms())
     run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
     priority = Map.get(attrs, :priority, 0)
+    retention = flow_retention_for_create(state, attrs)
 
     %{
       id: id,
@@ -4411,8 +4412,10 @@ defmodule Ferricstore.Raft.StateMachine do
       updated_at_ms: now_ms,
       next_run_at_ms: run_at_ms,
       priority: priority,
-      ttl_ms: Map.get(attrs, :ttl_ms),
-      history_max_events: Map.get(attrs, :history_max_events),
+      ttl_ms: nil,
+      retention_ttl_ms: Map.fetch!(retention, :ttl_ms),
+      terminal_retention_until_ms: nil,
+      history_hot_max_events: Map.fetch!(retention, :history_hot_max_events),
       partition_key: Map.get(attrs, :partition_key),
       payload_ref: flow_value_ref(attrs, :payload, id, 1, Map.get(attrs, :partition_key)),
       parent_flow_id: Map.get(attrs, :parent_flow_id),
@@ -4425,6 +4428,38 @@ defmodule Ferricstore.Raft.StateMachine do
       lease_deadline_ms: 0,
       run_state: nil
     }
+    |> flow_stamp_terminal_retention(now_ms)
+  end
+
+  defp flow_retention_for_create(state, attrs) do
+    flow_policy = flow_read_policy(state, Map.get(attrs, :type))
+
+    override =
+      %{}
+      |> maybe_put_retention_override(:ttl_ms, Map.get(attrs, :retention_ttl_ms))
+      |> maybe_put_retention_override(
+        :history_hot_max_events,
+        Map.get(attrs, :history_hot_max_events)
+      )
+
+    RetryPolicy.resolve_retention(flow_policy, Map.get(attrs, :state), override)
+  end
+
+  defp maybe_put_retention_override(map, _key, nil), do: map
+  defp maybe_put_retention_override(map, key, value), do: Map.put(map, key, value)
+
+  defp flow_stamp_terminal_retention(record, _now_ms) do
+    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+      retention_ttl_ms = Map.get(record, :retention_ttl_ms)
+
+      if is_integer(retention_ttl_ms) and retention_ttl_ms > 0 do
+        Map.put(record, :terminal_retention_until_ms, apply_now_ms() + retention_ttl_ms)
+      else
+        Map.put(record, :terminal_retention_until_ms, nil)
+      end
+    else
+      Map.put(record, :terminal_retention_until_ms, nil)
+    end
   end
 
   defp flow_create_duplicate_result(state, existing, %{idempotent: true} = attrs) do
@@ -4458,6 +4493,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_create_idempotent_match?(state, existing, attrs) do
     id = Map.fetch!(attrs, :id)
     partition_key = Map.get(attrs, :partition_key)
+    retention = flow_retention_for_create(state, attrs)
 
     comparable_attrs = %{
       id: id,
@@ -4469,8 +4505,9 @@ defmodule Ferricstore.Raft.StateMachine do
       root_flow_id: Map.get(attrs, :root_flow_id) || id,
       correlation_id: Map.get(attrs, :correlation_id),
       priority: Map.get(attrs, :priority, 0),
-      ttl_ms: Map.get(attrs, :ttl_ms),
-      history_max_events: Map.get(attrs, :history_max_events)
+      ttl_ms: nil,
+      retention_ttl_ms: Map.fetch!(retention, :ttl_ms),
+      history_hot_max_events: Map.fetch!(retention, :history_hot_max_events)
     }
 
     Enum.all?(comparable_attrs, fn {key, value} -> Map.get(existing, key) == value end) and
@@ -4549,7 +4586,7 @@ defmodule Ferricstore.Raft.StateMachine do
     |> Enum.reduce_while({:ok, [], []}, fn {%{id: _id} = attrs, existing}, {:ok, acc, new_acc} ->
       case existing do
         nil ->
-          record = flow_create_record(attrs)
+          record = flow_create_record(state, attrs)
 
           case flow_validate_record_keys(record) do
             :ok -> {:cont, {:ok, [record | acc], [{record, attrs} | new_acc]}}
@@ -5158,13 +5195,15 @@ defmodule Ferricstore.Raft.StateMachine do
               Map.get(record, :payload_ref)
             ),
           result_ref: flow_value_ref(attrs, :result, id, version, partition_key),
-          ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :ttl_ms),
-          history_max_events: Map.get(record, :history_max_events),
+          ttl_ms: nil,
+          retention_ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms),
+          history_hot_max_events: Map.get(record, :history_hot_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0,
           next_run_at_ms: nil
         })
+        |> flow_stamp_terminal_retention(now_ms)
 
       with :ok <- flow_validate_record_keys(record),
            :ok <- flow_validate_record_keys(next) do
@@ -5336,12 +5375,14 @@ defmodule Ferricstore.Raft.StateMachine do
               partition_key,
               Map.get(record, :payload_ref)
             ),
-          ttl_ms: Map.get(record, :ttl_ms),
-          history_max_events: Map.get(record, :history_max_events),
+          ttl_ms: nil,
+          retention_ttl_ms: Map.get(record, :retention_ttl_ms),
+          history_hot_max_events: Map.get(record, :history_hot_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0
         })
+        |> flow_stamp_terminal_retention(now_ms)
 
       with :ok <- flow_validate_record_keys(record),
            :ok <- flow_validate_record_keys(next) do
@@ -5481,13 +5522,15 @@ defmodule Ferricstore.Raft.StateMachine do
               Map.get(record, :payload_ref)
             ),
           error_ref: flow_value_ref(attrs, :error, id, version, partition_key),
-          ttl_ms: Map.get(record, :ttl_ms),
-          history_max_events: Map.get(record, :history_max_events),
+          ttl_ms: nil,
+          retention_ttl_ms: Map.get(record, :retention_ttl_ms),
+          history_hot_max_events: Map.get(record, :history_hot_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0,
           run_state: nil
         })
+        |> flow_stamp_terminal_retention(now_ms)
 
       with :ok <- flow_validate_record_keys(record),
            :ok <- flow_validate_record_keys(next) do
@@ -5653,13 +5696,15 @@ defmodule Ferricstore.Raft.StateMachine do
               Map.get(record, :payload_ref)
             ),
           error_ref: flow_value_ref(attrs, :error, id, version, partition_key),
-          ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :ttl_ms),
-          history_max_events: Map.get(record, :history_max_events),
+          ttl_ms: nil,
+          retention_ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms),
+          history_hot_max_events: Map.get(record, :history_hot_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0,
           next_run_at_ms: nil
         })
+        |> flow_stamp_terminal_retention(now_ms)
 
       with :ok <- flow_validate_record_keys(record),
            :ok <- flow_validate_record_keys(next) do
@@ -5759,13 +5804,15 @@ defmodule Ferricstore.Raft.StateMachine do
           version: Map.fetch!(record, :version) + 1,
           updated_at_ms: now_ms,
           error_ref: Map.get(attrs, :reason_ref),
-          ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :ttl_ms),
-          history_max_events: Map.get(record, :history_max_events),
+          ttl_ms: nil,
+          retention_ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms),
+          history_hot_max_events: Map.get(record, :history_hot_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0,
           next_run_at_ms: nil
         })
+        |> flow_stamp_terminal_retention(now_ms)
 
       with :ok <- flow_validate_record_keys(record),
            :ok <- flow_validate_record_keys(next) do
@@ -5893,14 +5940,16 @@ defmodule Ferricstore.Raft.StateMachine do
                 version: next_version,
                 fencing_token: next_fencing_token,
                 updated_at_ms: now_ms,
-                ttl_ms: Map.get(record, :ttl_ms),
-                history_max_events: Map.get(record, :history_max_events),
+                ttl_ms: nil,
+                retention_ttl_ms: Map.get(record, :retention_ttl_ms),
+                history_hot_max_events: Map.get(record, :history_hot_max_events),
                 lease_owner: worker,
                 lease_token: token,
                 lease_deadline_ms: deadline_ms,
                 next_run_at_ms: deadline_ms,
                 run_state: flow_claim_run_state(record)
               })
+              |> flow_stamp_terminal_retention(now_ms)
 
             with :ok <- flow_validate_record_keys(record),
                  :ok <- flow_validate_record_keys(next) do
@@ -6731,7 +6780,8 @@ defmodule Ferricstore.Raft.StateMachine do
          lease_owner: nil,
          lease_token: nil,
          lease_deadline_ms: 0
-       })}
+       })
+       |> flow_stamp_terminal_retention(now_ms)}
     end
   end
 
@@ -7268,14 +7318,14 @@ defmodule Ferricstore.Raft.StateMachine do
     flow_index_put_new_entries(state, entries)
   end
 
-  defp flow_history_trim(_state, %{history_max_events: nil}), do: :ok
-  defp flow_history_trim(_state, %{history_max_events: max}) when not is_integer(max), do: :ok
+  defp flow_history_trim(_state, %{history_hot_max_events: nil}), do: :ok
+  defp flow_history_trim(_state, %{history_hot_max_events: max}) when not is_integer(max), do: :ok
 
-  defp flow_history_trim(_state, %{history_max_events: max, version: version})
+  defp flow_history_trim(_state, %{history_hot_max_events: max, version: version})
        when is_integer(version) and version <= max,
        do: :ok
 
-  defp flow_history_trim(state, %{id: id, history_max_events: max} = record) when max > 0 do
+  defp flow_history_trim(state, %{id: id, history_hot_max_events: max} = record) when max > 0 do
     partition_key = Map.get(record, :partition_key)
     history_key = FlowKeys.history_key(id, partition_key)
 
@@ -7335,8 +7385,9 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
-  defp flow_record_expire_at(%{ttl_ms: ttl_ms}) when is_integer(ttl_ms) and ttl_ms > 0,
-    do: apply_now_ms() + ttl_ms
+  defp flow_record_expire_at(%{terminal_retention_until_ms: expire_at_ms})
+       when is_integer(expire_at_ms) and expire_at_ms > 0,
+       do: expire_at_ms
 
   defp flow_record_expire_at(_record), do: 0
 
@@ -7352,6 +7403,12 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_put_record_values(state, record, attrs) do
+    with :ok <- do_flow_put_record_values(state, record, attrs) do
+      flow_refresh_terminal_value_expirations(state, record, attrs)
+    end
+  end
+
+  defp do_flow_put_record_values(state, record, attrs) do
     Enum.reduce_while([:payload, :result, :error], :ok, fn kind, :ok ->
       if Map.has_key?(attrs, kind) do
         key = Map.fetch!(record, flow_value_ref_field(kind))
@@ -7372,6 +7429,40 @@ defmodule Ferricstore.Raft.StateMachine do
         {:cont, :ok}
       end
     end)
+  end
+
+  defp flow_refresh_terminal_value_expirations(state, record, attrs) do
+    expire_at_ms = flow_record_expire_at(record)
+
+    if expire_at_ms > 0 and Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+      refs =
+        [:payload, :result, :error]
+        |> Enum.reject(&Map.has_key?(attrs, &1))
+        |> Enum.map(fn kind -> Map.get(record, flow_value_ref_field(kind)) end)
+        |> Enum.filter(&(is_binary(&1) and &1 != ""))
+
+      values = sm_store_batch_get(state, refs, &sm_file_path/2)
+
+      refs
+      |> Enum.zip(values)
+      |> Enum.reduce_while(:ok, fn
+        {_key, nil}, :ok ->
+          {:cont, :ok}
+
+        {key, value}, :ok when is_binary(value) ->
+          with :ok <- flow_validate_key_size(key),
+               :ok <- raw_put_cold(state, key, value, expire_at_ms) do
+            {:cont, :ok}
+          else
+            {:error, _reason} = error -> {:halt, error}
+          end
+
+        {_key, _value}, :ok ->
+          {:cont, :ok}
+      end)
+    else
+      :ok
+    end
   end
 
   defp flow_create_put_record_values(state, plans) do

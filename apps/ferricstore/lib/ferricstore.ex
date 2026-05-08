@@ -769,7 +769,7 @@ defmodule FerricStore do
   @doc """
   Returns Flow history events for `id`.
 
-  Default reads use the hot history index, bounded by `:history_max_events`.
+  Default reads use the hot history index, bounded by `:history_hot_max_events`.
   Pass `include_cold: true` to include older history projected into LMDB.
   Pass `consistent_projection: true` to flush the async projection first.
   """

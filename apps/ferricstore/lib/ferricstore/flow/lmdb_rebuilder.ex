@@ -461,7 +461,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          history_keys
        ) do
     Enum.each(history_keys, fn history_key ->
-      case history_max_events_for_key(keydir, shard_path, history_key) do
+      case history_hot_max_events_for_key(keydir, shard_path, history_key) do
         max when is_integer(max) and max > 0 ->
           case FlowIndex.count_all(flow_lookup, history_key) do
             count when count > max ->
@@ -486,10 +486,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     :ok
   end
 
-  defp history_max_events_for_key(keydir, shard_path, history_key) do
+  defp history_hot_max_events_for_key(keydir, shard_path, history_key) do
     with {:ok, state_key} <- state_key_from_history_key(history_key),
          {:ok, record} <- read_rebuild_state_record(keydir, shard_path, state_key) do
-      Map.get(record, :history_max_events)
+      Map.get(record, :history_hot_max_events)
     else
       _ -> nil
     end

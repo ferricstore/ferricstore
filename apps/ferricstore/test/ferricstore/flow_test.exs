@@ -140,8 +140,10 @@ defmodule Ferricstore.FlowTest do
       updated_at_ms: 1_100,
       next_run_at_ms: 1_200,
       priority: 1,
-      ttl_ms: 60_000,
-      history_max_events: 100,
+      ttl_ms: nil,
+      retention_ttl_ms: 60_000,
+      terminal_retention_until_ms: nil,
+      history_hot_max_events: 100,
       partition_key: "tenant-a",
       payload_ref: "payload:1",
       parent_flow_id: "parent-1",
@@ -157,28 +159,29 @@ defmodule Ferricstore.FlowTest do
     }
 
     compact = Ferricstore.Flow.encode_record(record)
-    old_map = :erlang.term_to_binary(record)
+
+    old_map_record =
+      record
+      |> Map.put(:ttl_ms, 60_000)
+      |> Map.put(:history_max_events, 100)
+      |> Map.delete(:history_hot_max_events)
+      |> Map.delete(:retention_ttl_ms)
+      |> Map.delete(:terminal_retention_until_ms)
+
+    old_map = :erlang.term_to_binary(old_map_record)
     normal_record = Map.delete(record, :rewound_to_event_id)
 
-    assert "FSF1" <> _ = compact
+    assert "FSF2" <> _ = compact
     assert Ferricstore.Flow.decode_record(compact) == record
-    assert Ferricstore.Flow.decode_record(old_map) == record
+    assert Ferricstore.Flow.decode_record(old_map) == %{record | ttl_ms: 60_000}
 
     assert Ferricstore.Flow.decode_record(Ferricstore.Flow.encode_record(normal_record)) ==
              normal_record
 
-    old_compact_without_run_state =
-      record
-      |> Map.drop([:run_state, :rewound_to_event_id])
-      |> Ferricstore.Flow.encode_record()
-      |> then(fn encoded -> binary_part(encoded, 0, byte_size(encoded) - 1) end)
-
-    assert Ferricstore.Flow.decode_record(old_compact_without_run_state).run_state == nil
-
     assert byte_size(compact) < byte_size(old_map)
 
     assert_raise ArgumentError, fn ->
-      Ferricstore.Flow.decode_record("FSF2" <> binary_part(compact, 4, byte_size(compact) - 4))
+      Ferricstore.Flow.decode_record("FSF9" <> binary_part(compact, 4, byte_size(compact) - 4))
     end
 
     assert_raise ArgumentError, fn ->
@@ -2049,11 +2052,12 @@ defmodule Ferricstore.FlowTest do
              )
   end
 
-  test "flow policy exposes type and state retry defaults" do
+  test "flow policy exposes type and state retry and retention defaults" do
     type = uid("flow-policy")
 
     assert {:ok, policy} =
              FerricStore.flow_policy_set(type,
+               retention: [ttl_ms: 60_000, history_hot_max_events: 128],
                retry: [
                  max_retries: 5,
                  backoff: [kind: :fixed, base_ms: 10_000, max_ms: 30_000, jitter_pct: 0],
@@ -2064,20 +2068,27 @@ defmodule Ferricstore.FlowTest do
                    retry: [
                      max_retries: 2,
                      exhausted_to: "payment_failed"
-                   ]
+                   ],
+                   retention: [ttl_ms: 30_000, history_hot_max_events: 64]
                  ]
                }
              )
 
     assert policy.retry.max_retries == 5
+    assert policy.retention.ttl_ms == 60_000
+    assert policy.retention.history_hot_max_events == 128
     assert policy.states["charge_card"].retry.max_retries == 2
     assert policy.states["charge_card"].retry.backoff.kind == :fixed
     assert policy.states["charge_card"].retry.exhausted_to == "payment_failed"
+    assert policy.states["charge_card"].retention.ttl_ms == 30_000
+    assert policy.states["charge_card"].retention.history_hot_max_events == 64
 
     assert {:ok, state_policy} = FerricStore.flow_policy_get(type, state: "charge_card")
     assert state_policy.retry.max_retries == 2
     assert state_policy.retry.backoff.base_ms == 10_000
     assert state_policy.retry.exhausted_to == "payment_failed"
+    assert state_policy.retention.ttl_ms == 30_000
+    assert state_policy.retention.history_hot_max_events == 64
   end
 
   test "flow policy is mirrored to LMDB asynchronously" do
@@ -3658,14 +3669,14 @@ defmodule Ferricstore.FlowTest do
            ]
   end
 
-  test "flow history retention keeps only latest configured events" do
+  test "flow history hot max keeps only latest configured hot events" do
     id = uid("flow-history-retention")
 
     assert {:ok, _} =
              FerricStore.flow_create(id,
                type: "audit-retention",
                run_at_ms: 1_000,
-               history_max_events: 2
+               history_hot_max_events: 2
              )
 
     assert {:ok, [{created_event_id, _fields}]} = FerricStore.flow_history(id, count: 10)
@@ -3706,15 +3717,15 @@ defmodule Ferricstore.FlowTest do
              |> Enum.filter(fn {event_id, _score} -> event_id == created_event_id end)
   end
 
-  test "flow history uses configured default retention when omitted" do
-    original = Application.get_env(:ferricstore, :flow_default_history_max_events)
-    Application.put_env(:ferricstore, :flow_default_history_max_events, 2)
+  test "flow history uses configured default hot max when omitted" do
+    original = Application.get_env(:ferricstore, :flow_default_history_hot_max_events)
+    Application.put_env(:ferricstore, :flow_default_history_hot_max_events, 2)
 
     on_exit(fn ->
       if is_nil(original) do
-        Application.delete_env(:ferricstore, :flow_default_history_max_events)
+        Application.delete_env(:ferricstore, :flow_default_history_hot_max_events)
       else
-        Application.put_env(:ferricstore, :flow_default_history_max_events, original)
+        Application.put_env(:ferricstore, :flow_default_history_hot_max_events, original)
       end
     end)
 
@@ -3727,7 +3738,7 @@ defmodule Ferricstore.FlowTest do
                now_ms: 1_000
              )
 
-    assert created.history_max_events == 2
+    assert created.history_hot_max_events == 2
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due("audit-default-retention",
@@ -3747,22 +3758,22 @@ defmodule Ferricstore.FlowTest do
     assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == ["claimed", "completed"]
   end
 
-  test "flow history retention rejects values above configured maximum" do
-    original = Application.get_env(:ferricstore, :flow_max_history_max_events)
-    Application.put_env(:ferricstore, :flow_max_history_max_events, 2)
+  test "flow history hot max rejects values above configured maximum" do
+    original = Application.get_env(:ferricstore, :flow_max_history_hot_max_events)
+    Application.put_env(:ferricstore, :flow_max_history_hot_max_events, 2)
 
     on_exit(fn ->
       if is_nil(original) do
-        Application.delete_env(:ferricstore, :flow_max_history_max_events)
+        Application.delete_env(:ferricstore, :flow_max_history_hot_max_events)
       else
-        Application.put_env(:ferricstore, :flow_max_history_max_events, original)
+        Application.put_env(:ferricstore, :flow_max_history_hot_max_events, original)
       end
     end)
 
-    assert {:error, "ERR flow history_max_events exceeds maximum 2"} =
+    assert {:error, "ERR flow history_hot_max_events exceeds maximum 2"} =
              FerricStore.flow_create(uid("flow-history-max"),
                type: "audit-history-max",
-               history_max_events: 3
+               history_hot_max_events: 3
              )
   end
 
@@ -3826,7 +3837,7 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_create(id,
                type: "rewind-trimmed",
                run_at_ms: 1_000,
-               history_max_events: 2,
+               history_hot_max_events: 2,
                now_ms: 1_000
              )
 
@@ -3949,10 +3960,19 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_rewind(id, to_event: "999999-0")
   end
 
-  test "terminal ttl expires flow state record" do
+  test "terminal retention from create expires flow state record" do
     id = uid("flow-terminal-ttl")
 
-    assert {:ok, _} = FerricStore.flow_create(id, type: "ttl", run_at_ms: 1_000)
+    assert {:ok, created} =
+             FerricStore.flow_create(id,
+               type: "ttl",
+               run_at_ms: 1_000,
+               retention_ttl_ms: 20,
+               now_ms: 1_000
+             )
+
+    assert created.retention_ttl_ms == 20
+    assert created.terminal_retention_until_ms == nil
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due("ttl",
@@ -3964,13 +3984,29 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, _} =
              FerricStore.flow_complete(id, claimed.lease_token,
-               fencing_token: claimed.fencing_token,
-               ttl_ms: 20
+               fencing_token: claimed.fencing_token
              )
 
     Process.sleep(40)
 
     assert {:ok, nil} = FerricStore.flow_get(id)
+  end
+
+  test "flow create inherits retention defaults from policy" do
+    type = uid("flow-retention-policy")
+    id = uid("flow-retention-policy-id")
+
+    assert {:ok, _policy} =
+             FerricStore.flow_policy_set(type,
+               retention: [ttl_ms: 5_000, history_hot_max_events: 3]
+             )
+
+    assert {:ok, created} =
+             FerricStore.flow_create(id, type: type, state: "queued", now_ms: 10)
+
+    assert created.retention_ttl_ms == 5_000
+    assert created.history_hot_max_events == 3
+    assert created.terminal_retention_until_ms == nil
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
