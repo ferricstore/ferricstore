@@ -297,6 +297,15 @@ defmodule Ferricstore.Flow.OrderedIndex do
     end
   end
 
+  @spec count_keys(:ets.tid() | atom()) :: [binary()]
+  def count_keys(lookup_table) do
+    :ets.select(lookup_table, [
+      {{{:count, :"$1"}, :"$2"}, [{:is_binary, :"$1"}, {:>, :"$2", 0}], [:"$1"]}
+    ])
+  rescue
+    ArgumentError -> []
+  end
+
   defp increment_count(_lookup_table, _key, 0), do: :ok
 
   defp increment_count(lookup_table, key, delta) do

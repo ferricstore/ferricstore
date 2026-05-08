@@ -1560,6 +1560,118 @@ defmodule Ferricstore.FlowTest do
     assert claimed_b.partition_key == partition_b
   end
 
+  test "flow_claim_due can scan any partition and selected states" do
+    {partition_a, partition_b} = different_partition_keys()
+    type = uid("claim-any")
+    queued_global = uid("flow-claim-any-global")
+    queued_partition = uid("flow-claim-any-queued")
+    ready_partition = uid("flow-claim-any-ready")
+    held_partition = uid("flow-claim-any-held")
+
+    assert {:ok, _} = FerricStore.flow_create(queued_global, type: type, run_at_ms: 1_000)
+
+    assert {:ok, _} =
+             FerricStore.flow_create(queued_partition,
+               type: type,
+               partition_key: partition_b,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_create(ready_partition,
+               type: type,
+               state: "ready",
+               partition_key: partition_a,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_create(held_partition,
+               type: type,
+               state: "held",
+               partition_key: partition_b,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               partition_key: :any,
+               states: ["queued", "ready"],
+               worker: "worker-any",
+               lease_ms: 30_000,
+               limit: 10,
+               now_ms: 1_000
+             )
+
+    assert MapSet.new(Enum.map(claimed, & &1.id)) ==
+             MapSet.new([queued_global, queued_partition, ready_partition])
+
+    assert {:ok, [claimed_held]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: :any,
+               state: :any,
+               worker: "worker-any",
+               lease_ms: 30_000,
+               limit: 10,
+               now_ms: 1_000
+             )
+
+    assert claimed_held.id == held_partition
+    assert claimed_held.partition_key == partition_b
+  end
+
+  test "flow_claim_due any partition drains higher priority across shards first" do
+    type = uid("claim-any-priority")
+    low_id = uid("flow-claim-any-low")
+    high_id = uid("flow-claim-any-high")
+
+    case :ets.whereis(:ferricstore_flow_claim_due_any_cursor) do
+      :undefined -> :ok
+      table -> :ets.delete_all_objects(table)
+    end
+
+    partitions_by_shard =
+      1..512
+      |> Enum.map(&"#{type}:partition:#{&1}")
+      |> Enum.group_by(fn partition ->
+        shard_for(Ferricstore.Flow.Keys.state_key("probe", partition))
+      end)
+
+    [low_partition | _] = Map.fetch!(partitions_by_shard, 0)
+
+    {_high_shard, [high_partition | _]} =
+      Enum.find(partitions_by_shard, fn {shard, _partitions} -> shard != 0 end)
+
+    assert {:ok, _} =
+             FerricStore.flow_create(low_id,
+               type: type,
+               partition_key: low_partition,
+               priority: 0,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_create(high_id,
+               type: type,
+               partition_key: high_partition,
+               priority: 2,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: :any,
+               state: :any,
+               worker: "worker-any-priority",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert claimed.id == high_id
+    assert claimed.partition_key == high_partition
+  end
+
   test "flow_claim_due skips stale due index members without starving live work" do
     stale_id = "a-" <> uid("flow-stale-due")
     live_id = "z-" <> uid("flow-live-due")
@@ -2490,6 +2602,77 @@ defmodule Ferricstore.FlowTest do
     assert second.id == id
     assert second.lease_owner == "worker-b"
     assert second.lease_token != first.lease_token
+  end
+
+  test "flow_claim_due automatically reclaims expired leases by ratio" do
+    type = uid("lease-ratio")
+    expired_ids = Enum.map(1..4, &uid("flow-expired-#{&1}"))
+    fresh_ids = Enum.map(1..4, &uid("flow-fresh-#{&1}"))
+
+    for id <- expired_ids do
+      assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_000)
+    end
+
+    assert {:ok, expired_first_claim} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-a",
+               lease_ms: 50,
+               limit: 4,
+               now_ms: 1_000
+             )
+
+    assert MapSet.new(Enum.map(expired_first_claim, & &1.id)) == MapSet.new(expired_ids)
+
+    for id <- fresh_ids do
+      assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_050)
+    end
+
+    assert {:ok, claimed} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-b",
+               lease_ms: 50,
+               limit: 4,
+               now_ms: 1_050,
+               reclaim_ratio: 50
+             )
+
+    reclaimed = Enum.filter(claimed, &(&1.version == 3))
+    fresh = Enum.filter(claimed, &(&1.version == 2))
+
+    assert length(reclaimed) == 2
+    assert length(fresh) == 2
+    assert Enum.all?(reclaimed, &(&1.id in expired_ids))
+    assert Enum.all?(fresh, &(&1.id in fresh_ids))
+  end
+
+  test "flow_claim_due can disable automatic expired lease reclaim" do
+    type = uid("lease-no-auto-reclaim")
+    expired_id = uid("flow-expired")
+    fresh_id = uid("flow-fresh")
+
+    assert {:ok, _} = FerricStore.flow_create(expired_id, type: type, run_at_ms: 1_000)
+
+    assert {:ok, [_]} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-a",
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, _} = FerricStore.flow_create(fresh_id, type: type, run_at_ms: 1_050)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-b",
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_050,
+               reclaim_expired: false
+             )
+
+    assert claimed.id == fresh_id
+    assert claimed.version == 2
   end
 
   test "expired running lease reclaim is partition scoped" do

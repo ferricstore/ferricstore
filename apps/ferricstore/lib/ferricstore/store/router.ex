@@ -31,6 +31,7 @@ defmodule Ferricstore.Store.Router do
   @cold_location_retry_attempts 8
   @cold_location_retry_sleep_ms 1
   @default_async_key_latch_timeout_ms 30_000
+  @flow_claim_cursor_table :ferricstore_flow_claim_due_any_cursor
 
   defguardp valid_cold_file_ref(file_id, value_size)
             when is_integer(file_id) and file_id >= 0 and is_integer(value_size) and
@@ -2882,8 +2883,24 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc false
-  def flow_claim_due(ctx, %{type: type, state: state, priority: priority} = attrs)
-      when is_binary(type) and is_binary(state) and (is_integer(priority) or is_nil(priority)) do
+  def flow_claim_due(ctx, %{partition_key: :any, limit: limit} = attrs)
+      when is_integer(limit) and limit > 0 do
+    start_idx = flow_claim_due_start_shard(ctx, attrs)
+
+    flow_claim_due_any_priorities(
+      ctx,
+      attrs,
+      start_idx,
+      flow_claim_any_priorities(Map.get(attrs, :priority)),
+      limit,
+      []
+    )
+  end
+
+  def flow_claim_due(ctx, %{type: type, priority: priority} = attrs)
+      when is_binary(type) and (is_integer(priority) or is_nil(priority)) do
+    state = flow_claim_route_state(Map.get(attrs, :state))
+
     key =
       Ferricstore.Flow.Keys.due_key(type, state, priority || 0, Map.get(attrs, :partition_key))
 
@@ -2894,6 +2911,117 @@ defmodule Ferricstore.Store.Router do
       raft_write(ctx, idx, key, {:flow_claim_due, key, attrs})
     end
   end
+
+  defp flow_claim_due_any_partition(ctx, _attrs, _start_idx, offset, _limit, acc)
+       when offset >= ctx.shard_count,
+       do: {:ok, Enum.reverse(acc)}
+
+  defp flow_claim_due_any_partition(ctx, attrs, start_idx, offset, limit, acc) do
+    idx = rem(start_idx + offset, ctx.shard_count)
+    remaining = limit - length(acc)
+
+    if remaining <= 0 do
+      {:ok, Enum.reverse(acc)}
+    else
+      key = "f:{flow-claim-any-" <> Integer.to_string(idx) <> "}:d"
+      shard_attrs = Map.put(attrs, :limit, remaining)
+
+      case raft_write(ctx, idx, key, {:flow_claim_due, key, shard_attrs}) do
+        {:ok, records} when is_list(records) ->
+          flow_claim_due_any_partition(
+            ctx,
+            attrs,
+            start_idx,
+            offset + 1,
+            limit,
+            Enum.reverse(records) ++ acc
+          )
+
+        {:error, _reason} = error when acc == [] ->
+          error
+
+        {:error, _reason} ->
+          {:ok, Enum.reverse(acc)}
+
+        other ->
+          other
+      end
+    end
+  end
+
+  defp flow_claim_due_any_priorities(_ctx, _attrs, _start_idx, [], _limit, acc),
+    do: {:ok, Enum.reverse(acc)}
+
+  defp flow_claim_due_any_priorities(_ctx, _attrs, _start_idx, _priorities, limit, acc)
+       when length(acc) >= limit,
+       do: {:ok, acc |> Enum.reverse() |> Enum.take(limit)}
+
+  defp flow_claim_due_any_priorities(ctx, attrs, start_idx, [priority | rest], limit, acc) do
+    remaining = limit - length(acc)
+    priority_attrs = %{attrs | priority: priority, limit: remaining}
+
+    case flow_claim_due_any_partition(ctx, priority_attrs, start_idx, 0, remaining, []) do
+      {:ok, records} ->
+        flow_claim_due_any_priorities(
+          ctx,
+          attrs,
+          start_idx,
+          rest,
+          limit,
+          Enum.reverse(records) ++ acc
+        )
+
+      {:error, _reason} = error when acc == [] ->
+        error
+
+      {:error, _reason} ->
+        {:ok, Enum.reverse(acc)}
+
+      other ->
+        other
+    end
+  end
+
+  defp flow_claim_any_priorities(nil), do: [2, 1, 0]
+  defp flow_claim_any_priorities(priority), do: [priority]
+
+  defp flow_claim_due_start_shard(%{shard_count: shard_count} = ctx, attrs)
+       when shard_count > 1 do
+    table = flow_claim_due_cursor_table()
+    type = Map.get(attrs, :type, "")
+    cursor_key = {ctx.name, type}
+
+    next =
+      :ets.update_counter(table, cursor_key, {2, 1}, {cursor_key, 0})
+
+    rem(next - 1, shard_count)
+  end
+
+  defp flow_claim_due_start_shard(_ctx, _attrs), do: 0
+
+  defp flow_claim_due_cursor_table do
+    case :ets.whereis(@flow_claim_cursor_table) do
+      :undefined ->
+        try do
+          :ets.new(@flow_claim_cursor_table, [
+            :named_table,
+            :public,
+            read_concurrency: true,
+            write_concurrency: true
+          ])
+        rescue
+          ArgumentError -> @flow_claim_cursor_table
+        end
+
+      _tid ->
+        @flow_claim_cursor_table
+    end
+  end
+
+  defp flow_claim_route_state(:any), do: "queued"
+  defp flow_claim_route_state([state | _]) when is_binary(state), do: state
+  defp flow_claim_route_state(state) when is_binary(state), do: state
+  defp flow_claim_route_state(_state), do: "queued"
 
   @doc false
   def flow_complete(ctx, %{id: id} = attrs) when is_binary(id) do

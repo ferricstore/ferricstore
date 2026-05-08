@@ -6393,6 +6393,8 @@ fn flow_claim_due_option<'a>(
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"RECLAIM_EXPIRED", "reclaim_expired", FlowOptType::Boolean),
+            (b"RECLAIM_RATIO", "reclaim_ratio", FlowOptType::NonNegative),
         ],
     )
 }

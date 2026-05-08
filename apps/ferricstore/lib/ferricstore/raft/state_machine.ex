@@ -4575,7 +4575,7 @@ defmodule Ferricstore.Raft.StateMachine do
          state,
          %{
            type: type,
-           state: expected_state,
+           state: state_filter,
            worker: worker,
            lease_ms: lease_ms,
            limit: limit,
@@ -4585,11 +4585,14 @@ defmodule Ferricstore.Raft.StateMachine do
     now_ms = Map.get(attrs, :now_ms, apply_now_ms())
     partition_key = Map.get(attrs, :partition_key)
 
+    state_filter =
+      flow_claim_state_filter(state_filter, Map.get(attrs, :exclude_states, []))
+
     claimed =
       flow_claim_due_priorities(
         state,
         type,
-        expected_state,
+        state_filter,
         worker,
         lease_ms,
         now_ms,
@@ -4605,10 +4608,15 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_claim_priorities(nil), do: [2, 1, 0]
   defp flow_claim_priorities(priority), do: [priority]
 
+  defp flow_claim_state_filter(state_filter, []), do: state_filter
+
+  defp flow_claim_state_filter(state_filter, exclude_states),
+    do: {:exclude, state_filter, exclude_states}
+
   defp flow_claim_due_priorities(
          _state,
          _type,
-         _expected_state,
+         _state_filter,
          _worker,
          _lease_ms,
          _now_ms,
@@ -4624,7 +4632,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_claim_due_priorities(
          _state,
          _type,
-         _expected_state,
+         _state_filter,
          _worker,
          _lease_ms,
          _now_ms,
@@ -4639,7 +4647,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_claim_due_priorities(
          state,
          type,
-         expected_state,
+         state_filter,
          worker,
          lease_ms,
          now_ms,
@@ -4648,32 +4656,26 @@ defmodule Ferricstore.Raft.StateMachine do
          limit,
          claimed
        ) do
-    due_key = FlowKeys.due_key(type, expected_state, priority, partition_key)
-    flow_ensure_due_index_ready(state, due_key)
-
-    max_scan = max((limit - length(claimed)) * 16, limit + 64)
+    due_keys = flow_claim_due_keys(state, type, state_filter, partition_key, priority)
 
     next_claimed =
-      flow_claim_due_scan(
+      flow_claim_due_scan_keys(
         state,
-        due_key,
-        expected_state,
+        due_keys,
+        type,
+        state_filter,
         worker,
         lease_ms,
         now_ms,
         partition_key,
         limit,
-        max_scan,
-        0,
-        length(claimed),
         claimed
       )
-      |> Enum.reverse()
 
     flow_claim_due_priorities(
       state,
       type,
-      expected_state,
+      state_filter,
       worker,
       lease_ms,
       now_ms,
@@ -4684,9 +4686,216 @@ defmodule Ferricstore.Raft.StateMachine do
     )
   end
 
+  defp flow_claim_due_scan_keys(
+         state,
+         [due_key],
+         type,
+         state_filter,
+         worker,
+         lease_ms,
+         now_ms,
+         partition_key,
+         limit,
+         claimed
+       ) do
+    flow_ensure_due_index_ready(state, due_key)
+    max_scan = max((limit - length(claimed)) * 16, limit + 64)
+
+    flow_claim_due_scan(
+      state,
+      due_key,
+      type,
+      state_filter,
+      worker,
+      lease_ms,
+      now_ms,
+      partition_key,
+      limit,
+      max_scan,
+      0,
+      length(claimed),
+      claimed
+    )
+    |> Enum.reverse()
+  end
+
+  defp flow_claim_due_scan_keys(
+         state,
+         due_keys,
+         type,
+         state_filter,
+         worker,
+         lease_ms,
+         now_ms,
+         partition_key,
+         limit,
+         claimed
+       ) do
+    due_keys = Enum.sort(due_keys)
+    Enum.each(due_keys, &flow_ensure_due_index_ready(state, &1))
+
+    flow_claim_due_scan_key_rounds(
+      state,
+      due_keys,
+      type,
+      state_filter,
+      worker,
+      lease_ms,
+      now_ms,
+      partition_key,
+      limit,
+      claimed
+    )
+  end
+
+  defp flow_claim_due_scan_key_rounds(
+         _state,
+         [],
+         _type,
+         _state_filter,
+         _worker,
+         _lease_ms,
+         _now_ms,
+         _partition_key,
+         _limit,
+         claimed
+       ),
+       do: claimed
+
+  defp flow_claim_due_scan_key_rounds(
+         _state,
+         _due_keys,
+         _type,
+         _state_filter,
+         _worker,
+         _lease_ms,
+         _now_ms,
+         _partition_key,
+         limit,
+         claimed
+       )
+       when length(claimed) >= limit,
+       do: claimed
+
+  defp flow_claim_due_scan_key_rounds(
+         state,
+         due_keys,
+         type,
+         state_filter,
+         worker,
+         lease_ms,
+         now_ms,
+         partition_key,
+         limit,
+         claimed
+       ) do
+    {next_claimed, progressed?} =
+      Enum.reduce_while(due_keys, {claimed, false}, fn due_key, {acc, progressed?} ->
+        claimed_count = length(acc)
+
+        if claimed_count >= limit do
+          {:halt, {acc, progressed?}}
+        else
+          next_acc =
+            flow_claim_due_scan(
+              state,
+              due_key,
+              type,
+              state_filter,
+              worker,
+              lease_ms,
+              now_ms,
+              partition_key,
+              min(limit, claimed_count + 1),
+              32,
+              0,
+              claimed_count,
+              acc
+            )
+            |> Enum.reverse()
+
+          {:cont, {next_acc, progressed? or length(next_acc) > claimed_count}}
+        end
+      end)
+
+    cond do
+      length(next_claimed) >= limit ->
+        next_claimed
+
+      progressed? ->
+        flow_claim_due_scan_key_rounds(
+          state,
+          due_keys,
+          type,
+          state_filter,
+          worker,
+          lease_ms,
+          now_ms,
+          partition_key,
+          limit,
+          next_claimed
+        )
+
+      true ->
+        next_claimed
+    end
+  end
+
+  defp flow_claim_due_keys(_state, type, state_filter, partition_key, priority)
+       when partition_key != :any and is_binary(state_filter) do
+    [FlowKeys.due_key(type, state_filter, priority, partition_key)]
+  end
+
+  defp flow_claim_due_keys(_state, type, states, partition_key, priority)
+       when partition_key != :any and is_list(states) do
+    Enum.map(states, &FlowKeys.due_key(type, &1, priority, partition_key))
+  end
+
+  defp flow_claim_due_keys(state, type, state_filter, partition_key, priority) do
+    state
+    |> flow_index_count_keys()
+    |> Enum.filter(&flow_due_key_matches?(&1, type, state_filter, partition_key, priority))
+  end
+
+  defp flow_due_key_matches?(key, type, state_filter, partition_key, priority)
+       when is_binary(key) do
+    String.starts_with?(key, "f:{f") and
+      flow_due_key_partition_match?(key, partition_key) and
+      flow_due_key_state_match?(key, type, state_filter) and
+      String.ends_with?(key, ":p" <> Integer.to_string(priority))
+  end
+
+  defp flow_due_key_matches?(_key, _type, _state_filter, _partition_key, _priority), do: false
+
+  defp flow_due_key_partition_match?(_key, :any), do: true
+
+  defp flow_due_key_partition_match?(key, partition_key) do
+    tag = FlowKeys.tag(partition_key)
+    String.starts_with?(key, "f:" <> tag <> ":d:")
+  end
+
+  defp flow_due_key_state_match?(key, type, :any) do
+    String.contains?(key, "}:d:" <> type <> ":")
+  end
+
+  defp flow_due_key_state_match?(key, type, {:exclude, state_filter, _exclude_states}) do
+    flow_due_key_state_match?(key, type, state_filter)
+  end
+
+  defp flow_due_key_state_match?(key, type, states) when is_list(states) do
+    Enum.any?(states, &flow_due_key_state_match?(key, type, &1))
+  end
+
+  defp flow_due_key_state_match?(key, type, state) when is_binary(state) do
+    String.contains?(key, "}:d:" <> type <> ":" <> state <> ":p")
+  end
+
+  defp flow_due_key_state_match?(_key, _type, _state), do: false
+
   defp flow_claim_due_scan(
          _state,
          _due_key,
+         _type,
          _expected_state,
          _worker,
          _lease_ms,
@@ -4705,6 +4914,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_claim_due_scan(
          _state,
          _due_key,
+         _type,
          _expected_state,
          _worker,
          _lease_ms,
@@ -4723,6 +4933,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_claim_due_scan(
          state,
          due_key,
+         type,
          expected_state,
          worker,
          lease_ms,
@@ -4755,6 +4966,7 @@ defmodule Ferricstore.Raft.StateMachine do
         flow_claim_candidate_batch(
           state,
           due_key,
+          type,
           expected_state,
           worker,
           lease_ms,
@@ -4769,6 +4981,7 @@ defmodule Ferricstore.Raft.StateMachine do
       flow_claim_due_scan(
         state,
         due_key,
+        type,
         expected_state,
         worker,
         lease_ms,
@@ -4786,6 +4999,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_claim_candidate_batch(
          state,
          due_key,
+         type,
          expected_state,
          worker,
          lease_ms,
@@ -4800,6 +5014,7 @@ defmodule Ferricstore.Raft.StateMachine do
       flow_plan_claim_candidates(
         state,
         due_key,
+        type,
         expected_state,
         worker,
         lease_ms,
@@ -4823,8 +5038,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_plan_claim_candidates(
          state,
-         _due_key,
-         expected_state,
+         due_key,
+         type,
+         state_filter,
          worker,
          lease_ms,
          now_ms,
@@ -4832,11 +5048,7 @@ defmodule Ferricstore.Raft.StateMachine do
          candidates,
          remaining
        ) do
-    records =
-      flow_read_records(
-        state,
-        Enum.map(candidates, fn {id, _score} -> %{id: id, partition_key: partition_key} end)
-      )
+    records = flow_read_claim_candidate_records(state, partition_key, due_key, candidates)
 
     {plans, stale_due_ids, _count} =
       candidates
@@ -4849,7 +5061,8 @@ defmodule Ferricstore.Raft.StateMachine do
           case flow_prepare_claim_candidate_record(
                  record,
                  id,
-                 expected_state,
+                 type,
+                 state_filter,
                  worker,
                  lease_ms,
                  now_ms
@@ -4867,6 +5080,25 @@ defmodule Ferricstore.Raft.StateMachine do
       end)
 
     {Enum.reverse(plans), Enum.reverse(stale_due_ids)}
+  end
+
+  defp flow_read_claim_candidate_records(state, :any, due_key, candidates) do
+    keys =
+      Enum.map(candidates, fn {id, _score} ->
+        case FlowKeys.state_key_from_due_key(due_key, id) do
+          {:ok, key} -> key
+          :error -> FlowKeys.state_key(id, nil)
+        end
+      end)
+
+    flow_read_records_by_keys(state, keys)
+  end
+
+  defp flow_read_claim_candidate_records(state, partition_key, _due_key, candidates) do
+    flow_read_records(
+      state,
+      Enum.map(candidates, fn {id, _score} -> %{id: id, partition_key: partition_key} end)
+    )
   end
 
   defp do_flow_complete(state, %{id: id, lease_token: lease_token} = attrs) do
@@ -5617,7 +5849,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_prepare_claim_candidate_record(
          record,
          _id,
-         expected_state,
+         type,
+         state_filter,
          worker,
          lease_ms,
          now_ms
@@ -5626,42 +5859,67 @@ defmodule Ferricstore.Raft.StateMachine do
       nil ->
         :delete_due
 
-      %{state: ^expected_state} = record ->
-        next_version = Map.fetch!(record, :version) + 1
-        next_fencing_token = Map.get(record, :fencing_token, 0) + 1
-        deadline_ms = now_ms + lease_ms
+      %{type: record_type} when record_type != type ->
+        :skip
 
-        token =
-          worker <>
-            ":" <> Integer.to_string(now_ms) <> ":" <> Integer.to_string(next_fencing_token)
+      %{state: record_state} = record ->
+        cond do
+          flow_claim_state_excluded?(state_filter, record_state) ->
+            :skip
 
-        next =
-          record
-          |> Map.merge(%{
-            state: "running",
-            version: next_version,
-            fencing_token: next_fencing_token,
-            updated_at_ms: now_ms,
-            ttl_ms: Map.get(record, :ttl_ms),
-            history_max_events: Map.get(record, :history_max_events),
-            lease_owner: worker,
-            lease_token: token,
-            lease_deadline_ms: deadline_ms,
-            next_run_at_ms: deadline_ms,
-            run_state: flow_claim_run_state(record)
-          })
+          flow_claim_state_match?(state_filter, record_state) ->
+            next_version = Map.fetch!(record, :version) + 1
+            next_fencing_token = Map.get(record, :fencing_token, 0) + 1
+            deadline_ms = now_ms + lease_ms
 
-        with :ok <- flow_validate_record_keys(record),
-             :ok <- flow_validate_record_keys(next) do
-          {:ok, record, next}
-        else
-          _ -> :skip
+            token =
+              worker <>
+                ":" <> Integer.to_string(now_ms) <> ":" <> Integer.to_string(next_fencing_token)
+
+            next =
+              record
+              |> Map.merge(%{
+                state: "running",
+                version: next_version,
+                fencing_token: next_fencing_token,
+                updated_at_ms: now_ms,
+                ttl_ms: Map.get(record, :ttl_ms),
+                history_max_events: Map.get(record, :history_max_events),
+                lease_owner: worker,
+                lease_token: token,
+                lease_deadline_ms: deadline_ms,
+                next_run_at_ms: deadline_ms,
+                run_state: flow_claim_run_state(record)
+              })
+
+            with :ok <- flow_validate_record_keys(record),
+                 :ok <- flow_validate_record_keys(next) do
+              {:ok, record, next}
+            else
+              _ -> :skip
+            end
+
+          true ->
+            :delete_due
         end
 
       _record ->
         :delete_due
     end
   end
+
+  defp flow_claim_state_excluded?({:exclude, _state_filter, exclude_states}, state),
+    do: state in exclude_states
+
+  defp flow_claim_state_excluded?(_state_filter, _state), do: false
+
+  defp flow_claim_state_match?({:exclude, state_filter, _exclude_states}, state),
+    do: flow_claim_state_match?(state_filter, state)
+
+  defp flow_claim_state_match?(:any, state) when is_binary(state), do: true
+  defp flow_claim_state_match?(states, state) when is_list(states), do: state in states
+  defp flow_claim_state_match?(state, state), do: true
+  defp flow_claim_state_match?(_state_filter, _state), do: false
 
   defp flow_claim_run_state(%{state: "running"} = record),
     do: Map.get(record, :run_state) || "queued"
@@ -6188,6 +6446,10 @@ defmodule Ferricstore.Raft.StateMachine do
         FlowKeys.state_key(Map.fetch!(attrs, :id), Map.get(attrs, :partition_key))
       end)
 
+    flow_read_records_by_keys(state, keys)
+  end
+
+  defp flow_read_records_by_keys(state, keys) do
     cond do
       flow_lmdb_mirror?(state) ->
         flow_read_mirror_records(state, keys)
@@ -6703,6 +6965,12 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_index_count_all(_state, _key), do: 0
+
+  defp flow_index_count_keys(%{flow_lookup_name: lookup} = state) do
+    if flow_index_tables?(state), do: FlowIndex.count_keys(lookup), else: []
+  end
+
+  defp flow_index_count_keys(_state), do: []
 
   defp flow_index_score_of(%{flow_lookup_name: lookup} = state, key, member) do
     if flow_index_tables?(state), do: FlowIndex.score_of(lookup, key, member), else: :miss

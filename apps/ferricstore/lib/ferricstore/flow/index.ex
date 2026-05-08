@@ -41,4 +41,6 @@ defmodule Ferricstore.Flow.Index do
     to: Ferricstore.Flow.OrderedIndex
 
   defdelegate count_all(lookup_table, key), to: Ferricstore.Flow.OrderedIndex
+
+  defdelegate count_keys(lookup_table), to: Ferricstore.Flow.OrderedIndex
 end

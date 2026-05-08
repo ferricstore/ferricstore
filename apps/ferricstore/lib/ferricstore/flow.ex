@@ -159,7 +159,11 @@ defmodule Ferricstore.Flow do
   def reclaim(ctx, type, opts) when is_binary(type) and is_list(opts) do
     started = flow_start_time()
 
-    result = claim_due_result(ctx, type, Keyword.put(opts, :state, "running"))
+    result =
+      opts
+      |> Keyword.put(:state, "running")
+      |> Keyword.put(:reclaim_expired, false)
+      |> then(&claim_due_result(ctx, type, &1))
 
     observe_flow(:reclaim, started, result, %{flow_type: type})
   end
@@ -167,14 +171,16 @@ defmodule Ferricstore.Flow do
   defp claim_due_result(ctx, type, opts) do
     with :ok <- validate_opts(opts),
          :ok <- validate_type(type),
-         {:ok, state} <- optional_binary(opts, :state, @default_state),
+         {:ok, state} <- optional_claim_states(opts),
          {:ok, worker} <- required_binary(opts, :worker),
          {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
          {:ok, limit} <- optional_claim_limit(opts),
          {:ok, priority} <- optional_priority_or_nil(opts),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, payload_return} <- payload_return_opts(opts, true),
-         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, reclaim_expired?} <- optional_boolean(opts, :reclaim_expired, true),
+         {:ok, reclaim_ratio} <- optional_reclaim_ratio(opts),
+         {:ok, partition_key} <- optional_claim_partition_key(opts),
          :ok <- validate_claim_due_keys(type, state, priority, partition_key) do
       attrs =
         %{
@@ -188,7 +194,7 @@ defmodule Ferricstore.Flow do
         }
         |> maybe_put_attr(:now_ms, now)
 
-      case Router.flow_claim_due(ctx, attrs) do
+      case claim_due_router_result(ctx, attrs, reclaim_expired?, reclaim_ratio) do
         {:ok, records} when is_list(records) ->
           {:ok, hydrate_payload_records(ctx, records, payload_return)}
 
@@ -197,6 +203,67 @@ defmodule Ferricstore.Flow do
       end
     end
   end
+
+  defp claim_due_router_result(ctx, %{state: "running"} = attrs, _reclaim_expired?, _ratio) do
+    Router.flow_claim_due(ctx, attrs)
+  end
+
+  defp claim_due_router_result(ctx, attrs, true, reclaim_ratio) when reclaim_ratio > 0 do
+    limit = Map.fetch!(attrs, :limit)
+    initial_reclaim_limit = max(1, div(limit * reclaim_ratio + 99, 100))
+    normal_state = claim_normal_state_filter(Map.fetch!(attrs, :state))
+
+    with {:ok, reclaimed_first} <-
+           claim_due_router_maybe(ctx, %{attrs | state: "running", limit: initial_reclaim_limit}),
+         remaining_after_reclaim = limit - length(reclaimed_first),
+         {:ok, normal} <-
+           claim_due_router_maybe(
+             ctx,
+             claim_normal_attrs(attrs, normal_state, remaining_after_reclaim)
+           ),
+         remaining_after_normal = limit - length(reclaimed_first) - length(normal),
+         {:ok, reclaimed_more} <-
+           claim_due_router_maybe(ctx, %{attrs | state: "running", limit: remaining_after_normal}) do
+      {:ok, reclaimed_first ++ normal ++ reclaimed_more}
+    end
+  end
+
+  defp claim_due_router_result(ctx, attrs, _reclaim_expired?, _ratio) do
+    Router.flow_claim_due(ctx, attrs)
+  end
+
+  defp claim_due_router_maybe(_ctx, nil), do: {:ok, []}
+  defp claim_due_router_maybe(_ctx, %{limit: limit}) when limit <= 0, do: {:ok, []}
+  defp claim_due_router_maybe(ctx, attrs), do: Router.flow_claim_due(ctx, attrs)
+
+  defp claim_normal_attrs(_attrs, nil, _limit), do: nil
+
+  defp claim_normal_attrs(attrs, {:any_except_running, state}, limit) do
+    attrs
+    |> Map.put(:state, state)
+    |> Map.put(:limit, limit)
+    |> Map.put(:exclude_states, ["running"])
+  end
+
+  defp claim_normal_attrs(attrs, state, limit) do
+    attrs
+    |> Map.put(:state, state)
+    |> Map.put(:limit, limit)
+  end
+
+  defp claim_normal_state_filter("running"), do: nil
+
+  defp claim_normal_state_filter(:any), do: {:any_except_running, :any}
+
+  defp claim_normal_state_filter(states) when is_list(states) do
+    case Enum.reject(states, &(&1 == "running")) do
+      [] -> nil
+      [state] -> state
+      filtered -> filtered
+    end
+  end
+
+  defp claim_normal_state_filter(state), do: state
 
   def complete(ctx, id, lease_token, opts \\ [])
       when is_binary(id) and is_binary(lease_token) and is_list(opts) do
@@ -3721,6 +3788,13 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp optional_reclaim_ratio(opts) do
+    case Keyword.get(opts, :reclaim_ratio, 25) do
+      value when is_integer(value) and value >= 0 and value <= 100 -> {:ok, value}
+      _ -> {:error, "ERR flow reclaim_ratio must be an integer between 0 and 100"}
+    end
+  end
+
   defp flow_max_claim_limit do
     case Application.get_env(:ferricstore, :flow_max_claim_limit, @default_max_claim_limit) do
       value when is_integer(value) and value > 0 -> value
@@ -3852,11 +3926,28 @@ defmodule Ferricstore.Flow do
 
   defp validate_claim_due_keys(type, state, nil, partition_key) do
     Enum.reduce_while(@max_priority..0//-1, :ok, fn priority, :ok ->
-      case validate_key_size(__MODULE__.Keys.due_key(type, state, priority, partition_key)) do
+      case validate_claim_due_keys(type, state, priority, partition_key) do
         :ok -> {:cont, :ok}
         {:error, _} = error -> {:halt, error}
       end
     end)
+  end
+
+  defp validate_claim_due_keys(type, :any, _priority, _partition_key) do
+    validate_key_size(__MODULE__.Keys.due_key(type, @default_state, 0, nil))
+  end
+
+  defp validate_claim_due_keys(type, states, priority, partition_key) when is_list(states) do
+    Enum.reduce_while(states, :ok, fn state, :ok ->
+      case validate_claim_due_keys(type, state, priority, partition_key) do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp validate_claim_due_keys(type, state, priority, :any) when is_binary(state) do
+    validate_key_size(__MODULE__.Keys.due_key(type, state, priority, nil))
   end
 
   defp validate_claim_due_keys(type, state, priority, partition_key) do
@@ -3878,6 +3969,85 @@ defmodule Ferricstore.Flow do
       _ -> {:error, "ERR flow partition_key must be a non-empty string or :global"}
     end
   end
+
+  defp optional_claim_partition_key(opts) do
+    case Keyword.get(opts, :partition_key, nil) do
+      :any ->
+        {:ok, :any}
+
+      value when is_binary(value) and value != "" ->
+        case String.upcase(value) do
+          "ANY" -> {:ok, :any}
+          "GLOBAL" -> {:ok, nil}
+          _ -> {:ok, value}
+        end
+
+      _ ->
+        optional_partition_key(opts)
+    end
+  end
+
+  defp optional_claim_states(opts) do
+    state_values = Keyword.get_values(opts, :state)
+    states_value = Keyword.get(opts, :states, nil)
+
+    cond do
+      state_values != [] and not is_nil(states_value) ->
+        {:error, "ERR flow state and states are mutually exclusive"}
+
+      state_values != [] ->
+        normalize_claim_state_values(state_values)
+
+      not is_nil(states_value) ->
+        normalize_claim_state_values(states_value)
+
+      true ->
+        {:ok, @default_state}
+    end
+  end
+
+  defp normalize_claim_state_values(:any), do: {:ok, :any}
+
+  defp normalize_claim_state_values(value) when is_binary(value) do
+    if String.upcase(value) == "ANY" do
+      {:ok, :any}
+    else
+      normalize_claim_state_values([value])
+    end
+  end
+
+  defp normalize_claim_state_values(values) when is_list(values) do
+    cond do
+      values == [] ->
+        {:error, "ERR flow states must be a non-empty list"}
+
+      Enum.any?(values, &claim_state_any?/1) ->
+        if length(values) == 1 do
+          {:ok, :any}
+        else
+          {:error, "ERR flow STATE ANY cannot be mixed with explicit states"}
+        end
+
+      true ->
+        values
+        |> Enum.reduce_while({:ok, []}, fn
+          value, {:ok, acc} when is_binary(value) and value != "" -> {:cont, {:ok, [value | acc]}}
+          _bad, {:ok, _acc} -> {:halt, {:error, "ERR flow state must be a non-empty string"}}
+        end)
+        |> case do
+          {:ok, [single]} -> {:ok, single}
+          {:ok, states} -> {:ok, Enum.reverse(Enum.uniq(states))}
+          {:error, _reason} = error -> error
+        end
+    end
+  end
+
+  defp normalize_claim_state_values(_value),
+    do: {:error, "ERR flow state must be a non-empty string"}
+
+  defp claim_state_any?(:any), do: true
+  defp claim_state_any?(value) when is_binary(value), do: String.upcase(value) == "ANY"
+  defp claim_state_any?(_value), do: false
 
   defp required_partition_key(partition_key) do
     case optional_partition_key(partition_key: partition_key) do
@@ -3941,6 +4111,17 @@ defmodule Ferricstore.Flow do
 
     def state_key(id, partition_key \\ nil) do
       "f:" <> tag(partition_key) <> ":s:" <> id
+    end
+
+    def state_key_from_due_key(due_key, id) when is_binary(due_key) and is_binary(id) do
+      case :binary.match(due_key, "}:d:") do
+        {pos, _len} when pos >= 2 ->
+          tag = binary_part(due_key, 2, pos + 1 - 2)
+          {:ok, "f:" <> tag <> ":s:" <> id}
+
+        :nomatch ->
+          :error
+      end
     end
 
     def history_key(id, partition_key \\ nil) do

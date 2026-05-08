@@ -432,6 +432,52 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches Flow claim_due reclaim controls through Rust AST" do
+    type = uid("flow-command-claim-reclaim-ratio")
+    expired_id = uid("flow-command-expired")
+    fresh_id = uid("flow-command-fresh")
+
+    assert %{"id" => ^expired_id} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [expired_id, "TYPE", type, "RUN_AT", "1000"],
+               MockStore.make()
+             )
+
+    assert [%{"id" => ^expired_id}] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [type, "WORKER", "worker-a", "LEASE_MS", "50", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert %{"id" => ^fresh_id} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [fresh_id, "TYPE", type, "RUN_AT", "1050"],
+               MockStore.make()
+             )
+
+    assert [%{"id" => ^fresh_id, "version" => 2}] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [
+                 type,
+                 "WORKER",
+                 "worker-b",
+                 "LEASE_MS",
+                 "50",
+                 "NOW",
+                 "1050",
+                 "RECLAIM_EXPIRED",
+                 "false",
+                 "RECLAIM_RATIO",
+                 "50"
+               ],
+               MockStore.make()
+             )
+  end
+
   test "dispatches Flow create_many through Rust AST" do
     partition = uid("tenant")
     type = uid("flow-command-bulk")
@@ -813,6 +859,82 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
+  end
+
+  test "dispatches Flow claim_due with any partition and repeated states through Rust AST" do
+    type = uid("flow-command-claim-any")
+    partition = uid("tenant")
+    queued_id = uid("flow-command-claim-any-queued")
+    ready_id = uid("flow-command-claim-any-ready")
+    held_id = uid("flow-command-claim-any-held")
+
+    assert %{"id" => ^queued_id} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [queued_id, "TYPE", type, "RUN_AT", "1000", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert %{"id" => ^ready_id} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [
+                 ready_id,
+                 "TYPE",
+                 type,
+                 "STATE",
+                 "ready",
+                 "RUN_AT",
+                 "1000",
+                 "NOW",
+                 "1000",
+                 "PARTITION",
+                 partition
+               ],
+               MockStore.make()
+             )
+
+    assert %{"id" => ^held_id} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [
+                 held_id,
+                 "TYPE",
+                 type,
+                 "STATE",
+                 "held",
+                 "RUN_AT",
+                 "1000",
+                 "NOW",
+                 "1000",
+                 "PARTITION",
+                 partition
+               ],
+               MockStore.make()
+             )
+
+    claimed =
+      Dispatcher.dispatch(
+        "FLOW.CLAIM_DUE",
+        [
+          type,
+          "WORKER",
+          "worker-a",
+          "LIMIT",
+          "10",
+          "NOW",
+          "1000",
+          "PARTITION",
+          "ANY",
+          "STATE",
+          "queued",
+          "STATE",
+          "ready"
+        ],
+        MockStore.make()
+      )
+
+    assert MapSet.new(Enum.map(claimed, & &1["id"])) == MapSet.new([queued_id, ready_id])
   end
 
   test "dispatches Flow cancel_many through Rust AST" do
