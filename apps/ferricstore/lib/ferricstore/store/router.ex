@@ -277,7 +277,11 @@ defmodule Ferricstore.Store.Router do
       |> Enum.map(fn {shard_idx, _queue, _sandbox_namespace} -> shard_idx end)
       |> Enum.uniq()
 
-    case acquire_standalone_cross_shard_barriers(ctx, touched) do
+    barriered =
+      [0 | touched]
+      |> Enum.uniq()
+
+    case acquire_standalone_cross_shard_barriers(ctx, barriered) do
       :ok ->
         try do
           case standalone_write(ctx, 0, {:cross_shard_tx, shard_batches}, :sync_no_version) do
@@ -289,7 +293,7 @@ defmodule Ferricstore.Store.Router do
               result
           end
         after
-          release_standalone_cross_shard_barriers(ctx, touched)
+          release_standalone_cross_shard_barriers(ctx, barriered)
         end
 
       {:error, {_idx, :standalone_cross_shard_barrier_busy}} ->

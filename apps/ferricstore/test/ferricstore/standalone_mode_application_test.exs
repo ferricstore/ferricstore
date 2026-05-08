@@ -387,6 +387,58 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     _ = GenServer.call(elem(ctx.shard_names, 0), :standalone_cross_shard_barrier_release, 5_000)
   end
 
+  test "standalone cross-shard tx fences coordinator shard on fail-closed pause" do
+    ctx = FerricStore.Instance.get(:default)
+    remote_key_a = key_on_same_shard(ctx, 1)
+    remote_key_b = key_on_same_shard(ctx, 2)
+    coordinator_key = key_on_same_shard(ctx, 0)
+    parent = self()
+
+    Application.put_env(:ferricstore, :standalone_cross_shard_tx_hook, fn
+      {:prepared, _txid, _groups} ->
+        send(parent, {:standalone_cross_shard_tx_prepared, self()})
+
+        receive do
+          :release_standalone_cross_shard_tx ->
+            {:error, :simulated_crash_after_prepare}
+        after
+          5_000 ->
+            {:error, :standalone_cross_shard_tx_hook_timeout}
+        end
+
+      _other ->
+        :ok
+    end)
+
+    tx_task =
+      Task.async(fn ->
+        Ferricstore.Commands.Strings.handle(
+          "MSETNX",
+          [remote_key_a, "tx-a", remote_key_b, "tx-b"],
+          %{}
+        )
+      end)
+
+    assert_receive {:standalone_cross_shard_tx_prepared, hook_pid}, 5_000
+
+    put_task = Task.async(fn -> Router.put(ctx, coordinator_key, "must-not-apply", 0) end)
+    send(hook_pid, :release_standalone_cross_shard_tx)
+
+    assert {:error, tx_message} = Task.await(tx_task, 5_000)
+    assert tx_message =~ "ERR standalone durability failure"
+
+    assert {:error, put_message} = Task.await(put_task, 5_000)
+
+    assert put_message in [
+             "ERR standalone durability failure: :prior_standalone_write_failed",
+             "ERR shard writes paused for sync"
+           ]
+
+    assert Router.get(ctx, coordinator_key) == nil
+  after
+    Application.delete_env(:ferricstore, :standalone_cross_shard_tx_hook)
+  end
+
   test "standalone batch read-modify-write commands see staged values before publish" do
     ctx = FerricStore.Instance.get(:default)
     key = "standalone:group-commit:incr"
