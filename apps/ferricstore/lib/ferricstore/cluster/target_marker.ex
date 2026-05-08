@@ -8,8 +8,8 @@ defmodule Ferricstore.Cluster.TargetMarker do
     rpc = Keyword.get(opts, :rpc, &:erpc.call/5)
 
     case Ferricstore.ReplicationMode.read(ctx.data_dir) do
-      {:ok, %{cluster_id: cluster_id}} when is_binary(cluster_id) ->
-        write_remote_marker(target_node, ctx, barrier_indices, cluster_id, rpc)
+      {:ok, %{cluster_id: cluster_id} = local_state} when is_binary(cluster_id) ->
+        write_remote_marker(target_node, ctx, barrier_indices, local_state, rpc)
 
       {:ok, _} ->
         {:error, :local_cluster_id_missing}
@@ -19,7 +19,10 @@ defmodule Ferricstore.Cluster.TargetMarker do
     end
   end
 
-  defp write_remote_marker(target_node, ctx, barrier_indices, cluster_id, rpc) do
+  defp write_remote_marker(target_node, ctx, barrier_indices, local_state, rpc) do
+    cluster_id = Map.fetch!(local_state, :cluster_id)
+    promotion_epoch = Map.get(local_state, :promotion_epoch, 0)
+
     with {:ok, target_ctx} <- safe_rpc(rpc, target_node, FerricStore.Instance, :get, [:default]),
          {:ok, target_data_dir} <- target_data_dir(target_ctx),
          {:ok, :ok} <-
@@ -34,6 +37,7 @@ defmodule Ferricstore.Cluster.TargetMarker do
                  replication_mode: :raft,
                  shard_count: ctx.shard_count,
                  cluster_id: cluster_id,
+                 promotion_epoch: promotion_epoch,
                  barrier_indices: barrier_indices
                }
              ]

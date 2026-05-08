@@ -46,6 +46,7 @@ defmodule Ferricstore.Cluster.TargetMarkerTest do
                       replication_mode: :raft,
                       shard_count: 4,
                       cluster_id: ^cluster_id,
+                      promotion_epoch: 9,
                       barrier_indices: %{0 => 42}
                     }}
   end

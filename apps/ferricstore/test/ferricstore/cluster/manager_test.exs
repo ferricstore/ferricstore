@@ -241,6 +241,57 @@ defmodule Ferricstore.Cluster.ManagerTest do
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
+    test "standalone target data is rejected without replace even with same cluster id" do
+      target = :"standalone_same_cluster_target@127.0.0.1"
+      parent = self()
+      ctx = FerricStore.Instance.get(:default)
+      {:ok, %{cluster_id: local_cluster_id}} = Ferricstore.ReplicationMode.read(ctx.data_dir)
+
+      Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 ->
+        {:ok, true}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_read_target_cluster_state_hook, fn ^target ->
+        {:ok, %{cluster_id: local_cluster_id, replication_mode: :standalone}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 1 ->
+        send(parent, :target_raft_stop)
+        :ok
+      end)
+
+      Process.put(:ferricstore_cluster_manager_read_target_indices_hook, fn ^target, 1 ->
+        send(parent, :target_indices_read)
+        {:ok, %{0 => 7}}
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
+        Process.delete(:ferricstore_cluster_manager_read_target_cluster_state_hook)
+        Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
+        Process.delete(:ferricstore_cluster_manager_read_target_indices_hook)
+      end)
+
+      state = %{
+        mode: :cluster,
+        role: :voter,
+        cluster_nodes: [],
+        remove_delay_ms: 60_000,
+        known_nodes: MapSet.new(),
+        remove_timers: %{},
+        sync_status: :synced,
+        shard_sync_status: %{},
+        shard_count: 1
+      }
+
+      assert {:reply, {:error, {:target_standalone_data_requires_replace, ^target}}, new_state} =
+               Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
+
+      refute_received :target_raft_stop
+      refute_received :target_indices_read
+      refute MapSet.member?(new_state.known_nodes, target)
+    end
+
     test "target marker failure rolls back raft membership and does not poison known_nodes" do
       target = :"marker_failure_target@127.0.0.1"
       parent = self()
@@ -426,7 +477,7 @@ defmodule Ferricstore.Cluster.ManagerTest do
       end)
 
       Process.put(:ferricstore_cluster_manager_read_target_cluster_state_hook, fn ^target ->
-        {:ok, %{cluster_id: cluster_id}}
+        {:ok, %{cluster_id: cluster_id, replication_mode: :raft}}
       end)
 
       Process.put(:ferricstore_cluster_manager_target_membership_hook, fn ^target, _state ->

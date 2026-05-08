@@ -8,8 +8,17 @@ defmodule Ferricstore.Cluster.JoinIdentityTest do
   test "accepts copied data when local and target cluster ids match" do
     assert :ok =
              JoinIdentity.validate(
-               {:ok, %{cluster_id: "cluster-a"}},
-               {:ok, %{cluster_id: "cluster-a"}},
+               {:ok, %{cluster_id: "cluster-a", replication_mode: :raft}},
+               {:ok, %{cluster_id: "cluster-a", replication_mode: :raft}},
+               @target
+             )
+  end
+
+  test "rejects standalone target data even when cluster ids match" do
+    assert {:error, {:target_standalone_data_requires_replace, @target}} =
+             JoinIdentity.validate(
+               {:ok, %{cluster_id: "cluster-a", replication_mode: :raft}},
+               {:ok, %{cluster_id: "cluster-a", replication_mode: :standalone}},
                @target
              )
   end
