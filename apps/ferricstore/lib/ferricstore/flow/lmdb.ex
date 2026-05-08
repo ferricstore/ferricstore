@@ -848,7 +848,7 @@ defmodule Ferricstore.Flow.LMDB do
     end
   end
 
-  defp history_index_delete_ops(path, history_index_key) do
+  def history_index_delete_ops(path, history_index_key) do
     ops = [{:delete, history_index_key}]
 
     case get(path, history_index_key) do

@@ -4985,6 +4985,7 @@ defmodule Ferricstore.Raft.StateMachine do
       retention_ttl_ms: Map.fetch!(retention, :ttl_ms),
       terminal_retention_until_ms: nil,
       history_hot_max_events: Map.fetch!(retention, :history_hot_max_events),
+      history_max_events: Map.fetch!(retention, :history_max_events),
       partition_key: Map.get(attrs, :partition_key),
       payload_ref: flow_value_ref(attrs, :payload, id, 1, Map.get(attrs, :partition_key)),
       parent_flow_id: Map.get(attrs, :parent_flow_id),
@@ -5158,6 +5159,7 @@ defmodule Ferricstore.Raft.StateMachine do
       :priority,
       :retention_ttl_ms,
       :history_hot_max_events,
+      :history_max_events,
       :correlation_id,
       :payload
     ])
@@ -5204,6 +5206,10 @@ defmodule Ferricstore.Raft.StateMachine do
       |> maybe_put_retention_override(
         :history_hot_max_events,
         Map.get(attrs, :history_hot_max_events)
+      )
+      |> maybe_put_retention_override(
+        :history_max_events,
+        Map.get(attrs, :history_max_events)
       )
 
     RetryPolicy.resolve_retention(flow_policy, Map.get(attrs, :state), override)
@@ -5271,7 +5277,8 @@ defmodule Ferricstore.Raft.StateMachine do
       priority: Map.get(attrs, :priority, 0),
       ttl_ms: nil,
       retention_ttl_ms: Map.fetch!(retention, :ttl_ms),
-      history_hot_max_events: Map.fetch!(retention, :history_hot_max_events)
+      history_hot_max_events: Map.fetch!(retention, :history_hot_max_events),
+      history_max_events: Map.fetch!(retention, :history_max_events)
     }
 
     Enum.all?(comparable_attrs, fn {key, value} -> Map.get(existing, key) == value end) and
@@ -5931,6 +5938,7 @@ defmodule Ferricstore.Raft.StateMachine do
           ttl_ms: nil,
           retention_ttl_ms: Map.get(record, :retention_ttl_ms),
           history_hot_max_events: Map.get(record, :history_hot_max_events),
+          history_max_events: Map.get(record, :history_max_events),
           lease_deadline_ms: deadline_ms,
           next_run_at_ms: deadline_ms
         })
@@ -6001,6 +6009,7 @@ defmodule Ferricstore.Raft.StateMachine do
           ttl_ms: nil,
           retention_ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms),
           history_hot_max_events: Map.get(record, :history_hot_max_events),
+          history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0,
@@ -6183,6 +6192,7 @@ defmodule Ferricstore.Raft.StateMachine do
           ttl_ms: nil,
           retention_ttl_ms: Map.get(record, :retention_ttl_ms),
           history_hot_max_events: Map.get(record, :history_hot_max_events),
+          history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0
@@ -6329,6 +6339,7 @@ defmodule Ferricstore.Raft.StateMachine do
           ttl_ms: nil,
           retention_ttl_ms: Map.get(record, :retention_ttl_ms),
           history_hot_max_events: Map.get(record, :history_hot_max_events),
+          history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0,
@@ -6502,6 +6513,7 @@ defmodule Ferricstore.Raft.StateMachine do
           ttl_ms: nil,
           retention_ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms),
           history_hot_max_events: Map.get(record, :history_hot_max_events),
+          history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0,
@@ -6623,6 +6635,7 @@ defmodule Ferricstore.Raft.StateMachine do
           ttl_ms: nil,
           retention_ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms),
           history_hot_max_events: Map.get(record, :history_hot_max_events),
+          history_max_events: Map.get(record, :history_max_events),
           lease_owner: nil,
           lease_token: nil,
           lease_deadline_ms: 0,
@@ -7563,6 +7576,7 @@ defmodule Ferricstore.Raft.StateMachine do
                 ttl_ms: nil,
                 retention_ttl_ms: Map.get(record, :retention_ttl_ms),
                 history_hot_max_events: Map.get(record, :history_hot_max_events),
+                history_max_events: Map.get(record, :history_max_events),
                 lease_owner: worker,
                 lease_token: token,
                 lease_deadline_ms: deadline_ms,
@@ -8928,14 +8942,14 @@ defmodule Ferricstore.Raft.StateMachine do
     flow_index_put_new_entries(state, entries)
   end
 
-  defp flow_history_trim(_state, %{history_hot_max_events: nil}), do: :ok
-  defp flow_history_trim(_state, %{history_hot_max_events: max}) when not is_integer(max), do: :ok
+  defp flow_history_trim(_state, %{history_max_events: nil}), do: :ok
+  defp flow_history_trim(_state, %{history_max_events: max}) when not is_integer(max), do: :ok
 
-  defp flow_history_trim(_state, %{history_hot_max_events: max, version: version})
+  defp flow_history_trim(_state, %{history_max_events: max, version: version})
        when is_integer(version) and version <= max,
        do: :ok
 
-  defp flow_history_trim(state, %{id: id, history_hot_max_events: max} = record) when max > 0 do
+  defp flow_history_trim(state, %{id: id, history_max_events: max} = record) when max > 0 do
     partition_key = Map.get(record, :partition_key)
     history_key = FlowKeys.history_key(id, partition_key)
 
@@ -8947,8 +8961,6 @@ defmodule Ferricstore.Raft.StateMachine do
       _ ->
         :ok
     end
-
-    :ok
   end
 
   defp flow_history_trim(_state, _record), do: :ok
@@ -8971,16 +8983,37 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_history_trim_oldest(state, record, id, partition_key, history_key, delete_count) do
     events = flow_index_rank_range(state, history_key, 0, delete_count - 1, false)
 
-    event_ids =
-      Enum.map(events, fn {event_id, event_ms} ->
-        compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
-        queue_lmdb_history_index_put(record, history_key, event_id, trunc(event_ms), compound_key)
-        event_id
-      end)
+    with :ok <-
+           flow_history_delete_oldest_events(
+             state,
+             record,
+             id,
+             partition_key,
+             history_key,
+             events
+           ) do
+      events
+      |> Enum.map(fn {event_id, _event_ms} -> event_id end)
+      |> then(&flow_index_delete_members(state, history_key, &1))
+    end
+  end
 
-    flow_index_delete_members(state, history_key, event_ids)
+  defp flow_history_delete_oldest_events(_state, _record, _id, _partition_key, _history_key, []),
+    do: :ok
 
-    :ok
+  defp flow_history_delete_oldest_events(state, record, id, partition_key, history_key, events) do
+    Enum.reduce_while(events, :ok, fn {event_id, event_ms}, :ok ->
+      compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
+
+      if flow_lmdb_mirror?(state) do
+        queue_lmdb_history_index_delete(record, history_key, event_id, trunc(event_ms))
+      end
+
+      case do_delete(state, compound_key) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp maybe_queue_terminal_lmdb_history_indexes(state, record) do
@@ -10205,9 +10238,21 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp queue_lmdb_history_index_delete(_record, history_key, event_id, event_ms) do
+    history_key
+    |> Ferricstore.Flow.LMDB.history_index_key(event_id, event_ms)
+    |> queue_pending_lmdb_mirror_history_delete()
+  end
+
   defp queue_pending_lmdb_mirror_query_put(query_key, value) do
     pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
     Process.put(:sm_pending_lmdb_mirror_ops, [{:query_put, query_key, value} | pending])
+    :ok
+  end
+
+  defp queue_pending_lmdb_mirror_history_delete(history_index_key) do
+    pending = Process.get(:sm_pending_lmdb_mirror_ops, [])
+    Process.put(:sm_pending_lmdb_mirror_ops, [{:history_delete, history_index_key} | pending])
     :ok
   end
 

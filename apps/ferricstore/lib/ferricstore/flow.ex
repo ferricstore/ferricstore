@@ -13,6 +13,7 @@ defmodule Ferricstore.Flow do
   @default_lease_ms 30_000
   @default_limit 1
   @max_history_hot_max_events 10_000
+  @max_history_max_events 1_000_000
   @default_max_batch_items 1_000
   @default_max_claim_limit 1_000
   @default_payload_return_max_bytes 64 * 1024
@@ -1063,6 +1064,7 @@ defmodule Ferricstore.Flow do
       encode_int(Map.get(record, :priority)),
       encode_int(Map.get(record, :ttl_ms)),
       encode_int(Map.get(record, :history_hot_max_events)),
+      encode_int(Map.get(record, :history_max_events)),
       encode_int(Map.get(record, :retention_ttl_ms)),
       encode_int(Map.get(record, :terminal_retention_until_ms)),
       encode_bin(Map.get(record, :partition_key)),
@@ -1229,6 +1231,7 @@ defmodule Ferricstore.Flow do
          {:ok, priority, rest} <- decode_int(rest),
          {:ok, ttl_ms, rest} <- decode_int(rest),
          {:ok, history_hot_max_events, rest} <- decode_int(rest),
+         {:ok, history_max_events, rest} <- decode_int(rest),
          {:ok, retention_ttl_ms, rest} <- decode_int(rest),
          {:ok, terminal_retention_until_ms, rest} <- decode_int(rest),
          {:ok, partition_key, rest} <- decode_bin(rest),
@@ -1258,6 +1261,7 @@ defmodule Ferricstore.Flow do
         priority: priority,
         ttl_ms: ttl_ms,
         history_hot_max_events: history_hot_max_events,
+        history_max_events: history_max_events,
         retention_ttl_ms: retention_ttl_ms,
         terminal_retention_until_ms: terminal_retention_until_ms,
         partition_key: partition_key,
@@ -2435,6 +2439,8 @@ defmodule Ferricstore.Flow do
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
          {:ok, retention_ttl_ms} <- optional_retention_ttl_ms(opts),
          {:ok, history_hot_max_events} <- optional_history_hot_max_events(opts),
+         {:ok, history_max_events} <- optional_history_max_events(opts),
+         :ok <- validate_history_event_caps(history_hot_max_events, history_max_events),
          {:ok, priority} <- optional_priority(opts, @default_priority),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_flow_keys(id, type, state, priority, partition_key) do
@@ -2450,6 +2456,7 @@ defmodule Ferricstore.Flow do
           idempotent: idempotent,
           retention_ttl_ms: retention_ttl_ms,
           history_hot_max_events: history_hot_max_events,
+          history_max_events: history_max_events,
           priority: priority,
           partition_key: partition_key
         }
@@ -2654,6 +2661,7 @@ defmodule Ferricstore.Flow do
       :history_hot_max_events,
       "history_hot_max_events"
     )
+    |> maybe_put_item_opt(:history_max_events, item, :history_max_events, "history_max_events")
   end
 
   defp transition_attrs(id, from_state, to_state, opts) do
@@ -4040,27 +4048,55 @@ defmodule Ferricstore.Flow do
   end
 
   defp optional_history_hot_max_events(opts) do
-    cond do
-      Keyword.has_key?(opts, :history_max_events) ->
-        {:error, "ERR flow history_max_events was renamed to history_hot_max_events"}
+    if Keyword.has_key?(opts, :history_hot_max_events) do
+      case Keyword.get(opts, :history_hot_max_events) do
+        value when is_integer(value) and value > 0 ->
+          max = flow_max_history_hot_max_events()
 
-      Keyword.has_key?(opts, :history_hot_max_events) ->
-        case Keyword.get(opts, :history_hot_max_events) do
-          value when is_integer(value) and value > 0 ->
-            max = flow_max_history_hot_max_events()
+          if value <= max do
+            {:ok, value}
+          else
+            {:error, "ERR flow history_hot_max_events exceeds maximum #{max}"}
+          end
 
-            if value <= max do
-              {:ok, value}
-            else
-              {:error, "ERR flow history_hot_max_events exceeds maximum #{max}"}
-            end
+        _ ->
+          {:error, "ERR flow history_hot_max_events must be a positive integer"}
+      end
+    else
+      {:ok, nil}
+    end
+  end
 
-          _ ->
-            {:error, "ERR flow history_hot_max_events must be a positive integer"}
-        end
+  defp optional_history_max_events(opts) do
+    if Keyword.has_key?(opts, :history_max_events) do
+      case Keyword.get(opts, :history_max_events) do
+        value when is_integer(value) and value > 0 ->
+          max = flow_max_history_max_events()
 
-      true ->
-        {:ok, nil}
+          if value <= max do
+            {:ok, value}
+          else
+            {:error, "ERR flow history_max_events exceeds maximum #{max}"}
+          end
+
+        _ ->
+          {:error, "ERR flow history_max_events must be a positive integer"}
+      end
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp validate_history_event_caps(nil, _history_max_events), do: :ok
+  defp validate_history_event_caps(_history_hot_max_events, nil), do: :ok
+
+  defp validate_history_event_caps(history_hot_max_events, history_max_events)
+       when is_integer(history_hot_max_events) and is_integer(history_max_events) do
+    if history_max_events >= history_hot_max_events do
+      :ok
+    else
+      {:error,
+       "ERR flow history_max_events must be greater than or equal to history_hot_max_events"}
     end
   end
 
@@ -4072,6 +4108,17 @@ defmodule Ferricstore.Flow do
          ) do
       value when is_integer(value) and value > 0 -> value
       _ -> @max_history_hot_max_events
+    end
+  end
+
+  defp flow_max_history_max_events do
+    case Application.get_env(
+           :ferricstore,
+           :flow_max_history_max_events,
+           @max_history_max_events
+         ) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> @max_history_max_events
     end
   end
 

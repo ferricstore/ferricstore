@@ -157,6 +157,7 @@ defmodule Ferricstore.FlowTest do
       retention_ttl_ms: 60_000,
       terminal_retention_until_ms: nil,
       history_hot_max_events: 100,
+      history_max_events: 100_000,
       partition_key: "tenant-a",
       payload_ref: "payload:1",
       parent_flow_id: "parent-1",
@@ -3291,7 +3292,7 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, policy} =
              FerricStore.flow_policy_set(type,
-               retention: [ttl_ms: 60_000, history_hot_max_events: 128],
+               retention: [ttl_ms: 60_000, history_hot_max_events: 128, history_max_events: 512],
                retry: [
                  max_retries: 5,
                  backoff: [kind: :fixed, base_ms: 10_000, max_ms: 30_000, jitter_pct: 0],
@@ -3303,7 +3304,11 @@ defmodule Ferricstore.FlowTest do
                      max_retries: 2,
                      exhausted_to: "payment_failed"
                    ],
-                   retention: [ttl_ms: 30_000, history_hot_max_events: 64]
+                   retention: [
+                     ttl_ms: 30_000,
+                     history_hot_max_events: 64,
+                     history_max_events: 256
+                   ]
                  ]
                }
              )
@@ -3311,11 +3316,13 @@ defmodule Ferricstore.FlowTest do
     assert policy.retry.max_retries == 5
     assert policy.retention.ttl_ms == 60_000
     assert policy.retention.history_hot_max_events == 128
+    assert policy.retention.history_max_events == 512
     assert policy.states["charge_card"].retry.max_retries == 2
     assert policy.states["charge_card"].retry.backoff.kind == :fixed
     assert policy.states["charge_card"].retry.exhausted_to == "payment_failed"
     assert policy.states["charge_card"].retention.ttl_ms == 30_000
     assert policy.states["charge_card"].retention.history_hot_max_events == 64
+    assert policy.states["charge_card"].retention.history_max_events == 256
 
     assert {:ok, state_policy} = FerricStore.flow_policy_get(type, state: "charge_card")
     assert state_policy.retry.max_retries == 2
@@ -3323,6 +3330,7 @@ defmodule Ferricstore.FlowTest do
     assert state_policy.retry.exhausted_to == "payment_failed"
     assert state_policy.retention.ttl_ms == 30_000
     assert state_policy.retention.history_hot_max_events == 64
+    assert state_policy.retention.history_max_events == 256
   end
 
   test "flow policy is mirrored to LMDB asynchronously" do
@@ -5123,17 +5131,98 @@ defmodule Ferricstore.FlowTest do
     shard = shard_for(history_key)
     {flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(:default, shard)
 
-    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 2
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 3
 
     assert Ferricstore.Flow.OrderedIndex.rank_range(flow_index, history_key, 0, 10, false)
            |> Enum.map(&elem(&1, 0)) ==
-             event_ids
+             [created_event_id | event_ids]
 
     assert [] = :ets.lookup(Ferricstore.Stream.Meta, history_key)
 
-    assert [] =
+    assert [{^created_event_id, _score}] =
              Ferricstore.Flow.OrderedIndex.rank_range(flow_index, history_key, 0, 10, false)
              |> Enum.filter(fn {event_id, _score} -> event_id == created_event_id end)
+  end
+
+  test "flow history max events hard-caps stored history records" do
+    id = uid("flow-history-hard-cap")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: "audit-hard-cap",
+               run_at_ms: 1_000,
+               history_hot_max_events: 5,
+               history_max_events: 5,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [{created_event_id, _fields}]} = FerricStore.flow_history(id, count: 10)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("audit-hard-cap",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_010
+             )
+
+    1..5
+    |> Enum.each(fn idx ->
+      assert {:ok, _extended} =
+               FerricStore.flow_extend_lease(id, claimed.lease_token,
+                 fencing_token: claimed.fencing_token,
+                 lease_ms: 30_000,
+                 now_ms: 1_020 + idx
+               )
+    end)
+
+    assert {:ok, _} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               now_ms: 1_100
+             )
+
+    assert {:ok, events} = FerricStore.flow_history(id, count: 10)
+    event_ids = Enum.map(events, fn {event_id, _fields} -> event_id end)
+
+    assert length(events) == 5
+    refute created_event_id in event_ids
+
+    assert Enum.map(events, fn {_id, fields} -> fields["event"] end) == [
+             "lease_extended",
+             "lease_extended",
+             "lease_extended",
+             "lease_extended",
+             "completed"
+           ]
+
+    history_key = Ferricstore.Flow.Keys.history_key(id)
+    history_entry_key = Ferricstore.Flow.Keys.stream_entry_key(id, created_event_id)
+    shard = shard_for(history_key)
+    {_flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(:default, shard)
+
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 5
+    assert {:ok, nil} = FerricStore.get(history_entry_key)
+  end
+
+  test "flow history max events defaults to 100k and rejects invalid caps" do
+    id = uid("flow-history-default-hard-cap")
+
+    assert {:ok, created} =
+             FerricStore.flow_create(id,
+               type: "audit-default-hard-cap",
+               run_at_ms: 1_000
+             )
+
+    assert created.history_max_events == 100_000
+
+    assert {:error,
+            "ERR flow history_max_events must be greater than or equal to history_hot_max_events"} =
+             FerricStore.flow_create(uid("flow-history-bad-hard-cap"),
+               type: "audit-bad-hard-cap",
+               history_hot_max_events: 10,
+               history_max_events: 5
+             )
   end
 
   test "flow history uses configured default hot max when omitted" do
@@ -5257,6 +5346,7 @@ defmodule Ferricstore.FlowTest do
                type: "rewind-trimmed",
                run_at_ms: 1_000,
                history_hot_max_events: 2,
+               history_max_events: 2,
                now_ms: 1_000
              )
 
@@ -5475,7 +5565,7 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, _policy} =
              FerricStore.flow_policy_set(type,
-               retention: [ttl_ms: 5_000, history_hot_max_events: 3]
+               retention: [ttl_ms: 5_000, history_hot_max_events: 3, history_max_events: 9]
              )
 
     assert {:ok, created} =
@@ -5483,6 +5573,7 @@ defmodule Ferricstore.FlowTest do
 
     assert created.retention_ttl_ms == 5_000
     assert created.history_hot_max_events == 3
+    assert created.history_max_events == 9
     assert created.terminal_retention_until_ms == nil
   end
 

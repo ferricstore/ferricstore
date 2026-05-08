@@ -444,6 +444,12 @@ defmodule Ferricstore.Flow.LMDBWriter do
     {:ok, prepend_ops(acc, [{:delete, query_key}])}
   end
 
+  defp expand_op(path, {:history_delete, history_index_key}, acc)
+       when is_binary(history_index_key) do
+    {:ok,
+     prepend_ops(acc, Ferricstore.Flow.LMDB.history_index_delete_ops(path, history_index_key))}
+  end
+
   defp expand_op(_path, {put_mode, key, value} = op, acc)
        when put_mode in [:put, :put_new] and is_binary(key) and is_binary(value) do
     acc = maybe_init_terminal_counts_for_active_record(value, acc)
