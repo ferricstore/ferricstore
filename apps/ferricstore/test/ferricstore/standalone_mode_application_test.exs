@@ -215,6 +215,58 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     Application.delete_env(:ferricstore, :standalone_durability_hook)
   end
 
+  test "pause_writes drains queued standalone commits before returning" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "standalone:pause-drains-queued"
+    shard_idx = Router.shard_for(ctx, key)
+    shard = elem(ctx.shard_names, shard_idx)
+    parent = self()
+
+    Application.put_env(:ferricstore, :standalone_fsync_max_delay_ms, 10_000)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      if Enum.any?(batch, fn
+           {:put, ^key, "value", 0} -> true
+           {:put_cold, ^key, "value", 0, _lfu} -> true
+           _ -> false
+         end) do
+        send(parent, {:pause_drain_hook_blocked, self(), batch})
+
+        receive do
+          :release_pause_drain_hook -> :passthrough
+        after
+          5_000 -> {:error, :pause_drain_hook_timeout}
+        end
+      else
+        :passthrough
+      end
+    end)
+
+    put_task = Task.async(fn -> Router.put(ctx, key, "value", 0) end)
+
+    assert eventually(fn ->
+             debug = GenServer.call(shard, :standalone_commit_debug, 100)
+             debug.batch_count == 1
+           end)
+
+    pause_task = Task.async(fn -> GenServer.call(shard, {:pause_writes}, 30_000) end)
+
+    refute Task.yield(pause_task, 50)
+    refute Task.yield(put_task, 50)
+    assert_receive {:pause_drain_hook_blocked, hook_pid, _batch}, 5_000
+
+    send(hook_pid, :release_pause_drain_hook)
+
+    assert :ok = Task.await(put_task, 5_000)
+    assert :ok = Task.await(pause_task, 5_000)
+    assert Router.get(ctx, key) == "value"
+
+    assert {:error, "ERR shard writes paused for sync"} = Router.put(ctx, key, "after-pause", 0)
+  after
+    Application.delete_env(:ferricstore, :standalone_fsync_max_delay_ms)
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
   test "standalone cross-shard command commits through durable tx path", %{tmp_dir: tmp_dir} do
     ctx = FerricStore.Instance.get(:default)
     key_a = "standalone:cross-shard:msetnx:a"

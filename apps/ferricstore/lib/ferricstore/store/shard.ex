@@ -936,6 +936,7 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   def handle_call({:pause_writes}, _from, state) do
+    state = drain_standalone_commits_for_sync(state)
     state = await_in_flight(state)
     state = flush_pending_sync(state)
     {:reply, :ok, %{state | writes_paused: true}}
