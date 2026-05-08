@@ -2262,9 +2262,7 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowPolicyGet => make_flow_policy_get_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowClaimDue => make_flow_claim_due_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowReclaim => make_flow_reclaim_command_ast(env, args, arg_bytes),
-        CommandAstKind::FlowExtendLease => {
-            make_flow_extend_lease_command_ast(env, args, arg_bytes)
-        }
+        CommandAstKind::FlowExtendLease => make_flow_extend_lease_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowComplete => make_flow_complete_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCompleteMany => {
             make_flow_complete_many_command_ast(env, args, arg_bytes)
@@ -6285,6 +6283,11 @@ fn flow_create_option<'a>(
                 "history_hot_max_events",
                 FlowOptType::Positive(b"history_hot_max_events"),
             ),
+            (
+                b"HISTORY_MAX_EVENTS",
+                "history_max_events",
+                FlowOptType::Positive(b"history_max_events"),
+            ),
             (b"IDEMPOTENT", "idempotent", FlowOptType::Boolean),
         ],
     )
@@ -6453,6 +6456,16 @@ fn flow_policy_option<'a>(
         match parse_int_bytes(arg_bytes[idx + 1]) {
             Some(value) if value > 0 => Ok(FlowPolicyOpt::Retention(
                 (atom(env, "history_hot_max_events"), value).encode(env),
+            )),
+            _ => Err(generic_ast_error(
+                env,
+                b"ERR value is not an integer or out of range",
+            )),
+        }
+    } else if ascii_eq_ignore_case(arg_bytes[idx], b"HISTORY_MAX_EVENTS") {
+        match parse_int_bytes(arg_bytes[idx + 1]) {
+            Some(value) if value > 0 => Ok(FlowPolicyOpt::Retention(
+                (atom(env, "history_max_events"), value).encode(env),
             )),
             _ => Err(generic_ast_error(
                 env,

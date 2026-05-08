@@ -69,12 +69,18 @@ defmodule Ferricstore.Commands.FlowTest do
                  "RETENTION_TTL",
                  "60000",
                  "HISTORY_HOT_MAX_EVENTS",
-                 "5"
+                 "5",
+                 "HISTORY_MAX_EVENTS",
+                 "25"
                ],
                MockStore.make()
              )
 
-    assert %{"root_flow_id" => "checkout-root", "correlation_id" => "order-123"} =
+    assert %{
+             "root_flow_id" => "checkout-root",
+             "correlation_id" => "order-123",
+             "history_max_events" => 25
+           } =
              Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
 
     assert %{"id" => ^id, "type" => "checkout"} =
@@ -1277,7 +1283,7 @@ defmodule Ferricstore.Commands.FlowTest do
              Dispatcher.dispatch_ast(
                {:flow_policy_set, type,
                 [
-                  retention: [ttl_ms: 60_000, history_hot_max_events: 32],
+                  retention: [ttl_ms: 60_000, history_hot_max_events: 32, history_max_events: 320],
                   retry: [
                     max_retries: 5,
                     backoff: [kind: :fixed, base_ms: 1_000, max_ms: 5_000, jitter_pct: 0],
@@ -1286,21 +1292,35 @@ defmodule Ferricstore.Commands.FlowTest do
                   states: %{
                     "charge_card" => [
                       retry: [max_retries: 1, exhausted_to: "payment_failed"],
-                      retention: [ttl_ms: 30_000, history_hot_max_events: 16]
+                      retention: [
+                        ttl_ms: 30_000,
+                        history_hot_max_events: 16,
+                        history_max_events: 160
+                      ]
                     ]
                   }
                 ]},
                MockStore.make()
              )
 
-    assert %{"retention" => %{"ttl_ms" => 60_000, "history_hot_max_events" => 32}} =
+    assert %{
+             "retention" => %{
+               "ttl_ms" => 60_000,
+               "history_hot_max_events" => 32,
+               "history_max_events" => 320
+             }
+           } =
              Dispatcher.dispatch_ast({:flow_policy_get, type, []}, MockStore.make())
 
     assert %{
              "type" => ^type,
              "state" => "charge_card",
              "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"},
-             "retention" => %{"ttl_ms" => 30_000, "history_hot_max_events" => 16}
+             "retention" => %{
+               "ttl_ms" => 30_000,
+               "history_hot_max_events" => 16,
+               "history_max_events" => 160
+             }
            } =
              Dispatcher.dispatch_ast(
                {:flow_policy_get, type, [state: "charge_card"]},
@@ -1342,6 +1362,8 @@ defmodule Ferricstore.Commands.FlowTest do
                  "60000",
                  "HISTORY_HOT_MAX_EVENTS",
                  "32",
+                 "HISTORY_MAX_EVENTS",
+                 "320",
                  "EXHAUSTED_TO",
                  "failed",
                  "STATE",
@@ -1353,19 +1375,31 @@ defmodule Ferricstore.Commands.FlowTest do
                  "RETENTION_TTL",
                  "30000",
                  "HISTORY_HOT_MAX_EVENTS",
-                 "16"
+                 "16",
+                 "HISTORY_MAX_EVENTS",
+                 "160"
                ],
                MockStore.make()
              )
 
-    assert %{"retention" => %{"ttl_ms" => 60_000, "history_hot_max_events" => 32}} =
+    assert %{
+             "retention" => %{
+               "ttl_ms" => 60_000,
+               "history_hot_max_events" => 32,
+               "history_max_events" => 320
+             }
+           } =
              Dispatcher.dispatch("FLOW.POLICY.GET", [type], MockStore.make())
 
     assert %{
              "type" => ^type,
              "state" => "charge_card",
              "retry" => %{"max_retries" => 1, "exhausted_to" => "payment_failed"},
-             "retention" => %{"ttl_ms" => 30_000, "history_hot_max_events" => 16}
+             "retention" => %{
+               "ttl_ms" => 30_000,
+               "history_hot_max_events" => 16,
+               "history_max_events" => 160
+             }
            } =
              Dispatcher.dispatch(
                "FLOW.POLICY.GET",

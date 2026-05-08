@@ -2196,6 +2196,8 @@ defmodule Ferricstore.Flow.LMDBTest do
                type: "history-restart",
                run_at_ms: 1,
                partition_key: partition_key,
+               history_hot_max_events: 2,
+               history_max_events: 5,
                now_ms: 1
              )
 
@@ -2209,17 +2211,24 @@ defmodule Ferricstore.Flow.LMDBTest do
              )
 
     assert {:ok, _record} =
+             Ferricstore.Flow.extend_lease(ctx, id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               lease_ms: 30_000,
+               partition_key: partition_key,
+               now_ms: 2
+             )
+
+    assert {:ok, _record} =
              Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                partition_key: partition_key,
-               now_ms: 2
+               now_ms: 3
              )
 
     assert {:ok, before_restart} = Ferricstore.Flow.history(ctx, id, partition_key: partition_key)
 
     assert Enum.map(before_restart, fn {_event_id, fields} -> fields["event"] end) == [
-             "created",
-             "claimed",
+             "lease_extended",
              "completed"
            ]
 
@@ -2228,10 +2237,14 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert {:ok, after_restart} = Ferricstore.Flow.history(ctx, id, partition_key: partition_key)
 
     assert Enum.map(after_restart, fn {_event_id, fields} -> fields["event"] end) == [
-             "created",
-             "claimed",
+             "lease_extended",
              "completed"
            ]
+
+    history_key = Ferricstore.Flow.Keys.history_key(id, partition_key)
+    {_flow_index, flow_lookup} = Ferricstore.Flow.OrderedIndex.table_names(ctx.name, 0)
+
+    assert Ferricstore.Flow.OrderedIndex.count_all(flow_lookup, history_key) == 4
   end
 
   test "startup rebuild recovers terminal LMDB mirror when writer dies before flush" do
