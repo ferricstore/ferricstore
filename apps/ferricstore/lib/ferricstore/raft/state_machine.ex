@@ -1822,13 +1822,39 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp dispatch_cross_shard_entry(
+         {orig_idx, entry},
+         sandbox_namespace,
+         store,
+         state
+       )
+       when is_integer(orig_idx) and is_tuple(entry) do
+    dispatch_cross_shard_entry(entry, sandbox_namespace, store, state)
+  end
+
+  defp dispatch_cross_shard_entry(
          {:flow_cross_terminal, op, attrs},
          _sandbox_namespace,
          _store,
          state
-       )
-       when op in [:complete, :fail, :cancel] do
-    do_flow_cross_terminal(state, op, attrs)
+       ) do
+    if op in [:complete, :fail, :cancel] do
+      do_flow_cross_terminal(state, op, attrs)
+    else
+      {:error, "ERR invalid flow cross-shard terminal op"}
+    end
+  end
+
+  defp dispatch_cross_shard_entry(
+         {:flow_cross_terminal_many, op, attrs_list},
+         _sandbox_namespace,
+         _store,
+         state
+       ) do
+    if op in [:complete, :fail, :cancel] do
+      do_flow_cross_terminal_many(state, op, attrs_list)
+    else
+      {:error, "ERR invalid flow cross-shard terminal op"}
+    end
   end
 
   defp dispatch_cross_shard_entry(entry, sandbox_namespace, store, _state) do
@@ -4731,7 +4757,8 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_require_spawn_wait_state(%{state: "running"}, %{wait: :all, wait_state: nil}) do
+  defp flow_require_spawn_wait_state(%{state: "running"}, %{wait: wait, wait_state: nil})
+       when wait in [:all, :any] do
     {:error, "ERR flow wait_state is required for running parent"}
   end
 
@@ -4793,8 +4820,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_spawn_parent_state(_parent, %{wait: :none, exhaust_to: %{"success" => state}}),
     do: state
 
-  defp flow_spawn_parent_state(_parent, %{wait: :all, wait_state: wait_state})
-       when is_binary(wait_state) and wait_state != "",
+  defp flow_spawn_parent_state(_parent, %{wait: wait, wait_state: wait_state})
+       when wait in [:all, :any] and is_binary(wait_state) and wait_state != "",
        do: wait_state
 
   defp flow_spawn_parent_state(parent, _attrs), do: Map.fetch!(parent, :state)
@@ -4814,6 +4841,7 @@ defmodule Ferricstore.Raft.StateMachine do
       case Map.fetch!(attrs, :wait) do
         :none -> "success"
         :all -> nil
+        :any -> nil
       end
 
     %{
@@ -6367,6 +6395,115 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp do_flow_cross_terminal_many(state, op, [_ | _] = attrs_list)
+       when op in [:complete, :fail, :cancel] do
+    with :ok <- flow_transition_many_unique?(attrs_list),
+         {:ok, plans} <- flow_cross_terminal_many_prepare(state, op, attrs_list),
+         :ok <- flow_cross_terminal_many_apply(state, op, plans) do
+      {:ok,
+       Enum.map(plans, fn {_child_state, _record, next, _attrs, _partition_key, _now_ms} ->
+         next
+       end)}
+    end
+  end
+
+  defp do_flow_cross_terminal_many(_state, _op, _attrs),
+    do: {:error, "ERR flow items must be a non-empty list"}
+
+  defp flow_cross_terminal_many_prepare(state, op, attrs_list) do
+    attrs_list
+    |> Enum.reduce_while({:ok, []}, fn attrs, {:ok, acc} ->
+      case flow_cross_terminal_prepare(state, op, attrs) do
+        {:ok, plan} -> {:cont, {:ok, [plan | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, plans} -> {:ok, Enum.reverse(plans)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_cross_terminal_prepare(state, :complete, %{id: id, lease_token: lease_token} = attrs)
+       when is_binary(id) and id != "" do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
+    child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
+
+    with {:ok, record} <- flow_require_record(child_state, id, partition_key),
+         {:ok, record, next} <-
+           flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms) do
+      {:ok, {child_state, record, next, attrs, partition_key, now_ms}}
+    end
+  end
+
+  defp flow_cross_terminal_prepare(state, :fail, %{id: id, lease_token: lease_token} = attrs)
+       when is_binary(id) and id != "" do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
+    child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
+
+    with {:ok, record} <- flow_require_record(child_state, id, partition_key),
+         {:ok, record, next} <-
+           flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms) do
+      {:ok, {child_state, record, next, attrs, partition_key, now_ms}}
+    end
+  end
+
+  defp flow_cross_terminal_prepare(state, :cancel, %{id: id} = attrs)
+       when is_binary(id) and id != "" do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
+    child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
+
+    with {:ok, record} <- flow_require_record(child_state, id, partition_key),
+         {:ok, record, next} <- flow_prepare_cancel_existing_record(record, attrs, now_ms) do
+      {:ok, {child_state, record, next, attrs, partition_key, now_ms}}
+    end
+  end
+
+  defp flow_cross_terminal_prepare(_state, _op, _attrs),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  defp flow_cross_terminal_many_apply(state, op, plans) do
+    Enum.reduce_while(plans, :ok, fn plan, :ok ->
+      case flow_cross_terminal_apply_plan(state, op, plan) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_cross_terminal_apply_plan(
+         state,
+         :complete,
+         {child_state, record, next, attrs, partition_key, now_ms}
+       ) do
+    with :ok <- flow_apply_complete_local(child_state, record, next, partition_key, now_ms, attrs) do
+      flow_apply_child_terminal_chain(state, next, "completed", now_ms)
+    end
+  end
+
+  defp flow_cross_terminal_apply_plan(
+         state,
+         :fail,
+         {child_state, record, next, attrs, partition_key, now_ms}
+       ) do
+    with :ok <- flow_apply_fail_local(child_state, record, next, partition_key, now_ms, attrs) do
+      flow_apply_child_terminal_chain(state, next, "failed", now_ms)
+    end
+  end
+
+  defp flow_cross_terminal_apply_plan(
+         state,
+         :cancel,
+         {child_state, record, next, attrs, partition_key, now_ms}
+       ) do
+    with :ok <- flow_apply_cancel_local(child_state, record, next, attrs, partition_key, now_ms) do
+      flow_apply_child_terminal_chain(state, next, "cancelled", now_ms)
+    end
+  end
+
   defp flow_apply_complete_local(state, record, next, partition_key, now_ms, attrs) do
     plans = [{record, next}]
 
@@ -6456,11 +6593,20 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_maybe_cancel_children_on_parent_closed(state, parent, now_ms) do
-    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(parent, :state)) do
+    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(parent, :state)) or
+         flow_has_resolved_cancel_child_group?(parent) do
       flow_cancel_children_on_parent_closed(state, parent, now_ms)
     else
       :ok
     end
+  end
+
+  defp flow_has_resolved_cancel_child_group?(parent) do
+    parent
+    |> flow_child_groups()
+    |> Enum.any?(fn {_group_id, group} ->
+      not is_nil(Map.get(group, "resolved")) and flow_group_should_cancel_children?(group)
+    end)
   end
 
   defp flow_cancel_children_on_parent_closed(state, parent, now_ms) do
@@ -6491,11 +6637,11 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_group_should_cancel_children?(%{
-         "resolved" => nil,
-         "on_parent_closed" => "cancel_children"
-       }),
-       do: true
+  defp flow_group_should_cancel_children?(%{"on_parent_closed" => "cancel_children"} = group) do
+    group
+    |> Map.get("children", %{})
+    |> Enum.any?(fn {_child_id, status} -> status == "running" end)
+  end
 
   defp flow_group_should_cancel_children?(_group), do: false
 
@@ -6523,12 +6669,13 @@ defmodule Ferricstore.Raft.StateMachine do
 
     summary = Map.get(group, "summary", %{})
     cancelled = Map.get(summary, "cancelled", 0) + length(child_ids)
+    resolved = Map.get(group, "resolved") || "failure"
 
     group
     |> Map.put("children", children)
     |> Map.put("results", flow_child_group_cancelled_results(group, child_ids))
     |> Map.put("summary", Map.put(summary, "cancelled", cancelled))
-    |> Map.put("resolved", "failure")
+    |> Map.put("resolved", resolved)
   end
 
   defp flow_child_group_cancelled_results(group, child_ids) do
@@ -6729,6 +6876,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp maybe_put_group_result_ref(result, _key, nil), do: result
   defp maybe_put_group_result_ref(result, key, value), do: Map.put(result, key, value)
+
+  defp flow_child_group_resolve(%{"wait" => "any"} = group, "completed") do
+    Map.put(group, "resolved", "success")
+  end
 
   defp flow_child_group_resolve(group, status) when status in ["failed", "cancelled"] do
     if Map.get(group, "on_child_failed") == "fail_parent" do

@@ -3201,13 +3201,25 @@ defmodule Ferricstore.Store.Router do
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
     else
-      idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_complete_many, key, %{records: attrs_list}})
+      case flow_cross_terminal_many_keys(ctx, attrs_list) do
+        {:ok, keys} ->
+          flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :complete, attrs_list})
+
+        :same_or_none ->
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_complete_many, key, %{records: attrs_list}})
+      end
     end
   end
 
   def flow_complete_many(ctx, nil, attrs_list) when is_list(attrs_list) do
-    flow_many_by_shard(ctx, attrs_list, :flow_complete_many, "__complete_batch__")
+    case flow_cross_terminal_many_keys(ctx, attrs_list) do
+      {:ok, keys} ->
+        flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :complete, attrs_list})
+
+      :same_or_none ->
+        flow_many_by_shard(ctx, attrs_list, :flow_complete_many, "__complete_batch__")
+    end
   end
 
   @doc false
@@ -3339,13 +3351,25 @@ defmodule Ferricstore.Store.Router do
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
     else
-      idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_fail_many, key, %{records: attrs_list}})
+      case flow_cross_terminal_many_keys(ctx, attrs_list) do
+        {:ok, keys} ->
+          flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :fail, attrs_list})
+
+        :same_or_none ->
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_fail_many, key, %{records: attrs_list}})
+      end
     end
   end
 
   def flow_fail_many(ctx, nil, attrs_list) when is_list(attrs_list) do
-    flow_many_by_shard(ctx, attrs_list, :flow_fail_many, "__fail_batch__")
+    case flow_cross_terminal_many_keys(ctx, attrs_list) do
+      {:ok, keys} ->
+        flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :fail, attrs_list})
+
+      :same_or_none ->
+        flow_many_by_shard(ctx, attrs_list, :flow_fail_many, "__fail_batch__")
+    end
   end
 
   @doc false
@@ -3367,29 +3391,63 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp flow_cross_terminal_keys(ctx, id, partition_key) do
+    case flow_terminal_keys(ctx, id, partition_key) do
+      {:ok, keys} ->
+        if flow_keys_cross_shard?(ctx, keys), do: {:ok, keys}, else: :same_or_none
+
+      :missing ->
+        :same_or_none
+    end
+  end
+
+  defp flow_cross_terminal_many_keys(ctx, attrs_list) do
+    entries =
+      Enum.map(attrs_list, fn
+        %{id: id} = attrs when is_binary(id) and id != "" ->
+          flow_terminal_keys(ctx, id, Map.get(attrs, :partition_key))
+
+        _attrs ->
+          :missing
+      end)
+
+    if Enum.any?(entries, &flow_terminal_key_entry_cross_shard?(ctx, &1)) do
+      keys =
+        entries
+        |> Enum.flat_map(fn
+          {:ok, keys} -> keys
+          :missing -> []
+        end)
+        |> Enum.uniq()
+
+      {:ok, keys}
+    else
+      :same_or_none
+    end
+  end
+
+  defp flow_terminal_key_entry_cross_shard?(ctx, {:ok, keys}),
+    do: flow_keys_cross_shard?(ctx, keys)
+
+  defp flow_terminal_key_entry_cross_shard?(_ctx, _entry), do: false
+
+  defp flow_terminal_keys(ctx, id, partition_key) do
     child_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
     case flow_get(ctx, id, partition_key) do
       value when is_binary(value) ->
         record = Ferricstore.Flow.decode_record(value)
 
-        keys =
-          [child_key]
-          |> flow_maybe_add_parent_key(record)
-          |> flow_add_child_group_keys(record)
-          |> Enum.uniq()
-
-        if flow_keys_cross_shard?(ctx, keys) do
-          {:ok, keys}
-        else
-          :same_or_none
-        end
+        {:ok,
+         [child_key]
+         |> flow_maybe_add_parent_key(record)
+         |> flow_add_child_group_keys(record)
+         |> Enum.uniq()}
 
       _other ->
-        :same_or_none
+        :missing
     end
   rescue
-    _ -> :same_or_none
+    _ -> :missing
   end
 
   defp flow_maybe_add_parent_key(keys, record) do
@@ -3431,13 +3489,25 @@ defmodule Ferricstore.Store.Router do
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
     else
-      idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_cancel_many, key, %{records: attrs_list}})
+      case flow_cross_terminal_many_keys(ctx, attrs_list) do
+        {:ok, keys} ->
+          flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :cancel, attrs_list})
+
+        :same_or_none ->
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_cancel_many, key, %{records: attrs_list}})
+      end
     end
   end
 
   def flow_cancel_many(ctx, nil, attrs_list) when is_list(attrs_list) do
-    flow_many_by_shard(ctx, attrs_list, :flow_cancel_many, "__cancel_batch__")
+    case flow_cross_terminal_many_keys(ctx, attrs_list) do
+      {:ok, keys} ->
+        flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :cancel, attrs_list})
+
+      :same_or_none ->
+        flow_many_by_shard(ctx, attrs_list, :flow_cancel_many, "__cancel_batch__")
+    end
   end
 
   @doc false

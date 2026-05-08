@@ -272,6 +272,84 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     refute File.exists?(tx_log_path)
   end
 
+  test "standalone prepared Flow child terminal tx rolls forward on restart", %{tmp_dir: tmp_dir} do
+    test_pid = self()
+    ctx = FerricStore.Instance.get(:default)
+    parent = "standalone-flow-parent-recover:#{System.unique_integer([:positive])}"
+    child = "standalone-flow-child-recover:#{System.unique_integer([:positive])}"
+    parent_partition = "standalone-flow-parent-partition"
+
+    parent_shard =
+      Router.shard_for(ctx, Ferricstore.Flow.Keys.state_key(parent, parent_partition))
+
+    child_partition = flow_partition_on_different_shard(ctx, child, parent_shard)
+    tx_log_path = Path.join(tmp_dir, "standalone_cross_shard_tx.log")
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: parent_partition
+             )
+
+    assert {:ok, _waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child, type: "child", partition_key: child_partition}],
+               group_id: "fanout",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :ignore,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               partition_key: parent_partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    assert {:ok, spawned_child} = FerricStore.flow_get(child, partition_key: child_partition)
+
+    Application.put_env(:ferricstore, :standalone_cross_shard_tx_hook, fn
+      {:prepared, _txid, _groups} ->
+        send(test_pid, :standalone_flow_cross_shard_tx_prepared)
+        {:error, :simulated_crash_after_flow_prepare}
+
+      _event ->
+        :ok
+    end)
+
+    assert {:error, reason} =
+             FerricStore.flow_cancel(child,
+               partition_key: child_partition,
+               fencing_token: spawned_child.fencing_token,
+               reason: "cancelled for recovery test"
+             )
+
+    assert inspect(reason) =~ "standalone"
+    assert_receive :standalone_flow_cross_shard_tx_prepared, 5_000
+    assert File.exists?(tx_log_path)
+
+    assert {:ok, still_waiting} = FerricStore.flow_get(parent, partition_key: parent_partition)
+    assert still_waiting.state == "waiting_children"
+
+    Application.delete_env(:ferricstore, :standalone_cross_shard_tx_hook)
+
+    assert :ok = Application.stop(:ferricstore)
+    stop_ra_system()
+    {:ok, _} = Application.ensure_all_started(:ferricstore)
+    wait_local_shards_alive()
+
+    assert {:ok, done_parent} = FerricStore.flow_get(parent, partition_key: parent_partition)
+    assert done_parent.state == "children_done"
+    assert done_parent.child_groups["fanout"]["children"][child] == "cancelled"
+
+    assert {:ok, done_child} = FerricStore.flow_get(child, partition_key: child_partition)
+    assert done_child.state == "cancelled"
+    refute File.exists?(tx_log_path)
+  after
+    Application.delete_env(:ferricstore, :standalone_cross_shard_tx_hook)
+  end
+
   test "standalone cross-shard tx log fsyncs parent directory", %{tmp_dir: tmp_dir} do
     parent = self()
 
@@ -1152,6 +1230,15 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     Enum.find_value(1..10_000, fn i ->
       key = "standalone:same-shard:#{i}"
       if Router.shard_for(ctx, key) == shard_idx, do: key
+    end)
+  end
+
+  defp flow_partition_on_different_shard(ctx, flow_id, shard_idx) do
+    Enum.find_value(1..10_000, fn i ->
+      partition = "standalone:flow:other-shard:#{i}"
+      key = Ferricstore.Flow.Keys.state_key(flow_id, partition)
+
+      if Router.shard_for(ctx, key) != shard_idx, do: partition
     end)
   end
 

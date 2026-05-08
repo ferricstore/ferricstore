@@ -2483,7 +2483,7 @@ defmodule Ferricstore.Flow do
          :ok <- validate_children(children),
          {:ok, partition_key} <- required_partition_key(Keyword.get(opts, :partition_key)),
          {:ok, group_id} <- required_binary(opts, :group_id),
-         {:ok, wait} <- optional_child_policy(opts, :wait, :all, [:all, :none]),
+         {:ok, wait} <- optional_child_policy(opts, :wait, :all, [:all, :any, :none]),
          {:ok, on_child_failed} <-
            optional_child_policy(opts, :on_child_failed, :fail_parent, [
              :fail_parent,

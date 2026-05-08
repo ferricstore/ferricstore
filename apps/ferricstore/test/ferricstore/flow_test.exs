@@ -1506,6 +1506,292 @@ defmodule Ferricstore.FlowTest do
     assert final_parent.child_groups["fanout"]["children"][child] == "cancelled"
   end
 
+  test "flow_complete_many resolves cross-shard child groups" do
+    parent = uid("flow-parent-cross-complete-many")
+    child_a = uid("flow-child-cross-complete-many-a")
+    child_b = uid("flow-child-cross-complete-many-b")
+    {partition, same_partition, other_partition} = mixed_partition_keys()
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    assert {:ok, _waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [
+                 %{id: child_a, type: "child", partition_key: same_partition},
+                 %{id: child_b, type: "child", partition_key: other_partition}
+               ],
+               group_id: "fanout",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :ignore,
+               on_parent_closed: :abandon_children,
+               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    claimed_a = create_claimed_flow_child(child_a, same_partition, "worker-cross-a")
+    claimed_b = create_claimed_flow_child(child_b, other_partition, "worker-cross-b")
+
+    assert {:ok, completed} =
+             FerricStore.flow_complete_many(
+               nil,
+               [
+                 %{
+                   id: child_a,
+                   partition_key: same_partition,
+                   lease_token: claimed_a.lease_token,
+                   fencing_token: claimed_a.fencing_token
+                 },
+                 %{
+                   id: child_b,
+                   partition_key: other_partition,
+                   lease_token: claimed_b.lease_token,
+                   fencing_token: claimed_b.fencing_token
+                 }
+               ],
+               now_ms: 8_000
+             )
+
+    assert Enum.map(completed, & &1.state) == ["completed", "completed"]
+
+    assert {:ok, done_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert done_parent.state == "children_done"
+    assert done_parent.child_groups["fanout"]["resolved"] == "success"
+    assert done_parent.child_groups["fanout"]["summary"]["completed"] == 2
+  end
+
+  test "Raft routing resolves cross-shard child terminal propagation" do
+    previous_mode = Ferricstore.ReplicationMode.current()
+    Ferricstore.ReplicationMode.put_current(:raft)
+
+    parent = uid("flow-parent-raft-cross")
+    child = uid("flow-child-raft-cross")
+    {partition, _same_partition, other_partition} = mixed_partition_keys()
+
+    try do
+      assert {:ok, created_parent} =
+               FerricStore.flow_create(parent,
+                 type: "parent",
+                 state: "dispatch",
+                 partition_key: partition
+               )
+
+      assert {:ok, _waiting} =
+               FerricStore.flow_spawn_children(
+                 parent,
+                 [%{id: child, type: "child", partition_key: other_partition}],
+                 group_id: "fanout",
+                 wait: :all,
+                 wait_state: "waiting_children",
+                 on_child_failed: :fail_parent,
+                 on_parent_closed: :cancel_children,
+                 exhaust_to: %{success: "children_done", failure: "children_failed"},
+                 partition_key: partition,
+                 from_state: "dispatch",
+                 fencing_token: created_parent.fencing_token
+               )
+
+      claimed = create_claimed_flow_child(child, other_partition, "worker-raft-cross")
+
+      assert {:ok, %{id: ^child, state: "completed"}} =
+               FerricStore.flow_complete(child, claimed.lease_token,
+                 partition_key: other_partition,
+                 fencing_token: claimed.fencing_token
+               )
+
+      assert {:ok, done_parent} = FerricStore.flow_get(parent, partition_key: partition)
+      assert done_parent.state == "children_done"
+      assert done_parent.child_groups["fanout"]["children"][child] == "completed"
+    after
+      Ferricstore.ReplicationMode.put_current(previous_mode)
+    end
+  end
+
+  test "cross-shard nested child completion resolves parent and grandparent" do
+    grandparent = uid("flow-grandparent-cross")
+    middle = uid("flow-middle-cross")
+    leaf = uid("flow-leaf-cross")
+    {grand_partition, middle_partition, leaf_partition} = mixed_partition_keys()
+
+    assert {:ok, created_grandparent} =
+             FerricStore.flow_create(grandparent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: grand_partition
+             )
+
+    assert {:ok, _waiting_grandparent} =
+             FerricStore.flow_spawn_children(
+               grandparent,
+               [%{id: middle, type: "child", state: "dispatch", partition_key: middle_partition}],
+               group_id: "outer",
+               wait: :all,
+               wait_state: "waiting_middle",
+               on_child_failed: :fail_parent,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "completed", failure: "failed"},
+               partition_key: grand_partition,
+               from_state: "dispatch",
+               fencing_token: created_grandparent.fencing_token
+             )
+
+    assert {:ok, middle_record} = FerricStore.flow_get(middle, partition_key: middle_partition)
+
+    assert {:ok, _waiting_middle} =
+             FerricStore.flow_spawn_children(
+               middle,
+               [%{id: leaf, type: "child", partition_key: leaf_partition}],
+               group_id: "inner",
+               wait: :all,
+               wait_state: "waiting_leaf",
+               on_child_failed: :fail_parent,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "completed", failure: "failed"},
+               partition_key: middle_partition,
+               from_state: "dispatch",
+               fencing_token: middle_record.fencing_token
+             )
+
+    claimed_leaf = create_claimed_flow_child(leaf, leaf_partition, "worker-cross-leaf")
+
+    assert {:ok, _leaf_done} =
+             FerricStore.flow_complete(leaf, claimed_leaf.lease_token,
+               partition_key: leaf_partition,
+               fencing_token: claimed_leaf.fencing_token
+             )
+
+    assert {:ok, resolved_middle} = FerricStore.flow_get(middle, partition_key: middle_partition)
+    assert resolved_middle.state == "completed"
+    assert resolved_middle.child_groups["inner"]["resolved"] == "success"
+
+    assert {:ok, resolved_grandparent} =
+             FerricStore.flow_get(grandparent, partition_key: grand_partition)
+
+    assert resolved_grandparent.state == "completed"
+    assert resolved_grandparent.child_groups["outer"]["children"][middle] == "completed"
+  end
+
+  test "flow_spawn_children wait any resolves on first successful child across shards" do
+    parent = uid("flow-parent-any-cross")
+    child_a = uid("flow-child-any-cross-a")
+    child_b = uid("flow-child-any-cross-b")
+    {partition, same_partition, other_partition} = mixed_partition_keys()
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    assert {:ok, waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [
+                 %{id: child_a, type: "child", partition_key: same_partition},
+                 %{id: child_b, type: "child", partition_key: other_partition}
+               ],
+               group_id: "fanout",
+               wait: :any,
+               wait_state: "waiting_children",
+               on_child_failed: :ignore,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "completed", failure: "children_failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    assert waiting.state == "waiting_children"
+
+    claimed_b = create_claimed_flow_child(child_b, other_partition, "worker-cross-any")
+
+    assert {:ok, _child_done} =
+             FerricStore.flow_complete(child_b, claimed_b.lease_token,
+               partition_key: other_partition,
+               fencing_token: claimed_b.fencing_token
+             )
+
+    assert {:ok, done_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert done_parent.state == "completed"
+    assert done_parent.child_groups["fanout"]["resolved"] == "success"
+    assert done_parent.child_groups["fanout"]["children"][child_b] == "completed"
+
+    assert {:ok, cancelled_sibling} = FerricStore.flow_get(child_a, partition_key: same_partition)
+    assert cancelled_sibling.state == "cancelled"
+  end
+
+  test "flow_fail_many fail_parent policy closes parent and cancels cross-shard siblings" do
+    parent = uid("flow-parent-cross-fail-many")
+    failed_child = uid("flow-child-cross-fail-many-failed")
+    sibling = uid("flow-child-cross-fail-many-sibling")
+    {partition, same_partition, other_partition} = mixed_partition_keys()
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    assert {:ok, _waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [
+                 %{id: failed_child, type: "child", partition_key: other_partition},
+                 %{id: sibling, type: "child", partition_key: same_partition}
+               ],
+               group_id: "fanout",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :fail_parent,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    claimed_failed = create_claimed_flow_child(failed_child, other_partition, "worker-cross-fail")
+
+    assert {:ok, [%{id: ^failed_child, state: "failed"}]} =
+             FerricStore.flow_fail_many(
+               nil,
+               [
+                 %{
+                   id: failed_child,
+                   partition_key: other_partition,
+                   lease_token: claimed_failed.lease_token,
+                   fencing_token: claimed_failed.fencing_token
+                 }
+               ],
+               error: "boom"
+             )
+
+    assert {:ok, failed_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert failed_parent.state == "children_failed"
+    assert failed_parent.child_groups["fanout"]["resolved"] == "failure"
+    assert failed_parent.child_groups["fanout"]["children"][failed_child] == "failed"
+    assert failed_parent.child_groups["fanout"]["children"][sibling] == "cancelled"
+
+    assert {:ok, cancelled_sibling} = FerricStore.flow_get(sibling, partition_key: same_partition)
+    assert cancelled_sibling.state == "cancelled"
+
+    assert {:ok, parent_history} = FerricStore.flow_history(parent, partition_key: partition)
+
+    parent_events = Enum.map(parent_history, fn {_event_id, fields} -> fields["event"] end)
+    assert "child_failed" in parent_events
+    assert "children_cancelled" in parent_events
+  end
+
   test "flow_create_many spans shards and rolls back failing shard group" do
     {same_a, same_b, other} = mixed_partition_keys()
     type = uid("bulk-mixed-create")

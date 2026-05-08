@@ -221,7 +221,7 @@ defmodule Ferricstore.Commands.FlowTest do
                  "FENCING",
                  Integer.to_string(fencing_token),
                  "WAIT",
-                 "all",
+                 "any",
                  "ON_CHILD_FAILED",
                  "fail_parent",
                  "ON_PARENT_CLOSED",
@@ -247,6 +247,7 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert child_groups["fanout"]["wait"] == "any"
     assert child_groups["fanout"]["children"][child_a] == "running"
     assert child_groups["fanout"]["children"][child_b] == "running"
 
