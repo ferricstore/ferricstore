@@ -5224,8 +5224,7 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "completed", now_ms),
-         :ok <- flow_history_trim(state, next),
-         :ok <- maybe_queue_terminal_lmdb_history_indexes(state, next) do
+         :ok <- flow_after_history_put(state, next) do
       :ok
     end
   end
@@ -5406,8 +5405,7 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "transitioned", now_ms),
-         :ok <- flow_history_trim(state, next),
-         :ok <- maybe_queue_terminal_lmdb_history_indexes(state, next) do
+         :ok <- flow_after_history_put(state, next) do
       :ok
     end
   end
@@ -5597,8 +5595,7 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "retry", now_ms, history_meta),
-         :ok <- flow_history_trim(state, next),
-         :ok <- maybe_queue_terminal_lmdb_history_indexes(state, next) do
+         :ok <- flow_after_history_put(state, next) do
       :ok
     end
   end
@@ -5725,8 +5722,7 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "failed", now_ms),
-         :ok <- flow_history_trim(state, next),
-         :ok <- maybe_queue_terminal_lmdb_history_indexes(state, next) do
+         :ok <- flow_after_history_put(state, next) do
       :ok
     end
   end
@@ -5824,7 +5820,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_apply_cancel(state, record, next, partition_key, now_ms) do
     plans = [{record, next}]
 
-    with :ok <- flow_transition_move_indexes(state, plans),
+    with :ok <- flow_refresh_terminal_value_expirations(state, next, %{}),
+         :ok <- flow_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
              state,
@@ -5832,8 +5829,7 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "cancelled", now_ms),
-         :ok <- flow_history_trim(state, next),
-         :ok <- maybe_queue_terminal_lmdb_history_indexes(state, next) do
+         :ok <- flow_after_history_put(state, next) do
       :ok
     end
   end
@@ -5868,7 +5864,8 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_cancel_many_apply(state, plans) do
-    with :ok <- flow_transition_move_indexes(state, plans),
+    with :ok <- flow_refresh_many_terminal_value_expirations(state, plans),
+         :ok <- flow_transition_move_indexes(state, plans),
          :ok <- flow_claim_put_state_records(state, plans),
          :ok <- flow_many_put_history(state, plans, "cancelled") do
       :ok
@@ -5889,6 +5886,7 @@ defmodule Ferricstore.Raft.StateMachine do
       with :ok <- flow_validate_record_keys(record),
            :ok <- flow_validate_record_keys(next),
            :ok <- flow_transition_move_indexes(state, [{record, next}]),
+           :ok <- flow_refresh_record_value_expirations(state, next, %{}),
            :ok <-
              flow_put_state_record(
                state,
@@ -5896,8 +5894,7 @@ defmodule Ferricstore.Raft.StateMachine do
                next
              ),
            :ok <- flow_history_put_planned(state, record, next, "rewound", now_ms),
-           :ok <- flow_history_trim(state, next),
-           :ok <- maybe_queue_terminal_lmdb_history_indexes(state, next) do
+           :ok <- flow_after_history_put(state, next) do
         {:ok, Map.delete(next, :rewound_to_event_id)}
       end
     end
@@ -6258,12 +6255,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
     flow_history_index_put_entries(state, history_entries)
 
-    Enum.each(plans, fn {_record, next} ->
-      flow_history_trim(state, next)
-      maybe_queue_terminal_lmdb_history_indexes(state, next)
-    end)
-
-    :ok
+    plans
+    |> Enum.map(fn {_record, next} -> next end)
+    |> flow_after_history_put_many(state)
   end
 
   defp flow_transition_put_history(state, plans) do
@@ -6284,12 +6278,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
     flow_history_index_put_entries(state, history_entries)
 
-    Enum.each(plans, fn {_record, next} ->
-      flow_history_trim(state, next)
-      maybe_queue_terminal_lmdb_history_indexes(state, next)
-    end)
-
-    :ok
+    plans
+    |> Enum.map(fn {_record, next} -> next end)
+    |> flow_after_history_put_many(state)
   end
 
   defp flow_retry_many_put_history(state, plans) do
@@ -6307,12 +6298,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
     flow_history_index_put_entries(state, history_entries)
 
-    Enum.each(plans, fn {_record, next, _history_meta} ->
-      flow_history_trim(state, next)
-      maybe_queue_terminal_lmdb_history_indexes(state, next)
-    end)
-
-    :ok
+    plans
+    |> Enum.map(fn {_record, next, _history_meta} -> next end)
+    |> flow_after_history_put_many(state)
   end
 
   defp flow_create_put_history(state, records) do
@@ -6327,10 +6315,9 @@ defmodule Ferricstore.Raft.StateMachine do
         )
       end)
 
-    flow_history_index_put_entries(state, history_entries)
-    Enum.each(records, &flow_history_trim(state, &1))
-
-    :ok
+    with :ok <- flow_history_index_put_entries(state, history_entries) do
+      flow_after_history_put_many(records, state)
+    end
   end
 
   defp flow_require_record(state, id, partition_key) do
@@ -7343,6 +7330,22 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_history_trim(_state, _record), do: :ok
 
+  defp flow_after_history_put_many(records, state) do
+    Enum.reduce_while(records, :ok, fn record, :ok ->
+      case flow_after_history_put(state, record) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_after_history_put(state, record) do
+    with :ok <- flow_history_trim(state, record),
+         :ok <- flow_refresh_terminal_history_expirations(state, record) do
+      maybe_queue_terminal_lmdb_history_indexes(state, record)
+    end
+  end
+
   defp flow_history_trim_oldest(state, record, id, partition_key, history_key, delete_count) do
     events = flow_index_rank_range(state, history_key, 0, delete_count - 1, false)
 
@@ -7356,6 +7359,52 @@ defmodule Ferricstore.Raft.StateMachine do
     flow_index_delete_members(state, history_key, event_ids)
 
     :ok
+  end
+
+  defp flow_refresh_terminal_history_expirations(state, record) do
+    expire_at_ms = flow_record_expire_at(record)
+
+    if expire_at_ms > 0 and Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+      id = Map.fetch!(record, :id)
+      partition_key = Map.get(record, :partition_key)
+      history_key = FlowKeys.history_key(id, partition_key)
+      prefix = "X:" <> history_key <> <<0>>
+
+      keys = flow_history_keys_for_prefix(state, prefix)
+      values = sm_store_batch_get(state, keys, &sm_file_path/2)
+
+      keys
+      |> Enum.zip(values)
+      |> Enum.reduce_while(:ok, fn
+        {key, value}, :ok when is_binary(value) ->
+          with :ok <- flow_validate_key_size(key),
+               :ok <- raw_put_cold(state, key, value, expire_at_ms) do
+            {:cont, :ok}
+          else
+            {:error, _reason} = error -> {:halt, error}
+          end
+
+        _entry, :ok ->
+          {:cont, :ok}
+      end)
+    else
+      :ok
+    end
+  end
+
+  defp flow_history_keys_for_prefix(state, prefix) do
+    prefix_len = byte_size(prefix)
+
+    match_spec = [
+      {{:"$1", :_, :_, :_, :_, :_, :_},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+       ], [:"$1"]}
+    ]
+
+    :ets.select(state.ets, match_spec)
   end
 
   defp maybe_queue_terminal_lmdb_history_indexes(state, record) do
@@ -7435,34 +7484,55 @@ defmodule Ferricstore.Raft.StateMachine do
     expire_at_ms = flow_record_expire_at(record)
 
     if expire_at_ms > 0 and Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-      refs =
-        [:payload, :result, :error]
-        |> Enum.reject(&Map.has_key?(attrs, &1))
-        |> Enum.map(fn kind -> Map.get(record, flow_value_ref_field(kind)) end)
-        |> Enum.filter(&(is_binary(&1) and &1 != ""))
-
-      values = sm_store_batch_get(state, refs, &sm_file_path/2)
-
-      refs
-      |> Enum.zip(values)
-      |> Enum.reduce_while(:ok, fn
-        {_key, nil}, :ok ->
-          {:cont, :ok}
-
-        {key, value}, :ok when is_binary(value) ->
-          with :ok <- flow_validate_key_size(key),
-               :ok <- raw_put_cold(state, key, value, expire_at_ms) do
-            {:cont, :ok}
-          else
-            {:error, _reason} = error -> {:halt, error}
-          end
-
-        {_key, _value}, :ok ->
-          {:cont, :ok}
-      end)
+      flow_refresh_record_value_expirations(state, record, attrs)
     else
       :ok
     end
+  end
+
+  defp flow_refresh_record_value_expirations(state, record, attrs) do
+    refs =
+      [:payload, :result, :error]
+      |> Enum.reject(&Map.has_key?(attrs, &1))
+      |> Enum.map(fn kind -> Map.get(record, flow_value_ref_field(kind)) end)
+      |> Enum.filter(&(is_binary(&1) and &1 != ""))
+
+    values = sm_store_batch_get(state, refs, &sm_file_path/2)
+    expire_at_ms = flow_record_expire_at(record)
+
+    refs
+    |> Enum.zip(values)
+    |> Enum.reduce_while(:ok, fn
+      {_key, nil}, :ok ->
+        {:cont, :ok}
+
+      {key, value}, :ok when is_binary(value) ->
+        with :ok <- flow_validate_key_size(key),
+             :ok <- raw_put_cold(state, key, value, expire_at_ms) do
+          {:cont, :ok}
+        else
+          {:error, _reason} = error -> {:halt, error}
+        end
+
+      {_key, _value}, :ok ->
+        {:cont, :ok}
+    end)
+  end
+
+  defp flow_refresh_many_terminal_value_expirations(state, plans) do
+    Enum.reduce_while(plans, :ok, fn
+      {_record, next}, :ok ->
+        case flow_refresh_terminal_value_expirations(state, next, %{}) do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+
+      {_record, next, attrs}, :ok ->
+        case flow_refresh_terminal_value_expirations(state, next, attrs) do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+    end)
   end
 
   defp flow_create_put_record_values(state, plans) do

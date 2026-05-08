@@ -6477,7 +6477,7 @@ fn flow_terminal_option<'a>(
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
             (b"RESULT", "result", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
-            (b"TTL", "ttl_ms", FlowOptType::NonNegative),
+            (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -6498,7 +6498,7 @@ fn flow_complete_many_option<'a>(
         &[
             (b"RESULT", "result", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
-            (b"TTL", "ttl_ms", FlowOptType::NonNegative),
+            (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
         ],
     )
@@ -6562,7 +6562,7 @@ fn flow_fail_many_option<'a>(
         &[
             (b"ERROR", "error", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
-            (b"TTL", "ttl_ms", FlowOptType::NonNegative),
+            (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -6582,7 +6582,7 @@ fn flow_cancel_many_option<'a>(
         idx,
         &[
             (b"REASON_REF", "reason_ref", FlowOptType::Ref(b"reason_ref")),
-            (b"TTL", "ttl_ms", FlowOptType::NonNegative),
+            (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -6646,7 +6646,7 @@ fn flow_fail_option<'a>(
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
             (b"ERROR", "error", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
-            (b"TTL", "ttl_ms", FlowOptType::NonNegative),
+            (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -6668,7 +6668,7 @@ fn flow_cancel_option<'a>(
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
             (b"LEASE_TOKEN", "lease_token", FlowOptType::Binary),
             (b"REASON_REF", "reason_ref", FlowOptType::Ref(b"reason_ref")),
-            (b"TTL", "ttl_ms", FlowOptType::NonNegative),
+            (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],

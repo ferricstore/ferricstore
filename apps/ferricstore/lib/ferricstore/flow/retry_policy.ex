@@ -468,14 +468,20 @@ defmodule Ferricstore.Flow.RetryPolicy do
     end
   end
 
-  defp validate_history_hot_max_events(value)
-       when is_integer(value) and value > 0 and value <= @max_history_hot_max_events,
-       do: {:ok, value}
+  defp validate_history_hot_max_events(value) when is_integer(value) and value > 0 do
+    max = max_history_hot_max_events()
 
-  defp validate_history_hot_max_events(_value),
-    do:
-      {:error,
-       "ERR flow retention history_hot_max_events must be between 1 and #{@max_history_hot_max_events}"}
+    if value <= max do
+      {:ok, value}
+    else
+      {:error, "ERR flow retention history_hot_max_events must be between 1 and #{max}"}
+    end
+  end
+
+  defp validate_history_hot_max_events(_value) do
+    max = max_history_hot_max_events()
+    {:error, "ERR flow retention history_hot_max_events must be between 1 and #{max}"}
+  end
 
   defp default_retention_ttl_ms do
     case Application.get_env(

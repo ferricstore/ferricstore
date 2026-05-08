@@ -2729,7 +2729,7 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
-         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms) do
+         {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms) do
       attrs =
         %{
           id: id,
@@ -2779,7 +2779,7 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
-         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms) do
+         {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms) do
       attrs =
         %{
           id: id,
@@ -2805,7 +2805,7 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
-         {:ok, ttl_ms} <- optional_non_neg_integer_or_nil(opts, :ttl_ms),
+         {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms),
          {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
          :ok <- validate_ref_size(:reason_ref, reason_ref) do
       attrs =
@@ -3942,6 +3942,14 @@ defmodule Ferricstore.Flow do
       nil -> {:ok, nil}
       value when is_integer(value) and value >= 0 -> {:ok, value}
       _ -> {:error, "ERR flow #{key} must be a non-negative integer"}
+    end
+  end
+
+  defp optional_pos_integer_or_nil(opts, key) do
+    case Keyword.get(opts, key, nil) do
+      nil -> {:ok, nil}
+      value when is_integer(value) and value > 0 -> {:ok, value}
+      _ -> {:error, "ERR flow #{key} must be a positive integer"}
     end
   end
 

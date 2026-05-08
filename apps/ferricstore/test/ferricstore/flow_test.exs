@@ -3992,6 +3992,64 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, nil} = FerricStore.flow_get(id)
   end
 
+  test "terminal retention expires queryable flow history" do
+    id = uid("flow-terminal-history-ttl")
+
+    assert {:ok, _created} =
+             FerricStore.flow_create(id,
+               type: "history-ttl",
+               payload: %{input: 1},
+               run_at_ms: 1_000,
+               retention_ttl_ms: 20,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [_created_event]} = FerricStore.flow_history(id, count: 10)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("history-ttl",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token
+             )
+
+    Process.sleep(40)
+
+    assert {:ok, nil} = FerricStore.flow_get(id)
+    assert {:ok, []} = FerricStore.flow_history(id, count: 10)
+  end
+
+  test "terminal ttl override must be positive" do
+    id = uid("flow-terminal-ttl-zero")
+
+    assert {:ok, _created} =
+             FerricStore.flow_create(id,
+               type: "ttl-zero",
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("ttl-zero",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:error, "ERR flow ttl_ms must be a positive integer"} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               ttl_ms: 0
+             )
+  end
+
   test "flow create inherits retention defaults from policy" do
     type = uid("flow-retention-policy")
     id = uid("flow-retention-policy-id")
@@ -4007,6 +4065,20 @@ defmodule Ferricstore.FlowTest do
     assert created.retention_ttl_ms == 5_000
     assert created.history_hot_max_events == 3
     assert created.terminal_retention_until_ms == nil
+  end
+
+  test "flow policy retention history hot max respects configured maximum" do
+    original = Application.get_env(:ferricstore, :flow_max_history_hot_max_events)
+    Application.put_env(:ferricstore, :flow_max_history_hot_max_events, 2)
+
+    on_exit(fn -> restore_env(:flow_max_history_hot_max_events, original) end)
+
+    type = uid("flow-policy-hot-cap")
+
+    assert {:error, "ERR flow retention history_hot_max_events must be between 1 and 2"} =
+             FerricStore.flow_policy_set(type,
+               retention: [ttl_ms: 5_000, history_hot_max_events: 3]
+             )
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)

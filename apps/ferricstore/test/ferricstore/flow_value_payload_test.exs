@@ -202,6 +202,83 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert {:ok, nil} = FerricStore.get(created.payload_ref)
   end
 
+  test "cancel terminal retention expires generated payload value refs" do
+    id = unique_id("flow-value-cancel-retention")
+
+    assert {:ok, created} =
+             FerricStore.flow_create(id,
+               type: "value-cancel-retention",
+               partition_key: "tenant-retention",
+               payload: %{large: String.duplicate("x", 256)},
+               retention_ttl_ms: 20,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, value_blob} = FerricStore.get(created.payload_ref)
+    assert is_binary(value_blob)
+
+    assert {:ok, _cancelled} =
+             FerricStore.flow_cancel(id,
+               partition_key: "tenant-retention",
+               fencing_token: created.fencing_token
+             )
+
+    Process.sleep(40)
+
+    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
+    assert {:ok, nil} = FerricStore.get(created.payload_ref)
+  end
+
+  test "rewind from terminal back to active clears value ref expiration" do
+    id = unique_id("flow-value-rewind-retention")
+
+    assert {:ok, created} =
+             FerricStore.flow_create(id,
+               type: "value-rewind-retention",
+               partition_key: "tenant-retention",
+               payload: %{large: String.duplicate("x", 256)},
+               retention_ttl_ms: 20,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [{created_event_id, _fields}]} =
+             FerricStore.flow_history(id, partition_key: "tenant-retention", count: 10)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("value-rewind-retention",
+               partition_key: "tenant-retention",
+               worker: "worker-retention",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, _completed} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               partition_key: "tenant-retention",
+               fencing_token: claimed.fencing_token
+             )
+
+    assert {:ok, rewound} =
+             FerricStore.flow_rewind(id,
+               partition_key: "tenant-retention",
+               to_event: created_event_id
+             )
+
+    assert rewound.state == created.state
+    assert rewound.payload_ref == created.payload_ref
+
+    Process.sleep(40)
+
+    assert {:ok, fetched} =
+             FerricStore.flow_get(id, partition_key: "tenant-retention", full: true)
+
+    assert fetched.state == created.state
+    assert fetched.payload == %{large: String.duplicate("x", 256)}
+    assert {:ok, value_blob} = FerricStore.get(created.payload_ref)
+    assert is_binary(value_blob)
+  end
+
   test "batch APIs also persist full value fields" do
     partition = "tenant-b"
     type = "value-batch"
