@@ -22,6 +22,9 @@ defmodule FerricstoreServer.Connection.Sendfile do
   @spec threshold_bytes() :: pos_integer()
   def threshold_bytes, do: @sendfile_threshold_bytes
 
+  @spec file_stream_chunk_bytes() :: pos_integer()
+  def file_stream_chunk_bytes, do: @file_stream_chunk_bytes
+
   @doc """
   Handles the GET command with sendfile optimization for `:ranch_tcp` transport
   and bounded chunk streaming for encrypted transports.

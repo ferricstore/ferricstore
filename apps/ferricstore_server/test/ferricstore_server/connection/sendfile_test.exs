@@ -10,6 +10,13 @@ defmodule FerricstoreServer.Connection.SendfileTest do
   alias FerricstoreServer.Connection.Sendfile
   alias FerricstoreServer.Resp.Parser
 
+  defmodule FakeTlsTransport do
+    def send(test_pid, iodata) do
+      Kernel.send(test_pid, {:fake_tls_send, IO.iodata_to_binary(iodata)})
+      :ok
+    end
+  end
+
   setup do
     ClientTracking.init_tables()
     ActiveFile.init(1)
@@ -24,6 +31,70 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     end)
 
     {:ok, ctx: ctx}
+  end
+
+  test "encrypted file ref response streams bounded chunks instead of one large binary" do
+    chunk_bytes = Sendfile.file_stream_chunk_bytes()
+    value = IO.iodata_to_binary([:binary.copy("a", chunk_bytes), :binary.copy("b", 17)])
+    path = write_tmp_file!(value)
+
+    state = %{
+      socket: self(),
+      transport: FakeTlsTransport,
+      client_id: :test_client,
+      tracking: nil
+    }
+
+    assert {:sent, ^state} =
+             Sendfile.send_file_ref_response("k", path, 0, byte_size(value), state)
+
+    sends = collect_fake_tls_sends()
+
+    assert List.first(sends) ==
+             ["$", Integer.to_string(byte_size(value)), "\r\n"] |> IO.iodata_to_binary()
+
+    assert List.last(sends) == "\r\n"
+
+    chunks = sends |> Enum.drop(1) |> Enum.drop(-1)
+    assert length(chunks) == 2
+    assert Enum.all?(chunks, &(byte_size(&1) <= chunk_bytes))
+    assert IO.iodata_to_binary(chunks) == value
+  end
+
+  test "encrypted file range response streams only the requested range in bounded chunks" do
+    chunk_bytes = Sendfile.file_stream_chunk_bytes()
+    prefix = :binary.copy("p", 9)
+    range = IO.iodata_to_binary([:binary.copy("r", chunk_bytes), :binary.copy("s", 23)])
+    suffix = :binary.copy("z", 11)
+    path = write_tmp_file!(IO.iodata_to_binary([prefix, range, suffix]))
+
+    state = %{
+      socket: self(),
+      transport: FakeTlsTransport,
+      client_id: :test_client,
+      tracking: nil
+    }
+
+    assert {:sent, ^state} =
+             Sendfile.send_file_range_response(
+               ["k", "9", Integer.to_string(9 + byte_size(range) - 1)],
+               path,
+               byte_size(prefix),
+               byte_size(range),
+               state
+             )
+
+    sends = collect_fake_tls_sends()
+
+    assert List.first(sends) ==
+             ["$", Integer.to_string(byte_size(range)), "\r\n"] |> IO.iodata_to_binary()
+
+    assert List.last(sends) == "\r\n"
+
+    chunks = sends |> Enum.drop(1) |> Enum.drop(-1)
+    assert length(chunks) == 2
+    assert Enum.all?(chunks, &(byte_size(&1) <= chunk_bytes))
+    assert IO.iodata_to_binary(chunks) == range
   end
 
   test "MGET reuses prefetched cold values below stream threshold instead of dispatching again",
@@ -132,5 +203,25 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     {:ok, server_socket} = Task.await(acceptor)
     :gen_tcp.close(listen)
     {server_socket, client_socket}
+  end
+
+  defp write_tmp_file!(value) do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_sendfile_test_#{System.unique_integer([:positive, :monotonic])}.bin"
+      )
+
+    File.write!(path, value)
+    on_exit(fn -> File.rm(path) end)
+    path
+  end
+
+  defp collect_fake_tls_sends(acc \\ []) do
+    receive do
+      {:fake_tls_send, data} -> collect_fake_tls_sends([data | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 end
