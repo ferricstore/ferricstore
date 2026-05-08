@@ -680,7 +680,7 @@ defmodule FerricstoreServer.Acl do
   """
   @spec protected_mode?() :: boolean()
   def protected_mode? do
-    Application.get_env(:ferricstore, :protected_mode, false)
+    Application.get_env(:ferricstore, :protected_mode, true)
   end
 
   @doc """

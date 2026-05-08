@@ -619,9 +619,9 @@ defmodule FerricstoreServer.Resp.ParserTest do
     test "parses pubsub and transaction command arguments into Rust AST" do
       assert {:ok,
               [
-                {:command, "SUBSCRIBE", ["a", "b"], {:subscribe, ["a", "b"]}, []},
+                {:command, "SUBSCRIBE", ["a", "b"], {:subscribe, ["a", "b"]}, ["a", "b"]},
                 {:command, "UNSUBSCRIBE", [], {:unsubscribe, []}, []},
-                {:command, "PSUBSCRIBE", ["p*"], {:psubscribe, ["p*"]}, []},
+                {:command, "PSUBSCRIBE", ["p*"], {:psubscribe, ["p*"]}, ["p*"]},
                 {:command, "PUNSUBSCRIBE", [], {:punsubscribe, []}, []},
                 {:command, "MULTI", [], :multi, []},
                 {:command, "EXEC", [], :exec, []},
@@ -693,6 +693,28 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "memory usage k\r\n" <>
                    "ferricstore.config set p ttl 1\r\n" <>
                    "pubsub channels\r\n"
+               )
+    end
+
+    test "extracts pubsub channels and patterns as ACL keys" do
+      assert {:ok,
+              [
+                {:command, "PUBLISH", ["tenant:a", "msg"], {:publish, ["tenant:a", "msg"]},
+                 ["tenant:a"]},
+                {:command, "SUBSCRIBE", ["tenant:a", "tenant:b"],
+                 {:subscribe, ["tenant:a", "tenant:b"]}, ["tenant:a", "tenant:b"]},
+                {:command, "PSUBSCRIBE", ["tenant:*"], {:psubscribe, ["tenant:*"]}, ["tenant:*"]},
+                {:command, "PUBSUB", ["numsub", "tenant:a"], {:pubsub, ["NUMSUB", "tenant:a"]},
+                 ["tenant:a"]},
+                {:command, "PUBSUB", ["channels", "tenant:*"],
+                 {:pubsub, ["CHANNELS", "tenant:*"]}, ["tenant:*"]}
+              ], ""} =
+               Parser.parse_commands(
+                 "publish tenant:a msg\r\n" <>
+                   "subscribe tenant:a tenant:b\r\n" <>
+                   "psubscribe tenant:*\r\n" <>
+                   "pubsub numsub tenant:a\r\n" <>
+                   "pubsub channels tenant:*\r\n"
                )
     end
 

@@ -7441,6 +7441,9 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"BLMPOP" => counted_key_indices(arg_bytes, 1, 2),
         b"ZUNIONSTORE" | b"ZINTERSTORE" => counted_key_indices(arg_bytes, 1, 2),
         b"XREAD" | b"XREADGROUP" => stream_key_indices(arg_bytes),
+        b"PUBLISH" => first_n_indices(argc, 1),
+        b"SUBSCRIBE" | b"UNSUBSCRIBE" | b"PSUBSCRIBE" | b"PUNSUBSCRIBE" => all_indices(argc),
+        b"PUBSUB" => pubsub_key_indices(arg_bytes),
         b"XGROUP" | b"XINFO" => {
             if argc > 1 {
                 vec![1]
@@ -7882,6 +7885,20 @@ fn stream_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
 
 fn object_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
     if arg_bytes.len() > 1 && !ascii_eq_ignore_case(arg_bytes[0], b"HELP") {
+        vec![1]
+    } else {
+        Vec::new()
+    }
+}
+
+fn pubsub_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
+    if arg_bytes.is_empty() {
+        return Vec::new();
+    }
+
+    if ascii_eq_ignore_case(arg_bytes[0], b"NUMSUB") {
+        range_indices(1, arg_bytes.len())
+    } else if ascii_eq_ignore_case(arg_bytes[0], b"CHANNELS") && arg_bytes.len() > 1 {
         vec![1]
     } else {
         Vec::new()
@@ -9667,6 +9684,23 @@ mod tests {
     fn ast_extracts_acl_keys_for_common_shapes() {
         assert_eq!(command_key_indices(b"GET", &[b"k"]), vec![0]);
         assert_eq!(command_key_indices(b"SET", &[b"k", b"v"]), vec![0]);
+        assert_eq!(
+            command_key_indices(b"PUBLISH", &[b"tenant:a", b"msg"]),
+            vec![0]
+        );
+        assert_eq!(
+            command_key_indices(b"SUBSCRIBE", &[b"tenant:a", b"tenant:b"]),
+            vec![0, 1]
+        );
+        assert_eq!(command_key_indices(b"PSUBSCRIBE", &[b"tenant:*"]), vec![0]);
+        assert_eq!(
+            command_key_indices(b"PUBSUB", &[b"NUMSUB", b"tenant:a", b"tenant:b"]),
+            vec![1, 2]
+        );
+        assert_eq!(
+            command_key_indices(b"PUBSUB", &[b"CHANNELS", b"tenant:*"]),
+            vec![1]
+        );
         assert_eq!(
             command_key_indices(b"DEL", &[b"a", b"b", b"c"]),
             vec![0, 1, 2]

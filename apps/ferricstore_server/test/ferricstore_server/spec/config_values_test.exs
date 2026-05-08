@@ -184,7 +184,9 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
     end
 
     test "CONFIG SET tls-cert-file is rejected as read-only", %{store: store} do
-      assert {:error, msg} = Server.handle("CONFIG", ["SET", "tls-cert-file", "/etc/cert.pem"], store)
+      assert {:error, msg} =
+               Server.handle("CONFIG", ["SET", "tls-cert-file", "/etc/cert.pem"], store)
+
       assert msg =~ "read-only"
     end
   end
@@ -203,7 +205,9 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
     end
 
     test "CONFIG SET tls-key-file is rejected as read-only", %{store: store} do
-      assert {:error, msg} = Server.handle("CONFIG", ["SET", "tls-key-file", "/etc/key.pem"], store)
+      assert {:error, msg} =
+               Server.handle("CONFIG", ["SET", "tls-key-file", "/etc/key.pem"], store)
+
       assert msg =~ "read-only"
     end
   end
@@ -240,28 +244,41 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
   describe "read-write param: maxmemory-policy — valid values" do
     test "CONFIG SET maxmemory-policy volatile-lru succeeds", %{store: store} do
       assert :ok = Server.handle("CONFIG", ["SET", "maxmemory-policy", "volatile-lru"], store)
+
       assert ["maxmemory-policy", "volatile-lru"] =
                Server.handle("CONFIG", ["GET", "maxmemory-policy"], store)
     end
 
-    test "CONFIG SET maxmemory-policy allkeys-lru succeeds and updates Application env", %{store: store} do
+    test "CONFIG SET maxmemory-policy allkeys-lru succeeds and updates Application env", %{
+      store: store
+    } do
       assert :ok = Server.handle("CONFIG", ["SET", "maxmemory-policy", "allkeys-lru"], store)
+
       assert ["maxmemory-policy", "allkeys-lru"] =
                Server.handle("CONFIG", ["GET", "maxmemory-policy"], store)
+
       assert :allkeys_lru == Application.get_env(:ferricstore, :eviction_policy)
     end
 
-    test "CONFIG SET maxmemory-policy volatile-ttl succeeds and updates Application env", %{store: store} do
+    test "CONFIG SET maxmemory-policy volatile-ttl succeeds and updates Application env", %{
+      store: store
+    } do
       assert :ok = Server.handle("CONFIG", ["SET", "maxmemory-policy", "volatile-ttl"], store)
+
       assert ["maxmemory-policy", "volatile-ttl"] =
                Server.handle("CONFIG", ["GET", "maxmemory-policy"], store)
+
       assert :volatile_ttl == Application.get_env(:ferricstore, :eviction_policy)
     end
 
-    test "CONFIG SET maxmemory-policy noeviction succeeds and updates Application env", %{store: store} do
+    test "CONFIG SET maxmemory-policy noeviction succeeds and updates Application env", %{
+      store: store
+    } do
       assert :ok = Server.handle("CONFIG", ["SET", "maxmemory-policy", "noeviction"], store)
+
       assert ["maxmemory-policy", "noeviction"] =
                Server.handle("CONFIG", ["GET", "maxmemory-policy"], store)
+
       assert :noeviction == Application.get_env(:ferricstore, :eviction_policy)
     end
   end
@@ -270,18 +287,21 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
     test "CONFIG SET maxmemory-policy with invalid string returns error", %{store: store} do
       assert {:error, msg} =
                Server.handle("CONFIG", ["SET", "maxmemory-policy", "invalid-policy"], store)
+
       assert msg =~ "Invalid argument"
     end
 
     test "CONFIG SET maxmemory-policy with empty string returns error", %{store: store} do
       assert {:error, msg} =
                Server.handle("CONFIG", ["SET", "maxmemory-policy", ""], store)
+
       assert msg =~ "Invalid argument"
     end
 
     test "CONFIG SET maxmemory-policy with numeric string returns error", %{store: store} do
       assert {:error, msg} =
                Server.handle("CONFIG", ["SET", "maxmemory-policy", "42"], store)
+
       assert msg =~ "Invalid argument"
     end
 
@@ -294,49 +314,61 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
   describe "read-write param: slowlog-log-slower-than — valid values" do
     test "CONFIG SET slowlog-log-slower-than with valid positive integer", %{store: store} do
       assert :ok = Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "5000"], store)
+
       assert ["slowlog-log-slower-than", "5000"] =
                Server.handle("CONFIG", ["GET", "slowlog-log-slower-than"], store)
+
       assert 5000 == Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
     end
 
     test "CONFIG SET slowlog-log-slower-than with 0 logs every command", %{store: store} do
       assert :ok = Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "0"], store)
+
       assert ["slowlog-log-slower-than", "0"] =
                Server.handle("CONFIG", ["GET", "slowlog-log-slower-than"], store)
+
       assert 0 == Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
     end
 
     test "CONFIG SET slowlog-log-slower-than with -1 disables slowlog", %{store: store} do
       assert :ok = Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "-1"], store)
+
       assert ["slowlog-log-slower-than", "-1"] =
                Server.handle("CONFIG", ["GET", "slowlog-log-slower-than"], store)
+
       assert -1 == Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
     end
 
     test "CONFIG SET slowlog-log-slower-than with large value", %{store: store} do
       assert :ok =
                Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "999999999"], store)
+
       assert ["slowlog-log-slower-than", "999999999"] =
                Server.handle("CONFIG", ["GET", "slowlog-log-slower-than"], store)
     end
   end
 
   describe "read-write param: slowlog-log-slower-than — invalid values rejected" do
-    test "CONFIG SET slowlog-log-slower-than with non-integer string returns error", %{store: store} do
+    test "CONFIG SET slowlog-log-slower-than with non-integer string returns error", %{
+      store: store
+    } do
       assert {:error, msg} =
                Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "abc"], store)
+
       assert msg =~ "Invalid argument"
     end
 
     test "CONFIG SET slowlog-log-slower-than with float string returns error", %{store: store} do
       assert {:error, msg} =
                Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "3.14"], store)
+
       assert msg =~ "Invalid argument"
     end
 
     test "CONFIG SET slowlog-log-slower-than with -2 returns error", %{store: store} do
       assert {:error, msg} =
                Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "-2"], store)
+
       assert msg =~ "Invalid argument"
     end
 
@@ -349,25 +381,30 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
   describe "read-write param: slowlog-max-len — valid values" do
     test "CONFIG SET slowlog-max-len with valid positive integer", %{store: store} do
       assert :ok = Server.handle("CONFIG", ["SET", "slowlog-max-len", "256"], store)
+
       assert ["slowlog-max-len", "256"] =
                Server.handle("CONFIG", ["GET", "slowlog-max-len"], store)
+
       assert 256 == Application.get_env(:ferricstore, :slowlog_max_len)
     end
 
     test "CONFIG SET slowlog-max-len with 0 is accepted (boundary)", %{store: store} do
       assert :ok = Server.handle("CONFIG", ["SET", "slowlog-max-len", "0"], store)
+
       assert ["slowlog-max-len", "0"] =
                Server.handle("CONFIG", ["GET", "slowlog-max-len"], store)
     end
 
     test "CONFIG SET slowlog-max-len with 1 (minimum useful value)", %{store: store} do
       assert :ok = Server.handle("CONFIG", ["SET", "slowlog-max-len", "1"], store)
+
       assert ["slowlog-max-len", "1"] =
                Server.handle("CONFIG", ["GET", "slowlog-max-len"], store)
     end
 
     test "CONFIG SET slowlog-max-len with large value", %{store: store} do
       assert :ok = Server.handle("CONFIG", ["SET", "slowlog-max-len", "100000"], store)
+
       assert ["slowlog-max-len", "100000"] =
                Server.handle("CONFIG", ["GET", "slowlog-max-len"], store)
     end
@@ -377,18 +414,21 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
     test "CONFIG SET slowlog-max-len with negative returns error", %{store: store} do
       assert {:error, msg} =
                Server.handle("CONFIG", ["SET", "slowlog-max-len", "-1"], store)
+
       assert msg =~ "Invalid argument"
     end
 
     test "CONFIG SET slowlog-max-len with string returns error", %{store: store} do
       assert {:error, msg} =
                Server.handle("CONFIG", ["SET", "slowlog-max-len", "abc"], store)
+
       assert msg =~ "Invalid argument"
     end
 
     test "CONFIG SET slowlog-max-len with float returns error", %{store: store} do
       assert {:error, msg} =
                Server.handle("CONFIG", ["SET", "slowlog-max-len", "1.5"], store)
+
       assert msg =~ "Invalid argument"
     end
   end
@@ -438,6 +478,7 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
   describe "read-write param: notify-keyspace-events" do
     test "CONFIG SET notify-keyspace-events accepts flag strings", %{store: store} do
       assert :ok = Server.handle("CONFIG", ["SET", "notify-keyspace-events", "KEA"], store)
+
       assert ["notify-keyspace-events", "KEA"] =
                Server.handle("CONFIG", ["GET", "notify-keyspace-events"], store)
     end
@@ -445,18 +486,21 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
     test "CONFIG SET notify-keyspace-events accepts empty string to disable", %{store: store} do
       Server.handle("CONFIG", ["SET", "notify-keyspace-events", "KEA"], store)
       assert :ok = Server.handle("CONFIG", ["SET", "notify-keyspace-events", ""], store)
+
       assert ["notify-keyspace-events", ""] =
                Server.handle("CONFIG", ["GET", "notify-keyspace-events"], store)
     end
 
     test "CONFIG SET notify-keyspace-events accepts arbitrary flag strings", %{store: store} do
       assert :ok = Server.handle("CONFIG", ["SET", "notify-keyspace-events", "Kx$g"], store)
+
       assert ["notify-keyspace-events", "Kx$g"] =
                Server.handle("CONFIG", ["GET", "notify-keyspace-events"], store)
     end
 
     test "CONFIG SET notify-keyspace-events accepts single character", %{store: store} do
       assert :ok = Server.handle("CONFIG", ["SET", "notify-keyspace-events", "A"], store)
+
       assert ["notify-keyspace-events", "A"] =
                Server.handle("CONFIG", ["GET", "notify-keyspace-events"], store)
     end
@@ -477,12 +521,14 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
     test "CONFIG SET with completely unknown param returns ERR Unsupported", %{store: store} do
       assert {:error, msg} =
                Server.handle("CONFIG", ["SET", "totally-unknown-param", "value"], store)
+
       assert msg =~ "Unsupported CONFIG parameter"
     end
 
     test "CONFIG SET with another unknown param returns error", %{store: store} do
       assert {:error, msg} =
                Server.handle("CONFIG", ["SET", "foo-bar-baz", "123"], store)
+
       assert msg =~ "Unsupported CONFIG parameter"
     end
 
@@ -565,6 +611,14 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
 
       pairs = pair_up(result)
       assert Map.get(pairs, "hz") == "42"
+    end
+
+    test "CONFIG GET redacts requirepass while keeping auth value internal", %{store: store} do
+      on_exit(fn -> Ferricstore.Config.set("requirepass", "") end)
+
+      assert :ok = Server.handle("CONFIG", ["SET", "requirepass", "super-secret"], store)
+      assert ["requirepass", ""] = Server.handle("CONFIG", ["GET", "requirepass"], store)
+      assert Ferricstore.Config.get_value("requirepass") == "super-secret"
     end
   end
 
@@ -676,9 +730,14 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
       Ferricstore.SlowLog.maybe_log(["SET", "key", "val"], 999_999_999)
       GenServer.call(Ferricstore.SlowLog, :ping)
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        Ferricstore.SlowLog.len() > 0
-      end, "slowlog entry should be recorded", 40, 50)
+      Ferricstore.Test.ShardHelpers.eventually(
+        fn ->
+          Ferricstore.SlowLog.len() > 0
+        end,
+        "slowlog entry should be recorded",
+        40,
+        50
+      )
 
       Server.handle("CONFIG", ["RESETSTAT"], store)
       assert Ferricstore.SlowLog.len() == 0
@@ -905,6 +964,32 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
       assert metadata.param == "hz"
       assert metadata.value == "42"
       assert is_binary(metadata.old_value)
+    end
+
+    test "CONFIG SET telemetry redacts sensitive values", %{store: store} do
+      on_exit(fn -> Ferricstore.Config.set("requirepass", "") end)
+
+      ref = make_ref()
+      test_pid = self()
+      handler_id = "config-values-sensitive-test-#{inspect(ref)}"
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :config, :changed],
+        fn _event, _measurements, metadata, _config ->
+          send(test_pid, {:config_changed, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Server.handle("CONFIG", ["SET", "requirepass", "top-secret"], store)
+
+      assert_receive {:config_changed, metadata}, 1_000
+      assert metadata.param == "requirepass"
+      assert metadata.value == "[redacted]"
+      refute inspect(metadata) =~ "top-secret"
     end
   end
 

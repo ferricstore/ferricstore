@@ -252,10 +252,10 @@ defmodule FerricstoreServer.AclSecurityTest do
       assert Acl.protected_mode?() == true
     end
 
-    test "protected_mode? defaults to false" do
+    test "protected_mode? defaults to true" do
       Application.delete_env(:ferricstore, :protected_mode)
 
-      assert Acl.protected_mode?() == false
+      assert Acl.protected_mode?() == true
     end
 
     test "protected_mode? returns false when config is false" do

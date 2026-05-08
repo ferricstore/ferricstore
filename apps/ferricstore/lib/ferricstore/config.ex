@@ -107,6 +107,10 @@ defmodule Ferricstore.Config do
     "requirepass" => ""
   }
 
+  @sensitive_params MapSet.new(["requirepass"])
+  @redacted_config_value ""
+  @redacted_metadata_value "[redacted]"
+
   # -------------------------------------------------------------------
   # Types
   # -------------------------------------------------------------------
@@ -213,6 +217,36 @@ defmodule Ferricstore.Config do
   end
 
   @doc """
+  Returns true when a config parameter carries secret material and should not be
+  exposed through client-visible responses, telemetry, or audit metadata.
+  """
+  @spec sensitive_param?(binary()) :: boolean()
+  def sensitive_param?(key) when is_binary(key) do
+    key
+    |> String.downcase()
+    |> then(&MapSet.member?(@sensitive_params, &1))
+  end
+
+  @spec sensitive_param?(term()) :: false
+  def sensitive_param?(_key), do: false
+
+  @doc """
+  Redacts a config value for CONFIG GET output.
+  """
+  @spec redact_for_config_get(binary(), binary()) :: binary()
+  def redact_for_config_get(key, value) do
+    if sensitive_param?(key), do: @redacted_config_value, else: value
+  end
+
+  @doc """
+  Redacts a config value for telemetry and audit metadata.
+  """
+  @spec redact_for_metadata(binary(), binary()) :: binary()
+  def redact_for_metadata(key, value) do
+    if sensitive_param?(key), do: @redacted_metadata_value, else: value
+  end
+
+  @doc """
   Returns the full map of default configuration values.
 
   Note: this returns the static defaults only, not the live state which
@@ -282,6 +316,7 @@ defmodule Ferricstore.Config do
     result =
       state
       |> Enum.filter(fn {key, _val} -> Ferricstore.GlobMatcher.match?(key, pattern) end)
+      |> Enum.map(fn {key, val} -> {key, redact_for_config_get(key, val)} end)
       |> Enum.sort_by(fn {key, _val} -> key end)
 
     {:reply, result, state}
@@ -729,7 +764,11 @@ defmodule Ferricstore.Config do
     :telemetry.execute(
       [:ferricstore, :config, :changed],
       %{},
-      %{param: key, value: value, old_value: old_value}
+      %{
+        param: key,
+        value: redact_for_metadata(key, value),
+        old_value: redact_for_metadata(key, old_value)
+      }
     )
   end
 

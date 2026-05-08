@@ -1323,8 +1323,8 @@ defmodule Ferricstore.Commands.Server do
       :ok ->
         AuditLog.log(:config_change, %{
           parameter: key,
-          old_value: old_value || "",
-          new_value: value
+          old_value: Ferricstore.Config.redact_for_metadata(key, old_value || ""),
+          new_value: Ferricstore.Config.redact_for_metadata(key, value)
         })
 
         :ok

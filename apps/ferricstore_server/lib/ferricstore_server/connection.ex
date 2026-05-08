@@ -393,11 +393,10 @@ defmodule FerricstoreServer.Connection do
   # commands needed for connection setup, teardown, and user switching.
   @acl_bypass_cmds ~w(AUTH HELLO QUIT RESET)
 
-  # Fast path: no auth required, default user with full access — skip ACL checks entirely.
-  # This is the common case for 99% of deployments (no requirepass, default user).
+  # Fast path: no auth required, default user with canonical full access.
   defp handle_command(
          {:command, cmd, args, ast, _keys},
-         %{require_auth: false, acl_cache: %{commands: :all, keys: :all}} = state
+         %{require_auth: false, acl_cache: :full_access} = state
        )
        when is_binary(cmd) and is_list(args) do
     Stats.incr_commands(state.stats_counter)

@@ -389,6 +389,30 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
     end
   end
 
+  describe "TCP: no-auth ACL enforcement" do
+    test "default user denied commands are enforced without requirepass", %{port: port} do
+      :ok = Acl.set_user("default", ["on", "nopass", "+@all", "~*", "-ping"])
+
+      sock = connect_and_hello(port)
+
+      send_cmd(sock, ["PING"])
+      assert match?({:error, "NOPERM" <> _}, recv_response(sock))
+
+      :gen_tcp.close(sock)
+    end
+
+    test "disabled default user is enforced without requirepass", %{port: port} do
+      :ok = Acl.set_user("default", ["off", "nopass", "+@all", "~*"])
+
+      sock = connect_and_hello(port)
+
+      send_cmd(sock, ["PING"])
+      assert match?({:error, "NOPERM" <> _}, recv_response(sock))
+
+      :gen_tcp.close(sock)
+    end
+  end
+
   describe "Flow partition ACL key extraction" do
     test "explicit partition keys are enforced for single-flow commands" do
       :ok = Acl.set_user("flow_tenant_a", ["on", ">pass", "+@all", "~tenant-a"])
@@ -427,6 +451,27 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
 
       assert {:error, "NOPERM" <> _} =
                ConnAuth.check_keys_cached(cache, "FLOW.INFO", ["tenant-b"])
+    end
+  end
+
+  describe "PubSub channel ACL key extraction" do
+    test "pubsub channels and patterns are enforced as ACL keys" do
+      :ok = Acl.set_user("tenant_pubsub", ["on", ">pass", "+@pubsub", "~tenant:*"])
+      cache = ConnAuth.build_acl_cache("tenant_pubsub")
+
+      assert {"PUBLISH", ["tenant:a"]} = parsed_command_keys("publish tenant:a msg\r\n")
+      assert :ok = ConnAuth.check_keys_cached(cache, "PUBLISH", ["tenant:a"])
+
+      assert {"PUBLISH", ["other:a"]} = parsed_command_keys("publish other:a msg\r\n")
+
+      assert {:error, "NOPERM" <> _} =
+               ConnAuth.check_keys_cached(cache, "PUBLISH", ["other:a"])
+
+      assert {"SUBSCRIBE", ["tenant:a", "tenant:b"]} =
+               parsed_command_keys("subscribe tenant:a tenant:b\r\n")
+
+      assert {"PSUBSCRIBE", ["tenant:*"]} = parsed_command_keys("psubscribe tenant:*\r\n")
+      assert {"PUBSUB", ["tenant:a"]} = parsed_command_keys("pubsub numsub tenant:a\r\n")
     end
   end
 
