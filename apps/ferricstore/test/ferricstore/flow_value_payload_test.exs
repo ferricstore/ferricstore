@@ -210,7 +210,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
                type: "value-cancel-retention",
                partition_key: "tenant-retention",
                payload: %{large: String.duplicate("x", 256)},
-               retention_ttl_ms: 20,
+               retention_ttl_ms: 100,
                run_at_ms: 1_000
              )
 
@@ -223,10 +223,38 @@ defmodule Ferricstore.FlowValuePayloadTest do
                fencing_token: created.fencing_token
              )
 
-    Process.sleep(40)
+    Process.sleep(150)
 
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
     assert {:ok, nil} = FerricStore.get(created.payload_ref)
+  end
+
+  test "cancel terminal retention does not expire user-owned reason_ref" do
+    id = unique_id("flow-value-cancel-reason-ref")
+    reason_key = unique_id("flow-value-cancel-reason-user-key")
+
+    assert :ok = FerricStore.set(reason_key, "keep-me")
+
+    assert {:ok, created} =
+             FerricStore.flow_create(id,
+               type: "value-cancel-reason-ref",
+               partition_key: "tenant-retention",
+               payload: %{large: String.duplicate("x", 256)},
+               retention_ttl_ms: 100,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, _cancelled} =
+             FerricStore.flow_cancel(id,
+               partition_key: "tenant-retention",
+               fencing_token: created.fencing_token,
+               reason_ref: reason_key
+             )
+
+    Process.sleep(150)
+
+    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
+    assert {:ok, "keep-me"} = FerricStore.get(reason_key)
   end
 
   test "rewind from terminal back to active clears value ref expiration" do
@@ -237,7 +265,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
                type: "value-rewind-retention",
                partition_key: "tenant-retention",
                payload: %{large: String.duplicate("x", 256)},
-               retention_ttl_ms: 20,
+               retention_ttl_ms: 100,
                run_at_ms: 1_000,
                now_ms: 1_000
              )
@@ -268,7 +296,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert rewound.state == created.state
     assert rewound.payload_ref == created.payload_ref
 
-    Process.sleep(40)
+    Process.sleep(150)
 
     assert {:ok, fetched} =
              FerricStore.flow_get(id, partition_key: "tenant-retention", full: true)

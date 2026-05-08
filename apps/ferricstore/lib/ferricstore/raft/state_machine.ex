@@ -5898,7 +5898,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_apply_cancel(state, record, next, partition_key, now_ms) do
     plans = [{record, next}]
 
-    with :ok <- flow_refresh_terminal_value_expirations(state, next, %{}),
+    with :ok <- flow_refresh_terminal_value_expirations(state, next, %{error: true}),
          :ok <- flow_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
@@ -7418,8 +7418,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_after_history_put(state, record) do
-    with :ok <- flow_history_trim(state, record),
-         :ok <- flow_refresh_terminal_history_expirations(state, record) do
+    with :ok <- flow_history_trim(state, record) do
       maybe_queue_terminal_lmdb_history_indexes(state, record)
     end
   end
@@ -7437,52 +7436,6 @@ defmodule Ferricstore.Raft.StateMachine do
     flow_index_delete_members(state, history_key, event_ids)
 
     :ok
-  end
-
-  defp flow_refresh_terminal_history_expirations(state, record) do
-    expire_at_ms = flow_record_expire_at(record)
-
-    if expire_at_ms > 0 and Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-      id = Map.fetch!(record, :id)
-      partition_key = Map.get(record, :partition_key)
-      history_key = FlowKeys.history_key(id, partition_key)
-      prefix = "X:" <> history_key <> <<0>>
-
-      keys = flow_history_keys_for_prefix(state, prefix)
-      values = sm_store_batch_get(state, keys, &sm_file_path/2)
-
-      keys
-      |> Enum.zip(values)
-      |> Enum.reduce_while(:ok, fn
-        {key, value}, :ok when is_binary(value) ->
-          with :ok <- flow_validate_key_size(key),
-               :ok <- raw_put_cold(state, key, value, expire_at_ms) do
-            {:cont, :ok}
-          else
-            {:error, _reason} = error -> {:halt, error}
-          end
-
-        _entry, :ok ->
-          {:cont, :ok}
-      end)
-    else
-      :ok
-    end
-  end
-
-  defp flow_history_keys_for_prefix(state, prefix) do
-    prefix_len = byte_size(prefix)
-
-    match_spec = [
-      {{:"$1", :_, :_, :_, :_, :_, :_},
-       [
-         {:andalso, {:is_binary, :"$1"},
-          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
-       ], [:"$1"]}
-    ]
-
-    :ets.select(state.ets, match_spec)
   end
 
   defp maybe_queue_terminal_lmdb_history_indexes(state, record) do
@@ -7600,7 +7553,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_refresh_many_terminal_value_expirations(state, plans) do
     Enum.reduce_while(plans, :ok, fn
       {_record, next}, :ok ->
-        case flow_refresh_terminal_value_expirations(state, next, %{}) do
+        case flow_refresh_terminal_value_expirations(state, next, %{error: true}) do
           :ok -> {:cont, :ok}
           {:error, _reason} = error -> {:halt, error}
         end

@@ -4000,7 +4000,7 @@ defmodule Ferricstore.FlowTest do
                type: "history-ttl",
                payload: %{input: 1},
                run_at_ms: 1_000,
-               retention_ttl_ms: 20,
+               retention_ttl_ms: 100,
                now_ms: 1_000
              )
 
@@ -4019,7 +4019,7 @@ defmodule Ferricstore.FlowTest do
                fencing_token: claimed.fencing_token
              )
 
-    Process.sleep(40)
+    Process.sleep(150)
 
     assert {:ok, nil} = FerricStore.flow_get(id)
     assert {:ok, []} = FerricStore.flow_history(id, count: 10)

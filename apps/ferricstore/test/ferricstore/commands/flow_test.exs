@@ -690,6 +690,50 @@ defmodule Ferricstore.Commands.FlowTest do
     assert result_ref_b != "result:batch"
   end
 
+  test "rejects terminal Flow TTL zero through Rust AST" do
+    assert {:error, "ERR flow ttl_ms must be a positive integer"} =
+             Dispatcher.dispatch(
+               "FLOW.COMPLETE",
+               ["flow-complete-ttl-zero", "lease", "FENCING", "1", "TTL", "0"],
+               MockStore.make()
+             )
+
+    assert {:error, "ERR flow ttl_ms must be a positive integer"} =
+             Dispatcher.dispatch(
+               "FLOW.FAIL",
+               ["flow-fail-ttl-zero", "lease", "FENCING", "1", "TTL", "0"],
+               MockStore.make()
+             )
+
+    assert {:error, "ERR flow ttl_ms must be a positive integer"} =
+             Dispatcher.dispatch(
+               "FLOW.CANCEL",
+               ["flow-cancel-ttl-zero", "FENCING", "1", "TTL", "0"],
+               MockStore.make()
+             )
+
+    assert {:error, "ERR flow ttl_ms must be a positive integer"} =
+             Dispatcher.dispatch(
+               "FLOW.COMPLETE_MANY",
+               ["tenant", "TTL", "0", "ITEMS", "flow-a", "lease-a", "1"],
+               MockStore.make()
+             )
+
+    assert {:error, "ERR flow ttl_ms must be a positive integer"} =
+             Dispatcher.dispatch(
+               "FLOW.FAIL_MANY",
+               ["tenant", "TTL", "0", "ITEMS", "flow-a", "lease-a", "1"],
+               MockStore.make()
+             )
+
+    assert {:error, "ERR flow ttl_ms must be a positive integer"} =
+             Dispatcher.dispatch(
+               "FLOW.CANCEL_MANY",
+               ["tenant", "TTL", "0", "ITEMS", "flow-a", "1"],
+               MockStore.make()
+             )
+  end
+
   test "dispatches Flow fail_many through Rust AST" do
     partition = uid("flow-command-fail-many-tenant")
     type = uid("flow-command-fail-many")

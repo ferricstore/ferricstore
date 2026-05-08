@@ -791,13 +791,25 @@ defmodule Ferricstore.Flow do
          _consistent?,
          value_return
        ) do
-    case flow_history_hot_refs(ctx, id, partition_key, history_key, count) do
-      {:ok, []} ->
-        flow_history_fallback_scan(ctx, history_key, count, value_return)
+    if flow_history_state_exists?(ctx, id, partition_key) do
+      case flow_history_hot_refs(ctx, id, partition_key, history_key, count) do
+        {:ok, []} ->
+          flow_history_fallback_scan(ctx, history_key, count, value_return)
 
-      {:ok, event_refs} ->
-        event_ids = Enum.map(event_refs, fn {event_id, _score} -> event_id end)
-        flow_history_from_event_ids(ctx, id, partition_key, history_key, event_ids, value_return)
+        {:ok, event_refs} ->
+          event_ids = Enum.map(event_refs, fn {event_id, _score} -> event_id end)
+
+          flow_history_from_event_ids(
+            ctx,
+            id,
+            partition_key,
+            history_key,
+            event_ids,
+            value_return
+          )
+      end
+    else
+      {:ok, []}
     end
   end
 
@@ -811,29 +823,40 @@ defmodule Ferricstore.Flow do
          consistent?,
          value_return
        ) do
-    with {:ok, hot_refs} <- flow_history_hot_refs(ctx, id, partition_key, history_key, count),
-         {:ok, cold_refs} <- flow_history_lmdb_refs(ctx, history_key, count, consistent?) do
-      event_ids =
-        (hot_refs ++ cold_refs)
-        |> Enum.sort_by(fn {event_id, score} -> {score, event_id} end)
-        |> Enum.uniq_by(fn {event_id, _score} -> event_id end)
-        |> Enum.take(count)
-        |> Enum.map(fn {event_id, _score} -> event_id end)
+    if flow_history_state_exists?(ctx, id, partition_key) do
+      with {:ok, hot_refs} <- flow_history_hot_refs(ctx, id, partition_key, history_key, count),
+           {:ok, cold_refs} <- flow_history_lmdb_refs(ctx, history_key, count, consistent?) do
+        event_ids =
+          (hot_refs ++ cold_refs)
+          |> Enum.sort_by(fn {event_id, score} -> {score, event_id} end)
+          |> Enum.uniq_by(fn {event_id, _score} -> event_id end)
+          |> Enum.take(count)
+          |> Enum.map(fn {event_id, _score} -> event_id end)
 
-      case event_ids do
-        [] ->
-          flow_history_fallback_scan(ctx, history_key, count, value_return)
+        case event_ids do
+          [] ->
+            flow_history_fallback_scan(ctx, history_key, count, value_return)
 
-        _ ->
-          flow_history_from_event_ids(
-            ctx,
-            id,
-            partition_key,
-            history_key,
-            event_ids,
-            value_return
-          )
+          _ ->
+            flow_history_from_event_ids(
+              ctx,
+              id,
+              partition_key,
+              history_key,
+              event_ids,
+              value_return
+            )
+        end
       end
+    else
+      {:ok, []}
+    end
+  end
+
+  defp flow_history_state_exists?(ctx, id, partition_key) do
+    case Router.flow_get(ctx, id, partition_key) do
+      value when is_binary(value) -> true
+      _ -> false
     end
   end
 
