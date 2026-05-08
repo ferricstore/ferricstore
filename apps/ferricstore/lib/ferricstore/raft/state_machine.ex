@@ -494,7 +494,7 @@ defmodule Ferricstore.Raft.StateMachine do
                         {store, Map.put(stores, shard_idx, store)}
                     end
 
-                  result = dispatch_cross_shard_entry(entry, sandbox_namespace, store)
+                  result = dispatch_cross_shard_entry(entry, sandbox_namespace, store, state)
 
                   results =
                     Map.update(results, shard_idx, %{pos => result}, fn shard_results ->
@@ -1812,7 +1812,26 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
-  defp dispatch_cross_shard_entry(entry, sandbox_namespace, store) do
+  defp dispatch_cross_shard_entry(
+         {:flow_cross_spawn_children, attrs},
+         _sandbox_namespace,
+         _store,
+         state
+       ) do
+    do_flow_cross_spawn_children(state, attrs)
+  end
+
+  defp dispatch_cross_shard_entry(
+         {:flow_cross_terminal, op, attrs},
+         _sandbox_namespace,
+         _store,
+         state
+       )
+       when op in [:complete, :fail, :cancel] do
+    do_flow_cross_terminal(state, op, attrs)
+  end
+
+  defp dispatch_cross_shard_entry(entry, sandbox_namespace, store, _state) do
     ast =
       entry
       |> TxAst.command_ast()
@@ -2351,6 +2370,30 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp cross_shard_route_key(_instance_ctx, _key, default_idx), do: default_idx
+
+  defp cross_shard_state_for_key(anchor_state, key) when is_binary(key) do
+    instance_ctx = cross_shard_instance_ctx(anchor_state)
+
+    shard_idx =
+      if instance_ctx, do: Router.shard_for(instance_ctx, key), else: anchor_state.shard_index
+
+    ctx = cross_shard_ctx(anchor_state, shard_idx, anchor_state.data_dir, instance_ctx)
+
+    %{
+      anchor_state
+      | shard_index: ctx.index,
+        ets: ctx.keydir,
+        shard_data_path: ctx.shard_data_path,
+        shard_data_path_expanded: Path.expand(ctx.shard_data_path),
+        active_file_path: ctx.active_file_path,
+        active_file_id: ctx.active_file_id,
+        zset_score_index_name: ctx.zset_score_index_name,
+        zset_score_lookup_name: ctx.zset_score_lookup_name,
+        flow_index_name: ctx.flow_index_name,
+        flow_lookup_name: ctx.flow_lookup_name,
+        flow_lmdb_path: Ferricstore.Flow.LMDB.path(ctx.shard_data_path)
+    }
+  end
 
   defp cross_shard_instance_ctx(%{instance_ctx: %FerricStore.Instance{} = ctx} = state) do
     if instance_data_path?(ctx, state), do: ctx, else: nil
@@ -4054,6 +4097,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp normalize_stamped_command(command), do: command
 
   defp with_cross_shard_pending_writes(state, fun) do
+    init_pending_write_process_state()
     Process.put(:sm_cross_shard_pending_writes, [])
     Process.put(:sm_cross_shard_pending_originals, %{})
 
@@ -4062,6 +4106,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
       case flush_cross_shard_pending_writes(state) do
         {:ok, flushed_state} ->
+          observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
           {result, flushed_state}
 
         {:error, reason, partial_state, successful_groups} ->
@@ -4072,10 +4117,12 @@ defmodule Ferricstore.Raft.StateMachine do
                ) do
             {:ok, compensated_state} ->
               rollback_cross_shard_pending_writes(state)
+              rollback_pending_writes(state)
               {:error, reason, compensated_state}
 
             {:error, compensation_reason, compensated_state} ->
               rollback_cross_shard_pending_writes(state)
+              rollback_pending_writes(state)
               block_release_cursor_for_apply()
               {:error, {:cross_shard_compensation_failed, compensation_reason}, compensated_state}
           end
@@ -4083,6 +4130,7 @@ defmodule Ferricstore.Raft.StateMachine do
     after
       Process.delete(:sm_cross_shard_pending_writes)
       Process.delete(:sm_cross_shard_pending_originals)
+      clear_pending_write_process_state()
     end
   end
 
@@ -4208,6 +4256,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_cross_shard_pending_locations(keydir, file_id, entries, locations) do
     Enum.zip(entries, locations)
+    |> only_latest_cross_shard_entries()
     |> Enum.each(fn
       {{:put, _idx, ^keydir, _file_path, ^file_id, key, ets_value, _disk_value, exp},
        {:put, offset, value_size}} ->
@@ -4227,6 +4276,33 @@ defmodule Ferricstore.Raft.StateMachine do
         :ok
     end)
   end
+
+  defp only_latest_cross_shard_entries(entry_locations) do
+    latest =
+      entry_locations
+      |> Enum.with_index()
+      |> Enum.reduce(%{}, fn {{entry, _location}, idx}, acc ->
+        Map.put(acc, cross_shard_entry_identity(entry), idx)
+      end)
+
+    entry_locations
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {{entry, location}, idx} ->
+      if Map.fetch!(latest, cross_shard_entry_identity(entry)) == idx do
+        [{entry, location}]
+      else
+        []
+      end
+    end)
+  end
+
+  defp cross_shard_entry_identity(
+         {:put, _idx, keydir, _file_path, _file_id, key, _ets_value, _disk_value, _expire_at_ms}
+       ),
+       do: {keydir, key}
+
+  defp cross_shard_entry_identity({:delete, _idx, keydir, _file_path, _file_id, key}),
+    do: {keydir, key}
 
   defp compensate_cross_shard_partial_writes(state, successful_groups, originals) do
     Enum.reduce_while(successful_groups, {:ok, state}, fn {idx, file_path, file_id, keydir,
@@ -4528,6 +4604,79 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_flow_spawn_children(_state, _attrs),
     do: {:error, "ERR flow children must be a non-empty list"}
 
+  defp do_flow_cross_spawn_children(
+         state,
+         %{id: parent_id, partition_key: partition_key, children: [_ | _] = children} = attrs
+       ) do
+    parent_state = cross_shard_state_for_key(state, FlowKeys.state_key(parent_id, partition_key))
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+
+    with {:ok, parent} <- flow_require_record(parent_state, parent_id, partition_key),
+         :ok <- flow_require_parent_partition(parent, partition_key),
+         child_attrs = flow_spawn_child_attrs(parent, children),
+         :ok <- flow_many_partition_keys_present?(child_attrs),
+         :ok <- flow_create_many_unique?(child_attrs),
+         {:ok, group_state} <- flow_child_group_spawn_state(parent, attrs, child_attrs) do
+      case group_state do
+        :idempotent ->
+          {:ok, parent}
+
+        :new ->
+          with :ok <- flow_require_expected_state(parent, Map.get(attrs, :from_state)),
+               :ok <- flow_require_fencing_token(parent, Map.fetch!(attrs, :fencing_token)),
+               :ok <- flow_require_transition_lease(parent, Map.get(attrs, :lease_token)),
+               :ok <- flow_require_active_parent(parent),
+               :ok <- flow_require_spawn_wait_state(parent, attrs),
+               {:ok, child_apply_groups} <- flow_cross_create_many_prepare(state, child_attrs),
+               {:ok, next_parent} <- flow_prepare_spawn_parent(parent, attrs, child_attrs, now_ms),
+               :ok <- flow_validate_record_keys(next_parent),
+               :ok <-
+                 flow_apply_parent_update(
+                   parent_state,
+                   parent,
+                   next_parent,
+                   "children_spawned",
+                   now_ms
+                 ),
+               :ok <- flow_cross_create_many_apply(child_apply_groups) do
+            {:ok, next_parent}
+          end
+      end
+    end
+  end
+
+  defp do_flow_cross_spawn_children(_state, _attrs),
+    do: {:error, "ERR flow children must be a non-empty list"}
+
+  defp flow_cross_create_many_prepare(state, attrs_list) do
+    attrs_list
+    |> Enum.group_by(fn attrs ->
+      key = FlowKeys.state_key(Map.fetch!(attrs, :id), Map.fetch!(attrs, :partition_key))
+      cross_shard_state_for_key(state, key)
+    end)
+    |> Enum.reduce_while({:ok, []}, fn {child_state, shard_attrs}, {:ok, acc} ->
+      with :ok <- flow_many_partitions_valid?(child_state, shard_attrs),
+           {:ok, _records, plans} <- flow_create_many_prepare(child_state, shard_attrs) do
+        {:cont, {:ok, [{child_state, plans} | acc]}}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, groups} -> {:ok, Enum.reverse(groups)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp flow_cross_create_many_apply(groups) do
+    Enum.reduce_while(groups, :ok, fn {child_state, plans}, :ok ->
+      case flow_create_many_apply(child_state, plans) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
   defp flow_create_record(state, %{id: id, type: type, state: flow_state} = attrs) do
     now_ms = Map.get(attrs, :now_ms, apply_now_ms())
     run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
@@ -4552,6 +4701,7 @@ defmodule Ferricstore.Raft.StateMachine do
       partition_key: Map.get(attrs, :partition_key),
       payload_ref: flow_value_ref(attrs, :payload, id, 1, Map.get(attrs, :partition_key)),
       parent_flow_id: Map.get(attrs, :parent_flow_id),
+      parent_partition_key: Map.get(attrs, :parent_partition_key),
       root_flow_id: Map.get(attrs, :root_flow_id) || id,
       correlation_id: Map.get(attrs, :correlation_id),
       result_ref: nil,
@@ -4611,8 +4761,9 @@ defmodule Ferricstore.Raft.StateMachine do
     Enum.map(children, fn attrs ->
       attrs
       |> Map.put(:parent_flow_id, parent_id)
+      |> Map.put(:parent_partition_key, partition_key)
       |> Map.put(:root_flow_id, root_flow_id)
-      |> Map.put(:partition_key, partition_key)
+      |> Map.put_new(:partition_key, partition_key)
     end)
   end
 
@@ -4654,6 +4805,11 @@ defmodule Ferricstore.Raft.StateMachine do
       |> Enum.map(fn %{id: id} -> {id, "running"} end)
       |> Map.new()
 
+    child_partitions =
+      child_attrs
+      |> Enum.map(fn %{id: id, partition_key: child_partition} -> {id, child_partition} end)
+      |> Map.new()
+
     resolved =
       case Map.fetch!(attrs, :wait) do
         :none -> "success"
@@ -4667,6 +4823,7 @@ defmodule Ferricstore.Raft.StateMachine do
       "exhaust_to" => Map.fetch!(attrs, :exhaust_to),
       "request_hash" => flow_child_group_request_hash(attrs, child_attrs),
       "children" => children,
+      "child_partitions" => child_partitions,
       "summary" => %{
         "total" => map_size(children),
         "completed" => 0,
@@ -6169,6 +6326,135 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp do_flow_cross_terminal(state, :complete, %{id: id, lease_token: lease_token} = attrs) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
+    child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
+
+    with {:ok, record} <- flow_require_record(child_state, id, partition_key),
+         {:ok, record, next} <-
+           flow_prepare_complete_existing_record(record, attrs, lease_token, now_ms),
+         :ok <- flow_apply_complete_local(child_state, record, next, partition_key, now_ms, attrs),
+         :ok <- flow_apply_child_terminal_chain(state, next, "completed", now_ms) do
+      {:ok, next}
+    end
+  end
+
+  defp do_flow_cross_terminal(state, :fail, %{id: id, lease_token: lease_token} = attrs) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
+    child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
+
+    with {:ok, record} <- flow_require_record(child_state, id, partition_key),
+         {:ok, record, next} <-
+           flow_prepare_fail_existing_record(record, attrs, lease_token, now_ms),
+         :ok <- flow_apply_fail_local(child_state, record, next, partition_key, now_ms, attrs),
+         :ok <- flow_apply_child_terminal_chain(state, next, "failed", now_ms) do
+      {:ok, next}
+    end
+  end
+
+  defp do_flow_cross_terminal(state, :cancel, %{id: id} = attrs) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    partition_key = Map.get(attrs, :partition_key)
+    child_state = cross_shard_state_for_key(state, FlowKeys.state_key(id, partition_key))
+
+    with {:ok, record} <- flow_require_record(child_state, id, partition_key),
+         {:ok, record, next} <- flow_prepare_cancel_existing_record(record, attrs, now_ms),
+         :ok <- flow_apply_cancel_local(child_state, record, next, attrs, partition_key, now_ms),
+         :ok <- flow_apply_child_terminal_chain(state, next, "cancelled", now_ms) do
+      {:ok, next}
+    end
+  end
+
+  defp flow_apply_complete_local(state, record, next, partition_key, now_ms, attrs) do
+    plans = [{record, next}]
+
+    with :ok <- flow_put_record_values(state, next, attrs),
+         :ok <- flow_transition_move_indexes(state, plans),
+         :ok <- flow_put_state_record(state, FlowKeys.state_key(next.id, partition_key), next),
+         :ok <- flow_history_put_planned(state, record, next, "completed", now_ms),
+         :ok <- flow_after_history_put(state, next) do
+      flow_maybe_cancel_children_on_parent_closed(state, next, now_ms)
+    end
+  end
+
+  defp flow_apply_fail_local(state, record, next, partition_key, now_ms, attrs) do
+    plans = [{record, next}]
+
+    with :ok <- flow_put_record_values(state, next, attrs),
+         :ok <- flow_transition_move_indexes(state, plans),
+         :ok <- flow_put_state_record(state, FlowKeys.state_key(next.id, partition_key), next),
+         :ok <- flow_history_put_planned(state, record, next, "failed", now_ms),
+         :ok <- flow_after_history_put(state, next) do
+      flow_maybe_cancel_children_on_parent_closed(state, next, now_ms)
+    end
+  end
+
+  defp flow_apply_cancel_local(state, record, next, attrs, partition_key, now_ms) do
+    plans = [{record, next}]
+    refresh_attrs = flow_cancel_refresh_attrs(attrs)
+
+    with :ok <- do_flow_put_record_values(state, next, attrs),
+         :ok <- flow_refresh_terminal_value_expirations(state, next, refresh_attrs),
+         :ok <- flow_transition_move_indexes(state, plans),
+         :ok <- flow_put_state_record(state, FlowKeys.state_key(next.id, partition_key), next),
+         :ok <- flow_history_put_planned(state, record, next, "cancelled", now_ms),
+         :ok <- flow_after_history_put(state, next) do
+      flow_maybe_cancel_children_on_parent_closed(state, next, now_ms)
+    end
+  end
+
+  defp flow_apply_child_terminal_chain(state, child, status, now_ms) do
+    parent_id = Map.get(child, :parent_flow_id)
+    parent_partition = Map.get(child, :parent_partition_key) || Map.get(child, :partition_key)
+
+    if is_binary(parent_id) and parent_id != "" and status in ["completed", "failed", "cancelled"] do
+      parent_state =
+        cross_shard_state_for_key(state, FlowKeys.state_key(parent_id, parent_partition))
+
+      case flow_read_record(parent_state, parent_id, parent_partition) do
+        nil ->
+          :ok
+
+        parent ->
+          case flow_child_terminal_parent_next(parent, child, status, now_ms) do
+            {:ok, nil} ->
+              :ok
+
+            {:ok, next_parent} ->
+              with :ok <-
+                     flow_apply_parent_update(
+                       parent_state,
+                       parent,
+                       next_parent,
+                       "child_#{status}",
+                       now_ms
+                     ),
+                   :ok <-
+                     flow_maybe_cancel_children_on_parent_closed(
+                       parent_state,
+                       next_parent,
+                       now_ms
+                     ) do
+                flow_maybe_apply_resolved_parent_terminal_cross(state, next_parent, now_ms)
+              end
+          end
+      end
+    else
+      :ok
+    end
+  end
+
+  defp flow_maybe_apply_resolved_parent_terminal_cross(state, parent, now_ms) do
+    case Map.get(parent, :state) do
+      "completed" -> flow_apply_child_terminal_chain(state, parent, "completed", now_ms)
+      "failed" -> flow_apply_child_terminal_chain(state, parent, "failed", now_ms)
+      "cancelled" -> flow_apply_child_terminal_chain(state, parent, "cancelled", now_ms)
+      _state -> :ok
+    end
+  end
+
   defp flow_maybe_cancel_children_on_parent_closed(state, parent, now_ms) do
     if Ferricstore.Flow.LMDB.terminal_state?(Map.get(parent, :state)) do
       flow_cancel_children_on_parent_closed(state, parent, now_ms)
@@ -6180,23 +6466,24 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_cancel_children_on_parent_closed(state, parent, now_ms) do
     groups = flow_child_groups(parent)
 
-    {updated_groups, child_ids} =
+    {updated_groups, child_refs} =
       Enum.reduce(groups, {groups, []}, fn {group_id, group}, {groups_acc, child_acc} ->
         if flow_group_should_cancel_children?(group) do
-          running_ids = flow_group_running_child_ids(group)
+          running_refs = flow_group_running_child_refs(group, Map.get(parent, :partition_key))
+          running_ids = Enum.map(running_refs, fn {child_id, _partition_key} -> child_id end)
           updated_group = flow_group_mark_children_cancelled(group, running_ids)
-          {Map.put(groups_acc, group_id, updated_group), running_ids ++ child_acc}
+          {Map.put(groups_acc, group_id, updated_group), running_refs ++ child_acc}
         else
           {groups_acc, child_acc}
         end
       end)
 
-    child_ids = Enum.uniq(child_ids)
+    child_refs = Enum.uniq(child_refs)
 
-    if child_ids == [] do
+    if child_refs == [] do
       :ok
     else
-      with :ok <- flow_cancel_direct_children(state, parent, child_ids, now_ms),
+      with :ok <- flow_cancel_direct_children(state, child_refs, now_ms),
            {:ok, updated_parent} <-
              flow_parent_with_updated_child_groups(parent, updated_groups, now_ms) do
         flow_apply_parent_update(state, parent, updated_parent, "children_cancelled", now_ms)
@@ -6212,12 +6499,17 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_group_should_cancel_children?(_group), do: false
 
-  defp flow_group_running_child_ids(group) do
+  defp flow_group_running_child_refs(group, default_partition_key) do
+    child_partitions = Map.get(group, "child_partitions", %{})
+
     group
     |> Map.get("children", %{})
     |> Enum.flat_map(fn
-      {child_id, "running"} -> [child_id]
-      _other -> []
+      {child_id, "running"} ->
+        [{child_id, Map.get(child_partitions, child_id, default_partition_key)}]
+
+      _other ->
+        []
     end)
   end
 
@@ -6245,9 +6537,11 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
-  defp flow_cancel_direct_children(state, parent, child_ids, now_ms) do
-    Enum.reduce_while(child_ids, :ok, fn child_id, :ok ->
-      case flow_read_record(state, child_id, Map.get(parent, :partition_key)) do
+  defp flow_cancel_direct_children(state, child_refs, now_ms) do
+    Enum.reduce_while(child_refs, :ok, fn {child_id, partition_key}, :ok ->
+      child_state = flow_child_state_for_partition(state, child_id, partition_key)
+
+      case flow_read_record(child_state, child_id, partition_key) do
         nil ->
           {:cont, :ok}
 
@@ -6255,13 +6549,21 @@ defmodule Ferricstore.Raft.StateMachine do
           if Ferricstore.Flow.LMDB.terminal_state?(Map.get(child, :state)) do
             {:cont, :ok}
           else
-            case flow_apply_internal_child_cancel(state, child, now_ms) do
+            case flow_apply_internal_child_cancel(child_state, child, now_ms) do
               :ok -> {:cont, :ok}
               {:error, _reason} = error -> {:halt, error}
             end
           end
       end
     end)
+  end
+
+  defp flow_child_state_for_partition(state, child_id, partition_key) do
+    if cross_shard_pending_active?() do
+      cross_shard_state_for_key(state, FlowKeys.state_key(child_id, partition_key))
+    else
+      state
+    end
   end
 
   defp flow_apply_internal_child_cancel(state, child, now_ms) do
@@ -6314,28 +6616,46 @@ defmodule Ferricstore.Raft.StateMachine do
        )
        when is_binary(parent_id) and parent_id != "" and
               status in ["completed", "failed", "cancelled"] do
-    case flow_read_record(state, parent_id, partition_key) do
-      nil ->
-        :ok
+    parent_partition_key = Map.get(child, :parent_partition_key) || partition_key
 
-      parent ->
-        case flow_child_terminal_parent_next(parent, child, status, now_ms) do
-          {:ok, nil} ->
-            :ok
-
-          {:ok, next_parent} ->
-            with :ok <-
-                   flow_apply_parent_update(
-                     state,
-                     parent,
-                     next_parent,
-                     "child_#{status}",
-                     now_ms
-                   ),
-                 :ok <- flow_maybe_cancel_children_on_parent_closed(state, next_parent, now_ms) do
-              flow_maybe_apply_resolved_parent_terminal(state, next_parent, now_ms)
-            end
+    if parent_partition_key != partition_key and not cross_shard_pending_active?() do
+      :ok
+    else
+      parent_state =
+        if cross_shard_pending_active?() do
+          cross_shard_state_for_key(state, FlowKeys.state_key(parent_id, parent_partition_key))
+        else
+          state
         end
+
+      case flow_read_record(parent_state, parent_id, parent_partition_key) do
+        nil ->
+          :ok
+
+        parent ->
+          case flow_child_terminal_parent_next(parent, child, status, now_ms) do
+            {:ok, nil} ->
+              :ok
+
+            {:ok, next_parent} ->
+              with :ok <-
+                     flow_apply_parent_update(
+                       parent_state,
+                       parent,
+                       next_parent,
+                       "child_#{status}",
+                       now_ms
+                     ),
+                   :ok <-
+                     flow_maybe_cancel_children_on_parent_closed(
+                       parent_state,
+                       next_parent,
+                       now_ms
+                     ) do
+                flow_maybe_apply_resolved_parent_terminal(parent_state, next_parent, now_ms)
+              end
+          end
+      end
     end
   end
 
@@ -8366,19 +8686,70 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp raw_put_cold(state, key, value, expire_at_ms, lfu) do
     disk_val = to_disk_binary(value)
-    record_pending_original(state, key)
 
-    unless standalone_staged_apply?() do
-      track_keydir_binary_delta(state, key, nil)
+    if cross_shard_pending_active?() do
+      ets_val = nil
+      cross_shard_raw_put(state, key, ets_val, disk_val, expire_at_ms, lfu)
+    else
+      record_pending_original(state, key)
 
-      :ets.insert(
-        state.ets,
-        {key, nil, expire_at_ms, lfu, :pending, 0, byte_size(disk_val)}
-      )
+      unless standalone_staged_apply?() do
+        track_keydir_binary_delta(state, key, nil)
+
+        :ets.insert(
+          state.ets,
+          {key, nil, expire_at_ms, lfu, :pending, 0, byte_size(disk_val)}
+        )
+      end
+
+      queue_pending_put_cold(key, disk_val, expire_at_ms, lfu)
+      :ok
     end
+  end
 
-    queue_pending_put_cold(key, disk_val, expire_at_ms, lfu)
+  defp cross_shard_raw_put(state, key, ets_val, disk_val, expire_at_ms, lfu) do
+    ctx = cross_shard_pending_ctx(state)
+    record_cross_shard_pending_original(ctx, key)
+
+    track_keydir_binary_delta_for_keydir(state, ctx.keydir, ctx.index, key, ets_val)
+
+    :ets.insert(
+      ctx.keydir,
+      {key, ets_val, expire_at_ms, lfu, :pending, 0, byte_size(disk_val)}
+    )
+
+    queue_cross_shard_pending_put(ctx, key, disk_val, expire_at_ms, ets_val)
     :ok
+  end
+
+  defp cross_shard_pending_ctx(state) do
+    %{
+      keydir: state.ets,
+      index: state.shard_index,
+      active_file_path: state.active_file_path,
+      active_file_id: state.active_file_id
+    }
+  end
+
+  defp cross_shard_pending_active? do
+    is_list(Process.get(:sm_cross_shard_pending_writes, :undefined))
+  end
+
+  defp track_keydir_binary_delta_for_keydir(state, keydir, shard_index, key, new_value) do
+    ref = keydir_binary_ref(state)
+
+    if ref do
+      new_bytes = binary_byte_size(key) + binary_byte_size(new_value)
+
+      old_bytes =
+        case :ets.lookup(keydir, key) do
+          [{^key, old_val, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(old_val)
+          _ -> 0
+        end
+
+      delta = new_bytes - old_bytes
+      if delta != 0, do: :atomics.add(ref, shard_index + 1, delta)
+    end
   end
 
   defp flow_record_lfu(%{version: version}, _value) when is_integer(version) do
@@ -8403,29 +8774,35 @@ defmodule Ferricstore.Raft.StateMachine do
     ets_val = value_for_ets(value, hot_cache_threshold(state))
     disk_val = to_disk_binary(value)
 
-    record_pending_original(state, key)
+    if cross_shard_pending_active?() do
+      cross_shard_raw_put(state, key, ets_val, disk_val, expire_at_ms, LFU.initial())
+      maybe_queue_lmdb_policy_put(key, disk_val, expire_at_ms)
+      :ok
+    else
+      record_pending_original(state, key)
 
-    unless standalone_staged_apply?() do
-      # Track binary memory: subtract old entry's bytes, add new entry's bytes.
-      # This gives MemoryGuard accurate off-heap binary accounting.
-      track_keydir_binary_delta(state, key, ets_val)
+      unless standalone_staged_apply?() do
+        # Track binary memory: subtract old entry's bytes, add new entry's bytes.
+        # This gives MemoryGuard accurate off-heap binary accounting.
+        track_keydir_binary_delta(state, key, ets_val)
 
-      # Insert into ETS immediately so subsequent read-modify-write commands
-      # (INCR, APPEND, etc.) in the same batch see the correct value.
-      # The file_id is :pending — flush_pending_writes will update it with
-      # the real offset after the batch NIF call.
-      :ets.insert(
-        state.ets,
-        {key, ets_val, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
-      )
+        # Insert into ETS immediately so subsequent read-modify-write commands
+        # (INCR, APPEND, etc.) in the same batch see the correct value.
+        # The file_id is :pending — flush_pending_writes will update it with
+        # the real offset after the batch NIF call.
+        :ets.insert(
+          state.ets,
+          {key, ets_val, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
+        )
+      end
+
+      # Accumulate for batch disk write — flushed by flush_pending_writes
+      # at the end of apply/3 before returning to ra.
+      queue_pending_put(key, disk_val, expire_at_ms)
+      maybe_queue_lmdb_policy_put(key, disk_val, expire_at_ms)
+
+      :ok
     end
-
-    # Accumulate for batch disk write — flushed by flush_pending_writes
-    # at the end of apply/3 before returning to ra.
-    queue_pending_put(key, disk_val, expire_at_ms)
-    maybe_queue_lmdb_policy_put(key, disk_val, expire_at_ms)
-
-    :ok
   end
 
   defp do_set(state, key, value, expire_at_ms, opts) do

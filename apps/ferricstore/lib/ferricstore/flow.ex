@@ -26,7 +26,7 @@ defmodule Ferricstore.Flow do
   # Flow records and history are durable bytes. Before Flow is public, keep one
   # current compact schema and change it directly. Once users can have persisted
   # Flow data, incompatible field-order/type changes need explicit migration.
-  @record_bin_magic "FSF3"
+  @record_bin_magic "FSF4"
   @history_bin_magic "FSH1"
 
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
@@ -1056,6 +1056,7 @@ defmodule Ferricstore.Flow do
       encode_bin(Map.get(record, :partition_key)),
       encode_bin(Map.get(record, :payload_ref)),
       encode_bin(Map.get(record, :parent_flow_id)),
+      encode_bin(Map.get(record, :parent_partition_key)),
       encode_bin(Map.get(record, :root_flow_id)),
       encode_bin(Map.get(record, :correlation_id)),
       encode_bin(Map.get(record, :result_ref)),
@@ -1221,6 +1222,7 @@ defmodule Ferricstore.Flow do
          {:ok, partition_key, rest} <- decode_bin(rest),
          {:ok, payload_ref, rest} <- decode_bin(rest),
          {:ok, parent_flow_id, rest} <- decode_bin(rest),
+         {:ok, parent_partition_key, rest} <- decode_bin(rest),
          {:ok, root_flow_id, rest} <- decode_bin(rest),
          {:ok, correlation_id, rest} <- decode_bin(rest),
          {:ok, result_ref, rest} <- decode_bin(rest),
@@ -1249,6 +1251,7 @@ defmodule Ferricstore.Flow do
         partition_key: partition_key,
         payload_ref: payload_ref,
         parent_flow_id: parent_flow_id,
+        parent_partition_key: parent_partition_key,
         root_flow_id: root_flow_id,
         correlation_id: correlation_id,
         result_ref: result_ref,
@@ -2497,16 +2500,9 @@ defmodule Ferricstore.Flow do
          {:ok, lease_token} <- optional_lease_token(opts),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, now} <- optional_now_ms(opts),
-         {:ok, child_attrs} <-
-           create_many_attrs(
-             children,
-             opts,
-             partition_key,
-             "ERR flow child partition_key must match parent partition_key"
-           ),
+         {:ok, child_attrs} <- create_many_attrs(children, opts, partition_key, :allow_override),
          :ok <- validate_unique_create_ids(child_attrs),
          :ok <- validate_no_parent_child_id(parent_id, child_attrs),
-         :ok <- validate_spawn_child_partitions(child_attrs, partition_key),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(parent_id, partition_key)) do
       attrs =
         %{
@@ -2537,14 +2533,6 @@ defmodule Ferricstore.Flow do
       {:error, "ERR flow child id must differ from parent id"}
     else
       :ok
-    end
-  end
-
-  defp validate_spawn_child_partitions(child_attrs, partition_key) do
-    if Enum.all?(child_attrs, &(Map.get(&1, :partition_key) == partition_key)) do
-      :ok
-    else
-      {:error, "ERR flow child partition_key must match parent partition_key"}
     end
   end
 
@@ -3742,6 +3730,13 @@ defmodule Ferricstore.Flow do
   defp many_item_partition_key(nil, item_opts, _mismatch_error) do
     item_opts
     |> Keyword.get(:partition_key)
+    |> required_partition_key()
+  end
+
+  defp many_item_partition_key(partition_key, item_opts, :allow_override)
+       when is_binary(partition_key) do
+    item_opts
+    |> Keyword.get(:partition_key, partition_key)
     |> required_partition_key()
   end
 

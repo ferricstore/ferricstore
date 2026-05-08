@@ -160,6 +160,7 @@ defmodule Ferricstore.FlowTest do
       partition_key: "tenant-a",
       payload_ref: "payload:1",
       parent_flow_id: "parent-1",
+      parent_partition_key: nil,
       root_flow_id: "root-1",
       correlation_id: "order-1",
       result_ref: "result:1",
@@ -177,7 +178,7 @@ defmodule Ferricstore.FlowTest do
     normal_record = Map.delete(record, :rewound_to_event_id)
     term_record = :erlang.term_to_binary(record)
 
-    assert "FSF3" <> _ = compact
+    assert "FSF4" <> _ = compact
     assert Ferricstore.Flow.decode_record(compact) == record
 
     assert Ferricstore.Flow.decode_record(Ferricstore.Flow.encode_record(normal_record)) ==
@@ -1417,11 +1418,10 @@ defmodule Ferricstore.FlowTest do
     assert cancelled_sibling.state == "cancelled"
   end
 
-  test "flow_spawn_children rejects child partition overrides" do
+  test "flow_spawn_children supports child partition overrides across shards" do
     parent = uid("flow-parent-cross-partition")
     child = uid("flow-child-cross-partition")
-    partition = uid("tenant")
-    other_partition = uid("other-tenant")
+    {partition, _same_partition, other_partition} = mixed_partition_keys()
 
     assert {:ok, created_parent} =
              FerricStore.flow_create(parent,
@@ -1430,7 +1430,7 @@ defmodule Ferricstore.FlowTest do
                partition_key: partition
              )
 
-    assert {:error, "ERR flow child partition_key must match parent partition_key"} =
+    assert {:ok, waiting} =
              FerricStore.flow_spawn_children(
                parent,
                [%{id: child, type: "child", partition_key: other_partition}],
@@ -1444,6 +1444,66 @@ defmodule Ferricstore.FlowTest do
                from_state: "dispatch",
                fencing_token: created_parent.fencing_token
              )
+
+    assert waiting.state == "waiting_children"
+    assert waiting.child_groups["fanout"]["children"][child] == "running"
+    assert waiting.child_groups["fanout"]["child_partitions"][child] == other_partition
+
+    assert {:ok, child_record} = FerricStore.flow_get(child, partition_key: other_partition)
+    assert child_record.parent_flow_id == parent
+    assert child_record.parent_partition_key == partition
+
+    claimed = create_claimed_flow_child(child, other_partition, "worker-cross")
+
+    assert {:ok, _child_done} =
+             FerricStore.flow_complete(child, claimed.lease_token,
+               partition_key: other_partition,
+               fencing_token: claimed.fencing_token
+             )
+
+    assert {:ok, done_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert done_parent.state == "children_done"
+    assert done_parent.child_groups["fanout"]["children"][child] == "completed"
+  end
+
+  test "terminal parent cancellation cancels cross-shard children" do
+    parent = uid("flow-parent-cross-cancel")
+    child = uid("flow-child-cross-cancel")
+    {partition, _same_partition, other_partition} = mixed_partition_keys()
+
+    assert {:ok, created_parent} =
+             FerricStore.flow_create(parent,
+               type: "parent",
+               state: "dispatch",
+               partition_key: partition
+             )
+
+    assert {:ok, waiting} =
+             FerricStore.flow_spawn_children(
+               parent,
+               [%{id: child, type: "child", partition_key: other_partition}],
+               group_id: "fanout",
+               wait: :all,
+               wait_state: "waiting_children",
+               on_child_failed: :ignore,
+               on_parent_closed: :cancel_children,
+               exhaust_to: %{success: "children_done", failure: "children_failed"},
+               partition_key: partition,
+               from_state: "dispatch",
+               fencing_token: created_parent.fencing_token
+             )
+
+    assert {:ok, _cancelled_parent} =
+             FerricStore.flow_cancel(parent,
+               partition_key: partition,
+               fencing_token: waiting.fencing_token
+             )
+
+    assert {:ok, cancelled_child} = FerricStore.flow_get(child, partition_key: other_partition)
+    assert cancelled_child.state == "cancelled"
+
+    assert {:ok, final_parent} = FerricStore.flow_get(parent, partition_key: partition)
+    assert final_parent.child_groups["fanout"]["children"][child] == "cancelled"
   end
 
   test "flow_create_many spans shards and rolls back failing shard group" do

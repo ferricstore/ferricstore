@@ -2902,8 +2902,58 @@ defmodule Ferricstore.Store.Router do
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
     else
-      idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_spawn_children, key, attrs})
+      child_keys =
+        attrs
+        |> Map.get(:children, [])
+        |> Enum.map(fn %{id: child_id, partition_key: child_partition} ->
+          Ferricstore.Flow.Keys.state_key(child_id, child_partition)
+        end)
+
+      keys = [key | child_keys]
+
+      if flow_keys_cross_shard?(ctx, keys) do
+        flow_cross_shard_tx(ctx, keys, {:flow_cross_spawn_children, attrs})
+      else
+        idx = shard_for(ctx, key)
+        raft_write(ctx, idx, key, {:flow_spawn_children, key, attrs})
+      end
+    end
+  end
+
+  defp flow_keys_cross_shard?(ctx, [first | rest]) do
+    first_idx = shard_for(ctx, first)
+    Enum.any?(rest, &(shard_for(ctx, &1) != first_idx))
+  end
+
+  defp flow_keys_cross_shard?(_ctx, _keys), do: false
+
+  defp flow_cross_shard_tx(ctx, keys, entry) do
+    _route_keys = keys
+
+    # Flow child closure can discover additional child shards while applying
+    # parent terminal policies, so take a conservative all-shard transaction.
+    shards = Enum.to_list(0..(ctx.shard_count - 1))
+
+    anchor_idx = hd(shards)
+
+    shard_batches =
+      Enum.map(shards, fn
+        ^anchor_idx -> {anchor_idx, [{0, entry}], nil}
+        shard_idx -> {shard_idx, [], nil}
+      end)
+
+    result =
+      if ctx.name == :default && !Ferricstore.ReplicationMode.raft?() do
+        standalone_cross_shard_tx(ctx, shard_batches)
+      else
+        anchor_key = "f:{flow-cross-shard}:tx"
+        raft_write(ctx, anchor_idx, anchor_key, {:cross_shard_tx, shard_batches})
+      end
+
+    case result do
+      %{^anchor_idx => [reply]} -> reply
+      {:error, _reason} = error -> error
+      other -> other
     end
   end
 
@@ -3132,8 +3182,14 @@ defmodule Ferricstore.Store.Router do
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
     else
-      idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_complete, key, attrs})
+      case flow_cross_terminal_keys(ctx, id, Map.get(attrs, :partition_key)) do
+        {:ok, keys} ->
+          flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal, :complete, attrs})
+
+        :same_or_none ->
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_complete, key, attrs})
+      end
     end
   end
 
@@ -3264,8 +3320,14 @@ defmodule Ferricstore.Store.Router do
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
     else
-      idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_fail, key, attrs})
+      case flow_cross_terminal_keys(ctx, id, Map.get(attrs, :partition_key)) do
+        {:ok, keys} ->
+          flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal, :fail, attrs})
+
+        :same_or_none ->
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_fail, key, attrs})
+      end
     end
   end
 
@@ -3293,9 +3355,72 @@ defmodule Ferricstore.Store.Router do
     if byte_size(key) > @max_key_size do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
     else
-      idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_cancel, key, attrs})
+      case flow_cross_terminal_keys(ctx, id, Map.get(attrs, :partition_key)) do
+        {:ok, keys} ->
+          flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal, :cancel, attrs})
+
+        :same_or_none ->
+          idx = shard_for(ctx, key)
+          raft_write(ctx, idx, key, {:flow_cancel, key, attrs})
+      end
     end
+  end
+
+  defp flow_cross_terminal_keys(ctx, id, partition_key) do
+    child_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    case flow_get(ctx, id, partition_key) do
+      value when is_binary(value) ->
+        record = Ferricstore.Flow.decode_record(value)
+
+        keys =
+          [child_key]
+          |> flow_maybe_add_parent_key(record)
+          |> flow_add_child_group_keys(record)
+          |> Enum.uniq()
+
+        if flow_keys_cross_shard?(ctx, keys) do
+          {:ok, keys}
+        else
+          :same_or_none
+        end
+
+      _other ->
+        :same_or_none
+    end
+  rescue
+    _ -> :same_or_none
+  end
+
+  defp flow_maybe_add_parent_key(keys, record) do
+    parent_id = Map.get(record, :parent_flow_id)
+    parent_partition = Map.get(record, :parent_partition_key) || Map.get(record, :partition_key)
+
+    if is_binary(parent_id) and parent_id != "" do
+      [Ferricstore.Flow.Keys.state_key(parent_id, parent_partition) | keys]
+    else
+      keys
+    end
+  end
+
+  defp flow_add_child_group_keys(keys, record) do
+    record
+    |> Map.get(:child_groups, %{})
+    |> Enum.flat_map(fn {_group_id, group} ->
+      child_partitions = Map.get(group, "child_partitions", %{})
+
+      group
+      |> Map.get("children", %{})
+      |> Enum.flat_map(fn
+        {child_id, "running"} ->
+          child_partition = Map.get(child_partitions, child_id, Map.get(record, :partition_key))
+          [Ferricstore.Flow.Keys.state_key(child_id, child_partition)]
+
+        _other ->
+          []
+      end)
+    end)
+    |> Kernel.++(keys)
   end
 
   @doc false
