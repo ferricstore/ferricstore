@@ -328,11 +328,14 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
   test "standalone command key audit covers multi-key writes" do
     compound_key = Ferricstore.Store.CompoundKey.zset_member("zset-key", "member")
     owner_ref = make_ref()
+    flow_a = Ferricstore.Flow.Keys.state_key("flow-a", "tenant-a")
+    flow_b = Ferricstore.Flow.Keys.state_key("flow-b", "tenant-a")
+    flow_batch = Ferricstore.Flow.Keys.state_key("__complete_batch__", "tenant-a")
 
     assert standalone_keys({:list_op_lmove, "source", "destination", :left, :right}) ==
              ["destination", "source"]
 
-    assert standalone_keys({:pfmerge, "destination", ["source-a", "source-b"]}) ==
+    assert standalone_keys({:pfmerge, "destination", ["source-a", "source-b"], [:sketch_a]}) ==
              ["destination", "source-a", "source-b"]
 
     assert standalone_keys({:cms_merge, "destination", ["source-a", "source-b"], [1, 1], nil}) ==
@@ -346,6 +349,44 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
 
     assert standalone_keys({:compound_put, compound_key, "1.0", 0}) == ["zset-key"]
     assert standalone_keys({:locked_delete_prefix, compound_key, owner_ref}) == ["zset-key"]
+
+    assert standalone_keys({:compound_batch_put, "hash-key", [{compound_key, "1", 0}]}) == [
+             "hash-key"
+           ]
+
+    expected_flow_keys = Enum.sort([flow_batch, flow_a, flow_b])
+
+    assert standalone_keys(
+             {:flow_complete_many, flow_batch,
+              %{
+                records: [
+                  %{id: "flow-a", partition_key: "tenant-a"},
+                  %{id: "flow-b", partition_key: "tenant-a"}
+                ]
+              }}
+           ) == expected_flow_keys
+
+    assert standalone_keys({:flow_claim_due, "f:{tenant-a}:d", %{limit: 10}}) == [
+             "__standalone_global__"
+           ]
+
+    assert standalone_keys({:server_command, {:opaque, :write}}) == ["__standalone_global__"]
+
+    assert standalone_keys({:cross_shard_tx, %{0 => [{:put, "k", "v", 0}]}}) == [
+             "__standalone_global__"
+           ]
+  end
+
+  test "standalone global command key conflicts with ordinary key writes" do
+    refute standalone_conflict?({:put, "a", "1", 0}, {:put, "b", "2", 0})
+    assert standalone_conflict?({:put, "a", "1", 0}, {:put, "a", "2", 0})
+
+    assert standalone_conflict?(
+             {:flow_claim_due, "f:{tenant-a}:d", %{limit: 1}},
+             {:put, "a", "1", 0}
+           )
+
+    assert standalone_conflict?({:put, "a", "1", 0}, {:server_command, :opaque})
   end
 
   test "standalone blocked fsync does not let same-key write publish early" do
@@ -571,6 +612,10 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
 
   defp standalone_keys(command) do
     Ferricstore.Store.Shard.__standalone_command_keys_for_test__(command)
+  end
+
+  defp standalone_conflict?(left, right) do
+    Ferricstore.Store.Shard.__standalone_command_keys_conflict_for_test__(left, right)
   end
 
   defp eventually(fun, timeout_ms \\ 2_000) do

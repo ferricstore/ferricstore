@@ -671,6 +671,12 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
+  def apply(meta, {:pfmerge, dest_key, _source_keys, source_sketches}, state) do
+    apply_pending_with_time(meta, state, fn ->
+      do_pfmerge(state, dest_key, source_sketches)
+    end)
+  end
+
   def apply(meta, {:json_set, key, path, value, flags}, state) do
     apply_pending_with_time(meta, state, fn ->
       Json.handle_ast({:json_set, key, path, value, flags}, build_string_value_store(state))
@@ -3303,6 +3309,10 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp apply_single(state, {:pfmerge, dest_key, source_sketches}) do
+    do_pfmerge(state, dest_key, source_sketches)
+  end
+
+  defp apply_single(state, {:pfmerge, dest_key, _source_keys, source_sketches}) do
     do_pfmerge(state, dest_key, source_sketches)
   end
 

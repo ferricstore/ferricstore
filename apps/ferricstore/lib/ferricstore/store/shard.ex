@@ -69,6 +69,15 @@ defmodule Ferricstore.Store.Shard do
   @cold_read_timeout_ms 10_000
   @cold_read_compaction_retry_attempts 8
   @cold_read_compaction_retry_delay_ms 1
+  @standalone_global_key "__standalone_global__"
+  @standalone_flow_many_commands [
+    :flow_create_many,
+    :flow_complete_many,
+    :flow_transition_many,
+    :flow_retry_many,
+    :flow_fail_many,
+    :flow_cancel_many
+  ]
 
   # Default maximum active file size before rotation (256 MB).
   # Configurable via :max_active_file_size application env.
@@ -1455,8 +1464,11 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp standalone_entry_conflicts?({_from, _command, keys}, inflight_keys) do
-    not MapSet.disjoint?(keys, inflight_keys)
+    standalone_global_keys?(keys) or standalone_global_keys?(inflight_keys) or
+      not MapSet.disjoint?(keys, inflight_keys)
   end
+
+  defp standalone_global_keys?(keys), do: MapSet.member?(keys, @standalone_global_key)
 
   defp standalone_entries_keys(entries) do
     Enum.reduce(entries, MapSet.new(), fn {_from, _command, keys}, acc ->
@@ -1472,12 +1484,37 @@ defmodule Ferricstore.Store.Shard do
     |> standalone_nonempty_keys()
   end
 
+  defp standalone_command_keys({:async, _origin, command}) when is_tuple(command) do
+    standalone_command_keys(command)
+  end
+
+  defp standalone_command_keys({:async, command}) when is_tuple(command) do
+    standalone_command_keys(command)
+  end
+
+  defp standalone_command_keys({command, %{hlc_ts: _remote_ts}}) when is_tuple(command) do
+    standalone_command_keys(command)
+  end
+
+  defp standalone_command_keys({:cross_shard_tx, _shard_batches}) do
+    standalone_global_keys()
+  end
+
+  defp standalone_command_keys({:server_command, _command}) do
+    standalone_global_keys()
+  end
+
   defp standalone_command_keys({:list_op_lmove, source, destination, _from_dir, _to_dir}) do
     MapSet.new([standalone_lock_key(source), standalone_lock_key(destination)])
   end
 
   defp standalone_command_keys({:pfmerge, destination, sources}) when is_list(sources) do
     standalone_lock_keys([destination | sources])
+  end
+
+  defp standalone_command_keys({:pfmerge, destination, source_keys, _source_sketches})
+       when is_list(source_keys) do
+    standalone_lock_keys([destination | source_keys])
   end
 
   defp standalone_command_keys({:cms_merge, destination, sources, _weights, _create_params})
@@ -1530,14 +1567,25 @@ defmodule Ferricstore.Store.Shard do
     MapSet.new([standalone_lock_key(prefix)])
   end
 
+  defp standalone_command_keys({command, route_key, %{records: records}})
+       when command in @standalone_flow_many_commands and is_list(records) do
+    standalone_flow_record_keys(route_key, records)
+  end
+
+  defp standalone_command_keys({:flow_claim_due, _route_key, _attrs}) do
+    # Claims discover and mutate record keys by scanning due indexes, so the
+    # exact write set is not knowable before the state machine runs.
+    standalone_global_keys()
+  end
+
   defp standalone_command_keys(command) when is_tuple(command) and tuple_size(command) > 1 do
     case elem(command, 1) do
       key when is_binary(key) -> MapSet.new([standalone_lock_key(key)])
-      _other -> MapSet.new(["__standalone_global__"])
+      _other -> standalone_global_keys()
     end
   end
 
-  defp standalone_command_keys(_command), do: MapSet.new(["__standalone_global__"])
+  defp standalone_command_keys(_command), do: standalone_global_keys()
 
   defp standalone_lock_keys(keys) do
     keys
@@ -1545,7 +1593,7 @@ defmodule Ferricstore.Store.Shard do
       if is_binary(key) do
         MapSet.put(acc, standalone_lock_key(key))
       else
-        MapSet.put(acc, "__standalone_global__")
+        MapSet.put(acc, @standalone_global_key)
       end
     end)
     |> standalone_nonempty_keys()
@@ -1557,9 +1605,27 @@ defmodule Ferricstore.Store.Shard do
 
   defp standalone_nonempty_keys(keys) do
     if MapSet.size(keys) == 0 do
-      MapSet.new(["__standalone_global__"])
+      standalone_global_keys()
     else
       keys
+    end
+  end
+
+  defp standalone_global_keys, do: MapSet.new([@standalone_global_key])
+
+  defp standalone_flow_record_keys(route_key, records) do
+    records
+    |> Enum.reduce_while([route_key], fn
+      %{id: id} = attrs, acc when is_binary(id) ->
+        key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+        {:cont, [key | acc]}
+
+      _record, _acc ->
+        {:halt, :global}
+    end)
+    |> case do
+      :global -> standalone_global_keys()
+      keys -> standalone_lock_keys(keys)
     end
   end
 
@@ -1586,6 +1652,14 @@ defmodule Ferricstore.Store.Shard do
     |> standalone_command_keys()
     |> MapSet.to_list()
     |> Enum.sort()
+  end
+
+  @doc false
+  def __standalone_command_keys_conflict_for_test__(left, right) do
+    left_keys = standalone_command_keys(left)
+    right_keys = standalone_command_keys(right)
+
+    standalone_entry_conflicts?({nil, left, left_keys}, right_keys)
   end
 
   defp shared_write_version(%{instance_ctx: %{write_version: write_version}, index: index}) do

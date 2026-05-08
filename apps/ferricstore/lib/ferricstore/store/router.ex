@@ -3235,7 +3235,7 @@ defmodule Ferricstore.Store.Router do
       when is_binary(dest_key) and is_list(source_keys) and source_keys != [] do
     with {:ok, [_dest_sketch | source_sketches]} <-
            hll_read_sketches(ctx, [dest_key | source_keys]) do
-      forced_single_key_quorum(ctx, dest_key, {:pfmerge, dest_key, source_sketches})
+      forced_single_key_quorum(ctx, dest_key, {:pfmerge, dest_key, source_keys, source_sketches})
     end
   end
 
