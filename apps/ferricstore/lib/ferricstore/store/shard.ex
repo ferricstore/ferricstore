@@ -1734,6 +1734,11 @@ defmodule Ferricstore.Store.Shard do
     standalone_flow_record_keys(route_key, records)
   end
 
+  defp standalone_command_keys({:flow_spawn_children, route_key, %{children: children}})
+       when is_list(children) do
+    standalone_flow_record_keys(route_key, children)
+  end
+
   defp standalone_command_keys({:flow_claim_due, _route_key, _attrs}) do
     # Claims discover and mutate record keys by scanning due indexes, so the
     # exact write set is not knowable before the state machine runs.

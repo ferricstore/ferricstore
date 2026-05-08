@@ -441,6 +441,10 @@ defmodule FerricStore.Macro do
         FerricStore.Impl.flow_create_many(__instance__(), partition_key, items, opts)
       end
 
+      def flow_spawn_children(parent_id, children, opts \\ []) do
+        FerricStore.Impl.flow_spawn_children(__instance__(), parent_id, children, opts)
+      end
+
       def flow_get(id, opts \\ []) do
         FerricStore.Impl.flow_get(__instance__(), id, opts)
       end

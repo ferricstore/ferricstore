@@ -20,15 +20,13 @@ defmodule Ferricstore.Flow do
   @default_max_count 10_000
   @default_lmdb_query_scan_limit 10_000
   @terminal_states ["completed", "failed", "cancelled"]
-  @record_tag :flow_record_v1
   @history_tag :flow_history_v1
   @value_bin_magic "FSV1"
 
   # Flow records and history are durable bytes. Before Flow is public, keep one
   # current compact schema and change it directly. Once users can have persisted
   # Flow data, incompatible field-order/type changes need explicit migration.
-  @record_bin_magic_v1 "FSF1"
-  @record_bin_magic "FSF2"
+  @record_bin_magic "FSF3"
   @history_bin_magic "FSH1"
 
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
@@ -95,6 +93,27 @@ defmodule Ferricstore.Flow do
   end
 
   def create_many(_ctx, _partition_key, _items, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  def spawn_children(ctx, parent_id, children, opts)
+      when is_binary(parent_id) and is_list(children) and is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with {:ok, attrs} <- spawn_children_attrs(parent_id, children, opts) do
+        Router.flow_spawn_children(ctx, attrs)
+      end
+
+    observe_flow(:spawn_children, started, result, %{flow_id: parent_id})
+  end
+
+  def spawn_children(_ctx, parent_id, _children, _opts) when not is_binary(parent_id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def spawn_children(_ctx, _parent_id, children, _opts) when not is_list(children),
+    do: {:error, "ERR flow children must be a non-empty list"}
+
+  def spawn_children(_ctx, _parent_id, _children, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
   def get(ctx, id, opts \\ []) when is_binary(id) and is_list(opts) do
@@ -1014,16 +1033,9 @@ defmodule Ferricstore.Flow do
 
   @doc false
   # Encodes the current Flow metadata schema. User payload bytes are not encoded
-  # here; only payload_ref/result_ref/error_ref metadata is stored. Adding fields
-  # to this binary requires a decoder compatibility decision:
-  #
-  #   * compatible append with old defaults: old decoder must reject or never see
-  #     the new magic during rolling upgrade;
-  #   * incompatible layout/type change: introduce a new magic and decode both;
-  #   * removing/renaming a field: keep decoding old bytes into the current map.
-  #
-  # Tests should keep golden FSF1 fixtures so future changes prove old data can
-  # still boot, query, transition, and compact.
+  # here; only payload_ref/result_ref/error_ref metadata is stored. Flow records
+  # are not public-persisted yet, so this intentionally supports one current
+  # format.
   def encode_record(record) when is_map(record) do
     [
       @record_bin_magic,
@@ -1052,7 +1064,8 @@ defmodule Ferricstore.Flow do
       encode_bin(Map.get(record, :lease_token)),
       encode_int(Map.get(record, :lease_deadline_ms)),
       encode_bin(Map.get(record, :run_state)),
-      encode_bin(Map.get(record, :rewound_to_event_id))
+      encode_bin(Map.get(record, :rewound_to_event_id)),
+      encode_term(Map.get(record, :child_groups, %{}))
     ]
     |> IO.iodata_to_binary()
   end
@@ -1070,138 +1083,10 @@ defmodule Ferricstore.Flow do
   def decode_value(value), do: value
 
   @doc false
-  # Decodes all supported durable Flow record formats into the current runtime
-  # map shape. This function is on the recovery path for Bitcask, LMDB mirror,
-  # Ra replay, and query hydration, so unknown or corrupt bytes must fail
-  # cleanly. Never remove an old magic decoder until there is a deliberate
-  # offline migration that rewrites every stored record and blocks downgrade.
+  # Flow has not shipped as a public durable format yet, so recovery accepts
+  # only the current compact record encoding.
   def decode_record(@record_bin_magic <> rest), do: decode_record_bin(rest)
-  def decode_record(@record_bin_magic_v1 <> rest), do: decode_record_bin_v1(rest)
-
-  def decode_record(value) when is_binary(value) do
-    value
-    |> :erlang.binary_to_term([:safe])
-    |> decode_record_term()
-  end
-
-  defp decode_record_term({
-         @record_tag,
-         id,
-         type,
-         state,
-         version,
-         attempts,
-         fencing_token,
-         created_at_ms,
-         updated_at_ms,
-         next_run_at_ms,
-         priority,
-         ttl_ms,
-         history_max_events,
-         partition_key,
-         payload_ref,
-         parent_flow_id,
-         root_flow_id,
-         correlation_id,
-         result_ref,
-         error_ref,
-         lease_owner,
-         lease_token,
-         lease_deadline_ms,
-         run_state,
-         rewound_to_event_id
-       }) do
-    record = %{
-      id: id,
-      type: type,
-      state: state,
-      version: version,
-      attempts: attempts,
-      fencing_token: fencing_token,
-      created_at_ms: created_at_ms,
-      updated_at_ms: updated_at_ms,
-      next_run_at_ms: next_run_at_ms,
-      priority: priority,
-      ttl_ms: ttl_ms,
-      history_hot_max_events: history_max_events,
-      retention_ttl_ms: ttl_ms,
-      terminal_retention_until_ms: nil,
-      partition_key: partition_key,
-      payload_ref: payload_ref,
-      parent_flow_id: parent_flow_id,
-      root_flow_id: root_flow_id,
-      correlation_id: correlation_id,
-      result_ref: result_ref,
-      error_ref: error_ref,
-      lease_owner: lease_owner,
-      lease_token: lease_token,
-      lease_deadline_ms: lease_deadline_ms,
-      run_state: run_state
-    }
-
-    if is_nil(rewound_to_event_id) do
-      record
-    else
-      Map.put(record, :rewound_to_event_id, rewound_to_event_id)
-    end
-  end
-
-  defp decode_record_term({
-         @record_tag,
-         id,
-         type,
-         state,
-         version,
-         attempts,
-         fencing_token,
-         created_at_ms,
-         updated_at_ms,
-         next_run_at_ms,
-         priority,
-         ttl_ms,
-         history_max_events,
-         partition_key,
-         payload_ref,
-         parent_flow_id,
-         root_flow_id,
-         correlation_id,
-         result_ref,
-         error_ref,
-         lease_owner,
-         lease_token,
-         lease_deadline_ms,
-         rewound_to_event_id
-       }) do
-    decode_record_term({
-      @record_tag,
-      id,
-      type,
-      state,
-      version,
-      attempts,
-      fencing_token,
-      created_at_ms,
-      updated_at_ms,
-      next_run_at_ms,
-      priority,
-      ttl_ms,
-      history_max_events,
-      partition_key,
-      payload_ref,
-      parent_flow_id,
-      root_flow_id,
-      correlation_id,
-      result_ref,
-      error_ref,
-      lease_owner,
-      lease_token,
-      lease_deadline_ms,
-      nil,
-      rewound_to_event_id
-    })
-  end
-
-  defp decode_record_term(record) when is_map(record), do: normalize_record_map(record)
+  def decode_record(_value), do: raise(ArgumentError, "invalid flow record")
 
   @doc false
   # History entries have their own durable schema because they are retained for
@@ -1343,7 +1228,9 @@ defmodule Ferricstore.Flow do
          {:ok, lease_owner, rest} <- decode_bin(rest),
          {:ok, lease_token, rest} <- decode_bin(rest),
          {:ok, lease_deadline_ms, rest} <- decode_int(rest),
-         {:ok, run_state, rewound_to_event_id} <- decode_record_run_state_and_rewind(rest) do
+         {:ok, run_state, rest} <- decode_bin(rest),
+         {:ok, rewound_to_event_id, rest} <- decode_bin(rest),
+         {:ok, child_groups, ""} <- decode_term(rest) do
       record = %{
         id: id,
         type: type,
@@ -1369,7 +1256,8 @@ defmodule Ferricstore.Flow do
         lease_owner: lease_owner,
         lease_token: lease_token,
         lease_deadline_ms: lease_deadline_ms,
-        run_state: run_state
+        run_state: run_state,
+        child_groups: normalize_child_groups(child_groups)
       }
 
       if is_nil(rewound_to_event_id) do
@@ -1379,91 +1267,6 @@ defmodule Ferricstore.Flow do
       end
     else
       _ -> raise ArgumentError, "invalid flow record"
-    end
-  end
-
-  defp decode_record_bin_v1(rest) do
-    with {:ok, id, rest} <- decode_bin(rest),
-         {:ok, type, rest} <- decode_bin(rest),
-         {:ok, state, rest} <- decode_bin(rest),
-         {:ok, version, rest} <- decode_int(rest),
-         {:ok, attempts, rest} <- decode_int(rest),
-         {:ok, fencing_token, rest} <- decode_int(rest),
-         {:ok, created_at_ms, rest} <- decode_int(rest),
-         {:ok, updated_at_ms, rest} <- decode_int(rest),
-         {:ok, next_run_at_ms, rest} <- decode_int(rest),
-         {:ok, priority, rest} <- decode_int(rest),
-         {:ok, ttl_ms, rest} <- decode_int(rest),
-         {:ok, history_max_events, rest} <- decode_int(rest),
-         {:ok, partition_key, rest} <- decode_bin(rest),
-         {:ok, payload_ref, rest} <- decode_bin(rest),
-         {:ok, parent_flow_id, rest} <- decode_bin(rest),
-         {:ok, root_flow_id, rest} <- decode_bin(rest),
-         {:ok, correlation_id, rest} <- decode_bin(rest),
-         {:ok, result_ref, rest} <- decode_bin(rest),
-         {:ok, error_ref, rest} <- decode_bin(rest),
-         {:ok, lease_owner, rest} <- decode_bin(rest),
-         {:ok, lease_token, rest} <- decode_bin(rest),
-         {:ok, lease_deadline_ms, rest} <- decode_int(rest),
-         {:ok, run_state, rewound_to_event_id} <- decode_record_run_state_and_rewind(rest) do
-      %{
-        id: id,
-        type: type,
-        state: state,
-        version: version,
-        attempts: attempts,
-        fencing_token: fencing_token,
-        created_at_ms: created_at_ms,
-        updated_at_ms: updated_at_ms,
-        next_run_at_ms: next_run_at_ms,
-        priority: priority,
-        ttl_ms: ttl_ms,
-        history_hot_max_events: history_max_events,
-        retention_ttl_ms: ttl_ms,
-        terminal_retention_until_ms: nil,
-        partition_key: partition_key,
-        payload_ref: payload_ref,
-        parent_flow_id: parent_flow_id,
-        root_flow_id: root_flow_id,
-        correlation_id: correlation_id,
-        result_ref: result_ref,
-        error_ref: error_ref,
-        lease_owner: lease_owner,
-        lease_token: lease_token,
-        lease_deadline_ms: lease_deadline_ms,
-        run_state: run_state
-      }
-      |> maybe_put_decoded_rewind(rewound_to_event_id)
-    else
-      _ -> raise ArgumentError, "invalid flow record"
-    end
-  end
-
-  defp normalize_record_map(record) when is_map(record) do
-    record
-    |> Map.put_new(:history_hot_max_events, Map.get(record, :history_max_events))
-    |> Map.put_new(:retention_ttl_ms, Map.get(record, :ttl_ms))
-    |> Map.put_new(:terminal_retention_until_ms, nil)
-    |> Map.delete(:history_max_events)
-  end
-
-  defp maybe_put_decoded_rewind(record, nil), do: record
-
-  defp maybe_put_decoded_rewind(record, rewound_to_event_id),
-    do: Map.put(record, :rewound_to_event_id, rewound_to_event_id)
-
-  defp decode_record_run_state_and_rewind(rest) do
-    case decode_bin(rest) do
-      {:ok, rewound_to_event_id, ""} ->
-        {:ok, nil, rewound_to_event_id}
-
-      {:ok, run_state, next} ->
-        with {:ok, rewound_to_event_id, ""} <- decode_bin(next) do
-          {:ok, run_state, rewound_to_event_id}
-        end
-
-      :error ->
-        :error
     end
   end
 
@@ -1602,6 +1405,23 @@ defmodule Ferricstore.Flow do
       end
     end
   end
+
+  defp encode_term(value) do
+    value
+    |> :erlang.term_to_binary()
+    |> encode_bin()
+  end
+
+  defp decode_term(binary) do
+    with {:ok, encoded, rest} <- decode_bin(binary) do
+      {:ok, :erlang.binary_to_term(encoded, [:safe]), rest}
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp normalize_child_groups(groups) when is_map(groups), do: groups
+  defp normalize_child_groups(_groups), do: %{}
 
   defp encode_varint(value) when value < 128, do: <<value>>
 
@@ -2626,12 +2446,18 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp create_many_attrs(items, opts, partition_key) do
+  defp create_many_attrs(
+         items,
+         opts,
+         partition_key,
+         mismatch_error \\ "ERR flow partition_key mismatch in batch"
+       ) do
     base_opts = Keyword.delete(opts, :partition_key)
 
     Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
       with {:ok, id, item_opts} <- create_many_item_opts(item),
-           {:ok, item_partition_key} <- many_item_partition_key(partition_key, item_opts),
+           {:ok, item_partition_key} <-
+             many_item_partition_key(partition_key, item_opts, mismatch_error),
            {:ok, attrs} <-
              create_attrs(
                id,
@@ -2646,6 +2472,131 @@ defmodule Ferricstore.Flow do
       {:ok, attrs_list} -> {:ok, Enum.reverse(attrs_list)}
       {:error, _reason} = error -> error
     end
+  end
+
+  defp spawn_children_attrs(parent_id, children, opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(parent_id),
+         :ok <- validate_children(children),
+         {:ok, partition_key} <- required_partition_key(Keyword.get(opts, :partition_key)),
+         {:ok, group_id} <- required_binary(opts, :group_id),
+         {:ok, wait} <- optional_child_policy(opts, :wait, :all, [:all, :none]),
+         {:ok, on_child_failed} <-
+           optional_child_policy(opts, :on_child_failed, :fail_parent, [
+             :fail_parent,
+             :ignore
+           ]),
+         {:ok, on_parent_closed} <-
+           optional_child_policy(opts, :on_parent_closed, :cancel_children, [
+             :cancel_children,
+             :abandon_children
+           ]),
+         {:ok, exhaust_to} <- exhaust_to_opts(opts),
+         {:ok, from_state} <- optional_binary_or_nil(opts, :from_state, nil),
+         {:ok, wait_state} <- optional_binary_or_nil(opts, :wait_state, nil),
+         {:ok, lease_token} <- optional_lease_token(opts),
+         {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
+         {:ok, now} <- optional_now_ms(opts),
+         {:ok, child_attrs} <-
+           create_many_attrs(
+             children,
+             opts,
+             partition_key,
+             "ERR flow child partition_key must match parent partition_key"
+           ),
+         :ok <- validate_unique_create_ids(child_attrs),
+         :ok <- validate_no_parent_child_id(parent_id, child_attrs),
+         :ok <- validate_spawn_child_partitions(child_attrs, partition_key),
+         :ok <- validate_key_size(__MODULE__.Keys.state_key(parent_id, partition_key)) do
+      attrs =
+        %{
+          id: parent_id,
+          partition_key: partition_key,
+          group_id: group_id,
+          wait: wait,
+          on_child_failed: on_child_failed,
+          on_parent_closed: on_parent_closed,
+          exhaust_to: exhaust_to,
+          from_state: from_state,
+          wait_state: wait_state,
+          lease_token: lease_token,
+          fencing_token: fencing_token,
+          children: child_attrs
+        }
+        |> maybe_put_attr(:now_ms, now)
+
+      {:ok, attrs}
+    end
+  end
+
+  defp validate_children([_ | _]), do: :ok
+  defp validate_children(_children), do: {:error, "ERR flow children must be a non-empty list"}
+
+  defp validate_no_parent_child_id(parent_id, child_attrs) do
+    if Enum.any?(child_attrs, &(Map.get(&1, :id) == parent_id)) do
+      {:error, "ERR flow child id must differ from parent id"}
+    else
+      :ok
+    end
+  end
+
+  defp validate_spawn_child_partitions(child_attrs, partition_key) do
+    if Enum.all?(child_attrs, &(Map.get(&1, :partition_key) == partition_key)) do
+      :ok
+    else
+      {:error, "ERR flow child partition_key must match parent partition_key"}
+    end
+  end
+
+  defp optional_child_policy(opts, key, default, allowed) do
+    value =
+      opts
+      |> Keyword.get(key, default)
+      |> normalize_child_policy_value()
+
+    if value in allowed do
+      {:ok, value}
+    else
+      {:error, "ERR flow #{key} has unsupported value"}
+    end
+  end
+
+  defp normalize_child_policy_value(value) when is_atom(value), do: value
+
+  defp normalize_child_policy_value(value) when is_binary(value) do
+    value
+    |> String.downcase()
+    |> String.replace("-", "_")
+    |> String.to_existing_atom()
+  rescue
+    ArgumentError -> value
+  end
+
+  defp normalize_child_policy_value(value), do: value
+
+  defp exhaust_to_opts(opts) do
+    case Keyword.get(opts, :exhaust_to) do
+      nil ->
+        exhaust_to_states(Keyword.get(opts, :success), Keyword.get(opts, :failure))
+
+      %{success: success, failure: failure} ->
+        exhaust_to_states(success, failure)
+
+      %{"success" => success, "failure" => failure} ->
+        exhaust_to_states(success, failure)
+
+      _ ->
+        {:error, "ERR flow exhaust_to must include success and failure states"}
+    end
+  end
+
+  defp exhaust_to_states(success, failure)
+       when is_binary(success) and success != "" and is_binary(failure) and failure != "" do
+    {:ok, %{"success" => success, "failure" => failure}}
+  end
+
+  defp exhaust_to_states(_success, _failure) do
+    {:error, "ERR flow exhaust_to must include success and failure states"}
   end
 
   defp create_many_item_opts(id) when is_binary(id), do: {:ok, id, []}
@@ -2685,6 +2636,10 @@ defmodule Ferricstore.Flow do
 
   defp create_many_item_opts_from_map(item) do
     []
+    |> maybe_put_item_opt(:type, item, :type, "type")
+    |> maybe_put_item_opt(:state, item, :state, "state")
+    |> maybe_put_item_opt(:run_at_ms, item, :run_at_ms, "run_at_ms")
+    |> maybe_put_item_opt(:priority, item, :priority, "priority")
     |> maybe_put_item_opt(:payload, item, :payload, "payload")
     |> maybe_put_item_opt(:payload_ref, item, :payload_ref, "payload_ref")
     |> maybe_put_item_opt(:partition_key, item, :partition_key, "partition_key")
@@ -3778,18 +3733,25 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp many_item_partition_key(nil, item_opts) do
+  defp many_item_partition_key(
+         partition_key,
+         item_opts,
+         mismatch_error \\ "ERR flow partition_key mismatch in batch"
+       )
+
+  defp many_item_partition_key(nil, item_opts, _mismatch_error) do
     item_opts
     |> Keyword.get(:partition_key)
     |> required_partition_key()
   end
 
-  defp many_item_partition_key(partition_key, item_opts) when is_binary(partition_key) do
+  defp many_item_partition_key(partition_key, item_opts, mismatch_error)
+       when is_binary(partition_key) do
     case Keyword.fetch(item_opts, :partition_key) do
       {:ok, item_partition_key} ->
         case required_partition_key(item_partition_key) do
           {:ok, ^partition_key} -> {:ok, partition_key}
-          {:ok, _other} -> {:error, "ERR flow partition_key mismatch in batch"}
+          {:ok, _other} -> {:error, mismatch_error}
           {:error, _reason} = error -> error
         end
 

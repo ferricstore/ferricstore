@@ -196,6 +196,35 @@ defmodule Ferricstore.InstanceTest do
 
       assert {:ok, history} = EmbeddedFlow.flow_history(id, partition_key: partition)
       assert Enum.any?(history, fn {_event_id, fields} -> fields["event"] == "completed" end)
+
+      spawn_parent = "embedded-spawn-parent-1"
+      spawn_child = "embedded-spawn-child-1"
+
+      assert {:ok, created_parent} =
+               EmbeddedFlow.flow_create(spawn_parent,
+                 type: "embedded-parent",
+                 state: "dispatch",
+                 partition_key: partition,
+                 now_ms: 3_000
+               )
+
+      assert {:ok, %{id: ^spawn_parent, state: "dispatched"}} =
+               EmbeddedFlow.flow_spawn_children(
+                 spawn_parent,
+                 [%{id: spawn_child, type: "embedded-child", payload: "child-payload"}],
+                 group_id: "embedded-fanout",
+                 wait: :none,
+                 on_child_failed: :ignore,
+                 on_parent_closed: :abandon_children,
+                 exhaust_to: %{success: "dispatched", failure: "dispatch_failed"},
+                 partition_key: partition,
+                 from_state: "dispatch",
+                 fencing_token: created_parent.fencing_token,
+                 now_ms: 3_010
+               )
+
+      assert {:ok, [%{id: ^spawn_child, parent_flow_id: ^spawn_parent}]} =
+               EmbeddedFlow.flow_by_parent(spawn_parent, partition_key: partition)
     end
   end
 

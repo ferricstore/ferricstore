@@ -170,6 +170,86 @@ defmodule Ferricstore.Commands.FlowTest do
              )
   end
 
+  test "dispatches Flow spawn children through Rust AST" do
+    parent = uid("flow-command-spawn-parent")
+    child_a = uid("flow-command-spawn-child-a")
+    child_b = uid("flow-command-spawn-child-b")
+    partition = uid("tenant-command")
+
+    assert %{"id" => ^parent, "fencing_token" => fencing_token} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [
+                 parent,
+                 "TYPE",
+                 "parent",
+                 "STATE",
+                 "dispatch",
+                 "PARTITION",
+                 partition,
+                 "NOW",
+                 "1000"
+               ],
+               MockStore.make()
+             )
+
+    assert %{"id" => ^parent, "state" => "waiting_children", "child_groups" => child_groups} =
+             Dispatcher.dispatch(
+               "FLOW.SPAWN_CHILDREN",
+               [
+                 parent,
+                 "GROUP",
+                 "fanout",
+                 "PARTITION",
+                 partition,
+                 "FENCING",
+                 Integer.to_string(fencing_token),
+                 "WAIT",
+                 "all",
+                 "ON_CHILD_FAILED",
+                 "fail_parent",
+                 "ON_PARENT_CLOSED",
+                 "cancel_children",
+                 "SUCCESS",
+                 "children_done",
+                 "FAILURE",
+                 "children_failed",
+                 "FROM_STATE",
+                 "dispatch",
+                 "WAIT_STATE",
+                 "waiting_children",
+                 "NOW",
+                 "1010",
+                 "ITEMS",
+                 child_a,
+                 "child",
+                 "payload-a",
+                 child_b,
+                 "child",
+                 "payload-b"
+               ],
+               MockStore.make()
+             )
+
+    assert child_groups["fanout"]["children"][child_a] == "running"
+    assert child_groups["fanout"]["children"][child_b] == "running"
+
+    assert [%{"id" => ^child_a}, %{"id" => ^child_b}] =
+             Dispatcher.dispatch(
+               "FLOW.BY_PARENT",
+               [parent, "PARTITION", partition, "COUNT", "10"],
+               MockStore.make()
+             )
+             |> Enum.sort_by(& &1["id"])
+
+    assert %{"payload" => "payload-a"} =
+             Dispatcher.dispatch(
+               "FLOW.GET",
+               [child_a, "PARTITION", partition, "FULL"],
+               MockStore.make()
+             )
+  end
+
   test "dispatches Flow mutation values through Rust AST" do
     transition_id = uid("flow-command-transition-value")
     fail_id = uid("flow-command-fail-value")

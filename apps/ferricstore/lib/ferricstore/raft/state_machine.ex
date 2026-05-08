@@ -1003,6 +1003,10 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_with_time(meta, state, fn -> do_flow_create_many(state, attrs) end)
   end
 
+  def apply(meta, {:flow_spawn_children, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_spawn_children(state, attrs) end)
+  end
+
   def apply(meta, {:flow_claim_due, _key, attrs}, state) when is_map(attrs) do
     apply_pending_with_time(meta, state, fn -> do_flow_claim_due(state, attrs) end)
   end
@@ -3445,6 +3449,10 @@ defmodule Ferricstore.Raft.StateMachine do
     do_flow_create_many(state, attrs)
   end
 
+  defp apply_single(state, {:flow_spawn_children, _key, attrs}) do
+    do_flow_spawn_children(state, attrs)
+  end
+
   defp apply_single(state, {:flow_claim_due, _key, attrs}) do
     do_flow_claim_due(state, attrs)
   end
@@ -4483,6 +4491,42 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_flow_create_many(_state, _attrs),
     do: {:error, "ERR flow items must be a non-empty list"}
 
+  defp do_flow_spawn_children(
+         state,
+         %{id: parent_id, partition_key: partition_key, children: [_ | _] = children} = attrs
+       ) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+
+    with {:ok, parent} <- flow_require_record(state, parent_id, partition_key),
+         :ok <- flow_require_parent_partition(parent, partition_key),
+         child_attrs = flow_spawn_child_attrs(parent, children),
+         :ok <- flow_many_partitions_valid?(state, child_attrs),
+         :ok <- flow_create_many_unique?(child_attrs),
+         {:ok, group_state} <- flow_child_group_spawn_state(parent, attrs, child_attrs) do
+      case group_state do
+        :idempotent ->
+          {:ok, parent}
+
+        :new ->
+          with :ok <- flow_require_expected_state(parent, Map.get(attrs, :from_state)),
+               :ok <- flow_require_fencing_token(parent, Map.fetch!(attrs, :fencing_token)),
+               :ok <- flow_require_transition_lease(parent, Map.get(attrs, :lease_token)),
+               :ok <- flow_require_spawn_wait_state(parent, attrs),
+               {:ok, _child_records, child_plans} <- flow_create_many_prepare(state, child_attrs),
+               {:ok, next_parent} <- flow_prepare_spawn_parent(parent, attrs, child_attrs, now_ms),
+               :ok <- flow_validate_record_keys(next_parent),
+               :ok <- flow_create_many_apply(state, child_plans),
+               :ok <-
+                 flow_apply_parent_update(state, parent, next_parent, "children_spawned", now_ms) do
+            {:ok, next_parent}
+          end
+      end
+    end
+  end
+
+  defp do_flow_spawn_children(_state, _attrs),
+    do: {:error, "ERR flow children must be a non-empty list"}
+
   defp flow_create_record(state, %{id: id, type: type, state: flow_state} = attrs) do
     now_ms = Map.get(attrs, :now_ms, apply_now_ms())
     run_at_ms = Map.get(attrs, :run_at_ms, now_ms)
@@ -4514,9 +4558,137 @@ defmodule Ferricstore.Raft.StateMachine do
       lease_owner: nil,
       lease_token: nil,
       lease_deadline_ms: 0,
-      run_state: nil
+      run_state: nil,
+      child_groups: %{}
     }
     |> flow_stamp_terminal_retention(now_ms)
+  end
+
+  defp flow_require_parent_partition(parent, partition_key) do
+    if Map.get(parent, :partition_key) == partition_key do
+      :ok
+    else
+      {:error, "ERR flow parent partition mismatch"}
+    end
+  end
+
+  defp flow_require_spawn_wait_state(%{state: "running"}, %{wait: :all, wait_state: nil}) do
+    {:error, "ERR flow wait_state is required for running parent"}
+  end
+
+  defp flow_require_spawn_wait_state(_parent, _attrs), do: :ok
+
+  defp flow_child_group_spawn_state(parent, attrs, child_attrs) do
+    group_id = Map.fetch!(attrs, :group_id)
+    requested = flow_new_child_group(attrs, child_attrs)
+
+    case Map.get(flow_child_groups(parent), group_id) do
+      nil ->
+        {:ok, :new}
+
+      ^requested ->
+        {:ok, :idempotent}
+
+      _existing ->
+        {:error, "ERR flow child group idempotency conflict"}
+    end
+  end
+
+  defp flow_spawn_child_attrs(parent, children) do
+    root_flow_id = Map.get(parent, :root_flow_id) || Map.fetch!(parent, :id)
+    parent_id = Map.fetch!(parent, :id)
+    partition_key = Map.get(parent, :partition_key)
+
+    Enum.map(children, fn attrs ->
+      attrs
+      |> Map.put(:parent_flow_id, parent_id)
+      |> Map.put(:root_flow_id, root_flow_id)
+      |> Map.put(:partition_key, partition_key)
+    end)
+  end
+
+  defp flow_prepare_spawn_parent(parent, attrs, child_attrs, now_ms) do
+    group = flow_new_child_group(attrs, child_attrs)
+    groups = Map.put(flow_child_groups(parent), Map.fetch!(attrs, :group_id), group)
+    state = flow_spawn_parent_state(parent, attrs)
+
+    next =
+      parent
+      |> Map.merge(%{
+        state: state,
+        version: Map.fetch!(parent, :version) + 1,
+        updated_at_ms: now_ms,
+        next_run_at_ms: nil,
+        ttl_ms: nil,
+        lease_owner: nil,
+        lease_token: nil,
+        lease_deadline_ms: 0,
+        child_groups: groups
+      })
+      |> flow_stamp_terminal_retention(now_ms)
+
+    {:ok, next}
+  end
+
+  defp flow_spawn_parent_state(_parent, %{wait: :none, exhaust_to: %{"success" => state}}),
+    do: state
+
+  defp flow_spawn_parent_state(_parent, %{wait: :all, wait_state: wait_state})
+       when is_binary(wait_state) and wait_state != "",
+       do: wait_state
+
+  defp flow_spawn_parent_state(parent, _attrs), do: Map.fetch!(parent, :state)
+
+  defp flow_new_child_group(attrs, child_attrs) do
+    children =
+      child_attrs
+      |> Enum.map(fn %{id: id} -> {id, "running"} end)
+      |> Map.new()
+
+    resolved =
+      case Map.fetch!(attrs, :wait) do
+        :none -> "success"
+        :all -> nil
+      end
+
+    %{
+      "wait" => Atom.to_string(Map.fetch!(attrs, :wait)),
+      "on_child_failed" => Atom.to_string(Map.fetch!(attrs, :on_child_failed)),
+      "on_parent_closed" => Atom.to_string(Map.fetch!(attrs, :on_parent_closed)),
+      "exhaust_to" => Map.fetch!(attrs, :exhaust_to),
+      "children" => children,
+      "summary" => %{
+        "total" => map_size(children),
+        "completed" => 0,
+        "failed" => 0,
+        "cancelled" => 0
+      },
+      "results" => %{},
+      "resolved" => resolved
+    }
+  end
+
+  defp flow_child_groups(record) do
+    case Map.get(record, :child_groups) do
+      groups when is_map(groups) -> groups
+      _ -> %{}
+    end
+  end
+
+  defp flow_apply_parent_update(state, record, next, event, now_ms) do
+    plans = [{record, next}]
+
+    with :ok <- flow_transition_move_indexes(state, plans),
+         :ok <-
+           flow_put_state_record(
+             state,
+             FlowKeys.state_key(next.id, Map.get(next, :partition_key)),
+             next
+           ),
+         :ok <- flow_history_put_planned(state, record, next, event, now_ms),
+         :ok <- flow_after_history_put(state, next) do
+      :ok
+    end
   end
 
   defp flow_retention_for_create(state, attrs) do
@@ -5312,7 +5484,9 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "completed", now_ms),
-         :ok <- flow_after_history_put(state, next) do
+         :ok <- flow_after_history_put(state, next),
+         :ok <- flow_maybe_cancel_children_on_parent_closed(state, next, now_ms),
+         :ok <- flow_maybe_apply_child_terminal(state, next, "completed", now_ms) do
       :ok
     end
   end
@@ -5352,7 +5526,8 @@ defmodule Ferricstore.Raft.StateMachine do
     with :ok <- flow_many_put_record_values(state, plans),
          :ok <- flow_transition_move_indexes(state, pair_plans),
          :ok <- flow_claim_put_state_records(state, pair_plans),
-         :ok <- flow_many_put_history(state, pair_plans, "completed") do
+         :ok <- flow_many_put_history(state, pair_plans, "completed"),
+         :ok <- flow_many_after_terminal(state, pair_plans, "completed") do
       :ok
     end
   end
@@ -5810,7 +5985,9 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "failed", now_ms),
-         :ok <- flow_after_history_put(state, next) do
+         :ok <- flow_after_history_put(state, next),
+         :ok <- flow_maybe_cancel_children_on_parent_closed(state, next, now_ms),
+         :ok <- flow_maybe_apply_child_terminal(state, next, "failed", now_ms) do
       :ok
     end
   end
@@ -5850,7 +6027,8 @@ defmodule Ferricstore.Raft.StateMachine do
     with :ok <- flow_many_put_record_values(state, plans),
          :ok <- flow_transition_move_indexes(state, pair_plans),
          :ok <- flow_claim_put_state_records(state, pair_plans),
-         :ok <- flow_many_put_history(state, pair_plans, "failed") do
+         :ok <- flow_many_put_history(state, pair_plans, "failed"),
+         :ok <- flow_many_after_terminal(state, pair_plans, "failed") do
       :ok
     end
   end
@@ -5930,8 +6108,306 @@ defmodule Ferricstore.Raft.StateMachine do
              next
            ),
          :ok <- flow_history_put_planned(state, record, next, "cancelled", now_ms),
-         :ok <- flow_after_history_put(state, next) do
+         :ok <- flow_after_history_put(state, next),
+         :ok <- flow_maybe_cancel_children_on_parent_closed(state, next, now_ms),
+         :ok <- flow_maybe_apply_child_terminal(state, next, "cancelled", now_ms) do
       :ok
+    end
+  end
+
+  defp flow_maybe_cancel_children_on_parent_closed(state, parent, now_ms) do
+    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(parent, :state)) do
+      flow_cancel_children_on_parent_closed(state, parent, now_ms)
+    else
+      :ok
+    end
+  end
+
+  defp flow_cancel_children_on_parent_closed(state, parent, now_ms) do
+    groups = flow_child_groups(parent)
+
+    {updated_groups, child_ids} =
+      Enum.reduce(groups, {groups, []}, fn {group_id, group}, {groups_acc, child_acc} ->
+        if flow_group_should_cancel_children?(group) do
+          running_ids = flow_group_running_child_ids(group)
+          updated_group = flow_group_mark_children_cancelled(group, running_ids)
+          {Map.put(groups_acc, group_id, updated_group), running_ids ++ child_acc}
+        else
+          {groups_acc, child_acc}
+        end
+      end)
+
+    child_ids = Enum.uniq(child_ids)
+
+    if child_ids == [] do
+      :ok
+    else
+      with :ok <- flow_cancel_direct_children(state, parent, child_ids, now_ms),
+           {:ok, updated_parent} <-
+             flow_parent_with_updated_child_groups(parent, updated_groups, now_ms) do
+        flow_apply_parent_update(state, parent, updated_parent, "children_cancelled", now_ms)
+      end
+    end
+  end
+
+  defp flow_group_should_cancel_children?(%{
+         "resolved" => nil,
+         "on_parent_closed" => "cancel_children"
+       }),
+       do: true
+
+  defp flow_group_should_cancel_children?(_group), do: false
+
+  defp flow_group_running_child_ids(group) do
+    group
+    |> Map.get("children", %{})
+    |> Enum.flat_map(fn
+      {child_id, "running"} -> [child_id]
+      _other -> []
+    end)
+  end
+
+  defp flow_group_mark_children_cancelled(group, []), do: group
+
+  defp flow_group_mark_children_cancelled(group, child_ids) do
+    children =
+      Enum.reduce(child_ids, Map.get(group, "children", %{}), fn child_id, acc ->
+        Map.put(acc, child_id, "cancelled")
+      end)
+
+    summary = Map.get(group, "summary", %{})
+    cancelled = Map.get(summary, "cancelled", 0) + length(child_ids)
+
+    group
+    |> Map.put("children", children)
+    |> Map.put("results", flow_child_group_cancelled_results(group, child_ids))
+    |> Map.put("summary", Map.put(summary, "cancelled", cancelled))
+    |> Map.put("resolved", "failure")
+  end
+
+  defp flow_child_group_cancelled_results(group, child_ids) do
+    Enum.reduce(child_ids, Map.get(group, "results", %{}), fn child_id, acc ->
+      Map.put(acc, child_id, %{"status" => "cancelled"})
+    end)
+  end
+
+  defp flow_cancel_direct_children(state, parent, child_ids, now_ms) do
+    Enum.reduce_while(child_ids, :ok, fn child_id, :ok ->
+      case flow_read_record(state, child_id, Map.get(parent, :partition_key)) do
+        nil ->
+          {:cont, :ok}
+
+        child ->
+          if Ferricstore.Flow.LMDB.terminal_state?(Map.get(child, :state)) do
+            {:cont, :ok}
+          else
+            case flow_apply_internal_child_cancel(state, child, now_ms) do
+              :ok -> {:cont, :ok}
+              {:error, _reason} = error -> {:halt, error}
+            end
+          end
+      end
+    end)
+  end
+
+  defp flow_apply_internal_child_cancel(state, child, now_ms) do
+    next =
+      child
+      |> Map.merge(%{
+        state: "cancelled",
+        version: Map.fetch!(child, :version) + 1,
+        updated_at_ms: now_ms,
+        ttl_ms: nil,
+        lease_owner: nil,
+        lease_token: nil,
+        lease_deadline_ms: 0,
+        next_run_at_ms: nil
+      })
+      |> flow_stamp_terminal_retention(now_ms)
+
+    with :ok <- flow_transition_move_indexes(state, [{child, next}]),
+         :ok <-
+           flow_put_state_record(
+             state,
+             FlowKeys.state_key(next.id, Map.get(next, :partition_key)),
+             next
+           ),
+         :ok <- flow_history_put_planned(state, child, next, "cancelled", now_ms),
+         :ok <- flow_after_history_put(state, next) do
+      flow_maybe_cancel_children_on_parent_closed(state, next, now_ms)
+    end
+  end
+
+  defp flow_parent_with_updated_child_groups(parent, updated_groups, now_ms) do
+    next =
+      parent
+      |> Map.merge(%{
+        version: Map.fetch!(parent, :version) + 1,
+        updated_at_ms: now_ms,
+        child_groups: updated_groups
+      })
+
+    with :ok <- flow_validate_record_keys(next) do
+      {:ok, next}
+    end
+  end
+
+  defp flow_maybe_apply_child_terminal(
+         state,
+         %{parent_flow_id: parent_id, partition_key: partition_key} = child,
+         status,
+         now_ms
+       )
+       when is_binary(parent_id) and parent_id != "" and
+              status in ["completed", "failed", "cancelled"] do
+    case flow_read_record(state, parent_id, partition_key) do
+      nil ->
+        :ok
+
+      parent ->
+        case flow_child_terminal_parent_next(parent, child, status, now_ms) do
+          {:ok, nil} ->
+            :ok
+
+          {:ok, next_parent} ->
+            with :ok <-
+                   flow_apply_parent_update(
+                     state,
+                     parent,
+                     next_parent,
+                     "child_#{status}",
+                     now_ms
+                   ) do
+              flow_maybe_apply_resolved_parent_terminal(state, next_parent, now_ms)
+            end
+        end
+    end
+  end
+
+  defp flow_maybe_apply_child_terminal(_state, _child, _status, _now_ms), do: :ok
+
+  defp flow_many_after_terminal(state, plans, status) do
+    Enum.reduce_while(plans, :ok, fn {_record, next}, :ok ->
+      now_ms = Map.get(next, :updated_at_ms, apply_now_ms())
+
+      with :ok <- flow_maybe_cancel_children_on_parent_closed(state, next, now_ms),
+           :ok <- flow_maybe_apply_child_terminal(state, next, status, now_ms) do
+        {:cont, :ok}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_child_terminal_parent_next(parent, child, status, now_ms) do
+    child_id = Map.fetch!(child, :id)
+    groups = flow_child_groups(parent)
+
+    case flow_find_open_child_group(groups, child_id) do
+      nil ->
+        {:ok, nil}
+
+      {group_id, group} ->
+        updated_group = flow_child_group_count_terminal(group, child, status)
+        resolved_group = flow_child_group_resolve(updated_group, status)
+        updated_groups = Map.put(groups, group_id, resolved_group)
+        next_state = flow_child_group_parent_state(parent, resolved_group)
+
+        next =
+          parent
+          |> Map.merge(%{
+            state: next_state,
+            version: Map.fetch!(parent, :version) + 1,
+            updated_at_ms: now_ms,
+            child_groups: updated_groups
+          })
+          |> flow_clear_parent_if_resolved(resolved_group)
+          |> flow_stamp_terminal_retention(now_ms)
+
+        {:ok, next}
+    end
+  end
+
+  defp flow_find_open_child_group(groups, child_id) do
+    Enum.find(groups, fn {_group_id, group} ->
+      is_nil(Map.get(group, "resolved")) and
+        Map.get(group, "children", %{})[child_id] == "running"
+    end)
+  end
+
+  defp flow_child_group_count_terminal(group, child, status) do
+    child_id = Map.fetch!(child, :id)
+    summary_key = status
+    result = flow_child_terminal_result(child, status)
+
+    group
+    |> update_in(["children"], &Map.put(&1, child_id, status))
+    |> update_in(["results"], &Map.put(&1 || %{}, child_id, result))
+    |> update_in(["summary", summary_key], fn count -> (count || 0) + 1 end)
+  end
+
+  defp flow_child_terminal_result(child, status) do
+    %{"status" => status}
+    |> maybe_put_group_result_ref("result_ref", Map.get(child, :result_ref))
+    |> maybe_put_group_result_ref("error_ref", Map.get(child, :error_ref))
+  end
+
+  defp maybe_put_group_result_ref(result, _key, nil), do: result
+  defp maybe_put_group_result_ref(result, key, value), do: Map.put(result, key, value)
+
+  defp flow_child_group_resolve(group, status) when status in ["failed", "cancelled"] do
+    if Map.get(group, "on_child_failed") == "fail_parent" do
+      Map.put(group, "resolved", "failure")
+    else
+      flow_child_group_resolve_all_terminal(group)
+    end
+  end
+
+  defp flow_child_group_resolve(group, _status), do: flow_child_group_resolve_all_terminal(group)
+
+  defp flow_child_group_resolve_all_terminal(group) do
+    summary = Map.get(group, "summary", %{})
+    total = Map.get(summary, "total", 0)
+
+    terminal_count =
+      Map.get(summary, "completed", 0) + Map.get(summary, "failed", 0) +
+        Map.get(summary, "cancelled", 0)
+
+    if terminal_count >= total do
+      Map.put(group, "resolved", "success")
+    else
+      group
+    end
+  end
+
+  defp flow_child_group_parent_state(_parent, %{
+         "resolved" => resolved,
+         "exhaust_to" => exhaust_to
+       })
+       when resolved in ["success", "failure"] and is_map(exhaust_to) do
+    Map.fetch!(exhaust_to, resolved)
+  end
+
+  defp flow_child_group_parent_state(parent, _group), do: Map.fetch!(parent, :state)
+
+  defp flow_clear_parent_if_resolved(next, %{"resolved" => resolved})
+       when resolved in ["success", "failure"] do
+    next
+    |> Map.put(:next_run_at_ms, nil)
+    |> Map.put(:ttl_ms, nil)
+    |> Map.put(:lease_owner, nil)
+    |> Map.put(:lease_token, nil)
+    |> Map.put(:lease_deadline_ms, 0)
+  end
+
+  defp flow_clear_parent_if_resolved(next, _group), do: next
+
+  defp flow_maybe_apply_resolved_parent_terminal(state, parent, now_ms) do
+    case Map.get(parent, :state) do
+      "completed" -> flow_maybe_apply_child_terminal(state, parent, "completed", now_ms)
+      "failed" -> flow_maybe_apply_child_terminal(state, parent, "failed", now_ms)
+      "cancelled" -> flow_maybe_apply_child_terminal(state, parent, "cancelled", now_ms)
+      _state -> :ok
     end
   end
 
@@ -5978,7 +6454,8 @@ defmodule Ferricstore.Raft.StateMachine do
     with :ok <- flow_cancel_many_put_record_values(state, plans),
          :ok <- flow_transition_move_indexes(state, pair_plans),
          :ok <- flow_claim_put_state_records(state, pair_plans),
-         :ok <- flow_many_put_history(state, pair_plans, "cancelled") do
+         :ok <- flow_many_put_history(state, pair_plans, "cancelled"),
+         :ok <- flow_many_after_terminal(state, pair_plans, "cancelled") do
       :ok
     end
   end
@@ -8243,9 +8720,6 @@ defmodule Ferricstore.Raft.StateMachine do
             end)
 
           {:ok, tagged_locations}
-
-        {:error, _reason} = error ->
-          error
       end
     end
   end

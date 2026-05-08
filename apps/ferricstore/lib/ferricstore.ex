@@ -390,6 +390,31 @@ defmodule FerricStore do
     do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
+  Atomically creates child Flow records under `parent_id`.
+
+  v1 requires a single `partition_key`, so parent and children are coordinated by
+  one shard. `wait: :none` advances the parent immediately to
+  `exhaust_to.success`; `wait: :all` keeps the parent in `wait_state` until all
+  direct children are terminal.
+  """
+  @spec flow_spawn_children(binary(), list(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_spawn_children(parent_id, children, opts \\ [])
+
+  def flow_spawn_children(parent_id, children, opts)
+      when is_binary(parent_id) and is_list(children) and is_list(opts) do
+    Ferricstore.Flow.spawn_children(default_ctx(), parent_id, children, opts)
+  end
+
+  def flow_spawn_children(parent_id, _children, _opts) when not is_binary(parent_id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def flow_spawn_children(_parent_id, children, _opts) when not is_list(children),
+    do: {:error, "ERR flow children must be a non-empty list"}
+
+  def flow_spawn_children(_parent_id, _children, _opts),
+    do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc """
   Returns the latest Flow state record for `id`.
 
   By default this returns metadata and value references only. Pass `full: true`

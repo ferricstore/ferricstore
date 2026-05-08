@@ -2894,6 +2894,19 @@ defmodule Ferricstore.Store.Router do
     flow_many_by_shard(ctx, attrs_list, :flow_create_many, "__batch__")
   end
 
+  @doc false
+  def flow_spawn_children(ctx, %{id: id, partition_key: partition_key} = attrs)
+      when is_binary(id) and is_binary(partition_key) do
+    key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    if byte_size(key) > @max_key_size do
+      {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+    else
+      idx = shard_for(ctx, key)
+      raft_write(ctx, idx, key, {:flow_spawn_children, key, attrs})
+    end
+  end
+
   defp flow_many_by_shard(ctx, attrs_list, command, batch_id)
        when command in [
               :flow_create_many,

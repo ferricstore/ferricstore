@@ -1561,6 +1561,7 @@ enum CommandAstKind {
     TdigestMerge,
     FlowCreate,
     FlowCreateMany,
+    FlowSpawnChildren,
     FlowGet,
     FlowPolicySet,
     FlowPolicyGet,
@@ -1806,6 +1807,7 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"TDIGEST.MERGE" => CommandAstKind::TdigestMerge,
         b"FLOW.CREATE" => CommandAstKind::FlowCreate,
         b"FLOW.CREATE_MANY" => CommandAstKind::FlowCreateMany,
+        b"FLOW.SPAWN_CHILDREN" => CommandAstKind::FlowSpawnChildren,
         b"FLOW.GET" => CommandAstKind::FlowGet,
         b"FLOW.POLICY.SET" => CommandAstKind::FlowPolicySet,
         b"FLOW.POLICY.GET" => CommandAstKind::FlowPolicyGet,
@@ -2248,6 +2250,9 @@ fn make_command_ast<'a>(
         CommandAstKind::TdigestMerge => make_tdigest_merge_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCreate => make_flow_create_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCreateMany => make_flow_create_many_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowSpawnChildren => {
+            make_flow_spawn_children_command_ast(env, args, arg_bytes)
+        }
         CommandAstKind::FlowGet => make_flow_get_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowPolicySet => make_flow_policy_set_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowPolicyGet => make_flow_policy_get_command_ast(env, args, arg_bytes),
@@ -5209,6 +5214,55 @@ fn make_flow_create_many_command_ast<'a>(
     (tag, partition, items, opts).encode(env)
 }
 
+fn make_flow_spawn_children_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_spawn_children");
+    if args.len() < 15 {
+        return (tag, wrong_number_error(env, b"flow.spawn_children")).encode(env);
+    }
+
+    let Some(items_idx) = flow_find_option(arg_bytes, 1, b"ITEMS") else {
+        return (
+            tag,
+            args[0],
+            generic_ast_error(env, b"ERR flow children are required"),
+        )
+            .encode(env);
+    };
+
+    if items_idx == args.len() - 1 || (args.len() - items_idx - 1) % 3 != 0 {
+        return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
+    }
+
+    let opts = match parse_flow_options_until(
+        env,
+        args,
+        arg_bytes,
+        1,
+        items_idx,
+        flow_spawn_children_option,
+    ) {
+        Ok(opts) => opts,
+        Err(err) => return (tag, args[0], err).encode(env),
+    };
+
+    let mut items = Vec::with_capacity((args.len() - items_idx - 1) / 3);
+    let mut idx = items_idx + 1;
+    while idx < args.len() {
+        let item_opts = vec![
+            (atom(env, "type"), args[idx + 1]).encode(env),
+            (atom(env, "payload"), args[idx + 2]).encode(env),
+        ];
+        items.push((args[idx], item_opts).encode(env));
+        idx += 3;
+    }
+
+    (tag, args[0], items, opts).encode(env)
+}
+
 fn make_flow_get_command_ast<'a>(env: Env<'a>, args: &[Term<'a>], arg_bytes: &[&[u8]]) -> Term<'a> {
     let tag = atom(env, "flow_get");
     if args.is_empty() {
@@ -6193,6 +6247,34 @@ fn flow_create_option<'a>(
                 FlowOptType::Positive(b"history_hot_max_events"),
             ),
             (b"IDEMPOTENT", "idempotent", FlowOptType::Boolean),
+        ],
+    )
+}
+
+fn flow_spawn_children_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"GROUP", "group_id", FlowOptType::Binary),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"FENCING", "fencing_token", FlowOptType::NonNegative),
+            (b"WAIT", "wait", FlowOptType::Binary),
+            (b"ON_CHILD_FAILED", "on_child_failed", FlowOptType::Binary),
+            (b"ON_PARENT_CLOSED", "on_parent_closed", FlowOptType::Binary),
+            (b"SUCCESS", "success", FlowOptType::Binary),
+            (b"FAILURE", "failure", FlowOptType::Binary),
+            (b"FROM_STATE", "from_state", FlowOptType::Binary),
+            (b"WAIT_STATE", "wait_state", FlowOptType::Binary),
+            (b"LEASE_TOKEN", "lease_token", FlowOptType::Binary),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
         ],
     )
 }
@@ -7242,6 +7324,7 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"TDIGEST.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"RATELIMIT.ADD" => vec![0],
         b"FLOW.CREATE_MANY" => flow_create_many_key_indices(arg_bytes),
+        b"FLOW.SPAWN_CHILDREN" => flow_spawn_children_key_indices(arg_bytes),
         b"FLOW.COMPLETE_MANY" => flow_complete_many_key_indices(arg_bytes),
         b"FLOW.RETRY_MANY" => flow_retry_many_key_indices(arg_bytes),
         b"FLOW.FAIL_MANY" => flow_fail_many_key_indices(arg_bytes),
@@ -7451,6 +7534,10 @@ fn flow_create_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
         idx += 3;
     }
     keys
+}
+
+fn flow_spawn_children_key_indices(_arg_bytes: &[&[u8]]) -> Vec<usize> {
+    vec![0]
 }
 
 fn flow_transition_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
@@ -9061,6 +9148,10 @@ mod tests {
         assert_eq!(
             classify_command_ast(b"FLOW.CREATE_MANY", 0),
             CommandAstKind::FlowCreateMany
+        );
+        assert_eq!(
+            classify_command_ast(b"FLOW.SPAWN_CHILDREN", 0),
+            CommandAstKind::FlowSpawnChildren
         );
         assert_eq!(
             classify_command_ast(b"FLOW.COMPLETE_MANY", 0),

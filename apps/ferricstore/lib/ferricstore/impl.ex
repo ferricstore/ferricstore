@@ -446,6 +446,9 @@ defmodule FerricStore.Impl do
   def flow_create_many(ctx, partition_key, items, opts),
     do: Ferricstore.Flow.create_many(ctx, partition_key, items, opts)
 
+  def flow_spawn_children(ctx, parent_id, children, opts \\ []),
+    do: Ferricstore.Flow.spawn_children(ctx, parent_id, children, opts)
+
   def flow_get(ctx, id, opts \\ []), do: Ferricstore.Flow.get(ctx, id, opts)
   def flow_policy_set(ctx, type, opts), do: Ferricstore.Flow.policy_set(ctx, type, opts)
   def flow_policy_get(ctx, type, opts \\ []), do: Ferricstore.Flow.policy_get(ctx, type, opts)

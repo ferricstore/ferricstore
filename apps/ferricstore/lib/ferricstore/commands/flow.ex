@@ -26,6 +26,11 @@ defmodule Ferricstore.Commands.Flow do
     FerricStore.flow_create_many(partition_key, items, opts) |> normalize_result()
   end
 
+  def handle_ast({:flow_spawn_children, parent_id, children, opts}, _store)
+      when is_binary(parent_id) and is_list(children) and is_list(opts) do
+    FerricStore.flow_spawn_children(parent_id, children, opts) |> normalize_result()
+  end
+
   def handle_ast({:flow_get, id, opts}, _store) when is_binary(id) and is_list(opts) do
     FerricStore.flow_get(id, opts) |> normalize_result()
   end
