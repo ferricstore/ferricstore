@@ -2001,6 +2001,71 @@ defmodule Ferricstore.Flow.LMDBTest do
            ]
   end
 
+  test "history include_cold returns latest count when cold history exceeds query scan window" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+    end)
+
+    id = "history-cold-latest-window"
+    partition_key = "tenant-history-cold-latest-window"
+    flow_type = "history-cold-latest-window"
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.create(ctx, id,
+               type: flow_type,
+               partition_key: partition_key,
+               history_hot_max_events: 2,
+               history_max_events: 200,
+               run_at_ms: 1,
+               now_ms: 1
+             )
+
+    assert {:ok, [claimed]} =
+             Ferricstore.Flow.claim_due(ctx, flow_type,
+               worker: "worker-history-cold-latest-window",
+               partition_key: partition_key,
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 2
+             )
+
+    Enum.each(3..92, fn now_ms ->
+      assert {:ok, _record} =
+               Ferricstore.Flow.extend_lease(ctx, id, claimed.lease_token,
+                 partition_key: partition_key,
+                 fencing_token: claimed.fencing_token,
+                 lease_ms: 30_000,
+                 now_ms: now_ms
+               )
+    end)
+
+    assert {:ok, _record} =
+             Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
+               partition_key: partition_key,
+               fencing_token: claimed.fencing_token,
+               now_ms: 93
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
+
+    assert {:ok, cold_events} =
+             Ferricstore.Flow.history(ctx, id,
+               partition_key: partition_key,
+               count: 10,
+               include_cold: true
+             )
+
+    assert Enum.map(cold_events, fn {event_id, _fields} -> history_event_ms(event_id) end) ==
+             Enum.to_list(84..93)
+  end
+
   test "LMDB rebuild counts cold-read failures and marks mirror degraded" do
     data_dir =
       Path.join(
@@ -2535,6 +2600,15 @@ defmodule Ferricstore.Flow.LMDBTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
+  defp history_event_ms(event_id) do
+    event_id
+    |> String.split("-", parts: 2)
+    |> case do
+      [ms, _seq] -> String.to_integer(ms)
+      _ -> 0
+    end
+  end
 
   defp restart_isolated_shard!(ctx, shard_index) do
     shard_name = elem(ctx.shard_names, shard_index)

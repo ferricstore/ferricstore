@@ -239,8 +239,17 @@ defmodule Ferricstore.Flow.LMDB do
 
   def delete_terminal_index_entry(path, terminal_key, state_key)
       when is_binary(path) and is_binary(terminal_key) do
+    count_key = terminal_count_key_for_index_entry(path, terminal_key)
     ops = terminal_index_delete_ops(path, terminal_key, state_key)
-    write_batch(path, ops)
+
+    case write_batch(path, ops) do
+      :ok ->
+        refresh_terminal_count_cache_after_delete(path, count_key)
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   def delete_history_index_entry(path, history_index_key)
@@ -584,6 +593,23 @@ defmodule Ferricstore.Flow.LMDB do
   rescue
     _ -> :missing
   end
+
+  defp terminal_count_key_for_index_entry(path, terminal_key) do
+    case get(path, terminal_key) do
+      {:ok, terminal_value} -> terminal_index_count_key(terminal_value)
+      _ -> :missing
+    end
+  end
+
+  defp refresh_terminal_count_cache_after_delete(path, {:ok, count_key}) do
+    case terminal_count_key_uncached(path, count_key) do
+      {:ok, count} -> put_cached_terminal_count_key(path, count_key, count)
+      :not_found -> put_cached_terminal_count_key(path, count_key, 0)
+      {:error, _reason} -> delete_cached_terminal_count_key(path, count_key)
+    end
+  end
+
+  defp refresh_terminal_count_cache_after_delete(_path, :missing), do: :ok
 
   defp normalize_mode(:off), do: :mirror
   defp normalize_mode(:write_through), do: :mirror

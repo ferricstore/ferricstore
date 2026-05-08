@@ -115,6 +115,7 @@ defmodule Ferricstore.Raft.StateMachine do
     :sm_pending_lmdb_mirror_ops,
     :sm_pending_lmdb_mirror_after_flush,
     :sm_pending_flow_index_originals,
+    :sm_pending_flow_index_counts,
     :sm_pending_zset_index_ops,
     :sm_pending_prob_creates
   ]
@@ -126,6 +127,7 @@ defmodule Ferricstore.Raft.StateMachine do
     sm_pending_lmdb_mirror_ops: [],
     sm_pending_lmdb_mirror_after_flush: [],
     sm_pending_flow_index_originals: %{},
+    sm_pending_flow_index_counts: %{},
     sm_pending_zset_index_ops: [],
     sm_pending_prob_creates: []
   ]
@@ -5411,21 +5413,21 @@ defmodule Ferricstore.Raft.StateMachine do
     state_filter =
       flow_claim_state_filter(state_filter, Map.get(attrs, :exclude_states, []))
 
-    claimed =
-      flow_claim_due_priorities(
-        state,
-        type,
-        state_filter,
-        worker,
-        lease_ms,
-        now_ms,
-        partition_key,
-        flow_claim_priorities(priority),
-        limit,
-        []
-      )
-
-    {:ok, claimed}
+    case flow_claim_due_priorities(
+           state,
+           type,
+           state_filter,
+           worker,
+           lease_ms,
+           now_ms,
+           partition_key,
+           flow_claim_priorities(priority),
+           limit,
+           []
+         ) do
+      {:error, _reason} = error -> error
+      claimed -> {:ok, claimed}
+    end
   end
 
   defp flow_claim_priorities(nil), do: [2, 1, 0]
@@ -5481,32 +5483,35 @@ defmodule Ferricstore.Raft.StateMachine do
        ) do
     due_keys = flow_claim_due_keys(state, type, state_filter, partition_key, priority)
 
-    next_claimed =
-      flow_claim_due_scan_keys(
-        state,
-        due_keys,
-        type,
-        state_filter,
-        worker,
-        lease_ms,
-        now_ms,
-        partition_key,
-        limit,
-        claimed
-      )
+    case flow_claim_due_scan_keys(
+           state,
+           due_keys,
+           type,
+           state_filter,
+           worker,
+           lease_ms,
+           now_ms,
+           partition_key,
+           limit,
+           claimed
+         ) do
+      {:error, _reason} = error ->
+        error
 
-    flow_claim_due_priorities(
-      state,
-      type,
-      state_filter,
-      worker,
-      lease_ms,
-      now_ms,
-      partition_key,
-      rest,
-      limit,
-      next_claimed
-    )
+      next_claimed ->
+        flow_claim_due_priorities(
+          state,
+          type,
+          state_filter,
+          worker,
+          lease_ms,
+          now_ms,
+          partition_key,
+          rest,
+          limit,
+          next_claimed
+        )
+    end
   end
 
   defp flow_claim_due_scan_keys(
@@ -5524,22 +5529,24 @@ defmodule Ferricstore.Raft.StateMachine do
     flow_ensure_due_index_ready(state, due_key)
     max_scan = max((limit - length(claimed)) * 16, limit + 64)
 
-    flow_claim_due_scan(
-      state,
-      due_key,
-      type,
-      state_filter,
-      worker,
-      lease_ms,
-      now_ms,
-      partition_key,
-      limit,
-      max_scan,
-      0,
-      length(claimed),
-      claimed
-    )
-    |> Enum.reverse()
+    case flow_claim_due_scan(
+           state,
+           due_key,
+           type,
+           state_filter,
+           worker,
+           lease_ms,
+           now_ms,
+           partition_key,
+           limit,
+           max_scan,
+           0,
+           length(claimed),
+           claimed
+         ) do
+      {:error, _reason} = error -> error
+      scanned_claimed -> Enum.reverse(scanned_claimed)
+    end
   end
 
   defp flow_claim_due_scan_keys(
@@ -5612,55 +5619,64 @@ defmodule Ferricstore.Raft.StateMachine do
          limit,
          claimed
        ) do
-    {next_claimed, progressed?} =
+    scan_result =
       Enum.reduce_while(due_keys, {claimed, false}, fn due_key, {acc, progressed?} ->
         claimed_count = length(acc)
 
         if claimed_count >= limit do
           {:halt, {acc, progressed?}}
         else
-          next_acc =
-            flow_claim_due_scan(
+          case flow_claim_due_scan(
+                 state,
+                 due_key,
+                 type,
+                 state_filter,
+                 worker,
+                 lease_ms,
+                 now_ms,
+                 partition_key,
+                 min(limit, claimed_count + 1),
+                 32,
+                 0,
+                 claimed_count,
+                 acc
+               ) do
+            {:error, _reason} = error ->
+              {:halt, error}
+
+            scanned_claimed ->
+              next_acc = Enum.reverse(scanned_claimed)
+              {:cont, {next_acc, progressed? or length(next_acc) > claimed_count}}
+          end
+        end
+      end)
+
+    case scan_result do
+      {:error, _reason} = error ->
+        error
+
+      {next_claimed, progressed?} ->
+        cond do
+          length(next_claimed) >= limit ->
+            next_claimed
+
+          progressed? ->
+            flow_claim_due_scan_key_rounds(
               state,
-              due_key,
+              due_keys,
               type,
               state_filter,
               worker,
               lease_ms,
               now_ms,
               partition_key,
-              min(limit, claimed_count + 1),
-              32,
-              0,
-              claimed_count,
-              acc
+              limit,
+              next_claimed
             )
-            |> Enum.reverse()
 
-          {:cont, {next_acc, progressed? or length(next_acc) > claimed_count}}
+          true ->
+            next_claimed
         end
-      end)
-
-    cond do
-      length(next_claimed) >= limit ->
-        next_claimed
-
-      progressed? ->
-        flow_claim_due_scan_key_rounds(
-          state,
-          due_keys,
-          type,
-          state_filter,
-          worker,
-          lease_ms,
-          now_ms,
-          partition_key,
-          limit,
-          next_claimed
-        )
-
-      true ->
-        next_claimed
     end
   end
 
@@ -5785,37 +5801,40 @@ defmodule Ferricstore.Raft.StateMachine do
     if candidates == [] do
       Enum.reverse(claimed)
     else
-      {next_claimed_count, next_claimed} =
-        flow_claim_candidate_batch(
-          state,
-          due_key,
-          type,
-          expected_state,
-          worker,
-          lease_ms,
-          now_ms,
-          partition_key,
-          candidates,
-          limit - claimed_count,
-          claimed_count,
-          claimed
-        )
+      case flow_claim_candidate_batch(
+             state,
+             due_key,
+             type,
+             expected_state,
+             worker,
+             lease_ms,
+             now_ms,
+             partition_key,
+             candidates,
+             limit - claimed_count,
+             claimed_count,
+             claimed
+           ) do
+        {:error, _reason} = error ->
+          error
 
-      flow_claim_due_scan(
-        state,
-        due_key,
-        type,
-        expected_state,
-        worker,
-        lease_ms,
-        now_ms,
-        partition_key,
-        limit,
-        max_scan,
-        scanned + length(candidates),
-        next_claimed_count,
-        next_claimed
-      )
+        {next_claimed_count, next_claimed} ->
+          flow_claim_due_scan(
+            state,
+            due_key,
+            type,
+            expected_state,
+            worker,
+            lease_ms,
+            now_ms,
+            partition_key,
+            limit,
+            max_scan,
+            scanned + length(candidates),
+            next_claimed_count,
+            next_claimed
+          )
+      end
     end
   end
 
@@ -5854,8 +5873,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
         {claimed_count + length(plans), next_claimed}
 
-      {:error, _reason} ->
-        {claimed_count, claimed}
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -8792,6 +8811,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp track_flow_index_missing_originals(state, key, members) do
     case Process.get(:sm_pending_flow_index_originals, :undefined) do
       originals when is_map(originals) ->
+        track_flow_index_count_original(state, key)
+
         originals =
           Enum.reduce(members, originals, fn member, acc ->
             original_key = {state.flow_index_name, state.flow_lookup_name, key, member}
@@ -8810,6 +8831,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp track_flow_index_originals(state, key, members) do
     case Process.get(:sm_pending_flow_index_originals, :undefined) do
       originals when is_map(originals) ->
+        track_flow_index_count_original(state, key)
+
         originals =
           Enum.reduce(members, originals, fn member, acc ->
             original_key = {state.flow_index_name, state.flow_lookup_name, key, member}
@@ -8836,6 +8859,30 @@ defmodule Ferricstore.Raft.StateMachine do
     :ok
   end
 
+  defp track_flow_index_count_original(state, key) do
+    case Process.get(:sm_pending_flow_index_counts, :undefined) do
+      counts when is_map(counts) ->
+        count_key = {state.flow_index_name, state.flow_lookup_name, key}
+
+        if Map.has_key?(counts, count_key) do
+          :ok
+        else
+          original =
+            case :ets.lookup(state.flow_lookup_name, {:count, key}) do
+              [{{:count, ^key}, count}] when is_integer(count) -> {:count, count}
+              _ -> :missing
+            end
+
+          Process.put(:sm_pending_flow_index_counts, Map.put(counts, count_key, original))
+        end
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
   defp rollback_pending_flow_indexes do
     Process.get(:sm_pending_flow_index_originals, %{})
     |> Enum.each(fn
@@ -8847,6 +8894,19 @@ defmodule Ferricstore.Raft.StateMachine do
       {{index_table, lookup_table, key, member}, :missing} ->
         if :ets.whereis(index_table) != :undefined and :ets.whereis(lookup_table) != :undefined do
           FlowIndex.delete_member(index_table, lookup_table, key, member)
+        end
+    end)
+
+    Process.get(:sm_pending_flow_index_counts, %{})
+    |> Enum.each(fn
+      {{_index_table, lookup_table, key}, {:count, count}} ->
+        if :ets.whereis(lookup_table) != :undefined do
+          :ets.insert(lookup_table, {{:count, key}, count})
+        end
+
+      {{_index_table, lookup_table, key}, :missing} ->
+        if :ets.whereis(lookup_table) != :undefined do
+          :ets.delete(lookup_table, {:count, key})
         end
     end)
 

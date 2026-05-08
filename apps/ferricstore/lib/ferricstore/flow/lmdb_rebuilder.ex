@@ -174,8 +174,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             Map.update(counts, count_key, 1, &(&1 + 1))
           }
         else
-          {query_metadata_index_ops(record, expire_at_ms) ++
-             cleanup_stale_terminal_ops(lmdb_path, key) ++ lmdb_ops, prunes,
+          {cleanup_stale_terminal_ops(lmdb_path, key) ++ lmdb_ops, prunes,
            [{key, record} | active], counts}
         end
       end)

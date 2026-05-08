@@ -5250,6 +5250,19 @@ defmodule Ferricstore.FlowTest do
     assert created.history_hot_max_events == 5
   end
 
+  test "flow history configured maximum cannot exceed hard cap" do
+    original_max = Application.get_env(:ferricstore, :flow_max_history_max_events)
+    Application.put_env(:ferricstore, :flow_max_history_max_events, 2_000_000)
+
+    on_exit(fn -> restore_env(:flow_max_history_max_events, original_max) end)
+
+    assert {:error, "ERR flow history_max_events exceeds maximum 1000000"} =
+             FerricStore.flow_create(uid("flow-history-hard-cap-env"),
+               type: "audit-hard-cap-env",
+               history_max_events: 2_000_000
+             )
+  end
+
   test "flow history uses configured default hot max when omitted" do
     original = Application.get_env(:ferricstore, :flow_default_history_hot_max_events)
     Application.put_env(:ferricstore, :flow_default_history_hot_max_events, 2)

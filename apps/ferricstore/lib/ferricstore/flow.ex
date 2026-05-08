@@ -971,7 +971,7 @@ defmodule Ferricstore.Flow do
                Ferricstore.Flow.LMDB.prefix_entries(
                  path,
                  prefix,
-                 flow_lmdb_query_scan_count(count)
+                 flow_history_lmdb_query_scan_count(count)
                ) do
           {:ok, flow_decode_history_index_entries(entries, path, now_ms)}
         end
@@ -2000,6 +2000,23 @@ defmodule Ferricstore.Flow do
     |> max(count * 4)
     |> min(max_scan)
     |> max(count)
+  end
+
+  defp flow_history_lmdb_query_scan_count(count) when is_integer(count) and count > 0 do
+    max_scan =
+      Application.get_env(
+        :ferricstore,
+        :flow_lmdb_history_query_scan_limit,
+        flow_max_history_max_events()
+      )
+
+    max_scan =
+      case max_scan do
+        value when is_integer(value) and value > 0 -> min(value, flow_max_history_max_events())
+        _ -> flow_max_history_max_events()
+      end
+
+    max(count, max_scan)
   end
 
   defp flow_require_lmdb_mirror_healthy(ctx, index_key, partition_key) do
@@ -4127,7 +4144,7 @@ defmodule Ferricstore.Flow do
            :flow_max_history_max_events,
            @max_history_max_events
          ) do
-      value when is_integer(value) and value > 0 -> value
+      value when is_integer(value) and value > 0 -> min(value, @max_history_max_events)
       _ -> @max_history_max_events
     end
   end

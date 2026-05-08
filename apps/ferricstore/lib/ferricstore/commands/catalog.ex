@@ -340,6 +340,15 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Creates workflow records, atomic per partition/shard group."
     },
     %{
+      name: "flow.spawn_children",
+      arity: -4,
+      flags: ["write", "denyoom"],
+      first_key: 1,
+      last_key: 1,
+      step: 1,
+      summary: "Creates child workflow records and updates parent wait groups."
+    },
+    %{
       name: "flow.get",
       arity: -2,
       flags: ["readonly", "fast"],
@@ -349,7 +358,7 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Returns a workflow record."
     },
     %{
-      name: "flow.policy_set",
+      name: "flow.policy.set",
       arity: -2,
       flags: ["write"],
       first_key: 0,
@@ -358,13 +367,22 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Configures default and state retry policies for a workflow type."
     },
     %{
-      name: "flow.policy_get",
+      name: "flow.policy.get",
       arity: -2,
       flags: ["readonly", "fast"],
       first_key: 0,
       last_key: 0,
       step: 0,
       summary: "Returns effective retry policy for a workflow type or state."
+    },
+    %{
+      name: "flow.retention_cleanup",
+      arity: -1,
+      flags: ["write"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Runs bounded Flow retention cleanup."
     },
     %{
       name: "flow.claim_due",

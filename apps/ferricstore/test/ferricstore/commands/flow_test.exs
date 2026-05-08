@@ -1432,8 +1432,10 @@ defmodule Ferricstore.Commands.FlowTest do
     names = Dispatcher.dispatch("COMMAND", ["LIST"], MockStore.make())
     assert "flow.create" in names
     assert "flow.create_many" in names
-    assert "flow.policy_set" in names
-    assert "flow.policy_get" in names
+    assert "flow.spawn_children" in names
+    assert "flow.policy.set" in names
+    assert "flow.policy.get" in names
+    assert "flow.retention_cleanup" in names
     assert "flow.claim_due" in names
     assert "flow.complete" in names
     assert "flow.rewind" in names
@@ -1443,6 +1445,6 @@ defmodule Ferricstore.Commands.FlowTest do
 
     assert "write" in flags
     assert {:ok, ["flow-id"]} = Ferricstore.Commands.Catalog.get_keys("flow.create", ["flow-id"])
-    assert {:ok, []} = Ferricstore.Commands.Catalog.get_keys("flow.policy_set", ["checkout"])
+    assert {:ok, []} = Ferricstore.Commands.Catalog.get_keys("flow.policy.set", ["checkout"])
   end
 end

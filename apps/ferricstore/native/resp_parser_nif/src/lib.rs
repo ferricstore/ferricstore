@@ -6963,6 +6963,12 @@ fn flow_history_option<'a>(
                 FlowOptType::Boolean,
             ),
             (b"VALUES", "values", FlowOptType::Boolean),
+            (
+                b"PAYLOAD_MAX_BYTES",
+                "payload_max_bytes",
+                FlowOptType::NonNegative,
+            ),
+            (b"MAXBYTES", "payload_max_bytes", FlowOptType::NonNegative),
         ],
     )
 }
@@ -7036,10 +7042,12 @@ fn flow_option_value<'a>(
         FlowOptType::Binary => Ok(Some((key_atom, value_term).encode(env))),
         FlowOptType::Boolean => match parse_bool_bytes(value_bytes) {
             Some(value) => Ok(Some((key_atom, value).encode(env))),
-            None => Err(generic_ast_error(
-                env,
-                b"ERR flow idempotent must be a boolean",
-            )),
+            None => {
+                let mut msg = b"ERR flow ".to_vec();
+                msg.extend_from_slice(key.as_bytes());
+                msg.extend_from_slice(b" must be a boolean");
+                Err(generic_ast_error(env, &msg))
+            }
         },
         FlowOptType::Ref(_label) if value_bytes.len() <= FLOW_MAX_REF_SIZE => {
             Ok(Some((key_atom, value_term).encode(env)))
@@ -7440,9 +7448,19 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"FLOW.FAIL_MANY" => flow_fail_many_key_indices(arg_bytes),
         b"FLOW.CANCEL_MANY" => flow_cancel_many_key_indices(arg_bytes),
         b"FLOW.TRANSITION_MANY" => flow_transition_many_key_indices(arg_bytes),
-        b"FLOW.CREATE" | b"FLOW.GET" | b"FLOW.COMPLETE" | b"FLOW.TRANSITION" | b"FLOW.RETRY"
-        | b"FLOW.FAIL" | b"FLOW.CANCEL" | b"FLOW.REWIND" | b"FLOW.HISTORY" => {
-            vec![0]
+        b"FLOW.CREATE" | b"FLOW.GET" | b"FLOW.HISTORY" => {
+            flow_single_key_with_partition_indices(arg_bytes, 1)
+        }
+        b"FLOW.COMPLETE" | b"FLOW.RETRY" | b"FLOW.FAIL" | b"FLOW.EXTEND_LEASE" => {
+            flow_single_key_with_partition_indices(arg_bytes, 2)
+        }
+        b"FLOW.TRANSITION" => flow_single_key_with_partition_indices(arg_bytes, 3),
+        b"FLOW.CANCEL" | b"FLOW.REWIND" => flow_single_key_with_partition_indices(arg_bytes, 1),
+        b"FLOW.BY_PARENT" | b"FLOW.BY_ROOT" | b"FLOW.BY_CORRELATION" => {
+            flow_single_key_with_partition_indices(arg_bytes, 1)
+        }
+        b"FLOW.CLAIM_DUE" | b"FLOW.RECLAIM" | b"FLOW.LIST" | b"FLOW.INFO" | b"FLOW.STUCK" => {
+            flow_partition_key_indices(arg_bytes, 1)
         }
         b"MEMORY" => {
             if argc > 1 && ascii_eq_ignore_case(arg_bytes[0], b"USAGE") {
@@ -7628,6 +7646,49 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
     }
 }
 
+fn flow_single_key_with_partition_indices(arg_bytes: &[&[u8]], option_start: usize) -> Vec<usize> {
+    if arg_bytes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut keys = vec![0];
+    keys.extend(flow_partition_key_indices(arg_bytes, option_start));
+    dedup_indices(keys)
+}
+
+fn flow_partition_key_indices(arg_bytes: &[&[u8]], option_start: usize) -> Vec<usize> {
+    flow_partition_key_indices_until(arg_bytes, option_start, arg_bytes.len())
+}
+
+fn flow_partition_key_indices_until(
+    arg_bytes: &[&[u8]],
+    option_start: usize,
+    option_end: usize,
+) -> Vec<usize> {
+    let mut keys = Vec::new();
+    let mut idx = option_start;
+    let end = option_end.min(arg_bytes.len());
+
+    while idx + 1 < end {
+        if ascii_eq_ignore_case(arg_bytes[idx], b"PARTITION") {
+            keys.push(idx + 1);
+        }
+        idx += 2;
+    }
+
+    keys
+}
+
+fn dedup_indices(indices: Vec<usize>) -> Vec<usize> {
+    let mut deduped = Vec::with_capacity(indices.len());
+    for idx in indices {
+        if !deduped.contains(&idx) {
+            deduped.push(idx);
+        }
+    }
+    deduped
+}
+
 fn flow_create_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
     if arg_bytes.is_empty() || !ascii_eq_ignore_case(arg_bytes[0], b"MIXED") {
         return vec![0];
@@ -7646,8 +7707,16 @@ fn flow_create_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
     keys
 }
 
-fn flow_spawn_children_key_indices(_arg_bytes: &[&[u8]]) -> Vec<usize> {
-    vec![0]
+fn flow_spawn_children_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
+    let mut keys = if arg_bytes.is_empty() {
+        Vec::new()
+    } else {
+        vec![0]
+    };
+
+    let option_end = option_index(arg_bytes, 1, b"ITEMS").unwrap_or(arg_bytes.len());
+    keys.extend(flow_partition_key_indices_until(arg_bytes, 1, option_end));
+    dedup_indices(keys)
 }
 
 fn flow_transition_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {

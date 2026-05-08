@@ -586,7 +586,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
            :flow_max_history_max_events,
            @max_history_max_events
          ) do
-      value when is_integer(value) and value > 0 -> value
+      value when is_integer(value) and value > 0 -> min(value, @max_history_max_events)
       _ -> @max_history_max_events
     end
   end
