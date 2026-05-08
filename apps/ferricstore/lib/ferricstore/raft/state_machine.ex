@@ -1047,6 +1047,10 @@ defmodule Ferricstore.Raft.StateMachine do
     apply_pending_with_time(meta, state, fn -> do_flow_cancel_many(state, attrs) end)
   end
 
+  def apply(meta, {:flow_retention_cleanup, _key, attrs}, state) when is_map(attrs) do
+    apply_pending_with_time(meta, state, fn -> do_flow_retention_cleanup(state, attrs) end)
+  end
+
   def apply(meta, {:flow_rewind, _key, attrs}, state) when is_map(attrs) do
     apply_pending_with_time(meta, state, fn -> do_flow_rewind(state, attrs) end)
   end
@@ -3485,6 +3489,10 @@ defmodule Ferricstore.Raft.StateMachine do
     do_flow_cancel_many(state, attrs)
   end
 
+  defp apply_single(state, {:flow_retention_cleanup, _key, attrs}) do
+    do_flow_retention_cleanup(state, attrs)
+  end
+
   defp apply_single(state, {:flow_rewind, _key, attrs}) do
     do_flow_rewind(state, attrs)
   end
@@ -5853,7 +5861,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     with {:ok, record} <- flow_require_record(state, id, partition_key),
          {:ok, record, next} <- flow_prepare_cancel_existing_record(record, attrs, now_ms),
-         :ok <- flow_apply_cancel(state, record, next, partition_key, now_ms) do
+         :ok <- flow_apply_cancel(state, record, next, attrs, partition_key, now_ms) do
       {:ok, next}
     end
   end
@@ -5863,7 +5871,7 @@ defmodule Ferricstore.Raft.StateMachine do
          :ok <- flow_transition_many_unique?(attrs_list),
          {:ok, plans} <- flow_cancel_many_prepare(state, attrs_list),
          :ok <- flow_cancel_many_apply(state, plans) do
-      {:ok, Enum.map(plans, fn {_record, next} -> next end)}
+      {:ok, Enum.map(plans, fn {_record, next, _attrs} -> next end)}
     end
   end
 
@@ -5873,13 +5881,24 @@ defmodule Ferricstore.Raft.StateMachine do
   defp flow_prepare_cancel_existing_record(record, attrs, now_ms) do
     with :ok <- flow_require_fencing_token(record, Map.fetch!(attrs, :fencing_token)),
          :ok <- flow_require_transition_lease(record, Map.get(attrs, :lease_token)) do
+      version = Map.fetch!(record, :version) + 1
+      partition_key = Map.get(record, :partition_key)
+
       next =
         record
         |> Map.merge(%{
           state: "cancelled",
-          version: Map.fetch!(record, :version) + 1,
+          version: version,
           updated_at_ms: now_ms,
-          error_ref: Map.get(attrs, :reason_ref),
+          error_ref:
+            flow_value_ref(
+              attrs,
+              :error,
+              Map.fetch!(record, :id),
+              version,
+              partition_key,
+              Map.get(attrs, :reason_ref)
+            ),
           ttl_ms: nil,
           retention_ttl_ms: Map.get(attrs, :ttl_ms) || Map.get(record, :retention_ttl_ms),
           history_hot_max_events: Map.get(record, :history_hot_max_events),
@@ -5897,10 +5916,12 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp flow_apply_cancel(state, record, next, partition_key, now_ms) do
+  defp flow_apply_cancel(state, record, next, attrs, partition_key, now_ms) do
     plans = [{record, next}]
+    refresh_attrs = flow_cancel_refresh_attrs(attrs)
 
-    with :ok <- flow_refresh_terminal_value_expirations(state, next, %{error: true}),
+    with :ok <- do_flow_put_record_values(state, next, attrs),
+         :ok <- flow_refresh_terminal_value_expirations(state, next, refresh_attrs),
          :ok <- flow_transition_move_indexes(state, plans),
          :ok <-
            flow_put_state_record(
@@ -5911,6 +5932,14 @@ defmodule Ferricstore.Raft.StateMachine do
          :ok <- flow_history_put_planned(state, record, next, "cancelled", now_ms),
          :ok <- flow_after_history_put(state, next) do
       :ok
+    end
+  end
+
+  defp flow_cancel_refresh_attrs(attrs) do
+    if Map.has_key?(attrs, :error) do
+      attrs
+    else
+      Map.put(attrs, :error, true)
     end
   end
 
@@ -5929,7 +5958,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
           record ->
             case flow_prepare_cancel_existing_record(record, attrs, now_ms) do
-              {:ok, record, next} -> {:cont, {:ok, [{record, next} | acc]}}
+              {:ok, record, next} -> {:cont, {:ok, [{record, next, attrs} | acc]}}
               {:error, _reason} = error -> {:halt, error}
             end
         end
@@ -5944,12 +5973,195 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp flow_cancel_many_apply(state, plans) do
-    with :ok <- flow_refresh_many_terminal_value_expirations(state, plans),
-         :ok <- flow_transition_move_indexes(state, plans),
-         :ok <- flow_claim_put_state_records(state, plans),
-         :ok <- flow_many_put_history(state, plans, "cancelled") do
+    pair_plans = Enum.map(plans, fn {record, next, _attrs} -> {record, next} end)
+
+    with :ok <- flow_cancel_many_put_record_values(state, plans),
+         :ok <- flow_transition_move_indexes(state, pair_plans),
+         :ok <- flow_claim_put_state_records(state, pair_plans),
+         :ok <- flow_many_put_history(state, pair_plans, "cancelled") do
       :ok
     end
+  end
+
+  defp flow_cancel_many_put_record_values(state, plans) do
+    Enum.reduce_while(plans, :ok, fn {_record, next, attrs}, :ok ->
+      refresh_attrs = flow_cancel_refresh_attrs(attrs)
+
+      case do_flow_put_record_values(state, next, attrs) do
+        :ok ->
+          case flow_refresh_terminal_value_expirations(state, next, refresh_attrs) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp do_flow_retention_cleanup(state, attrs) do
+    now_ms = Map.get(attrs, :now_ms, apply_now_ms())
+    limit = Map.get(attrs, :limit, 100)
+
+    state
+    |> flow_retention_expired_state_entries(now_ms, limit)
+    |> Enum.reduce_while({:ok, %{flows: 0, history: 0, values: 0}}, fn entry, {:ok, acc} ->
+      case flow_retention_cleanup_entry(state, entry) do
+        {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_retention_expired_state_entries(state, now_ms, limit) do
+    prefix = "f:{f"
+    prefix_len = byte_size(prefix)
+
+    match_spec = [
+      {{:"$1", :"$2", :"$3", :_, :"$5", :"$6", :"$7"},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:andalso, {:==, {:binary_part, :"$1", 0, prefix_len}, prefix},
+            {:andalso, {:>, :"$3", 0}, {:<, :"$3", now_ms + 1}}}}}
+       ], [{{:"$1", :"$2", :"$3", :"$5", :"$6", :"$7"}}]}
+    ]
+
+    state.ets
+    |> :ets.select(match_spec)
+    |> Enum.filter(fn {key, _value, _expire_at_ms, _fid, _offset, _value_size} ->
+      FlowKeys.state_key?(key)
+    end)
+    |> Enum.take(limit)
+  end
+
+  defp flow_retention_cleanup_entry(
+         state,
+         {state_key, value, _expire_at_ms, fid, offset, value_size}
+       ) do
+    case flow_retention_decode_state_record(state, state_key, value, fid, offset, value_size) do
+      {:ok, record} ->
+        if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+          flow_retention_cleanup_record(state, state_key, record)
+        else
+          {:ok, %{flows: 0, history: 0, values: 0}}
+        end
+
+      :miss ->
+        {:ok, %{flows: 0, history: 0, values: 0}}
+    end
+  end
+
+  defp flow_retention_decode_state_record(_state, _key, value, _fid, _offset, _value_size)
+       when is_binary(value) do
+    flow_decode_record_blob(value)
+  end
+
+  defp flow_retention_decode_state_record(state, key, nil, fid, offset, value_size)
+       when valid_cold_location(fid, offset, value_size) do
+    case ColdRead.pread_at(sm_file_path(state, fid), offset, key, @cold_read_timeout_ms) do
+      {:ok, value} -> flow_decode_record_blob(value)
+      {:error, _reason} -> :miss
+    end
+  end
+
+  defp flow_retention_decode_state_record(_state, _key, _value, _fid, _offset, _value_size),
+    do: :miss
+
+  defp flow_retention_cleanup_record(state, state_key, record) do
+    history_key = FlowKeys.history_key(Map.fetch!(record, :id), Map.get(record, :partition_key))
+    history_entries = flow_retention_history_entries(state, history_key)
+    history_keys = Enum.map(history_entries, fn {key, _event_id} -> key end)
+    history_values = sm_store_batch_get(state, history_keys, &sm_file_path/2)
+
+    value_refs =
+      record
+      |> flow_retention_record_value_refs()
+      |> Kernel.++(flow_retention_history_value_refs(history_values))
+      |> Enum.uniq()
+
+    with :ok <- flow_retention_delete_history_index(state, history_key, history_entries),
+         {:ok, history_count} <- flow_retention_delete_keys(state, history_keys),
+         {:ok, values_count} <- flow_retention_delete_keys(state, value_refs),
+         :ok <- do_delete(state, state_key) do
+      {:ok, %{flows: 1, history: history_count, values: values_count}}
+    end
+  end
+
+  defp flow_retention_history_entries(state, history_key) do
+    prefix = "X:" <> history_key <> <<0>>
+    prefix_len = byte_size(prefix)
+
+    match_spec = [
+      {{:"$1", :_, :_, :_, :_, :_, :_},
+       [
+         {:andalso, {:is_binary, :"$1"},
+          {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
+           {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
+       ], [:"$1"]}
+    ]
+
+    state.ets
+    |> :ets.select(match_spec)
+    |> Enum.map(fn key -> {key, binary_part(key, prefix_len, byte_size(key) - prefix_len)} end)
+  end
+
+  defp flow_retention_delete_history_index(_state, _history_key, []), do: :ok
+
+  defp flow_retention_delete_history_index(state, history_key, entries) do
+    event_ids = Enum.map(entries, fn {_key, event_id} -> event_id end)
+    flow_index_delete_members(state, history_key, event_ids)
+  end
+
+  defp flow_retention_record_value_refs(record) do
+    [:payload_ref, :result_ref, :error_ref]
+    |> Enum.flat_map(fn key ->
+      string_key = Atom.to_string(key)
+      [Map.get(record, key), Map.get(record, string_key)]
+    end)
+    |> Enum.filter(&flow_owned_value_ref?/1)
+  end
+
+  defp flow_retention_history_value_refs(values) do
+    values
+    |> Enum.flat_map(fn
+      value when is_binary(value) ->
+        value
+        |> Flow.decode_history_fields()
+        |> flow_history_fields_to_map()
+        |> flow_retention_record_value_refs()
+
+      _other ->
+        []
+    end)
+    |> Enum.filter(&flow_owned_value_ref?/1)
+  end
+
+  defp flow_owned_value_ref?(ref) when is_binary(ref) do
+    String.starts_with?(ref, "f:{f") and String.contains?(ref, "}:v:")
+  end
+
+  defp flow_owned_value_ref?(_ref), do: false
+
+  defp flow_retention_delete_keys(state, keys) do
+    keys
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.reduce_while({:ok, 0}, fn key, {:ok, count} ->
+      case do_delete(state, key) do
+        :ok -> {:cont, {:ok, count + 1}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_retention_merge_counts(left, right) do
+    %{
+      flows: Map.get(left, :flows, 0) + Map.get(right, :flows, 0),
+      history: Map.get(left, :history, 0) + Map.get(right, :history, 0),
+      values: Map.get(left, :values, 0) + Map.get(right, :values, 0)
+    }
   end
 
   defp do_flow_rewind(state, %{id: id, to_event: to_event} = attrs) do
@@ -7549,22 +7761,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
       {_key, _value}, :ok ->
         {:cont, :ok}
-    end)
-  end
-
-  defp flow_refresh_many_terminal_value_expirations(state, plans) do
-    Enum.reduce_while(plans, :ok, fn
-      {_record, next}, :ok ->
-        case flow_refresh_terminal_value_expirations(state, next, %{error: true}) do
-          :ok -> {:cont, :ok}
-          {:error, _reason} = error -> {:halt, error}
-        end
-
-      {_record, next, attrs}, :ok ->
-        case flow_refresh_terminal_value_expirations(state, next, attrs) do
-          :ok -> {:cont, :ok}
-          {:error, _reason} = error -> {:halt, error}
-        end
     end)
   end
 

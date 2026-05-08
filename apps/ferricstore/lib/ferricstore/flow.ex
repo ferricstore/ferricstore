@@ -558,6 +558,23 @@ defmodule Ferricstore.Flow do
   def cancel_many(_ctx, _partition_key, _items, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
+  def retention_cleanup(ctx, opts \\ [])
+
+  def retention_cleanup(ctx, opts) when is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with :ok <- validate_opts(opts),
+           {:ok, limit} <- optional_pos_integer(opts, :limit, 100),
+           {:ok, now} <- optional_non_neg_integer(opts, :now_ms, now_ms()) do
+        Router.flow_retention_cleanup(ctx, %{limit: limit, now_ms: now})
+      end
+
+    observe_flow(:retention_cleanup, started, result, %{flow_id: nil})
+  end
+
+  def retention_cleanup(_ctx, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
   def rewind(ctx, id, opts) when is_binary(id) and is_list(opts) do
     started = flow_start_time()
 
@@ -2830,7 +2847,8 @@ defmodule Ferricstore.Flow do
          {:ok, now} <- optional_now_ms(opts),
          {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms),
          {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
-         :ok <- validate_ref_size(:reason_ref, reason_ref) do
+         :ok <- validate_ref_size(:reason_ref, reason_ref),
+         :ok <- validate_cancel_reason_source(opts) do
       attrs =
         %{
           id: id,
@@ -2840,9 +2858,26 @@ defmodule Ferricstore.Flow do
           reason_ref: reason_ref,
           partition_key: partition_key
         }
+        |> maybe_put_cancel_reason(opts)
         |> maybe_put_attr(:now_ms, now)
 
       {:ok, attrs}
+    end
+  end
+
+  defp validate_cancel_reason_source(opts) do
+    if Keyword.has_key?(opts, :reason) and Keyword.has_key?(opts, :reason_ref) do
+      {:error, "ERR flow reason and reason_ref are mutually exclusive"}
+    else
+      :ok
+    end
+  end
+
+  defp maybe_put_cancel_reason(attrs, opts) do
+    if Keyword.has_key?(opts, :reason) do
+      Map.put(attrs, :error, Keyword.fetch!(opts, :reason))
+    else
+      attrs
     end
   end
 
@@ -3506,7 +3541,8 @@ defmodule Ferricstore.Flow do
     {:ok, id,
      [fencing_token: fencing_token] ++
        cancel_many_item_lease_token(item) ++
-       cancel_many_item_reason_ref(item) ++ cancel_many_item_partition_key(item)}
+       cancel_many_item_reason_ref(item) ++
+       cancel_many_item_reason(item) ++ cancel_many_item_partition_key(item)}
   end
 
   defp cancel_many_item_opts(%{"id" => id, "fencing_token" => fencing_token} = item)
@@ -3514,7 +3550,8 @@ defmodule Ferricstore.Flow do
     {:ok, id,
      [fencing_token: fencing_token] ++
        cancel_many_item_lease_token(item) ++
-       cancel_many_item_reason_ref(item) ++ cancel_many_item_partition_key(item)}
+       cancel_many_item_reason_ref(item) ++
+       cancel_many_item_reason(item) ++ cancel_many_item_partition_key(item)}
   end
 
   defp cancel_many_item_opts({id, item_opts}) when is_binary(id) and is_list(item_opts) do
@@ -3721,6 +3758,11 @@ defmodule Ferricstore.Flow do
   defp cancel_many_item_reason_ref(item) do
     []
     |> maybe_put_item_opt(:reason_ref, item, :reason_ref, "reason_ref")
+  end
+
+  defp cancel_many_item_reason(item) do
+    []
+    |> maybe_put_item_opt(:reason, item, :reason, "reason")
   end
 
   defp cancel_many_item_partition_key(item) do

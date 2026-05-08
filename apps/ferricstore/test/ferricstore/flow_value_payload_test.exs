@@ -257,6 +257,81 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert {:ok, "keep-me"} = FerricStore.get(reason_key)
   end
 
+  test "cancel stores inline reason payload as an owned terminal value" do
+    id = unique_id("flow-value-cancel-reason")
+    reason = %{code: "user_cancelled", details: String.duplicate("x", 256)}
+
+    assert {:ok, created} =
+             FerricStore.flow_create(id,
+               type: "value-cancel-reason",
+               partition_key: "tenant-retention",
+               payload: %{large: String.duplicate("p", 256)},
+               retention_ttl_ms: 100,
+               run_at_ms: 1_000
+             )
+
+    assert {:ok, cancelled} =
+             FerricStore.flow_cancel(id,
+               partition_key: "tenant-retention",
+               fencing_token: created.fencing_token,
+               reason: reason
+             )
+
+    assert is_binary(cancelled.error_ref)
+    assert cancelled.error_ref != ""
+
+    assert {:ok, fetched} =
+             FerricStore.flow_get(id, partition_key: "tenant-retention", full: true)
+
+    assert fetched.error == reason
+
+    Process.sleep(150)
+
+    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
+    assert {:ok, nil} = FerricStore.get(cancelled.error_ref)
+  end
+
+  test "retention cleanup removes expired terminal state, history, and owned values" do
+    id = unique_id("flow-value-retention-cleanup")
+
+    assert {:ok, created} =
+             FerricStore.flow_create(id,
+               type: "value-retention-cleanup",
+               partition_key: "tenant-retention",
+               payload: %{large: String.duplicate("p", 256)},
+               retention_ttl_ms: 100,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("value-retention-cleanup",
+               partition_key: "tenant-retention",
+               worker: "worker-retention-cleanup",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, completed} =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               partition_key: "tenant-retention",
+               fencing_token: claimed.fencing_token,
+               result: %{ok: true},
+               now_ms: 1_100
+             )
+
+    Process.sleep(150)
+
+    assert {:ok, cleaned} = FerricStore.flow_retention_cleanup(limit: 10)
+    assert cleaned.flows >= 1
+    assert cleaned.history >= 1
+    assert cleaned.values >= 2
+
+    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "tenant-retention")
+    assert {:ok, nil} = FerricStore.get(created.payload_ref)
+    assert {:ok, nil} = FerricStore.get(completed.result_ref)
+  end
+
   test "rewind from terminal back to active clears value ref expiration" do
     id = unique_id("flow-value-rewind-retention")
 

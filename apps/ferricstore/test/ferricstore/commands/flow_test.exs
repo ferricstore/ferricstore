@@ -712,6 +712,13 @@ defmodule Ferricstore.Commands.FlowTest do
                MockStore.make()
              )
 
+    assert {:error, "ERR syntax error"} =
+             Dispatcher.dispatch(
+               "FLOW.CANCEL",
+               ["flow-cancel-error-option", "FENCING", "1", "ERROR", "bad"],
+               MockStore.make()
+             )
+
     assert {:error, "ERR flow ttl_ms must be a positive integer"} =
              Dispatcher.dispatch(
                "FLOW.COMPLETE_MANY",
@@ -732,6 +739,40 @@ defmodule Ferricstore.Commands.FlowTest do
                ["tenant", "TTL", "0", "ITEMS", "flow-a", "1"],
                MockStore.make()
              )
+  end
+
+  test "dispatches Flow cancel inline reason through Rust AST" do
+    id = uid("flow-command-cancel-reason")
+    partition = uid("flow-command-cancel-reason-tenant")
+    reason = "cancelled by operator"
+
+    assert %{"id" => ^id, "fencing_token" => fencing_token} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [id, "TYPE", "cancel-reason", "PARTITION", partition],
+               MockStore.make()
+             )
+
+    assert %{"id" => ^id, "state" => "cancelled", "error_ref" => error_ref} =
+             Dispatcher.dispatch(
+               "FLOW.CANCEL",
+               [
+                 id,
+                 "FENCING",
+                 Integer.to_string(fencing_token),
+                 "PARTITION",
+                 partition,
+                 "REASON",
+                 reason
+               ],
+               MockStore.make()
+             )
+
+    assert is_binary(error_ref)
+    assert error_ref != reason
+
+    assert {:ok, fetched} = FerricStore.flow_get(id, partition_key: partition, full: true)
+    assert fetched.error == reason
   end
 
   test "dispatches Flow fail_many through Rust AST" do

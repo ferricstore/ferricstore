@@ -3303,6 +3303,33 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc false
+  def flow_retention_cleanup(ctx, attrs) when is_map(attrs) do
+    0..(ctx.shard_count - 1)
+    |> Enum.reduce_while({:ok, %{flows: 0, history: 0, values: 0}}, fn idx, {:ok, acc} ->
+      key = "__flow_retention_cleanup__:#{idx}"
+
+      case raft_write(ctx, idx, key, {:flow_retention_cleanup, key, attrs}) do
+        {:ok, result} when is_map(result) ->
+          {:cont, {:ok, merge_flow_cleanup_counts(acc, result)}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+
+        _other ->
+          {:halt, {:error, "ERR flow retention cleanup failed"}}
+      end
+    end)
+  end
+
+  defp merge_flow_cleanup_counts(left, right) do
+    %{
+      flows: Map.get(left, :flows, 0) + Map.get(right, :flows, 0),
+      history: Map.get(left, :history, 0) + Map.get(right, :history, 0),
+      values: Map.get(left, :values, 0) + Map.get(right, :values, 0)
+    }
+  end
+
+  @doc false
   def flow_rewind(ctx, %{id: id} = attrs) when is_binary(id) do
     key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
 

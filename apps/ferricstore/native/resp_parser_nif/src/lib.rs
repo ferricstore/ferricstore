@@ -6581,6 +6581,7 @@ fn flow_cancel_many_option<'a>(
         arg_bytes,
         idx,
         &[
+            (b"REASON", "reason", FlowOptType::Binary),
             (b"REASON_REF", "reason_ref", FlowOptType::Ref(b"reason_ref")),
             (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
@@ -6667,6 +6668,7 @@ fn flow_cancel_option<'a>(
         &[
             (b"FENCING", "fencing_token", FlowOptType::NonNegative),
             (b"LEASE_TOKEN", "lease_token", FlowOptType::Binary),
+            (b"REASON", "reason", FlowOptType::Binary),
             (b"REASON_REF", "reason_ref", FlowOptType::Ref(b"reason_ref")),
             (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),

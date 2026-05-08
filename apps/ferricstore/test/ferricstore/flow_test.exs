@@ -1051,6 +1051,13 @@ defmodule Ferricstore.FlowTest do
     assert {:error, "ERR flow reason_ref too large" <> _} =
              FerricStore.flow_cancel("flow", fencing_token: 0, reason_ref: huge_ref)
 
+    assert {:error, "ERR flow reason and reason_ref are mutually exclusive"} =
+             FerricStore.flow_cancel("flow",
+               fencing_token: 0,
+               reason: "inline",
+               reason_ref: "external"
+             )
+
     assert {:error, "ERR flow reason_ref too large" <> _} =
              FerricStore.flow_rewind("flow", to_event: "1-1", reason_ref: huge_ref)
   end

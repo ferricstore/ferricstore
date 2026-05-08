@@ -675,6 +675,21 @@ defmodule FerricStore do
   def flow_cancel_many(_partition_key, _items, _opts),
     do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc """
+  Removes expired terminal Flow state, history rows, and generated value payload keys.
+
+  This is a bounded cleanup pass; pass `limit: n` to cap the number of expired
+  terminal flows cleaned per shard.
+  """
+  @spec flow_retention_cleanup(keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_retention_cleanup(opts \\ [])
+
+  def flow_retention_cleanup(opts) when is_list(opts) do
+    Ferricstore.Flow.retention_cleanup(default_ctx(), opts)
+  end
+
+  def flow_retention_cleanup(_opts), do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Rewinds a Flow record to a previous history event without rewriting history."
   @spec flow_rewind(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_rewind(id, opts) when is_binary(id) and is_list(opts) do
