@@ -233,7 +233,7 @@ defmodule Ferricstore.Store.StandaloneTxLog do
 
   defp decode_line(line) do
     with {:ok, binary} <- Base.decode64(line),
-         term <- :erlang.binary_to_term(binary),
+         term <- :erlang.binary_to_term(binary, [:safe]),
          true <- valid_entry?(term) do
       [term]
     else

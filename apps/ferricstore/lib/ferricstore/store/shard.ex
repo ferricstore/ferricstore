@@ -533,22 +533,34 @@ defmodule Ferricstore.Store.Shard do
         _from,
         state
       ) do
-    sm_state = direct_sm_state(state)
+    state = drain_standalone_commits_for_sync(state)
 
-    case run_standalone_command(command, sm_state) do
-      {:ok, new_sm_state, result} ->
-        {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+    cond do
+      state.writes_paused ->
+        {:reply, {:error, {:standalone_durability_failed, :prior_standalone_write_failed}}, state}
 
-      {:error, new_sm_state, reason} ->
-        state =
-          if new_sm_state do
-            apply_direct_sm_state(state, new_sm_state)
-          else
-            state
-          end
-
-        {:reply, {:error, {:standalone_durability_failed, reason}},
+      state.last_flush_error != nil ->
+        {:reply, {:error, {:standalone_durability_failed, state.last_flush_error}},
          %{state | writes_paused: true}}
+
+      true ->
+        sm_state = direct_sm_state(state)
+
+        case run_standalone_command(command, sm_state) do
+          {:ok, new_sm_state, result} ->
+            {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+
+          {:error, new_sm_state, reason} ->
+            state =
+              if new_sm_state do
+                apply_direct_sm_state(state, new_sm_state)
+              else
+                state
+              end
+
+            {:reply, {:error, {:standalone_durability_failed, reason}},
+             %{state | writes_paused: true}}
+        end
     end
   end
 
@@ -1514,6 +1526,13 @@ defmodule Ferricstore.Store.Shard do
       30_000 ->
         %{state | last_flush_error: {:standalone_commit_flush_timeout, ref}}
     end
+  end
+
+  defp drain_standalone_commits_for_sync(state) do
+    state
+    |> drain_standalone_waiting()
+    |> flush_ready_standalone_batch()
+    |> await_standalone_flush()
   end
 
   defp drain_standalone_waiting(state) do

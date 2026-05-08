@@ -268,6 +268,48 @@ defmodule Ferricstore.StandaloneModeApplicationTest do
     refute File.exists?(tx_log_path)
   end
 
+  test "standalone cross-shard tx waits for earlier pending standalone writes" do
+    ctx = FerricStore.Instance.get(:default)
+    key_a = "standalone:cross-shard:pending-source"
+    key_b = key_on_different_shard(ctx, Router.shard_for(ctx, key_a))
+    parent = self()
+
+    Application.put_env(:ferricstore, :standalone_fsync_max_delay_ms, 1)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      if Enum.any?(batch, &match?({:put, ^key_a, "pending", 0}, &1)) do
+        send(parent, {:durability_hook_blocked, self()})
+
+        receive do
+          :release_durability_hook -> :passthrough
+        after
+          5_000 -> {:error, :durability_hook_timeout}
+        end
+      else
+        :passthrough
+      end
+    end)
+
+    put_task = Task.async(fn -> Router.put(ctx, key_a, "pending", 0) end)
+    assert_receive {:durability_hook_blocked, hook_pid}, 5_000
+
+    tx_task =
+      Task.async(fn ->
+        Ferricstore.Commands.Strings.handle("MSETNX", [key_a, "tx-a", key_b, "tx-b"], %{})
+      end)
+
+    refute Task.yield(tx_task, 100)
+
+    send(hook_pid, :release_durability_hook)
+    assert :ok = Task.await(put_task, 5_000)
+    assert 0 = Task.await(tx_task, 5_000)
+    assert Router.get(ctx, key_a) == "pending"
+    assert Router.get(ctx, key_b) == nil
+  after
+    Application.delete_env(:ferricstore, :standalone_fsync_max_delay_ms)
+    Application.delete_env(:ferricstore, :standalone_durability_hook)
+  end
+
   test "standalone batch read-modify-write commands see staged values before publish" do
     ctx = FerricStore.Instance.get(:default)
     key = "standalone:group-commit:incr"
