@@ -444,6 +444,29 @@ defmodule Ferricstore.Flow do
     do: [{:error, "ERR flow opts must be a keyword list"}]
 
   @doc false
+  def pipeline_claim_due_batch(_ctx, []), do: []
+
+  def pipeline_claim_due_batch(ctx, ops) when is_list(ops) do
+    started = flow_start_time()
+
+    {results, stats} =
+      ops
+      |> Enum.map(&pipeline_claim_due_command/1)
+      |> pipeline_claim_due_results(ctx, [], %{groups: 0, coalesced_calls: 0})
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :pipeline_claim_due_batch],
+      Map.merge(stats, %{commands: length(ops), duration_us: elapsed_us(started)}),
+      %{source: :resp_pipeline}
+    )
+
+    results
+  end
+
+  def pipeline_claim_due_batch(_ctx, _ops),
+    do: [{:error, "ERR flow opts must be a keyword list"}]
+
+  @doc false
   def pipeline_read_batch(_ctx, []), do: []
 
   def pipeline_read_batch(ctx, ops) when is_list(ops) do
@@ -2332,6 +2355,10 @@ defmodule Ferricstore.Flow do
     }
   end
 
+  defp elapsed_us(started) do
+    System.convert_time_unit(System.monotonic_time() - started, :native, :microsecond)
+  end
+
   defp result_count({:ok, records}) when is_list(records), do: length(records)
   defp result_count({:ok, nil}), do: 0
   defp result_count({:ok, _record}), do: 1
@@ -2961,6 +2988,310 @@ defmodule Ferricstore.Flow do
     key = __MODULE__.Keys.state_key(id, partition_key)
     {:ok, {key, {command, key, attrs}}}
   end
+
+  defp pipeline_claim_due_command({:claim_due, type, opts})
+       when is_binary(type) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_type(type),
+         {:ok, state} <- optional_claim_states(opts),
+         {:ok, worker} <- required_binary(opts, :worker),
+         {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
+         {:ok, limit} <- optional_claim_limit(opts),
+         {:ok, priority} <- optional_priority_or_nil(opts),
+         {:ok, now} <- optional_now_ms(opts),
+         {:ok, payload_return} <- payload_return_opts(opts, true),
+         {:ok, reclaim_expired?} <- optional_boolean(opts, :reclaim_expired, true),
+         {:ok, reclaim_ratio} <- optional_reclaim_ratio(opts),
+         {:ok, partition_key} <- optional_claim_partition_key(opts),
+         :ok <- validate_claim_due_keys(type, state, priority, partition_key) do
+      normalized_opts =
+        claim_due_normalized_opts(
+          state,
+          worker,
+          lease_ms,
+          limit,
+          priority,
+          now,
+          payload_return,
+          reclaim_expired?,
+          reclaim_ratio,
+          partition_key
+        )
+
+      attrs =
+        %{
+          type: type,
+          state: state,
+          worker: worker,
+          lease_ms: lease_ms,
+          limit: limit,
+          priority: priority,
+          partition_key: partition_key
+        }
+        |> maybe_put_attr(:now_ms, now)
+
+      queue_key = {type, state, priority, now, partition_key}
+
+      key =
+        {type, state, worker, lease_ms, priority, now, payload_return, reclaim_expired?,
+         reclaim_ratio, partition_key}
+
+      {:ok,
+       %{
+         type: type,
+         attrs: attrs,
+         opts: normalized_opts,
+         limit: limit,
+         key: key,
+         queue_key: queue_key,
+         payload_return: payload_return,
+         reclaim_expired?: reclaim_expired?,
+         reclaim_ratio: reclaim_ratio,
+         groupable?: partition_key != :any
+       }}
+    end
+  end
+
+  defp pipeline_claim_due_command(_op), do: {:error, "ERR unsupported flow pipeline command"}
+
+  defp pipeline_claim_due_results(commands, ctx, acc, stats) do
+    if global_claim_grouping_safe?(commands) do
+      pipeline_claim_due_grouped_results(commands, ctx, stats)
+    else
+      pipeline_claim_due_adjacent_results(commands, ctx, acc, stats)
+    end
+  end
+
+  defp pipeline_claim_due_adjacent_results([], _ctx, acc, stats), do: {Enum.reverse(acc), stats}
+
+  defp pipeline_claim_due_adjacent_results([{:error, _reason} = error | rest], ctx, acc, stats),
+    do: pipeline_claim_due_adjacent_results(rest, ctx, [error | acc], stats)
+
+  defp pipeline_claim_due_adjacent_results([{:ok, claim} | rest], ctx, acc, stats) do
+    {run, rest} = take_compatible_claims(rest, claim.key, [claim])
+    claims = Enum.reverse(run)
+    {results, stats} = execute_claim_due_run(ctx, claims, stats)
+    pipeline_claim_due_adjacent_results(rest, ctx, Enum.reverse(results) ++ acc, stats)
+  end
+
+  defp take_compatible_claims(
+         [{:ok, %{key: key, groupable?: true} = claim} | rest],
+         key,
+         [
+           %{groupable?: true} | _
+         ] = acc
+       ),
+       do: take_compatible_claims(rest, key, [claim | acc])
+
+  defp take_compatible_claims(rest, _key, acc), do: {acc, rest}
+
+  defp global_claim_grouping_safe?(commands) do
+    commands
+    |> Enum.reduce_while(%{}, fn
+      {:ok, %{groupable?: false}}, _seen ->
+        {:halt, false}
+
+      {:ok, %{queue_key: queue_key, key: key, groupable?: true}}, seen ->
+        case Map.get(seen, queue_key) do
+          nil -> {:cont, Map.put(seen, queue_key, key)}
+          ^key -> {:cont, seen}
+          _conflicting_key -> {:halt, false}
+        end
+
+      {:error, _reason}, seen ->
+        {:cont, seen}
+    end)
+    |> is_map()
+  end
+
+  defp pipeline_claim_due_grouped_results(commands, ctx, stats) do
+    {groups, indexed_results} =
+      commands
+      |> Enum.with_index()
+      |> Enum.reduce({%{}, %{}}, fn
+        {{:ok, claim}, idx}, {group_acc, result_acc} ->
+          {Map.update(group_acc, claim.key, [{idx, claim}], fn acc -> [{idx, claim} | acc] end),
+           result_acc}
+
+        {{:error, _reason} = error, idx}, {group_acc, result_acc} ->
+          {group_acc, Map.put(result_acc, idx, error)}
+      end)
+
+    {indexed_results, stats} =
+      Enum.reduce(groups, {indexed_results, stats}, fn {_key, indexed_claims},
+                                                       {result_acc, stats_acc} ->
+        indexed_claims = Enum.reverse(indexed_claims)
+        claims = Enum.map(indexed_claims, fn {_idx, claim} -> claim end)
+        {results, stats_acc} = execute_claim_due_run(ctx, claims, stats_acc)
+
+        indexed_claims
+        |> Enum.map(fn {idx, _claim} -> idx end)
+        |> Enum.zip(results)
+        |> Enum.reduce({result_acc, stats_acc}, fn {idx, result}, {acc, stats} ->
+          {Map.put(acc, idx, result), stats}
+        end)
+      end)
+
+    results = for idx <- 0..(length(commands) - 1), do: Map.fetch!(indexed_results, idx)
+    {results, stats}
+  end
+
+  defp execute_claim_due_run(ctx, [%{type: type, opts: opts}], stats) do
+    {[claim_due_result(ctx, type, opts)], %{stats | groups: stats.groups + 1}}
+  end
+
+  defp execute_claim_due_run(
+         ctx,
+         [
+           %{
+             attrs: %{state: state},
+             reclaim_expired?: true,
+             reclaim_ratio: reclaim_ratio
+           }
+           | _
+         ] = claims,
+         stats
+       )
+       when state != "running" and reclaim_ratio > 0 do
+    results = execute_claim_due_reclaim_run(ctx, claims, reclaim_ratio)
+    {results, %{stats | groups: stats.groups + 1, coalesced_calls: stats.coalesced_calls + 1}}
+  end
+
+  defp execute_claim_due_run(ctx, [%{type: type, opts: opts} | _] = claims, stats) do
+    total_limit = Enum.reduce(claims, 0, fn %{limit: limit}, acc -> acc + limit end)
+    combined_opts = Keyword.put(opts, :limit, total_limit)
+
+    results =
+      case claim_due_result(ctx, type, combined_opts) do
+        {:ok, records} ->
+          split_claim_due_records(records, claims, [])
+
+        {:error, _reason} = error ->
+          List.duplicate(error, length(claims))
+      end
+
+    {results, %{stats | groups: stats.groups + 1, coalesced_calls: stats.coalesced_calls + 1}}
+  end
+
+  defp execute_claim_due_reclaim_run(ctx, [%{attrs: base_attrs} | _] = claims, reclaim_ratio) do
+    initial_caps =
+      Enum.map(claims, fn %{limit: limit} ->
+        max(1, div(limit * reclaim_ratio + 99, 100))
+      end)
+
+    with {:ok, reclaimed_first} <-
+           pipeline_claim_due_router(ctx, %{
+             base_attrs
+             | state: "running",
+               limit: Enum.sum(initial_caps)
+           }),
+         {first_allocations, _unused} <- allocate_claim_due_records(reclaimed_first, initial_caps),
+         normal_caps = remaining_claim_due_caps(claims, first_allocations),
+         normal_attrs =
+           claim_normal_attrs(
+             base_attrs,
+             claim_normal_state_filter(base_attrs.state),
+             Enum.sum(normal_caps)
+           ),
+         {:ok, normal} <- pipeline_claim_due_router_maybe(ctx, normal_attrs),
+         {normal_allocations, _unused} <- allocate_claim_due_records(normal, normal_caps),
+         final_caps = remaining_claim_due_caps(claims, first_allocations, normal_allocations),
+         {:ok, reclaimed_more} <-
+           pipeline_claim_due_router(ctx, %{
+             base_attrs
+             | state: "running",
+               limit: Enum.sum(final_caps)
+           }),
+         {final_allocations, _unused} <- allocate_claim_due_records(reclaimed_more, final_caps) do
+      [first_allocations, normal_allocations, final_allocations]
+      |> combine_claim_due_allocations()
+      |> Enum.map(fn allocations ->
+        {:ok, Enum.flat_map(allocations, & &1)}
+      end)
+      |> hydrate_claim_due_pipeline_results(ctx, hd(claims).payload_return)
+    else
+      {:error, _reason} = error -> List.duplicate(error, length(claims))
+    end
+  end
+
+  defp pipeline_claim_due_router_maybe(_ctx, nil), do: {:ok, []}
+  defp pipeline_claim_due_router_maybe(_ctx, %{limit: limit}) when limit <= 0, do: {:ok, []}
+  defp pipeline_claim_due_router_maybe(ctx, attrs), do: pipeline_claim_due_router(ctx, attrs)
+
+  defp pipeline_claim_due_router(_ctx, %{limit: limit}) when limit <= 0, do: {:ok, []}
+  defp pipeline_claim_due_router(ctx, attrs), do: Router.flow_claim_due(ctx, attrs)
+
+  defp allocate_claim_due_records(records, caps) do
+    Enum.map_reduce(caps, records, fn cap, remaining_records ->
+      Enum.split(remaining_records, cap)
+    end)
+  end
+
+  defp combine_claim_due_allocations([first_allocations, normal_allocations, final_allocations]) do
+    first_allocations
+    |> Enum.zip(normal_allocations)
+    |> Enum.zip(final_allocations)
+    |> Enum.map(fn {{first, normal}, final} -> [first, normal, final] end)
+  end
+
+  defp remaining_claim_due_caps(claims, allocations) do
+    claims
+    |> Enum.zip(allocations)
+    |> Enum.map(fn {%{limit: limit}, records} -> limit - length(records) end)
+  end
+
+  defp remaining_claim_due_caps(claims, first_allocations, normal_allocations) do
+    claims
+    |> Enum.zip(first_allocations)
+    |> Enum.zip(normal_allocations)
+    |> Enum.map(fn {{%{limit: limit}, first}, normal} ->
+      limit - length(first) - length(normal)
+    end)
+  end
+
+  defp hydrate_claim_due_pipeline_results(results, ctx, payload_return) do
+    Enum.map(results, fn
+      {:ok, records} -> {:ok, hydrate_payload_records(ctx, records, payload_return)}
+      other -> other
+    end)
+  end
+
+  defp split_claim_due_records(_records, [], acc), do: Enum.reverse(acc)
+
+  defp split_claim_due_records(records, [%{limit: limit} | rest], acc) do
+    {claimed, records} = Enum.split(records, limit)
+    split_claim_due_records(records, rest, [{:ok, claimed} | acc])
+  end
+
+  defp claim_due_normalized_opts(
+         state,
+         worker,
+         lease_ms,
+         limit,
+         priority,
+         now,
+         payload_return,
+         reclaim_expired?,
+         reclaim_ratio,
+         partition_key
+       ) do
+    [
+      state: state,
+      worker: worker,
+      lease_ms: lease_ms,
+      limit: limit,
+      payload: payload_return.enabled?,
+      payload_max_bytes: payload_return.max_bytes,
+      reclaim_expired: reclaim_expired?,
+      reclaim_ratio: reclaim_ratio
+    ]
+    |> maybe_put_keyword(:priority, priority)
+    |> maybe_put_keyword(:now_ms, now)
+    |> maybe_put_keyword(:partition_key, partition_key)
+  end
+
+  defp maybe_put_keyword(opts, _key, nil), do: opts
+  defp maybe_put_keyword(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp pipeline_read_command(_ctx, {:get, id, opts}) when is_binary(id) and is_list(opts) do
     with :ok <- validate_id(id),

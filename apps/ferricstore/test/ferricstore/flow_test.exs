@@ -482,6 +482,171 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, %{id: ^id_b}} = FerricStore.flow_get(id_b, partition_key: partition_key)
   end
 
+  test "pipeline_claim_due_batch coalesces compatible claims and preserves worker boundaries" do
+    ctx = FerricStore.Instance.get(:default)
+    type = uid("pipeline-claim")
+    partition_key = uid("tenant")
+    ids = Enum.map(1..3, &uid("pipeline-claim-#{&1}"))
+
+    Enum.each(ids, fn id ->
+      assert {:ok, %{id: ^id}} =
+               FerricStore.flow_create(id,
+                 type: type,
+                 partition_key: partition_key,
+                 now_ms: 1,
+                 run_at_ms: 1
+               )
+    end)
+
+    attach_flow_telemetry([[:ferricstore, :flow, :pipeline_claim_due_batch]])
+
+    assert [
+             {:ok, [%{lease_owner: "worker-a"} = first]},
+             {:ok, [%{lease_owner: "worker-a"} = second]},
+             {:ok, [%{lease_owner: "worker-b"} = third]}
+           ] =
+             Ferricstore.Flow.pipeline_claim_due_batch(ctx, [
+               {:claim_due, type,
+                [worker: "worker-a", partition_key: partition_key, limit: 1, now_ms: 2]},
+               {:claim_due, type,
+                [worker: "worker-a", partition_key: partition_key, limit: 1, now_ms: 2]},
+               {:claim_due, type,
+                [worker: "worker-b", partition_key: partition_key, limit: 1, now_ms: 2]}
+             ])
+
+    assert MapSet.new([first.id, second.id, third.id]) == MapSet.new(ids)
+
+    assert_receive {:flow_telemetry, [:ferricstore, :flow, :pipeline_claim_due_batch],
+                    %{commands: 3, groups: 2, coalesced_calls: 1}, %{source: :resp_pipeline}}
+  end
+
+  test "pipeline_claim_due_batch groups interleaved independent partitions" do
+    ctx = FerricStore.Instance.get(:default)
+    type = uid("pipeline-claim-partitions")
+    partition_a = uid("tenant-a")
+    partition_b = uid("tenant-b")
+
+    ids =
+      for {partition_key, idx} <- [
+            {partition_a, 1},
+            {partition_b, 2},
+            {partition_a, 3},
+            {partition_b, 4}
+          ] do
+        id = uid("pipeline-claim-partition-#{idx}")
+
+        assert {:ok, %{id: ^id}} =
+                 FerricStore.flow_create(id,
+                   type: type,
+                   partition_key: partition_key,
+                   now_ms: 1,
+                   run_at_ms: 1
+                 )
+
+        id
+      end
+
+    attach_flow_telemetry([[:ferricstore, :flow, :pipeline_claim_due_batch]])
+
+    results =
+      Ferricstore.Flow.pipeline_claim_due_batch(ctx, [
+        {:claim_due, type, [worker: "worker-a", partition_key: partition_a, limit: 1, now_ms: 2]},
+        {:claim_due, type, [worker: "worker-a", partition_key: partition_b, limit: 1, now_ms: 2]},
+        {:claim_due, type, [worker: "worker-a", partition_key: partition_a, limit: 1, now_ms: 2]},
+        {:claim_due, type, [worker: "worker-a", partition_key: partition_b, limit: 1, now_ms: 2]}
+      ])
+
+    assert Enum.all?(results, fn {:ok, records} -> length(records) == 1 end)
+
+    claimed_ids =
+      results
+      |> Enum.flat_map(fn {:ok, [record]} -> [record.id] end)
+      |> MapSet.new()
+
+    assert claimed_ids == MapSet.new(ids)
+
+    assert_receive {:flow_telemetry, [:ferricstore, :flow, :pipeline_claim_due_batch],
+                    %{commands: 4, groups: 2, coalesced_calls: 2}, %{source: :resp_pipeline}}
+  end
+
+  test "pipeline_claim_due_batch accepts omitted NOW option" do
+    ctx = FerricStore.Instance.get(:default)
+    type = uid("pipeline-claim-no-now")
+    partition_key = uid("tenant")
+    id = uid("pipeline-claim-no-now-id")
+    now = System.system_time(:millisecond)
+
+    assert {:ok, %{id: ^id}} =
+             FerricStore.flow_create(id,
+               type: type,
+               partition_key: partition_key,
+               now_ms: now,
+               run_at_ms: now
+             )
+
+    assert [{:ok, [%{id: ^id, lease_owner: "worker-a"}]}] =
+             Ferricstore.Flow.pipeline_claim_due_batch(ctx, [
+               {:claim_due, type, [worker: "worker-a", partition_key: partition_key, limit: 1]}
+             ])
+  end
+
+  test "pipeline_claim_due_batch preserves sequential reclaim preference" do
+    ctx = FerricStore.Instance.get(:default)
+    type = uid("pipeline-claim-reclaim")
+    partition_key = uid("tenant")
+    expired_a = uid("pipeline-claim-expired-a")
+    expired_b = uid("pipeline-claim-expired-b")
+    queued = uid("pipeline-claim-queued")
+
+    for id <- [expired_a, expired_b, queued] do
+      assert {:ok, %{id: ^id}} =
+               FerricStore.flow_create(id,
+                 type: type,
+                 partition_key: partition_key,
+                 now_ms: 1_000,
+                 run_at_ms: 1_000
+               )
+    end
+
+    assert {:ok, [%{id: ^expired_a}]} =
+             FerricStore.flow_claim_due(type,
+               worker: "old-worker",
+               partition_key: partition_key,
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [%{id: ^expired_b}]} =
+             FerricStore.flow_claim_due(type,
+               worker: "old-worker",
+               partition_key: partition_key,
+               lease_ms: 50,
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert [
+             {:ok, [%{id: first}]},
+             {:ok, [%{id: second}]}
+           ] =
+             Ferricstore.Flow.pipeline_claim_due_batch(ctx, [
+               {:claim_due, type,
+                [worker: "worker-a", partition_key: partition_key, limit: 1, now_ms: 1_100]},
+               {:claim_due, type,
+                [worker: "worker-a", partition_key: partition_key, limit: 1, now_ms: 1_100]}
+             ])
+
+    assert MapSet.new([first, second]) == MapSet.new([expired_a, expired_b])
+
+    assert {:ok, [%{id: ^queued}]} =
+             FerricStore.flow_claim_due(type,
+               worker: "worker-b",
+               partition_key: partition_key,
+               now_ms: 1_100
+             )
+  end
+
   test "pipeline_read_batch hydrates Flow GET payloads with per-command caps" do
     ctx = FerricStore.Instance.get(:default)
     id_a = uid("flow-pipeline-payload-a")

@@ -282,6 +282,71 @@ defmodule FerricstoreServer.ConnectionTest do
     :gen_tcp.close(sock)
   end
 
+  test "pipelined FLOW.CLAIM_DUE commands coalesce compatible claims", %{port: port} do
+    handler_id =
+      {__MODULE__, self(), :flow_claim_due_pipeline, System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :flow, :pipeline_claim_due_batch],
+        &__MODULE__.handle_pipeline_claim_due_batch/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    partition = "tenant:" <> Integer.to_string(System.unique_integer([:positive]))
+    type = "pipeline-claim:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    ids =
+      for idx <- 1..3 do
+        id = "#{type}:#{idx}:#{System.unique_integer([:positive])}"
+
+        assert {:ok, %{id: ^id}} =
+                 FerricStore.flow_create(id,
+                   type: type,
+                   partition_key: partition,
+                   run_at_ms: 1_000,
+                   now_ms: 1_000
+                 )
+
+        id
+      end
+
+    claim =
+      Encoder.encode([
+        "FLOW.CLAIM_DUE",
+        type,
+        "WORKER",
+        "worker-a",
+        "PARTITION",
+        partition,
+        "LIMIT",
+        "1",
+        "NOW",
+        "2000"
+      ])
+
+    send_raw(sock, IO.iodata_to_binary([claim, claim, claim]))
+
+    results = recv_values(sock, 3)
+    claimed_ids = results |> Enum.flat_map(& &1) |> Enum.map(&Map.fetch!(&1, "id"))
+
+    assert Enum.all?(results, &(length(&1) == 1))
+    assert MapSet.new(claimed_ids) == MapSet.new(ids)
+
+    assert_receive {:pipeline_claim_due_batch, %{commands: 3, groups: 1, coalesced_calls: 1},
+                    %{source: :resp_pipeline}},
+                   1_000
+
+    :gen_tcp.close(sock)
+  end
+
   test "empty command frames are skipped and do not poison the connection buffer", %{port: port} do
     sock = connect(port)
     send_raw(sock, hello3())
@@ -761,6 +826,10 @@ defmodule FerricstoreServer.ConnectionTest do
 
   def handle_quorum_submit(event, measurements, metadata, test_pid) do
     send(test_pid, {:quorum_submit, event, measurements, metadata})
+  end
+
+  def handle_pipeline_claim_due_batch(_event, measurements, metadata, test_pid) do
+    send(test_pid, {:pipeline_claim_due_batch, measurements, metadata})
   end
 
   defp recv_all(_sock, _pattern, 0), do: ""

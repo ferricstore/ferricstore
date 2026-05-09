@@ -617,6 +617,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp flow_write_op(_command), do: :fallback
 
+  defp flow_claim_due_op(
+         {:command, "FLOW.CLAIM_DUE", _args, {:flow_claim_due, type, opts}, _keys}
+       )
+       when is_binary(type) and is_list(opts),
+       do: {:ok, {:claim_due, type, opts}}
+
+  defp flow_claim_due_op(_command), do: :fallback
+
   defp flow_read_op({:command, "FLOW.GET", _args, {:flow_get, id, opts}, _keys})
        when is_binary(id) and is_list(opts),
        do: {:ok, {:get, id, opts}}
@@ -767,10 +775,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
         dispatch_pure_segments(rest, state, store, prefetched_reads, Enum.reverse(entries) ++ acc)
 
       :fallback ->
-        case flow_read_op(cmd) do
+        case flow_claim_due_op(cmd) do
           {:ok, op} ->
-            {ops, rest} = take_flow_read_segment(rest, [op])
-            entries = dispatch_flow_read_segment(Enum.reverse(ops), state)
+            {ops, rest} = take_flow_claim_due_segment(rest, [op])
+            entries = dispatch_flow_claim_due_segment(Enum.reverse(ops), state)
 
             dispatch_pure_segments(
               rest,
@@ -781,12 +789,27 @@ defmodule FerricstoreServer.Connection.Pipeline do
             )
 
           :fallback ->
-            {name, args, _ast, _keys} = command_parts(cmd)
+            case flow_read_op(cmd) do
+              {:ok, op} ->
+                {ops, rest} = take_flow_read_segment(rest, [op])
+                entries = dispatch_flow_read_segment(Enum.reverse(ops), state)
 
-            {entry, new_state} =
-              dispatch_pure_single(idx, cmd, name, args, store, state, prefetched_reads)
+                dispatch_pure_segments(
+                  rest,
+                  state,
+                  store,
+                  prefetched_reads,
+                  Enum.reverse(entries) ++ acc
+                )
 
-            dispatch_pure_segments(rest, new_state, store, prefetched_reads, [entry | acc])
+              :fallback ->
+                {name, args, _ast, _keys} = command_parts(cmd)
+
+                {entry, new_state} =
+                  dispatch_pure_single(idx, cmd, name, args, store, state, prefetched_reads)
+
+                dispatch_pure_segments(rest, new_state, store, prefetched_reads, [entry | acc])
+            end
         end
     end
   end
@@ -799,6 +822,15 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp take_flow_write_segment([], acc), do: {acc, []}
+
+  defp take_flow_claim_due_segment([{cmd, idx} | rest], acc) do
+    case flow_claim_due_op(cmd) do
+      {:ok, op} -> take_flow_claim_due_segment(rest, [op | acc])
+      :fallback -> {acc, [{cmd, idx} | rest]}
+    end
+  end
+
+  defp take_flow_claim_due_segment([], acc), do: {acc, []}
 
   defp take_flow_read_segment([{cmd, idx} | rest], acc) do
     case flow_read_op(cmd) do
@@ -814,6 +846,20 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
     case safe_dispatch(fn ->
            Ferricstore.Flow.pipeline_write_batch_independent(state.instance_ctx, ops)
+         end) do
+      {:ok, results} ->
+        Enum.map(results, fn result -> {:encoded, encode_flow_result(result)} end)
+
+      {:error, err} ->
+        List.duplicate({:encoded, Encoder.encode(err)}, length(ops))
+    end
+  end
+
+  defp dispatch_flow_claim_due_segment(ops, state) do
+    Stats.incr_commands_by(state.stats_counter, length(ops))
+
+    case safe_dispatch(fn ->
+           Ferricstore.Flow.pipeline_claim_due_batch(state.instance_ctx, ops)
          end) do
       {:ok, results} ->
         Enum.map(results, fn result -> {:encoded, encode_flow_result(result)} end)
