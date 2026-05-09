@@ -88,6 +88,13 @@ defmodule Ferricstore.Flow.LMDB do
     NIF.lmdb_prefix_entries(path, prefix, limit, map_size())
   end
 
+  def prefix_entries(path, prefix, limit, false), do: prefix_entries(path, prefix, limit)
+
+  def prefix_entries(path, prefix, limit, true)
+      when is_binary(path) and is_binary(prefix) and is_integer(limit) and limit >= 0 do
+    NIF.lmdb_prefix_entries_reverse(path, prefix, limit, map_size())
+  end
+
   def prefix_count(path, prefix) when is_binary(path) and is_binary(prefix) do
     NIF.lmdb_prefix_count(path, prefix, map_size())
   end

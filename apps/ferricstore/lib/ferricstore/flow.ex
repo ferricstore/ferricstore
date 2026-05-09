@@ -963,7 +963,7 @@ defmodule Ferricstore.Flow do
           (hot_refs ++ cold_refs)
           |> Enum.sort_by(fn {event_id, score} -> {score, event_id} end)
           |> Enum.uniq_by(fn {event_id, _score} -> event_id end)
-          |> Enum.take(-scan_count)
+          |> Enum.take(-flow_history_merge_count(query, scan_count))
           |> Enum.map(fn {event_id, _score} -> event_id end)
 
         case event_ids do
@@ -994,6 +994,10 @@ defmodule Ferricstore.Flow do
       value when is_binary(value) -> true
       _ -> false
     end
+  end
+
+  defp flow_history_merge_count(query, scan_count) do
+    if flow_history_query_filtering?(query), do: scan_count, else: query.count
   end
 
   defp flow_history_hot_refs(ctx, id, partition_key, history_key, count) do
@@ -1890,7 +1894,8 @@ defmodule Ferricstore.Flow do
                  index_key,
                  partition_key,
                  fetch_count,
-                 consistent?
+                 consistent?,
+                 query.rev?
                ) do
           ids =
             (Enum.map(ram_entries, fn {id, score} -> {id, score} end) ++
@@ -2366,11 +2371,18 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_lmdb_query_index_entries(_ctx, _index_key, _partition_key, count, _consistent?)
+  defp flow_lmdb_query_index_entries(
+         _ctx,
+         _index_key,
+         _partition_key,
+         count,
+         _consistent?,
+         _reverse?
+       )
        when count <= 0,
        do: {:ok, []}
 
-  defp flow_lmdb_query_index_entries(ctx, index_key, partition_key, count, consistent?) do
+  defp flow_lmdb_query_index_entries(ctx, index_key, partition_key, count, consistent?, reverse?) do
     with :ok <- flow_maybe_flush_lmdb_for_index(ctx, index_key, partition_key, consistent?),
          :ok <- flow_require_lmdb_mirror_healthy(ctx, index_key, partition_key) do
       prefix = Ferricstore.Flow.LMDB.query_index_prefix(index_key)
@@ -2380,7 +2392,8 @@ defmodule Ferricstore.Flow do
       ctx
       |> flow_lmdb_paths_for_index(index_key, partition_key)
       |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
-        with {:ok, entries} <- Ferricstore.Flow.LMDB.prefix_entries(path, prefix, scan_count) do
+        with {:ok, entries} <-
+               Ferricstore.Flow.LMDB.prefix_entries(path, prefix, scan_count, reverse?) do
           {:cont, {:ok, flow_decode_query_index_entries(entries, path, now_ms) ++ acc}}
         else
           {:error, _reason} = error -> {:halt, error}

@@ -116,6 +116,9 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert {:ok, [{^older_key, ^older_value}]} =
              Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1)
+
+    assert {:ok, [{^newer_key, ^newer_value}]} =
+             Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1, true)
   end
 
   test "history index keys preserve numeric timestamp order in bounded prefix reads" do
@@ -1706,6 +1709,85 @@ defmodule Ferricstore.Flow.LMDBTest do
              Ferricstore.Flow.by_correlation(ctx, correlation_id,
                partition_key: partition_key,
                include_cold: true
+             )
+  end
+
+  test "lineage include_cold reverse reads newest LMDB prefix rows" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_scan_limit = Application.get_env(:ferricstore, :flow_lmdb_query_scan_limit)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_query_scan_limit, 1)
+
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_query_scan_limit, old_scan_limit)
+    end)
+
+    partition_key = "tenant-reverse-cold-lineage"
+    correlation_id = "correlation-reverse-cold-lineage"
+    query_index_key = Ferricstore.Flow.Keys.correlation_index_key(correlation_id, partition_key)
+
+    lmdb_path =
+      ctx.data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> Ferricstore.Flow.LMDB.path()
+
+    ops =
+      Enum.flat_map([{"flow-cold-old", 10}, {"flow-cold-new", 20}], fn {id, updated_at_ms} ->
+        state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+        record = %{
+          id: id,
+          type: "reverse-cold-lineage",
+          state: "queued",
+          version: 1,
+          attempts: 0,
+          fencing_token: 0,
+          created_at_ms: updated_at_ms,
+          updated_at_ms: updated_at_ms,
+          next_run_at_ms: updated_at_ms,
+          priority: 0,
+          ttl_ms: nil,
+          history_hot_max_events: nil,
+          history_max_events: nil,
+          partition_key: partition_key,
+          payload_ref: nil,
+          parent_flow_id: nil,
+          root_flow_id: nil,
+          correlation_id: correlation_id,
+          result_ref: nil,
+          error_ref: nil,
+          lease_owner: nil,
+          lease_token: nil,
+          lease_deadline_ms: 0,
+          rewound_to_event_id: nil
+        }
+
+        state_value =
+          record
+          |> Ferricstore.Flow.encode_record()
+          |> Ferricstore.Flow.LMDB.encode_value(0)
+
+        query_key = Ferricstore.Flow.LMDB.query_index_key(query_index_key, id, updated_at_ms)
+
+        query_value =
+          Ferricstore.Flow.LMDB.encode_query_index_value(id, updated_at_ms, 0, state_key)
+
+        [{:put, state_key, state_value}, {:put, query_key, query_value}]
+      end)
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, ops)
+
+    assert {:ok, [%{id: "flow-cold-new"}]} =
+             Ferricstore.Flow.by_correlation(ctx, correlation_id,
+               partition_key: partition_key,
+               include_cold: true,
+               rev: true,
+               count: 1
              )
   end
 

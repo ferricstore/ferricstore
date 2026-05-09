@@ -166,6 +166,11 @@ defmodule Ferricstore.Bitcask.NIF do
   def lmdb_prefix_entries(_path, _prefix, _limit, _map_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_prefix_entries_reverse(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, [{binary(), binary()}]} | {:error, term()}
+  def lmdb_prefix_entries_reverse(_path, _prefix, _limit, _map_size),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec lmdb_prefix_count(binary(), binary(), non_neg_integer()) ::
           {:ok, non_neg_integer()} | {:error, term()}
   def lmdb_prefix_count(_path, _prefix, _map_size), do: :erlang.nif_error(:nif_not_loaded)

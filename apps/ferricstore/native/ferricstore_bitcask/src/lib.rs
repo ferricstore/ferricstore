@@ -2304,6 +2304,47 @@ fn lmdb_prefix_entries<'a>(
 
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
+fn lmdb_prefix_entries_reverse<'a>(
+    env: Env<'a>,
+    path: String,
+    prefix: Binary<'a>,
+    limit: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let rtxn = match store.env.read_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let iter = match store.db.rev_prefix_iter(&rtxn, prefix.as_slice()) {
+                Ok(iter) => iter,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let max = usize::try_from(limit).unwrap_or(usize::MAX);
+            let mut entries = Vec::new();
+
+            for item in iter.take(max) {
+                match item {
+                    Ok((key, value)) => {
+                        let key_term = binary_term(env, key)?;
+                        let value_term = binary_term(env, value)?;
+                        entries.push((key_term, value_term).encode(env));
+                    }
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                }
+            }
+
+            Ok((atoms::ok(), entries).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
 fn lmdb_prefix_count<'a>(
     env: Env<'a>,
     path: String,
