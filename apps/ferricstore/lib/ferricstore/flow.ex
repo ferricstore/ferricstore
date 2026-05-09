@@ -482,11 +482,11 @@ defmodule Ferricstore.Flow do
             {[{idx, id, partition_key, payload_return} | get_acc], history_acc, other_acc,
              result_acc}
 
-          {:history, id, partition_key, history_key, count, include_cold?, consistent?,
+          {:history, id, partition_key, history_key, query, include_cold?, consistent?,
            value_return} ->
             {get_acc,
              [
-               {idx, id, partition_key, history_key, count, include_cold?, consistent?,
+               {idx, id, partition_key, history_key, query, include_cold?, consistent?,
                 value_return}
                | history_acc
              ], other_acc, result_acc}
@@ -672,6 +672,54 @@ defmodule Ferricstore.Flow do
 
   def list(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  def terminals(ctx, type, opts \\ [])
+
+  def terminals(ctx, type, opts) when is_binary(type) and is_list(opts) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_type(type),
+         {:ok, state} <- flow_terminal_state(opts),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, count} <- flow_count(opts),
+         {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
+         {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, from_ms} <- optional_non_neg_integer(opts, :from_ms, nil),
+         {:ok, to_ms} <- optional_non_neg_integer(opts, :to_ms, nil),
+         :ok <- validate_ms_range(from_ms, to_ms),
+         fetch_count = flow_time_filter_fetch_count(count, from_ms, to_ms),
+         {:ok, records} <-
+           flow_terminal_records(
+             ctx,
+             type,
+             state,
+             partition_key,
+             fetch_count,
+             include_cold? or consistent_projection?,
+             consistent_projection?
+           ) do
+      {:ok,
+       records
+       |> filter_flow_records_by_ms(from_ms, to_ms)
+       |> sort_flow_records_by_update()
+       |> Enum.take(count)}
+    end
+  end
+
+  def terminals(_ctx, type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def terminals(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  def failures(ctx, type, opts \\ [])
+
+  def failures(ctx, type, opts) when is_binary(type) and is_list(opts) do
+    terminals(ctx, type, Keyword.put(opts, :state, "failed"))
+  end
+
+  def failures(_ctx, type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def failures(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
   def by_parent(ctx, parent_flow_id, opts \\ [])
 
   def by_parent(ctx, parent_flow_id, opts)
@@ -834,13 +882,14 @@ defmodule Ferricstore.Flow do
          {:ok, count} <- flow_count(opts),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
-         {:ok, value_return} <- history_value_return_opts(opts) do
+         {:ok, value_return} <- history_value_return_opts(opts),
+         {:ok, query} <- flow_history_query_opts(opts, count) do
       flow_history_read(
         ctx,
         id,
         partition_key,
         history_key,
-        count,
+        query,
         include_cold? or consistent_projection?,
         consistent_projection?,
         value_return
@@ -858,27 +907,32 @@ defmodule Ferricstore.Flow do
          id,
          partition_key,
          history_key,
-         count,
+         query,
          false,
          _consistent?,
          value_return
        ) do
     if flow_history_state_exists?(ctx, id, partition_key) do
-      case flow_history_hot_refs(ctx, id, partition_key, history_key, count) do
+      fetch_count = flow_history_query_fetch_count(query)
+
+      case flow_history_hot_refs(ctx, id, partition_key, history_key, fetch_count) do
         {:ok, []} ->
-          flow_history_fallback_scan(ctx, history_key, count, value_return)
+          flow_history_fallback_scan(ctx, history_key, query, value_return)
 
         {:ok, event_refs} ->
           event_ids = Enum.map(event_refs, fn {event_id, _score} -> event_id end)
 
-          flow_history_from_event_ids(
-            ctx,
-            id,
-            partition_key,
-            history_key,
-            event_ids,
-            value_return
-          )
+          with {:ok, events} <-
+                 flow_history_from_event_ids(
+                   ctx,
+                   id,
+                   partition_key,
+                   history_key,
+                   event_ids,
+                   value_return
+                 ) do
+            {:ok, flow_history_apply_query(events, query)}
+          end
       end
     else
       {:ok, []}
@@ -890,15 +944,18 @@ defmodule Ferricstore.Flow do
          id,
          partition_key,
          history_key,
-         count,
+         query,
          true,
          consistent?,
          value_return
        ) do
     if flow_history_state_exists?(ctx, id, partition_key) do
-      with {:ok, hot_refs} <- flow_history_hot_refs(ctx, id, partition_key, history_key, count),
-           {:ok, cold_refs} <- flow_history_lmdb_refs(ctx, history_key, count, consistent?) do
-        scan_count = flow_lmdb_query_scan_count(count)
+      fetch_count = flow_history_query_fetch_count(query)
+
+      with {:ok, hot_refs} <-
+             flow_history_hot_refs(ctx, id, partition_key, history_key, fetch_count),
+           {:ok, cold_refs} <- flow_history_lmdb_refs(ctx, history_key, fetch_count, consistent?) do
+        scan_count = flow_lmdb_query_scan_count(fetch_count)
 
         event_ids =
           (hot_refs ++ cold_refs)
@@ -909,7 +966,7 @@ defmodule Ferricstore.Flow do
 
         case event_ids do
           [] ->
-            flow_history_fallback_scan(ctx, history_key, count, value_return)
+            flow_history_fallback_scan(ctx, history_key, query, value_return)
 
           _ ->
             with {:ok, events} <-
@@ -921,7 +978,7 @@ defmodule Ferricstore.Flow do
                      event_ids,
                      value_return
                    ) do
-              {:ok, Enum.take(events, -count)}
+              {:ok, flow_history_apply_query(events, query)}
             end
         end
       end
@@ -1040,9 +1097,10 @@ defmodule Ferricstore.Flow do
      |> hydrate_history_values(ctx, value_return)}
   end
 
-  defp flow_history_fallback_scan(ctx, history_key, count, value_return) do
+  defp flow_history_fallback_scan(ctx, history_key, query, value_return) do
     prefix = "X:" <> history_key <> <<0>>
     prefix_size = byte_size(prefix)
+    fetch_count = flow_history_query_fetch_count(query)
 
     entries =
       ctx
@@ -1059,12 +1117,187 @@ defmodule Ferricstore.Flow do
           []
       end)
       |> Enum.sort_by(fn {event_id, _fields} -> {flow_history_event_ms(event_id), event_id} end)
-      |> Enum.take(-count)
+      |> Enum.take(-fetch_count)
 
-    {:ok,
-     entries
-     |> Enum.map(&flow_history_entry_to_tuple/1)
-     |> hydrate_history_values(ctx, value_return)}
+    events =
+      entries
+      |> Enum.map(&flow_history_entry_to_tuple/1)
+      |> hydrate_history_values(ctx, value_return)
+
+    {:ok, flow_history_apply_query(events, query)}
+  end
+
+  defp flow_history_query_opts(opts, count) do
+    with {:ok, from_event} <- optional_binary_or_nil(opts, :from_event, nil),
+         {:ok, to_event} <- optional_binary_or_nil(opts, :to_event, nil),
+         {:ok, from_ms} <- optional_non_neg_integer(opts, :from_ms, nil),
+         {:ok, to_ms} <- optional_non_neg_integer(opts, :to_ms, nil),
+         {:ok, rev?} <- optional_boolean(opts, :rev, false),
+         {:ok, event} <- optional_binary_or_nil(opts, :event, nil),
+         {:ok, worker} <- optional_binary_or_nil(opts, :worker, nil),
+         :ok <- validate_ms_range(from_ms, to_ms),
+         :ok <- validate_event_range(from_event, to_event) do
+      query = %{
+        count: count,
+        from_event: from_event,
+        to_event: to_event,
+        from_ms: from_ms,
+        to_ms: to_ms,
+        rev?: rev?,
+        event: event,
+        worker: worker
+      }
+
+      {:ok, query}
+    end
+  end
+
+  defp flow_history_query_fetch_count(%{count: count} = query) do
+    if flow_history_query_filtering?(query) do
+      flow_history_lmdb_query_scan_count(count)
+    else
+      count
+    end
+  end
+
+  defp flow_history_query_filtering?(%{
+         from_event: nil,
+         to_event: nil,
+         from_ms: nil,
+         to_ms: nil,
+         event: nil,
+         worker: nil
+       }),
+       do: false
+
+  defp flow_history_query_filtering?(_query), do: true
+
+  defp flow_history_apply_query(events, query) do
+    events
+    |> Enum.filter(&flow_history_event_matches?(&1, query))
+    |> maybe_reverse_history(query)
+    |> Enum.take(query.count)
+  end
+
+  defp flow_history_event_matches?({event_id, fields}, query) do
+    event_ms = flow_history_event_ms(event_id)
+    event_key = {event_ms, event_id}
+
+    flow_event_after?(event_key, query.from_event) and
+      flow_event_before?(event_key, query.to_event) and
+      flow_ms_after?(event_ms, query.from_ms) and
+      flow_ms_before?(event_ms, query.to_ms) and
+      flow_field_matches?(fields, "event", query.event) and
+      flow_field_matches?(fields, "lease_owner", query.worker)
+  end
+
+  defp maybe_reverse_history(events, %{rev?: true}), do: Enum.reverse(events)
+  defp maybe_reverse_history(events, _query), do: events
+
+  defp flow_event_after?(_event_key, nil), do: true
+
+  defp flow_event_after?(event_key, from_event),
+    do: event_key >= flow_history_event_key(from_event)
+
+  defp flow_event_before?(_event_key, nil), do: true
+  defp flow_event_before?(event_key, to_event), do: event_key <= flow_history_event_key(to_event)
+
+  defp flow_history_event_key(event_id), do: {flow_history_event_ms(event_id), event_id}
+
+  defp flow_ms_after?(_event_ms, nil), do: true
+  defp flow_ms_after?(event_ms, from_ms), do: event_ms >= from_ms
+
+  defp flow_ms_before?(_event_ms, nil), do: true
+  defp flow_ms_before?(event_ms, to_ms), do: event_ms <= to_ms
+
+  defp flow_field_matches?(_fields, _key, nil), do: true
+  defp flow_field_matches?(fields, key, value), do: Map.get(fields, key) == value
+
+  defp validate_ms_range(nil, _to_ms), do: :ok
+  defp validate_ms_range(_from_ms, nil), do: :ok
+
+  defp validate_ms_range(from_ms, to_ms) when from_ms <= to_ms, do: :ok
+  defp validate_ms_range(_from_ms, _to_ms), do: {:error, "ERR flow from_ms must be <= to_ms"}
+
+  defp validate_event_range(nil, _to_event), do: :ok
+  defp validate_event_range(_from_event, nil), do: :ok
+
+  defp validate_event_range(from_event, to_event) do
+    if flow_history_event_key(from_event) <= flow_history_event_key(to_event) do
+      :ok
+    else
+      {:error, "ERR flow from_event must be <= to_event"}
+    end
+  end
+
+  defp flow_time_filter_fetch_count(count, nil, nil), do: count
+
+  defp flow_time_filter_fetch_count(count, _from_ms, _to_ms),
+    do: flow_lmdb_query_scan_count(count)
+
+  defp filter_flow_records_by_ms(records, from_ms, to_ms) do
+    Enum.filter(records, fn record ->
+      updated_at_ms = Map.get(record, :updated_at_ms, 0)
+      flow_ms_after?(updated_at_ms, from_ms) and flow_ms_before?(updated_at_ms, to_ms)
+    end)
+  end
+
+  defp sort_flow_records_by_update(records) do
+    Enum.sort_by(records, fn record ->
+      {Map.get(record, :updated_at_ms, 0), Map.get(record, :id, "")}
+    end)
+  end
+
+  defp flow_terminal_state(opts) do
+    case Keyword.get(opts, :state, "any") do
+      "any" -> {:ok, "any"}
+      state when state in @terminal_states -> {:ok, state}
+      _ -> {:error, "ERR flow terminal state must be failed, completed, cancelled, or any"}
+    end
+  end
+
+  defp flow_terminal_records(
+         ctx,
+         type,
+         "any",
+         partition_key,
+         count,
+         include_cold?,
+         consistent?
+       ) do
+    @terminal_states
+    |> Enum.reduce_while({:ok, []}, fn state, {:ok, acc} ->
+      case flow_terminal_records(
+             ctx,
+             type,
+             state,
+             partition_key,
+             count,
+             include_cold?,
+             consistent?
+           ) do
+        {:ok, records} -> {:cont, {:ok, records ++ acc}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp flow_terminal_records(ctx, type, state, partition_key, count, include_cold?, consistent?) do
+    index_key = __MODULE__.Keys.state_index_key(type, state, partition_key)
+
+    with :ok <- validate_key_size(index_key),
+         {:ok, ids} <-
+           flow_index_ids(
+             ctx,
+             index_key,
+             state,
+             partition_key,
+             count,
+             include_cold?,
+             consistent?
+           ) do
+      flow_records_for_ids(ctx, ids, partition_key)
+    end
   end
 
   defp flow_history_event_ms(event_id) when is_binary(event_id) do
@@ -2879,6 +3112,7 @@ defmodule Ferricstore.Flow do
 
   defp cancel_attrs(id, opts) do
     with :ok <- validate_opts(opts),
+         :ok <- reject_external_ref_input(opts, :reason_ref, :reason),
          :ok <- validate_id(id),
          {:ok, lease_token} <- optional_lease_token(opts),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
@@ -2886,8 +3120,6 @@ defmodule Ferricstore.Flow do
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms),
-         {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
-         :ok <- validate_ref_size(:reason_ref, reason_ref),
          :ok <- validate_cancel_reason_source(opts) do
       attrs =
         %{
@@ -2895,7 +3127,7 @@ defmodule Ferricstore.Flow do
           lease_token: lease_token,
           fencing_token: fencing_token,
           ttl_ms: ttl_ms,
-          reason_ref: reason_ref,
+          reason_ref: nil,
           partition_key: partition_key
         }
         |> maybe_put_cancel_reason(opts)
@@ -2913,6 +3145,14 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp reject_external_ref_input(opts, ref_key, replacement_key) do
+    if Keyword.has_key?(opts, ref_key) do
+      {:error, "ERR flow #{ref_key} input is not supported; use #{replacement_key}"}
+    else
+      :ok
+    end
+  end
+
   defp maybe_put_cancel_reason(attrs, opts) do
     if Keyword.has_key?(opts, :reason) do
       Map.put(attrs, :error, Keyword.fetch!(opts, :reason))
@@ -2923,13 +3163,12 @@ defmodule Ferricstore.Flow do
 
   defp rewind_attrs(id, opts) do
     with :ok <- validate_opts(opts),
+         :ok <- reject_external_ref_input(opts, :reason_ref, :reason),
          :ok <- validate_id(id),
          {:ok, to_event} <- required_binary(opts, :to_event),
          {:ok, expect_state} <- optional_binary_or_nil(opts, :expect_state, nil),
          {:ok, run_at_ms} <- optional_non_neg_integer_or_nil(opts, :run_at_ms),
          {:ok, now} <- optional_now_ms(opts),
-         {:ok, reason_ref} <- optional_binary_or_nil(opts, :reason_ref, nil),
-         :ok <- validate_ref_size(:reason_ref, reason_ref),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)),
          :ok <- validate_key_size(__MODULE__.Keys.history_key(id, partition_key)) do
@@ -2939,7 +3178,7 @@ defmodule Ferricstore.Flow do
           to_event: to_event,
           expect_state: expect_state,
           run_at_ms: run_at_ms,
-          reason_ref: reason_ref,
+          reason_ref: nil,
           partition_key: partition_key
         }
         |> maybe_put_attr(:now_ms, now)
@@ -3521,7 +3760,7 @@ defmodule Ferricstore.Flow do
   defp pipeline_read_history_results(history_ops, ctx) do
     hot_ops =
       Enum.filter(history_ops, fn
-        {_idx, _id, _partition_key, _history_key, _count, false, false, %{enabled?: false}} ->
+        {_idx, _id, _partition_key, _history_key, _query, false, false, %{enabled?: false}} ->
           true
 
         _cold_or_consistent ->
@@ -3531,7 +3770,7 @@ defmodule Ferricstore.Flow do
     cold_ops = history_ops -- hot_ops
 
     cold_results =
-      Map.new(cold_ops, fn {idx, id, partition_key, history_key, count, include_cold?,
+      Map.new(cold_ops, fn {idx, id, partition_key, history_key, query, include_cold?,
                             consistent?, value_return} ->
         {idx,
          flow_history_read(
@@ -3539,7 +3778,7 @@ defmodule Ferricstore.Flow do
            id,
            partition_key,
            history_key,
-           count,
+           query,
            include_cold? or consistent?,
            consistent?,
            value_return
@@ -3558,14 +3797,18 @@ defmodule Ferricstore.Flow do
 
   defp pipeline_read_hot_history_results(history_ops, ctx) do
     requests =
-      Enum.map(history_ops, fn {idx, id, partition_key, history_key, count, false, false,
+      Enum.map(history_ops, fn {idx, id, partition_key, history_key, query, false, false,
                                 value_return} ->
-        {start_idx, stop_idx} = flow_history_hot_range(ctx, id, partition_key, history_key, count)
-        {idx, id, partition_key, history_key, start_idx, stop_idx, false, value_return}
+        fetch_count = flow_history_query_fetch_count(query)
+
+        {start_idx, stop_idx} =
+          flow_history_hot_range(ctx, id, partition_key, history_key, fetch_count)
+
+        {idx, id, partition_key, history_key, query, start_idx, stop_idx, false, value_return}
       end)
 
     router_requests =
-      Enum.map(requests, fn {_idx, _id, _partition_key, history_key, start_idx, stop_idx,
+      Enum.map(requests, fn {_idx, _id, _partition_key, history_key, _query, start_idx, stop_idx,
                              reverse?, _value_return} ->
         {history_key, start_idx, stop_idx, reverse?}
       end)
@@ -3574,7 +3817,7 @@ defmodule Ferricstore.Flow do
       {:ok, rank_results} ->
         history_ops
         |> Enum.zip(rank_results)
-        |> Map.new(fn {{idx, id, partition_key, history_key, count, _include_cold?, _consistent?,
+        |> Map.new(fn {{idx, id, partition_key, history_key, query, _include_cold?, _consistent?,
                         value_return}, rank_result} ->
           {idx,
            history_result_from_rank(
@@ -3582,34 +3825,45 @@ defmodule Ferricstore.Flow do
              id,
              partition_key,
              history_key,
-             count,
+             query,
              rank_result,
              value_return
            )}
         end)
 
       :unavailable ->
-        Map.new(history_ops, fn {idx, _id, _partition_key, history_key, count, _include_cold?,
+        Map.new(history_ops, fn {idx, _id, _partition_key, history_key, query, _include_cold?,
                                  _consistent?, value_return} ->
-          {idx, flow_history_fallback_scan(ctx, history_key, count, value_return)}
+          {idx, flow_history_fallback_scan(ctx, history_key, query, value_return)}
         end)
     end
   end
 
-  defp history_result_from_rank(ctx, _id, _partition_key, history_key, count, [], value_return),
-    do: flow_history_fallback_scan(ctx, history_key, count, value_return)
+  defp history_result_from_rank(ctx, _id, _partition_key, history_key, query, [], value_return),
+    do: flow_history_fallback_scan(ctx, history_key, query, value_return)
 
   defp history_result_from_rank(
          ctx,
          id,
          partition_key,
          history_key,
-         _count,
+         query,
          event_refs,
          value_return
        ) do
     event_ids = Enum.map(event_refs, fn {event_id, _score} -> event_id end)
-    flow_history_from_event_ids(ctx, id, partition_key, history_key, event_ids, value_return)
+
+    with {:ok, events} <-
+           flow_history_from_event_ids(
+             ctx,
+             id,
+             partition_key,
+             history_key,
+             event_ids,
+             value_return
+           ) do
+      {:ok, flow_history_apply_query(events, query)}
+    end
   end
 
   defp history_query_attrs(id, opts) do
@@ -3621,8 +3875,9 @@ defmodule Ferricstore.Flow do
          {:ok, count} <- flow_count(opts),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent?} <- optional_boolean(opts, :consistent_projection, false),
-         {:ok, value_return} <- history_value_return_opts(opts) do
-      {:ok, {partition_key, history_key, count, include_cold?, consistent?, value_return}}
+         {:ok, value_return} <- history_value_return_opts(opts),
+         {:ok, query} <- flow_history_query_opts(opts, count) do
+      {:ok, {partition_key, history_key, query, include_cold?, consistent?, value_return}}
     end
   end
 

@@ -124,6 +124,15 @@ defmodule Ferricstore.Commands.Flow do
     FerricStore.flow_list(type, opts) |> normalize_result()
   end
 
+  def handle_ast({:flow_terminals, type, opts}, _store)
+      when is_binary(type) and is_list(opts) do
+    FerricStore.flow_terminals(type, opts) |> normalize_result()
+  end
+
+  def handle_ast({:flow_failures, type, opts}, _store) when is_binary(type) and is_list(opts) do
+    FerricStore.flow_failures(type, opts) |> normalize_result()
+  end
+
   def handle_ast({:flow_by_parent, parent_flow_id, opts}, _store)
       when is_binary(parent_flow_id) and is_list(opts) do
     FerricStore.flow_by_parent(parent_flow_id, opts) |> normalize_result()

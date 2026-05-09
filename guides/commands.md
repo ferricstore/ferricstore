@@ -40,8 +40,8 @@ compatibility commands. They are exposed through RESP3 and the embedded API:
 `FLOW.FAIL_MANY`, `FLOW.CANCEL`, `FLOW.CANCEL_MANY`, `FLOW.TRANSITION`,
 `FLOW.TRANSITION_MANY`, `FLOW.REWIND`, `FLOW.LIST`, `FLOW.BY_PARENT`,
 `FLOW.BY_ROOT`, `FLOW.BY_CORRELATION`, `FLOW.INFO`, `FLOW.STUCK`,
-`FLOW.HISTORY`, `FLOW.POLICY.SET`, `FLOW.POLICY.GET`, and
-`FLOW.RETENTION_CLEANUP`.
+`FLOW.HISTORY`, `FLOW.TERMINALS`, `FLOW.FAILURES`, `FLOW.POLICY.SET`,
+`FLOW.POLICY.GET`, and `FLOW.RETENTION_CLEANUP`.
 
 Production semantics, retry policy, history caps, LMDB cold projection, and
 operator metrics are documented in `docs/flow-production-readiness.md` and

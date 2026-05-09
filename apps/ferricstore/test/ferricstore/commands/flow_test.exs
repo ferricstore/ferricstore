@@ -98,6 +98,65 @@ defmodule Ferricstore.Commands.FlowTest do
                [id, "COUNT", "10", "INCLUDE_COLD", "true", "CONSISTENT_PROJECTION", "false"],
                MockStore.make()
              )
+
+    assert [[_event_id, %{"event" => "created", "version" => "1"}]] =
+             Dispatcher.dispatch(
+               "FLOW.HISTORY",
+               [
+                 id,
+                 "COUNT",
+                 "10",
+                 "FROM_MS",
+                 "0",
+                 "TO_MS",
+                 "9999999999999",
+                 "EVENT",
+                 "created",
+                 "REV",
+                 "true"
+               ],
+               MockStore.make()
+             )
+  end
+
+  test "dispatches Flow failures through Rust AST" do
+    id = uid("flow-command-failures")
+    type = uid("flow-command-failures-type")
+
+    assert %{"id" => ^id} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [id, "TYPE", type, "RUN_AT", "1000", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert [%{"id" => ^id, "lease_token" => lease_token, "fencing_token" => fencing_token}] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               [type, "WORKER", "worker-failures", "LIMIT", "1", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert %{"id" => ^id, "state" => "failed"} =
+             Dispatcher.dispatch(
+               "FLOW.FAIL",
+               [id, lease_token, "FENCING", Integer.to_string(fencing_token), "NOW", "1500"],
+               MockStore.make()
+             )
+
+    assert [%{"id" => ^id, "state" => "failed"}] =
+             Dispatcher.dispatch(
+               "FLOW.FAILURES",
+               [type, "FROM_MS", "1000", "TO_MS", "2000", "COUNT", "10"],
+               MockStore.make()
+             )
+
+    assert [%{"id" => ^id, "state" => "failed"}] =
+             Dispatcher.dispatch(
+               "FLOW.TERMINALS",
+               [type, "STATE", "any", "FROM_MS", "1000", "TO_MS", "2000", "COUNT", "10"],
+               MockStore.make()
+             )
   end
 
   test "dispatches Flow retention cleanup through Rust AST" do
@@ -1201,14 +1260,14 @@ defmodule Ferricstore.Commands.FlowTest do
              )
 
     assert [
-             %{"id" => ^id_a, "state" => "cancelled", "error_ref" => "cancel:batch"},
-             %{"id" => ^id_b, "state" => "cancelled", "error_ref" => "cancel:batch"}
+             %{"id" => ^id_a, "state" => "cancelled", "error_ref" => error_ref_a},
+             %{"id" => ^id_b, "state" => "cancelled", "error_ref" => error_ref_b}
            ] =
              Dispatcher.dispatch(
                "FLOW.CANCEL_MANY",
                [
                  partition,
-                 "REASON_REF",
+                 "REASON",
                  "cancel:batch",
                  "NOW",
                  "2000",
@@ -1220,6 +1279,11 @@ defmodule Ferricstore.Commands.FlowTest do
                ],
                MockStore.make()
              )
+
+    assert is_binary(error_ref_a)
+    assert is_binary(error_ref_b)
+    assert error_ref_a != "cancel:batch"
+    assert error_ref_b != "cancel:batch"
   end
 
   test "dispatches Flow rewind through Rust AST" do
@@ -1437,6 +1501,8 @@ defmodule Ferricstore.Commands.FlowTest do
     assert "flow.policy.get" in names
     assert "flow.retention_cleanup" in names
     assert "flow.claim_due" in names
+    assert "flow.failures" in names
+    assert "flow.terminals" in names
     assert "flow.complete" in names
     assert "flow.rewind" in names
 

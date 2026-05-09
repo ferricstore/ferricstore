@@ -2370,20 +2370,18 @@ defmodule Ferricstore.FlowTest do
     assert {:error, "ERR flow error_ref input is not supported; use error"} =
              FerricStore.flow_fail("flow", "token", fencing_token: 0, error_ref: "e")
 
-    huge_ref = String.duplicate("p", 4_097)
+    assert {:error, "ERR flow reason_ref input is not supported; use reason"} =
+             FerricStore.flow_cancel("flow", fencing_token: 0, reason_ref: "external")
 
-    assert {:error, "ERR flow reason_ref too large" <> _} =
-             FerricStore.flow_cancel("flow", fencing_token: 0, reason_ref: huge_ref)
-
-    assert {:error, "ERR flow reason and reason_ref are mutually exclusive"} =
+    assert {:error, "ERR flow reason_ref input is not supported; use reason"} =
              FerricStore.flow_cancel("flow",
                fencing_token: 0,
                reason: "inline",
                reason_ref: "external"
              )
 
-    assert {:error, "ERR flow reason_ref too large" <> _} =
-             FerricStore.flow_rewind("flow", to_event: "1-1", reason_ref: huge_ref)
+    assert {:error, "ERR flow reason_ref input is not supported; use reason"} =
+             FerricStore.flow_rewind("flow", to_event: "1-1", reason_ref: "external")
   end
 
   test "flow_claim_due atomically leases due flows and removes them from due set" do
@@ -5049,13 +5047,13 @@ defmodule Ferricstore.FlowTest do
 
     assert {:ok, cancelled} =
              FerricStore.flow_cancel_many(partition, items,
-               reason_ref: "cancel-batch",
+               reason: "cancel-batch",
                now_ms: 2_000
              )
 
     assert Enum.map(cancelled, & &1.id) == [id_a, id_b]
     assert Enum.all?(cancelled, &(&1.state == "cancelled"))
-    assert Enum.all?(cancelled, &(&1.error_ref == "cancel-batch"))
+    assert Enum.all?(cancelled, &(is_binary(&1.error_ref) and &1.error_ref != "cancel-batch"))
 
     assert {:ok, info} = FerricStore.flow_info(type, partition_key: partition)
     assert info.cancelled == 2
@@ -5296,12 +5294,13 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, cancelled} =
              FerricStore.flow_cancel(cancel_id,
                fencing_token: 0,
-               reason_ref: "reason:" <> cancel_id,
+               reason: "reason:" <> cancel_id,
                now_ms: 1_500
              )
 
     assert cancelled.state == "cancelled"
-    assert cancelled.error_ref == "reason:" <> cancel_id
+    assert is_binary(cancelled.error_ref)
+    assert cancelled.error_ref != "reason:" <> cancel_id
     assert cancelled.next_run_at_ms == nil
 
     assert {:ok, []} =
@@ -5367,6 +5366,185 @@ defmodule Ferricstore.FlowTest do
              3
 
     assert [] = :ets.lookup(Ferricstore.Stream.Meta, history_key)
+  end
+
+  test "flow_history supports range reverse event and worker filters" do
+    id = uid("flow-history-query")
+    type = uid("audit-history-query")
+    partition = uid("tenant-history-query")
+
+    assert {:ok, _} =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "queued",
+               partition_key: partition,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [first_claim]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               state: "queued",
+               worker: "worker-a",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_100
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_transition(id, "running", "email",
+               partition_key: partition,
+               lease_token: first_claim.lease_token,
+               fencing_token: first_claim.fencing_token,
+               run_at_ms: 1_200,
+               now_ms: 1_200
+             )
+
+    assert {:ok, [second_claim]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               state: "email",
+               worker: "worker-b",
+               lease_ms: 30_000,
+               limit: 1,
+               now_ms: 1_250
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_fail(id, second_claim.lease_token,
+               partition_key: partition,
+               fencing_token: second_claim.fencing_token,
+               error: "boom",
+               now_ms: 1_300
+             )
+
+    assert {:ok, all_events} = FerricStore.flow_history(id, partition_key: partition, count: 10)
+    all_ids = Enum.map(all_events, &elem(&1, 0))
+
+    assert Enum.map(all_events, fn {_event_id, fields} -> fields["event"] end) == [
+             "created",
+             "claimed",
+             "transitioned",
+             "claimed",
+             "failed"
+           ]
+
+    assert {:ok, range_events} =
+             FerricStore.flow_history(id,
+               partition_key: partition,
+               from_event: Enum.at(all_ids, 1),
+               to_event: Enum.at(all_ids, 3),
+               count: 10
+             )
+
+    assert Enum.map(range_events, fn {_event_id, fields} -> fields["event"] end) == [
+             "claimed",
+             "transitioned",
+             "claimed"
+           ]
+
+    assert {:ok, reverse_events} =
+             FerricStore.flow_history(id,
+               partition_key: partition,
+               from_ms: 1_100,
+               to_ms: 1_300,
+               rev: true,
+               count: 2
+             )
+
+    assert Enum.map(reverse_events, fn {_event_id, fields} -> fields["event"] end) == [
+             "failed",
+             "claimed"
+           ]
+
+    assert {:ok, worker_events} =
+             FerricStore.flow_history(id,
+               partition_key: partition,
+               event: "claimed",
+               worker: "worker-b",
+               count: 10
+             )
+
+    assert [{_event_id, %{"event" => "claimed", "lease_owner" => "worker-b"}}] = worker_events
+  end
+
+  test "flow_terminals and flow_failures list terminal records by state and time range" do
+    type = uid("flow-failures")
+    partition = uid("tenant-flow-failures")
+    failed_a = create_claimed_flow(uid("flow-failures-a"), partition, type, "worker-failures")
+    failed_b = create_claimed_flow(uid("flow-failures-b"), partition, type, "worker-failures")
+    completed = create_claimed_flow(uid("flow-failures-c"), partition, type, "worker-failures")
+    cancelled = create_claimed_flow(uid("flow-failures-d"), partition, type, "worker-failures")
+
+    assert {:ok, _} =
+             FerricStore.flow_fail(failed_a.id, failed_a.lease_token,
+               partition_key: partition,
+               fencing_token: failed_a.fencing_token,
+               now_ms: 1_500
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_fail(failed_b.id, failed_b.lease_token,
+               partition_key: partition,
+               fencing_token: failed_b.fencing_token,
+               now_ms: 2_500
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_complete(completed.id, completed.lease_token,
+               partition_key: partition,
+               fencing_token: completed.fencing_token,
+               now_ms: 2_000
+             )
+
+    assert {:ok, _} =
+             FerricStore.flow_cancel(cancelled.id,
+               partition_key: partition,
+               lease_token: cancelled.lease_token,
+               fencing_token: cancelled.fencing_token,
+               now_ms: 1_750
+             )
+
+    assert {:ok, failures} =
+             FerricStore.flow_failures(type,
+               partition_key: partition,
+               from_ms: 1_000,
+               to_ms: 2_000,
+               count: 10
+             )
+
+    assert Enum.map(failures, & &1.id) == [failed_a.id]
+    assert Enum.all?(failures, &(&1.state == "failed"))
+
+    assert {:ok, completed_records} =
+             FerricStore.flow_terminals(type,
+               partition_key: partition,
+               state: "completed",
+               count: 10
+             )
+
+    assert Enum.map(completed_records, & &1.id) == [completed.id]
+
+    assert {:ok, cancelled_records} =
+             FerricStore.flow_terminals(type,
+               partition_key: partition,
+               state: "cancelled",
+               count: 10
+             )
+
+    assert Enum.map(cancelled_records, & &1.id) == [cancelled.id]
+
+    assert {:ok, terminal_records} =
+             FerricStore.flow_terminals(type,
+               partition_key: partition,
+               state: "any",
+               from_ms: 1_400,
+               to_ms: 2_100,
+               count: 10
+             )
+
+    assert Enum.map(terminal_records, & &1.id) == [failed_a.id, cancelled.id, completed.id]
   end
 
   test "flow_history event ids stay monotonic when claim time is behind record time" do

@@ -1580,6 +1580,8 @@ enum CommandAstKind {
     FlowCancelMany,
     FlowRewind,
     FlowList,
+    FlowTerminals,
+    FlowFailures,
     FlowByParent,
     FlowByRoot,
     FlowByCorrelation,
@@ -1828,6 +1830,8 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"FLOW.CANCEL_MANY" => CommandAstKind::FlowCancelMany,
         b"FLOW.REWIND" => CommandAstKind::FlowRewind,
         b"FLOW.LIST" => CommandAstKind::FlowList,
+        b"FLOW.TERMINALS" => CommandAstKind::FlowTerminals,
+        b"FLOW.FAILURES" => CommandAstKind::FlowFailures,
         b"FLOW.BY_PARENT" => CommandAstKind::FlowByParent,
         b"FLOW.BY_ROOT" => CommandAstKind::FlowByRoot,
         b"FLOW.BY_CORRELATION" => CommandAstKind::FlowByCorrelation,
@@ -2279,6 +2283,8 @@ fn make_command_ast<'a>(
         CommandAstKind::FlowCancelMany => make_flow_cancel_many_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowRewind => make_flow_rewind_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowList => make_flow_list_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowTerminals => make_flow_terminals_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowFailures => make_flow_failures_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowByParent => make_flow_index_query_command_ast(
             env,
             "flow_by_parent",
@@ -5949,6 +5955,38 @@ fn make_flow_list_command_ast<'a>(
     }
 }
 
+fn make_flow_failures_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_failures");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.failures")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_failures_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
+fn make_flow_terminals_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_terminals");
+    if args.is_empty() {
+        return (tag, wrong_number_error(env, b"flow.terminals")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_terminals_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
 fn make_flow_index_query_command_ast<'a>(
     env: Env<'a>,
     tag_name: &str,
@@ -6969,6 +7007,13 @@ fn flow_history_option<'a>(
         &[
             (b"COUNT", "count", FlowOptType::Positive(b"count")),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"FROM_EVENT", "from_event", FlowOptType::Binary),
+            (b"TO_EVENT", "to_event", FlowOptType::Binary),
+            (b"FROM_MS", "from_ms", FlowOptType::NonNegative),
+            (b"TO_MS", "to_ms", FlowOptType::NonNegative),
+            (b"REV", "rev", FlowOptType::Boolean),
+            (b"EVENT", "event", FlowOptType::Binary),
+            (b"WORKER", "worker", FlowOptType::Binary),
             (b"INCLUDE_COLD", "include_cold", FlowOptType::Boolean),
             (
                 b"CONSISTENT_PROJECTION",
@@ -6982,6 +7027,59 @@ fn flow_history_option<'a>(
                 FlowOptType::NonNegative,
             ),
             (b"MAXBYTES", "payload_max_bytes", FlowOptType::NonNegative),
+        ],
+    )
+}
+
+fn flow_failures_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"COUNT", "count", FlowOptType::Positive(b"count")),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"FROM_MS", "from_ms", FlowOptType::NonNegative),
+            (b"TO_MS", "to_ms", FlowOptType::NonNegative),
+            (b"INCLUDE_COLD", "include_cold", FlowOptType::Boolean),
+            (
+                b"CONSISTENT_PROJECTION",
+                "consistent_projection",
+                FlowOptType::Boolean,
+            ),
+        ],
+    )
+}
+
+fn flow_terminals_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"STATE", "state", FlowOptType::Binary),
+            (b"COUNT", "count", FlowOptType::Positive(b"count")),
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"FROM_MS", "from_ms", FlowOptType::NonNegative),
+            (b"TO_MS", "to_ms", FlowOptType::NonNegative),
+            (b"INCLUDE_COLD", "include_cold", FlowOptType::Boolean),
+            (
+                b"CONSISTENT_PROJECTION",
+                "consistent_projection",
+                FlowOptType::Boolean,
+            ),
         ],
     )
 }
@@ -7475,7 +7573,8 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"FLOW.BY_PARENT" | b"FLOW.BY_ROOT" | b"FLOW.BY_CORRELATION" => {
             flow_partition_or_first_key_indices(arg_bytes, 1)
         }
-        b"FLOW.CLAIM_DUE" | b"FLOW.RECLAIM" | b"FLOW.LIST" | b"FLOW.INFO" | b"FLOW.STUCK" => {
+        b"FLOW.CLAIM_DUE" | b"FLOW.RECLAIM" | b"FLOW.LIST" | b"FLOW.TERMINALS"
+        | b"FLOW.FAILURES" | b"FLOW.INFO" | b"FLOW.STUCK" => {
             flow_partition_or_first_key_indices(arg_bytes, 1)
         }
         b"FLOW.POLICY.SET" | b"FLOW.POLICY.GET" => first_n_indices(arg_bytes.len(), 1),

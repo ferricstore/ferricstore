@@ -1812,8 +1812,37 @@ defmodule FerricstoreServer.Resp.ParserTest do
                  {:flow_info, "checkout", [partition_key: "tenant-a"]}, ["tenant-a"]},
                 {:command, "FLOW.STUCK", ["checkout", "OLDER_THAN", "1000", "COUNT", "10"],
                  {:flow_stuck, "checkout", [older_than_ms: 1000, count: 10]}, ["checkout"]},
-                {:command, "FLOW.HISTORY", ["flow-1", "COUNT", "10"],
-                 {:flow_history, "flow-1", [count: 10]}, ["flow-1"]}
+                {:command, "FLOW.HISTORY",
+                 [
+                   "flow-1",
+                   "COUNT",
+                   "10",
+                   "FROM_MS",
+                   "1000",
+                   "TO_MS",
+                   "2000",
+                   "EVENT",
+                   "claimed",
+                   "WORKER",
+                   "worker-a",
+                   "REV",
+                   "true"
+                 ],
+                 {:flow_history, "flow-1",
+                  [
+                    count: 10,
+                    from_ms: 1000,
+                    to_ms: 2000,
+                    event: "claimed",
+                    worker: "worker-a",
+                    rev: true
+                  ]}, ["flow-1"]},
+                {:command, "FLOW.FAILURES", ["checkout", "FROM_MS", "1000", "TO_MS", "2000"],
+                 {:flow_failures, "checkout", [from_ms: 1000, to_ms: 2000]}, ["checkout"]},
+                {:command, "FLOW.TERMINALS",
+                 ["checkout", "STATE", "any", "FROM_MS", "1000", "TO_MS", "2000"],
+                 {:flow_terminals, "checkout", [state: "any", from_ms: 1000, to_ms: 2000]},
+                 ["checkout"]}
               ], ""} =
                Parser.parse_commands(
                  "flow.get flow-1 PARTITION GLOBAL\r\n" <>
@@ -1823,7 +1852,9 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "flow.claim_due checkout WORKER worker-a LIMIT 10 PAYLOAD MAXBYTES 2048\r\n" <>
                    "flow.info checkout PARTITION tenant-a\r\n" <>
                    "flow.stuck checkout OLDER_THAN 1000 COUNT 10\r\n" <>
-                   "flow.history flow-1 COUNT 10\r\n"
+                   "flow.history flow-1 COUNT 10 FROM_MS 1000 TO_MS 2000 EVENT claimed WORKER worker-a REV true\r\n" <>
+                   "flow.failures checkout FROM_MS 1000 TO_MS 2000\r\n" <>
+                   "flow.terminals checkout STATE any FROM_MS 1000 TO_MS 2000\r\n"
                )
     end
 

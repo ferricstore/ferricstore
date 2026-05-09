@@ -757,6 +757,32 @@ defmodule FerricStore do
 
   def flow_list(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
+  @doc "Lists terminal Flow records for `type`, optionally bounded by terminal update time."
+  @spec flow_terminals(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_terminals(type, opts \\ [])
+
+  def flow_terminals(type, opts) when is_binary(type) and is_list(opts) do
+    Ferricstore.Flow.terminals(default_ctx(), type, opts)
+  end
+
+  def flow_terminals(type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def flow_terminals(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc "Lists failed Flow records for `type`, optionally bounded by terminal update time."
+  @spec flow_failures(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def flow_failures(type, opts \\ [])
+
+  def flow_failures(type, opts) when is_binary(type) and is_list(opts) do
+    Ferricstore.Flow.failures(default_ctx(), type, opts)
+  end
+
+  def flow_failures(type, _opts) when not is_binary(type),
+    do: {:error, "ERR flow type must be a non-empty string"}
+
+  def flow_failures(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
   @doc "Lists Flow records by parent flow id."
   @spec flow_by_parent(binary(), keyword()) :: {:ok, [map()]} | {:error, binary()}
   def flow_by_parent(parent_flow_id, opts \\ [])

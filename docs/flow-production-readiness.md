@@ -134,6 +134,24 @@ FLOW_LINEAGE_BACKLOG=10000000 FLOW_LINEAGE_TERMINAL=10000000
 Track p50/p95/p99 for `flow.by_root`, `flow.by_correlation`, and terminal LMDB
 queries, plus BEAM memory delta and LMDB replay-safe lag.
 
+## Audit Query Surfaces
+
+`FLOW.HISTORY <id>` is a per-flow query. It stays on the owning shard and uses
+the existing hot history refs, Bitcask history records, and optional LMDB cold
+projection. Supported filters are `COUNT`, `FROM_EVENT`, `TO_EVENT`, `FROM_MS`,
+`TO_MS`, `REV`, `EVENT`, `WORKER`, `INCLUDE_COLD`, and
+`CONSISTENT_PROJECTION`.
+
+`FLOW.TERMINALS <type>` lists terminal records from existing terminal state
+indexes. `STATE` accepts `failed`, `completed`, `cancelled`, or `any`, with
+optional `COUNT`, `PARTITION`, `FROM_MS`, `TO_MS`, `INCLUDE_COLD`, and
+`CONSISTENT_PROJECTION`. `FLOW.FAILURES <type>` is a convenience alias for
+`FLOW.TERMINALS <type> STATE failed`.
+
+These audit queries add no hot-path write indexes. They reuse Flow state/history
+truth plus existing terminal projections, so create/transition/claim latency is
+not affected by the richer read shape.
+
 ## Flow Schema Migration
 
 Before public release, Flow uses one compact current schema:

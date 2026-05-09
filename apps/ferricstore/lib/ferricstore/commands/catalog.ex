@@ -520,6 +520,24 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Lists workflow records by type and optional state."
     },
     %{
+      name: "flow.failures",
+      arity: -2,
+      flags: ["readonly"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Lists failed workflow records by type and optional time range."
+    },
+    %{
+      name: "flow.terminals",
+      arity: -2,
+      flags: ["readonly"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Lists terminal workflow records by type, state, and optional time range."
+    },
+    %{
       name: "flow.by_parent",
       arity: -2,
       flags: ["readonly"],
@@ -847,7 +865,15 @@ defmodule Ferricstore.Commands.Catalog do
        do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
 
   defp flow_dynamic_keys(name, args)
-       when name in ["FLOW.CLAIM_DUE", "FLOW.RECLAIM", "FLOW.LIST", "FLOW.INFO", "FLOW.STUCK"],
+       when name in [
+              "FLOW.CLAIM_DUE",
+              "FLOW.RECLAIM",
+              "FLOW.LIST",
+              "FLOW.TERMINALS",
+              "FLOW.FAILURES",
+              "FLOW.INFO",
+              "FLOW.STUCK"
+            ],
        do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
 
   defp flow_dynamic_keys(name, args)
