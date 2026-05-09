@@ -574,6 +574,158 @@ defmodule Ferricstore.Raft.StateMachineTest do
       end
     end
 
+    test "claim_due apply uses a claim-specific bulk index plan" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/raft/state_machine.ex", __DIR__))
+
+      [_, body] =
+        Regex.run(
+          ~r/defp flow_apply_claim_batch\(state, due_key, plans, stale_due_ids, now_ms\) do(.*?)\n  end\n\n  defp flow_claim_move_indexes/s,
+          source
+        )
+
+      assert body =~ "flow_claim_move_indexes(state, plans)"
+      refute body =~ "flow_transition_move_indexes(state, plans)"
+    end
+
+    test "claim_due bulk index plan keeps metadata and reclaimed running indexes correct", %{
+      state: state
+    } do
+      :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
+      :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+
+      on_exit(fn ->
+        safe_delete_ets(state.zset_score_index_name)
+        safe_delete_ets(state.zset_score_lookup_name)
+        safe_delete_ets(state.flow_index_name)
+        safe_delete_ets(state.flow_lookup_name)
+      end)
+
+      id = "flow-claim-bulk-index"
+      type = "claim-bulk-index"
+      partition_key = "tenant-claim-bulk-index"
+      parent_id = "parent-claim-bulk-index"
+      correlation_id = "corr-claim-bulk-index"
+      state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+      {state, {:ok, _created}} =
+        StateMachine.apply(
+          %{system_time: 1_000},
+          {:flow_create, state_key,
+           %{
+             id: id,
+             type: type,
+             state: "queued",
+             partition_key: partition_key,
+             parent_flow_id: parent_id,
+             correlation_id: correlation_id,
+             now_ms: 1_000,
+             run_at_ms: 1_000
+           }},
+          state
+        )
+
+      queued_due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
+
+      {state, {:ok, [first_claim]}} =
+        StateMachine.apply(
+          %{system_time: 2_000},
+          {:flow_claim_due, queued_due_key,
+           %{
+             type: type,
+             state: "queued",
+             worker: "worker-old",
+             lease_ms: 100,
+             limit: 1,
+             priority: nil,
+             partition_key: partition_key
+           }},
+          state
+        )
+
+      running_due_key = Ferricstore.Flow.Keys.due_key(type, "running", 0, partition_key)
+      running_state_key = Ferricstore.Flow.Keys.state_index_key(type, "running", partition_key)
+      parent_index_key = Ferricstore.Flow.Keys.parent_index_key(parent_id, partition_key)
+
+      correlation_index_key =
+        Ferricstore.Flow.Keys.correlation_index_key(correlation_id, partition_key)
+
+      inflight_key = Ferricstore.Flow.Keys.inflight_index_key(type, partition_key)
+      old_worker_key = Ferricstore.Flow.Keys.worker_index_key("worker-old", partition_key)
+
+      assert first_claim.lease_deadline_ms == 2_100
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, queued_due_key, id) ==
+               :miss
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, running_due_key, id) ==
+               {:ok, 2_100.0}
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, running_state_key, id) ==
+               {:ok, 2_000.0}
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, parent_index_key, id) ==
+               {:ok, 2_000.0}
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(
+               state.flow_lookup_name,
+               correlation_index_key,
+               id
+             ) == {:ok, 2_000.0}
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, inflight_key, id) ==
+               {:ok, 2_100.0}
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, old_worker_key, id) ==
+               {:ok, 2_100.0}
+
+      {_, {:ok, [reclaimed]}} =
+        StateMachine.apply(
+          %{system_time: 2_200},
+          {:flow_claim_due, running_due_key,
+           %{
+             type: type,
+             state: "running",
+             worker: "worker-new",
+             lease_ms: 300,
+             limit: 1,
+             priority: nil,
+             partition_key: partition_key
+           }},
+          state
+        )
+
+      new_worker_key = Ferricstore.Flow.Keys.worker_index_key("worker-new", partition_key)
+
+      assert reclaimed.lease_deadline_ms == 2_500
+      assert reclaimed.lease_owner == "worker-new"
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, running_due_key, id) ==
+               {:ok, 2_500.0}
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, running_state_key, id) ==
+               {:ok, 2_200.0}
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, parent_index_key, id) ==
+               {:ok, 2_200.0}
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(
+               state.flow_lookup_name,
+               correlation_index_key,
+               id
+             ) == {:ok, 2_200.0}
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, inflight_key, id) ==
+               {:ok, 2_500.0}
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, old_worker_key, id) ==
+               :miss
+
+      assert Ferricstore.Flow.OrderedIndex.score_of(state.flow_lookup_name, new_worker_key, id) ==
+               {:ok, 2_500.0}
+    end
+
     test "claim_due mirror does not enqueue full active state blobs", %{
       state: state,
       shard_index: shard_index

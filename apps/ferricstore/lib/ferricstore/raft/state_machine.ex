@@ -8037,11 +8037,130 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp flow_apply_claim_batch(state, due_key, plans, stale_due_ids, now_ms) do
     with :ok <- flow_zset_delete_members_from_key(state, due_key, stale_due_ids),
-         :ok <- flow_transition_move_indexes(state, plans),
+         :ok <- flow_claim_move_indexes(state, plans),
          :ok <- flow_claim_put_state_records(state, plans),
          :ok <- flow_claim_put_history(state, plans, now_ms) do
       :ok
     end
+  end
+
+  defp flow_claim_move_indexes(_state, []), do: :ok
+
+  defp flow_claim_move_indexes(state, plans) do
+    {moves, deletes, puts} =
+      Enum.reduce(plans, {[], [], %{}}, fn {record, next}, {moves, deletes, puts} ->
+        {moves, deletes, puts} =
+          flow_claim_due_index_plan(record, next, moves, deletes, puts)
+
+        moves =
+          record
+          |> flow_claim_state_index_move(next)
+          |> then(&[&1 | moves])
+
+        moves =
+          record
+          |> flow_claim_metadata_index_moves(next)
+          |> Enum.reduce(moves, fn move, acc -> [move | acc] end)
+
+        flow_claim_queue_old_terminal_lmdb_deletes(state, record)
+        deletes = flow_claim_old_running_index_deletes(record, deletes)
+        puts = flow_claim_new_running_index_puts(next, puts)
+
+        {moves, deletes, puts}
+      end)
+
+    with :ok <- flow_index_move_entries(state, Enum.reverse(moves)),
+         :ok <- flow_zset_index_delete_grouped(state, deletes) do
+      flow_claim_put_grouped_zset_entries(state, puts)
+    end
+  end
+
+  defp flow_claim_queue_old_terminal_lmdb_deletes(state, record) do
+    maybe_queue_terminal_lmdb_index_delete(state, record)
+
+    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+      queue_lmdb_metadata_index_deletes(state, record)
+    end
+
+    :ok
+  end
+
+  defp flow_claim_due_index_plan(record, next, moves, deletes, puts) do
+    from_key = flow_due_index_key(record)
+    to_key = flow_due_index_key(next)
+
+    cond do
+      is_binary(from_key) and is_binary(to_key) ->
+        {[{from_key, to_key, next.id, Map.fetch!(next, :next_run_at_ms)} | moves], deletes, puts}
+
+      is_binary(from_key) ->
+        {moves, [{from_key, record.id} | deletes], puts}
+
+      is_binary(to_key) ->
+        puts = flow_claim_add_zset_entry(puts, to_key, next.id, Map.fetch!(next, :next_run_at_ms))
+        {moves, deletes, puts}
+
+      true ->
+        {moves, deletes, puts}
+    end
+  end
+
+  defp flow_claim_state_index_move(record, next) do
+    from_key =
+      FlowKeys.state_index_key(record.type, record.state, Map.get(record, :partition_key))
+
+    to_key = FlowKeys.state_index_key(next.type, next.state, Map.get(next, :partition_key))
+
+    {from_key, to_key, next.id, Map.get(next, :updated_at_ms, 0)}
+  end
+
+  defp flow_claim_metadata_index_moves(record, next) do
+    score = Map.get(next, :updated_at_ms, 0)
+
+    Enum.map(flow_metadata_index_entries(record), fn {key, id, _old_score} ->
+      {key, key, id, score}
+    end)
+  end
+
+  defp flow_claim_old_running_index_deletes(%{state: "running"} = record, deletes) do
+    partition_key = Map.get(record, :partition_key)
+
+    [
+      {FlowKeys.inflight_index_key(record.type, partition_key), record.id},
+      {FlowKeys.worker_index_key(Map.get(record, :lease_owner, ""), partition_key), record.id}
+      | deletes
+    ]
+  end
+
+  defp flow_claim_old_running_index_deletes(_record, deletes), do: deletes
+
+  defp flow_claim_new_running_index_puts(%{state: "running"} = next, puts) do
+    partition_key = Map.get(next, :partition_key)
+    lease_score = Map.get(next, :lease_deadline_ms, 0)
+
+    puts
+    |> flow_claim_add_zset_entry(
+      FlowKeys.inflight_index_key(next.type, partition_key),
+      next.id,
+      lease_score
+    )
+    |> flow_claim_add_zset_entry(
+      FlowKeys.worker_index_key(Map.get(next, :lease_owner, ""), partition_key),
+      next.id,
+      lease_score
+    )
+  end
+
+  defp flow_claim_new_running_index_puts(_next, puts), do: puts
+
+  defp flow_claim_put_grouped_zset_entries(_state, puts) when map_size(puts) == 0, do: :ok
+
+  defp flow_claim_put_grouped_zset_entries(state, puts) do
+    Enum.each(puts, fn {key, member_score_pairs} ->
+      flow_zset_put_many_new(state, key, Enum.reverse(member_score_pairs))
+    end)
+
+    :ok
   end
 
   defp flow_transition_move_indexes(_state, []), do: :ok
