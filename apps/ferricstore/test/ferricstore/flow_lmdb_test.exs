@@ -2265,14 +2265,17 @@ defmodule Ferricstore.Flow.LMDBTest do
 
   test "history include_cold returns latest count when cold history exceeds query scan window" do
     old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_scan_limit = Application.get_env(:ferricstore, :flow_lmdb_history_query_scan_limit)
 
     Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_history_query_scan_limit, 10)
 
     ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
 
     on_exit(fn ->
       Ferricstore.Test.IsolatedInstance.checkin(ctx)
       restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_history_query_scan_limit, old_scan_limit)
     end)
 
     id = "history-cold-latest-window"

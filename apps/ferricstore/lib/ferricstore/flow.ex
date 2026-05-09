@@ -956,7 +956,14 @@ defmodule Ferricstore.Flow do
 
       with {:ok, hot_refs} <-
              flow_history_hot_refs(ctx, id, partition_key, history_key, fetch_count),
-           {:ok, cold_refs} <- flow_history_lmdb_refs(ctx, history_key, fetch_count, consistent?) do
+           {:ok, cold_refs} <-
+             flow_history_lmdb_refs(
+               ctx,
+               history_key,
+               fetch_count,
+               consistent?,
+               flow_history_lmdb_reverse_scan?(query)
+             ) do
         scan_count = flow_lmdb_query_scan_count(fetch_count)
 
         event_ids =
@@ -1000,6 +1007,8 @@ defmodule Ferricstore.Flow do
     if flow_history_query_filtering?(query), do: scan_count, else: query.count
   end
 
+  defp flow_history_lmdb_reverse_scan?(query), do: not flow_history_query_filtering?(query)
+
   defp flow_history_hot_refs(ctx, id, partition_key, history_key, count) do
     {start_idx, stop_idx} = flow_history_hot_range(ctx, id, partition_key, history_key, count)
 
@@ -1033,10 +1042,10 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_history_lmdb_refs(_ctx, _history_key, count, _consistent?) when count <= 0,
+  defp flow_history_lmdb_refs(_ctx, _history_key, count, _consistent?, _reverse?) when count <= 0,
     do: {:ok, []}
 
-  defp flow_history_lmdb_refs(ctx, history_key, count, consistent?) do
+  defp flow_history_lmdb_refs(ctx, history_key, count, consistent?, reverse?) do
     if Ferricstore.Flow.LMDB.mirror?() do
       shard_index = Router.shard_for(ctx, history_key)
 
@@ -1057,7 +1066,8 @@ defmodule Ferricstore.Flow do
                Ferricstore.Flow.LMDB.prefix_entries(
                  path,
                  prefix,
-                 flow_history_lmdb_query_scan_count(count)
+                 flow_history_lmdb_query_scan_count(count, reverse?),
+                 reverse?
                ) do
           {:ok, flow_decode_history_index_entries(entries, path, now_ms)}
         end
@@ -2435,6 +2445,13 @@ defmodule Ferricstore.Flow do
   end
 
   defp flow_history_lmdb_query_scan_count(count) when is_integer(count) and count > 0 do
+    flow_history_lmdb_query_scan_count(count, false)
+  end
+
+  defp flow_history_lmdb_query_scan_count(count, true) when is_integer(count) and count > 0,
+    do: count
+
+  defp flow_history_lmdb_query_scan_count(count, false) when is_integer(count) and count > 0 do
     max_scan =
       Application.get_env(
         :ferricstore,
