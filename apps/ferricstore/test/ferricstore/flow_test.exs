@@ -5545,6 +5545,18 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert Enum.map(terminal_records, & &1.id) == [failed_a.id, cancelled.id, completed.id]
+
+    assert {:ok, reverse_terminal_records} =
+             FerricStore.flow_terminals(type,
+               partition_key: partition,
+               state: "any",
+               from_ms: 1_400,
+               to_ms: 2_100,
+               rev: true,
+               count: 2
+             )
+
+    assert Enum.map(reverse_terminal_records, & &1.id) == [completed.id, cancelled.id]
   end
 
   test "flow_history event ids stay monotonic when claim time is behind record time" do

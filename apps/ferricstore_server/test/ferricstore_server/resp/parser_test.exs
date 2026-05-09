@@ -1840,9 +1840,19 @@ defmodule FerricstoreServer.Resp.ParserTest do
                 {:command, "FLOW.FAILURES", ["checkout", "FROM_MS", "1000", "TO_MS", "2000"],
                  {:flow_failures, "checkout", [from_ms: 1000, to_ms: 2000]}, ["checkout"]},
                 {:command, "FLOW.TERMINALS",
-                 ["checkout", "STATE", "any", "FROM_MS", "1000", "TO_MS", "2000"],
-                 {:flow_terminals, "checkout", [state: "any", from_ms: 1000, to_ms: 2000]},
-                 ["checkout"]}
+                 [
+                   "checkout",
+                   "STATE",
+                   "any",
+                   "FROM_MS",
+                   "1000",
+                   "TO_MS",
+                   "2000",
+                   "REV",
+                   "true"
+                 ],
+                 {:flow_terminals, "checkout",
+                  [state: "any", from_ms: 1000, to_ms: 2000, rev: true]}, ["checkout"]}
               ], ""} =
                Parser.parse_commands(
                  "flow.get flow-1 PARTITION GLOBAL\r\n" <>
@@ -1854,7 +1864,7 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "flow.stuck checkout OLDER_THAN 1000 COUNT 10\r\n" <>
                    "flow.history flow-1 COUNT 10 FROM_MS 1000 TO_MS 2000 EVENT claimed WORKER worker-a REV true\r\n" <>
                    "flow.failures checkout FROM_MS 1000 TO_MS 2000\r\n" <>
-                   "flow.terminals checkout STATE any FROM_MS 1000 TO_MS 2000\r\n"
+                   "flow.terminals checkout STATE any FROM_MS 1000 TO_MS 2000 REV true\r\n"
                )
     end
 

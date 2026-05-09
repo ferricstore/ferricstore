@@ -154,7 +154,19 @@ defmodule Ferricstore.Commands.FlowTest do
     assert [%{"id" => ^id, "state" => "failed"}] =
              Dispatcher.dispatch(
                "FLOW.TERMINALS",
-               [type, "STATE", "any", "FROM_MS", "1000", "TO_MS", "2000", "COUNT", "10"],
+               [
+                 type,
+                 "STATE",
+                 "any",
+                 "FROM_MS",
+                 "1000",
+                 "TO_MS",
+                 "2000",
+                 "REV",
+                 "true",
+                 "COUNT",
+                 "10"
+               ],
                MockStore.make()
              )
   end

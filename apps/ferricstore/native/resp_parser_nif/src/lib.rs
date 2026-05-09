@@ -7047,6 +7047,7 @@ fn flow_failures_option<'a>(
             (b"PARTITION", "partition_key", FlowOptType::Partition),
             (b"FROM_MS", "from_ms", FlowOptType::NonNegative),
             (b"TO_MS", "to_ms", FlowOptType::NonNegative),
+            (b"REV", "rev", FlowOptType::Boolean),
             (b"INCLUDE_COLD", "include_cold", FlowOptType::Boolean),
             (
                 b"CONSISTENT_PROJECTION",
@@ -7074,6 +7075,7 @@ fn flow_terminals_option<'a>(
             (b"PARTITION", "partition_key", FlowOptType::Partition),
             (b"FROM_MS", "from_ms", FlowOptType::NonNegative),
             (b"TO_MS", "to_ms", FlowOptType::NonNegative),
+            (b"REV", "rev", FlowOptType::Boolean),
             (b"INCLUDE_COLD", "include_cold", FlowOptType::Boolean),
             (
                 b"CONSISTENT_PROJECTION",

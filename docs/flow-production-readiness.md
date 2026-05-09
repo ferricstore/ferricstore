@@ -144,7 +144,7 @@ projection. Supported filters are `COUNT`, `FROM_EVENT`, `TO_EVENT`, `FROM_MS`,
 
 `FLOW.TERMINALS <type>` lists terminal records from existing terminal state
 indexes. `STATE` accepts `failed`, `completed`, `cancelled`, or `any`, with
-optional `COUNT`, `PARTITION`, `FROM_MS`, `TO_MS`, `INCLUDE_COLD`, and
+optional `COUNT`, `PARTITION`, `FROM_MS`, `TO_MS`, `REV`, `INCLUDE_COLD`, and
 `CONSISTENT_PROJECTION`. `FLOW.FAILURES <type>` is a convenience alias for
 `FLOW.TERMINALS <type> STATE failed`.
 

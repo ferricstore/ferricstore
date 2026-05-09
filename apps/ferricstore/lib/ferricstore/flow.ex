@@ -682,6 +682,7 @@ defmodule Ferricstore.Flow do
          {:ok, count} <- flow_count(opts),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, rev?} <- optional_boolean(opts, :rev, false),
          {:ok, from_ms} <- optional_non_neg_integer(opts, :from_ms, nil),
          {:ok, to_ms} <- optional_non_neg_integer(opts, :to_ms, nil),
          :ok <- validate_ms_range(from_ms, to_ms),
@@ -700,6 +701,7 @@ defmodule Ferricstore.Flow do
        records
        |> filter_flow_records_by_ms(from_ms, to_ms)
        |> sort_flow_records_by_update()
+       |> maybe_reverse_flow_records(rev?)
        |> Enum.take(count)}
     end
   end
@@ -1248,6 +1250,9 @@ defmodule Ferricstore.Flow do
     end)
   end
 
+  defp maybe_reverse_flow_records(records, true), do: Enum.reverse(records)
+  defp maybe_reverse_flow_records(records, false), do: records
+
   defp flow_terminal_state(opts) do
     case Keyword.get(opts, :state, "any") do
       "any" -> {:ok, "any"}
@@ -1267,7 +1272,7 @@ defmodule Ferricstore.Flow do
        ) do
     @terminal_states
     |> Enum.reduce_while({:ok, []}, fn state, {:ok, acc} ->
-      case flow_terminal_records(
+      case flow_terminal_ids(
              ctx,
              type,
              state,
@@ -1276,13 +1281,32 @@ defmodule Ferricstore.Flow do
              include_cold?,
              consistent?
            ) do
-        {:ok, records} -> {:cont, {:ok, records ++ acc}}
+        {:ok, ids} -> {:cont, {:ok, ids ++ acc}}
         {:error, _reason} = error -> {:halt, error}
       end
     end)
+    |> case do
+      {:ok, ids} ->
+        ids = ids |> Enum.uniq() |> Enum.take(count * length(@terminal_states))
+
+        with {:ok, records} <- flow_records_for_ids(ctx, ids, partition_key) do
+          {:ok, Enum.filter(records, &(Map.get(&1, :state) in @terminal_states))}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   defp flow_terminal_records(ctx, type, state, partition_key, count, include_cold?, consistent?) do
+    with {:ok, ids} <-
+           flow_terminal_ids(ctx, type, state, partition_key, count, include_cold?, consistent?),
+         {:ok, records} <- flow_records_for_ids(ctx, ids, partition_key) do
+      {:ok, Enum.filter(records, &(Map.get(&1, :state) == state))}
+    end
+  end
+
+  defp flow_terminal_ids(ctx, type, state, partition_key, count, include_cold?, consistent?) do
     index_key = __MODULE__.Keys.state_index_key(type, state, partition_key)
 
     with :ok <- validate_key_size(index_key),
@@ -1296,7 +1320,7 @@ defmodule Ferricstore.Flow do
              include_cold?,
              consistent?
            ) do
-      flow_records_for_ids(ctx, ids, partition_key)
+      {:ok, ids}
     end
   end
 
