@@ -110,6 +110,10 @@ defmodule Ferricstore.Commands.FlowTest do
                  "0",
                  "TO_MS",
                  "9999999999999",
+                 "FROM_VERSION",
+                 "1",
+                 "TO_VERSION",
+                 "1",
                  "EVENT",
                  "created",
                  "REV",
@@ -553,7 +557,21 @@ defmodule Ferricstore.Commands.FlowTest do
     assert [%{"id" => ^child}] =
              Dispatcher.dispatch(
                "FLOW.BY_PARENT",
-               [root, "PARTITION", partition, "COUNT", "10"],
+               [
+                 root,
+                 "PARTITION",
+                 partition,
+                 "COUNT",
+                 "10",
+                 "FROM_MS",
+                 "1500",
+                 "TO_MS",
+                 "2500",
+                 "REV",
+                 "true",
+                 "STATE",
+                 "queued"
+               ],
                MockStore.make()
              )
 

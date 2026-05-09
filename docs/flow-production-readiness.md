@@ -139,7 +139,7 @@ queries, plus BEAM memory delta and LMDB replay-safe lag.
 `FLOW.HISTORY <id>` is a per-flow query. It stays on the owning shard and uses
 the existing hot history refs, Bitcask history records, and optional LMDB cold
 projection. Supported filters are `COUNT`, `FROM_EVENT`, `TO_EVENT`, `FROM_MS`,
-`TO_MS`, `REV`, `EVENT`, `WORKER`, `INCLUDE_COLD`, and
+`TO_MS`, `FROM_VERSION`, `TO_VERSION`, `REV`, `EVENT`, `WORKER`, `INCLUDE_COLD`, and
 `CONSISTENT_PROJECTION`.
 
 `FLOW.TERMINALS <type>` lists terminal records from existing terminal state
@@ -151,6 +151,11 @@ optional `COUNT`, `PARTITION`, `FROM_MS`, `TO_MS`, `REV`, `INCLUDE_COLD`, and
 These audit queries add no hot-path write indexes. They reuse Flow state/history
 truth plus existing terminal projections, so create/transition/claim latency is
 not affected by the richer read shape.
+
+`FLOW.BY_PARENT`, `FLOW.BY_ROOT`, and `FLOW.BY_CORRELATION` also reuse the
+existing LMDB lineage indexes. They support `FROM_MS`, `TO_MS`, `REV`, `STATE`,
+and `TERMINAL_ONLY` as read-side filters; no new LMDB rows are written for
+these query shapes.
 
 ## Flow Schema Migration
 

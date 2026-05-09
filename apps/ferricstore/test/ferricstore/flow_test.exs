@@ -876,17 +876,58 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, [%{id: ^child_a}, %{id: ^child_b}]} =
              FerricStore.flow_by_parent(root, partition_key: partition, count: 10)
 
+    assert {:ok, [%{id: ^child_b}, %{id: ^child_a}]} =
+             FerricStore.flow_by_parent(root,
+               partition_key: partition,
+               from_ms: 1_500,
+               to_ms: 3_500,
+               rev: true,
+               count: 10
+             )
+
+    assert {:ok, [%{id: ^child_b}]} =
+             FerricStore.flow_by_parent(root,
+               partition_key: partition,
+               rev: true,
+               count: 1
+             )
+
     assert {:ok, []} =
              FerricStore.zrange(Ferricstore.Flow.Keys.parent_index_key(root, partition), 0, 10)
 
     assert {:ok, [%{id: ^root}, %{id: ^child_a}, %{id: ^child_b}, %{id: ^grandchild}]} =
              FerricStore.flow_by_root(root, partition_key: partition, count: 10)
 
+    assert {:ok, [%{id: ^child_b}]} =
+             FerricStore.flow_by_root(root,
+               partition_key: partition,
+               from_ms: 2_500,
+               to_ms: 3_500,
+               state: "queued",
+               count: 10
+             )
+
     assert {:ok, []} =
              FerricStore.zrange(Ferricstore.Flow.Keys.root_index_key(root, partition), 0, 10)
 
     assert {:ok, [%{id: ^root}, %{id: ^child_a}]} =
              FerricStore.flow_by_correlation(correlation, partition_key: partition, count: 2)
+
+    assert {:ok, child_a_record} = FerricStore.flow_get(child_a, partition_key: partition)
+
+    assert {:ok, _cancelled} =
+             FerricStore.flow_cancel(child_a,
+               partition_key: partition,
+               fencing_token: child_a_record.fencing_token,
+               now_ms: 5_000
+             )
+
+    assert {:ok, [%{id: ^child_a, state: "cancelled"}]} =
+             FerricStore.flow_by_correlation(correlation,
+               partition_key: partition,
+               terminal_only: true,
+               count: 10
+             )
 
     assert {:ok, []} =
              FerricStore.zrange(
@@ -5467,6 +5508,20 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert [{_event_id, %{"event" => "claimed", "lease_owner" => "worker-b"}}] = worker_events
+
+    assert {:ok, version_events} =
+             FerricStore.flow_history(id,
+               partition_key: partition,
+               from_version: 2,
+               to_version: 4,
+               count: 10
+             )
+
+    assert Enum.map(version_events, fn {_event_id, fields} -> fields["version"] end) == [
+             "2",
+             "3",
+             "4"
+           ]
   end
 
   test "flow_terminals and flow_failures list terminal records by state and time range" do

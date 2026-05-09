@@ -6963,6 +6963,11 @@ fn flow_index_query_option<'a>(
         &[
             (b"COUNT", "count", FlowOptType::Positive(b"count")),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (b"FROM_MS", "from_ms", FlowOptType::NonNegative),
+            (b"TO_MS", "to_ms", FlowOptType::NonNegative),
+            (b"REV", "rev", FlowOptType::Boolean),
+            (b"STATE", "state", FlowOptType::Binary),
+            (b"TERMINAL_ONLY", "terminal_only", FlowOptType::Boolean),
             (b"INCLUDE_COLD", "include_cold", FlowOptType::Boolean),
             (
                 b"CONSISTENT_PROJECTION",
@@ -7011,6 +7016,8 @@ fn flow_history_option<'a>(
             (b"TO_EVENT", "to_event", FlowOptType::Binary),
             (b"FROM_MS", "from_ms", FlowOptType::NonNegative),
             (b"TO_MS", "to_ms", FlowOptType::NonNegative),
+            (b"FROM_VERSION", "from_version", FlowOptType::NonNegative),
+            (b"TO_VERSION", "to_version", FlowOptType::NonNegative),
             (b"REV", "rev", FlowOptType::Boolean),
             (b"EVENT", "event", FlowOptType::Binary),
             (b"WORKER", "worker", FlowOptType::Binary),

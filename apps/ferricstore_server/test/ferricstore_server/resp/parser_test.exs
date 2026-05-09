@@ -1821,6 +1821,10 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "1000",
                    "TO_MS",
                    "2000",
+                   "FROM_VERSION",
+                   "2",
+                   "TO_VERSION",
+                   "4",
                    "EVENT",
                    "claimed",
                    "WORKER",
@@ -1833,6 +1837,8 @@ defmodule FerricstoreServer.Resp.ParserTest do
                     count: 10,
                     from_ms: 1000,
                     to_ms: 2000,
+                    from_version: 2,
+                    to_version: 4,
                     event: "claimed",
                     worker: "worker-a",
                     rev: true
@@ -1852,7 +1858,29 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "true"
                  ],
                  {:flow_terminals, "checkout",
-                  [state: "any", from_ms: 1000, to_ms: 2000, rev: true]}, ["checkout"]}
+                  [state: "any", from_ms: 1000, to_ms: 2000, rev: true]}, ["checkout"]},
+                {:command, "FLOW.BY_PARENT",
+                 [
+                   "parent-1",
+                   "FROM_MS",
+                   "1000",
+                   "TO_MS",
+                   "2000",
+                   "REV",
+                   "true",
+                   "STATE",
+                   "failed",
+                   "TERMINAL_ONLY",
+                   "true"
+                 ],
+                 {:flow_by_parent, "parent-1",
+                  [
+                    from_ms: 1000,
+                    to_ms: 2000,
+                    rev: true,
+                    state: "failed",
+                    terminal_only: true
+                  ]}, ["parent-1"]}
               ], ""} =
                Parser.parse_commands(
                  "flow.get flow-1 PARTITION GLOBAL\r\n" <>
@@ -1862,9 +1890,10 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "flow.claim_due checkout WORKER worker-a LIMIT 10 PAYLOAD MAXBYTES 2048\r\n" <>
                    "flow.info checkout PARTITION tenant-a\r\n" <>
                    "flow.stuck checkout OLDER_THAN 1000 COUNT 10\r\n" <>
-                   "flow.history flow-1 COUNT 10 FROM_MS 1000 TO_MS 2000 EVENT claimed WORKER worker-a REV true\r\n" <>
+                   "flow.history flow-1 COUNT 10 FROM_MS 1000 TO_MS 2000 FROM_VERSION 2 TO_VERSION 4 EVENT claimed WORKER worker-a REV true\r\n" <>
                    "flow.failures checkout FROM_MS 1000 TO_MS 2000\r\n" <>
-                   "flow.terminals checkout STATE any FROM_MS 1000 TO_MS 2000 REV true\r\n"
+                   "flow.terminals checkout STATE any FROM_MS 1000 TO_MS 2000 REV true\r\n" <>
+                   "flow.by_parent parent-1 FROM_MS 1000 TO_MS 2000 REV true STATE failed TERMINAL_ONLY true\r\n"
                )
     end
 
