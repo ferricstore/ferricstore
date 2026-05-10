@@ -985,11 +985,17 @@ defmodule Ferricstore.Raft.Batcher do
   defp unwrap_applied({:applied_at, ra_index, real_result}), do: {ra_index, real_result}
   defp unwrap_applied(other), do: {0, other}
 
-  # Reply now if the legacy result has no Ra index or if the local state machine
-  # has already applied this index. Otherwise all callers wait for
-  # `{:locally_applied, ra_index}`. That includes local callers: Ra's applied
-  # event is not a sufficient read-your-write barrier for the Router/Shard read
-  # path, which observes this node's ETS.
+  # Reply now if:
+  #   * the legacy result has no Ra index,
+  #   * the local state machine has already applied this index, or
+  #   * every caller originated on this node.
+  #
+  # The local-caller fast path is critical for SET pipeline throughput. The
+  # `:ra_event {:applied, ...}` for this batcher is emitted by the local Ra
+  # server, so local callers do not need a second mailbox round trip through
+  # `{:locally_applied, ra_index}`. Forwarded callers are different: the
+  # leader's batcher may reply to another node, so those keep the explicit
+  # local-apply barrier via `:remote_origin`.
   defp gate_reply(state, 0, kind, froms, result) do
     do_reply(kind, froms, result, 0)
     state
@@ -1002,7 +1008,31 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   defp gate_reply(state, ra_index, kind, froms, result) do
-    enqueue_local_apply_waiter(state, ra_index, kind, froms, result)
+    if all_local_reply?(froms) do
+      do_reply(kind, froms, result, ra_index)
+      state
+    else
+      enqueue_local_apply_waiter(state, ra_index, kind, froms, result)
+    end
+  end
+
+  defp all_local_reply?(froms) do
+    Enum.all?(froms, fn
+      {pid, _ref} when is_pid(pid) ->
+        node(pid) == node()
+
+      {:batch_from, {pid, _ref}, _count} when is_pid(pid) ->
+        node(pid) == node()
+
+      {:batch_from, {:remote_origin, _origin_node, _from}, _count} ->
+        false
+
+      {:remote_origin, _origin_node, _from} ->
+        false
+
+      _ ->
+        false
+    end)
   end
 
   defp track_origin_local_apply(state, ra_index) when is_integer(ra_index) and ra_index > 0 do

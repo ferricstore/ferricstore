@@ -219,7 +219,7 @@ defmodule Ferricstore.Raft.BatcherTest do
                      1_000
     end
 
-    test "local quorum caller is not replied before local apply reaches the raft index" do
+    test "local quorum caller replies on raft apply without local-apply waiter" do
       shard_index = 0
       batcher = Batcher.batcher_name(shard_index)
       %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
@@ -243,13 +243,46 @@ defmodule Ferricstore.Raft.BatcherTest do
 
       send(batcher, {:ra_event, :leader, {:applied, [{corr, {:applied_at, ra_index, :ok}}]}})
 
-      refute_receive {^reply_ref, :ok}, 50
-
-      send(batcher, {:locally_applied, ra_index})
       assert_receive {^reply_ref, :ok}, 1_000
+
+      state = :sys.get_state(batcher)
+      assert state.local_apply_waiters == []
     end
 
-    test "queued local apply waiters emit depth and oldest age telemetry" do
+    test "local batch quorum caller replies on raft apply without local-apply waiter" do
+      shard_index = 0
+      batcher = Batcher.batcher_name(shard_index)
+      %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
+      ra_index = last_local_applied + 1_000
+      corr = make_ref()
+      reply_ref = make_ref()
+
+      on_exit(fn ->
+        send(batcher, {:locally_applied, ra_index})
+        Batcher.reset_pending(shard_index)
+      end)
+
+      :ok =
+        Batcher.__inject_quorum_pending_at__(
+          shard_index,
+          corr,
+          [{:batch_from, {self(), reply_ref}, 2}],
+          :batch,
+          System.monotonic_time()
+        )
+
+      send(
+        batcher,
+        {:ra_event, :leader, {:applied, [{corr, {:applied_at, ra_index, {:ok, [:ok, :ok]}}}]}}
+      )
+
+      assert_receive {^reply_ref, {:ok, [:ok, :ok]}}, 1_000
+
+      state = :sys.get_state(batcher)
+      assert state.local_apply_waiters == []
+    end
+
+    test "remote-origin quorum callers wait for local apply and emit wait telemetry" do
       shard_index = 0
       batcher = Batcher.batcher_name(shard_index)
       %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
@@ -282,7 +315,7 @@ defmodule Ferricstore.Raft.BatcherTest do
         Batcher.__inject_quorum_pending_at__(
           shard_index,
           corr,
-          [{self(), reply_ref}],
+          [{:remote_origin, :remote@nohost, {self(), reply_ref}}],
           :single,
           System.monotonic_time()
         )
@@ -306,7 +339,7 @@ defmodule Ferricstore.Raft.BatcherTest do
       refute_receive {^reply_ref, :ok}, 50
 
       send(batcher, {:locally_applied, ra_index})
-      assert_receive {^reply_ref, :ok}, 1_000
+      assert_receive {^reply_ref, {:remote_applied_at, ^ra_index, :ok}}, 1_000
 
       assert_receive {:batcher_telemetry, [:ferricstore, :batcher, :local_apply_gate],
                       %{duration_us: gate_us, caller_count: 1},
