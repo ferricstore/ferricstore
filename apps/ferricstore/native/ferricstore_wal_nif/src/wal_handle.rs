@@ -8,7 +8,7 @@
 // - Thread join handle
 
 use crate::aligned_buffer::AlignedBuffer;
-use crate::background_thread::{self, FlushCaller, ThreadConfig, ThreadMsg};
+use crate::background_thread::{self, FlushCaller, FlushTarget, ThreadConfig, ThreadMsg};
 use crossbeam_channel::Sender;
 use std::fs::File;
 use std::io;
@@ -32,6 +32,9 @@ pub struct WalHandle {
 
     /// Maximum buffer size before backpressure.
     max_buffer_bytes: u64,
+
+    /// Default adaptive sync delay cap used by legacy sync/3 callers.
+    commit_delay: Duration,
 
     /// Background thread handle.
     thread_handle: Mutex<Option<JoinHandle<()>>>,
@@ -77,6 +80,7 @@ impl WalHandle {
             alive,
             file_size_counter: file_size,
             max_buffer_bytes,
+            commit_delay: Duration::from_micros(commit_delay_us),
             thread_handle: Mutex::new(Some(thread_handle)),
             read_file: Mutex::new(read_file),
         })
@@ -121,16 +125,24 @@ impl WalHandle {
         pid: rustler::LocalPid,
         env: rustler::OwnedEnv,
         saved_ref: rustler::env::SavedTerm,
+        commit_delay: Duration,
     ) -> Result<(), rustler::Error> {
         let caller = FlushCaller {
-            pid,
-            env,
-            saved_ref,
+            target: FlushTarget::Beam {
+                pid,
+                env,
+                saved_ref,
+            },
+            commit_delay,
         };
 
         self.flush_tx
             .send(ThreadMsg::Flush(caller))
             .map_err(|_| rustler::Error::Term(Box::new("wal_thread_dead")))
+    }
+
+    pub fn commit_delay(&self) -> Duration {
+        self.commit_delay
     }
 
     /// Close the WAL. Blocks until background thread exits (max 30s).

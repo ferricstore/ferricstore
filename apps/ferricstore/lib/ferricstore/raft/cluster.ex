@@ -54,7 +54,7 @@ defmodule Ferricstore.Raft.Cluster do
       names = :ra_system.derive_names(@ra_system)
 
       commit_delay_us =
-        Application.get_env(:ferricstore, :wal_commit_delay_us, 200)
+        Application.get_env(:ferricstore, :wal_commit_delay_us, 6_000)
 
       config = %{
         name: @ra_system,

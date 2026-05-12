@@ -128,7 +128,7 @@ if config_env() == :prod do
     promotion_threshold:
       String.to_integer(System.get_env("FERRICSTORE_PROMOTION_THRESHOLD", "100")),
     wal_commit_delay_us:
-      String.to_integer(System.get_env("FERRICSTORE_WAL_COMMIT_DELAY_US", "200"))
+      String.to_integer(System.get_env("FERRICSTORE_WAL_COMMIT_DELAY_US", "6000"))
 
   # ---------------------------------------------------------------------------
   # Supervisor (test-only tuning, production defaults are fine)

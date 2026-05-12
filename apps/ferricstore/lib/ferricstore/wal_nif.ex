@@ -37,8 +37,11 @@ defmodule :ferricstore_wal_nif do
   @doc "Write pre-formatted iodata to the WAL buffer. Does NOT write to disk."
   def write(_handle, _iodata), do: :erlang.nif_error(:nif_not_loaded)
 
-  @doc "Request async fdatasync. Sends {wal_sync_complete, Ref} on completion."
+  @doc "Request async fdatasync. Sends {wal_sync_complete, Ref, synced_position} on completion."
   def sync(_handle, _caller_pid, _ref), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Request async fdatasync with a per-sync adaptive delay."
+  def sync_with_delay(_handle, _caller_pid, _ref, _delay_us), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Close the WAL file. Blocks until drain + sync + close."
   def close(_handle), do: :erlang.nif_error(:nif_not_loaded)

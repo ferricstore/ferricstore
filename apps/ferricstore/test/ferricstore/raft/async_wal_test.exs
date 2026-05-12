@@ -31,6 +31,7 @@ defmodule Ferricstore.Raft.AsyncWalTest do
 
   setup do
     ShardHelpers.flush_all_keys()
+
     on_exit(fn ->
       ShardHelpers.flush_all_keys()
       ShardHelpers.wait_shards_alive()
@@ -84,6 +85,65 @@ defmodule Ferricstore.Raft.AsyncWalTest do
 
       assert status_str =~ "async_sync",
              "format_status should contain async_sync key, got: #{status_str}"
+    end
+
+    test "WAL sync emits duration telemetry for profiling" do
+      parent = self()
+      handler_id = {__MODULE__, :wal_sync_profile, make_ref()}
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :wal, :sync],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:wal_sync_profile, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      try do
+        :ok = FerricStore.set(ukey("wal_sync_profile"), "value")
+
+        assert_receive {:wal_sync_profile, [:ferricstore, :wal, :sync], measurements, metadata},
+                       5_000
+
+        assert is_integer(measurements.duration_us)
+        assert measurements.duration_us >= 0
+        assert measurements.pending_batches >= 1
+        assert is_integer(measurements.delay_us)
+        assert measurements.delay_us >= 0
+        assert metadata.status == :ok
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
+    test "adaptive WAL delay only waits when sync backlog exists" do
+      assert :ra_log_wal.__adaptive_commit_delay_us_for_test__(0, 0) == 0
+      assert :ra_log_wal.__adaptive_commit_delay_us_for_test__(6_000, 0) == 200
+      assert :ra_log_wal.__adaptive_commit_delay_us_for_test__(6_000, 1) == 200
+      assert :ra_log_wal.__adaptive_commit_delay_us_for_test__(6_000, 2) == 1_000
+      assert :ra_log_wal.__adaptive_commit_delay_us_for_test__(6_000, 8) == 3_000
+      assert :ra_log_wal.__adaptive_commit_delay_us_for_test__(6_000, 32) == 6_000
+      assert :ra_log_wal.__adaptive_commit_delay_us_for_test__(100, 1) == 100
+      assert :ra_log_wal.__adaptive_commit_delay_us_for_test__(100, 32) == 100
+    end
+
+    test "adaptive WAL delay ramps on queued pressure and decays when idle" do
+      assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(0, 200, 1, 1) == 0
+      assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 200, 1, 1) == 1_000
+      assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 1_000, 1, 1) == 2_000
+      assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 4_000, 1, 1) == 6_000
+      assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 6_000, 1, 0) == 3_000
+      assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 300, 1, 0) == 200
+    end
+
+    test "completed WAL sync releases only the batches covered by that sync" do
+      assert :ra_log_wal.__complete_sync_partition_for_test__(3, 2) == {3, 2}
+    end
+
+    test "completed WAL sync can release delay-covered batches by synced byte frontier" do
+      assert :ra_log_wal.__complete_sync_frontier_for_test__([100], [300, 200], 250) ==
+               {2, [300]}
     end
 
     test "patched module source file contains async-sync marker" do

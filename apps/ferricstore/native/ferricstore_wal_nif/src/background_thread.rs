@@ -32,9 +32,18 @@ pub enum ThreadMsg {
 
 /// Caller information for flush notification.
 pub struct FlushCaller {
-    pub pid: rustler::LocalPid,
-    pub env: rustler::OwnedEnv,
-    pub saved_ref: rustler::env::SavedTerm,
+    pub target: FlushTarget,
+    pub commit_delay: Duration,
+}
+
+pub enum FlushTarget {
+    Beam {
+        pid: rustler::LocalPid,
+        env: rustler::OwnedEnv,
+        saved_ref: rustler::env::SavedTerm,
+    },
+    #[cfg(test)]
+    Test(Sender<u64>),
 }
 
 // FlushCaller must be Send to cross thread boundary
@@ -94,7 +103,7 @@ fn thread_loop_inner(
     buffer: Arc<Mutex<AlignedBuffer>>,
     rx: Receiver<ThreadMsg>,
     file_size: Arc<AtomicU64>,
-    commit_delay: Duration,
+    _commit_delay: Duration,
 ) {
     let mut callers: Vec<FlushCaller> = Vec::new();
 
@@ -116,124 +125,116 @@ fn thread_loop_inner(
                 return;
             }
             ThreadMsg::Flush(caller) => {
+                let commit_delay = caller.commit_delay;
                 callers.push(caller);
-            }
-        }
-
-        // =====================================================================
-        // Phase 2: Drain buffer to kernel immediately (before sync decision)
-        // =====================================================================
-        if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
-            notify_callers_error(&mut callers, &e);
-            return;
-        }
-
-        // =====================================================================
-        // Phase 3: Commit delay — collect more Flush requests, keep draining
-        // =====================================================================
-        if !commit_delay.is_zero() {
-            let deadline = Instant::now() + commit_delay;
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                match rx.recv_timeout(remaining) {
-                    Ok(ThreadMsg::Flush(c)) => callers.push(c),
-                    Ok(ThreadMsg::Close(response)) => {
-                        finish_close(&mut file, &buffer, &file_size, &mut callers, response);
-                        return;
-                    }
-                    Err(RecvTimeoutError::Timeout) => break,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        finish_disconnect(&mut file, &buffer, &file_size, &mut callers);
-                        return;
-                    }
-                }
-                if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
-                    notify_callers_error(&mut callers, &e);
-                    return;
-                }
-            }
-        }
-
-        // =====================================================================
-        // Phase 4: Self-driving — drain, sync when callers waiting, repeat
-        // =====================================================================
-        loop {
-            // Drain any remaining buffer to kernel
-            if let Err(e) = drain_to_kernel(&mut file, &buffer, &file_size) {
-                notify_callers_error(&mut callers, &e);
-                return;
-            }
-
-            // Sync + notify if we have callers
-            if !callers.is_empty() {
-                match file.sync_data() {
-                    Ok(()) => {
-                        notify_callers_success(&mut callers);
-                    }
-                    Err(e) => {
-                        notify_callers_error(&mut callers, &e);
-                        return;
-                    }
-                }
-            }
-
-            // Collect messages that arrived during I/O
-            loop {
-                match rx.try_recv() {
-                    Ok(ThreadMsg::Flush(c)) => callers.push(c),
-                    Ok(ThreadMsg::Close(response)) => {
-                        finish_close(&mut file, &buffer, &file_size, &mut callers, response);
-                        return;
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            // More callers arrived? Drain and loop for another sync.
-            if !callers.is_empty() {
+                run_sync_cycle(
+                    &mut file,
+                    &buffer,
+                    &file_size,
+                    &rx,
+                    &mut callers,
+                    commit_delay,
+                );
                 continue;
             }
-
-            // Buffer has data? Drain it to kernel (writes flow continuously).
-            let has_data = match buffer.lock() {
-                Ok(buf) => !buf.is_empty(),
-                Err(_) => {
-                    let err = io::Error::new(io::ErrorKind::Other, "buffer mutex poisoned");
-                    notify_callers_error(&mut callers, &err);
-                    return;
-                }
-            };
-            if has_data {
-                continue;
-            }
-
-            // Truly idle. Return to Phase 1.
-            break;
         }
     }
 }
 
-fn finish_close(
-    file: &mut File,
+fn run_sync_cycle<W>(
+    file: &mut W,
+    buffer: &Arc<Mutex<AlignedBuffer>>,
+    file_size: &Arc<AtomicU64>,
+    rx: &Receiver<ThreadMsg>,
+    callers: &mut Vec<FlushCaller>,
+    commit_delay: Duration,
+) where
+    W: Write + SyncData,
+{
+    // =====================================================================
+    // Phase 2: Drain buffer to kernel immediately (before sync decision)
+    // =====================================================================
+    if let Err(e) = drain_to_kernel(file, buffer, file_size) {
+        notify_callers_error(callers, &e);
+        return;
+    }
+
+    // =====================================================================
+    // Phase 3: Commit delay — collect more Flush requests, keep draining
+    // =====================================================================
+    if !commit_delay.is_zero() {
+        let deadline = Instant::now() + commit_delay;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(ThreadMsg::Flush(c)) => callers.push(c),
+                Ok(ThreadMsg::Close(response)) => {
+                    finish_close(file, buffer, file_size, callers, response);
+                    return;
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    finish_disconnect(file, buffer, file_size, callers);
+                    return;
+                }
+            }
+            if let Err(e) = drain_to_kernel(file, buffer, file_size) {
+                notify_callers_error(callers, &e);
+                return;
+            }
+        }
+    }
+
+    // =====================================================================
+    // Phase 4: one Erlang-owned sync cycle
+    // =====================================================================
+    // ra_log_wal owns sync_in_flight and the pending/syncing frontier. Do not
+    // self-drive extra syncs here: Flush messages that arrive during fdatasync
+    // must stay queued until Erlang observes this completion and explicitly
+    // schedules the next sync cycle.
+    if let Err(e) = drain_to_kernel(file, buffer, file_size) {
+        notify_callers_error(callers, &e);
+        return;
+    }
+
+    if !callers.is_empty() {
+        let synced_position = file_size.load(Ordering::Acquire);
+        match file.sync_data() {
+            Ok(()) => {
+                notify_callers_success(callers, synced_position);
+            }
+            Err(e) => {
+                notify_callers_error(callers, &e);
+            }
+        }
+    }
+}
+
+fn finish_close<W>(
+    file: &mut W,
     buffer: &Mutex<AlignedBuffer>,
     file_size: &AtomicU64,
     callers: &mut Vec<FlushCaller>,
     response: Option<Sender<ThreadResult>>,
-) {
+) where
+    W: Write + SyncData,
+{
     let result = close_drain_and_sync(file, buffer, file_size);
     notify_callers_for_close(callers, &result);
     send_close_result(response, &result);
 }
 
-fn finish_disconnect(
-    file: &mut File,
+fn finish_disconnect<W>(
+    file: &mut W,
     buffer: &Mutex<AlignedBuffer>,
     file_size: &AtomicU64,
     callers: &mut Vec<FlushCaller>,
-) {
+) where
+    W: Write + SyncData,
+{
     let result = close_drain_and_sync(file, buffer, file_size);
     notify_callers_for_close(callers, &result);
 
@@ -242,14 +243,14 @@ fn finish_disconnect(
     }
 }
 
-fn notify_callers_for_close(callers: &mut Vec<FlushCaller>, result: &io::Result<()>) {
+fn notify_callers_for_close(callers: &mut Vec<FlushCaller>, result: &io::Result<u64>) {
     match result {
-        Ok(()) => notify_callers_success(callers),
+        Ok(synced_position) => notify_callers_success(callers, *synced_position),
         Err(e) => notify_callers_error(callers, e),
     }
 }
 
-fn send_close_result(response: Option<Sender<ThreadResult>>, result: &io::Result<()>) {
+fn send_close_result(response: Option<Sender<ThreadResult>>, result: &io::Result<u64>) {
     if let Some(response) = response {
         let _ = response.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
     }
@@ -259,21 +260,26 @@ fn close_drain_and_sync<W>(
     writer: &mut W,
     buffer: &Mutex<AlignedBuffer>,
     file_size: &AtomicU64,
-) -> io::Result<()>
+) -> io::Result<u64>
 where
     W: Write + SyncData,
 {
     drain_to_kernel_writer(writer, buffer, file_size)?;
-    writer.sync_data()
+    let synced_position = file_size.load(Ordering::Acquire);
+    writer.sync_data()?;
+    Ok(synced_position)
 }
 
 /// Drain shared buffer to kernel page cache. No fdatasync.
 /// Returns true if data was written.
-fn drain_to_kernel(
-    file: &mut File,
+fn drain_to_kernel<W>(
+    file: &mut W,
     buffer: &Mutex<AlignedBuffer>,
     file_size: &AtomicU64,
-) -> io::Result<bool> {
+) -> io::Result<bool>
+where
+    W: Write,
+{
     drain_to_kernel_writer(file, buffer, file_size)
 }
 
@@ -326,33 +332,59 @@ fn write_all_retry<W: Write>(file: &mut W, data: &[u8]) -> io::Result<()> {
 }
 
 /// Notify all callers that sync completed successfully.
-fn notify_callers_success(callers: &mut Vec<FlushCaller>) {
-    for mut caller in callers.drain(..) {
-        let _ = caller.env.send_and_clear(&caller.pid, |env| {
-            let ref_term = caller.saved_ref.load(env);
-            rustler::types::tuple::make_tuple(
-                env,
-                &[crate::atoms::wal_sync_complete().encode(env), ref_term],
-            )
-        });
+fn notify_callers_success(callers: &mut Vec<FlushCaller>, synced_position: u64) {
+    for caller in callers.drain(..) {
+        match caller.target {
+            FlushTarget::Beam {
+                pid,
+                mut env,
+                saved_ref,
+            } => {
+                let _ = env.send_and_clear(&pid, |env| {
+                    let ref_term = saved_ref.load(env);
+                    rustler::types::tuple::make_tuple(
+                        env,
+                        &[
+                            crate::atoms::wal_sync_complete().encode(env),
+                            ref_term,
+                            synced_position.encode(env),
+                        ],
+                    )
+                });
+            }
+            #[cfg(test)]
+            FlushTarget::Test(tx) => {
+                let _ = tx.send(synced_position);
+            }
+        }
     }
 }
 
 /// Notify all callers that sync failed.
 fn notify_callers_error(callers: &mut Vec<FlushCaller>, error: &io::Error) {
     let reason = format!("{error}");
-    for mut caller in callers.drain(..) {
-        let _ = caller.env.send_and_clear(&caller.pid, |env| {
-            let ref_term = caller.saved_ref.load(env);
-            rustler::types::tuple::make_tuple(
-                env,
-                &[
-                    crate::atoms::wal_sync_error().encode(env),
-                    ref_term,
-                    reason.as_str().encode(env),
-                ],
-            )
-        });
+    for caller in callers.drain(..) {
+        match caller.target {
+            FlushTarget::Beam {
+                pid,
+                mut env,
+                saved_ref,
+            } => {
+                let _ = env.send_and_clear(&pid, |env| {
+                    let ref_term = saved_ref.load(env);
+                    rustler::types::tuple::make_tuple(
+                        env,
+                        &[
+                            crate::atoms::wal_sync_error().encode(env),
+                            ref_term,
+                            reason.as_str().encode(env),
+                        ],
+                    )
+                });
+            }
+            #[cfg(test)]
+            FlushTarget::Test(_tx) => {}
+        }
     }
 }
 
@@ -424,6 +456,7 @@ pub fn pread_from_file(file: &mut File, offset: u64, len: u64) -> io::Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use tempfile::NamedTempFile;
 
     struct FailingWriter;
@@ -456,6 +489,42 @@ mod tests {
     impl SyncData for FailingSyncWriter {
         fn sync_data(&mut self) -> io::Result<()> {
             Err(io::Error::new(io::ErrorKind::Other, "forced sync failure"))
+        }
+    }
+
+    struct BlockingSyncWriter {
+        writes: Vec<u8>,
+        sync_started_tx: Sender<()>,
+        release_sync_rx: Receiver<()>,
+        sync_count: Arc<AtomicUsize>,
+    }
+
+    impl Write for BlockingSyncWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SyncData for BlockingSyncWriter {
+        fn sync_data(&mut self) -> io::Result<()> {
+            self.sync_count.fetch_add(1, Ordering::AcqRel);
+            self.sync_started_tx.send(()).unwrap();
+            self.release_sync_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            Ok(())
+        }
+    }
+
+    fn test_flush(tx: Sender<u64>, commit_delay: Duration) -> FlushCaller {
+        FlushCaller {
+            target: FlushTarget::Test(tx),
+            commit_delay,
         }
     }
 
@@ -529,6 +598,83 @@ mod tests {
         assert!(err.to_string().contains("forced sync failure"));
         assert_eq!(file_size.load(Ordering::Acquire), WAL_HEADER_SIZE + 5);
         assert!(!writer.writes.is_empty());
+    }
+
+    #[test]
+    fn sync_cycle_does_not_self_drive_flushes_arriving_during_fdatasync() {
+        let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
+        {
+            let mut guard = buffer.lock().unwrap();
+            guard.extend(b"first");
+        }
+
+        let file_size = Arc::new(AtomicU64::new(0));
+        let (flush_tx, flush_rx) = crossbeam_channel::unbounded();
+        let (first_done_tx, first_done_rx) = crossbeam_channel::bounded(1);
+        let (second_done_tx, second_done_rx) = crossbeam_channel::bounded(1);
+        let (sync_started_tx, sync_started_rx) = crossbeam_channel::bounded(1);
+        let (release_sync_tx, release_sync_rx) = crossbeam_channel::bounded(1);
+        let sync_count = Arc::new(AtomicUsize::new(0));
+
+        let thread_buffer = Arc::clone(&buffer);
+        let thread_file_size = Arc::clone(&file_size);
+        let thread_sync_count = Arc::clone(&sync_count);
+
+        let handle = std::thread::spawn(move || {
+            let mut writer = BlockingSyncWriter {
+                writes: Vec::new(),
+                sync_started_tx,
+                release_sync_rx,
+                sync_count: thread_sync_count,
+            };
+            let mut callers = vec![test_flush(first_done_tx, Duration::ZERO)];
+
+            run_sync_cycle(
+                &mut writer,
+                &thread_buffer,
+                &thread_file_size,
+                &flush_rx,
+                &mut callers,
+                Duration::ZERO,
+            );
+        });
+
+        sync_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        {
+            let mut guard = buffer.lock().unwrap();
+            guard.extend(b"second");
+        }
+        flush_tx
+            .send(ThreadMsg::Flush(test_flush(second_done_tx, Duration::ZERO)))
+            .unwrap();
+
+        release_sync_tx.send(()).unwrap();
+
+        assert_eq!(
+            first_done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            5
+        );
+
+        let second_sync_started = sync_started_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+        if second_sync_started {
+            let _ = release_sync_tx.send(());
+        }
+
+        assert!(
+            !second_sync_started,
+            "flush arriving during fdatasync must wait for the next Erlang-owned sync cycle"
+        );
+        assert!(second_done_rx
+            .recv_timeout(Duration::from_millis(20))
+            .is_err());
+
+        handle.join().unwrap();
+        assert_eq!(sync_count.load(Ordering::Acquire), 1);
     }
 
     /// Helper: create a thread config for testing (no BEAM notifications).

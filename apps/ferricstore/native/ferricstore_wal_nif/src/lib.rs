@@ -7,7 +7,7 @@
 //
 // Architecture:
 //   NIF calls → Mutex<AlignedBuffer> (shared) → FlushRequest channel → Background thread
-//   Background thread: commit_delay → write() → fdatasync() → notify caller
+//   Background thread: adaptive commit_delay → write() → fdatasync() → notify caller
 
 #![allow(clippy::needless_pass_by_value)] // Rustler NIF convention
 
@@ -19,6 +19,7 @@ mod wal_handle;
 mod tests;
 
 use rustler::{Atom, Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, ResourceArc, Term};
+use std::time::Duration;
 use wal_handle::WalHandle;
 
 // WalHandle is registered as a NIF resource via `rustler::resource!` in
@@ -43,7 +44,7 @@ mod atoms {
 // ---------------------------------------------------------------------------
 
 /// Open a WAL file. Spawns background I/O thread.
-/// commit_delay_us: microseconds to wait before fdatasync (default 200)
+/// commit_delay_us: maximum adaptive microseconds to wait before fdatasync (default 6000)
 /// pre_allocate_bytes: fallocate size (default 256MB)
 /// max_buffer_bytes: backpressure limit (default 64MB)
 #[rustler::nif(schedule = "Normal")]
@@ -73,9 +74,7 @@ fn write(handle: ResourceArc<WalHandle>, iodata: Term) -> NifResult<Atom> {
     Ok(atoms::ok())
 }
 
-/// Request async fdatasync. Background thread will flush buffer to disk,
-/// fdatasync, and send {wal_sync_complete, Ref} to CallerPid.
-/// Returns :ok immediately.
+/// Request async fdatasync using the handle's default delay.
 #[rustler::nif(schedule = "Normal")]
 #[allow(unused_variables)]
 fn sync(
@@ -90,7 +89,32 @@ fn sync(
     let owned_env = rustler::OwnedEnv::new();
     let saved_ref = owned_env.save(ref_term);
 
-    handle.request_sync(caller_pid, owned_env, saved_ref)?;
+    handle.request_sync(caller_pid, owned_env, saved_ref, handle.commit_delay())?;
+    Ok(atoms::ok())
+}
+
+/// Request async fdatasync with a per-sync delay selected by the Erlang WAL.
+/// Returns :ok immediately; the background thread replies after fdatasync.
+#[rustler::nif(schedule = "Normal")]
+#[allow(unused_variables)]
+fn sync_with_delay(
+    env: Env,
+    handle: ResourceArc<WalHandle>,
+    caller_pid: LocalPid,
+    ref_term: Term<'_>,
+    delay_us: u64,
+) -> NifResult<Atom> {
+    handle.check_alive()?;
+
+    let owned_env = rustler::OwnedEnv::new();
+    let saved_ref = owned_env.save(ref_term);
+
+    handle.request_sync(
+        caller_pid,
+        owned_env,
+        saved_ref,
+        Duration::from_micros(delay_us),
+    )?;
     Ok(atoms::ok())
 }
 

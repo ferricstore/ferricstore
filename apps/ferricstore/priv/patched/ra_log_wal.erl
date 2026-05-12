@@ -22,8 +22,8 @@
 %%    next sync cycle.
 %%
 %% 4. handle_op({info, {wal_async_sync_complete}}, ...) — when sync completes,
-%%    notifies ALL queued writers (from potentially many batches that accumulated
-%%    during the sync), then starts another sync if more data arrived.
+%%    releases only pending writer batches whose WAL end offset is covered by
+%%    the completed fdatasync, then starts another sync if more data arrived.
 %%
 %% INVARIANT PRESERVED: Writers are ONLY notified AFTER fdatasync completes.
 %% This preserves Raft's durability guarantee — a quorum of nodes must have
@@ -50,7 +50,11 @@
 
 -export([wal2list/1]).
 -export(['__close_file_for_test__'/1,
-         '__wal_write_for_test__'/3]).
+         '__wal_write_for_test__'/3,
+         '__adaptive_commit_delay_us_for_test__'/2,
+         '__next_adaptive_commit_delay_us_for_test__'/4,
+         '__complete_sync_partition_for_test__'/2,
+         '__complete_sync_frontier_for_test__'/3]).
 
 -compile([inline_list_funcs]).
 -compile(inline).
@@ -60,6 +64,7 @@
 -define(CURRENT_VERSION, 1).
 -define(MAGIC, "RAWA").
 -define(HEADER_SIZE, 5).
+-define(WAL_DELAY_FLOOR_US, 200).
 
 -define(C_WAL_FILES, 1).
 -define(C_BATCHES, 2).
@@ -120,7 +125,7 @@
                pre_allocate = false :: boolean(),
                ra_log_snapshot_state_tid :: ets:tid(),
                wal_io_module :: atom() | undefined,
-               wal_commit_delay_us = 200 :: non_neg_integer(),
+               wal_commit_delay_us = 6000 :: non_neg_integer(),
                wal_max_buffer_bytes = 67108864 :: non_neg_integer()
               }).
 
@@ -160,11 +165,25 @@
                 batch :: option(#batch{}),
                 %% --- async fdatasync patch fields ---
                 %% List of {Waiting, WalRanges} tuples queued for writer
-                %% notification after the next fdatasync completes.
+                %% notification by a future fdatasync. Batches appended while
+                %% sync_in_flight=true stay here until the current sync
+                %% completes, then they are covered by the next sync cycle.
                 %% Newest entries are prepended (reversed order).
-                pending_sync = [] :: [{map(), map()}],
+                pending_sync = [] :: [{map(), map(), non_neg_integer()}],
+                %% Batches covered by the currently in-flight fdatasync. Only
+                %% this set may be notified when that fdatasync completes.
+                syncing_sync = [] :: [{map(), map(), non_neg_integer()}],
                 %% True when a spawned process is currently running fdatasync.
-                sync_in_flight = false :: boolean()
+                sync_in_flight = false :: boolean(),
+                %% Monotonic timestamp for the current async fdatasync. Used only
+                %% for low-cardinality telemetry so SET p99 can be profiled.
+                sync_started_at = undefined :: undefined | integer(),
+                %% Adaptive per-sync delay selected when fdatasync is requested.
+                sync_delay_us = 0 :: non_neg_integer(),
+                %% Delay to try for the next fdatasync. This is adjusted from
+                %% completion pressure: queued batches ramp it up, idle syncs
+                %% decay it back to the low-latency floor.
+                sync_next_delay_us = ?WAL_DELAY_FLOOR_US :: non_neg_integer()
                }).
 
 -type state() :: #state{}.
@@ -349,7 +368,7 @@ init(#{system := System,
                            ?COUNTER_FIELDS,
                            #{ra_system => System, module => ?MODULE}),
     WalIoModule = maps:get(wal_io_module, Conf0, undefined),
-    WalCommitDelayUs = maps:get(wal_commit_delay_us, Conf0, 200),
+    WalCommitDelayUs = maps:get(wal_commit_delay_us, Conf0, 6000),
     WalMaxBufferBytes = maps:get(wal_max_buffer_bytes, Conf0, 64 * 1024 * 1024),
     Conf = #conf{dir = Dir,
                  system = System,
@@ -405,7 +424,9 @@ format_status(#state{conf = #conf{sync_method = SyncMeth,
                                   max_size_bytes = MaxSize},
                      writers = Writers,
                      pending_sync = PendingSync,
+                     syncing_sync = SyncingSync,
                      sync_in_flight = SyncInFlight,
+                     sync_next_delay_us = NextDelayUs,
                      wal = #wal{file_size = FSize,
                                 filename = Fn}}) ->
     #{sync_method => SyncMeth,
@@ -415,9 +436,11 @@ format_status(#state{conf = #conf{sync_method = SyncMeth,
       current_size => FSize,
       max_size_bytes => MaxSize,
       counters => ra_counters:overview(WalName),
-      %% PATCHED: expose async sync state
-      async_sync => #{pending_batches => length(PendingSync),
-                      sync_in_flight => SyncInFlight}
+                     %% PATCHED: expose async sync state
+                     async_sync => #{pending_batches => length(PendingSync),
+                      syncing_batches => length(SyncingSync),
+                      sync_in_flight => SyncInFlight,
+                      next_delay_us => NextDelayUs}
      }.
 
 %% Internal
@@ -432,25 +455,32 @@ handle_op({call, From, {last_writer_seq, UId}},
 %% gen_batch_server wraps info messages as {info, Msg} before passing them
 %% to the module's ops processing. When our spawned sync process sends
 %% {wal_async_sync_complete} back to this process, it arrives here.
+handle_op({info, {wal_async_sync_complete, SyncedFileSize}},
+          {#state{} = State0, Actions}) ->
+    emit_wal_sync_telemetry(State0, ok, SyncedFileSize),
+    State2 = complete_async_sync(State0, SyncedFileSize),
+    State3 = maybe_start_async_sync(State2),
+    {State3, Actions};
 handle_op({info, {wal_async_sync_complete}},
           {#state{} = State0, Actions}) ->
-    State1 = State0#state{sync_in_flight = false},
-    State2 = notify_all_pending(State1),
-    State3 = case State2#state.pending_sync of
-                 [] -> State2;
-                 _ -> maybe_start_async_sync(State2)
-             end,
+    emit_wal_sync_telemetry(State0, ok),
+    State2 = complete_async_sync(State0, undefined),
+    State3 = maybe_start_async_sync(State2),
+    {State3, Actions};
+handle_op({info, {wal_sync_complete, _Ref, SyncedFileSize}},
+          {#state{} = State0, Actions}) ->
+    emit_wal_sync_telemetry(State0, ok, SyncedFileSize),
+    State2 = complete_async_sync(State0, SyncedFileSize),
+    State3 = maybe_start_async_sync(State2),
     {State3, Actions};
 handle_op({info, {wal_sync_complete, _Ref}},
           {#state{} = State0, Actions}) ->
-    State1 = State0#state{sync_in_flight = false},
-    State2 = notify_all_pending(State1),
-    State3 = case State2#state.pending_sync of
-                 [] -> State2;
-                 _ -> maybe_start_async_sync(State2)
-             end,
+    emit_wal_sync_telemetry(State0, ok),
+    State2 = complete_async_sync(State0, undefined),
+    State3 = maybe_start_async_sync(State2),
     {State3, Actions};
-handle_op({info, {wal_sync_error, _Ref, Reason}}, _State) ->
+handle_op({info, {wal_sync_error, _Ref, Reason}}, {#state{} = State0, _Actions}) ->
+    emit_wal_sync_telemetry(State0, error),
     throw({stop, {wal_sync_failed, Reason}});
 handle_op({info, {'EXIT', _, normal}}, {State, Actions}) ->
     {State, Actions};
@@ -545,7 +575,8 @@ cleanup(#state{wal = #wal{fd = undefined}}) ->
     ok;
 cleanup(#state{wal = #wal{fd = Fd},
                conf = #conf{wal_io_module = IoMod,
-                            sync_method = SyncMeth}}) ->
+                            sync_method = SyncMeth}} = State) ->
+    _ = drain_pending_sync(State),
     ok = wal_sync_blocking(IoMod, Fd, SyncMeth),
     ok = close_file(Fd),
     ok.
@@ -720,35 +751,37 @@ complete_batch_and_roll(#state{} = State0) ->
 %% Synchronously drain any pending async sync. Called before WAL rollover
 %% and during terminate to ensure all writers are notified.
 drain_pending_sync(#state{pending_sync = [],
+                          syncing_sync = [],
                           sync_in_flight = false} = State) ->
     State;
+drain_pending_sync(#state{sync_in_flight = true} = State) ->
+    SyncResult = wait_for_sync_complete(),
+    State2 = case SyncResult of
+                 {ok, SyncedFileSize} ->
+                     complete_async_sync(State, SyncedFileSize);
+                 ok ->
+                     complete_async_sync(State, undefined)
+             end,
+    drain_pending_sync(State2);
 drain_pending_sync(#state{wal = #wal{fd = Fd},
                           conf = #conf{sync_method = SyncMeth,
                                        wal_io_module = IoMod},
-                          sync_in_flight = true,
                           pending_sync = Pending} = State) when Pending =/= [] ->
-    wait_for_sync_complete(),
     wal_sync_blocking(IoMod, Fd, SyncMeth),
-    State1 = State#state{sync_in_flight = false},
-    notify_all_pending(State1);
+    drain_pending_sync(notify_all_pending(State));
 drain_pending_sync(#state{wal = #wal{fd = Fd},
                           conf = #conf{sync_method = SyncMeth,
                                        wal_io_module = IoMod},
                           sync_in_flight = false,
-                          pending_sync = Pending} = State) when Pending =/= [] ->
+                          syncing_sync = Syncing} = State) when Syncing =/= [] ->
     wal_sync_blocking(IoMod, Fd, SyncMeth),
-    notify_all_pending(State#state{sync_in_flight = false});
-drain_pending_sync(#state{sync_in_flight = true,
-                          wal = #wal{fd = Fd},
-                          conf = #conf{sync_method = SyncMeth,
-                                       wal_io_module = IoMod}} = State) ->
-    wait_for_sync_complete(),
-    wal_sync_blocking(IoMod, Fd, SyncMeth),
-    State#state{sync_in_flight = false}.
+    drain_pending_sync(notify_syncing_pending(State#state{sync_in_flight = false})).
 
 wait_for_sync_complete() ->
     receive
+        {wal_async_sync_complete, SyncedFileSize} -> {ok, SyncedFileSize};
         {wal_async_sync_complete} -> ok;
+        {wal_sync_complete, _Ref, SyncedFileSize} -> {ok, SyncedFileSize};
         {wal_sync_complete, _Ref} -> ok;
         {wal_sync_error, _Ref, Reason} -> throw({stop, {wal_sync_failed, Reason}})
     after 30000 -> throw({stop, wal_sync_timeout})
@@ -758,8 +791,9 @@ wal_sync_blocking(undefined, Fd, SyncMeth) ->
     sync(Fd, SyncMeth);
 wal_sync_blocking(IoMod, Handle, _SyncMeth) ->
     Ref = make_ref(),
-    ok = IoMod:sync(Handle, self(), Ref),
+    ok = wal_sync_async(IoMod, Handle, self(), Ref, 0),
     receive
+        {wal_sync_complete, Ref, _SyncedFileSize} -> ok;
         {wal_sync_complete, Ref} -> ok;
         {wal_sync_error, Ref, Reason} -> throw({stop, {wal_sync_failed, Reason}})
     after 30000 ->
@@ -1006,7 +1040,11 @@ complete_batch(#state{batch = #batch{waiting = Waiting,
     %% DON'T notify writers yet — queue them for after the next fdatasync.
     %% We capture {Waiting, CurrentRanges} so that notify_all_pending can
     %% properly update the WAL ranges when it processes these.
-    NewPending = [{Waiting, Wal#wal.ranges} | PendingSync],
+    %% The WAL end offset lets the async completion release every batch
+    %% actually covered by the fdatasync. That keeps the 200us delay useful:
+    %% batches that arrive during the delay can be acknowledged by the same
+    %% sync, while batches that arrive during fdatasync stay queued.
+    NewPending = [{Waiting, Wal#wal.ranges, Wal#wal.file_size} | PendingSync],
 
     %% Try to start an async sync if not already running.
     maybe_start_async_sync(State#state{pending_sync = NewPending}).
@@ -1023,39 +1061,237 @@ maybe_start_async_sync(#state{conf = #conf{sync_method = none}} = State) ->
     notify_all_pending(State);
 maybe_start_async_sync(#state{wal = #wal{fd = Fd, filename = Filename},
                                conf = #conf{sync_method = SyncMeth,
-                                            wal_io_module = IoMod}} = State) ->
+                                            wal_io_module = IoMod,
+                                            wal_commit_delay_us = MaxDelayUs},
+                               sync_next_delay_us = NextDelayUs,
+                               pending_sync = PendingSync} = State) ->
     Self = self(),
+    StartedAt = erlang:monotonic_time(),
+    DelayUs = adaptive_commit_delay_us(MaxDelayUs, length(PendingSync), NextDelayUs),
+    SyncTargetFileSize = max_pending_end_file_size(PendingSync),
     case IoMod of
         undefined ->
             spawn_link(fun() ->
+                maybe_sleep_us(DelayUs),
                 {ok, SyncFd} = file:open(Filename, [raw, write, binary]),
                 ok = file:SyncMeth(SyncFd),
                 ok = file:close(SyncFd),
-                Self ! {wal_async_sync_complete}
+                Self ! {wal_async_sync_complete, SyncTargetFileSize}
             end);
         _Mod ->
             Ref = make_ref(),
-            ok = IoMod:sync(Fd, Self, Ref)
+            ok = wal_sync_async(IoMod, Fd, Self, Ref, DelayUs)
     end,
-    State#state{sync_in_flight = true}.
+    State#state{sync_in_flight = true,
+                sync_started_at = StartedAt,
+                sync_delay_us = DelayUs,
+                pending_sync = [],
+                syncing_sync = PendingSync}.
 
-%% PATCHED: notify all writers queued in pending_sync.
+wal_sync_async(IoMod, Handle, Pid, Ref, DelayUs) ->
+    case erlang:function_exported(IoMod, sync_with_delay, 4) of
+        true -> IoMod:sync_with_delay(Handle, Pid, Ref, DelayUs);
+        false -> IoMod:sync(Handle, Pid, Ref)
+    end.
+
+adaptive_commit_delay_us(MaxDelayUs, PendingBatches)
+  when is_integer(MaxDelayUs) ->
+    adaptive_commit_delay_us(MaxDelayUs, PendingBatches,
+                             min(MaxDelayUs, ?WAL_DELAY_FLOOR_US));
+adaptive_commit_delay_us(_MaxDelayUs, _PendingBatches) ->
+    0.
+
+adaptive_commit_delay_us(MaxDelayUs, PendingBatches, _NextDelayUs)
+  when is_integer(MaxDelayUs), MaxDelayUs =< 0;
+       not is_integer(PendingBatches) ->
+    0;
+adaptive_commit_delay_us(MaxDelayUs, PendingBatches, NextDelayUs)
+  when is_integer(MaxDelayUs), MaxDelayUs > 0, PendingBatches =< 1 ->
+    min(MaxDelayUs, max(?WAL_DELAY_FLOOR_US, NextDelayUs));
+adaptive_commit_delay_us(MaxDelayUs, PendingBatches, NextDelayUs)
+  when is_integer(MaxDelayUs), MaxDelayUs > 0, PendingBatches =< 4 ->
+    min(MaxDelayUs, max(1000, NextDelayUs));
+adaptive_commit_delay_us(MaxDelayUs, PendingBatches, NextDelayUs)
+  when is_integer(MaxDelayUs), MaxDelayUs > 0, PendingBatches =< 16 ->
+    min(MaxDelayUs, max(3000, NextDelayUs));
+adaptive_commit_delay_us(MaxDelayUs, _PendingBatches, _NextDelayUs)
+  when is_integer(MaxDelayUs), MaxDelayUs > 0 ->
+    MaxDelayUs;
+adaptive_commit_delay_us(_MaxDelayUs, _PendingBatches, _NextDelayUs) ->
+    0.
+
+'__adaptive_commit_delay_us_for_test__'(MaxDelayUs, PendingBatches) ->
+    adaptive_commit_delay_us(MaxDelayUs, PendingBatches).
+
+next_adaptive_commit_delay_us(MaxDelayUs, _CurrentDelayUs, _ReleasedBatches, _QueuedBatches)
+  when not is_integer(MaxDelayUs); MaxDelayUs =< 0 ->
+    0;
+next_adaptive_commit_delay_us(MaxDelayUs, CurrentDelayUs, _ReleasedBatches, QueuedBatches)
+  when is_integer(QueuedBatches), QueuedBatches > 0 ->
+    min(MaxDelayUs, max(1000, max(?WAL_DELAY_FLOOR_US, CurrentDelayUs) * 2));
+next_adaptive_commit_delay_us(MaxDelayUs, CurrentDelayUs, _ReleasedBatches, _QueuedBatches) ->
+    min(MaxDelayUs, max(?WAL_DELAY_FLOOR_US, CurrentDelayUs div 2)).
+
+'__next_adaptive_commit_delay_us_for_test__'(MaxDelayUs,
+                                             CurrentDelayUs,
+                                             ReleasedBatches,
+                                             QueuedBatches) ->
+    next_adaptive_commit_delay_us(MaxDelayUs,
+                                  CurrentDelayUs,
+                                  ReleasedBatches,
+                                  QueuedBatches).
+
+maybe_sleep_us(DelayUs) when is_integer(DelayUs), DelayUs > 0 ->
+    timer:sleep(max(1, DelayUs div 1000));
+maybe_sleep_us(_DelayUs) ->
+    ok.
+
+emit_wal_sync_telemetry(State, Status) ->
+    emit_wal_sync_telemetry(State, Status, undefined).
+
+emit_wal_sync_telemetry(#state{sync_started_at = StartedAt,
+                               sync_delay_us = DelayUs} = State,
+                        Status,
+                        SyncedFileSize) ->
+    Now = erlang:monotonic_time(),
+    DurationUs = case StartedAt of
+                     undefined -> 0;
+                     _ -> erlang:convert_time_unit(max(Now - StartedAt, 0),
+                                                   native,
+                                                   microsecond)
+                 end,
+    {ReleasedBatches, QueuedBatches} = sync_batch_counts(State, SyncedFileSize),
+    telemetry:execute([ferricstore, wal, sync],
+                      #{duration_us => DurationUs,
+                        pending_batches => ReleasedBatches,
+                        queued_batches => QueuedBatches,
+                        delay_us => DelayUs},
+                      #{status => Status}),
+    ok.
+
+%% PATCHED: notify writers covered by the just-completed fdatasync.
+%% Batches that arrived while the sync was in flight remain in pending_sync
+%% and must be covered by a later fdatasync before they are released.
+notify_syncing_pending(#state{syncing_sync = []} = State) ->
+    State;
+notify_syncing_pending(#state{syncing_sync = SyncingPending} = State) ->
+    State1 = notify_pending_batches(SyncingPending, State),
+    State1#state{syncing_sync = []}.
+
+release_synced_pending(#state{syncing_sync = SyncingSync,
+                              pending_sync = PendingSync} = State,
+                       SyncedFileSize)
+  when is_integer(SyncedFileSize), SyncedFileSize >= 0 ->
+    {Covered, Deferred} = split_synced_pending(PendingSync ++ SyncingSync,
+                                               SyncedFileSize),
+    State1 = notify_pending_batches(Covered, State),
+    State1#state{syncing_sync = [],
+                 pending_sync = Deferred};
+release_synced_pending(State, _SyncedFileSize) ->
+    notify_syncing_pending(State).
+
+complete_async_sync(#state{conf = #conf{wal_commit_delay_us = MaxDelayUs},
+                           sync_delay_us = CurrentDelayUs} = State0,
+                    SyncedFileSize) ->
+    {ReleasedBatches, QueuedBatches} = sync_batch_counts(State0, SyncedFileSize),
+    NextDelayUs = next_adaptive_commit_delay_us(MaxDelayUs,
+                                                CurrentDelayUs,
+                                                ReleasedBatches,
+                                                QueuedBatches),
+    State1 = State0#state{sync_in_flight = false,
+                          sync_started_at = undefined,
+                          sync_delay_us = 0,
+                          sync_next_delay_us = NextDelayUs},
+    case SyncedFileSize of
+        Pos when is_integer(Pos), Pos >= 0 ->
+            release_synced_pending(State1, Pos);
+        _ ->
+            notify_syncing_pending(State1)
+    end.
+
+%% PATCHED: notify all writers queued in pending_sync. Used only for
+%% sync_method=none and synchronous drain paths that explicitly synced after
+%% all pending writes were already flushed to the WAL I/O layer.
 %% Called after fdatasync completes (or immediately for sync_method=none).
 notify_all_pending(#state{pending_sync = []} = State) ->
     State;
-notify_all_pending(#state{pending_sync = PendingBatches,
-                          wal = Wal} = State) ->
+notify_all_pending(#state{pending_sync = PendingBatches} = State) ->
+    State1 = notify_pending_batches(PendingBatches, State),
+    State1#state{pending_sync = []}.
+
+notify_pending_batches([], State) ->
+    State;
+notify_pending_batches(PendingBatches, #state{wal = Wal} = State) ->
     %% Process all queued batches in order (oldest first — reverse the list
     %% since we prepend newest).
     FinalRanges = lists:foldl(
-        fun({Waiting, _BatchRanges}, AccRanges) ->
+        fun(PendingBatch, AccRanges) ->
+            Waiting = pending_waiting(PendingBatch),
             maps:fold(fun(Pid, BatchWriter, Acc) ->
                 complete_batch_writer(Pid, BatchWriter, Acc)
             end, AccRanges, Waiting)
         end, Wal#wal.ranges, lists:reverse(PendingBatches)),
 
-    State#state{pending_sync = [],
-                wal = Wal#wal{ranges = FinalRanges}}.
+    State#state{wal = Wal#wal{ranges = FinalRanges}}.
+
+split_synced_pending(PendingBatches, SyncedFileSize) ->
+    lists:partition(
+      fun(PendingBatch) ->
+              pending_end_file_size(PendingBatch) =< SyncedFileSize
+      end, PendingBatches).
+
+sync_batch_counts(#state{syncing_sync = SyncingSync,
+                         pending_sync = PendingSync}, SyncedFileSize)
+  when is_integer(SyncedFileSize), SyncedFileSize >= 0 ->
+    {Covered, Deferred} = split_synced_pending(PendingSync ++ SyncingSync,
+                                               SyncedFileSize),
+    {length(Covered), length(Deferred)};
+sync_batch_counts(#state{syncing_sync = SyncingSync,
+                         pending_sync = PendingSync}, _SyncedFileSize) ->
+    {length(SyncingSync), length(PendingSync)}.
+
+pending_waiting({Waiting, _BatchRanges, _EndFileSize}) ->
+    Waiting;
+pending_waiting({Waiting, _BatchRanges}) ->
+    Waiting.
+
+pending_end_file_size({_Waiting, _BatchRanges, EndFileSize}) ->
+    EndFileSize;
+pending_end_file_size({_Waiting, _BatchRanges}) ->
+    0.
+
+max_pending_end_file_size([]) ->
+    0;
+max_pending_end_file_size(PendingBatches) ->
+    lists:max([pending_end_file_size(PendingBatch) || PendingBatch <- PendingBatches]).
+
+'__complete_sync_partition_for_test__'(SyncingCount, PendingCount)
+  when is_integer(SyncingCount), SyncingCount >= 0,
+       is_integer(PendingCount), PendingCount >= 0 ->
+    State0 = #state{wal = #wal{ranges = #{}},
+                    syncing_sync = make_empty_pending_batches(SyncingCount),
+                    pending_sync = make_empty_pending_batches(PendingCount)},
+    State = notify_syncing_pending(State0),
+    {SyncingCount - length(State#state.syncing_sync),
+     length(State#state.pending_sync)}.
+
+'__complete_sync_frontier_for_test__'(SyncingEnds, PendingEnds, SyncedFileSize)
+  when is_list(SyncingEnds), is_list(PendingEnds),
+       is_integer(SyncedFileSize), SyncedFileSize >= 0 ->
+    State0 = #state{wal = #wal{ranges = #{}},
+                    syncing_sync = make_pending_batches_with_ends(SyncingEnds),
+                    pending_sync = make_pending_batches_with_ends(PendingEnds)},
+    {Covered, Deferred} = split_synced_pending(State0#state.pending_sync ++
+                                               State0#state.syncing_sync,
+                                               SyncedFileSize),
+    {length(Covered), [pending_end_file_size(PendingBatch) ||
+                       PendingBatch <- Deferred]}.
+
+make_empty_pending_batches(Count) ->
+    lists:duplicate(Count, {#{}, #{}, 0}).
+
+make_pending_batches_with_ends(Ends) ->
+    [{#{}, #{}, End} || End <- Ends].
 
 complete_batch_writer(Pid, #batch_writer{smallest_live_idx = SmallestIdx,
                                          tid = MtTid,
