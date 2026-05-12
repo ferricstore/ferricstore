@@ -2348,21 +2348,15 @@ defmodule Ferricstore.Store.Router do
     # per-key {:put, ...} commands or run a separate pre-map pass. Do not
     # re-expand this to generic commands unless a benchmark and apply-path audit
     # show the specialized term is no longer the faster shape.
-    {by_shard, count, by_shard_entries} =
+    {by_shard, count} =
       entries
-      |> Enum.reduce({%{}, 0, %{}}, fn entry, {shards, i, entries_map} ->
+      |> Enum.reduce({%{}, 0}, fn entry, {shards, i} ->
         {key, value, expire_at_ms} = normalize_put_batch_entry(entry)
         idx = shard_for(ctx, key)
         entry = Map.get(shards, idx, {[], []})
         {entries_acc, indices} = entry
-        shards = Map.put(shards, idx, {[{key, value, expire_at_ms} | entries_acc], [i | indices]})
 
-        entries_map =
-          Map.update(entries_map, idx, [{key, value, expire_at_ms}], fn acc ->
-            [{key, value, expire_at_ms} | acc]
-          end)
-
-        {shards, i + 1, entries_map}
+        {Map.put(shards, idx, {[{key, value, expire_at_ms} | entries_acc], [i | indices]}), i + 1}
       end)
 
     shard_refs =
@@ -2390,16 +2384,16 @@ defmodule Ferricstore.Store.Router do
     # Per-shard not_leader → forward that shard's slice to its hinted leader.
     # Each shard reports independently; we re-issue just the failing shard.
     results =
-      Enum.reduce(by_shard_entries, results, fn {shard_idx, entries}, acc ->
+      Enum.reduce(by_shard, results, fn {shard_idx, {entries, indices}}, acc ->
         # All indices for this shard share the same shard-level reply
-        first_index = Map.get(by_shard, shard_idx) |> elem(1) |> List.last()
+        first_index = List.last(indices)
 
         case Map.get(acc, first_index) do
           {:error, {:not_leader, {_shard_name, leader_node}}} when is_atom(leader_node) ->
-            merge_forwarded(acc, by_shard, shard_idx, entries, leader_node, ctx)
+            merge_forwarded(acc, shard_idx, entries, indices, leader_node, ctx)
 
           {:error, {:not_leader, leader_node}} when is_atom(leader_node) ->
-            merge_forwarded(acc, by_shard, shard_idx, entries, leader_node, ctx)
+            merge_forwarded(acc, shard_idx, entries, indices, leader_node, ctx)
 
           _ ->
             acc
@@ -2420,17 +2414,13 @@ defmodule Ferricstore.Store.Router do
   defp do_batch_quorum_delete_keys(ctx, keys, origin_node) do
     wv_size = :counters.info(ctx.write_version).size
 
-    {by_shard, count, by_shard_keys} =
+    {by_shard, count} =
       keys
-      |> Enum.reduce({%{}, 0, %{}}, fn key, {shards, i, keys_map} ->
+      |> Enum.reduce({%{}, 0}, fn key, {shards, i} ->
         idx = shard_for(ctx, key)
         {keys_acc, indices} = Map.get(shards, idx, {[], []})
 
-        {
-          Map.put(shards, idx, {[key | keys_acc], [i | indices]}),
-          i + 1,
-          Map.update(keys_map, idx, [key], fn acc -> [key | acc] end)
-        }
+        {Map.put(shards, idx, {[key | keys_acc], [i | indices]}), i + 1}
       end)
 
     shard_refs =
@@ -2456,16 +2446,15 @@ defmodule Ferricstore.Store.Router do
       collect_shard_replies(shard_refs, wv_size, ctx, %{}, System.monotonic_time(:millisecond))
 
     results =
-      Enum.reduce(by_shard_keys, results, fn {shard_idx, keys}, acc ->
-        {_keys, indices} = Map.fetch!(by_shard, shard_idx)
+      Enum.reduce(by_shard, results, fn {shard_idx, {keys, indices}}, acc ->
         first_index = List.last(indices)
 
         case Map.get(acc, first_index) do
           {:error, {:not_leader, {_shard_name, leader_node}}} when is_atom(leader_node) ->
-            merge_forwarded_deletes(acc, by_shard, shard_idx, keys, leader_node, ctx)
+            merge_forwarded_deletes(acc, shard_idx, keys, indices, leader_node, ctx)
 
           {:error, {:not_leader, leader_node}} when is_atom(leader_node) ->
-            merge_forwarded_deletes(acc, by_shard, shard_idx, keys, leader_node, ctx)
+            merge_forwarded_deletes(acc, shard_idx, keys, indices, leader_node, ctx)
 
           _ ->
             acc
@@ -2476,8 +2465,7 @@ defmodule Ferricstore.Store.Router do
     |> Enum.map(fn i -> Map.get(results, i, ErrorReasons.write_timeout_unknown()) end)
   end
 
-  defp merge_forwarded(acc, by_shard, shard_idx, entries, leader_node, ctx) do
-    {_, indices} = Map.fetch!(by_shard, shard_idx)
+  defp merge_forwarded(acc, shard_idx, entries, indices, leader_node, ctx) do
     indices = Enum.reverse(indices)
     new_results = forward_batch_to_leader(ctx, leader_node, shard_idx, Enum.reverse(entries))
 
@@ -2496,8 +2484,7 @@ defmodule Ferricstore.Store.Router do
     |> Enum.reduce(acc, fn {i, r}, a -> Map.put(a, i, r) end)
   end
 
-  defp merge_forwarded_deletes(acc, by_shard, shard_idx, keys, leader_node, ctx) do
-    {_, indices} = Map.fetch!(by_shard, shard_idx)
+  defp merge_forwarded_deletes(acc, shard_idx, keys, indices, leader_node, ctx) do
     indices = Enum.reverse(indices)
     new_results = forward_delete_batch_to_leader(ctx, leader_node, shard_idx, Enum.reverse(keys))
 

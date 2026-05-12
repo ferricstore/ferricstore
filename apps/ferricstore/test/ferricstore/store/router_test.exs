@@ -99,6 +99,21 @@ defmodule Ferricstore.Store.RouterTest do
     end
   end
 
+  describe "direct batch grouping allocation guard" do
+    test "put/delete direct batch paths keep one per-shard grouping structure" do
+      source = File.read!("lib/ferricstore/store/router.ex")
+      {:ok, ast} = Code.string_to_quoted(source)
+
+      put_vars = private_function_var_names(ast, :do_batch_quorum_put_entries, 3)
+      delete_vars = private_function_var_names(ast, :do_batch_quorum_delete_keys, 3)
+
+      refute :by_shard_entries in put_vars
+      refute :entries_map in put_vars
+      refute :by_shard_keys in delete_vars
+      refute :keys_map in delete_vars
+    end
+  end
+
   describe "async list timeout classification" do
     test "list worker timeout is reported as unknown outcome" do
       source = File.read!("lib/ferricstore/store/router.ex")
@@ -154,5 +169,29 @@ defmodule Ferricstore.Store.RouterTest do
       refute Router.get_with_file_ref(ctx, key) == {:cold_ref, path, value_offset, size}
       refute Router.get(ctx, key) == value
     end
+  end
+
+  defp private_function_var_names(ast, function_name, arity) do
+    {_ast, vars} =
+      Macro.prewalk(ast, MapSet.new(), fn
+        {:defp, _meta, [{^function_name, _call_meta, args}, body]} = node, acc
+        when length(args) == arity ->
+          {_body, function_vars} =
+            Macro.prewalk(body, MapSet.new(), fn
+              {var, _meta, context} = var_node, var_acc
+              when is_atom(var) and is_atom(context) ->
+                {var_node, MapSet.put(var_acc, var)}
+
+              node, var_acc ->
+                {node, var_acc}
+            end)
+
+          {node, MapSet.union(acc, function_vars)}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    MapSet.to_list(vars)
   end
 end
