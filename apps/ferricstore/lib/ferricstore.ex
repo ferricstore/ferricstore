@@ -855,7 +855,8 @@ defmodule FerricStore do
 
   Default reads use the hot history index, bounded by `:history_hot_max_events`.
   Pass `include_cold: true` to include older history projected into LMDB.
-  Pass `consistent_projection: true` to flush the async projection first.
+  When async history is enabled, reads flush the async projection by default.
+  Pass `consistent_projection: false` to allow briefly stale history reads.
 
   History caps are set when the Flow is created. Defaults are
   `history_hot_max_events: 1024` and `history_max_events: 100000`; hard caps are

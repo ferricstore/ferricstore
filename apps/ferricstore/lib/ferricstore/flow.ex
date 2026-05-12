@@ -38,7 +38,11 @@ defmodule Ferricstore.Flow do
         Router.flow_create(ctx, attrs)
       end
 
-    observe_flow(:create, started, result, %{flow_id: id})
+    observe_flow(:create, started, result, %{
+      flow_id: id,
+      flow_type: Keyword.get(opts, :type),
+      _count: 1
+    })
   end
 
   @doc false
@@ -90,7 +94,11 @@ defmodule Ferricstore.Flow do
         Router.flow_create_many(ctx, partition_key, attrs_list)
       end
 
-    observe_flow(:create, started, result, %{flow_id: nil})
+    observe_flow(:create, started, result, %{
+      flow_id: nil,
+      flow_type: Keyword.get(opts, :type),
+      _count: length(items)
+    })
   end
 
   def create_many(_ctx, _partition_key, _items, _opts),
@@ -105,7 +113,7 @@ defmodule Ferricstore.Flow do
         Router.flow_spawn_children(ctx, attrs)
       end
 
-    observe_flow(:spawn_children, started, result, %{flow_id: parent_id})
+    observe_flow(:spawn_children, started, result, %{flow_id: parent_id, _count: 1})
   end
 
   def spawn_children(_ctx, parent_id, _children, _opts) when not is_binary(parent_id),
@@ -294,7 +302,7 @@ defmodule Ferricstore.Flow do
         Router.flow_extend_lease(ctx, attrs)
       end
 
-    observe_flow(:extend_lease, started, result, %{flow_id: id})
+    observe_flow(:extend_lease, started, result, %{flow_id: id, _count: 1})
   end
 
   def complete(ctx, id, lease_token, opts \\ [])
@@ -306,7 +314,7 @@ defmodule Ferricstore.Flow do
         Router.flow_complete(ctx, attrs)
       end
 
-    observe_flow(:complete, started, result, %{flow_id: id})
+    observe_flow(:complete, started, result, %{flow_id: id, _count: 1})
   end
 
   def complete_many(ctx, partition_key, items, opts)
@@ -321,7 +329,7 @@ defmodule Ferricstore.Flow do
         Router.flow_complete_many(ctx, partition_key, attrs_list)
       end
 
-    observe_flow(:complete, started, result, %{flow_id: nil})
+    observe_flow(:complete, started, result, %{flow_id: nil, _count: length(items)})
   end
 
   def complete_many(_ctx, _partition_key, _items, _opts),
@@ -339,7 +347,8 @@ defmodule Ferricstore.Flow do
     observe_flow(:transition, started, result, %{
       flow_id: id,
       from_state: from_state,
-      to_state: to_state
+      to_state: to_state,
+      _count: 1
     })
   end
 
@@ -359,7 +368,8 @@ defmodule Ferricstore.Flow do
     observe_flow(:transition, started, result, %{
       flow_id: nil,
       from_state: from_state,
-      to_state: to_state
+      to_state: to_state,
+      _count: length(items)
     })
   end
 
@@ -536,7 +546,7 @@ defmodule Ferricstore.Flow do
         Router.flow_retry(ctx, attrs)
       end
 
-    observe_flow(:retry, started, result, %{flow_id: id})
+    observe_flow(:retry, started, result, %{flow_id: id, _count: 1})
   end
 
   def retry_many(ctx, partition_key, items, opts) when is_list(items) and is_list(opts) do
@@ -550,7 +560,7 @@ defmodule Ferricstore.Flow do
         Router.flow_retry_many(ctx, partition_key, attrs_list)
       end
 
-    observe_flow(:retry, started, result, %{flow_id: nil})
+    observe_flow(:retry, started, result, %{flow_id: nil, _count: length(items)})
   end
 
   def retry_many(_ctx, _partition_key, _items, _opts),
@@ -565,7 +575,7 @@ defmodule Ferricstore.Flow do
         Router.flow_fail(ctx, attrs)
       end
 
-    observe_flow(:fail, started, result, %{flow_id: id})
+    observe_flow(:fail, started, result, %{flow_id: id, _count: 1})
   end
 
   def fail_many(ctx, partition_key, items, opts) when is_list(items) and is_list(opts) do
@@ -579,7 +589,7 @@ defmodule Ferricstore.Flow do
         Router.flow_fail_many(ctx, partition_key, attrs_list)
       end
 
-    observe_flow(:fail, started, result, %{flow_id: nil})
+    observe_flow(:fail, started, result, %{flow_id: nil, _count: length(items)})
   end
 
   def fail_many(_ctx, _partition_key, _items, _opts),
@@ -593,7 +603,7 @@ defmodule Ferricstore.Flow do
         Router.flow_cancel(ctx, attrs)
       end
 
-    observe_flow(:cancel, started, result, %{flow_id: id})
+    observe_flow(:cancel, started, result, %{flow_id: id, _count: 1})
   end
 
   def cancel_many(ctx, partition_key, items, opts) when is_list(items) and is_list(opts) do
@@ -607,7 +617,7 @@ defmodule Ferricstore.Flow do
         Router.flow_cancel_many(ctx, partition_key, attrs_list)
       end
 
-    observe_flow(:cancel, started, result, %{flow_id: nil})
+    observe_flow(:cancel, started, result, %{flow_id: nil, _count: length(items)})
   end
 
   def cancel_many(_ctx, _partition_key, _items, _opts),
@@ -638,7 +648,7 @@ defmodule Ferricstore.Flow do
         Router.flow_rewind(ctx, attrs)
       end
 
-    observe_flow(:rewind, started, result, %{flow_id: id})
+    observe_flow(:rewind, started, result, %{flow_id: id, _count: 1})
   end
 
   def list(ctx, type, opts \\ [])
@@ -883,7 +893,7 @@ defmodule Ferricstore.Flow do
          :ok <- validate_key_size(history_key),
          {:ok, count} <- flow_count(opts),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
-         {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, true),
          {:ok, value_return} <- history_value_return_opts(opts),
          {:ok, query} <- flow_history_query_opts(opts, count) do
       flow_history_read(
@@ -892,7 +902,7 @@ defmodule Ferricstore.Flow do
         partition_key,
         history_key,
         query,
-        include_cold? or consistent_projection?,
+        include_cold?,
         consistent_projection?,
         value_return
       )
@@ -911,33 +921,35 @@ defmodule Ferricstore.Flow do
          history_key,
          query,
          false,
-         _consistent?,
+         consistent?,
          value_return
        ) do
-    if flow_history_state_exists?(ctx, id, partition_key) do
-      fetch_count = flow_history_query_fetch_count(query)
+    with :ok <- flow_maybe_flush_history_projector(ctx, history_key, consistent?) do
+      if flow_history_state_exists?(ctx, id, partition_key) do
+        fetch_count = flow_history_query_fetch_count(query)
 
-      case flow_history_hot_refs(ctx, id, partition_key, history_key, fetch_count) do
-        {:ok, []} ->
-          flow_history_fallback_scan(ctx, history_key, query, value_return)
+        case flow_history_hot_refs(ctx, id, partition_key, history_key, fetch_count) do
+          {:ok, []} ->
+            flow_history_fallback_scan(ctx, history_key, query, value_return)
 
-        {:ok, event_refs} ->
-          event_ids = Enum.map(event_refs, fn {event_id, _score} -> event_id end)
+          {:ok, event_refs} ->
+            event_ids = Enum.map(event_refs, fn {event_id, _score} -> event_id end)
 
-          with {:ok, events} <-
-                 flow_history_from_event_ids(
-                   ctx,
-                   id,
-                   partition_key,
-                   history_key,
-                   event_ids,
-                   value_return
-                 ) do
-            {:ok, flow_history_apply_query(events, query)}
-          end
+            with {:ok, events} <-
+                   flow_history_from_event_ids(
+                     ctx,
+                     id,
+                     partition_key,
+                     history_key,
+                     event_ids,
+                     value_return
+                   ) do
+              {:ok, flow_history_apply_query(events, query)}
+            end
+        end
+      else
+        {:ok, []}
       end
-    else
-      {:ok, []}
     end
   end
 
@@ -951,48 +963,50 @@ defmodule Ferricstore.Flow do
          consistent?,
          value_return
        ) do
-    if flow_history_state_exists?(ctx, id, partition_key) do
-      fetch_count = flow_history_query_fetch_count(query)
+    with :ok <- flow_maybe_flush_history_projector(ctx, history_key, consistent?) do
+      if flow_history_state_exists?(ctx, id, partition_key) do
+        fetch_count = flow_history_query_fetch_count(query)
 
-      with {:ok, hot_refs} <-
-             flow_history_hot_refs(ctx, id, partition_key, history_key, fetch_count),
-           {:ok, cold_refs} <-
-             flow_history_lmdb_refs(
-               ctx,
-               history_key,
-               fetch_count,
-               consistent?,
-               flow_history_lmdb_reverse_scan?(query)
-             ) do
-        scan_count = flow_lmdb_query_scan_count(fetch_count)
+        with {:ok, hot_refs} <-
+               flow_history_hot_refs(ctx, id, partition_key, history_key, fetch_count),
+             {:ok, cold_refs} <-
+               flow_history_lmdb_refs(
+                 ctx,
+                 history_key,
+                 fetch_count,
+                 consistent?,
+                 flow_history_lmdb_reverse_scan?(query)
+               ) do
+          scan_count = flow_lmdb_query_scan_count(fetch_count)
 
-        event_ids =
-          (hot_refs ++ cold_refs)
-          |> Enum.sort_by(fn {event_id, score} -> {score, event_id} end)
-          |> Enum.uniq_by(fn {event_id, _score} -> event_id end)
-          |> Enum.take(-flow_history_merge_count(query, scan_count))
-          |> Enum.map(fn {event_id, _score} -> event_id end)
+          event_ids =
+            (hot_refs ++ cold_refs)
+            |> Enum.sort_by(fn {event_id, score} -> {score, event_id} end)
+            |> Enum.uniq_by(fn {event_id, _score} -> event_id end)
+            |> Enum.take(-flow_history_merge_count(query, scan_count))
+            |> Enum.map(fn {event_id, _score} -> event_id end)
 
-        case event_ids do
-          [] ->
-            flow_history_fallback_scan(ctx, history_key, query, value_return)
+          case event_ids do
+            [] ->
+              flow_history_fallback_scan(ctx, history_key, query, value_return)
 
-          _ ->
-            with {:ok, events} <-
-                   flow_history_from_event_ids(
-                     ctx,
-                     id,
-                     partition_key,
-                     history_key,
-                     event_ids,
-                     value_return
-                   ) do
-              {:ok, flow_history_apply_query(events, query)}
-            end
+            _ ->
+              with {:ok, events} <-
+                     flow_history_from_event_ids(
+                       ctx,
+                       id,
+                       partition_key,
+                       history_key,
+                       event_ids,
+                       value_return
+                     ) do
+                {:ok, flow_history_apply_query(events, query)}
+              end
+          end
         end
+      else
+        {:ok, []}
       end
-    else
-      {:ok, []}
     end
   end
 
@@ -1081,6 +1095,17 @@ defmodule Ferricstore.Flow do
 
   defp flow_maybe_flush_lmdb_shard(ctx, shard_index, true),
     do: Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index)
+
+  defp flow_maybe_flush_history_projector(_ctx, _history_key, false), do: :ok
+
+  defp flow_maybe_flush_history_projector(ctx, history_key, true) do
+    shard_index = Router.shard_for(ctx, history_key)
+
+    case Ferricstore.Flow.HistoryProjector.flush(ctx, shard_index, 120_000) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "ERR flow history projection unavailable: #{inspect(reason)}"}
+    end
+  end
 
   defp flow_require_lmdb_mirror_healthy_shard(ctx, index_key, shard_index) do
     if Ferricstore.Flow.LMDB.mirror?() and flow_lmdb_mirror_degraded_shard?(ctx, shard_index) do
@@ -1452,32 +1477,89 @@ defmodule Ferricstore.Flow do
   # audit/debug and rewind.
   def encode_history_fields(record, event, now_ms, meta \\ %{})
       when is_map(record) and is_binary(event) and is_integer(now_ms) do
-    meta_fields = encode_history_meta(normalize_history_meta(meta))
+    record
+    |> history_snapshot(event, now_ms, meta)
+    |> encode_history_snapshot()
+  end
 
+  @doc false
+  def history_snapshot(record, event, now_ms, meta \\ %{})
+      when is_map(record) and is_binary(event) and is_integer(now_ms) do
+    {
+      event,
+      Map.get(record, :version),
+      now_ms,
+      Map.get(record, :id),
+      Map.get(record, :type),
+      Map.get(record, :state),
+      Map.get(record, :priority, 0),
+      Map.get(record, :attempts, 0),
+      Map.get(record, :fencing_token, 0),
+      Map.get(record, :created_at_ms, now_ms),
+      Map.get(record, :updated_at_ms, now_ms),
+      Map.get(record, :next_run_at_ms),
+      Map.get(record, :lease_deadline_ms),
+      Map.get(record, :lease_owner),
+      Map.get(record, :payload_ref),
+      Map.get(record, :parent_flow_id),
+      Map.get(record, :root_flow_id),
+      Map.get(record, :correlation_id),
+      Map.get(record, :result_ref),
+      Map.get(record, :error_ref),
+      Map.get(record, :rewound_to_event_id),
+      normalize_history_meta(meta)
+    }
+  end
+
+  @doc false
+  def encode_history_snapshot({
+        event,
+        version,
+        now_ms,
+        id,
+        type,
+        state,
+        priority,
+        attempts,
+        fencing_token,
+        created_at_ms,
+        updated_at_ms,
+        next_run_at_ms,
+        lease_deadline_ms,
+        lease_owner,
+        payload_ref,
+        parent_flow_id,
+        root_flow_id,
+        correlation_id,
+        result_ref,
+        error_ref,
+        rewound_to_event_id,
+        meta_fields
+      }) do
     [
       @history_bin_magic,
       encode_bin(event),
-      encode_int(Map.get(record, :version)),
+      encode_int(version),
       encode_int(now_ms),
-      encode_bin(Map.get(record, :id)),
-      encode_bin(Map.get(record, :type)),
-      encode_bin(Map.get(record, :state)),
-      encode_int(Map.get(record, :priority, 0)),
-      encode_int(Map.get(record, :attempts, 0)),
-      encode_int(Map.get(record, :fencing_token, 0)),
-      encode_int(Map.get(record, :created_at_ms, now_ms)),
-      encode_int(Map.get(record, :updated_at_ms, now_ms)),
-      encode_int(Map.get(record, :next_run_at_ms)),
-      encode_int(Map.get(record, :lease_deadline_ms)),
-      encode_bin(Map.get(record, :lease_owner)),
-      encode_bin(Map.get(record, :payload_ref)),
-      encode_bin(Map.get(record, :parent_flow_id)),
-      encode_bin(Map.get(record, :root_flow_id)),
-      encode_bin(Map.get(record, :correlation_id)),
-      encode_bin(Map.get(record, :result_ref)),
-      encode_bin(Map.get(record, :error_ref)),
-      encode_bin(Map.get(record, :rewound_to_event_id)),
-      meta_fields
+      encode_bin(id),
+      encode_bin(type),
+      encode_bin(state),
+      encode_int(priority),
+      encode_int(attempts),
+      encode_int(fencing_token),
+      encode_int(created_at_ms),
+      encode_int(updated_at_ms),
+      encode_int(next_run_at_ms),
+      encode_int(lease_deadline_ms),
+      encode_bin(lease_owner),
+      encode_bin(payload_ref),
+      encode_bin(parent_flow_id),
+      encode_bin(root_flow_id),
+      encode_bin(correlation_id),
+      encode_bin(result_ref),
+      encode_bin(error_ref),
+      encode_bin(rewound_to_event_id),
+      encode_history_meta(meta_fields)
     ]
     |> IO.iodata_to_binary()
   end
@@ -2734,7 +2816,8 @@ defmodule Ferricstore.Flow do
   defp flow_start_time, do: System.monotonic_time()
 
   defp observe_flow(command, started, result, fallback_metadata) do
-    measurements = flow_measurements(started, command, result)
+    {success_count, fallback_metadata} = Map.pop(fallback_metadata, :_count)
+    measurements = flow_measurements(started, command, result, success_count)
     metadata = flow_metadata(result, fallback_metadata)
 
     :telemetry.execute([:ferricstore, :flow, command, :stop], measurements, metadata)
@@ -2770,8 +2853,8 @@ defmodule Ferricstore.Flow do
     )
   end
 
-  defp flow_measurements(started, command, result) do
-    count = result_count(result)
+  defp flow_measurements(started, command, result, success_count \\ nil) do
+    count = result_count(result, success_count)
 
     %{
       duration_ms:
@@ -2784,6 +2867,9 @@ defmodule Ferricstore.Flow do
   defp elapsed_us(started) do
     System.convert_time_unit(System.monotonic_time() - started, :native, :microsecond)
   end
+
+  defp result_count(:ok, count) when is_integer(count) and count >= 0, do: count
+  defp result_count(result, _count), do: result_count(result)
 
   defp result_count({:ok, records}) when is_list(records), do: length(records)
   defp result_count({:ok, nil}), do: 0
@@ -2810,6 +2896,9 @@ defmodule Ferricstore.Flow do
   end
 
   defp flow_metadata({:ok, _value}, fallback),
+    do: Map.merge(fallback, %{result: :ok, reason: nil})
+
+  defp flow_metadata(:ok, fallback),
     do: Map.merge(fallback, %{result: :ok, reason: nil})
 
   defp flow_metadata({:error, reason}, fallback) when is_binary(reason) do
@@ -2842,10 +2931,15 @@ defmodule Ferricstore.Flow do
   end
 
   defp validate_opts(opts) do
-    if Keyword.keyword?(opts) do
-      :ok
-    else
-      {:error, "ERR flow opts must be a keyword list"}
+    cond do
+      not Keyword.keyword?(opts) ->
+        {:error, "ERR flow opts must be a keyword list"}
+
+      Keyword.has_key?(opts, :return) ->
+        {:error, "ERR flow return option is not supported"}
+
+      true ->
+        :ok
     end
   end
 
@@ -3972,7 +4066,7 @@ defmodule Ferricstore.Flow do
            partition_key,
            history_key,
            query,
-           include_cold? or consistent?,
+           include_cold?,
            consistent?,
            value_return
          )}
@@ -4067,7 +4161,7 @@ defmodule Ferricstore.Flow do
          :ok <- validate_key_size(history_key),
          {:ok, count} <- flow_count(opts),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
-         {:ok, consistent?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, consistent?} <- optional_boolean(opts, :consistent_projection, true),
          {:ok, value_return} <- history_value_return_opts(opts),
          {:ok, query} <- flow_history_query_opts(opts, count) do
       {:ok, {partition_key, history_key, query, include_cold?, consistent?, value_return}}

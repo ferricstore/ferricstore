@@ -3,11 +3,13 @@
 # End-to-end TCP benchmarks: connect, send RESP3 commands, receive responses.
 #
 # Run:
-#   MIX_ENV=bench mix run bench/tcp_bench.exs
+#   MIX_ENV=bench mix run --no-start bench/tcp_bench.exs
 #
 # Starts the full application with an ephemeral port and connects over TCP.
 
-alias Ferricstore.Resp.Encoder
+alias FerricstoreServer.Resp.Encoder
+
+Logger.configure(level: :warning)
 
 bench_warmup = System.get_env("BENCH_WARMUP", "2") |> String.to_integer()
 bench_time = System.get_env("BENCH_TIME", "5") |> String.to_integer()
@@ -22,10 +24,10 @@ File.mkdir_p!(bench_data_dir)
 Application.put_env(:ferricstore, :data_dir, bench_data_dir)
 Application.put_env(:ferricstore, :port, 0)
 
-{:ok, _} = Application.ensure_all_started(:ferricstore)
+{:ok, _} = Application.ensure_all_started(:ferricstore_server)
 
 # Discover the ephemeral port Ranch assigned
-port = :ranch.get_port(Ferricstore.Server.Listener)
+port = FerricstoreServer.Listener.port()
 IO.puts("=== TCP End-to-End Benchmarks ===")
 IO.puts("Listening on port: #{port}")
 IO.puts("Data dir: #{bench_data_dir}\n")

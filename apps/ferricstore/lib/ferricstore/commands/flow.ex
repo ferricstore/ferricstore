@@ -170,6 +170,8 @@ defmodule Ferricstore.Commands.Flow do
   def handle_ast(_ast, _store), do: {:error, "ERR unsupported flow command AST"}
 
   @doc false
+  def normalize_result(:ok), do: "OK"
+
   def normalize_result({:ok, records}) when is_list(records),
     do: Enum.map(records, &normalize_value/1)
 

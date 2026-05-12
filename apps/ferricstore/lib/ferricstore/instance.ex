@@ -40,6 +40,8 @@ defmodule FerricStore.Instance do
           flow_lmdb_writer_pending_ops: reference(),
           flow_lmdb_writer_oldest_pending_age_us: reference(),
           flow_lmdb_writer_flush_failures: reference(),
+          flow_history_projected_index: reference(),
+          flow_history_projector_flush_failures: reference(),
           last_applied_index: reference(),
           last_released_cursor_index: reference(),
           pending_release_cursor_checkpoint_count: reference(),
@@ -90,6 +92,8 @@ defmodule FerricStore.Instance do
     :flow_lmdb_writer_pending_ops,
     :flow_lmdb_writer_oldest_pending_age_us,
     :flow_lmdb_writer_flush_failures,
+    :flow_history_projected_index,
+    :flow_history_projector_flush_failures,
     :last_applied_index,
     :last_released_cursor_index,
     :pending_release_cursor_checkpoint_count,
@@ -294,6 +298,24 @@ defmodule FerricStore.Instance do
         :atomics.new(shard_count, signed: false)
       end
 
+    flow_history_projected_index =
+      if name == :default do
+        try_get_pt(:ferricstore_flow_history_projected_index, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
+    flow_history_projector_flush_failures =
+      if name == :default do
+        try_get_pt(:ferricstore_flow_history_projector_flush_failures, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
     # Per-shard Ra index observability for the current coarse WAL/Bitcask gate.
     # These atomics do not affect release_cursor correctness; they let INFO show
     # how far Ra apply has advanced beyond the last emitted release cursor.
@@ -409,6 +431,8 @@ defmodule FerricStore.Instance do
       flow_lmdb_writer_pending_ops: flow_lmdb_writer_pending_ops,
       flow_lmdb_writer_oldest_pending_age_us: flow_lmdb_writer_oldest_pending_age_us,
       flow_lmdb_writer_flush_failures: flow_lmdb_writer_flush_failures,
+      flow_history_projected_index: flow_history_projected_index,
+      flow_history_projector_flush_failures: flow_history_projector_flush_failures,
       last_applied_index: last_applied_index,
       last_released_cursor_index: last_released_cursor_index,
       pending_release_cursor_checkpoint_count: pending_release_cursor_checkpoint_count,

@@ -45,6 +45,11 @@ defmodule Ferricstore.Store.Shard.ETS do
         # Cold key (evicted from RAM) with no expiry -- disk location known.
         {:cold, fid, off, vsize, 0}
 
+      [{^key, nil, 0, _lfu, {:flow_history, file_id} = fid, off, vsize}]
+      when is_integer(file_id) and file_id >= 0 and is_integer(off) and off >= 0 and
+             is_integer(vsize) and vsize >= 0 ->
+        {:cold, fid, off, vsize, 0}
+
       [{^key, value, exp, lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
         lfu_touch(keydir, key, lfu)
         {:hit, value, exp}
@@ -56,6 +61,11 @@ defmodule Ferricstore.Store.Shard.ETS do
       [{^key, nil, exp, _lfu, fid, off, vsize}]
       when exp > now and valid_cold_location(fid, off, vsize) ->
         # Cold key with valid TTL -- disk location known.
+        {:cold, fid, off, vsize, exp}
+
+      [{^key, nil, exp, _lfu, {:flow_history, file_id} = fid, off, vsize}]
+      when exp > now and is_integer(file_id) and file_id >= 0 and is_integer(off) and
+             off >= 0 and is_integer(vsize) and vsize >= 0 ->
         {:cold, fid, off, vsize, exp}
 
       [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
@@ -379,8 +389,12 @@ defmodule Ferricstore.Store.Shard.ETS do
   # -------------------------------------------------------------------
 
   # Returns the file path for a given file_id within the shard data directory.
-  @spec file_path(binary(), non_neg_integer()) :: binary()
+  @spec file_path(binary(), non_neg_integer() | {:flow_history, non_neg_integer()}) :: binary()
   @doc false
+  def file_path(shard_path, {:flow_history, file_id}) do
+    Ferricstore.Flow.HistoryProjector.history_file_path(shard_path, file_id)
+  end
+
   def file_path(shard_path, file_id) do
     Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
   end
@@ -421,7 +435,9 @@ defmodule Ferricstore.Store.Shard.ETS do
             maybe_delete_expired_prefix_entry(state, keydir, key)
             {tokens, {cold_entries, cold_count}}
 
-          value == nil and not valid_cold_location(fid, off, vsize) ->
+          value == nil and
+              not (valid_cold_location(fid, off, vsize) or
+                     flow_history_cold_location?(fid, off, vsize)) ->
             maybe_delete_expired_prefix_entry(state, keydir, key)
             {tokens, {cold_entries, cold_count}}
 
@@ -463,6 +479,13 @@ defmodule Ferricstore.Store.Shard.ETS do
       _ -> key
     end
   end
+
+  defp flow_history_cold_location?({:flow_history, file_id}, offset, value_size)
+       when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+              is_integer(value_size) and value_size >= 0,
+       do: true
+
+  defp flow_history_cold_location?(_file_id, _offset, _value_size), do: false
 
   defp prefix_read_cold_batch_async([]), do: []
 

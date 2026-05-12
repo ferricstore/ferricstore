@@ -57,6 +57,15 @@ defmodule Ferricstore.Store.ShardSupervisor do
             id: :"shard_#{i}"
           ),
           Supervisor.child_spec(
+            {Ferricstore.Flow.HistoryProjector,
+             [
+               shard_index: i,
+               shard_data_path: Ferricstore.DataDir.shard_data_path(data_dir, i),
+               instance_ctx: instance_ctx
+             ]},
+            id: :"flow_history_projector_#{i}"
+          ),
+          Supervisor.child_spec(
             {Ferricstore.Store.BitcaskCheckpointer, [index: i, instance_ctx: instance_ctx]},
             id: :"checkpointer_#{i}"
           )

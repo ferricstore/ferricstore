@@ -1018,6 +1018,12 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  defp cold_file_path(ctx, idx, {:flow_history, file_id}) do
+    ctx.data_dir
+    |> Ferricstore.DataDir.shard_data_path(idx)
+    |> Ferricstore.Flow.HistoryProjector.history_file_path(file_id)
+  end
+
   defp cold_file_path(ctx, idx, file_id) do
     shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
     Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
@@ -1041,6 +1047,11 @@ defmodule Ferricstore.Store.Router do
         [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
           {:cold, fid, off, vsize}
 
+        [{^key, nil, 0, _lfu, {:flow_history, file_id} = fid, off, vsize}]
+        when is_integer(file_id) and file_id >= 0 and is_integer(off) and off >= 0 and
+               is_integer(vsize) and vsize >= 0 ->
+          {:cold, fid, off, vsize}
+
         [{^key, nil, 0, _lfu, :pending, off, vsize}] ->
           {:cold, :pending, off, vsize}
 
@@ -1049,6 +1060,11 @@ defmodule Ferricstore.Store.Router do
 
         [{^key, nil, exp, _lfu, fid, off, vsize}]
         when exp > now and valid_cold_location(fid, off, vsize) ->
+          {:cold, fid, off, vsize}
+
+        [{^key, nil, exp, _lfu, {:flow_history, file_id} = fid, off, vsize}]
+        when exp > now and is_integer(file_id) and file_id >= 0 and is_integer(off) and
+               off >= 0 and is_integer(vsize) and vsize >= 0 ->
           {:cold, fid, off, vsize}
 
         [{^key, nil, exp, _lfu, :pending, off, vsize}] when exp > now ->
@@ -1076,6 +1092,11 @@ defmodule Ferricstore.Store.Router do
 
         [{^key, nil, exp, _lfu, fid, off, vsize}]
         when (exp == 0 or exp > now) and valid_cold_location(fid, off, vsize) ->
+          {:cold, fid, off, vsize, exp}
+
+        [{^key, nil, exp, _lfu, {:flow_history, file_id} = fid, off, vsize}]
+        when (exp == 0 or exp > now) and is_integer(file_id) and file_id >= 0 and
+               is_integer(off) and off >= 0 and is_integer(vsize) and vsize >= 0 ->
           {:cold, fid, off, vsize, exp}
 
         [{^key, nil, exp, _lfu, :pending, off, vsize}] when exp == 0 or exp > now ->
@@ -2886,7 +2907,13 @@ defmodule Ferricstore.Store.Router do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
     else
       idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_create_many, key, %{records: attrs_list}})
+
+      raft_write(
+        ctx,
+        idx,
+        key,
+        {:flow_create_many, key, %{records: attrs_list}}
+      )
     end
   end
 
@@ -3011,27 +3038,31 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp expand_flow_many_results(count, groups, group_results) do
-    expanded =
-      group_results
-      |> Enum.zip(groups)
-      |> Enum.reduce(%{}, fn
-        {{:ok, records}, {_shard_idx, _key, indices, _cmd}}, acc when is_list(records) ->
-          indices
-          |> Enum.zip(records)
-          |> Enum.reduce(acc, fn {idx, record}, next -> Map.put(next, idx, record) end)
+    if Enum.all?(group_results, &(&1 == :ok)) do
+      :ok
+    else
+      expanded =
+        group_results
+        |> Enum.zip(groups)
+        |> Enum.reduce(%{}, fn
+          {{:ok, records}, {_shard_idx, _key, indices, _cmd}}, acc when is_list(records) ->
+            indices
+            |> Enum.zip(records)
+            |> Enum.reduce(acc, fn {idx, record}, next -> Map.put(next, idx, record) end)
 
-        {{:error, _reason} = error, {_shard_idx, _key, indices, _cmd}}, acc ->
-          Enum.reduce(indices, acc, fn idx, next -> Map.put(next, idx, error) end)
+          {{:error, _reason} = error, {_shard_idx, _key, indices, _cmd}}, acc ->
+            Enum.reduce(indices, acc, fn idx, next -> Map.put(next, idx, error) end)
 
-        {other, {_shard_idx, _key, indices, _cmd}}, acc ->
-          Enum.reduce(indices, acc, fn idx, next -> Map.put(next, idx, other) end)
-      end)
+          {other, {_shard_idx, _key, indices, _cmd}}, acc ->
+            Enum.reduce(indices, acc, fn idx, next -> Map.put(next, idx, other) end)
+        end)
 
-    results =
-      0..(count - 1)
-      |> Enum.map(fn idx -> Map.get(expanded, idx, ErrorReasons.write_timeout_unknown()) end)
+      results =
+        0..(count - 1)
+        |> Enum.map(fn idx -> Map.get(expanded, idx, ErrorReasons.write_timeout_unknown()) end)
 
-    {:ok, results}
+      {:ok, results}
+    end
   end
 
   @doc false
@@ -3283,11 +3314,21 @@ defmodule Ferricstore.Store.Router do
     else
       case flow_cross_terminal_many_keys(ctx, attrs_list) do
         {:ok, keys} ->
-          flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :complete, attrs_list})
+          flow_cross_shard_tx(
+            ctx,
+            keys,
+            {:flow_cross_terminal_many, :complete, %{records: attrs_list}}
+          )
 
         :same_or_none ->
           idx = shard_for(ctx, key)
-          raft_write(ctx, idx, key, {:flow_complete_many, key, %{records: attrs_list}})
+
+          raft_write(
+            ctx,
+            idx,
+            key,
+            {:flow_complete_many, key, %{records: attrs_list}}
+          )
       end
     end
   end
@@ -3295,7 +3336,11 @@ defmodule Ferricstore.Store.Router do
   def flow_complete_many(ctx, nil, attrs_list) when is_list(attrs_list) do
     case flow_cross_terminal_many_keys(ctx, attrs_list) do
       {:ok, keys} ->
-        flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :complete, attrs_list})
+        flow_cross_shard_tx(
+          ctx,
+          keys,
+          {:flow_cross_terminal_many, :complete, %{records: attrs_list}}
+        )
 
       :same_or_none ->
         flow_many_by_shard(ctx, attrs_list, :flow_complete_many, "__complete_batch__")
@@ -3368,7 +3413,13 @@ defmodule Ferricstore.Store.Router do
       {:error, "ERR key too large (max #{@max_key_size} bytes)"}
     else
       idx = shard_for(ctx, key)
-      raft_write(ctx, idx, key, {:flow_transition_many, key, %{records: attrs_list}})
+
+      raft_write(
+        ctx,
+        idx,
+        key,
+        {:flow_transition_many, key, %{records: attrs_list}}
+      )
     end
   end
 
@@ -3404,11 +3455,21 @@ defmodule Ferricstore.Store.Router do
     else
       case flow_cross_terminal_many_keys(ctx, attrs_list) do
         {:ok, keys} ->
-          flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :retry, attrs_list})
+          flow_cross_shard_tx(
+            ctx,
+            keys,
+            {:flow_cross_terminal_many, :retry, %{records: attrs_list}}
+          )
 
         :same_or_none ->
           idx = shard_for(ctx, key)
-          raft_write(ctx, idx, key, {:flow_retry_many, key, %{records: attrs_list}})
+
+          raft_write(
+            ctx,
+            idx,
+            key,
+            {:flow_retry_many, key, %{records: attrs_list}}
+          )
       end
     end
   end
@@ -3416,7 +3477,11 @@ defmodule Ferricstore.Store.Router do
   def flow_retry_many(ctx, nil, attrs_list) when is_list(attrs_list) do
     case flow_cross_terminal_many_keys(ctx, attrs_list) do
       {:ok, keys} ->
-        flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :retry, attrs_list})
+        flow_cross_shard_tx(
+          ctx,
+          keys,
+          {:flow_cross_terminal_many, :retry, %{records: attrs_list}}
+        )
 
       :same_or_none ->
         flow_many_by_shard(ctx, attrs_list, :flow_retry_many, "__retry_batch__")
@@ -3451,11 +3516,21 @@ defmodule Ferricstore.Store.Router do
     else
       case flow_cross_terminal_many_keys(ctx, attrs_list) do
         {:ok, keys} ->
-          flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :fail, attrs_list})
+          flow_cross_shard_tx(
+            ctx,
+            keys,
+            {:flow_cross_terminal_many, :fail, %{records: attrs_list}}
+          )
 
         :same_or_none ->
           idx = shard_for(ctx, key)
-          raft_write(ctx, idx, key, {:flow_fail_many, key, %{records: attrs_list}})
+
+          raft_write(
+            ctx,
+            idx,
+            key,
+            {:flow_fail_many, key, %{records: attrs_list}}
+          )
       end
     end
   end
@@ -3463,7 +3538,11 @@ defmodule Ferricstore.Store.Router do
   def flow_fail_many(ctx, nil, attrs_list) when is_list(attrs_list) do
     case flow_cross_terminal_many_keys(ctx, attrs_list) do
       {:ok, keys} ->
-        flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :fail, attrs_list})
+        flow_cross_shard_tx(
+          ctx,
+          keys,
+          {:flow_cross_terminal_many, :fail, %{records: attrs_list}}
+        )
 
       :same_or_none ->
         flow_many_by_shard(ctx, attrs_list, :flow_fail_many, "__fail_batch__")
@@ -3647,11 +3726,21 @@ defmodule Ferricstore.Store.Router do
     else
       case flow_cross_terminal_many_keys(ctx, attrs_list) do
         {:ok, keys} ->
-          flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :cancel, attrs_list})
+          flow_cross_shard_tx(
+            ctx,
+            keys,
+            {:flow_cross_terminal_many, :cancel, %{records: attrs_list}}
+          )
 
         :same_or_none ->
           idx = shard_for(ctx, key)
-          raft_write(ctx, idx, key, {:flow_cancel_many, key, %{records: attrs_list}})
+
+          raft_write(
+            ctx,
+            idx,
+            key,
+            {:flow_cancel_many, key, %{records: attrs_list}}
+          )
       end
     end
   end
@@ -3659,7 +3748,11 @@ defmodule Ferricstore.Store.Router do
   def flow_cancel_many(ctx, nil, attrs_list) when is_list(attrs_list) do
     case flow_cross_terminal_many_keys(ctx, attrs_list) do
       {:ok, keys} ->
-        flow_cross_shard_tx(ctx, keys, {:flow_cross_terminal_many, :cancel, attrs_list})
+        flow_cross_shard_tx(
+          ctx,
+          keys,
+          {:flow_cross_terminal_many, :cancel, %{records: attrs_list}}
+        )
 
       :same_or_none ->
         flow_many_by_shard(ctx, attrs_list, :flow_cancel_many, "__cancel_batch__")

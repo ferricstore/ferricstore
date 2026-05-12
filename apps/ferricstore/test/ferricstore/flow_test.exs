@@ -42,6 +42,246 @@ defmodule Ferricstore.FlowTest do
 
   defp uid(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"
 
+  defp flow_create_and_get(id, opts) do
+    case FerricStore.flow_create(id, opts) do
+      :ok -> FerricStore.flow_get(id, flow_partition_opts(Keyword.get(opts, :partition_key)))
+      other -> other
+    end
+  end
+
+  defp flow_create_many_and_get(partition_key, items, opts) do
+    case FerricStore.flow_create_many(partition_key, items, opts) do
+      :ok ->
+        {:ok, Enum.map(items, &fetch_created_flow(&1, partition_key, opts))}
+
+      {:ok, results} when is_list(results) ->
+        {:ok, hydrate_create_results(results, items, partition_key, opts)}
+
+      other ->
+        other
+    end
+  end
+
+  defp flow_spawn_children_and_get(parent_id, children, opts) do
+    case FerricStore.flow_spawn_children(parent_id, children, opts) do
+      :ok ->
+        FerricStore.flow_get(parent_id, flow_partition_opts(Keyword.get(opts, :partition_key)))
+
+      other ->
+        other
+    end
+  end
+
+  defp flow_transition_and_get(id, from_state, to_state, opts \\ []) do
+    case FerricStore.flow_transition(id, from_state, to_state, opts) do
+      :ok -> FerricStore.flow_get(id, flow_partition_opts(Keyword.get(opts, :partition_key)))
+      other -> other
+    end
+  end
+
+  defp flow_transition_many_and_get(partition_key, from_state, to_state, items, opts \\ []) do
+    case FerricStore.flow_transition_many(partition_key, from_state, to_state, items, opts) do
+      :ok ->
+        {:ok, Enum.map(items, &fetch_many_flow(&1, partition_key))}
+
+      {:ok, results} when is_list(results) ->
+        {:ok, hydrate_many_results(results, items, partition_key)}
+
+      other ->
+        other
+    end
+  end
+
+  defp flow_complete_and_get(id, lease_token, opts \\ []) do
+    case FerricStore.flow_complete(id, lease_token, opts) do
+      :ok -> FerricStore.flow_get(id, flow_partition_opts(Keyword.get(opts, :partition_key)))
+      other -> other
+    end
+  end
+
+  defp flow_complete_many_and_get(partition_key, items, opts) do
+    case FerricStore.flow_complete_many(partition_key, items, opts) do
+      :ok ->
+        {:ok, Enum.map(items, &fetch_many_flow(&1, partition_key))}
+
+      {:ok, results} when is_list(results) ->
+        {:ok, hydrate_many_results(results, items, partition_key)}
+
+      other ->
+        other
+    end
+  end
+
+  defp flow_retry_and_get(id, lease_token, opts) do
+    case FerricStore.flow_retry(id, lease_token, opts) do
+      :ok -> FerricStore.flow_get(id, flow_partition_opts(Keyword.get(opts, :partition_key)))
+      other -> other
+    end
+  end
+
+  defp flow_retry_many_and_get(partition_key, items, opts) do
+    case FerricStore.flow_retry_many(partition_key, items, opts) do
+      :ok ->
+        {:ok, Enum.map(items, &fetch_many_flow(&1, partition_key))}
+
+      {:ok, results} when is_list(results) ->
+        {:ok, hydrate_many_results(results, items, partition_key)}
+
+      other ->
+        other
+    end
+  end
+
+  defp flow_fail_and_get(id, lease_token, opts \\ []) do
+    case FerricStore.flow_fail(id, lease_token, opts) do
+      :ok -> FerricStore.flow_get(id, flow_partition_opts(Keyword.get(opts, :partition_key)))
+      other -> other
+    end
+  end
+
+  defp flow_fail_many_and_get(partition_key, items, opts) do
+    case FerricStore.flow_fail_many(partition_key, items, opts) do
+      :ok ->
+        {:ok, Enum.map(items, &fetch_many_flow(&1, partition_key))}
+
+      {:ok, results} when is_list(results) ->
+        {:ok, hydrate_many_results(results, items, partition_key)}
+
+      other ->
+        other
+    end
+  end
+
+  defp flow_cancel_and_get(id, opts \\ []) do
+    case FerricStore.flow_cancel(id, opts) do
+      :ok -> FerricStore.flow_get(id, flow_partition_opts(Keyword.get(opts, :partition_key)))
+      other -> other
+    end
+  end
+
+  defp flow_cancel_many_and_get(partition_key, items, opts) do
+    case FerricStore.flow_cancel_many(partition_key, items, opts) do
+      :ok ->
+        {:ok, Enum.map(items, &fetch_many_flow(&1, partition_key))}
+
+      {:ok, results} when is_list(results) ->
+        {:ok, hydrate_many_results(results, items, partition_key)}
+
+      other ->
+        other
+    end
+  end
+
+  defp impl_flow_create_and_get(ctx, id, opts) do
+    case FerricStore.Impl.flow_create(ctx, id, opts) do
+      :ok ->
+        FerricStore.Impl.flow_get(ctx, id, flow_partition_opts(Keyword.get(opts, :partition_key)))
+
+      other ->
+        other
+    end
+  end
+
+  defp impl_flow_spawn_children_and_get(ctx, parent_id, children, opts) do
+    case FerricStore.Impl.flow_spawn_children(ctx, parent_id, children, opts) do
+      :ok ->
+        FerricStore.Impl.flow_get(
+          ctx,
+          parent_id,
+          flow_partition_opts(Keyword.get(opts, :partition_key))
+        )
+
+      other ->
+        other
+    end
+  end
+
+  defp impl_flow_retry_and_get(ctx, id, lease_token, opts) do
+    case FerricStore.Impl.flow_retry(ctx, id, lease_token, opts) do
+      :ok ->
+        FerricStore.Impl.flow_get(ctx, id, flow_partition_opts(Keyword.get(opts, :partition_key)))
+
+      other ->
+        other
+    end
+  end
+
+  defp fetch_created_flow(item, partition_key, opts) do
+    {id, item_partition_key} = create_item_identity(item, partition_key, opts)
+    {:ok, flow} = FerricStore.flow_get(id, flow_partition_opts(item_partition_key))
+    flow
+  end
+
+  defp fetch_many_flow(item, partition_key) do
+    {id, item_partition_key} = many_item_identity(item, partition_key)
+    {:ok, flow} = FerricStore.flow_get(id, flow_partition_opts(item_partition_key))
+    flow
+  end
+
+  defp hydrate_create_results(results, items, partition_key, opts) do
+    results
+    |> Enum.zip(items)
+    |> Enum.map(fn
+      {:ok, item} -> fetch_created_flow(item, partition_key, opts)
+      {other, _item} -> other
+    end)
+  end
+
+  defp hydrate_many_results(results, items, partition_key) do
+    results
+    |> Enum.zip(items)
+    |> Enum.map(fn
+      {:ok, item} -> fetch_many_flow(item, partition_key)
+      {other, _item} -> other
+    end)
+  end
+
+  defp create_item_identity(%{id: id} = item, partition_key, opts),
+    do: {id, Map.get(item, :partition_key) || partition_key || Keyword.get(opts, :partition_key)}
+
+  defp create_item_identity(%{"id" => id} = item, partition_key, opts),
+    do: {id, Map.get(item, "partition_key") || partition_key || Keyword.get(opts, :partition_key)}
+
+  defp create_item_identity({id, item_opts}, partition_key, opts)
+       when is_binary(id) and is_list(item_opts),
+       do:
+         {id,
+          Keyword.get(item_opts, :partition_key) || partition_key ||
+            Keyword.get(opts, :partition_key)}
+
+  defp create_item_identity(id, partition_key, opts) when is_binary(id),
+    do: {id, partition_key || Keyword.get(opts, :partition_key)}
+
+  defp many_item_identity(%{id: id} = item, partition_key),
+    do: {id, Map.get(item, :partition_key) || partition_key}
+
+  defp many_item_identity(%{"id" => id} = item, partition_key),
+    do: {id, Map.get(item, "partition_key") || partition_key}
+
+  defp many_item_identity({id, _lease_token, item_opts}, partition_key)
+       when is_binary(id) and is_list(item_opts),
+       do: {id, Keyword.get(item_opts, :partition_key) || partition_key}
+
+  defp many_item_identity({id, item_opts}, partition_key)
+       when is_binary(id) and is_list(item_opts),
+       do: {id, Keyword.get(item_opts, :partition_key) || partition_key}
+
+  defp many_item_identity(
+         {:id, id, :partition_key, item_partition_key, :lease_token, _token, :fencing_token,
+          _fencing_token},
+         _partition_key
+       ),
+       do: {id, item_partition_key}
+
+  defp many_item_identity(
+         {:id, id, :lease_token, _token, :fencing_token, _fencing_token},
+         partition_key
+       ),
+       do: {id, partition_key}
+
+  defp flow_partition_opts(nil), do: []
+  defp flow_partition_opts(partition_key), do: [partition_key: partition_key]
+
   defp encoded_value_size(value) do
     value
     |> Ferricstore.Flow.encode_value()
@@ -93,7 +333,7 @@ defmodule Ferricstore.FlowTest do
 
   defp create_claimed_flow(id, partition_key, flow_type, worker) do
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: flow_type,
                partition_key: partition_key,
                state: "queued",
@@ -295,7 +535,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-create")
 
     assert {:ok, flow} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "checkout",
                state: "queued",
                payload: "payload:" <> id,
@@ -315,7 +555,7 @@ defmodule Ferricstore.FlowTest do
     assert fetched.state == "queued"
 
     assert {:error, "ERR flow already exists"} =
-             FerricStore.flow_create(id, type: "checkout", state: "queued")
+             flow_create_and_get(id, type: "checkout", state: "queued")
   end
 
   test "flow_get hydrates payload refs only when full or payload is requested" do
@@ -323,7 +563,7 @@ defmodule Ferricstore.FlowTest do
     payload = "payload-body"
 
     assert {:ok, _flow} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "checkout",
                state: "queued",
                payload: payload,
@@ -355,7 +595,7 @@ defmodule Ferricstore.FlowTest do
     payload = "worker-input"
 
     assert {:ok, _flow} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: type,
                state: "queued",
                payload: payload,
@@ -377,7 +617,7 @@ defmodule Ferricstore.FlowTest do
     missing_id = uid("claim-missing-payload-flow")
 
     assert {:ok, missing_flow} =
-             FerricStore.flow_create(missing_id,
+             flow_create_and_get(missing_id,
                type: type,
                state: "queued",
                payload: "missing-worker-input",
@@ -408,7 +648,7 @@ defmodule Ferricstore.FlowTest do
     attach_flow_telemetry([[:ferricstore, :flow, :pipeline_read_batch]])
 
     assert {:ok, _} =
-             FerricStore.flow_create(id_a,
+             flow_create_and_get(id_a,
                type: "pipeline-read",
                state: "queued",
                partition_key: partition_a,
@@ -417,7 +657,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_create(id_b,
+             flow_create_and_get(id_b,
                type: "pipeline-read",
                state: "queued",
                partition_key: partition_b,
@@ -455,10 +695,7 @@ defmodule Ferricstore.FlowTest do
     id_a = uid("flow-pipeline-write-standalone-a")
     id_b = uid("flow-pipeline-write-standalone-b")
 
-    assert [
-             {:ok, %{id: ^id_a, state: "queued"}},
-             {:ok, %{id: ^id_b, state: "queued"}}
-           ] =
+    assert [:ok, :ok] =
              Ferricstore.Flow.pipeline_write_batch_independent(ctx, [
                {:create, id_a,
                 [
@@ -490,7 +727,7 @@ defmodule Ferricstore.FlowTest do
 
     Enum.each(ids, fn id ->
       assert {:ok, %{id: ^id}} =
-               FerricStore.flow_create(id,
+               flow_create_and_get(id,
                  type: type,
                  partition_key: partition_key,
                  now_ms: 1,
@@ -536,7 +773,7 @@ defmodule Ferricstore.FlowTest do
         id = uid("pipeline-claim-partition-#{idx}")
 
         assert {:ok, %{id: ^id}} =
-                 FerricStore.flow_create(id,
+                 flow_create_and_get(id,
                    type: type,
                    partition_key: partition_key,
                    now_ms: 1,
@@ -577,7 +814,7 @@ defmodule Ferricstore.FlowTest do
     now = System.system_time(:millisecond)
 
     assert {:ok, %{id: ^id}} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: type,
                partition_key: partition_key,
                now_ms: now,
@@ -600,7 +837,7 @@ defmodule Ferricstore.FlowTest do
 
     for id <- [expired_a, expired_b, queued] do
       assert {:ok, %{id: ^id}} =
-               FerricStore.flow_create(id,
+               flow_create_and_get(id,
                  type: type,
                  partition_key: partition_key,
                  now_ms: 1_000,
@@ -657,14 +894,14 @@ defmodule Ferricstore.FlowTest do
     payload_b_size = encoded_value_size(payload_b)
 
     assert {:ok, _flow} =
-             FerricStore.flow_create(id_a,
+             flow_create_and_get(id_a,
                type: "pipeline-payload",
                payload: payload_a,
                run_at_ms: 1
              )
 
     assert {:ok, _flow} =
-             FerricStore.flow_create(id_b,
+             flow_create_and_get(id_b,
                type: "pipeline-payload",
                payload: payload_b,
                run_at_ms: 1
@@ -689,7 +926,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-create-idempotent")
 
     assert {:ok, created} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "checkout",
                state: "queued",
                payload: "payload:" <> id,
@@ -699,7 +936,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, retried} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "checkout",
                state: "queued",
                payload: "payload:" <> id,
@@ -716,7 +953,7 @@ defmodule Ferricstore.FlowTest do
     assert Enum.map(history, fn {_event_id, fields} -> fields["event"] end) == ["created"]
 
     assert {:error, "ERR flow idempotency conflict"} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "checkout",
                state: "queued",
                payload: "different:" <> id,
@@ -730,7 +967,7 @@ defmodule Ferricstore.FlowTest do
     run_at_ms = 1_234
 
     assert {:ok, _flow} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "checkout",
                state: "queued",
                run_at_ms: run_at_ms
@@ -761,7 +998,7 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, flow} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "lineage",
                partition_key: partition,
                parent_flow_id: parent,
@@ -810,7 +1047,7 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, flow} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "lineage",
                partition_key: partition,
                run_at_ms: 1_000,
@@ -832,7 +1069,7 @@ defmodule Ferricstore.FlowTest do
     correlation = uid("order")
 
     assert {:ok, %{id: ^root}} =
-             FerricStore.flow_create(root,
+             flow_create_and_get(root,
                type: "lineage",
                partition_key: partition,
                correlation_id: correlation,
@@ -841,7 +1078,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, %{id: ^child_a}} =
-             FerricStore.flow_create(child_a,
+             flow_create_and_get(child_a,
                type: "lineage",
                partition_key: partition,
                parent_flow_id: root,
@@ -852,7 +1089,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, %{id: ^child_b}} =
-             FerricStore.flow_create(child_b,
+             flow_create_and_get(child_b,
                type: "lineage",
                partition_key: partition,
                parent_flow_id: root,
@@ -863,7 +1100,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, %{id: ^grandchild}} =
-             FerricStore.flow_create(grandchild,
+             flow_create_and_get(grandchild,
                type: "lineage",
                partition_key: partition,
                parent_flow_id: child_a,
@@ -916,7 +1153,7 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, child_a_record} = FerricStore.flow_get(child_a, partition_key: partition)
 
     assert {:ok, _cancelled} =
-             FerricStore.flow_cancel(child_a,
+             flow_cancel_and_get(child_a,
                partition_key: partition,
                fencing_token: child_a_record.fencing_token,
                now_ms: 5_000
@@ -944,7 +1181,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("bulk-b")
 
     assert {:ok, flows} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [
                  %{id: id_a, payload: "payload:" <> id_a},
@@ -969,6 +1206,73 @@ defmodule Ferricstore.FlowTest do
     assert claimed |> Enum.map(& &1.id) |> MapSet.new() == MapSet.new([id_a, id_b])
   end
 
+  test "flow write APIs return ok and reject return option" do
+    partition = uid("tenant-return")
+    type = uid("return-api")
+    id = uid("return-flow")
+
+    assert :ok =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: id, payload: "payload:" <> id}],
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000,
+               now_ms: 900
+             )
+
+    assert :ok =
+             FerricStore.flow_transition_many(
+               partition,
+               "queued",
+               "ready",
+               [%{id: id, fencing_token: 0}],
+               run_at_ms: 1_000,
+               now_ms: 950
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               partition_key: partition,
+               state: "ready",
+               worker: "worker-return",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert claimed.id == id
+    assert claimed.payload == "payload:" <> id
+    assert is_binary(claimed.lease_token)
+    assert is_integer(claimed.fencing_token)
+
+    assert :ok =
+             FerricStore.flow_complete_many(
+               partition,
+               [
+                 %{
+                   id: claimed.id,
+                   lease_token: claimed.lease_token,
+                   fencing_token: claimed.fencing_token
+                 }
+               ],
+               result: "ok",
+               now_ms: 1_100
+             )
+
+    rejected_id = uid("return-rejected")
+
+    assert {:error, "ERR flow return option is not supported"} =
+             FerricStore.flow_create_many(
+               partition,
+               [%{id: rejected_id}],
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000,
+               now_ms: 900,
+               return: :full
+             )
+  end
+
   test "flow_create_many lets item attrs override common attrs" do
     partition = uid("tenant")
     type = uid("bulk-create-override")
@@ -976,7 +1280,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("bulk-override-b")
 
     assert {:ok, [flow_a, flow_b]} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [
                  %{id: id_a},
@@ -1005,17 +1309,17 @@ defmodule Ferricstore.FlowTest do
     new_id = uid("bulk-new")
 
     assert {:error, "ERR flow partition_key is required"} =
-             FerricStore.flow_create_many(nil, [%{id: new_id}], type: type)
+             flow_create_many_and_get(nil, [%{id: new_id}], type: type)
 
     assert {:ok, _} =
-             FerricStore.flow_create(existing_id,
+             flow_create_and_get(existing_id,
                type: type,
                partition_key: partition,
                run_at_ms: 1_000
              )
 
     assert {:error, "ERR flow already exists"} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: existing_id}, %{id: new_id}],
                type: type,
@@ -1026,7 +1330,7 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, []} = FerricStore.flow_history(new_id, partition_key: partition)
 
     assert {:error, "ERR flow duplicate id in batch"} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: new_id}, %{id: new_id}],
                type: type,
@@ -1044,7 +1348,7 @@ defmodule Ferricstore.FlowTest do
     new_id = uid("bulk-new")
 
     assert {:ok, %{id: ^existing_id}} =
-             FerricStore.flow_create(existing_id,
+             flow_create_and_get(existing_id,
                type: type,
                partition_key: partition,
                payload: "payload:" <> existing_id,
@@ -1053,7 +1357,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, records} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [
                  %{id: existing_id, payload: "payload:" <> existing_id},
@@ -1084,7 +1388,7 @@ defmodule Ferricstore.FlowTest do
     new_id = uid("bulk-new")
 
     assert {:ok, _} =
-             FerricStore.flow_create(existing_id,
+             flow_create_and_get(existing_id,
                type: type,
                partition_key: partition,
                payload: "payload:old",
@@ -1092,7 +1396,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:error, "ERR flow idempotency conflict"} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [
                  %{id: existing_id, payload: "payload:new"},
@@ -1114,7 +1418,7 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition,
@@ -1122,7 +1426,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, advanced} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [
                  %{id: child_a, type: "child", payload: %{n: 1}},
@@ -1154,7 +1458,7 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition,
@@ -1162,7 +1466,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [
                  %{id: child_a, type: "child", state: "queued"},
@@ -1186,7 +1490,7 @@ defmodule Ferricstore.FlowTest do
     claimed_a = create_claimed_flow_child(child_a, partition, "worker-a")
 
     assert {:ok, _child_done_a} =
-             FerricStore.flow_complete(child_a, claimed_a.lease_token,
+             flow_complete_and_get(child_a, claimed_a.lease_token,
                partition_key: partition,
                fencing_token: claimed_a.fencing_token,
                result: "child-a-result",
@@ -1203,7 +1507,7 @@ defmodule Ferricstore.FlowTest do
     claimed_b = create_claimed_flow_child(child_b, partition, "worker-b")
 
     assert {:ok, _child_done_b} =
-             FerricStore.flow_complete(child_b, claimed_b.lease_token,
+             flow_complete_and_get(child_b, claimed_b.lease_token,
                partition_key: partition,
                fencing_token: claimed_b.fencing_token,
                now_ms: 2_030
@@ -1221,14 +1525,14 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:error, "ERR flow wait_state is required when waiting for children"} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child, type: "child"}],
                group_id: "fanout-1",
@@ -1257,7 +1561,7 @@ defmodule Ferricstore.FlowTest do
       create_claimed_flow(parent, partition, "parent-running-empty-wait", "parent-worker")
 
     assert {:error, "ERR flow wait_state is required when waiting for children"} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child, type: "child"}],
                group_id: "fanout-1",
@@ -1285,7 +1589,7 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition,
@@ -1293,7 +1597,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child_a, type: "child"}, %{id: child_b, type: "child"}],
                group_id: "fanout-1",
@@ -1311,7 +1615,7 @@ defmodule Ferricstore.FlowTest do
     claimed_a = create_claimed_flow_child(child_a, partition, "worker-a")
 
     assert {:ok, _child_done_a} =
-             FerricStore.flow_complete(child_a, claimed_a.lease_token,
+             flow_complete_and_get(child_a, claimed_a.lease_token,
                partition_key: partition,
                fencing_token: claimed_a.fencing_token,
                now_ms: 3_020
@@ -1322,7 +1626,7 @@ defmodule Ferricstore.FlowTest do
     parent_version = after_first.version
 
     assert {:error, _reason} =
-             FerricStore.flow_complete(child_a, claimed_a.lease_token,
+             flow_complete_and_get(child_a, claimed_a.lease_token,
                partition_key: partition,
                fencing_token: claimed_a.fencing_token,
                now_ms: 3_030
@@ -1342,7 +1646,7 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, created_grandparent} =
-             FerricStore.flow_create(grandparent,
+             flow_create_and_get(grandparent,
                type: "parent",
                state: "dispatch",
                partition_key: partition,
@@ -1350,7 +1654,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _waiting_grandparent} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                grandparent,
                [%{id: middle, type: "child", state: "dispatch"}],
                group_id: "outer",
@@ -1368,7 +1672,7 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, middle_record} = FerricStore.flow_get(middle, partition_key: partition)
 
     assert {:ok, _waiting_middle} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                middle,
                [%{id: leaf, type: "child"}],
                group_id: "inner",
@@ -1386,7 +1690,7 @@ defmodule Ferricstore.FlowTest do
     claimed_leaf = create_claimed_flow_child(leaf, partition, "worker-leaf")
 
     assert {:ok, _leaf_done} =
-             FerricStore.flow_complete(leaf, claimed_leaf.lease_token,
+             flow_complete_and_get(leaf, claimed_leaf.lease_token,
                partition_key: partition,
                fencing_token: claimed_leaf.fencing_token,
                now_ms: 4_030
@@ -1413,14 +1717,14 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, fail_created} =
-             FerricStore.flow_create(fail_parent,
+             flow_create_and_get(fail_parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, _} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                fail_parent,
                [%{id: fail_child, type: "child"}],
                group_id: "fanout",
@@ -1437,7 +1741,7 @@ defmodule Ferricstore.FlowTest do
     failed_claim = create_claimed_flow_child(fail_child, partition, "worker-fail")
 
     assert {:ok, _failed_child} =
-             FerricStore.flow_fail(fail_child, failed_claim.lease_token,
+             flow_fail_and_get(fail_child, failed_claim.lease_token,
                partition_key: partition,
                fencing_token: failed_claim.fencing_token,
                error: "boom"
@@ -1451,14 +1755,14 @@ defmodule Ferricstore.FlowTest do
     assert is_binary(fail_result["error_ref"])
 
     assert {:ok, ignore_created} =
-             FerricStore.flow_create(ignore_parent,
+             flow_create_and_get(ignore_parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, _} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                ignore_parent,
                [%{id: ignore_child, type: "child"}],
                group_id: "fanout",
@@ -1475,7 +1779,7 @@ defmodule Ferricstore.FlowTest do
     ignore_claim = create_claimed_flow_child(ignore_child, partition, "worker-ignore")
 
     assert {:ok, _ignored_child} =
-             FerricStore.flow_fail(ignore_child, ignore_claim.lease_token,
+             flow_fail_and_get(ignore_child, ignore_claim.lease_token,
                partition_key: partition,
                fencing_token: ignore_claim.fencing_token,
                error: "ignored"
@@ -1494,14 +1798,14 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child_a, type: "child"}, %{id: child_b, type: "child"}],
                group_id: "fanout",
@@ -1516,7 +1820,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _cancelled_parent} =
-             FerricStore.flow_cancel(parent,
+             flow_cancel_and_get(parent,
                partition_key: partition,
                fencing_token: waiting.fencing_token,
                reason: "parent closed"
@@ -1541,7 +1845,7 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
@@ -1560,16 +1864,16 @@ defmodule Ferricstore.FlowTest do
     ]
 
     assert {:ok, first} =
-             FerricStore.flow_spawn_children(parent, [%{id: child, type: "child"}], opts)
+             flow_spawn_children_and_get(parent, [%{id: child, type: "child"}], opts)
 
     assert {:ok, same} =
-             FerricStore.flow_spawn_children(parent, [%{id: child, type: "child"}], opts)
+             flow_spawn_children_and_get(parent, [%{id: child, type: "child"}], opts)
 
     assert same.id == first.id
     assert same.version == first.version
 
     assert {:error, "ERR flow child group idempotency conflict"} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: other_child, type: "child"}],
                opts
@@ -1583,7 +1887,7 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
@@ -1602,7 +1906,7 @@ defmodule Ferricstore.FlowTest do
     ]
 
     assert {:ok, waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child_a, type: "child"}, %{id: child_b, type: "child"}],
                opts
@@ -1611,13 +1915,13 @@ defmodule Ferricstore.FlowTest do
     claimed_a = create_claimed_flow_child(child_a, partition, "worker-a")
 
     assert {:ok, _child_done_a} =
-             FerricStore.flow_complete(child_a, claimed_a.lease_token,
+             flow_complete_and_get(child_a, claimed_a.lease_token,
                partition_key: partition,
                fencing_token: claimed_a.fencing_token
              )
 
     assert {:ok, same} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child_a, type: "child"}, %{id: child_b, type: "child"}],
                opts
@@ -1634,14 +1938,14 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, cancelled_parent} =
-             FerricStore.flow_cancel(parent,
+             flow_cancel_and_get(parent,
                partition_key: partition,
                fencing_token: created_parent.fencing_token
              )
@@ -1649,7 +1953,7 @@ defmodule Ferricstore.FlowTest do
     assert cancelled_parent.state == "cancelled"
 
     assert {:error, "ERR flow parent is terminal"} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child, type: "child"}],
                group_id: "fanout",
@@ -1671,14 +1975,14 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant")
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, waiting_first} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: failing_child, type: "child"}],
                group_id: "fanout-a",
@@ -1693,7 +1997,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _waiting_second} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: sibling_child, type: "child"}],
                group_id: "fanout-b",
@@ -1710,7 +2014,7 @@ defmodule Ferricstore.FlowTest do
     failed_claim = create_claimed_flow_child(failing_child, partition, "worker-fail")
 
     assert {:ok, _failed_child} =
-             FerricStore.flow_fail(failing_child, failed_claim.lease_token,
+             flow_fail_and_get(failing_child, failed_claim.lease_token,
                partition_key: partition,
                fencing_token: failed_claim.fencing_token,
                error: "boom"
@@ -1734,14 +2038,14 @@ defmodule Ferricstore.FlowTest do
     {partition, _same_partition, other_partition} = mixed_partition_keys()
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child, type: "child", partition_key: other_partition}],
                group_id: "fanout",
@@ -1766,7 +2070,7 @@ defmodule Ferricstore.FlowTest do
     claimed = create_claimed_flow_child(child, other_partition, "worker-cross")
 
     assert {:ok, _child_done} =
-             FerricStore.flow_complete(child, claimed.lease_token,
+             flow_complete_and_get(child, claimed.lease_token,
                partition_key: other_partition,
                fencing_token: claimed.fencing_token
              )
@@ -1782,14 +2086,14 @@ defmodule Ferricstore.FlowTest do
     {partition, _same_partition, other_partition} = mixed_partition_keys()
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, _waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child, type: "child", partition_key: other_partition}],
                group_id: "fanout",
@@ -1806,7 +2110,7 @@ defmodule Ferricstore.FlowTest do
     claimed = create_claimed_flow_child(child, other_partition, "worker-ra-replay")
 
     assert {:ok, _completed_child} =
-             FerricStore.flow_complete(child, claimed.lease_token,
+             flow_complete_and_get(child, claimed.lease_token,
                partition_key: other_partition,
                fencing_token: claimed.fencing_token,
                result: "ok"
@@ -1835,14 +2139,14 @@ defmodule Ferricstore.FlowTest do
     {partition, _same_partition, other_partition} = mixed_partition_keys()
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child, type: "child", partition_key: other_partition}],
                group_id: "fanout",
@@ -1857,7 +2161,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _cancelled_parent} =
-             FerricStore.flow_cancel(parent,
+             flow_cancel_and_get(parent,
                partition_key: partition,
                fencing_token: waiting.fencing_token
              )
@@ -1876,14 +2180,14 @@ defmodule Ferricstore.FlowTest do
     {partition, same_partition, other_partition} = mixed_partition_keys()
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, _waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [
                  %{id: child_a, type: "child", partition_key: same_partition},
@@ -1904,7 +2208,7 @@ defmodule Ferricstore.FlowTest do
     claimed_b = create_claimed_flow_child(child_b, other_partition, "worker-cross-b")
 
     assert {:ok, completed} =
-             FerricStore.flow_complete_many(
+             flow_complete_many_and_get(
                nil,
                [
                  %{
@@ -1941,14 +2245,14 @@ defmodule Ferricstore.FlowTest do
 
     try do
       assert {:ok, created_parent} =
-               FerricStore.flow_create(parent,
+               flow_create_and_get(parent,
                  type: "parent",
                  state: "dispatch",
                  partition_key: partition
                )
 
       assert {:ok, _waiting} =
-               FerricStore.flow_spawn_children(
+               flow_spawn_children_and_get(
                  parent,
                  [%{id: child, type: "child", partition_key: other_partition}],
                  group_id: "fanout",
@@ -1965,7 +2269,7 @@ defmodule Ferricstore.FlowTest do
       claimed = create_claimed_flow_child(child, other_partition, "worker-raft-cross")
 
       assert {:ok, %{id: ^child, state: "completed"}} =
-               FerricStore.flow_complete(child, claimed.lease_token,
+               flow_complete_and_get(child, claimed.lease_token,
                  partition_key: other_partition,
                  fencing_token: claimed.fencing_token
                )
@@ -1985,14 +2289,14 @@ defmodule Ferricstore.FlowTest do
     {grand_partition, middle_partition, leaf_partition} = mixed_partition_keys()
 
     assert {:ok, created_grandparent} =
-             FerricStore.flow_create(grandparent,
+             flow_create_and_get(grandparent,
                type: "parent",
                state: "dispatch",
                partition_key: grand_partition
              )
 
     assert {:ok, _waiting_grandparent} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                grandparent,
                [%{id: middle, type: "child", state: "dispatch", partition_key: middle_partition}],
                group_id: "outer",
@@ -2009,7 +2313,7 @@ defmodule Ferricstore.FlowTest do
     assert {:ok, middle_record} = FerricStore.flow_get(middle, partition_key: middle_partition)
 
     assert {:ok, _waiting_middle} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                middle,
                [%{id: leaf, type: "child", partition_key: leaf_partition}],
                group_id: "inner",
@@ -2026,7 +2330,7 @@ defmodule Ferricstore.FlowTest do
     claimed_leaf = create_claimed_flow_child(leaf, leaf_partition, "worker-cross-leaf")
 
     assert {:ok, _leaf_done} =
-             FerricStore.flow_complete(leaf, claimed_leaf.lease_token,
+             flow_complete_and_get(leaf, claimed_leaf.lease_token,
                partition_key: leaf_partition,
                fencing_token: claimed_leaf.fencing_token
              )
@@ -2049,14 +2353,14 @@ defmodule Ferricstore.FlowTest do
     {partition, same_partition, other_partition} = mixed_partition_keys()
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [
                  %{id: child_a, type: "child", partition_key: same_partition},
@@ -2078,7 +2382,7 @@ defmodule Ferricstore.FlowTest do
     claimed_b = create_claimed_flow_child(child_b, other_partition, "worker-cross-any")
 
     assert {:ok, _child_done} =
-             FerricStore.flow_complete(child_b, claimed_b.lease_token,
+             flow_complete_and_get(child_b, claimed_b.lease_token,
                partition_key: other_partition,
                fencing_token: claimed_b.fencing_token
              )
@@ -2099,14 +2403,14 @@ defmodule Ferricstore.FlowTest do
     {partition, same_partition, other_partition} = mixed_partition_keys()
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [
                  %{id: child_a, type: "child", partition_key: same_partition},
@@ -2129,7 +2433,7 @@ defmodule Ferricstore.FlowTest do
     claimed_b = create_claimed_flow_child(child_b, other_partition, "worker-cross-any-fail-b")
 
     assert {:ok, failed_children} =
-             FerricStore.flow_fail_many(
+             flow_fail_many_and_get(
                nil,
                [
                  %{
@@ -2163,14 +2467,14 @@ defmodule Ferricstore.FlowTest do
     {partition, same_partition, other_partition} = mixed_partition_keys()
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, _waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [
                  %{id: failed_child, type: "child", partition_key: other_partition},
@@ -2190,7 +2494,7 @@ defmodule Ferricstore.FlowTest do
     claimed_failed = create_claimed_flow_child(failed_child, other_partition, "worker-cross-fail")
 
     assert {:ok, [%{id: ^failed_child, state: "failed"}]} =
-             FerricStore.flow_fail_many(
+             flow_fail_many_and_get(
                nil,
                [
                  %{
@@ -2227,14 +2531,14 @@ defmodule Ferricstore.FlowTest do
     other_new_id = uid("bulk-mixed-other")
 
     assert {:ok, _} =
-             FerricStore.flow_create(existing_id,
+             flow_create_and_get(existing_id,
                type: type,
                partition_key: same_a,
                run_at_ms: 1_000
              )
 
     assert {:ok, results} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                nil,
                [
                  %{id: existing_id, partition_key: same_a},
@@ -2275,7 +2579,7 @@ defmodule Ferricstore.FlowTest do
       Ferricstore.PubSub.unsubscribe(due_channel, self())
     end)
 
-    assert {:ok, %{id: ^id}} =
+    assert :ok =
              FerricStore.flow_create(id,
                type: "observability",
                state: "queued",
@@ -2283,12 +2587,11 @@ defmodule Ferricstore.FlowTest do
                now_ms: 1_000
              )
 
-    assert_receive {:flow_telemetry, [:ferricstore, :flow, :create, :stop], measurements,
-                    metadata}
+    assert_receive {:flow_telemetry, [:ferricstore, :flow, :create, :stop],
+                    %{duration_ms: duration_ms, count: 1},
+                    %{flow_id: ^id, flow_type: "observability", result: :ok, reason: nil}}
 
-    assert %{duration_ms: duration_ms, count: 1} = measurements
     assert is_integer(duration_ms) and duration_ms >= 0
-    assert %{flow_id: ^id, flow_type: "observability", result: :ok, reason: nil} = metadata
 
     refute_receive {:pubsub_message, ^changed_channel, _message}, 50
     refute_receive {:pubsub_message, ^due_channel, _message}, 50
@@ -2296,28 +2599,28 @@ defmodule Ferricstore.FlowTest do
 
   test "flow APIs reject malformed inputs before raft apply" do
     assert {:error, "ERR flow id must be a non-empty string"} =
-             FerricStore.flow_create("", type: "checkout")
+             flow_create_and_get("", type: "checkout")
 
     assert {:error, "ERR flow opts must be a keyword list"} =
-             FerricStore.flow_create("bad-opts", ["checkout"])
+             flow_create_and_get("bad-opts", ["checkout"])
 
     assert {:error, "ERR flow type is required"} =
-             FerricStore.flow_create("missing-type", state: "queued")
+             flow_create_and_get("missing-type", state: "queued")
 
     assert {:error, "ERR flow type must be a non-empty string"} =
-             FerricStore.flow_create("empty-type", type: "")
+             flow_create_and_get("empty-type", type: "")
 
     assert {:error, "ERR flow now_ms must be a non-negative integer"} =
-             FerricStore.flow_create("bad-now", type: "checkout", now_ms: -1)
+             flow_create_and_get("bad-now", type: "checkout", now_ms: -1)
 
     assert {:error, "ERR flow run_at_ms must be a non-negative integer"} =
-             FerricStore.flow_create("bad-run-at", type: "checkout", run_at_ms: -1)
+             flow_create_and_get("bad-run-at", type: "checkout", run_at_ms: -1)
 
     assert {:error, "ERR flow priority must be between 0 and 2"} =
-             FerricStore.flow_create("bad-priority", type: "checkout", priority: 3)
+             flow_create_and_get("bad-priority", type: "checkout", priority: 3)
 
     assert {:error, "ERR flow partition_key must be a non-empty string or :global"} =
-             FerricStore.flow_create("bad-partition", type: "checkout", partition_key: "")
+             flow_create_and_get("bad-partition", type: "checkout", partition_key: "")
 
     assert {:error, "ERR flow opts must be a keyword list"} =
              FerricStore.flow_get("bad-get", ["bad"])
@@ -2335,13 +2638,13 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_claim_due("email", worker: "worker-a", limit: 0)
 
     assert {:error, "ERR flow lease_token must be a non-empty string"} =
-             FerricStore.flow_complete("flow", "")
+             flow_complete_and_get("flow", "")
 
     assert {:error, "ERR flow fencing_token is required"} =
-             FerricStore.flow_complete("flow", "token")
+             flow_complete_and_get("flow", "token")
 
     assert {:error, "ERR flow now_ms must be a non-negative integer"} =
-             FerricStore.flow_retry("flow", "token", fencing_token: 0, now_ms: -1)
+             flow_retry_and_get("flow", "token", fencing_token: 0, now_ms: -1)
 
     assert {:error, "ERR flow id must be a non-empty string"} =
              FerricStore.flow_history("")
@@ -2356,40 +2659,40 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_history("flow", count: 10_001)
 
     assert {:error, "ERR flow id must be a non-empty string"} =
-             FerricStore.flow_transition("", "queued", "done")
+             flow_transition_and_get("", "queued", "done")
 
     assert {:error, "ERR flow from must be a non-empty string"} =
-             FerricStore.flow_transition("flow", "", "done")
+             flow_transition_and_get("flow", "", "done")
 
     assert {:error, "ERR flow to must be a non-empty string"} =
-             FerricStore.flow_transition("flow", "queued", "")
+             flow_transition_and_get("flow", "queued", "")
 
     assert {:error, "ERR flow opts must be a keyword list"} =
-             FerricStore.flow_transition("flow", "queued", "done", ["bad"])
+             flow_transition_and_get("flow", "queued", "done", ["bad"])
 
     assert {:error, "ERR flow lease_token must be a non-empty string"} =
-             FerricStore.flow_transition("flow", "queued", "done", lease_token: "")
+             flow_transition_and_get("flow", "queued", "done", lease_token: "")
 
     assert {:error, "ERR flow fencing_token is required"} =
-             FerricStore.flow_transition("flow", "queued", "done")
+             flow_transition_and_get("flow", "queued", "done")
 
     assert {:error, "ERR flow lease_token must be a non-empty string"} =
-             FerricStore.flow_fail("flow", "")
+             flow_fail_and_get("flow", "")
 
     assert {:error, "ERR flow fencing_token is required"} =
-             FerricStore.flow_fail("flow", "token")
+             flow_fail_and_get("flow", "token")
 
     assert {:error, "ERR flow now_ms must be a non-negative integer"} =
-             FerricStore.flow_fail("flow", "token", fencing_token: 0, now_ms: -1)
+             flow_fail_and_get("flow", "token", fencing_token: 0, now_ms: -1)
 
     assert {:error, "ERR flow id must be a non-empty string"} =
-             FerricStore.flow_cancel("")
+             flow_cancel_and_get("")
 
     assert {:error, "ERR flow opts must be a keyword list"} =
-             FerricStore.flow_cancel("flow", ["bad"])
+             flow_cancel_and_get("flow", ["bad"])
 
     assert {:error, "ERR flow fencing_token is required"} =
-             FerricStore.flow_cancel("flow")
+             flow_cancel_and_get("flow")
 
     assert {:error, "ERR flow partition_key must be a non-empty string or :global"} =
              FerricStore.flow_claim_due("email", worker: "worker-a", partition_key: "")
@@ -2397,25 +2700,25 @@ defmodule Ferricstore.FlowTest do
     large_id = String.duplicate("x", 65_536)
 
     assert {:error, "ERR key too large" <> _} =
-             FerricStore.flow_create(large_id, type: "checkout")
+             flow_create_and_get(large_id, type: "checkout")
 
     assert {:error, "ERR flow payload_ref input is not supported; use payload"} =
-             FerricStore.flow_create("payload-ref-input", type: "checkout", payload_ref: "p")
+             flow_create_and_get("payload-ref-input", type: "checkout", payload_ref: "p")
 
     assert {:error, "ERR flow result_ref input is not supported; use result"} =
-             FerricStore.flow_complete("flow", "token", fencing_token: 0, result_ref: "r")
+             flow_complete_and_get("flow", "token", fencing_token: 0, result_ref: "r")
 
     assert {:error, "ERR flow error_ref input is not supported; use error"} =
-             FerricStore.flow_retry("flow", "token", fencing_token: 0, error_ref: "e")
+             flow_retry_and_get("flow", "token", fencing_token: 0, error_ref: "e")
 
     assert {:error, "ERR flow error_ref input is not supported; use error"} =
-             FerricStore.flow_fail("flow", "token", fencing_token: 0, error_ref: "e")
+             flow_fail_and_get("flow", "token", fencing_token: 0, error_ref: "e")
 
     assert {:error, "ERR flow reason_ref input is not supported; use reason"} =
-             FerricStore.flow_cancel("flow", fencing_token: 0, reason_ref: "external")
+             flow_cancel_and_get("flow", fencing_token: 0, reason_ref: "external")
 
     assert {:error, "ERR flow reason_ref input is not supported; use reason"} =
-             FerricStore.flow_cancel("flow",
+             flow_cancel_and_get("flow",
                fencing_token: 0,
                reason: "inline",
                reason_ref: "external"
@@ -2429,7 +2732,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-claim")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "email",
                state: "queued",
                payload: "payload:" <> id,
@@ -2468,7 +2771,7 @@ defmodule Ferricstore.FlowTest do
 
     for id <- ids do
       assert {:ok, _} =
-               FerricStore.flow_create(id,
+               flow_create_and_get(id,
                  type: type,
                  state: "queued",
                  payload: "payload:" <> id,
@@ -2544,7 +2847,7 @@ defmodule Ferricstore.FlowTest do
       |> Enum.map(fn {member, _score} -> member end)
     end
 
-    assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_000)
+    assert {:ok, _} = flow_create_and_get(id, type: type, run_at_ms: 1_000)
     assert [^id] = range_ids.(queued_index)
 
     assert {:ok, [first_claim]} =
@@ -2561,7 +2864,7 @@ defmodule Ferricstore.FlowTest do
     assert [^id] = range_ids.(worker_index)
 
     assert {:ok, _retried} =
-             FerricStore.flow_retry(id, first_claim.lease_token,
+             flow_retry_and_get(id, first_claim.lease_token,
                fencing_token: first_claim.fencing_token,
                run_at_ms: 2_000
              )
@@ -2580,7 +2883,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _completed} =
-             FerricStore.flow_complete(id, second_claim.lease_token,
+             flow_complete_and_get(id, second_claim.lease_token,
                fencing_token: second_claim.fencing_token
              )
 
@@ -2596,9 +2899,9 @@ defmodule Ferricstore.FlowTest do
     done_id = uid("flow-list-done")
     type = "ops"
 
-    assert {:ok, _} = FerricStore.flow_create(due_id, type: type, run_at_ms: 2_000)
-    assert {:ok, _} = FerricStore.flow_create(running_id, type: type, run_at_ms: 1_000)
-    assert {:ok, _} = FerricStore.flow_create(done_id, type: type, run_at_ms: 1_000)
+    assert {:ok, _} = flow_create_and_get(due_id, type: type, run_at_ms: 2_000)
+    assert {:ok, _} = flow_create_and_get(running_id, type: type, run_at_ms: 1_000)
+    assert {:ok, _} = flow_create_and_get(done_id, type: type, run_at_ms: 1_000)
 
     assert {:ok, [claimed_running, claimed_done]} =
              FerricStore.flow_claim_due(type,
@@ -2609,7 +2912,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_complete(claimed_done.id, claimed_done.lease_token,
+             flow_complete_and_get(claimed_done.id, claimed_done.lease_token,
                fencing_token: claimed_done.fencing_token
              )
 
@@ -2662,7 +2965,7 @@ defmodule Ferricstore.FlowTest do
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: type,
                partition_key: partition,
                run_at_ms: 1,
@@ -2679,7 +2982,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _completed} =
-             FerricStore.flow_complete(claimed.id, claimed.lease_token,
+             flow_complete_and_get(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 3,
                partition_key: partition
@@ -2703,7 +3006,7 @@ defmodule Ferricstore.FlowTest do
     end)
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: type,
                partition_key: partition,
                run_at_ms: 1,
@@ -2733,7 +3036,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-info-empty-index")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: type,
                partition_key: partition,
                run_at_ms: 1,
@@ -2759,7 +3062,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-native-index")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: type,
                partition_key: partition,
                run_at_ms: 1_000,
@@ -2822,7 +3125,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-partition")
 
     assert {:ok, flow} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "email",
                partition_key: partition,
                state: "queued",
@@ -2858,12 +3161,10 @@ defmodule Ferricstore.FlowTest do
     assert claimed.partition_key == partition
 
     assert {:error, "ERR flow not found"} =
-             FerricStore.flow_complete(id, claimed.lease_token,
-               fencing_token: claimed.fencing_token
-             )
+             flow_complete_and_get(id, claimed.lease_token, fencing_token: claimed.fencing_token)
 
     assert {:ok, completed} =
-             FerricStore.flow_complete(id, claimed.lease_token,
+             flow_complete_and_get(id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                partition_key: partition
              )
@@ -2886,14 +3187,14 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("flow-partition-claim-b")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id_a,
+             flow_create_and_get(id_a,
                type: "email",
                partition_key: partition_a,
                run_at_ms: 1_000
              )
 
     assert {:ok, _} =
-             FerricStore.flow_create(id_b,
+             flow_create_and_get(id_b,
                type: "email",
                partition_key: partition_b,
                run_at_ms: 1_000
@@ -2941,17 +3242,17 @@ defmodule Ferricstore.FlowTest do
     ready_partition = uid("flow-claim-any-ready")
     held_partition = uid("flow-claim-any-held")
 
-    assert {:ok, _} = FerricStore.flow_create(queued_global, type: type, run_at_ms: 1_000)
+    assert {:ok, _} = flow_create_and_get(queued_global, type: type, run_at_ms: 1_000)
 
     assert {:ok, _} =
-             FerricStore.flow_create(queued_partition,
+             flow_create_and_get(queued_partition,
                type: type,
                partition_key: partition_b,
                run_at_ms: 1_000
              )
 
     assert {:ok, _} =
-             FerricStore.flow_create(ready_partition,
+             flow_create_and_get(ready_partition,
                type: type,
                state: "ready",
                partition_key: partition_a,
@@ -2959,7 +3260,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_create(held_partition,
+             flow_create_and_get(held_partition,
                type: type,
                state: "held",
                partition_key: partition_b,
@@ -3016,7 +3317,7 @@ defmodule Ferricstore.FlowTest do
       Enum.find(partitions_by_shard, fn {shard, _partitions} -> shard != 0 end)
 
     assert {:ok, _} =
-             FerricStore.flow_create(low_id,
+             flow_create_and_get(low_id,
                type: type,
                partition_key: low_partition,
                priority: 0,
@@ -3024,7 +3325,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_create(high_id,
+             flow_create_and_get(high_id,
                type: type,
                partition_key: high_partition,
                priority: 2,
@@ -3070,7 +3371,7 @@ defmodule Ferricstore.FlowTest do
           {partition_1, "1b"}
         ] do
       assert {:ok, _} =
-               FerricStore.flow_create(uid("flow-claim-any-rotate-#{suffix}"),
+               flow_create_and_get(uid("flow-claim-any-rotate-#{suffix}"),
                  type: type,
                  partition_key: partition,
                  priority: 0,
@@ -3124,7 +3425,7 @@ defmodule Ferricstore.FlowTest do
 
     for suffix <- ["hot-a", "hot-b"] do
       assert {:ok, _} =
-               FerricStore.flow_create(uid("flow-claim-any-skew-#{suffix}"),
+               flow_create_and_get(uid("flow-claim-any-skew-#{suffix}"),
                  type: type,
                  partition_key: hot_partition,
                  run_at_ms: 1_000
@@ -3132,7 +3433,7 @@ defmodule Ferricstore.FlowTest do
     end
 
     assert {:ok, _} =
-             FerricStore.flow_create(uid("flow-claim-any-skew-other"),
+             flow_create_and_get(uid("flow-claim-any-skew-other"),
                type: type,
                partition_key: other_partition,
                run_at_ms: 1_000
@@ -3159,10 +3460,10 @@ defmodule Ferricstore.FlowTest do
     live_id = "z-" <> uid("flow-live-due")
 
     assert {:ok, _} =
-             FerricStore.flow_create(stale_id, type: "stale-scan", run_at_ms: 1_000)
+             flow_create_and_get(stale_id, type: "stale-scan", run_at_ms: 1_000)
 
     assert {:ok, _} =
-             FerricStore.flow_create(live_id, type: "stale-scan", run_at_ms: 1_000)
+             flow_create_and_get(live_id, type: "stale-scan", run_at_ms: 1_000)
 
     assert {:ok, 1} = FerricStore.del(Ferricstore.Flow.Keys.state_key(stale_id))
 
@@ -3182,14 +3483,14 @@ defmodule Ferricstore.FlowTest do
     high_id = uid("flow-high-priority")
 
     assert {:ok, _} =
-             FerricStore.flow_create(low_id,
+             flow_create_and_get(low_id,
                type: "priority",
                priority: 0,
                run_at_ms: 1_000
              )
 
     assert {:ok, _} =
-             FerricStore.flow_create(high_id,
+             flow_create_and_get(high_id,
                type: "priority",
                priority: 2,
                run_at_ms: 1_000
@@ -3221,14 +3522,14 @@ defmodule Ferricstore.FlowTest do
     high_id = uid("flow-high-priority-target")
 
     assert {:ok, _} =
-             FerricStore.flow_create(low_id,
+             flow_create_and_get(low_id,
                type: "priority-target",
                priority: 0,
                run_at_ms: 1_000
              )
 
     assert {:ok, _} =
-             FerricStore.flow_create(high_id,
+             flow_create_and_get(high_id,
                type: "priority-target",
                priority: 2,
                run_at_ms: 1_000
@@ -3261,7 +3562,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-complete")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id, type: "image", state: "queued", run_at_ms: 1_000)
+             flow_create_and_get(id, type: "image", state: "queued", run_at_ms: 1_000)
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due("image",
@@ -3273,19 +3574,19 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_complete(id, "wrong-token",
+             flow_complete_and_get(id, "wrong-token",
                fencing_token: claimed.fencing_token,
                result: "result:" <> id
              )
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_complete(id, claimed.lease_token,
+             flow_complete_and_get(id, claimed.lease_token,
                fencing_token: claimed.fencing_token + 1,
                result: "result:" <> id
              )
 
     assert {:ok, completed} =
-             FerricStore.flow_complete(claimed.id, claimed.lease_token,
+             flow_complete_and_get(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                result: "result:" <> id
              )
@@ -3301,7 +3602,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-retry")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id, type: "webhook", state: "queued", run_at_ms: 1_000)
+             flow_create_and_get(id, type: "webhook", state: "queued", run_at_ms: 1_000)
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due("webhook",
@@ -3313,14 +3614,14 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+             flow_retry_and_get(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token + 1,
                error: "error:" <> id,
                run_at_ms: 2_000
              )
 
     assert {:ok, retried} =
-             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+             flow_retry_and_get(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                error: "error:" <> id,
                run_at_ms: 2_000
@@ -3349,7 +3650,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-retry-run-state")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "payment",
                state: "charge_card",
                run_at_ms: 1_000
@@ -3368,7 +3669,7 @@ defmodule Ferricstore.FlowTest do
     assert claimed.run_state == "charge_card"
 
     assert {:ok, retried} =
-             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+             flow_retry_and_get(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 2_000,
                retry: [
@@ -3422,7 +3723,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-retry-exhaust")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "payment-exhaust",
                state: "charge_card",
                run_at_ms: 1_000
@@ -3437,7 +3738,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, exhausted} =
-             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+             flow_retry_and_get(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 2_000,
                retry: [
@@ -3467,7 +3768,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-retry-terminal-exhaust")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "payment-terminal-exhaust",
                state: "charge_card",
                run_at_ms: 1_000
@@ -3482,7 +3783,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, exhausted} =
-             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+             flow_retry_and_get(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 2_000,
                retry: [
@@ -3511,14 +3812,14 @@ defmodule Ferricstore.FlowTest do
     {partition, _same_partition, other_partition} = mixed_partition_keys()
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child, type: "child", partition_key: other_partition}],
                group_id: "retry-fanout",
@@ -3536,7 +3837,7 @@ defmodule Ferricstore.FlowTest do
     claimed = create_claimed_flow_child(child, other_partition, "worker-retry-cross")
 
     assert {:ok, exhausted_child} =
-             FerricStore.flow_retry(child, claimed.lease_token,
+             flow_retry_and_get(child, claimed.lease_token,
                partition_key: other_partition,
                fencing_token: claimed.fencing_token,
                now_ms: 2_000,
@@ -3555,7 +3856,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-retry-policy-invalid")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id, type: "retry-policy-invalid", run_at_ms: 1_000)
+             flow_create_and_get(id, type: "retry-policy-invalid", run_at_ms: 1_000)
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due("retry-policy-invalid",
@@ -3565,13 +3866,13 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:error, "ERR flow retry max_retries must be between 0 and 1000"} =
-             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+             flow_retry_and_get(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                retry: [max_retries: 1001]
              )
 
     assert {:error, "ERR flow retry exhausted_to cannot be running"} =
-             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+             flow_retry_and_get(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                retry: [exhausted_to: "running"]
              )
@@ -3689,7 +3990,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _flow} =
-             FerricStore.Impl.flow_create(ctx, id,
+             impl_flow_create_and_get(ctx, id,
                type: type,
                state: "charge_card",
                run_at_ms: 1_000,
@@ -3716,7 +4017,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, retried} =
-             FerricStore.Impl.flow_retry(restarted, claimed.id, claimed.lease_token,
+             impl_flow_retry_and_get(restarted, claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 2_000
              )
@@ -3746,7 +4047,7 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant-restart")
 
     assert {:ok, created_parent} =
-             FerricStore.Impl.flow_create(ctx, parent,
+             impl_flow_create_and_get(ctx, parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition,
@@ -3754,7 +4055,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _waiting} =
-             FerricStore.Impl.flow_spawn_children(
+             impl_flow_spawn_children_and_get(
                ctx,
                parent,
                [%{id: child, type: "child", state: "queued"}],
@@ -3801,7 +4102,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_create(id, type: type, state: "charge_card", run_at_ms: 1_000)
+             flow_create_and_get(id, type: type, state: "charge_card", run_at_ms: 1_000)
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due(type,
@@ -3812,7 +4113,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, exhausted} =
-             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+             flow_retry_and_get(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 2_000
              )
@@ -3833,7 +4134,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_create(id, type: type, state: "charge_card", run_at_ms: 1_000)
+             flow_create_and_get(id, type: type, state: "charge_card", run_at_ms: 1_000)
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due(type,
@@ -3844,7 +4145,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, retried} =
-             FerricStore.flow_retry(claimed.id, claimed.lease_token,
+             flow_retry_and_get(claimed.id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 2_000,
                retry: [
@@ -4002,7 +4303,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("retry-many-b")
 
     assert {:ok, _} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: id_a}, %{id: id_b}],
                type: type,
@@ -4026,7 +4327,7 @@ defmodule Ferricstore.FlowTest do
       end)
 
     assert {:ok, retried} =
-             FerricStore.flow_retry_many(partition, items,
+             flow_retry_many_and_get(partition, items,
                error: "retry-error",
                run_at_ms: 2_000,
                now_ms: 2_000
@@ -4055,7 +4356,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("retry-many-bad")
 
     assert {:ok, _} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: id_a}, %{id: id_b}],
                type: type,
@@ -4082,7 +4383,7 @@ defmodule Ferricstore.FlowTest do
       end)
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_retry_many(partition, items, now_ms: 2_000, run_at_ms: 2_000)
+             flow_retry_many_and_get(partition, items, now_ms: 2_000, run_at_ms: 2_000)
 
     assert {:ok, fetched_a} = FerricStore.flow_get(id_a, partition_key: partition)
     assert {:ok, fetched_b} = FerricStore.flow_get(id_b, partition_key: partition)
@@ -4099,7 +4400,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("retry-many-policy-b")
 
     assert {:ok, _} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: id_a}, %{id: id_b}],
                type: type,
@@ -4121,7 +4422,7 @@ defmodule Ferricstore.FlowTest do
       end)
 
     assert {:error, "ERR flow retry max_retries must be between 0 and 1000"} =
-             FerricStore.flow_retry_many(partition, items,
+             flow_retry_many_and_get(partition, items,
                retry: [max_retries: 1001],
                now_ms: 2_000
              )
@@ -4138,7 +4439,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-reclaim")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id, type: "lease", state: "queued", run_at_ms: 1_000)
+             flow_create_and_get(id, type: "lease", state: "queued", run_at_ms: 1_000)
 
     assert {:ok, [first]} =
              FerricStore.flow_claim_due("lease",
@@ -4179,7 +4480,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-reclaim-api")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id, type: "lease-api", state: "queued", run_at_ms: 1_000)
+             flow_create_and_get(id, type: "lease-api", state: "queued", run_at_ms: 1_000)
 
     assert {:ok, [first]} =
              FerricStore.flow_claim_due("lease-api",
@@ -4214,7 +4515,7 @@ defmodule Ferricstore.FlowTest do
     type = uid("lease-extend")
     id = uid("flow-lease-extend")
 
-    assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_000)
+    assert {:ok, _} = flow_create_and_get(id, type: type, run_at_ms: 1_000)
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due(type,
@@ -4257,7 +4558,7 @@ defmodule Ferricstore.FlowTest do
     type = uid("lease-reclaim-fence")
     id = uid("flow-reclaim-fence")
 
-    assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_000)
+    assert {:ok, _} = flow_create_and_get(id, type: type, run_at_ms: 1_000)
 
     assert {:ok, [first]} =
              FerricStore.flow_claim_due(type,
@@ -4281,7 +4582,7 @@ defmodule Ferricstore.FlowTest do
     assert second.lease_token != first.lease_token
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_complete(id, first.lease_token,
+             flow_complete_and_get(id, first.lease_token,
                fencing_token: first.fencing_token,
                now_ms: 1_060
              )
@@ -4308,7 +4609,7 @@ defmodule Ferricstore.FlowTest do
     type = uid("lease-extend-terminal")
     id = uid("flow-lease-extend-terminal")
 
-    assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_000)
+    assert {:ok, _} = flow_create_and_get(id, type: type, run_at_ms: 1_000)
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due(type,
@@ -4319,7 +4620,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _completed} =
-             FerricStore.flow_complete(id, claimed.lease_token,
+             flow_complete_and_get(id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 1_010
              )
@@ -4338,7 +4639,7 @@ defmodule Ferricstore.FlowTest do
     fresh_ids = Enum.map(1..4, &uid("flow-fresh-#{&1}"))
 
     for id <- expired_ids do
-      assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_000)
+      assert {:ok, _} = flow_create_and_get(id, type: type, run_at_ms: 1_000)
     end
 
     assert {:ok, expired_first_claim} =
@@ -4352,7 +4653,7 @@ defmodule Ferricstore.FlowTest do
     assert MapSet.new(Enum.map(expired_first_claim, & &1.id)) == MapSet.new(expired_ids)
 
     for id <- fresh_ids do
-      assert {:ok, _} = FerricStore.flow_create(id, type: type, run_at_ms: 1_050)
+      assert {:ok, _} = flow_create_and_get(id, type: type, run_at_ms: 1_050)
     end
 
     assert {:ok, claimed} =
@@ -4378,7 +4679,7 @@ defmodule Ferricstore.FlowTest do
     expired_id = uid("flow-expired")
     fresh_id = uid("flow-fresh")
 
-    assert {:ok, _} = FerricStore.flow_create(expired_id, type: type, run_at_ms: 1_000)
+    assert {:ok, _} = flow_create_and_get(expired_id, type: type, run_at_ms: 1_000)
 
     assert {:ok, [_]} =
              FerricStore.flow_claim_due(type,
@@ -4388,7 +4689,7 @@ defmodule Ferricstore.FlowTest do
                now_ms: 1_000
              )
 
-    assert {:ok, _} = FerricStore.flow_create(fresh_id, type: type, run_at_ms: 1_050)
+    assert {:ok, _} = flow_create_and_get(fresh_id, type: type, run_at_ms: 1_050)
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due(type,
@@ -4411,7 +4712,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("flow-reclaim-b")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id_a,
+             flow_create_and_get(id_a,
                type: type,
                state: "queued",
                partition_key: partition_a,
@@ -4419,7 +4720,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_create(id_b,
+             flow_create_and_get(id_b,
                type: type,
                state: "queued",
                partition_key: partition_b,
@@ -4487,7 +4788,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-transition")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "checkout",
                state: "payment_pending",
                run_at_ms: 1_000,
@@ -4495,7 +4796,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, transitioned} =
-             FerricStore.flow_transition(id, "payment_pending", "email_pending",
+             flow_transition_and_get(id, "payment_pending", "email_pending",
                fencing_token: 0,
                run_at_ms: 2_000,
                now_ms: 1_100
@@ -4541,7 +4842,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("transition-b")
 
     assert {:ok, _} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: id_a}, %{id: id_b}],
                type: type,
@@ -4551,7 +4852,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, transitioned} =
-             FerricStore.flow_transition_many(
+             flow_transition_many_and_get(
                partition,
                "queued",
                "ready",
@@ -4595,7 +4896,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("transition-bad")
 
     assert {:ok, _} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: id_a}, %{id: id_b}],
                type: type,
@@ -4604,7 +4905,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_transition_many(
+             flow_transition_many_and_get(
                partition,
                "queued",
                "ready",
@@ -4648,7 +4949,7 @@ defmodule Ferricstore.FlowTest do
 
     for {id, partition} <- [{bad_id, same_a}, {same_id, same_b}, {other_id, other}] do
       assert {:ok, _} =
-               FerricStore.flow_create(id,
+               flow_create_and_get(id,
                  type: type,
                  partition_key: partition,
                  state: "queued",
@@ -4657,7 +4958,7 @@ defmodule Ferricstore.FlowTest do
     end
 
     assert {:ok, results} =
-             FerricStore.flow_transition_many(
+             flow_transition_many_and_get(
                nil,
                "queued",
                "ready",
@@ -4700,7 +5001,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("complete-many-b")
 
     assert {:ok, _} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: id_a}, %{id: id_b}],
                type: type,
@@ -4725,7 +5026,7 @@ defmodule Ferricstore.FlowTest do
       end)
 
     assert {:ok, completed} =
-             FerricStore.flow_complete_many(partition, items,
+             flow_complete_many_and_get(partition, items,
                result: "result-batch",
                now_ms: 2_000
              )
@@ -4745,7 +5046,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("complete-many-bad")
 
     assert {:ok, _} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: id_a}, %{id: id_b}],
                type: type,
@@ -4772,7 +5073,7 @@ defmodule Ferricstore.FlowTest do
       end)
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_complete_many(partition, items, now_ms: 2_000)
+             flow_complete_many_and_get(partition, items, now_ms: 2_000)
 
     assert {:ok, fetched_a} = FerricStore.flow_get(id_a, partition_key: partition)
     assert {:ok, fetched_b} = FerricStore.flow_get(id_b, partition_key: partition)
@@ -4795,7 +5096,7 @@ defmodule Ferricstore.FlowTest do
     other_flow = create_claimed_flow(uid("complete-mixed-other"), other, type, "worker-complete")
 
     assert {:ok, results} =
-             FerricStore.flow_complete_many(
+             flow_complete_many_and_get(
                nil,
                [
                  %{
@@ -4841,7 +5142,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("fail-many-b")
 
     assert {:ok, _} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: id_a}, %{id: id_b}],
                type: type,
@@ -4865,7 +5166,7 @@ defmodule Ferricstore.FlowTest do
       end)
 
     assert {:ok, failed} =
-             FerricStore.flow_fail_many(partition, items,
+             flow_fail_many_and_get(partition, items,
                error: "error-batch",
                now_ms: 2_000
              )
@@ -4885,7 +5186,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("fail-many-bad")
 
     assert {:ok, _} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: id_a}, %{id: id_b}],
                type: type,
@@ -4912,7 +5213,7 @@ defmodule Ferricstore.FlowTest do
       end)
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_fail_many(partition, items, now_ms: 2_000)
+             flow_fail_many_and_get(partition, items, now_ms: 2_000)
 
     assert {:ok, fetched_a} = FerricStore.flow_get(id_a, partition_key: partition)
     assert {:ok, fetched_b} = FerricStore.flow_get(id_b, partition_key: partition)
@@ -4930,7 +5231,7 @@ defmodule Ferricstore.FlowTest do
     other_flow = create_claimed_flow(uid("retry-mixed-other"), other, type, "worker-retry")
 
     assert {:ok, results} =
-             FerricStore.flow_retry_many(
+             flow_retry_many_and_get(
                nil,
                [
                  %{
@@ -4974,14 +5275,14 @@ defmodule Ferricstore.FlowTest do
     {partition, _same_partition, other_partition} = mixed_partition_keys()
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child, type: "child", partition_key: other_partition}],
                group_id: "retry-many-fanout",
@@ -4999,7 +5300,7 @@ defmodule Ferricstore.FlowTest do
     claimed = create_claimed_flow_child(child, other_partition, "worker-retry-many-cross")
 
     assert {:ok, [exhausted_child]} =
-             FerricStore.flow_retry_many(
+             flow_retry_many_and_get(
                nil,
                [
                  %{
@@ -5029,7 +5330,7 @@ defmodule Ferricstore.FlowTest do
     other_flow = create_claimed_flow(uid("fail-mixed-other"), other, type, "worker-fail")
 
     assert {:ok, results} =
-             FerricStore.flow_fail_many(
+             flow_fail_many_and_get(
                nil,
                [
                  %{
@@ -5073,7 +5374,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("cancel-many-b")
 
     assert {:ok, _} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: id_a}, %{id: id_b}],
                type: type,
@@ -5087,7 +5388,7 @@ defmodule Ferricstore.FlowTest do
     ]
 
     assert {:ok, cancelled} =
-             FerricStore.flow_cancel_many(partition, items,
+             flow_cancel_many_and_get(partition, items,
                reason: "cancel-batch",
                now_ms: 2_000
              )
@@ -5107,7 +5408,7 @@ defmodule Ferricstore.FlowTest do
     id_b = uid("cancel-many-bad")
 
     assert {:ok, _} =
-             FerricStore.flow_create_many(
+             flow_create_many_and_get(
                partition,
                [%{id: id_a}, %{id: id_b}],
                type: type,
@@ -5121,7 +5422,7 @@ defmodule Ferricstore.FlowTest do
     ]
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_cancel_many(partition, items, now_ms: 2_000)
+             flow_cancel_many_and_get(partition, items, now_ms: 2_000)
 
     assert {:ok, fetched_a} = FerricStore.flow_get(id_a, partition_key: partition)
     assert {:ok, fetched_b} = FerricStore.flow_get(id_b, partition_key: partition)
@@ -5140,7 +5441,7 @@ defmodule Ferricstore.FlowTest do
 
     for {id, partition} <- [{bad_id, same_a}, {same_id, same_b}, {other_id, other}] do
       assert {:ok, _} =
-               FerricStore.flow_create(id,
+               flow_create_and_get(id,
                  type: type,
                  partition_key: partition,
                  state: "queued",
@@ -5149,7 +5450,7 @@ defmodule Ferricstore.FlowTest do
     end
 
     assert {:ok, results} =
-             FerricStore.flow_cancel_many(
+             flow_cancel_many_and_get(
                nil,
                [
                  %{id: bad_id, partition_key: same_a, fencing_token: 1},
@@ -5174,10 +5475,10 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-transition-guard")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id, type: "checkout", state: "queued", run_at_ms: 1_000)
+             flow_create_and_get(id, type: "checkout", state: "queued", run_at_ms: 1_000)
 
     assert {:error, "ERR flow wrong state"} =
-             FerricStore.flow_transition(id, "running", "completed",
+             flow_transition_and_get(id, "running", "completed",
                fencing_token: 0,
                run_at_ms: 1_000
              )
@@ -5196,20 +5497,20 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_transition(id, "running", "next",
+             flow_transition_and_get(id, "running", "next",
                fencing_token: claimed.fencing_token,
                run_at_ms: 2_000
              )
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_transition(id, "running", "next",
+             flow_transition_and_get(id, "running", "next",
                lease_token: claimed.lease_token,
                fencing_token: claimed.fencing_token + 1,
                run_at_ms: 2_000
              )
 
     assert {:ok, transitioned} =
-             FerricStore.flow_transition(id, "running", "next",
+             flow_transition_and_get(id, "running", "next",
                lease_token: claimed.lease_token,
                fencing_token: claimed.fencing_token,
                run_at_ms: 2_000
@@ -5225,14 +5526,14 @@ defmodule Ferricstore.FlowTest do
     {partition, _same_partition, other_partition} = mixed_partition_keys()
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition
              )
 
     assert {:ok, waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child, type: "child", partition_key: other_partition}],
                group_id: "fanout",
@@ -5250,7 +5551,7 @@ defmodule Ferricstore.FlowTest do
     claimed = create_claimed_flow_child(child, other_partition, "worker-terminal-transition")
 
     assert {:error, "ERR terminal flow state requires FLOW.COMPLETE, FLOW.FAIL, or FLOW.CANCEL"} =
-             FerricStore.flow_transition(child, "running", "completed",
+             flow_transition_and_get(child, "running", "completed",
                partition_key: other_partition,
                lease_token: claimed.lease_token,
                fencing_token: claimed.fencing_token,
@@ -5267,10 +5568,10 @@ defmodule Ferricstore.FlowTest do
     huge_state = String.duplicate("x", 65_536)
 
     assert {:ok, _} =
-             FerricStore.flow_create(id, type: "audit", state: "queued", run_at_ms: 1_000)
+             flow_create_and_get(id, type: "audit", state: "queued", run_at_ms: 1_000)
 
     assert {:error, "ERR key too large" <> _} =
-             FerricStore.flow_transition(id, "queued", huge_state,
+             flow_transition_and_get(id, "queued", huge_state,
                fencing_token: 0,
                run_at_ms: 2_000,
                now_ms: 1_100
@@ -5298,8 +5599,8 @@ defmodule Ferricstore.FlowTest do
     fail_type = "jobs-fail"
     cancel_type = "jobs-cancel"
 
-    assert {:ok, _} = FerricStore.flow_create(fail_id, type: fail_type, run_at_ms: 1_000)
-    assert {:ok, _} = FerricStore.flow_create(cancel_id, type: cancel_type, run_at_ms: 1_000)
+    assert {:ok, _} = flow_create_and_get(fail_id, type: fail_type, run_at_ms: 1_000)
+    assert {:ok, _} = flow_create_and_get(cancel_id, type: cancel_type, run_at_ms: 1_000)
 
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due(fail_type,
@@ -5313,14 +5614,14 @@ defmodule Ferricstore.FlowTest do
     assert claimed.id == fail_id
 
     assert {:error, "ERR stale flow lease"} =
-             FerricStore.flow_fail(fail_id, claimed.lease_token,
+             flow_fail_and_get(fail_id, claimed.lease_token,
                fencing_token: claimed.fencing_token + 1,
                error: "error:" <> fail_id,
                now_ms: 1_500
              )
 
     assert {:ok, failed} =
-             FerricStore.flow_fail(fail_id, claimed.lease_token,
+             flow_fail_and_get(fail_id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                error: "error:" <> fail_id,
                now_ms: 1_500
@@ -5333,7 +5634,7 @@ defmodule Ferricstore.FlowTest do
     assert failed.next_run_at_ms == nil
 
     assert {:ok, cancelled} =
-             FerricStore.flow_cancel(cancel_id,
+             flow_cancel_and_get(cancel_id,
                fencing_token: 0,
                reason: "reason:" <> cancel_id,
                now_ms: 1_500
@@ -5367,7 +5668,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-history")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "audit",
                state: "queued",
                run_at_ms: 1_000,
@@ -5384,9 +5685,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_complete(id, claimed.lease_token,
-               fencing_token: claimed.fencing_token
-             )
+             flow_complete_and_get(id, claimed.lease_token, fencing_token: claimed.fencing_token)
 
     assert {:ok, events} = FerricStore.flow_history(id, count: 10)
 
@@ -5415,7 +5714,7 @@ defmodule Ferricstore.FlowTest do
     partition = uid("tenant-history-query")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: type,
                state: "queued",
                partition_key: partition,
@@ -5434,7 +5733,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_transition(id, "running", "email",
+             flow_transition_and_get(id, "running", "email",
                partition_key: partition,
                lease_token: first_claim.lease_token,
                fencing_token: first_claim.fencing_token,
@@ -5453,7 +5752,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_fail(id, second_claim.lease_token,
+             flow_fail_and_get(id, second_claim.lease_token,
                partition_key: partition,
                fencing_token: second_claim.fencing_token,
                error: "boom",
@@ -5533,28 +5832,28 @@ defmodule Ferricstore.FlowTest do
     cancelled = create_claimed_flow(uid("flow-failures-d"), partition, type, "worker-failures")
 
     assert {:ok, _} =
-             FerricStore.flow_fail(failed_a.id, failed_a.lease_token,
+             flow_fail_and_get(failed_a.id, failed_a.lease_token,
                partition_key: partition,
                fencing_token: failed_a.fencing_token,
                now_ms: 1_500
              )
 
     assert {:ok, _} =
-             FerricStore.flow_fail(failed_b.id, failed_b.lease_token,
+             flow_fail_and_get(failed_b.id, failed_b.lease_token,
                partition_key: partition,
                fencing_token: failed_b.fencing_token,
                now_ms: 2_500
              )
 
     assert {:ok, _} =
-             FerricStore.flow_complete(completed.id, completed.lease_token,
+             flow_complete_and_get(completed.id, completed.lease_token,
                partition_key: partition,
                fencing_token: completed.fencing_token,
                now_ms: 2_000
              )
 
     assert {:ok, _} =
-             FerricStore.flow_cancel(cancelled.id,
+             flow_cancel_and_get(cancelled.id,
                partition_key: partition,
                lease_token: cancelled.lease_token,
                fencing_token: cancelled.fencing_token,
@@ -5618,7 +5917,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-history-monotonic")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "audit-monotonic",
                state: "queued",
                run_at_ms: 1_000,
@@ -5652,7 +5951,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-history-fallback")
     partition = "tenant-history-fallback"
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.create(ctx, id,
                type: "history-fallback",
                partition_key: partition,
@@ -5668,7 +5967,7 @@ defmodule Ferricstore.FlowTest do
                now_ms: 2
              )
 
-    assert {:ok, _record} =
+    assert :ok =
              Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
                partition_key: partition,
                fencing_token: claimed.fencing_token,
@@ -5692,7 +5991,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-history-retention")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "audit-retention",
                run_at_ms: 1_000,
                history_hot_max_events: 2
@@ -5709,9 +6008,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_complete(id, claimed.lease_token,
-               fencing_token: claimed.fencing_token
-             )
+             flow_complete_and_get(id, claimed.lease_token, fencing_token: claimed.fencing_token)
 
     assert {:ok, events} = FerricStore.flow_history(id, count: 10)
     event_ids = Enum.map(events, fn {event_id, _fields} -> event_id end)
@@ -5740,7 +6037,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-history-hard-cap")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "audit-hard-cap",
                run_at_ms: 1_000,
                history_hot_max_events: 5,
@@ -5769,7 +6066,7 @@ defmodule Ferricstore.FlowTest do
     end)
 
     assert {:ok, _} =
-             FerricStore.flow_complete(id, claimed.lease_token,
+             flow_complete_and_get(id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 1_100
              )
@@ -5801,7 +6098,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-history-default-hard-cap")
 
     assert {:ok, created} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "audit-default-hard-cap",
                run_at_ms: 1_000
              )
@@ -5810,7 +6107,7 @@ defmodule Ferricstore.FlowTest do
 
     assert {:error,
             "ERR flow history_max_events must be greater than or equal to history_hot_max_events"} =
-             FerricStore.flow_create(uid("flow-history-bad-hard-cap"),
+             flow_create_and_get(uid("flow-history-bad-hard-cap"),
                type: "audit-bad-hard-cap",
                history_hot_max_events: 10,
                history_max_events: 5
@@ -5833,7 +6130,7 @@ defmodule Ferricstore.FlowTest do
     end)
 
     assert {:ok, created} =
-             FerricStore.flow_create(uid("flow-history-default-hard-clamp"),
+             flow_create_and_get(uid("flow-history-default-hard-clamp"),
                type: "audit-default-hard-clamp",
                run_at_ms: 1_000
              )
@@ -5849,7 +6146,7 @@ defmodule Ferricstore.FlowTest do
     on_exit(fn -> restore_env(:flow_max_history_max_events, original_max) end)
 
     assert {:error, "ERR flow history_max_events exceeds maximum 1000000"} =
-             FerricStore.flow_create(uid("flow-history-hard-cap-env"),
+             flow_create_and_get(uid("flow-history-hard-cap-env"),
                type: "audit-hard-cap-env",
                history_max_events: 2_000_000
              )
@@ -5870,7 +6167,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-history-default-retention")
 
     assert {:ok, created} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "audit-default-retention",
                run_at_ms: 1_000,
                now_ms: 1_000
@@ -5887,7 +6184,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_complete(id, claimed.lease_token,
+             flow_complete_and_get(id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 1_200
              )
@@ -5909,7 +6206,7 @@ defmodule Ferricstore.FlowTest do
     end)
 
     assert {:error, "ERR flow history_hot_max_events exceeds maximum 2"} =
-             FerricStore.flow_create(uid("flow-history-max"),
+             flow_create_and_get(uid("flow-history-max"),
                type: "audit-history-max",
                history_hot_max_events: 3
              )
@@ -5928,10 +6225,10 @@ defmodule Ferricstore.FlowTest do
     end)
 
     assert {:error, "ERR flow batch item count exceeds maximum 2"} =
-             FerricStore.flow_create_many("tenant-batch-cap", ["a", "b", "c"], type: "batch-cap")
+             flow_create_many_and_get("tenant-batch-cap", ["a", "b", "c"], type: "batch-cap")
 
     assert {:error, "ERR flow batch item count exceeds maximum 2"} =
-             FerricStore.flow_transition_many(
+             flow_transition_many_and_get(
                "tenant-batch-cap",
                "queued",
                "waiting",
@@ -5972,7 +6269,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-rewind-trimmed")
 
     assert {:ok, _} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "rewind-trimmed",
                run_at_ms: 1_000,
                history_hot_max_events: 2,
@@ -5991,7 +6288,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _completed} =
-             FerricStore.flow_complete(id, claimed.lease_token,
+             flow_complete_and_get(id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 2_000
              )
@@ -6010,7 +6307,7 @@ defmodule Ferricstore.FlowTest do
   test "flow_rewind restores a previous history state and reindexes atomically" do
     id = uid("flow-rewind")
 
-    assert {:ok, _} = FerricStore.flow_create(id, type: "rewind", run_at_ms: 1_000, now_ms: 1_000)
+    assert {:ok, _} = flow_create_and_get(id, type: "rewind", run_at_ms: 1_000, now_ms: 1_000)
 
     assert {:ok, [{created_event_id, %{"event" => "created", "state" => "queued"}} | _]} =
              FerricStore.flow_history(id, count: 10)
@@ -6024,7 +6321,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, completed} =
-             FerricStore.flow_complete(id, claimed.lease_token,
+             flow_complete_and_get(id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 2_000
              )
@@ -6069,7 +6366,7 @@ defmodule Ferricstore.FlowTest do
   test "flow_rewind validates target, expected state, and active leases" do
     id = uid("flow-rewind-guard")
 
-    assert {:ok, _} = FerricStore.flow_create(id, type: "rewind-guard", run_at_ms: 1_000)
+    assert {:ok, _} = flow_create_and_get(id, type: "rewind-guard", run_at_ms: 1_000)
     assert {:ok, [{created_event_id, _fields} | _]} = FerricStore.flow_history(id, count: 10)
 
     assert {:error, "ERR flow wrong state"} =
@@ -6090,7 +6387,7 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_rewind(id, to_event: created_event_id)
 
     assert {:ok, _} =
-             FerricStore.flow_complete(id, claimed.lease_token,
+             flow_complete_and_get(id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: 2_000
              )
@@ -6105,7 +6402,7 @@ defmodule Ferricstore.FlowTest do
     {partition, _same_partition, other_partition} = mixed_partition_keys()
 
     assert {:ok, created_parent} =
-             FerricStore.flow_create(parent,
+             flow_create_and_get(parent,
                type: "parent",
                state: "dispatch",
                partition_key: partition,
@@ -6116,7 +6413,7 @@ defmodule Ferricstore.FlowTest do
              FerricStore.flow_history(parent, partition_key: partition, count: 10)
 
     assert {:ok, _waiting} =
-             FerricStore.flow_spawn_children(
+             flow_spawn_children_and_get(
                parent,
                [%{id: child, type: "child", partition_key: other_partition}],
                group_id: "rewind-fanout",
@@ -6155,7 +6452,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-terminal-ttl")
 
     assert {:ok, created} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "ttl",
                run_at_ms: 1_000,
                retention_ttl_ms: 20,
@@ -6174,9 +6471,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_complete(id, claimed.lease_token,
-               fencing_token: claimed.fencing_token
-             )
+             flow_complete_and_get(id, claimed.lease_token, fencing_token: claimed.fencing_token)
 
     Process.sleep(40)
 
@@ -6189,7 +6484,7 @@ defmodule Ferricstore.FlowTest do
     complete_now = create_now + 10_000
 
     assert {:ok, _created} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "ttl-command-time",
                run_at_ms: create_now,
                retention_ttl_ms: 5_000,
@@ -6205,7 +6500,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, completed} =
-             FerricStore.flow_complete(id, claimed.lease_token,
+             flow_complete_and_get(id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                now_ms: complete_now
              )
@@ -6217,7 +6512,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-terminal-history-ttl")
 
     assert {:ok, _created} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "history-ttl",
                payload: %{input: 1},
                run_at_ms: 1_000,
@@ -6236,9 +6531,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, _} =
-             FerricStore.flow_complete(id, claimed.lease_token,
-               fencing_token: claimed.fencing_token
-             )
+             flow_complete_and_get(id, claimed.lease_token, fencing_token: claimed.fencing_token)
 
     Process.sleep(150)
 
@@ -6250,7 +6543,7 @@ defmodule Ferricstore.FlowTest do
     id = uid("flow-terminal-ttl-zero")
 
     assert {:ok, _created} =
-             FerricStore.flow_create(id,
+             flow_create_and_get(id,
                type: "ttl-zero",
                run_at_ms: 1_000,
                now_ms: 1_000
@@ -6265,7 +6558,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:error, "ERR flow ttl_ms must be a positive integer"} =
-             FerricStore.flow_complete(id, claimed.lease_token,
+             flow_complete_and_get(id, claimed.lease_token,
                fencing_token: claimed.fencing_token,
                ttl_ms: 0
              )
@@ -6281,7 +6574,7 @@ defmodule Ferricstore.FlowTest do
              )
 
     assert {:ok, created} =
-             FerricStore.flow_create(id, type: type, state: "queued", now_ms: 10)
+             flow_create_and_get(id, type: type, state: "queued", now_ms: 10)
 
     assert created.retention_ttl_ms == 5_000
     assert created.history_hot_max_events == 3
