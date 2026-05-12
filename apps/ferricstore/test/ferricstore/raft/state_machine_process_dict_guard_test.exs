@@ -50,10 +50,37 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
           ":sm_pending_values",
           ":sm_pending_lmdb_values",
           ":sm_pending_lmdb_mirror_ops",
-          ":sm_pending_lmdb_mirror_after_flush"
+          ":sm_pending_lmdb_mirror_after_flush",
+          ":sm_pending_fast_put_batch",
+          ":sm_pending_fast_delete_batch"
         ] do
       assert source =~ key
     end
+  end
+
+  test "delete_batch fast path stages tombstones and publishes ETS after append" do
+    source = File.read!(@state_machine_path)
+
+    assert source =~ "defp apply_delete_batch_keys_fast",
+           "delete_batch should have a dedicated pure-delete fast path"
+
+    [_match, fast_body] =
+      Regex.run(
+        ~r/(defp apply_delete_batch_keys_fast\(state, keys\) do.*?)(?=\n  defp maybe_prepare_delete_batch_fast)/s,
+        source
+      )
+
+    assert fast_body =~ "queue_pending_delete_fast"
+    refute fast_body =~ "do_delete("
+
+    [_before_publish, publish_section] =
+      String.split(source, "defp apply_fast_delete_pending_locations(\n         state,", parts: 2)
+
+    [publish_body | _after_publish] =
+      String.split(publish_section, "\n  defp apply_pending_locations", parts: 2)
+
+    assert publish_body =~ ":ets.delete(state.ets, key)"
+    assert publish_body =~ "maybe_queue_lmdb_state_delete_after_publish(state, key)"
   end
 
   test "no-meta apply path clears consolidated apply process state" do

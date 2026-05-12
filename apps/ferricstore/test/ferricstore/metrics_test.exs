@@ -6,7 +6,6 @@ defmodule Ferricstore.MetricsTest do
   alias Ferricstore.Metrics
   alias Ferricstore.PrefixMetricsCache
   alias Ferricstore.QuorumMetrics
-  alias Ferricstore.StandaloneTxMetrics
 
   # ---------------------------------------------------------------------------
   # scrape/0 — Prometheus text format validity
@@ -235,6 +234,12 @@ defmodule Ferricstore.MetricsTest do
         %{shard_index: 2}
       )
 
+      :telemetry.execute(
+        [:ferricstore, :wal, :sync],
+        %{duration_us: 31, pending_batches: 4, queued_batches: 2, delay_us: 2_000},
+        %{status: :ok}
+      )
+
       text = Metrics.handle("FERRICSTORE.METRICS", [])
 
       assert String.contains?(text, "# TYPE ferricstore_quorum_submit_total counter")
@@ -251,7 +256,17 @@ defmodule Ferricstore.MetricsTest do
 
       assert String.contains?(
                text,
+               ~s(ferricstore_quorum_slot_flush_queue_wait_us_max{shard_index="2",write_path="quorum"} 17)
+             )
+
+      assert String.contains?(
+               text,
                ~s(ferricstore_quorum_submit_total{shard_index="2",kind="batch",status="ok"} 1)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_quorum_submit_duration_us_max{shard_index="2",kind="batch",status="ok"} 5)
              )
 
       assert String.contains?(
@@ -266,7 +281,22 @@ defmodule Ferricstore.MetricsTest do
 
       assert String.contains?(
                text,
+               ~s(ferricstore_quorum_applied_duration_us_max{shard_index="2",kind="batch",result="ok"} 19)
+             )
+
+      assert String.contains?(
+               text,
                ~s(ferricstore_quorum_apply_total{shard_index="2",result="ok",disk="ok"} 1)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_quorum_apply_duration_us_max{shard_index="2",result="ok",disk="ok"} 11)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_quorum_bitcask_append_duration_us_max{shard_index="2",status="ok"} 7)
              )
 
       assert String.contains?(
@@ -291,78 +321,53 @@ defmodule Ferricstore.MetricsTest do
 
       assert String.contains?(
                text,
+               ~s(ferricstore_batcher_local_apply_gate_duration_us_max{shard_index="2",kind="batch"} 23)
+             )
+
+      assert String.contains?(
+               text,
                ~s(ferricstore_batcher_local_apply_timeout_total{shard_index="2"} 2)
              )
-    end
-
-    test "includes standalone tx-log recovery telemetry counters" do
-      StandaloneTxMetrics.reset()
-
-      on_exit(fn ->
-        StandaloneTxMetrics.reset()
-      end)
-
-      :telemetry.execute(
-        [:ferricstore, :standalone_tx_log, :prepare],
-        %{groups: 4, ops: 12},
-        %{status: :ok}
-      )
-
-      :telemetry.execute(
-        [:ferricstore, :standalone_tx_log, :commit],
-        %{count: 1},
-        %{status: :ok}
-      )
-
-      :telemetry.execute(
-        [:ferricstore, :standalone_tx_log, :recover],
-        %{pending: 2, replayed: 1, groups: 4, ops: 12},
-        %{status: :ok}
-      )
-
-      :telemetry.execute(
-        [:ferricstore, :standalone_tx_log, :recover],
-        %{pending: 0, replayed: 0, groups: 0, ops: 0},
-        %{status: :error}
-      )
-
-      :telemetry.execute(
-        [:ferricstore, :standalone_tx_log, :corrupt_entry],
-        %{count: 3},
-        %{}
-      )
-
-      text = Metrics.handle("FERRICSTORE.METRICS", [])
-
-      assert String.contains?(text, "# TYPE ferricstore_standalone_tx_recover_total counter")
 
       assert String.contains?(
                text,
-               ~s(ferricstore_standalone_tx_prepare_total{status="ok"} 1)
+               ~s(ferricstore_wal_sync_duration_us_total{status="ok"})
              )
 
       assert String.contains?(
                text,
-               ~s(ferricstore_standalone_tx_prepare_ops_total{status="ok"} 12)
+               ~s(ferricstore_wal_sync_duration_us_max{status="ok"})
              )
 
       assert String.contains?(
                text,
-               ~s(ferricstore_standalone_tx_commit_total{status="ok"} 1)
+               ~s(ferricstore_wal_sync_delay_us_total{status="ok"})
              )
 
       assert String.contains?(
                text,
-               ~s(ferricstore_standalone_tx_recover_total{status="ok"} 1)
+               ~s(ferricstore_wal_sync_delay_us_max{status="ok"})
              )
 
       assert String.contains?(
                text,
-               ~s(ferricstore_standalone_tx_recover_total{status="error"} 1)
+               ~s(ferricstore_wal_sync_pending_batches_total{status="ok"})
              )
 
-      assert String.contains?(text, "ferricstore_standalone_tx_recover_replayed_total")
-      assert String.contains?(text, "ferricstore_standalone_tx_corrupt_entries_skipped_total 3")
+      assert String.contains?(
+               text,
+               ~s(ferricstore_wal_sync_pending_batches_max{status="ok"})
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_wal_sync_queued_batches_total{status="ok"} 2)
+             )
+
+      assert String.contains?(
+               text,
+               ~s(ferricstore_wal_sync_queued_batches_max{status="ok"} 2)
+             )
     end
 
     test "includes per-shard checkpoint and release cursor gauges" do

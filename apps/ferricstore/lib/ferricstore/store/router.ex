@@ -23,6 +23,7 @@ defmodule Ferricstore.Store.Router do
   alias Ferricstore.HLC
   alias Ferricstore.HyperLogLog, as: HLL
   alias Ferricstore.ErrorReasons
+  alias Ferricstore.Raft.PerfToggles
   alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Stats
   alias Ferricstore.Store.{CompoundKey, LFU, ListOps, SlotMap, TypeRegistry}
@@ -116,11 +117,7 @@ defmodule Ferricstore.Store.Router do
 
   @spec quorum_write(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
   defp quorum_write(ctx, idx, command) do
-    if ctx.name == :default && !Ferricstore.ReplicationMode.raft?() do
-      standalone_write(ctx, idx, command)
-    else
-      do_quorum_write(ctx, idx, command)
-    end
+    do_quorum_write(ctx, idx, command)
   end
 
   defp do_quorum_write(ctx, idx, command) do
@@ -237,201 +234,14 @@ defmodule Ferricstore.Store.Router do
   @spec raft_write(FerricStore.Instance.t(), non_neg_integer(), binary(), tuple()) :: term()
   defp raft_write(ctx, idx, _key, command) do
     cond do
-      ctx.name == :default && Ferricstore.ReplicationMode.raft?() ->
-        quorum_write(ctx, idx, command)
-
       ctx.name == :default ->
-        standalone_write(ctx, idx, command)
+        quorum_write(ctx, idx, command)
 
       true ->
         # Custom embedded instances are local/direct. The default application
-        # instance owns Raft or the standalone fsync boundary.
+        # instance owns Raft durability.
         GenServer.call(elem(ctx.shard_names, idx), command)
     end
-  end
-
-  defp standalone_write(ctx, idx, command) do
-    shard = elem(ctx.shard_names, idx)
-
-    if Ferricstore.ReplicationMode.current() == :enabling do
-      {:error, "ERR cluster promotion in progress"}
-    else
-      case GenServer.call(shard, {:standalone_commit, command}, 30_000) do
-        {:error, {:standalone_durability_failed, reason}} ->
-          fail_closed_standalone_write(ctx, idx, reason)
-
-        {:error, _reason} = error ->
-          error
-
-        result ->
-          bump_standalone_write_version(ctx, idx, command)
-          result
-      end
-    end
-  end
-
-  @doc false
-  def standalone_cross_shard_tx(ctx, shard_batches) when is_list(shard_batches) do
-    touched =
-      shard_batches
-      |> Enum.map(fn {shard_idx, _queue, _sandbox_namespace} -> shard_idx end)
-      |> Enum.uniq()
-
-    barriered =
-      [0 | touched]
-      |> Enum.uniq()
-
-    case acquire_standalone_cross_shard_barriers(ctx, barriered) do
-      :ok ->
-        try do
-          case standalone_write(ctx, 0, {:cross_shard_tx, shard_batches}, :sync_no_version) do
-            {:error, _reason} = error ->
-              error
-
-            result ->
-              Enum.each(touched, fn idx -> bump_standalone_write_version(ctx, idx, 1) end)
-              result
-          end
-        after
-          release_standalone_cross_shard_barriers(ctx, barriered)
-        end
-
-      {:error, {_idx, :standalone_cross_shard_barrier_busy}} ->
-        {:error, "ERR standalone cross-shard operation busy"}
-
-      {:error, reason} ->
-        fail_closed_standalone_write(ctx, 0, {:standalone_cross_shard_barrier_failed, reason})
-    end
-  end
-
-  defp acquire_standalone_cross_shard_barriers(ctx, touched) do
-    touched
-    |> Enum.sort()
-    |> Enum.reduce_while([], fn idx, acquired ->
-      shard = elem(ctx.shard_names, idx)
-
-      case standalone_barrier_call(shard, :standalone_cross_shard_barrier_acquire) do
-        :ok ->
-          {:cont, [idx | acquired]}
-
-        {:error, reason} ->
-          release_standalone_cross_shard_barriers(ctx, acquired)
-          {:halt, {:error, {idx, reason}}}
-      end
-    end)
-    |> case do
-      acquired when is_list(acquired) -> :ok
-      {:error, _reason} = error -> error
-    end
-  end
-
-  defp release_standalone_cross_shard_barriers(ctx, touched) do
-    Enum.each(touched, fn idx ->
-      shard = elem(ctx.shard_names, idx)
-      _ = standalone_barrier_call(shard, :standalone_cross_shard_barrier_release)
-    end)
-
-    :ok
-  end
-
-  defp standalone_barrier_call(shard, message) do
-    GenServer.call(shard, message, 30_000)
-  catch
-    :exit, reason -> {:error, reason}
-  end
-
-  defp standalone_write(ctx, idx, command, :sync_no_version) do
-    shard = elem(ctx.shard_names, idx)
-
-    if Ferricstore.ReplicationMode.current() == :enabling do
-      {:error, "ERR cluster promotion in progress"}
-    else
-      case GenServer.call(shard, {:standalone_commit_sync, command}, 30_000) do
-        {:error, {:standalone_durability_failed, reason}} ->
-          fail_closed_standalone_write(ctx, idx, reason)
-
-        {:error, _reason} = error ->
-          error
-
-        result ->
-          result
-      end
-    end
-  end
-
-  defp fail_closed_standalone_write(ctx, _idx, reason) do
-    Ferricstore.Health.set_ready(false)
-    pause_all_standalone_shards(ctx)
-    mark_all_shards_under_disk_pressure(ctx)
-
-    {:error,
-     "ERR standalone durability failure: write not applied, node paused for repair: #{inspect(reason)}"}
-  end
-
-  defp pause_all_standalone_shards(%{shard_count: shard_count, shard_names: shard_names}) do
-    Enum.each(0..(shard_count - 1), fn shard_idx ->
-      try do
-        GenServer.call(elem(shard_names, shard_idx), {:pause_writes}, 5_000)
-      catch
-        _, _ -> :ok
-      end
-    end)
-
-    :ok
-  end
-
-  defp mark_all_shards_under_disk_pressure(%{shard_count: shard_count} = ctx) do
-    Enum.each(0..(shard_count - 1), fn shard_idx ->
-      Ferricstore.Store.DiskPressure.set(ctx, shard_idx)
-    end)
-
-    :ok
-  end
-
-  defp bump_standalone_write_version(ctx, idx, {:batch, commands}) when is_list(commands) do
-    bump_standalone_write_version(ctx, idx, max(length(commands), 1))
-  end
-
-  defp bump_standalone_write_version(ctx, idx, amount) when is_integer(amount) do
-    size = :counters.info(ctx.write_version).size
-    if idx < size, do: :counters.add(ctx.write_version, idx + 1, amount)
-    :ok
-  rescue
-    _ -> :ok
-  end
-
-  defp bump_standalone_write_version(ctx, idx, _command) do
-    bump_standalone_write_version(ctx, idx, 1)
-  end
-
-  defp standalone_batch_commands(_ctx, []), do: []
-
-  defp standalone_batch_commands(ctx, keyed_commands) do
-    {by_shard, count} =
-      keyed_commands
-      |> Enum.reduce({%{}, 0}, fn {key, command}, {shards, i} ->
-        idx = shard_for(ctx, key)
-        {cmds, indices} = Map.get(shards, idx, {[], []})
-        {Map.put(shards, idx, {[command | cmds], [i | indices]}), i + 1}
-      end)
-
-    results =
-      Enum.reduce(by_shard, %{}, fn {shard_idx, {cmds, indices}}, acc ->
-        shard_results =
-          case standalone_write(ctx, shard_idx, {:batch, Enum.reverse(cmds)}) do
-            {:ok, results} when is_list(results) -> results
-            {:error, _reason} = error -> List.duplicate(error, length(indices))
-            other -> List.duplicate(other, length(indices))
-          end
-
-        indices
-        |> Enum.reverse()
-        |> Enum.zip(shard_results)
-        |> Enum.reduce(acc, fn {i, result}, next -> Map.put(next, i, result) end)
-      end)
-
-    0..(count - 1)
-    |> Enum.map(fn i -> Map.get(results, i, ErrorReasons.write_timeout_unknown()) end)
   end
 
   defp shard_under_disk_pressure?(ctx, idx) do
@@ -440,11 +250,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp forced_quorum_write(ctx, idx, command, origin_node) do
-    if ctx.name == :default && !Ferricstore.ReplicationMode.raft?() do
-      standalone_write(ctx, idx, command)
-    else
-      do_forced_quorum_write(ctx, idx, command, origin_node)
-    end
+    do_forced_quorum_write(ctx, idx, command, origin_node)
   end
 
   defp do_forced_quorum_write(ctx, idx, command, origin_node) do
@@ -2382,11 +2188,20 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc false
-  def flow_command_batch(_ctx, []), do: []
+  def pipeline_write_batch(_ctx, []), do: []
 
-  def flow_command_batch(ctx, keyed_commands) when is_list(keyed_commands) do
-    if ctx.name == :default do
-      batch_quorum_commands(ctx, keyed_commands)
+  def pipeline_write_batch(ctx, keyed_commands) when is_list(keyed_commands) do
+    if ctx.name == :default and PerfToggles.direct_batch_commands?() do
+      # Homogeneous hot pipeline batches go straight to final Ra command shapes.
+      # That avoids allocating per-key command tuples just to compact them later.
+      # The matching state-machine path must stay equally compact: for pure
+      # writes, stage disk records first and publish ETS only after append
+      # succeeds.
+      case direct_batch_command_shape(keyed_commands) do
+        {:put, entries} -> do_batch_quorum_put_entries(ctx, entries, nil)
+        {:delete, keys} -> do_batch_quorum_delete_keys(ctx, keys, nil)
+        :generic -> batch_quorum_commands(ctx, keyed_commands)
+      end
     else
       Enum.map(keyed_commands, fn {key, command} ->
         idx = shard_for(ctx, key)
@@ -2395,14 +2210,40 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @doc false
+  def flow_command_batch(ctx, keyed_commands), do: pipeline_write_batch(ctx, keyed_commands)
+
+  defp direct_batch_command_shape([]), do: :generic
+
+  defp direct_batch_command_shape(keyed_commands) do
+    direct_batch_command_shape(keyed_commands, :unknown, [])
+  end
+
+  defp direct_batch_command_shape([], :put, acc), do: {:put, Enum.reverse(acc)}
+  defp direct_batch_command_shape([], :delete, acc), do: {:delete, Enum.reverse(acc)}
+  defp direct_batch_command_shape([], _mode, _acc), do: :generic
+
+  defp direct_batch_command_shape(
+         [{_route_key, {:put, key, value, expire_at_ms}} | rest],
+         mode,
+         acc
+       )
+       when mode in [:unknown, :put] and is_binary(key) and is_binary(value) and
+              is_integer(expire_at_ms) do
+    direct_batch_command_shape(rest, :put, [{key, value, expire_at_ms} | acc])
+  end
+
+  defp direct_batch_command_shape([{_route_key, {:delete, key}} | rest], mode, acc)
+       when mode in [:unknown, :delete] and is_binary(key) do
+    direct_batch_command_shape(rest, :delete, [key | acc])
+  end
+
+  defp direct_batch_command_shape(_commands, _mode, _acc), do: :generic
+
   defp batch_quorum_commands(_ctx, [], _origin_node), do: []
 
   defp batch_quorum_commands(ctx, keyed_commands, origin_node) do
-    if ctx.name == :default && !Ferricstore.ReplicationMode.raft?() do
-      standalone_batch_commands(ctx, keyed_commands)
-    else
-      do_batch_quorum_commands(ctx, keyed_commands, origin_node)
-    end
+    do_batch_quorum_commands(ctx, keyed_commands, origin_node)
   end
 
   defp do_batch_quorum_commands(ctx, keyed_commands, origin_node) do
@@ -2462,41 +2303,82 @@ defmodule Ferricstore.Store.Router do
   defp batch_quorum_put(_ctx, [], _origin_node), do: []
 
   defp batch_quorum_put(ctx, kv_pairs, origin_node) do
-    if ctx.name == :default && !Ferricstore.ReplicationMode.raft?() do
-      keyed_commands = Enum.map(kv_pairs, fn {key, value} -> {key, {:put, key, value, 0}} end)
-      standalone_batch_commands(ctx, keyed_commands)
+    if PerfToggles.direct_batch_commands?() do
+      do_batch_quorum_put_entries(ctx, kv_pairs, origin_node)
     else
-      do_batch_quorum_put(ctx, kv_pairs, origin_node)
+      batch_quorum_commands(ctx, put_entries_to_keyed_commands(kv_pairs), origin_node)
     end
   end
 
-  defp do_batch_quorum_put(ctx, kv_pairs, origin_node) do
+  @doc false
+  @spec batch_quorum_delete(FerricStore.Instance.t(), [binary()]) :: [
+          :ok | {:error, binary() | {:timeout, :unknown_outcome}}
+        ]
+  def batch_quorum_delete(ctx, keys) do
+    batch_quorum_delete(ctx, keys, nil)
+  end
+
+  defp batch_quorum_delete(_ctx, [], _origin_node), do: []
+
+  defp batch_quorum_delete(ctx, keys, origin_node) do
+    if PerfToggles.direct_batch_commands?() do
+      do_batch_quorum_delete_keys(ctx, keys, origin_node)
+    else
+      batch_quorum_commands(ctx, delete_keys_to_keyed_commands(keys), origin_node)
+    end
+  end
+
+  defp put_entries_to_keyed_commands(entries) do
+    Enum.map(entries, fn entry ->
+      {key, value, expire_at_ms} = normalize_put_batch_entry(entry)
+      {key, {:put, key, value, expire_at_ms}}
+    end)
+  end
+
+  defp delete_keys_to_keyed_commands(keys) do
+    Enum.map(keys, fn key -> {key, {:delete, key}} end)
+  end
+
+  defp do_batch_quorum_put_entries(ctx, entries, origin_node) do
     wv_size = :counters.info(ctx.write_version).size
 
-    # Single pass: group by shard, build cmds + indices lists simultaneously,
-    # also remember the kv_pairs subset per shard so we can re-issue the
-    # batch via erpc on :not_leader replies.
-    {by_shard, count, by_shard_kvs} =
-      kv_pairs
-      |> Enum.reduce({%{}, 0, %{}}, fn {key, value}, {shards, i, kvs_map} ->
+    # Single pass: group final put_batch entries by shard. Public SET callers
+    # pass {key, value}; internal callers may pass {key, value, expire_at_ms}.
+    # We normalize while grouping so the hot path does not allocate old
+    # per-key {:put, ...} commands or run a separate pre-map pass. Do not
+    # re-expand this to generic commands unless a benchmark and apply-path audit
+    # show the specialized term is no longer the faster shape.
+    {by_shard, count, by_shard_entries} =
+      entries
+      |> Enum.reduce({%{}, 0, %{}}, fn entry, {shards, i, entries_map} ->
+        {key, value, expire_at_ms} = normalize_put_batch_entry(entry)
         idx = shard_for(ctx, key)
-        cmd = {:put, key, value, 0}
         entry = Map.get(shards, idx, {[], []})
-        {cmds, indices} = entry
-        shards = Map.put(shards, idx, {[cmd | cmds], [i | indices]})
-        kvs_map = Map.update(kvs_map, idx, [{key, value}], fn acc -> [{key, value} | acc] end)
-        {shards, i + 1, kvs_map}
+        {entries_acc, indices} = entry
+        shards = Map.put(shards, idx, {[{key, value, expire_at_ms} | entries_acc], [i | indices]})
+
+        entries_map =
+          Map.update(entries_map, idx, [{key, value, expire_at_ms}], fn acc ->
+            [{key, value, expire_at_ms} | acc]
+          end)
+
+        {shards, i + 1, entries_map}
       end)
 
     shard_refs =
-      Enum.map(by_shard, fn {shard_idx, {cmds, indices}} ->
+      Enum.map(by_shard, fn {shard_idx, {entries, indices}} ->
         {from, token} = ReplyAwaiter.new()
-        cmds = Enum.reverse(cmds)
+        entries = Enum.reverse(entries)
 
         if origin_node == nil do
-          Ferricstore.Raft.Batcher.write_batch(shard_idx, cmds, from)
+          Ferricstore.Raft.Batcher.write_put_batch(shard_idx, entries, from)
         else
-          Ferricstore.Raft.Batcher.write_batch_forwarded(shard_idx, cmds, from, origin_node)
+          Ferricstore.Raft.Batcher.write_put_batch_forwarded(
+            shard_idx,
+            entries,
+            from,
+            origin_node
+          )
         end
 
         {token, shard_idx, Enum.reverse(indices)}
@@ -2508,16 +2390,16 @@ defmodule Ferricstore.Store.Router do
     # Per-shard not_leader → forward that shard's slice to its hinted leader.
     # Each shard reports independently; we re-issue just the failing shard.
     results =
-      Enum.reduce(by_shard_kvs, results, fn {shard_idx, kvs}, acc ->
+      Enum.reduce(by_shard_entries, results, fn {shard_idx, entries}, acc ->
         # All indices for this shard share the same shard-level reply
         first_index = Map.get(by_shard, shard_idx) |> elem(1) |> List.last()
 
         case Map.get(acc, first_index) do
           {:error, {:not_leader, {_shard_name, leader_node}}} when is_atom(leader_node) ->
-            merge_forwarded(acc, by_shard, shard_idx, kvs, leader_node, ctx)
+            merge_forwarded(acc, by_shard, shard_idx, entries, leader_node, ctx)
 
           {:error, {:not_leader, leader_node}} when is_atom(leader_node) ->
-            merge_forwarded(acc, by_shard, shard_idx, kvs, leader_node, ctx)
+            merge_forwarded(acc, by_shard, shard_idx, entries, leader_node, ctx)
 
           _ ->
             acc
@@ -2528,10 +2410,76 @@ defmodule Ferricstore.Store.Router do
     |> Enum.map(fn i -> Map.get(results, i, ErrorReasons.write_timeout_unknown()) end)
   end
 
-  defp merge_forwarded(acc, by_shard, shard_idx, kvs, leader_node, ctx) do
+  defp normalize_put_batch_entry({key, value}) when is_binary(key) and is_binary(value),
+    do: {key, value, 0}
+
+  defp normalize_put_batch_entry({key, value, expire_at_ms})
+       when is_binary(key) and is_binary(value) and is_integer(expire_at_ms),
+       do: {key, value, expire_at_ms}
+
+  defp do_batch_quorum_delete_keys(ctx, keys, origin_node) do
+    wv_size = :counters.info(ctx.write_version).size
+
+    {by_shard, count, by_shard_keys} =
+      keys
+      |> Enum.reduce({%{}, 0, %{}}, fn key, {shards, i, keys_map} ->
+        idx = shard_for(ctx, key)
+        {keys_acc, indices} = Map.get(shards, idx, {[], []})
+
+        {
+          Map.put(shards, idx, {[key | keys_acc], [i | indices]}),
+          i + 1,
+          Map.update(keys_map, idx, [key], fn acc -> [key | acc] end)
+        }
+      end)
+
+    shard_refs =
+      Enum.map(by_shard, fn {shard_idx, {keys, indices}} ->
+        {from, token} = ReplyAwaiter.new()
+        keys = Enum.reverse(keys)
+
+        if origin_node == nil do
+          Ferricstore.Raft.Batcher.write_delete_batch(shard_idx, keys, from)
+        else
+          Ferricstore.Raft.Batcher.write_delete_batch_forwarded(
+            shard_idx,
+            keys,
+            from,
+            origin_node
+          )
+        end
+
+        {token, shard_idx, Enum.reverse(indices)}
+      end)
+
+    results =
+      collect_shard_replies(shard_refs, wv_size, ctx, %{}, System.monotonic_time(:millisecond))
+
+    results =
+      Enum.reduce(by_shard_keys, results, fn {shard_idx, keys}, acc ->
+        {_keys, indices} = Map.fetch!(by_shard, shard_idx)
+        first_index = List.last(indices)
+
+        case Map.get(acc, first_index) do
+          {:error, {:not_leader, {_shard_name, leader_node}}} when is_atom(leader_node) ->
+            merge_forwarded_deletes(acc, by_shard, shard_idx, keys, leader_node, ctx)
+
+          {:error, {:not_leader, leader_node}} when is_atom(leader_node) ->
+            merge_forwarded_deletes(acc, by_shard, shard_idx, keys, leader_node, ctx)
+
+          _ ->
+            acc
+        end
+      end)
+
+    0..(count - 1)
+    |> Enum.map(fn i -> Map.get(results, i, ErrorReasons.write_timeout_unknown()) end)
+  end
+
+  defp merge_forwarded(acc, by_shard, shard_idx, entries, leader_node, ctx) do
     {_, indices} = Map.fetch!(by_shard, shard_idx)
     indices = Enum.reverse(indices)
-    new_results = forward_batch_to_leader(ctx, leader_node, shard_idx, Enum.reverse(kvs))
+    new_results = forward_batch_to_leader(ctx, leader_node, shard_idx, Enum.reverse(entries))
 
     Enum.zip(indices, new_results)
     |> Enum.reduce(acc, fn {i, r}, a -> Map.put(a, i, r) end)
@@ -2543,6 +2491,15 @@ defmodule Ferricstore.Store.Router do
 
     new_results =
       forward_batch_commands_to_leader(ctx, leader_node, shard_idx, Enum.reverse(commands))
+
+    Enum.zip(indices, new_results)
+    |> Enum.reduce(acc, fn {i, r}, a -> Map.put(a, i, r) end)
+  end
+
+  defp merge_forwarded_deletes(acc, by_shard, shard_idx, keys, leader_node, ctx) do
+    {_, indices} = Map.fetch!(by_shard, shard_idx)
+    indices = Enum.reverse(indices)
+    new_results = forward_delete_batch_to_leader(ctx, leader_node, shard_idx, Enum.reverse(keys))
 
     Enum.zip(indices, new_results)
     |> Enum.reduce(acc, fn {i, r}, a -> Map.put(a, i, r) end)
@@ -2595,15 +2552,16 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  # Forward a batch to the leader's node. Used by batch_quorum_put when
-  # the local Batcher rejects with :not_leader. Issues an erpc to run
-  # batch_quorum_put on the leader, then returns its results.
-  defp forward_batch_to_leader(_ctx, leader_node, _shard_idx, kv_pairs)
+  # Forward a final put_batch to the leader's node. Used by batch_quorum_put when
+  # the local Batcher rejects with :not_leader. The entries are already in the
+  # optimized `{key, value, expire_at_ms}` shape, so forwarded writes keep the
+  # same shape instead of rebuilding old per-key command tuples.
+  defp forward_batch_to_leader(_ctx, leader_node, _shard_idx, entries)
        when leader_node == node() do
-    Enum.map(kv_pairs, fn _ -> {:error, "ERR not leader, election in progress"} end)
+    Enum.map(entries, fn _ -> {:error, "ERR not leader, election in progress"} end)
   end
 
-  defp forward_batch_to_leader(_ctx, leader_node, shard_idx, kv_pairs) do
+  defp forward_batch_to_leader(_ctx, leader_node, shard_idx, entries) do
     try do
       remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
 
@@ -2611,8 +2569,8 @@ defmodule Ferricstore.Store.Router do
         :erpc.call(
           leader_node,
           __MODULE__,
-          :__forwarded_batch_quorum_put__,
-          [remote_ctx, kv_pairs, node()],
+          :__forwarded_batch_quorum_put_entries__,
+          [remote_ctx, entries, node()],
           10_000
         )
 
@@ -2621,7 +2579,7 @@ defmodule Ferricstore.Store.Router do
       _, reason ->
         require Logger
         Logger.warning("batch forward to #{inspect(leader_node)} failed: #{inspect(reason)}")
-        __forward_batch_failure_results__(reason, length(kv_pairs))
+        __forward_batch_failure_results__(reason, length(entries))
     end
   end
 
@@ -2656,9 +2614,50 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  defp forward_delete_batch_to_leader(_ctx, leader_node, _shard_idx, keys)
+       when leader_node == node() do
+    Enum.map(keys, fn _ -> {:error, "ERR not leader, election in progress"} end)
+  end
+
+  defp forward_delete_batch_to_leader(_ctx, leader_node, shard_idx, keys) do
+    try do
+      remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
+
+      leader_results =
+        :erpc.call(
+          leader_node,
+          __MODULE__,
+          :__forwarded_batch_quorum_delete__,
+          [remote_ctx, keys, node()],
+          10_000
+        )
+
+      unwrap_forwarded_batch_results(shard_idx, leader_results)
+    catch
+      _, reason ->
+        require Logger
+
+        Logger.warning(
+          "delete batch forward to #{inspect(leader_node)} failed: #{inspect(reason)}"
+        )
+
+        __forward_batch_failure_results__(reason, length(keys))
+    end
+  end
+
   @doc false
   def __forwarded_batch_quorum_put__(ctx, kv_pairs, origin_node) do
     batch_quorum_put(ctx, kv_pairs, origin_node)
+  end
+
+  @doc false
+  def __forwarded_batch_quorum_put_entries__(ctx, entries, origin_node) do
+    do_batch_quorum_put_entries(ctx, entries, origin_node)
+  end
+
+  @doc false
+  def __forwarded_batch_quorum_delete__(ctx, keys, origin_node) do
+    batch_quorum_delete(ctx, keys, origin_node)
   end
 
   @doc false
@@ -2970,12 +2969,7 @@ defmodule Ferricstore.Store.Router do
       end)
 
     result =
-      if ctx.name == :default && !Ferricstore.ReplicationMode.raft?() do
-        standalone_cross_shard_tx(ctx, shard_batches)
-      else
-        anchor_key = "f:{flow-cross-shard}:tx"
-        raft_write(ctx, anchor_idx, anchor_key, {:cross_shard_tx, shard_batches})
-      end
+      raft_write(ctx, anchor_idx, "f:{flow-cross-shard}:tx", {:cross_shard_tx, shard_batches})
 
     case result do
       %{^anchor_idx => [reply]} -> reply
@@ -4303,23 +4297,11 @@ defmodule Ferricstore.Store.Router do
   def get_version(ctx, key) do
     idx = shard_for(ctx, key)
 
-    if default_standalone_instance?(ctx) do
-      shared_write_version(ctx, idx)
-    else
-      case safe_read_call(ctx, idx, {:get_version, key}) do
-        {:ok, version} -> version
-        :unavailable -> shared_write_version(ctx, idx)
-      end
+    case safe_read_call(ctx, idx, {:get_version, key}) do
+      {:ok, version} -> version
+      :unavailable -> shared_write_version(ctx, idx)
     end
   end
-
-  defp default_standalone_instance?(%{name: :default}) do
-    not Ferricstore.ReplicationMode.raft?()
-  rescue
-    _ -> false
-  end
-
-  defp default_standalone_instance?(_ctx), do: false
 
   defp shared_write_version(%{write_version: write_version}, idx) do
     size = :counters.info(write_version).size

@@ -10,6 +10,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -998,6 +999,51 @@ defmodule Ferricstore.Raft.WritePathTest do
       cleanup_sm(ctx)
     end
 
+    test "put_batch clears stale compound data before storing a string" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+      key = "hotbatch:compound"
+      type_key = Ferricstore.Store.CompoundKey.type_key(key)
+      field_key = Ferricstore.Store.CompoundKey.hash_field(key, "field")
+
+      {state, :ok} = SM.apply(%{}, {:compound_put, type_key, "hash", 0}, state)
+      {state, :ok} = SM.apply(%{}, {:compound_put, field_key, "old", 0}, state)
+
+      {new_state, {:ok, [:ok]}} = SM.apply(%{}, {:put_batch, [{key, "string", 0}]}, state)
+
+      assert new_state.applied_count == 3
+      assert [{^key, "string", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets, key)
+      assert [] == :ets.lookup(ets, type_key)
+      assert [] == :ets.lookup(ets, field_key)
+
+      cleanup_sm(ctx)
+    end
+
+    test "put_batch preserves per-key lock rejection" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+      owner = make_ref()
+
+      locked_state = %{
+        state
+        | cross_shard_locks: %{"hotbatch:locked" => {owner, Ferricstore.HLC.now_ms() + 60_000}}
+      }
+
+      entries = [
+        {"hotbatch:open", "va", 0},
+        {"hotbatch:locked", "vb", 0}
+      ]
+
+      {new_state, {:ok, results}} = SM.apply(%{}, {:put_batch, entries}, locked_state)
+
+      assert results == [:ok, {:error, :key_locked}]
+      assert new_state.applied_count == 2
+      assert [{_, "va", 0, _, _, _, _}] = :ets.lookup(ets, "hotbatch:open")
+      assert [] == :ets.lookup(ets, "hotbatch:locked")
+
+      cleanup_sm(ctx)
+    end
+
     test "delete_batch removes many keys and preserves per-key results" do
       ctx = fresh_sm_state()
       {state, ets, _store, _dir} = ctx
@@ -1012,6 +1058,53 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert new_state.applied_count == 4
       assert [] == :ets.lookup(ets, "hotdel:a")
       assert [] == :ets.lookup(ets, "hotdel:b")
+
+      cleanup_sm(ctx)
+    end
+
+    test "compound_batch_put applies many fields with one batched result" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+      key = "hotcompound:hash"
+      field_a = CompoundKey.hash_field(key, "a")
+      field_b = CompoundKey.hash_field(key, "b")
+
+      {new_state, {:ok, results}} =
+        SM.apply(
+          %{},
+          {:compound_batch_put, key, [{field_a, "va", 0}, {field_b, "vb", 12_345}]},
+          state
+        )
+
+      assert results == [:ok, :ok]
+      assert new_state.applied_count == 2
+      assert [{^field_a, "va", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets, field_a)
+      assert [{^field_b, "vb", 12_345, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets, field_b)
+
+      cleanup_sm(ctx)
+    end
+
+    test "compound_batch_delete removes many fields with one batched result" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+      key = "hotcompound:hash"
+      field_a = CompoundKey.hash_field(key, "a")
+      field_b = CompoundKey.hash_field(key, "b")
+
+      {state, {:ok, [:ok, :ok]}} =
+        SM.apply(
+          %{},
+          {:compound_batch_put, key, [{field_a, "va", 0}, {field_b, "vb", 0}]},
+          state
+        )
+
+      {new_state, {:ok, results}} =
+        SM.apply(%{}, {:compound_batch_delete, key, [field_a, field_b]}, state)
+
+      assert results == [:ok, :ok]
+      assert new_state.applied_count == 4
+      assert [] == :ets.lookup(ets, field_a)
+      assert [] == :ets.lookup(ets, field_b)
 
       cleanup_sm(ctx)
     end

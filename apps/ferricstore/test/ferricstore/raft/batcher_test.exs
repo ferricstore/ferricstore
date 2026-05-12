@@ -13,6 +13,7 @@ defmodule Ferricstore.Raft.BatcherTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Raft.Batcher
+  alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -277,6 +278,39 @@ defmodule Ferricstore.Raft.BatcherTest do
       )
 
       assert_receive {^reply_ref, {:ok, [:ok, :ok]}}, 1_000
+
+      state = :sys.get_state(batcher)
+      assert state.local_apply_waiters == []
+    end
+
+    test "local alias-backed batch caller replies on raft apply without local-apply waiter" do
+      shard_index = 0
+      batcher = Batcher.batcher_name(shard_index)
+      %{last_local_applied: last_local_applied} = :sys.get_state(batcher)
+      ra_index = last_local_applied + 1_000
+      corr = make_ref()
+      {from, token} = ReplyAwaiter.new()
+
+      on_exit(fn ->
+        send(batcher, {:locally_applied, ra_index})
+        Batcher.reset_pending(shard_index)
+      end)
+
+      :ok =
+        Batcher.__inject_quorum_pending_at__(
+          shard_index,
+          corr,
+          [{:batch_from, from, 2}],
+          :batch,
+          System.monotonic_time()
+        )
+
+      send(
+        batcher,
+        {:ra_event, :leader, {:applied, [{corr, {:applied_at, ra_index, {:ok, [:ok, :ok]}}}]}}
+      )
+
+      assert {:ok, [:ok, :ok]} == ReplyAwaiter.await(token, 1_000, {:error, :timeout})
 
       state = :sys.get_state(batcher)
       assert state.local_apply_waiters == []

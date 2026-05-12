@@ -41,7 +41,6 @@ defmodule Ferricstore.Raft.Cluster do
   """
   @spec start_system(binary()) :: :ok | {:error, term()}
   def start_system(data_dir) do
-    ra_data_dir = Path.join(data_dir, "ra") |> to_charlist()
     ra_dir_str = Path.join(data_dir, "ra")
     created? = not Ferricstore.FS.dir?(ra_dir_str)
     Ferricstore.FS.mkdir_p!(ra_dir_str)
@@ -56,18 +55,7 @@ defmodule Ferricstore.Raft.Cluster do
       commit_delay_us =
         Application.get_env(:ferricstore, :wal_commit_delay_us, 6_000)
 
-      config = %{
-        name: @ra_system,
-        names: names,
-        data_dir: ra_data_dir,
-        wal_data_dir: ra_data_dir,
-        segment_max_entries: 32_768,
-        wal_max_batch_size: 32_768,
-        wal_compute_checksums: true,
-        wal_pre_allocate: true,
-        wal_io_module: :ferricstore_wal_nif,
-        wal_commit_delay_us: commit_delay_us
-      }
+      config = system_config(ra_dir_str, names, commit_delay_us)
 
       case :ra_system.start(config) do
         {:ok, _pid} ->
@@ -98,6 +86,34 @@ defmodule Ferricstore.Raft.Cluster do
 
         {:error, {:fsync_dir_failed, :create_ra_dir, reason}}
     end
+  end
+
+  @doc false
+  @spec system_config(binary()) :: map()
+  def system_config(data_dir) when is_binary(data_dir) do
+    names = :ra_system.derive_names(@ra_system)
+    commit_delay_us = Application.get_env(:ferricstore, :wal_commit_delay_us, 6_000)
+
+    system_config(data_dir, names, commit_delay_us)
+  end
+
+  defp system_config(data_dir, names, commit_delay_us) do
+    ra_data_dir = to_charlist(data_dir)
+
+    %{
+      name: @ra_system,
+      names: names,
+      data_dir: ra_data_dir,
+      wal_data_dir: ra_data_dir,
+      segment_max_entries: ra_segment_max_entries(),
+      segment_max_size_bytes: ra_segment_max_size_bytes(),
+      wal_max_size_bytes: ra_wal_max_size_bytes(),
+      wal_max_batch_size: 32_768,
+      wal_compute_checksums: ra_wal_compute_checksums?(),
+      wal_pre_allocate: true,
+      wal_io_module: :ferricstore_wal_nif,
+      wal_commit_delay_us: commit_delay_us
+    }
   end
 
   defp raft_cluster_fsync_dir(path) do
@@ -444,11 +460,27 @@ defmodule Ferricstore.Raft.Cluster do
   end
 
   defp ra_min_snapshot_interval do
-    Application.get_env(:ferricstore, :ra_min_snapshot_interval, 200_000)
+    Application.get_env(:ferricstore, :ra_min_snapshot_interval, 10_000_000)
   end
 
   defp ra_min_checkpoint_interval do
-    Application.get_env(:ferricstore, :ra_min_checkpoint_interval, 16_384)
+    Application.get_env(:ferricstore, :ra_min_checkpoint_interval, 1_000_000)
+  end
+
+  defp ra_segment_max_entries do
+    Application.get_env(:ferricstore, :ra_segment_max_entries, 1_048_576)
+  end
+
+  defp ra_segment_max_size_bytes do
+    Application.get_env(:ferricstore, :ra_segment_max_size_bytes, 256_000_000)
+  end
+
+  defp ra_wal_max_size_bytes do
+    Application.get_env(:ferricstore, :ra_wal_max_size_bytes, 8_589_934_592)
+  end
+
+  defp ra_wal_compute_checksums? do
+    Application.get_env(:ferricstore, :ra_wal_compute_checksums, true)
   end
 
   @doc false

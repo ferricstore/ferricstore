@@ -234,6 +234,29 @@ defmodule Ferricstore.Raft.StateMachineTest do
     ArgumentError -> :ok
   end
 
+  defp flow_record!(state, state_key) do
+    case :ets.lookup(state.ets, state_key) do
+      [{^state_key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}]
+      when is_binary(value) ->
+        Ferricstore.Flow.decode_record(value)
+
+      [{^state_key, nil, _expire_at_ms, _lfu, file_id, offset, _value_size}] ->
+        path =
+          Path.join(
+            state.shard_data_path,
+            "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log"
+          )
+
+        case NIF.v2_pread_at(path, offset) do
+          {:ok, value} when is_binary(value) -> Ferricstore.Flow.decode_record(value)
+          other -> flunk("expected cold Flow record at #{path}:#{offset}, got: #{inspect(other)}")
+        end
+
+      other ->
+        flunk("expected hot Flow state record for #{inspect(state_key)}, got: #{inspect(other)}")
+    end
+  end
+
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 
@@ -256,7 +279,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       partition_key = "tenant-command-time"
       state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
-      {state, {:ok, created}} =
+      {state, :ok} =
         StateMachine.apply(
           %{system_time: 1_000},
           {:flow_create, state_key,
@@ -264,6 +287,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
           state
         )
 
+      created = flow_record!(state, state_key)
       assert created.created_at_ms == 1_000
       assert created.updated_at_ms == 1_000
       assert created.next_run_at_ms == 1_000
@@ -301,7 +325,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       inflight_index_key = Ferricstore.Flow.Keys.inflight_index_key(type, partition_key)
 
-      {_, {:ok, transitioned}} =
+      {state, :ok} =
         StateMachine.apply(
           %{system_time: 2_000},
           {:flow_transition, state_key,
@@ -316,6 +340,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
           state
         )
 
+      transitioned = flow_record!(state, state_key)
       assert transitioned.updated_at_ms == 2_000
       assert transitioned.next_run_at_ms == 2_000
 
@@ -386,14 +411,17 @@ defmodule Ferricstore.Raft.StateMachineTest do
         end
 
       try do
-        {_state, {:ok, created}} =
+        {_state, :ok} =
           StateMachine.apply(
             %{system_time: 1_000},
             {:flow_create_many, nil, %{records: records}},
             state
           )
 
-        assert length(created) == 3
+        assert Enum.all?(records, fn %{id: id, partition_key: partition_key} ->
+                 state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+                 flow_record!(state, state_key).id == id
+               end)
 
         assert_receive {:flow_bitcask_append, measurements,
                         %{shard_index: ^shard_index, status: :ok}},
@@ -468,9 +496,21 @@ defmodule Ferricstore.Raft.StateMachineTest do
             state
           )
 
-        assert {:ok, %{id: "flow-ra-batch-a"}} = result_a
+        assert :ok = result_a
         assert {:error, "ERR flow already exists"} = duplicate_result
-        assert {:ok, %{id: "flow-ra-batch-b"}} = result_b
+        assert :ok = result_b
+
+        assert flow_record!(
+                 state,
+                 Ferricstore.Flow.Keys.state_key("flow-ra-batch-a", partition_key)
+               ).id ==
+                 "flow-ra-batch-a"
+
+        assert flow_record!(
+                 state,
+                 Ferricstore.Flow.Keys.state_key("flow-ra-batch-b", partition_key)
+               ).id ==
+                 "flow-ra-batch-b"
 
         assert_receive {:flow_bitcask_append, measurements,
                         %{shard_index: ^shard_index, status: :ok}},
@@ -518,14 +558,17 @@ defmodule Ferricstore.Raft.StateMachineTest do
           }
         end
 
-      {state, {:ok, created}} =
+      {state, :ok} =
         StateMachine.apply(
           %{system_time: 1_000},
           {:flow_create_many, nil, %{records: records}},
           state
         )
 
-      assert length(created) == 3
+      assert Enum.all?(records, fn %{id: id, partition_key: partition_key} ->
+               state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+               flow_record!(state, state_key).id == id
+             end)
 
       handler_id = {:flow_claim_due_append_batch, self(), make_ref()}
 
@@ -609,7 +652,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       correlation_id = "corr-claim-bulk-index"
       state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
-      {state, {:ok, _created}} =
+      {state, :ok} =
         StateMachine.apply(
           %{system_time: 1_000},
           {:flow_create, state_key,
@@ -781,14 +824,18 @@ defmodule Ferricstore.Raft.StateMachineTest do
           }
         end
 
-      {state, {:ok, created}} =
+      {state, :ok} =
         StateMachine.apply(
           %{system_time: 1_000},
           {:flow_create_many, nil, %{records: records}},
           state
         )
 
-      assert length(created) == 10
+      assert Enum.all?(records, fn %{id: id, partition_key: partition_key} ->
+               state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+               flow_record!(state, state_key).id == id
+             end)
+
       assert :ok = Ferricstore.Flow.LMDBWriter.flush(state.instance_name, shard_index)
 
       handler_id = {:flow_claim_due_lmdb_enqueue, self(), make_ref()}
@@ -889,7 +936,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       id = "flow-active-lmdb-projection"
       state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
-      {state, {:ok, _created}} =
+      {state, :ok} =
         StateMachine.apply(
           %{system_time: 1_000},
           {:flow_create, state_key,
@@ -928,7 +975,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       refute_receive {:flow_lmdb_backlog, _measurements, _metadata}, 100
 
-      {_state, {:ok, completed}} =
+      {state, :ok} =
         StateMachine.apply(
           %{system_time: 3_000},
           {:flow_complete, state_key,
@@ -942,9 +989,168 @@ defmodule Ferricstore.Raft.StateMachineTest do
           state
         )
 
+      completed = flow_record!(state, state_key)
       assert completed.state == "completed"
       assert_receive {:flow_lmdb_backlog, measurements, %{shard_index: ^shard_index}}, 500
       assert measurements.pending_ops > 0
+    end
+
+    test "Flow hot path does not depend on LMDB writer availability", %{
+      state: state,
+      shard_index: shard_index
+    } do
+      old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+      old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+      old_max_ops = Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops)
+
+      Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+      Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+      Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
+
+      :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
+      :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
+      :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+
+      writer_name = Ferricstore.Flow.LMDBWriter.name(state.instance_name, shard_index)
+      assert Process.whereis(writer_name) == nil
+
+      backlog_handler_id = {:flow_hot_path_lmdb_backlog, self(), make_ref()}
+      degraded_handler_id = {:flow_hot_path_lmdb_degraded, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          backlog_handler_id,
+          [:ferricstore, :flow, :lmdb_writer, :backlog],
+          fn _event, measurements, metadata, test_pid ->
+            send(test_pid, {:flow_lmdb_backlog, measurements, metadata})
+          end,
+          self()
+        )
+
+      :ok =
+        :telemetry.attach(
+          degraded_handler_id,
+          [:ferricstore, :flow, :lmdb_mirror, :degraded],
+          fn _event, measurements, metadata, test_pid ->
+            send(test_pid, {:flow_lmdb_degraded, measurements, metadata})
+          end,
+          self()
+        )
+
+      on_exit(fn ->
+        :telemetry.detach(backlog_handler_id)
+        :telemetry.detach(degraded_handler_id)
+        safe_delete_ets(state.zset_score_index_name)
+        safe_delete_ets(state.zset_score_lookup_name)
+        safe_delete_ets(state.flow_index_name)
+        safe_delete_ets(state.flow_lookup_name)
+        restore_env(:flow_lmdb_mode, old_mode)
+        restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+        restore_env(:flow_lmdb_max_batch_ops, old_max_ops)
+      end)
+
+      partition_key = "tenant-flow-hot-path-lmdb"
+      type = "flow-hot-path-lmdb"
+      id = "flow-hot-path-lmdb"
+      state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+      {state, :ok} =
+        StateMachine.apply(
+          %{system_time: 1_000},
+          {:flow_create, state_key,
+           %{
+             id: id,
+             type: type,
+             state: "queued",
+             partition_key: partition_key,
+             parent_flow_id: "parent-flow-hot-path-lmdb",
+             correlation_id: "correlation-flow-hot-path-lmdb",
+             now_ms: 1_000,
+             run_at_ms: 1_000
+           }},
+          state
+        )
+
+      assert flow_record!(state, state_key).state == "queued"
+
+      due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
+
+      {state, {:ok, [claimed]}} =
+        StateMachine.apply(
+          %{system_time: 2_000},
+          {:flow_claim_due, due_key,
+           %{
+             type: type,
+             state: "queued",
+             worker: "worker-flow-hot-path-lmdb",
+             lease_ms: 30_000,
+             limit: 1,
+             priority: nil,
+             partition_key: partition_key
+           }},
+          state
+        )
+
+      {state, :ok} =
+        StateMachine.apply(
+          %{system_time: 3_000},
+          {:flow_transition, state_key,
+           %{
+             id: id,
+             from_state: "running",
+             to_state: "waiting",
+             lease_token: claimed.lease_token,
+             fencing_token: claimed.fencing_token,
+             partition_key: partition_key,
+             now_ms: 3_000
+           }},
+          state
+        )
+
+      waiting = flow_record!(state, state_key)
+      assert waiting.state == "waiting"
+      refute_receive {:flow_lmdb_backlog, _measurements, _metadata}, 100
+      refute_receive {:flow_lmdb_degraded, _measurements, _metadata}, 100
+
+      waiting_due_key = Ferricstore.Flow.Keys.due_key(type, "waiting", 0, partition_key)
+
+      {state, {:ok, [claimed_again]}} =
+        StateMachine.apply(
+          %{system_time: 4_000},
+          {:flow_claim_due, waiting_due_key,
+           %{
+             type: type,
+             state: "waiting",
+             worker: "worker-flow-hot-path-lmdb",
+             lease_ms: 30_000,
+             limit: 1,
+             priority: nil,
+             partition_key: partition_key
+           }},
+          state
+        )
+
+      {state, :ok} =
+        StateMachine.apply(
+          %{system_time: 5_000},
+          {:flow_complete, state_key,
+           %{
+             id: id,
+             lease_token: claimed_again.lease_token,
+             fencing_token: claimed_again.fencing_token,
+             partition_key: partition_key,
+             now_ms: 5_000
+           }},
+          state
+        )
+
+      completed = flow_record!(state, state_key)
+      assert completed.state == "completed"
+
+      assert_receive {:flow_lmdb_degraded, %{count: 1},
+                      %{shard_index: ^shard_index, reason: :writer_not_started}},
+                     500
     end
   end
 
@@ -2860,6 +3066,144 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert {:error, {:bitcask_append_failed, _reason}} = result
       assert old_entry == :ets.lookup(ets, "delete_failure_existing")
       assert [] == :ets.lookup(ets, "delete_failure_new")
+    end
+
+    test "put_batch Bitcask append errors restore originals and remove new puts", %{
+      state: state,
+      ets: ets
+    } do
+      {state2, :ok} =
+        StateMachine.apply(%{}, {:put, "put_batch_failure_existing", "old_value", 0}, state)
+
+      old_entry = :ets.lookup(ets, "put_batch_failure_existing")
+
+      file_id = 9_200_000 + :erlang.unique_integer([:positive])
+      bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+      File.mkdir_p!(bad_active_path)
+      bad_state = %{state2 | active_file_id: file_id, active_file_path: bad_active_path}
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:put_batch,
+           [
+             {"put_batch_failure_existing", "new_value", 0},
+             {"put_batch_failure_new", "new_value", 0}
+           ]},
+          bad_state
+        )
+
+      assert {:error, {:bitcask_append_failed, _reason}} = result
+      assert old_entry == :ets.lookup(ets, "put_batch_failure_existing")
+      assert [] == :ets.lookup(ets, "put_batch_failure_new")
+    end
+
+    test "delete_batch Bitcask append errors keep existing keys visible", %{
+      state: state,
+      ets: ets
+    } do
+      {state2, {:ok, [:ok, :ok]}} =
+        StateMachine.apply(
+          %{},
+          {:put_batch,
+           [
+             {"delete_batch_failure_existing_a", "old_a", 0},
+             {"delete_batch_failure_existing_b", "old_b", 0}
+           ]},
+          state
+        )
+
+      old_a = :ets.lookup(ets, "delete_batch_failure_existing_a")
+      old_b = :ets.lookup(ets, "delete_batch_failure_existing_b")
+
+      file_id = 9_300_000 + :erlang.unique_integer([:positive])
+      bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+      File.mkdir_p!(bad_active_path)
+      bad_state = %{state2 | active_file_id: file_id, active_file_path: bad_active_path}
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:delete_batch,
+           [
+             "delete_batch_failure_existing_a",
+             "delete_batch_failure_existing_b",
+             "delete_batch_failure_missing"
+           ]},
+          bad_state
+        )
+
+      assert {:error, {:bitcask_append_failed, _reason}} = result
+      assert old_a == :ets.lookup(ets, "delete_batch_failure_existing_a")
+      assert old_b == :ets.lookup(ets, "delete_batch_failure_existing_b")
+      assert [] == :ets.lookup(ets, "delete_batch_failure_missing")
+    end
+
+    test "compound_batch_put Bitcask append errors keep existing fields visible", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "compound_batch_failure_hash"
+      existing = CompoundKey.hash_field(redis_key, "existing")
+      new_field = CompoundKey.hash_field(redis_key, "new")
+
+      {state2, {:ok, [:ok]}} =
+        StateMachine.apply(%{}, {:compound_batch_put, redis_key, [{existing, "old", 0}]}, state)
+
+      old_entry = :ets.lookup(ets, existing)
+
+      file_id = 9_400_000 + :erlang.unique_integer([:positive])
+      bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+      File.mkdir_p!(bad_active_path)
+      bad_state = %{state2 | active_file_id: file_id, active_file_path: bad_active_path}
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:compound_batch_put, redis_key, [{existing, "new", 0}, {new_field, "new", 0}]},
+          bad_state
+        )
+
+      assert {:error, {:bitcask_append_failed, _reason}} = result
+      assert old_entry == :ets.lookup(ets, existing)
+      assert [] == :ets.lookup(ets, new_field)
+    end
+
+    test "compound_batch_delete Bitcask append errors keep existing fields visible", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "compound_delete_batch_failure_hash"
+      existing_a = CompoundKey.hash_field(redis_key, "a")
+      existing_b = CompoundKey.hash_field(redis_key, "b")
+      missing = CompoundKey.hash_field(redis_key, "missing")
+
+      {state2, {:ok, [:ok, :ok]}} =
+        StateMachine.apply(
+          %{},
+          {:compound_batch_put, redis_key, [{existing_a, "old_a", 0}, {existing_b, "old_b", 0}]},
+          state
+        )
+
+      old_a = :ets.lookup(ets, existing_a)
+      old_b = :ets.lookup(ets, existing_b)
+
+      file_id = 9_500_000 + :erlang.unique_integer([:positive])
+      bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+      File.mkdir_p!(bad_active_path)
+      bad_state = %{state2 | active_file_id: file_id, active_file_path: bad_active_path}
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:compound_batch_delete, redis_key, [existing_a, existing_b, missing]},
+          bad_state
+        )
+
+      assert {:error, {:bitcask_append_failed, _reason}} = result
+      assert old_a == :ets.lookup(ets, existing_a)
+      assert old_b == :ets.lookup(ets, existing_b)
+      assert [] == :ets.lookup(ets, missing)
     end
 
     test "emits bounded apply and Bitcask append telemetry", %{

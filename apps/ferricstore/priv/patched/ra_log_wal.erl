@@ -1028,6 +1028,12 @@ sync(Fd, Meth) ->
 %% notifying them inline.
 complete_batch(#state{batch = undefined} = State) ->
     State;
+complete_batch(#state{batch = #batch{num_writes = 0,
+                                     pending = []}} = State) ->
+    %% gen_batch_server also batches non-write messages such as query and
+    %% async sync completions. Do not turn those empty batches into fdatasync
+    %% work; only WAL append batches need durability notification.
+    State#state{batch = undefined};
 complete_batch(#state{batch = #batch{waiting = Waiting,
                                      num_writes = NumWrites},
                       wal = Wal,
@@ -1128,7 +1134,10 @@ next_adaptive_commit_delay_us(MaxDelayUs, _CurrentDelayUs, _ReleasedBatches, _Qu
     0;
 next_adaptive_commit_delay_us(MaxDelayUs, CurrentDelayUs, _ReleasedBatches, QueuedBatches)
   when is_integer(QueuedBatches), QueuedBatches > 0 ->
-    min(MaxDelayUs, max(1000, max(?WAL_DELAY_FLOOR_US, CurrentDelayUs) * 2));
+    %% Queued batches mean writes arrived while fdatasync was already running.
+    %% The disk sync itself is giving us enough group-commit opportunity, so
+    %% adding extra delay on the next cycle only increases client latency.
+    min(MaxDelayUs, min(CurrentDelayUs, ?WAL_DELAY_FLOOR_US));
 next_adaptive_commit_delay_us(MaxDelayUs, CurrentDelayUs, _ReleasedBatches, _QueuedBatches) ->
     min(MaxDelayUs, max(?WAL_DELAY_FLOOR_US, CurrentDelayUs div 2)).
 

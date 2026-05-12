@@ -19,6 +19,7 @@ defmodule Ferricstore.QuorumMetrics do
     [:ferricstore, :batcher, :local_apply_waiters],
     [:ferricstore, :batcher, :local_apply_gate],
     [:ferricstore, :batcher, :local_apply_timeout],
+    [:ferricstore, :wal, :sync],
     [:ferricstore, :raft, :apply],
     [:ferricstore, :bitcask, :append]
   ]
@@ -30,6 +31,9 @@ defmodule Ferricstore.QuorumMetrics do
     slot_flush_queue_wait_us_total:
       {"ferricstore_quorum_slot_flush_queue_wait_us_total", :counter,
        "Total queued microseconds observed before slot flush"},
+    slot_flush_queue_wait_us_max:
+      {"ferricstore_quorum_slot_flush_queue_wait_us_max", :gauge,
+       "Maximum queued microseconds observed before slot flush"},
     slot_flush_batch_size_total:
       {"ferricstore_quorum_slot_flush_batch_size_total", :counter,
        "Total commands flushed from batcher slots"},
@@ -41,6 +45,9 @@ defmodule Ferricstore.QuorumMetrics do
     submit_duration_us_total:
       {"ferricstore_quorum_submit_duration_us_total", :counter,
        "Total microseconds spent submitting quorum commands to Raft"},
+    submit_duration_us_max:
+      {"ferricstore_quorum_submit_duration_us_max", :gauge,
+       "Maximum microseconds spent submitting quorum commands to Raft"},
     submit_batch_size_total:
       {"ferricstore_quorum_submit_batch_size_total", :counter,
        "Total commands submitted through the quorum path"},
@@ -56,6 +63,9 @@ defmodule Ferricstore.QuorumMetrics do
     applied_duration_us_total:
       {"ferricstore_quorum_applied_duration_us_total", :counter,
        "Total microseconds from quorum submission tracking to Raft applied event"},
+    applied_duration_us_max:
+      {"ferricstore_quorum_applied_duration_us_max", :gauge,
+       "Maximum microseconds from quorum submission tracking to Raft applied event"},
     applied_caller_count_total:
       {"ferricstore_quorum_applied_caller_count_total", :counter,
        "Total callers represented by Raft-applied quorum submissions"},
@@ -71,24 +81,59 @@ defmodule Ferricstore.QuorumMetrics do
     local_apply_gate_duration_us_total:
       {"ferricstore_batcher_local_apply_gate_duration_us_total", :counter,
        "Total microseconds quorum replies spent gated on local Raft apply"},
+    local_apply_gate_duration_us_max:
+      {"ferricstore_batcher_local_apply_gate_duration_us_max", :gauge,
+       "Maximum microseconds quorum replies spent gated on local Raft apply"},
     local_apply_gate_caller_count_total:
       {"ferricstore_batcher_local_apply_gate_caller_count_total", :counter,
        "Total callers represented by local Raft apply gate releases"},
     local_apply_timeout_total:
       {"ferricstore_batcher_local_apply_timeout_total", :counter,
        "Total timeouts while waiting for local Raft apply"},
+    wal_sync_total:
+      {"ferricstore_wal_sync_total", :counter, "Total async Ra WAL sync completions"},
+    wal_sync_duration_us_total:
+      {"ferricstore_wal_sync_duration_us_total", :counter,
+       "Total microseconds spent waiting for async Ra WAL sync"},
+    wal_sync_duration_us_max:
+      {"ferricstore_wal_sync_duration_us_max", :gauge,
+       "Maximum observed async Ra WAL sync duration in microseconds"},
+    wal_sync_delay_us_total:
+      {"ferricstore_wal_sync_delay_us_total", :counter,
+       "Total adaptive Ra WAL sync delay selected in microseconds"},
+    wal_sync_delay_us_max:
+      {"ferricstore_wal_sync_delay_us_max", :gauge,
+       "Maximum adaptive Ra WAL sync delay selected in microseconds"},
+    wal_sync_pending_batches_total:
+      {"ferricstore_wal_sync_pending_batches_total", :counter,
+       "Total Ra WAL batches released by async sync completions"},
+    wal_sync_pending_batches_max:
+      {"ferricstore_wal_sync_pending_batches_max", :gauge,
+       "Maximum observed number of Ra WAL batches released by one async sync completion"},
+    wal_sync_queued_batches_total:
+      {"ferricstore_wal_sync_queued_batches_total", :counter,
+       "Total Ra WAL batches left queued behind async sync completions"},
+    wal_sync_queued_batches_max:
+      {"ferricstore_wal_sync_queued_batches_max", :gauge,
+       "Maximum observed number of Ra WAL batches left queued behind one async sync completion"},
     apply_total:
       {"ferricstore_quorum_apply_total", :counter,
        "Total number of Raft state-machine apply calls"},
     apply_duration_us_total:
       {"ferricstore_quorum_apply_duration_us_total", :counter,
        "Total microseconds spent in Raft state-machine apply"},
+    apply_duration_us_max:
+      {"ferricstore_quorum_apply_duration_us_max", :gauge,
+       "Maximum microseconds spent in Raft state-machine apply"},
     bitcask_append_total:
       {"ferricstore_quorum_bitcask_append_total", :counter,
        "Total number of Bitcask append attempts from Raft apply"},
     bitcask_append_duration_us_total:
       {"ferricstore_quorum_bitcask_append_duration_us_total", :counter,
        "Total microseconds spent appending Raft-applied writes to Bitcask"},
+    bitcask_append_duration_us_max:
+      {"ferricstore_quorum_bitcask_append_duration_us_max", :gauge,
+       "Maximum microseconds spent appending Raft-applied writes to Bitcask"},
     bitcask_append_batch_size_total:
       {"ferricstore_quorum_bitcask_append_batch_size_total", :counter,
        "Total records appended to Bitcask from Raft apply"},
@@ -147,6 +192,7 @@ defmodule Ferricstore.QuorumMetrics do
 
     increment(:slot_flush_total, labels, 1)
     increment(:slot_flush_queue_wait_us_total, labels, measurement(measurements, :queue_wait_us))
+    max_metric(:slot_flush_queue_wait_us_max, labels, measurement(measurements, :queue_wait_us))
     increment(:slot_flush_batch_size_total, labels, measurement(measurements, :batch_size))
     increment(:slot_flush_caller_count_total, labels, measurement(measurements, :caller_count))
   end
@@ -160,6 +206,7 @@ defmodule Ferricstore.QuorumMetrics do
 
     increment(:submit_total, labels, 1)
     increment(:submit_duration_us_total, labels, measurement(measurements, :duration_us))
+    max_metric(:submit_duration_us_max, labels, measurement(measurements, :duration_us))
     increment(:submit_batch_size_total, labels, measurement(measurements, :batch_size))
     increment(:submit_caller_count_total, labels, measurement(measurements, :caller_count))
     increment(:submit_command_bytes_total, labels, measurement(measurements, :command_bytes))
@@ -174,6 +221,7 @@ defmodule Ferricstore.QuorumMetrics do
 
     increment(:applied_total, labels, 1)
     increment(:applied_duration_us_total, labels, measurement(measurements, :duration_us))
+    max_metric(:applied_duration_us_max, labels, measurement(measurements, :duration_us))
     increment(:applied_caller_count_total, labels, measurement(measurements, :caller_count))
   end
 
@@ -213,6 +261,12 @@ defmodule Ferricstore.QuorumMetrics do
       measurement(measurements, :duration_us)
     )
 
+    max_metric(
+      :local_apply_gate_duration_us_max,
+      labels,
+      measurement(measurements, :duration_us)
+    )
+
     increment(
       :local_apply_gate_caller_count_total,
       labels,
@@ -230,6 +284,40 @@ defmodule Ferricstore.QuorumMetrics do
     increment(:local_apply_timeout_total, labels, measurement(measurements, :count))
   end
 
+  def handle_event([:ferricstore, :wal, :sync], measurements, metadata, _config) do
+    labels = [status: enum_label(Map.get(metadata, :status), [:ok, :error])]
+
+    increment(:wal_sync_total, labels, 1)
+    increment(:wal_sync_duration_us_total, labels, measurement(measurements, :duration_us))
+    max_metric(:wal_sync_duration_us_max, labels, measurement(measurements, :duration_us))
+    increment(:wal_sync_delay_us_total, labels, measurement(measurements, :delay_us))
+    max_metric(:wal_sync_delay_us_max, labels, measurement(measurements, :delay_us))
+
+    increment(
+      :wal_sync_pending_batches_total,
+      labels,
+      measurement(measurements, :pending_batches)
+    )
+
+    max_metric(
+      :wal_sync_pending_batches_max,
+      labels,
+      measurement(measurements, :pending_batches)
+    )
+
+    increment(
+      :wal_sync_queued_batches_total,
+      labels,
+      measurement(measurements, :queued_batches)
+    )
+
+    max_metric(
+      :wal_sync_queued_batches_max,
+      labels,
+      measurement(measurements, :queued_batches)
+    )
+  end
+
   def handle_event([:ferricstore, :raft, :apply], measurements, metadata, _config) do
     labels = [
       shard_index: shard_label(Map.get(metadata, :shard_index)),
@@ -239,6 +327,7 @@ defmodule Ferricstore.QuorumMetrics do
 
     increment(:apply_total, labels, 1)
     increment(:apply_duration_us_total, labels, measurement(measurements, :duration_us))
+    max_metric(:apply_duration_us_max, labels, measurement(measurements, :duration_us))
   end
 
   def handle_event([:ferricstore, :bitcask, :append], measurements, metadata, _config) do
@@ -251,6 +340,12 @@ defmodule Ferricstore.QuorumMetrics do
 
     increment(
       :bitcask_append_duration_us_total,
+      labels,
+      measurement(measurements, :duration_us)
+    )
+
+    max_metric(
+      :bitcask_append_duration_us_max,
       labels,
       measurement(measurements, :duration_us)
     )
@@ -327,6 +422,23 @@ defmodule Ferricstore.QuorumMetrics do
 
     try do
       :ets.insert(@table, {key, counter_value(value)})
+      :ok
+    rescue
+      ArgumentError -> :ok
+    end
+  end
+
+  @spec max_metric(metric_id(), labels(), integer()) :: :ok
+  defp max_metric(metric_id, labels, value) do
+    amount = counter_value(value)
+    key = {metric_id, labels}
+
+    try do
+      case :ets.lookup(@table, key) do
+        [{^key, current}] when current >= amount -> :ok
+        _ -> :ets.insert(@table, {key, amount})
+      end
+
       :ok
     rescue
       ArgumentError -> :ok

@@ -79,6 +79,39 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
              "do_compound_delete(state, redis_key, CompoundKey.zset_member(redis_key, member))"
   end
 
+  test "state-machine applies compact compound batch terms directly" do
+    source = File.read!(@state_machine_path)
+
+    assert source =~ "def apply(meta, {:compound_batch_put, redis_key, entries}, state)",
+           "compound batch writes should not replay through generic {:batch, compound_put...}"
+
+    assert source =~ "def apply(meta, {:compound_batch_delete, redis_key, compound_keys}, state)",
+           "compound batch deletes should not replay through generic {:batch, compound_delete...}"
+
+    assert source =~ "defp do_shared_compound_batch_put_fast",
+           "shared compound puts should stage records and publish after append success"
+
+    assert source =~ "defp do_shared_compound_batch_delete_fast",
+           "shared compound deletes should stage tombstones and publish after append success"
+  end
+
+  test "shard raft path submits compact compound batch terms" do
+    shard_compound_path =
+      Path.expand("../../../lib/ferricstore/store/shard/compound.ex", __DIR__)
+
+    source = File.read!(shard_compound_path)
+    put_body = function_body(source, "handle_compound_batch_put_raft")
+    delete_body = function_body(source, "handle_compound_batch_delete_raft")
+
+    assert put_body =~ "{:compound_batch_put, redis_key, entries}"
+    refute put_body =~ "Enum.map(entries"
+    refute put_body =~ "{:batch, commands}"
+
+    assert delete_body =~ "{:compound_batch_delete, redis_key, compound_keys}"
+    refute delete_body =~ "Enum.map(compound_keys"
+    refute delete_body =~ "{:batch, commands}"
+  end
+
   test "state-machine promoted compound batch tombstones keep sync durability" do
     source = File.read!(@state_machine_path)
     body = function_body(source, "do_promoted_compound_batch_delete")

@@ -59,8 +59,9 @@ defmodule Ferricstore.Raft.Batcher do
   If no configuration exists for a prefix, the default window is used:
   `window_ms = 1`.
 
-  Quorum commands are submitted to ra via `:ra.pipeline_command/3` with a
-  correlation reference. Callers are replied to when the `ra_event`
+  Quorum commands are submitted to ra via `:ra.pipeline_command/4` with a
+  correlation reference and low priority so Ra can batch the hot write stream.
+  Callers are replied to when the `ra_event`
   notification arrives confirming the command was applied.
 
   The module still has an internal `{prefix, :origin_replay}` slot for
@@ -81,6 +82,7 @@ defmodule Ferricstore.Raft.Batcher do
     * `:shard_id` (required) -- the ra server ID for this shard
     * `:shard_index` (required) -- zero-based shard index
     * `:max_batch_size` -- flush single-write slot when it reaches this size (default: 50_000)
+    * `:max_pending_batches` -- max in-flight Ra batches before backpressure (default: 256)
   """
 
   use GenServer
@@ -90,8 +92,10 @@ defmodule Ferricstore.Raft.Batcher do
   alias Ferricstore.ErrorReasons
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.CommandClock
+  alias Ferricstore.Raft.PerfToggles
 
   @default_max_batch_size 50_000
+  @default_max_pending_batches 256
 
   # Origin retry tuning (Option R1 from the rejected-retry design). When Ra
   # returns :rejected {:not_leader, hint, corr} for an origin replay batch, the
@@ -134,6 +138,7 @@ defmodule Ferricstore.Raft.Batcher do
              non_neg_integer()}
           | {:list_op, binary(), term()}
           | {:compound_put, binary(), binary(), non_neg_integer()}
+          | {:compound_batch_put, binary(), [{binary(), binary(), non_neg_integer()}]}
           | {:compound_delete, binary()}
           | {:compound_batch_delete, binary(), [binary()]}
           | {:compound_delete_prefix, binary()}
@@ -190,6 +195,7 @@ defmodule Ferricstore.Raft.Batcher do
     :shard_id,
     :shard_index,
     :max_batch_size,
+    :max_pending_batches,
     slots: %{},
     ns_cache: %{},
     # Map from correlation ref -> {froms, :single | :batch} for in-flight ra commands
@@ -320,6 +326,69 @@ defmodule Ferricstore.Raft.Batcher do
   @spec write_batch(non_neg_integer(), [command()], GenServer.from()) :: :ok
   def write_batch(shard_index, cmds, from) do
     GenServer.cast(batcher_name(shard_index), {:write_batch, cmds, length(cmds), from})
+  end
+
+  @doc """
+  Submits a pre-normalized SET batch.
+
+  This is the hot RESP pipeline path: callers should build the final
+  `{:put_batch, entries}` shape directly instead of allocating one
+  `{:put, key, value, expire_at_ms}` tuple per key and asking the batcher
+  to compact it later.
+
+  The apply-side contract matters as much as the term shape. `{:put_batch, _}`
+  is a pure write batch, so the state machine must stage disk records and
+  publish ETS once after Bitcask returns ordered append locations. It should
+  not create temporary pending ETS rows unless a future term needs
+  read-your-own-write inside the same Ra entry.
+  """
+  @spec write_put_batch(
+          non_neg_integer(),
+          [{binary(), binary(), non_neg_integer()}],
+          GenServer.from()
+        ) :: :ok
+  def write_put_batch(shard_index, entries, from) do
+    GenServer.cast(batcher_name(shard_index), {:write_put_batch, entries, length(entries), from})
+  end
+
+  @doc false
+  @spec write_put_batch_forwarded(
+          non_neg_integer(),
+          [{binary(), binary(), non_neg_integer()}],
+          GenServer.from(),
+          node()
+        ) :: :ok
+  def write_put_batch_forwarded(shard_index, entries, from, origin_node) do
+    GenServer.cast(
+      batcher_name(shard_index),
+      {:write_put_batch, entries, length(entries), remote_origin_from(origin_node, from)}
+    )
+  end
+
+  @doc """
+  Submits a pre-normalized DELETE batch.
+
+  This keeps delete-heavy internal callers and future RESP pipeline fast paths
+  on the final `{:delete_batch, keys}` Raft shape from the start.
+
+  Future specialized Ra command terms should follow the same shape: build the
+  final compact term before Ra serialization, preserve the logical command
+  count for replies, and add a matching bulk apply path with rollback/order
+  tests before using it on a hot path.
+  """
+  @spec write_delete_batch(non_neg_integer(), [binary()], GenServer.from()) :: :ok
+  def write_delete_batch(shard_index, keys, from) do
+    GenServer.cast(batcher_name(shard_index), {:write_delete_batch, keys, length(keys), from})
+  end
+
+  @doc false
+  @spec write_delete_batch_forwarded(non_neg_integer(), [binary()], GenServer.from(), node()) ::
+          :ok
+  def write_delete_batch_forwarded(shard_index, keys, from, origin_node) do
+    GenServer.cast(
+      batcher_name(shard_index),
+      {:write_delete_batch, keys, length(keys), remote_origin_from(origin_node, from)}
+    )
   end
 
   @doc false
@@ -565,6 +634,12 @@ defmodule Ferricstore.Raft.Batcher do
   def extract_prefix(command) when is_tuple(command) do
     key =
       case command do
+        {:put_batch, [{first_key, _value, _expire_at_ms} | _rest]} ->
+          first_key
+
+        {:delete_batch, [first_key | _rest]} ->
+          first_key
+
         {:origin_checked, key, _inner, _before_value, _before_exp, _expected_value, _expire_at_ms} ->
           key
 
@@ -608,11 +683,13 @@ defmodule Ferricstore.Raft.Batcher do
     shard_id = Keyword.fetch!(opts, :shard_id)
     shard_index = Keyword.fetch!(opts, :shard_index)
     max_batch_size = Keyword.get(opts, :max_batch_size, @default_max_batch_size)
+    max_pending_batches = Keyword.get(opts, :max_pending_batches, @default_max_pending_batches)
 
     state = %__MODULE__{
       shard_id: shard_id,
       shard_index: shard_index,
-      max_batch_size: max_batch_size
+      max_batch_size: max_batch_size,
+      max_pending_batches: max_pending_batches
     }
 
     # Kick off the periodic origin-pending sweep (TTL-drop lost entries).
@@ -798,6 +875,24 @@ defmodule Ferricstore.Raft.Batcher do
 
   def handle_cast({:write_batch, cmds, cmd_count, from}, state) do
     enqueue_write_batch(cmds, cmd_count, from, state)
+  end
+
+  def handle_cast({:write_put_batch, [], _cmd_count, from}, state) do
+    reply_from(from, {:ok, []})
+    {:noreply, state}
+  end
+
+  def handle_cast({:write_put_batch, entries, cmd_count, from}, state) do
+    enqueue_write_batch([{:put_batch, entries}], cmd_count, from, state)
+  end
+
+  def handle_cast({:write_delete_batch, [], _cmd_count, from}, state) do
+    reply_from(from, {:ok, []})
+    {:noreply, state}
+  end
+
+  def handle_cast({:write_delete_batch, keys, cmd_count, from}, state) do
+    enqueue_write_batch([{:delete_batch, keys}], cmd_count, from, state)
   end
 
   # Backwards compat: old callers without count
@@ -1017,23 +1112,22 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   defp all_local_reply?(froms) do
-    Enum.all?(froms, fn
-      {pid, _ref} when is_pid(pid) ->
-        node(pid) == node()
-
-      {:batch_from, {pid, _ref}, _count} when is_pid(pid) ->
-        node(pid) == node()
-
-      {:batch_from, {:remote_origin, _origin_node, _from}, _count} ->
-        false
-
-      {:remote_origin, _origin_node, _from} ->
-        false
-
-      _ ->
-        false
-    end)
+    Enum.all?(froms, &local_reply_target?/1)
   end
+
+  defp local_reply_target?({:batch_from, from, _count}), do: local_reply_target?(from)
+  defp local_reply_target?({:remote_origin, _origin_node, _from}), do: false
+
+  defp local_reply_target?({pid, _ref}) when is_pid(pid), do: node(pid) == node()
+
+  # Router batch waits use process aliases through ReplyAwaiter. An alias is
+  # only valid in this BEAM process, so it is a local caller and can use the
+  # immediate local Raft-applied reply path.
+  defp local_reply_target?({alias_ref, {Ferricstore.Raft.ReplyAwaiter, _tag}})
+       when is_reference(alias_ref),
+       do: true
+
+  defp local_reply_target?(_from), do: false
 
   defp track_origin_local_apply(state, ra_index) when is_integer(ra_index) and ra_index > 0 do
     %{state | origin_local_apply_index: max(state.origin_local_apply_index, ra_index)}
@@ -1302,8 +1396,6 @@ defmodule Ferricstore.Raft.Batcher do
   # Private: write enqueue (shared by handle_call and handle_cast)
   # ---------------------------------------------------------------------------
 
-  @max_pending 64
-
   # Accumulates write_batch commands into the quorum slot, flushing when
   # count >= max_batch_size or on next message loop (timer 0). Rejects
   # new batches when too many ra commands are already in flight.
@@ -1313,7 +1405,7 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   defp enqueue_write_batch(cmds, cmd_count, from, state) do
-    if map_size(state.pending) >= @max_pending do
+    if pending_full?(state) do
       reply_from(from, {:error, :overloaded})
       {:noreply, state}
     else
@@ -1448,16 +1540,25 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
-  # Submit a batch via ra:pipeline_command/3 with a correlation ref.
+  # Submit a batch via ra:pipeline_command/4 with a correlation ref.
   # For single commands, submit directly (no batch wrapper).
   # For multiple commands, wrap in {:batch, commands}.
   # Returns updated state with the correlation tracked in `pending`.
   @spec pipeline_submit(%__MODULE__{}, [command()], [GenServer.from()]) :: %__MODULE__{}
+  defp pipeline_submit(state, [{:put_batch, _entries} = command], froms) do
+    pipeline_submit_batch_command(state, command, froms, batch_from_count(froms), :put_batch)
+  end
+
+  defp pipeline_submit(state, [{:delete_batch, _keys} = command], froms) do
+    pipeline_submit_batch_command(state, command, froms, batch_from_count(froms), :delete_batch)
+  end
+
   defp pipeline_submit(state, [single_cmd], froms) do
     corr = make_ref()
     started_at = System.monotonic_time()
     {:ttb, bin} = serialized = CommandClock.to_ttb(single_cmd)
-    submit_result = pipeline_command(state.shard_id, serialized, corr, :normal)
+    priority = raft_pipeline_priority()
+    submit_result = pipeline_command(state.shard_id, serialized, corr, priority)
 
     emit_quorum_submit_telemetry(
       state,
@@ -1467,6 +1568,7 @@ defmodule Ferricstore.Raft.Batcher do
       length(froms),
       byte_size(bin),
       command_shape(single_cmd),
+      priority,
       submit_result
     )
 
@@ -1478,7 +1580,8 @@ defmodule Ferricstore.Raft.Batcher do
     started_at = System.monotonic_time()
     {command, logical_count} = compact_hot_batch(batch)
     {:ttb, bin} = serialized = CommandClock.to_ttb(command)
-    submit_result = pipeline_command(state.shard_id, serialized, corr, :normal)
+    priority = raft_pipeline_priority()
+    submit_result = pipeline_command(state.shard_id, serialized, corr, priority)
 
     emit_quorum_submit_telemetry(
       state,
@@ -1488,6 +1591,29 @@ defmodule Ferricstore.Raft.Batcher do
       length(froms),
       byte_size(bin),
       command_shape(command),
+      priority,
+      submit_result
+    )
+
+    track_or_reject_quorum_submit(state, corr, froms, :batch, submit_result)
+  end
+
+  defp pipeline_submit_batch_command(state, command, froms, logical_count, command_shape) do
+    corr = make_ref()
+    started_at = System.monotonic_time()
+    {:ttb, bin} = serialized = CommandClock.to_ttb(command)
+    priority = raft_pipeline_priority()
+    submit_result = pipeline_command(state.shard_id, serialized, corr, priority)
+
+    emit_quorum_submit_telemetry(
+      state,
+      started_at,
+      :batch,
+      logical_count,
+      length(froms),
+      byte_size(bin),
+      command_shape,
+      priority,
       submit_result
     )
 
@@ -1535,7 +1661,7 @@ defmodule Ferricstore.Raft.Batcher do
   defp submit_origin_with_retry(state, wrapped_batch, target, retry_count, submit_froms \\ []) do
     corr = make_ref()
     serialized = CommandClock.to_ttb({:batch, wrapped_batch})
-    submit_result = pipeline_command(target, serialized, corr, :normal)
+    submit_result = pipeline_command(target, serialized, corr, raft_pipeline_priority())
 
     if pipeline_submit_status(submit_result) == :ok do
       reply_all_froms(submit_froms, :ok)
@@ -1599,16 +1725,24 @@ defmodule Ferricstore.Raft.Batcher do
   @doc false
   @spec compact_hot_batch([command()]) :: {command(), non_neg_integer()}
   def compact_hot_batch(commands) when is_list(commands) do
-    compact_hot_batch(commands, commands, :unknown, [], 0)
+    if PerfToggles.compact_hot_batches?() do
+      compact_hot_batch(commands, commands, :unknown, [], 0)
+    else
+      generic_hot_batch(commands)
+    end
   end
 
   defp compact_hot_batch(_original, [], :put, entries, count),
     do: {{:put_batch, Enum.reverse(entries)}, count}
 
+  defp compact_hot_batch(_original, [], :put_batch, entries, count),
+    do: {{:put_batch, Enum.reverse(entries)}, count}
+
   defp compact_hot_batch(_original, [], :delete, keys, count),
     do: {{:delete_batch, Enum.reverse(keys)}, count}
 
-  defp compact_hot_batch(original, [], _mode, _acc, count), do: {{:batch, original}, count}
+  defp compact_hot_batch(_original, [], :delete_batch, keys, count),
+    do: {{:delete_batch, Enum.reverse(keys)}, count}
 
   defp compact_hot_batch(original, [{:put, key, value, expire_at_ms} | rest], :unknown, [], 0),
     do: compact_hot_batch(original, rest, :put, [{key, value, expire_at_ms}], 1)
@@ -1616,17 +1750,188 @@ defmodule Ferricstore.Raft.Batcher do
   defp compact_hot_batch(original, [{:put, key, value, expire_at_ms} | rest], :put, acc, count),
     do: compact_hot_batch(original, rest, :put, [{key, value, expire_at_ms} | acc], count + 1)
 
+  defp compact_hot_batch(
+         original,
+         [{:put, key, value, expire_at_ms} | rest],
+         :put_batch,
+         acc,
+         count
+       ),
+       do:
+         compact_hot_batch(
+           original,
+           rest,
+           :put_batch,
+           [{key, value, expire_at_ms} | acc],
+           count + 1
+         )
+
+  defp compact_hot_batch(original, [{:put_batch, entries} | rest], :unknown, [], 0),
+    do:
+      compact_hot_batch(
+        original,
+        rest,
+        :put_batch,
+        prepend_reversed(entries, []),
+        length(entries)
+      )
+
+  defp compact_hot_batch(original, [{:put_batch, entries} | rest], :put_batch, acc, count),
+    do:
+      compact_hot_batch(
+        original,
+        rest,
+        :put_batch,
+        prepend_reversed(entries, acc),
+        count + length(entries)
+      )
+
+  defp compact_hot_batch(original, [{:put_batch, entries} | rest], :put, acc, count),
+    do:
+      compact_hot_batch(
+        original,
+        rest,
+        :put,
+        prepend_reversed(entries, acc),
+        count + length(entries)
+      )
+
   defp compact_hot_batch(original, [{:delete, key} | rest], :unknown, [], 0),
     do: compact_hot_batch(original, rest, :delete, [key], 1)
 
   defp compact_hot_batch(original, [{:delete, key} | rest], :delete, acc, count),
     do: compact_hot_batch(original, rest, :delete, [key | acc], count + 1)
 
-  defp compact_hot_batch(original, [_other | rest], _mode, _acc, count),
-    do: {{:batch, original}, count_remaining(rest, count + 1)}
+  defp compact_hot_batch(original, [{:delete, key} | rest], :delete_batch, acc, count),
+    do: compact_hot_batch(original, rest, :delete_batch, [key | acc], count + 1)
 
-  defp count_remaining([], count), do: count
-  defp count_remaining([_ | rest], count), do: count_remaining(rest, count + 1)
+  defp compact_hot_batch(original, [{:delete_batch, keys} | rest], :unknown, [], 0),
+    do: compact_hot_batch(original, rest, :delete_batch, prepend_reversed(keys, []), length(keys))
+
+  defp compact_hot_batch(original, [{:delete_batch, keys} | rest], :delete_batch, acc, count),
+    do:
+      compact_hot_batch(
+        original,
+        rest,
+        :delete_batch,
+        prepend_reversed(keys, acc),
+        count + length(keys)
+      )
+
+  defp compact_hot_batch(original, [{:delete_batch, keys} | rest], :delete, acc, count),
+    do:
+      compact_hot_batch(
+        original,
+        rest,
+        :delete,
+        prepend_reversed(keys, acc),
+        count + length(keys)
+      )
+
+  defp compact_hot_batch(_original, [], {:compound_put, redis_key}, entries, count),
+    do: {{:compound_batch_put, redis_key, Enum.reverse(entries)}, count}
+
+  defp compact_hot_batch(_original, [], {:compound_delete, redis_key}, keys, count),
+    do: {{:compound_batch_delete, redis_key, Enum.reverse(keys)}, count}
+
+  defp compact_hot_batch(
+         original,
+         [{:compound_put, compound_key, value, expire_at_ms} | rest],
+         :unknown,
+         [],
+         0
+       ) do
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
+
+    compact_hot_batch(
+      original,
+      rest,
+      {:compound_put, redis_key},
+      [{compound_key, value, expire_at_ms}],
+      1
+    )
+  end
+
+  defp compact_hot_batch(
+         original,
+         [{:compound_put, compound_key, value, expire_at_ms} | rest],
+         {:compound_put, redis_key},
+         acc,
+         count
+       ) do
+    if Ferricstore.Store.CompoundKey.extract_redis_key(compound_key) == redis_key do
+      compact_hot_batch(
+        original,
+        rest,
+        {:compound_put, redis_key},
+        [{compound_key, value, expire_at_ms} | acc],
+        count + 1
+      )
+    else
+      generic_hot_batch(original)
+    end
+  end
+
+  defp compact_hot_batch(
+         original,
+         [{:compound_delete, compound_key} | rest],
+         :unknown,
+         [],
+         0
+       ) do
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
+    compact_hot_batch(original, rest, {:compound_delete, redis_key}, [compound_key], 1)
+  end
+
+  defp compact_hot_batch(
+         original,
+         [{:compound_delete, compound_key} | rest],
+         {:compound_delete, redis_key},
+         acc,
+         count
+       ) do
+    if Ferricstore.Store.CompoundKey.extract_redis_key(compound_key) == redis_key do
+      compact_hot_batch(
+        original,
+        rest,
+        {:compound_delete, redis_key},
+        [compound_key | acc],
+        count + 1
+      )
+    else
+      generic_hot_batch(original)
+    end
+  end
+
+  defp compact_hot_batch(original, [], _mode, _acc, _count), do: generic_hot_batch(original)
+
+  defp compact_hot_batch(original, [_other | _rest], _mode, _acc, _count),
+    do: generic_hot_batch(original)
+
+  defp generic_hot_batch(commands) do
+    expanded = expand_put_delete_batch_terms(commands)
+    {{:batch, expanded}, length(expanded)}
+  end
+
+  defp expand_put_delete_batch_terms(commands) do
+    Enum.flat_map(commands, fn
+      {:put_batch, entries} ->
+        Enum.map(entries, fn {key, value, expire_at_ms} -> {:put, key, value, expire_at_ms} end)
+
+      {:delete_batch, keys} ->
+        Enum.map(keys, fn key -> {:delete, key} end)
+
+      command ->
+        [command]
+    end)
+  end
+
+  defp batch_from_count(froms) do
+    Enum.reduce(froms, 0, fn
+      {:batch_from, _from, count}, acc -> acc + count
+      _from, acc -> acc + 1
+    end)
+  end
 
   # Enqueue a write that enters through a non-blocking call but must use the
   # quorum slot like every other user-visible write.
@@ -1744,7 +2049,7 @@ defmodule Ferricstore.Raft.Batcher do
   defp maybe_add_origin_submit_from(froms, nil), do: froms
   defp maybe_add_origin_submit_from(froms, from), do: [from | froms]
 
-  defp pending_full?(state), do: map_size(state.pending) >= @max_pending
+  defp pending_full?(state), do: map_size(state.pending) >= state.max_pending_batches
 
   # Reply to flush waiters once everything is drained: in-flight ra commands
   # are all applied AND the local state machine has caught up to all their
@@ -1869,7 +2174,7 @@ defmodule Ferricstore.Raft.Batcher do
     :telemetry.execute(
       [:ferricstore, :batcher, :slot_flush],
       %{
-        batch_size: length(batch),
+        batch_size: Map.get(slot, :count, length(batch)),
         caller_count: length(froms),
         queue_wait_us: duration_us(Map.get(slot, :created_mono, System.monotonic_time()))
       },
@@ -1890,6 +2195,7 @@ defmodule Ferricstore.Raft.Batcher do
          caller_count,
          command_bytes,
          command_shape,
+         raft_priority,
          submit_result
        ) do
     :telemetry.execute(
@@ -1904,13 +2210,18 @@ defmodule Ferricstore.Raft.Batcher do
         shard_index: state.shard_index,
         kind: kind,
         command_shape: command_shape,
+        raft_priority: raft_priority,
         status: pipeline_submit_status(submit_result)
       }
     )
   end
 
+  defp raft_pipeline_priority, do: PerfToggles.pipeline_priority()
+
   defp command_shape({:put_batch, _entries}), do: :put_batch
   defp command_shape({:delete_batch, _keys}), do: :delete_batch
+  defp command_shape({:compound_batch_put, _redis_key, _entries}), do: :compound_batch_put
+  defp command_shape({:compound_batch_delete, _redis_key, _keys}), do: :compound_batch_delete
   defp command_shape({:batch, _commands}), do: :batch
   defp command_shape(command) when is_tuple(command), do: elem(command, 0)
   defp command_shape(_command), do: :unknown

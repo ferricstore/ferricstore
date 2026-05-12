@@ -32,22 +32,67 @@ defmodule Ferricstore.Raft.CommandClockGuardTest do
     assert violations == []
   end
 
+  test "production pipeline submissions do not force normal priority" do
+    # FerricStore write throughput depends on Ra's low-priority user-command
+    # queue, which batches pipelined commands into a single Ra log transaction.
+    # A hardcoded `:normal` priority bypasses that queue and can split hot
+    # pipelines into many immediate WAL appends.
+    violations =
+      production_files()
+      |> Enum.flat_map(&normal_priority_pipeline_calls/1)
+
+    assert violations == []
+  end
+
   test "direct raft scanner ignores comments and detects executable calls" do
     source = """
     defmodule Example do
       # :ra.process_command(commented, :ignored)
 
       def run(target) do
-        :ra.pipeline_command(target, :cmd, make_ref(), :normal)
+        :ra.pipeline_command(target, :cmd, make_ref(), :low)
       end
     end
     """
 
     assert [
              {"lib/ferricstore/example.ex", 5,
-              ":ra.pipeline_command(target, :cmd, make_ref(), :normal)"}
+              ":ra.pipeline_command(target, :cmd, make_ref(), :low)"}
            ] =
              direct_ra_calls_in_source("lib/ferricstore/example.ex", source)
+  end
+
+  defp normal_priority_pipeline_calls(path) do
+    relative = Path.relative_to(path, @root)
+
+    source = File.read!(path)
+
+    lines =
+      source
+      |> String.split("\n")
+      |> Enum.with_index(1)
+      |> Map.new(fn {line, line_no} -> {line_no, String.trim(line)} end)
+
+    {:ok, ast} = Code.string_to_quoted(source)
+
+    {_ast, calls} =
+      Macro.prewalk(ast, [], fn
+        {{:., meta, [_module, :pipeline_command]}, _call_meta,
+         [_target, _command, _corr, :normal]} =
+            node,
+        acc ->
+          line_no = Keyword.fetch!(meta, :line)
+          {node, [{relative, line_no, Map.fetch!(lines, line_no)} | acc]}
+
+        {:pipeline_command, meta, [_target, _command, _corr, :normal]} = node, acc ->
+          line_no = Keyword.fetch!(meta, :line)
+          {node, [{relative, line_no, Map.fetch!(lines, line_no)} | acc]}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    Enum.reverse(calls)
   end
 
   defp production_files do

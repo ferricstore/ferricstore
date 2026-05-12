@@ -70,7 +70,7 @@ defmodule Ferricstore.Raft.ClusterStartErrorTest do
       election_pos =
         :binary.match(source, "Ferricstore.Raft.Cluster.trigger_shard_elections_parallel")
 
-      ready_pos = :binary.match(source, "Ferricstore.Health.set_ready(true)")
+      ready_pos = :binary.match(source, "mark_started(shard_count)")
 
       assert match?({_, _}, election_pos)
       assert match?({_, _}, ready_pos)
@@ -89,11 +89,49 @@ defmodule Ferricstore.Raft.ClusterStartErrorTest do
       assert Cluster.wait_for_leader_on_start?(wait_for_leader: false) == false
     end
 
-    test "raft log snapshots are throttled separately from release cursor" do
+    test "raft log maintenance is throttled separately from release cursor" do
       args = Cluster.log_init_args_for_shard(0)
 
-      assert args.min_snapshot_interval == 200_000
-      assert args.min_checkpoint_interval == 16_384
+      assert args.min_snapshot_interval == 10_000_000
+      assert args.min_checkpoint_interval == 1_000_000
+    end
+
+    test "ra system segment size is configurable for tail-latency profiling" do
+      original_segment = Application.get_env(:ferricstore, :ra_segment_max_entries)
+      original_segment_size = Application.get_env(:ferricstore, :ra_segment_max_size_bytes)
+      original_wal_size = Application.get_env(:ferricstore, :ra_wal_max_size_bytes)
+      original_checksums = Application.get_env(:ferricstore, :ra_wal_compute_checksums)
+
+      Application.put_env(:ferricstore, :ra_segment_max_entries, 123_456)
+      Application.put_env(:ferricstore, :ra_segment_max_size_bytes, 456_789)
+      Application.put_env(:ferricstore, :ra_wal_max_size_bytes, 987_654)
+      Application.put_env(:ferricstore, :ra_wal_compute_checksums, false)
+
+      on_exit(fn ->
+        restore_env(:ra_segment_max_entries, original_segment)
+        restore_env(:ra_segment_max_size_bytes, original_segment_size)
+        restore_env(:ra_wal_max_size_bytes, original_wal_size)
+        restore_env(:ra_wal_compute_checksums, original_checksums)
+      end)
+
+      config = Cluster.system_config("/tmp/ferricstore-ra-config-test")
+
+      assert config.segment_max_entries == 123_456
+      assert config.segment_max_size_bytes == 456_789
+      assert config.wal_max_size_bytes == 987_654
+      assert config.wal_max_batch_size == 32_768
+      assert config.wal_compute_checksums == false
+    end
+
+    test "ra system default WAL cap avoids frequent high-throughput rollover" do
+      original_wal_size = Application.get_env(:ferricstore, :ra_wal_max_size_bytes)
+      Application.delete_env(:ferricstore, :ra_wal_max_size_bytes)
+
+      on_exit(fn -> restore_env(:ra_wal_max_size_bytes, original_wal_size) end)
+
+      config = Cluster.system_config("/tmp/ferricstore-ra-default-config-test")
+
+      assert config.wal_max_size_bytes == 8_589_934_592
     end
 
     test "raft snapshot throttle can be tuned for recovery tests" do

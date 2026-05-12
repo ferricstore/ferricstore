@@ -796,12 +796,12 @@ defmodule Ferricstore.Store.Shard.Compound do
         end
       end)
 
-    commands =
-      Enum.map(entries, fn {compound_key, value, expire_at_ms} ->
-        {:compound_put, compound_key, value, expire_at_ms}
-      end)
+    result =
+      Ferricstore.Raft.Batcher.write(
+        tracked_state.index,
+        {:compound_batch_put, redis_key, entries}
+      )
 
-    result = Ferricstore.Raft.Batcher.write(tracked_state.index, {:batch, commands})
     new_version = tracked_state.write_version + 1
 
     case normalize_compound_batch_result(result) do
@@ -1016,8 +1016,12 @@ defmodule Ferricstore.Store.Shard.Compound do
         end
       end)
 
-    commands = Enum.map(compound_keys, &{:compound_delete, &1})
-    result = Ferricstore.Raft.Batcher.write(tracked_state.index, {:batch, commands})
+    result =
+      Ferricstore.Raft.Batcher.write(
+        tracked_state.index,
+        {:compound_batch_delete, redis_key, compound_keys}
+      )
+
     new_version = tracked_state.write_version + 1
 
     case normalize_compound_batch_result(result) do

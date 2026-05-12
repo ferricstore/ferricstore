@@ -239,7 +239,7 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
         Batcher.__inject_quorum_pending_at__(
           shard_index,
           corr,
-          [{self(), reply_ref}],
+          [{:remote_origin, :origin@nohost, {self(), reply_ref}}],
           :single,
           System.monotonic_time()
         )
@@ -328,7 +328,7 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
   describe "single-write backpressure" do
     setup do
       idx = 0
-      fill_pending(idx, 64)
+      fill_pending(idx, 256)
 
       on_exit(fn -> Batcher.reset_pending(idx) end)
 

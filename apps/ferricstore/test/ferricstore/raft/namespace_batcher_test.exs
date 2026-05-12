@@ -118,10 +118,150 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
                {{:put_batch, [{"hotbatch:a", "va", 0}, {"hotbatch:b", "vb", 12_345}]}, 2}
     end
 
+    test "keeps direct put_batch commands in put_batch form" do
+      commands = [
+        {:put_batch, [{"hotbatch:direct_a", "va", 0}]},
+        {:put_batch, [{"hotbatch:direct_b", "vb", 12_345}]}
+      ]
+
+      assert Batcher.compact_hot_batch(commands) ==
+               {{:put_batch,
+                 [{"hotbatch:direct_a", "va", 0}, {"hotbatch:direct_b", "vb", 12_345}]}, 2}
+    end
+
+    test "merges direct put_batch and single put commands" do
+      commands = [
+        {:put_batch, [{"hotbatch:mixed_direct_a", "va", 0}]},
+        {:put, "hotbatch:mixed_direct_b", "vb", 12_345}
+      ]
+
+      assert Batcher.compact_hot_batch(commands) ==
+               {{:put_batch,
+                 [
+                   {"hotbatch:mixed_direct_a", "va", 0},
+                   {"hotbatch:mixed_direct_b", "vb", 12_345}
+                 ]}, 2}
+    end
+
     test "compacts all-delete batches into one delete_batch raft command" do
       commands = [{:delete, "hotdel:a"}, {:delete, "hotdel:b"}]
 
       assert Batcher.compact_hot_batch(commands) == {{:delete_batch, ["hotdel:a", "hotdel:b"]}, 2}
+    end
+
+    test "keeps direct delete_batch commands in delete_batch form" do
+      commands = [
+        {:delete_batch, ["hotdel:direct_a"]},
+        {:delete_batch, ["hotdel:direct_b"]}
+      ]
+
+      assert Batcher.compact_hot_batch(commands) ==
+               {{:delete_batch, ["hotdel:direct_a", "hotdel:direct_b"]}, 2}
+    end
+
+    test "merges direct delete_batch and single delete commands" do
+      commands = [
+        {:delete_batch, ["hotdel:mixed_direct_a"]},
+        {:delete, "hotdel:mixed_direct_b"}
+      ]
+
+      assert Batcher.compact_hot_batch(commands) ==
+               {{:delete_batch, ["hotdel:mixed_direct_a", "hotdel:mixed_direct_b"]}, 2}
+    end
+
+    test "expands direct put_batch when falling back to generic mixed batch" do
+      commands = [
+        {:put_batch, [{"hotbatch:mixed_a", "va", 0}, {"hotbatch:mixed_b", "vb", 0}]},
+        {:append, "hotbatch:mixed_a", "!"}
+      ]
+
+      assert Batcher.compact_hot_batch(commands) ==
+               {{:batch,
+                 [
+                   {:put, "hotbatch:mixed_a", "va", 0},
+                   {:put, "hotbatch:mixed_b", "vb", 0},
+                   {:append, "hotbatch:mixed_a", "!"}
+                 ]}, 3}
+    end
+
+    test "expands direct delete_batch when falling back to generic mixed batch" do
+      commands = [
+        {:delete_batch, ["hotdel:mixed_a", "hotdel:mixed_b"]},
+        {:append, "hotdel:mixed_a", "!"}
+      ]
+
+      assert Batcher.compact_hot_batch(commands) ==
+               {{:batch,
+                 [
+                   {:delete, "hotdel:mixed_a"},
+                   {:delete, "hotdel:mixed_b"},
+                   {:append, "hotdel:mixed_a", "!"}
+                 ]}, 3}
+    end
+
+    test "compacts same-key compound puts into one compound batch command" do
+      key = "hotcompound:hash"
+
+      commands = [
+        {:compound_put, CompoundKey.hash_field(key, "a"), "va", 0},
+        {:compound_put, CompoundKey.hash_field(key, "b"), "vb", 12_345}
+      ]
+
+      assert Batcher.compact_hot_batch(commands) ==
+               {{:compound_batch_put, key,
+                 [
+                   {CompoundKey.hash_field(key, "a"), "va", 0},
+                   {CompoundKey.hash_field(key, "b"), "vb", 12_345}
+                 ]}, 2}
+    end
+
+    test "compacts same-key compound deletes into one compound batch command" do
+      key = "hotcompound:hash"
+
+      commands = [
+        {:compound_delete, CompoundKey.hash_field(key, "a")},
+        {:compound_delete, CompoundKey.hash_field(key, "b")}
+      ]
+
+      assert Batcher.compact_hot_batch(commands) ==
+               {{:compound_batch_delete, key,
+                 [CompoundKey.hash_field(key, "a"), CompoundKey.hash_field(key, "b")]}, 2}
+    end
+
+    test "keeps different-key compound batches generic" do
+      commands = [
+        {:compound_put, CompoundKey.hash_field("hotcompound:a", "f"), "va", 0},
+        {:compound_put, CompoundKey.hash_field("hotcompound:b", "f"), "vb", 0}
+      ]
+
+      assert Batcher.compact_hot_batch(commands) == {{:batch, commands}, 2}
+    end
+
+    test "keeps direct compound batches generic because callers expect one reply" do
+      key = "hotcompound:direct"
+
+      commands = [
+        {:compound_batch_put, key,
+         [
+           {CompoundKey.hash_field(key, "a"), "va", 0},
+           {CompoundKey.hash_field(key, "b"), "vb", 0}
+         ]},
+        {:compound_put, CompoundKey.hash_field(key, "c"), "vc", 0}
+      ]
+
+      assert Batcher.compact_hot_batch(commands) == {{:batch, commands}, 2}
+    end
+
+    test "keeps direct compound delete batches generic because callers expect one reply" do
+      key = "hotcompound:direct_delete"
+
+      commands = [
+        {:compound_batch_delete, key,
+         [CompoundKey.hash_field(key, "a"), CompoundKey.hash_field(key, "b")]},
+        {:compound_delete, CompoundKey.hash_field(key, "c")}
+      ]
+
+      assert Batcher.compact_hot_batch(commands) == {{:batch, commands}, 2}
     end
 
     test "keeps mixed command batches in generic batch form" do
@@ -175,7 +315,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
           end
 
         for ref <- refs do
-          assert_receive {^ref, {:ok, %{type: "nsbatcher-flow-pipeline"}}}, 5_000
+          assert_receive {^ref, :ok}, 5_000
         end
 
         flushes = drain_slot_flushes()
@@ -296,12 +436,122 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
         assert Enum.any?(submits, fn {measurements, metadata} ->
                  metadata.kind == :batch and measurements.batch_size == 2 and
-                   measurements.caller_count == 2 and metadata.command_shape == :put_batch
+                   measurements.caller_count == 2 and metadata.command_shape == :put_batch and
+                   metadata.raft_priority == :low
                end),
                "expected the two caller-backed writes to submit as one compact put_batch, got: #{inspect(submits)}"
 
         assert "v1" == Router.get(FerricStore.Instance.get(:default), k1)
         assert "v2" == Router.get(FerricStore.Instance.get(:default), k2)
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
+    test "direct put_batch API replies with per-entry results and submits final shape" do
+      prefix = "directput_#{System.unique_integer([:positive])}"
+      :ok = NamespaceConfig.set(prefix, "window_ms", "1")
+
+      {shard_idx, [k1, k2]} =
+        1..20_000
+        |> Enum.reduce_while(%{}, fn i, by_shard ->
+          key = "#{prefix}:#{i}"
+          shard = Router.shard_for(FerricStore.Instance.get(:default), key)
+          keys = [key | Map.get(by_shard, shard, [])]
+
+          if length(keys) == 2 do
+            {:halt, {shard, Enum.reverse(keys)}}
+          else
+            {:cont, Map.put(by_shard, shard, keys)}
+          end
+        end)
+
+      test_pid = self()
+      handler_id = {:direct_put_batch_submit, test_pid, make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :batcher, :quorum_submit],
+          &__MODULE__.forward_caller_quorum_submit/4,
+          {test_pid, shard_idx}
+        )
+
+      try do
+        ref = make_ref()
+        entries = [{k1, "v1", 0}, {k2, "v2", 0}]
+
+        assert :ok == Batcher.write_put_batch(shard_idx, entries, {self(), ref})
+        assert_receive {^ref, {:ok, [:ok, :ok]}}, 5_000
+
+        submits = drain_caller_quorum_submits()
+
+        assert Enum.any?(submits, fn {measurements, metadata} ->
+                 metadata.kind == :batch and measurements.batch_size == 2 and
+                   measurements.caller_count == 1 and metadata.command_shape == :put_batch and
+                   metadata.raft_priority == :low
+               end),
+               "expected direct put_batch to submit as one put_batch, got: #{inspect(submits)}"
+
+        assert "v1" == Router.get(FerricStore.Instance.get(:default), k1)
+        assert "v2" == Router.get(FerricStore.Instance.get(:default), k2)
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
+    test "direct delete_batch API replies with per-entry results and submits final shape" do
+      prefix = "directdel_#{System.unique_integer([:positive])}"
+      :ok = NamespaceConfig.set(prefix, "window_ms", "1")
+
+      {shard_idx, [k1, k2]} =
+        1..20_000
+        |> Enum.reduce_while(%{}, fn i, by_shard ->
+          key = "#{prefix}:#{i}"
+          shard = Router.shard_for(FerricStore.Instance.get(:default), key)
+          keys = [key | Map.get(by_shard, shard, [])]
+
+          if length(keys) == 2 do
+            {:halt, {shard, Enum.reverse(keys)}}
+          else
+            {:cont, Map.put(by_shard, shard, keys)}
+          end
+        end)
+
+      assert [:ok, :ok] ==
+               Router.batch_quorum_put(FerricStore.Instance.get(:default), [
+                 {k1, "v1"},
+                 {k2, "v2"}
+               ])
+
+      test_pid = self()
+      handler_id = {:direct_delete_batch_submit, test_pid, make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :batcher, :quorum_submit],
+          &__MODULE__.forward_caller_quorum_submit/4,
+          {test_pid, shard_idx}
+        )
+
+      try do
+        ref = make_ref()
+
+        assert :ok == Batcher.write_delete_batch(shard_idx, [k1, k2], {self(), ref})
+        assert_receive {^ref, {:ok, [:ok, :ok]}}, 5_000
+
+        submits = drain_caller_quorum_submits()
+
+        assert Enum.any?(submits, fn {measurements, metadata} ->
+                 metadata.kind == :batch and measurements.batch_size == 2 and
+                   measurements.caller_count == 1 and metadata.command_shape == :delete_batch and
+                   metadata.raft_priority == :low
+               end),
+               "expected direct delete_batch to submit as one delete_batch, got: #{inspect(submits)}"
+
+        assert nil == Router.get(FerricStore.Instance.get(:default), k1)
+        assert nil == Router.get(FerricStore.Instance.get(:default), k2)
       after
         :telemetry.detach(handler_id)
       end

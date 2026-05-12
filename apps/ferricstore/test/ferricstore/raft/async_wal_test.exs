@@ -128,11 +128,11 @@ defmodule Ferricstore.Raft.AsyncWalTest do
       assert :ra_log_wal.__adaptive_commit_delay_us_for_test__(100, 32) == 100
     end
 
-    test "adaptive WAL delay ramps on queued pressure and decays when idle" do
+    test "adaptive WAL delay drains queued pressure and decays when idle" do
       assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(0, 200, 1, 1) == 0
-      assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 200, 1, 1) == 1_000
-      assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 1_000, 1, 1) == 2_000
-      assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 4_000, 1, 1) == 6_000
+      assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 200, 1, 1) == 200
+      assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 1_000, 1, 1) == 200
+      assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 4_000, 1, 1) == 200
       assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 6_000, 1, 0) == 3_000
       assert :ra_log_wal.__next_adaptive_commit_delay_us_for_test__(6_000, 300, 1, 0) == 200
     end
