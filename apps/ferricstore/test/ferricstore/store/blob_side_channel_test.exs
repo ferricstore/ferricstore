@@ -183,6 +183,67 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     end
   end
 
+  test "batch_get_with_file_refs validates encoded blob refs with one segment open", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key_a = "blob:auto:batch-ref-open-a"
+    key_b = "blob:auto:batch-ref-open-b"
+    payload_a = :binary.copy("A", 1024)
+    payload_b = :binary.copy("B", 2048)
+
+    assert {:ok, [ref_a, ref_b]} = BlobStore.put_many(ctx.data_dir, 0, [payload_a, payload_b])
+    assert BlobRef.path(ctx.data_dir, 0, ref_a) == BlobRef.path(ctx.data_dir, 0, ref_b)
+
+    encoded_a = BlobRef.encode!(ref_a)
+    encoded_b = BlobRef.encode!(ref_b)
+
+    :ets.insert(keydir, {
+      key_a,
+      nil,
+      0,
+      LFU.initial(),
+      0,
+      444_444,
+      BlobRef.encoded_size()
+    })
+
+    :ets.insert(keydir, {
+      key_b,
+      nil,
+      0,
+      LFU.initial(),
+      0,
+      555_555,
+      BlobRef.encoded_size()
+    })
+
+    parent = self()
+    segment_path = BlobRef.path(ctx.data_dir, 0, ref_a)
+
+    Process.put(:ferricstore_router_pread_batch_keyed_result, {:ok, [encoded_a, encoded_b]})
+
+    Process.put(:ferricstore_blob_store_open_read_hook, fn path, modes ->
+      send(parent, {:blob_open_read, path})
+      File.open(path, modes)
+    end)
+
+    try do
+      assert [
+               {:file_ref, ^segment_path, offset_a, 1024},
+               {:file_ref, ^segment_path, offset_b, 2048}
+             ] = Router.batch_get_with_file_refs(ctx, [key_a, key_b], 64)
+
+      assert offset_a == ref_a.offset
+      assert offset_b == ref_b.offset
+      assert_received {:blob_open_read, ^segment_path}
+      refute_received {:blob_open_read, _}
+    after
+      Process.delete(:ferricstore_router_pread_batch_keyed_result)
+      Process.delete(:ferricstore_blob_store_open_read_hook)
+    end
+  end
+
   test "batch_get_with_file_refs keeps fixed-size non-ref cold values inline", %{
     ctx: ctx,
     keydir: keydir

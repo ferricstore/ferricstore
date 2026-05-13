@@ -1545,7 +1545,7 @@ defmodule Ferricstore.Store.Router do
     entry_values = Enum.zip(entries, values)
     emit_batch_cold_read_corruption(blob_file_ref_batch_corruption_counts(entry_values))
 
-    Enum.map(entry_values, &blob_file_ref_batch_value(&1, now))
+    resolve_blob_file_ref_batch_values(entry_values, now)
   end
 
   defp blob_file_ref_batch_corruption_counts(entry_values) do
@@ -1565,21 +1565,69 @@ defmodule Ferricstore.Store.Router do
        ),
        do: path
 
-  defp blob_file_ref_batch_value(
+  defp resolve_blob_file_ref_batch_values(entry_values, now) do
+    prepared = Enum.map(entry_values, &prepare_blob_file_ref_batch_value(&1, now))
+    resolved_file_refs = resolve_prepared_blob_file_refs(prepared)
+
+    prepared
+    |> Enum.with_index()
+    |> Enum.map(fn
+      {{:value, value}, _index} -> value
+      {{:blob_file_ref, _entry, _ref}, index} -> Map.fetch!(resolved_file_refs, index)
+    end)
+  end
+
+  defp prepare_blob_file_ref_batch_value(
          {{ctx, idx, keydir, key, _path, file_id, offset, _value_size, min_file_ref_size} =
             entry, value},
          _now
        )
        when is_binary(value) do
     case BlobRef.decode(value) do
+      {:ok, %BlobRef{size: blob_size} = ref} when blob_size >= min_file_ref_size ->
+        {:blob_file_ref, entry, ref}
+
       {:ok, %BlobRef{} = ref} ->
-        blob_file_ref_batch_blob_value(entry, ref, min_file_ref_size)
+        {:value,
+         materialize_blob_file_ref_batch_value(ctx, idx, keydir, key, file_id, offset, ref)}
 
       :error ->
         Stats.record_cold_read(ctx, key)
         warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
-        value
+        {:value, value}
     end
+  end
+
+  defp prepare_blob_file_ref_batch_value(entry_value, now),
+    do: {:value, blob_file_ref_batch_value(entry_value, now)}
+
+  defp resolve_prepared_blob_file_refs(prepared) do
+    prepared
+    |> Enum.with_index()
+    |> Enum.reduce([], fn
+      {{:blob_file_ref, entry, ref}, index}, acc -> [{index, entry, ref} | acc]
+      {{:value, _value}, _index}, acc -> acc
+    end)
+    |> Enum.reverse()
+    |> Enum.group_by(fn {_index,
+                         {ctx, idx, _keydir, _key, _path, _file_id, _offset, _value_size,
+                          _min_file_ref_size}, _ref} ->
+      {ctx.data_dir, idx}
+    end)
+    |> Enum.reduce(%{}, fn {{data_dir, idx}, candidates}, acc ->
+      refs = Enum.map(candidates, fn {_index, _entry, ref} -> ref end)
+
+      data_dir
+      |> BlobStore.file_refs_many(idx, refs)
+      |> Enum.zip(candidates)
+      |> Enum.reduce(acc, fn {file_ref_result, {index, entry, ref}}, result_acc ->
+        Map.put(
+          result_acc,
+          index,
+          blob_file_ref_batch_file_ref_value(entry, ref, file_ref_result)
+        )
+      end)
+    end)
   end
 
   defp blob_file_ref_batch_value(
@@ -1602,26 +1650,20 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp blob_file_ref_batch_blob_value(
-         {ctx, idx, keydir, key, _path, file_id, offset, _value_size, _min_file_ref_size},
-         %BlobRef{size: blob_size} = ref,
-         min_file_ref_size
+  defp blob_file_ref_batch_file_ref_value(
+         {ctx, _idx, _keydir, key, _path, _file_id, _offset, _value_size, _min_file_ref_size},
+         %BlobRef{size: blob_size},
+         {:ok, {blob_path, blob_offset, size}}
        )
-       when blob_size >= min_file_ref_size do
-    case BlobStore.file_ref(ctx.data_dir, idx, ref) do
-      {:ok, {blob_path, blob_offset, ^blob_size}} ->
-        Stats.record_cold_read(ctx, key)
-        {:file_ref, blob_path, blob_offset, blob_size}
-
-      {:error, _reason} ->
-        materialize_blob_file_ref_batch_value(ctx, idx, keydir, key, file_id, offset, ref)
-    end
+       when size == blob_size do
+    Stats.record_cold_read(ctx, key)
+    {:file_ref, blob_path, blob_offset, blob_size}
   end
 
-  defp blob_file_ref_batch_blob_value(
-         {ctx, idx, keydir, key, _path, file_id, offset, _value_size, _entry_min_file_ref_size},
+  defp blob_file_ref_batch_file_ref_value(
+         {ctx, idx, keydir, key, _path, file_id, offset, _value_size, _min_file_ref_size},
          %BlobRef{} = ref,
-         _ignored_min_file_ref_size
+         _error_or_mismatched_file_ref
        ) do
     materialize_blob_file_ref_batch_value(ctx, idx, keydir, key, file_id, offset, ref)
   end

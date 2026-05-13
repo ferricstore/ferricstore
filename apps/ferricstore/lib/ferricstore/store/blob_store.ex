@@ -450,6 +450,88 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
+  defp load_blob_file_refs(data_dir, shard_index, refs) do
+    {legacy_refs, segment_refs, invalid_refs} =
+      Enum.reduce(refs, {[], [], []}, fn
+        %BlobRef{version: 1} = ref, {legacy_refs, segment_refs, invalid_refs} ->
+          {[ref | legacy_refs], segment_refs, invalid_refs}
+
+        %BlobRef{version: 2} = ref, {legacy_refs, segment_refs, invalid_refs} ->
+          {legacy_refs, [ref | segment_refs], invalid_refs}
+
+        %BlobRef{} = ref, {legacy_refs, segment_refs, invalid_refs} ->
+          {legacy_refs, segment_refs, [ref | invalid_refs]}
+      end)
+
+    %{}
+    |> put_invalid_file_ref_results(invalid_refs)
+    |> put_legacy_file_ref_results(data_dir, shard_index, Enum.reverse(legacy_refs))
+    |> put_segment_file_ref_results(data_dir, shard_index, Enum.reverse(segment_refs))
+  end
+
+  defp put_invalid_file_ref_results(results, refs) do
+    Enum.reduce(refs, results, fn ref, acc ->
+      Map.put(acc, ref, {:error, :invalid_blob_ref})
+    end)
+  end
+
+  defp put_legacy_file_ref_results(results, data_dir, shard_index, refs) do
+    Enum.reduce(refs, results, fn ref, acc ->
+      Map.put(acc, ref, file_ref(data_dir, shard_index, ref))
+    end)
+  end
+
+  defp put_segment_file_ref_results(results, _data_dir, _shard_index, []), do: results
+
+  defp put_segment_file_ref_results(results, data_dir, shard_index, refs) do
+    refs
+    |> Enum.group_by(&BlobRef.path(data_dir, shard_index, &1))
+    |> Enum.reduce(results, fn {path, path_refs}, acc ->
+      Map.merge(acc, get_segment_file_refs_at_path(path, shard_index, path_refs))
+    end)
+  end
+
+  defp get_segment_file_refs_at_path(path, shard_index, refs) do
+    max_extent =
+      Enum.reduce(refs, 0, fn %BlobRef{offset: offset, size: size}, acc ->
+        max(acc, offset + size)
+      end)
+
+    with :ok <- stat_regular_min_size(path, max_extent),
+         {:ok, io} <- open_read_file(path) do
+      try do
+        get_open_segment_file_refs(io, path, shard_index, refs)
+      after
+        :file.close(io)
+      end
+    else
+      {:error, reason} ->
+        Enum.reduce(refs, %{}, fn ref, acc ->
+          emit_error(:file_ref, shard_index, path, ref, reason)
+          Map.put(acc, ref, {:error, reason})
+        end)
+    end
+  end
+
+  defp get_open_segment_file_refs(io, path, shard_index, refs) do
+    Enum.reduce(refs, %{}, fn %BlobRef{offset: offset, size: size} = ref, acc ->
+      result =
+        case validate_open_segment_record(io, offset, size, ref) do
+          :ok -> {:ok, {path, offset, size}}
+          {:error, _reason} = error -> error
+        end
+
+      case result do
+        {:ok, _file_ref} = ok ->
+          Map.put(acc, ref, ok)
+
+        {:error, reason} = error ->
+          emit_error(:file_ref, shard_index, path, ref, reason)
+          Map.put(acc, ref, error)
+      end
+    end)
+  end
+
   @doc """
   Returns a file ref for a blob after validating the file is regular and has
   the expected size.
@@ -498,6 +580,28 @@ defmodule Ferricstore.Store.BlobStore do
         emit_error(:file_ref, shard_index, path, ref, reason)
         error
     end
+  end
+
+  @doc """
+  Returns file refs in input order while validating append-segment headers in
+  batches.
+
+  This is the streaming read hot path for MGET/pipelined GET. Segment refs are
+  grouped by path so a batch that points at one blob segment opens it once, but
+  corruption and missing-file results stay isolated per requested ref.
+  """
+  @spec file_refs_many(binary(), non_neg_integer(), [BlobRef.t()]) ::
+          [{:ok, {binary(), non_neg_integer(), non_neg_integer()}} | {:error, reason()}]
+  def file_refs_many(data_dir, shard_index, refs)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_list(refs) do
+    {prepared, unique_refs} = prepare_get_many_refs(refs)
+    loaded_refs = load_blob_file_refs(data_dir, shard_index, unique_refs)
+
+    Enum.map(prepared, fn
+      {:ref, ref} -> Map.fetch!(loaded_refs, ref)
+      :invalid -> {:error, :invalid_blob_ref}
+    end)
   end
 
   @doc """
