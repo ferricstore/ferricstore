@@ -20,6 +20,9 @@ defmodule Ferricstore.Store.BlobStore do
   @segment_next_id_filename "next_segment_id"
   @recovery_table :ferricstore_blob_store_recovery
   @segment_table :ferricstore_blob_store_segments
+  @lock_table :ferricstore_blob_store_locks
+  @held_locks_key :ferricstore_blob_store_held_locks
+  @lock_retry_ms 1
 
   @type reason :: term()
 
@@ -45,11 +48,7 @@ defmodule Ferricstore.Store.BlobStore do
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
              is_list(payloads) do
     if Enum.all?(payloads, &is_binary/1) do
-      :global.trans(
-        blob_lock_key(data_dir, shard_index),
-        fn -> do_put_many(data_dir, shard_index, payloads) end,
-        [node()]
-      )
+      with_blob_lock(data_dir, shard_index, fn -> do_put_many(data_dir, shard_index, payloads) end)
     else
       {:error, :invalid_blob_payload}
     end
@@ -273,11 +272,9 @@ defmodule Ferricstore.Store.BlobStore do
           | {:error, term()}
   def sweep_unreferenced(data_dir, shard_index, live_refs)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
-    :global.trans(
-      blob_lock_key(data_dir, shard_index),
-      fn -> do_sweep_unreferenced(data_dir, shard_index, live_refs) end,
-      [node()]
-    )
+    with_blob_lock(data_dir, shard_index, fn ->
+      do_sweep_unreferenced(data_dir, shard_index, live_refs)
+    end)
   end
 
   @doc """
@@ -655,11 +652,115 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  defp blob_lock_key(data_dir, shard_index),
-    do: {{__MODULE__, data_dir, shard_index}, __MODULE__}
-
   defp blob_error_ref([payload | _]) when is_binary(payload), do: BlobRef.from_payload(payload)
   defp blob_error_ref(_payloads), do: %BlobRef{checksum: :binary.copy(<<0>>, 32), size: 0}
+
+  # Blob segments are shard-local files. A local ETS latch is enough to
+  # serialize append offsets and GC deletes without paying for :global locks.
+  defp with_blob_lock(data_dir, shard_index, fun) do
+    key = {data_dir, shard_index}
+    held = Process.get(@held_locks_key, %{})
+
+    case Map.get(held, key) do
+      nil ->
+        :ok = acquire_blob_lock(key)
+        Process.put(@held_locks_key, Map.put(held, key, 1))
+
+        try do
+          fun.()
+        after
+          release_blob_lock(key)
+        end
+
+      count when is_integer(count) and count > 0 ->
+        Process.put(@held_locks_key, Map.put(held, key, count + 1))
+
+        try do
+          fun.()
+        after
+          release_blob_lock(key)
+        end
+    end
+  end
+
+  defp acquire_blob_lock(key) do
+    ensure_lock_table()
+
+    case :ets.insert_new(@lock_table, {key, self()}) do
+      true ->
+        :ok
+
+      false ->
+        wait_for_blob_lock(key)
+    end
+  end
+
+  defp wait_for_blob_lock(key) do
+    case :ets.lookup(@lock_table, key) do
+      [{^key, holder}] when is_pid(holder) ->
+        if Process.alive?(holder) do
+          blob_lock_backoff()
+        else
+          :ets.select_delete(@lock_table, [{{key, holder}, [], [true]}])
+        end
+
+      _other ->
+        :ok
+    end
+
+    acquire_blob_lock(key)
+  end
+
+  defp release_blob_lock(key) do
+    held = Process.get(@held_locks_key, %{})
+
+    case Map.get(held, key) do
+      count when is_integer(count) and count > 1 ->
+        Process.put(@held_locks_key, Map.put(held, key, count - 1))
+
+      1 ->
+        next = Map.delete(held, key)
+
+        if map_size(next) == 0 do
+          Process.delete(@held_locks_key)
+        else
+          Process.put(@held_locks_key, next)
+        end
+
+        ensure_lock_table()
+        :ets.select_delete(@lock_table, [{{key, self()}, [], [true]}])
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp blob_lock_backoff do
+    receive do
+    after
+      @lock_retry_ms -> :ok
+    end
+  end
+
+  defp ensure_lock_table do
+    case :ets.whereis(@lock_table) do
+      :undefined ->
+        try do
+          :ets.new(@lock_table, [
+            :named_table,
+            :public,
+            :set,
+            {:read_concurrency, true},
+            {:write_concurrency, :auto}
+          ])
+        rescue
+          ArgumentError -> @lock_table
+        end
+
+      tid ->
+        tid
+    end
+  end
 
   defp segment_path(data_dir, shard_index, segment_id) do
     BlobRef.path(data_dir, shard_index, %BlobRef{

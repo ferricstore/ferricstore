@@ -96,6 +96,72 @@ defmodule Ferricstore.Store.BlobStoreTest do
            end)
   end
 
+  test "same-shard blob appends serialize while preserving offsets", %{root: root} do
+    parent = self()
+
+    first =
+      Task.async(fn ->
+        Process.put(:ferricstore_blob_store_write_hook, fn io, iodata ->
+          send(parent, :first_blob_write_started)
+
+          receive do
+            :release_first_blob_write -> :file.write(io, iodata)
+          after
+            5_000 -> {:error, :test_timeout}
+          end
+        end)
+
+        BlobStore.put(root, 0, :binary.copy("a", 128))
+      end)
+
+    assert_receive :first_blob_write_started, 1_000
+
+    second =
+      Task.async(fn ->
+        Process.put(:ferricstore_blob_store_write_hook, fn io, iodata ->
+          send(parent, :second_blob_write_started)
+          :file.write(io, iodata)
+        end)
+
+        BlobStore.put(root, 0, :binary.copy("b", 128))
+      end)
+
+    refute_receive :second_blob_write_started, 100
+    send(first.pid, :release_first_blob_write)
+
+    assert {:ok, first_ref} = Task.await(first, 5_000)
+    assert_receive :second_blob_write_started, 1_000
+    assert {:ok, second_ref} = Task.await(second, 5_000)
+
+    assert first_ref.segment_id == second_ref.segment_id
+    assert first_ref.offset != second_ref.offset
+    assert {:ok, :binary.copy("a", 128)} == BlobStore.get(root, 0, first_ref)
+    assert {:ok, :binary.copy("b", 128)} == BlobStore.get(root, 0, second_ref)
+  end
+
+  test "same-shard blob latch recovers when the holder process dies", %{root: root} do
+    parent = self()
+
+    blocked =
+      Task.async(fn ->
+        Process.put(:ferricstore_blob_store_write_hook, fn _io, _iodata ->
+          send(parent, :blocked_blob_write_started)
+
+          receive do
+            :never -> :ok
+          end
+        end)
+
+        BlobStore.put(root, 0, :binary.copy("x", 128))
+      end)
+
+    assert_receive :blocked_blob_write_started, 1_000
+    Task.shutdown(blocked, :brutal_kill)
+
+    assert {:ok, ref} = BlobStore.put(root, 0, :binary.copy("y", 128))
+    assert {:ok, :binary.copy("y", 128)} == BlobStore.get(root, 0, ref)
+  end
+
   test "put rotates append segments when the active segment crosses the size cap", %{
     root: root
   } do
