@@ -44,10 +44,10 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
 
     do_put_many =
       source
-      |> String.split("  defp do_put_many(data_dir, shard_index, payloads) do", parts: 2)
-      |> List.last()
-      |> String.split("  defp build_segment_records", parts: 2)
-      |> List.first()
+      |> source_section!(
+        "  defp do_put_many(data_dir, shard_index, batch) do",
+        "  defp build_segment_records"
+      )
 
     refute do_put_many =~ "mkdir_p",
            "BlobStore should cache the segment directory after the first durable mkdir; " <>
@@ -82,5 +82,11 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
     refute segment_path =~ "%BlobRef{",
            "BlobStore.segment_path/3 is on the append path; it should not allocate a fake BlobRef " <>
              "or checksum just to build the append-segment filename"
+  end
+
+  defp source_section!(source, start_marker, end_marker) do
+    [_, rest] = String.split(source, start_marker, parts: 2)
+    [section | _] = String.split(rest, end_marker, parts: 2)
+    section
   end
 end
