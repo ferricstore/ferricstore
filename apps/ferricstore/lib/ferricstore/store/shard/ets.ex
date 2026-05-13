@@ -516,18 +516,50 @@ defmodule Ferricstore.Store.Shard.ETS do
 
     emit_prefix_cold_read_errors(entries, values)
 
-    Enum.zip(entries, values)
+    Enum.zip(entries, prefix_materialize_blob_values(state, values))
     |> Enum.map(fn
-      {{field, _key, _file_path, _off}, value} when is_binary(value) ->
-        case materialize_blob_value(state, value) do
-          {:ok, materialized} -> {field, materialized}
-          {:error, _reason} -> nil
-        end
+      {{field, _key, _file_path, _off}, {:ok, materialized}} ->
+        {field, materialized}
 
       {_entry, _value} ->
         nil
     end)
   end
+
+  defp prefix_materialize_blob_values(%{data_dir: data_dir, index: shard_index} = state, values) do
+    {binary_values, indexed_results} =
+      values
+      |> Enum.with_index()
+      |> Enum.reduce({[], %{}}, fn
+        {value, index}, {binary_values, indexed_results} when is_binary(value) ->
+          {[{index, value} | binary_values], indexed_results}
+
+        {_value, index}, {binary_values, indexed_results} ->
+          {binary_values, Map.put(indexed_results, index, :skip)}
+      end)
+
+    indexed_results =
+      if binary_values == [] do
+        indexed_results
+      else
+        ordered_values = Enum.reverse(binary_values)
+        threshold = blob_side_channel_threshold(state)
+        values = Enum.map(ordered_values, fn {_index, value} -> value end)
+
+        ordered_values
+        |> Enum.zip(BlobValue.maybe_materialize_many(data_dir, shard_index, threshold, values))
+        |> Enum.reduce(indexed_results, fn {{index, _value}, result}, acc ->
+          Map.put(acc, index, result)
+        end)
+      end
+
+    values
+    |> Enum.with_index()
+    |> Enum.map(fn {_value, index} -> Map.fetch!(indexed_results, index) end)
+  end
+
+  defp prefix_materialize_blob_values(_state, values),
+    do: Enum.map(values, fn _value -> :skip end)
 
   defp emit_prefix_cold_read_errors(entries, values) do
     entries
