@@ -276,6 +276,56 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     assert {:ok, [[^value1, ^value2]], ""} = Parser.parse(IO.iodata_to_binary(encoded))
   end
 
+  test "MGET reuses one open file for blob refs in the same append segment" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 1024,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    on_exit(fn -> IsolatedInstance.checkin(ctx) end)
+
+    key1 = "mget-blob-sendfile-open:1"
+    key2 = "mget-blob-sendfile-open:2"
+    value1 = :binary.copy("a", Sendfile.threshold_bytes() + 1024)
+    value2 = :binary.copy("b", Sendfile.threshold_bytes() + 2048)
+
+    assert :ok = Router.batch_put(ctx, [{key1, value1}, {key2, value2}])
+
+    state = %{
+      socket: self(),
+      transport: FakeTlsTransport,
+      client_id: :test_client,
+      instance_ctx: ctx,
+      sandbox_namespace: nil,
+      pubsub_channels: nil,
+      tracking: nil
+    }
+
+    parent = self()
+
+    Process.put(:ferricstore_sendfile_open_hook, fn path, modes ->
+      send(parent, {:sendfile_open, path})
+      :file.open(path, modes)
+    end)
+
+    fallback = fn _cmd, _args, _state ->
+      flunk("MGET fallback should not run after batch_get_with_file_refs returned blob refs")
+    end
+
+    try do
+      assert {:continue, "", ^state} = Sendfile.dispatch_mget([key1, key2], state, fallback)
+
+      sends = collect_fake_tls_sends()
+      assert {:ok, [[^value1, ^value2]], ""} = Parser.parse(IO.iodata_to_binary(sends))
+      assert [path] = collect_sendfile_opens()
+      assert Path.extname(path) == ".bloblog"
+    after
+      Process.delete(:ferricstore_sendfile_open_hook)
+    end
+  end
+
   test "GET tracks client-visible sandbox key, not internal lookup key", %{ctx: ctx} do
     sandbox = "sandbox:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"
     key = "tracked-hot-get"
@@ -899,6 +949,14 @@ defmodule FerricstoreServer.Connection.SendfileTest do
   defp collect_sendfile_preads(acc \\ []) do
     receive do
       {:sendfile_pread, offset, size} -> collect_sendfile_preads([{offset, size} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp collect_sendfile_opens(acc \\ []) do
+    receive do
+      {:sendfile_open, path} -> collect_sendfile_opens([path | acc])
     after
       0 -> Enum.reverse(acc)
     end

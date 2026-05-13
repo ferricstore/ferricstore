@@ -571,41 +571,121 @@ defmodule FerricstoreServer.Connection.Sendfile do
   end
 
   defp stream_mget_elements(keys, lookup_keys, results, state) do
-    keys
-    |> Enum.zip(lookup_keys)
-    |> Enum.zip(results)
-    |> Enum.reduce_while({:sent, state}, fn
-      {{key, lookup_key}, {:file_ref, path, offset, size}}, {:sent, acc_state} ->
-        case send_file_ref_element_response(key, lookup_key, path, offset, size, acc_state) do
-          {:sent, new_state} ->
-            {:cont, {:sent, new_state}}
+    entries =
+      keys
+      |> Enum.zip(lookup_keys)
+      |> Enum.zip(results)
 
-          :fallback ->
-            case send_stream_response(
-                   acc_state,
-                   Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key)),
-                   :mget_stream_fallback
-                 ) do
-              :ok -> {:cont, {:sent, acc_state}}
-              {:error, reason} -> {:halt, {:error_after_header, reason}}
-            end
+    {result, file_cache} = stream_mget_entries(entries, state, %{})
+    close_file_cache(file_cache)
 
-          {:error_after_header, _reason} = error ->
-            {:halt, error}
-        end
-
-      {{_key, _lookup_key}, value}, {:sent, acc_state} ->
-        case send_stream_response(acc_state, Encoder.encode(value), :mget_stream_element) do
-          :ok -> {:cont, {:sent, acc_state}}
-          {:error, reason} -> {:halt, {:error_after_header, reason}}
-        end
-    end)
-    |> case do
+    case result do
       {:sent, new_state} ->
         {:sent, ConnTracking.maybe_track_read("MGET", keys, :sendfile_ok, new_state)}
 
       other ->
         other
+    end
+  end
+
+  defp stream_mget_entries([], state, file_cache), do: {{:sent, state}, file_cache}
+
+  defp stream_mget_entries(
+         [{{key, lookup_key}, {:file_ref, path, offset, size}} | rest],
+         state,
+         file_cache
+       ) do
+    case send_file_ref_element_response_cached(
+           key,
+           lookup_key,
+           path,
+           offset,
+           size,
+           state,
+           file_cache
+         ) do
+      {:sent, new_state, new_cache} ->
+        stream_mget_entries(rest, new_state, new_cache)
+
+      {:fallback, new_cache} ->
+        case send_stream_response(
+               state,
+               Encoder.encode(Router.get(state.instance_ctx, lookup_key)),
+               :mget_stream_fallback
+             ) do
+          :ok -> stream_mget_entries(rest, state, new_cache)
+          {:error, reason} -> {{:error_after_header, reason}, new_cache}
+        end
+
+      {:error_after_header, reason, new_cache} ->
+        {{:error_after_header, reason}, new_cache}
+    end
+  end
+
+  defp stream_mget_entries([{{_key, _lookup_key}, value} | rest], state, file_cache) do
+    case send_stream_response(state, Encoder.encode(value), :mget_stream_element) do
+      :ok -> stream_mget_entries(rest, state, file_cache)
+      {:error, reason} -> {{:error_after_header, reason}, file_cache}
+    end
+  end
+
+  defp send_file_ref_element_response_cached(
+         key,
+         validate_key,
+         path,
+         offset,
+         size,
+         %{transport: :ranch_tcp} = state,
+         file_cache
+       ) do
+    case cached_file_open(path, file_cache) do
+      {:ok, fd, new_cache} ->
+        result = do_sendfile_get_open(key, validate_key, path, fd, offset, size, state, false)
+        emit_sendfile_result(result, size, state)
+
+        case result do
+          {:sent, new_state} ->
+            {:sent, new_state, new_cache}
+
+          :fallback ->
+            {:fallback, new_cache}
+
+          {:error_after_header, reason} ->
+            {:error_after_header, reason, new_cache}
+        end
+
+      {:error, _reason} ->
+        {:fallback, file_cache}
+    end
+  end
+
+  defp send_file_ref_element_response_cached(
+         _key,
+         validate_key,
+         path,
+         offset,
+         size,
+         state,
+         file_cache
+       ) do
+    case cached_file_open(path, file_cache) do
+      {:ok, fd, new_cache} ->
+        result = do_stream_file_ref_get_open(validate_key, path, fd, offset, size, state)
+        emit_file_stream_result(result, size, state)
+
+        case result do
+          {:sent, new_state, _chunks} ->
+            {:sent, new_state, new_cache}
+
+          :fallback ->
+            {:fallback, new_cache}
+
+          {:error_after_header, reason, _chunks} ->
+            {:error_after_header, reason, new_cache}
+        end
+
+      {:error, _reason} ->
+        {:fallback, file_cache}
     end
   end
 
@@ -711,7 +791,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
   end
 
   defp do_stream_file_get(path, offset, size, validator, state) do
-    case :file.open(path, [:read, :raw, :binary]) do
+    case file_open(path) do
       {:ok, fd} ->
         try do
           case validate_open_file_range(path, fd, offset, size, validator) do
@@ -728,19 +808,23 @@ defmodule FerricstoreServer.Connection.Sendfile do
   end
 
   defp do_stream_file_ref_get(key, path, offset, size, state) do
-    case :file.open(path, [:read, :raw, :binary]) do
+    case file_open(path) do
       {:ok, fd} ->
         try do
-          case validate_open_file_ref(path, fd, key, offset, size) do
-            :ok -> stream_file_get_open(fd, offset, size, state)
-            :mismatch -> :fallback
-          end
+          do_stream_file_ref_get_open(key, path, fd, offset, size, state)
         after
           :file.close(fd)
         end
 
       {:error, _reason} ->
         :fallback
+    end
+  end
+
+  defp do_stream_file_ref_get_open(key, path, fd, offset, size, state) do
+    case validate_open_file_ref(path, fd, key, offset, size) do
+      :ok -> stream_file_get_open(fd, offset, size, state)
+      :mismatch -> :fallback
     end
   end
 
@@ -819,21 +903,25 @@ defmodule FerricstoreServer.Connection.Sendfile do
   end
 
   defp do_sendfile_get(key, validate_key, path, offset, size, state, track_read?) do
-    socket = state.socket
-
-    case :file.open(path, [:read, :raw, :binary]) do
+    case file_open(path) do
       {:ok, fd} ->
         try do
-          case validate_open_file_ref(path, fd, validate_key, offset, size, :sendfile) do
-            :ok -> send_with_cork(socket, fd, offset, size, key, state, track_read?)
-            :mismatch -> :fallback
-          end
+          do_sendfile_get_open(key, validate_key, path, fd, offset, size, state, track_read?)
         after
           :file.close(fd)
         end
 
       {:error, _} ->
         :fallback
+    end
+  end
+
+  defp do_sendfile_get_open(key, validate_key, path, fd, offset, size, state, track_read?) do
+    socket = state.socket
+
+    case validate_open_file_ref(path, fd, validate_key, offset, size, :sendfile) do
+      :ok -> send_with_cork(socket, fd, offset, size, key, state, track_read?)
+      :mismatch -> :fallback
     end
   end
 
@@ -1047,6 +1135,32 @@ defmodule FerricstoreServer.Connection.Sendfile do
   end
 
   defp validate_open_value_ref(_fd, _key, _value_offset, _value_size), do: :mismatch
+
+  defp cached_file_open(path, file_cache) do
+    case Map.fetch(file_cache, path) do
+      {:ok, fd} ->
+        {:ok, fd, file_cache}
+
+      :error ->
+        case file_open(path) do
+          {:ok, fd} -> {:ok, fd, Map.put(file_cache, path, fd)}
+          {:error, _reason} = error -> error
+        end
+    end
+  end
+
+  defp close_file_cache(file_cache) do
+    Enum.each(file_cache, fn {_path, fd} -> :file.close(fd) end)
+  end
+
+  defp file_open(path) do
+    modes = [:read, :raw, :binary]
+
+    case Process.get(:ferricstore_sendfile_open_hook) do
+      fun when is_function(fun, 2) -> fun.(path, modes)
+      _other -> :file.open(path, modes)
+    end
+  end
 
   defp file_pread(fd, offset, size) do
     case Process.get(:ferricstore_sendfile_pread_hook) do
