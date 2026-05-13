@@ -391,8 +391,24 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   defp pread_file_ref_range(path, value_offset, value_size, relative_offset, count) do
     if blob_file_ref_path?(path) do
-      with {:ok, payload} <- pread_blob_file_ref_value(path, value_size) do
-        {:ok, binary_part(payload, relative_offset, count)}
+      read_offset = value_offset + relative_offset
+
+      case :file.open(path, [:read, :raw, :binary]) do
+        {:ok, fd} ->
+          try do
+            with :ok <- validate_open_blob_file_ref(path, fd, value_offset, value_size, :sendfile),
+                 {:ok, value} when byte_size(value) == count <-
+                   file_pread(fd, read_offset, count) do
+              {:ok, value}
+            else
+              _other -> :fallback
+            end
+          after
+            :file.close(fd)
+          end
+
+        {:error, _reason} ->
+          :fallback
       end
     else
       pread_file_range(path, value_offset + relative_offset, count)

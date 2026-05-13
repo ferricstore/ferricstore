@@ -589,7 +589,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     end
   end
 
-  test "GETRANGE does not materialize a corrupt small blob file ref range" do
+  test "GETRANGE rejects a small blob file ref range whose segment header no longer matches" do
     ctx =
       IsolatedInstance.checkout(
         shard_count: 1,
@@ -604,7 +604,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     try do
       :ok = Router.put(ctx, key, value, 0)
       assert {:cold_ref, blob_path, blob_offset, 1024} = Router.get_with_file_ref(ctx, key)
-      overwrite_file_range!(blob_path, blob_offset, :binary.copy("x", byte_size(value)))
+      overwrite_file_range!(blob_path, blob_offset - 48, :binary.copy("x", 48))
 
       state = %{
         instance_ctx: ctx,
@@ -623,6 +623,57 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
       assert IO.iodata_to_binary(encoded) == "$0\r\n\r\n"
     after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "GETRANGE reads small blob file ref ranges without falling back" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 64,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    key = "small-blob-sendfile-getrange"
+    value = :binary.copy("a", 2048) <> "target-slice" <> :binary.copy("z", 2048)
+    args = [key, "2048", "2053"]
+    parent = self()
+
+    Process.put(:ferricstore_sendfile_pread_hook, fn fd, read_offset, read_size ->
+      send(parent, {:sendfile_pread, read_offset, read_size})
+      :file.pread(fd, read_offset, read_size)
+    end)
+
+    try do
+      :ok = Router.put(ctx, key, value, 0)
+      size = byte_size(value)
+      assert {:cold_ref, blob_path, blob_offset, ^size} = Router.get_with_file_ref(ctx, key)
+
+      state = %{
+        instance_ctx: ctx,
+        sandbox_namespace: nil,
+        pubsub_channels: nil,
+        tracking: nil
+      }
+
+      fallback = fn _fallback_state ->
+        flunk("GETRANGE should pread the blob range directly")
+      end
+
+      assert {:continue, encoded, ^state} =
+               Sendfile.dispatch_getrange(args, key, 2048, 2053, state, fallback)
+
+      assert IO.iodata_to_binary(encoded) == "$6\r\ntarget\r\n"
+
+      assert collect_sendfile_preads() == [
+               {blob_offset - 48, 48},
+               {blob_offset + 2048, 6}
+             ]
+
+      assert Path.extname(blob_path) == ".bloblog"
+    after
+      Process.delete(:ferricstore_sendfile_pread_hook)
       IsolatedInstance.checkin(ctx)
     end
   end
