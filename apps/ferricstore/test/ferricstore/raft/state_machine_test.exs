@@ -12,7 +12,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.StateMachine
   alias Ferricstore.Store.BitcaskWriter
-  alias Ferricstore.Store.{CompoundKey, LFU, Promotion}
+  alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, Promotion}
 
   # ---------------------------------------------------------------------------
   # Setup: create a temporary Bitcask store and ETS table for each test.
@@ -3365,6 +3365,90 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert result == :ok
       assert [{^key, "new", 0, _lfu, _fid, _off, 3}] = :ets.lookup(ets, key)
+    end
+
+    test "SET blob ref NX skips existing keys without writing the ref", %{
+      state: state,
+      ets: ets
+    } do
+      key = "set_blob_ref_nx_existing"
+      payload = :binary.copy("blob-set-nx", 32)
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+      :ets.insert(ets, {key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")})
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:set_blob_ref, key, encoded_ref, 0, set_opts(%{nx: true})},
+          state
+        )
+
+      assert result == nil
+      assert [{^key, "old", 0, _lfu, 0, 0, 3}] = :ets.lookup(ets, key)
+    end
+
+    test "SET blob ref NX skip does not validate an unreadable ref", %{
+      state: state,
+      ets: ets
+    } do
+      key = "set_blob_ref_nx_skip_invalid_ref"
+      missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+      :ets.insert(ets, {key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")})
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:set_blob_ref, key, missing_ref, 0, set_opts(%{nx: true})},
+          state
+        )
+
+      assert result == nil
+      assert [{^key, "old", 0, _lfu, 0, 0, 3}] = :ets.lookup(ets, key)
+    end
+
+    test "SET blob ref XX stores the validated ref without materializing it in ETS", %{
+      state: state,
+      ets: ets
+    } do
+      key = "set_blob_ref_xx_existing"
+      payload = :binary.copy("blob-set-xx", 32)
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+      encoded_ref_size = byte_size(encoded_ref)
+      :ets.insert(ets, {key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")})
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:set_blob_ref, key, encoded_ref, 0, set_opts(%{xx: true})},
+          state
+        )
+
+      assert result == :ok
+      assert [{^key, nil, 0, _lfu, _fid, _off, ^encoded_ref_size}] = :ets.lookup(ets, key)
+    end
+
+    test "SET blob ref GET returns the old value while storing the new ref", %{
+      state: state,
+      ets: ets
+    } do
+      key = "set_blob_ref_get_existing"
+      payload = :binary.copy("blob-set-get", 32)
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+      encoded_ref_size = byte_size(encoded_ref)
+      :ets.insert(ets, {key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")})
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:set_blob_ref, key, encoded_ref, 0, set_opts(%{get: true})},
+          state
+        )
+
+      assert result == "old"
+      assert [{^key, nil, 0, _lfu, _fid, _off, ^encoded_ref_size}] = :ets.lookup(ets, key)
     end
   end
 

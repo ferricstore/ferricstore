@@ -292,6 +292,9 @@ defmodule Ferricstore.Raft.StateMachine do
     * `{:put_batch, entries}` -- Hot-path write-only SET batch where entries
       are `{key, value, expire_at_ms}` tuples. Stages Bitcask records, then
       publishes ETS after append succeeds. Returns `{:ok, results}`.
+    * `{:set_blob_ref, key, encoded_ref, expire_at_ms, opts}` -- Conditional
+      SET whose large value was externalized before Ra submission. NX/XX/GET
+      checks still run inside the state machine.
     * `{:put_blob_batch, entries}` -- SET batch where some values were already
       externalized to blob refs before Ra submission. Entries are
       `{key, value_or_ref, expire_at_ms, :value | :blob_ref}` tuples.
@@ -454,6 +457,27 @@ defmodule Ferricstore.Raft.StateMachine do
         case check_key_lock(state, redis_key, nil) do
           :ok ->
             with_pending_writes(state, fn -> do_set(state, key, value, expire_at_ms, opts) end)
+
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
+
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
+  end
+
+  def apply(meta, {:set_blob_ref, key, encoded_ref, expire_at_ms, opts}, state) do
+    with_apply_time(meta, fn ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+      result =
+        case check_key_lock(state, redis_key, nil) do
+          :ok ->
+            with_pending_writes(state, fn ->
+              do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts)
+            end)
 
           {:error, :key_locked} ->
             {:error, :key_locked}
@@ -3796,6 +3820,15 @@ defmodule Ferricstore.Raft.StateMachine do
 
     case check_key_lock(state, redis_key, nil) do
       :ok -> do_set(state, key, value, expire_at_ms, opts)
+      {:error, :key_locked} -> {:error, :key_locked}
+    end
+  end
+
+  defp apply_single(state, {:set_blob_ref, key, encoded_ref, expire_at_ms, opts}) do
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+    case check_key_lock(state, redis_key, nil) do
+      :ok -> do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts)
       {:error, :key_locked} -> {:error, :key_locked}
     end
   end
@@ -10611,6 +10644,57 @@ defmodule Ferricstore.Raft.StateMachine do
         if get?, do: old_value, else: :ok
     end
   end
+
+  defp do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts) when is_binary(encoded_ref) do
+    compound_data_structure? = compound_data_structure_key?(state, key)
+    get? = Map.get(opts, :get, false)
+    current = set_current_meta(state, key, get?)
+    exists? = current != nil or compound_data_structure?
+
+    {old_value, old_expire_at_ms} =
+      case current do
+        nil -> {nil, expire_at_ms}
+        {old_value, old_expire_at_ms} -> {old_value, old_expire_at_ms}
+      end
+
+    skip? =
+      cond do
+        Map.get(opts, :nx, false) and exists? -> true
+        Map.get(opts, :xx, false) and not exists? -> true
+        true -> false
+      end
+
+    cond do
+      compound_data_structure? and get? ->
+        {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+
+      skip? and get? ->
+        old_value
+
+      skip? ->
+        nil
+
+      true ->
+        effective_expire_at_ms =
+          if Map.get(opts, :keepttl, false) and exists? do
+            old_expire_at_ms
+          else
+            expire_at_ms
+          end
+
+        case validate_put_blob_ref(state, encoded_ref) do
+          :ok ->
+            do_put_validated_blob_ref(state, key, encoded_ref, effective_expire_at_ms)
+            if get?, do: old_value, else: :ok
+
+          {:error, _reason} = error ->
+            error
+        end
+    end
+  end
+
+  defp do_set_blob_ref(_state, _key, _encoded_ref, _expire_at_ms, _opts),
+    do: {:error, {:blob_ref_unavailable, :invalid_ref}}
 
   defp set_current_meta(state, key, true), do: do_get_meta(state, key)
 

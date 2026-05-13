@@ -126,6 +126,7 @@ defmodule Ferricstore.Raft.Batcher do
   @type command ::
           {:put, binary(), binary(), non_neg_integer()}
           | {:put_blob_ref, binary(), binary(), non_neg_integer()}
+          | {:set_blob_ref, binary(), binary(), non_neg_integer(), map()}
           | {:put_batch, [{binary(), binary(), non_neg_integer()}]}
           | {:put_blob_batch, [{binary(), binary(), non_neg_integer(), :value | :blob_ref}]}
           | {:delete, binary()}
