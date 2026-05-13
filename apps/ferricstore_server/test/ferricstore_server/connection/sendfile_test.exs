@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.BlobRef
+  alias Ferricstore.Store.BlobStore
   alias Ferricstore.Store.ActiveFile
   alias Ferricstore.Stats
   alias Ferricstore.Test.IsolatedInstance
@@ -106,6 +107,42 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     assert List.first(sends) == "$#{byte_size(value)}\r\n"
     assert List.last(sends) == "\r\n"
     assert IO.iodata_to_binary(sends |> Enum.drop(1) |> Enum.drop(-1)) == value
+  end
+
+  test "tcp segment blob sendfile validates header without pre-reading payload" do
+    root = tmp_blob_root!()
+    value = :binary.copy("z", Sendfile.threshold_bytes() + 4096)
+    assert {:ok, ref} = BlobStore.put(root, 0, value)
+    assert {:ok, {path, offset, size}} = BlobStore.file_ref(root, 0, ref)
+    assert size == byte_size(value)
+
+    parent = self()
+
+    Process.put(:ferricstore_sendfile_pread_hook, fn fd, read_offset, read_size ->
+      send(parent, {:sendfile_pread, read_offset, read_size})
+      :file.pread(fd, read_offset, read_size)
+    end)
+
+    {server_socket, client_socket} = tcp_pair()
+
+    state = %{
+      socket: server_socket,
+      transport: :ranch_tcp,
+      client_id: :test_client,
+      tracking: nil
+    }
+
+    try do
+      assert {:sent, ^state} =
+               Sendfile.send_file_ref_response("blob-key", path, offset, size, state)
+
+      assert recv_until(client_socket, "\r\n") =~ "$#{size}\r\n"
+      assert collect_sendfile_preads() == [{offset - 48, 48}]
+    after
+      Process.delete(:ferricstore_sendfile_pread_hook)
+      :gen_tcp.close(server_socket)
+      :gen_tcp.close(client_socket)
+    end
   end
 
   test "blob file ref response rejects an opened blob file with extra bytes" do
@@ -724,6 +761,19 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     path
   end
 
+  defp tmp_blob_root! do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_sendfile_blob_root_#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    File.rm_rf!(path)
+    File.mkdir_p!(path)
+    on_exit(fn -> File.rm_rf(path) end)
+    path
+  end
+
   defp write_tmp_bitcask_record!(key, value) do
     path = write_tmp_file!("")
     assert {:ok, {record_offset, _record_size}} = NIF.v2_append_record(path, key, value, 0)
@@ -743,6 +793,14 @@ defmodule FerricstoreServer.Connection.SendfileTest do
   defp collect_fake_tls_sends(acc \\ []) do
     receive do
       {:fake_tls_send, data} -> collect_fake_tls_sends([data | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp collect_sendfile_preads(acc \\ []) do
+    receive do
+      {:sendfile_pread, offset, size} -> collect_sendfile_preads([{offset, size} | acc])
     after
       0 -> Enum.reverse(acc)
     end
