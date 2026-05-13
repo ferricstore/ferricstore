@@ -292,6 +292,29 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:ok, ^third_payload} = BlobStore.get(root, 0, third_ref)
   end
 
+  test "recover_shard refuses to truncate corrupt non-latest segments", %{root: root} do
+    with_blob_segment_max_bytes(600)
+
+    first_payload = :binary.copy("a", 400)
+    second_payload = :binary.copy("b", 400)
+
+    assert {:ok, first_ref} = BlobStore.put(root, 0, first_payload)
+    assert {:ok, second_ref} = BlobStore.put(root, 0, second_payload)
+    assert first_ref.segment_id == 0
+    assert second_ref.segment_id == 1
+
+    assert {:ok, {first_path, _first_offset, _first_size}} =
+             BlobStore.file_ref(root, 0, first_ref)
+
+    first_size = File.stat!(first_path).size
+    overwrite_segment_payload!(root, 0, first_ref, :binary.copy("x", 400))
+
+    assert {:error, {:corrupt_immutable_blob_segment, ^first_path}} =
+             BlobStore.recover_shard(root, 0)
+
+    assert File.stat!(first_path).size == first_size
+  end
+
   test "put appends duplicate payloads without creating per-value files", %{root: root} do
     payload = "dedupe-me"
 

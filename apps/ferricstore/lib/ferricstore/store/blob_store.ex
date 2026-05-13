@@ -301,12 +301,14 @@ defmodule Ferricstore.Store.BlobStore do
     shard_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
 
     with {:ok, paths} <- segment_files(shard_path) do
+      latest_path = List.last(paths)
+
       result =
         Enum.reduce_while(
           paths,
           {:ok, %{segments: 0, truncated_segments: 0, truncated_bytes: 0}},
           fn path, {:ok, acc} ->
-            case recover_segment(path) do
+            case recover_segment(path, path == latest_path) do
               {:ok, bytes} ->
                 acc = %{
                   acc
@@ -1170,13 +1172,14 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  defp recover_segment(path) do
+  defp recover_segment(path, can_truncate?) do
     case File.open(path, [:read, :write, :raw, :binary]) do
       {:ok, io} ->
         try do
           with {:ok, size} <- file_size(io),
                {:ok, valid_size} <- scan_segment(io, 0, size),
-               {:ok, truncated_bytes} <- maybe_truncate_segment(io, path, size, valid_size) do
+               {:ok, truncated_bytes} <-
+                 maybe_truncate_segment(io, path, size, valid_size, can_truncate?) do
             {:ok, truncated_bytes}
           end
         after
@@ -1249,9 +1252,13 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  defp maybe_truncate_segment(_io, _path, size, size), do: {:ok, 0}
+  defp maybe_truncate_segment(_io, _path, size, size, _can_truncate?), do: {:ok, 0}
 
-  defp maybe_truncate_segment(io, path, size, valid_size) do
+  defp maybe_truncate_segment(_io, path, _size, _valid_size, false) do
+    {:error, {:corrupt_immutable_blob_segment, path}}
+  end
+
+  defp maybe_truncate_segment(io, path, size, valid_size, true) do
     with {:ok, _} <- :file.position(io, valid_size),
          :ok <- :file.truncate(io),
          :ok <- fsync_file(path) do
