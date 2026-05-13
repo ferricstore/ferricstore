@@ -194,7 +194,8 @@ defmodule Ferricstore.Store.BlobStore do
     path = BlobRef.path(data_dir, shard_index, ref)
 
     result =
-      with :ok <- stat_regular_min_size(path, offset + size) do
+      with :ok <- stat_regular_min_size(path, offset + size),
+           :ok <- validate_segment_record_header(path, offset, size, ref) do
         {:ok, {path, offset, size}}
       end
 
@@ -946,6 +947,20 @@ defmodule Ferricstore.Store.BlobStore do
                :ok <- open_file_range_matches_ref?(io, offset, size, ref) do
             :ok
           end
+        after
+          :file.close(io)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp validate_segment_record_header(path, offset, size, %BlobRef{} = ref) do
+    case File.open(path, [:read, :raw, :binary]) do
+      {:ok, io} ->
+        try do
+          validate_open_segment_record(io, offset, size, ref)
         after
           :file.close(io)
         end

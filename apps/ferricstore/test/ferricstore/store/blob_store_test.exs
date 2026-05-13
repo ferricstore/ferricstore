@@ -110,6 +110,17 @@ defmodule Ferricstore.Store.BlobStoreTest do
     refute_received :unexpected_blob_write
   end
 
+  test "file_ref rejects a segment ref whose header does not match", %{root: root} do
+    payload_a = :binary.copy("a", 512)
+    payload_b = :binary.copy("b", 512)
+
+    assert {:ok, [ref_a, ref_b]} = BlobStore.put_many(root, 0, [payload_a, payload_b])
+
+    wrong_ref = %{ref_a | offset: ref_b.offset}
+
+    assert {:error, :segment_header_mismatch} = BlobStore.file_ref(root, 0, wrong_ref)
+  end
+
   test "same-shard blob appends serialize while preserving offsets", %{root: root} do
     parent = self()
 
