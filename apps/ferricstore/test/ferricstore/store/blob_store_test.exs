@@ -50,6 +50,19 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
   end
 
+  test "put replaces same-size corrupt existing blob", %{root: root} do
+    payload = "complete-payload"
+    ref = BlobRef.from_payload(payload)
+    path = BlobRef.path(root, 0, ref)
+
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, :binary.copy("x", byte_size(payload)))
+
+    assert {:ok, ^ref} = BlobStore.put(root, 0, payload)
+    assert File.read!(path) == payload
+    assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
+  end
+
   test "get detects same-size corrupt blob bytes", %{root: root} do
     payload = "correct"
 

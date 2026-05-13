@@ -11,6 +11,8 @@ defmodule Ferricstore.Store.BlobStore do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.BlobRef
 
+  @hash_chunk_bytes 1_048_576
+
   @type reason :: term()
 
   @doc """
@@ -27,7 +29,7 @@ defmodule Ferricstore.Store.BlobStore do
     ref = BlobRef.from_payload(payload)
     path = BlobRef.path(data_dir, shard_index, ref)
 
-    case existing_complete?(path, byte_size(payload)) do
+    case existing_complete?(path, ref) do
       true -> {:ok, ref}
       false -> write_atomic(path, payload, ref)
       {:error, reason} -> {:error, reason}
@@ -47,12 +49,23 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  defp existing_complete?(path, expected_size) do
+  defp existing_complete?(path, %BlobRef{size: expected_size} = ref) do
     case File.stat(path) do
-      {:ok, %{type: :regular, size: ^expected_size}} -> true
-      {:ok, _other} -> false
-      {:error, :enoent} -> false
-      {:error, reason} -> {:error, reason}
+      {:ok, %{type: :regular, size: ^expected_size}} ->
+        case file_matches_ref?(path, ref) do
+          :ok -> true
+          :mismatch -> false
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:ok, _other} ->
+        false
+
+      {:error, :enoent} ->
+        false
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -97,6 +110,37 @@ defmodule Ferricstore.Store.BlobStore do
 
   defp normalize_fsync(:ok), do: :ok
   defp normalize_fsync({:error, reason}), do: {:error, reason}
+
+  defp file_matches_ref?(path, %BlobRef{checksum: expected_checksum}) do
+    case File.open(path, [:read, :raw, :binary]) do
+      {:ok, io} ->
+        try do
+          case hash_file(io, :crypto.hash_init(:sha256)) do
+            {:ok, ^expected_checksum} -> :ok
+            {:ok, _other_checksum} -> :mismatch
+            {:error, reason} -> {:error, reason}
+          end
+        after
+          :file.close(io)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp hash_file(io, hash_state) do
+    case :file.read(io, @hash_chunk_bytes) do
+      {:ok, chunk} when is_binary(chunk) and byte_size(chunk) > 0 ->
+        hash_file(io, :crypto.hash_update(hash_state, chunk))
+
+      :eof ->
+        {:ok, :crypto.hash_final(hash_state)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   defp verify_size(%BlobRef{size: size}, payload) do
     if byte_size(payload) == size do
