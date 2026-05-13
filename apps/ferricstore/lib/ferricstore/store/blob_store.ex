@@ -217,6 +217,7 @@ defmodule Ferricstore.Store.BlobStore do
           | {:error, term()}
   def recover_shard(data_dir, shard_index)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    clear_active_segment_cache(data_dir, shard_index)
     shard_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
 
     with {:ok, paths} <- segment_files(shard_path) do
@@ -443,26 +444,19 @@ defmodule Ferricstore.Store.BlobStore do
     key = {data_dir, shard_index}
 
     case :ets.lookup(@segment_table, key) do
-      [{^key, id, path, _cached_size}] ->
-        case File.stat(path) do
-          {:ok, %{type: :regular, size: size}} ->
-            if rotate_segment?(size, batch_bytes) do
-              rotate_after_segment(data_dir, shard_index, id)
-            else
-              {:ok, %{id: id, path: path, start_offset: size, file_existed?: true}}
-            end
-
-          {:ok, _other} ->
-            {:error, :invalid_blob_file}
-
-          {:error, :enoent} ->
-            :miss
-
-          {:error, reason} ->
-            {:error, reason}
+      [{^key, id, path, cached_size}]
+      when is_integer(id) and id >= 0 and is_binary(path) and is_integer(cached_size) and
+             cached_size >= 0 ->
+        if rotate_segment?(cached_size, batch_bytes) do
+          rotate_after_segment(data_dir, shard_index, id)
+        else
+          {:ok, %{id: id, path: path, start_offset: cached_size, file_existed?: true}}
         end
 
       [] ->
+        :miss
+
+      _other ->
         :miss
     end
   end

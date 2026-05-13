@@ -193,6 +193,26 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
   end
 
+  test "recover_shard invalidates cached append offsets after truncating a corrupt record", %{
+    root: root
+  } do
+    first_payload = :binary.copy("a", 128)
+    second_payload = :binary.copy("b", 128)
+    third_payload = :binary.copy("c", 128)
+
+    assert {:ok, first_ref} = BlobStore.put(root, 0, first_payload)
+    assert {:ok, second_ref} = BlobStore.put(root, 0, second_payload)
+    overwrite_segment_payload!(root, 0, second_ref, :binary.copy("x", 128))
+
+    assert {:ok, %{truncated_segments: 1}} = BlobStore.recover_shard(root, 0)
+    assert {:ok, ^first_payload} = BlobStore.get(root, 0, first_ref)
+    assert {:error, _reason} = BlobStore.get(root, 0, second_ref)
+
+    assert {:ok, third_ref} = BlobStore.put(root, 0, third_payload)
+    assert third_ref.offset == second_ref.offset
+    assert {:ok, ^third_payload} = BlobStore.get(root, 0, third_ref)
+  end
+
   test "put appends duplicate payloads without creating per-value files", %{root: root} do
     payload = "dedupe-me"
 
