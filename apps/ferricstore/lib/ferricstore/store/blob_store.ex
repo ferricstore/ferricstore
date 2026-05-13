@@ -1428,7 +1428,7 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp file_matches_ref?(path, %BlobRef{checksum: expected_checksum}) do
-    case File.open(path, [:read, :raw, :binary]) do
+    case open_read_file(path) do
       {:ok, io} ->
         try do
           case hash_file(io, :crypto.hash_init(:sha256)) do
@@ -1446,7 +1446,7 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp read_segment_payload(path, offset, size, %BlobRef{} = ref) do
-    case File.open(path, [:read, :raw, :binary]) do
+    case open_read_file(path) do
       {:ok, io} ->
         try do
           with :ok <- validate_open_segment_record(io, offset, size, ref),
@@ -1464,7 +1464,7 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp read_segment_payload_range(path, offset, size, %BlobRef{} = ref, relative_offset, count) do
-    case File.open(path, [:read, :raw, :binary]) do
+    case open_read_file(path) do
       {:ok, io} ->
         try do
           with :ok <- validate_open_segment_record(io, offset, size, ref),
@@ -1481,7 +1481,7 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp read_file_range(path, offset, count) do
-    case File.open(path, [:read, :raw, :binary]) do
+    case open_read_file(path) do
       {:ok, io} ->
         try do
           pread_exact_open(io, offset, count)
@@ -1495,7 +1495,7 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp verify_segment_record(path, offset, size, %BlobRef{} = ref) do
-    case File.open(path, [:read, :raw, :binary]) do
+    case open_read_file(path) do
       {:ok, io} ->
         try do
           with :ok <- validate_open_segment_record(io, offset, size, ref),
@@ -1512,7 +1512,7 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp validate_segment_record_header(path, offset, size, %BlobRef{} = ref) do
-    case File.open(path, [:read, :raw, :binary]) do
+    case open_read_file(path) do
       {:ok, io} ->
         try do
           validate_open_segment_record(io, offset, size, ref)

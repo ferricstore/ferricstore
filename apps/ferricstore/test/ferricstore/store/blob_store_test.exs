@@ -226,6 +226,23 @@ defmodule Ferricstore.Store.BlobStoreTest do
     refute_received {:blob_open_read, _}
   end
 
+  test "file_ref uses the shared blob read-open path for segment refs", %{root: root} do
+    assert {:ok, [ref]} = BlobStore.put_many(root, 0, [:binary.copy("f", 512)])
+    segment_path = BlobRef.path(root, 0, ref)
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_open_read_hook, fn path, modes ->
+      send(parent, {:blob_open_read, path})
+      File.open(path, modes)
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_open_read_hook) end)
+
+    assert {:ok, {^segment_path, _offset, 512}} = BlobStore.file_ref(root, 0, ref)
+    assert_received {:blob_open_read, ^segment_path}
+    refute_received {:blob_open_read, _}
+  end
+
   test "file_refs_many isolates corrupt segment headers", %{root: root} do
     first_payload = :binary.copy("a", 128)
     second_payload = :binary.copy("b", 128)
