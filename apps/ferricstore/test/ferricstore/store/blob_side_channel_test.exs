@@ -1,7 +1,17 @@
 defmodule Ferricstore.Store.BlobSideChannelTest do
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Store.{BlobRef, BlobStore, ColdRead, CompoundKey, LocalTxStore, Ops, Router}
+  alias Ferricstore.Store.{
+    BlobRef,
+    BlobStore,
+    ColdRead,
+    CompoundKey,
+    LFU,
+    LocalTxStore,
+    Ops,
+    Router
+  }
+
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Raft.StateMachine
@@ -121,6 +131,82 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert BlobRef.path(ctx.data_dir, 0, ref) == blob_path
     assert {:ok, ^payload} = BlobStore.get(ctx.data_dir, 0, ref)
     assert {:ok, ^payload} = BlobStore.get(ctx.data_dir, 0, second_ref)
+  end
+
+  test "batch_get_with_file_refs batches encoded blob ref reads before file-ref validation", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key_a = "blob:auto:batch-ref-a"
+    key_b = "blob:auto:batch-ref-b"
+    payload_a = :binary.copy("A", 1024)
+    payload_b = :binary.copy("B", 2048)
+
+    assert {:ok, ref_a} = BlobStore.put(ctx.data_dir, 0, payload_a)
+    assert {:ok, ref_b} = BlobStore.put(ctx.data_dir, 0, payload_b)
+
+    encoded_a = BlobRef.encode!(ref_a)
+    encoded_b = BlobRef.encode!(ref_b)
+
+    :ets.insert(keydir, {
+      key_a,
+      nil,
+      0,
+      LFU.initial(),
+      0,
+      111_111,
+      BlobRef.encoded_size()
+    })
+
+    :ets.insert(keydir, {
+      key_b,
+      nil,
+      0,
+      LFU.initial(),
+      0,
+      222_222,
+      BlobRef.encoded_size()
+    })
+
+    Process.put(:ferricstore_router_pread_batch_keyed_result, {:ok, [encoded_a, encoded_b]})
+
+    try do
+      assert [
+               {:file_ref, path_a, offset_a, 1024},
+               {:file_ref, path_b, offset_b, 2048}
+             ] = Router.batch_get_with_file_refs(ctx, [key_a, key_b], 64)
+
+      assert {:ok, {^path_a, ^offset_a, 1024}} = BlobStore.file_ref(ctx.data_dir, 0, ref_a)
+      assert {:ok, {^path_b, ^offset_b, 2048}} = BlobStore.file_ref(ctx.data_dir, 0, ref_b)
+    after
+      Process.delete(:ferricstore_router_pread_batch_keyed_result)
+    end
+  end
+
+  test "batch_get_with_file_refs keeps fixed-size non-ref cold values inline", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "blob:auto:batch-normal-encoded-size"
+    value = :binary.copy("N", BlobRef.encoded_size())
+
+    :ets.insert(keydir, {
+      key,
+      nil,
+      0,
+      LFU.initial(),
+      0,
+      333_333,
+      byte_size(value)
+    })
+
+    Process.put(:ferricstore_router_pread_batch_keyed_result, {:ok, [value]})
+
+    try do
+      assert [^value] = Router.batch_get_with_file_refs(ctx, [key], 64)
+    after
+      Process.delete(:ferricstore_router_pread_batch_keyed_result)
+    end
   end
 
   test "large direct hot-cache values still publish blob disk locations" do
