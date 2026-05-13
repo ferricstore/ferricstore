@@ -326,6 +326,66 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     end
   end
 
+  test "pipelined GET reuses one open file for blob refs in the same append segment" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 1024,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    {server_socket, client_socket} = tcp_pair()
+
+    key1 = "pipeline-blob-sendfile-open:1"
+    key2 = "pipeline-blob-sendfile-open:2"
+    value1 = :binary.copy("c", Sendfile.threshold_bytes() + 1024)
+    value2 = :binary.copy("d", Sendfile.threshold_bytes() + 2048)
+
+    assert :ok = Router.batch_put(ctx, [{key1, value1}, {key2, value2}])
+
+    state = %Connection{
+      socket: server_socket,
+      transport: :ranch_tcp,
+      client_id: :test_client,
+      instance_ctx: ctx,
+      stats_counter: ctx.stats_counter,
+      authenticated: true,
+      require_auth: false,
+      acl_cache: :full_access,
+      tracking: nil
+    }
+
+    commands = [
+      {:command, "GET", [key1], {:get, key1}, [key1]},
+      {:command, "GET", [key2], {:get, key2}, [key2]}
+    ]
+
+    send_response = fn socket, :ranch_tcp, response -> :gen_tcp.send(socket, response) end
+    handle_command = fn command, _state -> flunk("unexpected fallback: #{inspect(command)}") end
+    parent = self()
+
+    Process.put(:ferricstore_sendfile_open_hook, fn path, modes ->
+      send(parent, {:sendfile_open, path})
+      :file.open(path, modes)
+    end)
+
+    try do
+      assert {:continue, _new_state} =
+               Pipeline.pipeline_dispatch(commands, state, handle_command, send_response)
+
+      response = recv_until(client_socket, "$#{byte_size(value2)}\r\n", "", 100)
+      assert response =~ "$#{byte_size(value1)}\r\n"
+      assert response =~ "$#{byte_size(value2)}\r\n"
+      assert [path] = collect_sendfile_opens()
+      assert Path.extname(path) == ".bloblog"
+    after
+      Process.delete(:ferricstore_sendfile_open_hook)
+      :gen_tcp.close(server_socket)
+      :gen_tcp.close(client_socket)
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
   test "GET tracks client-visible sandbox key, not internal lookup key", %{ctx: ctx} do
     sandbox = "sandbox:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"
     key = "tracked-hot-get"

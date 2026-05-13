@@ -629,15 +629,80 @@ defmodule FerricstoreServer.Connection.Sendfile do
     end
   end
 
-  defp send_file_ref_element_response_cached(
-         key,
-         validate_key,
-         path,
-         offset,
-         size,
-         %{transport: :ranch_tcp} = state,
-         file_cache
-       ) do
+  @doc false
+  def send_file_ref_response_cached(
+        key,
+        validate_key,
+        path,
+        offset,
+        size,
+        %{transport: :ranch_tcp} = state,
+        file_cache
+      ) do
+    case cached_file_open(path, file_cache) do
+      {:ok, fd, new_cache} ->
+        result = do_sendfile_get_open(key, validate_key, path, fd, offset, size, state, true)
+        emit_sendfile_result(result, size, state)
+
+        case result do
+          {:sent, new_state} ->
+            {:sent, new_state, new_cache}
+
+          :fallback ->
+            {:fallback, new_cache}
+
+          {:error_after_header, reason} ->
+            {:error_after_header, reason, new_cache}
+        end
+
+      {:error, _reason} ->
+        {:fallback, file_cache}
+    end
+  end
+
+  def send_file_ref_response_cached(
+        key,
+        validate_key,
+        path,
+        offset,
+        size,
+        state,
+        file_cache
+      ) do
+    case cached_file_open(path, file_cache) do
+      {:ok, fd, new_cache} ->
+        result = do_stream_file_ref_get_open(validate_key, path, fd, offset, size, state)
+        emit_file_stream_result(result, size, state)
+
+        case result do
+          {:sent, new_state, _chunks} ->
+            tracked_state =
+              ConnTracking.maybe_track_read("GET", [key], :file_stream_ok, new_state)
+
+            {:sent, tracked_state, new_cache}
+
+          :fallback ->
+            {:fallback, new_cache}
+
+          {:error_after_header, reason, _chunks} ->
+            {:error_after_header, reason, new_cache}
+        end
+
+      {:error, _reason} ->
+        {:fallback, file_cache}
+    end
+  end
+
+  @doc false
+  def send_file_ref_element_response_cached(
+        key,
+        validate_key,
+        path,
+        offset,
+        size,
+        %{transport: :ranch_tcp} = state,
+        file_cache
+      ) do
     case cached_file_open(path, file_cache) do
       {:ok, fd, new_cache} ->
         result = do_sendfile_get_open(key, validate_key, path, fd, offset, size, state, false)
@@ -659,15 +724,15 @@ defmodule FerricstoreServer.Connection.Sendfile do
     end
   end
 
-  defp send_file_ref_element_response_cached(
-         _key,
-         validate_key,
-         path,
-         offset,
-         size,
-         state,
-         file_cache
-       ) do
+  def send_file_ref_element_response_cached(
+        _key,
+        validate_key,
+        path,
+        offset,
+        size,
+        state,
+        file_cache
+      ) do
     case cached_file_open(path, file_cache) do
       {:ok, fd, new_cache} ->
         result = do_stream_file_ref_get_open(validate_key, path, fd, offset, size, state)
@@ -1149,7 +1214,11 @@ defmodule FerricstoreServer.Connection.Sendfile do
     end
   end
 
-  defp close_file_cache(file_cache) do
+  @doc false
+  def new_file_cache, do: %{}
+
+  @doc false
+  def close_file_cache(file_cache) do
     Enum.each(file_cache, fn {_path, fd} -> :file.close(fd) end)
   end
 

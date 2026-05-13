@@ -191,17 +191,26 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp stream_get_results(keys, lookup_keys, results, state, send_response_fn) do
     TcpOpts.set_cork(state.socket, true)
 
-    result =
+    {result, file_cache} =
       keys
       |> Enum.zip(lookup_keys)
       |> Enum.zip(results)
-      |> Enum.reduce_while({:continue, state}, fn
-        {{key, lookup_key}, {:file_ref, path, offset, size}}, {:continue, acc_state} ->
-          case ConnSendfile.send_file_ref_response(key, lookup_key, path, offset, size, acc_state) do
-            {:sent, new_state} ->
-              {:cont, {:continue, new_state}}
+      |> Enum.reduce_while({{:continue, state}, ConnSendfile.new_file_cache()}, fn
+        {{key, lookup_key}, {:file_ref, path, offset, size}},
+        {{:continue, acc_state}, file_cache} ->
+          case ConnSendfile.send_file_ref_response_cached(
+                 key,
+                 lookup_key,
+                 path,
+                 offset,
+                 size,
+                 acc_state,
+                 file_cache
+               ) do
+            {:sent, new_state, new_cache} ->
+              {:cont, {{:continue, new_state}, new_cache}}
 
-            :fallback ->
+            {:fallback, new_cache} ->
               value =
                 Router.get(
                   acc_state.instance_ctx,
@@ -214,17 +223,21 @@ defmodule FerricstoreServer.Connection.Pipeline do
                 Encoder.encode(value)
               )
 
-              {:cont, {:continue, ConnTracking.maybe_track_read("GET", [key], value, acc_state)}}
+              tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
+              {:cont, {{:continue, tracked_state}, new_cache}}
 
-            {:error_after_header, _reason} ->
-              {:halt, {:quit, acc_state}}
+            {:error_after_header, _reason, new_cache} ->
+              {:halt, {{:quit, acc_state}, new_cache}}
           end
 
-        {{key, _lookup_key}, value}, {:continue, acc_state} ->
+        {{key, _lookup_key}, value}, {{:continue, acc_state}, file_cache} ->
           send_response_fn.(acc_state.socket, acc_state.transport, Encoder.encode(value))
 
-          {:cont, {:continue, ConnTracking.maybe_track_read("GET", [key], value, acc_state)}}
+          tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
+          {:cont, {{:continue, tracked_state}, file_cache}}
       end)
+
+    ConnSendfile.close_file_cache(file_cache)
 
     TcpOpts.set_cork(state.socket, false)
     result
@@ -512,45 +525,55 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp stream_indexed_results(count, primary_results, fallback_results, state, send_response_fn) do
     TcpOpts.set_cork(state.socket, true)
 
-    result =
-      Enum.reduce_while(0..(count - 1), {:continue, state}, fn idx, {:continue, acc_state} ->
-        case Map.get(primary_results, idx) || Map.get(fallback_results, idx) do
-          {:file_ref, key, lookup_key, path, offset, size} ->
-            case ConnSendfile.send_file_ref_response(
-                   key,
-                   lookup_key,
-                   path,
-                   offset,
-                   size,
-                   acc_state
-                 ) do
-              {:sent, new_state} ->
-                {:cont, {:continue, new_state}}
+    {result, file_cache} =
+      Enum.reduce_while(
+        0..(count - 1),
+        {{:continue, state}, ConnSendfile.new_file_cache()},
+        fn idx, {{:continue, acc_state}, file_cache} ->
+          case Map.get(primary_results, idx) || Map.get(fallback_results, idx) do
+            {:file_ref, key, lookup_key, path, offset, size} ->
+              case ConnSendfile.send_file_ref_response_cached(
+                     key,
+                     lookup_key,
+                     path,
+                     offset,
+                     size,
+                     acc_state,
+                     file_cache
+                   ) do
+                {:sent, new_state, new_cache} ->
+                  {:cont, {{:continue, new_state}, new_cache}}
 
-              :fallback ->
-                send_response_fn.(
-                  acc_state.socket,
-                  acc_state.transport,
-                  Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
-                )
+                {:fallback, new_cache} ->
+                  send_response_fn.(
+                    acc_state.socket,
+                    acc_state.transport,
+                    Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
+                  )
 
-                {:cont,
-                 {:continue, ConnTracking.maybe_track_read("GET", [key], :fallback_ok, acc_state)}}
+                  {:cont,
+                   {{:continue,
+                     ConnTracking.maybe_track_read("GET", [key], :fallback_ok, acc_state)},
+                    new_cache}}
 
-              {:error_after_header, _reason} ->
-                {:halt, {:quit, acc_state}}
-            end
+                {:error_after_header, _reason, new_cache} ->
+                  {:halt, {{:quit, acc_state}, new_cache}}
+              end
 
-          {:get_encoded, key, encoded, value} ->
-            send_response_fn.(acc_state.socket, acc_state.transport, encoded)
+            {:get_encoded, key, encoded, value} ->
+              send_response_fn.(acc_state.socket, acc_state.transport, encoded)
 
-            {:cont, {:continue, ConnTracking.maybe_track_read("GET", [key], value, acc_state)}}
+              tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
+              {:cont, {{:continue, tracked_state}, file_cache}}
 
-          encoded ->
-            send_response_fn.(acc_state.socket, acc_state.transport, encoded)
-            {:cont, {:continue, acc_state}}
+            encoded ->
+              send_response_fn.(acc_state.socket, acc_state.transport, encoded)
+              {:cont, {{:continue, acc_state}, file_cache}}
+          end
         end
-      end)
+      )
+
+    ConnSendfile.close_file_cache(file_cache)
 
     TcpOpts.set_cork(state.socket, false)
     result
@@ -1420,108 +1443,141 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp stream_response_entries(entries, state, send_response_fn) do
-    Enum.reduce_while(entries, {:continue, state}, fn
-      {:array, keys, elements}, {:continue, acc_state} ->
-        case stream_array_response(keys, elements, acc_state, send_response_fn) do
-          {:sent, new_state} ->
-            {:cont, {:continue, new_state}}
+    {result, file_cache} =
+      Enum.reduce_while(
+        entries,
+        {{:continue, state}, ConnSendfile.new_file_cache()},
+        fn
+          {:array, keys, elements}, {{:continue, acc_state}, file_cache} ->
+            case stream_array_response(keys, elements, acc_state, send_response_fn, file_cache) do
+              {{:sent, new_state}, new_cache} ->
+                {:cont, {{:continue, new_state}, new_cache}}
 
-          {:error_after_header, _reason} ->
-            {:halt, {:quit, acc_state}}
+              {{:error_after_header, _reason}, new_cache} ->
+                {:halt, {{:quit, acc_state}, new_cache}}
+            end
+
+          {:file_range, args, key, start_idx, end_idx, path, offset, size, validator},
+          {{:continue, acc_state}, file_cache} ->
+            case ConnSendfile.send_file_range_response(
+                   args,
+                   path,
+                   offset,
+                   size,
+                   validator,
+                   acc_state
+                 ) do
+              {:sent, new_state} ->
+                {:cont, {{:continue, new_state}, file_cache}}
+
+              :fallback ->
+                send_response_fn.(
+                  acc_state.socket,
+                  acc_state.transport,
+                  Encoder.encode(
+                    ConnSendfile.materialize_getrange(key, start_idx, end_idx, acc_state)
+                  )
+                )
+
+                tracked_state =
+                  ConnTracking.maybe_track_read("GETRANGE", args, :fallback_ok, acc_state)
+
+                {:cont, {{:continue, tracked_state}, file_cache}}
+
+              {:error_after_header, _reason} ->
+                {:halt, {{:quit, acc_state}, file_cache}}
+            end
+
+          {:file_ref, key, lookup_key, path, offset, size},
+          {{:continue, acc_state}, file_cache} ->
+            case ConnSendfile.send_file_ref_response_cached(
+                   key,
+                   lookup_key,
+                   path,
+                   offset,
+                   size,
+                   acc_state,
+                   file_cache
+                 ) do
+              {:sent, new_state, new_cache} ->
+                {:cont, {{:continue, new_state}, new_cache}}
+
+              {:fallback, new_cache} ->
+                send_response_fn.(
+                  acc_state.socket,
+                  acc_state.transport,
+                  Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
+                )
+
+                tracked_state =
+                  ConnTracking.maybe_track_read("GET", [key], :fallback_ok, acc_state)
+
+                {:cont, {{:continue, tracked_state}, new_cache}}
+
+              {:error_after_header, _reason, new_cache} ->
+                {:halt, {{:quit, acc_state}, new_cache}}
+            end
+
+          {:encoded, encoded}, {{:continue, acc_state}, file_cache} ->
+            send_response_fn.(acc_state.socket, acc_state.transport, encoded)
+            {:cont, {{:continue, acc_state}, file_cache}}
         end
+      )
 
-      {:file_range, args, key, start_idx, end_idx, path, offset, size, validator},
-      {:continue, acc_state} ->
-        case ConnSendfile.send_file_range_response(args, path, offset, size, validator, acc_state) do
-          {:sent, new_state} ->
-            {:cont, {:continue, new_state}}
-
-          :fallback ->
-            send_response_fn.(
-              acc_state.socket,
-              acc_state.transport,
-              Encoder.encode(
-                ConnSendfile.materialize_getrange(key, start_idx, end_idx, acc_state)
-              )
-            )
-
-            {:cont,
-             {:continue, ConnTracking.maybe_track_read("GETRANGE", args, :fallback_ok, acc_state)}}
-
-          {:error_after_header, _reason} ->
-            {:halt, {:quit, acc_state}}
-        end
-
-      {:file_ref, key, lookup_key, path, offset, size}, {:continue, acc_state} ->
-        case ConnSendfile.send_file_ref_response(key, lookup_key, path, offset, size, acc_state) do
-          {:sent, new_state} ->
-            {:cont, {:continue, new_state}}
-
-          :fallback ->
-            send_response_fn.(
-              acc_state.socket,
-              acc_state.transport,
-              Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
-            )
-
-            {:cont,
-             {:continue, ConnTracking.maybe_track_read("GET", [key], :fallback_ok, acc_state)}}
-
-          {:error_after_header, _reason} ->
-            {:halt, {:quit, acc_state}}
-        end
-
-      {:encoded, encoded}, {:continue, acc_state} ->
-        send_response_fn.(acc_state.socket, acc_state.transport, encoded)
-        {:cont, {:continue, acc_state}}
-    end)
+    ConnSendfile.close_file_cache(file_cache)
+    result
   end
 
-  defp stream_array_response(keys, elements, state, send_response_fn) do
+  defp stream_array_response(keys, elements, state, send_response_fn, file_cache) do
     send_response_fn.(state.socket, state.transport, [
       "*",
       Integer.to_string(length(elements)),
       "\r\n"
     ])
 
-    elements
-    |> Enum.reduce_while({:sent, state}, fn
-      {:file_ref, key, lookup_key, path, offset, size}, {:sent, acc_state} ->
-        case ConnSendfile.send_file_ref_element_response(
-               key,
-               lookup_key,
-               path,
-               offset,
-               size,
-               acc_state
-             ) do
-          {:sent, new_state} ->
-            {:cont, {:sent, new_state}}
+    {result, file_cache} =
+      Enum.reduce_while(elements, {{:sent, state}, file_cache}, fn
+        {:file_ref, key, lookup_key, path, offset, size}, {{:sent, acc_state}, file_cache} ->
+          case ConnSendfile.send_file_ref_element_response_cached(
+                 key,
+                 lookup_key,
+                 path,
+                 offset,
+                 size,
+                 acc_state,
+                 file_cache
+               ) do
+            {:sent, new_state, new_cache} ->
+              {:cont, {{:sent, new_state}, new_cache}}
 
-          :fallback ->
-            send_response_fn.(
-              acc_state.socket,
-              acc_state.transport,
-              Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
-            )
+            {:fallback, new_cache} ->
+              send_response_fn.(
+                acc_state.socket,
+                acc_state.transport,
+                Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
+              )
 
-            {:cont, {:sent, acc_state}}
+              {:cont, {{:sent, acc_state}, new_cache}}
 
-          {:error_after_header, _reason} = error ->
-            {:halt, error}
-        end
+            {:error_after_header, reason, new_cache} ->
+              {:halt, {{:error_after_header, reason}, new_cache}}
+          end
 
-      {:encoded, encoded}, {:sent, acc_state} ->
-        send_response_fn.(acc_state.socket, acc_state.transport, encoded)
-        {:cont, {:sent, acc_state}}
-    end)
-    |> case do
-      {:sent, new_state} ->
-        {:sent, ConnTracking.maybe_track_read("MGET", keys, :sendfile_ok, new_state)}
+        {:encoded, encoded}, {{:sent, acc_state}, file_cache} ->
+          send_response_fn.(acc_state.socket, acc_state.transport, encoded)
+          {:cont, {{:sent, acc_state}, file_cache}}
+      end)
 
-      other ->
-        other
-    end
+    result =
+      case result do
+        {:sent, new_state} ->
+          {:sent, ConnTracking.maybe_track_read("MGET", keys, :sendfile_ok, new_state)}
+
+        other ->
+          other
+      end
+
+    {result, file_cache}
   end
 
   defp log_acl_denied(state, name) do
