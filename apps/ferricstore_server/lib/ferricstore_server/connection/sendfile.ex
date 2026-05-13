@@ -415,29 +415,58 @@ defmodule FerricstoreServer.Connection.Sendfile do
     end
   end
 
-  defp pread_file_ref_value(validate_key, path, 0, size) do
-    if blob_file_ref_path?(path) do
-      pread_blob_file_ref_value(path, size)
-    else
-      pread_bitcask_file_ref_value(validate_key, path, 0, size)
-    end
-  end
-
   defp pread_file_ref_value(validate_key, path, offset, size) do
     if blob_file_ref_path?(path) do
-      :fallback
+      pread_blob_file_ref_value(path, offset, size)
     else
       pread_bitcask_file_ref_value(validate_key, path, offset, size)
     end
   end
 
-  defp pread_blob_file_ref_value(path, size) do
-    with {:ok, checksum} <- blob_checksum_from_path(path),
-         {:ok, payload} when is_binary(payload) and byte_size(payload) == size <- File.read(path),
+  defp pread_blob_file_ref_value(path, value_offset, size) do
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          case Path.extname(path) do
+            ".blob" -> pread_legacy_blob_file_ref_value(path, fd, value_offset, size)
+            ".bloblog" -> pread_segment_blob_file_ref_value(fd, value_offset, size)
+            _other -> :fallback
+          end
+        after
+          :file.close(fd)
+        end
+
+      {:error, _reason} ->
+        :fallback
+    end
+  end
+
+  defp pread_legacy_blob_file_ref_value(path, fd, value_offset, size) do
+    with true <- value_offset == 0,
+         {:ok, ^size} <- :file.position(fd, :eof),
+         {:ok, checksum} <- blob_checksum_from_path(path),
+         {:ok, payload} when is_binary(payload) and byte_size(payload) == size <-
+           file_pread(fd, 0, size),
          ^checksum <- :crypto.hash(:sha256, payload) do
       {:ok, payload}
     else
-      _ -> :fallback
+      _other -> :fallback
+    end
+  end
+
+  defp pread_segment_blob_file_ref_value(fd, value_offset, size) do
+    header_offset = value_offset - @blob_segment_header_bytes
+
+    with true <- header_offset >= 0,
+         {:ok, header} when byte_size(header) == @blob_segment_header_bytes <-
+           file_pread(fd, header_offset, @blob_segment_header_bytes),
+         {:ok, ^size, expected_checksum} <- decode_blob_segment_header(header),
+         {:ok, payload} when is_binary(payload) and byte_size(payload) == size <-
+           file_pread(fd, value_offset, size),
+         ^expected_checksum <- :crypto.hash(:sha256, payload) do
+      {:ok, payload}
+    else
+      _other -> :fallback
     end
   end
 

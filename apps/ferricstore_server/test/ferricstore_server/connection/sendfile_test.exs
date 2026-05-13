@@ -516,6 +516,53 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     assert Stats.total_cold_reads(ctx) - before_cold_reads == 1
   end
 
+  test "GET reads small blob file refs without falling back" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 64,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    key = "small-blob-sendfile-get"
+    value = :binary.copy("g", 1024)
+    parent = self()
+
+    Process.put(:ferricstore_sendfile_pread_hook, fn fd, read_offset, read_size ->
+      send(parent, {:sendfile_pread, read_offset, read_size})
+      :file.pread(fd, read_offset, read_size)
+    end)
+
+    try do
+      :ok = Router.put(ctx, key, value, 0)
+      assert {:cold_ref, blob_path, blob_offset, 1024} = Router.get_with_file_ref(ctx, key)
+
+      state = %{
+        instance_ctx: ctx,
+        sandbox_namespace: nil,
+        pubsub_channels: nil,
+        tracking: nil
+      }
+
+      fallback = fn _cmd, _args, _state ->
+        flunk("GET should pread the small blob value directly")
+      end
+
+      assert {:continue, encoded, ^state} = Sendfile.dispatch_get([key], state, fallback)
+      assert {:ok, [^value], ""} = Parser.parse(IO.iodata_to_binary(encoded))
+
+      assert collect_sendfile_preads() == [
+               {blob_offset - 48, 48},
+               {blob_offset, byte_size(value)}
+             ]
+
+      assert Path.extname(blob_path) == ".bloblog"
+    after
+      Process.delete(:ferricstore_sendfile_pread_hook)
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
   test "GET does not materialize a corrupt small blob file ref" do
     ctx =
       IsolatedInstance.checkout(
