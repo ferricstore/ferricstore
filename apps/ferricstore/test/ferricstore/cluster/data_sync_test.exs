@@ -60,6 +60,47 @@ defmodule Ferricstore.Cluster.DataSyncTest do
              2_500_000
   end
 
+  test "directory copy fsyncs copied files and target directories" do
+    root =
+      Path.join(System.tmp_dir!(), "ferricstore_data_sync_#{System.unique_integer([:positive])}")
+
+    source = Path.join(root, "source")
+    target = Path.join(root, "target")
+    subdir = Path.join(source, "nested")
+    parent = self()
+
+    on_exit(fn ->
+      Process.delete(:ferricstore_data_sync_file_sync_hook)
+      Process.delete(:ferricstore_data_sync_fsync_dir_hook)
+      File.rm_rf!(root)
+    end)
+
+    File.mkdir_p!(subdir)
+    File.write!(Path.join(source, "root.blob"), "root-payload")
+    File.write!(Path.join(subdir, "nested.blob"), "nested-payload")
+
+    Process.put(:ferricstore_data_sync_file_sync_hook, fn path ->
+      send(parent, {:file_sync, path})
+      :ok
+    end)
+
+    Process.put(:ferricstore_data_sync_fsync_dir_hook, fn path ->
+      send(parent, {:dir_sync, path})
+      :ok
+    end)
+
+    assert :ok = DataSync.copy_directory_from(node(), source, node(), target)
+
+    root_blob = Path.join(target, "root.blob")
+    nested_blob = Path.join([target, "nested", "nested.blob"])
+    copied_nested = Path.join(target, "nested")
+
+    assert_received {:file_sync, ^root_blob}
+    assert_received {:file_sync, ^nested_blob}
+    assert_received {:dir_sync, ^target}
+    assert_received {:dir_sync, ^copied_nested}
+  end
+
   test "shard storage copy includes promoted dedicated data and blob side-channel data" do
     root =
       Path.join(System.tmp_dir!(), "ferricstore_data_sync_#{System.unique_integer([:positive])}")

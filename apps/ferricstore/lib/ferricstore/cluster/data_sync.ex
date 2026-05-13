@@ -515,6 +515,7 @@ defmodule Ferricstore.Cluster.DataSync do
   def copy_directory_from(source_node, source_path, target_node, target_path) do
     Logger.info("DataSync: copying #{source_node}:#{source_path} → #{target_node}:#{target_path}")
     :erpc.call(target_node, File, :mkdir_p!, [target_path])
+    sync_target_dir!(target_node, Path.dirname(target_path), :create_target_dir, target_path)
 
     files =
       if source_node == node() do
@@ -542,6 +543,8 @@ defmodule Ferricstore.Cluster.DataSync do
         copy_file_from(source_node, src, target_node, dest)
       end
     end)
+
+    sync_target_dir!(target_node, target_path, :copy_directory, target_path)
   end
 
   defp copy_file_from(source_node, source_path, target_node, target_path) do
@@ -550,6 +553,7 @@ defmodule Ferricstore.Cluster.DataSync do
 
     try do
       copy_file_chunks(source_node, source_io, target_node, target_io, source_path, target_path)
+      sync_target_file!(target_node, target_io, target_path)
     after
       close_file(source_node, source_io)
       close_file(target_node, target_io)
@@ -587,6 +591,48 @@ defmodule Ferricstore.Cluster.DataSync do
   defp close_file(target_node, io) do
     _ = call_on(target_node, File, :close, [io])
     :ok
+  end
+
+  defp sync_target_file!(target_node, target_io, target_path) do
+    case target_file_sync(target_node, target_io, target_path) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        raise "DataSync: file fsync failed for #{target_path}: #{inspect(reason)}"
+
+      other ->
+        raise "DataSync: file fsync returned unexpected result for #{target_path}: #{inspect(other)}"
+    end
+  end
+
+  defp target_file_sync(target_node, target_io, target_path) do
+    case Process.get(:ferricstore_data_sync_file_sync_hook) do
+      hook when is_function(hook, 1) and target_node == node() -> hook.(target_path)
+      _ -> call_on(target_node, :file, :sync, [target_io])
+    end
+  end
+
+  defp sync_target_dir!(target_node, dir_path, phase, copied_path) do
+    case target_dir_sync(target_node, dir_path) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        raise "DataSync: directory fsync failed during #{phase} for #{dir_path} " <>
+                "while copying #{copied_path}: #{inspect(reason)}"
+
+      other ->
+        raise "DataSync: directory fsync returned unexpected result during #{phase} " <>
+                "for #{dir_path} while copying #{copied_path}: #{inspect(other)}"
+    end
+  end
+
+  defp target_dir_sync(target_node, dir_path) do
+    case Process.get(:ferricstore_data_sync_fsync_dir_hook) do
+      hook when is_function(hook, 1) and target_node == node() -> hook.(dir_path)
+      _ -> call_on(target_node, Ferricstore.Bitcask.NIF, :v2_fsync_dir, [dir_path])
+    end
   end
 
   defp call_on(target_node, module, function, args) do
