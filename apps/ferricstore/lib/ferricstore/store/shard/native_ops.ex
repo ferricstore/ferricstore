@@ -730,20 +730,47 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   defp normalize_batch_write_result(other), do: {:error, other}
 
   defp persisted_disk_entries(state, entries) do
-    Enum.reduce_while(entries, {:ok, []}, fn {compound_key, value, expire_at_ms}, {:ok, acc} ->
-      case persisted_disk_value(state, value) do
-        {:ok, persisted_value} ->
-          {:cont, {:ok, [{compound_key, persisted_value, expire_at_ms} | acc]}}
+    {prepared_reversed, disk_values_reversed} =
+      Enum.reduce(entries, {[], []}, fn {compound_key, value, expire_at_ms},
+                                        {prepared_acc, disk_acc} ->
+        disk_value = ShardETS.to_disk_binary(value)
 
-        {:error, _reason} = error ->
-          {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
-      {:error, _reason} = error -> error
+        {
+          [{compound_key, expire_at_ms} | prepared_acc],
+          [disk_value | disk_acc]
+        }
+      end)
+
+    with {:ok, persisted_values} <-
+           BlobValue.maybe_externalize_many(
+             Map.get(state, :data_dir),
+             Map.get(state, :index, 0),
+             blob_side_channel_threshold(state),
+             Enum.reverse(disk_values_reversed)
+           ),
+         {:ok, persisted_entries} <-
+           attach_persisted_disk_entries(Enum.reverse(prepared_reversed), persisted_values) do
+      {:ok, persisted_entries}
     end
   end
+
+  defp attach_persisted_disk_entries(prepared, persisted_values),
+    do: attach_persisted_disk_entries(prepared, persisted_values, [])
+
+  defp attach_persisted_disk_entries(
+         [{compound_key, expire_at_ms} | prepared],
+         [persisted_value | persisted_values],
+         acc
+       ) do
+    attach_persisted_disk_entries(prepared, persisted_values, [
+      {compound_key, persisted_value, expire_at_ms} | acc
+    ])
+  end
+
+  defp attach_persisted_disk_entries([], [], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp attach_persisted_disk_entries(_prepared, _persisted_values, _acc),
+    do: {:error, :blob_externalize_result_mismatch}
 
   defp persisted_disk_value(state, value) do
     disk_value = ShardETS.to_disk_binary(value)

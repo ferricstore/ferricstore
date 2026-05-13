@@ -6,6 +6,7 @@ defmodule Ferricstore.Store.Shard.NativeOpsTest do
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.NativeOps
 
   test "forwarded compound result returns unknown outcome when local apply barrier times out" do
@@ -108,6 +109,67 @@ defmodule Ferricstore.Store.Shard.NativeOpsTest do
       assert {total_bytes, 0} = Map.fetch!(new_state.file_stats, 0)
       assert total_bytes == new_state.active_file_size
     after
+      :ets.delete(keydir)
+      File.rm_rf!(dir)
+    end
+  end
+
+  test "direct list batch put externalizes large values with one blob segment fsync" do
+    dir =
+      Path.join(System.tmp_dir!(), "native_ops_blob_batch_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+
+    keydir =
+      :ets.new(:"native_ops_blob_batch_#{System.unique_integer([:positive])}", [
+        :set,
+        :public
+      ])
+
+    active_file_path = Path.join(dir, "00000.log")
+    File.touch!(active_file_path)
+
+    state = %{
+      active_file_path: active_file_path,
+      active_file_id: 0,
+      data_dir: dir,
+      instance_ctx: %{
+        blob_side_channel_threshold_bytes: 128,
+        hot_cache_max_value_size: 4096
+      },
+      keydir: keydir,
+      index: 0,
+      shard_data_path: dir
+    }
+
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_fsync_file_hook, fn path ->
+      send(parent, {:blob_fsync_file, path})
+      Ferricstore.Bitcask.NIF.v2_fsync(path)
+    end)
+
+    try do
+      store = NativeOps.build_list_compound_store_direct("list", state)
+      first_key = CompoundKey.list_element("list", 0)
+      second_key = CompoundKey.list_element("list", 1_000_000_000)
+      first_payload = :binary.copy("A", 1024)
+      second_payload = :binary.copy("B", 1024)
+
+      assert :ok =
+               store.compound_batch_put.("list", [
+                 {first_key, first_payload, 0},
+                 {second_key, second_payload, 0}
+               ])
+
+      assert {:hit, ^first_payload, 0} = ShardETS.ets_lookup(state, first_key)
+      assert {:hit, ^second_payload, 0} = ShardETS.ets_lookup(state, second_key)
+
+      assert_receive {:blob_fsync_file, first_path}, 1000
+      refute_receive {:blob_fsync_file, _second_path}, 100
+      assert String.ends_with?(first_path, ".bloblog")
+    after
+      Process.delete(:ferricstore_blob_store_fsync_file_hook)
       :ets.delete(keydir)
       File.rm_rf!(dir)
     end
