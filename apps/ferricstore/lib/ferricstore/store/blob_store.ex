@@ -463,14 +463,26 @@ defmodule Ferricstore.Store.BlobStore do
       case File.open(segment.path, [:append, :raw, :binary]) do
         {:ok, io} ->
           try do
-            with {:ok, refs, iodata, next_offset} <-
-                   build_segment_records(payloads, segment.id, segment.start_offset),
-                 :ok <- write_file(io, iodata),
-                 :ok <- fsync_file(segment.path),
-                 :ok <-
-                   maybe_fsync_new_segment_dir(Path.dirname(segment.path), segment.file_existed?) do
-              cache_active_segment(data_dir, shard_index, segment.id, segment.path, next_offset)
-              {:ok, refs}
+            case build_segment_records(payloads, segment.id, segment.start_offset) do
+              {:ok, refs, iodata, next_offset} ->
+                case append_and_sync_segment(io, segment, shard_index, iodata) do
+                  :ok ->
+                    cache_active_segment(
+                      data_dir,
+                      shard_index,
+                      segment.id,
+                      segment.path,
+                      next_offset
+                    )
+
+                    {:ok, refs}
+
+                  {:error, _reason} = error ->
+                    error
+                end
+
+              {:error, _reason} = error ->
+                error
             end
           after
             :file.close(io)
@@ -482,6 +494,29 @@ defmodule Ferricstore.Store.BlobStore do
         {:error, reason} ->
           {:error, reason}
       end
+    end
+  end
+
+  defp append_and_sync_segment(io, segment, shard_index, iodata) do
+    with :ok <- write_file(io, iodata),
+         :ok <- fsync_file(segment.path),
+         :ok <- maybe_fsync_new_segment_dir(Path.dirname(segment.path), segment.file_existed?) do
+      :ok
+    else
+      {:error, _reason} = error ->
+        rollback_segment_append(io, segment.path, shard_index, segment.start_offset)
+        error
+    end
+  end
+
+  defp rollback_segment_append(io, path, shard_index, start_offset) do
+    with {:ok, _} <- :file.position(io, start_offset),
+         :ok <- :file.truncate(io) do
+      :ok
+    else
+      {:error, reason} ->
+        emit_error(:rollback_append, shard_index, path, blob_error_ref([]), reason)
+        {:error, reason}
     end
   end
 

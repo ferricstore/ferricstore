@@ -110,6 +110,34 @@ defmodule Ferricstore.Store.BlobStoreTest do
     refute_received :unexpected_blob_write
   end
 
+  test "put rolls back unacknowledged segment bytes when fsync fails", %{root: root} do
+    first_payload = :binary.copy("a", 512)
+    failed_payload = :binary.copy("b", 768)
+    next_payload = :binary.copy("c", 256)
+
+    assert {:ok, first_ref} = BlobStore.put(root, 0, first_payload)
+
+    assert {:ok, {segment_path, _first_offset, _first_size}} =
+             BlobStore.file_ref(root, 0, first_ref)
+
+    before_size = File.stat!(segment_path).size
+
+    Process.put(:ferricstore_blob_store_fsync_file_hook, fn ^segment_path ->
+      {:error, :test_fsync_failed}
+    end)
+
+    try do
+      assert {:error, :test_fsync_failed} = BlobStore.put(root, 0, failed_payload)
+      assert File.stat!(segment_path).size == before_size
+    after
+      Process.delete(:ferricstore_blob_store_fsync_file_hook)
+    end
+
+    assert {:ok, next_ref} = BlobStore.put(root, 0, next_payload)
+    assert next_ref.offset == before_size + 48
+    assert {:ok, ^next_payload} = BlobStore.get(root, 0, next_ref)
+  end
+
   test "file_ref rejects a segment ref whose header does not match", %{root: root} do
     payload_a = :binary.copy("a", 512)
     payload_b = :binary.copy("b", 512)
