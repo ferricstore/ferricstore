@@ -343,6 +343,9 @@ defmodule Ferricstore.Raft.StateMachine do
     * `{:cas, key, expected, new_value, ttl_ms}` -- Compare-and-swap. Reads the
       current value; if it matches `expected`, writes `new_value` with optional
       TTL. Returns `1` (swapped), `0` (mismatch), or `nil` (key missing/expired).
+    * `{:cas_blob_ref, key, expected, encoded_ref, ttl_ms}` -- CAS whose new
+      value was externalized before Ra submission. Validates the ref only after
+      the expected value matches.
     * `{:lock, key, owner, ttl_ms}` -- Distributed lock acquire. If the key does
       not exist, is expired, or is already held by the same owner, sets
       `{owner, ttl}`. Returns `:ok` or `{:error, reason}`.
@@ -895,6 +898,12 @@ defmodule Ferricstore.Raft.StateMachine do
 
   def apply(meta, {:cas, key, expected, new_value, ttl_ms}, state) do
     apply_pending_with_time(meta, state, fn -> do_cas(state, key, expected, new_value, ttl_ms) end)
+  end
+
+  def apply(meta, {:cas_blob_ref, key, expected, encoded_ref, ttl_ms}, state) do
+    apply_pending_with_time(meta, state, fn ->
+      do_cas_blob_ref(state, key, expected, encoded_ref, ttl_ms)
+    end)
   end
 
   def apply(meta, {:lock, key, owner, ttl_ms}, state) do
@@ -4022,6 +4031,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:cas, key, expected, new_value, ttl_ms}) do
     do_cas(state, key, expected, new_value, ttl_ms)
+  end
+
+  defp apply_single(state, {:cas_blob_ref, key, expected, encoded_ref, ttl_ms}) do
+    do_cas_blob_ref(state, key, expected, encoded_ref, ttl_ms, materialize_pending?: true)
   end
 
   defp apply_single(state, {:lock, key, owner, ttl_ms}) do
@@ -13135,6 +13148,34 @@ defmodule Ferricstore.Raft.StateMachine do
         nil
     end
   end
+
+  defp do_cas_blob_ref(state, key, expected, encoded_ref, expire_at_ms, apply_opts \\ [])
+
+  defp do_cas_blob_ref(state, key, expected, encoded_ref, expire_at_ms, apply_opts)
+       when is_binary(encoded_ref) do
+    case ets_lookup(state, key) do
+      {:hit, ^expected, old_exp} ->
+        expire = if expire_at_ms, do: expire_at_ms, else: old_exp
+
+        with {:ok, pending_value} <-
+               prepare_blob_ref_pending_value(state, encoded_ref, apply_opts) do
+          do_put_validated_blob_ref(state, key, encoded_ref, expire, pending_value)
+          1
+        end
+
+      {:hit, _other, _exp} ->
+        0
+
+      :expired ->
+        nil
+
+      :miss ->
+        nil
+    end
+  end
+
+  defp do_cas_blob_ref(_state, _key, _expected, _encoded_ref, _expire_at_ms, _apply_opts),
+    do: {:error, {:blob_ref_unavailable, :invalid_ref}}
 
   # ---------------------------------------------------------------------------
   # Private: distributed lock operations

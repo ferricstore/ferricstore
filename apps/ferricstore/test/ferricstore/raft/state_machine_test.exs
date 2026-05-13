@@ -3604,6 +3604,54 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert result == {:ok, ["old", {:ok, expected_size}]}
       assert [{^key, ^expected, 0, _lfu, _fid, _off, ^expected_size}] = :ets.lookup(ets, key)
     end
+
+    test "CAS blob ref stores the validated ref when expected value matches", %{
+      state: state,
+      ets: ets
+    } do
+      key = "cas_blob_ref_match"
+      payload = :binary.copy("blob-cas", 32)
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+      encoded_ref_size = byte_size(encoded_ref)
+      :ets.insert(ets, {key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")})
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:cas_blob_ref, key, "old", encoded_ref, nil}, state)
+
+      assert result == 1
+      assert [{^key, nil, 0, _lfu, _fid, _off, ^encoded_ref_size}] = :ets.lookup(ets, key)
+    end
+
+    test "CAS blob ref mismatch skips validation and preserves the old value", %{
+      state: state,
+      ets: ets
+    } do
+      key = "cas_blob_ref_mismatch"
+      missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+      :ets.insert(ets, {key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")})
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:cas_blob_ref, key, "other", missing_ref, nil}, state)
+
+      assert result == 0
+      assert [{^key, "old", 0, _lfu, 0, 0, 3}] = :ets.lookup(ets, key)
+    end
+
+    test "CAS blob ref preserves the old value when matching ref validation fails", %{
+      state: state,
+      ets: ets
+    } do
+      key = "cas_blob_ref_invalid"
+      missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+      :ets.insert(ets, {key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")})
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:cas_blob_ref, key, "old", missing_ref, nil}, state)
+
+      assert {:error, {:blob_ref_unavailable, :enoent}} = result
+      assert [{^key, "old", 0, _lfu, 0, 0, 3}] = :ets.lookup(ets, key)
+    end
   end
 
   describe "apply/3 with {:append, key, suffix}" do

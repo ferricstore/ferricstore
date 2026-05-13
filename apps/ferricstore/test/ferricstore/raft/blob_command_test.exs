@@ -76,6 +76,16 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert {:ok, ^patch} = BlobStore.get(root, 0, ref)
   end
 
+  test "prepares large cas as a pre-externalized blob ref", %{ctx: ctx, root: root} do
+    new_value = :binary.copy("C", 1024)
+
+    assert {:ok, {:cas_blob_ref, "k", "old", encoded_ref, nil}} =
+             BlobCommand.prepare(ctx, 0, {:cas, "k", "old", new_value, nil}, single_member?: true)
+
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, ^new_value} = BlobStore.get(root, 0, ref)
+  end
+
   test "prepares mixed put batch without duplicating small values", %{ctx: ctx, root: root} do
     payload = :binary.copy("B", 1024)
 
@@ -105,6 +115,7 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     getset_payload = :binary.copy("T", 1024)
     append_suffix = :binary.copy("A", 1024)
     setrange_patch = :binary.copy("R", 1024)
+    cas_value = :binary.copy("C", 1024)
     opts = %{nx: true, xx: false, get: false, keepttl: false}
 
     assert {:ok,
@@ -115,7 +126,8 @@ defmodule Ferricstore.Raft.BlobCommandTest do
                {:set_blob_ref, "s", set_encoded_ref, 0, ^opts},
                {:getset_blob_ref, "g", getset_encoded_ref},
                {:append_blob_ref, "a", append_encoded_ref},
-               {:setrange_blob_ref, "r", 4, setrange_encoded_ref}
+               {:setrange_blob_ref, "r", 4, setrange_encoded_ref},
+               {:cas_blob_ref, "c", "old", cas_encoded_ref, nil}
              ]}} =
              BlobCommand.prepare(
                ctx,
@@ -127,7 +139,8 @@ defmodule Ferricstore.Raft.BlobCommandTest do
                   {:set, "s", set_payload, 0, opts},
                   {:getset, "g", getset_payload},
                   {:append, "a", append_suffix},
-                  {:setrange, "r", 4, setrange_patch}
+                  {:setrange, "r", 4, setrange_patch},
+                  {:cas, "c", "old", cas_value, nil}
                 ]},
                single_member?: true
              )
@@ -137,11 +150,13 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert {:ok, getset_ref} = BlobRef.decode(getset_encoded_ref)
     assert {:ok, append_ref} = BlobRef.decode(append_encoded_ref)
     assert {:ok, setrange_ref} = BlobRef.decode(setrange_encoded_ref)
+    assert {:ok, cas_ref} = BlobRef.decode(cas_encoded_ref)
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
     assert {:ok, ^set_payload} = BlobStore.get(root, 0, set_ref)
     assert {:ok, ^getset_payload} = BlobStore.get(root, 0, getset_ref)
     assert {:ok, ^append_suffix} = BlobStore.get(root, 0, append_ref)
     assert {:ok, ^setrange_patch} = BlobStore.get(root, 0, setrange_ref)
+    assert {:ok, ^cas_value} = BlobStore.get(root, 0, cas_ref)
   end
 
   test "prepares generic Ra batches with one blob segment fsync", %{ctx: ctx, root: root} do
@@ -231,6 +246,11 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert BlobCommand.side_channel_candidate?(
              ctx,
              {:setrange, "large", 0, :binary.copy("R", 1024)}
+           )
+
+    assert BlobCommand.side_channel_candidate?(
+             ctx,
+             {:cas, "large", "old", :binary.copy("C", 1024), nil}
            )
 
     assert BlobCommand.side_channel_candidate?(
