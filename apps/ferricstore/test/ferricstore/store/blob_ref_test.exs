@@ -3,13 +3,13 @@ defmodule Ferricstore.Store.BlobRefTest do
 
   alias Ferricstore.Store.BlobRef
 
-  test "encodes a deterministic fixed-size content-addressed ref" do
+  test "encodes a deterministic legacy content-addressed ref" do
     payload = :binary.copy("payload", 100)
 
     ref = BlobRef.from_payload(payload)
     encoded = BlobRef.encode!(ref)
 
-    assert byte_size(encoded) == BlobRef.encoded_size()
+    assert BlobRef.encoded_size?(byte_size(encoded))
     assert BlobRef.ref?(encoded)
     assert {:ok, ^ref} = BlobRef.decode(encoded)
     assert BlobRef.verify_payload?(ref, payload)
@@ -17,6 +17,19 @@ defmodule Ferricstore.Store.BlobRefTest do
 
     assert ref == BlobRef.from_payload(payload)
     refute ref == BlobRef.from_payload(payload <> "!")
+  end
+
+  test "encodes a fixed-size append segment ref" do
+    payload = :binary.copy("payload", 100)
+
+    ref = BlobRef.from_segment(payload, 12, 4096)
+    encoded = BlobRef.encode!(ref)
+
+    assert byte_size(encoded) == BlobRef.encoded_size()
+    assert BlobRef.ref?(encoded)
+    assert {:ok, ^ref} = BlobRef.decode(encoded)
+    assert BlobRef.verify_payload?(ref, payload)
+    assert BlobRef.relative_path(ref) == Path.join(["segments", "00000000000000000012.bloblog"])
   end
 
   test "maps refs to canonical shard-local blob paths" do

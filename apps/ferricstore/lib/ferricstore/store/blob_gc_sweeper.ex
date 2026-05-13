@@ -1,13 +1,14 @@
 defmodule Ferricstore.Store.BlobGCSweeper do
   @moduledoc """
-  Periodic conservative garbage collection for large-value blob files.
+  Periodic conservative garbage collection for large-value blob storage.
 
-  Blob files are content-addressed and can be shared by multiple live records.
-  The sweeper therefore asks `Router.sweep_blob_garbage/1` to build the live
-  reference set from the shard keydirs before deleting unreferenced files. To
-  avoid scanning keydirs on idle systems, each tick first checks blob storage
-  stats and skips the expensive sweep when no complete or temporary blob files
-  exist.
+  The sweeper asks `Router.sweep_blob_garbage/1` to build the live reference
+  set from shard keydirs before deleting unreferenced legacy blob files and
+  stale tmp files. Append-segment records are retained until segment compaction
+  exists; the sweep is deliberately conservative so it never removes a segment
+  that may still contain a live payload. To avoid scanning keydirs on idle
+  systems, each tick first checks blob storage stats and skips the expensive
+  sweep when no reclaimable legacy blob files or temporary files exist.
   """
 
   use GenServer
@@ -19,7 +20,16 @@ defmodule Ferricstore.Store.BlobGCSweeper do
   @default_initial_delay_ms 60_000
   @default_interval_ms 600_000
 
-  @zero_stats %{files: 0, bytes: 0, tmp_files: 0, tmp_bytes: 0}
+  @zero_stats %{
+    files: 0,
+    bytes: 0,
+    legacy_files: 0,
+    legacy_bytes: 0,
+    segment_files: 0,
+    segment_bytes: 0,
+    tmp_files: 0,
+    tmp_bytes: 0
+  }
   @zero_gc %{deleted_files: 0, deleted_bytes: 0, kept_files: 0}
 
   def start_link(opts \\ []) do
@@ -149,13 +159,38 @@ defmodule Ferricstore.Store.BlobGCSweeper do
   defp sweep(_state), do: {:error, :no_default_instance}
 
   defp blob_work_present?(stats) do
-    Map.get(stats, :files, 0) > 0 or Map.get(stats, :tmp_files, 0) > 0
+    legacy_files =
+      if Map.has_key?(stats, :legacy_files) do
+        Map.get(stats, :legacy_files, 0)
+      else
+        Map.get(stats, :files, 0)
+      end
+
+    legacy_files > 0 or Map.get(stats, :tmp_files, 0) > 0
   end
 
   defp normalize_stats(stats) do
+    legacy_files =
+      if Map.has_key?(stats, :legacy_files) do
+        Map.get(stats, :legacy_files, 0)
+      else
+        Map.get(stats, :files, 0)
+      end
+
+    legacy_bytes =
+      if Map.has_key?(stats, :legacy_bytes) do
+        Map.get(stats, :legacy_bytes, 0)
+      else
+        Map.get(stats, :bytes, 0)
+      end
+
     %{
       files: Map.get(stats, :files, 0),
       bytes: Map.get(stats, :bytes, 0),
+      legacy_files: legacy_files,
+      legacy_bytes: legacy_bytes,
+      segment_files: Map.get(stats, :segment_files, 0),
+      segment_bytes: Map.get(stats, :segment_bytes, 0),
       tmp_files: Map.get(stats, :tmp_files, 0),
       tmp_bytes: Map.get(stats, :tmp_bytes, 0)
     }

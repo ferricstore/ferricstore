@@ -12,35 +12,95 @@ defmodule Ferricstore.Store.BlobStoreTest do
     %{root: root}
   end
 
-  test "put writes a content-addressed blob and returns a small ref", %{root: root} do
+  test "put appends a blob segment record and returns a small ref", %{root: root} do
     payload = :binary.copy("abc", 1024)
 
     assert {:ok, ref} = BlobStore.put(root, 0, payload)
     encoded = BlobRef.encode!(ref)
 
     assert byte_size(encoded) == BlobRef.encoded_size()
-    assert File.read!(BlobRef.path(root, 0, ref)) == payload
+    assert %{version: 2, segment_id: 0, offset: offset} = ref
+    assert offset > 0
+    assert {:ok, {segment_path, ^offset, size}} = BlobStore.file_ref(root, 0, ref)
+    assert size == byte_size(payload)
+    assert Path.basename(segment_path) == "00000000000000000000.bloblog"
+
+    assert [] ==
+             Path.wildcard(Path.join(Ferricstore.DataDir.blob_shard_path(root, 0), "**/*.blob"))
+
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
     assert [] == tmp_files(root, 0)
   end
 
-  test "put is idempotent for the same payload", %{root: root} do
-    payload = "dedupe-me"
+  test "put_many appends a batch to the same segment with one file fsync", %{root: root} do
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_fsync_file_hook, fn path ->
+      send(parent, {:blob_fsync_file, path})
+      :ok
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_fsync_file_hook) end)
+
+    payloads = [
+      :binary.copy("a", 512),
+      :binary.copy("b", 768),
+      :binary.copy("c", 1024)
+    ]
+
+    assert {:ok, refs} = BlobStore.put_many(root, 0, payloads)
+    assert length(refs) == length(payloads)
+
+    file_refs = Enum.map(refs, &BlobStore.file_ref(root, 0, &1))
+    assert Enum.all?(file_refs, &match?({:ok, {_path, _offset, _size}}, &1))
+
+    paths =
+      Enum.map(file_refs, fn {:ok, {path, _offset, _size}} -> path end)
+      |> Enum.uniq()
+
+    assert [segment_path] = paths
+    assert_received {:blob_fsync_file, ^segment_path}
+    refute_received {:blob_fsync_file, _}
+
+    assert Enum.zip(payloads, refs)
+           |> Enum.all?(fn {payload, ref} ->
+             BlobStore.get(root, 0, ref) == {:ok, payload}
+           end)
+  end
+
+  test "recover_shard truncates a partial segment tail and preserves prior blobs", %{root: root} do
+    payload = :binary.copy("safe", 256)
 
     assert {:ok, ref} = BlobStore.put(root, 0, payload)
-    path = BlobRef.path(root, 0, ref)
-    assert {:ok, %{mtime: first_mtime}} = File.stat(path)
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
 
-    assert {:ok, ^ref} = BlobStore.put(root, 0, payload)
-    assert {:ok, %{mtime: second_mtime}} = File.stat(path)
+    File.write!(segment_path, "partial-tail", [:append, :binary])
+    dirty_size = File.stat!(segment_path).size
 
-    assert first_mtime == second_mtime
+    assert {:ok, %{truncated_segments: 1, truncated_bytes: 12}} =
+             BlobStore.recover_shard(root, 0)
+
+    assert File.stat!(segment_path).size == dirty_size - 12
+    assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
+  end
+
+  test "put appends duplicate payloads without creating per-value files", %{root: root} do
+    payload = "dedupe-me"
+
+    assert {:ok, first_ref} = BlobStore.put(root, 0, payload)
+    assert {:ok, second_ref} = BlobStore.put(root, 0, payload)
+
+    assert first_ref.checksum == second_ref.checksum
+    assert first_ref.offset != second_ref.offset
+    assert {:ok, ^payload} = BlobStore.get(root, 0, first_ref)
+    assert {:ok, ^payload} = BlobStore.get(root, 0, second_ref)
     assert count_regular_files(Ferricstore.DataDir.blob_shard_path(root, 0)) == 1
   end
 
-  test "put fsyncs checksum-prefix parent only when creating that directory", %{root: root} do
+  test "put fsyncs segment parent only when creating segment storage", %{root: root} do
     parent = self()
-    {first_payload, second_payload} = same_prefix_payloads()
+    first_payload = "segment-parent-a"
+    second_payload = "segment-parent-b"
 
     Process.put(:ferricstore_blob_store_fsync_dir_hook, fn path ->
       send(parent, {:blob_fsync_dir, path})
@@ -61,41 +121,36 @@ defmodule Ferricstore.Store.BlobStoreTest do
     second_dir = Path.dirname(BlobRef.path(root, 0, second_ref))
 
     assert second_dir == first_dir
-    assert_received {:blob_fsync_dir, ^second_dir}
     refute_received {:blob_fsync_dir, ^shard_blob_dir}
     refute_received {:blob_fsync_dir, _}
   end
 
-  test "put replaces an incomplete existing blob", %{root: root} do
+  test "legacy content-addressed refs remain readable", %{root: root} do
     payload = "complete-payload"
     ref = BlobRef.from_payload(payload)
-    path = BlobRef.path(root, 0, ref)
 
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, "partial")
+    write_legacy_blob!(root, 0, ref, payload)
 
-    assert {:ok, ^ref} = BlobStore.put(root, 0, payload)
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
+    assert {:ok, {path, 0, 16}} = BlobStore.file_ref(root, 0, ref)
+    assert path == BlobRef.path(root, 0, ref)
   end
 
-  test "put replaces same-size corrupt existing blob", %{root: root} do
+  test "legacy content-addressed corrupt refs are rejected", %{root: root} do
     payload = "complete-payload"
     ref = BlobRef.from_payload(payload)
-    path = BlobRef.path(root, 0, ref)
 
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, :binary.copy("x", byte_size(payload)))
+    write_legacy_blob!(root, 0, ref, :binary.copy("x", byte_size(payload)))
 
-    assert {:ok, ^ref} = BlobStore.put(root, 0, payload)
-    assert File.read!(path) == payload
-    assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
+    assert {:error, :checksum_mismatch} = BlobStore.get(root, 0, ref)
+    assert {:error, :checksum_mismatch} = BlobStore.verify(root, 0, ref)
   end
 
   test "get detects same-size corrupt blob bytes", %{root: root} do
     payload = "correct"
 
     assert {:ok, ref} = BlobStore.put(root, 0, payload)
-    File.write!(BlobRef.path(root, 0, ref), "corrupt")
+    overwrite_segment_payload!(root, 0, ref, "corrupt")
 
     assert {:error, :checksum_mismatch} = BlobStore.get(root, 0, ref)
   end
@@ -117,7 +172,7 @@ defmodule Ferricstore.Store.BlobStoreTest do
 
     assert {:ok, ref} = BlobStore.put(root, 0, "correct")
     path = BlobRef.path(root, 0, ref)
-    File.write!(path, "corrupt")
+    overwrite_segment_payload!(root, 0, ref, "corrupt")
 
     assert {:error, :checksum_mismatch} = BlobStore.get(root, 0, ref)
 
@@ -130,9 +185,10 @@ defmodule Ferricstore.Store.BlobStoreTest do
 
     assert {:ok, ref} = BlobStore.put(root, 0, payload)
     path = BlobRef.path(root, 0, ref)
-    File.write!(path, "corrupt")
+    overwrite_segment_payload!(root, 0, ref, "corrupt")
 
-    assert {:ok, {^path, 0, 7}} = BlobStore.file_ref(root, 0, ref)
+    assert {:ok, {^path, offset, 7}} = BlobStore.file_ref(root, 0, ref)
+    assert offset == ref.offset
     assert {:error, :checksum_mismatch} = BlobStore.get(root, 0, ref)
   end
 
@@ -142,9 +198,21 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:ok, ref} = BlobStore.put(root, 0, payload)
     assert :ok = BlobStore.verify(root, 0, ref)
 
-    File.write!(BlobRef.path(root, 0, ref), "corrupt")
+    overwrite_segment_payload!(root, 0, ref, "corrupt")
 
     assert {:error, :checksum_mismatch} = BlobStore.verify(root, 0, ref)
+  end
+
+  test "get and verify reject corrupt segment headers even when payload bytes match", %{
+    root: root
+  } do
+    payload = "correct"
+
+    assert {:ok, ref} = BlobStore.put(root, 0, payload)
+    overwrite_segment_header!(root, 0, ref, :binary.copy(<<0>>, 48))
+
+    assert {:error, :segment_header_mismatch} = BlobStore.get(root, 0, ref)
+    assert {:error, :segment_header_mismatch} = BlobStore.verify(root, 0, ref)
   end
 
   test "file_ref emits blob error telemetry when the blob file is missing", %{root: root} do
@@ -176,16 +244,19 @@ defmodule Ferricstore.Store.BlobStoreTest do
     payload = "correct"
 
     assert {:ok, ref} = BlobStore.put(root, 0, payload)
-    File.write!(BlobRef.path(root, 0, ref), "short")
+    truncate_segment_payload!(root, 0, ref, 5)
 
     assert {:error, :size_mismatch} = BlobStore.get(root, 0, ref)
   end
 
   test "sweep_unreferenced deletes only blobs absent from the live ref set", %{root: root} do
-    assert {:ok, live_ref} = BlobStore.put(root, 0, "live-payload")
-    assert {:ok, dead_ref} = BlobStore.put(root, 0, "dead-payload")
+    live_ref = BlobRef.from_payload("live-payload")
+    dead_ref = BlobRef.from_payload("dead-payload")
     live_path = BlobRef.path(root, 0, live_ref)
     dead_path = BlobRef.path(root, 0, dead_ref)
+
+    write_legacy_blob!(root, 0, live_ref, "live-payload")
+    write_legacy_blob!(root, 0, dead_ref, "dead-payload")
 
     assert {:ok, %{deleted_files: 1, deleted_bytes: 12, kept_files: 1}} =
              BlobStore.sweep_unreferenced(root, 0, MapSet.new([live_ref]))
@@ -239,17 +310,49 @@ defmodule Ferricstore.Store.BlobStoreTest do
     |> Enum.count(&File.regular?/1)
   end
 
-  defp same_prefix_payloads do
-    Stream.iterate(0, &(&1 + 1))
-    |> Enum.reduce_while(%{}, fn n, seen ->
-      payload = "blob-prefix-payload-#{n}"
-      ref = BlobRef.from_payload(payload)
-      prefix = binary_part(Base.encode16(ref.checksum, case: :lower), 0, 2)
+  defp write_legacy_blob!(root, shard_index, ref, payload) do
+    path = BlobRef.path(root, shard_index, ref)
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, payload)
+  end
 
-      case Map.fetch(seen, prefix) do
-        {:ok, previous} -> {:halt, {previous, payload}}
-        :error -> {:cont, Map.put(seen, prefix, payload)}
-      end
-    end)
+  defp overwrite_segment_payload!(root, shard_index, ref, payload) do
+    assert {:ok, {path, offset, size}} = BlobStore.file_ref(root, shard_index, ref)
+    assert byte_size(payload) == size
+
+    {:ok, io} = File.open(path, [:read, :write, :raw, :binary])
+
+    try do
+      assert :ok = :file.pwrite(io, offset, payload)
+    after
+      :file.close(io)
+    end
+  end
+
+  defp overwrite_segment_header!(root, shard_index, ref, header) do
+    assert {:ok, {path, offset, _size}} = BlobStore.file_ref(root, shard_index, ref)
+    assert byte_size(header) == 48
+
+    {:ok, io} = File.open(path, [:read, :write, :raw, :binary])
+
+    try do
+      assert :ok = :file.pwrite(io, offset - 48, header)
+    after
+      :file.close(io)
+    end
+  end
+
+  defp truncate_segment_payload!(root, shard_index, ref, keep_bytes) do
+    assert {:ok, {path, offset, size}} = BlobStore.file_ref(root, shard_index, ref)
+    assert keep_bytes < size
+
+    {:ok, io} = File.open(path, [:read, :write, :raw, :binary])
+
+    try do
+      assert {:ok, _} = :file.position(io, offset + keep_bytes)
+      assert :ok = :file.truncate(io)
+    after
+      :file.close(io)
+    end
   end
 end

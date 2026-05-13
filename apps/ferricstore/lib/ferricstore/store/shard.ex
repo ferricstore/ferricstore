@@ -2218,7 +2218,7 @@ defmodule Ferricstore.Store.Shard do
       true ->
         refs = maybe_add_blob_ref(refs, value)
 
-        if value_size == BlobRef.encoded_size() and valid_blob_gc_location?(fid, offset) do
+        if BlobRef.encoded_size?(value_size) and valid_blob_gc_location?(fid, offset) do
           collect_disk_blob_ref(state, key, fid, offset, refs)
         else
           {:ok, refs}

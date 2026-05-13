@@ -142,13 +142,16 @@ Most Redis client libraries support pipelining natively (e.g., `Redix.pipeline/2
 
 ## Size Your Values for the Hot Cache
 
-FerricStore keeps values in ETS (hot cache) only if they're smaller than `hot_cache_max_value_size` (default: 64KB). Larger values are stored cold — reads go to disk via Bitcask. Values at or above `blob_side_channel_threshold_bytes` (default: 256KB) are stored as content-addressed blob files with a small Bitcask reference.
+FerricStore keeps values in ETS (hot cache) only if they're smaller than `hot_cache_max_value_size` (default: 64KB). Larger values are stored cold — reads go to disk via Bitcask. Values at or above `blob_side_channel_threshold_bytes` (default: 256KB) are stored in per-shard append blob segments with a small Bitcask reference.
 
 Expired or overwritten large values become eligible for blob cleanup when their
 live Bitcask reference disappears. The automatic blob GC sweeper is enabled by
-default and runs conservatively: it first checks whether blob files exist, then
-builds the live reference set from the shard keydir before deleting unreferenced
-blob files. `FERRICSTORE.BLOBGC` can be used to force the same cleanup manually.
+default and runs conservatively: it first checks whether reclaimable legacy blob
+files or stale tmp files exist, then builds the live reference set from the
+shard keydir before deleting unreferenced legacy blob files. Append-segment
+record compaction is a separate maintenance path, so segment bytes are retained
+until that compactor rewrites live records. `FERRICSTORE.BLOBGC` can be used to
+force the same cleanup manually.
 
 If your values are consistently larger than this threshold, reads always hit disk. Consider:
 - Splitting large values into smaller fields (use Hash commands)

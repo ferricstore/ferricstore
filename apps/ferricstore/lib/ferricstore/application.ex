@@ -827,7 +827,7 @@ defmodule Ferricstore.Application do
     is_map(ctx) and is_binary(Map.get(ctx, :data_dir)) and
       Ferricstore.Store.BlobValue.threshold(ctx) > 0 and
       is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 and
-      vsize == Ferricstore.Store.BlobRef.encoded_size()
+      Ferricstore.Store.BlobRef.encoded_size?(vsize)
   end
 
   # Runs the large value check and emits a warning + telemetry if any are found.

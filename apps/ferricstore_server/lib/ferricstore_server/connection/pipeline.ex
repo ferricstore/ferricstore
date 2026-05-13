@@ -1382,7 +1382,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
     do: file_ref
 
   defp response_entry(
-         {:file_range, _args, _key, _start_idx, _end_idx, _path, _offset, _size} = file_range
+         {:file_range, _args, _key, _start_idx, _end_idx, _path, _offset, _size, _validator} =
+           file_range
        ),
        do: file_range
 
@@ -1394,7 +1395,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp streaming_response?({:file_ref, _key, _lookup_key, _path, _offset, _size}), do: true
 
   defp streaming_response?(
-         {:file_range, _args, _key, _start_idx, _end_idx, _path, _offset, _size}
+         {:file_range, _args, _key, _start_idx, _end_idx, _path, _offset, _size, _validator}
        ),
        do: true
 
@@ -1429,8 +1430,9 @@ defmodule FerricstoreServer.Connection.Pipeline do
             {:halt, {:quit, acc_state}}
         end
 
-      {:file_range, args, key, start_idx, end_idx, path, offset, size}, {:continue, acc_state} ->
-        case ConnSendfile.send_file_range_response(args, path, offset, size, acc_state) do
+      {:file_range, args, key, start_idx, end_idx, path, offset, size, validator},
+      {:continue, acc_state} ->
+        case ConnSendfile.send_file_range_response(args, path, offset, size, validator, acc_state) do
           {:sent, new_state} ->
             {:cont, {:continue, new_state}}
 

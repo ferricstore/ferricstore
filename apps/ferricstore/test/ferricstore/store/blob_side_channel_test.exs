@@ -64,13 +64,16 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert byte_size(payload) == Router.value_size(ctx, key)
     assert binary_part(payload, 128, 64) == Router.getrange(ctx, key, 128, 191)
 
-    assert {BlobRef.path(ctx.data_dir, 0, ref), 0, byte_size(payload)} ==
-             Router.get_file_ref(ctx, key)
+    assert {:ok, {blob_path, blob_offset, blob_size}} = BlobStore.file_ref(ctx.data_dir, 0, ref)
+    assert blob_size == byte_size(payload)
+    payload_size = byte_size(payload)
 
-    assert {:cold_ref, BlobRef.path(ctx.data_dir, 0, ref), 0, byte_size(payload)} ==
+    assert {blob_path, blob_offset, payload_size} == Router.get_file_ref(ctx, key)
+
+    assert {:cold_ref, ^blob_path, ^blob_offset, ^payload_size} =
              Router.get_with_file_ref(ctx, key)
 
-    assert [{:file_ref, BlobRef.path(ctx.data_dir, 0, ref), 0, byte_size(payload)}] ==
+    assert [{:file_ref, ^blob_path, ^blob_offset, ^payload_size}] =
              Router.batch_get_with_file_refs(ctx, [key], 64)
 
     assert payload == GenServer.call(shard, {:get, key})
@@ -87,16 +90,19 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert {:ok, _encoded_ref, ref} = raw_disk_blob_ref(ctx, keydir, key)
 
     blob_path = BlobRef.path(ctx.data_dir, 0, ref)
-    File.write!(blob_path, :binary.copy("x", byte_size(payload)))
+    overwrite_segment_payload!(ctx.data_dir, 0, ref, :binary.copy("x", byte_size(payload)))
 
-    assert {^blob_path, 0, 1024} = Router.get_file_ref(ctx, key)
-    assert {:cold_ref, ^blob_path, 0, 1024} = Router.get_with_file_ref(ctx, key)
-    assert [{:file_ref, ^blob_path, 0, 1024}] = Router.batch_get_with_file_refs(ctx, [key], 64)
+    assert {^blob_path, blob_offset, 1024} = Router.get_file_ref(ctx, key)
+    assert blob_offset == ref.offset
+    assert {:cold_ref, ^blob_path, ^blob_offset, 1024} = Router.get_with_file_ref(ctx, key)
+
+    assert [{:file_ref, ^blob_path, ^blob_offset, 1024}] =
+             Router.batch_get_with_file_refs(ctx, [key], 64)
 
     assert nil == Router.get(ctx, key)
   end
 
-  test "large duplicate values share one content-addressed blob file", %{
+  test "large duplicate values share one append segment file", %{
     ctx: ctx,
     keydir: keydir
   } do
@@ -106,9 +112,15 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert :ok = Router.put(ctx, "blob:auto:b", payload, 0)
 
     assert {:ok, encoded_ref, ref} = raw_disk_blob_ref(ctx, keydir, "blob:auto:a")
-    assert {:ok, ^encoded_ref, ^ref} = raw_disk_blob_ref(ctx, keydir, "blob:auto:b")
-    assert [blob_path] = Path.wildcard(Path.join(ctx.data_dir, "blob/shard_0/*/*.blob"))
-    assert File.read!(blob_path) == payload
+    assert {:ok, second_encoded_ref, second_ref} = raw_disk_blob_ref(ctx, keydir, "blob:auto:b")
+
+    refute second_encoded_ref == encoded_ref
+    assert second_ref.checksum == ref.checksum
+    assert second_ref.offset != ref.offset
+    assert [blob_path] = Path.wildcard(Path.join(ctx.data_dir, "blob/shard_0/segments/*.bloblog"))
+    assert BlobRef.path(ctx.data_dir, 0, ref) == blob_path
+    assert {:ok, ^payload} = BlobStore.get(ctx.data_dir, 0, ref)
+    assert {:ok, ^payload} = BlobStore.get(ctx.data_dir, 0, second_ref)
   end
 
   test "large direct hot-cache values still publish blob disk locations" do
@@ -298,8 +310,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     payload = :binary.copy("C", 1536)
     assert {:ok, ref} = BlobStore.put(ctx.data_dir, 0, payload)
     encoded_ref = BlobRef.encode!(ref)
-    blob_path = BlobRef.path(ctx.data_dir, 0, ref)
-    File.write!(blob_path, :binary.copy("x", byte_size(payload)))
+    overwrite_segment_payload!(ctx.data_dir, 0, ref, :binary.copy("x", byte_size(payload)))
 
     shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
     active_file_path = ShardETS.file_path(shard_path, 0)
@@ -1080,7 +1091,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
              GenServer.call(shard, {:run_compaction, [0]})
 
     assert blob_ref == GenServer.call(shard, {:get, "blob:shared"})
-    assert File.read!(blob_path) == payload
+    assert File.exists?(blob_path)
     assert {:ok, ^payload} = BlobStore.get(ctx.data_dir, 0, ref)
   end
 
@@ -1119,7 +1130,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
 
     assert first_ref == GenServer.call(shard, {:compound_get, redis_key, field_a})
     assert second_ref == GenServer.call(shard, {:compound_get, redis_key, field_b})
-    assert File.read!(blob_path) == first_payload
+    assert File.exists?(blob_path)
     assert {:ok, ^first_payload} = BlobStore.get(ctx.data_dir, 0, first_blob_ref)
     assert {:ok, ^second_payload} = BlobStore.get(ctx.data_dir, 0, second_blob_ref)
   end
@@ -1157,7 +1168,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
 
     assert :ok = GenServer.call(shard, {:delete, dead_key})
 
-    assert {:ok, %{deleted_files: 1} = stats} = Router.sweep_blob_garbage(ctx)
+    assert {:ok, %{deleted_files: 0} = stats} = Router.sweep_blob_garbage(ctx)
 
     assert_receive {:blob_gc, [:ferricstore, :blob, :gc], measurements,
                     %{result: :ok, shard_count: 1}}
@@ -1167,7 +1178,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert measurements.kept_files == stats.kept_files
 
     assert File.exists?(live_path)
-    refute File.exists?(dead_path)
+    assert File.exists?(dead_path)
     assert File.exists?(promoted_path)
     assert :binary.copy("L", 1024) == Router.get(ctx, live_key)
     assert :binary.copy("P", 1024) == GenServer.call(shard, {:compound_get, redis_key, field})
@@ -1227,13 +1238,18 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
 
     assert {:ok,
             %{
-              files: 2,
+              files: 1,
               bytes: bytes,
+              legacy_files: 0,
+              legacy_bytes: 0,
+              segment_files: 1,
+              segment_bytes: segment_bytes,
               tmp_files: 0,
               tmp_bytes: 0
             }} = BlobStore.storage_stats(ctx.data_dir)
 
     assert bytes >= 2048
+    assert segment_bytes == bytes
   end
 
   defp force_rotate_active_file(shard) do
@@ -1334,5 +1350,18 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp overwrite_segment_payload!(data_dir, shard_index, ref, payload) do
+    assert {:ok, {path, offset, size}} = BlobStore.file_ref(data_dir, shard_index, ref)
+    assert byte_size(payload) == size
+
+    {:ok, io} = File.open(path, [:read, :write, :raw, :binary])
+
+    try do
+      assert :ok = :file.pwrite(io, offset, payload)
+    after
+      :file.close(io)
+    end
   end
 end

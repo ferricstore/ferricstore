@@ -42,6 +42,46 @@ defmodule Ferricstore.Store.BlobGCSweeperTest do
     assert %{last_sweep: %{status: :skipped, files: 0, tmp_files: 0}} = BlobGCSweeper.info(name)
   end
 
+  test "skips expensive GC when only append segment files exist" do
+    parent = self()
+    name = :"blob_gc_sweeper_segment_skip_#{System.unique_integer([:positive])}"
+
+    pid =
+      start_supervised!(
+        {BlobGCSweeper,
+         name: name,
+         initial_delay_ms: 60_000,
+         interval_ms: 60_000,
+         stats_fun: fn ->
+           send(parent, :blob_gc_stats_called)
+
+           {:ok,
+            %{
+              files: 1,
+              bytes: 4096,
+              legacy_files: 0,
+              legacy_bytes: 0,
+              segment_files: 1,
+              segment_bytes: 4096,
+              tmp_files: 0,
+              tmp_bytes: 0
+            }}
+         end,
+         sweep_fun: fn ->
+           send(parent, :blob_gc_sweep_called)
+           {:ok, %{deleted_files: 0, deleted_bytes: 0, kept_files: 0}}
+         end}
+      )
+
+    send(pid, :sweep)
+
+    assert_receive :blob_gc_stats_called, 1_000
+    refute_receive :blob_gc_sweep_called, 100
+
+    assert %{last_sweep: %{status: :skipped, files: 1, segment_files: 1}} =
+             BlobGCSweeper.info(name)
+  end
+
   test "runs conservative GC automatically when blob files exist" do
     parent = self()
     name = :"blob_gc_sweeper_run_#{System.unique_integer([:positive])}"

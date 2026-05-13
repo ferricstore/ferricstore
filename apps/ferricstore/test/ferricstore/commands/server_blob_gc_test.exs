@@ -18,7 +18,7 @@ defmodule Ferricstore.Commands.ServerBlobGCTest do
     %{ctx: ctx, store: %{instance_ctx: ctx}}
   end
 
-  test "FERRICSTORE.BLOBGC sweeps unreferenced blob files and returns stats", %{
+  test "FERRICSTORE.BLOBGC preserves append segment records until segment compaction", %{
     ctx: ctx,
     store: store
   } do
@@ -26,12 +26,12 @@ defmodule Ferricstore.Commands.ServerBlobGCTest do
     payload = :binary.copy("G", 1024)
 
     assert :ok = Router.put(ctx, key, payload, 0)
-    assert blob_file_count(ctx) == 1
+    assert blob_segment_file_count(ctx) == 1
     assert :ok = Router.delete(ctx, key)
 
     assert [
              "deleted_files",
-             1,
+             0,
              "deleted_bytes",
              deleted_bytes,
              "kept_files",
@@ -42,8 +42,8 @@ defmodule Ferricstore.Commands.ServerBlobGCTest do
              0
            ] = Server.handle("FERRICSTORE.BLOBGC", [], store)
 
-    assert deleted_bytes >= byte_size(payload)
-    assert blob_file_count(ctx) == 0
+    assert deleted_bytes == 0
+    assert blob_segment_file_count(ctx) == 1
   end
 
   test "FERRICSTORE.BLOBGC rejects arguments", %{store: store} do
@@ -66,8 +66,8 @@ defmodule Ferricstore.Commands.ServerBlobGCTest do
            ] = Dispatcher.dispatch("FERRICSTORE.BLOBGC", [], store)
   end
 
-  defp blob_file_count(ctx) do
-    Path.join([ctx.data_dir, "blob", "shard_*", "*", "*.blob"])
+  defp blob_segment_file_count(ctx) do
+    Path.join([ctx.data_dir, "blob", "shard_*", "segments", "*.bloblog"])
     |> Path.wildcard()
     |> length()
   end

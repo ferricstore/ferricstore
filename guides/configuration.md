@@ -53,10 +53,10 @@ config :ferricstore, :health_port, 4000
 | `:data_dir` | `string` | `"data"` | Both | Root directory for Bitcask data files, Raft WAL, mmap structures, and hint files. Each shard gets a subdirectory. |
 | `:shard_count` | `integer` | `0` (auto) | Both | Number of shards. `0` = auto-detect via `System.schedulers_online()`. Each shard is a separate ETS table, Bitcask directory, and Raft group. More shards = more write parallelism but more file descriptors. Set at startup. |
 | `:hot_cache_max_value_size` | `integer` | `65_536` | Both | Maximum value size (bytes) stored in ETS hot cache. Values larger than this are stored as `nil` in ETS and read from Bitcask on access. Prevents large binaries from being copied on every ETS lookup. |
-| `:blob_side_channel_threshold_bytes` | `integer` | `262_144` | Both | Values at or above this size are stored as content-addressed blob files with a small Bitcask reference. `0` disables the blob side channel. |
-| `:blob_gc_sweeper_enabled` | `boolean` | `true` | Both | Enables automatic conservative cleanup of unreferenced side-channel blob files. |
+| `:blob_side_channel_threshold_bytes` | `integer` | `262_144` | Both | Values at or above this size are stored in per-shard append blob segments with a small Bitcask reference. `0` disables the blob side channel. |
+| `:blob_gc_sweeper_enabled` | `boolean` | `true` | Both | Enables automatic conservative cleanup of stale tmp and legacy side-channel blob files. Append-segment record compaction is a separate maintenance path. |
 | `:blob_gc_sweeper_initial_delay_ms` | `integer` | `60_000` | Both | Delay before the first automatic blob GC sweep. |
-| `:blob_gc_sweeper_interval_ms` | `integer` | `600_000` | Both | Interval between automatic blob GC sweeps. Each tick first checks blob storage stats and skips the keydir scan when no blob files exist. |
+| `:blob_gc_sweeper_interval_ms` | `integer` | `600_000` | Both | Interval between automatic blob GC sweeps. Each tick first checks blob storage stats and skips the keydir scan when no reclaimable legacy blob files or tmp files exist. |
 | `:max_active_file_size` | `integer` | `8_589_934_592` | Both | Maximum Bitcask active file size before rotation. Larger defaults reduce high-throughput rollover tail latency; lower this if reclaim granularity is more important than p99 write latency. |
 
 ```elixir
@@ -716,8 +716,8 @@ These environment variables are read from `config/runtime.exs` in production (`M
 | `FERRICSTORE_EVICTION_POLICY` | `volatile_lru` | Eviction policy when memory limit reached |
 | `FERRICSTORE_MAX_VALUE_SIZE` | `1048576` (1MB) | Max value size in bytes |
 | `FERRICSTORE_HOT_CACHE_MAX_VALUE_SIZE` | `65536` (64KB) | Values larger than this are stored cold (disk only) |
-| `FERRICSTORE_BLOB_SIDE_CHANNEL_THRESHOLD_BYTES` | `262144` (256KB) | Values at or above this size use blob side-channel storage. `0` disables it. |
-| `FERRICSTORE_BLOB_GC_SWEEPER_ENABLED` | `true` | Enables automatic conservative cleanup of unreferenced blob files. |
+| `FERRICSTORE_BLOB_SIDE_CHANNEL_THRESHOLD_BYTES` | `262144` (256KB) | Values at or above this size use append-segment blob side-channel storage. `0` disables it. |
+| `FERRICSTORE_BLOB_GC_SWEEPER_ENABLED` | `true` | Enables automatic conservative cleanup of stale tmp and legacy blob files. |
 | `FERRICSTORE_BLOB_GC_SWEEPER_INITIAL_DELAY_MS` | `60000` | Delay before the first automatic blob GC sweep. |
 | `FERRICSTORE_BLOB_GC_SWEEPER_INTERVAL_MS` | `600000` | Interval between automatic blob GC sweeps. |
 | `FERRICSTORE_MEMORY_GUARD_INTERVAL_MS` | `5000` | Memory pressure check interval |

@@ -30,10 +30,10 @@ config :ferricstore, :lfu_log_factor, 10
 # over plain TCP (:ranch_tcp); TLS and hot keys always use the normal path.
 config :ferricstore_server, :sendfile_threshold, 65_536
 
-# Large values at or above this size are stored as content-addressed blob files
-# with a small Bitcask reference. A conservative sweeper reclaims unreferenced
-# blob files automatically; the common no-blob tick only scans blob file names,
-# not the full keydir.
+# Large values at or above this size are stored in per-shard append blob
+# segments with a small Bitcask reference. A conservative sweeper cleans stale
+# tmp/legacy blob files; append-segment record compaction is intentionally a
+# separate storage-maintenance step.
 config :ferricstore,
   blob_side_channel_threshold_bytes: 256 * 1024,
   blob_gc_sweeper_enabled: true,

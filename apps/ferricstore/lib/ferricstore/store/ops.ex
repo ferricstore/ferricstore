@@ -1668,7 +1668,7 @@ defmodule Ferricstore.Store.Ops do
   end
 
   defp local_cold_value_size(tx, key, fid, off, vsize) do
-    if BlobValue.threshold(tx.instance_ctx) > 0 and vsize == BlobRef.encoded_size() do
+    if BlobValue.threshold(tx.instance_ctx) > 0 and BlobRef.encoded_size?(vsize) do
       path = ShardETS.file_path(tx.shard_state.shard_data_path, fid)
 
       case ColdRead.pread_at(path, off, key, @cold_read_timeout_ms) do

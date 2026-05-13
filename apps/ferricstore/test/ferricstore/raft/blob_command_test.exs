@@ -29,7 +29,7 @@ defmodule Ferricstore.Raft.BlobCommandTest do
              BlobCommand.prepare(ctx, 0, {:put, "k", payload, 0}, single_member?: true)
 
     assert {:ok, ref} = BlobRef.decode(encoded_ref)
-    assert File.read!(BlobRef.path(root, 0, ref)) == payload
+    assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
   end
 
   test "prepares mixed put batch without duplicating small values", %{ctx: ctx, root: root} do
@@ -49,7 +49,7 @@ defmodule Ferricstore.Raft.BlobCommandTest do
              )
 
     assert {:ok, ref} = BlobRef.decode(encoded_ref)
-    assert File.read!(BlobRef.path(root, 0, ref)) == payload
+    assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
   end
 
   test "prepares generic Ra batches by replacing large puts with blob refs", %{
@@ -67,7 +67,38 @@ defmodule Ferricstore.Raft.BlobCommandTest do
              )
 
     assert {:ok, ref} = BlobRef.decode(encoded_ref)
-    assert File.read!(BlobRef.path(root, 0, ref)) == payload
+    assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
+  end
+
+  test "prepares generic Ra batches with one blob segment fsync", %{ctx: ctx, root: root} do
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_fsync_file_hook, fn path ->
+      send(parent, {:blob_fsync_file, path})
+      :ok
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_fsync_file_hook) end)
+
+    payload_a = :binary.copy("A", 1024)
+    payload_b = :binary.copy("B", 1024)
+
+    assert {:ok,
+            {:batch, [{:put_blob_ref, "a", encoded_a, 0}, {:put_blob_ref, "b", encoded_b, 0}]}} =
+             BlobCommand.prepare(
+               ctx,
+               0,
+               {:batch, [{:put, "a", payload_a, 0}, {:put, "b", payload_b, 0}]},
+               single_member?: true
+             )
+
+    assert {:ok, ref_a} = BlobRef.decode(encoded_a)
+    assert {:ok, ref_b} = BlobRef.decode(encoded_b)
+    assert {:ok, {segment_path, _offset_a, _size_a}} = BlobStore.file_ref(root, 0, ref_a)
+    assert {:ok, {^segment_path, _offset_b, _size_b}} = BlobStore.file_ref(root, 0, ref_b)
+
+    assert_received {:blob_fsync_file, ^segment_path}
+    refute_received {:blob_fsync_file, _}
   end
 
   test "leaves commands unchanged when blob side-channel is disabled", %{ctx: ctx} do

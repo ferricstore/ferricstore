@@ -1,11 +1,11 @@
 defmodule Ferricstore.Store.BlobStore do
   @moduledoc """
-  Content-addressed side-channel blob storage for large values.
+  Side-channel blob storage for large values.
 
-  Large values are stored once under `data_dir/blob/shard_N/`, while Bitcask
-  stores the fixed-size `BlobRef`. Raft still receives the logical command
-  payload today; replacing that with ref-only replication needs a separate blob
-  transfer protocol so followers can prove the blob exists before apply.
+  New writes append payload records into a shard-local segment log under
+  `data_dir/blob/shard_N/segments/`, while Bitcask stores the fixed-size
+  `BlobRef`. Older content-addressed v1 refs remain readable so existing data
+  can be served during the transition.
   """
 
   alias Ferricstore.Bitcask.NIF
@@ -13,43 +13,45 @@ defmodule Ferricstore.Store.BlobStore do
 
   @hash_chunk_bytes 1_048_576
   @tmp_stale_after_seconds 300
+  @segment_id 0
+  @segment_header_magic <<0, ?F, ?S, ?B, ?L, ?O, ?G, 1>>
+  @segment_header_bytes 48
+  @recovery_table :ferricstore_blob_store_recovery
 
   @type reason :: term()
 
   @doc """
-  Stores `payload` under its content-addressed path and returns the small ref.
-
-  If the same complete blob already exists, this returns without rewriting it.
-  That keeps fanout-style workloads from writing identical large payload bytes
-  once per workflow/key.
+  Stores `payload` in the shard append segment and returns the small ref.
   """
   @spec put(binary(), non_neg_integer(), binary()) :: {:ok, BlobRef.t()} | {:error, reason()}
   def put(data_dir, shard_index, payload)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
              is_binary(payload) do
-    ref = BlobRef.from_payload(payload)
-    path = BlobRef.path(data_dir, shard_index, ref)
+    case put_many(data_dir, shard_index, [payload]) do
+      {:ok, [ref]} -> {:ok, ref}
+      {:error, _reason} = error -> error
+    end
+  end
 
-    result =
-      case existing_complete?(path, ref) do
-        true -> {:ok, ref}
-        false -> write_atomic(path, payload, ref)
-        {:error, reason} -> {:error, reason}
-      end
-
-    case result do
-      {:ok, ^ref} = ok ->
-        ok
-
-      {:error, reason} = error ->
-        emit_error(:put, shard_index, path, ref, reason)
-        error
+  @doc """
+  Stores payloads in one append batch and fsyncs the segment once.
+  """
+  @spec put_many(binary(), non_neg_integer(), [binary()]) ::
+          {:ok, [BlobRef.t()]} | {:error, reason()}
+  def put_many(data_dir, shard_index, payloads)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_list(payloads) do
+    if Enum.all?(payloads, &is_binary/1) do
+      lock_key = {{__MODULE__, data_dir, shard_index}, __MODULE__}
+      :global.trans(lock_key, fn -> do_put_many(data_dir, shard_index, payloads) end, [node()])
+    else
+      {:error, :invalid_blob_payload}
     end
   end
 
   @doc "Reads and validates a blob by ref."
   @spec get(binary(), non_neg_integer(), BlobRef.t()) :: {:ok, binary()} | {:error, reason()}
-  def get(data_dir, shard_index, %BlobRef{} = ref)
+  def get(data_dir, shard_index, %BlobRef{version: 1} = ref)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
     path = BlobRef.path(data_dir, shard_index, ref)
 
@@ -70,8 +72,23 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
+  def get(data_dir, shard_index, %BlobRef{version: 2, size: size, offset: offset} = ref)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    path = BlobRef.path(data_dir, shard_index, ref)
+    result = read_segment_payload(path, offset, size, ref)
+
+    case result do
+      {:ok, _payload} = ok ->
+        ok
+
+      {:error, reason} = error ->
+        emit_error(:get, shard_index, path, ref, reason)
+        error
+    end
+  end
+
   @doc """
-  Verifies that an existing blob file exactly matches its content-addressed ref.
+  Verifies that an existing blob exactly matches its ref.
 
   This is intended for write/apply correctness boundaries where a ref-only
   command would otherwise acknowledge a pointer without proving the pointed
@@ -79,7 +96,7 @@ defmodule Ferricstore.Store.BlobStore do
   full payload as a BEAM binary.
   """
   @spec verify(binary(), non_neg_integer(), BlobRef.t()) :: :ok | {:error, reason()}
-  def verify(data_dir, shard_index, %BlobRef{size: size} = ref)
+  def verify(data_dir, shard_index, %BlobRef{version: 1, size: size} = ref)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
     path = BlobRef.path(data_dir, shard_index, ref)
 
@@ -104,18 +121,43 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
+  def verify(data_dir, shard_index, %BlobRef{version: 2, size: size, offset: offset} = ref)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    path = BlobRef.path(data_dir, shard_index, ref)
+
+    result =
+      with :ok <- stat_regular_min_size(path, offset + size),
+           :ok <- verify_segment_record(path, offset, size, ref) do
+        :ok
+      end
+
+    case result do
+      :ok ->
+        :ok
+
+      :mismatch ->
+        error = {:error, :checksum_mismatch}
+        emit_error(:verify, shard_index, path, ref, :checksum_mismatch)
+        error
+
+      {:error, reason} = error ->
+        emit_error(:verify, shard_index, path, ref, reason)
+        error
+    end
+  end
+
   @doc """
   Returns a file ref for a blob after validating the file is regular and has
   the expected size.
 
   This is the hot streaming path. It intentionally does not hash the blob on
-  every read; `put/3` verifies existing blobs before dedupe, and `get/3` still
-  verifies materialized reads. Full checksum validation belongs in write-time
-  validation and background scrub, not in every sendfile/file-stream GET.
+  every read; `get/3` and `verify/3` still verify materialized reads. Full
+  checksum validation belongs in write-time validation and background scrub,
+  not in every sendfile/file-stream GET.
   """
   @spec file_ref(binary(), non_neg_integer(), BlobRef.t()) ::
-          {:ok, {binary(), 0, non_neg_integer()}} | {:error, reason()}
-  def file_ref(data_dir, shard_index, %BlobRef{size: size} = ref)
+          {:ok, {binary(), non_neg_integer(), non_neg_integer()}} | {:error, reason()}
+  def file_ref(data_dir, shard_index, %BlobRef{version: 1, size: size} = ref)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
     path = BlobRef.path(data_dir, shard_index, ref)
 
@@ -134,13 +176,87 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
+  def file_ref(data_dir, shard_index, %BlobRef{version: 2, size: size, offset: offset} = ref)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    path = BlobRef.path(data_dir, shard_index, ref)
+
+    result =
+      with :ok <- stat_regular_min_size(path, offset + size) do
+        {:ok, {path, offset, size}}
+      end
+
+    case result do
+      {:ok, _file_ref} = ok ->
+        ok
+
+      {:error, reason} = error ->
+        emit_error(:file_ref, shard_index, path, ref, reason)
+        error
+    end
+  end
+
   @doc """
-  Deletes blob files that are not present in `live_refs`.
+  Recovers append-segment files by truncating the first partial or corrupt tail.
+
+  This is called lazily before the first append in a VM and is also public for
+  startup/lifecycle tests. Older valid records before the bad tail remain
+  readable.
+  """
+  @spec recover_shard(binary(), non_neg_integer()) ::
+          {:ok,
+           %{
+             segments: non_neg_integer(),
+             truncated_segments: non_neg_integer(),
+             truncated_bytes: non_neg_integer()
+           }}
+          | {:error, term()}
+  def recover_shard(data_dir, shard_index)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    shard_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
+
+    with {:ok, paths} <- segment_files(shard_path) do
+      result =
+        Enum.reduce_while(
+          paths,
+          {:ok, %{segments: 0, truncated_segments: 0, truncated_bytes: 0}},
+          fn path, {:ok, acc} ->
+            case recover_segment(path) do
+              {:ok, bytes} ->
+                acc = %{
+                  acc
+                  | segments: acc.segments + 1,
+                    truncated_segments: acc.truncated_segments + if(bytes > 0, do: 1, else: 0),
+                    truncated_bytes: acc.truncated_bytes + bytes
+                }
+
+                {:cont, {:ok, acc}}
+
+              {:error, _reason} = error ->
+                {:halt, error}
+            end
+          end
+        )
+
+      case result do
+        {:ok, stats} ->
+          mark_recovered(data_dir, shard_index)
+          {:ok, stats}
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+  end
+
+  @doc """
+  Deletes legacy content-addressed blob files that are not present in
+  `live_refs`.
 
   The caller owns producing a complete live set. This function is deliberately
-  dumb: it only compares content-addressed paths and removes files outside that
-  set. That keeps the correctness boundary in the shard, which knows current
-  shared and promoted/dedicated Bitcask locations.
+  conservative: it can remove old v1 content-addressed files, but v2 append
+  segments are retained until segment compaction exists. That keeps the
+  correctness boundary in the shard, which knows current shared and
+  promoted/dedicated Bitcask locations.
   """
   @spec sweep_unreferenced(binary(), non_neg_integer(), Enumerable.t()) ::
           {:ok,
@@ -175,20 +291,30 @@ defmodule Ferricstore.Store.BlobStore do
            %{
              files: non_neg_integer(),
              bytes: non_neg_integer(),
+             legacy_files: non_neg_integer(),
+             legacy_bytes: non_neg_integer(),
+             segment_files: non_neg_integer(),
+             segment_bytes: non_neg_integer(),
              tmp_files: non_neg_integer(),
              tmp_bytes: non_neg_integer()
            }}
           | {:error, term()}
   def storage_stats(data_dir) when is_binary(data_dir) do
     blob_glob = Path.join([data_dir, "blob", "shard_*", "**", "*.blob"])
+    segment_glob = Path.join([data_dir, "blob", "shard_*", "segments", "*.bloblog"])
     tmp_glob = Path.join([data_dir, "blob", "shard_*", "**", "*.tmp"])
 
-    with {:ok, blob_stats} <- storage_stats_for_paths(Path.wildcard(blob_glob)),
+    with {:ok, blob_stats} <-
+           storage_stats_for_paths({Path.wildcard(blob_glob), Path.wildcard(segment_glob)}),
          {:ok, tmp_stats} <- storage_stats_for_paths(Path.wildcard(tmp_glob, match_dot: true)) do
       {:ok,
        %{
          files: blob_stats.files,
          bytes: blob_stats.bytes,
+         legacy_files: blob_stats.legacy_files,
+         legacy_bytes: blob_stats.legacy_bytes,
+         segment_files: blob_stats.segment_files,
+         segment_bytes: blob_stats.segment_bytes,
          tmp_files: tmp_stats.files,
          tmp_bytes: tmp_stats.bytes
        }}
@@ -197,7 +323,22 @@ defmodule Ferricstore.Store.BlobStore do
     error -> {:error, {:blob_storage_stats_failed, error}}
   end
 
-  defp storage_stats_for_paths(paths) do
+  defp storage_stats_for_paths({legacy_paths, segment_paths}) do
+    with {:ok, legacy_stats} <- storage_stats_for_paths(legacy_paths),
+         {:ok, segment_stats} <- storage_stats_for_paths(segment_paths) do
+      {:ok,
+       %{
+         files: legacy_stats.files + segment_stats.files,
+         bytes: legacy_stats.bytes + segment_stats.bytes,
+         legacy_files: legacy_stats.files,
+         legacy_bytes: legacy_stats.bytes,
+         segment_files: segment_stats.files,
+         segment_bytes: segment_stats.bytes
+       }}
+    end
+  end
+
+  defp storage_stats_for_paths(paths) when is_list(paths) do
     Enum.reduce_while(paths, {:ok, %{files: 0, bytes: 0}}, fn path, {:ok, acc} ->
       case File.stat(path) do
         {:ok, %{type: :regular, size: size}} ->
@@ -212,23 +353,129 @@ defmodule Ferricstore.Store.BlobStore do
     end)
   end
 
-  defp existing_complete?(path, %BlobRef{size: expected_size} = ref) do
-    case stat_regular_size(path, expected_size) do
-      :ok ->
-        case file_matches_ref?(path, ref) do
-          :ok -> true
-          :mismatch -> false
-          {:error, reason} -> {:error, reason}
+  defp do_put_many(_data_dir, _shard_index, []), do: {:ok, []}
+
+  defp do_put_many(data_dir, shard_index, payloads) do
+    path = segment_path(data_dir, shard_index, @segment_id)
+    dir = Path.dirname(path)
+    dir_existed? = Ferricstore.FS.dir?(dir)
+    file_existed? = File.exists?(path)
+
+    result =
+      with :ok <- Ferricstore.FS.mkdir_p(dir),
+           :ok <- fsync_parent_after_mkdir(dir, dir_existed?),
+           {:ok, _stats} <- ensure_recovered(data_dir, shard_index),
+           {:ok, start_offset} <- file_size_or_zero(path),
+           {:ok, io} <- File.open(path, [:append, :raw, :binary]) do
+        try do
+          with {:ok, refs, _next_offset} <- append_segment_records(io, payloads, start_offset),
+               :ok <- fsync_file(path),
+               :ok <- maybe_fsync_new_segment_dir(dir, file_existed?) do
+            {:ok, refs}
+          end
+        after
+          :file.close(io)
+        end
+      end
+
+    case result do
+      {:ok, refs} ->
+        {:ok, refs}
+
+      {:error, reason} = error ->
+        emit_error(:put, shard_index, path, blob_error_ref(payloads), reason)
+        recover_shard(data_dir, shard_index)
+        error
+    end
+  end
+
+  defp append_segment_records(io, payloads, start_offset) do
+    Enum.reduce_while(payloads, {:ok, [], start_offset}, fn payload, {:ok, refs, record_offset} ->
+      payload_offset = record_offset + @segment_header_bytes
+      ref = BlobRef.from_segment(payload, @segment_id, payload_offset)
+      record = [segment_header(ref), payload]
+
+      case :file.write(io, record) do
+        :ok ->
+          next_offset = payload_offset + byte_size(payload)
+          {:cont, {:ok, [ref | refs], next_offset}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, refs, next_offset} -> {:ok, Enum.reverse(refs), next_offset}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp segment_header(%BlobRef{version: 2, size: size, checksum: checksum})
+       when is_binary(checksum) and byte_size(checksum) == 32 do
+    <<@segment_header_magic::binary, size::unsigned-big-64, checksum::binary>>
+  end
+
+  defp maybe_fsync_new_segment_dir(_dir, true), do: :ok
+  defp maybe_fsync_new_segment_dir(dir, false), do: fsync_dir(dir)
+
+  defp ensure_recovered(data_dir, shard_index) do
+    ensure_recovery_table()
+    key = {data_dir, shard_index}
+
+    case :ets.lookup(@recovery_table, key) do
+      [{^key, :recovered}] ->
+        {:ok, %{segments: 0, truncated_segments: 0, truncated_bytes: 0}}
+
+      [] ->
+        recover_shard(data_dir, shard_index)
+    end
+  end
+
+  defp mark_recovered(data_dir, shard_index) do
+    ensure_recovery_table()
+    :ets.insert(@recovery_table, {{data_dir, shard_index}, :recovered})
+    :ok
+  end
+
+  defp ensure_recovery_table do
+    case :ets.whereis(@recovery_table) do
+      :undefined ->
+        try do
+          :ets.new(@recovery_table, [
+            :named_table,
+            :public,
+            :set,
+            {:read_concurrency, true},
+            {:write_concurrency, true}
+          ])
+        rescue
+          ArgumentError -> @recovery_table
         end
 
-      {:error, reason} when reason in [:invalid_blob_file, :size_mismatch] ->
-        false
+      tid ->
+        tid
+    end
+  end
 
-      {:error, :enoent} ->
-        false
+  defp blob_error_ref([payload | _]) when is_binary(payload), do: BlobRef.from_payload(payload)
+  defp blob_error_ref(_payloads), do: %BlobRef{checksum: :binary.copy(<<0>>, 32), size: 0}
 
-      {:error, reason} ->
-        {:error, reason}
+  defp segment_path(data_dir, shard_index, segment_id) do
+    BlobRef.path(data_dir, shard_index, %BlobRef{
+      version: 2,
+      checksum: :binary.copy(<<0>>, 32),
+      size: 0,
+      segment_id: segment_id,
+      offset: 0
+    })
+  end
+
+  defp file_size_or_zero(path) do
+    case File.stat(path) do
+      {:ok, %{type: :regular, size: size}} -> {:ok, size}
+      {:ok, _other} -> {:error, :invalid_blob_file}
+      {:error, :enoent} -> {:ok, 0}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -241,47 +488,38 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  defp write_atomic(path, payload, ref) do
-    dir = Path.dirname(path)
-    tmp_path = tmp_path(path)
-    dir_existed? = Ferricstore.FS.dir?(dir)
-
-    result =
-      with :ok <- Ferricstore.FS.mkdir_p(dir),
-           :ok <- fsync_parent_after_mkdir(dir, dir_existed?),
-           :ok <- File.write(tmp_path, payload, [:binary]),
-           :ok <- fsync_file(tmp_path),
-           :ok <- Ferricstore.FS.rename(tmp_path, path),
-           :ok <- fsync_dir(dir) do
-        {:ok, ref}
-      end
-
-    case result do
-      {:ok, ^ref} = ok ->
-        ok
-
-      {:error, _reason} = error ->
-        cleanup_tmp(tmp_path)
-        error
+  defp stat_regular_min_size(path, min_size) do
+    case File.stat(path) do
+      {:ok, %{type: :regular, size: size}} when size >= min_size -> :ok
+      {:ok, %{type: :regular}} -> {:error, :size_mismatch}
+      {:ok, _other} -> {:error, :invalid_blob_file}
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  defp tmp_path(path) do
-    basename = Path.basename(path)
-    suffix = System.unique_integer([:positive, :monotonic])
-    Path.join(Path.dirname(path), ".#{basename}.#{suffix}.tmp")
+  defp pread_exact_open(io, offset, size) do
+    case :file.pread(io, offset, size) do
+      {:ok, payload} when byte_size(payload) == size -> {:ok, payload}
+      {:ok, _short} -> {:error, :size_mismatch}
+      :eof -> {:error, :enoent}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp fsync_parent_after_mkdir(_dir, true), do: :ok
 
   defp fsync_parent_after_mkdir(dir, false) do
-    # The first blob in a checksum-prefix directory must make the directory
-    # entry durable. Later blobs in the same prefix only need the final fsync
-    # on `dir` after their atomic rename.
+    # The first append segment in a shard must make the segments directory entry
+    # durable before the segment file itself is fsynced.
     fsync_dir(Path.dirname(dir))
   end
 
-  defp fsync_file(path), do: normalize_fsync(NIF.v2_fsync(path))
+  defp fsync_file(path) do
+    case Process.get(:ferricstore_blob_store_fsync_file_hook) do
+      fun when is_function(fun, 1) -> normalize_fsync(fun.(path))
+      _ -> normalize_fsync(NIF.v2_fsync(path))
+    end
+  end
 
   defp fsync_dir(path) do
     case Process.get(:ferricstore_blob_store_fsync_dir_hook) do
@@ -319,6 +557,67 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
+  defp read_segment_payload(path, offset, size, %BlobRef{} = ref) do
+    case File.open(path, [:read, :raw, :binary]) do
+      {:ok, io} ->
+        try do
+          with :ok <- validate_open_segment_record(io, offset, size, ref),
+               {:ok, payload} <- pread_exact_open(io, offset, size),
+               :ok <- verify_checksum(ref, payload) do
+            {:ok, payload}
+          end
+        after
+          :file.close(io)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp verify_segment_record(path, offset, size, %BlobRef{} = ref) do
+    case File.open(path, [:read, :raw, :binary]) do
+      {:ok, io} ->
+        try do
+          with :ok <- validate_open_segment_record(io, offset, size, ref),
+               :ok <- open_file_range_matches_ref?(io, offset, size, ref) do
+            :ok
+          end
+        after
+          :file.close(io)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp validate_open_segment_record(
+         io,
+         offset,
+         size,
+         %BlobRef{version: 2, checksum: expected_checksum}
+       ) do
+    header_offset = offset - @segment_header_bytes
+
+    with true <- header_offset >= 0,
+         {:ok, header} when byte_size(header) == @segment_header_bytes <-
+           :file.pread(io, header_offset, @segment_header_bytes),
+         {:ok, ^size, ^expected_checksum} <- decode_segment_header(header) do
+      :ok
+    else
+      _ -> {:error, :segment_header_mismatch}
+    end
+  end
+
+  defp open_file_range_matches_ref?(io, offset, size, %BlobRef{checksum: expected_checksum}) do
+    case hash_file_range(io, offset, size, :crypto.hash_init(:sha256)) do
+      {:ok, ^expected_checksum} -> :ok
+      {:ok, _other_checksum} -> :mismatch
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp hash_file(io, hash_state) do
     case :file.read(io, @hash_chunk_bytes) do
       {:ok, chunk} when is_binary(chunk) and byte_size(chunk) > 0 ->
@@ -329,6 +628,120 @@ defmodule Ferricstore.Store.BlobStore do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp hash_file_range(_io, _offset, 0, hash_state), do: {:ok, :crypto.hash_final(hash_state)}
+
+  defp hash_file_range(io, offset, remaining, hash_state) do
+    read_size = min(@hash_chunk_bytes, remaining)
+
+    case :file.pread(io, offset, read_size) do
+      {:ok, chunk} when is_binary(chunk) and byte_size(chunk) == read_size ->
+        hash_file_range(
+          io,
+          offset + read_size,
+          remaining - read_size,
+          :crypto.hash_update(hash_state, chunk)
+        )
+
+      {:ok, _short} ->
+        {:error, :size_mismatch}
+
+      :eof ->
+        {:error, :size_mismatch}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp recover_segment(path) do
+    case File.open(path, [:read, :write, :raw, :binary]) do
+      {:ok, io} ->
+        try do
+          with {:ok, size} <- file_size(io),
+               {:ok, valid_size} <- scan_segment(io, 0, size),
+               {:ok, truncated_bytes} <- maybe_truncate_segment(io, path, size, valid_size) do
+            {:ok, truncated_bytes}
+          end
+        after
+          :file.close(io)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp file_size(io) do
+    with {:ok, current} <- :file.position(io, :cur),
+         {:ok, size} <- :file.position(io, :eof),
+         {:ok, _} <- :file.position(io, current) do
+      {:ok, size}
+    end
+  end
+
+  defp scan_segment(_io, offset, size) when offset == size, do: {:ok, offset}
+
+  defp scan_segment(_io, offset, size) when size - offset < @segment_header_bytes,
+    do: {:ok, offset}
+
+  defp scan_segment(io, offset, size) do
+    case :file.pread(io, offset, @segment_header_bytes) do
+      {:ok, header} when byte_size(header) == @segment_header_bytes ->
+        case decode_segment_header(header) do
+          {:ok, payload_size, checksum} ->
+            payload_offset = offset + @segment_header_bytes
+            next_offset = payload_offset + payload_size
+
+            cond do
+              next_offset > size ->
+                {:ok, offset}
+
+              segment_payload_matches?(io, payload_offset, payload_size, checksum) ->
+                scan_segment(io, next_offset, size)
+
+              true ->
+                {:ok, offset}
+            end
+
+          :error ->
+            {:ok, offset}
+        end
+
+      {:ok, _short} ->
+        {:ok, offset}
+
+      :eof ->
+        {:ok, offset}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp decode_segment_header(
+         <<@segment_header_magic::binary, size::unsigned-big-64, checksum::binary-size(32)>>
+       ),
+       do: {:ok, size, checksum}
+
+  defp decode_segment_header(_header), do: :error
+
+  defp segment_payload_matches?(io, payload_offset, payload_size, checksum) do
+    case hash_file_range(io, payload_offset, payload_size, :crypto.hash_init(:sha256)) do
+      {:ok, ^checksum} -> true
+      _ -> false
+    end
+  end
+
+  defp maybe_truncate_segment(_io, _path, size, size), do: {:ok, 0}
+
+  defp maybe_truncate_segment(io, path, size, valid_size) do
+    with {:ok, _} <- :file.position(io, valid_size),
+         :ok <- :file.truncate(io),
+         :ok <- fsync_file(path) do
+      {:ok, size - valid_size}
     end
   end
 
@@ -348,14 +761,6 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  defp cleanup_tmp(tmp_path) do
-    case Ferricstore.FS.rm(tmp_path) do
-      :ok -> :ok
-      {:error, {:not_found, _message}} -> :ok
-      {:error, _reason} -> :ok
-    end
-  end
-
   defp live_relative_paths(live_refs) do
     Enum.reduce(live_refs, MapSet.new(), fn
       %BlobRef{} = ref, acc -> MapSet.put(acc, BlobRef.relative_path(ref))
@@ -371,6 +776,18 @@ defmodule Ferricstore.Store.BlobStore do
     end
   rescue
     error -> {:error, {:blob_list_failed, error}}
+  end
+
+  defp segment_files(shard_path) do
+    segment_path = Path.join(shard_path, "segments")
+
+    if Ferricstore.FS.dir?(segment_path) do
+      {:ok, Path.wildcard(Path.join(segment_path, "*.bloblog"))}
+    else
+      {:ok, []}
+    end
+  rescue
+    error -> {:error, {:blob_segment_list_failed, error}}
   end
 
   defp blob_tmp_files(shard_path) do

@@ -90,9 +90,10 @@ defmodule Ferricstore.Cluster.BlobSideChannelClusterTest do
     n = node_name(node)
     ctx = :erpc.call(n, FerricStore.Instance, :get, [:default], 10_000)
 
-    Path.join([ctx.data_dir, "blob", "shard_*", "*", "*.blob"])
-    |> Path.wildcard()
-    |> length()
+    legacy_files = Path.wildcard(Path.join([ctx.data_dir, "blob", "shard_*", "*", "*.blob"]))
+    segment_files = Path.wildcard(Path.join([ctx.data_dir, "blob", "shard_*", "*", "*.bloblog"]))
+
+    length(legacy_files) + length(segment_files)
   end
 
   defp join_cluster(new_node, existing_node) do

@@ -125,7 +125,7 @@ defmodule Ferricstore.ApplicationTest do
                    :binary.copy("x", 256)
                  )
 
-        assert [_blob_file] = Path.wildcard(Path.join(data_dir, "blob/shard_0/*/*.blob"))
+        assert [_blob_file] = Path.wildcard(Path.join(data_dir, "blob/shard_0/*/*.bloblog"))
 
         assert {1, "blob-threshold-default", 256} =
                  Ferricstore.Application.scan_large_values(1, 200)

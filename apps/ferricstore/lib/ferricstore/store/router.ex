@@ -2227,13 +2227,16 @@ defmodule Ferricstore.Store.Router do
 
   defp validate_blob_file_ref(ctx, idx, %BlobRef{size: size} = ref) do
     case BlobStore.file_ref(ctx.data_dir, idx, ref) do
-      {:ok, {path, 0, ^size}} -> {:ok, {path, 0, size}}
-      {:error, _reason} = error -> error
+      {:ok, {path, blob_offset, ^size}} when is_integer(blob_offset) and blob_offset >= 0 ->
+        {:ok, {path, blob_offset, size}}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
   defp cold_blob_ref_from_location(ctx, path, offset, key, persisted_value_size) do
-    if blob_side_channel_threshold(ctx) > 0 and persisted_value_size == BlobRef.encoded_size() do
+    if blob_side_channel_threshold(ctx) > 0 and BlobRef.encoded_size?(persisted_value_size) do
       with {:ok, value} <- read_cold_async(path, offset, key),
            {:ok, %BlobRef{} = ref} <- BlobRef.decode(value) do
         {:ok, ref}

@@ -3,7 +3,7 @@ defmodule Ferricstore.Raft.BlobCommand do
   Prepares large-value Raft commands for blob side-channel replication.
 
   The ref-only command shapes are only safe for a single-member Raft group: the
-  local apply side can validate that the blob file already exists before it
+  local apply side can validate that the blob record already exists before it
   stores the ref in Bitcask. Multi-member groups still need a blob transfer
   protocol before followers can apply refs without the original payload.
   """
@@ -105,49 +105,87 @@ defmodule Ferricstore.Raft.BlobCommand do
   defp command_candidate?(_command, _threshold), do: false
 
   defp prepare_batch_entries(data_dir, shard_index, threshold, entries) do
-    Enum.reduce_while(entries, {:ok, [], false}, fn
-      {key, value, expire_at_ms}, {:ok, acc, externalized?}
+    entries
+    |> Enum.reduce_while({:ok, [], []}, fn
+      {key, value, expire_at_ms}, {:ok, acc, external_payloads}
       when is_binary(key) and is_binary(value) ->
-        case prepare_value(data_dir, shard_index, threshold, value) do
-          {:ok, {prepared_value, kind}} ->
-            next_externalized? = externalized? or kind == :blob_ref
-            {:cont, {:ok, [{key, prepared_value, expire_at_ms, kind} | acc], next_externalized?}}
-
-          {:error, _reason} = error ->
-            {:halt, error}
+        if externalize?(value, threshold) do
+          marker = {key, :external, expire_at_ms}
+          {:cont, {:ok, [marker | acc], [value | external_payloads]}}
+        else
+          {:cont, {:ok, [{key, value, expire_at_ms, :value} | acc], external_payloads}}
         end
 
-      _invalid, {:ok, _acc, _externalized?} ->
+      _invalid, {:ok, _acc, _external_payloads} ->
         {:halt, {:error, :invalid_put_batch_entry}}
     end)
     |> case do
-      {:ok, prepared, externalized?} -> {:ok, Enum.reverse(prepared), externalized?}
-      {:error, _reason} = error -> error
+      {:ok, prepared, []} ->
+        {:ok, Enum.reverse(prepared), false}
+
+      {:ok, prepared, external_payloads} ->
+        with {:ok, refs} <-
+               BlobStore.put_many(data_dir, shard_index, Enum.reverse(external_payloads)) do
+          {:ok, inflate_batch_blob_refs(Enum.reverse(prepared), refs), true}
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
+  defp inflate_batch_blob_refs(prepared, refs) do
+    {result, []} =
+      Enum.map_reduce(prepared, refs, fn
+        {key, :external, expire_at_ms}, [ref | rest] ->
+          {{key, BlobRef.encode!(ref), expire_at_ms, :blob_ref}, rest}
+
+        entry, refs ->
+          {entry, refs}
+      end)
+
+    result
+  end
+
   defp prepare_generic_batch_commands(data_dir, shard_index, threshold, commands) do
-    Enum.reduce_while(commands, {:ok, []}, fn
-      {:put, key, value, expire_at_ms}, {:ok, acc}
+    Enum.reduce_while(commands, {:ok, [], []}, fn
+      {:put, key, value, expire_at_ms}, {:ok, acc, external_payloads}
       when is_binary(key) and is_binary(value) ->
-        case prepare_value(data_dir, shard_index, threshold, value) do
-          {:ok, {^value, :value}} ->
-            {:cont, {:ok, [{:put, key, value, expire_at_ms} | acc]}}
-
-          {:ok, {encoded_ref, :blob_ref}} ->
-            {:cont, {:ok, [{:put_blob_ref, key, encoded_ref, expire_at_ms} | acc]}}
-
-          {:error, _reason} = error ->
-            {:halt, error}
+        if externalize?(value, threshold) do
+          {:cont, {:ok, [{:put_external, key, expire_at_ms} | acc], [value | external_payloads]}}
+        else
+          {:cont, {:ok, [{:put, key, value, expire_at_ms} | acc], external_payloads}}
         end
 
-      command, {:ok, acc} ->
-        {:cont, {:ok, [command | acc]}}
+      command, {:ok, acc, external_payloads} ->
+        {:cont, {:ok, [command | acc], external_payloads}}
     end)
     |> case do
-      {:ok, prepared} -> {:ok, Enum.reverse(prepared)}
-      {:error, _reason} = error -> error
+      {:ok, prepared, []} ->
+        {:ok, Enum.reverse(prepared)}
+
+      {:ok, prepared, external_payloads} ->
+        with {:ok, refs} <-
+               BlobStore.put_many(data_dir, shard_index, Enum.reverse(external_payloads)) do
+          {:ok, inflate_generic_batch_blob_refs(Enum.reverse(prepared), refs)}
+        end
+
+      {:error, _reason} = error ->
+        error
     end
+  end
+
+  defp inflate_generic_batch_blob_refs(prepared, refs) do
+    {result, []} =
+      Enum.map_reduce(prepared, refs, fn
+        {:put_external, key, expire_at_ms}, [ref | rest] ->
+          {{:put_blob_ref, key, BlobRef.encode!(ref), expire_at_ms}, rest}
+
+        command, refs ->
+          {command, refs}
+      end)
+
+    result
   end
 
   defp prepare_value(data_dir, shard_index, threshold, value) do

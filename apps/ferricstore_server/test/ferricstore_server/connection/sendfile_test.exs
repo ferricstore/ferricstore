@@ -492,8 +492,8 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
     try do
       :ok = Router.put(ctx, key, value, 0)
-      assert {:cold_ref, blob_path, 0, 1024} = Router.get_with_file_ref(ctx, key)
-      File.write!(blob_path, :binary.copy("x", byte_size(value)))
+      assert {:cold_ref, blob_path, blob_offset, 1024} = Router.get_with_file_ref(ctx, key)
+      overwrite_file_range!(blob_path, blob_offset, :binary.copy("x", byte_size(value)))
 
       state = %{
         instance_ctx: ctx,
@@ -526,9 +526,9 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
     try do
       :ok = Router.put(ctx, key, value, 0)
-      assert {:cold_ref, blob_path, 0, size} = Router.get_with_file_ref(ctx, key)
+      assert {:cold_ref, blob_path, blob_offset, size} = Router.get_with_file_ref(ctx, key)
       assert size == byte_size(value)
-      File.write!(blob_path, :binary.copy("x", byte_size(value)))
+      overwrite_file_range!(blob_path, blob_offset, :binary.copy("x", byte_size(value)))
 
       state = %{
         socket: self(),
@@ -566,8 +566,8 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
     try do
       :ok = Router.put(ctx, key, value, 0)
-      assert {:cold_ref, blob_path, 0, 1024} = Router.get_with_file_ref(ctx, key)
-      File.write!(blob_path, :binary.copy("x", byte_size(value)))
+      assert {:cold_ref, blob_path, blob_offset, 1024} = Router.get_with_file_ref(ctx, key)
+      overwrite_file_range!(blob_path, blob_offset, :binary.copy("x", byte_size(value)))
 
       state = %{
         instance_ctx: ctx,
@@ -604,9 +604,9 @@ defmodule FerricstoreServer.Connection.SendfileTest do
 
     try do
       :ok = Router.put(ctx, key, value, 0)
-      assert {:cold_ref, blob_path, 0, size} = Router.get_with_file_ref(ctx, key)
+      assert {:cold_ref, blob_path, blob_offset, size} = Router.get_with_file_ref(ctx, key)
       assert size == byte_size(value)
-      File.write!(blob_path, :binary.copy("x", byte_size(value)))
+      overwrite_file_range!(blob_path, blob_offset, :binary.copy("x", byte_size(value)))
 
       state = %{
         socket: self(),
@@ -728,6 +728,16 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     path = write_tmp_file!("")
     assert {:ok, {record_offset, _record_size}} = NIF.v2_append_record(path, key, value, 0)
     {path, record_offset + 26 + byte_size(key)}
+  end
+
+  defp overwrite_file_range!(path, offset, data) do
+    {:ok, io} = File.open(path, [:read, :write, :raw, :binary])
+
+    try do
+      :ok = :file.pwrite(io, offset, data)
+    after
+      :file.close(io)
+    end
   end
 
   defp collect_fake_tls_sends(acc \\ []) do
