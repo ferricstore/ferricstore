@@ -96,6 +96,19 @@ defmodule Ferricstore.Store.BlobStoreTest do
            end)
   end
 
+  test "put_many stores duplicate payloads once within the same append batch", %{root: root} do
+    payload = :binary.copy("same", 512)
+
+    assert {:ok, [first_ref, second_ref]} = BlobStore.put_many(root, 0, [payload, payload])
+    assert first_ref == second_ref
+
+    assert {:ok, {segment_path, offset, size}} = BlobStore.file_ref(root, 0, first_ref)
+    assert size == byte_size(payload)
+    assert offset == 48
+    assert File.stat!(segment_path).size == 48 + byte_size(payload)
+    assert {:ok, ^payload} = BlobStore.get(root, 0, second_ref)
+  end
+
   test "put_many rejects invalid payload without opening the segment", %{root: root} do
     parent = self()
 

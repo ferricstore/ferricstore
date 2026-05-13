@@ -29,6 +29,21 @@ defmodule Ferricstore.Store.RouterGetMetaGuardTest do
            "expected Router.batch_get/2 cold path to use ColdRead.pread_batch/2"
   end
 
+  test "batch_get cold reads dedupe duplicate locations with one pass" do
+    {:ok, ast} =
+      @router_path
+      |> File.read!()
+      |> Code.string_to_quoted()
+
+    bodies = function_bodies(ast, :read_cold_batch_async, 2)
+
+    # Duplicate keys in MGET-style reads should collapse to one physical
+    # pread, but the dedupe map walk itself must not run twice on the hot
+    # cold-batch path.
+    assert count_local_calls(bodies, :dedupe_cold_batch_entries, 1) == 1,
+           "expected Router cold batch reads to dedupe once, not repeat the O(N) pass"
+  end
+
   test "direct cold get and get_meta use the shared async cold reader" do
     source = File.read!(@router_path)
 
@@ -41,24 +56,43 @@ defmodule Ferricstore.Store.RouterGetMetaGuardTest do
   end
 
   defp function_body(ast, name, arity) do
-    {_ast, body} =
+    [body] = function_bodies(ast, name, arity)
+    body
+  end
+
+  defp function_bodies(ast, name, arity) do
+    {_ast, bodies} =
       Macro.prewalk(ast, nil, fn
-        {:def, _meta, [{^name, _fun_meta, args}, [do: body]]} = node, nil
-        when length(args) == arity ->
-          {node, body}
+        {kind, _meta, [{^name, _fun_meta, args}, [do: body]]} = node, acc
+        when kind in [:def, :defp] and length(args) == arity ->
+          {node, [body | List.wrap(acc)]}
 
         node, acc ->
           {node, acc}
       end)
 
-    assert body != nil, "expected to find #{name}/#{arity}"
-    body
+    bodies = bodies || []
+    assert bodies != [], "expected to find #{name}/#{arity}"
+    Enum.reverse(bodies)
   end
 
   defp count_ets_lookup_calls(ast) do
     {_ast, count} =
       Macro.prewalk(ast, 0, fn
         {{:., _, [:ets, :lookup]}, _, _args} = node, count ->
+          {node, count + 1}
+
+        node, count ->
+          {node, count}
+      end)
+
+    count
+  end
+
+  defp count_local_calls(ast, name, arity) do
+    {_ast, count} =
+      Macro.prewalk(ast, 0, fn
+        {^name, _meta, args} = node, count when length(args) == arity ->
           {node, count + 1}
 
         node, count ->

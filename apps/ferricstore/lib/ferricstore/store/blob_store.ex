@@ -48,13 +48,13 @@ defmodule Ferricstore.Store.BlobStore do
   def put_many(data_dir, shard_index, payloads)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
              is_list(payloads) do
-    case segment_batch_bytes(payloads) do
-      {:ok, 0} ->
+    case prepare_payload_batch(payloads) do
+      {:ok, %{batch_bytes: 0}} ->
         {:ok, []}
 
-      {:ok, batch_bytes} ->
+      {:ok, batch} ->
         with_blob_lock(data_dir, shard_index, fn ->
-          do_put_many(data_dir, shard_index, payloads, batch_bytes)
+          do_put_many(data_dir, shard_index, batch)
         end)
 
       {:error, :invalid_blob_payload} = error ->
@@ -433,15 +433,15 @@ defmodule Ferricstore.Store.BlobStore do
     end)
   end
 
-  defp do_put_many(data_dir, shard_index, payloads, batch_bytes) do
+  defp do_put_many(data_dir, shard_index, batch) do
     fallback_path = segment_path(data_dir, shard_index, @segment_id)
 
     result =
-      case do_put_many_once(data_dir, shard_index, payloads, batch_bytes) do
+      case do_put_many_once(data_dir, shard_index, batch) do
         {:error, :blob_segment_dir_missing} ->
           clear_active_segment_cache(data_dir, shard_index)
           clear_segment_dir_cache(data_dir, shard_index)
-          do_put_many_once(data_dir, shard_index, payloads, batch_bytes)
+          do_put_many_once(data_dir, shard_index, batch)
 
         other ->
           other
@@ -452,20 +452,20 @@ defmodule Ferricstore.Store.BlobStore do
         {:ok, refs}
 
       {:error, reason} = error ->
-        emit_error(:put, shard_index, fallback_path, blob_error_ref(payloads), reason)
+        emit_error(:put, shard_index, fallback_path, batch.error_ref, reason)
         recover_shard(data_dir, shard_index)
         error
     end
   end
 
-  defp do_put_many_once(data_dir, shard_index, payloads, batch_bytes) do
+  defp do_put_many_once(data_dir, shard_index, batch) do
     with {:ok, _stats} <- ensure_recovered(data_dir, shard_index),
          :ok <- ensure_segment_dir(data_dir, shard_index),
-         {:ok, segment} <- writable_segment(data_dir, shard_index, batch_bytes) do
+         {:ok, segment} <- writable_segment(data_dir, shard_index, batch.batch_bytes) do
       case File.open(segment.path, [:append, :raw, :binary]) do
         {:ok, io} ->
           try do
-            case build_segment_records(payloads, segment.id, segment.start_offset) do
+            case build_segment_records(batch, segment.id, segment.start_offset) do
               {:ok, refs, iodata, next_offset} ->
                 case append_and_sync_segment(io, segment, shard_index, iodata) do
                   :ok ->
@@ -517,29 +517,42 @@ defmodule Ferricstore.Store.BlobStore do
       :ok
     else
       {:error, reason} ->
-        emit_error(:rollback_append, shard_index, path, blob_error_ref([]), reason)
+        emit_error(:rollback_append, shard_index, path, empty_blob_error_ref(), reason)
         {:error, reason}
     end
   end
 
-  defp build_segment_records(payloads, segment_id, start_offset) do
-    Enum.reduce_while(payloads, {:ok, [], [], start_offset}, fn payload,
-                                                                {:ok, refs, records,
-                                                                 record_offset} ->
+  defp build_segment_records(batch, segment_id, start_offset) do
+    Enum.reduce_while(batch.unique_entries, {:ok, [], [], start_offset}, fn entry,
+                                                                            {:ok, refs, records,
+                                                                             record_offset} ->
       payload_offset = record_offset + @segment_header_bytes
-      ref = BlobRef.from_segment(payload, segment_id, payload_offset)
-      next_offset = payload_offset + byte_size(payload)
-      record = [segment_header(ref), payload]
+      ref = blob_ref_from_prehashed_segment(entry, segment_id, payload_offset)
+      next_offset = payload_offset + entry.size
+      record = [segment_header(ref), entry.payload]
 
       {:cont, {:ok, [ref | refs], [record | records], next_offset}}
     end)
     |> case do
-      {:ok, refs, records, next_offset} ->
-        {:ok, Enum.reverse(refs), Enum.reverse(records), next_offset}
+      {:ok, unique_refs, records, next_offset} ->
+        unique_refs = Enum.reverse(unique_refs)
+        unique_refs_tuple = List.to_tuple(unique_refs)
+        refs = Enum.map(batch.value_indexes, &elem(unique_refs_tuple, &1))
+        {:ok, refs, Enum.reverse(records), next_offset}
 
       {:error, _reason} = error ->
         error
     end
+  end
+
+  defp blob_ref_from_prehashed_segment(entry, segment_id, offset) do
+    %BlobRef{
+      version: 2,
+      checksum: entry.checksum,
+      size: entry.size,
+      segment_id: segment_id,
+      offset: offset
+    }
   end
 
   defp write_file(io, iodata) do
@@ -549,15 +562,56 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  defp segment_batch_bytes(payloads) do
-    Enum.reduce_while(payloads, {:ok, 0}, fn
-      payload, {:ok, acc} when is_binary(payload) ->
-        {:cont, {:ok, acc + @segment_header_bytes + byte_size(payload)}}
+  defp prepare_payload_batch(payloads) do
+    Enum.reduce_while(payloads, {:ok, [], %{}, [], 0, nil, 0}, fn
+      payload, {:ok, entries, seen, indexes, bytes, error_ref, unique_count}
+      when is_binary(payload) ->
+        size = byte_size(payload)
+        checksum = :crypto.hash(:sha256, payload)
+        key = {size, checksum}
 
-      _payload, {:ok, _acc} ->
+        case find_seen_payload(Map.get(seen, key, []), payload) do
+          {:ok, index} ->
+            {:cont, {:ok, entries, seen, [index | indexes], bytes, error_ref, unique_count}}
+
+          :error ->
+            entry = %{payload: payload, checksum: checksum, size: size}
+
+            seen =
+              Map.update(seen, key, [{payload, unique_count}], &[{payload, unique_count} | &1])
+
+            error_ref = error_ref || %BlobRef{checksum: checksum, size: size}
+
+            {:cont,
+             {:ok, [entry | entries], seen, [unique_count | indexes],
+              bytes + @segment_header_bytes + size, error_ref, unique_count + 1}}
+        end
+
+      _payload, {:ok, _entries, _seen, _indexes, _bytes, _error_ref, _unique_count} ->
         {:halt, {:error, :invalid_blob_payload}}
     end)
+    |> case do
+      {:ok, entries, _seen, indexes, bytes, error_ref, _unique_count} ->
+        {:ok,
+         %{
+           unique_entries: Enum.reverse(entries),
+           value_indexes: Enum.reverse(indexes),
+           batch_bytes: bytes,
+           error_ref: error_ref || empty_blob_error_ref()
+         }}
+
+      {:error, _reason} = error ->
+        error
+    end
   end
+
+  defp find_seen_payload([], _payload), do: :error
+
+  defp find_seen_payload([{seen_payload, index} | _rest], payload)
+       when seen_payload == payload,
+       do: {:ok, index}
+
+  defp find_seen_payload([_other | rest], payload), do: find_seen_payload(rest, payload)
 
   defp segment_header(%BlobRef{version: 2, size: size, checksum: checksum})
        when is_binary(checksum) and byte_size(checksum) == 32 do
@@ -832,8 +886,7 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  defp blob_error_ref([payload | _]) when is_binary(payload), do: BlobRef.from_payload(payload)
-  defp blob_error_ref(_payloads), do: %BlobRef{checksum: :binary.copy(<<0>>, 32), size: 0}
+  defp empty_blob_error_ref, do: %BlobRef{checksum: :binary.copy(<<0>>, 32), size: 0}
 
   # Blob segments are shard-local files. A local ETS latch is enough to
   # serialize append offsets and GC deletes without paying for :global locks.
