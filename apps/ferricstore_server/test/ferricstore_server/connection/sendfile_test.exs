@@ -14,6 +14,8 @@ defmodule FerricstoreServer.Connection.SendfileTest do
   alias FerricstoreServer.Connection.Sendfile
   alias FerricstoreServer.Resp.Parser
 
+  @blob_segment_header_bytes 48
+
   defmodule FakeTlsTransport do
     def send(test_pid, iodata) do
       Kernel.send(test_pid, {:fake_tls_send, IO.iodata_to_binary(iodata)})
@@ -380,6 +382,63 @@ defmodule FerricstoreServer.Connection.SendfileTest do
       assert Path.extname(path) == ".bloblog"
     after
       Process.delete(:ferricstore_sendfile_open_hook)
+      :gen_tcp.close(server_socket)
+      :gen_tcp.close(client_socket)
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "pipelined repeated GET reuses blob ref validation for the same segment record" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 1024,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    {server_socket, client_socket} = tcp_pair()
+
+    key = "pipeline-blob-sendfile-validation"
+    value = :binary.copy("v", Sendfile.threshold_bytes() + 1024)
+
+    assert :ok = Router.put(ctx, key, value, 0)
+
+    state = %Connection{
+      socket: server_socket,
+      transport: :ranch_tcp,
+      client_id: :test_client,
+      instance_ctx: ctx,
+      stats_counter: ctx.stats_counter,
+      authenticated: true,
+      require_auth: false,
+      acl_cache: :full_access,
+      tracking: nil
+    }
+
+    commands = [
+      {:command, "GET", [key], {:get, key}, [key]},
+      {:command, "GET", [key], {:get, key}, [key]}
+    ]
+
+    send_response = fn socket, :ranch_tcp, response -> :gen_tcp.send(socket, response) end
+    handle_command = fn command, _state -> flunk("unexpected fallback: #{inspect(command)}") end
+    parent = self()
+
+    Process.put(:ferricstore_sendfile_pread_hook, fn fd, offset, size ->
+      send(parent, {:sendfile_pread, offset, size})
+      :file.pread(fd, offset, size)
+    end)
+
+    try do
+      assert {:continue, _new_state} =
+               Pipeline.pipeline_dispatch(commands, state, handle_command, send_response)
+
+      response = recv_until(client_socket, "$#{byte_size(value)}\r\n", "", 100)
+      assert response =~ "$#{byte_size(value)}\r\n"
+
+      assert [{_header_offset, @blob_segment_header_bytes}] = collect_sendfile_preads()
+    after
+      Process.delete(:ferricstore_sendfile_pread_hook)
       :gen_tcp.close(server_socket)
       :gen_tcp.close(client_socket)
       IsolatedInstance.checkin(ctx)

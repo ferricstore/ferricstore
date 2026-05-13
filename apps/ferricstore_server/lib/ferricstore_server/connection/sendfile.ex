@@ -333,7 +333,23 @@ defmodule FerricstoreServer.Connection.Sendfile do
       ) do
     case cached_file_open(path, file_cache) do
       {:ok, fd, new_cache} ->
-        result = do_sendfile_range_open(path, fd, offset, size, validator, state)
+        {result, new_cache} =
+          case cached_validate_file_range(
+                 path,
+                 fd,
+                 offset,
+                 size,
+                 validator,
+                 :sendfile,
+                 new_cache
+               ) do
+            {:ok, validated_cache} ->
+              {send_file_range_with_cork(state.socket, fd, offset, size, state), validated_cache}
+
+            {:mismatch, validated_cache} ->
+              {:fallback, validated_cache}
+          end
+
         emit_sendfile_result(result, size, state)
 
         case result do
@@ -358,7 +374,23 @@ defmodule FerricstoreServer.Connection.Sendfile do
   def send_file_range_response_cached(args, path, offset, size, validator, state, file_cache) do
     case cached_file_open(path, file_cache) do
       {:ok, fd, new_cache} ->
-        result = do_stream_file_get_open(path, fd, offset, size, validator, state)
+        {result, new_cache} =
+          case cached_validate_file_range(
+                 path,
+                 fd,
+                 offset,
+                 size,
+                 validator,
+                 :verify_payload,
+                 new_cache
+               ) do
+            {:ok, validated_cache} ->
+              {stream_file_get_open(fd, offset, size, state), validated_cache}
+
+            {:mismatch, validated_cache} ->
+              {:fallback, validated_cache}
+          end
+
         emit_file_stream_result(result, size, state)
 
         case result do
@@ -639,7 +671,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
       |> Enum.zip(lookup_keys)
       |> Enum.zip(results)
 
-    {result, file_cache} = stream_mget_entries(entries, state, %{})
+    {result, file_cache} = stream_mget_entries(entries, state, new_file_cache())
     close_file_cache(file_cache)
 
     case result do
@@ -704,7 +736,23 @@ defmodule FerricstoreServer.Connection.Sendfile do
       ) do
     case cached_file_open(path, file_cache) do
       {:ok, fd, new_cache} ->
-        result = do_sendfile_get_open(key, validate_key, path, fd, offset, size, state, true)
+        {result, new_cache} =
+          case cached_validate_file_ref(
+                 path,
+                 fd,
+                 validate_key,
+                 offset,
+                 size,
+                 :sendfile,
+                 new_cache
+               ) do
+            {:ok, validated_cache} ->
+              {send_with_cork(state.socket, fd, offset, size, key, state, true), validated_cache}
+
+            {:mismatch, validated_cache} ->
+              {:fallback, validated_cache}
+          end
+
         emit_sendfile_result(result, size, state)
 
         case result do
@@ -734,7 +782,23 @@ defmodule FerricstoreServer.Connection.Sendfile do
       ) do
     case cached_file_open(path, file_cache) do
       {:ok, fd, new_cache} ->
-        result = do_stream_file_ref_get_open(validate_key, path, fd, offset, size, state)
+        {result, new_cache} =
+          case cached_validate_file_ref(
+                 path,
+                 fd,
+                 validate_key,
+                 offset,
+                 size,
+                 :verify_payload,
+                 new_cache
+               ) do
+            {:ok, validated_cache} ->
+              {stream_file_get_open(fd, offset, size, state), validated_cache}
+
+            {:mismatch, validated_cache} ->
+              {:fallback, validated_cache}
+          end
+
         emit_file_stream_result(result, size, state)
 
         case result do
@@ -768,7 +832,23 @@ defmodule FerricstoreServer.Connection.Sendfile do
       ) do
     case cached_file_open(path, file_cache) do
       {:ok, fd, new_cache} ->
-        result = do_sendfile_get_open(key, validate_key, path, fd, offset, size, state, false)
+        {result, new_cache} =
+          case cached_validate_file_ref(
+                 path,
+                 fd,
+                 validate_key,
+                 offset,
+                 size,
+                 :sendfile,
+                 new_cache
+               ) do
+            {:ok, validated_cache} ->
+              {send_with_cork(state.socket, fd, offset, size, key, state, false), validated_cache}
+
+            {:mismatch, validated_cache} ->
+              {:fallback, validated_cache}
+          end
+
         emit_sendfile_result(result, size, state)
 
         case result do
@@ -798,7 +878,23 @@ defmodule FerricstoreServer.Connection.Sendfile do
       ) do
     case cached_file_open(path, file_cache) do
       {:ok, fd, new_cache} ->
-        result = do_stream_file_ref_get_open(validate_key, path, fd, offset, size, state)
+        {result, new_cache} =
+          case cached_validate_file_ref(
+                 path,
+                 fd,
+                 validate_key,
+                 offset,
+                 size,
+                 :verify_payload,
+                 new_cache
+               ) do
+            {:ok, validated_cache} ->
+              {stream_file_get_open(fd, offset, size, state), validated_cache}
+
+            {:mismatch, validated_cache} ->
+              {:fallback, validated_cache}
+          end
+
         emit_file_stream_result(result, size, state)
 
         case result do
@@ -1268,25 +1364,71 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   defp validate_open_value_ref(_fd, _key, _value_offset, _value_size), do: :mismatch
 
-  defp cached_file_open(path, file_cache) do
-    case Map.fetch(file_cache, path) do
+  defp cached_file_open(path, %{files: files} = file_cache) do
+    case Map.fetch(files, path) do
       {:ok, fd} ->
         {:ok, fd, file_cache}
 
       :error ->
         case file_open(path) do
-          {:ok, fd} -> {:ok, fd, Map.put(file_cache, path, fd)}
+          {:ok, fd} -> {:ok, fd, %{file_cache | files: Map.put(files, path, fd)}}
           {:error, _reason} = error -> error
         end
     end
   end
 
   @doc false
-  def new_file_cache, do: %{}
+  def new_file_cache, do: %{files: %{}, validations: %{}}
 
   @doc false
-  def close_file_cache(file_cache) do
-    Enum.each(file_cache, fn {_path, fd} -> :file.close(fd) end)
+  def close_file_cache(%{files: files}) do
+    Enum.each(files, fn {_path, fd} -> :file.close(fd) end)
+  end
+
+  defp cached_validate_file_ref(path, fd, key, offset, size, mode, file_cache) do
+    cache_key = validation_cache_key(path, key, offset, size, mode)
+
+    cached_validate(cache_key, file_cache, fn ->
+      validate_open_file_ref(path, fd, key, offset, size, mode)
+    end)
+  end
+
+  defp cached_validate_file_range(_path, _fd, _offset, _size, :none, _mode, file_cache),
+    do: {:ok, file_cache}
+
+  defp cached_validate_file_range(
+         path,
+         fd,
+         _offset,
+         _size,
+         {:blob, value_offset, value_size},
+         mode,
+         file_cache
+       ) do
+    cache_key = validation_cache_key(path, nil, value_offset, value_size, mode)
+
+    cached_validate(cache_key, file_cache, fn ->
+      validate_open_blob_file_ref(path, fd, value_offset, value_size, mode)
+    end)
+  end
+
+  defp cached_validate(cache_key, %{validations: validations} = file_cache, validate_fun) do
+    case Map.fetch(validations, cache_key) do
+      {:ok, result} ->
+        {result, file_cache}
+
+      :error ->
+        result = validate_fun.()
+        {result, %{file_cache | validations: Map.put(validations, cache_key, result)}}
+    end
+  end
+
+  defp validation_cache_key(path, key, offset, size, mode) do
+    if blob_file_ref_path?(path) do
+      {:blob_ref, path, offset, size, mode}
+    else
+      {:value_ref, path, key, offset, size, mode}
+    end
   end
 
   defp file_open(path) do
