@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.BlobSideChannelTest do
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey}
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Test.IsolatedInstance
 
@@ -40,8 +40,10 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     ctx: ctx,
     shard: shard
   } do
-    blob_path = write_blob_file(ctx, "shared/ref-1.blob", :binary.copy("A", 1024))
-    blob_ref = blob_ref("shared/ref-1", byte_size(File.read!(blob_path)))
+    payload = :binary.copy("A", 1024)
+    assert {:ok, ref} = BlobStore.put(ctx.data_dir, 0, payload)
+    blob_path = BlobRef.path(ctx.data_dir, 0, ref)
+    blob_ref = BlobRef.encode!(ref)
 
     assert :ok = GenServer.call(shard, {:put, "blob:shared", blob_ref, 0})
     assert :ok = GenServer.call(shard, {:put, "blob:dead", "dead", 0})
@@ -54,16 +56,23 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
              GenServer.call(shard, {:run_compaction, [0]})
 
     assert blob_ref == GenServer.call(shard, {:get, "blob:shared"})
-    assert File.read!(blob_path) == :binary.copy("A", 1024)
+    assert File.read!(blob_path) == payload
+    assert {:ok, ^payload} = BlobStore.get(ctx.data_dir, 0, ref)
   end
 
   test "promoted dedicated compaction rewrites blob refs without owning blob bytes", %{
     ctx: ctx,
     shard: shard
   } do
-    blob_path = write_blob_file(ctx, "promoted/ref-1.blob", :binary.copy("B", 2048))
-    first_ref = blob_ref("promoted/ref-1", byte_size(File.read!(blob_path)))
-    second_ref = blob_ref("promoted/ref-2", 4096)
+    first_payload = :binary.copy("B", 2048)
+    second_payload = :binary.copy("C", 4096)
+
+    assert {:ok, first_blob_ref} = BlobStore.put(ctx.data_dir, 0, first_payload)
+    assert {:ok, second_blob_ref} = BlobStore.put(ctx.data_dir, 0, second_payload)
+
+    blob_path = BlobRef.path(ctx.data_dir, 0, first_blob_ref)
+    first_ref = BlobRef.encode!(first_blob_ref)
+    second_ref = BlobRef.encode!(second_blob_ref)
 
     redis_key = "blob_hash"
     field_a = CompoundKey.hash_field(redis_key, "a")
@@ -86,20 +95,9 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
 
     assert first_ref == GenServer.call(shard, {:compound_get, redis_key, field_a})
     assert second_ref == GenServer.call(shard, {:compound_get, redis_key, field_b})
-    assert File.read!(blob_path) == :binary.copy("B", 2048)
-  end
-
-  defp write_blob_file(ctx, relative_path, payload) do
-    path = Path.join(Ferricstore.DataDir.blob_shard_path(ctx.data_dir, 0), relative_path)
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, payload)
-    path
-  end
-
-  defp blob_ref(id, size) do
-    # Future blob support must store a small ref like this in Bitcask/Raft.
-    # The external blob file is copied by cluster sync and collected separately.
-    "blobref:v1:" <> id <> ":" <> Integer.to_string(size)
+    assert File.read!(blob_path) == first_payload
+    assert {:ok, ^first_payload} = BlobStore.get(ctx.data_dir, 0, first_blob_ref)
+    assert {:ok, ^second_payload} = BlobStore.get(ctx.data_dir, 0, second_blob_ref)
   end
 
   defp force_rotate_active_file(shard) do
