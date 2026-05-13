@@ -313,6 +313,9 @@ defmodule Ferricstore.Raft.StateMachine do
       from ETS/Bitcask, delegates to `ListOps.execute/4`, and persists the result.
     * `{:compound_put, compound_key, value, expire_at_ms}` -- Write a hash/set/zset
       field. Inserts `{compound_key, value, expire_at_ms}` into ETS and Bitcask.
+    * `{:compound_put_blob_ref, compound_key, encoded_ref, expire_at_ms}` --
+      Compound PUT whose large value was externalized before Ra submission.
+      ZSET score commands stay inline so score indexes never consume refs.
     * `{:compound_delete, compound_key}` -- Delete a hash/set/zset field. Removes
       the compound key from ETS and Bitcask.
     * `{:compound_delete_prefix, prefix}` -- Delete all compound keys matching the
@@ -684,6 +687,27 @@ defmodule Ferricstore.Raft.StateMachine do
           :ok ->
             with_pending_writes(state, fn ->
               do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
+            end)
+
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
+
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
+  end
+
+  def apply(meta, {:compound_put_blob_ref, compound_key, encoded_ref, expire_at_ms}, state) do
+    with_apply_time(meta, fn ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
+
+      result =
+        case check_key_lock(state, redis_key, nil) do
+          :ok ->
+            with_pending_writes(state, fn ->
+              do_compound_put_blob_ref(state, redis_key, compound_key, encoded_ref, expire_at_ms)
             end)
 
           {:error, :key_locked} ->
@@ -3894,6 +3918,20 @@ defmodule Ferricstore.Raft.StateMachine do
     case check_key_lock(state, redis_key, nil) do
       :ok -> do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
       {:error, :key_locked} -> {:error, :key_locked}
+    end
+  end
+
+  defp apply_single(state, {:compound_put_blob_ref, compound_key, encoded_ref, expire_at_ms}) do
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
+
+    case check_key_lock(state, redis_key, nil) do
+      :ok ->
+        do_compound_put_blob_ref(state, redis_key, compound_key, encoded_ref, expire_at_ms,
+          materialize_pending?: true
+        )
+
+      {:error, :key_locked} ->
+        {:error, :key_locked}
     end
   end
 
@@ -13780,6 +13818,88 @@ defmodule Ferricstore.Raft.StateMachine do
     result
   end
 
+  defp do_compound_put_blob_ref(
+         state,
+         redis_key,
+         compound_key,
+         encoded_ref,
+         expire_at_ms,
+         opts \\ []
+       )
+
+  defp do_compound_put_blob_ref(
+         state,
+         redis_key,
+         compound_key,
+         encoded_ref,
+         expire_at_ms,
+         opts
+       )
+       when is_binary(encoded_ref) do
+    opts =
+      if zset_compound_key?(redis_key, compound_key) do
+        Keyword.put(opts, :materialize_pending?, true)
+      else
+        opts
+      end
+
+    with {:ok, pending_value} <- prepare_blob_ref_pending_value(state, encoded_ref, opts) do
+      result =
+        case promoted_compound_path(state, redis_key, compound_key) do
+          nil ->
+            raw_put_persisted_blob_ref(
+              state,
+              compound_key,
+              encoded_ref,
+              expire_at_ms,
+              pending_value
+            )
+
+          dedicated_path ->
+            do_promoted_compound_put_blob_ref(
+              state,
+              redis_key,
+              compound_key,
+              encoded_ref,
+              expire_at_ms,
+              dedicated_path,
+              pending_value
+            )
+        end
+
+      if result == :ok do
+        zset_index_put(
+          state,
+          redis_key,
+          compound_key,
+          blob_ref_index_value(encoded_ref, pending_value)
+        )
+      end
+
+      result
+    end
+  end
+
+  defp do_compound_put_blob_ref(
+         _state,
+         _redis_key,
+         _compound_key,
+         _encoded_ref,
+         _expire_at_ms,
+         _opts
+       ),
+       do: {:error, {:blob_ref_unavailable, :invalid_ref}}
+
+  defp blob_ref_index_value(_encoded_ref, pending_value) when pending_value != :none,
+    do: pending_value
+
+  defp blob_ref_index_value(encoded_ref, :none), do: encoded_ref
+
+  defp zset_compound_key?(redis_key, compound_key)
+       when is_binary(redis_key) and is_binary(compound_key) do
+    String.starts_with?(compound_key, CompoundKey.zset_prefix(redis_key))
+  end
+
   defp do_compound_batch_put(_state, _redis_key, []), do: :ok
 
   defp do_compound_batch_put(state, redis_key, entries) do
@@ -14086,6 +14206,47 @@ defmodule Ferricstore.Raft.StateMachine do
         )
 
         sm_tx_put_pending(compound_key, value, expire_at_ms)
+        deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+        if MapSet.member?(deleted, compound_key) do
+          Process.put(:tx_deleted_keys, MapSet.delete(deleted, compound_key))
+        end
+
+        :ok
+
+      {:error, _reason} = err ->
+        err
+    end
+  end
+
+  defp do_promoted_compound_put_blob_ref(
+         state,
+         redis_key,
+         compound_key,
+         encoded_ref,
+         expire_at_ms,
+         dedicated_path,
+         pending_value
+       ) do
+    Promotion.await_compaction_latch(state, redis_key)
+
+    active = Promotion.find_active(dedicated_path)
+    fid = parse_fid_from_path(active)
+
+    case NIF.v2_append_record(active, compound_key, encoded_ref, expire_at_ms) do
+      {:ok, {offset, _record_size}} ->
+        value_size = byte_size(encoded_ref)
+        track_keydir_binary_delta(state, compound_key, nil, expire_at_ms)
+
+        :ets.insert(
+          state.ets,
+          {compound_key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size}
+        )
+
+        if pending_value != :none do
+          sm_tx_put_pending(compound_key, pending_value, expire_at_ms)
+        end
+
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
         if MapSet.member?(deleted, compound_key) do

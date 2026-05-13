@@ -2,7 +2,7 @@ defmodule Ferricstore.Raft.BlobCommandTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Raft.BlobCommand
-  alias Ferricstore.Store.{BlobRef, BlobStore}
+  alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey}
 
   setup do
     root =
@@ -86,6 +86,34 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert {:ok, ^new_value} = BlobStore.get(root, 0, ref)
   end
 
+  test "prepares large compound put as a pre-externalized blob ref", %{
+    ctx: ctx,
+    root: root
+  } do
+    payload = :binary.copy("H", 1024)
+    compound_key = CompoundKey.hash_field("hash", "field")
+
+    assert {:ok, {:compound_put_blob_ref, ^compound_key, encoded_ref, 0}} =
+             BlobCommand.prepare(
+               ctx,
+               0,
+               {:compound_put, compound_key, payload, 0},
+               single_member?: true
+             )
+
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
+  end
+
+  test "leaves zset score compound puts inline", %{ctx: ctx} do
+    payload = :binary.copy("9", 1024)
+    compound_key = CompoundKey.zset_member("zset", "member")
+    command = {:compound_put, compound_key, payload, 0}
+
+    assert {:ok, ^command} = BlobCommand.prepare(ctx, 0, command, single_member?: true)
+    refute BlobCommand.side_channel_candidate?(ctx, command)
+  end
+
   test "prepares mixed put batch without duplicating small values", %{ctx: ctx, root: root} do
     payload = :binary.copy("B", 1024)
 
@@ -116,6 +144,8 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     append_suffix = :binary.copy("A", 1024)
     setrange_patch = :binary.copy("R", 1024)
     cas_value = :binary.copy("C", 1024)
+    hash_value = :binary.copy("H", 1024)
+    hash_field = CompoundKey.hash_field("hash", "field")
     opts = %{nx: true, xx: false, get: false, keepttl: false}
 
     assert {:ok,
@@ -127,7 +157,8 @@ defmodule Ferricstore.Raft.BlobCommandTest do
                {:getset_blob_ref, "g", getset_encoded_ref},
                {:append_blob_ref, "a", append_encoded_ref},
                {:setrange_blob_ref, "r", 4, setrange_encoded_ref},
-               {:cas_blob_ref, "c", "old", cas_encoded_ref, nil}
+               {:cas_blob_ref, "c", "old", cas_encoded_ref, nil},
+               {:compound_put_blob_ref, ^hash_field, hash_encoded_ref, 0}
              ]}} =
              BlobCommand.prepare(
                ctx,
@@ -140,7 +171,8 @@ defmodule Ferricstore.Raft.BlobCommandTest do
                   {:getset, "g", getset_payload},
                   {:append, "a", append_suffix},
                   {:setrange, "r", 4, setrange_patch},
-                  {:cas, "c", "old", cas_value, nil}
+                  {:cas, "c", "old", cas_value, nil},
+                  {:compound_put, hash_field, hash_value, 0}
                 ]},
                single_member?: true
              )
@@ -151,12 +183,14 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert {:ok, append_ref} = BlobRef.decode(append_encoded_ref)
     assert {:ok, setrange_ref} = BlobRef.decode(setrange_encoded_ref)
     assert {:ok, cas_ref} = BlobRef.decode(cas_encoded_ref)
+    assert {:ok, hash_ref} = BlobRef.decode(hash_encoded_ref)
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
     assert {:ok, ^set_payload} = BlobStore.get(root, 0, set_ref)
     assert {:ok, ^getset_payload} = BlobStore.get(root, 0, getset_ref)
     assert {:ok, ^append_suffix} = BlobStore.get(root, 0, append_ref)
     assert {:ok, ^setrange_patch} = BlobStore.get(root, 0, setrange_ref)
     assert {:ok, ^cas_value} = BlobStore.get(root, 0, cas_ref)
+    assert {:ok, ^hash_value} = BlobStore.get(root, 0, hash_ref)
   end
 
   test "prepares generic Ra batches with one blob segment fsync", %{ctx: ctx, root: root} do
@@ -251,6 +285,11 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert BlobCommand.side_channel_candidate?(
              ctx,
              {:cas, "large", "old", :binary.copy("C", 1024), nil}
+           )
+
+    assert BlobCommand.side_channel_candidate?(
+             ctx,
+             {:compound_put, CompoundKey.hash_field("hash", "field"), :binary.copy("H", 1024), 0}
            )
 
     assert BlobCommand.side_channel_candidate?(

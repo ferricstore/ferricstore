@@ -3652,6 +3652,70 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert {:error, {:blob_ref_unavailable, :enoent}} = result
       assert [{^key, "old", 0, _lfu, 0, 0, 3}] = :ets.lookup(ets, key)
     end
+
+    test "compound put blob ref stores the validated ref", %{
+      state: state,
+      ets: ets
+    } do
+      compound_key = CompoundKey.hash_field("blob_hash", "field")
+      payload = :binary.copy("blob-hash", 32)
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+      encoded_ref_size = byte_size(encoded_ref)
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:compound_put_blob_ref, compound_key, encoded_ref, 0}, state)
+
+      assert result == :ok
+
+      assert [{^compound_key, nil, 0, _lfu, _fid, _off, ^encoded_ref_size}] =
+               :ets.lookup(ets, compound_key)
+    end
+
+    test "compound put blob ref preserves the old value when validation fails", %{
+      state: state,
+      ets: ets
+    } do
+      compound_key = CompoundKey.hash_field("blob_hash_invalid", "field")
+      missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+
+      :ets.insert(
+        ets,
+        {compound_key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")}
+      )
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:compound_put_blob_ref, compound_key, missing_ref, 0}, state)
+
+      assert {:error, {:blob_ref_unavailable, :enoent}} = result
+      assert [{^compound_key, "old", 0, _lfu, 0, 0, 3}] = :ets.lookup(ets, compound_key)
+    end
+
+    test "mixed batch compound put blob ref is visible to later RMW commands", %{
+      state: state,
+      ets: ets
+    } do
+      key = "blob_hash_batch"
+      field = "field"
+      compound_key = CompoundKey.hash_field(key, field)
+      payload = "1"
+      expected_size = byte_size("2")
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:batch,
+           [{:compound_put_blob_ref, compound_key, encoded_ref, 0}, {:hincrby, key, field, 1}]},
+          state
+        )
+
+      assert result == {:ok, [:ok, 2]}
+
+      assert [{^compound_key, "2", 0, _lfu, _fid, _off, ^expected_size}] =
+               :ets.lookup(ets, compound_key)
+    end
   end
 
   describe "apply/3 with {:append, key, suffix}" do

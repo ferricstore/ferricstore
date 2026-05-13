@@ -17,6 +17,7 @@ defmodule Ferricstore.Raft.BlobCommand do
           | {:getset, binary(), binary()}
           | {:setrange, binary(), non_neg_integer(), binary()}
           | {:cas, binary(), binary(), binary(), non_neg_integer() | nil}
+          | {:compound_put, binary(), binary(), non_neg_integer()}
           | {:put_batch, [{binary(), binary(), non_neg_integer()}]}
           | term()
 
@@ -137,6 +138,30 @@ defmodule Ferricstore.Raft.BlobCommand do
     end
   end
 
+  defp prepare_enabled(
+         %{data_dir: data_dir},
+         shard_index,
+         threshold,
+         {:compound_put, compound_key, value, expire_at_ms}
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_binary(compound_key) and is_binary(value) do
+    if compound_blob_side_channel_key?(compound_key) do
+      case prepare_value(data_dir, shard_index, threshold, value) do
+        {:ok, {^value, :value}} ->
+          {:ok, {:compound_put, compound_key, value, expire_at_ms}}
+
+        {:ok, {encoded_ref, :blob_ref}} ->
+          {:ok, {:compound_put_blob_ref, compound_key, encoded_ref, expire_at_ms}}
+
+        {:error, _reason} = error ->
+          error
+      end
+    else
+      {:ok, {:compound_put, compound_key, value, expire_at_ms}}
+    end
+  end
+
   defp prepare_enabled(%{data_dir: data_dir}, shard_index, threshold, {:put_batch, entries})
        when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
               is_list(entries) do
@@ -187,6 +212,11 @@ defmodule Ferricstore.Raft.BlobCommand do
   defp command_candidate?({:cas, _key, expected, new_value, _ttl_ms}, threshold)
        when is_binary(expected) and is_binary(new_value) do
     externalize?(new_value, threshold)
+  end
+
+  defp command_candidate?({:compound_put, compound_key, value, _expire_at_ms}, threshold)
+       when is_binary(compound_key) and is_binary(value) do
+    compound_blob_side_channel_key?(compound_key) and externalize?(value, threshold)
   end
 
   defp command_candidate?({:put_batch, entries}, threshold) when is_list(entries) do
@@ -298,6 +328,16 @@ defmodule Ferricstore.Raft.BlobCommand do
           {:cont, {:ok, [{:cas, key, expected, new_value, ttl_ms} | acc], external_payloads}}
         end
 
+      {:compound_put, compound_key, value, expire_at_ms}, {:ok, acc, external_payloads}
+      when is_binary(compound_key) and is_binary(value) ->
+        if compound_blob_side_channel_key?(compound_key) and externalize?(value, threshold) do
+          marker = {:compound_put_external, compound_key, expire_at_ms}
+          {:cont, {:ok, [marker | acc], [value | external_payloads]}}
+        else
+          {:cont,
+           {:ok, [{:compound_put, compound_key, value, expire_at_ms} | acc], external_payloads}}
+        end
+
       {:put_batch, entries}, {:ok, acc, external_payloads} when is_list(entries) ->
         case prepare_generic_put_batch_entries(entries, threshold, acc, external_payloads) do
           {:ok, acc, external_payloads} -> {:cont, {:ok, acc, external_payloads}}
@@ -358,6 +398,9 @@ defmodule Ferricstore.Raft.BlobCommand do
         {:cas_external, key, expected, ttl_ms}, [ref | rest] ->
           {{:cas_blob_ref, key, expected, BlobRef.encode!(ref), ttl_ms}, rest}
 
+        {:compound_put_external, compound_key, expire_at_ms}, [ref | rest] ->
+          {{:compound_put_blob_ref, compound_key, BlobRef.encode!(ref), expire_at_ms}, rest}
+
         command, refs ->
           {command, refs}
       end)
@@ -378,4 +421,9 @@ defmodule Ferricstore.Raft.BlobCommand do
   defp externalize?(value, threshold) do
     byte_size(value) >= threshold or BlobRef.ref?(value)
   end
+
+  defp compound_blob_side_channel_key?(<<"H:", _rest::binary>>), do: true
+  defp compound_blob_side_channel_key?(<<"L:", _rest::binary>>), do: true
+  defp compound_blob_side_channel_key?(<<"X:", _rest::binary>>), do: true
+  defp compound_blob_side_channel_key?(_key), do: false
 end
