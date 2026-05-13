@@ -436,6 +436,59 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert {:ok, ^encoded_ref, ^ref} = raw_disk_blob_ref(ctx, keydir, blob_key)
   end
 
+  test "Ra apply validates duplicate pre-externalized batch refs once", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    first_key = "blob:auto:raft-ref-batch-shared-a"
+    second_key = "blob:auto:raft-ref-batch-shared-b"
+    payload = :binary.copy("S", 1536)
+    assert {:ok, ref} = BlobStore.put(ctx.data_dir, 0, payload)
+    encoded_ref = BlobRef.encode!(ref)
+    parent = self()
+    data_dir = ctx.data_dir
+
+    Process.put(:ferricstore_blob_store_verify_hook, fn ^data_dir, 0, ^ref ->
+      send(parent, {:blob_verify, ref})
+      :ok
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_verify_hook) end)
+
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    active_file_path = ShardETS.file_path(shard_path, 0)
+
+    state =
+      StateMachine.init(%{
+        shard_index: 0,
+        shard_data_path: shard_path,
+        active_file_id: 0,
+        active_file_path: active_file_path,
+        ets: keydir,
+        data_dir: ctx.data_dir,
+        instance_ctx: ctx,
+        instance_name: ctx.name
+      })
+
+    assert_state_machine_result(
+      [:ok, :ok],
+      StateMachine.apply(
+        %{index: 1},
+        {:put_blob_batch,
+         [
+           {first_key, encoded_ref, 0, :blob_ref},
+           {second_key, encoded_ref, 0, :blob_ref}
+         ]},
+        state
+      )
+    )
+
+    assert_received {:blob_verify, ^ref}
+    refute_received {:blob_verify, _}
+    assert payload == Router.get(ctx, first_key)
+    assert payload == Router.get(ctx, second_key)
+  end
+
   test "Ra apply publishes the last same-key pre-externalized blob ref in batch", %{
     ctx: ctx,
     keydir: keydir

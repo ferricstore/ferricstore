@@ -4197,25 +4197,46 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp validate_put_blob_batch_entries(state, entries) do
-    Enum.reduce_while(entries, :ok, fn
-      {key, encoded_ref, _expire_at_ms, :blob_ref}, :ok
+    with {:ok, refs} <- collect_put_blob_batch_refs(state, entries),
+         :ok <- validate_put_blob_refs(state, refs) do
+      :ok
+    end
+  end
+
+  defp collect_put_blob_batch_refs(state, entries) do
+    Enum.reduce_while(entries, {:ok, []}, fn
+      {key, encoded_ref, _expire_at_ms, :blob_ref}, {:ok, refs}
       when is_binary(key) and is_binary(encoded_ref) ->
         with :ok <- validate_put_blob_batch_lock(state, key),
-             :ok <- validate_put_blob_ref(state, encoded_ref) do
-          {:cont, :ok}
+             {:ok, %BlobRef{} = ref} <- BlobRef.decode(encoded_ref) do
+          {:cont, {:ok, [ref | refs]}}
         else
+          :error -> {:halt, {:error, {:blob_ref_unavailable, :invalid_ref}}}
           {:error, _reason} = error -> {:halt, error}
         end
 
-      {key, value, _expire_at_ms, :value}, :ok when is_binary(key) and is_binary(value) ->
+      {key, value, _expire_at_ms, :value}, {:ok, refs} when is_binary(key) and is_binary(value) ->
         case validate_put_blob_batch_lock(state, key) do
-          :ok -> {:cont, :ok}
+          :ok -> {:cont, {:ok, refs}}
           {:error, _reason} = error -> {:halt, error}
         end
 
-      _invalid, :ok ->
+      _invalid, {:ok, _refs} ->
         {:halt, {:error, {:blob_batch_invalid_entry, :invalid_entry}}}
     end)
+    |> case do
+      {:ok, refs} -> {:ok, Enum.reverse(refs)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_put_blob_refs(_state, []), do: :ok
+
+  defp validate_put_blob_refs(state, refs) do
+    case BlobStore.verify_many(state.data_dir, state.shard_index, refs) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:blob_ref_unavailable, reason}}
+    end
   end
 
   defp validate_put_blob_batch_lock(state, key) do

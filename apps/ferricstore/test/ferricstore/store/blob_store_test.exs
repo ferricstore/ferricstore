@@ -109,6 +109,21 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:ok, ^payload} = BlobStore.get(root, 0, second_ref)
   end
 
+  test "verify_many validates duplicate refs once", %{root: root} do
+    payload = :binary.copy("same-ref", 512)
+    assert {:ok, ref} = BlobStore.put(root, 0, payload)
+    parent = self()
+
+    verifier = fn ^root, 0, ^ref ->
+      send(parent, {:verified, ref})
+      :ok
+    end
+
+    assert :ok = BlobStore.verify_many(root, 0, [ref, ref], verifier)
+    assert_received {:verified, ^ref}
+    refute_received {:verified, _}
+  end
+
   test "put_many rejects invalid payload without opening the segment", %{root: root} do
     parent = self()
 

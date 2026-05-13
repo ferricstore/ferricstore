@@ -109,8 +109,15 @@ defmodule Ferricstore.Store.BlobStore do
   full payload as a BEAM binary.
   """
   @spec verify(binary(), non_neg_integer(), BlobRef.t()) :: :ok | {:error, reason()}
-  def verify(data_dir, shard_index, %BlobRef{version: 1, size: size} = ref)
+  def verify(data_dir, shard_index, %BlobRef{} = ref)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    case Process.get(:ferricstore_blob_store_verify_hook) do
+      fun when is_function(fun, 3) -> normalize_verify(fun.(data_dir, shard_index, ref))
+      _other -> do_verify(data_dir, shard_index, ref)
+    end
+  end
+
+  defp do_verify(data_dir, shard_index, %BlobRef{version: 1, size: size} = ref) do
     path = BlobRef.path(data_dir, shard_index, ref)
 
     result =
@@ -134,8 +141,7 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  def verify(data_dir, shard_index, %BlobRef{version: 2, size: size, offset: offset} = ref)
-      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+  defp do_verify(data_dir, shard_index, %BlobRef{version: 2, size: size, offset: offset} = ref) do
     path = BlobRef.path(data_dir, shard_index, ref)
 
     result =
@@ -156,6 +162,50 @@ defmodule Ferricstore.Store.BlobStore do
       {:error, reason} = error ->
         emit_error(:verify, shard_index, path, ref, reason)
         error
+    end
+  end
+
+  defp normalize_verify(:ok), do: :ok
+  defp normalize_verify({:error, _reason} = error), do: error
+  defp normalize_verify(other), do: {:error, other}
+
+  @doc """
+  Verifies a batch of refs, validating duplicate refs once.
+
+  This keeps apply-time blob ref checks fully checksummed while avoiding
+  repeated disk reads when a batch intentionally fans out one payload to many
+  keys.
+  """
+  @spec verify_many(
+          binary(),
+          non_neg_integer(),
+          [BlobRef.t()],
+          (binary(), non_neg_integer(), BlobRef.t() -> :ok | {:error, reason()})
+        ) :: :ok | {:error, reason()}
+  def verify_many(data_dir, shard_index, refs, verifier \\ &verify/3)
+
+  def verify_many(data_dir, shard_index, refs, verifier)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_list(refs) and is_function(verifier, 3) do
+    refs
+    |> Enum.reduce_while({:ok, MapSet.new()}, fn
+      %BlobRef{} = ref, {:ok, seen} ->
+        if MapSet.member?(seen, ref) do
+          {:cont, {:ok, seen}}
+        else
+          case verifier.(data_dir, shard_index, ref) do
+            :ok -> {:cont, {:ok, MapSet.put(seen, ref)}}
+            {:error, reason} -> {:halt, {:error, reason}}
+            other -> {:halt, {:error, other}}
+          end
+        end
+
+      _invalid, {:ok, _seen} ->
+        {:halt, {:error, :invalid_blob_ref}}
+    end)
+    |> case do
+      {:ok, _seen} -> :ok
+      {:error, _reason} = error -> error
     end
   end
 
