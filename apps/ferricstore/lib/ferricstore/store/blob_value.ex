@@ -36,6 +36,23 @@ defmodule Ferricstore.Store.BlobValue do
   def maybe_externalize(_data_dir, _shard_index, _threshold, value) when is_binary(value),
     do: {:ok, value}
 
+  @doc "Externalizes a batch of values with one blob append/fsync when needed."
+  @spec maybe_externalize_many(binary(), non_neg_integer(), non_neg_integer(), [binary()]) ::
+          {:ok, [binary()]} | {:error, term()}
+  def maybe_externalize_many(data_dir, shard_index, threshold, values)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_integer(threshold) and threshold > 0 and is_list(values) do
+    externalize_many(data_dir, shard_index, threshold, values)
+  end
+
+  def maybe_externalize_many(_data_dir, _shard_index, _threshold, values) when is_list(values) do
+    if Enum.all?(values, &is_binary/1) do
+      {:ok, values}
+    else
+      {:error, :invalid_blob_payload}
+    end
+  end
+
   @doc """
   Materializes an encoded blob ref when the side-channel is enabled.
 
@@ -57,5 +74,43 @@ defmodule Ferricstore.Store.BlobValue do
 
   defp externalize?(value, threshold) do
     byte_size(value) >= threshold or BlobRef.ref?(value)
+  end
+
+  defp externalize_many(data_dir, shard_index, threshold, values) do
+    values
+    |> Enum.reduce_while({:ok, [], []}, fn
+      value, {:ok, prepared, payloads} when is_binary(value) ->
+        if externalize?(value, threshold) do
+          {:cont, {:ok, [{:external, value} | prepared], [value | payloads]}}
+        else
+          {:cont, {:ok, [{:value, value} | prepared], payloads}}
+        end
+
+      _invalid, {:ok, _prepared, _payloads} ->
+        {:halt, {:error, :invalid_blob_payload}}
+    end)
+    |> case do
+      {:ok, _prepared, []} ->
+        {:ok, values}
+
+      {:ok, prepared, external_payloads} ->
+        with {:ok, refs} <-
+               BlobStore.put_many(data_dir, shard_index, Enum.reverse(external_payloads)) do
+          {:ok, inflate_externalized_values(Enum.reverse(prepared), refs)}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp inflate_externalized_values(prepared, refs) do
+    {values, []} =
+      Enum.map_reduce(prepared, refs, fn
+        {:external, _value}, [ref | rest] -> {BlobRef.encode!(ref), rest}
+        {:value, value}, refs -> {value, refs}
+      end)
+
+    values
   end
 end

@@ -239,6 +239,64 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert binary_part(payload, 256, 32) == Router.getrange(ctx, key, 256, 287)
   end
 
+  test "Ra put_batch externalizes large values with one blob segment fsync", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_fsync_file_hook, fn path ->
+      send(parent, {:blob_fsync_file, path})
+      :ok
+    end)
+
+    key_a = "blob:auto:raft-put-batch-a"
+    key_b = "blob:auto:raft-put-batch-b"
+    payload_a = :binary.copy("A", 1536)
+    payload_b = :binary.copy("B", 2048)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+    active_file_path = ShardETS.file_path(shard_path, 0)
+
+    state =
+      StateMachine.init(%{
+        shard_index: 0,
+        shard_data_path: shard_path,
+        active_file_id: 0,
+        active_file_path: active_file_path,
+        ets: keydir,
+        data_dir: ctx.data_dir,
+        instance_ctx: ctx,
+        instance_name: ctx.name
+      })
+
+    try do
+      assert_state_machine_result(
+        [:ok, :ok],
+        StateMachine.apply(
+          %{index: 1},
+          {:put_batch, [{key_a, payload_a, 0}, {key_b, payload_b, 0}]},
+          state
+        )
+      )
+
+      assert payload_a == Router.get(ctx, key_a)
+      assert payload_b == Router.get(ctx, key_b)
+      assert {:ok, _encoded_a, ref_a} = raw_disk_blob_ref(ctx, keydir, key_a)
+      assert {:ok, _encoded_b, ref_b} = raw_disk_blob_ref(ctx, keydir, key_b)
+
+      assert {:ok, {segment_path, _offset_a, _size_a}} =
+               BlobStore.file_ref(ctx.data_dir, 0, ref_a)
+
+      assert {:ok, {^segment_path, _offset_b, _size_b}} =
+               BlobStore.file_ref(ctx.data_dir, 0, ref_b)
+
+      assert_received {:blob_fsync_file, ^segment_path}
+      refute_received {:blob_fsync_file, _}
+    after
+      Process.delete(:ferricstore_blob_store_fsync_file_hook)
+    end
+  end
+
   test "Ra apply accepts pre-externalized blob refs without double externalizing", %{
     ctx: ctx,
     keydir: keydir

@@ -4261,10 +4261,17 @@ defmodule Ferricstore.Raft.StateMachine do
     mirror_flow_policy? = flow_lmdb_mirror?(nil)
     fast_publish? = pending == [] and pending_values == %{}
 
+    disk_values =
+      persisted_disk_binaries!(
+        state,
+        Enum.map(entries, fn {_key, value, _expire_at_ms} -> value end)
+      )
+
     {results, pending} =
-      Enum.reduce(entries, {[], pending}, fn
-        {key, value, expire_at_ms}, {results, pending_acc} ->
-          disk_val = persisted_disk_binary!(state, value)
+      entries
+      |> Enum.zip(disk_values)
+      |> Enum.reduce({[], pending}, fn
+        {{key, value, expire_at_ms}, disk_val}, {results, pending_acc} ->
           ets_val = value_for_ets(value, hot_cache_threshold(state))
 
           if mirror_flow_policy? and FlowKeys.policy_key?(key) do
@@ -12247,6 +12254,20 @@ defmodule Ferricstore.Raft.StateMachine do
            disk_value
          ) do
       {:ok, persisted_value} -> persisted_value
+      {:error, reason} -> throw({:blob_externalize_failed, reason})
+    end
+  end
+
+  defp persisted_disk_binaries!(state, values) do
+    disk_values = Enum.map(values, &to_disk_binary/1)
+
+    case BlobValue.maybe_externalize_many(
+           state.data_dir,
+           state.shard_index,
+           blob_side_channel_threshold(state),
+           disk_values
+         ) do
+      {:ok, persisted_values} -> persisted_values
       {:error, reason} -> throw({:blob_externalize_failed, reason})
     end
   end
