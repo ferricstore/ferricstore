@@ -835,13 +835,11 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp segment_path(data_dir, shard_index, segment_id) do
-    BlobRef.path(data_dir, shard_index, %BlobRef{
-      version: 2,
-      checksum: :binary.copy(<<0>>, 32),
-      size: 0,
-      segment_id: segment_id,
-      offset: 0
-    })
+    Path.join([
+      Ferricstore.DataDir.blob_shard_path(data_dir, shard_index),
+      "segments",
+      BlobRef.segment_filename(segment_id)
+    ])
   end
 
   defp stat_regular_size(path, expected_size) do

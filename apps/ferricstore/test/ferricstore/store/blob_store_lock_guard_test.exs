@@ -68,4 +68,19 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
            "BlobStore.put_many/3 should validate payloads while computing batch bytes; " <>
              "a separate Enum.all?/2 pass adds avoidable CPU work for large blob batches"
   end
+
+  test "segment_path uses the segment filename directly" do
+    source = File.read!(@source)
+
+    segment_path =
+      source
+      |> String.split("  defp segment_path(data_dir, shard_index, segment_id) do", parts: 2)
+      |> List.last()
+      |> String.split("  defp stat_regular_size", parts: 2)
+      |> List.first()
+
+    refute segment_path =~ "%BlobRef{",
+           "BlobStore.segment_path/3 is on the append path; it should not allocate a fake BlobRef " <>
+             "or checksum just to build the append-segment filename"
+  end
 end
