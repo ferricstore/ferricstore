@@ -157,6 +157,12 @@ defmodule Ferricstore.Raft.BlobCommand do
           {:cont, {:ok, [{:put, key, value, expire_at_ms} | acc], external_payloads}}
         end
 
+      {:put_batch, entries}, {:ok, acc, external_payloads} when is_list(entries) ->
+        case prepare_generic_put_batch_entries(entries, threshold, acc, external_payloads) do
+          {:ok, acc, external_payloads} -> {:cont, {:ok, acc, external_payloads}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+
       command, {:ok, acc, external_payloads} ->
         {:cont, {:ok, [command | acc], external_payloads}}
     end)
@@ -173,6 +179,21 @@ defmodule Ferricstore.Raft.BlobCommand do
       {:error, _reason} = error ->
         error
     end
+  end
+
+  defp prepare_generic_put_batch_entries(entries, threshold, acc, external_payloads) do
+    Enum.reduce_while(entries, {:ok, acc, external_payloads}, fn
+      {key, value, expire_at_ms}, {:ok, acc, external_payloads}
+      when is_binary(key) and is_binary(value) ->
+        if externalize?(value, threshold) do
+          {:cont, {:ok, [{:put_external, key, expire_at_ms} | acc], [value | external_payloads]}}
+        else
+          {:cont, {:ok, [{:put, key, value, expire_at_ms} | acc], external_payloads}}
+        end
+
+      _invalid, {:ok, _acc, _external_payloads} ->
+        {:halt, {:error, :invalid_put_batch_entry}}
+    end)
   end
 
   defp inflate_generic_batch_blob_refs(prepared, refs) do

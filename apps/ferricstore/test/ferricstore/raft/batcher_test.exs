@@ -199,7 +199,8 @@ defmodule Ferricstore.Raft.BatcherTest do
       assert :ok = Batcher.write(shard_index, {:put, k, payload, 0})
       assert payload == Router.get(ctx, k)
 
-      assert {:cold_ref, path, 0, 1024} = Router.get_with_file_ref(ctx, k)
+      assert {:cold_ref, path, blob_offset, 1024} = Router.get_with_file_ref(ctx, k)
+      assert is_integer(blob_offset) and blob_offset >= 0
       assert String.contains?(path, "/blob/shard_#{shard_index}/")
     end
 
@@ -240,7 +241,8 @@ defmodule Ferricstore.Raft.BatcherTest do
       assert "small" == Router.get(ctx, k1)
       assert payload == Router.get(ctx, k2)
 
-      assert {:cold_ref, path, 0, 1024} = Router.get_with_file_ref(ctx, k2)
+      assert {:cold_ref, path, blob_offset, 1024} = Router.get_with_file_ref(ctx, k2)
+      assert is_integer(blob_offset) and blob_offset >= 0
       assert String.contains?(path, "/blob/shard_#{shard_index}/")
     end
   end

@@ -101,6 +101,31 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     refute_received {:blob_fsync_file, _}
   end
 
+  test "prepares nested put_batch inside generic Ra batches", %{ctx: ctx, root: root} do
+    payload = :binary.copy("N", 1024)
+
+    assert {:ok,
+            {:batch,
+             [
+               {:append, "log", "x"},
+               {:put_blob_ref, "large", encoded_ref, 0},
+               {:put, "small", "v", 0}
+             ]}} =
+             BlobCommand.prepare(
+               ctx,
+               0,
+               {:batch,
+                [
+                  {:append, "log", "x"},
+                  {:put_batch, [{"large", payload, 0}, {"small", "v", 0}]}
+                ]},
+               single_member?: true
+             )
+
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
+  end
+
   test "leaves commands unchanged when blob side-channel is disabled", %{ctx: ctx} do
     ctx = %{ctx | blob_side_channel_threshold_bytes: 0}
     command = {:put, "k", :binary.copy("P", 1024), 0}
