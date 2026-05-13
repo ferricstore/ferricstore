@@ -27,6 +27,39 @@ defmodule Ferricstore.Cluster.DataSyncTest do
     assert File.read!(Path.join([target, "flow_lmdb", "lock.mdb"])) == "lmdb-lock"
   end
 
+  test "directory copy streams large files in bounded chunks" do
+    root =
+      Path.join(System.tmp_dir!(), "ferricstore_data_sync_#{System.unique_integer([:positive])}")
+
+    source = Path.join(root, "source")
+    target = Path.join(root, "target")
+    payload = :binary.copy("x", 2_500_000)
+    parent = self()
+
+    on_exit(fn ->
+      Process.delete(:ferricstore_data_sync_copy_chunk_hook)
+      File.rm_rf!(root)
+    end)
+
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "large.blob"), payload)
+
+    Process.put(:ferricstore_data_sync_copy_chunk_hook, fn source_path, target_path, bytes ->
+      send(parent, {:copy_chunk, source_path, target_path, bytes})
+    end)
+
+    assert :ok = DataSync.copy_directory_from(node(), source, node(), target)
+    assert File.read!(Path.join(target, "large.blob")) == payload
+
+    chunks = collect_chunks([])
+
+    assert length(chunks) > 1
+    assert Enum.all?(chunks, fn {_source_path, _target_path, bytes} -> bytes <= 1_048_576 end)
+
+    assert Enum.sum(Enum.map(chunks, fn {_source_path, _target_path, bytes} -> bytes end)) ==
+             2_500_000
+  end
+
   test "shard storage copy includes promoted dedicated data and blob side-channel data" do
     root =
       Path.join(System.tmp_dir!(), "ferricstore_data_sync_#{System.unique_integer([:positive])}")
@@ -82,5 +115,14 @@ defmodule Ferricstore.Cluster.DataSyncTest do
     refute File.exists?(Path.join([target, "dedicated", "shard_0"]))
     refute File.exists?(Path.join([target, "blob", "shard_0"]))
     assert File.exists?(source)
+  end
+
+  defp collect_chunks(acc) do
+    receive do
+      {:copy_chunk, source_path, target_path, bytes} ->
+        collect_chunks([{source_path, target_path, bytes} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 end

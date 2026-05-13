@@ -12,6 +12,7 @@ defmodule Ferricstore.Cluster.DataSync do
   alias Ferricstore.Raft.Cluster, as: RaftCluster
 
   @default_max_retries 3
+  @copy_chunk_bytes 1_048_576
 
   # ---------------------------------------------------------------------------
   # WAL gap detection
@@ -538,15 +539,68 @@ defmodule Ferricstore.Cluster.DataSync do
       if is_dir do
         copy_directory_from(source_node, src, target_node, dest)
       else
-        content =
-          if source_node == node() do
-            File.read!(src)
-          else
-            :erpc.call(source_node, File, :read!, [src])
-          end
-
-        :erpc.call(target_node, File, :write!, [dest, content])
+        copy_file_from(source_node, src, target_node, dest)
       end
     end)
+  end
+
+  defp copy_file_from(source_node, source_path, target_node, target_path) do
+    {:ok, source_io} = call_on(source_node, File, :open, [source_path, [:read, :binary]])
+    {:ok, target_io} = call_on(target_node, File, :open, [target_path, [:write, :binary]])
+
+    try do
+      copy_file_chunks(source_node, source_io, target_node, target_io, source_path, target_path)
+    after
+      close_file(source_node, source_io)
+      close_file(target_node, target_io)
+    end
+  end
+
+  defp copy_file_chunks(source_node, source_io, target_node, target_io, source_path, target_path) do
+    case call_on(source_node, IO, :binread, [source_io, @copy_chunk_bytes]) do
+      :eof ->
+        :ok
+
+      {:error, reason} ->
+        raise File.Error, reason: reason, action: "read", path: source_path
+
+      chunk when is_binary(chunk) ->
+        case call_on(target_node, IO, :binwrite, [target_io, chunk]) do
+          :ok ->
+            observe_copy_chunk(source_path, target_path, byte_size(chunk))
+
+            copy_file_chunks(
+              source_node,
+              source_io,
+              target_node,
+              target_io,
+              source_path,
+              target_path
+            )
+
+          {:error, reason} ->
+            raise File.Error, reason: reason, action: "write", path: target_path
+        end
+    end
+  end
+
+  defp close_file(target_node, io) do
+    _ = call_on(target_node, File, :close, [io])
+    :ok
+  end
+
+  defp call_on(target_node, module, function, args) do
+    if target_node == node() do
+      apply(module, function, args)
+    else
+      :erpc.call(target_node, module, function, args)
+    end
+  end
+
+  defp observe_copy_chunk(source_path, target_path, bytes) do
+    case Process.get(:ferricstore_data_sync_copy_chunk_hook) do
+      hook when is_function(hook, 3) -> hook.(source_path, target_path, bytes)
+      _ -> :ok
+    end
   end
 end
