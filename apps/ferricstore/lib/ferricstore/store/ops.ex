@@ -1618,27 +1618,20 @@ defmodule Ferricstore.Store.Ops do
     case ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms) do
       {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
         cold_reads
-        |> Enum.zip(values)
+        |> Enum.zip(local_materialize_blob_values(tx, values))
         |> Enum.reduce(%{}, fn
-          {{index, key, path, fid, off, vsize, exp}, value}, acc when is_binary(value) ->
-            case local_materialize_blob_value(tx, value) do
-              {:ok, materialized} ->
-                ShardETS.cold_read_warm_ets(
-                  tx.shard_state,
-                  key,
-                  materialized,
-                  exp,
-                  fid,
-                  off,
-                  vsize
-                )
+          {{index, key, _path, fid, off, vsize, exp}, {:ok, materialized}}, acc ->
+            ShardETS.cold_read_warm_ets(
+              tx.shard_state,
+              key,
+              materialized,
+              exp,
+              fid,
+              off,
+              vsize
+            )
 
-                Map.put(acc, index, {materialized, exp})
-
-              {:error, reason} ->
-                ColdRead.emit_pread_error(path, reason)
-                acc
-            end
+            Map.put(acc, index, {materialized, exp})
 
           {{_index, _key, path, _fid, _off, _vsize, _exp}, {:error, reason}}, acc ->
             ColdRead.emit_pread_error(path, reason)
@@ -1656,6 +1649,48 @@ defmodule Ferricstore.Store.Ops do
         emit_local_batch_cold_errors(cold_reads, reason)
         %{}
     end
+  end
+
+  defp local_materialize_blob_values(tx, values) do
+    {binary_values, indexed_results} =
+      values
+      |> Enum.with_index()
+      |> Enum.reduce({[], %{}}, fn
+        {value, index}, {binary_values, indexed_results} when is_binary(value) ->
+          {[{index, value} | binary_values], indexed_results}
+
+        {{:error, reason}, index}, {binary_values, indexed_results} ->
+          {binary_values, Map.put(indexed_results, index, {:error, reason})}
+
+        {_unexpected, index}, {binary_values, indexed_results} ->
+          {binary_values, Map.put(indexed_results, index, :skip)}
+      end)
+
+    indexed_results =
+      if binary_values == [] do
+        indexed_results
+      else
+        ordered_values = Enum.reverse(binary_values)
+
+        ordered_values
+        |> Enum.map(fn {_index, value} -> value end)
+        |> then(fn values ->
+          BlobValue.maybe_materialize_many(
+            tx.shard_state.data_dir,
+            tx.shard_index,
+            BlobValue.threshold(tx.instance_ctx),
+            values
+          )
+        end)
+        |> then(fn materialized -> Enum.zip(ordered_values, materialized) end)
+        |> Enum.reduce(indexed_results, fn {{index, _value}, result}, acc ->
+          Map.put(acc, index, result)
+        end)
+      end
+
+    values
+    |> Enum.with_index()
+    |> Enum.map(fn {_value, index} -> Map.fetch!(indexed_results, index) end)
   end
 
   defp local_materialize_blob_value(tx, value) do

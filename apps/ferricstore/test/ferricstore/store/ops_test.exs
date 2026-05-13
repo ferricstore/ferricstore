@@ -128,6 +128,23 @@ defmodule Ferricstore.Store.OpsTest do
              "LocalTxStore batch reads should pread each repeated cold {path, offset, key} once and fan out the result"
     end
 
+    test "local cold batch reads materialize blob refs with the batch helper" do
+      source = File.read!(@ops_path)
+      [_before, section] = String.split(source, "defp read_unique_local_batch_cold", parts: 2)
+
+      [read_body, helper_section] =
+        String.split(section, "defp local_materialize_blob_values", parts: 2)
+
+      assert read_body =~ "local_materialize_blob_values",
+             "LocalTxStore batch reads should materialize duplicate blob refs once per batch"
+
+      assert helper_section =~ "BlobValue.maybe_materialize_many",
+             "LocalTxStore batch reads should use the BlobValue batch materializer"
+
+      refute read_body =~ "local_materialize_blob_value(tx, value)",
+             "LocalTxStore batch reads should not materialize blob refs one entry at a time"
+    end
+
     test "batch_get returns ordered cold values and warms matching ETS entries" do
       ctx = FerricStore.Instance.get(:default)
 
