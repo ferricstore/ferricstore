@@ -270,21 +270,48 @@ defmodule Ferricstore.Store.Shard.Compound do
 
     emit_compound_batch_cold_read_errors(entries, values)
 
-    Enum.zip(entries, values)
+    Enum.zip(entries, materialize_compound_blob_values(entries, values))
     |> Enum.map(fn
-      {{state, compound_key, _file_path, fid, off, vsize, exp}, value} when is_binary(value) ->
-        case materialize_blob_value(state, value) do
-          {:ok, materialized} ->
-            ShardETS.cold_read_warm_ets(state, compound_key, materialized, exp, fid, off, vsize)
-            materialized
-
-          {:error, _reason} ->
-            nil
-        end
+      {{state, compound_key, _file_path, fid, off, vsize, exp}, {:ok, materialized}} ->
+        ShardETS.cold_read_warm_ets(state, compound_key, materialized, exp, fid, off, vsize)
+        materialized
 
       {_entry, _value} ->
         nil
     end)
+  end
+
+  defp materialize_compound_blob_values(entries, values) do
+    {groups, indexed_results} =
+      entries
+      |> Enum.zip(values)
+      |> Enum.with_index()
+      |> Enum.reduce({%{}, %{}}, fn
+        {{{state, _compound_key, _file_path, _fid, _off, _vsize, _exp}, value}, index},
+        {groups, indexed_results}
+        when is_binary(value) ->
+          group_key = {state.data_dir, state.index, blob_side_channel_threshold(state)}
+          item = {index, value}
+
+          {Map.update(groups, group_key, [item], &[item | &1]), indexed_results}
+
+        {_entry_value, index}, {groups, indexed_results} ->
+          {groups, Map.put(indexed_results, index, :skip)}
+      end)
+
+    indexed_results =
+      Enum.reduce(groups, indexed_results, fn {{data_dir, shard_index, threshold}, items}, acc ->
+        ordered_items = Enum.reverse(items)
+        values = Enum.map(ordered_items, fn {_index, value} -> value end)
+
+        ordered_items
+        |> Enum.zip(BlobValue.maybe_materialize_many(data_dir, shard_index, threshold, values))
+        |> Enum.reduce(acc, fn {{index, _value}, result}, acc -> Map.put(acc, index, result) end)
+      end)
+
+    values
+    |> Enum.with_index()
+    |> Enum.map(fn {_value, index} -> Map.fetch!(indexed_results, index) end)
   end
 
   defp emit_compound_batch_cold_read_errors(entries, values) do

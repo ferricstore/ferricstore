@@ -36,6 +36,29 @@ defmodule Ferricstore.Store.CompoundBatchColdGuardTest do
            "expected compound batch cold reads to deduplicate duplicate cold locations"
   end
 
+  test "compound batch cold reads batch-materialize blob refs" do
+    ast = compound_ast()
+    unique_reader_body = function_body(ast, :read_unique_compound_cold_batch_async, 1)
+    materializer_body = function_body(ast, :materialize_compound_blob_values, 2)
+
+    # Fanout/shared-payload workloads can have many compound fields pointing at
+    # one exact blob ref. The cold reader should decode and read that blob once
+    # per batch, not once per field after the Bitcask batch pread returns.
+    assert contains_local_call?(unique_reader_body, :materialize_compound_blob_values, 2),
+           "expected compound cold batches to use the batch blob materializer"
+
+    assert contains_remote_call?(
+             materializer_body,
+             [:BlobValue],
+             :maybe_materialize_many,
+             4
+           ),
+           "expected compound cold batches to call BlobValue.maybe_materialize_many/4"
+
+    refute contains_local_call?(unique_reader_body, :materialize_blob_value, 2),
+           "compound cold batches should not materialize blob refs one field at a time"
+  end
+
   test "promoted compound batch reads use a dedicated batch cold path" do
     ast = compound_ast()
     batch_get_body = function_body(ast, :handle_compound_batch_get, 3)
