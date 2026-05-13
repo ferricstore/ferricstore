@@ -91,7 +91,9 @@ defmodule FerricstoreServer.Connection.Sendfile do
     ns = state.sandbox_namespace
     lookup_key = if ns, do: ns <> key, else: key
 
-    case Router.get_with_file_ref(state.instance_ctx, lookup_key) do
+    case Router.get_with_file_ref(state.instance_ctx, lookup_key,
+           defer_blob_file_ref_validation?: true
+         ) do
       {:hot, value} ->
         encode_get_result(value, key, state)
 

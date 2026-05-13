@@ -789,16 +789,28 @@ defmodule Ferricstore.Store.Router do
     - `{:cold_ref, path, offset, size}` — value is on disk, file ref for sendfile
     - `{:cold_value, value}` — value was on disk, GenServer fetched it
     - `:miss` — key doesn't exist
+
+  Server streaming callers may pass `defer_blob_file_ref_validation?: true`.
+  That skips duplicate blob segment validation here because sendfile/file-stream
+  validates the same segment immediately before writing bytes to the socket.
+  The default remains validated for embedded/API callers that consume file refs
+  directly.
   """
   @spec get_with_file_ref(FerricStore.Instance.t(), binary()) ::
           {:hot, binary()}
           | {:cold_ref, binary(), non_neg_integer(), non_neg_integer()}
           | {:cold_value, binary()}
           | :miss
-  def get_with_file_ref(ctx, key) do
+  @spec get_with_file_ref(FerricStore.Instance.t(), binary(), keyword()) ::
+          {:hot, binary()}
+          | {:cold_ref, binary(), non_neg_integer(), non_neg_integer()}
+          | {:cold_value, binary()}
+          | :miss
+  def get_with_file_ref(ctx, key, opts \\ []) do
     idx = shard_for(ctx, key)
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
+    defer_blob_validation? = Keyword.get(opts, :defer_blob_file_ref_validation?, false) == true
 
     case ets_get_full(ctx, idx, keydir, key, now) do
       {:hit, value, lfu} ->
@@ -807,7 +819,17 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, file_id, offset, value_size}
       when valid_cold_location(file_id, offset, value_size) ->
-        case file_ref_from_cold_location(ctx, idx, keydir, key, file_id, offset, value_size, now) do
+        case file_ref_from_cold_location(
+               ctx,
+               idx,
+               keydir,
+               key,
+               file_id,
+               offset,
+               value_size,
+               now,
+               defer_blob_validation?
+             ) do
           {:ok, {path, value_offset, value_size}} ->
             Stats.record_cold_read(ctx, key)
             {:cold_ref, path, value_offset, value_size}
@@ -875,10 +897,28 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp file_ref_from_cold_location(ctx, idx, keydir, key, file_id, offset, value_size, now) do
+  defp file_ref_from_cold_location(
+         ctx,
+         idx,
+         keydir,
+         key,
+         file_id,
+         offset,
+         value_size,
+         now,
+         defer_blob_validation? \\ false
+       ) do
     path = cold_file_path(ctx, idx, file_id)
 
-    case cold_blob_file_ref_from_location(ctx, idx, path, offset, key, value_size) do
+    case cold_blob_file_ref_from_location(
+           ctx,
+           idx,
+           path,
+           offset,
+           key,
+           value_size,
+           defer_blob_validation?
+         ) do
       {:ok, file_ref} ->
         {:ok, file_ref}
 
@@ -894,7 +934,8 @@ defmodule Ferricstore.Store.Router do
               keydir,
               key,
               {file_id, offset, value_size},
-              now
+              now,
+              defer_blob_validation?
             )
         end
 
@@ -905,13 +946,30 @@ defmodule Ferricstore.Store.Router do
           keydir,
           key,
           {file_id, offset, value_size},
-          now
+          now,
+          defer_blob_validation?
         )
     end
   end
 
-  defp retry_file_ref_from_changed_location(ctx, idx, keydir, key, original_location, now) do
-    case retry_changed_file_ref(ctx, idx, keydir, key, original_location, now) do
+  defp retry_file_ref_from_changed_location(
+         ctx,
+         idx,
+         keydir,
+         key,
+         original_location,
+         now,
+         defer_blob_validation?
+       ) do
+    case retry_changed_file_ref(
+           ctx,
+           idx,
+           keydir,
+           key,
+           original_location,
+           now,
+           defer_blob_validation?
+         ) do
       {:cold_ref, retry_path, value_offset, retry_size} ->
         {:ok, {retry_path, value_offset, retry_size}}
 
@@ -923,12 +981,36 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp retry_changed_file_ref(ctx, idx, keydir, key, original_location, now) do
-    case retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now) do
+  defp retry_changed_file_ref(
+         ctx,
+         idx,
+         keydir,
+         key,
+         original_location,
+         now,
+         defer_blob_validation? \\ false
+       ) do
+    case retry_changed_file_ref_once(
+           ctx,
+           idx,
+           keydir,
+           key,
+           original_location,
+           now,
+           defer_blob_validation?
+         ) do
       :unchanged_cold ->
         retry_after_unchanged_cold_location(
           fn ->
-            retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now)
+            retry_changed_file_ref_once(
+              ctx,
+              idx,
+              keydir,
+              key,
+              original_location,
+              now,
+              defer_blob_validation?
+            )
           end,
           cold_retry_metadata(ctx, idx, key, :file_ref)
         )
@@ -938,7 +1020,15 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now) do
+  defp retry_changed_file_ref_once(
+         ctx,
+         idx,
+         keydir,
+         key,
+         original_location,
+         now,
+         defer_blob_validation?
+       ) do
     case ets_get_full(ctx, idx, keydir, key, now) do
       {:hit, value, lfu} ->
         sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
@@ -949,7 +1039,15 @@ defmodule Ferricstore.Store.Router do
              {file_id, offset, value_size} != original_location ->
         path = cold_file_path(ctx, idx, file_id)
 
-        case cold_blob_file_ref_from_location(ctx, idx, path, offset, key, value_size) do
+        case cold_blob_file_ref_from_location(
+               ctx,
+               idx,
+               path,
+               offset,
+               key,
+               value_size,
+               defer_blob_validation?
+             ) do
           {:ok, {blob_path, blob_offset, blob_size}} ->
             {:cold_ref, blob_path, blob_offset, blob_size}
 
@@ -2488,15 +2586,46 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp cold_blob_file_ref_from_location(ctx, idx, path, offset, key, persisted_value_size) do
+  defp cold_blob_file_ref_from_location(
+         ctx,
+         idx,
+         path,
+         offset,
+         key,
+         persisted_value_size,
+         defer_blob_validation?
+       ) do
     with {:ok, %BlobRef{} = ref} <-
            cold_blob_ref_from_location(ctx, path, offset, key, persisted_value_size),
-         {:ok, file_ref} <- validate_blob_file_ref(ctx, idx, ref) do
+         {:ok, file_ref} <- maybe_deferred_blob_file_ref(ctx, idx, ref, defer_blob_validation?) do
       {:ok, file_ref}
     else
       :not_blob -> :not_blob
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp maybe_deferred_blob_file_ref(
+         ctx,
+         idx,
+         %BlobRef{version: 1, size: size} = ref,
+         true
+       ) do
+    {:ok, {BlobRef.path(ctx.data_dir, idx, ref), 0, size}}
+  end
+
+  defp maybe_deferred_blob_file_ref(
+         ctx,
+         idx,
+         %BlobRef{version: 2, offset: offset, size: size} = ref,
+         true
+       )
+       when is_integer(offset) and offset >= 0 do
+    {:ok, {BlobRef.path(ctx.data_dir, idx, ref), offset, size}}
+  end
+
+  defp maybe_deferred_blob_file_ref(ctx, idx, %BlobRef{} = ref, _defer_blob_validation?) do
+    validate_blob_file_ref(ctx, idx, ref)
   end
 
   defp validate_blob_file_ref(ctx, idx, %BlobRef{size: size} = ref) do

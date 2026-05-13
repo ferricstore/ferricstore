@@ -385,6 +385,61 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     end
   end
 
+  test "GET defers blob ref validation to the streaming layer" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 1024,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    on_exit(fn -> IsolatedInstance.checkin(ctx) end)
+
+    key = "get-blob-defer-validation"
+    value = :binary.copy("g", Sendfile.threshold_bytes() + 1024)
+
+    assert :ok = Router.put(ctx, key, value, 0)
+
+    state = %{
+      socket: self(),
+      transport: FakeTlsTransport,
+      client_id: :test_client,
+      instance_ctx: ctx,
+      sandbox_namespace: nil,
+      pubsub_channels: nil,
+      tracking: nil
+    }
+
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_open_read_hook, fn path, modes ->
+      send(parent, {:blob_store_open, path})
+      File.open(path, modes)
+    end)
+
+    Process.put(:ferricstore_sendfile_open_hook, fn path, modes ->
+      send(parent, {:sendfile_open, path})
+      :file.open(path, modes)
+    end)
+
+    fallback = fn _cmd, _args, _state ->
+      flunk("GET fallback should not run after streaming validation succeeds")
+    end
+
+    try do
+      assert {:continue, "", ^state} = Sendfile.dispatch_get([key], state, fallback)
+
+      sends = collect_fake_tls_sends()
+      assert {:ok, [^value], ""} = Parser.parse(IO.iodata_to_binary(sends))
+      refute_received {:blob_store_open, _path}
+      assert [path] = collect_sendfile_opens()
+      assert Path.extname(path) == ".bloblog"
+    after
+      Process.delete(:ferricstore_blob_store_open_read_hook)
+      Process.delete(:ferricstore_sendfile_open_hook)
+    end
+  end
+
   test "pipelined GET reuses one open file for blob refs in the same append segment" do
     ctx =
       IsolatedInstance.checkout(
