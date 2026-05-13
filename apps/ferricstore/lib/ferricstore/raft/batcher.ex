@@ -82,7 +82,9 @@ defmodule Ferricstore.Raft.Batcher do
     * `:shard_id` (required) -- the ra server ID for this shard
     * `:shard_index` (required) -- zero-based shard index
     * `:max_batch_size` -- flush single-write slot when it reaches this size (default: 50_000)
+    * `:max_batch_bytes` -- flush slot before estimated payload bytes exceed this cap (default: 4 MiB)
     * `:max_pending_batches` -- max in-flight Ra batches before backpressure (default: 256)
+    * `:max_pending_bytes` -- max serialized in-flight Ra payload bytes before backpressure (default: 0, disabled)
   """
 
   use GenServer
@@ -95,7 +97,9 @@ defmodule Ferricstore.Raft.Batcher do
   alias Ferricstore.Raft.PerfToggles
 
   @default_max_batch_size 50_000
+  @default_max_batch_bytes 4 * 1024 * 1024
   @default_max_pending_batches 256
+  @default_max_pending_bytes 0
 
   # Origin retry tuning (Option R1 from the rejected-retry design). When Ra
   # returns :rejected {:not_leader, hint, corr} for an origin replay batch, the
@@ -188,18 +192,26 @@ defmodule Ferricstore.Raft.Batcher do
           cmds: [command()],
           froms: [GenServer.from()],
           timer_ref: reference() | nil,
-          window_ms: non_neg_integer()
+          window_ms: non_neg_integer(),
+          count: non_neg_integer(),
+          bytes: non_neg_integer(),
+          created_mono: integer()
         }
 
   defstruct [
     :shard_id,
     :shard_index,
     :max_batch_size,
+    :max_batch_bytes,
     :max_pending_batches,
+    :max_pending_bytes,
     slots: %{},
     ns_cache: %{},
-    # Map from correlation ref -> {froms, :single | :batch} for in-flight ra commands
+    # Map from correlation ref -> pending entry for in-flight ra commands.
+    # Entries carry serialized bytes so large-payload bursts are bounded by
+    # byte pressure, not only by batch count.
     pending: %{},
+    pending_bytes: 0,
     # List of {from} callers waiting for all in-flight to drain (flush barrier)
     flush_waiters: [],
     # Highest ra_index this node's state machine has applied locally. Updated
@@ -232,6 +244,8 @@ defmodule Ferricstore.Raft.Batcher do
     * `:shard_id` (required) -- ra server ID `{name, node()}` for this shard
     * `:shard_index` (required) -- zero-based shard index (used for process name)
     * `:max_batch_size` -- max commands per slot before forced flush (default: #{@default_max_batch_size})
+    * `:max_batch_bytes` -- max estimated payload bytes per slot before forced flush (default: #{@default_max_batch_bytes})
+    * `:max_pending_bytes` -- max serialized in-flight Ra payload bytes before backpressure (default: #{@default_max_pending_bytes})
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -683,13 +697,17 @@ defmodule Ferricstore.Raft.Batcher do
     shard_id = Keyword.fetch!(opts, :shard_id)
     shard_index = Keyword.fetch!(opts, :shard_index)
     max_batch_size = Keyword.get(opts, :max_batch_size, @default_max_batch_size)
+    max_batch_bytes = Keyword.get(opts, :max_batch_bytes, @default_max_batch_bytes)
     max_pending_batches = Keyword.get(opts, :max_pending_batches, @default_max_pending_batches)
+    max_pending_bytes = Keyword.get(opts, :max_pending_bytes, @default_max_pending_bytes)
 
     state = %__MODULE__{
       shard_id: shard_id,
       shard_index: shard_index,
       max_batch_size: max_batch_size,
-      max_pending_batches: max_pending_batches
+      max_batch_bytes: max_batch_bytes,
+      max_pending_batches: max_pending_batches,
+      max_pending_bytes: max_pending_bytes
     }
 
     # Kick off the periodic origin-pending sweep (TTL-drop lost entries).
@@ -773,19 +791,23 @@ defmodule Ferricstore.Raft.Batcher do
   # Test-only hooks. See the __-prefixed public functions at the end of
   # the module for the corresponding API.
   def handle_call({:__inject_origin_pending__, corr, batch, retry_count, mono}, _from, state) do
-    entry = {[], :origin_no_reply, batch, retry_count, mono}
-    {:reply, :ok, %{state | pending: Map.put(state.pending, corr, entry)}}
+    entry = {[], :origin_no_reply, batch, retry_count, mono, 0}
+    {:reply, :ok, put_pending(state, corr, entry)}
   end
 
-  def handle_call({:__inject_quorum_pending__, corr, froms, kind, mono}, _from, state)
+  def handle_call({:__inject_quorum_pending__, corr, froms, kind, mono, bytes}, _from, state)
       when kind in [:single, :batch] do
-    entry = {froms, kind, mono}
-    {:reply, :ok, %{state | pending: Map.put(state.pending, corr, entry)}}
+    entry = {froms, kind, mono, bytes}
+    {:reply, :ok, put_pending(state, corr, entry)}
   end
 
   def handle_call(:__latest_origin_corr__, _from, state) do
     latest =
       Enum.reduce(state.pending, {nil, 0}, fn
+        {corr, {_froms, :origin_no_reply, _batch, _retry, mono, _bytes}}, {_best_corr, best_mono}
+        when mono > best_mono ->
+          {corr, mono}
+
         {corr, {_froms, :origin_no_reply, _batch, _retry, mono}}, {_best_corr, best_mono}
         when mono > best_mono ->
           {corr, mono}
@@ -801,6 +823,10 @@ defmodule Ferricstore.Raft.Batcher do
     {:reply, Map.has_key?(state.pending, corr), state}
   end
 
+  def handle_call(:__pending_bytes__, _from, state) do
+    {:reply, state.pending_bytes, state}
+  end
+
   def handle_call(:__sweep_pending_now__, _from, state) do
     {:reply, :ok, sweep_origin_pending(state)}
   end
@@ -812,6 +838,8 @@ defmodule Ferricstore.Raft.Batcher do
   # don't hang forever.
   def handle_call(:__reset_pending__, _from, state) do
     Enum.each(state.pending, fn
+      {_corr, {froms, :single, _mono, _bytes}} -> reply_all_froms(froms, {:error, :reset})
+      {_corr, {froms, :batch, _mono, _bytes}} -> reply_all_froms(froms, {:error, :reset})
       {_corr, {froms, :single, _mono}} -> reply_all_froms(froms, {:error, :reset})
       {_corr, {froms, :batch, _mono}} -> reply_all_froms(froms, {:error, :reset})
       {_corr, {froms, :single}} -> reply_all_froms(froms, {:error, :reset})
@@ -829,6 +857,7 @@ defmodule Ferricstore.Raft.Batcher do
       %{
         state
         | pending: %{},
+          pending_bytes: 0,
           flush_waiters: [],
           local_apply_waiters: [],
           origin_local_apply_index: state.last_local_applied
@@ -933,26 +962,71 @@ defmodule Ferricstore.Raft.Batcher do
       Enum.reduce(applied_list, state, fn {corr, raw_result}, acc ->
         {ra_index, result} = unwrap_applied(raw_result)
 
-        case Map.pop(acc.pending, corr) do
-          {nil, _pending} ->
-            acc
+        case pop_pending(acc, corr) do
+          {nil, acc_after_pop} ->
+            acc_after_pop
 
           # Async entries: no callers to reply to. Just track and clear.
-          {{_froms, :origin_no_reply}, new_pending} ->
-            track_origin_local_apply(%{acc | pending: new_pending}, ra_index)
+          {{_froms, :origin_no_reply}, acc_after_pop} ->
+            track_origin_local_apply(acc_after_pop, ra_index)
 
-          {{_froms, :origin_no_reply, _batch, _retry, _mono}, new_pending} ->
-            track_origin_local_apply(%{acc | pending: new_pending}, ra_index)
+          {{_froms, :origin_no_reply, _batch, _retry, _mono}, acc_after_pop} ->
+            track_origin_local_apply(acc_after_pop, ra_index)
 
-          {{froms, :single, mono}, new_pending} ->
-            acc2 = %{acc | pending: new_pending}
-            emit_quorum_applied_telemetry(acc2, mono, now, :single, froms, ra_index, result)
-            gate_reply(acc2, ra_index, :single, froms, result)
+          {{_froms, :origin_no_reply, _batch, _retry, _mono, _bytes}, acc_after_pop} ->
+            track_origin_local_apply(acc_after_pop, ra_index)
 
-          {{froms, :batch, mono}, new_pending} ->
-            acc2 = %{acc | pending: new_pending}
-            emit_quorum_applied_telemetry(acc2, mono, now, :batch, froms, ra_index, result)
-            gate_reply(acc2, ra_index, :batch, froms, result)
+          {{froms, :single, mono}, acc_after_pop} ->
+            emit_quorum_applied_telemetry(
+              acc_after_pop,
+              mono,
+              now,
+              :single,
+              froms,
+              ra_index,
+              result
+            )
+
+            gate_reply(acc_after_pop, ra_index, :single, froms, result)
+
+          {{froms, :batch, mono}, acc_after_pop} ->
+            emit_quorum_applied_telemetry(
+              acc_after_pop,
+              mono,
+              now,
+              :batch,
+              froms,
+              ra_index,
+              result
+            )
+
+            gate_reply(acc_after_pop, ra_index, :batch, froms, result)
+
+          {{froms, :single, mono, _bytes}, acc_after_pop} ->
+            emit_quorum_applied_telemetry(
+              acc_after_pop,
+              mono,
+              now,
+              :single,
+              froms,
+              ra_index,
+              result
+            )
+
+            gate_reply(acc_after_pop, ra_index, :single, froms, result)
+
+          {{froms, :batch, mono, _bytes}, acc_after_pop} ->
+            emit_quorum_applied_telemetry(
+              acc_after_pop,
+              mono,
+              now,
+              :batch,
+              froms,
+              ra_index,
+              result
+            )
+
+            gate_reply(acc_after_pop, ra_index, :batch, froms, result)
         end
       end)
 
@@ -980,67 +1054,38 @@ defmodule Ferricstore.Raft.Batcher do
   # For quorum entries we reply :error to the blocked caller so the
   # application can retry itself.
   def handle_info({:ra_event, _from_id, {:rejected, {not_leader, maybe_leader, corr}}}, state) do
-    case Map.pop(state.pending, corr) do
-      {nil, _pending} ->
-        {:noreply, state}
+    case pop_pending(state, corr) do
+      {nil, state_after_pop} ->
+        {:noreply, state_after_pop}
 
       # Retry-aware origin replay entry. Has the original batch + retry_count.
-      {{_froms, :origin_no_reply, batch, retry_count, _mono}, new_pending} ->
-        state_without = %{state | pending: new_pending}
+      {{_froms, :origin_no_reply, batch, retry_count, _mono}, state_without} ->
+        handle_rejected_origin(state_without, state, batch, retry_count, not_leader, maybe_leader)
 
-        target =
-          case {not_leader, maybe_leader} do
-            {:not_leader, leader} when leader != :undefined and leader != nil -> leader
-            _ -> state.shard_id
-          end
-
-        new_state =
-          if retry_count < @max_origin_retries do
-            :telemetry.execute(
-              [:ferricstore, :batcher, :origin_retry],
-              %{retry_count: retry_count + 1, batch_size: length(batch)},
-              %{shard_index: state.shard_index, target: inspect(target)}
-            )
-
-            submit_origin_with_retry(state_without, batch, target, retry_count + 1)
-          else
-            :telemetry.execute(
-              [:ferricstore, :batcher, :origin_dropped],
-              %{batch_size: length(batch)},
-              %{shard_index: state.shard_index, reason: :max_retries}
-            )
-
-            Logger.warning(
-              "Batcher shard=#{state.shard_index}: origin replay batch of #{length(batch)} commands dropped after #{@max_origin_retries} retries"
-            )
-
-            state_without
-          end
-
-        {:noreply, maybe_reply_flush_waiters(new_state)}
+      {{_froms, :origin_no_reply, batch, retry_count, _mono, _bytes}, state_without} ->
+        handle_rejected_origin(state_without, state, batch, retry_count, not_leader, maybe_leader)
 
       # Legacy origin shape without retry info — drop silently.
-      {{_froms, :origin_no_reply}, new_pending} ->
-        {:noreply, maybe_reply_flush_waiters(%{state | pending: new_pending})}
+      {{_froms, :origin_no_reply}, state_without} ->
+        {:noreply, maybe_reply_flush_waiters(state_without)}
 
       # Quorum entry — local server isn't leader. Reply :not_leader so
       # Router.forward_to_leader takes over (and barriers on local apply
       # via await_local_applied/2 after the leader replies, fixing
       # read-your-write across the redirect).
-      {pending_entry, new_pending}
+      {pending_entry, state_without}
       when is_tuple(pending_entry) and elem(pending_entry, 1) in [:single, :batch] ->
         froms = elem(pending_entry, 0)
-        new_state = %{state | pending: new_pending}
 
-        leader =
+        target =
           case {not_leader, maybe_leader} do
             {:not_leader, leader} when leader != :undefined and leader != nil -> leader
-            _ -> state.shard_id
+            _ -> state_without.shard_id
           end
 
-        reply_all_froms(froms, {:error, {:not_leader, leader}})
+        reply_all_froms(froms, {:error, {:not_leader, target}})
 
-        {:noreply, maybe_reply_flush_waiters(new_state)}
+        {:noreply, maybe_reply_flush_waiters(state_without)}
     end
   end
 
@@ -1073,6 +1118,46 @@ defmodule Ferricstore.Raft.Batcher do
   # from previous implementation). Silently discard.
   def handle_info(_msg, state) do
     {:noreply, state}
+  end
+
+  defp handle_rejected_origin(
+         state_without,
+         original_state,
+         batch,
+         retry_count,
+         not_leader,
+         maybe_leader
+       ) do
+    target =
+      case {not_leader, maybe_leader} do
+        {:not_leader, leader} when leader != :undefined and leader != nil -> leader
+        _ -> state_without.shard_id
+      end
+
+    new_state =
+      if retry_count < @max_origin_retries do
+        :telemetry.execute(
+          [:ferricstore, :batcher, :origin_retry],
+          %{retry_count: retry_count + 1, batch_size: length(batch)},
+          %{shard_index: original_state.shard_index, target: inspect(target)}
+        )
+
+        submit_origin_with_retry(state_without, batch, target, retry_count + 1)
+      else
+        :telemetry.execute(
+          [:ferricstore, :batcher, :origin_dropped],
+          %{batch_size: length(batch)},
+          %{shard_index: original_state.shard_index, reason: :max_retries}
+        )
+
+        Logger.warning(
+          "Batcher shard=#{original_state.shard_index}: origin replay batch of #{length(batch)} commands dropped after #{@max_origin_retries} retries"
+        )
+
+        state_without
+      end
+
+    {:noreply, maybe_reply_flush_waiters(new_state)}
   end
 
   # If the new-shape wrapped reply is present, unwrap; otherwise pass through
@@ -1299,8 +1384,16 @@ defmodule Ferricstore.Raft.Batcher do
     # entries (retry-aware 5-tuple or legacy 3-tuple) have no froms to
     # reply to — Router already got :ok.
     Enum.each(state.pending, fn
+      {_corr, {_froms, :origin_no_reply, _batch, _retry, _mono, _bytes}} ->
+        :ok
+
       {_corr, {_froms, :origin_no_reply, _batch, _retry, _mono}} ->
         :ok
+
+      {_corr, {froms, _kind, _mono, _bytes}} ->
+        Enum.each(froms, fn from ->
+          safe_reply(from, {:error, :batcher_terminated})
+        end)
 
       {_corr, {froms, _kind, _mono}} ->
         Enum.each(froms, fn from ->
@@ -1411,30 +1504,37 @@ defmodule Ferricstore.Raft.Batcher do
     else
       prefix = extract_prefix(hd(cmds))
       slot_key = {prefix, :quorum}
+      cmd_bytes = commands_estimated_bytes(cmds)
 
-      slot = Map.get(state.slots, slot_key, new_slot(0))
+      case slot_for_append(state, slot_key, 0, cmd_bytes) do
+        {:ok, state, slot} ->
+          updated_slot = %{
+            slot
+            | cmds: prepend_reversed(cmds, slot.cmds),
+              froms: [{:batch_from, from, cmd_count} | slot.froms],
+              count: slot.count + cmd_count,
+              bytes: slot.bytes + cmd_bytes
+          }
 
-      updated_slot = %{
-        slot
-        | cmds: prepend_reversed(cmds, slot.cmds),
-          froms: [{:batch_from, from, cmd_count} | slot.froms],
-          count: Map.get(slot, :count, 0) + cmd_count
-      }
+          state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
 
-      state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
+          if slot_flush_due?(state, updated_slot) do
+            case do_flush_slot(state, slot_key) do
+              {:noreply, new_state} -> {:noreply, new_state}
+            end
+          else
+            if updated_slot.timer_ref == nil do
+              ref = Process.send_after(self(), {:flush_slot, slot_key}, 0)
+              updated_slot = %{updated_slot | timer_ref: ref}
+              {:noreply, %{state | slots: Map.put(state.slots, slot_key, updated_slot)}}
+            else
+              {:noreply, state}
+            end
+          end
 
-      if updated_slot.count >= state.max_batch_size do
-        case do_flush_slot(state, slot_key) do
-          {:noreply, new_state} -> {:noreply, new_state}
-        end
-      else
-        if updated_slot.timer_ref == nil do
-          ref = Process.send_after(self(), {:flush_slot, slot_key}, 0)
-          updated_slot = %{updated_slot | timer_ref: ref}
-          {:noreply, %{state | slots: Map.put(state.slots, slot_key, updated_slot)}}
-        else
+        {:overloaded, state} ->
+          reply_from(from, {:error, :overloaded})
           {:noreply, state}
-        end
       end
     end
   end
@@ -1461,31 +1561,38 @@ defmodule Ferricstore.Raft.Batcher do
     prefix = extract_prefix(command)
     {window_ms, state} = lookup_ns_config(prefix, state)
     slot_key = {prefix, :quorum}
+    cmd_bytes = command_estimated_bytes(command)
 
-    slot = Map.get(state.slots, slot_key, new_slot(window_ms))
+    case slot_for_append(state, slot_key, window_ms, cmd_bytes) do
+      {:ok, state, slot} ->
+        updated_slot = %{
+          slot
+          | cmds: [command | slot.cmds],
+            froms: [from | slot.froms],
+            window_ms: window_ms,
+            count: slot.count + 1,
+            bytes: slot.bytes + cmd_bytes
+        }
 
-    updated_slot = %{
-      slot
-      | cmds: [command | slot.cmds],
-        froms: [from | slot.froms],
-        window_ms: window_ms,
-        count: Map.get(slot, :count, 0) + 1
-    }
+        updated_slot =
+          if updated_slot.timer_ref == nil do
+            ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
+            %{updated_slot | timer_ref: ref}
+          else
+            updated_slot
+          end
 
-    updated_slot =
-      if updated_slot.timer_ref == nil do
-        ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
-        %{updated_slot | timer_ref: ref}
-      else
-        updated_slot
-      end
+        new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
 
-    new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
+        if slot_flush_due?(state, updated_slot) do
+          do_flush_slot(new_state, slot_key)
+        else
+          {:noreply, new_state}
+        end
 
-    # Flush immediately if slot is full (O(1) count check instead of O(n) length)
-    cond do
-      updated_slot.count >= state.max_batch_size -> do_flush_slot(new_state, slot_key)
-      true -> {:noreply, new_state}
+      {:overloaded, state} ->
+        reply_from(from, {:error, :overloaded})
+        {:noreply, state}
     end
   end
 
@@ -1558,7 +1665,14 @@ defmodule Ferricstore.Raft.Batcher do
     started_at = System.monotonic_time()
     {:ttb, bin} = serialized = CommandClock.to_ttb(single_cmd)
     priority = raft_pipeline_priority()
-    submit_result = pipeline_command(state.shard_id, serialized, corr, priority)
+    command_bytes = byte_size(bin)
+
+    submit_result =
+      if pending_bytes_would_exceed?(state, command_bytes) do
+        {:error, :overloaded}
+      else
+        pipeline_command(state.shard_id, serialized, corr, priority)
+      end
 
     emit_quorum_submit_telemetry(
       state,
@@ -1566,13 +1680,13 @@ defmodule Ferricstore.Raft.Batcher do
       :single,
       1,
       length(froms),
-      byte_size(bin),
+      command_bytes,
       command_shape(single_cmd),
       priority,
       submit_result
     )
 
-    track_or_reject_quorum_submit(state, corr, froms, :single, submit_result)
+    track_or_reject_quorum_submit(state, corr, froms, :single, submit_result, command_bytes)
   end
 
   defp pipeline_submit(state, batch, froms) do
@@ -1581,7 +1695,14 @@ defmodule Ferricstore.Raft.Batcher do
     {command, logical_count} = compact_hot_batch(batch)
     {:ttb, bin} = serialized = CommandClock.to_ttb(command)
     priority = raft_pipeline_priority()
-    submit_result = pipeline_command(state.shard_id, serialized, corr, priority)
+    command_bytes = byte_size(bin)
+
+    submit_result =
+      if pending_bytes_would_exceed?(state, command_bytes) do
+        {:error, :overloaded}
+      else
+        pipeline_command(state.shard_id, serialized, corr, priority)
+      end
 
     emit_quorum_submit_telemetry(
       state,
@@ -1589,13 +1710,13 @@ defmodule Ferricstore.Raft.Batcher do
       :batch,
       logical_count,
       length(froms),
-      byte_size(bin),
+      command_bytes,
       command_shape(command),
       priority,
       submit_result
     )
 
-    track_or_reject_quorum_submit(state, corr, froms, :batch, submit_result)
+    track_or_reject_quorum_submit(state, corr, froms, :batch, submit_result, command_bytes)
   end
 
   defp pipeline_submit_batch_command(state, command, froms, logical_count, command_shape) do
@@ -1603,7 +1724,14 @@ defmodule Ferricstore.Raft.Batcher do
     started_at = System.monotonic_time()
     {:ttb, bin} = serialized = CommandClock.to_ttb(command)
     priority = raft_pipeline_priority()
-    submit_result = pipeline_command(state.shard_id, serialized, corr, priority)
+    command_bytes = byte_size(bin)
+
+    submit_result =
+      if pending_bytes_would_exceed?(state, command_bytes) do
+        {:error, :overloaded}
+      else
+        pipeline_command(state.shard_id, serialized, corr, priority)
+      end
 
     emit_quorum_submit_telemetry(
       state,
@@ -1611,13 +1739,13 @@ defmodule Ferricstore.Raft.Batcher do
       :batch,
       logical_count,
       length(froms),
-      byte_size(bin),
+      command_bytes,
       command_shape,
       priority,
       submit_result
     )
 
-    track_or_reject_quorum_submit(state, corr, froms, :batch, submit_result)
+    track_or_reject_quorum_submit(state, corr, froms, :batch, submit_result, command_bytes)
   end
 
   # Flush path for commands accumulated via Batcher.origin_submit. The caller
@@ -1660,14 +1788,23 @@ defmodule Ferricstore.Raft.Batcher do
   # at 0 for the first submission.
   defp submit_origin_with_retry(state, wrapped_batch, target, retry_count, submit_froms \\ []) do
     corr = make_ref()
-    serialized = CommandClock.to_ttb({:batch, wrapped_batch})
-    submit_result = pipeline_command(target, serialized, corr, raft_pipeline_priority())
+    {:ttb, bin} = serialized = CommandClock.to_ttb({:batch, wrapped_batch})
+    command_bytes = byte_size(bin)
+
+    submit_result =
+      if pending_bytes_would_exceed?(state, command_bytes) do
+        {:error, :overloaded}
+      else
+        pipeline_command(target, serialized, corr, raft_pipeline_priority())
+      end
 
     if pipeline_submit_status(submit_result) == :ok do
       reply_all_froms(submit_froms, :ok)
 
-      entry = {[], :origin_no_reply, wrapped_batch, retry_count, System.monotonic_time()}
-      %{state | pending: Map.put(state.pending, corr, entry)}
+      entry =
+        {[], :origin_no_reply, wrapped_batch, retry_count, System.monotonic_time(), command_bytes}
+
+      put_pending(state, corr, entry)
     else
       reply_all_froms(submit_froms, normalize_pipeline_error(submit_result))
 
@@ -1685,10 +1822,10 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
-  defp track_or_reject_quorum_submit(state, corr, froms, kind, submit_result) do
+  defp track_or_reject_quorum_submit(state, corr, froms, kind, submit_result, command_bytes) do
     if pipeline_submit_status(submit_result) == :ok do
       mono = System.monotonic_time()
-      %{state | pending: Map.put(state.pending, corr, {froms, kind, mono})}
+      put_pending(state, corr, {froms, kind, mono, command_bytes})
     else
       reply_all_froms(froms, normalize_pipeline_error(submit_result))
 
@@ -1948,31 +2085,38 @@ defmodule Ferricstore.Raft.Batcher do
     prefix = extract_prefix(command)
     {window_ms, state} = lookup_ns_config(prefix, state)
     slot_key = {prefix, :quorum}
+    cmd_bytes = command_estimated_bytes(command)
 
-    slot = Map.get(state.slots, slot_key, new_slot(window_ms))
+    case slot_for_append(state, slot_key, window_ms, cmd_bytes) do
+      {:ok, state, slot} ->
+        updated_slot = %{
+          slot
+          | cmds: [command | slot.cmds],
+            froms: [from | slot.froms],
+            window_ms: window_ms,
+            count: slot.count + 1,
+            bytes: slot.bytes + cmd_bytes
+        }
 
-    updated_slot = %{
-      slot
-      | cmds: [command | slot.cmds],
-        froms: [from | slot.froms],
-        window_ms: window_ms,
-        count: Map.get(slot, :count, 0) + 1
-    }
+        updated_slot =
+          if updated_slot.timer_ref == nil do
+            ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
+            %{updated_slot | timer_ref: ref}
+          else
+            updated_slot
+          end
 
-    updated_slot =
-      if updated_slot.timer_ref == nil do
-        ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
-        %{updated_slot | timer_ref: ref}
-      else
-        updated_slot
-      end
+        new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
 
-    new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
+        if slot_flush_due?(state, updated_slot) do
+          do_flush_slot(new_state, slot_key)
+        else
+          {:noreply, new_state}
+        end
 
-    if updated_slot.count >= state.max_batch_size do
-      do_flush_slot(new_state, slot_key)
-    else
-      {:noreply, new_state}
+      {:overloaded, state} ->
+        reply_from(from, {:error, :overloaded})
+        {:noreply, state}
     end
   end
 
@@ -2018,38 +2162,100 @@ defmodule Ferricstore.Raft.Batcher do
     # effects that were already applied locally. This is not a namespace
     # durability mode.
     slot_key = {prefix, :origin_replay}
+    cmd_bytes = command_estimated_bytes(command)
 
-    slot = Map.get(state.slots, slot_key, new_slot(window_ms))
+    case slot_for_append(state, slot_key, window_ms, cmd_bytes) do
+      {:ok, state, slot} ->
+        updated_slot = %{
+          slot
+          | cmds: [command | slot.cmds],
+            froms: maybe_add_origin_submit_from(slot.froms, from),
+            window_ms: window_ms,
+            count: slot.count + 1,
+            bytes: slot.bytes + cmd_bytes
+        }
 
-    updated_slot = %{
-      slot
-      | cmds: [command | slot.cmds],
-        froms: maybe_add_origin_submit_from(slot.froms, from),
-        window_ms: window_ms,
-        count: Map.get(slot, :count, 0) + 1
-    }
+        updated_slot =
+          if updated_slot.timer_ref == nil do
+            ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
+            %{updated_slot | timer_ref: ref}
+          else
+            updated_slot
+          end
 
-    updated_slot =
-      if updated_slot.timer_ref == nil do
-        ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
-        %{updated_slot | timer_ref: ref}
-      else
-        updated_slot
-      end
+        new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
 
-    new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
+        if slot_flush_due?(state, updated_slot) do
+          do_flush_slot(new_state, slot_key)
+        else
+          {:noreply, new_state}
+        end
 
-    if updated_slot.count >= state.max_batch_size do
-      do_flush_slot(new_state, slot_key)
-    else
-      {:noreply, new_state}
+      {:overloaded, state} ->
+        emit_origin_submit_overloaded(state)
+        if from != nil, do: reply_from(from, {:error, :overloaded})
+        {:noreply, state}
     end
   end
 
   defp maybe_add_origin_submit_from(froms, nil), do: froms
   defp maybe_add_origin_submit_from(froms, from), do: [from | froms]
 
-  defp pending_full?(state), do: map_size(state.pending) >= state.max_pending_batches
+  defp pending_full?(state) do
+    map_size(state.pending) >= state.max_pending_batches or
+      pending_bytes_full?(state)
+  end
+
+  defp pending_bytes_full?(state) do
+    state.max_pending_bytes > 0 and map_size(state.pending) > 0 and
+      state.pending_bytes >= state.max_pending_bytes
+  end
+
+  # Let one oversized write through when the queue is empty. Backpressure is
+  # for unbounded in-flight buildup, not for rejecting valid large commands.
+  defp pending_bytes_would_exceed?(state, incoming_bytes) do
+    state.max_pending_bytes > 0 and state.pending_bytes > 0 and
+      state.pending_bytes + incoming_bytes > state.max_pending_bytes
+  end
+
+  defp put_pending(state, corr, entry) do
+    bytes = pending_entry_bytes(entry)
+
+    %{
+      state
+      | pending: Map.put(state.pending, corr, entry),
+        pending_bytes: state.pending_bytes + bytes
+    }
+  end
+
+  defp pop_pending(state, corr) do
+    case Map.pop(state.pending, corr) do
+      {nil, pending} ->
+        {nil, %{state | pending: pending}}
+
+      {entry, pending} ->
+        {entry,
+         %{
+           state
+           | pending: pending,
+             pending_bytes: max(0, state.pending_bytes - pending_entry_bytes(entry))
+         }}
+    end
+  end
+
+  defp pending_entries_bytes(pending) do
+    Enum.reduce(pending, 0, fn {_corr, entry}, acc -> acc + pending_entry_bytes(entry) end)
+  end
+
+  defp pending_entry_bytes({_froms, kind, _mono, bytes})
+       when kind in [:single, :batch] and is_integer(bytes) and bytes >= 0,
+       do: bytes
+
+  defp pending_entry_bytes({_froms, :origin_no_reply, _batch, _retry, _mono, bytes})
+       when is_integer(bytes) and bytes >= 0,
+       do: bytes
+
+  defp pending_entry_bytes(_entry), do: 0
 
   # Reply to flush waiters once everything is drained: in-flight ra commands
   # are all applied AND the local state machine has caught up to all their
@@ -2098,13 +2304,40 @@ defmodule Ferricstore.Raft.Batcher do
 
     {expired, kept} =
       Enum.split_with(state.pending, fn
-        {_corr, {_froms, :origin_no_reply, _batch, _retry, mono}} -> mono < origin_cutoff
-        {_corr, {_froms, :single, mono}} -> mono < quorum_cutoff
-        {_corr, {_froms, :batch, mono}} -> mono < quorum_cutoff
-        _ -> false
+        {_corr, {_froms, :origin_no_reply, _batch, _retry, mono, _bytes}} ->
+          mono < origin_cutoff
+
+        {_corr, {_froms, :origin_no_reply, _batch, _retry, mono}} ->
+          mono < origin_cutoff
+
+        {_corr, {_froms, :single, mono, _bytes}} ->
+          mono < quorum_cutoff
+
+        {_corr, {_froms, :batch, mono, _bytes}} ->
+          mono < quorum_cutoff
+
+        {_corr, {_froms, :single, mono}} ->
+          mono < quorum_cutoff
+
+        {_corr, {_froms, :batch, mono}} ->
+          mono < quorum_cutoff
+
+        _ ->
+          false
       end)
 
     Enum.each(expired, fn
+      {_corr, {_froms, :origin_no_reply, batch, _retry, _mono, _bytes}} ->
+        :telemetry.execute(
+          [:ferricstore, :batcher, :origin_dropped],
+          %{batch_size: length(batch)},
+          %{shard_index: state.shard_index, reason: :ttl}
+        )
+
+        Logger.warning(
+          "Batcher shard=#{state.shard_index}: origin replay batch of #{length(batch)} commands dropped after #{@origin_pending_ttl_ms}ms TTL (ra_event lost)"
+        )
+
       {_corr, {_froms, :origin_no_reply, batch, _retry, _mono}} ->
         :telemetry.execute(
           [:ferricstore, :batcher, :origin_dropped],
@@ -2114,6 +2347,19 @@ defmodule Ferricstore.Raft.Batcher do
 
         Logger.warning(
           "Batcher shard=#{state.shard_index}: origin replay batch of #{length(batch)} commands dropped after #{@origin_pending_ttl_ms}ms TTL (ra_event lost)"
+        )
+
+      {_corr, {froms, kind, _mono, _bytes}} when kind in [:single, :batch] ->
+        reply_all_froms(froms, ErrorReasons.write_timeout_unknown())
+
+        :telemetry.execute(
+          [:ferricstore, :batcher, :quorum_timeout],
+          %{caller_count: length(froms), kind: kind},
+          %{shard_index: state.shard_index, reason: :ttl}
+        )
+
+        Logger.warning(
+          "Batcher shard=#{state.shard_index}: #{kind} pending entry with #{length(froms)} caller(s) timed out after #{@quorum_pending_ttl_ms}ms (ra_event lost after leader crash or disk error)"
         )
 
       {_corr, {froms, kind, _mono}} when kind in [:single, :batch] ->
@@ -2130,7 +2376,8 @@ defmodule Ferricstore.Raft.Batcher do
         )
     end)
 
-    new_state = %{state | pending: Map.new(kept)}
+    new_pending = Map.new(kept)
+    new_state = %{state | pending: new_pending, pending_bytes: pending_entries_bytes(new_pending)}
 
     # Swept quorum entries could unblock flush waiters whose pending ref
     # count drops to zero.
@@ -2166,15 +2413,77 @@ defmodule Ferricstore.Raft.Batcher do
       timer_ref: nil,
       window_ms: window_ms,
       count: 0,
+      bytes: 0,
       created_mono: System.monotonic_time()
     }
   end
+
+  defp slot_for_append(state, slot_key, window_ms, incoming_bytes) do
+    slot = Map.get(state.slots, slot_key, new_slot(window_ms))
+
+    if slot_byte_overflow?(state, slot, incoming_bytes) do
+      case do_flush_slot(state, slot_key) do
+        {:noreply, flushed_state} ->
+          if pending_full?(flushed_state) do
+            {:overloaded, flushed_state}
+          else
+            {:ok, flushed_state, new_slot(window_ms)}
+          end
+      end
+    else
+      {:ok, state, slot}
+    end
+  end
+
+  defp slot_byte_overflow?(state, slot, incoming_bytes) do
+    state.max_batch_bytes > 0 and slot.cmds != [] and
+      slot.bytes + incoming_bytes > state.max_batch_bytes
+  end
+
+  defp slot_flush_due?(state, slot) do
+    slot.count >= state.max_batch_size or
+      (state.max_batch_bytes > 0 and slot.bytes >= state.max_batch_bytes)
+  end
+
+  defp commands_estimated_bytes(commands) do
+    Enum.reduce(commands, 0, fn command, acc -> acc + command_estimated_bytes(command) end)
+  end
+
+  defp command_estimated_bytes({:put, key, value, _expire_at_ms})
+       when is_binary(key) and is_binary(value),
+       do: byte_size(key) + byte_size(value) + 32
+
+  defp command_estimated_bytes({:put_batch, entries}) when is_list(entries) do
+    Enum.reduce(entries, 16, fn
+      {key, value, _expire_at_ms}, acc when is_binary(key) and is_binary(value) ->
+        acc + byte_size(key) + byte_size(value) + 32
+
+      other, acc ->
+        acc + :erlang.external_size(other)
+    end)
+  end
+
+  defp command_estimated_bytes({:delete, key}) when is_binary(key),
+    do: byte_size(key) + 24
+
+  defp command_estimated_bytes({:delete_batch, keys}) when is_list(keys) do
+    Enum.reduce(keys, 16, fn
+      key, acc when is_binary(key) -> acc + byte_size(key) + 24
+      other, acc -> acc + :erlang.external_size(other)
+    end)
+  end
+
+  defp command_estimated_bytes({:batch, commands}) when is_list(commands),
+    do: commands_estimated_bytes(commands) + 16
+
+  defp command_estimated_bytes(command), do: :erlang.external_size(command)
 
   defp emit_slot_flush_telemetry(state, slot, prefix, write_path, batch, froms) do
     :telemetry.execute(
       [:ferricstore, :batcher, :slot_flush],
       %{
         batch_size: Map.get(slot, :count, length(batch)),
+        batch_bytes: Map.get(slot, :bytes, 0),
         caller_count: length(froms),
         queue_wait_us: duration_us(Map.get(slot, :created_mono, System.monotonic_time()))
       },
@@ -2204,7 +2513,9 @@ defmodule Ferricstore.Raft.Batcher do
         duration_us: duration_us(started_at),
         batch_size: batch_size,
         caller_count: caller_count,
-        command_bytes: command_bytes
+        command_bytes: command_bytes,
+        pending_bytes: state.pending_bytes,
+        max_pending_bytes: state.max_pending_bytes
       },
       %{
         shard_index: state.shard_index,
@@ -2288,9 +2599,22 @@ defmodule Ferricstore.Raft.Batcher do
           integer()
         ) :: :ok
   def __inject_quorum_pending_at__(shard_index, corr, froms, kind, submitted_mono) do
+    __inject_quorum_pending_at__(shard_index, corr, froms, kind, submitted_mono, 0)
+  end
+
+  @doc false
+  @spec __inject_quorum_pending_at__(
+          non_neg_integer(),
+          reference(),
+          [GenServer.from()],
+          :single | :batch,
+          integer(),
+          non_neg_integer()
+        ) :: :ok
+  def __inject_quorum_pending_at__(shard_index, corr, froms, kind, submitted_mono, bytes) do
     GenServer.call(
       batcher_name(shard_index),
-      {:__inject_quorum_pending__, corr, froms, kind, submitted_mono}
+      {:__inject_quorum_pending__, corr, froms, kind, submitted_mono, bytes}
     )
   end
 
@@ -2304,6 +2628,12 @@ defmodule Ferricstore.Raft.Batcher do
   @spec __has_pending__(non_neg_integer(), reference()) :: boolean()
   def __has_pending__(shard_index, corr) do
     GenServer.call(batcher_name(shard_index), {:__has_pending__, corr})
+  end
+
+  @doc false
+  @spec __pending_bytes__(non_neg_integer()) :: non_neg_integer()
+  def __pending_bytes__(shard_index) do
+    GenServer.call(batcher_name(shard_index), :__pending_bytes__)
   end
 
   @doc false

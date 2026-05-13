@@ -312,7 +312,13 @@ defmodule Ferricstore.Application do
       shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
 
       Supervisor.child_spec(
-        {Ferricstore.Raft.Batcher, shard_index: i, shard_id: shard_id},
+        {Ferricstore.Raft.Batcher,
+         shard_index: i,
+         shard_id: shard_id,
+         max_pending_batches: Application.get_env(:ferricstore, :raft_batcher_max_pending, 256),
+         max_pending_bytes: Application.get_env(:ferricstore, :raft_batcher_max_pending_bytes, 0),
+         max_batch_bytes:
+           Application.get_env(:ferricstore, :raft_batcher_max_batch_bytes, 4 * 1024 * 1024)},
         id: :"batcher_#{i}"
       )
     end)

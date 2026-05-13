@@ -448,6 +448,159 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       end
     end
 
+    test "direct put batches flush before exceeding configured byte cap" do
+      shard_idx = 130_000 + :rand.uniform(9_999)
+      name = Batcher.batcher_name(shard_idx)
+
+      {:ok, pid} =
+        Batcher.start_link(
+          shard_id: :missing_byte_capped_put_batch_target,
+          shard_index: shard_idx,
+          max_batch_size: 50_000,
+          max_batch_bytes: 96
+        )
+
+      on_exit(fn ->
+        try do
+          if Process.alive?(pid), do: GenServer.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
+
+      handler_id = {:direct_put_batch_byte_cap, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :batcher, :quorum_submit],
+          &__MODULE__.forward_caller_quorum_submit/4,
+          {self(), shard_idx}
+        )
+
+      try do
+        ref1 = make_ref()
+        ref2 = make_ref()
+        value = :binary.copy("v", 64)
+
+        :ok =
+          Batcher.write_put_batch(shard_idx, [{pkey("bytecap", "a"), value, 0}], {self(), ref1})
+
+        :ok =
+          Batcher.write_put_batch(shard_idx, [{pkey("bytecap", "b"), value, 0}], {self(), ref2})
+
+        assert_receive {^ref1,
+                        {:error, {:ra_target_down, :missing_byte_capped_put_batch_target}}},
+                       5_000
+
+        assert_receive {^ref2,
+                        {:error, {:ra_target_down, :missing_byte_capped_put_batch_target}}},
+                       5_000
+
+        submits = drain_caller_quorum_submits()
+
+        assert Enum.count(submits, fn {measurements, metadata} ->
+                 metadata.command_shape == :put_batch and measurements.batch_size == 1
+               end) == 2
+      after
+        :telemetry.detach(handler_id)
+      end
+
+      assert Process.whereis(name) == pid
+    end
+
+    test "direct put batch rejects before exceeding configured pending byte cap" do
+      shard_idx = 140_000 + :rand.uniform(9_999)
+      name = Batcher.batcher_name(shard_idx)
+
+      {:ok, pid} =
+        Batcher.start_link(
+          shard_id: :missing_pending_byte_capped_target,
+          shard_index: shard_idx,
+          max_batch_size: 50_000,
+          max_batch_bytes: 0,
+          max_pending_bytes: 96
+        )
+
+      on_exit(fn ->
+        try do
+          if Process.alive?(pid), do: GenServer.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
+
+      pending_corr = make_ref()
+      submitted_mono = System.monotonic_time()
+
+      :ok =
+        Batcher.__inject_quorum_pending_at__(
+          shard_idx,
+          pending_corr,
+          [{self(), make_ref()}],
+          :batch,
+          submitted_mono,
+          80
+        )
+
+      ref = make_ref()
+      value = :binary.copy("v", 64)
+
+      :ok =
+        Batcher.write_put_batch(
+          shard_idx,
+          [{pkey("pendingbytes", "a"), value, 0}],
+          {self(), ref}
+        )
+
+      assert_receive {^ref, {:error, :overloaded}}, 5_000
+      assert Batcher.__pending_bytes__(shard_idx) == 80
+      assert Batcher.__has_pending__(shard_idx, pending_corr)
+      assert Process.whereis(name) == pid
+    end
+
+    test "pending byte accounting clears when ra apply arrives" do
+      shard_idx = 150_000 + :rand.uniform(9_999)
+      name = Batcher.batcher_name(shard_idx)
+
+      {:ok, pid} =
+        Batcher.start_link(
+          shard_id: :missing_pending_byte_apply_target,
+          shard_index: shard_idx,
+          max_pending_bytes: 96
+        )
+
+      on_exit(fn ->
+        try do
+          if Process.alive?(pid), do: GenServer.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
+
+      corr = make_ref()
+      reply_ref = make_ref()
+      submitted_mono = System.monotonic_time()
+
+      :ok =
+        Batcher.__inject_quorum_pending_at__(
+          shard_idx,
+          corr,
+          [{self(), reply_ref}],
+          :batch,
+          submitted_mono,
+          80
+        )
+
+      assert Batcher.__pending_bytes__(shard_idx) == 80
+
+      send(name, {:ra_event, :leader, {:applied, [{corr, {:applied_at, 1, {:ok, [:ok]}}}]}})
+
+      assert_receive {^reply_ref, :ok}, 5_000
+      assert Batcher.__pending_bytes__(shard_idx) == 0
+      refute Batcher.__has_pending__(shard_idx, corr)
+    end
+
     test "direct put_batch API replies with per-entry results and submits final shape" do
       prefix = "directput_#{System.unique_integer([:positive])}"
       :ok = NamespaceConfig.set(prefix, "window_ms", "1")

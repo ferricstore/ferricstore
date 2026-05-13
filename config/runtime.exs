@@ -121,10 +121,31 @@ if config_env() == :prod do
   config :ferricstore,
     release_cursor_interval:
       String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "200000")),
+    ra_segment_max_entries:
+      String.to_integer(System.get_env("FERRICSTORE_RA_SEGMENT_MAX_ENTRIES", "1048576")),
+    ra_segment_max_size_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_RA_SEGMENT_MAX_SIZE_BYTES", "256000000")),
+    ra_wal_max_size_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_RA_WAL_MAX_SIZE_BYTES", "8589934592")),
+    ra_wal_compute_checksums:
+      System.get_env("FERRICSTORE_RA_WAL_COMPUTE_CHECKSUMS", "true") in ["1", "true", "TRUE"],
+    raft_batcher_max_pending:
+      String.to_integer(System.get_env("FERRICSTORE_RAFT_BATCHER_MAX_PENDING", "256")),
+    raft_batcher_max_pending_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_RAFT_BATCHER_MAX_PENDING_BYTES", "0")),
+    raft_batcher_max_batch_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_RAFT_BATCHER_MAX_BATCH_BYTES", "4194304")),
+    raft_pipeline_priority: System.get_env("FERRICSTORE_RAFT_PIPELINE_PRIORITY", "low"),
+    raft_direct_batch_commands: System.get_env("FERRICSTORE_RAFT_DIRECT_BATCH_COMMANDS", "true"),
+    raft_compact_hot_batches: System.get_env("FERRICSTORE_RAFT_COMPACT_HOT_BATCHES", "true"),
+    raft_put_batch_apply_fast_path:
+      System.get_env("FERRICSTORE_RAFT_PUT_BATCH_APPLY_FAST_PATH", "true"),
+    raft_delete_batch_apply_fast_path:
+      System.get_env("FERRICSTORE_RAFT_DELETE_BATCH_APPLY_FAST_PATH", "true"),
     ra_min_snapshot_interval:
-      String.to_integer(System.get_env("FERRICSTORE_RA_MIN_SNAPSHOT_INTERVAL", "200000")),
+      String.to_integer(System.get_env("FERRICSTORE_RA_MIN_SNAPSHOT_INTERVAL", "10000000")),
     ra_min_checkpoint_interval:
-      String.to_integer(System.get_env("FERRICSTORE_RA_MIN_CHECKPOINT_INTERVAL", "16384")),
+      String.to_integer(System.get_env("FERRICSTORE_RA_MIN_CHECKPOINT_INTERVAL", "1000000")),
     promotion_threshold:
       String.to_integer(System.get_env("FERRICSTORE_PROMOTION_THRESHOLD", "100")),
     wal_commit_delay_us:
