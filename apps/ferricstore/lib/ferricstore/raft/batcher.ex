@@ -134,6 +134,7 @@ defmodule Ferricstore.Raft.Batcher do
           | {:incr, binary(), integer()}
           | {:incr_float, binary(), float()}
           | {:append, binary(), binary()}
+          | {:append_blob_ref, binary(), binary()}
           | {:getset, binary(), binary()}
           | {:getdel, binary()}
           | {:getex, binary(), non_neg_integer()}

@@ -13,6 +13,7 @@ defmodule Ferricstore.Raft.BlobCommand do
   @type command ::
           {:put, binary(), binary(), non_neg_integer()}
           | {:set, binary(), binary(), non_neg_integer(), map()}
+          | {:append, binary(), binary()}
           | {:getset, binary(), binary()}
           | {:put_batch, [{binary(), binary(), non_neg_integer()}]}
           | term()
@@ -89,6 +90,16 @@ defmodule Ferricstore.Raft.BlobCommand do
     end
   end
 
+  defp prepare_enabled(%{data_dir: data_dir}, shard_index, threshold, {:append, key, suffix})
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_binary(key) and is_binary(suffix) do
+    case prepare_value(data_dir, shard_index, threshold, suffix) do
+      {:ok, {^suffix, :value}} -> {:ok, {:append, key, suffix}}
+      {:ok, {encoded_ref, :blob_ref}} -> {:ok, {:append_blob_ref, key, encoded_ref}}
+      {:error, _reason} = error -> error
+    end
+  end
+
   defp prepare_enabled(%{data_dir: data_dir}, shard_index, threshold, {:put_batch, entries})
        when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
               is_list(entries) do
@@ -125,6 +136,10 @@ defmodule Ferricstore.Raft.BlobCommand do
 
   defp command_candidate?({:getset, _key, value}, threshold) when is_binary(value) do
     externalize?(value, threshold)
+  end
+
+  defp command_candidate?({:append, _key, suffix}, threshold) when is_binary(suffix) do
+    externalize?(suffix, threshold)
   end
 
   defp command_candidate?({:put_batch, entries}, threshold) when is_list(entries) do
@@ -210,6 +225,14 @@ defmodule Ferricstore.Raft.BlobCommand do
           {:cont, {:ok, [{:getset, key, value} | acc], external_payloads}}
         end
 
+      {:append, key, suffix}, {:ok, acc, external_payloads}
+      when is_binary(key) and is_binary(suffix) ->
+        if externalize?(suffix, threshold) do
+          {:cont, {:ok, [{:append_external, key} | acc], [suffix | external_payloads]}}
+        else
+          {:cont, {:ok, [{:append, key, suffix} | acc], external_payloads}}
+        end
+
       {:put_batch, entries}, {:ok, acc, external_payloads} when is_list(entries) ->
         case prepare_generic_put_batch_entries(entries, threshold, acc, external_payloads) do
           {:ok, acc, external_payloads} -> {:cont, {:ok, acc, external_payloads}}
@@ -260,6 +283,9 @@ defmodule Ferricstore.Raft.BlobCommand do
 
         {:getset_external, key}, [ref | rest] ->
           {{:getset_blob_ref, key, BlobRef.encode!(ref)}, rest}
+
+        {:append_external, key}, [ref | rest] ->
+          {{:append_blob_ref, key, BlobRef.encode!(ref)}, rest}
 
         command, refs ->
           {command, refs}

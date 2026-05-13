@@ -325,6 +325,9 @@ defmodule Ferricstore.Raft.StateMachine do
     * `{:append, key, suffix}` -- Atomic read-modify-write append. Reads the
       current value (or `""`), concatenates `suffix`, writes back. Returns
       `{:ok, byte_size(new_value)}`.
+    * `{:append_blob_ref, key, encoded_ref}` -- APPEND whose suffix was
+      externalized before Ra submission. Materializes and validates the suffix
+      before mutating the key.
     * `{:getset, key, new_value}` -- Atomic get-and-set. Reads the old value,
       writes the new value with no expiry, returns the old value (or `nil`).
     * `{:getdel, key}` -- Atomic get-and-delete. Reads the value, deletes the
@@ -767,6 +770,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   def apply(meta, {:append, key, suffix}, state) do
     apply_pending_with_time(meta, state, fn -> do_append(state, key, suffix) end)
+  end
+
+  def apply(meta, {:append_blob_ref, key, encoded_ref}, state) do
+    apply_pending_with_time(meta, state, fn -> do_append_blob_ref(state, key, encoded_ref) end)
   end
 
   def apply(meta, {:getset, key, new_value}, state) do
@@ -3947,6 +3954,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:append, key, suffix}) do
     do_append(state, key, suffix)
+  end
+
+  defp apply_single(state, {:append_blob_ref, key, encoded_ref}) do
+    do_append_blob_ref(state, key, encoded_ref)
   end
 
   defp apply_single(state, {:getset, key, new_value}) do
@@ -12418,15 +12429,19 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp maybe_materialize_blob_ref_pending_value(state, encoded_ref, opts) do
     if Keyword.get(opts, :materialize_pending?, false) do
-      with {:ok, %BlobRef{} = ref} <- BlobRef.decode(encoded_ref),
-           {:ok, payload} <- BlobStore.get(state.data_dir, state.shard_index, ref) do
-        {:ok, payload}
-      else
-        :error -> {:error, {:blob_ref_unavailable, :invalid_ref}}
-        {:error, reason} -> {:error, {:blob_ref_unavailable, reason}}
-      end
+      materialize_blob_command_value(state, encoded_ref)
     else
       {:ok, :none}
+    end
+  end
+
+  defp materialize_blob_command_value(state, encoded_ref) do
+    with {:ok, %BlobRef{} = ref} <- BlobRef.decode(encoded_ref),
+         {:ok, payload} <- BlobStore.get(state.data_dir, state.shard_index, ref) do
+      {:ok, payload}
+    else
+      :error -> {:error, {:blob_ref_unavailable, :invalid_ref}}
+      {:error, reason} -> {:error, {:blob_ref_unavailable, reason}}
     end
   end
 
@@ -12531,6 +12546,16 @@ defmodule Ferricstore.Raft.StateMachine do
       {:ok, byte_size(new_val)}
     end
   end
+
+  defp do_append_blob_ref(state, key, encoded_ref) when is_binary(encoded_ref) do
+    with :ok <- ensure_string_key(state, key),
+         {:ok, suffix} <- materialize_blob_command_value(state, encoded_ref) do
+      do_append(state, key, suffix)
+    end
+  end
+
+  defp do_append_blob_ref(_state, _key, _encoded_ref),
+    do: {:error, {:blob_ref_unavailable, :invalid_ref}}
 
   # Atomic GETSET: reads old value, writes new value with no expiry, returns
   # old value directly (not wrapped in {:ok, ...}).
