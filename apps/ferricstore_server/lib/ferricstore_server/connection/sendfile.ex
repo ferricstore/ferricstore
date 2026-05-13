@@ -321,22 +321,85 @@ defmodule FerricstoreServer.Connection.Sendfile do
     end
   end
 
-  defp do_sendfile_range(path, offset, size, validator, state) do
-    socket = state.socket
+  @doc false
+  def send_file_range_response_cached(
+        args,
+        path,
+        offset,
+        size,
+        validator,
+        %{transport: :ranch_tcp} = state,
+        file_cache
+      ) do
+    case cached_file_open(path, file_cache) do
+      {:ok, fd, new_cache} ->
+        result = do_sendfile_range_open(path, fd, offset, size, validator, state)
+        emit_sendfile_result(result, size, state)
 
-    case :file.open(path, [:read, :raw, :binary]) do
+        case result do
+          {:sent, new_state} ->
+            tracked_state =
+              ConnTracking.maybe_track_read("GETRANGE", args, :sendfile_ok, new_state)
+
+            {:sent, tracked_state, new_cache}
+
+          :fallback ->
+            {:fallback, new_cache}
+
+          {:error_after_header, reason} ->
+            {:error_after_header, reason, new_cache}
+        end
+
+      {:error, _reason} ->
+        {:fallback, file_cache}
+    end
+  end
+
+  def send_file_range_response_cached(args, path, offset, size, validator, state, file_cache) do
+    case cached_file_open(path, file_cache) do
+      {:ok, fd, new_cache} ->
+        result = do_stream_file_get_open(path, fd, offset, size, validator, state)
+        emit_file_stream_result(result, size, state)
+
+        case result do
+          {:sent, new_state, _chunks} ->
+            tracked_state =
+              ConnTracking.maybe_track_read("GETRANGE", args, :file_stream_ok, new_state)
+
+            {:sent, tracked_state, new_cache}
+
+          :fallback ->
+            {:fallback, new_cache}
+
+          {:error_after_header, reason, _chunks} ->
+            {:error_after_header, reason, new_cache}
+        end
+
+      {:error, _reason} ->
+        {:fallback, file_cache}
+    end
+  end
+
+  defp do_sendfile_range(path, offset, size, validator, state) do
+    case file_open(path) do
       {:ok, fd} ->
         try do
-          case validate_open_file_range(path, fd, offset, size, validator, :sendfile) do
-            :ok -> send_file_range_with_cork(socket, fd, offset, size, state)
-            :mismatch -> :fallback
-          end
+          do_sendfile_range_open(path, fd, offset, size, validator, state)
         after
           :file.close(fd)
         end
 
       {:error, _reason} ->
         :fallback
+    end
+  end
+
+  defp do_sendfile_range_open(path, fd, offset, size, validator, state) do
+    socket = state.socket
+
+    case validate_open_file_range(path, fd, offset, size, validator, :sendfile) do
+      :ok -> send_file_range_with_cork(socket, fd, offset, size, state)
+      :mismatch -> :fallback
     end
   end
 
@@ -859,16 +922,20 @@ defmodule FerricstoreServer.Connection.Sendfile do
     case file_open(path) do
       {:ok, fd} ->
         try do
-          case validate_open_file_range(path, fd, offset, size, validator) do
-            :ok -> stream_file_get_open(fd, offset, size, state)
-            :mismatch -> :fallback
-          end
+          do_stream_file_get_open(path, fd, offset, size, validator, state)
         after
           :file.close(fd)
         end
 
       {:error, _reason} ->
         :fallback
+    end
+  end
+
+  defp do_stream_file_get_open(path, fd, offset, size, validator, state) do
+    case validate_open_file_range(path, fd, offset, size, validator) do
+      :ok -> stream_file_get_open(fd, offset, size, state)
+      :mismatch -> :fallback
     end
   end
 

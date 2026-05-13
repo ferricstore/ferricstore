@@ -1459,18 +1459,19 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
           {:file_range, args, key, start_idx, end_idx, path, offset, size, validator},
           {{:continue, acc_state}, file_cache} ->
-            case ConnSendfile.send_file_range_response(
+            case ConnSendfile.send_file_range_response_cached(
                    args,
                    path,
                    offset,
                    size,
                    validator,
-                   acc_state
+                   acc_state,
+                   file_cache
                  ) do
-              {:sent, new_state} ->
-                {:cont, {{:continue, new_state}, file_cache}}
+              {:sent, new_state, new_cache} ->
+                {:cont, {{:continue, new_state}, new_cache}}
 
-              :fallback ->
+              {:fallback, new_cache} ->
                 send_response_fn.(
                   acc_state.socket,
                   acc_state.transport,
@@ -1482,10 +1483,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
                 tracked_state =
                   ConnTracking.maybe_track_read("GETRANGE", args, :fallback_ok, acc_state)
 
-                {:cont, {{:continue, tracked_state}, file_cache}}
+                {:cont, {{:continue, tracked_state}, new_cache}}
 
-              {:error_after_header, _reason} ->
-                {:halt, {{:quit, acc_state}, file_cache}}
+              {:error_after_header, _reason, new_cache} ->
+                {:halt, {{:quit, acc_state}, new_cache}}
             end
 
           {:file_ref, key, lookup_key, path, offset, size},
