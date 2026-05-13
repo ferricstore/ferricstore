@@ -225,7 +225,8 @@ defmodule FerricstoreServer.Connection.Sendfile do
   end
 
   defp fetch_get_with_file_ref(instance_ctx, lookup_key) do
-    {:ok, Router.get_with_file_ref(instance_ctx, lookup_key)}
+    {:ok,
+     Router.get_with_file_ref(instance_ctx, lookup_key, defer_blob_file_ref_validation?: true)}
   catch
     _, _ -> :error
   end

@@ -1071,6 +1071,62 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     end
   end
 
+  test "GETRANGE defers blob ref validation to the streaming layer" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 64,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    key = "large-blob-defer-validation-getrange"
+    value = :binary.copy("R", Sendfile.threshold_bytes() + 512)
+    end_idx = byte_size(value) - 1
+    args = [key, "0", Integer.to_string(end_idx)]
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_open_read_hook, fn path, modes ->
+      send(parent, {:blob_store_open, path})
+      File.open(path, modes)
+    end)
+
+    Process.put(:ferricstore_sendfile_open_hook, fn path, modes ->
+      send(parent, {:sendfile_open, path})
+      :file.open(path, modes)
+    end)
+
+    try do
+      :ok = Router.put(ctx, key, value, 0)
+
+      state = %{
+        socket: self(),
+        transport: FakeTlsTransport,
+        client_id: :test_client,
+        instance_ctx: ctx,
+        sandbox_namespace: nil,
+        pubsub_channels: nil,
+        tracking: nil
+      }
+
+      fallback = fn _fallback_state ->
+        flunk("GETRANGE fallback should not run after streaming validation succeeds")
+      end
+
+      assert {:continue, "", ^state} =
+               Sendfile.dispatch_getrange(args, key, 0, end_idx, state, fallback)
+
+      sends = collect_fake_tls_sends()
+      assert {:ok, [^value], ""} = Parser.parse(IO.iodata_to_binary(sends))
+      refute_received {:blob_store_open, _path}
+      assert [path] = collect_sendfile_opens()
+      assert Path.extname(path) == ".bloblog"
+    after
+      Process.delete(:ferricstore_blob_store_open_read_hook)
+      Process.delete(:ferricstore_sendfile_open_hook)
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
   test "GETRANGE does not stream a corrupt large blob file ref range" do
     ctx =
       IsolatedInstance.checkout(
