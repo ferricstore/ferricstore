@@ -316,6 +316,10 @@ defmodule Ferricstore.Raft.StateMachine do
     * `{:compound_put_blob_ref, compound_key, encoded_ref, expire_at_ms}` --
       Compound PUT whose large value was externalized before Ra submission.
       ZSET score commands stay inline so score indexes never consume refs.
+    * `{:compound_blob_batch_put, redis_key, entries}` -- Compound batch PUT
+      where entries are `{compound_key, value_or_ref, expire_at_ms,
+      :value | :blob_ref}` tuples. Blob refs are validated before any entry is
+      made visible.
     * `{:compound_delete, compound_key}` -- Delete a hash/set/zset field. Removes
       the compound key from ETS and Bitcask.
     * `{:compound_delete_prefix, prefix}` -- Delete all compound keys matching the
@@ -728,6 +732,20 @@ defmodule Ferricstore.Raft.StateMachine do
       write_result =
         with_pending_writes(state, fn ->
           apply_compound_batch_put_entries(state, redis_key, entries)
+        end)
+
+      finish_hot_batch_apply(meta, old_count, state, length(entries), write_result)
+    end)
+  end
+
+  def apply(meta, {:compound_blob_batch_put, redis_key, entries}, state)
+      when is_binary(redis_key) and is_list(entries) do
+    with_apply_time(meta, fn ->
+      old_count = state.applied_count
+
+      write_result =
+        with_pending_writes(state, fn ->
+          apply_compound_blob_batch_put_entries(state, redis_key, entries)
         end)
 
       finish_hot_batch_apply(meta, old_count, state, length(entries), write_result)
@@ -3942,6 +3960,15 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp apply_single(state, {:compound_blob_batch_put, redis_key, entries}) do
+    case apply_compound_blob_batch_put_entries(state, redis_key, entries,
+           materialize_pending?: true
+         ) do
+      results when is_list(results) -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
   defp apply_single(state, {:compound_delete, compound_key}) do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
 
@@ -4546,6 +4573,30 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp apply_compound_blob_batch_put_entries(state, redis_key, entries, opts \\ []) do
+    cond do
+      not compound_blob_put_entries_for_key?(redis_key, entries) ->
+        {:error, :compound_batch_cross_key}
+
+      Map.get(state, :cross_shard_locks, %{}) != %{} ->
+        compound_batch_lock_checked_results(state, redis_key, entries, fn ->
+          do_compound_blob_batch_put(state, redis_key, entries, opts)
+        end)
+
+      true ->
+        case check_key_lock(state, redis_key, nil) do
+          :ok ->
+            case do_compound_blob_batch_put(state, redis_key, entries, opts) do
+              :ok -> List.duplicate(:ok, length(entries))
+              {:error, _reason} = error -> error
+            end
+
+          {:error, :key_locked} = error ->
+            List.duplicate(error, length(entries))
+        end
+    end
+  end
+
   defp apply_compound_batch_delete_keys(state, redis_key, compound_keys) do
     cond do
       not compound_delete_keys_for_key?(redis_key, compound_keys) ->
@@ -4586,6 +4637,17 @@ defmodule Ferricstore.Raft.StateMachine do
   defp compound_put_entries_for_key?(redis_key, entries) do
     Enum.all?(entries, fn
       {compound_key, _value, _expire_at_ms} when is_binary(compound_key) ->
+        CompoundKey.extract_redis_key(compound_key) == redis_key
+
+      _entry ->
+        false
+    end)
+  end
+
+  defp compound_blob_put_entries_for_key?(redis_key, entries) do
+    Enum.all?(entries, fn
+      {compound_key, _value_or_ref, _expire_at_ms, tag}
+      when is_binary(compound_key) and tag in [:value, :blob_ref] ->
         CompoundKey.extract_redis_key(compound_key) == redis_key
 
       _entry ->
@@ -13915,6 +13977,231 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp do_compound_blob_batch_put(_state, _redis_key, [], _opts), do: :ok
+
+  defp do_compound_blob_batch_put(state, redis_key, entries, opts) do
+    with {:ok, prepared} <-
+           prepare_compound_blob_batch_put_entries(state, redis_key, entries, opts) do
+      case compound_blob_batch_put_target(state, redis_key, entries) do
+        :shared ->
+          do_shared_compound_blob_batch_put(state, redis_key, prepared, opts)
+
+        {:promoted, dedicated_path} ->
+          do_promoted_compound_blob_batch_put(state, redis_key, prepared, dedicated_path)
+
+        :mixed ->
+          do_compound_blob_batch_put_generic(state, redis_key, prepared)
+      end
+    end
+  end
+
+  defp prepare_compound_blob_batch_put_entries(state, redis_key, entries, opts) do
+    materialize_pending? = Keyword.get(opts, :materialize_pending?, false)
+
+    entries
+    |> Enum.reduce_while({:ok, [], []}, fn
+      {compound_key, value, expire_at_ms, :value}, {:ok, prepared, refs}
+      when is_binary(compound_key) and is_binary(value) ->
+        {:cont, {:ok, [{:value, compound_key, value, expire_at_ms} | prepared], refs}}
+
+      {compound_key, encoded_ref, expire_at_ms, :blob_ref}, {:ok, prepared, refs}
+      when is_binary(compound_key) and is_binary(encoded_ref) ->
+        if materialize_pending? or zset_compound_key?(redis_key, compound_key) do
+          case materialize_blob_command_value(state, encoded_ref) do
+            {:ok, payload} ->
+              entry = {:blob_ref, compound_key, encoded_ref, expire_at_ms, payload}
+              {:cont, {:ok, [entry | prepared], refs}}
+
+            {:error, _reason} = error ->
+              {:halt, error}
+          end
+        else
+          case BlobRef.decode(encoded_ref) do
+            {:ok, %BlobRef{} = ref} ->
+              entry = {:blob_ref, compound_key, encoded_ref, expire_at_ms, :none}
+              {:cont, {:ok, [entry | prepared], [ref | refs]}}
+
+            :error ->
+              {:halt, {:error, {:blob_ref_unavailable, :invalid_ref}}}
+          end
+        end
+
+      _invalid, {:ok, _prepared, _refs} ->
+        {:halt, {:error, {:blob_batch_invalid_entry, :invalid_entry}}}
+    end)
+    |> case do
+      {:ok, prepared, refs} ->
+        with :ok <- validate_put_blob_refs(state, Enum.reverse(refs)) do
+          {:ok,
+           prepared
+           |> Enum.reverse()
+           |> Enum.map(&compound_blob_batch_disk_entry(state, &1))}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp compound_blob_batch_disk_entry(state, {:value, compound_key, value, expire_at_ms}) do
+    disk_value = persisted_disk_binary!(state, value)
+    ets_value = value_for_ets(value, hot_cache_threshold(state))
+
+    {compound_key, disk_value, expire_at_ms, ets_value, value, value}
+  end
+
+  defp compound_blob_batch_disk_entry(
+         _state,
+         {:blob_ref, compound_key, encoded_ref, expire_at_ms, pending_value}
+       ) do
+    {compound_key, encoded_ref, expire_at_ms, nil, pending_value,
+     blob_ref_index_value(encoded_ref, pending_value)}
+  end
+
+  defp do_shared_compound_blob_batch_put(state, redis_key, prepared, opts) do
+    materialize_pending? = Keyword.get(opts, :materialize_pending?, false)
+
+    cond do
+      compound_blob_batch_fast_path?(state, materialize_pending?) ->
+        do_shared_compound_blob_batch_put_fast(state, redis_key, prepared)
+
+      true ->
+        do_compound_blob_batch_put_generic(state, redis_key, prepared)
+    end
+  end
+
+  defp compound_blob_batch_fast_path?(state, false) do
+    compound_shared_fast_path?(state) and Process.get(:sm_pending_writes, []) == [] and
+      Process.get(:sm_pending_values, %{}) == %{}
+  end
+
+  defp compound_blob_batch_fast_path?(_state, _materialize_pending?), do: false
+
+  defp do_shared_compound_blob_batch_put_fast(state, redis_key, prepared) do
+    pending =
+      Enum.reduce(prepared, [], fn {compound_key, disk_value, expire_at_ms, ets_value,
+                                    _pending_value, index_value},
+                                   acc ->
+        queue_zset_index_put_after_flush(state, redis_key, compound_key, index_value)
+
+        [
+          {:put, compound_key, disk_value, expire_at_ms, ets_value, byte_size(disk_value)}
+          | acc
+        ]
+      end)
+
+    Process.put(:sm_pending_writes, pending)
+    Process.put(:sm_pending_fast_put_batch, true)
+    :ok
+  end
+
+  defp do_compound_blob_batch_put_generic(state, redis_key, prepared) do
+    Enum.each(prepared, fn entry ->
+      queue_prepared_compound_blob_put(state, redis_key, entry)
+    end)
+
+    :ok
+  end
+
+  defp queue_prepared_compound_blob_put(
+         state,
+         redis_key,
+         {compound_key, disk_value, expire_at_ms, ets_value, pending_value, index_value}
+       ) do
+    if cross_shard_pending_active?() do
+      cross_shard_raw_put(state, compound_key, ets_value, disk_value, expire_at_ms, LFU.initial())
+    else
+      record_pending_original(state, compound_key)
+
+      unless standalone_staged_apply?() do
+        track_keydir_binary_delta(state, compound_key, ets_value, expire_at_ms)
+
+        :ets.insert(
+          state.ets,
+          {compound_key, ets_value, expire_at_ms, LFU.initial(), :pending, 0,
+           byte_size(disk_value)}
+        )
+      end
+
+      queue_pending_prepared_put(
+        compound_key,
+        disk_value,
+        expire_at_ms,
+        ets_value,
+        pending_value
+      )
+    end
+
+    queue_zset_index_put_after_flush(state, redis_key, compound_key, index_value)
+    :ok
+  end
+
+  defp queue_pending_prepared_put(key, disk_value, expire_at_ms, ets_value, pending_value) do
+    pending = Process.get(:sm_pending_writes, [])
+
+    Process.put(:sm_pending_writes, [
+      {:put, key, disk_value, expire_at_ms, ets_value, byte_size(disk_value)} | pending
+    ])
+
+    if pending_value != :none do
+      pending_values = Process.get(:sm_pending_values, %{})
+      Process.put(:sm_pending_values, Map.put(pending_values, key, {pending_value, expire_at_ms}))
+    end
+  end
+
+  defp do_promoted_compound_blob_batch_put(state, redis_key, prepared, dedicated_path) do
+    Promotion.await_compaction_latch(state, redis_key)
+
+    active = Promotion.find_active(dedicated_path)
+    fid = parse_fid_from_path(active)
+
+    disk_entries =
+      Enum.map(prepared, fn {compound_key, disk_value, expire_at_ms, _ets_value, _pending_value,
+                             _index_value} ->
+        {compound_key, disk_value, expire_at_ms}
+      end)
+
+    case NIF.v2_append_batch(active, disk_entries) do
+      {:ok, locations} when length(locations) == length(prepared) ->
+        prepared
+        |> Enum.zip(locations)
+        |> Enum.each(fn
+          {{compound_key, _disk_value, expire_at_ms, ets_value, pending_value, index_value},
+           {offset, value_size}} ->
+            track_keydir_binary_delta(state, compound_key, ets_value, expire_at_ms)
+
+            :ets.insert(
+              state.ets,
+              {compound_key, ets_value, expire_at_ms, LFU.initial(), fid, offset, value_size}
+            )
+
+            if pending_value != :none do
+              sm_tx_put_pending(compound_key, pending_value, expire_at_ms)
+            else
+              clear_tx_deleted_key(compound_key)
+            end
+
+            zset_index_put(state, redis_key, compound_key, index_value)
+        end)
+
+        :ok
+
+      {:ok, locations} ->
+        {:error, {:batch_result_mismatch, length(prepared), locations}}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp clear_tx_deleted_key(key) do
+    deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+    if MapSet.member?(deleted, key) do
+      Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
+    end
+  end
+
   defp compound_batch_put_target(state, redis_key, [{compound_key, _value, _expire_at_ms} | rest]) do
     first_path = promoted_compound_path(state, redis_key, compound_key)
 
@@ -13937,6 +14224,25 @@ defmodule Ferricstore.Raft.StateMachine do
         {:error, _reason} = error -> {:halt, error}
       end
     end)
+  end
+
+  defp compound_blob_batch_put_target(
+         state,
+         redis_key,
+         [{compound_key, _value_or_ref, _expire_at_ms, _tag} | rest]
+       ) do
+    first_path = promoted_compound_path(state, redis_key, compound_key)
+
+    if Enum.all?(rest, fn {key, _value_or_ref, _expire_at_ms, _tag} ->
+         promoted_compound_path(state, redis_key, key) == first_path
+       end) do
+      case first_path do
+        nil -> :shared
+        dedicated_path -> {:promoted, dedicated_path}
+      end
+    else
+      :mixed
+    end
   end
 
   # Shared compound batches use the same publish-after-append contract as

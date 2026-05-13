@@ -134,6 +134,42 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
   end
 
+  test "prepares compound batch put with mixed inline and blob values", %{
+    ctx: ctx,
+    root: root
+  } do
+    redis_key = "hash"
+    small = CompoundKey.hash_field(redis_key, "small")
+    large = CompoundKey.hash_field(redis_key, "large")
+    payload = :binary.copy("B", 1024)
+
+    assert {:ok,
+            {:compound_blob_batch_put, ^redis_key,
+             [
+               {^small, "v", 0, :value},
+               {^large, encoded_ref, 0, :blob_ref}
+             ]}} =
+             BlobCommand.prepare(
+               ctx,
+               0,
+               {:compound_batch_put, redis_key, [{small, "v", 0}, {large, payload, 0}]},
+               single_member?: true
+             )
+
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
+  end
+
+  test "leaves zset score compound batches inline", %{ctx: ctx} do
+    redis_key = "zset"
+    member = CompoundKey.zset_member(redis_key, "member")
+    payload = :binary.copy("9", 1024)
+    command = {:compound_batch_put, redis_key, [{member, payload, 0}]}
+
+    assert {:ok, ^command} = BlobCommand.prepare(ctx, 0, command, single_member?: true)
+    refute BlobCommand.side_channel_candidate?(ctx, command)
+  end
+
   test "prepares generic Ra batches by replacing large puts with blob refs", %{
     ctx: ctx,
     root: root
@@ -290,6 +326,12 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert BlobCommand.side_channel_candidate?(
              ctx,
              {:compound_put, CompoundKey.hash_field("hash", "field"), :binary.copy("H", 1024), 0}
+           )
+
+    assert BlobCommand.side_channel_candidate?(
+             ctx,
+             {:compound_batch_put, "hash",
+              [{CompoundKey.hash_field("hash", "field"), :binary.copy("H", 1024), 0}]}
            )
 
     assert BlobCommand.side_channel_candidate?(

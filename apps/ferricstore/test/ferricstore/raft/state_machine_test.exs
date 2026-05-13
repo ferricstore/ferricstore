@@ -3716,6 +3716,122 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert [{^compound_key, "2", 0, _lfu, _fid, _off, ^expected_size}] =
                :ets.lookup(ets, compound_key)
     end
+
+    test "mixed batch compound blob batch put is visible to later RMW commands", %{
+      state: state,
+      ets: ets
+    } do
+      key = "blob_hash_batch_many"
+      field = "field"
+      compound_key = CompoundKey.hash_field(key, field)
+      payload = "1"
+      expected_size = byte_size("2")
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:batch,
+           [
+             {:compound_blob_batch_put, key, [{compound_key, encoded_ref, 0, :blob_ref}]},
+             {:hincrby, key, field, 1}
+           ]},
+          state
+        )
+
+      assert result == {:ok, [:ok, 2]}
+
+      assert [{^compound_key, "2", 0, _lfu, _fid, _off, ^expected_size}] =
+               :ets.lookup(ets, compound_key)
+    end
+
+    test "compound blob batch put stores inline and blob ref entries", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "blob_hash_batch_put"
+      small_field = CompoundKey.hash_field(redis_key, "small")
+      large_field = CompoundKey.hash_field(redis_key, "large")
+      payload = :binary.copy("blob-batch", 32)
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+      encoded_ref_size = byte_size(encoded_ref)
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:compound_blob_batch_put, redis_key,
+           [{small_field, "v", 0, :value}, {large_field, encoded_ref, 0, :blob_ref}]},
+          state
+        )
+
+      assert result == {:ok, [:ok, :ok]}
+      assert [{^small_field, "v", 0, _lfu, _fid, _off, 1}] = :ets.lookup(ets, small_field)
+
+      assert [{^large_field, nil, 0, _lfu, _fid, _off, ^encoded_ref_size}] =
+               :ets.lookup(ets, large_field)
+    end
+
+    test "compound blob batch put preserves old values when ref validation fails", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "blob_hash_batch_invalid"
+      existing = CompoundKey.hash_field(redis_key, "existing")
+      new_field = CompoundKey.hash_field(redis_key, "new")
+      missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+
+      {state2, {:ok, [:ok]}} =
+        StateMachine.apply(%{}, {:compound_batch_put, redis_key, [{existing, "old", 0}]}, state)
+
+      old_entry = :ets.lookup(ets, existing)
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:compound_blob_batch_put, redis_key,
+           [{existing, missing_ref, 0, :blob_ref}, {new_field, "new", 0, :value}]},
+          state2
+        )
+
+      assert {:error, {:blob_ref_unavailable, :enoent}} = result
+      assert old_entry == :ets.lookup(ets, existing)
+      assert [] == :ets.lookup(ets, new_field)
+    end
+
+    test "compound blob batch put Bitcask append errors keep existing fields visible", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "blob_hash_batch_append_invalid"
+      existing = CompoundKey.hash_field(redis_key, "existing")
+      new_field = CompoundKey.hash_field(redis_key, "new")
+      payload = :binary.copy("blob-batch-append", 32)
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+
+      {state2, {:ok, [:ok]}} =
+        StateMachine.apply(%{}, {:compound_batch_put, redis_key, [{existing, "old", 0}]}, state)
+
+      old_entry = :ets.lookup(ets, existing)
+      file_id = 9_600_000 + :erlang.unique_integer([:positive])
+      bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+      File.mkdir_p!(bad_active_path)
+      bad_state = %{state2 | active_file_id: file_id, active_file_path: bad_active_path}
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:compound_blob_batch_put, redis_key,
+           [{existing, encoded_ref, 0, :blob_ref}, {new_field, "new", 0, :value}]},
+          bad_state
+        )
+
+      assert {:error, {:bitcask_append_failed, _reason}} = result
+      assert old_entry == :ets.lookup(ets, existing)
+      assert [] == :ets.lookup(ets, new_field)
+    end
   end
 
   describe "apply/3 with {:append, key, suffix}" do

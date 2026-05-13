@@ -153,6 +153,8 @@ defmodule Ferricstore.Raft.Batcher do
           | {:compound_put, binary(), binary(), non_neg_integer()}
           | {:compound_put_blob_ref, binary(), binary(), non_neg_integer()}
           | {:compound_batch_put, binary(), [{binary(), binary(), non_neg_integer()}]}
+          | {:compound_blob_batch_put, binary(),
+             [{binary(), binary(), non_neg_integer(), :value | :blob_ref}]}
           | {:compound_delete, binary()}
           | {:compound_batch_delete, binary(), [binary()]}
           | {:compound_delete_prefix, binary()}
@@ -2698,6 +2700,10 @@ defmodule Ferricstore.Raft.Batcher do
   defp command_shape({:put_batch, _entries}), do: :put_batch
   defp command_shape({:delete_batch, _keys}), do: :delete_batch
   defp command_shape({:compound_batch_put, _redis_key, _entries}), do: :compound_batch_put
+
+  defp command_shape({:compound_blob_batch_put, _redis_key, _entries}),
+    do: :compound_blob_batch_put
+
   defp command_shape({:compound_batch_delete, _redis_key, _keys}), do: :compound_batch_delete
   defp command_shape({:batch, _commands}), do: :batch
   defp command_shape(command) when is_tuple(command), do: elem(command, 0)

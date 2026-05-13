@@ -18,6 +18,7 @@ defmodule Ferricstore.Raft.BlobCommand do
           | {:setrange, binary(), non_neg_integer(), binary()}
           | {:cas, binary(), binary(), binary(), non_neg_integer() | nil}
           | {:compound_put, binary(), binary(), non_neg_integer()}
+          | {:compound_batch_put, binary(), [{binary(), binary(), non_neg_integer()}]}
           | {:put_batch, [{binary(), binary(), non_neg_integer()}]}
           | term()
 
@@ -162,6 +163,24 @@ defmodule Ferricstore.Raft.BlobCommand do
     end
   end
 
+  defp prepare_enabled(
+         %{data_dir: data_dir},
+         shard_index,
+         threshold,
+         {:compound_batch_put, redis_key, entries}
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_binary(redis_key) and is_list(entries) do
+    with {:ok, prepared, externalized?} <-
+           prepare_compound_batch_entries(data_dir, shard_index, threshold, entries) do
+      if externalized? do
+        {:ok, {:compound_blob_batch_put, redis_key, prepared}}
+      else
+        {:ok, {:compound_batch_put, redis_key, entries}}
+      end
+    end
+  end
+
   defp prepare_enabled(%{data_dir: data_dir}, shard_index, threshold, {:put_batch, entries})
        when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
               is_list(entries) do
@@ -217,6 +236,17 @@ defmodule Ferricstore.Raft.BlobCommand do
   defp command_candidate?({:compound_put, compound_key, value, _expire_at_ms}, threshold)
        when is_binary(compound_key) and is_binary(value) do
     compound_blob_side_channel_key?(compound_key) and externalize?(value, threshold)
+  end
+
+  defp command_candidate?({:compound_batch_put, _redis_key, entries}, threshold)
+       when is_list(entries) do
+    Enum.any?(entries, fn
+      {compound_key, value, _expire_at_ms} when is_binary(compound_key) and is_binary(value) ->
+        compound_blob_side_channel_key?(compound_key) and externalize?(value, threshold)
+
+      _other ->
+        false
+    end)
   end
 
   defp command_candidate?({:put_batch, entries}, threshold) when is_list(entries) do
@@ -344,6 +374,19 @@ defmodule Ferricstore.Raft.BlobCommand do
           {:error, _reason} = error -> {:halt, error}
         end
 
+      {:compound_batch_put, redis_key, entries}, {:ok, acc, external_payloads}
+      when is_binary(redis_key) and is_list(entries) ->
+        case prepare_generic_compound_batch_entries(
+               redis_key,
+               entries,
+               threshold,
+               acc,
+               external_payloads
+             ) do
+          {:ok, acc, external_payloads} -> {:cont, {:ok, acc, external_payloads}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+
       command, {:ok, acc, external_payloads} ->
         {:cont, {:ok, [command | acc], external_payloads}}
     end)
@@ -377,6 +420,72 @@ defmodule Ferricstore.Raft.BlobCommand do
     end)
   end
 
+  defp prepare_compound_batch_entries(data_dir, shard_index, threshold, entries) do
+    entries
+    |> Enum.reduce_while({:ok, [], []}, fn
+      {compound_key, value, expire_at_ms}, {:ok, acc, external_payloads}
+      when is_binary(compound_key) and is_binary(value) ->
+        if compound_blob_side_channel_key?(compound_key) and externalize?(value, threshold) do
+          marker = {compound_key, :external, expire_at_ms}
+          {:cont, {:ok, [marker | acc], [value | external_payloads]}}
+        else
+          {:cont, {:ok, [{compound_key, value, expire_at_ms, :value} | acc], external_payloads}}
+        end
+
+      _invalid, {:ok, _acc, _external_payloads} ->
+        {:halt, {:error, :invalid_compound_batch_entry}}
+    end)
+    |> case do
+      {:ok, prepared, []} ->
+        {:ok, Enum.reverse(prepared), false}
+
+      {:ok, prepared, external_payloads} ->
+        with {:ok, refs} <-
+               BlobStore.put_many(data_dir, shard_index, Enum.reverse(external_payloads)) do
+          {:ok, inflate_compound_batch_blob_refs(Enum.reverse(prepared), refs), true}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp prepare_generic_compound_batch_entries(
+         redis_key,
+         entries,
+         threshold,
+         acc,
+         external_payloads
+       ) do
+    entries
+    |> Enum.reduce_while({:ok, [], external_payloads, false}, fn
+      {compound_key, value, expire_at_ms}, {:ok, prepared, external_payloads, externalized?}
+      when is_binary(compound_key) and is_binary(value) ->
+        if compound_blob_side_channel_key?(compound_key) and externalize?(value, threshold) do
+          marker = {compound_key, :external, expire_at_ms}
+          {:cont, {:ok, [marker | prepared], [value | external_payloads], true}}
+        else
+          {:cont,
+           {:ok, [{compound_key, value, expire_at_ms, :value} | prepared], external_payloads,
+            externalized?}}
+        end
+
+      _invalid, {:ok, _prepared, _external_payloads, _externalized?} ->
+        {:halt, {:error, :invalid_compound_batch_entry}}
+    end)
+    |> case do
+      {:ok, prepared, external_payloads, true} ->
+        {:ok, [{:compound_blob_batch_external, redis_key, Enum.reverse(prepared)} | acc],
+         external_payloads}
+
+      {:ok, _prepared, external_payloads, false} ->
+        {:ok, [{:compound_batch_put, redis_key, entries} | acc], external_payloads}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
   defp inflate_generic_batch_blob_refs(prepared, refs) do
     {result, []} =
       Enum.map_reduce(prepared, refs, fn
@@ -401,11 +510,30 @@ defmodule Ferricstore.Raft.BlobCommand do
         {:compound_put_external, compound_key, expire_at_ms}, [ref | rest] ->
           {{:compound_put_blob_ref, compound_key, BlobRef.encode!(ref), expire_at_ms}, rest}
 
+        {:compound_blob_batch_external, redis_key, entries}, refs ->
+          {inflated_entries, refs} = inflate_compound_batch_blob_refs_with_rest(entries, refs)
+          {{:compound_blob_batch_put, redis_key, inflated_entries}, refs}
+
         command, refs ->
           {command, refs}
       end)
 
     result
+  end
+
+  defp inflate_compound_batch_blob_refs(prepared, refs) do
+    {result, []} = inflate_compound_batch_blob_refs_with_rest(prepared, refs)
+    result
+  end
+
+  defp inflate_compound_batch_blob_refs_with_rest(prepared, refs) do
+    Enum.map_reduce(prepared, refs, fn
+      {compound_key, :external, expire_at_ms}, [ref | rest] ->
+        {{compound_key, BlobRef.encode!(ref), expire_at_ms, :blob_ref}, rest}
+
+      entry, refs ->
+        {entry, refs}
+    end)
   end
 
   defp prepare_value(data_dir, shard_index, threshold, value) do
