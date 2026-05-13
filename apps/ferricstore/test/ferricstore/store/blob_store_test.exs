@@ -128,6 +128,14 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:ok, "target"} = BlobStore.get_range(root, 0, ref, 2048, 6)
   end
 
+  test "get_range rejects an oversized legacy blob file", %{root: root} do
+    payload = "legacy-payload"
+    ref = BlobRef.from_payload(payload)
+    write_legacy_blob!(root, 0, ref, payload <> "-trailing-corruption")
+
+    assert {:error, :size_mismatch} = BlobStore.get_range(root, 0, ref, 0, 6)
+  end
+
   test "get_range rejects a segment ref whose header does not match", %{root: root} do
     payload_a = :binary.copy("a", 512)
     payload_b = :binary.copy("b", 512)

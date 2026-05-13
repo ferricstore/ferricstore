@@ -234,7 +234,7 @@ defmodule Ferricstore.Store.BlobStore do
 
     result =
       with :ok <- validate_blob_range(size, relative_offset, count),
-           :ok <- stat_regular_min_size(path, relative_offset + count),
+           :ok <- stat_regular_size(path, size),
            {:ok, payload} <- read_file_range(path, relative_offset, count) do
         {:ok, payload}
       end
