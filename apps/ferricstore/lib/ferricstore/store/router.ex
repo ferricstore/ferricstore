@@ -1265,12 +1265,25 @@ defmodule Ferricstore.Store.Router do
   `{:file_ref, path, value_offset, size}` tuples instead of being materialized
   into BEAM binaries. Stale or invalid refs fall back to the normal batched cold
   pread path.
+
+  Server streaming callers may pass `defer_blob_file_ref_validation?: true`.
+  That skips duplicate blob segment validation here because sendfile/file-stream
+  validates the same segment immediately before writing bytes to the socket.
+  The default remains validated for embedded/API callers that consume file refs
+  directly.
   """
   @spec batch_get_with_file_refs(FerricStore.Instance.t(), [binary()], non_neg_integer()) :: [
           binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}
         ]
-  def batch_get_with_file_refs(ctx, keys, min_file_ref_size) do
+  @spec batch_get_with_file_refs(
+          FerricStore.Instance.t(),
+          [binary()],
+          non_neg_integer(),
+          keyword()
+        ) :: [binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}]
+  def batch_get_with_file_refs(ctx, keys, min_file_ref_size, opts \\ []) do
     now = HLC.now_ms()
+    defer_blob_validation? = Keyword.get(opts, :defer_blob_file_ref_validation?, false) == true
 
     {results, {cold_entries, _cold_count, blob_ref_entries, _blob_ref_count}} =
       Enum.map_reduce(keys, {[], 0, [], 0}, fn key,
@@ -1373,7 +1386,7 @@ defmodule Ferricstore.Store.Router do
     blob_ref_values =
       blob_ref_entries
       |> Enum.reverse()
-      |> read_blob_file_ref_batch(now)
+      |> read_blob_file_ref_batch(now, defer_blob_validation?)
       |> List.to_tuple()
 
     Enum.map(results, fn
@@ -1489,11 +1502,14 @@ defmodule Ferricstore.Store.Router do
     {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
   end
 
-  defp read_blob_file_ref_batch([], _now), do: []
+  defp read_blob_file_ref_batch([], _now, _defer_blob_validation?), do: []
 
-  defp read_blob_file_ref_batch(entries, now) do
+  defp read_blob_file_ref_batch(entries, now, defer_blob_validation?) do
     {unique_entries, value_indexes} = dedupe_blob_file_ref_batch_entries(entries)
-    unique_values = read_unique_blob_file_ref_batch(unique_entries, now) |> List.to_tuple()
+
+    unique_values =
+      read_unique_blob_file_ref_batch(unique_entries, now, defer_blob_validation?)
+      |> List.to_tuple()
 
     Enum.map(value_indexes, fn index -> elem(unique_values, index) end)
   end
@@ -1522,7 +1538,7 @@ defmodule Ferricstore.Store.Router do
     {path, offset, key}
   end
 
-  defp read_unique_blob_file_ref_batch(entries, now) do
+  defp read_unique_blob_file_ref_batch(entries, now, defer_blob_validation?) do
     locations =
       Enum.map(entries, fn {_ctx, _idx, _keydir, key, path, _file_id, offset, _value_size,
                             _min_file_ref_size} ->
@@ -1545,7 +1561,11 @@ defmodule Ferricstore.Store.Router do
     entry_values = Enum.zip(entries, values)
     emit_batch_cold_read_corruption(blob_file_ref_batch_corruption_counts(entry_values))
 
-    resolve_blob_file_ref_batch_values(entry_values, now)
+    if defer_blob_validation? do
+      resolve_blob_file_ref_batch_values_deferred(entry_values, now)
+    else
+      resolve_blob_file_ref_batch_values(entry_values, now)
+    end
   end
 
   defp blob_file_ref_batch_corruption_counts(entry_values) do
@@ -1574,6 +1594,15 @@ defmodule Ferricstore.Store.Router do
     |> Enum.map(fn
       {{:value, value}, _index} -> value
       {{:blob_file_ref, _entry, _ref}, index} -> Map.fetch!(resolved_file_refs, index)
+    end)
+  end
+
+  defp resolve_blob_file_ref_batch_values_deferred(entry_values, now) do
+    entry_values
+    |> Enum.map(&prepare_blob_file_ref_batch_value(&1, now))
+    |> Enum.map(fn
+      {:value, value} -> value
+      {:blob_file_ref, entry, ref} -> deferred_blob_file_ref_batch_file_ref_value(entry, ref)
     end)
   end
 
@@ -1664,6 +1693,30 @@ defmodule Ferricstore.Store.Router do
          {ctx, idx, keydir, key, _path, file_id, offset, _value_size, _min_file_ref_size},
          %BlobRef{} = ref,
          _error_or_mismatched_file_ref
+       ) do
+    materialize_blob_file_ref_batch_value(ctx, idx, keydir, key, file_id, offset, ref)
+  end
+
+  defp deferred_blob_file_ref_batch_file_ref_value(
+         {ctx, idx, _keydir, key, _path, _file_id, _offset, _value_size, _min_file_ref_size},
+         %BlobRef{version: 1, size: size} = ref
+       ) do
+    Stats.record_cold_read(ctx, key)
+    {:file_ref, BlobRef.path(ctx.data_dir, idx, ref), 0, size}
+  end
+
+  defp deferred_blob_file_ref_batch_file_ref_value(
+         {ctx, idx, _keydir, key, _path, _file_id, _offset, _value_size, _min_file_ref_size},
+         %BlobRef{version: 2, offset: offset, size: size} = ref
+       )
+       when is_integer(offset) and offset >= 0 do
+    Stats.record_cold_read(ctx, key)
+    {:file_ref, BlobRef.path(ctx.data_dir, idx, ref), offset, size}
+  end
+
+  defp deferred_blob_file_ref_batch_file_ref_value(
+         {ctx, idx, keydir, key, _path, file_id, offset, _value_size, _min_file_ref_size},
+         %BlobRef{} = ref
        ) do
     materialize_blob_file_ref_batch_value(ctx, idx, keydir, key, file_id, offset, ref)
   end

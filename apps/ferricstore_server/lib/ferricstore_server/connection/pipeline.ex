@@ -149,7 +149,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
            Router.batch_get_with_file_refs(
              state.instance_ctx,
              lookup_keys,
-             ConnSendfile.threshold_bytes()
+             ConnSendfile.threshold_bytes(),
+             defer_blob_file_ref_validation?: true
            )
          end) do
       {:ok, results} ->
@@ -467,7 +468,9 @@ defmodule FerricstoreServer.Connection.Pipeline do
           get_dispatch =
             if state.transport in [:ranch_tcp, :ranch_ssl] do
               fn ->
-                Router.batch_get_with_file_refs(ctx, lookup_keys, ConnSendfile.threshold_bytes())
+                Router.batch_get_with_file_refs(ctx, lookup_keys, ConnSendfile.threshold_bytes(),
+                  defer_blob_file_ref_validation?: true
+                )
               end
             else
               fn -> Router.batch_get(ctx, lookup_keys) end
@@ -1313,7 +1316,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
                Router.batch_get_with_file_refs(
                  state.instance_ctx,
                  lookup_keys,
-                 ConnSendfile.threshold_bytes()
+                 ConnSendfile.threshold_bytes(),
+                 defer_blob_file_ref_validation?: true
                )
              end) do
           {:ok, results} ->
@@ -1356,7 +1360,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
            Router.batch_get_with_file_refs(
              state.instance_ctx,
              lookup_keys,
-             ConnSendfile.threshold_bytes()
+             ConnSendfile.threshold_bytes(),
+             defer_blob_file_ref_validation?: true
            )
          end) do
       {:ok, results} ->
