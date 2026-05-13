@@ -368,7 +368,8 @@ defmodule Ferricstore.Store.BlobStore do
            {:ok, start_offset} <- file_size_or_zero(path),
            {:ok, io} <- File.open(path, [:append, :raw, :binary]) do
         try do
-          with {:ok, refs, _next_offset} <- append_segment_records(io, payloads, start_offset),
+          with {:ok, refs, iodata, _next_offset} <- build_segment_records(payloads, start_offset),
+               :ok <- write_file(io, iodata),
                :ok <- fsync_file(path),
                :ok <- maybe_fsync_new_segment_dir(dir, file_existed?) do
             {:ok, refs}
@@ -389,24 +390,30 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  defp append_segment_records(io, payloads, start_offset) do
-    Enum.reduce_while(payloads, {:ok, [], start_offset}, fn payload, {:ok, refs, record_offset} ->
+  defp build_segment_records(payloads, start_offset) do
+    Enum.reduce_while(payloads, {:ok, [], [], start_offset}, fn payload,
+                                                                {:ok, refs, records,
+                                                                 record_offset} ->
       payload_offset = record_offset + @segment_header_bytes
       ref = BlobRef.from_segment(payload, @segment_id, payload_offset)
+      next_offset = payload_offset + byte_size(payload)
       record = [segment_header(ref), payload]
 
-      case :file.write(io, record) do
-        :ok ->
-          next_offset = payload_offset + byte_size(payload)
-          {:cont, {:ok, [ref | refs], next_offset}}
-
-        {:error, reason} ->
-          {:halt, {:error, reason}}
-      end
+      {:cont, {:ok, [ref | refs], [record | records], next_offset}}
     end)
     |> case do
-      {:ok, refs, next_offset} -> {:ok, Enum.reverse(refs), next_offset}
-      {:error, _reason} = error -> error
+      {:ok, refs, records, next_offset} ->
+        {:ok, Enum.reverse(refs), Enum.reverse(records), next_offset}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp write_file(io, iodata) do
+    case Process.get(:ferricstore_blob_store_write_hook) do
+      fun when is_function(fun, 2) -> fun.(io, iodata)
+      _ -> :file.write(io, iodata)
     end
   end
 

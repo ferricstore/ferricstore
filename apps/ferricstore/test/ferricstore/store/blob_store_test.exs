@@ -68,6 +68,34 @@ defmodule Ferricstore.Store.BlobStoreTest do
            end)
   end
 
+  test "put_many writes a batch with one file write", %{root: root} do
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_write_hook, fn io, iodata ->
+      send(parent, {:blob_write, IO.iodata_length(iodata)})
+      :file.write(io, iodata)
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_write_hook) end)
+
+    payloads = [
+      :binary.copy("a", 512),
+      :binary.copy("b", 768),
+      :binary.copy("c", 1024)
+    ]
+
+    assert {:ok, refs} = BlobStore.put_many(root, 0, payloads)
+
+    expected_bytes = Enum.sum(Enum.map(payloads, &byte_size/1)) + length(payloads) * 48
+    assert_received {:blob_write, ^expected_bytes}
+    refute_received {:blob_write, _}
+
+    assert Enum.zip(payloads, refs)
+           |> Enum.all?(fn {payload, ref} ->
+             BlobStore.get(root, 0, ref) == {:ok, payload}
+           end)
+  end
+
   test "recover_shard truncates a partial segment tail and preserves prior blobs", %{root: root} do
     payload = :binary.copy("safe", 256)
 
