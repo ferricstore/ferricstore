@@ -1286,6 +1286,32 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert :binary.copy("P", 1024) == GenServer.call(shard, {:compound_get, redis_key, field})
   end
 
+  test "blob garbage sweep skips deletion while Ra replay cursor still covers possible blob refs",
+       %{ctx: ctx, shard: shard} do
+    payload = "dead-but-possibly-still-in-raft-log"
+    ref = BlobRef.from_payload(payload)
+    path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
+
+    :sys.replace_state(shard, fn state -> %{state | raft?: true} end)
+    :atomics.put(ctx.last_applied_index, 1, 10)
+    :atomics.put(ctx.last_released_cursor_index, 1, 9)
+    state = :sys.get_state(shard)
+    assert state.raft?
+    assert :atomics.get(state.instance_ctx.last_applied_index, 1) == 10
+    assert :atomics.get(state.instance_ctx.last_released_cursor_index, 1) == 9
+
+    assert {:ok,
+            %{
+              deleted_files: 0,
+              deleted_bytes: 0,
+              kept_files: 0,
+              skipped: true,
+              reason: {:raft_replay_gap, 10, 9}
+            }} = Router.sweep_blob_garbage(ctx)
+
+    assert File.exists?(path)
+  end
+
   test "blob garbage sweep fails closed when the active Bitcask file cannot fsync", %{
     ctx: ctx,
     shard: shard,
@@ -1452,6 +1478,13 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp write_legacy_blob!(data_dir, shard_index, %BlobRef{} = ref, payload) do
+    path = BlobRef.path(data_dir, shard_index, ref)
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, payload)
+    path
   end
 
   defp overwrite_segment_payload!(data_dir, shard_index, ref, payload) do

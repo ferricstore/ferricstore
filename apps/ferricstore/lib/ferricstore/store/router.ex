@@ -113,7 +113,9 @@ defmodule Ferricstore.Store.Router do
       deleted_bytes: 0,
       kept_files: 0,
       deleted_tmp_files: 0,
-      deleted_tmp_bytes: 0
+      deleted_tmp_bytes: 0,
+      skipped: false,
+      reason: nil
     }
 
   defp merge_blob_gc_stats(acc, stats) do
@@ -122,7 +124,9 @@ defmodule Ferricstore.Store.Router do
       deleted_bytes: acc.deleted_bytes + Map.get(stats, :deleted_bytes, 0),
       kept_files: acc.kept_files + Map.get(stats, :kept_files, 0),
       deleted_tmp_files: acc.deleted_tmp_files + Map.get(stats, :deleted_tmp_files, 0),
-      deleted_tmp_bytes: acc.deleted_tmp_bytes + Map.get(stats, :deleted_tmp_bytes, 0)
+      deleted_tmp_bytes: acc.deleted_tmp_bytes + Map.get(stats, :deleted_tmp_bytes, 0),
+      skipped: acc.skipped or Map.get(stats, :skipped, false),
+      reason: acc.reason || Map.get(stats, :reason)
     }
   end
 

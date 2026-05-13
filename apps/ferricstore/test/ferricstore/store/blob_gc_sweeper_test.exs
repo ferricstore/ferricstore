@@ -125,6 +125,52 @@ defmodule Ferricstore.Store.BlobGCSweeperTest do
     assert %{last_sweep: %{status: :ok, deleted_files: 1}} = BlobGCSweeper.info(name)
   end
 
+  test "reports router skips as skipped sweeps" do
+    parent = self()
+    name = :"blob_gc_sweeper_skip_reason_#{System.unique_integer([:positive])}"
+    reason = {:raft_replay_gap, 10, 9}
+
+    pid =
+      start_supervised!(
+        {BlobGCSweeper,
+         name: name,
+         initial_delay_ms: 60_000,
+         interval_ms: 60_000,
+         stats_fun: fn ->
+           {:ok,
+            %{
+              files: 1,
+              bytes: 4096,
+              legacy_files: 1,
+              legacy_bytes: 4096,
+              segment_files: 0,
+              segment_bytes: 0,
+              tmp_files: 0,
+              tmp_bytes: 0
+            }}
+         end,
+         sweep_fun: fn ->
+           send(parent, :blob_gc_sweep_called)
+
+           {:ok,
+            %{
+              deleted_files: 0,
+              deleted_bytes: 0,
+              kept_files: 0,
+              skipped: true,
+              reason: reason
+            }}
+         end}
+      )
+
+    send(pid, :sweep)
+
+    assert_receive :blob_gc_sweep_called, 1_000
+
+    assert %{last_sweep: %{status: :skipped, skipped: true, reason: ^reason}} =
+             BlobGCSweeper.info(name)
+  end
+
   test "emits error telemetry when automatic GC fails" do
     parent = self()
     name = :"blob_gc_sweeper_error_#{System.unique_integer([:positive])}"

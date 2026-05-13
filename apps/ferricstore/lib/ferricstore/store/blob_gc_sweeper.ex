@@ -126,6 +126,9 @@ defmodule Ferricstore.Store.BlobGCSweeper do
     with {:ok, stats} <- storage_stats(state) do
       if blob_work_present?(stats) do
         case sweep(state) do
+          {:ok, %{skipped: true, reason: reason} = gc_stats} ->
+            {:skipped, normalize_stats(stats), normalize_gc_stats(gc_stats), reason}
+
           {:ok, gc_stats} -> {:ok, normalize_stats(stats), normalize_gc_stats(gc_stats), :none}
           {:error, reason} -> {:error, normalize_stats(stats), @zero_gc, reason}
           other -> {:error, normalize_stats(stats), @zero_gc, other}
@@ -202,7 +205,9 @@ defmodule Ferricstore.Store.BlobGCSweeper do
       deleted_bytes: Map.get(stats, :deleted_bytes, 0),
       kept_files: Map.get(stats, :kept_files, 0),
       deleted_tmp_files: Map.get(stats, :deleted_tmp_files, 0),
-      deleted_tmp_bytes: Map.get(stats, :deleted_tmp_bytes, 0)
+      deleted_tmp_bytes: Map.get(stats, :deleted_tmp_bytes, 0),
+      skipped: Map.get(stats, :skipped, false),
+      reason: Map.get(stats, :reason)
     }
   end
 
