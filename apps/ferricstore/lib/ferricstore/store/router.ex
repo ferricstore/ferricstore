@@ -2208,10 +2208,17 @@ defmodule Ferricstore.Store.Router do
          end_idx
        ) do
     with {:ok, %BlobRef{} = ref} <-
-           cold_blob_ref_from_location(ctx, path, offset, key, persisted_value_size),
-         {:ok, payload} <- BlobStore.get(ctx.data_dir, idx, ref) do
-      Stats.record_cold_read(ctx, key)
-      {:ok, range_from_value(payload, start_idx, end_idx)}
+           cold_blob_ref_from_location(ctx, path, offset, key, persisted_value_size) do
+      case normalize_byte_range(ref.size, start_idx, end_idx) do
+        :empty ->
+          {:ok, ""}
+
+        {relative_offset, count} ->
+          with {:ok, value} <- BlobStore.get_range(ctx.data_dir, idx, ref, relative_offset, count) do
+            Stats.record_cold_read(ctx, key)
+            {:ok, value}
+          end
+      end
     else
       :not_blob -> :not_blob
       {:error, reason} -> {:error, reason}

@@ -121,6 +121,24 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:error, :segment_header_mismatch} = BlobStore.file_ref(root, 0, wrong_ref)
   end
 
+  test "get_range reads only the requested segment blob slice", %{root: root} do
+    payload = :binary.copy("a", 2048) <> "target-slice" <> :binary.copy("z", 2048)
+
+    assert {:ok, ref} = BlobStore.put(root, 0, payload)
+    assert {:ok, "target"} = BlobStore.get_range(root, 0, ref, 2048, 6)
+  end
+
+  test "get_range rejects a segment ref whose header does not match", %{root: root} do
+    payload_a = :binary.copy("a", 512)
+    payload_b = :binary.copy("b", 512)
+
+    assert {:ok, [ref_a, ref_b]} = BlobStore.put_many(root, 0, [payload_a, payload_b])
+
+    wrong_ref = %{ref_a | offset: ref_b.offset}
+
+    assert {:error, :segment_header_mismatch} = BlobStore.get_range(root, 0, wrong_ref, 0, 1)
+  end
+
   test "same-shard blob appends serialize while preserving offsets", %{root: root} do
     parent = self()
 

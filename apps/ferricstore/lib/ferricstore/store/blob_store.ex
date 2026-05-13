@@ -210,6 +210,76 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   @doc """
+  Reads a byte range from a blob ref without materializing the full payload.
+
+  Segment refs still validate their record header and full declared extent
+  before the range pread. This keeps range reads aligned with the sendfile path:
+  cheap pointer validation, no full-payload hash on every read.
+  """
+  @spec get_range(binary(), non_neg_integer(), BlobRef.t(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, binary()} | {:error, reason()}
+  def get_range(_data_dir, _shard_index, %BlobRef{}, _relative_offset, 0), do: {:ok, ""}
+
+  def get_range(
+        data_dir,
+        shard_index,
+        %BlobRef{version: 1, size: size} = ref,
+        relative_offset,
+        count
+      )
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_integer(relative_offset) and relative_offset >= 0 and is_integer(count) and
+             count >= 0 do
+    path = BlobRef.path(data_dir, shard_index, ref)
+
+    result =
+      with :ok <- validate_blob_range(size, relative_offset, count),
+           :ok <- stat_regular_min_size(path, relative_offset + count),
+           {:ok, payload} <- read_file_range(path, relative_offset, count) do
+        {:ok, payload}
+      end
+
+    case result do
+      {:ok, _payload} = ok ->
+        ok
+
+      {:error, reason} = error ->
+        emit_error(:get_range, shard_index, path, ref, reason)
+        error
+    end
+  end
+
+  def get_range(
+        data_dir,
+        shard_index,
+        %BlobRef{version: 2, size: size, offset: offset} = ref,
+        relative_offset,
+        count
+      )
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_integer(relative_offset) and relative_offset >= 0 and is_integer(count) and
+             count >= 0 do
+    path = BlobRef.path(data_dir, shard_index, ref)
+
+    result =
+      with :ok <- validate_blob_range(size, relative_offset, count),
+           :ok <- stat_regular_min_size(path, offset + size),
+           {:ok, payload} <-
+             read_segment_payload_range(path, offset, size, ref, relative_offset, count) do
+        {:ok, payload}
+      end
+
+    case result do
+      {:ok, _payload} = ok ->
+        ok
+
+      {:error, reason} = error ->
+        emit_error(:get_range, shard_index, path, ref, reason)
+        error
+    end
+  end
+
+  @doc """
   Recovers append-segment files by truncating the first partial or corrupt tail.
 
   This is called lazily before the first append in a VM and is also public for
@@ -939,6 +1009,37 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
+  defp read_segment_payload_range(path, offset, size, %BlobRef{} = ref, relative_offset, count) do
+    case File.open(path, [:read, :raw, :binary]) do
+      {:ok, io} ->
+        try do
+          with :ok <- validate_open_segment_record(io, offset, size, ref),
+               {:ok, payload} <- pread_exact_open(io, offset + relative_offset, count) do
+            {:ok, payload}
+          end
+        after
+          :file.close(io)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp read_file_range(path, offset, count) do
+    case File.open(path, [:read, :raw, :binary]) do
+      {:ok, io} ->
+        try do
+          pread_exact_open(io, offset, count)
+        after
+          :file.close(io)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp verify_segment_record(path, offset, size, %BlobRef{} = ref) do
     case File.open(path, [:read, :raw, :binary]) do
       {:ok, io} ->
@@ -1122,6 +1223,14 @@ defmodule Ferricstore.Store.BlobStore do
       {:ok, size - valid_size}
     end
   end
+
+  defp validate_blob_range(size, relative_offset, count)
+       when is_integer(size) and size >= 0 and is_integer(relative_offset) and
+              relative_offset >= 0 and is_integer(count) and count >= 0 and
+              relative_offset + count <= size,
+       do: :ok
+
+  defp validate_blob_range(_size, _relative_offset, _count), do: {:error, :invalid_blob_range}
 
   defp verify_size(%BlobRef{size: size}, payload) do
     if byte_size(payload) == size do
