@@ -49,11 +49,16 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
     name = :"async_io_test_#{:erlang.unique_integer([:positive])}"
 
-    ctx =
-      FerricStore.Instance.build(name,
+    build_opts =
+      [
         data_dir: dir,
         shard_count: 1
-      )
+      ]
+      |> maybe_put_opt(:blob_side_channel_threshold_bytes, opts)
+      |> maybe_put_opt(:hot_cache_max_value_size, opts)
+
+    ctx =
+      FerricStore.Instance.build(name, build_opts)
 
     Ferricstore.DataDir.ensure_layout!(dir, 1)
 
@@ -66,6 +71,13 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       )
 
     {pid, 0, dir, ctx}
+  end
+
+  defp maybe_put_opt(build_opts, key, opts) do
+    case Keyword.fetch(opts, key) do
+      {:ok, value} -> Keyword.put(build_opts, key, value)
+      :error -> build_opts
+    end
   end
 
   defp restart_shard(dir, ctx, flush_ms) do
@@ -499,7 +511,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       try do
         :ets.insert(keydir, {key, "new", 456, LFU.initial(), :pending, 0, 0})
 
-        ShardFlush.update_ets_locations(state, [{key, "old", 123}], [{42, 3}])
+        ShardFlush.update_ets_locations(state, [{key, "old", 123, "old"}], [{42, 3}])
 
         assert [{^key, "new", 456, _lfu, :pending, 0, 0}] = :ets.lookup(keydir, key)
       after
@@ -526,12 +538,72 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       try do
         :ets.insert(keydir, {key, "42", 0, LFU.initial(), :pending, 0, 0})
 
-        ShardFlush.update_ets_locations(state, [{key, 42, 0}], [{42, 2}])
+        ShardFlush.update_ets_locations(state, [{key, 42, 0, "42"}], [{42, 2}])
 
         assert [{^key, "42", 0, _lfu, 7, 42, 2}] = :ets.lookup(keydir, key)
       after
         :ets.delete(keydir)
       end
+    end
+
+    test "shard flush externalizes large pending values with one blob segment fsync" do
+      {pid, _index, dir, ctx} =
+        start_shard(
+          flush_interval_ms: 5000,
+          blob_side_channel_threshold_bytes: 128,
+          hot_cache_max_value_size: 64
+        )
+
+      parent = self()
+
+      Process.put(:ferricstore_blob_store_fsync_file_hook, fn path ->
+        send(parent, {:blob_fsync_file, path})
+        NIF.v2_fsync(path)
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_blob_store_fsync_file_hook)
+        cleanup_shard(pid, ctx, dir)
+      end)
+
+      key_a = "flush_blob_batch:a"
+      key_b = "flush_blob_batch:b"
+      payload_a = :binary.copy("A", 1024)
+      payload_b = :binary.copy("B", 1024)
+
+      state = :sys.get_state(pid)
+
+      :ets.insert(state.keydir, {
+        key_a,
+        nil,
+        0,
+        LFU.initial(),
+        :pending,
+        :pending,
+        0
+      })
+
+      :ets.insert(state.keydir, {
+        key_b,
+        nil,
+        0,
+        LFU.initial(),
+        :pending,
+        :pending,
+        0
+      })
+
+      flushed =
+        %{state | pending: [{key_b, payload_b, 0}, {key_a, payload_a, 0}], pending_count: 2}
+        |> ShardFlush.flush_pending()
+
+      assert flushed.pending == []
+      assert payload_a == GenServer.call(pid, {:get, key_a})
+      assert payload_b == GenServer.call(pid, {:get, key_b})
+
+      assert_receive {:blob_fsync_file, first_path}, 1000
+      refute_receive {:blob_fsync_file, _second_path}, 100
+      assert String.ends_with?(first_path, ".bloblog")
     end
 
     test "put is readable immediately via ETS (before fsync)" do

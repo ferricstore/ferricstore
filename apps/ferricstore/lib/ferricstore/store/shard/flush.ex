@@ -190,39 +190,59 @@ defmodule Ferricstore.Store.Shard.Flush do
     threshold = blob_threshold(state)
     hot_cache_threshold = ShardETS.hot_cache_threshold(state)
 
-    Enum.reduce_while(raw_batch, {:ok, []}, fn {key, value, exp}, {:ok, acc} ->
-      disk_value = ShardETS.to_disk_binary(value)
-      staged_value = ShardETS.value_for_ets(disk_value, hot_cache_threshold)
+    {prepared_reversed, disk_values_reversed} =
+      Enum.reduce(raw_batch, {[], []}, fn {key, value, exp}, {prepared_acc, disk_acc} ->
+        disk_value = ShardETS.to_disk_binary(value)
+        staged_value = ShardETS.value_for_ets(disk_value, hot_cache_threshold)
 
-      case maybe_externalize_flush_value(state, threshold, disk_value) do
-        {:ok, persisted_value} ->
-          {:cont, {:ok, [{key, persisted_value, exp, staged_value} | acc]}}
+        {
+          [{key, disk_value, exp, staged_value} | prepared_acc],
+          [disk_value | disk_acc]
+        }
+      end)
 
-        {:error, reason} ->
-          {:halt, {:error, {:blob_externalize_failed, reason}}}
-      end
-    end)
-    |> case do
-      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
-      {:error, _reason} = error -> error
+    with {:ok, persisted_values} <-
+           externalize_flush_values(state, threshold, Enum.reverse(disk_values_reversed)),
+         {:ok, batch} <-
+           attach_persisted_flush_values(Enum.reverse(prepared_reversed), persisted_values) do
+      {:ok, batch}
+    else
+      {:error, reason} -> {:error, {:blob_externalize_failed, reason}}
     end
   end
+
+  defp attach_persisted_flush_values(prepared, persisted_values),
+    do: attach_persisted_flush_values(prepared, persisted_values, [])
+
+  defp attach_persisted_flush_values(
+         [{key, _disk_value, exp, staged_value} | prepared],
+         [persisted_value | persisted_values],
+         acc
+       ) do
+    attach_persisted_flush_values(prepared, persisted_values, [
+      {key, persisted_value, exp, staged_value} | acc
+    ])
+  end
+
+  defp attach_persisted_flush_values([], [], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp attach_persisted_flush_values(_prepared, _persisted_values, _acc),
+    do: {:error, :blob_externalize_result_mismatch}
 
   defp blob_threshold(%{instance_ctx: ctx}), do: BlobValue.threshold(ctx)
   defp blob_threshold(_state), do: 0
 
-  defp maybe_externalize_flush_value(_state, threshold, disk_value)
-       when threshold <= 0 and is_binary(disk_value),
-       do: {:ok, disk_value}
+  defp externalize_flush_values(_state, threshold, disk_values) when threshold <= 0,
+    do: BlobValue.maybe_externalize_many(nil, 0, 0, disk_values)
 
-  defp maybe_externalize_flush_value(
+  defp externalize_flush_values(
          %{data_dir: data_dir, index: shard_index},
          threshold,
-         disk_value
+         disk_values
        ),
-       do: BlobValue.maybe_externalize(data_dir, shard_index, threshold, disk_value)
+       do: BlobValue.maybe_externalize_many(data_dir, shard_index, threshold, disk_values)
 
-  defp maybe_externalize_flush_value(_state, _threshold, _disk_value),
+  defp externalize_flush_values(_state, _threshold, _disk_values),
     do: {:error, :missing_blob_data_dir}
 
   defp append_batch(batch) do
