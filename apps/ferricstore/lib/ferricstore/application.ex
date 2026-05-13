@@ -218,7 +218,8 @@ defmodule Ferricstore.Application do
           Ferricstore.NamespaceConfig,
           Ferricstore.HLC,
           Ferricstore.QuorumMetrics,
-          Ferricstore.PrefixMetricsCache
+          Ferricstore.PrefixMetricsCache,
+          Ferricstore.Store.BlobStore.TableOwner
         ] ++
         batcher_children ++
         bitcask_writer_children ++

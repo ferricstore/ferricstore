@@ -10,6 +10,7 @@ defmodule Ferricstore.Store.BlobStore do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.BlobRef
+  alias Ferricstore.Store.BlobStore.TableOwner
 
   @hash_chunk_bytes 1_048_576
   @tmp_stale_after_seconds 300
@@ -26,6 +27,12 @@ defmodule Ferricstore.Store.BlobStore do
   @lock_retry_ms 1
 
   @type reason :: term()
+
+  @doc false
+  @spec init_tables() :: :ok
+  def init_tables do
+    TableOwner.ensure_tables()
+  end
 
   @doc """
   Stores `payload` in the shard append segment and returns the small ref.
@@ -176,13 +183,24 @@ defmodule Ferricstore.Store.BlobStore do
   repeated disk reads when a batch intentionally fans out one payload to many
   keys.
   """
+  @spec verify_many(binary(), non_neg_integer(), [BlobRef.t()]) :: :ok | {:error, reason()}
   @spec verify_many(
           binary(),
           non_neg_integer(),
           [BlobRef.t()],
           (binary(), non_neg_integer(), BlobRef.t() -> :ok | {:error, reason()})
         ) :: :ok | {:error, reason()}
-  def verify_many(data_dir, shard_index, refs, verifier \\ &verify/3)
+  def verify_many(data_dir, shard_index, refs)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_list(refs) do
+    case Process.get(:ferricstore_blob_store_verify_hook) do
+      fun when is_function(fun, 3) ->
+        verify_many(data_dir, shard_index, refs, &verify/3)
+
+      _other ->
+        do_verify_many(data_dir, shard_index, refs)
+    end
+  end
 
   def verify_many(data_dir, shard_index, refs, verifier)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
@@ -207,6 +225,104 @@ defmodule Ferricstore.Store.BlobStore do
       {:ok, _seen} -> :ok
       {:error, _reason} = error -> error
     end
+  end
+
+  defp do_verify_many(data_dir, shard_index, refs) do
+    with {:ok, unique_refs} <- unique_blob_refs(refs),
+         :ok <- verify_legacy_refs(data_dir, shard_index, unique_refs) do
+      verify_segment_refs(data_dir, shard_index, unique_refs)
+    end
+  end
+
+  defp unique_blob_refs(refs) do
+    refs
+    |> Enum.reduce_while({:ok, [], MapSet.new()}, fn
+      %BlobRef{} = ref, {:ok, acc, seen} ->
+        if MapSet.member?(seen, ref) do
+          {:cont, {:ok, acc, seen}}
+        else
+          {:cont, {:ok, [ref | acc], MapSet.put(seen, ref)}}
+        end
+
+      _invalid, {:ok, _acc, _seen} ->
+        {:halt, {:error, :invalid_blob_ref}}
+    end)
+    |> case do
+      {:ok, acc, _seen} -> {:ok, Enum.reverse(acc)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp verify_legacy_refs(data_dir, shard_index, refs) do
+    Enum.reduce_while(refs, :ok, fn
+      %BlobRef{version: 1} = ref, :ok ->
+        case do_verify(data_dir, shard_index, ref) do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+
+      %BlobRef{version: 2}, :ok ->
+        {:cont, :ok}
+
+      %BlobRef{}, :ok ->
+        {:halt, {:error, :invalid_blob_ref}}
+    end)
+  end
+
+  defp verify_segment_refs(data_dir, shard_index, refs) do
+    refs
+    |> Enum.filter(&match?(%BlobRef{version: 2}, &1))
+    |> Enum.group_by(&BlobRef.path(data_dir, shard_index, &1))
+    |> Enum.reduce_while(:ok, fn {path, path_refs}, :ok ->
+      case verify_segment_refs_at_path(path, shard_index, path_refs) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp verify_segment_refs_at_path(path, shard_index, [first_ref | _] = refs) do
+    max_extent =
+      Enum.reduce(refs, 0, fn %BlobRef{offset: offset, size: size}, acc ->
+        max(acc, offset + size)
+      end)
+
+    with :ok <- stat_regular_min_size(path, max_extent),
+         {:ok, io} <- open_read_file(path) do
+      try do
+        verify_open_segment_refs(io, path, shard_index, refs)
+      after
+        :file.close(io)
+      end
+    else
+      {:error, reason} = error ->
+        emit_error(:verify, shard_index, path, first_ref, reason)
+        error
+    end
+  end
+
+  defp verify_open_segment_refs(io, path, shard_index, refs) do
+    Enum.reduce_while(refs, :ok, fn %BlobRef{offset: offset, size: size} = ref, :ok ->
+      result =
+        with :ok <- validate_open_segment_record(io, offset, size, ref),
+             :ok <- open_file_range_matches_ref?(io, offset, size, ref) do
+          :ok
+        end
+
+      case result do
+        :ok ->
+          {:cont, :ok}
+
+        :mismatch ->
+          error = {:error, :checksum_mismatch}
+          emit_error(:verify, shard_index, path, ref, :checksum_mismatch)
+          {:halt, error}
+
+        {:error, reason} = error ->
+          emit_error(:verify, shard_index, path, ref, reason)
+          {:halt, error}
+      end
+    end)
   end
 
   @doc """
@@ -837,17 +953,7 @@ defmodule Ferricstore.Store.BlobStore do
   defp ensure_recovery_table do
     case :ets.whereis(@recovery_table) do
       :undefined ->
-        try do
-          :ets.new(@recovery_table, [
-            :named_table,
-            :public,
-            :set,
-            {:read_concurrency, true},
-            {:write_concurrency, true}
-          ])
-        rescue
-          ArgumentError -> @recovery_table
-        end
+        TableOwner.ensure_tables()
 
       tid ->
         tid
@@ -887,17 +993,7 @@ defmodule Ferricstore.Store.BlobStore do
   defp ensure_dir_table do
     case :ets.whereis(@dir_table) do
       :undefined ->
-        try do
-          :ets.new(@dir_table, [
-            :named_table,
-            :public,
-            :set,
-            {:read_concurrency, true},
-            {:write_concurrency, :auto}
-          ])
-        rescue
-          ArgumentError -> @dir_table
-        end
+        TableOwner.ensure_tables()
 
       tid ->
         tid
@@ -919,17 +1015,7 @@ defmodule Ferricstore.Store.BlobStore do
   defp ensure_segment_table do
     case :ets.whereis(@segment_table) do
       :undefined ->
-        try do
-          :ets.new(@segment_table, [
-            :named_table,
-            :public,
-            :set,
-            {:read_concurrency, true},
-            {:write_concurrency, true}
-          ])
-        rescue
-          ArgumentError -> @segment_table
-        end
+        TableOwner.ensure_tables()
 
       tid ->
         tid
@@ -1028,17 +1114,7 @@ defmodule Ferricstore.Store.BlobStore do
   defp ensure_lock_table do
     case :ets.whereis(@lock_table) do
       :undefined ->
-        try do
-          :ets.new(@lock_table, [
-            :named_table,
-            :public,
-            :set,
-            {:read_concurrency, true},
-            {:write_concurrency, :auto}
-          ])
-        rescue
-          ArgumentError -> @lock_table
-        end
+        TableOwner.ensure_tables()
 
       tid ->
         tid
@@ -1077,6 +1153,15 @@ defmodule Ferricstore.Store.BlobStore do
       {:ok, _short} -> {:error, :size_mismatch}
       :eof -> {:error, :enoent}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp open_read_file(path) do
+    modes = [:read, :raw, :binary]
+
+    case Process.get(:ferricstore_blob_store_open_read_hook) do
+      fun when is_function(fun, 2) -> fun.(path, modes)
+      _other -> File.open(path, modes)
     end
   end
 

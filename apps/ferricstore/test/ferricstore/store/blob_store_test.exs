@@ -109,6 +109,27 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:ok, ^payload} = BlobStore.get(root, 0, second_ref)
   end
 
+  test "blob ETS caches survive short-lived writer processes", %{root: root} do
+    parent = self()
+    ref = make_ref()
+
+    pid =
+      spawn(fn ->
+        assert {:ok, _blob_ref} = BlobStore.put(root, 0, :binary.copy("x", 512))
+        send(parent, {ref, :writer_done})
+      end)
+
+    monitor = Process.monitor(pid)
+    assert_receive {^ref, :writer_done}
+    assert_receive {:DOWN, ^monitor, :process, ^pid, _reason}
+
+    refute :ets.whereis(:ferricstore_blob_store_dirs) == :undefined
+    refute :ets.whereis(:ferricstore_blob_store_segments) == :undefined
+    refute :ets.whereis(:ferricstore_blob_store_locks) == :undefined
+
+    assert {:ok, _blob_ref} = BlobStore.put(root, 0, :binary.copy("y", 512))
+  end
+
   test "verify_many validates duplicate refs once", %{root: root} do
     payload = :binary.copy("same-ref", 512)
     assert {:ok, ref} = BlobStore.put(root, 0, payload)
@@ -122,6 +143,38 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert :ok = BlobStore.verify_many(root, 0, [ref, ref], verifier)
     assert_received {:verified, ^ref}
     refute_received {:verified, _}
+  end
+
+  test "verify_many opens each append segment once for unique refs", %{root: root} do
+    payloads = [
+      :binary.copy("a", 512),
+      :binary.copy("b", 768),
+      :binary.copy("c", 1024)
+    ]
+
+    assert {:ok, refs} = BlobStore.put_many(root, 0, payloads)
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, hd(refs))
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_open_read_hook, fn path, modes ->
+      send(parent, {:blob_open_read, path})
+      File.open(path, modes)
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_open_read_hook) end)
+
+    assert :ok = BlobStore.verify_many(root, 0, refs)
+    assert_received {:blob_open_read, ^segment_path}
+    refute_received {:blob_open_read, _}
+  end
+
+  test "verify_many rejects corrupt refs inside grouped segment verification", %{root: root} do
+    assert {:ok, [good_ref, bad_ref]} =
+             BlobStore.put_many(root, 0, [:binary.copy("g", 128), :binary.copy("b", 128)])
+
+    overwrite_segment_payload!(root, 0, bad_ref, :binary.copy("x", 128))
+
+    assert {:error, :checksum_mismatch} = BlobStore.verify_many(root, 0, [good_ref, bad_ref])
   end
 
   test "put_many rejects invalid payload without opening the segment", %{root: root} do
