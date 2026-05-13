@@ -27,7 +27,7 @@ defmodule Ferricstore.Cluster.DataSyncTest do
     assert File.read!(Path.join([target, "flow_lmdb", "lock.mdb"])) == "lmdb-lock"
   end
 
-  test "shard storage copy includes promoted dedicated data" do
+  test "shard storage copy includes promoted dedicated data and blob side-channel data" do
     root =
       Path.join(System.tmp_dir!(), "ferricstore_data_sync_#{System.unique_integer([:positive])}")
 
@@ -35,13 +35,16 @@ defmodule Ferricstore.Cluster.DataSyncTest do
     target = Path.join(root, "target")
     source_data = Ferricstore.DataDir.shard_data_path(source, 0)
     source_dedicated = Path.join([source, "dedicated", "shard_0", "hash:abc"])
+    source_blob = Path.join([source, "blob", "shard_0", "aa"])
 
     on_exit(fn -> File.rm_rf!(root) end)
 
     File.mkdir_p!(source_data)
     File.mkdir_p!(source_dedicated)
+    File.mkdir_p!(source_blob)
     File.write!(Path.join(source_data, "00000.log"), "shared")
     File.write!(Path.join(source_dedicated, "00000.log"), "promoted")
+    File.write!(Path.join(source_blob, "payload.blob"), "large-payload")
 
     assert :ok = DataSync.copy_shard_storage_from(node(), source, node(), target, 0)
 
@@ -49,9 +52,12 @@ defmodule Ferricstore.Cluster.DataSyncTest do
 
     assert File.read!(Path.join([target, "dedicated", "shard_0", "hash:abc", "00000.log"])) ==
              "promoted"
+
+    assert File.read!(Path.join([target, "blob", "shard_0", "aa", "payload.blob"])) ==
+             "large-payload"
   end
 
-  test "partial cleanup removes target shard data and dedicated data from target data dir" do
+  test "partial cleanup removes target shard data, dedicated data, and blob data" do
     root =
       Path.join(System.tmp_dir!(), "ferricstore_data_sync_#{System.unique_integer([:positive])}")
 
@@ -63,8 +69,10 @@ defmodule Ferricstore.Cluster.DataSyncTest do
     File.mkdir_p!(Ferricstore.DataDir.shard_data_path(source, 0))
     File.mkdir_p!(Path.join([target, "data", "shard_0"]))
     File.mkdir_p!(Path.join([target, "dedicated", "shard_0", "hash:abc"]))
+    File.mkdir_p!(Path.join([target, "blob", "shard_0", "aa"]))
     File.write!(Path.join([target, "data", "shard_0", "00000.log"]), "partial")
     File.write!(Path.join([target, "dedicated", "shard_0", "hash:abc", "00000.log"]), "partial")
+    File.write!(Path.join([target, "blob", "shard_0", "aa", "payload.blob"]), "partial")
 
     ctx = %FerricStore.Instance{data_dir: source}
 
@@ -72,6 +80,7 @@ defmodule Ferricstore.Cluster.DataSyncTest do
 
     refute File.exists?(Path.join([target, "data", "shard_0"]))
     refute File.exists?(Path.join([target, "dedicated", "shard_0"]))
+    refute File.exists?(Path.join([target, "blob", "shard_0"]))
     assert File.exists?(source)
   end
 end

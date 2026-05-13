@@ -8,6 +8,7 @@ defmodule Ferricstore.DataDir do
   data_dir/
     data/shard_0/ ... shard_N/      (shared Bitcask per shard)
     dedicated/shard_0/ ... shard_N/ (for future promoted collections)
+    blob/shard_0/ ... shard_N/      (large-value side-channel blobs)
     prob/shard_0/ ... shard_N/      (probabilistic structure files)
     raft/shard_0/ ... shard_N/      (Raft WAL - managed by ra)
     registry/                        (merge scheduler state)
@@ -25,13 +26,13 @@ defmodule Ferricstore.DataDir do
 
   require Logger
 
-  @top_level_dirs ~w(data dedicated prob raft registry hints)
-  @sharded_dirs ~w(data dedicated prob raft)
+  @top_level_dirs ~w(data dedicated blob prob raft registry hints)
+  @sharded_dirs ~w(data dedicated blob prob raft)
 
   @doc """
   Creates the full directory layout under `data_dir`.
 
-  For each of `data/`, `dedicated/`, `prob/`, and `raft/`,
+  For each of `data/`, `dedicated/`, `blob/`, `prob/`, and `raft/`,
   per-shard subdirectories `shard_0` through `shard_{N-1}` are created.
   `registry/` and `hints/` are top-level directories without per-shard
   subdirectories.
@@ -140,6 +141,18 @@ defmodule Ferricstore.DataDir do
   @spec shard_data_path(binary(), non_neg_integer()) :: binary()
   def shard_data_path(data_dir, shard_index) do
     Path.join([data_dir, "data", "shard_#{shard_index}"])
+  end
+
+  @doc """
+  Returns the canonical large-value blob path for a given shard index.
+
+  This is intentionally outside the shared Bitcask shard directory. Large blob
+  side-channel files must be copied and cleaned as shard-owned storage during
+  cluster setup/join, but should not be scanned as normal Bitcask records.
+  """
+  @spec blob_shard_path(binary(), non_neg_integer()) :: binary()
+  def blob_shard_path(data_dir, shard_index) do
+    Path.join([data_dir, "blob", "shard_#{shard_index}"])
   end
 
   @doc """

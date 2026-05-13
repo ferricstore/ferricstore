@@ -30,6 +30,21 @@ defmodule Ferricstore.DataDirTest do
     end
   end
 
+  test "blob_shard_path returns canonical blob shard path and layout creates it" do
+    root =
+      Path.join(System.tmp_dir!(), "data_dir_blob_#{System.unique_integer([:positive])}")
+
+    try do
+      assert DataDir.blob_shard_path(root, 1) == Path.join([root, "blob", "shard_1"])
+
+      assert :ok = DataDir.ensure_layout!(root, 2)
+      assert File.dir?(Path.join([root, "blob", "shard_0"]))
+      assert File.dir?(Path.join([root, "blob", "shard_1"]))
+    after
+      File.rm_rf!(root)
+    end
+  end
+
   test "ensure_layout reports directory fsync failures for newly created layout" do
     root =
       Path.join(System.tmp_dir!(), "data_dir_fsync_fail_#{System.unique_integer([:positive])}")

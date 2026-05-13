@@ -433,7 +433,8 @@ defmodule Ferricstore.Cluster.DataSync do
   def cleanup_partial_sync(shard_index, target_node, _ctx, target_data_dir) do
     shard_paths = [
       Ferricstore.DataDir.shard_data_path(target_data_dir, shard_index),
-      dedicated_shard_path(target_data_dir, shard_index)
+      dedicated_shard_path(target_data_dir, shard_index),
+      blob_shard_path(target_data_dir, shard_index)
     ]
 
     Enum.each(shard_paths, fn path ->
@@ -470,11 +471,24 @@ defmodule Ferricstore.Cluster.DataSync do
       :ok
     end
 
+    source_blob = blob_shard_path(source_data_dir, shard_index)
+    target_blob = blob_shard_path(target_data_dir, shard_index)
+
+    if remote_dir?(source_node, source_blob) do
+      copy_directory_from(source_node, source_blob, target_node, target_blob)
+    else
+      :ok
+    end
+
     :ok
   end
 
   defp dedicated_shard_path(data_dir, shard_index) do
     Path.join([data_dir, "dedicated", "shard_#{shard_index}"])
+  end
+
+  defp blob_shard_path(data_dir, shard_index) do
+    Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
   end
 
   defp remote_dir?(node, path) do

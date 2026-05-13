@@ -135,6 +135,46 @@ defmodule Ferricstore.Cluster.ManagerTest do
                })
     end
 
+    test "target data probe treats blob side-channel files as existing shard data" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "cluster_manager_blob_probe_#{System.unique_integer([:positive])}"
+        )
+
+      blob_dir = Ferricstore.DataDir.blob_shard_path(root, 0)
+
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      File.mkdir_p!(blob_dir)
+      File.write!(Path.join(blob_dir, "payload.blob"), "large-payload")
+
+      assert {:ok, true} = Manager.__target_shard_has_data_for_test__(node(), root, 0)
+    end
+
+    test "target cleanup removes blob side-channel data" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "cluster_manager_blob_cleanup_#{System.unique_integer([:positive])}"
+        )
+
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      File.mkdir_p!(Ferricstore.DataDir.shard_data_path(root, 0))
+      File.mkdir_p!(Path.join([root, "dedicated", "shard_0", "hash:abc"]))
+      File.mkdir_p!(Path.join([root, "blob", "shard_0", "aa"]))
+      File.write!(Path.join([root, "data", "shard_0", "00000.log"]), "data")
+      File.write!(Path.join([root, "dedicated", "shard_0", "hash:abc", "00000.log"]), "dedicated")
+      File.write!(Path.join([root, "blob", "shard_0", "aa", "payload.blob"]), "blob")
+
+      assert :ok = Manager.__cleanup_target_data_dir_for_test__(node(), root, 1)
+
+      refute File.exists?(Path.join([root, "data", "shard_0"]))
+      refute File.exists?(Path.join(root, "dedicated"))
+      refute File.exists?(Path.join(root, "blob"))
+    end
+
     test "unknown target data state aborts join before identity bypass or sync" do
       target = :"unknown_target_data@127.0.0.1"
       parent = self()

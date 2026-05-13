@@ -1190,24 +1190,51 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   defp probe_target_shard_data(target_node, data_dir, shard_idx) do
-    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_idx)
+    case probe_target_shard_data_result(target_node, data_dir, shard_idx) do
+      {:ok, true} -> {:halt, {:ok, true}}
+      {:ok, false} -> {:cont, {:ok, false}}
+      {:error, _reason} = error -> {:halt, error}
+    end
+  end
 
+  defp probe_target_shard_data_result(target_node, data_dir, shard_idx) do
+    data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_idx)
+    dedicated_path = Path.join([data_dir, "dedicated", "shard_#{shard_idx}"])
+    blob_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_idx)
+
+    [
+      {:bitcask_logs, data_path},
+      {:file_tree, dedicated_path},
+      {:file_tree, blob_path}
+    ]
+    |> Enum.reduce_while({:ok, false}, fn
+      {:bitcask_logs, path}, {:ok, false} ->
+        probe_target_bitcask_logs(target_node, path)
+        |> reduce_target_data_probe()
+
+      {:file_tree, path}, {:ok, false} ->
+        probe_target_file_tree(target_node, path)
+        |> reduce_target_data_probe()
+    end)
+  end
+
+  defp reduce_target_data_probe({:ok, true}), do: {:halt, {:ok, true}}
+  defp reduce_target_data_probe({:ok, false}), do: {:cont, {:ok, false}}
+  defp reduce_target_data_probe({:error, _reason} = error), do: {:halt, error}
+
+  defp probe_target_bitcask_logs(target_node, shard_path) do
     case :erpc.call(target_node, File, :ls, [shard_path], 5_000) do
       {:ok, files} ->
-        case probe_target_log_files(target_node, shard_path, files) do
-          {:ok, true} -> {:halt, {:ok, true}}
-          {:ok, false} -> {:cont, {:ok, false}}
-          {:error, _reason} = error -> {:halt, error}
-        end
+        probe_target_log_files(target_node, shard_path, files)
 
       {:error, :enoent} ->
-        {:cont, {:ok, false}}
+        {:ok, false}
 
       {:error, reason} ->
-        {:halt, {:error, {:target_data_probe_failed, target_node, {:ls, shard_path, reason}}}}
+        {:error, {:target_data_probe_failed, target_node, {:ls, shard_path, reason}}}
 
       other ->
-        {:halt, {:error, {:target_data_probe_failed, target_node, {:ls, shard_path, other}}}}
+        {:error, {:target_data_probe_failed, target_node, {:ls, shard_path, other}}}
     end
   end
 
@@ -1231,6 +1258,49 @@ defmodule Ferricstore.Cluster.Manager do
         end
       else
         {:cont, {:ok, false}}
+      end
+    end)
+  end
+
+  defp probe_target_file_tree(target_node, path) do
+    case :erpc.call(target_node, File, :ls, [path], 5_000) do
+      {:ok, files} ->
+        probe_target_file_tree_entries(target_node, path, files)
+
+      {:error, :enoent} ->
+        {:ok, false}
+
+      {:error, reason} ->
+        {:error, {:target_data_probe_failed, target_node, {:ls, path, reason}}}
+
+      other ->
+        {:error, {:target_data_probe_failed, target_node, {:ls, path, other}}}
+    end
+  end
+
+  defp probe_target_file_tree_entries(target_node, path, files) do
+    Enum.reduce_while(files, {:ok, false}, fn file, {:ok, false} ->
+      entry_path = Path.join(path, file)
+
+      case :erpc.call(target_node, File, :stat, [entry_path], 5_000) do
+        {:ok, %{type: :directory}} ->
+          case probe_target_file_tree(target_node, entry_path) do
+            {:ok, true} -> {:halt, {:ok, true}}
+            {:ok, false} -> {:cont, {:ok, false}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+
+        {:ok, %{type: :regular, size: size}} when size > 0 ->
+          {:halt, {:ok, true}}
+
+        {:ok, _stat} ->
+          {:cont, {:ok, false}}
+
+        {:error, reason} ->
+          {:halt, {:error, {:target_data_probe_failed, target_node, {:stat, entry_path, reason}}}}
+
+        other ->
+          {:halt, {:error, {:target_data_probe_failed, target_node, {:stat, entry_path, other}}}}
       end
     end)
   end
@@ -1298,21 +1368,7 @@ defmodule Ferricstore.Cluster.Manager do
   defp do_cleanup_target_data(target_node, shard_count) do
     try do
       target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default], 5_000)
-
-      Enum.each(0..(shard_count - 1), fn i ->
-        shard_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, i)
-        :erpc.call(target_node, File, :rm_rf!, [shard_path], 30_000)
-      end)
-
-      :erpc.call(
-        target_node,
-        File,
-        :rm_rf!,
-        [Path.join(target_ctx.data_dir, "dedicated")],
-        30_000
-      )
-
-      :ok
+      cleanup_target_data_dir(target_node, target_ctx.data_dir, shard_count)
     catch
       kind, reason ->
         Logger.warning(
@@ -1321,6 +1377,22 @@ defmodule Ferricstore.Cluster.Manager do
 
         {:error, {:target_cleanup_failed, target_node, {kind, reason}}}
     end
+  end
+
+  defp cleanup_target_data_dir(target_node, data_dir, shard_count) do
+    Enum.each(0..(shard_count - 1), fn i ->
+      shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
+      :erpc.call(target_node, File, :rm_rf!, [shard_path], 30_000)
+    end)
+
+    # REPLACE join must remove every shard-owned side store. Leaving an old
+    # blob tree behind could make future large-value refs resolve to unrelated
+    # target data after the new cluster baseline is copied.
+    Enum.each(["dedicated", "blob"], fn dir ->
+      :erpc.call(target_node, File, :rm_rf!, [Path.join(data_dir, dir)], 30_000)
+    end)
+
+    :ok
   end
 
   defp direct_sync(target_node, ctx) do
@@ -1345,6 +1417,16 @@ defmodule Ferricstore.Cluster.Manager do
   @doc false
   def __extract_direct_sync_indices_for_test__(target_node, sync_results) do
     extract_direct_sync_indices(target_node, sync_results)
+  end
+
+  @doc false
+  def __target_shard_has_data_for_test__(target_node, data_dir, shard_idx) do
+    probe_target_shard_data_result(target_node, data_dir, shard_idx)
+  end
+
+  @doc false
+  def __cleanup_target_data_dir_for_test__(target_node, data_dir, shard_count) do
+    cleanup_target_data_dir(target_node, data_dir, shard_count)
   end
 
   defp extract_direct_sync_indices(target_node, sync_results) when is_map(sync_results) do
