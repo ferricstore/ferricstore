@@ -42,8 +42,11 @@ defmodule Ferricstore.Store.BlobStore do
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
              is_list(payloads) do
     if Enum.all?(payloads, &is_binary/1) do
-      lock_key = {{__MODULE__, data_dir, shard_index}, __MODULE__}
-      :global.trans(lock_key, fn -> do_put_many(data_dir, shard_index, payloads) end, [node()])
+      :global.trans(
+        blob_lock_key(data_dir, shard_index),
+        fn -> do_put_many(data_dir, shard_index, payloads) end,
+        [node()]
+      )
     else
       {:error, :invalid_blob_payload}
     end
@@ -249,14 +252,13 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   @doc """
-  Deletes legacy content-addressed blob files that are not present in
-  `live_refs`.
+  Deletes blob files that are not present in `live_refs`.
 
   The caller owns producing a complete live set. This function is deliberately
-  conservative: it can remove old v1 content-addressed files, but v2 append
-  segments are retained until segment compaction exists. That keeps the
-  correctness boundary in the shard, which knows current shared and
-  promoted/dedicated Bitcask locations.
+  conservative for append segments: a segment is kept while any live v2 ref
+  points into it, and reclaimed only when the whole segment is dead. The shard
+  must guard Ra replay safety before calling this, because unreleased Ra log
+  entries can still contain older blob refs.
   """
   @spec sweep_unreferenced(binary(), non_neg_integer(), Enumerable.t()) ::
           {:ok,
@@ -268,16 +270,11 @@ defmodule Ferricstore.Store.BlobStore do
           | {:error, term()}
   def sweep_unreferenced(data_dir, shard_index, live_refs)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
-    shard_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
-    live_paths = live_relative_paths(live_refs)
-
-    case blob_files(shard_path) do
-      {:ok, paths} ->
-        sweep_blob_paths(shard_path, paths, live_paths)
-
-      {:error, _reason} = error ->
-        error
-    end
+    :global.trans(
+      blob_lock_key(data_dir, shard_index),
+      fn -> do_sweep_unreferenced(data_dir, shard_index, live_refs) end,
+      [node()]
+    )
   end
 
   @doc """
@@ -425,6 +422,19 @@ defmodule Ferricstore.Store.BlobStore do
   defp maybe_fsync_new_segment_dir(_dir, true), do: :ok
   defp maybe_fsync_new_segment_dir(dir, false), do: fsync_dir(dir)
 
+  defp do_sweep_unreferenced(data_dir, shard_index, live_refs) do
+    shard_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
+    live_paths = live_relative_paths(live_refs)
+
+    case blob_files(shard_path) do
+      {:ok, paths} ->
+        sweep_blob_paths(shard_path, paths, live_paths)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
   defp ensure_recovered(data_dir, shard_index) do
     ensure_recovery_table()
     key = {data_dir, shard_index}
@@ -463,6 +473,9 @@ defmodule Ferricstore.Store.BlobStore do
         tid
     end
   end
+
+  defp blob_lock_key(data_dir, shard_index),
+    do: {{__MODULE__, data_dir, shard_index}, __MODULE__}
 
   defp blob_error_ref([payload | _]) when is_binary(payload), do: BlobRef.from_payload(payload)
   defp blob_error_ref(_payloads), do: %BlobRef{checksum: :binary.copy(<<0>>, 32), size: 0}
@@ -776,6 +789,13 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp blob_files(shard_path) do
+    with {:ok, legacy_paths} <- legacy_blob_files(shard_path),
+         {:ok, segment_paths} <- segment_files(shard_path) do
+      {:ok, legacy_paths ++ segment_paths}
+    end
+  end
+
+  defp legacy_blob_files(shard_path) do
     if Ferricstore.FS.dir?(shard_path) do
       {:ok, Path.wildcard(Path.join(shard_path, "**/*.blob"))}
     else

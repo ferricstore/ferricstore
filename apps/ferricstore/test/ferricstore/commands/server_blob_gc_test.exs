@@ -18,7 +18,7 @@ defmodule Ferricstore.Commands.ServerBlobGCTest do
     %{ctx: ctx, store: %{instance_ctx: ctx}}
   end
 
-  test "FERRICSTORE.BLOBGC preserves append segment records until segment compaction", %{
+  test "FERRICSTORE.BLOBGC reclaims an append segment after its keys are deleted", %{
     ctx: ctx,
     store: store
   } do
@@ -31,7 +31,7 @@ defmodule Ferricstore.Commands.ServerBlobGCTest do
 
     assert [
              "deleted_files",
-             0,
+             1,
              "deleted_bytes",
              deleted_bytes,
              "kept_files",
@@ -42,8 +42,8 @@ defmodule Ferricstore.Commands.ServerBlobGCTest do
              0
            ] = Server.handle("FERRICSTORE.BLOBGC", [], store)
 
-    assert deleted_bytes == 0
-    assert blob_segment_file_count(ctx) == 1
+    assert deleted_bytes > 0
+    assert blob_segment_file_count(ctx) == 0
   end
 
   test "FERRICSTORE.BLOBGC rejects arguments", %{store: store} do

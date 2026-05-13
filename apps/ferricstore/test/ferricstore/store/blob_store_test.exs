@@ -293,6 +293,48 @@ defmodule Ferricstore.Store.BlobStoreTest do
     refute File.exists?(dead_path)
   end
 
+  test "sweep_unreferenced deletes an append segment when no live ref points to it", %{
+    root: root
+  } do
+    assert {:ok, refs} =
+             BlobStore.put_many(root, 0, [
+               :binary.copy("a", 256),
+               :binary.copy("b", 512)
+             ])
+
+    assert [segment_path] =
+             refs
+             |> Enum.map(fn ref ->
+               assert {:ok, {path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
+               path
+             end)
+             |> Enum.uniq()
+
+    segment_bytes = File.stat!(segment_path).size
+
+    assert {:ok, %{deleted_files: 1, deleted_bytes: ^segment_bytes, kept_files: 0}} =
+             BlobStore.sweep_unreferenced(root, 0, [])
+
+    refute File.exists?(segment_path)
+  end
+
+  test "sweep_unreferenced preserves an append segment while any ref in it is live", %{
+    root: root
+  } do
+    live_payload = :binary.copy("l", 256)
+    dead_payload = :binary.copy("d", 512)
+    assert {:ok, [live_ref, dead_ref]} = BlobStore.put_many(root, 0, [live_payload, dead_payload])
+
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, live_ref)
+    assert {:ok, {^segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, dead_ref)
+
+    assert {:ok, %{deleted_files: 0, deleted_bytes: 0, kept_files: 1}} =
+             BlobStore.sweep_unreferenced(root, 0, MapSet.new([live_ref]))
+
+    assert File.exists?(segment_path)
+    assert {:ok, ^live_payload} = BlobStore.get(root, 0, live_ref)
+  end
+
   test "sweep_unreferenced deletes stale atomic-write tmp files", %{root: root} do
     ref = BlobRef.from_payload("crashed-write")
     blob_path = BlobRef.path(root, 0, ref)
