@@ -90,8 +90,7 @@ defmodule Ferricstore.Test.ClusterHelper do
       Enum.map(1..n, fn i ->
         node_suffix = "#{unique}_#{i}"
         name = :"ferric_#{node_suffix}"
-        data_dir = Path.join(System.tmp_dir!(), "ferricstore_cluster_#{node_suffix}")
-        File.mkdir_p!(data_dir)
+        data_dir = fresh_generated_data_dir("ferricstore_cluster_#{node_suffix}")
 
         # Start the peer with the same code paths as the test runner.
         code_paths = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
@@ -214,9 +213,13 @@ defmodule Ferricstore.Test.ClusterHelper do
     name = :"ferric_solo_#{unique}"
 
     data_dir =
-      Keyword.get(opts, :data_dir, Path.join(System.tmp_dir!(), "ferricstore_solo_#{unique}"))
-
-    File.mkdir_p!(data_dir)
+      if Keyword.has_key?(opts, :data_dir) do
+        data_dir = Keyword.fetch!(opts, :data_dir)
+        File.mkdir_p!(data_dir)
+        data_dir
+      else
+        fresh_generated_data_dir("ferricstore_solo_#{unique}")
+      end
 
     code_paths = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
     cookie = Atom.to_charlist(Node.get_cookie())
@@ -232,6 +235,7 @@ defmodule Ferricstore.Test.ClusterHelper do
     # Also store in a named ETS table for cross-process access.
     ensure_solo_registry!()
     :ets.insert(:ferricstore_solo_peers, {node_name, peer_pid, data_dir})
+    :persistent_term.put({__MODULE__, :solo_peer, node_name}, {peer_pid, data_dir})
 
     configure_remote_node(node_name, data_dir, shards)
 
@@ -281,9 +285,10 @@ defmodule Ferricstore.Test.ClusterHelper do
   def stop_node(node_name) do
     ensure_solo_registry!()
 
-    case :ets.lookup(:ferricstore_solo_peers, node_name) do
-      [{^node_name, peer_pid, data_dir}] ->
+    case lookup_solo_peer(node_name) do
+      {:ok, peer_pid, data_dir} ->
         :ets.delete(:ferricstore_solo_peers, node_name)
+        :persistent_term.erase({__MODULE__, :solo_peer, node_name})
 
         try do
           :peer.stop(peer_pid)
@@ -294,7 +299,7 @@ defmodule Ferricstore.Test.ClusterHelper do
         File.rm_rf(data_dir)
         :ok
 
-      [] ->
+      :error ->
         Logger.warning("stop_node: no registered peer for #{node_name}")
         :ok
     end
@@ -713,12 +718,26 @@ defmodule Ferricstore.Test.ClusterHelper do
   # Private: configure remote node
   # ---------------------------------------------------------------------------
 
+  defp fresh_generated_data_dir(prefix) do
+    suffix =
+      :crypto.strong_rand_bytes(8)
+      |> Base.url_encode64(padding: false)
+
+    data_dir = Path.join(System.tmp_dir!(), "#{prefix}_#{System.os_time(:microsecond)}_#{suffix}")
+
+    File.rm_rf!(data_dir)
+    File.mkdir_p!(data_dir)
+    data_dir
+  end
+
   defp configure_remote_node(node_name, data_dir, shards) do
     env_settings = [
       {:data_dir, data_dir},
       {:port, 0},
       {:health_port, 0},
       {:shard_count, shards},
+      {:cluster_nodes, []},
+      {:cluster_auto_join, false},
       {:memory_guard_interval_ms, 60_000},
       {:max_memory_bytes, 1_073_741_824},
       {:merge, [check_interval_ms: 600_000, fragmentation_threshold: 0.99]}
@@ -742,6 +761,26 @@ defmodule Ferricstore.Test.ClusterHelper do
 
       _ref ->
         :ok
+    end
+  end
+
+  defp lookup_solo_peer(node_name) do
+    ets_result =
+      try do
+        :ets.lookup(:ferricstore_solo_peers, node_name)
+      catch
+        _, _ -> []
+      end
+
+    case ets_result do
+      [{^node_name, peer_pid, data_dir}] ->
+        {:ok, peer_pid, data_dir}
+
+      [] ->
+        case :persistent_term.get({__MODULE__, :solo_peer, node_name}, :undefined) do
+          {peer_pid, data_dir} -> {:ok, peer_pid, data_dir}
+          :undefined -> :error
+        end
     end
   end
 
