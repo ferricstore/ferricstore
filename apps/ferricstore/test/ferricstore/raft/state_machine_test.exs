@@ -3517,6 +3517,48 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert {:error, {:blob_ref_unavailable, :enoent}} = result
       assert [{^key, "old", 0, _lfu, 0, 0, 3}] = :ets.lookup(ets, key)
     end
+
+    test "SETRANGE blob ref applies the materialized patch", %{
+      state: state,
+      ets: ets
+    } do
+      key = "setrange_blob_ref_existing"
+      patch = :binary.copy("R", 8)
+      expected = "he" <> patch
+      expected_size = byte_size(expected)
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, patch)
+      encoded_ref = BlobRef.encode!(ref)
+
+      :ets.insert(
+        ets,
+        {key, "hello", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("hello")}
+      )
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:setrange_blob_ref, key, 2, encoded_ref}, state)
+
+      assert result == {:ok, expected_size}
+      assert [{^key, ^expected, 0, _lfu, _fid, _off, ^expected_size}] = :ets.lookup(ets, key)
+    end
+
+    test "SETRANGE blob ref preserves the old value when ref materialization fails", %{
+      state: state,
+      ets: ets
+    } do
+      key = "setrange_blob_ref_invalid"
+      missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+
+      :ets.insert(
+        ets,
+        {key, "hello", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("hello")}
+      )
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:setrange_blob_ref, key, 2, missing_ref}, state)
+
+      assert {:error, {:blob_ref_unavailable, :enoent}} = result
+      assert [{^key, "hello", 0, _lfu, 0, 0, 5}] = :ets.lookup(ets, key)
+    end
   end
 
   describe "apply/3 with {:append, key, suffix}" do

@@ -337,6 +337,9 @@ defmodule Ferricstore.Raft.StateMachine do
     * `{:setrange, key, offset, value}` -- Atomic set-range. Reads the current
       value, pads with zero bytes if needed, replaces bytes at `offset`, writes
       back. Returns `{:ok, byte_size(new_value)}`.
+    * `{:setrange_blob_ref, key, offset, encoded_ref}` -- SETRANGE whose patch
+      bytes were externalized before Ra submission. Materializes and validates
+      the patch before mutating the key.
     * `{:cas, key, expected, new_value, ttl_ms}` -- Compare-and-swap. Reads the
       current value; if it matches `expected`, writes `new_value` with optional
       TTL. Returns `1` (swapped), `0` (mismatch), or `nil` (key missing/expired).
@@ -794,6 +797,12 @@ defmodule Ferricstore.Raft.StateMachine do
 
   def apply(meta, {:setrange, key, offset, value}, state) do
     apply_pending_with_time(meta, state, fn -> do_setrange(state, key, offset, value) end)
+  end
+
+  def apply(meta, {:setrange_blob_ref, key, offset, encoded_ref}, state) do
+    apply_pending_with_time(meta, state, fn ->
+      do_setrange_blob_ref(state, key, offset, encoded_ref)
+    end)
   end
 
   # Atomic SETBIT — read bitmap blob, mutate one bit, write back. Previously
@@ -3978,6 +3987,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:setrange, key, offset, value}) do
     do_setrange(state, key, offset, value)
+  end
+
+  defp apply_single(state, {:setrange_blob_ref, key, offset, encoded_ref}) do
+    do_setrange_blob_ref(state, key, offset, encoded_ref)
   end
 
   defp apply_single(state, {:setbit, key, offset, bit_val}) do
@@ -12626,6 +12639,17 @@ defmodule Ferricstore.Raft.StateMachine do
       {:ok, byte_size(new_val)}
     end
   end
+
+  defp do_setrange_blob_ref(state, key, offset, encoded_ref)
+       when is_integer(offset) and offset >= 0 and is_binary(encoded_ref) do
+    with :ok <- ensure_string_key(state, key),
+         {:ok, value} <- materialize_blob_command_value(state, encoded_ref) do
+      do_setrange(state, key, offset, value)
+    end
+  end
+
+  defp do_setrange_blob_ref(_state, _key, _offset, _encoded_ref),
+    do: {:error, {:blob_ref_unavailable, :invalid_ref}}
 
   # Atomic SETBIT: read bitmap, extend with zeros to include byte_index if
   # needed, flip the single bit, write back. Preserves expire_at_ms.
