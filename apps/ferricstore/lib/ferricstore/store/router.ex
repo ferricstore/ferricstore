@@ -1566,26 +1566,19 @@ defmodule Ferricstore.Store.Router do
 
     emit_batch_cold_read_corruption(corrupt_by_path)
 
-    Enum.map(entry_values, fn
-      {{ctx, idx, keydir, key, _path, file_id, offset, _value_size}, value}
-      when is_binary(value) ->
-        case BlobValue.maybe_materialize(
-               ctx.data_dir,
-               idx,
-               blob_side_channel_threshold(ctx),
-               value
-             ) do
-          {:ok, materialized} ->
-            Stats.record_cold_read(ctx, key)
-            warm_ets_after_cold_read(ctx, idx, keydir, key, materialized, file_id, offset)
-            materialized
+    entry_values
+    |> materialize_blob_entry_values()
+    |> Enum.map(fn
+      {{ctx, idx, keydir, key, _path, file_id, offset, _value_size}, {:ok, materialized}} ->
+        Stats.record_cold_read(ctx, key)
+        warm_ets_after_cold_read(ctx, idx, keydir, key, materialized, file_id, offset)
+        materialized
 
-          {:error, _reason} ->
-            Stats.incr_keyspace_misses(ctx)
-            nil
-        end
+      {{ctx, _idx, _keydir, _key, _path, _file_id, _offset, _value_size}, {:error, _reason}} ->
+        Stats.incr_keyspace_misses(ctx)
+        nil
 
-      {{ctx, idx, keydir, key, _path, file_id, offset, value_size}, _value} ->
+      {{ctx, idx, keydir, key, _path, file_id, offset, value_size}, {:cold_read_error, _value}} ->
         case retry_changed_cold_value(ctx, idx, keydir, key, {file_id, offset, value_size}, now) do
           {:cold, value, retry_file_id, retry_offset} ->
             Stats.record_cold_read(ctx, key)
@@ -1600,6 +1593,41 @@ defmodule Ferricstore.Store.Router do
             nil
         end
     end)
+  end
+
+  defp materialize_blob_entry_values(entry_values) do
+    {groups, indexed_results} =
+      entry_values
+      |> Enum.with_index()
+      |> Enum.reduce({%{}, %{}}, fn
+        {{{ctx, idx, _keydir, _key, _path, _file_id, _offset, _value_size}, value}, index},
+        {groups, indexed_results}
+        when is_binary(value) ->
+          group_key = {ctx.data_dir, idx, blob_side_channel_threshold(ctx)}
+          item = {index, value}
+
+          {
+            Map.update(groups, group_key, [item], &[item | &1]),
+            indexed_results
+          }
+
+        {{_entry, value}, index}, {groups, indexed_results} ->
+          {groups, Map.put(indexed_results, index, {:cold_read_error, value})}
+      end)
+
+    indexed_results =
+      Enum.reduce(groups, indexed_results, fn {{data_dir, idx, threshold}, items}, acc ->
+        ordered_items = Enum.reverse(items)
+        values = Enum.map(ordered_items, fn {_index, value} -> value end)
+
+        ordered_items
+        |> Enum.zip(BlobValue.maybe_materialize_many(data_dir, idx, threshold, values))
+        |> Enum.reduce(acc, fn {{index, _value}, result}, acc -> Map.put(acc, index, result) end)
+      end)
+
+    entry_values
+    |> Enum.with_index()
+    |> Enum.map(fn {{entry, _value}, index} -> {entry, Map.fetch!(indexed_results, index)} end)
   end
 
   defp router_pread_batch_keyed(locations, timeout_ms) do

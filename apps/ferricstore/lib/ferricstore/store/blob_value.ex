@@ -72,9 +72,75 @@ defmodule Ferricstore.Store.BlobValue do
 
   def maybe_materialize(_data_dir, _shard_index, _threshold, value), do: {:ok, value}
 
+  @doc """
+  Materializes a batch of values while loading each exact encoded blob ref once.
+
+  The result stays per-entry so one corrupt or missing blob ref only affects the
+  values that point at that exact ref.
+  """
+  @spec maybe_materialize_many(
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          [term()],
+          (binary(), non_neg_integer(), BlobRef.t() -> {:ok, binary()} | {:error, term()})
+        ) :: [{:ok, term()} | {:error, term()}]
+  def maybe_materialize_many(data_dir, shard_index, threshold, values, loader \\ &BlobStore.get/3)
+
+  def maybe_materialize_many(data_dir, shard_index, threshold, values, loader)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_integer(threshold) and threshold > 0 and is_list(values) and
+             is_function(loader, 3) do
+    {prepared, unique_refs} = prepare_materialize_batch(values)
+
+    loaded_refs =
+      unique_refs
+      |> Enum.reduce(%{}, fn {encoded_ref, ref}, acc ->
+        Map.put(acc, encoded_ref, normalize_load_result(loader.(data_dir, shard_index, ref)))
+      end)
+
+    Enum.map(prepared, fn
+      {:ref, encoded_ref} -> Map.fetch!(loaded_refs, encoded_ref)
+      {:value, value} -> {:ok, value}
+    end)
+  end
+
+  def maybe_materialize_many(_data_dir, _shard_index, _threshold, values, _loader)
+      when is_list(values) do
+    Enum.map(values, &{:ok, &1})
+  end
+
   defp externalize?(value, threshold) do
     byte_size(value) >= threshold or BlobRef.ref?(value)
   end
+
+  defp prepare_materialize_batch(values) do
+    {prepared, unique_refs, _seen} =
+      Enum.reduce(values, {[], [], MapSet.new()}, fn
+        value, {prepared, unique_refs, seen} when is_binary(value) ->
+          case BlobRef.decode(value) do
+            {:ok, ref} ->
+              if MapSet.member?(seen, value) do
+                {[{:ref, value} | prepared], unique_refs, seen}
+              else
+                {[{:ref, value} | prepared], [{value, ref} | unique_refs],
+                 MapSet.put(seen, value)}
+              end
+
+            :error ->
+              {[{:value, value} | prepared], unique_refs, seen}
+          end
+
+        value, {prepared, unique_refs, seen} ->
+          {[{:value, value} | prepared], unique_refs, seen}
+      end)
+
+    {Enum.reverse(prepared), Enum.reverse(unique_refs)}
+  end
+
+  defp normalize_load_result({:ok, _value} = ok), do: ok
+  defp normalize_load_result({:error, _reason} = error), do: error
+  defp normalize_load_result(other), do: {:error, other}
 
   defp externalize_many(data_dir, shard_index, threshold, values) do
     values
