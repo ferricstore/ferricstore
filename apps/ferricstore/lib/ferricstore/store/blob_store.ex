@@ -48,10 +48,17 @@ defmodule Ferricstore.Store.BlobStore do
   def put_many(data_dir, shard_index, payloads)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
              is_list(payloads) do
-    if Enum.all?(payloads, &is_binary/1) do
-      with_blob_lock(data_dir, shard_index, fn -> do_put_many(data_dir, shard_index, payloads) end)
-    else
-      {:error, :invalid_blob_payload}
+    case segment_batch_bytes(payloads) do
+      {:ok, 0} ->
+        {:ok, []}
+
+      {:ok, batch_bytes} ->
+        with_blob_lock(data_dir, shard_index, fn ->
+          do_put_many(data_dir, shard_index, payloads, batch_bytes)
+        end)
+
+      {:error, :invalid_blob_payload} = error ->
+        error
     end
   end
 
@@ -353,11 +360,8 @@ defmodule Ferricstore.Store.BlobStore do
     end)
   end
 
-  defp do_put_many(_data_dir, _shard_index, []), do: {:ok, []}
-
-  defp do_put_many(data_dir, shard_index, payloads) do
+  defp do_put_many(data_dir, shard_index, payloads, batch_bytes) do
     fallback_path = segment_path(data_dir, shard_index, @segment_id)
-    batch_bytes = segment_batch_bytes(payloads)
 
     result =
       case do_put_many_once(data_dir, shard_index, payloads, batch_bytes) do
@@ -438,8 +442,12 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp segment_batch_bytes(payloads) do
-    Enum.reduce(payloads, 0, fn payload, acc ->
-      acc + @segment_header_bytes + byte_size(payload)
+    Enum.reduce_while(payloads, {:ok, 0}, fn
+      payload, {:ok, acc} when is_binary(payload) ->
+        {:cont, {:ok, acc + @segment_header_bytes + byte_size(payload)}}
+
+      _payload, {:ok, _acc} ->
+        {:halt, {:error, :invalid_blob_payload}}
     end)
   end
 

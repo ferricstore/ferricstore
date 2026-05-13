@@ -53,4 +53,19 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
            "BlobStore should cache the segment directory after the first durable mkdir; " <>
              "repeating mkdir_p on every blob append adds avoidable NIF/filesystem work"
   end
+
+  test "put_many does not walk payloads only to validate binaries" do
+    source = File.read!(@source)
+
+    put_many =
+      source
+      |> String.split("  def put_many(data_dir, shard_index, payloads)", parts: 2)
+      |> List.last()
+      |> String.split("  @doc \"Reads and validates a blob by ref.\"", parts: 2)
+      |> List.first()
+
+    refute put_many =~ "Enum.all?",
+           "BlobStore.put_many/3 should validate payloads while computing batch bytes; " <>
+             "a separate Enum.all?/2 pass adds avoidable CPU work for large blob batches"
+  end
 end

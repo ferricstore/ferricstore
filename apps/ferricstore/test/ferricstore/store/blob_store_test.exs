@@ -96,6 +96,20 @@ defmodule Ferricstore.Store.BlobStoreTest do
            end)
   end
 
+  test "put_many rejects invalid payload without opening the segment", %{root: root} do
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_write_hook, fn io, iodata ->
+      send(parent, :unexpected_blob_write)
+      :file.write(io, iodata)
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_write_hook) end)
+
+    assert {:error, :invalid_blob_payload} = BlobStore.put_many(root, 0, ["valid", :invalid])
+    refute_received :unexpected_blob_write
+  end
+
   test "same-shard blob appends serialize while preserving offsets", %{root: root} do
     parent = self()
 
