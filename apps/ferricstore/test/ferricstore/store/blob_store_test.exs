@@ -254,6 +254,16 @@ defmodule Ferricstore.Store.BlobStoreTest do
     refute_received {:blob_fsync_dir, _}
   end
 
+  test "put recreates segment directory if it disappears after being cached", %{root: root} do
+    assert {:ok, first_ref} = BlobStore.put(root, 0, "first")
+    segment_dir = Path.dirname(BlobRef.path(root, 0, first_ref))
+    File.rm_rf!(segment_dir)
+
+    assert {:ok, second_ref} = BlobStore.put(root, 0, "second")
+    assert {:ok, "second"} = BlobStore.get(root, 0, second_ref)
+    assert File.dir?(segment_dir)
+  end
+
   test "legacy content-addressed refs remain readable", %{root: root} do
     payload = "complete-payload"
     ref = BlobRef.from_payload(payload)

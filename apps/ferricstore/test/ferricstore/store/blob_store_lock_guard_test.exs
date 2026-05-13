@@ -38,4 +38,19 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
            "cached active blob segment should use the cached size; " <>
              "per-append File.stat adds avoidable large-value write latency"
   end
+
+  test "blob append does not mkdir the segment directory on every write" do
+    source = File.read!(@source)
+
+    do_put_many =
+      source
+      |> String.split("  defp do_put_many(data_dir, shard_index, payloads) do", parts: 2)
+      |> List.last()
+      |> String.split("  defp build_segment_records", parts: 2)
+      |> List.first()
+
+    refute do_put_many =~ "mkdir_p",
+           "BlobStore should cache the segment directory after the first durable mkdir; " <>
+             "repeating mkdir_p on every blob append adds avoidable NIF/filesystem work"
+  end
 end

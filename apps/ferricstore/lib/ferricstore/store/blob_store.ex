@@ -21,6 +21,7 @@ defmodule Ferricstore.Store.BlobStore do
   @recovery_table :ferricstore_blob_store_recovery
   @segment_table :ferricstore_blob_store_segments
   @lock_table :ferricstore_blob_store_locks
+  @dir_table :ferricstore_blob_store_dirs
   @held_locks_key :ferricstore_blob_store_held_locks
   @lock_retry_ms 1
 
@@ -218,6 +219,7 @@ defmodule Ferricstore.Store.BlobStore do
   def recover_shard(data_dir, shard_index)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
     clear_active_segment_cache(data_dir, shard_index)
+    clear_segment_dir_cache(data_dir, shard_index)
     shard_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
 
     with {:ok, paths} <- segment_files(shard_path) do
@@ -355,28 +357,17 @@ defmodule Ferricstore.Store.BlobStore do
 
   defp do_put_many(data_dir, shard_index, payloads) do
     fallback_path = segment_path(data_dir, shard_index, @segment_id)
-    dir = Path.dirname(fallback_path)
-    dir_existed? = Ferricstore.FS.dir?(dir)
     batch_bytes = segment_batch_bytes(payloads)
 
     result =
-      with :ok <- Ferricstore.FS.mkdir_p(dir),
-           :ok <- fsync_parent_after_mkdir(dir, dir_existed?),
-           {:ok, _stats} <- ensure_recovered(data_dir, shard_index),
-           {:ok, segment} <- writable_segment(data_dir, shard_index, batch_bytes),
-           {:ok, io} <- File.open(segment.path, [:append, :raw, :binary]) do
-        try do
-          with {:ok, refs, iodata, next_offset} <-
-                 build_segment_records(payloads, segment.id, segment.start_offset),
-               :ok <- write_file(io, iodata),
-               :ok <- fsync_file(segment.path),
-               :ok <- maybe_fsync_new_segment_dir(dir, segment.file_existed?) do
-            cache_active_segment(data_dir, shard_index, segment.id, segment.path, next_offset)
-            {:ok, refs}
-          end
-        after
-          :file.close(io)
-        end
+      case do_put_many_once(data_dir, shard_index, payloads, batch_bytes) do
+        {:error, :blob_segment_dir_missing} ->
+          clear_active_segment_cache(data_dir, shard_index)
+          clear_segment_dir_cache(data_dir, shard_index)
+          do_put_many_once(data_dir, shard_index, payloads, batch_bytes)
+
+        other ->
+          other
       end
 
     case result do
@@ -387,6 +378,35 @@ defmodule Ferricstore.Store.BlobStore do
         emit_error(:put, shard_index, fallback_path, blob_error_ref(payloads), reason)
         recover_shard(data_dir, shard_index)
         error
+    end
+  end
+
+  defp do_put_many_once(data_dir, shard_index, payloads, batch_bytes) do
+    with {:ok, _stats} <- ensure_recovered(data_dir, shard_index),
+         :ok <- ensure_segment_dir(data_dir, shard_index),
+         {:ok, segment} <- writable_segment(data_dir, shard_index, batch_bytes) do
+      case File.open(segment.path, [:append, :raw, :binary]) do
+        {:ok, io} ->
+          try do
+            with {:ok, refs, iodata, next_offset} <-
+                   build_segment_records(payloads, segment.id, segment.start_offset),
+                 :ok <- write_file(io, iodata),
+                 :ok <- fsync_file(segment.path),
+                 :ok <-
+                   maybe_fsync_new_segment_dir(Path.dirname(segment.path), segment.file_existed?) do
+              cache_active_segment(data_dir, shard_index, segment.id, segment.path, next_offset)
+              {:ok, refs}
+            end
+          after
+            :file.close(io)
+          end
+
+        {:error, :enoent} ->
+          {:error, :blob_segment_dir_missing}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
@@ -607,6 +627,56 @@ defmodule Ferricstore.Store.BlobStore do
           ])
         rescue
           ArgumentError -> @recovery_table
+        end
+
+      tid ->
+        tid
+    end
+  end
+
+  defp ensure_segment_dir(data_dir, shard_index) do
+    ensure_dir_table()
+    key = {data_dir, shard_index}
+    dir = Path.dirname(segment_path(data_dir, shard_index, @segment_id))
+
+    case :ets.lookup(@dir_table, key) do
+      [{^key, ^dir}] ->
+        :ok
+
+      _other ->
+        create_segment_dir(key, dir)
+    end
+  end
+
+  defp create_segment_dir(key, dir) do
+    dir_existed? = Ferricstore.FS.dir?(dir)
+
+    with :ok <- Ferricstore.FS.mkdir_p(dir),
+         :ok <- fsync_parent_after_mkdir(dir, dir_existed?) do
+      :ets.insert(@dir_table, {key, dir})
+      :ok
+    end
+  end
+
+  defp clear_segment_dir_cache(data_dir, shard_index) do
+    ensure_dir_table()
+    :ets.delete(@dir_table, {data_dir, shard_index})
+    :ok
+  end
+
+  defp ensure_dir_table do
+    case :ets.whereis(@dir_table) do
+      :undefined ->
+        try do
+          :ets.new(@dir_table, [
+            :named_table,
+            :public,
+            :set,
+            {:read_concurrency, true},
+            {:write_concurrency, :auto}
+          ])
+        rescue
+          ArgumentError -> @dir_table
         end
 
       tid ->
