@@ -82,32 +82,63 @@ defmodule Ferricstore.Store.BlobValue do
           binary(),
           non_neg_integer(),
           non_neg_integer(),
+          [term()]
+        ) :: [{:ok, term()} | {:error, term()}]
+  @spec maybe_materialize_many(
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
           [term()],
           (binary(), non_neg_integer(), BlobRef.t() -> {:ok, binary()} | {:error, term()})
         ) :: [{:ok, term()} | {:error, term()}]
-  def maybe_materialize_many(data_dir, shard_index, threshold, values, loader \\ &BlobStore.get/3)
+  def maybe_materialize_many(data_dir, shard_index, threshold, values)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_integer(threshold) and threshold > 0 and is_list(values) do
+    {prepared, unique_refs} = prepare_materialize_batch(values)
+    loaded_refs = load_materialize_refs(data_dir, shard_index, unique_refs)
+    materialize_prepared(prepared, loaded_refs)
+  end
+
+  def maybe_materialize_many(_data_dir, _shard_index, _threshold, values) when is_list(values) do
+    Enum.map(values, &{:ok, &1})
+  end
 
   def maybe_materialize_many(data_dir, shard_index, threshold, values, loader)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
              is_integer(threshold) and threshold > 0 and is_list(values) and
              is_function(loader, 3) do
     {prepared, unique_refs} = prepare_materialize_batch(values)
-
-    loaded_refs =
-      unique_refs
-      |> Enum.reduce(%{}, fn {encoded_ref, ref}, acc ->
-        Map.put(acc, encoded_ref, normalize_load_result(loader.(data_dir, shard_index, ref)))
-      end)
-
-    Enum.map(prepared, fn
-      {:ref, encoded_ref} -> Map.fetch!(loaded_refs, encoded_ref)
-      {:value, value} -> {:ok, value}
-    end)
+    loaded_refs = load_materialize_refs(data_dir, shard_index, unique_refs, loader)
+    materialize_prepared(prepared, loaded_refs)
   end
 
   def maybe_materialize_many(_data_dir, _shard_index, _threshold, values, _loader)
       when is_list(values) do
     Enum.map(values, &{:ok, &1})
+  end
+
+  defp load_materialize_refs(data_dir, shard_index, unique_refs) do
+    refs = Enum.map(unique_refs, fn {_encoded_ref, ref} -> ref end)
+    results = BlobStore.get_many(data_dir, shard_index, refs)
+
+    unique_refs
+    |> Enum.zip(results)
+    |> Map.new(fn {{encoded_ref, _ref}, result} ->
+      {encoded_ref, normalize_load_result(result)}
+    end)
+  end
+
+  defp load_materialize_refs(data_dir, shard_index, unique_refs, loader) do
+    Enum.reduce(unique_refs, %{}, fn {encoded_ref, ref}, acc ->
+      Map.put(acc, encoded_ref, normalize_load_result(loader.(data_dir, shard_index, ref)))
+    end)
+  end
+
+  defp materialize_prepared(prepared, loaded_refs) do
+    Enum.map(prepared, fn
+      {:ref, encoded_ref} -> Map.fetch!(loaded_refs, encoded_ref)
+      {:value, value} -> {:ok, value}
+    end)
   end
 
   defp externalize?(value, threshold) do

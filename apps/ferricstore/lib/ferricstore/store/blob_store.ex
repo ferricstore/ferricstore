@@ -108,6 +108,27 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   @doc """
+  Reads and validates refs in order.
+
+  Segment refs are grouped by append segment so batch reads open each segment
+  once while still returning per-ref errors. Duplicate refs are loaded once and
+  fanned back out to their original positions.
+  """
+  @spec get_many(binary(), non_neg_integer(), [BlobRef.t()]) ::
+          [{:ok, binary()} | {:error, reason()}]
+  def get_many(data_dir, shard_index, refs)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_list(refs) do
+    {prepared, unique_refs} = prepare_get_many_refs(refs)
+    loaded_refs = load_blob_refs(data_dir, shard_index, unique_refs)
+
+    Enum.map(prepared, fn
+      {:ref, ref} -> Map.fetch!(loaded_refs, ref)
+      :invalid -> {:error, :invalid_blob_ref}
+    end)
+  end
+
+  @doc """
   Verifies that an existing blob exactly matches its ref.
 
   This is intended for write/apply correctness boundaries where a ref-only
@@ -323,6 +344,110 @@ defmodule Ferricstore.Store.BlobStore do
           {:halt, error}
       end
     end)
+  end
+
+  defp prepare_get_many_refs(refs) do
+    {prepared, unique_refs, _seen} =
+      Enum.reduce(refs, {[], [], MapSet.new()}, fn
+        %BlobRef{} = ref, {prepared, unique_refs, seen} ->
+          if MapSet.member?(seen, ref) do
+            {[{:ref, ref} | prepared], unique_refs, seen}
+          else
+            {[{:ref, ref} | prepared], [ref | unique_refs], MapSet.put(seen, ref)}
+          end
+
+        _invalid, {prepared, unique_refs, seen} ->
+          {[:invalid | prepared], unique_refs, seen}
+      end)
+
+    {Enum.reverse(prepared), Enum.reverse(unique_refs)}
+  end
+
+  defp load_blob_refs(data_dir, shard_index, refs) do
+    {legacy_refs, segment_refs, invalid_refs} =
+      Enum.reduce(refs, {[], [], []}, fn
+        %BlobRef{version: 1} = ref, {legacy_refs, segment_refs, invalid_refs} ->
+          {[ref | legacy_refs], segment_refs, invalid_refs}
+
+        %BlobRef{version: 2} = ref, {legacy_refs, segment_refs, invalid_refs} ->
+          {legacy_refs, [ref | segment_refs], invalid_refs}
+
+        %BlobRef{} = ref, {legacy_refs, segment_refs, invalid_refs} ->
+          {legacy_refs, segment_refs, [ref | invalid_refs]}
+      end)
+
+    %{}
+    |> put_invalid_ref_results(invalid_refs)
+    |> put_legacy_ref_results(data_dir, shard_index, Enum.reverse(legacy_refs))
+    |> put_segment_ref_results(data_dir, shard_index, Enum.reverse(segment_refs))
+  end
+
+  defp put_invalid_ref_results(results, refs) do
+    Enum.reduce(refs, results, fn ref, acc ->
+      Map.put(acc, ref, {:error, :invalid_blob_ref})
+    end)
+  end
+
+  defp put_legacy_ref_results(results, data_dir, shard_index, refs) do
+    Enum.reduce(refs, results, fn ref, acc ->
+      Map.put(acc, ref, get(data_dir, shard_index, ref))
+    end)
+  end
+
+  defp put_segment_ref_results(results, _data_dir, _shard_index, []), do: results
+
+  defp put_segment_ref_results(results, data_dir, shard_index, refs) do
+    refs
+    |> Enum.group_by(&BlobRef.path(data_dir, shard_index, &1))
+    |> Enum.reduce(results, fn {path, path_refs}, acc ->
+      Map.merge(acc, get_segment_refs_at_path(path, shard_index, path_refs))
+    end)
+  end
+
+  defp get_segment_refs_at_path(path, shard_index, [_first_ref | _] = refs) do
+    max_extent =
+      Enum.reduce(refs, 0, fn %BlobRef{offset: offset, size: size}, acc ->
+        max(acc, offset + size)
+      end)
+
+    with :ok <- stat_regular_min_size(path, max_extent),
+         {:ok, io} <- open_read_file(path) do
+      try do
+        get_open_segment_refs(io, path, shard_index, refs)
+      after
+        :file.close(io)
+      end
+    else
+      {:error, reason} ->
+        Enum.reduce(refs, %{}, fn ref, acc ->
+          emit_error(:get, shard_index, path, ref, reason)
+          Map.put(acc, ref, {:error, reason})
+        end)
+    end
+  end
+
+  defp get_open_segment_refs(io, path, shard_index, refs) do
+    Enum.reduce(refs, %{}, fn ref, acc ->
+      Map.put(acc, ref, get_open_segment_ref(io, path, shard_index, ref))
+    end)
+  end
+
+  defp get_open_segment_ref(io, path, shard_index, %BlobRef{offset: offset, size: size} = ref) do
+    result =
+      with :ok <- validate_open_segment_record(io, offset, size, ref),
+           {:ok, payload} <- pread_exact_open(io, offset, size),
+           :ok <- verify_checksum(ref, payload) do
+        {:ok, payload}
+      end
+
+    case result do
+      {:ok, _payload} = ok ->
+        ok
+
+      {:error, reason} = error ->
+        emit_error(:get, shard_index, path, ref, reason)
+        error
+    end
   end
 
   @doc """

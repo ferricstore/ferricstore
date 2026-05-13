@@ -177,6 +177,46 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:error, :checksum_mismatch} = BlobStore.verify_many(root, 0, [good_ref, bad_ref])
   end
 
+  test "get_many opens each append segment once for unique refs", %{root: root} do
+    payloads = [
+      :binary.copy("a", 512),
+      :binary.copy("b", 768),
+      :binary.copy("c", 1024)
+    ]
+
+    assert {:ok, refs} = BlobStore.put_many(root, 0, payloads)
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, hd(refs))
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_open_read_hook, fn path, modes ->
+      send(parent, {:blob_open_read, path})
+      File.open(path, modes)
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_open_read_hook) end)
+
+    assert Enum.map(payloads, &{:ok, &1}) == BlobStore.get_many(root, 0, refs)
+    assert_received {:blob_open_read, ^segment_path}
+    refute_received {:blob_open_read, _}
+  end
+
+  test "get_many isolates corrupt refs inside grouped segment reads", %{root: root} do
+    first_payload = :binary.copy("a", 128)
+    second_payload = :binary.copy("b", 128)
+    third_payload = :binary.copy("c", 128)
+
+    assert {:ok, [first_ref, second_ref, third_ref]} =
+             BlobStore.put_many(root, 0, [first_payload, second_payload, third_payload])
+
+    overwrite_segment_payload!(root, 0, second_ref, :binary.copy("x", 128))
+
+    assert [
+             {:ok, ^first_payload},
+             {:error, :checksum_mismatch},
+             {:ok, ^third_payload}
+           ] = BlobStore.get_many(root, 0, [first_ref, second_ref, third_ref])
+  end
+
   test "put_many rejects invalid payload without opening the segment", %{root: root} do
     parent = self()
 
