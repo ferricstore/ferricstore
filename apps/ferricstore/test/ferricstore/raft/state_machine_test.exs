@@ -3450,6 +3450,39 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert result == "old"
       assert [{^key, nil, 0, _lfu, _fid, _off, ^encoded_ref_size}] = :ets.lookup(ets, key)
     end
+
+    test "GETSET blob ref returns the old value while storing the new ref", %{
+      state: state,
+      ets: ets
+    } do
+      key = "getset_blob_ref_existing"
+      payload = :binary.copy("blob-getset", 32)
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+      encoded_ref_size = byte_size(encoded_ref)
+      :ets.insert(ets, {key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")})
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:getset_blob_ref, key, encoded_ref}, state)
+
+      assert result == "old"
+      assert [{^key, nil, 0, _lfu, _fid, _off, ^encoded_ref_size}] = :ets.lookup(ets, key)
+    end
+
+    test "GETSET blob ref preserves the old value when ref validation fails", %{
+      state: state,
+      ets: ets
+    } do
+      key = "getset_blob_ref_invalid"
+      missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+      :ets.insert(ets, {key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")})
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:getset_blob_ref, key, missing_ref}, state)
+
+      assert {:error, {:blob_ref_unavailable, :enoent}} = result
+      assert [{^key, "old", 0, _lfu, 0, 0, 3}] = :ets.lookup(ets, key)
+    end
   end
 
   describe "apply/3 with {:append, key, suffix}" do

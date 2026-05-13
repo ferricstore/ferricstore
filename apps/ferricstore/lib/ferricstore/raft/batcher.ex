@@ -139,6 +139,7 @@ defmodule Ferricstore.Raft.Batcher do
           | {:getex, binary(), non_neg_integer()}
           | {:setrange, binary(), non_neg_integer(), binary()}
           | {:cas, binary(), binary(), binary(), non_neg_integer() | nil}
+          | {:getset_blob_ref, binary(), binary()}
           | {:lock, binary(), binary(), non_neg_integer()}
           | {:unlock, binary(), binary()}
           | {:extend, binary(), binary(), non_neg_integer()}

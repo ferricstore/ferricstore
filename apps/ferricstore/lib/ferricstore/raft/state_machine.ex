@@ -305,6 +305,9 @@ defmodule Ferricstore.Raft.StateMachine do
       this shape when later commands in the same Ra entry need pending
       read-your-own-write state. Returns `{:ok, results}` where results is a
       list of individual command results.
+    * `{:getset_blob_ref, key, encoded_ref}` -- GETSET whose replacement value
+      was externalized before Ra submission. Returns the old value and stores
+      the ref only after validating it.
     * `{:list_op, key, operation}` -- Execute a list operation (LPUSH, RPUSH,
       LPOP, RPOP, etc.) as an atomic read-modify-write. Reads the current value
       from ETS/Bitcask, delegates to `ListOps.execute/4`, and persists the result.
@@ -768,6 +771,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   def apply(meta, {:getset, key, new_value}, state) do
     apply_pending_with_time(meta, state, fn -> do_getset(state, key, new_value) end)
+  end
+
+  def apply(meta, {:getset_blob_ref, key, encoded_ref}, state) do
+    apply_pending_with_time(meta, state, fn -> do_getset_blob_ref(state, key, encoded_ref) end)
   end
 
   def apply(meta, {:getdel, key}, state) do
@@ -3944,6 +3951,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:getset, key, new_value}) do
     do_getset(state, key, new_value)
+  end
+
+  defp apply_single(state, {:getset_blob_ref, key, encoded_ref}) do
+    do_getset_blob_ref(state, key, encoded_ref)
   end
 
   defp apply_single(state, {:getdel, key}) do
@@ -12530,6 +12541,18 @@ defmodule Ferricstore.Raft.StateMachine do
       old
     end
   end
+
+  defp do_getset_blob_ref(state, key, encoded_ref) when is_binary(encoded_ref) do
+    with :ok <- ensure_string_key(state, key),
+         :ok <- validate_put_blob_ref(state, encoded_ref) do
+      old = do_get(state, key)
+      do_put_validated_blob_ref(state, key, encoded_ref, 0)
+      old
+    end
+  end
+
+  defp do_getset_blob_ref(_state, _key, _encoded_ref),
+    do: {:error, {:blob_ref_unavailable, :invalid_ref}}
 
   # Atomic GETDEL: reads value, deletes key, returns value directly (not
   # wrapped in {:ok, ...}). Returns nil if key does not exist.
