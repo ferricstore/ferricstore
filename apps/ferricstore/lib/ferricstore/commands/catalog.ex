@@ -311,6 +311,15 @@ defmodule Ferricstore.Commands.Catalog do
       summary: "Manages per-namespace configuration (SET/GET/RESET)."
     },
     %{
+      name: "ferricstore.blobgc",
+      arity: 1,
+      flags: ["admin", "slow"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Runs conservative garbage collection for unreferenced large-value blobs."
+    },
+    %{
       name: "ferricstore.key_info",
       arity: 2,
       flags: ["readonly", "fast"],
@@ -845,6 +854,9 @@ defmodule Ferricstore.Commands.Catalog do
   defp flow_dynamic_keys("FLOW.TRANSITION_MANY", args),
     do: {:ok, args_at(args, flow_transition_many_key_indices(args))}
 
+  defp flow_dynamic_keys("FLOW.VALUE.PUT", args),
+    do: {:ok, args_at(args, flow_partition_key_indices(args, 1))}
+
   defp flow_dynamic_keys(name, args)
        when name in ["FLOW.CREATE", "FLOW.GET", "FLOW.HISTORY"],
        do: {:ok, args_at(args, flow_partition_or_first_key_indices(args, 1))}
@@ -916,10 +928,23 @@ defmodule Ferricstore.Commands.Catalog do
       [0]
     else
       case option_index(args, 1, "ITEMS") do
-        nil -> [0]
-        items_idx -> repeated_item_partition_indices(args, items_idx + 1, 3)
+        nil ->
+          [0]
+
+        items_idx ->
+          item_width =
+            if flow_option_present_until?(args, 1, items_idx, "PAYLOAD_REF"), do: 2, else: 3
+
+          repeated_item_partition_indices(args, items_idx + 1, item_width)
       end
     end
+  end
+
+  defp flow_option_present_until?(args, start, option_end, option) do
+    start..max(start, option_end - 1)
+    |> Enum.any?(fn idx ->
+      rem(idx - start, 2) == 0 and idx < option_end and arg_eq?(Enum.at(args, idx), option)
+    end)
   end
 
   defp flow_spawn_children_key_indices(args) do

@@ -363,7 +363,11 @@ defmodule Ferricstore.Config do
     path = config_file_path()
     dir = Path.dirname(path)
     Ferricstore.FS.mkdir_p(dir)
-    tmp_path = path <> ".tmp"
+
+    case validate_config_rewrite_path(path, dir) do
+      :ok -> :ok
+      {:error, _reason} = error -> throw(error)
+    end
 
     # Read existing file content (if any)
     existing_lines =
@@ -391,7 +395,7 @@ defmodule Ferricstore.Config do
 
     appended_lines =
       Enum.map(new_keys, fn key ->
-        value = Map.get(state, key, "")
+        value = rewrite_value(key, Map.get(state, key, ""))
         "#{key} #{value}"
       end)
 
@@ -407,8 +411,10 @@ defmodule Ferricstore.Config do
     content = Enum.join(all_lines, "\n") <> "\n"
 
     # Atomic write: write to tmp then rename
-    result = atomic_write_file(tmp_path, path, content)
+    result = atomic_write_file(path, content)
     {:reply, result, state}
+  catch
+    {:error, _reason} = error -> {:reply, error, state}
   end
 
   defp rewrite_config_line(line, state, lines_acc, written_acc) do
@@ -421,7 +427,7 @@ defmodule Ferricstore.Config do
       true ->
         case String.split(trimmed, " ", parts: 2) do
           [key | _rest] when is_map_key(state, key) ->
-            value = Map.get(state, key, "")
+            value = rewrite_value(key, Map.get(state, key, ""))
             {["#{key} #{value}" | lines_acc], MapSet.put(written_acc, key)}
 
           [_key | _rest] ->
@@ -433,9 +439,17 @@ defmodule Ferricstore.Config do
     end
   end
 
-  defp atomic_write_file(tmp_path, path, content) do
-    with :ok <- File.write(tmp_path, content),
+  defp rewrite_value(key, value) do
+    if sensitive_param?(key), do: @redacted_config_value, else: value
+  end
+
+  defp atomic_write_file(path, content) do
+    dir = Path.dirname(path)
+    tmp_path = Path.join(dir, ".#{Path.basename(path)}.tmp.#{System.unique_integer([:positive])}")
+
+    with :ok <- secure_write_tmp(tmp_path, content),
          :ok <- Ferricstore.FS.rename(tmp_path, path),
+         :ok <- File.chmod(path, 0o600),
          :ok <- Ferricstore.Bitcask.NIF.v2_fsync_dir(Path.dirname(path)) do
       :ok
     else
@@ -460,6 +474,58 @@ defmodule Ferricstore.Config do
         end
 
         {:error, "ERR failed to write/rename config file: #{inspect(reason)}"}
+    end
+  end
+
+  defp secure_write_tmp(tmp_path, content) do
+    case File.open(tmp_path, [:write, :exclusive, :binary]) do
+      {:ok, io} ->
+        try do
+          with :ok <- File.chmod(tmp_path, 0o600),
+               :ok <- IO.binwrite(io, content),
+               :ok <- :file.sync(io),
+               :ok <- File.close(io) do
+            :ok
+          else
+            {:error, reason} ->
+              _ = File.close(io)
+              {:error, reason}
+          end
+        rescue
+          error ->
+            _ = File.close(io)
+            {:error, error}
+        catch
+          kind, reason ->
+            _ = File.close(io)
+            {:error, {kind, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp validate_config_rewrite_path(path, data_dir) do
+    abs_path = Path.expand(path)
+    abs_dir = Path.expand(data_dir)
+
+    cond do
+      not (String.starts_with?(abs_path, abs_dir <> "/") or abs_path == abs_dir) ->
+        {:error, "ERR CONFIG REWRITE path escapes data directory"}
+
+      symlink?(path) ->
+        {:error, "ERR CONFIG REWRITE path is a symlink, refusing for security"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp symlink?(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :symlink}} -> true
+      _ -> false
     end
   end
 

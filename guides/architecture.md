@@ -93,7 +93,7 @@ Ferricstore.Supervisor (:one_for_one)
 ├── Ferricstore.SlowLog                   # Slow command ring buffer
 ├── Ferricstore.AuditLog                  # Security audit trail
 ├── Ferricstore.Config                    # Runtime CONFIG GET/SET (ETS-backed)
-├── Ferricstore.NamespaceConfig           # Per-namespace commit window + durability
+├── Ferricstore.NamespaceConfig           # Per-namespace commit window
 ├── Ferricstore.Acl                       # Access control lists (PBKDF2 passwords)
 ├── Ferricstore.HLC                       # Hybrid Logical Clock (for Raft timestamps)
 ├── Ferricstore.Raft.Batcher.0            # Group-commit batcher (shard 0)
@@ -107,9 +107,6 @@ Ferricstore.Supervisor (:one_for_one)
 │   ├── Ferricstore.Store.Shard.1
 │   ├── ...
 │   └── Ferricstore.Store.Shard.N-1   # N = System.schedulers_online()
-├── Ferricstore.Raft.AsyncApplyWorker.0   # Async durability worker (shard 0)
-├── Ferricstore.Raft.AsyncApplyWorker.1   # Async durability worker (shard 1)
-├── ...                                   # (one AsyncApplyWorker per shard)
 ├── Ferricstore.Merge.Supervisor          # Merge subsystem
 │   ├── Ferricstore.Merge.Semaphore       # Node-level concurrency gate (capacity 1)
 │   ├── Ferricstore.Merge.Scheduler.0     # Per-shard compaction scheduler
@@ -136,7 +133,7 @@ Before the supervision tree starts, `Application.start/2` performs critical init
 4. `Waiters.init()`, `ClientTracking.init_tables()`, `Stream.init_tables()` -- ETS tables for blocking commands, client tracking, and streams
 5. `install_patched_wal()` -- loads the patched `ra_log_wal` module with async fdatasync (pre-compiled `.beam` in release mode, runtime-compiled in dev)
 6. `Raft.Cluster.start_system(data_dir)` -- starts the ra system (WAL directory under `data_dir/ra`)
-7. Supervision tree starts: Stats -> SlowLog -> AuditLog -> Config -> NamespaceConfig -> Acl -> HLC -> Batchers -> BitcaskWriters -> ShardSupervisor -> AsyncApplyWorkers -> Merge.Supervisor -> PubSub -> FetchOrCompute -> MemoryGuard
+7. Supervision tree starts: Stats -> SlowLog -> AuditLog -> Config -> NamespaceConfig -> HLC -> Batchers -> BitcaskWriters -> Flow LMDB writers -> ShardSupervisor -> Merge.Supervisor -> PubSub -> FetchOrCompute -> MemoryGuard
 
 Stats starts first so counters are available before any connection. The ShardSupervisor must start before the Ranch listener (in the server app) so the key-value store is ready before any client arrives. MemoryGuard starts last because it reads from shard ETS tables.
 
@@ -151,7 +148,6 @@ Each shard has:
 - A group-commit batcher for write batching
 - A prefix index ETS table for efficient SCAN/KEYS by prefix
 - A merge scheduler for background compaction
-- An async apply worker for fire-and-forget writes
 
 The Router module (`Ferricstore.Store.Router`) pre-computes shard name atoms at startup via `Router.init_shard_names(shard_count)` for O(1) dispatch (~5ns via `elem/2` on a tuple vs ~300ns for string interpolation).
 
@@ -216,13 +212,11 @@ Client                Router              Shard GenServer         Raft Batcher
   |                     |                      |                       |-- extract namespace
   |                     |                      |                       |   prefix from key
   |                     |                      |                       |-- lookup window_ms
-  |                     |                      |                       |   and durability
   |                     |                      |                       |-- append to slot buffer
   |                     |                      |                       |-- start timer (1st write)
   |                     |                      |                       |
   |                     |                      |   (timer fires)       |
   |                     |                      |                       |
-  |                     |                      |  [:quorum durability] |
   |                     |                      |                       |-- :ra.process_command
   |                     |                      |                       |   (blocks until quorum)
   |                     |                      |                       |
@@ -232,10 +226,6 @@ Client                Router              Shard GenServer         Raft Batcher
   |                     |                      |                       |
   |<-- :ok ------------|<-- :ok --------------|<-- result ------------|
   |                     |                      |                       |
-  |                     |  [:async durability] |                       |
-  |                     |                      |                       |-- AsyncApplyWorker
-  |                     |                      |                       |   .apply_batch (cast)
-  |<-- :ok ------------|<-- :ok --------------|<-- :ok (immediate) --|
 ```
 
 ### Write Path Details
@@ -244,15 +234,13 @@ Client                Router              Shard GenServer         Raft Batcher
 
 1. `Router.put/3` validates key/value size limits (max key: 64KB, max value: 512MB) and checks `keydir_full?()` via `persistent_term` (~5ns).
 2. `Shard.handle_call({:put, key, value, expire_at_ms})` calls `Batcher.write(shard_index, {:put, key, value, expire_at_ms})`.
-3. The Batcher extracts the namespace prefix from the key (text before the first `:`; keys without `:` go to `"_root"`). It looks up the namespace config for `window_ms` (commit window) and `durability` (`:quorum` or `:async`).
+3. The Batcher extracts the namespace prefix from the key (text before the first `:`; keys without `:` go to `"_root"`). It looks up the namespace config for `window_ms` (commit window).
 4. The command and caller are appended to the namespace's slot buffer. On the first write to an empty slot, a timer is started with `window_ms` (default: 1ms). If the slot reaches `max_batch_size` (default: 1000), it flushes immediately.
-5. When the timer fires or the slot is full:
-   - **Quorum path**: The batch is submitted via `:ra.process_command/2` (for single commands) or as `{:batch, commands}` (for multi-command batches). The call blocks until Raft quorum acknowledges. `StateMachine.apply/3` runs on every node: it calls `NIF.v2_append_batch(active_file_path, records)` to write to Bitcask with fsync, then `:ets.insert(keydir, 7-tuple)` to update the keydir. Each caller receives their individual result.
-   - **Async path**: The batch is sent to `AsyncApplyWorker` via `GenServer.cast` (fire-and-forget). All callers receive `:ok` immediately. The worker writes to Bitcask via `NIF.v2_append_batch` and updates ETS in the background.
+5. When the timer fires or the slot is full, the batch is submitted through Raft via `:ra.pipeline_command/4`. `StateMachine.apply/3` runs after the Raft entry is committed: it calls `NIF.v2_append_batch(active_file_path, records)` to write to Bitcask with fsync, then `:ets.insert(keydir, 7-tuple)` to update the keydir. Each caller receives their individual result after the applied notification arrives.
 
-**Direct write path (sandbox test shards)**:
+**Direct write path (embedded custom instances and sandbox test shards)**:
 
-Sandbox test shards bypass Raft and write through the Shard GenServer directly. This is not a user-facing option -- it is used internally by the test sandbox infrastructure to provide isolated, single-process shards.
+Custom embedded instances and sandbox test shards bypass the default Raft-backed application instance and write through their own Shard GenServers directly. This is not a standalone-server durability mode.
 
 1. The Shard writes to ETS immediately via `:ets.insert` so reads see the value at once.
 2. The entry is prepended to an in-memory `pending` list in the GenServer state.
@@ -262,7 +250,7 @@ Sandbox test shards bypass Raft and write through the Shard GenServer directly. 
 
 ### File Rotation
 
-When the active log file exceeds `@max_active_file_size` (256MB), `maybe_rotate_file/1`:
+When the active log file exceeds `@max_active_file_size` (8 GiB by default), `maybe_rotate_file/1`:
 1. Writes a hint file for the current active file (for fast recovery)
 2. Increments the file ID
 3. Creates a new empty log file (e.g., `00001.log`)
@@ -334,29 +322,42 @@ The ra system is named `:ferricstore_raft` and stores its WAL and segment files 
 
 1. Client calls `Batcher.write(shard_index, command)` -- synchronous `GenServer.call`.
 2. The key's namespace prefix is extracted: `"session"` from `"session:abc123"`, `"_root"` for keys without a colon.
-3. Namespace config is looked up from the `ns_cache` process-state map (populated lazily from the `:ferricstore_ns_config` ETS table managed by `NamespaceConfig`). Returns `{window_ms, durability}`.
-4. Commands are buffered in a slot keyed by `{prefix, durability}`. A timer is started on the first write to each slot.
+3. Namespace config is looked up from the `ns_cache` process-state map (populated lazily from the `:ferricstore_ns_config` ETS table managed by `NamespaceConfig`). Returns `window_ms`.
+4. Commands are buffered in a slot keyed by prefix. A timer is started on the first write to each slot.
 5. When the timer fires (or `max_batch_size` of 1000 is reached):
-   - **Quorum**: Single command -> `:ra.process_command(shard_id, command)`. Batch -> `:ra.process_command(shard_id, {:batch, commands})`.
-   - **Async**: `AsyncApplyWorker.apply_batch(shard_index, commands)` -- fire-and-forget cast, callers replied immediately with `:ok`.
+   - Single command -> `:ra.pipeline_command(shard_id, command, corr, :low)`.
+   - Homogeneous hot batch -> `:ra.pipeline_command(shard_id, {:put_batch, entries}, corr, :low)` or `{:delete_batch, keys}` when the router can build the final shape directly.
+   - Mixed batch -> `:ra.pipeline_command(shard_id, {:batch, commands}, corr, :low)`.
 6. When `NamespaceConfig` changes (via `FERRICSTORE.CONFIG SET`), it broadcasts `:ns_config_changed` to all Batchers, which clear their `ns_cache`.
+
+### Specialized Ra Command Terms
+
+FerricStore uses compact Ra command terms for hot homogeneous write paths. The current examples are `{:put_batch, entries}` and `{:delete_batch, keys}`. They reduce allocation, Ra term size, serialization work, and per-command pattern matching compared with sending `{:batch, [{:put, ...}, ...]}` for the same request.
+
+The rule for adding the next specialized term is strict:
+
+1. Only specialize homogeneous write-only commands, or a deterministic bulk operation with identical semantics to the generic path.
+2. Preserve the logical command count separately from the compact term so callers still receive one reply per input command.
+3. Batch Bitcask work once and verify NIF result length/order before publishing public state.
+4. For pure writes, stage disk records only, then publish ETS once after append succeeds.
+5. Do not create temporary pending ETS rows or fill pending read maps unless later commands inside the same Ra entry must read intermediate state.
+6. On append failure, no new public ETS state should remain visible. Tests must cover rollback of overwritten keys and absence of new keys.
+7. Keep a runtime perf toggle while proving a new term, and benchmark it against the generic `{:batch, commands}` path plus any dedicated fast apply path disabled.
+
+The `put_batch` profiling lesson was that the compact wire term was good, but the first apply implementation did too much extra pending-state work. The matching `delete_batch` fast path follows the same rule for tombstones: stage the Bitcask delete records first, then remove ETS rows only after append success. Future terms need both halves: compact Ra shape and compact state-machine apply.
 
 ### State Machine
 
 `Ferricstore.Raft.StateMachine` implements the `:ra_machine` behaviour. Key callbacks:
 
 - **`init/1`**: Receives shard config (paths, ETS table name, active file info). Stores `release_cursor_interval` (default: 1000) in machine state for deterministic cursor emission.
-- **`apply/3`**: Deterministic command application. Supports `:put`, `:delete`, `:batch`, `:list_op`, `:compound_put`, `:compound_delete`, `:compound_delete_prefix`, `:incr_float`, `:append`, `:getset`, `:getdel`, `:getex`, `:setrange`, `:cas`, `:lock`, `:unlock`, `:extend`, `:ratelimit_add`. Each command calls `NIF.v2_append_batch/2` (synchronous write + fsync) and `:ets.insert/2`. Values exceeding `hot_cache_max_value_size` are stored as `nil` in ETS.
+- **`apply/3`**: Deterministic command application. Supports `:put`, `:put_batch`, `:delete`, `:delete_batch`, `:batch`, `:list_op`, `:compound_put`, `:compound_delete`, `:compound_delete_prefix`, `:incr_float`, `:append`, `:getset`, `:getdel`, `:getex`, `:setrange`, `:cas`, `:lock`, `:unlock`, `:extend`, `:ratelimit_add`. Writes are appended to Bitcask before public ETS state is updated. Values exceeding `hot_cache_max_value_size` are stored as `nil` in ETS.
 - **`state_enter/2`**: On becoming leader, calls `HLC.now()` to advance the local clock.
 - **`overview/1`**: Returns debugging info: shard index, keydir size, applied count, cursor interval.
 
 **Log Compaction**: Every `release_cursor_interval` applied commands, `apply/3` emits a `{:release_cursor, ra_index, state}` effect. This tells ra that all log entries up to that index are reflected in the snapshot and can be truncated.
 
 **HLC Piggybacking**: Commands can be wrapped as `{inner_command, %{hlc_ts: {physical_ms, logical}}}`. When `apply/3` processes a wrapped command, it calls `HLC.update/1` to merge the leader's clock into the local node's HLC, keeping followers causally synchronized.
-
-### AsyncApplyWorker
-
-`Ferricstore.Raft.AsyncApplyWorker` is a per-shard GenServer that processes async durability writes. It separates puts from deletes: puts are batched into a single `NIF.v2_append_batch/2` call, deletes are applied individually via `NIF.v2_append_tombstone/2`. After each batch, it emits `[:ferricstore, :async_apply, :batch]` telemetry with duration and batch size.
 
 ## LFU Eviction
 
@@ -591,6 +592,28 @@ Connections support pipelined commands with concurrent dispatch:
 - All "pure" commands (those that don't mutate connection state) in a pipeline batch are dispatched concurrently as `Task`s.
 - Responses are sent in-order: response N is sent as soon as responses 0..N are all complete. Fast commands before a slow command get delivered immediately.
 - Stateful commands (MULTI, AUTH, SUBSCRIBE, blocking ops) act as barriers: all prior concurrent tasks are awaited and flushed before the stateful command executes synchronously.
+
+### RESP Pipeline Write Batching
+
+Phase 1 batches only consecutive RESP pipeline runs of safe single-key writes that already have direct Raft state-machine commands. The connection keeps response order intact, preserves read boundaries, and falls back to the existing command path for anything outside the allowlist.
+
+Included in phase 1:
+
+- Plain `SET`
+- `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT`
+- `APPEND`, `SETRANGE`, `SETBIT`
+- `HINCRBY`, `HINCRBYFLOAT`, `ZINCRBY`
+- `PFADD`
+- JSON mutations: `JSON.SET`, `JSON.DEL`, `JSON.NUMINCRBY`, `JSON.ARRAPPEND`, `JSON.TOGGLE`, `JSON.CLEAR`
+
+Explicitly excluded:
+
+- `GETSET`, `GETDEL`, `GETEX`, and any other write command whose reply depends on returning prior state.
+- Multi-key commands and cross-shard commands.
+- Compound writes without a direct Raft command conversion, including `HSET`, `SADD`, `ZADD`, list/stream mutations, `MSET`, and `DEL`.
+- Commands inside `MULTI` or commands requiring per-command ACL checks.
+
+Phase 2 can expand the allowlist when needed. Good candidates are same-shard `MSET`, same-shard single-entry compound writes (`HSET`, `SADD`, `ZADD`) after exact type/error semantics are audited, and `DEL`/`UNLINK` only if the batched path can preserve Redis integer-delete replies for plain and compound keys.
 
 ### Per-Connection State
 

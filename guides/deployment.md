@@ -17,7 +17,6 @@ Environment variables:
 | `FERRICSTORE_HEALTH_PORT` | `6380` | Health endpoint port |
 | `FERRICSTORE_DATA_DIR` | `/data` | Bitcask + WAL data directory |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards (0 = CPU count) |
-| `FERRICSTORE_DURABILITY` | `quorum` | Default durability (`quorum` or `async`) |
 | `FERRICSTORE_PROTECTED_MODE` | `true` | Reject non-localhost without auth |
 | `FERRICSTORE_NODE_NAME` | none | Erlang node name for clustering |
 | `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie |

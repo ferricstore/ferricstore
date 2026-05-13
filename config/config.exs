@@ -19,11 +19,6 @@ config :ferricstore, :data_dir, "data"
 # Number of shards (0 = auto-detect from CPU cores)
 config :ferricstore, :shard_count, 0
 
-# Raft startup policy:
-#   :always - current behavior, start Raft even for a single node
-#   :manual - start as Bitcask-durable standalone until CLUSTER.ENABLE
-config :ferricstore, :raft_mode, :always
-
 # LFU decay: minutes per decay step (0 = no decay). Matches Redis lfu-decay-time.
 config :ferricstore, :lfu_decay_time, 1
 # LFU log factor: controls probabilistic increment curve. Matches Redis lfu-log-factor.
@@ -34,6 +29,16 @@ config :ferricstore, :lfu_log_factor, 10
 # instead of reading into BEAM memory. Only applies to cold (on-disk) keys
 # over plain TCP (:ranch_tcp); TLS and hot keys always use the normal path.
 config :ferricstore_server, :sendfile_threshold, 65_536
+
+# Large values at or above this size are stored as content-addressed blob files
+# with a small Bitcask reference. A conservative sweeper reclaims unreferenced
+# blob files automatically; the common no-blob tick only scans blob file names,
+# not the full keydir.
+config :ferricstore,
+  blob_side_channel_threshold_bytes: 256 * 1024,
+  blob_gc_sweeper_enabled: true,
+  blob_gc_sweeper_initial_delay_ms: 60_000,
+  blob_gc_sweeper_interval_ms: 600_000
 
 # Node discovery via libcluster.
 # Default: Gossip strategy for local/dev multi-node clusters.

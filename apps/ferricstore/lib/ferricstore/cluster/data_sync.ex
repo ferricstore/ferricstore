@@ -9,6 +9,7 @@ defmodule Ferricstore.Cluster.DataSync do
 
   require Logger
 
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Raft.Cluster, as: RaftCluster
 
   @default_max_retries 3
@@ -72,6 +73,16 @@ defmodule Ferricstore.Cluster.DataSync do
     end
   end
 
+  @doc false
+  def __maybe_require_blob_resync_for_test__(wal_result, leader_has_blob_files?),
+    do: maybe_require_blob_resync(wal_result, leader_has_blob_files?)
+
+  @doc false
+  def __pause_batcher_for_test__(node, shard_index), do: pause_batcher(node, shard_index)
+
+  @doc false
+  def __pause_shard_for_test__(node, shard_name), do: pause_shard(node, shard_name)
+
   @spec needs_resync?(non_neg_integer(), node(), node()) :: :wal_bridgeable | :needs_resync
   def needs_resync?(shard_index, target_node, leader_node) do
     # Check if the TARGET node has data files for this shard.
@@ -124,11 +135,32 @@ defmodule Ferricstore.Cluster.DataSync do
           first_index = Map.get(overview, :first_index, 0)
 
           if target_index >= first_index do
-            Logger.info(
-              "Shard #{shard_index}: WAL bridgeable (target=#{target_index} >= first=#{first_index})"
-            )
+            blob_status = leader_blob_files?(shard_index, leader_node)
+            result = maybe_require_blob_resync(:wal_bridgeable, blob_status)
 
-            :wal_bridgeable
+            case {result, blob_status} do
+              {:wal_bridgeable, _} ->
+                Logger.info(
+                  "Shard #{shard_index}: WAL bridgeable (target=#{target_index} >= first=#{first_index})"
+                )
+
+              {:needs_resync, {:ok, true}} ->
+                Logger.info(
+                  "Shard #{shard_index}: blob side-channel data present on leader, full resync required despite WAL bridgeability"
+                )
+
+              {:needs_resync, {:error, reason}} ->
+                Logger.warning(
+                  "Shard #{shard_index}: could not inspect leader blob side-channel data (#{inspect(reason)}), full resync required despite WAL bridgeability"
+                )
+
+              {:needs_resync, _} ->
+                Logger.info(
+                  "Shard #{shard_index}: full resync required despite WAL bridgeability"
+                )
+            end
+
+            result
           else
             Logger.info(
               "Shard #{shard_index}: WAL gap (target=#{target_index} < first=#{first_index}), needs resync"
@@ -144,6 +176,25 @@ defmodule Ferricstore.Cluster.DataSync do
       Logger.info("Shard #{shard_index}: target #{target_node} has no data, needs full resync")
       :needs_resync
     end
+  end
+
+  defp maybe_require_blob_resync(:wal_bridgeable, {:ok, true}), do: :needs_resync
+  defp maybe_require_blob_resync(:wal_bridgeable, {:ok, false}), do: :wal_bridgeable
+  defp maybe_require_blob_resync(:wal_bridgeable, {:error, _reason}), do: :needs_resync
+  defp maybe_require_blob_resync(result, _leader_has_blob_files?), do: result
+
+  defp leader_blob_files?(shard_index, leader_node) do
+    ctx =
+      if leader_node == node() do
+        FerricStore.Instance.get(:default)
+      else
+        :erpc.call(leader_node, FerricStore.Instance, :get, [:default])
+      end
+
+    blob_path = blob_shard_path(ctx.data_dir, shard_index)
+    remote_tree_regular_file_status(leader_node, blob_path)
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 
   # ---------------------------------------------------------------------------
@@ -326,39 +377,82 @@ defmodule Ferricstore.Cluster.DataSync do
       "Shard #{shard_index}: syncing #{leader_node}:#{leader_shard_data} → #{target_node}:#{target_shard_data}"
     )
 
-    # 1. Pause writes on the LEADER's shard (not local)
-    pause_shard(leader_node, shard_name)
+    # 1. Pause writes on the LEADER (not local). Pause the Batcher first
+    # because optimized pipeline SET/DEL can bypass the Shard GenServer.
+    case pause_batcher(leader_node, shard_index) do
+      :ok ->
+        try do
+          case pause_shard(leader_node, shard_name) do
+            :ok ->
+              try do
+                # 2. Get current Raft index (last_applied, not commit_index) from the
+                #    leader. last_applied tracks what the state machine has actually
+                #    flushed to Bitcask. commit_index can be ahead — entries committed
+                #    but not yet applied would be skipped on the joiner if we used
+                #    commit_index, losing those writes.
+                leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
 
-    try do
-      # 2. Get current Raft index (last_applied, not commit_index) from the
-      #    leader. last_applied tracks what the state machine has actually
-      #    flushed to Bitcask. commit_index can be ahead — entries committed
-      #    but not yet applied would be skipped on the joiner if we used
-      #    commit_index, losing those writes.
-      leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
-      {raft_index, overview_info} = get_raft_index_with_detail(leader_node, leader_server_id)
+                {raft_index, overview_info} =
+                  get_raft_index_with_detail(leader_node, leader_server_id)
 
-      # 3. Copy shard storage from leader to target. This includes the shared
-      # Bitcask shard directory and promoted dedicated collection files.
-      copy_shard_storage_from(
-        leader_node,
-        leader_data_dir,
-        target_node,
-        target_data_dir,
-        shard_index
-      )
+                # 3. Copy shard storage from leader to target. This includes the shared
+                # Bitcask shard directory, promoted dedicated collection files, and
+                # blob side-channel files.
+                copy_shard_storage_from(
+                  leader_node,
+                  leader_data_dir,
+                  target_node,
+                  target_data_dir,
+                  shard_index
+                )
 
-      Logger.info(
-        "Shard #{shard_index}: sync complete at raft last_applied=#{raft_index} #{overview_info}"
-      )
+                Logger.info(
+                  "Shard #{shard_index}: sync complete at raft last_applied=#{raft_index} #{overview_info}"
+                )
 
-      {:ok, raft_index}
-    rescue
-      e -> {:error, Exception.message(e)}
-    after
-      # 5. Always resume writes on the leader
-      resume_shard(leader_node, shard_name)
+                {:ok, raft_index}
+              after
+                resume_shard(leader_node, shard_name)
+              end
+
+            {:error, _reason} = error ->
+              error
+
+            other ->
+              {:error, {:pause_shard_failed, other}}
+          end
+        rescue
+          e -> {:error, Exception.message(e)}
+        after
+          resume_batcher(leader_node, shard_index)
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      other ->
+        {:error, {:pause_batcher_failed, other}}
     end
+  end
+
+  defp pause_batcher(node, shard_index) do
+    if node == node() do
+      Batcher.pause_writes_for_sync(shard_index, 30_000)
+    else
+      :erpc.call(node, Batcher, :pause_writes_for_sync, [shard_index, 30_000], 35_000)
+    end
+  catch
+    kind, reason -> {:error, {:pause_batcher_failed, {kind, reason}}}
+  end
+
+  defp resume_batcher(node, shard_index) do
+    if node == node() do
+      Batcher.resume_writes_for_sync(shard_index, 5_000)
+    else
+      :erpc.call(node, Batcher, :resume_writes_for_sync, [shard_index, 5_000], 10_000)
+    end
+  catch
+    _, _ -> :ok
   end
 
   defp pause_shard(node, shard_name) do
@@ -367,6 +461,8 @@ defmodule Ferricstore.Cluster.DataSync do
     else
       :erpc.call(node, GenServer, :call, [shard_name, {:pause_writes}, 30_000])
     end
+  catch
+    kind, reason -> {:error, {:pause_shard_failed, {kind, reason}}}
   end
 
   defp resume_shard(node, shard_name) do
@@ -504,6 +600,59 @@ defmodule Ferricstore.Cluster.DataSync do
     end
   end
 
+  defp remote_tree_regular_file_status(node, path) do
+    case remote_dir_status(node, path) do
+      {:ok, false} ->
+        {:ok, false}
+
+      {:ok, true} ->
+        case call_on(node, File, :ls, [path]) do
+          {:ok, entries} -> entries_have_regular_files?(node, path, entries)
+          {:error, reason} -> {:error, {:ls_failed, path, reason}}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp entries_have_regular_files?(node, parent, entries) do
+    Enum.reduce_while(entries, {:ok, false}, fn entry, {:ok, false} ->
+      child = Path.join(parent, entry)
+
+      case remote_dir_status(node, child) do
+        {:ok, true} ->
+          case remote_tree_regular_file_status(node, child) do
+            {:ok, true} -> {:halt, {:ok, true}}
+            {:ok, false} -> {:cont, {:ok, false}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+
+        {:ok, false} ->
+          case call_on(node, File, :stat, [child]) do
+            {:ok, %{type: :regular}} -> {:halt, {:ok, true}}
+            {:ok, _other} -> {:cont, {:ok, false}}
+            {:error, reason} -> {:halt, {:error, {:stat_failed, child, reason}}}
+          end
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp remote_dir_status(node, path) do
+    if node == node() do
+      {:ok, Ferricstore.FS.dir?(path)}
+    else
+      {:ok, :erpc.call(node, File, :dir?, [path])}
+    end
+  catch
+    kind, reason -> {:error, {:dir_check_failed, path, kind, reason}}
+  end
+
   # ---------------------------------------------------------------------------
   # Private: directory copy (source_node -> target_node)
   # ---------------------------------------------------------------------------
@@ -547,54 +696,105 @@ defmodule Ferricstore.Cluster.DataSync do
     sync_target_dir!(target_node, target_path, :copy_directory, target_path)
   end
 
-  defp copy_file_from(source_node, source_path, target_node, target_path) do
-    {:ok, source_io} = call_on(source_node, File, :open, [source_path, [:read, :binary]])
-    {:ok, target_io} = call_on(target_node, File, :open, [target_path, [:write, :binary]])
+  @doc false
+  def __prepare_target_file_for_copy__(path) when is_binary(path) do
+    case File.open(path, [:write, :raw, :binary]) do
+      {:ok, io} ->
+        File.close(io)
 
-    try do
-      copy_file_chunks(source_node, source_io, target_node, target_io, source_path, target_path)
-      sync_target_file!(target_node, target_io, target_path)
-    after
-      close_file(source_node, source_io)
-      close_file(target_node, target_io)
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp copy_file_chunks(source_node, source_io, target_node, target_io, source_path, target_path) do
-    case call_on(source_node, IO, :binread, [source_io, @copy_chunk_bytes]) do
+  @doc false
+  def __read_file_chunk_for_copy__(path, offset, bytes)
+      when is_binary(path) and is_integer(offset) and offset >= 0 and is_integer(bytes) and
+             bytes > 0 do
+    with {:ok, io} <- File.open(path, [:read, :raw, :binary]) do
+      try do
+        :file.pread(io, offset, bytes)
+      after
+        File.close(io)
+      end
+    end
+  end
+
+  @doc false
+  def __write_file_chunk_for_copy__(path, offset, chunk)
+      when is_binary(path) and is_integer(offset) and offset >= 0 and is_binary(chunk) do
+    with {:ok, io} <- File.open(path, [:read, :write, :raw, :binary]) do
+      try do
+        :file.pwrite(io, offset, chunk)
+      after
+        File.close(io)
+      end
+    end
+  end
+
+  @doc false
+  def __sync_file_for_copy__(path) when is_binary(path) do
+    with {:ok, io} <- File.open(path, [:read, :write, :raw, :binary]) do
+      try do
+        :file.sync(io)
+      after
+        File.close(io)
+      end
+    end
+  end
+
+  defp copy_file_from(source_node, source_path, target_node, target_path) do
+    :ok =
+      call_on(target_node, __MODULE__, :__prepare_target_file_for_copy__, [target_path])
+
+    copy_file_chunks(source_node, source_path, target_node, target_path, 0)
+    sync_target_file!(target_node, target_path)
+  end
+
+  defp copy_file_chunks(source_node, source_path, target_node, target_path, offset) do
+    case call_on(source_node, __MODULE__, :__read_file_chunk_for_copy__, [
+           source_path,
+           offset,
+           @copy_chunk_bytes
+         ]) do
       :eof ->
         :ok
 
       {:error, reason} ->
         raise File.Error, reason: reason, action: "read", path: source_path
 
+      {:ok, chunk} when is_binary(chunk) ->
+        write_copy_chunk(source_node, source_path, target_node, target_path, offset, chunk)
+
       chunk when is_binary(chunk) ->
-        case call_on(target_node, IO, :binwrite, [target_io, chunk]) do
-          :ok ->
-            observe_copy_chunk(source_path, target_path, byte_size(chunk))
-
-            copy_file_chunks(
-              source_node,
-              source_io,
-              target_node,
-              target_io,
-              source_path,
-              target_path
-            )
-
-          {:error, reason} ->
-            raise File.Error, reason: reason, action: "write", path: target_path
-        end
+        write_copy_chunk(source_node, source_path, target_node, target_path, offset, chunk)
     end
   end
 
-  defp close_file(target_node, io) do
-    _ = call_on(target_node, File, :close, [io])
-    :ok
+  defp write_copy_chunk(source_node, source_path, target_node, target_path, offset, chunk) do
+    case call_on(target_node, __MODULE__, :__write_file_chunk_for_copy__, [
+           target_path,
+           offset,
+           chunk
+         ]) do
+      :ok ->
+        observe_copy_chunk(source_path, target_path, byte_size(chunk))
+
+        copy_file_chunks(
+          source_node,
+          source_path,
+          target_node,
+          target_path,
+          offset + byte_size(chunk)
+        )
+
+      {:error, reason} ->
+        raise File.Error, reason: reason, action: "write", path: target_path
+    end
   end
 
-  defp sync_target_file!(target_node, target_io, target_path) do
-    case target_file_sync(target_node, target_io, target_path) do
+  defp sync_target_file!(target_node, target_path) do
+    case target_file_sync(target_node, target_path) do
       :ok ->
         :ok
 
@@ -606,10 +806,10 @@ defmodule Ferricstore.Cluster.DataSync do
     end
   end
 
-  defp target_file_sync(target_node, target_io, target_path) do
+  defp target_file_sync(target_node, target_path) do
     case Process.get(:ferricstore_data_sync_file_sync_hook) do
       hook when is_function(hook, 1) and target_node == node() -> hook.(target_path)
-      _ -> call_on(target_node, :file, :sync, [target_io])
+      _ -> call_on(target_node, __MODULE__, :__sync_file_for_copy__, [target_path])
     end
   end
 

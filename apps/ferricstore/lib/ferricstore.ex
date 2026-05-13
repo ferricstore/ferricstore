@@ -372,6 +372,19 @@ defmodule FerricStore do
   def flow_create(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
+  Stores a reusable Flow value and returns a `:ref` that can be passed as
+  `:payload_ref` to Flow create/transition commands.
+  """
+  @spec flow_value_put(term(), keyword()) :: {:ok, map()} | {:error, binary()}
+  def flow_value_put(value, opts \\ [])
+
+  def flow_value_put(value, opts) when is_list(opts) do
+    Ferricstore.Flow.value_put(default_ctx(), value, opts)
+  end
+
+  def flow_value_put(_value, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc """
   Creates a durable batch of Flow records.
 
   When `partition_key` is set, the batch is all-or-nothing because every item

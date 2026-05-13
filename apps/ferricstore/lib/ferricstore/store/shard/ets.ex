@@ -2,7 +2,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @moduledoc "ETS keydir operations: lookup, insert, delete, cold-read warming, LFU touch, hot-cache threshold enforcement, and prefix scans."
 
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{ColdRead, LFU, ValueCodec}
+  alias Ferricstore.Store.{BlobRef, BlobValue, ColdRead, ExpiryTracker, LFU, ValueCodec}
 
   @cold_batch_read_timeout_ms 10_000
 
@@ -89,7 +89,7 @@ defmodule Ferricstore.Store.Shard.ETS do
       {:cold, fid, off, _vsize, exp} ->
         p = file_path(state.shard_data_path, fid)
 
-        case read_cold_async(p, off, key) do
+        case read_cold_async(state, p, off, key) do
           {:ok, value} when is_binary(value) ->
             cold_read_warm_ets(state, key, value)
             {:hit, value, exp}
@@ -163,7 +163,8 @@ defmodule Ferricstore.Store.Shard.ETS do
     threshold = hot_cache_threshold(state)
     v = value_for_ets(value, threshold)
     {original_fid, original_vsize} = pending_original_location(key, previous)
-    track_binary_insert(state, key, v)
+    track_binary_insert(state, key, v, previous)
+    ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), expire_at_ms)
 
     :ets.insert(
       state.keydir,
@@ -200,7 +201,9 @@ defmodule Ferricstore.Store.Shard.ETS do
   def ets_insert_with_location(state, key, value, expire_at_ms, file_id, offset, value_size) do
     threshold = hot_cache_threshold(state)
     v = value_for_ets(value, threshold)
-    track_binary_insert(state, key, v)
+    previous = :ets.lookup(state.keydir, key)
+    track_binary_insert(state, key, v, previous)
+    ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), expire_at_ms)
     :ets.insert(state.keydir, {key, v, expire_at_ms, LFU.initial(), file_id, offset, value_size})
   end
 
@@ -239,6 +242,13 @@ defmodule Ferricstore.Store.Shard.ETS do
     else
       value
     end
+  end
+
+  @spec value_for_persisted_ets(binary(), non_neg_integer()) :: binary() | nil
+  @compile {:inline, value_for_persisted_ets: 2}
+  @doc false
+  def value_for_persisted_ets(value, threshold) when is_binary(value) do
+    if BlobRef.ref?(value), do: nil, else: value_for_ets(value, threshold)
   end
 
   @spec to_disk_binary(integer() | float() | binary()) :: binary()
@@ -333,7 +343,7 @@ defmodule Ferricstore.Store.Shard.ETS do
       [{^key, nil, exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         p = file_path(state.shard_data_path, fid)
 
-        case read_cold_async(p, off, key) do
+        case read_cold_async(state, p, off, key) do
           {:ok, value} when is_binary(value) ->
             v = value_for_ets(value, hot_cache_threshold(state))
             track_binary_cold_to_warm(state, key, v)
@@ -363,7 +373,7 @@ defmodule Ferricstore.Store.Shard.ETS do
       [{^key, nil, exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
         p = file_path(state.shard_data_path, fid)
 
-        case read_cold_async(p, off, key) do
+        case read_cold_async(state, p, off, key) do
           {:ok, value} when is_binary(value) ->
             v = value_for_ets(value, hot_cache_threshold(state))
             track_binary_cold_to_warm(state, key, v)
@@ -437,7 +447,7 @@ defmodule Ferricstore.Store.Shard.ETS do
 
           value == nil and
               not (valid_cold_location(fid, off, vsize) or
-                     flow_history_cold_location?(fid, off, vsize)) ->
+                       flow_history_cold_location?(fid, off, vsize)) ->
             maybe_delete_expired_prefix_entry(state, keydir, key)
             {tokens, {cold_entries, cold_count}}
 
@@ -458,7 +468,7 @@ defmodule Ferricstore.Store.Shard.ETS do
     cold_values =
       cold_entries
       |> Enum.reverse()
-      |> prefix_read_cold_batch_async()
+      |> prefix_read_cold_batch_async(state)
       |> List.to_tuple()
 
     Enum.flat_map(tokens, fn
@@ -487,9 +497,9 @@ defmodule Ferricstore.Store.Shard.ETS do
 
   defp flow_history_cold_location?(_file_id, _offset, _value_size), do: false
 
-  defp prefix_read_cold_batch_async([]), do: []
+  defp prefix_read_cold_batch_async([], _state), do: []
 
-  defp prefix_read_cold_batch_async(entries) do
+  defp prefix_read_cold_batch_async(entries, state) do
     locations = Enum.map(entries, fn {_field, key, file_path, off} -> {file_path, off, key} end)
 
     values =
@@ -508,8 +518,14 @@ defmodule Ferricstore.Store.Shard.ETS do
 
     Enum.zip(entries, values)
     |> Enum.map(fn
-      {{field, _key, _file_path, _off}, value} when is_binary(value) -> {field, value}
-      {_entry, _value} -> nil
+      {{field, _key, _file_path, _off}, value} when is_binary(value) ->
+        case materialize_blob_value(state, value) do
+          {:ok, materialized} -> {field, materialized}
+          {:error, _reason} -> nil
+        end
+
+      {_entry, _value} ->
+        nil
     end)
   end
 
@@ -528,9 +544,22 @@ defmodule Ferricstore.Store.Shard.ETS do
     end)
   end
 
-  defp read_cold_async(path, offset, key) do
-    Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_batch_read_timeout_ms)
+  defp read_cold_async(state, path, offset, key) do
+    with {:ok, value} <-
+           Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_batch_read_timeout_ms),
+         {:ok, materialized} <- materialize_blob_value(state, value) do
+      {:ok, materialized}
+    end
   end
+
+  defp materialize_blob_value(%{data_dir: data_dir, index: shard_index} = state, value) do
+    BlobValue.maybe_materialize(data_dir, shard_index, blob_side_channel_threshold(state), value)
+  end
+
+  defp materialize_blob_value(_state, value), do: {:ok, value}
+
+  defp blob_side_channel_threshold(%{instance_ctx: ctx}), do: BlobValue.threshold(ctx)
+  defp blob_side_channel_threshold(_state), do: 0
 
   @spec prefix_count_entries(map() | :ets.tid(), binary()) :: non_neg_integer()
   @doc false
@@ -678,15 +707,16 @@ defmodule Ferricstore.Store.Shard.ETS do
   # Tracks delta for insert (new value replacing possible existing value).
   # Must be called BEFORE :ets.insert so the old value can be read.
   defp track_binary_insert(
-         %{instance_ctx: %{keydir_binary_bytes: ref}, index: idx} = state,
+         %{instance_ctx: %{keydir_binary_bytes: ref}, index: idx},
          key,
-         new_val
+         new_val,
+         previous
        )
        when ref != nil do
     new_bytes = offheap_size(key) + offheap_size(new_val)
 
     old_bytes =
-      case :ets.lookup(state.keydir, key) do
+      case previous do
         [{^key, old_val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(old_val)
         _ -> 0
       end
@@ -695,13 +725,16 @@ defmodule Ferricstore.Store.Shard.ETS do
     if delta != 0, do: :atomics.add(ref, idx + 1, delta)
   end
 
-  defp track_binary_insert(_, _, _), do: :ok
+  defp track_binary_insert(_, _, _, _), do: :ok
 
   # Tracks bytes removed for delete. Must be called BEFORE :ets.delete.
   defp track_binary_delete(%{instance_ctx: %{keydir_binary_bytes: ref}, index: idx} = state, key)
        when ref != nil do
+    previous = :ets.lookup(state.keydir, key)
+    ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), 0)
+
     bytes =
-      case :ets.lookup(state.keydir, key) do
+      case previous do
         [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
         _ -> 0
       end
@@ -712,8 +745,15 @@ defmodule Ferricstore.Store.Shard.ETS do
   defp track_binary_delete(_, _), do: :ok
 
   # Tracks bytes removed for delete when value is already known (avoids extra lookup).
-  defp track_binary_delete(%{instance_ctx: %{keydir_binary_bytes: ref}, index: idx}, key, value)
+  defp track_binary_delete(
+         %{instance_ctx: %{keydir_binary_bytes: ref}, index: idx} = state,
+         key,
+         value
+       )
        when ref != nil do
+    previous = :ets.lookup(state.keydir, key)
+    ExpiryTracker.adjust_for_state(state, ExpiryTracker.entry_expire_at(previous), 0)
+
     bytes = offheap_size(key) + offheap_size(value)
     if bytes > 0, do: :atomics.sub(ref, idx + 1, bytes)
   end

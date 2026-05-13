@@ -399,8 +399,12 @@ defmodule FerricstoreServer.Connection do
          %{require_auth: false, acl_cache: :full_access} = state
        )
        when is_binary(cmd) and is_list(args) do
-    Stats.incr_commands(state.stats_counter)
-    dispatch_parsed(cmd, args, ast, state)
+    if live_requirepass_enabled?() do
+      handle_command_parts(cmd, args, ast, [], %{state | require_auth: true})
+    else
+      Stats.incr_commands(state.stats_counter)
+      dispatch_parsed(cmd, args, ast, state)
+    end
   end
 
   defp handle_command({:command, cmd, args, ast, keys}, state)
@@ -441,7 +445,11 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp requires_auth?(state) do
-    not state.authenticated and state.require_auth
+    not state.authenticated and live_requirepass_enabled?()
+  end
+
+  defp live_requirepass_enabled? do
+    Ferricstore.Config.get_value("requirepass") not in [nil, ""]
   end
 
   defp dispatch_parsed(cmd, args, ast, state) do
@@ -972,7 +980,7 @@ defmodule FerricstoreServer.Connection do
     do: {:continue, Encoder.encode({:error, "ERR unsupported blocking command AST"}), state}
 
   defp ast_store_command?({tag, _})
-       when tag in ~w(get del exists mget mset incr decr strlen getdel getex msetnx ttl pttl persist lpush rpush lpop llen lpushx rpushx hset hdel hmget hgetall hkeys hvals hlen hrandfield hscan httl hpersist hpttl hexpiretime hgetdel sadd srem smembers smismember scard sinter sunion sdiff sdiffstore sinterstore sunionstore sintercard srandmember spop zrem zcard zpopmin zpopmax zrandmember zmscore bitcount bitop type unlink randomkey expiretime pexpiretime object xadd xlen xread xinfo_stream xinfo xgroup xreadgroup json_set json_get json_del json_numincrby json_type json_strlen json_objkeys json_objlen json_arrappend json_arrlen json_toggle json_clear json_mget geoadd geopos geohash pfadd pfcount pfmerge bf_reserve bf_add bf_madd bf_exists bf_mexists bf_card bf_info cf_reserve cf_add cf_addnx cf_del cf_exists cf_mexists cf_count cf_info cms_initbydim cms_initbyprob cms_incrby cms_query cms_merge cms_info topk_reserve topk_add topk_incrby topk_query topk_list topk_count topk_info tdigest_create tdigest_add tdigest_reset tdigest_quantile tdigest_cdf tdigest_rank tdigest_revrank tdigest_byrank tdigest_byrevrank tdigest_trimmed_mean tdigest_min tdigest_max tdigest_info tdigest_merge ping echo dbsize keys flushdb flushall info command select lolwut debug slowlog save bgsave lastsave config module waitaof cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error cluster_health cluster_stats cluster_keyslot cluster_slots cluster_status cluster_join cluster_enable cluster_leave cluster_failover cluster_promote cluster_demote cluster_role ferricstore_hotness ferricstore_config ferricstore_metrics memory publish pubsub flow_create flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_info flow_stuck flow_history)a,
+       when tag in ~w(get del exists mget mset incr decr strlen getdel getex msetnx ttl pttl persist lpush rpush lpop llen lpushx rpushx hset hdel hmget hgetall hkeys hvals hlen hrandfield hscan httl hpersist hpttl hexpiretime hgetdel sadd srem smembers smismember scard sinter sunion sdiff sdiffstore sinterstore sunionstore sintercard srandmember spop zrem zcard zpopmin zpopmax zrandmember zmscore bitcount bitop type unlink randomkey expiretime pexpiretime object xadd xlen xread xinfo_stream xinfo xgroup xreadgroup json_set json_get json_del json_numincrby json_type json_strlen json_objkeys json_objlen json_arrappend json_arrlen json_toggle json_clear json_mget geoadd geopos geohash pfadd pfcount pfmerge bf_reserve bf_add bf_madd bf_exists bf_mexists bf_card bf_info cf_reserve cf_add cf_addnx cf_del cf_exists cf_mexists cf_count cf_info cms_initbydim cms_initbyprob cms_incrby cms_query cms_merge cms_info topk_reserve topk_add topk_incrby topk_query topk_list topk_count topk_info tdigest_create tdigest_add tdigest_reset tdigest_quantile tdigest_cdf tdigest_rank tdigest_revrank tdigest_byrank tdigest_byrevrank tdigest_trimmed_mean tdigest_min tdigest_max tdigest_info tdigest_merge ping echo dbsize keys flushdb flushall info command select lolwut debug slowlog save bgsave lastsave config module waitaof cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error cluster_health cluster_stats cluster_keyslot cluster_slots cluster_status cluster_join cluster_leave cluster_failover cluster_promote cluster_demote cluster_role ferricstore_hotness ferricstore_config ferricstore_metrics memory publish pubsub flow_create flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_info flow_stuck flow_history)a,
        do: true
 
   defp ast_store_command?({tag, _, _})

@@ -93,6 +93,7 @@ defmodule Ferricstore.Raft.Batcher do
 
   alias Ferricstore.ErrorReasons
   alias Ferricstore.NamespaceConfig
+  alias Ferricstore.Raft.BlobCommand
   alias Ferricstore.Raft.CommandClock
   alias Ferricstore.Raft.PerfToggles
 
@@ -100,6 +101,7 @@ defmodule Ferricstore.Raft.Batcher do
   @default_max_batch_bytes 4 * 1024 * 1024
   @default_max_pending_batches 256
   @default_max_pending_bytes 0
+  @sync_pause_error {:error, "ERR shard writes paused for sync"}
 
   # Origin retry tuning (Option R1 from the rejected-retry design). When Ra
   # returns :rejected {:not_leader, hint, corr} for an origin replay batch, the
@@ -123,7 +125,9 @@ defmodule Ferricstore.Raft.Batcher do
 
   @type command ::
           {:put, binary(), binary(), non_neg_integer()}
+          | {:put_blob_ref, binary(), binary(), non_neg_integer()}
           | {:put_batch, [{binary(), binary(), non_neg_integer()}]}
+          | {:put_blob_batch, [{binary(), binary(), non_neg_integer(), :value | :blob_ref}]}
           | {:delete, binary()}
           | {:delete_batch, [binary()]}
           | {:incr, binary(), integer()}
@@ -229,7 +233,11 @@ defmodule Ferricstore.Raft.Batcher do
     # this node may not have locally applied yet. Async callers are not blocked
     # on this, but flush/shutdown barriers must wait so local state-machine
     # side effects are caught up before reporting the shard drained.
-    origin_local_apply_index: 0
+    origin_local_apply_index: 0,
+    # Set by cluster data sync before copying shard storage. The batcher
+    # bypasses the Shard GenServer for optimized pipeline batches, so the
+    # Shard's own writes_paused flag is not enough to freeze a join snapshot.
+    writes_paused: false
   ]
 
   # ---------------------------------------------------------------------------
@@ -285,6 +293,33 @@ defmodule Ferricstore.Raft.Batcher do
           10_000
         )
     end
+  end
+
+  @doc """
+  Pauses user-visible writes for shard data sync and waits for queued writes to drain.
+
+  DataSync copies Bitcask, promoted files, and blob side-channel files as a
+  point-in-time baseline for a joining node. Optimized pipeline batches enter
+  through this batcher directly, bypassing the Shard GenServer's pause flag, so
+  sync must pause both layers before copying.
+  """
+  @spec pause_writes_for_sync(non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def pause_writes_for_sync(shard_index, timeout \\ 30_000) do
+    safe_sync_pause_call(shard_index, :pause_writes_for_sync, timeout)
+  end
+
+  @doc false
+  @spec resume_writes_for_sync(non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def resume_writes_for_sync(shard_index, timeout \\ 5_000) do
+    safe_sync_pause_call(shard_index, :resume_writes_for_sync, timeout)
+  end
+
+  defp safe_sync_pause_call(shard_index, request, timeout) do
+    GenServer.call(batcher_name(shard_index), request, timeout)
+  catch
+    :exit, {:noproc, _} = reason -> {:error, reason}
+    :exit, {:timeout, _} = reason -> {:error, reason}
+    :exit, reason -> {:error, reason}
   end
 
   @doc """
@@ -717,6 +752,23 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @impl true
+  def handle_call(:pause_writes_for_sync, from, state) do
+    new_state =
+      state
+      |> Map.put(:writes_paused, true)
+      |> flush_all_slots()
+
+    if flush_drained?(new_state) do
+      {:reply, :ok, new_state}
+    else
+      {:noreply, %{new_state | flush_waiters: [from | new_state.flush_waiters]}}
+    end
+  end
+
+  def handle_call(:resume_writes_for_sync, _from, state) do
+    {:reply, :ok, %{state | writes_paused: false}}
+  end
+
   def handle_call({:write, command}, from, state) do
     enqueue_write(command, from, state)
   end
@@ -1497,6 +1549,11 @@ defmodule Ferricstore.Raft.Batcher do
     {:noreply, state}
   end
 
+  defp enqueue_write_batch(_cmds, _cmd_count, from, %{writes_paused: true} = state) do
+    reply_from(from, sync_pause_error())
+    {:noreply, state}
+  end
+
   defp enqueue_write_batch(cmds, cmd_count, from, state) do
     if pending_full?(state) do
       reply_from(from, {:error, :overloaded})
@@ -1548,6 +1605,11 @@ defmodule Ferricstore.Raft.Batcher do
   # Returns `{:noreply, state}` -- the caller is replied to later when the
   # batch is flushed and committed.
   @spec enqueue_write(command(), GenServer.from(), %__MODULE__{}) :: {:noreply, %__MODULE__{}}
+  defp enqueue_write(_command, from, %{writes_paused: true} = state) do
+    reply_from(from, sync_pause_error())
+    {:noreply, state}
+  end
+
   defp enqueue_write(command, from, state) do
     if pending_full?(state) do
       reply_from(from, {:error, :overloaded})
@@ -1663,89 +1725,180 @@ defmodule Ferricstore.Raft.Batcher do
   defp pipeline_submit(state, [single_cmd], froms) do
     corr = make_ref()
     started_at = System.monotonic_time()
-    {:ttb, bin} = serialized = CommandClock.to_ttb(single_cmd)
-    priority = raft_pipeline_priority()
-    command_bytes = byte_size(bin)
 
-    submit_result =
-      if pending_bytes_would_exceed?(state, command_bytes) do
-        {:error, :overloaded}
-      else
-        pipeline_command(state.shard_id, serialized, corr, priority)
-      end
+    case prepare_quorum_command(state, single_cmd) do
+      {:ok, prepared_cmd} ->
+        {:ttb, bin} = serialized = CommandClock.to_ttb(prepared_cmd)
+        priority = raft_pipeline_priority()
+        command_bytes = byte_size(bin)
 
-    emit_quorum_submit_telemetry(
-      state,
-      started_at,
-      :single,
-      1,
-      length(froms),
-      command_bytes,
-      command_shape(single_cmd),
-      priority,
-      submit_result
-    )
+        submit_result =
+          if pending_bytes_would_exceed?(state, command_bytes) do
+            {:error, :overloaded}
+          else
+            pipeline_command(state.shard_id, serialized, corr, priority)
+          end
 
-    track_or_reject_quorum_submit(state, corr, froms, :single, submit_result, command_bytes)
+        emit_quorum_submit_telemetry(
+          state,
+          started_at,
+          :single,
+          1,
+          length(froms),
+          command_bytes,
+          command_shape(prepared_cmd),
+          priority,
+          submit_result
+        )
+
+        track_or_reject_quorum_submit(state, corr, froms, :single, submit_result, command_bytes)
+
+      {:error, reason} ->
+        reject_prepared_quorum_command(state, started_at, froms, :single, 1, reason)
+    end
   end
 
   defp pipeline_submit(state, batch, froms) do
     corr = make_ref()
     started_at = System.monotonic_time()
     {command, logical_count} = compact_hot_batch(batch)
-    {:ttb, bin} = serialized = CommandClock.to_ttb(command)
-    priority = raft_pipeline_priority()
-    command_bytes = byte_size(bin)
 
-    submit_result =
-      if pending_bytes_would_exceed?(state, command_bytes) do
-        {:error, :overloaded}
-      else
-        pipeline_command(state.shard_id, serialized, corr, priority)
-      end
+    case prepare_quorum_command(state, command) do
+      {:ok, prepared_command} ->
+        {:ttb, bin} = serialized = CommandClock.to_ttb(prepared_command)
+        priority = raft_pipeline_priority()
+        command_bytes = byte_size(bin)
 
-    emit_quorum_submit_telemetry(
-      state,
-      started_at,
-      :batch,
-      logical_count,
-      length(froms),
-      command_bytes,
-      command_shape(command),
-      priority,
-      submit_result
-    )
+        submit_result =
+          if pending_bytes_would_exceed?(state, command_bytes) do
+            {:error, :overloaded}
+          else
+            pipeline_command(state.shard_id, serialized, corr, priority)
+          end
 
-    track_or_reject_quorum_submit(state, corr, froms, :batch, submit_result, command_bytes)
+        emit_quorum_submit_telemetry(
+          state,
+          started_at,
+          :batch,
+          logical_count,
+          length(froms),
+          command_bytes,
+          command_shape(prepared_command),
+          priority,
+          submit_result
+        )
+
+        track_or_reject_quorum_submit(state, corr, froms, :batch, submit_result, command_bytes)
+
+      {:error, reason} ->
+        reject_prepared_quorum_command(state, started_at, froms, :batch, logical_count, reason)
+    end
   end
 
   defp pipeline_submit_batch_command(state, command, froms, logical_count, command_shape) do
     corr = make_ref()
     started_at = System.monotonic_time()
-    {:ttb, bin} = serialized = CommandClock.to_ttb(command)
-    priority = raft_pipeline_priority()
-    command_bytes = byte_size(bin)
 
-    submit_result =
-      if pending_bytes_would_exceed?(state, command_bytes) do
-        {:error, :overloaded}
-      else
-        pipeline_command(state.shard_id, serialized, corr, priority)
-      end
+    case prepare_quorum_command(state, command) do
+      {:ok, prepared_command} ->
+        {:ttb, bin} = serialized = CommandClock.to_ttb(prepared_command)
+        priority = raft_pipeline_priority()
+        command_bytes = byte_size(bin)
+
+        submit_result =
+          if pending_bytes_would_exceed?(state, command_bytes) do
+            {:error, :overloaded}
+          else
+            pipeline_command(state.shard_id, serialized, corr, priority)
+          end
+
+        emit_quorum_submit_telemetry(
+          state,
+          started_at,
+          :batch,
+          logical_count,
+          length(froms),
+          command_bytes,
+          prepared_command_shape(command_shape, prepared_command),
+          priority,
+          submit_result
+        )
+
+        track_or_reject_quorum_submit(state, corr, froms, :batch, submit_result, command_bytes)
+
+      {:error, reason} ->
+        reject_prepared_quorum_command(state, started_at, froms, :batch, logical_count, reason)
+    end
+  end
+
+  defp prepare_quorum_command(state, command) do
+    case default_instance_ctx() do
+      nil ->
+        {:ok, command}
+
+      ctx ->
+        if BlobCommand.side_channel_candidate?(ctx, command) do
+          BlobCommand.prepare(ctx, state.shard_index, command,
+            single_member?: single_member_raft_group?(state.shard_index)
+          )
+        else
+          {:ok, command}
+        end
+    end
+  end
+
+  defp default_instance_ctx do
+    FerricStore.Instance.get(:default)
+  rescue
+    _ -> nil
+  catch
+    :exit, _ -> nil
+  end
+
+  defp single_member_raft_group?(shard_index) do
+    case Ferricstore.Raft.Cluster.members(shard_index) do
+      {:ok, members, _leader} when is_list(members) -> length(members) == 1
+      _other -> false
+    end
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
+  end
+
+  defp prepared_command_shape(original_shape, prepared_command) do
+    prepared_shape = command_shape(prepared_command)
+
+    if prepared_shape == original_shape do
+      original_shape
+    else
+      prepared_shape
+    end
+  end
+
+  defp reject_prepared_quorum_command(state, started_at, froms, kind, logical_count, reason) do
+    priority = raft_pipeline_priority()
+    submit_result = {:error, reason}
 
     emit_quorum_submit_telemetry(
       state,
       started_at,
-      :batch,
+      kind,
       logical_count,
       length(froms),
-      command_bytes,
-      command_shape,
+      0,
+      :blob_prepare_failed,
       priority,
       submit_result
     )
 
-    track_or_reject_quorum_submit(state, corr, froms, :batch, submit_result, command_bytes)
+    reply_all_froms(froms, {:error, reason})
+
+    Logger.warning(
+      "Batcher shard=#{state.shard_index}: blob side-channel command preparation failed: #{inspect(reason)}"
+    )
+
+    maybe_reply_flush_waiters(state)
   end
 
   # Flush path for commands accumulated via Batcher.origin_submit. The caller
@@ -2072,6 +2225,11 @@ defmodule Ferricstore.Raft.Batcher do
 
   # Enqueue a write that enters through a non-blocking call but must use the
   # quorum slot like every other user-visible write.
+  defp enqueue_write_forced_quorum(_command, from, %{writes_paused: true} = state) do
+    reply_from(from, sync_pause_error())
+    {:noreply, state}
+  end
+
   defp enqueue_write_forced_quorum(command, from, state) do
     if pending_full?(state) do
       reply_from(from, {:error, :overloaded})
@@ -2200,6 +2358,8 @@ defmodule Ferricstore.Raft.Batcher do
 
   defp maybe_add_origin_submit_from(froms, nil), do: froms
   defp maybe_add_origin_submit_from(froms, from), do: [from | froms]
+
+  defp sync_pause_error, do: @sync_pause_error
 
   defp pending_full?(state) do
     map_size(state.pending) >= state.max_pending_batches or

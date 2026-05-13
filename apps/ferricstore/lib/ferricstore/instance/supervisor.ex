@@ -114,7 +114,11 @@ defmodule FerricStore.Instance.Supervisor do
              data_dir: ctx.data_dir,
              shard_count: ctx.shard_count,
              instance_ctx: ctx
-           ]}
+           ]},
+          Supervisor.child_spec(
+            {Ferricstore.Store.BlobGCSweeper, name: :"#{name}.BlobGCSweeper", instance_ctx: ctx},
+            id: :"#{name}.BlobGCSweeper"
+          )
         ]
 
     Supervisor.init(children, strategy: :one_for_one, max_restarts: 20, max_seconds: 10)

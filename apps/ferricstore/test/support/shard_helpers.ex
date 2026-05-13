@@ -117,9 +117,8 @@ defmodule Ferricstore.Test.ShardHelpers do
       Batcher.reset_pending(i)
     end)
 
-    # Batcher.flush now waits for all in-flight async commands (tracked in
+    # Batcher.flush waits for internal origin-replay commands (tracked in
     # `pending` with :origin_no_reply) to apply via ra_event before replying.
-    # AsyncApplyWorker is deprecated — no drain needed.
     Enum.each(0..(shard_count - 1), fn i ->
       try do
         GenServer.call(Batcher.batcher_name(i), :flush, flush_timeout)

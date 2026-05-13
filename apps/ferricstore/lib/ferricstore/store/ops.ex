@@ -12,6 +12,8 @@ defmodule Ferricstore.Store.Ops do
   """
 
   alias Ferricstore.HLC
+  alias Ferricstore.Store.BlobRef
+  alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Router
@@ -158,7 +160,7 @@ defmodule Ferricstore.Store.Ops do
           nil ->
             case ShardETS.ets_lookup(tx.shard_state, key) do
               {:hit, value, _exp} -> stored_value_size(value)
-              {:cold, _fid, _off, vsize, _exp} -> vsize
+              {:cold, fid, off, vsize, _exp} -> local_cold_value_size(tx, key, fid, off, vsize)
               _ -> nil
             end
         end
@@ -1618,9 +1620,25 @@ defmodule Ferricstore.Store.Ops do
         cold_reads
         |> Enum.zip(values)
         |> Enum.reduce(%{}, fn
-          {{index, key, _path, fid, off, vsize, exp}, value}, acc when is_binary(value) ->
-            ShardETS.cold_read_warm_ets(tx.shard_state, key, value, exp, fid, off, vsize)
-            Map.put(acc, index, {value, exp})
+          {{index, key, path, fid, off, vsize, exp}, value}, acc when is_binary(value) ->
+            case local_materialize_blob_value(tx, value) do
+              {:ok, materialized} ->
+                ShardETS.cold_read_warm_ets(
+                  tx.shard_state,
+                  key,
+                  materialized,
+                  exp,
+                  fid,
+                  off,
+                  vsize
+                )
+
+                Map.put(acc, index, {materialized, exp})
+
+              {:error, reason} ->
+                ColdRead.emit_pread_error(path, reason)
+                acc
+            end
 
           {{_index, _key, path, _fid, _off, _vsize, _exp}, {:error, reason}}, acc ->
             ColdRead.emit_pread_error(path, reason)
@@ -1637,6 +1655,35 @@ defmodule Ferricstore.Store.Ops do
       {:error, reason} ->
         emit_local_batch_cold_errors(cold_reads, reason)
         %{}
+    end
+  end
+
+  defp local_materialize_blob_value(tx, value) do
+    BlobValue.maybe_materialize(
+      tx.shard_state.data_dir,
+      tx.shard_index,
+      BlobValue.threshold(tx.instance_ctx),
+      value
+    )
+  end
+
+  defp local_cold_value_size(tx, key, fid, off, vsize) do
+    if BlobValue.threshold(tx.instance_ctx) > 0 and vsize == BlobRef.encoded_size() do
+      path = ShardETS.file_path(tx.shard_state.shard_data_path, fid)
+
+      case ColdRead.pread_at(path, off, key, @cold_read_timeout_ms) do
+        {:ok, value} ->
+          case BlobRef.decode(value) do
+            {:ok, %BlobRef{size: logical_size}} -> logical_size
+            :error -> vsize
+          end
+
+        {:error, reason} ->
+          ColdRead.emit_pread_error(path, reason)
+          vsize
+      end
+    else
+      vsize
     end
   end
 
@@ -1905,8 +1952,28 @@ defmodule Ferricstore.Store.Ops do
 
     case read_cold_async(path, off, compound_key) do
       {:ok, value} ->
-        ShardETS.cold_read_warm_ets(tx.shard_state, compound_key, value, exp, fid, off, vsize)
-        {value, exp}
+        case local_materialize_blob_value(tx, value) do
+          {:ok, materialized} ->
+            ShardETS.cold_read_warm_ets(
+              tx.shard_state,
+              compound_key,
+              materialized,
+              exp,
+              fid,
+              off,
+              vsize
+            )
+
+            {materialized, exp}
+
+          {:error, reason} ->
+            ColdRead.emit_pread_error(path, reason)
+            nil
+        end
+
+      {:error, reason} ->
+        ColdRead.emit_pread_error(path, reason)
+        nil
 
       _ ->
         nil

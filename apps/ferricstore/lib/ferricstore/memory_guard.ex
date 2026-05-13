@@ -627,9 +627,14 @@ defmodule Ferricstore.MemoryGuard do
 
         rss_fn ->
           rss = rss_fn.() || 0
-          limit = state.memory_limit
-          r = if limit > 0, do: rss / limit, else: 0.0
-          {rss, r, classify_pressure(r)}
+
+          if state.max_memory_bytes > 0 do
+            limit = state.memory_limit
+            r = if limit > 0, do: rss / limit, else: 0.0
+            {rss, r, classify_pressure(r)}
+          else
+            {rss, 0.0, :ok}
+          end
       end
 
     # Overall pressure is the worse of keydir-based and RSS-based.

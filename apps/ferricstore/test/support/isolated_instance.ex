@@ -40,6 +40,8 @@ defmodule Ferricstore.Test.IsolatedInstance do
         keydir_max_ram: Keyword.get(opts, :keydir_max_ram, 64 * 1024 * 1024),
         eviction_policy: Keyword.get(opts, :eviction_policy, :volatile_lfu),
         hot_cache_max_value_size: Keyword.get(opts, :hot_cache_max_value_size, 65_536),
+        blob_side_channel_threshold_bytes:
+          Keyword.get(opts, :blob_side_channel_threshold_bytes, 0),
         max_active_file_size: 64 * 1024 * 1024,
         read_sample_rate: Keyword.get(opts, :read_sample_rate, 1),
         lfu_decay_time: 1,

@@ -1,13 +1,6 @@
 import Config
 
 if config_env() == :prod do
-  raft_mode =
-    case System.get_env("FERRICSTORE_RAFT_MODE", "always") do
-      "always" -> :always
-      "manual" -> :manual
-      other -> raise "invalid FERRICSTORE_RAFT_MODE=#{inspect(other)}; expected always or manual"
-    end
-
   # ---------------------------------------------------------------------------
   # Core
   # ---------------------------------------------------------------------------
@@ -16,7 +9,6 @@ if config_env() == :prod do
     port: String.to_integer(System.get_env("FERRICSTORE_PORT", "6379")),
     health_port: String.to_integer(System.get_env("FERRICSTORE_HEALTH_PORT", "6380")),
     data_dir: System.get_env("FERRICSTORE_DATA_DIR", "/data"),
-    raft_mode: raft_mode,
     shard_count:
       (
         count = System.get_env("FERRICSTORE_SHARD_COUNT", "0")
@@ -29,10 +21,21 @@ if config_env() == :prod do
   # ---------------------------------------------------------------------------
   config :ferricstore,
     max_memory_bytes: String.to_integer(System.get_env("FERRICSTORE_MAX_MEMORY", "0")),
+    keydir_max_ram: String.to_integer(System.get_env("FERRICSTORE_KEYDIR_MAX_RAM", "268435456")),
     eviction_policy: System.get_env("FERRICSTORE_EVICTION_POLICY", "volatile_lru"),
     max_value_size: String.to_integer(System.get_env("FERRICSTORE_MAX_VALUE_SIZE", "1048576")),
     hot_cache_max_value_size:
       String.to_integer(System.get_env("FERRICSTORE_HOT_CACHE_MAX_VALUE_SIZE", "65536")),
+    blob_side_channel_threshold_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_BLOB_SIDE_CHANNEL_THRESHOLD_BYTES", "262144")),
+    blob_gc_sweeper_enabled:
+      System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_ENABLED", "true") in ["1", "true", "TRUE"],
+    blob_gc_sweeper_initial_delay_ms:
+      String.to_integer(System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_INITIAL_DELAY_MS", "60000")),
+    blob_gc_sweeper_interval_ms:
+      String.to_integer(System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_INTERVAL_MS", "600000")),
+    max_active_file_size:
+      String.to_integer(System.get_env("FERRICSTORE_MAX_ACTIVE_FILE_SIZE", "8589934592")),
     flow_lmdb_enabled: System.get_env("FERRICSTORE_FLOW_LMDB", "false") in ["1", "true", "TRUE"],
     flow_lmdb_mode:
       System.get_env(
@@ -64,7 +67,7 @@ if config_env() == :prod do
   # ---------------------------------------------------------------------------
   config :ferricstore,
     expiry_sweep_interval_ms:
-      String.to_integer(System.get_env("FERRICSTORE_EXPIRY_SWEEP_INTERVAL_MS", "100")),
+      String.to_integer(System.get_env("FERRICSTORE_EXPIRY_SWEEP_INTERVAL_MS", "5000")),
     expiry_max_keys_per_sweep:
       String.to_integer(System.get_env("FERRICSTORE_EXPIRY_MAX_KEYS_PER_SWEEP", "20"))
 
@@ -158,7 +161,8 @@ if config_env() == :prod do
     supervisor_max_restarts: {
       String.to_integer(System.get_env("FERRICSTORE_MAX_RESTARTS", "20")),
       String.to_integer(System.get_env("FERRICSTORE_MAX_RESTARTS_SECONDS", "10"))
-    }
+    },
+    observability_token: System.get_env("FERRICSTORE_OBSERVABILITY_TOKEN")
 
   # ---------------------------------------------------------------------------
   # Clustering
@@ -172,6 +176,7 @@ if config_env() == :prod do
       node_name: String.to_atom(node_name),
       cookie: String.to_atom(cookie),
       cluster_role: String.to_atom(System.get_env("FERRICSTORE_CLUSTER_ROLE", "voter")),
+      cluster_auto_join: System.get_env("FERRICSTORE_CLUSTER_AUTO_JOIN", "false") == "true",
       cluster_remove_delay_ms:
         String.to_integer(System.get_env("FERRICSTORE_CLUSTER_REMOVE_DELAY_MS", "60000"))
 

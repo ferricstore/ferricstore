@@ -205,6 +205,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
       durable_index: 0,
       requested_index: 0,
       terminal_count_inits: MapSet.new(),
+      lmdb_ready: false,
       flush_interval_ms:
         Application.get_env(
           :ferricstore,
@@ -213,8 +214,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
         ),
       max_ops: Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops, @default_max_ops)
     }
-
-    :ok = Ferricstore.Flow.LMDB.warm(state.path)
 
     durable_index = LMDBReplaySafeIndex.read(state.shard_data_path)
     publish_durable(state.instance_ctx, shard_index, durable_index)
@@ -342,7 +341,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp flush_ops_and_marker(state, ops, started_at) do
     try do
-      with {:ok, ops, state} <- expand_ops(state, ops),
+      with {:ok, state} <- maybe_ensure_lmdb_ready(state, ops),
+           {:ok, ops, state} <- expand_ops(state, ops),
            :ok <- write_ops(state.path, ops),
            :ok <- cache_terminal_counts(state.path, state.terminal_count_cache),
            {:ok, state} <- persist_requested(state, started_at) do
@@ -352,6 +352,18 @@ defmodule Ferricstore.Flow.LMDBWriter do
       end
     catch
       kind, reason -> {:error, {kind, reason}, state}
+    end
+  end
+
+  defp maybe_ensure_lmdb_ready(state, []), do: {:ok, state}
+  defp maybe_ensure_lmdb_ready(state, _ops), do: ensure_lmdb_ready(state)
+
+  defp ensure_lmdb_ready(%{lmdb_ready: true} = state), do: {:ok, state}
+
+  defp ensure_lmdb_ready(state) do
+    case Ferricstore.Flow.LMDB.warm(state.path) do
+      :ok -> {:ok, %{state | lmdb_ready: true}}
+      {:error, reason} -> {:error, reason}
     end
   end
 

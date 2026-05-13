@@ -271,9 +271,10 @@ defmodule Ferricstore.Store.StandaloneTxLog do
 
         if skipped > 0 do
           observe(:corrupt_entry, %{count: skipped}, %{data_dir_hash: :erlang.phash2(data_dir)})
+          {:error, {:corrupt_entries, skipped}}
+        else
+          {:ok, Enum.reverse(entries)}
         end
-
-        {:ok, Enum.reverse(entries)}
 
       {:error, :enoent} ->
         {:ok, []}
@@ -298,10 +299,28 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   end
 
   defp valid_entry?({@magic, :prepare, txid, groups}) when is_binary(txid) and is_list(groups),
-    do: true
+    do: Enum.all?(groups, &valid_group?/1)
 
   defp valid_entry?({@magic, :commit, txid}) when is_binary(txid), do: true
   defp valid_entry?(_other), do: false
+
+  defp valid_group?({file_path, batch}) when is_binary(file_path) and is_list(batch),
+    do: Enum.all?(batch, &valid_batch_op?/1)
+
+  defp valid_group?(_other), do: false
+
+  defp valid_batch_op?({:put, key, value, expire_at_ms})
+       when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and
+              expire_at_ms >= 0,
+       do: true
+
+  defp valid_batch_op?({:put_cold, key, value, expire_at_ms, _lfu})
+       when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and
+              expire_at_ms >= 0,
+       do: true
+
+  defp valid_batch_op?({:delete, key, _prob_path}) when is_binary(key), do: true
+  defp valid_batch_op?(_other), do: false
 
   defp path(data_dir), do: Path.join(data_dir, @file_name)
 

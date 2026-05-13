@@ -9,7 +9,7 @@ defmodule Ferricstore.Cluster.Manager do
 
   ## Modes
 
-    * `:standalone` — no cluster configured, no-op
+    * `:standalone` — no remote cluster configured
     * `:cluster` — cluster_nodes configured, actively managing membership
   """
 
@@ -76,30 +76,6 @@ defmodule Ferricstore.Cluster.Manager do
     GenServer.call(__MODULE__, :leave, 30_000)
   end
 
-  @doc "Promotes a manual standalone node into a one-node Raft cluster."
-  @spec enable_cluster(keyword()) :: :ok | {:error, term()}
-  def enable_cluster(opts \\ []) do
-    GenServer.call(__MODULE__, {:enable_cluster, opts}, 120_000)
-  end
-
-  @doc "Returns promotion/recovery status for CLUSTER.ENABLE."
-  @spec enable_status() :: map()
-  def enable_status do
-    GenServer.call(__MODULE__, :enable_status)
-  end
-
-  @doc "Returns standalone durability repair status."
-  @spec durability_status() :: map()
-  def durability_status do
-    GenServer.call(__MODULE__, :durability_status)
-  end
-
-  @doc "Attempts to resume standalone writes after a fail-closed durability error."
-  @spec resume_standalone_durability() :: :ok | {:error, term()}
-  def resume_standalone_durability do
-    GenServer.call(__MODULE__, :resume_standalone_durability, 120_000)
-  end
-
   # ---------------------------------------------------------------------------
   # GenServer callbacks
   # ---------------------------------------------------------------------------
@@ -144,11 +120,7 @@ defmodule Ferricstore.Cluster.Manager do
       shard_count: Application.get_env(:ferricstore, :shard_count, 4)
     }
 
-    if Ferricstore.ReplicationMode.current() == :enabling do
-      {:ok, state, {:continue, :recover_enable}}
-    else
-      {:ok, state}
-    end
+    {:ok, state}
   end
 
   @impl true
@@ -183,48 +155,6 @@ defmodule Ferricstore.Cluster.Manager do
        shard_sync_status: state.shard_sync_status,
        shards: status
      }, state}
-  end
-
-  def handle_call(:enable_status, _from, state) do
-    {:reply, enable_status_snapshot(state), state}
-  end
-
-  def handle_call(:durability_status, _from, state) do
-    {:reply, durability_status_snapshot(state), state}
-  end
-
-  def handle_call(:resume_standalone_durability, _from, state) do
-    result = do_resume_standalone_durability()
-    {:reply, result, state}
-  end
-
-  def handle_call({:enable_cluster, opts}, _from, state) do
-    dryrun? = Keyword.get(opts, :dryrun, false)
-    resume? = Keyword.get(opts, :resume, false)
-
-    cond do
-      dryrun? ->
-        {:reply, enable_cluster_dryrun(state), state}
-
-      resume? and Ferricstore.ReplicationMode.current() != :enabling ->
-        mode = Ferricstore.ReplicationMode.current()
-        {:reply, {:error, {:no_enable_recovery_needed, mode}}, state}
-
-      true ->
-        case enable_cluster_dryrun(state) do
-          :ok ->
-            case do_enable_cluster(state) do
-              :ok ->
-                {:reply, :ok, %{state | mode: :cluster, sync_status: :synced}}
-
-              {:error, reason} = error ->
-                {:reply, error, Map.put(state, :last_enable_error, reason)}
-            end
-
-          {:error, _reason} = error ->
-            {:reply, error, state}
-        end
-    end
   end
 
   def handle_call({:add_node, target_node, role}, from, state) do
@@ -269,19 +199,6 @@ defmodule Ferricstore.Cluster.Manager do
   def handle_call(:leave, _from, state) do
     result = do_leave(state)
     {:reply, result, %{state | mode: :standalone}}
-  end
-
-  @impl true
-  def handle_continue(:recover_enable, state) do
-    Logger.warning("ClusterManager: recovering interrupted CLUSTER.ENABLE promotion")
-
-    case do_recover_enable_cluster(state) do
-      :ok ->
-        {:noreply, %{state | mode: :cluster, sync_status: :synced}}
-
-      {:error, reason} ->
-        {:noreply, Map.put(state, :last_enable_error, reason)}
-    end
   end
 
   # ---------------------------------------------------------------------------
@@ -339,7 +256,7 @@ defmodule Ferricstore.Cluster.Manager do
       # Check if the remote node's cluster_nodes includes us.
       # IMPORTANT: Only the lowest-named existing node handles the join
       # to prevent multiple nodes racing to join the same new node.
-      true ->
+      auto_join_enabled?() ->
         spawn(fn ->
           try do
             remote_nodes =
@@ -387,6 +304,13 @@ defmodule Ferricstore.Cluster.Manager do
         end)
 
         {:noreply, state}
+
+      true ->
+        Logger.debug(
+          "ClusterManager: ignoring remote-driven auto-join request from #{node}; cluster_auto_join is disabled"
+        )
+
+        {:noreply, state}
     end
   end
 
@@ -422,339 +346,8 @@ defmodule Ferricstore.Cluster.Manager do
     {:noreply, state}
   end
 
-  defp enable_cluster_dryrun(state) do
-    cond do
-      Ferricstore.ReplicationMode.raft?() ->
-        :ok
-
-      Ferricstore.ReplicationMode.current() not in [:standalone, :enabling] ->
-        {:error, {:invalid_replication_mode, Ferricstore.ReplicationMode.current()}}
-
-      not Node.alive?() ->
-        {:error, :node_not_alive}
-
-      state.shard_count < 1 ->
-        {:error, :invalid_shard_count}
-
-      true ->
-        :ok
-    end
-  end
-
-  defp do_enable_cluster(_state) do
-    case Ferricstore.ReplicationMode.current() do
-      :raft -> :ok
-      :enabling -> do_recover_enable_cluster()
-      :standalone -> do_fresh_enable_cluster()
-    end
-  end
-
-  defp do_fresh_enable_cluster do
-    ctx = FerricStore.Instance.get(:default)
-    epoch = System.unique_integer([:positive, :monotonic])
-
-    with :ok <- Ferricstore.ReplicationMode.mark_enabling!(ctx.data_dir, ctx.shard_count, epoch),
-         :ok <- complete_enable_cluster(ctx, epoch) do
-      :ok
-    else
-      {:error, reason} = error ->
-        Logger.error("ClusterManager: CLUSTER.ENABLE failed: #{inspect(reason)}")
-        fail_closed_enable_failure(ctx)
-        error
-
-      other ->
-        Logger.error("ClusterManager: CLUSTER.ENABLE failed: #{inspect(other)}")
-        fail_closed_enable_failure(ctx)
-        {:error, other}
-    end
-  end
-
-  defp do_recover_enable_cluster(_state \\ nil) do
-    ctx = FerricStore.Instance.get(:default)
-    epoch = existing_promotion_epoch(ctx)
-
-    if Node.alive?() do
-      case complete_enable_cluster(ctx, epoch) do
-        :ok ->
-          Logger.info("ClusterManager: interrupted CLUSTER.ENABLE promotion recovered")
-          :ok
-
-        {:error, reason} = error ->
-          Logger.error("ClusterManager: CLUSTER.ENABLE recovery failed: #{inspect(reason)}")
-          fail_closed_enable_failure(ctx)
-          error
-
-        other ->
-          Logger.error("ClusterManager: CLUSTER.ENABLE recovery failed: #{inspect(other)}")
-          fail_closed_enable_failure(ctx)
-          {:error, other}
-      end
-    else
-      Logger.error(
-        "ClusterManager: CLUSTER.ENABLE recovery refused because node has no stable distributed name"
-      )
-
-      fail_closed_enable_failure(ctx)
-      {:error, :node_not_alive}
-    end
-  end
-
-  defp complete_enable_cluster(ctx, epoch) do
-    with :ok <- set_readiness(false),
-         :ok <- pause_all_shards(ctx),
-         :ok <- flush_all_shards(ctx),
-         :ok <- start_local_raft(ctx),
-         :ok <- trigger_elections(ctx.shard_count),
-         {:ok, barrier_indices} <- commit_barriers(ctx.shard_count),
-         :ok <-
-           Ferricstore.ReplicationMode.mark_raft!(
-             ctx.data_dir,
-             ctx.shard_count,
-             epoch,
-             barrier_indices
-           ),
-         :ok <- resume_all_shards(ctx),
-         :ok <- set_readiness(true) do
-      Logger.info("ClusterManager: standalone node promoted to Raft cluster")
-      :ok
-    end
-  end
-
-  defp existing_promotion_epoch(ctx) do
-    case Ferricstore.ReplicationMode.read(ctx.data_dir) do
-      {:ok, %{promotion_epoch: epoch}} when is_integer(epoch) ->
-        epoch
-
-      _ ->
-        System.unique_integer([:positive, :monotonic])
-    end
-  end
-
-  defp fail_closed_enable_failure(ctx) do
-    _ = pause_all_shards_best_effort(ctx)
-    _ = set_readiness(false)
-
-    Logger.error(
-      "ClusterManager: CLUSTER.ENABLE left node fail-closed with writes paused and readiness=false; durable marker remains :enabling"
-    )
-
-    :ok
-  end
-
-  defp set_readiness(value) do
-    Ferricstore.Health.set_ready(value)
-    :ok
-  end
-
-  defp enable_status_snapshot(state) do
-    ctx = default_instance()
-
-    marker =
-      if ctx, do: Ferricstore.ReplicationMode.read(ctx.data_dir), else: {:error, :no_instance}
-
-    %{
-      manager_mode: state.mode,
-      sync_status: state.sync_status,
-      replication_mode: Ferricstore.ReplicationMode.current(),
-      marker: marker,
-      node: node(),
-      node_alive: Node.alive?(),
-      ready: Ferricstore.Health.ready?(),
-      last_enable_error: Map.get(state, :last_enable_error)
-    }
-  end
-
-  defp default_instance do
-    FerricStore.Instance.get(:default)
-  rescue
-    _ -> nil
-  end
-
-  defp durability_status_snapshot(state) do
-    ctx = default_instance()
-    mode = Ferricstore.ReplicationMode.current()
-    shards = if ctx, do: durability_shard_statuses(ctx), else: %{}
-
-    paused_count =
-      Enum.count(shards, fn {_idx, info} -> Map.get(info, :writes_paused) == true end)
-
-    pressure_count =
-      Enum.count(shards, fn {_idx, info} -> Map.get(info, :disk_pressure) == true end)
-
-    error_count =
-      Enum.count(shards, fn {_idx, info} -> Map.get(info, :last_flush_error) != nil end)
-
-    %{
-      manager_mode: state.mode,
-      replication_mode: mode,
-      ready: Ferricstore.Health.ready?(),
-      repair_required: paused_count > 0 or pressure_count > 0 or error_count > 0,
-      paused_shards: paused_count,
-      disk_pressure_shards: pressure_count,
-      error_shards: error_count,
-      shards: shards
-    }
-  end
-
-  defp durability_shard_statuses(%{shard_count: shard_count, shard_names: shard_names} = ctx) do
-    for shard_idx <- 0..(shard_count - 1), into: %{} do
-      shard_status =
-        try do
-          GenServer.call(elem(shard_names, shard_idx), :write_status, 5_000)
-        catch
-          kind, reason -> %{error: {kind, reason}}
-        end
-
-      disk_pressure = Ferricstore.Store.DiskPressure.under_pressure?(ctx, shard_idx)
-
-      {shard_idx, Map.put(shard_status, :disk_pressure, disk_pressure)}
-    end
-  end
-
-  defp do_resume_standalone_durability do
-    case {Ferricstore.ReplicationMode.current(), default_instance()} do
-      {:standalone, ctx} when is_map(ctx) ->
-        with :ok <- flush_all_shards(ctx),
-             :ok <- resume_standalone_shards_after_repair(ctx) do
-          Ferricstore.Health.set_ready(true)
-          :ok
-        end
-
-      {mode, _ctx} ->
-        {:error, {:invalid_replication_mode, mode}}
-    end
-  end
-
-  defp resume_standalone_shards_after_repair(
-         %{shard_count: shard_count, shard_names: shard_names} = ctx
-       ) do
-    Enum.reduce_while(0..(shard_count - 1), :ok, fn shard_idx, :ok ->
-      Ferricstore.Store.DiskPressure.clear(ctx, shard_idx)
-
-      case GenServer.call(elem(shard_names, shard_idx), {:resume_writes}, 5_000) do
-        :ok -> {:cont, :ok}
-        other -> {:halt, {:error, {:resume_shard_failed, shard_idx, other}}}
-      end
-    end)
-  end
-
-  defp pause_all_shards(%{shard_count: shard_count} = ctx) do
-    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
-      case GenServer.call(elem(ctx.shard_names, i), {:pause_writes}, 30_000) do
-        :ok -> {:cont, :ok}
-        other -> {:halt, {:error, {:pause_shard_failed, i, other}}}
-      end
-    end)
-  end
-
-  defp resume_all_shards(%{shard_count: shard_count} = ctx) do
-    Enum.each(0..(shard_count - 1), fn i ->
-      try do
-        GenServer.call(elem(ctx.shard_names, i), {:resume_writes}, 5_000)
-      catch
-        _, _ -> :ok
-      end
-    end)
-
-    :ok
-  end
-
-  defp pause_all_shards_best_effort(%{shard_count: shard_count} = ctx) do
-    Enum.each(0..(shard_count - 1), fn i ->
-      try do
-        GenServer.call(elem(ctx.shard_names, i), {:pause_writes}, 5_000)
-      catch
-        _, _ -> :ok
-      end
-    end)
-
-    :ok
-  end
-
-  defp flush_all_shards(%{shard_count: shard_count} = ctx) do
-    with :ok <- flush_bitcask_writers(ctx),
-         :ok <- sync_shards(ctx, shard_count) do
-      :ok
-    end
-  end
-
-  defp flush_bitcask_writers(%{shard_count: shard_count} = ctx) do
-    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
-      case Ferricstore.Store.BitcaskWriter.flush(ctx, i, 30_000) do
-        :ok -> {:cont, :ok}
-        other -> {:halt, {:error, {:bitcask_writer_flush_failed, i, other}}}
-      end
-    end)
-  end
-
-  defp sync_shards(ctx, shard_count) do
-    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
-      case GenServer.call(elem(ctx.shard_names, i), :flush, 30_000) do
-        :ok -> {:cont, :ok}
-        other -> {:halt, {:error, {:shard_sync_failed, i, other}}}
-      end
-    end)
-  end
-
-  defp start_local_raft(%{data_dir: data_dir, shard_count: shard_count} = ctx) do
-    with :ok <- Ferricstore.Raft.Cluster.start_system(data_dir),
-         :ok <- start_batchers(shard_count),
-         :ok <- start_shard_raft(ctx) do
-      :ok
-    end
-  end
-
-  defp start_batchers(shard_count) do
-    Enum.reduce_while(Ferricstore.Application.raft_batcher_children(shard_count), :ok, fn spec,
-                                                                                          :ok ->
-      case Supervisor.start_child(Ferricstore.Supervisor, spec) do
-        {:ok, _pid} -> {:cont, :ok}
-        {:ok, _pid, _info} -> {:cont, :ok}
-        {:error, {:already_started, _pid}} -> {:cont, :ok}
-        {:error, :already_present} -> {:cont, :ok}
-        other -> {:halt, {:error, {:batcher_start_failed, spec.id, other}}}
-      end
-    end)
-  end
-
-  defp start_shard_raft(%{shard_count: shard_count} = ctx) do
-    Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
-      case GenServer.call(elem(ctx.shard_names, i), :start_raft, 30_000) do
-        :ok -> {:cont, :ok}
-        other -> {:halt, {:error, {:shard_raft_start_failed, i, other}}}
-      end
-    end)
-  end
-
-  defp trigger_elections(shard_count) do
-    case Ferricstore.Raft.Cluster.trigger_shard_elections_parallel(shard_count) do
-      :ok -> :ok
-      {:error, reason} -> {:error, {:raft_election_failed, reason}}
-    end
-  end
-
-  defp commit_barriers(shard_count) do
-    Enum.reduce_while(0..(shard_count - 1), {:ok, %{}}, fn i, {:ok, acc} ->
-      case Ferricstore.Raft.Batcher.write(i, {:batch, []}) do
-        {:ok, []} ->
-          case raft_last_applied(i) do
-            {:ok, index} -> {:cont, {:ok, Map.put(acc, i, index)}}
-            {:error, reason} -> {:halt, {:error, {:barrier_index_failed, i, reason}}}
-          end
-
-        other ->
-          {:halt, {:error, {:barrier_failed, i, other}}}
-      end
-    end)
-  end
-
-  defp raft_last_applied(shard_index) do
-    server_id = Ferricstore.Raft.Cluster.shard_server_id(shard_index)
-
-    case :ra.member_overview(server_id) do
-      {:ok, overview, _} -> {:ok, Map.get(overview, :last_applied, 0)}
-      other -> {:error, other}
-    end
+  defp auto_join_enabled? do
+    Application.get_env(:ferricstore, :cluster_auto_join, false) == true
   end
 
   # ---------------------------------------------------------------------------
@@ -1306,9 +899,15 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   defp validate_target_data_identity(_target_node, _ctx, false, _replace?), do: :ok
-  defp validate_target_data_identity(_target_node, _ctx, true, true), do: :ok
 
-  defp validate_target_data_identity(target_node, ctx, true, false) do
+  defp validate_target_data_identity(target_node, ctx, true, true) do
+    local_state = Ferricstore.ReplicationMode.read(ctx.data_dir)
+    target_state = read_target_cluster_state(target_node)
+
+    JoinIdentity.validate(local_state, target_state, target_node)
+  end
+
+  defp validate_target_data_identity(target_node, ctx, true, _replace?) do
     local_state = Ferricstore.ReplicationMode.read(ctx.data_dir)
     target_state = read_target_cluster_state(target_node)
 

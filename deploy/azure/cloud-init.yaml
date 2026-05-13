@@ -17,6 +17,7 @@ packages:
   - libncurses-dev
   - cpufrequtils
   - nvme-cli
+  - xfsprogs
 
 write_files:
   # OS tuning for FerricStore
@@ -72,7 +73,6 @@ write_files:
       +A 128
       +MHas aoffcbf
       +MBas aoffcbf
-    owner: "${admin_username}:${admin_username}"
 
   # FerricStore systemd service
   - path: /etc/systemd/system/ferricstore.service
@@ -89,6 +89,8 @@ write_files:
       Environment=FERRICSTORE_PORT=${ferricstore_port}
       Environment=FERRICSTORE_DATA_DIR=/data/ferricstore
       Environment=FERRICSTORE_SHARD_COUNT=${shard_count}
+      Environment=FERRICSTORE_PROTECTED_MODE=false
+      Environment=PATH=/home/${admin_username}/.asdf/shims:/home/${admin_username}/.asdf/bin:/home/${admin_username}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       Environment=ERL_FLAGS="+sbt db +sbwt very_short +swt very_low +K true +A 128 +P 5000000 +Q 65536 +MHas aoffcbf +MBas aoffcbf"
       ExecStart=/home/${admin_username}/.asdf/shims/elixir --sname ferricstore --cookie ferricstore_bench -S mix run --no-halt
       Restart=on-failure
@@ -101,7 +103,6 @@ write_files:
   # Setup script
   - path: /home/${admin_username}/setup.sh
     permissions: "0755"
-    owner: "${admin_username}:${admin_username}"
     content: |
       #!/bin/bash
       set -euo pipefail
@@ -138,9 +139,9 @@ write_files:
       fi
       cd "$HOME/ferricstore"
       git fetch origin
-      git checkout perf/write-throughput-optimization
-      git pull origin perf/write-throughput-optimization
-      export FERRICSTORE_BUILD_NIF=1
+      git checkout ${git_branch}
+      git pull --ff-only origin ${git_branch}
+      export FERRICSTORE_BUILD=1
       mix local.hex --force
       mix local.rebar --force
       mix deps.get
@@ -161,27 +162,77 @@ runcmd:
   # CPU governor
   - cpufreq-set -g performance 2>/dev/null || true
 
-  # Format and mount local NVMe (L-series VMs)
+  # Format and mount the local NVMe data disk (L-series VMs).
+  #
+  # Azure exposes the OS managed disk and the local data NVMe as /dev/nvme*n1.
+  # Do not pick "head -1": on prior benchmark VMs that selected the OS disk,
+  # leaving FerricStore on slow managed storage. Pick an unmounted disk with no
+  # root/boot mountpoints, format it, then verify /data is really mounted before
+  # the service can start.
   - |
-    NVME_DEV=$(ls /dev/nvme*n1 2>/dev/null | head -1)
-    if [ -n "$NVME_DEV" ]; then
-      mkfs.ext4 -F "$NVME_DEV"
-      mkdir -p /data
-      mount "$NVME_DEV" /data
-      echo "$NVME_DEV /data ext4 defaults,noatime,nodiratime 0 0" >> /etc/fstab
-      mkdir -p /data/ferricstore
-      chown ${admin_username}:${admin_username} /data/ferricstore
+    find_data_disk() {
+      for dev in $(lsblk -dnpo NAME,TYPE | awk '$2 == "disk" {print $1}' | sort); do
+        case "$dev" in
+          /dev/loop*|/dev/ram*) continue ;;
+        esac
 
-      # NVMe scheduler
-      NVME_NAME=$(basename "$NVME_DEV" | sed 's/n1//')
-      echo none > "/sys/block/$NVME_NAME/queue/scheduler" 2>/dev/null || true
-      echo 1024 > "/sys/block/$NVME_NAME/queue/nr_requests" 2>/dev/null || true
-    else
-      mkdir -p /data/ferricstore
-      chown ${admin_username}:${admin_username} /data/ferricstore
+        # Skip any disk that already backs root, boot, or an existing mount.
+        if lsblk -nrpo MOUNTPOINTS "$dev" | grep -Eq '(^|[[:space:]])/($|[[:space:]])|/boot|/mnt|/data'; then
+          continue
+        fi
+
+        # Prefer NVMe local disks on L-series. If Azure changes naming, this
+        # still stays fail-closed rather than formatting the OS disk.
+        case "$(basename "$dev")" in
+          nvme*)
+            echo "$dev"
+            return 0
+            ;;
+        esac
+      done
+
+      return 1
+    }
+
+    DATA_DEV="$(find_data_disk || true)"
+    if [ -z "$DATA_DEV" ]; then
+      echo "ERROR: no unmounted local NVMe data disk found; refusing to put FerricStore on OS disk" >&2
+      lsblk -f >&2
+      exit 1
     fi
 
+    mkdir -p /data
+
+    case "${data_filesystem}" in
+      xfs)
+        mkfs.xfs -f "$DATA_DEV"
+        mount -o noatime,nodiratime "$DATA_DEV" /data
+        echo "$DATA_DEV /data xfs defaults,noatime,nodiratime 0 0" >> /etc/fstab
+        ;;
+      ext4)
+        mkfs.ext4 -F "$DATA_DEV"
+        mount -o noatime,nodiratime "$DATA_DEV" /data
+        echo "$DATA_DEV /data ext4 defaults,noatime,nodiratime 0 0" >> /etc/fstab
+        ;;
+      *)
+        echo "ERROR: unsupported data filesystem ${data_filesystem}" >&2
+        exit 1
+        ;;
+    esac
+
+    findmnt -no SOURCE,FSTYPE,TARGET /data | tee /var/log/ferricstore-data-mount.log
+    mountpoint -q /data
+
+    mkdir -p /data/ferricstore
+    chown ${admin_username}:${admin_username} /data/ferricstore
+
+    DATA_NAME=$(basename "$DATA_DEV")
+    echo none > "/sys/block/$DATA_NAME/queue/scheduler" 2>/dev/null || true
+    echo 1024 > "/sys/block/$DATA_NAME/queue/nr_requests" 2>/dev/null || true
+
   # Run setup as the admin user
+  - chown -R ${admin_username}:${admin_username} /home/${admin_username}
+  - chown ${admin_username}:${admin_username} /home/${admin_username}/vm.args /home/${admin_username}/setup.sh
   - su - ${admin_username} -c "/home/${admin_username}/setup.sh"
 
   # Enable service (don't start — user starts manually after verifying)

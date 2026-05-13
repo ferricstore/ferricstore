@@ -1561,6 +1561,7 @@ enum CommandAstKind {
     TdigestMerge,
     FlowCreate,
     FlowCreateMany,
+    FlowValuePut,
     FlowSpawnChildren,
     FlowGet,
     FlowPolicySet,
@@ -1811,6 +1812,7 @@ fn classify_command_ast(cmd: &[u8], arity: usize) -> CommandAstKind {
         b"TDIGEST.MERGE" => CommandAstKind::TdigestMerge,
         b"FLOW.CREATE" => CommandAstKind::FlowCreate,
         b"FLOW.CREATE_MANY" => CommandAstKind::FlowCreateMany,
+        b"FLOW.VALUE.PUT" => CommandAstKind::FlowValuePut,
         b"FLOW.SPAWN_CHILDREN" => CommandAstKind::FlowSpawnChildren,
         b"FLOW.GET" => CommandAstKind::FlowGet,
         b"FLOW.POLICY.SET" => CommandAstKind::FlowPolicySet,
@@ -2258,6 +2260,7 @@ fn make_command_ast<'a>(
         CommandAstKind::TdigestMerge => make_tdigest_merge_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCreate => make_flow_create_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowCreateMany => make_flow_create_many_command_ast(env, args, arg_bytes),
+        CommandAstKind::FlowValuePut => make_flow_value_put_command_ast(env, args, arg_bytes),
         CommandAstKind::FlowSpawnChildren => {
             make_flow_spawn_children_command_ast(env, args, arg_bytes)
         }
@@ -5164,6 +5167,22 @@ fn make_flow_create_command_ast<'a>(
     }
 }
 
+fn make_flow_value_put_command_ast<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+) -> Term<'a> {
+    let tag = atom(env, "flow_value_put");
+    if args.is_empty() || args.len() % 2 == 0 {
+        return (tag, wrong_number_error(env, b"flow.value.put")).encode(env);
+    }
+
+    match parse_flow_options(env, args, arg_bytes, 1, flow_value_put_option) {
+        Ok(opts) => (tag, args[0], opts).encode(env),
+        Err(err) => (tag, args[0], err).encode(env),
+    }
+}
+
 fn make_flow_create_many_command_ast<'a>(
     env: Env<'a>,
     args: &[Term<'a>],
@@ -5185,7 +5204,13 @@ fn make_flow_create_many_command_ast<'a>(
             .encode(env);
     };
 
-    let item_width = if mixed { 3 } else { 2 };
+    let shared_payload_ref = flow_has_option_until(arg_bytes, 1, items_idx, b"PAYLOAD_REF");
+    let item_width = match (mixed, shared_payload_ref) {
+        (true, true) => 2,
+        (true, false) => 3,
+        (false, true) => 1,
+        (false, false) => 2,
+    };
     if items_idx == args.len() - 1 || (args.len() - items_idx - 1) % item_width != 0 {
         return (tag, args[0], generic_ast_error(env, b"ERR syntax error")).encode(env);
     }
@@ -5200,11 +5225,13 @@ fn make_flow_create_many_command_ast<'a>(
     let mut idx = items_idx + 1;
     while idx < args.len() {
         if mixed {
-            let item_opts = vec![
-                (atom(env, "partition_key"), args[idx + 1]).encode(env),
-                (atom(env, "payload"), args[idx + 2]).encode(env),
-            ];
+            let mut item_opts = vec![(atom(env, "partition_key"), args[idx + 1]).encode(env)];
+            if !shared_payload_ref {
+                item_opts.push((atom(env, "payload"), args[idx + 2]).encode(env));
+            }
             items.push((args[idx], item_opts).encode(env));
+        } else if shared_payload_ref {
+            items.push(args[idx]);
         } else {
             items.push(
                 (
@@ -6275,6 +6302,17 @@ fn flow_has_option(arg_bytes: &[&[u8]], start: usize, name: &[u8]) -> bool {
     false
 }
 
+fn flow_has_option_until(arg_bytes: &[&[u8]], start: usize, end: usize, name: &[u8]) -> bool {
+    let mut idx = start;
+    while idx < end {
+        if ascii_eq_ignore_case(arg_bytes[idx], name) {
+            return true;
+        }
+        idx += 2;
+    }
+    false
+}
+
 #[derive(Clone, Copy)]
 enum FlowOptType<'a> {
     Binary,
@@ -6300,6 +6338,7 @@ fn flow_create_option<'a>(
             (b"TYPE", "type", FlowOptType::Binary),
             (b"STATE", "state", FlowOptType::Binary),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
+            (b"PAYLOAD_REF", "payload_ref", FlowOptType::Ref(b"payload_ref")),
             (
                 b"PARENT_FLOW_ID",
                 "parent_flow_id",
@@ -6340,6 +6379,31 @@ fn flow_create_option<'a>(
                 FlowOptType::Positive(b"history_max_events"),
             ),
             (b"IDEMPOTENT", "idempotent", FlowOptType::Boolean),
+        ],
+    )
+}
+
+fn flow_value_put_option<'a>(
+    env: Env<'a>,
+    args: &[Term<'a>],
+    arg_bytes: &[&[u8]],
+    idx: usize,
+) -> Result<Option<Term<'a>>, Term<'a>> {
+    flow_option(
+        env,
+        args,
+        arg_bytes,
+        idx,
+        &[
+            (b"PARTITION", "partition_key", FlowOptType::Partition),
+            (
+                b"OWNER_FLOW_ID",
+                "owner_flow_id",
+                FlowOptType::Ref(b"owner_flow_id"),
+            ),
+            (b"TTL", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
+            (b"TTL_MS", "ttl_ms", FlowOptType::Positive(b"ttl_ms")),
+            (b"NOW", "now_ms", FlowOptType::NonNegative),
         ],
     )
 }
@@ -6746,6 +6810,7 @@ fn flow_transition_option<'a>(
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
+            (b"PAYLOAD_REF", "payload_ref", FlowOptType::Ref(b"payload_ref")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
             (b"PARTITION", "partition_key", FlowOptType::Partition),
         ],
@@ -6830,6 +6895,7 @@ fn flow_transition_many_option<'a>(
             (b"RUN_AT", "run_at_ms", FlowOptType::NonNegative),
             (b"PRIORITY", "priority", FlowOptType::NonNegative),
             (b"PAYLOAD", "payload", FlowOptType::Binary),
+            (b"PAYLOAD_REF", "payload_ref", FlowOptType::Ref(b"payload_ref")),
             (b"NOW", "now_ms", FlowOptType::NonNegative),
         ],
     )
@@ -7565,6 +7631,7 @@ fn command_key_indices(cmd: &[u8], arg_bytes: &[&[u8]]) -> Vec<usize> {
         b"TDIGEST.MERGE" => counted_key_indices_with_destination(arg_bytes, 1, 2),
         b"RATELIMIT.ADD" => vec![0],
         b"FLOW.CREATE_MANY" => flow_create_many_key_indices(arg_bytes),
+        b"FLOW.VALUE.PUT" => flow_partition_key_indices(arg_bytes, 1),
         b"FLOW.SPAWN_CHILDREN" => flow_spawn_children_key_indices(arg_bytes),
         b"FLOW.COMPLETE_MANY" => flow_complete_many_key_indices(arg_bytes),
         b"FLOW.RETRY_MANY" => flow_retry_many_key_indices(arg_bytes),
@@ -7826,11 +7893,13 @@ fn flow_create_many_key_indices(arg_bytes: &[&[u8]]) -> Vec<usize> {
         return vec![0];
     };
 
+    let shared_payload_ref = flow_has_option_until(arg_bytes, 1, items_idx, b"PAYLOAD_REF");
+    let item_width = if shared_payload_ref { 2 } else { 3 };
     let mut keys = Vec::new();
     let mut idx = items_idx + 1;
-    while idx + 2 < arg_bytes.len() {
+    while idx + item_width - 1 < arg_bytes.len() {
         keys.push(idx + 1);
-        idx += 3;
+        idx += item_width;
     }
     keys
 }
@@ -8251,8 +8320,6 @@ fn command_tag_name(cmd: &[u8]) -> Option<&'static str> {
         b"CLUSTER.SLOTS" => Some("cluster_slots"),
         b"CLUSTER.STATUS" => Some("cluster_status"),
         b"CLUSTER.JOIN" => Some("cluster_join"),
-        b"CLUSTER.ENABLE" => Some("cluster_enable"),
-        b"CLUSTER.DURABILITY" => Some("cluster_durability"),
         b"CLUSTER.LEAVE" => Some("cluster_leave"),
         b"CLUSTER.FAILOVER" => Some("cluster_failover"),
         b"CLUSTER.PROMOTE" => Some("cluster_promote"),
@@ -8261,6 +8328,7 @@ fn command_tag_name(cmd: &[u8]) -> Option<&'static str> {
         b"FERRICSTORE.HOTNESS" => Some("ferricstore_hotness"),
         b"FERRICSTORE.CONFIG" => Some("ferricstore_config"),
         b"FERRICSTORE.METRICS" => Some("ferricstore_metrics"),
+        b"FERRICSTORE.BLOBGC" => Some("ferricstore_blobgc"),
         b"FERRICSTORE.KEY_INFO" => Some("ferricstore_key_info"),
         b"MEMORY" => Some("memory"),
         b"HELLO" => Some("hello"),
@@ -9323,11 +9391,12 @@ mod tests {
         assert_eq!(command_tag_name(b"BF.ADD"), Some("bf_add"));
         assert_eq!(command_tag_name(b"TDIGEST.MERGE"), Some("tdigest_merge"));
         assert_eq!(command_tag_name(b"CLUSTER.HEALTH"), Some("cluster_health"));
-        assert_eq!(command_tag_name(b"CLUSTER.ENABLE"), Some("cluster_enable"));
         assert_eq!(
-            command_tag_name(b"CLUSTER.DURABILITY"),
-            Some("cluster_durability")
+            command_tag_name(b"FERRICSTORE.BLOBGC"),
+            Some("ferricstore_blobgc")
         );
+        assert_eq!(command_tag_name(b"CLUSTER.ENABLE"), None);
+        assert_eq!(command_tag_name(b"CLUSTER.DURABILITY"), None);
         assert_eq!(command_tag_name(b"NO_SUCH_COMMAND"), None);
     }
 
@@ -9477,6 +9546,10 @@ mod tests {
         assert_eq!(
             classify_command_ast(b"FLOW.CREATE_MANY", 0),
             CommandAstKind::FlowCreateMany
+        );
+        assert_eq!(
+            classify_command_ast(b"FLOW.VALUE.PUT", 0),
+            CommandAstKind::FlowValuePut
         );
         assert_eq!(
             classify_command_ast(b"FLOW.SPAWN_CHILDREN", 0),

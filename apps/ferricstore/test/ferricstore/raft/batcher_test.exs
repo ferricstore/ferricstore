@@ -78,6 +78,20 @@ defmodule Ferricstore.Raft.BatcherTest do
       assert {:error, [{^shard_index, {:flush_exit, {:timeout, _call}}}]} =
                Batcher.flush_all(shard_index + 1, 1)
     end
+
+    test "sync pause reports missing batcher as an error tuple" do
+      shard_index = 65
+      name = Batcher.batcher_name(shard_index)
+
+      if existing = Process.whereis(name) do
+        flunk(
+          "unexpected Batcher already registered for shard #{shard_index}: #{inspect(existing)}"
+        )
+      end
+
+      assert {:error, {:noproc, _}} = Batcher.pause_writes_for_sync(shard_index, 10)
+      assert {:error, {:noproc, _}} = Batcher.resume_writes_for_sync(shard_index, 10)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -85,6 +99,47 @@ defmodule Ferricstore.Raft.BatcherTest do
   # ---------------------------------------------------------------------------
 
   describe "single writes through batcher" do
+    test "sync pause rejects direct batcher writes until resumed" do
+      k = ukey("sync_pause")
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
+
+      assert :ok = Batcher.pause_writes_for_sync(shard_index)
+
+      on_exit(fn ->
+        _ = Batcher.resume_writes_for_sync(shard_index)
+      end)
+
+      assert {:error, "ERR shard writes paused for sync"} =
+               Batcher.write(shard_index, {:put, k, "blocked", 0})
+
+      ref = make_ref()
+      assert :ok = Batcher.write_put_batch(shard_index, [{k, "blocked", 0}], {self(), ref})
+      assert_receive {^ref, {:error, "ERR shard writes paused for sync"}}, 1_000
+
+      assert :ok = Batcher.resume_writes_for_sync(shard_index)
+      assert :ok = Batcher.write(shard_index, {:put, k, "allowed", 0})
+      assert "allowed" == Router.get(FerricStore.Instance.get(:default), k)
+    end
+
+    test "sync pause drains queued direct batches before returning" do
+      k = ukey("sync_pause_drain")
+      ctx = FerricStore.Instance.get(:default)
+      shard_index = Router.shard_for(ctx, k)
+      ref = make_ref()
+
+      assert :ok = Batcher.write_put_batch(shard_index, [{k, "queued", 0}], {self(), ref})
+      assert :ok = Batcher.pause_writes_for_sync(shard_index)
+
+      on_exit(fn ->
+        _ = Batcher.resume_writes_for_sync(shard_index)
+      end)
+
+      assert_receive {^ref, {:ok, [:ok]}}, 1_000
+      assert "queued" == Router.get(ctx, k)
+
+      assert :ok = Batcher.resume_writes_for_sync(shard_index)
+    end
+
     test "write put command succeeds" do
       k = ukey("single_put")
       shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
@@ -120,6 +175,73 @@ defmodule Ferricstore.Raft.BatcherTest do
 
       :ok = Batcher.write(shard_index, {:delete, k})
       assert nil == Router.get(FerricStore.Instance.get(:default), k)
+    end
+
+    test "large one-node Raft puts submit a blob ref instead of the payload" do
+      original_ctx = FerricStore.Instance.get(:default)
+
+      ctx = %{
+        original_ctx
+        | blob_side_channel_threshold_bytes: 128,
+          hot_cache_max_value_size: 64
+      }
+
+      :persistent_term.put({FerricStore.Instance, :default}, ctx)
+
+      on_exit(fn ->
+        :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
+      end)
+
+      k = ukey("blob_ref_only")
+      payload = :binary.copy("B", 1024)
+      shard_index = Router.shard_for(ctx, k)
+
+      assert :ok = Batcher.write(shard_index, {:put, k, payload, 0})
+      assert payload == Router.get(ctx, k)
+
+      assert {:cold_ref, path, 0, 1024} = Router.get_with_file_ref(ctx, k)
+      assert String.contains?(path, "/blob/shard_#{shard_index}/")
+    end
+
+    test "large one-node Raft put batches submit blob refs instead of payloads" do
+      original_ctx = FerricStore.Instance.get(:default)
+
+      ctx = %{
+        original_ctx
+        | blob_side_channel_threshold_bytes: 128,
+          hot_cache_max_value_size: 64
+      }
+
+      :persistent_term.put({FerricStore.Instance, :default}, ctx)
+
+      on_exit(fn ->
+        :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
+      end)
+
+      k1 = ukey("blob_ref_batch_small")
+      payload = :binary.copy("C", 1024)
+      shard_index = Router.shard_for(ctx, k1)
+
+      # Keep the batch on one shard so it exercises the direct put_batch path.
+      k2 =
+        Stream.repeatedly(fn -> ukey("blob_ref_batch_large") end)
+        |> Enum.find(&(Router.shard_for(ctx, &1) == shard_index))
+
+      ref = make_ref()
+
+      assert :ok =
+               Batcher.write_put_batch(
+                 shard_index,
+                 [{k1, "small", 0}, {k2, payload, 0}],
+                 {self(), ref}
+               )
+
+      assert_receive {^ref, {:ok, [:ok, :ok]}}, 5_000
+      assert "small" == Router.get(ctx, k1)
+      assert payload == Router.get(ctx, k2)
+
+      assert {:cold_ref, path, 0, 1024} = Router.get_with_file_ref(ctx, k2)
+      assert String.contains?(path, "/blob/shard_#{shard_index}/")
     end
   end
 

@@ -73,11 +73,11 @@ cache:product:3
 
 When keys span multiple shards, FerricStore uses a mini-percolator protocol: lock keys in shard order, write intent, execute, unlock. This is correct but slower than single-shard operations because it requires multiple Raft round-trips.
 
-If keys span shards and the namespace uses async durability, FerricStore returns a `CROSSSLOT` error with guidance:
+Some Redis-compatible multi-key commands require all keys to live on one shard. If keys span shards for one of those commands, FerricStore returns a `CROSSSLOT` error with guidance:
 
 ```
 CROSSSLOT Keys in request don't hash to the same slot.
-Use hash tags {tag} to colocate keys, or switch namespace to quorum durability.
+Use hash tags {tag} to colocate keys.
 ```
 
 ### Hash tag rules
@@ -87,26 +87,24 @@ Use hash tags {tag} to colocate keys, or switch namespace to quorum durability.
 - `{` without `}` — no tag, full key is used
 - Nested `{{tag}}` — outer braces are the tag, content is `{tag`
 
-## Choose the Right Durability per Namespace
+## Tune Commit Windows per Namespace
 
-Not all data needs the same guarantees. Use namespace prefixes to separate workloads:
+All standalone-server writes use the Raft durability path. Namespace prefixes can still tune the group-commit window:
 
 ```redis
-# Critical state — quorum (Raft + fsync before ack)
-FERRICSTORE.CONFIG SET "session:" durability quorum
-FERRICSTORE.CONFIG SET "order:" durability quorum
+# Latency-sensitive state: short commit window
+FERRICSTORE.CONFIG SET "session:" window_ms 1
+FERRICSTORE.CONFIG SET "order:" window_ms 1
 
-# Ephemeral data — async (fast, survives restart but not crash)
-FERRICSTORE.CONFIG SET "cache:" durability async
-FERRICSTORE.CONFIG SET "ratelimit:" durability async
+# Write-heavy data: larger batches
+FERRICSTORE.CONFIG SET "cache:" window_ms 5
+FERRICSTORE.CONFIG SET "ratelimit:" window_ms 5
 ```
-
-Quorum writes go through Raft consensus and fsync — safe but slower. Async writes go to ETS and Bitcask immediately, then replicate in the background — fast but can lose recent writes on crash.
 
 Design your key naming scheme around this:
 ```
-session:{user:42}:token     → quorum (namespace "session")
-cache:{product:99}:details  → async  (namespace "cache")
+session:{user:42}:token     → namespace "session"
+cache:{product:99}:details  → namespace "cache"
 ```
 
 ## Prefer Compound Operations Over Multiple Round-Trips
@@ -144,7 +142,13 @@ Most Redis client libraries support pipelining natively (e.g., `Redix.pipeline/2
 
 ## Size Your Values for the Hot Cache
 
-FerricStore keeps values in ETS (hot cache) only if they're smaller than `hot_cache_max_value_size` (default: 64KB). Larger values are stored cold — reads go to disk via Bitcask.
+FerricStore keeps values in ETS (hot cache) only if they're smaller than `hot_cache_max_value_size` (default: 64KB). Larger values are stored cold — reads go to disk via Bitcask. Values at or above `blob_side_channel_threshold_bytes` (default: 256KB) are stored as content-addressed blob files with a small Bitcask reference.
+
+Expired or overwritten large values become eligible for blob cleanup when their
+live Bitcask reference disappears. The automatic blob GC sweeper is enabled by
+default and runs conservatively: it first checks whether blob files exist, then
+builds the live reference set from the shard keydir before deleting unreferenced
+blob files. `FERRICSTORE.BLOBGC` can be used to force the same cleanup manually.
 
 If your values are consistently larger than this threshold, reads always hit disk. Consider:
 - Splitting large values into smaller fields (use Hash commands)

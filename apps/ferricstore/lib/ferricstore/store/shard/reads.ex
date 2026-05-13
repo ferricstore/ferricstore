@@ -3,7 +3,7 @@ defmodule Ferricstore.Store.Shard.Reads do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
-  alias Ferricstore.Store.ColdRead
+  alias Ferricstore.Store.{BlobValue, ColdRead}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
@@ -28,14 +28,13 @@ defmodule Ferricstore.Store.Shard.Reads do
       :expired ->
         {:reply, nil, state}
 
-      {:cold, fid, off, _vsize, exp} ->
+      {:cold, fid, off, vsize, exp} ->
         # Cold key — value evicted from ETS but disk location known.
         p = ShardETS.file_path(state.shard_data_path, fid)
 
         case read_cold_async(p, off, key) do
           {:ok, value} when is_binary(value) ->
-            ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, byte_size(value))
-            {:reply, value, state}
+            reply_cold_value(state, key, value, exp, fid, off, vsize)
 
           _ ->
             {:reply, nil, state}
@@ -117,13 +116,12 @@ defmodule Ferricstore.Store.Shard.Reads do
       :expired ->
         {:reply, nil, state}
 
-      {:cold, fid, off, _vsize, exp} ->
+      {:cold, fid, off, vsize, exp} ->
         p = ShardETS.file_path(state.shard_data_path, fid)
 
         case read_cold_async(p, off, key) do
           {:ok, value} when is_binary(value) ->
-            ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, byte_size(value))
-            {:reply, {value, exp}, state}
+            reply_cold_meta_value(state, key, value, exp, fid, off, vsize)
 
           _ ->
             {:reply, nil, state}
@@ -212,8 +210,7 @@ defmodule Ferricstore.Store.Shard.Reads do
 
         case read_cold_async(p, off, key) do
           {:ok, value} when is_binary(value) ->
-            ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
-            value
+            materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize)
 
           _ ->
             nil
@@ -257,8 +254,10 @@ defmodule Ferricstore.Store.Shard.Reads do
 
         case read_cold_async(p, off, key) do
           {:ok, value} when is_binary(value) ->
-            ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
-            {value, exp}
+            case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
+              nil -> nil
+              materialized -> {materialized, exp}
+            end
 
           _ ->
             nil
@@ -290,7 +289,11 @@ defmodule Ferricstore.Store.Shard.Reads do
       when is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 ->
         # Cold key -- pread from disk
         p = ShardETS.file_path(state.shard_data_path, fid)
-        read_cold_async(p, off, key)
+
+        with {:ok, value} <- read_cold_async(p, off, key),
+             {:ok, materialized} <- materialize_blob_value(state, value) do
+          {:ok, materialized}
+        end
 
       [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
         ShardETS.ets_delete_key(state, key)
@@ -326,6 +329,38 @@ defmodule Ferricstore.Store.Shard.Reads do
   defp read_cold_async(path, offset, expected_key) do
     Ferricstore.Store.ColdRead.pread_at(path, offset, expected_key, @cold_read_timeout_ms)
   end
+
+  defp reply_cold_value(state, key, value, exp, fid, off, vsize) do
+    case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
+      nil -> {:reply, nil, state}
+      materialized -> {:reply, materialized, state}
+    end
+  end
+
+  defp reply_cold_meta_value(state, key, value, exp, fid, off, vsize) do
+    case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
+      nil -> {:reply, nil, state}
+      materialized -> {:reply, {materialized, exp}, state}
+    end
+  end
+
+  defp materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
+    case materialize_blob_value(state, value) do
+      {:ok, materialized} ->
+        ShardETS.cold_read_warm_ets(state, key, materialized, exp, fid, off, vsize)
+        materialized
+
+      {:error, _reason} ->
+        nil
+    end
+  end
+
+  defp materialize_blob_value(%{data_dir: data_dir, index: shard_index} = state, value) do
+    BlobValue.maybe_materialize(data_dir, shard_index, blob_side_channel_threshold(state), value)
+  end
+
+  defp blob_side_channel_threshold(%{instance_ctx: ctx}), do: BlobValue.threshold(ctx)
+  defp blob_side_channel_threshold(_state), do: 0
 
   @spec live_keys(map()) :: [binary()]
   @doc false

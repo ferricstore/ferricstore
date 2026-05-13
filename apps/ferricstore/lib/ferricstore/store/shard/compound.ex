@@ -3,7 +3,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{ColdRead, LFU, Promotion}
+  alias Ferricstore.Store.{BlobValue, ColdRead, LFU, Promotion}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Store.Shard.ZSetIndex
@@ -273,8 +273,14 @@ defmodule Ferricstore.Store.Shard.Compound do
     Enum.zip(entries, values)
     |> Enum.map(fn
       {{state, compound_key, _file_path, fid, off, vsize, exp}, value} when is_binary(value) ->
-        ShardETS.cold_read_warm_ets(state, compound_key, value, exp, fid, off, vsize)
-        value
+        case materialize_blob_value(state, value) do
+          {:ok, materialized} ->
+            ShardETS.cold_read_warm_ets(state, compound_key, materialized, exp, fid, off, vsize)
+            materialized
+
+          {:error, _reason} ->
+            nil
+        end
 
       {_entry, _value} ->
         nil
@@ -863,10 +869,9 @@ defmodule Ferricstore.Store.Shard.Compound do
         {:reply, :ok, new_state}
 
       dedicated_path ->
-        case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
-          {:ok, {fid, offset, record_size}} ->
+        case promoted_write_value(state, dedicated_path, compound_key, value, expire_at_ms) do
+          {:ok, {fid, offset, value_size, record_size}} ->
             state = track_promoted_dead_bytes(state, redis_key, compound_key, record_size)
-            value_size = byte_size(value)
 
             ShardETS.ets_insert_with_location(
               state,
@@ -946,7 +951,7 @@ defmodule Ferricstore.Store.Shard.Compound do
          {:promoted, dedicated_path},
          state
        ) do
-    case promoted_write_batch(dedicated_path, entries) do
+    case promoted_write_batch_values(state, dedicated_path, entries) do
       {:ok, locations} ->
         new_state =
           entries
@@ -1330,7 +1335,7 @@ defmodule Ferricstore.Store.Shard.Compound do
              offset >= 0 and is_integer(vsize) and vsize >= 0 ->
         file_path = dedicated_file_path(dedicated_path, fid)
 
-        case read_cold_async(file_path, offset, compound_key) do
+        case read_cold_async(state, file_path, offset, compound_key) do
           {:ok, value} -> {:ok, value, exp, fid, offset, vsize}
           other -> other
         end
@@ -1357,28 +1362,47 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
-  defp promoted_write_batch(_dedicated_path, []), do: {:ok, []}
-
-  defp promoted_write_batch(dedicated_path, entries) do
+  defp promoted_write_value(state, dedicated_path, compound_key, value, expire_at_ms) do
     active = Promotion.find_active(dedicated_path)
     fid = parse_fid_from_path(active)
 
-    case NIF.v2_append_batch(active, entries) do
-      {:ok, locations} when length(locations) == length(entries) ->
-        results =
-          entries
-          |> Enum.zip(locations)
-          |> Enum.map(fn {{compound_key, value, _expire_at_ms}, {offset, value_size}} ->
-            {fid, offset, value_size, promoted_record_size(compound_key, value)}
-          end)
+    with {:ok, persisted_value} <- persisted_disk_value(state, value) do
+      case NIF.v2_append_record(active, compound_key, persisted_value, expire_at_ms) do
+        {:ok, {offset, _record_size}} ->
+          value_size = byte_size(persisted_value)
+          record_size = promoted_record_size(compound_key, persisted_value)
+          {:ok, {fid, offset, value_size, record_size}}
 
-        {:ok, results}
+        {:error, _} = err ->
+          err
+      end
+    end
+  end
 
-      {:ok, locations} ->
-        {:error, {:batch_result_mismatch, length(entries), locations}}
+  defp promoted_write_batch_values(_state, _dedicated_path, []), do: {:ok, []}
 
-      {:error, _} = err ->
-        err
+  defp promoted_write_batch_values(state, dedicated_path, entries) do
+    active = Promotion.find_active(dedicated_path)
+    fid = parse_fid_from_path(active)
+
+    with {:ok, persisted_entries} <- persisted_disk_entries(state, entries) do
+      case NIF.v2_append_batch(active, persisted_entries) do
+        {:ok, locations} when length(locations) == length(entries) ->
+          results =
+            persisted_entries
+            |> Enum.zip(locations)
+            |> Enum.map(fn {{compound_key, persisted_value, _expire_at_ms}, {offset, value_size}} ->
+              {fid, offset, value_size, promoted_record_size(compound_key, persisted_value)}
+            end)
+
+          {:ok, results}
+
+        {:ok, locations} ->
+          {:error, {:batch_result_mismatch, length(entries), locations}}
+
+        {:error, _} = err ->
+          err
+      end
     end
   end
 
@@ -2086,9 +2110,49 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
-  defp read_cold_async(path, offset, key) do
-    Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_batch_read_timeout_ms)
+  defp read_cold_async(state, path, offset, key) do
+    with {:ok, value} <-
+           Ferricstore.Store.ColdRead.pread_at(path, offset, key, @cold_batch_read_timeout_ms),
+         {:ok, materialized} <- materialize_blob_value(state, value) do
+      {:ok, materialized}
+    end
   end
+
+  defp materialize_blob_value(%{data_dir: data_dir, index: shard_index} = state, value) do
+    BlobValue.maybe_materialize(data_dir, shard_index, blob_side_channel_threshold(state), value)
+  end
+
+  defp materialize_blob_value(_state, value), do: {:ok, value}
+
+  defp persisted_disk_entries(state, entries) do
+    Enum.reduce_while(entries, {:ok, []}, fn {compound_key, value, expire_at_ms}, {:ok, acc} ->
+      case persisted_disk_value(state, value) do
+        {:ok, persisted_value} ->
+          {:cont, {:ok, [{compound_key, persisted_value, expire_at_ms} | acc]}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp persisted_disk_value(state, value) do
+    disk_value = ShardETS.to_disk_binary(value)
+
+    BlobValue.maybe_externalize(
+      Map.get(state, :data_dir),
+      Map.get(state, :index, 0),
+      blob_side_channel_threshold(state),
+      disk_value
+    )
+  end
+
+  defp blob_side_channel_threshold(%{instance_ctx: ctx}), do: BlobValue.threshold(ctx)
+  defp blob_side_channel_threshold(_state), do: 0
 
   # -- Off-heap binary byte tracking --
 

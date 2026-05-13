@@ -54,7 +54,6 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   use GenServer
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.ReplicationMode
   alias Ferricstore.Store.ActiveFile
   alias Ferricstore.Store.DiskPressure
 
@@ -407,7 +406,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
     end
   end
 
-  defp promotion_in_progress?, do: ReplicationMode.current() == :enabling
+  defp promotion_in_progress?, do: false
 
   defp write_version(%{write_version: ref}, index) do
     size = :counters.info(ref).size

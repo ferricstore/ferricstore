@@ -3,7 +3,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{CompoundKey, LFU}
+  alias Ferricstore.Store.{CompoundKey, ExpiryTracker, LFU}
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
@@ -185,11 +185,28 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # expired entries, deletes them from ETS, and purges expired entries
   # from the Bitcask store. Tracks consecutive ceiling-hit sweeps and
   # emits telemetry when the sweep is struggling or recovers.
-  @spec do_expiry_sweep(map()) :: map()
+  @spec do_expiry_sweep(map(), keyword()) :: map()
   @doc false
-  def do_expiry_sweep(state) do
+  def do_expiry_sweep(state, opts \\ []) do
+    force? = Keyword.get(opts, :force, false)
     now = HLC.now_ms()
 
+    cond do
+      force? ->
+        do_expiry_sweep_scan(state, now)
+
+      ExpiryTracker.count_for_state(state) == 0 ->
+        %{state | sweep_at_ceiling_count: 0, sweep_struggling: false}
+
+      not ExpiryTracker.due_for_state?(state, now) and not memory_pressure?(state) ->
+        %{state | sweep_at_ceiling_count: 0, sweep_struggling: false}
+
+      true ->
+        do_expiry_sweep_scan(state, now)
+    end
+  end
+
+  defp do_expiry_sweep_scan(state, now) do
     max_keys =
       Application.get_env(:ferricstore, :expiry_max_keys_per_sweep, @default_max_keys_per_sweep)
 
@@ -205,6 +222,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         Logger.debug("Shard #{state.index}: expiry sweep removed #{count} key(s)")
         state
       else
+        defer_next_due(state, now)
         state
       end
 
@@ -213,6 +231,19 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
     %{state | sweep_at_ceiling_count: new_ceiling_count, sweep_struggling: new_struggling}
   end
+
+  defp defer_next_due(state, now) do
+    interval =
+      Application.get_env(:ferricstore, :expiry_sweep_interval_ms, @default_sweep_interval_ms)
+
+    ExpiryTracker.defer_due_for_state(state, now + interval)
+  end
+
+  defp memory_pressure?(%{instance_ctx: %{pressure_flags: ref}}) when ref != nil do
+    :atomics.get(ref, 3) == 1 or :atomics.get(ref, 1) == 1
+  end
+
+  defp memory_pressure?(_state), do: false
 
   @spec scan_expired(:ets.tid(), integer(), non_neg_integer()) :: [binary()]
   @doc false
@@ -674,6 +705,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         Enum.each(entries, fn {key, _file_id, offset, value_size, expire_at_ms} ->
           # Cold insert (value=nil): only key bytes matter for off-heap tracking
           track_binary_add(shard_index, key, nil, instance_ctx)
+          ExpiryTracker.adjust(instance_ctx, shard_index, 0, expire_at_ms)
           :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
         end)
 
@@ -806,11 +838,12 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
          instance_ctx
        ) do
     case :ets.lookup(keydir, key) do
-      [{^key, _value, _exp, _lfu, entry_fid, entry_off, _vsize}]
+      [{^key, _value, expire_at_ms, _lfu, entry_fid, entry_off, _vsize}]
       when is_integer(entry_fid) and
              (entry_fid < fid or
                 (entry_fid == fid and is_integer(entry_off) and entry_off < offset)) ->
         track_binary_remove(keydir, shard_index, key, instance_ctx)
+        ExpiryTracker.adjust(instance_ctx, shard_index, expire_at_ms, 0)
         :ets.delete(keydir, key)
 
       _ ->
@@ -827,6 +860,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
          {key, _offset, _value_size, _expire_at_ms, true},
          instance_ctx
        ) do
+    ExpiryTracker.adjust(instance_ctx, shard_index, expire_at_ms_for_key(keydir, key), 0)
     track_binary_remove(keydir, shard_index, key, instance_ctx)
     :ets.delete(keydir, key)
   end
@@ -840,7 +874,22 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
        ) do
     # Cold insert (value=nil): only key bytes matter for off-heap tracking
     track_binary_add(shard_index, key, nil, instance_ctx)
+
+    ExpiryTracker.adjust(
+      instance_ctx,
+      shard_index,
+      expire_at_ms_for_key(keydir, key),
+      expire_at_ms
+    )
+
     :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
+  end
+
+  defp expire_at_ms_for_key(keydir, key) do
+    case :ets.lookup(keydir, key) do
+      [{^key, _value, expire_at_ms, _lfu, _fid, _offset, _value_size}] -> expire_at_ms
+      _ -> 0
+    end
   end
 
   defp expire_keys(state, expired_keys) do

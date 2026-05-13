@@ -6,6 +6,7 @@ defmodule Ferricstore.Flow do
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.RetryPolicy
   alias Ferricstore.Store.Router
+  alias Ferricstore.Store.TypeRegistry
 
   @default_state "queued"
   @default_priority 0
@@ -34,7 +35,8 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- create_attrs(id, opts) do
+      with {:ok, attrs} <- create_attrs(id, opts),
+           :ok <- validate_flow_payload_refs(ctx, [attrs]) do
         Router.flow_create(ctx, attrs)
       end
 
@@ -44,6 +46,35 @@ defmodule Ferricstore.Flow do
       _count: 1
     })
   end
+
+  def value_put(ctx, value, opts \\ [])
+
+  def value_put(ctx, value, opts) when is_list(opts) do
+    started = flow_start_time()
+
+    result =
+      with :ok <- validate_opts(opts),
+           {:ok, partition_key} <- optional_partition_key(opts),
+           {:ok, owner_flow_id} <- optional_binary_or_nil(opts, :owner_flow_id, nil),
+           :ok <- validate_ref_size(:owner_flow_id, owner_flow_id),
+           {:ok, now} <- optional_now_ms(opts),
+           {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms),
+           ref_id = shared_value_ref_id(),
+           ref = __MODULE__.Keys.shared_value_key(ref_id, partition_key),
+           link_key = shared_value_link_key(owner_flow_id, ref, partition_key),
+           :ok <- validate_key_size(ref),
+           :ok <- validate_flow_value_owner(ctx, owner_flow_id, partition_key),
+           expire_at = flow_value_expire_at(now, ttl_ms),
+           :ok <- Router.put(ctx, ref, encode_value(value), expire_at),
+           :ok <- maybe_put_flow_value_owner_link(ctx, link_key, ref, expire_at) do
+        response = %{ref: ref, partition_key: partition_key}
+        {:ok, maybe_put_attr(response, :owner_flow_id, owner_flow_id)}
+      end
+
+    observe_flow(:value_put, started, result, %{flow_id: Keyword.get(opts, :owner_flow_id)})
+  end
+
+  def value_put(_ctx, _value, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc false
   def create_batch_independent(_ctx, []), do: []
@@ -56,7 +87,13 @@ defmodule Ferricstore.Flow do
       |> Enum.with_index()
       |> Enum.reduce({[], %{}}, fn
         {{id, opts}, idx}, {valid_acc, result_acc} when is_binary(id) and is_list(opts) ->
-          case create_attrs(id, opts) do
+          create_result =
+            with {:ok, attrs} <- create_attrs(id, opts),
+                 :ok <- validate_flow_payload_refs(ctx, [attrs]) do
+              {:ok, attrs}
+            end
+
+          case create_result do
             {:ok, attrs} -> {[{idx, attrs} | valid_acc], result_acc}
             {:error, _reason} = error -> {valid_acc, Map.put(result_acc, idx, error)}
           end
@@ -90,7 +127,8 @@ defmodule Ferricstore.Flow do
       with {:ok, partition_key} <- optional_partition_key(partition_key: partition_key),
            :ok <- validate_create_many_items(items),
            {:ok, attrs_list} <- create_many_attrs(items, opts, partition_key),
-           :ok <- validate_unique_create_ids(attrs_list) do
+           :ok <- validate_unique_create_ids(attrs_list),
+           :ok <- validate_flow_payload_refs(ctx, attrs_list) do
         Router.flow_create_many(ctx, partition_key, attrs_list)
       end
 
@@ -109,7 +147,8 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- spawn_children_attrs(parent_id, children, opts) do
+      with {:ok, attrs} <- spawn_children_attrs(parent_id, children, opts),
+           :ok <- validate_flow_payload_refs(ctx, Map.fetch!(attrs, :children)) do
         Router.flow_spawn_children(ctx, attrs)
       end
 
@@ -340,7 +379,8 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- transition_attrs(id, from_state, to_state, opts) do
+      with {:ok, attrs} <- transition_attrs(id, from_state, to_state, opts),
+           :ok <- validate_flow_payload_refs(ctx, [attrs]) do
         Router.flow_transition(ctx, attrs)
       end
 
@@ -361,7 +401,8 @@ defmodule Ferricstore.Flow do
            :ok <- validate_transition_many_items(items),
            {:ok, attrs_list} <-
              transition_many_attrs(items, opts, partition_key, from_state, to_state),
-           :ok <- validate_unique_transition_ids(attrs_list) do
+           :ok <- validate_unique_transition_ids(attrs_list),
+           :ok <- validate_flow_payload_refs(ctx, attrs_list) do
         Router.flow_transition_many(ctx, partition_key, attrs_list)
       end
 
@@ -852,7 +893,8 @@ defmodule Ferricstore.Flow do
        counts
        |> Map.put(:type, type)
        |> Map.put(:partition_key, partition_key)
-       |> Map.put(:inflight, inflight)}
+       |> Map.put(:inflight, inflight)
+       |> Map.put(:retention_sweeper, Ferricstore.Flow.RetentionSweeper.info())}
     end
   end
 
@@ -2997,7 +3039,7 @@ defmodule Ferricstore.Flow do
 
   defp create_attrs(id, opts) do
     with :ok <- validate_opts(opts),
-         :ok <- reject_public_value_ref_input(opts, :payload_ref, :payload),
+         :ok <- validate_single_payload_source(opts),
          :ok <- validate_id(id),
          {:ok, type} <- required_binary(opts, :type),
          {:ok, state} <- optional_binary(opts, :state, @default_state),
@@ -3035,6 +3077,7 @@ defmodule Ferricstore.Flow do
           partition_key: partition_key
         }
         |> maybe_put_flow_value(opts, :payload)
+        |> maybe_put_flow_value_ref(opts, :payload_ref)
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:run_at_ms, run_at_ms)
 
@@ -3198,19 +3241,17 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp create_many_item_opts({:id, id, :payload_ref, _payload_ref}) when is_binary(id) do
-    {:error, "ERR flow payload_ref input is not supported; use payload"}
+  defp create_many_item_opts({:id, id, :payload_ref, payload_ref}) when is_binary(id) do
+    {:ok, id, [payload_ref: payload_ref]}
   end
 
   defp create_many_item_opts({:id, id, :payload, payload}) when is_binary(id) do
     {:ok, id, [payload: payload]}
   end
 
-  defp create_many_item_opts(
-         {:id, id, :partition_key, _partition_key, :payload_ref, _payload_ref}
-       )
+  defp create_many_item_opts({:id, id, :partition_key, partition_key, :payload_ref, payload_ref})
        when is_binary(id) do
-    {:error, "ERR flow payload_ref input is not supported; use payload"}
+    {:ok, id, [partition_key: partition_key, payload_ref: payload_ref]}
   end
 
   defp create_many_item_opts(_item), do: {:error, "ERR flow id must be a non-empty string"}
@@ -3240,6 +3281,7 @@ defmodule Ferricstore.Flow do
 
   defp transition_attrs(id, from_state, to_state, opts) do
     with :ok <- validate_opts(opts),
+         :ok <- validate_single_payload_source(opts),
          :ok <- validate_id(id),
          :ok <- validate_state(:from, from_state),
          :ok <- validate_state(:to, to_state),
@@ -3261,6 +3303,7 @@ defmodule Ferricstore.Flow do
           partition_key: partition_key
         }
         |> maybe_put_flow_value(opts, :payload)
+        |> maybe_put_flow_value_ref(opts, :payload_ref)
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:run_at_ms, run_at_ms)
 
@@ -4558,6 +4601,7 @@ defmodule Ferricstore.Flow do
   defp transition_many_item_payload(item) do
     []
     |> maybe_put_item_opt(:payload, item, :payload, "payload")
+    |> maybe_put_item_opt(:payload_ref, item, :payload_ref, "payload_ref")
   end
 
   defp complete_many_item_result_ref(item) do
@@ -5173,6 +5217,99 @@ defmodule Ferricstore.Flow do
     end
   end
 
+  defp maybe_put_flow_value_ref(attrs, opts, key) do
+    if Keyword.has_key?(opts, key) do
+      Map.put(attrs, key, Keyword.fetch!(opts, key))
+    else
+      attrs
+    end
+  end
+
+  defp validate_single_payload_source(opts) do
+    if Keyword.has_key?(opts, :payload) and Keyword.has_key?(opts, :payload_ref) do
+      {:error, "ERR flow payload and payload_ref are mutually exclusive"}
+    else
+      :ok
+    end
+  end
+
+  defp validate_flow_payload_refs(ctx, attrs_list) do
+    attrs_list
+    |> Enum.reduce_while({:ok, MapSet.new()}, fn attrs, {:ok, seen} ->
+      if Map.has_key?(attrs, :payload_ref) do
+        ref = Map.get(attrs, :payload_ref)
+
+        cond do
+          is_nil(ref) ->
+            {:cont, {:ok, seen}}
+
+          MapSet.member?(seen, ref) ->
+            {:cont, {:ok, seen}}
+
+          true ->
+            case validate_flow_payload_ref(ctx, ref) do
+              :ok -> {:cont, {:ok, MapSet.put(seen, ref)}}
+              {:error, _reason} = error -> {:halt, error}
+            end
+        end
+      else
+        {:cont, {:ok, seen}}
+      end
+    end)
+    |> case do
+      {:ok, _seen} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_flow_payload_ref(ctx, ref) when is_binary(ref) and ref != "" do
+    cond do
+      byte_size(ref) > @max_ref_size ->
+        {:error, "ERR flow payload_ref too large (max #{@max_ref_size} bytes)"}
+
+      TypeRegistry.get_type(ref, ctx) == "none" ->
+        {:error, "ERR flow payload_ref does not exist"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_flow_payload_ref(_ctx, _ref),
+    do: {:error, "ERR flow payload_ref must be a non-empty string"}
+
+  defp validate_flow_value_owner(_ctx, nil, _partition_key), do: :ok
+
+  defp validate_flow_value_owner(ctx, owner_flow_id, partition_key) do
+    case Router.flow_get(ctx, owner_flow_id, partition_key) do
+      value when is_binary(value) -> :ok
+      nil -> {:error, "ERR flow owner_flow_id does not exist"}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp shared_value_link_key(nil, _ref, _partition_key), do: nil
+
+  defp shared_value_link_key(owner_flow_id, ref, partition_key) do
+    __MODULE__.Keys.shared_value_link_key(owner_flow_id, ref, partition_key)
+  end
+
+  defp maybe_put_flow_value_owner_link(_ctx, nil, _ref, _expire_at), do: :ok
+
+  defp maybe_put_flow_value_owner_link(ctx, link_key, ref, expire_at) do
+    with :ok <- validate_key_size(link_key) do
+      Router.put(ctx, link_key, ref, expire_at)
+    end
+  end
+
+  defp shared_value_ref_id do
+    :crypto.strong_rand_bytes(18)
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp flow_value_expire_at(_now, nil), do: 0
+  defp flow_value_expire_at(now, ttl_ms), do: now + ttl_ms
+
   defp flow_policy_read(ctx, type) do
     case Router.get(ctx, __MODULE__.Keys.policy_key(type)) do
       nil ->
@@ -5248,6 +5385,28 @@ defmodule Ferricstore.Flow do
       "f:" <>
         tag(partition_key) <>
         ":v:" <> flow_value_kind(kind) <> ":" <> id <> ":" <> Integer.to_string(version)
+    end
+
+    def shared_value_key(ref_id, partition_key \\ nil) when is_binary(ref_id) do
+      "f:" <> tag(partition_key) <> ":sv:" <> ref_id
+    end
+
+    def shared_value_key?(key) when is_binary(key) do
+      String.starts_with?(key, "f:{f") and String.contains?(key, "}:sv:")
+    end
+
+    def shared_value_key?(_key), do: false
+
+    def shared_value_link_key(owner_flow_id, ref, partition_key \\ nil)
+        when is_binary(owner_flow_id) and is_binary(ref) do
+      "f:" <>
+        tag(partition_key) <>
+        ":svl:" <> owner_flow_id <> ":" <> Base.url_encode64(ref, padding: false)
+    end
+
+    def shared_value_link_prefix(owner_flow_id, partition_key \\ nil)
+        when is_binary(owner_flow_id) do
+      "f:" <> tag(partition_key) <> ":svl:" <> owner_flow_id <> ":"
     end
 
     def policy_key(type) do

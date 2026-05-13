@@ -21,10 +21,6 @@ defmodule Ferricstore.Commands.Cluster do
   ### Membership management
 
     * `CLUSTER.JOIN <node> [REPLACE]` -- adds a node to the cluster
-    * `CLUSTER.ENABLE [DRYRUN|RESUME|STATUS]` -- promotes or inspects a manual
-      standalone node to Raft
-    * `CLUSTER.DURABILITY [STATUS|RESUME]` -- inspects or resumes standalone
-      durability fail-closed state
     * `CLUSTER.LEAVE` -- gracefully removes this node from the cluster
     * `CLUSTER.FAILOVER <shard_index> <target_node>` -- transfers shard
       leadership to a specific node
@@ -177,22 +173,22 @@ defmodule Ferricstore.Commands.Cluster do
   # -- CLUSTER.JOIN -----------------------------------------------------------
 
   def handle("CLUSTER.JOIN", [node_str], _store) do
-    node = String.to_atom(node_str)
-
-    case ClusterManager.add_node(node) do
-      :ok -> :ok
-      {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+    with {:ok, node} <- parse_existing_node(node_str) do
+      case ClusterManager.add_node(node) do
+        :ok -> :ok
+        {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+      end
     end
   end
 
   def handle("CLUSTER.JOIN", [node_str, arg], _store) when is_binary(arg) do
     case String.upcase(arg) do
       "REPLACE" ->
-        node = String.to_atom(node_str)
-
-        case ClusterManager.add_node(node, :voter, replace: true) do
-          :ok -> :ok
-          {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+        with {:ok, node} <- parse_existing_node(node_str) do
+          case ClusterManager.add_node(node, :voter, replace: true) do
+            :ok -> :ok
+            {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+          end
         end
 
       _ ->
@@ -202,67 +198,6 @@ defmodule Ferricstore.Commands.Cluster do
 
   def handle("CLUSTER.JOIN", _args, _store) do
     {:error, "ERR wrong number of arguments for 'cluster.join' command"}
-  end
-
-  # -- CLUSTER.ENABLE ---------------------------------------------------------
-
-  def handle("CLUSTER.ENABLE", [], _store) do
-    case ClusterManager.enable_cluster() do
-      :ok -> :ok
-      {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
-    end
-  end
-
-  def handle("CLUSTER.ENABLE", [arg], _store) when is_binary(arg) do
-    case String.upcase(arg) do
-      "DRYRUN" ->
-        case ClusterManager.enable_cluster(dryrun: true) do
-          :ok -> :ok
-          {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
-        end
-
-      "RESUME" ->
-        case ClusterManager.enable_cluster(resume: true) do
-          :ok -> :ok
-          {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
-        end
-
-      "STATUS" ->
-        format_enable_status(ClusterManager.enable_status())
-
-      _ ->
-        {:error, "ERR syntax error"}
-    end
-  end
-
-  def handle("CLUSTER.ENABLE", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'cluster.enable' command"}
-  end
-
-  # -- CLUSTER.DURABILITY -----------------------------------------------------
-
-  def handle("CLUSTER.DURABILITY", [], _store) do
-    format_durability_status(ClusterManager.durability_status())
-  end
-
-  def handle("CLUSTER.DURABILITY", [arg], _store) when is_binary(arg) do
-    case String.upcase(arg) do
-      "STATUS" ->
-        format_durability_status(ClusterManager.durability_status())
-
-      "RESUME" ->
-        case ClusterManager.resume_standalone_durability() do
-          :ok -> :ok
-          {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
-        end
-
-      _ ->
-        {:error, "ERR syntax error"}
-    end
-  end
-
-  def handle("CLUSTER.DURABILITY", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'cluster.durability' command"}
   end
 
   # -- CLUSTER.LEAVE ----------------------------------------------------------
@@ -281,9 +216,8 @@ defmodule Ferricstore.Commands.Cluster do
   # -- CLUSTER.FAILOVER -------------------------------------------------------
 
   def handle("CLUSTER.FAILOVER", [shard_str, node_str], _store) do
-    with {shard_idx, ""} <- Integer.parse(shard_str) do
-      target = String.to_atom(node_str)
-
+    with {shard_idx, ""} <- Integer.parse(shard_str),
+         {:ok, target} <- parse_existing_node(node_str) do
       case RaftCluster.transfer_leadership(shard_idx, target) do
         :ok -> :ok
         {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
@@ -300,18 +234,19 @@ defmodule Ferricstore.Commands.Cluster do
   # -- CLUSTER.PROMOTE --------------------------------------------------------
 
   def handle("CLUSTER.PROMOTE", [node_str], _store) do
-    target = String.to_atom(node_str)
-    shard_count = FerricStore.Instance.get(:default).shard_count
+    with {:ok, target} <- parse_existing_node(node_str) do
+      shard_count = FerricStore.Instance.get(:default).shard_count
 
-    results =
-      for shard_idx <- 0..(shard_count - 1) do
-        RaftCluster.add_member(shard_idx, target, :voter)
+      results =
+        for shard_idx <- 0..(shard_count - 1) do
+          RaftCluster.add_member(shard_idx, target, :voter)
+        end
+
+      if Enum.all?(results, &(&1 == :ok)) do
+        :ok
+      else
+        {:error, "ERR partial failure: #{inspect(results)}"}
       end
-
-    if Enum.all?(results, &(&1 == :ok)) do
-      :ok
-    else
-      {:error, "ERR partial failure: #{inspect(results)}"}
     end
   end
 
@@ -322,18 +257,19 @@ defmodule Ferricstore.Commands.Cluster do
   # -- CLUSTER.DEMOTE ---------------------------------------------------------
 
   def handle("CLUSTER.DEMOTE", [node_str], _store) do
-    target = String.to_atom(node_str)
-    shard_count = FerricStore.Instance.get(:default).shard_count
+    with {:ok, target} <- parse_existing_node(node_str) do
+      shard_count = FerricStore.Instance.get(:default).shard_count
 
-    results =
-      for shard_idx <- 0..(shard_count - 1) do
-        RaftCluster.add_member(shard_idx, target, :promotable)
+      results =
+        for shard_idx <- 0..(shard_count - 1) do
+          RaftCluster.add_member(shard_idx, target, :promotable)
+        end
+
+      if Enum.all?(results, &(&1 == :ok)) do
+        :ok
+      else
+        {:error, "ERR partial failure: #{inspect(results)}"}
       end
-
-    if Enum.all?(results, &(&1 == :ok)) do
-      :ok
-    else
-      {:error, "ERR partial failure: #{inspect(results)}"}
     end
   end
 
@@ -464,72 +400,6 @@ defmodule Ferricstore.Commands.Cluster do
       "unavailable #{Exception.message(error)} promotion_epoch=unknown barrier_indices=unknown"
   end
 
-  defp format_enable_status(status) when is_map(status) do
-    marker = Map.get(status, :marker)
-    {marker_status, marker_lines} = format_enable_marker(marker)
-
-    [
-      "replication_mode: #{Map.get(status, :replication_mode)}",
-      "manager_mode: #{Map.get(status, :manager_mode)}",
-      "sync_status: #{Map.get(status, :sync_status)}",
-      "node: #{Map.get(status, :node)}",
-      "node_alive: #{Map.get(status, :node_alive)}",
-      "ready: #{Map.get(status, :ready)}",
-      "last_enable_error: #{inspect(Map.get(status, :last_enable_error))}",
-      "marker_status: #{marker_status}"
-      | marker_lines
-    ]
-    |> Enum.join("\r\n")
-  end
-
-  defp format_enable_marker({:ok, marker}) when is_map(marker) do
-    lines = [
-      "marker_mode: #{Map.get(marker, :replication_mode, :unknown)}",
-      "cluster_id: #{Map.get(marker, :cluster_id, "unknown")}",
-      "promotion_epoch: #{Map.get(marker, :promotion_epoch, "none")}",
-      "barrier_indices: #{inspect(Map.get(marker, :barrier_indices, %{}))}"
-    ]
-
-    {"ok", lines}
-  end
-
-  defp format_enable_marker({:error, reason}) do
-    {"error", ["marker_error: #{inspect(reason)}"]}
-  end
-
-  defp format_enable_marker(other) do
-    {"unknown", ["marker_error: #{inspect(other)}"]}
-  end
-
-  defp format_durability_status(status) when is_map(status) do
-    header = [
-      "replication_mode: #{Map.get(status, :replication_mode)}",
-      "manager_mode: #{Map.get(status, :manager_mode)}",
-      "ready: #{Map.get(status, :ready)}",
-      "repair_required: #{Map.get(status, :repair_required)}",
-      "paused_shards: #{Map.get(status, :paused_shards)}",
-      "disk_pressure_shards: #{Map.get(status, :disk_pressure_shards)}",
-      "error_shards: #{Map.get(status, :error_shards)}"
-    ]
-
-    shard_lines =
-      status
-      |> Map.get(:shards, %{})
-      |> Enum.sort_by(fn {idx, _info} -> idx end)
-      |> Enum.flat_map(fn {idx, info} ->
-        [
-          "shard_#{idx}:",
-          "  writes_paused: #{Map.get(info, :writes_paused)}",
-          "  disk_pressure: #{Map.get(info, :disk_pressure)}",
-          "  last_flush_error: #{inspect(Map.get(info, :last_flush_error))}",
-          "  pending_count: #{Map.get(info, :pending_count)}",
-          "  standalone_flush_inflight: #{Map.get(info, :standalone_flush_inflight)}"
-        ]
-      end)
-
-    Enum.join(header ++ shard_lines, "\r\n")
-  end
-
   defp collect_shard_info do
     ctx = default_instance()
     shard_count = if ctx, do: ctx.shard_count, else: configured_shard_count()
@@ -592,6 +462,13 @@ defmodule Ferricstore.Commands.Cluster do
       n when is_integer(n) -> n
       _ -> 0
     end
+  end
+
+  defp parse_existing_node(node_str) when is_binary(node_str) do
+    {:ok, String.to_existing_atom(node_str)}
+  rescue
+    ArgumentError ->
+      {:error, "ERR unknown node; connect the distributed node before using CLUSTER commands"}
   end
 
   # Returns "leader" or "follower" for the given shard on this node.

@@ -16,14 +16,80 @@ defmodule Ferricstore.Commands.FlowTest do
 
   defp uid(prefix), do: "#{prefix}:#{System.unique_integer([:positive])}"
 
-  test "rejects public Flow value ref inputs through Rust AST" do
-    assert {:error, "ERR syntax error"} =
+  test "dispatches Flow value put and payload refs through Rust AST" do
+    assert %{"ref" => shared_ref} =
              Dispatcher.dispatch(
-               "FLOW.CREATE",
-               ["ref-create", "TYPE", "checkout", "PAYLOAD_REF", "payload:external"],
+               "FLOW.VALUE.PUT",
+               ["shared-payload", "PARTITION", "tenant-a"],
                MockStore.make()
              )
 
+    id = uid("ref-create")
+
+    assert %{"id" => ^id, "payload_ref" => ^shared_ref} =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [id, "TYPE", "checkout", "PARTITION", "tenant-a", "PAYLOAD_REF", shared_ref],
+               MockStore.make()
+             )
+
+    assert %{"payload" => "shared-payload"} =
+             Dispatcher.dispatch(
+               "FLOW.GET",
+               [id, "PARTITION", "tenant-a", "FULL"],
+               MockStore.make()
+             )
+
+    id_a = uid("ref-create-many-a")
+    id_b = uid("ref-create-many-b")
+
+    assert [
+             %{"id" => ^id_a, "payload_ref" => ^shared_ref},
+             %{"id" => ^id_b, "payload_ref" => ^shared_ref}
+           ] =
+             Dispatcher.dispatch(
+               "FLOW.CREATE_MANY",
+               [
+                 "MIXED",
+                 "TYPE",
+                 "checkout",
+                 "PAYLOAD_REF",
+                 shared_ref,
+                 "ITEMS",
+                 id_a,
+                 "tenant-a",
+                 id_b,
+                 "tenant-b"
+               ],
+               MockStore.make()
+             )
+
+    assert [%{"id" => ^id, "fencing_token" => fencing_token, "lease_token" => lease_token}] =
+             Dispatcher.dispatch(
+               "FLOW.CLAIM_DUE",
+               ["checkout", "PARTITION", "tenant-a", "WORKER", "worker-ref", "LIMIT", "1"],
+               MockStore.make()
+             )
+
+    assert [%{"id" => ^id, "payload_ref" => ^shared_ref}] =
+             Dispatcher.dispatch(
+               "FLOW.TRANSITION_MANY",
+               [
+                 "tenant-a",
+                 "running",
+                 "waiting",
+                 "PAYLOAD_REF",
+                 shared_ref,
+                 "ITEMS",
+                 id,
+                 Integer.to_string(fencing_token),
+                 lease_token
+               ],
+               MockStore.make()
+             )
+  end
+
+  test "rejects unsupported Flow value ref inputs through Rust AST" do
     assert {:error, "ERR syntax error"} =
              Dispatcher.dispatch(
                "FLOW.COMPLETE",

@@ -281,7 +281,7 @@ defmodule Ferricstore.Cluster.ManagerTest do
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
-    test "standalone target data is rejected without replace even with same cluster id" do
+    test "unsupported standalone target marker is rejected without replace even with same cluster id" do
       target = :"standalone_same_cluster_target@127.0.0.1"
       parent = self()
       ctx = FerricStore.Instance.get(:default)
@@ -324,11 +324,93 @@ defmodule Ferricstore.Cluster.ManagerTest do
         shard_count: 1
       }
 
-      assert {:reply, {:error, {:target_standalone_data_requires_replace, ^target}}, new_state} =
+      assert {:reply,
+              {:error, {:target_cluster_state_unusable, ^target, :missing_replication_mode}},
+              new_state} =
                Manager.handle_call({:add_node, target, :voter, []}, {self(), make_ref()}, state)
 
       refute_received :target_raft_stop
       refute_received :target_indices_read
+      refute MapSet.member?(new_state.known_nodes, target)
+    end
+
+    test "replace join rejects foreign target data before cleanup" do
+      target = :"replace_foreign_target@127.0.0.1"
+      parent = self()
+      ctx = FerricStore.Instance.get(:default)
+      {:ok, %{cluster_id: local_cluster_id}} = Ferricstore.ReplicationMode.read(ctx.data_dir)
+
+      Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 ->
+        {:ok, true}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_read_target_cluster_state_hook, fn ^target ->
+        {:ok, %{cluster_id: "foreign-" <> local_cluster_id, replication_mode: :raft}}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 1 ->
+        send(parent, :target_data_cleanup)
+        :ok
+      end)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
+        Process.delete(:ferricstore_cluster_manager_read_target_cluster_state_hook)
+        Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
+      end)
+
+      state = %{
+        mode: :cluster,
+        role: :voter,
+        cluster_nodes: [],
+        remove_delay_ms: 60_000,
+        known_nodes: MapSet.new(),
+        remove_timers: %{},
+        sync_status: :synced,
+        shard_sync_status: %{},
+        shard_count: 1
+      }
+
+      assert {:reply,
+              {:error,
+               {:target_cluster_id_mismatch, ^target, ^local_cluster_id,
+                "foreign-" <> _local_cluster_id}}, new_state} =
+               Manager.handle_call(
+                 {:add_node, target, :voter, [replace: true]},
+                 {self(), make_ref()},
+                 state
+               )
+
+      refute_received :target_data_cleanup
+      refute MapSet.member?(new_state.known_nodes, target)
+    end
+
+    test "remote-driven auto-join is disabled by default for unknown nodes" do
+      old_auto_join = Application.get_env(:ferricstore, :cluster_auto_join)
+      Application.put_env(:ferricstore, :cluster_auto_join, false)
+
+      on_exit(fn ->
+        case old_auto_join do
+          nil -> Application.delete_env(:ferricstore, :cluster_auto_join)
+          value -> Application.put_env(:ferricstore, :cluster_auto_join, value)
+        end
+      end)
+
+      target = :"remote_auto_join_disabled_target@127.0.0.1"
+
+      state = %{
+        mode: :cluster,
+        role: :voter,
+        cluster_nodes: [],
+        remove_delay_ms: 60_000,
+        known_nodes: MapSet.new(),
+        remove_timers: %{},
+        sync_status: :synced,
+        shard_sync_status: %{},
+        shard_count: 1
+      }
+
+      assert {:noreply, new_state} = Manager.handle_info({:nodeup, target, []}, state)
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
@@ -845,11 +927,17 @@ defmodule Ferricstore.Cluster.ManagerTest do
       refute MapSet.member?(new_state.known_nodes, target)
     end
 
-    test "replace join aborts when target cleanup fails before sync" do
+    test "replace join rejects unsupported standalone marker before cleanup" do
       target = :"replace_cleanup_failure_target@127.0.0.1"
       parent = self()
+      ctx = FerricStore.Instance.get(:default)
+      {:ok, %{cluster_id: local_cluster_id}} = Ferricstore.ReplicationMode.read(ctx.data_dir)
 
       Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 -> true end)
+
+      Process.put(:ferricstore_cluster_manager_read_target_cluster_state_hook, fn ^target ->
+        {:ok, %{cluster_id: local_cluster_id, replication_mode: :standalone}}
+      end)
 
       Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 1 ->
         send(parent, :target_data_cleanup)
@@ -868,6 +956,7 @@ defmodule Ferricstore.Cluster.ManagerTest do
 
       on_exit(fn ->
         Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
+        Process.delete(:ferricstore_cluster_manager_read_target_cluster_state_hook)
         Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
         Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
         Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
@@ -885,14 +974,16 @@ defmodule Ferricstore.Cluster.ManagerTest do
         shard_count: 1
       }
 
-      assert {:reply, {:error, :simulated_cleanup_failure}, new_state} =
+      assert {:reply,
+              {:error, {:target_cluster_state_unusable, ^target, :missing_replication_mode}},
+              new_state} =
                Manager.handle_call(
                  {:add_node, target, :voter, [replace: true]},
                  {self(), make_ref()},
                  state
                )
 
-      assert_received :target_data_cleanup
+      refute_received :target_data_cleanup
       refute_received :direct_sync
       refute_received :raft_add
       refute MapSet.member?(new_state.known_nodes, target)
@@ -901,9 +992,15 @@ defmodule Ferricstore.Cluster.ManagerTest do
     test "replace join cleans target data then syncs starts raft adds member and writes marker" do
       target = :"replace_success_target@127.0.0.1"
       parent = self()
+      ctx = FerricStore.Instance.get(:default)
+      {:ok, %{cluster_id: local_cluster_id}} = Ferricstore.ReplicationMode.read(ctx.data_dir)
 
       Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 ->
         {:ok, true}
+      end)
+
+      Process.put(:ferricstore_cluster_manager_read_target_cluster_state_hook, fn ^target ->
+        {:ok, %{cluster_id: local_cluster_id, replication_mode: :raft}}
       end)
 
       Process.put(:ferricstore_cluster_manager_cleanup_target_data_hook, fn ^target, 1 ->
@@ -946,6 +1043,7 @@ defmodule Ferricstore.Cluster.ManagerTest do
 
       on_exit(fn ->
         Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
+        Process.delete(:ferricstore_cluster_manager_read_target_cluster_state_hook)
         Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
         Process.delete(:ferricstore_cluster_manager_target_membership_hook)
         Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)

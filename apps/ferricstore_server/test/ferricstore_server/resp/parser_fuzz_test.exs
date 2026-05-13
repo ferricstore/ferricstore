@@ -146,7 +146,7 @@ defmodule FerricstoreServer.Resp.ParserFuzzTest do
       "EXISTS",
       "JSON.GET",
       "PFADD",
-      "CLUSTER.ENABLE",
+      "CLUSTER.JOIN",
       ""
     ]
 

@@ -43,6 +43,7 @@ defmodule Ferricstore.Application do
   require Logger
 
   @default_large_value_warning_bytes 512 * 1024
+  @large_value_blob_ref_read_timeout_ms 1_000
 
   @impl true
   @spec start(Application.start_type(), term()) :: {:ok, pid()} | {:error, term()}
@@ -65,11 +66,8 @@ defmodule Ferricstore.Application do
 
     Ferricstore.ReplicationMode.put_current(replication_mode)
 
-    case {replication_mode, Ferricstore.ReplicationMode.read(data_dir)} do
-      {:standalone, {:error, :enoent}} ->
-        :ok = Ferricstore.ReplicationMode.mark_standalone!(data_dir, shard_count)
-
-      {:raft, {:error, :enoent}} ->
+    case Ferricstore.ReplicationMode.read(data_dir) do
+      {:error, :enoent} ->
         :ok = Ferricstore.ReplicationMode.mark_raft!(data_dir, shard_count, 0, %{})
 
       _ ->
@@ -104,7 +102,7 @@ defmodule Ferricstore.Application do
     # persistent_term.get (~5ns) at init. Never written again at runtime.
     :persistent_term.put(
       :ferricstore_max_active_file_size,
-      Application.get_env(:ferricstore, :max_active_file_size, 256 * 1024 * 1024)
+      Application.get_env(:ferricstore, :max_active_file_size, 8 * 1024 * 1024 * 1024)
     )
 
     # Initialize MemoryGuard pressure flags as atomics (3 slots).
@@ -157,10 +155,7 @@ defmodule Ferricstore.Application do
     maybe_start_distribution()
 
     # Start the ra system before shards so that Shard.init can start ra servers.
-    # In manual standalone mode it is started later by CLUSTER.ENABLE.
-    if replication_mode == :raft do
-      :ok = Ferricstore.Raft.Cluster.start_system(data_dir)
-    end
+    :ok = Ferricstore.Raft.Cluster.start_system(data_dir)
 
     # Build the default instance context. This creates the Instance struct
     # with all refs (atomics, counters, ETS tables) and caches it in
@@ -178,18 +173,13 @@ defmodule Ferricstore.Application do
         hot_cache_max_value_size:
           Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536),
         max_active_file_size:
-          Application.get_env(:ferricstore, :max_active_file_size, 256 * 1024 * 1024),
+          Application.get_env(:ferricstore, :max_active_file_size, 8 * 1024 * 1024 * 1024),
         read_sample_rate: Application.get_env(:ferricstore, :read_sample_rate, 100),
         lfu_decay_time: Application.get_env(:ferricstore, :lfu_decay_time, 1),
         lfu_log_factor: Application.get_env(:ferricstore, :lfu_log_factor, 10)
       )
 
-    batcher_children =
-      if replication_mode == :raft do
-        raft_batcher_children(shard_count)
-      else
-        []
-      end
+    batcher_children = raft_batcher_children(shard_count)
 
     # Background Bitcask writers — one per shard. Must start BEFORE the
     # ShardSupervisor because StateMachine.apply sends casts to these
@@ -228,7 +218,6 @@ defmodule Ferricstore.Application do
           Ferricstore.NamespaceConfig,
           Ferricstore.HLC,
           Ferricstore.QuorumMetrics,
-          Ferricstore.StandaloneTxMetrics,
           Ferricstore.PrefixMetricsCache
         ] ++
         batcher_children ++
@@ -243,6 +232,7 @@ defmodule Ferricstore.Application do
           Ferricstore.PubSub,
           Ferricstore.FetchOrCompute,
           Ferricstore.Flow.RetentionSweeper,
+          {Ferricstore.Store.BlobGCSweeper, instance_ctx: default_ctx},
           {Ferricstore.MemoryGuard, memory_guard_opts()},
           Ferricstore.Cluster.Manager
         ]
@@ -258,26 +248,15 @@ defmodule Ferricstore.Application do
 
     case Supervisor.start_link(children, opts) do
       {:ok, pid} = result ->
-        case replication_mode do
-          :raft ->
-            case Ferricstore.Raft.Cluster.trigger_shard_elections_parallel(shard_count) do
-              :ok ->
-                mark_started(shard_count)
-                result
-
-              {:error, reason} ->
-                stop_started_supervisor(pid)
-                cleanup_failed_start()
-                {:error, {:raft_election_failed, reason}}
-            end
-
-          :enabling ->
-            mark_started(shard_count, false)
-            result
-
-          :standalone ->
+        case Ferricstore.Raft.Cluster.trigger_shard_elections_parallel(shard_count) do
+          :ok ->
             mark_started(shard_count)
             result
+
+          {:error, reason} ->
+            stop_started_supervisor(pid)
+            cleanup_failed_start()
+            {:error, {:raft_election_failed, reason}}
         end
 
       result ->
@@ -733,8 +712,9 @@ defmodule Ferricstore.Application do
 
   Returns `{0, nil, 0}` when no large values are found.
 
-  This is a pure RAM scan -- ETS already holds the full value per entry, so no
-  disk reads are needed.
+  This is a mostly RAM scan. Normal cold values use the size stored in ETS.
+  Blob side-channel values store only a fixed-size ref in Bitcask, so those
+  entries read the small ref record and decode its logical payload size.
 
   ## Parameters
 
@@ -753,6 +733,8 @@ defmodule Ferricstore.Application do
           :embedded_large_value_warning_bytes,
           @default_large_value_warning_bytes
         )
+
+    ctx = default_instance_ctx()
 
     Enum.reduce(0..(shard_count - 1), {0, nil, 0}, fn i, {count, largest_key, largest_size} ->
       keydir = :"keydir_#{i}"
@@ -774,12 +756,16 @@ defmodule Ferricstore.Application do
                 {c, lk, ls}
               end
 
-            {key, nil, _exp, _lfu, _fid, _off, vsize}, {c, lk, ls}
+            {key, nil, _exp, _lfu, fid, off, vsize}, {c, lk, ls}
             when is_integer(vsize) and vsize > 0 ->
-              # Cold key (value evicted from RAM) -- use vsize from disk location
-              if vsize > threshold do
-                if vsize > ls do
-                  {c + 1, key, vsize}
+              # Cold key (value evicted from RAM) -- use vsize from disk location.
+              # Blob values store a 48-byte ref in Bitcask, but the ref carries
+              # the original logical payload size used by operators.
+              logical_size = large_value_logical_size(ctx, i, key, fid, off, vsize)
+
+              if logical_size > threshold do
+                if logical_size > ls do
+                  {c + 1, key, logical_size}
                 else
                   {c + 1, lk, ls}
                 end
@@ -799,6 +785,49 @@ defmodule Ferricstore.Application do
           {count, largest_key, largest_size}
       end
     end)
+  end
+
+  defp default_instance_ctx do
+    try do
+      FerricStore.Instance.get(:default)
+    rescue
+      ArgumentError -> nil
+    end
+  end
+
+  defp large_value_logical_size(ctx, shard_index, key, fid, off, vsize) do
+    if blob_ref_sized_location?(ctx, fid, off, vsize) do
+      path =
+        ctx.data_dir
+        |> Ferricstore.DataDir.shard_data_path(shard_index)
+        |> Ferricstore.Store.Shard.ETS.file_path(fid)
+
+      case Ferricstore.Store.ColdRead.pread_at(
+             path,
+             off,
+             key,
+             @large_value_blob_ref_read_timeout_ms
+           ) do
+        {:ok, value} ->
+          case Ferricstore.Store.BlobRef.decode(value) do
+            {:ok, %Ferricstore.Store.BlobRef{size: logical_size}} -> logical_size
+            :error -> vsize
+          end
+
+        {:error, reason} ->
+          Ferricstore.Store.ColdRead.emit_pread_error(path, reason)
+          vsize
+      end
+    else
+      vsize
+    end
+  end
+
+  defp blob_ref_sized_location?(ctx, fid, off, vsize) do
+    is_map(ctx) and is_binary(Map.get(ctx, :data_dir)) and
+      Ferricstore.Store.BlobValue.threshold(ctx) > 0 and
+      is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 and
+      vsize == Ferricstore.Store.BlobRef.encoded_size()
   end
 
   # Runs the large value check and emits a warning + telemetry if any are found.

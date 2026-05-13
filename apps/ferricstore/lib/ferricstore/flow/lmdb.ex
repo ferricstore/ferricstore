@@ -56,15 +56,21 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   def get(path, key) when is_binary(path) and is_binary(key) do
-    NIF.lmdb_get(path, key, map_size())
+    if File.dir?(path), do: NIF.lmdb_get(path, key, map_size()), else: :not_found
   end
 
+  def get_many(_path, []), do: {:ok, []}
+
   def get_many(path, keys) when is_binary(path) and is_list(keys) do
-    NIF.lmdb_get_many(path, keys, map_size())
+    if File.dir?(path) do
+      NIF.lmdb_get_many(path, keys, map_size())
+    else
+      {:ok, Enum.map(keys, fn _key -> :not_found end)}
+    end
   end
 
   def warm(path) when is_binary(path) do
-    case get(path, <<0>>) do
+    case NIF.lmdb_get(path, <<0>>, map_size()) do
       {:ok, _value} -> :ok
       :not_found -> :ok
       {:error, _reason} = error -> error
@@ -85,18 +91,22 @@ defmodule Ferricstore.Flow.LMDB do
 
   def prefix_entries(path, prefix, limit)
       when is_binary(path) and is_binary(prefix) and is_integer(limit) and limit >= 0 do
-    NIF.lmdb_prefix_entries(path, prefix, limit, map_size())
+    if File.dir?(path),
+      do: NIF.lmdb_prefix_entries(path, prefix, limit, map_size()),
+      else: {:ok, []}
   end
 
   def prefix_entries(path, prefix, limit, false), do: prefix_entries(path, prefix, limit)
 
   def prefix_entries(path, prefix, limit, true)
       when is_binary(path) and is_binary(prefix) and is_integer(limit) and limit >= 0 do
-    NIF.lmdb_prefix_entries_reverse(path, prefix, limit, map_size())
+    if File.dir?(path),
+      do: NIF.lmdb_prefix_entries_reverse(path, prefix, limit, map_size()),
+      else: {:ok, []}
   end
 
   def prefix_count(path, prefix) when is_binary(path) and is_binary(prefix) do
-    NIF.lmdb_prefix_count(path, prefix, map_size())
+    if File.dir?(path), do: NIF.lmdb_prefix_count(path, prefix, map_size()), else: {:ok, 0}
   end
 
   def terminal_state?(state) when state in ["completed", "failed", "cancelled"], do: true

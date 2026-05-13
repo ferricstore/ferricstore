@@ -238,7 +238,8 @@ defmodule Ferricstore.Commands.Dispatcher do
     tdigest_min: "tdigest.min",
     tdigest_max: "tdigest.max",
     tdigest_info: "tdigest.info",
-    tdigest_merge: "tdigest.merge"
+    tdigest_merge: "tdigest.merge",
+    ferricstore_blobgc: "ferricstore.blobgc"
   }
 
   @single_value_ast_tags ~w(get incr decr strlen getdel getex ttl pttl persist expiretime pexpiretime llen lpop rpop hgetall hkeys hvals hlen hrandfield hscan httl hpersist hpttl hexpiretime hgetdel smembers scard srandmember spop zscore zrank zrevrank zcard zpopmin zpopmax zrandmember bitcount bitpos type xlen)a
@@ -477,7 +478,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _args} = ast, store)
-      when tag in ~w(flow_create flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_terminals flow_failures flow_info flow_stuck flow_history flow_retention_cleanup)a,
+      when tag in ~w(flow_create flow_value_put flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_terminals flow_failures flow_info flow_stuck flow_history flow_retention_cleanup)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
@@ -485,7 +486,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
-      when tag in ~w(flow_create flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_list flow_terminals flow_failures flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history flow_create_many flow_complete_many flow_retry_many flow_fail_many flow_cancel_many)a,
+      when tag in ~w(flow_create flow_value_put flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_list flow_terminals flow_failures flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history flow_create_many flow_complete_many flow_retry_many flow_fail_many flow_cancel_many)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)
@@ -512,7 +513,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _args} = ast, store)
-      when tag in ~w(cluster_health cluster_stats cluster_keyslot cluster_slots cluster_status cluster_join cluster_enable cluster_leave cluster_failover cluster_promote cluster_demote cluster_role ferricstore_hotness)a,
+      when tag in ~w(cluster_health cluster_stats cluster_keyslot cluster_slots cluster_status cluster_join cluster_leave cluster_failover cluster_promote cluster_demote cluster_role ferricstore_hotness)a,
       do: Cluster.handle(ast_command_name(tag), ast_args(ast), store)
 
   def dispatch_ast({:ferricstore_config, args}, store),
@@ -520,6 +521,9 @@ defmodule Ferricstore.Commands.Dispatcher do
 
   def dispatch_ast({:ferricstore_metrics, args}, _store),
     do: Ferricstore.Metrics.handle("FERRICSTORE.METRICS", args)
+
+  def dispatch_ast({:ferricstore_blobgc, args}, store),
+    do: Server.handle("FERRICSTORE.BLOBGC", args, store)
 
   def dispatch_ast({:memory, []}, _store),
     do: {:error, "ERR wrong number of arguments for 'memory' command"}
@@ -624,7 +628,6 @@ defmodule Ferricstore.Commands.Dispatcher do
   defp ast_command_name(:cluster_slots), do: "CLUSTER.SLOTS"
   defp ast_command_name(:cluster_status), do: "CLUSTER.STATUS"
   defp ast_command_name(:cluster_join), do: "CLUSTER.JOIN"
-  defp ast_command_name(:cluster_enable), do: "CLUSTER.ENABLE"
   defp ast_command_name(:cluster_leave), do: "CLUSTER.LEAVE"
   defp ast_command_name(:cluster_failover), do: "CLUSTER.FAILOVER"
   defp ast_command_name(:cluster_promote), do: "CLUSTER.PROMOTE"

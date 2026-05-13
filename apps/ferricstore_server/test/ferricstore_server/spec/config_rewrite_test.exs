@@ -243,6 +243,18 @@ defmodule FerricstoreServer.Spec.ConfigRewriteTest do
       assert content =~ "hz 50"
       assert content =~ "slowlog-max-len 256"
     end
+
+    test "CONFIG REWRITE does not persist requirepass plaintext", %{path: path} do
+      Config.set("requirepass", "super-secret")
+      assert :ok = Config.rewrite()
+
+      content = File.read!(path)
+      assert content =~ "requirepass "
+      refute content =~ "super-secret"
+
+      {:ok, stat} = File.stat(path)
+      assert Bitwise.band(stat.mode, 0o777) == 0o600
+    end
   end
 
   # ===========================================================================
@@ -355,9 +367,10 @@ defmodule FerricstoreServer.Spec.ConfigRewriteTest do
         |> String.split("\n", trim: true)
         |> Enum.reject(&String.starts_with?(&1, "#"))
 
-      keys = Enum.map(lines, fn line ->
-        line |> String.split(" ", parts: 2) |> hd()
-      end)
+      keys =
+        Enum.map(lines, fn line ->
+          line |> String.split(" ", parts: 2) |> hd()
+        end)
 
       assert keys == Enum.uniq(keys),
              "Duplicate keys found after 100 rewrites: #{inspect(keys -- Enum.uniq(keys))}"
@@ -385,9 +398,10 @@ defmodule FerricstoreServer.Spec.ConfigRewriteTest do
         |> String.split("\n", trim: true)
         |> Enum.reject(&String.starts_with?(&1, "#"))
 
-      keys = Enum.map(lines, fn line ->
-        line |> String.split(" ", parts: 2) |> hd()
-      end)
+      keys =
+        Enum.map(lines, fn line ->
+          line |> String.split(" ", parts: 2) |> hd()
+        end)
 
       assert keys == Enum.uniq(keys)
     end

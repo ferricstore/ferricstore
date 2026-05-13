@@ -178,7 +178,7 @@ defmodule Ferricstore.Bench.MultiNodeWriteBenchTest do
       cmd = {:put, "#{prefix}w#{w}:#{i}", "v#{i}"}
       start_us = System.monotonic_time(:microsecond)
 
-      case :ra.pipeline_command(leader, cmd, corr, :normal) do
+      case :ra.pipeline_command(leader, cmd, corr, :low) do
         :ok ->
           receive do
             {:ra_event, _, {:applied, applied}} ->
@@ -219,7 +219,9 @@ defmodule Ferricstore.Bench.MultiNodeWriteBenchTest do
       {:ok, peer_pid, node_name} =
         :peer.start(%{
           name: name,
-          args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", Atom.to_charlist(Node.get_cookie())]
+          args:
+            code_paths ++
+              [~c"-connect_all", ~c"false", ~c"-setcookie", Atom.to_charlist(Node.get_cookie())]
         })
 
       # Start ra on the peer
@@ -306,7 +308,9 @@ defmodule Ferricstore.Bench.MultiNodeWriteBenchTest do
   # Replication lag test
   # ---------------------------------------------------------------------------
 
-  test "async replication: fire-and-forget bulk writes, verify follower catches up", %{peers: peers} do
+  test "async replication: fire-and-forget bulk writes, verify follower catches up", %{
+    peers: peers
+  } do
     selected = Enum.take(peers, 3)
 
     id = :erlang.unique_integer([:positive])
@@ -319,11 +323,15 @@ defmodule Ferricstore.Bench.MultiNodeWriteBenchTest do
       dir = Path.join(System.tmp_dir!(), "lag_bench_#{id}_#{nd}")
       :rpc.call(nd, File, :mkdir_p!, [dir])
       names = :rpc.call(nd, :ra_system, :derive_names, [ra_sys])
+
       config = %{
-        name: ra_sys, names: names,
-        data_dir: to_charlist(dir), wal_data_dir: to_charlist(dir),
+        name: ra_sys,
+        names: names,
+        data_dir: to_charlist(dir),
+        wal_data_dir: to_charlist(dir),
         segment_max_entries: 8192
       }
+
       case :rpc.call(nd, :ra_system, :start, [config]) do
         {:ok, _} -> :ok
         {:error, {:already_started, _}} -> :ok
@@ -349,23 +357,41 @@ defmodule Ferricstore.Bench.MultiNodeWriteBenchTest do
     IO.puts("  Followers: #{inspect(followers)}\n")
 
     # Test with different value sizes
-    for {value_size, num_writes} <- [{100, 100_000}, {1_000, 50_000}, {10_000, 10_000}, {50_000, 5_000}, {100_000, 2_000}, {500_000, 500}] do
+    for {value_size, num_writes} <- [
+          {100, 100_000},
+          {1_000, 50_000},
+          {10_000, 10_000},
+          {50_000, 5_000},
+          {100_000, 2_000},
+          {500_000, 500}
+        ] do
       test_value_size(leader, followers, prefix, value_size, num_writes)
     end
 
     # Cleanup
     Enum.each(members, fn sid ->
-      try do :ra.stop_server(ra_sys, sid) catch _, _ -> :ok end
-      try do :ra.force_delete_server(ra_sys, sid) catch _, _ -> :ok end
+      try do
+        :ra.stop_server(ra_sys, sid)
+      catch
+        _, _ -> :ok
+      end
+
+      try do
+        :ra.force_delete_server(ra_sys, sid)
+      catch
+        _, _ -> :ok
+      end
     end)
   end
 
   defp test_value_size(leader, followers, prefix, value_size, num_writes) do
     value = String.duplicate("x", value_size)
-    size_label = cond do
-      value_size >= 1000 -> "#{div(value_size, 1000)}KB"
-      true -> "#{value_size}B"
-    end
+
+    size_label =
+      cond do
+        value_size >= 1000 -> "#{div(value_size, 1000)}KB"
+        true -> "#{value_size}B"
+      end
 
     IO.puts("\n  --- Value size: #{size_label}, #{num_writes} writes ---")
 
@@ -373,28 +399,36 @@ defmodule Ferricstore.Bench.MultiNodeWriteBenchTest do
     {leader_name, leader_node} = leader
     leader_pid = :rpc.call(leader_node, Process, :whereis, [leader_name])
 
-    mq_before = case :rpc.call(leader_node, Process, :info, [leader_pid, :message_queue_len]) do
-      {:message_queue_len, n} -> n
-      _ -> -1
-    end
+    mq_before =
+      case :rpc.call(leader_node, Process, :info, [leader_pid, :message_queue_len]) do
+        {:message_queue_len, n} -> n
+        _ -> -1
+      end
+
     IO.puts("  Leader mailbox before: #{mq_before}")
 
     # Blast all writes fire-and-forget
     write_start = System.monotonic_time(:microsecond)
 
     size_prefix = "#{prefix}s#{value_size}_"
+
     for i <- 1..num_writes do
-      :ra.pipeline_command(leader, {:put, "#{size_prefix}k#{i}", value})
+      :ra.pipeline_command(leader, {:put, "#{size_prefix}k#{i}", value}, make_ref(), :low)
     end
 
     write_elapsed = System.monotonic_time(:microsecond) - write_start
-    IO.puts("  #{num_writes} fire-and-forget writes submitted in #{write_elapsed}us (#{div(write_elapsed, num_writes)}us/op)")
+
+    IO.puts(
+      "  #{num_writes} fire-and-forget writes submitted in #{write_elapsed}us (#{div(write_elapsed, num_writes)}us/op)"
+    )
 
     # Check leader mailbox immediately after blast
-    mq_after = case :rpc.call(leader_node, Process, :info, [leader_pid, :message_queue_len]) do
-      {:message_queue_len, n} -> n
-      _ -> -1
-    end
+    mq_after =
+      case :rpc.call(leader_node, Process, :info, [leader_pid, :message_queue_len]) do
+        {:message_queue_len, n} -> n
+        _ -> -1
+      end
+
     IO.puts("  Leader mailbox after blast: #{mq_after}")
 
     # Check leader alive
@@ -403,7 +437,11 @@ defmodule Ferricstore.Bench.MultiNodeWriteBenchTest do
 
     # Check follower state at increasing intervals
     IO.puts("  Checking follower replication over time:")
-    IO.puts("  #{pad("Delay", 12)} #{rpad("On leader", 12)} #{rpad("On follower1", 14)} #{rpad("On follower2", 14)} #{rpad("Lost", 8)}")
+
+    IO.puts(
+      "  #{pad("Delay", 12)} #{rpad("On leader", 12)} #{rpad("On follower1", 14)} #{rpad("On follower2", 14)} #{rpad("Lost", 8)}"
+    )
+
     IO.puts("  #{String.duplicate("-", 65)}")
 
     for delay_ms <- [0, 100, 500, 1000, 2000, 5000, 10_000] do
@@ -428,11 +466,14 @@ defmodule Ferricstore.Bench.MultiNodeWriteBenchTest do
       [f1, f2] = follower_counts
       lost = num_writes - min(f1, f2)
 
-      IO.puts("  #{pad("#{delay_ms}ms", 12)} #{rpad("#{leader_count}", 12)} #{rpad("#{f1}", 14)} #{rpad("#{f2}", 14)} #{rpad("#{lost}", 8)}")
+      IO.puts(
+        "  #{pad("#{delay_ms}ms", 12)} #{rpad("#{leader_count}", 12)} #{rpad("#{f1}", 14)} #{rpad("#{f2}", 14)} #{rpad("#{lost}", 8)}"
+      )
     end
 
     # Wait for full replication of this batch
     Process.sleep(5000)
+
     final_counts =
       Enum.map([leader | followers], fn m ->
         case :ra.local_query(m, &Ferricstore.Test.SimpleKvMachine.count/1) do

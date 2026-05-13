@@ -682,24 +682,17 @@ defmodule Ferricstore.FlowTest do
                     %{count: 4, gets: 3, histories: 1}, %{source: :pipeline}}
   end
 
-  test "pipeline_write_batch_independent works in standalone mode" do
-    previous_mode = Ferricstore.ReplicationMode.current()
-    Ferricstore.ReplicationMode.put_current(:standalone)
-
-    on_exit(fn ->
-      Ferricstore.ReplicationMode.put_current(previous_mode)
-    end)
-
+  test "pipeline_write_batch_independent works" do
     ctx = FerricStore.Instance.get(:default)
-    partition_key = uid("flow-pipeline-write-standalone-partition")
-    id_a = uid("flow-pipeline-write-standalone-a")
-    id_b = uid("flow-pipeline-write-standalone-b")
+    partition_key = uid("flow-pipeline-write-partition")
+    id_a = uid("flow-pipeline-write-a")
+    id_b = uid("flow-pipeline-write-b")
 
     assert [:ok, :ok] =
              Ferricstore.Flow.pipeline_write_batch_independent(ctx, [
                {:create, id_a,
                 [
-                  type: "pipeline-write-standalone",
+                  type: "pipeline-write",
                   state: "queued",
                   run_at_ms: 1,
                   now_ms: 1,
@@ -707,7 +700,7 @@ defmodule Ferricstore.FlowTest do
                 ]},
                {:create, id_b,
                 [
-                  type: "pipeline-write-standalone",
+                  type: "pipeline-write",
                   state: "queued",
                   run_at_ms: 1,
                   now_ms: 1,
@@ -2702,7 +2695,7 @@ defmodule Ferricstore.FlowTest do
     assert {:error, "ERR key too large" <> _} =
              flow_create_and_get(large_id, type: "checkout")
 
-    assert {:error, "ERR flow payload_ref input is not supported; use payload"} =
+    assert {:error, "ERR flow payload_ref does not exist"} =
              flow_create_and_get("payload-ref-input", type: "checkout", payload_ref: "p")
 
     assert {:error, "ERR flow result_ref input is not supported; use result"} =

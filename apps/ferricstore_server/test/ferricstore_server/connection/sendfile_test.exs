@@ -2,7 +2,9 @@ defmodule FerricstoreServer.Connection.SendfileTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
+  alias Ferricstore.Store.BlobRef
   alias Ferricstore.Store.ActiveFile
+  alias Ferricstore.Stats
   alias Ferricstore.Test.IsolatedInstance
   alias Ferricstore.Bitcask.NIF
   alias FerricstoreServer.ClientTracking
@@ -86,6 +88,43 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     assert collect_fake_tls_sends() == []
   end
 
+  test "encrypted blob file ref response streams the blob payload directly" do
+    value = :binary.copy("b", Sendfile.file_stream_chunk_bytes() + 19)
+    path = write_tmp_blob_file!(value)
+
+    state = %{
+      socket: self(),
+      transport: FakeTlsTransport,
+      client_id: :test_client,
+      tracking: nil
+    }
+
+    assert {:sent, ^state} =
+             Sendfile.send_file_ref_response("blob-key", path, 0, byte_size(value), state)
+
+    sends = collect_fake_tls_sends()
+    assert List.first(sends) == "$#{byte_size(value)}\r\n"
+    assert List.last(sends) == "\r\n"
+    assert IO.iodata_to_binary(sends |> Enum.drop(1) |> Enum.drop(-1)) == value
+  end
+
+  test "blob file ref response rejects an opened blob file with extra bytes" do
+    value = :binary.copy("b", Sendfile.threshold_bytes())
+    path = write_tmp_file!(value <> "stale-extra-bytes", ".blob")
+
+    state = %{
+      socket: self(),
+      transport: FakeTlsTransport,
+      client_id: :test_client,
+      tracking: nil
+    }
+
+    assert :fallback =
+             Sendfile.send_file_ref_response("blob-key", path, 0, byte_size(value), state)
+
+    assert collect_fake_tls_sends() == []
+  end
+
   test "encrypted file range response streams only the requested range in bounded chunks" do
     chunk_bytes = Sendfile.file_stream_chunk_bytes()
     prefix = :binary.copy("p", 9)
@@ -120,6 +159,58 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     assert length(chunks) == 2
     assert Enum.all?(chunks, &(byte_size(&1) <= chunk_bytes))
     assert IO.iodata_to_binary(chunks) == range
+  end
+
+  test "encrypted blob file range response rejects a same-size corrupt blob before header" do
+    value = :binary.copy("b", Sendfile.threshold_bytes() + 512)
+    path = write_tmp_blob_file!(value)
+    File.write!(path, :binary.copy("x", byte_size(value)))
+
+    state = %{
+      socket: self(),
+      transport: FakeTlsTransport,
+      client_id: :test_client,
+      tracking: nil
+    }
+
+    assert :fallback =
+             Sendfile.send_file_range_response(
+               ["blob-key", "0", Integer.to_string(Sendfile.threshold_bytes() - 1)],
+               path,
+               0,
+               Sendfile.threshold_bytes(),
+               state
+             )
+
+    assert collect_fake_tls_sends() == []
+  end
+
+  test "tcp blob file range response rejects a same-size corrupt blob before header" do
+    value = :binary.copy("b", Sendfile.threshold_bytes() + 512)
+    path = write_tmp_blob_file!(value)
+    File.write!(path, :binary.copy("x", byte_size(value)))
+    {server_socket, client_socket} = tcp_pair()
+
+    state = %{
+      socket: server_socket,
+      transport: :ranch_tcp,
+      client_id: :test_client,
+      tracking: nil
+    }
+
+    try do
+      assert :fallback =
+               Sendfile.send_file_range_response(
+                 ["blob-key", "0", Integer.to_string(Sendfile.threshold_bytes() - 1)],
+                 path,
+                 0,
+                 Sendfile.threshold_bytes(),
+                 state
+               )
+    after
+      :gen_tcp.close(server_socket)
+      :gen_tcp.close(client_socket)
+    end
   end
 
   test "MGET reuses prefetched cold values below stream threshold instead of dispatching again",
@@ -204,6 +295,351 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     assert IO.iodata_to_binary(sends |> Enum.drop(1) |> Enum.drop(-1)) == value
   end
 
+  test "sandboxed cold GET pipeline validates stream refs with internal lookup keys" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 1024,
+        blob_side_channel_threshold_bytes: 0
+      )
+
+    sandbox = "sandbox:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"
+    cold_key = "pipeline-cold-sandbox-sendfile"
+    hot_key = "pipeline-hot-sandbox-sendfile"
+    cold_lookup_key = sandbox <> cold_key
+    hot_lookup_key = sandbox <> hot_key
+    cold_value = :binary.copy("p", Sendfile.threshold_bytes() + 512)
+
+    :ok = Router.put(ctx, cold_lookup_key, cold_value, 0)
+    :ok = Router.put(ctx, hot_lookup_key, "ok", 0)
+
+    parent = self()
+    telemetry_id = {:pipeline_sandbox_sendfile, self(), make_ref()}
+
+    :telemetry.attach(
+      telemetry_id,
+      [:ferricstore, :server, :sendfile],
+      fn event, measurements, metadata, _config ->
+        send(parent, {:sendfile_event, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(telemetry_id) end)
+
+    {server_socket, client_socket} = tcp_pair()
+
+    state = %Connection{
+      socket: server_socket,
+      transport: :ranch_tcp,
+      client_id: :test_client,
+      instance_ctx: ctx,
+      stats_counter: ctx.stats_counter,
+      authenticated: true,
+      require_auth: false,
+      acl_cache: :full_access,
+      sandbox_namespace: sandbox,
+      tracking: nil
+    }
+
+    commands = [
+      {:command, "GET", [cold_key], {:get, cold_key}, [cold_key]},
+      {:command, "GET", [hot_key], {:get, hot_key}, [hot_key]}
+    ]
+
+    send_response = fn socket, :ranch_tcp, response -> :gen_tcp.send(socket, response) end
+    handle_command = fn command, _state -> flunk("unexpected fallback: #{inspect(command)}") end
+
+    try do
+      assert {:continue, _new_state} =
+               Pipeline.pipeline_dispatch(commands, state, handle_command, send_response)
+
+      assert_receive {:sendfile_event, [:ferricstore, :server, :sendfile], %{bytes: byte_count},
+                      %{result: :ok, client_id: :test_client}}
+
+      assert byte_count == byte_size(cold_value)
+      assert {:ok, _response} = :gen_tcp.recv(client_socket, 0, 1_000)
+    after
+      :gen_tcp.close(server_socket)
+      :gen_tcp.close(client_socket)
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "sandboxed mixed GET SET pipeline validates stream refs with internal lookup keys" do
+    ctx = FerricStore.Instance.get(:default)
+    sandbox = "sandbox:" <> Integer.to_string(System.unique_integer([:positive])) <> ":"
+    cold_key = "mixed-pipeline-cold-sandbox-sendfile"
+    set_key = "mixed-pipeline-set-sandbox-sendfile"
+    cold_lookup_key = sandbox <> cold_key
+    set_lookup_key = sandbox <> set_key
+    cold_value = :binary.copy("m", Sendfile.threshold_bytes() + 512)
+
+    :ok = Router.put(ctx, cold_lookup_key, cold_value, 0)
+
+    parent = self()
+    telemetry_id = {:mixed_pipeline_sandbox_sendfile, self(), make_ref()}
+
+    :telemetry.attach(
+      telemetry_id,
+      [:ferricstore, :server, :sendfile],
+      fn event, measurements, metadata, _config ->
+        send(parent, {:sendfile_event, event, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(telemetry_id) end)
+
+    {server_socket, client_socket} = tcp_pair()
+
+    state = %Connection{
+      socket: server_socket,
+      transport: :ranch_tcp,
+      client_id: :test_client,
+      instance_ctx: ctx,
+      stats_counter: ctx.stats_counter,
+      authenticated: true,
+      require_auth: false,
+      acl_cache: :full_access,
+      sandbox_namespace: sandbox,
+      tracking: nil
+    }
+
+    commands = [
+      {:command, "GET", [cold_key], {:get, cold_key}, [cold_key]},
+      {:command, "SET", [set_key, "ok"], {:set, set_key, "ok"}, [set_key]}
+    ]
+
+    send_response = fn socket, :ranch_tcp, response -> :gen_tcp.send(socket, response) end
+    handle_command = fn command, _state -> flunk("unexpected fallback: #{inspect(command)}") end
+
+    try do
+      assert {:continue, _new_state} =
+               Pipeline.pipeline_dispatch(commands, state, handle_command, send_response)
+
+      assert_receive {:sendfile_event, [:ferricstore, :server, :sendfile], %{bytes: byte_count},
+                      %{result: :ok, client_id: :test_client}}
+
+      assert byte_count == byte_size(cold_value)
+      response = recv_until(client_socket, "+OK\r\n")
+      assert response =~ "$#{byte_size(cold_value)}\r\n"
+      assert response =~ "+OK\r\n"
+      assert Router.get(ctx, set_lookup_key) == "ok"
+    after
+      Router.delete(ctx, cold_lookup_key)
+      Router.delete(ctx, set_lookup_key)
+      :gen_tcp.close(server_socket)
+      :gen_tcp.close(client_socket)
+    end
+  end
+
+  test "sendfile GET miss is accounted once", %{ctx: ctx} do
+    key = "missing-sendfile-get"
+
+    state = %{
+      instance_ctx: ctx,
+      sandbox_namespace: nil,
+      pubsub_channels: nil,
+      tracking: nil
+    }
+
+    fallback = fn "GET", [^key], fallback_state ->
+      {:continue, FerricstoreServer.Resp.Encoder.encode(Router.get(ctx, key)), fallback_state}
+    end
+
+    before_misses = Stats.keyspace_misses(ctx)
+
+    assert {:continue, encoded, ^state} = Sendfile.dispatch_get([key], state, fallback)
+    assert IO.iodata_to_binary(encoded) == "_\r\n"
+    assert Stats.keyspace_misses(ctx) - before_misses == 1
+  end
+
+  test "GET reuses a validated small cold file ref instead of dispatching again", %{ctx: ctx} do
+    key = "small-cold-sendfile-get"
+    value = :binary.copy("s", ctx.hot_cache_max_value_size + 256)
+
+    :ok = Router.put(ctx, key, value, 0)
+
+    state = %{
+      instance_ctx: ctx,
+      sandbox_namespace: nil,
+      pubsub_channels: nil,
+      tracking: nil
+    }
+
+    fallback = fn _cmd, _args, _state ->
+      flunk("GET fallback should not run after get_with_file_ref returned a small cold ref")
+    end
+
+    before_cold_reads = Stats.total_cold_reads(ctx)
+
+    assert {:continue, encoded, ^state} = Sendfile.dispatch_get([key], state, fallback)
+    assert {:ok, [^value], ""} = Parser.parse(IO.iodata_to_binary(encoded))
+    assert Stats.total_cold_reads(ctx) - before_cold_reads == 1
+  end
+
+  test "GET does not materialize a corrupt small blob file ref" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 64,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    key = "small-corrupt-blob-sendfile-get"
+    value = :binary.copy("b", 1024)
+
+    try do
+      :ok = Router.put(ctx, key, value, 0)
+      assert {:cold_ref, blob_path, 0, 1024} = Router.get_with_file_ref(ctx, key)
+      File.write!(blob_path, :binary.copy("x", byte_size(value)))
+
+      state = %{
+        instance_ctx: ctx,
+        sandbox_namespace: nil,
+        pubsub_channels: nil,
+        tracking: nil
+      }
+
+      fallback = fn "GET", [^key], fallback_state ->
+        {:continue, FerricstoreServer.Resp.Encoder.encode(Router.get(ctx, key)), fallback_state}
+      end
+
+      assert {:continue, encoded, ^state} = Sendfile.dispatch_get([key], state, fallback)
+      assert IO.iodata_to_binary(encoded) == "_\r\n"
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "GET does not stream a corrupt large blob file ref" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 64,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    key = "large-corrupt-blob-sendfile-get"
+    value = :binary.copy("B", Sendfile.threshold_bytes() + 512)
+
+    try do
+      :ok = Router.put(ctx, key, value, 0)
+      assert {:cold_ref, blob_path, 0, size} = Router.get_with_file_ref(ctx, key)
+      assert size == byte_size(value)
+      File.write!(blob_path, :binary.copy("x", byte_size(value)))
+
+      state = %{
+        socket: self(),
+        transport: FakeTlsTransport,
+        client_id: :test_client,
+        instance_ctx: ctx,
+        sandbox_namespace: nil,
+        pubsub_channels: nil,
+        tracking: nil
+      }
+
+      fallback = fn "GET", [^key], fallback_state ->
+        {:continue, FerricstoreServer.Resp.Encoder.encode(Router.get(ctx, key)), fallback_state}
+      end
+
+      assert {:continue, encoded, ^state} = Sendfile.dispatch_get([key], state, fallback)
+      assert IO.iodata_to_binary(encoded) == "_\r\n"
+      assert collect_fake_tls_sends() == []
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "GETRANGE does not materialize a corrupt small blob file ref range" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 64,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    key = "small-corrupt-blob-sendfile-getrange"
+    value = :binary.copy("r", 1024)
+    args = [key, "0", "15"]
+
+    try do
+      :ok = Router.put(ctx, key, value, 0)
+      assert {:cold_ref, blob_path, 0, 1024} = Router.get_with_file_ref(ctx, key)
+      File.write!(blob_path, :binary.copy("x", byte_size(value)))
+
+      state = %{
+        instance_ctx: ctx,
+        sandbox_namespace: nil,
+        pubsub_channels: nil,
+        tracking: nil
+      }
+
+      fallback = fn fallback_state ->
+        value = Sendfile.materialize_getrange(key, 0, 15, fallback_state)
+        {:continue, FerricstoreServer.Resp.Encoder.encode(value), fallback_state}
+      end
+
+      assert {:continue, encoded, ^state} =
+               Sendfile.dispatch_getrange(args, key, 0, 15, state, fallback)
+
+      assert IO.iodata_to_binary(encoded) == "$0\r\n\r\n"
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "GETRANGE does not stream a corrupt large blob file ref range" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 64,
+        blob_side_channel_threshold_bytes: 128
+      )
+
+    key = "large-corrupt-blob-sendfile-getrange"
+    value = :binary.copy("R", Sendfile.threshold_bytes() + 512)
+    args = [key, "0", Integer.to_string(Sendfile.threshold_bytes())]
+
+    try do
+      :ok = Router.put(ctx, key, value, 0)
+      assert {:cold_ref, blob_path, 0, size} = Router.get_with_file_ref(ctx, key)
+      assert size == byte_size(value)
+      File.write!(blob_path, :binary.copy("x", byte_size(value)))
+
+      state = %{
+        socket: self(),
+        transport: FakeTlsTransport,
+        client_id: :test_client,
+        instance_ctx: ctx,
+        sandbox_namespace: nil,
+        pubsub_channels: nil,
+        tracking: nil
+      }
+
+      fallback = fn fallback_state ->
+        value = Sendfile.materialize_getrange(key, 0, Sendfile.threshold_bytes(), fallback_state)
+        {:continue, FerricstoreServer.Resp.Encoder.encode(value), fallback_state}
+      end
+
+      assert {:continue, encoded, ^state} =
+               Sendfile.dispatch_getrange(
+                 args,
+                 key,
+                 0,
+                 Sendfile.threshold_bytes(),
+                 state,
+                 fallback
+               )
+
+      assert IO.iodata_to_binary(encoded) == "$0\r\n\r\n"
+      assert collect_fake_tls_sends() == []
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
   test "general pipeline keeps tracking from non-streaming reads when later cold reads stream",
        %{ctx: ctx} do
     hot_key = "pipeline-hot-tracked"
@@ -252,21 +688,37 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     {:ok, listen} =
       :gen_tcp.listen(0, [:binary, {:packet, :raw}, {:active, false}, {:reuseaddr, true}])
 
+    parent = self()
     {:ok, port} = :inet.port(listen)
-    acceptor = Task.async(fn -> :gen_tcp.accept(listen) end)
+
+    acceptor =
+      Task.async(fn ->
+        {:ok, server_socket} = :gen_tcp.accept(listen)
+        :ok = :gen_tcp.controlling_process(server_socket, parent)
+        {:ok, server_socket}
+      end)
+
     {:ok, client_socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, {:active, false}])
     {:ok, server_socket} = Task.await(acceptor)
     :gen_tcp.close(listen)
     {server_socket, client_socket}
   end
 
-  defp write_tmp_file!(value) do
+  defp write_tmp_file!(value, suffix \\ ".bin") do
     path =
       Path.join(
         System.tmp_dir!(),
-        "ferricstore_sendfile_test_#{System.unique_integer([:positive, :monotonic])}.bin"
+        "ferricstore_sendfile_test_#{System.unique_integer([:positive, :monotonic])}#{suffix}"
       )
 
+    File.write!(path, value)
+    on_exit(fn -> File.rm(path) end)
+    path
+  end
+
+  defp write_tmp_blob_file!(value) do
+    ref = BlobRef.from_payload(value)
+    path = Path.join(System.tmp_dir!(), Base.encode16(ref.checksum, case: :lower) <> ".blob")
     File.write!(path, value)
     on_exit(fn -> File.rm(path) end)
     path
@@ -283,6 +735,21 @@ defmodule FerricstoreServer.Connection.SendfileTest do
       {:fake_tls_send, data} -> collect_fake_tls_sends([data | acc])
     after
       0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp recv_until(sock, pattern, acc \\ "", attempts \\ 20)
+
+  defp recv_until(_sock, _pattern, acc, 0), do: acc
+
+  defp recv_until(sock, pattern, acc, attempts) do
+    if String.contains?(acc, pattern) do
+      acc
+    else
+      case :gen_tcp.recv(sock, 0, 100) do
+        {:ok, data} -> recv_until(sock, pattern, acc <> data, attempts - 1)
+        {:error, _reason} -> acc
+      end
     end
   end
 end

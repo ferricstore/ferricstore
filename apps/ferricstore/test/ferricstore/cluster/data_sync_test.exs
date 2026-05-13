@@ -131,6 +131,39 @@ defmodule Ferricstore.Cluster.DataSyncTest do
              "large-payload"
   end
 
+  test "blob side-channel files force full resync instead of WAL-only bridge" do
+    assert :needs_resync =
+             DataSync.__maybe_require_blob_resync_for_test__(:wal_bridgeable, {:ok, true})
+
+    assert :wal_bridgeable =
+             DataSync.__maybe_require_blob_resync_for_test__(:wal_bridgeable, {:ok, false})
+
+    assert :needs_resync =
+             DataSync.__maybe_require_blob_resync_for_test__(:needs_resync, {:ok, true})
+  end
+
+  test "blob side-channel inspection errors fail closed to full resync" do
+    assert :needs_resync =
+             DataSync.__maybe_require_blob_resync_for_test__(
+               :wal_bridgeable,
+               {:error, {:ls_failed, :eacces}}
+             )
+  end
+
+  test "remote batcher pause failures return error tuples instead of exiting" do
+    missing_node = :"missing_data_sync_node@127.0.0.1"
+
+    assert {:error, {:pause_batcher_failed, _reason}} =
+             DataSync.__pause_batcher_for_test__(missing_node, 0)
+  end
+
+  test "remote shard pause failures return error tuples instead of exiting" do
+    missing_node = :"missing_data_sync_node@127.0.0.1"
+
+    assert {:error, {:pause_shard_failed, _reason}} =
+             DataSync.__pause_shard_for_test__(missing_node, :missing_shard)
+  end
+
   test "partial cleanup removes target shard data, dedicated data, and blob data" do
     root =
       Path.join(System.tmp_dir!(), "ferricstore_data_sync_#{System.unique_integer([:positive])}")

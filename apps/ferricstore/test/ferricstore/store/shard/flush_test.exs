@@ -134,4 +134,46 @@ defmodule Ferricstore.Store.Shard.FlushTest do
       File.rm_rf!(dir)
     end
   end
+
+  test "maybe_rotate_file does not write hint files on the apply hot path" do
+    Ferricstore.Store.ActiveFile.init(1)
+
+    instance_name = :"rotation_no_hint_#{System.unique_integer([:positive])}"
+    scheduler_name = :"#{instance_name}.Merge.Scheduler.0"
+    ctx = %{name: instance_name}
+    dir = Path.join(System.tmp_dir!(), "rotation_no_hint_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+    active_path = Path.join(dir, "00000.log")
+    File.write!(active_path, "active")
+
+    keydir = :ets.new(:"rotation_no_hint_#{System.unique_integer([:positive])}", [:set, :public])
+    :ets.insert(keydir, {"hot-key", "value", 0, 0, 0, 0, 5})
+
+    {:ok, scheduler} = CaptureScheduler.start_link(name: scheduler_name, parent: self())
+
+    state = %{
+      active_file_id: 0,
+      active_file_path: active_path,
+      active_file_size: 10_000,
+      file_stats: %{0 => {10_000, 0}},
+      index: 0,
+      instance_ctx: ctx,
+      keydir: keydir,
+      max_active_file_size: 1_024,
+      pending: [],
+      shard_data_path: dir
+    }
+
+    try do
+      new_state = Flush.maybe_rotate_file(state)
+
+      assert new_state.active_file_id == 1
+      refute File.exists?(Path.join(dir, "00000.hint"))
+    after
+      if Process.alive?(scheduler), do: GenServer.stop(scheduler)
+      :ets.delete(keydir)
+      File.rm_rf!(dir)
+    end
+  end
 end

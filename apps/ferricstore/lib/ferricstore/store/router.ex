@@ -26,11 +26,22 @@ defmodule Ferricstore.Store.Router do
   alias Ferricstore.Raft.PerfToggles
   alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Stats
-  alias Ferricstore.Store.{CompoundKey, LFU, ListOps, SlotMap, TypeRegistry}
+
+  alias Ferricstore.Store.{
+    BlobRef,
+    BlobStore,
+    BlobValue,
+    CompoundKey,
+    LFU,
+    ListOps,
+    SlotMap,
+    TypeRegistry
+  }
 
   @cold_batch_read_timeout_ms 10_000
   @cold_location_retry_attempts 8
   @cold_location_retry_sleep_ms 1
+  @blob_gc_timeout_ms 30_000
   @default_async_key_latch_timeout_ms 30_000
   @flow_claim_cursor_table :ferricstore_flow_claim_due_any_cursor
 
@@ -51,6 +62,103 @@ defmodule Ferricstore.Store.Router do
   @spec resolve_shard(FerricStore.Instance.t(), non_neg_integer()) :: atom()
   @doc false
   def resolve_shard(ctx, idx), do: elem(ctx.shard_names, idx)
+
+  @doc "Runs conservative blob garbage collection across all shards."
+  @spec sweep_blob_garbage(FerricStore.Instance.t()) ::
+          {:ok,
+           %{
+             deleted_files: non_neg_integer(),
+             deleted_bytes: non_neg_integer(),
+             kept_files: non_neg_integer()
+           }}
+          | {:error, term()}
+  def sweep_blob_garbage(ctx) do
+    started_at = System.monotonic_time()
+
+    result =
+      shard_indices(ctx)
+      |> Enum.reduce_while({:ok, empty_blob_gc_stats()}, fn idx, {:ok, acc} ->
+        case call_blob_gc_shard(ctx, idx) do
+          {:ok, stats} ->
+            {:cont, {:ok, merge_blob_gc_stats(acc, stats)}}
+
+          {:error, reason} ->
+            emit_blob_gc_failed(idx, reason)
+            {:halt, {:error, {idx, reason}}}
+
+          other ->
+            emit_blob_gc_failed(idx, other)
+            {:halt, {:error, {idx, other}}}
+        end
+      end)
+
+    emit_blob_gc_finished(ctx, result, started_at)
+    result
+  end
+
+  defp shard_indices(%{shard_count: count}) when is_integer(count) and count > 0,
+    do: 0..(count - 1)
+
+  defp shard_indices(_ctx), do: []
+
+  defp call_blob_gc_shard(ctx, idx) do
+    GenServer.call(resolve_shard(ctx, idx), :sweep_blob_garbage, @blob_gc_timeout_ms)
+  catch
+    :exit, reason -> {:error, {:shard_unavailable, reason}}
+  end
+
+  defp empty_blob_gc_stats,
+    do: %{
+      deleted_files: 0,
+      deleted_bytes: 0,
+      kept_files: 0,
+      deleted_tmp_files: 0,
+      deleted_tmp_bytes: 0
+    }
+
+  defp merge_blob_gc_stats(acc, stats) do
+    %{
+      deleted_files: acc.deleted_files + Map.get(stats, :deleted_files, 0),
+      deleted_bytes: acc.deleted_bytes + Map.get(stats, :deleted_bytes, 0),
+      kept_files: acc.kept_files + Map.get(stats, :kept_files, 0),
+      deleted_tmp_files: acc.deleted_tmp_files + Map.get(stats, :deleted_tmp_files, 0),
+      deleted_tmp_bytes: acc.deleted_tmp_bytes + Map.get(stats, :deleted_tmp_bytes, 0)
+    }
+  end
+
+  defp emit_blob_gc_failed(shard_index, reason) do
+    :telemetry.execute(
+      [:ferricstore, :blob, :gc, :failed],
+      %{count: 1},
+      %{shard_index: shard_index, reason: reason}
+    )
+  end
+
+  defp emit_blob_gc_finished(ctx, result, started_at) do
+    duration_ms =
+      System.convert_time_unit(System.monotonic_time() - started_at, :native, :millisecond)
+
+    case result do
+      {:ok, stats} ->
+        :telemetry.execute(
+          [:ferricstore, :blob, :gc],
+          Map.put(stats, :duration_ms, duration_ms),
+          %{result: :ok, shard_count: Map.get(ctx, :shard_count, 0)}
+        )
+
+      {:error, {shard_index, reason}} ->
+        :telemetry.execute(
+          [:ferricstore, :blob, :gc],
+          Map.put(empty_blob_gc_stats(), :duration_ms, duration_ms),
+          %{
+            result: :error,
+            shard_count: Map.get(ctx, :shard_count, 0),
+            shard_index: shard_index,
+            reason: reason
+          }
+        )
+    end
+  end
 
   @doc false
   def safe_read_call(ctx, idx, request) do
@@ -644,20 +752,9 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, file_id, offset, value_size}
       when valid_cold_location(file_id, offset, value_size) ->
-        path = cold_file_path(ctx, idx, file_id)
-
-        case validated_file_ref(path, offset, key, value_size) do
-          {^path, value_offset, ^value_size} ->
-            {path, value_offset, value_size}
-
-          nil ->
-            case retry_changed_file_ref(ctx, idx, keydir, key, {file_id, offset, value_size}, now) do
-              {:cold_ref, retry_path, value_offset, retry_size} ->
-                {retry_path, value_offset, retry_size}
-
-              _ ->
-                nil
-            end
+        case file_ref_from_cold_location(ctx, idx, keydir, key, file_id, offset, value_size, now) do
+          {:ok, file_ref} -> file_ref
+          _ -> nil
         end
 
       {:cold, _file_id, _offset, _value_size} ->
@@ -706,26 +803,17 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, file_id, offset, value_size}
       when valid_cold_location(file_id, offset, value_size) ->
-        path = cold_file_path(ctx, idx, file_id)
-
-        case validated_file_ref(path, offset, key, value_size) do
-          {^path, value_offset, ^value_size} ->
+        case file_ref_from_cold_location(ctx, idx, keydir, key, file_id, offset, value_size, now) do
+          {:ok, {path, value_offset, value_size}} ->
             Stats.record_cold_read(ctx, key)
             {:cold_ref, path, value_offset, value_size}
 
-          nil ->
-            case retry_changed_file_ref(ctx, idx, keydir, key, {file_id, offset, value_size}, now) do
-              {:cold_ref, retry_path, value_offset, retry_size} ->
-                Stats.record_cold_read(ctx, key)
-                {:cold_ref, retry_path, value_offset, retry_size}
+          {:hot, value} ->
+            {:hot, value}
 
-              {:hot, value} ->
-                {:hot, value}
-
-              :miss ->
-                Stats.incr_keyspace_misses(ctx)
-                :miss
-            end
+          :miss ->
+            Stats.incr_keyspace_misses(ctx)
+            :miss
         end
 
       {:cold, _file_id, _offset, _value_size} ->
@@ -783,6 +871,54 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  defp file_ref_from_cold_location(ctx, idx, keydir, key, file_id, offset, value_size, now) do
+    path = cold_file_path(ctx, idx, file_id)
+
+    case cold_blob_file_ref_from_location(ctx, idx, path, offset, key, value_size) do
+      {:ok, file_ref} ->
+        {:ok, file_ref}
+
+      :not_blob ->
+        case validated_file_ref(path, offset, key, value_size) do
+          {^path, value_offset, ^value_size} ->
+            {:ok, {path, value_offset, value_size}}
+
+          nil ->
+            retry_file_ref_from_changed_location(
+              ctx,
+              idx,
+              keydir,
+              key,
+              {file_id, offset, value_size},
+              now
+            )
+        end
+
+      {:error, _reason} ->
+        retry_file_ref_from_changed_location(
+          ctx,
+          idx,
+          keydir,
+          key,
+          {file_id, offset, value_size},
+          now
+        )
+    end
+  end
+
+  defp retry_file_ref_from_changed_location(ctx, idx, keydir, key, original_location, now) do
+    case retry_changed_file_ref(ctx, idx, keydir, key, original_location, now) do
+      {:cold_ref, retry_path, value_offset, retry_size} ->
+        {:ok, {retry_path, value_offset, retry_size}}
+
+      {:hot, value} ->
+        {:hot, value}
+
+      _ ->
+        :miss
+    end
+  end
+
   defp retry_changed_file_ref(ctx, idx, keydir, key, original_location, now) do
     case retry_changed_file_ref_once(ctx, idx, keydir, key, original_location, now) do
       :unchanged_cold ->
@@ -809,9 +945,18 @@ defmodule Ferricstore.Store.Router do
              {file_id, offset, value_size} != original_location ->
         path = cold_file_path(ctx, idx, file_id)
 
-        case validated_file_ref(path, offset, key, value_size) do
-          {^path, value_offset, ^value_size} -> {:cold_ref, path, value_offset, value_size}
-          nil -> :miss
+        case cold_blob_file_ref_from_location(ctx, idx, path, offset, key, value_size) do
+          {:ok, {blob_path, blob_offset, blob_size}} ->
+            {:cold_ref, blob_path, blob_offset, blob_size}
+
+          :not_blob ->
+            case validated_file_ref(path, offset, key, value_size) do
+              {^path, value_offset, ^value_size} -> {:cold_ref, path, value_offset, value_size}
+              nil -> :miss
+            end
+
+          {:error, _reason} ->
+            :miss
         end
 
       {:cold, file_id, offset, value_size}
@@ -952,7 +1097,7 @@ defmodule Ferricstore.Store.Router do
         # so pread works without flushing pending writes.
         path = cold_file_path(ctx, idx, file_id)
 
-        case read_cold_async(path, offset, key) do
+        case read_cold_async(ctx, idx, path, offset, key) do
           {:ok, value} when is_binary(value) ->
             Stats.record_cold_read(ctx, key)
             # Warm ETS: promote back to hot if value fits in cache
@@ -1218,6 +1363,71 @@ defmodule Ferricstore.Store.Router do
          cold_entries,
          cold_count,
          now
+       ) do
+    case cold_blob_file_ref_from_location(ctx, idx, path, offset, key, value_size) do
+      {:ok, {blob_path, blob_offset, blob_size}} when blob_size >= min_file_ref_size ->
+        Stats.record_cold_read(ctx, key)
+        {{:file_ref, blob_path, blob_offset, blob_size}, {cold_entries, cold_count}}
+
+      {:ok, {_blob_path, _blob_offset, _blob_size}} ->
+        cold_batch_entry(
+          ctx,
+          idx,
+          keydir,
+          key,
+          path,
+          file_id,
+          offset,
+          value_size,
+          cold_entries,
+          cold_count
+        )
+
+      :not_blob ->
+        maybe_regular_file_ref_or_cold_entry(
+          ctx,
+          idx,
+          keydir,
+          key,
+          path,
+          file_id,
+          offset,
+          value_size,
+          min_file_ref_size,
+          cold_entries,
+          cold_count,
+          now
+        )
+
+      {:error, _reason} ->
+        cold_batch_entry(
+          ctx,
+          idx,
+          keydir,
+          key,
+          path,
+          file_id,
+          offset,
+          value_size,
+          cold_entries,
+          cold_count
+        )
+    end
+  end
+
+  defp maybe_regular_file_ref_or_cold_entry(
+         ctx,
+         idx,
+         keydir,
+         key,
+         path,
+         file_id,
+         offset,
+         value_size,
+         min_file_ref_size,
+         cold_entries,
+         cold_count,
+         now
        )
        when value_size >= min_file_ref_size do
     case validated_file_ref(path, offset, key, value_size) do
@@ -1241,7 +1451,7 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp maybe_file_ref_or_cold_entry(
+  defp maybe_regular_file_ref_or_cold_entry(
          ctx,
          idx,
          keydir,
@@ -1254,6 +1464,32 @@ defmodule Ferricstore.Store.Router do
          cold_entries,
          cold_count,
          _now
+       ) do
+    cold_batch_entry(
+      ctx,
+      idx,
+      keydir,
+      key,
+      path,
+      file_id,
+      offset,
+      value_size,
+      cold_entries,
+      cold_count
+    )
+  end
+
+  defp cold_batch_entry(
+         ctx,
+         idx,
+         keydir,
+         key,
+         path,
+         file_id,
+         offset,
+         value_size,
+         cold_entries,
+         cold_count
        ) do
     entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
     {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
@@ -1329,9 +1565,21 @@ defmodule Ferricstore.Store.Router do
     Enum.map(entry_values, fn
       {{ctx, idx, keydir, key, _path, file_id, offset, _value_size}, value}
       when is_binary(value) ->
-        Stats.record_cold_read(ctx, key)
-        warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
-        value
+        case BlobValue.maybe_materialize(
+               ctx.data_dir,
+               idx,
+               blob_side_channel_threshold(ctx),
+               value
+             ) do
+          {:ok, materialized} ->
+            Stats.record_cold_read(ctx, key)
+            warm_ets_after_cold_read(ctx, idx, keydir, key, materialized, file_id, offset)
+            materialized
+
+          {:error, _reason} ->
+            Stats.incr_keyspace_misses(ctx)
+            nil
+        end
 
       {{ctx, idx, keydir, key, _path, file_id, offset, value_size}, _value} ->
         case retry_changed_cold_value(ctx, idx, keydir, key, {file_id, offset, value_size}, now) do
@@ -1397,6 +1645,14 @@ defmodule Ferricstore.Store.Router do
     Ferricstore.Store.ColdRead.pread_at(path, offset, expected_key, @cold_batch_read_timeout_ms)
   end
 
+  defp read_cold_async(ctx, idx, path, offset, expected_key) do
+    with {:ok, value} <- read_cold_async(path, offset, expected_key),
+         {:ok, materialized} <-
+           BlobValue.maybe_materialize(ctx.data_dir, idx, blob_side_channel_threshold(ctx), value) do
+      {:ok, materialized}
+    end
+  end
+
   defp retry_changed_cold_value(ctx, idx, keydir, key, original_location, now) do
     case retry_changed_cold_value_once(ctx, idx, keydir, key, original_location, now) do
       :unchanged_cold ->
@@ -1423,7 +1679,7 @@ defmodule Ferricstore.Store.Router do
              {file_id, offset, value_size} != original_location ->
         path = cold_file_path(ctx, idx, file_id)
 
-        case read_cold_async(path, offset, key) do
+        case read_cold_async(ctx, idx, path, offset, key) do
           {:ok, value} when is_binary(value) -> {:cold, value, file_id, offset}
           _ -> :miss
         end
@@ -1464,7 +1720,7 @@ defmodule Ferricstore.Store.Router do
              {file_id, offset, value_size} != original_location ->
         path = cold_file_path(ctx, idx, file_id)
 
-        case read_cold_async(path, offset, key) do
+        case read_cold_async(ctx, idx, path, offset, key) do
           {:ok, value} when is_binary(value) -> {:cold, value, expire_at_ms, file_id, offset}
           _ -> :miss
         end
@@ -1551,7 +1807,7 @@ defmodule Ferricstore.Store.Router do
         # Cold key — read value from disk directly, return with expire_at_ms.
         path = cold_file_path(ctx, idx, file_id)
 
-        case read_cold_async(path, offset, key) do
+        case read_cold_async(ctx, idx, path, offset, key) do
           {:ok, value} when is_binary(value) ->
             Stats.record_cold_read(ctx, key)
             warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
@@ -1698,7 +1954,7 @@ defmodule Ferricstore.Store.Router do
           stored_value_size(value)
 
         [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-          vsize
+          cold_value_size(ctx, idx, key, fid, off, vsize)
 
         [{^key, nil, 0, _lfu, :pending, _off, vsize}]
         when valid_pending_value_size(vsize) ->
@@ -1709,7 +1965,7 @@ defmodule Ferricstore.Store.Router do
 
         [{^key, nil, exp, _lfu, fid, off, vsize}]
         when exp > now and valid_cold_location(fid, off, vsize) ->
-          vsize
+          cold_value_size(ctx, idx, key, fid, off, vsize)
 
         [{^key, nil, exp, _lfu, :pending, _off, vsize}]
         when exp > now and valid_pending_value_size(vsize) ->
@@ -1725,6 +1981,15 @@ defmodule Ferricstore.Store.Router do
       end
     rescue
       ArgumentError -> keydir_unavailable(ctx, idx, :value_size, nil)
+    end
+  end
+
+  defp cold_value_size(ctx, idx, key, file_id, offset, persisted_value_size) do
+    path = cold_file_path(ctx, idx, file_id)
+
+    case cold_blob_ref_from_location(ctx, path, offset, key, persisted_value_size) do
+      {:ok, %BlobRef{size: logical_size}} -> logical_size
+      _ -> persisted_value_size
     end
   end
 
@@ -1832,13 +2097,68 @@ defmodule Ferricstore.Store.Router do
          end_idx,
          now
        ) do
+    path = cold_file_path(ctx, idx, file_id)
+
+    case cold_blob_range_from_location(
+           ctx,
+           idx,
+           path,
+           offset,
+           key,
+           value_size,
+           start_idx,
+           end_idx
+         ) do
+      {:ok, value} ->
+        value
+
+      :not_blob ->
+        cold_bitcask_range_from_location(
+          ctx,
+          idx,
+          keydir,
+          key,
+          path,
+          file_id,
+          offset,
+          value_size,
+          start_idx,
+          end_idx,
+          now
+        )
+
+      {:error, _reason} ->
+        retry_getrange_after_ref_miss(
+          ctx,
+          idx,
+          keydir,
+          key,
+          {file_id, offset, value_size},
+          start_idx,
+          end_idx,
+          now
+        )
+    end
+  end
+
+  defp cold_bitcask_range_from_location(
+         ctx,
+         idx,
+         keydir,
+         key,
+         path,
+         file_id,
+         offset,
+         value_size,
+         start_idx,
+         end_idx,
+         now
+       ) do
     case normalize_byte_range(value_size, start_idx, end_idx) do
       :empty ->
         ""
 
       {relative_offset, count} ->
-        path = cold_file_path(ctx, idx, file_id)
-
         case validated_file_ref(path, offset, key, value_size) do
           {^path, value_offset, ^value_size} ->
             case read_validated_value_range(ctx, key, path, value_offset + relative_offset, count) do
@@ -1872,6 +2192,61 @@ defmodule Ferricstore.Store.Router do
         end
     end
   end
+
+  defp cold_blob_range_from_location(
+         ctx,
+         idx,
+         path,
+         offset,
+         key,
+         persisted_value_size,
+         start_idx,
+         end_idx
+       ) do
+    with {:ok, %BlobRef{} = ref} <-
+           cold_blob_ref_from_location(ctx, path, offset, key, persisted_value_size),
+         {:ok, payload} <- BlobStore.get(ctx.data_dir, idx, ref) do
+      Stats.record_cold_read(ctx, key)
+      {:ok, range_from_value(payload, start_idx, end_idx)}
+    else
+      :not_blob -> :not_blob
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp cold_blob_file_ref_from_location(ctx, idx, path, offset, key, persisted_value_size) do
+    with {:ok, %BlobRef{} = ref} <-
+           cold_blob_ref_from_location(ctx, path, offset, key, persisted_value_size),
+         {:ok, file_ref} <- validate_blob_file_ref(ctx, idx, ref) do
+      {:ok, file_ref}
+    else
+      :not_blob -> :not_blob
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_blob_file_ref(ctx, idx, %BlobRef{size: size} = ref) do
+    case BlobStore.file_ref(ctx.data_dir, idx, ref) do
+      {:ok, {path, 0, ^size}} -> {:ok, {path, 0, size}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp cold_blob_ref_from_location(ctx, path, offset, key, persisted_value_size) do
+    if blob_side_channel_threshold(ctx) > 0 and persisted_value_size == BlobRef.encoded_size() do
+      with {:ok, value} <- read_cold_async(path, offset, key),
+           {:ok, %BlobRef{} = ref} <- BlobRef.decode(value) do
+        {:ok, ref}
+      else
+        :error -> :not_blob
+        {:error, _reason} = error -> error
+      end
+    else
+      :not_blob
+    end
+  end
+
+  defp blob_side_channel_threshold(ctx), do: BlobValue.threshold(ctx)
 
   defp retry_getrange_after_ref_miss(
          ctx,
@@ -4471,7 +4846,7 @@ defmodule Ferricstore.Store.Router do
       when valid_cold_location(file_id, offset, value_size) ->
         path = cold_file_path(ctx, idx, file_id)
 
-        case read_cold_async(path, offset, compound_key) do
+        case read_cold_async(ctx, idx, path, offset, compound_key) do
           {:ok, value} when is_binary(value) ->
             Stats.record_cold_read(ctx, compound_key)
             warm_ets_after_cold_read(ctx, idx, keydir, compound_key, value, file_id, offset)
@@ -4549,7 +4924,7 @@ defmodule Ferricstore.Store.Router do
       when valid_cold_location(file_id, offset, value_size) ->
         path = cold_file_path(ctx, idx, file_id)
 
-        case read_cold_async(path, offset, compound_key) do
+        case read_cold_async(ctx, idx, path, offset, compound_key) do
           {:ok, value} when is_binary(value) ->
             Stats.record_cold_read(ctx, compound_key)
             warm_ets_after_cold_read(ctx, idx, keydir, compound_key, value, file_id, offset)
@@ -4649,7 +5024,7 @@ defmodule Ferricstore.Store.Router do
         path =
           Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
-        case read_cold_async(path, offset, compound_key) do
+        case read_cold_async(ctx, idx, path, offset, compound_key) do
           {:ok, value} when is_binary(value) ->
             warm_ets_after_cold_read(ctx, idx, keydir, compound_key, value, file_id, offset)
             value

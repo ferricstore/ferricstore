@@ -40,6 +40,7 @@ defmodule Ferricstore.Metrics do
   """
 
   alias Ferricstore.Stats
+  alias Ferricstore.Store.BlobStore
 
   @type metric_type :: :counter | :gauge
 
@@ -91,9 +92,10 @@ defmodule Ferricstore.Metrics do
     checkpoint = checkpoint_metrics_text()
     prefix = prefix_metrics_text()
     quorum = Ferricstore.QuorumMetrics.prometheus_text()
-    standalone_tx = Ferricstore.StandaloneTxMetrics.prometheus_text()
 
-    [base, ns, checkpoint, prefix, quorum, standalone_tx]
+    blob = blob_metrics_text()
+
+    [base, ns, checkpoint, prefix, quorum, blob]
     |> Enum.reject(&(&1 == ""))
     |> Enum.join("\n")
     |> Kernel.<>("\n")
@@ -162,6 +164,38 @@ defmodule Ferricstore.Metrics do
     end
   rescue
     _ -> 0
+  end
+
+  defp blob_metrics_text do
+    case default_instance() do
+      nil ->
+        format_blob_metrics(%{files: 0, bytes: 0, tmp_files: 0, tmp_bytes: 0}, 0)
+
+      ctx ->
+        case BlobStore.storage_stats(ctx.data_dir) do
+          {:ok, stats} ->
+            format_blob_metrics(stats, 0)
+
+          {:error, _reason} ->
+            format_blob_metrics(%{files: 0, bytes: 0, tmp_files: 0, tmp_bytes: 0}, 1)
+        end
+    end
+  end
+
+  defp format_blob_metrics(stats, error) do
+    [
+      {"ferricstore_blob_files", :gauge, "Number of complete large-value blob files",
+       Map.get(stats, :files, 0)},
+      {"ferricstore_blob_bytes", :gauge, "Bytes used by complete large-value blob files",
+       Map.get(stats, :bytes, 0)},
+      {"ferricstore_blob_tmp_files", :gauge, "Number of temporary large-value blob files",
+       Map.get(stats, :tmp_files, 0)},
+      {"ferricstore_blob_tmp_bytes", :gauge, "Bytes used by temporary large-value blob files",
+       Map.get(stats, :tmp_bytes, 0)},
+      {"ferricstore_blob_stats_error", :gauge,
+       "One when blob storage stats could not be collected, otherwise zero", error}
+    ]
+    |> Enum.map_join("\n", &format_metric/1)
   end
 
   @spec keydir_used_bytes() :: non_neg_integer()

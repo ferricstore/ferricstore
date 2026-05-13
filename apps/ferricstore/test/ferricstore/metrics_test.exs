@@ -37,7 +37,12 @@ defmodule Ferricstore.MetricsTest do
         "ferricstore_uptime_seconds",
         "ferricstore_blocked_clients",
         "ferricstore_tracking_clients",
-        "ferricstore_slowlog_entries"
+        "ferricstore_slowlog_entries",
+        "ferricstore_blob_files",
+        "ferricstore_blob_bytes",
+        "ferricstore_blob_tmp_files",
+        "ferricstore_blob_tmp_bytes",
+        "ferricstore_blob_stats_error"
       ]
 
       for metric <- expected_metrics do
@@ -60,7 +65,12 @@ defmodule Ferricstore.MetricsTest do
         "ferricstore_uptime_seconds",
         "ferricstore_blocked_clients",
         "ferricstore_tracking_clients",
-        "ferricstore_slowlog_entries"
+        "ferricstore_slowlog_entries",
+        "ferricstore_blob_files",
+        "ferricstore_blob_bytes",
+        "ferricstore_blob_tmp_files",
+        "ferricstore_blob_tmp_bytes",
+        "ferricstore_blob_stats_error"
       ]
 
       for metric <- expected_metrics do
@@ -86,7 +96,12 @@ defmodule Ferricstore.MetricsTest do
         "ferricstore_uptime_seconds",
         "ferricstore_blocked_clients",
         "ferricstore_tracking_clients",
-        "ferricstore_slowlog_entries"
+        "ferricstore_slowlog_entries",
+        "ferricstore_blob_files",
+        "ferricstore_blob_bytes",
+        "ferricstore_blob_tmp_files",
+        "ferricstore_blob_tmp_bytes",
+        "ferricstore_blob_stats_error"
       ]
 
       for metric <- counters do

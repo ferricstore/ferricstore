@@ -3,7 +3,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.ReplyAwaiter
-  alias Ferricstore.Store.{ValueCodec}
+  alias Ferricstore.Store.{BlobValue, ValueCodec}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
@@ -594,40 +594,12 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         do_compound_get(state, compound_key)
       end,
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
-        case NIF.v2_append_batch(state.active_file_path, [{compound_key, value, expire_at_ms}]) do
-          {:ok, [{offset, _value_size}]} ->
-            record_direct_dead_bytes(state, compound_key)
-
-            ShardETS.ets_insert_with_location(
-              state,
-              compound_key,
-              value,
-              expire_at_ms,
-              state.active_file_id,
-              offset,
-              byte_size(value)
-            )
-
-            :ok
-
-          {:error, reason} ->
-            Logger.error(
-              "Shard #{state.index}: append failed for list compound_put: #{inspect(reason)}"
-            )
-
-            {:error, reason}
-        end
-      end,
-      compound_batch_put: fn
-        _redis_key, [] ->
-          :ok
-
-        _redis_key, entries ->
-          case NIF.v2_append_batch(state.active_file_path, entries) do
-            {:ok, locations} when length(locations) == length(entries) ->
-              entries
-              |> Enum.zip(locations)
-              |> Enum.each(fn {{compound_key, value, expire_at_ms}, {offset, _value_size}} ->
+        case persisted_disk_value(state, value) do
+          {:ok, persisted_value} ->
+            case NIF.v2_append_batch(state.active_file_path, [
+                   {compound_key, persisted_value, expire_at_ms}
+                 ]) do
+              {:ok, [{offset, _value_size}]} ->
                 record_direct_dead_bytes(state, compound_key)
 
                 ShardETS.ets_insert_with_location(
@@ -637,26 +609,71 @@ defmodule Ferricstore.Store.Shard.NativeOps do
                   expire_at_ms,
                   state.active_file_id,
                   offset,
-                  byte_size(value)
+                  byte_size(ShardETS.to_disk_binary(persisted_value))
                 )
-              end)
 
-              :ok
+                :ok
 
-            {:ok, locations} ->
-              reason = {:location_count_mismatch, length(entries), length(locations)}
+              {:error, reason} ->
+                Logger.error(
+                  "Shard #{state.index}: append failed for list compound_put: #{inspect(reason)}"
+                )
 
-              Logger.error(
-                "Shard #{state.index}: append failed for list compound_batch_put: #{inspect(reason)}"
-              )
+                {:error, reason}
+            end
 
-              {:error, reason}
+          {:error, reason} ->
+            {:error, reason}
+        end
+      end,
+      compound_batch_put: fn
+        _redis_key, [] ->
+          :ok
+
+        _redis_key, entries ->
+          case persisted_disk_entries(state, entries) do
+            {:ok, persisted_entries} ->
+              case NIF.v2_append_batch(state.active_file_path, persisted_entries) do
+                {:ok, locations} when length(locations) == length(entries) ->
+                  entries
+                  |> Enum.zip(persisted_entries)
+                  |> Enum.zip(locations)
+                  |> Enum.each(fn {{{compound_key, value, expire_at_ms},
+                                    {_compound_key, persisted_value, _expire_at_ms}},
+                                   {offset, _value_size}} ->
+                    record_direct_dead_bytes(state, compound_key)
+
+                    ShardETS.ets_insert_with_location(
+                      state,
+                      compound_key,
+                      value,
+                      expire_at_ms,
+                      state.active_file_id,
+                      offset,
+                      byte_size(ShardETS.to_disk_binary(persisted_value))
+                    )
+                  end)
+
+                  :ok
+
+                {:ok, locations} ->
+                  reason = {:location_count_mismatch, length(entries), length(locations)}
+
+                  Logger.error(
+                    "Shard #{state.index}: append failed for list compound_batch_put: #{inspect(reason)}"
+                  )
+
+                  {:error, reason}
+
+                {:error, reason} ->
+                  Logger.error(
+                    "Shard #{state.index}: append failed for list compound_batch_put: #{inspect(reason)}"
+                  )
+
+                  {:error, reason}
+              end
 
             {:error, reason} ->
-              Logger.error(
-                "Shard #{state.index}: append failed for list compound_batch_put: #{inspect(reason)}"
-              )
-
               {:error, reason}
           end
       end,
@@ -711,6 +728,36 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   end
 
   defp normalize_batch_write_result(other), do: {:error, other}
+
+  defp persisted_disk_entries(state, entries) do
+    Enum.reduce_while(entries, {:ok, []}, fn {compound_key, value, expire_at_ms}, {:ok, acc} ->
+      case persisted_disk_value(state, value) do
+        {:ok, persisted_value} ->
+          {:cont, {:ok, [{compound_key, persisted_value, expire_at_ms} | acc]}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp persisted_disk_value(state, value) do
+    disk_value = ShardETS.to_disk_binary(value)
+
+    BlobValue.maybe_externalize(
+      Map.get(state, :data_dir),
+      Map.get(state, :index, 0),
+      blob_side_channel_threshold(state),
+      disk_value
+    )
+  end
+
+  defp blob_side_channel_threshold(%{instance_ctx: ctx}), do: BlobValue.threshold(ctx)
+  defp blob_side_channel_threshold(_state), do: 0
 
   defp append_tombstone_batch_sync(_path, []), do: {:ok, []}
 

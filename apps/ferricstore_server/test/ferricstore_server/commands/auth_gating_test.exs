@@ -60,6 +60,27 @@ defmodule FerricstoreServer.Commands.AuthGatingTest do
   # With requirepass set: commands rejected before AUTH
   # ---------------------------------------------------------------------------
 
+  test "existing unauthenticated socket is gated when requirepass is enabled", %{port: port} do
+    sock = connect_and_hello(port)
+
+    send_cmd(sock, ["PING"])
+    assert {:simple, "PONG"} = recv_response(sock)
+
+    Config.set("requirepass", "secret123")
+
+    send_cmd(sock, ["PING"])
+    assert {:error, msg} = recv_response(sock)
+    assert msg =~ "NOAUTH"
+
+    send_cmd(sock, ["AUTH", "secret123"])
+    assert {:simple, "OK"} = recv_response(sock)
+
+    send_cmd(sock, ["PING"])
+    assert {:simple, "PONG"} = recv_response(sock)
+
+    :gen_tcp.close(sock)
+  end
+
   describe "with requirepass set, GET returns NOAUTH before AUTH" do
     setup %{port: port} do
       Config.set("requirepass", "secret123")

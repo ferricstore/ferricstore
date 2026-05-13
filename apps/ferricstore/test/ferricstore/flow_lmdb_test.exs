@@ -13,6 +13,101 @@ defmodule Ferricstore.Flow.LMDBTest do
     assert :not_found = Ferricstore.Flow.LMDB.get(path, "missing")
   end
 
+  test "read-only operations do not open a missing LMDB env" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_read_only_missing_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    refute File.exists?(path)
+    assert :not_found = Ferricstore.Flow.LMDB.get(path, "missing")
+    assert {:ok, [:not_found, :not_found]} = Ferricstore.Flow.LMDB.get_many(path, ["a", "b"])
+    assert {:ok, []} = Ferricstore.Flow.LMDB.prefix_entries(path, "prefix", 10)
+    assert {:ok, []} = Ferricstore.Flow.LMDB.prefix_entries(path, "prefix", 10, true)
+    assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(path, "prefix")
+    refute File.exists?(path)
+  end
+
+  test "writer does not open LMDB until projection data is flushed" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_lazy_writer_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    instance_name = :"flow_lmdb_lazy_writer_#{System.unique_integer([:positive])}"
+    key = "flow:{flow:test}:state:lazy"
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    start_supervised!(
+      {Ferricstore.Flow.LMDBWriter,
+       shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+    )
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(shard_index)
+      |> Ferricstore.Flow.LMDB.path()
+
+    refute File.exists?(path)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [{:put, key, "v1"}])
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+    assert File.dir?(path)
+    assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
+  end
+
+  test "empty rebuild does not open LMDB" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_lmdb_empty_rebuild_#{System.unique_integer([:positive])}"
+      )
+
+    shard_index = 0
+    keydir = :ets.new(:flow_lmdb_empty_rebuild_keydir, [:set])
+
+    on_exit(fn ->
+      if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+      File.rm_rf!(data_dir)
+    end)
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+    refute File.exists?(lmdb_path)
+
+    assert :ok =
+             Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               shard_index,
+               nil,
+               nil,
+               nil,
+               nil,
+               nil
+             )
+
+    refute File.exists?(lmdb_path)
+  end
+
   test "stores, reads, overwrites, and deletes raw flow state blobs" do
     path =
       Path.join(System.tmp_dir!(), "ferricstore_flow_lmdb_#{System.unique_integer([:positive])}")

@@ -8,7 +8,7 @@
 #
 # Run:
 #   MIX_ENV=bench FERRICSTORE_BUILD=1 mix run --no-start \
-#     -e 'Application.put_env(:ferricstore, :raft_mode, :always); Code.require_file("bench/flow_pipeline_write_bench.exs")'
+#     -e 'Code.require_file("bench/flow_pipeline_write_bench.exs")'
 #
 # Options:
 #   FLOW_PIPE_BACKLOG=100000

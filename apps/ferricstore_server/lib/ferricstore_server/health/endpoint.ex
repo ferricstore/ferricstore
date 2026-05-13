@@ -113,10 +113,11 @@ defmodule FerricstoreServer.Health.Endpoint do
   def init(ref, transport, _opts) do
     {:ok, socket} = :ranch.handshake(ref)
     :ok = transport.setopts(socket, active: false)
+    peer = peer_addr(socket, transport)
 
     case read_request(socket, transport) do
-      {:ok, method, path} ->
-        handle_request(socket, transport, method, path)
+      {:ok, method, path, headers} ->
+        handle_request(socket, transport, method, path, peer, headers)
 
       :error ->
         send_response(socket, transport, 400, "Bad Request", ~s({"error":"bad request"}))
@@ -130,8 +131,9 @@ defmodule FerricstoreServer.Health.Endpoint do
   # HTTP request parsing (minimal)
   # ---------------------------------------------------------------------------
 
-  # Reads the HTTP request line and consumes headers. Returns {method, path}.
-  @spec read_request(:inet.socket(), module()) :: {:ok, String.t(), String.t()} | :error
+  # Reads the HTTP request line and consumes headers.
+  @spec read_request(:inet.socket(), module()) ::
+          {:ok, String.t(), String.t(), map()} | :error
   defp read_request(socket, transport) do
     read_request(socket, transport, <<>>)
   end
@@ -151,12 +153,14 @@ defmodule FerricstoreServer.Health.Endpoint do
     end
   end
 
-  @spec parse_request_line(binary()) :: {:ok, String.t(), String.t()} | :error
+  @spec parse_request_line(binary()) :: {:ok, String.t(), String.t(), map()} | :error
   defp parse_request_line(data) do
-    case String.split(data, "\r\n", parts: 2) do
-      [request_line, _rest] ->
+    case String.split(data, "\r\n\r\n", parts: 2) do
+      [head, _body] ->
+        [request_line | header_lines] = String.split(head, "\r\n")
+
         case String.split(request_line, " ", parts: 3) do
-          [method, path, _version] -> {:ok, method, path}
+          [method, path, _version] -> {:ok, method, path, parse_headers(header_lines)}
           _ -> :error
         end
 
@@ -169,12 +173,12 @@ defmodule FerricstoreServer.Health.Endpoint do
   # Request routing
   # ---------------------------------------------------------------------------
 
-  @spec handle_request(:inet.socket(), module(), String.t(), String.t()) :: :ok
-  defp handle_request(socket, transport, "GET", "/health/live") do
+  @spec handle_request(:inet.socket(), module(), String.t(), String.t(), term(), map()) :: :ok
+  defp handle_request(socket, transport, "GET", "/health/live", _peer, _headers) do
     send_response(socket, transport, 200, "OK", ~s({"status":"alive"}))
   end
 
-  defp handle_request(socket, transport, "GET", "/health/ready") do
+  defp handle_request(socket, transport, "GET", "/health/ready", _peer, _headers) do
     health = Ferricstore.Health.check()
 
     body =
@@ -197,72 +201,108 @@ defmodule FerricstoreServer.Health.Endpoint do
     end
   end
 
-  defp handle_request(socket, transport, "GET", "/dashboard") do
-    data = FerricstoreServer.Health.Dashboard.collect()
-    body = FerricstoreServer.Health.Dashboard.render(data)
-    send_html_response(socket, transport, 200, "OK", body)
-  end
-
-  defp handle_request(socket, transport, "GET", "/dashboard/slowlog") do
-    data = FerricstoreServer.Health.Dashboard.collect_slowlog_page()
-    body = FerricstoreServer.Health.Dashboard.render_slowlog_page(data)
-    send_html_response(socket, transport, 200, "OK", body)
-  end
-
-  defp handle_request(socket, transport, "GET", "/dashboard/merge") do
-    data = FerricstoreServer.Health.Dashboard.collect_merge_page()
-    body = FerricstoreServer.Health.Dashboard.render_merge_page(data)
-    send_html_response(socket, transport, 200, "OK", body)
-  end
-
-  defp handle_request(socket, transport, "GET", "/dashboard/config") do
-    data = FerricstoreServer.Health.Dashboard.collect_config_page()
-    body = FerricstoreServer.Health.Dashboard.render_config_page(data)
-    send_html_response(socket, transport, 200, "OK", body)
-  end
-
-  defp handle_request(socket, transport, "GET", "/dashboard/raft") do
-    try do
-      data = FerricstoreServer.Health.Dashboard.collect_raft_page()
-      body = FerricstoreServer.Health.Dashboard.render_raft_page(data)
+  defp handle_request(socket, transport, "GET", "/dashboard", peer, headers) do
+    unless observability_authorized?(peer, headers) do
+      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data = FerricstoreServer.Health.Dashboard.collect()
+      body = FerricstoreServer.Health.Dashboard.render(data)
       send_html_response(socket, transport, 200, "OK", body)
-    catch
-      kind, reason ->
-        body =
-          "<html><body style='background:#0d1117;color:#f85149;padding:20px;font-family:monospace;'><h2>Raft Page Error</h2><pre>#{inspect(kind)}: #{inspect(reason, pretty: true, limit: 10)}</pre><a href='/dashboard' style='color:#58a6ff;'>← Dashboard</a></body></html>"
-
-        send_html_response(socket, transport, 200, "OK", body)
     end
   end
 
-  defp handle_request(socket, transport, "GET", "/dashboard/clients") do
-    data = FerricstoreServer.Health.Dashboard.collect_clients_page()
-    body = FerricstoreServer.Health.Dashboard.render_clients_page(data)
-    send_html_response(socket, transport, 200, "OK", body)
+  defp handle_request(socket, transport, "GET", "/dashboard/slowlog", peer, headers) do
+    unless observability_authorized?(peer, headers) do
+      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data = FerricstoreServer.Health.Dashboard.collect_slowlog_page()
+      body = FerricstoreServer.Health.Dashboard.render_slowlog_page(data)
+      send_html_response(socket, transport, 200, "OK", body)
+    end
   end
 
-  defp handle_request(socket, transport, "GET", "/dashboard/storage") do
-    data = FerricstoreServer.Health.Dashboard.collect_storage_page()
-    body = FerricstoreServer.Health.Dashboard.render_storage_page(data)
-    send_html_response(socket, transport, 200, "OK", body)
+  defp handle_request(socket, transport, "GET", "/dashboard/merge", peer, headers) do
+    unless observability_authorized?(peer, headers) do
+      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data = FerricstoreServer.Health.Dashboard.collect_merge_page()
+      body = FerricstoreServer.Health.Dashboard.render_merge_page(data)
+      send_html_response(socket, transport, 200, "OK", body)
+    end
   end
 
-  defp handle_request(socket, transport, "GET", "/dashboard/prefixes") do
-    data = FerricstoreServer.Health.Dashboard.collect_prefixes_page()
-    body = FerricstoreServer.Health.Dashboard.render_prefixes_page(data)
-    send_html_response(socket, transport, 200, "OK", body)
+  defp handle_request(socket, transport, "GET", "/dashboard/config", peer, headers) do
+    unless observability_authorized?(peer, headers) do
+      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data = FerricstoreServer.Health.Dashboard.collect_config_page()
+      body = FerricstoreServer.Health.Dashboard.render_config_page(data)
+      send_html_response(socket, transport, 200, "OK", body)
+    end
   end
 
-  defp handle_request(socket, transport, "GET", "/metrics") do
-    body = Ferricstore.Metrics.scrape()
-    send_text_response(socket, transport, 200, "OK", body)
+  defp handle_request(socket, transport, "GET", "/dashboard/raft", peer, headers) do
+    unless observability_authorized?(peer, headers) do
+      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      try do
+        data = FerricstoreServer.Health.Dashboard.collect_raft_page()
+        body = FerricstoreServer.Health.Dashboard.render_raft_page(data)
+        send_html_response(socket, transport, 200, "OK", body)
+      catch
+        kind, reason ->
+          body =
+            "<html><body style='background:#0d1117;color:#f85149;padding:20px;font-family:monospace;'><h2>Raft Page Error</h2><pre>#{inspect(kind)}: #{inspect(reason, pretty: true, limit: 10)}</pre><a href='/dashboard' style='color:#58a6ff;'>← Dashboard</a></body></html>"
+
+          send_html_response(socket, transport, 200, "OK", body)
+      end
+    end
   end
 
-  defp handle_request(socket, transport, "GET", _path) do
+  defp handle_request(socket, transport, "GET", "/dashboard/clients", peer, headers) do
+    unless observability_authorized?(peer, headers) do
+      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data = FerricstoreServer.Health.Dashboard.collect_clients_page()
+      body = FerricstoreServer.Health.Dashboard.render_clients_page(data)
+      send_html_response(socket, transport, 200, "OK", body)
+    end
+  end
+
+  defp handle_request(socket, transport, "GET", "/dashboard/storage", peer, headers) do
+    unless observability_authorized?(peer, headers) do
+      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data = FerricstoreServer.Health.Dashboard.collect_storage_page()
+      body = FerricstoreServer.Health.Dashboard.render_storage_page(data)
+      send_html_response(socket, transport, 200, "OK", body)
+    end
+  end
+
+  defp handle_request(socket, transport, "GET", "/dashboard/prefixes", peer, headers) do
+    unless observability_authorized?(peer, headers) do
+      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      data = FerricstoreServer.Health.Dashboard.collect_prefixes_page()
+      body = FerricstoreServer.Health.Dashboard.render_prefixes_page(data)
+      send_html_response(socket, transport, 200, "OK", body)
+    end
+  end
+
+  defp handle_request(socket, transport, "GET", "/metrics", peer, headers) do
+    unless observability_authorized?(peer, headers) do
+      send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+    else
+      body = Ferricstore.Metrics.scrape()
+      send_text_response(socket, transport, 200, "OK", body)
+    end
+  end
+
+  defp handle_request(socket, transport, "GET", _path, _peer, _headers) do
     send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
   end
 
-  defp handle_request(socket, transport, _method, _path) do
+  defp handle_request(socket, transport, _method, _path, _peer, _headers) do
     send_response(
       socket,
       transport,
@@ -271,6 +311,49 @@ defmodule FerricstoreServer.Health.Endpoint do
       ~s({"error":"method not allowed"})
     )
   end
+
+  @doc false
+  @spec observability_authorized?(term(), map()) :: boolean()
+  def observability_authorized?(peer, headers) do
+    loopback_peer?(peer) or bearer_token_authorized?(headers)
+  end
+
+  defp peer_addr(socket, transport) do
+    case transport.peername(socket) do
+      {:ok, {addr, _port}} -> addr
+      _ -> :unknown
+    end
+  end
+
+  defp parse_headers(lines) do
+    Enum.reduce(lines, %{}, fn line, acc ->
+      case String.split(line, ":", parts: 2) do
+        [name, value] ->
+          Map.put(acc, String.downcase(String.trim(name)), String.trim(value))
+
+        _ ->
+          acc
+      end
+    end)
+  end
+
+  defp loopback_peer?({127, _, _, _}), do: true
+  defp loopback_peer?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
+  defp loopback_peer?({0, 0, 0, 0, 0, 65_535, 32_512, _}), do: true
+  defp loopback_peer?(_peer), do: false
+
+  defp bearer_token_authorized?(headers) do
+    token = Application.get_env(:ferricstore, :observability_token)
+
+    is_binary(token) and token != "" and
+      constant_time_equal?(Map.get(headers, "authorization"), "Bearer " <> token)
+  end
+
+  defp constant_time_equal?(left, right) when is_binary(left) and is_binary(right) do
+    :crypto.hash(:sha256, left) == :crypto.hash(:sha256, right)
+  end
+
+  defp constant_time_equal?(_left, _right), do: false
 
   # ---------------------------------------------------------------------------
   # HTTP response writing

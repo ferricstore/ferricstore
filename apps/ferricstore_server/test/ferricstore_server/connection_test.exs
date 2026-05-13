@@ -282,6 +282,255 @@ defmodule FerricstoreServer.ConnectionTest do
     :gen_tcp.close(sock)
   end
 
+  test "pipelined phase-1 single-key writes batch internally and preserve replies", %{
+    port: port
+  } do
+    handler_id = {__MODULE__, self(), :phase1_write_pipeline, System.unique_integer([:positive])}
+    attach_quorum_submit(handler_id)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    tag = "{phase1:" <> Integer.to_string(System.unique_integer([:positive])) <> "}"
+    counter_key = "#{tag}:counter"
+    value_key = "#{tag}:value"
+    delete_key = "#{tag}:delete"
+
+    pipeline =
+      IO.iodata_to_binary([
+        Encoder.encode(["SET", delete_key, "gone"]),
+        Encoder.encode(["INCR", counter_key]),
+        Encoder.encode(["APPEND", value_key, "a"]),
+        Encoder.encode(["SETRANGE", value_key, "1", "b"]),
+        Encoder.encode(["DEL", delete_key])
+      ])
+
+    send_raw(sock, pipeline)
+
+    assert [{:simple, "OK"}, 1, 1, 2, 1] = recv_values(sock, 5)
+
+    send_command(sock, ["GET", value_key])
+    assert ["ab"] = recv_values(sock, 1)
+
+    send_command(sock, ["GET", counter_key])
+    assert ["1"] = recv_values(sock, 1)
+
+    sends = drain_quorum_submits()
+    assert Enum.any?(sends, &quorum_batch_size_at_least?(&1, 4))
+
+    :gen_tcp.close(sock)
+  end
+
+  test "pipelined GETSET is not part of phase-1 write batching", %{port: port} do
+    handler_id =
+      {__MODULE__, self(), :phase1_write_pipeline_getset, System.unique_integer([:positive])}
+
+    attach_quorum_submit(handler_id)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    tag = "{phase1-getset:" <> Integer.to_string(System.unique_integer([:positive])) <> "}"
+    key = "#{tag}:key"
+    counter_key = "#{tag}:counter"
+
+    pipeline =
+      IO.iodata_to_binary([
+        Encoder.encode(["SET", key, "old"]),
+        Encoder.encode(["GETSET", key, "new"]),
+        Encoder.encode(["INCR", counter_key])
+      ])
+
+    send_raw(sock, pipeline)
+
+    assert [{:simple, "OK"}, "old", 1] = recv_values(sock, 3)
+
+    send_command(sock, ["GET", key])
+    assert ["new"] = recv_values(sock, 1)
+
+    sends = drain_quorum_submits()
+    refute Enum.any?(sends, &quorum_batch_size_at_least?(&1, 2))
+
+    :gen_tcp.close(sock)
+  end
+
+  test "pipelined phase-1 direct compound and JSON writes batch safely", %{port: port} do
+    handler_id =
+      {__MODULE__, self(), :phase1_direct_write_pipeline, System.unique_integer([:positive])}
+
+    attach_quorum_submit(handler_id)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    tag = "{phase1-direct:" <> Integer.to_string(System.unique_integer([:positive])) <> "}"
+
+    pipeline =
+      IO.iodata_to_binary([
+        Encoder.encode(["HINCRBY", "#{tag}:hash", "count", "2"]),
+        Encoder.encode(["HINCRBYFLOAT", "#{tag}:hashf", "price", "1.5"]),
+        Encoder.encode(["ZINCRBY", "#{tag}:zset", "2.5", "member"]),
+        Encoder.encode(["PFADD", "#{tag}:hll", "a", "b"]),
+        Encoder.encode(["SETBIT", "#{tag}:bits", "7", "1"]),
+        Encoder.encode(["JSON.SET", "#{tag}:doc", "$", ~s({"n":1})]),
+        Encoder.encode(["JSON.NUMINCRBY", "#{tag}:doc", "$.n", "1"])
+      ])
+
+    send_raw(sock, pipeline)
+
+    assert [
+             2,
+             hincrbyfloat,
+             zincrby,
+             1,
+             0,
+             {:simple, "OK"},
+             "2"
+           ] = recv_values(sock, 7)
+
+    assert_float_string(hincrbyfloat, 1.5)
+    assert_float_string(zincrby, 2.5)
+
+    sends = drain_quorum_submits()
+    assert Enum.any?(sends, &quorum_batch_size_at_least?(&1, 7))
+
+    :gen_tcp.close(sock)
+  end
+
+  test "pipelined out-of-range SETRANGE and SETBIT fall back to normal validation", %{
+    port: port
+  } do
+    handler_id =
+      {__MODULE__, self(), :phase1_invalid_range_pipeline, System.unique_integer([:positive])}
+
+    attach_quorum_submit(handler_id)
+
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    tag = "{phase1-invalid-range:" <> Integer.to_string(System.unique_integer([:positive])) <> "}"
+    counter_key = "#{tag}:counter"
+
+    pipeline =
+      IO.iodata_to_binary([
+        Encoder.encode(["SETRANGE", "#{tag}:range", "536870912", "x"]),
+        Encoder.encode(["SETBIT", "#{tag}:bits", "4294967296", "1"]),
+        Encoder.encode(["INCR", counter_key])
+      ])
+
+    send_raw(sock, pipeline)
+
+    assert [
+             {:error, setrange_error},
+             {:error, setbit_error},
+             1
+           ] = recv_values(sock, 3)
+
+    assert setrange_error =~ "ERR string exceeds maximum allowed size"
+    assert setbit_error =~ "ERR bit offset is not an integer or out of range"
+
+    sends = drain_quorum_submits()
+    refute Enum.any?(sends, &quorum_batch_size_at_least?(&1, 2))
+
+    :gen_tcp.close(sock)
+  end
+
+  test "pipeline read boundary sees prior phase-1 write before later write", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    key = "phase1-read-boundary:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    pipeline =
+      IO.iodata_to_binary([
+        Encoder.encode(["SET", key, "1"]),
+        Encoder.encode(["GET", key]),
+        Encoder.encode(["INCR", key])
+      ])
+
+    send_raw(sock, pipeline)
+    assert [{:simple, "OK"}, "1", 2] = recv_values(sock, 3)
+
+    send_command(sock, ["GET", key])
+    assert ["2"] = recv_values(sock, 1)
+
+    :gen_tcp.close(sock)
+  end
+
+  test "mixed GET and SET pipeline preserves read before write on same key", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    key = "mixed-read-before-write:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    send_command(sock, ["SET", key, "old"])
+    assert [{:simple, "OK"}] = recv_values(sock, 1)
+
+    pipeline =
+      IO.iodata_to_binary([
+        Encoder.encode(["GET", key]),
+        Encoder.encode(["SET", key, "new"]),
+        Encoder.encode(["GET", key])
+      ])
+
+    send_raw(sock, pipeline)
+    assert ["old", {:simple, "OK"}, "new"] = recv_values(sock, 3)
+
+    :gen_tcp.close(sock)
+  end
+
+  test "pipeline prefetch does not read through keyless write barrier", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    key = "prefetch-flushdb-barrier:" <> Integer.to_string(System.unique_integer([:positive]))
+
+    send_command(sock, ["SET", key, "old"])
+    assert [{:simple, "OK"}] = recv_values(sock, 1)
+
+    pipeline =
+      IO.iodata_to_binary([
+        Encoder.encode(["FLUSHDB"]),
+        Encoder.encode(["GET", key])
+      ])
+
+    send_raw(sock, pipeline)
+    assert [{:simple, "OK"}, nil] = recv_values(sock, 2)
+
+    :gen_tcp.close(sock)
+  end
+
+  test "multi-key DEL stays on existing command path and remains correct", %{port: port} do
+    sock = connect(port)
+    send_raw(sock, hello3())
+    _greeting = recv(sock)
+
+    tag = "{phase1-del:" <> Integer.to_string(System.unique_integer([:positive])) <> "}"
+    key_a = "#{tag}:a"
+    key_b = "#{tag}:b"
+
+    pipeline =
+      IO.iodata_to_binary([
+        Encoder.encode(["SET", key_a, "a"]),
+        Encoder.encode(["SET", key_b, "b"]),
+        Encoder.encode(["DEL", key_a, key_b]),
+        Encoder.encode(["GET", key_a]),
+        Encoder.encode(["GET", key_b])
+      ])
+
+    send_raw(sock, pipeline)
+    assert [{:simple, "OK"}, {:simple, "OK"}, 2, nil, nil] = recv_values(sock, 5)
+
+    :gen_tcp.close(sock)
+  end
+
   test "pipelined FLOW.CLAIM_DUE commands coalesce compatible claims", %{port: port} do
     handler_id =
       {__MODULE__, self(), :flow_claim_due_pipeline, System.unique_integer([:positive])}
@@ -826,6 +1075,40 @@ defmodule FerricstoreServer.ConnectionTest do
 
   def handle_quorum_submit(event, measurements, metadata, test_pid) do
     send(test_pid, {:quorum_submit, event, measurements, metadata})
+  end
+
+  defp attach_quorum_submit(handler_id) do
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :batcher, :quorum_submit],
+        &__MODULE__.handle_quorum_submit/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp drain_quorum_submits(acc \\ []) do
+    receive do
+      {:quorum_submit, _event, _measurements, _metadata} = msg ->
+        drain_quorum_submits([msg | acc])
+    after
+      150 -> Enum.reverse(acc)
+    end
+  end
+
+  defp quorum_batch_size_at_least?(
+         {:quorum_submit, _event, %{batch_size: batch_size}, %{kind: :batch}},
+         min_size
+       ),
+       do: batch_size >= min_size
+
+  defp quorum_batch_size_at_least?(_event, _min_size), do: false
+
+  defp assert_float_string(value, expected) when is_binary(value) do
+    {parsed, ""} = Float.parse(value)
+    assert_in_delta parsed, expected, 0.001
   end
 
   def handle_pipeline_claim_due_batch(_event, measurements, metadata, test_pid) do

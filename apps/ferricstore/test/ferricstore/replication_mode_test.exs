@@ -13,16 +13,8 @@ defmodule Ferricstore.ReplicationModeTest do
     File.rm_rf!(dir)
     File.mkdir_p!(dir)
 
-    old_mode = Application.get_env(:ferricstore, :raft_mode)
-
     on_exit(fn ->
       File.rm_rf!(dir)
-
-      if old_mode == nil do
-        Application.delete_env(:ferricstore, :raft_mode)
-      else
-        Application.put_env(:ferricstore, :raft_mode, old_mode)
-      end
 
       ReplicationMode.put_current(:raft)
     end)
@@ -30,15 +22,11 @@ defmodule Ferricstore.ReplicationModeTest do
     {:ok, dir: dir}
   end
 
-  test "manual env resolves to standalone when no marker exists", %{dir: dir} do
-    Application.put_env(:ferricstore, :raft_mode, :manual)
-
-    assert :standalone = ReplicationMode.resolve!(dir, 4)
+  test "missing marker resolves to raft", %{dir: dir} do
+    assert :raft = ReplicationMode.resolve!(dir, 4)
   end
 
-  test "raft marker overrides manual env", %{dir: dir} do
-    Application.put_env(:ferricstore, :raft_mode, :manual)
-
+  test "raft marker resolves to raft", %{dir: dir} do
     ReplicationMode.mark_raft!(dir, 4, 1, %{0 => 7})
 
     assert :raft = ReplicationMode.resolve!(dir, 4)
@@ -47,14 +35,17 @@ defmodule Ferricstore.ReplicationModeTest do
              ReplicationMode.read(dir)
   end
 
-  test "promotion markers preserve the data-dir cluster identity", %{dir: dir} do
-    ReplicationMode.mark_standalone!(dir, 4)
+  test "unsupported standalone marker fails closed", %{dir: dir} do
+    ReplicationMode.write!(dir, %{replication_mode: :standalone, shard_count: 4})
+
+    assert_raise RuntimeError, ~r/standalone promotion mode was removed/, fn ->
+      ReplicationMode.resolve!(dir, 4)
+    end
+  end
+
+  test "raft marker preserves the data-dir cluster identity", %{dir: dir} do
+    ReplicationMode.write!(dir, %{replication_mode: :raft, shard_count: 4})
     {:ok, %{cluster_id: cluster_id}} = ReplicationMode.read(dir)
-
-    ReplicationMode.mark_enabling!(dir, 4, 11)
-
-    assert {:ok, %{cluster_id: ^cluster_id, replication_mode: :enabling}} =
-             ReplicationMode.read(dir)
 
     ReplicationMode.mark_raft!(dir, 4, 11, %{0 => 42})
 

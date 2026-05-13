@@ -110,7 +110,7 @@ defmodule Ferricstore.HLC do
   Submit commands through `Ferricstore.Raft.CommandClock`:
 
       Ferricstore.Raft.CommandClock.process_command(shard_id, command)
-      Ferricstore.Raft.CommandClock.pipeline_command(shard_id, command, corr, :normal)
+      Ferricstore.Raft.CommandClock.pipeline_command(shard_id, command, corr, :low)
 
   Cost: one lock-free HLC stamp on submit plus one `update/1` merge per
   follower during `apply/3`.

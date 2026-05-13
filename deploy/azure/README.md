@@ -10,6 +10,19 @@ terraform init
 terraform apply -var="node_count=1"
 ```
 
+`terraform.tfvars` defaults the data mount to XFS:
+
+```hcl
+data_filesystem = "xfs"
+```
+
+To compare filesystems, recreate the server VM with the same client VM:
+
+```bash
+terraform apply -replace='azurerm_linux_virtual_machine.bench[0]' -var='data_filesystem=ext4'
+terraform apply -replace='azurerm_linux_virtual_machine.bench[0]' -var='data_filesystem=xfs'
+```
+
 ### 3-node cluster benchmark
 
 ```bash
@@ -38,6 +51,8 @@ terraform destroy
 - Rust stable (for NIF)
 - FerricStore cloned and compiled
 - Local NVMe formatted + mounted at `/data`
+  - The setup rejects boot if it cannot find an unmounted local NVMe data disk, so benchmarks do not silently fall back to the OS managed disk
+  - Filesystem is controlled by `data_filesystem` (`xfs` or `ext4`)
 - OS tuning: huge pages, swappiness=1, THP disabled, NVMe scheduler
 - BEAM VM flags: `+sbt db +sbwt very_short +swt very_low +K true +A 128`
 - systemd service ready

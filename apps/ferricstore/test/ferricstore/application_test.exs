@@ -52,6 +52,9 @@ defmodule Ferricstore.ApplicationTest do
     end)
   end
 
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
   # ---------------------------------------------------------------------------
   # Supervisor tree basics
   # ---------------------------------------------------------------------------
@@ -78,6 +81,89 @@ defmodule Ferricstore.ApplicationTest do
 
       refute Enum.any?(ids, &(to_string(&1) =~ "rmw_coordinator")),
              "RmwCoordinator belonged to the removed local-write fallback and should not be supervised"
+    end
+
+    test "starts blob GC sweeper by default when blob side-channel is enabled" do
+      children = Supervisor.which_children(Ferricstore.Supervisor)
+      ids = Enum.map(children, fn {id, _pid, _type, _mods} -> id end)
+
+      assert Ferricstore.Store.BlobGCSweeper in ids
+      assert Process.whereis(Ferricstore.Store.BlobGCSweeper)
+    end
+
+    test "default instance uses configured blob side-channel threshold for raft writes" do
+      server_started? = application_started?(:ferricstore_server)
+      old_data_dir = Application.get_env(:ferricstore, :data_dir)
+      old_shard_count = Application.get_env(:ferricstore, :shard_count)
+      old_hot_cache = Application.get_env(:ferricstore, :hot_cache_max_value_size)
+      old_threshold = Application.get_env(:ferricstore, :blob_side_channel_threshold_bytes)
+
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore-app-blob-threshold-#{System.unique_integer([:positive])}"
+        )
+
+      try do
+        stop_app_if_started(:ferricstore_server)
+        stop_app_if_started(:ferricstore)
+
+        Application.put_env(:ferricstore, :data_dir, data_dir)
+        Application.put_env(:ferricstore, :shard_count, 1)
+        Application.put_env(:ferricstore, :hot_cache_max_value_size, 64)
+        Application.put_env(:ferricstore, :blob_side_channel_threshold_bytes, 128)
+
+        assert {:ok, _} = Application.ensure_all_started(:ferricstore)
+
+        ctx = FerricStore.Instance.get(:default)
+        assert ctx.blob_side_channel_threshold_bytes == 128
+
+        assert :ok =
+                 Ferricstore.Store.Router.put(
+                   ctx,
+                   "blob-threshold-default",
+                   :binary.copy("x", 256)
+                 )
+
+        assert [_blob_file] = Path.wildcard(Path.join(data_dir, "blob/shard_0/*/*.blob"))
+
+        assert {1, "blob-threshold-default", 256} =
+                 Ferricstore.Application.scan_large_values(1, 200)
+      after
+        stop_app_if_started(:ferricstore_server)
+        stop_app_if_started(:ferricstore)
+
+        restore_env(:data_dir, old_data_dir)
+        restore_env(:shard_count, old_shard_count)
+        restore_env(:hot_cache_max_value_size, old_hot_cache)
+        restore_env(:blob_side_channel_threshold_bytes, old_threshold)
+        File.rm_rf(data_dir)
+
+        {:ok, _} = Application.ensure_all_started(:ferricstore)
+        ShardHelpers.wait_shards_alive()
+
+        if server_started? do
+          {:ok, _} = Application.ensure_all_started(:ferricstore_server)
+        end
+      end
+    end
+
+    test "instance build enables blob side-channel by default for large values" do
+      old_threshold = Application.get_env(:ferricstore, :blob_side_channel_threshold_bytes)
+
+      try do
+        Application.delete_env(:ferricstore, :blob_side_channel_threshold_bytes)
+
+        ctx =
+          FerricStore.Instance.build(:blob_default_threshold_test,
+            data_dir: System.tmp_dir!(),
+            shard_count: 1
+          )
+
+        assert ctx.blob_side_channel_threshold_bytes == 256 * 1024
+      after
+        restore_env(:blob_side_channel_threshold_bytes, old_threshold)
+      end
     end
   end
 

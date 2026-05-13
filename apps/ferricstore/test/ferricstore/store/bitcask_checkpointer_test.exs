@@ -18,7 +18,6 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
   alias Ferricstore.Store.ActiveFile
   alias Ferricstore.Store.BitcaskCheckpointer
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.ReplicationMode
 
   # Checkpointer is linked via start_link — when the test process exits,
   # the :EXIT signal shuts the checkpointer down. on_exit runs AFTER the
@@ -235,46 +234,6 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     assert_receive {:fsync_async_called, ^pid, 1, ^active_path}, 2_000
     assert :atomics.get(ctx.checkpoint_flags, 1) == 0
     assert :atomics.get(ctx.checkpoint_in_flight, 1) == 1
-  end
-
-  test "dirty tick defers fsync while standalone promotion is enabling", %{
-    ctx: ctx,
-    active_path: active_path
-  } do
-    old_mode = ReplicationMode.current()
-    ReplicationMode.put_current(:enabling)
-    on_exit(fn -> ReplicationMode.put_current(old_mode) end)
-
-    parent = self()
-
-    ctx =
-      Map.put(ctx, :fsync_async, fn caller, corr_id, path ->
-        send(parent, {:fsync_async_called, caller, corr_id, path})
-        :ok
-      end)
-
-    {:ok, pid} =
-      BitcaskCheckpointer.start_link(
-        index: 0,
-        instance_ctx: ctx,
-        checkpoint_interval_ms: 10_000,
-        checkpoint_idle_ms: 0,
-        checkpoint_max_delay_ms: 0,
-        name: :"ck_promotion_defer_#{:erlang.unique_integer([:positive])}"
-      )
-
-    on_exit(fn -> safe_stop(pid) end)
-
-    :atomics.put(ctx.checkpoint_flags, 1, 1)
-
-    send(pid, :tick)
-
-    assert_receive {:checkpoint, _meas, %{status: :deferred, reason: :promotion_in_progress}},
-                   2_000
-
-    refute_receive {:fsync_async_called, ^pid, 1, ^active_path}, 100
-    assert :atomics.get(ctx.checkpoint_flags, 1) == 1
-    assert :atomics.get(ctx.checkpoint_in_flight, 1) == 0
   end
 
   test "async fsync submit errors reset dirty and in-flight markers", %{

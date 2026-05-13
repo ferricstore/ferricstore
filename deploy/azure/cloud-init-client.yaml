@@ -16,11 +16,11 @@ packages:
   - libncurses-dev
   - libevent-dev
   - pkg-config
+  - zlib1g-dev
 
 write_files:
   - path: /home/${admin_username}/setup-client.sh
     permissions: "0755"
-    owner: "${admin_username}:${admin_username}"
     content: |
       #!/bin/bash
       set -euo pipefail
@@ -69,9 +69,9 @@ write_files:
       fi
       cd "$HOME/ferricstore"
       git fetch origin
-      git checkout perf/write-throughput-optimization
-      git pull origin perf/write-throughput-optimization
-      export FERRICSTORE_BUILD_NIF=1
+      git checkout ${git_branch}
+      git pull --ff-only origin ${git_branch}
+      export FERRICSTORE_BUILD=1
       mix local.hex --force
       mix local.rebar --force
       mix deps.get
@@ -89,4 +89,6 @@ write_files:
       echo "  elixir --sname bench --cookie ferricstore_bench -S mix run bench/cluster_throughput.exs --node ferricstore@ferricstore-0 --node ferricstore@ferricstore-1 --node ferricstore@ferricstore-2"
 
 runcmd:
+  - chown -R ${admin_username}:${admin_username} /home/${admin_username}
+  - chown ${admin_username}:${admin_username} /home/${admin_username}/setup-client.sh
   - su - ${admin_username} -c "/home/${admin_username}/setup-client.sh"

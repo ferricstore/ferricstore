@@ -25,6 +25,7 @@ defmodule Ferricstore.MetricsNoDefaultInstanceTest do
 
     assert text =~ "ferricstore_total_commands_processed 0"
     assert text =~ "ferricstore_hot_reads_total 0"
+    assert text =~ "ferricstore_blob_files 0"
     assert text =~ "ferricstore_bitcask_release_cursor_gap"
   end
 end

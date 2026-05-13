@@ -14,8 +14,8 @@ defmodule Ferricstore.Cluster.JoinIdentityTest do
              )
   end
 
-  test "rejects standalone target data even when cluster ids match" do
-    assert {:error, {:target_standalone_data_requires_replace, @target}} =
+  test "rejects unsupported standalone target marker even when cluster ids match" do
+    assert {:error, {:target_cluster_state_unusable, @target, :missing_replication_mode}} =
              JoinIdentity.validate(
                {:ok, %{cluster_id: "cluster-a", replication_mode: :raft}},
                {:ok, %{cluster_id: "cluster-a", replication_mode: :standalone}},

@@ -10,13 +10,14 @@ defmodule Ferricstore.ExpirySweepTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
-  import Ferricstore.Test.ShardHelpers, only: [flush_all_keys: 0]
+  import Ferricstore.Test.ShardHelpers, only: [eventually: 4, flush_all_keys: 0]
 
   # Use a unique prefix per test to avoid cross-test key collisions.
   defp ukey(base), do: "expiry_sweep_test:#{base}:#{System.unique_integer([:positive])}"
 
   setup do
     flush_all_keys()
+    reset_expiry_key_counts()
     :ok
   end
 
@@ -35,6 +36,15 @@ defmodule Ferricstore.ExpirySweepTest do
   # Triggers sweep on all 4 shards.
   defp trigger_all_sweeps do
     Enum.each(0..3, &trigger_sweep/1)
+  end
+
+  defp reset_expiry_key_counts do
+    ctx = FerricStore.Instance.get(:default)
+
+    Enum.each(1..ctx.shard_count, fn idx ->
+      :atomics.put(ctx.expiry_key_counts, idx, 0)
+      :atomics.put(ctx.expiry_next_due_at, idx, 0)
+    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -66,6 +76,134 @@ defmodule Ferricstore.ExpirySweepTest do
 
       # Key should still be present.
       assert Router.get(FerricStore.Instance.get(:default), key) == "persistent_value"
+    end
+
+    test "writes maintain per-shard TTL key counts without counting no-TTL keys" do
+      ctx = FerricStore.Instance.get(:default)
+      key = ukey("ttl_counter")
+      shard_idx = Router.shard_for(ctx, key)
+      counter_idx = shard_idx + 1
+      before = :atomics.get(ctx.expiry_key_counts, counter_idx)
+
+      assert :ok = Router.put(ctx, key, "persistent_value", 0)
+      assert :atomics.get(ctx.expiry_key_counts, counter_idx) == before
+
+      future = System.os_time(:millisecond) + 60_000
+      assert :ok = Router.put(ctx, key, "ttl_value", future)
+
+      eventually(
+        fn -> :atomics.get(ctx.expiry_key_counts, counter_idx) == before + 1 end,
+        "TTL key count did not increment",
+        50,
+        10
+      )
+
+      assert :ok = Router.put(ctx, key, "persistent_again", 0)
+
+      eventually(
+        fn -> :atomics.get(ctx.expiry_key_counts, counter_idx) == before end,
+        "TTL key count did not decrement",
+        50,
+        10
+      )
+    end
+
+    test "periodic sweep skips ETS scan when tracked shard has no TTL keys" do
+      ctx = FerricStore.Instance.get(:default)
+      keydir = :ets.new(:periodic_sweep_skip, [:set, :public])
+      expire_at_ms = System.os_time(:millisecond) - 1_000
+
+      try do
+        :ets.insert(keydir, {"manually_inserted_expired", "value", expire_at_ms, 0, 0, 0, 5})
+
+        state = %{
+          index: 0,
+          keydir: keydir,
+          instance_ctx: ctx,
+          file_stats: %{},
+          promoted_instances: %{},
+          active_file_path: "00000.log",
+          sweep_at_ceiling_count: 0,
+          sweep_struggling: false
+        }
+
+        :atomics.put(ctx.expiry_key_counts, 1, 0)
+
+        assert %{sweep_at_ceiling_count: 0, sweep_struggling: false} =
+                 Ferricstore.Store.Shard.Lifecycle.do_expiry_sweep(state)
+
+        assert [{_, _, ^expire_at_ms, _, _, _, _}] =
+                 :ets.lookup(keydir, "manually_inserted_expired")
+      after
+        :ets.delete(keydir)
+      end
+    end
+
+    test "periodic sweep waits until the tracked next TTL is due" do
+      ctx = FerricStore.Instance.get(:default)
+      keydir = :ets.new(:periodic_sweep_next_due_skip, [:set, :public])
+      expire_at_ms = System.os_time(:millisecond) - 1_000
+      future_due = System.os_time(:millisecond) + 60_000
+
+      try do
+        :ets.insert(keydir, {"manually_inserted_expired", "value", expire_at_ms, 0, 0, 0, 5})
+
+        state = %{
+          index: 0,
+          keydir: keydir,
+          instance_ctx: ctx,
+          file_stats: %{},
+          promoted_instances: %{},
+          active_file_path: "00000.log",
+          sweep_at_ceiling_count: 0,
+          sweep_struggling: false
+        }
+
+        :atomics.put(ctx.expiry_key_counts, 1, 1)
+        :atomics.put(ctx.expiry_next_due_at, 1, future_due)
+
+        assert %{sweep_at_ceiling_count: 0, sweep_struggling: false} =
+                 Ferricstore.Store.Shard.Lifecycle.do_expiry_sweep(state)
+
+        assert [{_, _, ^expire_at_ms, _, _, _, _}] =
+                 :ets.lookup(keydir, "manually_inserted_expired")
+      after
+        :ets.delete(keydir)
+      end
+    end
+
+    test "periodic sweep may scan before tracked due time under memory pressure" do
+      ctx = FerricStore.Instance.get(:default)
+      keydir = :ets.new(:periodic_sweep_pressure_scan, [:set, :public])
+      expire_at_ms = System.os_time(:millisecond) - 1_000
+      future_due = System.os_time(:millisecond) + 60_000
+
+      try do
+        :ets.insert(keydir, {"manually_inserted_expired", "value", expire_at_ms, 0, 0, 0, 5})
+
+        state = %{
+          index: 0,
+          keydir: keydir,
+          instance_ctx: ctx,
+          file_stats: %{},
+          promoted_instances: %{},
+          active_file_path: "00000.log",
+          sweep_at_ceiling_count: 0,
+          sweep_struggling: false
+        }
+
+        :atomics.put(ctx.expiry_key_counts, 1, 1)
+        :atomics.put(ctx.expiry_next_due_at, 1, future_due)
+        :atomics.put(ctx.pressure_flags, 3, 1)
+
+        assert %{sweep_at_ceiling_count: 0, sweep_struggling: false} =
+                 Ferricstore.Store.Shard.Lifecycle.do_expiry_sweep(state)
+
+        assert :ets.lookup(keydir, "manually_inserted_expired") == []
+      after
+        :atomics.put(ctx.pressure_flags, 3, 0)
+        :ets.delete(keydir)
+      end
     end
 
     test "keys with future TTL are not affected by sweep" do
@@ -115,7 +253,9 @@ defmodule Ferricstore.ExpirySweepTest do
         |> Stream.filter(fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) == 0 end)
         |> Enum.take(5)
 
-      Enum.each(keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "expired_val", past) end)
+      Enum.each(keys, fn k ->
+        Router.put(FerricStore.Instance.get(:default), k, "expired_val", past)
+      end)
 
       # First manual sweep should remove at most 2.
       # Note: the auto sweep timer may have already run, so we only assert
@@ -152,7 +292,9 @@ defmodule Ferricstore.ExpirySweepTest do
         |> Stream.filter(fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) == 0 end)
         |> Enum.take(5)
 
-      Enum.each(keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "expired_val", past) end)
+      Enum.each(keys, fn k ->
+        Router.put(FerricStore.Instance.get(:default), k, "expired_val", past)
+      end)
 
       # Run enough sweep cycles (ceiling of 5/2 = 3, plus 1 extra for safety).
       Enum.each(1..4, fn _ -> trigger_sweep(0) end)

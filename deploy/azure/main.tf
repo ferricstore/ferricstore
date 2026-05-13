@@ -158,13 +158,15 @@ resource "azurerm_linux_virtual_machine" "bench" {
   }
 
   custom_data = base64encode(templatefile("${path.module}/cloud-init.yaml", {
-    otp_version     = var.otp_version
-    elixir_version  = var.elixir_version
-    shard_count     = var.shard_count
+    otp_version      = var.otp_version
+    elixir_version   = var.elixir_version
+    shard_count      = var.shard_count
     ferricstore_port = var.ferricstore_port
-    node_index      = count.index
-    node_count      = var.node_count
-    admin_username  = var.admin_username
+    node_index       = count.index
+    node_count       = var.node_count
+    admin_username   = var.admin_username
+    data_filesystem  = var.data_filesystem
+    git_branch       = var.ferricstore_git_branch
   }))
 
   tags = {
@@ -236,6 +238,7 @@ resource "azurerm_linux_virtual_machine" "client" {
     otp_version    = var.otp_version
     elixir_version = var.elixir_version
     admin_username = var.admin_username
+    git_branch     = var.ferricstore_git_branch
   }))
 
   tags = {

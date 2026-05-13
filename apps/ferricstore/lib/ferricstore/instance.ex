@@ -16,6 +16,8 @@ defmodule FerricStore.Instance do
   which are mutable shared references).
   """
 
+  @default_blob_side_channel_threshold_bytes 256 * 1024
+
   @type t :: %__MODULE__{
           name: atom(),
           data_dir: binary(),
@@ -46,12 +48,15 @@ defmodule FerricStore.Instance do
           last_released_cursor_index: reference(),
           pending_release_cursor_checkpoint_count: reference(),
           release_cursor_blocked_apply_count: reference(),
+          expiry_key_counts: reference(),
+          expiry_next_due_at: reference(),
           write_version: reference(),
           stats_counter: reference(),
           lfu_decay_time: non_neg_integer(),
           lfu_log_factor: non_neg_integer(),
           lfu_initial_ref: reference(),
           hot_cache_max_value_size: non_neg_integer(),
+          blob_side_channel_threshold_bytes: non_neg_integer(),
           sync_flush_timeout_ms: non_neg_integer(),
           max_active_file_size: non_neg_integer(),
           read_sample_rate: non_neg_integer(),
@@ -98,12 +103,15 @@ defmodule FerricStore.Instance do
     :last_released_cursor_index,
     :pending_release_cursor_checkpoint_count,
     :release_cursor_blocked_apply_count,
+    :expiry_key_counts,
+    :expiry_next_due_at,
     :write_version,
     :stats_counter,
     :lfu_decay_time,
     :lfu_log_factor,
     :lfu_initial_ref,
     :hot_cache_max_value_size,
+    :blob_side_channel_threshold_bytes,
     :sync_flush_timeout_ms,
     :max_active_file_size,
     :read_sample_rate,
@@ -367,6 +375,29 @@ defmodule FerricStore.Instance do
         :atomics.new(shard_count, signed: true)
       end
 
+    # Per-shard count of keys with expire_at_ms > 0. The active expiry sweeper
+    # uses this to avoid scanning large no-TTL keydirs on hot write paths.
+    expiry_key_counts =
+      if name == :default do
+        try_get_pt(:ferricstore_expiry_key_counts, fn ->
+          :atomics.new(shard_count, signed: true)
+        end)
+      else
+        :atomics.new(shard_count, signed: true)
+      end
+
+    # Per-shard earliest known expire_at_ms. This is conservative: deletes or
+    # updates of the earliest key can leave a stale past value, which only costs
+    # one extra sweep. New TTL writes move it earlier without scanning ETS.
+    expiry_next_due_at =
+      if name == :default do
+        try_get_pt(:ferricstore_expiry_next_due_at, fn ->
+          :atomics.new(shard_count, signed: true)
+        end)
+      else
+        :atomics.new(shard_count, signed: true)
+      end
+
     # LFU config
     lfu_decay_time = Keyword.get(opts, :lfu_decay_time, 1)
     lfu_log_factor = Keyword.get(opts, :lfu_log_factor, 10)
@@ -443,19 +474,31 @@ defmodule FerricStore.Instance do
       lfu_log_factor: lfu_log_factor,
       lfu_initial_ref: lfu_initial_ref,
       hot_cache_max_value_size: Keyword.get(opts, :hot_cache_max_value_size, 65_536),
+      blob_side_channel_threshold_bytes:
+        Keyword.get(
+          opts,
+          :blob_side_channel_threshold_bytes,
+          Application.get_env(
+            :ferricstore,
+            :blob_side_channel_threshold_bytes,
+            @default_blob_side_channel_threshold_bytes
+          )
+        ),
       sync_flush_timeout_ms:
         Keyword.get(
           opts,
           :sync_flush_timeout_ms,
           Application.get_env(:ferricstore, :sync_flush_timeout_ms, 5_000)
         ),
-      max_active_file_size: Keyword.get(opts, :max_active_file_size, 256 * 1024 * 1024),
+      max_active_file_size: Keyword.get(opts, :max_active_file_size, 8 * 1024 * 1024 * 1024),
       read_sample_rate: Keyword.get(opts, :read_sample_rate, 100),
       eviction_policy: Keyword.get(opts, :eviction_policy, :volatile_lfu),
       max_memory_bytes: max_memory_bytes,
       keydir_max_ram: keydir_max_ram,
       memory_limit: memory_limit,
       keydir_binary_bytes: keydir_binary_bytes,
+      expiry_key_counts: expiry_key_counts,
+      expiry_next_due_at: expiry_next_due_at,
       hotness_table: hotness_table,
       config_table: config_table,
       connected_clients_fn: Keyword.get(opts, :connected_clients_fn, fn -> 0 end),

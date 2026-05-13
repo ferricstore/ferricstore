@@ -633,7 +633,7 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
     test "-@dangerous denies broad destructive maintenance commands" do
       :ok = Acl.set_user("no_danger", ["on", ">pass", "+@all", "-@dangerous"])
 
-      for cmd <- ~w(FLUSHDB CLUSTER.ENABLE CLUSTER.JOIN FLOW.RETENTION_CLEANUP) do
+      for cmd <- ~w(FLUSHDB CLUSTER.JOIN FLOW.RETENTION_CLEANUP) do
         assert {:error, _} = Acl.check_command("no_danger", cmd),
                "-@dangerous should deny #{cmd}"
       end

@@ -201,57 +201,15 @@ defmodule Ferricstore.Commands.ClusterCommandsTest do
       assert {:error, "ERR syntax error"} =
                Cluster.handle("CLUSTER.JOIN", [Atom.to_string(node()), "UNKNOWN"], store)
     end
-  end
 
-  describe "CLUSTER.ENABLE" do
-    test "dryrun is accepted when already in raft mode", %{store: store} do
-      assert :ok = Cluster.handle("CLUSTER.ENABLE", ["DRYRUN"], store)
-    end
+    test "rejects unknown node names without creating atoms", %{store: store} do
+      node_name = "cluster_join_unknown_#{System.unique_integer([:positive])}@127.0.0.1"
+      before_count = :erlang.system_info(:atom_count)
 
-    test "status reports promotion recovery fields", %{store: store} do
-      result = Cluster.handle("CLUSTER.ENABLE", ["STATUS"], store)
+      assert {:error, "ERR unknown node" <> _} =
+               Cluster.handle("CLUSTER.JOIN", [node_name], store)
 
-      assert is_binary(result)
-      assert result =~ "replication_mode:"
-      assert result =~ "manager_mode:"
-      assert result =~ "node_alive:"
-      assert result =~ "ready:"
-      assert result =~ "last_enable_error:"
-      assert result =~ "marker_status:"
-    end
-
-    test "resume reports when no enabling recovery is pending", %{store: store} do
-      old_mode = Ferricstore.ReplicationMode.current()
-
-      try do
-        Ferricstore.ReplicationMode.put_current(:raft)
-
-        assert {:error, message} = Cluster.handle("CLUSTER.ENABLE", ["RESUME"], store)
-        assert message =~ "no_enable_recovery_needed"
-      after
-        Ferricstore.ReplicationMode.put_current(old_mode)
-      end
-    end
-
-    test "rejects unknown CLUSTER.ENABLE option", %{store: store} do
-      assert {:error, "ERR syntax error"} = Cluster.handle("CLUSTER.ENABLE", ["NOW"], store)
-    end
-  end
-
-  describe "CLUSTER.DURABILITY" do
-    test "status reports standalone repair fields", %{store: store} do
-      result = Cluster.handle("CLUSTER.DURABILITY", ["STATUS"], store)
-
-      assert is_binary(result)
-      assert result =~ "replication_mode:"
-      assert result =~ "repair_required:"
-      assert result =~ "paused_shards:"
-      assert result =~ "disk_pressure_shards:"
-      assert result =~ "error_shards:"
-    end
-
-    test "rejects unknown CLUSTER.DURABILITY option", %{store: store} do
-      assert {:error, "ERR syntax error"} = Cluster.handle("CLUSTER.DURABILITY", ["NOW"], store)
+      assert :erlang.system_info(:atom_count) == before_count
     end
   end
 

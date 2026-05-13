@@ -382,8 +382,8 @@ redis-cli FERRICSTORE.HOTNESS   # Hot vs cold read ratio per key
 ### Namespace Configuration
 
 ```bash
-# Set session namespace to 5ms commit window with async durability
-redis-cli FERRICSTORE.CONFIG SET session window_ms 5 durability async
+# Set session namespace to a 5ms commit window
+redis-cli FERRICSTORE.CONFIG SET session window_ms 5
 
 # Reset a namespace to defaults
 redis-cli FERRICSTORE.CONFIG RESET session

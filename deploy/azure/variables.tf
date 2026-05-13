@@ -58,6 +58,23 @@ variable "shard_count" {
   default     = 0
 }
 
+variable "data_filesystem" {
+  description = "Filesystem used for the FerricStore local NVMe data mount"
+  type        = string
+  default     = "xfs"
+
+  validation {
+    condition     = contains(["ext4", "xfs"], var.data_filesystem)
+    error_message = "data_filesystem must be either ext4 or xfs."
+  }
+}
+
+variable "ferricstore_git_branch" {
+  description = "FerricStore git branch used by benchmark VMs"
+  type        = string
+  default     = "main"
+}
+
 variable "ferricstore_port" {
   description = "FerricStore TCP port"
   type        = number

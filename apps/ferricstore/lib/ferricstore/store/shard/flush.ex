@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   @moduledoc "Async and sync Bitcask batch flush, file rotation, hint-file writing, and per-file dead-byte fragmentation tracking."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   require Logger
@@ -29,37 +30,32 @@ defmodule Ferricstore.Store.Shard.Flush do
   def flush_pending(%{pending: pending} = state) do
     raw_batch = Enum.reverse(pending)
 
-    batch =
-      Enum.map(raw_batch, fn {key, value, exp} ->
-        {key, ShardETS.to_disk_binary(value), exp}
-      end)
+    with {:ok, batch} <- build_flush_batch(state, raw_batch),
+         state <- maybe_rotate_file(state),
+         {:ok, locations} <-
+           NIF.v2_append_batch_nosync(state.active_file_path, append_batch(batch)) do
+      Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
+      # Raise dirty flag so BitcaskCheckpointer picks this up on the
+      # next tick. This is the ONLY fsync trigger for the nosync path.
+      if state.instance_ctx do
+        :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 1)
+      end
 
-    state = maybe_rotate_file(state)
+      written = total_record_bytes(batch)
+      state = update_ets_locations(state, batch, locations)
+      state = track_flush_bytes(state, written)
 
-    case NIF.v2_append_batch_nosync(state.active_file_path, batch) do
-      {:ok, locations} ->
-        Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
-        # Raise dirty flag so BitcaskCheckpointer picks this up on the
-        # next tick. This is the ONLY fsync trigger for the nosync path.
-        if state.instance_ctx do
-          :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 1)
-        end
+      state =
+        %{
+          state
+          | pending: [],
+            pending_count: 0,
+            active_file_size: state.active_file_size + written
+        }
+        |> Map.put(:last_flush_error, nil)
 
-        written = total_record_bytes(batch)
-        state = update_ets_locations(state, batch, locations)
-        state = track_flush_bytes(state, written)
-
-        state =
-          %{
-            state
-            | pending: [],
-              pending_count: 0,
-              active_file_size: state.active_file_size + written
-          }
-          |> Map.put(:last_flush_error, nil)
-
-        maybe_notify_fragmentation(state)
-
+      maybe_notify_fragmentation(state)
+    else
       {:error, reason} ->
         Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.index)
 
@@ -107,37 +103,31 @@ defmodule Ferricstore.Store.Shard.Flush do
   def flush_pending_sync(%{pending: pending} = state) do
     raw_batch = Enum.reverse(pending)
 
-    batch =
-      Enum.map(raw_batch, fn {key, value, exp} ->
-        {key, ShardETS.to_disk_binary(value), exp}
-      end)
+    with {:ok, batch} <- build_flush_batch(state, raw_batch),
+         state <- maybe_rotate_file(state),
+         {:ok, locations} <- NIF.v2_append_batch(state.active_file_path, append_batch(batch)) do
+      Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
+      # v2_append_batch fsyncs inside the NIF — we just wrote & fsynced
+      # in one call, so clear the checkpoint flag too.
+      if state.instance_ctx do
+        :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 0)
+      end
 
-    state = maybe_rotate_file(state)
+      written = total_record_bytes(batch)
+      state = update_ets_locations(state, batch, locations)
+      state = track_flush_bytes(state, written)
 
-    case NIF.v2_append_batch(state.active_file_path, batch) do
-      {:ok, locations} ->
-        Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
-        # v2_append_batch fsyncs inside the NIF — we just wrote & fsynced
-        # in one call, so clear the checkpoint flag too.
-        if state.instance_ctx do
-          :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 0)
-        end
+      state =
+        %{
+          state
+          | pending: [],
+            pending_count: 0,
+            active_file_size: state.active_file_size + written
+        }
+        |> Map.put(:last_flush_error, nil)
 
-        written = total_record_bytes(batch)
-        state = update_ets_locations(state, batch, locations)
-        state = track_flush_bytes(state, written)
-
-        state =
-          %{
-            state
-            | pending: [],
-              pending_count: 0,
-              active_file_size: state.active_file_size + written
-          }
-          |> Map.put(:last_flush_error, nil)
-
-        maybe_notify_fragmentation(state)
-
+      maybe_notify_fragmentation(state)
+    else
       {:error, reason} ->
         Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.index)
 
@@ -196,7 +186,52 @@ defmodule Ferricstore.Store.Shard.Flush do
   # ETS location updates after flush
   # -------------------------------------------------------------------
 
-  @spec update_ets_locations(map(), [{binary(), binary(), non_neg_integer()}], [
+  defp build_flush_batch(state, raw_batch) do
+    threshold = blob_threshold(state)
+    hot_cache_threshold = ShardETS.hot_cache_threshold(state)
+
+    Enum.reduce_while(raw_batch, {:ok, []}, fn {key, value, exp}, {:ok, acc} ->
+      disk_value = ShardETS.to_disk_binary(value)
+      staged_value = ShardETS.value_for_ets(disk_value, hot_cache_threshold)
+
+      case maybe_externalize_flush_value(state, threshold, disk_value) do
+        {:ok, persisted_value} ->
+          {:cont, {:ok, [{key, persisted_value, exp, staged_value} | acc]}}
+
+        {:error, reason} ->
+          {:halt, {:error, {:blob_externalize_failed, reason}}}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp blob_threshold(%{instance_ctx: ctx}), do: BlobValue.threshold(ctx)
+  defp blob_threshold(_state), do: 0
+
+  defp maybe_externalize_flush_value(_state, threshold, disk_value)
+       when threshold <= 0 and is_binary(disk_value),
+       do: {:ok, disk_value}
+
+  defp maybe_externalize_flush_value(
+         %{data_dir: data_dir, index: shard_index},
+         threshold,
+         disk_value
+       ),
+       do: BlobValue.maybe_externalize(data_dir, shard_index, threshold, disk_value)
+
+  defp maybe_externalize_flush_value(_state, _threshold, _disk_value),
+    do: {:error, :missing_blob_data_dir}
+
+  defp append_batch(batch) do
+    Enum.map(batch, fn {key, persisted_value, exp, _staged_value} ->
+      {key, persisted_value, exp}
+    end)
+  end
+
+  @spec update_ets_locations(map(), [{binary(), binary(), non_neg_integer(), binary() | nil}], [
           {non_neg_integer(), non_neg_integer()}
         ]) :: map()
   @doc false
@@ -206,30 +241,47 @@ defmodule Ferricstore.Store.Shard.Flush do
     last_index_by_key =
       batch
       |> Enum.with_index()
-      |> Map.new(fn {{key, _value, _exp}, index} -> {key, index} end)
+      |> Map.new(fn {{key, _persisted_value, _exp, _staged_value}, index} -> {key, index} end)
 
     new_file_stats =
       Enum.zip(batch, locations)
       |> Enum.with_index()
-      |> Enum.reduce(state.file_stats, fn {{{key, value, exp}, {offset, _record_size}}, index},
-                                          fs ->
-        if last_index_by_key[key] == index do
-          update_single_ets_location(state, key, value, exp, fid, offset, fs)
-        else
-          track_overwrite_dead_bytes(fs, key, fid, persisted_value_size(value))
-        end
+      |> Enum.reduce(state.file_stats, fn
+        {{{key, persisted_value, exp, staged_value}, {offset, _record_size}}, index}, fs ->
+          if last_index_by_key[key] == index do
+            update_single_ets_location(
+              state,
+              key,
+              persisted_value,
+              exp,
+              staged_value,
+              fid,
+              offset,
+              fs
+            )
+          else
+            track_overwrite_dead_bytes(fs, key, fid, persisted_value_size(persisted_value))
+          end
       end)
 
     %{state | file_stats: new_file_stats}
   end
 
-  defp update_single_ets_location(state, key, value, exp, fid, offset, fs) do
+  defp update_single_ets_location(
+         state,
+         key,
+         persisted_value,
+         exp,
+         expected_value,
+         fid,
+         offset,
+         fs
+       ) do
     keydir = state.keydir
-    expected_value = ShardETS.value_for_ets(value, ShardETS.hot_cache_threshold(state))
 
     case :ets.lookup(keydir, key) do
       [{^key, ^expected_value, ^exp, _lfu, :pending, old_fid, old_vsize}] ->
-        vsize = persisted_value_size(value)
+        vsize = persisted_value_size(persisted_value)
 
         replaced =
           :ets.select_replace(keydir, [
@@ -253,7 +305,7 @@ defmodule Ferricstore.Store.Shard.Flush do
       [{^key, _old_value, _old_exp, _lfu, old_fid, _old_off, old_vsize}]
       when old_fid != :pending and is_integer(old_fid) and old_fid >= 0 and
              is_integer(old_vsize) and old_vsize >= 0 ->
-        vsize = persisted_value_size(value)
+        vsize = persisted_value_size(persisted_value)
 
         :ets.insert(
           keydir,
@@ -291,11 +343,12 @@ defmodule Ferricstore.Store.Shard.Flush do
   # Byte tracking / fragmentation
   # -------------------------------------------------------------------
 
-  @spec total_record_bytes([{binary(), binary(), non_neg_integer()}]) :: non_neg_integer()
+  @spec total_record_bytes([{binary(), binary(), non_neg_integer(), binary() | nil}]) ::
+          non_neg_integer()
   @doc false
   def total_record_bytes(batch) do
-    Enum.reduce(batch, 0, fn {key, value, _expire_at_ms}, acc ->
-      acc + @record_header_size + byte_size(key) + byte_size(value)
+    Enum.reduce(batch, 0, fn {key, persisted_value, _expire_at_ms, _staged_value}, acc ->
+      acc + @record_header_size + byte_size(key) + byte_size(persisted_value)
     end)
   end
 
@@ -481,7 +534,10 @@ defmodule Ferricstore.Store.Shard.Flush do
             %{shard_index: state.index, kind: :old_file, path: state.active_file_path}
           )
 
-          write_hint_for_file(state, state.active_file_id)
+          # Hint files are a recovery accelerator, not part of the commit
+          # boundary. Writing them here folds the full keydir during Ra apply
+          # and creates avoidable p99 spikes on hot shards. Shutdown and
+          # explicit sync paths still write hints; recovery scans unhinted logs.
           new_id = state.active_file_id + 1
           sp = state.shard_data_path
           new_path = ShardETS.file_path(sp, new_id)

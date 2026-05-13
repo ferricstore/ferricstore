@@ -1691,6 +1691,10 @@ defmodule FerricstoreServer.Resp.ParserTest do
                     history_max_events: 10,
                     idempotent: true
                   ]}, ["tenant-a"]},
+                {:command, "FLOW.VALUE.PUT",
+                 ["shared-payload", "PARTITION", "tenant-a", "OWNER_FLOW_ID", "flow-1"],
+                 {:flow_value_put, "shared-payload",
+                  [partition_key: "tenant-a", owner_flow_id: "flow-1"]}, ["tenant-a"]},
                 {:command, "FLOW.CLAIM_DUE",
                  [
                    "checkout",
@@ -1732,6 +1736,8 @@ defmodule FerricstoreServer.Resp.ParserTest do
                    "tenant-a",
                    "queued",
                    "running",
+                   "PAYLOAD_REF",
+                   "payload-ref",
                    "RUN_AT",
                    "2000",
                    "NOW",
@@ -1748,7 +1754,7 @@ defmodule FerricstoreServer.Resp.ParserTest do
                   [
                     {:id, "flow-1", :fencing_token, 1, :lease_token, nil},
                     {:id, "flow-2", :fencing_token, 2, :lease_token, "lease-2"}
-                  ], [run_at_ms: 2000, now_ms: 1000]}, ["tenant-a"]},
+                  ], [payload_ref: "payload-ref", run_at_ms: 2000, now_ms: 1000]}, ["tenant-a"]},
                 {:command, "FLOW.RETRY", ["flow-1", "lease-1", "FENCING", "1", "RUN_AT", "2000"],
                  {:flow_retry, "flow-1", "lease-1", [fencing_token: 1, run_at_ms: 2000]},
                  ["flow-1"]},
@@ -1780,11 +1786,12 @@ defmodule FerricstoreServer.Resp.ParserTest do
               ], ""} =
                Parser.parse_commands(
                  "flow.create flow-1 TYPE checkout STATE queued RUN_AT 1000 PRIORITY 2 PARTITION tenant-a RETENTION_TTL 5000 HISTORY_MAX_EVENTS 10 IDEMPOTENT true\r\n" <>
+                   "flow.value.put shared-payload PARTITION tenant-a OWNER_FLOW_ID flow-1\r\n" <>
                    "flow.claim_due checkout WORKER worker-a LEASE_MS 30000 LIMIT 100 NOW 1000\r\n" <>
                    "flow.reclaim checkout WORKER worker-b LEASE_MS 30000 LIMIT 10 NOW 2000\r\n" <>
                    "flow.complete flow-1 lease-1 FENCING 1 RESULT result-1\r\n" <>
                    "flow.transition flow-1 queued running FENCING 1 LEASE_TOKEN lease-1\r\n" <>
-                   "flow.transition_many tenant-a queued running RUN_AT 2000 NOW 1000 ITEMS flow-1 1 - flow-2 2 lease-2\r\n" <>
+                   "flow.transition_many tenant-a queued running PAYLOAD_REF payload-ref RUN_AT 2000 NOW 1000 ITEMS flow-1 1 - flow-2 2 lease-2\r\n" <>
                    "flow.retry flow-1 lease-1 FENCING 1 RUN_AT 2000\r\n" <>
                    "flow.fail flow-1 lease-1 FENCING 1 ERROR err-1\r\n" <>
                    "flow.cancel flow-1 FENCING 1 REASON_REF reason-1\r\n" <>
@@ -2000,7 +2007,8 @@ defmodule FerricstoreServer.Resp.ParserTest do
                  {:flow_create, "f", {:error, "ERR value is not an integer or out of range"}},
                  ["f"]},
                 {:command, "FLOW.CREATE", ["f", "TYPE", "t", "PAYLOAD_REF", ^huge_ref],
-                 {:flow_create, "f", {:error, "ERR syntax error"}}, ["f"]},
+                 {:flow_create, "f", {:error, "ERR flow payload_ref too large (max 4096 bytes)"}},
+                 ["f"]},
                 {:command, "FLOW.CLAIM_DUE", ["t", "WORKER", "w", "LIMIT", "0"],
                  {:flow_claim_due, "t", {:error, "ERR flow limit must be a positive integer"}},
                  ["t"]},
@@ -2021,11 +2029,12 @@ defmodule FerricstoreServer.Resp.ParserTest do
   end
 
   describe "cluster command AST parsing" do
-    test "parses CLUSTER.ENABLE through the Rust command catalog" do
+    test "removed CLUSTER.ENABLE is parsed as unknown" do
       assert {:ok,
               [
-                {:command, "CLUSTER.ENABLE", [], {:cluster_enable, []}, []},
-                {:command, "CLUSTER.ENABLE", ["dryrun"], {:cluster_enable, ["dryrun"]}, []}
+                {:command, "CLUSTER.ENABLE", [], {:unknown, "CLUSTER.ENABLE", []}, []},
+                {:command, "CLUSTER.ENABLE", ["dryrun"], {:unknown, "CLUSTER.ENABLE", ["dryrun"]},
+                 []}
               ], ""} =
                Parser.parse_commands("cluster.enable\r\ncluster.enable dryrun\r\n")
     end

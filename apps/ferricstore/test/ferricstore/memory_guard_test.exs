@@ -47,11 +47,11 @@ defmodule Ferricstore.MemoryGuardTest do
 
     test "stats handles zero configured shards without probing negative shard ids" do
       {:ok, pid} =
-        GenServer.start_link(MemoryGuard, [
+        GenServer.start_link(MemoryGuard,
           interval_ms: 60_000,
           max_memory_bytes: 1_073_741_824,
           shard_count: 0
-        ])
+        )
 
       stats = GenServer.call(pid, :stats)
 
@@ -90,11 +90,11 @@ defmodule Ferricstore.MemoryGuardTest do
 
       # Start a dedicated MemoryGuard with a very short interval to trigger quickly
       {:ok, pid} =
-        GenServer.start_link(MemoryGuard, [
+        GenServer.start_link(MemoryGuard,
           interval_ms: 50,
           max_memory_bytes: 1_073_741_824,
           shard_count: 4
-        ])
+        )
 
       assert_receive {:telemetry_event, [:ferricstore, :memory, :check], measurements, metadata},
                      1000
@@ -121,12 +121,12 @@ defmodule Ferricstore.MemoryGuardTest do
 
       # Start a MemoryGuard with a very small max_memory to force pressure
       {:ok, pid} =
-        GenServer.start_link(MemoryGuard, [
+        GenServer.start_link(MemoryGuard,
           interval_ms: 50,
           # Set max memory very low to trigger pressure
           max_memory_bytes: 1,
           shard_count: 4
-        ])
+        )
 
       # With max_memory_bytes=1, any ETS data should trigger pressure.
       # Match specifically on per-shard events (contain pressure_level in metadata).
@@ -231,11 +231,11 @@ defmodule Ferricstore.MemoryGuardTest do
 
     test "dedicated MemoryGuard with tiny budget reports :reject" do
       {:ok, pid} =
-        GenServer.start_link(MemoryGuard, [
+        GenServer.start_link(MemoryGuard,
           interval_ms: 60_000,
           max_memory_bytes: 1,
           shard_count: 4
-        ])
+        )
 
       stats = GenServer.call(pid, :stats)
       assert stats.pressure_level == :reject
@@ -243,14 +243,51 @@ defmodule Ferricstore.MemoryGuardTest do
       GenServer.stop(pid)
     end
 
+    test "max_memory_bytes 0 disables RSS pressure for unlimited deployments" do
+      key = {FerricStore.Instance, :default}
+      previous = :persistent_term.get(key, :__missing__)
+
+      ref = :atomics.new(4, signed: true)
+
+      :persistent_term.put(key, %{
+        keydir_binary_bytes: ref,
+        process_rss_fn: fn -> 10_000 end
+      })
+
+      on_exit(fn ->
+        case previous do
+          :__missing__ -> :persistent_term.erase(key)
+          value -> :persistent_term.put(key, value)
+        end
+      end)
+
+      {:ok, pid} =
+        GenServer.start_link(MemoryGuard,
+          interval_ms: 60_000,
+          max_memory_bytes: 0,
+          shard_count: 4
+        )
+
+      :sys.replace_state(pid, fn state -> %{state | memory_limit: 1} end)
+
+      stats = GenServer.call(pid, :stats)
+
+      assert stats.rss_bytes == 10_000
+      assert stats.rss_ratio == 0.0
+      assert stats.rss_pressure_level == :ok
+      assert stats.pressure_level == :ok
+
+      GenServer.stop(pid)
+    end
+
     test "reject_writes? is true when policy is noeviction and level is reject" do
       {:ok, pid} =
-        GenServer.start_link(MemoryGuard, [
+        GenServer.start_link(MemoryGuard,
           interval_ms: 50,
           max_memory_bytes: 1,
           shard_count: 4,
           eviction_policy: :noeviction
-        ])
+        )
 
       # Trigger a check
       send(pid, :check)
@@ -289,11 +326,11 @@ defmodule Ferricstore.MemoryGuardTest do
       )
 
       {:ok, pid} =
-        GenServer.start_link(MemoryGuard, [
+        GenServer.start_link(MemoryGuard,
           interval_ms: 50,
           max_memory_bytes: 1_073_741_824,
           shard_count: 4
-        ])
+        )
 
       # Should fire at least twice in 200ms with 50ms interval
       assert_receive :check_fired, 500

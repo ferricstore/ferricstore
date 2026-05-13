@@ -101,9 +101,6 @@ defmodule Ferricstore.CrossShardOp do
         length(keys) > @max_cross_shard_keys ->
           {:error, @too_many_keys_error}
 
-        default_standalone?(ctx) ->
-          execute_standalone_cross_shard_tx(ctx, shard_map, opts)
-
         ctx.name != :default ->
           execute_direct_cross_shard(ctx, shard_map, execute_fn)
 
@@ -153,38 +150,6 @@ defmodule Ferricstore.CrossShardOp do
 
     execute_fn.(build_routing_store(ctx, per_shard_stores))
   end
-
-  defp execute_standalone_cross_shard_tx(ctx, shard_map, opts) do
-    case Keyword.fetch(opts, :tx_entry) do
-      {:ok, tx_entry} ->
-        anchor_idx = shard_map |> Map.keys() |> Enum.min()
-        namespace = Keyword.get(opts, :namespace)
-
-        shard_batches =
-          shard_map
-          |> Map.keys()
-          |> Enum.sort()
-          |> Enum.map(fn
-            ^anchor_idx -> {anchor_idx, [{0, tx_entry}], namespace}
-            shard_idx -> {shard_idx, [], namespace}
-          end)
-
-        case Router.standalone_cross_shard_tx(ctx, shard_batches) do
-          %{^anchor_idx => [result]} -> result
-          {:error, _reason} = error -> error
-          other -> other
-        end
-
-      :error ->
-        {:error, "ERR cross-shard operation unavailable in standalone without tx entry"}
-    end
-  end
-
-  defp default_standalone?(%{name: :default}) do
-    Ferricstore.ReplicationMode.current() == :standalone
-  end
-
-  defp default_standalone?(_ctx), do: false
 
   defp execute_cross_shard(ctx, keys_with_roles, shard_map, execute_fn, opts) do
     owner_ref = make_ref()

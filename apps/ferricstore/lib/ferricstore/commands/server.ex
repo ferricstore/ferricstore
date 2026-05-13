@@ -33,6 +33,7 @@ defmodule Ferricstore.Commands.Server do
 
   alias Ferricstore.AuditLog
   alias Ferricstore.Commands.Catalog
+  alias Ferricstore.Store.Router
   alias Ferricstore.Stats
 
   @doc """
@@ -466,6 +467,23 @@ defmodule Ferricstore.Commands.Server do
 
   def handle("LASTSAVE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'lastsave' command"}
+  end
+
+  def handle("FERRICSTORE.BLOBGC", [], store) do
+    with {:ok, ctx} <- server_instance_ctx(store),
+         {:ok, stats} <- Router.sweep_blob_garbage(ctx) do
+      blob_gc_result(stats)
+    else
+      {:error, :no_default_instance} ->
+        {:error, "ERR no default instance available for 'ferricstore.blobgc' command"}
+
+      {:error, reason} ->
+        {:error, "ERR blob gc failed: #{inspect(reason)}"}
+    end
+  end
+
+  def handle("FERRICSTORE.BLOBGC", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'ferricstore.blobgc' command"}
   end
 
   # ===========================================================================
@@ -1407,6 +1425,29 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp upcase_local_modifier(args), do: args
+
+  defp server_instance_ctx(%{instance_ctx: %FerricStore.Instance{} = ctx}), do: {:ok, ctx}
+
+  defp server_instance_ctx(_store) do
+    {:ok, FerricStore.Instance.get(:default)}
+  rescue
+    ArgumentError -> {:error, :no_default_instance}
+  end
+
+  defp blob_gc_result(stats) do
+    [
+      "deleted_files",
+      Map.get(stats, :deleted_files, 0),
+      "deleted_bytes",
+      Map.get(stats, :deleted_bytes, 0),
+      "kept_files",
+      Map.get(stats, :kept_files, 0),
+      "deleted_tmp_files",
+      Map.get(stats, :deleted_tmp_files, 0),
+      "deleted_tmp_bytes",
+      Map.get(stats, :deleted_tmp_bytes, 0)
+    ]
+  end
 
   # ---------------------------------------------------------------------------
   # SLOWLOG formatting

@@ -4,7 +4,7 @@ defmodule Ferricstore.ReplicationMode do
   @state_file "cluster_state.term"
   @pt_key {__MODULE__, :current}
 
-  @type mode :: :standalone | :enabling | :raft
+  @type mode :: :raft
 
   @spec current() :: mode()
   def current do
@@ -12,29 +12,29 @@ defmodule Ferricstore.ReplicationMode do
   end
 
   @spec put_current(mode()) :: :ok
-  def put_current(mode) when mode in [:standalone, :enabling, :raft] do
-    :persistent_term.put(@pt_key, mode)
+  def put_current(:raft) do
+    :persistent_term.put(@pt_key, :raft)
     :ok
   end
 
   @spec raft?() :: boolean()
   def raft?, do: current() == :raft
 
-  @spec standalone?() :: boolean()
-  def standalone?, do: current() == :standalone
-
   @spec resolve!(binary(), pos_integer()) :: mode()
   def resolve!(data_dir, shard_count) do
     case read(data_dir) do
       {:ok, %{replication_mode: mode, shard_count: ^shard_count}}
-      when mode in [:standalone, :enabling, :raft] ->
+      when mode in [:raft] ->
         mode
+
+      {:ok, %{replication_mode: mode, shard_count: ^shard_count}} ->
+        raise "unsupported cluster_state replication_mode=#{inspect(mode)}; standalone promotion mode was removed"
 
       {:ok, %{replication_mode: _mode, shard_count: other}} ->
         raise "cluster_state shard_count mismatch: marker=#{inspect(other)} runtime=#{shard_count}"
 
       {:error, :enoent} ->
-        configured_default()
+        :raft
 
       {:error, reason} ->
         raise "failed to read cluster_state marker: #{inspect(reason)}"
@@ -83,29 +83,6 @@ defmodule Ferricstore.ReplicationMode do
     :ok
   end
 
-  @spec mark_standalone!(binary(), pos_integer()) :: :ok
-  def mark_standalone!(data_dir, shard_count) do
-    write!(data_dir, %{
-      replication_mode: :standalone,
-      shard_count: shard_count,
-      barrier_indices: %{}
-    })
-
-    put_current(:standalone)
-  end
-
-  @spec mark_enabling!(binary(), pos_integer(), non_neg_integer()) :: :ok
-  def mark_enabling!(data_dir, shard_count, epoch) do
-    write!(data_dir, %{
-      replication_mode: :enabling,
-      promotion_epoch: epoch,
-      shard_count: shard_count,
-      barrier_indices: %{}
-    })
-
-    put_current(:enabling)
-  end
-
   @spec mark_raft!(binary(), pos_integer(), non_neg_integer(), map()) :: :ok
   def mark_raft!(data_dir, shard_count, epoch, barrier_indices) do
     write!(data_dir, %{
@@ -116,14 +93,6 @@ defmodule Ferricstore.ReplicationMode do
     })
 
     put_current(:raft)
-  end
-
-  defp configured_default do
-    case Application.get_env(:ferricstore, :raft_mode, :always) do
-      :manual -> :standalone
-      "manual" -> :standalone
-      _ -> :raft
-    end
   end
 
   defp decode(binary) do

@@ -11,11 +11,6 @@ defmodule Ferricstore.Cluster.JoinIdentity do
       when is_binary(cluster_id) ->
         :ok
 
-      {{:ok, %{cluster_id: cluster_id}},
-       {:ok, %{cluster_id: cluster_id, replication_mode: :standalone}}}
-      when is_binary(cluster_id) ->
-        {:error, {:target_standalone_data_requires_replace, target_node}}
-
       {{:error, :enoent}, {:error, :enoent}} ->
         :ok
 

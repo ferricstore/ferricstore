@@ -29,8 +29,18 @@ defmodule FerricstoreServer.Connection.Pipeline do
     BF.EXISTS BF.MEXISTS CF.EXISTS CMS.QUERY TOPK.QUERY TDIGEST.INFO
   ))
 
+  @prefetch_read_only_keyless_cmds MapSet.new(~w(
+    PING ECHO DBSIZE INFO COMMAND LOLWUT LASTSAVE
+    CLUSTER.HEALTH CLUSTER.STATS CLUSTER.SLOTS CLUSTER.STATUS CLUSTER.ROLE
+    FERRICSTORE.METRICS MEMORY
+  ))
+
   # Maximum commands in a single pipeline batch (100K).
   @max_pipeline_size 100_000
+  @max_key_size 65_535
+  @max_value_size 512 * 1024 * 1024
+  @max_setrange_offset 536_870_911
+  @max_bit_offset 4_294_967_295
 
   @doc """
   Returns the maximum pipeline batch size.
@@ -186,8 +196,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
       |> Enum.zip(lookup_keys)
       |> Enum.zip(results)
       |> Enum.reduce_while({:continue, state}, fn
-        {{key, _lookup_key}, {:file_ref, path, offset, size}}, {:continue, acc_state} ->
-          case ConnSendfile.send_file_ref_response(key, path, offset, size, acc_state) do
+        {{key, lookup_key}, {:file_ref, path, offset, size}}, {:continue, acc_state} ->
+          case ConnSendfile.send_file_ref_response(key, lookup_key, path, offset, size, acc_state) do
             {:sent, new_state} ->
               {:cont, {:continue, new_state}}
 
@@ -271,7 +281,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
          [{:command, "SET", [key, value], {:set, key, value}, [key]} | rest],
          acc
        )
-       when is_binary(key) and is_binary(value),
+       when is_binary(key) and is_binary(value) and
+              byte_size(key) <= @max_key_size and byte_size(value) < @max_value_size,
        do: extract_plain_sets(rest, [{key, value} | acc])
 
   defp extract_plain_sets(_, _acc), do: :fallback
@@ -327,21 +338,29 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp classify_mixed_pipeline(commands),
-    do: classify_mixed_pipeline(commands, [], 0, MapSet.new())
+    do: classify_mixed_pipeline(commands, [], 0, MapSet.new(), MapSet.new())
 
-  defp classify_mixed_pipeline([], acc, _idx, _written_keys), do: {:ok, Enum.reverse(acc)}
+  defp classify_mixed_pipeline([], acc, _idx, _read_keys, _written_keys),
+    do: {:ok, Enum.reverse(acc)}
 
   defp classify_mixed_pipeline(
          [{:command, "GET", [key], {:get, key}, [key]} | rest],
          acc,
          idx,
+         read_keys,
          written_keys
        )
        when is_binary(key) do
     if MapSet.member?(written_keys, key) do
       :fallback
     else
-      classify_mixed_pipeline(rest, [{:get, idx, key} | acc], idx + 1, written_keys)
+      classify_mixed_pipeline(
+        rest,
+        [{:get, idx, key} | acc],
+        idx + 1,
+        MapSet.put(read_keys, key),
+        written_keys
+      )
     end
   end
 
@@ -349,18 +368,25 @@ defmodule FerricstoreServer.Connection.Pipeline do
          [{:command, "SET", [key, value], {:set, key, value}, [key]} | rest],
          acc,
          idx,
+         read_keys,
          written_keys
        )
-       when is_binary(key) and is_binary(value),
-       do:
-         classify_mixed_pipeline(
-           rest,
-           [{:set, idx, key, value} | acc],
-           idx + 1,
-           MapSet.put(written_keys, key)
-         )
+       when is_binary(key) and is_binary(value) and byte_size(key) <= @max_key_size and
+              byte_size(value) < @max_value_size do
+    if MapSet.member?(read_keys, key) do
+      :fallback
+    else
+      classify_mixed_pipeline(
+        rest,
+        [{:set, idx, key, value} | acc],
+        idx + 1,
+        read_keys,
+        MapSet.put(written_keys, key)
+      )
+    end
+  end
 
-  defp classify_mixed_pipeline(_, _, _, _), do: :fallback
+  defp classify_mixed_pipeline(_, _, _, _, _), do: :fallback
 
   defp do_mixed_fast_path(ops, state, send_response_fn) do
     ctx = state.instance_ctx
@@ -373,7 +399,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
     set_notify_args = Map.new(raw_set_ops, fn {idx, key, value} -> {idx, {key, value}} end)
     set_ops = namespace_set_ops(state.sandbox_namespace, raw_set_ops)
 
-    # Execute SETs first so subsequent GETs in the same pipeline see the new values.
+    # Reads and writes are disjoint here, so SETs can be grouped without
+    # changing any GET result in the same pipeline.
     set_results =
       case set_ops do
         [] ->
@@ -489,7 +516,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
       Enum.reduce_while(0..(count - 1), {:continue, state}, fn idx, {:continue, acc_state} ->
         case Map.get(primary_results, idx) || Map.get(fallback_results, idx) do
           {:file_ref, key, lookup_key, path, offset, size} ->
-            case ConnSendfile.send_file_ref_response(key, path, offset, size, acc_state) do
+            case ConnSendfile.send_file_ref_response(
+                   key,
+                   lookup_key,
+                   path,
+                   offset,
+                   size,
+                   acc_state
+                 ) do
               {:sent, new_state} ->
                 {:cont, {:continue, new_state}}
 
@@ -553,9 +587,15 @@ defmodule FerricstoreServer.Connection.Pipeline do
             Stats.incr_commands_by(state.stats_counter, length(writes))
 
             response =
-              state.instance_ctx
-              |> Ferricstore.Flow.pipeline_write_batch_independent(writes)
-              |> Enum.map(&encode_flow_result/1)
+              case safe_dispatch(fn ->
+                     Ferricstore.Flow.pipeline_write_batch_independent(state.instance_ctx, writes)
+                   end) do
+                {:ok, results} ->
+                  Enum.map(results, &encode_flow_result/1)
+
+                {:error, err} ->
+                  List.duplicate(Encoder.encode(err), length(writes))
+              end
 
             send_response_fn.(state.socket, state.transport, response)
             {:ok, {:continue, state}}
@@ -803,12 +843,36 @@ defmodule FerricstoreServer.Connection.Pipeline do
                 )
 
               :fallback ->
-                {name, args, _ast, _keys} = command_parts(cmd)
+                case phase1_write_op(cmd, idx, state) do
+                  {:ok, op} ->
+                    {ops, rest} = take_phase1_write_segment(rest, [op], state)
 
-                {entry, new_state} =
-                  dispatch_pure_single(idx, cmd, name, args, store, state, prefetched_reads)
+                    {entries, new_state} =
+                      dispatch_phase1_write_segment(
+                        Enum.reverse(ops),
+                        state,
+                        store,
+                        prefetched_reads
+                      )
 
-                dispatch_pure_segments(rest, new_state, store, prefetched_reads, [entry | acc])
+                    dispatch_pure_segments(
+                      rest,
+                      new_state,
+                      store,
+                      prefetched_reads,
+                      Enum.reverse(entries) ++ acc
+                    )
+
+                  :fallback ->
+                    {name, args, _ast, _keys} = command_parts(cmd)
+
+                    {entry, new_state} =
+                      dispatch_pure_single(idx, cmd, name, args, store, state, prefetched_reads)
+
+                    dispatch_pure_segments(rest, new_state, store, prefetched_reads, [
+                      entry | acc
+                    ])
+                end
             end
         end
     end
@@ -840,6 +904,15 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp take_flow_read_segment([], acc), do: {acc, []}
+
+  defp take_phase1_write_segment([{cmd, idx} | rest], acc, state) do
+    case phase1_write_op(cmd, idx, state) do
+      {:ok, op} -> take_phase1_write_segment(rest, [op | acc], state)
+      :fallback -> {acc, [{cmd, idx} | rest]}
+    end
+  end
+
+  defp take_phase1_write_segment([], acc, _state), do: {acc, []}
 
   defp dispatch_flow_write_segment(ops, state) do
     Stats.incr_commands_by(state.stats_counter, length(ops))
@@ -883,10 +956,212 @@ defmodule FerricstoreServer.Connection.Pipeline do
     end
   end
 
+  defp dispatch_phase1_write_segment(ops, state, store, prefetched_reads) do
+    if phase1_write_pressure_ok?(state.instance_ctx) do
+      Stats.incr_commands_by(state.stats_counter, length(ops))
+
+      keyed_commands = Enum.map(ops, fn op -> {op.key, op.command} end)
+
+      case safe_dispatch(fn ->
+             Router.pipeline_write_batch(state.instance_ctx, keyed_commands)
+           end) do
+        {:ok, results} ->
+          Enum.zip(ops, results)
+          |> Enum.reduce({[], state}, fn {op, result}, {entries, acc_state} ->
+            {
+              [response_entry(result) | entries],
+              track_non_streaming_pure_result(op.name, op.args, result, acc_state)
+            }
+          end)
+          |> then(fn {entries, final_state} -> {Enum.reverse(entries), final_state} end)
+
+        {:error, err} ->
+          {List.duplicate({:encoded, Encoder.encode(err)}, length(ops)), state}
+      end
+    else
+      dispatch_phase1_write_segment_sequential(ops, state, store, prefetched_reads)
+    end
+  end
+
+  defp dispatch_phase1_write_segment_sequential(ops, state, store, prefetched_reads) do
+    Enum.reduce(ops, {[], state}, fn op, {entries, acc_state} ->
+      {entry, new_state} =
+        dispatch_pure_single(op.idx, op.cmd, op.name, op.args, store, acc_state, prefetched_reads)
+
+      {[entry | entries], new_state}
+    end)
+    |> then(fn {entries, final_state} -> {Enum.reverse(entries), final_state} end)
+  end
+
+  defp phase1_write_pressure_ok?(ctx),
+    do: :atomics.get(ctx.pressure_flags, 1) == 0 and :atomics.get(ctx.pressure_flags, 2) == 0
+
   defp has_flow_write?(commands) do
     Enum.any?(commands, fn command ->
       match?({:ok, _op}, flow_write_op(command))
     end)
+  end
+
+  defp phase1_write_op(
+         {:command, name, args, ast, _keys} = cmd,
+         idx,
+         %{sandbox_namespace: namespace} = state
+       )
+       when is_binary(name) and is_list(args) do
+    if not phase1_write_batch_enabled?(state) do
+      :fallback
+    else
+      with {:ok, key, command} <- phase1_write_command(ast, namespace) do
+        {:ok, %{idx: idx, cmd: cmd, name: name, args: args, key: key, command: command}}
+      end
+    end
+  end
+
+  defp phase1_write_op(_command, _idx, _state), do: :fallback
+
+  defp phase1_write_batch_enabled?(%{transport: transport, instance_ctx: %{name: :default}})
+       when transport in [:ranch_tcp, :ranch_ssl],
+       do: true
+
+  defp phase1_write_batch_enabled?(_state), do: false
+
+  defp phase1_write_command({:set, key, value}, namespace)
+       when is_binary(key) and is_binary(value) and
+              byte_size(key) <= @max_key_size and byte_size(value) < @max_value_size,
+       do: phase1_key_command(key, {:put, namespace_key(namespace, key), value, 0}, namespace)
+
+  defp phase1_write_command({:set, _key, _value}, _namespace), do: :fallback
+
+  defp phase1_write_command({:incr, key}, namespace) when is_binary(key),
+    do: phase1_key_command(key, {:incr, namespace_key(namespace, key), 1}, namespace)
+
+  defp phase1_write_command({:decr, key}, namespace) when is_binary(key),
+    do: phase1_key_command(key, {:incr, namespace_key(namespace, key), -1}, namespace)
+
+  defp phase1_write_command({:incrby, key, delta}, namespace)
+       when is_binary(key) and is_integer(delta),
+       do: phase1_key_command(key, {:incr, namespace_key(namespace, key), delta}, namespace)
+
+  defp phase1_write_command({:decrby, key, delta}, namespace)
+       when is_binary(key) and is_integer(delta),
+       do: phase1_key_command(key, {:incr, namespace_key(namespace, key), -delta}, namespace)
+
+  defp phase1_write_command({:incrbyfloat, key, delta}, namespace)
+       when is_binary(key) and is_float(delta),
+       do: phase1_key_command(key, {:incr_float, namespace_key(namespace, key), delta}, namespace)
+
+  defp phase1_write_command({:append, key, suffix}, namespace) when is_binary(key),
+    do: phase1_key_command(key, {:append, namespace_key(namespace, key), suffix}, namespace)
+
+  defp phase1_write_command({:setrange, key, offset, value}, namespace)
+       when is_binary(key) and is_integer(offset) and offset >= 0 and
+              offset <= @max_setrange_offset,
+       do:
+         phase1_key_command(
+           key,
+           {:setrange, namespace_key(namespace, key), offset, value},
+           namespace
+         )
+
+  defp phase1_write_command({:setrange, _key, _offset, _value}, _namespace), do: :fallback
+
+  defp phase1_write_command({:setbit, key, offset, bit}, namespace)
+       when is_binary(key) and is_integer(offset) and offset >= 0 and offset <= @max_bit_offset and
+              bit in [0, 1],
+       do:
+         phase1_key_command(key, {:setbit, namespace_key(namespace, key), offset, bit}, namespace)
+
+  defp phase1_write_command({:setbit, _key, _offset, _bit}, _namespace), do: :fallback
+
+  defp phase1_write_command({:hincrby, key, field, delta}, namespace)
+       when is_binary(key) and is_integer(delta),
+       do:
+         phase1_key_command(
+           key,
+           {:hincrby, namespace_key(namespace, key), field, delta},
+           namespace
+         )
+
+  defp phase1_write_command({:hincrbyfloat, key, field, delta}, namespace)
+       when is_binary(key) and is_float(delta),
+       do:
+         phase1_key_command(
+           key,
+           {:hincrbyfloat, namespace_key(namespace, key), field, delta},
+           namespace
+         )
+
+  defp phase1_write_command({:zincrby, key, increment, member}, namespace)
+       when is_binary(key) and is_float(increment),
+       do:
+         phase1_key_command(
+           key,
+           {:zincrby, namespace_key(namespace, key), increment, member},
+           namespace
+         )
+
+  defp phase1_write_command({:pfadd, [key | elements]}, namespace) when is_binary(key),
+    do: phase1_key_command(key, {:pfadd, namespace_key(namespace, key), elements}, namespace)
+
+  defp phase1_write_command({:json_set, key, path, value, flags}, namespace)
+       when is_binary(key) and (is_binary(path) or is_list(path)) and is_binary(value) and
+              is_list(flags),
+       do:
+         phase1_key_command(
+           key,
+           {:json_set, namespace_key(namespace, key), path, value, flags},
+           namespace
+         )
+
+  defp phase1_write_command({:json_set, _key, _path, _value, _flags}, _namespace),
+    do: :fallback
+
+  defp phase1_write_command({:json_del, key, path}, namespace)
+       when is_binary(key) and (is_binary(path) or is_list(path)),
+       do: phase1_key_command(key, {:json_del, namespace_key(namespace, key), path}, namespace)
+
+  defp phase1_write_command({:json_del, _key, _path}, _namespace), do: :fallback
+
+  defp phase1_write_command({:json_numincrby, key, path, increment}, namespace)
+       when is_binary(key) and (is_binary(path) or is_list(path)) and is_number(increment),
+       do:
+         phase1_key_command(
+           key,
+           {:json_numincrby, namespace_key(namespace, key), path, increment},
+           namespace
+         )
+
+  defp phase1_write_command({:json_numincrby, _key, _path, _increment}, _namespace),
+    do: :fallback
+
+  defp phase1_write_command({:json_arrappend, key, path, values}, namespace)
+       when is_binary(key) and (is_binary(path) or is_list(path)) and is_list(values),
+       do:
+         phase1_key_command(
+           key,
+           {:json_arrappend, namespace_key(namespace, key), path, values},
+           namespace
+         )
+
+  defp phase1_write_command({:json_arrappend, _key, _path, _values}, _namespace),
+    do: :fallback
+
+  defp phase1_write_command({:json_toggle, key, path}, namespace)
+       when is_binary(key) and (is_binary(path) or is_list(path)),
+       do: phase1_key_command(key, {:json_toggle, namespace_key(namespace, key), path}, namespace)
+
+  defp phase1_write_command({:json_toggle, _key, _path}, _namespace), do: :fallback
+
+  defp phase1_write_command({:json_clear, key, path}, namespace)
+       when is_binary(key) and (is_binary(path) or is_list(path)),
+       do: phase1_key_command(key, {:json_clear, namespace_key(namespace, key), path}, namespace)
+
+  defp phase1_write_command({:json_clear, _key, _path}, _namespace), do: :fallback
+
+  defp phase1_write_command(_ast, _namespace), do: :fallback
+
+  defp phase1_key_command(key, command, namespace) do
+    {:ok, namespace_key(namespace, key), command}
   end
 
   defp dispatch_pure_single(idx, cmd, name, args, store, state, prefetched_reads) do
@@ -926,48 +1201,57 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp prefetch_pure_tcp_reads(commands, %{transport: transport} = state)
        when transport in [:ranch_tcp, :ranch_ssl] do
-    {gets, mgets, getranges, _written_keys} =
+    {gets, mgets, getranges, _written_keys, _prefetch_blocked?} =
       commands
       |> Enum.with_index()
-      |> Enum.reduce({[], [], [], MapSet.new()}, fn {cmd, idx},
-                                                    {get_acc, mget_acc, getrange_acc,
-                                                     written_keys} ->
+      |> Enum.reduce({[], [], [], MapSet.new(), false}, fn {cmd, idx},
+                                                           {get_acc, mget_acc, getrange_acc,
+                                                            written_keys, prefetch_blocked?} ->
         case command_parts(cmd) do
           {"GET", [key], {:get, key}, [key]} when is_binary(key) ->
-            if MapSet.member?(written_keys, key) do
-              {get_acc, mget_acc, getrange_acc, written_keys}
+            if prefetch_blocked? or MapSet.member?(written_keys, key) do
+              {get_acc, mget_acc, getrange_acc, written_keys, prefetch_blocked?}
             else
-              {[{idx, key, namespace_key(state.sandbox_namespace, key)} | get_acc], mget_acc,
-               getrange_acc, written_keys}
+              {
+                [{idx, key, namespace_key(state.sandbox_namespace, key)} | get_acc],
+                mget_acc,
+                getrange_acc,
+                written_keys,
+                prefetch_blocked?
+              }
             end
 
           {"MGET", keys, {:mget, keys}, keys} when is_list(keys) and keys != [] ->
-            if any_written_key?(keys, written_keys) do
-              {get_acc, mget_acc, getrange_acc, written_keys}
+            if prefetch_blocked? or any_written_key?(keys, written_keys) do
+              {get_acc, mget_acc, getrange_acc, written_keys, prefetch_blocked?}
             else
               lookup_keys = namespace_keys(state.sandbox_namespace, keys)
-              {get_acc, [{idx, keys, lookup_keys} | mget_acc], getrange_acc, written_keys}
+
+              {get_acc, [{idx, keys, lookup_keys} | mget_acc], getrange_acc, written_keys,
+               prefetch_blocked?}
             end
 
           {"GETRANGE", [key, _start_arg, _end_arg] = args, {:getrange, key, start_idx, end_idx},
            [key]}
           when is_binary(key) and is_integer(start_idx) and is_integer(end_idx) ->
-            if MapSet.member?(written_keys, key) do
-              {get_acc, mget_acc, getrange_acc, written_keys}
+            if prefetch_blocked? or MapSet.member?(written_keys, key) do
+              {get_acc, mget_acc, getrange_acc, written_keys, prefetch_blocked?}
             else
               {get_acc, mget_acc, [{idx, args, key, start_idx, end_idx} | getrange_acc],
-               written_keys}
+               written_keys, prefetch_blocked?}
             end
 
           {name, _args, _ast, keys} when is_list(keys) and keys != [] ->
             if read_only_keyed_command?(name) do
-              {get_acc, mget_acc, getrange_acc, written_keys}
+              {get_acc, mget_acc, getrange_acc, written_keys, prefetch_blocked?}
             else
-              {get_acc, mget_acc, getrange_acc, mark_written_keys(written_keys, keys)}
+              {get_acc, mget_acc, getrange_acc, mark_written_keys(written_keys, keys),
+               prefetch_blocked?}
             end
 
-          _ ->
-            {get_acc, mget_acc, getrange_acc, written_keys}
+          {name, _args, _ast, keys} when is_list(keys) ->
+            {get_acc, mget_acc, getrange_acc, written_keys,
+             prefetch_blocked? or prefetch_keyless_barrier_command?(name)}
         end
       end)
 
@@ -989,6 +1273,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp read_only_keyed_command?(name), do: MapSet.member?(@prefetch_read_only_keyed_cmds, name)
+
+  defp prefetch_keyless_barrier_command?(name) do
+    not MapSet.member?(@prefetch_read_only_keyless_cmds, name)
+  end
 
   defp prefetch_tcp_get_ops(gets, state) do
     case gets do

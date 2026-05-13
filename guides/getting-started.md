@@ -71,7 +71,6 @@ Environment variables (set via `docker run -e` or in `docker-compose.yml`):
 | `FERRICSTORE_HEALTH_PORT` | `6380` | HTTP health/metrics port |
 | `FERRICSTORE_DATA_DIR` | `/data` | Data directory inside the container |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto = scheduler count) | Number of shards |
-| `FERRICSTORE_DURABILITY` | `quorum` | Default durability (`quorum` or `async`) |
 | `FERRICSTORE_NODE_NAME` | unset | Erlang node name (enables clustering) |
 | `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie |
 | `FERRICSTORE_CLUSTER_NODES` | unset | Comma-separated list of peer node names |

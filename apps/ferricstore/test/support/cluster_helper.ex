@@ -130,6 +130,13 @@ defmodule Ferricstore.Test.ClusterHelper do
           :cluster_nodes,
           node_names
         ])
+
+      :ok =
+        :rpc.call(node.name, Application, :put_env, [
+          :ferricstore,
+          :cluster_auto_join,
+          true
+        ])
     end)
 
     # Phase 4: Start FerricStore on all nodes CONCURRENTLY. This is critical
@@ -189,7 +196,6 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     - `opts` -- keyword options:
       - `:shards` -- number of shards (default: 4)
-      - `:raft_mode` -- FerricStore raft mode (default: configured app default)
 
   ## Returns
 
@@ -229,14 +235,11 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     configure_remote_node(node_name, data_dir, shards)
 
-    if raft_mode = Keyword.get(opts, :raft_mode) do
-      :ok = :rpc.call(node_name, Application, :put_env, [:ferricstore, :raft_mode, raft_mode])
-    end
-
     cluster_nodes = Keyword.get(opts, :cluster_nodes, [])
 
     if cluster_nodes != [] do
       :rpc.call(node_name, Application, :put_env, [:ferricstore, :cluster_nodes, cluster_nodes])
+      :rpc.call(node_name, Application, :put_env, [:ferricstore, :cluster_auto_join, true])
     end
 
     cluster_role = Keyword.get(opts, :cluster_role)

@@ -14,12 +14,42 @@ defmodule FerricstoreServer.HealthTest do
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
+  alias FerricstoreServer.Health.Endpoint
   alias Ferricstore.Test.ShardHelpers
 
   setup do
     ShardHelpers.flush_all_keys()
-    on_exit(fn -> Ferricstore.Health.set_ready(true) end)
+
+    on_exit(fn ->
+      Ferricstore.Health.set_ready(true)
+      Application.delete_env(:ferricstore, :observability_token)
+    end)
+
     :ok
+  end
+
+  describe "observability endpoint authorization" do
+    test "allows loopback peers without a token" do
+      refute Application.get_env(:ferricstore, :observability_token)
+      assert Endpoint.observability_authorized?({127, 0, 0, 1}, %{})
+      assert Endpoint.observability_authorized?({0, 0, 0, 0, 0, 0, 0, 1}, %{})
+    end
+
+    test "rejects non-loopback peers without a token" do
+      refute Endpoint.observability_authorized?({10, 0, 0, 5}, %{})
+    end
+
+    test "allows non-loopback peers with the configured bearer token" do
+      Application.put_env(:ferricstore, :observability_token, "secret-token")
+
+      assert Endpoint.observability_authorized?({10, 0, 0, 5}, %{
+               "authorization" => "Bearer secret-token"
+             })
+
+      refute Endpoint.observability_authorized?({10, 0, 0, 5}, %{
+               "authorization" => "Bearer wrong"
+             })
+    end
   end
 
   # ---------------------------------------------------------------------------

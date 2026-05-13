@@ -96,14 +96,17 @@ defmodule FerricstoreServer.Connection.Sendfile do
       {:cold_ref, path, offset, size} when size >= @sendfile_threshold_bytes ->
         stream_large_get_ref(key, lookup_key, path, offset, size, state, dispatch_normal_fn)
 
-      {:cold_ref, _path, _offset, _size} ->
-        dispatch_normal_fn.("GET", [key], state)
+      {:cold_ref, path, offset, size} ->
+        case pread_file_ref_value(lookup_key, path, offset, size) do
+          {:ok, value} -> encode_get_result(value, key, state)
+          :fallback -> dispatch_normal_fn.("GET", [key], state)
+        end
 
       {:cold_value, value} ->
         encode_get_result(value, key, state)
 
       :miss ->
-        dispatch_normal_fn.("GET", [key], state)
+        encode_get_result(nil, key, state)
     end
   end
 
@@ -201,7 +204,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
              count}
 
           {relative_offset, count} ->
-            case pread_file_range(path, value_offset + relative_offset, count) do
+            case pread_file_ref_range(path, value_offset, value_size, relative_offset, count) do
               {:ok, value} -> {:value, value}
               :fallback -> :fallback
             end
@@ -284,7 +287,10 @@ defmodule FerricstoreServer.Connection.Sendfile do
     case :file.open(path, [:read, :raw, :binary]) do
       {:ok, fd} ->
         try do
-          send_file_range_with_cork(socket, fd, offset, size, state)
+          case validate_open_file_range(path, fd) do
+            :ok -> send_file_range_with_cork(socket, fd, offset, size, state)
+            :mismatch -> :fallback
+          end
         after
           :file.close(fd)
         end
@@ -333,6 +339,76 @@ defmodule FerricstoreServer.Connection.Sendfile do
           case :file.pread(fd, offset, size) do
             {:ok, value} when byte_size(value) == size -> {:ok, value}
             _ -> :fallback
+          end
+        after
+          :file.close(fd)
+        end
+
+      {:error, _reason} ->
+        :fallback
+    end
+  end
+
+  defp pread_file_ref_range(path, value_offset, value_size, relative_offset, count) do
+    if blob_file_ref_path?(path) do
+      with {:ok, payload} <- pread_blob_file_ref_value(path, value_size) do
+        {:ok, binary_part(payload, relative_offset, count)}
+      end
+    else
+      pread_file_range(path, value_offset + relative_offset, count)
+    end
+  end
+
+  defp pread_file_ref_value(validate_key, path, 0, size) do
+    if blob_file_ref_path?(path) do
+      pread_blob_file_ref_value(path, size)
+    else
+      pread_bitcask_file_ref_value(validate_key, path, 0, size)
+    end
+  end
+
+  defp pread_file_ref_value(validate_key, path, offset, size) do
+    if blob_file_ref_path?(path) do
+      :fallback
+    else
+      pread_bitcask_file_ref_value(validate_key, path, offset, size)
+    end
+  end
+
+  defp pread_blob_file_ref_value(path, size) do
+    with {:ok, checksum} <- blob_checksum_from_path(path),
+         {:ok, payload} when is_binary(payload) and byte_size(payload) == size <- File.read(path),
+         ^checksum <- :crypto.hash(:sha256, payload) do
+      {:ok, payload}
+    else
+      _ -> :fallback
+    end
+  end
+
+  defp blob_checksum_from_path(path) do
+    hex = Path.basename(path, ".blob")
+
+    with 64 <- byte_size(hex),
+         {:ok, checksum} <- Base.decode16(hex, case: :lower) do
+      {:ok, checksum}
+    else
+      _ -> :error
+    end
+  end
+
+  defp pread_bitcask_file_ref_value(validate_key, path, offset, size) do
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          case validate_open_file_ref(path, fd, validate_key, offset, size) do
+            :ok ->
+              case :file.pread(fd, offset, size) do
+                {:ok, value} when is_binary(value) and byte_size(value) == size -> {:ok, value}
+                _ -> :fallback
+              end
+
+            :mismatch ->
+              :fallback
           end
         after
           :file.close(fd)
@@ -553,7 +629,10 @@ defmodule FerricstoreServer.Connection.Sendfile do
     case :file.open(path, [:read, :raw, :binary]) do
       {:ok, fd} ->
         try do
-          stream_file_get_open(fd, offset, size, state)
+          case validate_open_file_range(path, fd) do
+            :ok -> stream_file_get_open(fd, offset, size, state)
+            :mismatch -> :fallback
+          end
         after
           :file.close(fd)
         end
@@ -567,7 +646,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
     case :file.open(path, [:read, :raw, :binary]) do
       {:ok, fd} ->
         try do
-          case validate_open_value_ref(fd, key, offset, size) do
+          case validate_open_file_ref(path, fd, key, offset, size) do
             :ok -> stream_file_get_open(fd, offset, size, state)
             :mismatch -> :fallback
           end
@@ -660,7 +739,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
     case :file.open(path, [:read, :raw, :binary]) do
       {:ok, fd} ->
         try do
-          case validate_open_value_ref(fd, validate_key, offset, size) do
+          case validate_open_file_ref(path, fd, validate_key, offset, size) do
             :ok -> send_with_cork(socket, fd, offset, size, key, state, track_read?)
             :mismatch -> :fallback
           end
@@ -712,6 +791,62 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
       {:error, reason} ->
         {:error_after_header, reason}
+    end
+  end
+
+  defp validate_open_file_ref(path, fd, key, value_offset, value_size) do
+    if blob_file_ref_path?(path) do
+      validate_open_blob_file_ref(path, fd, value_offset, value_size)
+    else
+      validate_open_value_ref(fd, key, value_offset, value_size)
+    end
+  end
+
+  defp blob_file_ref_path?(path) when is_binary(path), do: Path.extname(path) == ".blob"
+  defp blob_file_ref_path?(_path), do: false
+
+  defp validate_open_file_range(path, fd) do
+    if blob_file_ref_path?(path) do
+      case :file.position(fd, :eof) do
+        {:ok, size} -> validate_open_blob_file_ref(path, fd, 0, size)
+        {:error, _reason} -> :mismatch
+      end
+    else
+      :ok
+    end
+  end
+
+  defp validate_open_blob_file_ref(path, fd, value_offset, value_size)
+       when is_integer(value_offset) and value_offset >= 0 and is_integer(value_size) and
+              value_size >= 0 do
+    with true <- value_offset == 0,
+         {:ok, ^value_size} <- :file.position(fd, :eof),
+         {:ok, expected_checksum} <- blob_checksum_from_path(path),
+         {:ok, ^expected_checksum} <- hash_open_file(fd) do
+      :ok
+    else
+      _ -> :mismatch
+    end
+  end
+
+  defp validate_open_blob_file_ref(_path, _fd, _value_offset, _value_size), do: :mismatch
+
+  defp hash_open_file(fd) do
+    with {:ok, 0} <- :file.position(fd, 0) do
+      hash_open_file(fd, :crypto.hash_init(:sha256))
+    end
+  end
+
+  defp hash_open_file(fd, hash_state) do
+    case :file.read(fd, @file_stream_chunk_bytes) do
+      {:ok, chunk} when is_binary(chunk) and byte_size(chunk) > 0 ->
+        hash_open_file(fd, :crypto.hash_update(hash_state, chunk))
+
+      :eof ->
+        {:ok, :crypto.hash_final(hash_state)}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

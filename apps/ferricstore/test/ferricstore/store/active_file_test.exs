@@ -166,8 +166,8 @@ defmodule Ferricstore.Store.ActiveFileTest do
   # ---------------------------------------------------------------------------
 
   describe "max-active-file-size config" do
-    test "default is 256MB" do
-      assert :persistent_term.get(:ferricstore_max_active_file_size) == 256 * 1024 * 1024
+    test "default is 8GiB to avoid frequent high-throughput rollover" do
+      assert :persistent_term.get(:ferricstore_max_active_file_size) == 8 * 1024 * 1024 * 1024
     end
 
     test "shard reads max_active_file_size from persistent_term at init" do
