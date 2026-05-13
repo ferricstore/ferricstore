@@ -1038,6 +1038,27 @@ defmodule Ferricstore.Raft.StateMachine do
     end)
   end
 
+  def apply(meta, {:locked_put_blob_ref, key, encoded_ref, expire_at_ms, owner_ref}, state) do
+    with_apply_time(meta, fn ->
+      redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+      result =
+        case check_key_lock(state, redis_key, owner_ref) do
+          :ok ->
+            with_pending_writes(state, fn ->
+              do_put_blob_ref(state, key, encoded_ref, expire_at_ms)
+            end)
+
+          {:error, _} = err ->
+            err
+        end
+
+      old_count = state.applied_count
+      new_state = %{state | applied_count: old_count + 1}
+      maybe_release_cursor(meta, old_count, new_state, result)
+    end)
+  end
+
   def apply(meta, {:locked_delete, key, owner_ref}, state) do
     with_apply_time(meta, fn ->
       redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
@@ -3880,10 +3901,28 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
+  defp apply_single(state, {:locked_put, key, value, expire_at_ms, owner_ref}) do
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+    case check_key_lock(state, redis_key, owner_ref) do
+      :ok -> do_put(state, key, value, expire_at_ms)
+      {:error, :key_locked} -> {:error, :key_locked}
+    end
+  end
+
   defp apply_single(state, {:put_blob_ref, key, encoded_ref, expire_at_ms}) do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
     case check_key_lock(state, redis_key, nil) do
+      :ok -> do_put_blob_ref(state, key, encoded_ref, expire_at_ms, materialize_pending?: true)
+      {:error, :key_locked} -> {:error, :key_locked}
+    end
+  end
+
+  defp apply_single(state, {:locked_put_blob_ref, key, encoded_ref, expire_at_ms, owner_ref}) do
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+    case check_key_lock(state, redis_key, owner_ref) do
       :ok -> do_put_blob_ref(state, key, encoded_ref, expire_at_ms, materialize_pending?: true)
       {:error, :key_locked} -> {:error, :key_locked}
     end

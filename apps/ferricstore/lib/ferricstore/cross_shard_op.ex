@@ -27,6 +27,7 @@ defmodule Ferricstore.CrossShardOp do
   """
 
   alias Ferricstore.HLC
+  alias Ferricstore.Raft.BlobCommand
   alias Ferricstore.Raft.Cluster
   alias Ferricstore.Raft.CommandClock
   alias Ferricstore.Store.Router
@@ -558,17 +559,8 @@ defmodule Ferricstore.CrossShardOp do
 
     locked_compound_put = fn redis_key, compound_key, value, expire_at_ms ->
       shard_idx = Router.shard_for(ctx, redis_key)
-      shard_id = Cluster.shard_server_id(shard_idx)
-
-      case unwrap_ra_reply(
-             CommandClock.process_command(
-               shard_id,
-               {:locked_put, compound_key, value, expire_at_ms, owner_ref}
-             )
-           ) do
-        {:ok, result, _} -> result
-        {:error, reason} -> {:error, reason}
-      end
+      command = {:locked_put, compound_key, value, expire_at_ms, owner_ref}
+      submit_locked_write_command(ctx, shard_idx, command)
     end
 
     locked_compound_delete = fn redis_key, compound_key ->
@@ -611,17 +603,8 @@ defmodule Ferricstore.CrossShardOp do
       # Writes: use locked variants through Raft with owner_ref
       put: fn key, value, expire_at_ms ->
         shard_idx = Router.shard_for(ctx, key)
-        shard_id = Cluster.shard_server_id(shard_idx)
-
-        case unwrap_ra_reply(
-               CommandClock.process_command(
-                 shard_id,
-                 {:locked_put, key, value, expire_at_ms, owner_ref}
-               )
-             ) do
-          {:ok, result, _} -> result
-          {:error, reason} -> {:error, reason}
-        end
+        command = {:locked_put, key, value, expire_at_ms, owner_ref}
+        submit_locked_write_command(ctx, shard_idx, command)
       end,
       delete: fn key ->
         shard_idx = Router.shard_for(ctx, key)
@@ -692,6 +675,38 @@ defmodule Ferricstore.CrossShardOp do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  defp submit_locked_write_command(ctx, shard_idx, command) do
+    with {:ok, prepared_command} <- prepare_locked_write_command(ctx, shard_idx, command) do
+      shard_id = Cluster.shard_server_id(shard_idx)
+
+      case unwrap_ra_reply(CommandClock.process_command(shard_id, prepared_command)) do
+        {:ok, result, _} -> result
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp prepare_locked_write_command(ctx, shard_idx, command) do
+    if is_map(ctx) and BlobCommand.side_channel_candidate?(ctx, command) do
+      BlobCommand.prepare(ctx, shard_idx, command,
+        single_member?: single_member_raft_group?(shard_idx)
+      )
+    else
+      {:ok, command}
+    end
+  end
+
+  defp single_member_raft_group?(shard_index) do
+    case Cluster.members(shard_index) do
+      {:ok, members, _leader} when is_list(members) -> length(members) == 1
+      _other -> false
+    end
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
+  end
 
   # Groups keys by shard index, preserving roles.
   defp group_keys_by_shard(ctx, keys_with_roles) do
