@@ -1365,6 +1365,33 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert File.exists?(path)
   end
 
+  test "blob garbage sweep fails closed when Ra replay metrics are unavailable", %{
+    ctx: ctx,
+    shard: shard
+  } do
+    payload = "dead-but-unknown-raft-replay-gap"
+    ref = BlobRef.from_payload(payload)
+    path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
+    original_state = :sys.get_state(shard)
+
+    :sys.replace_state(shard, fn state -> %{state | raft?: true, instance_ctx: nil} end)
+
+    try do
+      assert {:ok,
+              %{
+                deleted_files: 0,
+                deleted_bytes: 0,
+                kept_files: 0,
+                skipped: true,
+                reason: :missing_raft_replay_metrics
+              }} = Router.sweep_blob_garbage(ctx)
+
+      assert File.exists?(path)
+    after
+      :sys.replace_state(shard, fn _state -> original_state end)
+    end
+  end
+
   test "blob garbage sweep fails closed when the active Bitcask file cannot fsync", %{
     ctx: ctx,
     shard: shard,

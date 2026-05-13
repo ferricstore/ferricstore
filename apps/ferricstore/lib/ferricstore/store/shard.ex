@@ -954,43 +954,35 @@ defmodule Ferricstore.Store.Shard do
     state = flush_pending_sync(state)
 
     reply =
-      if blob_side_channel_threshold(state) > 0 do
-        with :ok <- flush_blob_gc_writer(state),
-             :ok <- fsync_blob_gc_active_file(state),
-             :ok <- blob_gc_replay_safe(state) do
-          with {:ok, live_refs} <- collect_live_blob_refs(state),
-               {:ok, stats} <- BlobStore.sweep_unreferenced(state.data_dir, state.index, live_refs) do
-            :telemetry.execute(
-              [:ferricstore, :blob, :gc],
-              %{deleted_files: stats.deleted_files, deleted_bytes: stats.deleted_bytes},
-              %{shard_index: state.index}
-            )
+      cond do
+        blob_gc_replay_metrics_unavailable?(state) ->
+          {:ok, blob_gc_skipped_stats(state, :missing_raft_replay_metrics)}
 
-            {:ok, stats}
+        blob_side_channel_threshold(state) > 0 ->
+          with :ok <- flush_blob_gc_writer(state),
+               :ok <- fsync_blob_gc_active_file(state),
+               :ok <- blob_gc_replay_safe(state) do
+            with {:ok, live_refs} <- collect_live_blob_refs(state),
+                 {:ok, stats} <-
+                   BlobStore.sweep_unreferenced(state.data_dir, state.index, live_refs) do
+              :telemetry.execute(
+                [:ferricstore, :blob, :gc],
+                %{deleted_files: stats.deleted_files, deleted_bytes: stats.deleted_bytes},
+                %{shard_index: state.index}
+              )
+
+              {:ok, stats}
+            end
+          else
+            {:skip, reason} ->
+              {:ok, blob_gc_skipped_stats(state, reason)}
+
+            {:error, _reason} = error ->
+              error
           end
-        else
-          {:skip, reason} ->
-            stats = %{
-              deleted_files: 0,
-              deleted_bytes: 0,
-              kept_files: 0,
-              skipped: true,
-              reason: reason
-            }
 
-            :telemetry.execute(
-              [:ferricstore, :blob, :gc],
-              %{deleted_files: 0, deleted_bytes: 0},
-              %{shard_index: state.index, status: :skipped, reason: reason}
-            )
-
-            {:ok, stats}
-
-          {:error, _reason} = error ->
-            error
-        end
-      else
-        {:ok, %{deleted_files: 0, deleted_bytes: 0, kept_files: 0}}
+        true ->
+          {:ok, %{deleted_files: 0, deleted_bytes: 0, kept_files: 0}}
       end
 
     {:reply, reply, state}
@@ -2218,24 +2210,68 @@ defmodule Ferricstore.Store.Shard do
 
   defp blob_gc_replay_safe(%{raft?: true, instance_ctx: ctx, index: index})
        when is_map(ctx) do
-    last_applied = shard_atomic_get(Map.get(ctx, :last_applied_index), index)
-    last_released = shard_atomic_get(Map.get(ctx, :last_released_cursor_index), index)
-
-    if last_applied > last_released do
-      {:skip, {:raft_replay_gap, last_applied, last_released}}
+    with {:ok, last_applied} <-
+           shard_atomic_get_required(Map.get(ctx, :last_applied_index), index),
+         {:ok, last_released} <-
+           shard_atomic_get_required(Map.get(ctx, :last_released_cursor_index), index) do
+      if last_applied > last_released do
+        {:skip, {:raft_replay_gap, last_applied, last_released}}
+      else
+        :ok
+      end
     else
-      :ok
+      {:error, :missing_raft_replay_metrics} -> {:skip, :missing_raft_replay_metrics}
     end
   end
 
+  defp blob_gc_replay_safe(%{raft?: true}), do: {:skip, :missing_raft_replay_metrics}
+
   defp blob_gc_replay_safe(_state), do: :ok
 
-  defp shard_atomic_get(ref, index) when is_reference(ref) and is_integer(index) and index >= 0 do
-    size = :atomics.info(ref).size
-    if index < size, do: :atomics.get(ref, index + 1), else: 0
+  defp blob_gc_replay_metrics_unavailable?(%{raft?: true, instance_ctx: ctx, index: index})
+       when is_map(ctx) do
+    not shard_atomic_available?(Map.get(ctx, :last_applied_index), index) or
+      not shard_atomic_available?(Map.get(ctx, :last_released_cursor_index), index)
   end
 
-  defp shard_atomic_get(_ref, _index), do: 0
+  defp blob_gc_replay_metrics_unavailable?(%{raft?: true}), do: true
+  defp blob_gc_replay_metrics_unavailable?(_state), do: false
+
+  defp shard_atomic_available?(ref, index)
+       when is_reference(ref) and is_integer(index) and index >= 0 do
+    index < :atomics.info(ref).size
+  end
+
+  defp shard_atomic_available?(_ref, _index), do: false
+
+  defp blob_gc_skipped_stats(state, reason) do
+    :telemetry.execute(
+      [:ferricstore, :blob, :gc],
+      %{deleted_files: 0, deleted_bytes: 0},
+      %{shard_index: state.index, status: :skipped, reason: reason}
+    )
+
+    %{
+      deleted_files: 0,
+      deleted_bytes: 0,
+      kept_files: 0,
+      skipped: true,
+      reason: reason
+    }
+  end
+
+  defp shard_atomic_get_required(ref, index)
+       when is_reference(ref) and is_integer(index) and index >= 0 do
+    size = :atomics.info(ref).size
+
+    if index < size do
+      {:ok, :atomics.get(ref, index + 1)}
+    else
+      {:error, :missing_raft_replay_metrics}
+    end
+  end
+
+  defp shard_atomic_get_required(_ref, _index), do: {:error, :missing_raft_replay_metrics}
 
   defp collect_live_blob_refs(state) do
     now_ms = Ferricstore.HLC.now_ms()
