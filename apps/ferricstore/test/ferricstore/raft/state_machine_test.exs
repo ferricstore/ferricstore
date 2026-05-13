@@ -3559,6 +3559,51 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert {:error, {:blob_ref_unavailable, :enoent}} = result
       assert [{^key, "hello", 0, _lfu, 0, 0, 5}] = :ets.lookup(ets, key)
     end
+
+    test "mixed batch SET blob ref is visible to later RMW commands", %{
+      state: state,
+      ets: ets
+    } do
+      key = "batch_set_blob_ref_read_your_write"
+      payload = "blob-value"
+      expected = payload <> "!"
+      expected_size = byte_size(expected)
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:batch, [{:set_blob_ref, key, encoded_ref, 0, set_opts(%{})}, {:append, key, "!"}]},
+          state
+        )
+
+      assert result == {:ok, [:ok, {:ok, expected_size}]}
+      assert [{^key, ^expected, 0, _lfu, _fid, _off, ^expected_size}] = :ets.lookup(ets, key)
+    end
+
+    test "mixed batch GETSET blob ref is visible to later RMW commands", %{
+      state: state,
+      ets: ets
+    } do
+      key = "batch_getset_blob_ref_read_your_write"
+      payload = "new"
+      expected = payload <> "!"
+      expected_size = byte_size(expected)
+      assert {:ok, ref} = BlobStore.put(state.data_dir, state.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+      :ets.insert(ets, {key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")})
+
+      {_new_state, result} =
+        StateMachine.apply(
+          %{},
+          {:batch, [{:getset_blob_ref, key, encoded_ref}, {:append, key, "!"}]},
+          state
+        )
+
+      assert result == {:ok, ["old", {:ok, expected_size}]}
+      assert [{^key, ^expected, 0, _lfu, _fid, _off, ^expected_size}] = :ets.lookup(ets, key)
+    end
   end
 
   describe "apply/3 with {:append, key, suffix}" do

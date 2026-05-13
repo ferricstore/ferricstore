@@ -3851,8 +3851,11 @@ defmodule Ferricstore.Raft.StateMachine do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
     case check_key_lock(state, redis_key, nil) do
-      :ok -> do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts)
-      {:error, :key_locked} -> {:error, :key_locked}
+      :ok ->
+        do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts, materialize_pending?: true)
+
+      {:error, :key_locked} ->
+        {:error, :key_locked}
     end
   end
 
@@ -3974,7 +3977,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp apply_single(state, {:getset_blob_ref, key, encoded_ref}) do
-    do_getset_blob_ref(state, key, encoded_ref)
+    do_getset_blob_ref(state, key, encoded_ref, materialize_pending?: true)
   end
 
   defp apply_single(state, {:getdel, key}) do
@@ -10297,9 +10300,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_put_blob_ref(state, key, encoded_ref, expire_at_ms, opts \\ [])
 
   defp do_put_blob_ref(state, key, encoded_ref, expire_at_ms, opts) when is_binary(encoded_ref) do
-    with :ok <- validate_put_blob_ref(state, encoded_ref),
-         {:ok, pending_value} <-
-           maybe_materialize_blob_ref_pending_value(state, encoded_ref, opts) do
+    with {:ok, pending_value} <- prepare_blob_ref_pending_value(state, encoded_ref, opts) do
       do_put_validated_blob_ref(state, key, encoded_ref, expire_at_ms, pending_value)
     end
   end
@@ -10680,7 +10681,10 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts) when is_binary(encoded_ref) do
+  defp do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts, apply_opts \\ [])
+
+  defp do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts, apply_opts)
+       when is_binary(encoded_ref) do
     compound_data_structure? = compound_data_structure_key?(state, key)
     get? = Map.get(opts, :get, false)
     current = set_current_meta(state, key, get?)
@@ -10717,9 +10721,16 @@ defmodule Ferricstore.Raft.StateMachine do
             expire_at_ms
           end
 
-        case validate_put_blob_ref(state, encoded_ref) do
-          :ok ->
-            do_put_validated_blob_ref(state, key, encoded_ref, effective_expire_at_ms)
+        case prepare_blob_ref_pending_value(state, encoded_ref, apply_opts) do
+          {:ok, pending_value} ->
+            do_put_validated_blob_ref(
+              state,
+              key,
+              encoded_ref,
+              effective_expire_at_ms,
+              pending_value
+            )
+
             if get?, do: old_value, else: :ok
 
           {:error, _reason} = error ->
@@ -10728,7 +10739,7 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp do_set_blob_ref(_state, _key, _encoded_ref, _expire_at_ms, _opts),
+  defp do_set_blob_ref(_state, _key, _encoded_ref, _expire_at_ms, _opts, _apply_opts),
     do: {:error, {:blob_ref_unavailable, :invalid_ref}}
 
   defp set_current_meta(state, key, true), do: do_get_meta(state, key)
@@ -12440,11 +12451,13 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp maybe_materialize_blob_ref_pending_value(state, encoded_ref, opts) do
+  defp prepare_blob_ref_pending_value(state, encoded_ref, opts) do
     if Keyword.get(opts, :materialize_pending?, false) do
       materialize_blob_command_value(state, encoded_ref)
     else
-      {:ok, :none}
+      with :ok <- validate_put_blob_ref(state, encoded_ref) do
+        {:ok, :none}
+      end
     end
   end
 
@@ -12580,16 +12593,18 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  defp do_getset_blob_ref(state, key, encoded_ref) when is_binary(encoded_ref) do
+  defp do_getset_blob_ref(state, key, encoded_ref, apply_opts \\ [])
+
+  defp do_getset_blob_ref(state, key, encoded_ref, apply_opts) when is_binary(encoded_ref) do
     with :ok <- ensure_string_key(state, key),
-         :ok <- validate_put_blob_ref(state, encoded_ref) do
+         {:ok, pending_value} <- prepare_blob_ref_pending_value(state, encoded_ref, apply_opts) do
       old = do_get(state, key)
-      do_put_validated_blob_ref(state, key, encoded_ref, 0)
+      do_put_validated_blob_ref(state, key, encoded_ref, 0, pending_value)
       old
     end
   end
 
-  defp do_getset_blob_ref(_state, _key, _encoded_ref),
+  defp do_getset_blob_ref(_state, _key, _encoded_ref, _apply_opts),
     do: {:error, {:blob_ref_unavailable, :invalid_ref}}
 
   # Atomic GETDEL: reads value, deletes key, returns value directly (not
