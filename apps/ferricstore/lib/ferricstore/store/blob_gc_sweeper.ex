@@ -3,12 +3,12 @@ defmodule Ferricstore.Store.BlobGCSweeper do
   Periodic conservative garbage collection for large-value blob storage.
 
   The sweeper asks `Router.sweep_blob_garbage/1` to build the live reference
-  set from shard keydirs before deleting unreferenced legacy blob files and
-  stale tmp files. Append-segment records are retained until segment compaction
-  exists; the sweep is deliberately conservative so it never removes a segment
-  that may still contain a live payload. To avoid scanning keydirs on idle
-  systems, each tick first checks blob storage stats and skips the expensive
-  sweep when no reclaimable legacy blob files or temporary files exist.
+  set from shard keydirs before deleting unreferenced blob files and stale tmp
+  files. Append segments are reclaimed only when no live ref points into the
+  whole segment, so the sweep remains conservative while still cleaning the
+  default segment-backed blob layout. To avoid scanning keydirs on idle systems,
+  each tick first checks blob storage stats and skips the expensive sweep only
+  when no blob files or temporary files exist.
   """
 
   use GenServer
@@ -129,9 +129,14 @@ defmodule Ferricstore.Store.BlobGCSweeper do
           {:ok, %{skipped: true, reason: reason} = gc_stats} ->
             {:skipped, normalize_stats(stats), normalize_gc_stats(gc_stats), reason}
 
-          {:ok, gc_stats} -> {:ok, normalize_stats(stats), normalize_gc_stats(gc_stats), :none}
-          {:error, reason} -> {:error, normalize_stats(stats), @zero_gc, reason}
-          other -> {:error, normalize_stats(stats), @zero_gc, other}
+          {:ok, gc_stats} ->
+            {:ok, normalize_stats(stats), normalize_gc_stats(gc_stats), :none}
+
+          {:error, reason} ->
+            {:error, normalize_stats(stats), @zero_gc, reason}
+
+          other ->
+            {:error, normalize_stats(stats), @zero_gc, other}
         end
       else
         {:skipped, normalize_stats(stats), @zero_gc, :no_blob_files}
@@ -162,14 +167,7 @@ defmodule Ferricstore.Store.BlobGCSweeper do
   defp sweep(_state), do: {:error, :no_default_instance}
 
   defp blob_work_present?(stats) do
-    legacy_files =
-      if Map.has_key?(stats, :legacy_files) do
-        Map.get(stats, :legacy_files, 0)
-      else
-        Map.get(stats, :files, 0)
-      end
-
-    legacy_files > 0 or Map.get(stats, :tmp_files, 0) > 0
+    Map.get(stats, :files, 0) > 0 or Map.get(stats, :tmp_files, 0) > 0
   end
 
   defp normalize_stats(stats) do
