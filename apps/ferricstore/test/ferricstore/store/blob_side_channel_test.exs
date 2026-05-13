@@ -1193,6 +1193,50 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     assert {:ok, ^second_payload} = BlobStore.get(ctx.data_dir, 0, second_blob_ref)
   end
 
+  test "promoted compound batch put externalizes large values with one blob segment fsync", %{
+    shard: shard
+  } do
+    redis_key = "blob:promoted:batch-put"
+    seed_a = CompoundKey.hash_field(redis_key, "seed-a")
+    seed_b = CompoundKey.hash_field(redis_key, "seed-b")
+
+    assert :ok = GenServer.call(shard, {:compound_put, redis_key, seed_a, "small-a", 0})
+    assert :ok = GenServer.call(shard, {:compound_put, redis_key, seed_b, "small-b", 0})
+
+    state = :sys.get_state(shard)
+    assert Map.has_key?(state.promoted_instances, redis_key)
+
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_fsync_file_hook, fn path ->
+      send(parent, {:blob_fsync_file, path})
+      Ferricstore.Bitcask.NIF.v2_fsync(path)
+    end)
+
+    on_exit(fn ->
+      Process.delete(:ferricstore_blob_store_fsync_file_hook)
+    end)
+
+    field_a = CompoundKey.hash_field(redis_key, "large-a")
+    field_b = CompoundKey.hash_field(redis_key, "large-b")
+    payload_a = :binary.copy("A", 1024)
+    payload_b = :binary.copy("B", 1024)
+
+    assert {:reply, :ok, _new_state} =
+             ShardCompound.handle_compound_batch_put(
+               redis_key,
+               [{field_a, payload_a, 0}, {field_b, payload_b, 0}],
+               state
+             )
+
+    assert payload_a == GenServer.call(shard, {:compound_get, redis_key, field_a})
+    assert payload_b == GenServer.call(shard, {:compound_get, redis_key, field_b})
+
+    assert_receive {:blob_fsync_file, first_path}, 1000
+    refute_receive {:blob_fsync_file, _second_path}, 100
+    assert String.ends_with?(first_path, ".bloblog")
+  end
+
   test "blob garbage sweep removes deleted direct blobs and preserves promoted live refs", %{
     ctx: ctx,
     shard: shard,
