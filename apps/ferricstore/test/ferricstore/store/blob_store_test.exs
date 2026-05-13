@@ -96,6 +96,21 @@ defmodule Ferricstore.Store.BlobStoreTest do
            end)
   end
 
+  test "put rotates append segments when the active segment crosses the size cap", %{
+    root: root
+  } do
+    with_blob_segment_max_bytes(600)
+
+    assert {:ok, first_ref} = BlobStore.put(root, 0, :binary.copy("a", 400))
+    assert {:ok, second_ref} = BlobStore.put(root, 0, :binary.copy("b", 400))
+
+    assert first_ref.segment_id == 0
+    assert second_ref.segment_id == 1
+    assert {:ok, {first_path, _offset, _size}} = BlobStore.file_ref(root, 0, first_ref)
+    assert {:ok, {second_path, _offset, _size}} = BlobStore.file_ref(root, 0, second_ref)
+    assert first_path != second_path
+  end
+
   test "recover_shard truncates a partial segment tail and preserves prior blobs", %{root: root} do
     payload = :binary.copy("safe", 256)
 
@@ -335,6 +350,48 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:ok, ^live_payload} = BlobStore.get(root, 0, live_ref)
   end
 
+  test "sweep_unreferenced can reclaim a dead rotated segment while newer segment stays live", %{
+    root: root
+  } do
+    with_blob_segment_max_bytes(600)
+
+    first_payload = :binary.copy("a", 400)
+    second_payload = :binary.copy("b", 400)
+    assert {:ok, first_ref} = BlobStore.put(root, 0, first_payload)
+    assert {:ok, second_ref} = BlobStore.put(root, 0, second_payload)
+
+    assert first_ref.segment_id == 0
+    assert second_ref.segment_id == 1
+    assert {:ok, {first_path, _offset, _size}} = BlobStore.file_ref(root, 0, first_ref)
+    assert {:ok, {second_path, _offset, _size}} = BlobStore.file_ref(root, 0, second_ref)
+
+    first_bytes = File.stat!(first_path).size
+
+    assert {:ok, %{deleted_files: 1, deleted_bytes: ^first_bytes, kept_files: 1}} =
+             BlobStore.sweep_unreferenced(root, 0, MapSet.new([second_ref]))
+
+    refute File.exists?(first_path)
+    assert File.exists?(second_path)
+    assert {:ok, ^second_payload} = BlobStore.get(root, 0, second_ref)
+  end
+
+  test "sweep_unreferenced persists next segment id before deleting the last segment", %{
+    root: root
+  } do
+    with_blob_segment_max_bytes(600)
+
+    assert {:ok, first_ref} = BlobStore.put(root, 0, :binary.copy("a", 400))
+    assert {:ok, {first_path, _offset, _size}} = BlobStore.file_ref(root, 0, first_ref)
+
+    assert {:ok, %{deleted_files: 1}} = BlobStore.sweep_unreferenced(root, 0, [])
+    refute File.exists?(first_path)
+
+    assert {:ok, second_ref} = BlobStore.put(root, 0, :binary.copy("b", 400))
+    assert second_ref.segment_id == first_ref.segment_id + 1
+    assert {:ok, {second_path, _offset, _size}} = BlobStore.file_ref(root, 0, second_ref)
+    assert second_path != first_path
+  end
+
   test "sweep_unreferenced deletes stale atomic-write tmp files", %{root: root} do
     ref = BlobRef.from_payload("crashed-write")
     blob_path = BlobRef.path(root, 0, ref)
@@ -371,6 +428,11 @@ defmodule Ferricstore.Store.BlobStoreTest do
     |> Ferricstore.DataDir.blob_shard_path(shard_index)
     |> Path.join("**/*.tmp")
     |> Path.wildcard(match_dot: true)
+  end
+
+  defp with_blob_segment_max_bytes(bytes) do
+    Process.put(:ferricstore_blob_store_segment_max_bytes, bytes)
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_segment_max_bytes) end)
   end
 
   defp count_regular_files(path) do

@@ -14,9 +14,12 @@ defmodule Ferricstore.Store.BlobStore do
   @hash_chunk_bytes 1_048_576
   @tmp_stale_after_seconds 300
   @segment_id 0
+  @default_segment_max_bytes 256 * 1024 * 1024
   @segment_header_magic <<0, ?F, ?S, ?B, ?L, ?O, ?G, 1>>
   @segment_header_bytes 48
+  @segment_next_id_filename "next_segment_id"
   @recovery_table :ferricstore_blob_store_recovery
+  @segment_table :ferricstore_blob_store_segments
 
   @type reason :: term()
 
@@ -353,22 +356,24 @@ defmodule Ferricstore.Store.BlobStore do
   defp do_put_many(_data_dir, _shard_index, []), do: {:ok, []}
 
   defp do_put_many(data_dir, shard_index, payloads) do
-    path = segment_path(data_dir, shard_index, @segment_id)
-    dir = Path.dirname(path)
+    fallback_path = segment_path(data_dir, shard_index, @segment_id)
+    dir = Path.dirname(fallback_path)
     dir_existed? = Ferricstore.FS.dir?(dir)
-    file_existed? = File.exists?(path)
+    batch_bytes = segment_batch_bytes(payloads)
 
     result =
       with :ok <- Ferricstore.FS.mkdir_p(dir),
            :ok <- fsync_parent_after_mkdir(dir, dir_existed?),
            {:ok, _stats} <- ensure_recovered(data_dir, shard_index),
-           {:ok, start_offset} <- file_size_or_zero(path),
-           {:ok, io} <- File.open(path, [:append, :raw, :binary]) do
+           {:ok, segment} <- writable_segment(data_dir, shard_index, batch_bytes),
+           {:ok, io} <- File.open(segment.path, [:append, :raw, :binary]) do
         try do
-          with {:ok, refs, iodata, _next_offset} <- build_segment_records(payloads, start_offset),
+          with {:ok, refs, iodata, next_offset} <-
+                 build_segment_records(payloads, segment.id, segment.start_offset),
                :ok <- write_file(io, iodata),
-               :ok <- fsync_file(path),
-               :ok <- maybe_fsync_new_segment_dir(dir, file_existed?) do
+               :ok <- fsync_file(segment.path),
+               :ok <- maybe_fsync_new_segment_dir(dir, segment.file_existed?) do
+            cache_active_segment(data_dir, shard_index, segment.id, segment.path, next_offset)
             {:ok, refs}
           end
         after
@@ -381,18 +386,18 @@ defmodule Ferricstore.Store.BlobStore do
         {:ok, refs}
 
       {:error, reason} = error ->
-        emit_error(:put, shard_index, path, blob_error_ref(payloads), reason)
+        emit_error(:put, shard_index, fallback_path, blob_error_ref(payloads), reason)
         recover_shard(data_dir, shard_index)
         error
     end
   end
 
-  defp build_segment_records(payloads, start_offset) do
+  defp build_segment_records(payloads, segment_id, start_offset) do
     Enum.reduce_while(payloads, {:ok, [], [], start_offset}, fn payload,
                                                                 {:ok, refs, records,
                                                                  record_offset} ->
       payload_offset = record_offset + @segment_header_bytes
-      ref = BlobRef.from_segment(payload, @segment_id, payload_offset)
+      ref = BlobRef.from_segment(payload, segment_id, payload_offset)
       next_offset = payload_offset + byte_size(payload)
       record = [segment_header(ref), payload]
 
@@ -414,6 +419,12 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
+  defp segment_batch_bytes(payloads) do
+    Enum.reduce(payloads, 0, fn payload, acc ->
+      acc + @segment_header_bytes + byte_size(payload)
+    end)
+  end
+
   defp segment_header(%BlobRef{version: 2, size: size, checksum: checksum})
        when is_binary(checksum) and byte_size(checksum) == 32 do
     <<@segment_header_magic::binary, size::unsigned-big-64, checksum::binary>>
@@ -422,13 +433,151 @@ defmodule Ferricstore.Store.BlobStore do
   defp maybe_fsync_new_segment_dir(_dir, true), do: :ok
   defp maybe_fsync_new_segment_dir(dir, false), do: fsync_dir(dir)
 
+  defp writable_segment(data_dir, shard_index, batch_bytes) do
+    case cached_active_segment(data_dir, shard_index, batch_bytes) do
+      {:ok, segment} -> {:ok, segment}
+      :miss -> scan_writable_segment(data_dir, shard_index, batch_bytes)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp cached_active_segment(data_dir, shard_index, batch_bytes) do
+    ensure_segment_table()
+    key = {data_dir, shard_index}
+
+    case :ets.lookup(@segment_table, key) do
+      [{^key, id, path, _cached_size}] ->
+        case File.stat(path) do
+          {:ok, %{type: :regular, size: size}} ->
+            if rotate_segment?(size, batch_bytes) do
+              rotate_after_segment(data_dir, shard_index, id)
+            else
+              {:ok, %{id: id, path: path, start_offset: size, file_existed?: true}}
+            end
+
+          {:ok, _other} ->
+            {:error, :invalid_blob_file}
+
+          {:error, :enoent} ->
+            :miss
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      [] ->
+        :miss
+    end
+  end
+
+  defp scan_writable_segment(data_dir, shard_index, batch_bytes) do
+    shard_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
+
+    with {:ok, latest} <- latest_segment(shard_path),
+         {:ok, next_id} <- read_next_segment_id(Path.join(shard_path, "segments")) do
+      case latest do
+        nil ->
+          id = next_id || @segment_id
+          path = segment_path(data_dir, shard_index, id)
+
+          {:ok,
+           %{
+             id: id,
+             path: path,
+             start_offset: 0,
+             file_existed?: File.exists?(path)
+           }}
+
+        %{id: id, path: path, size: size} ->
+          if rotate_segment?(size, batch_bytes) do
+            new_id = max(next_id || 0, id + 1)
+            new_path = segment_path(data_dir, shard_index, new_id)
+
+            {:ok,
+             %{
+               id: new_id,
+               path: new_path,
+               start_offset: 0,
+               file_existed?: File.exists?(new_path)
+             }}
+          else
+            cache_active_segment(data_dir, shard_index, id, path, size)
+            {:ok, %{id: id, path: path, start_offset: size, file_existed?: true}}
+          end
+      end
+    end
+  end
+
+  defp rotate_after_segment(data_dir, shard_index, id) do
+    shard_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
+
+    with {:ok, next_id} <- read_next_segment_id(Path.join(shard_path, "segments")) do
+      new_id = max(next_id || 0, id + 1)
+      path = segment_path(data_dir, shard_index, new_id)
+
+      {:ok,
+       %{
+         id: new_id,
+         path: path,
+         start_offset: 0,
+         file_existed?: File.exists?(path)
+       }}
+    end
+  end
+
+  defp rotate_segment?(current_size, batch_bytes) do
+    max_bytes = segment_max_bytes()
+    current_size > 0 and current_size + batch_bytes > max_bytes
+  end
+
+  defp segment_max_bytes do
+    case Process.get(
+           :ferricstore_blob_store_segment_max_bytes,
+           Application.get_env(:ferricstore, :blob_segment_max_bytes, @default_segment_max_bytes)
+         ) do
+      value when is_integer(value) and value > 0 -> value
+      _other -> @default_segment_max_bytes
+    end
+  end
+
+  defp latest_segment(shard_path) do
+    with {:ok, paths} <- segment_files(shard_path) do
+      Enum.reduce_while(paths, {:ok, nil}, fn path, {:ok, latest} ->
+        with {:ok, id} <- segment_id_from_path(path),
+             {:ok, %{type: :regular, size: size}} <- File.stat(path) do
+          latest =
+            case latest do
+              nil -> %{id: id, path: path, size: size}
+              %{id: current_id} when id > current_id -> %{id: id, path: path, size: size}
+              _other -> latest
+            end
+
+          {:cont, {:ok, latest}}
+        else
+          {:ok, %{type: type}} ->
+            {:halt, {:error, {:invalid_blob_segment_file, path, type}}}
+
+          {:error, reason} ->
+            {:halt, {:error, reason}}
+        end
+      end)
+    end
+  end
+
   defp do_sweep_unreferenced(data_dir, shard_index, live_refs) do
     shard_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
     live_paths = live_relative_paths(live_refs)
 
     case blob_files(shard_path) do
       {:ok, paths} ->
-        sweep_blob_paths(shard_path, paths, live_paths)
+        with :ok <- ensure_next_segment_id_for_dead_segments(shard_path, paths, live_paths),
+             {:ok, stats} <- sweep_blob_paths(shard_path, paths, live_paths) do
+          if stats.deleted_files > 0 do
+            clear_active_segment_cache(data_dir, shard_index)
+          end
+
+          {:ok, stats}
+        end
 
       {:error, _reason} = error ->
         error
@@ -474,6 +623,38 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
+  defp cache_active_segment(data_dir, shard_index, id, path, size) do
+    ensure_segment_table()
+    :ets.insert(@segment_table, {{data_dir, shard_index}, id, path, size})
+    :ok
+  end
+
+  defp clear_active_segment_cache(data_dir, shard_index) do
+    ensure_segment_table()
+    :ets.delete(@segment_table, {data_dir, shard_index})
+    :ok
+  end
+
+  defp ensure_segment_table do
+    case :ets.whereis(@segment_table) do
+      :undefined ->
+        try do
+          :ets.new(@segment_table, [
+            :named_table,
+            :public,
+            :set,
+            {:read_concurrency, true},
+            {:write_concurrency, true}
+          ])
+        rescue
+          ArgumentError -> @segment_table
+        end
+
+      tid ->
+        tid
+    end
+  end
+
   defp blob_lock_key(data_dir, shard_index),
     do: {{__MODULE__, data_dir, shard_index}, __MODULE__}
 
@@ -488,15 +669,6 @@ defmodule Ferricstore.Store.BlobStore do
       segment_id: segment_id,
       offset: 0
     })
-  end
-
-  defp file_size_or_zero(path) do
-    case File.stat(path) do
-      {:ok, %{type: :regular, size: size}} -> {:ok, size}
-      {:ok, _other} -> {:error, :invalid_blob_file}
-      {:error, :enoent} -> {:ok, 0}
-      {:error, reason} -> {:error, reason}
-    end
   end
 
   defp stat_regular_size(path, expected_size) do
@@ -786,6 +958,102 @@ defmodule Ferricstore.Store.BlobStore do
       %BlobRef{} = ref, acc -> MapSet.put(acc, BlobRef.relative_path(ref))
       _other, acc -> acc
     end)
+  end
+
+  defp ensure_next_segment_id_for_dead_segments(shard_path, paths, live_paths) do
+    Enum.reduce_while(paths, {:ok, nil}, fn path, {:ok, max_dead_id} ->
+      relative = Path.relative_to(path, shard_path)
+
+      case segment_id_from_path(path) do
+        {:ok, id} ->
+          if MapSet.member?(live_paths, relative) do
+            {:cont, {:ok, max_dead_id}}
+          else
+            {:cont, {:ok, max(id, max_dead_id || id)}}
+          end
+
+        :not_segment ->
+          {:cont, {:ok, max_dead_id}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, nil} -> :ok
+      {:ok, max_dead_id} -> ensure_next_segment_id_at_least(shard_path, max_dead_id + 1)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp ensure_next_segment_id_at_least(shard_path, min_next_id) do
+    segment_dir = Path.join(shard_path, "segments")
+
+    with {:ok, current_next_id} <- read_next_segment_id(segment_dir) do
+      if (current_next_id || 0) >= min_next_id do
+        :ok
+      else
+        persist_next_segment_id(segment_dir, min_next_id)
+      end
+    end
+  end
+
+  defp read_next_segment_id(segment_dir) do
+    path = Path.join(segment_dir, @segment_next_id_filename)
+
+    case File.read(path) do
+      {:ok, data} ->
+        parse_next_segment_id(data, path)
+
+      {:error, :enoent} ->
+        {:ok, nil}
+
+      {:error, reason} ->
+        {:error, {:blob_segment_next_id_read_failed, path, reason}}
+    end
+  end
+
+  defp parse_next_segment_id(data, path) when is_binary(data) do
+    case Integer.parse(String.trim(data)) do
+      {id, ""} when id >= 0 -> {:ok, id}
+      _other -> {:error, {:blob_segment_next_id_invalid, path}}
+    end
+  end
+
+  defp persist_next_segment_id(segment_dir, next_id) when is_integer(next_id) and next_id >= 0 do
+    path = Path.join(segment_dir, @segment_next_id_filename)
+    tmp_path = path <> ".tmp"
+
+    result =
+      with :ok <- File.write(tmp_path, Integer.to_string(next_id) <> "\n", [:binary]),
+           :ok <- fsync_file(tmp_path),
+           :ok <- Ferricstore.FS.rename(tmp_path, path),
+           :ok <- fsync_dir(segment_dir) do
+        :ok
+      end
+
+    case result do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        _ = Ferricstore.FS.rm(tmp_path)
+        {:error, {:blob_segment_next_id_persist_failed, path, reason}}
+    end
+  end
+
+  defp segment_id_from_path(path) do
+    if Path.extname(path) == ".bloblog" do
+      path
+      |> Path.basename(".bloblog")
+      |> Integer.parse()
+      |> case do
+        {id, ""} when id >= 0 -> {:ok, id}
+        _other -> {:error, {:invalid_blob_segment_name, path}}
+      end
+    else
+      :not_segment
+    end
   end
 
   defp blob_files(shard_path) do

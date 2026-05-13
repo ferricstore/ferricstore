@@ -28,6 +28,8 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_HOT_CACHE_MAX_VALUE_SIZE", "65536")),
     blob_side_channel_threshold_bytes:
       String.to_integer(System.get_env("FERRICSTORE_BLOB_SIDE_CHANNEL_THRESHOLD_BYTES", "262144")),
+    blob_segment_max_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_BLOB_SEGMENT_MAX_BYTES", "268435456")),
     blob_gc_sweeper_enabled:
       System.get_env("FERRICSTORE_BLOB_GC_SWEEPER_ENABLED", "true") in ["1", "true", "TRUE"],
     blob_gc_sweeper_initial_delay_ms:

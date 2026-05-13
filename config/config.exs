@@ -32,10 +32,11 @@ config :ferricstore_server, :sendfile_threshold, 65_536
 
 # Large values at or above this size are stored in per-shard append blob
 # segments with a small Bitcask reference. A conservative sweeper cleans stale
-# tmp/legacy blob files; append-segment record compaction is intentionally a
-# separate storage-maintenance step.
+# tmp/legacy blob files and whole append segments once no live ref points into
+# them. Partial segment compaction is intentionally a separate maintenance step.
 config :ferricstore,
   blob_side_channel_threshold_bytes: 256 * 1024,
+  blob_segment_max_bytes: 256 * 1024 * 1024,
   blob_gc_sweeper_enabled: true,
   blob_gc_sweeper_initial_delay_ms: 60_000,
   blob_gc_sweeper_interval_ms: 600_000
