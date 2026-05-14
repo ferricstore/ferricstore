@@ -752,6 +752,26 @@ defmodule Ferricstore.Store.BlobStoreTest do
     refute File.exists?(segment_path)
   end
 
+  test "sweep_unreferenced ignores malformed live refs", %{root: root} do
+    assert {:ok, ref} = BlobStore.put(root, 0, :binary.copy("d", 256))
+    assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
+
+    invalid_ref = %BlobRef{
+      version: 2,
+      checksum: :binary.copy(<<0>>, 32),
+      size: 1,
+      segment_id: nil,
+      offset: 48
+    }
+
+    segment_bytes = File.stat!(segment_path).size
+
+    assert {:ok, %{deleted_files: 1, deleted_bytes: ^segment_bytes, kept_files: 0}} =
+             BlobStore.sweep_unreferenced(root, 0, MapSet.new([invalid_ref]))
+
+    refute File.exists?(segment_path)
+  end
+
   test "sweep_unreferenced preserves an append segment while any ref in it is live", %{
     root: root
   } do

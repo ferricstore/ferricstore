@@ -1785,8 +1785,11 @@ defmodule Ferricstore.Store.BlobStore do
 
   defp live_relative_paths(live_refs) do
     Enum.reduce(live_refs, MapSet.new(), fn
-      %BlobRef{} = ref, acc -> MapSet.put(acc, BlobRef.relative_path(ref))
-      _other, acc -> acc
+      %BlobRef{} = ref, acc ->
+        if BlobRef.valid?(ref), do: MapSet.put(acc, BlobRef.relative_path(ref)), else: acc
+
+      _other, acc ->
+        acc
     end)
   end
 
