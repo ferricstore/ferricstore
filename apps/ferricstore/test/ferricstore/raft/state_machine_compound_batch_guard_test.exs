@@ -63,14 +63,16 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
            "state-machine compound batch metadata reads must use the keyed batched cold reader"
   end
 
-  test "state-machine pop commands batch compound deletes inside Raft apply" do
+  test "state-machine pop commands remove selected members through the read-visible helper" do
     source = File.read!(@state_machine_path)
 
     # SPOP/ZPOP bypass the public command store and run as deterministic
-    # single-key Raft commands. Keep their member removals on the same batching
-    # path so promoted sets/zsets do not append one tombstone per popped member.
-    assert source =~ "defp do_compound_batch_delete"
-    assert source =~ "do_compound_batch_delete(state, redis_key, selected_delete_keys)"
+    # single-key Raft commands. The member deletes must be visible before the
+    # empty-type marker check runs in the same apply.
+    assert source =~ "defp do_compound_batch_delete_read_visible"
+
+    assert source =~
+             "do_compound_batch_delete_read_visible(state, redis_key, selected_delete_keys)"
 
     refute source =~
              "Enum.each(selected, fn member ->\n        do_compound_delete(state, redis_key, CompoundKey.set_member(redis_key, member))"
@@ -103,11 +105,11 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
     put_body = function_body(source, "handle_compound_batch_put_raft")
     delete_body = function_body(source, "handle_compound_batch_delete_raft")
 
-    assert put_body =~ "{:compound_batch_put, redis_key, entries}"
+    assert put_body =~ "CompoundCommand.batch_put(redis_key, entries)"
     refute put_body =~ "Enum.map(entries"
     refute put_body =~ "{:batch, commands}"
 
-    assert delete_body =~ "{:compound_batch_delete, redis_key, compound_keys}"
+    assert delete_body =~ "CompoundCommand.batch_delete(redis_key, compound_keys)"
     refute delete_body =~ "Enum.map(compound_keys"
     refute delete_body =~ "{:batch, commands}"
   end

@@ -3,7 +3,7 @@ defmodule Ferricstore.Store.Shard.Compound do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{BlobValue, ColdRead, LFU, Promotion}
+  alias Ferricstore.Store.{BlobValue, ColdRead, CompoundCommand, LFU, Promotion}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Store.Shard.ZSetIndex
@@ -788,7 +788,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     result =
       Ferricstore.Raft.Batcher.write(
         tracked_state.index,
-        {:compound_put, compound_key, value, expire_at_ms}
+        CompoundCommand.put(compound_key, value, expire_at_ms)
       )
 
     new_version = tracked_state.write_version + 1
@@ -832,12 +832,12 @@ defmodule Ferricstore.Store.Shard.Compound do
     result =
       Ferricstore.Raft.Batcher.write(
         tracked_state.index,
-        {:compound_batch_put, redis_key, entries}
+        CompoundCommand.batch_put(redis_key, entries)
       )
 
     new_version = tracked_state.write_version + 1
 
-    case normalize_compound_batch_result(result) do
+    case CompoundCommand.normalize_batch_reply(result) do
       :ok ->
         new_state = %{tracked_state | write_version: new_version}
 
@@ -861,17 +861,6 @@ defmodule Ferricstore.Store.Shard.Compound do
         {:reply, err, state}
     end
   end
-
-  defp normalize_compound_batch_result({:ok, results}) when is_list(results) do
-    case Enum.find(results, &match?({:error, _}, &1)) do
-      nil -> :ok
-      {:error, _} = err -> err
-    end
-  end
-
-  defp normalize_compound_batch_result(:ok), do: :ok
-  defp normalize_compound_batch_result({:error, _} = err), do: err
-  defp normalize_compound_batch_result(other), do: {:error, other}
 
   defp promoted_record_size(compound_key, value) when is_binary(value) do
     @record_header_size + byte_size(compound_key) + byte_size(value)
@@ -1017,7 +1006,9 @@ defmodule Ferricstore.Store.Shard.Compound do
         state
       end
 
-    result = Ferricstore.Raft.Batcher.write(tracked_state.index, {:compound_delete, compound_key})
+    result =
+      Ferricstore.Raft.Batcher.write(tracked_state.index, CompoundCommand.delete(compound_key))
+
     new_version = tracked_state.write_version + 1
 
     case result do
@@ -1051,12 +1042,12 @@ defmodule Ferricstore.Store.Shard.Compound do
     result =
       Ferricstore.Raft.Batcher.write(
         tracked_state.index,
-        {:compound_batch_delete, redis_key, compound_keys}
+        CompoundCommand.batch_delete(redis_key, compound_keys)
       )
 
     new_version = tracked_state.write_version + 1
 
-    case normalize_compound_batch_result(result) do
+    case CompoundCommand.normalize_batch_reply(result) do
       :ok ->
         new_state =
           Enum.reduce(compound_keys, tracked_state, fn compound_key, acc ->
@@ -1223,7 +1214,7 @@ defmodule Ferricstore.Store.Shard.Compound do
   end
 
   defp handle_compound_delete_prefix_raft(redis_key, prefix, state) do
-    result = Ferricstore.Raft.Batcher.write(state.index, {:compound_delete_prefix, prefix})
+    result = Ferricstore.Raft.Batcher.write(state.index, CompoundCommand.delete_prefix(prefix))
     new_version = state.write_version + 1
 
     case result do

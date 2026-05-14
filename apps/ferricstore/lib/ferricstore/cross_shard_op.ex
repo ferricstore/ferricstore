@@ -472,11 +472,7 @@ defmodule Ferricstore.CrossShardOp do
         end
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        try do
-          GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix}, 5_000)
-        catch
-          :exit, _ -> {:error, "ERR shard unavailable"}
-        end
+        Router.compound_delete_prefix(ctx, redis_key, prefix)
       end
     }
   end

@@ -31,6 +31,7 @@ defmodule Ferricstore.Store.Router do
     BlobRef,
     BlobStore,
     BlobValue,
+    CompoundCommand,
     CompoundKey,
     LFU,
     ListOps,
@@ -5369,7 +5370,7 @@ defmodule Ferricstore.Store.Router do
     idx = shard_for(ctx, redis_key)
 
     if ctx.name == :default do
-      quorum_write(ctx, idx, {:compound_put, compound_key, value, expire_at_ms})
+      quorum_write(ctx, idx, CompoundCommand.put(compound_key, value, expire_at_ms))
     else
       safe_write_call(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
     end
@@ -5387,8 +5388,8 @@ defmodule Ferricstore.Store.Router do
 
     if ctx.name == :default do
       ctx
-      |> quorum_write(idx, {:compound_batch_put, redis_key, entries})
-      |> normalize_compound_batch_write_result()
+      |> quorum_write(idx, CompoundCommand.batch_put(redis_key, entries))
+      |> CompoundCommand.normalize_batch_reply()
     else
       safe_write_call(ctx, idx, {:compound_batch_put, redis_key, entries})
     end
@@ -5399,7 +5400,7 @@ defmodule Ferricstore.Store.Router do
     idx = shard_for(ctx, redis_key)
 
     if ctx.name == :default do
-      quorum_write(ctx, idx, {:compound_delete, compound_key})
+      quorum_write(ctx, idx, CompoundCommand.delete(compound_key))
     else
       safe_write_call(ctx, idx, {:compound_delete, redis_key, compound_key})
     end
@@ -5414,23 +5415,12 @@ defmodule Ferricstore.Store.Router do
 
     if ctx.name == :default do
       ctx
-      |> quorum_write(idx, {:compound_batch_delete, redis_key, compound_keys})
-      |> normalize_compound_batch_write_result()
+      |> quorum_write(idx, CompoundCommand.batch_delete(redis_key, compound_keys))
+      |> CompoundCommand.normalize_batch_reply()
     else
       safe_write_call(ctx, idx, {:compound_batch_delete, redis_key, compound_keys})
     end
   end
-
-  defp normalize_compound_batch_write_result({:ok, results}) when is_list(results) do
-    case Enum.find(results, &match?({:error, _}, &1)) do
-      nil -> :ok
-      {:error, _} = error -> error
-    end
-  end
-
-  defp normalize_compound_batch_write_result(:ok), do: :ok
-  defp normalize_compound_batch_write_result({:error, _} = error), do: error
-  defp normalize_compound_batch_write_result(other), do: {:error, other}
 
   defp origin_compound_get(ctx, idx, keydir, compound_key) do
     now = HLC.now_ms()
@@ -5732,7 +5722,7 @@ defmodule Ferricstore.Store.Router do
     idx = shard_for(ctx, redis_key)
 
     if ctx.name == :default do
-      quorum_write(ctx, idx, {:compound_delete_prefix, prefix})
+      quorum_write(ctx, idx, CompoundCommand.delete_prefix(prefix))
     else
       safe_write_call(ctx, idx, {:compound_delete_prefix, redis_key, prefix})
     end

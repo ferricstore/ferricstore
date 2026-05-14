@@ -13,14 +13,14 @@ defmodule Ferricstore.Raft.CompoundShardRaftGuardTest do
     # every compound mutation must enter the replicated log first; otherwise a
     # promoted hash/set/zset can diverge across replicas.
     assert function_body(source, "handle_compound_put_raft") =~ "Ferricstore.Raft.Batcher.write("
-    assert function_body(source, "handle_compound_put_raft") =~ "{:compound_put,"
+    assert function_body(source, "handle_compound_put_raft") =~ "CompoundCommand.put("
 
     refute function_body(source, "handle_compound_put_raft") =~ "promoted_write("
 
     assert function_body(source, "handle_compound_delete_raft") =~
              "Ferricstore.Raft.Batcher.write("
 
-    assert function_body(source, "handle_compound_delete_raft") =~ "{:compound_delete,"
+    assert function_body(source, "handle_compound_delete_raft") =~ "CompoundCommand.delete("
 
     refute function_body(source, "handle_compound_delete_raft") =~ "promoted_tombstone("
 
@@ -28,7 +28,7 @@ defmodule Ferricstore.Raft.CompoundShardRaftGuardTest do
              "Ferricstore.Raft.Batcher.write("
 
     assert function_body(source, "handle_compound_delete_prefix_raft") =~
-             "{:compound_delete_prefix,"
+             "CompoundCommand.delete_prefix("
 
     refute function_body(source, "handle_compound_delete_prefix_raft") =~
              "Promotion.cleanup_promoted!("
