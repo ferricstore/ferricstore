@@ -200,6 +200,17 @@ defmodule Ferricstore.Store.BlobStoreTest do
     refute_received {:blob_open_read, _}
   end
 
+  test "get_many isolates a corrupt segment payload", %{root: root} do
+    payload_a = :binary.copy("a", 128)
+    payload_b = :binary.copy("b", 128)
+
+    assert {:ok, [ref_a, ref_b]} = BlobStore.put_many(root, 0, [payload_a, payload_b])
+    overwrite_segment_payload!(root, 0, ref_b, :binary.copy("x", 128))
+
+    assert [{:ok, ^payload_a}, {:error, :checksum_mismatch}] =
+             BlobStore.get_many(root, 0, [ref_a, ref_b])
+  end
+
   test "file_refs_many opens each append segment once for unique refs", %{root: root} do
     payloads = [
       :binary.copy("a", 512),

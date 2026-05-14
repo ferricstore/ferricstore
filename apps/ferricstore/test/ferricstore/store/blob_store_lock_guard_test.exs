@@ -147,6 +147,26 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
              "opening the segment"
   end
 
+  test "get_many validates and reads segment refs with batched preads" do
+    source = File.read!(@source)
+
+    section =
+      source
+      |> source_section!(
+        "  defp get_segment_refs_at_path(path, shard_index, [_first_ref | _] = refs) do",
+        "  defp load_blob_file_refs"
+      )
+
+    assert section =~ "read_segment_headers(io, refs)",
+           "get_many/3 should batch segment header validation before materializing payloads"
+
+    assert section =~ ":file.pread(io, payload_reads)",
+           "get_many/3 should batch same-segment payload preads instead of one pread per ref"
+
+    refute section =~ "get_open_segment_ref(",
+           "get_many/3 should not fall back to one full header+payload read per blob ref"
+  end
+
   defp source_section!(source, start_marker, end_marker) do
     [_, rest] = String.split(source, start_marker, parts: 2)
     [section | _] = String.split(rest, end_marker, parts: 2)

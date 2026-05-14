@@ -486,28 +486,77 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp get_open_segment_refs(io, path, shard_index, refs) do
-    Enum.reduce(refs, %{}, fn ref, acc ->
-      Map.put(acc, ref, get_open_segment_ref(io, path, shard_index, ref))
+    header_results = read_segment_headers(io, refs)
+    payload_results = read_segment_payloads(io, refs, header_results)
+
+    refs
+    |> Enum.zip(payload_results)
+    |> Enum.reduce(%{}, fn {ref, result}, acc ->
+      case result do
+        {:ok, _payload} = ok ->
+          Map.put(acc, ref, ok)
+
+        {:error, reason} = error ->
+          emit_error(:get, shard_index, path, ref, reason)
+          Map.put(acc, ref, error)
+      end
     end)
   end
 
-  defp get_open_segment_ref(io, path, shard_index, %BlobRef{offset: offset, size: size} = ref) do
-    result =
-      with :ok <- validate_open_segment_record(io, offset, size, ref),
-           {:ok, payload} <- pread_exact_open(io, offset, size),
-           :ok <- verify_checksum(ref, payload) do
-        {:ok, payload}
+  defp read_segment_payloads(io, refs, header_results) do
+    readable_refs =
+      refs
+      |> Enum.zip(header_results)
+      |> Enum.flat_map(fn
+        {ref, :ok} -> [ref]
+        {_ref, {:error, _reason}} -> []
+      end)
+
+    payload_reads =
+      Enum.map(readable_refs, fn %BlobRef{offset: offset, size: size} ->
+        {offset, size}
+      end)
+
+    payload_results =
+      case payload_reads do
+        [] ->
+          %{}
+
+        _ ->
+          case :file.pread(io, payload_reads) do
+            {:ok, payloads} ->
+              readable_refs
+              |> Enum.zip(payloads)
+              |> Map.new(fn {ref, payload} ->
+                {ref, validate_segment_payload(payload, ref)}
+              end)
+
+            {:error, reason} ->
+              Map.new(readable_refs, &{&1, {:error, reason}})
+          end
       end
 
-    case result do
-      {:ok, _payload} = ok ->
-        ok
+    refs
+    |> Enum.zip(header_results)
+    |> Enum.map(fn
+      {ref, :ok} -> Map.fetch!(payload_results, ref)
+      {_ref, {:error, _reason} = error} -> error
+    end)
+  end
 
-      {:error, reason} = error ->
-        emit_error(:get, shard_index, path, ref, reason)
-        error
+  defp validate_segment_payload(payload, %BlobRef{size: size} = ref)
+       when is_binary(payload) and byte_size(payload) == size do
+    case verify_checksum(ref, payload) do
+      :ok -> {:ok, payload}
+      {:error, _reason} = error -> error
     end
   end
+
+  defp validate_segment_payload(payload, %BlobRef{}) when is_binary(payload),
+    do: {:error, :size_mismatch}
+
+  defp validate_segment_payload(:eof, %BlobRef{}), do: {:error, :enoent}
+  defp validate_segment_payload(_payload, %BlobRef{}), do: {:error, :size_mismatch}
 
   defp load_blob_file_refs(data_dir, shard_index, refs) do
     {legacy_refs, segment_refs, invalid_refs} =
