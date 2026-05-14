@@ -28,6 +28,27 @@ defmodule Ferricstore.Store.BlobValueTest do
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
   end
 
+  test "maybe_materialize skips ref decode for non-ref-sized values" do
+    value = "ordinary-inline-value"
+
+    assert {:ok, ^value} = BlobValue.maybe_materialize("root", 0, 1, value)
+  end
+
+  test "maybe_materialize_many skips ref decode for non-ref-sized values" do
+    values = ["small", :binary.copy("x", 49), :binary.copy("y", 65), 42]
+
+    assert Enum.map(values, &{:ok, &1}) ==
+             BlobValue.maybe_materialize_many(
+               "root",
+               0,
+               1,
+               values,
+               fn _data_dir, _shard_index, ref ->
+                 flunk("unexpected blob ref load for #{inspect(ref)}")
+               end
+             )
+  end
+
   test "maybe_materialize_many loads duplicate encoded refs once" do
     parent = self()
     payload = :binary.copy("shared", 32)

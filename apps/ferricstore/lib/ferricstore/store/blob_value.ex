@@ -64,9 +64,13 @@ defmodule Ferricstore.Store.BlobValue do
   def maybe_materialize(data_dir, shard_index, threshold, value)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
              is_integer(threshold) and threshold > 0 and is_binary(value) do
-    case BlobRef.decode(value) do
-      {:ok, ref} -> BlobStore.get(data_dir, shard_index, ref)
-      :error -> {:ok, value}
+    if BlobRef.encoded_size?(byte_size(value)) do
+      case BlobRef.decode(value) do
+        {:ok, ref} -> BlobStore.get(data_dir, shard_index, ref)
+        :error -> {:ok, value}
+      end
+    else
+      {:ok, value}
     end
   end
 
@@ -150,17 +154,21 @@ defmodule Ferricstore.Store.BlobValue do
     {prepared, unique_refs, _seen} =
       Enum.reduce(values, {[], [], MapSet.new()}, fn
         value, {prepared, unique_refs, seen} when is_binary(value) ->
-          case BlobRef.decode(value) do
-            {:ok, ref} ->
-              if MapSet.member?(seen, value) do
-                {[{:ref, value} | prepared], unique_refs, seen}
-              else
-                {[{:ref, value} | prepared], [{value, ref} | unique_refs],
-                 MapSet.put(seen, value)}
-              end
+          if BlobRef.encoded_size?(byte_size(value)) do
+            case BlobRef.decode(value) do
+              {:ok, ref} ->
+                if MapSet.member?(seen, value) do
+                  {[{:ref, value} | prepared], unique_refs, seen}
+                else
+                  {[{:ref, value} | prepared], [{value, ref} | unique_refs],
+                   MapSet.put(seen, value)}
+                end
 
-            :error ->
-              {[{:value, value} | prepared], unique_refs, seen}
+              :error ->
+                {[{:value, value} | prepared], unique_refs, seen}
+            end
+          else
+            {[{:value, value} | prepared], unique_refs, seen}
           end
 
         value, {prepared, unique_refs, seen} ->
