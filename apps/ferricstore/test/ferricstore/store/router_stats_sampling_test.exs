@@ -103,6 +103,7 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
 
     for {name, arity} <- [
           {:batch_get, 2},
+          {:batch_get_planned, 2},
           {:do_batch_get_with_file_refs, 4},
           {:compound_batch_get, 3}
         ] do

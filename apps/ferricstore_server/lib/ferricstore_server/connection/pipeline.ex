@@ -5,6 +5,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Commands.Flow, as: FlowCommand
   alias Ferricstore.Stats
+  alias Ferricstore.Store.PipelinePlanner
   alias Ferricstore.Store.Router
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Sendfile, as: ConnSendfile
@@ -117,9 +118,18 @@ defmodule FerricstoreServer.Connection.Pipeline do
             :fallback
           else
             Stats.incr_commands_by(state.stats_counter, length(keys))
-            lookup_keys = namespace_keys(state.sandbox_namespace, keys)
 
-            {:ok, dispatch_batch_get_results(keys, lookup_keys, state, send_response_fn)}
+            result =
+              case state.sandbox_namespace do
+                nil ->
+                  dispatch_batch_get_results(keys, keys, state, send_response_fn)
+
+                namespace ->
+                  planned_keys = PipelinePlanner.plan_keys(state.instance_ctx, keys, namespace)
+                  dispatch_planned_batch_get_results(planned_keys, keys, state, send_response_fn)
+              end
+
+            {:ok, result}
           end
 
         :fallback ->
@@ -198,6 +208,66 @@ defmodule FerricstoreServer.Connection.Pipeline do
     end
   end
 
+  defp dispatch_planned_batch_get_results(
+         planned_keys,
+         keys,
+         %{transport: transport} = state,
+         send_response_fn
+       )
+       when transport in [:ranch_tcp, :ranch_ssl] do
+    case safe_dispatch(fn ->
+           Router.batch_get_with_deferred_blob_file_refs_planned(
+             state.instance_ctx,
+             planned_keys,
+             ConnSendfile.threshold_bytes()
+           )
+         end) do
+      {:ok, results} ->
+        if Enum.any?(results, &match?({:file_ref, _, _, _}, &1)) do
+          stream_get_results(planned_keys, results, state, send_response_fn)
+        else
+          send_response_fn.(
+            state.socket,
+            state.transport,
+            Encoder.encode_bulk_strings_or_nulls(results)
+          )
+
+          {:continue, ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)}
+        end
+
+      {:error, err} ->
+        send_response_fn.(
+          state.socket,
+          state.transport,
+          List.duplicate(Encoder.encode(err), length(planned_keys))
+        )
+
+        {:continue, state}
+    end
+  end
+
+  defp dispatch_planned_batch_get_results(planned_keys, keys, state, send_response_fn) do
+    case safe_dispatch(fn -> Router.batch_get_planned(state.instance_ctx, planned_keys) end) do
+      {:ok, values} ->
+        send_response_fn.(
+          state.socket,
+          state.transport,
+          Encoder.encode_bulk_strings_or_nulls(values)
+        )
+
+        {:continue, ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)}
+
+      {:error, err} ->
+        send_response_fn.(
+          state.socket,
+          state.transport,
+          List.duplicate(Encoder.encode(err), length(planned_keys))
+        )
+
+        {:continue, state}
+    end
+  end
+
   defp stream_get_results(keys, lookup_keys, results, state, send_response_fn) do
     TcpOpts.set_cork(state.socket, true)
 
@@ -241,6 +311,57 @@ defmodule FerricstoreServer.Connection.Pipeline do
           end
 
         {{key, _lookup_key}, value}, {{:continue, acc_state}, file_cache} ->
+          send_response_fn.(acc_state.socket, acc_state.transport, Encoder.encode(value))
+
+          tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
+          {:cont, {{:continue, tracked_state}, file_cache}}
+      end)
+
+    ConnSendfile.close_file_cache(file_cache)
+
+    TcpOpts.set_cork(state.socket, false)
+    result
+  end
+
+  defp stream_get_results(planned_keys, results, state, send_response_fn) do
+    TcpOpts.set_cork(state.socket, true)
+
+    {result, file_cache} =
+      planned_keys
+      |> Enum.zip(results)
+      |> Enum.reduce_while({{:continue, state}, ConnSendfile.new_file_cache()}, fn
+        {{key, lookup_key, _shard_index, _keydir}, {:file_ref, path, offset, size}},
+        {{:continue, acc_state}, file_cache} ->
+          case ConnSendfile.send_file_ref_response_cached(
+                 key,
+                 lookup_key,
+                 path,
+                 offset,
+                 size,
+                 acc_state,
+                 file_cache
+               ) do
+            {:sent, new_state, new_cache} ->
+              {:cont, {{:continue, new_state}, new_cache}}
+
+            {:fallback, new_cache} ->
+              value = Router.get(acc_state.instance_ctx, lookup_key)
+
+              send_response_fn.(
+                acc_state.socket,
+                acc_state.transport,
+                Encoder.encode(value)
+              )
+
+              tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
+              {:cont, {{:continue, tracked_state}, new_cache}}
+
+            {:error_after_header, _reason, new_cache} ->
+              {:halt, {{:quit, acc_state}, new_cache}}
+          end
+
+        {{key, _lookup_key, _shard_index, _keydir}, value},
+        {{:continue, acc_state}, file_cache} ->
           send_response_fn.(acc_state.socket, acc_state.transport, Encoder.encode(value))
 
           tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)

@@ -35,6 +35,7 @@ defmodule Ferricstore.Store.Router do
     CompoundKey,
     LFU,
     ListOps,
+    PipelinePlanner,
     SlotMap,
     TypeRegistry
   }
@@ -1370,6 +1371,100 @@ defmodule Ferricstore.Store.Router do
     end)
   end
 
+  @doc false
+  @spec batch_get_planned(FerricStore.Instance.t(), [PipelinePlanner.key_plan()]) :: [
+          binary() | nil
+        ]
+  def batch_get_planned(ctx, planned_keys) do
+    now = HLC.now_ms()
+    hit_sampler = Stats.start_keyspace_hit_batch(ctx, length(planned_keys))
+
+    {results, {cold_entries, _cold_count, sampled_hit_entries, hit_sampler}} =
+      Enum.map_reduce(planned_keys, {[], 0, [], hit_sampler}, fn {_original_key, key, idx, keydir},
+                                                                 {cold_entries, cold_count,
+                                                                  sampled_hit_entries,
+                                                                  hit_sampler} ->
+        case ets_get_full(ctx, idx, keydir, key, now) do
+          {:hit, value, lfu} ->
+            {sampled_hit_entries, hit_sampler} =
+              case hit_sampler do
+                {:exact, count} ->
+                  LFU.touch(ctx, keydir, key, lfu)
+                  Stats.record_hot_read(ctx, key)
+                  {sampled_hit_entries, {:exact, count + 1}}
+
+                {:sampled_no_touch, rate, previous, count} ->
+                  {sampled_hit_entries, {:sampled_no_touch, rate, previous, count + 1}}
+
+                sampler ->
+                  sample_batch_hit(sampler, sampled_hit_entries, {keydir, key, lfu})
+              end
+
+            {{:value, value}, {cold_entries, cold_count, sampled_hit_entries, hit_sampler}}
+
+          {:cold, file_id, offset, value_size}
+          when valid_cold_location(file_id, offset, value_size) ->
+            path = cold_file_path(ctx, idx, file_id)
+
+            entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
+
+            {{:cold, cold_count},
+             {[entry | cold_entries], cold_count + 1, sampled_hit_entries, hit_sampler}}
+
+          {:cold, _file_id, _offset, _value_size} ->
+            result =
+              case safe_read_call(ctx, idx, {:get, key}) do
+                {:ok, value} -> value
+                :unavailable -> nil
+              end
+
+            if result != nil do
+              Stats.record_cold_read(ctx, key)
+            else
+              Stats.sample_keyspace_misses(ctx)
+            end
+
+            {{:value, result}, {cold_entries, cold_count, sampled_hit_entries, hit_sampler}}
+
+          :expired ->
+            Stats.sample_keyspace_misses(ctx)
+            {{:value, nil}, {cold_entries, cold_count, sampled_hit_entries, hit_sampler}}
+
+          :miss ->
+            Stats.sample_keyspace_misses(ctx)
+            {{:value, nil}, {cold_entries, cold_count, sampled_hit_entries, hit_sampler}}
+
+          :no_table ->
+            result =
+              case safe_read_call(ctx, idx, {:get, key}) do
+                {:ok, value} -> value
+                :unavailable -> nil
+              end
+
+            if result != nil do
+              Stats.record_cold_read(ctx, key)
+            else
+              Stats.sample_keyspace_misses(ctx)
+            end
+
+            {{:value, result}, {cold_entries, cold_count, sampled_hit_entries, hit_sampler}}
+        end
+      end)
+
+    sampled_read_bookkeeping_batch(ctx, Enum.reverse(sampled_hit_entries), hit_sampler)
+
+    cold_values =
+      cold_entries
+      |> Enum.reverse()
+      |> read_cold_batch_async(now)
+      |> List.to_tuple()
+
+    Enum.map(results, fn
+      {:value, value} -> value
+      {:cold, index} -> elem(cold_values, index)
+    end)
+  end
+
   @doc """
   Batch GET variant for TCP large-value streaming.
 
@@ -1389,7 +1484,10 @@ defmodule Ferricstore.Store.Router do
           binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}
         ]
   def batch_get_with_file_refs(ctx, keys, min_file_ref_size),
-    do: do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, false)
+    do:
+      ctx
+      |> PipelinePlanner.plan_lookup_keys(keys)
+      |> do_batch_get_with_file_refs(ctx, min_file_ref_size, false)
 
   @doc false
   @spec batch_get_with_deferred_blob_file_refs(
@@ -1398,7 +1496,28 @@ defmodule Ferricstore.Store.Router do
           non_neg_integer()
         ) :: [binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}]
   def batch_get_with_deferred_blob_file_refs(ctx, keys, min_file_ref_size),
-    do: do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, true)
+    do:
+      ctx
+      |> PipelinePlanner.plan_lookup_keys(keys)
+      |> do_batch_get_with_file_refs(ctx, min_file_ref_size, true)
+
+  @doc false
+  @spec batch_get_with_file_refs_planned(
+          FerricStore.Instance.t(),
+          [PipelinePlanner.key_plan()],
+          non_neg_integer()
+        ) :: [binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}]
+  def batch_get_with_file_refs_planned(ctx, planned_keys, min_file_ref_size),
+    do: do_batch_get_with_file_refs(planned_keys, ctx, min_file_ref_size, false)
+
+  @doc false
+  @spec batch_get_with_deferred_blob_file_refs_planned(
+          FerricStore.Instance.t(),
+          [PipelinePlanner.key_plan()],
+          non_neg_integer()
+        ) :: [binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}]
+  def batch_get_with_deferred_blob_file_refs_planned(ctx, planned_keys, min_file_ref_size),
+    do: do_batch_get_with_file_refs(planned_keys, ctx, min_file_ref_size, true)
 
   @spec batch_get_with_file_refs(
           FerricStore.Instance.t(),
@@ -1408,23 +1527,31 @@ defmodule Ferricstore.Store.Router do
         ) :: [binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}]
   def batch_get_with_file_refs(ctx, keys, min_file_ref_size, opts) when is_list(opts) do
     defer_blob_validation? = Keyword.get(opts, :defer_blob_file_ref_validation?, false) == true
-    do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, defer_blob_validation?)
+
+    ctx
+    |> PipelinePlanner.plan_lookup_keys(keys)
+    |> do_batch_get_with_file_refs(ctx, min_file_ref_size, defer_blob_validation?)
   end
 
-  defp do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, defer_blob_validation?) do
+  defp do_batch_get_with_file_refs(
+         planned_keys,
+         ctx,
+         min_file_ref_size,
+         defer_blob_validation?
+       ) do
     now = HLC.now_ms()
-    hit_sampler = Stats.start_keyspace_hit_batch(ctx, length(keys))
+    hit_sampler = Stats.start_keyspace_hit_batch(ctx, length(planned_keys))
 
     {results,
      {cold_entries, _cold_count, blob_ref_entries, _blob_ref_count, sampled_hit_entries,
       hit_sampler}} =
-      Enum.map_reduce(keys, {[], 0, [], 0, [], hit_sampler}, fn key,
-                                                                {cold_entries, cold_count,
-                                                                 blob_ref_entries, blob_ref_count,
-                                                                 sampled_hit_entries, hit_sampler} ->
-        idx = shard_for(ctx, key)
-        keydir = resolve_keydir(ctx, idx)
-
+      Enum.map_reduce(planned_keys, {[], 0, [], 0, [], hit_sampler}, fn {_original_key, key, idx,
+                                                                         keydir},
+                                                                        {cold_entries, cold_count,
+                                                                         blob_ref_entries,
+                                                                         blob_ref_count,
+                                                                         sampled_hit_entries,
+                                                                         hit_sampler} ->
         case ets_get_full(ctx, idx, keydir, key, now) do
           {:hit, value, lfu} ->
             {sampled_hit_entries, hit_sampler} =
