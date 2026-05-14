@@ -156,14 +156,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
        )
        when transport in [:ranch_tcp, :ranch_ssl] do
     case safe_dispatch(fn ->
-           Router.batch_get_with_deferred_blob_file_refs(
+           Router.batch_get_with_deferred_blob_file_refs_and_presence(
              state.instance_ctx,
              lookup_keys,
              ConnSendfile.threshold_bytes()
            )
          end) do
-      {:ok, results} ->
-        if Enum.any?(results, &match?({:file_ref, _, _, _}, &1)) do
+      {:ok, {results, has_file_ref?}} ->
+        if has_file_ref? do
           stream_get_results(keys, lookup_keys, results, state, send_response_fn)
         else
           send_response_fn.(
@@ -216,14 +216,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
        )
        when transport in [:ranch_tcp, :ranch_ssl] do
     case safe_dispatch(fn ->
-           Router.batch_get_with_deferred_blob_file_refs_planned(
+           Router.batch_get_with_deferred_blob_file_refs_planned_and_presence(
              state.instance_ctx,
              planned_keys,
              ConnSendfile.threshold_bytes()
            )
          end) do
-      {:ok, results} ->
-        if Enum.any?(results, &match?({:file_ref, _, _, _}, &1)) do
+      {:ok, {results, has_file_ref?}} ->
+        if has_file_ref? do
           stream_get_results(planned_keys, results, state, send_response_fn)
         else
           send_response_fn.(

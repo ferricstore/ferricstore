@@ -95,6 +95,19 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
            end)
   end
 
+  test "deferred batch_get with presence reports no file refs for hot hits" do
+    ctx = IsolatedInstance.checkout(shard_count: 1, read_sample_rate: 3)
+    on_exit(fn -> IsolatedInstance.checkin(ctx) end)
+
+    keys = ["fileref-presence-hot-first:1", "fileref-presence-hot-second:1"]
+    Enum.each(keys, fn key -> assert :ok = Router.put(ctx, key, "value:" <> key) end)
+
+    expected = Enum.map(keys, &("value:" <> &1))
+
+    assert {^expected, false} =
+             Router.batch_get_with_deferred_blob_file_refs_and_presence(ctx, keys, 1024)
+  end
+
   test "batch read functions do not advance hit sampling one key at a time" do
     ast =
       @router_source
@@ -104,6 +117,7 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
     for {name, arity} <- [
           {:batch_get, 2},
           {:batch_get_planned, 2},
+          {:do_batch_get_lookup_keys_with_file_refs, 4},
           {:do_batch_get_with_file_refs, 4},
           {:compound_batch_get, 3}
         ] do

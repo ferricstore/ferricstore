@@ -129,6 +129,9 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
       assert [{:file_ref, blob_path, blob_offset, 1024}] =
                Router.batch_get_with_deferred_blob_file_refs(ctx, [key], 64)
 
+      assert {[{:file_ref, ^blob_path, ^blob_offset, 1024}], true} =
+               Router.batch_get_with_deferred_blob_file_refs_and_presence(ctx, [key], 64)
+
       assert Path.extname(blob_path) == ".bloblog"
       assert is_integer(blob_offset) and blob_offset >= 0
       refute_received {:blob_store_open, _path}
