@@ -11,11 +11,18 @@ defmodule SendfileColdReadBench do
       System.get_env("DATA_DIR") ||
         Path.join(System.tmp_dir!(), "ferricstore_sendfile_bench_#{System.os_time(:millisecond)}")
 
+    transport = transport()
+
+    tls_files =
+      if transport == :tls do
+        configure_tls_listener()
+      end
+
     Application.put_env(:ferricstore, :data_dir, data_dir)
     Mix.Task.run("app.start")
 
     host = {127, 0, 0, 1}
-    port = env_int("PORT", FerricstoreServer.Listener.port())
+    port = env_int("PORT", default_port(transport))
     key_count = env_int("KEYS", 32)
     value_bytes = env_int("VALUE_BYTES", 256 * 1024)
     rounds = env_int("ROUNDS", 100)
@@ -25,44 +32,47 @@ defmodule SendfileColdReadBench do
     keys = Enum.map(1..key_count, &"#{prefix}#{&1}")
     values = Map.new(keys, fn key -> {key, value_for(key, value_bytes)} end)
 
-    attach_sendfile_counter()
+    attach_stream_counter(transport)
     seed(host, port, values)
 
-    IO.puts("pipeline,ops,seconds,ops_per_sec,mb_per_sec,sendfile_events,sendfile_mb")
+    IO.puts("transport,pipeline,ops,seconds,ops_per_sec,mb_per_sec,stream_events,stream_mb")
 
     for pipeline <- pipelines do
-      reset_sendfile_counter()
+      reset_stream_counter()
       {ops, micros} = measure(host, port, keys, values, rounds, pipeline)
       seconds = micros / 1_000_000
       total_bytes = ops * value_bytes
-      {events, sendfile_bytes} = sendfile_counter()
+      {events, stream_bytes} = stream_counter()
 
       IO.puts(
         Enum.join(
           [
+            transport,
             pipeline,
             ops,
             Float.round(seconds, 4),
             Float.round(ops / seconds, 1),
             Float.round(total_bytes / seconds / 1_048_576, 1),
             events,
-            Float.round(sendfile_bytes / 1_048_576, 1)
+            Float.round(stream_bytes / 1_048_576, 1)
           ],
           ","
         )
       )
     end
+
+    cleanup_tls_files(tls_files)
   end
 
   defp seed(host, port, values) do
     sock = connect(host, port)
 
     Enum.each(values, fn {key, value} ->
-      :ok = :gen_tcp.send(sock, command(["SET", key, value]))
+      :ok = sock_send(sock, command(["SET", key, value]))
       {{:simple, "OK"}, ""} = recv_one(sock, "")
     end)
 
-    :gen_tcp.close(sock)
+    sock_close(sock)
   end
 
   defp measure(host, port, keys, values, rounds, pipeline) do
@@ -77,12 +87,12 @@ defmodule SendfileColdReadBench do
               Enum.at(keys, rem(round * pipeline + offset, key_count))
             end)
 
-          :ok = :gen_tcp.send(sock, IO.iodata_to_binary(Enum.map(batch, &command(["GET", &1]))))
+          :ok = sock_send(sock, IO.iodata_to_binary(Enum.map(batch, &command(["GET", &1]))))
           recv_and_verify(sock, batch, values, "")
         end)
       end)
 
-    :gen_tcp.close(sock)
+    sock_close(sock)
     {rounds * pipeline, micros}
   end
 
@@ -105,7 +115,7 @@ defmodule SendfileColdReadBench do
         {value, rest}
 
       :more ->
-        {:ok, data} = :gen_tcp.recv(sock, 0, 30_000)
+        {:ok, data} = sock_recv(sock, 30_000)
         recv_value(sock, buf <> data)
     end
   end
@@ -116,7 +126,7 @@ defmodule SendfileColdReadBench do
         {value, rest}
 
       :more ->
-        {:ok, data} = :gen_tcp.recv(sock, 0, 30_000)
+        {:ok, data} = sock_recv(sock, 30_000)
         recv_one(sock, buf <> data)
     end
   end
@@ -168,9 +178,37 @@ defmodule SendfileColdReadBench do
   defp parse_one(_buf), do: :more
 
   defp connect(host, port) do
-    {:ok, sock} = :gen_tcp.connect(host, port, [:binary, active: false, packet: :raw])
-    sock
+    case transport() do
+      :tcp -> connect_tcp(host, port)
+      :tls -> connect_tls(port)
+    end
   end
+
+  defp connect_tcp(host, port) do
+    {:ok, sock} = :gen_tcp.connect(host, port, [:binary, active: false, packet: :raw])
+    {:tcp, sock}
+  end
+
+  defp connect_tls(port) do
+    {:ok, sock} =
+      :ssl.connect(
+        ~c"127.0.0.1",
+        port,
+        [:binary, active: false, packet: :raw, verify: :verify_none],
+        5_000
+      )
+
+    {:tls, sock}
+  end
+
+  defp sock_send({:tcp, sock}, data), do: :gen_tcp.send(sock, data)
+  defp sock_send({:tls, sock}, data), do: :ssl.send(sock, data)
+
+  defp sock_recv({:tcp, sock}, timeout_ms), do: :gen_tcp.recv(sock, 0, timeout_ms)
+  defp sock_recv({:tls, sock}, timeout_ms), do: :ssl.recv(sock, 0, timeout_ms)
+
+  defp sock_close({:tcp, sock}), do: :gen_tcp.close(sock)
+  defp sock_close({:tls, sock}), do: :ssl.close(sock)
 
   defp command(parts) do
     [
@@ -202,36 +240,74 @@ defmodule SendfileColdReadBench do
     end
   end
 
-  defp attach_sendfile_counter do
+  defp attach_stream_counter(transport) do
     :persistent_term.put({__MODULE__, :counter}, :counters.new(2, []))
 
     :telemetry.attach(
-      {__MODULE__, :sendfile_counter},
-      [:ferricstore, :server, :sendfile],
-      &__MODULE__.handle_sendfile/4,
+      {__MODULE__, :stream_counter},
+      telemetry_event(transport),
+      &__MODULE__.handle_stream/4,
       nil
     )
   rescue
     ArgumentError -> :ok
   end
 
-  def handle_sendfile(_event, %{bytes: bytes}, %{result: :ok}, _config) do
+  def handle_stream(_event, %{bytes: bytes}, %{result: :ok}, _config) do
     counters = :persistent_term.get({__MODULE__, :counter})
     :counters.add(counters, 1, 1)
     :counters.add(counters, 2, bytes)
   end
 
-  def handle_sendfile(_event, _measurements, _metadata, _config), do: :ok
+  def handle_stream(_event, _measurements, _metadata, _config), do: :ok
 
-  defp reset_sendfile_counter do
+  defp reset_stream_counter do
     counters = :persistent_term.get({__MODULE__, :counter})
     :counters.put(counters, 1, 0)
     :counters.put(counters, 2, 0)
   end
 
-  defp sendfile_counter do
+  defp stream_counter do
     counters = :persistent_term.get({__MODULE__, :counter})
     {:counters.get(counters, 1), :counters.get(counters, 2)}
+  end
+
+  defp telemetry_event(:tcp), do: [:ferricstore, :server, :sendfile]
+  defp telemetry_event(:tls), do: [:ferricstore, :server, :file_stream]
+
+  defp default_port(:tcp), do: FerricstoreServer.Listener.port()
+  defp default_port(:tls), do: FerricstoreServer.TlsListener.port()
+
+  defp transport do
+    case String.downcase(System.get_env("TRANSPORT", "tcp")) do
+      "tcp" -> :tcp
+      "tls" -> :tls
+      other -> raise "unsupported TRANSPORT=#{inspect(other)}; use tcp or tls"
+    end
+  end
+
+  defp configure_tls_listener do
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_sendfile_bench_tls_#{System.os_time(:millisecond)}"
+      )
+
+    File.mkdir_p!(dir)
+    Code.require_file("apps/ferricstore/test/support/tls_cert_helper.ex")
+    {cert_path, key_path} = apply(Ferricstore.Test.TlsCertHelper, :generate_self_signed, [dir])
+    Application.put_env(:ferricstore, :tls_port, env_int("PORT", 0))
+    Application.put_env(:ferricstore, :tls_cert_file, cert_path)
+    Application.put_env(:ferricstore, :tls_key_file, key_path)
+    {dir, cert_path, key_path}
+  end
+
+  defp cleanup_tls_files(nil), do: :ok
+
+  defp cleanup_tls_files({dir, cert_path, key_path}) do
+    File.rm(cert_path)
+    File.rm(key_path)
+    File.rmdir(dir)
   end
 end
 
