@@ -113,6 +113,30 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     end
   end
 
+  test "deferred batch file-ref lookup skips blob validation open", %{ctx: ctx} do
+    key = "blob:auto:deferred-batch-file-ref"
+    payload = :binary.copy("B", 1024)
+    parent = self()
+
+    assert :ok = Router.put(ctx, key, payload, 0)
+
+    Process.put(:ferricstore_blob_store_open_read_hook, fn path, modes ->
+      send(parent, {:blob_store_open, path})
+      File.open(path, modes)
+    end)
+
+    try do
+      assert [{:file_ref, blob_path, blob_offset, 1024}] =
+               Router.batch_get_with_deferred_blob_file_refs(ctx, [key], 64)
+
+      assert Path.extname(blob_path) == ".bloblog"
+      assert is_integer(blob_offset) and blob_offset >= 0
+      refute_received {:blob_store_open, _path}
+    after
+      Process.delete(:ferricstore_blob_store_open_read_hook)
+    end
+  end
+
   test "file-ref reads keep streaming fast path while materialized reads reject corrupt blobs", %{
     ctx: ctx,
     keydir: keydir

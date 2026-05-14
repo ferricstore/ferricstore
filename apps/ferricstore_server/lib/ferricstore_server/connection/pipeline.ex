@@ -146,11 +146,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
        )
        when transport in [:ranch_tcp, :ranch_ssl] do
     case safe_dispatch(fn ->
-           Router.batch_get_with_file_refs(
+           Router.batch_get_with_deferred_blob_file_refs(
              state.instance_ctx,
              lookup_keys,
-             ConnSendfile.threshold_bytes(),
-             defer_blob_file_ref_validation?: true
+             ConnSendfile.threshold_bytes()
            )
          end) do
       {:ok, results} ->
@@ -468,8 +467,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
           get_dispatch =
             if state.transport in [:ranch_tcp, :ranch_ssl] do
               fn ->
-                Router.batch_get_with_file_refs(ctx, lookup_keys, ConnSendfile.threshold_bytes(),
-                  defer_blob_file_ref_validation?: true
+                Router.batch_get_with_deferred_blob_file_refs(
+                  ctx,
+                  lookup_keys,
+                  ConnSendfile.threshold_bytes()
                 )
               end
             else
@@ -1313,11 +1314,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
         lookup_keys = Enum.map(gets, fn {_idx, _key, lookup_key} -> lookup_key end)
 
         case safe_dispatch(fn ->
-               Router.batch_get_with_file_refs(
+               Router.batch_get_with_deferred_blob_file_refs(
                  state.instance_ctx,
                  lookup_keys,
-                 ConnSendfile.threshold_bytes(),
-                 defer_blob_file_ref_validation?: true
+                 ConnSendfile.threshold_bytes()
                )
              end) do
           {:ok, results} ->
@@ -1357,11 +1357,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp prefetch_tcp_mget_result(keys, lookup_keys, state) do
     case safe_dispatch(fn ->
-           Router.batch_get_with_file_refs(
+           Router.batch_get_with_deferred_blob_file_refs(
              state.instance_ctx,
              lookup_keys,
-             ConnSendfile.threshold_bytes(),
-             defer_blob_file_ref_validation?: true
+             ConnSendfile.threshold_bytes()
            )
          end) do
       {:ok, results} ->

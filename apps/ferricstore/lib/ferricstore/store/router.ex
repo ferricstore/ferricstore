@@ -1377,24 +1377,40 @@ defmodule Ferricstore.Store.Router do
   into BEAM binaries. Stale or invalid refs fall back to the normal batched cold
   pread path.
 
-  Server streaming callers may pass `defer_blob_file_ref_validation?: true`.
-  That skips duplicate blob segment validation here because sendfile/file-stream
-  validates the same segment immediately before writing bytes to the socket.
   The default remains validated for embedded/API callers that consume file refs
-  directly.
+  directly. Server streaming callers should use
+  `batch_get_with_deferred_blob_file_refs/3` to skip duplicate blob segment
+  validation and keyword parsing before sendfile/file-stream validates the same
+  segment at the socket boundary.
   """
   @spec batch_get_with_file_refs(FerricStore.Instance.t(), [binary()], non_neg_integer()) :: [
           binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}
         ]
+  def batch_get_with_file_refs(ctx, keys, min_file_ref_size),
+    do: do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, false)
+
+  @doc false
+  @spec batch_get_with_deferred_blob_file_refs(
+          FerricStore.Instance.t(),
+          [binary()],
+          non_neg_integer()
+        ) :: [binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}]
+  def batch_get_with_deferred_blob_file_refs(ctx, keys, min_file_ref_size),
+    do: do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, true)
+
   @spec batch_get_with_file_refs(
           FerricStore.Instance.t(),
           [binary()],
           non_neg_integer(),
           keyword()
         ) :: [binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}]
-  def batch_get_with_file_refs(ctx, keys, min_file_ref_size, opts \\ []) do
-    now = HLC.now_ms()
+  def batch_get_with_file_refs(ctx, keys, min_file_ref_size, opts) when is_list(opts) do
     defer_blob_validation? = Keyword.get(opts, :defer_blob_file_ref_validation?, false) == true
+    do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, defer_blob_validation?)
+  end
+
+  defp do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, defer_blob_validation?) do
+    now = HLC.now_ms()
 
     {results, {cold_entries, _cold_count, blob_ref_entries, _blob_ref_count}} =
       Enum.map_reduce(keys, {[], 0, [], 0}, fn key,

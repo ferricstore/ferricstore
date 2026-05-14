@@ -169,9 +169,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   defp fetch_mget_with_file_refs(instance_ctx, lookup_keys) do
     {:ok,
-     Router.batch_get_with_file_refs(instance_ctx, lookup_keys, threshold_bytes(),
-       defer_blob_file_ref_validation?: true
-     )}
+     Router.batch_get_with_deferred_blob_file_refs(instance_ctx, lookup_keys, threshold_bytes())}
   catch
     _, _ -> :error
   end
