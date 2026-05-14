@@ -69,6 +69,21 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
              "a separate Enum.all?/2 pass adds avoidable CPU work for large blob batches"
   end
 
+  test "single put avoids the batch dedupe preparation path" do
+    source = File.read!(@source)
+
+    put =
+      source
+      |> String.split("  def put(data_dir, shard_index, payload)", parts: 2)
+      |> List.last()
+      |> String.split("  @doc \"\"\"\n  Stores payloads", parts: 2)
+      |> List.first()
+
+    refute put =~ "put_many(data_dir, shard_index, [payload])",
+           "BlobStore.put/3 is the large single-SET hot path; it should not wrap the value " <>
+             "in a list and run the full batch dedupe map/list machinery"
+  end
+
   test "segment_path uses the segment filename directly" do
     source = File.read!(@source)
 

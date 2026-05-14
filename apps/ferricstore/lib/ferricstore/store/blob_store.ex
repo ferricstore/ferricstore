@@ -41,10 +41,28 @@ defmodule Ferricstore.Store.BlobStore do
   def put(data_dir, shard_index, payload)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
              is_binary(payload) do
-    case put_many(data_dir, shard_index, [payload]) do
-      {:ok, [ref]} -> {:ok, ref}
-      {:error, _reason} = error -> error
-    end
+    batch = prepare_single_payload_batch(payload)
+
+    with_blob_lock(data_dir, shard_index, fn ->
+      case do_put_many(data_dir, shard_index, batch) do
+        {:ok, [ref]} -> {:ok, ref}
+        {:ok, refs} when is_list(refs) -> {:error, {:unexpected_blob_ref_count, length(refs)}}
+        {:error, _reason} = error -> error
+      end
+    end)
+  end
+
+  defp prepare_single_payload_batch(payload) do
+    size = byte_size(payload)
+    checksum = :crypto.hash(:sha256, payload)
+    entry = %{payload: payload, checksum: checksum, size: size}
+
+    %{
+      unique_entries: [entry],
+      value_indexes: [0],
+      batch_bytes: @segment_header_bytes + size,
+      error_ref: %BlobRef{checksum: checksum, size: size}
+    }
   end
 
   @doc """
