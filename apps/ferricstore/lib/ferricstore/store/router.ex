@@ -3158,7 +3158,16 @@ defmodule Ferricstore.Store.Router do
     # per-key {:put, ...} commands or run a separate pre-map pass. Do not
     # re-expand this to generic commands unless a benchmark and apply-path audit
     # show the specialized term is no longer the faster shape.
-    {by_shard, count} = group_put_entries_by_fixed_shard_buckets(ctx, entries)
+    {by_shard, count} =
+      entries
+      |> Enum.reduce({%{}, 0}, fn entry, {shards, i} ->
+        {key, value, expire_at_ms} = normalize_put_batch_entry(entry)
+        idx = shard_for(ctx, key)
+        entry = Map.get(shards, idx, {[], []})
+        {entries_acc, indices} = entry
+
+        {Map.put(shards, idx, {[{key, value, expire_at_ms} | entries_acc], [i | indices]}), i + 1}
+      end)
 
     shard_refs =
       Enum.map(by_shard, fn {shard_idx, {entries, indices}} ->
@@ -3215,7 +3224,14 @@ defmodule Ferricstore.Store.Router do
   defp do_batch_quorum_delete_keys(ctx, keys, origin_node) do
     wv_size = :counters.info(ctx.write_version).size
 
-    {by_shard, count} = group_delete_keys_by_fixed_shard_buckets(ctx, keys)
+    {by_shard, count} =
+      keys
+      |> Enum.reduce({%{}, 0}, fn key, {shards, i} ->
+        idx = shard_for(ctx, key)
+        {keys_acc, indices} = Map.get(shards, idx, {[], []})
+
+        {Map.put(shards, idx, {[key | keys_acc], [i | indices]}), i + 1}
+      end)
 
     shard_refs =
       Enum.map(by_shard, fn {shard_idx, {keys, indices}} ->
@@ -3257,57 +3273,6 @@ defmodule Ferricstore.Store.Router do
 
     0..(count - 1)
     |> Enum.map(fn i -> Map.get(results, i, ErrorReasons.write_timeout_unknown()) end)
-  end
-
-  defp group_put_entries_by_fixed_shard_buckets(ctx, entries) do
-    shard_count = effective_shard_count(ctx)
-    buckets = :erlang.make_tuple(shard_count, {[], []})
-
-    {buckets, count} =
-      Enum.reduce(entries, {buckets, 0}, fn entry, {next_buckets, i} ->
-        {key, value, expire_at_ms} = normalize_put_batch_entry(entry)
-        idx = shard_for(ctx, key)
-        {entries_acc, indices} = elem(next_buckets, idx)
-
-        {
-          put_elem(
-            next_buckets,
-            idx,
-            {[{key, value, expire_at_ms} | entries_acc], [i | indices]}
-          ),
-          i + 1
-        }
-      end)
-
-    {fixed_shard_bucket_list(buckets, shard_count), count}
-  end
-
-  defp group_delete_keys_by_fixed_shard_buckets(ctx, keys) do
-    shard_count = effective_shard_count(ctx)
-    buckets = :erlang.make_tuple(shard_count, {[], []})
-
-    {buckets, count} =
-      Enum.reduce(keys, {buckets, 0}, fn key, {next_buckets, i} ->
-        idx = shard_for(ctx, key)
-        {keys_acc, indices} = elem(next_buckets, idx)
-
-        {put_elem(next_buckets, idx, {[key | keys_acc], [i | indices]}), i + 1}
-      end)
-
-    {fixed_shard_bucket_list(buckets, shard_count), count}
-  end
-
-  defp fixed_shard_bucket_list(_buckets, shard_count) when shard_count <= 0, do: []
-
-  defp fixed_shard_bucket_list(buckets, shard_count) do
-    0..(shard_count - 1)
-    |> Enum.reduce([], fn idx, acc ->
-      case elem(buckets, idx) do
-        {[], []} -> acc
-        bucket -> [{idx, bucket} | acc]
-      end
-    end)
-    |> Enum.reverse()
   end
 
   defp merge_forwarded(acc, shard_idx, entries, indices, leader_node, ctx) do
