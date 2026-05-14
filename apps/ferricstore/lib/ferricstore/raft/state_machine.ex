@@ -12976,7 +12976,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
       selected_delete_keys = Enum.map(selected, &CompoundKey.set_member(redis_key, &1))
 
-      with :ok <- do_compound_batch_delete(state, redis_key, selected_delete_keys),
+      with :ok <- do_compound_batch_delete_read_visible(state, redis_key, selected_delete_keys),
            :ok <- maybe_delete_empty_compound_type_key(state, redis_key, prefix, selected) do
         if is_nil(count), do: List.first(selected), else: selected
       end
@@ -13008,7 +13008,7 @@ defmodule Ferricstore.Raft.StateMachine do
       selected_delete_keys =
         Enum.map(selected, fn {member, _score} -> CompoundKey.zset_member(redis_key, member) end)
 
-      with :ok <- do_compound_batch_delete(state, redis_key, selected_delete_keys),
+      with :ok <- do_compound_batch_delete_read_visible(state, redis_key, selected_delete_keys),
            :ok <- maybe_delete_empty_compound_type_key(state, redis_key, prefix, selected) do
         Enum.flat_map(selected, fn {member, score} -> [member, format_zset_score(score)] end)
       end
@@ -14396,6 +14396,17 @@ defmodule Ferricstore.Raft.StateMachine do
       case result do
         :ok -> {:cont, :ok}
         {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp do_compound_batch_delete_read_visible(_state, _redis_key, []), do: :ok
+
+  defp do_compound_batch_delete_read_visible(state, redis_key, compound_keys) do
+    Enum.reduce_while(compound_keys, :ok, fn compound_key, :ok ->
+      case do_compound_delete(state, redis_key, compound_key) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
       end
     end)
   end

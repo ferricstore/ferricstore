@@ -229,35 +229,10 @@ defmodule Ferricstore.Store.Router do
 
   @spec quorum_write(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
   defp quorum_write(ctx, idx, command) do
-    do_quorum_write(ctx, idx, command)
-  end
-
-  defp do_quorum_write(ctx, idx, command) do
-    result =
-      try do
-        GenServer.call(elem(ctx.shard_names, idx), command, 10_000)
-      catch
-        :exit, {:timeout, _} ->
-          ErrorReasons.write_timeout_unknown()
-
-        :exit, {:noproc, _} ->
-          {:error, "ERR shard not available"}
-      end
-
-    case result do
-      {:error, {:not_leader, {_shard, leader_node}}} when is_atom(leader_node) ->
-        forward_to_leader(ctx, leader_node, idx, command)
-
-      {:error, {:not_leader, leader_node}} when is_atom(leader_node) ->
-        forward_to_leader(ctx, leader_node, idx, command)
-
-      {:error, _} ->
-        result
-
-      _ ->
-        size = :counters.info(ctx.write_version).size
-        if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
-        result
+    if ctx.name == :default do
+      forced_quorum_write(ctx, idx, command, node())
+    else
+      safe_write_call(ctx, idx, command)
     end
   end
 
@@ -265,20 +240,20 @@ defmodule Ferricstore.Store.Router do
     if leader_node == node() do
       {:error, "ERR not leader, election in progress"}
     else
-      forward_via_shard_call(ctx, leader_node, idx, command)
+      forward_via_batcher_call(ctx, leader_node, idx, command)
     end
   end
 
-  defp forward_via_shard_call(ctx, leader_node, idx, command) do
+  defp forward_via_batcher_call(_ctx, leader_node, idx, command) do
     try do
       remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
 
       result =
         :erpc.call(
           leader_node,
-          GenServer,
-          :call,
-          [elem(remote_ctx.shard_names, idx), {:forwarded_quorum, node(), command}, 10_000],
+          __MODULE__,
+          :__forwarded_quorum_write__,
+          [remote_ctx, idx, command, node()],
           10_000
         )
 
@@ -294,15 +269,7 @@ defmodule Ferricstore.Store.Router do
       end
     catch
       _, reason ->
-        if forward_timeout?(reason) do
-          ErrorReasons.write_timeout_unknown()
-        else
-          try do
-            GenServer.call(elem(ctx.shard_names, idx), command, 10_000)
-          catch
-            _, _ -> {:error, "ERR leader unavailable"}
-          end
-        end
+        forward_failure_result(reason)
     end
   end
 
@@ -363,6 +330,11 @@ defmodule Ferricstore.Store.Router do
 
   defp forced_quorum_write(ctx, idx, command, origin_node) do
     do_forced_quorum_write(ctx, idx, command, origin_node)
+  end
+
+  @doc false
+  def __forwarded_quorum_write__(ctx, idx, command, origin_node) do
+    forced_quorum_write(ctx, idx, command, origin_node)
   end
 
   defp do_forced_quorum_write(ctx, idx, command, origin_node) do
@@ -5397,7 +5369,7 @@ defmodule Ferricstore.Store.Router do
     idx = shard_for(ctx, redis_key)
 
     if ctx.name == :default do
-      quorum_write(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
+      quorum_write(ctx, idx, {:compound_put, compound_key, value, expire_at_ms})
     else
       safe_write_call(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
     end
@@ -5414,7 +5386,9 @@ defmodule Ferricstore.Store.Router do
     idx = shard_for(ctx, redis_key)
 
     if ctx.name == :default do
-      quorum_write(ctx, idx, {:compound_batch_put, redis_key, entries})
+      ctx
+      |> quorum_write(idx, {:compound_batch_put, redis_key, entries})
+      |> normalize_compound_batch_write_result()
     else
       safe_write_call(ctx, idx, {:compound_batch_put, redis_key, entries})
     end
@@ -5425,7 +5399,7 @@ defmodule Ferricstore.Store.Router do
     idx = shard_for(ctx, redis_key)
 
     if ctx.name == :default do
-      quorum_write(ctx, idx, {:compound_delete, redis_key, compound_key})
+      quorum_write(ctx, idx, {:compound_delete, compound_key})
     else
       safe_write_call(ctx, idx, {:compound_delete, redis_key, compound_key})
     end
@@ -5439,11 +5413,24 @@ defmodule Ferricstore.Store.Router do
     idx = shard_for(ctx, redis_key)
 
     if ctx.name == :default do
-      quorum_write(ctx, idx, {:compound_batch_delete, redis_key, compound_keys})
+      ctx
+      |> quorum_write(idx, {:compound_batch_delete, redis_key, compound_keys})
+      |> normalize_compound_batch_write_result()
     else
       safe_write_call(ctx, idx, {:compound_batch_delete, redis_key, compound_keys})
     end
   end
+
+  defp normalize_compound_batch_write_result({:ok, results}) when is_list(results) do
+    case Enum.find(results, &match?({:error, _}, &1)) do
+      nil -> :ok
+      {:error, _} = error -> error
+    end
+  end
+
+  defp normalize_compound_batch_write_result(:ok), do: :ok
+  defp normalize_compound_batch_write_result({:error, _} = error), do: error
+  defp normalize_compound_batch_write_result(other), do: {:error, other}
 
   defp origin_compound_get(ctx, idx, keydir, compound_key) do
     now = HLC.now_ms()
@@ -5743,7 +5730,12 @@ defmodule Ferricstore.Store.Router do
   @spec compound_delete_prefix(FerricStore.Instance.t(), binary(), binary()) :: :ok
   def compound_delete_prefix(ctx, redis_key, prefix) do
     idx = shard_for(ctx, redis_key)
-    quorum_write(ctx, idx, {:compound_delete_prefix, redis_key, prefix})
+
+    if ctx.name == :default do
+      quorum_write(ctx, idx, {:compound_delete_prefix, prefix})
+    else
+      safe_write_call(ctx, idx, {:compound_delete_prefix, redis_key, prefix})
+    end
   end
 
   # -------------------------------------------------------------------

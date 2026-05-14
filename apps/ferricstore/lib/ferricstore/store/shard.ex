@@ -9,7 +9,32 @@ defmodule Ferricstore.Store.Shard do
   `v2_append_batch`, `v2_append_tombstone`, `v2_scan_file`, hint file I/O.
   No Rust-side Store resource, HashMap keydir, or Mutex.
 
-  ## Write path: group commit
+  ## Ownership boundary
+
+  `Shard` owns the storage partition lifecycle, not the default application's
+  quorum write ingress.
+
+  It is responsible for:
+
+    * startup and recovery of the shard's Bitcask files, keydir, and indexes
+    * active-file state, file rotation, compaction, merge, and garbage cleanup
+    * cold-read fallback and validated file refs for streaming large values
+    * pause/resume, flush, stats, and other administrative lifecycle calls
+    * custom/direct instance writes that intentionally bypass the default Raft
+      cluster
+
+  For the default application instance, user-visible writes should enter through
+  `Ferricstore.Raft.Batcher`, then `Ferricstore.Raft.StateMachine.apply/3`.
+  The state machine is the mutation authority because Raft provides the
+  serialized committed order for read-modify-write commands. During the write
+  ingress migration this module still contains legacy/default write handlers,
+  but new default-instance write paths should not route through
+  `GenServer.call(shard, write_command)`.
+
+  ## Custom/direct write path
+
+  Custom embedded instances and non-default direct stores use the shard's local
+  write path:
 
   1. The key is written to ETS immediately (reads see it at once).
   2. The entry is appended to an in-memory pending list.
@@ -22,6 +47,9 @@ defmodule Ferricstore.Store.Shard do
      which runs on its own, longer tick and issues `v2_fsync` against
      the same active file.
   4. File rotation occurs when the active file exceeds the configured limit.
+
+  Default quorum writes do not use this direct path; they are committed by Raft
+  first and applied by `Ferricstore.Raft.StateMachine`.
 
   ## Read path: ETS bypass
 

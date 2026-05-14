@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.RouterTest do
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Store.{LFU, Router, SlotMap}
+  alias Ferricstore.Store.{CompoundKey, LFU, Router, SlotMap}
   alias Ferricstore.Test.IsolatedInstance
 
   describe "shard_for/1" do
@@ -114,6 +114,57 @@ defmodule Ferricstore.Store.RouterTest do
     end
   end
 
+  describe "default quorum write ingress" do
+    test "remote forwarding does not use shard forwarded_quorum calls" do
+      source = File.read!("lib/ferricstore/store/router.ex")
+
+      refute source =~ "{:forwarded_quorum,",
+             "default write forwarding must go through Router/Batcher, not Shard GenServer"
+
+      assert source =~ ":__forwarded_quorum_write__"
+    end
+
+    test "single writes and RMW commands do not enter Shard write handlers" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "router_direct_quorum:" <> Integer.to_string(System.unique_integer([:positive]))
+      idx = Router.shard_for(ctx, key)
+      shard = elem(ctx.shard_names, idx)
+      before_version = shard_write_version(shard)
+
+      assert :ok = Router.put(ctx, key, "1", 0)
+      assert {:ok, 2} = Router.incr(ctx, key, 1)
+      assert :ok = Router.delete(ctx, key)
+
+      assert shard_write_version(shard) == before_version
+    end
+
+    test "compound marker writes use state-machine command shapes" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "router_direct_compound:" <> Integer.to_string(System.unique_integer([:positive]))
+      idx = Router.shard_for(ctx, key)
+      shard = elem(ctx.shard_names, idx)
+      type_key = CompoundKey.type_key(key)
+      before_version = shard_write_version(shard)
+
+      assert :ok = Router.compound_put(ctx, key, type_key, "zset", 0)
+      assert "zset" = Router.compound_get(ctx, key, type_key)
+      assert :ok = Router.compound_delete(ctx, key, type_key)
+      assert nil == Router.compound_get(ctx, key, type_key)
+
+      entries = [
+        {CompoundKey.hash_field(key, "a"), "1", 0},
+        {CompoundKey.hash_field(key, "b"), "2", 0}
+      ]
+
+      assert :ok = Router.compound_batch_put(ctx, key, entries)
+      assert ["1", "2"] = Router.compound_batch_get(ctx, key, Enum.map(entries, &elem(&1, 0)))
+      assert :ok = Router.compound_batch_delete(ctx, key, Enum.map(entries, &elem(&1, 0)))
+      assert [nil, nil] = Router.compound_batch_get(ctx, key, Enum.map(entries, &elem(&1, 0)))
+
+      assert shard_write_version(shard) == before_version
+    end
+  end
+
   describe "async list timeout classification" do
     test "list worker timeout is reported as unknown outcome" do
       source = File.read!("lib/ferricstore/store/router.ex")
@@ -193,5 +244,11 @@ defmodule Ferricstore.Store.RouterTest do
       end)
 
     MapSet.to_list(vars)
+  end
+
+  defp shard_write_version(shard) do
+    shard
+    |> :sys.get_state()
+    |> Map.fetch!(:write_version)
   end
 end

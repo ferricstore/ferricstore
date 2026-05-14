@@ -1,5 +1,17 @@
 defmodule Ferricstore.Store.Shard.Writes do
-  @moduledoc "Shard write-path handlers: put, delete, incr, append, getset, getdel, getex, and setrange with async flush and Raft support."
+  @moduledoc """
+  Shard-local write handlers.
+
+  These handlers remain for custom/direct instances and for the staged migration
+  away from using `Shard` as a pass-through default quorum write proxy. For the
+  default application instance, write ingress should go through
+  `Ferricstore.Raft.Batcher` and be serialized by
+  `Ferricstore.Raft.StateMachine.apply/3`.
+
+  Do not add new default-instance write paths here. If a command is durable and
+  user-visible, route it to the Batcher so read-modify-write behavior is decided
+  in Raft apply order.
+  """
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.LFU
