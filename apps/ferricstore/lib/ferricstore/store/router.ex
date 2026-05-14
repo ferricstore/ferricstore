@@ -790,27 +790,40 @@ defmodule Ferricstore.Store.Router do
     - `{:cold_value, value}` — value was on disk, GenServer fetched it
     - `:miss` — key doesn't exist
 
-  Server streaming callers may pass `defer_blob_file_ref_validation?: true`.
-  That skips duplicate blob segment validation here because sendfile/file-stream
-  validates the same segment immediately before writing bytes to the socket.
   The default remains validated for embedded/API callers that consume file refs
-  directly.
+  directly. Server streaming callers should use
+  `get_with_deferred_blob_file_ref/2` to skip duplicate blob segment validation
+  before sendfile/file-stream validates the same segment at the socket boundary.
   """
   @spec get_with_file_ref(FerricStore.Instance.t(), binary()) ::
           {:hot, binary()}
           | {:cold_ref, binary(), non_neg_integer(), non_neg_integer()}
           | {:cold_value, binary()}
           | :miss
+  def get_with_file_ref(ctx, key), do: do_get_with_file_ref(ctx, key, false)
+
+  @doc false
+  @spec get_with_deferred_blob_file_ref(FerricStore.Instance.t(), binary()) ::
+          {:hot, binary()}
+          | {:cold_ref, binary(), non_neg_integer(), non_neg_integer()}
+          | {:cold_value, binary()}
+          | :miss
+  def get_with_deferred_blob_file_ref(ctx, key), do: do_get_with_file_ref(ctx, key, true)
+
   @spec get_with_file_ref(FerricStore.Instance.t(), binary(), keyword()) ::
           {:hot, binary()}
           | {:cold_ref, binary(), non_neg_integer(), non_neg_integer()}
           | {:cold_value, binary()}
           | :miss
-  def get_with_file_ref(ctx, key, opts \\ []) do
+  def get_with_file_ref(ctx, key, opts) when is_list(opts) do
+    defer_blob_validation? = Keyword.get(opts, :defer_blob_file_ref_validation?, false) == true
+    do_get_with_file_ref(ctx, key, defer_blob_validation?)
+  end
+
+  defp do_get_with_file_ref(ctx, key, defer_blob_validation?) do
     idx = shard_for(ctx, key)
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
-    defer_blob_validation? = Keyword.get(opts, :defer_blob_file_ref_validation?, false) == true
 
     case ets_get_full(ctx, idx, keydir, key, now) do
       {:hit, value, lfu} ->
