@@ -71,8 +71,12 @@ defmodule Ferricstore.Store.BlobStore do
 
   @doc "Reads and validates a blob by ref."
   @spec get(binary(), non_neg_integer(), BlobRef.t()) :: {:ok, binary()} | {:error, reason()}
-  def get(data_dir, shard_index, %BlobRef{version: 1} = ref)
+  def get(data_dir, shard_index, %BlobRef{} = ref)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    if BlobRef.valid?(ref), do: do_get(data_dir, shard_index, ref), else: invalid_blob_ref()
+  end
+
+  defp do_get(data_dir, shard_index, %BlobRef{version: 1} = ref) do
     path = BlobRef.path(data_dir, shard_index, ref)
 
     result =
@@ -92,8 +96,7 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  def get(data_dir, shard_index, %BlobRef{version: 2, size: size, offset: offset} = ref)
-      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+  defp do_get(data_dir, shard_index, %BlobRef{version: 2, size: size, offset: offset} = ref) do
     path = BlobRef.path(data_dir, shard_index, ref)
     result = read_segment_payload(path, offset, size, ref)
 
@@ -139,9 +142,13 @@ defmodule Ferricstore.Store.BlobStore do
   @spec verify(binary(), non_neg_integer(), BlobRef.t()) :: :ok | {:error, reason()}
   def verify(data_dir, shard_index, %BlobRef{} = ref)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
-    case Process.get(:ferricstore_blob_store_verify_hook) do
-      fun when is_function(fun, 3) -> normalize_verify(fun.(data_dir, shard_index, ref))
-      _other -> do_verify(data_dir, shard_index, ref)
+    if BlobRef.valid?(ref) do
+      case Process.get(:ferricstore_blob_store_verify_hook) do
+        fun when is_function(fun, 3) -> normalize_verify(fun.(data_dir, shard_index, ref))
+        _other -> do_verify(data_dir, shard_index, ref)
+      end
+    else
+      invalid_blob_ref()
     end
   end
 
@@ -197,6 +204,8 @@ defmodule Ferricstore.Store.BlobStore do
   defp normalize_verify({:error, _reason} = error), do: error
   defp normalize_verify(other), do: {:error, other}
 
+  defp invalid_blob_ref, do: {:error, :invalid_blob_ref}
+
   @doc """
   Verifies a batch of refs, validating duplicate refs once.
 
@@ -229,14 +238,19 @@ defmodule Ferricstore.Store.BlobStore do
     refs
     |> Enum.reduce_while({:ok, MapSet.new()}, fn
       %BlobRef{} = ref, {:ok, seen} ->
-        if MapSet.member?(seen, ref) do
-          {:cont, {:ok, seen}}
-        else
-          case verifier.(data_dir, shard_index, ref) do
-            :ok -> {:cont, {:ok, MapSet.put(seen, ref)}}
-            {:error, reason} -> {:halt, {:error, reason}}
-            other -> {:halt, {:error, other}}
-          end
+        cond do
+          not BlobRef.valid?(ref) ->
+            {:halt, {:error, :invalid_blob_ref}}
+
+          MapSet.member?(seen, ref) ->
+            {:cont, {:ok, seen}}
+
+          true ->
+            case verifier.(data_dir, shard_index, ref) do
+              :ok -> {:cont, {:ok, MapSet.put(seen, ref)}}
+              {:error, reason} -> {:halt, {:error, reason}}
+              other -> {:halt, {:error, other}}
+            end
         end
 
       _invalid, {:ok, _seen} ->
@@ -259,10 +273,15 @@ defmodule Ferricstore.Store.BlobStore do
     refs
     |> Enum.reduce_while({:ok, [], MapSet.new()}, fn
       %BlobRef{} = ref, {:ok, acc, seen} ->
-        if MapSet.member?(seen, ref) do
-          {:cont, {:ok, acc, seen}}
-        else
-          {:cont, {:ok, [ref | acc], MapSet.put(seen, ref)}}
+        cond do
+          not BlobRef.valid?(ref) ->
+            {:halt, {:error, :invalid_blob_ref}}
+
+          MapSet.member?(seen, ref) ->
+            {:cont, {:ok, acc, seen}}
+
+          true ->
+            {:cont, {:ok, [ref | acc], MapSet.put(seen, ref)}}
         end
 
       _invalid, {:ok, _acc, _seen} ->
@@ -350,10 +369,15 @@ defmodule Ferricstore.Store.BlobStore do
     {prepared, unique_refs, _seen} =
       Enum.reduce(refs, {[], [], MapSet.new()}, fn
         %BlobRef{} = ref, {prepared, unique_refs, seen} ->
-          if MapSet.member?(seen, ref) do
-            {[{:ref, ref} | prepared], unique_refs, seen}
-          else
-            {[{:ref, ref} | prepared], [ref | unique_refs], MapSet.put(seen, ref)}
+          cond do
+            not BlobRef.valid?(ref) ->
+              {[:invalid | prepared], unique_refs, seen}
+
+            MapSet.member?(seen, ref) ->
+              {[{:ref, ref} | prepared], unique_refs, seen}
+
+            true ->
+              {[{:ref, ref} | prepared], [ref | unique_refs], MapSet.put(seen, ref)}
           end
 
         _invalid, {prepared, unique_refs, seen} ->
@@ -543,8 +567,14 @@ defmodule Ferricstore.Store.BlobStore do
   """
   @spec file_ref(binary(), non_neg_integer(), BlobRef.t()) ::
           {:ok, {binary(), non_neg_integer(), non_neg_integer()}} | {:error, reason()}
-  def file_ref(data_dir, shard_index, %BlobRef{version: 1, size: size} = ref)
+  def file_ref(data_dir, shard_index, %BlobRef{} = ref)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    if BlobRef.valid?(ref),
+      do: do_file_ref(data_dir, shard_index, ref),
+      else: invalid_blob_ref()
+  end
+
+  defp do_file_ref(data_dir, shard_index, %BlobRef{version: 1, size: size} = ref) do
     path = BlobRef.path(data_dir, shard_index, ref)
 
     result =
@@ -562,8 +592,7 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  def file_ref(data_dir, shard_index, %BlobRef{version: 2, size: size, offset: offset} = ref)
-      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+  defp do_file_ref(data_dir, shard_index, %BlobRef{version: 2, size: size, offset: offset} = ref) do
     path = BlobRef.path(data_dir, shard_index, ref)
 
     result =
@@ -613,18 +642,32 @@ defmodule Ferricstore.Store.BlobStore do
   """
   @spec get_range(binary(), non_neg_integer(), BlobRef.t(), non_neg_integer(), non_neg_integer()) ::
           {:ok, binary()} | {:error, reason()}
-  def get_range(_data_dir, _shard_index, %BlobRef{}, _relative_offset, 0), do: {:ok, ""}
-
   def get_range(
         data_dir,
         shard_index,
-        %BlobRef{version: 1, size: size} = ref,
+        %BlobRef{} = ref,
         relative_offset,
         count
       )
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
              is_integer(relative_offset) and relative_offset >= 0 and is_integer(count) and
              count >= 0 do
+    if BlobRef.valid?(ref) do
+      do_get_range(data_dir, shard_index, ref, relative_offset, count)
+    else
+      invalid_blob_ref()
+    end
+  end
+
+  defp do_get_range(_data_dir, _shard_index, %BlobRef{}, _relative_offset, 0), do: {:ok, ""}
+
+  defp do_get_range(
+         data_dir,
+         shard_index,
+         %BlobRef{version: 1, size: size} = ref,
+         relative_offset,
+         count
+       ) do
     path = BlobRef.path(data_dir, shard_index, ref)
 
     result =
@@ -644,16 +687,13 @@ defmodule Ferricstore.Store.BlobStore do
     end
   end
 
-  def get_range(
-        data_dir,
-        shard_index,
-        %BlobRef{version: 2, size: size, offset: offset} = ref,
-        relative_offset,
-        count
-      )
-      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
-             is_integer(relative_offset) and relative_offset >= 0 and is_integer(count) and
-             count >= 0 do
+  defp do_get_range(
+         data_dir,
+         shard_index,
+         %BlobRef{version: 2, size: size, offset: offset} = ref,
+         relative_offset,
+         count
+       ) do
     path = BlobRef.path(data_dir, shard_index, ref)
 
     result =

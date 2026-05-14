@@ -103,6 +103,26 @@ defmodule Ferricstore.Store.BlobRef do
 
   def decode(_value), do: :error
 
+  @doc "Returns true when a BlobRef struct has a supported shape."
+  @spec valid?(term()) :: boolean()
+  def valid?(%__MODULE__{version: 1, size: size, checksum: checksum})
+      when is_integer(size) and size >= 0 and is_binary(checksum) and byte_size(checksum) == 32,
+      do: true
+
+  def valid?(%__MODULE__{
+        version: 2,
+        size: size,
+        segment_id: segment_id,
+        offset: offset,
+        checksum: checksum
+      })
+      when is_integer(size) and size >= 0 and is_integer(segment_id) and segment_id >= 0 and
+             is_integer(offset) and offset >= 0 and is_binary(checksum) and
+             byte_size(checksum) == 32,
+      do: true
+
+  def valid?(_ref), do: false
+
   @doc "Returns true when `value` is an encoded blob ref."
   @spec ref?(term()) :: boolean()
   def ref?(value) when is_binary(value) do

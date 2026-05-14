@@ -243,6 +243,32 @@ defmodule Ferricstore.Store.BlobStoreTest do
     refute_received {:blob_open_read, _}
   end
 
+  test "blob APIs reject malformed refs without raising", %{root: root} do
+    invalid_segment_ref = %BlobRef{
+      version: 2,
+      checksum: :binary.copy(<<0>>, 32),
+      size: 1,
+      segment_id: nil,
+      offset: 48
+    }
+
+    invalid_legacy_ref = %BlobRef{
+      version: 1,
+      checksum: "short",
+      size: 1
+    }
+
+    for ref <- [invalid_segment_ref, invalid_legacy_ref] do
+      assert {:error, :invalid_blob_ref} = BlobStore.get(root, 0, ref)
+      assert {:error, :invalid_blob_ref} = BlobStore.verify(root, 0, ref)
+      assert {:error, :invalid_blob_ref} = BlobStore.file_ref(root, 0, ref)
+      assert {:error, :invalid_blob_ref} = BlobStore.get_range(root, 0, ref, 0, 1)
+      assert [{:error, :invalid_blob_ref}] = BlobStore.get_many(root, 0, [ref])
+      assert [{:error, :invalid_blob_ref}] = BlobStore.file_refs_many(root, 0, [ref])
+      assert {:error, :invalid_blob_ref} = BlobStore.verify_many(root, 0, [ref])
+    end
+  end
+
   test "file_refs_many isolates corrupt segment headers", %{root: root} do
     first_payload = :binary.copy("a", 128)
     second_payload = :binary.copy("b", 128)
