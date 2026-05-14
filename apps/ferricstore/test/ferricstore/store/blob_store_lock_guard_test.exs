@@ -147,6 +147,26 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
              "opening the segment"
   end
 
+  test "verify_many validates segment headers with one batched pread while hashing payloads" do
+    source = File.read!(@source)
+
+    section =
+      source
+      |> source_section!(
+        "  defp verify_open_segment_refs(io, path, shard_index, refs) do",
+        "  defp prepare_get_many_refs"
+      )
+
+    assert section =~ "read_segment_headers(io, refs)",
+           "verify_many/3 should batch segment header validation before per-ref payload hashing"
+
+    assert section =~ "open_file_range_matches_ref?",
+           "verify_many/3 must still hash payload ranges in chunks for correctness"
+
+    refute section =~ "validate_open_segment_record(io",
+           "verify_many/3 should not issue one header pread per blob ref after opening the segment"
+  end
+
   test "get_many validates and reads segment refs with batched preads" do
     source = File.read!(@source)
 

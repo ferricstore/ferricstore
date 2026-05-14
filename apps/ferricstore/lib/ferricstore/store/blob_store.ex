@@ -376,26 +376,31 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp verify_open_segment_refs(io, path, shard_index, refs) do
-    Enum.reduce_while(refs, :ok, fn %BlobRef{offset: offset, size: size} = ref, :ok ->
-      result =
-        with :ok <- validate_open_segment_record(io, offset, size, ref),
-             :ok <- open_file_range_matches_ref?(io, offset, size, ref) do
-          :ok
+    header_results = read_segment_headers(io, refs)
+
+    refs
+    |> Enum.zip(header_results)
+    |> Enum.reduce_while(:ok, fn
+      {%BlobRef{offset: offset, size: size} = ref, :ok}, :ok ->
+        result = open_file_range_matches_ref?(io, offset, size, ref)
+
+        case result do
+          :ok ->
+            {:cont, :ok}
+
+          :mismatch ->
+            error = {:error, :checksum_mismatch}
+            emit_error(:verify, shard_index, path, ref, :checksum_mismatch)
+            {:halt, error}
+
+          {:error, reason} = error ->
+            emit_error(:verify, shard_index, path, ref, reason)
+            {:halt, error}
         end
 
-      case result do
-        :ok ->
-          {:cont, :ok}
-
-        :mismatch ->
-          error = {:error, :checksum_mismatch}
-          emit_error(:verify, shard_index, path, ref, :checksum_mismatch)
-          {:halt, error}
-
-        {:error, reason} = error ->
-          emit_error(:verify, shard_index, path, ref, reason)
-          {:halt, error}
-      end
+      {%BlobRef{} = ref, {:error, reason} = error}, :ok ->
+        emit_error(:verify, shard_index, path, ref, reason)
+        {:halt, error}
     end)
   end
 
