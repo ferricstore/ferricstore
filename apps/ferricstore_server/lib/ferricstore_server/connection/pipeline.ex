@@ -156,7 +156,12 @@ defmodule FerricstoreServer.Connection.Pipeline do
         if Enum.any?(results, &match?({:file_ref, _, _, _}, &1)) do
           stream_get_results(keys, lookup_keys, results, state, send_response_fn)
         else
-          send_response_fn.(state.socket, state.transport, Enum.map(results, &Encoder.encode/1))
+          send_response_fn.(
+            state.socket,
+            state.transport,
+            Encoder.encode_bulk_strings_or_nulls(results)
+          )
+
           {:continue, ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)}
         end
 
@@ -174,7 +179,12 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp dispatch_batch_get_results(keys, lookup_keys, state, send_response_fn) do
     case safe_dispatch(fn -> Router.batch_get(state.instance_ctx, lookup_keys) end) do
       {:ok, values} ->
-        send_response_fn.(state.socket, state.transport, Enum.map(values, &Encoder.encode/1))
+        send_response_fn.(
+          state.socket,
+          state.transport,
+          Encoder.encode_bulk_strings_or_nulls(values)
+        )
+
         {:continue, ConnTracking.maybe_track_read("MGET", keys, :pipeline_ok, state)}
 
       {:error, err} ->

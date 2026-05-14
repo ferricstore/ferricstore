@@ -783,13 +783,14 @@ defmodule Ferricstore.Commands.Server do
     hot_sampled = Stats.total_hot_reads()
     cold_sampled = Stats.total_cold_reads()
     hits_sampled = Stats.keyspace_hits()
-    misses = Stats.keyspace_misses()
+    misses_sampled = Stats.keyspace_misses()
 
     # Estimated actuals: sampled counters × sample rate
     hot_est = hot_sampled * rate
     cold_est = cold_sampled * rate
     hits_est = hits_sampled * rate
-    total_reads = hits_est + misses
+    misses_est = misses_sampled * rate
+    total_reads = hits_est + misses_est
     hit_ratio = if total_reads > 0, do: Float.round(hits_est / total_reads * 100, 2), else: 0.0
 
     hot_pct =
@@ -801,7 +802,7 @@ defmodule Ferricstore.Commands.Server do
       {"total_connections_received", Integer.to_string(Stats.total_connections())},
       {"total_commands_processed", Integer.to_string(Stats.total_commands())},
       {"keyspace_hits", Integer.to_string(hits_est)},
-      {"keyspace_misses", Integer.to_string(misses)},
+      {"keyspace_misses", Integer.to_string(misses_est)},
       {"keyspace_hit_ratio", format_float_field(hit_ratio)},
       {"hot_reads", Integer.to_string(hot_est)},
       {"cold_reads", Integer.to_string(cold_est)},

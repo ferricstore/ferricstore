@@ -729,7 +729,16 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, file_id, offset, value_size}
       when valid_cold_location(file_id, offset, value_size) ->
-        case file_ref_from_cold_location(ctx, idx, keydir, key, file_id, offset, value_size, now) do
+        case file_ref_from_cold_location(
+               ctx,
+               idx,
+               keydir,
+               key,
+               file_id,
+               offset,
+               value_size,
+               now
+             ) do
           {:ok, file_ref} -> file_ref
           _ -> nil
         end
@@ -742,7 +751,7 @@ defmodule Ferricstore.Store.Router do
         end
 
       :expired ->
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         nil
 
       :miss ->
@@ -824,7 +833,7 @@ defmodule Ferricstore.Store.Router do
             {:hot, value}
 
           :miss ->
-            Stats.incr_keyspace_misses(ctx)
+            Stats.sample_keyspace_misses(ctx)
             :miss
         end
 
@@ -834,12 +843,12 @@ defmodule Ferricstore.Store.Router do
         shard_file_ref_or_value(ctx, idx, key)
 
       :expired ->
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         :miss
 
       :miss ->
         # Key not in ETS = doesn't exist. No GenServer needed.
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         :miss
 
       :no_table ->
@@ -866,7 +875,7 @@ defmodule Ferricstore.Store.Router do
           Stats.record_cold_read(ctx, key)
           {:cold_value, result}
         else
-          Stats.incr_keyspace_misses(ctx)
+          Stats.sample_keyspace_misses(ctx)
           :miss
         end
     end
@@ -1220,7 +1229,7 @@ defmodule Ferricstore.Store.Router do
                 value
 
               :miss ->
-                Stats.incr_keyspace_misses(ctx)
+                Stats.sample_keyspace_misses(ctx)
                 nil
             end
         end
@@ -1236,18 +1245,18 @@ defmodule Ferricstore.Store.Router do
         if result != nil do
           Stats.record_cold_read(ctx, key)
         else
-          Stats.incr_keyspace_misses(ctx)
+          Stats.sample_keyspace_misses(ctx)
         end
 
         result
 
       :expired ->
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         nil
 
       :miss ->
         # Key not in ETS at all — doesn't exist. No GenServer needed.
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         nil
 
       :no_table ->
@@ -1261,7 +1270,7 @@ defmodule Ferricstore.Store.Router do
         if result != nil do
           Stats.record_cold_read(ctx, key)
         else
-          Stats.incr_keyspace_misses(ctx)
+          Stats.sample_keyspace_misses(ctx)
         end
 
         result
@@ -1299,17 +1308,17 @@ defmodule Ferricstore.Store.Router do
             if result != nil do
               Stats.record_cold_read(ctx, key)
             else
-              Stats.incr_keyspace_misses(ctx)
+              Stats.sample_keyspace_misses(ctx)
             end
 
             {{:value, result}, {cold_entries, cold_count}}
 
           :expired ->
-            Stats.incr_keyspace_misses(ctx)
+            Stats.sample_keyspace_misses(ctx)
             {{:value, nil}, {cold_entries, cold_count}}
 
           :miss ->
-            Stats.incr_keyspace_misses(ctx)
+            Stats.sample_keyspace_misses(ctx)
             {{:value, nil}, {cold_entries, cold_count}}
 
           :no_table ->
@@ -1322,7 +1331,7 @@ defmodule Ferricstore.Store.Router do
             if result != nil do
               Stats.record_cold_read(ctx, key)
             else
-              Stats.incr_keyspace_misses(ctx)
+              Stats.sample_keyspace_misses(ctx)
             end
 
             {{:value, result}, {cold_entries, cold_count}}
@@ -1447,17 +1456,17 @@ defmodule Ferricstore.Store.Router do
             if result != nil do
               Stats.record_cold_read(ctx, key)
             else
-              Stats.incr_keyspace_misses(ctx)
+              Stats.sample_keyspace_misses(ctx)
             end
 
             {{:value, result}, {cold_entries, cold_count, blob_ref_entries, blob_ref_count}}
 
           :expired ->
-            Stats.incr_keyspace_misses(ctx)
+            Stats.sample_keyspace_misses(ctx)
             {{:value, nil}, {cold_entries, cold_count, blob_ref_entries, blob_ref_count}}
 
           :miss ->
-            Stats.incr_keyspace_misses(ctx)
+            Stats.sample_keyspace_misses(ctx)
             {{:value, nil}, {cold_entries, cold_count, blob_ref_entries, blob_ref_count}}
 
           :no_table ->
@@ -1470,7 +1479,7 @@ defmodule Ferricstore.Store.Router do
             if result != nil do
               Stats.record_cold_read(ctx, key)
             else
-              Stats.incr_keyspace_misses(ctx)
+              Stats.sample_keyspace_misses(ctx)
             end
 
             {{:value, result}, {cold_entries, cold_count, blob_ref_entries, blob_ref_count}}
@@ -1552,7 +1561,7 @@ defmodule Ferricstore.Store.Router do
             {{:value, value}, {cold_entries, cold_count}}
 
           :miss ->
-            Stats.incr_keyspace_misses(ctx)
+            Stats.sample_keyspace_misses(ctx)
             {{:value, nil}, {cold_entries, cold_count}}
         end
     end
@@ -1774,7 +1783,7 @@ defmodule Ferricstore.Store.Router do
         value
 
       :miss ->
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         nil
     end
   end
@@ -1829,7 +1838,7 @@ defmodule Ferricstore.Store.Router do
         value
 
       {:error, _reason} ->
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         nil
     end
   end
@@ -1910,7 +1919,7 @@ defmodule Ferricstore.Store.Router do
         materialized
 
       {{ctx, _idx, _keydir, _key, _path, _file_id, _offset, _value_size}, {:error, _reason}} ->
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         nil
 
       {{ctx, idx, keydir, key, _path, file_id, offset, value_size}, {:cold_read_error, _value}} ->
@@ -1924,7 +1933,7 @@ defmodule Ferricstore.Store.Router do
             value
 
           :miss ->
-            Stats.incr_keyspace_misses(ctx)
+            Stats.sample_keyspace_misses(ctx)
             nil
         end
     end)
@@ -2208,7 +2217,7 @@ defmodule Ferricstore.Store.Router do
                 {value, retry_expire_at_ms}
 
               :miss ->
-                Stats.incr_keyspace_misses(ctx)
+                Stats.sample_keyspace_misses(ctx)
                 nil
             end
         end
@@ -2224,17 +2233,17 @@ defmodule Ferricstore.Store.Router do
         if result != nil do
           Stats.record_cold_read(ctx, key)
         else
-          Stats.incr_keyspace_misses(ctx)
+          Stats.sample_keyspace_misses(ctx)
         end
 
         result
 
       :expired ->
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         nil
 
       :miss ->
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         nil
 
       :no_table ->
@@ -2247,7 +2256,7 @@ defmodule Ferricstore.Store.Router do
         if result != nil do
           Stats.record_cold_read(ctx, key)
         else
-          Stats.incr_keyspace_misses(ctx)
+          Stats.sample_keyspace_misses(ctx)
         end
 
         result
@@ -2440,11 +2449,11 @@ defmodule Ferricstore.Store.Router do
         fallback_getrange(ctx, idx, key, start_idx, end_idx)
 
       :expired ->
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         nil
 
       :miss ->
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         nil
 
       :no_table ->
@@ -2678,7 +2687,7 @@ defmodule Ferricstore.Store.Router do
                 value
 
               :error ->
-                Stats.incr_keyspace_misses(ctx)
+                Stats.sample_keyspace_misses(ctx)
                 nil
             end
         end
@@ -2687,7 +2696,7 @@ defmodule Ferricstore.Store.Router do
         range_from_value(value, start_idx, end_idx)
 
       :miss ->
-        Stats.incr_keyspace_misses(ctx)
+        Stats.sample_keyspace_misses(ctx)
         nil
     end
   end
@@ -2723,7 +2732,7 @@ defmodule Ferricstore.Store.Router do
       Stats.record_cold_read(ctx, key)
       range_from_value(result, start_idx, end_idx)
     else
-      Stats.incr_keyspace_misses(ctx)
+      Stats.sample_keyspace_misses(ctx)
       nil
     end
   end
@@ -2791,10 +2800,7 @@ defmodule Ferricstore.Store.Router do
   # LFU counter already available from the initial ets_get_full lookup.
   # Eliminates the second ETS lookup that sampled_read_bookkeeping does.
   defp sampled_read_bookkeeping_fast(ctx, keydir, key, lfu) do
-    rate = ctx.read_sample_rate
-
-    if rate <= 1 or :rand.uniform(rate) == 1 do
-      Stats.incr_keyspace_hits(ctx)
+    if Stats.sample_keyspace_hits(ctx) > 0 do
       LFU.touch(ctx, keydir, key, lfu)
       Stats.record_hot_read(ctx, key)
     end

@@ -60,6 +60,8 @@ defmodule Ferricstore.Stats do
 
   @hotness_table :ferricstore_hotness
   @max_tracked_prefixes 1000
+  @keyspace_hit_sample_acc {__MODULE__, :keyspace_hit_sample_acc}
+  @keyspace_miss_sample_acc {__MODULE__, :keyspace_miss_sample_acc}
 
   # ---------------------------------------------------------------------------
   # Types
@@ -185,6 +187,15 @@ defmodule Ferricstore.Stats do
     :ok
   end
 
+  @doc "Increments the keyspace_hits counter using instance ctx."
+  @spec incr_keyspace_hits(FerricStore.Instance.t(), non_neg_integer()) :: :ok
+  def incr_keyspace_hits(_ctx, 0), do: :ok
+
+  def incr_keyspace_hits(ctx, count) when is_integer(count) and count > 0 do
+    :counters.add(ctx.stats_counter, @counter_keyspace_hits, count)
+    :ok
+  end
+
   @doc "Increments the keyspace_misses counter by 1."
   @spec incr_keyspace_misses() :: :ok
   def incr_keyspace_misses do
@@ -197,6 +208,80 @@ defmodule Ferricstore.Stats do
   def incr_keyspace_misses(ctx) do
     :counters.add(ctx.stats_counter, @counter_keyspace_misses, 1)
     :ok
+  end
+
+  @doc "Increments the keyspace_misses counter using instance ctx."
+  @spec incr_keyspace_misses(FerricStore.Instance.t(), non_neg_integer()) :: :ok
+  def incr_keyspace_misses(_ctx, 0), do: :ok
+
+  def incr_keyspace_misses(ctx, count) when is_integer(count) and count > 0 do
+    :counters.add(ctx.stats_counter, @counter_keyspace_misses, count)
+    :ok
+  end
+
+  @doc """
+  Samples keyspace misses using the instance read sample rate.
+
+  This mirrors hot-read sampling so miss-heavy workloads do not perform one
+  atomic counter write per failed lookup. `read_sample_rate <= 1` keeps exact
+  accounting for tests and users who explicitly disable sampling.
+  """
+  @spec sample_keyspace_misses(FerricStore.Instance.t(), non_neg_integer()) :: :ok
+  def sample_keyspace_misses(ctx, count \\ 1)
+
+  def sample_keyspace_misses(_ctx, 0), do: :ok
+
+  def sample_keyspace_misses(ctx, count) when is_integer(count) and count > 0 do
+    rate = ctx.read_sample_rate
+
+    if rate <= 1 do
+      incr_keyspace_misses(ctx, count)
+    else
+      key = {@keyspace_miss_sample_acc, ctx.stats_counter}
+      total = Process.get(key, 0) + count
+      sampled = div(total, rate)
+      remainder = rem(total, rate)
+
+      if sampled > 0 do
+        incr_keyspace_misses(ctx, sampled)
+      end
+
+      Process.put(key, remainder)
+      :ok
+    end
+  end
+
+  @doc """
+  Samples keyspace hits using the instance read sample rate.
+
+  Returns the sampled count written to the global counter. Router uses that
+  return value to run LFU/hotness updates only when a sample is actually
+  flushed. This avoids a PRNG call and a global counter write on every hot GET.
+  """
+  @spec sample_keyspace_hits(FerricStore.Instance.t(), non_neg_integer()) :: non_neg_integer()
+  def sample_keyspace_hits(ctx, count \\ 1)
+
+  def sample_keyspace_hits(_ctx, 0), do: 0
+
+  def sample_keyspace_hits(ctx, count) when is_integer(count) and count > 0 do
+    rate = ctx.read_sample_rate
+
+    if rate <= 1 do
+      incr_keyspace_hits(ctx, count)
+      count
+    else
+      key = {@keyspace_hit_sample_acc, ctx.stats_counter}
+      total = Process.get(key, 0) + count
+      sampled = div(total, rate)
+      remainder = rem(total, rate)
+
+      if sampled > 0 do
+        incr_keyspace_hits(ctx, sampled)
+      end
+
+      Process.put(key, remainder)
+      sampled
+    end
   end
 
   @doc "Returns the total number of successful key lookups since startup."

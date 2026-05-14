@@ -39,9 +39,20 @@ defmodule FerricstoreServer.Resp.Encoder do
 
   @crlf "\r\n"
   @ok_response "+OK\r\n"
+  @null_response "_\r\n"
 
   @doc "Pre-encoded `+OK\\r\\n` binary for batch responses."
   def ok_response, do: @ok_response
+
+  @doc """
+  Encodes a batch of GET/MGET result values.
+
+  The read pipeline only uses this for `binary | nil` results after file-ref
+  streaming has been ruled out. Keeping that contract explicit avoids generic
+  encoder dispatch for every value in large hot-read pipelines.
+  """
+  @spec encode_bulk_strings_or_nulls([binary() | nil]) :: iodata()
+  def encode_bulk_strings_or_nulls(values), do: encode_bulk_strings_or_nulls(values, [])
 
   @type encodable ::
           :ok
@@ -125,7 +136,7 @@ defmodule FerricstoreServer.Resp.Encoder do
     ["(", Integer.to_string(value), @crlf]
   end
 
-  def encode(nil), do: ["_", @crlf]
+  def encode(nil), do: @null_response
 
   def encode(true), do: ["#t", @crlf]
 
@@ -180,6 +191,17 @@ defmodule FerricstoreServer.Resp.Encoder do
 
   defp encode_map_pairs(map) do
     Enum.map(map, fn {key, value} -> [encode(key), encode(value)] end)
+  end
+
+  defp encode_bulk_strings_or_nulls([], acc), do: Enum.reverse(acc)
+
+  defp encode_bulk_strings_or_nulls([nil | rest], acc) do
+    encode_bulk_strings_or_nulls(rest, [@null_response | acc])
+  end
+
+  defp encode_bulk_strings_or_nulls([value | rest], acc) when is_binary(value) do
+    encoded = ["$", :erlang.integer_to_binary(byte_size(value)), @crlf, value, @crlf]
+    encode_bulk_strings_or_nulls(rest, [encoded | acc])
   end
 
   defp validate_no_crlf!(str, type) do

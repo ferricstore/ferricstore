@@ -186,6 +186,15 @@ defmodule FerricstoreServer.Resp.EncoderTest do
     end
   end
 
+  describe "encode bulk string result batches" do
+    test "encodes GET-style binary and nil values in order" do
+      values = ["hello", nil, "", "a\r\nb", <<0, 1, 2>>]
+
+      assert to_binary(Encoder.encode_bulk_strings_or_nulls(values)) ==
+               "$5\r\nhello\r\n_\r\n$0\r\n\r\n$4\r\na\r\nb\r\n$3\r\n\x00\x01\x02\r\n"
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Boolean
   # ---------------------------------------------------------------------------

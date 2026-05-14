@@ -185,7 +185,7 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     id_b = "pipe_flow_read_b_#{System.unique_integer([:positive])}"
     handler_id = {:pipeline_flow_read_batch, self(), make_ref()}
 
-    assert {:ok, _created_a} =
+    assert :ok =
              FerricStore.flow_create(id_a,
                type: "pipeline-flow-read",
                state: "queued",
@@ -194,7 +194,7 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
                run_at_ms: 1
              )
 
-    assert {:ok, _created_b} =
+    assert :ok =
              FerricStore.flow_create(id_b,
                type: "pipeline-flow-read",
                state: "queued",
@@ -248,14 +248,16 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     child = "pipe_flow_child_#{System.unique_integer([:positive])}"
     {parent_partition, child_partition} = different_flow_partitions()
 
-    assert {:ok, created_parent} =
+    assert :ok =
              FerricStore.flow_create(parent,
                type: "pipeline-parent",
                state: "dispatch",
                partition_key: parent_partition
              )
 
-    assert {:ok, waiting} =
+    assert {:ok, created_parent} = FerricStore.flow_get(parent, partition_key: parent_partition)
+
+    assert :ok =
              FerricStore.flow_spawn_children(
                parent,
                [%{id: child, type: "pipeline-child", partition_key: child_partition}],
@@ -269,6 +271,8 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
                from_state: "dispatch",
                fencing_token: created_parent.fencing_token
              )
+
+    assert {:ok, waiting} = FerricStore.flow_get(parent, partition_key: parent_partition)
 
     assert waiting.state == "waiting_children"
 

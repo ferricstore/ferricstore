@@ -521,16 +521,17 @@ defmodule FerricstoreServer.Health.Dashboard do
   defp collect_hotcold do
     rate = :persistent_term.get(:ferricstore_read_sample_rate, 100)
     _hits_sampled = Stats.keyspace_hits()
-    misses = Stats.keyspace_misses()
+    misses_sampled = Stats.keyspace_misses()
     hot_sampled = Stats.total_hot_reads()
     cold_sampled = Stats.total_cold_reads()
 
-    # hot_reads and keyspace_hits are sampled; cold_reads and misses are exact
+    # hot_reads, keyspace_hits, and keyspace_misses are sampled; cold_reads are exact.
     hot_est = hot_sampled * rate
+    misses_est = misses_sampled * rate
     # NOT sampled -- called on every cold read
     cold_exact = cold_sampled
     total_hits = hot_est + cold_exact
-    total_lookups = total_hits + misses
+    total_lookups = total_hits + misses_est
 
     uptime = max(Stats.uptime_seconds(), 1)
 
@@ -540,7 +541,7 @@ defmodule FerricstoreServer.Health.Dashboard do
       total_hot: hot_est,
       total_cold: cold_exact,
       total_hits: total_hits,
-      total_misses: misses,
+      total_misses: misses_est,
       total_lookups: total_lookups,
       hit_ratio:
         if(total_lookups > 0, do: Float.round(total_hits / total_lookups * 100, 1), else: 0.0),
@@ -549,7 +550,7 @@ defmodule FerricstoreServer.Health.Dashboard do
         if(total_hits > 0, do: Float.round(cold_exact / total_hits * 100, 1), else: 0.0),
       sample_rate: rate,
       hits_per_sec: Float.round(total_hits / uptime, 1),
-      misses_per_sec: Float.round(misses / uptime, 1),
+      misses_per_sec: Float.round(misses_est / uptime, 1),
       ops_per_sec: Float.round(Stats.total_commands() / uptime, 1),
       top_prefixes: Stats.hotness_top(10)
     }
