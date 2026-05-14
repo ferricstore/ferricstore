@@ -142,7 +142,8 @@ defmodule Ferricstore.Store.BlobValue do
   end
 
   defp externalize?(value, threshold) do
-    byte_size(value) >= threshold or BlobRef.ref?(value)
+    size = byte_size(value)
+    size >= threshold or (BlobRef.encoded_size?(size) and BlobRef.ref?(value))
   end
 
   defp prepare_materialize_batch(values) do

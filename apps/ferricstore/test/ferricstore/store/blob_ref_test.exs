@@ -50,6 +50,7 @@ defmodule Ferricstore.Store.BlobRefTest do
     encoded = BlobRef.encode!(ref)
 
     assert :error == BlobRef.decode("abc")
+    refute BlobRef.ref?(<<0, "FSBLOB", 2, "too-short">>)
     assert :error == BlobRef.decode(binary_part(encoded, 0, byte_size(encoded) - 1))
     assert :error == BlobRef.decode(encoded <> <<0>>)
     assert :error == BlobRef.decode(<<0, "FSBLOB", 2, 3::64, ref.checksum::binary>>)

@@ -105,7 +105,10 @@ defmodule Ferricstore.Store.BlobRef do
 
   @doc "Returns true when `value` is an encoded blob ref."
   @spec ref?(term()) :: boolean()
-  def ref?(value) when is_binary(value), do: match?({:ok, _ref}, decode(value))
+  def ref?(value) when is_binary(value) do
+    encoded_size?(byte_size(value)) and match?({:ok, _ref}, decode(value))
+  end
+
   def ref?(_value), do: false
 
   @doc "Verifies that payload bytes match a ref's checksum and size."

@@ -12,6 +12,22 @@ defmodule Ferricstore.Store.BlobValueTest do
     %{root: root}
   end
 
+  test "maybe_externalize keeps non-ref-sized small values inline" do
+    value = "small-value"
+
+    assert {:ok, ^value} = BlobValue.maybe_externalize("root", 0, 1024, value)
+  end
+
+  test "maybe_externalize still externalizes small ref-shaped user values", %{root: root} do
+    payload = BlobRef.encode!(BlobRef.from_segment("payload", 0, 48))
+
+    assert byte_size(payload) < 1024
+    assert {:ok, encoded_ref} = BlobValue.maybe_externalize(root, 0, 1024, payload)
+    assert encoded_ref != payload
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
+  end
+
   test "maybe_materialize_many loads duplicate encoded refs once" do
     parent = self()
     payload = :binary.copy("shared", 32)
