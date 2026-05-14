@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.BatchOperationsTest do
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.{CompoundKey, Router}
 
   @ns_batch "batch_test_batch"
@@ -20,6 +21,32 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
   defp ctx, do: Process.get(:test_ctx)
   defp default_ctx, do: FerricStore.Instance.get(:default)
+
+  defp two_shard_keys(prefix, keys_per_shard) do
+    ctx = default_ctx()
+
+    grouped =
+      1..100_000
+      |> Enum.reduce_while(%{}, fn i, acc ->
+        key = "#{prefix}:#{i}:#{System.unique_integer([:positive])}"
+        shard_idx = Router.shard_for(ctx, key)
+        next = Map.update(acc, shard_idx, [key], fn keys -> [key | keys] end)
+
+        ready =
+          next
+          |> Enum.filter(fn {_idx, keys} -> length(keys) >= keys_per_shard end)
+          |> Enum.take(2)
+
+        if length(ready) == 2 do
+          {:halt, ready}
+        else
+          {:cont, next}
+        end
+      end)
+
+    assert [{idx_a, keys_a}, {idx_b, keys_b}] = grouped
+    {idx_a, Enum.take(keys_a, keys_per_shard), idx_b, Enum.take(keys_b, keys_per_shard)}
+  end
 
   # ---------------------------------------------------------------------------
   # batch_put
@@ -147,6 +174,72 @@ defmodule Ferricstore.Store.BatchOperationsTest do
 
     test "empty quorum batch returns empty list" do
       assert [] = Router.batch_quorum_put(default_ctx(), [])
+    end
+
+    test "direct quorum SET batch maps mixed shard replies back to input order" do
+      {paused_idx, [blocked_a, blocked_b], _ok_idx, [ok_a, ok_b]} =
+        two_shard_keys("quorum_order_put", 2)
+
+      assert :ok = Batcher.pause_writes_for_sync(paused_idx)
+
+      on_exit(fn ->
+        _ = Batcher.resume_writes_for_sync(paused_idx)
+      end)
+
+      assert [
+               :ok,
+               {:error, "ERR shard writes paused for sync"},
+               :ok,
+               {:error, "ERR shard writes paused for sync"}
+             ] =
+               Router.batch_quorum_put(default_ctx(), [
+                 {ok_a, "ok-a"},
+                 {blocked_a, "blocked-a"},
+                 {ok_b, "ok-b"},
+                 {blocked_b, "blocked-b"}
+               ])
+
+      assert "ok-a" == Router.get(default_ctx(), ok_a)
+      assert "ok-b" == Router.get(default_ctx(), ok_b)
+      assert nil == Router.get(default_ctx(), blocked_a)
+      assert nil == Router.get(default_ctx(), blocked_b)
+    end
+
+    test "direct quorum DELETE batch maps mixed shard replies back to input order" do
+      {paused_idx, [blocked_a, blocked_b], _ok_idx, [ok_a, ok_b]} =
+        two_shard_keys("quorum_order_delete", 2)
+
+      assert [:ok, :ok, :ok, :ok] =
+               Router.batch_quorum_put(default_ctx(), [
+                 {ok_a, "ok-a"},
+                 {blocked_a, "blocked-a"},
+                 {ok_b, "ok-b"},
+                 {blocked_b, "blocked-b"}
+               ])
+
+      assert :ok = Batcher.pause_writes_for_sync(paused_idx)
+
+      on_exit(fn ->
+        _ = Batcher.resume_writes_for_sync(paused_idx)
+      end)
+
+      assert [
+               :ok,
+               {:error, "ERR shard writes paused for sync"},
+               :ok,
+               {:error, "ERR shard writes paused for sync"}
+             ] =
+               Router.batch_quorum_delete(default_ctx(), [
+                 ok_a,
+                 blocked_a,
+                 ok_b,
+                 blocked_b
+               ])
+
+      assert nil == Router.get(default_ctx(), ok_a)
+      assert nil == Router.get(default_ctx(), ok_b)
+      assert "blocked-a" == Router.get(default_ctx(), blocked_a)
+      assert "blocked-b" == Router.get(default_ctx(), blocked_b)
     end
 
     test "mixed prefixes preserve result order on quorum path" do

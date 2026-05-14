@@ -112,6 +112,30 @@ defmodule Ferricstore.Store.RouterTest do
       refute :by_shard_keys in delete_vars
       refute :keys_map in delete_vars
     end
+
+    test "put/delete direct grouping uses fixed shard buckets instead of map updates" do
+      source = File.read!("lib/ferricstore/store/router.ex")
+      {:ok, ast} = Code.string_to_quoted(source)
+
+      assert private_function_present?(ast, :group_put_entries_by_fixed_shard_buckets, 2)
+      assert private_function_present?(ast, :group_delete_keys_by_fixed_shard_buckets, 2)
+
+      for function_name <- [
+            :group_put_entries_by_fixed_shard_buckets,
+            :group_delete_keys_by_fixed_shard_buckets
+          ] do
+        remote_calls = private_function_remote_calls(ast, function_name, 2)
+
+        refute {Map, :get} in remote_calls,
+               "#{function_name}/2 should not use Map.get on the per-key hot grouping path"
+
+        refute {Map, :put} in remote_calls,
+               "#{function_name}/2 should not use Map.put on the per-key hot grouping path"
+
+        assert {Kernel, :put_elem} in remote_calls,
+               "#{function_name}/2 should group into fixed tuple buckets"
+      end
+    end
   end
 
   describe "async list timeout classification" do
@@ -193,5 +217,56 @@ defmodule Ferricstore.Store.RouterTest do
       end)
 
     MapSet.to_list(vars)
+  end
+
+  defp private_function_present?(ast, function_name, arity) do
+    {_ast, found?} =
+      Macro.prewalk(ast, false, fn
+        {:defp, _meta, [{^function_name, _call_meta, args}, _body]} = node, _acc
+        when length(args) == arity ->
+          {node, true}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    found?
+  end
+
+  defp private_function_remote_calls(ast, function_name, arity) do
+    {_ast, calls} =
+      Macro.prewalk(ast, MapSet.new(), fn
+        {:defp, _meta, [{^function_name, _call_meta, args}, body]} = node, acc
+        when length(args) == arity ->
+          {_body, function_calls} =
+            Macro.prewalk(body, MapSet.new(), fn
+              {{:., _dot_meta, [{:__aliases__, _alias_meta, module_parts}, call_name]},
+               _call_meta, _args} = call_node,
+              call_acc
+              when is_atom(call_name) ->
+                module = Module.concat(module_parts)
+                {call_node, MapSet.put(call_acc, {module, call_name})}
+
+              {{:., _dot_meta, [{module, _module_meta, context}, call_name]}, _call_meta, _args} =
+                  call_node,
+              call_acc
+              when is_atom(module) and is_atom(context) and is_atom(call_name) ->
+                {call_node, MapSet.put(call_acc, {module, call_name})}
+
+              {call_name, _call_meta, args} = call_node, call_acc
+              when is_atom(call_name) and is_list(args) ->
+                {call_node, MapSet.put(call_acc, {Kernel, call_name})}
+
+              call_node, call_acc ->
+                {call_node, call_acc}
+            end)
+
+          {node, MapSet.union(acc, function_calls)}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    MapSet.to_list(calls)
   end
 end
