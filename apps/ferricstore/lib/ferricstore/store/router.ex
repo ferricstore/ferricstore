@@ -1280,23 +1280,41 @@ defmodule Ferricstore.Store.Router do
   @spec batch_get(FerricStore.Instance.t(), [binary()]) :: [binary() | nil]
   def batch_get(ctx, keys) do
     now = HLC.now_ms()
+    hit_sampler = Stats.start_keyspace_hit_batch(ctx, length(keys))
 
-    {results, {cold_entries, _cold_count}} =
-      Enum.map_reduce(keys, {[], 0}, fn key, {cold_entries, cold_count} ->
+    {results, {cold_entries, _cold_count, sampled_hit_entries, hit_sampler}} =
+      Enum.map_reduce(keys, {[], 0, [], hit_sampler}, fn key,
+                                                         {cold_entries, cold_count,
+                                                          sampled_hit_entries, hit_sampler} ->
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
 
         case ets_get_full(ctx, idx, keydir, key, now) do
           {:hit, value, lfu} ->
-            sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
-            {{:value, value}, {cold_entries, cold_count}}
+            {sampled_hit_entries, hit_sampler} =
+              case hit_sampler do
+                {:exact, count} ->
+                  LFU.touch(ctx, keydir, key, lfu)
+                  Stats.record_hot_read(ctx, key)
+                  {sampled_hit_entries, {:exact, count + 1}}
+
+                {:sampled_no_touch, rate, previous, count} ->
+                  {sampled_hit_entries, {:sampled_no_touch, rate, previous, count + 1}}
+
+                sampler ->
+                  sample_batch_hit(sampler, sampled_hit_entries, {keydir, key, lfu})
+              end
+
+            {{:value, value}, {cold_entries, cold_count, sampled_hit_entries, hit_sampler}}
 
           {:cold, file_id, offset, value_size}
           when valid_cold_location(file_id, offset, value_size) ->
             path = cold_file_path(ctx, idx, file_id)
 
             entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
-            {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
+
+            {{:cold, cold_count},
+             {[entry | cold_entries], cold_count + 1, sampled_hit_entries, hit_sampler}}
 
           {:cold, _file_id, _offset, _value_size} ->
             result =
@@ -1311,15 +1329,15 @@ defmodule Ferricstore.Store.Router do
               Stats.sample_keyspace_misses(ctx)
             end
 
-            {{:value, result}, {cold_entries, cold_count}}
+            {{:value, result}, {cold_entries, cold_count, sampled_hit_entries, hit_sampler}}
 
           :expired ->
             Stats.sample_keyspace_misses(ctx)
-            {{:value, nil}, {cold_entries, cold_count}}
+            {{:value, nil}, {cold_entries, cold_count, sampled_hit_entries, hit_sampler}}
 
           :miss ->
             Stats.sample_keyspace_misses(ctx)
-            {{:value, nil}, {cold_entries, cold_count}}
+            {{:value, nil}, {cold_entries, cold_count, sampled_hit_entries, hit_sampler}}
 
           :no_table ->
             result =
@@ -1334,9 +1352,11 @@ defmodule Ferricstore.Store.Router do
               Stats.sample_keyspace_misses(ctx)
             end
 
-            {{:value, result}, {cold_entries, cold_count}}
+            {{:value, result}, {cold_entries, cold_count, sampled_hit_entries, hit_sampler}}
         end
       end)
+
+    sampled_read_bookkeeping_batch(ctx, Enum.reverse(sampled_hit_entries), hit_sampler)
 
     cold_values =
       cold_entries
@@ -1393,39 +1413,63 @@ defmodule Ferricstore.Store.Router do
 
   defp do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, defer_blob_validation?) do
     now = HLC.now_ms()
+    hit_sampler = Stats.start_keyspace_hit_batch(ctx, length(keys))
 
-    {results, {cold_entries, _cold_count, blob_ref_entries, _blob_ref_count}} =
-      Enum.map_reduce(keys, {[], 0, [], 0}, fn key,
-                                               {cold_entries, cold_count, blob_ref_entries,
-                                                blob_ref_count} ->
+    {results,
+     {cold_entries, _cold_count, blob_ref_entries, _blob_ref_count, sampled_hit_entries,
+      hit_sampler}} =
+      Enum.map_reduce(keys, {[], 0, [], 0, [], hit_sampler}, fn key,
+                                                                {cold_entries, cold_count,
+                                                                 blob_ref_entries, blob_ref_count,
+                                                                 sampled_hit_entries, hit_sampler} ->
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
 
         case ets_get_full(ctx, idx, keydir, key, now) do
           {:hit, value, lfu} ->
-            sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
-            {{:value, value}, {cold_entries, cold_count, blob_ref_entries, blob_ref_count}}
+            {sampled_hit_entries, hit_sampler} =
+              case hit_sampler do
+                {:exact, count} ->
+                  LFU.touch(ctx, keydir, key, lfu)
+                  Stats.record_hot_read(ctx, key)
+                  {sampled_hit_entries, {:exact, count + 1}}
+
+                {:sampled_no_touch, rate, previous, count} ->
+                  {sampled_hit_entries, {:sampled_no_touch, rate, previous, count + 1}}
+
+                sampler ->
+                  sample_batch_hit(sampler, sampled_hit_entries, {keydir, key, lfu})
+              end
+
+            {{:value, value},
+             {cold_entries, cold_count, blob_ref_entries, blob_ref_count, sampled_hit_entries,
+              hit_sampler}}
 
           {:cold, file_id, offset, value_size}
           when valid_cold_location(file_id, offset, value_size) ->
             path = cold_file_path(ctx, idx, file_id)
 
             if blob_file_ref_batch_candidate?(ctx, value_size) do
-              blob_file_ref_batch_entry(
-                ctx,
-                idx,
-                keydir,
-                key,
-                path,
-                file_id,
-                offset,
-                value_size,
-                min_file_ref_size,
-                cold_entries,
-                cold_count,
-                blob_ref_entries,
-                blob_ref_count
-              )
+              {result, {cold_entries, cold_count, blob_ref_entries, blob_ref_count}} =
+                blob_file_ref_batch_entry(
+                  ctx,
+                  idx,
+                  keydir,
+                  key,
+                  path,
+                  file_id,
+                  offset,
+                  value_size,
+                  min_file_ref_size,
+                  cold_entries,
+                  cold_count,
+                  blob_ref_entries,
+                  blob_ref_count
+                )
+
+              {result,
+               {cold_entries, cold_count, blob_ref_entries, blob_ref_count, sampled_hit_entries,
+                hit_sampler}}
             else
               {result, {cold_entries, cold_count}} =
                 maybe_regular_file_ref_or_cold_entry(
@@ -1443,7 +1487,9 @@ defmodule Ferricstore.Store.Router do
                   now
                 )
 
-              {result, {cold_entries, cold_count, blob_ref_entries, blob_ref_count}}
+              {result,
+               {cold_entries, cold_count, blob_ref_entries, blob_ref_count, sampled_hit_entries,
+                hit_sampler}}
             end
 
           {:cold, _file_id, _offset, _value_size} ->
@@ -1459,15 +1505,23 @@ defmodule Ferricstore.Store.Router do
               Stats.sample_keyspace_misses(ctx)
             end
 
-            {{:value, result}, {cold_entries, cold_count, blob_ref_entries, blob_ref_count}}
+            {{:value, result},
+             {cold_entries, cold_count, blob_ref_entries, blob_ref_count, sampled_hit_entries,
+              hit_sampler}}
 
           :expired ->
             Stats.sample_keyspace_misses(ctx)
-            {{:value, nil}, {cold_entries, cold_count, blob_ref_entries, blob_ref_count}}
+
+            {{:value, nil},
+             {cold_entries, cold_count, blob_ref_entries, blob_ref_count, sampled_hit_entries,
+              hit_sampler}}
 
           :miss ->
             Stats.sample_keyspace_misses(ctx)
-            {{:value, nil}, {cold_entries, cold_count, blob_ref_entries, blob_ref_count}}
+
+            {{:value, nil},
+             {cold_entries, cold_count, blob_ref_entries, blob_ref_count, sampled_hit_entries,
+              hit_sampler}}
 
           :no_table ->
             result =
@@ -1482,9 +1536,13 @@ defmodule Ferricstore.Store.Router do
               Stats.sample_keyspace_misses(ctx)
             end
 
-            {{:value, result}, {cold_entries, cold_count, blob_ref_entries, blob_ref_count}}
+            {{:value, result},
+             {cold_entries, cold_count, blob_ref_entries, blob_ref_count, sampled_hit_entries,
+              hit_sampler}}
         end
       end)
+
+    sampled_read_bookkeeping_batch(ctx, Enum.reverse(sampled_hit_entries), hit_sampler)
 
     cold_values =
       cold_entries
@@ -2804,6 +2862,35 @@ defmodule Ferricstore.Store.Router do
       LFU.touch(ctx, keydir, key, lfu)
       Stats.record_hot_read(ctx, key)
     end
+  end
+
+  @compile {:inline, sample_batch_hit: 3}
+  defp sample_batch_hit(
+         {:sampled_touch, rate, previous, count, next_sample_offset},
+         sampled_hits,
+         hit
+       ) do
+    next_count = count + 1
+
+    if next_count == next_sample_offset do
+      {[hit | sampled_hits],
+       {:sampled_touch, rate, previous, next_count, next_sample_offset + rate}}
+    else
+      {sampled_hits, {:sampled_touch, rate, previous, next_count, next_sample_offset}}
+    end
+  end
+
+  defp sampled_read_bookkeeping_batch(ctx, sampled_hits, hit_sampler) do
+    Stats.finish_keyspace_hit_batch(ctx, hit_sampler)
+    touch_sampled_hits(ctx, sampled_hits)
+  end
+
+  defp touch_sampled_hits(_ctx, []), do: :ok
+
+  defp touch_sampled_hits(ctx, [{keydir, key, lfu} | rest]) do
+    LFU.touch(ctx, keydir, key, lfu)
+    Stats.record_hot_read(ctx, key)
+    touch_sampled_hits(ctx, rest)
   end
 
   # After a cold read, promote the value back to ETS (hot) if it fits
@@ -5286,18 +5373,36 @@ defmodule Ferricstore.Store.Router do
     idx = shard_for(ctx, redis_key)
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
+    hit_sampler = Stats.start_keyspace_hit_batch(ctx, length(compound_keys))
 
-    {results, fallback_keys} =
-      Enum.map_reduce(compound_keys, [], fn compound_key, fallback_keys ->
+    {results, {fallback_keys, sampled_hit_entries, hit_sampler}} =
+      Enum.map_reduce(compound_keys, {[], [], hit_sampler}, fn compound_key,
+                                                               {fallback_keys,
+                                                                sampled_hit_entries, hit_sampler} ->
         case ets_get_full(ctx, idx, keydir, compound_key, now) do
           {:hit, value, lfu} ->
-            sampled_read_bookkeeping_fast(ctx, keydir, compound_key, lfu)
-            {{:value, value}, fallback_keys}
+            {sampled_hit_entries, hit_sampler} =
+              case hit_sampler do
+                {:exact, count} ->
+                  LFU.touch(ctx, keydir, compound_key, lfu)
+                  Stats.record_hot_read(ctx, compound_key)
+                  {sampled_hit_entries, {:exact, count + 1}}
+
+                {:sampled_no_touch, rate, previous, count} ->
+                  {sampled_hit_entries, {:sampled_no_touch, rate, previous, count + 1}}
+
+                sampler ->
+                  sample_batch_hit(sampler, sampled_hit_entries, {keydir, compound_key, lfu})
+              end
+
+            {{:value, value}, {fallback_keys, sampled_hit_entries, hit_sampler}}
 
           _ ->
-            {:fallback, [compound_key | fallback_keys]}
+            {:fallback, {[compound_key | fallback_keys], sampled_hit_entries, hit_sampler}}
         end
       end)
+
+    sampled_read_bookkeeping_batch(ctx, Enum.reverse(sampled_hit_entries), hit_sampler)
 
     fallback_values =
       case fallback_keys do

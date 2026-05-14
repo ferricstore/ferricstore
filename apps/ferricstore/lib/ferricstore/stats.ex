@@ -284,6 +284,60 @@ defmodule Ferricstore.Stats do
     end
   end
 
+  @doc false
+  @spec start_keyspace_hit_batch(FerricStore.Instance.t(), non_neg_integer()) ::
+          {:exact, non_neg_integer()}
+          | {:sampled_no_touch, pos_integer(), non_neg_integer(), non_neg_integer()}
+          | {:sampled_touch, pos_integer(), non_neg_integer(), non_neg_integer(), pos_integer()}
+  def start_keyspace_hit_batch(ctx, max_hits) when is_integer(max_hits) and max_hits >= 0 do
+    rate = ctx.read_sample_rate
+
+    if rate <= 1 do
+      {:exact, 0}
+    else
+      key = {@keyspace_hit_sample_acc, ctx.stats_counter}
+      previous = Process.get(key, 0)
+      next_sample_offset = rate - previous
+
+      if max_hits < next_sample_offset do
+        {:sampled_no_touch, rate, previous, 0}
+      else
+        {:sampled_touch, rate, previous, 0, next_sample_offset}
+      end
+    end
+  end
+
+  @doc false
+  @spec finish_keyspace_hit_batch(
+          FerricStore.Instance.t(),
+          {:exact, non_neg_integer()}
+          | {:sampled_no_touch, pos_integer(), non_neg_integer(), non_neg_integer()}
+          | {:sampled_touch, pos_integer(), non_neg_integer(), non_neg_integer(), pos_integer()}
+        ) :: :ok
+  def finish_keyspace_hit_batch(_ctx, {:exact, 0}), do: :ok
+
+  def finish_keyspace_hit_batch(ctx, {:exact, count}) do
+    incr_keyspace_hits(ctx, count)
+  end
+
+  def finish_keyspace_hit_batch(ctx, {:sampled_no_touch, rate, previous, count}) do
+    key = {@keyspace_hit_sample_acc, ctx.stats_counter}
+    Process.put(key, rem(previous + count, rate))
+    :ok
+  end
+
+  def finish_keyspace_hit_batch(ctx, {:sampled_touch, rate, previous, count, _next_sample_offset}) do
+    sampled = div(previous + count, rate)
+
+    if sampled > 0 do
+      incr_keyspace_hits(ctx, sampled)
+    end
+
+    key = {@keyspace_hit_sample_acc, ctx.stats_counter}
+    Process.put(key, rem(previous + count, rate))
+    :ok
+  end
+
   @doc "Returns the total number of successful key lookups since startup."
   @spec keyspace_hits() :: non_neg_integer()
   def keyspace_hits, do: counter_get(@counter_keyspace_hits)
