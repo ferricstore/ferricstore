@@ -147,6 +147,47 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     end
   end
 
+  test "encrypted segment blob stream validates header without pre-reading payload twice" do
+    root = tmp_blob_root!()
+    chunk_bytes = Sendfile.file_stream_chunk_bytes()
+    value = IO.iodata_to_binary([:binary.copy("s", chunk_bytes), :binary.copy("t", 19)])
+    assert {:ok, ref} = BlobStore.put(root, 0, value)
+    assert {:ok, {path, offset, size}} = BlobStore.file_ref(root, 0, ref)
+    assert size == byte_size(value)
+
+    parent = self()
+
+    Process.put(:ferricstore_sendfile_pread_hook, fn fd, read_offset, read_size ->
+      send(parent, {:sendfile_pread, read_offset, read_size})
+      :file.pread(fd, read_offset, read_size)
+    end)
+
+    state = %{
+      socket: self(),
+      transport: FakeTlsTransport,
+      client_id: :test_client,
+      tracking: nil
+    }
+
+    try do
+      assert {:sent, ^state} =
+               Sendfile.send_file_ref_response("blob-key", path, offset, size, state)
+
+      sends = collect_fake_tls_sends()
+      assert List.first(sends) == "$#{size}\r\n"
+      assert List.last(sends) == "\r\n"
+      assert IO.iodata_to_binary(sends |> Enum.drop(1) |> Enum.drop(-1)) == value
+
+      assert collect_sendfile_preads() == [
+               {offset - @blob_segment_header_bytes, @blob_segment_header_bytes},
+               {offset, chunk_bytes},
+               {offset + chunk_bytes, 19}
+             ]
+    after
+      Process.delete(:ferricstore_sendfile_pread_hook)
+    end
+  end
+
   test "blob file ref response rejects an opened blob file with extra bytes" do
     value = :binary.copy("b", Sendfile.threshold_bytes())
     path = write_tmp_file!(value <> "stale-extra-bytes", ".blob")
@@ -943,7 +984,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     end
   end
 
-  test "GET does not stream a corrupt large blob file ref" do
+  test "GET does not stream a large blob file ref with a corrupt segment header" do
     ctx =
       IsolatedInstance.checkout(
         shard_count: 1,
@@ -951,14 +992,19 @@ defmodule FerricstoreServer.Connection.SendfileTest do
         blob_side_channel_threshold_bytes: 128
       )
 
-    key = "large-corrupt-blob-sendfile-get"
+    key = "large-corrupt-blob-header-sendfile-get"
     value = :binary.copy("B", Sendfile.threshold_bytes() + 512)
 
     try do
       :ok = Router.put(ctx, key, value, 0)
       assert {:cold_ref, blob_path, blob_offset, size} = Router.get_with_file_ref(ctx, key)
       assert size == byte_size(value)
-      overwrite_file_range!(blob_path, blob_offset, :binary.copy("x", byte_size(value)))
+
+      overwrite_file_range!(
+        blob_path,
+        blob_offset - @blob_segment_header_bytes,
+        :binary.copy(<<0>>, @blob_segment_header_bytes)
+      )
 
       state = %{
         socket: self(),
@@ -1127,7 +1173,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
     end
   end
 
-  test "GETRANGE does not stream a corrupt large blob file ref range" do
+  test "GETRANGE does not stream a large blob file ref range with a corrupt segment header" do
     ctx =
       IsolatedInstance.checkout(
         shard_count: 1,
@@ -1135,7 +1181,7 @@ defmodule FerricstoreServer.Connection.SendfileTest do
         blob_side_channel_threshold_bytes: 128
       )
 
-    key = "large-corrupt-blob-sendfile-getrange"
+    key = "large-corrupt-blob-header-sendfile-getrange"
     value = :binary.copy("R", Sendfile.threshold_bytes() + 512)
     args = [key, "0", Integer.to_string(Sendfile.threshold_bytes())]
 
@@ -1143,7 +1189,12 @@ defmodule FerricstoreServer.Connection.SendfileTest do
       :ok = Router.put(ctx, key, value, 0)
       assert {:cold_ref, blob_path, blob_offset, size} = Router.get_with_file_ref(ctx, key)
       assert size == byte_size(value)
-      overwrite_file_range!(blob_path, blob_offset, :binary.copy("x", byte_size(value)))
+
+      overwrite_file_range!(
+        blob_path,
+        blob_offset - @blob_segment_header_bytes,
+        :binary.copy(<<0>>, @blob_segment_header_bytes)
+      )
 
       state = %{
         socket: self(),

@@ -382,7 +382,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
                  offset,
                  size,
                  validator,
-                 :verify_payload,
+                 :file_stream,
                  new_cache
                ) do
             {:ok, validated_cache} ->
@@ -790,7 +790,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
                  validate_key,
                  offset,
                  size,
-                 :verify_payload,
+                 :file_stream,
                  new_cache
                ) do
             {:ok, validated_cache} ->
@@ -886,7 +886,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
                  validate_key,
                  offset,
                  size,
-                 :verify_payload,
+                 :file_stream,
                  new_cache
                ) do
             {:ok, validated_cache} ->
@@ -1030,7 +1030,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
   end
 
   defp do_stream_file_get_open(path, fd, offset, size, validator, state) do
-    case validate_open_file_range(path, fd, offset, size, validator) do
+    case validate_open_file_range(path, fd, offset, size, validator, :file_stream) do
       :ok -> stream_file_get_open(fd, offset, size, state)
       :mismatch -> :fallback
     end
@@ -1051,7 +1051,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
   end
 
   defp do_stream_file_ref_get_open(key, path, fd, offset, size, state) do
-    case validate_open_file_ref(path, fd, key, offset, size) do
+    case validate_open_file_ref(path, fd, key, offset, size, :file_stream) do
       :ok -> stream_file_get_open(fd, offset, size, state)
       :mismatch -> :fallback
     end
@@ -1212,9 +1212,6 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   defp blob_file_ref_path?(_path), do: false
 
-  defp validate_open_file_range(path, fd, offset, size, validator),
-    do: validate_open_file_range(path, fd, offset, size, validator, :verify_payload)
-
   defp validate_open_file_range(_path, _fd, _offset, _size, :none, _mode), do: :ok
 
   defp validate_open_file_range(
@@ -1272,17 +1269,18 @@ defmodule FerricstoreServer.Connection.Sendfile do
     end
   end
 
-  # Plain TCP sendfile keeps the hot path zero-copy: the already-opened blob
-  # segment is checked for a valid record header and expected payload length,
-  # while payload checksum verification is left to write-time validation,
-  # materialized reads, and background scrub.
+  # TCP sendfile and encrypted file streaming keep the hot path one-pass: the
+  # already-opened blob segment is checked for a valid record header and
+  # expected payload length, while payload checksum verification is left to
+  # write-time validation, materialized reads, and background scrub.
   defp maybe_verify_segment_blob_payload(
          _fd,
          _value_offset,
          _value_size,
          _expected_checksum,
-         :sendfile
-       ),
+         mode
+       )
+       when mode in [:sendfile, :file_stream],
        do: :ok
 
   defp maybe_verify_segment_blob_payload(fd, value_offset, value_size, expected_checksum, _mode) do
