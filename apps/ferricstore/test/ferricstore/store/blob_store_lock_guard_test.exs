@@ -99,6 +99,27 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
              "or checksum just to build the append-segment filename"
   end
 
+  test "batched segment reads group by segment id before building paths" do
+    source = File.read!(@source)
+
+    for {name, start_marker, end_marker} <- [
+          {"verify_many segment refs", "  defp verify_segment_refs(data_dir, shard_index, refs)",
+           "  defp verify_segment_refs_at_path"},
+          {"get_many segment refs",
+           "  defp put_segment_ref_results(results, data_dir, shard_index, refs)",
+           "  defp get_segment_refs_at_path"},
+          {"file_refs_many segment refs",
+           "  defp put_segment_file_ref_results(results, data_dir, shard_index, refs)",
+           "  defp get_segment_file_refs_at_path"}
+        ] do
+      section = source_section!(source, start_marker, end_marker)
+
+      refute section =~ "BlobRef.path(data_dir, shard_index, &1)",
+             "#{name} should group by segment id, then build one path per segment; " <>
+               "building a full path per ref adds avoidable allocation on large cold-read batches"
+    end
+  end
+
   defp source_section!(source, start_marker, end_marker) do
     [_, rest] = String.split(source, start_marker, parts: 2)
     [section | _] = String.split(rest, end_marker, parts: 2)

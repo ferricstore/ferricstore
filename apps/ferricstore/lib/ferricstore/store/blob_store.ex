@@ -330,9 +330,11 @@ defmodule Ferricstore.Store.BlobStore do
   defp verify_segment_refs(data_dir, shard_index, refs) do
     refs
     |> Enum.filter(&match?(%BlobRef{version: 2}, &1))
-    |> Enum.group_by(&BlobRef.path(data_dir, shard_index, &1))
-    |> Enum.reduce_while(:ok, fn {path, path_refs}, :ok ->
-      case verify_segment_refs_at_path(path, shard_index, path_refs) do
+    |> Enum.group_by(& &1.segment_id)
+    |> Enum.reduce_while(:ok, fn {segment_id, segment_refs}, :ok ->
+      path = segment_path(data_dir, shard_index, segment_id)
+
+      case verify_segment_refs_at_path(path, shard_index, segment_refs) do
         :ok -> {:cont, :ok}
         {:error, _reason} = error -> {:halt, error}
       end
@@ -440,9 +442,10 @@ defmodule Ferricstore.Store.BlobStore do
 
   defp put_segment_ref_results(results, data_dir, shard_index, refs) do
     refs
-    |> Enum.group_by(&BlobRef.path(data_dir, shard_index, &1))
-    |> Enum.reduce(results, fn {path, path_refs}, acc ->
-      Map.merge(acc, get_segment_refs_at_path(path, shard_index, path_refs))
+    |> Enum.group_by(& &1.segment_id)
+    |> Enum.reduce(results, fn {segment_id, segment_refs}, acc ->
+      path = segment_path(data_dir, shard_index, segment_id)
+      Map.merge(acc, get_segment_refs_at_path(path, shard_index, segment_refs))
     end)
   end
 
@@ -527,9 +530,10 @@ defmodule Ferricstore.Store.BlobStore do
 
   defp put_segment_file_ref_results(results, data_dir, shard_index, refs) do
     refs
-    |> Enum.group_by(&BlobRef.path(data_dir, shard_index, &1))
-    |> Enum.reduce(results, fn {path, path_refs}, acc ->
-      Map.merge(acc, get_segment_file_refs_at_path(path, shard_index, path_refs))
+    |> Enum.group_by(& &1.segment_id)
+    |> Enum.reduce(results, fn {segment_id, segment_refs}, acc ->
+      path = segment_path(data_dir, shard_index, segment_id)
+      Map.merge(acc, get_segment_file_refs_at_path(path, shard_index, segment_refs))
     end)
   end
 
