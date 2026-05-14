@@ -574,9 +574,13 @@ defmodule Ferricstore.Store.BlobStore do
   end
 
   defp get_open_segment_file_refs(io, path, shard_index, refs) do
-    Enum.reduce(refs, %{}, fn %BlobRef{offset: offset, size: size} = ref, acc ->
+    header_results = read_segment_headers(io, refs)
+
+    refs
+    |> Enum.zip(header_results)
+    |> Enum.reduce(%{}, fn {%BlobRef{offset: offset, size: size} = ref, header_result}, acc ->
       result =
-        case validate_open_segment_record(io, offset, size, ref) do
+        case header_result do
           :ok -> {:ok, {path, offset, size}}
           {:error, _reason} = error -> error
         end
@@ -591,6 +595,52 @@ defmodule Ferricstore.Store.BlobStore do
       end
     end)
   end
+
+  defp read_segment_headers(io, refs) do
+    readable_refs =
+      Enum.filter(refs, fn %BlobRef{offset: offset} ->
+        offset >= @segment_header_bytes
+      end)
+
+    header_reads =
+      Enum.map(readable_refs, fn %BlobRef{offset: offset} ->
+        {offset - @segment_header_bytes, @segment_header_bytes}
+      end)
+
+    read_results =
+      case header_reads do
+        [] ->
+          %{}
+
+        _ ->
+          case :file.pread(io, header_reads) do
+            {:ok, headers} ->
+              readable_refs
+              |> Enum.zip(headers)
+              |> Map.new(fn {ref, header} ->
+                {ref, validate_segment_header(header, ref)}
+              end)
+
+            {:error, reason} ->
+              Map.new(readable_refs, &{&1, {:error, reason}})
+          end
+      end
+
+    Enum.map(refs, &Map.get(read_results, &1, {:error, :segment_header_mismatch}))
+  end
+
+  defp validate_segment_header(
+         header,
+         %BlobRef{version: 2, size: size, checksum: expected_checksum}
+       )
+       when is_binary(header) and byte_size(header) == @segment_header_bytes do
+    case decode_segment_header(header) do
+      {:ok, ^size, ^expected_checksum} -> :ok
+      _other -> {:error, :segment_header_mismatch}
+    end
+  end
+
+  defp validate_segment_header(_header, %BlobRef{}), do: {:error, :segment_header_mismatch}
 
   @doc """
   Returns a file ref for a blob after validating the file is regular and has

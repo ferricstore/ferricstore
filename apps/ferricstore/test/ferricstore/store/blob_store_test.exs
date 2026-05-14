@@ -370,6 +370,20 @@ defmodule Ferricstore.Store.BlobStoreTest do
     assert {:error, :segment_header_mismatch} = BlobStore.file_ref(root, 0, wrong_ref)
   end
 
+  test "file_refs_many isolates a segment header mismatch", %{root: root} do
+    payload_a = :binary.copy("a", 512)
+    payload_b = :binary.copy("b", 512)
+
+    assert {:ok, [ref_a, ref_b]} = BlobStore.put_many(root, 0, [payload_a, payload_b])
+    segment_path = BlobRef.path(root, 0, ref_a)
+    wrong_ref = %{ref_a | offset: ref_b.offset}
+
+    assert [
+             {:ok, {^segment_path, _offset, 512}},
+             {:error, :segment_header_mismatch}
+           ] = BlobStore.file_refs_many(root, 0, [ref_a, wrong_ref])
+  end
+
   test "get_range reads only the requested segment blob slice", %{root: root} do
     payload = :binary.copy("a", 2048) <> "target-slice" <> :binary.copy("z", 2048)
 

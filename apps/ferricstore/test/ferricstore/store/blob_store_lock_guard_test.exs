@@ -128,6 +128,25 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
     end
   end
 
+  test "file_refs_many validates segment headers with one batched pread" do
+    source = File.read!(@source)
+
+    section =
+      source
+      |> source_section!(
+        "  defp get_segment_file_refs_at_path(path, shard_index, refs) do",
+        "  @doc \"\"\"\n  Returns a file ref"
+      )
+
+    assert section =~ ":file.pread(io, header_reads)",
+           "file_refs_many/3 is the sendfile/MGET hot path; after grouping by segment " <>
+             "it should validate all 48-byte record headers with one batched pread"
+
+    refute section =~ "validate_open_segment_record(io",
+           "file_refs_many/3 should not issue one header pread per blob ref after " <>
+             "opening the segment"
+  end
+
   defp source_section!(source, start_marker, end_marker) do
     [_, rest] = String.split(source, start_marker, parts: 2)
     [section | _] = String.split(rest, end_marker, parts: 2)
