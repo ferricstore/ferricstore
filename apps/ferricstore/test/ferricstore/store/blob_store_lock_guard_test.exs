@@ -84,6 +84,14 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
              "in a list and run the full batch dedupe map/list machinery"
   end
 
+  test "single-entry put_many uses the single append preparation path" do
+    source = File.read!(@source)
+
+    assert source =~ "def put_many(data_dir, shard_index, [payload])",
+           "BlobStore.put_many/3 should special-case one payload; Raft batch prep often has " <>
+             "one externalized large value and should not pay the full batch dedupe path"
+  end
+
   test "segment_path uses the segment filename directly" do
     source = File.read!(@source)
 

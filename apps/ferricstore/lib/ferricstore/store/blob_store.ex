@@ -70,6 +70,20 @@ defmodule Ferricstore.Store.BlobStore do
   """
   @spec put_many(binary(), non_neg_integer(), [binary()]) ::
           {:ok, [BlobRef.t()]} | {:error, reason()}
+  def put_many(data_dir, shard_index, [payload])
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_binary(payload) do
+    case put(data_dir, shard_index, payload) do
+      {:ok, ref} -> {:ok, [ref]}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def put_many(data_dir, shard_index, [_payload])
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    {:error, :invalid_blob_payload}
+  end
+
   def put_many(data_dir, shard_index, payloads)
       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
              is_list(payloads) do

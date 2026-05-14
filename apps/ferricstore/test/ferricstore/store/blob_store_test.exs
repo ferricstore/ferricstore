@@ -317,6 +317,20 @@ defmodule Ferricstore.Store.BlobStoreTest do
     refute_received :unexpected_blob_write
   end
 
+  test "single-entry put_many rejects invalid payload without opening the segment", %{root: root} do
+    parent = self()
+
+    Process.put(:ferricstore_blob_store_write_hook, fn io, iodata ->
+      send(parent, :unexpected_blob_write)
+      :file.write(io, iodata)
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_write_hook) end)
+
+    assert {:error, :invalid_blob_payload} = BlobStore.put_many(root, 0, [:invalid])
+    refute_received :unexpected_blob_write
+  end
+
   test "put rolls back unacknowledged segment bytes when fsync fails", %{root: root} do
     first_payload = :binary.copy("a", 512)
     failed_payload = :binary.copy("b", 768)
