@@ -482,15 +482,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp classify_mixed_pipeline(commands),
-    do: classify_mixed_pipeline(commands, [], 0, MapSet.new(), MapSet.new())
+    do: classify_mixed_pipeline(commands, [], MapSet.new(), MapSet.new())
 
-  defp classify_mixed_pipeline([], acc, _idx, _read_keys, _written_keys),
+  defp classify_mixed_pipeline([], acc, _read_keys, _written_keys),
     do: {:ok, Enum.reverse(acc)}
 
   defp classify_mixed_pipeline(
          [{:command, "GET", [key], {:get, key}, [key]} | rest],
          acc,
-         idx,
          read_keys,
          written_keys
        )
@@ -500,8 +499,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
     else
       classify_mixed_pipeline(
         rest,
-        [{:get, idx, key} | acc],
-        idx + 1,
+        [{:get, key} | acc],
         MapSet.put(read_keys, key),
         written_keys
       )
@@ -511,7 +509,6 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp classify_mixed_pipeline(
          [{:command, "SET", [key, value], {:set, key, value}, [key]} | rest],
          acc,
-         idx,
          read_keys,
          written_keys
        )
@@ -522,37 +519,33 @@ defmodule FerricstoreServer.Connection.Pipeline do
     else
       classify_mixed_pipeline(
         rest,
-        [{:set, idx, key, value} | acc],
-        idx + 1,
+        [{:set, key, value} | acc],
         read_keys,
         MapSet.put(written_keys, key)
       )
     end
   end
 
-  defp classify_mixed_pipeline(_, _, _, _, _), do: :fallback
+  defp classify_mixed_pipeline(_, _, _, _), do: :fallback
 
   defp do_mixed_fast_path(ops, state, send_response_fn) do
     ctx = state.instance_ctx
     count = length(ops)
     Stats.incr_commands_by(state.stats_counter, count)
 
-    get_ops = for {:get, idx, key} <- ops, do: {idx, key}
-
-    raw_set_ops = for {:set, idx, key, value} <- ops, do: {idx, key, value}
-    set_notify_args = Map.new(raw_set_ops, fn {idx, key, value} -> {idx, {key, value}} end)
-    set_ops = namespace_set_ops(state.sandbox_namespace, raw_set_ops)
+    get_keys = for {:get, key} <- ops, do: key
+    lookup_keys = namespace_keys(state.sandbox_namespace, get_keys)
+    set_pairs = for {:set, key, value} <- ops, do: {key, value}
+    write_pairs = namespace_kv_pairs(state.sandbox_namespace, set_pairs)
 
     # Reads and writes are disjoint here, so SETs can be grouped without
     # changing any GET result in the same pipeline.
-    set_results =
-      case set_ops do
+    set_slots =
+      case write_pairs do
         [] ->
-          %{}
+          []
 
         _ ->
-          kv_pairs = Enum.map(set_ops, fn {_idx, key, value} -> {key, value} end)
-
           pressure_ok =
             :atomics.get(ctx.pressure_flags, 1) == 0 and
               :atomics.get(ctx.pressure_flags, 2) == 0
@@ -560,45 +553,27 @@ defmodule FerricstoreServer.Connection.Pipeline do
           # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
           results =
             if not pressure_ok do
-              List.duplicate({:error, "ERR server under pressure"}, length(kv_pairs))
+              List.duplicate({:error, "ERR server under pressure"}, length(write_pairs))
             else
-              case safe_dispatch(fn -> mixed_set_results(ctx, kv_pairs) end) do
+              case safe_dispatch(fn -> mixed_set_results(ctx, write_pairs) end) do
                 {:ok, results} -> results
-                {:error, err} -> List.duplicate(err, length(kv_pairs))
+                {:error, err} -> List.duplicate(err, length(write_pairs))
               end
             end
 
-          set_ops
-          |> Enum.zip(results)
-          |> Map.new(fn {{idx, _key, _value}, result} ->
-            encoded =
-              case result do
-                :ok ->
-                  {key, value} = Map.fetch!(set_notify_args, idx)
-                  notify_pipeline_set_success(key, value, state)
-                  Encoder.ok_response()
-
-                {:error, _} = err ->
-                  Encoder.encode(err)
-              end
-
-            {idx, encoded}
-          end)
+          encode_mixed_set_slots(set_pairs, results, state)
       end
 
-    get_results =
-      case get_ops do
+    {get_slots, has_file_ref?} =
+      case get_keys do
         [] ->
-          %{}
+          {[], false}
 
         _ ->
-          keys = Enum.map(get_ops, &elem(&1, 1))
-          lookup_keys = namespace_keys(state.sandbox_namespace, keys)
-
           get_dispatch =
             if state.transport in [:ranch_tcp, :ranch_ssl] do
               fn ->
-                Router.batch_get_with_deferred_blob_file_refs(
+                Router.batch_get_with_deferred_blob_file_refs_and_presence(
                   ctx,
                   lookup_keys,
                   ConnSendfile.threshold_bytes()
@@ -609,47 +584,83 @@ defmodule FerricstoreServer.Connection.Pipeline do
             end
 
           case safe_dispatch(get_dispatch) do
-            {:ok, values} ->
-              get_ops
-              |> Enum.zip(lookup_keys)
-              |> Enum.zip(values)
-              |> Map.new(fn
-                {{{idx, key}, lookup_key}, {:file_ref, path, offset, size}} ->
-                  {idx, {:file_ref, key, lookup_key, path, offset, size}}
+            {:ok, {values, has_file_ref?}} ->
+              slots = encode_mixed_get_slots(get_keys, lookup_keys, values)
+              {slots, has_file_ref?}
 
-                {{{idx, key}, _lookup_key}, value} ->
-                  {idx, {:get_encoded, key, Encoder.encode(value), value}}
-              end)
+            {:ok, values} ->
+              slots = encode_mixed_get_slots(get_keys, lookup_keys, values)
+              {slots, has_file_ref_slot?(slots)}
 
             {:error, err} ->
-              Map.new(get_ops, fn {idx, _key} -> {idx, Encoder.encode(err)} end)
+              {List.duplicate(Encoder.encode(err), length(get_keys)), false}
           end
       end
 
-    if map_has_file_ref?(get_results) do
-      stream_indexed_results(count, get_results, set_results, state, send_response_fn)
-    else
-      response =
-        for i <- 0..(count - 1),
-            do: response_iodata(Map.get(get_results, i) || Map.get(set_results, i))
+    response_slots = assemble_mixed_slots(ops, get_slots, set_slots)
 
+    if has_file_ref? do
+      stream_mixed_results(response_slots, state, send_response_fn)
+    else
+      response = Enum.map(response_slots, &response_iodata/1)
       send_response_fn.(state.socket, state.transport, response)
-      {:continue, track_mixed_get_results(get_results, state)}
+      {:continue, track_mixed_get_results(response_slots, state)}
     end
   end
 
-  defp map_has_file_ref?(results) do
-    Enum.any?(results, fn {_idx, result} ->
-      match?({:file_ref, _key, _lookup_key, _path, _offset, _size}, result)
+  defp encode_mixed_get_slots(get_keys, lookup_keys, values) do
+    get_keys
+    |> Enum.zip(lookup_keys)
+    |> Enum.zip(values)
+    |> Enum.map(fn
+      {{key, lookup_key}, {:file_ref, path, offset, size}} ->
+        {:file_ref, key, lookup_key, path, offset, size}
+
+      {{key, _lookup_key}, value} ->
+        {:get_encoded, key, Encoder.encode(value), value}
     end)
   end
+
+  defp encode_mixed_set_slots(set_pairs, results, state) do
+    set_pairs
+    |> Enum.zip(results)
+    |> Enum.map(fn
+      {{key, value}, :ok} ->
+        notify_pipeline_set_success(key, value, state)
+        Encoder.ok_response()
+
+      {_set_pair, {:error, _} = err} ->
+        Encoder.encode(err)
+    end)
+  end
+
+  defp has_file_ref_slot?(slots), do: Enum.any?(slots, &file_ref_slot?/1)
+
+  defp file_ref_slot?({:file_ref, _key, _lookup_key, _path, _offset, _size}), do: true
+  defp file_ref_slot?(_slot), do: false
+
+  defp assemble_mixed_slots(ops, get_slots, set_slots),
+    do: assemble_mixed_slots(ops, get_slots, set_slots, [])
+
+  defp assemble_mixed_slots([], [], [], acc), do: Enum.reverse(acc)
+
+  defp assemble_mixed_slots([{:get, _key} | rest], [slot | get_slots], set_slots, acc),
+    do: assemble_mixed_slots(rest, get_slots, set_slots, [slot | acc])
+
+  defp assemble_mixed_slots(
+         [{:set, _key, _value} | rest],
+         get_slots,
+         [slot | set_slots],
+         acc
+       ),
+       do: assemble_mixed_slots(rest, get_slots, set_slots, [slot | acc])
 
   defp response_iodata({:get_encoded, _key, encoded, _value}), do: encoded
   defp response_iodata(encoded), do: encoded
 
   defp track_mixed_get_results(results, state) do
     Enum.reduce(results, state, fn
-      {_idx, {:get_encoded, key, _encoded, value}}, acc_state ->
+      {:get_encoded, key, _encoded, value}, acc_state ->
         ConnTracking.maybe_track_read("GET", [key], value, acc_state)
 
       _other, acc_state ->
@@ -657,54 +668,53 @@ defmodule FerricstoreServer.Connection.Pipeline do
     end)
   end
 
-  defp stream_indexed_results(count, primary_results, fallback_results, state, send_response_fn) do
+  defp stream_mixed_results(response_slots, state, send_response_fn) do
     TcpOpts.set_cork(state.socket, true)
 
     {result, file_cache} =
       Enum.reduce_while(
-        0..(count - 1),
+        response_slots,
         {{:continue, state}, ConnSendfile.new_file_cache()},
-        fn idx, {{:continue, acc_state}, file_cache} ->
-          case Map.get(primary_results, idx) || Map.get(fallback_results, idx) do
-            {:file_ref, key, lookup_key, path, offset, size} ->
-              case ConnSendfile.send_file_ref_response_cached(
-                     key,
-                     lookup_key,
-                     path,
-                     offset,
-                     size,
-                     acc_state,
-                     file_cache
-                   ) do
-                {:sent, new_state, new_cache} ->
-                  {:cont, {{:continue, new_state}, new_cache}}
+        fn
+          {:file_ref, key, lookup_key, path, offset, size},
+          {{:continue, acc_state}, file_cache} ->
+            case ConnSendfile.send_file_ref_response_cached(
+                   key,
+                   lookup_key,
+                   path,
+                   offset,
+                   size,
+                   acc_state,
+                   file_cache
+                 ) do
+              {:sent, new_state, new_cache} ->
+                {:cont, {{:continue, new_state}, new_cache}}
 
-                {:fallback, new_cache} ->
-                  send_response_fn.(
-                    acc_state.socket,
-                    acc_state.transport,
-                    Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
-                  )
+              {:fallback, new_cache} ->
+                send_response_fn.(
+                  acc_state.socket,
+                  acc_state.transport,
+                  Encoder.encode(Router.get(acc_state.instance_ctx, lookup_key))
+                )
 
-                  {:cont,
-                   {{:continue,
-                     ConnTracking.maybe_track_read("GET", [key], :fallback_ok, acc_state)},
-                    new_cache}}
+                {:cont,
+                 {{:continue,
+                   ConnTracking.maybe_track_read("GET", [key], :fallback_ok, acc_state)},
+                  new_cache}}
 
-                {:error_after_header, _reason, new_cache} ->
-                  {:halt, {{:quit, acc_state}, new_cache}}
-              end
+              {:error_after_header, _reason, new_cache} ->
+                {:halt, {{:quit, acc_state}, new_cache}}
+            end
 
-            {:get_encoded, key, encoded, value} ->
-              send_response_fn.(acc_state.socket, acc_state.transport, encoded)
+          {:get_encoded, key, encoded, value}, {{:continue, acc_state}, file_cache} ->
+            send_response_fn.(acc_state.socket, acc_state.transport, encoded)
 
-              tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
-              {:cont, {{:continue, tracked_state}, file_cache}}
+            tracked_state = ConnTracking.maybe_track_read("GET", [key], value, acc_state)
+            {:cont, {{:continue, tracked_state}, file_cache}}
 
-            encoded ->
-              send_response_fn.(acc_state.socket, acc_state.transport, encoded)
-              {:cont, {{:continue, acc_state}, file_cache}}
-          end
+          encoded, {{:continue, acc_state}, file_cache} ->
+            send_response_fn.(acc_state.socket, acc_state.transport, encoded)
+            {:cont, {{:continue, acc_state}, file_cache}}
         end
       )
 
@@ -1864,11 +1874,6 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   defp namespace_kv_pairs(namespace, kv_pairs) when is_binary(namespace),
     do: Enum.map(kv_pairs, fn {key, value} -> {namespace <> key, value} end)
-
-  defp namespace_set_ops(nil, set_ops), do: set_ops
-
-  defp namespace_set_ops(namespace, set_ops) when is_binary(namespace),
-    do: Enum.map(set_ops, fn {idx, key, value} -> {idx, namespace <> key, value} end)
 
   defp safe_dispatch(fun) do
     {:ok, fun.()}

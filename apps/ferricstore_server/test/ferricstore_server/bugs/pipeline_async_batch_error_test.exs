@@ -9,6 +9,7 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
   alias FerricstoreServer.Connection.Pipeline
 
   @ns "pipeline_quorum_fast_path"
+  @pipeline_source Path.expand("../../../lib/ferricstore_server/connection/pipeline.ex", __DIR__)
 
   setup do
     ClientTracking.init_tables()
@@ -478,6 +479,19 @@ defmodule FerricstoreServer.Bugs.PipelineAsyncBatchErrorTest do
     assert_receive {:pipeline_response, "$2\r\nv1\r\n+OK\r\n"}
     assert_receive {:tracking_invalidation, _payload, [^set_key]}
     assert :ets.lookup(:ferricstore_tracking, set_key) == []
+  end
+
+  test "mixed GET and SET fast path assembles replies without index maps" do
+    body =
+      @pipeline_source
+      |> File.read!()
+      |> String.split("  defp do_mixed_fast_path", parts: 2)
+      |> List.last()
+      |> String.split("  defp mixed_set_results", parts: 2)
+      |> hd()
+
+    refute body =~ "Map.new("
+    refute body =~ "Map.get("
   end
 
   test "general pure pipeline converts command raises into Redis error replies" do
